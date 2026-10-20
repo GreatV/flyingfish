@@ -71,14 +71,29 @@ fn media_boundary(measured: &serde_json::Value) -> Result<[f64; 2]> {
 
 impl Bounds {
     fn read(fixtures: &Path, case: &str, format: crate::model_spec::ExpertFormat) -> Result<Self> {
-        if format == crate::model_spec::ExpertFormat::Fp8W8a16 {
-            return Self::read_fp8(fixtures, case);
-        }
         let directory = fixtures.parent().context("reference parent missing")?;
-        let noise: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(directory.join("noise_floor_r2.json"))?)?;
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(directory.join("fixtures_manifest.json"))?)?;
+        let video = case.starts_with("video_");
+        let controls = &manifest[if video { "video" } else { "image" }]["media_reach_controls"];
+        let (same_grid, cross_media) = if video {
+            (
+                "same_grid_1280x720_football_vs_boat_pan_logits_diff",
+                "football_16x_vs_sample_demo_1_16x_logits_diff",
+            )
+        } else {
+            (
+                "same_grid_400x267_hockey_vs_boat_logits_diff",
+                "hockey_16x_vs_boat_16x_logits_diff",
+            )
+        };
+        let media = media_boundary(&controls[same_grid])?;
+        let cross_media = media_boundary(&controls[cross_media])?;
+        if format == crate::model_spec::ExpertFormat::Fp8W8a16 {
+            return Self::read_fp8(fixtures, case, media, cross_media);
+        }
+        let noise: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join("noise_floor_r2.json"))?)?;
         let floor = &noise["per_case_reference_floor"]["cases"][case];
         let comparisons = floor["comparisons"]
             .as_object()
@@ -144,30 +159,22 @@ impl Bounds {
             }
             cells
         };
-        let video = case.starts_with("video_");
-        let media = &manifest[if video { "video" } else { "image" }]["media_reach_controls"];
-        let (same_grid, cross_media) = if video {
-            (
-                "same_grid_1280x720_football_vs_boat_pan_logits_diff",
-                "football_16x_vs_sample_demo_1_16x_logits_diff",
-            )
-        } else {
-            (
-                "same_grid_400x267_hockey_vs_boat_logits_diff",
-                "hockey_16x_vs_boat_16x_logits_diff",
-            )
-        };
         Ok(Self {
             layers,
             norm: measured_bounds(&cells("norm"))?,
             logits: measured_bounds(&cells("logits"))?,
             decode: measured_bounds(&cells("teacher_top2"))?,
-            media: media_boundary(&media[same_grid])?,
-            cross_media: media_boundary(&media[cross_media])?,
+            media,
+            cross_media,
         })
     }
 
-    fn read_fp8(fixtures: &Path, case: &str) -> Result<Self> {
+    fn read_fp8(
+        fixtures: &Path,
+        case: &str,
+        media: [f64; 2],
+        cross_media: [f64; 2],
+    ) -> Result<Self> {
         let directory = fixtures.parent().context("FP8 reference parent missing")?;
         let noise: serde_json::Value =
             serde_json::from_slice(&std::fs::read(directory.join("fp8-floor.json"))?)?;
@@ -201,11 +208,12 @@ impl Bounds {
             "same_input_cross_gpu",
         ];
         let vision = &components["official_vision_implementation_propagation"];
+        let visual = case.starts_with("image_") || case.starts_with("video_");
         ensure!(
-            vision["applicable"] == case.starts_with("image_"),
+            vision["applicable"] == visual,
             "FP8 vision floor applicability differs from case={case}"
         );
-        if case.starts_with("image_") {
+        if visual {
             arms.push("official_vision_implementation_propagation");
         }
         for arm in &arms {
@@ -261,18 +269,13 @@ impl Bounds {
                 }
             }
         }
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(directory.join("fixtures_manifest.json"))?)?;
-        let media = media_boundary(
-            &manifest["image"]["media_reach_controls"]["same_grid_400x267_hockey_vs_boat_logits_diff"],
-        )?;
         Ok(Self {
             layers,
             norm: measured_bounds(&cells("final_norm_last"))?,
             logits: measured_bounds(&cells("prefill_last_logits_bf16"))?,
             decode: measured_bounds(&cells("teacher_top2"))?,
             media,
-            cross_media: media,
+            cross_media,
         })
     }
 }
@@ -834,6 +837,30 @@ fn teacher_steps(
         );
     }
     Ok(steps)
+}
+
+fn native_cases(format: crate::model_spec::ExpertFormat) -> &'static [&'static str] {
+    match format {
+        crate::model_spec::ExpertFormat::Bf16 => &[
+            "text_32",
+            "text_1k",
+            "text_4k",
+            "image_hockey_16x",
+            "image_boat_16x",
+            "video_football_16x",
+            "video_control_clip2_16x",
+            "video_control_same_grid_16x",
+        ],
+        crate::model_spec::ExpertFormat::Fp8W8a16 => &[
+            "text_32",
+            "text_1k",
+            "text_4k",
+            "image_hockey_16x",
+            "video_football_16x",
+            "video_control_clip2_16x",
+            "video_control_same_grid_16x",
+        ],
+    }
 }
 
 fn check_fixtures(fixtures: &Path, model_dir: &Path, cases: &[&str]) -> Result<()> {
@@ -1438,28 +1465,20 @@ fn minicpm_native_checkpoint_fixtures_cpu() -> Result<()> {
     let fixtures = PathBuf::from(
         std::env::var_os("FF_MINICPM_REFERENCE_DIR").context("reference directory missing")?,
     );
-    check_fixtures(
-        &fixtures,
-        &model,
-        &[
-            "text_32",
-            "text_1k",
-            "text_4k",
-            "image_hockey_16x",
-            "image_boat_16x",
-            "video_football_16x",
-            "video_control_clip2_16x",
-            "video_control_same_grid_16x",
-        ],
-    )?;
+    let format = crate::model_spec::ModelSpec::read(&model)?
+        .expert_format
+        .context("native fixture expert_format missing")?;
+    let cases = native_cases(format);
+    check_fixtures(&fixtures, &model, cases)?;
     println!(
-        "PASS minicpm_native_fixture_preflight cases=8 video_decode=ffmpeg canvas=true floors_complete=true"
+        "PASS minicpm_native_fixture_preflight format={format:?} cases={} video_decode=ffmpeg canvas=true floors_complete=true",
+        cases.len()
     );
     Ok(())
 }
 
 #[test]
-#[ignore = "exclusive CUDA profiling, native FP8 FF_MODEL, text1k/text4k inputs and FLYINGFISH_RUNTIME_DIR required"]
+#[ignore = "exclusive CUDA profiling, native FP8 FF_MODEL, FF_MINICPM_REFERENCE_DIR, FF_VIDEO_REF_DIR and FLYINGFISH_RUNTIME_DIR required"]
 fn minicpm_native_prefill_profile_gpu() -> Result<()> {
     let model = PathBuf::from(std::env::var_os("FF_MODEL").context("FP8 model missing")?);
     let fixtures = PathBuf::from(
@@ -1486,47 +1505,56 @@ fn minicpm_native_prefill_profile_gpu() -> Result<()> {
     };
     Engine::calibrate(&model, 0, 4352, None, settings.clone())?;
     let mut engine = Engine::load(&model, 0, 4352, None, settings)?;
-    for (case, rows) in [("text_1k", 1024usize), ("text_4k", 4096)] {
+    let cases = native_cases(crate::model_spec::ExpertFormat::Fp8W8a16);
+    check_fixtures(&fixtures, &model, cases)?;
+    for &case in cases {
         let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
         let source = SafeTensors::deserialize(&bytes)?;
-        ensure!(
-            source.tensor("input_ids")?.shape() == [1, rows],
-            "profile input layout {case}"
-        );
-        let ids = integers(&source, "input_ids")?;
-        ensure!(
-            ids.len() == rows && ids.iter().all(|&id| id < spec.vocab),
-            "profile input extent/vocabulary {case}"
-        );
-        engine.reset()?;
-        engine.prefill(&ids, None)?;
-        engine.device.stream.synchronize()?;
-        engine.reset()?;
-        engine.profiler_start()?;
-        let started = Instant::now();
-        let result = engine.prefill(&ids, None);
-        engine.device.stream.synchronize()?;
-        let seconds = started.elapsed().as_secs_f64();
-        let stop = engine.profiler_stop();
-        result?;
-        stop?;
-        ensure!(
-            engine
-                .decode_logits()?
-                .iter()
-                .all(|value| value.is_finite()),
-            "nonfinite native prefill output {case}"
-        );
-        println!(
-            "{}",
-            serde_json::json!({"minicpm_native_prefill_profile": {
-                "case":case,"input_layout":[1,rows],"hidden":spec.hidden,
-                "graphs":false,"seconds":seconds,"warm_requests":1,
-                "region":"native full-model prefill; setup and warm request excluded"
-            }})
-        );
+        let input = if case.starts_with("video_") {
+            Input::video(&source, &model, case)?
+        } else {
+            Input::read(&source, case)?
+        };
+        for capture in [false, true] {
+            engine.reset()?;
+            if capture {
+                engine.profiler_start()?;
+            }
+            let started = Instant::now();
+            let result = if input.grids.is_empty() {
+                engine.prefill(&input.ids, None)
+            } else {
+                engine.prefill_multimodal(&input.packed(), None)
+            };
+            engine.device.stream.synchronize()?;
+            let seconds = started.elapsed().as_secs_f64();
+            if capture {
+                engine.profiler_stop()?;
+            }
+            result?;
+            ensure!(
+                engine
+                    .decode_logits()?
+                    .iter()
+                    .all(|value| value.is_finite()),
+                "nonfinite native prefill output {case}"
+            );
+            if capture {
+                println!(
+                    "{}",
+                    serde_json::json!({"minicpm_native_prefill_profile": {
+                        "case":case,"input_layout":[1,input.ids.len()],"hidden":spec.hidden,
+                        "graphs":false,"seconds":seconds,"warm_requests":1,
+                        "region":"native full-model media and text prefill; setup and warm request excluded"
+                    }})
+                );
+            }
+        }
     }
-    println!("PASS minicpm_native_prefill_profile cases=2 graphs=false finite=true");
+    println!(
+        "PASS minicpm_native_prefill_profile cases={} graphs=false finite=true capture=cudaProfilerApi",
+        cases.len()
+    );
     Ok(())
 }
 
@@ -2519,13 +2547,15 @@ fn reference_floors_are_selected_per_input() -> Result<()> {
             )?,
         )?;
         let media = serde_json::json!({"max_abs":1.0, "cosine_sim":0.0});
+        let video_media = serde_json::json!({"max_abs":2.0, "cosine_sim":0.5});
+        let video_cross = serde_json::json!({"max_abs":4.0, "cosine_sim":-0.5});
         std::fs::write(
             directory.join("fixtures_manifest.json"),
             serde_json::to_vec(&serde_json::json!({"image":{"media_reach_controls":{
                 "same_grid_400x267_hockey_vs_boat_logits_diff":media,
                 "hockey_16x_vs_boat_16x_logits_diff":media}},"video":{"media_reach_controls":{
-                "same_grid_1280x720_football_vs_boat_pan_logits_diff":media,
-                "football_16x_vs_sample_demo_1_16x_logits_diff":media}}}))?,
+                "same_grid_1280x720_football_vs_boat_pan_logits_diff":video_media,
+                "football_16x_vs_sample_demo_1_16x_logits_diff":video_cross}}}))?,
         )?;
         for (case, expected) in [
             ("text_32", 0.25),
@@ -2569,7 +2599,8 @@ fn reference_floors_are_selected_per_input() -> Result<()> {
             })
             .map(|key| (key, zero.clone()))
             .collect::<serde_json::Map<_, _>>();
-        let fp8_cases = ["text_32", "text_1k", "image_hockey_16x"].into_iter().enumerate().map(|(index, case)| {
+        let fp8_cases = ["text_32", "text_1k", "image_hockey_16x", "text_4k",
+            "video_football_16x", "video_control_clip2_16x", "video_control_same_grid_16x"].into_iter().enumerate().map(|(index, case)| {
             let mut tensors = layers.clone();
             for key in ["final_norm_last", "prefill_last_logits_bf16", "teacher_top2", "layer0_fp32_raw_last8"] {
                 tensors.insert(key.to_owned(), zero.clone());
@@ -2582,7 +2613,7 @@ fn reference_floors_are_selected_per_input() -> Result<()> {
             let teacher = (0..32).map(|step| {
                 serde_json::json!({"top2":if step == 0 {zero.clone()} else {aggregate.clone()}})
             }).collect::<Vec<_>>();
-            let image = case.starts_with("image_");
+            let image = case.starts_with("image_") || case.starts_with("video_");
             let mut teacher_arms = serde_json::json!({
                 "expert_implementation_order":teacher,"layer0_mixed_precision":teacher,
                 "same_input_cross_gpu":teacher});
@@ -2601,9 +2632,17 @@ fn reference_floors_are_selected_per_input() -> Result<()> {
             "state":"frozen_before_candidate_measurement","declaration":{"candidate_results_seen":false},"cases":fp8_cases});
         let path = directory.join("fp8-floor.json");
         std::fs::write(&path, serde_json::to_vec(&fp8)?)?;
-        for (index, case) in ["text_32", "text_1k", "image_hockey_16x"]
-            .into_iter()
-            .enumerate()
+        for (index, case) in [
+            "text_32",
+            "text_1k",
+            "image_hockey_16x",
+            "text_4k",
+            "video_football_16x",
+            "video_control_clip2_16x",
+            "video_control_same_grid_16x",
+        ]
+        .into_iter()
+        .enumerate()
         {
             let bound = Bounds::read(
                 &directory.join("fixtures"),
@@ -2612,6 +2651,12 @@ fn reference_floors_are_selected_per_input() -> Result<()> {
             )?;
             let expected = (index + 1) as f64 / 4.0;
             assert_eq!(bound.decode, [expected, expected, expected, 1.0]);
+            if case.starts_with("video_") {
+                assert_eq!(bound.media, [1.0, 0.75]);
+                assert_eq!(bound.cross_media, [2.0, 0.25]);
+            } else {
+                assert_eq!(bound.media, [0.5, 0.5]);
+            }
         }
         fp8["cases"]["text_32"]["components"]["teacher_forced_per_step"]["comparisons"]["same_input_cross_gpu"] =
             serde_json::json!([]);
@@ -2661,19 +2706,7 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
     let format = spec
         .expert_format
         .context("native checkpoint expert_format missing")?;
-    let names: &[&str] = match format {
-        crate::model_spec::ExpertFormat::Bf16 => &[
-            "text_32",
-            "text_1k",
-            "text_4k",
-            "image_hockey_16x",
-            "image_boat_16x",
-            "video_football_16x",
-            "video_control_clip2_16x",
-            "video_control_same_grid_16x",
-        ],
-        crate::model_spec::ExpertFormat::Fp8W8a16 => &["text_32", "text_1k", "image_hockey_16x"],
-    };
+    let names = native_cases(format);
     let cases = names
         .iter()
         .copied()
@@ -2701,6 +2734,8 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
     }
     let mut media_logits = Vec::new();
     let mut videos = Vec::new();
+    let mut splice_controls = 0;
+    let mut image_controls = 0;
     for (case, bounds) in &cases {
         let case = *case;
         let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
@@ -2782,6 +2817,7 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
             videos.push((case, first_logits.clone(), ids));
             if case == "video_football_16x" {
                 video_splice_control(&mut engine, &input, &source, bounds)?;
+                splice_controls += 1;
             }
         }
         if case == "image_hockey_16x" {
@@ -2792,6 +2828,7 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
                 &first_logits,
                 bounds.media,
             )?;
+            image_controls += 1;
         }
     }
     if format == crate::model_spec::ExpertFormat::Bf16 {
@@ -2801,49 +2838,45 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
             "minicpm_two_media max={} cosine={} defects={defects}",
             media[0], media[3]
         );
-        let video_bounds = &cases
-            .iter()
-            .find(|(case, _)| *case == "video_football_16x")
-            .context("video bounds missing")?
-            .1;
-        for (index, bound) in [(1, video_bounds.cross_media), (2, video_bounds.media)] {
-            let metrics = metrics(&videos[0].1, &videos[index].1)?;
-            let pass =
-                metrics[0] >= bound[0] && metrics[3] <= bound[1] && videos[0].2 != videos[index].2;
-            defects += usize::from(!pass);
-            println!(
-                "{} minicpm_two_videos pair={} max={} cosine={} distinct_ids={} bound={bound:?}",
-                if pass { "PASS" } else { "DEFECT" },
-                videos[index].0,
-                metrics[0],
-                metrics[3],
-                videos[0].2 != videos[index].2
-            );
-        }
-        for (case, _, expected) in videos.iter().rev() {
-            let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
-            let source = SafeTensors::deserialize(&bytes)?;
-            let input = Input::video(&source, &model, case)?;
-            let ids = video_caption(&mut engine, &input, case, &model, expected.len())?;
-            defects += usize::from(ids != *expected);
-            println!(
-                "{} minicpm_video_request_order {case} reverse_order=true same_ids={}",
-                if ids == *expected { "PASS" } else { "DEFECT" },
-                ids == *expected
-            );
-        }
+    }
+    let video_count = videos.len();
+    ensure!(video_count == 3, "native gate requires three video cases");
+    let video_bounds = &cases
+        .iter()
+        .find(|(case, _)| *case == "video_football_16x")
+        .context("video bounds missing")?
+        .1;
+    for (index, bound) in [(1, video_bounds.cross_media), (2, video_bounds.media)] {
+        let metrics = metrics(&videos[0].1, &videos[index].1)?;
+        let pass =
+            metrics[0] >= bound[0] && metrics[3] <= bound[1] && videos[0].2 != videos[index].2;
+        defects += usize::from(!pass);
+        println!(
+            "{} minicpm_two_videos pair={} max={} cosine={} distinct_ids={} bound={bound:?}",
+            if pass { "PASS" } else { "DEFECT" },
+            videos[index].0,
+            metrics[0],
+            metrics[3],
+            videos[0].2 != videos[index].2
+        );
+    }
+    for (case, _, expected) in videos.iter().rev() {
+        let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
+        let source = SafeTensors::deserialize(&bytes)?;
+        let input = Input::video(&source, &model, case)?;
+        let ids = video_caption(&mut engine, &input, case, &model, expected.len())?;
+        defects += usize::from(ids != *expected);
+        println!(
+            "{} minicpm_video_request_order {case} reverse_order=true same_ids={}",
+            if ids == *expected { "PASS" } else { "DEFECT" },
+            ids == *expected
+        );
     }
     println!("minicpm_native_end defects={defects}");
     ensure!(defects == 0, "MiniCPM end-to-end DEFECT count={defects}");
     println!(
-        "PASS minicpm_native_checkpoint format={format:?} cases={} bitwise_graphs=true media_control={} video_splice_control={}",
+        "PASS minicpm_native_checkpoint format={format:?} cases={} bitwise_graphs=true media_controls={image_controls} video_cases={video_count} video_splice_controls={splice_controls}",
         names.len(),
-        if format == crate::model_spec::ExpertFormat::Bf16 {
-            "boat_pixels,video_pixels"
-        } else {
-            "boat_pixels"
-        },
-        format == crate::model_spec::ExpertFormat::Bf16
     );
     Ok(())
 }
