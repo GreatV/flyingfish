@@ -55,6 +55,7 @@ fn decode_device_bytes(geometry: ExpertGeometry, rows: usize) -> Result<usize> {
         .and_then(|n| n.checked_add(26))
         .and_then(|n| n.checked_mul(k))
         .and_then(|n| n.checked_add(hidden * 2 + 2))
+        .and_then(|n| n.checked_add(geometry.experts as usize * 2))
         .context("expert decode row byte count overflow")?;
     let scratch = decode_scratch_bytes(rows, k, geometry.intermediate as usize);
     rows.checked_mul(row)
@@ -605,7 +606,7 @@ impl Decode {
             + decode.final_active.len()
             + decode.done.len())
             * size_of::<u32>()
-            + decode.weights.len() * size_of::<bf16>()
+            + (decode.weights.len() + decode.route_logits.len()) * size_of::<bf16>()
             + decode.generation.len() * size_of::<u64>()
             + (decode.contributions.len() + decode.shared.len() + decode.scale.len())
                 * size_of::<bf16>()
