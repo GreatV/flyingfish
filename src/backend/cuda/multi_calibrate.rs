@@ -39,7 +39,6 @@ struct Cache {
     key: CacheKey,
     rows: usize,
     causal: bool,
-    #[serde(default)]
     tree: bool,
     winner: MultiPlan,
     bucket: usize,

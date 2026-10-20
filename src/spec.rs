@@ -306,7 +306,7 @@ pub fn produce_events(
         return Ok(Output {
             ids: output,
             rounds: Vec::new(),
-            decode_ms: start.elapsed().as_secs_f64() * 1000.0,
+            decode_ms: 0.0,
             prefill_ms,
         });
     }

@@ -49,12 +49,7 @@ void gdn_chunked_core_t(
         float* __restrict__ S,            // FP32 [HEADS, DK, DV]
         __nv_bfloat16* __restrict__ out,  // BF16 [M, HEADS, DV]
         const GdnMeta* __restrict__ meta,
-        int valid_rows_in, float* snapshots
-// Negative-control build; never defined by build.rs.
-#ifdef GDN_DUMP_PARTS
-        , float* __restrict__ dump_inter, float* __restrict__ dump_attn
-#endif
-        ) {
+        int valid_rows_in, float* snapshots) {
     constexpr int VW = GDN_DV / VSPLIT;
     const int head = blockIdx.y;
     const int j0 = blockIdx.x * VW;
@@ -193,7 +188,6 @@ void gdn_chunked_core_t(
         }
         __syncthreads();
 
-// Negative-control build; never defined by build.rs.
 #ifdef GDN_RAW_V
         // v_new from raw V instead of w = T(beta.*V).
         for (int idx = tid; idx < GDN_CHUNK * VW; idx += GDN_THREADS) {
@@ -240,23 +234,6 @@ void gdn_chunked_core_t(
                 sQk[i] = qk;
             }
             __syncthreads();
-// Negative-control build; never defined by build.rs.
-#ifdef GDN_DUMP_PARTS
-            // Writes the inter and attn terms before rounding.
-            for (int j = tid; j < VW; j += GDN_THREADS) {
-                const float eG = __expf(sG[r]);
-                float i0 = 0.0f;
-                for (int u = 0; u < GDN_DK / RT; ++u) i0 += sRed[u * VW + j];
-                float a0 = 0.0f;
-                for (int i = 0; i <= r; ++i)
-                    a0 = fmaf(sQk[i] * __expf(sG[r] - sG[i]), sKbS[i * VW + j], a0);
-                if (gr < valid_rows) {
-                    const size_t oi = ((size_t)gr * GDN_HEADS + head) * GDN_DV + j0 + j;
-                    dump_inter[oi] = i0 * eG;
-                    dump_attn[oi] = a0;
-                }
-            }
-#endif
             for (int j = tid; j < VW; j += GDN_THREADS) {
                 const float eG = __expf(sG[r]);
                 float inter = 0.0f;
@@ -319,35 +296,18 @@ void gdn_chunked_core_t(
             S[(size_t)head * GDN_DK * GDN_DV + (i0 + a) * GDN_DV + j0 + jb + b] = Sr[a][b];
 }
 
-// Negative-control build; never defined by build.rs.
-#ifdef GDN_DUMP_PARTS
-#define GDN_DUMP_ARGS , nullptr, nullptr
-#else
-#define GDN_DUMP_ARGS
-#endif
-
 // VSPLIT is fixed at setup by the prepared plan.
 extern "C" __global__ __launch_bounds__(GDN_THREADS, 1)
 void gdn_chunked_core_v1(const float* q, const float* k, const float* v,
                         const float* beta, const float* g, float* S,
                         __nv_bfloat16* out, const GdnMeta* meta, int valid_rows) {
-    gdn_chunked_core_t<1>(q, k, v, beta, g, S, out, meta, valid_rows, nullptr GDN_DUMP_ARGS);
+    gdn_chunked_core_t<1>(q, k, v, beta, g, S, out, meta, valid_rows, nullptr);
 }
-
-// Negative-control build; never defined by build.rs.
-#ifdef GDN_DUMP_PARTS
-// Additionally writes the output phase's inter and attn terms before rounding.
-extern "C" __global__ void gdn_chunked_core_v1_dump(const float* q, const float* k, const float* v,
-    const float* beta, const float* g, float* S, __nv_bfloat16* out,
-    const GdnMeta* meta, int valid_rows, float* dump_inter, float* dump_attn) {
-    gdn_chunked_core_t<1>(q, k, v, beta, g, S, out, meta, valid_rows, nullptr, dump_inter, dump_attn);
-}
-#endif
 
 extern "C" __global__ __launch_bounds__(GDN_THREADS, 1)
 void gdn_chunked_core_snapshot(const float* q, const float* k, const float* v,
                               const float* beta, const float* g, float* S,
                               __nv_bfloat16* out, const GdnMeta* meta, int valid_rows,
                               float* snapshots) {
-    gdn_chunked_core_t<1, true>(q, k, v, beta, g, S, out, meta, valid_rows, snapshots GDN_DUMP_ARGS);
+    gdn_chunked_core_t<1, true>(q, k, v, beta, g, S, out, meta, valid_rows, snapshots);
 }

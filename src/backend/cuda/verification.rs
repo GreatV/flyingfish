@@ -56,30 +56,6 @@ pub fn phase1_residency(ctx: &Arc<CudaContext>) -> Result<[usize; 4]> {
 }
 
 impl Verification {
-    pub fn candidate(
-        ctx: &Arc<CudaContext>,
-        stream: &Arc<CudaStream>,
-        c: &Config,
-        capacity: usize,
-        rows: usize,
-        plan: AttentionPlan,
-    ) -> Result<Self> {
-        Self::with_plan(
-            ctx,
-            stream,
-            c,
-            MultiShape {
-                capacity,
-                rows,
-                causal: true,
-            },
-            MultiPlan {
-                implementation: MultiImpl::V1,
-                launch: plan,
-            },
-        )
-    }
-
     pub fn with_plan(
         ctx: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,

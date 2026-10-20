@@ -17,12 +17,9 @@ pub struct Request {
     pub images: Option<image::PreparedInput>,
 }
 
-pub enum EngineCommand {
-    Generate {
-        request: Request,
-        events: tokio_mpsc::Sender<EngineEvent>,
-    },
-    Abort,
+pub struct EngineCommand {
+    pub request: Request,
+    pub events: tokio_mpsc::Sender<EngineEvent>,
 }
 
 pub enum EngineEvent {
@@ -81,7 +78,7 @@ impl Admission<'_> {
     fn send(mut self, request: Request, events: tokio_mpsc::Sender<EngineEvent>) -> Result<()> {
         self.backend
             .commands
-            .send(EngineCommand::Generate { request, events })
+            .send(EngineCommand { request, events })
             .context("engine thread has exited")?;
         self.pending = false;
         Ok(())
@@ -119,12 +116,6 @@ impl Backend {
         events: tokio_mpsc::Sender<EngineEvent>,
     ) -> Result<()> {
         self.reserve()?.send(request, events)
-    }
-
-    pub fn abort(&self) -> Result<()> {
-        self.commands
-            .send(EngineCommand::Abort)
-            .context("engine thread has exited")
     }
 
     pub fn options(&self) -> SpecOptions {
@@ -244,31 +235,25 @@ fn engine_loop(
     slot: Arc<Mutex<Slot>>,
     mtp: bool,
 ) {
-    while let Ok(command) = commands.recv() {
-        match command {
-            EngineCommand::Generate { request, events } => {
-                generate_once(
-                    &mut model,
-                    &options,
-                    &model_spec,
-                    request,
-                    events,
-                    &commands,
-                    mtp,
-                );
-                let recovered = if mtp { model.reset_mtp() } else { Ok(()) };
-                let mut state = slot.lock().unwrap_or_else(|e| e.into_inner());
-                *state = if recovered.is_ok() {
-                    Slot::Idle
-                } else {
-                    Slot::Unavailable
-                };
-                if let Err(error) = recovered {
-                    eprintln!("serve recovery failed: {error:#}");
-                }
-            }
-            // A stale abort must not release a slot held by image preprocessing.
-            EngineCommand::Abort => {}
+    while let Ok(EngineCommand { request, events }) = commands.recv() {
+        let recovered = generate_once(
+            &mut model,
+            &options,
+            &model_spec,
+            request,
+            events,
+            &commands,
+            mtp,
+        )
+        .and_then(|()| if mtp { model.reset_mtp() } else { Ok(()) });
+        let mut state = slot.lock().unwrap_or_else(|e| e.into_inner());
+        *state = if recovered.is_ok() {
+            Slot::Idle
+        } else {
+            Slot::Unavailable
+        };
+        if let Err(error) = recovered {
+            eprintln!("serve recovery failed: {error:#}");
         }
     }
 }
@@ -281,7 +266,7 @@ fn generate_once(
     events: tokio_mpsc::Sender<EngineEvent>,
     commands: &mpsc::Receiver<EngineCommand>,
     mtp: bool,
-) {
+) -> Result<()> {
     let mtp = mtp && request.images.is_none();
     let route = if request.images.is_some() {
         "plain_image"
@@ -305,13 +290,13 @@ fn generate_once(
     };
     if let Err(error) = checked {
         let _ = events.blocking_send(EngineEvent::Failed(error.to_string()));
-        return;
+        return Ok(());
     }
     let input_dump = match trace_image_input(model_spec, &request) {
         Ok(path) => path,
         Err(error) => {
             let _ = events.blocking_send(EngineEvent::Failed(error.to_string()));
-            return;
+            return Ok(());
         }
     };
     let mut aborted = false;
@@ -320,21 +305,11 @@ fn generate_once(
             aborted = true;
             return false;
         }
-        match commands.try_recv() {
-            Ok(EngineCommand::Abort) => {
-                aborted = true;
-                false
-            }
-            Ok(EngineCommand::Generate { .. }) => {
-                aborted = true;
-                false
-            }
-            Err(mpsc::TryRecvError::Empty) => true,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                aborted = true;
-                false
-            }
+        if let Err(mpsc::TryRecvError::Empty) = commands.try_recv() {
+            return true;
         }
+        aborted = true;
+        false
     };
     let mut mtp_rounds = 0usize;
     let result = if mtp {
@@ -408,31 +383,29 @@ fn generate_once(
         Ok(output)
     });
     match result {
+        Ok(output) if aborted => {
+            let reset = if mtp { Ok(()) } else { model.reset() };
+            let _ = events.blocking_send(EngineEvent::Aborted { ids: output.ids });
+            reset
+        }
         Ok(output) => {
-            if aborted {
-                if !mtp {
-                    let _ = model.reset();
-                }
-                let _ = events.blocking_send(EngineEvent::Aborted { ids: output.ids });
-            } else {
-                let eos_hit = !run_options.ignore_eos
-                    && output
-                        .ids
-                        .last()
-                        .is_some_and(|token| model.config.eos_token_id.contains(token));
-                let length_reached = output.ids.len() >= run_options.count && !eos_hit;
-                let _ = events.blocking_send(EngineEvent::Done {
-                    ids: output.ids,
-                    rounds: if mtp { mtp_rounds } else { output.rounds.len() },
-                    length_reached,
-                });
-            }
+            let eos_hit = !run_options.ignore_eos
+                && output
+                    .ids
+                    .last()
+                    .is_some_and(|token| model.config.eos_token_id.contains(token));
+            let length_reached = output.ids.len() >= run_options.count && !eos_hit;
+            let _ = events.blocking_send(EngineEvent::Done {
+                ids: output.ids,
+                rounds: if mtp { mtp_rounds } else { output.rounds.len() },
+                length_reached,
+            });
+            Ok(())
         }
         Err(error) => {
-            if !mtp {
-                let _ = model.reset();
-            }
+            let reset = if mtp { Ok(()) } else { model.reset() };
             let _ = events.blocking_send(EngineEvent::Failed(error.to_string()));
+            reset
         }
     }
 }

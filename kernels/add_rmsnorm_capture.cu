@@ -1,4 +1,4 @@
-// BF16 residual capture with standard or zero-centered RMSNorm.
+// BF16 residual capture with standard RMSNorm (mode 0); hidden 2048 or 5120.
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include "q38_contract.cuh"
@@ -7,7 +7,7 @@ namespace add_norm_capture {
 
 using bf16 = __nv_bfloat16;
 
-constexpr int kHidden = 2048;      // hidden_size
+constexpr int kHidden = 2048;
 constexpr int kVec = 8;            // bf16 elements per 16 B access
 constexpr int kMaxPerThread = 8;   // elements cached per thread in registers
 

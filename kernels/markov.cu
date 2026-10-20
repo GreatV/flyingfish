@@ -73,18 +73,6 @@ __device__ __forceinline__ float markov_score(float dot, bf16 base, int rounding
       blockDim.x != MK2_NT || gridDim.x != (V + MK2_VT - 1) / MK2_VT) __trap();                \
 } while (0)
 
-// Test-only score dump: with -DMK2_DUMP_S and a non-null g_mk2_dump, every
-// computed s is also stored at [act*V + v]. Compiles to nothing otherwise.
-#ifdef MK2_DUMP_S
-__device__ float* g_mk2_dump;
-// The host installs g_mk2_dump by launching this kernel.
-extern "C" __global__ void mk2_set_dump(float* p) { g_mk2_dump = p; }
-#define MK2_DUMP_S_WRITE(act, v, s)                                          \
-  do { if (g_mk2_dump) g_mk2_dump[(size_t)(act) * V + (v)] = (s); } while (0)
-#else
-#define MK2_DUMP_S_WRITE(act, v, s) ((void)0)
-#endif
-
 namespace mk2p1 {
 
 __device__ __forceinline__ unsigned smem_u32(const void* p) {
@@ -292,22 +280,18 @@ __device__ __forceinline__ void markov2_p1_body64(
     if (act0 < P && vg < V) {
       const float sv = markov_score(acc[0], Brow0[vg], score_rounding);
       st.add<0>(sv, (unsigned)vg);
-      MK2_DUMP_S_WRITE(act0, vg, sv);
     }
     if (act1 < P && vg < V) {
       const float sv = markov_score(acc[1], Brow1[vg], score_rounding);
       st.add<1>(sv, (unsigned)vg);
-      MK2_DUMP_S_WRITE(act1, vg, sv);
     }
     if (act0 < P && vg + 8 < V) {
       const float sv = markov_score(acc[2], Brow0[vg + 8], score_rounding);
       st.add<0>(sv, (unsigned)(vg + 8));
-      MK2_DUMP_S_WRITE(act0, vg + 8, sv);
     }
     if (act1 < P && vg + 8 < V) {
       const float sv = markov_score(acc[3], Brow1[vg + 8], score_rounding);
       st.add<1>(sv, (unsigned)(vg + 8));
-      MK2_DUMP_S_WRITE(act1, vg + 8, sv);
     }
     if (c & 1) {                          // 32-v group complete
       st.merge_lanes_ml();
@@ -467,22 +451,18 @@ __device__ __forceinline__ void markov2_p1_small_body(
     if (act0 < P && vg < V) {
       const float sv = markov_score(acc[t][0], Brow0[vg], score_rounding);
       st.add<0>(sv, (unsigned)vg);
-      MK2_DUMP_S_WRITE(act0, vg, sv);
     }
     if (act1 < P && vg < V) {
       const float sv = markov_score(acc[t][1], Brow1[vg], score_rounding);
       st.add<1>(sv, (unsigned)vg);
-      MK2_DUMP_S_WRITE(act1, vg, sv);
     }
     if (act0 < P && vg + 8 < V) {
       const float sv = markov_score(acc[t][2], Brow0[vg + 8], score_rounding);
       st.add<0>(sv, (unsigned)(vg + 8));
-      MK2_DUMP_S_WRITE(act0, vg + 8, sv);
     }
     if (act1 < P && vg + 8 < V) {
       const float sv = markov_score(acc[t][3], Brow1[vg + 8], score_rounding);
       st.add<1>(sv, (unsigned)(vg + 8));
-      MK2_DUMP_S_WRITE(act1, vg + 8, sv);
     }
   }
 
@@ -598,22 +578,18 @@ __device__ __forceinline__ void markov2_p1_small_body_preF1(
     if (act0 < P && vg < V) {
       const float sv = markov_score(acc[0], Brow0[vg], score_rounding);
       st.add<0>(sv, (unsigned)vg);
-      MK2_DUMP_S_WRITE(act0, vg, sv);
     }
     if (act1 < P && vg < V) {
       const float sv = markov_score(acc[1], Brow1[vg], score_rounding);
       st.add<1>(sv, (unsigned)vg);
-      MK2_DUMP_S_WRITE(act1, vg, sv);
     }
     if (act0 < P && vg + 8 < V) {
       const float sv = markov_score(acc[2], Brow0[vg + 8], score_rounding);
       st.add<0>(sv, (unsigned)(vg + 8));
-      MK2_DUMP_S_WRITE(act0, vg + 8, sv);
     }
     if (act1 < P && vg + 8 < V) {
       const float sv = markov_score(acc[3], Brow1[vg + 8], score_rounding);
       st.add<1>(sv, (unsigned)(vg + 8));
-      MK2_DUMP_S_WRITE(act1, vg + 8, sv);
     }
   }
 
