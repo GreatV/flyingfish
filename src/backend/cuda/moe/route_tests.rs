@@ -140,7 +140,6 @@ fn invariant_route(device: &Device) -> Result<()> {
         .collect();
     let tie = router[3 * h..4 * h].to_vec();
     router[7 * h..8 * h].copy_from_slice(&tie);
-    let host_router = router.clone();
     let x = s.clone_htod(&values)?;
     let router = s.clone_htod(&router)?;
     let w = view(&router, s, 0, [e as u32, h as u32], [h as u64, 1])?;
@@ -232,12 +231,27 @@ fn invariant_route(device: &Device) -> Result<()> {
             );
         }
     }
+    let rx = crate::backend::cuda::calibrate::random(rows * h, 11);
+    let rw = crate::backend::cuda::calibrate::random(e * h, 12);
+    let (dx, dw) = (s.clone_htod(&rx)?, s.clone_htod(&rw)?);
+    ops.route(
+        s,
+        view(&dx, s, 0, [rows as u32, h as u32], [h as u64, 1])?,
+        view(&dw, s, 0, [e as u32, h as u32], [h as u64, 1])?,
+        &mut TensorMut(view(&ids, s, 0, [rows as u32, k as u32], [k as u64, 1])?),
+        &mut TensorMut(view(
+            &weights,
+            s,
+            0,
+            [rows as u32, k as u32],
+            [k as u64, 1],
+        )?),
+        &mut logits_view(rows as u32)?,
+    )?;
     let got_logits = s.clone_dtoh(&logits)?;
     let chain = |r: usize, j: usize, order: &mut dyn Iterator<Item = usize>| {
         bf16::from_f32(order.fold(0f32, |acc, i| {
-            values[r * h + i]
-                .to_f32()
-                .mul_add(host_router[j * h + i].to_f32(), acc)
+            rx[r * h + i].to_f32().mul_add(rw[j * h + i].to_f32(), acc)
         }))
     };
     let (mut logit_mismatches, mut reversed_differs) = (0usize, 0usize);
