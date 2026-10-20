@@ -76,16 +76,15 @@ impl Bounds {
             serde_json::from_slice(&std::fs::read(directory.join("fixtures_manifest.json"))?)?;
         let video = case.starts_with("video_");
         let controls = &manifest[if video { "video" } else { "image" }]["media_reach_controls"];
-        let (same_grid, cross_media) = if video {
-            (
-                "same_grid_1280x720_football_vs_boat_pan_logits_diff",
-                "football_16x_vs_sample_demo_1_16x_logits_diff",
-            )
+        let same_grid = if video {
+            "same_grid_1280x720_football_vs_boat_pan_logits_diff"
         } else {
-            (
-                "same_grid_400x267_hockey_vs_boat_logits_diff",
-                "hockey_16x_vs_boat_16x_logits_diff",
-            )
+            "same_grid_400x267_hockey_vs_boat_logits_diff"
+        };
+        let cross_media = match (format, video) {
+            (_, true) => "football_16x_vs_sample_demo_1_16x_logits_diff",
+            (crate::model_spec::ExpertFormat::Bf16, false) => "hockey_16x_vs_boat_16x_logits_diff",
+            (crate::model_spec::ExpertFormat::Fp8W8a16, false) => same_grid,
         };
         let media = media_boundary(&controls[same_grid])?;
         let cross_media = media_boundary(&controls[cross_media])?;
@@ -2588,6 +2587,15 @@ fn reference_floors_are_selected_per_input() -> Result<()> {
             );
             assert_eq!(bounds.decode, other);
         }
+        let manifest_path = directory.join("fixtures_manifest.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+        manifest["image"]["media_reach_controls"]
+            .as_object_mut()
+            .context("image media controls missing")?
+            .remove("hockey_16x_vs_boat_16x_logits_diff")
+            .context("two-image control missing")?;
+        std::fs::write(manifest_path, serde_json::to_vec(&manifest)?)?;
         let quant_cells = [3, 39]
             .into_iter()
             .flat_map(|layer| {
@@ -2656,6 +2664,7 @@ fn reference_floors_are_selected_per_input() -> Result<()> {
                 assert_eq!(bound.cross_media, [2.0, 0.25]);
             } else {
                 assert_eq!(bound.media, [0.5, 0.5]);
+                assert_eq!(bound.cross_media, bound.media);
             }
         }
         fp8["cases"]["text_32"]["components"]["teacher_forced_per_step"]["comparisons"]["same_input_cross_gpu"] =
