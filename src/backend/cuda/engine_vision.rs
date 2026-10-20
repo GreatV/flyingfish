@@ -269,6 +269,16 @@ pub(super) struct PositionInputs {
     pub patches: Tensor<bf16, 2>,
 }
 
+struct PatchPositionBindings<'a> {
+    patch: &'a BiasedWeight,
+    position: &'a CudaSlice<bf16>,
+    indices: &'a CudaSlice<i32>,
+    bilinear: Option<&'a BilinearTables>,
+    packed: &'a CudaSlice<bf16>,
+    patch_output: &'a CudaSlice<bf16>,
+    hidden: &'a CudaSlice<bf16>,
+}
+
 impl VisionIo {
     fn new(device: &Device, width: u32) -> Result<Self> {
         let splice = match width {
@@ -375,6 +385,59 @@ impl VisionIo {
                 .launch(grid(count.div_ceil(256).min(65535) as usize, 256))?;
         }
         Ok(())
+    }
+
+    fn project_position(
+        &self,
+        stream: &Arc<CudaStream>,
+        blas: &Blas,
+        bindings: PatchPositionBindings<'_>,
+    ) -> Result<()> {
+        let PatchPositionBindings {
+            patch,
+            position,
+            indices,
+            bilinear,
+            packed,
+            patch_output,
+            hidden,
+        } = bindings;
+        let width = patch.shape[0];
+        let rows = u32::try_from(packed.len() / patch.shape[1] as usize)?;
+        let output = dense(patch_output, stream, [rows, width])?;
+        patch.run(
+            stream,
+            blas,
+            dense(packed, stream, [rows, patch.shape[1]])?,
+            &mut TensorMut(output),
+        )?;
+        let mut hidden = TensorMut(dense(hidden, stream, [rows, width])?);
+        match bilinear {
+            Some(bilinear) => self.position_add(
+                stream,
+                PositionInputs {
+                    table: dense(position, stream, [2304, width])?,
+                    indices: dense(indices, stream, [4, rows])?,
+                    weights: dense(&bilinear.coefficients, stream, [4, rows])?,
+                    patches: output,
+                },
+                &mut hidden,
+                &mut TensorMut(dense(&bilinear.values, stream, [rows, width])?),
+                width,
+            ),
+            None => self.bucket_position_add(
+                stream,
+                dense(
+                    position,
+                    stream,
+                    [u32::try_from(position.len() / width as usize)?, width],
+                )?,
+                dense(indices, stream, [rows])?,
+                output,
+                &mut hidden,
+                width,
+            ),
+        }
     }
 
     fn splice(
@@ -2095,9 +2158,7 @@ impl VisionRuntime {
     ) -> Result<()> {
         let rows = u32::try_from(request.positions.patch_rows())?;
         let geometry = self.geometry;
-        let hidden = geometry.hidden();
         let packed = dense(&request.packed, stream, [rows, geometry.patch])?;
-        let patch_output = dense(&request.patch_output, stream, [rows, hidden])?;
         let launched = (|| -> Result<()> {
             match self.model.architecture {
                 Architecture::Qwen35Text => {
@@ -2127,39 +2188,19 @@ impl VisionRuntime {
                     bail!("vision configuration requires a multimodal architecture")
                 }
             }
-            self.weights
-                .patch
-                .run(stream, blas, packed, &mut TensorMut(patch_output))?;
-            match &request.bilinear {
-                Some(bilinear) => self.io.position_add(
-                    stream,
-                    PositionInputs {
-                        table: dense(&self.weights.position, stream, [2304, hidden])?,
-                        indices: dense(&request.indices, stream, [4, rows])?,
-                        weights: dense(&bilinear.coefficients, stream, [4, rows])?,
-                        patches: patch_output,
-                    },
-                    &mut TensorMut(dense(&request.hidden, stream, [rows, hidden])?),
-                    &mut TensorMut(dense(&bilinear.values, stream, [rows, hidden])?),
-                    hidden,
-                )?,
-                None => {
-                    let vision = self
-                        .model
-                        .vision
-                        .as_ref()
-                        .context("vision configuration missing")?;
-                    let side = vision.position_side;
-                    self.io.bucket_position_add(
-                        stream,
-                        dense(&self.weights.position, stream, [side * side, hidden])?,
-                        dense(&request.indices, stream, [rows])?,
-                        patch_output,
-                        &mut TensorMut(dense(&request.hidden, stream, [rows, hidden])?),
-                        hidden,
-                    )?;
-                }
-            }
+            self.io.project_position(
+                stream,
+                blas,
+                PatchPositionBindings {
+                    patch: &self.weights.patch,
+                    position: &self.weights.position,
+                    indices: &request.indices,
+                    bilinear: request.bilinear.as_ref(),
+                    packed: &request.packed,
+                    patch_output: &request.patch_output,
+                    hidden: &request.hidden,
+                },
+            )?;
             Ok(())
         })();
         let synchronized = stream.synchronize();
@@ -3592,6 +3633,12 @@ mod tests {
             [vision.hidden, geometry.patch],
             &stored_shape,
         )?;
+        let position = take(
+            &mut catalog,
+            "model.visual.pos_embed.weight",
+            &[2304, vision.hidden as usize],
+        )?;
+        let io = VisionIo::new(&device, geometry.output())?;
         drop(catalog);
         for rows in [1u32, 37, 1120, 7104] {
             patch.prepare(stream, &mut blas, rows)?;
@@ -3599,22 +3646,51 @@ mod tests {
         closure.freeze_fixed()?;
         closure.ready(Instant::now())?;
         device.finish_upload()?;
-        for rows in [1u32, 37, 1120, 7104] {
+        for (rows, h, w) in [(1u32, 2, 2), (37, 2, 20), (1120, 28, 40), (7104, 96, 74)] {
             let input: Vec<_> = (0..rows as usize * geometry.patch as usize)
                 .map(|index| bf16::from_f32(((index * 17 % 251) as f32 - 125.0) / 128.0))
                 .collect();
             let input = stream.clone_htod(&input)?;
             let output = stream.alloc_zeros::<bf16>(rows as usize * vision.hidden as usize)?;
+            let tables = VisionPositions::new(
+                vision,
+                model.architecture,
+                &[ImageGrid { t: 1, h, w }],
+                (h * w) as usize,
+            )?;
+            let indices: Vec<_> = tables
+                .bilinear_indices
+                .iter()
+                .flat_map(|corner| corner[..rows as usize].iter().copied())
+                .collect();
+            let coefficients: Vec<_> = tables
+                .bilinear_weights
+                .iter()
+                .flat_map(|corner| corner[..rows as usize].iter().copied())
+                .collect();
+            let indices = stream.clone_htod(&indices)?;
+            let bilinear = BilinearTables {
+                coefficients: stream.clone_htod(&coefficients)?,
+                values: stream.alloc_zeros(rows as usize * vision.hidden as usize)?,
+            };
+            let hidden = stream.alloc_zeros::<bf16>(rows as usize * vision.hidden as usize)?;
             let execute = || {
-                patch.run(
+                io.project_position(
                     stream,
                     &blas,
-                    dense(&input, stream, [rows, geometry.patch])?,
-                    &mut TensorMut(dense(&output, stream, [rows, vision.hidden])?),
+                    PatchPositionBindings {
+                        patch: &patch,
+                        position: &position,
+                        indices: &indices,
+                        bilinear: Some(&bilinear),
+                        packed: &input,
+                        patch_output: &output,
+                        hidden: &hidden,
+                    },
                 )
             };
             execute()?;
-            let reference = stream.clone_dtoh(&output)?;
+            let reference = stream.clone_dtoh(&hidden)?;
             ensure!(
                 reference.iter().all(|value| value.is_finite()),
                 "nonfinite native patch output"
@@ -3646,7 +3722,7 @@ mod tests {
                 )?;
                 ensure!(
                     stream
-                        .clone_dtoh(&output)?
+                        .clone_dtoh(&hidden)?
                         .iter()
                         .zip(&reference)
                         .all(|(actual, expected)| actual.to_bits() == expected.to_bits()),
@@ -3654,7 +3730,7 @@ mod tests {
                 );
                 println!(
                     "T20_OP_SAMPLE {}",
-                    serde_json::json!({"operation":"patch","mode":"biased_projection",
+                    serde_json::json!({"operation":"patch","mode":"projection_bias_position",
                         "rows":rows,"valid":rows,"graph":graph,"warm":16,"calls":32,
                         "mean_ms":mean_ms,"native_weights":true,"bias_mode":format!("{:?}",patch.bias_mode)})
                 );
