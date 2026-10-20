@@ -1612,12 +1612,21 @@ fn direct(engine: &Engine, layer: usize, input: &[bf16], rows: usize) -> Result<
     let xv = qwen::matrix(&x, stream, 0, rows, h)?;
     let idv = view(&ids, stream, 0, [rows as u32, k as u32], [k as u64, 1])?;
     let weightv = qwen::matrix(&weights, stream, 0, rows, k)?;
+    let experts = router.shape[0];
+    let logits = stream.alloc_zeros::<bf16>(rows * experts as usize)?;
     RouteOps::new(ctx, stream)?.route(
         stream,
         xv,
         router,
         &mut TensorMut(idv),
         &mut TensorMut(weightv),
+        &mut TensorMut(view(
+            &logits,
+            stream,
+            0,
+            [rows as u32, experts],
+            [u64::from(experts), 1],
+        )?),
     )?;
     let routed = stream.clone_dtoh(&ids)?;
     let published = &engine

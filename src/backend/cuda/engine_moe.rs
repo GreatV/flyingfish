@@ -488,6 +488,7 @@ pub(super) struct Decode {
     combine: CombineOps,
     ids: CudaSlice<i32>,
     weights: CudaSlice<bf16>,
+    route_logits: CudaSlice<bf16>,
     active: CudaSlice<u32>,
     final_active: CudaSlice<u32>,
     generation: CudaSlice<u64>,
@@ -563,6 +564,7 @@ impl Decode {
             combine: CombineOps::new(context)?,
             ids: stream.alloc_zeros(choices)?,
             weights: stream.alloc_zeros(choices)?,
+            route_logits: stream.alloc_zeros(max_rows * geometry.experts as usize)?,
             active: stream.alloc_zeros(choices)?,
             final_active: stream.clone_htod(&vec![1u32; choices])?,
             generation: stream.alloc_zeros(choices)?,
@@ -662,6 +664,13 @@ impl Decode {
                 0,
                 [rows as u32, k],
                 [u64::from(k), 1],
+            )?),
+            &mut TensorMut(view(
+                &self.route_logits,
+                stream,
+                0,
+                [rows as u32, self.geometry.experts],
+                [u64::from(self.geometry.experts), 1],
             )?),
         )
     }

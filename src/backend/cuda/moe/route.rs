@@ -1,18 +1,23 @@
 //! MoE router op: x·Wᵀ logits, FP32 softmax over BF16 logits, top-k ids and
-//! renormalised BF16 weights (kernels/moe_route.cu). `route` fuses the
-//! per-row GEMV (decode row counts); `route_prefill` computes all logits with
-//! one cuBLAS BF16 GEMM (FP32 accumulation) and applies `moe_route_topk`.
+//! renormalised BF16 weights (kernels/moe_route.cu). `route` computes the
+//! logits with `moe_route_logits_bf16` (one FP32 chain per expert, decode row
+//! counts); `route_prefill` computes them with one cuBLAS BF16 GEMM (FP32
+//! accumulation). Both apply `moe_route_topk` to the dense logits buffer.
 use crate::backend::cuda::contracts::{Tensor, TensorMut};
 use crate::backend::cuda::cubin;
 use crate::backend::cuda::ops::grid;
 use anyhow::{Result, ensure};
 use cudarc::cublas::{CudaBlas, sys as bs};
-use cudarc::driver::{CudaContext, CudaFunction, CudaStream, PushKernelArg};
+use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use half::bf16;
 use std::sync::Arc;
 
+/// Experts per `moe_route_logits_bf16` block and its block size.
+const LOGITS_EXPERTS: u32 = 32;
+const LOGITS_THREADS: u32 = 128;
+
 pub(crate) struct RouteOps {
-    route: CudaFunction,
+    logits: CudaFunction,
     topk: CudaFunction,
     blas: CudaBlas,
     stream: Arc<CudaStream>,
@@ -27,13 +32,15 @@ impl RouteOps {
                 .result()?;
         }
         Ok(Self {
-            route: module.load_function("moe_route_bf16")?,
+            logits: module.load_function("moe_route_logits_bf16")?,
             topk: module.load_function("moe_route_topk")?,
             blas,
             stream: stream.clone(),
         })
     }
 
+    /// Decode routing: `moe_route_logits_bf16` into `logits` ([rows, experts]
+    /// dense), then `moe_route_topk`.
     pub fn route(
         &self,
         stream: &Arc<CudaStream>,
@@ -41,26 +48,30 @@ impl RouteOps {
         router: Tensor<bf16, 2>,
         ids: &mut TensorMut<i32, 2>,
         weights: &mut TensorMut<bf16, 2>,
+        logits: &mut TensorMut<bf16, 2>,
     ) -> Result<()> {
         ensure!(
             Arc::ptr_eq(stream, &self.stream),
             "MoE route stream differs from its construction stream"
         );
         let plan = validate(&x, &router, &ids.0, &weights.0)?;
+        check_logits(&plan, &x, &router, &ids.0, &weights.0, &logits.0)?;
         unsafe {
             stream
-                .launch_builder(&self.route)
+                .launch_builder(&self.logits)
                 .arg(&x.ptr)
                 .arg(&router.ptr)
-                .arg(&ids.0.ptr)
-                .arg(&weights.0.ptr)
+                .arg(&logits.0.ptr)
                 .arg(&plan.rows)
                 .arg(&plan.experts)
-                .arg(&plan.top_k)
                 .arg(&plan.hidden)
-                .launch(grid(plan.rows as usize, plan.experts.div_ceil(32) * 32))?;
+                .launch(LaunchConfig {
+                    grid_dim: (plan.experts.div_ceil(LOGITS_EXPERTS), plan.rows, 1),
+                    block_dim: (LOGITS_THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
         }
-        Ok(())
+        self.topk(stream, &plan, logits, ids, weights)
     }
 
     /// Prefill routing: logits = x·routerᵀ via one cuBLAS GEMM, then
@@ -80,14 +91,8 @@ impl RouteOps {
             "moe route prefill stream is not the RouteOps construction stream (cuBLAS handle bound at construction)"
         );
         let plan = validate(&x, &router, &ids.0, &weights.0)?;
-        logits.0.validate()?;
+        check_logits(&plan, &x, &router, &ids.0, &weights.0, &logits.0)?;
         let (rows, experts) = (plan.rows, plan.experts);
-        ensure!(
-            logits.0.shape == [rows, experts] && logits.0.stride == [u64::from(experts), 1],
-            "route prefill logits must be a dense [rows, experts] view: shape {:?}, stride {:?}, expected [{rows}, {experts}] with stride [{experts}, 1]",
-            logits.0.shape,
-            logits.0.stride
-        );
         ensure!(
             experts.is_multiple_of(2),
             "route prefill expert count {experts} must be even (cuBLAS BF16 ldc*2 must be a multiple of 4 bytes)"
@@ -97,10 +102,6 @@ impl RouteOps {
             "route prefill GEMM dimensions must fit i32: rows {rows}, experts {experts}, hidden {}",
             plan.hidden
         );
-        no_overlap(&x, &logits.0, "x", "logits")?;
-        no_overlap(&router, &logits.0, "router", "logits")?;
-        no_overlap(&ids.0, &logits.0, "ids", "logits")?;
-        no_overlap(&weights.0, &logits.0, "weights", "logits")?;
 
         // opA=T/opB=N: router[H,E] * x[H,rows] -> logits[E,rows], column-major.
         // CUBLAS_COMPUTE_32F/CUBLAS_GEMM_DEFAULT; lda=ldb=H, ldc=E.
@@ -130,19 +131,52 @@ impl RouteOps {
             )
             .result()?;
         }
+        self.topk(stream, &plan, logits, ids, weights)
+    }
+
+    fn topk(
+        &self,
+        stream: &Arc<CudaStream>,
+        plan: &RoutePlan,
+        logits: &TensorMut<bf16, 2>,
+        ids: &mut TensorMut<i32, 2>,
+        weights: &mut TensorMut<bf16, 2>,
+    ) -> Result<()> {
         unsafe {
             stream
                 .launch_builder(&self.topk)
                 .arg(&logits.0.ptr)
                 .arg(&ids.0.ptr)
                 .arg(&weights.0.ptr)
-                .arg(&rows)
-                .arg(&experts)
+                .arg(&plan.rows)
+                .arg(&plan.experts)
                 .arg(&plan.top_k)
-                .launch(grid(rows as usize, experts.div_ceil(32) * 32))?;
+                .launch(grid(plan.rows as usize, plan.experts.div_ceil(32) * 32))?;
         }
         Ok(())
     }
+}
+
+fn check_logits(
+    plan: &RoutePlan,
+    x: &Tensor<bf16, 2>,
+    router: &Tensor<bf16, 2>,
+    ids: &Tensor<i32, 2>,
+    weights: &Tensor<bf16, 2>,
+    logits: &Tensor<bf16, 2>,
+) -> Result<()> {
+    logits.validate()?;
+    let (rows, experts) = (plan.rows, plan.experts);
+    ensure!(
+        logits.shape == [rows, experts] && logits.stride == [u64::from(experts), 1],
+        "route logits must be a dense [rows, experts] view: shape {:?}, stride {:?}, expected [{rows}, {experts}] with stride [{experts}, 1]",
+        logits.shape,
+        logits.stride
+    );
+    no_overlap(x, logits, "x", "logits")?;
+    no_overlap(router, logits, "router", "logits")?;
+    no_overlap(ids, logits, "ids", "logits")?;
+    no_overlap(weights, logits, "weights", "logits")
 }
 
 fn no_overlap<T: Copy, U: Copy, const R: usize, const S: usize>(
@@ -153,7 +187,7 @@ fn no_overlap<T: Copy, U: Copy, const R: usize, const S: usize>(
 ) -> Result<()> {
     ensure!(
         a.ptr + a.span_bytes <= b.ptr || b.ptr + b.span_bytes <= a.ptr,
-        "route prefill tensors overlap: {aname} vs {bname} (0x{:x}+0x{:x}, 0x{:x}+0x{:x})",
+        "route tensors overlap: {aname} vs {bname} (0x{:x}+0x{:x}, 0x{:x}+0x{:x})",
         a.ptr,
         a.span_bytes,
         b.ptr,
