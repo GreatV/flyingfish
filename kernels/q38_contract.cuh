@@ -3,10 +3,14 @@
 #include <cuda_bf16.h>
 #include <math.h>
 #include <stdint.h>
-struct alignas(16) Q38SequenceMeta {
+struct Q38SequenceFields {
     int32_t prefix, valid_rows, key_count, capacity, causal, reserved[3];
 };
+struct alignas(16) Q38SequenceMeta : Q38SequenceFields {};
 static_assert(sizeof(Q38SequenceMeta)==32,"Q38 ABI sequence size");
+__device__ __forceinline__ bool aligned16(const void* p) {
+    return p && (reinterpret_cast<uintptr_t>(p) & 15) == 0;
+}
 __device__ __forceinline__ float bround(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
 __device__ __forceinline__ float sigmoid(float x) {
     if (x>=0.0f) return 1.0f/(1.0f+expf(-x));

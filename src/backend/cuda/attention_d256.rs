@@ -753,6 +753,7 @@ impl FullAttentionPlan {
 mod tests {
     //! GPU probe of `workspace` -> `prepare` -> `run` through the real launch path, including the common `NormOps`.
     use super::*;
+    use crate::backend::cuda::moe::testing::view;
     use crate::backend::cuda::{Device, bf16_chain_bound};
     use crate::op_contract::SequenceMeta;
     use cudarc::driver::{CudaSlice, DevicePtr};
@@ -834,16 +835,6 @@ mod tests {
         fn bf(&mut self) -> bf16 {
             bf16::from_f32(self.next() * 1.5)
         }
-    }
-
-    fn view<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
-        buffer: &CudaSlice<T>,
-        stream: &Arc<CudaStream>,
-        shape: [u32; R],
-        stride: [u64; R],
-    ) -> Result<Tensor<T, R>> {
-        let (ptr, _hold) = buffer.device_ptr(stream);
-        unsafe { Tensor::new(ptr, shape, stride, (buffer.len() * size_of::<T>()) as u64) }
     }
 
     fn meta_device(

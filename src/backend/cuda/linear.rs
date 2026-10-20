@@ -790,7 +790,7 @@ mod tests {
     #[test]
     #[ignore = "GPU window, official FP8 model, T13 and projection reference required"]
     fn channel_projection_gpu() -> Result<()> {
-        use super::super::q38_tests::view;
+        use super::super::moe::testing::view;
         use crate::fp8::{effective_weight, linear_reference};
         use cudarc::driver::sys;
         ensure!(
@@ -1073,7 +1073,7 @@ mod tests {
     #[test]
     #[ignore = "GPU window and FF_MINICPM_REFERENCE_DIR required"]
     fn token_quantization_gpu() -> Result<()> {
-        use super::super::q38_tests::view;
+        use super::super::moe::testing::view;
         use crate::fp8::fake_quant_reference;
         use cudarc::driver::sys;
         ensure!(
@@ -1222,7 +1222,7 @@ mod tests {
     #[test]
     #[ignore = "GPU window required"]
     fn token_quantization_live_rows_gpu() -> Result<()> {
-        use super::super::{contracts::SeqRef, q38_tests::view};
+        use super::super::{contracts::SeqRef, moe::testing::view};
         use crate::fp8::fake_quant_reference;
         use cudarc::driver::{DevicePtr, sys};
         ensure!(

@@ -8,9 +8,6 @@
 #include <stdint.h>
 #include "q38_contract.cuh"
 
-__device__ __forceinline__ bool aligned16(const void* p) {
-    return p && (reinterpret_cast<uintptr_t>(p) & 15) == 0;
-}
 template <bool PER_CHANNEL>
 __device__ __forceinline__ __nv_bfloat16 weight_at(
         const uint8_t* w, const __nv_bfloat16* scales, uint64_t n,

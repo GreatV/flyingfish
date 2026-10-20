@@ -361,6 +361,15 @@ pub(super) fn uniform_attention_error(
         .fold((0f64, 0f64), |(a, r), (e, q)| (a.max(e), r.max(q)))
 }
 
+pub(super) fn random(n: usize, mut state: u32) -> Vec<bf16> {
+    (0..n)
+        .map(|_| {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            bf16::from_f32((state >> 8) as f32 / 16777216.0 - 0.5)
+        })
+        .collect()
+}
+
 fn measure(
     d: &Device,
     ops: &Ops,
@@ -374,14 +383,6 @@ fn measure(
     let s = &d.stream;
     let trial_ms = 30;
     let mut q = s.alloc_zeros::<bf16>(c.qkv_dim())?;
-    let random = |count: usize, mut seed: u32| {
-        (0..count)
-            .map(|_| {
-                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-                bf16::from_f32((seed >> 8) as f32 / 16777216.0 - 0.5)
-            })
-            .collect::<Vec<_>>()
-    };
     let zero_q = vec![bf16::ZERO; c.qkv_dim()];
     let queries = random(c.qkv_dim(), 4);
     let k = s.clone_htod(&random(CAPACITIES[selected] * c.kv_dim(), 1))?;

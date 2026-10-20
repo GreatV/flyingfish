@@ -4640,13 +4640,7 @@ impl Engine {
         if write {
             let c = &self.config;
             for &shape in &profile.linear {
-                let mut state = 1u32;
-                let values: Vec<_> = (0..shape.rows * shape.input)
-                    .map(|_| {
-                        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-                        bf16::from_f32((state >> 8) as f32 / 16777216.0 - 0.5)
-                    })
-                    .collect();
+                let values = super::calibrate::random(shape.rows * shape.input, 1);
                 let input = self.device.stream.clone_htod(&values)?;
                 let layer = &self.weights.layers[0];
                 let weight = if shape.output == c.vocab_size && shape.input == c.hidden_size {
