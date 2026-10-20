@@ -18,6 +18,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
+#include "../q38_contract.cuh"
 
 #ifndef GDN_CHUNK
 #define GDN_CHUNK 32
@@ -30,14 +31,6 @@
 #define GDN_DK    128
 #define GDN_DV    128
 
-struct GdnMeta {
-    int prefix, valid_rows, key_count, capacity, causal, r20, r24, r28;
-};
-
-__device__ __forceinline__ bool aligned16(const void* p) {
-    return p && (reinterpret_cast<uintptr_t>(p) & 15) == 0;
-}
-
 template <int VSPLIT, bool SNAPSHOT = false>
 __device__
 void gdn_chunked_core_t(
@@ -48,7 +41,7 @@ void gdn_chunked_core_t(
         const float* __restrict__ g,      // FP32 [M, HEADS]
         float* __restrict__ S,            // FP32 [HEADS, DK, DV]
         __nv_bfloat16* __restrict__ out,  // BF16 [M, HEADS, DV]
-        const GdnMeta* __restrict__ meta,
+        const Q38SequenceFields* __restrict__ meta,
         int valid_rows_in, float* snapshots) {
     constexpr int VW = GDN_DV / VSPLIT;
     const int head = blockIdx.y;
@@ -300,14 +293,14 @@ void gdn_chunked_core_t(
 extern "C" __global__ __launch_bounds__(GDN_THREADS, 1)
 void gdn_chunked_core_v1(const float* q, const float* k, const float* v,
                         const float* beta, const float* g, float* S,
-                        __nv_bfloat16* out, const GdnMeta* meta, int valid_rows) {
+                        __nv_bfloat16* out, const Q38SequenceFields* meta, int valid_rows) {
     gdn_chunked_core_t<1>(q, k, v, beta, g, S, out, meta, valid_rows, nullptr);
 }
 
 extern "C" __global__ __launch_bounds__(GDN_THREADS, 1)
 void gdn_chunked_core_snapshot(const float* q, const float* k, const float* v,
                               const float* beta, const float* g, float* S,
-                              __nv_bfloat16* out, const GdnMeta* meta, int valid_rows,
+                              __nv_bfloat16* out, const Q38SequenceFields* meta, int valid_rows,
                               float* snapshots) {
     gdn_chunked_core_t<1, true>(q, k, v, beta, g, S, out, meta, valid_rows, snapshots);
 }

@@ -705,9 +705,10 @@ mod probe {
     //! GPU probe of `workspace` -> `prepare` -> `run` for the attention stage and the merger, with negative controls.
     use super::*;
     use crate::backend::cuda::closure::Closure;
+    use crate::backend::cuda::moe::testing::view;
     use crate::backend::cuda::ops::Ops;
     use crate::backend::cuda::{Device, bf16_chain_bound};
-    use cudarc::driver::{CudaSlice, DevicePtr};
+    use cudarc::driver::DevicePtr;
     use std::rc::Rc;
 
     /// From `kernels/vision_rope.cu` / `kernels/vision_attn.cu` (private there).
@@ -721,23 +722,6 @@ mod probe {
             self.0 ^= self.0 >> 7;
             self.0 ^= self.0 << 17;
             ((self.0 >> 11) as f64 / 9007199254740992.0 * 2.0 - 1.0) as f32
-        }
-    }
-
-    fn view<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
-        buffer: &CudaSlice<T>,
-        stream: &Arc<CudaStream>,
-        shape: [u32; R],
-        stride: [u64; R],
-    ) -> Result<Tensor<T, R>> {
-        let (ptr, _hold) = buffer.device_ptr(stream);
-        unsafe {
-            Tensor::new(
-                ptr,
-                shape,
-                stride,
-                (buffer.len() * std::mem::size_of::<T>()) as u64,
-            )
         }
     }
 

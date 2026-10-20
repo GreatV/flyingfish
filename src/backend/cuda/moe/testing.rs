@@ -1,4 +1,4 @@
-//! Shared helpers for the MoE GPU-gate tests.
+//! Shared helpers for the GPU-gate tests.
 use crate::backend::cuda::contracts::{Tensor, TensorMut};
 use anyhow::Result;
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DeviceRepr, ValidAsZeroBits};

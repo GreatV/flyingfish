@@ -24,6 +24,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
+#include "../q38_contract.cuh"
 
 #include "gdn_cw_p1_layout.h"
 #include "gdn_cw_p2_layout.h"
@@ -79,36 +80,7 @@ static_assert(GDN_CW_P2_SLOT_BYTES == 16384 + 32768 + 9216 + 3 * 256,
 #define P2_VW        32
 #define P2_VT        8
 
-struct GdnMeta {
-    int prefix, valid_rows, key_count, capacity, causal, r20, r24, r28;
-};
-
-struct AFrag { uint32_t r[4]; };
-struct BFrag { uint32_t r[2]; };
-
-// C and D alias: the accumulator is both the mma input and its output.
-#define P2_MMA(d, a, b)                                                        \
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "        \
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"     \
-                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])              \
-                 : "r"(a.r[0]), "r"(a.r[1]), "r"(a.r[2]), "r"(a.r[3]),         \
-                   "r"(b.r[0]), "r"(b.r[1]))
-
-// Fragment geometry (PTX ISA 9.7.16.5.8, mma.m16n8k16), groupID = laneid >> 2, tig = laneid & 3: A row groupID (a0,a1) / groupID+8 (a2,a3) at column 2*tig+(i&1), +8 for a2,a3; B column groupID, row 2*tig+(i&1) for b0 and +8 for b1; C/D row groupID (c0,c1) / groupID+8 (c2,c3) at column 2*tig+(i&1); register i holds element 2i in its LOW half.
-#define P2_GID(l) ((l) >> 2)
-#define P2_T2(l)  (((l) & 3) << 1)
-
-template<bool Residual = false>
-__device__ __forceinline__ uint32_t p1_pack(float lo, float hi) {
-    if constexpr (Residual) {
-        lo = __fsub_rn(lo, __bfloat162float(__float2bfloat16_rn(lo)));
-        hi = __fsub_rn(hi, __bfloat162float(__float2bfloat16_rn(hi)));
-    }
-    return (uint32_t)__bfloat16_as_ushort(__float2bfloat16_rn(lo))
-         | ((uint32_t)__bfloat16_as_ushort(__float2bfloat16_rn(hi)) << 16);
-}
-
-
+#include "gdn_cw_frag.cuh"
 
 // A from Q/K source rows, one scale per row (beta, and the q liveness mask): register 1 is the
 // +8 row at the low columns and register 2 the base row at the +8 columns. `qscale` is
@@ -129,30 +101,6 @@ __device__ __forceinline__ AFrag p1_a_rows(const T* lo, const T* hi,
     return f;
 }
 
-// One element of (k . e^{G_last-G}) at chunk row ci and d_k column dk; the state update's A operand is the TRANSPOSE, so a register pair's two elements sit in DIFFERENT chunk rows at the SAME d_k column.
-__device__ __forceinline__ float p1_kdec(const float* kh, size_t ld, int row0,
-                                          int valid, int ci, int dk, const float* sG, float gl) {
-    const int gr = row0 + ci;
-    if (gr >= valid) return 0.0f;
-    return kh[(size_t)gr * ld + dk] * __expf(gl - sG[ci]);
-}
-
-template<bool Residual = false>
-__device__ __forceinline__ AFrag p1_a_kdec(const float* kh, size_t ld, int row0,
-                                           int valid, const float* sG, float gl, int dk, int t2) {
-    const int c0 = t2;
-    AFrag f;
-    f.r[0] = p1_pack<Residual>(p1_kdec(kh, ld, row0, valid, c0, dk, sG, gl),
-                     p1_kdec(kh, ld, row0, valid, c0 + 1, dk, sG, gl));
-    f.r[1] = p1_pack<Residual>(p1_kdec(kh, ld, row0, valid, c0, dk + 8, sG, gl),
-                     p1_kdec(kh, ld, row0, valid, c0 + 1, dk + 8, sG, gl));
-    f.r[2] = p1_pack<Residual>(p1_kdec(kh, ld, row0, valid, c0 + 8, dk, sG, gl),
-                     p1_kdec(kh, ld, row0, valid, c0 + 9, dk, sG, gl));
-    f.r[3] = p1_pack<Residual>(p1_kdec(kh, ld, row0, valid, c0 + 8, dk + 8, sG, gl),
-                     p1_kdec(kh, ld, row0, valid, c0 + 9, dk + 8, sG, gl));
-    return f;
-}
-
 // B from a row-major Q/K source: fragment row n, columns 2tig + {0,1} and +8.
 template<typename T>
 __device__ __forceinline__ BFrag p1_b_rows(const T* p, int ld, int n, int col0,
@@ -164,84 +112,6 @@ __device__ __forceinline__ BFrag p1_b_rows(const T* p, int ld, int n, int col0,
                      (float)r[col0 + t2 + 9] * s9);
     return f;
 }
-
-// A from a BF16 buffer (T, encoded qk, materialized W), shared or global; same register
-// order as p1_a_rows.
-__device__ __forceinline__ AFrag p1_a_sbf(const __nv_bfloat16* base, int ld, int row0,
-                                          int col0, int gid, int t2) {
-    const uint32_t* lo = reinterpret_cast<const uint32_t*>(base + (size_t)(row0 + gid) * ld);
-    const uint32_t* hi = reinterpret_cast<const uint32_t*>(base + (size_t)(row0 + gid + 8) * ld);
-    AFrag f;
-    f.r[0] = lo[(col0 + t2) >> 1];
-    f.r[1] = hi[(col0 + t2) >> 1];
-    f.r[2] = lo[(col0 + t2 + 8) >> 1];
-    f.r[3] = hi[(col0 + t2 + 8) >> 1];
-    return f;
-}
-
-// B from a BF16 row-major buffer (beta.V, the encoded v_new, the S copy).
-__device__ __forceinline__ BFrag p1_b_sbf(const __nv_bfloat16* base, int ld, int n,
-                                          int col0, int t2) {
-    const uint32_t* r = reinterpret_cast<const uint32_t*>(base + (size_t)n * ld);
-    BFrag f;
-    f.r[0] = r[(col0 + t2) >> 1];
-    f.r[1] = r[(col0 + t2 + 8) >> 1];
-    return f;
-}
-
-// A from an FP32 shared buffer, rounded to BF16 (A[b,a] of the inverse merge).
-__device__ __forceinline__ AFrag p1_a_sf32(const float* base, int ld, int row0, int col0,
-                                           int gid, int t2) {
-    const float* lo = base + (size_t)(row0 + gid) * ld;
-    const float* hi = base + (size_t)(row0 + gid + 8) * ld;
-    AFrag f;
-    f.r[0] = p1_pack(lo[col0 + t2], lo[col0 + t2 + 1]);
-    f.r[1] = p1_pack(hi[col0 + t2], hi[col0 + t2 + 1]);
-    f.r[2] = p1_pack(lo[col0 + t2 + 8], lo[col0 + t2 + 9]);
-    f.r[3] = p1_pack(hi[col0 + t2 + 8], hi[col0 + t2 + 9]);
-    return f;
-}
-
-// B from an FP32 shared buffer, rounded to BF16 (A[b,a] as the merge's non-T side).
-__device__ __forceinline__ BFrag p1_b_sf32(const float* base, int ld, int n, int col0, int t2) {
-    const float* r = base + (size_t)n * ld;
-    BFrag f;
-    f.r[0] = p1_pack(r[col0 + t2], r[col0 + t2 + 1]);
-    f.r[1] = p1_pack(r[col0 + t2 + 8], r[col0 + t2 + 9]);
-    return f;
-}
-
-// One element of (beta . K . e^G) at chunk row ci, d_k column dk; the only GEMM whose
-// B fragment reads the input TRANSPOSED (fragment row = d_k index, column = chunk row).
-__device__ __forceinline__ float p1_kbg(const float* kh, size_t ld, int row0, int valid,
-                                        int ci, int dk, const float* sSc) {
-    const int gr = row0 + ci;
-    const float* p = kh + (size_t)(gr < valid ? gr : row0) * ld + dk;
-    return p[0] * sSc[ci];
-}
-
-// D fragment -> FP32 shared, at (row0 + gid, col0 + 2*tig) and the +8 row.
-__device__ __forceinline__ void p1_store_f32(float* base, int ld, int row0, int col0,
-                                             int gid, int t2, const float* d) {
-    float* a = base + (size_t)(row0 + gid) * ld + col0 + t2;
-    a[0] = d[0];
-    a[1] = d[1];
-    float* b = a + 8 * ld;
-    b[0] = d[2];
-    b[1] = d[3];
-}
-
-// D fragment -> BF16 shared.
-__device__ __forceinline__ void p1_store_bf16(__nv_bfloat16* base, int ld, int row0, int col0,
-                                              int gid, int t2, const float* d) {
-    __nv_bfloat16* a = base + (size_t)(row0 + gid) * ld + col0 + t2;
-    a[0] = __float2bfloat16_rn(d[0]);
-    a[1] = __float2bfloat16_rn(d[1]);
-    __nv_bfloat16* b = a + 8 * ld;
-    b[0] = __float2bfloat16_rn(d[2]);
-    b[1] = __float2bfloat16_rn(d[3]);
-}
-
 
 // The arena is sA | sT | sV | sVn | sG | sBeta | sSc; sV is [output column] x
 // [reduction] (P2_VL, p1_b_sbf).
@@ -276,7 +146,7 @@ __device__ __forceinline__ char* p2_slot(char* ws, int chunk, int head) {
 
 // valid_rows_in == 0 selects meta->valid_rows; key_count == prefix + valid_rows bounds
 // the rows a kernel may read.
-__device__ __forceinline__ int p2_valid_rows(const GdnMeta* meta, int valid_rows_in) {
+__device__ __forceinline__ int p2_valid_rows(const Q38SequenceFields* meta, int valid_rows_in) {
     const int prefix = meta->prefix;
     const int valid_rows = valid_rows_in > 0 ? valid_rows_in : meta->valid_rows;
     if (valid_rows <= 0 || prefix < 0 || meta->causal != 1
@@ -296,7 +166,7 @@ void gdn_cw_p2_stage_a(const AQuery* __restrict__ q,
                        const float* __restrict__ beta,// FP32 [M, HEADS]
                        const float* __restrict__ g,   // FP32 [M, HEADS]
                        char* __restrict__ ws,
-                       const GdnMeta* __restrict__ meta, int valid_rows_in,
+                       const Q38SequenceFields* __restrict__ meta, int valid_rows_in,
                        uint32_t v_row_stride
 #ifdef GDN_COMPACT_QK
                        , const __nv_bfloat16* __restrict__ k_bf16
@@ -307,8 +177,8 @@ void gdn_cw_p2_stage_a(const AQuery* __restrict__ q,
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
-    const int gid = P2_GID(lane);
-    const int t2 = P2_T2(lane);
+    const int gid = CW_GID(lane);
+    const int t2 = CW_T2(lane);
 
     const bool aligned = (reinterpret_cast<uintptr_t>(q) | reinterpret_cast<uintptr_t>(k)
                           | reinterpret_cast<uintptr_t>(v) | reinterpret_cast<uintptr_t>(beta)
@@ -380,7 +250,7 @@ void gdn_cw_p2_stage_a(const AQuery* __restrict__ q,
         for (int ks = 0; ks < P2_DK / 16; ++ks) {
             const AFrag a = p1_a_rows(al, ah, ks * 16, t2, 1.0f, sl, sh);
             const BFrag b = p1_b_rows(bp, P2_DK, 0, ks * 16, t2, 1.0f, 1.0f, 1.0f, 1.0f);
-            P2_MMA(d, a, b);
+            CW_MMA(d, a, b);
         }
         p1_store_f32(sA, P2_A_LD, mt * 16, nt * 8, gid, t2, d);
     }
@@ -459,7 +329,7 @@ void gdn_cw_p2_stage_a(const AQuery* __restrict__ q,
             float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             const AFrag a = p1_a_sbf(sT, P2_T_LD, b0, b0, gid, t2);
             const BFrag b = p1_b_sbf(sV, 32, gid + nt * 8, 0, t2);
-            P2_MMA(d, a, b);
+            CW_MMA(d, a, b);
             p1_store_f32(sVn, P2_SUB, 0, nt * 8, gid, t2, d);
         }
         __syncthreads();
@@ -476,7 +346,7 @@ void gdn_cw_p2_stage_a(const AQuery* __restrict__ q,
             float d[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             const AFrag a = p1_a_sf32(sVn, P2_SUB, 0, 0, gid, t2);
             const BFrag b = p1_b_sbf(sVnB + 512, 32, gid + nt * 8, 0, t2);
-            P2_MMA(d, a, b);
+            CW_MMA(d, a, b);
             p1_store_bf16(sT, P2_T_LD, b0, a0 + nt * 8, gid, t2, d);
         }
         __syncthreads();
@@ -497,7 +367,7 @@ void gdn_cw_p2_stage_a(const AQuery* __restrict__ q,
             const AFrag a = p1_a_sbf(sT, P2_T_LD, 32 + mt * 16, 32 + ks * 16, gid, t2);
             // The staged tile is indexed by the local b.
             const BFrag b = p1_b_sbf(sV, 64, nt * 8 + gid, ks * 16, t2);
-            P2_MMA(d, a, b);
+            CW_MMA(d, a, b);
         }
         p1_store_f32(sA, P2_A_LD, mt * 16, 32 + nt * 8, gid, t2, d);
         __syncthreads();
@@ -512,7 +382,7 @@ void gdn_cw_p2_stage_a(const AQuery* __restrict__ q,
         for (int ks = 0; ks < P2_C / (2 * P2_SUB); ++ks) {
             const AFrag a = p1_a_sf32(sA, P2_A_LD, mt * 16, 32 + ks * 16, gid, t2);
             const BFrag b = p1_b_sbf(sV, 64, nt * 8 + gid, 32 + ks * 16, t2);
-            P2_MMA(e, a, b);
+            CW_MMA(e, a, b);
         }
         p1_store_bf16(sT, P2_T_LD, 32 + mt * 16, nt * 8, gid, t2, e);
         __syncthreads();
@@ -540,7 +410,7 @@ void gdn_cw_p2_stage_a(const AQuery* __restrict__ q,
             for (int ks = 0; ks < P2_C / 16; ++ks) {
                 const AFrag a = p1_a_sbf(sT, P2_T_LD, mt * 16, ks * 16, gid, t2);
                 const BFrag b = p1_b_sbf(sV, P2_VL, gid, ks * 16, t2);
-                P2_MMA(d, a, b);
+                CW_MMA(d, a, b);
             }
             p1_store_f32(sVn, P2_VT, mt * 16, 0, gid, t2, d);
         }
@@ -576,8 +446,8 @@ void gdn_cw_p2_stage_a(const AQuery* __restrict__ q,
                                          p1_kbg(kh, rstride, row0, valid_rows, c0 + 1, dk0 + 8, sSc)),
                                 p1_pack(p1_kbg(kh, rstride, row0, valid_rows, c0 + 8, dk0 + 8, sSc),
                                         p1_kbg(kh, rstride, row0, valid_rows, c0 + 9, dk0 + 8, sSc))} };
-                P2_MMA(w0, a, b0);
-                P2_MMA(w1, a, b1);
+                CW_MMA(w0, a, b0);
+                CW_MMA(w1, a, b1);
             }
             // w0 holds d_k columns [ks*16, +8) and w1 [ks*16+8, +8) of the window.
             const float g0[4] = {w0[0], w0[1], w0[2], w0[3]};
@@ -605,7 +475,7 @@ void gdn_cw_p2_stage_a(const AQuery* __restrict__ q,
         for (int ks = 0; ks < P2_DK / 16; ++ks) {
             const AFrag a = p1_a_rows(al, ah, ks * 16, t2, qscale, sl, sh);
             const BFrag b = p1_b_rows(bp, P2_DK, 0, ks * 16, t2, sb, sb, sb, sb);
-            P2_MMA(d, a, b);
+            CW_MMA(d, a, b);
         }
         p1_store_f32(sA, P2_A_LD, mt * 16, nt * 8, gid, t2, d);
     }
@@ -644,15 +514,15 @@ void gdn_cw_p2_stage_h(const float* __restrict__ q,
                        float* __restrict__ S,            // FP32 [HEADS, DK, DV]
                        __nv_bfloat16* __restrict__ out,  // BF16 [rows, HEADS, DV]
                        char* __restrict__ ws,
-                       const GdnMeta* __restrict__ meta,
+                       const Q38SequenceFields* __restrict__ meta,
                        int valid_rows_in) {
     const int head = blockIdx.y;
     const int j0 = blockIdx.x * P2_VW;
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
     const int lane = tid & 31;
-    const int gid = P2_GID(lane);
-    const int t2 = P2_T2(lane);
+    const int gid = CW_GID(lane);
+    const int t2 = CW_T2(lane);
     constexpr int NT = P2_VW / 8;   // 8-column value tiles of the 32-wide strip
 
     const bool aligned = (reinterpret_cast<uintptr_t>(k)
@@ -736,7 +606,7 @@ void gdn_cw_p2_stage_h(const float* __restrict__ q,
                 #pragma unroll
                 for (int nt = 0; nt < NT; ++nt) {
                     const BFrag b = p1_b_sbf(sV, P2_VLDK, nt * 8 + gid, ks * 16, t2);
-                    P2_MMA(d[nt], a, b);
+                    CW_MMA(d[nt], a, b);
                 }
             }
             #pragma unroll
@@ -769,7 +639,7 @@ void gdn_cw_p2_stage_h(const float* __restrict__ q,
             for (int ks = 0; ks < P2_C / 16; ++ks) {
                 const AFrag a = p1_a_sbf(wqk, P2_T_LD, mt * 16, ks * 16, gid, t2);
                 const BFrag b = p1_b_sbf(sV, P2_VL, nt * 8 + gid, ks * 16, t2);
-                P2_MMA(d, a, b);
+                CW_MMA(d, a, b);
             }
             p1_store_f32(sA, P2_A_LD, mt * 16, nt * 8, gid, t2, d);
         }
@@ -804,10 +674,10 @@ void gdn_cw_p2_stage_h(const float* __restrict__ q,
             for (int ks = 0; ks < P2_DK / 16; ++ks) {
                 const AFrag a = p1_a_rows(al, ah, ks * 16, t2, qscale, sl, sh);
                 const BFrag b = p1_b_sbf(sV, P2_VLDK, nt * 8 + gid, ks * 16, t2);
-                P2_MMA(d, a, b);
+                CW_MMA(d, a, b);
 #if GDN_HEADS == 32
                 const AFrag residual = p1_a_rows<true>(al, ah, ks * 16, t2, qscale, sl, sh);
-                P2_MMA(d, residual, b);
+                CW_MMA(d, residual, b);
 #endif
             }
             o[0] = d[0];
@@ -852,9 +722,9 @@ void gdn_cw_p2_stage_h(const float* __restrict__ q,
                 #pragma unroll
                 for (int nt = 0; nt < NT; ++nt) {
                     const BFrag b = p1_b_sbf(sV, P2_VL, nt * 8 + gid, ks * 16, t2);
-                    P2_MMA(o[nt], a, b);
+                    CW_MMA(o[nt], a, b);
 #if GDN_HEADS == 32
-                    P2_MMA(o[nt], residual, b);
+                    CW_MMA(o[nt], residual, b);
 #endif
                 }
             }

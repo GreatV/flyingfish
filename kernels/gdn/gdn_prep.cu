@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
+#include "../q38_contract.cuh"
 
 #ifndef GDN_HEADS
 #define GDN_HEADS 48
@@ -13,13 +14,11 @@
 #define GDN_PREP_DV 128
 
 // The row bound is read from the device meta.
-struct GdnPrepMeta { int prefix, valid_rows, key_count, capacity, causal, r20, r24, r28; };
-
 // Exact BF16 -> FP32 widen of beta [M, GDN_PREP_HEADS].
 extern "C" __global__ void gdn_beta_widen(
         const __nv_bfloat16* __restrict__ beta_bf16,   // [M, GDN_PREP_HEADS]
         float* __restrict__ beta_fp32,                 // [M, GDN_PREP_HEADS]
-        const GdnPrepMeta* __restrict__ meta) {
+        const Q38SequenceFields* __restrict__ meta) {
     const int h = blockIdx.x * blockDim.x + threadIdx.x;   // value head
     if (h >= GDN_PREP_HEADS) return;
     const int m = blockIdx.y;                              // LOCAL row
@@ -36,7 +35,7 @@ extern "C" __global__ void gdn_prep_l2_fp32(
         float* __restrict__ k_fp32,
         float* __restrict__ v_fp32,
         uint32_t row_stride,
-        const GdnPrepMeta* __restrict__ meta,
+        const Q38SequenceFields* __restrict__ meta,
         float l2_eps) {
     if (blockDim.x != GDN_PREP_DK || blockDim.y != 1 || blockDim.z != 1
         || gridDim.x != 1 || gridDim.y != GDN_PREP_KHEADS) {

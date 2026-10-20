@@ -17,14 +17,6 @@
 #define GDN_CONV_CHAN 256
 #define GDN_CONV_ROWS 32
 
-struct GdnMeta {
-    int prefix, valid_rows, key_count, capacity, causal, r20, r24, r28;
-};
-
-__device__ __forceinline__ bool aligned16(const void* p) {
-    return p && (reinterpret_cast<uintptr_t>(p) & 15) == 0;
-}
-
 // One thread per channel; the block's 256 threads cover 256 contiguous channels. Each
 // thread walks a strip of rows.
 //
@@ -35,7 +27,7 @@ __device__ __forceinline__ void gdn_conv_impl(
         const __nv_bfloat16* __restrict__ conv_w,  // [conv_dim, 4],   strides [4,1]
         const float* __restrict__ history,         // [conv_dim, 3],   read-only here
         __nv_bfloat16* __restrict__ out,           // [M, conv_dim] BF16 conv result
-        const GdnMeta* __restrict__ meta,
+        const Q38SequenceFields* __restrict__ meta,
         int conv_dim, float* q_fp32, float* k_fp32,
         __nv_bfloat16* q_bf16, __nv_bfloat16* k_bf16, float l2_eps) {
     const int ch = blockIdx.x * GDN_CONV_CHAN + threadIdx.x;
@@ -126,7 +118,7 @@ __device__ __forceinline__ void gdn_conv_impl(
 extern "C" __global__ void gdn_conv(
         const __nv_bfloat16* __restrict__ qkv, const __nv_bfloat16* __restrict__ conv_w,
         const float* __restrict__ history, __nv_bfloat16* __restrict__ out,
-        const GdnMeta* __restrict__ meta, int conv_dim) {
+        const Q38SequenceFields* __restrict__ meta, int conv_dim) {
     gdn_conv_impl<false>(qkv, conv_w, history, out, meta, conv_dim,
                          nullptr, nullptr, nullptr, nullptr, 0.0f);
 }
@@ -134,7 +126,7 @@ extern "C" __global__ void gdn_conv(
 extern "C" __global__ void gdn_conv_l2_compact(
         const __nv_bfloat16* __restrict__ qkv, const __nv_bfloat16* __restrict__ conv_w,
         const float* __restrict__ history, __nv_bfloat16* __restrict__ out,
-        const GdnMeta* __restrict__ meta, int conv_dim,
+        const Q38SequenceFields* __restrict__ meta, int conv_dim,
         float* __restrict__ q_fp32, float* __restrict__ k_fp32,
         __nv_bfloat16* __restrict__ q_bf16, __nv_bfloat16* __restrict__ k_bf16, float l2_eps) {
     if (conv_dim != 10240 || !aligned16(q_fp32) || !aligned16(k_fp32) ||
@@ -146,7 +138,7 @@ extern "C" __global__ void gdn_conv_l2_compact(
 extern "C" __global__ void gdn_conv_l2_compact_rows8(
         const __nv_bfloat16* __restrict__ qkv, const __nv_bfloat16* __restrict__ conv_w,
         const float* __restrict__ history, __nv_bfloat16* __restrict__ out,
-        const GdnMeta* __restrict__ meta, int conv_dim,
+        const Q38SequenceFields* __restrict__ meta, int conv_dim,
         float* __restrict__ q_fp32, float* __restrict__ k_fp32,
         __nv_bfloat16* __restrict__ q_bf16, __nv_bfloat16* __restrict__ k_bf16, float l2_eps) {
     if (conv_dim != 10240 || !aligned16(q_fp32) || !aligned16(k_fp32) ||
@@ -164,7 +156,7 @@ extern "C" __global__ void gdn_conv_l2_compact_rows8(
 extern "C" __global__ void gdn_conv_hist_update(
         const __nv_bfloat16* __restrict__ qkv,
         float* __restrict__ history,
-        const GdnMeta* __restrict__ meta,
+        const Q38SequenceFields* __restrict__ meta,
         int conv_dim) {
     const int ch = blockIdx.x * GDN_CONV_CHAN + threadIdx.x;
     if (conv_dim <= 0 || blockDim.x != GDN_CONV_CHAN || blockDim.y != 1 || blockDim.z != 1 ||
@@ -196,7 +188,7 @@ extern "C" __global__ void gdn_conv_hist_update(
 
 extern "C" __global__ void gdn_conv_hist_snapshot(
         const __nv_bfloat16* __restrict__ qkv, float* __restrict__ history,
-        const GdnMeta* __restrict__ meta, int conv_dim, float* __restrict__ snapshots) {
+        const Q38SequenceFields* __restrict__ meta, int conv_dim, float* __restrict__ snapshots) {
     const int ch = blockIdx.x * GDN_CONV_CHAN + threadIdx.x;
     const int rows = meta->valid_rows;
     constexpr int row_limit = GDN_HEADS == 32 ? 16 : 5;

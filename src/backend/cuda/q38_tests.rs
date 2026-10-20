@@ -7,6 +7,7 @@ use super::{
     contracts::{RowDomain, Scratch, SeqRef, Tensor, TensorMut},
     cubin,
     linear::{Fp8Ops, LinearWeightRef},
+    moe::testing::view,
     ops::{
         CommonOpsRef, GatedRmsInput, GdnGateBindings, Ops, ResidualRmsInput, RmsMode, RmsOptions,
         grid,
@@ -23,22 +24,6 @@ use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, PushKernelA
 use half::bf16;
 use std::{rc::Rc, sync::Arc};
 
-pub(super) fn view<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
-    b: &CudaSlice<T>,
-    s: &Arc<CudaStream>,
-    shape: [u32; R],
-    stride: [u64; R],
-) -> Result<Tensor<T, R>> {
-    let (p, _r) = b.device_ptr(s);
-    unsafe {
-        Tensor::new(
-            p,
-            shape,
-            stride,
-            (b.len() * std::mem::size_of::<T>()) as u64,
-        )
-    }
-}
 fn meta(
     s: &Arc<CudaStream>,
     prefix: i32,
