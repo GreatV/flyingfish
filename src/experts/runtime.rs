@@ -1765,7 +1765,7 @@ mod tests {
         let service = service();
         let layout = bf16_layout(&geometry)?;
         let slot = layout.slot_bytes();
-        let cap = 2u32;
+        let cap = 1u32;
         let spare = cap;
         let host_blocks = 14u32;
         let inputs = PlanInputs {
