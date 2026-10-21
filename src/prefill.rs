@@ -206,7 +206,8 @@ mod tests {
         model.linear_format = LinearFormat::Bf16;
         assert_eq!(dense_prompt_bytes(&model, 16384, 8192, KvFormat::Bf16)?, 0);
         let root = serde_json::from_str(include_str!("../tests/data/minicpm-config.json"))?;
-        let mut moe = ModelSpec::minicpm(&root, &serde_json::json!({}))?;
+        let mut moe =
+            ModelSpec::minicpm(&root, &serde_json::json!({"eos_token_id":[248044,248046]}))?;
         moe.linear_format = LinearFormat::Fp8E4m3Channel;
         for capacity in [1024, 4096, 16384] {
             assert_eq!(

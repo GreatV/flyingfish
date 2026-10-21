@@ -745,10 +745,9 @@ pub(super) mod tests {
                     for buffer in [&kv.k, &kv.v] {
                         for head in 0..e.model_spec.kv_heads as usize {
                             let dim = e.model_spec.head_dim as usize;
-                            let values =
-                                e.device.stream.clone_dtoh(&buffer.slice(
-                                    head * e.capacity * dim..(head * e.capacity + prefix) * dim,
-                                ))?;
+                            let values = e.device.stream.clone_dtoh(&buffer.slice(
+                                head * e.capacity * dim..(head * e.capacity + prefix) * dim,
+                            ))?;
                             ensure!(
                                 values.iter().all(|v| v.to_f32().is_finite()),
                                 "Runner FAIL nonfinite live KV"
@@ -824,7 +823,8 @@ pub(super) mod tests {
                     && e.model_spec.layers.len() == 64
                     && e.model_spec.vocab == 248320
                     && e.model_spec.moe.is_none()
-                    && e.model_spec.linear_format == crate::model_spec::LinearFormat::Fp8E4m3Block128,
+                    && e.model_spec.linear_format
+                        == crate::model_spec::LinearFormat::Fp8E4m3Block128,
                 "Runner FAIL dense prefill model geometry/format"
             );
             ensure!(
@@ -948,7 +948,9 @@ pub(super) mod tests {
                                     values.iter().all(|v| v.to_f32().is_finite()),
                                     "Runner FAIL nonfinite norm/hidden"
                                 );
-                                bits.extend(values.into_iter().flat_map(|v| v.to_bits().to_le_bytes()));
+                                bits.extend(
+                                    values.into_iter().flat_map(|v| v.to_bits().to_le_bytes()),
+                                );
                             }
                             norms.push(bits);
                             Ok(())
