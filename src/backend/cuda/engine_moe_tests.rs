@@ -114,11 +114,8 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
         catalogue::ExpertLayout,
         plan::{PlanInputs, Reserves, ServiceCell, ServiceTable, capacity},
     };
-    let (available, locked) = super::host_memory(Path::new("/"))?;
-    ensure!(
-        available > 0 && locked <= available,
-        "invalid expert host memory profile"
-    );
+    let available = super::host_memory(Path::new("/"))?;
+    ensure!(available > 0, "invalid expert host memory profile");
     let root = std::env::temp_dir().join(format!(
         "flyingfish-host-memory-{}-{}",
         std::process::id(),
@@ -212,7 +209,7 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
             )?;
         }
         ensure!(
-            super::host_memory(&root)? == (5 << 30, 8 << 20),
+            super::host_memory(&root)? == 5 << 30,
             "v1 ancestor headroom did not bind"
         );
         println!(
@@ -234,11 +231,8 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
                     &format!("total_active_file {active}\ntotal_inactive_file {inactive}\n"),
                 )?;
             }
-            let (available, locked) = super::host_memory(&root)?;
-            ensure!(
-                available == 5 << 30 && locked == 8 << 20,
-                "v1 cache changed headroom"
-            );
+            let available = super::host_memory(&root)?;
+            ensure!(available == 5 << 30, "v1 cache changed headroom");
             ensure!(
                 placement(available)? == expected_placement,
                 "v1 cache changed placement"
@@ -254,7 +248,7 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
             )?;
         }
         ensure!(
-            super::host_memory(&root)? == (16 << 30, 8 << 20),
+            super::host_memory(&root)? == 16 << 30,
             "v1 unlimited bound MemAvailable"
         );
         write(
@@ -262,7 +256,7 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
             "0::/unified\n5:cpu,memory:/pod/job/leaf\n",
         )?;
         ensure!(
-            super::host_memory(&root)? == (16 << 30, 8 << 20),
+            super::host_memory(&root)? == 16 << 30,
             "hybrid memory controller was not selected"
         );
         write("proc/self/cgroup", "0::/job/leaf\n")?;
@@ -278,7 +272,7 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
             )?;
         }
         ensure!(
-            super::host_memory(&root)? == (5 << 30, 8 << 20),
+            super::host_memory(&root)? == 5 << 30,
             "v2 ancestor headroom did not bind"
         );
         for (cache, inactive) in [(1u64 << 30, 1 << 30), (3 << 30, 1 << 30), (0, 0)] {
@@ -292,11 +286,8 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
                     &format!("file {cache}\nshmem 0\ninactive_file {inactive}\n"),
                 )?;
             }
-            let (available, locked) = super::host_memory(&root)?;
-            ensure!(
-                available == 5 << 30 && locked == 8 << 20,
-                "v2 cache changed headroom"
-            );
+            let available = super::host_memory(&root)?;
+            ensure!(available == 5 << 30, "v2 cache changed headroom");
             ensure!(
                 placement(available)? == expected_placement,
                 "v2 cache changed placement"
@@ -308,7 +299,7 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
             "file 3221225472\nshmem 1073741824\ninactive_file 1073741824\n",
         )?;
         ensure!(
-            super::host_memory(&root)?.0 == 5 << 30,
+            super::host_memory(&root)? == 5 << 30,
             "shared memory was reclaimed"
         );
         write("sys/fs/cgroup/job/memory.stat", "file 0\n")?;
@@ -325,7 +316,7 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
             write(&format!("{path}/memory.max"), "max\n")?;
         }
         ensure!(
-            super::host_memory(&root)? == (16 << 30, 8 << 20),
+            super::host_memory(&root)? == 16 << 30,
             "v2 unlimited bound MemAvailable"
         );
         write("proc/self/cgroup", "2:cpuset:/other\n")?;

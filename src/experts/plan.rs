@@ -232,7 +232,7 @@ pub struct PlanInputs<'a> {
     /// Device async copy engines available to expert transfers.
     pub copy_engines: u32,
     pub disk_readers: u32,
-    /// Largest host span the setup registration measurement can page-lock; 0 when unsupported.
+    /// Successfully registered host span measured at setup; 0 when unsupported.
     pub host_registration_bytes: u64,
     pub service: &'a ServiceTable,
     pub reserves: &'a Reserves,

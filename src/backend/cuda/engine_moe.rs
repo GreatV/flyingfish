@@ -137,7 +137,7 @@ impl Setup {
             model.expert_format.context("MoE expert_format missing")?,
             &calibration,
         )?;
-        let (available, locked) = host_memory(Path::new("/"))?;
+        let available = host_memory(Path::new("/"))?;
         let copies = measured.copy_engines.min(2);
         let slot = catalogue.slot_bytes();
         let workers = measured.service.worker_count()?;
@@ -258,14 +258,7 @@ impl Setup {
             "no admitted expert workspace: {}",
             failures.join("; ")
         );
-        let registration = if device.ctx.attribute(
-            cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED,
-        )? != 0
-        {
-            locked.saturating_sub(u64::from(copies) * slot)
-        } else {
-            0
-        };
+        let registration = measured.host_registration_bytes;
         let first = &candidates[0].candidate;
         let (index, capacity, admission) = ExpertWorkspaceBudget::select(
             &PlanInputs {

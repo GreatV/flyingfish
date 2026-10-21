@@ -551,7 +551,7 @@ fn measure(
     })
 }
 
-pub(super) fn host_memory(root: &Path) -> Result<(u64, u64)> {
+pub(super) fn host_memory(root: &Path) -> Result<u64> {
     let meminfo = std::fs::read_to_string(root.join("proc/meminfo"))?;
     let mut available = meminfo
         .lines()
@@ -668,18 +668,7 @@ pub(super) fn host_memory(root: &Path) -> Result<(u64, u64)> {
             mount.display()
         );
     }
-    let limits = std::fs::read_to_string(root.join("proc/self/limits"))?;
-    let locked = limits
-        .lines()
-        .find_map(|line| line.strip_prefix("Max locked memory"))
-        .and_then(|line| line.split_whitespace().next())
-        .context("expert host profile has no locked-memory limit")?;
-    let locked = if locked == "unlimited" {
-        available
-    } else {
-        locked.parse::<u64>()?.min(available)
-    };
-    Ok((available, locked))
+    Ok(available)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -836,6 +825,8 @@ struct ExpertCache {
     geometry: crate::experts::catalogue::ExpertGeometry,
     copy_engines: u32,
     ring_experts: u32,
+    host_registration_bytes: u64,
+    host_registration_seconds: [f64; 3],
     transfers: Vec<ExpertTransfer>,
     service: Vec<crate::experts::plan::ServiceCell>,
 }
@@ -844,6 +835,7 @@ pub(super) struct ExpertCalibration {
     pub h2d_bytes_per_second: f64,
     pub d2h_bytes_per_second: f64,
     pub copy_engines: u32,
+    pub host_registration_bytes: u64,
     pub service: crate::experts::plan::ServiceTable,
 }
 
@@ -856,8 +848,8 @@ impl ExpertCache {
         slot_bytes: u64,
     ) -> Result<ExpertCalibration> {
         ensure!(
-            self.schema == 2,
-            "expert calibration schema {} expected 2",
+            self.schema == 3,
+            "expert calibration schema {} expected 3",
             self.schema
         );
         ensure!(
@@ -893,6 +885,24 @@ impl ExpertCache {
             self.ring_experts == host.ring_experts(geometry, slot_bytes)?,
             "expert ring count {} differs from host-derived count",
             self.ring_experts
+        );
+        let expert_bytes = u64::from(geometry.layers)
+            .checked_mul(u64::from(geometry.experts))
+            .and_then(|n| n.checked_mul(slot_bytes))
+            .context("expert registration extent overflow")?;
+        ensure!(
+            self.host_registration_bytes <= expert_bytes
+                && self.host_registration_bytes.is_multiple_of(slot_bytes)
+                && if self.host_registration_bytes == 0 {
+                    self.host_registration_seconds == [0.0; 3]
+                } else {
+                    self.host_registration_seconds
+                        .iter()
+                        .all(|&n| n.is_finite() && n > 0.0)
+                },
+            "invalid measured host registration bytes={} seconds={:?}",
+            self.host_registration_bytes,
+            self.host_registration_seconds
         );
         let sizes = [1, geometry.top_k]
             .into_iter()
@@ -966,6 +976,7 @@ impl ExpertCache {
             h2d_bytes_per_second,
             d2h_bytes_per_second,
             copy_engines: self.copy_engines,
+            host_registration_bytes: self.host_registration_bytes,
             service,
         })
     }
@@ -1065,6 +1076,41 @@ fn measure_expert_transfer(d: &Device, bytes: usize) -> Result<ExpertTransfer> {
     Ok(cell)
 }
 
+fn measure_host_registration(d: &Device, bytes: u64) -> Result<(u64, [f64; 3])> {
+    if d.ctx
+        .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED)?
+        == 0
+    {
+        return Ok((0, [0.0; 3]));
+    }
+    ensure!(bytes > 0, "zero host registration measurement extent");
+    let start = Instant::now();
+    let mut allocation = memmap2::MmapMut::map_anon(usize::try_from(bytes)?)
+        .with_context(|| format!("allocate host registration measurement: bytes={bytes}"))?;
+    allocation.fill(0);
+    let allocated = start.elapsed().as_secs_f64();
+    d.ctx.bind_to_thread()?;
+    let pointer = allocation.as_mut_ptr().cast::<std::ffi::c_void>();
+    let start = Instant::now();
+    // SAFETY: the anonymous allocation remains owned through unregister and has no DMA users.
+    unsafe { sys::cuMemHostRegister_v2(pointer, allocation.len(), 0).result() }
+        .with_context(|| format!("measure CUDA host registration: bytes={bytes}"))?;
+    let registered = start.elapsed().as_secs_f64();
+    let start = Instant::now();
+    // SAFETY: pointer is the exact successfully registered allocation and has no DMA users.
+    unsafe { sys::cuMemHostUnregister(pointer).result() }
+        .with_context(|| format!("unregister host registration measurement: bytes={bytes}"))?;
+    let unregistered = start.elapsed().as_secs_f64();
+    eprintln!(
+        "{}",
+        serde_json::json!({"host_registration_measurement": {
+            "bytes":bytes,"cuda_result":"CUDA_SUCCESS","allocation_seconds":allocated,
+            "register_seconds":registered,"unregister_seconds":unregistered
+        }})
+    );
+    Ok((bytes, [allocated, registered, unregistered]))
+}
+
 pub(super) fn load_experts(
     d: &Device,
     dir: &Path,
@@ -1078,7 +1124,7 @@ pub(super) fn load_experts(
     let host = ExpertHost::read()?;
     let identity = super::closure::hash(&serde_json::to_vec(&(&host, geometry, expert_format))?);
     let path = dir.join(format!(
-        "experts-v2-{}-{}-{}-{identity}.json",
+        "experts-v3-{}-{}-{}-{identity}.json",
         key.device_uuid, key.driver_version, key.binary_version
     ));
     let (cache, hit) = if closure.access(&path)? {
@@ -1093,7 +1139,7 @@ pub(super) fn load_experts(
         let ring_bytes = u64::from(ring_experts)
             .checked_mul(slot_bytes)
             .context("expert ring bytes overflow")?;
-        let (available, _) = host_memory(Path::new("/"))?;
+        let available = host_memory(Path::new("/"))?;
         ensure!(
             ring_bytes <= available / 2,
             "expert service ring {ring_bytes} B exceeds half of effective available host memory {available} B"
@@ -1102,6 +1148,10 @@ pub(super) fn load_experts(
             d.ctx
                 .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT)?,
         )?;
+        let registration_slots = ((available - available / 16) / slot_bytes)
+            .min(u64::from(geometry.layers) * u64::from(geometry.experts));
+        let (host_registration_bytes, host_registration_seconds) =
+            measure_host_registration(d, registration_slots * slot_bytes)?;
         let transfers = [1, geometry.top_k]
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>()
@@ -1135,7 +1185,7 @@ pub(super) fn load_experts(
             expert_format,
         )?;
         let cache = ExpertCache {
-            schema: 2,
+            schema: 3,
             expert_format,
             slot_bytes,
             key: key.clone(),
@@ -1143,6 +1193,8 @@ pub(super) fn load_experts(
             geometry,
             copy_engines,
             ring_experts,
+            host_registration_bytes,
+            host_registration_seconds,
             transfers,
             service,
         };
@@ -1165,6 +1217,15 @@ pub(super) fn load_experts(
         cache.copy_engines == measured_engines,
         "expert cache engine count {} differs from driver {measured_engines}",
         cache.copy_engines
+    );
+    let registration_supported = d
+        .ctx
+        .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED)?
+        != 0;
+    ensure!(
+        (cache.host_registration_bytes > 0) == registration_supported,
+        "expert host registration profile differs from driver support={registration_supported} bytes={}",
+        cache.host_registration_bytes
     );
     let measured = cache.check(&key, &host, &geometry, slot_bytes)?;
     eprintln!(
@@ -1209,7 +1270,7 @@ mod long_tests {
         )?
         .slot_bytes();
         let mut cache = ExpertCache {
-            schema: 2,
+            schema: 3,
             expert_format: crate::model_spec::ExpertFormat::Bf16,
             slot_bytes,
             key: key.clone(),
@@ -1217,6 +1278,8 @@ mod long_tests {
             geometry,
             copy_engines: 2,
             ring_experts: host.ring_experts(&geometry, slot_bytes)?,
+            host_registration_bytes: 16 * slot_bytes,
+            host_registration_seconds: [0.001; 3],
             transfers: [768, 1536]
                 .map(|bytes| ExpertTransfer {
                     bytes,
@@ -1239,6 +1302,20 @@ mod long_tests {
                 .collect(),
         };
         let measured = cache.check(&key, &host, &geometry, slot_bytes)?;
+        let mut invalid_registration = serde_json::to_value(&cache)?;
+        invalid_registration["host_registration_bytes"] = serde_json::json!(u64::MAX);
+        let invalid_registration: ExpertCache = serde_json::from_value(invalid_registration)?;
+        assert!(
+            invalid_registration
+                .check(&key, &host, &geometry, slot_bytes)
+                .is_err()
+        );
+        assert_eq!(measured.host_registration_bytes, 16 * slot_bytes);
+        for seconds in [[f64::NAN, 0.001, 0.001], [0.001, 0.0, 0.001]] {
+            cache.host_registration_seconds = seconds;
+            assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
+        }
+        cache.host_registration_seconds = [0.001; 3];
         cache.expert_format = crate::model_spec::ExpertFormat::Fp8W8a16;
         assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
         cache.expert_format = crate::model_spec::ExpertFormat::Bf16;
@@ -1378,6 +1455,10 @@ mod long_tests {
         assert_eq!(measured.h2d_bytes_per_second, reused.h2d_bytes_per_second);
         assert_eq!(measured.d2h_bytes_per_second, reused.d2h_bytes_per_second);
         assert_eq!(measured.copy_engines, reused.copy_engines);
+        assert_eq!(
+            measured.host_registration_bytes,
+            reused.host_registration_bytes
+        );
         assert_eq!(measured.service, reused.service);
         assert_eq!(std::fs::read(&path)?, bytes);
         assert_eq!(std::fs::metadata(&path)?.modified()?, modified);
