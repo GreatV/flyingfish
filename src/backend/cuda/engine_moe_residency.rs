@@ -1,7 +1,7 @@
 //! Native expert DMA ownership and the CPU residency runtime.
 use super::*;
 use crate::experts::{
-    arena::WriteClaim,
+    arena::{BlockLease, WriteClaim},
     catalogue::ExpertCatalogue,
     disk::{DiskExperts, DiskReader},
     plan::Tier,
@@ -184,6 +184,7 @@ struct Stage {
 
 pub(in crate::backend::cuda::engine) struct Transfers {
     host: Option<Arc<HostBlocks>>,
+    backing: Option<BlockLease>,
     host_use: Vec<RefCell<HostUse>>,
     stages: Vec<RefCell<Stage>>,
     h2d_cursor: usize,
@@ -200,6 +201,7 @@ impl Transfers {
         storage: &super::super::super::weights::ExpertStorage,
         pinned: bool,
         engines: u32,
+        backing_blocks: u32,
     ) -> Result<Self> {
         ensure!(
             engines > 0,
@@ -220,8 +222,18 @@ impl Transfers {
         } else {
             0
         };
+        let backing = if backing_blocks == 0 {
+            None
+        } else {
+            Some(
+                host.as_ref()
+                    .context("immutable expert backing has no arena")?
+                    .lease(&(0..backing_blocks).collect::<Vec<_>>())?,
+            )
+        };
         Ok(Self {
             host,
+            backing,
             host_use,
             stages: (0..stages)
                 .map(|_| {
@@ -322,6 +334,9 @@ impl Transfers {
 
     fn source_host(&mut self, block: u32) -> Result<(u64, Option<usize>)> {
         if self.pinned {
+            if let Some(backing) = &self.backing {
+                return Ok((backing.read(block)?.as_ptr() as u64, None));
+            }
             let pointer = self.claim(block)?;
             self.wait_host(block, &self.h2d)?;
             return Ok((pointer, None));
@@ -330,11 +345,21 @@ impl Transfers {
         let index = self.h2d_cursor;
         self.h2d_cursor = (self.h2d_cursor + 1) % self.per_direction;
         self.flush_stage(index)?;
+        let lease = if self.backing.is_none() {
+            Some(
+                self.host
+                    .as_ref()
+                    .context("expert host source missing")?
+                    .lease(&[block])?,
+            )
+        } else {
+            None
+        };
         let lease = self
-            .host
+            .backing
             .as_ref()
-            .context("expert host source missing")?
-            .lease(&[block])?;
+            .or(lease.as_ref())
+            .context("expert host source has no read lease")?;
         let mut stage = self.stages[index].borrow_mut();
         stage
             .values
@@ -399,6 +424,9 @@ impl Transfers {
     }
 
     fn finish(&self) -> Result<()> {
+        if self.backing.is_some() {
+            self.h2d.synchronize()?;
+        }
         for index in 0..self.stages.len() {
             self.flush_stage(index)?;
         }
@@ -504,7 +532,7 @@ fn check_lifetime(expected: [Option<u64>; 2], owned: [Option<u64>; 2]) -> Result
 }
 
 #[cfg(test)]
-fn delay_stream(stream: &Arc<CudaStream>) -> Result<()> {
+pub(super) fn delay_stream(stream: &Arc<CudaStream>) -> Result<()> {
     unsafe extern "C" fn delay(_: *mut std::ffi::c_void) {
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
@@ -580,7 +608,17 @@ impl Slots {
             physical.iter().all(|slot| slot.pointer != 0),
             "physical expert slot map has a hole"
         );
-        let transfers = Transfers::new(device, &storage, input.capacity.pinned, input.engines)?;
+        let transfers = Transfers::new(
+            device,
+            &storage,
+            input.capacity.pinned,
+            input.engines,
+            if policy.ledger().has_full_host_backing() {
+                input.capacity.host_blocks
+            } else {
+                0
+            },
+        )?;
         let events = Events::new(
             &device.ctx,
             2 * physical_count
@@ -636,7 +674,12 @@ impl Slots {
                 if slots.policy.ledger().tier(layer, expert)? == crate::experts::plan::Tier::Gpu {
                     let slot = slots.policy.ledger().slot(layer, expert)?;
                     let generation = slots.policy.generation(layer, expert)?;
-                    slots.install(layer, expert, None, slot, generation, MoveSource::Disk)?;
+                    let source = if slots.policy.ledger().has_full_host_backing() {
+                        MoveSource::Host(slots.policy.host_block(layer, expert)?)
+                    } else {
+                        MoveSource::Disk
+                    };
+                    slots.install(layer, expert, None, slot, generation, source)?;
                 }
             }
         }

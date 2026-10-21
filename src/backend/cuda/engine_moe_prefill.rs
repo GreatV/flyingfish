@@ -271,6 +271,15 @@ pub(in crate::backend::cuda::engine) struct Prefill {
     pub stats: [u64; 8],
 }
 
+impl Drop for Prefill {
+    fn drop(&mut self) {
+        self.gpu
+            .mailbox
+            .context()
+            .record_err(self.gpu.mailbox.synchronize());
+    }
+}
+
 /// CPU workspace rows/choices, constrained expert rows, and measured expert rows.
 pub(in crate::backend::cuda::engine) fn cpu_bound(
     geometry: ExpertGeometry,
@@ -584,7 +593,7 @@ impl Prefill {
                     borrow.experts.get(victim) == Some(&(layer, expert)),
                     "borrowed victim order differs at physical slot={position}"
                 );
-                if victim < borrow.to_host as usize {
+                if borrow.write_back[victim] {
                     if let Some(id) = borrow.host_waits[victim] {
                         slots.events.wait(&slots.transfers.d2h, id)?;
                     }
@@ -1582,7 +1591,6 @@ impl Cpu {
         }
         let uploaded = events.record(mailbox)?;
         compute.wait(&uploaded.event)?;
-        uploaded.event.synchronize()?;
         Ok(())
     }
 }
@@ -3141,11 +3149,24 @@ mod tests {
                     );
                     expected.push(first);
                 }
-                for &(pinned, engines) in modes {
+                for (pinned, engines, backed) in modes.iter().flat_map(|&(pinned, engines)| {
+                    [false, true]
+                        .into_iter()
+                        .filter(move |&backed| !backed || host_complete)
+                        .map(move |backed| (pinned, engines, backed))
+                }) {
                     let directory =
-                        runtime.join(format!("span-{variant}-{rows}-{pinned}-{engines}"));
-                    let capacity =
+                        runtime.join(format!("span-{variant}-{rows}-{pinned}-{engines}-{backed}"));
+                    let mut capacity =
                         capacity(geometry, rows, pinned, engines, host_complete, format)?;
+                    if backed {
+                        capacity.host_blocks = geometry.layers * geometry.experts;
+                        capacity.host_expert_bytes =
+                            u64::from(capacity.host_blocks + capacity.spare_blocks)
+                                * capacity.slot_bytes();
+                        capacity.disk_bytes = 0;
+                        capacity.disk_workers = 0;
+                    }
                     let initial = vec![(0..capacity.slots_per_layer[0]).collect::<Vec<_>>(); 2];
                     let mut engine = Engine::load_moe_placed(
                         &fixture,
@@ -3194,8 +3215,10 @@ mod tests {
                     slots.policy.ledger().check()?;
                     if host_complete {
                         ensure!(
-                            prefill.stats[4] > 0 && prefill.stats[5] == 0 && slots.disk.is_none(),
-                            "Runner FAIL host borrow fixture: D2H_bytes={} dropped_bytes={} disk_reader={}",
+                            (prefill.stats[4] == 0) == backed
+                                && prefill.stats[5] == 0
+                                && slots.disk.is_none(),
+                            "Runner FAIL host borrow fixture: backed={backed} D2H_bytes={} dropped_bytes={} disk_reader={}",
                             prefill.stats[4],
                             prefill.stats[5],
                             slots.disk.is_some()
@@ -3308,6 +3331,23 @@ mod tests {
                                 rows,
                                 ffn,
                             )?;
+                            if !prefill.cpu.choices.is_empty() {
+                                super::super::delay_stream(&prefill.gpu.mailbox)?;
+                                prefill.cpu.upload(
+                                    &prefill.gpu.mailbox,
+                                    &engine.device.stream,
+                                    prefill.span.as_ref().context("upload span missing")?,
+                                    &mut slots.events,
+                                )?;
+                                let uploaded = slots.events.record(&prefill.gpu.mailbox)?;
+                                ensure!(
+                                    !uploaded.event.try_is_complete()?,
+                                    "DEFECT prefill CPU upload blocked the host until completion"
+                                );
+                                println!(
+                                    "PASS prefill_upload_async layer={layer} rows={rows} variant={variant} pinned={pinned} engines={engines} backed={backed} upload_pending=true delay_ms=100"
+                                );
+                            }
                             super::super::delay_stream(&engine.device.stream)?;
                             for base in (0..rows).step_by(4) {
                                 let count = 4.min(rows - base);
@@ -3412,7 +3452,7 @@ mod tests {
                         let cell_coverage: [u64; 5] =
                             std::array::from_fn(|index| coverage[index] - prior_coverage[index]);
                         println!(
-                            "{} prefill_span layer={layer} rows={rows} wave=4 variant={variant} pinned={pinned} engines={engines} bit_mismatches={mismatches} T3_contribution_mismatches={} CPU_contribution_mismatches={} combine_mismatches={output_mismatches} coverage={cell_coverage:?} ref_outside_NVTX=true",
+                            "{} prefill_span layer={layer} rows={rows} wave=4 variant={variant} pinned={pinned} engines={engines} backed={backed} bit_mismatches={mismatches} T3_contribution_mismatches={} CPU_contribution_mismatches={} combine_mismatches={output_mismatches} coverage={cell_coverage:?} ref_outside_NVTX=true",
                             if mismatches == 0 { "PASS" } else { "DEFECT" },
                             cohort_mismatches[0],
                             cohort_mismatches[1]
@@ -3460,7 +3500,7 @@ mod tests {
                         );
                     }
                     println!(
-                        "{} prefill_span_coverage rows={rows} variant={variant} pinned={pinned} engines={engines} stats={:?} IO={:?} expected={coverage:?} expected_cancellations={expected_cancellations} ref_outside_NVTX=true",
+                        "{} prefill_span_coverage rows={rows} variant={variant} pinned={pinned} engines={engines} backed={backed} stats={:?} IO={:?} expected={coverage:?} expected_cancellations={expected_cancellations} ref_outside_NVTX=true",
                         if state_mismatch { "DEFECT" } else { "PASS" },
                         prefill.stats,
                         prefill.gpu.read_ahead.stats

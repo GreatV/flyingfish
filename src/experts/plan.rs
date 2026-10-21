@@ -491,6 +491,22 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
             host_blocks = 0;
         }
     }
+    let partial_bytes = host_blocks
+        .checked_add(u64::from(reserve))
+        .and_then(|blocks| blocks.checked_mul(slot_bytes))
+        .context("partial host arena bytes overflow")?;
+    let backed_blocks = routed_slots
+        .checked_add(u64::from(reserve))
+        .context("complete host block count overflow")?;
+    let backed_bytes = backed_blocks
+        .checked_mul(slot_bytes)
+        .context("complete host arena bytes overflow")?;
+    if backed_blocks <= host_block_slots
+        && (partial_bytes > inputs.host_registration_bytes
+            || backed_bytes <= inputs.host_registration_bytes)
+    {
+        host_blocks = routed_slots;
+    }
     let host_blocks = u32::try_from(host_blocks).context("host block count exceeds u32")?;
     let hosted = u64::from(host_blocks).min(non_gpu);
     let unique_slots = total_slots
@@ -542,6 +558,8 @@ pub struct Borrow {
     pub to_disk: u32,
     pub d2h_bytes: u64,
     pub disk_bytes: u64,
+    /// One flag per victim; true when its host backing must be written.
+    pub write_back: Vec<bool>,
     /// Device events each host victim's D2H waits on; filled by the residency.
     pub host_waits: Vec<Option<u64>>,
 }
@@ -562,6 +580,7 @@ const EMPTY_SLOT: u32 = u32::MAX;
 pub struct TierLedger {
     layout: SlotLayout,
     host_blocks: u32,
+    host_backing: bool,
     gpu: Vec<Vec<bool>>,
     host: Vec<Vec<bool>>,
     /// Physical slot id -> resident expert, or `EMPTY_SLOT`.
@@ -578,6 +597,8 @@ impl TierLedger {
         let geometry = layout.geometry();
         let (layer_of, count) = Self::positions(&layout)?;
         let ledger = Self {
+            host_backing: u64::from(host_blocks)
+                == u64::from(geometry.layers) * u64::from(geometry.experts),
             gpu: vec![vec![false; geometry.experts as usize]; geometry.layers as usize],
             host: vec![vec![false; geometry.experts as usize]; geometry.layers as usize],
             slots: vec![EMPTY_SLOT; count],
@@ -672,6 +693,10 @@ impl TierLedger {
         })
     }
 
+    pub fn has_full_host_backing(&self) -> bool {
+        self.host_backing
+    }
+
     fn check_index(&self, layer: u32, expert: u32) -> Result<()> {
         let geometry = self.layout.geometry();
         ensure!(
@@ -697,7 +722,7 @@ impl TierLedger {
         self.host_blocks.saturating_sub(used)
     }
 
-    /// Admits a host expert into a GPU slot, writing the victim back into its block.
+    /// Admits a host expert into a GPU slot; complete backing retains both host copies.
     pub fn admit_host(&mut self, layer: u32, expert: u32, victim: u32) -> Result<()> {
         self.check_index(layer, expert)?;
         self.check_index(layer, victim)?;
@@ -716,7 +741,7 @@ impl TierLedger {
             !self.borrowed[position],
             "victim slot {position} is borrow-claimed"
         );
-        self.host[l][e] = false;
+        self.host[l][e] = self.host_backing;
         self.gpu[l][e] = true;
         self.gpu[l][v] = false;
         self.host[l][v] = true;
@@ -792,7 +817,7 @@ impl TierLedger {
             .empty_slot(layer)?
             .with_context(|| format!("layer {layer} has no empty slot for expert {expert}"))?;
         let position = usize::try_from(position).context("slot position exceeds usize")?;
-        self.host[l][e] = false;
+        self.host[l][e] &= self.host_backing;
         self.gpu[l][e] = true;
         self.slots[position] = expert;
         debug_assert!(self.check().is_ok());
@@ -832,7 +857,7 @@ impl TierLedger {
         self.check_index(layer, expert)?;
         let (l, e) = (layer as usize, expert as usize);
         ensure!(
-            !self.gpu[l][e],
+            !self.gpu[l][e] || self.host_backing,
             "expert {expert} of layer {layer} is GPU resident"
         );
         ensure!(
@@ -864,8 +889,8 @@ impl TierLedger {
 
     /// Borrows the last `slots` existing physical positions of the resident prefix
     /// (SlotLayout `borrowed_tail`, staging excluded, every layer's first slot retained).
-    /// At most `to_host_limit` victims are evicted into host blocks; the rest drop to the disk
-    /// tier; empty positions are only marked borrowed. The position list is validated before
+    /// At most `to_host_limit` new host copies are written; existing backing is retained.
+    /// Empty positions are only marked borrowed. The position list is validated before
     /// mutating. Reached only through `Residency::borrow`.
     pub(crate) fn borrow_tail(&mut self, slots: u32, to_host_limit: u32) -> Result<Borrow> {
         ensure!(slots > 0, "zero borrowed slots");
@@ -900,6 +925,7 @@ impl TierLedger {
         let mut victims: Vec<(u32, u32)> = Vec::with_capacity(slots as usize);
         let mut to_host = 0u32;
         let mut to_disk = 0u32;
+        let mut write_back = Vec::with_capacity(slots as usize);
         for position in (first..end).rev() {
             self.borrowed[position] = true;
             positions.push(u32::try_from(position).context("slot position exceeds u32")?);
@@ -910,7 +936,9 @@ impl TierLedger {
             let layer = self.layer_of[position];
             let (l, e) = (layer as usize, expert as usize);
             self.gpu[l][e] = false;
-            if to_host < to_host_limit {
+            let backed = self.host[l][e];
+            let copy = !backed && to_host < to_host_limit;
+            if backed || copy {
                 self.host[l][e] = true;
                 to_host += 1;
             } else {
@@ -918,15 +946,17 @@ impl TierLedger {
             }
             self.slots[position] = EMPTY_SLOT;
             victims.push((layer, expert));
+            write_back.push(copy);
         }
         self.check()?;
         Ok(Borrow {
-            d2h_bytes: u64::from(to_host) * slot_bytes,
+            d2h_bytes: write_back.iter().filter(|&&copy| copy).count() as u64 * slot_bytes,
             disk_bytes: u64::from(to_disk) * slot_bytes,
             positions,
             experts: victims,
             to_host,
             to_disk,
+            write_back,
             host_waits: Vec::new(),
         })
     }
@@ -949,9 +979,9 @@ impl TierLedger {
         let slots = self
             .gpu
             .iter()
-            .chain(self.host.iter())
-            .flat_map(|layer| layer.iter())
-            .filter(|resident| **resident)
+            .zip(&self.host)
+            .flat_map(|(gpu, host)| gpu.iter().zip(host))
+            .filter(|(gpu, host)| **gpu || **host)
             .count();
         u64::try_from(slots)?
             .checked_mul(self.layout.slot_bytes() as u64)
@@ -1027,7 +1057,8 @@ impl TierLedger {
             );
             for expert in 0..geometry.experts as usize {
                 ensure!(
-                    !(self.gpu[layer as usize][expert] && self.host[layer as usize][expert]),
+                    self.host_backing
+                        || !(self.gpu[layer as usize][expert] && self.host[layer as usize][expert]),
                     "expert {expert} of layer {layer} is both GPU and host resident"
                 );
                 if self.gpu[layer as usize][expert] {
@@ -1230,7 +1261,7 @@ mod tests {
         let inputs = inputs(&service, &reserves);
         let derived = capacity(&inputs, 0).unwrap();
         assert_eq!(derived.slots_per_layer, vec![2, 2]);
-        assert_eq!(derived.host_blocks, 15);
+        assert_eq!(derived.host_blocks, 16);
         assert_eq!(derived.disk_bytes, 0);
         let small_host = PlanInputs {
             host_available_bytes: reserves.host_bytes(slot()).unwrap() + 8 * slot(),
@@ -1279,6 +1310,38 @@ mod tests {
             ..capacity_ref(&inputs)
         };
         assert!(!capacity(&none, 0).unwrap().pinned);
+        let complete = PlanInputs {
+            host_available_bytes: reserves.host_bytes(slot()).unwrap() + 17 * slot(),
+            host_registration_bytes: 17 * slot(),
+            ..capacity_ref(&inputs)
+        };
+        let full = capacity(&complete, 0).unwrap();
+        assert_eq!(full.host_blocks, 16);
+        assert!(full.pinned);
+        for (host_available_bytes, host_registration_bytes) in [
+            (
+                complete.host_available_bytes - 1,
+                complete.host_registration_bytes,
+            ),
+            (
+                complete.host_available_bytes,
+                complete.host_registration_bytes - 1,
+            ),
+        ] {
+            let bounded = capacity(
+                &PlanInputs {
+                    host_available_bytes,
+                    host_registration_bytes,
+                    ..capacity_ref(&complete)
+                },
+                0,
+            )
+            .unwrap();
+            assert_eq!(bounded.host_blocks, 15);
+            assert_eq!(bounded.slots_per_layer, full.slots_per_layer);
+            assert_eq!(bounded.span_rows, full.span_rows);
+            assert!(bounded.pinned);
+        }
     }
 
     #[test]
@@ -1322,7 +1385,7 @@ mod tests {
         let inputs = inputs(&service, &reserves);
         assert_eq!(span_borrow_slots(&reserves, slot(), 4, 4).unwrap(), 3);
         let derived = capacity(&inputs, 0).unwrap();
-        assert_eq!(derived.host_blocks, 15, "12 non-GPU plus 3 borrow slots");
+        assert_eq!(derived.host_blocks, 16, "complete immutable host backing");
         assert_eq!(derived.spare_blocks, 1);
         assert_eq!(derived.disk_bytes, 0);
         assert_eq!(derived.disk_workers, 0);
