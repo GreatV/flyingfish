@@ -6,10 +6,290 @@ use super::{
 };
 use crate::{kv::KvFormat, op_contract::AttentionWorkspace, prefix_state::sha256};
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg};
 use half::bf16;
 use serde_json::{Value, json};
 use std::path::PathBuf;
+use std::sync::Arc;
+
+struct CommittedKv {
+    prefix: usize,
+    layout: crate::kv::KvLayout,
+    live: [Vec<bf16>; 2],
+    codes: [Vec<u8>; 2],
+    stats: [Vec<f32>; 2],
+}
+
+fn affine_codes(values: &[bf16]) -> (Vec<u8>, [f32; 2]) {
+    let lo = values.iter().map(|v| v.to_f32()).fold(f32::MAX, f32::min);
+    let hi = values.iter().map(|v| v.to_f32()).fold(f32::MIN, f32::max);
+    let scale = if hi == lo { 1.0 } else { (hi - lo) / 255.0 };
+    let codes = values
+        .iter()
+        .map(|v| {
+            ((v.to_f32() - lo) / scale)
+                .clamp(0.0, 255.0)
+                .round_ties_even() as u8
+        })
+        .collect();
+    (codes, [lo, scale])
+}
+
+impl CommittedKv {
+    fn capture(kv: &super::engine::Kv, prefix: usize, s: &Arc<CudaStream>) -> Result<Self> {
+        let c = kv.compact.as_ref().context("compact snapshot missing")?;
+        ensure!(
+            s.clone_dtoh(&c.cursor)?
+                == [prefix as i32, crate::kv::sealed_until(prefix) as i32, 0, 0],
+            "compact snapshot is not committed at prefix {prefix}"
+        );
+        let live = [s.clone_dtoh(&kv.k)?, s.clone_dtoh(&kv.v)?];
+        let stats = [s.clone_dtoh(&c.k_stats)?, s.clone_dtoh(&c.v_stats)?];
+        ensure!(
+            live.iter().flatten().all(|v| v.is_finite())
+                && stats.iter().flatten().all(|v| v.is_finite()),
+            "nonfinite compact snapshot"
+        );
+        Ok(Self {
+            prefix,
+            layout: c.layout,
+            live,
+            codes: [s.clone_dtoh(&c.k_code)?, s.clone_dtoh(&c.v_code)?],
+            stats,
+        })
+    }
+
+    fn differences(&self, kv: &super::engine::Kv, s: &Arc<CudaStream>) -> Result<usize> {
+        let c = kv.compact.as_ref().context("compact comparison missing")?;
+        let cursor = s.clone_dtoh(&c.cursor)?;
+        let sealed = usize::try_from(cursor[1])?;
+        let previous = crate::kv::sealed_until(self.prefix);
+        ensure!(
+            cursor[0] >= self.prefix as i32
+                && cursor[2..] == [0, 0]
+                && sealed >= previous
+                && sealed <= self.prefix
+                && sealed.is_multiple_of(crate::kv::GROUP_TOKENS),
+            "compact comparison cursor {cursor:?} prefix={}",
+            self.prefix
+        );
+        let mut codes = self.codes.clone();
+        let mut stats = self.stats.clone();
+        for h in 0..4 {
+            for start in (previous..sealed).step_by(crate::kv::GROUP_TOKENS) {
+                for d in 0..256 {
+                    let values = (start..start + crate::kv::GROUP_TOKENS)
+                        .map(|p| {
+                            Ok(self.live[0][(h * self.layout.ring
+                                + crate::kv::ring_slot(p, self.layout.ring)?)
+                                * 256
+                                + d])
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let (packed, scale) = affine_codes(&values);
+                    let stat = (h * self.layout.capacity.div_ceil(crate::kv::GROUP_TOKENS)
+                        + start / crate::kv::GROUP_TOKENS)
+                        * 256
+                        + d;
+                    stats[0][2 * stat..2 * stat + 2].copy_from_slice(&scale);
+                    for (r, code) in packed.into_iter().enumerate() {
+                        codes[0][(h * self.layout.capacity + start + r) * 256 + d] = code;
+                    }
+                }
+                for p in start..start + crate::kv::GROUP_TOKENS {
+                    let lo =
+                        (h * self.layout.ring + crate::kv::ring_slot(p, self.layout.ring)?) * 256;
+                    let (packed, scale) = affine_codes(&self.live[1][lo..lo + 256]);
+                    let dest = (h * self.layout.capacity + p) * 256;
+                    codes[1][dest..dest + 256].copy_from_slice(&packed);
+                    let stat = h * self.layout.capacity + p;
+                    stats[1][2 * stat..2 * stat + 2].copy_from_slice(&scale);
+                }
+            }
+        }
+        let mut different = 0;
+        for (which, tensor) in [&kv.k, &kv.v].into_iter().enumerate() {
+            let actual = s.clone_dtoh(tensor)?;
+            for h in 0..4 {
+                for p in (0..self.prefix).filter(|&p| p < crate::kv::SINK_TOKENS || p >= sealed) {
+                    let lo =
+                        (h * self.layout.ring + crate::kv::ring_slot(p, self.layout.ring)?) * 256;
+                    different += actual[lo..lo + 256]
+                        .iter()
+                        .zip(&self.live[which][lo..lo + 256])
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                }
+            }
+        }
+        for (which, tensor) in [&c.k_code, &c.v_code].into_iter().enumerate() {
+            different += s
+                .clone_dtoh(tensor)?
+                .iter()
+                .zip(&codes[which])
+                .filter(|(a, b)| a != b)
+                .count();
+        }
+        for (which, tensor) in [&c.k_stats, &c.v_stats].into_iter().enumerate() {
+            let actual = s.clone_dtoh(tensor)?;
+            ensure!(
+                actual.iter().all(|v| v.is_finite()),
+                "nonfinite KV statistics"
+            );
+            different += actual
+                .iter()
+                .zip(&stats[which])
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+        }
+        Ok(different)
+    }
+}
+
+#[test]
+#[ignore = "local GPU window required"]
+fn kv_cache_five_row_wrap_gpu() -> Result<()> {
+    let device = Device::new(0)?;
+    let s = &device.stream;
+    let cap = 16640;
+    let prefix = 4095;
+    let rows = crate::mtp::MAX_VERIFY_ROWS;
+    ensure!(rows == 5, "five-row regression geometry changed");
+    let spec = crate::model_spec::ModelSpec::qwen(
+        &serde_json::from_str(include_str!("../../../tests/data/q38-config.json"))?,
+        &Value::Null,
+    )?;
+    ensure!(
+        spec.kv_heads == 4 && spec.head_dim == 256,
+        "Qwen KV geometry"
+    );
+    let spec = crate::mtp::component_spec(&spec);
+    let values = |shift: usize| {
+        (0..4 * cap * 256)
+            .map(|i| {
+                let d = i % 256;
+                let p = i / 256 % cap;
+                let h = i / (256 * cap);
+                bf16::from_f32(((p * 17 + d * 29 + h * 43 + shift) % 251) as f32 / 64.0 - 2.0)
+            })
+            .collect::<Vec<_>>()
+    };
+    let k_src = s.clone_htod(&values(3))?;
+    let v_src = s.clone_htod(&values(19))?;
+    let mut state = StateStore::new_with_format(&spec, cap, KvFormat::Affine8, s)?;
+    state.set_sequence(s, 0, prefix as u32, prefix as u32)?;
+    let kv = &state.kv[0];
+    let c = kv.compact.as_ref().context("compact wrap cache missing")?;
+    let cache = c.view(&kv.k, &kv.v, s);
+    c.finish(
+        cache,
+        state.seq_ref(s)?,
+        Some((&k_src, &v_src, prefix)),
+        true,
+        s,
+    )?;
+    let before = CommittedKv::capture(kv, prefix, s)?;
+    let k_full = s.alloc_zeros::<bf16>(4 * cap * 256)?;
+    let v_full = s.alloc_zeros::<bf16>(4 * cap * 256)?;
+    state.set_sequence(s, prefix as u32, rows as u32, rows as u32)?;
+    let kv = &state.kv[0];
+    let c = kv.compact.as_ref().context("compact wrap cache missing")?;
+    c.dequant_prefix(cache, state.seq_ref(s)?, &k_full, &v_full, prefix, s)?;
+    let projection = |shift: usize| {
+        (0..rows * 1024)
+            .map(|i| bf16::from_f32(((i * 31 + shift) % 257) as f32 / 128.0 - 1.0))
+            .collect::<Vec<_>>()
+    };
+    let k = s.clone_htod(&projection(11))?;
+    let v = s.clone_htod(&projection(23))?;
+    let module = cubin::module(&device.ctx, "tcmqa_d256")?;
+    let writer = module.load_function("tcmqa_d256_write_ring")?;
+    let scatter_k = module.load_function("tcmqa_d256_rope_k_scatter")?;
+    let scatter_v = module.load_function("tcmqa_d256_v_scatter")?;
+    let meta = state.seq_ref(s)?.ptr;
+    let (kp, vp) = (k.device_ptr(s).0, v.device_ptr(s).0);
+    let (kf, vf) = (k_full.device_ptr(s).0, v_full.device_ptr(s).0);
+    let (stride, head, dim, axes) = (1024i32, (cap * 256) as i32, 256i32, 0u64);
+    let write_rows = || -> Result<()> {
+        unsafe {
+            s.launch_builder(&writer)
+                .arg(&kp)
+                .arg(&vp)
+                .arg(&meta)
+                .arg(&axes)
+                .arg(&stride)
+                .arg(&stride)
+                .arg(&cache)
+                .launch(flat(rows * 1024))?;
+            s.launch_builder(&scatter_k)
+                .arg(&kp)
+                .arg(&kf)
+                .arg(&meta)
+                .arg(&stride)
+                .arg(&head)
+                .arg(&dim)
+                .launch(flat(rows * 1024))?;
+            s.launch_builder(&scatter_v)
+                .arg(&vp)
+                .arg(&vf)
+                .arg(&meta)
+                .arg(&stride)
+                .arg(&head)
+                .arg(&dim)
+                .launch(flat(rows * 1024))?;
+        }
+        Ok(())
+    };
+    write_rows()?;
+    s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+    let launches = write_rows();
+    let graph = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+    launches?;
+    let graph = graph?.context("empty five-row writer graph")?;
+    graph.launch()?;
+    let q = s.clone_htod(
+        &(0..rows * 6144)
+            .map(|i| bf16::from_f32(((i * 7) % 251) as f32 / 512.0 - 0.25))
+            .collect::<Vec<_>>(),
+    )?;
+    let core = Core {
+        device: &device,
+        q: &q,
+        k: &kv.k,
+        v: &kv.v,
+        compact: Some(cache),
+    };
+    let eager = core.run(prefix, rows as u32, 0, false)?;
+    let actual = core.run(prefix, rows as u32, 0, true)?;
+    let expected = Core {
+        device: &device,
+        q: &q,
+        k: &k_full,
+        v: &v_full,
+        compact: None,
+    }
+    .run(prefix, rows as u32, 0, true)?;
+    let attention_differences = actual
+        .iter()
+        .zip(&expected)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    state.set_sequence(s, (prefix + rows) as u32, 1, rows as u32)?;
+    state.compact_commit(s, true)?;
+    let committed_differences = before.differences(&state.kv[0], s)?;
+    let graph_differences = eager
+        .iter()
+        .zip(&actual)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    let different = attention_differences + committed_differences + graph_differences;
+    let verdict = if different == 0 { "PASS" } else { "DEFECT" };
+    println!(
+        "T24_KV_FIVE_ROW_WRAP {verdict} prefix={prefix} rows={rows} attention_differences={attention_differences} committed_differences={committed_differences} graph_differences={graph_differences}"
+    );
+    ensure!(different == 0, "five-row KV wrap DEFECT");
+    Ok(())
+}
 
 fn input() -> Result<(PathBuf, PathBuf, Value)> {
     let root = PathBuf::from(
@@ -37,12 +317,19 @@ fn compact_binding_rejects_wrong_geometry_and_alignment() -> Result<()> {
         v_ring: 1536,
         cursor: 1792,
         capacity: 16640,
-        ring: 2243,
+        ring: crate::kv::RING_TOKENS as i32,
     };
-    for rows in 1..=5 {
+    for rows in 1..=crate::mtp::MAX_VERIFY_ROWS as u32 {
         view.validate(16640, rows)?;
     }
-    assert!(CacheView { ring: 2242, ..view }.validate(16640, 4).is_err());
+    assert!(
+        CacheView {
+            ring: view.ring - 1,
+            ..view
+        }
+        .validate(16640, 4)
+        .is_err()
+    );
     assert!(
         CacheView {
             k_stats: 769,
@@ -52,7 +339,10 @@ fn compact_binding_rejects_wrong_geometry_and_alignment() -> Result<()> {
         .is_err()
     );
     assert!(view.validate(16640, 0).is_err());
-    assert!(view.validate(16640, 6).is_err());
+    assert!(
+        view.validate(16640, crate::mtp::MAX_VERIFY_ROWS as u32 + 1)
+            .is_err()
+    );
     Ok(())
 }
 fn bf16_file(path: PathBuf, elements: usize) -> Result<Vec<bf16>> {

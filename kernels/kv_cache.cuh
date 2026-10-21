@@ -5,7 +5,6 @@
 #define KV_SINK_TOKENS 64
 #define KV_RECENT_TOKENS 2048
 #define KV_GROUP_TOKENS 128
-#define KV_TENTATIVE_TOKENS 4
 
 struct KvCacheView {
   unsigned char *k_code, *v_code;
