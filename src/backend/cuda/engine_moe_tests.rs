@@ -187,10 +187,6 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
         };
         let expected_placement = placement(5 << 30)?;
         write("proc/meminfo", "MemAvailable: 16777216 kB\n")?;
-        write(
-            "proc/self/limits",
-            "Max locked memory 8388608 8388608 bytes\n",
-        )?;
         let mounts = "1 0 0:1 / /other rw - cgroup none rw,cpuset\n2 0 0:2 /pod /controllers/memory\\040bank rw - cgroup none rw,cpu,memory\n3 0 0:3 / /sys/fs/cgroup rw - cgroup2 none rw\n";
         write("proc/self/mountinfo", mounts)?;
         write(
