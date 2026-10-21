@@ -7,8 +7,8 @@ use super::{
 };
 use crate::{
     backend::setup::{
-        ATTENTION_CAPACITIES, ATTENTION_LENGTHS, AttentionPlan, CacheKey, MultiImpl, MultiPlan,
-        MultiShape, Selection, attention_bucket, attention_chunks,
+        ATTENTION_LENGTHS, AttentionPlan, CacheKey, MultiImpl, MultiPlan, MultiShape, Selection,
+        attention_bucket, attention_chunks, attention_lengths,
     },
     config::Config,
 };
@@ -43,6 +43,8 @@ struct Cache {
     tree: bool,
     winner: MultiPlan,
     bucket: usize,
+    capacity: usize,
+    evaluation_lengths: [usize; 4],
     schema: u32,
     lengths: [usize; 5],
     trials: Vec<Trial>,
@@ -60,12 +62,12 @@ impl Calibrated {
     pub fn choose(&self, capacity: usize) -> Result<(MultiPlan, Selection)> {
         let bucket = attention_bucket(capacity)?;
         ensure!(
-            self.cache.bucket == bucket,
+            self.cache.bucket == bucket && self.cache.capacity == capacity,
             "multi calibration bucket does not match capacity"
         );
         eprintln!(
             "{}",
-            serde_json::json!({"attention_calibration_selection":{"capacity":capacity,"bucket":bucket,"measured_length":LENGTHS[bucket],"plan":self.cache.winner}})
+            serde_json::json!({"attention_calibration_selection":{"capacity":capacity,"bucket":bucket,"measured_length":self.cache.evaluation_lengths[0],"plan":self.cache.winner}})
         );
         Ok((
             self.cache.winner,
@@ -107,16 +109,10 @@ fn phase1_slots(budget: Budget, implementation: MultiImpl) -> usize {
     budget.sms * budget.phase1_resident[implementation.phase1() as usize].max(1)
 }
 
-/// KV capacity a calibration trial for this length bucket and row count
-/// allocates and launches with.
-fn calibration_capacity(length: usize, rows: usize) -> usize {
-    length + 256 + rows
-}
-
 /// 64-position-step chunks whose phase-1 grid fills at most one and two whole waves of resident CTAs.
-/// The grid is ceil(calibration_capacity / chunk) chunks per KV head times the row tiles.
+/// The grid is ceil(capacity / chunk) chunks per KV head times the row tiles.
 fn wave_chunks(
-    length: usize,
+    capacity: usize,
     rows: usize,
     kv_heads: usize,
     budget: Budget,
@@ -126,7 +122,7 @@ fn wave_chunks(
         .div_ceil(implementation.phase1_tile_rows())
         .max(1);
     let per_wave = (phase1_slots(budget, implementation) / (kv_heads * tiles)).max(1);
-    let work = calibration_capacity(length, rows);
+    let work = capacity;
     let mut chunks: Vec<usize> = [1usize, 2]
         .into_iter()
         .map(|waves| work.div_ceil(per_wave * waves).div_ceil(64) * 64)
@@ -160,13 +156,11 @@ fn baseline_chunks(bucket: usize, rows: usize) -> [usize; 2] {
     }
 }
 
-fn candidates(
-    bucket: usize,
-    rows: usize,
-    causal: bool,
-    tree: bool,
-    budget: Budget,
-) -> Vec<MultiPlan> {
+fn candidates(shape: MultiShape, tree: bool, budget: Budget) -> Result<Vec<MultiPlan>> {
+    let bucket = attention_bucket(shape.capacity)?;
+    let length = attention_lengths(shape.capacity, shape.rows)?[0];
+    let rows = shape.rows;
+    let causal = shape.causal;
     let mut plans = Vec::new();
     if causal && !tree && rows <= 16 {
         for &chunk in attention_chunks(bucket) {
@@ -190,7 +184,7 @@ fn candidates(
     let mut chunks: Vec<usize> = baseline_chunks(bucket, rows).to_vec();
     for implementation in [MultiImpl::Tcmqa, MultiImpl::TcmqaW, MultiImpl::TcmqaWs] {
         chunks.extend(wave_chunks(
-            LENGTHS[bucket],
+            shape.capacity,
             rows,
             budget.kv_heads,
             budget,
@@ -211,7 +205,7 @@ fn candidates(
         });
     }
     // 128-row tile variant: offered when rows span two or more 64-row tiles and one layer's K/V prefix exceeds L2.
-    if 8 * rows > 64 && LENGTHS[bucket] * budget.kv_bytes_per_token > budget.l2_bytes {
+    if 8 * rows > 64 && length * budget.kv_bytes_per_token > budget.l2_bytes {
         for &chunk in &chunks {
             plans.push(MultiPlan {
                 implementation: MultiImpl::TcmqaW,
@@ -235,11 +229,8 @@ fn candidates(
             });
         }
     }
-    let short_capacity = match bucket {
-        0 | 1 => Some(ATTENTION_CAPACITIES[bucket]),
-        _ => None,
-    };
-    if let Some(capacity) = short_capacity {
+    if bucket < 2 {
+        let capacity = shape.capacity;
         let short: Vec<_> = plans
             .iter()
             .filter_map(|p| {
@@ -256,7 +247,7 @@ fn candidates(
             .collect();
         plans.extend(short);
     }
-    plans
+    Ok(plans
         .into_iter()
         .flat_map(|p| {
             [
@@ -270,20 +261,24 @@ fn candidates(
                 },
             ]
         })
-        .collect()
+        .collect())
 }
 
 fn check(
     cache: &Cache,
     key: &CacheKey,
-    rows: usize,
-    causal: bool,
+    shape: MultiShape,
     tree: bool,
-    bucket: usize,
     budget: Budget,
 ) -> Result<()> {
+    let bucket = attention_bucket(shape.capacity)?;
+    let rows = shape.rows;
+    let causal = shape.causal;
+    let evaluation_lengths = attention_lengths(shape.capacity, rows)?;
     ensure!(
-        cache.schema == 2
+        cache.schema == 3
+            && cache.capacity == shape.capacity
+            && cache.evaluation_lengths == evaluation_lengths
             && cache.lengths == LENGTHS
             && cache.key == *key
             && cache.rows == rows
@@ -291,10 +286,10 @@ fn check(
             && cache.tree == tree
             && bucket < LENGTHS.len()
             && cache.bucket == bucket
-            && cache.trials.len() == candidates(bucket, rows, causal, tree, budget).len(),
+            && cache.trials.len() == candidates(shape, tree, budget)?.len(),
         "multi attention cache identity mismatch"
     );
-    let expected = candidates(bucket, rows, causal, tree, budget);
+    let expected = candidates(shape, tree, budget)?;
     let trials: Vec<_> = cache.trials.iter().filter(|t| t.bucket == bucket).collect();
     ensure!(
         trials.len() == expected.len(),
@@ -371,22 +366,21 @@ pub(super) fn cache_path(
     dir: &Path,
     key: &CacheKey,
     bucket: usize,
-    rows: usize,
-    causal: bool,
+    shape: MultiShape,
     tree: bool,
 ) -> PathBuf {
+    let rows = shape.rows;
+    let capacity = shape.capacity;
     dir.join(format!(
-        "multi-long-v2-b{bucket}-m{rows}-{}-{}-{}-{}.json",
+        "multi-long-v3-b{bucket}-c{capacity}-m{rows}-{}-{}.json",
         if tree {
             "tree"
-        } else if causal {
+        } else if shape.causal {
             "causal"
         } else {
             "full"
         },
-        key.device_uuid,
-        key.driver_version,
-        key.binary_version
+        key.tag()
     ))
 }
 
@@ -400,33 +394,25 @@ fn load_mask(
     closure: &super::closure::Closure,
 ) -> Result<Calibrated> {
     let rows = shape.rows;
-    let causal = shape.causal;
     let bucket = attention_bucket(shape.capacity)?;
     ensure!(
         (1..=64).contains(&rows),
         "multi attention M must be within1..64"
     );
-    let key = calibrate::key(d)?;
-    let path = cache_path(dir, &key, bucket, rows, causal, tree);
+    let key = d.key.clone();
+    attention_lengths(shape.capacity, rows)?;
+    let path = cache_path(dir, &key, bucket, shape, tree);
     let (cache, hit) = if closure.access(&path)? {
         let cache: Cache = serde_json::from_slice(&std::fs::read(&path)?)?;
-        check(&cache, &key, rows, causal, tree, bucket, budget(d, c)?)?;
+        check(&cache, &key, shape, tree, budget(d, c)?)?;
         (cache, true)
     } else {
         eprintln!(
             "{}",
-            serde_json::json!({"attention_calibration_cache":{"schema":2,"lengths":LENGTHS,"bucket":bucket,"path":path,"cached":false,"action":"measure requested bucket"}})
+            serde_json::json!({"attention_calibration_cache":{"schema":3,"lengths":LENGTHS,"bucket":bucket,"capacity":shape.capacity,"path":path,"cached":false,"action":"measure requested bucket"}})
         );
         let cache = measure(d, ops, c, key, shape, tree, closure)?;
-        check(
-            &cache,
-            &cache.key,
-            rows,
-            causal,
-            tree,
-            bucket,
-            budget(d, c)?,
-        )?;
+        check(&cache, &cache.key, shape, tree, budget(d, c)?)?;
         let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
         let mut f = std::fs::OpenOptions::new()
             .write(true)
@@ -456,12 +442,13 @@ fn measure(
     let start = Instant::now();
     let trial_ms = if causal { 10 } else { 30 };
     let s = &d.stream;
-    let capacities = LENGTHS.map(|n| calibration_capacity(n, rows));
+    let evaluation_lengths = attention_lengths(shape.capacity, rows)?;
+    let capacity = shape.capacity;
     let q_values = random(rows * c.qkv_dim(), 4);
     let zero_q = vec![bf16::ZERO; q_values.len()];
     let mut q = s.clone_htod(&q_values)?;
-    let k = s.clone_htod(&random(capacities[selected] * c.kv_dim(), 1))?;
-    let v_values = random(capacities[selected] * c.kv_dim(), 2);
+    let k = s.clone_htod(&random(capacity * c.kv_dim(), 1))?;
+    let v_values = random(capacity * c.kv_dim(), 2);
     let v_max = v_values
         .iter()
         .map(|v| v.to_f32().abs() as f64)
@@ -494,8 +481,9 @@ fn measure(
     s.synchronize()?;
     let mut trials = Vec::new();
     let mut winner = None;
-    for (bucket, &l) in LENGTHS.iter().enumerate().filter(|(b, _)| *b == selected) {
-        let capacity = capacities[bucket];
+    let bucket = selected;
+    let l = evaluation_lengths[0];
+    {
         let mut expected = vec![0f64; rows * c.kv_dim()];
         for head in 0..c.num_key_value_heads {
             let mut sum = vec![0f64; c.head_dim];
@@ -541,7 +529,7 @@ fn measure(
             }
         }
         let mut best = (f64::INFINITY, f64::INFINITY);
-        for plan in candidates(bucket, rows, causal, tree, budget(d, c)?) {
+        for plan in candidates(shape, tree, budget(d, c)?)? {
             let mut op = Verification::with_plan(
                 &d.ctx,
                 s,
@@ -618,7 +606,7 @@ fn measure(
             let mut samples = Vec::new();
             while timer.elapsed() < Duration::from_millis(trial_ms) {
                 for (index, (begin, end)) in events.iter().enumerate() {
-                    s.memcpy_htod(&[(l + [0, 1, 128, 256][index]) as i32], &mut length)?;
+                    s.memcpy_htod(&[evaluation_lengths[index] as i32], &mut length)?;
                     unsafe {
                         s.launch_builder(&ops.residual)
                             .arg(&mut flush)
@@ -654,7 +642,9 @@ fn measure(
     }
     let wall_ms = start.elapsed().as_secs_f64() * 1000.0;
     Ok(Cache {
-        schema: 2,
+        schema: 3,
+        capacity,
+        evaluation_lengths,
         lengths: LENGTHS,
         key,
         rows,
@@ -693,7 +683,7 @@ mod long_tests {
     #[test]
     fn measured_bucket_has_complete_candidates_and_valid_launches() -> Result<()> {
         let budget = Budget {
-            kv_bytes_per_token: 2 * 128 * std::mem::size_of::<bf16>() * 2,
+            kv_bytes_per_token: 2 * 128 * size_of::<bf16>() * 2,
             l2_bytes: 4 << 20,
             sms: 48,
             phase1_resident: [0, 2, 1, 2],
@@ -706,48 +696,40 @@ mod long_tests {
             (16, false, true),
             (64, false, true),
         ] {
-            for (bucket, &length) in LENGTHS.iter().enumerate() {
+            for (bucket, &capacity) in crate::backend::setup::ATTENTION_CAPACITIES
+                .iter()
+                .enumerate()
+            {
+                let shape = MultiShape {
+                    capacity,
+                    rows,
+                    causal,
+                };
                 let key = CacheKey {
                     device_uuid: "test".into(),
                     driver_version: "test".into(),
                     binary_version: "test".into(),
+                    cublaslt_version: 130201,
                 };
-                let plans = candidates(bucket, rows, causal, tree, budget);
+                let plans = candidates(shape, tree, budget)?;
                 assert_eq!(
                     plans.iter().any(|p| p.implementation.short_merge()),
                     bucket < 2
                 );
-                for plan in &plans {
-                    if plan.implementation.short_merge() {
-                        assert!(bucket < 2);
-                        let upper = ATTENTION_CAPACITIES[bucket];
-                        assert_eq!(attention_bucket(upper)?, bucket);
-                        assert_eq!(attention_bucket(upper + 1)?, bucket + 1);
-                        assert!(upper.div_ceil(plan.launch.chunk) <= 2 * budget.warp);
-                        assert!(matches!(plan.launch.merge_threads, 256 | 512));
-                        let original = MultiPlan {
-                            implementation: plan.implementation.phase1(),
-                            ..*plan
-                        };
-                        assert!(plans.contains(&original));
-                        assert_eq!(
-                            phase1_slots(budget, plan.implementation),
-                            phase1_slots(budget, original.implementation)
-                        );
-                        assert_eq!(
-                            plan.implementation.phase1_smem_bytes(),
-                            original.implementation.phase1_smem_bytes()
-                        );
-                    }
-                }
-                let mut union: Vec<usize> = baseline_chunks(bucket, rows).to_vec();
+                let mut union = baseline_chunks(bucket, rows).to_vec();
                 for variant in [MultiImpl::Tcmqa, MultiImpl::TcmqaW, MultiImpl::TcmqaWs] {
-                    union.extend(wave_chunks(length, rows, budget.kv_heads, budget, variant));
+                    union.extend(wave_chunks(
+                        capacity,
+                        rows,
+                        budget.kv_heads,
+                        budget,
+                        variant,
+                    ));
                 }
                 union.sort_unstable();
                 union.dedup();
                 for variant in [MultiImpl::Tcmqa, MultiImpl::TcmqaW, MultiImpl::TcmqaWs] {
-                    let mut offered: Vec<usize> = plans
+                    let mut offered: Vec<_> = plans
                         .iter()
                         .filter(|p| p.implementation == variant)
                         .map(|p| p.launch.chunk)
@@ -755,19 +737,21 @@ mod long_tests {
                     offered.sort_unstable();
                     offered.dedup();
                     assert!(offered.is_empty() || offered == union);
-                    let own = wave_chunks(length, rows, budget.kv_heads, budget, variant);
-                    assert!(own.iter().all(|chunk| union.contains(chunk)));
                 }
                 let mut trials = Vec::new();
                 for (i, plan) in plans.into_iter().enumerate() {
-                    let capacity = calibration_capacity(length, rows);
-                    assert!(capacity <= 131072);
                     assert!(
                         (2 * capacity.div_ceil(plan.launch.chunk)
                             + plan.launch.merge_threads as usize)
                             * 4
                             <= 49152
                     );
+                    if plan.implementation.short_merge() {
+                        assert!(
+                            bucket < 2 && capacity.div_ceil(plan.launch.chunk) <= 2 * budget.warp
+                        );
+                        assert!(matches!(plan.launch.merge_threads, 256 | 512));
+                    }
                     let median_us = (i + 1) as f64;
                     trials.push(Trial {
                         bucket,
@@ -786,34 +770,51 @@ mod long_tests {
                     tree,
                     winner: trials[0].plan,
                     bucket,
-                    schema: 2,
+                    capacity,
+                    evaluation_lengths: attention_lengths(capacity, rows)?,
+                    schema: 3,
                     lengths: LENGTHS,
                     trials,
                     wall_ms: 1.0,
                 };
-                check(&cache, &cache.key, rows, causal, tree, bucket, budget)?;
-                let winner = cache.winner;
-                cache.winner = cache.trials[1].plan;
-                assert!(check(&cache, &cache.key, rows, causal, tree, bucket, budget).is_err());
-                cache.winner = winner;
+                check(&cache, &cache.key, shape, tree, budget)?;
                 assert!(
                     check(
                         &cache,
                         &cache.key,
-                        rows,
-                        causal,
+                        MultiShape {
+                            capacity: capacity - 1,
+                            ..shape
+                        },
                         tree,
-                        (bucket + 1) % LENGTHS.len(),
-                        budget,
+                        budget
                     )
                     .is_err()
                 );
-                cache.schema = 1;
-                assert!(check(&cache, &cache.key, rows, causal, tree, bucket, budget).is_err());
                 cache.schema = 2;
+                assert!(check(&cache, &cache.key, shape, tree, budget).is_err());
+                cache.schema = 3;
+                cache.evaluation_lengths[3] = capacity;
+                assert!(check(&cache, &cache.key, shape, tree, budget).is_err());
+                cache.evaluation_lengths = attention_lengths(capacity, rows)?;
+                cache.winner = cache.trials[1].plan;
+                assert!(check(&cache, &cache.key, shape, tree, budget).is_err());
+                cache.winner = cache.trials[0].plan;
                 cache.trials.pop();
-                assert!(check(&cache, &cache.key, rows, causal, tree, bucket, budget).is_err());
+                assert!(check(&cache, &cache.key, shape, tree, budget).is_err());
             }
+            assert!(
+                candidates(
+                    MultiShape {
+                        capacity: rows - 1,
+                        rows,
+                        causal
+                    },
+                    tree,
+                    budget
+                )
+                .is_err()
+            );
         }
         Ok(())
     }

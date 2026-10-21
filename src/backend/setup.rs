@@ -1,5 +1,5 @@
 use crate::{config::Config, prefill::Plan};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -21,6 +21,16 @@ pub struct CacheKey {
     pub device_uuid: String,
     pub driver_version: String,
     pub binary_version: String,
+    pub cublaslt_version: usize,
+}
+
+impl CacheKey {
+    pub fn tag(&self) -> String {
+        format!(
+            "{}-{}-{}-lt{}",
+            self.device_uuid, self.driver_version, self.binary_version, self.cublaslt_version
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -101,9 +111,23 @@ pub struct LinearShape {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LinearImpl {
-    CublasLt(u32),
+    Cublas,
+    CublasLt(LtAlgorithm),
     Skinny,
     Candidate(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LtAlgorithm {
+    pub id: i32,
+    pub tile: i32,
+    pub split_k: i32,
+    pub reduction: i32,
+    pub swizzle: i32,
+    pub custom: i32,
+    pub stages: i32,
+    pub inner: u16,
+    pub cluster: u16,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -197,6 +221,15 @@ pub fn attention_bucket(capacity: usize) -> Result<usize> {
     Ok(ATTENTION_CAPACITIES.partition_point(|&upper| upper < capacity))
 }
 
+pub fn attention_lengths(capacity: usize, rows: usize) -> Result<[usize; 4]> {
+    let bucket = attention_bucket(capacity)?;
+    let maximum = capacity
+        .checked_sub(rows)
+        .context("attention query rows exceed capacity")?;
+    let base = ATTENTION_LENGTHS[bucket].min(maximum);
+    Ok([0, 1, 128, 256].map(|growth| (base + growth).min(maximum)))
+}
+
 pub fn attention_chunks(bucket: usize) -> &'static [usize] {
     if bucket < 3 {
         &[128, 256, 512, 1024]
@@ -231,6 +264,24 @@ mod long_tests {
         }
         assert!(attention_bucket(0).is_err());
         assert!(attention_bucket(131073).is_err());
+        for capacity in [
+            1, 7, 64, 257, 1023, 1024, 1280, 1312, 2048, 2049, 16384, 16385, 49152, 49153, 98304,
+            98305, 131072,
+        ] {
+            for rows in [0, 7, 8, 16, 64] {
+                if capacity < rows {
+                    assert!(attention_lengths(capacity, rows).is_err());
+                    continue;
+                }
+                let lengths = attention_lengths(capacity, rows)?;
+                assert!(lengths.iter().all(|&length| length + rows <= capacity));
+                assert_eq!(
+                    lengths[0],
+                    ATTENTION_LENGTHS[attention_bucket(capacity)?].min(capacity - rows)
+                );
+                assert!(lengths.windows(2).all(|pair| pair[0] <= pair[1]));
+            }
+        }
         for length in ATTENTION_LENGTHS {
             assert!(length + 256 + 64 <= 131072);
         }
@@ -289,6 +340,7 @@ mod long_tests {
                             device_uuid: String::new(),
                             driver_version: String::new(),
                             binary_version: String::new(),
+                            cublaslt_version: 130201,
                         },
                         cached: true,
                     },

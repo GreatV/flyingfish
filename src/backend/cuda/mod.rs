@@ -26,12 +26,13 @@ pub mod verification;
 pub(crate) mod vision;
 pub mod weights;
 
-use crate::backend::setup::DeviceInfo;
+use crate::backend::setup::{CacheKey, DeviceInfo};
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::{CudaContext, CudaStream};
 use std::sync::Arc;
 
 pub struct Device {
+    key: CacheKey,
     pub info: DeviceInfo,
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
@@ -77,7 +78,9 @@ impl Device {
         };
         let stream = ctx.new_stream()?;
         let upload = ctx.new_stream()?;
+        let key = calibrate::key(&ctx)?;
         Ok(Self {
+            key,
             info,
             ctx,
             stream,

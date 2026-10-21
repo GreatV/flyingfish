@@ -86,7 +86,7 @@ impl Verification {
             "MQ rows exceed implementation support"
         );
         ensure!(
-            capacity > rows && capacity <= i32::MAX as usize / 128,
+            capacity >= rows && capacity <= i32::MAX as usize / 128,
             "MQ capacity exceeds kernel stride range"
         );
         ensure!(

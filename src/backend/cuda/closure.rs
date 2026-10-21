@@ -252,10 +252,8 @@ impl Profile {
     }
     pub fn path(&self, dir: &Path, key: &CacheKey) -> Result<PathBuf> {
         Ok(dir.join(format!(
-            "closure-v1-{}-{}-{}-{}.json",
-            key.device_uuid,
-            key.driver_version,
-            key.binary_version,
+            "closure-v1-{}-{}.json",
+            key.tag(),
             hash(&serde_json::to_vec(self)?)
         )))
     }
@@ -721,6 +719,7 @@ mod tests {
                 device_uuid: "test".into(),
                 driver_version: "test".into(),
                 binary_version: "test".into(),
+                cublaslt_version: 130201,
             };
             for budget in [
                 None,
@@ -1077,6 +1076,7 @@ mod tests {
                 device_uuid: "test".into(),
                 driver_version: "test".into(),
                 binary_version: "test".into(),
+                cublaslt_version: 130201,
             };
             let profile = || Profile {
                 linear: BTreeSet::new(),

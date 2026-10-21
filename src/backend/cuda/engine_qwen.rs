@@ -1484,7 +1484,7 @@ impl Engine {
                     .as_deref()
                     .context("draft calibration path missing")?,
             )?;
-            let key = super::super::calibrate::key(&engine.device)?;
+            let key = engine.device.key.clone();
             let mut paths: Vec<_> = profile
                 .linear
                 .iter()

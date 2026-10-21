@@ -43,7 +43,7 @@ unsafe fn heuristic_algos(
     ensure!(!ok.is_empty(), "cuBLASLt returned no successful algorithm");
     Ok(ok)
 }
-use crate::backend::setup::{LinearChoice, LinearImpl, LinearShape};
+use crate::backend::setup::{LinearChoice, LinearImpl, LinearShape, LtAlgorithm};
 use anyhow::{Context, Result, ensure};
 use cudarc::{
     cublas::{CudaBlas, Gemm, GemmConfig, sys as bs},
@@ -77,6 +77,41 @@ struct Plan {
 }
 
 impl Plan {
+    fn attr16(&self, attr: sys::cublasLtMatmulAlgoConfigAttributes_t) -> Result<u16> {
+        let mut value = 0u16;
+        let mut written = 0usize;
+        unsafe {
+            sys::cublasLtMatmulAlgoConfigGetAttribute(
+                self.algo.as_ref().context("Lt algorithm missing")?,
+                attr,
+                (&mut value as *mut u16).cast(),
+                size_of::<u16>(),
+                &mut written,
+            )
+            .result()?;
+        }
+        ensure!(
+            written == size_of::<u16>(),
+            "Lt attribute {attr:?} returned {written} bytes"
+        );
+        Ok(value)
+    }
+
+    fn identity(&self) -> Result<LtAlgorithm> {
+        use sys::cublasLtMatmulAlgoConfigAttributes_t as A;
+        Ok(LtAlgorithm {
+            id: self.attr(A::CUBLASLT_ALGO_CONFIG_ID)?,
+            tile: self.attr(A::CUBLASLT_ALGO_CONFIG_TILE_ID)?,
+            split_k: self.attr(A::CUBLASLT_ALGO_CONFIG_SPLITK_NUM)?,
+            reduction: self.attr(A::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME)?,
+            swizzle: self.attr(A::CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING)?,
+            custom: self.attr(A::CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION)?,
+            stages: self.attr(A::CUBLASLT_ALGO_CONFIG_STAGES_ID)?,
+            inner: self.attr16(A::CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID)?,
+            cluster: self.attr16(A::CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID)?,
+        })
+    }
+
     fn attr(&self, attr: sys::cublasLtMatmulAlgoConfigAttributes_t) -> Result<i32> {
         let mut value = 0i32;
         let mut written = 0usize;
@@ -258,7 +293,7 @@ impl Drop for Plan {
 }
 
 pub struct Blas {
-    choices: RefCell<BTreeMap<LinearShape, LinearChoice>>,
+    choices: RefCell<BTreeMap<LinearShape, (LinearChoice, u32)>>,
     coverage: Option<(usize, std::collections::BTreeSet<(usize, usize)>)>,
     calibration: linear_calibrate::Environment,
     fp8: Option<super::linear::Fp8Ops>,
@@ -288,7 +323,158 @@ fn checked_dims(rows: usize, output: usize, input: usize) -> Result<()> {
     Ok(())
 }
 
+fn algorithm_index(candidates: &[LinearImpl], implementation: &LinearImpl) -> Result<u32> {
+    if *implementation == LinearImpl::Skinny {
+        return Ok(0);
+    }
+    let matches: Vec<_> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| *candidate == implementation)
+        .map(|(index, _)| index)
+        .collect();
+    ensure!(
+        matches.len() == 1,
+        "frozen algorithm {implementation:?} has {} matches in current Lt candidates {candidates:?}",
+        matches.len()
+    );
+    Ok(matches[0] as u32)
+}
+
 impl Blas {
+    #[cfg(test)]
+    pub(super) fn calibration_identity_gate(
+        device: &Device,
+        ops: &Ops,
+        runtime: &Path,
+    ) -> Result<()> {
+        use std::collections::BTreeSet;
+        let stream = &device.stream;
+        let mut discriminating = 0;
+        for (output, input) in [(2048, 2048), (12288, 2048), (2048, 6144)] {
+            let shape = LinearShape {
+                rows: 8,
+                output,
+                input,
+            };
+            let mut blas = Self::new(
+                device,
+                ops,
+                runtime,
+                Rc::new(super::closure::Closure::new(
+                    true,
+                    "Lt identity gate".into(),
+                )),
+            )?;
+            let w = stream.clone_htod(&super::calibrate::random(output * input, 13))?;
+            let x = stream.clone_htod(&super::calibrate::random(8 * input, 17))?;
+            blas.calibrate_shape(&w, &x.slice(..), shape)?;
+            let candidates = blas.candidates(shape)?;
+            let Some(other) = candidates
+                .iter()
+                .position(|candidate| *candidate != candidates[0])
+            else {
+                println!("Lt identity cell {shape:?} has one distinct candidate");
+                continue;
+            };
+            discriminating += 1;
+            let path = blas.choice_path(shape);
+            let cold = std::fs::read(&path)?;
+            let mut cache: serde_json::Value = serde_json::from_slice(&cold)?;
+            let trials = cache["trials"]
+                .as_array_mut()
+                .context("Lt trials missing")?;
+            for (i, trial) in trials.iter_mut().enumerate() {
+                let median = (i + 1) as f64;
+                trial["median_us"] = median.into();
+                trial["p10_us"] = median.into();
+                trial["p90_us"] = median.into();
+            }
+            let implementation = serde_json::to_value(&candidates[0])?;
+            cache["choice"]["implementation"] = implementation.clone();
+            cache["choice"]["median_us"] = 1.0.into();
+            let frozen = serde_json::to_vec_pretty(&cache)?;
+            std::fs::write(&path, &frozen)?;
+            let mut y = stream.alloc_zeros::<bf16>(8 * output)?;
+            blas.cublas(&w, &x.slice(..), &mut y.slice_mut(..), shape, 0)?;
+            let expected = stream.clone_dtoh(&y)?;
+            {
+                let mut plans = blas.plans.borrow_mut();
+                let first = plans
+                    .remove(&(8, output, input, 0))
+                    .context("first Lt plan missing")?;
+                let second = plans
+                    .remove(&(8, output, input, other as u32))
+                    .context("second Lt plan missing")?;
+                plans.insert((8, output, input, 0), second);
+                plans.insert((8, output, input, other as u32), first);
+            }
+            blas.choices.borrow_mut().clear();
+            blas.load_choices(&BTreeSet::from([shape]))?;
+            let index = blas
+                .choices
+                .borrow()
+                .get(&shape)
+                .context("bound choice missing")?
+                .1;
+            let actual_identity = blas
+                .plans
+                .borrow()
+                .get(&(8, output, input, index))
+                .context("bound Lt plan missing")?
+                .identity()?;
+            ensure!(
+                LinearImpl::CublasLt(actual_identity) == candidates[0],
+                "DEFECT Lt identity binding after reorder: expected={:?} actual={actual_identity:?} index={index}",
+                candidates[0]
+            );
+            for graph in [false, true] {
+                if graph {
+                    stream.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                }
+                blas.linear(&w, &x.slice(..), &mut y.slice_mut(..), 8, output, input)?;
+                if graph {
+                    let captured = stream
+                        .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
+                        .context("Lt gate captured no graph")?;
+                    captured.launch()?;
+                    stream.synchronize()?;
+                }
+                let actual = stream.clone_dtoh(&y)?;
+                ensure!(
+                    actual
+                        .iter()
+                        .zip(&expected)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "DEFECT Lt identity output changed after reuse {shape:?} graph={graph}"
+                );
+            }
+            ensure!(
+                std::fs::read(&path)? == frozen,
+                "Lt cache changed during reuse"
+            );
+            let wrong_tile = i32::MAX;
+            cache["choice"]["implementation"]["CublasLt"]["tile"] = wrong_tile.into();
+            cache["trials"][0]["implementation"]["CublasLt"]["tile"] = wrong_tile.into();
+            std::fs::write(&path, serde_json::to_vec(&cache)?)?;
+            blas.choices.borrow_mut().clear();
+            ensure!(
+                blas.load_choices(&BTreeSet::from([shape])).is_err(),
+                "invalid Lt tile was accepted"
+            );
+            std::fs::write(&path, &frozen)?;
+            println!(
+                "PASS calibration_lt_identity shape={shape:?} id={} tile={} reordered_index={index} eager_graph_bits=0 missing_tile=rejected fixture=planted_frozen_choice",
+                actual_identity.id, actual_identity.tile
+            );
+        }
+        ensure!(
+            discriminating > 0,
+            "no native Lt shape distinguishes reordered algorithm identities"
+        );
+        Ok(())
+    }
+
     pub fn new(
         device: &Device,
         ops: &Ops,
@@ -335,7 +521,9 @@ impl Blas {
     pub fn load_choices(&mut self, shapes: &std::collections::BTreeSet<LinearShape>) -> Result<()> {
         for &shape in shapes {
             let choice = self.calibration.read(shape)?;
-            self.choices.borrow_mut().insert(shape, choice);
+            let index = algorithm_index(&self.candidates(shape)?, &choice.implementation)
+                .with_context(|| format!("bind frozen Lt choice for {shape:?}"))?;
+            self.choices.borrow_mut().insert(shape, (choice, index));
         }
         Ok(())
     }
@@ -387,6 +575,28 @@ impl Blas {
         Ok(count as u32)
     }
 
+    fn candidates(&self, shape: LinearShape) -> Result<Vec<LinearImpl>> {
+        let LinearShape {
+            rows,
+            output,
+            input,
+        } = shape;
+        if rows == 1 {
+            return Ok(vec![LinearImpl::Cublas]);
+        }
+        let count = self.lt_algo_count(rows, output, input)?;
+        (0..count)
+            .map(|index| {
+                self.prepare_with(rows, output, input, index)?;
+                let plans = self.plans.borrow();
+                let plan = plans
+                    .get(&(rows, output, input, index))
+                    .context("Lt candidate missing")?;
+                Ok(LinearImpl::CublasLt(plan.identity()?))
+            })
+            .collect()
+    }
+
     pub fn linear(
         &self,
         w: &impl DevicePtr<bf16>,
@@ -418,9 +628,9 @@ impl Blas {
             );
         }
         let mut algo = 0u32;
-        if let Some(choice) = self.choices.borrow().get(&shape) {
+        if let Some((choice, index)) = self.choices.borrow().get(&shape) {
             match &choice.implementation {
-                LinearImpl::CublasLt(index) => algo = *index,
+                LinearImpl::Cublas | LinearImpl::CublasLt(_) => algo = *index,
                 LinearImpl::Skinny => return self.skinny(w, x, y, shape),
                 LinearImpl::Candidate(name) => {
                     anyhow::bail!("linear candidate {name} has not been registered for {shape:?}")
@@ -438,24 +648,26 @@ impl Blas {
         shape: LinearShape,
     ) -> Result<()> {
         linear_calibrate::check_extent(shape, w.len(), x.len())?;
-        self.prepare(shape.rows, shape.output, shape.input)?;
-        let algos = self.lt_algo_count(shape.rows, shape.output, shape.input)?;
-        let (rows, output, input) = (shape.rows, shape.output, shape.input);
+        let candidates = self.candidates(shape)?;
+        let (rows, output) = (shape.rows, shape.output);
         {
-            let choice = self.calibration.load(shape, algos, |implementation, out| {
-                let mut y = out.slice_mut(..rows * output);
-                match implementation {
-                    LinearImpl::CublasLt(algo) => {
-                        self.prepare_with(rows, output, input, *algo)?;
-                        self.cublas(w, x, &mut y, shape, *algo)
+            let choice = self
+                .calibration
+                .load(shape, &candidates, |implementation, out| {
+                    let mut y = out.slice_mut(..rows * output);
+                    match implementation {
+                        LinearImpl::Cublas | LinearImpl::CublasLt(_) => {
+                            let index = algorithm_index(&candidates, implementation)?;
+                            self.cublas(w, x, &mut y, shape, index)
+                        }
+                        LinearImpl::Skinny => self.skinny(w, x, &mut y, shape),
+                        LinearImpl::Candidate(name) => {
+                            anyhow::bail!("unknown linear candidate {name}")
+                        }
                     }
-                    LinearImpl::Skinny => self.skinny(w, x, &mut y, shape),
-                    LinearImpl::Candidate(name) => {
-                        anyhow::bail!("unknown linear candidate {name}")
-                    }
-                }
-            })?;
-            self.choices.borrow_mut().insert(shape, choice);
+                })?;
+            let index = algorithm_index(&candidates, &choice.implementation)?;
+            self.choices.borrow_mut().insert(shape, (choice, index));
         }
         Ok(())
     }
@@ -504,11 +716,9 @@ impl Blas {
 
     pub fn decode_impl(&self) -> &'static str {
         let choices = self.choices.borrow();
-        let rows: Vec<_> = choices.values().filter(|c| c.shape.rows == 1).collect();
-        if rows
-            .iter()
-            .any(|c| matches!(c.implementation, LinearImpl::Skinny))
-        {
+        if choices.values().any(|(choice, _)| {
+            choice.shape.rows == 1 && choice.implementation == LinearImpl::Skinny
+        }) {
             "calibrated cuBLAS/skinny BF16, FP32 accumulation"
         } else {
             "calibrated cuBLAS BF16, FP32 accumulation"
@@ -645,22 +855,6 @@ impl Blas {
         use sys::cublasLtMatmulAlgoConfigAttributes_t as A;
         let mut plans = Vec::new();
         for (&(rows, output, input, index), p) in self.plans.borrow().iter() {
-            let attr16 = |attribute| -> Result<u16> {
-                let mut value = 0u16;
-                let mut written = 0usize;
-                unsafe {
-                    sys::cublasLtMatmulAlgoConfigGetAttribute(
-                        p.algo.as_ref().context("fixed Lt algorithm missing")?,
-                        attribute,
-                        (&mut value as *mut u16).cast(),
-                        size_of::<u16>(),
-                        &mut written,
-                    )
-                    .result()?;
-                }
-                ensure!(written == size_of::<u16>(), "Lt short attribute size");
-                Ok(value)
-            };
             plans.push(serde_json::json!({
                 "rows":rows,"output":output,"input":input,"algo_index":index,
                 "id":p.attr(A::CUBLASLT_ALGO_CONFIG_ID)?,
@@ -671,8 +865,8 @@ impl Blas {
                 "cta_swizzling":p.attr(A::CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING)?,
                 "custom_option":p.attr(A::CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION)?,
                 "stages_id":p.attr(A::CUBLASLT_ALGO_CONFIG_STAGES_ID)?,
-                "inner_shape_id":attr16(A::CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID)?,
-                "cluster_shape_id":attr16(A::CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID)?,
+                "inner_shape_id":p.attr16(A::CUBLASLT_ALGO_CONFIG_INNER_SHAPE_ID)?,
+                "cluster_shape_id":p.attr16(A::CUBLASLT_ALGO_CONFIG_CLUSTER_SHAPE_ID)?,
                 "opaque_algorithm":p.algo.as_ref().context("fixed Lt algorithm missing")?.data
             }));
         }
@@ -938,6 +1132,37 @@ impl Blas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn algorithm_identity_survives_heuristic_reordering() -> Result<()> {
+        let a = LtAlgorithm {
+            id: 7,
+            tile: 20,
+            split_k: 1,
+            reduction: 0,
+            swizzle: 0,
+            custom: 0,
+            stages: 16,
+            inner: 0,
+            cluster: 0,
+        };
+        let b = LtAlgorithm { tile: 21, ..a };
+        let original = [LinearImpl::CublasLt(a), LinearImpl::CublasLt(b)];
+        let reordered = [original[1].clone(), original[0].clone()];
+        assert_eq!(algorithm_index(&original, &original[0])?, 0);
+        assert_eq!(algorithm_index(&reordered, &original[0])?, 1);
+        for wrong in [
+            LtAlgorithm { id: 8, ..a },
+            LtAlgorithm { tile: 22, ..a },
+            LtAlgorithm { stages: 17, ..a },
+        ] {
+            assert!(algorithm_index(&original, &LinearImpl::CublasLt(wrong)).is_err());
+        }
+        assert!(
+            algorithm_index(&[original[0].clone(), original[0].clone()], &original[0]).is_err()
+        );
+        Ok(())
+    }
 
     /// Only the i32-cast paths (rows == 1 cuBLAS and skinny) are bounded.
     #[test]
