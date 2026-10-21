@@ -65,12 +65,7 @@ fn main() {
         (
             "kernels/kv_cache.cuh",
             "KV_",
-            &[
-                "SINK_TOKENS",
-                "RECENT_TOKENS",
-                "GROUP_TOKENS",
-                "TENTATIVE_TOKENS",
-            ][..],
+            &["SINK_TOKENS", "RECENT_TOKENS", "GROUP_TOKENS"][..],
             "usize",
             "kv_geometry.rs",
         ),
@@ -89,6 +84,10 @@ fn main() {
                 .expect("numeric kernel constant");
             assert!(value <= 101_376);
             constants.push_str(&format!("pub const {name}: {ty} = {value};\n"));
+        }
+        if output == "kv_geometry.rs" {
+            constants
+                .push_str("pub const TENTATIVE_TOKENS: usize = crate::mtp::MAX_VERIFY_ROWS;\n");
         }
         fs::write(out.join(output), constants).expect("write kernel constants");
     }

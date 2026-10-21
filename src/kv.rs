@@ -153,8 +153,8 @@ mod tests {
             (a.codes * 2 + (a.k_stats + a.v_stats) * 4) * 16,
             8_992_587_776
         );
-        assert_eq!(a.ring_elements * 4 * 16, 146_997_248);
-        assert_eq!(a.bytes * 16, 9_139_585_280);
+        assert_eq!(a.ring_elements * 4 * 16, 147_062_784);
+        assert_eq!(a.bytes * 16, 9_139_650_816);
         assert_eq!(
             KvFormat::Bf16.layout(262144, 4, 256)?.bytes * 16,
             17_179_869_184
@@ -163,15 +163,16 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn committed_complete_blocks_and_four_tentative_slots() -> Result<()> {
+    fn committed_complete_blocks_and_max_verify_rows() -> Result<()> {
         let ring = KvFormat::Affine8.layout(262144, 4, 256)?.ring;
         for n in 0..16384 {
             let start = sealed_until(n);
             assert!(start.is_multiple_of(128) && start <= n.saturating_sub(2048));
-            let slots = (start.max(64)..n + 4)
+            let end = n + crate::mtp::MAX_VERIFY_ROWS;
+            let slots = (start.max(64)..end)
                 .map(|p| ring_slot(p, ring))
                 .collect::<Result<std::collections::BTreeSet<_>>>()?;
-            assert_eq!(slots.len(), n + 4 - start.max(64).min(n + 4));
+            assert_eq!(slots.len(), end - start.max(64).min(end), "prefix={n}");
         }
         assert_eq!([2175, 2176, 2177].map(sealed_until), [0, 128, 128]);
         assert_eq!([2047, 2048, 2049].map(sealed_until), [0, 0, 0]);
