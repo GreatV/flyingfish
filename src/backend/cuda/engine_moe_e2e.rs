@@ -2053,13 +2053,13 @@ fn minicpm_chain_decode_timing_gpu() -> Result<()> {
 }
 
 #[test]
-#[ignore = "exclusive CUDA, BF16 FF_MODEL, text_1k reference and pinned calibration required"]
+#[ignore = "exclusive CUDA, native FF_MODEL, text_1k reference and pinned calibration required"]
 fn minicpm_expert_swap_identity_gpu() -> Result<()> {
     chain_decode_timing(&["text_1k"], 1, true)
 }
 
 #[test]
-#[ignore = "exclusive CUDA timing, BF16 FF_MODEL, text_1k reference and pinned calibration required"]
+#[ignore = "exclusive CUDA timing, native FF_MODEL, text_1k reference and pinned calibration required"]
 fn minicpm_expert_swap_timing_gpu() -> Result<()> {
     chain_decode_timing(&["text_1k"], 2, false)
 }

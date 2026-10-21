@@ -294,6 +294,7 @@ impl Setup {
                 "mixer_rows":workspace.mixer.plan.chunk,"workspace_rows":workspace.workspace_rows,
                 "borrowed_slots":workspace.borrowed_slots,"slots_per_layer":capacity.slots_per_layer,
                 "host_blocks":capacity.host_blocks,"spare_blocks":capacity.spare_blocks,
+                "host_backing_complete":u64::from(capacity.host_blocks)==u64::from(geometry.layers)*u64::from(geometry.experts),
                 "disk_bytes":capacity.disk_bytes,"pinned":capacity.pinned,
                 "host_available_bytes":available,"host_registration_bytes":registration,
                 "device_fixed_bytes":workspace.candidate.reserves.device_fixed_bytes,
@@ -545,6 +546,14 @@ impl DecodePhase {
 
     fn reset(&mut self) {
         *self = Self::default();
+    }
+}
+
+impl Drop for Decode {
+    fn drop(&mut self) {
+        self.mailbox
+            .context()
+            .record_err(self.mailbox.synchronize());
     }
 }
 
@@ -1016,7 +1025,6 @@ impl Decode {
             }
             self.mailbox_ready.record(&self.mailbox)?;
             stream.wait(&self.mailbox_ready)?;
-            self.mailbox_ready.synchronize()?;
             self.stats[2] += (dispatch.assignments.len() + dispatch.disk.len()) as u64;
             self.stats[3] += 1;
         }

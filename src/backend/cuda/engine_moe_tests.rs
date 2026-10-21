@@ -1052,21 +1052,32 @@ fn graph_gate(format: crate::model_spec::ExpertFormat) -> Result<()> {
     let frequency = vec![vec![1.0; 16]; 2];
     let mut defects = 0;
     let mut control = false;
-    for (resident, pinned, engines, cap) in [
-        (true, false, 1, 0),
-        (false, false, 1, 2),
-        (false, true, 2, 2),
-        (false, false, 2, 0),
+    for (resident, pinned, engines, cap, backed) in [
+        (true, false, 1, 0, false),
+        (false, false, 1, 2, false),
+        (false, true, 2, 2, false),
+        (false, false, 2, 0, false),
+        (false, false, 1, 2, true),
+        (false, true, 2, 2, true),
     ] {
         let mut capacity = tier_capacity(geometry, pinned, format)?;
         if cap == 0 {
             capacity.spare_blocks = 1;
             capacity.host_expert_bytes = 9 * capacity.slot_bytes();
         }
+        if backed {
+            capacity.host_blocks = geometry.layers * geometry.experts;
+            capacity.spare_blocks = 0;
+            capacity.host_expert_bytes =
+                u64::from(capacity.host_blocks + capacity.spare_blocks) * capacity.slot_bytes();
+            capacity.disk_bytes = 0;
+            capacity.disk_workers = 0;
+        }
         let mut pair = (0..2)
             .map(|arm| {
-                let directory =
-                    runtime.join(format!("graphs-{resident}-{pinned}-{engines}-{cap}-{arm}"));
+                let directory = runtime.join(format!(
+                    "graphs-{resident}-{pinned}-{engines}-{cap}-{backed}-{arm}"
+                ));
                 if resident {
                     Engine::load_moe_test(&fixture, &directory, 8, format)
                 } else {
@@ -1112,7 +1123,7 @@ fn graph_gate(format: crate::model_spec::ExpertFormat) -> Result<()> {
         reference.closure.ready(Instant::now())?;
         candidate.closure.ready(Instant::now())?;
         println!(
-            "{} moe_graph_capture resident={resident} pinned={pinned} engines={engines} admission_cap={cap} graphs={expected_graphs} state_bit_mismatches={capture_mismatches}",
+            "{} moe_graph_capture resident={resident} pinned={pinned} engines={engines} admission_cap={cap} backed={backed} graphs={expected_graphs} state_bit_mismatches={capture_mismatches}",
             if capture_mismatches == 0 {
                 "PASS"
             } else {
@@ -1175,7 +1186,7 @@ fn graph_gate(format: crate::model_spec::ExpertFormat) -> Result<()> {
                 let mismatch = logits + state + placement;
                 defects += usize::from(mismatch != 0);
                 println!(
-                    "{} moe_graph_decode resident={resident} pinned={pinned} engines={engines} admission_cap={cap} request={request} step={step} logits_bit_mismatches={logits} state_bit_mismatches={state} placement_mismatches={placement} graph_launches={expected_graphs}",
+                    "{} moe_graph_decode resident={resident} pinned={pinned} engines={engines} admission_cap={cap} backed={backed} request={request} step={step} logits_bit_mismatches={logits} state_bit_mismatches={state} placement_mismatches={placement} graph_launches={expected_graphs}",
                     if mismatch == 0 { "PASS" } else { "DEFECT" }
                 );
             }
@@ -1223,7 +1234,7 @@ fn graph_gate(format: crate::model_spec::ExpertFormat) -> Result<()> {
     ensure!(control, "Runner FAIL graph control did not execute");
     ensure!(defects == 0, "DEFECT MoE graph cells={defects}");
     println!(
-        "PASS moe_graph_gate format={format:?} cases=4 requests=2 steps=6 bitwise=true control=wrong_join"
+        "PASS moe_graph_gate format={format:?} cases=6 requests=2 steps=6 bitwise=true control=wrong_join backing=partial,complete"
     );
     Ok(())
 }
@@ -1952,9 +1963,20 @@ fn tier_gate(
                 references.insert((layer, rows), trace);
             }
         }
-        for &(pinned, engines) in cases {
-            let directory = runtime.join(format!("tier-{variant}-{pinned}-{engines}"));
-            let capacity = tier_capacity(geometry, pinned, format)?;
+        for (pinned, engines, backed) in cases
+            .iter()
+            .flat_map(|&(pinned, engines)| [(pinned, engines, false), (pinned, engines, true)])
+        {
+            let directory = runtime.join(format!("tier-{variant}-{pinned}-{engines}-{backed}"));
+            let mut capacity = tier_capacity(geometry, pinned, format)?;
+            if backed {
+                capacity.host_blocks = geometry.layers * geometry.experts;
+                capacity.spare_blocks = 0;
+                capacity.host_expert_bytes =
+                    u64::from(capacity.host_blocks + capacity.spare_blocks) * capacity.slot_bytes();
+                capacity.disk_bytes = 0;
+                capacity.disk_workers = 0;
+            }
             let mut oracle = TierOracle::new(&fixture, &directory.join("oracle"), &capacity)?;
             let mut engine = Engine::load_moe_placed(
                 &fixture,
@@ -1992,7 +2014,7 @@ fn tier_gate(
                         .moe_slots
                         .as_mut()
                         .context("tier request slots missing")?;
-                    slots.delay_copies()?;
+                    slots.delay_copies();
                     slots.begin_request(&frequency)?;
                 }
                 defects += oracle.compare_state(&engine)?;
@@ -2021,6 +2043,10 @@ fn tier_gate(
                         updates.len() <= 2,
                         "Runner FAIL CPU oracle exceeds frozen admission cap"
                     );
+                    ensure!(
+                        !backed || updates.iter().all(|update| update.dest_block.is_none()),
+                        "DEFECT complete backing requested a victim write-back"
+                    );
                     admissions += updates.len();
                     for update in &updates {
                         oracle.policy.record_copy(&[update.slot], event)?;
@@ -2030,12 +2056,12 @@ fn tier_gate(
                         .moe_slots
                         .as_mut()
                         .context("tier admission slots missing")?;
-                    slots.delay_copies()?;
+                    slots.delay_copies();
                     slots.finish_token()?;
                     let mismatch = oracle.compare_state(&engine)?;
                     defects += mismatch;
                     println!(
-                        "{} decode_residency_admission variant={variant} pinned={pinned} engines={engines} request={request} rows={rows} moves={} cap=2 state_mismatches={mismatch}",
+                        "{} decode_residency_admission variant={variant} pinned={pinned} engines={engines} backed={backed} request={request} rows={rows} moves={} cap=2 state_mismatches={mismatch}",
                         if mismatch == 0 { "PASS" } else { "DEFECT" },
                         updates.len()
                     );
@@ -2054,16 +2080,20 @@ fn tier_gate(
                 pending > 0.0,
                 "Runner FAIL delayed copy control did not execute an outstanding first-read wait"
             );
+            ensure!(
+                host_choices > 0 && admissions > 0 && (disk_choices == 0) == backed,
+                "Runner FAIL tier coverage host={host_choices} disk={disk_choices} admissions={admissions} backed={backed}"
+            );
             println!(
-                "PASS decode_residency_coverage variant={variant} pinned={pinned} engines={engines} host_choices={host_choices} disk_choices={disk_choices} admissions={admissions} pending_first_reads={pending} requests=3 end_request=true"
+                "PASS decode_residency_coverage variant={variant} pinned={pinned} engines={engines} backed={backed} host_choices={host_choices} disk_choices={disk_choices} admissions={admissions} pending_first_reads={pending} requests=3 end_request=true"
             );
         }
     }
     ensure!(defects == 0, "DEFECT decode residency cells={defects}");
     println!(
-        "PASS decode_residency_gate variants={} cases={} rows=1,2,5,8 format={format:?} host=true disk=true admissions=true writeback=true requests=3 graphs=false",
+        "PASS decode_residency_gate variants={} cases={} rows=1,2,5,8 format={format:?} host=true disk=true admissions=true writeback=true requests=3 graphs=false backing=partial,complete",
         variants.len(),
-        cases.len()
+        cases.len() * 2
     );
     Ok(())
 }
@@ -2204,6 +2234,7 @@ fn cpu_control(
             ),
         )
         .is_err();
+    super::residency::delay_stream(&decode.mailbox)?;
     decode.finish(
         &engine.device,
         ffn,
@@ -2225,6 +2256,10 @@ fn cpu_control(
             &mut TensorMut(qwen::matrix(&engine.work.out, stream, 0, rows, 128)?),
         ),
     )?;
+    ensure!(
+        !decode.mailbox_ready.try_is_complete()?,
+        "DEFECT decode CPU upload blocked the host until completion"
+    );
     stream.synchronize()?;
     let duplicate_finish = decode
         .finish(
@@ -2261,7 +2296,7 @@ fn cpu_control(
         .count();
     let defects = mismatches + done_mismatches + output_mismatches;
     println!(
-        "{} eager_moe_cpu_control rows={rows} cpu_choices={} compacted_rows={} contribution_mismatches={mismatches} done_mismatches={done_mismatches} output_mismatches={output_mismatches}",
+        "{} eager_moe_cpu_control rows={rows} cpu_choices={} compacted_rows={} contribution_mismatches={mismatches} done_mismatches={done_mismatches} output_mismatches={output_mismatches} upload_pending=true delay_ms=100",
         if defects == 0 { "PASS" } else { "DEFECT" },
         assignments.len(),
         miss_rows.len()
