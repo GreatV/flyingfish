@@ -36,6 +36,47 @@ pub(crate) fn view<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
     unsafe { Tensor::new(ptr + (offset * size_of::<T>()) as u64, shape, stride, bytes) }
 }
 
+pub(crate) fn dense_layout<const R: usize>(shape: [u32; R]) -> Result<([u64; R], u64)> {
+    ensure!(R > 0, "empty tensor rank");
+    let mut stride = [1; R];
+    let mut count = 1u64;
+    for axis in (0..R).rev() {
+        ensure!(shape[axis] > 0, "zero tensor dimension");
+        stride[axis] = count;
+        count = count
+            .checked_mul(u64::from(shape[axis]))
+            .context("dense extent overflow")?;
+    }
+    Ok((stride, count))
+}
+
+pub(crate) fn spans_disjoint(a_ptr: u64, a_bytes: u64, b_ptr: u64, b_bytes: u64) -> Result<bool> {
+    let a_end = a_ptr
+        .checked_add(a_bytes)
+        .context("first span address overflow")?;
+    let b_end = b_ptr
+        .checked_add(b_bytes)
+        .context("second span address overflow")?;
+    Ok(a_end <= b_ptr || b_end <= a_ptr)
+}
+
+pub(crate) fn no_overlap<T: Copy, U: Copy, const R: usize, const S: usize>(
+    a: &Tensor<T, R>,
+    b: &Tensor<U, S>,
+    aname: &str,
+    bname: &str,
+) -> Result<()> {
+    ensure!(
+        spans_disjoint(a.ptr, a.span_bytes, b.ptr, b.span_bytes)?,
+        "tensors overlap: {aname} vs {bname} (0x{:x}+0x{:x}, 0x{:x}+0x{:x})",
+        a.ptr,
+        a.span_bytes,
+        b.ptr,
+        b.span_bytes
+    );
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Tensor<T, const R: usize> {
     pub ptr: u64,
@@ -207,6 +248,31 @@ mod tests {
 
     #[test]
     fn prefix_rows_preserves_physical_projection_offsets() -> Result<()> {
+        assert_eq!(dense_layout([3, 5, 7])?, ([35, 7, 1], 105));
+        assert!(dense_layout([3, 0]).is_err());
+        assert!(dense_layout([u32::MAX; 3]).is_err());
+        assert!(dense_layout([]).is_err());
+        for (a, b, expected) in [
+            ((0x1000, 32), (0x1020, 16), true),
+            ((0x1020, 16), (0x1000, 32), true),
+            ((0x1000, 32), (0x1010, 16), false),
+            ((0x1000, 32), (0x1000, 32), false),
+        ] {
+            assert_eq!(spans_disjoint(a.0, a.1, b.0, b.1)?, expected);
+        }
+        assert!(spans_disjoint(u64::MAX - 7, 16, 0x1000, 32).is_err());
+        assert!(spans_disjoint(0x1000, 32, u64::MAX - 7, 16).is_err());
+        let strided = unsafe { Tensor::<bf16, 2>::new(0x1000, [3, 5], [8, 1], 42)? };
+        assert_eq!(strided.prefix_rows(2)?.span_bytes, 42);
+        assert!(unsafe { Tensor::<bf16, 2>::new(0x1000, [3, 5], [8, 1], 40) }.is_err());
+        let (stride, count) = dense_layout([3, 5])?;
+        for span in [count * 2, 64] {
+            let dense = unsafe { Tensor::<bf16, 2>::new(0x1000, [3, 5], stride, span)? };
+            assert_eq!(dense.prefix_rows(2)?.span_bytes, span);
+            assert!(no_overlap(&dense, &dense, "input", "output").is_err());
+            let next = unsafe { Tensor::<bf16, 2>::new(0x1040, [1, 5], [5, 1], 10)? };
+            no_overlap(&dense, &next, "input", "output")?;
+        }
         // Synthetic addresses are used only for CPU layout validation.
         let workspace = 2048u64;
         for (offset, width) in [(0, 12288), (12288, 1024), (13312, 1024), (48, 48)] {

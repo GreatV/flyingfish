@@ -2,7 +2,7 @@
 //! Grouped GEMMs use opA=T/opB=N over native [2I, H] and [H, I] expert weights.
 //! Count/scan/permute stage one host count read and two pointer-table uploads per cohort.
 //! Finish runs the shared FFN and one combine after every contribution is complete.
-use crate::backend::cuda::contracts::{Scratch, Tensor, TensorMut};
+use crate::backend::cuda::contracts::{Scratch, Tensor, TensorMut, no_overlap};
 use crate::backend::cuda::cubin;
 use crate::backend::cuda::ops::grid;
 use crate::experts::catalogue::{ExpertGeometry, ExpertLayout, Fp8Slot};
@@ -438,19 +438,6 @@ impl MoePrefill<'_> {
         )?;
         Ok(())
     }
-}
-
-fn no_overlap<T: Copy, U: Copy, const R: usize, const S: usize>(
-    a: &Tensor<T, R>,
-    b: &Tensor<U, S>,
-    aname: &str,
-    bname: &str,
-) -> Result<()> {
-    ensure!(
-        a.ptr + a.span_bytes <= b.ptr || b.ptr + b.span_bytes <= a.ptr,
-        "moe prefill tensors overlap: {aname} vs {bname}"
-    );
-    Ok(())
 }
 
 /// Scratch regions, byte offsets from the scratch base, each 256-aligned.

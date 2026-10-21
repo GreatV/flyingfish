@@ -37,14 +37,7 @@ pub struct Settings {
     pub graph: bool,
 }
 
-fn percentile(values: &[f64], q: f64) -> f64 {
-    let mut sorted = values.to_vec();
-    sorted.sort_by(f64::total_cmp);
-    let index = q * (sorted.len() - 1) as f64;
-    let lo = index.floor() as usize;
-    let hi = index.ceil() as usize;
-    sorted[lo] + (sorted[hi] - sorted[lo]) * (index - lo as f64)
-}
+use crate::verify::percentile;
 
 fn event(model: &Model) -> Result<backend::Event> {
     model.event()
@@ -196,7 +189,7 @@ pub fn run(dir: &Path, ids: &[u32], s: &Settings) -> Result<()> {
         "prefill_wall_ms_median":percentile(&prefill_ms,0.5),"prefill_gpu_ms_median":percentile(&prefill_gpu_ms,0.5),
         "prefill_tok_s":t*1000.0/percentile(&prefill_ms,0.5),"prefill_linear_flops":linear_flops,"prefill_causal_attention_flops":attention_flops,
         "prefill_ideal_minimum_read_bytes":model.decode_weight_bytes()+model.kv_read_bytes(ids.len()),
-        "prefill_compute_denominator_tflops":s.gemm_tflops,"prefill_compute_denominator_source":"CLI measured calibration input",
+        "prefill_compute_denominator_tflops":s.gemm_tflops,"prefill_compute_denominator_source":"configured reference input",
         "prefill_compute_floor_ms":prefill_compute_floor_ms,"prefill_bandwidth_floor_ms":prefill_bandwidth_floor_ms,
         "prefill_roofline_pct":prefill_compute_floor_ms.max(prefill_bandwidth_floor_ms)/prefill_ms_gpu*100.0,
         "load_ms":load_ms,"ignore_eos":true,"validation_copy_bytes_per_step":vocab*2,

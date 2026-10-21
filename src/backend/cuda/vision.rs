@@ -17,7 +17,7 @@
 
 use super::Device;
 use super::blas::Blas;
-use super::contracts::{Scratch, Tensor, TensorMut};
+use super::contracts::{Scratch, Tensor, TensorMut, dense_layout};
 use super::cubin;
 use super::linear::LinearBiasMode;
 use super::ops::{CommonOpsRef, GeluMode};
@@ -300,11 +300,8 @@ fn want<T: Copy, const R: usize>(view: &Tensor<T, R>, shape: [u32; R], name: &st
 }
 
 fn dense<T: Copy, const R: usize>(view: &Tensor<T, R>, name: &str) -> Result<()> {
-    let mut stride = 1u64;
-    for axis in (0..R).rev() {
-        ensure!(view.stride[axis] == stride, "{name} must be contiguous");
-        stride *= u64::from(view.shape[axis]);
-    }
+    let (stride, _) = dense_layout(view.shape)?;
+    ensure!(view.stride == stride, "{name} must be contiguous");
     Ok(())
 }
 

@@ -1,4 +1,4 @@
-use crate::{config::Config, prefill::Plan};
+use crate::config::Config;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
@@ -114,7 +114,6 @@ pub enum LinearImpl {
     Cublas,
     CublasLt(LtAlgorithm),
     Skinny,
-    Candidate(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -195,17 +194,6 @@ impl Setup {
             selection,
             attention,
         })
-    }
-    pub fn prefill(
-        &self,
-        c: &Config,
-        capacity: usize,
-        requested: Option<usize>,
-        free: usize,
-        total: usize,
-        alignment: usize,
-    ) -> Result<Plan> {
-        Plan::new(c, capacity, requested, free, total, alignment, 0)
     }
 }
 

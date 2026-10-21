@@ -12,6 +12,7 @@ use std::{
     collections::{BTreeSet, hash_map::DefaultHasher},
     fs,
     hash::Hasher,
+    io::Write,
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -74,6 +75,32 @@ struct Manifest {
     key: CacheKey,
     profile: Profile,
     files: Vec<(String, String)>,
+}
+
+pub(super) fn write_cache(path: &Path, value: &impl Serialize) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    let result = (|| -> Result<()> {
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(error) = result {
+        fs::remove_file(&temporary).with_context(|| {
+            format!(
+                "remove cache temporary {} after {error:#}",
+                temporary.display()
+            )
+        })?;
+        return Err(error);
+    }
+    Ok(())
 }
 
 pub(super) fn hash(bytes: &[u8]) -> String {
@@ -387,15 +414,7 @@ impl Closure {
             files,
         };
         if self.write {
-            use std::io::Write;
-            let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-            let mut file = fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&tmp)?;
-            file.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
-            file.sync_all()?;
-            fs::rename(tmp, &path)?;
+            write_cache(&path, &manifest)?;
         } else {
             let expected: Manifest = serde_json::from_slice(
                 &fs::read(&path).with_context(|| format!("read closure {}", path.display()))?,
@@ -1071,6 +1090,33 @@ mod tests {
         fs::create_dir(&root)?;
         let result = (|| -> Result<()> {
             let path = root.join("choice.json");
+            let published = root.join("atomic.json");
+            let value = serde_json::json!({"shape":[3,5],"choice":"complete"});
+            write_cache(&published, &value)?;
+            let original = fs::read(&published)?;
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&original)?,
+                value
+            );
+            let temporary = published.with_extension(format!("tmp-{}", std::process::id()));
+            let invalid = std::collections::BTreeMap::from([(vec![1u8], 0u8)]);
+            assert!(write_cache(&published, &invalid).is_err());
+            assert_eq!(fs::read(&published)?, original);
+            assert!(!temporary.exists());
+            fs::write(&temporary, b"another writer")?;
+            assert!(write_cache(&published, &value).is_err());
+            assert_eq!(fs::read(&temporary)?, b"another writer");
+            assert_eq!(fs::read(&published)?, original);
+            fs::remove_file(&temporary)?;
+            let directory = root.join("directory.json");
+            fs::create_dir(&directory)?;
+            assert!(write_cache(&directory, &value).is_err());
+            assert!(directory.is_dir());
+            assert!(
+                !directory
+                    .with_extension(format!("tmp-{}", std::process::id()))
+                    .exists()
+            );
             fs::write(&path, b"original")?;
             let key = CacheKey {
                 device_uuid: "test".into(),

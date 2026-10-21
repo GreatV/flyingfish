@@ -189,11 +189,7 @@ pub(crate) fn disjoint<T: Copy, U: Copy, const R: usize, const S: usize>(
 ) -> Result<()> {
     a.validate()?;
     b.validate()?;
-    ensure!(
-        a.ptr + a.span_bytes <= b.ptr || b.ptr + b.span_bytes <= a.ptr,
-        "linear buffers overlap"
-    );
-    Ok(())
+    super::contracts::no_overlap(a, b, "linear input", "linear output")
 }
 pub(crate) fn validate_call(
     weight: [u32; 2],

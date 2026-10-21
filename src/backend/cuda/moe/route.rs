@@ -3,7 +3,7 @@
 //! logits with `moe_route_logits_bf16` (one FP32 chain per expert, decode row
 //! counts); `route_prefill` computes them with one cuBLAS BF16 GEMM (FP32
 //! accumulation). Both apply `moe_route_topk` to the dense logits buffer.
-use crate::backend::cuda::contracts::{Tensor, TensorMut};
+use crate::backend::cuda::contracts::{Tensor, TensorMut, no_overlap};
 use crate::backend::cuda::cubin;
 use crate::backend::cuda::ops::grid;
 use anyhow::{Result, ensure};
@@ -177,23 +177,6 @@ fn check_logits(
     no_overlap(router, logits, "router", "logits")?;
     no_overlap(ids, logits, "ids", "logits")?;
     no_overlap(weights, logits, "weights", "logits")
-}
-
-fn no_overlap<T: Copy, U: Copy, const R: usize, const S: usize>(
-    a: &Tensor<T, R>,
-    b: &Tensor<U, S>,
-    aname: &str,
-    bname: &str,
-) -> Result<()> {
-    ensure!(
-        a.ptr + a.span_bytes <= b.ptr || b.ptr + b.span_bytes <= a.ptr,
-        "route tensors overlap: {aname} vs {bname} (0x{:x}+0x{:x}, 0x{:x}+0x{:x})",
-        a.ptr,
-        a.span_bytes,
-        b.ptr,
-        b.span_bytes
-    );
-    Ok(())
 }
 
 pub(crate) struct RoutePlan {

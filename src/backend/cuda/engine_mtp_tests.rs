@@ -1085,11 +1085,8 @@ fn q38_mtp_recursive_fixture_gpu() -> Result<()> {
             expected.len() == 64 && expected.bytes().all(|b| b.is_ascii_hexdigit()),
             "invalid fixture SHA256"
         );
-        let output = std::process::Command::new("sha256sum").arg(path).output()?;
-        ensure!(output.status.success(), "fixture checksum command failed");
-        let text = std::str::from_utf8(&output.stdout)?;
         ensure!(
-            text.split_whitespace().next() == Some(expected),
+            crate::prefix_state::file_sha256(path)? == expected,
             "fixture SHA256 mismatch: {}",
             path.display()
         );

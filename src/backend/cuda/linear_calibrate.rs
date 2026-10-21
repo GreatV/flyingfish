@@ -9,7 +9,6 @@ use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, PushKerne
 use half::bf16;
 use serde::{Deserialize, Serialize};
 use std::{
-    io::Write,
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -128,14 +127,7 @@ impl Environment {
         } else {
             let cache = self.measure(shape, algorithms, launch)?;
             check(&cache, &self.key, shape)?;
-            let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)?;
-            f.write_all(&serde_json::to_vec_pretty(&cache)?)?;
-            f.sync_all()?;
-            std::fs::rename(tmp, &path)?;
+            super::closure::write_cache(&path, &cache)?;
             (cache, false)
         };
         eprintln!(
