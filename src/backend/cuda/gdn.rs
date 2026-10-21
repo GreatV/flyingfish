@@ -1119,21 +1119,28 @@ mod tests {
         ) -> Result<(Tensor<f32, 4>, Tensor<f32, 3>)> {
             ensure!(self.snapshots.is_none(), "geometry snapshots already bound");
             let cd = spec.conv_dim()?;
+            let slots = spec.snapshot_limit()? - 1;
             let poison = f32::from_bits(0x7fc1_0001);
             self.snapshots = Some((
-                stream.clone_htod(&vec![poison; 4 * spec.hv as usize * 128 * 128])?,
-                stream.clone_htod(&vec![poison; 4 * cd as usize * 3])?,
+                stream.clone_htod(&vec![poison; slots as usize * spec.hv as usize * 128 * 128])?,
+                stream.clone_htod(&vec![poison; slots as usize * cd as usize * 3])?,
             ));
             let (state, history) = self.snapshots.as_ref().context("snapshots not allocated")?;
             Ok((
                 geometry_view(
                     state,
                     stream,
-                    [4, spec.hv, 128, 128],
+                    [slots, spec.hv, 128, 128],
                     [u64::from(spec.hv) * 128 * 128, 128 * 128, 128, 1],
                     0,
                 )?,
-                geometry_view(history, stream, [4, cd, 3], [u64::from(cd) * 3, 3, 1], 0)?,
+                geometry_view(
+                    history,
+                    stream,
+                    [slots, cd, 3],
+                    [u64::from(cd) * 3, 3, 1],
+                    0,
+                )?,
             ))
         }
 
@@ -1226,11 +1233,92 @@ mod tests {
     enum GeometryCore {
         Recurrent,
         Verify,
+        ChunkedSnapshot,
+        RstepSnapshot,
         Chunked,
         P1(u32),
         P2,
         P2Expanded,
         WrongHeadStride,
+    }
+
+    fn geometry_plan(
+        device: &crate::backend::cuda::Device,
+        spec: GdnSpec,
+        rows: u32,
+        offset: u32,
+        buffers: &mut GeometryBuffers,
+        core: GeometryCore,
+    ) -> Result<GdnPlan> {
+        let stream = &device.stream;
+        let compact = matches!(core, GeometryCore::P2);
+        let mut plan = GdnOps::prepare(
+            &device.ctx,
+            &spec,
+            rows,
+            buffers.bindings(stream, spec, rows, offset)?,
+            compact,
+        )?;
+        if matches!(core, GeometryCore::P2Expanded) {
+            let module = cubin::module(
+                &device.ctx,
+                &format!("gdn/gdn_cw_p2{}", spec.kernel_suffix()?),
+            )?;
+            Arc::get_mut(&mut plan.kernels)
+                .context("expanded P2 kernels are shared")?
+                .p2 = Some(ChunkwiseP2 {
+                a: module.load_function("gdn_cw_p2_stage_a")?,
+                h: module.load_function("gdn_cw_p2_stage_h")?,
+            });
+            plan.cw_p2 = true;
+            plan.ws_p2 = cw_p2_bytes(spec.hv, rows);
+        }
+        if matches!(
+            core,
+            GeometryCore::ChunkedSnapshot | GeometryCore::RstepSnapshot
+        ) {
+            let suffix = spec.kernel_suffix()?;
+            let kernels = Arc::get_mut(&mut plan.kernels).context("snapshot kernels are shared")?;
+            if matches!(core, GeometryCore::RstepSnapshot) {
+                let module = cubin::module(&device.ctx, &format!("gdn/gdn_rstep{suffix}"))?;
+                kernels.rstep = Some(module.load_function("gdn_rstep_core_v1")?);
+                kernels.core_snapshot = module.load_function("gdn_rstep_core_snapshot")?;
+            } else {
+                ensure!(
+                    rows <= 5,
+                    "chunked snapshot kernel supports at most five rows"
+                );
+                kernels.rstep = None;
+                kernels.core_snapshot =
+                    cubin::module(&device.ctx, &format!("gdn/gdn_chunked{suffix}"))?
+                        .load_function("gdn_chunked_core_snapshot")?;
+                kernels.core_snapshot.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    CHUNKED_SMEM as i32,
+                )?;
+            }
+        }
+        if matches!(
+            core,
+            GeometryCore::Verify | GeometryCore::ChunkedSnapshot | GeometryCore::RstepSnapshot
+        ) {
+            plan = plan.for_rows(rows, Some(buffers.bind_snapshots(stream, spec)?))?;
+        }
+        if matches!(core, GeometryCore::WrongHeadStride) {
+            let directory = std::path::PathBuf::from(
+                std::env::var_os("FF_Q38_PROBE_DIR").context("GDN control directory missing")?,
+            );
+            let module = device
+                .ctx
+                .load_module(cudarc::nvrtc::Ptx::from_file(directory.join(format!(
+                    "gdn_prep_h32_wrong_stride_sm{}.cubin",
+                    device.info.arch
+                ))))?;
+            Arc::get_mut(&mut plan.kernels)
+                .context("GDN control kernels are shared")?
+                .prep = module.load_function("gdn_prep_l2_fp32")?;
+        }
+        Ok(plan)
     }
 
     fn geometry_run(
@@ -1277,46 +1365,7 @@ mod tests {
         for row in 0..if sequential { valid } else { 1 } {
             let bound = if sequential { 1 } else { rows };
             let meta = geometry_meta(stream, 23 + row, if sequential { 1 } else { valid })?;
-            let mut plan = GdnOps::prepare(
-                &device.ctx,
-                &spec,
-                bound,
-                buffers.bindings(stream, spec, bound, row)?,
-                compact_binding,
-            )?;
-            if matches!(core, GeometryCore::P2Expanded) {
-                let module = cubin::module(
-                    &device.ctx,
-                    &format!("gdn/gdn_cw_p2{}", spec.kernel_suffix()?),
-                )?;
-                Arc::get_mut(&mut plan.kernels)
-                    .context("expanded P2 kernels are shared")?
-                    .p2 = Some(ChunkwiseP2 {
-                    a: module.load_function("gdn_cw_p2_stage_a")?,
-                    h: module.load_function("gdn_cw_p2_stage_h")?,
-                });
-                plan.cw_p2 = true;
-                plan.ws_p2 = cw_p2_bytes(spec.hv, rows);
-            }
-            if matches!(core, GeometryCore::Verify) {
-                plan = plan.for_rows(rows, Some(buffers.bind_snapshots(stream, spec)?))?;
-            }
-            if matches!(core, GeometryCore::WrongHeadStride) {
-                let directory = std::path::PathBuf::from(
-                    std::env::var_os("FF_Q38_PROBE_DIR")
-                        .context("GDN control directory missing")?,
-                );
-                let module =
-                    device
-                        .ctx
-                        .load_module(cudarc::nvrtc::Ptx::from_file(directory.join(format!(
-                            "gdn_prep_h32_wrong_stride_sm{}.cubin",
-                            device.info.arch
-                        ))))?;
-                Arc::get_mut(&mut plan.kernels)
-                    .context("GDN control kernels are shared")?
-                    .prep = module.load_function("gdn_prep_l2_fp32")?;
-            }
+            let plan = geometry_plan(device, spec, bound, row, &mut buffers, core)?;
             plans.push((plan, meta));
         }
         let p1 = if let GeometryCore::P1(split) = core {
@@ -1375,7 +1424,16 @@ mod tests {
                             .arg(&0i32)
                             .launch(*config)?;
                     }
-                } else if matches!(core, GeometryCore::Verify) {
+                } else if matches!(core, GeometryCore::ChunkedSnapshot) {
+                    GdnOps::run_core(
+                        plan,
+                        stream,
+                        meta,
+                        ExecutionPhase::Prefill,
+                        Scratch { ptr, bytes },
+                        true,
+                    )?;
+                } else if matches!(core, GeometryCore::Verify | GeometryCore::RstepSnapshot) {
                     GdnOps::run_verify(plan, stream, meta, Scratch { ptr, bytes })?;
                 } else {
                     GdnOps::run(
@@ -1494,7 +1552,7 @@ mod tests {
             let histories = stream.clone_dtoh(saved_history)?;
             let state_width = spec.hv as usize * 128 * 128;
             let history_width = spec.conv_dim()? as usize * 3;
-            for prefix in 0..4usize {
+            for prefix in 0..(spec.snapshot_limit()? - 1) as usize {
                 let state = &states[prefix * state_width..(prefix + 1) * state_width];
                 let history = &histories[prefix * history_width..(prefix + 1) * history_width];
                 if prefix + 1 < valid as usize {
@@ -1503,7 +1561,11 @@ mod tests {
                         spec,
                         rows,
                         prefix as u32 + 1,
-                        GeometryCore::Recurrent,
+                        if matches!(core, GeometryCore::ChunkedSnapshot) {
+                            GeometryCore::Chunked
+                        } else {
+                            GeometryCore::Recurrent
+                        },
                         false,
                     )?;
                     ensure!(
@@ -1900,174 +1962,157 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires exclusive sm89 window, FF_Q38_MODEL and native GDN parameters"]
+    #[ignore = "requires an exclusive CUDA window"]
     fn gdn_operation_timing_gpu() -> Result<()> {
-        use crate::checkpoint::{LoadPolicy, MappedCheckpoint};
-        use std::path::PathBuf;
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
             "GPU window required"
         );
-        let directory =
-            PathBuf::from(std::env::var_os("FF_Q38_MODEL").context("FF_Q38_MODEL required")?);
-        let model = crate::model_spec::ModelSpec::read(&directory)?;
-        let spec = GdnSpec::from_model(&model)?;
-        ensure!(spec.hv == 48 && spec.hk == 16, "timing requires h48/hk16");
-        let mapped = MappedCheckpoint::open(&directory)?;
-        mapped.manifest(&model, LoadPolicy::TextOnly)?;
-        let views = mapped.views()?;
-        let read = |suffix: &str, shape: &[usize]| -> Result<Vec<bf16>> {
-            let name = format!("model.language_model.layers.0.linear_attn.{suffix}");
-            let shard = mapped
-                .index
-                .weight_map
-                .get(&name)
-                .context("GDN weight missing")?;
-            let tensor = views
-                .get(shard)
-                .context("GDN shard missing")?
-                .tensor(&name)?;
-            ensure!(
-                tensor.dtype() == safetensors::Dtype::BF16 && tensor.shape() == shape,
-                "native GDN tensor dtype/shape mismatch {name}"
-            );
-            let mut bytes = vec![0u8; tensor.data().len()];
-            mapped.read_mapped_range(shard, tensor.data(), &mut bytes)?;
-            Ok(bytes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|value| bf16::from_bits(u16::from_le_bytes([value[0], value[1]])))
-                .collect())
-        };
-        let cd = spec.conv_dim()? as usize;
-        let conv = read("conv1d.weight", &[cd, 1, 4])?;
-        let a_log = read("A_log", &[spec.hv as usize])?;
-        let dt = read("dt_bias", &[spec.hv as usize])?;
-        drop(views);
-        drop(mapped);
         let device = crate::backend::cuda::Device::new(0)?;
-        ensure!(device.info.arch == 89, "operator timing requires sm89");
         let stream = &device.stream;
-        for (mode, rows, valid) in [
-            ("recurrent", 1, 1),
-            ("legacy", 2, 2),
-            ("legacy", 5, 5),
-            ("verify", 2, 2),
-            ("verify", 5, 5),
-            ("verify", 5, 2),
-            ("legacy", 64, 64),
-            ("legacy", 512, 512),
-            ("legacy", 512, 509),
-            ("legacy", 4096, 4096),
-            ("p2", 64, 64),
-            ("p2", 512, 512),
-            ("p2", 512, 509),
-            ("p2", 4096, 4096),
+        let mut cells = Vec::new();
+        for config in [
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/data/q38-config.json"
+            )),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/data/minicpm-config.json"
+            )),
         ] {
-            let mut buffers = GeometryBuffers::new(stream, spec, rows, valid)?;
-            stream.memcpy_htod(&conv, &mut buffers.conv)?;
-            stream.memcpy_htod(&a_log, &mut buffers.a_log)?;
-            stream.memcpy_htod(&dt, &mut buffers.dt)?;
-            let initial_state = geometry_state(spec.hv as usize);
-            let initial_history = stream.clone_dtoh(&buffers.history)?;
-            let p2 = mode == "p2";
-            let bytes = GdnOps::workspace(
-                &spec,
-                rows,
-                if p2 { GdnPolicy::P2 } else { GdnPolicy::LEGACY },
-            )?
-            .bytes;
-            let workspace = stream.alloc_zeros::<u8>(bytes as usize)?;
-            let ptr = workspace.device_ptr(stream).0;
-            let mut plan = GdnOps::prepare(
-                &device.ctx,
-                &spec,
-                rows,
-                buffers.bindings(stream, spec, rows, 0)?,
-                p2,
-            )?;
-            if mode == "verify" {
-                plan = plan.for_rows(rows, Some(buffers.bind_snapshots(stream, spec)?))?;
+            let root = serde_json::from_str(config)?;
+            let model = if config.contains("MiniCPM") {
+                crate::model_spec::ModelSpec::minicpm(
+                    &root,
+                    &serde_json::json!({"eos_token_id": [248044, 248046]}),
+                )?
+            } else {
+                crate::model_spec::ModelSpec::qwen(&root, &serde_json::Value::Null)?
+            };
+            let spec = GdnSpec::from_model(&model)?;
+            for rows in [512, 4096] {
+                cells.push((spec, rows, [GeometryCore::Chunked, GeometryCore::P2]));
             }
-            let metadata = geometry_meta(stream, 23, valid)?;
+            for rows in 1..=5 {
+                cells.push((
+                    spec,
+                    rows,
+                    [GeometryCore::ChunkedSnapshot, GeometryCore::RstepSnapshot],
+                ));
+            }
+        }
+        let mut defects = 0;
+        for &(spec, rows, cores) in &cells {
+            for core in cores {
+                let reference_core = match core {
+                    GeometryCore::P2 => GeometryCore::P1(4),
+                    GeometryCore::RstepSnapshot => GeometryCore::Recurrent,
+                    _ => core,
+                };
+                let reference = geometry_run(&device, spec, rows, rows, reference_core, false)?;
+                for graph in [false, true] {
+                    let actual = geometry_run(&device, spec, rows, rows, core, graph)?;
+                    let mismatches = geometry_mismatches(&actual, &reference);
+                    let passed =
+                        mismatches == 0 && actual.norm_ratio <= 1.0 && reference.norm_ratio <= 1.0;
+                    defects += usize::from(!passed);
+                    println!(
+                        "{} GDN_DECISION_CORRECT hv={} rows={rows} core={core:?} graph={graph} mismatches={mismatches}",
+                        if passed { "PASS" } else { "DEFECT" },
+                        spec.hv
+                    );
+                }
+            }
+        }
+        ensure!(
+            defects == 0,
+            "GDN_DECISION correctness DEFECT cells={defects}"
+        );
+        for (spec, rows, cores) in cells {
+            let metadata = geometry_meta(stream, 23, rows)?;
             let meta = SeqRef {
                 ptr: metadata.device_ptr(stream).0,
             };
-            device.finish_upload()?;
-            let execute = || -> Result<()> {
-                if mode == "verify" {
-                    GdnOps::run_verify(&plan, stream, meta, Scratch { ptr, bytes })
-                } else {
-                    GdnOps::run(
-                        &plan,
-                        stream,
-                        meta,
-                        if mode == "recurrent" {
-                            ExecutionPhase::Decode
-                        } else {
-                            ExecutionPhase::Prefill
-                        },
-                        Scratch { ptr, bytes },
-                    )
-                }
-            };
-            execute()?;
-            let reference_out = stream.clone_dtoh(&buffers.out)?;
-            let reference_state = stream.clone_dtoh(&buffers.state)?;
-            let reference_history = stream.clone_dtoh(&buffers.history)?;
-            for graph in [false, true] {
-                let captured = if graph {
-                    stream.begin_capture(
-                        sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-                    )?;
-                    let result = execute();
-                    let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
-                    result?;
-                    Some(captured?.context("empty GDN operation graph")?)
-                } else {
-                    None
-                };
-                let mean_ms = crate::backend::cuda::time_prepared_operation(
-                    stream,
-                    || {
-                        stream.memcpy_htod(&initial_state, &mut buffers.state)?;
-                        stream.memcpy_htod(&initial_history, &mut buffers.history)?;
-                        Ok(())
-                    },
-                    || {
-                        if let Some(graph) = &captured {
-                            graph.launch()?;
-                            Ok(())
-                        } else {
-                            execute()
-                        }
-                    },
-                )?;
-                let out = stream.clone_dtoh(&buffers.out)?;
-                let state = stream.clone_dtoh(&buffers.state)?;
-                let history = stream.clone_dtoh(&buffers.history)?;
-                ensure!(
-                    out.iter()
-                        .zip(&reference_out)
-                        .all(|(a, b)| a.to_bits() == b.to_bits())
-                        && state
-                            .iter()
-                            .zip(&reference_state)
-                            .all(|(a, b)| a.to_bits() == b.to_bits())
-                        && history
-                            .iter()
-                            .zip(&reference_history)
-                            .all(|(a, b)| a.to_bits() == b.to_bits()),
-                    "GDN operation reset/replay changed mode={mode} rows={rows} valid={valid} graph={graph}"
-                );
-                println!(
-                    "T20_OP_SAMPLE {}",
-                    serde_json::json!({"operation":"gdn","mode":mode,"rows":rows,"valid":valid,
-                        "graph":graph,"warm":16,"calls":32,"mean_ms":mean_ms,"native_weights":true})
-                );
+            let initial_state = geometry_state(spec.hv as usize);
+            let mut arms = Vec::new();
+            for core in cores {
+                let mut buffers = GeometryBuffers::new(stream, spec, rows, rows)?;
+                let initial_history = stream.clone_dtoh(&buffers.history)?;
+                let plan = geometry_plan(&device, spec, rows, 0, &mut buffers, core)?;
+                let bytes = add(plan.ws.bytes, plan.ws_p2)?;
+                let workspace = stream.alloc_zeros::<u8>(bytes as usize)?;
+                arms.push((core, buffers, plan, workspace, initial_history));
             }
+            device.finish_upload()?;
+            let mut ratios = Vec::new();
+            for block in 0..6 {
+                let mut elapsed = [0.0; 4];
+                for (position, arm) in [0usize, 1, 1, 0].into_iter().enumerate() {
+                    let (core, buffers, plan, workspace, initial_history) = &mut arms[arm];
+                    let scratch = Scratch {
+                        ptr: workspace.device_ptr(stream).0,
+                        bytes: workspace.len() as u64,
+                    };
+                    let mean_ms = crate::backend::cuda::time_prepared_operation(
+                        stream,
+                        || {
+                            stream.memcpy_htod(&initial_state, &mut buffers.state)?;
+                            stream.memcpy_htod(initial_history, &mut buffers.history)?;
+                            Ok(())
+                        },
+                        || {
+                            GdnOps::run_core(
+                                plan,
+                                stream,
+                                meta,
+                                ExecutionPhase::Prefill,
+                                scratch,
+                                matches!(
+                                    core,
+                                    GeometryCore::ChunkedSnapshot | GeometryCore::RstepSnapshot
+                                ),
+                            )
+                        },
+                    )?;
+                    ensure!(
+                        mean_ms.is_finite() && mean_ms > 0.0,
+                        "invalid GDN decision timing"
+                    );
+                    elapsed[position] = mean_ms;
+                    println!(
+                        "GDN_DECISION_SAMPLE {}",
+                        serde_json::json!({
+                            "arch":device.info.arch,"hv":spec.hv,"rows":rows,"core":format!("{core:?}"),
+                            "block":block + 1,"position":position + 1,"arm":arm,"mean_ms":mean_ms,
+                            "warm":16,"calls":32,"graph":false,"synthetic":true,
+                        })
+                    );
+                }
+                if block != 0 {
+                    ratios.push(
+                        ((elapsed[1] / elapsed[0]).ln() + (elapsed[2] / elapsed[3]).ln()) / 2.0,
+                    );
+                }
+            }
+            let mean = ratios.iter().sum::<f64>() / 5.0;
+            let variance = ratios
+                .iter()
+                .map(|value| (value - mean).powi(2))
+                .sum::<f64>()
+                / 4.0;
+            let half = 2.7764451051977987 * (variance / 5.0).sqrt();
+            println!(
+                "GDN_DECISION_RESULT {}",
+                serde_json::json!({
+                    "arch":device.info.arch,"hv":spec.hv,"rows":rows,
+                    "A":format!("{:?}",cores[0]),"B":format!("{:?}",cores[1]),
+                    "ratio_B_over_A":mean.exp(),"ci95":[(mean-half).exp(),(mean+half).exp()],
+                    "blocks":6,"discard":1,"df":4,"graph":false,"synthetic":true,
+                })
+            );
         }
+        println!("PASS GDN_DECISION completed_cells=14 graph=false synthetic=true");
         Ok(())
     }
 
