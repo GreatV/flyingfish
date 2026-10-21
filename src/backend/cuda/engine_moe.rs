@@ -1097,7 +1097,7 @@ impl Decode {
         let cpu_hidden = &self.cpu_x[..dispatch.miss_rows.len() * hidden];
         let output = &mut self.cpu_out.as_mut_slice()?
             [..self.phase.rows * self.geometry.top_k as usize * hidden];
-        let mut contribute = |out: &mut [bf16]| -> Result<()> {
+        let contribute = |out: &mut [bf16]| -> Result<()> {
             if !dispatch.assignments.is_empty() {
                 if let Some(dma) = dispatch.host_dma {
                     dma.ready_weights(dispatch.experts)?;

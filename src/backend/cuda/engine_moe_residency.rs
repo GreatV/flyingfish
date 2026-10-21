@@ -890,8 +890,12 @@ impl Slots {
 
     pub fn end_request(&mut self) -> Result<()> {
         self.policy.end_request()?;
+        self.transfers.finish()?;
+        if let Some(disk) = &self.disk_cpu {
+            disk.check_ready()?;
+        }
         self.request_open = false;
-        self.transfers.finish()
+        Ok(())
     }
 
     pub fn begin_token(&mut self) -> Result<()> {

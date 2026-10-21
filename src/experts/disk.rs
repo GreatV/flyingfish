@@ -434,6 +434,18 @@ impl DiskExperts {
         Ok(pool)
     }
 
+    pub fn check_ready(&self) -> Result<()> {
+        ensure!(!self.failed, "disk expert worker service is unavailable");
+        ensure!(!self.running, "disk contribution job is already running");
+        for (index, worker) in self.workers.iter().enumerate() {
+            ensure!(
+                worker.work.is_some() && worker.input.is_some(),
+                "disk expert worker {index} has no reusable job or input"
+            );
+        }
+        Ok(())
+    }
+
     pub fn start(
         &mut self,
         layer: u32,
@@ -441,8 +453,7 @@ impl DiskExperts {
         rows: usize,
         routes: &[crate::experts::runtime::Route],
     ) -> Result<()> {
-        ensure!(!self.failed, "disk expert worker service is unavailable");
-        ensure!(!self.running, "disk contribution job is already running");
+        self.check_ready()?;
         ensure!(
             layer < self.geometry.layers
                 && rows > 0
@@ -467,12 +478,6 @@ impl DiskExperts {
                     .any(|previous| previous.choice == route.choice),
                 "disk choice={} has duplicate routes",
                 route.choice
-            );
-        }
-        for (index, worker) in self.workers.iter().enumerate() {
-            ensure!(
-                worker.work.is_some() && worker.input.is_some(),
-                "disk expert worker {index} has no reusable job or input"
             );
         }
         let workers = self.workers.len();
@@ -1146,6 +1151,7 @@ mod tests {
                 .expect_err("host error must be returned");
             assert!(format!("{error:#}").contains(fault));
             assert!(!pool.running);
+            pool.check_ready()?;
             assert!(pool.workers.iter().all(|worker| worker.work.is_some()));
             assert!(output.iter().all(|&value| value == bf16::from_f32(-99.0)));
             pool.run(0, &hidden, 1, &routes, &mut output, |_| Ok(()))?;
@@ -1186,6 +1192,7 @@ mod tests {
         assert!(pool.start(0, &[bf16::ZERO; 8], 1, &[]).is_err());
         assert!(!pool.running);
         assert!(pool.failed);
+        assert!(pool.check_ready().is_err());
         assert!(pool.workers.iter().all(|worker| worker.work.is_some()));
         assert!(pool.start(0, &[bf16::ZERO; 8], 1, &[]).is_err());
         Ok(())
@@ -1202,6 +1209,7 @@ mod tests {
         assert!(pool.finish(&mut []).is_err());
         assert!(!pool.running);
         assert!(pool.failed);
+        assert!(pool.check_ready().is_err());
         assert!(pool.workers[1].work.is_some());
         assert!(pool.start(0, &[bf16::ZERO; 8], 1, &[]).is_err());
         Ok(())
@@ -1222,6 +1230,7 @@ mod tests {
         pool.start(0, &hidden, 1, &routes)?;
         assert!(pool.finish(&mut []).is_err());
         assert!(!pool.running);
+        pool.check_ready()?;
         assert!(pool.workers.iter().all(|worker| worker.work.is_some()));
         let mut output = [bf16::ZERO; 16];
         pool.start(0, &hidden, 1, &routes)?;
