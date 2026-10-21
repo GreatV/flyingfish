@@ -716,7 +716,8 @@ fn q38_mtp_batch_chain_gpu() -> Result<()> {
                         .logits
                         .slice(..rows * VOCAB),
                 )?;
-                for (&token, values) in round.round.tokens.iter().zip(logits.chunks_exact(VOCAB)) {
+                for (&token, values) in round.round.tokens.iter().zip(logits.as_chunks::<VOCAB>().0)
+                {
                     batched.push((token, chain_margin(values.iter().map(|x| x.to_f32()))?));
                 }
             }
