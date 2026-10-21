@@ -347,6 +347,7 @@ pub struct DiskExperts {
     max_rows: usize,
     max_routes: usize,
     running: bool,
+    failed: bool,
     workers: Vec<Worker>,
 }
 
@@ -377,6 +378,7 @@ impl DiskExperts {
             max_rows: max_rows as usize,
             max_routes,
             running: false,
+            failed: false,
             workers: Vec::with_capacity(workers as usize),
         };
         for index in 0..workers {
@@ -439,6 +441,7 @@ impl DiskExperts {
         rows: usize,
         routes: &[crate::experts::runtime::Route],
     ) -> Result<()> {
+        ensure!(!self.failed, "disk expert worker service is unavailable");
         ensure!(!self.running, "disk contribution job is already running");
         ensure!(
             layer < self.geometry.layers
@@ -466,12 +469,17 @@ impl DiskExperts {
                 route.choice
             );
         }
+        for (index, worker) in self.workers.iter().enumerate() {
+            ensure!(
+                worker.work.is_some() && worker.input.is_some(),
+                "disk expert worker {index} has no reusable job or input"
+            );
+        }
         let workers = self.workers.len();
+        self.running = true;
+        let mut failure = None;
         for (index, worker) in self.workers.iter_mut().enumerate() {
-            let mut work = worker
-                .work
-                .take()
-                .context("disk worker has no reusable job")?;
+            let mut work = worker.work.take().expect("preflight checked reusable job");
             work.layer = layer;
             work.hidden.clear();
             work.hidden.extend_from_slice(hidden);
@@ -481,15 +489,44 @@ impl DiskExperts {
                     .iter()
                     .filter(|r| r.expert as usize % workers == index),
             );
-            worker
+            if let Err(error) = worker
                 .input
                 .as_ref()
-                .context("disk worker input closed")?
+                .expect("preflight checked worker input")
                 .send(work)
-                .map_err(|_| anyhow::anyhow!("disk expert worker {index} stopped"))?;
+            {
+                worker.work = Some(error.0);
+                failure = Some(anyhow::anyhow!("disk expert worker {index} stopped"));
+                break;
+            }
         }
-        self.running = true;
+        if let Some(error) = failure {
+            self.failed = true;
+            return match self.collect(None) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(error.context(format!("disk cleanup: {cleanup:#}"))),
+            };
+        }
         Ok(())
+    }
+
+    pub fn run(
+        &mut self,
+        layer: u32,
+        hidden: &[bf16],
+        rows: usize,
+        routes: &[crate::experts::runtime::Route],
+        output: &mut [bf16],
+        contribute: impl FnOnce(&mut [bf16]) -> Result<()>,
+    ) -> Result<()> {
+        self.start(layer, hidden, rows, routes)?;
+        let result = contribute(output);
+        let disk = self.collect(if result.is_ok() { Some(output) } else { None });
+        match (result, disk) {
+            (Ok(()), disk) => disk,
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(cleanup)) => Err(error.context(format!("disk cleanup: {cleanup:#}"))),
+        }
     }
 
     pub fn finish(&mut self, output: &mut [bf16]) -> Result<()> {
@@ -497,45 +534,72 @@ impl DiskExperts {
             self.running,
             "disk contribution finish without a running job"
         );
+        self.collect(Some(output))
+    }
+
+    fn collect(&mut self, mut output: Option<&mut [bf16]>) -> Result<()> {
         let width = self.geometry.hidden as usize;
-        let mut failure = None;
+        let mut failures = Vec::new();
         for (index, worker) in self.workers.iter_mut().enumerate() {
-            let completed = worker
-                .output
-                .recv()
-                .with_context(|| format!("receive disk worker {index}"))?;
-            for route in &completed.work.routes {
-                let first = route.choice as usize * width;
-                ensure!(
-                    first + width <= output.len(),
-                    "disk contribution choice={} outside output={}",
-                    route.choice,
-                    output.len()
-                );
-                output[first..first + width]
-                    .copy_from_slice(&completed.work.output[first..first + width]);
+            if worker.work.is_some() {
+                continue;
             }
-            if completed.error.is_some() {
-                failure = completed.error;
+            let completed = match worker.output.recv() {
+                Ok(completed) => completed,
+                Err(error) => {
+                    self.failed = true;
+                    failures.push(format!("receive disk worker {index}: {error}"));
+                    continue;
+                }
+            };
+            if let Some(error) = completed.error {
+                failures.push(format!("disk worker {index}: {error}"));
+            } else if let Some(target) = output.as_deref_mut() {
+                let copied = (|| -> Result<()> {
+                    for route in &completed.work.routes {
+                        let first = route.choice as usize * width;
+                        ensure!(
+                            first + width <= target.len(),
+                            "disk contribution choice={} outside output={}",
+                            route.choice,
+                            target.len()
+                        );
+                        target[first..first + width]
+                            .copy_from_slice(&completed.work.output[first..first + width]);
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = copied {
+                    failures.push(format!("disk worker {index}: {error:#}"));
+                }
             }
             worker.work = Some(completed.work);
         }
         self.running = false;
-        if let Some(error) = failure {
-            anyhow::bail!("disk expert contribution: {error}");
-        }
+        ensure!(
+            failures.is_empty(),
+            "disk expert contribution: {}",
+            failures.join("; ")
+        );
         Ok(())
     }
 }
 
 impl Drop for DiskExperts {
     fn drop(&mut self) {
+        if self.running
+            && let Err(error) = self.collect(None)
+        {
+            eprintln!("disk expert cleanup failed: {error:#}");
+        }
         for worker in &mut self.workers {
             worker.input.take();
         }
-        for worker in &mut self.workers {
-            if let Some(handle) = worker.handle.take() {
-                let _ = handle.join();
+        for (index, worker) in self.workers.iter_mut().enumerate() {
+            if let Some(handle) = worker.handle.take()
+                && handle.join().is_err()
+            {
+                eprintln!("disk expert worker {index} panicked");
             }
         }
     }
@@ -951,17 +1015,13 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn disk_workers_preserve_compacted_rows_choices_and_native_offsets() -> Result<()> {
-        use crate::cpu::expert_ffn::{Contribution, Isa, Scratch, Shape, contribution};
-        use crate::experts::runtime::Route;
+    fn native_workers(tag: &str) -> Result<(TempDir, std::sync::Arc<ExpertCatalogue>)> {
         use std::sync::Arc;
-        let dir = temp_dir("workers")?;
+        let dir = temp_dir(tag)?;
         let geometry = ExpertGeometry {
             intermediate: 8,
             ..geometry()
         };
-        let shape = Shape::new(8, 8)?;
         let mut bytes = Vec::new();
         let mut manifest = TensorManifest {
             entries: BTreeMap::new(),
@@ -991,6 +1051,15 @@ mod tests {
             geometry,
             crate::model_spec::ExpertFormat::Bf16,
         )?);
+        Ok((dir, catalogue))
+    }
+
+    #[test]
+    fn disk_workers_preserve_compacted_rows_choices_and_native_offsets() -> Result<()> {
+        use crate::cpu::expert_ffn::{Contribution, Isa, Scratch, Shape, contribution};
+        use crate::experts::runtime::Route;
+        let (dir, catalogue) = native_workers("workers")?;
+        let shape = Shape::new(8, 8)?;
         let mut pool = DiskExperts::new(catalogue.clone(), dir.path(), 2, 3)?;
         let oracle = DiskReader::open(&catalogue, dir.path(), 1)?;
         let mut scratch = Scratch::new(&shape);
@@ -1051,6 +1120,113 @@ mod tests {
             assert_eq!(output, expected);
             assert!(pool.finish(&mut output).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn disk_scoped_host_errors_drain_jobs_and_preserve_both_failures() -> Result<()> {
+        use crate::experts::runtime::Route;
+        let (dir, catalogue) = native_workers("scoped-errors")?;
+        let mut pool = DiskExperts::new(catalogue, dir.path(), 2, 1)?;
+        let hidden = [bf16::from_f32(0.25); 8];
+        let routes = [0, 1].map(|expert| Route {
+            row: 0,
+            choice: expert,
+            expert,
+            weight: bf16::from_f32(0.5),
+        });
+        let mut expected = vec![bf16::ZERO; 16];
+        pool.run(0, &hidden, 1, &routes, &mut expected, |_| Ok(()))?;
+        assert!(expected.iter().all(|value| value.to_f32().is_finite()));
+        assert!(expected.iter().any(|&value| value != bf16::ZERO));
+        for fault in ["ready_weights", "pool.run"] {
+            let mut output = vec![bf16::from_f32(-99.0); 16];
+            let error = pool
+                .run(0, &hidden, 1, &routes, &mut output, |_| bail!("{fault}"))
+                .expect_err("host error must be returned");
+            assert!(format!("{error:#}").contains(fault));
+            assert!(!pool.running);
+            assert!(pool.workers.iter().all(|worker| worker.work.is_some()));
+            assert!(output.iter().all(|&value| value == bf16::from_f32(-99.0)));
+            pool.run(0, &hidden, 1, &routes, &mut output, |_| Ok(()))?;
+            assert_eq!(output, expected);
+        }
+        let path = dir.path().join("native.bin");
+        let native = std::fs::read(&path)?;
+        std::fs::write(&path, [])?;
+        let mut output = vec![bf16::ZERO; 16];
+        let error = pool
+            .run(0, &hidden, 1, &routes, &mut output, |_| {
+                bail!("host failure")
+            })
+            .expect_err("host and disk errors must both be returned");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("host failure") && error.contains("disk worker"),
+            "{error}"
+        );
+        assert!(!pool.running);
+        assert!(pool.workers.iter().all(|worker| worker.work.is_some()));
+        std::fs::write(&path, native)?;
+        pool.run(0, &hidden, 1, &routes, &mut output, |_| Ok(()))?;
+        assert_eq!(output, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn disk_partial_start_drains_accepted_work() -> Result<()> {
+        let (dir, catalogue) = native_workers("partial-start")?;
+        let mut pool = DiskExperts::new(catalogue, dir.path(), 2, 1)?;
+        let stopped = &mut pool.workers[1];
+        stopped.input.take();
+        stopped.handle.take().unwrap().join().unwrap();
+        let (input, receiver) = std::sync::mpsc::sync_channel(1);
+        drop(receiver);
+        stopped.input = Some(input);
+        assert!(pool.start(0, &[bf16::ZERO; 8], 1, &[]).is_err());
+        assert!(!pool.running);
+        assert!(pool.failed);
+        assert!(pool.workers.iter().all(|worker| worker.work.is_some()));
+        assert!(pool.start(0, &[bf16::ZERO; 8], 1, &[]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn disk_partial_finish_drains_other_workers() -> Result<()> {
+        let (dir, catalogue) = native_workers("partial-finish")?;
+        let mut pool = DiskExperts::new(catalogue, dir.path(), 2, 1)?;
+        pool.start(0, &[bf16::ZERO; 8], 1, &[])?;
+        let (sender, output) = std::sync::mpsc::sync_channel(1);
+        drop(sender);
+        drop(std::mem::replace(&mut pool.workers[0].output, output));
+        assert!(pool.finish(&mut []).is_err());
+        assert!(!pool.running);
+        assert!(pool.failed);
+        assert!(pool.workers[1].work.is_some());
+        assert!(pool.start(0, &[bf16::ZERO; 8], 1, &[]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn disk_short_output_drains_jobs_before_reuse() -> Result<()> {
+        use crate::experts::runtime::Route;
+        let (dir, catalogue) = native_workers("short-output")?;
+        let mut pool = DiskExperts::new(catalogue, dir.path(), 2, 1)?;
+        let hidden = [bf16::from_f32(0.25); 8];
+        let routes = [0, 1].map(|expert| Route {
+            row: 0,
+            choice: expert,
+            expert,
+            weight: bf16::from_f32(0.5),
+        });
+        pool.start(0, &hidden, 1, &routes)?;
+        assert!(pool.finish(&mut []).is_err());
+        assert!(!pool.running);
+        assert!(pool.workers.iter().all(|worker| worker.work.is_some()));
+        let mut output = [bf16::ZERO; 16];
+        pool.start(0, &hidden, 1, &routes)?;
+        pool.finish(&mut output)?;
+        assert!(output.iter().any(|&value| value != bf16::ZERO));
         Ok(())
     }
 

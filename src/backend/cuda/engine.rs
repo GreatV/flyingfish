@@ -2063,6 +2063,9 @@ impl Engine {
                 .context("MTP state epoch exhausted")?;
         }
         self.device.stream.synchronize()?;
+        if let Some(decode) = self.moe.as_mut() {
+            decode.reset()?;
+        }
         self.images = None;
         self.reset_qwen_positions()?;
         self.state.reset(&self.device.stream)?;
