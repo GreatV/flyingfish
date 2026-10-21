@@ -948,7 +948,7 @@ fn check_bindings(b: &GdnBindings, rows: u32, conv_dim: u32, hv: u32) -> Result<
 #[cfg(test)]
 mod tests {
     use super::prep_grids;
-    use cudarc::driver::{DevicePtr, LaunchConfig, sys};
+    use cudarc::driver::{DevicePtr, LaunchConfig};
 
     fn cfg(d: (u32, u32, u32)) -> LaunchConfig {
         LaunchConfig {
@@ -1981,8 +1981,8 @@ mod tests {
                 "/tests/data/minicpm-config.json"
             )),
         ] {
-            let root = serde_json::from_str(config)?;
-            let model = if config.contains("MiniCPM") {
+            let root: serde_json::Value = serde_json::from_str(config)?;
+            let model = if root["model_type"] == "minicpmv4_7" {
                 crate::model_spec::ModelSpec::minicpm(
                     &root,
                     &serde_json::json!({"eos_token_id": [248044, 248046]}),
@@ -2050,10 +2050,8 @@ mod tests {
                 let mut elapsed = [0.0; 4];
                 for (position, arm) in [0usize, 1, 1, 0].into_iter().enumerate() {
                     let (core, buffers, plan, workspace, initial_history) = &mut arms[arm];
-                    let scratch = Scratch {
-                        ptr: workspace.device_ptr(stream).0,
-                        bytes: workspace.len() as u64,
-                    };
+                    let ptr = workspace.device_ptr(stream).0;
+                    let bytes = workspace.len() as u64;
                     let mean_ms = crate::backend::cuda::time_prepared_operation(
                         stream,
                         || {
@@ -2067,7 +2065,7 @@ mod tests {
                                 stream,
                                 meta,
                                 ExecutionPhase::Prefill,
-                                scratch,
+                                Scratch { ptr, bytes },
                                 matches!(
                                     core,
                                     GeometryCore::ChunkedSnapshot | GeometryCore::RstepSnapshot
