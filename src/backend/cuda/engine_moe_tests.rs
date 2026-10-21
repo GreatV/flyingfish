@@ -1067,6 +1067,7 @@ fn graph_gate(format: crate::model_spec::ExpertFormat) -> Result<()> {
         }
         if backed {
             capacity.host_blocks = geometry.layers * geometry.experts;
+            capacity.spare_blocks = 0;
             capacity.host_expert_bytes =
                 u64::from(capacity.host_blocks + capacity.spare_blocks) * capacity.slot_bytes();
             capacity.disk_bytes = 0;
@@ -1970,6 +1971,7 @@ fn tier_gate(
             let mut capacity = tier_capacity(geometry, pinned, format)?;
             if backed {
                 capacity.host_blocks = geometry.layers * geometry.experts;
+                capacity.spare_blocks = 0;
                 capacity.host_expert_bytes =
                     u64::from(capacity.host_blocks + capacity.spare_blocks) * capacity.slot_bytes();
                 capacity.disk_bytes = 0;

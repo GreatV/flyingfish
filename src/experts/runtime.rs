@@ -260,7 +260,11 @@ impl Residency {
         );
         let slot_bytes = capacity.slot_bytes();
         let cap = admission.hard_cap(slot_bytes)?;
-        let reserve = if capacity.host_blocks > 0 {
+        let reserve = if u64::from(capacity.host_blocks)
+            == u64::from(geometry.layers) * u64::from(geometry.experts)
+        {
+            0
+        } else if capacity.host_blocks > 0 {
             cap.max(1)
         } else {
             cap
@@ -1176,7 +1180,10 @@ mod tests {
         let admission = Admission {
             budget_bytes_per_token: slot * u64::from(cap),
         };
-        let host = HostBlocks::new(host_blocks + cap, usize::try_from(slot / 2)?)?;
+        let host = HostBlocks::new(
+            host_blocks + capacity.spare_blocks,
+            usize::try_from(slot / 2)?,
+        )?;
         let (dir, catalogue) = staged(geometry)?;
         let reader = DiskReader::open(&catalogue, dir.path(), 1)?;
         let frequency = vec![vec![1.0; 8]; geometry.layers as usize];
@@ -1952,7 +1959,7 @@ mod tests {
             assert_eq!(backed.host_block, blocks);
             assert_eq!(backed.ledger().unique_bytes()?, bytes);
             assert_eq!(backed.ledger().disk_bytes()?, 0);
-            assert_eq!(backed.free_host_blocks(), 2);
+            assert_eq!(backed.free_host_blocks(), 0);
         }
         backed.end_request()?;
         let borrow = backed.borrow(2)?;
@@ -1969,7 +1976,7 @@ mod tests {
         assert!(host.claim(0).is_err());
         assert_eq!(lease.read(0)?.len(), host.block_elements());
         println!(
-            "PASS residency_complete_backing requests=2 tokens=4 borrow=2 d2h_bytes=0 unique_union=true read_lease=true"
+            "PASS residency_complete_backing requests=2 tokens=4 borrow=2 d2h_bytes=0 spare_blocks=0 unique_union=true read_lease=true"
         );
         Ok(())
     }

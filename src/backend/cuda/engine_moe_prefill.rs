@@ -3161,6 +3161,7 @@ mod tests {
                         capacity(geometry, rows, pinned, engines, host_complete, format)?;
                     if backed {
                         capacity.host_blocks = geometry.layers * geometry.experts;
+                        capacity.spare_blocks = 0;
                         capacity.host_expert_bytes =
                             u64::from(capacity.host_blocks + capacity.spare_blocks)
                                 * capacity.slot_bytes();

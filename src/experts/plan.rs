@@ -495,17 +495,15 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
         .checked_add(u64::from(reserve))
         .and_then(|blocks| blocks.checked_mul(slot_bytes))
         .context("partial host arena bytes overflow")?;
-    let backed_blocks = routed_slots
-        .checked_add(u64::from(reserve))
-        .context("complete host block count overflow")?;
-    let backed_bytes = backed_blocks
+    let backed_bytes = routed_slots
         .checked_mul(slot_bytes)
         .context("complete host arena bytes overflow")?;
-    if backed_blocks <= host_block_slots
+    if routed_slots <= host_block_slots
         && (partial_bytes > inputs.host_registration_bytes
             || backed_bytes <= inputs.host_registration_bytes)
     {
         host_blocks = routed_slots;
+        reserve = 0;
     }
     let host_blocks = u32::try_from(host_blocks).context("host block count exceeds u32")?;
     let hosted = u64::from(host_blocks).min(non_gpu);
@@ -1311,12 +1309,14 @@ mod tests {
         };
         assert!(!capacity(&none, 0).unwrap().pinned);
         let complete = PlanInputs {
-            host_available_bytes: reserves.host_bytes(slot()).unwrap() + 17 * slot(),
-            host_registration_bytes: 17 * slot(),
+            device_free_bytes: reserves.persistent_bytes(slot()).unwrap() + 8 * slot(),
+            host_available_bytes: reserves.host_bytes(slot()).unwrap() + 16 * slot(),
+            host_registration_bytes: 16 * slot(),
             ..capacity_ref(&inputs)
         };
         let full = capacity(&complete, 0).unwrap();
         assert_eq!(full.host_blocks, 16);
+        assert_eq!(full.spare_blocks, 0);
         assert!(full.pinned);
         for (host_available_bytes, host_registration_bytes) in [
             (
@@ -1337,7 +1337,8 @@ mod tests {
                 0,
             )
             .unwrap();
-            assert_eq!(bounded.host_blocks, 15);
+            assert_eq!(bounded.host_blocks, 11);
+            assert_eq!(bounded.spare_blocks, 1);
             assert_eq!(bounded.slots_per_layer, full.slots_per_layer);
             assert_eq!(bounded.span_rows, full.span_rows);
             assert!(bounded.pinned);
@@ -1386,7 +1387,7 @@ mod tests {
         assert_eq!(span_borrow_slots(&reserves, slot(), 4, 4).unwrap(), 3);
         let derived = capacity(&inputs, 0).unwrap();
         assert_eq!(derived.host_blocks, 16, "complete immutable host backing");
-        assert_eq!(derived.spare_blocks, 1);
+        assert_eq!(derived.spare_blocks, 0);
         assert_eq!(derived.disk_bytes, 0);
         assert_eq!(derived.disk_workers, 0);
         let partial = PlanInputs {
