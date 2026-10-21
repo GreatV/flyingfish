@@ -894,7 +894,9 @@ impl ExpertCache {
             self.host_registration_bytes <= expert_bytes
                 && self.host_registration_bytes.is_multiple_of(slot_bytes)
                 && if self.host_registration_bytes == 0 {
-                    self.host_registration_seconds == [0.0; 3]
+                    self.host_registration_seconds[0].is_finite()
+                        && self.host_registration_seconds[0] >= 0.0
+                        && self.host_registration_seconds[1..] == [0.0; 2]
                 } else {
                     self.host_registration_seconds
                         .iter()
@@ -1076,14 +1078,36 @@ fn measure_expert_transfer(d: &Device, bytes: usize) -> Result<ExpertTransfer> {
     Ok(cell)
 }
 
-fn measure_host_registration(d: &Device, bytes: u64) -> Result<(u64, [f64; 3])> {
+fn registration_extent<T>(
+    maximum: u64,
+    mut register: impl FnMut(u64) -> Result<Option<T>>,
+) -> Result<Option<(u64, T)>> {
+    let (mut accepted, mut end, mut probe) = (0, maximum, maximum);
+    let mut measured = None;
+    while accepted < end {
+        match register(probe)? {
+            Some(value) => {
+                accepted = probe;
+                measured = Some(value);
+            }
+            None => end = probe - 1,
+        }
+        probe = accepted + (end - accepted).div_ceil(2);
+    }
+    Ok(measured.map(|value| (accepted, value)))
+}
+
+fn measure_host_registration(d: &Device, bytes: u64, slot_bytes: u64) -> Result<(u64, [f64; 3])> {
     if d.ctx
         .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED)?
         == 0
     {
         return Ok((0, [0.0; 3]));
     }
-    ensure!(bytes > 0, "zero host registration measurement extent");
+    ensure!(
+        bytes > 0 && slot_bytes > 0 && bytes.is_multiple_of(slot_bytes),
+        "invalid host registration measurement bytes={bytes} slot_bytes={slot_bytes}"
+    );
     let start = Instant::now();
     let mut allocation = memmap2::MmapMut::map_anon(usize::try_from(bytes)?)
         .with_context(|| format!("allocate host registration measurement: bytes={bytes}"))?;
@@ -1091,24 +1115,44 @@ fn measure_host_registration(d: &Device, bytes: u64) -> Result<(u64, [f64; 3])> 
     let allocated = start.elapsed().as_secs_f64();
     d.ctx.bind_to_thread()?;
     let pointer = allocation.as_mut_ptr().cast::<std::ffi::c_void>();
-    let start = Instant::now();
-    // SAFETY: the anonymous allocation remains owned through unregister and has no DMA users.
-    unsafe { sys::cuMemHostRegister_v2(pointer, allocation.len(), 0).result() }
-        .with_context(|| format!("measure CUDA host registration: bytes={bytes}"))?;
-    let registered = start.elapsed().as_secs_f64();
-    let start = Instant::now();
-    // SAFETY: pointer is the exact successfully registered allocation and has no DMA users.
-    unsafe { sys::cuMemHostUnregister(pointer).result() }
-        .with_context(|| format!("unregister host registration measurement: bytes={bytes}"))?;
-    let unregistered = start.elapsed().as_secs_f64();
+    let measured = registration_extent(bytes / slot_bytes, |slots| {
+        let extent = usize::try_from(slots * slot_bytes)?;
+        let start = Instant::now();
+        // SAFETY: every prefix stays within the owned mapping and has no DMA users.
+        let result = unsafe { sys::cuMemHostRegister_v2(pointer, extent, 0).result() };
+        let registered = start.elapsed().as_secs_f64();
+        if let Err(error) = result {
+            if error.0 == sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({"host_registration_capacity_probe": {
+                        "bytes":extent,"cuda_result":"CUDA_ERROR_OUT_OF_MEMORY",
+                        "register_seconds":registered
+                    }})
+                );
+                return Ok(None);
+            }
+            return Err(error)
+                .with_context(|| format!("measure CUDA host registration: bytes={extent}"));
+        }
+        let start = Instant::now();
+        // SAFETY: pointer is the successfully registered prefix and has no DMA users.
+        unsafe { sys::cuMemHostUnregister(pointer).result() }
+            .with_context(|| format!("unregister host registration measurement: bytes={extent}"))?;
+        Ok(Some([registered, start.elapsed().as_secs_f64()]))
+    })?;
+    let (extent, [registered, unregistered]) = measured
+        .map(|(slots, seconds)| (slots * slot_bytes, seconds))
+        .unwrap_or((0, [0.0; 2]));
     eprintln!(
         "{}",
         serde_json::json!({"host_registration_measurement": {
-            "bytes":bytes,"cuda_result":"CUDA_SUCCESS","allocation_seconds":allocated,
+            "bytes":extent,"allocation_bytes":bytes,"allocation_seconds":allocated,
+            "cuda_result":if extent > 0 {"CUDA_SUCCESS"} else {"CUDA_ERROR_OUT_OF_MEMORY"},
             "register_seconds":registered,"unregister_seconds":unregistered
         }})
     );
-    Ok((bytes, [allocated, registered, unregistered]))
+    Ok((extent, [allocated, registered, unregistered]))
 }
 
 pub(super) fn load_experts(
@@ -1151,7 +1195,7 @@ pub(super) fn load_experts(
         let registration_slots = ((available - available / 16) / slot_bytes)
             .min(u64::from(geometry.layers) * u64::from(geometry.experts));
         let (host_registration_bytes, host_registration_seconds) =
-            measure_host_registration(d, registration_slots * slot_bytes)?;
+            measure_host_registration(d, registration_slots * slot_bytes, slot_bytes)?;
         let transfers = [1, geometry.top_k]
             .into_iter()
             .collect::<std::collections::BTreeSet<_>>()
@@ -1223,7 +1267,7 @@ pub(super) fn load_experts(
         .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED)?
         != 0;
     ensure!(
-        (cache.host_registration_bytes > 0) == registration_supported,
+        registration_supported || cache.host_registration_bytes == 0,
         "expert host registration profile differs from driver support={registration_supported} bytes={}",
         cache.host_registration_bytes
     );
@@ -1241,6 +1285,27 @@ mod long_tests {
     #[test]
     fn expert_cells_guard_capacity_inputs() -> Result<()> {
         use crate::experts::{catalogue::ExpertGeometry, plan::ServiceCell};
+        for limit in 0..=17 {
+            let measured = registration_extent(17, |slots| Ok((slots <= limit).then_some(slots)))?;
+            assert_eq!(measured.map(|(slots, _)| slots).unwrap_or(0), limit);
+            assert!(measured.is_none_or(|(slots, value)| slots == value));
+        }
+        let mut attempts = 0;
+        assert_eq!(
+            registration_extent(17, |_| {
+                attempts += 1;
+                Ok(Some(()))
+            })?,
+            Some((17, ()))
+        );
+        assert_eq!(attempts, 1);
+        assert!(
+            registration_extent::<()>(0, |_| panic!("zero extent must not register"))?.is_none()
+        );
+        assert!(registration_extent::<()>(17, |_| anyhow::bail!("register failed")).is_err());
+        println!(
+            "PASS host_registration_search maximum_slots=17 exact_limits=0..17 fatal_error=propagated"
+        );
         let mut bytes: Vec<u8> = (0..4096).map(|index| (index % 251) as u8).collect();
         check_expert_transfer(&bytes)?;
         bytes[2048] ^= 1;
@@ -1302,6 +1367,16 @@ mod long_tests {
                 .collect(),
         };
         let measured = cache.check(&key, &host, &geometry, slot_bytes)?;
+        cache.host_registration_bytes = 0;
+        cache.host_registration_seconds = [0.001, 0.0, 0.0];
+        assert_eq!(
+            cache
+                .check(&key, &host, &geometry, slot_bytes)?
+                .host_registration_bytes,
+            0
+        );
+        cache.host_registration_bytes = 16 * slot_bytes;
+        cache.host_registration_seconds = [0.001; 3];
         let mut invalid_registration = serde_json::to_value(&cache)?;
         invalid_registration["host_registration_bytes"] = serde_json::json!(u64::MAX);
         let invalid_registration: ExpertCache = serde_json::from_value(invalid_registration)?;
@@ -1462,6 +1537,53 @@ mod long_tests {
         assert_eq!(measured.service, reused.service);
         assert_eq!(std::fs::read(&path)?, bytes);
         assert_eq!(std::fs::metadata(&path)?.modified()?, modified);
+        let (device_free, device_total) = device.ctx.mem_get_info()?;
+        let available = host_memory(Path::new("/"))?;
+        let copies = measured.copy_engines.min(2);
+        let reserves = crate::experts::plan::Reserves {
+            device_fixed_bytes: device_total as u64 / 16,
+            host_fixed_bytes: available / 16,
+            residual_row_bytes: 0,
+            normalized_row_bytes: 0,
+            contribution_row_bytes: 0,
+            done_row_bytes: 0,
+            route_row_bytes: 0,
+            prefill_staging_slots: copies,
+            disk_ring_slots: copies,
+        };
+        let capacity = crate::experts::plan::capacity(
+            &crate::experts::plan::PlanInputs {
+                geometry,
+                layout: crate::experts::catalogue::ExpertLayout::new(
+                    spec.expert_format.context("MoE expert_format missing")?,
+                    &geometry,
+                )?,
+                device_free_bytes: device_free as u64,
+                host_available_bytes: available,
+                h2d_bytes_per_second: measured.h2d_bytes_per_second,
+                d2h_bytes_per_second: measured.d2h_bytes_per_second,
+                copy_engines: measured.copy_engines,
+                disk_readers: copies,
+                host_registration_bytes: measured.host_registration_bytes,
+                service: &measured.service,
+                reserves: &reserves,
+                span_rows: 1,
+                wave_rows: 1,
+            },
+            1,
+        )?;
+        println!(
+            "PASS expert_setup_capacity_probe {}",
+            serde_json::json!({"pinned":capacity.pinned,"geometry":geometry,
+                "slot_bytes":slot_bytes,"registered_bytes":measured.host_registration_bytes,
+                "host_blocks":capacity.host_blocks,"spare_blocks":capacity.spare_blocks,
+                "disk_bytes":capacity.disk_bytes,"device_free_bytes":device_free,
+                "device_fixed_bytes":reserves.device_fixed_bytes,
+                "host_available_bytes":available,"host_fixed_bytes":reserves.host_fixed_bytes,
+                "prefill_staging_slots":copies,"disk_ring_slots":copies,
+                "span_rows":1,"wave_rows":1,"admission_cap":1,
+                "scope":"calibration capacity probe; model weights and inference workspace not loaded"})
+        );
         let mut invalid: ExpertCache = serde_json::from_slice(&bytes)?;
         invalid.transfers[0].d2h_seconds[0] = 0.0;
         std::fs::write(&path, serde_json::to_vec(&invalid)?)?;
