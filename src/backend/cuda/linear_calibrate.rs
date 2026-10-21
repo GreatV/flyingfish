@@ -1,5 +1,5 @@
 use super::{
-    Device, bf16_chain_bound, blas, calibrate,
+    Device, bf16_chain_bound, calibrate,
     closure::Closure,
     ops::{Ops, grid},
 };
@@ -27,6 +27,7 @@ struct Trial {
 
 #[derive(Serialize, Deserialize)]
 struct Cache {
+    schema: u32,
     choice: LinearChoice,
     trials: Vec<Trial>,
     rel_rmse: f64,
@@ -78,7 +79,7 @@ impl Environment {
             "skinny GEMM requires 40960 bytes shared memory"
         );
         Ok(Self {
-            key: calibrate::key(d)?,
+            key: d.key.clone(),
             ctx: d.ctx.clone(),
             stream: d.stream.clone(),
             residual: ops.residual.clone(),
@@ -90,13 +91,11 @@ impl Environment {
 
     pub fn path(&self, shape: LinearShape) -> PathBuf {
         self.runtime.join(format!(
-            "linear-m{}-o{}-i{}-{}-{}-{}.json",
+            "linear-v2-m{}-o{}-i{}-{}.json",
             shape.rows,
             shape.output,
             shape.input,
-            self.key.device_uuid,
-            self.key.driver_version,
-            self.key.binary_version
+            self.key.tag()
         ))
     }
     pub fn read(&self, shape: LinearShape) -> Result<LinearChoice> {
@@ -113,7 +112,7 @@ impl Environment {
     pub fn load(
         &self,
         shape: LinearShape,
-        algo_count: u32,
+        algorithms: &[LinearImpl],
         launch: impl Fn(&LinearImpl, &mut CudaSlice<bf16>) -> Result<()>,
     ) -> Result<LinearChoice> {
         ensure!(
@@ -127,7 +126,7 @@ impl Environment {
             check(&cache, &self.key, shape)?;
             (cache, true)
         } else {
-            let cache = self.measure(shape, algo_count, launch)?;
+            let cache = self.measure(shape, algorithms, launch)?;
             check(&cache, &self.key, shape)?;
             let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
             let mut f = std::fs::OpenOptions::new()
@@ -151,21 +150,26 @@ impl Environment {
     fn measure(
         &self,
         shape: LinearShape,
-        algo_count: u32,
+        algorithms: &[LinearImpl],
         launch: impl Fn(&LinearImpl, &mut CudaSlice<bf16>) -> Result<()>,
     ) -> Result<Cache> {
         self.closure.measurement()?;
         let started = Instant::now();
         let s = &self.stream;
         let mut out = s.alloc_zeros::<bf16>(shape.rows * shape.output)?;
-        launch(&LinearImpl::CublasLt(0), &mut out)?;
+        let reference_impl = algorithms
+            .first()
+            .context("no linear algorithm candidates")?;
+        launch(reference_impl, &mut out)?;
         let reference = s.clone_dtoh(&out)?;
         let signal: f64 = reference.iter().map(|v| (v.to_f32() as f64).powi(2)).sum();
         // One BF16 output rounding and one FP32 reduction over `input` per GEMM.
         let bound = bf16_chain_bound(1, &[shape.input]);
         let mut rel_rmse = 0.0f64;
-        for implementation in (1..blas::LT_CANDIDATES.min(algo_count))
-            .map(LinearImpl::CublasLt)
+        for implementation in algorithms
+            .iter()
+            .skip(1)
+            .cloned()
             .chain([LinearImpl::Skinny])
         {
             launch(&implementation, &mut out)?;
@@ -201,8 +205,9 @@ impl Environment {
             .ctx
             .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
         let mut trials = Vec::new();
-        let candidates: Vec<LinearImpl> = (0..blas::LT_CANDIDATES.min(algo_count))
-            .map(LinearImpl::CublasLt)
+        let candidates: Vec<LinearImpl> = algorithms
+            .iter()
+            .cloned()
             .chain([LinearImpl::Skinny])
             .collect();
         for implementation in candidates {
@@ -242,6 +247,7 @@ impl Environment {
         }
         let best = best(&trials)?;
         Ok(Cache {
+            schema: 2,
             choice: LinearChoice {
                 shape,
                 key: self.key.clone(),
@@ -268,31 +274,54 @@ fn best(trials: &[Trial]) -> Result<&Trial> {
 
 fn check(cache: &Cache, key: &CacheKey, shape: LinearShape) -> Result<()> {
     ensure!(
-        cache.choice.key == *key && cache.choice.shape == shape,
+        cache.schema == 2 && cache.choice.key == *key && cache.choice.shape == shape,
         "linear cache identity mismatch"
     );
-    let lt_indices: Vec<u32> = cache
+    let lt: Vec<_> = cache
         .trials
         .iter()
         .filter_map(|t| match t.implementation {
-            LinearImpl::CublasLt(index) => Some(index),
-            LinearImpl::Skinny | LinearImpl::Candidate(_) => None,
+            LinearImpl::CublasLt(identity) => Some(identity),
+            _ => None,
         })
         .collect();
+    let unique: std::collections::BTreeSet<_> = lt.iter().collect();
+    let cublas = cache
+        .trials
+        .iter()
+        .filter(|t| t.implementation == LinearImpl::Cublas)
+        .count();
+    let native_count = if shape.rows == 1 {
+        ensure!(
+            cublas == 1 && lt.is_empty(),
+            "single-row cache requires cuBLAS"
+        );
+        1
+    } else {
+        ensure!(
+            cublas == 0
+                && !lt.is_empty()
+                && lt.len() <= super::blas::LT_CANDIDATES as usize
+                && unique.len() == lt.len()
+                && lt.iter().all(|a| a.id >= 0
+                    && a.tile >= 0
+                    && a.split_k >= 0
+                    && a.reduction >= 0
+                    && a.swizzle >= 0
+                    && a.custom >= 0
+                    && a.stages >= 0),
+            "linear cache Lt candidate identity mismatch"
+        );
+        lt.len()
+    };
     ensure!(
-        !lt_indices.is_empty()
-            && lt_indices.len() <= blas::LT_CANDIDATES as usize
-            && lt_indices
-                .iter()
-                .enumerate()
-                .all(|(i, &index)| index == i as u32)
-            && cache
-                .trials
-                .iter()
-                .filter(|t| matches!(t.implementation, LinearImpl::Skinny))
-                .count()
-                == 1
-            && cache.trials.len() == lt_indices.len() + 1,
+        cache
+            .trials
+            .iter()
+            .filter(|t| t.implementation == LinearImpl::Skinny)
+            .count()
+            == 1
+            && cache.trials.len() == native_count + 1,
         "linear cache candidate list mismatch"
     );
     ensure!(
@@ -346,13 +375,28 @@ mod tests {
             device_uuid: "device".into(),
             driver_version: "driver".into(),
             binary_version: "binary".into(),
+            cublaslt_version: 130201,
         };
         let shape = LinearShape {
             rows: 8,
             output: 2048,
             input: 2048,
         };
+        let identities = [0, 1].map(|id| {
+            LinearImpl::CublasLt(crate::backend::setup::LtAlgorithm {
+                id,
+                tile: 20,
+                split_k: 1,
+                reduction: 0,
+                swizzle: 0,
+                custom: 0,
+                stages: 16,
+                inner: 0,
+                cluster: 0,
+            })
+        });
         let mut cache = Cache {
+            schema: 2,
             choice: LinearChoice {
                 shape,
                 key: key.clone(),
@@ -361,14 +405,14 @@ mod tests {
             },
             trials: vec![
                 Trial {
-                    implementation: LinearImpl::CublasLt(0),
+                    implementation: identities[0].clone(),
                     samples: 12,
                     median_us: 20.0,
                     p10_us: 18.0,
                     p90_us: 22.0,
                 },
                 Trial {
-                    implementation: LinearImpl::CublasLt(1),
+                    implementation: identities[1].clone(),
                     samples: 12,
                     median_us: 21.0,
                     p10_us: 19.0,
@@ -387,6 +431,9 @@ mod tests {
         };
         check(&cache, &key, shape).unwrap();
         let mut stale = key.clone();
+        stale.cublaslt_version += 1;
+        assert!(check(&cache, &stale, shape).is_err());
+        stale = key.clone();
         stale.driver_version = "new driver".into();
         assert!(
             check(&cache, &stale, shape)
@@ -394,7 +441,7 @@ mod tests {
                 .to_string()
                 .contains("identity")
         );
-        cache.choice.implementation = LinearImpl::CublasLt(0);
+        cache.choice.implementation = identities[0].clone();
         assert!(
             check(&cache, &key, shape)
                 .unwrap_err()

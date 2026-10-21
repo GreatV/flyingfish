@@ -6,6 +6,7 @@ use super::{
 use crate::{
     backend::setup::{
         ATTENTION_LENGTHS, AttentionPlan, CacheKey, Selection, attention_bucket, attention_chunks,
+        attention_lengths,
     },
     config::Config,
 };
@@ -19,12 +20,11 @@ use std::{
     hash::Hasher,
     io::{Read, Write},
     path::{Component, Path, PathBuf},
-    process::Command,
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
 const LENGTHS: [usize; 5] = ATTENTION_LENGTHS;
-const CAPACITIES: [usize; 5] = [1280, 8448, 33024, 65792, 131008];
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Trial {
@@ -77,6 +77,7 @@ struct Cache {
     key: CacheKey,
     winner: AttentionPlan,
     bucket: usize,
+    capacity: usize,
     lengths: [usize; 5],
     trials: Vec<Trial>,
     sms: usize,
@@ -95,12 +96,12 @@ impl Calibrated {
     pub fn choose(&self, capacity: usize) -> Result<(AttentionPlan, Selection)> {
         let bucket = attention_bucket(capacity)?;
         ensure!(
-            self.cache.bucket == bucket,
+            self.cache.bucket == bucket && self.cache.capacity == capacity,
             "decode calibration bucket does not match capacity"
         );
         eprintln!(
             "{}",
-            serde_json::json!({"attention_calibration_selection":{"capacity":capacity,"bucket":bucket,"measured_length":LENGTHS[bucket],"plan":self.cache.winner}})
+            serde_json::json!({"attention_calibration_selection":{"capacity":capacity,"bucket":bucket,"measured_length":self.cache.trials[0].length,"plan":self.cache.winner}})
         );
         Ok((
             self.cache.winner,
@@ -153,52 +154,63 @@ pub fn runtime_dir(path: &Path, model: &Path, create: bool) -> Result<PathBuf> {
     Ok(resolved)
 }
 
-pub(super) fn key(d: &Device) -> Result<CacheKey> {
-    let bytes = d.ctx.uuid()?.bytes;
-    let hex: String = bytes.iter().map(|&b| format!("{:02x}", b as u8)).collect();
+fn driver_release(text: &str) -> Result<String> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("NVRM version:"))
+        .and_then(|line| {
+            line.split_whitespace().find(|part| {
+                let pieces: Vec<_> = part.split('.').collect();
+                pieces.len() == 3
+                    && pieces
+                        .iter()
+                        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            })
+        })
+        .map(str::to_owned)
+        .context("NVRM version line has no NVIDIA driver release")
+}
+
+pub(super) fn key(ctx: &cudarc::driver::CudaContext) -> Result<CacheKey> {
+    static DRIVER: OnceLock<std::result::Result<String, String>> = OnceLock::new();
+    let version = DRIVER
+        .get_or_init(|| {
+            std::fs::read_to_string("/proc/driver/nvidia/version")
+                .context("read NVIDIA kernel-module release")
+                .and_then(|text| driver_release(&text))
+                .map_err(|error| format!("{error:#}"))
+        })
+        .as_ref()
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let bytes = ctx.uuid()?.bytes;
+    let hex: Vec<String> = bytes.iter().map(|&v| format!("{:02x}", v as u8)).collect();
     let uuid = format!(
         "GPU-{}-{}-{}-{}-{}",
-        &hex[..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..]
-    );
-    let result = Command::new("nvidia-smi")
-        .args(["--query-gpu=uuid,driver_version", "--format=csv,noheader"])
-        .output()
-        .context("query NVIDIA driver version for calibration cache")?;
-    ensure!(
-        result.status.success(),
-        "nvidia-smi driver query failed: {}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    let stdout = String::from_utf8(result.stdout)?;
-    let version = stdout
-        .lines()
-        .find_map(|line| {
-            let (id, version) = line.split_once(',')?;
-            (id.trim() == uuid).then(|| version.trim().to_owned())
-        })
-        .context("CUDA UUID was not found in nvidia-smi driver query")?;
-    ensure!(
-        !version.is_empty() && version.chars().all(|c| c.is_ascii_digit() || c == '.'),
-        "invalid driver version in calibration cache key"
+        hex[0..4].concat(),
+        hex[4..6].concat(),
+        hex[6..8].concat(),
+        hex[8..10].concat(),
+        hex[10..16].concat()
     );
     let mut file = File::open(std::env::current_exe()?)?;
     let mut hash = DefaultHasher::new();
-    let mut block = [0u8; 65536];
+    let mut buffer = [0u8; 65536];
     loop {
-        let n = file.read(&mut block)?;
-        if n == 0 {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
             break;
         }
-        hash.write(&block[..n]);
+        hash.write(&buffer[..count]);
     }
+    let cublaslt_version = unsafe { cudarc::cublaslt::sys::cublasLtGetVersion() };
+    ensure!(
+        cublaslt_version > 0,
+        "cuBLASLt returned an invalid library version"
+    );
     Ok(CacheKey {
         device_uuid: uuid,
-        driver_version: version,
+        driver_version: version.clone(),
         binary_version: format!("hash64-{:016x}", hash.finish()),
+        cublaslt_version,
     })
 }
 
@@ -206,11 +218,14 @@ fn rank(t: &Trial) -> (f64, f64, usize) {
     (t.median_us, t.p90_us, usize::MAX - t.plan.chunk)
 }
 
-fn check(cache: &Cache, key: &CacheKey, bucket: usize) -> Result<()> {
+fn check(cache: &Cache, key: &CacheKey, capacity: usize) -> Result<()> {
+    let bucket = attention_bucket(capacity)?;
+    let evaluation_lengths = attention_lengths(capacity, 0)?;
     let expected = plans(bucket);
     let filtered = bucket >= 3;
     ensure!(
-        cache.schema == 2
+        cache.schema == 3
+            && cache.capacity == capacity
             && cache.lengths == LENGTHS
             && cache.key == *key
             && bucket < LENGTHS.len()
@@ -222,7 +237,7 @@ fn check(cache: &Cache, key: &CacheKey, bucket: usize) -> Result<()> {
         cache.phase1.len() == if filtered { expected.len() } else { 0 },
         "invalid phase1 occupancy lattice"
     );
-    let length = &LENGTHS[bucket];
+    let length = &evaluation_lengths[0];
     let trials: Vec<_> = cache
         .trials
         .iter()
@@ -239,7 +254,8 @@ fn check(cache: &Cache, key: &CacheKey, bucket: usize) -> Result<()> {
             ensure!(records.len() == 1, "missing or duplicate phase1 occupancy");
             let o = records[0];
             ensure!(
-                o.blocks == length.div_ceil(plan.chunk) * (16 / plan.qpack) && o.active_per_sm > 0,
+                o.blocks == capacity.div_ceil(plan.chunk) * (16 / plan.qpack)
+                    && o.active_per_sm > 0,
                 "invalid phase1 occupancy record"
             );
             o.fits(cache.sms)
@@ -260,7 +276,7 @@ fn check(cache: &Cache, key: &CacheKey, bucket: usize) -> Result<()> {
         trials.iter().all(|t| t.samples > 0
             && t.median_us.is_finite()
             && t.median_us > 0.0
-            && t.evaluation_lengths == [*length, *length + 1, *length + 128, *length + 256]),
+            && t.evaluation_lengths == evaluation_lengths),
         "invalid calibration sample"
     );
     let best = trials
@@ -278,10 +294,10 @@ fn check(cache: &Cache, key: &CacheKey, bucket: usize) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn cache_path(dir: &Path, key: &CacheKey, bucket: usize) -> PathBuf {
+pub(super) fn cache_path(dir: &Path, key: &CacheKey, bucket: usize, capacity: usize) -> PathBuf {
     dir.join(format!(
-        "attention-long-v2-b{bucket}-{}-{}-{}.json",
-        key.device_uuid, key.driver_version, key.binary_version
+        "attention-long-v3-b{bucket}-c{capacity}-{}.json",
+        key.tag()
     ))
 }
 
@@ -294,22 +310,22 @@ pub(super) fn load(
     closure: &super::closure::Closure,
 ) -> Result<Calibrated> {
     let bucket = attention_bucket(capacity)?;
-    let key = key(d).context("calibration cache key")?;
-    let path = cache_path(dir, &key, bucket);
+    let key = d.key.clone();
+    let path = cache_path(dir, &key, bucket, capacity);
     let (cache, hit) = if closure.access(&path)? {
         let cache: Cache = serde_json::from_slice(&std::fs::read(&path)?)
             .with_context(|| format!("read calibration cache {}", path.display()))?;
         ensure!(cache.sms == d.info.sms, "attention cache SM count mismatch");
-        check(&cache, &key, bucket)?;
+        check(&cache, &key, capacity)?;
         (cache, true)
     } else {
         eprintln!(
             "{}",
-            serde_json::json!({"attention_calibration_cache":{"schema":2,"lengths":LENGTHS,"bucket":bucket,"path":path,"cached":false,"action":"measure requested bucket"}})
+            serde_json::json!({"attention_calibration_cache":{"schema":3,"lengths":LENGTHS,"bucket":bucket,"capacity":capacity,"path":path,"cached":false,"action":"measure requested bucket"}})
         );
         let cache =
-            measure(d, ops, c, key, bucket, closure).context("measure attention candidates")?;
-        check(&cache, &cache.key, bucket)?;
+            measure(d, ops, c, key, capacity, closure).context("measure attention candidates")?;
+        check(&cache, &cache.key, capacity)?;
         let temp = path.with_extension(format!("tmp-{}", std::process::id()));
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -375,9 +391,11 @@ fn measure(
     ops: &Ops,
     c: &Config,
     key: CacheKey,
-    selected: usize,
+    capacity: usize,
     closure: &super::closure::Closure,
 ) -> Result<Cache> {
+    let selected = attention_bucket(capacity)?;
+    let evaluation_lengths = attention_lengths(capacity, 0)?;
     closure.measurement()?;
     let start = Instant::now();
     let s = &d.stream;
@@ -385,8 +403,8 @@ fn measure(
     let mut q = s.alloc_zeros::<bf16>(c.qkv_dim())?;
     let zero_q = vec![bf16::ZERO; c.qkv_dim()];
     let queries = random(c.qkv_dim(), 4);
-    let k = s.clone_htod(&random(CAPACITIES[selected] * c.kv_dim(), 1))?;
-    let v_values = random(CAPACITIES[selected] * c.kv_dim(), 2);
+    let k = s.clone_htod(&random(capacity * c.kv_dim(), 1))?;
+    let v_values = random(capacity * c.kv_dim(), 2);
     let v_max = v_values
         .iter()
         .map(|v| v.to_f32().abs() as f64)
@@ -419,15 +437,16 @@ fn measure(
     let mut trials = Vec::new();
     let mut phase1 = Vec::new();
     let mut winner = None;
-    for (bucket, &l) in LENGTHS.iter().enumerate().filter(|(b, _)| *b == selected) {
+    let bucket = selected;
+    let l = evaluation_lengths[0];
+    {
         s.memcpy_htod(&[l as i32], &mut length)?;
         let mut expected = vec![0f64; c.kv_dim()];
         for head in 0..c.num_key_value_heads {
             let mut sum = vec![0f64; c.head_dim];
             for row in 0..l {
                 for (dim, value) in sum.iter_mut().enumerate() {
-                    *value += v_values[(head * CAPACITIES[bucket] + row) * c.head_dim + dim]
-                        .to_f32() as f64;
+                    *value += v_values[(head * capacity + row) * c.head_dim + dim].to_f32() as f64;
                 }
             }
             for (dim, value) in sum.iter().enumerate() {
@@ -437,12 +456,11 @@ fn measure(
         let mut best = (f64::INFINITY, f64::INFINITY, usize::MAX);
         for plan in plans(bucket) {
             let chunk = plan.chunk;
-            let mut attention =
-                Attention::candidate(&d.ctx, s, c, CAPACITIES[bucket], plan, false)?;
+            let mut attention = Attention::candidate(&d.ctx, s, c, capacity, plan, false)?;
             if bucket >= 3 {
                 let record = Occupancy {
                     plan,
-                    blocks: l.div_ceil(chunk) * (16 / plan.qpack),
+                    blocks: capacity.div_ceil(chunk) * (16 / plan.qpack),
                     active_per_sm: attention
                         .phase1_blocks_per_sm()
                         .context("query decode phase1 occupancy")?,
@@ -488,8 +506,8 @@ fn measure(
             let mut samples = Vec::new();
             while timer.elapsed() < Duration::from_millis(trial_ms) {
                 for (index, (begin, end)) in pairs.iter().enumerate() {
-                    let growth = [0, 1, 128, 256][index % 4];
-                    s.memcpy_htod(&[(l + growth) as i32], &mut length)?;
+                    let measured_length = evaluation_lengths[index % 4];
+                    s.memcpy_htod(&[measured_length as i32], &mut length)?;
                     unsafe {
                         s.launch_builder(&ops.residual)
                             .arg(&mut flush)
@@ -533,13 +551,14 @@ fn measure(
                 p90_us: percentile(&samples, 0.9),
                 wall_ms,
                 max_abs_error: max_error,
-                evaluation_lengths: [l, l + 1, l + 128, l + 256],
+                evaluation_lengths,
             });
         }
     }
     let wall_ms = start.elapsed().as_secs_f64() * 1000.0;
     Ok(Cache {
-        schema: 2,
+        schema: 3,
+        capacity,
         lengths: LENGTHS,
         key,
         winner: winner.context("no measured decode attention candidate")?,
@@ -1164,13 +1183,10 @@ pub(super) fn load_experts(
 ) -> Result<ExpertCalibration> {
     let slot_bytes =
         crate::experts::catalogue::ExpertLayout::new(expert_format, &geometry)?.slot_bytes();
-    let key = key(d)?;
+    let key = d.key.clone();
     let host = ExpertHost::read()?;
     let identity = super::closure::hash(&serde_json::to_vec(&(&host, geometry, expert_format))?);
-    let path = dir.join(format!(
-        "experts-v3-{}-{}-{}-{identity}.json",
-        key.device_uuid, key.driver_version, key.binary_version
-    ));
+    let path = dir.join(format!("experts-v3-{}-{identity}.json", key.tag()));
     let (cache, hit) = if closure.access(&path)? {
         (
             serde_json::from_slice::<ExpertCache>(&std::fs::read(&path)?)
@@ -1314,6 +1330,7 @@ mod long_tests {
             device_uuid: "fixture".into(),
             driver_version: "fixture".into(),
             binary_version: "fixture".into(),
+            cublaslt_version: 130201,
         };
         let host = ExpertHost {
             cpu: "fixture".into(),
@@ -1517,8 +1534,7 @@ mod long_tests {
         let modified = std::fs::metadata(&path)?.modified()?;
         let device = Device::new(0)?;
         let measured: ExpertCache = serde_json::from_slice(&bytes)?;
-        let measured =
-            measured.check(&key(&device)?, &ExpertHost::read()?, &geometry, slot_bytes)?;
+        let measured = measured.check(&device.key, &ExpertHost::read()?, &geometry, slot_bytes)?;
         let reader = super::super::closure::Closure::new(false, "calibrate".into());
         let reused = load_experts(
             &device,
@@ -1604,13 +1620,314 @@ mod long_tests {
         Ok(())
     }
 
+    fn calibration_expected(
+        c: &Config,
+        values: &[bf16],
+        shape: crate::backend::setup::MultiShape,
+        prefix: usize,
+        tree: bool,
+    ) -> Vec<f64> {
+        let mut expected = vec![0.0; shape.rows * c.kv_dim()];
+        let mut masks = vec![1u64; shape.rows];
+        for row in 1..shape.rows {
+            masks[row] = masks[(row - 1) / 4] | (1u64 << row);
+        }
+        for head in 0..c.num_key_value_heads {
+            for dim in 0..c.head_dim {
+                let value = |position: usize| {
+                    values[(head * shape.capacity + position) * c.head_dim + dim].to_f32() as f64
+                };
+                let sum: f64 = (0..prefix).map(value).sum();
+                for row in 0..shape.rows {
+                    let (extra, count) = if shape.rows == 1 {
+                        (0.0, 0)
+                    } else if tree {
+                        let positions =
+                            (0..shape.rows).filter(|&col| masks[row] & (1u64 << col) != 0);
+                        (
+                            positions.map(|col| value(prefix + col)).sum(),
+                            masks[row].count_ones() as usize,
+                        )
+                    } else {
+                        let count = if shape.causal { row + 1 } else { shape.rows };
+                        ((0..count).map(|col| value(prefix + col)).sum(), count)
+                    };
+                    expected[(row * c.num_key_value_heads + head) * c.head_dim + dim] =
+                        (sum + extra) / (prefix + count) as f64;
+                }
+            }
+        }
+        expected
+    }
+
+    fn calibration_attention_cell(
+        d: &Device,
+        ops: &Ops,
+        c: &Config,
+        dir: &Path,
+        shape: crate::backend::setup::MultiShape,
+        tree: bool,
+    ) -> Result<()> {
+        use super::super::{flash::Shape, verification::Verification};
+        use crate::backend::setup::attention_lengths;
+        let crate::backend::setup::MultiShape {
+            capacity,
+            rows,
+            causal,
+        } = shape;
+        let lengths = attention_lengths(capacity, if rows == 1 { 0 } else { rows })?;
+        let bucket = attention_bucket(capacity)?;
+        let writer = super::super::closure::Closure::new(true, "capacity calibration gate".into());
+        let reader = super::super::closure::Closure::new(false, "capacity calibration gate".into());
+        let cold = Instant::now();
+        let (plan, mut decode, mut multi, path) = if rows == 1 {
+            let calibrated = load(d, ops, c, dir, capacity, &writer)?;
+            let plan = calibrated.choose(capacity)?.0;
+            let path = cache_path(dir, &d.key, bucket, capacity);
+            let bytes = std::fs::read(&path)?;
+            let hit = load(d, ops, c, dir, capacity, &reader)?;
+            ensure!(
+                hit.hit && std::fs::read(&path)? == bytes,
+                "decode cache hit changed bytes"
+            );
+            let wrong = if capacity == 131072 {
+                capacity - 1
+            } else {
+                capacity + 1
+            };
+            ensure!(
+                hit.choose(wrong).is_err(),
+                "decode accepted another capacity"
+            );
+            (
+                plan,
+                Some(Attention::candidate(
+                    &d.ctx, &d.stream, c, capacity, plan, false,
+                )?),
+                None,
+                path,
+            )
+        } else {
+            let calibrated = if tree {
+                super::super::multi_calibrate::load_tree(d, ops, c, dir, rows, capacity, &writer)?
+            } else {
+                super::super::multi_calibrate::load(d, ops, c, dir, shape, &writer)?
+            };
+            let plan = calibrated.choose(capacity)?.0;
+            let path = super::super::multi_calibrate::cache_path(dir, &d.key, bucket, shape, tree);
+            let bytes = std::fs::read(&path)?;
+            let hit = if tree {
+                super::super::multi_calibrate::load_tree(d, ops, c, dir, rows, capacity, &reader)?
+            } else {
+                super::super::multi_calibrate::load(d, ops, c, dir, shape, &reader)?
+            };
+            ensure!(
+                std::fs::read(&path)? == bytes,
+                "multi cache hit changed bytes"
+            );
+            let wrong = if capacity == 131072 {
+                capacity - 1
+            } else {
+                capacity + 1
+            };
+            ensure!(
+                hit.choose(wrong).is_err(),
+                "multi accepted another capacity"
+            );
+            (
+                plan.launch,
+                None,
+                Some(Verification::with_plan(&d.ctx, &d.stream, c, shape, plan)?),
+                path,
+            )
+        };
+        let cold_and_reload_s = cold.elapsed().as_secs_f64();
+        let cache: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        ensure!(
+            cache["capacity"].as_u64() == Some(capacity as u64),
+            "calibration capacity differs from allocation"
+        );
+        let cold_ms = cache["wall_ms"]
+            .as_f64()
+            .context("calibration wall_ms missing")?;
+        let s = &d.stream;
+        let q = s.alloc_zeros::<bf16>(rows * c.qkv_dim())?;
+        let k = s.alloc_zeros::<bf16>(capacity * c.kv_dim())?;
+        let values: Vec<_> = (0..capacity * c.kv_dim())
+            .map(|i| bf16::from_f32(((i * 37 + i / 128 * 11) % 263) as f32 / 512.0 - 131.0 / 512.0))
+            .collect();
+        let v = s.clone_htod(&values)?;
+        let mut out = s.alloc_zeros::<bf16>(rows * c.hidden_size)?;
+        let mut prefix = s.alloc_zeros::<i32>(1)?;
+        let mut masks = vec![1u64; rows];
+        for row in 1..rows {
+            masks[row] = masks[(row - 1) / 4] | (1u64 << row);
+        }
+        let ancestors = s.clone_htod(&masks)?;
+        for length in lengths {
+            ensure!(
+                length + if rows == 1 { 0 } else { rows } <= capacity,
+                "calibration evaluation exceeds capacity"
+            );
+            s.memcpy_htod(&[length as i32], &mut prefix)?;
+            let mut launch = |out: &mut cudarc::driver::CudaSlice<bf16>| -> Result<()> {
+                if let Some(op) = &mut decode {
+                    return op.run(s, &q, &k, &v, out, &prefix);
+                }
+                let op = multi.as_mut().context("multi operation missing")?;
+                let geometry = Shape {
+                    rows,
+                    start: 0,
+                    q_heads: c.num_attention_heads,
+                    kv_heads: c.num_key_value_heads,
+                    capacity,
+                    head_dim: c.head_dim,
+                    causal,
+                };
+                if tree {
+                    op.run_tree(
+                        super::super::verification::Query {
+                            qkv: &q,
+                            k: &k,
+                            v: &v,
+                            out,
+                            prefix: &prefix,
+                            shape: geometry,
+                        },
+                        &ancestors,
+                    )
+                } else {
+                    op.run(&q, &k, &v, out, &prefix, geometry)
+                }
+            };
+            launch(&mut out)?;
+            let eager = s.clone_dtoh(&out)?;
+            ensure!(
+                eager.iter().all(|v| v.is_finite()),
+                "nonfinite selected attention output"
+            );
+            let expected = calibration_expected(c, &values, shape, length, tree);
+            let (error, ratio) = uniform_attention_error(
+                c,
+                &eager,
+                &expected,
+                plan.chunk,
+                length + if rows == 1 { 0 } else { rows },
+                0.5,
+            );
+            ensure!(
+                ratio <= 1.0,
+                "DEFECT selected calibration attention error={error} error/bound={ratio} C={capacity} R={rows} tree={tree}"
+            );
+            s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+            launch(&mut out)?;
+            let graph = s
+                .end_capture(sys::CUgraphInstantiate_flags(0))?
+                .context("selected attention graph missing")?;
+            graph.launch()?;
+            let actual = s.clone_dtoh(&out)?;
+            ensure!(
+                actual
+                    .iter()
+                    .zip(&eager)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "DEFECT selected attention graph/eager bits differ"
+            );
+        }
+        println!(
+            "PASS calibration_attention_capacity C={capacity} R={rows} causal={causal} tree={tree} lengths={lengths:?} kv=[2,{capacity},128] cold_ms={cold_ms} cold_and_reload_s={cold_and_reload_s} cache_reuse=byte_identical uniform_bound=1 graph_eager_bits=0"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "exclusive CUDA, FF_ARGMAX_MODEL and an empty FLYINGFISH_RUNTIME_DIR"]
+    fn calibration_identity_capacity_gpu() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let model =
+            PathBuf::from(std::env::var_os("FF_ARGMAX_MODEL").context("FF_ARGMAX_MODEL missing")?);
+        let c = Config::read(&model)?;
+        ensure!(
+            c.hidden_size == 2048
+                && c.num_attention_heads == 16
+                && c.num_key_value_heads == 2
+                && c.head_dim == 128,
+            "calibration gate requires native MiniCPM5-2B geometry"
+        );
+        let dir = runtime_dir(
+            &PathBuf::from(
+                std::env::var_os("FLYINGFISH_RUNTIME_DIR")
+                    .context("FLYINGFISH_RUNTIME_DIR missing")?,
+            ),
+            &model,
+            true,
+        )?;
+        let d = Device::new(0)?;
+        let ops = Ops::new(&d.ctx)?;
+        let mut defects = 0;
+        let mut cells = 0;
+        for capacity in [1, 64, 257, 1023, 1312, 2049, 16385, 49153, 98305, 131072] {
+            for (rows, causal, tree) in [
+                (1, false, false),
+                (7, false, false),
+                (8, true, false),
+                (16, false, true),
+                (64, false, true),
+            ] {
+                if capacity < rows {
+                    continue;
+                }
+                cells += 1;
+                let shape = crate::backend::setup::MultiShape {
+                    capacity,
+                    rows,
+                    causal,
+                };
+                if let Err(error) = calibration_attention_cell(&d, &ops, &c, &dir, shape, tree) {
+                    defects += 1;
+                    println!(
+                        "DEFECT calibration_attention_capacity C={capacity} R={rows} causal={causal} tree={tree} error={error:#}"
+                    );
+                }
+            }
+        }
+        if let Err(error) = super::super::blas::Blas::calibration_identity_gate(&d, &ops, &dir) {
+            defects += 1;
+            println!("DEFECT calibration_lt_identity error={error:#}");
+        }
+        d.stream.synchronize()?;
+        println!(
+            "{} calibration_identity_capacity cells={cells} defects={defects}",
+            if defects == 0 { "PASS" } else { "DEFECT" }
+        );
+        ensure!(defects == 0, "DEFECT calibration gate cells={defects}");
+        Ok(())
+    }
+
     #[test]
     fn cache_requires_measured_bucket_and_complete_candidates() -> Result<()> {
-        for (bucket, &length) in LENGTHS.iter().enumerate() {
+        assert_eq!(
+            driver_release(
+                "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64 595.99.02 Release Build"
+            )?,
+            "595.99.02"
+        );
+        assert!(driver_release("NVRM version: unavailable").is_err());
+        assert!(driver_release("GCC version: 13.3.0").is_err());
+        for (bucket, &capacity) in crate::backend::setup::ATTENTION_CAPACITIES
+            .iter()
+            .enumerate()
+        {
+            let lengths = attention_lengths(capacity, 0)?;
+            let length = lengths[0];
             let key = CacheKey {
                 device_uuid: "test".into(),
                 driver_version: "test".into(),
                 binary_version: "test".into(),
+                cublaslt_version: 130201,
             };
             let mut trials = Vec::new();
             let mut phase1 = Vec::new();
@@ -1618,7 +1935,7 @@ mod long_tests {
                 if bucket >= 3 {
                     let o = Occupancy {
                         plan,
-                        blocks: length.div_ceil(plan.chunk) * (16 / plan.qpack),
+                        blocks: capacity.div_ceil(plan.chunk) * (16 / plan.qpack),
                         active_per_sm: 8,
                     };
                     let fits = o.fits(128);
@@ -1637,39 +1954,43 @@ mod long_tests {
                     p90_us: median_us,
                     wall_ms: 1.0,
                     max_abs_error: 0.0,
-                    evaluation_lengths: [length, length + 1, length + 128, length + 256],
+                    evaluation_lengths: lengths,
                 });
             }
             let mut cache = Cache {
-                schema: 2,
+                schema: 3,
                 key,
                 winner: trials[0].plan,
                 bucket,
+                capacity,
                 lengths: LENGTHS,
                 trials,
                 sms: 128,
                 phase1,
                 wall_ms: 1.0,
             };
-            check(&cache, &cache.key, bucket)?;
+            check(&cache, &cache.key, capacity)?;
+            assert!(check(&cache, &cache.key, capacity - 1).is_err());
+            let mut stale = cache.key.clone();
+            stale.cublaslt_version += 1;
+            assert!(check(&cache, &stale, capacity).is_err());
             let winner = cache.winner;
             cache.winner = cache.trials[1].plan;
-            assert!(check(&cache, &cache.key, bucket).is_err());
+            assert!(check(&cache, &cache.key, capacity).is_err());
             cache.winner = winner;
-            assert!(check(&cache, &cache.key, (bucket + 1) % LENGTHS.len()).is_err());
             if bucket >= 3 {
                 cache.phase1[0].blocks += 1;
-                assert!(check(&cache, &cache.key, bucket).is_err());
+                assert!(check(&cache, &cache.key, capacity).is_err());
                 cache.phase1[0].blocks -= 1;
             }
-            cache.schema = 1;
-            assert!(check(&cache, &cache.key, bucket).is_err());
             cache.schema = 2;
-            cache.lengths[4] = 32768;
-            assert!(check(&cache, &cache.key, bucket).is_err());
-            cache.lengths = LENGTHS;
+            assert!(check(&cache, &cache.key, capacity).is_err());
+            cache.schema = 3;
+            cache.trials[0].evaluation_lengths[3] = capacity + 1;
+            assert!(check(&cache, &cache.key, capacity).is_err());
+            cache.trials[0].evaluation_lengths = lengths;
             cache.trials.pop();
-            assert!(check(&cache, &cache.key, bucket).is_err());
+            assert!(check(&cache, &cache.key, capacity).is_err());
         }
         Ok(())
     }

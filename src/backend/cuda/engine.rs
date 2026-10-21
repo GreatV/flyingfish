@@ -4589,7 +4589,7 @@ impl Engine {
             self.spec.as_ref().map(|s| &s.draft.config),
         )?;
         self.blas.declare(self.workspace_rows, &profile.pairs);
-        let key = super::calibrate::key(&self.device)?;
+        let key = self.device.key.clone();
         let bucket = crate::backend::setup::attention_bucket(self.capacity)?;
         let mut paths: Vec<_> = profile
             .linear
@@ -4599,7 +4599,9 @@ impl Engine {
         use super::closure::Attention as Kind;
         for &kind in &profile.attention {
             paths.push(match kind {
-                Kind::Decode => super::calibrate::cache_path(&self.runtime, &key, bucket),
+                Kind::Decode => {
+                    super::calibrate::cache_path(&self.runtime, &key, bucket, self.capacity)
+                }
                 Kind::Draft | Kind::Verify | Kind::Tree => {
                     let draft = &self
                         .spec
@@ -4617,8 +4619,11 @@ impl Engine {
                         &self.runtime,
                         &key,
                         bucket,
-                        rows,
-                        kind == Kind::Verify,
+                        crate::backend::setup::MultiShape {
+                            rows,
+                            causal: kind == Kind::Verify,
+                            capacity: self.capacity,
+                        },
                         kind == Kind::Tree,
                     )
                 }

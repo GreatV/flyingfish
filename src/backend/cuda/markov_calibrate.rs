@@ -147,10 +147,8 @@ fn check(cache: &Cache, key: &CacheKey, shape: MarkovShape) -> Result<()> {
 
 pub(super) fn cache_path(dir: &Path, key: &CacheKey, shape: MarkovShape) -> PathBuf {
     dir.join(format!(
-        "markov-phase1-v2-{}-{}-{}-{}-{}-{}-{}.json",
-        key.device_uuid,
-        key.driver_version,
-        key.binary_version,
+        "markov-phase1-v2-{}-{}-{}-{}-{}.json",
+        key.tag(),
         shape.rows,
         shape.vocab,
         shape.rank,
@@ -166,7 +164,7 @@ pub(super) fn load(
     shape: MarkovShape,
 ) -> Result<Calibrated> {
     shape.validate()?;
-    let key = super::calibrate::key(d)?;
+    let key = d.key.clone();
     let path = cache_path(dir, &key, shape);
     let (cache, hit) = if closure.access(&path)? {
         let cache: Cache = serde_json::from_slice(&std::fs::read(&path)?)?;
