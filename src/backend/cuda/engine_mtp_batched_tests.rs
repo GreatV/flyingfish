@@ -603,64 +603,143 @@ fn poison_snapshot_rows(
     Ok(())
 }
 
+fn chain_margin(logits: impl IntoIterator<Item = f32>) -> Result<f32> {
+    let mut top = [f32::NEG_INFINITY; 2];
+    let mut count = 0;
+    for value in logits {
+        ensure!(value.is_finite(), "Runner FAIL nonfinite chain logits");
+        count += 1;
+        if value > top[0] {
+            top[1] = top[0];
+            top[0] = value;
+        } else if value > top[1] {
+            top[1] = value;
+        }
+    }
+    let margin = top[0] - top[1];
+    ensure!(
+        count == VOCAB && margin.is_finite() && margin >= 0.0,
+        "Runner FAIL chain logits extent={count} margin={margin}"
+    );
+    Ok(margin)
+}
+
+fn chain_identity(case: &str, plain: &[(u32, f32)], batched: &[(u32, f32)]) -> Result<()> {
+    let mut differences = 0;
+    for position in 0..plain.len().max(batched.len()) {
+        let expected = plain.get(position);
+        let actual = batched.get(position);
+        if expected.map(|x| x.0) != actual.map(|x| x.0) {
+            differences += 1;
+            println!(
+                "DEFECT q38_mtp_batch_chain_position {}",
+                serde_json::json!({"case":case,"position":position,
+                    "plain_id_margin":expected,"batched_id_margin":actual})
+            );
+        }
+    }
+    println!(
+        "{} q38_mtp_batch_chain_case {}",
+        if differences == 0 { "PASS" } else { "DEFECT" },
+        serde_json::json!({"case":case,"plain_id_margins":plain,"batched_id_margins":batched,
+            "token_differences":differences,"allowed_differences":0,"margin_exclusions":0})
+    );
+    ensure!(
+        differences == 0,
+        "DEFECT {case} token differences={differences}"
+    );
+    Ok(())
+}
+
 #[test]
-#[ignore = "authorized full-model GPU window required; DRef scoring follows export"]
+fn batch_chain_identity_rejects_token_perturbation() -> Result<()> {
+    let plain = [(17, 0.25), (263, 0.0), (42, 0.5)];
+    chain_identity("control-aligned", &plain, &plain)?;
+    let mut changed = plain;
+    changed[1].0 += 1;
+    assert!(chain_identity("control-planted-token", &plain, &changed).is_err());
+    println!("PASS batch_chain_identity_control planted_position=1 margin=0 threshold=0");
+    Ok(())
+}
+
+#[test]
+#[ignore = "authorized full-model GPU window; production depth4 Batched/graph identity"]
 fn q38_mtp_batch_chain_gpu() -> Result<()> {
-    let mut e = ready()?;
-    let out = output()?;
-    let mut cases = Vec::new();
-    for k in 1..=4 {
-        for h2 in [MtpHiddenTap::PreFinalNorm, MtpHiddenTap::PostFinalNorm] {
-            for h5 in [MtpRecurrentTap::PreMtpNorm, MtpRecurrentTap::PostMtpNorm] {
-                for case in ["math1", "code1", "gen1", "gen2", "math2"] {
-                    configure(&mut e, options(k, h2, h5, true))?;
-                    let ids = prompt(case)?;
-                    let first = e.prefill(&ids, None)?;
-                    let mut plain = vec![first];
-                    while plain.len() < 64 && !e.model_spec.eos.contains(plain.last().unwrap()) {
-                        plain.push(e.decode(true, None)?);
-                    }
-                    let mut graph_tokens = None;
-                    for graph in [false, true] {
-                        e.mtp.as_mut().context("MTP missing")?.options.graph = graph;
-                        ensure!(
-                            e.mtp_prefill(&ids)? == first,
-                            "batch bootstrap changed prefill"
-                        );
-                        let mut tokens = vec![first];
-                        let mut rounds = Vec::new();
-                        while tokens.len() < 64
-                            && !e.model_spec.eos.contains(tokens.last().unwrap())
-                        {
-                            let r = e.mtp_batch_round(64 - tokens.len(), None)?;
-                            ensure!(!r.round.tokens.is_empty(), "batch stopped before budget");
-                            rounds.push(serde_json::json!({"matched":r.round.matched,"accepted":r.round.accepted,"consumed":r.round.consumed,"proposals":r.round.proposals,"tokens":r.round.tokens,"kept_verify_state":r.kept_verify_state,"verify_predictions":r.verify_predictions}));
-                            tokens.extend_from_slice(&r.round.tokens);
-                        }
-                        if let Some(expected) = &graph_tokens {
-                            ensure!(&tokens == expected, "M2b eager/graph trajectory differs");
-                        } else {
-                            graph_tokens = Some(tokens.clone());
-                        }
-                        let divergence = tokens.iter().zip(&plain).filter(|(a, b)| a != b).count()
-                            + tokens.len().abs_diff(plain.len());
-                        let name = format!("{case}-K{k}-{h2:?}-{h5:?}-graph{graph}");
-                        std::fs::write(
-                            out.join(format!("{name}.json")),
-                            serde_json::to_vec_pretty(
-                                &serde_json::json!({"case":case,"depth":k,"h2":h2,"h5":h5,"graph":graph,"prompt_ids":ids,"tokens":tokens,"plain_tokens":plain,"batch_vs_decode_divergences":divergence,"rounds":rounds,"numeric_gate":"PENDING_DREF_G7; exporter rc0 is not numeric PASS"}),
-                            )?,
-                        )?;
-                        cases.push(name);
-                    }
+    let mut e = load(true)?;
+    e.mtp_enable(options(
+        4,
+        MtpHiddenTap::PostFinalNorm,
+        MtpRecurrentTap::PostMtpNorm,
+        true,
+    ))?;
+    e.mtp_batch_enable()?;
+    e.capture()?;
+    e.closure.ready(std::time::Instant::now())?;
+    let mut defects = 0;
+    for case in ["math1", "code1", "gen1", "gen2", "math2"] {
+        let ids = prompt(case)?;
+        e.reset()?;
+        let first = e.prefill(&ids, None)?;
+        let mut plain = vec![(first, chain_margin(e.decode_logits()?)?)];
+        while plain.len() < 64 && !e.model_spec.eos.contains(&plain.last().unwrap().0) {
+            let token = e.decode(true, None)?;
+            plain.push((token, chain_margin(e.decode_logits()?)?));
+        }
+        let first = e.mtp_prefill(&ids)?;
+        let mut batched = vec![(first, chain_margin(e.decode_logits()?)?)];
+        while batched.len() < 64 && !e.model_spec.eos.contains(&batched.last().unwrap().0) {
+            let round = e.mtp_batch_round(64 - batched.len(), None)?;
+            ensure!(
+                !round.round.tokens.is_empty(),
+                "Runner FAIL batch stopped before budget"
+            );
+            if round.verify_predictions.is_empty() {
+                ensure!(
+                    round.round.tokens.len() == 1,
+                    "Runner FAIL single-row tail extent"
+                );
+                batched.push((round.round.tokens[0], chain_margin(e.decode_logits()?)?));
+            } else {
+                let rows = round.verify_predictions.len();
+                ensure!(
+                    (2..=crate::mtp::MAX_VERIFY_ROWS).contains(&rows)
+                        && round.round.tokens.len() <= rows,
+                    "Runner FAIL verify output/logit alignment"
+                );
+                let logits = e.device.stream.clone_dtoh(
+                    &e.mtp
+                        .as_ref()
+                        .context("MTP missing")?
+                        .batch
+                        .as_ref()
+                        .context("batch missing")?
+                        .logits
+                        .slice(..rows * VOCAB),
+                )?;
+                for (&token, values) in round.round.tokens.iter().zip(logits.chunks_exact(VOCAB)) {
+                    batched.push((token, chain_margin(values.iter().map(|x| x.to_f32()))?));
                 }
             }
         }
+        let plain_eos = e.model_spec.eos.contains(&plain.last().unwrap().0);
+        let batched_eos = e.model_spec.eos.contains(&batched.last().unwrap().0);
+        println!(
+            "q38_mtp_batch_chain_termination {}",
+            serde_json::json!({"case":case,"plain_tokens":plain.len(),
+                "batched_tokens":batched.len(),"plain_eos":plain_eos,"batched_eos":batched_eos})
+        );
+        let same_tokens = chain_identity(case, &plain, &batched).is_ok();
+        defects += usize::from(!same_tokens || plain_eos != batched_eos);
     }
-    receipt(
-        "m2b-chain-export",
-        serde_json::json!({"result":"EXPORTED_PENDING_DREF","cases":cases,"eager_graph_tokens":"BIT_EQUAL"}),
-    )
+    println!(
+        "{} q38_mtp_batch_chain_gate cases=5 depth=4 graph=true taps=post/post horizon=64 natural_eos=true allowed_differences=0 margin_exclusions=0 defective_cases={defects}",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(
+        defects == 0,
+        "DEFECT batched/greedy identity cases={defects}"
+    );
+    Ok(())
 }
 
 #[test]
