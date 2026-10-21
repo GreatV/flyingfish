@@ -2049,6 +2049,22 @@ fn minicpm_chain_decode_gpu() -> Result<()> {
 #[ignore = "requires CUDA, T0 fixtures, pinned calibration and explicit draft/graph timing arms"]
 fn minicpm_chain_decode_timing_gpu() -> Result<()> {
     // One deployment arm runs text1k/text4k with one warmup and three measured decodes each.
+    chain_decode_timing(&["text_1k", "text_4k"], 4, false)
+}
+
+#[test]
+#[ignore = "exclusive CUDA, BF16 FF_MODEL, text_1k reference and pinned calibration required"]
+fn minicpm_expert_swap_identity_gpu() -> Result<()> {
+    chain_decode_timing(&["text_1k"], 1, true)
+}
+
+#[test]
+#[ignore = "exclusive CUDA timing, BF16 FF_MODEL, text_1k reference and pinned calibration required"]
+fn minicpm_expert_swap_timing_gpu() -> Result<()> {
+    chain_decode_timing(&["text_1k"], 2, false)
+}
+
+fn chain_decode_timing(cases: &[&str], runs: usize, margins: bool) -> Result<()> {
     ensure!(
         std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
         "GPU window not acknowledged"
@@ -2070,7 +2086,7 @@ fn minicpm_chain_decode_timing_gpu() -> Result<()> {
         kv_format: crate::kv::KvFormat::Bf16,
     };
     let mut inputs = Vec::new();
-    for case in ["text_1k", "text_4k"] {
+    for &case in cases {
         let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
         let tensors = SafeTensors::deserialize(&bytes)?;
         inputs.push((case, integers(&tensors, "input_ids")?));
@@ -2088,6 +2104,10 @@ fn minicpm_chain_decode_timing_gpu() -> Result<()> {
     let setup_seconds = setup.elapsed().as_secs_f64();
     let eos = model.model_spec.eos.clone();
     let with_draft = model.spec.is_some();
+    ensure!(
+        !margins || !with_draft,
+        "swap identity requires plain decode"
+    );
     if with_draft {
         model.set_spec_graph(graph)?;
         model.set_spec_eos(&eos)?;
@@ -2107,15 +2127,36 @@ fn minicpm_chain_decode_timing_gpu() -> Result<()> {
         "capacity":capacity,"slots_per_layer":slots,"setup_seconds":setup_seconds})
     );
     let mut defects = 0;
+    let margin = |model: &mut Engine| -> Result<f32> {
+        let logits = model.decode_logits()?;
+        ensure!(
+            logits.iter().all(|x| x.is_finite()),
+            "nonfinite swap identity logits"
+        );
+        let mut top = [f32::NEG_INFINITY; 2];
+        for value in logits {
+            if value > top[0] {
+                top[1] = top[0];
+                top[0] = value;
+            } else if value > top[1] {
+                top[1] = value;
+            }
+        }
+        Ok(top[0] - top[1])
+    };
     for (case, input) in inputs {
         let mut expected = None;
-        for run in 0..4 {
+        for run in 0..runs {
             model.reset()?;
             let prefill = Instant::now();
             let first = model.prefill(&input, None)?;
             model.synchronize()?;
             let prefill_seconds = prefill.elapsed().as_secs_f64();
             let mut ids = vec![first];
+            let mut top2_margins = Vec::new();
+            if margins {
+                top2_margins.push(margin(&mut model)?);
+            }
             let mut rounds = Vec::new();
             let range = super::super::super::profile::Range::new(run > 0, c"minicpm_chain_decode");
             let timer = Instant::now();
@@ -2126,6 +2167,9 @@ fn minicpm_chain_decode_timing_gpu() -> Result<()> {
                     rounds.push(round);
                 } else {
                     ids.push(model.decode(graph, None)?);
+                    if margins {
+                        top2_margins.push(margin(&mut model)?);
+                    }
                 }
             }
             model.synchronize()?;
@@ -2137,13 +2181,20 @@ fn minicpm_chain_decode_timing_gpu() -> Result<()> {
                 "nonfinite/nonpositive chain timing"
             );
             let same = expected.as_ref().is_none_or(|expected| *expected == ids);
+            ensure!(
+                !margins || top2_margins.len() == ids.len(),
+                "swap identity margin extent"
+            );
+            let decode_tokens = ids.len() - 1;
+            let ms_per_token = seconds * 1000.0 / decode_tokens as f64;
             defects += usize::from(!same);
             println!(
                 "{} minicpm_chain_decode_timing {}",
                 if same { "PASS" } else { "DEFECT" },
                 serde_json::json!({"case":case,"run":run,"measured":run>0,"with_draft":with_draft,
                     "graph":graph,"seconds":seconds,"prefill_seconds":prefill_seconds,
-                    "tokens":ids.len(),"ids":ids,"rounds":rounds})
+                    "tokens":ids.len(),"ids":ids,"rounds":rounds,"decode_tokens":decode_tokens,
+                    "ms_per_token":ms_per_token,"margin_collection":margins,"top2_margins":top2_margins})
             );
             if expected.is_none() {
                 expected = Some(ids);
