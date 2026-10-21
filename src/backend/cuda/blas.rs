@@ -649,7 +649,7 @@ impl Blas {
     ) -> Result<()> {
         linear_calibrate::check_extent(shape, w.len(), x.len())?;
         let candidates = self.candidates(shape)?;
-        let (rows, output, input) = (shape.rows, shape.output, shape.input);
+        let (rows, output) = (shape.rows, shape.output);
         {
             let choice = self
                 .calibration
@@ -716,11 +716,9 @@ impl Blas {
 
     pub fn decode_impl(&self) -> &'static str {
         let choices = self.choices.borrow();
-        let rows: Vec<_> = choices.values().filter(|c| c.shape.rows == 1).collect();
-        if rows
-            .iter()
-            .any(|c| matches!(c.implementation, LinearImpl::Skinny))
-        {
+        if choices.values().any(|(choice, _)| {
+            choice.shape.rows == 1 && choice.implementation == LinearImpl::Skinny
+        }) {
             "calibrated cuBLAS/skinny BF16, FP32 accumulation"
         } else {
             "calibrated cuBLAS BF16, FP32 accumulation"
