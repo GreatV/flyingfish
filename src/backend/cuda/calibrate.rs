@@ -1867,6 +1867,7 @@ mod long_tests {
         )?;
         let d = Device::new(0)?;
         let ops = Ops::new(&d.ctx)?;
+        d.finish_upload()?;
         let mut defects = 0;
         let mut cells = 0;
         for capacity in [1, 64, 257, 1023, 1312, 2049, 16385, 49153, 98305, 131072] {
@@ -1887,6 +1888,11 @@ mod long_tests {
                     causal,
                 };
                 if let Err(error) = calibration_attention_cell(&d, &ops, &c, &dir, shape, tree) {
+                    let message = format!("{error:#}");
+                    ensure!(
+                        message.contains("DEFECT") || message.contains("reference mismatch"),
+                        "RUNNER FAIL calibration C={capacity} R={rows} tree={tree}: {message}"
+                    );
                     defects += 1;
                     println!(
                         "DEFECT calibration_attention_capacity C={capacity} R={rows} causal={causal} tree={tree} error={error:#}"
@@ -1895,6 +1901,10 @@ mod long_tests {
             }
         }
         if let Err(error) = super::super::blas::Blas::calibration_identity_gate(&d, &ops, &dir) {
+            ensure!(
+                format!("{error:#}").contains("DEFECT"),
+                "RUNNER FAIL Lt identity: {error:#}"
+            );
             defects += 1;
             println!("DEFECT calibration_lt_identity error={error:#}");
         }
