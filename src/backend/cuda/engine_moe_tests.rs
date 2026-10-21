@@ -2014,7 +2014,7 @@ fn tier_gate(
                         .moe_slots
                         .as_mut()
                         .context("tier request slots missing")?;
-                    slots.delay_copies()?;
+                    slots.delay_copies();
                     slots.begin_request(&frequency)?;
                 }
                 defects += oracle.compare_state(&engine)?;
@@ -2056,7 +2056,7 @@ fn tier_gate(
                         .moe_slots
                         .as_mut()
                         .context("tier admission slots missing")?;
-                    slots.delay_copies()?;
+                    slots.delay_copies();
                     slots.finish_token()?;
                     let mismatch = oracle.compare_state(&engine)?;
                     defects += mismatch;

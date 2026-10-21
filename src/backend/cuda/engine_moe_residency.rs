@@ -883,14 +883,14 @@ impl Slots {
     }
 
     pub(super) fn begin_request(&mut self, frequency: &[Vec<f64>]) -> Result<()> {
-        #[cfg(test)]
-        if std::mem::take(&mut self.delay_request) {
-            delay_stream(&self.transfers.h2d)?;
-        }
         self.moves.clear();
         self.moves
             .extend_from_slice(self.policy.begin_request(frequency)?);
         for index in 0..self.moves.len() {
+            #[cfg(test)]
+            if index + 1 == self.moves.len() && std::mem::take(&mut self.delay_request) {
+                delay_stream(&self.transfers.h2d)?;
+            }
             self.apply_move(self.moves[index])?;
         }
         self.refill.record(&self.transfers.h2d)?;
@@ -966,6 +966,10 @@ impl Slots {
             });
         }
         for index in 0..self.moves.len() {
+            #[cfg(test)]
+            if index + 1 == self.moves.len() && std::mem::take(&mut self.delay_request) {
+                delay_stream(&self.transfers.h2d)?;
+            }
             self.apply_move(self.moves[index])?;
         }
         Ok(())
@@ -1210,8 +1214,8 @@ impl Slots {
     }
 
     #[cfg(test)]
-    pub(super) fn delay_copies(&self) -> Result<()> {
-        delay_stream(&self.transfers.h2d)
+    pub(super) fn delay_copies(&mut self) {
+        self.delay_request = true;
     }
 }
 
