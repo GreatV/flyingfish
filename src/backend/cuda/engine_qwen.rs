@@ -345,7 +345,7 @@ impl Runtime {
             FullAttentionOps::workspace(&attention, limits(rows.min(verify_rows), capacity)?)?;
         let spec = gdn;
         let prefill = GdnOps::workspace(&spec, u32::try_from(rows)?, policy)?;
-        let decode = GdnOps::workspace(&spec, 1, GdnPolicy::LEGACY)?;
+        let decode = GdnOps::workspace(&spec, 1, GdnPolicy::P2)?;
         ensure!(
             [
                 attention_prefill.alignment,
@@ -382,7 +382,7 @@ impl Runtime {
         let gdn = GdnSpec::from_model(&engine.model_spec)?;
         let q_width = engine.model_spec.q_width;
         let kv_width = attention.hkv * attention.d;
-        let gdn_policy = GdnPolicy::for_device(engine.device.info.arch, engine.device.info.sms);
+        let gdn_policy = GdnPolicy::for_device(&engine.device.info);
         let common = CommonOpsRef::new(&engine.device.ctx)?;
         let positions = s.clone_htod(
             &crate::vision_input::PositionPlan::text(1, engine.capacity)?.packed_axes()?,
@@ -1120,7 +1120,7 @@ impl Engine {
             "invalid Q38 capacity"
         );
         // Reject an incomplete operator plan before allocating model weights.
-        Runtime::workspace(&model_spec, 1, capacity, GdnPolicy::LEGACY, verify_rows)?;
+        Runtime::workspace(&model_spec, 1, capacity, GdnPolicy::P2, verify_rows)?;
         let runtime = settings
             .runtime_dir
             .as_deref()
@@ -1135,7 +1135,7 @@ impl Engine {
             ),
         ));
         let device = Device::new(ordinal)?;
-        let gdn_policy = GdnPolicy::for_device(device.info.arch, device.info.sms);
+        let gdn_policy = GdnPolicy::for_device(&device.info);
         let prefix_cache = settings.prefix_cache;
         let mut catalog = if prefix_cache {
             WeightCatalog::load_for_prefix_cache(dir, &model_spec, &device)?
@@ -1371,7 +1371,7 @@ impl Engine {
                 "attention_prefill_backend": "FA2 d256",
                 "attention_decode_backend": "TCMQA d256",
                 "gdn_prefill_workspace_bytes": GdnOps::workspace(&gdn, u32::try_from(rows)?, gdn_policy)?.bytes,
-                "gdn_decode_workspace_bytes": GdnOps::workspace(&gdn, 1, GdnPolicy::LEGACY)?.bytes,
+                "gdn_decode_workspace_bytes": GdnOps::workspace(&gdn, 1, GdnPolicy::P2)?.bytes,
                 "bound_prefill_max_rows": rows,
                 "bound_decode_max_rows": 1,
                 "gdn_plan": gdn_policy.identity(),
@@ -2430,19 +2430,13 @@ mod tests {
             assert!(plans.select(0, &narrow).is_err());
             assert!(plans.select(capacity + 1, &narrow).is_err());
             assert!(plans.select(usize::MAX, &narrow).is_err());
-            let budget = Runtime::workspace(
-                &geometry(),
-                capacity,
-                4096,
-                GdnPolicy::for_device(89, 128),
-                5,
-            )? as u64;
+            let budget = Runtime::workspace(&geometry(), capacity, 4096, GdnPolicy::P2, 5)? as u64;
             for rows in 1..=5.min(capacity) {
                 assert!(
                     GdnOps::workspace(
                         &crate::op_contract::GdnSpec::q38(),
                         rows as u32,
-                        GdnPolicy::LEGACY
+                        GdnPolicy::P2
                     )?
                     .bytes
                         <= budget
@@ -2498,8 +2492,7 @@ mod tests {
         for capacity in [256, 16_832] {
             let required =
                 FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(5, capacity)?)?;
-            let allocated =
-                Runtime::workspace(&geometry(), 5, capacity, GdnPolicy::for_device(89, 128), 5)?;
+            let allocated = Runtime::workspace(&geometry(), 5, capacity, GdnPolicy::P2, 5)?;
             ensure!(
                 required.bytes <= allocated as u64,
                 "nested verify workspace {required:?} exceeds allocation {allocated}"
@@ -2508,13 +2501,10 @@ mod tests {
             let row_bytes = Runtime::row_bytes(&spec)? + mtp.row_bytes;
             let fixed = Runtime::fixed_bytes(&spec, capacity)? + mtp.fixed_bytes;
             let workspace = |rows| {
-                Ok(Runtime::workspace(
-                    &geometry(),
-                    rows,
-                    capacity,
-                    GdnPolicy::for_device(89, 128),
-                    5,
-                )? + mtp.workspace(rows)?)
+                Ok(
+                    Runtime::workspace(&geometry(), rows, capacity, GdnPolicy::P2, 5)?
+                        + mtp.workspace(rows)?,
+                )
             };
             let total = 24usize << 30;
             let request = WorkspaceRequest {
@@ -2580,7 +2570,7 @@ mod tests {
         let total = 1 << 30;
         let fixed = spec.vocab as usize * 2 + 12 + 64 * size_of::<u64>() + capacity * 12;
         for rows in [1, 65, 128] {
-            let scratch = Runtime::workspace(&geometry(), rows, capacity, GdnPolicy::LEGACY, 5)?;
+            let scratch = Runtime::workspace(&geometry(), rows, capacity, GdnPolicy::P2, 5)?;
             for required in [
                 FullAttentionOps::preprocess_workspace(
                     &FullAttentionSpec::q38(),
@@ -2590,9 +2580,9 @@ mod tests {
                 GdnOps::workspace(
                     &crate::op_contract::GdnSpec::q38(),
                     rows as u32,
-                    GdnPolicy::LEGACY,
+                    GdnPolicy::P2,
                 )?,
-                GdnOps::workspace(&crate::op_contract::GdnSpec::q38(), 1, GdnPolicy::LEGACY)?,
+                GdnOps::workspace(&crate::op_contract::GdnSpec::q38(), 1, GdnPolicy::P2)?,
             ] {
                 ensure!(
                     scratch as u64 >= required.bytes,
@@ -2612,7 +2602,7 @@ mod tests {
             };
             let budget = WorkspaceBudget::new(
                 request,
-                |r| Runtime::workspace(&geometry(), r, capacity, GdnPolicy::LEGACY, 5),
+                |r| Runtime::workspace(&geometry(), r, capacity, GdnPolicy::P2, 5),
                 Ok,
             )?;
             assert_eq!(budget.planned_transient_bytes, allocated);
@@ -2624,7 +2614,7 @@ mod tests {
                         free_after_resident: request.free_after_resident - 1,
                         ..request
                     },
-                    |r| Runtime::workspace(&geometry(), r, capacity, GdnPolicy::LEGACY, 5),
+                    |r| Runtime::workspace(&geometry(), r, capacity, GdnPolicy::P2, 5),
                     Ok,
                 )
                 .is_err()
@@ -2641,7 +2631,7 @@ mod tests {
             )))?,
             &serde_json::json!({}),
         )?;
-        let policy = GdnPolicy::for_device(89, 128);
+        let policy = GdnPolicy::P2;
         let capacity = 8192;
         let total = 8usize << 30;
         let row_bytes = Runtime::row_bytes(&spec)?;
