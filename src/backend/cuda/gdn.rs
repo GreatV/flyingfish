@@ -9,7 +9,7 @@
 //! `hist_update` is a separate launch after conv; conv blocks read `history[]` to seed their window.
 //!
 //! Ordinary `run` selects the core by phase. `run_verify` keeps Prefill preparation and uses the
-//! ordered h32 R1..16 core on every bound architecture and h48 R1..5 core on sm89.
+//! ordered h32 R1..16 and h48 R1..5 cores with resource-checked native bindings.
 //! Plans bind before Ready.
 //!
 //! Rows are local: `qkv` and `core_out` are this call's `[M, ...]`; prefix rows are reachable only
@@ -448,19 +448,9 @@ impl GdnOps {
             }
         }
 
-        let rstep = if spec.hv == 32 || cubin::capability(ctx)? == 89 {
-            Some(module("gdn_rstep")?.load_function("gdn_rstep_core_v1")?)
-        } else {
-            None
-        };
+        let rstep = Some(module("gdn_rstep")?.load_function("gdn_rstep_core_v1")?);
         let hist_snapshot = module("gdn_conv")?.load_function("gdn_conv_hist_snapshot")?;
-        let core_snapshot = if rstep.is_some() {
-            module("gdn_rstep")?.load_function("gdn_rstep_core_snapshot")?
-        } else {
-            let f = module("gdn_chunked")?.load_function("gdn_chunked_core_snapshot")?;
-            f.set_attribute(cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, CHUNKED_SMEM as i32)?;
-            f
-        };
+        let core_snapshot = module("gdn_rstep")?.load_function("gdn_rstep_core_snapshot")?;
         // All three arenas are under the 48 KiB no-opt-in cap.
         let p2 = if !cw_p2 {
             None
@@ -496,6 +486,56 @@ impl GdnOps {
             recurrent: f_recurrent,
             p2,
         };
+        let max_threads =
+            u32::try_from(ctx.attribute(Attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)?)?;
+        ensure!(
+            ctx.attribute(Attribute::CU_DEVICE_ATTRIBUTE_WARP_SIZE)? == 32,
+            "GDN requires 32-thread warps"
+        );
+        let core_functions = [
+            (
+                "recurrent",
+                &kernels.recurrent,
+                CORE_THREADS,
+                RECURRENT_SMEM,
+            ),
+            ("chunked", &kernels.chunked, CORE_THREADS, CHUNKED_SMEM),
+            (
+                "rstep snapshot",
+                &kernels.core_snapshot,
+                CORE_THREADS,
+                RECURRENT_SMEM,
+            ),
+        ];
+        let rstep_function = kernels
+            .rstep
+            .as_ref()
+            .map(|f| ("rstep", f, CORE_THREADS, RECURRENT_SMEM));
+        let p2_functions = kernels.p2.iter().flat_map(|p2| {
+            [
+                ("P2 stage A", &p2.a, P2_THREADS, cw_p2::SMEM_BYTES as u32),
+                ("P2 stage H", &p2.h, P2_THREADS, cw_p2::SMEM_BYTES as u32),
+            ]
+        });
+        for (name, function, threads, shared) in core_functions
+            .into_iter()
+            .chain(rstep_function)
+            .chain(p2_functions)
+        {
+            ensure!(
+                threads <= max_threads && u64::from(shared) <= optin,
+                "GDN {name} launch exceeds device limits: threads={threads}/{max_threads} shared={shared}/{optin}"
+            );
+            let resident = function
+                .occupancy_max_active_blocks_per_multiprocessor(threads, shared as usize, None)
+                .with_context(|| {
+                    format!("GDN {name} occupancy threads={threads} shared={shared}")
+                })?;
+            ensure!(
+                resident > 0,
+                "GDN {name} has zero resident blocks: threads={threads} shared={shared}"
+            );
+        }
         let (conv, conv_rows) = bind_conv(&kernels, spec, max_rows, sms, compact)?;
         // Grids derive from the bound rows, never from device valid_rows.
         let (prep_cfg, beta_cfg, conv_cfg) = prep_grids(
@@ -1232,6 +1272,7 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum GeometryCore {
         Recurrent,
+        Selected,
         Verify,
         ChunkedSnapshot,
         RstepSnapshot,
@@ -1251,7 +1292,9 @@ mod tests {
         core: GeometryCore,
     ) -> Result<GdnPlan> {
         let stream = &device.stream;
-        let compact = matches!(core, GeometryCore::P2);
+        let compact = matches!(core, GeometryCore::P2)
+            || matches!(core, GeometryCore::Selected)
+                && GdnPolicy::for_device(&device.info).cw_p2_for_step(rows);
         let mut plan = GdnOps::prepare(
             &device.ctx,
             &spec,
@@ -1330,9 +1373,16 @@ mod tests {
         graph: bool,
     ) -> Result<GeometryOutput> {
         use cudarc::driver::{DevicePtr, sys};
+        let label = std::ffi::CString::new(format!(
+            "gdn hv={} rows={rows} valid={valid} core={core:?} graph={graph}",
+            spec.hv
+        ))?;
+        let _range = super::super::profile::Range::new(true, &label);
         let stream = &device.stream;
         let mut buffers = GeometryBuffers::new(stream, spec, rows, valid)?;
-        let p2 = matches!(core, GeometryCore::P2 | GeometryCore::P2Expanded);
+        let p2 = matches!(core, GeometryCore::P2 | GeometryCore::P2Expanded)
+            || matches!(core, GeometryCore::Selected)
+                && GdnPolicy::for_device(&device.info).cw_p2_for_step(rows);
         let compact_binding = p2 && !matches!(core, GeometryCore::P2Expanded);
         let layout = GdnWorkspace::new(&spec, rows, compact_binding)?;
         let bytes = add(
@@ -1600,7 +1650,7 @@ mod tests {
         })
     }
 
-    fn invariant_gdn(device: &crate::backend::cuda::Device, spec: GdnSpec) -> Result<()> {
+    fn invariant_gdn(device: &crate::backend::cuda::Device, spec: GdnSpec) -> Result<usize> {
         let rows = spec.snapshot_limit()?;
         let reference = (1..=rows)
             .map(|valid| geometry_run(device, spec, rows, valid, GeometryCore::Recurrent, false))
@@ -1611,14 +1661,21 @@ mod tests {
         let mut controls = 0;
         for valid in 1..=rows {
             for graph in [false, true] {
+                take_phase_log();
                 let candidate =
                     geometry_run(device, spec, rows, valid, GeometryCore::Verify, graph)?;
+                let phases = take_phase_log();
+                let ordered = phases.first().copied() == Some("rstep");
                 let expected = &reference[valid as usize - 1];
                 let mismatches = geometry_mismatches(&candidate, expected);
-                defects += usize::from(mismatches != 0);
+                defects += usize::from(mismatches != 0 || !ordered);
                 println!(
-                    "{} INVARIANT_GDN hv={} bound={rows} valid={valid} graph={graph} output_state_history_bit_mismatches={mismatches}",
-                    if mismatches == 0 { "PASS" } else { "DEFECT" },
+                    "{} INVARIANT_GDN hv={} bound={rows} valid={valid} graph={graph} output_state_history_bit_mismatches={mismatches} ordered_rstep={ordered}",
+                    if mismatches == 0 && ordered {
+                        "PASS"
+                    } else {
+                        "DEFECT"
+                    },
                     spec.hv
                 );
                 for (stage, slots, width) in [
@@ -1674,11 +1731,8 @@ mod tests {
             "INVARIANT_GDN_SUMMARY hv={} rows=1..{rows} eager_graph=true prefix_control={controls} defects={defects}",
             spec.hv
         );
-        ensure!(
-            defects == 0 && controls == 1,
-            "invariant GDN DEFECT cells={defects}"
-        );
-        Ok(())
+        ensure!(controls == 1, "invariant GDN control escaped");
+        Ok(defects)
     }
 
     fn geometry_qk_norm(data: &[u8], plan: &GdnPlan, rows: u32) -> Result<f64> {
@@ -1767,7 +1821,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "coordinator-granted GPU window required"]
+    #[ignore = "requires an exclusive CUDA window"]
     fn mixer_smoke_gpu() -> Result<()> {
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -1782,30 +1836,68 @@ mod tests {
             &root,
             &serde_json::json!({"eos_token_id": [248044, 248046]}),
         )?;
-        let spec = GdnSpec::from_model(&model)?;
-        invariant_gdn(&device, spec)?;
+        let qwen_root = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/q38-config.json"
+        )))?;
+        let qwen = crate::model_spec::ModelSpec::qwen(&qwen_root, &serde_json::Value::Null)?;
         let mut defects = 0;
-        for core in [
-            GeometryCore::Recurrent,
-            GeometryCore::Chunked,
-            GeometryCore::P2,
-        ] {
-            for graph in [false, true] {
-                let reference_core = if matches!(core, GeometryCore::P2) {
-                    GeometryCore::P1(4)
-                } else {
-                    core
-                };
-                let reference = geometry_run(&device, spec, 2, 2, reference_core, false)?;
-                let candidate = geometry_run(&device, spec, 2, 2, core, graph)?;
-                defects += usize::from(
-                    geometry_mismatches(&candidate, &reference) != 0
-                        || candidate.norm_ratio > 1.0
-                        || reference.norm_ratio > 1.0,
-                );
+        for spec in [GdnSpec::from_model(&model)?, GdnSpec::from_model(&qwen)?] {
+            defects += invariant_gdn(&device, spec)?;
+            for core in [
+                GeometryCore::Recurrent,
+                GeometryCore::Chunked,
+                GeometryCore::P2,
+            ] {
+                for graph in [false, true] {
+                    let reference_core = if matches!(core, GeometryCore::P2) {
+                        GeometryCore::P1(4)
+                    } else {
+                        core
+                    };
+                    let reference = geometry_run(&device, spec, 2, 2, reference_core, false)?;
+                    let candidate = geometry_run(&device, spec, 2, 2, core, graph)?;
+                    defects += usize::from(
+                        geometry_mismatches(&candidate, &reference) != 0
+                            || candidate.norm_ratio > 1.0
+                            || reference.norm_ratio > 1.0,
+                    );
+                }
+            }
+            for rows in [1, 4, 5, 64] {
+                for graph in [false, true] {
+                    let reference_core = if rows > crate::gdn_plan::MIN_VERIFY_ROWS {
+                        GeometryCore::P1(4)
+                    } else {
+                        GeometryCore::Chunked
+                    };
+                    let expected_phase = if rows > crate::gdn_plan::MIN_VERIFY_ROWS {
+                        "chunkwise_p2"
+                    } else {
+                        "chunked"
+                    };
+                    let reference = geometry_run(&device, spec, rows, rows, reference_core, false)?;
+                    take_phase_log();
+                    let candidate =
+                        geometry_run(&device, spec, rows, rows, GeometryCore::Selected, graph)?;
+                    let phases = take_phase_log();
+                    let mismatches = geometry_mismatches(&candidate, &reference);
+                    let passed = mismatches == 0
+                        && phases == [expected_phase]
+                        && candidate.norm_ratio <= 1.0
+                        && reference.norm_ratio <= 1.0;
+                    defects += usize::from(!passed);
+                    println!(
+                        "{} GDN_SELECTED hv={} rows={rows} graph={graph} phase={phases:?} expected={expected_phase} mismatches={mismatches}",
+                        if passed { "PASS" } else { "DEFECT" },
+                        spec.hv
+                    );
+                }
             }
         }
-        println!("MIXER_SMOKE prefix=23 rows=2 cores=3 graph_modes=2 defects={defects}");
+        println!(
+            "MIXER_SMOKE geometries=2 prefix=23 selected_rows=1,4,5,64 graph_modes=2 defects={defects}"
+        );
         ensure!(defects == 0, "mixer SMOKE DEFECT cases={defects}");
         Ok(())
     }
@@ -1859,14 +1951,12 @@ mod tests {
                 (4096, 4096),
             ] {
                 let verify_tail = rows == 5 && valid == 2;
-                if verify_tail && device.info.arch != 89 {
-                    continue;
-                }
                 let mut cores = if verify_tail {
                     vec![GeometryCore::Verify]
                 } else {
                     vec![
                         GeometryCore::Chunked,
+                        GeometryCore::Selected,
                         GeometryCore::P1(4),
                         GeometryCore::P1(8),
                         GeometryCore::P1(16),
@@ -1876,13 +1966,17 @@ mod tests {
                 if rows <= 8 && !verify_tail {
                     cores.push(GeometryCore::Recurrent);
                 }
-                if rows <= 5 && device.info.arch == 89 && !verify_tail {
+                if rows <= 5 && !verify_tail {
                     cores.push(GeometryCore::Verify);
                 }
                 for core in cores {
                     for graph in [false, true] {
                         let reference_core = match core {
                             GeometryCore::P2 => GeometryCore::P1(4),
+                            GeometryCore::Selected if rows > crate::gdn_plan::MIN_VERIFY_ROWS => {
+                                GeometryCore::P1(4)
+                            }
+                            GeometryCore::Selected => GeometryCore::Chunked,
                             GeometryCore::Verify => GeometryCore::Recurrent,
                             _ => core,
                         };
@@ -2115,7 +2209,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "authorized sm89 GPU window required"]
+    #[ignore = "requires an exclusive CUDA window"]
     fn gdn_verify_snapshot_rows_gpu() -> Result<()> {
         let qwen = GdnSpec::q38();
         let qwen_conv_dim = qwen.conv_dim().expect("Qwen GDN geometry");
@@ -2125,10 +2219,6 @@ mod tests {
             "GPU window required"
         );
         let device = crate::backend::cuda::Device::new(0)?;
-        ensure!(
-            device.info.arch == 89,
-            "bitwise R-step primitive gate requires sm89"
-        );
         let stream = &device.stream;
         let state_elements = (qwen.hv * DK * DV) as usize;
         let row_elements = (qwen.hv * DK) as usize;
@@ -2658,8 +2748,8 @@ mod tests {
     #[test]
     fn workspace_is_pure_and_matches_the_plan() {
         let spec = GdnSpec::q38();
-        let a = GdnOps::workspace(&spec, 2048, GdnPolicy::LEGACY).expect("workspace");
-        let b = GdnOps::workspace(&spec, 2048, GdnPolicy::LEGACY).expect("workspace");
+        let a = GdnWorkspace::new(&spec, 2048, false).expect("workspace");
+        let b = GdnWorkspace::new(&spec, 2048, false).expect("workspace");
         assert_eq!(a.bytes, b.bytes);
         assert_eq!(a.alignment, 256);
         assert_eq!(
@@ -2667,7 +2757,7 @@ mod tests {
             GdnWorkspace::new(&spec, 2048, false).expect("ws").bytes
         );
         // decode's plan is max_rows = 1; the Engine shares one scratch sized to the larger.
-        let d = GdnOps::workspace(&spec, 1, GdnPolicy::LEGACY).expect("decode workspace");
+        let d = GdnWorkspace::new(&spec, 1, false).expect("decode workspace");
         assert!(
             d.bytes < a.bytes,
             "a 1-row plan must not exceed the prefill plan"
@@ -2781,7 +2871,7 @@ mod tests {
                 "rows={rows}"
             );
             assert_eq!(
-                GdnPolicy::LEGACY.workspace(&spec, rows)?.bytes,
+                GdnWorkspace::new(&spec, rows, false)?.bytes,
                 fused,
                 "the split must not tax a plan that does not carry it, rows={rows}"
             );
@@ -3253,7 +3343,7 @@ mod gpu_probe {
         let dev_core = s.clone_htod(&core)?;
         let dev_s = s.clone_htod(&s_init)?;
         let dev_hist = s.clone_htod(&hist_init)?;
-        let req = GdnOps::workspace(&GdnSpec::q38(), man.plan_rows, GdnPolicy::LEGACY)?;
+        let req = GdnWorkspace::new(&GdnSpec::q38(), man.plan_rows, false)?;
         let scratch_buf = s.alloc_zeros::<u8>(req.bytes as usize)?;
         Ok(Case {
             man,

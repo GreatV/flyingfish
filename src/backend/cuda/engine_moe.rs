@@ -141,7 +141,7 @@ impl Setup {
         let copies = measured.copy_engines.min(2);
         let slot = catalogue.slot_bytes();
         let workers = measured.service.worker_count()?;
-        let policy = crate::gdn_plan::GdnPolicy::for_device(device.info.arch, device.info.sms);
+        let policy = crate::gdn_plan::GdnPolicy::for_device(&device.info);
         let vision = if model.vision.is_some() {
             crate::checkpoint::MappedCheckpoint::open(directory)?
                 .manifest(model, crate::checkpoint::LoadPolicy::VisionOnly)?

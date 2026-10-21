@@ -1,5 +1,8 @@
 //! Pure GDN plan geometry, dispatch and shared-scratch admission accounting.
-use crate::op_contract::{GdnSpec, WorkspaceReq};
+use crate::{
+    backend::setup::DeviceInfo,
+    op_contract::{GdnSpec, WorkspaceReq},
+};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
@@ -88,39 +91,20 @@ pub struct P2StageArgs {
 /// Immutable device qualification; no runtime GPU query or tuning in a forward.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct GdnPolicy {
-    /// Value split of the chunkwise-P1 prefill core; 0 = the recursive core.
-    prefill_p1_split: u32,
-    /// The chunkwise-P2 split (two kernels over a workspace slot) in place of the fused P1 core.
     cw_p2: bool,
 }
 impl GdnPolicy {
-    pub const LEGACY: Self = Self {
-        prefill_p1_split: 0,
-        cw_p2: false,
-    };
-    pub const P2: Self = Self {
-        prefill_p1_split: 0,
-        cw_p2: true,
-    };
-    pub const fn for_device(arch: u32, sms: usize) -> Self {
+    pub const P2: Self = Self { cw_p2: true };
+    pub const fn for_device(info: &DeviceInfo) -> Self {
         Self {
-            prefill_p1_split: 0,
-            cw_p2: arch == 89 && sms == 128,
+            cw_p2: info.arch >= 80
+                && info.sms > 0
+                && info.warp == 32
+                && info.max_threads >= 256
+                && info.optin_shared_bytes as u64 >= cw_p2::SMEM_BYTES,
         }
     }
-    /// The device's chunkwise-P1 value split; `p1_split_for_step` is the per-step decision.
-    pub const fn prefill_p1_split(self) -> u32 {
-        self.prefill_p1_split
-    }
-    /// Steps above MIN_VERIFY_ROWS take the chunkwise core; 1..=MIN_VERIFY_ROWS keep split 0.
-    pub const fn p1_split_for_step(self, step_rows: u32) -> u32 {
-        if step_rows > MIN_VERIFY_ROWS {
-            self.prefill_p1_split
-        } else {
-            0
-        }
-    }
-    /// Whether a step of `step_rows` rows takes the chunkwise-P2 split; same floor as `p1_split_for_step`.
+    /// Steps above MIN_VERIFY_ROWS use the resource-qualified chunkwise core.
     pub const fn cw_p2_for_step(self, step_rows: u32) -> bool {
         self.cw_p2 && step_rows > MIN_VERIFY_ROWS
     }
@@ -256,36 +240,46 @@ mod tests {
 
     #[test]
     fn every_prefill_step_above_the_verify_floor_takes_the_chunkwise_core() {
-        let qualified = GdnPolicy::for_device(89, 128);
-        assert_eq!(qualified, GdnPolicy::P2);
-        for rows in [1u32, 2, 3, 4] {
-            assert_eq!(
-                qualified.p1_split_for_step(rows),
-                0,
-                "{rows} keeps the verify core"
-            );
-            assert!(
-                !qualified.cw_p2_for_step(rows),
-                "{rows} keeps the verify core"
-            );
+        let mut info = DeviceInfo {
+            name: String::new(),
+            arch: 86,
+            sms: 48,
+            l2_bytes: 0,
+            warp: 32,
+            max_threads: 1024,
+            shared_bytes: 48 * 1024,
+            sm_shared_bytes: 100 * 1024,
+            cooperative: false,
+            optin_shared_bytes: 99 * 1024,
+        };
+        for (arch, sms) in [(86, 48), (89, 128), (89, 80), (90, 128)] {
+            info.arch = arch;
+            info.sms = sms;
+            let policy = GdnPolicy::for_device(&info);
+            assert_eq!(policy, GdnPolicy::P2);
+            for rows in 1..=MIN_VERIFY_ROWS {
+                assert!(!policy.cw_p2_for_step(rows));
+            }
+            for rows in [5, 63, 64, 512, 1021, 2048, 2049, 4096, 16384] {
+                assert!(policy.cw_p2_for_step(rows));
+            }
         }
-        for rows in [5u32, 63, 64, 512, 1021, 2048, 2049, 4096, 16384] {
-            assert!(qualified.cw_p2_for_step(rows), "{rows} must take P2");
-        }
-        for (arch, sms) in [(86, 48), (89, 80), (90, 128)] {
-            let legacy = GdnPolicy::for_device(arch, sms);
-            assert_eq!(legacy, GdnPolicy::LEGACY);
-            assert_eq!(legacy.prefill_p1_split(), 0);
-            assert!(!legacy.cw_p2_for_step(64));
-            assert!(!legacy.cw_p2_for_step(16384));
+        for (threads, shared, eligible) in [
+            (256, cw_p2::SMEM_BYTES, true),
+            (255, cw_p2::SMEM_BYTES, false),
+            (256, cw_p2::SMEM_BYTES - 1, false),
+        ] {
+            info.max_threads = threads;
+            info.optin_shared_bytes = shared as usize;
+            assert_eq!(GdnPolicy::for_device(&info).cw_p2_for_step(4096), eligible);
         }
     }
     #[test]
     fn exact_shared_arena_and_monotone_admission() -> Result<()> {
         let spec = GdnSpec::q38();
-        let policy = GdnPolicy::for_device(89, 128);
-        let legacy_ws = GdnPolicy::LEGACY.workspace(&spec, 2048)?;
-        assert!(policy.workspace(&spec, 2048)?.bytes > legacy_ws.bytes);
+        let policy = GdnPolicy::P2;
+        let direct_ws = GdnWorkspace::new(&spec, 2048, false)?;
+        assert!(policy.workspace(&spec, 2048)?.bytes > direct_ws.bytes);
         let mut last = 0;
         for rows in 1..=8192 {
             let bytes = policy.workspace(&spec, rows)?.bytes;
