@@ -181,7 +181,7 @@ impl Detok {
     }
 
     fn compact_replacements(&mut self) -> Result<String> {
-        if !self.byte_level || self.context.len() <= 8 {
+        if !self.byte_level || self.context.len() - self.prefix_index <= 8 {
             return Ok(String::new());
         }
         let decoded = self.decode(&self.context)?;
@@ -294,6 +294,38 @@ mod tests {
             ids.len()
         );
         Ok(visits)
+    }
+
+    #[test]
+    fn replacement_tail_followed_by_text_matches_batch() -> Result<()> {
+        let shared = streaming_fixture(false)?;
+        let invalid = shared.token_id("ÿ")?;
+        let ordinary = shared.token_id("a")?;
+        for count in [8, 9, 16, 31, 4096, 8192] {
+            let mut ids = vec![invalid; count];
+            ids.push(ordinary);
+            for grouped in [false, true] {
+                let visits = check_stream(&shared, &ids, grouped)?;
+                eprintln!(
+                    "PASS detok_replacement_then_text grouped={grouped} tokens={} visits={visits}",
+                    ids.len()
+                );
+            }
+        }
+        let pattern = [invalid; 8]
+            .into_iter()
+            .chain([ordinary])
+            .cycle()
+            .take(8192)
+            .collect::<Vec<_>>();
+        for grouped in [false, true] {
+            let visits = check_stream(&shared, &pattern, grouped)?;
+            eprintln!(
+                "PASS detok_replacement_text_cycles grouped={grouped} tokens={} visits={visits}",
+                pattern.len()
+            );
+        }
+        Ok(())
     }
 
     #[test]
