@@ -14,6 +14,8 @@ const MAX_SOURCE_PIXELS: usize = 4 * 16_777_216;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const DECODE_TIMEOUT: Duration = Duration::from_secs(600);
 static VIDEO_SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+pub(super) static VIDEO_PROBE_TRAP_CALLS: AtomicU64 = AtomicU64::new(0);
 
 pub struct RgbImage {
     pub width: usize,
@@ -1527,6 +1529,11 @@ fn load_encoded_video(url: &str) -> Result<Vec<u8>> {
 
 /// Probes one MP4 container: frame geometry, rational rate and decoded frame count.
 fn probe_video(bytes: &[u8]) -> Result<(ScratchVideo, ProbedVideo)> {
+    #[cfg(test)]
+    if bytes == b"flyingfish-admission-probe-trap" {
+        VIDEO_PROBE_TRAP_CALLS.fetch_add(1, Ordering::Relaxed);
+        bail!("injected video probe failure");
+    }
     ensure!(!bytes.is_empty(), "empty video container");
     ensure!(
         bytes.len() <= MAX_ENCODED_BYTES,
@@ -1567,18 +1574,10 @@ fn probe_video(bytes: &[u8]) -> Result<(ScratchVideo, ProbedVideo)> {
 /// Decodes every frame of one MP4 container through ffmpeg over a pipe.
 pub fn decode_video(bytes: &[u8]) -> Result<DecodedVideo> {
     let (source, probed) = probe_video(bytes)?;
-    let frame_bytes = probed.frame_bytes()?;
-    let raw = decode_raw(&source, None, MAX_DECODED_VIDEO_BYTES)?;
-    ensure!(
-        raw.len() % frame_bytes == 0,
-        "ffmpeg produced {} bytes, not a multiple of the {frame_bytes}-byte {}x{} frame",
-        raw.len(),
-        probed.width,
-        probed.height
-    );
-    let count = raw.len() / frame_bytes;
-    ensure!(count > 0, "ffmpeg decoded no video frames");
-    let frames = frames_from_raw(&raw, &probed, frame_bytes);
+    let mut output = FrameOutput::new(&probed, &[], &[])?;
+    decode_raw(&source, None, MAX_DECODED_VIDEO_BYTES, &mut output)?;
+    let frames = output.finish()?;
+    let count = frames.len();
     Ok(DecodedVideo {
         frames,
         metadata: probed.metadata_with_count(count)?,
@@ -1593,14 +1592,6 @@ fn decode_video_indices(
 ) -> Result<Vec<RgbImage>> {
     ensure!(!indices.is_empty(), "video has no sampled frames");
     let frame_bytes = probed.frame_bytes()?;
-    let expected = indices
-        .len()
-        .checked_mul(frame_bytes)
-        .context("decoded video byte count overflow")?;
-    ensure!(
-        expected <= MAX_DECODED_VIDEO_BYTES,
-        "decoded video is expected to be {expected} bytes over the {MAX_DECODED_VIDEO_BYTES}-byte limit"
-    );
     let mut unique = indices.to_vec();
     unique.sort_unstable();
     unique.dedup();
@@ -1610,31 +1601,117 @@ fn decode_video_indices(
         .collect::<Vec<_>>()
         .join("+");
     let filter = format!("select={select}");
+    let mut output = FrameOutput::new(probed, indices, &unique)?;
     let decoded_bytes = unique.len() * frame_bytes;
-    let raw = decode_raw(source, Some(&filter), decoded_bytes)?;
-    ensure!(
-        raw.len() == decoded_bytes,
-        "ffmpeg selected {} bytes, expected {decoded_bytes} for {} unique sampled frames",
-        raw.len(),
-        unique.len()
-    );
-    indices
-        .iter()
-        .map(|index| {
-            let position = unique.binary_search(index).map_err(|_| {
-                anyhow::anyhow!("sampled frame {index} missing from decoded indices")
-            })?;
-            let start = position * frame_bytes;
-            Ok(RgbImage {
-                width: probed.width as usize,
-                height: probed.height as usize,
-                pixels: raw[start..start + frame_bytes].to_vec(),
-            })
-        })
-        .collect()
+    decode_raw(source, Some(&filter), decoded_bytes, &mut output)?;
+    output.finish()
 }
 
-fn decode_raw(source: &ScratchVideo, filter: Option<&str>, limit: usize) -> Result<Vec<u8>> {
+struct FrameOutput {
+    width: usize,
+    height: usize,
+    frame_bytes: usize,
+    destinations: Vec<Vec<usize>>,
+    frames: Vec<RgbImage>,
+    received: usize,
+}
+
+impl FrameOutput {
+    fn new(probed: &ProbedVideo, indices: &[usize], unique: &[usize]) -> Result<Self> {
+        let frame_bytes = probed.frame_bytes()?;
+        let expected = indices
+            .len()
+            .checked_mul(frame_bytes)
+            .context("decoded video byte count overflow")?;
+        ensure!(
+            frame_bytes > 0
+                && frame_bytes <= MAX_DECODED_VIDEO_BYTES
+                && expected <= MAX_DECODED_VIDEO_BYTES,
+            "decoded video frame={frame_bytes} requested={expected} exceeds the {MAX_DECODED_VIDEO_BYTES}-byte limit or has zero dimensions"
+        );
+        let mut destinations = vec![Vec::new(); unique.len()];
+        for (destination, index) in indices.iter().enumerate() {
+            let frame = unique.binary_search(index).map_err(|_| {
+                anyhow::anyhow!("sampled frame {index} missing from decoded indices")
+            })?;
+            destinations[frame].push(destination);
+        }
+        Ok(Self {
+            width: probed.width as usize,
+            height: probed.height as usize,
+            frame_bytes,
+            destinations,
+            frames: indices
+                .iter()
+                .map(|_| RgbImage {
+                    width: probed.width as usize,
+                    height: probed.height as usize,
+                    pixels: vec![0; frame_bytes],
+                })
+                .collect(),
+            received: 0,
+        })
+    }
+
+    fn push(&mut self, mut bytes: &[u8]) -> Result<()> {
+        while !bytes.is_empty() {
+            let frame = self.received / self.frame_bytes;
+            let offset = self.received % self.frame_bytes;
+            let count = bytes.len().min(self.frame_bytes - offset);
+            if self.destinations.is_empty() {
+                if frame == self.frames.len() {
+                    self.frames.push(RgbImage {
+                        width: self.width,
+                        height: self.height,
+                        pixels: vec![0; self.frame_bytes],
+                    });
+                }
+                self.frames[frame].pixels[offset..offset + count].copy_from_slice(&bytes[..count]);
+            } else {
+                let destinations = self
+                    .destinations
+                    .get(frame)
+                    .context("ffmpeg selected more frames than requested")?;
+                for &destination in destinations {
+                    self.frames[destination].pixels[offset..offset + count]
+                        .copy_from_slice(&bytes[..count]);
+                }
+            }
+            self.received += count;
+            bytes = &bytes[count..];
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<Vec<RgbImage>> {
+        ensure!(
+            self.received > 0
+                && self.received.is_multiple_of(self.frame_bytes)
+                && (self.destinations.is_empty()
+                    || self.received / self.frame_bytes == self.destinations.len()),
+            "ffmpeg produced {} bytes for {}-byte frames, expected_unique={:?}",
+            self.received,
+            self.frame_bytes,
+            (!self.destinations.is_empty()).then_some(self.destinations.len())
+        );
+        Ok(self.frames)
+    }
+
+    #[cfg(test)]
+    fn rgb_owned_bytes(&self) -> usize {
+        self.frames
+            .iter()
+            .map(|frame| frame.pixels.capacity())
+            .sum()
+    }
+}
+
+fn decode_raw(
+    source: &ScratchVideo,
+    filter: Option<&str>,
+    limit: usize,
+    output: &mut FrameOutput,
+) -> Result<()> {
     let path = source
         .path()
         .to_str()
@@ -1666,17 +1743,10 @@ fn decode_raw(source: &ScratchVideo, filter: Option<&str>, limit: usize) -> Resu
         "rgb24",
         "-",
     ]);
-    tool_stdout("ffmpeg", &args, DECODE_TIMEOUT, limit).map_err(|error| redact_scratch(error, path))
-}
-
-fn frames_from_raw(raw: &[u8], probed: &ProbedVideo, frame_bytes: usize) -> Vec<RgbImage> {
-    raw.chunks_exact(frame_bytes)
-        .map(|pixels| RgbImage {
-            width: probed.width as usize,
-            height: probed.height as usize,
-            pixels: pixels.to_vec(),
-        })
-        .collect()
+    tool_output("ffmpeg", &args, DECODE_TIMEOUT, limit, |bytes| {
+        output.push(bytes)
+    })
+    .map_err(|error| redact_scratch(error, path))
 }
 
 fn redact_scratch(error: anyhow::Error, path: &str) -> anyhow::Error {
@@ -1704,6 +1774,21 @@ enum ToolExit {
 
 /// Runs one tool, keeps stdout under `limit` bytes and kills it after `timeout`.
 fn tool_stdout(tool: &str, args: &[&str], timeout: Duration, limit: usize) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    tool_output(tool, args, timeout, limit, |bytes| {
+        output.extend_from_slice(bytes);
+        Ok(())
+    })?;
+    Ok(output)
+}
+
+fn tool_output(
+    tool: &str,
+    args: &[&str],
+    timeout: Duration,
+    limit: usize,
+    mut consume: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
     let mut child = std::process::Command::new(tool)
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -1774,21 +1859,25 @@ fn tool_stdout(tool: &str, args: &[&str], timeout: Duration, limit: usize) -> Re
             buffer
         })
         .context("spawn tool stderr reader")?;
-    let mut output = Vec::new();
+    let mut received = 0usize;
     let mut chunk = vec![0u8; 1 << 20];
     let mut failure = None;
     loop {
         match stdout.read(&mut chunk) {
             Ok(0) => break,
             Ok(read) => {
-                if failure.is_none() && output.len().checked_add(read).is_none_or(|n| n > limit) {
+                if failure.is_none() && received.checked_add(read).is_none_or(|n| n > limit) {
                     failure = Some(anyhow::anyhow!(
                         "{tool} output exceeds the {limit}-byte limit"
                     ));
                     let _ = stop_tx.send(());
                 }
                 if failure.is_none() {
-                    output.extend_from_slice(&chunk[..read]);
+                    received += read;
+                    if let Err(error) = consume(&chunk[..read]) {
+                        failure = Some(error);
+                        let _ = stop_tx.send(());
+                    }
                 }
             }
             Err(error) => {
@@ -1823,7 +1912,7 @@ fn tool_stdout(tool: &str, args: &[&str], timeout: Duration, limit: usize) -> Re
             }
         }
     }
-    Ok(output)
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -2486,6 +2575,58 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn selected_frame_stream_preserves_order_repeats_and_storage_bound() -> Result<()> {
+        let probed = ProbedVideo {
+            width: 1280,
+            height: 720,
+            numerator: 30,
+            denominator: 1,
+            frames: 3,
+        };
+        let indices = [2, 0, 2, 1];
+        let frame_bytes = probed.frame_bytes()?;
+        assert_ne!(frame_bytes % 251, 0);
+        assert_ne!(frame_bytes % 4093, 0);
+        let expected = indices.len() * frame_bytes;
+        let mut output = FrameOutput::new(&probed, &indices, &[0, 1, 2])?;
+        let mut peak = output.rgb_owned_bytes();
+        let pattern = |offset: usize| ((offset * 37 + offset / frame_bytes * 11) % 251) as u8;
+        for first in (0..3 * frame_bytes).step_by(4093) {
+            let last = (first + 4093).min(3 * frame_bytes);
+            let chunk = (first..last).map(pattern).collect::<Vec<_>>();
+            output.push(&chunk)?;
+            peak = peak.max(output.rgb_owned_bytes());
+            assert!(
+                peak <= expected + frame_bytes,
+                "owned={peak} bound={}",
+                expected + frame_bytes
+            );
+        }
+        let frames = output.finish()?;
+        for (frame, index) in frames.iter().zip(indices) {
+            assert_eq!((frame.width, frame.height), (1280, 720));
+            assert_eq!(frame.pixels.len(), frame_bytes);
+            assert!(
+                frame
+                    .pixels
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &byte)| byte == pattern(index * frame_bytes + i))
+            );
+        }
+        let mut short = FrameOutput::new(&probed, &[0], &[0])?;
+        short.push(&[1, 2])?;
+        assert!(short.finish().is_err());
+        let mut excess = FrameOutput::new(&probed, &[0], &[0])?;
+        assert!(excess.push(&vec![0; frame_bytes + 1]).is_err());
+        eprintln!(
+            "PASS frame_stream layout=[4,720,1280,3] unique=3 frame_bytes={frame_bytes} rgb_peak_bytes={peak} bound_bytes={}",
+            expected + frame_bytes
+        );
         Ok(())
     }
 

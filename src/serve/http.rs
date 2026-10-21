@@ -414,7 +414,7 @@ fn add_request(
     ids: Vec<u32>,
     max_tokens: usize,
     images: Option<super::image::PreparedInput>,
-    admission: Option<super::Admission<'_>>,
+    admission: Option<super::Admission>,
 ) -> Result<tokio_mpsc::Receiver<EngineEvent>, Box<Response>> {
     let (event_tx, event_rx) = tokio_mpsc::channel::<EngineEvent>(64);
     let request = Request {
@@ -507,7 +507,37 @@ async fn chat_completions(
             ));
         }
     }
-    let (images, videos) = match prepare_message_media(&state, &mut messages).await {
+    let has_media = messages.iter().any(|message| {
+        message["content"].as_array().is_some_and(|parts| {
+            parts
+                .iter()
+                .any(|part| matches!(part["type"].as_str(), Some("image_url" | "video_url")))
+        })
+    });
+    let mut admission = None;
+    let media = if has_media {
+        let reservation = match state.backend.reserve() {
+            Ok(reservation) => reservation,
+            Err(error) => return *admission_error(error),
+        };
+        let planning = state.clone();
+        match with_admission(reservation, move || {
+            let media = prepare_message_media(&planning, &mut messages);
+            (media, messages)
+        })
+        .await
+        {
+            Ok(((media, planned_messages), reservation)) => {
+                messages = planned_messages;
+                admission = Some(reservation);
+                media
+            }
+            Err(error) => return bad_request(&format!("media planning task failed: {error}")),
+        }
+    } else {
+        prepare_message_media(&state, &mut messages)
+    };
+    let (images, videos) = match media {
         Ok(media) => media,
         Err(error) => return bad_request(&format!("media input: {error}")),
     };
@@ -534,7 +564,6 @@ async fn chat_completions(
         Ok(ids) => ids,
         Err(e) => return bad_request(&format!("tokenize: {e}")),
     };
-    let mut admission = None;
     let images = if images.is_empty() && videos.is_empty() {
         None
     } else {
@@ -552,37 +581,36 @@ async fn chat_completions(
         ) {
             return bad_request(&format!("media input: {error}"));
         }
-        admission = match state.backend.reserve() {
-            Ok(reservation) => Some(reservation),
-            Err(error) => return *admission_error(error),
-        };
-        let images = match images
-            .into_iter()
-            .map(|image| processor.prepare_planned(image))
-            .collect::<Result<Vec<_>>>()
-        {
-            Ok(images) => images,
-            Err(error) => return bad_request(&format!("image input: {error}")),
-        };
-        let mut prepared_videos = Vec::with_capacity(videos.len());
-        for video in videos {
-            let processor = processor.clone();
-            match tokio::task::spawn_blocking(move || processor.prepare_planned_video(video)).await
-            {
-                Ok(Ok(video)) => prepared_videos.push(video),
-                Ok(Err(error)) => return bad_request(&format!("video input: {error}")),
-                Err(error) => {
-                    return bad_request(&format!("video input: preparation task failed: {error}"));
-                }
+        let processor = processor.clone();
+        let capacity = state.backend.options().capacity;
+        let reservation = admission.take().expect("media planning holds admission");
+        let prepared = with_admission(reservation, move || -> Result<_> {
+            let images = images
+                .into_iter()
+                .map(|image| processor.prepare_planned(image))
+                .collect::<Result<Vec<_>>>()
+                .context("image input")?;
+            let videos = videos
+                .into_iter()
+                .map(|video| processor.prepare_planned_video(video))
+                .collect::<Result<Vec<_>>>()
+                .context("video input")?;
+            processor.expand(&ids, images, videos, capacity)
+        })
+        .await;
+        let prepared = match prepared {
+            Ok((prepared, reservation)) => {
+                admission = Some(reservation);
+                prepared
             }
-        }
-        let videos = prepared_videos;
-        match processor.expand(&ids, images, videos, state.backend.options().capacity) {
+            Err(error) => return bad_request(&format!("media preparation task failed: {error}")),
+        };
+        match prepared {
             Ok((expanded, prepared)) => {
                 ids = expanded;
                 Some(prepared)
             }
-            Err(error) => return bad_request(&format!("media input: {error}")),
+            Err(error) => return bad_request(&format!("media input: {error:#}")),
         }
     };
     if let Err(response) = check_validity(&state, &ids, max_tokens, images.is_some()) {
@@ -605,7 +633,14 @@ async fn chat_completions(
     .await
 }
 
-async fn prepare_message_media(
+async fn with_admission<T: Send + 'static>(
+    admission: super::Admission,
+    prepare: impl FnOnce() -> T + Send + 'static,
+) -> Result<(T, super::Admission), tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || (prepare(), admission)).await
+}
+
+fn prepare_message_media(
     state: &AppState,
     messages: &mut [serde_json::Value],
 ) -> Result<(
@@ -721,12 +756,7 @@ async fn prepare_message_media(
                     };
                     let url = url.to_owned();
                     let capacity = state.backend.options().capacity;
-                    let planning = processor.clone();
-                    let video = tokio::task::spawn_blocking(move || {
-                        planning.plan_video(&url, options, capacity)
-                    })
-                    .await
-                    .context("video planning task failed")??;
+                    let video = processor.plan_video(&url, options, capacity)?;
                     video_tokens = video_tokens
                         .checked_add(processor.video_tokens(&video)?)
                         .context("video token count overflow")?;
@@ -1240,6 +1270,12 @@ mod tests {
         drop(admission);
         assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Idle);
         let admission = state.backend.reserve()?;
+        *state.backend.slot.lock().unwrap() = Slot::Unavailable;
+        drop(admission);
+        assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Unavailable);
+        assert!(state.backend.reserve().is_err());
+        *state.backend.slot.lock().unwrap() = Slot::Idle;
+        let admission = state.backend.reserve()?;
         drop(commands);
         let (events, _receiver) = tokio_mpsc::channel(1);
         assert!(
@@ -1254,7 +1290,7 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Idle);
+        assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Unavailable);
         Ok(())
     }
 
@@ -1270,6 +1306,71 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
         assert!(commands.try_recv().is_err());
         assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Running);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn busy_video_rejects_before_probe_and_probe_error_releases_admission() -> Result<()> {
+        let calls = &super::super::image::VIDEO_PROBE_TRAP_CALLS;
+        calls.store(0, Ordering::Relaxed);
+        let url = format!(
+            "data:video/mp4;base64,{}",
+            base64::encode(b"flyingfish-admission-probe-trap")
+        );
+        for (slot, expected_calls, status) in [
+            (Slot::Running, 0, StatusCode::CONFLICT),
+            (Slot::Idle, 1, StatusCode::BAD_REQUEST),
+        ] {
+            let (state, commands) = image_request_state(slot, "probe-admission")?;
+            let request = serde_json::from_value(json!({"messages":[{"role":"user","content":[
+                {"type":"video_url","video_url":{"url":url}}
+            ]}],"max_tokens":1}))?;
+            let response = chat_completions(State(state.clone()), Json(request)).await;
+            assert_eq!(response.status(), status);
+            assert_eq!(calls.load(Ordering::Relaxed), expected_calls);
+            assert!(commands.try_recv().is_err());
+            if expected_calls == 1 {
+                assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Idle);
+                drop(state.backend.reserve()?);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn blocking_media_keeps_admission_until_cancelled_work_finishes() -> Result<()> {
+        let (state, _commands) = test_state(256, Slot::Idle);
+        let admission = state.backend.reserve()?;
+        let runtime_thread = std::thread::current().id();
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let (release, blocked) = mpsc::sync_channel(1);
+        let request = tokio::spawn(with_admission(admission, move || {
+            assert_ne!(std::thread::current().id(), runtime_thread);
+            started.send(()).unwrap();
+            blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+        }));
+        tokio::time::timeout(Duration::from_secs(2), waiting).await??;
+        let advanced = tokio::spawn(async { 7 }).await?;
+        assert_eq!(advanced, 7);
+        request.abort();
+        assert!(matches!(request.await, Err(error) if error.is_cancelled()));
+        assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Running);
+        assert!(state.backend.reserve().is_err());
+        release.send(())?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while *state.backend.slot.lock().unwrap() != Slot::Idle {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let admission = state.backend.reserve()?;
+        let (result, admission) = with_admission(admission, || -> Result<()> {
+            anyhow::bail!("injected preprocessing error")
+        })
+        .await?;
+        assert!(result.is_err());
+        drop(admission);
+        assert_eq!(*state.backend.slot.lock().unwrap(), Slot::Idle);
         Ok(())
     }
 
