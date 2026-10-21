@@ -472,10 +472,7 @@ pub(super) struct Decode {
     geometry: ExpertGeometry,
     fp8_slot: Option<crate::experts::catalogue::Fp8Slot>,
     max_rows: usize,
-    rows: usize,
-    pending: bool,
-    input_ptr: u64,
-    router_ptr: u64,
+    phase: DecodePhase,
     route: RouteOps,
     contribute: DecodeOps,
     prefill: PrefillOps,
@@ -506,6 +503,49 @@ pub(super) struct Decode {
     reader: Arc<CudaEvent>,
     mask: cudarc::driver::CudaFunction,
     pub stats: [u64; 5],
+}
+
+#[derive(Default)]
+struct DecodePhase {
+    rows: usize,
+    pending: bool,
+    input_ptr: u64,
+    router_ptr: u64,
+}
+
+impl DecodePhase {
+    fn begin(&mut self, rows: usize, input_ptr: u64, router_ptr: u64) -> Result<()> {
+        ensure!(
+            !self.pending && rows > 0,
+            "MoE route phase is not idle or has zero rows"
+        );
+        self.rows = rows;
+        self.input_ptr = input_ptr;
+        self.router_ptr = router_ptr;
+        self.pending = true;
+        Ok(())
+    }
+
+    fn check(&self, input_ptr: u64, router_ptr: u64) -> Result<()> {
+        ensure!(
+            self.pending && input_ptr == self.input_ptr && router_ptr == self.router_ptr,
+            "MoE completion phase/input mismatch pending={} input={input_ptr:#x} routed_input={:#x} router={router_ptr:#x} routed_router={:#x}",
+            self.pending,
+            self.input_ptr,
+            self.router_ptr
+        );
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        ensure!(self.pending, "MoE completion has no pending route");
+        self.pending = false;
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
 }
 
 impl Decode {
@@ -548,10 +588,7 @@ impl Decode {
             geometry,
             fp8_slot: layout.fp8_slot().cloned(),
             max_rows,
-            rows: 0,
-            pending: false,
-            input_ptr: 0,
-            router_ptr: 0,
+            phase: DecodePhase::default(),
             route: RouteOps::new(context, stream)?,
             contribute: DecodeOps::new(context)?,
             prefill: PrefillOps::new(context, stream, format)?,
@@ -617,12 +654,18 @@ impl Decode {
         self.read_route(device, ffn, x)
     }
 
+    pub fn reset(&mut self) -> Result<()> {
+        self.mailbox.synchronize()?;
+        self.phase.reset();
+        Ok(())
+    }
+
     fn route_device(&self, device: &Device, ffn: BoundFfn, x: Tensor<bf16, 2>) -> Result<()> {
         let BoundFfn::Moe { router, .. } = ffn else {
             anyhow::bail!("MoE route received a dense FFN");
         };
         ensure!(
-            !self.pending,
+            !self.phase.pending,
             "MoE route has an unfinished contribution/combine phase"
         );
         let rows = x.shape[0] as usize;
@@ -675,12 +718,12 @@ impl Decode {
         };
         let rows = x.shape[0] as usize;
         ensure!(
-            !self.pending
+            !self.phase.pending
                 && rows > 0
                 && rows <= self.max_rows
                 && x.shape[1] == self.geometry.hidden,
             "MoE route mailbox pending={} shape={:?} row_bound={}",
-            self.pending,
+            self.phase.pending,
             x.shape,
             self.max_rows
         );
@@ -713,16 +756,13 @@ impl Decode {
             }
         }
         self.mailbox.synchronize()?;
-        self.rows = rows;
-        self.input_ptr = x.ptr;
-        self.router_ptr = router.ptr;
-        self.pending = true;
+        self.phase.begin(rows, x.ptr, router.ptr)?;
         self.stats[0] += 1;
         Ok(())
     }
 
     pub fn routed(&self) -> Result<(&[i32], &[bf16])> {
-        let count = self.rows * self.geometry.top_k as usize;
+        let count = self.phase.rows * self.geometry.top_k as usize;
         Ok((
             &self.host_ids.as_slice()?[..count],
             &self.host_weights.as_slice()?[..count],
@@ -754,17 +794,9 @@ impl Decode {
             anyhow::bail!("MoE completion received a dense FFN");
         };
         let (x, y) = activation;
-        ensure!(
-            self.pending && x.ptr == self.input_ptr && router.ptr == self.router_ptr,
-            "MoE completion phase/input mismatch pending={} input={:#x} routed_input={:#x} router={:#x} routed_router={:#x}",
-            self.pending,
-            x.ptr,
-            self.input_ptr,
-            router.ptr,
-            self.router_ptr
-        );
+        self.phase.check(x.ptr, router.ptr)?;
         let (rows, k, hidden) = (
-            self.rows,
+            self.phase.rows,
             self.geometry.top_k as usize,
             self.geometry.hidden as usize,
         );
@@ -829,7 +861,7 @@ impl Decode {
         }
         self.stats[1] += dispatch.active.iter().map(|&n| u64::from(n)).sum::<u64>();
         self.stats[4] += 1;
-        self.pending = false;
+        self.phase.finish()?;
         Ok(())
     }
 
@@ -935,7 +967,7 @@ impl Decode {
         reader: &CudaEvent,
     ) -> Result<()> {
         let (rows, k, hidden) = (
-            self.rows,
+            self.phase.rows,
             self.geometry.top_k as usize,
             self.geometry.hidden as usize,
         );
@@ -1055,50 +1087,51 @@ impl Decode {
         let source = self.host_x.as_slice()?;
         for (compacted, &row) in dispatch.miss_rows.iter().enumerate() {
             ensure!(
-                (row as usize) < self.rows,
+                (row as usize) < self.phase.rows,
                 "MoE CPU row={row} outside rows={}",
-                self.rows
+                self.phase.rows
             );
             self.cpu_x[compacted * hidden..(compacted + 1) * hidden]
                 .copy_from_slice(&source[row as usize * hidden..(row as usize + 1) * hidden]);
         }
         let cpu_hidden = &self.cpu_x[..dispatch.miss_rows.len() * hidden];
-        if !dispatch.disk.is_empty() {
+        let output = &mut self.cpu_out.as_mut_slice()?
+            [..self.phase.rows * self.geometry.top_k as usize * hidden];
+        let contribute = |out: &mut [bf16]| -> Result<()> {
+            if !dispatch.assignments.is_empty() {
+                if let Some(dma) = dispatch.host_dma {
+                    dma.ready_weights(dispatch.experts)?;
+                }
+                self.pool.run(Job {
+                    arena: dispatch
+                        .host
+                        .as_ref()
+                        .context("MoE CPU assignments have no host arena")?
+                        .clone(),
+                    hidden: cpu_hidden,
+                    rows: dispatch.miss_rows.len(),
+                    experts: dispatch.experts,
+                    assignments: dispatch.assignments,
+                    out,
+                })?;
+            }
+            Ok(())
+        };
+        if dispatch.disk.is_empty() {
+            contribute(output)?;
+        } else {
             dispatch
                 .disk_cpu
                 .as_deref_mut()
                 .context("disk routes have no bound CPU workers")?
-                .start(
+                .run(
                     dispatch.layer,
                     cpu_hidden,
                     dispatch.miss_rows.len(),
                     dispatch.disk,
+                    output,
+                    contribute,
                 )?;
-        }
-        if !dispatch.assignments.is_empty() {
-            if let Some(dma) = dispatch.host_dma {
-                dma.ready_weights(dispatch.experts)?;
-            }
-            self.pool.run(Job {
-                arena: dispatch
-                    .host
-                    .as_ref()
-                    .context("MoE CPU assignments have no host arena")?
-                    .clone(),
-                hidden: cpu_hidden,
-                rows: dispatch.miss_rows.len(),
-                experts: dispatch.experts,
-                assignments: dispatch.assignments,
-                out: &mut self.cpu_out.as_mut_slice()?
-                    [..self.rows * self.geometry.top_k as usize * hidden],
-            })?;
-        }
-        if !dispatch.disk.is_empty() {
-            dispatch
-                .disk_cpu
-                .as_deref_mut()
-                .context("disk completion has no bound CPU workers")?
-                .finish(self.cpu_out.as_mut_slice()?)?;
         }
         device.ctx.check_err()?;
         Ok(())
@@ -1106,7 +1139,7 @@ impl Decode {
 
     pub fn trace(&self, stream: &Arc<CudaStream>, trace: &mut Trace, prefix: &str) -> Result<()> {
         let (rows, k, hidden) = (
-            self.rows,
+            self.phase.rows,
             self.geometry.top_k as usize,
             self.geometry.hidden as usize,
         );

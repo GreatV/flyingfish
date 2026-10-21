@@ -3,6 +3,25 @@ use crate::backend::cuda::moe::reference::{MoeDims, MoeFixture, fixture};
 use crate::experts::plan::Capacity;
 
 #[test]
+fn decode_phase_reset_recovers_after_completion_errors() -> Result<()> {
+    let mut phase = DecodePhase::default();
+    for rows in [1, 8, 16] {
+        phase.begin(rows, 0x1000, 0x2000)?;
+        assert!(phase.begin(rows, 0x1000, 0x2000).is_err());
+        assert!(phase.check(0x3000, 0x2000).is_err());
+        assert!(phase.check(0x1000, 0x4000).is_err());
+        phase.check(0x1000, 0x2000)?;
+        phase.reset();
+        phase.begin(rows, 0x5000, 0x6000)?;
+        phase.check(0x5000, 0x6000)?;
+        assert_eq!(phase.rows, rows);
+        phase.finish()?;
+        assert!(phase.finish().is_err());
+    }
+    Ok(())
+}
+
+#[test]
 fn expert_host_reserve_keeps_span_independent_of_cpu_ceiling() -> Result<()> {
     use crate::experts::{
         catalogue::ExpertLayout,
