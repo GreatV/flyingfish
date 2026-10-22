@@ -561,7 +561,8 @@ mod tests {
             })
             .collect();
         let input = stream.clone_htod(&values)?;
-        let expected = stream.alloc_zeros::<bf16>(rows * n)?;
+        let serial_stride = n.next_multiple_of(16 / size_of::<bf16>());
+        let expected = stream.alloc_zeros::<bf16>(rows * serial_stride)?;
         let canary = bf16::from_bits(0x7fc1);
         let output = stream.clone_htod(&vec![canary; (rows + 1) * n])?;
         let serial_ids = stream.alloc_zeros::<u32>(rows)?;
@@ -581,12 +582,13 @@ mod tests {
                 &mut TensorMut(view(
                     &expected,
                     stream,
-                    row * n,
+                    row * serial_stride,
                     [1, n as u32],
                     [n as u64, 1],
                 )?),
             )?;
-            let input_ptr = expected.device_ptr(stream).0 + (row * n * size_of::<bf16>()) as u64;
+            let input_ptr =
+                expected.device_ptr(stream).0 + (row * serial_stride * size_of::<bf16>()) as u64;
             let token_ptr = serial_ptr + (row * size_of::<u32>()) as u64;
             // SAFETY: each M1 input covers n logits and each output covers one token.
             unsafe {
@@ -598,7 +600,11 @@ mod tests {
                     .launch(crate::backend::cuda::ops::grid(1, 1024))?;
             }
         }
-        let expected = stream.clone_dtoh(&expected)?;
+        let expected: Vec<_> = stream
+            .clone_dtoh(&expected)?
+            .chunks_exact(serial_stride)
+            .flat_map(|row| row[..n].iter().copied())
+            .collect();
         let expected_ids = stream.clone_dtoh(&serial_ids)?;
         for (row, &id) in expected.chunks_exact(n).zip(&expected_ids) {
             let (want, _) = row.iter().enumerate().fold(
