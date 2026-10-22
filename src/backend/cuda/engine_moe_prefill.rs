@@ -337,7 +337,7 @@ pub(in crate::backend::cuda::engine) fn cpu_bound(
 
 impl Prefill {
     #[cfg(test)]
-    pub(super) fn allocated_workspace_bytes(&self) -> u64 {
+    pub(in crate::backend::cuda::engine) fn allocated_workspace_bytes(&self) -> u64 {
         self.gpu.scratch.len() as u64
     }
 
