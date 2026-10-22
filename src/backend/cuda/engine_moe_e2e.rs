@@ -2512,6 +2512,119 @@ fn minicpm_chain_decode_gpu() -> Result<()> {
 }
 
 #[test]
+#[ignore = "exclusive CUDA; native BF16 fixtures and pinned runtime/decode-prefix.json"]
+fn minicpm_gdn_workspace_timing_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    let target = PathBuf::from(std::env::var("FF_MODEL")?);
+    let fixtures = PathBuf::from(std::env::var("FF_MINICPM_REFERENCE_DIR")?);
+    let runtime = PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
+    let forced: Vec<u32> =
+        serde_json::from_slice(&std::fs::read(runtime.join("decode-prefix.json"))?)?;
+    let settings = Settings {
+        runtime_dir: Some(runtime),
+        prefix_cache: false,
+        draft_model: None,
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: true,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    let mut model = Engine::load(&target, 0, 4096, None, settings)?;
+    ensure!(
+        forced.len() == 256 && forced.iter().all(|&id| id < model.model_spec.vocab),
+        "GDN timing forced prefix extent/vocabulary"
+    );
+    ensure!(
+        model.model_spec.hidden == 2048
+            && model.model_spec.layers.len() == 40
+            && model.model_spec.expert_format == Some(crate::model_spec::ExpertFormat::Bf16),
+        "GDN workspace timing requires native BF16 MiniCPM"
+    );
+    let slots = model
+        .moe_slots
+        .as_ref()
+        .context("GDN timing slots missing")?
+        .storage
+        .layout();
+    let slots = (0..40)
+        .map(|layer| slots.slot_count(layer))
+        .collect::<Result<Vec<_>>>()?;
+    let operator_bytes = model
+        .qwen
+        .as_ref()
+        .context("GDN timing runtime missing")?
+        .allocated_workspace_bytes();
+    let moe_bytes = model
+        .moe_prefill
+        .as_ref()
+        .context("GDN timing prefill missing")?
+        .allocated_workspace_bytes();
+    let (free, total) = model.device.ctx.mem_get_info()?;
+    let mut peak_sampled_device_bytes = total - free;
+    println!(
+        "minicpm_gdn_workspace_plan {}",
+        serde_json::json!({
+        "capacity":4096,"slots_per_layer":slots,"gpu_slots":slots.iter().sum::<u32>(),
+        "allocated_operator_workspace_bytes":operator_bytes,
+        "allocated_moe_prefill_workspace_bytes":moe_bytes,
+        "simultaneously_live_operator_and_moe_bytes":operator_bytes+moe_bytes,
+        "device_live_bytes_after_setup":peak_sampled_device_bytes})
+    );
+    for (case, rows, decode) in [("text_1k", 1024, true), ("text_4k", 4096, false)] {
+        let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
+        let tensors = SafeTensors::deserialize(&bytes)?;
+        let input = integers(&tensors, "input_ids")?;
+        ensure!(input.len() == rows, "GDN timing fixture extent {case}");
+        for run in 0..2 {
+            model.reset()?;
+            let range = super::super::super::profile::Range::new(
+                run == 1 && !decode,
+                c"minicpm_gdn_workspace_prefill",
+            );
+            let timer = Instant::now();
+            let first = model.prefill(&input, None)?;
+            model.synchronize()?;
+            let ttft_seconds = timer.elapsed().as_secs_f64();
+            drop(range);
+            let mut ids = vec![first];
+            let timer = Instant::now();
+            if decode {
+                while ids.len() < 256 {
+                    model.set_token(forced[ids.len() - 1])?;
+                    ids.push(model.decode(true, None)?);
+                }
+                model.synchronize()?;
+            }
+            let seconds = timer.elapsed().as_secs_f64();
+            model.check_logits()?;
+            ensure!(
+                ttft_seconds.is_finite()
+                    && ttft_seconds > 0.0
+                    && seconds.is_finite()
+                    && seconds > 0.0,
+                "invalid GDN request timing"
+            );
+            let (free, total) = model.device.ctx.mem_get_info()?;
+            peak_sampled_device_bytes = peak_sampled_device_bytes.max(total - free);
+            println!(
+                "PASS minicpm_gdn_workspace_timing {}",
+                serde_json::json!({
+                "case":case,"input_layout":[1,rows],"run":run,"measured":run==1,
+                "ttft_seconds":ttft_seconds,"decode_seconds":decode.then_some(seconds),
+                "output_tokens":ids.len(),"decode_tokens":if decode {255} else {0},
+                "decode_ms_per_token":decode.then_some(seconds*1000.0/255.0),
+                    "ids":ids,"graph_decode":decode,"forced_feedback_tokens":if decode {255} else {0},
+                    "peak_sampled_device_bytes":peak_sampled_device_bytes})
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires CUDA, T0 fixtures, pinned calibration and explicit draft/graph timing arms"]
 fn minicpm_chain_decode_timing_gpu() -> Result<()> {
     // One deployment arm runs text1k/text4k with one warmup and three measured decodes each.

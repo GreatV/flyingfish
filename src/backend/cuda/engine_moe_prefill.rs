@@ -337,6 +337,11 @@ pub(in crate::backend::cuda::engine) fn cpu_bound(
 
 impl Prefill {
     #[cfg(test)]
+    pub(in crate::backend::cuda::engine) fn allocated_workspace_bytes(&self) -> u64 {
+        self.gpu.scratch.len() as u64
+    }
+
+    #[cfg(test)]
     pub(in crate::backend::cuda::engine) fn capture_frequency(&self) -> Vec<Vec<f64>> {
         self.frequency.clone()
     }

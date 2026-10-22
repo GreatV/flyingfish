@@ -50,6 +50,9 @@ pub const fn cw_p2_slot_layout() -> [(u64, u64, char); 6] {
 
 /// Bytes of one slot: the six fields above.
 pub const CW_P2_SLOT_BYTES: u64 = 64 * 128 * 2 + 64 * 128 * 4 + 64 * 72 * 2 + 3 * 64 * 4;
+/// Group-count bound for 128-wide FP32 V and 64-row slot chunks.
+pub const CW_P2_MAX_GROUPS: usize =
+    (2 * CW_P2_SLOT_BYTES).div_ceil(CW_P2_CHUNK as u64 * 128 * 4) as usize;
 const _: () = assert!(
     CW_P2_SLOT_BYTES == cw_p2::SLOT_BYTES,
     "the chunkwise-P2 slot fields and gdn_cw_p2_layout.h disagree"
@@ -82,8 +85,12 @@ pub struct P2StageArgs {
     pub ws: u64,
     /// The sequence metadata (eight i32).
     pub meta: u64,
-    /// 0, the sentinel that makes the kernel read `meta->valid_rows`.
-    pub valid_rows: i32,
+    /// Physical row bound of the prebound plan.
+    pub max_rows: i32,
+    /// First row of this 64-row-aligned group.
+    pub row_base: i32,
+    /// Physical rows in this group, including its partial final chunk.
+    pub group_rows: i32,
     /// Stage A only: the element stride between V's rows.
     pub v_row_stride: u32,
 }
@@ -118,13 +125,8 @@ impl GdnPolicy {
     /// All prebound operators reuse the arena sized by the maximum complete plan layout.
     pub fn workspace(self, spec: &GdnSpec, physical_rows: u32) -> Result<WorkspaceReq> {
         let p2 = self.cw_p2_for_step(physical_rows);
-        let bytes = GdnWorkspace::new(spec, physical_rows, p2)?.bytes;
         Ok(WorkspaceReq {
-            bytes: if p2 {
-                add(bytes, cw_p2_bytes(spec.hv, physical_rows))?
-            } else {
-                bytes
-            },
+            bytes: GdnWorkspace::new(spec, physical_rows, p2)?.bytes,
             alignment: 256,
         })
     }
@@ -157,6 +159,10 @@ pub struct GdnWorkspace {
     /// `[R, hk, 128]` BF16 for unscaled P2 A operands; empty for expanded sources.
     pub q_bf16: Region,
     pub k_bf16: Region,
+    /// P2 slots alias V after prep, or occupy one additive chunk for short plans.
+    pub p2: Region,
+    /// Maximum rows per P2 slot group; a multiple of 64, or zero without P2.
+    pub p2_group_rows: u32,
     /// Physical head count of normalized Q/K, hk for compact P2 and hv otherwise.
     pub qk_heads: u32,
     pub bytes: u64,
@@ -217,6 +223,33 @@ impl GdnWorkspace {
             };
             off = align(add(off, padded)?)?;
         }
+        let (p2_region, p2_group_rows) = if p2 {
+            let chunk_bytes = cw_p2_bytes(spec.hv, CW_P2_CHUNK);
+            let alias_chunks =
+                (r[6].bytes / chunk_bytes).min(u64::from(max_rows.div_ceil(CW_P2_CHUNK)));
+            let chunks = alias_chunks.max(1);
+            (
+                Region {
+                    offset: if alias_chunks > 0 { r[6].offset } else { off },
+                    bytes: mul(chunks, chunk_bytes)?,
+                },
+                u32::try_from(mul(chunks, u64::from(CW_P2_CHUNK))?)?,
+            )
+        } else {
+            (
+                Region {
+                    offset: off,
+                    bytes: 0,
+                },
+                0,
+            )
+        };
+        let mut bytes = off.max(add(p2_region.offset, p2_region.bytes)?);
+        if p2 && p2_region.offset < off {
+            let first_alias_rows = cw_p2_bytes(spec.hv, CW_P2_CHUNK).div_ceil(mul(hd_dv, 4)?);
+            let short_rows = u32::try_from(first_alias_rows - 1)?;
+            bytes = bytes.max(Self::new(spec, short_rows, true)?.bytes);
+        }
         Ok(Self {
             conv_out: r[0],
             beta: r[1],
@@ -227,8 +260,10 @@ impl GdnWorkspace {
             v_fp32: r[6],
             q_bf16: r[7],
             k_bf16: r[8],
+            p2: p2_region,
+            p2_group_rows,
             qk_heads,
-            bytes: off,
+            bytes,
             alignment: 256,
         })
     }
@@ -279,12 +314,54 @@ mod tests {
         let spec = GdnSpec::q38();
         let policy = GdnPolicy::P2;
         let direct_ws = GdnWorkspace::new(&spec, 2048, false)?;
-        assert!(policy.workspace(&spec, 2048)?.bytes > direct_ws.bytes);
-        let mut last = 0;
-        for rows in 1..=8192 {
-            let bytes = policy.workspace(&spec, rows)?.bytes;
-            assert!(bytes >= last, "non-monotone at {rows}");
-            last = bytes;
+        assert!(policy.workspace(&spec, 2048)?.bytes < direct_ws.bytes);
+        for hv in [32, 48] {
+            let spec = GdnSpec { hv, ..spec };
+            let mut last = 0;
+            for rows in 1..=65_535 {
+                let p2 = policy.cw_p2_for_step(rows);
+                let ws = GdnWorkspace::new(&spec, rows, p2)?;
+                let bytes = policy.workspace(&spec, rows)?.bytes;
+                assert!(bytes >= last, "non-monotone at hv={hv} rows={rows}");
+                last = bytes;
+                let base = ws.k_bf16.offset + ws.k_bf16.bytes;
+                let original = base + if p2 { cw_p2_bytes(hv, rows) } else { 0 };
+                assert!(bytes <= original, "grew at hv={hv} rows={rows}");
+                assert!(ws.p2.offset.is_multiple_of(256));
+                assert!(ws.p2.offset + ws.p2.bytes <= bytes);
+                if !p2 {
+                    assert_eq!(ws.p2.bytes, 0);
+                    assert_eq!(ws.p2_group_rows, 0);
+                    continue;
+                }
+                assert!(ws.p2_group_rows.is_multiple_of(CW_P2_CHUNK));
+                assert!(ws.p2_group_rows > 0);
+                assert!(rows.div_ceil(ws.p2_group_rows) as usize <= CW_P2_MAX_GROUPS);
+                assert_eq!(ws.p2.bytes, cw_p2_bytes(hv, ws.p2_group_rows));
+                for live in [
+                    ws.conv_out,
+                    ws.beta,
+                    ws.beta_fp32,
+                    ws.g,
+                    ws.q_fp32,
+                    ws.k_fp32,
+                    ws.q_bf16,
+                    ws.k_bf16,
+                ] {
+                    assert!(
+                        live.offset + live.bytes <= ws.p2.offset
+                            || ws.p2.offset + ws.p2.bytes <= live.offset
+                    );
+                }
+                if rows >= 116 {
+                    assert_eq!(ws.p2.offset, ws.v_fp32.offset);
+                    assert!(ws.p2.bytes <= ws.v_fp32.bytes);
+                }
+                if rows == 4096 {
+                    assert_eq!(bytes, base);
+                    assert_eq!(ws.p2_group_rows, 2240);
+                }
+            }
         }
         assert!(policy.workspace(&spec, 0).is_err());
         assert_eq!(
@@ -343,7 +420,7 @@ mod tests {
                     assert!(region.offset >= end && region.offset.is_multiple_of(256));
                     end = region.offset + region.bytes;
                 }
-                assert_eq!(end, compact.bytes);
+                assert!(end <= compact.bytes);
             }
         }
         Ok(())
