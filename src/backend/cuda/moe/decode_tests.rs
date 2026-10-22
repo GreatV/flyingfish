@@ -110,6 +110,7 @@ fn w8a16_world(fx: &reference::MoeFixture) -> Result<W8a16World> {
     let layout = ExpertLayout::new(
         ExpertFormat::Fp8W8a16,
         &ExpertGeometry {
+            first_layer: 0,
             layers: 1,
             experts: e as u32,
             hidden: h as u32,
@@ -259,6 +260,7 @@ fn invariant_decode(device: &Device) -> Result<()> {
     let legacy = DecodeOps::new(&device.ctx)?;
     let combine = CombineOps::new(&device.ctx)?;
     let geometry = ExpertGeometry {
+        first_layer: 0,
         layers: 1,
         experts: e as u32,
         top_k: k as u32,
@@ -1180,6 +1182,7 @@ impl W8Gate<'_> {
         {
             let input = self.input(rows, rt, io.contributions, &mut io.shared_out, &mut io.done)?;
             let geometry = ExpertGeometry {
+                first_layer: 0,
                 layers: 1,
                 experts: self.valid.shape[0],
                 hidden: self.hidden,
@@ -1328,6 +1331,7 @@ fn decode_expert_ffn_w8a16_gpu() -> Result<()> {
             let layout = ExpertLayout::new(
                 ExpertFormat::Fp8W8a16,
                 &ExpertGeometry {
+                    first_layer: 0,
                     layers: 1,
                     experts: eu,
                     hidden: hu,

@@ -62,7 +62,7 @@ fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
             );
             (2048, 512, 248144, 16, 2, 40, 32, spec.linear_format)
         }
-        Architecture::Llama => anyhow::bail!(
+        Architecture::Llama | Architecture::Flint => anyhow::bail!(
             "hybrid engine does not implement architecture={:?}",
             spec.architecture
         ),

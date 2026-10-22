@@ -977,6 +977,7 @@ impl Prefill {
         else {
             anyhow::bail!("prefill finish received a dense FFN");
         };
+        let shared_gate = shared_gate.context("ungated shared expert prefill is not bound")?;
         let span = self
             .span
             .as_ref()
@@ -1836,6 +1837,7 @@ impl Gpu {
         else {
             anyhow::bail!("prefill contribute received a dense FFN");
         };
+        let shared_gate = shared_gate.context("ungated shared expert prefill is not bound")?;
         let stream = &device.stream;
         let geometry = span.geometry;
         let tables = self.tables.bindings(stream, cohort, geometry.experts)?;
@@ -2904,6 +2906,7 @@ mod tests {
         else {
             anyhow::bail!("prefill reference has a dense FFN");
         };
+        let shared_gate = shared_gate.context("prefill reference has no shared gate")?;
         let input = stream.clone_htod(&fixture.x)?;
         let ids = stream.alloc_zeros::<i32>(rows * 4)?;
         let weights = stream.alloc_zeros::<bf16>(rows * 4)?;

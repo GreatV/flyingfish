@@ -586,13 +586,29 @@ pub(crate) struct WeightCatalog {
 impl WeightCatalog {
     /// Move shared global tensors into the existing Engine weight owner.
     pub fn take_globals(&mut self) -> Result<Weights> {
+        let embed_name = if self
+            .tensors
+            .contains_key("model.language_model.embed_tokens.weight")
+        {
+            "model.language_model.embed_tokens.weight"
+        } else {
+            "model.embed_tokens.weight"
+        };
+        let norm_name = if self
+            .tensors
+            .contains_key("model.language_model.norm.weight")
+        {
+            "model.language_model.norm.weight"
+        } else {
+            "model.norm.weight"
+        };
         let mut take = |name: &str| match self.tensors.remove(name) {
             Some(StoredTensor::Bf16(v)) => Ok(v),
             _ => anyhow::bail!("missing/non-BF16 global tensor {name}"),
         };
         Ok(Weights {
-            embed: take("model.language_model.embed_tokens.weight")?,
-            norm: take("model.language_model.norm.weight")?,
+            embed: take(embed_name)?,
+            norm: take(norm_name)?,
             head: take("lm_head.weight")?,
             layers: Vec::new(),
             bytes: self.bytes,
@@ -877,6 +893,7 @@ mod tests {
     #[ignore = "requires CUDA"]
     fn expert_storage_smoke_gpu() -> Result<()> {
         expert_storage_case(crate::experts::catalogue::ExpertGeometry {
+            first_layer: 0,
             layers: 3,
             experts: 8,
             hidden: 128,

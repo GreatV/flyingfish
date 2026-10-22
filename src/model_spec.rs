@@ -9,6 +9,7 @@ pub enum Architecture {
     Llama,
     Qwen35Text,
     MiniCpmV47,
+    Flint,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Mixer {
@@ -21,6 +22,13 @@ pub struct MoeConfig {
     pub experts_per_tok: u32,
     pub expert_intermediate: u32,
     pub shared_intermediate: u32,
+    pub score: RouterScore,
+    pub shared_gate: bool,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum RouterScore {
+    Softmax,
+    Sigmoid,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum LinearFormat {
@@ -29,11 +37,12 @@ pub enum LinearFormat {
     /// compressed-tensors FP8_DYNAMIC per-output-channel weights plus token activations.
     Fp8E4m3Channel,
 }
-/// Routed-expert checkpoint layout: fused BF16 slices or per-expert E4M3 weights with BF16
-/// per-output-channel scales (compressed-tensors FP8_DYNAMIC).
+/// Routed-expert checkpoint layout: fused BF16 slices, separate BF16 tensors, or per-expert
+/// E4M3 weights with BF16 per-output-channel scales (compressed-tensors FP8_DYNAMIC).
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ExpertFormat {
     Bf16,
+    Bf16Separate,
     Fp8W8a16,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -49,6 +58,15 @@ pub struct GdnConfig {
 pub struct LayerPlan {
     pub mixer: Mixer,
     pub state_index: u32,
+    pub rope: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sliding_window: Option<u32>,
+    pub ffn: FfnKind,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum FfnKind {
+    Dense,
+    Moe,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelSpec {
@@ -192,7 +210,9 @@ impl VisionConfig {
                     v.newline_token
                 );
             }
-            Architecture::Llama => bail!("vision configuration requires a multimodal architecture"),
+            Architecture::Llama | Architecture::Flint => {
+                bail!("vision configuration requires a multimodal architecture")
+            }
         }
         Ok(())
     }
@@ -316,6 +336,22 @@ fn positive(v: &Value, key: &str) -> Result<u32> {
     let n = integer(v, key)?;
     ensure!(n > 0, "unsupported {key}: 0");
     Ok(n)
+}
+fn integer_array(v: &Value, key: &str, limit: u32) -> Result<Vec<u32>> {
+    let values = v
+        .get(key)
+        .and_then(Value::as_array)
+        .with_context(|| format!("missing/invalid {key}"))?;
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let n = value
+            .as_u64()
+            .with_context(|| format!("{key} contains a non-unsigned integer"))?;
+        let n = u32::try_from(n).with_context(|| format!("{key} overflows u32"))?;
+        ensure!(n < limit, "{key} contains out-of-range layer {n}");
+        out.push(n);
+    }
+    Ok(out)
 }
 fn equal(v: &Value, key: &str, expected: Value) -> Result<()> {
     ensure!(
@@ -774,6 +810,13 @@ impl TextGeometry {
             layers.push(LayerPlan {
                 mixer,
                 state_index: counts[slot],
+                rope: full,
+                sliding_window: None,
+                ffn: if model_type == "qwen3_5_moe_text" {
+                    FfnKind::Moe
+                } else {
+                    FfnKind::Dense
+                },
             });
             counts[slot] += 1;
         }
@@ -805,6 +848,8 @@ impl TextGeometry {
                 experts_per_tok,
                 expert_intermediate: positive(t, "moe_intermediate_size")?,
                 shared_intermediate: positive(t, "shared_expert_intermediate_size")?,
+                score: RouterScore::Softmax,
+                shared_gate: true,
             })
         } else {
             for key in [
@@ -855,6 +900,7 @@ impl ModelSpec {
                 Architecture::Llama => "llama",
                 Architecture::Qwen35Text => "qwen3_5_text",
                 Architecture::MiniCpmV47 => "qwen3_5_moe_text",
+                Architecture::Flint => "flint",
             }
             .into(),
             hidden_size: self.hidden as usize,
@@ -890,6 +936,8 @@ impl ModelSpec {
         };
         if root.get("model_type").and_then(Value::as_str) == Some("minicpmv4_7") {
             Self::minicpm(&root, &generation)
+        } else if root.get("model_type").and_then(Value::as_str) == Some("flint") {
+            Self::flint(&root, &generation)
         } else {
             Self::qwen(&root, &generation)
         }
@@ -920,6 +968,9 @@ impl ModelSpec {
                 .map(|state_index| LayerPlan {
                     mixer: Mixer::FullAttention,
                     state_index,
+                    rope: true,
+                    sliding_window: None,
+                    ffn: FfnKind::Dense,
                 })
                 .collect(),
         })
@@ -961,7 +1012,7 @@ impl ModelSpec {
         let text = TextGeometry::read(t, "qwen3_5_moe_text")?;
         let expert_format = ExpertFormat::read(root)?;
         let linear_format = match expert_format {
-            ExpertFormat::Bf16 => LinearFormat::Bf16,
+            ExpertFormat::Bf16 | ExpertFormat::Bf16Separate => LinearFormat::Bf16,
             ExpertFormat::Fp8W8a16 => LinearFormat::Fp8E4m3Channel,
         };
         let spec = Self::from_text(
@@ -975,6 +1026,192 @@ impl ModelSpec {
         )?;
         expert_format.check_ignore(root, &spec)?;
         Ok(spec)
+    }
+    pub fn flint(root: &Value, generation: &Value) -> Result<Self> {
+        equal(root, "model_type", "flint".into())?;
+        equal(
+            root,
+            "architectures",
+            serde_json::json!(["FlintForCausalLM"]),
+        )?;
+        exact_keys(
+            root,
+            &[
+                "architectures",
+                "attention_bias",
+                "attention_dropout",
+                "bos_token_id",
+                "decoder_sparse_step",
+                "eos_token_id",
+                "head_dim",
+                "hidden_act",
+                "hidden_size",
+                "initializer_range",
+                "intermediate_size",
+                "layer_types",
+                "max_position_embeddings",
+                "model_type",
+                "mlp_only_layers",
+                "moe_intermediate_size",
+                "norm_topk_prob",
+                "num_attention_heads",
+                "num_experts",
+                "num_experts_per_tok",
+                "num_hidden_layers",
+                "num_key_value_heads",
+                "no_rope_layer_indices",
+                "output_router_logits",
+                "pad_token_id",
+                "rms_norm_eps",
+                "rope_theta",
+                "router_aux_loss_coef",
+                "router_score_function",
+                "shared_expert_intermediate_size",
+                "sliding_window",
+                "softmax_type",
+                "tie_word_embeddings",
+                "torch_dtype",
+                "transformers_version",
+                "use_cache",
+                "use_sliding_window",
+                "vocab_size",
+            ],
+            "flint config",
+        )?;
+        for (key, value) in [
+            ("attention_bias", false.into()),
+            ("attention_dropout", 0.0.into()),
+            ("bos_token_id", 150000.into()),
+            ("decoder_sparse_step", 1.into()),
+            ("hidden_act", "silu".into()),
+            ("initializer_range", 0.02.into()),
+            ("norm_topk_prob", true.into()),
+            ("output_router_logits", false.into()),
+            ("pad_token_id", 150001.into()),
+            ("router_aux_loss_coef", 0.0005.into()),
+            ("router_score_function", "sigmoid".into()),
+            ("softmax_type", "learnable".into()),
+            ("tie_word_embeddings", false.into()),
+            ("torch_dtype", "bfloat16".into()),
+            ("transformers_version", "5.12.1".into()),
+            ("use_cache", true.into()),
+            ("use_sliding_window", true.into()),
+        ] {
+            equal(root, key, value)?;
+        }
+        let hidden = positive(root, "hidden_size")?;
+        let head_dim = positive(root, "head_dim")?;
+        let q_heads = positive(root, "num_attention_heads")?;
+        let kv_heads = positive(root, "num_key_value_heads")?;
+        let rope_theta = root
+            .get("rope_theta")
+            .and_then(Value::as_f64)
+            .context("missing/invalid rope_theta")?;
+        ensure!(
+            [
+                hidden,
+                positive(root, "intermediate_size")?,
+                positive(root, "max_position_embeddings")?,
+                positive(root, "vocab_size")?,
+                head_dim,
+                q_heads,
+                kv_heads,
+            ] == [2048, 6144, 262144, 150144, 128, 32, 4]
+                && rope_theta == 10000.0,
+            "unsupported Flint attention geometry"
+        );
+        ensure!(
+            q_heads.is_multiple_of(kv_heads),
+            "Flint Q heads are not a multiple of KV heads"
+        );
+        let depth = positive(root, "num_hidden_layers")?;
+        ensure!(depth == 49, "unsupported Flint depth {depth}");
+        let sliding_window = positive(root, "sliding_window")?;
+        ensure!(
+            sliding_window == 513,
+            "unsupported sliding_window {sliding_window}"
+        );
+        equal(root, "mlp_only_layers", serde_json::json!([0, 1]))?;
+        let no_rope = integer_array(root, "no_rope_layer_indices", depth)?;
+        ensure!(
+            no_rope == [0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 48],
+            "unsupported Flint no-rope layer set"
+        );
+        let types = root
+            .get("layer_types")
+            .and_then(Value::as_array)
+            .context("missing/invalid layer_types")?;
+        ensure!(types.len() == depth as usize, "invalid layer_types length");
+        let mut layers = Vec::with_capacity(types.len());
+        for (i, kind) in types.iter().enumerate() {
+            let full = no_rope.contains(&(i as u32));
+            let expected = if full {
+                "full_attention"
+            } else {
+                "sliding_attention"
+            };
+            ensure!(
+                kind.as_str() == Some(expected),
+                "unsupported Flint layer type at {i}: {kind:?}"
+            );
+            layers.push(LayerPlan {
+                mixer: Mixer::FullAttention,
+                state_index: u32::try_from(i).context("Flint layer index overflows u32")?,
+                rope: !full,
+                sliding_window: (!full).then_some(sliding_window),
+                ffn: if i < 2 { FfnKind::Dense } else { FfnKind::Moe },
+            });
+        }
+        let moe = MoeConfig {
+            experts: positive(root, "num_experts")?,
+            experts_per_tok: positive(root, "num_experts_per_tok")?,
+            expert_intermediate: positive(root, "moe_intermediate_size")?,
+            shared_intermediate: positive(root, "shared_expert_intermediate_size")?,
+            score: RouterScore::Sigmoid,
+            shared_gate: false,
+        };
+        ensure!(
+            [
+                moe.experts,
+                moe.experts_per_tok,
+                moe.expert_intermediate,
+                moe.shared_intermediate
+            ] == [256, 6, 512, 1024],
+            "unsupported Flint MoE geometry"
+        );
+        let eps = root
+            .get("rms_norm_eps")
+            .and_then(Value::as_f64)
+            .context("missing/invalid rms_norm_eps")?;
+        ensure!(eps == 1e-6, "unsupported rms_norm_eps {eps}");
+        let vocab = positive(root, "vocab_size")?;
+        let eos_value = generation
+            .get("eos_token_id")
+            .filter(|x| !x.is_null())
+            .or_else(|| root.get("eos_token_id"))
+            .context("missing Flint EOS")?;
+        Ok(Self {
+            abi_version: 1,
+            architecture: Architecture::Flint,
+            hidden,
+            intermediate: positive(root, "intermediate_size")?,
+            vocab,
+            q_heads,
+            kv_heads,
+            head_dim,
+            q_width: q_heads * head_dim,
+            max_position: positive(root, "max_position_embeddings")?,
+            rms_eps: eps as f32,
+            rope_theta: rope_theta as f32,
+            rotary_dim: head_dim,
+            linear_format: LinearFormat::Bf16,
+            expert_format: Some(ExpertFormat::Bf16Separate),
+            eos: eos(eos_value, vocab)?,
+            layers,
+            moe: Some(moe),
+            gdn: None,
+            vision: None,
+        })
     }
     fn from_text(
         architecture: Architecture,

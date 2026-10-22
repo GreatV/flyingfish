@@ -509,6 +509,7 @@ mod tests {
     #[test]
     fn forecast_cancellations_ignore_read_completion() -> Result<()> {
         let geometry = ExpertGeometry {
+            first_layer: 0,
             layers: 2,
             experts: 16,
             hidden: 128,

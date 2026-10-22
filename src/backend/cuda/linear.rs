@@ -296,13 +296,16 @@ pub(crate) enum BoundFfn {
     Moe {
         router: Tensor<bf16, 2>,
         shared: [Tensor<bf16, 2>; 3],
-        shared_gate: Tensor<bf16, 1>,
+        shared_gate: Option<Tensor<bf16, 1>>,
     },
 }
 
 impl BoundFfn {
     pub fn bind(spec: &crate::model_spec::ModelSpec, linear: &mut LayerLinearPlan) -> Result<Self> {
-        let Some(moe) = spec.moe else {
+        let Some(moe) = spec
+            .moe
+            .filter(|_| linear.projections.contains_key("mlp.gate.weight"))
+        else {
             return Ok(Self::Dense);
         };
         let h = spec.hidden;
@@ -313,8 +316,12 @@ impl BoundFfn {
             linear.take_bf16("mlp.shared_expert.up_proj.weight", [i, h])?,
             linear.take_bf16("mlp.shared_expert.down_proj.weight", [h, i])?,
         ];
-        let gate = linear.take_bf16("mlp.shared_expert_gate.weight", [1, h])?;
-        let shared_gate = unsafe { Tensor::new(gate.ptr, [h], [1], gate.span_bytes)? };
+        let shared_gate = if moe.shared_gate {
+            let gate = linear.take_bf16("mlp.shared_expert_gate.weight", [1, h])?;
+            Some(unsafe { Tensor::new(gate.ptr, [h], [1], gate.span_bytes)? })
+        } else {
+            None
+        };
         Ok(Self::Moe {
             router,
             shared,
@@ -330,7 +337,9 @@ impl BoundFfn {
                 shared_gate,
                 ..
             } => {
-                shared_gate.validate()?;
+                if let Some(gate) = shared_gate {
+                    gate.validate()?;
+                }
                 for weight in shared {
                     blas.prepare_fixed(rows, weight.shape[0], weight.shape[1])?;
                 }
@@ -1451,6 +1460,7 @@ mod tests {
                 else {
                     anyhow::bail!("MoE layer selected the dense FFN plan");
                 };
+                let shared_gate = shared_gate.context("test FFN plan has no shared-expert gate")?;
                 assert_eq!(router.shape, [256, 2048]);
                 assert_eq!(
                     shared.map(|weight| weight.shape),

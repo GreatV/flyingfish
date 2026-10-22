@@ -262,6 +262,7 @@ pub(super) fn validate_w8a16(
     };
     let dims = validate(input, scratch)?;
     let geometry = ExpertGeometry {
+        first_layer: 0,
         layers: 1,
         experts: dims.experts,
         hidden: dims.hidden,

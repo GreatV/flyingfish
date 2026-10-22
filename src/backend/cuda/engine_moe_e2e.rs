@@ -558,6 +558,9 @@ impl Bounds {
         let cross_media = match (format, video) {
             (_, true) => "football_16x_vs_sample_demo_1_16x_logits_diff",
             (crate::model_spec::ExpertFormat::Bf16, false) => "hockey_16x_vs_boat_16x_logits_diff",
+            (crate::model_spec::ExpertFormat::Bf16Separate, false) => {
+                anyhow::bail!("Flint has no MiniCPM media fixture floor")
+            }
             (crate::model_spec::ExpertFormat::Fp8W8a16, false) => same_grid,
         };
         let media = media_boundary(&controls[same_grid])?;
@@ -1312,8 +1315,8 @@ fn teacher_steps(
     Ok(steps)
 }
 
-fn native_cases(format: crate::model_spec::ExpertFormat) -> &'static [&'static str] {
-    match format {
+fn native_cases(format: crate::model_spec::ExpertFormat) -> Result<&'static [&'static str]> {
+    Ok(match format {
         crate::model_spec::ExpertFormat::Bf16 => &[
             "text_32",
             "text_1k",
@@ -1333,7 +1336,10 @@ fn native_cases(format: crate::model_spec::ExpertFormat) -> &'static [&'static s
             "video_control_clip2_16x",
             "video_control_same_grid_16x",
         ],
-    }
+        crate::model_spec::ExpertFormat::Bf16Separate => {
+            anyhow::bail!("Flint has no MiniCPM native fixtures")
+        }
+    })
 }
 
 fn check_fixtures(fixtures: &Path, model_dir: &Path, cases: &[&str]) -> Result<()> {
@@ -2087,7 +2093,7 @@ fn minicpm_native_checkpoint_fixtures_cpu() -> Result<()> {
     let format = crate::model_spec::ModelSpec::read(&model)?
         .expert_format
         .context("native fixture expert_format missing")?;
-    let cases = native_cases(format);
+    let cases = native_cases(format)?;
     check_fixtures(&fixtures, &model, cases)?;
     println!(
         "PASS minicpm_native_fixture_preflight format={format:?} cases={} video_decode=ffmpeg canvas=true floors_complete=true",
@@ -2124,7 +2130,7 @@ fn minicpm_native_prefill_profile_gpu() -> Result<()> {
     };
     Engine::calibrate(&model, 0, 4352, None, settings.clone())?;
     let mut engine = Engine::load(&model, 0, 4352, None, settings)?;
-    let cases = native_cases(crate::model_spec::ExpertFormat::Fp8W8a16);
+    let cases = native_cases(crate::model_spec::ExpertFormat::Fp8W8a16)?;
     check_fixtures(&fixtures, &model, cases)?;
     for &case in cases {
         let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
@@ -3517,7 +3523,7 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
     let format = spec
         .expert_format
         .context("native checkpoint expert_format missing")?;
-    let names = native_cases(format);
+    let names = native_cases(format)?;
     let cases = names
         .iter()
         .copied()

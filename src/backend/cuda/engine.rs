@@ -539,6 +539,7 @@ fn load_dispatch(architecture: crate::model_spec::Architecture) -> Result<LoadDi
         Architecture::Qwen35Text => LoadDispatch::Qwen,
         Architecture::Llama => LoadDispatch::Llama,
         Architecture::MiniCpmV47 => LoadDispatch::Qwen,
+        Architecture::Flint => LoadDispatch::Qwen,
     })
 }
 

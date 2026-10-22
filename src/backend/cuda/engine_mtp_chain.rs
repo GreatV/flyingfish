@@ -451,7 +451,7 @@ impl Engine {
             catalog.bytes == crate::mtp::WEIGHT_BYTES && catalog.tensors.len() == 22,
             "MTP-only ledger mismatch"
         );
-        let spec = crate::mtp::component_spec(&self.model_spec);
+        let spec = crate::mtp::component_spec(&self.model_spec)?;
         let state = StateStore::new(&spec, self.capacity, &self.device.stream)?;
         let mut runtime = MtpRuntime::allocate(
             &self.device,
