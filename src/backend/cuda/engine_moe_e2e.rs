@@ -98,7 +98,7 @@ fn placement_components(engine: &Engine, model: &Path) -> Result<usize> {
         if expert == 0 {
             host.claim(0)?.slice()?.copy_from_slice(&lease);
         }
-        gpu_weights.push(stream.clone_htod(&lease)?);
+        gpu_weights.push(stream.clone_htod(lease.values())?);
     }
     let mut gate_ptrs = vec![0u64; 256];
     let mut down_ptrs = vec![0u64; 256];
