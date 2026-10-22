@@ -415,6 +415,7 @@ impl DecodeOps {
                         .arg(&(inner as i32))
                         .arg(&i64::from(inner))
                         .arg(&(rows as i32))
+                        .arg(&0i32)
                         .launch(crate::backend::cuda::blas::Blas::skinny_launch(
                             crate::backend::setup::LinearShape {
                                 rows: rows as usize,

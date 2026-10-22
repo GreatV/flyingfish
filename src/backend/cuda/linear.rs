@@ -281,6 +281,7 @@ impl crate::linear_plan::LayerDequantPlan {
 struct BoundProjection {
     resident: LinearWeightRef,
     prefill: Tensor<bf16, 2>,
+    invariant_rows: usize,
 }
 /// Setup-bound views for a layer. Engine retains catalog/arena storage; run does
 /// not construct tensor names, allocate scratch or invoke a Lt heuristic.
@@ -397,9 +398,31 @@ impl LayerLinearPlan {
                     w
                 }
             };
+            let role = &name[prefix.len()..];
+            let invariant_rows = if matches!(
+                role,
+                "linear_attn.in_proj_a.weight" | "linear_attn.in_proj_b.weight"
+            ) {
+                ensure!(
+                    matches!(resident, LinearWeightRef::Bf16(_)),
+                    "GDN gate projection requires BF16: {role}"
+                );
+                super::blas::Blas::skinny_launch(crate::backend::setup::LinearShape {
+                    rows: crate::linear_plan::MAX_SKINNY_ROWS,
+                    output: prefill.shape[0] as usize,
+                    input: prefill.shape[1] as usize,
+                })?;
+                crate::linear_plan::MAX_SKINNY_ROWS
+            } else {
+                0
+            };
             projections.insert(
-                name[prefix.len()..].to_owned(),
-                BoundProjection { resident, prefill },
+                role.to_owned(),
+                BoundProjection {
+                    resident,
+                    prefill,
+                    invariant_rows,
+                },
             );
         }
         ensure!(
@@ -413,7 +436,15 @@ impl LayerLinearPlan {
     }
     pub fn prepare(&self, blas: &super::blas::Blas, rows: u32) -> Result<()> {
         for p in self.projections.values() {
-            blas.prepare_fixed(rows, p.prefill.shape[0], p.prefill.shape[1])?;
+            if rows as usize > p.invariant_rows {
+                blas.prepare_fixed(rows, p.prefill.shape[0], p.prefill.shape[1])?;
+            } else {
+                blas.prepare_skinny(crate::backend::setup::LinearShape {
+                    rows: rows as usize,
+                    output: p.prefill.shape[0] as usize,
+                    input: p.prefill.shape[1] as usize,
+                })?;
+            }
         }
         Ok(())
     }
@@ -455,7 +486,7 @@ impl LayerLinearPlan {
         } else {
             p.resident
         };
-        blas.linear_typed(phase, weight, x, y)
+        blas.linear_typed_bound(phase, weight, x, y, p.invariant_rows)
     }
 }
 
@@ -517,18 +548,21 @@ mod tests {
                 BoundProjection {
                     resident: weight,
                     prefill,
+                    invariant_rows: 0,
                 },
             )]
             .into(),
             materialize: Vec::new(),
         };
+        layer.prepare(blas, 1)?;
         let values: Vec<_> = (0..rows * k)
             .map(|i| {
                 bf16::from_f32((((i / k) * 71 + (i % k) * 13) % 509) as f32 / 256.0 - 254.0 / 256.0)
             })
             .collect();
         let input = stream.clone_htod(&values)?;
-        let expected = stream.alloc_zeros::<bf16>(rows * n)?;
+        let serial_stride = n.next_multiple_of(16 / size_of::<bf16>());
+        let expected = stream.alloc_zeros::<bf16>(rows * serial_stride)?;
         let canary = bf16::from_bits(0x7fc1);
         let output = stream.clone_htod(&vec![canary; (rows + 1) * n])?;
         let serial_ids = stream.alloc_zeros::<u32>(rows)?;
@@ -548,12 +582,13 @@ mod tests {
                 &mut TensorMut(view(
                     &expected,
                     stream,
-                    row * n,
+                    row * serial_stride,
                     [1, n as u32],
                     [n as u64, 1],
                 )?),
             )?;
-            let input_ptr = expected.device_ptr(stream).0 + (row * n * size_of::<bf16>()) as u64;
+            let input_ptr =
+                expected.device_ptr(stream).0 + (row * serial_stride * size_of::<bf16>()) as u64;
             let token_ptr = serial_ptr + (row * size_of::<u32>()) as u64;
             // SAFETY: each M1 input covers n logits and each output covers one token.
             unsafe {
@@ -565,7 +600,11 @@ mod tests {
                     .launch(crate::backend::cuda::ops::grid(1, 1024))?;
             }
         }
-        let expected = stream.clone_dtoh(&expected)?;
+        let expected: Vec<_> = stream
+            .clone_dtoh(&expected)?
+            .chunks_exact(serial_stride)
+            .flat_map(|row| row[..n].iter().copied())
+            .collect();
         let expected_ids = stream.clone_dtoh(&serial_ids)?;
         for (row, &id) in expected.chunks_exact(n).zip(&expected_ids) {
             let (want, _) = row.iter().enumerate().fold(
@@ -726,6 +765,9 @@ mod tests {
             (248144, 2048),
             (512, 2048),
             (2048, 512),
+            (63, 2048),
+            (64, 2048),
+            (65, 2048),
         ] {
             {
                 let values: Vec<_> = (0..n * k)
@@ -742,6 +784,9 @@ mod tests {
                     [k as u64, 1],
                 )?);
                 defects += invariant_rows(device, &blas, &ops, weight, (n, k))?;
+            }
+            if [63, 64, 65].contains(&n) {
+                continue;
             }
             {
                 let codes: Vec<_> = (0..n * k)
@@ -777,7 +822,7 @@ mod tests {
             }
         }
         println!(
-            "INVARIANT_LINEAR_SUMMARY shapes=6 formats=3 rows=1..16 eager_graph=true defects={defects}"
+            "INVARIANT_LINEAR_SUMMARY shapes=9 bf16_shapes=9 fp8_shapes=6 rows=1..16 eager_graph=true defects={defects}"
         );
         ensure!(defects == 0, "invariant linear DEFECT cells={defects}");
         Ok(())
@@ -1353,6 +1398,7 @@ mod tests {
                     BoundProjection {
                         resident: LinearWeightRef::Bf16(weight),
                         prefill: weight,
+                        invariant_rows: 0,
                     },
                 );
                 ptr += bytes;

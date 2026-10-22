@@ -2399,8 +2399,451 @@ mod tests {
         Ok(())
     }
 
+    fn gate_projection_rows(
+        device: &crate::backend::cuda::Device,
+        shape: [u32; 2],
+        weights: [Vec<bf16>; 4],
+        hidden: &[bf16],
+    ) -> Result<usize> {
+        use crate::backend::cuda::{
+            blas::Blas,
+            closure::Closure,
+            linear::LayerLinearPlan,
+            ops::Ops,
+            weights::{StoredTensor, WeightCatalog},
+        };
+        use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope};
+        let [heads, width] = shape;
+        let rows = crate::linear_plan::MAX_SKINNY_ROWS;
+        ensure!(hidden.len() == width as usize, "gate input extent");
+        let stream = &device.stream;
+        let mut entries = std::collections::BTreeMap::new();
+        let mut tensors = std::collections::BTreeMap::new();
+        let mut bytes = 0;
+        for (role, weight) in ["in_proj_a.weight", "in_proj_b.weight", "A_log", "dt_bias"]
+            .into_iter()
+            .zip(weights)
+        {
+            let name = format!("model.language_model.layers.0.linear_attn.{role}");
+            let shape = if role.ends_with(".weight") {
+                vec![heads as usize, width as usize]
+            } else {
+                vec![heads as usize]
+            };
+            ensure!(
+                weight.len() == shape.iter().product::<usize>(),
+                "gate weight extent"
+            );
+            let size = weight.len() * size_of::<bf16>();
+            entries.insert(
+                name.clone(),
+                TensorEntry {
+                    dtype: safetensors::Dtype::BF16,
+                    shape,
+                    shard: "gate-projection.safetensors".into(),
+                    bytes: size,
+                    load: true,
+                    data_start: 0,
+                    data_offsets: [0, size as u64],
+                    scope: TensorScope::Text,
+                    layer: Some(0),
+                    role: format!("linear_attn.{role}"),
+                    scale_name: None,
+                },
+            );
+            tensors.insert(name, StoredTensor::Bf16(stream.clone_htod(&weight)?));
+            bytes += size;
+        }
+        let catalog = WeightCatalog {
+            linear_format: crate::model_spec::LinearFormat::Bf16,
+            tensors,
+            manifest: TensorManifest {
+                entries,
+                resident_bytes: bytes,
+            },
+            bytes,
+            upload_content_sha256: None,
+            upload_hashed_bytes: None,
+            load_wall_ms: 0.0,
+        };
+        let dequant = crate::linear_plan::LayerDequantPlan::from_manifest(
+            &catalog.manifest,
+            0,
+            catalog.linear_format,
+        )?;
+        let layer = LayerLinearPlan::bind(&dequant, &catalog, None, stream)?;
+        let runtime = std::path::PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
+        let ops = Ops::new(&device.ctx)?;
+        let blas = Blas::new(
+            device,
+            &ops,
+            &runtime,
+            std::rc::Rc::new(Closure::new(false, "gate projection invariance".into())),
+        )?;
+        for m in 1..=rows as u32 {
+            layer.prepare(&blas, m)?;
+        }
+        let gate = cubin::module(&device.ctx, "q38_common")?.load_function(match heads {
+            48 => "q38_gdn_gates",
+            32 => "gdn_gates_h32",
+            _ => anyhow::bail!("unsupported published gate heads={heads}"),
+        })?;
+        let a_log = catalog.bf16("model.language_model.layers.0.linear_attn.A_log")?;
+        let dt = catalog.bf16("model.language_model.layers.0.linear_attn.dt_bias")?;
+        let mut defects = 0;
+        for distinct in [false, true] {
+            let values: Vec<_> = (0..rows * width as usize)
+                .map(|i| {
+                    let row = i / width as usize;
+                    let col = i % width as usize;
+                    if distinct {
+                        bf16::from_f32(
+                            hidden[col].to_f32()
+                                + (((row * 73 + col * 31) % 509) as f32 - 254.0) / 512.0,
+                        )
+                    } else {
+                        hidden[col]
+                    }
+                })
+                .collect();
+            let input = stream.clone_htod(&values)?;
+            let reference: Vec<_> = (0..3)
+                .map(|_| stream.alloc_zeros::<bf16>(rows * heads as usize))
+                .collect::<std::result::Result<_, _>>()?;
+            let reference_g = stream.alloc_zeros::<f32>(rows * heads as usize)?;
+            let mut a = stream.alloc_zeros::<bf16>((rows + 1) * heads as usize)?;
+            let mut b = stream.alloc_zeros::<bf16>((rows + 1) * heads as usize)?;
+            let mut beta = stream.alloc_zeros::<bf16>((rows + 1) * heads as usize)?;
+            let mut g = stream.alloc_zeros::<f32>((rows + 1) * heads as usize)?;
+            for row in 0..rows {
+                for (role, output) in ["a", "b"].into_iter().zip(&reference) {
+                    layer.run(
+                        &blas,
+                        &format!("linear_attn.in_proj_{role}.weight"),
+                        ExecutionPhase::Decode,
+                        geometry_view(
+                            &input,
+                            stream,
+                            [1, width],
+                            [u64::from(width), 1],
+                            row * width as usize,
+                        )?,
+                        &mut TensorMut(geometry_view(
+                            output,
+                            stream,
+                            [1, heads],
+                            [u64::from(heads), 1],
+                            row * heads as usize,
+                        )?),
+                    )?;
+                }
+            }
+            let reference_meta = geometry_meta(stream, 67, rows as u32)?;
+            super::super::ops::GateOps::gdn_gates_with(
+                &gate,
+                stream,
+                RowDomain {
+                    meta: SeqRef {
+                        ptr: reference_meta.device_ptr(stream).0,
+                    },
+                    row_base: 0,
+                    row_capacity: rows as u32,
+                },
+                GdnGateBindings {
+                    a: geometry_view(
+                        &reference[0],
+                        stream,
+                        [rows as u32, heads],
+                        [u64::from(heads), 1],
+                        0,
+                    )?,
+                    b: geometry_view(
+                        &reference[1],
+                        stream,
+                        [rows as u32, heads],
+                        [u64::from(heads), 1],
+                        0,
+                    )?,
+                    a_log: geometry_view(a_log, stream, [heads], [1], 0)?,
+                    dt_bias: geometry_view(dt, stream, [heads], [1], 0)?,
+                    beta: &mut TensorMut(geometry_view(
+                        &reference[2],
+                        stream,
+                        [rows as u32, heads],
+                        [u64::from(heads), 1],
+                        0,
+                    )?),
+                    g: &mut TensorMut(geometry_view(
+                        &reference_g,
+                        stream,
+                        [rows as u32, heads],
+                        [u64::from(heads), 1],
+                        0,
+                    )?),
+                },
+            )?;
+            let expected: Vec<_> = reference
+                .iter()
+                .map(|value| stream.clone_dtoh(value))
+                .collect::<std::result::Result<_, _>>()?;
+            let expected_g = stream.clone_dtoh(&reference_g)?;
+            for m in 2..=rows as u32 {
+                let meta = geometry_meta(stream, 67, m)?;
+                for graph in [false, true] {
+                    let canary = bf16::from_bits(0x7fc1);
+                    for output in [&mut a, &mut b, &mut beta] {
+                        stream
+                            .memcpy_htod(&vec![canary; output.len()], &mut output.slice_mut(..))?;
+                    }
+                    stream.memcpy_htod(
+                        &vec![f32::from_bits(0x7fc00001); g.len()],
+                        &mut g.slice_mut(..),
+                    )?;
+                    device.finish_upload()?;
+                    let execute = || -> Result<()> {
+                        for (role, output) in [("a", &a), ("b", &b)] {
+                            layer.run(
+                                &blas,
+                                &format!("linear_attn.in_proj_{role}.weight"),
+                                ExecutionPhase::Prefill,
+                                geometry_view(
+                                    &input,
+                                    stream,
+                                    [m, width],
+                                    [u64::from(width), 1],
+                                    0,
+                                )?,
+                                &mut TensorMut(geometry_view(
+                                    output,
+                                    stream,
+                                    [m, heads],
+                                    [u64::from(heads), 1],
+                                    0,
+                                )?),
+                            )?;
+                        }
+                        super::super::ops::GateOps::gdn_gates_with(
+                            &gate,
+                            stream,
+                            RowDomain {
+                                meta: SeqRef {
+                                    ptr: meta.device_ptr(stream).0,
+                                },
+                                row_base: 0,
+                                row_capacity: m,
+                            },
+                            GdnGateBindings {
+                                a: geometry_view(&a, stream, [m, heads], [u64::from(heads), 1], 0)?,
+                                b: geometry_view(&b, stream, [m, heads], [u64::from(heads), 1], 0)?,
+                                a_log: geometry_view(a_log, stream, [heads], [1], 0)?,
+                                dt_bias: geometry_view(dt, stream, [heads], [1], 0)?,
+                                beta: &mut TensorMut(geometry_view(
+                                    &beta,
+                                    stream,
+                                    [m, heads],
+                                    [u64::from(heads), 1],
+                                    0,
+                                )?),
+                                g: &mut TensorMut(geometry_view(
+                                    &g,
+                                    stream,
+                                    [m, heads],
+                                    [u64::from(heads), 1],
+                                    0,
+                                )?),
+                            },
+                        )
+                    };
+                    if graph {
+                        use cudarc::driver::sys;
+                        stream.begin_capture(
+                            sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                        )?;
+                        let launched = execute();
+                        let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
+                        launched?;
+                        captured?.context("empty gate projection graph")?.launch()?;
+                    } else {
+                        execute()?;
+                    }
+                    let got: Vec<_> = [&a, &b, &beta]
+                        .into_iter()
+                        .map(|value| stream.clone_dtoh(value))
+                        .collect::<std::result::Result<_, _>>()?;
+                    let got_g = stream.clone_dtoh(&g)?;
+                    let count = m as usize * heads as usize;
+                    ensure!(
+                        got.iter()
+                            .all(|values| values[..count].iter().all(|v| v.is_finite()))
+                            && got_g[..count].iter().all(|v| v.is_finite()),
+                        "Runner FAIL nonfinite gate projection"
+                    );
+                    ensure!(
+                        got.iter().all(|values| values[count..]
+                            .iter()
+                            .all(|v| v.to_bits() == canary.to_bits()))
+                            && got_g[count..].iter().all(|v| v.to_bits() == 0x7fc00001),
+                        "gate projection wrote a dead row"
+                    );
+                    let mut mismatch_counts = Vec::new();
+                    for (role, (actual, expected)) in ["a", "b", "beta"]
+                        .into_iter()
+                        .zip(got.iter().zip(&expected))
+                    {
+                        let mismatches: Vec<_> = actual[..count].iter().zip(expected).enumerate()
+                            .filter(|(_, (a,b))| a.to_bits() != b.to_bits())
+                            .map(|(index, (a,b))| serde_json::json!({"row":index / heads as usize,"head":index % heads as usize,"actual":a.to_f32(),"expected":b.to_f32()})).collect();
+                        mismatch_counts.push(mismatches.len());
+                        if !mismatches.is_empty() {
+                            println!(
+                                "DEFECT GDN_GATE_PROJECTION_VALUES {}",
+                                serde_json::json!({"weight":shape,"distinct":distinct,"rows":m,"graph":graph,"role":role,"mismatches":mismatches})
+                            );
+                        }
+                    }
+                    mismatch_counts.push(
+                        got_g[..count]
+                            .iter()
+                            .zip(&expected_g)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count(),
+                    );
+                    let exact = mismatch_counts.iter().all(|n| *n == 0);
+                    defects += usize::from(!exact);
+                    println!(
+                        "{} GDN_GATE_PROJECTION {}",
+                        if exact { "PASS" } else { "DEFECT" },
+                        serde_json::json!({"weight":shape,"distinct":distinct,"rows":m,"graph":graph,"compared_per_output":count,"mismatches_a_b_beta_g":mismatch_counts})
+                    );
+                    if heads == 48 && !distinct && m == 5 && !graph {
+                        let index = heads as usize + 43;
+                        println!(
+                            "GDN_GATE_HEAD43 {}",
+                            serde_json::json!({"head":43,"row":1,"weight":shape,
+                            "a_m1":expected[0][index].to_f32(),"a_m5":got[0][index].to_f32(),
+                            "b_m1":expected[1][index].to_f32(),"b_m5":got[1][index].to_f32(),
+                            "beta_m1":expected[2][index].to_f32(),"beta_m5":got[2][index].to_f32()})
+                        );
+                    }
+                }
+            }
+        }
+        println!(
+            "GDN_GATE_PROJECTION_BINDING {}",
+            serde_json::json!({"weight":shape,"fixed_lt_plans":blas.fixed_plan_count()})
+        );
+        Ok(defects)
+    }
+
+    fn gate_projection_isolation(device: &crate::backend::cuda::Device) -> Result<usize> {
+        use safetensors::{Dtype, SafeTensors};
+        let model = std::path::PathBuf::from(std::env::var("FF_Q38_MODEL")?);
+        let root = std::path::PathBuf::from(std::env::var("FF_Q38_PROBE_DIR")?);
+        let spec = crate::model_spec::ModelSpec::read(&model)?;
+        let gdn = GdnSpec::from_model(&spec)?;
+        ensure!(
+            spec.hidden == 5120 && (gdn.hk, gdn.hv, gdn.dk, gdn.dv) == (16, 48, 128, 128),
+            "gate isolation requires the published Qwen geometry"
+        );
+        let mapped = crate::checkpoint::MappedCheckpoint::open(&model)?;
+        let views = mapped.views()?;
+        let read = |role: &str, shape: &[usize]| -> Result<Vec<bf16>> {
+            let name = format!("model.language_model.layers.0.linear_attn.{role}");
+            let shard = mapped
+                .index
+                .weight_map
+                .get(&name)
+                .context("gate weight missing")?;
+            let tensor = views
+                .get(shard)
+                .context("gate shard missing")?
+                .tensor(&name)?;
+            ensure!(
+                tensor.dtype() == Dtype::BF16 && tensor.shape() == shape,
+                "gate weight layout {name}"
+            );
+            Ok(tensor
+                .data()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|v| bf16::from_bits(u16::from_le_bytes(*v)))
+                .collect())
+        };
+        let trace_bytes = std::fs::read(root.join("scalar-stages.safetensors"))?;
+        let trace = SafeTensors::deserialize(&trace_bytes)?;
+        let hidden = trace.tensor("target.0.debug.norm1")?;
+        ensure!(
+            hidden.dtype() == Dtype::F32 && hidden.shape() == [1, 1, 5120],
+            "layer0 norm1 trace layout"
+        );
+        let hidden = hidden
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| {
+                let value = f32::from_le_bytes(*v);
+                let rounded = bf16::from_f32(value);
+                ensure!(
+                    value.is_finite() && rounded.to_f32().to_bits() == value.to_bits(),
+                    "trace is not an exact native BF16 widen"
+                );
+                Ok(rounded)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut defects = gate_projection_rows(
+            device,
+            [gdn.hv, spec.hidden],
+            [
+                read("in_proj_a.weight", &[48, 5120])?,
+                read("in_proj_b.weight", &[48, 5120])?,
+                read("A_log", &[48])?,
+                read("dt_bias", &[48])?,
+            ],
+            &hidden,
+        )?;
+        let mini = crate::model_spec::ModelSpec::read(&root.join("minicpm"))?;
+        let gdn = GdnSpec::from_model(&mini)?;
+        ensure!(
+            mini.hidden == 2048 && gdn.hv == 32,
+            "MiniCPM gate production geometry"
+        );
+        let matrix = |seed: usize| {
+            (0..gdn.hv as usize * mini.hidden as usize)
+                .map(|i| {
+                    bf16::from_f32(
+                        (((i / mini.hidden as usize) * 73 + i % mini.hidden as usize * 31 + seed)
+                            % 509) as f32
+                            / 512.0
+                            - 254.0 / 512.0,
+                    )
+                })
+                .collect()
+        };
+        let hidden: Vec<_> = (0..mini.hidden)
+            .map(|i| bf16::from_f32((i * 37 % 509) as f32 / 512.0 - 254.0 / 512.0))
+            .collect();
+        defects += gate_projection_rows(
+            device,
+            [gdn.hv, mini.hidden],
+            [
+                matrix(17),
+                matrix(191),
+                vec![bf16::from_f32(-1.0); gdn.hv as usize],
+                vec![bf16::from_f32(0.25); gdn.hv as usize],
+            ],
+            &hidden,
+        )?;
+        println!(
+            "{} GDN_GATE_PROJECTION_SUMMARY shapes=2 patterns=2 rows=2..16 eager_graph=true defects={defects}",
+            if defects == 0 { "PASS" } else { "DEFECT" }
+        );
+        Ok(defects)
+    }
+
     #[test]
-    #[ignore = "requires an exclusive CUDA window"]
+    #[ignore = "exclusive CUDA, published Qwen gate weights and saved layer0 normalized row"]
     fn gdn_verify_snapshot_rows_gpu() -> Result<()> {
         let qwen = GdnSpec::q38();
         let qwen_conv_dim = qwen.conv_dim().expect("Qwen GDN geometry");
@@ -2410,6 +2853,7 @@ mod tests {
             "GPU window required"
         );
         let device = crate::backend::cuda::Device::new(0)?;
+        let projection_defects = gate_projection_isolation(&device)?;
         let stream = &device.stream;
         let state_elements = (qwen.hv * DK * DV) as usize;
         let row_elements = (qwen.hv * DK) as usize;
@@ -2419,7 +2863,9 @@ mod tests {
         let q: Vec<_> = (0..5 * row_elements).map(|i| signal(i, 131)).collect();
         let k: Vec<_> = (0..5 * row_elements).map(|i| signal(i, 137)).collect();
         let v: Vec<_> = (0..5 * row_elements).map(|i| signal(i, 139)).collect();
-        let beta = vec![0.5f32; 5 * qwen.hv as usize];
+        let beta: Vec<_> = (0..5 * qwen.hv as usize)
+            .map(|i| 0.25 + (i * 17 % 53) as f32 / 128.0)
+            .collect();
         let g: Vec<_> = (0..5 * qwen.hv as usize)
             .map(|i| -((i * 17 % 157 + 1) as f32) / 256.0)
             .collect();
@@ -2430,7 +2876,8 @@ mod tests {
         let g = stream.clone_htod(&g)?;
         let module = cubin::module(&device.ctx, "gdn/gdn_rstep")?;
         let snapshot_kernel = module.load_function("gdn_rstep_core_snapshot")?;
-        let plain_kernel = module.load_function("gdn_rstep_core_v1")?;
+        let plain_kernel = cubin::module(&device.ctx, "gdn/gdn_recurrent")?
+            .load_function("gdn_recurrent_core_v2")?;
         let config = LaunchConfig {
             grid_dim: (2, qwen.hv, 1),
             block_dim: (512, 1, 1),
@@ -2482,10 +2929,39 @@ mod tests {
                         .arg(&mut reference)
                         .arg(&mut output)
                         .arg(&meta)
-                        .arg(&1i32)
                         .launch(config)?;
                 }
                 let expected = stream.clone_dtoh(&reference)?;
+                let observed = if row + 1 < rows {
+                    &slots[row * state_elements..(row + 1) * state_elements]
+                } else {
+                    &final_state
+                };
+                for head in 0..qwen.hv as usize {
+                    let start = head * DK as usize * DV as usize;
+                    let end = start + DK as usize * DV as usize;
+                    let mismatches = expected[start..end]
+                        .iter()
+                        .zip(&observed[start..end])
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    println!(
+                        "{} GDN_DECODE_VERIFY_HEAD rows={rows} row={row} head={head} state_elements=16384 bit_mismatches={mismatches}",
+                        if mismatches == 0 { "PASS" } else { "DEFECT" }
+                    );
+                }
+                if rows == 5 && row == 1 {
+                    let width = DK as usize * DV as usize;
+                    let mismatches = expected[43 * width..44 * width]
+                        .iter()
+                        .zip(&observed[42 * width..43 * width])
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    ensure!(mismatches > 0, "head42-for-head43 control escaped");
+                    println!(
+                        "PASS GDN_HEAD_CONTROL rows=5 row=1 expected_head=43 wrong_head=42 bit_mismatches={mismatches}"
+                    );
+                }
                 // The last live row is not snapshotted (it is the final S write-back).
                 if row + 1 < rows {
                     ensure!(
@@ -2572,8 +3048,16 @@ mod tests {
                 "dead history slots written"
             );
         }
-        let a = stream.clone_htod(&vec![bf16::from_f32(0.25); 5 * qwen.hv as usize])?;
-        let b = stream.clone_htod(&vec![bf16::from_f32(0.5); 5 * qwen.hv as usize])?;
+        let a = stream.clone_htod(
+            &(0..5 * qwen.hv as usize)
+                .map(|i| bf16::from_f32(signal(i, 163)))
+                .collect::<Vec<_>>(),
+        )?;
+        let b = stream.clone_htod(
+            &(0..5 * qwen.hv as usize)
+                .map(|i| bf16::from_f32(signal(i, 167)))
+                .collect::<Vec<_>>(),
+        )?;
         let conv_weight = stream.clone_htod(&vec![bf16::from_f32(0.25); conv_dim * 4])?;
         let a_log = stream.alloc_zeros::<bf16>(qwen.hv as usize)?;
         let dt_bias = stream.alloc_zeros::<bf16>(qwen.hv as usize)?;
@@ -2760,18 +3244,17 @@ mod tests {
             let reference = GdnOps::prepare(&device.ctx, &GdnSpec::q38(), 1, bindings, false)?;
             let meta =
                 stream.clone_htod(&[17 + row as i32, 1, 18 + row as i32, 128, 1, 0, 0, 0])?;
-            GdnOps::run_core(
+            GdnOps::run(
                 &reference,
                 stream,
                 SeqRef {
                     ptr: meta.device_ptr(stream).0,
                 },
-                ExecutionPhase::Prefill,
+                ExecutionPhase::Decode,
                 Scratch {
                     ptr: scratch.device_ptr(stream).0,
                     bytes: plan.ws.bytes,
                 },
-                true,
             )?;
             let expected = stream.clone_dtoh(&reference_state)?;
             let actual = if row < 4 {
@@ -2779,12 +3262,27 @@ mod tests {
             } else {
                 &final_state
             };
+            if row == 1 {
+                let width = DK as usize * DV as usize;
+                for head in 0..qwen.hv as usize {
+                    let start = head * width;
+                    let mismatches = expected[start..start + width]
+                        .iter()
+                        .zip(&actual[start..start + width])
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    println!(
+                        "{} GDN_BOUND_DECODE_VERIFY_HEAD row=1 head={head} state_elements=16384 bit_mismatches={mismatches}",
+                        if mismatches == 0 { "PASS" } else { "DEFECT" }
+                    );
+                }
+            }
             ensure!(
                 expected
                     .iter()
                     .zip(actual)
                     .all(|(a, b)| a.to_bits() == b.to_bits()),
-                "snapshot state differs from prepared R1 chain, row={row}"
+                "snapshot state differs from prepared decode chain, row={row}"
             );
             let expected = stream.clone_dtoh(&reference_history)?;
             let actual = if row < 4 {
@@ -2850,10 +3348,14 @@ mod tests {
             "ordinary M5 prefill nonfinite values"
         );
         println!(
-            "GDN_VERIFY_M5_BINDING_PASS recurrent_snapshot_rows=4 retained_state_prefixes=4 raw_history_CPU ordinary_prefill_P2_unchanged prepared_R1_state_output_history_bitwise shared_plan_mutant_chunked ordinary_M5_P2_launched"
+            "GDN_VERIFY_M5_BINDING_PASS recurrent_snapshot_rows=4 retained_state_prefixes=4 raw_history_CPU ordinary_prefill_P2_unchanged prepared_decode_state_output_history_bitwise shared_plan_mutant_chunked ordinary_M5_P2_launched"
         );
         println!(
-            "GDN_VERIFY_SNAPSHOT_PRIMITIVE_PASS rows1..5 state_bitwise_R1 raw_history_CPU dead_slots M5_bound_plan"
+            "GDN_VERIFY_SNAPSHOT_PRIMITIVE_PASS rows1..5 state_bitwise_decode raw_history_CPU dead_slots M5_bound_plan"
+        );
+        ensure!(
+            projection_defects == 0,
+            "DEFECT GDN gate projection cells={projection_defects}"
         );
         Ok(())
     }

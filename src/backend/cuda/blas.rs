@@ -298,6 +298,8 @@ pub struct Blas {
     calibration: linear_calibrate::Environment,
     fp8: Option<super::linear::Fp8Ops>,
     skinny: CudaFunction,
+    skinny_device: (usize, usize),
+    skinny_plans: RefCell<BTreeMap<(usize, usize), (LaunchConfig, bool)>>,
     invariant_rows: usize,
     plans: RefCell<BTreeMap<(usize, usize, usize, u32), Plan>>,
     biased_plans: RefCell<BTreeMap<(LinearShape, u64, super::linear::LinearBiasMode), Plan>>,
@@ -500,6 +502,8 @@ impl Blas {
             calibration,
             fp8: None,
             skinny: cubin::module(&device.ctx, "gemm_skinny")?.load_function("gemm_skinny_bf16")?,
+            skinny_device: (device.info.sms, device.info.l2_bytes),
+            skinny_plans: RefCell::new(BTreeMap::new()),
             invariant_rows: 0,
             plans: RefCell::new(BTreeMap::new()),
             biased_plans: RefCell::new(BTreeMap::new()),
@@ -523,6 +527,9 @@ impl Blas {
             let choice = self.calibration.read(shape)?;
             let index = algorithm_index(&self.candidates(shape)?, &choice.implementation)
                 .with_context(|| format!("bind frozen Lt choice for {shape:?}"))?;
+            if choice.implementation == LinearImpl::Skinny {
+                self.prepare_skinny(shape)?;
+            }
             self.choices.borrow_mut().insert(shape, (choice, index));
         }
         Ok(())
@@ -538,6 +545,13 @@ impl Blas {
         input: usize,
         algo_index: u32,
     ) -> Result<()> {
+        if (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&rows) && input.is_multiple_of(256) {
+            self.prepare_skinny(LinearShape {
+                rows,
+                output,
+                input,
+            })?;
+        }
         if rows > 1
             && !self
                 .plans
@@ -645,6 +659,7 @@ impl Blas {
         shape: LinearShape,
     ) -> Result<()> {
         linear_calibrate::check_extent(shape, w.len(), x.len())?;
+        self.prepare_skinny(shape)?;
         let candidates = self.candidates(shape)?;
         let (rows, output) = (shape.rows, shape.output);
         {
@@ -679,7 +694,18 @@ impl Blas {
         self.skinny_raw(wp, xp, yp, shape)
     }
     fn skinny_raw(&self, wp: u64, xp: u64, yp: u64, shape: LinearShape) -> Result<()> {
-        let launch = Self::skinny_launch(shape)?;
+        ensure!(
+            (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&shape.rows),
+            "skinny rows exceed the bound: {shape:?}"
+        );
+        let &(mut launch, tiny) = self
+            .skinny_plans
+            .borrow()
+            .get(&(shape.output, shape.input))
+            .context("skinny launch missing; bind before run/capture")?;
+        if tiny {
+            launch.grid_dim.1 = shape.rows as u32;
+        }
         unsafe {
             self.stream
                 .launch_builder(&self.skinny)
@@ -690,7 +716,30 @@ impl Blas {
                 .arg(&(shape.input as i32))
                 .arg(&(shape.input as i64))
                 .arg(&(shape.rows as i32))
+                .arg(&i32::from(tiny))
                 .launch(launch)?;
+        }
+        Ok(())
+    }
+    pub(super) fn prepare_skinny(&self, shape: LinearShape) -> Result<()> {
+        let mut plans = self.skinny_plans.borrow_mut();
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            plans.entry((shape.output, shape.input))
+        {
+            let mut launch = Self::skinny_launch(shape)?;
+            let bytes = shape
+                .output
+                .checked_mul(shape.input)
+                .and_then(|n| n.checked_mul(size_of::<bf16>()))
+                .context("skinny weight byte extent overflow")?;
+            let tiny = shape.output <= 16 * 4
+                && (launch.grid_dim.0 as usize) < self.skinny_device.0
+                && bytes <= self.skinny_device.1;
+            if tiny {
+                launch.grid_dim = (shape.output as u32, 1, 1);
+                launch.shared_mem_bytes = 4 * size_of::<f32>() as u32;
+            }
+            entry.insert((launch, tiny));
         }
         Ok(())
     }
@@ -891,6 +940,13 @@ impl Blas {
             "invalid fixed linear dimensions"
         );
         let key = (rows as usize, output as usize, input as usize, 0);
+        if (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&key.0) && input.is_multiple_of(256) {
+            self.prepare_skinny(LinearShape {
+                rows: key.0,
+                output: key.1,
+                input: key.2,
+            })?;
+        }
         if !self.plans.borrow().contains_key(&key) {
             let p = Plan::new(self.handle, key.0, key.1, key.2, self.workspace.len(), 0)?;
             self.plans.borrow_mut().insert(key, p);
@@ -911,6 +967,16 @@ impl Blas {
         weight: super::linear::LinearWeightRef,
         x: super::contracts::Tensor<bf16, 2>,
         y: &mut super::contracts::TensorMut<bf16, 2>,
+    ) -> Result<()> {
+        self.linear_typed_bound(phase, weight, x, y, 0)
+    }
+    pub(crate) fn linear_typed_bound(
+        &self,
+        phase: crate::op_contract::ExecutionPhase,
+        weight: super::linear::LinearWeightRef,
+        x: super::contracts::Tensor<bf16, 2>,
+        y: &mut super::contracts::TensorMut<bf16, 2>,
+        invariant_rows: usize,
     ) -> Result<()> {
         use super::linear::LinearWeightRef;
         if phase == crate::op_contract::ExecutionPhase::Decode {
@@ -940,7 +1006,7 @@ impl Blas {
                     w.stride == [u64::from(w.shape[1]), 1],
                     "BF16 linear requires row-major weight"
                 );
-                if (1..=self.invariant_rows).contains(&(x.shape[0] as usize)) {
+                if (1..=self.invariant_rows.max(invariant_rows)).contains(&(x.shape[0] as usize)) {
                     return self.skinny_raw(
                         w.ptr,
                         x.ptr,
@@ -1126,6 +1192,126 @@ impl Blas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "exclusive CUDA window and an empty FLYINGFISH_RUNTIME_DIR"]
+    fn m1_calibration_binds_skinny_gpu() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let runtime = PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR missing")?,
+        );
+        ensure!(
+            std::fs::read_dir(&runtime)?.next().is_none(),
+            "runtime must be empty"
+        );
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let stream = &device.stream;
+        for output in [32, 2048] {
+            let shape = LinearShape {
+                rows: 1,
+                output,
+                input: 2048,
+            };
+            let mut cold = Blas::new(
+                &device,
+                &ops,
+                &runtime,
+                Rc::new(super::super::closure::Closure::new(
+                    true,
+                    "cold M1 gate".into(),
+                )),
+            )?;
+            cold.prepare(128, output, shape.input)?;
+            assert!(cold.skinny_plans.borrow().is_empty());
+            let w =
+                stream.clone_htod(&super::super::calibrate::random(output * shape.input, 13))?;
+            let x = stream.clone_htod(&super::super::calibrate::random(shape.input, 17))?;
+            cold.calibrate_shape(&w, &x.slice(..), shape)?;
+            let mut y = stream.alloc_zeros::<bf16>(output)?;
+            cold.skinny(&w, &x.slice(..), &mut y.slice_mut(..), shape)?;
+            let expected = stream.clone_dtoh(&y)?;
+            ensure!(
+                expected.iter().all(|v| v.is_finite()),
+                "nonfinite M1 reference"
+            );
+            let path = cold.choice_path(shape);
+            let mut cache: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+            let skinny = serde_json::to_value(LinearImpl::Skinny)?;
+            for trial in cache["trials"]
+                .as_array_mut()
+                .context("linear trials missing")?
+            {
+                let median = if trial["implementation"] == skinny {
+                    1.0
+                } else {
+                    2.0
+                };
+                for key in ["median_us", "p10_us", "p90_us"] {
+                    trial[key] = median.into();
+                }
+            }
+            cache["choice"]["implementation"] = skinny;
+            cache["choice"]["median_us"] = 1.0.into();
+            let frozen = serde_json::to_vec(&cache)?;
+            std::fs::write(&path, &frozen)?;
+            for cached_calibration in [false, true] {
+                let mut loaded = Blas::new(
+                    &device,
+                    &ops,
+                    &runtime,
+                    Rc::new(super::super::closure::Closure::new(
+                        false,
+                        "frozen M1 gate".into(),
+                    )),
+                )?;
+                assert!(loaded.skinny_plans.borrow().is_empty());
+                if cached_calibration {
+                    loaded.calibrate_shape(&w, &x.slice(..), shape)?;
+                } else {
+                    loaded.load_choices(&std::collections::BTreeSet::from([shape]))?;
+                }
+                for graph in [false, true] {
+                    if graph {
+                        stream.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                    }
+                    let launch = loaded.linear(
+                        &w,
+                        &x.slice(..),
+                        &mut y.slice_mut(..),
+                        1,
+                        output,
+                        shape.input,
+                    );
+                    if graph {
+                        let captured =
+                            stream.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                        launch?;
+                        captured?.context("M1 gate captured no graph")?.launch()?;
+                    } else {
+                        launch?;
+                    }
+                    let actual = stream.clone_dtoh(&y)?;
+                    ensure!(
+                        actual
+                            .iter()
+                            .zip(&expected)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "DEFECT M1 frozen Skinny output changed: {shape:?} cached_calibration={cached_calibration} graph={graph}"
+                    );
+                }
+                ensure!(std::fs::read(&path)? == frozen, "frozen M1 cache changed");
+            }
+            println!(
+                "PASS M1_SKINNY_BINDING weight=[{output},2048] cold=true cached_calibration=true frozen_load=true eager_graph_bits=0 fixture=planted_frozen_skinny"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn algorithm_identity_survives_heuristic_reordering() -> Result<()> {
