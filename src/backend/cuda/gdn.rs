@@ -2399,8 +2399,165 @@ mod tests {
         Ok(())
     }
 
+    fn gate_projection_isolation(device: &crate::backend::cuda::Device) -> Result<()> {
+        use crate::backend::cuda::{
+            blas::Blas, closure::Closure, linear::LinearWeightRef, ops::Ops,
+        };
+        use safetensors::{Dtype, SafeTensors};
+        let model = std::path::PathBuf::from(std::env::var("FF_Q38_MODEL")?);
+        let root = std::path::PathBuf::from(std::env::var("FF_Q38_PROBE_DIR")?);
+        let runtime = std::path::PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
+        let spec = crate::model_spec::ModelSpec::read(&model)?;
+        let gdn = GdnSpec::from_model(&spec)?;
+        ensure!(
+            spec.hidden == 5120 && (gdn.hk, gdn.hv, gdn.dk, gdn.dv) == (16, 48, 128, 128),
+            "gate isolation requires the published Qwen geometry"
+        );
+        let mapped = crate::checkpoint::MappedCheckpoint::open(&model)?;
+        let views = mapped.views()?;
+        let read = |role: &str, shape: &[usize]| -> Result<Vec<bf16>> {
+            let name = format!("model.language_model.layers.0.linear_attn.{role}");
+            let shard = mapped
+                .index
+                .weight_map
+                .get(&name)
+                .context("gate weight missing")?;
+            let tensor = views
+                .get(shard)
+                .context("gate shard missing")?
+                .tensor(&name)?;
+            ensure!(
+                tensor.dtype() == Dtype::BF16 && tensor.shape() == shape,
+                "gate weight layout {name}"
+            );
+            Ok(tensor
+                .data()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|v| bf16::from_bits(u16::from_le_bytes(*v)))
+                .collect())
+        };
+        let stream = &device.stream;
+        let a_weight = stream.clone_htod(&read("in_proj_a.weight", &[48, 5120])?)?;
+        let b_weight = stream.clone_htod(&read("in_proj_b.weight", &[48, 5120])?)?;
+        let a_log = stream.clone_htod(&read("A_log", &[48])?)?;
+        let dt = stream.clone_htod(&read("dt_bias", &[48])?)?;
+        let trace_bytes = std::fs::read(root.join("scalar-stages.safetensors"))?;
+        let trace = SafeTensors::deserialize(&trace_bytes)?;
+        let hidden = trace.tensor("target.0.debug.norm1")?;
+        ensure!(
+            hidden.dtype() == Dtype::F32 && hidden.shape() == [1, 1, 5120],
+            "layer0 norm1 trace layout"
+        );
+        let hidden = hidden
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| {
+                let value = f32::from_le_bytes(*v);
+                let rounded = bf16::from_f32(value);
+                ensure!(
+                    value.is_finite() && rounded.to_f32().to_bits() == value.to_bits(),
+                    "trace is not an exact native BF16 widen"
+                );
+                Ok(rounded)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let input = stream.clone_htod(&hidden.repeat(5))?;
+        let ops = Ops::new(&device.ctx)?;
+        let blas = Blas::new(
+            device,
+            &ops,
+            &runtime,
+            std::rc::Rc::new(Closure::new(false, "gate projection isolation".into())),
+        )?;
+        blas.prepare_fixed(1, 48, 5120)?;
+        blas.prepare_fixed(5, 48, 5120)?;
+        let gate = cubin::module(&device.ctx, "q38_common")?.load_function("q38_gdn_gates")?;
+        let mut observations = Vec::new();
+        for rows in [1u32, 5] {
+            let a = stream.alloc_zeros::<bf16>(rows as usize * 48)?;
+            let b = stream.alloc_zeros::<bf16>(rows as usize * 48)?;
+            let beta = stream.alloc_zeros::<bf16>(rows as usize * 48)?;
+            let g = stream.alloc_zeros::<f32>(rows as usize * 48)?;
+            for (weight, output) in [(&a_weight, &a), (&b_weight, &b)] {
+                blas.linear_typed(
+                    if rows == 1 {
+                        ExecutionPhase::Decode
+                    } else {
+                        ExecutionPhase::Prefill
+                    },
+                    LinearWeightRef::Bf16(geometry_view(weight, stream, [48, 5120], [5120, 1], 0)?),
+                    geometry_view(&input, stream, [rows, 5120], [5120, 1], 0)?,
+                    &mut TensorMut(geometry_view(output, stream, [rows, 48], [48, 1], 0)?),
+                )?;
+            }
+            let meta = geometry_meta(stream, if rows == 1 { 68 } else { 67 }, rows)?;
+            super::super::ops::GateOps::gdn_gates_with(
+                &gate,
+                stream,
+                RowDomain {
+                    meta: SeqRef {
+                        ptr: meta.device_ptr(stream).0,
+                    },
+                    row_base: 0,
+                    row_capacity: rows,
+                },
+                GdnGateBindings {
+                    a: geometry_view(&a, stream, [rows, 48], [48, 1], 0)?,
+                    b: geometry_view(&b, stream, [rows, 48], [48, 1], 0)?,
+                    a_log: geometry_view(&a_log, stream, [48], [1], 0)?,
+                    dt_bias: geometry_view(&dt, stream, [48], [1], 0)?,
+                    beta: &mut TensorMut(geometry_view(&beta, stream, [rows, 48], [48, 1], 0)?),
+                    g: &mut TensorMut(geometry_view(&g, stream, [rows, 48], [48, 1], 0)?),
+                },
+            )?;
+            observations.push((
+                stream.clone_dtoh(&a)?,
+                stream.clone_dtoh(&b)?,
+                stream.clone_dtoh(&beta)?,
+                stream.clone_dtoh(&g)?,
+            ));
+        }
+        let single = &observations[0];
+        let multiple = &observations[1];
+        for head in 0..48 {
+            let row = 48 + head;
+            ensure!(
+                [
+                    single.0[head].to_f32(),
+                    single.1[head].to_f32(),
+                    single.2[head].to_f32(),
+                    single.3[head],
+                    multiple.0[row].to_f32(),
+                    multiple.1[row].to_f32(),
+                    multiple.2[row].to_f32(),
+                    multiple.3[row]
+                ]
+                .iter()
+                .all(|v| v.is_finite()),
+                "nonfinite gate projection"
+            );
+            println!(
+                "T24.13B_GATE_PROJECTION {}",
+                serde_json::json!({"head":head,"selected_row":1,"verify_rows":5,
+                "a_m1":single.0[head].to_f32(),"a_m5":multiple.0[row].to_f32(),"a_equal":single.0[head].to_bits()==multiple.0[row].to_bits(),
+                "b_m1":single.1[head].to_f32(),"b_m5":multiple.1[row].to_f32(),"b_equal":single.1[head].to_bits()==multiple.1[row].to_bits(),
+                "beta_m1":single.2[head].to_f32(),"beta_m5":multiple.2[row].to_f32(),"beta_equal":single.2[head].to_bits()==multiple.2[row].to_bits(),
+                "g_m1":single.3[head],"g_m5":multiple.3[row],"g_equal":single.3[head].to_bits()==multiple.3[row].to_bits()})
+            );
+        }
+        println!(
+            "T24.13B_PROJECTION_PLAN {}",
+            serde_json::json!({"stored_weight":[48,5120],"input":[5,5120],"input_rows":"same selected normalized row repeated five times","bound_plans":blas.bound_plan_receipt()?})
+        );
+        Ok(())
+    }
+
     #[test]
-    #[ignore = "requires an exclusive CUDA window"]
+    #[ignore = "exclusive CUDA, published Qwen gate weights and saved layer0 normalized row"]
     fn gdn_verify_snapshot_rows_gpu() -> Result<()> {
         let qwen = GdnSpec::q38();
         let qwen_conv_dim = qwen.conv_dim().expect("Qwen GDN geometry");
@@ -2410,6 +2567,7 @@ mod tests {
             "GPU window required"
         );
         let device = crate::backend::cuda::Device::new(0)?;
+        gate_projection_isolation(&device)?;
         let stream = &device.stream;
         let state_elements = (qwen.hv * DK * DV) as usize;
         let row_elements = (qwen.hv * DK) as usize;
@@ -2419,7 +2577,9 @@ mod tests {
         let q: Vec<_> = (0..5 * row_elements).map(|i| signal(i, 131)).collect();
         let k: Vec<_> = (0..5 * row_elements).map(|i| signal(i, 137)).collect();
         let v: Vec<_> = (0..5 * row_elements).map(|i| signal(i, 139)).collect();
-        let beta = vec![0.5f32; 5 * qwen.hv as usize];
+        let beta: Vec<_> = (0..5 * qwen.hv as usize)
+            .map(|i| 0.25 + (i * 17 % 53) as f32 / 128.0)
+            .collect();
         let g: Vec<_> = (0..5 * qwen.hv as usize)
             .map(|i| -((i * 17 % 157 + 1) as f32) / 256.0)
             .collect();
@@ -2430,7 +2590,8 @@ mod tests {
         let g = stream.clone_htod(&g)?;
         let module = cubin::module(&device.ctx, "gdn/gdn_rstep")?;
         let snapshot_kernel = module.load_function("gdn_rstep_core_snapshot")?;
-        let plain_kernel = module.load_function("gdn_rstep_core_v1")?;
+        let plain_kernel = cubin::module(&device.ctx, "gdn/gdn_recurrent")?
+            .load_function("gdn_recurrent_core_v2")?;
         let config = LaunchConfig {
             grid_dim: (2, qwen.hv, 1),
             block_dim: (512, 1, 1),
@@ -2482,10 +2643,39 @@ mod tests {
                         .arg(&mut reference)
                         .arg(&mut output)
                         .arg(&meta)
-                        .arg(&1i32)
                         .launch(config)?;
                 }
                 let expected = stream.clone_dtoh(&reference)?;
+                let observed = if row + 1 < rows {
+                    &slots[row * state_elements..(row + 1) * state_elements]
+                } else {
+                    &final_state
+                };
+                for head in 0..qwen.hv as usize {
+                    let start = head * DK as usize * DV as usize;
+                    let end = start + DK as usize * DV as usize;
+                    let mismatches = expected[start..end]
+                        .iter()
+                        .zip(&observed[start..end])
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    println!(
+                        "{} GDN_DECODE_VERIFY_HEAD rows={rows} row={row} head={head} state_elements=16384 bit_mismatches={mismatches}",
+                        if mismatches == 0 { "PASS" } else { "DEFECT" }
+                    );
+                }
+                if rows == 5 && row == 1 {
+                    let width = DK as usize * DV as usize;
+                    let mismatches = expected[43 * width..44 * width]
+                        .iter()
+                        .zip(&observed[42 * width..43 * width])
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    ensure!(mismatches > 0, "head42-for-head43 control escaped");
+                    println!(
+                        "PASS GDN_HEAD_CONTROL rows=5 row=1 expected_head=43 wrong_head=42 bit_mismatches={mismatches}"
+                    );
+                }
                 // The last live row is not snapshotted (it is the final S write-back).
                 if row + 1 < rows {
                     ensure!(
@@ -2572,8 +2762,16 @@ mod tests {
                 "dead history slots written"
             );
         }
-        let a = stream.clone_htod(&vec![bf16::from_f32(0.25); 5 * qwen.hv as usize])?;
-        let b = stream.clone_htod(&vec![bf16::from_f32(0.5); 5 * qwen.hv as usize])?;
+        let a = stream.clone_htod(
+            &(0..5 * qwen.hv as usize)
+                .map(|i| bf16::from_f32(signal(i, 163)))
+                .collect::<Vec<_>>(),
+        )?;
+        let b = stream.clone_htod(
+            &(0..5 * qwen.hv as usize)
+                .map(|i| bf16::from_f32(signal(i, 167)))
+                .collect::<Vec<_>>(),
+        )?;
         let conv_weight = stream.clone_htod(&vec![bf16::from_f32(0.25); conv_dim * 4])?;
         let a_log = stream.alloc_zeros::<bf16>(qwen.hv as usize)?;
         let dt_bias = stream.alloc_zeros::<bf16>(qwen.hv as usize)?;
@@ -2760,18 +2958,17 @@ mod tests {
             let reference = GdnOps::prepare(&device.ctx, &GdnSpec::q38(), 1, bindings, false)?;
             let meta =
                 stream.clone_htod(&[17 + row as i32, 1, 18 + row as i32, 128, 1, 0, 0, 0])?;
-            GdnOps::run_core(
+            GdnOps::run(
                 &reference,
                 stream,
                 SeqRef {
                     ptr: meta.device_ptr(stream).0,
                 },
-                ExecutionPhase::Prefill,
+                ExecutionPhase::Decode,
                 Scratch {
                     ptr: scratch.device_ptr(stream).0,
                     bytes: plan.ws.bytes,
                 },
-                true,
             )?;
             let expected = stream.clone_dtoh(&reference_state)?;
             let actual = if row < 4 {
@@ -2779,12 +2976,27 @@ mod tests {
             } else {
                 &final_state
             };
+            if row == 1 {
+                let width = DK as usize * DV as usize;
+                for head in 0..qwen.hv as usize {
+                    let start = head * width;
+                    let mismatches = expected[start..start + width]
+                        .iter()
+                        .zip(&actual[start..start + width])
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    println!(
+                        "{} GDN_BOUND_DECODE_VERIFY_HEAD row=1 head={head} state_elements=16384 bit_mismatches={mismatches}",
+                        if mismatches == 0 { "PASS" } else { "DEFECT" }
+                    );
+                }
+            }
             ensure!(
                 expected
                     .iter()
                     .zip(actual)
                     .all(|(a, b)| a.to_bits() == b.to_bits()),
-                "snapshot state differs from prepared R1 chain, row={row}"
+                "snapshot state differs from prepared decode chain, row={row}"
             );
             let expected = stream.clone_dtoh(&reference_history)?;
             let actual = if row < 4 {
@@ -2850,10 +3062,10 @@ mod tests {
             "ordinary M5 prefill nonfinite values"
         );
         println!(
-            "GDN_VERIFY_M5_BINDING_PASS recurrent_snapshot_rows=4 retained_state_prefixes=4 raw_history_CPU ordinary_prefill_P2_unchanged prepared_R1_state_output_history_bitwise shared_plan_mutant_chunked ordinary_M5_P2_launched"
+            "GDN_VERIFY_M5_BINDING_PASS recurrent_snapshot_rows=4 retained_state_prefixes=4 raw_history_CPU ordinary_prefill_P2_unchanged prepared_decode_state_output_history_bitwise shared_plan_mutant_chunked ordinary_M5_P2_launched"
         );
         println!(
-            "GDN_VERIFY_SNAPSHOT_PRIMITIVE_PASS rows1..5 state_bitwise_R1 raw_history_CPU dead_slots M5_bound_plan"
+            "GDN_VERIFY_SNAPSHOT_PRIMITIVE_PASS rows1..5 state_bitwise_decode raw_history_CPU dead_slots M5_bound_plan"
         );
         Ok(())
     }
