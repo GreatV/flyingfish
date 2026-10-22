@@ -34,7 +34,8 @@ use super::contracts::{RowDomain, Scratch, SeqRef, Tensor, TensorMut};
 use super::cubin;
 use super::ops::GdnGateBindings;
 use crate::gdn_plan::{
-    CW_P2_CHUNK, CW_P2_VALUE_BLOCK, GdnPolicy, GdnWorkspace, Region, add, cw_p2, mul,
+    CW_P2_CHUNK, CW_P2_MAX_GROUPS, CW_P2_VALUE_BLOCK, GdnPolicy, GdnWorkspace, Region, add, cw_p2,
+    mul,
 };
 use crate::op_contract::{ExecutionPhase, GdnSpec, WorkspaceReq};
 use anyhow::{Context, Result, ensure};
@@ -146,17 +147,24 @@ fn cw_p2_grids(rows: u32, hv: u32) -> (LaunchConfig, LaunchConfig) {
     (per_chunk, per_value_block)
 }
 
-fn cw_p2_groups(ws: &GdnWorkspace, rows: u32, hv: u32) -> Vec<(i32, i32, LaunchConfig)> {
+fn cw_p2_groups(
+    ws: &GdnWorkspace,
+    rows: u32,
+    hv: u32,
+) -> Result<[Option<(i32, i32, LaunchConfig)>; CW_P2_MAX_GROUPS]> {
+    let mut groups = [None; CW_P2_MAX_GROUPS];
     if ws.p2_group_rows == 0 {
-        return Vec::new();
+        return Ok(groups);
     }
-    (0..rows)
-        .step_by(ws.p2_group_rows as usize)
-        .map(|base| {
-            let count = ws.p2_group_rows.min(rows - base);
-            (base as i32, count as i32, cw_p2_grids(count, hv).0)
-        })
-        .collect()
+    ensure!(
+        rows.div_ceil(ws.p2_group_rows) as usize <= groups.len(),
+        "GDN P2 group count exceeds its slot-geometry bound"
+    );
+    for (index, base) in (0..rows).step_by(ws.p2_group_rows as usize).enumerate() {
+        let count = ws.p2_group_rows.min(rows - base);
+        groups[index] = Some((base as i32, count as i32, cw_p2_grids(count, hv).0));
+    }
+    Ok(groups)
 }
 
 /// CUDA caps gridDim.y and gridDim.z at 65535; prep puts rows on gridDim.z and beta on gridDim.y.
@@ -205,7 +213,7 @@ pub(crate) struct GdnPlan {
     /// Whether this plan carries the chunkwise-P2 split.
     cw_p2: bool,
     /// Prebound row base, group extent and stage-A grid, in chunk order.
-    p2_groups: Vec<(i32, i32, LaunchConfig)>,
+    p2_groups: [Option<(i32, i32, LaunchConfig)>; CW_P2_MAX_GROUPS],
     p2_h_cfg: LaunchConfig,
 }
 
@@ -299,7 +307,7 @@ impl GdnPlan {
             hist_cfg: self.hist_cfg,
             chunked_cfg: self.chunked_cfg,
             recurrent_cfg: self.recurrent_cfg,
-            p2_groups: cw_p2_groups(&ws, rows, self.spec.hv),
+            p2_groups: cw_p2_groups(&ws, rows, self.spec.hv)?,
             p2_h_cfg: cw_p2_grids(rows, self.spec.hv).1,
             cw_p2,
         })
@@ -317,7 +325,7 @@ impl GdnPlan {
         meta.validate()?;
         scratch.validate(self.ws.bytes)?;
         ensure!(
-            self.cw_p2 && !self.p2_groups.is_empty(),
+            self.cw_p2 && self.p2_groups[0].is_some(),
             "chunkwise P2 slot groups were not bound"
         );
         let p2 = self
@@ -338,7 +346,7 @@ impl GdnPlan {
             q
         };
         let a_key = ws + self.ws.k_bf16.offset;
-        for &(row_base, group_rows, a_cfg) in &self.p2_groups {
+        for &(row_base, group_rows, a_cfg) in self.p2_groups.iter().flatten() {
             let stage = crate::gdn_plan::P2StageArgs {
                 q,
                 k,
@@ -606,7 +614,7 @@ impl GdnOps {
                 block_dim: (CORE_THREADS, 1, 1),
                 shared_mem_bytes: RECURRENT_SMEM,
             },
-            p2_groups: cw_p2_groups(&ws, max_rows, spec.hv),
+            p2_groups: cw_p2_groups(&ws, max_rows, spec.hv)?,
             p2_h_cfg: cw_p2_grids(max_rows, spec.hv).1,
             cw_p2,
         })
@@ -1344,7 +1352,7 @@ mod tests {
             };
             plan.ws.p2_group_rows = bounded.p2_group_rows;
             plan.ws.bytes = plan.ws.bytes.max(add(plan.ws.p2.offset, plan.ws.p2.bytes)?);
-            plan.p2_groups = cw_p2_groups(&plan.ws, rows, spec.hv);
+            plan.p2_groups = cw_p2_groups(&plan.ws, rows, spec.hv)?;
         }
         if matches!(core, GeometryCore::P2Whole) {
             let base = add(plan.ws.k_bf16.offset, plan.ws.k_bf16.bytes)?;
@@ -1354,7 +1362,7 @@ mod tests {
             };
             plan.ws.p2_group_rows = rows.div_ceil(CW_P2_CHUNK) * CW_P2_CHUNK;
             plan.ws.bytes = add(base, plan.ws.p2.bytes)?;
-            plan.p2_groups = cw_p2_groups(&plan.ws, rows, spec.hv);
+            plan.p2_groups = cw_p2_groups(&plan.ws, rows, spec.hv)?;
         }
         if matches!(
             core,

@@ -50,6 +50,9 @@ pub const fn cw_p2_slot_layout() -> [(u64, u64, char); 6] {
 
 /// Bytes of one slot: the six fields above.
 pub const CW_P2_SLOT_BYTES: u64 = 64 * 128 * 2 + 64 * 128 * 4 + 64 * 72 * 2 + 3 * 64 * 4;
+/// Group-count bound for 128-wide FP32 V and 64-row slot chunks.
+pub const CW_P2_MAX_GROUPS: usize =
+    (2 * CW_P2_SLOT_BYTES).div_ceil(CW_P2_CHUNK as u64 * 128 * 4) as usize;
 const _: () = assert!(
     CW_P2_SLOT_BYTES == cw_p2::SLOT_BYTES,
     "the chunkwise-P2 slot fields and gdn_cw_p2_layout.h disagree"
@@ -315,7 +318,7 @@ mod tests {
         for hv in [32, 48] {
             let spec = GdnSpec { hv, ..spec };
             let mut last = 0;
-            for rows in 1..=8192 {
+            for rows in 1..=65_535 {
                 let p2 = policy.cw_p2_for_step(rows);
                 let ws = GdnWorkspace::new(&spec, rows, p2)?;
                 let bytes = policy.workspace(&spec, rows)?.bytes;
@@ -333,6 +336,7 @@ mod tests {
                 }
                 assert!(ws.p2_group_rows.is_multiple_of(CW_P2_CHUNK));
                 assert!(ws.p2_group_rows > 0);
+                assert!(rows.div_ceil(ws.p2_group_rows) as usize <= CW_P2_MAX_GROUPS);
                 assert_eq!(ws.p2.bytes, cw_p2_bytes(hv, ws.p2_group_rows));
                 for live in [
                     ws.conv_out,
