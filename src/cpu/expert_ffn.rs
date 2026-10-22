@@ -106,6 +106,10 @@ impl ExpertWeights {
                 let down = range.start + usize::try_from(gate_up_bytes / 2)?;
                 (range.start..down, down..range.end)
             }
+            ExpertLayout::Bf16Separate { matrix_bytes, .. } => {
+                let down = range.start + usize::try_from(matrix_bytes / 2)?;
+                (range.start..down, down..range.end)
+            }
             ExpertLayout::Fp8W8a16(_) => (range.clone(), range),
         };
         Ok(Self {
@@ -917,6 +921,7 @@ impl ExpertPool {
         let isa = Isa::detect();
         if let Some(slot) = &fp8_slot {
             let geometry = ExpertGeometry {
+                first_layer: 0,
                 layers: 1,
                 experts: 1,
                 hidden: u32::try_from(shape.hidden)?,
@@ -1545,6 +1550,7 @@ pub fn measure_service_table(
         "expert service ring {ring_experts} cannot hold {missed_max} misses"
     );
     let geometry = ExpertGeometry {
+        first_layer: 0,
         layers: 1,
         experts: ring_experts,
         hidden: u32::try_from(shape.hidden)?,
@@ -1564,7 +1570,7 @@ pub fn measure_service_table(
     let arena = HostBlocks::new(ring_experts, per)?;
     let mut values = vec![bf16::ZERO; per];
     match &layout {
-        ExpertLayout::Bf16Fused { .. } => {
+        ExpertLayout::Bf16Fused { .. } | ExpertLayout::Bf16Separate { .. } => {
             for (index, value) in values.iter_mut().enumerate() {
                 *value = bf16::from_f32((((index % 251) as f32) - 125.0) / 128.0);
             }
@@ -1972,6 +1978,7 @@ mod tests {
 
     fn fp8_fixture(shape: &Shape) -> (Vec<u8>, crate::experts::catalogue::Fp8Slot) {
         let geometry = crate::experts::catalogue::ExpertGeometry {
+            first_layer: 0,
             layers: 1,
             experts: 1,
             hidden: shape.hidden as u32,

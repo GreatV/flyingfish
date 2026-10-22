@@ -22,7 +22,7 @@ impl RowWorkSpec {
             .checked_mul(spec.head_dim as usize)
             .context("KV width overflow")?;
         let (projection, mixer, extra_mixer, ab) = match spec.architecture {
-            Architecture::Llama => (
+            Architecture::Llama | Architecture::Flint => (
                 q.checked_add(kv.checked_mul(2).context("KV width overflow")?)
                     .context("projection width overflow")?,
                 q,

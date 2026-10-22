@@ -163,7 +163,7 @@ fn kv_cache_five_row_wrap_gpu() -> Result<()> {
         spec.kv_heads == 4 && spec.head_dim == 256,
         "Qwen KV geometry"
     );
-    let spec = crate::mtp::component_spec(&spec);
+    let spec = crate::mtp::component_spec(&spec)?;
     let values = |shift: usize| {
         (0..4 * cap * 256)
             .map(|i| {
@@ -569,7 +569,7 @@ fn kv_cache_kernel_gpu() -> Result<()> {
         &serde_json::from_str(include_str!("../../../tests/data/q38-config.json"))?,
         &Value::Null,
     )?;
-    let spec = crate::mtp::component_spec(&spec);
+    let spec = crate::mtp::component_spec(&spec)?;
     let smoke = match manifest["run_mode"].as_str() {
         Some("smoke") => true,
         Some("formal") => false,
@@ -1058,7 +1058,7 @@ fn kv_cache_prefix_request_history_gpu() -> Result<()> {
         &serde_json::from_str(include_str!("../../../tests/data/q38-config.json"))?,
         &Value::Null,
     )?;
-    let spec = crate::mtp::component_spec(&spec);
+    let spec = crate::mtp::component_spec(&spec)?;
     let cap = 16640;
     let k = s.clone_htod(&bf16_file(root.join("synthetic-k.bf16"), 4 * cap * 256)?)?;
     let v = s.clone_htod(&bf16_file(root.join("synthetic-v.bf16"), 4 * cap * 256)?)?;

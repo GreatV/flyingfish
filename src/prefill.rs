@@ -922,6 +922,7 @@ mod admission_tests {
     fn expert_workspace_exact_boundary_preserves_minimum_slots_and_headroom() -> Result<()> {
         use crate::experts::catalogue::ExpertGeometry;
         let geometry = ExpertGeometry {
+            first_layer: 0,
             layers: 2,
             experts: 8,
             hidden: 16,

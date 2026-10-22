@@ -1319,6 +1319,7 @@ mod long_tests {
             llc_bytes: 128,
         };
         let geometry = ExpertGeometry {
+            first_layer: 0,
             layers: 2,
             experts: 8,
             hidden: 16,

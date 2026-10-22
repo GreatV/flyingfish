@@ -887,6 +887,7 @@ impl Decode {
         else {
             anyhow::bail!("MoE contribution received a dense FFN");
         };
+        let shared_gate = shared_gate.context("ungated shared expert decode is not bound")?;
         let (rows, k, hidden) = (
             x.shape[0] as usize,
             self.geometry.top_k as usize,
@@ -1039,6 +1040,7 @@ impl Decode {
         let BoundFfn::Moe { shared_gate, .. } = ffn else {
             anyhow::bail!("MoE combine received a dense FFN");
         };
+        let shared_gate = shared_gate.context("ungated shared expert combine is not bound")?;
         let (rows, k, hidden) = (
             x.shape[0] as usize,
             self.geometry.top_k as usize,

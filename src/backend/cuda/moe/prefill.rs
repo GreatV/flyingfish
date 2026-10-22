@@ -587,6 +587,7 @@ pub(crate) fn prefill_layout(
             "unsupported native expert GEMM shape hidden={hidden} intermediate={inter}: output channels must be multiples of 128 and K multiples of 64"
         );
         let geometry = ExpertGeometry {
+            first_layer: 0,
             layers: 1,
             experts: u32::try_from(experts)?,
             hidden: u32::try_from(hidden)?,

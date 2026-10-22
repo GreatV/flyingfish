@@ -182,6 +182,7 @@ impl MappedCheckpoint {
         let label = match spec.architecture {
             Architecture::Qwen35Text => "Q38",
             Architecture::MiniCpmV47 => "MiniCPM",
+            Architecture::Flint => "Flint",
             Architecture::Llama => bail!("checkpoint manifest requires a Qwen3.5-family spec"),
         };
         let mut expected = BTreeMap::new();
@@ -217,6 +218,7 @@ impl MappedCheckpoint {
                 }
             }
             Architecture::MiniCpmV47 => Self::minicpm_vision_entries(spec, &mut expected)?,
+            Architecture::Flint => {}
             Architecture::Llama => unreachable!(),
         }
         if policy.selects(TensorScope::Mtp)
@@ -248,6 +250,7 @@ impl MappedCheckpoint {
         spec: &crate::model_spec::ModelSpec,
         expected: &mut BTreeMap<String, ExpectedTensor>,
     ) -> Result<()> {
+        use crate::model_spec::Architecture;
         use crate::model_spec::Mixer;
         let hidden = spec.hidden as usize;
         let vocab = spec.vocab as usize;
@@ -256,10 +259,19 @@ impl MappedCheckpoint {
         let kv_width = spec.kv_heads as usize * head_dim;
         let fp8 = spec.linear_format.fp8_layout();
         let dense_fp8 = fp8.filter(|layout| *layout == crate::fp8::Fp8ScaleLayout::Block128);
-        for name in ["model.language_model.embed_tokens.weight", "lm_head.weight"] {
+        let global_prefix = match spec.architecture {
+            Architecture::Flint => "model",
+            Architecture::Qwen35Text | Architecture::MiniCpmV47 | Architecture::Llama => {
+                "model.language_model"
+            }
+        };
+        for name in [
+            format!("{global_prefix}.embed_tokens.weight"),
+            "lm_head.weight".to_owned(),
+        ] {
             put(
                 expected,
-                name.into(),
+                name,
                 Dtype::BF16,
                 vec![vocab, hidden],
                 TensorScope::Text,
@@ -267,13 +279,13 @@ impl MappedCheckpoint {
         }
         put(
             expected,
-            "model.language_model.norm.weight".into(),
+            format!("{global_prefix}.norm.weight"),
             Dtype::BF16,
             vec![hidden],
             TensorScope::Text,
         );
         for (i, layer) in spec.layers.iter().enumerate() {
-            let p = format!("model.language_model.layers.{i}");
+            let p = format!("{global_prefix}.layers.{i}");
             for name in ["input_layernorm", "post_attention_layernorm"] {
                 put(
                     expected,
@@ -283,8 +295,12 @@ impl MappedCheckpoint {
                     TensorScope::Text,
                 );
             }
-            match &spec.moe {
-                Some(moe) => {
+            match layer.ffn {
+                crate::model_spec::FfnKind::Moe => {
+                    let moe = spec
+                        .moe
+                        .as_ref()
+                        .context("MoE layer has no global MoE geometry")?;
                     let experts = moe.experts as usize;
                     let expert_i = moe.expert_intermediate as usize;
                     let shared_i = moe.shared_intermediate as usize;
@@ -308,6 +324,24 @@ impl MappedCheckpoint {
                                     n,
                                     k,
                                     Some(crate::fp8::Fp8ScaleLayout::PerChannel),
+                                );
+                            }
+                        }
+                    } else if spec.expert_format
+                        == Some(crate::model_spec::ExpertFormat::Bf16Separate)
+                    {
+                        for expert in 0..experts {
+                            for (role, n, k) in [
+                                ("gate_proj", expert_i, hidden),
+                                ("up_proj", expert_i, hidden),
+                                ("down_proj", hidden, expert_i),
+                            ] {
+                                put(
+                                    expected,
+                                    format!("{p}.mlp.experts.{expert}.{role}.weight"),
+                                    Dtype::BF16,
+                                    vec![n, k],
+                                    TensorScope::Text,
                                 );
                             }
                         }
@@ -348,15 +382,17 @@ impl MappedCheckpoint {
                         vec![hidden, shared_i],
                         TensorScope::Text,
                     );
-                    put(
-                        expected,
-                        format!("{p}.mlp.shared_expert_gate.weight"),
-                        Dtype::BF16,
-                        vec![1, hidden],
-                        TensorScope::Text,
-                    );
+                    if moe.shared_gate {
+                        put(
+                            expected,
+                            format!("{p}.mlp.shared_expert_gate.weight"),
+                            Dtype::BF16,
+                            vec![1, hidden],
+                            TensorScope::Text,
+                        );
+                    }
                 }
-                None => {
+                crate::model_spec::FfnKind::Dense => {
                     let intermediate = spec.intermediate as usize;
                     projection(
                         expected,
@@ -383,10 +419,16 @@ impl MappedCheckpoint {
             }
             match layer.mixer {
                 Mixer::FullAttention => {
+                    let q_out = match spec.architecture {
+                        Architecture::Flint => q_width,
+                        Architecture::Qwen35Text
+                        | Architecture::MiniCpmV47
+                        | Architecture::Llama => 2 * q_width,
+                    };
                     projection(
                         expected,
                         format!("{p}.self_attn.q_proj"),
-                        2 * q_width,
+                        q_out,
                         hidden,
                         fp8,
                     );
@@ -417,6 +459,15 @@ impl MappedCheckpoint {
                             format!("{p}.self_attn.{name}.weight"),
                             Dtype::BF16,
                             vec![head_dim],
+                            TensorScope::Text,
+                        );
+                    }
+                    if spec.architecture == Architecture::Flint {
+                        put(
+                            expected,
+                            format!("{p}.self_attn.softmax_offset"),
+                            Dtype::BF16,
+                            vec![spec.q_heads as usize],
                             TensorScope::Text,
                         );
                     }
@@ -703,12 +754,14 @@ impl MappedCheckpoint {
                 .checked_add(t.data().len() as u64)
                 .context("tensor offset overflow")?;
             let layer = name
-                .strip_prefix("model.language_model.layers.")
+                .strip_prefix("model.layers.")
+                .or_else(|| name.strip_prefix("model.language_model.layers."))
                 .and_then(|s| s.split('.').next())
                 .map(str::parse::<u32>)
                 .transpose()?;
             let role = if let Some(layer) = layer {
-                name.strip_prefix(&format!("model.language_model.layers.{layer}."))
+                name.strip_prefix(&format!("model.layers.{layer}."))
+                    .or_else(|| name.strip_prefix(&format!("model.language_model.layers.{layer}.")))
                     .unwrap_or(name)
                     .to_owned()
             } else {

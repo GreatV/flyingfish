@@ -121,6 +121,11 @@ fn visit_slices(
             visit(gate_up)?;
             visit(down)?;
         }
+        ExpertRange::Bf16Separate { gate, up, down } => {
+            visit(gate)?;
+            visit(up)?;
+            visit(down)?;
+        }
         ExpertRange::Fp8 {
             gate,
             up,
@@ -248,6 +253,14 @@ impl DiskReader {
             ) => {
                 read(0, gate_up)?;
                 read(*gate_up_bytes, down)?;
+            }
+            (
+                ExpertLayout::Bf16Separate { matrix_bytes, .. },
+                ExpertRange::Bf16Separate { gate, up, down },
+            ) => {
+                read(0, gate)?;
+                read(*matrix_bytes, up)?;
+                read(*matrix_bytes * 2, down)?;
             }
             (
                 ExpertLayout::Fp8W8a16(slot),
@@ -684,6 +697,7 @@ mod tests {
 
     fn geometry() -> ExpertGeometry {
         ExpertGeometry {
+            first_layer: 0,
             layers: 2,
             experts: 4,
             hidden: 8,

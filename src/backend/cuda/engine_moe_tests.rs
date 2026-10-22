@@ -28,6 +28,7 @@ fn expert_host_reserve_keeps_span_independent_of_cpu_ceiling() -> Result<()> {
         plan::{PlanInputs, Reserves, ServiceCell, ServiceTable, SpanCandidate, select_span},
     };
     let geometry = ExpertGeometry {
+        first_layer: 0,
         layers: 2,
         experts: 16,
         hidden: 32,
@@ -487,15 +488,23 @@ pub(super) fn hybrid_spec() -> Result<crate::model_spec::ModelSpec> {
         experts_per_tok: 4,
         expert_intermediate: 64,
         shared_intermediate: 64,
+        score: crate::model_spec::RouterScore::Softmax,
+        shared_gate: true,
     });
     spec.layers = vec![
         LayerPlan {
             mixer: Mixer::Gdn,
             state_index: 0,
+            rope: false,
+            sliding_window: None,
+            ffn: crate::model_spec::FfnKind::Moe,
         },
         LayerPlan {
             mixer: Mixer::FullAttention,
             state_index: 0,
+            rope: true,
+            sliding_window: None,
+            ffn: crate::model_spec::FfnKind::Moe,
         },
     ];
     Ok(spec)
@@ -664,6 +673,9 @@ impl Engine {
         model_spec.expert_format = Some(match &capacity.layout {
             crate::experts::catalogue::ExpertLayout::Bf16Fused { .. } => {
                 crate::model_spec::ExpertFormat::Bf16
+            }
+            crate::experts::catalogue::ExpertLayout::Bf16Separate { .. } => {
+                crate::model_spec::ExpertFormat::Bf16Separate
             }
             crate::experts::catalogue::ExpertLayout::Fp8W8a16(_) => {
                 crate::model_spec::ExpertFormat::Fp8W8a16
@@ -1356,6 +1368,9 @@ impl TierOracle {
             crate::experts::catalogue::ExpertLayout::Bf16Fused { .. } => {
                 crate::model_spec::ExpertFormat::Bf16
             }
+            crate::experts::catalogue::ExpertLayout::Bf16Separate { .. } => {
+                crate::model_spec::ExpertFormat::Bf16Separate
+            }
             crate::experts::catalogue::ExpertLayout::Fp8W8a16(_) => {
                 crate::model_spec::ExpertFormat::Fp8W8a16
             }
@@ -1616,6 +1631,7 @@ fn direct(engine: &Engine, layer: usize, input: &[bf16], rows: usize) -> Result<
     else {
         anyhow::bail!("dense test FFN");
     };
+    let shared_gate = shared_gate.context("test FFN has no shared gate")?;
     let x = stream.clone_htod(input)?;
     let ids = stream.alloc_zeros::<i32>(rows * k)?;
     let weights = stream.alloc_zeros::<bf16>(rows * k)?;
@@ -1703,6 +1719,7 @@ fn direct(engine: &Engine, layer: usize, input: &[bf16], rows: usize) -> Result<
     let mut y_view = TensorMut(qwen::matrix(&y, stream, 0, rows, h)?);
     let scratch = qwen::scratch(&scratch, stream);
     let geometry = crate::experts::catalogue::ExpertGeometry {
+        first_layer: 0,
         layers: 1,
         experts: slots.valid.shape[0],
         hidden: h as u32,
@@ -1795,6 +1812,7 @@ fn combine_expected(engine: &Engine, contributions: &[bf16], rows: usize) -> Res
     let BoundFfn::Moe { shared_gate, .. } = ffn else {
         anyhow::bail!("dense CPU control FFN");
     };
+    let shared_gate = shared_gate.context("CPU control FFN has no shared gate")?;
     let scale = view(&expected_scale, stream, 0, [rows as u32, 1], [1, 1])?;
     let combine = CombineOps::new(&engine.device.ctx)?;
     combine.shared_scale(stream, x, shared_gate, &mut TensorMut(scale))?;

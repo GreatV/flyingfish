@@ -76,7 +76,7 @@ impl VisionGeometry {
                     ln_eps: crate::backend::cuda::vision::LN_EPS,
                 }
             }
-            crate::model_spec::Architecture::Llama => {
+            crate::model_spec::Architecture::Llama | crate::model_spec::Architecture::Flint => {
                 bail!("vision configuration requires a multimodal architecture")
             }
         };
@@ -1052,7 +1052,7 @@ impl VisionWeights {
                     expected,
                 )
             }
-            Architecture::Llama => {
+            Architecture::Llama | Architecture::Flint => {
                 bail!("vision configuration requires a multimodal architecture")
             }
         };
@@ -2154,7 +2154,9 @@ impl VisionRuntime {
                     crate::vision_input::nearest_position_ids(input.grids, vision.position_side)?;
                 (s.clone_htod(&ids)?, None)
             }
-            Architecture::Llama => bail!("vision configuration requires a multimodal architecture"),
+            Architecture::Llama | Architecture::Flint => {
+                bail!("vision configuration requires a multimodal architecture")
+            }
         };
         let hidden = geometry.hidden() as usize;
         if bilinear.is_some() {
@@ -2211,7 +2213,7 @@ impl VisionRuntime {
                         vision.patch,
                     )?;
                 }
-                Architecture::Llama => {
+                Architecture::Llama | Architecture::Flint => {
                     bail!("vision configuration requires a multimodal architecture")
                 }
             }

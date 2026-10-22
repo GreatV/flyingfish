@@ -85,6 +85,7 @@ fn scratch_sizing_matches_region_math() {
         model_spec::ExpertFormat,
     };
     let geometry = ExpertGeometry {
+        first_layer: 0,
         layers: 40,
         experts: 256,
         hidden: 2048,
