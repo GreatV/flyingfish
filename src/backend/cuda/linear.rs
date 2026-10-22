@@ -407,11 +407,6 @@ impl LayerLinearPlan {
                     matches!(resident, LinearWeightRef::Bf16(_)),
                     "GDN gate projection requires BF16: {role}"
                 );
-                super::blas::Blas::skinny_launch(crate::backend::setup::LinearShape {
-                    rows: crate::linear_plan::MAX_SKINNY_ROWS,
-                    output: prefill.shape[0] as usize,
-                    input: prefill.shape[1] as usize,
-                })?;
                 crate::linear_plan::MAX_SKINNY_ROWS
             } else {
                 0
@@ -436,14 +431,15 @@ impl LayerLinearPlan {
     }
     pub fn prepare(&self, blas: &super::blas::Blas, rows: u32) -> Result<()> {
         for p in self.projections.values() {
-            if rows as usize > p.invariant_rows {
-                blas.prepare_fixed(rows, p.prefill.shape[0], p.prefill.shape[1])?;
-            } else {
+            if p.invariant_rows > 0 {
                 blas.prepare_skinny(crate::backend::setup::LinearShape {
-                    rows: rows as usize,
+                    rows: (rows as usize).min(p.invariant_rows),
                     output: p.prefill.shape[0] as usize,
                     input: p.prefill.shape[1] as usize,
                 })?;
+            }
+            if rows as usize > p.invariant_rows {
+                blas.prepare_fixed(rows, p.prefill.shape[0], p.prefill.shape[1])?;
             }
         }
         Ok(())
@@ -561,6 +557,13 @@ mod tests {
             })
             .collect();
         let input = stream.clone_htod(&values)?;
+        let input_stride = k.next_multiple_of(16 / size_of::<bf16>());
+        let mut serial_values = vec![bf16::ZERO; rows * input_stride];
+        for row in 0..rows {
+            serial_values[row * input_stride..row * input_stride + k]
+                .copy_from_slice(&values[row * k..(row + 1) * k]);
+        }
+        let serial_input = stream.clone_htod(&serial_values)?;
         let serial_stride = n.next_multiple_of(16 / size_of::<bf16>());
         let expected = stream.alloc_zeros::<bf16>(rows * serial_stride)?;
         let canary = bf16::from_bits(0x7fc1);
@@ -578,7 +581,13 @@ mod tests {
                 blas,
                 "projection.weight",
                 ExecutionPhase::Decode,
-                view(&input, stream, row * k, [1, k as u32], [k as u64, 1])?,
+                view(
+                    &serial_input,
+                    stream,
+                    row * input_stride,
+                    [1, k as u32],
+                    [k as u64, 1],
+                )?,
                 &mut TensorMut(view(
                     &expected,
                     stream,
@@ -825,6 +834,30 @@ mod tests {
             "INVARIANT_LINEAR_SUMMARY shapes=9 bf16_shapes=9 fp8_shapes=6 rows=1..16 eager_graph=true defects={defects}"
         );
         ensure!(defects == 0, "invariant linear DEFECT cells={defects}");
+        for k in [128, 130] {
+            let n = 32;
+            let values: Vec<_> = (0..n * k)
+                .map(|i| {
+                    bf16::from_f32(((i * 37 + i / k * 71) % 257) as f32 / 512.0 - 128.0 / 512.0)
+                })
+                .collect();
+            let weight = stream.clone_htod(&values)?;
+            let weight = LinearWeightRef::Bf16(view(
+                &weight,
+                stream,
+                0,
+                [n as u32, k as u32],
+                [k as u64, 1],
+            )?);
+            defects += invariant_rows(device, &blas, &ops, weight, (n, k))?;
+        }
+        println!(
+            "INVARIANT_LINEAR_EVEN_K_SUMMARY shapes=2 rows=1..16 eager_graph=true defects={defects}"
+        );
+        ensure!(
+            defects == 0,
+            "even-K invariant linear DEFECT cells={defects}"
+        );
         Ok(())
     }
 

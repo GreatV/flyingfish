@@ -545,7 +545,9 @@ impl Blas {
         input: usize,
         algo_index: u32,
     ) -> Result<()> {
-        if (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&rows) && input.is_multiple_of(256) {
+        if (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&rows)
+            && (input.is_multiple_of(256) || rows <= self.invariant_rows)
+        {
             self.prepare_skinny(LinearShape {
                 rows,
                 output,
@@ -726,34 +728,41 @@ impl Blas {
         if let std::collections::btree_map::Entry::Vacant(entry) =
             plans.entry((shape.output, shape.input))
         {
-            let mut launch = Self::skinny_launch(shape)?;
             let bytes = shape
                 .output
                 .checked_mul(shape.input)
                 .and_then(|n| n.checked_mul(size_of::<bf16>()))
                 .context("skinny weight byte extent overflow")?;
             let tiny = shape.output <= 16 * 4
-                && (launch.grid_dim.0 as usize) < self.skinny_device.0
+                && shape.output.div_ceil(16) < self.skinny_device.0
                 && bytes <= self.skinny_device.1;
-            if tiny {
-                launch.grid_dim = (shape.output as u32, 1, 1);
-                launch.shared_mem_bytes = 4 * size_of::<f32>() as u32;
-            }
-            entry.insert((launch, tiny));
+            entry.insert((Self::skinny_launch(shape, tiny)?, tiny));
         }
         Ok(())
     }
-    pub(super) fn skinny_launch(shape: LinearShape) -> Result<LaunchConfig> {
+    pub(super) fn skinny_launch(shape: LinearShape, tiny: bool) -> Result<LaunchConfig> {
+        checked_dims(shape.rows, shape.output, shape.input)?;
         ensure!(
             (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&shape.rows)
-                && shape.input.is_multiple_of(256),
+                && shape.input.is_multiple_of(if tiny { 2 } else { 256 }),
             "unsupported skinny GEMM shape: {shape:?}"
         );
-        checked_dims(shape.rows, shape.output, shape.input)?;
         Ok(LaunchConfig {
-            grid_dim: (shape.output.div_ceil(16) as u32, 1, 1),
+            grid_dim: (
+                if tiny {
+                    shape.output
+                } else {
+                    shape.output.div_ceil(16)
+                } as u32,
+                1,
+                1,
+            ),
             block_dim: (128, 1, 1),
-            shared_mem_bytes: 40960,
+            shared_mem_bytes: if tiny {
+                4 * size_of::<f32>() as u32
+            } else {
+                40960
+            },
         })
     }
 
@@ -940,7 +949,9 @@ impl Blas {
             "invalid fixed linear dimensions"
         );
         let key = (rows as usize, output as usize, input as usize, 0);
-        if (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&key.0) && input.is_multiple_of(256) {
+        if (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&key.0)
+            && (input.is_multiple_of(256) || key.0 <= self.invariant_rows)
+        {
             self.prepare_skinny(LinearShape {
                 rows: key.0,
                 output: key.1,
@@ -1353,5 +1364,52 @@ mod tests {
         assert!(checked_dims(1, (i32::MAX as usize) + 1, 17408).is_err());
         assert!(checked_dims(1, 5120, (i32::MAX as usize) + 1).is_err());
         assert!(checked_dims(0, 5120, 17408).is_err());
+        for (output, input, tiny) in [
+            (32, 2, true),
+            (32, 128, true),
+            (32, 130, true),
+            (64, 130, true),
+            (32, 2048, true),
+            (48, 5120, true),
+            (65, 256, false),
+        ] {
+            for rows in [1, 16] {
+                let launch = Blas::skinny_launch(
+                    LinearShape {
+                        rows,
+                        output,
+                        input,
+                    },
+                    tiny,
+                )
+                .expect("supported skinny shape");
+                assert_eq!(
+                    launch.grid_dim.0 as usize,
+                    if tiny { output } else { output.div_ceil(16) }
+                );
+                assert_eq!(launch.shared_mem_bytes, if tiny { 16 } else { 40960 });
+            }
+        }
+        for (rows, output, input, tiny) in [
+            (1, 32, 129, true),
+            (1, 65, 128, false),
+            (1, 32, 128, false),
+            (0, 32, 128, true),
+            (17, 32, 128, true),
+            (1, 0, 128, true),
+            (1, 32, 0, true),
+        ] {
+            assert!(
+                Blas::skinny_launch(
+                    LinearShape {
+                        rows,
+                        output,
+                        input
+                    },
+                    tiny
+                )
+                .is_err()
+            );
+        }
     }
 }
