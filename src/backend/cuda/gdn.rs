@@ -2729,8 +2729,8 @@ mod tests {
             }
         }
         println!(
-            "GDN_GATE_PROJECTION_PLAN {}",
-            serde_json::json!({"weight":shape,"bound_plans":blas.bound_plan_receipt()?})
+            "GDN_GATE_PROJECTION_BINDING {}",
+            serde_json::json!({"weight":shape,"fixed_lt_plans":blas.fixed_plan_count()})
         );
         Ok(defects)
     }
