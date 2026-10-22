@@ -281,6 +281,7 @@ impl crate::linear_plan::LayerDequantPlan {
 struct BoundProjection {
     resident: LinearWeightRef,
     prefill: Tensor<bf16, 2>,
+    invariant_rows: usize,
 }
 /// Setup-bound views for a layer. Engine retains catalog/arena storage; run does
 /// not construct tensor names, allocate scratch or invoke a Lt heuristic.
@@ -397,9 +398,31 @@ impl LayerLinearPlan {
                     w
                 }
             };
+            let role = &name[prefix.len()..];
+            let invariant_rows = if matches!(
+                role,
+                "linear_attn.in_proj_a.weight" | "linear_attn.in_proj_b.weight"
+            ) {
+                ensure!(
+                    matches!(resident, LinearWeightRef::Bf16(_)),
+                    "GDN gate projection requires BF16: {role}"
+                );
+                super::blas::Blas::skinny_launch(crate::backend::setup::LinearShape {
+                    rows: crate::linear_plan::MAX_SKINNY_ROWS,
+                    output: prefill.shape[0] as usize,
+                    input: prefill.shape[1] as usize,
+                })?;
+                crate::linear_plan::MAX_SKINNY_ROWS
+            } else {
+                0
+            };
             projections.insert(
-                name[prefix.len()..].to_owned(),
-                BoundProjection { resident, prefill },
+                role.to_owned(),
+                BoundProjection {
+                    resident,
+                    prefill,
+                    invariant_rows,
+                },
             );
         }
         ensure!(
@@ -413,7 +436,9 @@ impl LayerLinearPlan {
     }
     pub fn prepare(&self, blas: &super::blas::Blas, rows: u32) -> Result<()> {
         for p in self.projections.values() {
-            blas.prepare_fixed(rows, p.prefill.shape[0], p.prefill.shape[1])?;
+            if rows as usize > p.invariant_rows {
+                blas.prepare_fixed(rows, p.prefill.shape[0], p.prefill.shape[1])?;
+            }
         }
         Ok(())
     }
@@ -455,7 +480,7 @@ impl LayerLinearPlan {
         } else {
             p.resident
         };
-        blas.linear_typed(phase, weight, x, y)
+        blas.linear_typed_bound(phase, weight, x, y, p.invariant_rows)
     }
 }
 
@@ -517,6 +542,7 @@ mod tests {
                 BoundProjection {
                     resident: weight,
                     prefill,
+                    invariant_rows: 0,
                 },
             )]
             .into(),
@@ -1353,6 +1379,7 @@ mod tests {
                     BoundProjection {
                         resident: LinearWeightRef::Bf16(weight),
                         prefill: weight,
+                        invariant_rows: 0,
                     },
                 );
                 ptr += bytes;

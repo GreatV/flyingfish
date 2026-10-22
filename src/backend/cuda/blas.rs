@@ -912,6 +912,16 @@ impl Blas {
         x: super::contracts::Tensor<bf16, 2>,
         y: &mut super::contracts::TensorMut<bf16, 2>,
     ) -> Result<()> {
+        self.linear_typed_bound(phase, weight, x, y, 0)
+    }
+    pub(crate) fn linear_typed_bound(
+        &self,
+        phase: crate::op_contract::ExecutionPhase,
+        weight: super::linear::LinearWeightRef,
+        x: super::contracts::Tensor<bf16, 2>,
+        y: &mut super::contracts::TensorMut<bf16, 2>,
+        invariant_rows: usize,
+    ) -> Result<()> {
         use super::linear::LinearWeightRef;
         if phase == crate::op_contract::ExecutionPhase::Decode {
             ensure!(x.shape[0] == 1, "Decode requires M1");
@@ -940,7 +950,7 @@ impl Blas {
                     w.stride == [u64::from(w.shape[1]), 1],
                     "BF16 linear requires row-major weight"
                 );
-                if (1..=self.invariant_rows).contains(&(x.shape[0] as usize)) {
+                if (1..=self.invariant_rows.max(invariant_rows)).contains(&(x.shape[0] as usize)) {
                     return self.skinny_raw(
                         w.ptr,
                         x.ptr,
