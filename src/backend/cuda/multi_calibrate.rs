@@ -17,7 +17,6 @@ use cudarc::driver::{PushKernelArg, sys};
 use half::bf16;
 use serde::{Deserialize, Serialize};
 use std::{
-    io::Write,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -413,14 +412,7 @@ fn load_mask(
         );
         let cache = measure(d, ops, c, key, shape, tree, closure)?;
         check(&cache, &cache.key, shape, tree, budget(d, c)?)?;
-        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
-        f.write_all(&serde_json::to_vec_pretty(&cache)?)?;
-        f.sync_all()?;
-        std::fs::rename(temporary, &path)?;
+        super::closure::write_cache(&path, &cache)?;
         (cache, false)
     };
     Ok(Calibrated { cache, hit, path })

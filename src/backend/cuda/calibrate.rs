@@ -18,7 +18,7 @@ use std::{
     collections::hash_map::DefaultHasher,
     fs::File,
     hash::Hasher,
-    io::{Read, Write},
+    io::Read,
     path::{Component, Path, PathBuf},
     sync::OnceLock,
     time::{Duration, Instant},
@@ -326,27 +326,13 @@ pub(super) fn load(
         let cache =
             measure(d, ops, c, key, capacity, closure).context("measure attention candidates")?;
         check(&cache, &cache.key, capacity)?;
-        let temp = path.with_extension(format!("tmp-{}", std::process::id()));
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
-        file.write_all(&serde_json::to_vec_pretty(&cache)?)?;
-        file.sync_all()?;
-        std::fs::rename(temp, &path)?;
+        super::closure::write_cache(&path, &cache)?;
         (cache, false)
     };
     Ok(Calibrated { cache, hit, path })
 }
 
-pub(super) fn percentile(values: &[f64], q: f64) -> f64 {
-    let mut v = values.to_vec();
-    v.sort_by(f64::total_cmp);
-    let k = (v.len() - 1) as f64 * q;
-    let lo = k.floor() as usize;
-    let hi = k.ceil() as usize;
-    v[lo] + (v[hi] - v[lo]) * (k - lo as f64)
-}
+pub(super) use crate::verify::percentile;
 
 /// Uniform-attention max |actual − expected| and max error / bound over elements.
 /// Bound: a + half_ulp_bf16(|expected| + a), a = γ_{chunk + ⌈keys/chunk⌉}(2^-23)·max|V| for the
@@ -1259,14 +1245,7 @@ pub(super) fn load_experts(
             service,
         };
         cache.check(&key, &host, &geometry, slot_bytes)?;
-        let temp = path.with_extension(format!("tmp-{}", std::process::id()));
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
-        file.write_all(&serde_json::to_vec_pretty(&cache)?)?;
-        file.sync_all()?;
-        std::fs::rename(temp, &path)?;
+        super::closure::write_cache(&path, &cache)?;
         (cache, false)
     };
     let measured_engines = u32::try_from(

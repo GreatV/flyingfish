@@ -19,18 +19,18 @@
 // max_rows; segments with no live rows exit without writing.
 #include <cuda_bf16.h>
 #include <cstdint>
-#include "kv_cache.cuh"
-
-namespace tcmqa_d256 {
-
-using bf16 = __nv_bfloat16;
-
 #ifndef ATTENTION_Q_HEADS
 #define ATTENTION_Q_HEADS 24
 #endif
 #ifndef ATTENTION_KV_HEADS
 #define ATTENTION_KV_HEADS 4
 #endif
+#include "kv_cache.cuh"
+
+namespace tcmqa_d256 {
+
+using bf16 = __nv_bfloat16;
+
 constexpr int HQ      = ATTENTION_Q_HEADS;
 constexpr int HKV     = ATTENTION_KV_HEADS;
 constexpr int GQA     = HQ / HKV;

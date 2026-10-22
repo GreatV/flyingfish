@@ -57,3 +57,4 @@ jobs:
           key: cuda-13.2-sm86-sm89
           env-vars: CARGO CC CFLAGS CXX CMAKE RUST CUDA
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --workspace --all-targets

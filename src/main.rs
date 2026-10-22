@@ -25,9 +25,19 @@ struct Cli {
     device: usize,
     #[arg(long, default_value_t = 4096, global = true)]
     capacity: usize,
-    #[arg(long, global = true, default_value_t = 958.0)]
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 958.0,
+        help = "DRAM reference denominator in GB/s; default is an RTX 4090 reference value"
+    )]
     dram_gb_s: f64,
-    #[arg(long, global = true, default_value_t = 166.06)]
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 166.06,
+        help = "GEMM reference denominator in TFLOP/s; default is an RTX 4090 reference value"
+    )]
     gemm_tflops: f64,
     #[arg(
         long,

@@ -35,6 +35,7 @@ __device__ __forceinline__ __nv_bfloat16 kv_load(KvCacheView b, bool is_k,
   return __float2bfloat16_rn(x);
 }
 
+#if ATTENTION_KV_HEADS == 4
 __device__ __forceinline__ float kv_source(KvCacheView b, bool is_k, int h,
                                           int pos, int d, const __nv_bfloat16* full) {
   const int slot = full ? pos : kv_slot(pos,b.ring);
@@ -126,3 +127,4 @@ extern "C" __global__ void kv_cache_dequant(KvCacheView b,__nv_bfloat16* k,
   const size_t dest=((size_t)h*b.capacity+pos)*256+d;
   k[dest]=kv_load(b,true,h,pos,d);v[dest]=kv_load(b,false,h,pos,d);
 }
+#endif

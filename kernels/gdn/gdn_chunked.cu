@@ -181,16 +181,6 @@ void gdn_chunked_core_t(
         }
         __syncthreads();
 
-#ifdef GDN_RAW_V
-        // v_new from raw V instead of w = T(beta.*V).
-        for (int idx = tid; idx < GDN_CHUNK * VW; idx += GDN_THREADS) {
-            const int r = idx / VW, j = idx - r * VW;
-            float acc = 0.0f;
-            for (int t = 0; t <= r; ++t) acc = fmaf(sT[r * GDN_CHUNK + t], sVb[t * VW + j], acc);
-            sKbS[r * VW + j] = sVb[r * VW + j] - acc;   // raw v, not w
-        }
-        __syncthreads();
-#else
         // v_new = w - T @ kbS, in place in sKbS
         for (int idx = tid; idx < GDN_CHUNK * VW; idx += GDN_THREADS) {
             const int r = idx / VW, j = idx - r * VW;
@@ -199,7 +189,6 @@ void gdn_chunked_core_t(
             sKbS[r * VW + j] -= acc;
         }
         __syncthreads();
-#endif
 
         // o = (q.e^G) @ S + [tril(q k^T .* L)] @ v_new
         for (int r = 0; r < GDN_CHUNK; ++r) {

@@ -1,4 +1,4 @@
-use super::cubin;
+use super::{contracts::no_overlap, cubin};
 use anyhow::Result;
 use cudarc::driver::{CudaContext, CudaFunction, LaunchConfig};
 use std::sync::Arc;
@@ -135,16 +135,6 @@ impl CommonOpsRef {
         })
     }
 }
-fn no_overlap<T: Copy, U: Copy, const R: usize, const S: usize>(
-    a: &Tensor<T, R>,
-    b: &Tensor<U, S>,
-) -> Result<()> {
-    ensure!(
-        a.ptr + a.span_bytes <= b.ptr || b.ptr + b.span_bytes <= a.ptr,
-        "operator tensors overlap"
-    );
-    Ok(())
-}
 fn validate_io(x: &Tensor<bf16, 3>, y: &Tensor<bf16, 3>, rows: RowDomain) -> Result<()> {
     x.validate()?;
     y.validate()?;
@@ -157,7 +147,7 @@ fn validate_io(x: &Tensor<bf16, 3>, y: &Tensor<bf16, 3>, rows: RowDomain) -> Res
             "partial in-place alias"
         );
     } else {
-        no_overlap(x, y)?;
+        no_overlap(x, y, "operator input", "operator output")?;
     }
     for view in [x, y] {
         ensure!(
@@ -254,10 +244,10 @@ impl Ops {
             (residual, capture.0),
             (y.0, capture.0),
         ] {
-            no_overlap(&a, &b)?;
+            no_overlap(&a, &b, "operator input", "operator output")?;
         }
         for tensor in [x.0, residual, y.0, capture.0] {
-            no_overlap(&weight, &tensor)?;
+            no_overlap(&weight, &tensor, "operator input", "operator output")?;
         }
         let (meta, base, rows) = if let Some(domain) = domain {
             domain.validate(x.0.shape[0])?;
@@ -409,9 +399,9 @@ impl NormOps {
             matches!(mode, RmsMode::ZeroCentered),
             "residual norm requires zero-centered RMS semantics"
         );
-        no_overlap(&x.0, &y.0)?;
-        no_overlap(&z, &x.0)?;
-        no_overlap(&weight, &x.0)?;
+        no_overlap(&x.0, &y.0, "operator input", "operator output")?;
+        no_overlap(&z, &x.0, "operator input", "operator output")?;
+        no_overlap(&weight, &x.0, "operator input", "operator output")?;
         self.launch(
             stream,
             NormLaunch {
@@ -495,7 +485,7 @@ impl NormOps {
                 w.shape == [x.shape[2]] && w.stride == [1],
                 "norm weight layout mismatch"
             );
-            no_overlap(&w, &y.0)?;
+            no_overlap(&w, &y.0, "operator input", "operator output")?;
             wp = w.ptr;
         }
         let (zp, zs) = if let Some(z) = z {
@@ -507,7 +497,7 @@ impl NormOps {
                     && z.stride[0] >= u64::from(z.shape[1]) * z.stride[1],
                 "overlapping/unsupported tensor strides"
             );
-            no_overlap(&z, &y.0)?;
+            no_overlap(&z, &y.0, "operator input", "operator output")?;
             (z.ptr, z.stride)
         } else {
             (0, [0; 3])
@@ -579,8 +569,8 @@ impl GateOps {
         validate_io(&x, &y.0, rows)?;
         up.validate()?;
         ensure!(up.shape == x.shape, "SwiGLU shape mismatch");
-        no_overlap(&x, &up)?;
-        no_overlap(&up, &y.0)?;
+        no_overlap(&x, &up, "operator input", "operator output")?;
+        no_overlap(&up, &y.0, "operator input", "operator output")?;
         let width = x.shape[2];
         ensure!(
             x.shape[1] == 1
@@ -642,7 +632,7 @@ impl GateOps {
         let (gp, gs) = if let Some(g) = gate {
             g.validate()?;
             ensure!(g.shape == x.shape, "gate shape mismatch");
-            no_overlap(&g, &y.0)?;
+            no_overlap(&g, &y.0, "operator input", "operator output")?;
             (g.ptr, g.stride)
         } else {
             (0, [0; 3])
@@ -705,8 +695,8 @@ impl GateOps {
                 t.shape == [heads] && t.stride == [1],
                 "GDN gate weight mismatch"
             );
-            no_overlap(t, &beta.0)?;
-            no_overlap(t, &g.0)?;
+            no_overlap(t, &beta.0, "operator input", "operator output")?;
+            no_overlap(t, &g.0, "operator input", "operator output")?;
         }
         g.0.validate()?;
         ensure!(
@@ -714,10 +704,10 @@ impl GateOps {
             "GDN g layout mismatch"
         );
         for t in [&a, &b] {
-            no_overlap(t, &beta.0)?;
-            no_overlap(t, &g.0)?;
+            no_overlap(t, &beta.0, "operator input", "operator output")?;
+            no_overlap(t, &g.0, "operator input", "operator output")?;
         }
-        no_overlap(&beta.0, &g.0)?;
+        no_overlap(&beta.0, &g.0, "operator input", "operator output")?;
         let blocks = (u64::from(rows.row_capacity) * u64::from(heads))
             .div_ceil(256)
             .min(65535);
@@ -760,7 +750,7 @@ fn validate_dense_io(x: &Tensor<bf16, 3>, y: &Tensor<bf16, 3>) -> Result<()> {
             "partial dense alias"
         );
     } else {
-        no_overlap(x, y)?;
+        no_overlap(x, y, "operator input", "operator output")?;
     }
     for t in [x, y] {
         ensure!(
@@ -791,7 +781,7 @@ impl NormOps {
                 t.shape == [x.shape[2]] && t.stride == [1],
                 "LayerNorm affine shape mismatch"
             );
-            no_overlap(&t, &y.0)?;
+            no_overlap(&t, &y.0, "operator input", "operator output")?;
         }
         let blocks = x.shape[0]
             .checked_mul(x.shape[1])

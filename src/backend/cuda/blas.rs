@@ -632,9 +632,6 @@ impl Blas {
             match &choice.implementation {
                 LinearImpl::Cublas | LinearImpl::CublasLt(_) => algo = *index,
                 LinearImpl::Skinny => return self.skinny(w, x, y, shape),
-                LinearImpl::Candidate(name) => {
-                    anyhow::bail!("linear candidate {name} has not been registered for {shape:?}")
-                }
             }
         }
         self.prepare_with(rows, output, input, algo)?;
@@ -661,9 +658,6 @@ impl Blas {
                             self.cublas(w, x, &mut y, shape, index)
                         }
                         LinearImpl::Skinny => self.skinny(w, x, &mut y, shape),
-                        LinearImpl::Candidate(name) => {
-                            anyhow::bail!("unknown linear candidate {name}")
-                        }
                     }
                 })?;
             let index = algorithm_index(&candidates, &choice.implementation)?;

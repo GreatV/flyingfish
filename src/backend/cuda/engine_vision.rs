@@ -3,7 +3,7 @@ use crate::{
     backend::cuda::{
         Device,
         blas::Blas,
-        contracts::{Scratch, Tensor, TensorMut},
+        contracts::{Scratch, Tensor, TensorMut, dense_layout},
         cubin,
         linear::{LinearBiasMode, LinearWeightRef, disjoint},
         ops::{CommonOpsRef, GeluMode, grid},
@@ -113,14 +113,7 @@ fn dense<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
     stream: &Arc<CudaStream>,
     shape: [u32; R],
 ) -> Result<Tensor<T, R>> {
-    let mut stride = [1u64; R];
-    let mut count = 1u64;
-    for i in (0..R).rev() {
-        stride[i] = count;
-        count = count
-            .checked_mul(u64::from(shape[i]))
-            .context("vision view extent overflow")?;
-    }
+    let (stride, count) = dense_layout(shape)?;
     ensure!(
         count == buffer.len() as u64,
         "vision view/allocation size mismatch: view={count} allocated={}",
@@ -145,14 +138,7 @@ fn dense_at<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
     shape: [u32; R],
     offset: usize,
 ) -> Result<Tensor<T, R>> {
-    let mut stride = [1u64; R];
-    let mut count = 1u64;
-    for i in (0..R).rev() {
-        stride[i] = count;
-        count = count
-            .checked_mul(u64::from(shape[i]))
-            .context("vision view extent overflow")?;
-    }
+    let (stride, count) = dense_layout(shape)?;
     let end = (offset as u64)
         .checked_add(count)
         .context("vision view offset overflow")?;
@@ -178,10 +164,7 @@ fn stage_view<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
     stream: &Arc<CudaStream>,
     shape: [u32; R],
 ) -> Result<Tensor<T, R>> {
-    let count = shape
-        .iter()
-        .try_fold(1u64, |acc, &n| acc.checked_mul(u64::from(n)))
-        .context("vision view extent overflow")?;
+    let (_, count) = dense_layout(shape)?;
     if count == buffer.len() as u64 {
         dense(buffer, stream, shape)
     } else {

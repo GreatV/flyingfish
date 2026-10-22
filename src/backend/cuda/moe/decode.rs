@@ -2,7 +2,7 @@
 //! slot tables plus the shared expert, rows 1..8, writing per-(row, choice)
 //! BF16 contributions, the ungated shared row and the per-assignment done
 //! bits consumed by the shared combine op.
-use crate::backend::cuda::contracts::{Scratch, Tensor, TensorMut};
+use crate::backend::cuda::contracts::{Scratch, Tensor, TensorMut, spans_disjoint};
 use crate::backend::cuda::cubin;
 #[cfg(test)]
 use crate::backend::cuda::moe::combine::{CombineOps, MoeCombine};
@@ -54,10 +54,6 @@ pub(super) struct DecodeDims {
     top_k: u32,
     hidden: u32,
     inter: u32,
-}
-
-fn spans_disjoint(a_ptr: u64, a_bytes: u64, b_ptr: u64, b_bytes: u64) -> bool {
-    a_ptr + a_bytes <= b_ptr || b_ptr + b_bytes <= a_ptr
 }
 
 pub(super) fn validate(input: &MoeDecode<'_>, scratch: &Scratch) -> Result<DecodeDims> {
@@ -184,22 +180,22 @@ pub(super) fn validate(input: &MoeDecode<'_>, scratch: &Scratch) -> Result<Decod
             input.x.span_bytes,
             shared_out.ptr,
             shared_out.span_bytes
-        ) && spans_disjoint(
+        )? && spans_disjoint(
             input.x.ptr,
             input.x.span_bytes,
             input.contributions.ptr,
             input.contributions.span_bytes
-        ) && spans_disjoint(
+        )? && spans_disjoint(
             shared_out.ptr,
             shared_out.span_bytes,
             input.contributions.ptr,
             input.contributions.span_bytes
-        ) && spans_disjoint(
+        )? && spans_disjoint(
             done.ptr,
             done.span_bytes,
             input.contributions.ptr,
             input.contributions.span_bytes
-        ),
+        )?,
         "decode contributions/shared_out overlap x/shared_out/done (contributions ptr {:#x} bytes {}, x ptr {:#x}, shared_out ptr {:#x}, done ptr {:#x})",
         input.contributions.ptr,
         input.contributions.span_bytes,
@@ -218,7 +214,7 @@ pub(super) fn validate(input: &MoeDecode<'_>, scratch: &Scratch) -> Result<Decod
         ("done", done.ptr, done.span_bytes),
     ] {
         ensure!(
-            spans_disjoint(scratch.ptr, scratch.bytes, ptr, bytes),
+            spans_disjoint(scratch.ptr, scratch.bytes, ptr, bytes)?,
             "decode scratch overlaps {name} (scratch ptr {:#x} bytes {}, {name} ptr {ptr:#x} bytes {bytes})",
             scratch.ptr,
             scratch.bytes

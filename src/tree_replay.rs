@@ -47,18 +47,22 @@ struct Round {
     commit_logits_row: usize,
 }
 
-pub fn sha256(path: &Path) -> Result<String> {
-    let result = Command::new("sha256sum").arg(path).output()?;
-    ensure!(
-        result.status.success(),
-        "sha256sum failed for {}",
-        path.display()
-    );
-    Ok(String::from_utf8(result.stdout)?
-        .split_whitespace()
-        .next()
-        .context("SHA output empty")?
-        .to_owned())
+impl Request {
+    fn fixture(&self, plan: &Path) -> Result<PathBuf> {
+        let fixture = if self.fixture_file.is_absolute() {
+            self.fixture_file.clone()
+        } else {
+            plan.parent()
+                .unwrap_or(Path::new("."))
+                .join(&self.fixture_file)
+        }
+        .canonicalize()?;
+        ensure!(
+            crate::prefix_state::file_sha256(&fixture)? == self.fixture_sha256,
+            "tree fixture SHA256 mismatch"
+        );
+        Ok(fixture)
+    }
 }
 
 fn ids(t: &mut Tensors, name: String, values: &[u32]) -> Result<()> {
@@ -89,18 +93,7 @@ pub fn run(target: &Path, draft: &Path, plan: &Path, dump: &Path, options: &Opti
         request.schema == "m6-replay-request-v1",
         "unsupported tree request schema"
     );
-    let fixture = if request.fixture_file.is_absolute() {
-        request.fixture_file.clone()
-    } else {
-        plan.parent()
-            .unwrap_or(Path::new("."))
-            .join(&request.fixture_file)
-    }
-    .canonicalize()?;
-    ensure!(
-        sha256(&fixture)? == request.fixture_sha256,
-        "tree fixture SHA256 mismatch"
-    );
+    let fixture = request.fixture(plan)?;
     ensure!(
         dump.file_name() == fixture.file_name(),
         "tree dump must retain fixture filename"
@@ -330,7 +323,6 @@ pub fn run(target: &Path, draft: &Path, plan: &Path, dump: &Path, options: &Opti
     );
     metadata.insert("fixture_file".into(), fixture.display().to_string());
     metadata.insert("fixture_sha256".into(), request.fixture_sha256);
-    metadata.insert("ff_sha256".into(), sha256(&std::env::current_exe()?)?);
     metadata.insert("engine_budget".into(), request.engine_budget.to_string());
     metadata.insert("spec_graph".into(), options.backend.spec_graph.to_string());
     let date = Command::new("date")
@@ -343,4 +335,43 @@ pub fn run(target: &Path, draft: &Path, plan: &Path, dump: &Path, options: &Opti
     );
     tensors.save_new(dump, metadata)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixture_integrity_rejects_altered_input() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "flyingfish-replay-fixture-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root)?;
+        let result = (|| -> Result<()> {
+            let fixture = root.join("fixture.safetensors");
+            let original = b"qualified fixture";
+            std::fs::write(&fixture, original)?;
+            let request: Request = serde_json::from_value(serde_json::json!({
+                "schema":"m6-replay-request-v1", "fixture_file":"fixture.safetensors",
+                "fixture_sha256":crate::prefix_state::sha256(original),
+                "prompt_id":"fixture", "fixture_budget":16, "engine_budget":16,
+                "vocab_size":32, "hidden_size":16, "input_ids":[1],
+                "target_layer_ids":[1,10,20,30,39], "rounds":[]
+            }))?;
+            assert_eq!(
+                request.fixture(&root.join("request.json"))?,
+                fixture.canonicalize()?
+            );
+            std::fs::write(&fixture, b"qualifiee fixture")?;
+            assert!(request.fixture(&root.join("request.json")).is_err());
+            eprintln!("PASS replay_fixture_integrity original=accepted altered=rejected");
+            Ok(())
+        })();
+        std::fs::remove_dir_all(root)?;
+        result
+    }
 }

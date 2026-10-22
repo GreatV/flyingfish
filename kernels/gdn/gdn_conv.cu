@@ -60,26 +60,12 @@ __device__ __forceinline__ void gdn_conv_impl(
         #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const int sl = lr - 3 + j;               // LOCAL row of tap j
-// Negative-control build; never defined by build.rs.
-#ifdef GDN_ABS_ROWS
-            // Absolute-row indexing; fails every prefix != 0 case.
-            const int s = prefix + sl;
-            const float x = (s < prefix)
-                ? history[ch * 3 + (s - prefix + 3)]
-                : __bfloat162float(qkv[(size_t)s * conv_dim + ch]);
-#else
             // sl < 0 -> the row is in history, at index sl - (-3) = sl + 3
             const float x = (sl < 0)
                 ? history[ch * 3 + (sl + 3)]
                 : __bfloat162float(qkv[(size_t)sl * conv_dim + ch]);
-#endif
             acc = fmaf(x, wgt[j], acc);
         }
-// Negative-control build; never defined by build.rs.
-#ifdef GDN_ABS_ROWS
-        const __nv_bfloat16 vis = __float2bfloat16_rn(acc);
-        out[(size_t)(prefix + lr) * conv_dim + ch] = __float2bfloat16_rn(silu(__bfloat162float(vis)));
-#else
         const __nv_bfloat16 vis = __float2bfloat16_rn(acc);   // the visible BF16 cast
         const __nv_bfloat16 value = __float2bfloat16_rn(silu(__bfloat162float(vis)));
         out[(size_t)lr * conv_dim + ch] = value;
@@ -111,7 +97,6 @@ __device__ __forceinline__ void gdn_conv_impl(
                 __syncthreads();
             }
         }
-#endif
     }
 }
 
@@ -172,17 +157,9 @@ extern "C" __global__ void gdn_conv_hist_update(
     for (int j = 0; j < 3; ++j) {
         const int idx = valid_rows + j;             // index into (history ++ qkv)
         // qkv is this call's [M, conv_dim] buffer; its row is the local index idx-3.
-// Negative-control build; never defined by build.rs.
-#ifdef GDN_ABS_ROWS
-        // Absolute-row indexing.
-        history[ch * 3 + j] = (idx < 3)
-            ? history[ch * 3 + idx]
-            : __bfloat162float(qkv[(size_t)(prefix + idx - 3) * conv_dim + ch]);
-#else
         history[ch * 3 + j] = (idx < 3)
             ? history[ch * 3 + idx]
             : __bfloat162float(qkv[(size_t)(idx - 3) * conv_dim + ch]);
-#endif
     }
 }
 

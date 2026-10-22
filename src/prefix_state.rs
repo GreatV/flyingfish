@@ -82,7 +82,7 @@ impl PrefixLogitsCache {
     }
 }
 
-fn file_sha256(path: &Path) -> Result<String> {
+pub(crate) fn file_sha256(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("open identity file {}", path.display()))?;
     let mut h = Sha256::new();

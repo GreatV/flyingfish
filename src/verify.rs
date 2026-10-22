@@ -40,7 +40,7 @@ struct SystemRule {
     max: Vec<f64>,
 }
 
-fn percentile(values: &[f64], q: f64) -> f64 {
+pub(crate) fn percentile(values: &[f64], q: f64) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
     let index = q * (sorted.len() - 1) as f64;

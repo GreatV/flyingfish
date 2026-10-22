@@ -2088,40 +2088,6 @@ impl Engine {
         Ok(())
     }
 
-    /// Destroys resident state before a prefix restore; not a cache eviction API.
-    #[doc(hidden)]
-    pub fn poison_state_for_prefix_e1(&mut self) -> Result<()> {
-        self.device.stream.synchronize()?;
-        for kv in &mut self.state.kv {
-            self.device.stream.memset_zeros(&mut kv.k)?;
-            self.device.stream.memset_zeros(&mut kv.v)?;
-            if let Some(c) = &mut kv.compact {
-                self.device.stream.memset_zeros(&mut c.k_code)?;
-                self.device.stream.memset_zeros(&mut c.v_code)?;
-                self.device.stream.memset_zeros(&mut c.k_stats)?;
-                self.device.stream.memset_zeros(&mut c.v_stats)?;
-                self.device.stream.memset_zeros(&mut c.cursor)?;
-            }
-        }
-        self.state.reset(&self.device.stream)?;
-        self.reset_qwen_positions()?;
-        self.device
-            .stream
-            .memcpy_htod(&[0i32], &mut self.work.position)?;
-        self.device
-            .stream
-            .memcpy_htod(&[1i32], &mut self.work.length)?;
-        self.set_token(0)?;
-        self.position = 0;
-        self.logits_cache.invalidate();
-        self.committed_prefix_ids.clear();
-        self.pending_token = Some(0);
-        self.resident_ids_len = 0;
-        self.last_input_kind = None;
-        self.device.stream.synchronize()?;
-        Ok(())
-    }
-
     pub fn save_text_prefix(
         &mut self,
         request: TextPrefixSaveRequest<'_>,

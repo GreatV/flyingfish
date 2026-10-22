@@ -1,5 +1,5 @@
 //! Shared helpers for the GPU-gate tests.
-use crate::backend::cuda::contracts::{Tensor, TensorMut};
+use crate::backend::cuda::contracts::{Tensor, TensorMut, dense_layout};
 use anyhow::Result;
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DeviceRepr, ValidAsZeroBits};
 use std::sync::Arc;
@@ -59,7 +59,8 @@ pub(crate) fn dense<T: DeviceRepr + Copy>(
     rows: u32,
     cols: u32,
 ) -> Result<Tensor<T, 2>> {
-    view(b, s, [rows, cols], [u64::from(cols), 1])
+    let (stride, _) = dense_layout([rows, cols])?;
+    view(b, s, [rows, cols], stride)
 }
 
 pub(crate) fn dense_mut<T: DeviceRepr + Copy>(
@@ -68,7 +69,8 @@ pub(crate) fn dense_mut<T: DeviceRepr + Copy>(
     rows: u32,
     cols: u32,
 ) -> Result<TensorMut<T, 2>> {
-    mut_view(b, s, [rows, cols], [u64::from(cols), 1])
+    let (stride, _) = dense_layout([rows, cols])?;
+    mut_view(b, s, [rows, cols], stride)
 }
 
 /// Device slot table: `[experts]` device addresses of each expert's weight
