@@ -44,6 +44,8 @@ const MAX_GROUPS: usize = MAX_EXPERTS + 2;
 /// Caller-owned contribution/done buffers survive cohorts; inputs stay immutable until stream completion.
 #[derive(Debug)]
 pub(crate) struct MoePrefillContribute<'a> {
+    /// Host-packed `(cohort, base, active)` wave expectation checked at the count sync.
+    pub wave: Option<(usize, u32, u32)>,
     /// Whole-span counts at most LANE16_ROWS use the CPU arithmetic form in every wave.
     pub cpu_arithmetic: &'a [bool],
     /// Native FP8 tables carry the six-slice slot base in both pointer arrays.
@@ -73,8 +75,7 @@ pub(crate) struct MoePrefillContribute<'a> {
     pub done: TensorMut<u32, 2>,
 }
 
-/// The wrapper input: the cohort fields plus the output `y`; the wrapper
-/// owns `contributions`/`done` in scratch.
+/// The wrapper input: the cohort fields plus the output `y`.
 #[derive(Debug)]
 #[cfg(test)]
 pub(crate) struct MoePrefill<'a> {
@@ -97,6 +98,8 @@ pub(crate) struct MoePrefill<'a> {
     pub shared_up: Tensor<bf16, 2>,
     pub shared_down: Tensor<bf16, 2>,
     pub shared_expert_gate: Tensor<bf16, 1>,
+    pub contributions: Tensor<bf16, 3>,
+    pub done: TensorMut<u32, 2>,
     pub y: TensorMut<bf16, 2>,
 }
 
@@ -219,6 +222,7 @@ impl MoePrefillFinish {
             MAX_EXPERTS
         );
         let layout = prefill_layout(
+            rows as usize,
             rows as usize,
             top_k as usize,
             self.experts as usize,
@@ -391,7 +395,18 @@ impl MoePrefillContribute<'_> {
             "assignment_gen",
             "done",
         )?;
+        let active_rows = match self.wave {
+            Some((cohort, base, expected_active)) => {
+                ensure!(
+                    u64::from(expected_active) <= assignments,
+                    "moe prefill cohort={cohort} base={base} rows={rows} host-packed active={expected_active} exceeds wave assignments={assignments}"
+                );
+                (expected_active as usize).div_ceil(top_k as usize)
+            }
+            None => rows as usize,
+        };
         let layout = prefill_layout(
+            active_rows,
             rows as usize,
             top_k as usize,
             experts as usize,
@@ -450,14 +465,10 @@ pub(crate) struct PrefillLayout {
     offsets: u64,
     cursor: u64,
     pub(crate) pos_of: u64,
-    #[cfg(test)]
-    done: u64,
     x_perm: u64,
     pub(crate) h1: u64,
     pub(crate) act: u64,
     pub(crate) y_perm: u64,
-    #[cfg(test)]
-    contributions: u64,
     h1s: u64,
     act_s: u64,
     pub(crate) shared_out: u64,
@@ -479,13 +490,23 @@ pub fn stage_device_bytes() -> u64 {
 
 pub(crate) fn prefill_scratch_bytes(
     rows: usize,
+    contribute_rows: usize,
     top_k: usize,
     experts: usize,
     hidden: usize,
     inter: usize,
     fp8_slot: Option<&Fp8Slot>,
 ) -> Result<u64> {
-    prefill_layout(rows, top_k, experts, hidden, inter, fp8_slot).map(|layout| layout.bytes)
+    prefill_layout(
+        rows,
+        contribute_rows,
+        top_k,
+        experts,
+        hidden,
+        inter,
+        fp8_slot,
+    )
+    .map(|layout| layout.bytes)
 }
 
 fn region(at: &mut u64, elements: usize, element_bytes: u64) -> Result<u64> {
@@ -503,15 +524,23 @@ fn region(at: &mut u64, elements: usize, element_bytes: u64) -> Result<u64> {
 
 pub(crate) fn prefill_layout(
     rows: usize,
+    contribute_rows: usize,
     top_k: usize,
     experts: usize,
     hidden: usize,
     inter: usize,
     fp8_slot: Option<&Fp8Slot>,
 ) -> Result<PrefillLayout> {
+    ensure!(
+        contribute_rows >= rows,
+        "moe prefill contribute_rows={contribute_rows} below wave rows={rows}"
+    );
     let assignments = rows
         .checked_mul(top_k)
         .context("moe prefill assignment overflow")?;
+    let contribute_assignments = contribute_rows
+        .checked_mul(top_k)
+        .context("moe prefill contribute assignment overflow")?;
     let routed_hidden = assignments
         .checked_mul(hidden)
         .context("moe prefill hidden extent overflow")?;
@@ -541,17 +570,11 @@ pub(crate) fn prefill_layout(
         4,
     )?;
     let cursor = region(&mut at, experts, 4)?;
-    let pos_of = region(&mut at, assignments, 4)?;
-    #[cfg(test)]
-    let done = at;
-    region(&mut at, assignments, 4)?;
+    let pos_of = region(&mut at, contribute_assignments, 4)?;
     let x_perm = region(&mut at, routed_hidden, 2)?;
     let h1 = region(&mut at, routed_gate_up, 2)?;
     let act = region(&mut at, routed_inter, 2)?;
     let y_perm = region(&mut at, routed_hidden, 2)?;
-    #[cfg(test)]
-    let contributions = at;
-    region(&mut at, routed_hidden, 2)?;
     let h1s = region(&mut at, shared_gate_up, 2)?;
     let act_s = region(&mut at, shared_inter, 2)?;
     let shared_out = region(&mut at, shared_hidden, 2)?;
@@ -580,14 +603,10 @@ pub(crate) fn prefill_layout(
         offsets,
         cursor,
         pos_of,
-        #[cfg(test)]
-        done,
         x_perm,
         h1,
         act,
         y_perm,
-        #[cfg(test)]
-        contributions,
         h1s,
         act_s,
         shared_out,
@@ -906,6 +925,12 @@ impl PrefillOps {
             "moe prefill scan total {} != {active_total} active assignments",
             window[d2h_words - 1]
         );
+        if let Some((cohort, base, expected_active)) = input.wave {
+            ensure!(
+                active_total == u64::from(expected_active),
+                "moe prefill wave count mismatch cohort={cohort} base={base} rows={rows}: device active_total={active_total} != host={expected_active}"
+            );
+        }
         if active_total == 0 {
             return Ok(());
         }
@@ -1123,35 +1148,12 @@ impl PrefillOps {
             Arc::ptr_eq(stream, &self.stream),
             "moe prefill stream is not the PrefillOps construction stream (cuBLAS handle bound at construction)"
         );
-        let (rows, top_k, hidden) = (input.x.shape[0], input.ids.shape[1], input.x.shape[1]);
-        let layout = prefill_layout(
-            rows as usize,
-            top_k as usize,
-            input.slot_valid.shape[0] as usize,
-            hidden as usize,
-            input.shared_gate.shape[0] as usize,
-            None,
-        )?;
-        let assignments = u64::from(rows) * u64::from(top_k);
         let cohort = MoePrefillContribute {
             cpu_arithmetic: &[false; MAX_EXPERTS][..input.slot_valid.shape[0] as usize],
             fp8_slot: None,
-            contributions: unsafe {
-                Tensor::<bf16, 3>::new(
-                    scratch.ptr + layout.contributions,
-                    [rows, top_k, hidden],
-                    [u64::from(top_k) * u64::from(hidden), u64::from(hidden), 1],
-                    assignments * u64::from(hidden) * 2,
-                )?
-            },
-            done: unsafe {
-                TensorMut::<u32, 2>::new(
-                    scratch.ptr + layout.done,
-                    [rows, top_k],
-                    [u64::from(top_k), 1],
-                    assignments * 4,
-                )?
-            },
+            wave: None,
+            contributions: input.contributions,
+            done: TensorMut(input.done.0),
             x: input.x,
             ids: input.ids,
             weights: input.weights,
@@ -1172,11 +1174,7 @@ impl PrefillOps {
         input.validate_y(&plan)?;
         scratch.validate(plan.layout.bytes)?;
         unsafe {
-            zero_words(
-                stream,
-                scratch.ptr + plan.layout.done,
-                plan.assignments as usize,
-            )?;
+            zero_words(stream, cohort.done.0.ptr, plan.assignments as usize)?;
         }
         self.contribute(stream, &cohort, &plan, scratch)?;
         let y = input.y;

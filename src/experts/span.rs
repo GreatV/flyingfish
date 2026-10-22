@@ -35,6 +35,12 @@ pub struct SpanPlan {
     staged: Vec<u32>,
     cpu: Vec<u32>,
     classes: Vec<SpanClass>,
+    expert_cohort: Vec<u16>,
+    cohort_offsets: Vec<usize>,
+    cohort_cursor: Vec<usize>,
+    assignment_rows: Vec<u32>,
+    wave_offsets: Vec<usize>,
+    packed_waves: Vec<(u32, u32, u32)>,
 }
 
 impl SpanPlan {
@@ -50,6 +56,7 @@ impl SpanPlan {
         ensure!(staging_slots > 0, "zero prefill staging slots");
         ensure!(workers > 0, "zero service workers");
         let experts = geometry.experts as usize;
+        let max_cohorts = experts.div_ceil(staging_slots as usize) + 1;
         Ok(Self {
             span_rows: 0,
             wave_rows: 0,
@@ -63,6 +70,12 @@ impl SpanPlan {
             staged: Vec::with_capacity(experts),
             cpu: Vec::with_capacity(experts),
             classes: vec![SpanClass::Cpu; experts],
+            expert_cohort: vec![u16::MAX; experts],
+            cohort_offsets: Vec::with_capacity(max_cohorts + 1),
+            cohort_cursor: Vec::with_capacity(max_cohorts),
+            assignment_rows: Vec::new(),
+            wave_offsets: Vec::with_capacity(max_cohorts + 1),
+            packed_waves: Vec::new(),
         })
     }
 
@@ -150,7 +163,133 @@ impl SpanPlan {
         self.wave_rows = wave_rows;
         self.waves = span_rows.div_ceil(wave_rows);
         self.streamed_bytes = streamed_bytes;
+        self.wave_offsets.clear();
+        self.packed_waves.clear();
         Ok(())
+    }
+
+    /// Buckets whole-span assignments by cohort in one pass and cuts each cohort into
+    /// contiguous `(base, rows, active)` waves with `0 < active <= wave_rows * top_k`.
+    pub fn pack_waves(&mut self, counts: &[u32], ids: &[i32]) -> Result<()> {
+        let experts = self.geometry.experts as usize;
+        let top_k = self.geometry.top_k as usize;
+        let choices = (self.span_rows as usize)
+            .checked_mul(top_k)
+            .context("span choice count overflow")?;
+        ensure!(
+            self.span_rows > 0 && self.wave_rows > 0,
+            "span plan is not initialized"
+        );
+        ensure!(
+            counts.len() == experts,
+            "expert counts hold {} experts, expected {experts}",
+            counts.len()
+        );
+        ensure!(
+            ids.len() == choices,
+            "routed ids hold {} choices, expected {choices}",
+            ids.len()
+        );
+        let num_cohorts = 1 + self.cohort_count() as usize;
+        self.expert_cohort.fill(u16::MAX);
+        for &expert in &self.resident {
+            self.expert_cohort[expert as usize] = 0;
+        }
+        for (cohort, chunk) in self.staged.chunks(self.staging_slots as usize).enumerate() {
+            let tag = u16::try_from(cohort + 1).context("cohort index exceeds u16")?;
+            for &expert in chunk {
+                self.expert_cohort[expert as usize] = tag;
+            }
+        }
+        self.cohort_offsets.clear();
+        self.cohort_offsets.push(0);
+        let resident_total: usize = self
+            .resident
+            .iter()
+            .map(|&expert| counts[expert as usize] as usize)
+            .sum();
+        self.cohort_offsets.push(resident_total);
+        let mut total = resident_total;
+        for chunk in self.staged.chunks(self.staging_slots as usize) {
+            let cohort_total: usize = chunk
+                .iter()
+                .map(|&expert| counts[expert as usize] as usize)
+                .sum();
+            total = total
+                .checked_add(cohort_total)
+                .context("cohort assignment offset overflow")?;
+            self.cohort_offsets.push(total);
+        }
+        self.cohort_cursor.clear();
+        self.cohort_cursor
+            .extend_from_slice(&self.cohort_offsets[..num_cohorts]);
+        if self.assignment_rows.len() < total {
+            self.assignment_rows.resize(total, 0);
+        }
+        for (choice, &expert) in ids.iter().enumerate() {
+            let index = usize::try_from(expert)
+                .ok()
+                .filter(|&index| index < experts)
+                .with_context(|| format!("routed expert {expert} outside 0..{experts}"))?;
+            let cohort = self.expert_cohort[index];
+            if cohort != u16::MAX {
+                let c = cohort as usize;
+                let pos = self.cohort_cursor[c];
+                ensure!(
+                    pos < self.cohort_offsets[c + 1],
+                    "cohort {c} assignment count exceeds span count"
+                );
+                self.assignment_rows[pos] = (choice / top_k) as u32;
+                self.cohort_cursor[c] = pos + 1;
+            }
+        }
+        for c in 0..num_cohorts {
+            ensure!(
+                self.cohort_cursor[c] == self.cohort_offsets[c + 1],
+                "cohort {c} bucketed {} of {} assignments",
+                self.cohort_cursor[c] - self.cohort_offsets[c],
+                self.cohort_offsets[c + 1] - self.cohort_offsets[c]
+            );
+        }
+        let active_limit = (self.wave_rows as usize)
+            .checked_mul(top_k)
+            .context("wave active capacity overflow")?;
+        self.packed_waves.clear();
+        self.wave_offsets.clear();
+        self.wave_offsets.push(0);
+        for c in 0..num_cohorts {
+            let rows = &self.assignment_rows[self.cohort_offsets[c]..self.cohort_offsets[c + 1]];
+            let mut idx = 0usize;
+            while idx < rows.len() {
+                let base = rows[idx];
+                let mut end = (idx + active_limit).min(rows.len());
+                if end < rows.len() {
+                    let split_row = rows[end];
+                    while end > idx && rows[end - 1] == split_row {
+                        end -= 1;
+                    }
+                }
+                ensure!(
+                    end > idx,
+                    "wave packing made no progress at cohort {c} row {base}"
+                );
+                let wave_rows = rows[end - 1] - base + 1;
+                let active = u32::try_from(end - idx)?;
+                self.packed_waves.push((base, wave_rows, active));
+                idx = end;
+            }
+            self.wave_offsets.push(self.packed_waves.len());
+        }
+        Ok(())
+    }
+
+    pub fn cohort_waves(&self, cohort: usize) -> Result<&[(u32, u32, u32)]> {
+        ensure!(
+            cohort + 1 < self.wave_offsets.len(),
+            "cohort {cohort} outside packed wave count {}",
+            self.wave_offsets.len().saturating_sub(1)
+        );
+        Ok(&self.packed_waves[self.wave_offsets[cohort]..self.wave_offsets[cohort + 1]])
     }
 
     pub fn span_rows(&self) -> u32 {
@@ -865,6 +1004,156 @@ mod tests {
         let waits = leases.release()?;
         assert_eq!(waits, &[5, 6]);
         assert_eq!(waits.as_ptr(), first);
+        Ok(())
+    }
+
+    #[test]
+    fn packed_waves_cover_cohort_assignments_within_active_capacity() -> Result<()> {
+        let geometry = ExpertGeometry {
+            layers: 1,
+            experts: 256,
+            hidden: 2048,
+            intermediate: 512,
+            top_k: 8,
+        };
+        let mut cells = Vec::new();
+        for workers in [1u32, 2] {
+            for rows in [1u32, 16, 256, 1024] {
+                for experts in [1u32, 2] {
+                    cells.push(ServiceCell {
+                        workers,
+                        rows,
+                        experts,
+                        seconds: f64::from(rows) * 0.01 * f64::from(experts) / f64::from(workers),
+                    });
+                }
+            }
+        }
+        let service = ServiceTable::new("test_minicpm", cells)?;
+        let rates = SpanRates {
+            cpu_row_limit: 16,
+            service: &service,
+            h2d_bytes_per_second: 1e10,
+        };
+        let span_rows = 1024u32;
+        let wave_rows = 256u32;
+        let top_k = geometry.top_k as usize;
+        let mut ids = Vec::with_capacity(span_rows as usize * top_k);
+        let mut counts = vec![0u32; geometry.experts as usize];
+        for r in 0..span_rows as usize {
+            for c in 0..top_k {
+                let expert = if c < 3 {
+                    // 3 choices per row in 0..16 (resident): 3072 total assignments (> 2048).
+                    ((r * 3 + c) % 16) as u32
+                } else if c < 7 {
+                    // 4 choices per row in 16..32 (staged, > 16 rows each).
+                    16 + ((r * 5 + c * 3) % 16) as u32
+                } else if r < 64 {
+                    // 1 choice per row in 32..40 on first 64 rows (8 rows each <= 16 -> CPU).
+                    32 + (r % 8) as u32
+                } else {
+                    16 + ((r * 7 + 13) % 16) as u32
+                };
+                ids.push(expert as i32);
+                counts[expert as usize] += 1;
+            }
+        }
+        let mut resident = vec![false; geometry.experts as usize];
+        for flag in &mut resident[..16] {
+            *flag = true;
+        }
+        let mut plan = planner(&geometry, 2, &rates)?;
+        plan.update(&counts, &resident, span_rows, wave_rows, &rates)?;
+        plan.pack_waves(&counts, &ids)?;
+
+        // Resident cohort (3072 assignments, 3 per row) splits on a row boundary into 2046 + 1026.
+        let res_waves = plan.cohort_waves(0)?;
+        assert_eq!(res_waves, &[(0, 682, 2046), (682, 342, 1026)]);
+
+        let total_cohorts = 1 + plan.cohort_count() as usize;
+        for cohort in 0..total_cohorts {
+            let experts: Vec<u32> = if cohort == 0 {
+                plan.resident().to_vec()
+            } else {
+                plan.cohorts().nth(cohort - 1).unwrap().to_vec()
+            };
+            let waves = plan.cohort_waves(cohort)?;
+            assert!(!waves.is_empty(), "non-empty cohort {cohort} has no waves");
+            let mut prev_end = 0u32;
+            for (w_idx, &(base, rows, active)) in waves.iter().enumerate() {
+                assert!(rows > 0, "cohort {cohort} wave {w_idx} has zero rows");
+                assert!(
+                    active > 0 && active <= wave_rows * geometry.top_k,
+                    "cohort {cohort} wave {w_idx} active={active} outside 1..=2048"
+                );
+                if w_idx > 0 {
+                    assert!(
+                        base >= prev_end,
+                        "cohort {cohort} wave {w_idx} overlaps previous wave"
+                    );
+                }
+                prev_end = base + rows;
+                assert!(prev_end <= span_rows);
+            }
+            for r in 0..span_rows {
+                let row_ids = &ids[r as usize * top_k..(r as usize + 1) * top_k];
+                let row_active = row_ids
+                    .iter()
+                    .filter(|&&e| experts.contains(&(e as u32)))
+                    .count();
+                let covering: Vec<_> = waves
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (base, rows, _))| r >= *base && r < *base + *rows)
+                    .collect();
+                if row_active > 0 {
+                    assert_eq!(
+                        covering.len(),
+                        1,
+                        "cohort {cohort} row {r} with {row_active} assignments covered {} times",
+                        covering.len()
+                    );
+                } else {
+                    assert!(covering.len() <= 1);
+                }
+            }
+            for &(base, rows, active) in waves {
+                let start = base as usize * top_k;
+                let end = (base + rows) as usize * top_k;
+                let actual = ids[start..end]
+                    .iter()
+                    .filter(|&&e| experts.contains(&(e as u32)))
+                    .count() as u32;
+                assert_eq!(actual, active, "cohort {cohort} wave ({base}, {rows})");
+            }
+        }
+
+        let span_16k = 16_320u32;
+        let mut ids_16k = Vec::with_capacity(span_16k as usize * top_k);
+        let mut counts_16k = vec![0u32; geometry.experts as usize];
+        for r in 0..span_16k as usize {
+            for c in 0..top_k {
+                let expert = ((r * 13 + c * 31) % geometry.experts as usize) as u32;
+                ids_16k.push(expert as i32);
+                counts_16k[expert as usize] += 1;
+            }
+        }
+        let mut resident_16k = vec![false; geometry.experts as usize];
+        for flag in &mut resident_16k[..118] {
+            *flag = true;
+        }
+        plan.update(&counts_16k, &resident_16k, span_16k, wave_rows, &rates)?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..40 {
+            plan.pack_waves(&counts_16k, &ids_16k)?;
+        }
+        let elapsed = t0.elapsed();
+        assert!(!plan.cohort_waves(0)?.is_empty());
+        eprintln!(
+            "pack_waves_16k span_rows={span_16k} layers=40 total_us={} per_layer_us={:.2}",
+            elapsed.as_micros(),
+            elapsed.as_secs_f64() * 1e6 / 40.0
+        );
         Ok(())
     }
 }

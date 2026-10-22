@@ -169,6 +169,7 @@ impl Setup {
             while wave_rows <= span_rows / 2
                 && crate::backend::cuda::moe::prefill::prefill_scratch_bytes(
                     wave_rows as usize * 2,
+                    span_rows as usize,
                     geometry.top_k as usize,
                     geometry.experts as usize,
                     geometry.hidden as usize,
@@ -181,6 +182,7 @@ impl Setup {
             let scratch =
                 usize::try_from(crate::backend::cuda::moe::prefill::prefill_scratch_bytes(
                     wave_rows as usize,
+                    span_rows as usize,
                     geometry.top_k as usize,
                     geometry.experts as usize,
                     geometry.hidden as usize,
