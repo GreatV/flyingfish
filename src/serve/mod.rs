@@ -38,8 +38,7 @@ pub enum EngineEvent {
     Failed(String),
 }
 
-/// Single-request admission state: Idle accepts, Running rejects with an
-/// explicit error; the engine thread clears back to Idle when a run ends.
+/// Idle accepts one request; a failed engine stays Unavailable.
 #[derive(PartialEq, Eq, Debug)]
 pub enum Slot {
     Idle,
@@ -69,43 +68,48 @@ pub struct Backend {
 }
 
 /// Owns admission until the engine has accepted the request.
-pub(super) struct Admission<'a> {
-    backend: &'a Backend,
+pub(super) struct Admission {
+    commands: mpsc::Sender<EngineCommand>,
+    slot: Arc<Mutex<Slot>>,
     pending: bool,
 }
 
-impl Admission<'_> {
+impl Admission {
     fn send(mut self, request: Request, events: tokio_mpsc::Sender<EngineEvent>) -> Result<()> {
-        self.backend
+        if self
             .commands
             .send(EngineCommand { request, events })
-            .context("engine thread has exited")?;
+            .is_err()
+        {
+            *self.slot.lock().unwrap_or_else(|error| error.into_inner()) = Slot::Unavailable;
+            self.pending = false;
+            anyhow::bail!("engine thread has exited");
+        }
         self.pending = false;
         Ok(())
     }
 }
 
-impl Drop for Admission<'_> {
+impl Drop for Admission {
     fn drop(&mut self) {
         if self.pending {
-            let mut slot = self
-                .backend
-                .slot
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            *slot = Slot::Idle;
+            let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
+            if *slot == Slot::Running {
+                *slot = Slot::Idle;
+            }
         }
     }
 }
 
 impl Backend {
-    fn reserve(&self) -> Result<Admission<'_>> {
+    fn reserve(&self) -> Result<Admission> {
         self.slot
             .lock()
             .map_err(|_| anyhow::anyhow!("slot mutex poisoned"))?
             .admit()?;
         Ok(Admission {
-            backend: self,
+            commands: self.commands.clone(),
+            slot: self.slot.clone(),
             pending: true,
         })
     }
@@ -236,26 +240,52 @@ fn engine_loop(
     mtp: bool,
 ) {
     while let Ok(EngineCommand { request, events }) = commands.recv() {
-        let recovered = generate_once(
-            &mut model,
-            &options,
-            &model_spec,
-            request,
-            events,
-            &commands,
-            mtp,
-        )
-        .and_then(|()| if mtp { model.reset_mtp() } else { Ok(()) });
-        let mut state = slot.lock().unwrap_or_else(|e| e.into_inner());
-        *state = if recovered.is_ok() {
-            Slot::Idle
-        } else {
-            Slot::Unavailable
-        };
-        if let Err(error) = recovered {
-            eprintln!("serve recovery failed: {error:#}");
+        let active_events = events.clone();
+        if !run_request(&slot, &active_events, || {
+            generate_once(
+                &mut model,
+                &options,
+                &model_spec,
+                request,
+                events,
+                &commands,
+                mtp,
+            )
+            .and_then(|()| if mtp { model.reset_mtp() } else { Ok(()) })
+        }) {
+            break;
         }
     }
+}
+
+fn run_request(
+    slot: &Mutex<Slot>,
+    events: &tokio_mpsc::Sender<EngineEvent>,
+    generate: impl FnOnce() -> Result<()>,
+) -> bool {
+    let recovered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(generate));
+    let (healthy, failure) = match recovered {
+        Ok(Ok(())) => (true, None),
+        Ok(Err(error)) => (false, Some(format!("serve recovery failed: {error:#}"))),
+        Err(panic) => {
+            let detail = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic payload");
+            (false, Some(format!("engine thread panicked: {detail}")))
+        }
+    };
+    *slot.lock().unwrap_or_else(|error| error.into_inner()) = if healthy {
+        Slot::Idle
+    } else {
+        Slot::Unavailable
+    };
+    if let Some(failure) = failure {
+        eprintln!("{failure}");
+        let _ = events.try_send(EngineEvent::Failed(failure));
+    }
+    healthy
 }
 
 fn generate_once(
@@ -514,5 +544,22 @@ mod tests {
                 .contains("unavailable")
         );
         assert_eq!(slot, Slot::Unavailable);
+    }
+
+    #[test]
+    fn engine_panic_marks_slot_unavailable_and_exposes_failure() {
+        let slot = Mutex::new(Slot::Running);
+        let (events, mut receiver) = tokio_mpsc::channel(1);
+        assert!(!run_request(&slot, &events, || panic!(
+            "injected engine panic"
+        )));
+        assert_eq!(*slot.lock().unwrap(), Slot::Unavailable);
+        assert!(matches!(receiver.try_recv(), Ok(EngineEvent::Failed(_))));
+        assert!(slot.lock().unwrap().admit().is_err());
+        drop(receiver);
+        assert!(!run_request(&slot, &events, || panic!(
+            "disconnected client"
+        )));
+        assert_eq!(*slot.lock().unwrap(), Slot::Unavailable);
     }
 }
