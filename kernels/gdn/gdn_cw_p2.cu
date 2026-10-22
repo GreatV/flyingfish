@@ -144,16 +144,20 @@ __device__ __forceinline__ char* p2_slot(char* ws, int chunk, int head) {
     return ws + ((size_t)chunk * P2_HEADS + (size_t)head) * P2_SLOT_BYTES;
 }
 
-// valid_rows_in == 0 selects meta->valid_rows; key_count == prefix + valid_rows bounds
-// the rows a kernel may read.
-__device__ __forceinline__ int p2_valid_rows(const Q38SequenceFields* meta, int valid_rows_in) {
+// Global metadata bounds the request; row_base and group_rows bound this slot group.
+__device__ __forceinline__ int p2_valid_rows(const Q38SequenceFields* meta,
+                                           int max_rows, int row_base, int group_rows) {
     const int prefix = meta->prefix;
-    const int valid_rows = valid_rows_in > 0 ? valid_rows_in : meta->valid_rows;
-    if (valid_rows <= 0 || prefix < 0 || meta->causal != 1
-        || meta->key_count != prefix + valid_rows || meta->capacity < meta->key_count) {
+    const int valid_rows = meta->valid_rows;
+    if (valid_rows <= 0 || valid_rows > max_rows || prefix < 0 || meta->causal != 1
+        || meta->capacity < valid_rows || prefix > meta->capacity - valid_rows
+        || meta->key_count != prefix + valid_rows
+        || group_rows <= 0 || group_rows > max_rows || row_base < 0
+        || row_base % P2_C != 0 || row_base > max_rows - group_rows
+        || (row_base + group_rows != max_rows && group_rows % P2_C != 0)) {
         __trap();
     }
-    return valid_rows;
+    return row_base < valid_rows ? min(group_rows, valid_rows - row_base) : 0;
 }
 
 
@@ -166,7 +170,8 @@ void gdn_cw_p2_stage_a(const AQuery* __restrict__ q,
                        const float* __restrict__ beta,// FP32 [M, HEADS]
                        const float* __restrict__ g,   // FP32 [M, HEADS]
                        char* __restrict__ ws,
-                       const Q38SequenceFields* __restrict__ meta, int valid_rows_in,
+                       const Q38SequenceFields* __restrict__ meta,
+                       int max_rows, int row_base, int group_rows,
                        uint32_t v_row_stride
 #ifdef GDN_COMPACT_QK
                        , const __nv_bfloat16* __restrict__ k_bf16
@@ -190,12 +195,21 @@ void gdn_cw_p2_stage_a(const AQuery* __restrict__ q,
         __trap();
         return;
     }
-    const int valid_rows = p2_valid_rows(meta, valid_rows_in);
+    const int valid_rows = p2_valid_rows(meta, max_rows, row_base, group_rows);
     const int nchunk = (valid_rows + P2_C - 1) / P2_C;
     if (chunk >= nchunk) return;
     const int row0 = chunk * P2_C;
 #ifdef GDN_COMPACT_QK
     if (!k_bf16 || reinterpret_cast<uintptr_t>(k_bf16) % 256 != 0) { __trap(); return; }
+#endif
+    const size_t source_base = static_cast<size_t>(row_base);
+    q += source_base * P2_QK_ROW;
+    k += source_base * P2_QK_ROW;
+    v += source_base * v_row_stride;
+    beta += source_base * P2_HEADS;
+    g += source_base * P2_HEADS;
+#ifdef GDN_COMPACT_QK
+    k_bf16 += source_base * P2_QK_ROW;
 #endif
 
     extern __shared__ __align__(16) char p2_smem[];
@@ -515,7 +529,7 @@ void gdn_cw_p2_stage_h(const float* __restrict__ q,
                        __nv_bfloat16* __restrict__ out,  // BF16 [rows, HEADS, DV]
                        char* __restrict__ ws,
                        const Q38SequenceFields* __restrict__ meta,
-                       int valid_rows_in) {
+                       int max_rows, int row_base, int group_rows) {
     const int head = blockIdx.y;
     const int j0 = blockIdx.x * P2_VW;
     const int tid = threadIdx.x;
@@ -534,7 +548,11 @@ void gdn_cw_p2_stage_h(const float* __restrict__ q,
         __trap();
         return;
     }
-    const int valid_rows = p2_valid_rows(meta, valid_rows_in);
+    const int valid_rows = p2_valid_rows(meta, max_rows, row_base, group_rows);
+    if (valid_rows == 0) return;
+    q += static_cast<size_t>(row_base) * P2_QK_ROW;
+    k += static_cast<size_t>(row_base) * P2_QK_ROW;
+    out += static_cast<size_t>(row_base) * P2_HEADS * P2_DV;
 
     extern __shared__ __align__(16) char p2_smem[];
     const P2Arena ar = p2_arena(p2_smem);
