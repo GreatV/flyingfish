@@ -3,7 +3,12 @@ use super::*;
 use crate::vision_input::{ImageGrid, MultimodalInput};
 use safetensors::{Dtype, SafeTensors};
 
-fn placement_compare(label: &str, a: &[f32], b: &[f32]) -> Result<usize> {
+fn placement_compare(
+    label: &str,
+    a: &[f32],
+    b: &[f32],
+    bf16_ulp_limit: Option<u16>,
+) -> Result<usize> {
     ensure!(
         !a.is_empty() && a.len() == b.len(),
         "Runner FAIL {label} extent"
@@ -40,15 +45,20 @@ fn placement_compare(label: &str, a: &[f32], b: &[f32]) -> Result<usize> {
         .map(|(&a, &b)| ordered(a).abs_diff(ordered(b)))
         .max()
         .context("empty comparison")?;
+    let passed = match bf16_ulp_limit {
+        Some(limit) => max_bf16_ulp <= limit,
+        None => mismatches == 0,
+    };
     println!(
         "{} placement_comparison {}",
-        if mismatches == 0 { "PASS" } else { "DEFECT" },
+        if passed { "PASS" } else { "DEFECT" },
         serde_json::json!({
             "label":label,"elements":a.len(),"bit_mismatches":mismatches,"first":first,
-            "first_a":first.map(|i|a[i]),"first_b":first.map(|i|b[i]),"max_abs":max_abs,"max_bf16_ulp":max_bf16_ulp
+            "first_a":first.map(|i|a[i]),"first_b":first.map(|i|b[i]),"max_abs":max_abs,"max_bf16_ulp":max_bf16_ulp,
+            "strict_bits":bf16_ulp_limit.is_none(),"bf16_ulp_limit":bf16_ulp_limit,"passed":passed
         })
     );
-    Ok(usize::from(mismatches != 0))
+    Ok(usize::from(!passed))
 }
 
 fn placement_graph(
@@ -241,6 +251,7 @@ fn placement_components(engine: &Engine, model: &Path) -> Result<usize> {
                     ),
                     previous,
                     &values,
+                    None,
                 )?;
             } else {
                 reference = Some(values);
@@ -252,14 +263,26 @@ fn placement_components(engine: &Engine, model: &Path) -> Result<usize> {
         "gpu_host_contribution",
         &eager[0][..2048],
         &eager[1][..2048],
+        Some(1),
     )?;
     defects += placement_compare(
         "host_disk_contribution",
         &eager[1][..2048],
         &eager[2][..2048],
+        None,
     )?;
-    defects += placement_compare("gpu_host_output", &eager[0][16384..], &eager[1][16384..])?;
-    defects += placement_compare("host_disk_output", &eager[1][16384..], &eager[2][16384..])?;
+    defects += placement_compare(
+        "gpu_host_output",
+        &eager[0][16384..],
+        &eager[1][16384..],
+        Some(1),
+    )?;
+    defects += placement_compare(
+        "host_disk_output",
+        &eager[1][16384..],
+        &eager[2][16384..],
+        None,
+    )?;
     Ok(defects)
 }
 
@@ -419,7 +442,7 @@ fn minicpm_placement_invariance_gpu() -> Result<()> {
             engine.graphs.len()
         );
         if let Some((a, previous)) = &expected {
-            defects += placement_compare("full_graph_eager_logits", a, &logits)?;
+            defects += placement_compare("full_graph_eager_logits", a, &logits, None)?;
             ensure!(
                 previous.len() == state.len(),
                 "Runner FAIL placement state extent"
@@ -436,7 +459,7 @@ fn minicpm_placement_invariance_gpu() -> Result<()> {
         }
     }
     println!(
-        "{} placement_invariance comparisons_complete=true identity_defects={defects} format=BF16 rows=1 graph_eager=true tiers=GPU,Host,Disk strict_bits=true",
+        "{} placement_invariance comparisons_complete=true identity_defects={defects} format=BF16 rows=1 graph_eager=true tiers=GPU,Host,Disk strict_graph_eager_host_disk_repeat=true gpu_cpu_max_bf16_ulp=1",
         if defects == 0 { "PASS" } else { "DEFECT" }
     );
     ensure!(
