@@ -234,6 +234,13 @@ fn host_fill_order(
 }
 
 impl Residency {
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn freeze_probe_admissions(&mut self) -> Result<()> {
+        ensure!(!self.token_open, "placement probe has an open token");
+        self.admission.budget_bytes_per_token = 0;
+        Ok(())
+    }
+
     /// Setup: installs the initial GPU set, fills every host data block from the native ranges
     /// through the disk reader, and reports the host-tier load cost. The request boundary only
     /// changes the GPU set.

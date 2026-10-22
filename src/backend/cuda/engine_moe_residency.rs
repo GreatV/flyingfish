@@ -945,6 +945,12 @@ impl Slots {
         self.policy.begin_token()
     }
 
+    #[cfg(test)]
+    pub(in crate::backend::cuda::engine) fn freeze_probe_admissions(&mut self) -> Result<()> {
+        self.transfers.finish()?;
+        self.policy.freeze_probe_admissions()
+    }
+
     pub fn finish_token(&mut self) -> Result<()> {
         self.moves.clear();
         for published in self.policy.finish_token()? {
