@@ -438,6 +438,12 @@ impl LayerLinearPlan {
         for p in self.projections.values() {
             if rows as usize > p.invariant_rows {
                 blas.prepare_fixed(rows, p.prefill.shape[0], p.prefill.shape[1])?;
+            } else {
+                blas.prepare_skinny(crate::backend::setup::LinearShape {
+                    rows: rows as usize,
+                    output: p.prefill.shape[0] as usize,
+                    input: p.prefill.shape[1] as usize,
+                })?;
             }
         }
         Ok(())
@@ -548,6 +554,7 @@ mod tests {
             .into(),
             materialize: Vec::new(),
         };
+        layer.prepare(blas, 1)?;
         let values: Vec<_> = (0..rows * k)
             .map(|i| {
                 bf16::from_f32((((i / k) * 71 + (i % k) * 13) % 509) as f32 / 256.0 - 254.0 / 256.0)
@@ -752,6 +759,9 @@ mod tests {
             (248144, 2048),
             (512, 2048),
             (2048, 512),
+            (63, 2048),
+            (64, 2048),
+            (65, 2048),
         ] {
             {
                 let values: Vec<_> = (0..n * k)
@@ -768,6 +778,9 @@ mod tests {
                     [k as u64, 1],
                 )?);
                 defects += invariant_rows(device, &blas, &ops, weight, (n, k))?;
+            }
+            if [63, 64, 65].contains(&n) {
+                continue;
             }
             {
                 let codes: Vec<_> = (0..n * k)
@@ -803,7 +816,7 @@ mod tests {
             }
         }
         println!(
-            "INVARIANT_LINEAR_SUMMARY shapes=6 formats=3 rows=1..16 eager_graph=true defects={defects}"
+            "INVARIANT_LINEAR_SUMMARY shapes=9 bf16_shapes=9 fp8_shapes=6 rows=1..16 eager_graph=true defects={defects}"
         );
         ensure!(defects == 0, "invariant linear DEFECT cells={defects}");
         Ok(())

@@ -298,6 +298,8 @@ pub struct Blas {
     calibration: linear_calibrate::Environment,
     fp8: Option<super::linear::Fp8Ops>,
     skinny: CudaFunction,
+    skinny_device: (usize, usize),
+    skinny_plans: RefCell<BTreeMap<(usize, usize), (LaunchConfig, bool)>>,
     invariant_rows: usize,
     plans: RefCell<BTreeMap<(usize, usize, usize, u32), Plan>>,
     biased_plans: RefCell<BTreeMap<(LinearShape, u64, super::linear::LinearBiasMode), Plan>>,
@@ -500,6 +502,8 @@ impl Blas {
             calibration,
             fp8: None,
             skinny: cubin::module(&device.ctx, "gemm_skinny")?.load_function("gemm_skinny_bf16")?,
+            skinny_device: (device.info.sms, device.info.l2_bytes),
+            skinny_plans: RefCell::new(BTreeMap::new()),
             invariant_rows: 0,
             plans: RefCell::new(BTreeMap::new()),
             biased_plans: RefCell::new(BTreeMap::new()),
@@ -538,6 +542,13 @@ impl Blas {
         input: usize,
         algo_index: u32,
     ) -> Result<()> {
+        if (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&rows) && input.is_multiple_of(256) {
+            self.prepare_skinny(LinearShape {
+                rows,
+                output,
+                input,
+            })?;
+        }
         if rows > 1
             && !self
                 .plans
@@ -679,7 +690,18 @@ impl Blas {
         self.skinny_raw(wp, xp, yp, shape)
     }
     fn skinny_raw(&self, wp: u64, xp: u64, yp: u64, shape: LinearShape) -> Result<()> {
-        let launch = Self::skinny_launch(shape)?;
+        ensure!(
+            (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&shape.rows),
+            "skinny rows exceed the bound: {shape:?}"
+        );
+        let &(mut launch, tiny) = self
+            .skinny_plans
+            .borrow()
+            .get(&(shape.output, shape.input))
+            .context("skinny launch missing; bind before run/capture")?;
+        if tiny {
+            launch.grid_dim.1 = shape.rows as u32;
+        }
         unsafe {
             self.stream
                 .launch_builder(&self.skinny)
@@ -690,7 +712,30 @@ impl Blas {
                 .arg(&(shape.input as i32))
                 .arg(&(shape.input as i64))
                 .arg(&(shape.rows as i32))
+                .arg(&i32::from(tiny))
                 .launch(launch)?;
+        }
+        Ok(())
+    }
+    pub(super) fn prepare_skinny(&self, shape: LinearShape) -> Result<()> {
+        let mut plans = self.skinny_plans.borrow_mut();
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            plans.entry((shape.output, shape.input))
+        {
+            let mut launch = Self::skinny_launch(shape)?;
+            let bytes = shape
+                .output
+                .checked_mul(shape.input)
+                .and_then(|n| n.checked_mul(size_of::<bf16>()))
+                .context("skinny weight byte extent overflow")?;
+            let tiny = shape.output <= 16 * 4
+                && (launch.grid_dim.0 as usize) < self.skinny_device.0
+                && bytes <= self.skinny_device.1;
+            if tiny {
+                launch.grid_dim = (shape.output as u32, 1, 1);
+                launch.shared_mem_bytes = 4 * size_of::<f32>() as u32;
+            }
+            entry.insert((launch, tiny));
         }
         Ok(())
     }
@@ -891,6 +936,13 @@ impl Blas {
             "invalid fixed linear dimensions"
         );
         let key = (rows as usize, output as usize, input as usize, 0);
+        if (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&key.0) && input.is_multiple_of(256) {
+            self.prepare_skinny(LinearShape {
+                rows: key.0,
+                output: key.1,
+                input: key.2,
+            })?;
+        }
         if !self.plans.borrow().contains_key(&key) {
             let p = Plan::new(self.handle, key.0, key.1, key.2, self.workspace.len(), 0)?;
             self.plans.borrow_mut().insert(key, p);

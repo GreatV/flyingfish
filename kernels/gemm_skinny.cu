@@ -14,6 +14,8 @@
 // Launch: grid = ceil(out / 16), block = 128,
 //   dynamic smem = 2 x 9216 (W) + 2 x 9216 (X) + 4096 (merge) = 40960 B.
 // W and X are 16B-aligned. Every Y element is written by exactly one block.
+// tiny: grid [out,m,1], 128 threads, four FP32 shared partials per CTA.
+// tiny uses fixed lane-strided BF16 pairs and fixed FP32 reductions for every m.
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
@@ -62,12 +64,40 @@ constexpr int MG_OFF = 2 * (WT_BYTES + XT_BYTES);  // 36864; + merge 4096 = 4096
 extern "C" __global__ void __launch_bounds__(NT_) gemm_skinny_bf16(
     const bf16* __restrict__ W, const bf16* __restrict__ X,
     bf16* __restrict__ Y, int out_features, int in_features,
-    long ldw, int m) {
+    long ldw, int m, int tiny) {
   FD_GUARD_SKINNY;
 
   const int tid  = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
+  if (tiny) {
+    if (gridDim.x != out_features || gridDim.y != m || gridDim.z != 1) __trap();
+    const int output = blockIdx.x;
+    const int row = blockIdx.y;
+    const bf16* weights = W + (size_t)output * ldw;
+    const bf16* input = X + (size_t)row * in_features;
+    float sum = 0.0f;
+    for (int k = 2 * tid; k < in_features; k += 2 * NT_) {
+      const float2 w = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(weights + k));
+      const float2 x = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(input + k));
+      sum = fmaf(w.x, x.x, sum);
+      sum = fmaf(w.y, x.y, sum);
+    }
+#pragma unroll
+    for (int delta = 16; delta > 0; delta >>= 1) {
+      sum += __shfl_down_sync(0xffffffffu, sum, delta);
+    }
+    extern __shared__ float partials[];
+    if (lane == 0) partials[warp] = sum;
+    __syncthreads();
+    if (tid == 0) {
+      float total = 0.0f;
+#pragma unroll
+      for (int w = 0; w < NW; ++w) total += partials[w];
+      Y[(size_t)row * out_features + output] = __float2bfloat16(total);
+    }
+    return;
+  }
   const int row0 = blockIdx.x * RT;                 // this block's first W row
   const int nck  = in_features / (NW * CK);         // 64-wide in-chunks per warp
   const int kbeg = warp * (in_features / NW);       // warp's k-quarter start
