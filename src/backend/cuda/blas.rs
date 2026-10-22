@@ -527,6 +527,9 @@ impl Blas {
             let choice = self.calibration.read(shape)?;
             let index = algorithm_index(&self.candidates(shape)?, &choice.implementation)
                 .with_context(|| format!("bind frozen Lt choice for {shape:?}"))?;
+            if choice.implementation == LinearImpl::Skinny {
+                self.prepare_skinny(shape)?;
+            }
             self.choices.borrow_mut().insert(shape, (choice, index));
         }
         Ok(())
@@ -656,6 +659,7 @@ impl Blas {
         shape: LinearShape,
     ) -> Result<()> {
         linear_calibrate::check_extent(shape, w.len(), x.len())?;
+        self.prepare_skinny(shape)?;
         let candidates = self.candidates(shape)?;
         let (rows, output) = (shape.rows, shape.output);
         {
@@ -1188,6 +1192,126 @@ impl Blas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "exclusive CUDA window and an empty FLYINGFISH_RUNTIME_DIR"]
+    fn m1_calibration_binds_skinny_gpu() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let runtime = PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR missing")?,
+        );
+        ensure!(
+            std::fs::read_dir(&runtime)?.next().is_none(),
+            "runtime must be empty"
+        );
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let stream = &device.stream;
+        for output in [32, 2048] {
+            let shape = LinearShape {
+                rows: 1,
+                output,
+                input: 2048,
+            };
+            let mut cold = Blas::new(
+                &device,
+                &ops,
+                &runtime,
+                Rc::new(super::super::closure::Closure::new(
+                    true,
+                    "cold M1 gate".into(),
+                )),
+            )?;
+            cold.prepare(128, output, shape.input)?;
+            assert!(cold.skinny_plans.borrow().is_empty());
+            let w =
+                stream.clone_htod(&super::super::calibrate::random(output * shape.input, 13))?;
+            let x = stream.clone_htod(&super::super::calibrate::random(shape.input, 17))?;
+            cold.calibrate_shape(&w, &x.slice(..), shape)?;
+            let mut y = stream.alloc_zeros::<bf16>(output)?;
+            cold.skinny(&w, &x.slice(..), &mut y.slice_mut(..), shape)?;
+            let expected = stream.clone_dtoh(&y)?;
+            ensure!(
+                expected.iter().all(|v| v.is_finite()),
+                "nonfinite M1 reference"
+            );
+            let path = cold.choice_path(shape);
+            let mut cache: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+            let skinny = serde_json::to_value(LinearImpl::Skinny)?;
+            for trial in cache["trials"]
+                .as_array_mut()
+                .context("linear trials missing")?
+            {
+                let median = if trial["implementation"] == skinny {
+                    1.0
+                } else {
+                    2.0
+                };
+                for key in ["median_us", "p10_us", "p90_us"] {
+                    trial[key] = median.into();
+                }
+            }
+            cache["choice"]["implementation"] = skinny;
+            cache["choice"]["median_us"] = 1.0.into();
+            let frozen = serde_json::to_vec(&cache)?;
+            std::fs::write(&path, &frozen)?;
+            for cached_calibration in [false, true] {
+                let mut loaded = Blas::new(
+                    &device,
+                    &ops,
+                    &runtime,
+                    Rc::new(super::super::closure::Closure::new(
+                        false,
+                        "frozen M1 gate".into(),
+                    )),
+                )?;
+                assert!(loaded.skinny_plans.borrow().is_empty());
+                if cached_calibration {
+                    loaded.calibrate_shape(&w, &x.slice(..), shape)?;
+                } else {
+                    loaded.load_choices(&std::collections::BTreeSet::from([shape]))?;
+                }
+                for graph in [false, true] {
+                    if graph {
+                        stream.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                    }
+                    let launch = loaded.linear(
+                        &w,
+                        &x.slice(..),
+                        &mut y.slice_mut(..),
+                        1,
+                        output,
+                        shape.input,
+                    );
+                    if graph {
+                        let captured =
+                            stream.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                        launch?;
+                        captured?.context("M1 gate captured no graph")?.launch()?;
+                    } else {
+                        launch?;
+                    }
+                    let actual = stream.clone_dtoh(&y)?;
+                    ensure!(
+                        actual
+                            .iter()
+                            .zip(&expected)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "DEFECT M1 frozen Skinny output changed: {shape:?} cached_calibration={cached_calibration} graph={graph}"
+                    );
+                }
+                ensure!(std::fs::read(&path)? == frozen, "frozen M1 cache changed");
+            }
+            println!(
+                "PASS M1_SKINNY_BINDING weight=[{output},2048] cold=true cached_calibration=true frozen_load=true eager_graph_bits=0 fixture=planted_frozen_skinny"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn algorithm_identity_survives_heuristic_reordering() -> Result<()> {
