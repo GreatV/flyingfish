@@ -23,23 +23,23 @@ fn up256(n: u64) -> u64 {
 
 #[test]
 fn scratch_sizing_matches_region_math() {
-    for (rows, top_k, experts, hidden, inter) in [
-        (2usize, 2usize, 4usize, 8usize, 4usize),
-        (37, 8, 256, 2048, 512),
-        (4096, 8, 256, 2048, 512),
+    for (rows, contribute_rows, top_k, experts, hidden, inter) in [
+        (2usize, 2usize, 2usize, 4usize, 8usize, 4usize),
+        (37, 37, 8, 256, 2048, 512),
+        (256, 16352, 8, 256, 2048, 512),
+        (4096, 4096, 8, 256, 2048, 512),
     ] {
         let assignments = rows * top_k;
-        let regions: [(usize, u64); 15] = [
+        let contribute_assignments = contribute_rows * top_k;
+        let regions: [(usize, u64); 13] = [
             (experts, 4),
             (1, 4),
             (experts + 1, 4),
             (experts, 4),
-            (assignments, 4),
-            (assignments, 4),
+            (contribute_assignments, 4),
             (assignments * hidden, 2),
             (assignments * 2 * inter, 2),
             (assignments * inter, 2),
-            (assignments * hidden, 2),
             (assignments * hidden, 2),
             (rows * 2 * inter, 2),
             (rows * inter, 2),
@@ -50,24 +50,35 @@ fn scratch_sizing_matches_region_math() {
             .iter()
             .map(|&(n, size)| up256((n as u64) * size))
             .sum();
-        let got = prefill_scratch_bytes(rows, top_k, experts, hidden, inter, None).unwrap();
-        assert_eq!(got, expected, "rows={rows} top_k={top_k}");
+        let got = prefill_scratch_bytes(rows, contribute_rows, top_k, experts, hidden, inter, None)
+            .unwrap();
+        assert_eq!(
+            got, expected,
+            "rows={rows} contribute_rows={contribute_rows} top_k={top_k}"
+        );
         assert_eq!(got % 256, 0);
         assert!(
             got > regions.iter().map(|&(n, s)| (n as u64) * s).sum::<u64>(),
             "scratch must pad at least one region"
         );
     }
-    // Production prefill chunk: raw regions 532,950,024 B plus the region
-    // paddings; y_perm duplicates the contributions extent for the
-    // per-expert grouped GEMM2.
+    // Production MiniCPM prefill scratch: 24,976,384 B at 2144 rows and 25,431,040 B at 16352 rows (vs 33,312,768 B on main).
     assert_eq!(
-        prefill_scratch_bytes(4096, 8, 256, 2048, 512, None).unwrap(),
-        532_950_528
+        prefill_scratch_bytes(256, 2144, 8, 256, 2048, 512, None).unwrap(),
+        24_976_384
+    );
+    assert_eq!(
+        prefill_scratch_bytes(256, 16352, 8, 256, 2048, 512, None).unwrap(),
+        25_431_040
+    );
+    assert!(prefill_scratch_bytes(256, 16352, 8, 256, 2048, 512, None).unwrap() <= 33_312_768);
+    assert_eq!(
+        prefill_scratch_bytes(4096, 4096, 8, 256, 2048, 512, None).unwrap(),
+        398_601_728
     );
     assert!(
-        prefill_scratch_bytes(4096, 8, 256, 2048, 512, None).unwrap()
-            > prefill_scratch_bytes(512, 8, 256, 2048, 512, None).unwrap()
+        prefill_scratch_bytes(4096, 4096, 8, 256, 2048, 512, None).unwrap()
+            > prefill_scratch_bytes(512, 512, 8, 256, 2048, 512, None).unwrap()
     );
     use crate::{
         experts::catalogue::{ExpertGeometry, ExpertLayout},
@@ -85,8 +96,8 @@ fn scratch_sizing_matches_region_math() {
     assert_eq!(native.slot_bytes(), 3_151_872);
     assert_eq!(wave.slot_bytes(), 6_291_456);
     for rows in [1usize, 2, 37, 4096] {
-        let baseline = prefill_scratch_bytes(rows, 8, 256, 2048, 512, None).unwrap();
-        let got = prefill_scratch_bytes(rows, 8, 256, 2048, 512, native.fp8_slot()).unwrap();
+        let baseline = prefill_scratch_bytes(rows, rows, 8, 256, 2048, 512, None).unwrap();
+        let got = prefill_scratch_bytes(rows, rows, 8, 256, 2048, 512, native.fp8_slot()).unwrap();
         assert_eq!(got, baseline);
     }
     for (hidden, intermediate, supported) in [
@@ -104,6 +115,7 @@ fn scratch_sizing_matches_region_math() {
         let native = ExpertLayout::new(ExpertFormat::Fp8W8a16, &geometry).unwrap();
         let scratch = prefill_scratch_bytes(
             37,
+            37,
             8,
             256,
             hidden as usize,
@@ -112,11 +124,14 @@ fn scratch_sizing_matches_region_math() {
         );
         assert_eq!(scratch.is_ok(), supported, "native geometry {geometry:?}");
     }
-    assert!(prefill_scratch_bytes(usize::MAX, 2, 256, 2048, 512, native.fp8_slot()).is_err());
-    assert!(prefill_scratch_bytes(1, 1, 256, usize::MAX, 512, native.fp8_slot()).is_err());
+    assert!(
+        prefill_scratch_bytes(usize::MAX, usize::MAX, 2, 256, 2048, 512, native.fp8_slot())
+            .is_err()
+    );
+    assert!(prefill_scratch_bytes(1, 1, 1, 256, usize::MAX, 512, native.fp8_slot()).is_err());
     let mut wrong = native.fp8_slot().unwrap().clone();
     wrong.up.start += 16;
-    assert!(prefill_scratch_bytes(37, 8, 256, 2048, 512, Some(&wrong)).is_err());
+    assert!(prefill_scratch_bytes(37, 37, 8, 256, 2048, 512, Some(&wrong)).is_err());
 }
 
 #[test]
@@ -254,8 +269,9 @@ fn fp8_prefill_gpu() -> Result<()> {
         let cpu_arithmetic = (0..experts)
             .map(|e| arithmetic == 2 || (arithmetic == 1 && e % 3 == 1))
             .collect::<Vec<_>>();
-        let layout = prefill_layout(rows, top_k, experts, hidden, inter, Some(slot))?;
-        let scratch_bytes = prefill_scratch_bytes(rows, top_k, experts, hidden, inter, Some(slot))?;
+        let layout = prefill_layout(rows, rows, top_k, experts, hidden, inter, Some(slot))?;
+        let scratch_bytes =
+            prefill_scratch_bytes(rows, rows, top_k, experts, hidden, inter, Some(slot))?;
         let scratch_buf = s.alloc_zeros::<u8>(scratch_bytes as usize)?;
         let scratch = Scratch {
             ptr: scratch_buf.device_ptr(s).0,
@@ -614,6 +630,8 @@ struct CaseBufs {
     active: CudaSlice<u32>,
     weights: CudaSlice<bf16>,
     gens: CudaSlice<u64>,
+    contributions: CudaSlice<bf16>,
+    done: CudaSlice<u32>,
     y: CudaSlice<bf16>,
 }
 
@@ -626,13 +644,15 @@ fn case_bufs(
     weights: &[bf16],
     gens: &[u64],
 ) -> Result<CaseBufs> {
-    let hidden = fx.dims.hidden;
+    let (top_k, hidden) = (fx.dims.top_k, fx.dims.hidden);
     Ok(CaseBufs {
         x: s.clone_htod(&fx.x[..rows * hidden])?,
         ids: s.clone_htod(ids)?,
         active: s.clone_htod(active)?,
         weights: s.clone_htod(weights)?,
         gens: s.clone_htod(gens)?,
+        contributions: s.alloc_zeros(rows * top_k * hidden)?,
+        done: s.alloc_zeros(rows * top_k)?,
         y: s.alloc_zeros(rows * hidden)?,
     })
 }
@@ -703,6 +723,18 @@ fn moe_input<'a>(
         shared_up: testing::dense(&shared.su, s, inter as u32, hidden as u32)?,
         shared_down: testing::dense(&shared.sd, s, hidden as u32, inter as u32)?,
         shared_expert_gate: testing::view(&shared.seg, s, [hidden as u32], [1])?,
+        contributions: testing::view(
+            &bufs.contributions,
+            s,
+            [rows as u32, top_k as u32, hidden as u32],
+            [(top_k * hidden) as u64, hidden as u64, 1],
+        )?,
+        done: testing::mut_view(
+            &bufs.done,
+            s,
+            [rows as u32, top_k as u32],
+            [top_k as u64, 1],
+        )?,
         y,
     })
 }
@@ -733,6 +765,7 @@ fn contribute_input<'a>(
     Ok(MoePrefillContribute {
         cpu_arithmetic: &[false; MAX_EXPERTS][..experts],
         fp8_slot: None,
+        wave: None,
         x: testing::dense(&bufs.x, s, rows as u32, hidden as u32)?,
         ids: testing::dense(&bufs.ids, s, rows as u32, top_k as u32)?,
         active: testing::dense(&bufs.active, s, rows as u32, top_k as u32)?,
@@ -922,7 +955,7 @@ fn capture_shared_out(
     let input = moe_input(ctx.s, fx, rows, &case_bufs, ctx.slots, ctx.shared, y_view)?;
     ctx.ops.prefill(ctx.s, input, ctx.scratch)?;
     ctx.s.synchronize()?;
-    let layout = prefill_layout(rows, top_k, experts, hidden, inter, None)?;
+    let layout = prefill_layout(rows, rows, top_k, experts, hidden, inter, None)?;
     let mut host = vec![bf16::ZERO; rows * hidden];
     raw_dtoh(ctx.s, ctx.scratch.ptr + layout.shared_out, &mut host)?;
     Ok(ctx.s.clone_htod(&host)?)
@@ -1088,7 +1121,7 @@ fn moe_prefill_gpu() -> Result<()> {
         vec![1u32; experts],
         vec![1u64; experts],
     )?;
-    let scratch_bytes = prefill_scratch_bytes(16384, top_k, experts, hidden, inter, None)?;
+    let scratch_bytes = prefill_scratch_bytes(16384, 16384, top_k, experts, hidden, inter, None)?;
     let scratch_buf: CudaSlice<u8> = s.alloc_zeros(scratch_bytes as usize)?;
     let (scratch_ptr, _gs) = scratch_buf.device_ptr(s);
     let scratch = Scratch {
@@ -1483,7 +1516,7 @@ fn moe_prefill_gpu() -> Result<()> {
         let input = contribute_input(s, &fx, rows, &bufs, &main_slots, &shared, &cohort)?;
         ops.prefill_contribute(s, input, &scratch)?;
         s.synchronize()?;
-        let layout = prefill_layout(rows, top_k, experts, hidden, inter, None)?;
+        let layout = prefill_layout(rows, rows, top_k, experts, hidden, inter, None)?;
         let mut pos_of = vec![0i32; rows * top_k];
         raw_dtoh(s, scratch.ptr + layout.pos_of, &mut pos_of)?;
         let planted = (pos_of[0], pos_of[1]);
@@ -1710,7 +1743,15 @@ fn child_setup(s: &Arc<CudaStream>, fx: &MoeFixture, generation: Vec<u64>) -> Re
         sd: s.clone_htod(fx.shared_down.as_slice())?,
         seg: s.clone_htod(fx.shared_expert_gate.as_slice())?,
     };
-    let scratch_bytes = prefill_scratch_bytes(fx.dims.rows, top_k, experts, hidden, inter, None)?;
+    let scratch_bytes = prefill_scratch_bytes(
+        fx.dims.rows,
+        fx.dims.rows,
+        top_k,
+        experts,
+        hidden,
+        inter,
+        None,
+    )?;
     let scratch_buf: CudaSlice<u8> = s.alloc_zeros(scratch_bytes as usize)?;
     let scratch_ptr = {
         let (ptr, guard) = scratch_buf.device_ptr(s);
@@ -1835,7 +1876,7 @@ fn pos_of_oob_child() -> Result<()> {
     let input = contribute_input(s, &fx, rows, &bufs, &setup.slots, &setup.shared, &cohort)?;
     ops.prefill_contribute(s, input, &setup.scratch)?;
     s.synchronize()?;
-    let layout = prefill_layout(rows, top_k, experts, hidden, inter, None)?;
+    let layout = prefill_layout(rows, rows, top_k, experts, hidden, inter, None)?;
     let planted = [(rows * top_k) as i32];
     raw_htod(s, setup.scratch.ptr + layout.pos_of, &planted)?;
     let module = cubin::module(&d.ctx, "moe_prefill")?;
@@ -1985,7 +2026,7 @@ fn prefill_racecheck_small_gpu() -> Result<()> {
     let su: CudaSlice<bf16> = s.clone_htod(fx.shared_up.as_slice())?;
     let sd: CudaSlice<bf16> = s.clone_htod(fx.shared_down.as_slice())?;
     let seg: CudaSlice<bf16> = s.clone_htod(fx.shared_expert_gate.as_slice())?;
-    let scratch_bytes = prefill_scratch_bytes(64, top_k, experts, hidden, inter, None)?;
+    let scratch_bytes = prefill_scratch_bytes(64, 64, top_k, experts, hidden, inter, None)?;
     let scratch_buf: CudaSlice<u8> = s.alloc_zeros(scratch_bytes as usize)?;
     let (scratch_ptr, _c) = scratch_buf.device_ptr(s);
     let scratch = Scratch {
@@ -2001,6 +2042,8 @@ fn prefill_racecheck_small_gpu() -> Result<()> {
     let active_buf: CudaSlice<u32> = s.clone_htod(&active)?;
     let weights_buf: CudaSlice<bf16> = s.clone_htod(&weights)?;
     let gens_buf: CudaSlice<u64> = s.clone_htod(&gens)?;
+    let contributions_buf: CudaSlice<bf16> = s.alloc_zeros(rows * top_k * hidden)?;
+    let done_buf: CudaSlice<u32> = s.alloc_zeros(rows * top_k)?;
     let y: CudaSlice<bf16> = s.alloc_zeros(rows * hidden)?;
     let y_view = testing::dense_mut(&y, s, rows as u32, hidden as u32)?;
     let input = MoePrefill {
@@ -2019,6 +2062,13 @@ fn prefill_racecheck_small_gpu() -> Result<()> {
         shared_up: testing::dense(&su, s, inter as u32, hidden as u32)?,
         shared_down: testing::dense(&sd, s, hidden as u32, inter as u32)?,
         shared_expert_gate: testing::view(&seg, s, [hidden as u32], [1])?,
+        contributions: testing::view(
+            &contributions_buf,
+            s,
+            [rows as u32, top_k as u32, hidden as u32],
+            [(top_k * hidden) as u64, hidden as u64, 1],
+        )?,
+        done: testing::mut_view(&done_buf, s, [rows as u32, top_k as u32], [top_k as u64, 1])?,
         y: y_view,
     };
     ops.prefill(s, input, &scratch)?;
@@ -2072,7 +2122,7 @@ fn prefill_reset_done_gpu() -> Result<()> {
             vec![1u32; experts],
             vec![1u64; experts],
         )?;
-        let scratch_bytes = prefill_scratch_bytes(rows, top_k, experts, hidden, inter, None)?;
+        let scratch_bytes = prefill_scratch_bytes(rows, rows, top_k, experts, hidden, inter, None)?;
         let scratch_buf: CudaSlice<u8> = s.alloc_zeros(scratch_bytes as usize)?;
         let (scratch_ptr, _gs) = scratch_buf.device_ptr(s);
         let scratch = Scratch {
@@ -2207,7 +2257,7 @@ fn k5c_seam_child() -> Result<()> {
         vec![1u32; experts],
         vec![1u64; experts],
     )?;
-    let scratch_bytes = prefill_scratch_bytes(37, top_k, experts, hidden, inter, None)?;
+    let scratch_bytes = prefill_scratch_bytes(37, 37, top_k, experts, hidden, inter, None)?;
     let scratch_buf: CudaSlice<u8> = s.alloc_zeros(scratch_bytes as usize)?;
     let (scratch_ptr, _gs) = scratch_buf.device_ptr(s);
     let scratch = Scratch {
@@ -2425,7 +2475,15 @@ fn prefill_stage_backtoback_gpu() -> Result<()> {
         vec![1u32; experts],
         vec![1u64; experts],
     )?;
-    let scratch_bytes = prefill_scratch_bytes(fx.dims.rows, top_k, experts, hidden, inter, None)?;
+    let scratch_bytes = prefill_scratch_bytes(
+        fx.dims.rows,
+        fx.dims.rows,
+        top_k,
+        experts,
+        hidden,
+        inter,
+        None,
+    )?;
     let scratch_buf: CudaSlice<u8> = s.alloc_zeros(scratch_bytes as usize)?;
     let (scratch_ptr, _gs) = scratch_buf.device_ptr(s);
     let scratch = Scratch {
@@ -2480,5 +2538,407 @@ fn prefill_stage_backtoback_gpu() -> Result<()> {
         "back-to-back prefill outputs diverged: the stage mirror was rewritten before a queued copy completed"
     );
     eprintln!("moe_prefill H1 back-to-back 3x outputs bitwise-identical PASS");
+    Ok(())
+}
+
+/// Discriminating GPU test for T25.2 Step 2A:
+/// Runs one span (rows=769, coprime with 256 and 8) with forced 256-row waves
+/// and with packed waves from SpanPlan::pack_waves, with coprime activations
+/// and experts at both <= 16 rows (lane16) and > 16 rows (grouped GEMM).
+/// Asserts 0 differing bits in contributions, then verifies that an off-by-one
+/// wave base shift (and a host/device count mismatch) fail discriminantly.
+#[test]
+#[ignore = "requires GPU window, FF_Q38_GPU_WINDOW=granted"]
+fn prefill_packed_waves_gpu() -> Result<()> {
+    use crate::backend::cuda::contracts::view;
+    use crate::experts::{
+        catalogue::{ExpertGeometry, ExpertLayout},
+        plan::{ServiceCell, ServiceTable},
+        span::{SpanPlan, SpanRates},
+    };
+    use crate::model_spec::ExpertFormat;
+    anyhow::ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let d = crate::backend::cuda::Device::new(0)?;
+    let s = &d.stream;
+    let rows = 769usize;
+    let wave_rows = 256usize;
+    let fx = reference::fixture(MoeDims::minicpm47(rows), 19);
+    let (experts, top_k, hidden, inter) = (
+        fx.dims.experts,
+        fx.dims.top_k,
+        fx.dims.hidden,
+        fx.dims.inter,
+    );
+    // Confirm consecutive rows of fx.x carry distinct signal.
+    for r in 0..rows - 1 {
+        anyhow::ensure!(
+            fx.x[r * hidden..(r + 1) * hidden] != fx.x[(r + 1) * hidden..(r + 2) * hidden],
+            "fixture rows {r} and {} are identical",
+            r + 1
+        );
+    }
+    let geometry = ExpertGeometry {
+        layers: 1,
+        experts: experts as u32,
+        hidden: hidden as u32,
+        intermediate: inter as u32,
+        top_k: top_k as u32,
+    };
+    let slot_bytes = ExpertLayout::new(ExpertFormat::Bf16, &geometry)?.slot_bytes();
+    let mut cells = Vec::new();
+    for workers in [1u32, 2] {
+        for r in [1u32, 16, 256, 1024] {
+            for exp in [1u32, 2] {
+                cells.push(ServiceCell {
+                    workers,
+                    rows: r,
+                    experts: exp,
+                    seconds: f64::from(r) * 0.01 * f64::from(exp) / f64::from(workers),
+                });
+            }
+        }
+    }
+    let service = ServiceTable::new("packed_wave_test", cells)?;
+    let rates = SpanRates {
+        cpu_row_limit: 16,
+        service: &service,
+        h2d_bytes_per_second: 1e10,
+    };
+
+    // Routing construction across 769 rows * 8 choices = 6152 assignments:
+    // - Resident experts (0..12):
+    //   - experts 0..10 get > 16 rows each (~307 rows each -> 3076 assignments);
+    //   - experts 10..12 get <= 16 rows each (11 rows each -> 22 assignments);
+    //   Total resident assignments = 3098 (> 2048 -> 2 packed waves).
+    // - Staged experts (16..20, 2 cohorts of 2 experts):
+    //   - expert 16 gets > 16 rows; expert 17 gets > 16 rows (cohort 1 fits in 1 packed wave);
+    //   - expert 18 gets > 16 rows; expert 19 gets > 16 rows (cohort 2 fits in 1 packed wave).
+    let mut ids = vec![0i32; rows * top_k];
+    let mut weights = vec![bf16::ZERO; rows * top_k];
+    let mut counts = vec![0u32; experts];
+    for r in 0..rows {
+        for c in 0..top_k {
+            let expert = if c < 4 {
+                if r < 11 && c == 0 {
+                    10
+                } else if r < 11 && c == 1 {
+                    11
+                } else {
+                    ((r * 7 + c * 3) % 10) as i32
+                }
+            } else {
+                16 + ((r * 5 + (c - 4)) % 4) as i32
+            };
+            ids[r * top_k + c] = expert;
+            counts[expert as usize] += 1;
+            weights[r * top_k + c] =
+                bf16::from_f32(0.0625 + 0.015625 * ((r * 13 + c * 7) % 11) as f32);
+        }
+    }
+    anyhow::ensure!(
+        counts[10] <= 16 && counts[11] <= 16 && counts[0] > 16 && counts[16] > 16,
+        "expected both <=16 and >16 expert counts: c10={} c11={} c0={} c16={}",
+        counts[10],
+        counts[11],
+        counts[0],
+        counts[16]
+    );
+    let mut resident = vec![false; experts];
+    for flag in &mut resident[..12] {
+        *flag = true;
+    }
+    let mut plan = SpanPlan::new(&geometry, slot_bytes, 2, 2)?;
+    plan.update(&counts, &resident, rows as u32, wave_rows as u32, &rates)?;
+    plan.pack_waves(&counts, &ids)?;
+    anyhow::ensure!(
+        plan.cohort_waves(0)?.len() == 2 && plan.cohort_waves(1)?.len() == 1,
+        "expected cohort 0 to split into 2 packed waves and cohort 1 into 1: c0={:?} c1={:?}",
+        plan.cohort_waves(0)?,
+        plan.cohort_waves(1)?
+    );
+
+    let cpu_arithmetic: Vec<bool> = counts
+        .iter()
+        .map(|&c| c > 0 && c <= super::prefill::LANE16_ROWS)
+        .collect();
+    anyhow::ensure!(
+        cpu_arithmetic[10] && !cpu_arithmetic[0] && !cpu_arithmetic[16],
+        "expected both lane16 (true) and grouped GEMM (false) in cpu_arithmetic"
+    );
+
+    let ops = PrefillOps::new(&d.ctx, s, ExpertFormat::Bf16)?;
+    let gu: CudaSlice<bf16> = s.clone_htod(fx.gate_up.as_slice())?;
+    let dn: CudaSlice<bf16> = s.clone_htod(fx.down.as_slice())?;
+    let (gu_ptr, _a) = gu.device_ptr(s);
+    let (dn_ptr, _b) = dn.device_ptr(s);
+    let slots = device_slots(
+        s,
+        (0..experts as u64)
+            .map(|e| gu_ptr + e * (2 * inter * hidden * 2) as u64)
+            .collect(),
+        (0..experts as u64)
+            .map(|e| dn_ptr + e * (hidden * inter * 2) as u64)
+            .collect(),
+        vec![1u32; experts],
+        vec![1u64; experts],
+    )?;
+    let shared = SharedBufs {
+        sg: s.clone_htod(fx.shared_gate.as_slice())?,
+        su: s.clone_htod(fx.shared_up.as_slice())?,
+        sd: s.clone_htod(fx.shared_down.as_slice())?,
+        seg: s.clone_htod(fx.shared_expert_gate.as_slice())?,
+    };
+    // Split layout: rows = wave_rows (256), contribute_rows = rows (769).
+    let scratch_bytes =
+        prefill_scratch_bytes(wave_rows, rows, top_k, experts, hidden, inter, None)?;
+    let scratch_buf: CudaSlice<u8> = s.alloc_zeros(scratch_bytes as usize)?;
+    let (scratch_ptr, _gs) = scratch_buf.device_ptr(s);
+    let scratch = Scratch {
+        ptr: scratch_ptr,
+        bytes: scratch_bytes,
+    };
+
+    let x_dev: CudaSlice<bf16> = s.clone_htod(&fx.x[..rows * hidden])?;
+    let ids_dev: CudaSlice<i32> = s.clone_htod(&ids)?;
+    let weights_dev: CudaSlice<bf16> = s.clone_htod(&weights)?;
+    let gens_dev: CudaSlice<u64> = s.clone_htod(&vec![1u64; rows * top_k])?;
+    let total_cohorts = 1 + plan.cohort_count() as usize;
+    let cohort_masks: Vec<CudaSlice<u32>> = (0..total_cohorts)
+        .map(|cohort| {
+            let set: Vec<u32> = if cohort == 0 {
+                plan.resident().to_vec()
+            } else {
+                plan.cohorts().nth(cohort - 1).unwrap().to_vec()
+            };
+            let mask: Vec<u32> = ids
+                .iter()
+                .map(|&e| u32::from(set.contains(&(e as u32))))
+                .collect();
+            Ok(s.clone_htod(&mask)?)
+        })
+        .collect::<Result<_>>()?;
+
+    let run_waves = |packed: bool, shift_first_packed_wave: bool| -> Result<(Vec<u16>, Vec<u32>)> {
+        let contributions: CudaSlice<bf16> = s.alloc_zeros(rows * top_k * hidden)?;
+        let done: CudaSlice<u32> = s.alloc_zeros(rows * top_k)?;
+        for (cohort, active_dev) in cohort_masks.iter().enumerate() {
+            let waves: Vec<(u32, u32, Option<u32>)> = if packed {
+                plan.cohort_waves(cohort)?
+                    .iter()
+                    .map(|&(base, w_rows, active)| (base, w_rows, Some(active)))
+                    .collect()
+            } else {
+                (0..rows as u32)
+                    .step_by(wave_rows)
+                    .map(|base| (base, (wave_rows as u32).min(rows as u32 - base), None))
+                    .collect()
+            };
+            for (w_idx, (base, w_rows, wave_active)) in waves.into_iter().enumerate() {
+                let x_base = if shift_first_packed_wave && cohort == 0 && w_idx == 1 {
+                    base - 1
+                } else {
+                    base
+                };
+                let b = base as usize;
+                ops.prefill_contribute(
+                    s,
+                    MoePrefillContribute {
+                        cpu_arithmetic: &cpu_arithmetic,
+                        fp8_slot: None,
+                        wave: wave_active.map(|a| (cohort, base, a)),
+                        x: view(
+                            &x_dev,
+                            s,
+                            x_base as usize * hidden,
+                            [w_rows, hidden as u32],
+                            [hidden as u64, 1],
+                        )?,
+                        ids: view(
+                            &ids_dev,
+                            s,
+                            b * top_k,
+                            [w_rows, top_k as u32],
+                            [top_k as u64, 1],
+                        )?,
+                        weights: view(
+                            &weights_dev,
+                            s,
+                            b * top_k,
+                            [w_rows, top_k as u32],
+                            [top_k as u64, 1],
+                        )?,
+                        active: view(
+                            active_dev,
+                            s,
+                            b * top_k,
+                            [w_rows, top_k as u32],
+                            [top_k as u64, 1],
+                        )?,
+                        assignment_gen: view(
+                            &gens_dev,
+                            s,
+                            b * top_k,
+                            [w_rows, top_k as u32],
+                            [top_k as u64, 1],
+                        )?,
+                        slots_gate_up: testing::view(&slots.gu_dev, s, [experts as u32], [1])?,
+                        slots_down: testing::view(&slots.dn_dev, s, [experts as u32], [1])?,
+                        slot_valid: testing::view(&slots.valid, s, [experts as u32], [1])?,
+                        slot_generation: testing::view(
+                            &slots.generation,
+                            s,
+                            [experts as u32],
+                            [1],
+                        )?,
+                        slots_gate_up_host: &slots.gu_host,
+                        slots_down_host: &slots.dn_host,
+                        shared_gate: testing::dense(&shared.sg, s, inter as u32, hidden as u32)?,
+                        shared_up: testing::dense(&shared.su, s, inter as u32, hidden as u32)?,
+                        shared_down: testing::dense(&shared.sd, s, hidden as u32, inter as u32)?,
+                        shared_expert_gate: testing::view(&shared.seg, s, [hidden as u32], [1])?,
+                        contributions: view(
+                            &contributions,
+                            s,
+                            b * top_k * hidden,
+                            [w_rows, top_k as u32, hidden as u32],
+                            [(top_k * hidden) as u64, hidden as u64, 1],
+                        )?,
+                        done: TensorMut(view(
+                            &done,
+                            s,
+                            b * top_k,
+                            [w_rows, top_k as u32],
+                            [top_k as u64, 1],
+                        )?),
+                    },
+                    &scratch,
+                )?;
+            }
+        }
+        s.synchronize()?;
+        let bits = s
+            .clone_dtoh(&contributions)?
+            .into_iter()
+            .map(|v| v.to_bits())
+            .collect();
+        let done_host = s.clone_dtoh(&done)?;
+        Ok((bits, done_host))
+    };
+
+    let (fixed_bits, fixed_done) = run_waves(false, false)?;
+    let (packed_bits, packed_done) = run_waves(true, false)?;
+    anyhow::ensure!(
+        fixed_done.iter().all(|&d| d == 1) && packed_done.iter().all(|&d| d == 1),
+        "incomplete done bits in fixed or packed wave run"
+    );
+    let diff_bits = fixed_bits
+        .iter()
+        .zip(&packed_bits)
+        .filter(|(a, b)| a != b)
+        .count();
+    eprintln!(
+        "prefill_packed_waves_gpu rows={rows} cohorts={total_cohorts} c0_waves={} c1_waves={} diff_bits={diff_bits}",
+        plan.cohort_waves(0)?.len(),
+        plan.cohort_waves(1)?.len()
+    );
+    anyhow::ensure!(
+        diff_bits == 0,
+        "packed waves diverged from forced 256-row waves: diff_bits={diff_bits}"
+    );
+
+    // Control 1: plant an off-by-one wave base (shifted by 1 row); must FAIL (>0 differing bits).
+    let (shifted_bits, _) = run_waves(true, true)?;
+    let shifted_diff = fixed_bits
+        .iter()
+        .zip(&shifted_bits)
+        .filter(|(a, b)| a != b)
+        .count();
+    eprintln!(
+        "prefill_packed_waves_gpu off-by-one base control shifted_diff_bits={shifted_diff} DETECTED"
+    );
+    anyhow::ensure!(
+        shifted_diff > 0,
+        "off-by-one wave base control was not detected"
+    );
+
+    // Control 2: mismatch host-packed active count against device count at :899; must return Err.
+    let &(base, w_rows, active) = &plan.cohort_waves(0)?[0];
+    let bad_c: CudaSlice<bf16> = s.alloc_zeros(w_rows as usize * top_k * hidden)?;
+    let bad_d: CudaSlice<u32> = s.alloc_zeros(w_rows as usize * top_k)?;
+    let mismatch = ops.prefill_contribute(
+        s,
+        MoePrefillContribute {
+            cpu_arithmetic: &cpu_arithmetic,
+            fp8_slot: None,
+            wave: Some((0, base, active - 1)),
+            x: view(
+                &x_dev,
+                s,
+                base as usize * hidden,
+                [w_rows, hidden as u32],
+                [hidden as u64, 1],
+            )?,
+            ids: view(
+                &ids_dev,
+                s,
+                base as usize * top_k,
+                [w_rows, top_k as u32],
+                [top_k as u64, 1],
+            )?,
+            weights: view(
+                &weights_dev,
+                s,
+                base as usize * top_k,
+                [w_rows, top_k as u32],
+                [top_k as u64, 1],
+            )?,
+            active: view(
+                &cohort_masks[0],
+                s,
+                base as usize * top_k,
+                [w_rows, top_k as u32],
+                [top_k as u64, 1],
+            )?,
+            assignment_gen: view(
+                &gens_dev,
+                s,
+                base as usize * top_k,
+                [w_rows, top_k as u32],
+                [top_k as u64, 1],
+            )?,
+            slots_gate_up: testing::view(&slots.gu_dev, s, [experts as u32], [1])?,
+            slots_down: testing::view(&slots.dn_dev, s, [experts as u32], [1])?,
+            slot_valid: testing::view(&slots.valid, s, [experts as u32], [1])?,
+            slot_generation: testing::view(&slots.generation, s, [experts as u32], [1])?,
+            slots_gate_up_host: &slots.gu_host,
+            slots_down_host: &slots.dn_host,
+            shared_gate: testing::dense(&shared.sg, s, inter as u32, hidden as u32)?,
+            shared_up: testing::dense(&shared.su, s, inter as u32, hidden as u32)?,
+            shared_down: testing::dense(&shared.sd, s, hidden as u32, inter as u32)?,
+            shared_expert_gate: testing::view(&shared.seg, s, [hidden as u32], [1])?,
+            contributions: view(
+                &bad_c,
+                s,
+                0,
+                [w_rows, top_k as u32, hidden as u32],
+                [(top_k * hidden) as u64, hidden as u64, 1],
+            )?,
+            done: TensorMut(view(
+                &bad_d,
+                s,
+                0,
+                [w_rows, top_k as u32],
+                [top_k as u64, 1],
+            )?),
+        },
+        &scratch,
+    );
+    anyhow::ensure!(
+        mismatch.is_err(),
+        "mismatched wave active count control was not detected"
+    );
     Ok(())
 }

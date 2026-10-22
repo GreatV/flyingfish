@@ -464,6 +464,7 @@ impl Prefill {
                     .stream
                     .alloc_zeros(usize::try_from(prefill_scratch_bytes(
                         capacity.wave_rows as usize,
+                        capacity.span_rows as usize,
                         geometry.top_k as usize,
                         geometry.experts as usize,
                         geometry.hidden as usize,
@@ -733,6 +734,7 @@ impl Prefill {
             self.gpu.scratch.len() as u64
                 >= prefill_scratch_bytes(
                     self.capacity.wave_rows.min(rows) as usize,
+                    rows as usize,
                     self.geometry.top_k as usize,
                     self.geometry.experts as usize,
                     self.geometry.hidden as usize,
@@ -806,6 +808,7 @@ impl Prefill {
                 cpu_row_limit: self.cpu_ceiling,
             },
         )?;
+        self.plan.pack_waves(&self.counts, host_ids)?;
         let plan = &self.plan;
         arithmetic_mask(&self.counts, &mut self.gpu.cpu_arithmetic)?;
         for &expert in plan.cpu() {
@@ -1693,8 +1696,8 @@ impl Gpu {
                 slots.physical[position as usize].reader = Some(ticket.clone());
             }
         }
-        leases.reset(plan.waves())?;
         for (cohort, experts) in plan.cohorts().enumerate() {
+            leases.reset(u32::try_from(plan.cohort_waves(cohort + 1)?.len())?)?;
             for (position, &expert) in experts.iter().enumerate() {
                 if let Some(reader) = self.staging_readers[position].take() {
                     slots.transfers.h2d.wait(&reader.event)?;
@@ -1850,13 +1853,13 @@ impl Gpu {
         }
         let range = cohort * geometry.experts as usize..(cohort + 1) * geometry.experts as usize;
         let mut last = None;
-        for base in (0..plan.span_rows()).step_by(plan.wave_rows() as usize) {
-            let rows = plan.wave_rows().min(plan.span_rows() - base);
+        for &(base, rows, active) in plan.cohort_waves(cohort)? {
             ops.prefill_contribute(
                 stream,
                 MoePrefillContribute {
                     cpu_arithmetic: &self.cpu_arithmetic,
                     fp8_slot: slots.catalogue.layout().fp8_slot(),
+                    wave: Some((cohort, base, active)),
                     x: span.hidden(&span.layout.normalized, base, rows)?,
                     ids: span.choices(&span.layout.ids, base, rows)?,
                     weights: span.choices(&span.layout.weights, base, rows)?,
@@ -2105,6 +2108,7 @@ mod tests {
             let generation = stream.clone_htod(&vec![1u64; rows])?;
             let layout = crate::backend::cuda::moe::prefill::prefill_layout(
                 rows,
+                rows,
                 1,
                 geometry.experts as usize,
                 hidden,
@@ -2112,6 +2116,7 @@ mod tests {
                 None,
             )?;
             let scratch = stream.alloc_zeros::<u8>(usize::try_from(prefill_scratch_bytes(
+                rows,
                 rows,
                 1,
                 geometry.experts as usize,
@@ -2144,6 +2149,7 @@ mod tests {
                         MoePrefillContribute {
                             cpu_arithmetic: &arithmetic,
                             fp8_slot: None,
+                            wave: None,
                             x: qwen::matrix(&x_device, stream, 0, rows, hidden)?,
                             ids: testing::dense(&ids, stream, rows as u32, 1)?,
                             weights: testing::dense(&routing_device, stream, rows as u32, 1)?,
@@ -2915,6 +2921,7 @@ mod tests {
         let y = stream.alloc_zeros::<bf16>(rows * 128)?;
         let scratch = stream.alloc_zeros::<u8>(prefill_scratch_bytes(
             wave,
+            wave,
             4,
             16,
             128,
@@ -2934,6 +2941,7 @@ mod tests {
                     MoePrefillContribute {
                         cpu_arithmetic: &arithmetic,
                         fp8_slot: slots.catalogue.layout().fp8_slot(),
+                        wave: None,
                         x: qwen::matrix(&input, stream, base * 128, count, 128)?,
                         ids: view(&ids, stream, base * 4, [count as u32, 4], [4, 1])?,
                         weights: view(&weights, stream, base * 4, [count as u32, 4], [4, 1])?,
