@@ -3,6 +3,449 @@ use super::*;
 use crate::vision_input::{ImageGrid, MultimodalInput};
 use safetensors::{Dtype, SafeTensors};
 
+fn placement_compare(label: &str, a: &[f32], b: &[f32]) -> Result<usize> {
+    ensure!(
+        !a.is_empty() && a.len() == b.len(),
+        "Runner FAIL {label} extent"
+    );
+    ensure!(
+        a.iter().chain(b).all(|v| v.is_finite()),
+        "Runner FAIL {label} nonfinite"
+    );
+    let mismatches = a
+        .iter()
+        .zip(b)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    let first = a
+        .iter()
+        .zip(b)
+        .position(|(a, b)| a.to_bits() != b.to_bits());
+    let max_abs = a
+        .iter()
+        .zip(b)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let ordered = |value: f32| {
+        let bits = bf16::from_f32(value).to_bits();
+        if bits & 0x8000 == 0 {
+            bits | 0x8000
+        } else {
+            !bits
+        }
+    };
+    let max_bf16_ulp = a
+        .iter()
+        .zip(b)
+        .map(|(&a, &b)| ordered(a).abs_diff(ordered(b)))
+        .max()
+        .context("empty comparison")?;
+    println!(
+        "{} placement_comparison {}",
+        if mismatches == 0 { "PASS" } else { "DEFECT" },
+        serde_json::json!({
+            "label":label,"elements":a.len(),"bit_mismatches":mismatches,"first":first,
+            "first_a":first.map(|i|a[i]),"first_b":first.map(|i|b[i]),"max_abs":max_abs,"max_bf16_ulp":max_bf16_ulp
+        })
+    );
+    Ok(usize::from(mismatches != 0))
+}
+
+fn placement_graph(
+    stream: &Arc<CudaStream>,
+    launch: impl FnOnce() -> Result<()>,
+) -> Result<CudaGraph> {
+    stream.synchronize()?;
+    stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+    let launched = launch();
+    let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
+    launched?;
+    let graph = captured?.context("Runner FAIL empty placement graph")?;
+    graph.upload()?;
+    stream.synchronize()?;
+    Ok(graph)
+}
+
+fn placement_components(engine: &Engine, model: &Path) -> Result<usize> {
+    use crate::experts::{
+        catalogue::ExpertCatalogue,
+        disk::{DiskExperts, DiskReader},
+    };
+    let device = &engine.device;
+    let stream = &device.stream;
+    let geometry = ExpertGeometry::from_model(&engine.model_spec)?;
+    ensure!(
+        geometry.hidden == 2048
+            && geometry.intermediate == 512
+            && geometry.top_k == 8
+            && geometry.experts == 256,
+        "Runner FAIL placement geometry {geometry:?}"
+    );
+    let manifest = crate::checkpoint::MappedCheckpoint::open(model)?
+        .manifest(&engine.model_spec, crate::checkpoint::LoadPolicy::TextOnly)?;
+    let catalogue = Arc::new(ExpertCatalogue::from_manifest(
+        &manifest,
+        geometry,
+        crate::model_spec::ExpertFormat::Bf16,
+    )?);
+    let reader = DiskReader::open(&catalogue, model, 1)?;
+    let elements = usize::try_from(catalogue.slot_bytes() / 2)?;
+    let host = HostBlocks::new(1, elements)?;
+    let mut gpu_weights = Vec::new();
+    for expert in 0..8 {
+        let index = reader.read_expert(0, expert, &catalogue)?;
+        let lease = reader.values(index)?;
+        if expert == 0 {
+            host.claim(0)?.slice()?.copy_from_slice(&lease);
+        }
+        gpu_weights.push(stream.clone_htod(&lease)?);
+    }
+    let mut gate_ptrs = vec![0u64; 256];
+    let mut down_ptrs = vec![0u64; 256];
+    let mut valid = vec![0u32; 256];
+    let mut generations = vec![0u64; 256];
+    for (expert, weights) in gpu_weights.iter().enumerate() {
+        gate_ptrs[expert] = weights.device_ptr(stream).0;
+        down_ptrs[expert] = gate_ptrs[expert] + catalogue.layout().down_offset();
+        valid[expert] = 1;
+        generations[expert] = 1;
+    }
+    let gates = stream.clone_htod(&gate_ptrs)?;
+    let downs = stream.clone_htod(&down_ptrs)?;
+    let valid = stream.clone_htod(&valid)?;
+    let generations = stream.clone_htod(&generations)?;
+    let table = SlotBindings {
+        gate_up: view(&gates, stream, 0, [256], [1])?,
+        down: view(&downs, stream, 0, [256], [1])?,
+        valid: view(&valid, stream, 0, [256], [1])?,
+        generation: view(&generations, stream, 0, [256], [1])?,
+    };
+    let input = (0..2048)
+        .map(|index| bf16::from_f32(((index * 37 % 131) as f32 - 65.0) / 128.0))
+        .collect::<Vec<_>>();
+    let x_buffer = stream.clone_htod(&input)?;
+    let y = stream.alloc_zeros::<bf16>(2048)?;
+    let x = qwen::matrix(&x_buffer, stream, 0, 1, 2048)?;
+    let mut y_view = TensorMut(qwen::matrix(&y, stream, 0, 1, 2048)?);
+    let ffn = engine.moe_ffn_binding(0)?;
+    let mut decode = Decode::new(
+        device,
+        geometry,
+        1,
+        1,
+        (1, 8),
+        crate::model_spec::ExpertFormat::Bf16,
+    )?;
+    let ids = (0..8).collect::<Vec<i32>>();
+    let weights = [bf16::from_f32(0.125); 8];
+    stream.memcpy_htod(&ids, &mut decode.ids)?;
+    stream.memcpy_htod(&weights, &mut decode.weights)?;
+    stream.memcpy_htod(&[1u32; 8], &mut decode.active)?;
+    stream.memcpy_htod(&[1u64; 8], &mut decode.generation)?;
+    decode.contribute_device(device, ffn, table, x)?;
+    decode.combine_device(device, ffn, x, &mut y_view)?;
+    let route = placement_graph(stream, || decode.route_device(device, ffn, x))?;
+    let contribute = placement_graph(stream, || decode.contribute_device(device, ffn, table, x))?;
+    let join = placement_graph(stream, || {
+        decode.combine_device(device, ffn, x, &mut y_view)
+    })?;
+    decode.segments.push(graphs::Segments {
+        route,
+        contribute,
+        join,
+    });
+    let native = [ExpertWeights::from_slot(
+        Shape::new(2048, 512)?,
+        host.block_range(0)?,
+        catalogue.layout(),
+    )?];
+    let mut disk = DiskExperts::new(catalogue.clone(), model, 1, 1)?;
+    let assignment = [Assignment {
+        row: 0,
+        choice: 0,
+        expert: 0,
+        weight: weights[0],
+    }];
+    let disk_route = [crate::experts::runtime::Route {
+        row: 0,
+        choice: 0,
+        expert: 0,
+        weight: weights[0],
+    }];
+    let mut defects = 0;
+    let mut eager = Vec::new();
+    for tier in 0..3 {
+        let mut reference: Option<Vec<f32>> = None;
+        for (repeat, graph) in [(0, false), (1, false), (0, true)] {
+            stream.memcpy_htod(&ids, &mut decode.ids)?;
+            stream.memcpy_htod(&weights, &mut decode.weights)?;
+            let active = if tier == 0 {
+                [1; 8]
+            } else {
+                [0, 1, 1, 1, 1, 1, 1, 1]
+            };
+            decode.read_route(device, ffn, x)?;
+            let dispatch = Dispatch {
+                active: &active,
+                generation: &[1; 8],
+                host: Some(host.clone()),
+                experts: &native,
+                assignments: if tier == 1 { &assignment } else { &[] },
+                miss_rows: if tier == 0 { &[] } else { &[0] },
+                host_dma: None,
+                disk: if tier == 2 { &disk_route } else { &[] },
+                disk_cpu: Some(&mut disk),
+                layer: 0,
+            };
+            let before = decode.stats;
+            let _range = super::super::super::profile::Range::new(true, c"placement_component");
+            decode.finish_with(
+                device,
+                ffn,
+                table,
+                dispatch,
+                (x, &mut y_view),
+                graph.then_some(0),
+            )?;
+            stream.synchronize()?;
+            ensure!(
+                decode.stats[1] - before[1] == if tier == 0 { 8 } else { 7 }
+                    && decode.stats[2] - before[2] == u64::from(tier != 0),
+                "Runner FAIL forced tier coverage"
+            );
+            let done = stream.clone_dtoh(&decode.done)?;
+            ensure!(done == [1; 8], "Runner FAIL placement completion words");
+            ensure!(
+                stream.clone_dtoh(&decode.ids)? == ids
+                    && stream.clone_dtoh(&decode.weights)? == weights,
+                "Runner FAIL placement changed frozen routing"
+            );
+            let mut values = stream
+                .clone_dtoh(&decode.contributions)?
+                .into_iter()
+                .map(bf16::to_f32)
+                .collect::<Vec<_>>();
+            values.extend(stream.clone_dtoh(&y)?.into_iter().map(bf16::to_f32));
+            println!(
+                "PASS placement_path tier={tier} graph={graph} repeat={repeat} gpu_choices={} cpu_choices={} disk_choices={} graph_launches={} input=[1,2048] contributions=[1,8,2048] output=[1,2048]",
+                decode.stats[1] - before[1],
+                u64::from(tier == 1),
+                u64::from(tier == 2),
+                if graph { 2 } else { 0 }
+            );
+            if let Some(previous) = &reference {
+                defects += placement_compare(
+                    &format!(
+                        "tier{tier}_{}",
+                        if graph { "graph_eager" } else { "self_repeat" }
+                    ),
+                    previous,
+                    &values,
+                )?;
+            } else {
+                reference = Some(values);
+            }
+        }
+        eager.push(reference.context("missing eager placement")?);
+    }
+    defects += placement_compare(
+        "gpu_host_contribution",
+        &eager[0][..2048],
+        &eager[1][..2048],
+    )?;
+    defects += placement_compare(
+        "host_disk_contribution",
+        &eager[1][..2048],
+        &eager[2][..2048],
+    )?;
+    defects += placement_compare("gpu_host_output", &eager[0][16384..], &eager[1][16384..])?;
+    defects += placement_compare("host_disk_output", &eager[1][16384..], &eager[2][16384..])?;
+    Ok(defects)
+}
+
+#[test]
+#[ignore = "exclusive CUDA, published BF16 FF_MODEL, text fixtures and pinned runtime/placement-prefix.json"]
+fn minicpm_placement_invariance_gpu() -> Result<()> {
+    let model = PathBuf::from(std::env::var_os("FF_MODEL").context("placement model missing")?);
+    let fixtures = PathBuf::from(
+        std::env::var_os("FF_MINICPM_REFERENCE_DIR").context("placement fixtures missing")?,
+    );
+    let runtime = PathBuf::from(
+        std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("placement runtime missing")?,
+    );
+    let forced: Vec<u32> =
+        serde_json::from_slice(&std::fs::read(runtime.join("placement-prefix.json"))?)?;
+    let spec = crate::model_spec::ModelSpec::read(&model)?;
+    ensure!(
+        spec.expert_format == Some(crate::model_spec::ExpertFormat::Bf16)
+            && forced.len() == 201
+            && forced.iter().all(|&id| id < spec.vocab),
+        "Runner FAIL placement prefix/format"
+    );
+    let source_bytes = std::fs::read(fixtures.join("text_1k.safetensors"))?;
+    let source = SafeTensors::deserialize(&source_bytes)?;
+    let input = Input::read(&source, "text_1k")?;
+    ensure!(
+        input.ids.len() == 1024,
+        "Runner FAIL placement text_1k extent"
+    );
+    let settings = Settings {
+        runtime_dir: Some(runtime),
+        prefix_cache: false,
+        draft_model: None,
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: true,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    let mut engine = Engine::load(&model, 0, 4352, None, settings)?;
+    ensure!(
+        engine.has_moe_segments(),
+        "Runner FAIL placement graph segments absent"
+    );
+    let component_range = super::super::super::profile::Range::new(true, c"placement_components");
+    let mut defects = placement_components(&engine, &model)?;
+    drop(component_range);
+    engine.reset()?;
+    engine.prefill(&input.ids, None)?;
+    for &id in &forced[..200] {
+        engine.set_token(id)?;
+        engine.decode(false, None)?;
+    }
+    engine.set_token(forced[200])?;
+    engine.device.stream.synchronize()?;
+    engine
+        .moe_prefill
+        .as_ref()
+        .context("placement prefill missing")?
+        .reseed_request(
+            engine
+                .moe_slots
+                .as_mut()
+                .context("placement slots missing")?,
+        )?;
+    engine
+        .moe_slots
+        .as_mut()
+        .context("placement slots missing")?
+        .freeze_probe_admissions()?;
+    let stream = engine.device.stream.clone();
+    let mut saved = super::super::super::state::StateCheckpoint::new(
+        &engine.state,
+        &engine.model_spec,
+        1,
+        &stream,
+    )?;
+    saved.save(
+        &engine.state,
+        &engine.work.token,
+        engine.position,
+        &stream,
+        None,
+    )?;
+    let host_boundary = (
+        engine.position,
+        engine.pending_token,
+        engine.resident_ids_len,
+        engine.last_input_kind,
+        engine.committed_prefix_ids.clone(),
+        engine.qwen_device_prefix,
+    );
+    let position = stream.clone_dtoh(&engine.work.position)?;
+    let length = stream.clone_dtoh(&engine.work.length)?;
+    let placement = |engine: &Engine| -> Result<_> {
+        let slots = engine
+            .moe_slots
+            .as_ref()
+            .context("placement slots missing")?;
+        let mut trace = Trace::default();
+        slots.trace(&mut trace)?;
+        Ok((
+            slots.capture_placement()?,
+            trace.values("residency.generation")?.to_vec(),
+        ))
+    };
+    let initial = placement(&engine)?;
+    let mut expected: Option<(Vec<f32>, Vec<u32>)> = None;
+    for graph in [false, true] {
+        if graph {
+            engine
+                .moe_prefill
+                .as_ref()
+                .context("placement prefill missing")?
+                .reseed_request(
+                    engine
+                        .moe_slots
+                        .as_mut()
+                        .context("placement slots missing")?,
+                )?;
+            saved.restore(&mut engine.state, &mut engine.work.token, &stream)?;
+            engine.position = host_boundary.0;
+            engine.pending_token = host_boundary.1;
+            engine.resident_ids_len = host_boundary.2;
+            engine.last_input_kind = host_boundary.3;
+            engine.committed_prefix_ids.clone_from(&host_boundary.4);
+            engine.qwen_device_prefix = host_boundary.5;
+            stream.memcpy_htod(&position, &mut engine.work.position)?;
+            stream.memcpy_htod(&length, &mut engine.work.length)?;
+        }
+        ensure!(
+            placement(&engine)? == initial,
+            "Runner FAIL full decoder placement/generation changed before arm"
+        );
+        engine.decode(graph, None)?;
+        stream.synchronize()?;
+        ensure!(
+            placement(&engine)? == initial,
+            "Runner FAIL full decoder placement/generation changed during arm"
+        );
+        let logits = engine.decode_logits()?;
+        ensure!(logits.len() == 248144, "Runner FAIL placement logit extent");
+        let state = super::tests::graph_state(&engine)?;
+        let mut top = [f32::NEG_INFINITY; 2];
+        for &value in &logits {
+            if value > top[0] {
+                top[1] = top[0];
+                top[0] = value;
+            } else if value > top[1] {
+                top[1] = value;
+            }
+        }
+        println!(
+            "PASS placement_full_arm graph={graph} prefix={} teacher_ids=201 prediction={} top2_margin={} graph_segments={} admission_moves=0",
+            host_boundary.0,
+            engine.token()?,
+            top[0] - top[1],
+            engine.graphs.len()
+        );
+        if let Some((a, previous)) = &expected {
+            defects += placement_compare("full_graph_eager_logits", a, &logits)?;
+            ensure!(
+                previous.len() == state.len(),
+                "Runner FAIL placement state extent"
+            );
+            let mismatch = previous.iter().zip(&state).filter(|(a, b)| a != b).count();
+            defects += usize::from(mismatch != 0);
+            println!(
+                "{} placement_full_state words={} bit_mismatches={mismatch}",
+                if mismatch == 0 { "PASS" } else { "DEFECT" },
+                state.len()
+            );
+        } else {
+            expected = Some((logits, state));
+        }
+    }
+    println!(
+        "{} placement_invariance comparisons_complete=true identity_defects={defects} format=BF16 rows=1 graph_eager=true tiers=GPU,Host,Disk strict_bits=true",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(
+        defects == 0,
+        "DEFECT placement identity comparisons={defects}"
+    );
+    Ok(())
+}
+
 #[derive(Debug)]
 struct Bounds {
     layers: std::collections::BTreeMap<usize, [f64; 4]>,
