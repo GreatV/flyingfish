@@ -3,8 +3,7 @@
 //   W: bf16 row-major [out,in], row stride ldw elements (packed: ldw == in).
 //   X: bf16 row-major [m,in] packed.  Y: bf16 row-major [m,out].
 //   fp32 accumulation (MMA D fragments), one bf16 rounding at the store.
-// FD_GUARD_SKINNY calls __trap() on m outside [1,16], in % 256 != 0, ldw % 8 != 0, or
-// blockDim.x != 128.
+// Regular MMA requires in % 256 == 0 and ldw % 8 == 0.
 // Block = 4 warps over 16 consecutive W rows (the m16 tile of mma.m16n8k16); warp w sweeps
 // k in [w*in/4, (w+1)*in/4); the warps merge fp32 partials through smem at the end.
 // Per warp per 64-wide in-chunk: 4 k16 slices; A = ldmatrix.x4 on the W tile (row-major
@@ -16,6 +15,7 @@
 // W and X are 16B-aligned. Every Y element is written by exactly one block.
 // tiny: grid [out,m,1], 128 threads, four FP32 shared partials per CTA.
 // tiny uses fixed lane-strided BF16 pairs and fixed FP32 reductions for every m.
+// tiny requires positive even in, even ldw >= in, and 4B-aligned W/X bases.
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 
@@ -56,21 +56,19 @@ constexpr int WT_BYTES = NW * RT * LDS * 2;        // 9216 per buffer
 constexpr int XT_BYTES = NW * MA * LDS * 2;        // 9216 per buffer
 constexpr int MG_OFF = 2 * (WT_BYTES + XT_BYTES);  // 36864; + merge 4096 = 40960 total
 
-#define FD_GUARD_SKINNY do {                                                            \
-  if (blockDim.x != NT_ || in_features % (NW * CK) != 0 || (ldw & 7) != 0 ||            \
-      m < 1 || m > MA) __trap();                                                        \
-} while (0)
-
 extern "C" __global__ void __launch_bounds__(NT_) gemm_skinny_bf16(
     const bf16* __restrict__ W, const bf16* __restrict__ X,
     bf16* __restrict__ Y, int out_features, int in_features,
     long ldw, int m, int tiny) {
-  FD_GUARD_SKINNY;
+  if (blockDim.x != NT_ || m < 1 || m > MA || out_features < 1 ||
+      in_features < 1 || ldw < in_features) __trap();
 
   const int tid  = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
   if (tiny) {
+    if ((in_features & 1) != 0 || (ldw & 1) != 0 ||
+        ((size_t)W & 3) != 0 || ((size_t)X & 3) != 0) __trap();
     if (gridDim.x != out_features || gridDim.y != m || gridDim.z != 1) __trap();
     const int output = blockIdx.x;
     const int row = blockIdx.y;
@@ -98,6 +96,7 @@ extern "C" __global__ void __launch_bounds__(NT_) gemm_skinny_bf16(
     }
     return;
   }
+  if (in_features % (NW * CK) != 0 || (ldw & 7) != 0) __trap();
   const int row0 = blockIdx.x * RT;                 // this block's first W row
   const int nck  = in_features / (NW * CK);         // 64-wide in-chunks per warp
   const int kbeg = warp * (in_features / NW);       // warp's k-quarter start

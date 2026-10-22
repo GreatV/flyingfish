@@ -422,6 +422,7 @@ impl DecodeOps {
                                 output: columns as usize,
                                 input: inner as usize,
                             },
+                            false,
                         )?)?;
                 }
                 Ok(())
