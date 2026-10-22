@@ -138,6 +138,7 @@ pub(super) struct Runtime {
     arena: Option<CudaSlice<u8>>,
     scratch: CudaSlice<u8>,
     kv_scratch: Option<(CudaSlice<bf16>, CudaSlice<bf16>)>,
+    pub(super) prompt: Option<CudaSlice<bf16>>,
     mask: CudaSlice<u64>,
     layers: Vec<Layer>,
     common: CommonOpsRef,
@@ -672,6 +673,7 @@ impl Runtime {
             arena,
             scratch: scratch_buffer,
             kv_scratch,
+            prompt: None,
             mask,
             layers,
             common,
@@ -1280,37 +1282,62 @@ impl Engine {
             None
         };
         let dense_budget;
+        let mut dense_prompt_bytes = 0;
         let budget = if let Some(setup) = &expert_setup {
             &setup.workspace.mixer
         } else {
-            dense_budget = crate::prefill::WorkspaceBudget::new(
-                request,
-                |rows| {
-                    let mut target =
-                        Runtime::workspace(&model_spec, rows, capacity, gdn_policy, verify_rows)?;
-                    if settings.kv_format != crate::kv::KvFormat::Bf16 {
-                        target = target.max(
-                            crate::op_contract::AttentionWorkspace::new(
-                                &attention,
-                                verify_rows as u32,
-                                capacity as u32,
-                                limits(verify_rows, capacity)?.key_chunk,
-                            )?
-                            .bytes as usize,
-                        );
-                    }
-                    target
-                        .checked_add(
-                            mtp_budget
-                                .as_ref()
-                                .map(|b| b.workspace(rows))
-                                .transpose()?
-                                .unwrap_or(0),
-                        )
-                        .context("Q38 combined workspace overflow")
-                },
-                |admitted| Ok(default_chunk(admitted)),
+            let workspace = |rows| {
+                let mut target =
+                    Runtime::workspace(&model_spec, rows, capacity, gdn_policy, verify_rows)?;
+                if settings.kv_format != crate::kv::KvFormat::Bf16 {
+                    target = target.max(
+                        crate::op_contract::AttentionWorkspace::new(
+                            &attention,
+                            verify_rows as u32,
+                            capacity as u32,
+                            limits(verify_rows, capacity)?.key_chunk,
+                        )?
+                        .bytes as usize,
+                    );
+                }
+                target
+                    .checked_add(
+                        mtp_budget
+                            .as_ref()
+                            .map(|b| b.workspace(rows))
+                            .transpose()?
+                            .unwrap_or(0),
+                    )
+                    .context("Q38 combined workspace overflow")
+            };
+            let initial = crate::prefill::WorkspaceBudget::new(request, workspace, |admitted| {
+                Ok(default_chunk(admitted))
+            })?;
+            dense_prompt_bytes = crate::prefill::dense_prompt_bytes(
+                &model_spec,
+                capacity,
+                initial.plan.chunk,
+                settings.kv_format,
             )?;
+            dense_budget = if dense_prompt_bytes == 0 {
+                initial
+            } else {
+                crate::prefill::WorkspaceBudget::new(
+                    crate::prefill::WorkspaceRequest {
+                        fixed_transient_bytes: request.fixed_transient_bytes
+                            .checked_add(dense_prompt_bytes)
+                            .context("dense prefill fixed bytes overflow")?,
+                        ..request
+                    },
+                    workspace,
+                    |admitted| {
+                        ensure!(initial.plan.chunk <= admitted,
+                            "dense prefill prompt buffers cannot preserve chunk {} within {admitted} rows",
+                            initial.plan.chunk);
+                        Ok(initial.plan.chunk)
+                    },
+                ).context("dense prefill prompt-buffer admission")?
+            };
             &dense_budget
         };
         let chunk = budget.plan.chunk;
@@ -1369,6 +1396,7 @@ impl Engine {
                 "target_transaction_planned_bytes": target_transaction_bytes,
                 "target_all_row_head_bytes": target_head_bytes,
                 "layer_arena_bytes": arena_bytes,
+                "dense_prefill_prompt_bytes": dense_prompt_bytes,
                 "attention_prefill_preprocess_bytes": FullAttentionOps::preprocess_workspace(&attention, limits(rows, capacity)?)?.bytes,
                 "attention_prefill_lse_bytes": rows * model_spec.q_heads as usize * size_of::<f32>(),
                 "attention_decode_workspace_bytes": FullAttentionOps::workspace(&attention, limits(1, capacity)?)?.bytes,
@@ -1457,6 +1485,14 @@ impl Engine {
             kv_scratch,
             verify_rows,
         )?);
+        if dense_prompt_bytes > 0 {
+            engine.qwen.as_mut().context("Qwen runtime missing")?.prompt = Some(
+                engine
+                    .device
+                    .stream
+                    .alloc_zeros(dense_prompt_bytes / size_of::<bf16>())?,
+            );
+        }
         if let Some(draft) = draft {
             let spec = Spec::new(draft, &engine)?;
             engine.bind_gdn_snapshots(&spec.snapshots, verify_rows)?;
@@ -1542,6 +1578,299 @@ impl Engine {
         self.work.advance(&self.ops, &self.device.stream)?;
         self.state.compact_commit(&self.device.stream, false)
     }
+    pub(super) fn prefill_dense_layers(
+        &mut self,
+        ids: &[u32],
+        mut trace: Option<&mut Trace>,
+        keep: usize,
+        after_chunk: &mut impl FnMut(&mut Self, &[u32]) -> Result<()>,
+    ) -> Result<u32> {
+        let prefix = self.position;
+        let trace_offset = ids
+            .len()
+            .checked_sub(keep)
+            .context("dense prefill trace extent")?;
+        let mut prompt = self
+            .qwen
+            .as_mut()
+            .context("Qwen runtime missing")?
+            .prompt
+            .take()
+            .context("dense prefill prompt buffers missing")?;
+        let result = (|| {
+            ensure!(
+                self.model_spec.moe.is_none() && self.images.is_none(),
+                "layer-major prefill requires dense text"
+            );
+            let elements = self
+                .capacity
+                .checked_mul(self.model_spec.hidden as usize)
+                .and_then(|n| n.checked_mul(2))
+                .context("dense prefill prompt extent overflow")?;
+            ensure!(
+                prompt.len() == elements,
+                "dense prefill prompt allocation differs from its plan"
+            );
+            self.dense_prefill_embed(ids, prefix, trace_offset, trace.as_deref_mut(), &mut prompt)?;
+            for layer in 0..self.model_spec.layers.len() {
+                self.dense_prefill_layer(
+                    layer,
+                    ids,
+                    prefix,
+                    trace_offset,
+                    trace.as_deref_mut(),
+                    &mut prompt,
+                )?;
+            }
+            self.dense_prefill_finish(ids, prefix, trace_offset, trace, &prompt, after_chunk)?;
+            let stream = &self.device.stream;
+            stream.memcpy_htod(&[self.position as i32], &mut self.work.position)?;
+            stream.memcpy_htod(&[(self.position + 1) as i32], &mut self.work.length)?;
+            if self.position < self.capacity {
+                self.state.set_sequence(
+                    stream,
+                    self.position as u32,
+                    1,
+                    self.workspace_rows as u32,
+                )?;
+            }
+            let token = self.token()?;
+            self.pending_token = Some(token);
+            Ok(token)
+        })();
+        self.qwen.as_mut().context("Qwen runtime missing")?.prompt = Some(prompt);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
+    }
+
+    pub(super) fn dense_prefill_chunk(
+        &mut self,
+        ids: &[u32],
+        prefix: usize,
+        start: usize,
+        expected: usize,
+    ) -> Result<usize> {
+        let rows = ids
+            .len()
+            .checked_sub(start)
+            .context("dense prefill chunk start")?
+            .min(self.chunk);
+        let end = crate::prefill::chunk_end(start, expected, rows, ids.len())?;
+        let position = prefix
+            .checked_add(start)
+            .context("dense prefill position overflow")?;
+        ensure!(
+            position
+                .checked_add(rows)
+                .is_some_and(|end| end <= self.capacity),
+            "dense prefill exceeds capacity"
+        );
+        let stream = &self.device.stream;
+        self.state.set_sequence(
+            stream,
+            position as u32,
+            rows as u32,
+            self.workspace_rows as u32,
+        )?;
+        stream.memcpy_htod(&[position as i32], &mut self.work.position)?;
+        stream.memcpy_htod(&ids[start..end], &mut self.work.ids.slice_mut(..rows))?;
+        self.position = position;
+        self.resident_ids_len = rows;
+        self.last_input_kind = Some(PrefixLastInputKind::PrefillChunk);
+        self.prepare_step(crate::backend::Step {
+            rows,
+            input: crate::backend::Input::Ids,
+            head: Head::None,
+            mask: crate::backend::Mask::Causal,
+        })?;
+        Ok(end)
+    }
+
+    fn dense_prefill_embed(
+        &mut self,
+        ids: &[u32],
+        prefix: usize,
+        trace_offset: usize,
+        mut trace: Option<&mut Trace>,
+        prompt: &mut CudaSlice<bf16>,
+    ) -> Result<()> {
+        let stream = self.device.stream.clone();
+        let hidden = self.model_spec.hidden as usize;
+        let mut next = 0;
+        for start in (0..ids.len()).step_by(self.chunk) {
+            next = self.dense_prefill_chunk(ids, prefix, start, next)?;
+            let rows = next - start;
+            let skip = trace_offset.saturating_sub(start).min(rows);
+            let name = format!(
+                "prefill.{}",
+                (start / self.chunk).saturating_sub(trace_offset / self.chunk)
+            );
+            let mut target = trace
+                .as_deref_mut()
+                .filter(|_| skip < rows)
+                .map(|trace| Target {
+                    trace,
+                    prefix: &name,
+                    skip,
+                });
+            self.run_operator(
+                crate::backend::Operator::Embed,
+                0,
+                crate::backend::Step {
+                    rows,
+                    input: crate::backend::Input::Ids,
+                    head: Head::None,
+                    mask: crate::backend::Mask::Causal,
+                },
+                &mut target,
+            )?;
+            stream.memcpy_dtod(
+                &self.work.x.slice(..rows * hidden),
+                &mut prompt.slice_mut(start * hidden..next * hidden),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn dense_prefill_layer(
+        &mut self,
+        layer: usize,
+        ids: &[u32],
+        prefix: usize,
+        trace_offset: usize,
+        mut trace: Option<&mut Trace>,
+        prompt: &mut CudaSlice<bf16>,
+    ) -> Result<()> {
+        let stream = self.device.stream.clone();
+        let hidden = self.model_spec.hidden as usize;
+        let normalized = self.capacity * hidden;
+        self.qwen_layer_begin(
+            layer,
+            crate::backend::Step {
+                rows: self.chunk,
+                input: crate::backend::Input::Ids,
+                head: Head::None,
+                mask: crate::backend::Mask::Causal,
+            },
+        )?;
+        let mut next = 0;
+        for start in (0..ids.len()).step_by(self.chunk) {
+            next = self.dense_prefill_chunk(ids, prefix, start, next)?;
+            let rows = next - start;
+            self.qwen
+                .as_ref()
+                .context("Qwen runtime missing")?
+                .select_positions(&stream, self.state.seq_ref(&stream)?, self.workspace_rows)?;
+            stream.memcpy_dtod(
+                &prompt.slice(start * hidden..next * hidden),
+                &mut self.work.x.slice_mut(..rows * hidden),
+            )?;
+            stream.memcpy_dtod(
+                &prompt.slice(normalized + start * hidden..normalized + next * hidden),
+                &mut self.work.n.slice_mut(..rows * hidden),
+            )?;
+            let skip = trace_offset.saturating_sub(start).min(rows);
+            let name = format!(
+                "prefill.{}",
+                (start / self.chunk).saturating_sub(trace_offset / self.chunk)
+            );
+            let mut target = trace
+                .as_deref_mut()
+                .filter(|_| skip < rows)
+                .map(|trace| Target {
+                    trace,
+                    prefix: &name,
+                    skip,
+                });
+            self.run_layer_program(
+                layer,
+                crate::backend::Step {
+                    rows,
+                    input: crate::backend::Input::Ids,
+                    head: Head::None,
+                    mask: crate::backend::Mask::Causal,
+                },
+                &mut target,
+            )?;
+            stream.memcpy_dtod(
+                &self.work.x.slice(..rows * hidden),
+                &mut prompt.slice_mut(start * hidden..next * hidden),
+            )?;
+            stream.memcpy_dtod(
+                &self.work.n.slice(..rows * hidden),
+                &mut prompt.slice_mut(normalized + start * hidden..normalized + next * hidden),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn dense_prefill_finish(
+        &mut self,
+        ids: &[u32],
+        prefix: usize,
+        trace_offset: usize,
+        mut trace: Option<&mut Trace>,
+        prompt: &CudaSlice<bf16>,
+        after_chunk: &mut impl FnMut(&mut Self, &[u32]) -> Result<()>,
+    ) -> Result<()> {
+        let stream = self.device.stream.clone();
+        let hidden = self.model_spec.hidden as usize;
+        let normalized = self.capacity * hidden;
+        let mut next = 0;
+        for start in (0..ids.len()).step_by(self.chunk) {
+            next = self.dense_prefill_chunk(ids, prefix, start, next)?;
+            let rows = next - start;
+            stream.memcpy_dtod(
+                &prompt.slice(start * hidden..next * hidden),
+                &mut self.work.x.slice_mut(..rows * hidden),
+            )?;
+            stream.memcpy_dtod(
+                &prompt.slice(normalized + start * hidden..normalized + next * hidden),
+                &mut self.work.n.slice_mut(..rows * hidden),
+            )?;
+            let skip = trace_offset.saturating_sub(start).min(rows);
+            let name = format!(
+                "prefill.{}",
+                (start / self.chunk).saturating_sub(trace_offset / self.chunk)
+            );
+            let mut target = trace
+                .as_deref_mut()
+                .filter(|_| skip < rows)
+                .map(|trace| Target {
+                    trace,
+                    prefix: &name,
+                    skip,
+                });
+            self.run_operator(
+                crate::backend::Operator::Head,
+                0,
+                crate::backend::Step {
+                    rows,
+                    input: crate::backend::Input::Ids,
+                    head: if next == ids.len() {
+                        Head::Last
+                    } else {
+                        Head::None
+                    },
+                    mask: crate::backend::Mask::Causal,
+                },
+                &mut target,
+            )?;
+            if next == ids.len() {
+                self.logits_cache.mark_valid();
+            } else {
+                self.logits_cache.invalidate();
+            }
+            after_chunk(self, &ids[start..next])?;
+            self.committed_prefix_ids
+                .extend_from_slice(&ids[start..next]);
+            self.position = prefix + next;
+        }
+        Ok(())
+    }
+
     pub(super) fn qwen_layer_begin(
         &mut self,
         i: usize,

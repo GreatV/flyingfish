@@ -2,6 +2,44 @@ use crate::config::Config;
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn dense_prompt_bytes(
+    spec: &crate::model_spec::ModelSpec,
+    capacity: usize,
+    chunk: usize,
+    kv: crate::kv::KvFormat,
+) -> Result<usize> {
+    ensure!(
+        capacity > 0 && chunk > 0 && chunk <= capacity,
+        "invalid dense prefill extent"
+    );
+    if spec.moe.is_some()
+        || spec.linear_format.fp8_layout().is_none()
+        || kv != crate::kv::KvFormat::Bf16
+        || chunk <= crate::mtp::MAX_VERIFY_ROWS
+        || capacity == chunk
+    {
+        return Ok(0);
+    }
+    capacity
+        .checked_mul(spec.hidden as usize)
+        .and_then(|n| n.checked_mul(2 * std::mem::size_of::<u16>()))
+        .context("dense prefill prompt buffer extent overflow")
+}
+
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn chunk_end(start: usize, expected: usize, rows: usize, total: usize) -> Result<usize> {
+    ensure!(
+        start == expected && rows > 0,
+        "prefill chunks are out of order"
+    );
+    let end = start
+        .checked_add(rows)
+        .context("prefill chunk extent overflow")?;
+    ensure!(end <= total, "prefill chunk exceeds the request");
+    Ok(end)
+}
+
 #[derive(Debug, Serialize)]
 pub struct Plan {
     pub chunk: usize,
@@ -83,7 +121,102 @@ impl Plan {
 
 #[cfg(test)]
 mod tests {
-    use super::Plan;
+    use super::{Plan, WorkspaceBudget, WorkspaceRequest, chunk_end, dense_prompt_bytes};
+
+    #[test]
+    fn dense_prefill_chunk_order_rejects_a_swapped_predecessor() -> anyhow::Result<()> {
+        let mut expected = 0;
+        for (start, rows) in [(0, 8192), (8192, 8128)] {
+            expected = chunk_end(start, expected, rows, 16320)?;
+        }
+        assert_eq!(expected, 16320);
+        assert!(chunk_end(8192, 0, 8128, 16320).is_err());
+        assert!(chunk_end(0, 0, 16321, 16320).is_err());
+        assert!(chunk_end(usize::MAX, usize::MAX, 1, usize::MAX).is_err());
+        println!(
+            "PASS dense_prefill_chunk_order_control rows=16320 swapped_start=8192 expected_start=0 rejected=true"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dense_prompt_buffers_preserve_exact_capacity_bounds() -> anyhow::Result<()> {
+        use crate::{
+            gdn_plan::GdnPolicy,
+            kv::KvFormat,
+            model_spec::{LinearFormat, ModelSpec},
+            op_contract::GdnSpec,
+        };
+        let root = serde_json::from_str(include_str!("../tests/data/q38-config.json"))?;
+        let mut model = ModelSpec::qwen(&root, &serde_json::json!({}))?;
+        model.linear_format = LinearFormat::Fp8E4m3Block128;
+        assert_eq!(model.hidden, 5120);
+        let gdn = GdnSpec::from_model(&model)?;
+        let row_bytes = crate::work_layout::RowWorkSpec::new(&model)?.row_bytes()?;
+        for (capacity, expected) in [(1024, 20_971_520), (4096, 83_886_080), (16384, 335_544_320)] {
+            let chunk = capacity / 2;
+            let bytes = dense_prompt_bytes(&model, capacity, chunk, KvFormat::Bf16)?;
+            assert_eq!(bytes, expected);
+            assert_eq!(
+                dense_prompt_bytes(&model, capacity, capacity, KvFormat::Bf16)?,
+                0
+            );
+            assert_eq!(
+                dense_prompt_bytes(&model, capacity, chunk, KvFormat::Affine8)?,
+                0
+            );
+            let workspace = |rows| {
+                Ok(usize::try_from(
+                    GdnPolicy::P2.workspace(&gdn, rows as u32)?.bytes,
+                )?)
+            };
+            let fixed = bytes + 4096;
+            let total = 48usize << 30;
+            let live = fixed + row_bytes * chunk + workspace(chunk)?;
+            let request = WorkspaceRequest {
+                capacity,
+                requested: Some(chunk),
+                free_after_resident: total / 16 + live,
+                total,
+                alignment: 32,
+                row_bytes,
+                fixed_transient_bytes: fixed,
+            };
+            let budget = WorkspaceBudget::new(request, workspace, Ok)?;
+            assert_eq!(budget.plan.chunk, chunk);
+            assert_eq!(budget.plan.row_limit, chunk);
+            assert_eq!(budget.planned_transient_bytes, live);
+            assert!(
+                WorkspaceBudget::new(
+                    WorkspaceRequest {
+                        free_after_resident: request.free_after_resident - 1,
+                        ..request
+                    },
+                    workspace,
+                    Ok
+                )
+                .is_err()
+            );
+            println!(
+                "PASS dense_prompt_capacity capacity={capacity} chunk={chunk} layout=[2,{capacity},5120] prompt_bytes={bytes} planned_transient_bytes={live} boundary_minus_one_rejected=true"
+            );
+        }
+        assert!(dense_prompt_bytes(&model, usize::MAX, 32, KvFormat::Bf16).is_err());
+        assert!(dense_prompt_bytes(&model, 32, 33, KvFormat::Bf16).is_err());
+        model.linear_format = LinearFormat::Bf16;
+        assert_eq!(dense_prompt_bytes(&model, 16384, 8192, KvFormat::Bf16)?, 0);
+        let root = serde_json::from_str(include_str!("../tests/data/minicpm-config.json"))?;
+        let mut moe =
+            ModelSpec::minicpm(&root, &serde_json::json!({"eos_token_id":[248044,248046]}))?;
+        moe.linear_format = LinearFormat::Fp8E4m3Channel;
+        for capacity in [1024, 4096, 16384] {
+            assert_eq!(
+                dense_prompt_bytes(&moe, capacity, capacity / 2, KvFormat::Bf16)?,
+                0
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn budget_bounds_and_override() {

@@ -1656,6 +1656,15 @@ impl Engine {
         if self.qwen.is_some() {
             self.qwen_layer_begin(layer, step)?;
         }
+        self.run_layer_program(layer, step, trace)
+    }
+
+    fn run_layer_program(
+        &mut self,
+        layer: usize,
+        step: crate::backend::Step<'_>,
+        trace: &mut Option<Target<'_>>,
+    ) -> Result<()> {
         for stage in crate::model::layer_program(&self.model_spec, layer)? {
             match stage {
                 crate::model::LayerStage::Common(op) => {
@@ -2595,6 +2604,12 @@ impl Engine {
         );
         if self.model_spec.moe.is_some() {
             return self.prefill_moe_chunks(ids, trace, keep, &mut after_chunk);
+        }
+        if ids.len() > self.chunk
+            && self.images.is_none()
+            && self.qwen.as_ref().is_some_and(|q| q.prompt.is_some())
+        {
+            return self.prefill_dense_layers(ids, trace, keep, &mut after_chunk);
         }
         let trace_start = self.position + ids.len() - keep;
         let end = self.position + ids.len();

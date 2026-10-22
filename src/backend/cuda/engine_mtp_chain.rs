@@ -697,6 +697,305 @@ pub(super) mod tests {
         )?)?;
         Ok(serde_json::from_value(v["input_ids"].clone())?)
     }
+    #[test]
+    #[ignore = "exclusive full Qwen model, text_2k/text_16k fixtures and calibrated runtime"]
+    fn q38_dense_layer_prefill_gpu() -> Result<()> {
+        use crate::backend::cuda::{
+            contracts::{RowDomain, TensorMut},
+            ops::{CommonOpsRef, RmsMode, RmsOptions},
+        };
+        use safetensors::{Dtype, SafeTensors};
+        ensure!(
+            std::env::var("FF_Q38_FULL_MODEL_WINDOW").as_deref() == Ok("granted"),
+            "full-model GPU window not acknowledged"
+        );
+        let directory = PathBuf::from(std::env::var("FF_Q38_MODEL")?);
+        let fixtures = PathBuf::from(std::env::var("FF_MINICPM_REFERENCE_DIR")?);
+        let settings = Settings {
+            tree_builder: TreeBuilder::Waves,
+            spec_budget: SpecBudget::Chain,
+            spec_graph: false,
+            draft_model: None,
+            runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
+            prefix_cache: false,
+            kv_format: crate::kv::KvFormat::Bf16,
+        };
+        let signature = |e: &Engine, mtp: bool| -> Result<Vec<u8>> {
+            let mut bits = Vec::new();
+            for (store, prefix) in std::iter::once((&e.state, e.position)).chain(
+                mtp.then(|| -> Result<_> {
+                    Ok((
+                        e.mtp_state.as_ref().context("MTP state missing")?,
+                        e.mtp.as_ref().context("MTP missing")?.cursor,
+                    ))
+                })
+                .transpose()?,
+            ) {
+                for gdn in &store.gdn {
+                    for buffer in [&gdn.s, &gdn.history] {
+                        let values = e.device.stream.clone_dtoh(buffer)?;
+                        ensure!(
+                            values.iter().all(|v| v.is_finite()),
+                            "Runner FAIL nonfinite GDN state"
+                        );
+                        bits.extend(values.into_iter().flat_map(|v| v.to_bits().to_le_bytes()));
+                    }
+                }
+                for kv in &store.kv {
+                    for buffer in [&kv.k, &kv.v] {
+                        for head in 0..e.model_spec.kv_heads as usize {
+                            let dim = e.model_spec.head_dim as usize;
+                            let values = e.device.stream.clone_dtoh(&buffer.slice(
+                                head * e.capacity * dim..(head * e.capacity + prefix) * dim,
+                            ))?;
+                            ensure!(
+                                values.iter().all(|v| v.to_f32().is_finite()),
+                                "Runner FAIL nonfinite live KV"
+                            );
+                            bits.extend(values.into_iter().flat_map(|v| v.to_bits().to_le_bytes()));
+                        }
+                    }
+                }
+                for value in e
+                    .device
+                    .stream
+                    .clone_dtoh(store.sequence.as_ref().context("sequence missing")?)?
+                {
+                    bits.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+            if mtp {
+                let chain = e.mtp.as_ref().context("MTP missing")?;
+                for buffer in [&chain.last_target, &chain.recurrent, &chain.bootstrap.carry] {
+                    let values = e.device.stream.clone_dtoh(buffer)?;
+                    ensure!(
+                        values.iter().all(|v| v.to_f32().is_finite()),
+                        "Runner FAIL nonfinite bootstrap hidden"
+                    );
+                    bits.extend(values.into_iter().flat_map(|v| v.to_bits().to_le_bytes()));
+                }
+                for value in [
+                    chain.cursor,
+                    chain.committed_position,
+                    chain.bootstrap.last_rows,
+                ] {
+                    bits.extend_from_slice(&value.to_le_bytes());
+                }
+                bits.extend_from_slice(&chain.pending.to_le_bytes());
+            }
+            bits.extend_from_slice(&e.position.to_le_bytes());
+            bits.extend_from_slice(&e.token()?.to_le_bytes());
+            for value in e.decode_logits()? {
+                ensure!(
+                    value.is_finite(),
+                    "Runner FAIL nonfinite dense prefill logits"
+                );
+                bits.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+            Ok(bits)
+        };
+        let mut defects = 0;
+        for (case, length) in [
+            ("text_2k", 1000usize),
+            ("text_2k", 2100),
+            ("text_16k", 16320),
+        ] {
+            let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
+            let source = SafeTensors::deserialize(&bytes)?;
+            let tensor = source.tensor("input_ids")?;
+            ensure!(
+                tensor.dtype() == Dtype::I32
+                    && tensor.shape() == [1, if case == "text_2k" { 2100 } else { 16320 }],
+                "Runner FAIL dense prefill fixture layout"
+            );
+            let ids = tensor
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .take(length)
+                .map(|x| Ok(u32::try_from(i32::from_le_bytes(*x))?))
+                .collect::<Result<Vec<_>>>()?;
+            let capacity = (length + 17).next_multiple_of(32);
+            let mut e = Engine::load_kind(&directory, 0, capacity, None, settings.clone(), true)?;
+            ensure!(
+                e.model_spec.hidden == 5120
+                    && e.model_spec.layers.len() == 64
+                    && e.model_spec.vocab == 248320
+                    && e.model_spec.moe.is_none()
+                    && e.model_spec.linear_format
+                        == crate::model_spec::LinearFormat::Fp8E4m3Block128,
+                "Runner FAIL dense prefill model geometry/format"
+            );
+            ensure!(
+                ids.len() == length && ids.iter().all(|&id| id < e.model_spec.vocab),
+                "Runner FAIL dense prefill input extent/vocabulary"
+            );
+            let common = CommonOpsRef::new(&e.device.ctx)?;
+            e.mtp_enable(options(
+                4,
+                MtpHiddenTap::PostFinalNorm,
+                MtpRecurrentTap::PostMtpNorm,
+                false,
+            ))?;
+            e.closure.ready(std::time::Instant::now())?;
+            let mut pool = e
+                .qwen
+                .as_mut()
+                .context("Qwen runtime missing")?
+                .prompt
+                .take();
+            ensure!(
+                pool.is_some() == (length > e.chunk),
+                "Runner FAIL expected dense schedule eligibility"
+            );
+            if length == 2100 {
+                ensure!(
+                    e.dense_prefill_chunk(&ids, 0, e.chunk, 0).is_err(),
+                    "out-of-order predecessor was not rejected"
+                );
+                let mut ordered = Vec::new();
+                for reverse in [false, true] {
+                    e.reset()?;
+                    for kv in &mut e.state.kv {
+                        e.device.stream.memset_zeros(&mut kv.k)?;
+                        e.device.stream.memset_zeros(&mut kv.v)?;
+                    }
+                    let mut starts: Vec<_> = (0..ids.len()).step_by(e.chunk).collect();
+                    if reverse {
+                        starts.reverse();
+                    }
+                    for start in starts {
+                        let end = e.dense_prefill_chunk(&ids, 0, start, start)?;
+                        e.run_step(
+                            crate::backend::Step {
+                                rows: end - start,
+                                input: crate::backend::Input::Ids,
+                                head: crate::backend::Head::None,
+                                mask: crate::backend::Mask::Causal,
+                            },
+                            None,
+                        )?;
+                    }
+                    let values = e
+                        .state
+                        .gdn
+                        .iter()
+                        .map(|g| e.device.stream.clone_dtoh(&g.s))
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>();
+                    ensure!(
+                        values.iter().all(|v| v.is_finite()),
+                        "Runner FAIL nonfinite order-control GDN state"
+                    );
+                    let values: Vec<_> = values.into_iter().map(f32::to_bits).collect();
+                    if reverse {
+                        ensure!(
+                            values != ordered,
+                            "Runner FAIL reversed chunks did not perturb GDN state"
+                        );
+                    } else {
+                        ordered = values;
+                    }
+                }
+                println!(
+                    "PASS dense_prefill_order_control length=2100 predecessor_rejected=true bypass_changes_gdn_state=true"
+                );
+            }
+            for mtp in [false, true] {
+                let mut reference = None;
+                for candidate in [false, true] {
+                    if candidate {
+                        e.qwen.as_mut().context("Qwen runtime missing")?.prompt = pool.take();
+                    }
+                    e.reset()?;
+                    let mut norms = Vec::new();
+                    let token = if mtp {
+                        e.mtp_prefill(&ids)?
+                    } else {
+                        e.prefill_chunks(&ids, None, ids.len(), |engine, part| {
+                            let stream = &engine.device.stream;
+                            let rows = part.len();
+                            common.norm.rms_with(
+                                stream,
+                                RowDomain {
+                                    meta: engine.state.seq_ref(stream)?,
+                                    row_base: 0,
+                                    row_capacity: rows as u32,
+                                },
+                                heads(&engine.work.x, stream, 0, rows, 1, HIDDEN as u32)?,
+                                vector(&engine.weights.norm, stream)?,
+                                &mut TensorMut(heads(
+                                    &engine.work.n,
+                                    stream,
+                                    0,
+                                    rows,
+                                    1,
+                                    HIDDEN as u32,
+                                )?),
+                                RmsOptions {
+                                    mode: RmsMode::ZeroCentered,
+                                    eps: engine.model_spec.rms_eps,
+                                },
+                            )?;
+                            let mut bits = Vec::new();
+                            bits.extend_from_slice(&engine.position.to_le_bytes());
+                            for buffer in [&engine.work.x, &engine.work.n] {
+                                let values = stream.clone_dtoh(&buffer.slice(..rows * HIDDEN))?;
+                                ensure!(
+                                    values.iter().all(|v| v.to_f32().is_finite()),
+                                    "Runner FAIL nonfinite norm/hidden"
+                                );
+                                bits.extend(
+                                    values.into_iter().flat_map(|v| v.to_bits().to_le_bytes()),
+                                );
+                            }
+                            norms.push(bits);
+                            Ok(())
+                        })?
+                    };
+                    ensure!(
+                        e.committed_prefix_ids == ids,
+                        "Runner FAIL committed dense prefix differs"
+                    );
+                    let before = signature(&e, mtp)?;
+                    let mut continuation = Vec::new();
+                    for index in 0..4 {
+                        e.set_token(ids[index * 263 % ids.len()])?;
+                        continuation.push(e.decode(false, None)?);
+                        continuation.extend(e.decode_logits()?.into_iter().map(f32::to_bits));
+                    }
+                    let observed = (token, norms, before, continuation, signature(&e, false)?);
+                    if let Some(expected) = reference.take() {
+                        let equal = expected == observed;
+                        defects += usize::from(!equal);
+                        println!(
+                            "{} dense_layer_prefill length={length} chunk={} mtp={mtp} bitwise_equal={equal} continuation=4",
+                            if equal { "PASS" } else { "DEFECT" },
+                            e.chunk
+                        );
+                    } else {
+                        reference = Some(observed);
+                    }
+                }
+                pool = e
+                    .qwen
+                    .as_mut()
+                    .context("Qwen runtime missing")?
+                    .prompt
+                    .take();
+            }
+        }
+        println!(
+            "{} dense_layer_prefill_gate cases=6 tolerance_bits=0 defects={defects}",
+            if defects == 0 { "PASS" } else { "DEFECT" }
+        );
+        ensure!(defects == 0, "DEFECT dense layer prefill cases={defects}");
+        Ok(())
+    }
+
     pub(super) fn output() -> Result<PathBuf> {
         let p = PathBuf::from(
             std::env::var_os("FF_Q38_MTP_OUTPUT").context("FF_Q38_MTP_OUTPUT missing")?,
