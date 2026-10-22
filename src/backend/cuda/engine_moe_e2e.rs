@@ -2046,7 +2046,7 @@ fn minicpm_chain_decode_gpu() -> Result<()> {
 }
 
 #[test]
-#[ignore = "exclusive CUDA; native BF16 MiniCPM fixtures and pinned calibration"]
+#[ignore = "exclusive CUDA; native BF16 fixtures and pinned runtime/decode-prefix.json"]
 fn minicpm_gdn_workspace_timing_gpu() -> Result<()> {
     ensure!(
         std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -2054,8 +2054,11 @@ fn minicpm_gdn_workspace_timing_gpu() -> Result<()> {
     );
     let target = PathBuf::from(std::env::var("FF_MODEL")?);
     let fixtures = PathBuf::from(std::env::var("FF_MINICPM_REFERENCE_DIR")?);
+    let runtime = PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
+    let forced: Vec<u32> =
+        serde_json::from_slice(&std::fs::read(runtime.join("decode-prefix.json"))?)?;
     let settings = Settings {
-        runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
+        runtime_dir: Some(runtime),
         prefix_cache: false,
         draft_model: None,
         tree_builder: TreeBuilder::Waves,
@@ -2064,6 +2067,10 @@ fn minicpm_gdn_workspace_timing_gpu() -> Result<()> {
         kv_format: crate::kv::KvFormat::Bf16,
     };
     let mut model = Engine::load(&target, 0, 4096, None, settings)?;
+    ensure!(
+        forced.len() == 256 && forced.iter().all(|&id| id < model.model_spec.vocab),
+        "GDN timing forced prefix extent/vocabulary"
+    );
     ensure!(
         model.model_spec.hidden == 2048
             && model.model_spec.layers.len() == 40
@@ -2120,6 +2127,7 @@ fn minicpm_gdn_workspace_timing_gpu() -> Result<()> {
             let timer = Instant::now();
             if decode {
                 while ids.len() < 256 {
+                    model.set_token(forced[ids.len() - 1])?;
                     ids.push(model.decode(true, None)?);
                 }
                 model.synchronize()?;
@@ -2142,7 +2150,8 @@ fn minicpm_gdn_workspace_timing_gpu() -> Result<()> {
                 "ttft_seconds":ttft_seconds,"decode_seconds":decode.then_some(seconds),
                 "output_tokens":ids.len(),"decode_tokens":if decode {255} else {0},
                 "decode_ms_per_token":decode.then_some(seconds*1000.0/255.0),
-                "ids":ids,"graph_decode":decode,"peak_sampled_device_bytes":peak_sampled_device_bytes})
+                    "ids":ids,"graph_decode":decode,"forced_feedback_tokens":if decode {255} else {0},
+                    "peak_sampled_device_bytes":peak_sampled_device_bytes})
             );
         }
     }
