@@ -476,6 +476,7 @@ impl Engine {
         ffn: BoundFfn,
         trace: &mut Option<Target<'_>>,
     ) -> Result<()> {
+        let slot_layer = u32::try_from(self.moe_slot_layer(layer)?)?;
         let decode = self
             .moe
             .as_mut()
@@ -490,7 +491,7 @@ impl Engine {
         slots.run(
             &self.device,
             decode,
-            u32::try_from(layer)?,
+            slot_layer,
             ffn,
             x,
             &mut TensorMut(qwen::matrix(&self.work.out, stream, 0, rows, hidden)?),

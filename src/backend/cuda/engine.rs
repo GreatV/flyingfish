@@ -569,6 +569,7 @@ pub struct Engine {
     #[cfg(test)]
     moe_test_ffn: Option<super::linear::BoundFfn>,
     flint_legacy_overflow_prefill: bool,
+    flint_frozen_decode_length: bool,
     mtp: Option<mtp::Chain>,
     mtp_state: Option<super::state::StateStore>,
     mtp_epoch: u64,
@@ -581,6 +582,7 @@ pub struct Engine {
     blas: Blas,
     flash: Option<Flash>,
     decode: Option<Attention>,
+    flint_logits: Option<CudaSlice<f32>>,
     device: Device,
     config: Config,
     model_spec: crate::model_spec::ModelSpec,
@@ -987,6 +989,7 @@ impl Engine {
             #[cfg(test)]
             moe_test_ffn: None,
             flint_legacy_overflow_prefill: false,
+            flint_frozen_decode_length: false,
             mtp: None,
             mtp_state: None,
             mtp_epoch: 0,
@@ -1013,6 +1016,7 @@ impl Engine {
             blas,
             flash: Some(flash),
             decode: None,
+            flint_logits: None,
             device,
             config,
             model_spec,
@@ -2972,6 +2976,9 @@ impl Engine {
 
     pub fn decode_logits(&self) -> Result<Vec<f32>> {
         self.logits_cache.read()?;
+        if let Some(logits) = &self.flint_logits {
+            return Ok(self.device.stream.clone_dtoh(logits)?);
+        }
         let values = self
             .device
             .stream

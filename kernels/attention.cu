@@ -343,10 +343,12 @@ __device__ __forceinline__ void fd_window_phase1_entry(
     const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v,
     float* __restrict__ scratch, int L, int chunk, int n_q_heads, int gqa,
     int k_head_stride, int k_pos_stride, int v_head_stride, int v_pos_stride,
-    int first_pos, int ring_tokens) {
+    const int* __restrict__ position, int ring_tokens) {
   constexpr int U = (QP == 1) ? 2 : 1;
   const int nchunks = (L + chunk - 1) / chunk;
   if (blockIdx.x >= nchunks) return;
+  const int logical_length = *position + 1;
+  const int first_pos = (logical_length - L) % ring_tokens;
   float* p_m = scratch;
   float* p_l = scratch + (size_t)n_q_heads * nchunks;
   float* p_o = scratch + 2 * (size_t)n_q_heads * nchunks;
@@ -378,11 +380,11 @@ extern "C" __global__ void flash_decode_window_phase1_q##QP(                    
     float* __restrict__ scratch, const int* __restrict__ len_dev,                             \
     int n_q_heads, int n_kv_heads, int gqa, int head_dim,                                     \
     int k_head_stride, int k_pos_stride, int v_head_stride, int v_pos_stride, int chunk,      \
-    int first_pos, int ring_tokens) {                                                          \
+    const int* position, int ring_tokens) {                                                    \
   FD_GUARD;                                                                                    \
   fd_window_phase1_entry<DH, QP>(                                                             \
       q, k, v, scratch, *len_dev, chunk, n_q_heads, gqa,                                      \
-      k_head_stride, k_pos_stride, v_head_stride, v_pos_stride, first_pos, ring_tokens);      \
+      k_head_stride, k_pos_stride, v_head_stride, v_pos_stride, position, ring_tokens);       \
 }
 
 FD_WINDOW_P1_EXPORTS(1)

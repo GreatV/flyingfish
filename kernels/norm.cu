@@ -8,6 +8,8 @@
 //   add_rmsnorm: res_out[r][d] = bf16(res[r][d] + x[r][d])   (add in fp32, one round)
 //                y[r][d] = bf16(res_out[r][d]) * rsqrt(mean_d(res_out[r][.]^2) + eps) * w[d]
 //                (the norm consumes the rounded residual as stored)
+//   add_rmsnorm_fp32: same BF16 residual store; variance and normalization
+//                consume the unrounded FP32 sum.
 //   residual:    x[i] = bf16(x[i] + y[i])   (__hadd2 per pair)
 //   rms_norm/add_rmsnorm compute x*rstd*w in fp32 and round once at the store.
 //   All reductions accumulate in fp32.
@@ -121,7 +123,7 @@ __device__ __forceinline__ float norm_scale(float x, float inv, float weight) {
 }
 
 // One block normalizes one row of n elements (nthr = blockDim.x, gid = threadIdx.x).
-template <int VEC, bool BF16_SCALE = false>
+template <int VEC, bool BF16_SCALE = false, bool ROUND_RESIDUAL = true>
 __device__ __forceinline__ void rmsnorm_row(const __nv_bfloat16* __restrict__ x,
                                             const __nv_bfloat16* __restrict__ w,
                                             __nv_bfloat16* __restrict__ y, int n,
@@ -181,13 +183,13 @@ __device__ __forceinline__ void rmsnorm_row(const __nv_bfloat16* __restrict__ x,
 
 // Fused residual add + RMSNorm over one row per block. res/res_out are not
 // __restrict__: res_out == res (in-place residual stream) is supported.
-template <int VEC, bool BF16_SCALE = false>
+template <int VEC, bool BF16_SCALE = false, bool ROUND_RESIDUAL = true>
 __device__ __forceinline__ void add_rmsnorm_row(const __nv_bfloat16* __restrict__ x,
                                                 const __nv_bfloat16* res,
                                                 const __nv_bfloat16* __restrict__ w,
                                                 __nv_bfloat16* __restrict__ y,
                                                 __nv_bfloat16* res_out, int n,
-                                                float eps) {
+                                                float eps, float* unrounded) {
   __shared__ float smem[32];
   const int nthr = blockDim.x;
   const int gid = threadIdx.x;
@@ -207,9 +209,14 @@ __device__ __forceinline__ void add_rmsnorm_row(const __nv_bfloat16* __restrict_
         ld_vec<VEC>(res + idx, b);
 #pragma unroll
         for (int j = 0; j < VEC; ++j) {
-          const __nv_bfloat16 s = __float2bfloat16(b[j] + a[j]);  // the norm reads the stored value
+          const float summed = b[j] + a[j];
+          const __nv_bfloat16 s = __float2bfloat16(summed);
           res_out[idx + j] = s;
-          b[j] = __bfloat162float(s);
+          if constexpr (ROUND_RESIDUAL) b[j] = __bfloat162float(s);
+          else {
+            if (!cached) unrounded[idx + j] = summed;
+            b[j] = summed;
+          }
           rr[i * VEC + j] = b[j];
           ssq += b[j] * b[j];
         }
@@ -223,9 +230,11 @@ __device__ __forceinline__ void add_rmsnorm_row(const __nv_bfloat16* __restrict_
       ld_vec<VEC>(res + idx, b);
 #pragma unroll
       for (int j = 0; j < VEC; ++j) {
-        const __nv_bfloat16 s = __float2bfloat16(b[j] + a[j]);
+        const float summed = b[j] + a[j];
+        const __nv_bfloat16 s = __float2bfloat16(summed);
         res_out[idx + j] = s;
-        b[j] = __bfloat162float(s);
+        if constexpr (ROUND_RESIDUAL) b[j] = __bfloat162float(s);
+        else unrounded[idx + j] = summed;
         ssq += b[j] * b[j];
       }
     }
@@ -248,8 +257,12 @@ __device__ __forceinline__ void add_rmsnorm_row(const __nv_bfloat16* __restrict_
   } else {
     for (int c = gid; c < nv; c += nthr) {
       const size_t idx = (size_t)c * VEC;
-      float b[VEC], ww[VEC], out[VEC];
-      ld_vec<VEC>(res_out + idx, b);
+        float b[VEC], ww[VEC], out[VEC];
+        if constexpr (ROUND_RESIDUAL) ld_vec<VEC>(res_out + idx, b);
+        else {
+#pragma unroll
+          for (int j = 0; j < VEC; ++j) b[j] = unrounded[idx + j];
+        }
       ld_vec<VEC>(w + idx, ww);
 #pragma unroll
       for (int j = 0; j < VEC; ++j) out[j] = norm_scale<BF16_SCALE>(b[j], rstd, ww[j]);
@@ -285,8 +298,28 @@ __global__ __launch_bounds__(1024) void add_rmsnorm(const __nv_bfloat16* x,
   const int row = blockIdx.x;
   if (row >= rows) return;
   const size_t off = (size_t)row * dim;
-  if ((dim & 7) == 0) add_rmsnorm_row<8>(x + off, res + off, w, y + off, res_out + off, dim, eps);
-  else                add_rmsnorm_row<1>(x + off, res + off, w, y + off, res_out + off, dim, eps);
+  if ((dim & 7) == 0)
+    add_rmsnorm_row<8>(x + off, res + off, w, y + off, res_out + off, dim, eps, nullptr);
+  else
+    add_rmsnorm_row<1>(x + off, res + off, w, y + off, res_out + off, dim, eps, nullptr);
+}
+
+// The residual stream stores BF16; RMS variance and normalization consume the
+// unrounded FP32 sum.
+__global__ __launch_bounds__(1024) void add_rmsnorm_fp32(const __nv_bfloat16* x,
+                                                          const __nv_bfloat16* res,
+                                                          const __nv_bfloat16* w,
+                                                          __nv_bfloat16* y,
+                                                          __nv_bfloat16* res_out,
+                                                          int rows, int dim,
+                                                          float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const size_t off = (size_t)row * dim;
+  if ((dim & 7) == 0)
+    add_rmsnorm_row<8, false, false>(x + off, res + off, w, y + off, res_out + off, dim, eps, nullptr);
+  else
+    add_rmsnorm_row<1, false, false>(x + off, res + off, w, y + off, res_out + off, dim, eps, nullptr);
 }
 
 // Normalized values round to BF16 before multiplication by the BF16 weight.
@@ -310,8 +343,10 @@ __global__ __launch_bounds__(1024) void add_rmsnorm_bf16(const __nv_bfloat16* x,
   const int row = blockIdx.x;
   if (row >= rows) return;
   const size_t off = (size_t)row * dim;
-  if ((dim & 7) == 0) add_rmsnorm_row<8, true>(x + off, res + off, w, y + off, res_out + off, dim, eps);
-  else                add_rmsnorm_row<1, true>(x + off, res + off, w, y + off, res_out + off, dim, eps);
+  if ((dim & 7) == 0)
+    add_rmsnorm_row<8, true>(x + off, res + off, w, y + off, res_out + off, dim, eps, nullptr);
+  else
+    add_rmsnorm_row<1, true>(x + off, res + off, w, y + off, res_out + off, dim, eps, nullptr);
 }
 
 // x[i] += y[i] in bf16, flat grid-stride.

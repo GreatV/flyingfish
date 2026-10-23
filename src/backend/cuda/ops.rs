@@ -1,6 +1,6 @@
 use super::{contracts::no_overlap, cubin};
-use anyhow::Result;
-use cudarc::driver::{CudaContext, CudaFunction, LaunchConfig};
+use anyhow::{Context, Result};
+use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaView, LaunchConfig};
 use std::sync::Arc;
 
 pub struct Ops {
@@ -8,14 +8,18 @@ pub struct Ops {
     pub embed_rmsnorm: CudaFunction,
     pub add_norm: CudaFunction,
     pub add_norm_capture: CudaFunction,
+    pub add_norm_fp32: CudaFunction,
     norm_capture: CudaFunction,
     pub kv_write: CudaFunction,
     pub rope_kv: CudaFunction,
     pub act: CudaFunction,
     pub argmax: CudaFunction,
     pub argmax_rows: CudaFunction,
+    pub argmax_f32: CudaFunction,
     pub finite_bf16: CudaFunction,
     pub advance: CudaFunction,
+    pub flint_decode_length: CudaFunction,
+    pub flint_lm_head_f32: CudaFunction,
     pub residual: CudaFunction,
 }
 
@@ -58,16 +62,89 @@ impl Ops {
             embed_rmsnorm: embed_rmsnorm.load_function("embed_rmsnorm")?,
             add_norm: norm.load_function("add_rmsnorm")?,
             add_norm_capture: add_norm_capture.load_function("add_rmsnorm_capture")?,
+            add_norm_fp32: norm.load_function("add_rmsnorm_fp32")?,
             norm_capture: cubin::module(ctx, "q38_common")?.load_function("q38_norm_capture")?,
             kv_write: rope.load_function("kv_write")?,
             rope_kv: rope_kv.load_function("rope_kv")?,
             act: act.load_function("silu_mul")?,
             argmax: sample.load_function("argmax")?,
             argmax_rows: sample.load_function("argmax_rows_bf16")?,
+            argmax_f32: sample.load_function("argmax_f32")?,
             finite_bf16: sample.load_function("finite_bf16")?,
             advance: sample.load_function("advance")?,
+            flint_decode_length: sample.load_function("flint_decode_length")?,
+            flint_lm_head_f32: sample.load_function("lm_head_f32")?,
             residual: norm.load_function("residual")?,
         })
+    }
+
+    pub fn flint_decode_length(
+        &self,
+        stream: &Arc<CudaStream>,
+        position: &CudaSlice<i32>,
+        length: &mut CudaSlice<i32>,
+        ring: usize,
+    ) -> Result<()> {
+        ensure!(
+            position.len() == 1 && length.len() == 1 && ring <= i32::MAX as usize,
+            "Flint decode position/length/ring extent differs"
+        );
+        unsafe {
+            stream
+                .launch_builder(&self.flint_decode_length)
+                .arg(position)
+                .arg(&mut length.slice_mut(..))
+                .arg(&(ring as i32))
+                .launch(grid(1, 1))?;
+        }
+        Ok(())
+    }
+
+    pub fn flint_lm_head_f32(
+        &self,
+        stream: &Arc<CudaStream>,
+        input: &CudaView<'_, bf16>,
+        weight: &CudaSlice<bf16>,
+        logits: &mut CudaSlice<f32>,
+    ) -> Result<()> {
+        let vocab = logits.len();
+        let hidden = input.len();
+        ensure!(
+            weight.len()
+                == vocab
+                    .checked_mul(hidden)
+                    .context("LM head extent overflow")?,
+            "FP32 LM head weight extent differs"
+        );
+        unsafe {
+            stream
+                .launch_builder(&self.flint_lm_head_f32)
+                .arg(input)
+                .arg(weight)
+                .arg(&mut logits.slice_mut(..))
+                .arg(&(vocab as i32))
+                .arg(&(hidden as i32))
+                .launch(grid(vocab, 256))?;
+        }
+        Ok(())
+    }
+
+    pub fn argmax_f32(
+        &self,
+        stream: &Arc<CudaStream>,
+        logits: &CudaSlice<f32>,
+        token: &mut CudaSlice<u32>,
+    ) -> Result<()> {
+        ensure!(token.len() == 1, "FP32 argmax token extent differs");
+        unsafe {
+            stream
+                .launch_builder(&self.argmax_f32)
+                .arg(logits)
+                .arg(&mut token.slice_mut(..))
+                .arg(&(logits.len() as i32))
+                .launch(grid(1, 1024))?;
+        }
+        Ok(())
     }
 }
 
@@ -315,6 +392,58 @@ impl Ops {
                 .arg(&meta)
                 .arg(&i32::try_from(base)?)
                 .launch(grid(rows as usize, 256))?;
+        }
+        Ok(())
+    }
+
+    pub fn rms_add_fp32_with(
+        &self,
+        stream: &Arc<CudaStream>,
+        rows: RowDomain,
+        input: ResidualRmsInput<'_>,
+        y: &mut TensorMut<bf16, 3>,
+        eps: f32,
+    ) -> Result<()> {
+        let ResidualRmsInput {
+            x,
+            residual: z,
+            weight,
+        } = input;
+        validate_io(&x.0, &y.0, rows)?;
+        z.validate()?;
+        weight.validate()?;
+        ensure!(
+            z.shape == x.0.shape
+                && z.stride == x.0.stride
+                && weight.shape == [x.0.shape[2]]
+                && weight.stride == [1],
+            "FP32 residual norm tensor layout differs"
+        );
+        no_overlap(&z, &x.0, "operator input", "operator output")?;
+        no_overlap(&weight, &x.0, "operator input", "operator output")?;
+        no_overlap(&x.0, &y.0, "operator input", "operator output")?;
+        ensure!(eps.is_finite() && eps > 0.0, "invalid epsilon {eps}");
+        let hidden = x.0.shape[2];
+        ensure!(
+            hidden != 0 && hidden.is_multiple_of(8) && hidden <= 2048,
+            "FP32 residual norm hidden={hidden} outside the cached 8..=2048 extent"
+        );
+        unsafe {
+            stream
+                .launch_builder(&self.add_norm_fp32)
+                .arg(&x.0.ptr)
+                .arg(&z.ptr)
+                .arg(&weight.ptr)
+                .arg(&y.0.ptr)
+                .arg(&x.0.ptr)
+                .arg(&rows.row_capacity)
+                .arg(&hidden)
+                .arg(&eps)
+                .launch(LaunchConfig {
+                    grid_dim: (rows.row_capacity, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
         }
         Ok(())
     }

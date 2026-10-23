@@ -252,6 +252,24 @@ fn flint_engine_short_prefill_gpu() -> Result<()> {
     let mut engine = Backend::calibrate(&dir, 0, 600, None, settings)?
         .context("Flint calibration did not return the prepared engine")?;
     let ids = [150000u32, 1, 2, 3, 4, 5, 6, 7];
+    if let Some(path) = env::var_os("FF_FLINT_POSITION_LOGITS_OUT") {
+        engine.prefill(&ids[..1], None)?;
+        let mut positions = vec![engine.decode_logits()?];
+        for target in &ids[1..] {
+            engine.set_token(*target)?;
+            engine.decode(true, None)?;
+            positions.push(engine.decode_logits()?);
+        }
+        let mut position_trace = flyingfish::trace::Trace::default();
+        position_trace.set_device(&engine.device_info().name)?;
+        position_trace.add(
+            "logits.positions".to_owned(),
+            vec![ids.len(), engine.config().vocab_size],
+            positions.into_iter().flatten().collect(),
+        )?;
+        position_trace.save(&PathBuf::from(path))?;
+        engine.reset()?;
+    }
     let mut trace = flyingfish::trace::Trace::all_layers();
     let token = engine.prefill(&ids, Some(&mut trace))?;
     engine.set_token(ids[0])?;
@@ -318,6 +336,7 @@ fn flint_engine_prefix_nll_gpu() -> Result<()> {
         .context("Flint calibration did not return the prepared engine")?;
     engine.prefill(&ids[..1], None)?;
     let mut total_nll = 0f64;
+    let mut position_nll = Vec::with_capacity(599);
     for (index, target) in ids[1..600].iter().enumerate() {
         let logits = engine.decode_logits()?;
         let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -327,12 +346,23 @@ fn flint_engine_prefix_nll_gpu() -> Result<()> {
             .sum::<f32>()
             .ln();
         total_nll += f64::from(max + logsumexp - logits[*target as usize]);
+        position_nll.push(f64::from(max + logsumexp - logits[*target as usize]));
         if index + 2 != 600 {
             engine.set_token(*target)?;
             engine.decode(true, None)?;
         }
     }
     let mean_nll = total_nll / 599.0;
+    let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
+    eprintln!(
+        "FLINT_ENGINE_PREFIX_NLL_SEGMENTS first_8={:.9} 9_32={:.9} 33_128={:.9} 129_256={:.9} 257_512={:.9} 513_599={:.9}",
+        mean(&position_nll[..8]),
+        mean(&position_nll[8..32]),
+        mean(&position_nll[32..128]),
+        mean(&position_nll[128..256]),
+        mean(&position_nll[256..512]),
+        mean(&position_nll[512..599]),
+    );
     ensure!(mean_nll.is_finite(), "nonfinite Flint prefix NLL");
     ensure!(
         mean_nll <= 4.0,

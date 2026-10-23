@@ -2,12 +2,13 @@ use super::cubin;
 use crate::config::Config;
 use anyhow::{Result, ensure};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtrMut, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
 use half::bf16;
 use std::sync::Arc;
 
 use crate::backend::setup::AttentionPlan;
+use cudarc::driver::DevicePtrMut;
 
 pub struct Attention {
     first: CudaFunction,
@@ -34,12 +35,11 @@ pub struct GqaDecodeInput<'a> {
     pub output_offset: usize,
     pub length: &'a CudaSlice<i32>,
     pub sinks: Option<&'a CudaSlice<bf16>>,
-    pub window: Option<SlidingWindow>,
+    pub window: Option<SlidingWindow<'a>>,
 }
 
-pub struct SlidingWindow {
-    pub first_pos: i32,
-    pub tokens: i32,
+pub struct SlidingWindow<'a> {
+    pub position: &'a CudaSlice<i32>,
     pub head_stride: i32,
 }
 
@@ -227,8 +227,8 @@ impl Attention {
                     .arg(&window.head_stride)
                     .arg(&128i32)
                     .arg(&chunk)
-                    .arg(&window.first_pos)
-                    .arg(&window.tokens)
+                    .arg(window.position)
+                    .arg(&(window.head_stride / 128))
                     .launch(self.first_launch)?;
             } else {
                 stream
