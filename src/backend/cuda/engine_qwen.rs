@@ -2541,9 +2541,7 @@ impl Engine {
                         .as_mut()
                         .context("MoE all-row head requires draft state")?;
                     ensure!(
-                        self.model_spec.moe.is_some()
-                            && (1..=spec.draft.config.target_rows(&self.model_spec)?)
-                                .contains(&rows),
+                        self.model_spec.moe.is_some() && (1..=spec.max_verify_rows).contains(&rows),
                         "all-row head rows={rows} outside the loaded MoE verification extent"
                     );
                     self.blas.linear_typed(

@@ -172,10 +172,7 @@ impl Engine {
     pub(in crate::backend::cuda::engine) fn capture_moe(&mut self) -> Result<()> {
         let verify = self.spec.is_some();
         let widths = match &self.spec {
-            Some(spec) => {
-                crate::dspark::MIN_MOE_VERIFY_ROWS
-                    ..=spec.draft.config.target_rows(&self.model_spec)?
-            }
+            Some(spec) => crate::dspark::MIN_MOE_VERIFY_ROWS..=spec.max_verify_rows,
             None => 1..=1,
         };
         let max_rows = *widths.end();
@@ -376,10 +373,7 @@ impl Engine {
             return false;
         };
         if let Some(spec) = &self.spec {
-            let Ok(max_rows) = spec.draft.config.target_rows(&self.model_spec) else {
-                return false;
-            };
-            (crate::dspark::MIN_MOE_VERIFY_ROWS..=max_rows).all(|rows| {
+            (crate::dspark::MIN_MOE_VERIFY_ROWS..=spec.max_verify_rows).all(|rows| {
                 decode
                     .verify_segments
                     .get(&rows)
@@ -394,20 +388,13 @@ impl Engine {
         let Some(spec) = &self.spec else {
             return false;
         };
-        let Ok(max_rows) = spec.draft.config.target_rows(&self.model_spec) else {
-            return false;
-        };
-        (crate::dspark::MIN_MOE_VERIFY_ROWS..=max_rows)
+        (crate::dspark::MIN_MOE_VERIFY_ROWS..=spec.max_verify_rows)
             .all(|rows| spec.moe_verify_graphs.contains_key(&rows))
     }
 
-    pub(in crate::backend::cuda::engine) fn run_moe_graph(&mut self) -> Result<()> {
+    pub(in crate::backend::cuda::engine) fn run_moe_graph(&mut self, rows: usize) -> Result<()> {
         let mut decode = self.moe.take().context("MoE graph executor missing")?;
         let mut slots = self.moe_slots.take().context("MoE graph slots missing")?;
-        let rows = match &self.spec {
-            Some(spec) => spec.verify_rows,
-            None => 1,
-        };
         let mut token_open = false;
         let result = (|| -> Result<()> {
             if slots.all_resident() {

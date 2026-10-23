@@ -1467,7 +1467,7 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
     let (rows, draft_rows, taps) = {
         let spec = model.spec.as_ref().context("chain draft missing")?;
         (
-            spec.draft.config.target_rows(&model.model_spec)?,
+            spec.max_verify_rows,
             spec.draft.config.verify_rows()?,
             spec.draft.config.target_layer_ids.clone(),
         )
@@ -2849,10 +2849,17 @@ fn chain_decode_timing(cases: &[&str], runs: usize, margins: bool) -> Result<()>
         .context("chain timing runtime missing")?
         .allocated_workspace_bytes();
     let (free, total) = model.device.ctx.mem_get_info()?;
+    let verify_segment_widths = model.moe.as_ref().map_or(0, |m| m.verify_segments.len());
+    let verify_segments: usize = model
+        .moe
+        .as_ref()
+        .map_or(0, |m| m.verify_segments.values().map(|v| v.len() * 3).sum());
     println!(
         "minicpm_chain_timing_plan {}",
         serde_json::json!({"with_draft":with_draft,
         "capacity":capacity,"slots_per_layer":slots,"gpu_slots":slots.iter().sum::<u32>(),
+        "declared_graphs":model.graphs.len(),"verify_segment_widths":verify_segment_widths,
+        "verify_segments":verify_segments,
         "allocated_operator_workspace_bytes":operator_bytes,
         "device_live_bytes_after_setup":total-free,"setup_seconds":setup_seconds})
     );
