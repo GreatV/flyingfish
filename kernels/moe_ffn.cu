@@ -187,7 +187,7 @@ __device__ __forceinline__ void moe_gate_up(
   }
   accg = INVARIANT ? moe_pairwise16(accg, tid) : moe_group_sum(accg);
   accu = INVARIANT ? moe_pairwise16(accu, tid) : moe_group_sum(accu);
-  if (lane == 0 && j < inter && live_seg) {
+  if (lane == 0 && j < out_inter && live_seg) {
     const float g = __bfloat162float(__float2bfloat16(accg));
     const float u = __bfloat162float(__float2bfloat16(accu));
     const float activation = INVARIANT

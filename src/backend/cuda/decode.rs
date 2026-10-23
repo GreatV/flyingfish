@@ -2,7 +2,7 @@ use super::cubin;
 use crate::config::Config;
 use anyhow::{Result, ensure};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtrMut, LaunchConfig, PushKernelArg,
 };
 use half::bf16;
 use std::sync::Arc;
@@ -14,11 +14,13 @@ pub struct Attention {
     second: CudaFunction,
     window_first: CudaFunction,
     sink_second: CudaFunction,
+    set_length: CudaFunction,
     scratch: CudaSlice<f32>,
     first_launch: LaunchConfig,
     second_launch: LaunchConfig,
     head_stride: i32,
     chunk: usize,
+    max_chunks: usize,
     q_heads: i32,
     kv_heads: i32,
     plan: AttentionPlan,
@@ -113,6 +115,7 @@ impl Attention {
         let window_first =
             module.load_function(&format!("flash_decode_window_phase1_q{}", settings.qpack))?;
         let sink_second = module.load_function("flash_decode_sink_phase2")?;
+        let set_length = module.load_function("flash_decode_set_length")?;
         ensure!(
             settings.threads as i32 <= first.max_threads_per_block()?
                 && settings.merge_threads as i32 <= second.max_threads_per_block()?
@@ -150,11 +153,13 @@ impl Attention {
             second,
             window_first,
             sink_second,
+            set_length,
             scratch,
             first_launch,
             second_launch,
             head_stride: (capacity * 128) as i32,
             chunk,
+            max_chunks: chunks,
             q_heads: c.num_attention_heads as i32,
             kv_heads: c.num_key_value_heads as i32,
             plan: settings,
@@ -273,6 +278,33 @@ impl Attention {
                     .arg(&chunk)
                     .launch(self.second_launch)?;
             }
+        }
+        Ok(())
+    }
+
+    pub fn set_length(
+        &self,
+        stream: &Arc<CudaStream>,
+        value: i32,
+        length: &mut CudaSlice<i32>,
+    ) -> Result<()> {
+        ensure!(
+            value > 0 && usize::try_from(value)? <= self.max_chunks * self.chunk,
+            "decode attention length {value} exceeds launched chunks {} chunk {}",
+            self.max_chunks,
+            self.chunk
+        );
+        let (ptr, _length) = length.device_ptr_mut(stream);
+        unsafe {
+            stream
+                .launch_builder(&self.set_length)
+                .arg(&ptr)
+                .arg(&value)
+                .launch(LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (1, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
         }
         Ok(())
     }

@@ -275,6 +275,109 @@ fn gqa32_attention_window_sink_gpu() -> Result<()> {
         );
     }
 
+    let mut r5_attention = Attention::new(
+        &device.ctx,
+        s,
+        &config,
+        capacity,
+        AttentionPlan {
+            chunk: 128,
+            qpack: 2,
+            threads: 256,
+            merge_threads: 256,
+        },
+    )?;
+    r5_attention.run_with(
+        s,
+        GqaDecodeInput {
+            q: &q_dev,
+            q_offset: 0,
+            k: &full_k_dev,
+            v: &full_v_dev,
+            output: &mut sink_output,
+            output_offset: 0,
+            length: &length,
+            sinks: Some(&sinks_dev),
+            window: None,
+        },
+    )?;
+    r5_attention.run_with(
+        s,
+        GqaDecodeInput {
+            q: &q_dev,
+            q_offset: 0,
+            k: &window_k_dev,
+            v: &window_v_dev,
+            output: &mut window_output,
+            output_offset: 0,
+            length: &window_length,
+            sinks: Some(&sinks_dev),
+            window: Some(SlidingWindow {
+                first_pos: first as i32,
+                tokens: ring as i32,
+                head_stride: (ring * 128) as i32,
+            }),
+        },
+    )?;
+    s.synchronize()?;
+    let r5_full = s.clone_dtoh(&sink_output)?;
+    let r5_window = s.clone_dtoh(&window_output)?;
+    let mut graph_length = s.clone_htod(&[capacity as i32])?;
+    s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+    r5_attention.set_length(s, capacity as i32, &mut graph_length)?;
+    r5_attention.run_with(
+        s,
+        GqaDecodeInput {
+            q: &q_dev,
+            q_offset: 0,
+            k: &full_k_dev,
+            v: &full_v_dev,
+            output: &mut sink_output,
+            output_offset: 0,
+            length: &graph_length,
+            sinks: Some(&sinks_dev),
+            window: None,
+        },
+    )?;
+    r5_attention.set_length(s, ring as i32, &mut graph_length)?;
+    r5_attention.run_with(
+        s,
+        GqaDecodeInput {
+            q: &q_dev,
+            q_offset: 0,
+            k: &window_k_dev,
+            v: &window_v_dev,
+            output: &mut window_output,
+            output_offset: 0,
+            length: &graph_length,
+            sinks: Some(&sinks_dev),
+            window: Some(SlidingWindow {
+                first_pos: first as i32,
+                tokens: ring as i32,
+                head_stride: (ring * 128) as i32,
+            }),
+        },
+    )?;
+    let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+    let graph = captured?.context("GQA32 sink graph capture")?;
+    graph.upload()?;
+    graph.launch()?;
+    s.synchronize()?;
+    let graph_full = s.clone_dtoh(&sink_output)?;
+    let graph_window = s.clone_dtoh(&window_output)?;
+    ensure!(
+        graph_full
+            .iter()
+            .zip(&r5_full)
+            .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
+            && graph_window
+                .iter()
+                .zip(&r5_window)
+                .all(|(actual, expected)| actual.to_bits() == expected.to_bits()),
+        "GQA32 chunk-128 qpack-2 sink graph differs from eager attention"
+    );
+    eprintln!("GQA32_SINK_GRAPH chunk=128 qpack=2 chunks=8 bitwise=true PASS");
+
     let boundary_sinks = vec![bf16::ZERO; hq];
     let boundary_sinks_dev = s.clone_htod(&boundary_sinks)?;
     device.finish_upload()?;

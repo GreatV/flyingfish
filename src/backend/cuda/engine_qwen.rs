@@ -417,9 +417,14 @@ impl Runtime {
                 moe.experts as usize,
                 moe.experts_per_tok as usize,
             );
-            let decode =
-                crate::backend::cuda::moe::decode::decode_scratch_bytes(rows, top_k, intermediate);
+            let decode = crate::backend::cuda::moe::decode::decode_scratch_bytes_mixed(
+                rows,
+                top_k,
+                intermediate,
+                moe.shared_intermediate as usize,
+            );
             let prefill = crate::backend::cuda::moe::prefill::prefill_scratch_bytes(
+                rows,
                 rows,
                 top_k,
                 experts,
@@ -2279,30 +2284,30 @@ impl Engine {
                                 let position = self.position + row;
                                 let tokens = (position + 1).min(ring);
                                 let first = position + 1 - tokens;
-                                s.memcpy_htod(&[tokens as i32], &mut w.length)?;
-                                self.decode
+                                let decode = self
+                                    .decode
                                     .as_mut()
-                                    .context("Flint sliding prefill decode is not bound")?
-                                    .run_with(
-                                        s,
-                                        GqaDecodeInput {
-                                            q: &w.qkv,
-                                            q_offset: row * qkv_width,
-                                            k: &kv.k,
-                                            v: &kv.v,
-                                            output: &mut w.attn,
-                                            output_offset: row * q_width as usize,
-                                            length: &w.length,
-                                            sinks: Some(sinks),
-                                            window: Some(SlidingWindow {
-                                                first_pos: (first % ring) as i32,
-                                                tokens: tokens as i32,
-                                                head_stride: (ring
-                                                    * self.model_spec.head_dim as usize)
-                                                    as i32,
-                                            }),
-                                        },
-                                    )?;
+                                    .context("Flint sliding prefill decode is not bound")?;
+                                decode.set_length(s, tokens as i32, &mut w.length)?;
+                                decode.run_with(
+                                    s,
+                                    GqaDecodeInput {
+                                        q: &w.qkv,
+                                        q_offset: row * qkv_width,
+                                        k: &kv.k,
+                                        v: &kv.v,
+                                        output: &mut w.attn,
+                                        output_offset: row * q_width as usize,
+                                        length: &w.length,
+                                        sinks: Some(sinks),
+                                        window: Some(SlidingWindow {
+                                            first_pos: (first % ring) as i32,
+                                            tokens: tokens as i32,
+                                            head_stride: (ring * self.model_spec.head_dim as usize)
+                                                as i32,
+                                        }),
+                                    },
+                                )?;
                             }
                         } else {
                             self.flash
@@ -2328,29 +2333,29 @@ impl Engine {
                             logical_length
                         };
                         let first = logical_length - tokens;
-                        s.memcpy_htod(&[tokens as i32], &mut w.length)?;
-                        self.decode
+                        let decode = self
+                            .decode
                             .as_mut()
-                            .context("Flint decode attention is not bound")?
-                            .run_with(
-                                s,
-                                GqaDecodeInput {
-                                    q: &w.qkv,
-                                    q_offset: 0,
-                                    k: &kv.k,
-                                    v: &kv.v,
-                                    output: &mut w.attn,
-                                    output_offset: 0,
-                                    length: &w.length,
-                                    sinks: Some(sinks),
-                                    window: sliding.then_some(SlidingWindow {
-                                        first_pos: (first % ring) as i32,
-                                        tokens: tokens as i32,
-                                        head_stride: (ring * self.model_spec.head_dim as usize)
-                                            as i32,
-                                    }),
-                                },
-                            )?;
+                            .context("Flint decode attention is not bound")?;
+                        decode.set_length(s, tokens as i32, &mut w.length)?;
+                        decode.run_with(
+                            s,
+                            GqaDecodeInput {
+                                q: &w.qkv,
+                                q_offset: 0,
+                                k: &kv.k,
+                                v: &kv.v,
+                                output: &mut w.attn,
+                                output_offset: 0,
+                                length: &w.length,
+                                sinks: Some(sinks),
+                                window: sliding.then_some(SlidingWindow {
+                                    first_pos: (first % ring) as i32,
+                                    tokens: tokens as i32,
+                                    head_stride: (ring * self.model_spec.head_dim as usize) as i32,
+                                }),
+                            },
+                        )?;
                     }
                 }
                 layer.linear.run(
@@ -2673,7 +2678,8 @@ impl Engine {
             crate::backend::Operator::Activate,
             crate::backend::Operator::Down,
         ] {
-            self.run_operator(op, layer, step, trace)?;
+            self.run_operator(op, layer, step, trace)
+                .with_context(|| format!("dense FFN operator {op:?} layer={layer}"))?;
         }
         Ok(())
     }

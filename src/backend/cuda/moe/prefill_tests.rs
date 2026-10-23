@@ -724,6 +724,18 @@ fn moe_input<'a>(
         shared_up: testing::dense(&shared.su, s, inter as u32, hidden as u32)?,
         shared_down: testing::dense(&shared.sd, s, hidden as u32, inter as u32)?,
         shared_expert_gate: Some(testing::view(&shared.seg, s, [hidden as u32], [1])?),
+        contributions: testing::view(
+            &bufs.contributions,
+            s,
+            [rows as u32, top_k as u32, hidden as u32],
+            [(top_k * hidden) as u64, hidden as u64, 1],
+        )?,
+        done: testing::mut_view(
+            &bufs.done,
+            s,
+            [rows as u32, top_k as u32],
+            [top_k as u64, 1],
+        )?,
         y,
     })
 }
@@ -2033,6 +2045,8 @@ fn prefill_racecheck_small_gpu() -> Result<()> {
     let active_buf: CudaSlice<u32> = s.clone_htod(&active)?;
     let weights_buf: CudaSlice<bf16> = s.clone_htod(&weights)?;
     let gens_buf: CudaSlice<u64> = s.clone_htod(&gens)?;
+    let contributions_buf: CudaSlice<bf16> = s.alloc_zeros(rows * top_k * hidden)?;
+    let done_buf: CudaSlice<u32> = s.alloc_zeros(rows * top_k)?;
     let y: CudaSlice<bf16> = s.alloc_zeros(rows * hidden)?;
     let y_view = testing::dense_mut(&y, s, rows as u32, hidden as u32)?;
     let input = MoePrefill {
@@ -2051,6 +2065,13 @@ fn prefill_racecheck_small_gpu() -> Result<()> {
         shared_up: testing::dense(&su, s, inter as u32, hidden as u32)?,
         shared_down: testing::dense(&sd, s, hidden as u32, inter as u32)?,
         shared_expert_gate: Some(testing::view(&seg, s, [hidden as u32], [1])?),
+        contributions: testing::view(
+            &contributions_buf,
+            s,
+            [rows as u32, top_k as u32, hidden as u32],
+            [(top_k * hidden) as u64, hidden as u64, 1],
+        )?,
+        done: testing::mut_view(&done_buf, s, [rows as u32, top_k as u32], [top_k as u64, 1])?,
         y: y_view,
     };
     ops.prefill(s, input, &scratch)?;
@@ -2563,6 +2584,7 @@ fn prefill_packed_waves_gpu() -> Result<()> {
         );
     }
     let geometry = ExpertGeometry {
+        first_layer: 0,
         layers: 1,
         experts: experts as u32,
         hidden: hidden as u32,
@@ -2936,7 +2958,12 @@ fn prefill_packed_waves_gpu() -> Result<()> {
                         shared_gate: testing::dense(&shared.sg, s, inter as u32, hidden as u32)?,
                         shared_up: testing::dense(&shared.su, s, inter as u32, hidden as u32)?,
                         shared_down: testing::dense(&shared.sd, s, hidden as u32, inter as u32)?,
-                        shared_expert_gate: testing::view(&shared.seg, s, [hidden as u32], [1])?,
+                        shared_expert_gate: Some(testing::view(
+                            &shared.seg,
+                            s,
+                            [hidden as u32],
+                            [1],
+                        )?),
                         contributions: view(
                             &contributions,
                             s,
@@ -3129,7 +3156,7 @@ fn prefill_packed_waves_gpu() -> Result<()> {
             shared_gate: testing::dense(&shared.sg, s, inter as u32, hidden as u32)?,
             shared_up: testing::dense(&shared.su, s, inter as u32, hidden as u32)?,
             shared_down: testing::dense(&shared.sd, s, hidden as u32, inter as u32)?,
-            shared_expert_gate: testing::view(&shared.seg, s, [hidden as u32], [1])?,
+            shared_expert_gate: Some(testing::view(&shared.seg, s, [hidden as u32], [1])?),
             contributions: view(
                 &bad_c,
                 s,
