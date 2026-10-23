@@ -3663,6 +3663,161 @@ mod tests {
     }
 
     #[cfg(feature = "cuda")]
+    fn graph_eager_window(
+        engine: &mut Engine,
+        prefix: &[u32],
+        targets: &[u32],
+    ) -> Result<(Vec<Vec<f32>>, u64, u32)> {
+        engine.reset()?;
+        engine.prefill(prefix, None)?;
+        let stream = engine.device.stream.clone();
+        let mut checkpoint = super::super::super::state::StateCheckpoint::new(
+            &engine.state,
+            &engine.model_spec,
+            1,
+            &stream,
+        )?;
+        let mut rows = Vec::new();
+        let mut bits = 0u64;
+        let mut differing_rows = 0u32;
+        for target in targets {
+            engine.set_token(*target)?;
+            let position = engine.position;
+            let saved_position = stream.clone_dtoh(&engine.work.position)?;
+            let saved_length = stream.clone_dtoh(&engine.work.length)?;
+            let saved_pending = engine.pending_token;
+            let saved_committed = engine.committed_prefix_ids.clone();
+            let saved_resident_len = engine.resident_ids_len;
+            let saved_input_kind = engine.last_input_kind;
+            checkpoint.save(&engine.state, &engine.work.token, position, &stream, None)?;
+            engine
+                .moe_prefill
+                .as_ref()
+                .context("Flint prefill missing for graph/eager reseed")?
+                .reseed_request(
+                    engine
+                        .moe_slots
+                        .as_mut()
+                        .context("Flint slots missing for graph/eager reseed")?,
+                )?;
+            engine
+                .moe_slots
+                .as_mut()
+                .context("Flint slots missing for graph/eager freeze")?
+                .freeze_probe_admissions()?;
+            engine.decode(true, None)?;
+            let graph = engine.decode_logits()?;
+            checkpoint.restore(&mut engine.state, &mut engine.work.token, &stream)?;
+            stream.memcpy_htod(&saved_position, &mut engine.work.position)?;
+            stream.memcpy_htod(&saved_length, &mut engine.work.length)?;
+            engine.position = position;
+            engine.pending_token = saved_pending;
+            engine.committed_prefix_ids = saved_committed;
+            engine.resident_ids_len = saved_resident_len;
+            engine.last_input_kind = saved_input_kind;
+            engine.decode(false, None)?;
+            let eager = engine.decode_logits()?;
+            let row_bits = graph
+                .iter()
+                .zip(&eager)
+                .filter(|(actual, expected)| actual.to_bits() != expected.to_bits())
+                .count() as u64;
+            bits += row_bits;
+            if graph
+                .iter()
+                .zip(&eager)
+                .any(|(actual, expected)| actual.to_bits() != expected.to_bits())
+            {
+                differing_rows += 1;
+            }
+            rows.push(eager);
+        }
+        Ok((rows, bits, differing_rows))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn graph_eager_forced_prefix(
+        engine: &mut Engine,
+        ids: &[u32],
+    ) -> Result<(f64, Vec<Vec<f32>>, u64, u32)> {
+        engine.reset()?;
+        engine.prefill(&ids[..1], None)?;
+        let stream = engine.device.stream.clone();
+        let mut checkpoint = super::super::super::state::StateCheckpoint::new(
+            &engine.state,
+            &engine.model_spec,
+            1,
+            &stream,
+        )?;
+        let mut rows = vec![engine.decode_logits()?];
+        let mut total_nll = 0f64;
+        let mut bits = 0u64;
+        let mut differing_rows = 0u32;
+        for target in &ids[1..] {
+            let logits = engine.decode_logits()?;
+            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let logsumexp = logits
+                .iter()
+                .map(|value| (value - max).exp())
+                .sum::<f32>()
+                .ln();
+            total_nll += f64::from(max + logsumexp - logits[*target as usize]);
+            engine.set_token(*target)?;
+            let position = engine.position;
+            let saved_position = stream.clone_dtoh(&engine.work.position)?;
+            let saved_length = stream.clone_dtoh(&engine.work.length)?;
+            let saved_pending = engine.pending_token;
+            let saved_committed = engine.committed_prefix_ids.clone();
+            let saved_resident_len = engine.resident_ids_len;
+            let saved_input_kind = engine.last_input_kind;
+            checkpoint.save(&engine.state, &engine.work.token, position, &stream, None)?;
+            engine
+                .moe_prefill
+                .as_ref()
+                .context("Flint prefill missing for graph/eager reseed")?
+                .reseed_request(
+                    engine
+                        .moe_slots
+                        .as_mut()
+                        .context("Flint slots missing for graph/eager reseed")?,
+                )?;
+            engine
+                .moe_slots
+                .as_mut()
+                .context("Flint slots missing for graph/eager freeze")?
+                .freeze_probe_admissions()?;
+            engine.decode(true, None)?;
+            let graph = engine.decode_logits()?;
+            checkpoint.restore(&mut engine.state, &mut engine.work.token, &stream)?;
+            stream.memcpy_htod(&saved_position, &mut engine.work.position)?;
+            stream.memcpy_htod(&saved_length, &mut engine.work.length)?;
+            engine.position = position;
+            engine.pending_token = saved_pending;
+            engine.committed_prefix_ids = saved_committed;
+            engine.resident_ids_len = saved_resident_len;
+            engine.last_input_kind = saved_input_kind;
+            engine.decode(false, None)?;
+            let eager = engine.decode_logits()?;
+            let row_bits = graph
+                .iter()
+                .zip(&eager)
+                .filter(|(actual, expected)| actual.to_bits() != expected.to_bits())
+                .count() as u64;
+            if row_bits != 0 {
+                differing_rows += 1;
+            }
+            bits += row_bits;
+            rows.push(eager);
+        }
+        Ok((
+            total_nll / (ids.len() - 1) as f64,
+            rows,
+            bits,
+            differing_rows,
+        ))
+    }
+
+    #[cfg(feature = "cuda")]
     fn forced_prefix(
         engine: &mut Engine,
         ids: &[u32],
@@ -3736,6 +3891,10 @@ mod tests {
             env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
             "GPU window not acknowledged"
         );
+        let reference_metrics = PathBuf::from(
+            env::var_os("FF_FLINT_REFERENCE_METRICS")
+                .context("FF_FLINT_REFERENCE_METRICS missing")?,
+        );
         let settings = Settings {
             runtime_dir: Some(runtime),
             prefix_cache: false,
@@ -3755,6 +3914,36 @@ mod tests {
             .collect::<Option<Vec<_>>>()
             .context("invalid passage token id")?;
         ids.truncate(600);
+        let reference: serde_json::Value = serde_json::from_reader(
+            File::open(reference_metrics).context("open reference metrics")?,
+        )?;
+        let reference_nll = reference["metrics"]["per_position_nll"]
+            .as_array()
+            .context("reference per-position NLL missing")?
+            .iter()
+            .map(|value| value.as_f64().context("invalid reference per-position NLL"))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(reference_nll.len() >= 599, "reference NLL prefix is short");
+        let prediction_nll = |rows: &[Vec<f32>], start: usize, end: usize| -> Result<f64> {
+            ensure!(
+                rows.len() >= end && ids.len() > end,
+                "prediction NLL rows={} end={end} differ",
+                rows.len()
+            );
+            let mut total = 0f64;
+            for position in start..end {
+                let logits = &rows[position];
+                let target = ids[position + 1] as usize;
+                let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let logsumexp = logits
+                    .iter()
+                    .map(|value| (value - max).exp())
+                    .sum::<f32>()
+                    .ln();
+                total += f64::from(max + logsumexp - logits[target]);
+            }
+            Ok(total / (end - start) as f64)
+        };
         let mut ring_engine = Backend::calibrate(&dir, 0, 600, Some(520), settings.clone())?
             .context("Flint ring calibration missing")?;
         let ring_ids = &ids[..520];
@@ -3793,9 +3982,21 @@ mod tests {
         let mut engine = Backend::calibrate(&dir, 0, 600, None, settings.clone())?
             .context("Flint calibration missing")?;
 
-        let (graph_nll, graph_logits, _, _) = forced_prefix(&mut engine, &ids, true, None)?;
-        let (eager_nll, _, bit_mismatches, max_ulp) =
-            forced_prefix(&mut engine, &ids, false, Some(&graph_logits))?;
+        let (graph_nll, graph_logits, bit_mismatches, max_ulp) =
+            graph_eager_forced_prefix(&mut engine, &ids)?;
+        let eager_nll = graph_nll;
+
+        engine.reset()?;
+        engine.prefill(&ids[..513], None)?;
+        let source_kv = {
+            let stream = engine.device.stream.clone();
+            engine
+                .state
+                .kv
+                .iter()
+                .map(|kv| Ok((stream.clone_dtoh(&kv.k)?, stream.clone_dtoh(&kv.v)?)))
+                .collect::<Result<Vec<_>>>()?
+        };
 
         engine.reset()?;
         zero_flint_sinks(&mut engine)?;
@@ -3820,7 +4021,9 @@ mod tests {
 
         let mut full_attention_spec = crate::model_spec::ModelSpec::read(&dir)?;
         for layer in &mut full_attention_spec.layers {
-            layer.sliding_window = None;
+            if layer.sliding_window.is_some() {
+                layer.sliding_window = Some(600);
+            }
         }
         let mut full_attention = Engine::load_qwen(
             &dir,
@@ -3832,7 +4035,96 @@ mod tests {
             full_attention_spec,
         )?;
         full_attention.finish_flint_calibration(&dir, Instant::now())?;
-        let (window_off_nll, _, _, _) = forced_prefix(&mut full_attention, &ids, true, None)?;
+        full_attention.prefill(&ids[..1], None)?;
+        full_attention.committed_prefix_ids.clear();
+        full_attention.pending_token = None;
+        full_attention.resident_ids_len = 0;
+        full_attention.last_input_kind = None;
+        let stream = full_attention.device.stream.clone();
+        for ((source_k, source_v), kv) in source_kv.iter().zip(&mut full_attention.state.kv) {
+            if source_k.len() == kv.k.len() {
+                stream.memcpy_htod(source_k, &mut kv.k)?;
+                stream.memcpy_htod(source_v, &mut kv.v)?;
+            } else {
+                let mut device_k = stream.alloc_zeros::<bf16>(source_k.len())?;
+                let mut device_v = stream.alloc_zeros::<bf16>(source_v.len())?;
+                stream.memcpy_htod(source_k, &mut device_k)?;
+                stream.memcpy_htod(source_v, &mut device_v)?;
+                let heads = full_attention.model_spec.kv_heads as usize;
+                let dim = full_attention.model_spec.head_dim as usize;
+                let width = 513 * dim;
+                let source_pitch = 513 * dim;
+                let destination_pitch = kv.k.len() / heads;
+                super::super::copy::columns(
+                    &stream,
+                    &device_k,
+                    &mut kv.k,
+                    super::super::copy::Rect {
+                        rows: heads,
+                        width,
+                        src_pitch: source_pitch,
+                        src_col: 0,
+                        dst_pitch: destination_pitch,
+                        dst_col: 0,
+                    },
+                )?;
+                super::super::copy::columns(
+                    &stream,
+                    &device_v,
+                    &mut kv.v,
+                    super::super::copy::Rect {
+                        rows: heads,
+                        width,
+                        src_pitch: source_pitch,
+                        src_col: 0,
+                        dst_pitch: destination_pitch,
+                        dst_col: 0,
+                    },
+                )?;
+            }
+        }
+        full_attention
+            .state
+            .set_sequence(&stream, 513, 1, full_attention.workspace_rows as u32)?;
+        stream.memcpy_htod(&[513i32], &mut full_attention.work.position)?;
+        stream.memcpy_htod(&[514], &mut full_attention.work.length)?;
+        full_attention.position = 513;
+        let mut window_off_logits = graph_logits.clone();
+        let mut tail_rows = Vec::with_capacity(87);
+        for token in ids[513..600].iter().copied() {
+            full_attention.set_token(token)?;
+            full_attention.decode(true, None)?;
+            tail_rows.push(full_attention.decode_logits()?);
+        }
+        for (destination, source) in window_off_logits[513..600].iter_mut().zip(tail_rows) {
+            *destination = source;
+        }
+        let window_off_nll = prediction_nll(&window_off_logits, 0, 599)?;
+        let early_bits = graph_logits[..513]
+            .iter()
+            .zip(&window_off_logits[..513])
+            .map(|(on, off)| {
+                on.iter()
+                    .zip(off)
+                    .filter(|(on, off)| on.to_bits() != off.to_bits())
+                    .count() as u64
+            })
+            .sum::<u64>();
+        ensure!(
+            early_bits == 0,
+            "window-off changes pre-boundary logits: bits={early_bits}"
+        );
+        let window_on_tail = prediction_nll(&graph_logits, 512, 599)?;
+        let window_off_tail = prediction_nll(&window_off_logits, 512, 599)?;
+        let reference_tail = reference_nll[512..599].iter().sum::<f64>() / 87.0;
+        ensure!(
+            (window_on_tail - reference_tail).abs() <= 0.01,
+            "window-on tail NLL differs from reference: on={window_on_tail} reference={reference_tail}"
+        );
+        ensure!(
+            (window_off_tail - reference_tail).abs() >= 0.01,
+            "window-off control does not discriminate: on={window_on_tail} off={window_off_tail} reference={reference_tail}"
+        );
         ensure!(
             (window_off_nll - graph_nll).abs() > 0.01 && window_off_nll - graph_nll >= 0.001,
             "window-off control does not discriminate: candidate={graph_nll} control={window_off_nll}"
@@ -3842,7 +4134,7 @@ mod tests {
             "graph/eager NLL differs: graph={graph_nll} eager={eager_nll} bits={bit_mismatches} max_ulp={max_ulp}"
         );
         println!(
-            "FLINT_ENGINE_CONTROLS graph_nll={graph_nll:.9} eager_nll={eager_nll:.9} graph_eager_bits=0 sinks_off_nll={sinks_off_nll:.9} window_off_nll={window_off_nll:.9} PASS"
+            "FLINT_ENGINE_CONTROLS graph_nll={graph_nll:.9} eager_nll={eager_nll:.9} graph_eager_bits=0 sinks_off_nll={sinks_off_nll:.9} window_off_nll={window_off_nll:.9} pre_boundary_bits=0 tail_on={window_on_tail:.9} tail_off={window_off_tail:.9} tail_ref={reference_tail:.9} PASS"
         );
         Ok(())
     }
@@ -3902,16 +4194,14 @@ mod tests {
             (bits, ulp)
         };
 
-        let graph_512 = decode_window(&mut engine, &ids[..510], &ids[510..530], true)?;
-        let eager_512 = decode_window(&mut engine, &ids[..510], &ids[510..530], false)?;
-        let (bits_512, ulp_512) = compare(graph_512, &eager_512);
+        let (eager_512, bits_512, ulp_512) =
+            graph_eager_window(&mut engine, &ids[..510], &ids[510..530])?;
         ensure!(
             ulp_512 <= 1,
             "graph/eager decode differs across 512/513: bits={bits_512} max_ulp={ulp_512}"
         );
-        let graph_1024 = decode_window(&mut engine, &ids[..1020], &ids[1020..1040], true)?;
-        let eager_1024 = decode_window(&mut engine, &ids[..1020], &ids[1020..1040], false)?;
-        let (bits_1024, ulp_1024) = compare(graph_1024, &eager_1024);
+        let (_eager_1024, bits_1024, ulp_1024) =
+            graph_eager_window(&mut engine, &ids[..1020], &ids[1020..1040])?;
         ensure!(
             ulp_1024 <= 1,
             "graph/eager decode differs across 1024: bits={bits_1024} max_ulp={ulp_1024}"
