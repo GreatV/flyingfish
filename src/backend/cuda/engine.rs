@@ -568,6 +568,7 @@ pub struct Engine {
     moe_prefill: Option<moe::Prefill>,
     #[cfg(test)]
     moe_test_ffn: Option<super::linear::BoundFfn>,
+    flint_legacy_overflow_prefill: bool,
     mtp: Option<mtp::Chain>,
     mtp_state: Option<super::state::StateStore>,
     mtp_epoch: u64,
@@ -985,6 +986,7 @@ impl Engine {
             moe_prefill: None,
             #[cfg(test)]
             moe_test_ffn: None,
+            flint_legacy_overflow_prefill: false,
             mtp: None,
             mtp_state: None,
             mtp_epoch: 0,
