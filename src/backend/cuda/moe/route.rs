@@ -19,6 +19,7 @@ const LOGITS_THREADS: u32 = 128;
 pub(crate) struct RouteOps {
     logits: CudaFunction,
     topk: CudaFunction,
+    sigmoid_topk: CudaFunction,
     blas: CudaBlas,
     stream: Arc<CudaStream>,
 }
@@ -34,6 +35,7 @@ impl RouteOps {
         Ok(Self {
             logits: module.load_function("moe_route_logits_bf16")?,
             topk: module.load_function("moe_route_topk")?,
+            sigmoid_topk: module.load_function("moe_route_topk_sigmoid")?,
             blas,
             stream: stream.clone(),
         })
@@ -43,13 +45,14 @@ impl RouteOps {
     /// dense), then `moe_route_topk`.
     pub fn route(
         &self,
-        stream: &Arc<CudaStream>,
         x: Tensor<bf16, 2>,
         router: Tensor<bf16, 2>,
         ids: &mut TensorMut<i32, 2>,
         weights: &mut TensorMut<bf16, 2>,
         logits: &mut TensorMut<bf16, 2>,
+        score: crate::model_spec::RouterScore,
     ) -> Result<()> {
+        let stream = &self.stream;
         ensure!(
             Arc::ptr_eq(stream, &self.stream),
             "MoE route stream differs from its construction stream"
@@ -71,7 +74,7 @@ impl RouteOps {
                     shared_mem_bytes: 0,
                 })?;
         }
-        self.topk(stream, &plan, logits, ids, weights)
+        self.topk(stream, &plan, logits, ids, weights, score)
     }
 
     /// Prefill routing: logits = x·routerᵀ via one cuBLAS GEMM, then
@@ -79,13 +82,14 @@ impl RouteOps {
     /// dense; it is not read after this call returns.
     pub fn route_prefill(
         &self,
-        stream: &Arc<CudaStream>,
         x: Tensor<bf16, 2>,
         router: Tensor<bf16, 2>,
         ids: &mut TensorMut<i32, 2>,
         weights: &mut TensorMut<bf16, 2>,
         logits: &mut TensorMut<bf16, 2>,
+        score: crate::model_spec::RouterScore,
     ) -> Result<()> {
+        let stream = &self.stream;
         ensure!(
             Arc::ptr_eq(stream, &self.stream),
             "moe route prefill stream is not the RouteOps construction stream (cuBLAS handle bound at construction)"
@@ -131,7 +135,7 @@ impl RouteOps {
             )
             .result()?;
         }
-        self.topk(stream, &plan, logits, ids, weights)
+        self.topk(stream, &plan, logits, ids, weights, score)
     }
 
     fn topk(
@@ -141,10 +145,15 @@ impl RouteOps {
         logits: &TensorMut<bf16, 2>,
         ids: &mut TensorMut<i32, 2>,
         weights: &mut TensorMut<bf16, 2>,
+        score: crate::model_spec::RouterScore,
     ) -> Result<()> {
+        let function = match score {
+            crate::model_spec::RouterScore::Softmax => &self.topk,
+            crate::model_spec::RouterScore::Sigmoid => &self.sigmoid_topk,
+        };
         unsafe {
             stream
-                .launch_builder(&self.topk)
+                .launch_builder(function)
                 .arg(&logits.0.ptr)
                 .arg(&ids.0.ptr)
                 .arg(&weights.0.ptr)

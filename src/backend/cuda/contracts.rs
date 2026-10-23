@@ -218,7 +218,9 @@ impl Scratch {
     pub fn validate(&self, bytes: u64) -> Result<()> {
         ensure!(
             self.ptr != 0 && self.ptr.is_multiple_of(256) && self.bytes >= bytes,
-            "scratch alignment/capacity mismatch"
+            "scratch alignment/capacity mismatch: ptr={:#x} bytes={} required={bytes}",
+            self.ptr,
+            self.bytes
         );
         self.ptr
             .checked_add(self.bytes)

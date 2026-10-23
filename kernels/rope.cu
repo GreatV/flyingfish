@@ -74,18 +74,19 @@ extern "C" __global__ void rope_float(__nv_bfloat16* qkv, const int* start,
     qkv[off + dim / 2] = __float2bfloat16(b * c + a * s);
 }
 
-// draft_qknorm_rope_kv: draft q/k RMSNorm + RoPE + KV write in one launch,
-// bit-identical to columns+norm+columns (q,k) + rope_float + kv_write.
-extern "C" __global__ void draft_qknorm_rope_kv(__nv_bfloat16* qkv,
-                                                __nv_bfloat16* k, __nv_bfloat16* v,
-                                                const __nv_bfloat16* q_norm_w,
-                                                const __nv_bfloat16* k_norm_w,
-                                                const int* start,
-                                                int rows, int q_heads, int kv_heads,
-                                                int dim, int capacity,
-                                                float theta, float eps) {
-    if (q_heads != 16 || kv_heads != 2 || dim != 128 || rows > 8 ||
-        *start < 0 || *start + rows > capacity)
+template <bool ROTARY>
+__device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
+                                                    __nv_bfloat16* k, __nv_bfloat16* v,
+                                                    const __nv_bfloat16* q_norm_w,
+                                                    const __nv_bfloat16* k_norm_w,
+                                                    const int* start,
+                                                    int rows, int q_heads, int kv_heads,
+                                                    int dim, int capacity,
+                                                    int ring_tokens, float theta, float eps) {
+    const bool shape = (q_heads == 16 && kv_heads == 2) ||
+                       (q_heads == 32 && kv_heads == 4);
+    if (!shape || dim != 128 || rows < 1 || rows > 65535 ||
+        *start < 0 || (ring_tokens == 0 && *start + rows > capacity))
         __trap();
     __shared__ float smem[32];
     const int heads = q_heads + 2 * kv_heads;
@@ -96,6 +97,7 @@ extern "C" __global__ void draft_qknorm_rope_kv(__nv_bfloat16* qkv,
     const int nthr = blockDim.x;
     const size_t base = (size_t)row * heads * dim + (size_t)head * dim;
     const int position = *start + row;
+    const int cache_pos = ring_tokens > 0 ? position % ring_tokens : position;
 
     if (head < q_heads + kv_heads) {
         const __nv_bfloat16* w = (head < q_heads) ? q_norm_w : k_norm_w;
@@ -146,7 +148,8 @@ extern "C" __global__ void draft_qknorm_rope_kv(__nv_bfloat16* qkv,
         }
         __syncthreads();
 
-        if (gid < dim / 2) {
+        if constexpr (ROTARY) {
+          if (gid < dim / 2) {
             const float inv = 1.0f / powf(theta, float(2 * gid) / dim);
             const float angle = float(position) * inv;
             const float c = __bfloat162float(__float2bfloat16(cosf(angle)));
@@ -159,15 +162,46 @@ extern "C" __global__ void draft_qknorm_rope_kv(__nv_bfloat16* qkv,
             qkv[base + gid + dim / 2] = hi;
             if (head >= q_heads) {
                 const int kv_head = head - q_heads;
-                const size_t dst = ((size_t)kv_head * capacity + position) * dim;
+                const size_t dst = ((size_t)kv_head * capacity + cache_pos) * dim;
                 k[dst + gid] = lo;
                 k[dst + gid + dim / 2] = hi;
             }
+          }
+        } else if (head >= q_heads) {
+            const int kv_head = head - q_heads;
+            const size_t dst = ((size_t)kv_head * capacity + cache_pos) * dim;
+            for (int d = gid; d < dim; d += nthr) k[dst + d] = qkv[base + d];
         }
     } else {
         const int kv_head = head - q_heads - kv_heads;
-        const size_t dst = ((size_t)kv_head * capacity + position) * dim;
+        const size_t dst = ((size_t)kv_head * capacity + cache_pos) * dim;
 #pragma unroll
         for (int d = gid; d < dim; d += nthr) v[dst + d] = qkv[base + d];
     }
+}
+
+// draft q/k RMSNorm + RoPE + KV write in one launch,
+// bit-identical to columns+norm+columns (q,k) + rope_float + kv_write.
+extern "C" __global__ void draft_qknorm_rope_kv(__nv_bfloat16* qkv,
+                                                __nv_bfloat16* k, __nv_bfloat16* v,
+                                                const __nv_bfloat16* q_norm_w,
+                                                const __nv_bfloat16* k_norm_w,
+                                                const int* start,
+                                                int rows, int q_heads, int kv_heads,
+                                                int dim, int capacity,
+                                                int ring_tokens, float theta, float eps) {
+    qknorm_rope_kv_impl<true>(qkv, k, v, q_norm_w, k_norm_w, start, rows,
+                              q_heads, kv_heads, dim, capacity, ring_tokens, theta, eps);
+}
+
+extern "C" __global__ void qknorm_kv_nope(__nv_bfloat16* qkv,
+                                          __nv_bfloat16* k, __nv_bfloat16* v,
+                                          const __nv_bfloat16* q_norm_w,
+                                          const __nv_bfloat16* k_norm_w,
+                                          const int* start,
+                                          int rows, int q_heads, int kv_heads,
+                                          int dim, int capacity,
+                                          int ring_tokens, float, float eps) {
+    qknorm_rope_kv_impl<false>(qkv, k, v, q_norm_w, k_norm_w, start, rows,
+                               q_heads, kv_heads, dim, capacity, ring_tokens, 1.0f, eps);
 }

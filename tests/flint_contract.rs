@@ -223,3 +223,48 @@ fn read_native_bf16(dir: &std::path::Path, entry: &TensorEntry) -> Result<Vec<ha
         .map(|word| half::bf16::from_le_bytes(*word))
         .collect())
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "GPU window, FF_MODEL and FLYINGFISH_RUNTIME_DIR required"]
+fn flint_engine_short_prefill_gpu() -> Result<()> {
+    use flyingfish::backend::{Backend, Settings};
+    let dir = PathBuf::from(
+        env::var_os("FF_MODEL")
+            .context("FF_MODEL missing; point it at the published Flint directory")?,
+    );
+    let runtime = PathBuf::from(
+        env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR missing")?,
+    );
+    ensure!(
+        env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let settings = Settings {
+        runtime_dir: Some(runtime),
+        prefix_cache: false,
+        draft_model: None,
+        tree_builder: flyingfish::backend::TreeBuilder::Serial,
+        spec_budget: flyingfish::backend::SpecBudget::Chain,
+        spec_graph: false,
+        kv_format: flyingfish::kv::KvFormat::Bf16,
+    };
+    let mut engine = Backend::calibrate(&dir, 0, 600, None, settings)?
+        .context("Flint calibration did not return the prepared engine")?;
+    let ids = [150000u32, 1, 2, 3, 4, 5, 6, 7];
+    let mut trace = flyingfish::trace::Trace::all_layers();
+    let token = engine.prefill(&ids, Some(&mut trace))?;
+    let logits = engine.decode_logits()?;
+    ensure!(
+        logits.len() == 150_144 && logits.iter().all(|value| value.is_finite()),
+        "invalid Flint logits extent or nonfinite values"
+    );
+    println!(
+        "FLINT_ENGINE_SHORT_PREFILL rows={} token={token} finite_logits=true PASS",
+        ids.len()
+    );
+    if let Some(path) = env::var_os("FF_FLINT_TRACE_OUT") {
+        trace.save(&PathBuf::from(path))?;
+    }
+    Ok(())
+}

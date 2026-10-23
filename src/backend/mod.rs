@@ -120,7 +120,7 @@ impl SpecBudget {
 pub struct Settings {
     #[arg(long, global = true, value_enum, default_value_t = TreeBuilder::Waves)]
     pub tree_builder: TreeBuilder,
-    #[arg(long, global = true, value_enum, default_value_t = SpecBudget::default(), requires = "draft_model")]
+    #[arg(long, global = true, value_enum, default_value_t = SpecBudget::default())]
     pub spec_budget: SpecBudget,
     #[arg(long, global = true, default_value_t = true, action = clap::ArgAction::Set)]
     pub spec_graph: bool,

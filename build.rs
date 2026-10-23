@@ -244,7 +244,6 @@ fn main() {
         "-DFLASHATTENTION_DISABLE_ALIBI",
         "-DFLASHATTENTION_DISABLE_UNEVEN_K",
         "-DFLASHATTENTION_DISABLE_SOFTCAP",
-        "-DFLASHATTENTION_DISABLE_LOCAL",
         "-Ithird_party/cutlass/include",
     ]);
     for sm in &archs {

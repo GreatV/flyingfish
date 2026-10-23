@@ -1,7 +1,7 @@
 //! GPU correctness, control and trap gates for the decode contribute and
 //! combine ops.
 use super::combine::{CombineOps, MoeCombine};
-use super::decode::{DecodeOps, MoeDecode, decode_scratch_bytes};
+use super::decode::{DecodeOps, MoeDecode, decode_scratch_bytes, decode_scratch_bytes_mixed};
 use super::reference::{self, Combine, MoeDims};
 use super::testing;
 use crate::backend::cuda::Device;
@@ -314,6 +314,7 @@ fn invariant_decode(device: &Device) -> Result<()> {
             },
             top_k: k as u32,
             hidden: h as u32,
+            expert_inter: i as u32,
             inter: i as u32,
         };
         let mut alias_io = decode_io(s, 1, k as u32, h as u32)?;
@@ -326,7 +327,7 @@ fn invariant_decode(device: &Device) -> Result<()> {
             &mut alias_io.done,
         )?;
         ensure!(
-            super::decode::validate(&alias, &gate.scratch).is_err(),
+            super::decode::validate(&alias, &gate.scratch, gate.inter).is_err(),
             "shared output may not alias the source activation"
         );
         println!(
@@ -520,6 +521,7 @@ struct Gate<'a> {
     scratch: Scratch,
     top_k: u32,
     hidden: u32,
+    expert_inter: u32,
     inter: u32,
 }
 
@@ -559,8 +561,14 @@ impl Gate<'_> {
         let mut done = io._done_dev.slice_mut(..choices);
         let mut execute = || -> Result<()> {
             self.s.memset_zeros(&mut done)?;
-            self.ops
-                .decode(self.s, &input, &mut io.y, &self.scratch, layout)
+            self.ops.decode(
+                self.s,
+                &input,
+                &mut io.y,
+                &self.scratch,
+                layout,
+                self.expert_inter,
+            )
         };
         execute()?;
         if graph {
@@ -624,7 +632,7 @@ impl Gate<'_> {
             shared_gate: self.shared_gate,
             shared_up: self.shared_up,
             shared_down: self.shared_down,
-            shared_expert_gate: self.seg,
+            shared_expert_gate: Some(self.seg),
             contributions,
             shared_out,
             done,
@@ -636,8 +644,14 @@ impl Gate<'_> {
         let mut io = decode_io(self.s, rows, self.top_k, self.hidden)?;
         {
             let input = self.input(rows, rt, io.contributions, &mut io.shared_out, &mut io.done)?;
-            self.ops
-                .decode(self.s, &input, &mut io.y, &self.scratch, None)?;
+            self.ops.decode(
+                self.s,
+                &input,
+                &mut io.y,
+                &self.scratch,
+                None,
+                self.expert_inter,
+            )?;
         }
         self.s.synchronize()?;
         Ok(self.s.clone_dtoh(&io.y_dev)?)
@@ -648,14 +662,20 @@ impl Gate<'_> {
         let mut io = decode_io(self.s, rows, self.top_k, self.hidden)?;
         {
             let input = self.input(rows, rt, io.contributions, &mut io.shared_out, &mut io.done)?;
-            self.ops.contribute(self.s, &input, &self.scratch)?;
+            self.ops
+                .contribute(self.s, &input, &self.scratch, self.expert_inter)?;
             let scale_ptr = self.scratch.ptr
-                + u64::from(rows) * u64::from(self.top_k + 1) * u64::from(self.inter) * 2;
+                + (u64::from(rows) * u64::from(self.top_k) * u64::from(self.expert_inter)
+                    + u64::from(rows) * u64::from(self.inter))
+                    * 2;
             let mut scale = unsafe {
                 TensorMut::<bf16, 2>::new(scale_ptr, [rows, 1], [1, 1], u64::from(rows) * 2)?
             };
+            let shared_gate = input
+                .shared_expert_gate
+                .context("split decode reference has no shared gate")?;
             self.combine
-                .shared_scale(self.s, input.x, input.shared_expert_gate, &mut scale)?;
+                .shared_scale(self.s, input.x, shared_gate, &mut scale)?;
             let combine_input = MoeCombine {
                 ids: input.ids,
                 final_active: input.active,
@@ -663,8 +683,8 @@ impl Gate<'_> {
                 contributions: input.contributions,
                 shared_out: input.shared_out.read(),
                 x: input.x,
-                shared_expert_gate: input.shared_expert_gate,
-                scale,
+                shared_expert_gate: Some(shared_gate),
+                scale: Some(scale),
                 y: TensorMut(io.y.read()),
             };
             self.combine.combine(self.s, &combine_input)?;
@@ -677,7 +697,8 @@ impl Gate<'_> {
     fn contribute_sync(&self, rows: u32, rt: &Routing) -> Result<()> {
         let mut io = decode_io(self.s, rows, self.top_k, self.hidden)?;
         let input = self.input(rows, rt, io.contributions, &mut io.shared_out, &mut io.done)?;
-        self.ops.contribute(self.s, &input, &self.scratch)?;
+        self.ops
+            .contribute(self.s, &input, &self.scratch, self.expert_inter)?;
         Ok(self.s.synchronize()?)
     }
 }
@@ -743,8 +764,8 @@ fn decode_expert_ffn_gpu() -> Result<()> {
                 contributions: io.contributions,
                 shared_out: io.shared_out.read(),
                 x: io.shared_out.read(),
-                shared_expert_gate: testing::view(&io._shared_out_dev, s, [h as u32], [1])?,
-                scale: testing::dense_mut(&scale, s, rows as u32, 1)?,
+                shared_expert_gate: Some(testing::view(&io._shared_out_dev, s, [h as u32], [1])?),
+                scale: Some(testing::dense_mut(&scale, s, rows as u32, 1)?),
                 y: TensorMut(io.y.read()),
             },
         )?;
@@ -763,6 +784,46 @@ fn decode_expert_ffn_gpu() -> Result<()> {
             if mismatches == 0 { "PASS" } else { "DEFECT" }
         );
         anyhow::ensure!(mismatches == 0, "DEFECT routed/shared BF16 boundary");
+
+        let mut ungated_shared = vec![bf16::ZERO; rows * h];
+        for row in 0..rows {
+            let value = if row == 0 { 0.25 } else { -0.25 };
+            ungated_shared[row * h..][..h].fill(bf16::from_f32(value));
+        }
+        s.memcpy_htod(&ungated_shared, &mut io._shared_out_dev)?;
+        combine_ops.combine(
+            s,
+            &MoeCombine {
+                ids: testing::dense(&ids, s, rows as u32, k as u32)?,
+                final_active: active_view,
+                done: active_view,
+                contributions: io.contributions,
+                shared_out: io.shared_out.read(),
+                x: io.shared_out.read(),
+                shared_expert_gate: None,
+                scale: None,
+                y: TensorMut(io.y.read()),
+            },
+        )?;
+        s.synchronize()?;
+        let ungated = s.clone_dtoh(&io.y_dev)?;
+        let ungated_mismatches = ungated
+            .iter()
+            .enumerate()
+            .filter(|(word, value)| {
+                let expected = bf16::from_f32(if *word < h { 1.25 } else { -1.25 });
+                value.to_bits() != expected.to_bits()
+            })
+            .count();
+        println!(
+            "{} moe_combine_ungated rows={rows} top_k={k} hidden={h} bit_mismatches={ungated_mismatches}",
+            if ungated_mismatches == 0 {
+                "PASS"
+            } else {
+                "DEFECT"
+            }
+        );
+        anyhow::ensure!(ungated_mismatches == 0, "DEFECT ungated shared expert");
     }
     let fx = reference::fixture(MoeDims::minicpm47(8), 0);
     let (e, k, h, i) = (
@@ -829,6 +890,7 @@ fn decode_expert_ffn_gpu() -> Result<()> {
         scratch,
         top_k: ku,
         hidden: hu,
+        expert_inter: iu,
         inter: iu,
     };
 
@@ -941,6 +1003,93 @@ fn decode_expert_ffn_gpu() -> Result<()> {
             "partial-active row 0 (dropped {dropped:?}) max diff {diff:e} exceeds tolerance {tol:e}"
         );
         println!("MOE_DECODE_PARTIAL row=0 dropped={dropped:?} max_diff={diff:e} tol={tol:e} PASS");
+    }
+
+    {
+        let mut mixed_dims = MoeDims::new(2, 16, 4, 128, 64);
+        mixed_dims.shared_inter = 128;
+        let mixed = reference::fixture(mixed_dims, 11);
+        let (mi, msi, mh, mk, me) = (
+            mixed.dims.inter,
+            mixed.dims.shared_inter,
+            mixed.dims.hidden,
+            mixed.dims.top_k,
+            mixed.dims.experts,
+        );
+        let x_m = testing::upload(&device.upload, mixed.x.clone())?;
+        let gu_m = testing::upload(&device.upload, mixed.gate_up.clone())?;
+        let dn_m = testing::upload(&device.upload, mixed.down.clone())?;
+        let sg_m = testing::upload(&device.upload, mixed.shared_gate.clone())?;
+        let su_m = testing::upload(&device.upload, mixed.shared_up.clone())?;
+        let sd_m = testing::upload(&device.upload, mixed.shared_down.clone())?;
+        let se_m = testing::upload(&device.upload, mixed.shared_expert_gate.clone())?;
+        device.finish_upload()?;
+        let routed = reference::route_row(&mixed, 0);
+        let ids_m = testing::upload(s, routed.ids.clone())?;
+        let weights_m = testing::upload(s, routed.weights.clone())?;
+        let active_m = testing::upload(s, vec![1u32; mk])?;
+        let generations_m = testing::upload(s, vec![1u64; me])?;
+        let valid_m = testing::upload(s, vec![1u32; me])?;
+        let gu_base_m = gu_m.device_ptr(s).0;
+        let dn_base_m = dn_m.device_ptr(s).0;
+        let gu_stride_m = (2 * mi * mh * 2) as u64;
+        let dn_stride_m = (mh * mi * 2) as u64;
+        let gu_table_m: Vec<u64> = (0..me)
+            .map(|expert| gu_base_m + expert as u64 * gu_stride_m)
+            .collect();
+        let dn_table_m: Vec<u64> = (0..me)
+            .map(|expert| dn_base_m + expert as u64 * dn_stride_m)
+            .collect();
+        let gu_table_dev = testing::upload(s, gu_table_m)?;
+        let dn_table_dev = testing::upload(s, dn_table_m)?;
+        let scratch_m =
+            testing::zeros::<u8>(s, decode_scratch_bytes_mixed(1, mk, mi, msi) as usize)?;
+        let mixed_gate = Gate {
+            ops: &ops,
+            combine: &combine_ops,
+            s,
+            x: testing::dense(&x_m, s, 2, mh as u32)?,
+            shared_gate: testing::dense(&sg_m, s, msi as u32, mh as u32)?,
+            shared_up: testing::dense(&su_m, s, msi as u32, mh as u32)?,
+            shared_down: testing::dense(&sd_m, s, mh as u32, msi as u32)?,
+            seg: testing::view(&se_m, s, [mh as u32], [1])?,
+            valid: testing::view(&valid_m, s, [me as u32], [1])?,
+            scratch: Scratch {
+                ptr: scratch_m.device_ptr(s).0,
+                bytes: decode_scratch_bytes_mixed(1, mk, mi, msi),
+            },
+            top_k: mk as u32,
+            hidden: mh as u32,
+            expert_inter: mi as u32,
+            inter: msi as u32,
+        };
+        let mixed_rt = Routing {
+            ids: testing::dense(&ids_m, s, 1, mk as u32)?,
+            active: testing::dense(&active_m, s, 1, mk as u32)?,
+            weights: testing::dense(&weights_m, s, 1, mk as u32)?,
+            agen: testing::dense(&generations_m, s, 1, mk as u32)?,
+            gu: testing::view(&gu_table_dev, s, [me as u32], [1])?,
+            dn: testing::view(&dn_table_dev, s, [me as u32], [1])?,
+            slot_gen: testing::view(&generations_m, s, [me as u32], [1])?,
+        };
+        let got = mixed_gate.run(1, &mixed_rt)?;
+        let want = reference::moe_row_ids(
+            &mixed,
+            0,
+            &routed.ids,
+            &routed.weights,
+            &(0..mk).collect::<Vec<_>>(),
+            Combine::Fp32,
+        );
+        let tol = reference::tolerance(&mixed, &[0]);
+        let diff = max_row_diff(&got[..mh], &want);
+        anyhow::ensure!(
+            diff <= tol,
+            "mixed shared width max diff {diff:e} exceeds tolerance {tol:e}"
+        );
+        println!(
+            "MOE_DECODE_MIXED expert_inter={mi} shared_inter={msi} max_diff={diff:e} tol={tol:e} PASS"
+        );
     }
 
     let tol0 = reference::tolerance(&fx, &[0]);
@@ -1169,7 +1318,7 @@ impl W8Gate<'_> {
             shared_gate: self.shared_gate,
             shared_up: self.shared_up,
             shared_down: self.shared_down,
-            shared_expert_gate: self.seg,
+            shared_expert_gate: Some(self.seg),
             contributions,
             shared_out,
             done,
@@ -1194,8 +1343,14 @@ impl W8Gate<'_> {
                 layout.slot_bytes() == self.slot_bytes,
                 "W8A16 gate slot bytes"
             );
-            self.ops
-                .decode(self.s, &input, &mut io.y, scratch, layout.fp8_slot())?;
+            self.ops.decode(
+                self.s,
+                &input,
+                &mut io.y,
+                scratch,
+                layout.fp8_slot(),
+                self.shared_gate.shape[0],
+            )?;
         }
         self.s.synchronize()?;
         Ok(self.s.clone_dtoh(&io.y_dev)?)
@@ -1339,7 +1494,7 @@ fn decode_expert_ffn_w8a16_gpu() -> Result<()> {
                     top_k: ku,
                 },
             )?;
-            ops.contribute_w8a16(s, &input, layout.fp8_slot().unwrap(), &scratch)?;
+            ops.contribute_w8a16(s, &input, layout.fp8_slot().unwrap(), &scratch, iu)?;
         }
         s.synchronize()?;
         let scratch_w8 = s.clone_dtoh(&scratch_mem)?;
@@ -1370,12 +1525,12 @@ fn decode_expert_ffn_w8a16_gpu() -> Result<()> {
                 shared_gate: w8.shared_gate,
                 shared_up: w8.shared_up,
                 shared_down: w8.shared_down,
-                shared_expert_gate: w8.seg,
+                shared_expert_gate: Some(w8.seg),
                 contributions: io_bf16.contributions,
                 shared_out: &mut io_bf16.shared_out,
                 done: &mut io_bf16.done,
             };
-            ops.contribute(s, &input, &scratch)?;
+            ops.contribute(s, &input, &scratch, iu)?;
         }
         s.synchronize()?;
         let scratch_bf16 = s.clone_dtoh(&scratch_mem)?;

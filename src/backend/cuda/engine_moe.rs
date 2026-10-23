@@ -7,7 +7,7 @@ use crate::backend::cuda::{
     linear::BoundFfn,
     moe::{
         combine::{CombineOps, MoeCombine},
-        decode::{DecodeOps, MoeDecode, decode_scratch_bytes},
+        decode::{DecodeOps, MoeDecode, decode_scratch_bytes, decode_scratch_bytes_mixed},
         prefill::{LANE16_ROWS, PrefillOps},
         route::RouteOps,
     },
@@ -31,7 +31,11 @@ pub(super) struct Setup {
     decode_rows: usize,
 }
 
-fn decode_device_bytes(geometry: ExpertGeometry, rows: usize) -> Result<usize> {
+fn decode_device_bytes(
+    geometry: ExpertGeometry,
+    shared_intermediate: u32,
+    rows: usize,
+) -> Result<usize> {
     ensure!(
         (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&rows),
         "expert decode rows={rows} exceeds skinny bound={} geometry={geometry:?}",
@@ -46,7 +50,12 @@ fn decode_device_bytes(geometry: ExpertGeometry, rows: usize) -> Result<usize> {
         .and_then(|n| n.checked_add(hidden * 2 + 2))
         .and_then(|n| n.checked_add(geometry.experts as usize * 2))
         .context("expert decode row byte count overflow")?;
-    let scratch = decode_scratch_bytes(rows, k, geometry.intermediate as usize);
+    let scratch = decode_scratch_bytes_mixed(
+        rows,
+        k,
+        geometry.intermediate as usize,
+        shared_intermediate as usize,
+    );
     rows.checked_mul(row)
         .and_then(|n| n.checked_add(usize::try_from(scratch).ok()?))
         .context("expert decode device reserve overflow")
@@ -103,15 +112,23 @@ impl Setup {
     ) -> Result<Self> {
         use crate::experts::plan::PlanInputs;
         use crate::prefill::{ExpertWorkspaceBudget, ExpertWorkspaceRequest};
+        let total_started = std::time::Instant::now();
+        let phase_started = total_started;
         let geometry = ExpertGeometry::from_model(model)?;
-        let decode_extra = decode_device_bytes(geometry, decode_rows)?
-            .checked_sub(decode_device_bytes(geometry, 1)?)
+        let shared_intermediate = model
+            .moe
+            .context("MoE geometry missing")?
+            .shared_intermediate;
+        let decode_extra = decode_device_bytes(geometry, shared_intermediate, decode_rows)?
+            .checked_sub(decode_device_bytes(geometry, shared_intermediate, 1)?)
             .context("expert decode reserve underflow")?;
         let catalogue = Arc::new(crate::experts::catalogue::ExpertCatalogue::from_manifest(
             manifest,
             geometry,
             model.expert_format.context("MoE expert_format missing")?,
         )?);
+        let catalogue_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+        let phase_started = std::time::Instant::now();
         let calibration = super::super::closure::Closure::new(
             write,
             format!(
@@ -126,6 +143,8 @@ impl Setup {
             model.expert_format.context("MoE expert_format missing")?,
             &calibration,
         )?;
+        let expert_calibration_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+        let phase_started = std::time::Instant::now();
         let available = host_memory(Path::new("/"))?;
         let copies = measured.copy_engines.min(2);
         let slot = catalogue.slot_bytes();
@@ -298,6 +317,15 @@ impl Setup {
                 "context_span_bytes":context_row_bytes.checked_mul(capacity.span_rows as usize).context("draft context span bytes overflow")?
             }})
         );
+        eprintln!(
+            "{}",
+            serde_json::json!({"expert_setup_phase": {
+                "catalogue_ms": catalogue_ms,
+                "expert_calibration_ms": expert_calibration_ms,
+                "planning_ms": phase_started.elapsed().as_secs_f64() * 1000.0,
+                "total_ms": total_started.elapsed().as_secs_f64() * 1000.0
+            }})
+        );
         Ok(Self {
             workspace,
             capacity,
@@ -309,6 +337,7 @@ impl Setup {
     }
 
     pub fn bind(self, engine: &mut Engine) -> Result<()> {
+        let total_started = std::time::Instant::now();
         let geometry = self.catalogue.geometry();
         let initial = crate::experts::plan::initial_residency(
             &vec![vec![0.0; geometry.experts as usize]; geometry.layers as usize],
@@ -322,6 +351,7 @@ impl Setup {
             &self.measured.service,
             self.measured.h2d_bytes_per_second,
         )?;
+        let phase_started = std::time::Instant::now();
         let mut slots = Slots::load(
             &engine.device,
             geometry,
@@ -339,6 +369,8 @@ impl Setup {
                 max_rows: u32::try_from(cpu.0.max(self.decode_rows))?,
             },
         )?;
+        let slots_load_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+        let phase_started = std::time::Instant::now();
         engine.moe = Some(Decode::new(
             &engine.device,
             geometry,
@@ -352,7 +384,14 @@ impl Setup {
                 .model_spec
                 .expert_format
                 .context("MoE expert_format missing")?,
+            engine
+                .model_spec
+                .moe
+                .context("MoE shared geometry missing")?
+                .shared_intermediate,
         )?);
+        let decode_new_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+        let phase_started = std::time::Instant::now();
         engine.moe_prefill = Some(Prefill::new(
             &engine.device,
             &mut slots,
@@ -365,8 +404,18 @@ impl Setup {
                 self.workspace.mixer.plan.chunk,
             ),
         )?);
+        let prefill_new_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
         engine.device.finish_upload()?;
         engine.moe_slots = Some(slots);
+        eprintln!(
+            "{}",
+            serde_json::json!({"expert_bind_phase": {
+                "slots_load_ms": slots_load_ms,
+                "decode_new_ms": decode_new_ms,
+                "prefill_new_ms": prefill_new_ms,
+                "total_ms": total_started.elapsed().as_secs_f64() * 1000.0
+            }})
+        );
         Ok(())
     }
 }
@@ -462,6 +511,7 @@ pub(super) struct Dispatch<'a> {
 
 pub(super) struct Decode {
     geometry: ExpertGeometry,
+    shared_intermediate: u32,
     fp8_slot: Option<crate::experts::catalogue::Fp8Slot>,
     max_rows: usize,
     phase: DecodePhase,
@@ -557,6 +607,7 @@ impl Decode {
         workers: u32,
         cpu_bounds: (usize, usize),
         format: crate::model_spec::ExpertFormat,
+        shared_intermediate: u32,
     ) -> Result<Self> {
         ensure!(
             (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&max_rows),
@@ -587,6 +638,7 @@ impl Decode {
         let layout = crate::experts::catalogue::ExpertLayout::new(format, &geometry)?;
         let decode = Self {
             geometry,
+            shared_intermediate,
             fp8_slot: layout.fp8_slot().cloned(),
             max_rows,
             phase: DecodePhase::default(),
@@ -604,10 +656,11 @@ impl Decode {
             done: stream.alloc_zeros(choices)?,
             shared: stream.alloc_zeros(hidden)?,
             scale: stream.alloc_zeros(max_rows)?,
-            scratch: stream.alloc_zeros(usize::try_from(decode_scratch_bytes(
+            scratch: stream.alloc_zeros(usize::try_from(decode_scratch_bytes_mixed(
                 max_rows,
                 geometry.top_k as usize,
                 geometry.intermediate as usize,
+                shared_intermediate as usize,
             ))?)?,
             host_ids: pinned_zeros(context, choices)?,
             host_weights: pinned_zeros(context, choices)?,
@@ -643,7 +696,7 @@ impl Decode {
             + (decode.contributions.len() + decode.shared.len() + decode.scale.len())
                 * size_of::<bf16>()
             + decode.scratch.len();
-        let planned = decode_device_bytes(geometry, max_rows)?;
+        let planned = decode_device_bytes(geometry, shared_intermediate, max_rows)?;
         ensure!(
             allocated == planned,
             "MoE decode row buffers allocation={allocated} differs from planned={planned} rows={max_rows}"
@@ -651,7 +704,7 @@ impl Decode {
         Ok(decode)
     }
 
-    pub fn route(&mut self, device: &Device, ffn: BoundFfn, x: Tensor<bf16, 2>) -> Result<()> {
+    pub fn route(&mut self, device: &Device, ffn: &BoundFfn, x: Tensor<bf16, 2>) -> Result<()> {
         self.route_device(device, ffn, x)?;
         self.read_route(device, ffn, x)
     }
@@ -662,8 +715,8 @@ impl Decode {
         Ok(())
     }
 
-    fn route_device(&self, device: &Device, ffn: BoundFfn, x: Tensor<bf16, 2>) -> Result<()> {
-        let BoundFfn::Moe { router, .. } = ffn else {
+    fn route_device(&self, device: &Device, ffn: &BoundFfn, x: Tensor<bf16, 2>) -> Result<()> {
+        let BoundFfn::Moe { router, score, .. } = ffn else {
             anyhow::bail!("MoE route received a dense FFN");
         };
         ensure!(
@@ -687,9 +740,8 @@ impl Decode {
         let k = self.geometry.top_k;
         let stream = &device.stream;
         self.route.route(
-            stream,
             x,
-            router,
+            *router,
             &mut TensorMut(view(
                 &self.ids,
                 stream,
@@ -711,10 +763,11 @@ impl Decode {
                 [rows as u32, self.geometry.experts],
                 [u64::from(self.geometry.experts), 1],
             )?),
+            *score,
         )
     }
 
-    fn read_route(&mut self, device: &Device, ffn: BoundFfn, x: Tensor<bf16, 2>) -> Result<()> {
+    fn read_route(&mut self, device: &Device, ffn: &BoundFfn, x: Tensor<bf16, 2>) -> Result<()> {
         let BoundFfn::Moe { router, .. } = ffn else {
             anyhow::bail!("MoE route mailbox received a dense FFN");
         };
@@ -805,7 +858,10 @@ impl Decode {
         activation: (Tensor<bf16, 2>, &mut TensorMut<bf16, 2>),
         graph: Option<usize>,
     ) -> Result<()> {
-        let BoundFfn::Moe { router, shared, .. } = ffn else {
+        let BoundFfn::Moe {
+            router, ref shared, ..
+        } = ffn
+        else {
             anyhow::bail!("MoE completion received a dense FFN");
         };
         let (x, y) = activation;
@@ -821,10 +877,10 @@ impl Decode {
             x.shape
         );
         ensure!(
-            shared[0].shape[0] == self.geometry.intermediate,
-            "MoE shared intermediate={} expert intermediate={}",
+            shared[0].shape[0] == self.shared_intermediate,
+            "MoE shared intermediate={} expected={}",
             shared[0].shape[0],
-            self.geometry.intermediate
+            self.shared_intermediate
         );
         validate_dispatch(rows, k, self.routed()?.1, &dispatch)?;
         let stream = &device.stream;
@@ -856,7 +912,7 @@ impl Decode {
         if let Some(layer) = graph {
             self.segment(rows, layer)?.contribute.launch()?;
         } else {
-            self.contribute_device(device, ffn, slots, x)?;
+            self.contribute_device(device, ffn.clone(), slots, x)?;
         }
         self.reader.record(stream)?;
         let reader = self.reader.clone();
@@ -880,14 +936,13 @@ impl Decode {
         x: Tensor<bf16, 2>,
     ) -> Result<()> {
         let BoundFfn::Moe {
-            shared,
+            ref shared,
             shared_gate,
             ..
         } = ffn
         else {
             anyhow::bail!("MoE contribution received a dense FFN");
         };
-        let shared_gate = shared_gate.context("ungated shared expert decode is not bound")?;
         let (rows, k, hidden) = (
             x.shape[0] as usize,
             self.geometry.top_k as usize,
@@ -961,10 +1016,16 @@ impl Decode {
         };
         let scratch = qwen::scratch(&self.scratch, stream);
         if let Some(slot) = self.fp8_slot.as_ref() {
-            self.contribute
-                .contribute_w8a16(stream, &input, slot, &scratch)
+            self.contribute.contribute_w8a16(
+                stream,
+                &input,
+                slot,
+                &scratch,
+                self.geometry.intermediate,
+            )
         } else {
-            self.contribute.contribute(stream, &input, &scratch)
+            self.contribute
+                .contribute(stream, &input, &scratch, self.geometry.intermediate)
         }
     }
 
@@ -1040,7 +1101,6 @@ impl Decode {
         let BoundFfn::Moe { shared_gate, .. } = ffn else {
             anyhow::bail!("MoE combine received a dense FFN");
         };
-        let shared_gate = shared_gate.context("ungated shared expert combine is not bound")?;
         let (rows, k, hidden) = (
             x.shape[0] as usize,
             self.geometry.top_k as usize,
@@ -1063,9 +1123,14 @@ impl Decode {
             [rows as u32, k as u32],
             [k as u64, 1],
         )?;
-        let mut scale = TensorMut(view(&self.scale, stream, 0, [rows as u32, 1], [1, 1])?);
-        self.combine
-            .shared_scale(stream, x, shared_gate, &mut scale)?;
+        let mut gate_view = None;
+        let mut scale = None;
+        if let Some(gate) = shared_gate {
+            let mut written = TensorMut(view(&self.scale, stream, 0, [rows as u32, 1], [1, 1])?);
+            self.combine.shared_scale(stream, x, gate, &mut written)?;
+            gate_view = Some(gate);
+            scale = Some(written);
+        }
         let final_active = view(
             &self.final_active,
             stream,
@@ -1082,7 +1147,7 @@ impl Decode {
                 contributions,
                 shared_out,
                 x,
-                shared_expert_gate: shared_gate,
+                shared_expert_gate: gate_view,
                 scale,
                 y: TensorMut(y.read()),
             },

@@ -12,12 +12,34 @@ use crate::backend::setup::AttentionPlan;
 pub struct Attention {
     first: CudaFunction,
     second: CudaFunction,
+    window_first: CudaFunction,
+    sink_second: CudaFunction,
     scratch: CudaSlice<f32>,
     first_launch: LaunchConfig,
     second_launch: LaunchConfig,
     head_stride: i32,
     chunk: usize,
+    q_heads: i32,
+    kv_heads: i32,
     plan: AttentionPlan,
+}
+
+pub struct GqaDecodeInput<'a> {
+    pub q: &'a CudaSlice<bf16>,
+    pub q_offset: usize,
+    pub k: &'a CudaSlice<bf16>,
+    pub v: &'a CudaSlice<bf16>,
+    pub output: &'a mut CudaSlice<bf16>,
+    pub output_offset: usize,
+    pub length: &'a CudaSlice<i32>,
+    pub sinks: Option<&'a CudaSlice<bf16>>,
+    pub window: Option<SlidingWindow>,
+}
+
+pub struct SlidingWindow {
+    pub first_pos: i32,
+    pub tokens: i32,
+    pub head_stride: i32,
 }
 
 impl Attention {
@@ -47,9 +69,11 @@ impl Attention {
         settings: AttentionPlan,
         log: bool,
     ) -> Result<Self> {
+        ensure!(c.head_dim == 128, "decode attention requires head_dim 128");
+        let shape = (c.num_attention_heads, c.num_key_value_heads);
         ensure!(
-            c.num_attention_heads == 16 && c.num_key_value_heads == 2 && c.head_dim == 128,
-            "decode attention requires 16 Q heads, 2 KV heads and head_dim 128"
+            shape == (16, 2) || shape == (32, 4),
+            "decode attention requires Q/KV heads 16/2 or 32/4, got {shape:?}"
         );
         ensure!(
             [1, 2, 4, 8].contains(&settings.qpack),
@@ -86,19 +110,28 @@ impl Attention {
         let module = cubin::module(ctx, "attention")?;
         let first = module.load_function(&format!("flash_decode_phase1_q{}", settings.qpack))?;
         let second = module.load_function("flash_decode_phase2")?;
+        let window_first =
+            module.load_function(&format!("flash_decode_window_phase1_q{}", settings.qpack))?;
+        let sink_second = module.load_function("flash_decode_sink_phase2")?;
         ensure!(
             settings.threads as i32 <= first.max_threads_per_block()?
-                && settings.merge_threads as i32 <= second.max_threads_per_block()?,
+                && settings.merge_threads as i32 <= second.max_threads_per_block()?
+                && settings.threads as i32 <= window_first.max_threads_per_block()?
+                && settings.merge_threads as i32 <= sink_second.max_threads_per_block()?,
             "decode attention block size exceeds kernel limit"
         );
-        let scratch = stream.alloc_zeros(16 * chunks * 130)?;
+        let scratch = stream.alloc_zeros(c.num_attention_heads * chunks * 130)?;
         let first_launch = LaunchConfig {
-            grid_dim: (chunks as u32, (16 / settings.qpack) as u32, 1),
+            grid_dim: (
+                chunks as u32,
+                (c.num_attention_heads / settings.qpack) as u32,
+                1,
+            ),
             block_dim: (settings.threads, 1, 1),
             shared_mem_bytes: first_smem as u32,
         };
         let second_launch = LaunchConfig {
-            grid_dim: (16, 1, 1),
+            grid_dim: (c.num_attention_heads as u32, 1, 1),
             block_dim: (settings.merge_threads, 1, 1),
             shared_mem_bytes: second_smem as u32,
         };
@@ -106,20 +139,25 @@ impl Attention {
             eprintln!(
                 "{}",
                 serde_json::json!({"decode_attention_plan":{
-            "settings":settings,"selected_chunk":chunk,"max_chunks":chunks,"scratch_bytes":16*chunks*130*4,
+            "settings":settings,"selected_chunk":chunk,"max_chunks":chunks,
+            "scratch_bytes":c.num_attention_heads*chunks*130*4,
             "phase1_smem_bytes":first_smem,"phase2_smem_bytes":second_smem,
             "length":"device scalar counts KV positions including current token"}})
             );
         }
         Ok(Self {
-            plan: settings,
             first,
             second,
+            window_first,
+            sink_second,
             scratch,
             first_launch,
             second_launch,
             head_stride: (capacity * 128) as i32,
             chunk,
+            q_heads: c.num_attention_heads as i32,
+            kv_heads: c.num_key_value_heads as i32,
+            plan: settings,
         })
     }
 
@@ -132,37 +170,109 @@ impl Attention {
         output: &mut CudaSlice<bf16>,
         length: &CudaSlice<i32>,
     ) -> Result<()> {
+        self.run_with(
+            stream,
+            GqaDecodeInput {
+                q: qkv,
+                q_offset: 0,
+                k,
+                v,
+                output,
+                output_offset: 0,
+                length,
+                sinks: None,
+                window: None,
+            },
+        )
+    }
+
+    pub fn run_with(&mut self, stream: &Arc<CudaStream>, input: GqaDecodeInput<'_>) -> Result<()> {
+        let GqaDecodeInput {
+            q,
+            q_offset,
+            k,
+            v,
+            output,
+            output_offset,
+            length,
+            sinks,
+            window,
+        } = input;
         let chunk = self.chunk as i32;
-        let q = qkv.slice(..2048);
+        let gqa = self.q_heads / self.kv_heads;
+        ensure!(
+            q.len() - q_offset >= self.q_heads as usize * 128
+                && output.len() - output_offset >= self.q_heads as usize * 128,
+            "decode attention Q/output offsets exceed their buffers"
+        );
+        let q = q.slice(q_offset..);
+        let mut output = output.slice_mut(output_offset..);
         unsafe {
-            stream
-                .launch_builder(&self.first)
-                .arg(&q)
-                .arg(k)
-                .arg(v)
-                .arg(&mut self.scratch)
-                .arg(length)
-                .arg(&16i32)
-                .arg(&2i32)
-                .arg(&8i32)
-                .arg(&128i32)
-                .arg(&self.head_stride)
-                .arg(&128i32)
-                .arg(&self.head_stride)
-                .arg(&128i32)
-                .arg(&chunk)
-                .launch(self.first_launch)?;
-            stream
-                .launch_builder(&self.second)
-                .arg(&mut self.scratch)
-                .arg(output)
-                .arg(length)
-                .arg(&16i32)
-                .arg(&2i32)
-                .arg(&8i32)
-                .arg(&128i32)
-                .arg(&chunk)
-                .launch(self.second_launch)?;
+            if let Some(window) = window {
+                stream
+                    .launch_builder(&self.window_first)
+                    .arg(&q)
+                    .arg(k)
+                    .arg(v)
+                    .arg(&mut self.scratch)
+                    .arg(length)
+                    .arg(&self.q_heads)
+                    .arg(&self.kv_heads)
+                    .arg(&gqa)
+                    .arg(&128i32)
+                    .arg(&window.head_stride)
+                    .arg(&128i32)
+                    .arg(&window.head_stride)
+                    .arg(&128i32)
+                    .arg(&chunk)
+                    .arg(&window.first_pos)
+                    .arg(&window.tokens)
+                    .launch(self.first_launch)?;
+            } else {
+                stream
+                    .launch_builder(&self.first)
+                    .arg(&q)
+                    .arg(k)
+                    .arg(v)
+                    .arg(&mut self.scratch)
+                    .arg(length)
+                    .arg(&self.q_heads)
+                    .arg(&self.kv_heads)
+                    .arg(&gqa)
+                    .arg(&128i32)
+                    .arg(&self.head_stride)
+                    .arg(&128i32)
+                    .arg(&self.head_stride)
+                    .arg(&128i32)
+                    .arg(&chunk)
+                    .launch(self.first_launch)?;
+            }
+            if let Some(sinks) = sinks {
+                stream
+                    .launch_builder(&self.sink_second)
+                    .arg(&mut self.scratch)
+                    .arg(&mut output)
+                    .arg(sinks)
+                    .arg(length)
+                    .arg(&self.q_heads)
+                    .arg(&self.kv_heads)
+                    .arg(&gqa)
+                    .arg(&128i32)
+                    .arg(&chunk)
+                    .launch(self.second_launch)?;
+            } else {
+                stream
+                    .launch_builder(&self.second)
+                    .arg(&mut self.scratch)
+                    .arg(&mut output)
+                    .arg(length)
+                    .arg(&self.q_heads)
+                    .arg(&self.kv_heads)
+                    .arg(&gqa)
+                    .arg(&128i32)
+                    .arg(&chunk)
+                    .launch(self.second_launch)?;
+            }
         }
         Ok(())
     }
