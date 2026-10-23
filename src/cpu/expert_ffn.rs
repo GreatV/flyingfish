@@ -107,7 +107,7 @@ impl ExpertWeights {
                 (range.start..down, down..range.end)
             }
             ExpertLayout::Bf16Separate { matrix_bytes, .. } => {
-                let down = range.start + usize::try_from(matrix_bytes / 2)?;
+                let down = range.start + usize::try_from(*matrix_bytes)?;
                 (range.start..down, down..range.end)
             }
             ExpertLayout::Fp8W8a16(_) => (range.clone(), range),
@@ -1673,6 +1673,27 @@ mod tests {
 
     fn production_shape() -> Shape {
         Shape::new(H, I).unwrap()
+    }
+
+    #[test]
+    fn separate_bf16_slots_cover_two_gate_up_matrices_and_one_down_matrix() -> Result<()> {
+        let shape = production_shape();
+        let geometry = ExpertGeometry {
+            first_layer: 0,
+            layers: 1,
+            experts: 2,
+            hidden: H as u32,
+            intermediate: I as u32,
+            top_k: 2,
+        };
+        let layout = ExpertLayout::new(crate::model_spec::ExpertFormat::Bf16Separate, &geometry)?;
+        let words = usize::try_from(layout.slot_bytes() / 2)?;
+        let weights = ExpertWeights::from_slot(shape, 0..words, &layout)?;
+        weights.validate(&shape, words, None)?;
+        let matrix_words = shape.intermediate * shape.hidden;
+        assert_eq!(weights.gate_up, 0..2 * matrix_words);
+        assert_eq!(weights.down, 2 * matrix_words..3 * matrix_words);
+        Ok(())
     }
 
     fn pattern(seed: usize, phase: f64) -> bf16 {

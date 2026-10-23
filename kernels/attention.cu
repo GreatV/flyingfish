@@ -1,8 +1,8 @@
 // GQA flash-decoding attention: single-token decode (flash_decode_*) and M-token
 // block-causal verification (flash_decode_mq_*).
-// Shape: 16 q-heads / 2 kv-heads (gqa 8), head_dim 128, bf16 data, fp32 accumulation,
+// Shape: 16/2 or 32/4 GQA-8 heads, head_dim 128, bf16 data, fp32 accumulation,
 // scale = 1/sqrt(128). FD_GUARD calls __trap() on any other shape.
-//   q  : bf16 [16][128]
+//   q  : bf16 [n_q_heads][128]
 //   K,V: bf16, separate tensors, head_dim-contiguous rows
 //   o  : bf16 [16][128]
 // Phase 1: grid (nchunks, n_q_heads/QP); one block runs an online softmax over `chunk`
@@ -85,12 +85,13 @@ __device__ __forceinline__ void st_vec(float* __restrict__ p, const float* v) {
 }
 
 // QP = q heads per block sharing one kv head; U = key positions per lane group per iteration.
-template <int DH, int QP, int U>
+template <int DH, int QP, int U, bool WINDOW>
 __device__ __forceinline__ void fd_phase1_body(
     const bf16* __restrict__ q, const bf16* __restrict__ Kc, const bf16* __restrict__ Vc,
     float* __restrict__ p_m, float* __restrict__ p_l, float* __restrict__ p_o,
     int L, int chunk, int nchunks, int gqa,
-    int k_head_stride, int k_pos_stride, int v_head_stride, int v_pos_stride) {
+    int k_head_stride, int k_pos_stride, int v_head_stride, int v_pos_stride,
+    int first_pos, int ring_tokens) {
   constexpr int VPR = DH / TP;
   const int ch      = blockIdx.x;
   const int qh0     = blockIdx.y * QP;
@@ -133,7 +134,12 @@ __device__ __forceinline__ void fd_phase1_body(
     for (int u = 0; u < U; ++u) {
       const int pos = base + u * ngrp;
       ok[u] = (pos < pos_end);
-      ld_vec<VPR>(Krow + (size_t)(ok[u] ? pos : 0) * k_pos_stride, kf[u]);
+      int cache_pos = pos;
+      if constexpr (WINDOW) {
+        cache_pos = first_pos + pos;
+        if (cache_pos >= ring_tokens) cache_pos -= ring_tokens;
+      }
+      ld_vec<VPR>(Krow + (size_t)(ok[u] ? cache_pos : 0) * k_pos_stride, kf[u]);
     }
 
 #pragma unroll
@@ -165,8 +171,13 @@ __device__ __forceinline__ void fd_phase1_body(
       }
 
       const int pos = base + u * ngrp;
+      int cache_pos = pos;
+      if constexpr (WINDOW) {
+        cache_pos = first_pos + pos;
+        if (cache_pos >= ring_tokens) cache_pos -= ring_tokens;
+      }
       float vf[VPR];
-      ld_vec<VPR>(Vrow + (size_t)(ok[u] ? pos : 0) * v_pos_stride, vf);
+      ld_vec<VPR>(Vrow + (size_t)(ok[u] ? cache_pos : 0) * v_pos_stride, vf);
 #pragma unroll
       for (int h = 0; h < QP; ++h)
 #pragma unroll
@@ -236,10 +247,11 @@ __device__ __forceinline__ void fd_phase1_body(
 
 // One block per q head; blockDim.x = DH*G2, G2 groups split the chunk range.
 // Dynamic smem: 2*nchunks (m, l) + blockDim.x floats.
-template <int DH>
+template <int DH, bool SINK>
 __device__ __forceinline__ void fd_phase2_body(const float* __restrict__ p_m,
                                                const float* __restrict__ p_l,
                                                const float* __restrict__ p_o,
+                                               const bf16* __restrict__ sinks,
                                                bf16* __restrict__ o, int nchunks) {
   extern __shared__ float sm[];
   const int qh  = blockIdx.x;
@@ -267,10 +279,16 @@ __device__ __forceinline__ void fd_phase2_body(const float* __restrict__ p_m,
     if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
     __syncthreads();
   }
-  const float M = red[0];
+  float sink = -3.0e38f;
+  if constexpr (SINK) sink = __bfloat162float(sinks[qh]);
+  float M = red[0];
+  if constexpr (SINK) M = fmaxf(M, sink);
 
   float pv = 0.0f;
   for (int h = tid; h < nchunks; h += nt) pv += sl_[h] * __expf(sm_[h] - M);
+  if constexpr (SINK) {
+    if (tid == 0) pv += __expf(sink - M);
+  }
   __syncthreads();      // all threads have read red[0] before red[] is reused
   red[tid] = pv;
   __syncthreads();
@@ -298,7 +316,10 @@ __device__ __forceinline__ void fd_phase2_body(const float* __restrict__ p_m,
 }
 
 // QP is baked into the symbol name; every other dimension and stride is an argument.
-#define FD_GUARD do { if (head_dim != DH || n_q_heads != HQ || n_kv_heads != HKV || gqa != GQA) __trap(); } while (0)
+#define FD_GUARD do { \
+  const bool shape = (n_q_heads == HQ && n_kv_heads == HKV) || (n_q_heads == 32 && n_kv_heads == 4); \
+  if (head_dim != DH || !shape || gqa != GQA) __trap(); \
+} while (0)
 
 template <int DH, int QP>
 __device__ __forceinline__ void fd_phase1_entry(
@@ -312,8 +333,27 @@ __device__ __forceinline__ void fd_phase1_entry(
   float* p_m = scratch;
   float* p_l = scratch + (size_t)n_q_heads * nchunks;
   float* p_o = scratch + 2 * (size_t)n_q_heads * nchunks;
-  fd_phase1_body<DH, QP, U>(q, k, v, p_m, p_l, p_o, L, chunk, nchunks, gqa,
-                            k_head_stride, k_pos_stride, v_head_stride, v_pos_stride);
+  fd_phase1_body<DH, QP, U, false>(
+      q, k, v, p_m, p_l, p_o, L, chunk, nchunks, gqa,
+      k_head_stride, k_pos_stride, v_head_stride, v_pos_stride, 0, 1);
+}
+
+template <int DH, int QP>
+__device__ __forceinline__ void fd_window_phase1_entry(
+    const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v,
+    float* __restrict__ scratch, int L, int chunk, int n_q_heads, int gqa,
+    int k_head_stride, int k_pos_stride, int v_head_stride, int v_pos_stride,
+    int first_pos, int ring_tokens) {
+  constexpr int U = (QP == 1) ? 2 : 1;
+  const int nchunks = (L + chunk - 1) / chunk;
+  if (blockIdx.x >= nchunks) return;
+  float* p_m = scratch;
+  float* p_l = scratch + (size_t)n_q_heads * nchunks;
+  float* p_o = scratch + 2 * (size_t)n_q_heads * nchunks;
+  fd_phase1_body<DH, QP, U, true>(
+      q, k, v, p_m, p_l, p_o, L, chunk, nchunks, gqa,
+      k_head_stride, k_pos_stride, v_head_stride, v_pos_stride,
+      first_pos, ring_tokens);
 }
 
 #define FD_P1_EXPORTS(QP)                                                                   \
@@ -332,6 +372,40 @@ FD_P1_EXPORTS(2)
 FD_P1_EXPORTS(4)
 FD_P1_EXPORTS(8)
 
+#define FD_WINDOW_P1_EXPORTS(QP)                                                              \
+extern "C" __global__ void flash_decode_window_phase1_q##QP(                                  \
+    const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v,        \
+    float* __restrict__ scratch, const int* __restrict__ len_dev,                             \
+    int n_q_heads, int n_kv_heads, int gqa, int head_dim,                                     \
+    int k_head_stride, int k_pos_stride, int v_head_stride, int v_pos_stride, int chunk,      \
+    int first_pos, int ring_tokens) {                                                          \
+  FD_GUARD;                                                                                    \
+  fd_window_phase1_entry<DH, QP>(                                                             \
+      q, k, v, scratch, *len_dev, chunk, n_q_heads, gqa,                                      \
+      k_head_stride, k_pos_stride, v_head_stride, v_pos_stride, first_pos, ring_tokens);      \
+}
+
+FD_WINDOW_P1_EXPORTS(1)
+FD_WINDOW_P1_EXPORTS(2)
+FD_WINDOW_P1_EXPORTS(4)
+FD_WINDOW_P1_EXPORTS(8)
+
+extern "C" __global__ void attention_sink_rescale(
+    const float* __restrict__ lse, const bf16* __restrict__ sinks,
+    bf16* __restrict__ output, int rows, int heads) {
+  if (rows < 1 || heads < 1 || (blockDim.x & 31) != 0) __trap();
+  const long long extent = (long long)rows * heads * 128;
+  for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < extent;
+       i += (long long)gridDim.x * blockDim.x) {
+    const int row = (int)(i / (heads * 128));
+    const int head = (int)(i / 128) % heads;
+    const float logit = __bfloat162float(sinks[head]);
+    const float denominator = 1.0f + __expf(logit - lse[(long long)head * rows + row]);
+    output[i] = __float2bfloat16(__bfloat162float(output[i]) / denominator);
+  }
+}
+
+
 template <int DH>
 __device__ __forceinline__ void fd_phase2_entry(float* __restrict__ scratch,
                                                 bf16* __restrict__ o, int L, int chunk,
@@ -340,7 +414,18 @@ __device__ __forceinline__ void fd_phase2_entry(float* __restrict__ scratch,
   const float* p_m = scratch;
   const float* p_l = scratch + (size_t)n_q_heads * nchunks;
   const float* p_o = scratch + 2 * (size_t)n_q_heads * nchunks;
-  fd_phase2_body<DH>(p_m, p_l, p_o, o, nchunks);
+  fd_phase2_body<DH, false>(p_m, p_l, p_o, nullptr, o, nchunks);
+}
+
+template <int DH>
+__device__ __forceinline__ void fd_sink_phase2_entry(
+    float* __restrict__ scratch, bf16* __restrict__ o, const bf16* __restrict__ sinks,
+    int L, int chunk, int n_q_heads) {
+  const int nchunks = (L + chunk - 1) / chunk;
+  const float* p_m = scratch;
+  const float* p_l = scratch + (size_t)n_q_heads * nchunks;
+  const float* p_o = scratch + 2 * (size_t)n_q_heads * nchunks;
+  fd_phase2_body<DH, true>(p_m, p_l, p_o, sinks, o, nchunks);
 }
 
 extern "C" __global__ void flash_decode_phase2(float* __restrict__ scratch,
@@ -352,7 +437,18 @@ extern "C" __global__ void flash_decode_phase2(float* __restrict__ scratch,
   fd_phase2_entry<DH>(scratch, o, *len_dev, chunk, n_q_heads);
 }
 
+extern "C" __global__ void flash_decode_sink_phase2(float* __restrict__ scratch,
+                                                    bf16* __restrict__ o,
+                                                    const bf16* __restrict__ sinks,
+                                                    const int* __restrict__ len_dev,
+                                                    int n_q_heads, int n_kv_heads, int gqa,
+                                                    int head_dim, int chunk) {
+  FD_GUARD;
+  fd_sink_phase2_entry<DH>(scratch, o, sinks, *len_dev, chunk, n_q_heads);
+}
+
 #undef FD_P1_EXPORTS
+#undef FD_WINDOW_P1_EXPORTS
 #undef FD_GUARD
 
 // Multi-query flash decode: M query tokens share one KV cache, block-causal among the

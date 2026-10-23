@@ -1367,6 +1367,7 @@ mod tests {
                         capacity: capacity as usize,
                         head_dim: d,
                         causal: true,
+                        window_left: None,
                     },
                 )
             } else {

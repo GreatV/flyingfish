@@ -11,6 +11,7 @@ use crate::backend::cuda::ops::grid;
 pub struct CombineOps {
     shared_scale: CudaFunction,
     combine: CudaFunction,
+    combine_ungated: CudaFunction,
 }
 
 pub struct MoeCombine {
@@ -27,9 +28,9 @@ pub struct MoeCombine {
     /// `[rows, hidden]` token rows (dense).
     pub x: Tensor<bf16, 2>,
     /// `[hidden]` shared-expert sigmoid gate vector.
-    pub shared_expert_gate: Tensor<bf16, 1>,
+    pub shared_expert_gate: Option<Tensor<bf16, 1>>,
     /// `[rows]` sigmoid scales (written by shared_scale).
-    pub scale: TensorMut<bf16, 2>,
+    pub scale: Option<TensorMut<bf16, 2>>,
     /// `[rows, hidden]` output.
     pub y: TensorMut<bf16, 2>,
 }
@@ -76,16 +77,24 @@ impl MoeCombine {
                 "moe combine {name} must be dense [rows, hidden]"
             );
         }
-        self.scale.read().validate()?;
-        ensure!(
-            self.scale.read().shape == [rows, 1] && self.scale.read().stride == [1, 1],
-            "moe combine scale must be a dense [rows, 1] buffer"
-        );
-        self.shared_expert_gate.validate()?;
-        ensure!(
-            self.shared_expert_gate.shape == [hidden] && self.shared_expert_gate.stride == [1],
-            "moe combine shared gate must be dense [hidden]"
-        );
+        match (&self.shared_expert_gate, &self.scale) {
+            (Some(gate), Some(scale)) => {
+                scale.read().validate()?;
+                ensure!(
+                    scale.read().shape == [rows, 1] && scale.read().stride == [1, 1],
+                    "moe combine scale must be a dense [rows, 1] buffer"
+                );
+                gate.validate()?;
+                ensure!(
+                    gate.shape == [hidden] && gate.stride == [1],
+                    "moe combine shared gate must be dense [hidden]"
+                );
+            }
+            (None, None) => {}
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!("moe combine has partial shared gate/scale inputs")
+            }
+        }
         ensure!(
             (1..=32).contains(&top_k),
             "moe combine top_k {top_k} outside [1,32]"
@@ -100,6 +109,7 @@ impl CombineOps {
         Ok(Self {
             shared_scale: module.load_function("moe_shared_scale")?,
             combine: module.load_function("moe_combine")?,
+            combine_ungated: module.load_function("moe_combine_ungated")?,
         })
     }
 
@@ -141,20 +151,41 @@ impl CombineOps {
     pub fn combine(&self, stream: &Arc<CudaStream>, input: &MoeCombine) -> Result<()> {
         let (rows, top_k, hidden) = input.validate()?;
         // SAFETY: all validated views cover rows*top_k choices and rows*hidden output values.
-        unsafe {
-            stream
-                .launch_builder(&self.combine)
-                .arg(&input.contributions.ptr)
-                .arg(&input.shared_out.ptr)
-                .arg(&input.scale.read().ptr)
-                .arg(&input.ids.ptr)
-                .arg(&input.done.ptr)
-                .arg(&input.final_active.ptr)
-                .arg(&input.y.0.ptr)
-                .arg(&(rows as i32))
-                .arg(&(top_k as i32))
-                .arg(&(hidden as i64))
-                .launch(grid(rows as usize, 256))?;
+        if let (Some(_), Some(scale)) = (&input.shared_expert_gate, &input.scale) {
+            unsafe {
+                stream
+                    .launch_builder(&self.combine)
+                    .arg(&input.contributions.ptr)
+                    .arg(&input.shared_out.ptr)
+                    .arg(&scale.read().ptr)
+                    .arg(&input.ids.ptr)
+                    .arg(&input.done.ptr)
+                    .arg(&input.final_active.ptr)
+                    .arg(&input.y.0.ptr)
+                    .arg(&(rows as i32))
+                    .arg(&(top_k as i32))
+                    .arg(&(hidden as i64))
+                    .launch(grid(rows as usize, 256))?;
+            }
+        } else {
+            ensure!(
+                input.shared_expert_gate.is_none() && input.scale.is_none(),
+                "moe ungated combine has partial gate/scale inputs"
+            );
+            unsafe {
+                stream
+                    .launch_builder(&self.combine_ungated)
+                    .arg(&input.contributions.ptr)
+                    .arg(&input.shared_out.ptr)
+                    .arg(&input.ids.ptr)
+                    .arg(&input.done.ptr)
+                    .arg(&input.final_active.ptr)
+                    .arg(&input.y.0.ptr)
+                    .arg(&(rows as i32))
+                    .arg(&(top_k as i32))
+                    .arg(&(hidden as i64))
+                    .launch(grid(rows as usize, 256))?;
+            }
         }
         Ok(())
     }

@@ -17,7 +17,27 @@ use std::{
     path::Path,
     sync::Arc,
     sync::mpsc,
+    time::Instant,
 };
+
+const UPLOAD_CHUNK_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Clone, Copy, Default, serde::Serialize)]
+struct UploadTimings {
+    init_ms: f64,
+    device_alloc_ms: f64,
+    source_read_ms: f64,
+    hash_ms: f64,
+    decode_ms: f64,
+    finite_check_ms: f64,
+    h2d_ms: f64,
+    dtoh_ms: f64,
+    compare_ms: f64,
+}
+
+fn elapsed_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
+}
 
 pub struct Layer {
     pub input_norm: CudaSlice<bf16>,
@@ -202,6 +222,7 @@ pub(crate) struct Loader<'a> {
     byte_staging: Option<PinnedHostSlice<u8>>,
     verify_upload: bool,
     upload_hashers: BTreeMap<String, UploadHashWorker>,
+    timings: UploadTimings,
     pub(crate) bytes: usize,
 }
 
@@ -281,7 +302,9 @@ impl Loader<'_> {
             })?;
             total.checked_add(n).context("weight allocation overflow")
         })?;
+        let phase = Instant::now();
         let mut dst = unsafe { self.stream.alloc::<bf16>(count)? };
+        self.timings.device_alloc_ms += elapsed_ms(phase);
         let mut offset = 0;
         for (name, shape) in specs {
             let file = self
@@ -304,7 +327,8 @@ impl Loader<'_> {
             if let Some(hasher) = self.upload_hashers.get(file) {
                 hasher.begin(name)?;
             }
-            for mapped_chunk in t.data().chunks(self.staging.len() * 2) {
+            for mapped_chunk in t.data().chunks(UPLOAD_CHUNK_BYTES) {
+                let phase = Instant::now();
                 let chunk = if self.verify_upload {
                     let len = mapped_chunk.len();
                     self.source.read_mapped_range(
@@ -316,31 +340,44 @@ impl Loader<'_> {
                 } else {
                     mapped_chunk
                 };
+                self.timings.source_read_ms += elapsed_ms(phase);
+                let phase = Instant::now();
                 if let Some(hasher) = self.upload_hashers.get(file) {
                     hasher.bytes(chunk)?;
                 }
+                self.timings.hash_ms += elapsed_ms(phase);
                 let len = chunk.len() / 2;
+                let phase = Instant::now();
                 let buf = self.staging.as_mut_slice()?;
                 decode_bf16(chunk, &mut buf[..len]);
+                self.timings.decode_ms += elapsed_ms(phase);
+                let phase = Instant::now();
                 if self.verify_upload {
                     ensure!(
-                        buf[..len].iter().all(|v| v.to_f32().is_finite()),
+                        buf[..len].iter().all(|v| v.to_bits() & 0x7f80 != 0x7f80),
                         "nonfinite BF16 tensor {name}"
                     );
                 }
+                self.timings.finite_check_ms += elapsed_ms(phase);
+                let phase = Instant::now();
                 let mut view = dst.slice_mut(offset..offset + len);
                 self.stream
                     .memcpy_htod(&self.staging.as_slice()?[..len], &mut view)?;
-                self.stream.synchronize()?;
+                self.timings.h2d_ms += elapsed_ms(phase);
+                let phase = Instant::now();
                 if self.verify_upload {
                     let received = self.stream.clone_dtoh(&view)?;
+                    self.timings.dtoh_ms += elapsed_ms(phase);
+                    let phase = Instant::now();
                     ensure!(
-                        received
-                            .iter()
-                            .flat_map(|v| v.to_bits().to_le_bytes())
-                            .eq(chunk.iter().copied()),
+                        received.iter().zip(chunk.as_chunks::<2>().0).all(
+                            |(received, expected)| {
+                                received.to_bits() == u16::from_le_bytes(*expected)
+                            }
+                        ),
                         "upload byte mismatch for {name}"
                     );
+                    self.timings.compare_ms += elapsed_ms(phase);
                 }
                 offset += len;
             }
@@ -370,14 +407,16 @@ pub(super) fn checkpoint_mapped<T>(
     hash_uploads: bool,
     read: impl FnOnce(&mut Loader<'_>) -> Result<T>,
 ) -> Result<(T, Option<(usize, String)>)> {
+    let init_started = Instant::now();
     let index = mapped.index.clone();
     let tensors = mapped.views()?;
     // Verified uploads read staging on the CPU, so they need cacheable pinned memory.
     let staging = unsafe {
         if manifest.is_some() {
-            d.ctx.alloc_pinned_with_flags::<bf16>(1024 * 1024, 0)?
+            d.ctx
+                .alloc_pinned_with_flags::<bf16>(UPLOAD_CHUNK_BYTES / 2, 0)?
         } else {
-            d.ctx.alloc_pinned::<bf16>(1024 * 1024)?
+            d.ctx.alloc_pinned::<bf16>(UPLOAD_CHUNK_BYTES / 2)?
         }
     };
     let upload_shards = if hash_uploads {
@@ -394,10 +433,11 @@ pub(super) fn checkpoint_mapped<T>(
     } else {
         BTreeSet::new()
     };
+    let init_ms = elapsed_ms(init_started);
     let mut l = Loader {
         source: mapped,
         read_buffer: if manifest.is_some() {
-            vec![0; 2 * 1024 * 1024]
+            vec![0; UPLOAD_CHUNK_BYTES]
         } else {
             Vec::new()
         },
@@ -415,7 +455,7 @@ pub(super) fn checkpoint_mapped<T>(
         staging,
         stream: d.upload.clone(),
         byte_staging: if manifest.is_some() {
-            Some(unsafe { d.ctx.alloc_pinned_with_flags::<u8>(2 * 1024 * 1024, 0)? })
+            Some(unsafe { d.ctx.alloc_pinned_with_flags::<u8>(UPLOAD_CHUNK_BYTES, 0)? })
         } else {
             None
         },
@@ -424,6 +464,10 @@ pub(super) fn checkpoint_mapped<T>(
             .into_iter()
             .map(|shard| (shard.clone(), UploadHashWorker::new()))
             .collect(),
+        timings: UploadTimings {
+            init_ms,
+            ..UploadTimings::default()
+        },
         bytes: 0,
     };
     let value = read(&mut l)?;
@@ -536,7 +580,7 @@ impl Loader<'_> {
             .as_mut()
             .context("FP8 upload requires audited manifest")?;
         let mut dst = unsafe { self.stream.alloc::<u8>(t.data().len())? };
-        for (i, mapped_chunk) in t.data().chunks(staging.len()).enumerate() {
+        for (i, mapped_chunk) in t.data().chunks(UPLOAD_CHUNK_BYTES).enumerate() {
             let len = mapped_chunk.len();
             self.source.read_mapped_range(
                 file,
@@ -554,7 +598,6 @@ impl Loader<'_> {
             let mut view = dst.slice_mut(start..start + len);
             self.stream
                 .memcpy_htod(&staging.as_slice()?[..len], &mut view)?;
-            self.stream.synchronize()?;
             let received = self.stream.clone_dtoh(&view)?;
             ensure!(
                 received.as_slice() == &staging.as_slice()?[..len],
@@ -642,8 +685,12 @@ impl WeightCatalog {
         hash_uploads: bool,
     ) -> Result<Self> {
         let started = std::time::Instant::now();
+        let phase = Instant::now();
         let mapped = MappedCheckpoint::open(dir)?;
+        let mapped_open_ms = elapsed_ms(phase);
+        let phase = Instant::now();
         let manifest = mapped.manifest(spec, policy)?;
+        let manifest_ms = elapsed_ms(phase);
         let upload_bytes = manifest
             .entries
             .values()
@@ -657,7 +704,8 @@ impl WeightCatalog {
             "prefix-cache identity does not cover deferred expert bytes: uploaded={upload_bytes} selected={}",
             manifest.resident_bytes
         );
-        let ((tensors, bytes), upload_digest) =
+        let phase = Instant::now();
+        let ((tensors, bytes, upload_timings), upload_digest) =
             checkpoint_mapped(&mapped, d, Some(&manifest), hash_uploads, |loader| {
                 let mut tensors = BTreeMap::new();
                 for (name, entry) in &manifest.entries {
@@ -680,12 +728,27 @@ impl WeightCatalog {
                     };
                     tensors.insert(name.clone(), value);
                 }
-                Ok((tensors, loader.bytes))
+                Ok((tensors, loader.bytes, loader.timings))
             })?;
+        let checkpoint_wall_ms = elapsed_ms(phase);
         ensure!(
             bytes == upload_bytes,
             "resident/upload byte count mismatch: uploaded={bytes} planned={upload_bytes} selected={}",
             manifest.resident_bytes
+        );
+        let load_wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "{}",
+            serde_json::json!({"weight_load_phase": {
+                "bytes": bytes,
+                "tensors": tensors.len(),
+                "load_wall_ms": load_wall_ms,
+                "mapped_open_ms": mapped_open_ms,
+                "manifest_ms": manifest_ms,
+                "checkpoint_wall_ms": checkpoint_wall_ms,
+                "chunk_bytes": UPLOAD_CHUNK_BYTES,
+                "timings": upload_timings
+            }})
         );
         Ok(Self {
             linear_format: spec.linear_format,
@@ -694,7 +757,7 @@ impl WeightCatalog {
             bytes,
             upload_content_sha256: upload_digest.as_ref().map(|x| x.1.clone()),
             upload_hashed_bytes: upload_digest.map(|x| x.0),
-            load_wall_ms: started.elapsed().as_secs_f64() * 1000.0,
+            load_wall_ms,
         })
     }
     pub fn bf16(&self, name: &str) -> Result<&CudaSlice<bf16>> {

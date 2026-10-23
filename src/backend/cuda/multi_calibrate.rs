@@ -541,6 +541,7 @@ fn measure(
                 capacity,
                 head_dim: 128,
                 causal,
+                window_left: None,
             };
             s.memcpy_htod(&zero_q, &mut q)?;
             s.memcpy_htod(&[l as i32], &mut length)?;

@@ -15,13 +15,15 @@ constexpr int DN_NT = LANES * DN_ROWS;
 
 #define FD_GUARD_MOE_GATE_UP do {                                                  \
   if (blockDim.x != GU_NT || gridDim.y != rows || gridDim.z != top_k + 1 ||        \
-      rows < 1 || rows > 8 || top_k < 1 || (hidden & 7) != 0 || inter < 1)         \
+      rows < 1 || rows > 8 || top_k < 1 || (hidden & 7) != 0 || inter < 1 ||       \
+      shared_inter < 1 || (shared_inter & 7) != 0)                                 \
     __trap();                                                                     \
 } while (0)
 
 #define FD_GUARD_MOE_DOWN do {                                                     \
   if (blockDim.x != DN_NT || gridDim.y != rows || gridDim.z != top_k + 1 ||        \
-      rows < 1 || rows > 8 || top_k < 1 || (inter & 7) != 0)                       \
+      rows < 1 || rows > 8 || top_k < 1 || (inter & 7) != 0 ||                     \
+      (shared_inter & 7) != 0)                                                     \
     __trap();                                                                     \
 } while (0)
 
@@ -97,7 +99,7 @@ __device__ __forceinline__ void moe_gate_up(
     const unsigned long long* __restrict__ assignment_gen,
     const bf16* __restrict__ shared_gate, const bf16* __restrict__ shared_up,
     bf16* __restrict__ h, bf16* __restrict__ h_shared,
-    int rows, int experts, int top_k, int hidden, int inter) {
+    int rows, int experts, int top_k, int hidden, int inter, int shared_inter) {
   constexpr int lanes = INVARIANT ? 16 : LANES;
   if constexpr (INVARIANT) {
     if (blockDim.x != GU_NT || gridDim.y != rows || gridDim.z != top_k ||
@@ -112,6 +114,7 @@ __device__ __forceinline__ void moe_gate_up(
   const int lane = tid & (lanes - 1);
   const int j = blockIdx.x * (GU_NT / lanes) + (tid / lanes);
   const int nvec = hidden >> 3;
+  const int out_inter = seg == top_k ? shared_inter : inter;
   const bool live_seg = seg >= top_k || active[(size_t)r * top_k + seg] != 0u;
 
   extern __shared__ __align__(16) bf16 xs[];
@@ -146,14 +149,14 @@ __device__ __forceinline__ void moe_gate_up(
     if constexpr (FP8) {
       codes = gu;
     } else {
-      gate_base = gu;
-      up_base = gu + (size_t)inter * hidden;
+    gate_base = gu;
+    up_base = gu + (size_t)inter * hidden;
     }
   }
 
   float accg = 0.0f;
   float accu = 0.0f;
-  if (j < inter && live_seg) {
+  if (j < out_inter && live_seg) {
     float gs = 0.0f, us = 0.0f;
     const unsigned char* gc = nullptr;
     const unsigned char* uc = nullptr;
@@ -191,7 +194,7 @@ __device__ __forceinline__ void moe_gate_up(
         ? __fmul_rn(g, __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-g))))
         : moe_silu(g);
     const float s = __bfloat162float(__float2bfloat16(activation));
-    bf16* out = seg == top_k ? h_shared + (size_t)r * inter
+    bf16* out = seg == top_k ? h_shared + (size_t)r * shared_inter
                              : h + ((size_t)r * top_k + seg) * inter;
     out[j] = __float2bfloat16(s * u);
   }
@@ -209,7 +212,7 @@ __device__ __forceinline__ void moe_down(
     const bf16* __restrict__ shared_down,
     bf16* __restrict__ contributions, bf16* __restrict__ shared_out,
     unsigned* __restrict__ done,
-    int rows, int experts, int top_k, int hidden, int inter) {
+    int rows, int experts, int top_k, int hidden, int inter, int shared_inter) {
   constexpr int lanes = INVARIANT ? 16 : LANES;
   if constexpr (INVARIANT) {
     if (blockDim.x != DN_NT || gridDim.y != rows || gridDim.z != top_k ||
@@ -223,9 +226,10 @@ __device__ __forceinline__ void moe_down(
   const int tid = threadIdx.x;
   const int lane = tid & (lanes - 1);
   const int d = blockIdx.x * (DN_NT / lanes) + (tid / lanes);
-  const int ivec = inter >> 3;
   const bool routed = seg < top_k;
   const bool live = !routed || active[(size_t)r * top_k + seg] != 0u;
+  const int row_inter = routed ? inter : shared_inter;
+  const int ivec = row_inter >> 3;
   const bf16* wrow = shared_down;
   const unsigned char* codes = nullptr;
   float wk = 0.0f;
@@ -248,8 +252,9 @@ __device__ __forceinline__ void moe_down(
       done[a] = 1u;
     }
   }
-  const bf16* hrow =
-      routed ? h + ((size_t)r * top_k + seg) * inter : h_shared + (size_t)r * inter;
+  const bf16* hrow = routed
+      ? h + ((size_t)r * top_k + seg) * inter
+      : h_shared + (size_t)r * shared_inter;
   float acc = 0.0f;
   if (d < hidden && live) {
     float scale = 0.0f;
@@ -261,10 +266,10 @@ __device__ __forceinline__ void moe_down(
         wc = codes + (size_t)2 * inter * hidden + (size_t)d * inter;
       }
     }
-    const bf16* wv = wrow + (size_t)d * inter;
+    const bf16* wv = wrow + (size_t)d * row_inter;
     const uint4* hv = reinterpret_cast<const uint4*>(hrow);
     if constexpr (INVARIANT) {
-      for (int col = lane; col < inter; col += 16)
+      for (int col = lane; col < row_inter; col += 16)
         acc = __fmaf_rn(__bfloat162float(hrow[col]),
                        moe_load1<FP8>(wv, wc, scale, col), acc);
     } else {
@@ -291,8 +296,8 @@ extern "C" __global__ void __launch_bounds__(GU_NT) moe_ffn_gate_up(
     const unsigned long long* __restrict__ assignment_gen,
     const bf16* __restrict__ shared_gate, const bf16* __restrict__ shared_up,
     bf16* __restrict__ h, bf16* __restrict__ h_shared,
-    int rows, int experts, int top_k, int hidden, int inter) {
-  moe_gate_up<false>(x, ids, active, slots_gate_up, slot_valid, slot_generation, assignment_gen, shared_gate, shared_up, h, h_shared, rows, experts, top_k, hidden, inter);
+    int rows, int experts, int top_k, int hidden, int inter, int shared_inter) {
+  moe_gate_up<false>(x, ids, active, slots_gate_up, slot_valid, slot_generation, assignment_gen, shared_gate, shared_up, h, h_shared, rows, experts, top_k, hidden, inter, shared_inter);
 }
 
 extern "C" __global__ void __launch_bounds__(GU_NT) moe_ffn_gate_up_w8a16(
@@ -304,8 +309,8 @@ extern "C" __global__ void __launch_bounds__(GU_NT) moe_ffn_gate_up_w8a16(
     const unsigned long long* __restrict__ assignment_gen,
     const bf16* __restrict__ shared_gate, const bf16* __restrict__ shared_up,
     bf16* __restrict__ h, bf16* __restrict__ h_shared,
-    int rows, int experts, int top_k, int hidden, int inter) {
-  moe_gate_up<true>(x, ids, active, slots_gate_up, slot_valid, slot_generation, assignment_gen, shared_gate, shared_up, h, h_shared, rows, experts, top_k, hidden, inter);
+    int rows, int experts, int top_k, int hidden, int inter, int shared_inter) {
+  moe_gate_up<true>(x, ids, active, slots_gate_up, slot_valid, slot_generation, assignment_gen, shared_gate, shared_up, h, h_shared, rows, experts, top_k, hidden, inter, shared_inter);
 }
 
 extern "C" __global__ void __launch_bounds__(DN_NT) moe_ffn_down(
@@ -319,8 +324,8 @@ extern "C" __global__ void __launch_bounds__(DN_NT) moe_ffn_down(
     const bf16* __restrict__ shared_down,
     bf16* __restrict__ contributions, bf16* __restrict__ shared_out,
     unsigned* __restrict__ done,
-    int rows, int experts, int top_k, int hidden, int inter) {
-  moe_down<false>(h, h_shared, ids, active, weights, slots_down, slot_valid, slot_generation, assignment_gen, shared_down, contributions, shared_out, done, rows, experts, top_k, hidden, inter);
+    int rows, int experts, int top_k, int hidden, int inter, int shared_inter) {
+  moe_down<false>(h, h_shared, ids, active, weights, slots_down, slot_valid, slot_generation, assignment_gen, shared_down, contributions, shared_out, done, rows, experts, top_k, hidden, inter, shared_inter);
 }
 
 extern "C" __global__ void __launch_bounds__(DN_NT) moe_ffn_down_w8a16(
@@ -334,8 +339,8 @@ extern "C" __global__ void __launch_bounds__(DN_NT) moe_ffn_down_w8a16(
     const bf16* __restrict__ shared_down,
     bf16* __restrict__ contributions, bf16* __restrict__ shared_out,
     unsigned* __restrict__ done,
-    int rows, int experts, int top_k, int hidden, int inter) {
-  moe_down<true>(h, h_shared, ids, active, weights, slots_down, slot_valid, slot_generation, assignment_gen, shared_down, contributions, shared_out, done, rows, experts, top_k, hidden, inter);
+    int rows, int experts, int top_k, int hidden, int inter, int shared_inter) {
+  moe_down<true>(h, h_shared, ids, active, weights, slots_down, slot_valid, slot_generation, assignment_gen, shared_down, contributions, shared_out, done, rows, experts, top_k, hidden, inter, shared_inter);
 }
 
 #define MOE_INVARIANT_GU(NAME, WORD, FP8) \
@@ -344,9 +349,9 @@ extern "C" __global__ void __launch_bounds__(GU_NT) NAME( \
     const WORD* const* slots, const unsigned* valid, \
     const unsigned long long* generation, const unsigned long long* assigned, \
     const bf16* shared_gate, const bf16* shared_up, bf16* h, bf16* hs, \
-    int rows, int experts, int top_k, int hidden, int inter) { \
+    int rows, int experts, int top_k, int hidden, int inter, int shared_inter) { \
   moe_gate_up<FP8, true>(x, ids, active, slots, valid, generation, assigned, \
-      shared_gate, shared_up, h, hs, rows, experts, top_k, hidden, inter); \
+      shared_gate, shared_up, h, hs, rows, experts, top_k, hidden, inter, shared_inter); \
 }
 #define MOE_INVARIANT_DOWN(NAME, WORD, FP8) \
 extern "C" __global__ void __launch_bounds__(DN_NT) NAME( \
@@ -354,9 +359,9 @@ extern "C" __global__ void __launch_bounds__(DN_NT) NAME( \
     const bf16* weights, const WORD* const* slots, const unsigned* valid, \
     const unsigned long long* generation, const unsigned long long* assigned, \
     const bf16* shared_down, bf16* contributions, bf16* shared_out, unsigned* done, \
-    int rows, int experts, int top_k, int hidden, int inter) { \
+    int rows, int experts, int top_k, int hidden, int inter, int shared_inter) { \
   moe_down<FP8, true>(h, hs, ids, active, weights, slots, valid, generation, assigned, \
-      shared_down, contributions, shared_out, done, rows, experts, top_k, hidden, inter); \
+      shared_down, contributions, shared_out, done, rows, experts, top_k, hidden, inter, shared_inter); \
 }
 MOE_INVARIANT_GU(moe_ffn_gate_up_lane16, bf16, false)
 MOE_INVARIANT_DOWN(moe_ffn_down_lane16, bf16, false)

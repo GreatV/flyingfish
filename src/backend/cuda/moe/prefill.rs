@@ -70,7 +70,7 @@ pub(crate) struct MoePrefillContribute<'a> {
     pub shared_gate: Tensor<bf16, 2>,
     pub shared_up: Tensor<bf16, 2>,
     pub shared_down: Tensor<bf16, 2>,
-    pub shared_expert_gate: Tensor<bf16, 1>,
+    pub shared_expert_gate: Option<Tensor<bf16, 1>>,
     /// CALLER-OWNED `[rows, top_k, hidden]` weighted BF16 contributions.
     pub contributions: Tensor<bf16, 3>,
     /// CALLER-OWNED `[rows, top_k]` done bits (zeroed by the first cohort).
@@ -99,9 +99,7 @@ pub(crate) struct MoePrefill<'a> {
     pub shared_gate: Tensor<bf16, 2>,
     pub shared_up: Tensor<bf16, 2>,
     pub shared_down: Tensor<bf16, 2>,
-    pub shared_expert_gate: Tensor<bf16, 1>,
-    pub contributions: Tensor<bf16, 3>,
-    pub done: TensorMut<u32, 2>,
+    pub shared_expert_gate: Option<Tensor<bf16, 1>>,
     pub y: TensorMut<bf16, 2>,
 }
 
@@ -127,7 +125,7 @@ pub(crate) struct MoePrefillFinish {
     pub shared_gate: Tensor<bf16, 2>,
     pub shared_up: Tensor<bf16, 2>,
     pub shared_down: Tensor<bf16, 2>,
-    pub shared_expert_gate: Tensor<bf16, 1>,
+    pub shared_expert_gate: Option<Tensor<bf16, 1>>,
     pub y: TensorMut<bf16, 2>,
 }
 
@@ -194,11 +192,13 @@ impl MoePrefillFinish {
             "moe prefill finish shared_down must be dense [hidden, inter] (shape {:?})",
             self.shared_down.shape
         );
-        self.shared_expert_gate.validate()?;
-        ensure!(
-            self.shared_expert_gate.shape == [hidden] && self.shared_expert_gate.stride == [1],
-            "moe prefill finish shared gate must be dense [hidden]"
-        );
+        if let Some(gate) = &self.shared_expert_gate {
+            gate.validate()?;
+            ensure!(
+                gate.shape == [hidden] && gate.stride == [1],
+                "moe prefill finish shared gate must be dense [hidden]"
+            );
+        }
         self.y.read().validate()?;
         ensure!(
             self.y.read().shape == [rows, hidden] && self.y.read().stride == [u64::from(hidden), 1],
@@ -211,12 +211,9 @@ impl MoePrefillFinish {
         no_overlap(&self.shared_gate, &self.y.read(), "shared_gate", "y")?;
         no_overlap(&self.shared_up, &self.y.read(), "shared_up", "y")?;
         no_overlap(&self.shared_down, &self.y.read(), "shared_down", "y")?;
-        no_overlap(
-            &self.shared_expert_gate,
-            &self.y.read(),
-            "shared_expert_gate",
-            "y",
-        )?;
+        if let Some(gate) = &self.shared_expert_gate {
+            no_overlap(gate, &self.y.read(), "shared_expert_gate", "y")?;
+        }
         ensure!(
             (1..=MAX_EXPERTS).contains(&(self.experts as usize)),
             "moe prefill finish experts {} outside [1, {}]",
@@ -301,7 +298,9 @@ impl MoePrefillContribute<'_> {
         self.shared_gate.validate()?;
         self.shared_up.validate()?;
         self.shared_down.validate()?;
-        self.shared_expert_gate.validate()?;
+        if let Some(gate) = &self.shared_expert_gate {
+            gate.validate()?;
+        }
         ensure!(
             self.shared_gate.shape == [inter, hidden]
                 && self.shared_gate.stride == [u64::from(hidden), 1]
@@ -309,8 +308,10 @@ impl MoePrefillContribute<'_> {
                 && self.shared_up.stride == [u64::from(hidden), 1]
                 && self.shared_down.shape == [hidden, inter]
                 && self.shared_down.stride == [u64::from(inter), 1]
-                && self.shared_expert_gate.shape == [hidden]
-                && self.shared_expert_gate.stride == [1],
+                && self
+                    .shared_expert_gate
+                    .as_ref()
+                    .is_none_or(|gate| gate.shape == [hidden] && gate.stride == [1]),
             "moe prefill shared expert layout mismatch (inter {inter}, hidden {hidden})"
         );
         self.contributions.validate()?;
@@ -382,12 +383,14 @@ impl MoePrefillContribute<'_> {
             "shared_down",
             "contributions",
         )?;
-        no_overlap(
-            &self.shared_expert_gate,
-            &self.contributions,
-            "shared_expert_gate",
-            "contributions",
-        )?;
+        if let Some(gate) = &self.shared_expert_gate {
+            no_overlap(
+                gate,
+                &self.contributions,
+                "shared_expert_gate",
+                "contributions",
+            )?;
+        }
         no_overlap(&self.ids, &self.done.read(), "ids", "done")?;
         no_overlap(&self.weights, &self.done.read(), "weights", "done")?;
         no_overlap(&self.active, &self.done.read(), "active", "done")?;
@@ -447,12 +450,9 @@ impl MoePrefill<'_> {
         no_overlap(&self.shared_gate, &self.y.read(), "shared_gate", "y")?;
         no_overlap(&self.shared_up, &self.y.read(), "shared_up", "y")?;
         no_overlap(&self.shared_down, &self.y.read(), "shared_down", "y")?;
-        no_overlap(
-            &self.shared_expert_gate,
-            &self.y.read(),
-            "shared_expert_gate",
-            "y",
-        )?;
+        if let Some(gate) = &self.shared_expert_gate {
+            no_overlap(gate, &self.y.read(), "shared_expert_gate", "y")?;
+        }
         Ok(())
     }
 }
@@ -1318,10 +1318,17 @@ impl PrefillOps {
         // moe_combine's scale column over the same [rows] words; the nonzero
         // stride keeps Tensor::validate satisfied.
         let scale_at = scratch.ptr + plan.layout.scale;
-        let mut scale =
-            unsafe { TensorMut::<bf16, 2>::new(scale_at, [rows, 1], [1, 1], u64::from(rows) * 2)? };
-        self.combine
-            .shared_scale(stream, input.x, input.shared_expert_gate, &mut scale)?;
+        let mut gate = None;
+        let mut scale = None;
+        if let Some(shared_gate) = input.shared_expert_gate {
+            let mut written = unsafe {
+                TensorMut::<bf16, 2>::new(scale_at, [rows, 1], [1, 1], u64::from(rows) * 2)?
+            };
+            self.combine
+                .shared_scale(stream, input.x, shared_gate, &mut written)?;
+            gate = Some(shared_gate);
+            scale = Some(written);
+        }
         let combine_input = MoeCombine {
             ids: input.ids,
             final_active: input.final_active,
@@ -1336,7 +1343,7 @@ impl PrefillOps {
                 )?
             },
             x: input.x,
-            shared_expert_gate: input.shared_expert_gate,
+            shared_expert_gate: gate,
             scale,
             y: input.y,
         };

@@ -725,7 +725,7 @@ impl Prefill {
         rows: u32,
         ffn: BoundFfn,
     ) -> Result<()> {
-        let BoundFfn::Moe { router, .. } = ffn else {
+        let BoundFfn::Moe { router, score, .. } = ffn else {
             anyhow::bail!("prefill layer={layer} has a dense FFN");
         };
         let span_rows = self
@@ -770,12 +770,12 @@ impl Prefill {
             [u64::from(self.geometry.experts), 1],
         )?);
         decode.route.route_prefill(
-            stream,
             x,
             router,
             &mut TensorMut(ids),
             &mut TensorMut(weights),
             &mut logits,
+            score,
         )?;
         let routed = slots.events.record(stream)?;
         self.gpu.mailbox.wait(&routed.event)?;
@@ -970,14 +970,13 @@ impl Prefill {
         y: Tensor<bf16, 2>,
     ) -> Result<()> {
         let BoundFfn::Moe {
-            shared,
+            ref shared,
             shared_gate,
             ..
         } = ffn
         else {
             anyhow::bail!("prefill finish received a dense FFN");
         };
-        let shared_gate = shared_gate.context("ungated shared expert prefill is not bound")?;
         let span = self
             .span
             .as_ref()
@@ -1258,14 +1257,14 @@ impl Engine {
                     decode,
                     layer as u32,
                     admitted.len() as u32,
-                    ffn,
+                    ffn.clone(),
                 )?;
                 for base in (0..admitted.len()).step_by(prefill.capacity.wave_rows as usize) {
                     let rows = (prefill.capacity.wave_rows as usize).min(admitted.len() - base);
                     prefill.finish_wave(
                         &self.device,
                         decode,
-                        ffn,
+                        ffn.clone(),
                         base as u32,
                         rows as u32,
                         qwen::matrix(
@@ -1700,7 +1699,14 @@ impl Gpu {
             )?;
         }
         if !plan.resident().is_empty() {
-            let ticket = self.cohort(device, slots, span, ops, plan, (layer, 0, ffn, None))?;
+            let ticket = self.cohort(
+                device,
+                slots,
+                span,
+                ops,
+                plan,
+                (layer, 0, ffn.clone(), None),
+            )?;
             self.resident_slots.clear();
             for &expert in plan.resident() {
                 self.resident_slots
@@ -1736,7 +1742,7 @@ impl Gpu {
                 span,
                 ops,
                 plan,
-                (layer, cohort + 1, ffn, Some(leases)),
+                (layer, cohort + 1, ffn.clone(), Some(leases)),
             )?;
             for &id in leases.release()? {
                 ensure!(
@@ -1830,14 +1836,13 @@ impl Gpu {
             0
         };
         let BoundFfn::Moe {
-            shared,
+            ref shared,
             shared_gate,
             ..
         } = ffn
         else {
             anyhow::bail!("prefill contribute received a dense FFN");
         };
-        let shared_gate = shared_gate.context("ungated shared expert prefill is not bound")?;
         let stream = &device.stream;
         let geometry = span.geometry;
         let tables = self.tables.bindings(stream, cohort, geometry.experts)?;
@@ -2234,12 +2239,12 @@ mod tests {
                                 hidden,
                                 intermediate,
                             )?,
-                            shared_expert_gate: testing::view(
+                            shared_expert_gate: Some(testing::view(
                                 &x_device,
                                 stream,
                                 [geometry.hidden],
                                 [1],
-                            )?,
+                            )?),
                             contributions: testing::view(
                                 &contributions,
                                 stream,
@@ -2899,7 +2904,8 @@ mod tests {
         let ffn = engine.moe_ffn_binding(layer as usize)?;
         let BoundFfn::Moe {
             router,
-            shared,
+            score,
+            ref shared,
             shared_gate,
             ..
         } = ffn
@@ -2912,12 +2918,12 @@ mod tests {
         let weights = stream.alloc_zeros::<bf16>(rows * 4)?;
         let logits = stream.alloc_zeros::<bf16>(rows * 16)?;
         decode.route.route_prefill(
-            stream,
             qwen::matrix(&input, stream, 0, rows, 128)?,
             router,
             &mut TensorMut(view(&ids, stream, 0, [rows as u32, 4], [4, 1])?),
             &mut TensorMut(view(&weights, stream, 0, [rows as u32, 4], [4, 1])?),
             &mut TensorMut(qwen::matrix(&logits, stream, 0, rows, 16)?),
+            score,
         )?;
         let host_ids = stream.clone_dtoh(&ids)?;
         let host_weights = stream.clone_dtoh(&weights)?;
@@ -2997,7 +3003,7 @@ mod tests {
                         shared_gate: shared[0],
                         shared_up: shared[1],
                         shared_down: shared[2],
-                        shared_expert_gate: shared_gate,
+                        shared_expert_gate: Some(shared_gate),
                         contributions: view(
                             &contributions,
                             stream,
@@ -3126,7 +3132,7 @@ mod tests {
                     shared_gate: shared[0],
                     shared_up: shared[1],
                     shared_down: shared[2],
-                    shared_expert_gate: shared_gate,
+                    shared_expert_gate: Some(shared_gate),
                     y: TensorMut(qwen::matrix(&y, stream, base * 128, count, 128)?),
                 },
                 &qwen::scratch(&scratch, stream),
@@ -3378,7 +3384,7 @@ mod tests {
                                 &mut decode,
                                 layer as u32,
                                 rows,
-                                ffn,
+                                ffn.clone(),
                             )?;
                             if !prefill.cpu.choices.is_empty() {
                                 super::super::delay_stream(&prefill.gpu.mailbox)?;
@@ -3403,7 +3409,7 @@ mod tests {
                                 prefill.finish_wave(
                                     &engine.device,
                                     &mut decode,
-                                    ffn,
+                                    ffn.clone(),
                                     base,
                                     count,
                                     qwen::matrix(

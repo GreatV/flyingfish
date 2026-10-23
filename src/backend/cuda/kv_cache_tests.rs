@@ -1,10 +1,14 @@
 use super::state::{CacheView, StateCheckpoint, StateStore};
 use super::{
     Device, cubin,
+    decode::{Attention, GqaDecodeInput, SlidingWindow},
     flash::{Flash, Shape},
     ops::flat,
 };
-use crate::{kv::KvFormat, op_contract::AttentionWorkspace, prefix_state::sha256};
+use crate::{
+    backend::setup::AttentionPlan, kv::KvFormat, op_contract::AttentionWorkspace,
+    prefix_state::sha256,
+};
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DeviceRepr, LaunchConfig, PushKernelArg};
 use half::bf16;
@@ -18,6 +22,861 @@ struct CommittedKv {
     live: [Vec<bf16>; 2],
     codes: [Vec<u8>; 2],
     stats: [Vec<f32>; 2],
+}
+
+#[test]
+#[ignore = "GPU window required; HD128 Flint attention gate"]
+fn gqa32_attention_window_sink_gpu() -> Result<()> {
+    let device = Device::new(0)?;
+    let s = &device.stream;
+    let capacity = 1024;
+    let ring = 513;
+    let (hq, hkv, dim) = (32usize, 4usize, 128usize);
+    let q: Vec<_> = (0..hq * dim)
+        .map(|i| bf16::from_f32((((i * 71 + 13) % 251) as f32) / 64.0 - 2.0))
+        .collect();
+    let logical_k = |p: usize| -> Vec<bf16> {
+        (0..hkv * dim)
+            .map(|i| {
+                let h = i / dim;
+                let d = i % dim;
+                bf16::from_f32((((p * 29 + h * 113 + d * 17) % 503) as f32) / 64.0 - 4.0)
+            })
+            .collect()
+    };
+    let logical_v = |p: usize| -> Vec<bf16> {
+        (0..hkv * dim)
+            .map(|i| {
+                let h = i / dim;
+                let d = i % dim;
+                bf16::from_f32((((p * 43 + h * 89 + d * 31) % 503) as f32) / 64.0 - 4.0)
+            })
+            .collect()
+    };
+    let mut full_k = vec![bf16::ZERO; hkv * capacity * dim];
+    let mut full_v = vec![bf16::ZERO; hkv * capacity * dim];
+    for p in 0..capacity {
+        for (src, dst) in [(&logical_k(p), &mut full_k), (&logical_v(p), &mut full_v)] {
+            for h in 0..hkv {
+                let src = &src[h * dim..(h + 1) * dim];
+                let dst = &mut dst[(h * capacity + p) * dim..(h * capacity + p + 1) * dim];
+                dst.copy_from_slice(src);
+            }
+        }
+    }
+    let first = 512;
+    let mut window_k = vec![bf16::ZERO; hkv * ring * dim];
+    let mut window_v = vec![bf16::ZERO; hkv * ring * dim];
+    for logical in 0..ring {
+        let p = 512 + logical;
+        let physical = if p >= ring { p - ring } else { p };
+        for (src, dst) in [
+            (&logical_k(p), &mut window_k),
+            (&logical_v(p), &mut window_v),
+        ] {
+            for h in 0..hkv {
+                let src = &src[h * dim..(h + 1) * dim];
+                let dst = &mut dst[(h * ring + physical) * dim..(h * ring + physical + 1) * dim];
+                dst.copy_from_slice(src);
+            }
+        }
+    }
+    let expected_window_k = logical_cache(&logical_k, first, ring);
+    let expected_window_v = logical_cache(&logical_v, first, ring);
+    let sinks: Vec<_> = (0..hq)
+        .map(|h| bf16::from_f32(((h * 37 + 5) % 64) as f32 / 8.0 - 4.0))
+        .collect();
+    let negligible: Vec<_> = vec![bf16::from_f32(-100.0); hq];
+    let q_dev = s.clone_htod(&q)?;
+    let full_k_dev = s.clone_htod(&full_k)?;
+    let full_v_dev = s.clone_htod(&full_v)?;
+    let window_k_dev = s.clone_htod(&window_k)?;
+    let window_v_dev = s.clone_htod(&window_v)?;
+    let sinks_dev = s.clone_htod(&sinks)?;
+    let negligible_dev = s.clone_htod(&negligible)?;
+    let length = s.clone_htod(&[capacity as i32])?;
+    let window_length = s.clone_htod(&[ring as i32])?;
+    device.finish_upload()?;
+    let plan = AttentionPlan {
+        chunk: 512,
+        qpack: 4,
+        threads: 256,
+        merge_threads: 256,
+    };
+    let config = crate::config::Config {
+        model_type: "flint".into(),
+        hidden_size: 2048,
+        intermediate_size: 6144,
+        num_hidden_layers: 1,
+        num_attention_heads: hq,
+        num_key_value_heads: hkv,
+        head_dim: dim,
+        vocab_size: 150144,
+        max_position_embeddings: capacity,
+        rms_norm_eps: 1e-6,
+        rope_theta: 10000.0,
+        rope_scaling: None,
+        hidden_act: "silu".into(),
+        tie_word_embeddings: false,
+        torch_dtype: "bfloat16".into(),
+        eos_token_id: vec![150001],
+        attention_bias: false,
+        mlp_bias: false,
+    };
+    let mut attention = Attention::new(&device.ctx, s, &config, capacity, plan)?;
+
+    let expected_attention = |k: &[bf16], v: &[bf16], cache_len: usize, sinks: &[bf16]| {
+        (0..hq * dim)
+            .map(|i| {
+                let h = i / dim;
+                let d = i % dim;
+                let kv = h / (hq / hkv);
+                let mut scores = vec![0f32; cache_len];
+                for (p, score) in scores.iter_mut().enumerate() {
+                    *score = (0..dim)
+                        .map(|j| {
+                            q[h * dim + j].to_f32() * k[(kv * cache_len + p) * dim + j].to_f32()
+                        })
+                        .sum::<f32>()
+                        * (dim as f32).sqrt().recip();
+                }
+                let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let sink = sinks[h].to_f32();
+                let shift = max.max(sink);
+                let mut denominator = (sink - shift).exp();
+                for score in &scores {
+                    denominator += (score - shift).exp();
+                }
+                let mut numerator = 0f32;
+                for p in 0..cache_len {
+                    let probability = ((scores[p] - shift).exp() / denominator) as f32;
+                    numerator += probability * v[(kv * cache_len + p) * dim + d].to_f32();
+                }
+                bf16::from_f32(numerator).to_f32()
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut normal = s.alloc_zeros::<bf16>(hq * dim)?;
+    let mut sink_output = s.alloc_zeros::<bf16>(hq * dim)?;
+    let mut negligible_output = s.alloc_zeros::<bf16>(hq * dim)?;
+    let mut window_output = s.alloc_zeros::<bf16>(hq * dim)?;
+    attention.run_with(
+        s,
+        GqaDecodeInput {
+            q: &q_dev,
+            q_offset: 0,
+            k: &full_k_dev,
+            v: &full_v_dev,
+            output: &mut normal,
+            output_offset: 0,
+            length: &length,
+            sinks: None,
+            window: None,
+        },
+    )?;
+    attention.run_with(
+        s,
+        GqaDecodeInput {
+            q: &q_dev,
+            q_offset: 0,
+            k: &full_k_dev,
+            v: &full_v_dev,
+            output: &mut negligible_output,
+            output_offset: 0,
+            length: &length,
+            sinks: Some(&negligible_dev),
+            window: None,
+        },
+    )?;
+    attention.run_with(
+        s,
+        GqaDecodeInput {
+            q: &q_dev,
+            q_offset: 0,
+            k: &full_k_dev,
+            v: &full_v_dev,
+            output: &mut sink_output,
+            output_offset: 0,
+            length: &length,
+            sinks: Some(&sinks_dev),
+            window: None,
+        },
+    )?;
+    attention.run_with(
+        s,
+        GqaDecodeInput {
+            q: &q_dev,
+            q_offset: 0,
+            k: &window_k_dev,
+            v: &window_v_dev,
+            output: &mut window_output,
+            output_offset: 0,
+            length: &window_length,
+            sinks: Some(&sinks_dev),
+            window: Some(SlidingWindow {
+                first_pos: first as i32,
+                tokens: ring as i32,
+                head_stride: (ring * 128) as i32,
+            }),
+        },
+    )?;
+    s.synchronize()?;
+
+    let normal = s.clone_dtoh(&normal)?;
+    let negligible = s.clone_dtoh(&negligible_output)?;
+    let sink = s.clone_dtoh(&sink_output)?;
+    let window = s.clone_dtoh(&window_output)?;
+    ensure!(
+        normal
+            .iter()
+            .zip(&negligible)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "negligible sink changed ordinary attention output"
+    );
+    let full_expected = expected_attention(&full_k, &full_v, capacity, &sinks);
+    let window_expected = expected_attention(&expected_window_k, &expected_window_v, ring, &sinks);
+    let bound = super::bf16_chain_bound(3, &[dim, ring + 1]);
+    for (name, actual, expected) in [
+        ("full", &sink, &full_expected),
+        ("window", &window, &window_expected),
+    ] {
+        let magnitude = expected
+            .iter()
+            .map(|value| value.abs())
+            .fold(0f32, f32::max);
+        let max = actual
+            .iter()
+            .zip(expected)
+            .map(|(a, b)| (a.to_f32() - b).abs())
+            .fold(0f32, f32::max);
+        if let Some((index, value, wanted)) = actual
+            .iter()
+            .zip(expected)
+            .enumerate()
+            .find(|(_, (a, b))| (a.to_f32() - *b).abs() > bound as f32 * magnitude)
+            .map(|(index, (a, b))| (index, a.to_f32(), *b))
+        {
+            eprintln!(
+                "{name} first_bad index={index} value={value:e} expected={wanted:e} ordinary={} head={} dim={}",
+                normal[index].to_f32(),
+                index / dim,
+                index % dim
+            );
+        }
+        ensure!(
+            max <= bound as f32 * magnitude,
+            "{name} attention max={max:e} bound={}",
+            bound as f32 * magnitude
+        );
+        eprintln!(
+            "GQA32_ATTENTION mode={name} max_abs={max:e} relative_bound={} PASS",
+            bound as f32 * magnitude
+        );
+    }
+
+    let boundary_sinks = vec![bf16::ZERO; hq];
+    let boundary_sinks_dev = s.clone_htod(&boundary_sinks)?;
+    device.finish_upload()?;
+    for position in [0usize, 1, 511, 512, 513, 1024, 1025, 262_143] {
+        let first = position.saturating_sub(512);
+        let tokens = position - first + 1;
+        let q = vec![bf16::ZERO; hq * dim];
+        let k = vec![bf16::ZERO; hkv * ring * dim];
+        let mut v = vec![bf16::ZERO; hkv * ring * dim];
+        for logical in [first.saturating_sub(1), first, position] {
+            if logical < first || logical > position {
+                continue;
+            }
+            let physical = logical % ring;
+            for head in 0..hkv {
+                let index = (head * ring + physical) * dim;
+                if logical + 1 == first {
+                    v[index + 1] = bf16::ONE;
+                } else if logical == first && position >= 512 {
+                    v[index] = bf16::ONE;
+                } else if logical == position {
+                    v[index + 2] = bf16::ONE;
+                }
+            }
+        }
+        let q_dev = s.clone_htod(&q)?;
+        let k_dev = s.clone_htod(&k)?;
+        let mut v_dev = s.alloc_zeros::<bf16>(hkv * ring * dim)?;
+        s.memcpy_htod(&v, &mut v_dev)?;
+        let length_dev = s.clone_htod(&[tokens as i32])?;
+        let mut output = s.alloc_zeros::<bf16>(hq * dim)?;
+        device.finish_upload()?;
+        attention.run_with(
+            s,
+            GqaDecodeInput {
+                q: &q_dev,
+                q_offset: 0,
+                k: &k_dev,
+                v: &v_dev,
+                output: &mut output,
+                output_offset: 0,
+                length: &length_dev,
+                sinks: Some(&boundary_sinks_dev),
+                window: Some(SlidingWindow {
+                    first_pos: (first % ring) as i32,
+                    tokens: tokens as i32,
+                    head_stride: (ring * dim) as i32,
+                }),
+            },
+        )?;
+        s.synchronize()?;
+        let output = s.clone_dtoh(&output)?;
+        let expected = bf16::from_f32(1.0 / (tokens as f32 + 1.0)).to_f32();
+        let tolerance = 4.0 * bf16::EPSILON.to_f32() * expected;
+        for head in 0..hq {
+            let base = head * dim;
+            ensure!(
+                output[base + 1].to_bits() == bf16::ZERO.to_bits(),
+                "decode ring p={position} included excluded key"
+            );
+            for (d, wanted) in [
+                (0usize, if position >= 512 { expected } else { 0.0 }),
+                (2, expected),
+            ] {
+                let error = (output[base + d].to_f32() - wanted).abs();
+                ensure!(
+                    error <= tolerance,
+                    "decode ring p={position} d={d} output={:.9e} expected={wanted:e}",
+                    output[base + d].to_f32(),
+                );
+            }
+        }
+        eprintln!(
+            "GQA32_RING position={position} first={first} tokens={tokens} p_minus_512=visible p_minus_513=excluded PASS"
+        );
+    }
+    Ok(())
+}
+
+fn logical_cache(logical: &dyn Fn(usize) -> Vec<bf16>, first: usize, ring: usize) -> Vec<bf16> {
+    let (hkv, dim) = (4usize, 128usize);
+    let mut values = vec![bf16::ZERO; hkv * ring * dim];
+    for logical_pos in 0..ring {
+        let p = first + logical_pos;
+        let row = logical(p);
+        for h in 0..hkv {
+            let src = &row[h * dim..(h + 1) * dim];
+            let dst =
+                &mut values[(h * ring + logical_pos) * dim..(h * ring + logical_pos + 1) * dim];
+            dst.copy_from_slice(src);
+        }
+    }
+    values
+}
+
+#[derive(Clone, Copy)]
+struct AttentionMetrics {
+    max_abs: f32,
+    p99_abs: f32,
+    mean_abs: f32,
+    cosine: f32,
+    max_reference: f32,
+}
+
+fn attention_metrics(actual: &[bf16], expected: &[f32]) -> AttentionMetrics {
+    assert_eq!(actual.len(), expected.len());
+    let mut errors: Vec<_> = actual
+        .iter()
+        .zip(expected)
+        .map(|(actual, expected)| (actual.to_f32() - expected).abs())
+        .collect();
+    errors.sort_by(f32::total_cmp);
+    let max_abs = errors.last().copied().unwrap_or_default();
+    let p99_abs = errors[(expected.len() * 99).div_ceil(100) - 1];
+    let mean_abs = errors.iter().sum::<f32>() / errors.len() as f32;
+    let dot = actual
+        .iter()
+        .zip(expected)
+        .map(|(actual, expected)| actual.to_f32() * expected)
+        .sum::<f32>();
+    let actual_norm = actual
+        .iter()
+        .map(|value| value.to_f32() * value.to_f32())
+        .sum::<f32>()
+        .sqrt();
+    let expected_norm = expected
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    let cosine = if actual_norm == 0.0 && expected_norm == 0.0 {
+        1.0
+    } else {
+        dot / (actual_norm * expected_norm)
+    };
+    AttentionMetrics {
+        max_abs,
+        p99_abs,
+        mean_abs,
+        cosine,
+        max_reference: expected
+            .iter()
+            .map(|value| value.abs())
+            .fold(0f32, f32::max),
+    }
+}
+
+#[test]
+#[ignore = "GPU window required; Flint QK norm/RoPE/NoPE gate"]
+fn gqa32_qknorm_rope_nope_gpu() -> Result<()> {
+    let device = Device::new(0)?;
+    let s = &device.stream;
+    let (max_rows, hq, hkv, dim, capacity, start) =
+        (2048usize, 32usize, 4usize, 128usize, 2055usize, 7usize);
+    let heads = hq + 2 * hkv;
+    let input: Vec<_> = (0..max_rows * heads * dim)
+        .map(|i| bf16::from_f32((((i * 73 + 31) % 503) as f32) / 64.0 - 4.0))
+        .collect();
+    let q_norm: Vec<_> = (0..dim)
+        .map(|i| bf16::from_f32((((i * 37 + 3) % 127) as f32) / 64.0 - 1.0))
+        .collect();
+    let k_norm: Vec<_> = (0..dim)
+        .map(|i| bf16::from_f32((((i * 53 + 11) % 127) as f32) / 64.0 - 1.0))
+        .collect();
+    let expected = |rows: usize, rope: bool| -> Vec<Vec<bf16>> {
+        let mut output = input.clone();
+        let mut k = vec![bf16::ZERO; hkv * capacity * dim];
+        let mut v = vec![bf16::ZERO; hkv * capacity * dim];
+        for row in 0..rows {
+            let position = start + row;
+            for head in 0..heads {
+                let base = (row * heads + head) * dim;
+                let weight = if head < hq { &q_norm } else { &k_norm };
+                if head < hq + hkv {
+                    let mut values = [0f32; 128];
+                    for d in 0..dim {
+                        values[d] = input[base + d].to_f32();
+                    }
+                    let mean = values.iter().map(|value| value * value).sum::<f32>() / dim as f32;
+                    let rstd = (mean + 1e-6).sqrt().recip();
+                    for d in 0..dim {
+                        output[base + d] = bf16::from_f32(values[d] * rstd * weight[d].to_f32());
+                    }
+                    if rope {
+                        for pair in 0..dim / 2 {
+                            let frequency = pair as f32 * 2.0 / dim as f32;
+                            let angle = position as f32 * 10_000f32.powf(-frequency);
+                            let cos = bf16::from_f32(angle.cos()).to_f32();
+                            let sin = bf16::from_f32(angle.sin()).to_f32();
+                            let a = output[base + pair].to_f32();
+                            let b = output[base + pair + dim / 2].to_f32();
+                            output[base + pair] = bf16::from_f32(a * cos - b * sin);
+                            output[base + pair + dim / 2] = bf16::from_f32(b * cos + a * sin);
+                        }
+                    }
+                    if head >= hq {
+                        let kv_head = head - hq;
+                        let dst = (kv_head * capacity + position) * dim;
+                        k[dst..dst + dim].copy_from_slice(&output[base..base + dim]);
+                    }
+                } else {
+                    let kv_head = head - hq - hkv;
+                    let dst = (kv_head * capacity + position) * dim;
+                    v[dst..dst + dim].copy_from_slice(&input[base..base + dim]);
+                }
+            }
+        }
+        vec![output, k, v]
+    };
+
+    let start_dev = s.clone_htod(&[start as i32])?;
+    let q_norm_dev = s.clone_htod(&q_norm)?;
+    let k_norm_dev = s.clone_htod(&k_norm)?;
+    let module = cubin::module(&device.ctx, "rope")?;
+    let rope = module.load_function("draft_qknorm_rope_kv")?;
+    let nope = module.load_function("qknorm_kv_nope")?;
+    for (function, use_rope, name) in [(&rope, true, "rope"), (&nope, false, "nope")] {
+        let reference = expected(max_rows, use_rope);
+        for rows in [1usize, 2, 3, 64, 512, 513, 1024, 2048] {
+            let input_dev = s.clone_htod(&input[..rows * heads * dim])?;
+            let k_dev = s.alloc_zeros::<bf16>(hkv * capacity * dim)?;
+            let v_dev = s.alloc_zeros::<bf16>(hkv * capacity * dim)?;
+            unsafe {
+                s.launch_builder(function)
+                    .arg(&input_dev)
+                    .arg(&k_dev)
+                    .arg(&v_dev)
+                    .arg(&q_norm_dev)
+                    .arg(&k_norm_dev)
+                    .arg(&start_dev)
+                    .arg(&(rows as i32))
+                    .arg(&(hq as i32))
+                    .arg(&(hkv as i32))
+                    .arg(&(dim as i32))
+                    .arg(&(capacity as i32))
+                    .arg(&0i32)
+                    .arg(&10_000.0f32)
+                    .arg(&1e-6f32)
+                    .launch(LaunchConfig {
+                        grid_dim: ((rows * heads) as u32, 1, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+            s.synchronize()?;
+            let actual_output = s.clone_dtoh(&input_dev)?;
+            let actual_k = s.clone_dtoh(&k_dev)?;
+            let actual_v = s.clone_dtoh(&v_dev)?;
+            let expected_output = &reference[0][..rows * heads * dim];
+            let mut live_k = Vec::with_capacity(hkv * rows * dim);
+            let mut live_v = Vec::with_capacity(hkv * rows * dim);
+            let mut expected_k = Vec::with_capacity(hkv * rows * dim);
+            let mut expected_v = Vec::with_capacity(hkv * rows * dim);
+            for head in 0..hkv {
+                for position in start..start + rows {
+                    let range =
+                        (head * capacity + position) * dim..(head * capacity + position + 1) * dim;
+                    live_k.extend_from_slice(&actual_k[range.clone()]);
+                    live_v.extend_from_slice(&actual_v[range.clone()]);
+                    expected_k.extend_from_slice(&reference[1][range.clone()]);
+                    expected_v.extend_from_slice(&reference[2][range.clone()]);
+                }
+            }
+            ensure!(
+                live_v
+                    .iter()
+                    .zip(&expected_v)
+                    .all(|(actual, expected)| actual.to_bits() == expected.to_bits()),
+                "{name} rows={rows} V writes are not bitwise"
+            );
+            let output_metrics = attention_metrics(
+                &actual_output,
+                &expected_output
+                    .iter()
+                    .map(|value| value.to_f32())
+                    .collect::<Vec<_>>(),
+            );
+            let k_metrics = attention_metrics(
+                &live_k,
+                &expected_k
+                    .iter()
+                    .map(|value| value.to_f32())
+                    .collect::<Vec<_>>(),
+            );
+            let bound = super::bf16_chain_bound(3, &[dim]);
+            let output_bound = bound as f32 * output_metrics.max_reference;
+            let k_bound = bound as f32 * k_metrics.max_reference;
+            for (label, metrics, max_bound) in [
+                ("output", output_metrics, output_bound),
+                ("k", k_metrics, k_bound),
+            ] {
+                ensure!(
+                    metrics.max_abs <= max_bound,
+                    "{name} rows={rows} {label} max={:.9e} bound={max_bound:e}",
+                    metrics.max_abs
+                );
+                ensure!(
+                    metrics.p99_abs <= max_bound / 2.0,
+                    "{name} rows={rows} {label} p99={:.9e} bound={}",
+                    metrics.p99_abs,
+                    max_bound / 2.0
+                );
+                ensure!(
+                    metrics.mean_abs <= max_bound / 4.0,
+                    "{name} rows={rows} {label} mean={:.9e} bound={}",
+                    metrics.mean_abs,
+                    max_bound / 4.0
+                );
+                ensure!(
+                    metrics.cosine >= 1.0 - bound as f32,
+                    "{name} rows={rows} {label} cosine={:.9e} bound={}",
+                    metrics.cosine,
+                    1.0 - bound as f32
+                );
+            }
+            eprintln!(
+                "GQA32_QKNORM mode={name} rows={rows} output_max={:.9e} output_p99={:.9e} output_mean={:.9e} output_cosine={:.9e} k_max={:.9e} PASS",
+                output_metrics.max_abs,
+                output_metrics.p99_abs,
+                output_metrics.mean_abs,
+                output_metrics.cosine,
+                k_metrics.max_abs
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "GPU window required; Flint FA2 learned-sink gate"]
+fn fa2_gqa32_learned_sink_gpu() -> Result<()> {
+    let device = Device::new(0)?;
+    let s = &device.stream;
+    let (rows, start, hq, hkv, dim, capacity) =
+        (128usize, 64usize, 32usize, 4usize, 128usize, 256usize);
+    let slide_rows = 2048usize;
+    let q: Vec<_> = (0..rows * hq * dim)
+        .map(|i| bf16::from_f32((((i * 83 + 17) % 503) as f32) / 64.0 - 4.0))
+        .collect();
+    let k: Vec<_> = (0..hkv * capacity * dim)
+        .map(|i| bf16::from_f32((((i * 61 + 29) % 503) as f32) / 64.0 - 4.0))
+        .collect();
+    let v: Vec<_> = (0..hkv * capacity * dim)
+        .map(|i| bf16::from_f32((((i * 47 + 41) % 503) as f32) / 64.0 - 4.0))
+        .collect();
+    let sinks: Vec<_> = (0..hq)
+        .map(|h| bf16::from_f32((((h * 41 + 7) % 64) as f32) / 8.0 - 4.0))
+        .collect();
+    let negligible = vec![bf16::from_f32(-100.0); hq];
+    let q_dev = s.clone_htod(&q)?;
+    let k_dev = s.clone_htod(&k)?;
+    let v_dev = s.clone_htod(&v)?;
+    let sinks_dev = s.clone_htod(&sinks)?;
+    let negligible_dev = s.clone_htod(&negligible)?;
+    let mut ordinary = s.alloc_zeros::<bf16>(rows * hq * dim)?;
+    let mut sink_output = s.alloc_zeros::<bf16>(rows * hq * dim)?;
+    let mut negligible_output = s.alloc_zeros::<bf16>(rows * hq * dim)?;
+    let mut flash = Flash::new(s.clone(), rows.max(slide_rows), hq)?;
+    let shape = Shape {
+        rows,
+        start,
+        q_heads: hq,
+        kv_heads: hkv,
+        capacity,
+        head_dim: dim,
+        causal: true,
+        window_left: None,
+    };
+    flash.run(&q_dev, hq * dim, &k_dev, &v_dev, &mut ordinary, shape)?;
+    s.memcpy_dtod(&ordinary, &mut sink_output)?;
+    flash.apply_sinks(&sinks_dev, &mut sink_output, rows, hq)?;
+    s.memcpy_dtod(&ordinary, &mut negligible_output)?;
+    flash.apply_sinks(&negligible_dev, &mut negligible_output, rows, hq)?;
+    s.synchronize()?;
+    let ordinary = s.clone_dtoh(&ordinary)?;
+    let negligible_output = s.clone_dtoh(&negligible_output)?;
+    let sink_output = s.clone_dtoh(&sink_output)?;
+    ensure!(
+        ordinary
+            .iter()
+            .zip(&negligible_output)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "negligible FA2 sink changed ordinary output"
+    );
+    ensure!(
+        ordinary
+            .iter()
+            .zip(&sink_output)
+            .any(|(a, b)| a.to_bits() != b.to_bits()),
+        "meaningful FA2 sink did not change ordinary output"
+    );
+    let negligible_max = ordinary
+        .iter()
+        .zip(&negligible_output)
+        .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+        .fold(0f32, f32::max);
+
+    let mut expected = vec![0f32; rows * hq * dim];
+    for row in 0..rows {
+        let keys = start + row + 1;
+        for (head, sink) in sinks.iter().enumerate() {
+            let kv_head = head / (hq / hkv);
+            let mut scores = vec![0f32; keys];
+            for (position, score) in scores.iter_mut().enumerate() {
+                let q_base = (row * hq + head) * dim;
+                let k_base = (kv_head * capacity + position) * dim;
+                *score = (0..dim)
+                    .map(|d| q[q_base + d].to_f32() * k[k_base + d].to_f32())
+                    .sum::<f32>()
+                    * (dim as f32).sqrt().recip();
+            }
+            let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum: f32 = scores.iter().map(|score| (score - max_score).exp()).sum();
+            let expected_lse = max_score + sum.ln();
+            let denominator = 1.0 + (sink.to_f32() - expected_lse).exp();
+            for d in 0..dim {
+                let index = (row * hq + head) * dim + d;
+                let mut numerator = 0f32;
+                for (position, score) in scores.iter().enumerate() {
+                    let probability = ((score - max_score).exp() / sum) as f32;
+                    let v_base = (kv_head * capacity + position) * dim;
+                    numerator += probability * v[v_base + d].to_f32();
+                }
+                expected[index] = bf16::from_f32(numerator / denominator).to_f32();
+            }
+        }
+    }
+    let metrics = attention_metrics(&sink_output, &expected);
+    let bound = super::bf16_chain_bound(3, &[dim, capacity + 1]);
+    let max_bound = bound as f32 * metrics.max_reference;
+    ensure!(
+        metrics.max_abs <= max_bound,
+        "FA2 sink max={:.9e} bound={max_bound:e}",
+        metrics.max_abs
+    );
+    ensure!(
+        metrics.p99_abs <= max_bound / 2.0,
+        "FA2 sink p99={:.9e} bound={}",
+        metrics.p99_abs,
+        max_bound / 2.0
+    );
+    ensure!(
+        metrics.mean_abs <= max_bound / 4.0,
+        "FA2 sink mean={:.9e} bound={}",
+        metrics.mean_abs,
+        max_bound / 4.0
+    );
+    ensure!(
+        metrics.cosine >= 1.0 - bound as f32,
+        "FA2 sink cosine={:.9e} bound={}",
+        metrics.cosine,
+        1.0 - bound as f32
+    );
+    eprintln!(
+        "FA2_GQA32_SINK rows={rows} negligible_max={negligible_max:e} max_abs={:.9e} p99_abs={:.9e} mean_abs={:.9e} cosine={:.9e} max_reference={:.9e} relative_bound={max_bound:e} PASS",
+        metrics.max_abs, metrics.p99_abs, metrics.mean_abs, metrics.cosine, metrics.max_reference
+    );
+
+    let (slide_capacity, window) = (2048usize, 512usize);
+    let slide_q = vec![bf16::ZERO; slide_rows * hq * dim];
+    let slide_k = vec![bf16::ZERO; hkv * slide_capacity * dim];
+    let mut slide_v = vec![bf16::ZERO; hkv * slide_capacity * dim];
+    let slide_pattern = [1.0f32, -1.0, 0.5, -0.5, 0.25];
+    let mut slide_prefix = vec![0f32; slide_capacity + 1];
+    for position in 0..slide_capacity {
+        slide_prefix[position + 1] = slide_prefix[position] + slide_pattern[position % 5];
+        let value = bf16::from_f32(slide_pattern[position % 5]);
+        for head in 0..hkv {
+            slide_v[(head * slide_capacity + position) * dim] = value;
+        }
+    }
+    let slide_q_dev = s.clone_htod(&slide_q)?;
+    let slide_k_dev = s.clone_htod(&slide_k)?;
+    let slide_v_dev = s.clone_htod(&slide_v)?;
+    let zero_sinks = vec![bf16::ZERO; hq];
+    let zero_sinks_dev = s.clone_htod(&zero_sinks)?;
+    let mut slide_ordinary = s.alloc_zeros::<bf16>(slide_rows * hq * dim)?;
+    let mut slide_sink = s.alloc_zeros::<bf16>(slide_rows * hq * dim)?;
+    let slide_shape = Shape {
+        rows: slide_rows,
+        start: 0,
+        q_heads: hq,
+        kv_heads: hkv,
+        capacity: slide_capacity,
+        head_dim: dim,
+        causal: true,
+        window_left: Some(window),
+    };
+    flash.run(
+        &slide_q_dev,
+        hq * dim,
+        &slide_k_dev,
+        &slide_v_dev,
+        &mut slide_ordinary,
+        slide_shape,
+    )?;
+    s.memcpy_dtod(&slide_ordinary, &mut slide_sink)?;
+    flash.apply_sinks(&zero_sinks_dev, &mut slide_sink, slide_rows, hq)?;
+    s.synchronize()?;
+    let slide_ordinary = s.clone_dtoh(&slide_ordinary)?;
+    let slide_sink = s.clone_dtoh(&slide_sink)?;
+    ensure!(
+        slide_ordinary
+            .iter()
+            .zip(&slide_sink)
+            .any(|(ordinary, sink)| ordinary.to_bits() != sink.to_bits()),
+        "zero FA2 sink did not rescale sliding prefill"
+    );
+    let mut slide_expected = vec![0f32; slide_rows * hq * dim];
+    for row in 0..slide_rows {
+        let first = row.saturating_sub(window);
+        let tokens = row - first + 1;
+        let window_sum = slide_prefix[row + 1] - slide_prefix[first];
+        for head in 0..hq {
+            slide_expected[(row * hq + head) * dim] = window_sum / (tokens as f32 + 1.0);
+        }
+    }
+    let slide_metrics = attention_metrics(&slide_sink, &slide_expected);
+    let slide_bound = super::bf16_chain_bound(3, &[dim, window + 2]);
+    let slide_max_bound = slide_bound as f32 * slide_metrics.max_reference;
+    eprintln!(
+        "FA2_SLIDING_METRICS max_abs={:.9e} p99_abs={:.9e} mean_abs={:.9e} cosine={:.9e} max_reference={:.9e}",
+        slide_metrics.max_abs,
+        slide_metrics.p99_abs,
+        slide_metrics.mean_abs,
+        slide_metrics.cosine,
+        slide_metrics.max_reference
+    );
+    ensure!(
+        slide_metrics.max_abs <= slide_max_bound,
+        "sliding FA2 max={:.9e} bound={slide_max_bound:e}",
+        slide_metrics.max_abs
+    );
+    ensure!(
+        slide_metrics.p99_abs <= slide_max_bound / 2.0,
+        "sliding FA2 p99={:.9e} bound={}",
+        slide_metrics.p99_abs,
+        slide_max_bound / 2.0
+    );
+    ensure!(
+        slide_metrics.mean_abs <= slide_max_bound / 4.0,
+        "sliding FA2 mean={:.9e} bound={}",
+        slide_metrics.mean_abs,
+        slide_max_bound / 4.0
+    );
+    ensure!(
+        slide_metrics.cosine >= 1.0 - slide_bound as f32,
+        "sliding FA2 cosine={:.9e} bound={}",
+        slide_metrics.cosine,
+        1.0 - slide_bound as f32
+    );
+
+    let one_capacity = 1025usize;
+    let one_start = 1024usize;
+    let one_q = vec![bf16::ZERO; hq * dim];
+    let one_k = vec![bf16::ZERO; hkv * one_capacity * dim];
+    let mut one_v = vec![bf16::ZERO; hkv * one_capacity * dim];
+    for head in 0..hkv {
+        one_v[(head * one_capacity + one_start - window) * dim] = bf16::ONE;
+        one_v[(head * one_capacity + one_start - window - 1) * dim + 1] = bf16::ONE;
+        one_v[(head * one_capacity + one_start) * dim + 2] = bf16::ONE;
+    }
+    let one_q_dev = s.clone_htod(&one_q)?;
+    let one_k_dev = s.clone_htod(&one_k)?;
+    let one_v_dev = s.clone_htod(&one_v)?;
+    let mut one_output = s.alloc_zeros::<bf16>(hq * dim)?;
+    flash.run(
+        &one_q_dev,
+        hq * dim,
+        &one_k_dev,
+        &one_v_dev,
+        &mut one_output,
+        Shape {
+            rows: 1,
+            start: one_start,
+            q_heads: hq,
+            kv_heads: hkv,
+            capacity: one_capacity,
+            head_dim: dim,
+            causal: true,
+            window_left: Some(window),
+        },
+    )?;
+    flash.apply_sinks(&sinks_dev, &mut one_output, 1, hq)?;
+    s.synchronize()?;
+    let one_output = s.clone_dtoh(&one_output)?;
+    for head in 0..hq {
+        let base = head * dim;
+        ensure!(
+            one_output[base + 1].to_bits() == bf16::ZERO.to_bits(),
+            "sliding FA2 included excluded key p-513"
+        );
+        ensure!(
+            one_output[base].to_f32() > 0.0 && one_output[base + 2].to_f32() > 0.0,
+            "sliding FA2 omitted p-512 or p"
+        );
+    }
+    eprintln!(
+        "FA2_GQA32_SLIDING rows={slide_rows} window={window} max_abs={:.9e} p99_abs={:.9e} mean_abs={:.9e} cosine={:.9e} relative_bound={slide_max_bound:e} one_hot_boundary=PASS",
+        slide_metrics.max_abs, slide_metrics.p99_abs, slide_metrics.mean_abs, slide_metrics.cosine
+    );
+    Ok(())
 }
 
 fn affine_codes(values: &[bf16]) -> (Vec<u8>, [f32; 2]) {
@@ -994,6 +1853,7 @@ fn kv_cache_kernel_gpu() -> Result<()> {
             capacity: cap,
             head_dim: 256,
             causal: true,
+            window_left: None,
         };
         flash.run(&q, 6144, &k_full, &v_full, &mut result, shape)?;
         flash.run(&q, 6144, &oracle_k, &oracle_v, &mut reference, shape)?;

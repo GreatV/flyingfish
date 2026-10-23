@@ -290,12 +290,13 @@ pub(crate) struct LayerLinearPlan {
     materialize: Vec<(LinearWeightRef, TensorMut<bf16, 2>)>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum BoundFfn {
     Dense,
     Moe {
         router: Tensor<bf16, 2>,
-        shared: [Tensor<bf16, 2>; 3],
+        score: crate::model_spec::RouterScore,
+        shared: Box<[Tensor<bf16, 2>; 3]>,
         shared_gate: Option<Tensor<bf16, 1>>,
     },
 }
@@ -311,11 +312,11 @@ impl BoundFfn {
         let h = spec.hidden;
         let i = moe.shared_intermediate;
         let router = linear.take_bf16("mlp.gate.weight", [moe.experts, h])?;
-        let shared = [
+        let shared = Box::new([
             linear.take_bf16("mlp.shared_expert.gate_proj.weight", [i, h])?,
             linear.take_bf16("mlp.shared_expert.up_proj.weight", [i, h])?,
             linear.take_bf16("mlp.shared_expert.down_proj.weight", [h, i])?,
-        ];
+        ]);
         let shared_gate = if moe.shared_gate {
             let gate = linear.take_bf16("mlp.shared_expert_gate.weight", [1, h])?;
             Some(unsafe { Tensor::new(gate.ptr, [h], [1], gate.span_bytes)? })
@@ -324,6 +325,7 @@ impl BoundFfn {
         };
         Ok(Self::Moe {
             router,
+            score: moe.score,
             shared,
             shared_gate,
         })
@@ -340,7 +342,7 @@ impl BoundFfn {
                 if let Some(gate) = shared_gate {
                     gate.validate()?;
                 }
-                for weight in shared {
+                for weight in shared.iter() {
                     blas.prepare_fixed(rows, weight.shape[0], weight.shape[1])?;
                 }
                 Ok(())
@@ -1454,8 +1456,9 @@ mod tests {
             } else {
                 let BoundFfn::Moe {
                     router,
-                    shared,
+                    ref shared,
                     shared_gate,
+                    ..
                 } = bound?
                 else {
                     anyhow::bail!("MoE layer selected the dense FFN plan");

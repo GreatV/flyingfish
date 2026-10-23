@@ -98,7 +98,8 @@ fn expert_host_reserve_keeps_span_independent_of_cpu_ceiling() -> Result<()> {
     }
     assert_eq!(admitted, [32, 32]);
     let extra = |rows| -> Result<usize> {
-        Ok(decode_device_bytes(geometry, rows)? - decode_device_bytes(geometry, 1)?)
+        Ok(decode_device_bytes(geometry, geometry.intermediate, rows)?
+            - decode_device_bytes(geometry, geometry.intermediate, 1)?)
     };
     let total = 24usize << 30;
     let mut request = crate::prefill::WorkspaceRequest {
@@ -113,7 +114,7 @@ fn expert_host_reserve_keeps_span_independent_of_cpu_ceiling() -> Result<()> {
     assert!(crate::prefill::WorkspaceBudget::new(request, |_| Ok(0), Ok).is_ok());
     request.fixed_transient_bytes = extra(16)?;
     assert!(crate::prefill::WorkspaceBudget::new(request, |_| Ok(0), Ok).is_err());
-    assert!(decode_device_bytes(geometry, 17).is_err());
+    assert!(decode_device_bytes(geometry, geometry.intermediate, 17).is_err());
     assert_eq!(extra(1)?, 0);
     // Per decode row: k * (contribution row + 26 B of ids/weights/flags) + residual and
     // shared rows + scale + one BF16 router logit per expert.
@@ -838,6 +839,10 @@ impl Engine {
             model_spec
                 .expert_format
                 .context("MoE expert_format missing")?,
+            model_spec
+                .moe
+                .context("MoE shared geometry missing")?
+                .shared_intermediate,
         )?);
         let moe_prefill = if capacity.prefill_staging_slots > 0 {
             let reserves = crate::experts::plan::Reserves {
@@ -1625,9 +1630,10 @@ fn direct(engine: &Engine, layer: usize, input: &[bf16], rows: usize) -> Result<
     let ctx = &engine.device.ctx;
     let BoundFfn::Moe {
         router,
-        shared,
+        ref shared,
         shared_gate,
-    } = engine.moe_test_ffn.context("test FFN absent")?
+        ..
+    } = engine.moe_test_ffn.clone().context("test FFN absent")?
     else {
         anyhow::bail!("dense test FFN");
     };
@@ -1653,7 +1659,6 @@ fn direct(engine: &Engine, layer: usize, input: &[bf16], rows: usize) -> Result<
     let experts = router.shape[0];
     let logits = stream.alloc_zeros::<bf16>(rows * experts as usize)?;
     RouteOps::new(ctx, stream)?.route(
-        stream,
         xv,
         router,
         &mut TensorMut(idv),
@@ -1665,6 +1670,7 @@ fn direct(engine: &Engine, layer: usize, input: &[bf16], rows: usize) -> Result<
             [rows as u32, experts],
             [u64::from(experts), 1],
         )?),
+        crate::model_spec::RouterScore::Softmax,
     )?;
     let routed = stream.clone_dtoh(&ids)?;
     let published = &engine
@@ -1704,7 +1710,7 @@ fn direct(engine: &Engine, layer: usize, input: &[bf16], rows: usize) -> Result<
         shared_gate: shared[0],
         shared_up: shared[1],
         shared_down: shared[2],
-        shared_expert_gate: shared_gate,
+        shared_expert_gate: Some(shared_gate),
         contributions: view(
             &contributions,
             stream,
@@ -1733,7 +1739,14 @@ fn direct(engine: &Engine, layer: usize, input: &[bf16], rows: usize) -> Result<
             .context("MoE reference expert format missing")?,
         &geometry,
     )?;
-    op.decode(stream, &input, &mut y_view, &scratch, layout.fp8_slot())?;
+    op.decode(
+        stream,
+        &input,
+        &mut y_view,
+        &scratch,
+        layout.fp8_slot(),
+        i as u32,
+    )?;
     stream.synchronize()?;
     let mut trace = Trace::default();
     trace.add(
@@ -1805,7 +1818,10 @@ fn combine_expected(engine: &Engine, contributions: &[bf16], rows: usize) -> Res
     let stream = &engine.device.stream;
     let decode = engine.moe.as_ref().context("reference decode missing")?;
     let x = qwen::matrix(&engine.work.n, stream, 0, rows, 128)?;
-    let ffn = engine.moe_test_ffn.context("reference FFN missing")?;
+    let ffn = engine
+        .moe_test_ffn
+        .clone()
+        .context("reference FFN missing")?;
     let expected_contributions = stream.clone_htod(contributions)?;
     let expected_out = stream.alloc_zeros::<bf16>(rows * 128)?;
     let expected_scale = stream.alloc_zeros::<bf16>(rows)?;
@@ -1831,8 +1847,8 @@ fn combine_expected(engine: &Engine, contributions: &[bf16], rows: usize) -> Res
             )?,
             shared_out: qwen::matrix(&decode.shared, stream, 0, rows, 128)?,
             x,
-            shared_expert_gate: shared_gate,
-            scale: TensorMut(scale),
+            shared_expert_gate: Some(shared_gate),
+            scale: Some(TensorMut(scale)),
             y: TensorMut(qwen::matrix(&expected_out, stream, 0, rows, 128)?),
         },
     )?;
@@ -2150,7 +2166,10 @@ fn cpu_control(
     reference: &Trace,
 ) -> Result<usize> {
     use crate::cpu::expert_ffn::{Contribution, Isa, Scratch, contribution};
-    let ffn = engine.moe_test_ffn.context("CPU control FFN missing")?;
+    let ffn = engine
+        .moe_test_ffn
+        .clone()
+        .context("CPU control FFN missing")?;
     let slots = engine
         .moe_slots
         .as_ref()
@@ -2224,8 +2243,8 @@ fn cpu_control(
     let decode = engine.moe.as_mut().context("CPU control decode missing")?;
     let stream = &engine.device.stream;
     let x = qwen::matrix(&engine.work.n, stream, 0, rows, 128)?;
-    decode.route(&engine.device, ffn, x)?;
-    let duplicate_route = decode.route(&engine.device, ffn, x).is_err();
+    decode.route(&engine.device, &ffn, x)?;
+    let duplicate_route = decode.route(&engine.device, &ffn, x).is_err();
     let alternate = stream.clone_htod(input)?;
     let mut probe_out = TensorMut(qwen::matrix(&engine.work.out, stream, 0, rows, 128)?);
     let dispatch = || Dispatch {
@@ -2243,7 +2262,7 @@ fn cpu_control(
     let different_input = decode
         .finish(
             &engine.device,
-            ffn,
+            ffn.clone(),
             slots.bindings(0, stream)?,
             dispatch(),
             (
@@ -2255,7 +2274,7 @@ fn cpu_control(
     super::residency::delay_stream(&decode.mailbox)?;
     decode.finish(
         &engine.device,
-        ffn,
+        ffn.clone(),
         slots.bindings(0, stream)?,
         Dispatch {
             active: &active,
