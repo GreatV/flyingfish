@@ -889,14 +889,10 @@ impl Engine {
                 let a = matrix(&input.ab, stream, 0, slots, hv)?;
                 let b = matrix(&input.ab, stream, slots * hv, slots, hv)?;
                 *verify = (1..=verify_rows)
-                    .map(|rows| prefill.full.for_verify(rows as u32, None, None))
+                    .map(|rows| prefill.full.for_verify(rows as u32, None))
                     .collect::<Result<_>>()?;
                 *replay = (1..=slots)
-                    .map(|rows| {
-                        prefill
-                            .full
-                            .for_verify(rows as u32, Some((qkv, a, b)), None)
-                    })
+                    .map(|rows| prefill.full.for_verify(rows as u32, Some((qkv, a, b))))
                     .collect::<Result<_>>()?;
             }
         }
