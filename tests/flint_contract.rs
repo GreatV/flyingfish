@@ -254,17 +254,99 @@ fn flint_engine_short_prefill_gpu() -> Result<()> {
     let ids = [150000u32, 1, 2, 3, 4, 5, 6, 7];
     let mut trace = flyingfish::trace::Trace::all_layers();
     let token = engine.prefill(&ids, Some(&mut trace))?;
+    engine.set_token(ids[0])?;
+    engine.decode(true, None)?;
     let logits = engine.decode_logits()?;
     ensure!(
         logits.len() == 150_144 && logits.iter().all(|value| value.is_finite()),
         "invalid Flint logits extent or nonfinite values"
     );
     println!(
-        "FLINT_ENGINE_SHORT_PREFILL rows={} token={token} finite_logits=true PASS",
+        "FLINT_ENGINE_SHORT_PREFILL rows={} decode_rows=1 token={token} finite_logits=true PASS",
         ids.len()
     );
     if let Some(path) = env::var_os("FF_FLINT_TRACE_OUT") {
         trace.save(&PathBuf::from(path))?;
     }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "GPU window, FF_MODEL, FLYINGFISH_RUNTIME_DIR and FF_FLINT_PASSAGE required"]
+fn flint_engine_prefix_nll_gpu() -> Result<()> {
+    use flyingfish::backend::{Backend, Settings};
+    use std::fs::File;
+
+    let dir = PathBuf::from(
+        env::var_os("FF_MODEL")
+            .context("FF_MODEL missing; point it at the published Flint directory")?,
+    );
+    let runtime = PathBuf::from(
+        env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR missing")?,
+    );
+    let passage =
+        PathBuf::from(env::var_os("FF_FLINT_PASSAGE").context("FF_FLINT_PASSAGE missing")?);
+    ensure!(
+        env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let passage: serde_json::Value =
+        serde_json::from_reader(File::open(&passage).context("open FF_FLINT_PASSAGE")?)?;
+    let ids = passage["input_ids"]
+        .as_array()
+        .context("FF_FLINT_PASSAGE input_ids missing")?
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .context("invalid passage token id")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(ids.len() >= 600, "passage shorter than capacity-600 gate");
+    let settings = Settings {
+        runtime_dir: Some(runtime),
+        prefix_cache: false,
+        draft_model: None,
+        tree_builder: flyingfish::backend::TreeBuilder::Serial,
+        spec_budget: flyingfish::backend::SpecBudget::Chain,
+        spec_graph: false,
+        kv_format: flyingfish::kv::KvFormat::Bf16,
+    };
+    let mut engine = Backend::calibrate(&dir, 0, 600, None, settings)?
+        .context("Flint calibration did not return the prepared engine")?;
+    engine.prefill(&ids[..1], None)?;
+    let mut total_nll = 0f64;
+    for (index, target) in ids[1..600].iter().enumerate() {
+        let logits = engine.decode_logits()?;
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let logsumexp = logits
+            .iter()
+            .map(|value| (value - max).exp())
+            .sum::<f32>()
+            .ln();
+        total_nll += f64::from(max + logsumexp - logits[*target as usize]);
+        if index + 2 != 600 {
+            engine.set_token(*target)?;
+            engine.decode(true, None)?;
+        }
+    }
+    let mean_nll = total_nll / 599.0;
+    ensure!(mean_nll.is_finite(), "nonfinite Flint prefix NLL");
+    ensure!(
+        mean_nll <= 4.0,
+        "Flint prefix NLL exceeds ceiling: {mean_nll}"
+    );
+    if let Ok(reference) = env::var("FF_FLINT_REFERENCE_NLL") {
+        let reference = reference.parse::<f64>()?;
+        ensure!(
+            (mean_nll - reference).abs() <= 0.01,
+            "Flint prefix NLL differs from reference: candidate={mean_nll} reference={reference}"
+        );
+    }
+    println!(
+        "FLINT_ENGINE_PREFIX_NLL prefix_tokens=600 predicted_tokens=599 mean_nll={mean_nll:.9} PASS"
+    );
     Ok(())
 }

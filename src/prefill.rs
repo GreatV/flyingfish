@@ -464,6 +464,28 @@ impl ExpertSpanLayout {
         let done = region(reserves.done_row_bytes)?;
         let ids = region(choices * 4)?;
         let weights = region(choices * 2)?;
+        drop(region);
+        if weights.len() % 16 != 0 {
+            bytes = bytes
+                .checked_add(15)
+                .context("expert span weight padding overflow")?
+                & !15;
+        }
+        let mut region = |row_bytes: u64| -> Result<std::ops::Range<usize>> {
+            let first = bytes
+                .checked_add(15)
+                .context("expert span alignment overflow")?
+                & !15;
+            let count = usize::try_from(
+                row_bytes
+                    .checked_mul(u64::from(rows))
+                    .context("expert span region overflow")?,
+            )?;
+            bytes = first
+                .checked_add(count)
+                .context("expert span extent overflow")?;
+            Ok(first..bytes)
+        };
         let active = region(choices * 4)?;
         let generation = region(choices * 8)?;
         let raw = reserves.span_bytes(rows)?;

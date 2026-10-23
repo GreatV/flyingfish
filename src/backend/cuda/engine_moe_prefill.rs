@@ -1,8 +1,10 @@
 //! Layer-major prefill over borrowed expert slots.
 use super::*;
+#[cfg(test)]
 use crate::backend::cuda::moe::prefill::prefill_scratch_bytes;
 use crate::backend::cuda::moe::prefill::{
     LANE16_ROWS, MoePrefillContribute, MoePrefillFinish, PrefillOps, arithmetic_mask,
+    prefill_scratch_bytes_mixed,
 };
 use crate::experts::{
     plan::{Capacity, Reserves, ServiceTable},
@@ -36,15 +38,14 @@ impl Span {
             "prefill span view outside region={region:?} offset={offset} bytes={}",
             self.layout.bytes
         );
+        let ptr = self.base + (region.start + offset) as u64;
+        ensure!(
+            ptr != 0 && ptr.is_multiple_of(16),
+            "prefill span pointer base={:#x} region={region:?} offset={offset}",
+            self.base
+        );
         // SAFETY: the slot arena owns this borrowed range through refill; callers order all uses.
-        unsafe {
-            Tensor::new(
-                self.base + (region.start + offset) as u64,
-                shape,
-                stride,
-                (region.len() - offset) as u64,
-            )
-        }
+        unsafe { Tensor::new(ptr, shape, stride, (region.len() - offset) as u64) }
     }
 
     fn hidden(&self, region: &Range<usize>, base: u32, rows: u32) -> Result<Tensor<bf16, 2>> {
@@ -260,6 +261,7 @@ type Wave = (usize, usize, usize, bool, String);
 
 pub(in crate::backend::cuda::engine) struct Prefill {
     geometry: ExpertGeometry,
+    shared_intermediate: u32,
     capacity: Capacity,
     reserves: Reserves,
     service: ServiceTable,
@@ -402,9 +404,9 @@ impl Prefill {
         reserves: Reserves,
         service: ServiceTable,
         h2d_bytes_per_second: f64,
-        windows: (usize, usize),
+        shape: (u32, usize, usize),
     ) -> Result<Self> {
-        let (workspace_rows, mixer_rows) = windows;
+        let (shared_intermediate, workspace_rows, mixer_rows) = shape;
         let geometry = slots.catalogue.geometry();
         ensure!(
             mixer_rows > 0 && mixer_rows <= workspace_rows,
@@ -465,6 +467,7 @@ impl Prefill {
             (geometry.experts as usize).div_ceil(capacity.prefill_staging_slots as usize) + 1;
         Ok(Self {
             geometry,
+            shared_intermediate,
             capacity: capacity.clone(),
             reserves,
             service,
@@ -475,17 +478,17 @@ impl Prefill {
             gpu: Gpu {
                 mask: super::super::super::super::cubin::module(&device.ctx, "moe_route")?
                     .load_function("moe_route_mask")?,
-                scratch: device
-                    .stream
-                    .alloc_zeros(usize::try_from(prefill_scratch_bytes(
+                scratch: device.stream.alloc_zeros(usize::try_from(
+                    prefill_scratch_bytes_mixed(
                         capacity.wave_rows as usize,
                         capacity.span_rows as usize,
                         geometry.top_k as usize,
                         geometry.experts as usize,
                         geometry.hidden as usize,
-                        geometry.intermediate as usize,
+                        (geometry.intermediate as usize, shared_intermediate as usize),
                         capacity.layout.fp8_slot(),
-                    )?)?)?,
+                    )?,
+                )?)?,
                 tables: Tables::new(device, geometry.experts as usize, cohorts)?,
                 host_ids: pinned_zeros(&device.ctx, assignments)?,
                 host_weights: pinned_zeros(&device.ctx, assignments)?,
@@ -747,13 +750,16 @@ impl Prefill {
         let stream = &device.stream;
         ensure!(
             self.gpu.scratch.len() as u64
-                >= prefill_scratch_bytes(
+                >= prefill_scratch_bytes_mixed(
                     self.capacity.wave_rows.min(rows) as usize,
                     rows as usize,
                     self.geometry.top_k as usize,
                     self.geometry.experts as usize,
                     self.geometry.hidden as usize,
-                    self.geometry.intermediate as usize,
+                    (
+                        self.geometry.intermediate as usize,
+                        self.shared_intermediate as usize,
+                    ),
                     self.capacity.layout.fp8_slot(),
                 )?,
             "prefill wave scratch bytes={} are below the rows={rows} wave={} bound",
@@ -984,6 +990,7 @@ impl Prefill {
         decode.prefill.prefill_finish(
             &device.stream,
             MoePrefillFinish {
+                expert_inter: self.geometry.intermediate,
                 x: span.hidden(&span.layout.normalized, base, rows)?,
                 ids: span.choices(&span.layout.ids, base, rows)?,
                 final_active: span.choices(&span.layout.active, base, rows)?,
@@ -1042,7 +1049,7 @@ impl Engine {
     pub(in crate::backend::cuda::engine) fn prefill_moe_chunks(
         &mut self,
         ids: &[u32],
-        trace: Option<&mut Trace>,
+        mut trace: Option<&mut Trace>,
         keep: usize,
         after_chunk: &mut impl FnMut(&mut Self, &[u32]) -> Result<()>,
     ) -> Result<u32> {
@@ -1057,6 +1064,9 @@ impl Engine {
             self.moe_slots.is_some(),
             self.moe.is_some()
         );
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.set_device(&self.device.info.name)?;
+        }
         let mut prefill = self
             .moe_prefill
             .take()
@@ -1255,11 +1265,12 @@ impl Engine {
                     None
                 } else {
                     let ffn = self.moe_ffn_binding(layer)?;
+                    let slot_layer = u32::try_from(self.moe_slot_layer(layer)?)?;
                     prefill.ffn(
                         &self.device,
                         slots,
                         decode,
-                        layer as u32,
+                        slot_layer,
                         admitted.len() as u32,
                         ffn.clone(),
                     )?;
@@ -1406,36 +1417,31 @@ impl Engine {
                         prefix,
                         skip: *skip,
                     });
-                    if layer == self.trace_layer {
+                    if target.is_some() {
+                        let name = if all_layers {
+                            format!("{layer}.ffn")
+                        } else {
+                            "ffn".to_owned()
+                        };
                         trace_value(
                             &mut target,
                             &self.device.stream,
-                            "ffn",
+                            &name,
                             &self.work.out,
                             *rows,
                             self.model_spec.hidden as usize,
                         )?;
                     }
-                    let layers = self.model_spec.layers.len();
-                    if !all_layers
-                        || layer == 0
-                        || layer == self.trace_layer
-                        || layer == layers / 2
-                        || layer + 1 == layers
-                        || self
-                            .hidden_capture
-                            .as_ref()
-                            .is_some_and(|capture| capture.layer_slots[layer].is_some())
-                    {
+                    if target.is_some() {
                         let name = if all_layers {
-                            &prefill.layer_names[layer]["layer.".len()..]
+                            layer.to_string()
                         } else {
-                            &prefill.layer_names[layer]
+                            prefill.layer_names[layer].clone()
                         };
                         trace_value(
                             &mut target,
                             &self.device.stream,
-                            name,
+                            &name,
                             &self.work.x,
                             *rows,
                             self.model_spec.hidden as usize,
@@ -1920,6 +1926,7 @@ impl Gpu {
             ops.prefill_contribute(
                 stream,
                 MoePrefillContribute {
+                    expert_inter: geometry.intermediate,
                     cpu_arithmetic: &self.cpu_arithmetic,
                     fp8_slot: slots.catalogue.layout().fp8_slot(),
                     wave: Some((cohort, base, active)),
@@ -2211,6 +2218,7 @@ mod tests {
                     ops.prefill_contribute(
                         stream,
                         MoePrefillContribute {
+                            expert_inter: geometry.intermediate,
                             cpu_arithmetic: &arithmetic,
                             fp8_slot: None,
                             wave: None,
@@ -3007,6 +3015,7 @@ mod tests {
                 decode.prefill.prefill_contribute(
                     stream,
                     MoePrefillContribute {
+                        expert_inter: 64,
                         cpu_arithmetic: &arithmetic,
                         fp8_slot: slots.catalogue.layout().fp8_slot(),
                         wave: None,
@@ -3146,6 +3155,7 @@ mod tests {
             decode.prefill.prefill_finish(
                 stream,
                 MoePrefillFinish {
+                    expert_inter: 64,
                     x: qwen::matrix(&input, stream, base * 128, count, 128)?,
                     ids: view(&ids, stream, base * 4, [count as u32, 4], [4, 1])?,
                     final_active: view(&active, stream, base * 4, [count as u32, 4], [4, 1])?,
