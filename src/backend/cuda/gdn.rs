@@ -233,17 +233,77 @@ impl GdnPlan {
         rows: u32,
         snapshots: Option<(Tensor<f32, 4>, Tensor<f32, 3>)>,
     ) -> Result<Self> {
+        if snapshots.is_some() {
+            return self.for_verify(rows, None, snapshots);
+        }
         ensure!(
             rows > 0 && rows <= self.max_rows,
             "GDN rows outside binding"
         );
+        let b = &self.bindings;
+        let bindings = GdnBindings {
+            qkv: b.qkv.prefix_rows(rows)?,
+            a: b.a.prefix_rows(rows)?,
+            b: b.b.prefix_rows(rows)?,
+            conv_weight: b.conv_weight,
+            a_log: b.a_log,
+            dt_bias: b.dt_bias,
+            core_out: TensorMut(b.core_out.read().prefix_rows(rows)?),
+            s: TensorMut(b.s.read()),
+            history: TensorMut(b.history.read()),
+        };
+        check_bindings(&bindings, rows, self.conv_dim, self.spec.hv)?;
+        let cw_p2 = self.cw_p2 && rows > crate::gdn_plan::MIN_VERIFY_ROWS;
+        let ws = GdnWorkspace::new(&self.spec, rows, cw_p2)?;
+        let (conv, conv_rows) = bind_conv(
+            &self.kernels,
+            &self.spec,
+            rows,
+            self.sms,
+            ws.q_bf16.bytes > 0,
+        )?;
+        let (prep_cfg, beta_cfg, conv_cfg) =
+            prep_grids(self.prep_cfg, self.beta_cfg, self.conv_cfg, rows, conv_rows)?;
+        Ok(Self {
+            spec: self.spec,
+            snapshots: None,
+            kernels: self.kernels.clone(),
+            conv,
+            sms: self.sms,
+            bindings,
+            ws,
+            conv_dim: self.conv_dim,
+            l2_eps: self.l2_eps,
+            max_rows: rows,
+            prep_cfg,
+            beta_cfg,
+            conv_cfg,
+            hist_cfg: self.hist_cfg,
+            chunked_cfg: self.chunked_cfg,
+            recurrent_cfg: self.recurrent_cfg,
+            p2_groups: cw_p2_groups(&ws, rows, self.spec.hv)?,
+            p2_h_cfg: cw_p2_grids(rows, self.spec.hv).1,
+            cw_p2,
+        })
+    }
+
+    pub(crate) fn for_verify(
+        &self,
+        rows: u32,
+        inputs: Option<(Tensor<bf16, 2>, Tensor<bf16, 2>, Tensor<bf16, 2>)>,
+        snapshots: Option<(Tensor<f32, 4>, Tensor<f32, 3>)>,
+    ) -> Result<Self> {
+        ensure!(
+            rows > 0 && rows <= self.max_rows,
+            "GDN rows outside binding"
+        );
+        let limit = self.spec.snapshot_limit()?;
+        ensure!(
+            (1..=limit).contains(&rows),
+            "GDN hv={} snapshot rows={rows} exceeds bound={limit}",
+            self.spec.hv
+        );
         if let Some((state, history)) = snapshots {
-            let limit = self.spec.snapshot_limit()?;
-            ensure!(
-                (1..=limit).contains(&rows),
-                "GDN hv={} snapshot rows={rows} exceeds bound={limit}",
-                self.spec.hv
-            );
             state.validate()?;
             let slots = state.shape[0];
             ensure!(
@@ -267,10 +327,22 @@ impl GdnPlan {
             );
         }
         let b = &self.bindings;
+        let (qkv, a, b_in) = match inputs {
+            Some((qkv, a, b_in)) => (
+                qkv.prefix_rows(rows)?,
+                a.prefix_rows(rows)?,
+                b_in.prefix_rows(rows)?,
+            ),
+            None => (
+                b.qkv.prefix_rows(rows)?,
+                b.a.prefix_rows(rows)?,
+                b.b.prefix_rows(rows)?,
+            ),
+        };
         let bindings = GdnBindings {
-            qkv: b.qkv.prefix_rows(rows)?,
-            a: b.a.prefix_rows(rows)?,
-            b: b.b.prefix_rows(rows)?,
+            qkv,
+            a,
+            b: b_in,
             conv_weight: b.conv_weight,
             a_log: b.a_log,
             dt_bias: b.dt_bias,
@@ -279,8 +351,7 @@ impl GdnPlan {
             history: TensorMut(b.history.read()),
         };
         check_bindings(&bindings, rows, self.conv_dim, self.spec.hv)?;
-        let cw_p2 = snapshots.is_none() && self.cw_p2 && rows > crate::gdn_plan::MIN_VERIFY_ROWS;
-        let ws = GdnWorkspace::new(&self.spec, rows, cw_p2)?;
+        let ws = GdnWorkspace::new(&self.spec, rows, false)?;
         let (conv, conv_rows) = bind_conv(
             &self.kernels,
             &self.spec,
@@ -307,9 +378,9 @@ impl GdnPlan {
             hist_cfg: self.hist_cfg,
             chunked_cfg: self.chunked_cfg,
             recurrent_cfg: self.recurrent_cfg,
-            p2_groups: cw_p2_groups(&ws, rows, self.spec.hv)?,
+            p2_groups: [None; CW_P2_MAX_GROUPS],
             p2_h_cfg: cw_p2_grids(rows, self.spec.hv).1,
-            cw_p2,
+            cw_p2: false,
         })
     }
 
@@ -650,7 +721,10 @@ impl GdnOps {
             plan.spec.hv != 32 || plan.kernels.rstep.is_some(),
             "GDN hv=32 verify requires the ordered recurrent core"
         );
-        ensure!(plan.snapshots.is_some(), "verify snapshots not bound");
+        ensure!(
+            plan.snapshots.is_some() || plan.kernels.rstep.is_some(),
+            "verify requires snapshot bindings or the ordered recurrent core"
+        );
         Self::run_core(plan, stream, meta, ExecutionPhase::Prefill, scratch, true)
     }
 

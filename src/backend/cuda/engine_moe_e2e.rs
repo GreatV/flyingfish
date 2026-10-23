@@ -1475,6 +1475,18 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
         rows == 16 && model.model_spec.moe.is_some(),
         "production block15 MoE fixture required"
     );
+    model.set_moe_verify_rows(rows)?;
+    let snapshots = model
+        .state
+        .gdn
+        .iter()
+        .map(|live| {
+            Ok(super::super::super::state::GdnState {
+                s: stream.alloc_zeros((rows - 1) * live.s.len())?,
+                history: stream.alloc_zeros((rows - 1) * live.history.len())?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let h = model.config.hidden_size;
     let width = h * taps.len();
     ensure!(
@@ -1508,6 +1520,7 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
     }
     let mut defects = 0;
     let mut wrong_layer = 0;
+    let mut perturbed_gdn_control = 0;
     for prefix in [17usize, 65] {
         model.reset()?;
         let ids: Vec<_> = (0..prefix).map(|row| (row * 263 + 17) as u32).collect();
@@ -1615,6 +1628,7 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
             .as_ref()
             .context("chain checkpoint missing")?
             .restore(&mut model.state, &mut model.work.token, &stream)?;
+        model.bind_gdn_snapshots(&snapshots, rows)?;
         model.position = prefix;
         model.committed_prefix_ids.truncate(prefix);
         model.set_token(inputs[0])?;
@@ -1630,6 +1644,31 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
             },
             None,
         )?;
+        model
+            .spec
+            .as_ref()
+            .context("chain missing")?
+            .checkpoint
+            .as_ref()
+            .context("chain checkpoint missing")?
+            .restore(&mut model.state, &mut model.work.token, &stream)?;
+        model.bind_gdn_verify_inputs(rows)?;
+        model.position = prefix;
+        model.committed_prefix_ids.truncate(prefix);
+        model.set_token(inputs[0])?;
+        stream.memcpy_htod(&[prefix as i32], &mut model.work.position)?;
+        stream.memcpy_htod(&[prefix as i32 + 1], &mut model.work.length)?;
+        stream.memcpy_htod(&inputs, &mut model.work.ids.slice_mut(..rows))?;
+        model.run_step(
+            crate::backend::Step {
+                rows,
+                input: crate::backend::Input::Ids,
+                mask: crate::backend::Mask::Causal,
+                head: Head::All,
+            },
+            None,
+        )?;
+        let full_verify_state = chain_state(&model)?;
         let spec = model.spec.as_ref().context("chain missing")?;
         let actual = stream.clone_dtoh(&spec.logits)?;
         let logit_mismatches = actual
@@ -1658,22 +1697,97 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
             .count();
         defects += logit_mismatches + tap_mismatches + id_mismatches;
         for accepted in (0..=rows).rev() {
+            restore_chain_state(&mut model, &full_verify_state)?;
             let spec = model.spec.as_ref().context("chain missing")?;
             spec.checkpoint
                 .as_ref()
                 .context("chain checkpoint missing")?
-                .select_prefix(&mut model.state, &spec.snapshots, accepted, &stream)?;
+                .select_prefix(&mut model.state, &snapshots, accepted, &stream)?;
+            let snapshot_gdn = model
+                .state
+                .gdn
+                .iter()
+                .map(|g| Ok((stream.clone_dtoh(&g.s)?, stream.clone_dtoh(&g.history)?)))
+                .collect::<Result<Vec<_>>>()?;
+            restore_chain_state(&mut model, &full_verify_state)?;
+            let spec = model.spec.as_ref().context("chain missing")?;
+            spec.checkpoint
+                .as_ref()
+                .context("chain checkpoint missing")?
+                .restore_for_replay(&mut model.state, accepted, &stream)?;
+            if accepted > 0 && accepted < rows {
+                model.replay_gdn_prefix(prefix, accepted)?;
+            }
+            let mut snapshot_mismatches = 0;
+            for (live, (exp_s, exp_h)) in model.state.gdn.iter().zip(&snapshot_gdn) {
+                let live_s = stream.clone_dtoh(&live.s)?;
+                let live_h = stream.clone_dtoh(&live.history)?;
+                snapshot_mismatches += live_s
+                    .iter()
+                    .zip(exp_s)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count()
+                    + live_h
+                        .iter()
+                        .zip(exp_h)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+            }
             let actual = chain_state(&model)?;
             let mismatches = actual
                 .iter()
                 .zip(&expected_states[accepted])
                 .filter(|(a, b)| a != b)
                 .count();
-            defects += mismatches;
+            defects += mismatches + snapshot_mismatches;
             println!(
-                "{} minicpm_chain_prefix prefix={prefix} accepted={accepted} state_bit_mismatches={mismatches}",
-                if mismatches == 0 { "PASS" } else { "DEFECT" }
+                "{} minicpm_chain_prefix prefix={prefix} accepted={accepted} state_bit_mismatches={mismatches} snapshot_gdn_bit_mismatches={snapshot_mismatches}",
+                if mismatches + snapshot_mismatches == 0 {
+                    "PASS"
+                } else {
+                    "DEFECT"
+                }
             );
+            if accepted == crate::gdn_plan::MIN_VERIFY_ROWS as usize + 1 {
+                let conv_dim = crate::op_contract::GdnSpec::from_model(&model.model_spec)?
+                    .conv_dim()? as usize;
+                let word_idx = (accepted - 1) * conv_dim;
+                let orig = {
+                    let qkv = &mut model.spec.as_mut().context("chain missing")?.gdn_inputs[0].qkv;
+                    let orig = stream.clone_dtoh(&qkv.slice(word_idx..word_idx + 1))?;
+                    let flipped = [bf16::from_f32(orig[0].to_f32() + 1.0)];
+                    stream.memcpy_htod(&flipped, &mut qkv.slice_mut(word_idx..word_idx + 1))?;
+                    orig
+                };
+                model
+                    .spec
+                    .as_ref()
+                    .context("chain missing")?
+                    .checkpoint
+                    .as_ref()
+                    .context("chain checkpoint missing")?
+                    .restore_for_replay(&mut model.state, accepted, &stream)?;
+                model.replay_gdn_prefix(prefix, accepted)?;
+                let perturbed_s = stream.clone_dtoh(&model.state.gdn[0].s)?;
+                let perturbed_h = stream.clone_dtoh(&model.state.gdn[0].history)?;
+                let control_diff = perturbed_s
+                    .iter()
+                    .zip(&snapshot_gdn[0].0)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count()
+                    + perturbed_h
+                        .iter()
+                        .zip(&snapshot_gdn[0].1)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                perturbed_gdn_control += control_diff;
+                stream.memcpy_htod(
+                    &orig,
+                    &mut model.spec.as_mut().context("chain missing")?.gdn_inputs[0]
+                        .qkv
+                        .slice_mut(word_idx..word_idx + 1),
+                )?;
+            }
         }
         println!(
             "{} minicpm_chain_verify prefix={prefix} rows={rows} logits_bit_mismatches={logit_mismatches} capture_bit_mismatches={tap_mismatches} id_mismatches={id_mismatches}",
@@ -1912,8 +2026,12 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
         wrong_layer > 0,
         "Runner FAIL wrong-layer capture control was not detected"
     );
+    ensure!(
+        perturbed_gdn_control > 0,
+        "Runner FAIL planted gdn_inputs perturbation control was not detected"
+    );
     println!(
-        "{} minicpm_chain_verify_end rows=16 prefixes=17,65 accepted=0..16 wrong_layer_mismatches={wrong_layer} defects={defects}",
+        "{} minicpm_chain_verify_end rows=16 prefixes=17,65 accepted=0..16 wrong_layer_mismatches={wrong_layer} perturbed_gdn_mismatches={perturbed_gdn_control} defects={defects}",
         if defects == 0 { "PASS" } else { "DEFECT" }
     );
     ensure!(

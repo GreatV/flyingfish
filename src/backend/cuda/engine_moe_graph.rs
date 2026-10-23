@@ -172,7 +172,7 @@ impl Engine {
     pub(in crate::backend::cuda::engine) fn capture_moe(&mut self) -> Result<()> {
         let verify = self.spec.is_some();
         let rows = match &self.spec {
-            Some(spec) => spec.draft.config.verify_rows()?,
+            Some(spec) => spec.verify_rows,
             None => 1,
         };
         let step = crate::backend::Step {
@@ -232,7 +232,14 @@ impl Engine {
         self.qwen_device_prefix = verify;
         let result = (|| -> Result<Option<CudaGraph>> {
             stream.wait(&slots.refill)?;
-            checkpoint.save(&self.state, &self.work.token, self.position, &stream, None)?;
+            checkpoint.save_rows(
+                &self.state,
+                &self.work.token,
+                self.position,
+                rows,
+                &stream,
+                None,
+            )?;
             self.state.set_sequence(
                 &stream,
                 self.position as u32,
@@ -296,7 +303,7 @@ impl Engine {
         })();
         let result = result.and_then(|graph| {
             let logits = if let Some(spec) = &self.spec {
-                stream.clone_dtoh(&spec.logits)?
+                stream.clone_dtoh(&spec.logits.slice(..rows * self.config.vocab_size))?
             } else {
                 stream.clone_dtoh(&self.work.logits.slice(..self.config.vocab_size))?
             };
@@ -347,6 +354,36 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(in crate::backend::cuda::engine) fn set_moe_verify_rows(
+        &mut self,
+        rows: usize,
+    ) -> Result<()> {
+        let max_rows = self
+            .spec
+            .as_ref()
+            .context("MoE chain missing")?
+            .draft
+            .config
+            .verify_rows()?;
+        ensure!(
+            (2..=max_rows).contains(&rows),
+            "MoE verify_rows={rows} outside 2..={max_rows}"
+        );
+        if let Some(spec) = self.spec.as_mut() {
+            if spec.verify_rows == rows {
+                return Ok(());
+            }
+            spec.verify_rows = rows;
+            spec.verify_graph = None;
+        }
+        if let Some(decode) = self.moe.as_mut() {
+            decode.segments.clear();
+        }
+        let closure = self.closure.clone();
+        closure.with_test_recapture(|| self.capture_moe())
+    }
+
     pub(in crate::backend::cuda::engine) fn has_moe_segments(&self) -> bool {
         self.moe.as_ref().is_some_and(|decode| {
             decode.segments.len() == self.model_spec.layers.len() && !decode.segments.is_empty()
@@ -356,10 +393,9 @@ impl Engine {
     pub(in crate::backend::cuda::engine) fn run_moe_graph(&mut self) -> Result<()> {
         let mut decode = self.moe.take().context("MoE graph executor missing")?;
         let mut slots = self.moe_slots.take().context("MoE graph slots missing")?;
-        let rows = if self.spec.is_some() {
-            decode.max_rows
-        } else {
-            1
+        let rows = match &self.spec {
+            Some(spec) => spec.verify_rows,
+            None => 1,
         };
         let mut token_open = false;
         let result = (|| -> Result<()> {

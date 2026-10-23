@@ -503,6 +503,32 @@ impl StateStore {
     }
 }
 
+pub(crate) struct GdnVerifyInput {
+    pub qkv: CudaSlice<bf16>,
+    pub ab: CudaSlice<bf16>,
+}
+impl GdnVerifyInput {
+    pub fn new(spec: &GdnSpec, slots: usize, stream: &Arc<CudaStream>) -> Result<Self> {
+        let conv_dim = usize::try_from(spec.conv_dim()?)?;
+        let ab_width = usize::try_from(spec.hv)?
+            .checked_mul(2)
+            .context("GDN verify input ab width overflow")?;
+        let qkv_elems = slots
+            .checked_mul(conv_dim)
+            .context("GDN verify input qkv extent overflow")?;
+        let ab_elems = slots
+            .checked_mul(ab_width)
+            .context("GDN verify input ab extent overflow")?;
+        Ok(Self {
+            qkv: stream.alloc_zeros(qkv_elems)?,
+            ab: stream.alloc_zeros(ab_elems)?,
+        })
+    }
+    pub fn bytes(&self) -> usize {
+        (self.qkv.len() + self.ab.len()) * std::mem::size_of::<bf16>()
+    }
+}
+
 /// Preallocated snapshot for capture/warmup. Only the KV slots that can be written
 /// are copied; every recurrent state/history element is copied.
 pub(crate) struct StateCheckpoint {
@@ -606,13 +632,24 @@ impl StateCheckpoint {
         stream: &Arc<CudaStream>,
         validation: Option<(&CudaFunction, Tensor<u32, 1>)>,
     ) -> Result<()> {
+        self.save_rows(store, token, prefix, self.rows, stream, validation)
+    }
+    pub fn save_rows(
+        &mut self,
+        store: &StateStore,
+        token: &CudaSlice<u32>,
+        prefix: usize,
+        rows: usize,
+        stream: &Arc<CudaStream>,
+        validation: Option<(&CudaFunction, Tensor<u32, 1>)>,
+    ) -> Result<()> {
         self.valid = false;
         self.check(store)?;
         ensure!(
-            token.len() == 1 && prefix < self.capacity,
+            rows > 0 && rows <= self.rows && token.len() == 1 && prefix < self.capacity,
             "checkpoint writes exceed capacity"
         );
-        let active_rows = self.rows.min(self.capacity - prefix);
+        let active_rows = rows.min(self.capacity - prefix);
         if let Some(seq) = &store.sequence {
             ensure!(seq.len() == 8, "checkpoint sequence extent mismatch");
             if let Some((check, flag)) = validation {
@@ -625,7 +662,7 @@ impl StateCheckpoint {
                         .arg(seq)
                         .arg(&(prefix as i32))
                         .arg(&(self.capacity as i32))
-                        .arg(&(self.rows as i32))
+                        .arg(&(rows as i32))
                         .arg(&flag_ptr)
                         .launch(super::ops::grid(1, 1))
                         .context("checkpoint sequence-check launch")?;
@@ -644,7 +681,7 @@ impl StateCheckpoint {
                     causal: host[4],
                     reserved: [host[5], host[6], host[7]],
                 }
-                .validate(store.capacity, self.rows as u32)?;
+                .validate(store.capacity, rows as u32)?;
             }
         }
         for (src, dst) in store.gdn.iter().zip(&mut self.gdn) {
@@ -738,6 +775,7 @@ impl StateCheckpoint {
         stream.memcpy_dtod(&self.token, token)?;
         Ok(())
     }
+    #[cfg(test)]
     pub(super) fn select_prefix(
         &self,
         store: &mut StateStore,
@@ -786,6 +824,27 @@ impl StateCheckpoint {
             }
         }
         self.restore_kv_rows(store, accepted, stream)
+    }
+    pub(super) fn restore_for_replay(
+        &self,
+        store: &mut StateStore,
+        committed: usize,
+        stream: &Arc<CudaStream>,
+    ) -> Result<()> {
+        ensure!(self.valid, "checkpoint has no valid snapshot");
+        self.check(store)?;
+        ensure!(
+            committed <= self.active_rows,
+            "checkpoint committed={committed} exceeds active_rows={}",
+            self.active_rows
+        );
+        if committed < self.active_rows {
+            for (saved, state) in self.gdn.iter().zip(&mut store.gdn) {
+                stream.memcpy_dtod(&saved.s, &mut state.s)?;
+                stream.memcpy_dtod(&saved.history, &mut state.history)?;
+            }
+        }
+        self.restore_kv_rows(store, committed, stream)
     }
     fn restore_kv_rows(
         &self,

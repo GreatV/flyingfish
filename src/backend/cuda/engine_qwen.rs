@@ -165,6 +165,7 @@ enum BoundMixer {
         norm: Tensor<bf16, 1>,
         prefill: PrefillPlans<GdnPlan>,
         verify: Vec<GdnPlan>,
+        replay: Vec<GdnPlan>,
         decode: Box<GdnPlan>,
     },
 }
@@ -639,6 +640,7 @@ impl Runtime {
                             |plan, rows| plan.for_rows(rows, None),
                         )?,
                         verify: Vec::new(),
+                        replay: Vec::new(),
                         decode: Box::new(bind(1)?),
                     }
                 }
@@ -847,6 +849,80 @@ impl Engine {
             }
         }
         ensure!(states.next().is_none(), "extra GDN snapshot allocation");
+        Ok(())
+    }
+
+    pub(super) fn bind_gdn_verify_inputs(&mut self, verify_rows: usize) -> Result<()> {
+        let q = self.qwen.as_mut().context("Q38 runtime missing")?;
+        let inputs = &self.spec.as_ref().context("MoE chain missing")?.gdn_inputs;
+        let stream = &self.device.stream;
+        let g = q.gdn;
+        let cd = g.conv_dim()? as usize;
+        let hv = g.hv as usize;
+        ensure!(
+            (2..=g.snapshot_limit()? as usize).contains(&verify_rows),
+            "GDN hv={} verify_rows={verify_rows} exceeds snapshot bound={}",
+            g.hv,
+            g.snapshot_limit()?
+        );
+        let slots = verify_rows - 1;
+        let mut items = inputs.iter();
+        for layer in &mut q.layers {
+            if let BoundMixer::Gdn {
+                prefill,
+                verify,
+                replay,
+                ..
+            } = &mut layer.mixer
+            {
+                let input = items
+                    .next()
+                    .context("missing GDN verify input allocation")?;
+                ensure!(
+                    input.qkv.len() == slots * cd && input.ab.len() == slots * 2 * hv,
+                    "GDN verify input storage hv={} rows={verify_rows} slots={slots} qkv={} ab={}",
+                    g.hv,
+                    input.qkv.len(),
+                    input.ab.len()
+                );
+                let qkv = matrix(&input.qkv, stream, 0, slots, cd)?;
+                let a = matrix(&input.ab, stream, 0, slots, hv)?;
+                let b = matrix(&input.ab, stream, slots * hv, slots, hv)?;
+                *verify = (1..=verify_rows)
+                    .map(|rows| prefill.full.for_verify(rows as u32, None, None))
+                    .collect::<Result<_>>()?;
+                *replay = (1..=slots)
+                    .map(|rows| {
+                        prefill
+                            .full
+                            .for_verify(rows as u32, Some((qkv, a, b)), None)
+                    })
+                    .collect::<Result<_>>()?;
+            }
+        }
+        ensure!(items.next().is_none(), "extra GDN verify input allocation");
+        Ok(())
+    }
+
+    pub(super) fn replay_gdn_prefix(&mut self, start: usize, committed: usize) -> Result<()> {
+        ensure!(committed > 0, "GDN replay requires committed > 0");
+        let s = &self.device.stream;
+        self.state.set_sequence(
+            s,
+            start as u32,
+            committed as u32,
+            self.workspace_rows as u32,
+        )?;
+        let meta = self.state.seq_ref(s)?;
+        let q = self.qwen.as_ref().context("Q38 runtime missing")?;
+        for layer in &q.layers {
+            if let BoundMixer::Gdn { replay, .. } = &layer.mixer {
+                let plan = replay
+                    .get(committed - 1)
+                    .context("GDN replay plan missing")?;
+                GdnOps::run_verify(plan, s, meta, scratch(&q.scratch, s))?;
+            }
+        }
         Ok(())
     }
 
@@ -1494,9 +1570,8 @@ impl Engine {
             );
         }
         if let Some(draft) = draft {
-            let spec = Spec::new(draft, &engine)?;
-            engine.bind_gdn_snapshots(&spec.snapshots, verify_rows)?;
-            engine.spec = Some(spec);
+            engine.spec = Some(Spec::new(draft, &engine)?);
+            engine.bind_gdn_verify_inputs(verify_rows)?;
         }
         if let Some(setup) = expert_setup {
             setup.bind(&mut engine)?;
@@ -2072,6 +2147,7 @@ impl Engine {
                 prefill,
                 verify,
                 decode,
+                ..
             } => {
                 let spec = gdn;
                 let conv = conv_width as usize;
@@ -2095,6 +2171,33 @@ impl Engine {
                         matrix(&w.n, s, 0, linear_rows, hidden)?,
                         &mut TensorMut(matrix(output, s, offset, linear_rows, width)?),
                     )?;
+                }
+                if self.qwen_device_prefix
+                    && let Some(spec_state) = self.spec.as_mut()
+                {
+                    let gdn_idx = self.model_spec.layers[i].state_index as usize;
+                    let input = spec_state
+                        .gdn_inputs
+                        .get_mut(gdn_idx)
+                        .context("GDN verify input slot missing")?;
+                    let slots = input.qkv.len() / conv;
+                    let capture_rows = rows.min(slots);
+                    if capture_rows > 0 {
+                        s.memcpy_dtod(
+                            &w.qkv.slice(..capture_rows * conv),
+                            &mut input.qkv.slice_mut(..capture_rows * conv),
+                        )?;
+                        s.memcpy_dtod(
+                            &mw.ab.slice(..capture_rows * hv),
+                            &mut input.ab.slice_mut(..capture_rows * hv),
+                        )?;
+                        s.memcpy_dtod(
+                            &mw.ab.slice(
+                                self.workspace_rows * hv..(self.workspace_rows + capture_rows) * hv,
+                            ),
+                            &mut input.ab.slice_mut(slots * hv..(slots + capture_rows) * hv),
+                        )?;
+                    }
                 }
                 let narrowed;
                 let plan: &GdnPlan = if self.qwen_device_prefix {
@@ -2442,8 +2545,9 @@ impl Engine {
                         .as_mut()
                         .context("MoE all-row head requires draft state")?;
                     ensure!(
-                        self.model_spec.moe.is_some() && rows == spec.draft.config.verify_rows()?,
-                        "all-row head rows={rows} differs from the loaded MoE verification extent"
+                        self.model_spec.moe.is_some()
+                            && (1..=spec.draft.config.verify_rows()?).contains(&rows),
+                        "all-row head rows={rows} outside the loaded MoE verification extent"
                     );
                     self.blas.linear_typed(
                         phase,

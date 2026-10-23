@@ -465,6 +465,13 @@ impl Closure {
         );
         Ok(())
     }
+    #[cfg(test)]
+    pub(super) fn with_test_recapture<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let prev = self.stage.replace(Stage::Frozen);
+        let result = f();
+        self.stage.set(prev);
+        result
+    }
 }
 
 #[cfg(test)]

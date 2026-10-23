@@ -306,6 +306,14 @@ impl GdnSpec {
             .checked_add(self.history_bytes()?)
             .context("GDN state image byte overflow")
     }
+    pub fn input_row_bytes(&self) -> Result<u64> {
+        self.validate()?;
+        let ab = mul(u64::from(self.hv), 2)?;
+        let elems = u64::from(self.conv_dim()?)
+            .checked_add(ab)
+            .context("GDN verify input width overflow")?;
+        mul(elems, 2)
+    }
 }
 
 #[cfg(test)]
