@@ -94,6 +94,8 @@ impl Rules {
     }
 }
 
+pub const DEFAULT_MOE_VERIFY_ROWS: usize = 3;
+
 impl DraftConfig {
     pub fn verify_rows(&self) -> Result<usize> {
         self.block_size
@@ -129,13 +131,13 @@ impl DraftConfig {
             .iter()
             .filter(|layer| layer.mixer == crate::model_spec::Mixer::Gdn)
             .count();
-        let images =
-            usize::try_from(crate::op_contract::GdnSpec::from_model(spec)?.image_bytes()?)?
+        let replay_inputs =
+            usize::try_from(crate::op_contract::GdnSpec::from_model(spec)?.input_row_bytes()?)?
                 .checked_mul(layers)
                 .and_then(|n| n.checked_mul(rows - 1))
-                .context("DSpark intermediate GDN snapshots overflow")?;
+                .context("DSpark GDN replay input overflow")?;
         crate::mtp::checkpoint_bytes(spec, rows)?
-            .checked_add(images)
+            .checked_add(replay_inputs)
             .context("DSpark target transaction byte overflow")
     }
     pub fn capture_width(&self) -> usize {
@@ -581,22 +583,37 @@ mod tests {
                 crate::prefill::WorkspaceBudget::new(row_request, |_| Ok(0), Ok).is_err(),
                 "draft rows escaped the workspace budget"
             );
-            ensure!(
-                draft.target_state_bytes(&model)? == 1_054_146_596,
-                "block15 transaction must retain 30 GDN checkpoint+15 prefix images and 16 KV write slots for 10 attention layers"
-            );
+            let verify_rows = draft.target_rows(&model)?;
+            let gdn_layers = model
+                .layers
+                .iter()
+                .filter(|layer| layer.mixer == crate::model_spec::Mixer::Gdn)
+                .count();
+            let gdn = crate::op_contract::GdnSpec::from_model(&model)?;
+            let checkpoint = crate::mtp::checkpoint_bytes(&model, verify_rows)?;
+            let replay_inputs =
+                usize::try_from(gdn.input_row_bytes()?)? * gdn_layers * (verify_rows - 1);
+            let snapshot_images =
+                usize::try_from(gdn.image_bytes()?)? * gdn_layers * (verify_rows - 1);
+            let expected_state_bytes = checkpoint + replay_inputs;
+            let legacy_state_bytes = checkpoint + snapshot_images;
             let state_bytes = draft.target_state_bytes(&model)?;
+            ensure!(
+                state_bytes == expected_state_bytes && state_bytes < legacy_state_bytes,
+                "block15 transaction must retain base GDN checkpoint, 15 replay input rows and 16 KV write slots"
+            );
             let geometry = crate::experts::catalogue::ExpertGeometry::from_model(&model)?;
             let slot_bytes = crate::experts::catalogue::ExpertLayout::new(
                 crate::model_spec::ExpertFormat::Bf16,
                 &geometry,
             )?
             .slot_bytes();
+            let base_reserve = usize::try_from(u64::from(geometry.layers + 2) * slot_bytes)?;
             let request = crate::prefill::ExpertWorkspaceRequest {
                 mixer: crate::prefill::WorkspaceRequest {
                     capacity: 16,
                     requested: Some(16),
-                    free_after_resident: state_bytes / 2,
+                    free_after_resident: base_reserve + state_bytes / 2,
                     total: 24 << 30,
                     alignment: 1,
                     row_bytes: model.hidden as usize * size_of::<half::bf16>(),
@@ -629,6 +646,102 @@ mod tests {
                 budget(reserved).is_err(),
                 "snapshot reserve escaped expert admission"
             );
+            let service = crate::experts::plan::ServiceTable::new(
+                "test",
+                vec![
+                    crate::experts::plan::ServiceCell {
+                        workers: 8,
+                        rows: 1,
+                        experts: 1,
+                        seconds: 0.001,
+                    },
+                    crate::experts::plan::ServiceCell {
+                        workers: 8,
+                        rows: 1,
+                        experts: geometry.experts,
+                        seconds: 0.02,
+                    },
+                ],
+            )?;
+            for format in [
+                crate::model_spec::ExpertFormat::Bf16,
+                crate::model_spec::ExpertFormat::Fp8W8a16,
+            ] {
+                let layout = crate::experts::catalogue::ExpertLayout::new(format, &geometry)?;
+                let format_slot_bytes = layout.slot_bytes();
+                let free_bytes =
+                    usize::try_from(u64::from(geometry.layers + 2) * format_slot_bytes)?
+                        + legacy_state_bytes * 2;
+                let mut replay_req = request;
+                replay_req.mixer.free_after_resident = free_bytes;
+                replay_req.mixer.fixed_transient_bytes = state_bytes;
+                let mut legacy_req = replay_req;
+                legacy_req.mixer.fixed_transient_bytes = legacy_state_bytes;
+                let replay_budget = crate::prefill::ExpertWorkspaceBudget::new(
+                    replay_req,
+                    geometry,
+                    format_slot_bytes,
+                    |_| Ok(0),
+                    Ok,
+                )?;
+                let legacy_budget = crate::prefill::ExpertWorkspaceBudget::new(
+                    legacy_req,
+                    geometry,
+                    format_slot_bytes,
+                    |_| Ok(0),
+                    Ok,
+                )?;
+                let select_slots = |b: crate::prefill::ExpertWorkspaceBudget| -> Result<u32> {
+                    let reserves = b.candidate.reserves;
+                    let span_rows = b.candidate.span_rows;
+                    let wave_rows = b.candidate.wave_rows;
+                    Ok(crate::prefill::ExpertWorkspaceBudget::select(
+                        &crate::experts::plan::PlanInputs {
+                            geometry,
+                            layout: layout.clone(),
+                            device_free_bytes: free_bytes as u64,
+                            host_available_bytes: 64 << 30,
+                            h2d_bytes_per_second: 24e9,
+                            d2h_bytes_per_second: 24e9,
+                            copy_engines: 2,
+                            disk_readers: 2,
+                            host_registration_bytes: 64 << 30,
+                            service: &service,
+                            reserves: &reserves,
+                            span_rows,
+                            wave_rows,
+                        },
+                        16,
+                        &[b],
+                    )?
+                    .1
+                    .slots_total())
+                };
+                let replay_persistent = replay_budget
+                    .candidate
+                    .reserves
+                    .persistent_bytes(format_slot_bytes)?;
+                let legacy_persistent = legacy_budget
+                    .candidate
+                    .reserves
+                    .persistent_bytes(format_slot_bytes)?;
+                let replay_slots = select_slots(replay_budget)?;
+                let legacy_slots = select_slots(legacy_budget)?;
+                let expected_replay_slots =
+                    u32::try_from((free_bytes as u64 - replay_persistent) / format_slot_bytes)?;
+                let expected_legacy_slots =
+                    u32::try_from((free_bytes as u64 - legacy_persistent) / format_slot_bytes)?;
+                let delta_bytes = (legacy_state_bytes - state_bytes) as u64;
+                let min_extra = u32::try_from(delta_bytes / format_slot_bytes)?;
+                let max_extra = u32::try_from(delta_bytes.div_ceil(format_slot_bytes))?;
+                ensure!(
+                    replay_slots == expected_replay_slots
+                        && legacy_slots == expected_legacy_slots
+                        && (min_extra..=max_extra).contains(&(replay_slots - legacy_slots))
+                        && min_extra > 0,
+                    "planner slot gain mismatch for {format:?}: replay={replay_slots} legacy={legacy_slots}"
+                );
+            }
             let mut invalid_rows = DraftConfig::read(&root, &hybrid_target)?;
             for block in [0, crate::linear_plan::MAX_SKINNY_ROWS, usize::MAX] {
                 invalid_rows.block_size = block;

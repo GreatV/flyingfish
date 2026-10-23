@@ -347,6 +347,7 @@ struct Spec {
     inject_graphs: Vec<Option<CudaGraph>>,
     tree: Option<super::tree::State>,
     tree_attention: Option<super::verification::Verification>,
+    verify_rows: usize,
     active_rows: usize,
     graph: bool,
     verification: Option<super::verification::Verification>,
@@ -355,7 +356,7 @@ struct Spec {
     predictions: CudaSlice<u32>,
     row_counts: CudaSlice<i32>,
     checkpoint: Option<super::state::StateCheckpoint>,
-    snapshots: Vec<super::state::GdnState>,
+    gdn_inputs: Vec<super::state::GdnVerifyInput>,
 }
 
 #[derive(Clone, Copy)]
@@ -366,10 +367,10 @@ enum SpecPhase {
 }
 
 impl SpecPhase {
-    fn rows(self, draft: &crate::dspark::DraftConfig) -> Result<usize> {
+    fn rows(self, spec: &Spec) -> Result<usize> {
         match self {
-            Self::Draft => Ok(draft.block_size),
-            Self::Verify => draft.verify_rows(),
+            Self::Draft => Ok(spec.draft.config.block_size),
+            Self::Verify => Ok(spec.verify_rows),
             Self::Inject(rows) => Ok(rows),
         }
     }
@@ -408,17 +409,13 @@ impl Spec {
                 super::state::StateCheckpoint::new(&engine.state, &engine.model_spec, rows, stream)
             })
             .transpose()?;
-        let snapshots = if checkpoint.is_some() {
+        let gdn_inputs = if checkpoint.is_some() {
+            let gdn_spec = crate::op_contract::GdnSpec::from_model(&engine.model_spec)?;
             engine
                 .state
                 .gdn
                 .iter()
-                .map(|live| {
-                    Ok(super::state::GdnState {
-                        s: stream.alloc_zeros((rows - 1) * live.s.len())?,
-                        history: stream.alloc_zeros((rows - 1) * live.history.len())?,
-                    })
-                })
+                .map(|_| super::state::GdnVerifyInput::new(&gdn_spec, rows - 1, stream))
                 .collect::<Result<Vec<_>>>()?
         } else {
             Vec::new()
@@ -442,6 +439,11 @@ impl Spec {
                 None
             },
             tree_attention: None,
+            verify_rows: if engine.model_spec.moe.is_some() {
+                crate::dspark::DEFAULT_MOE_VERIFY_ROWS.min(verify_rows)
+            } else {
+                verify_rows
+            },
             active_rows: 0,
             graph: engine.spec_graph,
             draft_graph: None,
@@ -453,14 +455,14 @@ impl Spec {
             predictions: stream.alloc_zeros(rows)?,
             row_counts,
             checkpoint,
-            snapshots,
+            gdn_inputs,
         };
         if let Some(checkpoint) = &spec.checkpoint {
             let actual = checkpoint.bytes()
                 + spec
-                    .snapshots
+                    .gdn_inputs
                     .iter()
-                    .map(|image| (image.s.len() + image.history.len()) * size_of::<f32>())
+                    .map(super::state::GdnVerifyInput::bytes)
                     .sum::<usize>();
             let planned = spec.draft.config.target_state_bytes(&engine.model_spec)?;
             ensure!(
@@ -1401,9 +1403,7 @@ impl Engine {
                         .spec
                         .as_ref()
                         .context("causal verification requires draft geometry")?
-                        .draft
-                        .config
-                        .verify_rows()?,
+                        .verify_rows,
                 "causal all-row verification rows={} differs from the loaded chain geometry",
                 step.rows
             );
@@ -3019,8 +3019,8 @@ impl Engine {
         let spec = self.spec.as_mut().context("draft state is not enabled")?;
         if self.qwen.is_some() {
             ensure!(
-                spec.checkpoint.is_some() && spec.snapshots.len() == self.state.gdn.len(),
-                "MoE verification lacks transaction state or recurrent prefix images"
+                spec.checkpoint.is_some() && spec.gdn_inputs.len() == self.state.gdn.len(),
+                "MoE verification lacks transaction state or recurrent replay inputs"
             );
             return Ok(());
         }
@@ -3544,14 +3544,7 @@ impl Engine {
     }
 
     fn run_spec_device(&mut self, phase: SpecPhase, start: usize) -> Result<()> {
-        let rows = phase.rows(
-            &self
-                .spec
-                .as_ref()
-                .context("draft is not enabled")?
-                .draft
-                .config,
-        )?;
+        let rows = phase.rows(self.spec.as_ref().context("draft is not enabled")?)?;
         match phase {
             SpecPhase::Draft => {
                 self.spec
@@ -3631,14 +3624,7 @@ impl Engine {
             );
             return Ok(());
         }
-        let rows = phase.rows(
-            &self
-                .spec
-                .as_ref()
-                .context("draft is not enabled")?
-                .draft
-                .config,
-        )?;
+        let rows = phase.rows(self.spec.as_ref().context("draft is not enabled")?)?;
         if self
             .spec
             .as_mut()
@@ -3696,13 +3682,7 @@ impl Engine {
 
     fn launch_spec_graph(&mut self, phase: SpecPhase) -> Result<()> {
         if self.model_spec.moe.is_some() && matches!(phase, SpecPhase::Verify) {
-            let rows = self
-                .spec
-                .as_ref()
-                .context("MoE chain missing")?
-                .draft
-                .config
-                .verify_rows()?;
+            let rows = self.spec.as_ref().context("MoE chain missing")?.verify_rows;
             self.state.set_sequence(
                 &self.device.stream,
                 self.position as u32,
@@ -3719,7 +3699,7 @@ impl Engine {
             .context("spec Graph has not been captured")?
             .launch()?;
         if matches!(phase, SpecPhase::Verify) {
-            spec.active_rows = phase.rows(&spec.draft.config)?;
+            spec.active_rows = phase.rows(spec)?;
         }
         Ok(())
     }
@@ -3808,7 +3788,7 @@ impl Engine {
                 .spec
                 .as_mut()
                 .context("MoE chain requires a loaded draft")?;
-            let rows = spec.draft.config.verify_rows()?;
+            let rows = spec.verify_rows;
             ensure!(
                 limit > 0
                     && !self.spec_budget.is_tree()
@@ -3822,10 +3802,11 @@ impl Engine {
             spec.checkpoint
                 .as_mut()
                 .context("MoE chain checkpoint missing")?
-                .save(
+                .save_rows(
                     &self.state,
                     &self.work.token,
                     origin,
+                    rows,
                     &self.device.stream,
                     None,
                 )?;
@@ -3853,9 +3834,7 @@ impl Engine {
                 .spec
                 .as_ref()
                 .context("draft is not enabled")?
-                .draft
-                .config
-                .verify_rows()?;
+                .verify_rows;
             ensure!(limit > 0, "spec round output limit must be positive");
             ensure!(
                 self.position
@@ -3932,8 +3911,10 @@ impl Engine {
                 forced_applied = true;
                 forced
             } else {
-                proposals
+                proposals[..rows - 1].to_vec()
             };
+            #[cfg(not(test))]
+            let proposals = proposals[..rows - 1].to_vec();
             self.device.stream.synchronize()?;
             let draft_ms = draft_start.elapsed().as_secs_f64() * 1000.0;
             drop(draft_range);
@@ -3976,7 +3957,8 @@ impl Engine {
                     .spec
                     .as_ref()
                     .context("draft is not enabled")?
-                    .predictions,
+                    .predictions
+                    .slice(..rows),
             )?;
             let verify_ms = verify_start.elapsed().as_secs_f64() * 1000.0;
             drop(verify_range);
@@ -4028,8 +4010,12 @@ impl Engine {
                 spec.checkpoint
                     .as_ref()
                     .context("MoE chain checkpoint missing")?
-                    .select_prefix(&mut self.state, &spec.snapshots, committed, s)?;
+                    .restore_for_replay(&mut self.state, committed, s)?;
                 spec.draft.restore_kv(start, committed)?;
+                if committed < rows {
+                    self.replay_gdn_prefix(start, committed)?;
+                }
+                let s = &self.device.stream;
                 self.state.set_sequence(
                     s,
                     (start + committed - 1) as u32,
@@ -4587,15 +4573,13 @@ impl Engine {
                     super::calibrate::cache_path(&self.runtime, &key, bucket, self.capacity)
                 }
                 Kind::Draft | Kind::Verify | Kind::Tree => {
-                    let draft = &self
+                    let spec = self
                         .spec
                         .as_ref()
-                        .context("attention calibration requires draft geometry")?
-                        .draft
-                        .config;
+                        .context("attention calibration requires draft geometry")?;
                     let rows = match kind {
-                        Kind::Draft => SpecPhase::Draft.rows(draft)?,
-                        Kind::Verify => SpecPhase::Verify.rows(draft)?,
+                        Kind::Draft => SpecPhase::Draft.rows(spec)?,
+                        Kind::Verify => SpecPhase::Verify.rows(spec)?,
                         Kind::Tree => self.spec_budget.rows(),
                         Kind::Decode => anyhow::bail!("decode attention has no multirow cache"),
                     };
