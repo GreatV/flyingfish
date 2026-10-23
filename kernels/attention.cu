@@ -447,6 +447,10 @@ extern "C" __global__ void flash_decode_sink_phase2(float* __restrict__ scratch,
   fd_sink_phase2_entry<DH>(scratch, o, sinks, *len_dev, chunk, n_q_heads);
 }
 
+extern "C" __global__ void flash_decode_set_length(int* __restrict__ length, int value) {
+  if (threadIdx.x == 0) *length = value;
+}
+
 #undef FD_P1_EXPORTS
 #undef FD_WINDOW_P1_EXPORTS
 #undef FD_GUARD

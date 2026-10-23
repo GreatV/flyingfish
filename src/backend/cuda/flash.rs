@@ -252,8 +252,8 @@ impl Flash {
             self.lse.len()
         );
         ensure!(
-            output.len() == rows * heads * 128,
-            "attention sink output extent differs"
+            output.len() >= rows * heads * 128,
+            "attention sink output extent is below rows*heads*128"
         );
         self.stream.context().bind_to_thread()?;
         let (lse, _lse) = self.lse.device_ptr(&self.stream);

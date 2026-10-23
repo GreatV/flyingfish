@@ -1250,31 +1250,60 @@ impl Engine {
                         span.hidden(&span.layout.normalized, *base as u32, *rows as u32)?,
                     )?;
                 }
-                let ffn = self.moe_ffn_binding(layer)?;
-                prefill.ffn(
-                    &self.device,
-                    slots,
-                    decode,
-                    layer as u32,
-                    admitted.len() as u32,
-                    ffn.clone(),
-                )?;
+                let dense = self.model_spec.layers[layer].ffn == crate::model_spec::FfnKind::Dense;
+                let ffn = if dense {
+                    None
+                } else {
+                    let ffn = self.moe_ffn_binding(layer)?;
+                    prefill.ffn(
+                        &self.device,
+                        slots,
+                        decode,
+                        layer as u32,
+                        admitted.len() as u32,
+                        ffn.clone(),
+                    )?;
+                    Some(ffn)
+                };
                 for base in (0..admitted.len()).step_by(prefill.capacity.wave_rows as usize) {
                     let rows = (prefill.capacity.wave_rows as usize).min(admitted.len() - base);
-                    prefill.finish_wave(
-                        &self.device,
-                        decode,
-                        ffn.clone(),
-                        base as u32,
-                        rows as u32,
-                        qwen::matrix(
-                            &self.work.out,
-                            &self.device.stream,
-                            0,
-                            rows,
-                            self.model_spec.hidden as usize,
-                        )?,
-                    )?;
+                    let step = self.moe_wave(span_start + base, rows)?;
+                    match &ffn {
+                        Some(ffn) => {
+                            prefill.finish_wave(
+                                &self.device,
+                                decode,
+                                ffn.clone(),
+                                base as u32,
+                                rows as u32,
+                                qwen::matrix(
+                                    &self.work.out,
+                                    &self.device.stream,
+                                    0,
+                                    rows,
+                                    self.model_spec.hidden as usize,
+                                )?,
+                            )?;
+                        }
+                        None => {
+                            let span = prefill
+                                .span
+                                .as_ref()
+                                .context("prefill dense FFN has no borrowed span")?;
+                            device_copy(
+                                &self.device.stream,
+                                span.hidden(&span.layout.normalized, base as u32, rows as u32)?,
+                                qwen::matrix(
+                                    &self.work.n,
+                                    &self.device.stream,
+                                    0,
+                                    rows,
+                                    self.model_spec.hidden as usize,
+                                )?,
+                            )?;
+                            self.run_ffn(layer, step, &mut None)?;
+                        }
+                    }
                     let span = prefill
                         .span
                         .as_ref()

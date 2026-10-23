@@ -100,6 +100,8 @@ pub(crate) struct MoePrefill<'a> {
     pub shared_up: Tensor<bf16, 2>,
     pub shared_down: Tensor<bf16, 2>,
     pub shared_expert_gate: Option<Tensor<bf16, 1>>,
+    pub contributions: Tensor<bf16, 3>,
+    pub done: TensorMut<u32, 2>,
     pub y: TensorMut<bf16, 2>,
 }
 

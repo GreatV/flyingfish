@@ -1011,6 +1011,7 @@ mod tests {
     #[test]
     fn packed_waves_cover_cohort_assignments_within_active_capacity() -> Result<()> {
         let geometry = ExpertGeometry {
+            first_layer: 0,
             layers: 1,
             experts: 256,
             hidden: 2048,
