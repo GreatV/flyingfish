@@ -1131,6 +1131,7 @@ impl Engine {
         after_chunk: &mut impl FnMut(&mut Self, &[u32]) -> Result<()>,
     ) -> Result<u32> {
         use crate::backend::Operator as O;
+        let flint = self.model_spec.architecture == crate::model_spec::Architecture::Flint;
         let (ids, waves) = input;
         let (mut trace, keep) = tracing;
         let start = self.position;
@@ -1224,6 +1225,19 @@ impl Engine {
                             self.model_spec.hidden as usize,
                         )?,
                     )?;
+                    if flint && layer > 0 {
+                        device_copy(
+                            &self.device.stream,
+                            span.hidden(&span.layout.normalized, *base as u32, *rows as u32)?,
+                            qwen::matrix(
+                                &self.work.n,
+                                &self.device.stream,
+                                0,
+                                *rows,
+                                self.model_spec.hidden as usize,
+                            )?,
+                        )?;
+                    }
                     let mut target = if *selected {
                         trace.as_deref_mut().map(|trace| Target {
                             trace,
@@ -1233,8 +1247,28 @@ impl Engine {
                     } else {
                         None
                     };
+                    if flint && layer > 0 {
+                        let all = target
+                            .as_ref()
+                            .is_some_and(|target| target.trace.all_layers);
+                        let name = if all {
+                            format!("{layer}.debug.norm1")
+                        } else {
+                            "debug.norm1".to_owned()
+                        };
+                        trace_value(
+                            &mut target,
+                            &self.device.stream,
+                            &name,
+                            &self.work.n,
+                            *rows,
+                            self.model_spec.hidden as usize,
+                        )?;
+                    }
                     self.qwen_layer_begin(layer, step)?;
-                    self.run_operator(O::Norm, layer, step, &mut target)?;
+                    if !(flint && layer > 0) {
+                        self.run_operator(O::Norm, layer, step, &mut target)?;
+                    }
                     self.qwen_mixer(layer, step, &mut target)?;
                     self.run_operator(O::PostNorm, layer, step, &mut target)?;
                     device_copy(
@@ -1278,6 +1312,12 @@ impl Engine {
                 };
                 for base in (0..admitted.len()).step_by(prefill.capacity.wave_rows as usize) {
                     let rows = (prefill.capacity.wave_rows as usize).min(admitted.len() - base);
+                    let (wave_base, _, mixer_skip, mixer_selected, prefix) = waves
+                        .iter()
+                        .find(|wave| base >= wave.0 && base < wave.0 + wave.1)
+                        .context("prefill residual trace wave is missing")?;
+                    let skip = mixer_skip.saturating_sub(base - wave_base).min(rows);
+                    let selected = *mixer_selected && skip < rows;
                     let step = self.moe_wave(span_start + base, rows)?;
                     match &ffn {
                         Some(ffn) => {
@@ -1341,17 +1381,21 @@ impl Engine {
                         )?,
                         span.hidden(&span.layout.normalized, base as u32, rows as u32)?,
                     )?;
-                    // SAFETY: the two owned dense row windows cover rows*hidden values on this stream.
-                    unsafe {
-                        self.device
-                            .stream
-                            .launch_builder(&self.ops.residual)
-                            .arg(&mut self.work.x)
-                            .arg(&self.work.out)
-                            .arg(&(i32::try_from(rows * self.model_spec.hidden as usize)?))
-                            .launch(super::super::super::super::ops::flat(
-                                rows * self.model_spec.hidden as usize,
-                            ))?;
+                    if flint {
+                        self.run_operator(O::NextNorm, layer, step, &mut None)?;
+                    } else {
+                        // SAFETY: the two owned dense row windows cover rows*hidden values on this stream.
+                        unsafe {
+                            self.device
+                                .stream
+                                .launch_builder(&self.ops.residual)
+                                .arg(&mut self.work.x)
+                                .arg(&self.work.out)
+                                .arg(&(i32::try_from(rows * self.model_spec.hidden as usize)?))
+                                .launch(super::super::super::super::ops::flat(
+                                    rows * self.model_spec.hidden as usize,
+                                ))?;
+                        }
                     }
                     if let Some(capture) = &mut self.hidden_capture
                         && let Some(slot) = capture.layer_slots[layer]
@@ -1381,43 +1425,25 @@ impl Engine {
                         )?,
                         span.hidden(&span.layout.residual, base as u32, rows as u32)?,
                     )?;
-                }
-                for (base, rows, skip, selected, prefix) in waves.iter() {
-                    if !selected {
-                        continue;
+                    if flint {
+                        device_copy(
+                            &self.device.stream,
+                            qwen::matrix(
+                                &self.work.n,
+                                &self.device.stream,
+                                0,
+                                rows,
+                                self.model_spec.hidden as usize,
+                            )?,
+                            span.hidden(&span.layout.normalized, base as u32, rows as u32)?,
+                        )?;
                     }
-                    let span = prefill
-                        .span
-                        .as_ref()
-                        .context("prefill trace has no borrowed span")?;
-                    device_copy(
-                        &self.device.stream,
-                        span.hidden(&span.layout.residual, *base as u32, *rows as u32)?,
-                        qwen::matrix(
-                            &self.work.x,
-                            &self.device.stream,
-                            0,
-                            *rows,
-                            self.model_spec.hidden as usize,
-                        )?,
-                    )?;
-                    device_copy(
-                        &self.device.stream,
-                        span.hidden(&span.layout.normalized, *base as u32, *rows as u32)?,
-                        qwen::matrix(
-                            &self.work.out,
-                            &self.device.stream,
-                            0,
-                            *rows,
-                            self.model_spec.hidden as usize,
-                        )?,
-                    )?;
-                    let mut target = trace.as_deref_mut().map(|trace| Target {
-                        trace,
-                        prefix,
-                        skip: *skip,
-                    });
-                    if target.is_some() {
+                    if selected {
+                        let mut target = trace.as_deref_mut().map(|trace| Target {
+                            trace,
+                            prefix,
+                            skip,
+                        });
                         let name = if all_layers {
                             format!("{layer}.ffn")
                         } else {
@@ -1428,11 +1454,9 @@ impl Engine {
                             &self.device.stream,
                             &name,
                             &self.work.out,
-                            *rows,
+                            rows,
                             self.model_spec.hidden as usize,
                         )?;
-                    }
-                    if target.is_some() {
                         let name = if all_layers {
                             layer.to_string()
                         } else {
@@ -1443,7 +1467,7 @@ impl Engine {
                             &self.device.stream,
                             &name,
                             &self.work.x,
-                            *rows,
+                            rows,
                             self.model_spec.hidden as usize,
                         )?;
                     }
@@ -1470,6 +1494,19 @@ impl Engine {
                         self.model_spec.hidden as usize,
                     )?,
                 )?;
+                if flint {
+                    device_copy(
+                        &self.device.stream,
+                        span.hidden(&span.layout.normalized, *base as u32, *rows as u32)?,
+                        qwen::matrix(
+                            &self.work.n,
+                            &self.device.stream,
+                            0,
+                            *rows,
+                            self.model_spec.hidden as usize,
+                        )?,
+                    )?;
+                }
                 if span_start + base + rows == end {
                     step.head = Head::Last;
                 }

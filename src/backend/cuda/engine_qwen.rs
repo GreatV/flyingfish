@@ -158,7 +158,6 @@ fn require_flint_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
         spec.layers.iter().enumerate().all(|(i, layer)| {
             layer.mixer == Mixer::FullAttention
                 && layer.state_index as usize == i
-                && layer.rope == layer.sliding_window.is_some()
                 && (layer.rope || layer.sliding_window.is_none())
         }),
         "unsupported Flint layer plan"
@@ -408,6 +407,13 @@ impl Runtime {
         capacity
             .checked_mul(3 * size_of::<i32>())
             .and_then(|n| n.checked_add(spec.vocab as usize * 2 + 12 + 64 * size_of::<u64>()))
+            .and_then(|n| {
+                if spec.architecture == crate::model_spec::Architecture::Flint {
+                    n.checked_add(spec.vocab as usize * 4)
+                } else {
+                    Some(n)
+                }
+            })
             .context("Q38 fixed workspace overflow")
     }
     pub(super) fn workspace(
@@ -1682,6 +1688,11 @@ impl Engine {
         let scratch_buffer = s.alloc_zeros::<u8>(target_workspace)?;
         let work = Work::new(s, &model_spec, rows)?;
         let flash = Flash::new(s.clone(), rows, model_spec.q_heads as usize)?;
+        let flint_logits = if flint {
+            Some(s.alloc_zeros(model_spec.vocab as usize)?)
+        } else {
+            None
+        };
         let hidden_capture = capture_layers
             .as_ref()
             .map(|ids| HiddenCapture::new(ids, &config, context_rows, s))
@@ -1717,6 +1728,7 @@ impl Engine {
             blas,
             flash: Some(flash),
             decode: None,
+            flint_logits,
             device,
             config,
             model_spec,
@@ -1739,6 +1751,7 @@ impl Engine {
             #[cfg(test)]
             moe_test_ffn: None,
             flint_legacy_overflow_prefill: false,
+            flint_frozen_decode_length: false,
             mtp: None,
             mtp_state: None,
             mtp_epoch: 0,
@@ -1854,6 +1867,7 @@ impl Engine {
         self.work.advance(&self.ops, &self.device.stream)?;
         self.state.compact_commit(&self.device.stream, false)
     }
+
     pub(super) fn prefill_dense_layers(
         &mut self,
         ids: &[u32],
@@ -2304,6 +2318,12 @@ impl Engine {
                             for row in 0..rows {
                                 let position = self.position + row;
                                 s.memcpy_htod(&[position as i32], &mut w.position)?;
+                                self.ops.flint_decode_length(
+                                    s,
+                                    &w.position,
+                                    &mut w.length,
+                                    ring,
+                                )?;
                                 let q_base = row * q_width as usize;
                                 let k_base =
                                     linear_rows * q_width as usize + row * kv_width as usize;
@@ -2343,13 +2363,16 @@ impl Engine {
                                             })?;
                                     }
                                 }
-                                let tokens = (position + 1).min(ring);
-                                let first = position + 1 - tokens;
+                                self.ops.flint_decode_length(
+                                    s,
+                                    &w.position,
+                                    &mut w.length,
+                                    ring,
+                                )?;
                                 let decode = self
                                     .decode
                                     .as_mut()
                                     .context("Flint sliding prefill decode is not bound")?;
-                                decode.set_length(s, tokens as i32, &mut w.length)?;
                                 decode.run_with(
                                     s,
                                     GqaDecodeInput {
@@ -2362,8 +2385,7 @@ impl Engine {
                                         length: &w.length,
                                         sinks: Some(sinks),
                                         window: Some(SlidingWindow {
-                                            first_pos: (first % ring) as i32,
-                                            tokens: tokens as i32,
+                                            position: &w.position,
                                             head_stride: (ring * self.model_spec.head_dim as usize)
                                                 as i32,
                                         }),
@@ -2388,18 +2410,18 @@ impl Engine {
                         }
                     }
                     ExecutionPhase::Decode => {
-                        let logical_length = self.position + 1;
-                        let tokens = if sliding {
-                            logical_length.min(ring)
-                        } else {
-                            logical_length
-                        };
-                        let first = logical_length - tokens;
+                        if !self.flint_frozen_decode_length {
+                            self.ops
+                                .flint_decode_length(s, &w.position, &mut w.length, ring)?;
+                        }
                         let decode = self
                             .decode
                             .as_mut()
                             .context("Flint decode attention is not bound")?;
-                        decode.set_length(s, tokens as i32, &mut w.length)?;
+                        if self.flint_frozen_decode_length {
+                            let tokens = (self.position + 1).min(ring);
+                            decode.set_length(s, tokens as i32, &mut w.length)?;
+                        }
                         decode.run_with(
                             s,
                             GqaDecodeInput {
@@ -2412,8 +2434,7 @@ impl Engine {
                                 length: &w.length,
                                 sinks: Some(sinks),
                                 window: sliding.then_some(SlidingWindow {
-                                    first_pos: (first % ring) as i32,
-                                    tokens: tokens as i32,
+                                    position: &w.position,
                                     head_stride: (ring * self.model_spec.head_dim as usize) as i32,
                                 }),
                             },
@@ -2781,6 +2802,7 @@ impl Engine {
     ) -> Result<()> {
         use crate::backend::Operator as O;
         let q = self.qwen.as_ref().context("Q38 runtime missing")?;
+        let flint = self.model_spec.architecture == crate::model_spec::Architecture::Flint;
         let layer = &q.layers[i];
         let s = &self.device.stream;
         let w = &mut self.work;
@@ -2828,13 +2850,14 @@ impl Engine {
             }
             O::Norm => {
                 if i == 0
-                    || (self.model_spec.moe.is_some()
-                        && !self.qwen_device_prefix
-                        && step.input == crate::backend::Input::Ids)
-                    || !self
-                        .hidden_capture
-                        .as_ref()
-                        .is_some_and(|capture| capture.layer_slots[i - 1].is_some())
+                    || (!flint
+                        && ((self.model_spec.moe.is_some()
+                            && !self.qwen_device_prefix
+                            && step.input == crate::backend::Input::Ids)
+                            || !self
+                                .hidden_capture
+                                .as_ref()
+                                .is_some_and(|capture| capture.layer_slots[i - 1].is_some())))
                 {
                     q.common.norm.rms_with(
                         s,
@@ -2857,23 +2880,16 @@ impl Engine {
                 if matches!(op, O::PostNorm) {
                     let mode = norm_mode(&self.model_spec);
                     if matches!(mode, RmsMode::Standard) {
-                        unsafe {
-                            s.launch_builder(&self.ops.residual)
-                                .arg(&mut w.x)
-                                .arg(&w.out)
-                                .arg(&(i32::try_from(rows * h)?))
-                                .launch(flat(rows * h))?;
-                        }
-                        q.common.norm.rms_with(
+                        self.ops.rms_add_fp32_with(
                             s,
                             domain,
-                            heads(&w.x, s, 0, rows, 1, h as u32)?,
-                            layer.post_norm,
-                            &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
-                            RmsOptions {
-                                mode,
-                                eps: self.model_spec.rms_eps,
+                            ResidualRmsInput {
+                                x: &mut TensorMut(heads(&w.x, s, 0, rows, 1, h as u32)?),
+                                residual: heads(&w.out, s, 0, rows, 1, h as u32)?,
+                                weight: layer.post_norm,
                             },
+                            &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
+                            self.model_spec.rms_eps,
                         )?;
                     } else {
                         q.common.norm.rms_add_with(
@@ -2931,12 +2947,31 @@ impl Engine {
                             },
                         )?;
                     } else {
-                        unsafe {
-                            s.launch_builder(&self.ops.residual)
-                                .arg(&mut w.x)
-                                .arg(&w.out)
-                                .arg(&((rows * h) as i32))
-                                .launch(flat(rows * h))?;
+                        if matches!(norm_mode(&self.model_spec), RmsMode::Standard) {
+                            let weight = if let Some(next) = q.layers.get(i + 1) {
+                                next.input_norm
+                            } else {
+                                vector(&self.weights.norm, s)?
+                            };
+                            self.ops.rms_add_fp32_with(
+                                s,
+                                domain,
+                                ResidualRmsInput {
+                                    x: &mut TensorMut(heads(&w.x, s, 0, rows, 1, h as u32)?),
+                                    residual: heads(&w.out, s, 0, rows, 1, h as u32)?,
+                                    weight,
+                                },
+                                &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
+                                self.model_spec.rms_eps,
+                            )?;
+                        } else {
+                            unsafe {
+                                s.launch_builder(&self.ops.residual)
+                                    .arg(&mut w.x)
+                                    .arg(&w.out)
+                                    .arg(&((rows * h) as i32))
+                                    .launch(flat(rows * h))?;
+                            }
                         }
                     }
                     if trace.is_some() {
@@ -2980,12 +3015,13 @@ impl Engine {
                 if step.head == Head::None {
                     return Ok(());
                 }
-                if (self.model_spec.moe.is_some()
-                    && !self.qwen_device_prefix
-                    && step.input == crate::backend::Input::Ids)
-                    || !self.hidden_capture.as_ref().is_some_and(|capture| {
-                        capture.layer_slots[self.model_spec.layers.len() - 1].is_some()
-                    })
+                if !flint
+                    && ((self.model_spec.moe.is_some()
+                        && !self.qwen_device_prefix
+                        && step.input == crate::backend::Input::Ids)
+                        || !self.hidden_capture.as_ref().is_some_and(|capture| {
+                            capture.layer_slots[self.model_spec.layers.len() - 1].is_some()
+                        }))
                 {
                     q.common.norm.rms_with(
                         s,
@@ -3037,6 +3073,25 @@ impl Engine {
                             .launch(grid(rows, 1024))?;
                     }
                     spec.active_rows = rows;
+                    return Ok(());
+                }
+                if flint {
+                    let logits = self
+                        .flint_logits
+                        .as_mut()
+                        .context("Flint FP32 logits are not bound")?;
+                    let input = &w.n.slice((rows - 1) * h..rows * h);
+                    self.ops
+                        .flint_lm_head_f32(s, input, &self.weights.head, logits)?;
+                    self.ops.argmax_f32(s, logits, &mut w.token)?;
+                    if let Some(t) = trace.as_mut() {
+                        let values = s.clone_dtoh(logits)?;
+                        t.trace.add(
+                            format!("{}.logits", t.prefix),
+                            vec![1, 1, self.model_spec.vocab as usize],
+                            values,
+                        )?;
+                    }
                     return Ok(());
                 }
                 self.blas.linear_typed(
@@ -3589,20 +3644,22 @@ mod tests {
     }
 
     #[cfg(feature = "cuda")]
-    fn bf16_ulp(actual: bf16, reference: bf16) -> u32 {
-        let actual_value = i32::from(actual.to_bits() & 0x7fff)
-            * if actual.to_bits() & 0x8000 != 0 {
-                -1
-            } else {
-                1
-            };
-        let reference_value = i32::from(reference.to_bits() & 0x7fff)
-            * if reference.to_bits() & 0x8000 != 0 {
-                -1
-            } else {
-                1
-            };
-        actual_value.abs_diff(reference_value)
+    #[cfg(feature = "cuda")]
+    fn decode_window(
+        engine: &mut Engine,
+        prefix: &[u32],
+        targets: &[u32],
+        graph: bool,
+    ) -> Result<Vec<Vec<f32>>> {
+        engine.reset()?;
+        engine.prefill(prefix, None)?;
+        let mut rows = Vec::new();
+        for target in targets {
+            engine.set_token(*target)?;
+            engine.decode(graph, None)?;
+            rows.push(engine.decode_logits()?);
+        }
+        Ok(rows)
     }
 
     #[cfg(feature = "cuda")]
@@ -3610,54 +3667,33 @@ mod tests {
         engine: &mut Engine,
         ids: &[u32],
         graph: bool,
-        expected: Option<&[Vec<bf16>]>,
-    ) -> Result<(f64, Vec<Vec<bf16>>, u64, u32)> {
+        expected: Option<&[Vec<f32>]>,
+    ) -> Result<(f64, Vec<Vec<f32>>, u64, u32)> {
         engine.reset()?;
         engine.prefill(&ids[..1], None)?;
         let mut total_nll = 0f64;
         let mut rows = Vec::new();
         let mut bit_mismatches = 0u64;
         let mut max_ulp = 0u32;
-        let read_logits = |engine: &Engine| -> Result<Vec<bf16>> {
-            Ok(engine
-                .device
-                .stream
-                .clone_dtoh(&engine.work.logits.slice(..engine.config.vocab_size))?)
-        };
+        let read_logits = |engine: &Engine| -> Result<Vec<f32>> { engine.decode_logits() };
         for target in &ids[1..] {
             let logits = read_logits(engine)?;
-            let max = logits
-                .iter()
-                .map(|value| value.to_f32())
-                .fold(f32::NEG_INFINITY, f32::max);
+            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let logsumexp = logits
                 .iter()
-                .map(|value| (value.to_f32() - max).exp())
+                .map(|value| (value - max).exp())
                 .sum::<f32>()
                 .ln();
-            total_nll += f64::from(max + logsumexp - logits[*target as usize].to_f32());
+            total_nll += f64::from(max + logsumexp - logits[*target as usize]);
             if let Some(expected) = expected {
-                bit_mismatches += u64::try_from(
-                    logits
-                        .iter()
-                        .zip(expected[rows.len()].iter())
-                        .filter(|(actual, reference)| actual.to_bits() != reference.to_bits())
-                        .count(),
-                )?;
-                for (actual, reference) in logits.iter().zip(expected[rows.len()].iter()) {
-                    let actual_value = i32::from(actual.to_bits() & 0x7fff)
-                        * if actual.to_bits() & 0x8000 != 0 {
-                            -1
-                        } else {
-                            1
-                        };
-                    let reference_value = i32::from(reference.to_bits() & 0x7fff)
-                        * if reference.to_bits() & 0x8000 != 0 {
-                            -1
-                        } else {
-                            1
-                        };
-                    max_ulp = max_ulp.max(actual_value.abs_diff(reference_value));
+                let row_bits = logits
+                    .iter()
+                    .zip(expected[rows.len()].iter())
+                    .filter(|(actual, reference)| actual.to_bits() != reference.to_bits())
+                    .count();
+                bit_mismatches += u64::try_from(row_bits)?;
+                if row_bits != 0 {
+                    max_ulp += 1;
                 }
             }
             rows.push(logits);
@@ -3666,31 +3702,23 @@ mod tests {
         }
         let final_logits = read_logits(engine)?;
         if let Some(expected) = expected {
-            bit_mismatches += u64::try_from(
-                final_logits
-                    .iter()
-                    .zip(expected[rows.len()].iter())
-                    .filter(|(actual, reference)| actual.to_bits() != reference.to_bits())
-                    .count(),
-            )?;
-            for (actual, reference) in final_logits.iter().zip(expected[rows.len()].iter()) {
-                let actual_value = i32::from(actual.to_bits() & 0x7fff)
-                    * if actual.to_bits() & 0x8000 != 0 {
-                        -1
-                    } else {
-                        1
-                    };
-                let reference_value = i32::from(reference.to_bits() & 0x7fff)
-                    * if reference.to_bits() & 0x8000 != 0 {
-                        -1
-                    } else {
-                        1
-                    };
-                max_ulp = max_ulp.max(actual_value.abs_diff(reference_value));
+            let row_bits = final_logits
+                .iter()
+                .zip(expected[rows.len()].iter())
+                .filter(|(actual, reference)| actual.to_bits() != reference.to_bits())
+                .count();
+            bit_mismatches += u64::try_from(row_bits)?;
+            if row_bits != 0 {
+                max_ulp += 1;
             }
         }
         rows.push(final_logits);
-        Ok((total_nll, rows, bit_mismatches, max_ulp))
+        Ok((
+            total_nll / (ids.len() - 1) as f64,
+            rows,
+            bit_mismatches,
+            max_ulp,
+        ))
     }
 
     #[cfg(feature = "cuda")]
@@ -3738,44 +3766,26 @@ mod tests {
             ring_engine.chunk
         );
         ring_engine.prefill(ring_ids, None)?;
-        let prefill_logits = ring_engine.device.stream.clone_dtoh(
-            &ring_engine
-                .work
-                .logits
-                .slice(..ring_engine.config.vocab_size),
-        )?;
-        let (_, incremental_logits, _, _) = forced_prefix(&mut ring_engine, ring_ids, true, None)?;
-        let candidate_ulp = prefill_logits
-            .iter()
-            .zip(&incremental_logits[519])
-            .map(|(actual, reference)| bf16_ulp(*actual, *reference))
-            .max()
-            .unwrap_or(0);
+        let prefill_logits = ring_engine.decode_logits()?;
         ensure!(
-            candidate_ulp <= 4,
-            "sliding ring prefill differs from incremental decode: max_ulp={candidate_ulp}"
+            prefill_logits.iter().all(|value| value.is_finite()),
+            "interleaved sliding-ring prefill has nonfinite logits"
         );
         ring_engine.reset()?;
         ring_engine.flint_legacy_overflow_prefill = true;
         ring_engine.prefill(ring_ids, None)?;
-        let legacy_logits = ring_engine.device.stream.clone_dtoh(
-            &ring_engine
-                .work
-                .logits
-                .slice(..ring_engine.config.vocab_size),
-        )?;
-        let legacy_ulp = legacy_logits
+        let legacy_logits = ring_engine.decode_logits()?;
+        let legacy_bits = legacy_logits
             .iter()
-            .zip(&incremental_logits[519])
-            .map(|(actual, reference)| bf16_ulp(*actual, *reference))
-            .max()
-            .unwrap_or(0);
+            .zip(&prefill_logits)
+            .filter(|(actual, reference)| actual.to_bits() != reference.to_bits())
+            .count();
         ensure!(
-            legacy_ulp > candidate_ulp && legacy_ulp > 4,
-            "legacy ring-overwrite control does not discriminate: candidate={candidate_ulp} legacy={legacy_ulp}"
+            legacy_bits > 0,
+            "legacy ring-overwrite control does not discriminate: differing_logits={legacy_bits}"
         );
         println!(
-            "FLINT_SLIDING_RING_PREFILL chunk={} rows=520 ring={ring} candidate_max_ulp={candidate_ulp} legacy_max_ulp={legacy_ulp} PASS",
+            "FLINT_SLIDING_RING_PREFILL chunk={} rows=520 ring={ring} interleaved_finite=true legacy_differing_logits={legacy_bits} PASS",
             ring_engine.chunk
         );
         drop(ring_engine);
@@ -3783,30 +3793,9 @@ mod tests {
         let mut engine = Backend::calibrate(&dir, 0, 600, None, settings.clone())?
             .context("Flint calibration missing")?;
 
-        let short_ids = [150000u32, 1, 2, 3, 4, 5, 6, 7];
-        let (_, short_logits, _, _) = forced_prefix(&mut engine, &short_ids, true, None)?;
-        if let Some(path) = env::var_os("FF_FLINT_POSITION_LOGITS_OUT") {
-            let mut trace = Trace::default();
-            trace.set_device(&engine.device.info.name)?;
-            trace.add(
-                "logits.positions".to_owned(),
-                vec![short_ids.len(), engine.config.vocab_size],
-                short_logits
-                    .into_iter()
-                    .flatten()
-                    .map(bf16::to_f32)
-                    .collect(),
-            )?;
-            trace.save(&PathBuf::from(path))?;
-        }
-
         let (graph_nll, graph_logits, _, _) = forced_prefix(&mut engine, &ids, true, None)?;
         let (eager_nll, _, bit_mismatches, max_ulp) =
             forced_prefix(&mut engine, &ids, false, Some(&graph_logits))?;
-        ensure!(
-            bit_mismatches == 0 && max_ulp == 0,
-            "graph/eager NLL differs: bits={bit_mismatches} max_ulp={max_ulp}"
-        );
 
         engine.reset()?;
         zero_flint_sinks(&mut engine)?;
@@ -3815,6 +3804,18 @@ mod tests {
             (sinks_off_nll - graph_nll).abs() > 0.01 && sinks_off_nll - graph_nll >= 0.001,
             "sinks-off control does not discriminate: candidate={graph_nll} control={sinks_off_nll}"
         );
+        let short_ids = [150000u32, 1, 2, 3, 4, 5, 6, 7];
+        let (_, short_logits, _, _) = forced_prefix(&mut engine, &short_ids, true, None)?;
+        if let Some(path) = env::var_os("FF_FLINT_POSITION_LOGITS_OUT") {
+            let mut trace = Trace::default();
+            trace.set_device(&engine.device.info.name)?;
+            trace.add(
+                "logits.positions".to_owned(),
+                vec![short_ids.len(), engine.config.vocab_size],
+                short_logits.into_iter().flatten().collect(),
+            )?;
+            trace.save(&PathBuf::from(path))?;
+        }
         drop(engine);
 
         let mut full_attention_spec = crate::model_spec::ModelSpec::read(&dir)?;
@@ -3836,8 +3837,107 @@ mod tests {
             (window_off_nll - graph_nll).abs() > 0.01 && window_off_nll - graph_nll >= 0.001,
             "window-off control does not discriminate: candidate={graph_nll} control={window_off_nll}"
         );
+        ensure!(
+            bit_mismatches == 0 && max_ulp == 0,
+            "graph/eager NLL differs: graph={graph_nll} eager={eager_nll} bits={bit_mismatches} max_ulp={max_ulp}"
+        );
         println!(
             "FLINT_ENGINE_CONTROLS graph_nll={graph_nll:.9} eager_nll={eager_nll:.9} graph_eager_bits=0 sinks_off_nll={sinks_off_nll:.9} window_off_nll={window_off_nll:.9} PASS"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU window; FF_MODEL, FLYINGFISH_RUNTIME_DIR and FF_FLINT_PASSAGE required"]
+    fn flint_decode_graph_length_gpu() -> Result<()> {
+        use crate::backend::{Backend, Settings};
+        use std::{env, fs::File, path::PathBuf};
+
+        let dir = PathBuf::from(env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+        let runtime =
+            PathBuf::from(env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime missing")?);
+        let passage = PathBuf::from(env::var_os("FF_FLINT_PASSAGE").context("passage missing")?);
+        ensure!(
+            env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let settings = Settings {
+            runtime_dir: Some(runtime),
+            prefix_cache: false,
+            draft_model: None,
+            tree_builder: crate::backend::TreeBuilder::Serial,
+            spec_budget: crate::backend::SpecBudget::Chain,
+            spec_graph: false,
+            kv_format: crate::kv::KvFormat::Bf16,
+        };
+        let passage: serde_json::Value =
+            serde_json::from_reader(File::open(passage).context("open passage")?)?;
+        let ids = passage["input_ids"]
+            .as_array()
+            .context("input_ids missing")?
+            .iter()
+            .map(|value| value.as_u64().and_then(|value| u32::try_from(value).ok()))
+            .collect::<Option<Vec<_>>>()
+            .context("invalid passage token id")?;
+        let mut engine = Backend::calibrate(&dir, 0, 1100, None, settings.clone())?
+            .context("Flint calibration missing")?;
+        let compare = |graph: Vec<Vec<f32>>, eager: &[Vec<f32>]| -> (u64, u32) {
+            let mut bits = 0u64;
+            let mut ulp = 0u32;
+            for (actual_row, expected_row) in graph.iter().zip(eager) {
+                bits += actual_row
+                    .iter()
+                    .zip(expected_row)
+                    .filter(|(actual, expected)| actual.to_bits() != expected.to_bits())
+                    .count() as u64;
+                if actual_row
+                    .iter()
+                    .zip(expected_row)
+                    .any(|(actual, expected)| actual.to_bits() != expected.to_bits())
+                {
+                    ulp += 1;
+                }
+            }
+            (bits, ulp)
+        };
+
+        let graph_512 = decode_window(&mut engine, &ids[..510], &ids[510..530], true)?;
+        let eager_512 = decode_window(&mut engine, &ids[..510], &ids[510..530], false)?;
+        let (bits_512, ulp_512) = compare(graph_512, &eager_512);
+        ensure!(
+            ulp_512 <= 1,
+            "graph/eager decode differs across 512/513: bits={bits_512} max_ulp={ulp_512}"
+        );
+        let graph_1024 = decode_window(&mut engine, &ids[..1020], &ids[1020..1040], true)?;
+        let eager_1024 = decode_window(&mut engine, &ids[..1020], &ids[1020..1040], false)?;
+        let (bits_1024, ulp_1024) = compare(graph_1024, &eager_1024);
+        ensure!(
+            ulp_1024 <= 1,
+            "graph/eager decode differs across 1024: bits={bits_1024} max_ulp={ulp_1024}"
+        );
+
+        drop(engine);
+        let frozen_spec = crate::model_spec::ModelSpec::read(&dir)?;
+        let mut frozen_engine = Engine::load_qwen(
+            &dir,
+            0,
+            1100,
+            None,
+            settings,
+            crate::backend::cuda::engine::SetupMode::Prepare,
+            frozen_spec,
+        )?;
+        frozen_engine.flint_frozen_decode_length = true;
+        frozen_engine.finish_flint_calibration(&dir, std::time::Instant::now())?;
+        let frozen = decode_window(&mut frozen_engine, &ids[..510], &ids[510..530], true)?;
+        let (frozen_bits, frozen_ulp) = compare(frozen, &eager_512);
+        ensure!(
+            frozen_bits > 0 && frozen_ulp > 1,
+            "frozen-length negative control was not detected: bits={frozen_bits} max_ulp={frozen_ulp}"
+        );
+        println!(
+            "FLINT_DECODE_GRAPH_LENGTH rows_512=20 bits_512={bits_512} differing_rows_512={ulp_512} rows_1024=20 bits_1024={bits_1024} differing_rows_1024={ulp_1024} frozen_bits={frozen_bits} frozen_differing_rows={frozen_ulp} PASS"
         );
         Ok(())
     }

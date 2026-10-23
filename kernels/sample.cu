@@ -64,6 +64,76 @@ extern "C" __global__ void argmax(const __nv_bfloat16* logits, uint32_t* token, 
     }
 }
 
+extern "C" __global__ void lm_head_f32(const __nv_bfloat16* __restrict__ x,
+                                        const __nv_bfloat16* __restrict__ weight,
+                                        float* __restrict__ logits, int vocab,
+                                        int hidden) {
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const __nv_bfloat16* xr = x;
+  const __nv_bfloat16* wr = weight + (size_t)row * hidden;
+  float part = 0.0f;
+  for (int c = tid; c < hidden; c += blockDim.x)
+    part = fmaf(__bfloat162float(xr[c]), __bfloat162float(wr[c]), part);
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    part += __shfl_down_sync(0xffffffffu, part, off);
+  __shared__ float red[8];
+  if ((tid & 31) == 0) red[tid >> 5] = part;
+  __syncthreads();
+  if (tid < 32) {
+    float value = tid < (blockDim.x >> 5) ? red[tid] : 0.0f;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+      value += __shfl_xor_sync(0xffffffffu, value, off);
+    if (tid == 0) logits[row] = value;
+  }
+}
+
+extern "C" __global__ void argmax_f32(const float* logits, uint32_t* token, int vocab) {
+  const int tid = threadIdx.x;
+  const int nthr = blockDim.x;
+  float best = -INFINITY;
+  uint32_t id = 0xFFFFFFFFu;
+  for (int v = tid; v < vocab; v += nthr) {
+    const float value = logits[v];
+    if (value > best) {
+      best = value;
+      id = (uint32_t)v;
+    }
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    const float other_best = __shfl_down_sync(0xffffffffu, best, off);
+    const uint32_t other_id = __shfl_down_sync(0xffffffffu, id, off);
+    if (other_best > best || (other_best == best && other_id < id)) {
+      best = other_best;
+      id = other_id;
+    }
+  }
+  __shared__ float best_red[8];
+  __shared__ uint32_t id_red[8];
+  if ((tid & 31) == 0) {
+    best_red[tid >> 5] = best;
+    id_red[tid >> 5] = id;
+  }
+  __syncthreads();
+  if (tid < 32) {
+    best = tid < (nthr >> 5) ? best_red[tid] : -INFINITY;
+    id = tid < (nthr >> 5) ? id_red[tid] : 0xFFFFFFFFu;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      const float other_best = __shfl_xor_sync(0xffffffffu, best, off);
+      const uint32_t other_id = __shfl_xor_sync(0xffffffffu, id, off);
+      if (other_best > best || (other_best == best && other_id < id)) {
+        best = other_best;
+        id = other_id;
+      }
+    }
+    if (tid == 0) *token = id;
+  }
+}
+
 // Per-row argmax, launch <<<budget, 1024>>>: block b reduces row b of a
 // [budget][vocab] bf16 logits slab into tokens[b]. Same comparator as argmax.
 // Rows b >= *valid_rows_dev return before any write.
@@ -129,6 +199,13 @@ extern "C" __global__ void __launch_bounds__(1024) argmax_rows_bf16(
 
 extern "C" __global__ void advance(int* position) {
     if (threadIdx.x == 0) ++*position;
+}
+
+extern "C" __global__ void flint_decode_length(const int* position, int* length, int ring) {
+  if (threadIdx.x == 0) {
+    const int logical = *position + 1;
+    *length = logical < ring ? logical : ring;
+  }
 }
 
 // A call-scoped sticky error flag. The caller clears it before the first scan.

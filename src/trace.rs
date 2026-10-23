@@ -26,7 +26,7 @@ impl Trace {
         }
     }
 
-    pub(crate) fn set_device(&mut self, name: &str) -> Result<()> {
+    pub fn set_device(&mut self, name: &str) -> Result<()> {
         ensure!(
             self.device.as_deref().is_none_or(|device| device == name),
             "trace contains tensors from different devices"

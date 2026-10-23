@@ -682,6 +682,108 @@ fn target_capture_wave_offsets_gpu() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[ignore = "requires a GPU window and FF_Q38_GPU_WINDOW=granted"]
+fn rms_add_fp32_boundary_gpu() -> Result<()> {
+    use super::super::contracts::{RowDomain, SeqRef, TensorMut};
+    use super::super::ops::ResidualRmsInput;
+    use cudarc::driver::DevicePtr;
+
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let rows = 2usize;
+    let hidden = 2048usize;
+    let device = Device::new(0)?;
+    let s = &device.stream;
+    let ops = Ops::new(&device.ctx)?;
+    let x_host = (0..rows * hidden)
+        .map(|index| {
+            let row = index / hidden;
+            bf16::from_f32(1.0 + row as f32)
+        })
+        .collect::<Vec<_>>();
+    let residual_host = (0..rows * hidden)
+        .map(|index| {
+            let row = index / hidden;
+            let column = index % hidden;
+            bf16::from_f32(if row == 0 {
+                2.0
+            } else {
+                0.01 * (column % 8) as f32
+            })
+        })
+        .collect::<Vec<_>>();
+    let weight_host = vec![bf16::from_f32(64.0); hidden];
+    let x = s.clone_htod(&x_host)?;
+    let residual = s.clone_htod(&residual_host)?;
+    let weight = s.clone_htod(&weight_host)?;
+    let normalized = s.alloc_zeros::<bf16>(rows * hidden)?;
+    let metadata = s.clone_htod(&[0i32, rows as i32, rows as i32, rows as i32, 1, 0, 0, 0])?;
+    let seq = SeqRef {
+        ptr: metadata.device_ptr(s).0,
+    };
+    ops.rms_add_fp32_with(
+        s,
+        RowDomain {
+            meta: seq,
+            row_base: 0,
+            row_capacity: rows as u32,
+        },
+        ResidualRmsInput {
+            x: &mut TensorMut(qwen::heads(&x, s, 0, rows, 1, hidden as u32)?),
+            residual: qwen::heads(&residual, s, 0, rows, 1, hidden as u32)?,
+            weight: qwen::vector(&weight, s)?,
+        },
+        &mut TensorMut(qwen::heads(&normalized, s, 0, rows, 1, hidden as u32)?),
+        1e-6,
+    )?;
+    let residual_out = s.clone_dtoh(&x)?;
+    let normalized_out = s.clone_dtoh(&normalized)?;
+    let scales = (0..rows)
+        .map(|row| {
+            let variance = (0..hidden)
+                .map(|column| {
+                    let index = row * hidden + column;
+                    (x_host[index].to_f32() + residual_host[index].to_f32()).powi(2)
+                })
+                .sum::<f32>()
+                / hidden as f32;
+            (variance + 1e-6).recip().sqrt()
+        })
+        .collect::<Vec<_>>();
+    let mut norm_defects = 0usize;
+    let mut residual_defects = 0usize;
+    let mut rounded_control_differences = 0usize;
+    for index in 0..rows * hidden {
+        let row = index / hidden;
+        let summed = x_host[index].to_f32() + residual_host[index].to_f32();
+        let expected_residual = bf16::from_f32(summed);
+        let scale = scales[row];
+        let weight = weight_host[index % hidden].to_f32();
+        let expected_norm = bf16::from_f32(summed * scale * weight);
+        let rounded_norm = bf16::from_f32(expected_residual.to_f32() * scale * weight);
+        if residual_out[index].to_bits() != expected_residual.to_bits() {
+            residual_defects += 1;
+        }
+        if normalized_out[index].to_bits() != expected_norm.to_bits() {
+            norm_defects += 1;
+        }
+        if rounded_norm.to_bits() == expected_norm.to_bits() {
+            rounded_control_differences += 1;
+        }
+    }
+    ensure!(
+        residual_defects == 0 && norm_defects == 0 && rounded_control_differences < rows * hidden,
+        "FP32 residual/RMS boundary differs: residual={residual_defects} norm={norm_defects} rounded_control_differences={rounded_control_differences}"
+    );
+    println!(
+        "RMS_ADD_FP32 rows={rows} hidden={hidden} residual_bits=0 norm_bits=0 rounded_control_discriminates=true PASS"
+    );
+    Ok(())
+}
+
 fn captured_trace_bits(
     actual: &[bf16],
     shape: (usize, usize),
