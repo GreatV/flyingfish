@@ -124,10 +124,10 @@ impl Tables {
             .checked_mul(cohorts)
             .context("prefill table extent overflow")?;
         Ok(Self {
-            gate_up: device.stream.alloc_zeros(experts)?,
-            down: device.stream.alloc_zeros(experts)?,
-            valid: device.stream.alloc_zeros(experts)?,
-            generation: device.stream.alloc_zeros(experts)?,
+            gate_up: device.stream.alloc_zeros(words)?,
+            down: device.stream.alloc_zeros(words)?,
+            valid: device.stream.alloc_zeros(words)?,
+            generation: device.stream.alloc_zeros(words)?,
             host_gate_up: pinned_zeros(&device.ctx, words)?,
             host_down: pinned_zeros(&device.ctx, words)?,
             host_valid: pinned_zeros(&device.ctx, words)?,
@@ -167,18 +167,15 @@ impl Tables {
         Ok(())
     }
 
-    fn upload(
-        &mut self,
-        stream: &Arc<CudaStream>,
-        cohort: usize,
-        experts: u32,
-    ) -> Result<SlotBindings> {
-        let range = cohort * experts as usize..(cohort + 1) * experts as usize;
+    fn upload(&mut self, stream: &Arc<CudaStream>, cohorts: usize, experts: u32) -> Result<()> {
+        let words = cohorts
+            .checked_mul(experts as usize)
+            .context("prefill upload table extent overflow")?;
         ensure!(
-            range.end <= self.host_gate_up.len(),
-            "prefill upload cohort={cohort} outside table allocation"
+            words > 0 && words <= self.host_gate_up.len(),
+            "prefill upload cohorts={cohorts} outside table allocation"
         );
-        // SAFETY: each pinned cohort snapshot stays immutable until the next layer's route receipt.
+        // SAFETY: each pinned layer table stays immutable until the next layer's route receipt.
         unsafe {
             let (gu, _gu) = self.gate_up.device_ptr_mut(stream);
             let (down, _down) = self.down.device_ptr_mut(stream);
@@ -186,30 +183,48 @@ impl Tables {
             let (generation, _generation) = self.generation.device_ptr_mut(stream);
             result::memcpy_htod_async(
                 gu,
-                &self.host_gate_up.as_slice()?[range.clone()],
+                &self.host_gate_up.as_slice()?[..words],
                 stream.cu_stream(),
             )?;
             result::memcpy_htod_async(
                 down,
-                &self.host_down.as_slice()?[range.clone()],
+                &self.host_down.as_slice()?[..words],
                 stream.cu_stream(),
             )?;
             result::memcpy_htod_async(
                 valid,
-                &self.host_valid.as_slice()?[range.clone()],
+                &self.host_valid.as_slice()?[..words],
                 stream.cu_stream(),
             )?;
             result::memcpy_htod_async(
                 generation,
-                &self.host_generation.as_slice()?[range],
+                &self.host_generation.as_slice()?[..words],
                 stream.cu_stream(),
             )?;
         }
+        Ok(())
+    }
+
+    fn bindings(
+        &self,
+        stream: &Arc<CudaStream>,
+        cohort: usize,
+        experts: u32,
+    ) -> Result<SlotBindings> {
+        let offset = cohort
+            .checked_mul(experts as usize)
+            .context("prefill cohort table offset overflow")?;
+        ensure!(
+            offset
+                .checked_add(experts as usize)
+                .is_some_and(|end| end <= self.host_gate_up.len()),
+            "prefill bindings cohort={cohort} outside table allocation"
+        );
         Ok(SlotBindings {
-            gate_up: view(&self.gate_up, stream, 0, [experts], [1])?,
-            down: view(&self.down, stream, 0, [experts], [1])?,
-            valid: view(&self.valid, stream, 0, [experts], [1])?,
-            generation: view(&self.generation, stream, 0, [experts], [1])?,
+            gate_up: view(&self.gate_up, stream, offset, [experts], [1])?,
+            down: view(&self.down, stream, offset, [experts], [1])?,
+            valid: view(&self.valid, stream, offset, [experts], [1])?,
+            generation: view(&self.generation, stream, offset, [experts], [1])?,
         })
     }
 }
@@ -1654,7 +1669,8 @@ impl Gpu {
                 )?;
             }
         }
-        Ok(())
+        self.tables
+            .upload(compute, 1 + plan.cohort_count() as usize, geometry.experts)
     }
 
     fn contribute(
@@ -1705,7 +1721,6 @@ impl Gpu {
                 self.copy_expert(slots, layer, expert, position as u32)?;
             }
             let copied = slots.events.record(&slots.transfers.h2d)?;
-            stream.wait(&copied.event)?;
             leases.load(experts, copied.id)?;
             self.staging_copy = Some(copied);
             self.read_ahead.prime(slots, layer, plan)?;
@@ -1823,7 +1838,7 @@ impl Gpu {
         };
         let stream = &device.stream;
         let geometry = span.geometry;
-        let tables = self.tables.upload(stream, cohort, geometry.experts)?;
+        let tables = self.tables.bindings(stream, cohort, geometry.experts)?;
         let ids = span.choices::<i32>(&span.layout.ids, 0, plan.span_rows())?;
         let active = span.choices::<u32>(&span.layout.active, 0, plan.span_rows())?;
         let generation = span.choices::<u64>(&span.layout.generation, 0, plan.span_rows())?;
@@ -1851,15 +1866,29 @@ impl Gpu {
                     256,
                 ))?;
         }
+        let wait_copy = if leases.is_some() {
+            Some(
+                self.staging_copy
+                    .as_ref()
+                    .context("prefill staging cohort has no copy event")?
+                    .event
+                    .as_ref(),
+            )
+        } else {
+            None
+        };
         let range = cohort * geometry.experts as usize..(cohort + 1) * geometry.experts as usize;
         let mut last = None;
-        for &(base, rows, active) in plan.cohort_waves(cohort)? {
+        for (wave_index, &(base, rows, active)) in plan.cohort_waves(cohort)?.iter().enumerate() {
+            let ticket = slots.events.claim()?;
             ops.prefill_contribute(
                 stream,
                 MoePrefillContribute {
                     cpu_arithmetic: &self.cpu_arithmetic,
                     fp8_slot: slots.catalogue.layout().fp8_slot(),
                     wave: Some((cohort, base, active)),
+                    wait_copy: (wave_index == 0).then_some(wait_copy).flatten(),
+                    reader_event: Some(&ticket.event),
                     x: span.hidden(&span.layout.normalized, base, rows)?,
                     ids: span.choices(&span.layout.ids, base, rows)?,
                     weights: span.choices(&span.layout.weights, base, rows)?,
@@ -1880,7 +1909,6 @@ impl Gpu {
                 },
                 &qwen::scratch(&self.scratch, stream),
             )?;
-            let ticket = slots.events.record(stream)?;
             if let Some(leases) = leases.as_mut() {
                 for position in 0..staged_slots {
                     leases.record_wave(position as u32, ticket.id)?;
@@ -2150,6 +2178,8 @@ mod tests {
                             cpu_arithmetic: &arithmetic,
                             fp8_slot: None,
                             wave: None,
+                            wait_copy: None,
+                            reader_event: None,
                             x: qwen::matrix(&x_device, stream, 0, rows, hidden)?,
                             ids: testing::dense(&ids, stream, rows as u32, 1)?,
                             weights: testing::dense(&routing_device, stream, rows as u32, 1)?,
@@ -2942,6 +2972,8 @@ mod tests {
                         cpu_arithmetic: &arithmetic,
                         fp8_slot: slots.catalogue.layout().fp8_slot(),
                         wave: None,
+                        wait_copy: None,
+                        reader_event: None,
                         x: qwen::matrix(&input, stream, base * 128, count, 128)?,
                         ids: view(&ids, stream, base * 4, [count as u32, 4], [4, 1])?,
                         weights: view(&weights, stream, base * 4, [count as u32, 4], [4, 1])?,
