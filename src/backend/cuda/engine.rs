@@ -344,6 +344,7 @@ struct Spec {
     tree_draft_graph: Option<CudaGraph>,
     draft_graph: Option<CudaGraph>,
     verify_graph: Option<CudaGraph>,
+    moe_verify_graphs: std::collections::BTreeMap<usize, CudaGraph>,
     inject_graphs: Vec<Option<CudaGraph>>,
     tree: Option<super::tree::State>,
     tree_attention: Option<super::verification::Verification>,
@@ -385,7 +386,11 @@ impl SpecPhase {
 
 impl Spec {
     fn new(draft: super::draft::Draft, engine: &Engine) -> Result<Self> {
-        let verify_rows = draft.config.verify_rows()?;
+        let verify_rows = if engine.model_spec.moe.is_some() {
+            draft.config.target_rows(&engine.model_spec)?
+        } else {
+            draft.config.verify_rows()?
+        };
         let rows = if engine.spec_budget.is_tree() {
             engine.spec_budget.rows()
         } else {
@@ -439,15 +444,12 @@ impl Spec {
                 None
             },
             tree_attention: None,
-            verify_rows: if engine.model_spec.moe.is_some() {
-                crate::dspark::DEFAULT_MOE_VERIFY_ROWS.min(verify_rows)
-            } else {
-                verify_rows
-            },
+            verify_rows,
             active_rows: 0,
             graph: engine.spec_graph,
             draft_graph: None,
             verify_graph: None,
+            moe_verify_graphs: std::collections::BTreeMap::new(),
             inject_graphs: (0..verify_rows).map(|_| None).collect(),
             verification: None,
             draft,
@@ -1214,25 +1216,38 @@ impl Engine {
         self.graphs = if self.spec.as_ref().is_some_and(|spec| !spec.graph) {
             Vec::new()
         } else if self.model_spec.moe.is_some() {
-            let mut graphs = if self
+            let widths = match &self.spec {
+                Some(spec) => {
+                    crate::dspark::MIN_MOE_VERIFY_ROWS
+                        ..=spec.draft.config.target_rows(&self.model_spec)?
+                }
+                None => 1..=1,
+            };
+            let mut graphs: Vec<_> = if self
                 .moe_slots
                 .as_ref()
                 .context("MoE graph declaration has no slots")?
                 .all_resident()
             {
-                vec![if self.spec.is_some() {
-                    Graph::Verify
-                } else {
-                    Graph::Decode
-                }]
+                widths
+                    .map(|_| {
+                        if self.spec.is_some() {
+                            Graph::Verify
+                        } else {
+                            Graph::Decode
+                        }
+                    })
+                    .collect()
             } else {
-                (0..self.model_spec.layers.len())
-                    .flat_map(|layer| {
-                        [
-                            Graph::MoeRoute(layer),
-                            Graph::MoeContribute(layer),
-                            Graph::MoeJoin(layer),
-                        ]
+                widths
+                    .flat_map(|_| {
+                        (0..self.model_spec.layers.len()).flat_map(|layer| {
+                            [
+                                Graph::MoeRoute(layer),
+                                Graph::MoeContribute(layer),
+                                Graph::MoeJoin(layer),
+                            ]
+                        })
                     })
                     .collect()
             };
@@ -1278,7 +1293,13 @@ impl Engine {
             Graph::Decode => self.graph.is_some(),
             Graph::MoeRoute(_) | Graph::MoeContribute(_) | Graph::MoeJoin(_) => false,
             Graph::Draft => spec.draft_graph.is_some(),
-            Graph::Verify => spec.verify_graph.is_some(),
+            Graph::Verify => {
+                if self.model_spec.moe.is_some() {
+                    self.has_moe_verify_graphs()
+                } else {
+                    spec.verify_graph.is_some()
+                }
+            }
             Graph::TreeDraft => spec.tree_draft_graph.is_some(),
             Graph::TreeVerify => spec.tree_verify_graph.is_some(),
             Graph::TreeCommit => spec.tree_commit_graph.is_some(),
@@ -1397,13 +1418,19 @@ impl Engine {
             && step.head == Head::All
             && matches!(step.mask, crate::backend::Mask::Causal)
         {
+            let spec = self
+                .spec
+                .as_ref()
+                .context("causal verification requires draft geometry")?;
+            let valid = if self.model_spec.moe.is_some() {
+                (crate::dspark::MIN_MOE_VERIFY_ROWS
+                    ..=spec.draft.config.target_rows(&self.model_spec)?)
+                    .contains(&step.rows)
+            } else {
+                step.rows == spec.verify_rows
+            };
             ensure!(
-                step.rows
-                    == self
-                        .spec
-                        .as_ref()
-                        .context("causal verification requires draft geometry")?
-                        .verify_rows,
+                valid,
                 "causal all-row verification rows={} differs from the loaded chain geometry",
                 step.rows
             );
@@ -3615,11 +3642,7 @@ impl Engine {
     fn ensure_spec_graph(&mut self, phase: SpecPhase, start: usize) -> Result<()> {
         if self.model_spec.moe.is_some() && matches!(phase, SpecPhase::Verify) {
             ensure!(
-                self.has_moe_segments()
-                    || self
-                        .spec
-                        .as_ref()
-                        .is_some_and(|spec| spec.verify_graph.is_some()),
+                self.has_moe_segments() || self.has_moe_verify_graphs(),
                 "MoE verification graphs were not bound before Ready"
             );
             return Ok(());
@@ -3788,7 +3811,7 @@ impl Engine {
                 .spec
                 .as_mut()
                 .context("MoE chain requires a loaded draft")?;
-            let rows = spec.verify_rows;
+            let rows = spec.draft.config.target_rows(&self.model_spec)?;
             ensure!(
                 limit > 0
                     && !self.spec_budget.is_tree()
@@ -3830,17 +3853,20 @@ impl Engine {
                     &self.closure,
                 )?;
             let _round_range = super::profile::Range::new(self.profile_rounds, c"dspark_round");
-            let rows = self
-                .spec
-                .as_ref()
-                .context("draft is not enabled")?
-                .verify_rows;
+            let max_rows = {
+                let spec = self.spec.as_ref().context("draft is not enabled")?;
+                if transaction {
+                    spec.draft.config.target_rows(&self.model_spec)?
+                } else {
+                    spec.verify_rows
+                }
+            };
             ensure!(limit > 0, "spec round output limit must be positive");
             ensure!(
                 self.position
-                    .checked_add(rows)
+                    .checked_add(max_rows)
                     .is_some_and(|end| end <= self.capacity),
-                "spec verification position={} rows={rows} exceeds capacity={}",
+                "spec verification position={} rows={max_rows} exceeds capacity={}",
                 self.position,
                 self.capacity
             );
@@ -3872,7 +3898,7 @@ impl Engine {
             let proposals = if graph {
                 self.launch_spec_graph(SpecPhase::Draft)?;
                 self.spec
-                    .as_ref()
+                    .as_mut()
                     .context("draft is not enabled")?
                     .draft
                     .proposals()?
@@ -3891,33 +3917,56 @@ impl Engine {
                     None,
                 )?
             };
+            self.device.stream.synchronize()?;
+            let draft_ms = draft_start.elapsed().as_secs_f64() * 1000.0;
+            drop(draft_range);
+            let base_rows = if transaction {
+                let confidences = self
+                    .spec
+                    .as_ref()
+                    .context("draft is not enabled")?
+                    .draft
+                    .confidences()?;
+                crate::dspark::select_verify_rows(
+                    &confidences,
+                    crate::dspark::MIN_MOE_VERIFY_ROWS,
+                    max_rows,
+                    crate::dspark::MOE_VERIFY_CONFIDENCE_TAU,
+                )?
+            } else {
+                max_rows
+            };
             #[cfg(test)]
             let mut forced_applied = false;
             #[cfg(test)]
-            let proposals = if let Some(forced) = self
+            let (rows, proposals) = if let Some(forced) = self
                 .spec
                 .as_mut()
                 .context("chain missing")?
                 .forced_proposals
                 .take()
             {
+                let forced_rows = forced.len() + 1;
                 ensure!(
-                    forced.len() == rows - 1
-                        && forced
-                            .iter()
-                            .all(|&id| (id as usize) < self.config.vocab_size),
+                    if transaction {
+                        (crate::dspark::MIN_MOE_VERIFY_ROWS..=max_rows).contains(&forced_rows)
+                    } else {
+                        forced_rows == max_rows
+                    } && forced
+                        .iter()
+                        .all(|&id| (id as usize) < self.config.vocab_size),
                     "forced chain proposals exceed the loaded geometry"
                 );
                 forced_applied = true;
-                forced
+                (forced_rows, forced)
             } else {
-                proposals[..rows - 1].to_vec()
+                (base_rows, proposals[..base_rows - 1].to_vec())
             };
             #[cfg(not(test))]
-            let proposals = proposals[..rows - 1].to_vec();
-            self.device.stream.synchronize()?;
-            let draft_ms = draft_start.elapsed().as_secs_f64() * 1000.0;
-            drop(draft_range);
+            let (rows, proposals) = (base_rows, proposals[..base_rows - 1].to_vec());
+            if transaction {
+                self.spec.as_mut().context("MoE chain missing")?.verify_rows = rows;
+            }
             #[cfg(test)]
             if graph && transaction && forced_applied {
                 let ids: Vec<_> = std::iter::once(anchor.context("forced graph anchor missing")?)

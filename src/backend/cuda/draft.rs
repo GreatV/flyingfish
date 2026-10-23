@@ -265,6 +265,7 @@ pub struct Draft {
     scores: CudaSlice<bf16>,
     combined: Option<CudaSlice<f32>>,
     confidence_values: CudaSlice<f32>,
+    host_confidence: cudarc::driver::PinnedHostSlice<u8>,
     forced_tokens: CudaSlice<u32>,
     sum_argmax: cudarc::driver::CudaFunction,
     concat_dot_sigmoid: cudarc::driver::CudaFunction,
@@ -399,6 +400,7 @@ impl Draft {
             s.memset_zeros(combined)?;
         }
         s.memset_zeros(&mut self.confidence_values)?;
+        self.host_confidence.as_mut_slice()?.fill(0);
         s.memset_zeros(&mut self.forced_tokens)?;
         s.memcpy_htod(&self.mask_ids, &mut self.ids)?;
         Ok(())
@@ -516,6 +518,7 @@ impl Draft {
                 None
             },
             confidence_values: s.alloc_zeros(block_rows)?,
+            host_confidence: super::copy::pinned_zeros(&d.ctx, block_rows * size_of::<f32>())?,
             forced_tokens: s.alloc_zeros(block_rows)?,
             sum_argmax: super::cubin::module(&d.ctx, "markov")?.load_function("sum_argmax")?,
             concat_dot_sigmoid: super::cubin::module(&d.ctx, "markov")?
@@ -972,8 +975,28 @@ impl Draft {
             .distributions_batch(&self.base, &self.weights.w1, &self.weights.w2, requests)
     }
 
-    pub fn proposals(&self) -> Result<Vec<u32>> {
+    pub fn proposals(&mut self) -> Result<Vec<u32>> {
+        super::copy::dtoh_bytes(
+            &self.stream,
+            &self.confidence_values,
+            0,
+            &mut self.host_confidence,
+            0,
+            self.config.block_size * size_of::<f32>(),
+        )?;
         Ok(self.stream.clone_dtoh(&self.tokens)?)
+    }
+
+    pub fn confidences(&self) -> Result<Vec<f32>> {
+        let bytes = self.host_confidence.as_slice()?;
+        let (chunks, remainder) = bytes.as_chunks::<4>();
+        ensure!(
+            remainder.is_empty() && chunks.len() == self.config.block_size,
+            "draft host confidence extent={} block_size={}",
+            bytes.len(),
+            self.config.block_size
+        );
+        Ok(chunks.iter().map(|b| f32::from_le_bytes(*b)).collect())
     }
 
     pub fn copy_proposals(&self, ids: &mut cudarc::driver::CudaViewMut<'_, u32>) -> Result<()> {
@@ -1300,28 +1323,34 @@ impl Draft {
                 s.memcpy_dtod(&self.forced_tokens.slice(row..row + 1), &mut self.token)?;
             }
         }
-        if trace.is_some() {
-            unsafe {
-                s.launch_builder(&self.concat_dot_sigmoid)
-                    .arg(&self.n)
-                    .arg(&self.weights.w1)
-                    .arg(&self.ids)
-                    .arg(if forced.is_some() {
-                        &self.forced_tokens
-                    } else {
-                        &self.tokens
-                    })
-                    .arg(&self.weights.confidence)
-                    .arg(&self.weights.confidence_bias)
-                    .arg(&mut self.confidence_values)
-                    .arg(&(block_rows as i32))
-                    .arg(&(h as i32))
-                    .arg(&(c.markov_rank as i32))
-                    .arg(&(c.vocab_size as i32))
-                    .launch(grid(block_rows, 256))?;
-            }
+        unsafe {
+            s.launch_builder(&self.concat_dot_sigmoid)
+                .arg(&self.n)
+                .arg(&self.weights.w1)
+                .arg(&self.ids)
+                .arg(if forced.is_some() {
+                    &self.forced_tokens
+                } else {
+                    &self.tokens
+                })
+                .arg(&self.weights.confidence)
+                .arg(&self.weights.confidence_bias)
+                .arg(&mut self.confidence_values)
+                .arg(&(block_rows as i32))
+                .arg(&(h as i32))
+                .arg(&(c.markov_rank as i32))
+                .arg(&(c.vocab_size as i32))
+                .launch(grid(block_rows, 256))?;
         }
         let proposals = if matches!(output, Output::Tokens) {
+            super::copy::dtoh_bytes(
+                s,
+                &self.confidence_values,
+                0,
+                &mut self.host_confidence,
+                0,
+                block_rows * size_of::<f32>(),
+            )?;
             s.clone_dtoh(&self.tokens)?
         } else {
             Vec::new()

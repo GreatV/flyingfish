@@ -1,4 +1,5 @@
 //! Eager routed-FFN execution over caller-provided residency decisions.
+use super::super::copy::pinned_zeros;
 use super::*;
 use crate::backend::cuda::{
     calibrate::host_memory,
@@ -13,25 +14,13 @@ use crate::backend::cuda::{
 };
 use crate::cpu::expert_ffn::{Assignment, ExpertPool, ExpertWeights, Job, Shape};
 use crate::experts::{arena::HostBlocks, catalogue::ExpertGeometry};
-use cudarc::driver::{CudaEvent, DevicePtr, DeviceRepr, HostSlice, ValidAsZeroBits, result};
+use cudarc::driver::{CudaEvent, DevicePtr, HostSlice, result};
 
 #[path = "engine_moe_residency.rs"]
 mod residency;
 pub(super) use residency::{Prefill, Slots};
 #[path = "engine_moe_graph.rs"]
 mod graphs;
-
-fn pinned_zeros<T: DeviceRepr + ValidAsZeroBits>(
-    context: &Arc<CudaContext>,
-    len: usize,
-) -> Result<PinnedHostSlice<T>> {
-    // SAFETY: flags0 allocates CPU-readable pinned storage, initialized before creating typed slices.
-    let mut allocation = unsafe { context.alloc_pinned_with_flags(len, 0)? };
-    unsafe {
-        std::ptr::write_bytes(allocation.as_mut_ptr()?, 0, len);
-    }
-    Ok(allocation)
-}
 
 pub(super) struct Setup {
     pub workspace: crate::prefill::ExpertWorkspaceBudget,
@@ -502,6 +491,7 @@ pub(super) struct Decode {
     pool: ExpertPool,
     mailbox: Arc<CudaStream>,
     segments: Vec<graphs::Segments>,
+    verify_segments: std::collections::BTreeMap<usize, Vec<graphs::Segments>>,
     mailbox_ready: CudaEvent,
     reader: Arc<CudaEvent>,
     mask: cudarc::driver::CudaFunction,
@@ -629,6 +619,7 @@ impl Decode {
             cpu_done: pinned_zeros(context, choices)?,
             mailbox: context.new_stream()?,
             segments: Vec::new(),
+            verify_segments: std::collections::BTreeMap::new(),
             mailbox_ready: context.new_event(None)?,
             reader: Arc::new(context.new_event(None)?),
             mask: super::super::cubin::module(context, "moe_route")?
@@ -792,6 +783,19 @@ impl Decode {
         self.finish_with(device, ffn, slots, dispatch, activation, None)
     }
 
+    fn segment(&self, rows: usize, layer: usize) -> Result<&graphs::Segments> {
+        let layers = if rows == 1 {
+            &self.segments
+        } else {
+            self.verify_segments
+                .get(&rows)
+                .with_context(|| format!("MoE verify graph width={rows} missing"))?
+        };
+        layers
+            .get(layer)
+            .with_context(|| format!("MoE graph segment missing rows={rows} layer={layer}"))
+    }
+
     fn finish_with(
         &mut self,
         device: &Device,
@@ -850,11 +854,7 @@ impl Decode {
         self.mailbox_ready.record(&self.mailbox)?;
         stream.wait(&self.mailbox_ready)?;
         if let Some(layer) = graph {
-            self.segments
-                .get(layer)
-                .context("MoE contribution graph missing")?
-                .contribute
-                .launch()?;
+            self.segment(rows, layer)?.contribute.launch()?;
         } else {
             self.contribute_device(device, ffn, slots, x)?;
         }
@@ -862,11 +862,7 @@ impl Decode {
         let reader = self.reader.clone();
         self.upload_cpu(device, &mut dispatch, &reader)?;
         if let Some(layer) = graph {
-            self.segments
-                .get(layer)
-                .context("MoE join graph missing")?
-                .join
-                .launch()?;
+            self.segment(rows, layer)?.join.launch()?;
         } else {
             self.combine_device(device, ffn, x, y)?;
         }
