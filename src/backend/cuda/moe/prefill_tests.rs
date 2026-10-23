@@ -766,6 +766,8 @@ fn contribute_input<'a>(
         cpu_arithmetic: &[false; MAX_EXPERTS][..experts],
         fp8_slot: None,
         wave: None,
+        wait_copy: None,
+        reader_event: None,
         x: testing::dense(&bufs.x, s, rows as u32, hidden as u32)?,
         ids: testing::dense(&bufs.ids, s, rows as u32, top_k as u32)?,
         active: testing::dense(&bufs.active, s, rows as u32, top_k as u32)?,
@@ -2762,45 +2764,58 @@ fn prefill_packed_waves_gpu() -> Result<()> {
 
     let ops = PrefillOps::new(&d.ctx, s, ExpertFormat::Bf16)?;
     let fp8_ops = PrefillOps::new(&d.ctx, s, ExpertFormat::Fp8W8a16)?;
+    let total_cohorts = 1 + plan.cohort_count() as usize;
+    let cohort_sets: Vec<Vec<u32>> = (0..total_cohorts)
+        .map(|cohort| {
+            if cohort == 0 {
+                plan.resident().to_vec()
+            } else {
+                plan.cohorts().nth(cohort - 1).unwrap().to_vec()
+            }
+        })
+        .collect();
+    let multi_cohort_slots = |gu_addrs: &[u64], dn_addrs: &[u64]| -> Result<DeviceSlots> {
+        let mut gu_all = vec![0u64; total_cohorts * experts];
+        let mut dn_all = vec![0u64; total_cohorts * experts];
+        let valid_all = vec![1u32; total_cohorts * experts];
+        let gen_all = vec![1u64; total_cohorts * experts];
+        for (cohort, set) in cohort_sets.iter().enumerate() {
+            for e in 0..experts {
+                let idx = cohort * experts + e;
+                let src = if set.contains(&(e as u32)) {
+                    e
+                } else {
+                    (e + cohort + 1) % experts
+                };
+                gu_all[idx] = gu_addrs[src];
+                dn_all[idx] = dn_addrs[src];
+            }
+        }
+        device_slots(s, gu_all, dn_all, valid_all, gen_all)
+    };
     let gu: CudaSlice<bf16> = s.clone_htod(fx.gate_up.as_slice())?;
     let dn: CudaSlice<bf16> = s.clone_htod(fx.down.as_slice())?;
     let (gu_ptr, _a) = gu.device_ptr(s);
     let (dn_ptr, _b) = dn.device_ptr(s);
-    let slots = device_slots(
-        s,
-        (0..experts as u64)
-            .map(|e| gu_ptr + e * (2 * inter * hidden * 2) as u64)
-            .collect(),
-        (0..experts as u64)
-            .map(|e| dn_ptr + e * (hidden * inter * 2) as u64)
-            .collect(),
-        vec![1u32; experts],
-        vec![1u64; experts],
-    )?;
+    let bf16_gu_addrs: Vec<u64> = (0..experts as u64)
+        .map(|e| gu_ptr + e * (2 * inter * hidden * 2) as u64)
+        .collect();
+    let bf16_dn_addrs: Vec<u64> = (0..experts as u64)
+        .map(|e| dn_ptr + e * (hidden * inter * 2) as u64)
+        .collect();
+    let slots = multi_cohort_slots(&bf16_gu_addrs, &bf16_dn_addrs)?;
     let native_buf: CudaSlice<u8> = s.clone_htod(&native)?;
     let (native_base, _nb) = native_buf.device_ptr(s);
     let native_addrs: Vec<u64> = (0..experts as u64)
         .map(|e| native_base + e * native_layout.slot_bytes())
         .collect();
-    let fp8_slots = device_slots(
-        s,
-        native_addrs.clone(),
-        native_addrs,
-        vec![1u32; experts],
-        vec![1u64; experts],
-    )?;
+    let fp8_slots = multi_cohort_slots(&native_addrs, &native_addrs)?;
     let k_swapped_buf: CudaSlice<u8> = s.clone_htod(&k_swapped_native)?;
     let (k_swapped_base, _ksb) = k_swapped_buf.device_ptr(s);
     let k_swapped_addrs: Vec<u64> = (0..experts as u64)
         .map(|e| k_swapped_base + e * native_layout.slot_bytes())
         .collect();
-    let k_swapped_slots = device_slots(
-        s,
-        k_swapped_addrs.clone(),
-        k_swapped_addrs,
-        vec![1u32; experts],
-        vec![1u64; experts],
-    )?;
+    let k_swapped_slots = multi_cohort_slots(&k_swapped_addrs, &k_swapped_addrs)?;
     let shared = SharedBufs {
         sg: s.clone_htod(fx.shared_gate.as_slice())?,
         su: s.clone_htod(fx.shared_up.as_slice())?,
@@ -2821,14 +2836,9 @@ fn prefill_packed_waves_gpu() -> Result<()> {
     let ids_dev: CudaSlice<i32> = s.clone_htod(&ids)?;
     let weights_dev: CudaSlice<bf16> = s.clone_htod(&weights)?;
     let gens_dev: CudaSlice<u64> = s.clone_htod(&vec![1u64; rows * top_k])?;
-    let total_cohorts = 1 + plan.cohort_count() as usize;
-    let cohort_masks: Vec<CudaSlice<u32>> = (0..total_cohorts)
-        .map(|cohort| {
-            let set: Vec<u32> = if cohort == 0 {
-                plan.resident().to_vec()
-            } else {
-                plan.cohorts().nth(cohort - 1).unwrap().to_vec()
-            };
+    let cohort_masks: Vec<CudaSlice<u32>> = cohort_sets
+        .iter()
+        .map(|set| {
             let mask: Vec<u32> = ids
                 .iter()
                 .map(|&e| u32::from(set.contains(&(e as u32))))
@@ -2836,16 +2846,27 @@ fn prefill_packed_waves_gpu() -> Result<()> {
             Ok(s.clone_htod(&mask)?)
         })
         .collect::<Result<_>>()?;
+    let copy_event = d.ctx.new_event(None)?;
+    let reader_event = d.ctx.new_event(None)?;
 
     let run_waves = |run_ops: &PrefillOps,
                      run_slots: &DeviceSlots,
                      run_fp8_slot: Option<&crate::experts::catalogue::Fp8Slot>,
                      packed: bool,
-                     shift_first_packed_wave: bool|
+                     shift_first_packed_wave: bool,
+                     corrupt_cohort_offset: bool|
      -> Result<(Vec<u16>, Vec<u32>)> {
         let contributions: CudaSlice<bf16> = s.alloc_zeros(rows * top_k * hidden)?;
         let done: CudaSlice<u32> = s.alloc_zeros(rows * top_k)?;
         for (cohort, active_dev) in cohort_masks.iter().enumerate() {
+            if cohort > 0 {
+                copy_event.record(s)?;
+            }
+            let table_offset = if corrupt_cohort_offset && cohort == 1 {
+                cohort * experts + experts
+            } else {
+                cohort * experts
+            };
             let waves: Vec<(u32, u32, Option<u32>)> = if packed {
                 plan.cohort_waves(cohort)?
                     .iter()
@@ -2870,6 +2891,8 @@ fn prefill_packed_waves_gpu() -> Result<()> {
                         cpu_arithmetic: &cpu_arithmetic,
                         fp8_slot: run_fp8_slot,
                         wave: wave_active.map(|a| (cohort, base, a)),
+                        wait_copy: (cohort > 0 && w_idx == 0).then_some(&copy_event),
+                        reader_event: Some(&reader_event),
                         x: view(
                             &x_dev,
                             s,
@@ -2905,17 +2928,31 @@ fn prefill_packed_waves_gpu() -> Result<()> {
                             [w_rows, top_k as u32],
                             [top_k as u64, 1],
                         )?,
-                        slots_gate_up: testing::view(&run_slots.gu_dev, s, [experts as u32], [1])?,
-                        slots_down: testing::view(&run_slots.dn_dev, s, [experts as u32], [1])?,
-                        slot_valid: testing::view(&run_slots.valid, s, [experts as u32], [1])?,
-                        slot_generation: testing::view(
-                            &run_slots.generation,
+                        slots_gate_up: view(
+                            &run_slots.gu_dev,
                             s,
+                            table_offset,
                             [experts as u32],
                             [1],
                         )?,
-                        slots_gate_up_host: &run_slots.gu_host,
-                        slots_down_host: &run_slots.dn_host,
+                        slots_down: view(
+                            &run_slots.dn_dev,
+                            s,
+                            table_offset,
+                            [experts as u32],
+                            [1],
+                        )?,
+                        slot_valid: view(&run_slots.valid, s, table_offset, [experts as u32], [1])?,
+                        slot_generation: view(
+                            &run_slots.generation,
+                            s,
+                            table_offset,
+                            [experts as u32],
+                            [1],
+                        )?,
+                        slots_gate_up_host: &run_slots.gu_host
+                            [table_offset..table_offset + experts],
+                        slots_down_host: &run_slots.dn_host[table_offset..table_offset + experts],
                         shared_gate: testing::dense(&shared.sg, s, inter as u32, hidden as u32)?,
                         shared_up: testing::dense(&shared.su, s, inter as u32, hidden as u32)?,
                         shared_down: testing::dense(&shared.sd, s, hidden as u32, inter as u32)?,
@@ -2949,8 +2986,8 @@ fn prefill_packed_waves_gpu() -> Result<()> {
         Ok((bits, done_host))
     };
 
-    let (fixed_bits, fixed_done) = run_waves(&ops, &slots, None, false, false)?;
-    let (packed_bits, packed_done) = run_waves(&ops, &slots, None, true, false)?;
+    let (fixed_bits, fixed_done) = run_waves(&ops, &slots, None, false, false, false)?;
+    let (packed_bits, packed_done) = run_waves(&ops, &slots, None, true, false, false)?;
     anyhow::ensure!(
         fixed_done.iter().all(|&d| d == 1) && packed_done.iter().all(|&d| d == 1),
         "incomplete done bits in fixed or packed wave run"
@@ -2971,9 +3008,9 @@ fn prefill_packed_waves_gpu() -> Result<()> {
     );
 
     let (fp8_fixed_bits, fp8_fixed_done) =
-        run_waves(&fp8_ops, &fp8_slots, Some(fp8_slot), false, false)?;
+        run_waves(&fp8_ops, &fp8_slots, Some(fp8_slot), false, false, false)?;
     let (fp8_packed_bits, fp8_packed_done) =
-        run_waves(&fp8_ops, &fp8_slots, Some(fp8_slot), true, false)?;
+        run_waves(&fp8_ops, &fp8_slots, Some(fp8_slot), true, false, false)?;
     anyhow::ensure!(
         fp8_fixed_done.iter().all(|&d| d == 1) && fp8_packed_done.iter().all(|&d| d == 1),
         "incomplete done bits in FP8 fixed or packed wave run"
@@ -2998,7 +3035,14 @@ fn prefill_packed_waves_gpu() -> Result<()> {
     );
 
     // Control 0 (Step 2B): swap the two k-halves (col ^ 32) of each 64-K stage in FP8 codes; must FAIL (>0 differing bits).
-    let (k_swapped_bits, _) = run_waves(&fp8_ops, &k_swapped_slots, Some(fp8_slot), true, false)?;
+    let (k_swapped_bits, _) = run_waves(
+        &fp8_ops,
+        &k_swapped_slots,
+        Some(fp8_slot),
+        true,
+        false,
+        false,
+    )?;
     let k_swap_diff = fp8_packed_bits
         .iter()
         .zip(&k_swapped_bits)
@@ -3013,7 +3057,7 @@ fn prefill_packed_waves_gpu() -> Result<()> {
     );
 
     // Control 1: plant an off-by-one wave base (shifted by 1 row); must FAIL (>0 differing bits).
-    let (shifted_bits, _) = run_waves(&ops, &slots, None, true, true)?;
+    let (shifted_bits, _) = run_waves(&ops, &slots, None, true, true, false)?;
     let shifted_diff = fixed_bits
         .iter()
         .zip(&shifted_bits)
@@ -3027,6 +3071,28 @@ fn prefill_packed_waves_gpu() -> Result<()> {
         "off-by-one wave base control was not detected"
     );
 
+    // Control 3 (Step 2C): corrupted cohort slice offset (cohort * experts + experts); must FAIL (>0 differing bits).
+    let (corrupted_cohort_bits, _) = run_waves(&ops, &slots, None, true, false, true)?;
+    let cohort_offset_diff = packed_bits
+        .iter()
+        .zip(&corrupted_cohort_bits)
+        .filter(|(a, b)| a != b)
+        .count();
+    let (fp8_corrupted_cohort_bits, _) =
+        run_waves(&fp8_ops, &fp8_slots, Some(fp8_slot), true, false, true)?;
+    let fp8_cohort_offset_diff = fp8_packed_bits
+        .iter()
+        .zip(&fp8_corrupted_cohort_bits)
+        .filter(|(a, b)| a != b)
+        .count();
+    eprintln!(
+        "prefill_packed_waves_gpu cohort offset control bf16_diff_bits={cohort_offset_diff} fp8_diff_bits={fp8_cohort_offset_diff} DETECTED"
+    );
+    anyhow::ensure!(
+        cohort_offset_diff > 0 && fp8_cohort_offset_diff > 0,
+        "corrupted cohort slice offset control was not detected: bf16={cohort_offset_diff} fp8={fp8_cohort_offset_diff}"
+    );
+
     // Control 2: mismatch host-packed active count against device count at :899; must return Err.
     let &(base, w_rows, active) = &plan.cohort_waves(0)?[0];
     let bad_c: CudaSlice<bf16> = s.alloc_zeros(w_rows as usize * top_k * hidden)?;
@@ -3037,6 +3103,8 @@ fn prefill_packed_waves_gpu() -> Result<()> {
             cpu_arithmetic: &cpu_arithmetic,
             fp8_slot: None,
             wave: Some((0, base, active - 1)),
+            wait_copy: None,
+            reader_event: None,
             x: view(
                 &x_dev,
                 s,
@@ -3072,12 +3140,12 @@ fn prefill_packed_waves_gpu() -> Result<()> {
                 [w_rows, top_k as u32],
                 [top_k as u64, 1],
             )?,
-            slots_gate_up: testing::view(&slots.gu_dev, s, [experts as u32], [1])?,
-            slots_down: testing::view(&slots.dn_dev, s, [experts as u32], [1])?,
-            slot_valid: testing::view(&slots.valid, s, [experts as u32], [1])?,
-            slot_generation: testing::view(&slots.generation, s, [experts as u32], [1])?,
-            slots_gate_up_host: &slots.gu_host,
-            slots_down_host: &slots.dn_host,
+            slots_gate_up: view(&slots.gu_dev, s, 0, [experts as u32], [1])?,
+            slots_down: view(&slots.dn_dev, s, 0, [experts as u32], [1])?,
+            slot_valid: view(&slots.valid, s, 0, [experts as u32], [1])?,
+            slot_generation: view(&slots.generation, s, 0, [experts as u32], [1])?,
+            slots_gate_up_host: &slots.gu_host[..experts],
+            slots_down_host: &slots.dn_host[..experts],
             shared_gate: testing::dense(&shared.sg, s, inter as u32, hidden as u32)?,
             shared_up: testing::dense(&shared.su, s, inter as u32, hidden as u32)?,
             shared_down: testing::dense(&shared.sd, s, hidden as u32, inter as u32)?,

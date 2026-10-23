@@ -46,6 +46,8 @@ const MAX_GROUPS: usize = MAX_EXPERTS + 2;
 pub(crate) struct MoePrefillContribute<'a> {
     /// Host-packed `(cohort, base, active)` wave expectation checked at the count sync.
     pub wave: Option<(usize, u32, u32)>,
+    pub wait_copy: Option<&'a CudaEvent>,
+    pub reader_event: Option<&'a CudaEvent>,
     /// Whole-span counts at most LANE16_ROWS use the CPU arithmetic form in every wave.
     pub cpu_arithmetic: &'a [bool],
     /// Native FP8 tables carry the six-slice slot base in both pointer arrays.
@@ -932,6 +934,12 @@ impl PrefillOps {
             );
         }
         if active_total == 0 {
+            if let Some(wait) = input.wait_copy {
+                stream.wait(wait)?;
+            }
+            if let Some(reader) = input.reader_event {
+                reader.record(stream)?;
+            }
             return Ok(());
         }
         problem_order(counts, input.cpu_arithmetic, &mut stage.order);
@@ -1010,6 +1018,9 @@ impl PrefillOps {
                 ldc: 2 * inter,
                 size,
             });
+        }
+        if let Some(wait) = input.wait_copy {
+            stream.wait(wait)?;
         }
         let (gemm1_base, _g1) = stage.gemm1_dev.device_ptr(stream);
         unsafe {
@@ -1118,6 +1129,9 @@ impl PrefillOps {
                 None,
             )?;
         }
+        if let Some(reader) = input.reader_event {
+            reader.record(stream)?;
+        }
         unsafe {
             stream
                 .launch_builder(&self.scatter)
@@ -1152,6 +1166,8 @@ impl PrefillOps {
             cpu_arithmetic: &[false; MAX_EXPERTS][..input.slot_valid.shape[0] as usize],
             fp8_slot: None,
             wave: None,
+            wait_copy: None,
+            reader_event: None,
             contributions: input.contributions,
             done: TensorMut(input.done.0),
             x: input.x,

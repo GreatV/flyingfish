@@ -52,7 +52,7 @@ impl Events {
         })
     }
 
-    fn record(&mut self, stream: &Arc<CudaStream>) -> Result<Ticket> {
+    fn claim(&mut self) -> Result<Ticket> {
         let index = (0..self.pool.len())
             .map(|offset| (self.cursor + offset) % self.pool.len())
             .find(|&index| Arc::strong_count(&self.pool[index]) == 1)
@@ -66,13 +66,18 @@ impl Events {
             .checked_mul(self.pool.len() as u64)
             .and_then(|base| base.checked_add(index as u64 + 1))
             .context("expert event id overflow")?;
-        self.pool[index].record(stream)?;
         self.ids[index] = id;
         self.cursor = (index + 1) % self.pool.len();
         Ok(Ticket {
             id,
             event: self.pool[index].clone(),
         })
+    }
+
+    fn record(&mut self, stream: &Arc<CudaStream>) -> Result<Ticket> {
+        let ticket = self.claim()?;
+        ticket.event.record(stream)?;
+        Ok(ticket)
     }
 
     fn wait(&self, stream: &Arc<CudaStream>, id: u64) -> Result<()> {
