@@ -1738,6 +1738,7 @@ impl Engine {
             moe_prefill: None,
             #[cfg(test)]
             moe_test_ffn: None,
+            flint_legacy_overflow_prefill: false,
             mtp: None,
             mtp_state: None,
             mtp_epoch: 0,
@@ -2246,38 +2247,42 @@ impl Engine {
                     !use_rope || self.model_spec.layers[i].rope,
                     "Flint RoPE function selected for NoPE layer {i}"
                 );
-                unsafe {
-                    s.launch_builder(function)
-                        .arg(&mut w.qkv)
-                        .arg(&kv.k)
-                        .arg(&kv.v)
-                        .arg(&q_norm.ptr)
-                        .arg(&k_norm.ptr)
-                        .arg(&w.position)
-                        .arg(&(rows as i32))
-                        .arg(&(self.model_spec.q_heads as i32))
-                        .arg(&(self.model_spec.kv_heads as i32))
-                        .arg(&(self.model_spec.head_dim as i32))
-                        .arg(&(ring as i32))
-                        .arg(&(if sliding { ring as i32 } else { 0 }))
-                        .arg(&(self.model_spec.rope_theta))
-                        .arg(&(self.model_spec.rms_eps))
-                        .arg(&q_source_stride)
-                        .arg(&k_source_offset)
-                        .arg(&kv_source_stride)
-                        .arg(&v_source_offset)
-                        .arg(&kv_source_stride)
-                        .launch(LaunchConfig {
-                            grid_dim: (
-                                (rows
-                                    * (self.model_spec.q_heads + 2 * self.model_spec.kv_heads)
-                                        as usize) as u32,
-                                1,
-                                1,
-                            ),
-                            block_dim: (128, 1, 1),
-                            shared_mem_bytes: 0,
-                        })?;
+                let overflow_sliding =
+                    sliding && phase == ExecutionPhase::Prefill && self.position + rows > ring;
+                if !overflow_sliding || self.flint_legacy_overflow_prefill {
+                    unsafe {
+                        s.launch_builder(function)
+                            .arg(&mut w.qkv)
+                            .arg(&kv.k)
+                            .arg(&kv.v)
+                            .arg(&q_norm.ptr)
+                            .arg(&k_norm.ptr)
+                            .arg(&w.position)
+                            .arg(&(rows as i32))
+                            .arg(&(self.model_spec.q_heads as i32))
+                            .arg(&(self.model_spec.kv_heads as i32))
+                            .arg(&(self.model_spec.head_dim as i32))
+                            .arg(&(ring as i32))
+                            .arg(&(if sliding { ring as i32 } else { 0 }))
+                            .arg(&(self.model_spec.rope_theta))
+                            .arg(&(self.model_spec.rms_eps))
+                            .arg(&q_source_stride)
+                            .arg(&k_source_offset)
+                            .arg(&kv_source_stride)
+                            .arg(&v_source_offset)
+                            .arg(&kv_source_stride)
+                            .launch(LaunchConfig {
+                                grid_dim: (
+                                    (rows
+                                        * (self.model_spec.q_heads + 2 * self.model_spec.kv_heads)
+                                            as usize) as u32,
+                                    1,
+                                    1,
+                                ),
+                                block_dim: (128, 1, 1),
+                                shared_mem_bytes: 0,
+                            })?;
+                    }
                 }
                 match phase {
                     ExecutionPhase::Prefill => {
@@ -2294,9 +2299,50 @@ impl Engine {
                                     - 1,
                             ),
                         };
-                        if sliding && self.position + rows > ring {
+                        if overflow_sliding {
+                            // Each row is written and consumed before a later row reuses its slot.
                             for row in 0..rows {
                                 let position = self.position + row;
+                                s.memcpy_htod(&[position as i32], &mut w.position)?;
+                                let q_base = row * q_width as usize;
+                                let k_base =
+                                    linear_rows * q_width as usize + row * kv_width as usize;
+                                let v_base = linear_rows * (q_width as usize + kv_width as usize)
+                                    + row * kv_width as usize;
+                                if !self.flint_legacy_overflow_prefill {
+                                    unsafe {
+                                        s.launch_builder(function)
+                                            .arg(&mut w.qkv.slice_mut(q_base..w.qkv.len()))
+                                            .arg(&kv.k)
+                                            .arg(&kv.v)
+                                            .arg(&q_norm.ptr)
+                                            .arg(&k_norm.ptr)
+                                            .arg(&w.position)
+                                            .arg(&1i32)
+                                            .arg(&(self.model_spec.q_heads as i32))
+                                            .arg(&(self.model_spec.kv_heads as i32))
+                                            .arg(&(self.model_spec.head_dim as i32))
+                                            .arg(&(ring as i32))
+                                            .arg(&(ring as i32))
+                                            .arg(&(self.model_spec.rope_theta))
+                                            .arg(&(self.model_spec.rms_eps))
+                                            .arg(&q_source_stride)
+                                            .arg(&((k_base - q_base) as u64))
+                                            .arg(&kv_source_stride)
+                                            .arg(&((v_base - q_base) as u64))
+                                            .arg(&kv_source_stride)
+                                            .launch(LaunchConfig {
+                                                grid_dim: (
+                                                    self.model_spec.q_heads
+                                                        + 2 * self.model_spec.kv_heads,
+                                                    1,
+                                                    1,
+                                                ),
+                                                block_dim: (128, 1, 1),
+                                                shared_mem_bytes: 0,
+                                            })?;
+                                    }
+                                }
                                 let tokens = (position + 1).min(ring);
                                 let first = position + 1 - tokens;
                                 let decode = self
@@ -2324,6 +2370,7 @@ impl Engine {
                                     },
                                 )?;
                             }
+                            s.memcpy_htod(&[self.position as i32], &mut w.position)?;
                         } else {
                             self.flash
                                 .as_mut()
@@ -3521,6 +3568,277 @@ mod tests {
                 .is_err()
             );
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn zero_flint_sinks(engine: &mut Engine) -> Result<()> {
+        let stream = engine.device.stream.clone();
+        let runtime = engine
+            .qwen
+            .as_mut()
+            .context("Flint runtime missing for sink control")?;
+        for layer in &mut runtime.layers {
+            if let BoundMixer::Flint { sinks, .. } = &mut layer.mixer {
+                let zeros = vec![bf16::ZERO; sinks.len()];
+                stream.memcpy_htod(&zeros, &mut sinks.slice_mut(..))?;
+            }
+        }
+        stream.synchronize()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn bf16_ulp(actual: bf16, reference: bf16) -> u32 {
+        let actual_value = i32::from(actual.to_bits() & 0x7fff)
+            * if actual.to_bits() & 0x8000 != 0 {
+                -1
+            } else {
+                1
+            };
+        let reference_value = i32::from(reference.to_bits() & 0x7fff)
+            * if reference.to_bits() & 0x8000 != 0 {
+                -1
+            } else {
+                1
+            };
+        actual_value.abs_diff(reference_value)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn forced_prefix(
+        engine: &mut Engine,
+        ids: &[u32],
+        graph: bool,
+        expected: Option<&[Vec<bf16>]>,
+    ) -> Result<(f64, Vec<Vec<bf16>>, u64, u32)> {
+        engine.reset()?;
+        engine.prefill(&ids[..1], None)?;
+        let mut total_nll = 0f64;
+        let mut rows = Vec::new();
+        let mut bit_mismatches = 0u64;
+        let mut max_ulp = 0u32;
+        let read_logits = |engine: &Engine| -> Result<Vec<bf16>> {
+            Ok(engine
+                .device
+                .stream
+                .clone_dtoh(&engine.work.logits.slice(..engine.config.vocab_size))?)
+        };
+        for target in &ids[1..] {
+            let logits = read_logits(engine)?;
+            let max = logits
+                .iter()
+                .map(|value| value.to_f32())
+                .fold(f32::NEG_INFINITY, f32::max);
+            let logsumexp = logits
+                .iter()
+                .map(|value| (value.to_f32() - max).exp())
+                .sum::<f32>()
+                .ln();
+            total_nll += f64::from(max + logsumexp - logits[*target as usize].to_f32());
+            if let Some(expected) = expected {
+                bit_mismatches += u64::try_from(
+                    logits
+                        .iter()
+                        .zip(expected[rows.len()].iter())
+                        .filter(|(actual, reference)| actual.to_bits() != reference.to_bits())
+                        .count(),
+                )?;
+                for (actual, reference) in logits.iter().zip(expected[rows.len()].iter()) {
+                    let actual_value = i32::from(actual.to_bits() & 0x7fff)
+                        * if actual.to_bits() & 0x8000 != 0 {
+                            -1
+                        } else {
+                            1
+                        };
+                    let reference_value = i32::from(reference.to_bits() & 0x7fff)
+                        * if reference.to_bits() & 0x8000 != 0 {
+                            -1
+                        } else {
+                            1
+                        };
+                    max_ulp = max_ulp.max(actual_value.abs_diff(reference_value));
+                }
+            }
+            rows.push(logits);
+            engine.set_token(*target)?;
+            engine.decode(graph, None)?;
+        }
+        let final_logits = read_logits(engine)?;
+        if let Some(expected) = expected {
+            bit_mismatches += u64::try_from(
+                final_logits
+                    .iter()
+                    .zip(expected[rows.len()].iter())
+                    .filter(|(actual, reference)| actual.to_bits() != reference.to_bits())
+                    .count(),
+            )?;
+            for (actual, reference) in final_logits.iter().zip(expected[rows.len()].iter()) {
+                let actual_value = i32::from(actual.to_bits() & 0x7fff)
+                    * if actual.to_bits() & 0x8000 != 0 {
+                        -1
+                    } else {
+                        1
+                    };
+                let reference_value = i32::from(reference.to_bits() & 0x7fff)
+                    * if reference.to_bits() & 0x8000 != 0 {
+                        -1
+                    } else {
+                        1
+                    };
+                max_ulp = max_ulp.max(actual_value.abs_diff(reference_value));
+            }
+        }
+        rows.push(final_logits);
+        Ok((total_nll, rows, bit_mismatches, max_ulp))
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU window; FF_MODEL, FLYINGFISH_RUNTIME_DIR and FF_FLINT_PASSAGE required"]
+    fn flint_engine_controls_and_graph_eager_nll_gpu() -> Result<()> {
+        use crate::backend::{Backend, Settings};
+        use std::{env, fs::File, path::PathBuf, time::Instant};
+
+        let dir = PathBuf::from(env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+        let runtime =
+            PathBuf::from(env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime missing")?);
+        let passage = PathBuf::from(env::var_os("FF_FLINT_PASSAGE").context("passage missing")?);
+        ensure!(
+            env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let settings = Settings {
+            runtime_dir: Some(runtime),
+            prefix_cache: false,
+            draft_model: None,
+            tree_builder: crate::backend::TreeBuilder::Serial,
+            spec_budget: crate::backend::SpecBudget::Chain,
+            spec_graph: false,
+            kv_format: crate::kv::KvFormat::Bf16,
+        };
+        let passage: serde_json::Value =
+            serde_json::from_reader(File::open(passage).context("open passage")?)?;
+        let mut ids = passage["input_ids"]
+            .as_array()
+            .context("input_ids missing")?
+            .iter()
+            .map(|value| value.as_u64().and_then(|value| u32::try_from(value).ok()))
+            .collect::<Option<Vec<_>>>()
+            .context("invalid passage token id")?;
+        ids.truncate(600);
+        let mut ring_engine = Backend::calibrate(&dir, 0, 600, Some(520), settings.clone())?
+            .context("Flint ring calibration missing")?;
+        let ring_ids = &ids[..520];
+        let sliding_state = ring_engine.model_spec.layers[3].state_index as usize;
+        let ring = ring_engine.state.kv_ring(sliding_state)?;
+        ensure!(
+            ring_engine.chunk > ring,
+            "ring gate chunk={} does not exceed ring={ring}",
+            ring_engine.chunk
+        );
+        ring_engine.prefill(ring_ids, None)?;
+        let prefill_logits = ring_engine.device.stream.clone_dtoh(
+            &ring_engine
+                .work
+                .logits
+                .slice(..ring_engine.config.vocab_size),
+        )?;
+        let (_, incremental_logits, _, _) = forced_prefix(&mut ring_engine, ring_ids, true, None)?;
+        let candidate_ulp = prefill_logits
+            .iter()
+            .zip(&incremental_logits[519])
+            .map(|(actual, reference)| bf16_ulp(*actual, *reference))
+            .max()
+            .unwrap_or(0);
+        ensure!(
+            candidate_ulp <= 4,
+            "sliding ring prefill differs from incremental decode: max_ulp={candidate_ulp}"
+        );
+        ring_engine.reset()?;
+        ring_engine.flint_legacy_overflow_prefill = true;
+        ring_engine.prefill(ring_ids, None)?;
+        let legacy_logits = ring_engine.device.stream.clone_dtoh(
+            &ring_engine
+                .work
+                .logits
+                .slice(..ring_engine.config.vocab_size),
+        )?;
+        let legacy_ulp = legacy_logits
+            .iter()
+            .zip(&incremental_logits[519])
+            .map(|(actual, reference)| bf16_ulp(*actual, *reference))
+            .max()
+            .unwrap_or(0);
+        ensure!(
+            legacy_ulp > candidate_ulp && legacy_ulp > 4,
+            "legacy ring-overwrite control does not discriminate: candidate={candidate_ulp} legacy={legacy_ulp}"
+        );
+        println!(
+            "FLINT_SLIDING_RING_PREFILL chunk={} rows=520 ring={ring} candidate_max_ulp={candidate_ulp} legacy_max_ulp={legacy_ulp} PASS",
+            ring_engine.chunk
+        );
+        drop(ring_engine);
+
+        let mut engine = Backend::calibrate(&dir, 0, 600, None, settings.clone())?
+            .context("Flint calibration missing")?;
+
+        let short_ids = [150000u32, 1, 2, 3, 4, 5, 6, 7];
+        let (_, short_logits, _, _) = forced_prefix(&mut engine, &short_ids, true, None)?;
+        if let Some(path) = env::var_os("FF_FLINT_POSITION_LOGITS_OUT") {
+            let mut trace = Trace::default();
+            trace.set_device(&engine.device.info.name)?;
+            trace.add(
+                "logits.positions".to_owned(),
+                vec![short_ids.len(), engine.config.vocab_size],
+                short_logits
+                    .into_iter()
+                    .flatten()
+                    .map(bf16::to_f32)
+                    .collect(),
+            )?;
+            trace.save(&PathBuf::from(path))?;
+        }
+
+        let (graph_nll, graph_logits, _, _) = forced_prefix(&mut engine, &ids, true, None)?;
+        let (eager_nll, _, bit_mismatches, max_ulp) =
+            forced_prefix(&mut engine, &ids, false, Some(&graph_logits))?;
+        ensure!(
+            bit_mismatches == 0 && max_ulp == 0,
+            "graph/eager NLL differs: bits={bit_mismatches} max_ulp={max_ulp}"
+        );
+
+        engine.reset()?;
+        zero_flint_sinks(&mut engine)?;
+        let (sinks_off_nll, _, _, _) = forced_prefix(&mut engine, &ids, true, None)?;
+        ensure!(
+            (sinks_off_nll - graph_nll).abs() > 0.01 && sinks_off_nll - graph_nll >= 0.001,
+            "sinks-off control does not discriminate: candidate={graph_nll} control={sinks_off_nll}"
+        );
+        drop(engine);
+
+        let mut full_attention_spec = crate::model_spec::ModelSpec::read(&dir)?;
+        for layer in &mut full_attention_spec.layers {
+            layer.sliding_window = None;
+        }
+        let mut full_attention = Engine::load_qwen(
+            &dir,
+            0,
+            600,
+            None,
+            settings,
+            super::super::SetupMode::Prepare,
+            full_attention_spec,
+        )?;
+        full_attention.finish_flint_calibration(&dir, Instant::now())?;
+        let (window_off_nll, _, _, _) = forced_prefix(&mut full_attention, &ids, true, None)?;
+        ensure!(
+            (window_off_nll - graph_nll).abs() > 0.01 && window_off_nll - graph_nll >= 0.001,
+            "window-off control does not discriminate: candidate={graph_nll} control={window_off_nll}"
+        );
+        println!(
+            "FLINT_ENGINE_CONTROLS graph_nll={graph_nll:.9} eager_nll={eager_nll:.9} graph_eager_bits=0 sinks_off_nll={sinks_off_nll:.9} window_off_nll={window_off_nll:.9} PASS"
+        );
         Ok(())
     }
 }

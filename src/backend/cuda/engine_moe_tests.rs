@@ -884,6 +884,7 @@ impl Engine {
             moe_slots: Some(slots),
             moe_prefill,
             moe_test_ffn: Some(ffn),
+            flint_legacy_overflow_prefill: false,
             mtp: None,
             mtp_state: None,
             mtp_epoch: 0,
