@@ -594,6 +594,8 @@ fn gqa32_qknorm_rope_nope_gpu() -> Result<()> {
     let module = cubin::module(&device.ctx, "rope")?;
     let rope = module.load_function("draft_qknorm_rope_kv")?;
     let nope = module.load_function("qknorm_kv_nope")?;
+    let flint_rope = module.load_function("flint_qknorm_rope_kv")?;
+    let flint_nope = module.load_function("flint_qknorm_kv_nope")?;
     for (function, use_rope, name) in [(&rope, true, "rope"), (&nope, false, "nope")] {
         let reference = expected(max_rows, use_rope);
         for rows in [1usize, 2, 3, 64, 512, 513, 1024, 2048] {
@@ -702,6 +704,116 @@ fn gqa32_qknorm_rope_nope_gpu() -> Result<()> {
                 k_metrics.max_abs
             );
         }
+    }
+    for (function, use_rope, name) in [
+        (&flint_rope, true, "planar-rope"),
+        (&flint_nope, false, "planar-nope"),
+    ] {
+        let rows = 3usize;
+        let q_width = hq * dim;
+        let kv_width = hkv * dim;
+        let mut planar = Vec::with_capacity(rows * (q_width + 2 * kv_width));
+        for row in 0..rows {
+            let base = row * heads * dim;
+            planar.extend_from_slice(&input[base..base + q_width]);
+        }
+        for row in 0..rows {
+            let base = row * heads * dim + q_width;
+            planar.extend_from_slice(&input[base..base + kv_width]);
+        }
+        for row in 0..rows {
+            let base = row * heads * dim + q_width + kv_width;
+            planar.extend_from_slice(&input[base..base + kv_width]);
+        }
+        let planar_dev = s.clone_htod(&planar)?;
+        let k_dev = s.alloc_zeros::<bf16>(hkv * capacity * dim)?;
+        let v_dev = s.alloc_zeros::<bf16>(hkv * capacity * dim)?;
+        let q_stride = q_width as u64;
+        let kv_stride = kv_width as u64;
+        let k_offset = (rows * q_width) as u64;
+        let v_offset = (rows * (q_width + kv_width)) as u64;
+        unsafe {
+            s.launch_builder(function)
+                .arg(&planar_dev)
+                .arg(&k_dev)
+                .arg(&v_dev)
+                .arg(&q_norm_dev)
+                .arg(&k_norm_dev)
+                .arg(&start_dev)
+                .arg(&(rows as i32))
+                .arg(&(hq as i32))
+                .arg(&(hkv as i32))
+                .arg(&(dim as i32))
+                .arg(&(capacity as i32))
+                .arg(&0i32)
+                .arg(&10_000.0f32)
+                .arg(&1e-6f32)
+                .arg(&q_stride)
+                .arg(&k_offset)
+                .arg(&kv_stride)
+                .arg(&v_offset)
+                .arg(&kv_stride)
+                .launch(LaunchConfig {
+                    grid_dim: ((rows * heads) as u32, 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        s.synchronize()?;
+        let actual = s.clone_dtoh(&planar_dev)?;
+        let reference = expected(rows, use_rope);
+        let mut expected_q = Vec::with_capacity(rows * q_width);
+        let mut expected_k = Vec::with_capacity(rows * kv_width);
+        for row in 0..rows {
+            let base = row * heads * dim;
+            expected_q.extend_from_slice(&reference[0][base..base + q_width]);
+            expected_k.extend_from_slice(&reference[0][base + q_width..base + q_width + kv_width]);
+        }
+        let expected_v = &planar[v_offset as usize..];
+        let q_metrics = attention_metrics(
+            &actual[..rows * q_width],
+            &expected_q
+                .iter()
+                .map(|value| value.to_f32())
+                .collect::<Vec<_>>(),
+        );
+        let k_metrics = attention_metrics(
+            &actual[k_offset as usize..k_offset as usize + rows * kv_width],
+            &expected_k
+                .iter()
+                .map(|value| value.to_f32())
+                .collect::<Vec<_>>(),
+        );
+        let mismatch = actual[v_offset as usize..]
+            .iter()
+            .zip(expected_v)
+            .enumerate()
+            .find(|(_, (actual, expected))| actual.to_bits() != expected.to_bits());
+        if let Some((index, (actual, expected))) = mismatch {
+            ensure!(
+                false,
+                "{name} V planar writes are not bitwise at index {index}: actual={actual:?} expected={expected:?}"
+            );
+        }
+        let bound = super::bf16_chain_bound(3, &[dim]) as f32;
+        for (label, metrics) in [("q", q_metrics), ("k", k_metrics)] {
+            let max_bound = bound * metrics.max_reference;
+            ensure!(
+                metrics.max_abs <= max_bound
+                    && metrics.p99_abs <= max_bound / 2.0
+                    && metrics.mean_abs <= max_bound / 4.0
+                    && metrics.cosine >= 1.0 - bound,
+                "{name} {label} max={:.9e} p99={:.9e} mean={:.9e} cosine={:.9e} bound={max_bound:e}",
+                metrics.max_abs,
+                metrics.p99_abs,
+                metrics.mean_abs,
+                metrics.cosine
+            );
+        }
+        eprintln!(
+            "GQA32_QKNORM mode={name} rows={rows} q_max={:.9e} k_max={:.9e} v_bitwise=true PASS",
+            q_metrics.max_abs, k_metrics.max_abs
+        );
     }
     Ok(())
 }

@@ -863,7 +863,14 @@ impl Engine {
                 reserves,
                 service,
                 1_000_000_000.0,
-                (workspace_rows, 8),
+                (
+                    model_spec
+                        .moe
+                        .context("MoE shared geometry missing")?
+                        .shared_intermediate,
+                    workspace_rows,
+                    8,
+                ),
             )?)
         } else {
             None

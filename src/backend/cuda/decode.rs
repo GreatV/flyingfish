@@ -14,7 +14,6 @@ pub struct Attention {
     second: CudaFunction,
     window_first: CudaFunction,
     sink_second: CudaFunction,
-    set_length: CudaFunction,
     scratch: CudaSlice<f32>,
     first_launch: LaunchConfig,
     second_launch: LaunchConfig,
@@ -115,7 +114,6 @@ impl Attention {
         let window_first =
             module.load_function(&format!("flash_decode_window_phase1_q{}", settings.qpack))?;
         let sink_second = module.load_function("flash_decode_sink_phase2")?;
-        let set_length = module.load_function("flash_decode_set_length")?;
         ensure!(
             settings.threads as i32 <= first.max_threads_per_block()?
                 && settings.merge_threads as i32 <= second.max_threads_per_block()?
@@ -153,7 +151,6 @@ impl Attention {
             second,
             window_first,
             sink_second,
-            set_length,
             scratch,
             first_launch,
             second_launch,
@@ -295,16 +292,10 @@ impl Attention {
             self.chunk
         );
         let (ptr, _length) = length.device_ptr_mut(stream);
+        stream.context().bind_to_thread()?;
+        let bits = u32::try_from(value)?;
         unsafe {
-            stream
-                .launch_builder(&self.set_length)
-                .arg(&ptr)
-                .arg(&value)
-                .launch(LaunchConfig {
-                    grid_dim: (1, 1, 1),
-                    block_dim: (1, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
+            cudarc::driver::sys::cuMemsetD32Async(ptr, bits, 1, stream.cu_stream()).result()?;
         }
         Ok(())
     }

@@ -169,34 +169,44 @@ impl Setup {
         if let Some(rows) = request.requested {
             spans.retain(|&span| span >= rows);
         }
+        let choice_row_alignment = match (geometry.top_k * 2) % 16 {
+            0 => 1,
+            8 => 2,
+            4 | 12 => 4,
+            2 | 6 | 10 | 14 => 8,
+            _ => 16,
+        };
+        spans.retain(|&span| span >= choice_row_alignment);
         spans.retain(|&span| span >= decode_rows);
         for span in spans {
             let span_rows = u32::try_from(span)?;
             let mut wave_rows = 1u32;
             // L2 bounds activation scratch.
             while wave_rows <= span_rows / 2
-                && crate::backend::cuda::moe::prefill::prefill_scratch_bytes(
+                && crate::backend::cuda::moe::prefill::prefill_scratch_bytes_mixed(
                     wave_rows as usize * 2,
                     span_rows as usize,
                     geometry.top_k as usize,
                     geometry.experts as usize,
                     geometry.hidden as usize,
-                    geometry.intermediate as usize,
+                    (geometry.intermediate as usize, shared_intermediate as usize),
                     None,
                 )? <= device.info.l2_bytes as u64 / 2
             {
                 wave_rows *= 2;
             }
-            let scratch =
-                usize::try_from(crate::backend::cuda::moe::prefill::prefill_scratch_bytes(
+            wave_rows = wave_rows.next_multiple_of(u32::try_from(choice_row_alignment)?);
+            let scratch = usize::try_from(
+                crate::backend::cuda::moe::prefill::prefill_scratch_bytes_mixed(
                     wave_rows as usize,
                     span_rows as usize,
                     geometry.top_k as usize,
                     geometry.experts as usize,
                     geometry.hidden as usize,
-                    geometry.intermediate as usize,
+                    (geometry.intermediate as usize, shared_intermediate as usize),
                     catalogue.layout().fp8_slot(),
-                )?)?;
+                )?,
+            )?;
             let decode_scratch = usize::try_from(decode_scratch_bytes(
                 1,
                 geometry.top_k as usize,
@@ -400,6 +410,11 @@ impl Setup {
             self.measured.service,
             self.measured.h2d_bytes_per_second,
             (
+                engine
+                    .model_spec
+                    .moe
+                    .context("MoE shared geometry missing")?
+                    .shared_intermediate,
                 self.workspace.workspace_rows,
                 self.workspace.mixer.plan.chunk,
             ),

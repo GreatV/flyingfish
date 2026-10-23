@@ -115,7 +115,7 @@ impl Engine {
         Ok(())
     }
 
-    fn moe_slot_layer(&self, layer: usize) -> Result<usize> {
+    pub(super) fn moe_slot_layer(&self, layer: usize) -> Result<usize> {
         let first = self
             .model_spec
             .layers

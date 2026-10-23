@@ -5,7 +5,7 @@ use super::combine::{CombineOps, MoeCombine};
 use super::prefill::{
     GEMM1_PTR_WORDS, GEMM2_PTR_WORDS, MAX_EXPERTS, MoePrefill, MoePrefillContribute,
     MoePrefillFinish, PrefillOps, d2h_active_total_word, d2h_window_words, group_runs,
-    prefill_layout, prefill_scratch_bytes, problem_order,
+    prefill_layout, prefill_scratch_bytes, prefill_scratch_bytes_mixed, problem_order,
 };
 use super::reference::{self, Combine, MoeDims, MoeFixture};
 use super::testing;
@@ -709,6 +709,7 @@ fn moe_input<'a>(
         fx.dims.inter,
     );
     Ok(MoePrefill {
+        expert_inter: inter as u32,
         x: testing::dense(&bufs.x, s, rows as u32, hidden as u32)?,
         ids: testing::dense(&bufs.ids, s, rows as u32, top_k as u32)?,
         active: testing::dense(&bufs.active, s, rows as u32, top_k as u32)?,
@@ -764,6 +765,7 @@ fn contribute_input<'a>(
         fx.dims.inter,
     );
     Ok(MoePrefillContribute {
+        expert_inter: inter as u32,
         cpu_arithmetic: &[false; MAX_EXPERTS][..experts],
         fp8_slot: None,
         wave: None,
@@ -1276,6 +1278,120 @@ fn moe_prefill_gpu() -> Result<()> {
             },
             &mut defects,
         )?;
+    }
+
+    // Flint geometry: routed experts use I=64 while the always-on shared
+    // expert uses I=128. The old single-width path read past each routed
+    // down-projection row.
+    {
+        let mut mixed_dims = MoeDims::new(2, 16, 4, 128, 64);
+        mixed_dims.shared_inter = 128;
+        let mixed = reference::fixture(mixed_dims, 11);
+        let (mi, msi, mh, mk, me) = (
+            mixed.dims.inter,
+            mixed.dims.shared_inter,
+            mixed.dims.hidden,
+            mixed.dims.top_k,
+            mixed.dims.experts,
+        );
+        let x_m = testing::upload(&d.upload, mixed.x.clone())?;
+        let gu_m = testing::upload(&d.upload, mixed.gate_up.clone())?;
+        let dn_m = testing::upload(&d.upload, mixed.down.clone())?;
+        let sg_m = testing::upload(&d.upload, mixed.shared_gate.clone())?;
+        let su_m = testing::upload(&d.upload, mixed.shared_up.clone())?;
+        let sd_m = testing::upload(&d.upload, mixed.shared_down.clone())?;
+        let seg_m = testing::upload(&d.upload, mixed.shared_expert_gate.clone())?;
+        d.finish_upload()?;
+        let routed0 = reference::route_row(&mixed, 0);
+        let routed1 = reference::route_row(&mixed, 1);
+        let mut ids_host_m = routed0.ids.clone();
+        ids_host_m.extend_from_slice(&routed1.ids);
+        let mut weights_host_m = routed0.weights.clone();
+        weights_host_m.extend_from_slice(&routed1.weights);
+        let active_m = vec![1u32; 2 * mk];
+        let generations_m = vec![1u64; me];
+        let valid_m = vec![1u32; me];
+        let gu_base_m = gu_m.device_ptr(s).0;
+        let dn_base_m = dn_m.device_ptr(s).0;
+        let gu_stride_m = (2 * mi * mh * 2) as u64;
+        let dn_stride_m = (mh * mi * 2) as u64;
+        let gu_table_m: Vec<u64> = (0..me)
+            .map(|expert| gu_base_m + expert as u64 * gu_stride_m)
+            .collect();
+        let dn_table_m: Vec<u64> = (0..me)
+            .map(|expert| dn_base_m + expert as u64 * dn_stride_m)
+            .collect();
+        let gu_table_dev = testing::upload(s, gu_table_m.clone())?;
+        let dn_table_dev = testing::upload(s, dn_table_m.clone())?;
+        let ids_m = testing::upload(s, ids_host_m.clone())?;
+        let weights_m = testing::upload(s, weights_host_m.clone())?;
+        let valid_dev_m = testing::upload(s, valid_m)?;
+        let generations_dev_m = testing::upload(s, generations_m)?;
+        let assignment_gen_m = testing::upload(s, vec![1u64; 2 * mk])?;
+        let active_dev_m = testing::upload(s, active_m)?;
+        let contributions_buf_m = testing::zeros::<bf16>(s, 2 * mk * mh)?;
+        let done_buf_m = testing::zeros::<u32>(s, 2 * mk)?;
+        let contributions_m = testing::view(
+            &contributions_buf_m,
+            s,
+            [2, mk as u32, mh as u32],
+            [(mk * mh) as u64, mh as u64, 1],
+        )?;
+        let done_m = testing::mut_view(&done_buf_m, s, [2, mk as u32], [mk as u64, 1])?;
+        let scratch_bytes_m = prefill_scratch_bytes_mixed(2, 2, mk, me, mh, (mi, msi), None)?;
+        let scratch_m = testing::zeros::<u8>(s, scratch_bytes_m as usize)?;
+        let scratch_view_m = Scratch {
+            ptr: scratch_m.device_ptr(s).0,
+            bytes: scratch_bytes_m,
+        };
+        let y_m = testing::zeros::<bf16>(s, 2 * mh)?;
+        let input_m = MoePrefill {
+            expert_inter: mi as u32,
+            x: testing::dense(&x_m, s, 2, mh as u32)?,
+            ids: testing::dense(&ids_m, s, 2, mk as u32)?,
+            active: testing::dense(&active_dev_m, s, 2, mk as u32)?,
+            weights: testing::dense(&weights_m, s, 2, mk as u32)?,
+            slots_gate_up: testing::view(&gu_table_dev, s, [me as u32], [1])?,
+            slots_down: testing::view(&dn_table_dev, s, [me as u32], [1])?,
+            slot_valid: testing::view(&valid_dev_m, s, [me as u32], [1])?,
+            slot_generation: testing::view(&generations_dev_m, s, [me as u32], [1])?,
+            assignment_gen: testing::dense(&assignment_gen_m, s, 2, mk as u32)?,
+            slots_gate_up_host: &gu_table_m,
+            slots_down_host: &dn_table_m,
+            shared_gate: testing::dense(&sg_m, s, msi as u32, mh as u32)?,
+            shared_up: testing::dense(&su_m, s, msi as u32, mh as u32)?,
+            shared_down: testing::dense(&sd_m, s, mh as u32, msi as u32)?,
+            shared_expert_gate: Some(testing::view(&seg_m, s, [mh as u32], [1])?),
+            contributions: contributions_m,
+            done: done_m,
+            y: testing::dense_mut(&y_m, s, 2, mh as u32)?,
+        };
+        ops.prefill(s, input_m, &scratch_view_m)?;
+        s.synchronize()?;
+        let got_m = s.clone_dtoh(&y_m)?;
+        let want_m = reference::moe_row_ids(
+            &mixed,
+            0,
+            &routed0.ids,
+            &routed0.weights,
+            &(0..mk).collect::<Vec<_>>(),
+            reference::Combine::Fp32,
+        );
+        let diff_m = got_m[..mh]
+            .iter()
+            .zip(&want_m)
+            .map(|(got, want)| (got.to_f32() - want.to_f32()).abs())
+            .fold(0.0f32, f32::max);
+        let tol_m = reference::tolerance(&mixed, &[0]);
+        if diff_m > tol_m {
+            defects.push(format!(
+                "mixed prefill expert_inter={mi} shared_inter={msi} max_diff={diff_m:e} tol={tol_m:e}"
+            ));
+        } else {
+            println!(
+                "MOE_PREFILL_MIXED expert_inter={mi} shared_inter={msi} max_diff={diff_m:e} tol={tol_m:e} PASS"
+            );
+        }
     }
 
     // Partial-active cohort at rows=37: every 5th assignment inactive; the
@@ -2050,6 +2166,7 @@ fn prefill_racecheck_small_gpu() -> Result<()> {
     let y: CudaSlice<bf16> = s.alloc_zeros(rows * hidden)?;
     let y_view = testing::dense_mut(&y, s, rows as u32, hidden as u32)?;
     let input = MoePrefill {
+        expert_inter: inter as u32,
         x: testing::dense(&x, s, rows as u32, hidden as u32)?,
         ids: testing::dense(&ids_buf, s, rows as u32, top_k as u32)?,
         active: testing::dense(&active_buf, s, rows as u32, top_k as u32)?,
@@ -2170,6 +2287,7 @@ fn prefill_reset_done_gpu() -> Result<()> {
             &gens,
         )?;
         let fin = MoePrefillFinish {
+            expert_inter: fx.dims.inter as u32,
             x: testing::dense(&union.x, s, rows as u32, hidden as u32)?,
             ids: testing::dense(&union.ids, s, rows as u32, top_k as u32)?,
             final_active: testing::dense(&union.active, s, rows as u32, top_k as u32)?,
@@ -2361,6 +2479,7 @@ fn k5c_seam_child() -> Result<()> {
             )?;
             let y_view = testing::dense_mut(&y_fin, s, rows as u32, hidden as u32)?;
             MoePrefillFinish {
+                expert_inter: fx.dims.inter as u32,
                 x: testing::dense(&union.x, s, rows as u32, hidden as u32)?,
                 ids: testing::dense(&union.ids, s, rows as u32, top_k as u32)?,
                 final_active: testing::dense(&union.active, s, rows as u32, top_k as u32)?,
@@ -2890,6 +3009,7 @@ fn prefill_packed_waves_gpu() -> Result<()> {
                 run_ops.prefill_contribute(
                     s,
                     MoePrefillContribute {
+                        expert_inter: inter as u32,
                         cpu_arithmetic: &cpu_arithmetic,
                         fp8_slot: run_fp8_slot,
                         wave: wave_active.map(|a| (cohort, base, a)),
@@ -3107,6 +3227,7 @@ fn prefill_packed_waves_gpu() -> Result<()> {
     let mismatch = ops.prefill_contribute(
         s,
         MoePrefillContribute {
+            expert_inter: inter as u32,
             cpu_arithmetic: &cpu_arithmetic,
             fp8_slot: None,
             wave: Some((0, base, active - 1)),

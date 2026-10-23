@@ -39,6 +39,14 @@ fn debug_name(trace: &Option<Target<'_>>, layer: usize, point: &str) -> String {
     }
 }
 
+fn norm_mode(spec: &crate::model_spec::ModelSpec) -> RmsMode {
+    if spec.architecture == crate::model_spec::Architecture::Flint {
+        RmsMode::Standard
+    } else {
+        RmsMode::ZeroCentered
+    }
+}
+
 fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
     use crate::model_spec::{Architecture, LinearFormat};
     let (hidden, intermediate, vocab, hq, hkv, layers, hv, format) = match spec.architecture {
@@ -423,13 +431,13 @@ impl Runtime {
                 intermediate,
                 moe.shared_intermediate as usize,
             );
-            let prefill = crate::backend::cuda::moe::prefill::prefill_scratch_bytes(
+            let prefill = crate::backend::cuda::moe::prefill::prefill_scratch_bytes_mixed(
                 rows,
                 rows,
                 top_k,
                 experts,
                 hidden,
-                intermediate,
+                (intermediate, moe.shared_intermediate as usize),
                 None,
             )?;
             return Ok(usize::try_from(decode.max(prefill).div_ceil(256) * 256)?);
@@ -543,8 +551,8 @@ impl Runtime {
                             sinks: catalog
                                 .bf16(&format!("{prefix}self_attn.softmax_offset"))?
                                 .clone(),
-                            rope: module.load_function("draft_qknorm_rope_kv")?,
-                            nope: module.load_function("qknorm_kv_nope")?,
+                            rope: module.load_function("flint_qknorm_rope_kv")?,
+                            nope: module.load_function("flint_qknorm_kv_nope")?,
                         }
                     } else {
                         let attention = *attention
@@ -2200,8 +2208,6 @@ impl Engine {
                 rope,
                 nope,
             } => {
-                let qkv_width = (self.model_spec.q_heads + 2 * self.model_spec.kv_heads) as usize
-                    * self.model_spec.head_dim as usize;
                 for (role, width, offset) in [
                     ("self_attn.q_proj.weight", q_width as usize, 0),
                     (
@@ -2232,6 +2238,10 @@ impl Engine {
                 } else {
                     (nope, false)
                 };
+                let q_source_stride = u64::from(q_width);
+                let kv_source_stride = u64::from(kv_width);
+                let k_source_offset = u64::from(linear_rows as u32) * u64::from(q_width);
+                let v_source_offset = u64::from(linear_rows as u32) * u64::from(q_width + kv_width);
                 ensure!(
                     !use_rope || self.model_spec.layers[i].rope,
                     "Flint RoPE function selected for NoPE layer {i}"
@@ -2252,6 +2262,11 @@ impl Engine {
                         .arg(&(if sliding { ring as i32 } else { 0 }))
                         .arg(&(self.model_spec.rope_theta))
                         .arg(&(self.model_spec.rms_eps))
+                        .arg(&q_source_stride)
+                        .arg(&k_source_offset)
+                        .arg(&kv_source_stride)
+                        .arg(&v_source_offset)
+                        .arg(&kv_source_stride)
                         .launch(LaunchConfig {
                             grid_dim: (
                                 (rows
@@ -2293,7 +2308,7 @@ impl Engine {
                                     s,
                                     GqaDecodeInput {
                                         q: &w.qkv,
-                                        q_offset: row * qkv_width,
+                                        q_offset: row * q_width as usize,
                                         k: &kv.k,
                                         v: &kv.v,
                                         output: &mut w.attn,
@@ -2313,7 +2328,7 @@ impl Engine {
                             self.flash
                                 .as_mut()
                                 .context("Flint prefill attention is not bound")?
-                                .run(&w.qkv, qkv_width, &kv.k, &kv.v, &mut w.attn, shape)?;
+                                .run(&w.qkv, q_width as usize, &kv.k, &kv.v, &mut w.attn, shape)?;
                             self.flash
                                 .as_mut()
                                 .context("Flint prefill attention is not bound")?
@@ -2781,7 +2796,7 @@ impl Engine {
                         layer.input_norm,
                         &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
                         RmsOptions {
-                            mode: RmsMode::ZeroCentered,
+                            mode: norm_mode(&self.model_spec),
                             eps: self.model_spec.rms_eps,
                         },
                     )?;
@@ -2793,20 +2808,42 @@ impl Engine {
             }
             O::PostNorm | O::NextNorm => {
                 if matches!(op, O::PostNorm) {
-                    q.common.norm.rms_add_with(
-                        s,
-                        domain,
-                        ResidualRmsInput {
-                            x: &mut TensorMut(heads(&w.x, s, 0, rows, 1, h as u32)?),
-                            residual: heads(&w.out, s, 0, rows, 1, h as u32)?,
-                            weight: layer.post_norm,
-                        },
-                        &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
-                        RmsOptions {
-                            mode: RmsMode::ZeroCentered,
-                            eps: self.model_spec.rms_eps,
-                        },
-                    )?;
+                    let mode = norm_mode(&self.model_spec);
+                    if matches!(mode, RmsMode::Standard) {
+                        unsafe {
+                            s.launch_builder(&self.ops.residual)
+                                .arg(&mut w.x)
+                                .arg(&w.out)
+                                .arg(&(i32::try_from(rows * h)?))
+                                .launch(flat(rows * h))?;
+                        }
+                        q.common.norm.rms_with(
+                            s,
+                            domain,
+                            heads(&w.x, s, 0, rows, 1, h as u32)?,
+                            layer.post_norm,
+                            &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
+                            RmsOptions {
+                                mode,
+                                eps: self.model_spec.rms_eps,
+                            },
+                        )?;
+                    } else {
+                        q.common.norm.rms_add_with(
+                            s,
+                            domain,
+                            ResidualRmsInput {
+                                x: &mut TensorMut(heads(&w.x, s, 0, rows, 1, h as u32)?),
+                                residual: heads(&w.out, s, 0, rows, 1, h as u32)?,
+                                weight: layer.post_norm,
+                            },
+                            &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
+                            RmsOptions {
+                                mode,
+                                eps: self.model_spec.rms_eps,
+                            },
+                        )?;
+                    }
                     if all_layers(trace) || i == self.trace_layer {
                         let name = debug_name(trace, i, "post_attention");
                         trace_value(trace, s, &name, &w.x, rows, h)?;
@@ -2842,7 +2879,7 @@ impl Engine {
                             },
                             &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
                             RmsOptions {
-                                mode: RmsMode::ZeroCentered,
+                                mode: norm_mode(&self.model_spec),
                                 eps: self.model_spec.rms_eps,
                             },
                         )?;
@@ -2855,14 +2892,7 @@ impl Engine {
                                 .launch(flat(rows * h))?;
                         }
                     }
-                    if trace.is_some()
-                        && (!all_layers(trace)
-                            || [0, 3, 7, 31, 32, 47, 63].contains(&i)
-                            || self
-                                .hidden_capture
-                                .as_ref()
-                                .is_some_and(|capture| capture.layer_slots[i].is_some()))
-                    {
+                    if trace.is_some() {
                         let name = if all_layers(trace) {
                             i.to_string()
                         } else {
@@ -2917,12 +2947,11 @@ impl Engine {
                         vector(&self.weights.norm, s)?,
                         &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
                         RmsOptions {
-                            mode: RmsMode::ZeroCentered,
+                            mode: norm_mode(&self.model_spec),
                             eps: self.model_spec.rms_eps,
                         },
                     )?;
                 }
-                #[cfg(test)]
                 trace_value(trace, s, "norm", &w.n, rows, h)?;
                 if step.head == Head::All {
                     let spec = self
