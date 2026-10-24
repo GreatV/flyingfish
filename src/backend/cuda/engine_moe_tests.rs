@@ -876,6 +876,7 @@ impl Engine {
                         .shared_intermediate,
                     workspace_rows,
                     8,
+                    model_spec.routed_weight_boundary(),
                 ),
             )?)
         } else {

@@ -315,7 +315,13 @@ fn dot(a: &[bf16], b: &[bf16]) -> f32 {
         .sum()
 }
 
-fn expert_out(fx: &MoeFixture, e: usize, xr: &[bf16], weight: bf16) -> Vec<bf16> {
+fn expert_out(
+    fx: &MoeFixture,
+    e: usize,
+    xr: &[bf16],
+    weight: bf16,
+    routed_weight: crate::model_spec::RoutedWeightBoundary,
+) -> Vec<bf16> {
     let (h, i) = (fx.dims.hidden, fx.dims.inter);
     let mut prod = Vec::with_capacity(i);
     for j in 0..i {
@@ -326,8 +332,16 @@ fn expert_out(fx: &MoeFixture, e: usize, xr: &[bf16], weight: bf16) -> Vec<bf16>
     }
     (0..h)
         .map(|d| {
-            let lin = bf16::from_f32(dot(&prod, fx.down_row(e, d)));
-            bf16::from_f32(lin.to_f32() * weight.to_f32())
+            let lin = dot(&prod, fx.down_row(e, d));
+            let weighted = match routed_weight {
+                crate::model_spec::RoutedWeightBoundary::AfterDownBf16 => {
+                    bf16::from_f32(lin).to_f32() * weight.to_f32()
+                }
+                crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16 => {
+                    lin * weight.to_f32()
+                }
+            };
+            bf16::from_f32(weighted)
         })
         .collect()
 }
@@ -364,6 +378,26 @@ pub(crate) fn moe_row_ids(
     keep: &[usize],
     combine: Combine,
 ) -> Vec<bf16> {
+    moe_row_ids_with_boundary(
+        fx,
+        row,
+        ids,
+        weights,
+        keep,
+        combine,
+        crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+    )
+}
+
+pub(crate) fn moe_row_ids_with_boundary(
+    fx: &MoeFixture,
+    row: usize,
+    ids: &[i32],
+    weights: &[bf16],
+    keep: &[usize],
+    combine: Combine,
+    routed_weight: crate::model_spec::RoutedWeightBoundary,
+) -> Vec<bf16> {
     let h = fx.dims.hidden;
     assert!(row < fx.dims.rows);
     assert!(!keep.is_empty());
@@ -379,7 +413,7 @@ pub(crate) fn moe_row_ids(
     let xr = &fx.x[row * h..(row + 1) * h];
     let contributions: Vec<Vec<bf16>> = slots
         .iter()
-        .map(|&(e, w)| expert_out(fx, e, xr, w))
+        .map(|&(e, w)| expert_out(fx, e, xr, w, routed_weight))
         .collect();
     let shared = shared_out(fx, xr);
     let scale = bf16::from_f32(sigmoid(

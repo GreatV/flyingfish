@@ -183,28 +183,31 @@ impl Setup {
             let mut wave_rows = 1u32;
             // L2 bounds activation scratch.
             while wave_rows <= span_rows / 2
-                && crate::backend::cuda::moe::prefill::prefill_scratch_bytes_mixed(
+                && crate::backend::cuda::moe::prefill::prefill_scratch_bytes_mixed_with_boundary(
                     wave_rows as usize * 2,
                     span_rows as usize,
                     geometry.top_k as usize,
                     geometry.experts as usize,
                     geometry.hidden as usize,
                     (geometry.intermediate as usize, shared_intermediate as usize),
-                    None,
+                    (None, model.routed_weight_boundary()),
                 )? <= device.info.l2_bytes as u64 / 2
             {
                 wave_rows *= 2;
             }
             wave_rows = wave_rows.next_multiple_of(u32::try_from(choice_row_alignment)?);
             let scratch = usize::try_from(
-                crate::backend::cuda::moe::prefill::prefill_scratch_bytes_mixed(
+                crate::backend::cuda::moe::prefill::prefill_scratch_bytes_mixed_with_boundary(
                     wave_rows as usize,
                     span_rows as usize,
                     geometry.top_k as usize,
                     geometry.experts as usize,
                     geometry.hidden as usize,
                     (geometry.intermediate as usize, shared_intermediate as usize),
-                    catalogue.layout().fp8_slot(),
+                    (
+                        catalogue.layout().fp8_slot(),
+                        model.routed_weight_boundary(),
+                    ),
                 )?,
             )?;
             let decode_scratch = usize::try_from(decode_scratch_bytes(
@@ -423,6 +426,7 @@ impl Setup {
                     .shared_intermediate,
                 self.workspace.workspace_rows,
                 self.workspace.mixer.plan.chunk,
+                engine.model_spec.routed_weight_boundary(),
             ),
         )?);
         let prefill_new_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
@@ -683,11 +687,12 @@ impl Decode {
             phase: DecodePhase::default(),
             route: RouteOps::new(context, stream)?,
             contribute: DecodeOps::new_with_boundaries(context, swiglu_rounding, routed_weight)?,
-            prefill: PrefillOps::new_with_swiglu_rounding(
+            prefill: PrefillOps::new_with_boundaries(
                 context,
                 stream,
                 format,
                 swiglu_rounding,
+                routed_weight,
             )?,
             combine: CombineOps::new(context)?,
             ids: stream.alloc_zeros(choices)?,
