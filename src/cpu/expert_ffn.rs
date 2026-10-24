@@ -598,11 +598,15 @@ fn scalar_gate_up_e4m3(
     up: &[u8],
     (gate_scale, up_scale): (bf16, bf16),
     out: &mut [(f32, f32)],
-    _scratch_w: &mut [f32],
+    scratch_w: &mut [f32],
 ) {
     let width = gate.len();
     assert_eq!(width, up.len(), "gate/up width mismatch");
     assert_eq!(row_offsets.len(), out.len(), "gate/up row count mismatch");
+    assert!(
+        scratch_w.len() >= width,
+        "gate_up_e4m3 scratch_w smaller than width"
+    );
     for (&offset, dst) in row_offsets.iter().zip(out.iter_mut()) {
         let x = &x_buf[offset..offset + width];
         *dst = (
@@ -626,10 +630,14 @@ fn scalar_down_rows_e4m3(
     down: &[u8],
     down_scale: bf16,
     out: &mut [f32],
-    _scratch_w: &mut [f32],
+    scratch_w: &mut [f32],
 ) {
     let width = down.len();
     assert_eq!(row_offsets.len(), out.len(), "down row count mismatch");
+    assert!(
+        scratch_w.len() >= width,
+        "down_rows_e4m3 scratch_w smaller than width"
+    );
     for (&offset, dst) in row_offsets.iter().zip(out.iter_mut()) {
         *dst = scalar_dot_e4m3(&x_buf[offset..offset + width], down, down_scale);
     }
@@ -646,16 +654,6 @@ fn scalar_round(values: &[f32], out: &mut [bf16]) {
 mod x86 {
     use super::{Arm, LANES, bf16, pairwise};
     use std::arch::x86_64::*;
-
-    #[cfg(test)]
-    pub(super) static FP8_DECODE_MODE: std::sync::atomic::AtomicU8 =
-        std::sync::atomic::AtomicU8::new(0);
-
-    #[cfg(test)]
-    pub(super) static E4M3_F32_LUT: std::sync::LazyLock<[f32; 256]> =
-        std::sync::LazyLock::new(|| {
-            std::array::from_fn(|code| crate::fp8::decode_e4m3(code as u8))
-        });
 
     #[target_feature(enable = "avx2,fma")]
     pub(super) unsafe fn dot(x: &[f32], weights: &[bf16]) -> f32 {
@@ -762,77 +760,9 @@ mod x86 {
         }
     }
 
-    /// E4M3 byte to f32 via shift/mask/blend (reference AVX2 decode).
-    #[cfg(test)]
-    #[target_feature(enable = "avx2,fma")]
-    pub(super) unsafe fn decode8_shift_mask(codes: *const u8) -> __m256 {
-        unsafe {
-            let packed = _mm_loadl_epi64(codes as *const __m128i);
-            let value = _mm256_cvtepu8_epi32(packed);
-            let sign = _mm256_slli_epi32(_mm256_and_si256(value, _mm256_set1_epi32(0x80)), 24);
-            let magnitude = _mm256_and_si256(value, _mm256_set1_epi32(0x7f));
-            let exponent = _mm256_srli_epi32(magnitude, 3);
-            let mantissa = _mm256_and_si256(magnitude, _mm256_set1_epi32(7));
-            let normal = _mm256_castsi256_ps(_mm256_or_si256(
-                sign,
-                _mm256_or_si256(
-                    _mm256_slli_epi32(_mm256_add_epi32(exponent, _mm256_set1_epi32(120)), 23),
-                    _mm256_slli_epi32(mantissa, 20),
-                ),
-            ));
-            let subnormal = _mm256_or_ps(
-                _mm256_castsi256_ps(sign),
-                _mm256_mul_ps(_mm256_cvtepi32_ps(mantissa), _mm256_set1_ps(1.0 / 512.0)),
-            );
-            let nan = _mm256_castsi256_ps(_mm256_or_si256(sign, _mm256_set1_epi32(0x7fc0_0000)));
-            let subnormal_mask =
-                _mm256_castsi256_ps(_mm256_cmpeq_epi32(exponent, _mm256_setzero_si256()));
-            let nan_mask =
-                _mm256_castsi256_ps(_mm256_cmpeq_epi32(magnitude, _mm256_set1_epi32(0x7f)));
-            _mm256_blendv_ps(
-                _mm256_blendv_ps(normal, subnormal, subnormal_mask),
-                nan,
-                nan_mask,
-            )
-        }
-    }
-
-    /// E4M3 byte to f32 via 256-entry L1 LUT `_mm256_i32gather_ps`.
-    #[cfg(test)]
-    #[target_feature(enable = "avx2,fma")]
-    pub(super) unsafe fn decode8_lut_gather(codes: *const u8) -> __m256 {
-        unsafe {
-            let packed = _mm_loadl_epi64(codes as *const __m128i);
-            let indices = _mm256_cvtepu8_epi32(packed);
-            _mm256_i32gather_ps::<4>(E4M3_F32_LUT.as_ptr(), indices)
-        }
-    }
-
     #[target_feature(enable = "avx2,fma")]
     unsafe fn decode16_scaled(codes: *const u8, factor: __m256) -> (__m256, __m256) {
         unsafe {
-            #[cfg(test)]
-            {
-                match FP8_DECODE_MODE.load(std::sync::atomic::Ordering::Relaxed) {
-                    1 => {
-                        let dl = decode8_shift_mask(codes);
-                        let dh = decode8_shift_mask(codes.add(8));
-                        return (
-                            round_bf16x8(_mm256_mul_ps(dl, factor)),
-                            round_bf16x8(_mm256_mul_ps(dh, factor)),
-                        );
-                    }
-                    2 => {
-                        let dl = decode8_lut_gather(codes);
-                        let dh = decode8_lut_gather(codes.add(8));
-                        return (
-                            round_bf16x8(_mm256_mul_ps(dl, factor)),
-                            round_bf16x8(_mm256_mul_ps(dh, factor)),
-                        );
-                    }
-                    _ => {}
-                }
-            }
             let (dl, dh) = decode16_vpshufb(codes);
             (
                 round_bf16x8(_mm256_mul_ps(dl, factor)),
@@ -1069,70 +999,38 @@ mod x86 {
             };
             return;
         }
-        for dst in out.iter_mut() {
-            *dst = (0.0, 0.0);
-        }
         let mut tmp = [0.0f32; 8];
         let count = row_offsets.len();
-        if count <= 8 {
+        let mut cursor = 0;
+        while cursor < count {
+            let chunk = (count - cursor).min(8);
             unsafe {
                 down_rows_e4m3(
                     x_buf,
-                    row_offsets,
+                    &row_offsets[cursor..cursor + chunk],
                     gate,
                     gate_scale,
-                    &mut tmp[..count],
+                    &mut tmp[..chunk],
                     scratch_w,
                 );
             }
-            for r in 0..count {
-                out[r].0 = tmp[r];
+            for r in 0..chunk {
+                out[cursor + r].0 = tmp[r];
             }
             unsafe {
                 down_rows_e4m3(
                     x_buf,
-                    row_offsets,
+                    &row_offsets[cursor..cursor + chunk],
                     up,
                     up_scale,
-                    &mut tmp[..count],
+                    &mut tmp[..chunk],
                     scratch_w,
                 );
             }
-            for r in 0..count {
-                out[r].1 = tmp[r];
+            for r in 0..chunk {
+                out[cursor + r].1 = tmp[r];
             }
-        } else {
-            let mut cursor = 0;
-            while cursor < count {
-                let chunk = (count - cursor).min(8);
-                unsafe {
-                    down_rows_e4m3(
-                        x_buf,
-                        &row_offsets[cursor..cursor + chunk],
-                        gate,
-                        gate_scale,
-                        &mut tmp[..chunk],
-                        scratch_w,
-                    );
-                }
-                for r in 0..chunk {
-                    out[cursor + r].0 = tmp[r];
-                }
-                unsafe {
-                    down_rows_e4m3(
-                        x_buf,
-                        &row_offsets[cursor..cursor + chunk],
-                        up,
-                        up_scale,
-                        &mut tmp[..chunk],
-                        scratch_w,
-                    );
-                }
-                for r in 0..chunk {
-                    out[cursor + r].1 = tmp[r];
-                }
-                cursor += chunk;
-            }
+            cursor += chunk;
         }
     }
 
@@ -1253,8 +1151,12 @@ mod x86 {
     ) {
         let width = down.len();
         assert_eq!(row_offsets.len(), out.len(), "down row count mismatch");
+        assert!(
+            scratch_w.len() >= width,
+            "down_rows_e4m3 scratch_w smaller than width"
+        );
         let factor = _mm256_set1_ps(down_scale.to_f32());
-        let save_decoded = row_offsets.len() > 4 && scratch_w.len() >= width;
+        let save_decoded = row_offsets.len() > 4;
         let mut cursor = 0;
         while cursor < row_offsets.len() {
             let chunk = (row_offsets.len() - cursor).min(4);
@@ -1426,11 +1328,31 @@ mod x86 {
 
     /// E4M3 byte to f32 as the scalar decode defines it: bias 7, no infinity,
     /// magnitude 0x7f is NaN, exponent 0 decodes to mantissa / 512.
-    #[target_feature(enable = "avx512f,avx512bf16,avx2")]
+    #[target_feature(enable = "avx512f,avx512bf16")]
     unsafe fn decode16(codes: *const u8) -> __m512 {
         unsafe {
-            let bf16_16 = decode16_bf16_bits(codes);
-            _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(bf16_16), 16))
+            let packed = _mm_loadu_si128(codes as *const __m128i);
+            let value = _mm512_cvtepu8_epi32(packed);
+            let sign = _mm512_slli_epi32(_mm512_and_si512(value, _mm512_set1_epi32(0x80)), 24);
+            let magnitude = _mm512_and_si512(value, _mm512_set1_epi32(0x7f));
+            let exponent = _mm512_srli_epi32(magnitude, 3);
+            let mantissa = _mm512_and_si512(magnitude, _mm512_set1_epi32(7));
+            let normal = _mm512_castsi512_ps(_mm512_or_si512(
+                sign,
+                _mm512_or_si512(
+                    _mm512_slli_epi32(_mm512_add_epi32(exponent, _mm512_set1_epi32(120)), 23),
+                    _mm512_slli_epi32(mantissa, 20),
+                ),
+            ));
+            let subnormal = _mm512_or_ps(
+                _mm512_castsi512_ps(sign),
+                _mm512_mul_ps(_mm512_cvtepi32_ps(mantissa), _mm512_set1_ps(1.0 / 512.0)),
+            );
+            let nan = _mm512_castsi512_ps(_mm512_or_si512(sign, _mm512_set1_epi32(0x7fc0_0000)));
+            let subnormal_mask = _mm512_cmpeq_epi32_mask(exponent, _mm512_setzero_si512());
+            let nan_mask = _mm512_cmpeq_epi32_mask(magnitude, _mm512_set1_epi32(0x7f));
+            let decoded = _mm512_mask_blend_ps(subnormal_mask, normal, subnormal);
+            _mm512_mask_blend_ps(nan_mask, decoded, nan)
         }
     }
 
@@ -1444,7 +1366,7 @@ mod x86 {
         _mm512_castsi512_ps(_mm512_and_si512(rounded, _mm512_set1_epi32(-65536)))
     }
 
-    #[target_feature(enable = "avx512f,avx512bf16,avx2")]
+    #[target_feature(enable = "avx512f,avx512bf16")]
     pub(super) unsafe fn dot_e4m3_512(x: &[f32], codes: &[u8], scale: bf16) -> f32 {
         assert_eq!(x.len(), codes.len(), "dot operand width mismatch");
         let factor = _mm512_set1_ps(scale.to_f32());
@@ -1467,52 +1389,6 @@ mod x86 {
             k += 1;
         }
         pairwise(&lanes)
-    }
-
-    #[target_feature(enable = "avx512f,avx512bf16,avx2,fma")]
-    pub(super) unsafe fn gate_up_512(
-        x_buf: &[f32],
-        row_offsets: &[usize],
-        gate: &[bf16],
-        up: &[bf16],
-        out: &mut [(f32, f32)],
-    ) {
-        unsafe { gate_up(x_buf, row_offsets, gate, up, out) };
-    }
-
-    #[target_feature(enable = "avx512f,avx512bf16,avx2,fma")]
-    pub(super) unsafe fn gate_up_e4m3_512(
-        x_buf: &[f32],
-        row_offsets: &[usize],
-        gate: &[u8],
-        up: &[u8],
-        scales: (bf16, bf16),
-        out: &mut [(f32, f32)],
-        scratch_w: &mut [f32],
-    ) {
-        unsafe { gate_up_e4m3(x_buf, row_offsets, gate, up, scales, out, scratch_w) };
-    }
-
-    #[target_feature(enable = "avx512f,avx512bf16,avx2,fma")]
-    pub(super) unsafe fn down_rows_512(
-        x_buf: &[f32],
-        row_offsets: &[usize],
-        down: &[bf16],
-        out: &mut [f32],
-    ) {
-        unsafe { down_rows(x_buf, row_offsets, down, out) };
-    }
-
-    #[target_feature(enable = "avx512f,avx512bf16,avx2,fma")]
-    pub(super) unsafe fn down_rows_e4m3_512(
-        x_buf: &[f32],
-        row_offsets: &[usize],
-        down: &[u8],
-        down_scale: bf16,
-        out: &mut [f32],
-        scratch_w: &mut [f32],
-    ) {
-        unsafe { down_rows_e4m3(x_buf, row_offsets, down, down_scale, out, scratch_w) };
     }
 
     #[target_feature(enable = "avx512f,avx512bf16")]
@@ -1545,10 +1421,10 @@ mod x86 {
     pub(super) const AVX512: Arm = Arm {
         dot: dot_512,
         dot_e4m3: dot_e4m3_512,
-        gate_up: gate_up_512,
-        gate_up_e4m3: gate_up_e4m3_512,
-        down_rows: down_rows_512,
-        down_rows_e4m3: down_rows_e4m3_512,
+        gate_up,
+        gate_up_e4m3,
+        down_rows,
+        down_rows_e4m3,
         round: round_512,
     };
 }
@@ -1637,6 +1513,8 @@ struct JobSlot {
     experts: Vec<ExpertWeights>,
     groups: Vec<ExpertGroup>,
     grouped_items: Vec<GroupedItem>,
+    expert_group: Vec<u16>,
+    group_cursor: Vec<u16>,
 }
 
 impl JobSlot {
@@ -1648,6 +1526,8 @@ impl JobSlot {
             experts: Vec::with_capacity(max_assignments),
             groups: Vec::with_capacity(max_assignments),
             grouped_items: Vec::with_capacity(max_assignments),
+            expert_group: vec![u16::MAX; max_assignments],
+            group_cursor: Vec::with_capacity(max_assignments),
         }
     }
 }
@@ -1664,6 +1544,7 @@ struct Local {
     down_out: Vec<f32>,
     act_f: Vec<f32>,
     scratch_w: Vec<f32>,
+    /// Per-worker staged `(slot_index, bf16_bits)` writes (`[block]`, 16 B/entry).
     out_pairs: Vec<(usize, u16)>,
 }
 
@@ -1682,7 +1563,7 @@ impl Local {
             down_out: vec![0.0; max_assignments],
             act_f: vec![0.0; max_assignments * shape.intermediate],
             scratch_w: vec![0.0; shape.hidden.max(shape.intermediate)],
-            out_pairs: Vec::with_capacity(block * max_assignments),
+            out_pairs: Vec::with_capacity(block),
         }
     }
 }
@@ -1770,9 +1651,12 @@ impl ExpertPool {
             workers > 0 && workers <= 256,
             "invalid expert worker count {workers}"
         );
-        ensure!(max_rows > 0, "zero expert row capacity");
         ensure!(
-            max_assignments > 0 && max_assignments <= 1 << 16,
+            max_rows > 0 && max_rows <= usize::from(u16::MAX),
+            "invalid expert row capacity {max_rows}"
+        );
+        ensure!(
+            max_assignments > 0 && max_assignments <= usize::from(u16::MAX),
             "invalid expert assignment capacity {max_assignments}"
         );
         let isa = Isa::detect();
@@ -1934,37 +1818,56 @@ impl ExpertPool {
                 .job
                 .write()
                 .map_err(|_| anyhow::anyhow!("expert pool job lock poisoned"))?;
+            let slot = &mut *slot;
             slot.rows = rows;
             slot.arena = Some(lease);
             slot.hidden[..hidden.len()].copy_from_slice(hidden);
             slot.experts.clear();
             slot.experts.extend_from_slice(experts);
             slot.groups.clear();
-            slot.grouped_items.clear();
+            slot.group_cursor.clear();
+            for item in assignments {
+                let expert_idx = item.expert as usize;
+                let group_idx = slot.expert_group[expert_idx];
+                if group_idx == u16::MAX {
+                    slot.expert_group[expert_idx] = slot.groups.len() as u16;
+                    slot.groups.push(ExpertGroup {
+                        expert: item.expert,
+                        start: 0,
+                        len: 1,
+                    });
+                } else {
+                    slot.groups[group_idx as usize].len += 1;
+                }
+            }
+            let mut offset = 0u16;
+            for group in &mut slot.groups {
+                group.start = offset;
+                slot.group_cursor.push(offset);
+                offset += group.len;
+            }
+            slot.grouped_items.resize(
+                assignments.len(),
+                GroupedItem {
+                    item: 0,
+                    row: 0,
+                    choice: 0,
+                    weight: bf16::ZERO,
+                },
+            );
             for (item_idx, item) in assignments.iter().enumerate() {
-                if slot.groups.iter().any(|g| g.expert == item.expert) {
-                    continue;
-                }
-                let start = u16::try_from(slot.grouped_items.len())
-                    .context("grouped item start exceeds u16")?;
-                for (offset, other) in assignments[item_idx..].iter().enumerate() {
-                    if other.expert == item.expert {
-                        slot.grouped_items.push(GroupedItem {
-                            item: u16::try_from(item_idx + offset)
-                                .context("assignment index exceeds u16")?,
-                            row: u16::try_from(other.row).context("row index exceeds u16")?,
-                            choice: other.choice,
-                            weight: other.weight,
-                        });
-                    }
-                }
-                let end = u16::try_from(slot.grouped_items.len())
-                    .context("grouped item end exceeds u16")?;
-                slot.groups.push(ExpertGroup {
-                    expert: item.expert,
-                    start,
-                    len: end - start,
-                });
+                let group_idx = slot.expert_group[item.expert as usize] as usize;
+                let dst = slot.group_cursor[group_idx] as usize;
+                slot.group_cursor[group_idx] += 1;
+                slot.grouped_items[dst] = GroupedItem {
+                    item: item_idx as u16,
+                    row: item.row as u16,
+                    choice: item.choice,
+                    weight: item.weight,
+                };
+            }
+            for group in &slot.groups {
+                slot.expert_group[group.expert as usize] = u16::MAX;
             }
         }
         *error = None;
@@ -4126,304 +4029,265 @@ mod tests {
 
     #[test]
     fn t28_1_pool_multi_row_bitwise_and_lane_mutant_control() -> Result<()> {
-        let shape = production_shape();
         #[cfg(target_arch = "x86_64")]
         if Isa::Avx2.available() {
             let codes: Vec<u8> = (0u8..=255).collect();
             for chunk in codes.as_chunks::<16>().0 {
-                for mode in [0u8, 1, 2] {
-                    let mut lo = [0.0f32; 8];
-                    let mut hi = [0.0f32; 8];
-                    unsafe {
-                        let (v0, v1) = match mode {
-                            1 => (
-                                x86::decode8_shift_mask(chunk.as_ptr()),
-                                x86::decode8_shift_mask(chunk.as_ptr().add(8)),
-                            ),
-                            2 => (
-                                x86::decode8_lut_gather(chunk.as_ptr()),
-                                x86::decode8_lut_gather(chunk.as_ptr().add(8)),
-                            ),
-                            _ => x86::decode16_vpshufb(chunk.as_ptr()),
-                        };
-                        std::arch::x86_64::_mm256_storeu_ps(lo.as_mut_ptr(), v0);
-                        std::arch::x86_64::_mm256_storeu_ps(hi.as_mut_ptr(), v1);
+                let mut lo = [0.0f32; 8];
+                let mut hi = [0.0f32; 8];
+                unsafe {
+                    let (v0, v1) = x86::decode16_vpshufb(chunk.as_ptr());
+                    std::arch::x86_64::_mm256_storeu_ps(lo.as_mut_ptr(), v0);
+                    std::arch::x86_64::_mm256_storeu_ps(hi.as_mut_ptr(), v1);
+                }
+                for i in 0..8 {
+                    let expected_lo = crate::fp8::decode_e4m3(chunk[i]);
+                    let expected_hi = crate::fp8::decode_e4m3(chunk[8 + i]);
+                    if expected_lo.is_nan() {
+                        assert!(lo[i].is_nan(), "code={:#04x}", chunk[i]);
+                    } else {
+                        assert_eq!(
+                            lo[i].to_bits(),
+                            expected_lo.to_bits(),
+                            "code={:#04x}",
+                            chunk[i]
+                        );
                     }
-                    for i in 0..8 {
-                        let expected_lo = crate::fp8::decode_e4m3(chunk[i]);
-                        let expected_hi = crate::fp8::decode_e4m3(chunk[8 + i]);
-                        if expected_lo.is_nan() {
-                            assert!(lo[i].is_nan(), "mode={mode} code={:#04x}", chunk[i]);
-                        } else {
-                            assert_eq!(
-                                lo[i].to_bits(),
-                                expected_lo.to_bits(),
-                                "mode={mode} code={:#04x}",
-                                chunk[i]
-                            );
-                        }
-                        if expected_hi.is_nan() {
-                            assert!(hi[i].is_nan(), "mode={mode} code={:#04x}", chunk[8 + i]);
-                        } else {
-                            assert_eq!(
-                                hi[i].to_bits(),
-                                expected_hi.to_bits(),
-                                "mode={mode} code={:#04x}",
-                                chunk[8 + i]
-                            );
-                        }
+                    if expected_hi.is_nan() {
+                        assert!(hi[i].is_nan(), "code={:#04x}", chunk[8 + i]);
+                    } else {
+                        assert_eq!(
+                            hi[i].to_bits(),
+                            expected_hi.to_bits(),
+                            "code={:#04x}",
+                            chunk[8 + i]
+                        );
                     }
                 }
             }
         }
-        let bf16_arena = build_arena(&shape, 4);
-        let bf16_flat = arena_flat(&bf16_arena);
-        let bf16_experts: Vec<_> = (0..4).map(|e| weights(&shape, e)).collect();
+        let mut bf16_bit_mismatches = 0usize;
+        let mut fp8_bit_mismatches = 0usize;
+        let mut bf16_mutant_mismatches = 0usize;
+        let mut fp8_mutant_mismatches = 0usize;
 
-        let (fp8_codes, fp8_slot) = fp8_fixture(&shape);
-        let fp8_layout = ExpertLayout::Fp8W8a16(fp8_slot.clone());
-        let fp8_per = fp8_codes.len() / 2;
-        let fp8_arena = HostBlocks::new(4, fp8_per)?;
-        let mut fp8_slots_bytes = Vec::with_capacity(4);
-        for block in 0..4u32 {
-            let mut mutated = fp8_codes.clone();
-            for (idx, b) in mutated[..3 * shape.hidden * shape.intermediate]
-                .iter_mut()
-                .enumerate()
-            {
-                *b = (((idx * 37 + 11 + block as usize * 13) % 64) as u8)
-                    | ((((idx / 7 + block as usize) & 1) as u8) << 7);
+        for shape in [production_shape(), Shape::new(40, 24)?] {
+            let bf16_arena = build_arena(&shape, 4);
+            let bf16_flat = arena_flat(&bf16_arena);
+            let bf16_experts: Vec<_> = (0..4).map(|e| weights(&shape, e)).collect();
+
+            let (fp8_codes, fp8_slot) = fp8_fixture(&shape);
+            let fp8_layout = ExpertLayout::Fp8W8a16(fp8_slot.clone());
+            let fp8_per = fp8_codes.len() / 2;
+            let fp8_arena = HostBlocks::new(4, fp8_per)?;
+            let mut fp8_slots_bytes = Vec::with_capacity(4);
+            for block in 0..4u32 {
+                let mut mutated = fp8_codes.clone();
+                for (idx, b) in mutated[..3 * shape.hidden * shape.intermediate]
+                    .iter_mut()
+                    .enumerate()
+                {
+                    *b = (((idx * 37 + 11 + block as usize * 13) % 64) as u8)
+                        | ((((idx / 7 + block as usize) & 1) as u8) << 7);
+                }
+                let mut claim = fp8_arena.claim(block)?;
+                for (dst, bytes) in claim.slice()?.iter_mut().zip(mutated.as_chunks::<2>().0) {
+                    *dst = bf16::from_le_bytes(*bytes);
+                }
+                fp8_slots_bytes.push(mutated);
             }
-            let mut claim = fp8_arena.claim(block)?;
-            for (dst, bytes) in claim.slice()?.iter_mut().zip(mutated.as_chunks::<2>().0) {
-                *dst = bf16::from_le_bytes(*bytes);
-            }
-            fp8_slots_bytes.push(mutated);
-        }
-        let fp8_experts = (0..4u32)
-            .map(|block| {
-                ExpertWeights::from_slot(shape, fp8_arena.block_range(block)?, &fp8_layout)
-            })
-            .collect::<Result<Vec<_>>>()?;
+            let fp8_experts = (0..4u32)
+                .map(|block| {
+                    ExpertWeights::from_slot(shape, fp8_arena.block_range(block)?, &fp8_layout)
+                })
+                .collect::<Result<Vec<_>>>()?;
 
-        let max_rows = 8usize;
-        let hidden: Vec<bf16> = (0..max_rows)
-            .flat_map(|row| hidden_row(&shape, row))
-            .collect();
-        let mut scratch = Scratch::new(&shape);
-        let bits = |values: &[bf16]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            let max_rows = 10usize;
+            let hidden: Vec<bf16> = (0..max_rows)
+                .flat_map(|row| hidden_row(&shape, row))
+                .collect();
+            let mut scratch = Scratch::new(&shape);
 
-        for rows in 1..=8usize {
-            let mut assignments = Vec::new();
-            let mut choice = 0u32;
-            for r in 0..rows {
+            for rows in [1usize, 2, 3, 5, 8, 10] {
+                let mut assignments = Vec::new();
+                let mut choice = 0u32;
+                for r in 0..rows {
+                    assignments.push(Assignment {
+                        row: r as u32,
+                        choice,
+                        expert: 0,
+                        weight: bf16::from_f32(0.125 + 0.0625 * (r as f32)),
+                    });
+                    choice += 1;
+                }
+                for r in 0..rows.min(3) {
+                    assignments.push(Assignment {
+                        row: r as u32,
+                        choice,
+                        expert: 1,
+                        weight: bf16::from_f32(-0.25 + 0.0625 * (r as f32)),
+                    });
+                    choice += 1;
+                }
+                for r in 0..rows.min(2) {
+                    assignments.push(Assignment {
+                        row: (rows - 1 - r) as u32,
+                        choice,
+                        expert: 2,
+                        weight: bf16::from_f32(0.5 - 0.125 * (r as f32)),
+                    });
+                    choice += 1;
+                }
                 assignments.push(Assignment {
-                    row: r as u32,
+                    row: (rows / 2) as u32,
                     choice,
-                    expert: 0,
-                    weight: bf16::from_f32(0.125 + 0.0625 * (r as f32)),
+                    expert: 3,
+                    weight: bf16::from_f32(0.375),
                 });
-                choice += 1;
-            }
-            for r in 0..rows.min(3) {
-                assignments.push(Assignment {
-                    row: r as u32,
-                    choice,
-                    expert: 1,
-                    weight: bf16::from_f32(-0.25 + 0.0625 * (r as f32)),
-                });
-                choice += 1;
-            }
-            for r in 0..rows.min(2) {
-                assignments.push(Assignment {
-                    row: (rows - 1 - r) as u32,
-                    choice,
-                    expert: 2,
-                    weight: bf16::from_f32(0.5 - 0.125 * (r as f32)),
-                });
-                choice += 1;
-            }
-            assignments.push(Assignment {
-                row: (rows / 2) as u32,
-                choice,
-                expert: 3,
-                weight: bf16::from_f32(0.375),
-            });
 
-            let mut expected_bf16 = vec![bf16::ZERO; assignments.len() * shape.hidden];
-            let mut expected_fp8 = vec![bf16::ZERO; assignments.len() * shape.hidden];
-            for item in &assignments {
-                let row_slice = &hidden[item.row as usize * shape.hidden..][..shape.hidden];
-                contribution(
-                    Isa::Scalar,
-                    Contribution {
-                        shape: &shape,
-                        arena: &bf16_flat,
-                        weights: &bf16_experts[item.expert as usize],
-                        hidden: row_slice,
-                        routing: item.weight,
-                        rounding: crate::model_spec::SwigluRounding::Twice,
-                        routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
-                    },
-                    &mut expected_bf16[item.choice as usize * shape.hidden..][..shape.hidden],
-                    &mut scratch,
-                )?;
-                fp8_contribution(
-                    Isa::Scalar,
-                    Fp8Contribution {
-                        shape: &shape,
-                        slot: &fp8_slots_bytes[item.expert as usize],
-                        slot_layout: &fp8_slot,
-                        hidden: row_slice,
-                        routing: item.weight,
-                        rounding: crate::model_spec::SwigluRounding::Twice,
-                        routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
-                    },
-                    &mut expected_fp8[item.choice as usize * shape.hidden..][..shape.hidden],
-                    &mut scratch,
-                )?;
-            }
+                let mut expected_bf16 = vec![bf16::ZERO; assignments.len() * shape.hidden];
+                let mut expected_fp8 = vec![bf16::ZERO; assignments.len() * shape.hidden];
+                for item in &assignments {
+                    let row_slice = &hidden[item.row as usize * shape.hidden..][..shape.hidden];
+                    contribution(
+                        Isa::Scalar,
+                        Contribution {
+                            shape: &shape,
+                            arena: &bf16_flat,
+                            weights: &bf16_experts[item.expert as usize],
+                            hidden: row_slice,
+                            routing: item.weight,
+                            rounding: crate::model_spec::SwigluRounding::Twice,
+                            routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+                        },
+                        &mut expected_bf16[item.choice as usize * shape.hidden..][..shape.hidden],
+                        &mut scratch,
+                    )?;
+                    fp8_contribution(
+                        Isa::Scalar,
+                        Fp8Contribution {
+                            shape: &shape,
+                            slot: &fp8_slots_bytes[item.expert as usize],
+                            slot_layout: &fp8_slot,
+                            hidden: row_slice,
+                            routing: item.weight,
+                            rounding: crate::model_spec::SwigluRounding::Twice,
+                            routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+                        },
+                        &mut expected_fp8[item.choice as usize * shape.hidden..][..shape.hidden],
+                        &mut scratch,
+                    )?;
+                }
 
-            for workers in [1usize, 4] {
-                let bf16_pool = ExpertPool::new(workers, shape, rows, assignments.len(), None)?;
-                let mut out_bf16 = vec![bf16::ZERO; expected_bf16.len()];
-                bf16_pool.run(Job {
-                    arena: bf16_arena.clone(),
-                    hidden: &hidden[..rows * shape.hidden],
-                    rows,
-                    experts: &bf16_experts,
-                    assignments: &assignments,
-                    out: &mut out_bf16,
-                })?;
-                assert_eq!(
-                    bits(&out_bf16),
-                    bits(&expected_bf16),
-                    "BF16 multi-row mismatch at rows={rows} workers={workers}"
-                );
+                for workers in [1usize, 4] {
+                    let bf16_pool = ExpertPool::new(workers, shape, rows, assignments.len(), None)?;
+                    let mut out_bf16 = vec![bf16::ZERO; expected_bf16.len()];
+                    bf16_pool.run(Job {
+                        arena: bf16_arena.clone(),
+                        hidden: &hidden[..rows * shape.hidden],
+                        rows,
+                        experts: &bf16_experts,
+                        assignments: &assignments,
+                        out: &mut out_bf16,
+                    })?;
+                    bf16_bit_mismatches += out_bf16
+                        .iter()
+                        .zip(&expected_bf16)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
 
-                let fp8_pool = ExpertPool::new(
-                    workers,
-                    shape,
-                    rows,
-                    assignments.len(),
-                    Some(fp8_slot.clone()),
-                )?;
-                let mut out_fp8 = vec![bf16::ZERO; expected_fp8.len()];
-                fp8_pool.run(Job {
-                    arena: fp8_arena.clone(),
-                    hidden: &hidden[..rows * shape.hidden],
-                    rows,
-                    experts: &fp8_experts,
-                    assignments: &assignments,
-                    out: &mut out_fp8,
-                })?;
-                assert_eq!(
-                    bits(&out_fp8),
-                    bits(&expected_fp8),
-                    "FP8 multi-row mismatch at rows={rows} workers={workers}"
-                );
+                    let fp8_pool = ExpertPool::new(
+                        workers,
+                        shape,
+                        rows,
+                        assignments.len(),
+                        Some(fp8_slot.clone()),
+                    )?;
+                    let mut out_fp8 = vec![bf16::ZERO; expected_fp8.len()];
+                    fp8_pool.run(Job {
+                        arena: fp8_arena.clone(),
+                        hidden: &hidden[..rows * shape.hidden],
+                        rows,
+                        experts: &fp8_experts,
+                        assignments: &assignments,
+                        out: &mut out_fp8,
+                    })?;
+                    fp8_bit_mismatches += out_fp8
+                        .iter()
+                        .zip(&expected_fp8)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+
+                    if shape == production_shape() && rows == 1 && workers == 1 {
+                        // Adjacent-lane weight permutation (k ^ 1) run through ExpertPool/Arm.
+                        let bf16_mutant_arena = build_arena(&shape, 4);
+                        {
+                            let mut claim = bf16_mutant_arena.claim(0)?;
+                            let slice = claim.slice()?;
+                            for pair in slice.as_chunks_mut::<2>().0 {
+                                pair.swap(0, 1);
+                            }
+                        }
+                        let mut out_bf16_mutant = vec![bf16::ZERO; expected_bf16.len()];
+                        bf16_pool.run(Job {
+                            arena: bf16_mutant_arena,
+                            hidden: &hidden[..rows * shape.hidden],
+                            rows,
+                            experts: &bf16_experts,
+                            assignments: &assignments,
+                            out: &mut out_bf16_mutant,
+                        })?;
+                        bf16_mutant_mismatches = out_bf16_mutant
+                            .iter()
+                            .zip(&expected_bf16)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+
+                        let fp8_mutant_arena = HostBlocks::new(4, fp8_per)?;
+                        for (block, bytes) in fp8_slots_bytes.iter().enumerate() {
+                            let mut mutated = bytes.clone();
+                            if block == 0 {
+                                for pair in mutated[..3 * shape.hidden * shape.intermediate]
+                                    .as_chunks_mut::<2>()
+                                    .0
+                                {
+                                    pair.swap(0, 1);
+                                }
+                            }
+                            let mut claim = fp8_mutant_arena.claim(block as u32)?;
+                            for (dst, pair) in
+                                claim.slice()?.iter_mut().zip(mutated.as_chunks::<2>().0)
+                            {
+                                *dst = bf16::from_le_bytes(*pair);
+                            }
+                        }
+                        let mut out_fp8_mutant = vec![bf16::ZERO; expected_fp8.len()];
+                        fp8_pool.run(Job {
+                            arena: fp8_mutant_arena,
+                            hidden: &hidden[..rows * shape.hidden],
+                            rows,
+                            experts: &fp8_experts,
+                            assignments: &assignments,
+                            out: &mut out_fp8_mutant,
+                        })?;
+                        fp8_mutant_mismatches = out_fp8_mutant
+                            .iter()
+                            .zip(&expected_fp8)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                    }
+                }
             }
         }
-
-        // Planted lane-permutation mutant control: permuting weight lanes across adjacent elements
-        // (or permuting accumulator lanes across the pairwise reduction tree) alters the output on
-        // the production shape [1024,2048]/[2048,512].
-        let row0: Vec<f32> = hidden[..shape.hidden]
-            .iter()
-            .map(|&v| f32::from(v))
-            .collect();
-        let mut mutant_mismatches = 0usize;
-        let gate_up_slice = &bf16_flat[bf16_experts[0].gate_up.clone()];
-        for j in 0..shape.intermediate {
-            let weights_row = &gate_up_slice[j * shape.hidden..][..shape.hidden];
-            let mut lanes_exact = [0.0f32; LANES];
-            let mut lanes_permuted = [0.0f32; LANES];
-            for (index, &x_val) in row0.iter().enumerate() {
-                let lane = index % LANES;
-                lanes_exact[lane] = x_val.mul_add(f32::from(weights_row[index]), lanes_exact[lane]);
-                lanes_permuted[lane] =
-                    x_val.mul_add(f32::from(weights_row[index ^ 1]), lanes_permuted[lane]);
-            }
-            let exact = bf16::from_f32(pairwise(&lanes_exact));
-            let permuted = bf16::from_f32(pairwise(&lanes_permuted));
-            if exact.to_bits() != permuted.to_bits() {
-                mutant_mismatches += 1;
-            }
-        }
+        assert_eq!(bf16_bit_mismatches, 0, "BF16 multi-row bitwise mismatches");
+        assert_eq!(fp8_bit_mismatches, 0, "FP8 multi-row bitwise mismatches");
         assert!(
-            mutant_mismatches > 0,
-            "lane-permutation mutant control must alter BF16 rounded output"
+            bf16_mutant_mismatches > 0 && fp8_mutant_mismatches > 0,
+            "lane-permutation mutant control through ExpertPool must fail: bf16={bf16_mutant_mismatches} fp8={fp8_mutant_mismatches}"
         );
         println!(
-            "PASS T28_1_MULTI_ROW_GATE stored_gate_up=[1024,2048] stored_down=[2048,512] rows=1..8 R_e=1,2,3,8 bf16_bit_mismatches=0 fp8_bit_mismatches=0 lane_mutant_mismatches={mutant_mismatches}"
+            "PASS T28_1_MULTI_ROW_GATE stored_gate_up=[1024,2048],[48,40] stored_down=[2048,512],[40,24] rows=1,2,3,5,8,10 R_e=1,2,3,5,8,10 bf16_bit_mismatches={bf16_bit_mismatches} fp8_bit_mismatches={fp8_bit_mismatches} bf16_mutant_mismatches={bf16_mutant_mismatches} fp8_mutant_mismatches={fp8_mutant_mismatches}"
         );
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "in-process FP8 decode and ServiceTable benchmark"]
-    fn t28_1_fp8_decode_and_service_table_bench() -> Result<()> {
-        let shape = production_shape();
-        #[cfg(target_arch = "x86_64")]
-        {
-            for (mode, name) in [
-                (1u8, "shift_mask"),
-                (2u8, "lut_gather"),
-                (0u8, "vpshufb_u16"),
-            ] {
-                x86::FP8_DECODE_MODE.store(mode, Ordering::Relaxed);
-                let cells = measure_service_table(
-                    shape,
-                    RING_EXPERTS as u32,
-                    &[1, 8, 16],
-                    &[1, 2, 4, 8],
-                    &[1, 2, 4, 8],
-                    crate::model_spec::ExpertFormat::Fp8W8a16,
-                )?;
-                for cell in cells {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "bench": "fp8_decode_mode",
-                            "mode": name,
-                            "isa": Isa::detect().name(),
-                            "workers": cell.workers,
-                            "rows": cell.rows,
-                            "missed": cell.experts,
-                            "seconds": cell.seconds,
-                        })
-                    );
-                }
-            }
-            x86::FP8_DECODE_MODE.store(0, Ordering::Relaxed);
-        }
-        for (fmt_name, format) in [
-            ("fp8_w8a16", crate::model_spec::ExpertFormat::Fp8W8a16),
-            ("bf16", crate::model_spec::ExpertFormat::Bf16),
-        ] {
-            let cells = measure_service_table(
-                shape,
-                RING_EXPERTS as u32,
-                &[1, 2, 4, 8, 16, 24],
-                &[1, 2, 5, 8],
-                &[1, 2, 4, 8],
-                format,
-            )?;
-            for cell in cells {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "bench": "service_table_t28_1",
-                        "format": fmt_name,
-                        "isa": Isa::detect().name(),
-                        "workers": cell.workers,
-                        "rows": cell.rows,
-                        "missed": cell.experts,
-                        "seconds": cell.seconds,
-                    })
-                );
-            }
-        }
         Ok(())
     }
 }
