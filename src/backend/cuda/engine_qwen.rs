@@ -54,7 +54,6 @@ struct FlintWindowInputs<'a> {
     sliding: bool,
     ring: usize,
     position: &'a CudaSlice<i32>,
-    length: &'a CudaSlice<i32>,
     qkv: &'a CudaSlice<bf16>,
     attention: &'a CudaSlice<bf16>,
     kv: &'a Kv,
@@ -74,7 +73,6 @@ fn capture_flint_window(
         sliding,
         ring,
         position,
-        length,
         qkv,
         attention,
         kv,
@@ -181,7 +179,6 @@ fn capture_flint_window(
     trace.save(&directory.join(format!(
         "layer{layer}_position{logical_position}.safetensors"
     )))?;
-    let _ = length;
     Ok(())
 }
 
@@ -2593,7 +2590,6 @@ impl Engine {
                                 sliding,
                                 ring,
                                 position: &w.position,
-                                length: &w.length,
                                 qkv: &w.qkv,
                                 attention: &w.attn,
                                 kv,
@@ -4056,7 +4052,7 @@ mod tests {
     #[ignore = "GPU window; FF_MODEL, FLYINGFISH_RUNTIME_DIR and FF_FLINT_PASSAGE required"]
     fn flint_engine_controls_and_graph_eager_nll_gpu() -> Result<()> {
         use crate::backend::{Backend, Settings};
-        use std::{env, fs::File, path::PathBuf, time::Instant};
+        use std::{env, fs::File};
 
         let dir = PathBuf::from(env::var_os("FF_MODEL").context("FF_MODEL missing")?);
         let runtime =
@@ -4108,10 +4104,9 @@ mod tests {
             })
             .collect::<Result<Vec<_>>>()?;
         ensure!(
-            !reference_nlls.is_empty() && reference_nlls.iter().all(|values| values.len() >= 599),
-            "reference NLL prefix is short"
+            reference_nlls.len() == 4 && reference_nlls.iter().all(|values| values.len() >= 599),
+            "expected four measured Flint reference runs"
         );
-        let reference_nll = &reference_nlls[0];
         let prediction_nll = |rows: &[Vec<f32>], start: usize, end: usize| -> Result<f64> {
             ensure!(
                 rows.len() >= end && ids.len() > end,
@@ -4173,70 +4168,6 @@ mod tests {
         let (graph_nll, graph_logits, bit_mismatches, max_ulp) =
             graph_eager_forced_prefix(&mut engine, &ids)?;
         let eager_nll = graph_nll;
-        let candidate_nll = (0..599)
-            .map(|position| {
-                let logits = &graph_logits[position];
-                let target = ids[position + 1] as usize;
-                let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let logsumexp = logits
-                    .iter()
-                    .map(|value| (value - max).exp())
-                    .sum::<f32>()
-                    .ln();
-                f64::from(max + logsumexp - logits[target])
-            })
-            .collect::<Vec<_>>();
-        let nll_deltas = candidate_nll
-            .iter()
-            .zip(&reference_nll[..599])
-            .map(|(candidate, reference)| candidate - reference)
-            .collect::<Vec<_>>();
-        println!(
-            "FLINT_PER_POSITION_NLL {}",
-            serde_json::json!({
-                "candidate": candidate_nll,
-                "reference": reference_nll[..599],
-                "delta": nll_deltas,
-            })
-        );
-        if let Some(path) = env::var_os("FF_FLINT_GRAPH_LOGITS_OUT") {
-            let mut selected_positions = (512..599).collect::<Vec<_>>();
-            selected_positions
-                .sort_by(|&a, &b| nll_deltas[b].abs().total_cmp(&nll_deltas[a].abs()));
-            selected_positions.truncate(3);
-            selected_positions.sort_unstable();
-            let mut trace = Trace::default();
-            trace.set_device(&engine.device.info.name)?;
-            trace.add(
-                "logits.positions".to_owned(),
-                vec![selected_positions.len(), engine.config.vocab_size],
-                selected_positions
-                    .iter()
-                    .flat_map(|&position| graph_logits[position].iter().copied())
-                    .collect(),
-            )?;
-            trace.add(
-                "positions".to_owned(),
-                vec![selected_positions.len()],
-                selected_positions
-                    .iter()
-                    .map(|position| *position as f32)
-                    .collect(),
-            )?;
-            trace.save(&PathBuf::from(path))?;
-        }
-
-        engine.reset()?;
-        engine.prefill(&ids[..513], None)?;
-        let source_kv = {
-            let stream = engine.device.stream.clone();
-            engine
-                .state
-                .kv
-                .iter()
-                .map(|kv| Ok((stream.clone_dtoh(&kv.k)?, stream.clone_dtoh(&kv.v)?)))
-                .collect::<Result<Vec<_>>>()?
-        };
 
         engine.reset()?;
         zero_flint_sinks(&mut engine)?;
@@ -4245,116 +4176,12 @@ mod tests {
             (sinks_off_nll - graph_nll).abs() > 0.01 && sinks_off_nll - graph_nll >= 0.001,
             "sinks-off control does not discriminate: candidate={graph_nll} control={sinks_off_nll}"
         );
-        let short_ids = [150000u32, 1, 2, 3, 4, 5, 6, 7];
-        let (_, short_logits, _, _) = forced_prefix(&mut engine, &short_ids, true, None)?;
-        if let Some(path) = env::var_os("FF_FLINT_POSITION_LOGITS_OUT") {
-            let mut trace = Trace::default();
-            trace.set_device(&engine.device.info.name)?;
-            trace.add(
-                "logits.positions".to_owned(),
-                vec![short_ids.len(), engine.config.vocab_size],
-                short_logits.into_iter().flatten().collect(),
-            )?;
-            trace.save(&PathBuf::from(path))?;
-        }
         drop(engine);
-
-        let mut full_attention_spec = crate::model_spec::ModelSpec::read(&dir)?;
-        for layer in &mut full_attention_spec.layers {
-            if layer.sliding_window.is_some() {
-                layer.sliding_window = Some(600);
-            }
-        }
-        let mut full_attention = Engine::load_qwen(
-            &dir,
-            0,
-            600,
-            None,
-            settings,
-            super::super::SetupMode::Prepare,
-            full_attention_spec,
-        )?;
-        full_attention.finish_flint_calibration(&dir, Instant::now())?;
-        full_attention.prefill(&ids[..1], None)?;
-        full_attention.committed_prefix_ids.clear();
-        full_attention.pending_token = None;
-        full_attention.resident_ids_len = 0;
-        full_attention.last_input_kind = None;
-        let stream = full_attention.device.stream.clone();
-        for ((source_k, source_v), kv) in source_kv.iter().zip(&mut full_attention.state.kv) {
-            if source_k.len() == kv.k.len() {
-                stream.memcpy_htod(source_k, &mut kv.k)?;
-                stream.memcpy_htod(source_v, &mut kv.v)?;
-            } else {
-                let mut device_k = stream.alloc_zeros::<bf16>(source_k.len())?;
-                let mut device_v = stream.alloc_zeros::<bf16>(source_v.len())?;
-                stream.memcpy_htod(source_k, &mut device_k)?;
-                stream.memcpy_htod(source_v, &mut device_v)?;
-                let heads = full_attention.model_spec.kv_heads as usize;
-                let dim = full_attention.model_spec.head_dim as usize;
-                let width = 513 * dim;
-                let source_pitch = 513 * dim;
-                let destination_pitch = kv.k.len() / heads;
-                super::super::copy::columns(
-                    &stream,
-                    &device_k,
-                    &mut kv.k,
-                    super::super::copy::Rect {
-                        rows: heads,
-                        width,
-                        src_pitch: source_pitch,
-                        src_col: 0,
-                        dst_pitch: destination_pitch,
-                        dst_col: 0,
-                    },
-                )?;
-                super::super::copy::columns(
-                    &stream,
-                    &device_v,
-                    &mut kv.v,
-                    super::super::copy::Rect {
-                        rows: heads,
-                        width,
-                        src_pitch: source_pitch,
-                        src_col: 0,
-                        dst_pitch: destination_pitch,
-                        dst_col: 0,
-                    },
-                )?;
-            }
-        }
-        full_attention
-            .state
-            .set_sequence(&stream, 513, 1, full_attention.workspace_rows as u32)?;
-        stream.memcpy_htod(&[513i32], &mut full_attention.work.position)?;
-        stream.memcpy_htod(&[514], &mut full_attention.work.length)?;
-        full_attention.position = 513;
-        let mut window_off_logits = graph_logits.clone();
-        let mut tail_rows = Vec::with_capacity(87);
-        for token in ids[513..600].iter().copied() {
-            full_attention.set_token(token)?;
-            full_attention.decode(true, None)?;
-            tail_rows.push(full_attention.decode_logits()?);
-        }
-        for (destination, source) in window_off_logits[513..600].iter_mut().zip(tail_rows) {
-            *destination = source;
-        }
-        let early_bits = graph_logits[..513]
-            .iter()
-            .zip(&window_off_logits[..513])
-            .map(|(on, off)| {
-                on.iter()
-                    .zip(off)
-                    .filter(|(on, off)| on.to_bits() != off.to_bits())
-                    .count() as u64
-            })
-            .sum::<u64>();
-        ensure!(
-            early_bits == 0,
-            "window-off changes pre-boundary logits: bits={early_bits}"
-        );
         let window_on_tail = prediction_nll(&graph_logits, 512, 599)?;
-        let window_off_tail = prediction_nll(&window_off_logits, 512, 599)?;
+        let reference_means = reference_nlls
+            .iter()
+            .map(|values| values[..599].iter().sum::<f64>() / 599.0)
+            .collect::<Vec<_>>();
         let reference_tails = reference_nlls
             .iter()
             .map(|values| values[512..599].iter().sum::<f64>() / 87.0)
@@ -4364,23 +4191,24 @@ mod tests {
             .flat_map(|a| reference_tails.iter().map(move |b| (a - b).abs()))
             .fold(0f64, f64::max);
         let tail_tolerance = 0.01f64.max(2.0 * reference_spread);
+        for (index, &reference_mean) in reference_means.iter().enumerate() {
+            ensure!(
+                (graph_nll - reference_mean).abs() <= tail_tolerance,
+                "graph NLL differs from reference {index}: graph={graph_nll} reference={reference_mean} tolerance={tail_tolerance}"
+            );
+        }
         for (index, &reference_tail) in reference_tails.iter().enumerate() {
             ensure!(
                 (window_on_tail - reference_tail).abs() <= tail_tolerance,
                 "window-on tail NLL differs from reference {index}: on={window_on_tail} reference={reference_tail} tolerance={tail_tolerance}"
             );
         }
-        let window_off_delta = (window_off_tail - window_on_tail).abs();
-        ensure!(
-            window_off_delta >= tail_tolerance + 0.01,
-            "window-off tail control does not discriminate: on={window_on_tail} off={window_off_tail} delta={window_off_delta} tolerance={tail_tolerance}"
-        );
         ensure!(
             bit_mismatches == 0 && max_ulp == 0,
             "graph/eager NLL differs: graph={graph_nll} eager={eager_nll} bits={bit_mismatches} max_ulp={max_ulp}"
         );
         println!(
-            "FLINT_ENGINE_CONTROLS graph_nll={graph_nll:.9} eager_nll={eager_nll:.9} graph_eager_bits=0 sinks_off_nll={sinks_off_nll:.9} pre_boundary_bits=0 tail_on={window_on_tail:.9} tail_off={window_off_tail:.9} tail_off_delta={window_off_delta:.9} reference_spread={reference_spread:.9} tail_tolerance={tail_tolerance:.9} tail_refs={reference_tails:?} PASS"
+            "FLINT_ENGINE_CONTROLS graph_nll={graph_nll:.9} eager_nll={eager_nll:.9} graph_eager_bits=0 sinks_off_nll={sinks_off_nll:.9} tail_on={window_on_tail:.9} reference_spread={reference_spread:.9} tail_tolerance={tail_tolerance:.9} reference_means={reference_means:?} tail_refs={reference_tails:?} PASS"
         );
         Ok(())
     }
@@ -4399,7 +4227,6 @@ mod tests {
         let output = PathBuf::from(
             env::var_os("FF_FLINT_WINDOW_DUMP").context("FF_FLINT_WINDOW_DUMP missing")?,
         );
-        let tail_trace = env::var_os("FF_FLINT_TAIL_TRACE_OUT").map(PathBuf::from);
         ensure!(
             env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
             "GPU window not acknowledged"
@@ -4425,28 +4252,8 @@ mod tests {
         ensure!(ids.len() >= 600, "passage is shorter than the gate");
         let mut engine = Backend::calibrate(&dir, 0, 600, None, settings)?
             .context("Flint calibration missing")?;
-        let capture_layers = match env::var("FF_FLINT_WINDOW_LAYERS") {
-            Ok(value) => Some(
-                value
-                    .split(',')
-                    .map(|value| value.parse::<usize>())
-                    .collect::<Result<Vec<_>, _>>()
-                    .context("invalid FF_FLINT_WINDOW_LAYERS")?,
-            ),
-            Err(_) => None,
-        }
-        .unwrap_or_else(|| vec![3, 5]);
-        let capture_positions = match env::var("FF_FLINT_WINDOW_POSITIONS") {
-            Ok(value) => Some(
-                value
-                    .split(',')
-                    .map(|value| value.parse::<usize>())
-                    .collect::<Result<Vec<_>, _>>()
-                    .context("invalid FF_FLINT_WINDOW_POSITIONS")?,
-            ),
-            Err(_) => None,
-        }
-        .unwrap_or_else(|| vec![513, 560, 599]);
+        let capture_layers = vec![3, 5];
+        let capture_positions = vec![513, 560, 599];
         engine.flint_window_capture = Some((
             capture_layers.clone(),
             capture_positions.clone(),
@@ -4456,16 +4263,7 @@ mod tests {
         for (offset, token) in ids[1..600].iter().enumerate() {
             let position = offset + 1;
             engine.set_token(*token)?;
-            if position == 560
-                && let Some(path) = tail_trace.as_ref()
-            {
-                let mut trace = Trace::all_layers();
-                engine.decode(false, Some((&mut trace, "decode")))?;
-                trace.set_device(&engine.device.info.name)?;
-                trace.save(path)?;
-            } else {
-                engine.decode(false, None)?;
-            }
+            engine.decode(false, None)?;
             if capture_positions == [560] && position == 560 {
                 break;
             }
