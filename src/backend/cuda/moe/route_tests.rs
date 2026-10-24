@@ -3,10 +3,10 @@
 use super::reference::{self, MoeDims, RouteRow};
 use super::route::RouteOps;
 use super::testing;
-use crate::backend::cuda::Device;
 use crate::backend::cuda::contracts::TensorMut;
+use crate::backend::cuda::{Device, cubin};
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 use half::bf16;
 use std::collections::HashMap;
 
@@ -158,7 +158,6 @@ fn invariant_route(device: &Device) -> Result<()> {
     device.finish_upload()?;
     for r in 0..rows {
         ops.route(
-            s,
             view(&x, s, r * h, [1, h as u32], [h as u64, 1])?,
             w,
             &mut TensorMut(view(&expected_ids, s, r * k, [1, k as u32], [k as u64, 1])?),
@@ -170,6 +169,7 @@ fn invariant_route(device: &Device) -> Result<()> {
                 [k as u64, 1],
             )?),
             &mut logits_view(1)?,
+            crate::model_spec::RouterScore::Softmax,
         )?;
     }
     let expected_ids = s.clone_dtoh(&expected_ids)?;
@@ -183,8 +183,16 @@ fn invariant_route(device: &Device) -> Result<()> {
         let mut id_view = TensorMut(view(&ids, s, 0, [m, k as u32], [k as u64, 1])?);
         let mut weight_view = TensorMut(view(&weights, s, 0, [m, k as u32], [k as u64, 1])?);
         let mut logit_view = logits_view(m)?;
-        let mut execute =
-            || ops.route(s, input, w, &mut id_view, &mut weight_view, &mut logit_view);
+        let mut execute = || {
+            ops.route(
+                input,
+                w,
+                &mut id_view,
+                &mut weight_view,
+                &mut logit_view,
+                crate::model_spec::RouterScore::Softmax,
+            )
+        };
         for graph in [false, true] {
             if graph {
                 s.synchronize()?;
@@ -235,7 +243,6 @@ fn invariant_route(device: &Device) -> Result<()> {
     let rw = crate::backend::cuda::calibrate::random(e * h, 12);
     let (dx, dw) = (s.clone_htod(&rx)?, s.clone_htod(&rw)?);
     ops.route(
-        s,
         view(&dx, s, 0, [rows as u32, h as u32], [h as u64, 1])?,
         view(&dw, s, 0, [e as u32, h as u32], [h as u64, 1])?,
         &mut TensorMut(view(&ids, s, 0, [rows as u32, k as u32], [k as u64, 1])?),
@@ -247,6 +254,7 @@ fn invariant_route(device: &Device) -> Result<()> {
             [k as u64, 1],
         )?),
         &mut logits_view(rows as u32)?,
+        crate::model_spec::RouterScore::Softmax,
     )?;
     let got_logits = s.clone_dtoh(&logits)?;
     let chain = |r: usize, j: usize, order: &mut dyn Iterator<Item = usize>| {
@@ -281,7 +289,6 @@ fn invariant_route(device: &Device) -> Result<()> {
     }
     let wrong = s.clone_htod(&wrong)?;
     ops.route(
-        s,
         view(&wrong, s, 0, [rows as u32, h as u32], [h as u64, 1])?,
         w,
         &mut TensorMut(view(&ids, s, 0, [rows as u32, k as u32], [k as u64, 1])?),
@@ -293,6 +300,7 @@ fn invariant_route(device: &Device) -> Result<()> {
             [k as u64, 1],
         )?),
         &mut logits_view(rows as u32)?,
+        crate::model_spec::RouterScore::Softmax,
     )?;
     let mismatches = s
         .clone_dtoh(&ids)?
@@ -314,6 +322,170 @@ fn invariant_route(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn sigmoid_route(device: &Device, ops: &RouteOps) -> Result<()> {
+    let dims = MoeDims::new(4096, 256, 6, 2048, 512);
+    let (e, k, h) = (dims.experts, dims.top_k, dims.hidden);
+    let fx = reference::fixture(dims, 3);
+    let s = &device.stream;
+    let xb = testing::upload(&device.upload, fx.x.clone())?;
+    let rb = testing::upload(&device.upload, fx.router_w.clone())?;
+    device.finish_upload()?;
+    let mut idsb = testing::zeros::<i32>(s, dims.rows * k)?;
+    let mut wb = testing::zeros::<bf16>(s, dims.rows * k)?;
+    let lb = testing::zeros::<bf16>(s, dims.rows * e)?;
+
+    let run = |row: usize, idsb: &mut CudaSlice<i32>, wb: &mut CudaSlice<bf16>| -> Result<()> {
+        let rows = u32::try_from(row + 1)?;
+        let x = testing::dense(&xb, s, dims.rows as u32, h as u32)?.prefix_rows(rows)?;
+        let router = testing::dense(&rb, s, e as u32, h as u32)?;
+        let mut ids = TensorMut(
+            testing::dense_mut(idsb, s, dims.rows as u32, k as u32)?
+                .0
+                .prefix_rows(rows)?,
+        );
+        let mut weights = TensorMut(
+            testing::dense_mut(wb, s, dims.rows as u32, k as u32)?
+                .0
+                .prefix_rows(rows)?,
+        );
+        let mut logits = TensorMut(
+            testing::dense_mut(&lb, s, dims.rows as u32, e as u32)?
+                .0
+                .prefix_rows(rows)?,
+        );
+        ops.route(
+            x,
+            router,
+            &mut ids,
+            &mut weights,
+            &mut logits,
+            crate::model_spec::RouterScore::Sigmoid,
+        )
+    };
+
+    let mut strict = 0;
+    let mut skipped = 0;
+    for row in [0usize, 1, 3, 7, 15, 63, 1023, 2047] {
+        let want = reference::sigmoid_route_row(&fx, row);
+        ensure!(
+            want.probs.iter().all(|value| value.is_finite()),
+            "non-finite sigmoid reference row={row}"
+        );
+        if want.margin <= f32::EPSILON {
+            skipped += 1;
+            continue;
+        }
+        s.memcpy_htod(&vec![-1i32; dims.rows * k], &mut idsb)?;
+        s.memcpy_htod(&vec![bf16::from_f32(-17.0); dims.rows * k], &mut wb)?;
+        run(row, &mut idsb, &mut wb)?;
+        s.synchronize()?;
+        let ids = s.clone_dtoh(&idsb)?;
+        let weights = s.clone_dtoh(&wb)?;
+        ensure!(
+            ids[row * k..(row + 1) * k] == want.ids[..],
+            "sigmoid route row={row} ids {:?} != {:?}",
+            &ids[row * k..(row + 1) * k],
+            &want.ids[..]
+        );
+        for (got, expected) in weights[row * k..(row + 1) * k].iter().zip(&want.weights) {
+            let got = got.to_f32();
+            let expected = expected.to_f32();
+            let tolerance = reference::bf16_ulp(expected) + f32::EPSILON;
+            ensure!(
+                (got - expected).abs() <= tolerance,
+                "sigmoid route row={row} weight {got:e} != {expected:e}"
+            );
+        }
+        strict += 1;
+    }
+    ensure!(strict > 0, "sigmoid route gate had no strict rows");
+
+    s.memcpy_htod(&vec![-1i32; dims.rows * k], &mut idsb)?;
+    run(fx.exact_tie_row, &mut idsb, &mut wb)?;
+    s.synchronize()?;
+    let first = (
+        s.clone_dtoh(&idsb)?[..k].to_vec(),
+        s.clone_dtoh(&wb)?[..k].to_vec(),
+    );
+    s.memcpy_htod(&vec![-1i32; dims.rows * k], &mut idsb)?;
+    run(fx.exact_tie_row, &mut idsb, &mut wb)?;
+    s.synchronize()?;
+    let second = (
+        s.clone_dtoh(&idsb)?[..k].to_vec(),
+        s.clone_dtoh(&wb)?[..k].to_vec(),
+    );
+    ensure!(
+        first == second,
+        "sigmoid exact-tie kernel is not deterministic"
+    );
+    let tie = reference::sigmoid_route_row(&fx, fx.exact_tie_row);
+    let (lower, higher) = fx.exact_tie_experts;
+    let lower_rank = tie.ids.iter().position(|id| *id as usize == lower);
+    let higher_rank = tie.ids.iter().position(|id| *id as usize == higher);
+    ensure!(
+        lower_rank.is_some() && higher_rank.is_some() && lower_rank < higher_rank,
+        "sigmoid exact tie did not order lower expert id first"
+    );
+    let mut neighbor_logits = vec![bf16::from_f32(-1.0); e];
+    for logit in &mut neighbor_logits[..5] {
+        *logit = bf16::from_f32(10.0);
+    }
+    neighbor_logits[5] = bf16::ONE;
+    neighbor_logits[250] = bf16::ONE;
+    let mut neighbor_logits_dev = s.clone_htod(&neighbor_logits)?;
+    let mut neighbor_ids = s.alloc_zeros::<i32>(k)?;
+    let neighbor_weights = s.alloc_zeros::<bf16>(k)?;
+    let sigmoid_topk =
+        cubin::module(&device.ctx, "moe_route")?.load_function("moe_route_topk_sigmoid")?;
+    unsafe {
+        s.launch_builder(&sigmoid_topk)
+            .arg(&neighbor_logits_dev)
+            .arg(&neighbor_ids)
+            .arg(&neighbor_weights)
+            .arg(&1i32)
+            .arg(&(e as i32))
+            .arg(&(k as i32))
+            .launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    s.synchronize()?;
+    let tie_ids = s.clone_dtoh(&neighbor_ids)?;
+    ensure!(
+        tie_ids.contains(&(5i32)) && !tie_ids.contains(&250i32),
+        "sigmoid tie control did not select lower expert id"
+    );
+    neighbor_logits[250] = bf16::from_bits(bf16::ONE.to_bits() + 1);
+    s.memcpy_htod(&neighbor_logits, &mut neighbor_logits_dev)?;
+    s.memcpy_htod(&vec![-1i32; k], &mut neighbor_ids)?;
+    unsafe {
+        s.launch_builder(&sigmoid_topk)
+            .arg(&neighbor_logits_dev)
+            .arg(&neighbor_ids)
+            .arg(&neighbor_weights)
+            .arg(&1i32)
+            .arg(&(e as i32))
+            .arg(&(k as i32))
+            .launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    s.synchronize()?;
+    let neighbor_ids = s.clone_dtoh(&neighbor_ids)?;
+    ensure!(
+        neighbor_ids.contains(&250i32) && !neighbor_ids.contains(&5i32),
+        "sigmoid one-ULP neighbor did not change selection"
+    );
+    eprintln!(
+        "MOE_ROUTE_SIGMOID strict_rows={strict} tie_rows_skipped={skipped} deterministic=true tie_lower_id=true one_ulp_neighbor_changes_selection=true PASS"
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires coordinator-granted GPU window; FF_Q38_GPU_WINDOW=granted"]
 fn moe_route_gpu() -> Result<()> {
@@ -325,6 +497,7 @@ fn moe_route_gpu() -> Result<()> {
     invariant_route(&d)?;
     let s = &d.stream;
     let ops = RouteOps::new(&d.ctx, s)?;
+    sigmoid_route(&d, &ops)?;
     let dims = MoeDims::minicpm47(4096);
     let (e, k, h) = (dims.experts, dims.top_k, dims.hidden);
     let fx = reference::fixture(dims, 0);
@@ -363,7 +536,14 @@ fn moe_route_gpu() -> Result<()> {
                 .0
                 .prefix_rows(rows)?,
         );
-        ops.route(s, x, router, &mut ids, &mut weights, &mut logits)
+        ops.route(
+            x,
+            router,
+            &mut ids,
+            &mut weights,
+            &mut logits,
+            crate::model_spec::RouterScore::Softmax,
+        )
     };
 
     for &case in &ROW_CASES {
@@ -486,7 +666,6 @@ fn official_router_logits(d: &Device, ops: &RouteOps) -> Result<()> {
     let mut total = 0;
     for rows in [1u32, 94, 481, 1024, 4096] {
         ops.route_prefill(
-            s,
             testing::dense(&xb, s, 4096, spec.hidden)?.prefix_rows(rows)?,
             testing::dense(&wb, s, moe.experts, spec.hidden)?,
             &mut TensorMut(testing::dense(&ids, s, 4096, moe.experts_per_tok)?.prefix_rows(rows)?),
@@ -494,6 +673,7 @@ fn official_router_logits(d: &Device, ops: &RouteOps) -> Result<()> {
                 testing::dense(&weights, s, 4096, moe.experts_per_tok)?.prefix_rows(rows)?,
             ),
             &mut TensorMut(testing::dense(&logits, s, 4096, moe.experts)?.prefix_rows(rows)?),
+            crate::model_spec::RouterScore::Softmax,
         )?;
         let actual = s.clone_dtoh(&logits)?;
         let expected = fixture.tensor(&format!("logits_{rows}"))?;
@@ -597,7 +777,14 @@ fn moe_route_prefill_gpu() -> Result<()> {
                 .0
                 .prefix_rows(rows)?,
         );
-        ops.route_prefill(s, x, router, &mut ids, &mut weights, &mut logits)
+        ops.route_prefill(
+            x,
+            router,
+            &mut ids,
+            &mut weights,
+            &mut logits,
+            crate::model_spec::RouterScore::Softmax,
+        )
     };
 
     for &case in &PREFILL_ROW_CASES {

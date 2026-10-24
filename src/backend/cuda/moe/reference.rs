@@ -10,6 +10,7 @@ pub(crate) struct MoeDims {
     pub top_k: usize,
     pub hidden: usize,
     pub inter: usize,
+    pub shared_inter: usize,
 }
 
 impl MoeDims {
@@ -20,6 +21,7 @@ impl MoeDims {
             top_k,
             hidden,
             inter,
+            shared_inter: inter,
         }
     }
 
@@ -33,8 +35,8 @@ impl MoeDims {
 /// x `[rows, hidden]`, router_w `[experts, hidden]`,
 /// gate_up `[experts, 2*inter, hidden]` with gate rows `[0, inter)` and up
 /// rows `[inter, 2*inter)`, down `[experts, hidden, inter]`,
-/// shared_gate/shared_up `[inter, hidden]`, shared_down `[hidden, inter]`,
-/// shared_expert_gate `[hidden]`.
+/// shared_gate/shared_up `[shared_inter, hidden]`,
+/// shared_down `[hidden, shared_inter]`, shared_expert_gate `[hidden]`.
 pub(crate) struct MoeFixture {
     pub dims: MoeDims,
     pub x: Vec<bf16>,
@@ -101,10 +103,14 @@ pub(crate) fn fixture(dims: MoeDims, variant: u32) -> MoeFixture {
         top_k,
         hidden: h,
         inter: i,
+        shared_inter: si,
     } = dims;
-    assert!(rows >= 2 && experts >= 6 && top_k >= 4 && experts > top_k && h >= 8 && i >= 1);
+    assert!(
+        rows >= 2 && experts >= 6 && top_k >= 4 && experts > top_k && h >= 8 && i >= 1 && si >= 1
+    );
     let wscale = 2.0 / (h as f32).sqrt();
     let dscale = 1.0 / (i as f32).sqrt();
+    let shared_dscale = 1.0 / (si as f32).sqrt();
     let mut x = Vec::with_capacity(rows * h);
     for r in 0..rows {
         for c in 0..h {
@@ -133,18 +139,20 @@ pub(crate) fn fixture(dims: MoeDims, variant: u32) -> MoeFixture {
             }
         }
     }
-    let mut shared_gate = Vec::with_capacity(i * h);
-    let mut shared_up = Vec::with_capacity(i * h);
-    for j in 0..i {
+    let mut shared_gate = Vec::with_capacity(si * h);
+    let mut shared_up = Vec::with_capacity(si * h);
+    for j in 0..si {
         for c in 0..h {
             shared_gate.push(bf16::from_f32(unit(seed(variant, 5), 0, j, c) * wscale));
             shared_up.push(bf16::from_f32(unit(seed(variant, 6), 0, j, c) * wscale));
         }
     }
-    let mut shared_down = Vec::with_capacity(h * i);
+    let mut shared_down = Vec::with_capacity(h * si);
     for d in 0..h {
-        for j in 0..i {
-            shared_down.push(bf16::from_f32(unit(seed(variant, 7), 0, d, j) * dscale));
+        for j in 0..si {
+            shared_down.push(bf16::from_f32(
+                unit(seed(variant, 7), 0, d, j) * shared_dscale,
+            ));
         }
     }
     let mut shared_expert_gate = Vec::with_capacity(h);
@@ -250,6 +258,29 @@ pub(crate) fn route_row(fx: &MoeFixture, row: usize) -> RouteRow {
     )
 }
 
+pub(crate) fn sigmoid_route_row(fx: &MoeFixture, row: usize) -> RouteRow {
+    let (e, k, h) = (fx.dims.experts, fx.dims.top_k, fx.dims.hidden);
+    assert!(row < fx.dims.rows);
+    let logits = router_logits(&fx.router_w, &fx.x[row * h..(row + 1) * h], e);
+    let probs: Vec<_> = logits
+        .iter()
+        .map(|logit| 1.0 / (1.0 + (-logit.to_f32()).exp()))
+        .collect();
+    let order = ranking(&probs);
+    let top = &order[..k];
+    let tsum: f32 = top.iter().map(|&id| probs[id]).sum::<f32>() + 1.0e-20;
+    let margin = probs[order[k - 1]] - probs[order[k]];
+    RouteRow {
+        ids: top.iter().map(|&id| id as i32).collect(),
+        weights: top
+            .iter()
+            .map(|&id| bf16::from_f32(probs[id] / tsum))
+            .collect(),
+        probs,
+        margin,
+    }
+}
+
 pub(crate) fn route_logits(logits: &[bf16], k: usize) -> RouteRow {
     let probs = softmax_probs(logits);
     let order = ranking(&probs);
@@ -284,7 +315,13 @@ fn dot(a: &[bf16], b: &[bf16]) -> f32 {
         .sum()
 }
 
-fn expert_out(fx: &MoeFixture, e: usize, xr: &[bf16], weight: bf16) -> Vec<bf16> {
+fn expert_out(
+    fx: &MoeFixture,
+    e: usize,
+    xr: &[bf16],
+    weight: bf16,
+    routed_weight: crate::model_spec::RoutedWeightBoundary,
+) -> Vec<bf16> {
     let (h, i) = (fx.dims.hidden, fx.dims.inter);
     let mut prod = Vec::with_capacity(i);
     for j in 0..i {
@@ -295,23 +332,31 @@ fn expert_out(fx: &MoeFixture, e: usize, xr: &[bf16], weight: bf16) -> Vec<bf16>
     }
     (0..h)
         .map(|d| {
-            let lin = bf16::from_f32(dot(&prod, fx.down_row(e, d)));
-            bf16::from_f32(lin.to_f32() * weight.to_f32())
+            let lin = dot(&prod, fx.down_row(e, d));
+            let weighted = match routed_weight {
+                crate::model_spec::RoutedWeightBoundary::AfterDownBf16 => {
+                    bf16::from_f32(lin).to_f32() * weight.to_f32()
+                }
+                crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16 => {
+                    lin * weight.to_f32()
+                }
+            };
+            bf16::from_f32(weighted)
         })
         .collect()
 }
 
 fn shared_out(fx: &MoeFixture, xr: &[bf16]) -> Vec<bf16> {
-    let (h, i) = (fx.dims.hidden, fx.dims.inter);
-    let mut prod = Vec::with_capacity(i);
-    for j in 0..i {
+    let (h, si) = (fx.dims.hidden, fx.dims.shared_inter);
+    let mut prod = Vec::with_capacity(si);
+    for j in 0..si {
         let g = bf16::from_f32(dot(xr, &fx.shared_gate[j * h..(j + 1) * h]));
         let u = bf16::from_f32(dot(xr, &fx.shared_up[j * h..(j + 1) * h]));
         let s = bf16::from_f32(silu(g.to_f32()));
         prod.push(bf16::from_f32(s.to_f32() * u.to_f32()));
     }
     (0..h)
-        .map(|d| bf16::from_f32(dot(&prod, &fx.shared_down[d * i..(d + 1) * i])))
+        .map(|d| bf16::from_f32(dot(&prod, &fx.shared_down[d * si..(d + 1) * si])))
         .collect()
 }
 
@@ -333,6 +378,26 @@ pub(crate) fn moe_row_ids(
     keep: &[usize],
     combine: Combine,
 ) -> Vec<bf16> {
+    moe_row_ids_with_boundary(
+        fx,
+        row,
+        ids,
+        weights,
+        keep,
+        combine,
+        crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+    )
+}
+
+pub(crate) fn moe_row_ids_with_boundary(
+    fx: &MoeFixture,
+    row: usize,
+    ids: &[i32],
+    weights: &[bf16],
+    keep: &[usize],
+    combine: Combine,
+    routed_weight: crate::model_spec::RoutedWeightBoundary,
+) -> Vec<bf16> {
     let h = fx.dims.hidden;
     assert!(row < fx.dims.rows);
     assert!(!keep.is_empty());
@@ -348,7 +413,7 @@ pub(crate) fn moe_row_ids(
     let xr = &fx.x[row * h..(row + 1) * h];
     let contributions: Vec<Vec<bf16>> = slots
         .iter()
-        .map(|&(e, w)| expert_out(fx, e, xr, w))
+        .map(|&(e, w)| expert_out(fx, e, xr, w, routed_weight))
         .collect();
     let shared = shared_out(fx, xr);
     let scale = bf16::from_f32(sigmoid(

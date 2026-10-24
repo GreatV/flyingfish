@@ -249,6 +249,12 @@ impl SlotLayout {
                     "BF16 native gate-up alignment: bytes={gate_up_bytes}"
                 );
             }
+            crate::experts::catalogue::ExpertLayout::Bf16Separate { matrix_bytes, .. } => {
+                ensure!(
+                    *matrix_bytes > 0 && matrix_bytes.is_multiple_of(16),
+                    "BF16 native matrix alignment: bytes={matrix_bytes}"
+                );
+            }
             crate::experts::catalogue::ExpertLayout::Fp8W8a16(layout) => {
                 for (name, range) in [
                     ("gate", &layout.gate),
@@ -498,6 +504,7 @@ mod tests {
     #[test]
     fn slot_layout_matches_ledger_tail_with_uneven_layers() -> Result<()> {
         let geometry = ExpertGeometry {
+            first_layer: 0,
             layers: 3,
             experts: 8,
             hidden: 8,
@@ -535,6 +542,7 @@ mod tests {
     #[test]
     fn native_slot_layout_prices_spares_and_rejects_out_of_bounds_extents() -> Result<()> {
         let geometry = ExpertGeometry {
+            first_layer: 0,
             layers: 40,
             experts: 256,
             hidden: 2048,

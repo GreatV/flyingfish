@@ -44,6 +44,7 @@ const MAX_GROUPS: usize = MAX_EXPERTS + 2;
 /// Caller-owned contribution/done buffers survive cohorts; inputs stay immutable until stream completion.
 #[derive(Debug)]
 pub(crate) struct MoePrefillContribute<'a> {
+    pub expert_inter: u32,
     /// Host-packed `(cohort, base, active)` wave expectation checked at the count sync.
     pub wave: Option<(usize, u32, u32)>,
     pub wait_copy: Option<&'a CudaEvent>,
@@ -70,7 +71,7 @@ pub(crate) struct MoePrefillContribute<'a> {
     pub shared_gate: Tensor<bf16, 2>,
     pub shared_up: Tensor<bf16, 2>,
     pub shared_down: Tensor<bf16, 2>,
-    pub shared_expert_gate: Tensor<bf16, 1>,
+    pub shared_expert_gate: Option<Tensor<bf16, 1>>,
     /// CALLER-OWNED `[rows, top_k, hidden]` weighted BF16 contributions.
     pub contributions: Tensor<bf16, 3>,
     /// CALLER-OWNED `[rows, top_k]` done bits (zeroed by the first cohort).
@@ -81,6 +82,7 @@ pub(crate) struct MoePrefillContribute<'a> {
 #[derive(Debug)]
 #[cfg(test)]
 pub(crate) struct MoePrefill<'a> {
+    pub expert_inter: u32,
     pub x: Tensor<bf16, 2>,
     pub ids: Tensor<i32, 2>,
     pub active: Tensor<u32, 2>,
@@ -99,7 +101,7 @@ pub(crate) struct MoePrefill<'a> {
     pub shared_gate: Tensor<bf16, 2>,
     pub shared_up: Tensor<bf16, 2>,
     pub shared_down: Tensor<bf16, 2>,
-    pub shared_expert_gate: Tensor<bf16, 1>,
+    pub shared_expert_gate: Option<Tensor<bf16, 1>>,
     pub contributions: Tensor<bf16, 3>,
     pub done: TensorMut<u32, 2>,
     pub y: TensorMut<bf16, 2>,
@@ -112,6 +114,7 @@ pub(crate) struct MoePrefill<'a> {
 /// written.
 #[derive(Debug)]
 pub(crate) struct MoePrefillFinish {
+    pub expert_inter: u32,
     pub x: Tensor<bf16, 2>,
     pub ids: Tensor<i32, 2>,
     /// `[rows, top_k]` the completed assignment union the combine checks
@@ -127,7 +130,7 @@ pub(crate) struct MoePrefillFinish {
     pub shared_gate: Tensor<bf16, 2>,
     pub shared_up: Tensor<bf16, 2>,
     pub shared_down: Tensor<bf16, 2>,
-    pub shared_expert_gate: Tensor<bf16, 1>,
+    pub shared_expert_gate: Option<Tensor<bf16, 1>>,
     pub y: TensorMut<bf16, 2>,
 }
 
@@ -138,6 +141,7 @@ pub(crate) struct PrefillPlan {
     experts: u32,
     hidden: u32,
     inter: u32,
+    shared_inter: u32,
     assignments: u64,
     layout: PrefillLayout,
 }
@@ -175,30 +179,32 @@ impl MoePrefillFinish {
             "moe prefill finish contributions must be dense [rows, top_k, hidden] (shape {:?})",
             self.contributions.shape
         );
-        let inter = self.shared_gate.shape[0];
+        let shared_inter = self.shared_gate.shape[0];
         for (t, name) in [
             (&self.shared_gate, "shared_gate"),
             (&self.shared_up, "shared_up"),
         ] {
             t.validate()?;
             ensure!(
-                t.shape == [inter, hidden] && t.stride == [u64::from(hidden), 1],
-                "moe prefill finish {name} must be dense [inter, hidden] (shape {:?})",
+                t.shape == [shared_inter, hidden] && t.stride == [u64::from(hidden), 1],
+                "moe prefill finish {name} must be dense [shared_inter, hidden] (shape {:?})",
                 t.shape
             );
         }
         self.shared_down.validate()?;
         ensure!(
-            self.shared_down.shape == [hidden, inter]
-                && self.shared_down.stride == [u64::from(inter), 1],
-            "moe prefill finish shared_down must be dense [hidden, inter] (shape {:?})",
+            self.shared_down.shape == [hidden, shared_inter]
+                && self.shared_down.stride == [u64::from(shared_inter), 1],
+            "moe prefill finish shared_down must be dense [hidden, shared_inter] (shape {:?})",
             self.shared_down.shape
         );
-        self.shared_expert_gate.validate()?;
-        ensure!(
-            self.shared_expert_gate.shape == [hidden] && self.shared_expert_gate.stride == [1],
-            "moe prefill finish shared gate must be dense [hidden]"
-        );
+        if let Some(gate) = &self.shared_expert_gate {
+            gate.validate()?;
+            ensure!(
+                gate.shape == [hidden] && gate.stride == [1],
+                "moe prefill finish shared gate must be dense [hidden]"
+            );
+        }
         self.y.read().validate()?;
         ensure!(
             self.y.read().shape == [rows, hidden] && self.y.read().stride == [u64::from(hidden), 1],
@@ -211,33 +217,31 @@ impl MoePrefillFinish {
         no_overlap(&self.shared_gate, &self.y.read(), "shared_gate", "y")?;
         no_overlap(&self.shared_up, &self.y.read(), "shared_up", "y")?;
         no_overlap(&self.shared_down, &self.y.read(), "shared_down", "y")?;
-        no_overlap(
-            &self.shared_expert_gate,
-            &self.y.read(),
-            "shared_expert_gate",
-            "y",
-        )?;
+        if let Some(gate) = &self.shared_expert_gate {
+            no_overlap(gate, &self.y.read(), "shared_expert_gate", "y")?;
+        }
         ensure!(
             (1..=MAX_EXPERTS).contains(&(self.experts as usize)),
             "moe prefill finish experts {} outside [1, {}]",
             self.experts,
             MAX_EXPERTS
         );
-        let layout = prefill_layout(
+        let layout = prefill_layout_mixed(
             rows as usize,
             rows as usize,
             top_k as usize,
             self.experts as usize,
             hidden as usize,
-            inter as usize,
-            None,
+            (self.expert_inter as usize, shared_inter as usize),
+            (None, crate::model_spec::RoutedWeightBoundary::AfterDownBf16),
         )?;
         Ok(PrefillPlan {
             rows,
             top_k,
             experts: self.experts,
             hidden,
-            inter,
+            inter: shared_inter,
+            shared_inter,
             assignments: u64::from(rows) * u64::from(top_k),
             layout,
         })
@@ -245,7 +249,10 @@ impl MoePrefillFinish {
 }
 
 impl MoePrefillContribute<'_> {
-    pub(crate) fn validate(&self) -> Result<PrefillPlan> {
+    pub(crate) fn validate(
+        &self,
+        routed_weight: crate::model_spec::RoutedWeightBoundary,
+    ) -> Result<PrefillPlan> {
         self.x.validate()?;
         let (rows, hidden) = (self.x.shape[0], self.x.shape[1]);
         ensure!(
@@ -297,21 +304,26 @@ impl MoePrefillContribute<'_> {
             self.slots_gate_up_host.len(),
             self.slots_down_host.len()
         );
-        let inter = self.shared_gate.shape[0];
+        let shared_inter = self.shared_gate.shape[0];
+        let inter = self.expert_inter;
         self.shared_gate.validate()?;
         self.shared_up.validate()?;
         self.shared_down.validate()?;
-        self.shared_expert_gate.validate()?;
+        if let Some(gate) = &self.shared_expert_gate {
+            gate.validate()?;
+        }
         ensure!(
-            self.shared_gate.shape == [inter, hidden]
+            self.shared_gate.shape == [shared_inter, hidden]
                 && self.shared_gate.stride == [u64::from(hidden), 1]
-                && self.shared_up.shape == [inter, hidden]
+                && self.shared_up.shape == [shared_inter, hidden]
                 && self.shared_up.stride == [u64::from(hidden), 1]
-                && self.shared_down.shape == [hidden, inter]
-                && self.shared_down.stride == [u64::from(inter), 1]
-                && self.shared_expert_gate.shape == [hidden]
-                && self.shared_expert_gate.stride == [1],
-            "moe prefill shared expert layout mismatch (inter {inter}, hidden {hidden})"
+                && self.shared_down.shape == [hidden, shared_inter]
+                && self.shared_down.stride == [u64::from(shared_inter), 1]
+                && self
+                    .shared_expert_gate
+                    .as_ref()
+                    .is_none_or(|gate| gate.shape == [hidden] && gate.stride == [1]),
+            "moe prefill shared expert layout mismatch (inter {shared_inter}, hidden {hidden})"
         );
         self.contributions.validate()?;
         ensure!(
@@ -338,12 +350,14 @@ impl MoePrefillContribute<'_> {
             "moe prefill top_k {top_k} outside [1,32]"
         );
         ensure!(
-            hidden.is_multiple_of(2) && inter.is_multiple_of(2),
-            "moe prefill hidden {hidden} and inter {inter} must be even for cuBLAS BF16 alignment"
+            hidden.is_multiple_of(2) && inter.is_multiple_of(2) && shared_inter.is_multiple_of(2),
+            "moe prefill hidden {hidden}, inter {inter}, and shared inter {shared_inter} must be even for cuBLAS BF16 alignment"
         );
         ensure!(
-            u64::from(hidden) <= i32::MAX as u64 && u64::from(inter) <= i32::MAX as u64,
-            "moe prefill hidden {hidden} and inter {inter} exceed the cuBLAS grouped i32 leading dims"
+            u64::from(hidden) <= i32::MAX as u64
+                && u64::from(inter) <= i32::MAX as u64
+                && u64::from(shared_inter) <= i32::MAX as u64,
+            "moe prefill hidden {hidden}, inter {inter}, or shared inter {shared_inter} exceeds the cuBLAS grouped i32 leading dims"
         );
         let assignments = u64::from(rows) * u64::from(top_k);
         ensure!(
@@ -351,7 +365,7 @@ impl MoePrefillContribute<'_> {
             "moe prefill assignment count {assignments} exceeds i32"
         );
         let silu_routed = assignments * u64::from(inter);
-        let silu_shared = u64::from(rows) * u64::from(inter);
+        let silu_shared = u64::from(rows) * u64::from(shared_inter);
         ensure!(
             silu_routed <= i32::MAX as u64 && silu_shared <= i32::MAX as u64,
             "moe prefill activation elements assignments*inter {silu_routed} and rows*inter {silu_shared} exceed the silu_mul flat-grid index"
@@ -382,12 +396,14 @@ impl MoePrefillContribute<'_> {
             "shared_down",
             "contributions",
         )?;
-        no_overlap(
-            &self.shared_expert_gate,
-            &self.contributions,
-            "shared_expert_gate",
-            "contributions",
-        )?;
+        if let Some(gate) = &self.shared_expert_gate {
+            no_overlap(
+                gate,
+                &self.contributions,
+                "shared_expert_gate",
+                "contributions",
+            )?;
+        }
         no_overlap(&self.ids, &self.done.read(), "ids", "done")?;
         no_overlap(&self.weights, &self.done.read(), "weights", "done")?;
         no_overlap(&self.active, &self.done.read(), "active", "done")?;
@@ -407,14 +423,14 @@ impl MoePrefillContribute<'_> {
             }
             None => rows as usize,
         };
-        let layout = prefill_layout(
+        let layout = prefill_layout_mixed(
             active_rows,
             rows as usize,
             top_k as usize,
             experts as usize,
             hidden as usize,
-            inter as usize,
-            self.fp8_slot,
+            (inter as usize, shared_inter as usize),
+            (self.fp8_slot, routed_weight),
         )?;
         Ok(PrefillPlan {
             rows,
@@ -422,6 +438,7 @@ impl MoePrefillContribute<'_> {
             experts,
             hidden,
             inter,
+            shared_inter,
             assignments,
             layout,
         })
@@ -447,12 +464,9 @@ impl MoePrefill<'_> {
         no_overlap(&self.shared_gate, &self.y.read(), "shared_gate", "y")?;
         no_overlap(&self.shared_up, &self.y.read(), "shared_up", "y")?;
         no_overlap(&self.shared_down, &self.y.read(), "shared_down", "y")?;
-        no_overlap(
-            &self.shared_expert_gate,
-            &self.y.read(),
-            "shared_expert_gate",
-            "y",
-        )?;
+        if let Some(gate) = &self.shared_expert_gate {
+            no_overlap(gate, &self.y.read(), "shared_expert_gate", "y")?;
+        }
         Ok(())
     }
 }
@@ -490,6 +504,7 @@ pub fn stage_device_bytes() -> u64 {
     ((GEMM1_PTR_WORDS + GEMM2_PTR_WORDS) * 8) as u64
 }
 
+#[cfg(test)]
 pub(crate) fn prefill_scratch_bytes(
     rows: usize,
     contribute_rows: usize,
@@ -499,14 +514,58 @@ pub(crate) fn prefill_scratch_bytes(
     inter: usize,
     fp8_slot: Option<&Fp8Slot>,
 ) -> Result<u64> {
-    prefill_layout(
+    prefill_scratch_bytes_mixed(
         rows,
         contribute_rows,
         top_k,
         experts,
         hidden,
-        inter,
+        (inter, inter),
         fp8_slot,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn prefill_scratch_bytes_mixed(
+    rows: usize,
+    contribute_rows: usize,
+    top_k: usize,
+    experts: usize,
+    hidden: usize,
+    intermediates: (usize, usize),
+    fp8_slot: Option<&Fp8Slot>,
+) -> Result<u64> {
+    prefill_scratch_bytes_mixed_with_boundary(
+        rows,
+        contribute_rows,
+        top_k,
+        experts,
+        hidden,
+        intermediates,
+        (
+            fp8_slot,
+            crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+        ),
+    )
+}
+
+pub(crate) fn prefill_scratch_bytes_mixed_with_boundary(
+    rows: usize,
+    contribute_rows: usize,
+    top_k: usize,
+    experts: usize,
+    hidden: usize,
+    intermediates: (usize, usize),
+    arithmetic: (Option<&Fp8Slot>, crate::model_spec::RoutedWeightBoundary),
+) -> Result<u64> {
+    prefill_layout_mixed(
+        rows,
+        contribute_rows,
+        top_k,
+        experts,
+        hidden,
+        intermediates,
+        arithmetic,
     )
     .map(|layout| layout.bytes)
 }
@@ -524,6 +583,7 @@ fn region(at: &mut u64, elements: usize, element_bytes: u64) -> Result<u64> {
     Ok(off)
 }
 
+#[cfg(test)]
 pub(crate) fn prefill_layout(
     rows: usize,
     contribute_rows: usize,
@@ -533,6 +593,31 @@ pub(crate) fn prefill_layout(
     inter: usize,
     fp8_slot: Option<&Fp8Slot>,
 ) -> Result<PrefillLayout> {
+    prefill_layout_mixed(
+        rows,
+        contribute_rows,
+        top_k,
+        experts,
+        hidden,
+        (inter, inter),
+        (
+            fp8_slot,
+            crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+        ),
+    )
+}
+
+pub(crate) fn prefill_layout_mixed(
+    rows: usize,
+    contribute_rows: usize,
+    top_k: usize,
+    experts: usize,
+    hidden: usize,
+    intermediates: (usize, usize),
+    arithmetic: (Option<&Fp8Slot>, crate::model_spec::RoutedWeightBoundary),
+) -> Result<PrefillLayout> {
+    let (fp8_slot, routed_weight) = arithmetic;
+    let (inter, shared_inter) = intermediates;
     ensure!(
         contribute_rows >= rows,
         "moe prefill contribute_rows={contribute_rows} below wave rows={rows}"
@@ -552,10 +637,10 @@ pub(crate) fn prefill_layout(
     let routed_gate_up = routed_inter
         .checked_mul(2)
         .context("moe prefill gate-up extent overflow")?;
-    let shared_inter = rows
-        .checked_mul(inter)
+    let shared_inter_extent = rows
+        .checked_mul(shared_inter)
         .context("moe prefill shared intermediate overflow")?;
-    let shared_gate_up = shared_inter
+    let shared_gate_up = shared_inter_extent
         .checked_mul(2)
         .context("moe prefill shared gate-up overflow")?;
     let shared_hidden = rows
@@ -576,9 +661,16 @@ pub(crate) fn prefill_layout(
     let x_perm = region(&mut at, routed_hidden, 2)?;
     let h1 = region(&mut at, routed_gate_up, 2)?;
     let act = region(&mut at, routed_inter, 2)?;
-    let y_perm = region(&mut at, routed_hidden, 2)?;
+    let y_perm_bytes = if fp8_slot.is_none()
+        && routed_weight == crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16
+    {
+        4
+    } else {
+        2
+    };
+    let y_perm = region(&mut at, routed_hidden, y_perm_bytes)?;
     let h1s = region(&mut at, shared_gate_up, 2)?;
-    let act_s = region(&mut at, shared_inter, 2)?;
+    let act_s = region(&mut at, shared_inter_extent, 2)?;
     let shared_out = region(&mut at, shared_hidden, 2)?;
     let scale = region(&mut at, rows, 2)?;
     if let Some(slot) = fp8_slot {
@@ -587,6 +679,7 @@ pub(crate) fn prefill_layout(
             "unsupported native expert GEMM shape hidden={hidden} intermediate={inter}: output channels must be multiples of 128 and K multiples of 64"
         );
         let geometry = ExpertGeometry {
+            first_layer: 0,
             layers: 1,
             experts: u32::try_from(experts)?,
             hidden: u32::try_from(hidden)?,
@@ -765,8 +858,12 @@ pub(crate) struct PrefillOps {
     scan: CudaFunction,
     permute: CudaFunction,
     scatter: CudaFunction,
+    scatter_f32: CudaFunction,
     lane16: CudaFunction,
+    lane16_f32: CudaFunction,
     silu: CudaFunction,
+    swiglu_rounding: crate::model_spec::SwigluRounding,
+    routed_weight: crate::model_spec::RoutedWeightBoundary,
     combine: CombineOps,
     blas: CudaBlas,
     stream: Arc<CudaStream>,
@@ -787,10 +884,27 @@ pub(crate) fn arithmetic_mask(counts: &[u32], mask: &mut [bool]) -> Result<()> {
 }
 
 impl PrefillOps {
+    #[cfg(test)]
     pub fn new(
         ctx: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
         format: ExpertFormat,
+    ) -> Result<Self> {
+        Self::new_with_boundaries(
+            ctx,
+            stream,
+            format,
+            crate::model_spec::SwigluRounding::Twice,
+            crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+        )
+    }
+
+    pub fn new_with_boundaries(
+        ctx: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
+        format: ExpertFormat,
+        swiglu_rounding: crate::model_spec::SwigluRounding,
+        routed_weight: crate::model_spec::RoutedWeightBoundary,
     ) -> Result<Self> {
         let module = cubin::module(ctx, "moe_prefill")?;
         let act = cubin::module(ctx, "act")?;
@@ -815,8 +929,12 @@ impl PrefillOps {
             scan: module.load_function("moe_scan")?,
             permute: module.load_function("moe_permute")?,
             scatter: module.load_function("moe_scatter")?,
+            scatter_f32: module.load_function("moe_scatter_f32")?,
             lane16: module.load_function("moe_gemm_lane16")?,
+            lane16_f32: module.load_function("moe_gemm_lane16_f32")?,
             silu: act.load_function("silu_mul")?,
+            swiglu_rounding,
+            routed_weight,
             combine: CombineOps::new(ctx)?,
             blas,
             stream: stream.clone(),
@@ -835,7 +953,7 @@ impl PrefillOps {
             Arc::ptr_eq(stream, &self.stream),
             "moe prefill stream is not the PrefillOps construction stream (cuBLAS handle bound at construction)"
         );
-        let plan = input.validate()?;
+        let plan = input.validate(self.routed_weight)?;
         ensure!(
             input.fp8_slot.is_none() || self.fp8.is_some(),
             "FP8 prefill operators not bound at setup"
@@ -854,6 +972,10 @@ impl PrefillOps {
     ) -> Result<()> {
         let experts = plan.experts as usize;
         let (rows, top_k, hidden, inter) = (plan.rows, plan.top_k, plan.hidden, plan.inter);
+        let output_fp32 = input.fp8_slot.is_none()
+            && self.routed_weight
+                == crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16;
+        let y_elem = if output_fp32 { 4 } else { 2 };
         let layout = &plan.layout;
         let counts_at = scratch.ptr + layout.counts;
         let active_total_at = scratch.ptr + layout.active_total;
@@ -943,9 +1065,14 @@ impl PrefillOps {
             return Ok(());
         }
         problem_order(counts, input.cpu_arithmetic, &mut stage.order);
-        let tensor_problems = stage
-            .order
-            .partition_point(|&expert| !input.cpu_arithmetic[expert as usize]);
+        // FP32 routed contributions use lane16; grouped cuBLAS has no BF16-input/FP32-C form on sm86.
+        let tensor_problems = if output_fp32 {
+            0
+        } else {
+            stage
+                .order
+                .partition_point(|&expert| !input.cpu_arithmetic[expert as usize])
+        };
         let small_rows = stage.order[tensor_problems..]
             .iter()
             .map(|&expert| counts[expert as usize] as u32)
@@ -1037,7 +1164,7 @@ impl PrefillOps {
                 stage,
                 gemm1_base,
                 len1,
-                (tensor_problems, small_rows),
+                (tensor_problems, small_rows, false),
                 (2 * inter, hidden),
                 slot.gate_scale.start,
             )?;
@@ -1049,7 +1176,7 @@ impl PrefillOps {
             self.small_gemm(
                 gemm1_base,
                 len1,
-                (tensor_problems, small_rows),
+                (tensor_problems, small_rows, false),
                 (2 * inter, hidden),
                 None,
             )?;
@@ -1063,6 +1190,7 @@ impl PrefillOps {
                 .arg(&act_at)
                 .arg(&(active_total as i32))
                 .arg(&(inter as i32))
+                .arg(&(self.swiglu_rounding as i32))
                 .launch(silu_grid(active_total as usize * inter as usize))?;
         }
 
@@ -1081,7 +1209,7 @@ impl PrefillOps {
                     input.slots_down_host[e]
                 };
                 mirror[len2 + j] = act_at + elem(off * u64::from(inter));
-                mirror[2 * len2 + j] = y_perm_at + elem(off * u64::from(hidden));
+                mirror[2 * len2 + j] = y_perm_at + off * u64::from(hidden) * y_elem;
                 mirror[3 * len2 + j] = counts[e] as u64;
             }
         }
@@ -1112,19 +1240,21 @@ impl PrefillOps {
                 stage,
                 gemm2_base,
                 len2,
-                (tensor_problems, small_rows),
+                (tensor_problems, small_rows, false),
                 (hidden, inter),
                 slot.down_scale.start - slot.down.start,
             )?;
         } else {
             unsafe {
-                self.grouped_gemm(stage, gemm2_base, len2)
-                    .context("moe prefill grouped GEMM 2")?;
+                if !output_fp32 {
+                    self.grouped_gemm(stage, gemm2_base, len2)
+                        .context("moe prefill grouped GEMM 2")?;
+                }
             }
             self.small_gemm(
                 gemm2_base,
                 len2,
-                (tensor_problems, small_rows),
+                (tensor_problems, small_rows, output_fp32),
                 (hidden, inter),
                 None,
             )?;
@@ -1133,16 +1263,30 @@ impl PrefillOps {
             reader.record(stream)?;
         }
         unsafe {
-            stream
-                .launch_builder(&self.scatter)
-                .arg(&y_perm_at)
-                .arg(&input.weights.ptr)
-                .arg(&pos_of_at)
-                .arg(&input.active.ptr)
-                .arg(&input.contributions.ptr)
-                .arg(&(plan.assignments as i64))
-                .arg(&(hidden as i64))
-                .launch(grid(plan.assignments as usize, BLOCK_THREADS))?;
+            if output_fp32 {
+                stream
+                    .launch_builder(&self.scatter_f32)
+                    .arg(&y_perm_at)
+                    .arg(&input.weights.ptr)
+                    .arg(&pos_of_at)
+                    .arg(&input.active.ptr)
+                    .arg(&input.contributions.ptr)
+                    .arg(&(plan.assignments as i64))
+                    .arg(&(hidden as i64))
+                    .arg(&1i32)
+                    .launch(grid(plan.assignments as usize, BLOCK_THREADS))?;
+            } else {
+                stream
+                    .launch_builder(&self.scatter)
+                    .arg(&y_perm_at)
+                    .arg(&input.weights.ptr)
+                    .arg(&pos_of_at)
+                    .arg(&input.active.ptr)
+                    .arg(&input.contributions.ptr)
+                    .arg(&(plan.assignments as i64))
+                    .arg(&(hidden as i64))
+                    .launch(grid(plan.assignments as usize, BLOCK_THREADS))?;
+            }
         }
         Ok(())
     }
@@ -1163,6 +1307,7 @@ impl PrefillOps {
             "moe prefill stream is not the PrefillOps construction stream (cuBLAS handle bound at construction)"
         );
         let cohort = MoePrefillContribute {
+            expert_inter: input.expert_inter,
             cpu_arithmetic: &[false; MAX_EXPERTS][..input.slot_valid.shape[0] as usize],
             fp8_slot: None,
             wave: None,
@@ -1186,7 +1331,7 @@ impl PrefillOps {
             shared_down: input.shared_down,
             shared_expert_gate: input.shared_expert_gate,
         };
-        let plan = cohort.validate()?;
+        let plan = cohort.validate(self.routed_weight)?;
         input.validate_y(&plan)?;
         scratch.validate(plan.layout.bytes)?;
         unsafe {
@@ -1195,6 +1340,7 @@ impl PrefillOps {
         self.contribute(stream, &cohort, &plan, scratch)?;
         let y = input.y;
         let fin = MoePrefillFinish {
+            expert_inter: input.expert_inter,
             x: cohort.x,
             ids: cohort.ids,
             final_active: input.active,
@@ -1241,7 +1387,7 @@ impl PrefillOps {
         // Shared FFN: the gate/up group (2 problems) and the down group (1
         // problem) share one 9-pointer block [A|B|C] per group, uploaded
         // with a single H2D.
-        let (rows, hidden, inter) = (plan.rows, plan.hidden, plan.inter);
+        let (rows, hidden, inter) = (plan.rows, plan.hidden, plan.shared_inter);
         let h1s_at = scratch.ptr + plan.layout.h1s;
         let act_s_at = scratch.ptr + plan.layout.act_s;
         let shared_out_at = scratch.ptr + plan.layout.shared_out;
@@ -1293,6 +1439,7 @@ impl PrefillOps {
                     .arg(&act_s_at)
                     .arg(&(rows as i32))
                     .arg(&(inter as i32))
+                    .arg(&(self.swiglu_rounding as i32))
                     .launch(grid(
                         (rows as usize * inter as usize).div_ceil(BLOCK_THREADS as usize),
                         BLOCK_THREADS,
@@ -1317,10 +1464,17 @@ impl PrefillOps {
         // moe_combine's scale column over the same [rows] words; the nonzero
         // stride keeps Tensor::validate satisfied.
         let scale_at = scratch.ptr + plan.layout.scale;
-        let mut scale =
-            unsafe { TensorMut::<bf16, 2>::new(scale_at, [rows, 1], [1, 1], u64::from(rows) * 2)? };
-        self.combine
-            .shared_scale(stream, input.x, input.shared_expert_gate, &mut scale)?;
+        let mut gate = None;
+        let mut scale = None;
+        if let Some(shared_gate) = input.shared_expert_gate {
+            let mut written = unsafe {
+                TensorMut::<bf16, 2>::new(scale_at, [rows, 1], [1, 1], u64::from(rows) * 2)?
+            };
+            self.combine
+                .shared_scale(stream, input.x, shared_gate, &mut written)?;
+            gate = Some(shared_gate);
+            scale = Some(written);
+        }
         let combine_input = MoeCombine {
             ids: input.ids,
             final_active: input.final_active,
@@ -1335,7 +1489,7 @@ impl PrefillOps {
                 )?
             },
             x: input.x,
-            shared_expert_gate: input.shared_expert_gate,
+            shared_expert_gate: gate,
             scale,
             y: input.y,
         };
@@ -1348,11 +1502,11 @@ impl PrefillOps {
         stage: &Stage,
         block: u64,
         problems: usize,
-        small: (usize, u32),
+        small: (usize, u32, bool),
         shape: (u32, u32),
         scale_offset: u64,
     ) -> Result<()> {
-        let (tensor_problems, _) = small;
+        let (tensor_problems, _, _) = small;
         if tensor_problems > 0 {
             let kernel = &self.fp8.as_ref().context("native expert GEMM missing")?.0;
             let rows = stage
@@ -1388,18 +1542,18 @@ impl PrefillOps {
         &self,
         block: u64,
         problems: usize,
-        small: (usize, u32),
+        small: (usize, u32, bool),
         shape: (u32, u32),
         scale_offset: Option<u64>,
     ) -> Result<()> {
-        let (first, rows) = small;
+        let (first, rows, output_fp32) = small;
         if first == problems {
             return Ok(());
         }
-        let kernel = if scale_offset.is_some() {
-            &self.fp8.as_ref().context("FP8 lane16 operator missing")?.1
-        } else {
-            &self.lane16
+        let kernel = match (scale_offset.is_some(), output_fp32) {
+            (true, _) => &self.fp8.as_ref().context("FP8 lane16 operator missing")?.1,
+            (false, true) => &self.lane16_f32,
+            (false, false) => &self.lane16,
         };
         let offset = scale_offset.unwrap_or(0);
         let (problem_count, first_problem, columns, inner) = (

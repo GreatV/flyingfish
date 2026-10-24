@@ -677,6 +677,7 @@ impl MtpRuntime {
                         capacity: self.plan.capacity,
                         head_dim: 256,
                         causal: true,
+                        window_left: None,
                     },
                 )?;
             }

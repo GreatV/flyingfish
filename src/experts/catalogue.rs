@@ -21,6 +21,12 @@ pub enum ExpertRange {
         gate_up: NativeRange,
         down: NativeRange,
     },
+    /// Three published per-expert BF16 tensors staged into one runtime gate-up/down slot.
+    Bf16Separate {
+        gate: NativeRange,
+        up: NativeRange,
+        down: NativeRange,
+    },
     /// Per-expert 2-D E4M3 weights with BF16 per-output-channel scales.
     Fp8 {
         gate: NativeRange,
@@ -47,6 +53,7 @@ pub struct Fp8Slot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExpertLayout {
     Bf16Fused { slot_bytes: u64, gate_up_bytes: u64 },
+    Bf16Separate { slot_bytes: u64, matrix_bytes: u64 },
     Fp8W8a16(Fp8Slot),
 }
 
@@ -82,6 +89,23 @@ impl ExpertLayout {
                 Ok(Self::Bf16Fused {
                     slot_bytes,
                     gate_up_bytes: gate_up,
+                })
+            }
+            ExpertFormat::Bf16Separate => {
+                let matrix = intermediate
+                    .checked_mul(hidden)
+                    .and_then(|n| n.checked_mul(2))
+                    .context("separate BF16 expert matrix overflow")?;
+                let slot_bytes = matrix
+                    .checked_mul(3)
+                    .context("separate BF16 expert slot overflow")?;
+                ensure!(
+                    slot_bytes.is_multiple_of(16) && matrix.is_multiple_of(16),
+                    "separate BF16 slot alignment: slot_bytes={slot_bytes} matrix_bytes={matrix}"
+                );
+                Ok(Self::Bf16Separate {
+                    slot_bytes,
+                    matrix_bytes: matrix,
                 })
             }
             ExpertFormat::Fp8W8a16 => {
@@ -134,6 +158,7 @@ impl ExpertLayout {
     pub fn slot_bytes(&self) -> u64 {
         match self {
             Self::Bf16Fused { slot_bytes, .. } => *slot_bytes,
+            Self::Bf16Separate { slot_bytes, .. } => *slot_bytes,
             Self::Fp8W8a16(slot) => slot.down_scale.end,
         }
     }
@@ -141,6 +166,7 @@ impl ExpertLayout {
     pub fn down_offset(&self) -> u64 {
         match self {
             Self::Bf16Fused { gate_up_bytes, .. } => *gate_up_bytes,
+            Self::Bf16Separate { matrix_bytes, .. } => matrix_bytes * 2,
             Self::Fp8W8a16(_) => 0,
         }
     }
@@ -148,6 +174,7 @@ impl ExpertLayout {
     pub fn fp8_slot(&self) -> Option<&Fp8Slot> {
         match self {
             Self::Bf16Fused { .. } => None,
+            Self::Bf16Separate { .. } => None,
             Self::Fp8W8a16(slot) => Some(slot),
         }
     }
@@ -157,6 +184,7 @@ impl ExpertLayout {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExpertGeometry {
     pub layers: u32,
+    pub first_layer: u32,
     pub experts: u32,
     pub hidden: u32,
     pub intermediate: u32,
@@ -166,7 +194,12 @@ pub struct ExpertGeometry {
 impl ExpertGeometry {
     pub fn from_model(model: &ModelSpec) -> Result<Self> {
         let moe = model.moe.as_ref().context("model has no routed experts")?;
-        let layers = u32::try_from(model.layers.len()).context("layer count exceeds u32")?;
+        let moe_layers = model
+            .layers
+            .iter()
+            .filter(|layer| layer.ffn == crate::model_spec::FfnKind::Moe)
+            .count();
+        let layers = u32::try_from(moe_layers).context("MoE layer count exceeds u32")?;
         ensure!(
             layers > 0 && moe.experts > 0 && moe.experts_per_tok > 0,
             "expert geometry has a zero extent"
@@ -183,6 +216,12 @@ impl ExpertGeometry {
         );
         Ok(Self {
             layers,
+            first_layer: model
+                .layers
+                .iter()
+                .position(|layer| layer.ffn == crate::model_spec::FfnKind::Moe)
+                .and_then(|index| u32::try_from(index).ok())
+                .context("model has no routed experts")?,
             experts: moe.experts,
             hidden: model.hidden,
             intermediate: moe.expert_intermediate,
@@ -202,9 +241,10 @@ pub struct ExpertCatalogue {
 fn layer_entry<'a>(
     manifest: &'a TensorManifest,
     layer: u32,
+    prefix: &str,
     role: &str,
 ) -> Result<&'a crate::checkpoint::TensorEntry> {
-    let name = format!("model.language_model.layers.{layer}.mlp.experts.{role}");
+    let name = format!("{prefix}.layers.{layer}.mlp.experts.{role}");
     manifest
         .entries
         .get(&name)
@@ -214,10 +254,11 @@ fn layer_entry<'a>(
 fn expert_entry<'a>(
     manifest: &'a TensorManifest,
     layer: u32,
+    prefix: &str,
     expert: u32,
     role: &str,
 ) -> Result<&'a crate::checkpoint::TensorEntry> {
-    let name = format!("model.language_model.layers.{layer}.mlp.experts.{expert}.{role}");
+    let name = format!("{prefix}.layers.{layer}.mlp.experts.{expert}.{role}");
     manifest
         .entries
         .get(&name)
@@ -342,8 +383,16 @@ impl ExpertCatalogue {
         format: ExpertFormat,
     ) -> Result<Self> {
         let layout = ExpertLayout::new(format, &geometry)?;
+        let prefix = match format {
+            ExpertFormat::Bf16Separate => "model",
+            ExpertFormat::Bf16 | ExpertFormat::Fp8W8a16 => "model.language_model",
+        };
         let mut ranges = Vec::with_capacity(geometry.layers as usize);
         for layer in 0..geometry.layers {
+            let checkpoint_layer = geometry
+                .first_layer
+                .checked_add(layer)
+                .context("expert checkpoint layer overflow")?;
             match layout {
                 ExpertLayout::Bf16Fused { gate_up_bytes, .. } => {
                     let gate_shape = [
@@ -356,8 +405,8 @@ impl ExpertCatalogue {
                         geometry.hidden as usize,
                         geometry.intermediate as usize,
                     ];
-                    let gate = layer_entry(manifest, layer, "gate_up_proj")?;
-                    let down = layer_entry(manifest, layer, "down_proj")?;
+                    let gate = layer_entry(manifest, checkpoint_layer, prefix, "gate_up_proj")?;
+                    let down = layer_entry(manifest, checkpoint_layer, prefix, "down_proj")?;
                     let gate_ranges =
                         slice_ranges(gate, geometry.experts, &gate_shape, gate_up_bytes)?;
                     let down_ranges = slice_ranges(
@@ -374,6 +423,30 @@ impl ExpertCatalogue {
                             .collect(),
                     );
                 }
+                ExpertLayout::Bf16Separate { .. } => {
+                    let hidden = geometry.hidden as usize;
+                    let intermediate = geometry.intermediate as usize;
+                    let mut layer_ranges = Vec::with_capacity(geometry.experts as usize);
+                    for expert in 0..geometry.experts {
+                        let weight = |role: &str, shape: &[usize]| {
+                            let name = format!(
+                                "{prefix}.layers.{checkpoint_layer}.mlp.experts.{expert}.{role}"
+                            );
+                            native_entry(
+                                expert_entry(manifest, checkpoint_layer, prefix, expert, role)?,
+                                safetensors::Dtype::BF16,
+                                shape,
+                            )
+                            .with_context(|| format!("separate BF16 expert tensor {name}"))
+                        };
+                        layer_ranges.push(ExpertRange::Bf16Separate {
+                            gate: weight("gate_proj.weight", &[intermediate, hidden])?,
+                            up: weight("up_proj.weight", &[intermediate, hidden])?,
+                            down: weight("down_proj.weight", &[hidden, intermediate])?,
+                        });
+                    }
+                    ranges.push(layer_ranges);
+                }
                 ExpertLayout::Fp8W8a16(_) => {
                     let hidden = geometry.hidden as usize;
                     let intermediate = geometry.intermediate as usize;
@@ -382,14 +455,14 @@ impl ExpertCatalogue {
                     for expert in 0..geometry.experts {
                         let weight = |role: &str, shape: &[usize]| {
                             native_entry(
-                                expert_entry(manifest, layer, expert, role)?,
+                                expert_entry(manifest, checkpoint_layer, prefix, expert, role)?,
                                 safetensors::Dtype::F8_E4M3,
                                 shape,
                             )
                         };
                         let scale = |role: &str, rows: usize| {
                             native_entry(
-                                expert_entry(manifest, layer, expert, role)?,
+                                expert_entry(manifest, checkpoint_layer, prefix, expert, role)?,
                                 safetensors::Dtype::BF16,
                                 &[rows, 1],
                             )
@@ -480,6 +553,7 @@ mod tests {
 
     fn geometry() -> ExpertGeometry {
         ExpertGeometry {
+            first_layer: 0,
             layers: 2,
             experts: 4,
             hidden: 8,
@@ -597,6 +671,7 @@ mod tests {
     fn slice_offsets_cover_each_expert_exactly() -> Result<()> {
         for bad in [
             ExpertGeometry {
+                first_layer: 0,
                 layers: 0,
                 ..geometry()
             },

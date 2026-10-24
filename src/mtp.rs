@@ -292,13 +292,15 @@ pub(crate) fn checkpoint_bytes(spec: &ModelSpec, rows: usize) -> Result<usize> {
 }
 
 #[cfg(any(feature = "cuda", test))]
-pub(crate) fn component_spec(spec: &ModelSpec) -> ModelSpec {
+pub(crate) fn component_spec(spec: &ModelSpec) -> Result<ModelSpec> {
     let mut component = spec.clone();
-    component.layers = vec![crate::model_spec::LayerPlan {
-        mixer: crate::model_spec::Mixer::FullAttention,
-        state_index: 0,
-    }];
-    component
+    component.layers = vec![
+        spec.layers
+            .first()
+            .cloned()
+            .context("model has no MTP component layer")?,
+    ];
+    Ok(component)
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -355,7 +357,7 @@ pub(crate) fn attachment_bytes(
         memory.total - memory.weights - memory.blas,
         WEIGHT_BYTES,
         checkpoint_bytes(spec, 5)?,
-        checkpoint_bytes(&component_spec(spec), 5)?,
+        checkpoint_bytes(&component_spec(spec)?, 5)?,
         bootstrap,
         (4 * HIDDEN + VOCAB) * 2 + 8,
         if batched { batch_bytes(spec)? } else { 0 },

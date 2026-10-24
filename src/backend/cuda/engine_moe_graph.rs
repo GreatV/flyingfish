@@ -91,9 +91,12 @@ impl Engine {
         self.run_operator(O::Norm, layer, step, &mut None)?;
         self.run_mixer(self.model_spec.layers[layer].mixer, layer, step, &mut None)?;
         self.run_operator(O::PostNorm, layer, step, &mut None)?;
+        if self.model_spec.layers[layer].ffn == crate::model_spec::FfnKind::Dense {
+            return Ok(());
+        }
         decode.route_device(
             &self.device,
-            self.moe_ffn_binding(layer)?,
+            &self.moe_ffn_binding(layer)?,
             qwen::matrix(
                 &self.work.n,
                 &self.device.stream,
@@ -102,6 +105,28 @@ impl Engine {
                 self.model_spec.hidden as usize,
             )?,
         )
+    }
+
+    fn dense_ffn_segment(&mut self, layer: usize, step: crate::backend::Step<'_>) -> Result<()> {
+        use crate::backend::Operator as O;
+        for op in [O::GateUp, O::Activate, O::Down] {
+            self.run_operator(op, layer, step, &mut None)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn moe_slot_layer(&self, layer: usize) -> Result<usize> {
+        let first = self
+            .model_spec
+            .layers
+            .iter()
+            .position(|plan| plan.ffn == crate::model_spec::FfnKind::Moe)
+            .context("model has no MoE layer")?;
+        ensure!(
+            layer >= first,
+            "dense model layer={layer} has no expert slot"
+        );
+        Ok(layer - first)
     }
 
     fn moe_join_segment(
@@ -113,6 +138,18 @@ impl Engine {
         use crate::backend::Operator as O;
         let stream = &self.device.stream;
         let hidden = self.model_spec.hidden as usize;
+        if self.model_spec.layers[layer].ffn == crate::model_spec::FfnKind::Dense {
+            self.run_operator(O::NextNorm, layer, step, &mut None)?;
+            if layer + 1 == self.model_spec.layers.len() {
+                self.run_operator(O::Head, 0, step, &mut None)?;
+                if step.head == Head::Last {
+                    self.qwen_advance()?;
+                }
+            }
+            #[cfg(test)]
+            self.check_capture_layer(layer)?;
+            return Ok(());
+        }
         decode.combine_device(
             &self.device,
             self.moe_ffn_binding(layer)?,
@@ -145,7 +182,13 @@ impl Engine {
         }
         for layer in 0..self.model_spec.layers.len() {
             self.moe_route_segment(layer, decode, step)?;
-            let bindings = slots.bindings(layer, &stream)?;
+            if self.model_spec.layers[layer].ffn == crate::model_spec::FfnKind::Dense {
+                self.dense_ffn_segment(layer, step)?;
+                self.moe_join_segment(layer, decode, step)?;
+                continue;
+            }
+            let slot_layer = self.moe_slot_layer(layer)?;
+            let bindings = slots.bindings(slot_layer, &stream)?;
             if resident {
                 decode.resident_mask(&self.device, bindings, step.rows)?;
             }
@@ -273,21 +316,27 @@ impl Engine {
                         let route = record(self, |engine| {
                             engine.moe_route_segment(layer, &decode, step)
                         })?;
-                        let contribute = record(self, |engine| {
-                            decode.contribute_device(
-                                &engine.device,
-                                engine.moe_ffn_binding(layer)?,
-                                slots.bindings(layer, &stream)?,
-                                qwen::matrix(
-                                    &engine.work.n,
-                                    &stream,
-                                    0,
-                                    rows,
-                                    engine.model_spec.hidden as usize,
-                                )?,
-                            )?;
-                            Ok(())
-                        })?;
+                        let contribute = if self.model_spec.layers[layer].ffn
+                            == crate::model_spec::FfnKind::Dense
+                        {
+                            record(self, |engine| engine.dense_ffn_segment(layer, step))?
+                        } else {
+                            record(self, |engine| {
+                                decode.contribute_device(
+                                    &engine.device,
+                                    engine.moe_ffn_binding(layer)?,
+                                    slots.bindings(engine.moe_slot_layer(layer)?, &stream)?,
+                                    qwen::matrix(
+                                        &engine.work.n,
+                                        &stream,
+                                        0,
+                                        rows,
+                                        engine.model_spec.hidden as usize,
+                                    )?,
+                                )?;
+                                Ok(())
+                            })?
+                        };
                         let join =
                             record(self, |engine| engine.moe_join_segment(layer, &decode, step))?;
                         segments.push(Segments {
@@ -310,13 +359,30 @@ impl Engine {
                     }
                 }
                 let logits = if let Some(spec) = &self.spec {
-                    stream.clone_dtoh(&spec.logits.slice(..rows * self.config.vocab_size))?
+                    stream
+                        .clone_dtoh(&spec.logits.slice(..rows * self.config.vocab_size))?
+                        .into_iter()
+                        .map(bf16::to_f32)
+                        .collect::<Vec<_>>()
+                } else if let Some(logits) = &self.flint_logits {
+                    stream.clone_dtoh(logits)?
                 } else {
-                    stream.clone_dtoh(&self.work.logits.slice(..self.config.vocab_size))?
+                    stream
+                        .clone_dtoh(&self.work.logits.slice(..self.config.vocab_size))?
+                        .into_iter()
+                        .map(bf16::to_f32)
+                        .collect::<Vec<_>>()
                 };
+                let nonfinite = logits.iter().filter(|value| !value.is_finite()).count();
+                let mut finite_min = f32::INFINITY;
+                let mut finite_max = f32::NEG_INFINITY;
+                for value in logits.iter().filter(|value| value.is_finite()).copied() {
+                    finite_min = finite_min.min(value);
+                    finite_max = finite_max.max(value);
+                }
                 ensure!(
-                    logits.iter().all(|value| value.to_f32().is_finite()),
-                    "nonfinite MoE capture logits"
+                    nonfinite == 0,
+                    "nonfinite MoE capture logits count={nonfinite} finite_min={finite_min} finite_max={finite_max}"
                 );
                 checkpoint.restore(&mut self.state, &mut self.work.token, &stream)?;
                 stream.memcpy_htod(&saved_position, &mut self.work.position)?;
@@ -441,19 +507,32 @@ impl Engine {
                 slots.begin_token()?;
                 token_open = true;
                 for layer in 0..self.model_spec.layers.len() {
-                    decode.segment(rows, layer)?.route.launch()?;
-                    let stream = &self.device.stream;
-                    let hidden = self.model_spec.hidden as usize;
-                    slots.run_graph(
-                        &self.device,
-                        &mut decode,
-                        layer as u32,
-                        self.moe_ffn_binding(layer)?,
-                        (
-                            qwen::matrix(&self.work.n, stream, 0, rows, hidden)?,
-                            &mut TensorMut(qwen::matrix(&self.work.out, stream, 0, rows, hidden)?),
-                        ),
-                    )?;
+                    let segment = decode.segment(rows, layer)?;
+                    segment.route.launch()?;
+                    if self.model_spec.layers[layer].ffn == crate::model_spec::FfnKind::Dense {
+                        segment.contribute.launch()?;
+                        segment.join.launch()?;
+                    } else {
+                        let stream = &self.device.stream;
+                        let hidden = self.model_spec.hidden as usize;
+                        slots.run_graph(
+                            &self.device,
+                            &mut decode,
+                            u32::try_from(self.moe_slot_layer(layer)?)?,
+                            layer,
+                            self.moe_ffn_binding(layer)?,
+                            (
+                                qwen::matrix(&self.work.n, stream, 0, rows, hidden)?,
+                                &mut TensorMut(qwen::matrix(
+                                    &self.work.out,
+                                    stream,
+                                    0,
+                                    rows,
+                                    hidden,
+                                )?),
+                            ),
+                        )?;
+                    }
                 }
             }
             if self.spec.is_none() {

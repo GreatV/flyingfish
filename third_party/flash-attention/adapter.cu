@@ -53,9 +53,10 @@ bool hdim256_big_tile() {
 template <int D, typename Traits>
 int run_impl(void* q, void* k, void* v, void* out, void* lse, int rows, int start, int q_heads,
              int kv_heads, int capacity, int64_t q_row_stride, int causal,
-             cudaStream_t stream, int* seqused_k = nullptr) {
+             int window_left, cudaStream_t stream, int* seqused_k = nullptr) {
     if (rows <= 0 || start < 0 || start + rows > capacity || kv_heads <= 0 || q_heads <= 0 ||
-        q_heads % kv_heads != 0 || q_row_stride < int64_t(q_heads) * D) {
+        q_heads % kv_heads != 0 || q_row_stride < int64_t(q_heads) * D ||
+        window_left < -1) {
         error = "invalid FA2 shape or cache range";
         return -1;
     }
@@ -89,35 +90,39 @@ int run_impl(void* q, void* k, void* v, void* out, void* lse, int rows, int star
     p.p_dropout = p.rp_dropout = 1.0f;
     p.p_dropout_in_uint8_t = 255;
     p.scale_softmax_rp_dropout = p.scale_softmax;
-    p.window_size_left = -1;
+    p.window_size_left = window_left;
     p.window_size_right = 0;
     p.is_bf16 = p.is_seqlens_k_cumulative = true;
-    p.is_causal = causal != 0;
+    p.is_causal = causal != 0 && window_left < 0;
     p.num_splits = 1;
-    if (causal) flash::run_flash_fwd<Traits, false, true>(p, stream);
+    if (p.is_causal) flash::run_flash_fwd<Traits, false, true>(p, stream);
     else flash::run_flash_fwd<Traits, false, false>(p, stream);
     return 0;
 }
 
 int dispatch(void* q, void* k, void* v, void* out, void* lse, int rows, int start,
                           int q_heads, int kv_heads, int capacity, int head_dim,
-                          int64_t q_row_stride, int causal, cudaStream_t stream, int* seqused_k) {
+                          int64_t q_row_stride, int causal, int window_left, cudaStream_t stream,
+                          int* seqused_k) {
     try {
         if (head_dim == 128) {
             return run_impl<128, Traits128>(q, k, v, out, lse, rows, start, q_heads, kv_heads,
-                                            capacity, q_row_stride, causal, stream, seqused_k);
+                                                capacity, q_row_stride, causal, window_left,
+                                                stream, seqused_k);
         }
         if (head_dim == 256) {
             if (hdim256_big_tile()) {
                 using Traits =
                     Flash_fwd_kernel_traits<256, 128, 64, 8, false, false, cutlass::bfloat16_t>;
                 return run_impl<256, Traits>(q, k, v, out, lse, rows, start, q_heads, kv_heads,
-                                             capacity, q_row_stride, causal, stream, seqused_k);
+                                             capacity, q_row_stride, causal, window_left, stream,
+                                             seqused_k);
             }
             using Traits =
                 Flash_fwd_kernel_traits<256, 64, 64, 4, false, false, cutlass::bfloat16_t>;
             return run_impl<256, Traits>(q, k, v, out, lse, rows, start, q_heads, kv_heads,
-                                         capacity, q_row_stride, causal, stream, seqused_k);
+                                         capacity, q_row_stride, causal, window_left, stream,
+                                         seqused_k);
         }
         error = "unsupported FA2 head dim";
         return -1;
@@ -145,5 +150,13 @@ extern "C" int ff_fa2_run(void* q, void* k, void* v, void* out, void* lse, int r
                           int q_heads, int kv_heads, int capacity, int head_dim,
                           int64_t q_row_stride, int causal, cudaStream_t stream) {
     return dispatch(q, k, v, out, lse, rows, start, q_heads, kv_heads, capacity,
-                    head_dim, q_row_stride, causal, stream, nullptr);
+                    head_dim, q_row_stride, causal, -1, stream, nullptr);
+}
+
+extern "C" int ff_fa2_run_window(void* q, void* k, void* v, void* out, void* lse, int rows,
+                                 int start, int q_heads, int kv_heads, int capacity, int head_dim,
+                                 int64_t q_row_stride, int causal, int window_left,
+                                 cudaStream_t stream) {
+    return dispatch(q, k, v, out, lse, rows, start, q_heads, kv_heads, capacity,
+                    head_dim, q_row_stride, causal, window_left, stream, nullptr);
 }

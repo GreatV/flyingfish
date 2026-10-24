@@ -191,6 +191,20 @@ impl SpanPlan {
             ids.len()
         );
         let num_cohorts = 1 + self.cohort_count() as usize;
+        let weight_row_bytes = top_k * 2;
+        let row_alignment = match weight_row_bytes % 16 {
+            0 => 1,
+            8 => 2,
+            4 | 12 => 4,
+            2 | 6 | 10 | 14 => 8,
+            _ => 16,
+        };
+        ensure!(
+            self.wave_rows.is_multiple_of(row_alignment) || self.span_rows == 1,
+            "wave rows {} cannot align {}-byte choice rows",
+            self.wave_rows,
+            weight_row_bytes
+        );
         self.expert_cohort.fill(u16::MAX);
         for &expert in &self.resident {
             self.expert_cohort[expert as usize] = 0;
@@ -251,7 +265,12 @@ impl SpanPlan {
                 self.cohort_offsets[c + 1] - self.cohort_offsets[c]
             );
         }
-        let active_limit = (self.wave_rows as usize)
+        let active_rows = if self.wave_rows < row_alignment {
+            self.wave_rows as usize
+        } else {
+            self.wave_rows as usize - row_alignment as usize + 1
+        };
+        let active_limit = active_rows
             .checked_mul(top_k)
             .context("wave active capacity overflow")?;
         self.packed_waves.clear();
@@ -261,7 +280,8 @@ impl SpanPlan {
             let rows = &self.assignment_rows[self.cohort_offsets[c]..self.cohort_offsets[c + 1]];
             let mut idx = 0usize;
             while idx < rows.len() {
-                let base = rows[idx];
+                let raw_base = rows[idx];
+                let base = raw_base - raw_base % row_alignment;
                 let mut end = (idx + active_limit).min(rows.len());
                 if end < rows.len() {
                     let split_row = rows[end];
@@ -273,7 +293,14 @@ impl SpanPlan {
                     end > idx,
                     "wave packing made no progress at cohort {c} row {base}"
                 );
-                let wave_rows = rows[end - 1] - base + 1;
+                let aligned_end = (rows[end - 1] + 1).div_ceil(row_alignment) * row_alignment;
+                let wave_end = aligned_end.min(self.span_rows);
+                end = rows.partition_point(|&row| row < wave_end);
+                ensure!(
+                    end > idx,
+                    "aligned wave packing made no progress at cohort {c} row {base}"
+                );
+                let wave_rows = wave_end - base;
                 let active = u32::try_from(end - idx)?;
                 self.packed_waves.push((base, wave_rows, active));
                 idx = end;
@@ -654,6 +681,7 @@ mod tests {
 
     fn geometry() -> ExpertGeometry {
         ExpertGeometry {
+            first_layer: 0,
             layers: 1,
             experts: 8,
             hidden: 8,
@@ -1010,6 +1038,7 @@ mod tests {
     #[test]
     fn packed_waves_cover_cohort_assignments_within_active_capacity() -> Result<()> {
         let geometry = ExpertGeometry {
+            first_layer: 0,
             layers: 1,
             experts: 256,
             hidden: 2048,
@@ -1127,6 +1156,46 @@ mod tests {
                 assert_eq!(actual, active, "cohort {cohort} wave ({base}, {rows})");
             }
         }
+
+        let flint_geometry = ExpertGeometry {
+            first_layer: 2,
+            layers: 47,
+            experts: 7,
+            hidden: 2048,
+            intermediate: 512,
+            top_k: 6,
+        };
+        let mut flint_ids = Vec::with_capacity(8 * 6);
+        let mut flint_counts = vec![0u32; flint_geometry.experts as usize];
+        for row in 0..8u32 {
+            for _ in 0..flint_geometry.top_k {
+                let expert = u32::from(row > 0);
+                flint_ids.push(expert as i32);
+                flint_counts[expert as usize] += 1;
+            }
+        }
+        let mut flint_resident = vec![false; flint_geometry.experts as usize];
+        flint_resident[1] = true;
+        let mut flint_plan = planner(&flint_geometry, 2, &rates)?;
+        flint_plan.update(&flint_counts, &flint_resident, 8, 4, &rates)?;
+        flint_plan.pack_waves(&flint_counts, &flint_ids)?;
+        let flint_waves = flint_plan.cohort_waves(0)?;
+        assert_eq!(flint_waves, &[(0, 4, 18), (4, 4, 24)]);
+        assert!(
+            flint_waves
+                .iter()
+                .all(|&(base, _, _)| (base * flint_geometry.top_k * 2).is_multiple_of(16)),
+            "top-k-6 wave bases must keep BF16 choice rows 16-byte aligned"
+        );
+
+        let flint_decode_ids = vec![0i32; flint_geometry.top_k as usize];
+        flint_counts[0] = flint_geometry.top_k;
+        flint_counts[1] = 0;
+        flint_resident[0] = true;
+        flint_resident[1] = false;
+        flint_plan.update(&flint_counts, &flint_resident, 1, 1, &rates)?;
+        flint_plan.pack_waves(&flint_counts, &flint_decode_ids)?;
+        assert_eq!(flint_plan.cohort_waves(0)?, &[(0, 1, 6)]);
 
         let span_16k = 16_320u32;
         let mut ids_16k = Vec::with_capacity(span_16k as usize * top_k);
