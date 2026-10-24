@@ -91,13 +91,13 @@ fn placement_components(engine: &Engine, model: &Path) -> Result<usize> {
             && geometry.experts == 256,
         "Runner FAIL placement geometry {geometry:?}"
     );
+    let format = engine
+        .model_spec
+        .expert_format
+        .context("Runner FAIL placement expert format missing")?;
     let manifest = crate::checkpoint::MappedCheckpoint::open(model)?
         .manifest(&engine.model_spec, crate::checkpoint::LoadPolicy::TextOnly)?;
-    let catalogue = Arc::new(ExpertCatalogue::from_manifest(
-        &manifest,
-        geometry,
-        crate::model_spec::ExpertFormat::Bf16,
-    )?);
+    let catalogue = Arc::new(ExpertCatalogue::from_manifest(&manifest, geometry, format)?);
     let reader = DiskReader::open(&catalogue, model, 1)?;
     let elements = usize::try_from(catalogue.slot_bytes() / 2)?;
     let host = HostBlocks::new(1, elements)?;
@@ -138,14 +138,7 @@ fn placement_components(engine: &Engine, model: &Path) -> Result<usize> {
     let x = qwen::matrix(&x_buffer, stream, 0, 1, 2048)?;
     let mut y_view = TensorMut(qwen::matrix(&y, stream, 0, 1, 2048)?);
     let ffn = engine.moe_ffn_binding(0)?;
-    let mut decode = Decode::new(
-        device,
-        geometry,
-        1,
-        1,
-        (1, 8),
-        crate::model_spec::ExpertFormat::Bf16,
-    )?;
+    let mut decode = Decode::new(device, geometry, 1, 1, (1, 8), format)?;
     let ids = (0..8).collect::<Vec<i32>>();
     let weights = [bf16::from_f32(0.125); 8];
     stream.memcpy_htod(&ids, &mut decode.ids)?;
@@ -299,9 +292,14 @@ fn minicpm_placement_invariance_gpu() -> Result<()> {
     let forced: Vec<u32> =
         serde_json::from_slice(&std::fs::read(runtime.join("placement-prefix.json"))?)?;
     let spec = crate::model_spec::ModelSpec::read(&model)?;
+    let format = spec
+        .expert_format
+        .context("Runner FAIL placement expert format missing")?;
     ensure!(
-        spec.expert_format == Some(crate::model_spec::ExpertFormat::Bf16)
-            && forced.len() == 201
+        matches!(
+            format,
+            crate::model_spec::ExpertFormat::Bf16 | crate::model_spec::ExpertFormat::Fp8W8a16
+        ) && forced.len() == 201
             && forced.iter().all(|&id| id < spec.vocab),
         "Runner FAIL placement prefix/format"
     );
@@ -322,8 +320,14 @@ fn minicpm_placement_invariance_gpu() -> Result<()> {
         kv_format: crate::kv::KvFormat::Bf16,
     };
     let mut engine = Engine::load(&model, 0, 4352, None, settings)?;
+    engine.check_ready()?;
     ensure!(
-        engine.has_moe_segments(),
+        engine.has_moe_segments()
+            || (engine
+                .moe_slots
+                .as_ref()
+                .is_some_and(super::residency::Slots::all_resident)
+                && engine.graph.is_some()),
         "Runner FAIL placement graph segments absent"
     );
     let component_range = super::super::super::profile::Range::new(true, c"placement_components");
@@ -458,8 +462,12 @@ fn minicpm_placement_invariance_gpu() -> Result<()> {
             expected = Some((logits, state));
         }
     }
+    let format_tag = match format {
+        crate::model_spec::ExpertFormat::Bf16 => "BF16",
+        crate::model_spec::ExpertFormat::Fp8W8a16 => "FP8",
+    };
     println!(
-        "{} placement_invariance comparisons_complete=true identity_defects={defects} format=BF16 rows=1 graph_eager=true tiers=GPU,Host,Disk strict_graph_eager_host_disk_repeat=true gpu_cpu_max_bf16_ulp=1",
+        "{} placement_invariance comparisons_complete=true identity_defects={defects} format={format_tag} rows=1 graph_eager=true tiers=GPU,Host,Disk strict_graph_eager_host_disk_repeat=true gpu_cpu_max_bf16_ulp=1",
         if defects == 0 { "PASS" } else { "DEFECT" }
     );
     ensure!(
