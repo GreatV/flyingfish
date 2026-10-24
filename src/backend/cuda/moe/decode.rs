@@ -17,6 +17,8 @@ pub(crate) struct DecodeOps {
     invariant: Option<(CudaFunction, CudaFunction)>,
     gate_up_w8a16: CudaFunction,
     down_w8a16: CudaFunction,
+    swiglu_rounding: crate::model_spec::SwigluRounding,
+    routed_weight: crate::model_spec::RoutedWeightBoundary,
     #[cfg(test)]
     combine: CombineOps,
 }
@@ -302,7 +304,20 @@ pub(super) fn validate_w8a16(
 }
 
 impl DecodeOps {
+    #[cfg(test)]
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
+        Self::new_with_boundaries(
+            ctx,
+            crate::model_spec::SwigluRounding::Twice,
+            crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+        )
+    }
+
+    pub fn new_with_boundaries(
+        ctx: &Arc<CudaContext>,
+        swiglu_rounding: crate::model_spec::SwigluRounding,
+        routed_weight: crate::model_spec::RoutedWeightBoundary,
+    ) -> Result<Self> {
         let module = cubin::module(ctx, "moe_ffn")?;
         Ok(Self {
             gate_up: module.load_function("moe_ffn_gate_up")?,
@@ -310,18 +325,35 @@ impl DecodeOps {
             invariant: None,
             gate_up_w8a16: module.load_function("moe_ffn_gate_up_w8a16")?,
             down_w8a16: module.load_function("moe_ffn_down_w8a16")?,
+            swiglu_rounding,
+            routed_weight,
             #[cfg(test)]
             combine: CombineOps::new(ctx)?,
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn new_invariant(ctx: &Arc<CudaContext>) -> Result<Self> {
+        Self::new_invariant_with_boundaries(
+            ctx,
+            crate::model_spec::SwigluRounding::Twice,
+            crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+        )
+    }
+
+    pub(crate) fn new_invariant_with_boundaries(
+        ctx: &Arc<CudaContext>,
+        swiglu_rounding: crate::model_spec::SwigluRounding,
+        routed_weight: crate::model_spec::RoutedWeightBoundary,
+    ) -> Result<Self> {
         let module = cubin::module(ctx, "moe_ffn")?;
         Ok(Self {
             gate_up: module.load_function("moe_ffn_gate_up_lane16")?,
             down: module.load_function("moe_ffn_down_lane16")?,
             gate_up_w8a16: module.load_function("moe_ffn_gate_up_w8a16_lane16")?,
             down_w8a16: module.load_function("moe_ffn_down_w8a16_lane16")?,
+            swiglu_rounding,
+            routed_weight,
             invariant: Some((
                 cubin::module(ctx, "gemm_skinny")?.load_function("gemm_skinny_bf16")?,
                 cubin::module(ctx, "act")?.load_function("silu_mul_split")?,
@@ -400,6 +432,7 @@ impl DecodeOps {
                 .arg(&(hidden as i32))
                 .arg(&(inter as i32))
                 .arg(&(shared_inter as i32))
+                .arg(&(self.swiglu_rounding as i32))
                 .launch(LaunchConfig {
                     grid_dim: (
                         gate_inter.div_ceil(32 >> invariant),
@@ -430,6 +463,7 @@ impl DecodeOps {
                 .arg(&(hidden as i32))
                 .arg(&(inter as i32))
                 .arg(&(shared_inter as i32))
+                .arg(&(self.routed_weight as i32))
                 .launch(LaunchConfig {
                     grid_dim: (
                         hidden.div_ceil(16 >> invariant),
@@ -483,6 +517,7 @@ impl DecodeOps {
                     .arg(&up)
                     .arg(&hs_ptr)
                     .arg(&((rows * shared_inter) as i32))
+                    .arg(&(self.swiglu_rounding as i32))
                     .launch(crate::backend::cuda::ops::flat(
                         (rows * shared_inter) as usize,
                     ))?;

@@ -265,6 +265,8 @@ pub struct Contribution<'a> {
     pub weights: &'a ExpertWeights,
     pub hidden: &'a [bf16],
     pub routing: bf16,
+    pub rounding: crate::model_spec::SwigluRounding,
+    pub routed_weight: crate::model_spec::RoutedWeightBoundary,
 }
 
 /// One `(row, choice)` contribution with the model-definition BF16 boundaries.
@@ -293,6 +295,8 @@ fn compute(arm: &Arm, input: Contribution<'_>, out: &mut [bf16], scratch: &mut S
         weights,
         hidden,
         routing,
+        rounding,
+        routed_weight,
     } = input;
     let (hidden_width, intermediate) = (shape.hidden, shape.intermediate);
     for (value, source) in scratch.hidden.iter_mut().zip(hidden) {
@@ -312,8 +316,12 @@ fn compute(arm: &Arm, input: Contribution<'_>, out: &mut [bf16], scratch: &mut S
     unsafe { (arm.round)(&scratch.up, &mut scratch.up_bf) };
     for j in 0..intermediate {
         let gate = f32::from(scratch.gate_bf[j]);
-        let silu = bf16::from_f32(gate * (1.0 / (1.0 + (-gate).exp())));
-        scratch.product[j] = f32::from(silu) * f32::from(scratch.up_bf[j]);
+        let up = f32::from(scratch.up_bf[j]);
+        let activation = gate * (1.0 / (1.0 + (-gate).exp()));
+        scratch.product[j] = match rounding {
+            crate::model_spec::SwigluRounding::Twice => f32::from(bf16::from_f32(activation)) * up,
+            crate::model_spec::SwigluRounding::Once => activation * up,
+        };
     }
     // SAFETY: as above.
     unsafe { (arm.round)(&scratch.product, &mut scratch.activated) };
@@ -326,11 +334,20 @@ fn compute(arm: &Arm, input: Contribution<'_>, out: &mut [bf16], scratch: &mut S
         // SAFETY: as above.
         scratch.down[k] = unsafe { (arm.dot)(&scratch.activated_f, row) };
     }
-    // SAFETY: as above.
-    unsafe { (arm.round)(&scratch.down, &mut scratch.down_bf) };
     let weight = f32::from(routing);
-    for (value, source) in scratch.weighted.iter_mut().zip(&scratch.down_bf) {
-        *value = f32::from(*source) * weight;
+    match routed_weight {
+        crate::model_spec::RoutedWeightBoundary::AfterDownBf16 => {
+            // SAFETY: as above.
+            unsafe { (arm.round)(&scratch.down, &mut scratch.down_bf) };
+            for (value, source) in scratch.weighted.iter_mut().zip(&scratch.down_bf) {
+                *value = f32::from(*source) * weight;
+            }
+        }
+        crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16 => {
+            for (value, source) in scratch.weighted.iter_mut().zip(&scratch.down) {
+                *value = *source * weight;
+            }
+        }
     }
     // SAFETY: as above.
     unsafe { (arm.round)(&scratch.weighted, out) };
@@ -344,6 +361,8 @@ pub struct Fp8Contribution<'a> {
     pub slot_layout: &'a crate::experts::catalogue::Fp8Slot,
     pub hidden: &'a [bf16],
     pub routing: bf16,
+    pub rounding: crate::model_spec::SwigluRounding,
+    pub routed_weight: crate::model_spec::RoutedWeightBoundary,
 }
 
 struct Fp8Rows<'a> {
@@ -353,6 +372,8 @@ struct Fp8Rows<'a> {
     gate_scale: &'a [u8],
     up_scale: &'a [u8],
     down_scale: &'a [u8],
+    rounding: crate::model_spec::SwigluRounding,
+    routed_weight: crate::model_spec::RoutedWeightBoundary,
 }
 
 fn fp8_slice<'a>(slot: &'a [u8], range: &Range<u64>, bytes: usize, role: &str) -> Result<&'a [u8]> {
@@ -400,6 +421,8 @@ pub fn fp8_contribution(
         )?,
         up_scale: fp8_slice(input.slot, &layout.up_scale, intermediate * 2, "up scale")?,
         down_scale: fp8_slice(input.slot, &layout.down_scale, hidden * 2, "down scale")?,
+        rounding: input.rounding,
+        routed_weight: input.routed_weight,
     };
     scratch.check(input.shape)?;
     compute_fp8(
@@ -441,8 +464,12 @@ fn compute_fp8(
     unsafe { (arm.round)(&scratch.up, &mut scratch.up_bf) };
     for j in 0..intermediate {
         let gate = f32::from(scratch.gate_bf[j]);
-        let silu = bf16::from_f32(gate * (1.0 / (1.0 + (-gate).exp())));
-        scratch.product[j] = f32::from(silu) * f32::from(scratch.up_bf[j]);
+        let up = f32::from(scratch.up_bf[j]);
+        let activation = gate * (1.0 / (1.0 + (-gate).exp()));
+        scratch.product[j] = match rows.rounding {
+            crate::model_spec::SwigluRounding::Twice => f32::from(bf16::from_f32(activation)) * up,
+            crate::model_spec::SwigluRounding::Once => activation * up,
+        };
     }
     // SAFETY: as above.
     unsafe { (arm.round)(&scratch.product, &mut scratch.activated) };
@@ -455,11 +482,20 @@ fn compute_fp8(
         scratch.down[k] =
             unsafe { (arm.dot_e4m3)(&scratch.activated_f, row, row_scale(rows.down_scale, k)) };
     }
-    // SAFETY: as above.
-    unsafe { (arm.round)(&scratch.down, &mut scratch.down_bf) };
     let weight = f32::from(routing);
-    for (value, source) in scratch.weighted.iter_mut().zip(&scratch.down_bf) {
-        *value = f32::from(*source) * weight;
+    match rows.routed_weight {
+        crate::model_spec::RoutedWeightBoundary::AfterDownBf16 => {
+            // SAFETY: as above.
+            unsafe { (arm.round)(&scratch.down, &mut scratch.down_bf) };
+            for (value, source) in scratch.weighted.iter_mut().zip(&scratch.down_bf) {
+                *value = f32::from(*source) * weight;
+            }
+        }
+        crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16 => {
+            for (value, source) in scratch.weighted.iter_mut().zip(&scratch.down) {
+                *value = *source * weight;
+            }
+        }
     }
     // SAFETY: as above.
     unsafe { (arm.round)(&scratch.weighted, out) };
@@ -811,6 +847,8 @@ struct PoolShared {
     wake: Condvar,
     error: Mutex<Option<String>>,
     workers: usize,
+    swiglu_rounding: crate::model_spec::SwigluRounding,
+    routed_weight: crate::model_spec::RoutedWeightBoundary,
     generation: AtomicU64,
     pending: AtomicBool,
     shutdown: AtomicBool,
@@ -909,6 +947,44 @@ impl ExpertPool {
         max_assignments: usize,
         fp8_slot: Option<Fp8Slot>,
     ) -> Result<Self> {
+        Self::new_with_swiglu_rounding(
+            workers,
+            shape,
+            max_rows,
+            max_assignments,
+            fp8_slot,
+            crate::model_spec::SwigluRounding::Twice,
+        )
+    }
+
+    pub fn new_with_swiglu_rounding(
+        workers: usize,
+        shape: Shape,
+        max_rows: usize,
+        max_assignments: usize,
+        fp8_slot: Option<Fp8Slot>,
+        swiglu_rounding: crate::model_spec::SwigluRounding,
+    ) -> Result<Self> {
+        Self::new_with_boundaries(
+            workers,
+            shape,
+            max_rows,
+            max_assignments,
+            fp8_slot,
+            swiglu_rounding,
+            crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+        )
+    }
+
+    pub fn new_with_boundaries(
+        workers: usize,
+        shape: Shape,
+        max_rows: usize,
+        max_assignments: usize,
+        fp8_slot: Option<Fp8Slot>,
+        swiglu_rounding: crate::model_spec::SwigluRounding,
+        routed_weight: crate::model_spec::RoutedWeightBoundary,
+    ) -> Result<Self> {
         ensure!(
             workers > 0 && workers <= 256,
             "invalid expert worker count {workers}"
@@ -940,6 +1016,8 @@ impl ExpertPool {
             wake: Condvar::new(),
             error: Mutex::new(None),
             workers,
+            swiglu_rounding,
+            routed_weight,
             generation: AtomicU64::new(0),
             pending: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
@@ -1306,7 +1384,15 @@ fn worker(
                 drop(guard);
             }
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                phases(index, &shared, &shape, isa, &mut local, fp8_slot.as_ref())
+                phases(
+                    index,
+                    &shared,
+                    &shape,
+                    isa,
+                    &mut local,
+                    fp8_slot.as_ref(),
+                    shared.swiglu_rounding,
+                )
             }));
             let message = match outcome {
                 Ok(Ok(())) => None,
@@ -1361,6 +1447,7 @@ fn phases<const FP8: bool>(
     isa: Isa,
     local: &mut Local,
     fp8_slot: Option<&Fp8Slot>,
+    swiglu_rounding: crate::model_spec::SwigluRounding,
 ) -> Result<()> {
     let arm = arm_for(isa)?;
     let (hidden, intermediate) = (shape.hidden, shape.intermediate);
@@ -1439,8 +1526,12 @@ fn phases<const FP8: bool>(
         let gate = bf16::from_f32(gate);
         let up = bf16::from_f32(up);
         let gate = f32::from(gate);
-        let silu = bf16::from_f32(gate * (1.0 / (1.0 + (-gate).exp())));
-        local.block[unit - range1.start] = bf16::from_f32(f32::from(silu) * f32::from(up));
+        let up = f32::from(up);
+        let activation = gate * (1.0 / (1.0 + (-gate).exp()));
+        local.block[unit - range1.start] = bf16::from_f32(match swiglu_rounding {
+            crate::model_spec::SwigluRounding::Twice => f32::from(bf16::from_f32(activation)) * up,
+            crate::model_spec::SwigluRounding::Once => activation * up,
+        });
     }
     if shared.failed.load(Ordering::Acquire) {
         return Ok(());
@@ -1510,9 +1601,14 @@ fn phases<const FP8: bool>(
                     )
                 }
             };
-            let linear = bf16::from_f32(value);
-            local.block[unit - range2.start] =
-                bf16::from_f32(f32::from(linear) * f32::from(item.weight));
+            let weight = f32::from(item.weight);
+            let weighted = match shared.routed_weight {
+                crate::model_spec::RoutedWeightBoundary::AfterDownBf16 => {
+                    f32::from(bf16::from_f32(value)) * weight
+                }
+                crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16 => value * weight,
+            };
+            local.block[unit - range2.start] = bf16::from_f32(weighted);
         }
     }
     if shared.failed.load(Ordering::Acquire) {
@@ -1812,7 +1908,7 @@ mod tests {
     }
 
     #[test]
-    fn native_expert_silu_rounds_before_up_multiply() -> Result<()> {
+    fn native_expert_silu_boundary_is_per_model() -> Result<()> {
         let shape = production_shape();
         let (h, i) = (shape.hidden, shape.intermediate);
         let mut flat = vec![bf16::ZERO; per_expert(&shape)];
@@ -1826,8 +1922,10 @@ mod tests {
         let mut hidden = vec![bf16::ZERO; h];
         hidden[0] = bf16::ONE;
         let silu = gate / (1.0 + (-gate).exp());
-        let expected = bf16::from_f32(f32::from(bf16::from_f32(silu)) * up);
-        assert_ne!(expected.to_bits(), bf16::from_f32(silu * up).to_bits());
+        let twice = bf16::from_f32(f32::from(bf16::from_f32(silu)) * up);
+        let once = bf16::from_f32(silu * up);
+        assert_ne!(twice.to_bits(), once.to_bits());
+        let expected = twice;
         let expert = weights(&shape, 0);
         let mut scratch = Scratch::new(&shape);
         let mut output = vec![bf16::ZERO; h];
@@ -1844,6 +1942,9 @@ mod tests {
                     weights: &expert,
                     hidden: &hidden,
                     routing: bf16::ONE,
+
+                    rounding: crate::model_spec::SwigluRounding::Twice,
+                    routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                 },
                 &mut output,
                 &mut scratch,
@@ -1867,7 +1968,7 @@ mod tests {
             expert: 0,
             weight: bf16::ONE,
         }];
-        let experts = [expert];
+        let experts = [expert.clone()];
         let pending = pool.submit(Job {
             arena,
             hidden: &hidden,
@@ -1908,6 +2009,9 @@ mod tests {
                     slot_layout: &slot,
                     hidden: &hidden,
                     routing: bf16::ONE,
+
+                    rounding: crate::model_spec::SwigluRounding::Twice,
+                    routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                 },
                 &mut output,
                 &mut scratch,
@@ -1931,7 +2035,7 @@ mod tests {
             arena.block_range(0)?,
             &layout,
         )?];
-        let pool = ExpertPool::new(2, shape, 1, 1, Some(slot))?;
+        let pool = ExpertPool::new(2, shape, 1, 1, Some(slot.clone()))?;
         pool.run(Job {
             arena,
             hidden: &hidden,
@@ -1942,6 +2046,114 @@ mod tests {
         })?;
         assert!(output.iter().all(|v| v.to_bits() == expected.to_bits()));
         println!("expert_silu_boundary arm=fp8_pool bit_mismatches=0");
+        let expected = once;
+        for isa in [Isa::Scalar, Isa::Avx2, Isa::Avx512Bf16] {
+            if !isa.available() {
+                continue;
+            }
+            contribution(
+                isa,
+                Contribution {
+                    shape: &shape,
+                    arena: &flat,
+                    weights: &expert,
+                    hidden: &hidden,
+                    routing: bf16::ONE,
+                    rounding: crate::model_spec::SwigluRounding::Once,
+                    routed_weight: crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16,
+                },
+                &mut output,
+                &mut scratch,
+            )?;
+            assert!(output.iter().all(|v| v.to_bits() == expected.to_bits()));
+            println!(
+                "expert_silu_boundary_once arm={} bit_mismatches=0",
+                isa.name()
+            );
+        }
+        let arena = HostBlocks::new(1, flat.len())?;
+        arena.claim(0)?.slice()?.copy_from_slice(&flat);
+        let once_experts = [expert.clone()];
+        let pool = ExpertPool::new_with_swiglu_rounding(
+            2,
+            shape,
+            1,
+            1,
+            None,
+            crate::model_spec::SwigluRounding::Once,
+        )?;
+        pool.run(Job {
+            arena,
+            hidden: &hidden,
+            rows: 1,
+            experts: &once_experts,
+            assignments: &assignments,
+            out: &mut output,
+        })?;
+        assert!(output.iter().all(|v| v.to_bits() == expected.to_bits()));
+        println!("expert_silu_boundary_once arm=pool bit_mismatches=0");
+        for isa in [Isa::Scalar, Isa::Avx2, Isa::Avx512Bf16] {
+            if !isa.available() {
+                continue;
+            }
+            fp8_contribution(
+                isa,
+                Fp8Contribution {
+                    shape: &shape,
+                    slot: &native,
+                    slot_layout: &slot,
+                    hidden: &hidden,
+                    routing: bf16::ONE,
+                    rounding: crate::model_spec::SwigluRounding::Once,
+                    routed_weight: crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16,
+                },
+                &mut output,
+                &mut scratch,
+            )?;
+            assert!(output.iter().all(|v| v.to_bits() == expected.to_bits()));
+            println!(
+                "expert_silu_boundary_once arm=fp8_{} bit_mismatches=0",
+                isa.name()
+            );
+        }
+        flat[h] = bf16::from_f32(-3.0);
+        flat[(i + 1) * h] = bf16::from_f32(0.7);
+        for row in 0..h {
+            flat[2 * i * h + row * i + 1] = bf16::ONE;
+        }
+        let routing = bf16::from_f32(0.1);
+        let mut after = vec![bf16::ZERO; h];
+        let mut before = vec![bf16::ZERO; h];
+        contribution(
+            Isa::Scalar,
+            Contribution {
+                shape: &shape,
+                arena: &flat,
+                weights: &expert,
+                hidden: &hidden,
+                routing,
+                rounding: crate::model_spec::SwigluRounding::Twice,
+                routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+            },
+            &mut after,
+            &mut scratch,
+        )?;
+        contribution(
+            Isa::Scalar,
+            Contribution {
+                shape: &shape,
+                arena: &flat,
+                weights: &expert,
+                hidden: &hidden,
+                routing,
+                rounding: crate::model_spec::SwigluRounding::Twice,
+                routed_weight: crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16,
+            },
+            &mut before,
+            &mut scratch,
+        )?;
+        assert_ne!(after, before);
+        println!("expert_routed_weight_boundary bit_mismatches>0");
         Ok(())
     }
 
@@ -1965,6 +2177,8 @@ mod tests {
                     weights: &weights(&shape, expert),
                     hidden: &hidden,
                     routing,
+                    rounding: crate::model_spec::SwigluRounding::Twice,
+                    routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                 },
                 &mut out,
                 &mut scratch,
@@ -2143,6 +2357,8 @@ mod tests {
                     slot_layout: &layout,
                     hidden: &hidden,
                     routing,
+                    rounding: crate::model_spec::SwigluRounding::Twice,
+                    routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                 },
                 &mut out,
                 &mut scratch,
@@ -2206,6 +2422,9 @@ mod tests {
                     slot_layout: &slot,
                     hidden: &hidden[item.row as usize * shape.hidden..][..shape.hidden],
                     routing: item.weight,
+
+                    rounding: crate::model_spec::SwigluRounding::Twice,
+                    routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                 },
                 &mut expected[item.choice as usize * shape.hidden..][..shape.hidden],
                 &mut scratch,
@@ -2290,6 +2509,8 @@ mod tests {
                     slot_layout: &layout,
                     hidden: &hidden,
                     routing,
+                    rounding: crate::model_spec::SwigluRounding::Twice,
+                    routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                 },
                 &mut scalar,
                 &mut scratch,
@@ -2308,6 +2529,8 @@ mod tests {
                         slot_layout: &layout,
                         hidden: &hidden,
                         routing,
+                        rounding: crate::model_spec::SwigluRounding::Twice,
+                        routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                     },
                     &mut out,
                     &mut scratch,
@@ -2327,6 +2550,8 @@ mod tests {
                     slot_layout: &layout,
                     hidden: &hidden,
                     routing,
+                    rounding: crate::model_spec::SwigluRounding::Twice,
+                    routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                 },
                 &mut mutant,
                 &mut scratch,
@@ -2357,6 +2582,8 @@ mod tests {
                     weights: &weights0,
                     hidden: &hidden,
                     routing,
+                    rounding: crate::model_spec::SwigluRounding::Twice,
+                    routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                 },
                 &mut scalar,
                 &mut scratch,
@@ -2375,6 +2602,8 @@ mod tests {
                         weights: &weights0,
                         hidden: &hidden,
                         routing,
+                        rounding: crate::model_spec::SwigluRounding::Twice,
+                        routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                     },
                     &mut out,
                     &mut scratch,
@@ -2407,6 +2636,8 @@ mod tests {
                 weights: &weights(&shape, 0),
                 hidden: &hidden,
                 routing,
+                rounding: crate::model_spec::SwigluRounding::Twice,
+                routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
             },
             &mut correct,
             &mut scratch,
@@ -2420,6 +2651,8 @@ mod tests {
                 weights: &weights(&shape, 1),
                 hidden: &hidden,
                 routing,
+                rounding: crate::model_spec::SwigluRounding::Twice,
+                routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
             },
             &mut wrong_expert,
             &mut scratch,
@@ -2451,6 +2684,8 @@ mod tests {
                 weights: &shifted_weights,
                 hidden: &hidden,
                 routing,
+                rounding: crate::model_spec::SwigluRounding::Twice,
+                routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
             },
             &mut split,
             &mut scratch,
@@ -2495,6 +2730,9 @@ mod tests {
                             weights: &experts[assignment.expert as usize],
                             hidden: row,
                             routing: assignment.weight,
+
+                            rounding: crate::model_spec::SwigluRounding::Twice,
+                            routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                         },
                         out,
                         &mut scratch,
@@ -2583,6 +2821,9 @@ mod tests {
                     weights: &fixture.experts[assignment.expert as usize],
                     hidden: row,
                     routing: assignment.weight,
+
+                    rounding: crate::model_spec::SwigluRounding::Twice,
+                    routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                 },
                 out,
                 &mut scratch,
@@ -2730,6 +2971,9 @@ mod tests {
                     weights: &experts[assignment.expert as usize],
                     hidden: &hidden,
                     routing: assignment.weight,
+
+                    rounding: crate::model_spec::SwigluRounding::Twice,
+                    routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                 },
                 out,
                 &mut scratch,
@@ -2913,6 +3157,9 @@ mod tests {
                     weights: &weights,
                     hidden: &hidden,
                     routing: weight[0],
+
+                    rounding: crate::model_spec::SwigluRounding::Twice,
+                    routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                 },
                 &mut out,
                 &mut scratch,

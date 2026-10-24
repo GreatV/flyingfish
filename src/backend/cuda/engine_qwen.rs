@@ -47,6 +47,144 @@ fn norm_mode(spec: &crate::model_spec::ModelSpec) -> RmsMode {
     }
 }
 
+#[cfg(test)]
+struct FlintWindowInputs<'a> {
+    spec: &'a crate::model_spec::ModelSpec,
+    layer: usize,
+    sliding: bool,
+    ring: usize,
+    position: &'a CudaSlice<i32>,
+    length: &'a CudaSlice<i32>,
+    qkv: &'a CudaSlice<bf16>,
+    attention: &'a CudaSlice<bf16>,
+    kv: &'a Kv,
+    sinks: &'a CudaSlice<bf16>,
+}
+
+#[cfg(test)]
+fn capture_flint_window(
+    stream: &Arc<CudaStream>,
+    device_name: &str,
+    inputs: FlintWindowInputs<'_>,
+    capture: &Option<(Vec<usize>, Vec<usize>, PathBuf)>,
+) -> Result<()> {
+    let FlintWindowInputs {
+        spec,
+        layer,
+        sliding,
+        ring,
+        position,
+        length,
+        qkv,
+        attention,
+        kv,
+        sinks,
+    } = inputs;
+    let Some((layers, positions, directory)) = capture else {
+        return Ok(());
+    };
+    if !layers.contains(&layer) {
+        return Ok(());
+    }
+    let host_position = stream.clone_dtoh(position)?[0];
+    ensure!(host_position >= 0, "negative Flint window position");
+    let logical_position = host_position as usize;
+    if !positions.contains(&logical_position) {
+        return Ok(());
+    }
+    let logical_length = if sliding {
+        (logical_position + 1).min(ring)
+    } else {
+        logical_position + 1
+    };
+    let first = (logical_position + 1 - logical_length) % ring;
+    let ring_slots = (0..logical_length)
+        .map(|offset| (first + offset) % ring)
+        .collect::<Vec<_>>();
+    let logical_positions = (logical_position + 1 - logical_length..=logical_position)
+        .map(|position| position as f32)
+        .collect::<Vec<_>>();
+    let head_dim = spec.head_dim as usize;
+    let q_heads = spec.q_heads as usize;
+    let q_width = spec.q_width as usize;
+    let kv_heads = spec.kv_heads as usize;
+    let kv_values = ring * kv_heads * head_dim;
+    let mut trace = Trace::default();
+    trace.set_device(device_name)?;
+    trace.add(
+        "q".to_owned(),
+        vec![q_heads, head_dim],
+        stream
+            .clone_dtoh(&qkv.slice(..q_width))?
+            .into_iter()
+            .map(bf16::to_f32)
+            .collect(),
+    )?;
+    trace.add(
+        "k".to_owned(),
+        vec![kv_heads, ring, head_dim],
+        stream
+            .clone_dtoh(&kv.k.slice(..kv_values))?
+            .into_iter()
+            .map(bf16::to_f32)
+            .collect(),
+    )?;
+    trace.add(
+        "v".to_owned(),
+        vec![kv_heads, ring, head_dim],
+        stream
+            .clone_dtoh(&kv.v.slice(..kv_values))?
+            .into_iter()
+            .map(bf16::to_f32)
+            .collect(),
+    )?;
+    trace.add(
+        "attention".to_owned(),
+        vec![q_heads, head_dim],
+        stream
+            .clone_dtoh(&attention.slice(..q_width))?
+            .into_iter()
+            .map(bf16::to_f32)
+            .collect(),
+    )?;
+    trace.add(
+        "sinks".to_owned(),
+        vec![q_heads],
+        stream
+            .clone_dtoh(sinks)?
+            .into_iter()
+            .map(bf16::to_f32)
+            .collect(),
+    )?;
+    trace.add(
+        "ring_slots".to_owned(),
+        vec![logical_length],
+        ring_slots.iter().map(|slot| *slot as f32).collect(),
+    )?;
+    trace.add(
+        "logical_positions".to_owned(),
+        vec![logical_length],
+        logical_positions,
+    )?;
+    trace.add(
+        "metadata".to_owned(),
+        vec![5],
+        vec![
+            layer as f32,
+            logical_position as f32,
+            logical_length as f32,
+            first as f32,
+            u8::from(sliding) as f32,
+        ],
+    )?;
+    std::fs::create_dir_all(directory)?;
+    trace.save(&directory.join(format!(
+        "layer{layer}_position{logical_position}.safetensors"
+    )))?;
+    let _ = length;
+    Ok(())
+}
+
 fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
     use crate::model_spec::{Architecture, LinearFormat};
     let (hidden, intermediate, vocab, hq, hkv, layers, hv, format) = match spec.architecture {
@@ -508,7 +646,10 @@ impl Runtime {
         } else {
             GdnPolicy::for_device(&engine.device.info)
         };
-        let common = CommonOpsRef::new(&engine.device.ctx)?;
+        let common = CommonOpsRef::new_with_swiglu_rounding(
+            &engine.device.ctx,
+            engine.model_spec.swiglu_rounding(),
+        )?;
         let positions = s.clone_htod(
             &crate::vision_input::PositionPlan::text(1, engine.capacity)?.packed_axes()?,
         )?;
@@ -1009,7 +1150,7 @@ impl Engine {
         let q = self.qwen.as_mut().context("Q38 runtime missing")?;
         let inputs = &self.spec.as_ref().context("MoE chain missing")?.gdn_inputs;
         let stream = &self.device.stream;
-        let g = q.gdn;
+        let g = q.gdn.as_ref().context("GDN verify runtime missing")?;
         let cd = g.conv_dim()? as usize;
         let hv = g.hv as usize;
         ensure!(
@@ -1702,6 +1843,8 @@ impl Engine {
             capture_fail_after_layer: None,
             #[cfg(test)]
             capture_fail_stage: None,
+            #[cfg(test)]
+            flint_window_capture: None,
             qwen_device_prefix: false,
             forward_rows: (1..=rows.min(16)).collect(),
             graphs: if expert_setup.is_some() {
@@ -2439,6 +2582,24 @@ impl Engine {
                                 }),
                             },
                         )?;
+                        #[cfg(test)]
+                        capture_flint_window(
+                            s,
+                            &self.device.info.name,
+                            FlintWindowInputs {
+                                spec: &self.model_spec,
+                                layer: i,
+                                sliding,
+                                ring,
+                                position: &w.position,
+                                length: &w.length,
+                                qkv: &w.qkv,
+                                attention: &w.attn,
+                                kv,
+                                sinks,
+                            },
+                            &self.flint_window_capture,
+                        )?;
                     }
                 }
                 layer.linear.run(
@@ -3004,13 +3165,26 @@ impl Engine {
                 let mut activated = TensorMut(heads(&w.act, s, 0, rows, 1, f as u32)?);
                 q.common.gate.swiglu(s, domain, gate, up, &mut activated)?;
             }
-            O::Down => layer.linear.run(
-                &self.blas,
-                "mlp.down_proj.weight",
-                phase,
-                matrix(&w.act, s, 0, linear_rows, f)?,
-                &mut TensorMut(matrix(&w.out, s, 0, linear_rows, h)?),
-            )?,
+            O::Down => {
+                layer.linear.run(
+                    &self.blas,
+                    "mlp.down_proj.weight",
+                    phase,
+                    matrix(&w.act, s, 0, linear_rows, f)?,
+                    &mut TensorMut(matrix(&w.out, s, 0, linear_rows, h)?),
+                )?;
+                if let Some(target) = trace
+                    .as_mut()
+                    .filter(|target| target.trace.all_layers || i == self.trace_layer)
+                {
+                    let name = if target.trace.all_layers {
+                        format!("{i}.ffn")
+                    } else {
+                        "ffn".to_owned()
+                    };
+                    trace_value(trace, s, &name, &w.out, rows, h)?;
+                }
+            }
             O::Head => {
                 if step.head == Head::None {
                     return Ok(());
@@ -4135,6 +4309,115 @@ mod tests {
         );
         println!(
             "FLINT_ENGINE_CONTROLS graph_nll={graph_nll:.9} eager_nll={eager_nll:.9} graph_eager_bits=0 sinks_off_nll={sinks_off_nll:.9} window_off_nll={window_off_nll:.9} pre_boundary_bits=0 tail_on={window_on_tail:.9} tail_off={window_off_tail:.9} tail_ref={reference_tail:.9} PASS"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU window; FF_MODEL, FLYINGFISH_RUNTIME_DIR, FF_FLINT_PASSAGE and FF_FLINT_WINDOW_DUMP required"]
+    fn flint_window_boundary_dump_gpu() -> Result<()> {
+        use crate::backend::{Backend, Settings};
+        use std::{env, fs::File, path::PathBuf};
+
+        let dir = PathBuf::from(env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+        let runtime =
+            PathBuf::from(env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime missing")?);
+        let passage = PathBuf::from(env::var_os("FF_FLINT_PASSAGE").context("passage missing")?);
+        let output = PathBuf::from(
+            env::var_os("FF_FLINT_WINDOW_DUMP").context("FF_FLINT_WINDOW_DUMP missing")?,
+        );
+        let tail_trace = env::var_os("FF_FLINT_TAIL_TRACE_OUT").map(PathBuf::from);
+        ensure!(
+            env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let settings = Settings {
+            runtime_dir: Some(runtime),
+            prefix_cache: false,
+            draft_model: None,
+            tree_builder: crate::backend::TreeBuilder::Serial,
+            spec_budget: crate::backend::SpecBudget::Chain,
+            spec_graph: false,
+            kv_format: crate::kv::KvFormat::Bf16,
+        };
+        let passage: serde_json::Value =
+            serde_json::from_reader(File::open(passage).context("open passage")?)?;
+        let ids = passage["input_ids"]
+            .as_array()
+            .context("input_ids missing")?
+            .iter()
+            .map(|value| value.as_u64().and_then(|value| u32::try_from(value).ok()))
+            .collect::<Option<Vec<_>>>()
+            .context("invalid passage token id")?;
+        ensure!(ids.len() >= 600, "passage is shorter than the gate");
+        let mut engine = Backend::calibrate(&dir, 0, 600, None, settings)?
+            .context("Flint calibration missing")?;
+        let capture_layers = match env::var("FF_FLINT_WINDOW_LAYERS") {
+            Ok(value) => Some(
+                value
+                    .split(',')
+                    .map(|value| value.parse::<usize>())
+                    .collect::<Result<Vec<_>, _>>()
+                    .context("invalid FF_FLINT_WINDOW_LAYERS")?,
+            ),
+            Err(_) => None,
+        }
+        .unwrap_or_else(|| vec![3, 5]);
+        let capture_positions = match env::var("FF_FLINT_WINDOW_POSITIONS") {
+            Ok(value) => Some(
+                value
+                    .split(',')
+                    .map(|value| value.parse::<usize>())
+                    .collect::<Result<Vec<_>, _>>()
+                    .context("invalid FF_FLINT_WINDOW_POSITIONS")?,
+            ),
+            Err(_) => None,
+        }
+        .unwrap_or_else(|| vec![513, 560, 599]);
+        engine.flint_window_capture = Some((
+            capture_layers.clone(),
+            capture_positions.clone(),
+            output.clone(),
+        ));
+        engine.prefill(&ids[..1], None)?;
+        for (offset, token) in ids[1..600].iter().enumerate() {
+            let position = offset + 1;
+            engine.set_token(*token)?;
+            if position == 560
+                && let Some(path) = tail_trace.as_ref()
+            {
+                let mut trace = Trace::all_layers();
+                engine.decode(false, Some((&mut trace, "decode")))?;
+                trace.set_device(&engine.device.info.name)?;
+                trace.save(path)?;
+            } else {
+                engine.decode(false, None)?;
+            }
+            if capture_positions == [560] && position == 560 {
+                break;
+            }
+        }
+        let expected = capture_layers
+            .iter()
+            .flat_map(|layer| {
+                capture_positions
+                    .iter()
+                    .map(move |position| (layer, position))
+            })
+            .map(|(layer, position)| {
+                output.join(format!("layer{layer}_position{position}.safetensors"))
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            expected
+                .iter()
+                .all(|path| path.is_file() && path.metadata().is_ok_and(|meta| meta.len() > 0)),
+            "Flint window dump files are incomplete"
+        );
+        println!(
+            "FLINT_WINDOW_DUMP layers={capture_layers:?} positions={capture_positions:?} files={} PASS",
+            expected.len()
         );
         Ok(())
     }

@@ -549,6 +549,8 @@ pub struct Engine {
     capture_fail_after_layer: Option<(usize, usize)>,
     #[cfg(test)]
     capture_fail_stage: Option<CaptureFault>,
+    #[cfg(test)]
+    flint_window_capture: Option<(Vec<usize>, Vec<usize>, PathBuf)>,
     forward_rows: std::collections::BTreeSet<usize>,
     graphs: Vec<Graph>,
     closure: Rc<super::closure::Closure>,
@@ -960,7 +962,8 @@ impl Engine {
             1,
             s,
         )?);
-        let ops = Ops::new(&device.ctx).context("load CUDA operator modules")?;
+        let ops = Ops::new_with_swiglu_rounding(&device.ctx, model_spec.swiglu_rounding())
+            .context("load CUDA operator modules")?;
         eprintln!("{}", serde_json::json!({"backend_device":device.info}));
         let blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
         let workspace_rows = if let Some(draft) = &draft_config {
@@ -982,6 +985,8 @@ impl Engine {
             capture_fail_after_layer: None,
             #[cfg(test)]
             capture_fail_stage: None,
+            #[cfg(test)]
+            flint_window_capture: None,
             qwen: None,
             moe: None,
             moe_slots: None,
@@ -1984,6 +1989,7 @@ impl Engine {
                     .arg(&mut w.act)
                     .arg(&nr)
                     .arg(&fd)
+                    .arg(&(self.ops.swiglu_rounding() as i32))
                     .launch(flat(rows * f))?;
             },
             crate::backend::Operator::Down => {

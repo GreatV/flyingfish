@@ -722,6 +722,8 @@ impl Engine {
                 directory: runtime,
                 engines,
                 max_rows: cpu_bounds.0 as u32,
+                swiglu_rounding: crate::model_spec::SwigluRounding::Twice,
+                routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
             },
         )?;
         std::fs::remove_file(runtime.join("expert-fixture.bin"))?;
@@ -832,17 +834,21 @@ impl Engine {
         )?);
         let moe = Some(Decode::new(
             &device,
-            geometry,
-            decode_rows,
-            capacity.worker_count,
-            cpu_bounds,
-            model_spec
-                .expert_format
-                .context("MoE expert_format missing")?,
-            model_spec
-                .moe
-                .context("MoE shared geometry missing")?
-                .shared_intermediate,
+            DecodeOptions {
+                geometry,
+                max_rows: decode_rows,
+                workers: capacity.worker_count,
+                cpu_bounds,
+                format: model_spec
+                    .expert_format
+                    .context("MoE expert_format missing")?,
+                shared_intermediate: model_spec
+                    .moe
+                    .context("MoE shared geometry missing")?
+                    .shared_intermediate,
+                swiglu_rounding: model_spec.swiglu_rounding(),
+                routed_weight: model_spec.routed_weight_boundary(),
+            },
         )?);
         let moe_prefill = if capacity.prefill_staging_slots > 0 {
             let reserves = crate::experts::plan::Reserves {
@@ -879,6 +885,8 @@ impl Engine {
             hidden_capture: None,
             capture_fail_after_layer: None,
             capture_fail_stage: None,
+            #[cfg(test)]
+            flint_window_capture: None,
             qwen: None,
             moe,
             moe_slots: Some(slots),
@@ -1482,6 +1490,9 @@ impl TierOracle {
                         slot_layout,
                         hidden: &input[row * 128..(row + 1) * 128],
                         routing: bf16::from_f32(weights[choice]),
+
+                        rounding: crate::model_spec::SwigluRounding::Twice,
+                        routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                     },
                     &mut output[choice * 128..(choice + 1) * 128],
                     &mut scratch,
@@ -1495,6 +1506,9 @@ impl TierOracle {
                         weights: &native,
                         hidden: &input[row * 128..(row + 1) * 128],
                         routing: bf16::from_f32(weights[choice]),
+
+                        rounding: crate::model_spec::SwigluRounding::Twice,
+                        routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                     },
                     &mut output[choice * 128..(choice + 1) * 128],
                     &mut scratch,
@@ -2237,6 +2251,9 @@ fn cpu_control(
                 weights: &local,
                 hidden: &input[row * 128..(row + 1) * 128],
                 routing: bf16::from_f32(weights[choice]),
+
+                rounding: crate::model_spec::SwigluRounding::Twice,
+                routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
             },
             &mut contributions[choice * 128..(choice + 1) * 128],
             &mut scratch,

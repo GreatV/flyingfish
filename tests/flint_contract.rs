@@ -6,7 +6,9 @@ use flyingfish::{
         catalogue::{ExpertCatalogue, ExpertGeometry, ExpertRange},
         disk::DiskReader,
     },
-    model_spec::{Architecture, ExpertFormat, FfnKind, ModelSpec},
+    model_spec::{
+        Architecture, ExpertFormat, FfnKind, ModelSpec, RoutedWeightBoundary, SwigluRounding,
+    },
 };
 use std::{env, path::PathBuf};
 
@@ -32,6 +34,14 @@ fn flint_config_normalizes_the_published_layer_plan() -> Result<()> {
         "unsupported normalized Flint geometry: {spec:?}"
     );
     ensure!(spec.layers.len() == 49, "Flint layer count");
+    ensure!(
+        spec.swiglu_rounding() == SwigluRounding::Once,
+        "Flint SwiGLU rounding"
+    );
+    ensure!(
+        spec.routed_weight_boundary() == RoutedWeightBoundary::BeforeContributionBf16,
+        "Flint routed-weight boundary"
+    );
     ensure!(
         spec.layers
             .iter()

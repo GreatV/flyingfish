@@ -471,6 +471,8 @@ pub(super) struct Load<'a> {
     pub directory: &'a Path,
     pub engines: u32,
     pub max_rows: u32,
+    pub swiglu_rounding: crate::model_spec::SwigluRounding,
+    pub routed_weight: crate::model_spec::RoutedWeightBoundary,
 }
 
 pub(in crate::backend::cuda::engine) struct Slots {
@@ -673,11 +675,13 @@ impl Slots {
                 physical_count.max(input.max_rows as usize * geometry.top_k as usize),
             ),
             disk_cpu: if input.capacity.disk_workers > 0 {
-                Some(DiskExperts::new(
+                Some(DiskExperts::new_with_swiglu_rounding(
                     input.catalogue.clone(),
                     input.directory,
                     input.capacity.disk_workers,
                     input.max_rows,
+                    input.swiglu_rounding,
+                    input.routed_weight,
                 )?)
             } else {
                 None

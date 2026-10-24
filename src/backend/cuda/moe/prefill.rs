@@ -822,6 +822,7 @@ pub(crate) struct PrefillOps {
     scatter: CudaFunction,
     lane16: CudaFunction,
     silu: CudaFunction,
+    swiglu_rounding: crate::model_spec::SwigluRounding,
     combine: CombineOps,
     blas: CudaBlas,
     stream: Arc<CudaStream>,
@@ -842,10 +843,25 @@ pub(crate) fn arithmetic_mask(counts: &[u32], mask: &mut [bool]) -> Result<()> {
 }
 
 impl PrefillOps {
+    #[cfg(test)]
     pub fn new(
         ctx: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
         format: ExpertFormat,
+    ) -> Result<Self> {
+        Self::new_with_swiglu_rounding(
+            ctx,
+            stream,
+            format,
+            crate::model_spec::SwigluRounding::Twice,
+        )
+    }
+
+    pub fn new_with_swiglu_rounding(
+        ctx: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
+        format: ExpertFormat,
+        swiglu_rounding: crate::model_spec::SwigluRounding,
     ) -> Result<Self> {
         let module = cubin::module(ctx, "moe_prefill")?;
         let act = cubin::module(ctx, "act")?;
@@ -872,6 +888,7 @@ impl PrefillOps {
             scatter: module.load_function("moe_scatter")?,
             lane16: module.load_function("moe_gemm_lane16")?,
             silu: act.load_function("silu_mul")?,
+            swiglu_rounding,
             combine: CombineOps::new(ctx)?,
             blas,
             stream: stream.clone(),
@@ -1118,6 +1135,7 @@ impl PrefillOps {
                 .arg(&act_at)
                 .arg(&(active_total as i32))
                 .arg(&(inter as i32))
+                .arg(&(self.swiglu_rounding as i32))
                 .launch(silu_grid(active_total as usize * inter as usize))?;
         }
 
@@ -1350,6 +1368,7 @@ impl PrefillOps {
                     .arg(&act_s_at)
                     .arg(&(rows as i32))
                     .arg(&(inter as i32))
+                    .arg(&(self.swiglu_rounding as i32))
                     .launch(grid(
                         (rows as usize * inter as usize).div_ceil(BLOCK_THREADS as usize),
                         BLOCK_THREADS,

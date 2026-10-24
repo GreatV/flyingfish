@@ -1232,6 +1232,7 @@ impl Draft {
                     .arg(&mut self.act)
                     .arg(&(block_rows as i32))
                     .arg(&(f as i32))
+                    .arg(&(ops.swiglu_rounding() as i32))
                     .launch(flat(block_rows * f))?;
             }
             blas.linear(

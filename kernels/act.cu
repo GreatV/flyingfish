@@ -1,23 +1,36 @@
 #include <cuda_bf16.h>
 
 extern "C" __global__ void silu_mul(const __nv_bfloat16* gu, __nv_bfloat16* y,
-                                   int rows, int dim) {
+                                   int rows, int dim, int rounding_once) {
+    if ((unsigned)rounding_once > 1u) __trap();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows * dim) return;
     int row = i / dim;
     int d = i % dim;
     float g = __bfloat162float(gu[row * 2 * dim + d]);
-  float u = __bfloat162float(gu[row * 2 * dim + dim + d]);
-  y[i] = __float2bfloat16(g / (1.0f + expf(-g)) * u);
+    const float u = __bfloat162float(gu[row * 2 * dim + dim + d]);
+    if (rounding_once) {
+      y[i] = __float2bfloat16(g / (1.0f + expf(-g)) * u);
+    } else {
+      const __nv_bfloat16 s = __float2bfloat16(g / (1.0f + expf(-g)));
+      y[i] = __hmul(s, gu[row * 2 * dim + dim + d]);
+    }
 }
 
 // Gate and up are dense [rows,dim] regions; y is disjoint from both inputs.
 extern "C" __global__ void silu_mul_split(const __nv_bfloat16* gate,
                                          const __nv_bfloat16* up,
-                                         __nv_bfloat16* y, int count) {
+                                         __nv_bfloat16* y, int count,
+                                         int rounding_once) {
+    if ((unsigned)rounding_once > 1u) __trap();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     const float g = __bfloat162float(gate[i]);
     const float u = __bfloat162float(up[i]);
-    y[i] = __float2bfloat16_rn(g / (1.0f + expf(-g)) * u);
+    if (rounding_once) {
+      y[i] = __float2bfloat16_rn(g / (1.0f + expf(-g)) * u);
+    } else {
+      const __nv_bfloat16 s = __float2bfloat16_rn(g / (1.0f + expf(-g)));
+      y[i] = __hmul(s, up[i]);
+    }
 }
