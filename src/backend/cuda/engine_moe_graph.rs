@@ -316,26 +316,27 @@ impl Engine {
                         let route = record(self, |engine| {
                             engine.moe_route_segment(layer, &decode, step)
                         })?;
-                        let contribute =
-                            if self.model_spec.layers[layer].ffn == crate::model_spec::FfnKind::Dense {
-                                record(self, |engine| engine.dense_ffn_segment(layer, step))?
-                            } else {
-                                record(self, |engine| {
-                                    decode.contribute_device(
-                                        &engine.device,
-                                        engine.moe_ffn_binding(layer)?,
-                                        slots.bindings(engine.moe_slot_layer(layer)?, &stream)?,
-                                        qwen::matrix(
-                                            &engine.work.n,
-                                            &stream,
-                                            0,
-                                            rows,
-                                            engine.model_spec.hidden as usize,
-                                        )?,
-                                    )?;
-                                    Ok(())
-                                })?
-                            };
+                        let contribute = if self.model_spec.layers[layer].ffn
+                            == crate::model_spec::FfnKind::Dense
+                        {
+                            record(self, |engine| engine.dense_ffn_segment(layer, step))?
+                        } else {
+                            record(self, |engine| {
+                                decode.contribute_device(
+                                    &engine.device,
+                                    engine.moe_ffn_binding(layer)?,
+                                    slots.bindings(engine.moe_slot_layer(layer)?, &stream)?,
+                                    qwen::matrix(
+                                        &engine.work.n,
+                                        &stream,
+                                        0,
+                                        rows,
+                                        engine.model_spec.hidden as usize,
+                                    )?,
+                                )?;
+                                Ok(())
+                            })?
+                        };
                         let join =
                             record(self, |engine| engine.moe_join_segment(layer, &decode, step))?;
                         segments.push(Segments {

@@ -797,6 +797,9 @@ impl Engine {
             }
         }
         let mut engine = Self::load_kind(dir, ordinal, capacity, chunk, settings, true)?;
+        if spec.architecture != crate::model_spec::Architecture::Flint {
+            return Ok(None);
+        }
         engine.finish_flint_calibration(dir, started)?;
         Ok(Some(engine))
     }
