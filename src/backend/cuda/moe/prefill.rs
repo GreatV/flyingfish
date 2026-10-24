@@ -233,7 +233,7 @@ impl MoePrefillFinish {
             self.experts as usize,
             hidden as usize,
             (self.expert_inter as usize, shared_inter as usize),
-            None,
+            (None, crate::model_spec::RoutedWeightBoundary::AfterDownBf16),
         )?;
         Ok(PrefillPlan {
             rows,
@@ -249,7 +249,10 @@ impl MoePrefillFinish {
 }
 
 impl MoePrefillContribute<'_> {
-    pub(crate) fn validate(&self) -> Result<PrefillPlan> {
+    pub(crate) fn validate(
+        &self,
+        routed_weight: crate::model_spec::RoutedWeightBoundary,
+    ) -> Result<PrefillPlan> {
         self.x.validate()?;
         let (rows, hidden) = (self.x.shape[0], self.x.shape[1]);
         ensure!(
@@ -427,7 +430,7 @@ impl MoePrefillContribute<'_> {
             experts as usize,
             hidden as usize,
             (inter as usize, shared_inter as usize),
-            self.fp8_slot,
+            (self.fp8_slot, routed_weight),
         )?;
         Ok(PrefillPlan {
             rows,
@@ -522,6 +525,7 @@ pub(crate) fn prefill_scratch_bytes(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn prefill_scratch_bytes_mixed(
     rows: usize,
     contribute_rows: usize,
@@ -531,6 +535,29 @@ pub(crate) fn prefill_scratch_bytes_mixed(
     intermediates: (usize, usize),
     fp8_slot: Option<&Fp8Slot>,
 ) -> Result<u64> {
+    prefill_scratch_bytes_mixed_with_boundary(
+        rows,
+        contribute_rows,
+        top_k,
+        experts,
+        hidden,
+        intermediates,
+        (
+            fp8_slot,
+            crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+        ),
+    )
+}
+
+pub(crate) fn prefill_scratch_bytes_mixed_with_boundary(
+    rows: usize,
+    contribute_rows: usize,
+    top_k: usize,
+    experts: usize,
+    hidden: usize,
+    intermediates: (usize, usize),
+    arithmetic: (Option<&Fp8Slot>, crate::model_spec::RoutedWeightBoundary),
+) -> Result<u64> {
     prefill_layout_mixed(
         rows,
         contribute_rows,
@@ -538,7 +565,7 @@ pub(crate) fn prefill_scratch_bytes_mixed(
         experts,
         hidden,
         intermediates,
-        fp8_slot,
+        arithmetic,
     )
     .map(|layout| layout.bytes)
 }
@@ -573,7 +600,10 @@ pub(crate) fn prefill_layout(
         experts,
         hidden,
         (inter, inter),
-        fp8_slot,
+        (
+            fp8_slot,
+            crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+        ),
     )
 }
 
@@ -584,8 +614,9 @@ pub(crate) fn prefill_layout_mixed(
     experts: usize,
     hidden: usize,
     intermediates: (usize, usize),
-    fp8_slot: Option<&Fp8Slot>,
+    arithmetic: (Option<&Fp8Slot>, crate::model_spec::RoutedWeightBoundary),
 ) -> Result<PrefillLayout> {
+    let (fp8_slot, routed_weight) = arithmetic;
     let (inter, shared_inter) = intermediates;
     ensure!(
         contribute_rows >= rows,
@@ -630,7 +661,14 @@ pub(crate) fn prefill_layout_mixed(
     let x_perm = region(&mut at, routed_hidden, 2)?;
     let h1 = region(&mut at, routed_gate_up, 2)?;
     let act = region(&mut at, routed_inter, 2)?;
-    let y_perm = region(&mut at, routed_hidden, 2)?;
+    let y_perm_bytes = if fp8_slot.is_none()
+        && routed_weight == crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16
+    {
+        4
+    } else {
+        2
+    };
+    let y_perm = region(&mut at, routed_hidden, y_perm_bytes)?;
     let h1s = region(&mut at, shared_gate_up, 2)?;
     let act_s = region(&mut at, shared_inter_extent, 2)?;
     let shared_out = region(&mut at, shared_hidden, 2)?;
@@ -820,9 +858,12 @@ pub(crate) struct PrefillOps {
     scan: CudaFunction,
     permute: CudaFunction,
     scatter: CudaFunction,
+    scatter_f32: CudaFunction,
     lane16: CudaFunction,
+    lane16_f32: CudaFunction,
     silu: CudaFunction,
     swiglu_rounding: crate::model_spec::SwigluRounding,
+    routed_weight: crate::model_spec::RoutedWeightBoundary,
     combine: CombineOps,
     blas: CudaBlas,
     stream: Arc<CudaStream>,
@@ -849,19 +890,21 @@ impl PrefillOps {
         stream: &Arc<CudaStream>,
         format: ExpertFormat,
     ) -> Result<Self> {
-        Self::new_with_swiglu_rounding(
+        Self::new_with_boundaries(
             ctx,
             stream,
             format,
             crate::model_spec::SwigluRounding::Twice,
+            crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
         )
     }
 
-    pub fn new_with_swiglu_rounding(
+    pub fn new_with_boundaries(
         ctx: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
         format: ExpertFormat,
         swiglu_rounding: crate::model_spec::SwigluRounding,
+        routed_weight: crate::model_spec::RoutedWeightBoundary,
     ) -> Result<Self> {
         let module = cubin::module(ctx, "moe_prefill")?;
         let act = cubin::module(ctx, "act")?;
@@ -886,9 +929,12 @@ impl PrefillOps {
             scan: module.load_function("moe_scan")?,
             permute: module.load_function("moe_permute")?,
             scatter: module.load_function("moe_scatter")?,
+            scatter_f32: module.load_function("moe_scatter_f32")?,
             lane16: module.load_function("moe_gemm_lane16")?,
+            lane16_f32: module.load_function("moe_gemm_lane16_f32")?,
             silu: act.load_function("silu_mul")?,
             swiglu_rounding,
+            routed_weight,
             combine: CombineOps::new(ctx)?,
             blas,
             stream: stream.clone(),
@@ -907,7 +953,7 @@ impl PrefillOps {
             Arc::ptr_eq(stream, &self.stream),
             "moe prefill stream is not the PrefillOps construction stream (cuBLAS handle bound at construction)"
         );
-        let plan = input.validate()?;
+        let plan = input.validate(self.routed_weight)?;
         ensure!(
             input.fp8_slot.is_none() || self.fp8.is_some(),
             "FP8 prefill operators not bound at setup"
@@ -926,6 +972,10 @@ impl PrefillOps {
     ) -> Result<()> {
         let experts = plan.experts as usize;
         let (rows, top_k, hidden, inter) = (plan.rows, plan.top_k, plan.hidden, plan.inter);
+        let output_fp32 = input.fp8_slot.is_none()
+            && self.routed_weight
+                == crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16;
+        let y_elem = if output_fp32 { 4 } else { 2 };
         let layout = &plan.layout;
         let counts_at = scratch.ptr + layout.counts;
         let active_total_at = scratch.ptr + layout.active_total;
@@ -1015,9 +1065,14 @@ impl PrefillOps {
             return Ok(());
         }
         problem_order(counts, input.cpu_arithmetic, &mut stage.order);
-        let tensor_problems = stage
-            .order
-            .partition_point(|&expert| !input.cpu_arithmetic[expert as usize]);
+        // FP32 routed contributions use lane16; grouped cuBLAS has no BF16-input/FP32-C form on sm86.
+        let tensor_problems = if output_fp32 {
+            0
+        } else {
+            stage
+                .order
+                .partition_point(|&expert| !input.cpu_arithmetic[expert as usize])
+        };
         let small_rows = stage.order[tensor_problems..]
             .iter()
             .map(|&expert| counts[expert as usize] as u32)
@@ -1109,7 +1164,7 @@ impl PrefillOps {
                 stage,
                 gemm1_base,
                 len1,
-                (tensor_problems, small_rows),
+                (tensor_problems, small_rows, false),
                 (2 * inter, hidden),
                 slot.gate_scale.start,
             )?;
@@ -1121,7 +1176,7 @@ impl PrefillOps {
             self.small_gemm(
                 gemm1_base,
                 len1,
-                (tensor_problems, small_rows),
+                (tensor_problems, small_rows, false),
                 (2 * inter, hidden),
                 None,
             )?;
@@ -1154,7 +1209,7 @@ impl PrefillOps {
                     input.slots_down_host[e]
                 };
                 mirror[len2 + j] = act_at + elem(off * u64::from(inter));
-                mirror[2 * len2 + j] = y_perm_at + elem(off * u64::from(hidden));
+                mirror[2 * len2 + j] = y_perm_at + off * u64::from(hidden) * y_elem;
                 mirror[3 * len2 + j] = counts[e] as u64;
             }
         }
@@ -1185,19 +1240,21 @@ impl PrefillOps {
                 stage,
                 gemm2_base,
                 len2,
-                (tensor_problems, small_rows),
+                (tensor_problems, small_rows, false),
                 (hidden, inter),
                 slot.down_scale.start - slot.down.start,
             )?;
         } else {
             unsafe {
-                self.grouped_gemm(stage, gemm2_base, len2)
-                    .context("moe prefill grouped GEMM 2")?;
+                if !output_fp32 {
+                    self.grouped_gemm(stage, gemm2_base, len2)
+                        .context("moe prefill grouped GEMM 2")?;
+                }
             }
             self.small_gemm(
                 gemm2_base,
                 len2,
-                (tensor_problems, small_rows),
+                (tensor_problems, small_rows, output_fp32),
                 (hidden, inter),
                 None,
             )?;
@@ -1206,16 +1263,30 @@ impl PrefillOps {
             reader.record(stream)?;
         }
         unsafe {
-            stream
-                .launch_builder(&self.scatter)
-                .arg(&y_perm_at)
-                .arg(&input.weights.ptr)
-                .arg(&pos_of_at)
-                .arg(&input.active.ptr)
-                .arg(&input.contributions.ptr)
-                .arg(&(plan.assignments as i64))
-                .arg(&(hidden as i64))
-                .launch(grid(plan.assignments as usize, BLOCK_THREADS))?;
+            if output_fp32 {
+                stream
+                    .launch_builder(&self.scatter_f32)
+                    .arg(&y_perm_at)
+                    .arg(&input.weights.ptr)
+                    .arg(&pos_of_at)
+                    .arg(&input.active.ptr)
+                    .arg(&input.contributions.ptr)
+                    .arg(&(plan.assignments as i64))
+                    .arg(&(hidden as i64))
+                    .arg(&1i32)
+                    .launch(grid(plan.assignments as usize, BLOCK_THREADS))?;
+            } else {
+                stream
+                    .launch_builder(&self.scatter)
+                    .arg(&y_perm_at)
+                    .arg(&input.weights.ptr)
+                    .arg(&pos_of_at)
+                    .arg(&input.active.ptr)
+                    .arg(&input.contributions.ptr)
+                    .arg(&(plan.assignments as i64))
+                    .arg(&(hidden as i64))
+                    .launch(grid(plan.assignments as usize, BLOCK_THREADS))?;
+            }
         }
         Ok(())
     }
@@ -1260,7 +1331,7 @@ impl PrefillOps {
             shared_down: input.shared_down,
             shared_expert_gate: input.shared_expert_gate,
         };
-        let plan = cohort.validate()?;
+        let plan = cohort.validate(self.routed_weight)?;
         input.validate_y(&plan)?;
         scratch.validate(plan.layout.bytes)?;
         unsafe {
@@ -1431,11 +1502,11 @@ impl PrefillOps {
         stage: &Stage,
         block: u64,
         problems: usize,
-        small: (usize, u32),
+        small: (usize, u32, bool),
         shape: (u32, u32),
         scale_offset: u64,
     ) -> Result<()> {
-        let (tensor_problems, _) = small;
+        let (tensor_problems, _, _) = small;
         if tensor_problems > 0 {
             let kernel = &self.fp8.as_ref().context("native expert GEMM missing")?.0;
             let rows = stage
@@ -1471,18 +1542,18 @@ impl PrefillOps {
         &self,
         block: u64,
         problems: usize,
-        small: (usize, u32),
+        small: (usize, u32, bool),
         shape: (u32, u32),
         scale_offset: Option<u64>,
     ) -> Result<()> {
-        let (first, rows) = small;
+        let (first, rows, output_fp32) = small;
         if first == problems {
             return Ok(());
         }
-        let kernel = if scale_offset.is_some() {
-            &self.fp8.as_ref().context("FP8 lane16 operator missing")?.1
-        } else {
-            &self.lane16
+        let kernel = match (scale_offset.is_some(), output_fp32) {
+            (true, _) => &self.fp8.as_ref().context("FP8 lane16 operator missing")?.1,
+            (false, true) => &self.lane16_f32,
+            (false, false) => &self.lane16,
         };
         let offset = scale_offset.unwrap_or(0);
         let (problem_count, first_problem, columns, inner) = (

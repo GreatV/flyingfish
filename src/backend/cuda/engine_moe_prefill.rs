@@ -4,7 +4,7 @@ use super::*;
 use crate::backend::cuda::moe::prefill::prefill_scratch_bytes;
 use crate::backend::cuda::moe::prefill::{
     LANE16_ROWS, MoePrefillContribute, MoePrefillFinish, PrefillOps, arithmetic_mask,
-    prefill_scratch_bytes_mixed,
+    prefill_scratch_bytes_mixed_with_boundary,
 };
 use crate::experts::{
     plan::{Capacity, Reserves, ServiceTable},
@@ -274,6 +274,7 @@ pub(in crate::backend::cuda::engine) struct Prefill {
     frequency: Vec<Vec<f64>>,
     rows: u64,
     failed: bool,
+    routed_weight: crate::model_spec::RoutedWeightBoundary,
     mixer_rows: usize,
     workspace_rows: usize,
     waves: Vec<Wave>,
@@ -404,9 +405,9 @@ impl Prefill {
         reserves: Reserves,
         service: ServiceTable,
         h2d_bytes_per_second: f64,
-        shape: (u32, usize, usize),
+        shape: (u32, usize, usize, crate::model_spec::RoutedWeightBoundary),
     ) -> Result<Self> {
-        let (shared_intermediate, workspace_rows, mixer_rows) = shape;
+        let (shared_intermediate, workspace_rows, mixer_rows, routed_weight) = shape;
         let geometry = slots.catalogue.geometry();
         ensure!(
             mixer_rows > 0 && mixer_rows <= workspace_rows,
@@ -479,14 +480,14 @@ impl Prefill {
                 mask: super::super::super::super::cubin::module(&device.ctx, "moe_route")?
                     .load_function("moe_route_mask")?,
                 scratch: device.stream.alloc_zeros(usize::try_from(
-                    prefill_scratch_bytes_mixed(
+                    prefill_scratch_bytes_mixed_with_boundary(
                         capacity.wave_rows as usize,
                         capacity.span_rows as usize,
                         geometry.top_k as usize,
                         geometry.experts as usize,
                         geometry.hidden as usize,
                         (geometry.intermediate as usize, shared_intermediate as usize),
-                        capacity.layout.fp8_slot(),
+                        (capacity.layout.fp8_slot(), routed_weight),
                     )?,
                 )?)?,
                 tables: Tables::new(device, geometry.experts as usize, cohorts)?,
@@ -522,6 +523,7 @@ impl Prefill {
             frequency: vec![vec![0.0; geometry.experts as usize]; geometry.layers as usize],
             rows: 0,
             failed: false,
+            routed_weight,
             mixer_rows,
             workspace_rows,
             waves: (0..capacity.span_rows as usize)
@@ -750,7 +752,7 @@ impl Prefill {
         let stream = &device.stream;
         ensure!(
             self.gpu.scratch.len() as u64
-                >= prefill_scratch_bytes_mixed(
+                >= prefill_scratch_bytes_mixed_with_boundary(
                     self.capacity.wave_rows.min(rows) as usize,
                     rows as usize,
                     self.geometry.top_k as usize,
@@ -760,7 +762,7 @@ impl Prefill {
                         self.geometry.intermediate as usize,
                         self.shared_intermediate as usize,
                     ),
-                    self.capacity.layout.fp8_slot(),
+                    (self.capacity.layout.fp8_slot(), self.routed_weight),
                 )?,
             "prefill wave scratch bytes={} are below the rows={rows} wave={} bound",
             self.gpu.scratch.len(),

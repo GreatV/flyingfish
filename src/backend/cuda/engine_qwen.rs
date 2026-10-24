@@ -575,15 +575,16 @@ impl Runtime {
                 intermediate,
                 moe.shared_intermediate as usize,
             );
-            let prefill = crate::backend::cuda::moe::prefill::prefill_scratch_bytes_mixed(
-                rows,
-                rows,
-                top_k,
-                experts,
-                hidden,
-                (intermediate, moe.shared_intermediate as usize),
-                None,
-            )?;
+            let prefill =
+                crate::backend::cuda::moe::prefill::prefill_scratch_bytes_mixed_with_boundary(
+                    rows,
+                    rows,
+                    top_k,
+                    experts,
+                    hidden,
+                    (intermediate, moe.shared_intermediate as usize),
+                    (None, model.routed_weight_boundary()),
+                )?;
             return Ok(usize::try_from(decode.max(prefill).div_ceil(256) * 256)?);
         }
         let attention = FullAttentionSpec::from_model(model)?;
@@ -4159,6 +4160,58 @@ mod tests {
         let (graph_nll, graph_logits, bit_mismatches, max_ulp) =
             graph_eager_forced_prefix(&mut engine, &ids)?;
         let eager_nll = graph_nll;
+        let candidate_nll = (0..599)
+            .map(|position| {
+                let logits = &graph_logits[position];
+                let target = ids[position + 1] as usize;
+                let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let logsumexp = logits
+                    .iter()
+                    .map(|value| (value - max).exp())
+                    .sum::<f32>()
+                    .ln();
+                f64::from(max + logsumexp - logits[target])
+            })
+            .collect::<Vec<_>>();
+        let nll_deltas = candidate_nll
+            .iter()
+            .zip(&reference_nll[..599])
+            .map(|(candidate, reference)| candidate - reference)
+            .collect::<Vec<_>>();
+        println!(
+            "FLINT_PER_POSITION_NLL {}",
+            serde_json::json!({
+                "candidate": candidate_nll,
+                "reference": reference_nll[..599],
+                "delta": nll_deltas,
+            })
+        );
+        if let Some(path) = env::var_os("FF_FLINT_GRAPH_LOGITS_OUT") {
+            let mut selected_positions = (512..599).collect::<Vec<_>>();
+            selected_positions
+                .sort_by(|&a, &b| nll_deltas[b].abs().total_cmp(&nll_deltas[a].abs()));
+            selected_positions.truncate(3);
+            selected_positions.sort_unstable();
+            let mut trace = Trace::default();
+            trace.set_device(&engine.device.info.name)?;
+            trace.add(
+                "logits.positions".to_owned(),
+                vec![selected_positions.len(), engine.config.vocab_size],
+                selected_positions
+                    .iter()
+                    .flat_map(|&position| graph_logits[position].iter().copied())
+                    .collect(),
+            )?;
+            trace.add(
+                "positions".to_owned(),
+                vec![selected_positions.len()],
+                selected_positions
+                    .iter()
+                    .map(|position| *position as f32)
+                    .collect(),
+            )?;
+            trace.save(&PathBuf::from(path))?;
+        }
 
         engine.reset()?;
         engine.prefill(&ids[..513], None)?;

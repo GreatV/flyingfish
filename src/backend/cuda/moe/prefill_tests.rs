@@ -5,7 +5,8 @@ use super::combine::{CombineOps, MoeCombine};
 use super::prefill::{
     GEMM1_PTR_WORDS, GEMM2_PTR_WORDS, MAX_EXPERTS, MoePrefill, MoePrefillContribute,
     MoePrefillFinish, PrefillOps, d2h_active_total_word, d2h_window_words, group_runs,
-    prefill_layout, prefill_scratch_bytes, prefill_scratch_bytes_mixed, problem_order,
+    prefill_layout, prefill_scratch_bytes, prefill_scratch_bytes_mixed,
+    prefill_scratch_bytes_mixed_with_boundary, problem_order,
 };
 use super::reference::{self, Combine, MoeDims, MoeFixture};
 use super::testing;
@@ -849,6 +850,7 @@ struct GpuCase<'a> {
     fx: &'a MoeFixture,
     scratch: &'a Scratch,
     shared: &'a SharedBufs,
+    routed_weight: crate::model_spec::RoutedWeightBoundary,
 }
 
 impl GpuCase<'_> {
@@ -898,9 +900,25 @@ impl GpuCase<'_> {
             let expected = if keep_row.is_empty() {
                 let zeros = vec![bf16::ZERO; top_k];
                 let all: Vec<usize> = (0..top_k).collect();
-                reference::moe_row_ids(self.fx, row, ids_row, &zeros, &all, Combine::Fp32)
+                reference::moe_row_ids_with_boundary(
+                    self.fx,
+                    row,
+                    ids_row,
+                    &zeros,
+                    &all,
+                    Combine::Fp32,
+                    self.routed_weight,
+                )
             } else {
-                reference::moe_row_ids(self.fx, row, ids_row, weights_row, &keep_row, Combine::Fp32)
+                reference::moe_row_ids_with_boundary(
+                    self.fx,
+                    row,
+                    ids_row,
+                    weights_row,
+                    &keep_row,
+                    Combine::Fp32,
+                    self.routed_weight,
+                )
             };
             for c in 0..hidden {
                 let got = y[row * hidden + c];
@@ -1065,13 +1083,14 @@ fn control_diff(
     let all: Vec<usize> = (0..top_k).collect();
     let mut max_diff = 0.0f32;
     for row in 0..rows {
-        let expected = reference::moe_row_ids(
+        let expected = reference::moe_row_ids_with_boundary(
             case.fx,
             row,
             &ids[row * top_k..(row + 1) * top_k],
             &weights[row * top_k..(row + 1) * top_k],
             &all,
             Combine::Fp32,
+            case.routed_weight,
         );
         for c in 0..hidden {
             max_diff = max_diff.max((y[row * hidden + c].to_f32() - expected[c].to_f32()).abs());
@@ -1145,6 +1164,40 @@ fn moe_prefill_gpu() -> Result<()> {
         fx: &fx,
         scratch: &scratch,
         shared: &shared,
+        routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+    };
+    let flint_ops = PrefillOps::new_with_boundaries(
+        &d.ctx,
+        s,
+        crate::model_spec::ExpertFormat::Bf16,
+        crate::model_spec::SwigluRounding::Once,
+        crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16,
+    )?;
+    let flint_scratch_bytes = prefill_scratch_bytes_mixed_with_boundary(
+        512,
+        512,
+        top_k,
+        experts,
+        hidden,
+        (inter, fx.dims.shared_inter),
+        (
+            None,
+            crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16,
+        ),
+    )?;
+    let flint_scratch_buf: CudaSlice<u8> = s.alloc_zeros(flint_scratch_bytes as usize)?;
+    let (flint_scratch_ptr, _fgs) = flint_scratch_buf.device_ptr(s);
+    let flint_scratch = Scratch {
+        ptr: flint_scratch_ptr,
+        bytes: flint_scratch_bytes,
+    };
+    let flint_case = GpuCase {
+        s,
+        ops: &flint_ops,
+        fx: &fx,
+        scratch: &flint_scratch,
+        shared: &shared,
+        routed_weight: crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16,
     };
 
     // The per-expert GEMM2 shape (n = m_e per expert, restored from the
@@ -1176,6 +1229,21 @@ fn moe_prefill_gpu() -> Result<()> {
             },
             &mut defects,
         )?;
+        if rows <= 512 {
+            flint_case.run(
+                Arm {
+                    label: "uniform-flint-before",
+                    rows,
+                    ids: &ids,
+                    active: &active,
+                    weights: &weights,
+                    check: &check,
+                    gens: &gens,
+                    slots: &main_slots,
+                },
+                &mut defects,
+            )?;
+        }
         let (ids, weights) = planted_skewed(rows, top_k);
         let gens = vec![1u64; rows * top_k];
         case.run(
@@ -1529,6 +1597,7 @@ fn moe_prefill_gpu() -> Result<()> {
             fx: case.fx,
             scratch: case.scratch,
             shared: case.shared,
+            routed_weight: case.routed_weight,
         };
         ev_case.run(
             Arm {
