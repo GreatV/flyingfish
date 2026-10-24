@@ -4048,7 +4048,7 @@ impl Engine {
                 spec.checkpoint
                     .as_ref()
                     .context("MoE chain checkpoint missing")?
-                    .restore_for_replay(&mut self.state, committed, s)?;
+                    .restore_for_replay(&mut self.state, committed, rows, s)?;
                 spec.draft.restore_kv(start, committed)?;
                 if committed < rows {
                     self.replay_gdn_prefix(start, committed)?;

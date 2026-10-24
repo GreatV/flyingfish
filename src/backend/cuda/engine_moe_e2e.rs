@@ -1714,7 +1714,7 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
             spec.checkpoint
                 .as_ref()
                 .context("chain checkpoint missing")?
-                .restore_for_replay(&mut model.state, accepted, &stream)?;
+                .restore_for_replay(&mut model.state, accepted, rows, &stream)?;
             if accepted > 0 && accepted < rows {
                 model.replay_gdn_prefix(prefix, accepted)?;
             }
@@ -1766,7 +1766,7 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
                     .checkpoint
                     .as_ref()
                     .context("chain checkpoint missing")?
-                    .restore_for_replay(&mut model.state, accepted, &stream)?;
+                    .restore_for_replay(&mut model.state, accepted, rows, &stream)?;
                 model.replay_gdn_prefix(prefix, accepted)?;
                 let perturbed_s = stream.clone_dtoh(&model.state.gdn[0].s)?;
                 let perturbed_h = stream.clone_dtoh(&model.state.gdn[0].history)?;
@@ -1836,6 +1836,7 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
             (Some(2usize), 1usize, 8usize, None),
             (Some(3), 2, 8, None),
             (Some(4), 3, 8, None),
+            (Some(5), 2, 8, None),
             (Some(5), 4, 8, None),
             (Some(6), 5, 8, None),
             (Some(7), 6, 8, None),

@@ -758,7 +758,7 @@ impl StateCheckpoint {
             stream.memcpy_dtod(&src.s, &mut dst.s)?;
             stream.memcpy_dtod(&src.history, &mut dst.history)?;
         }
-        self.restore_kv_rows(store, 0, stream)?;
+        self.restore_kv_rows(store, 0, self.active_rows, stream)?;
         if let (Some(saved), Some(seq)) = (&self.sequence, &mut store.sequence) {
             stream.memcpy_dtod(saved, seq)?;
         }
@@ -823,41 +823,43 @@ impl StateCheckpoint {
                 }
             }
         }
-        self.restore_kv_rows(store, accepted, stream)
+        self.restore_kv_rows(store, accepted, self.active_rows, stream)
     }
     pub(super) fn restore_for_replay(
         &self,
         store: &mut StateStore,
         committed: usize,
+        verified_rows: usize,
         stream: &Arc<CudaStream>,
     ) -> Result<()> {
         ensure!(self.valid, "checkpoint has no valid snapshot");
         self.check(store)?;
         ensure!(
-            committed <= self.active_rows,
-            "checkpoint committed={committed} exceeds active_rows={}",
+            verified_rows > 0 && verified_rows <= self.active_rows && committed <= verified_rows,
+            "checkpoint committed={committed} verified_rows={verified_rows} exceeds active_rows={}",
             self.active_rows
         );
-        if committed < self.active_rows {
+        if committed < verified_rows {
             for (saved, state) in self.gdn.iter().zip(&mut store.gdn) {
                 stream.memcpy_dtod(&saved.s, &mut state.s)?;
                 stream.memcpy_dtod(&saved.history, &mut state.history)?;
             }
         }
-        self.restore_kv_rows(store, committed, stream)
+        self.restore_kv_rows(store, committed, verified_rows, stream)
     }
     fn restore_kv_rows(
         &self,
         store: &mut StateStore,
         first: usize,
+        end: usize,
         stream: &Arc<CudaStream>,
     ) -> Result<()> {
         ensure!(
-            first <= self.active_rows,
-            "accepted KV rows={first} exceeds checkpoint rows={}",
+            first <= end && end <= self.active_rows,
+            "accepted KV rows={first}..{end} exceeds checkpoint rows={}",
             self.active_rows
         );
-        if first == self.active_rows {
+        if first == end {
             return Ok(());
         }
         for (src, dst) in self.kv.iter().zip(&mut store.kv) {
@@ -874,7 +876,7 @@ impl StateCheckpoint {
                         b,
                         super::copy::Rect {
                             rows: self.heads,
-                            width: (self.active_rows - first) * self.dim,
+                            width: (end - first) * self.dim,
                             src_pitch: self.rows * self.dim,
                             src_col: first * self.dim,
                             dst_pitch: self.capacity * self.dim,
@@ -883,7 +885,7 @@ impl StateCheckpoint {
                     )?;
                     continue;
                 }
-                for row in first..self.active_rows {
+                for row in first..end {
                     let pos = crate::kv::ring_slot(self.prefix + row, cap)?;
                     super::copy::columns(
                         stream,
