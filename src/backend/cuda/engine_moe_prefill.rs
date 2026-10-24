@@ -307,6 +307,7 @@ pub(in crate::backend::cuda::engine) struct Prefill {
     routed_weight: crate::model_spec::RoutedWeightBoundary,
     mixer_rows: usize,
     workspace_rows: usize,
+    routed_wave_rows: u32,
     waves: Vec<Wave>,
     layer_names: Vec<String>,
     counts: Vec<u32>,
@@ -416,7 +417,7 @@ impl Prefill {
     pub(in crate::backend::cuda::engine) fn reference_geometry(&self) -> [usize; 4] {
         [
             self.capacity.span_rows as usize,
-            self.capacity.wave_rows as usize,
+            self.routed_wave_rows as usize,
             self.mixer_rows,
             self.workspace_rows,
         ]
@@ -435,9 +436,16 @@ impl Prefill {
         reserves: Reserves,
         service: ServiceTable,
         h2d_bytes_per_second: f64,
-        shape: (u32, usize, usize, crate::model_spec::RoutedWeightBoundary),
+        shape: (
+            u32,
+            usize,
+            usize,
+            u32,
+            crate::model_spec::RoutedWeightBoundary,
+        ),
     ) -> Result<Self> {
-        let (shared_intermediate, workspace_rows, mixer_rows, routed_weight) = shape;
+        let (shared_intermediate, workspace_rows, mixer_rows, routed_wave_rows, routed_weight) =
+            shape;
         let geometry = slots.catalogue.geometry();
         ensure!(
             mixer_rows > 0 && mixer_rows <= workspace_rows,
@@ -472,7 +480,13 @@ impl Prefill {
             capacity.slot_bytes(),
             capacity.span_rows,
         )?
-        .validate_wave(capacity.wave_rows, workspace_rows)?;
+        .validate_wave(routed_wave_rows, workspace_rows)?;
+        ensure!(
+            routed_wave_rows >= capacity.wave_rows
+                && (u64::from(routed_wave_rows) * u64::from(geometry.top_k) * 2).is_multiple_of(16),
+            "routed wave rows={routed_wave_rows} below shared wave rows={} or unaligned",
+            capacity.wave_rows
+        );
         let borrowed = reserves
             .span_bytes(capacity.span_rows)?
             .div_ceil(capacity.slot_bytes());
@@ -500,6 +514,7 @@ impl Prefill {
             geometry,
             shared_intermediate,
             capacity: capacity.clone(),
+            routed_wave_rows,
             reserves,
             service,
             workers,
@@ -511,7 +526,7 @@ impl Prefill {
                     .load_function("moe_route_mask")?,
                 scratch: device.stream.alloc_zeros(usize::try_from(
                     prefill_scratch_bytes_mixed_with_boundary(
-                        capacity.wave_rows as usize,
+                        routed_wave_rows as usize,
                         capacity.span_rows as usize,
                         geometry.top_k as usize,
                         geometry.experts as usize,
@@ -607,7 +622,7 @@ impl Prefill {
             self.capacity.slot_bytes(),
             rows,
         )?;
-        layout.validate_wave(self.capacity.wave_rows.min(rows), self.workspace_rows)?;
+        layout.validate_wave(self.routed_wave_rows.min(rows), self.workspace_rows)?;
         let borrowed = u32::try_from(
             self.reserves
                 .span_bytes(rows)?
@@ -783,7 +798,7 @@ impl Prefill {
         ensure!(
             self.gpu.scratch.len() as u64
                 >= prefill_scratch_bytes_mixed_with_boundary(
-                    self.capacity.wave_rows.min(rows) as usize,
+                    self.routed_wave_rows.min(rows) as usize,
                     rows as usize,
                     self.geometry.top_k as usize,
                     self.geometry.experts as usize,
@@ -796,7 +811,7 @@ impl Prefill {
                 )?,
             "prefill wave scratch bytes={} are below the rows={rows} wave={} bound",
             self.gpu.scratch.len(),
-            self.capacity.wave_rows
+            self.routed_wave_rows
         );
         let x = span.hidden(&span.layout.normalized, 0, rows)?;
         let ids = span.choices::<i32>(&span.layout.ids, 0, rows)?;
@@ -854,7 +869,7 @@ impl Prefill {
             &self.counts,
             &self.resident,
             rows,
-            self.capacity.wave_rows.min(rows),
+            self.routed_wave_rows.min(rows),
             &SpanRates {
                 service: &self.service,
                 h2d_bytes_per_second: self.h2d_bytes_per_second,
@@ -988,7 +1003,7 @@ impl Prefill {
             &self.forecast_counts,
             &self.forecast_resident,
             rows,
-            rows.min(self.capacity.wave_rows),
+            rows.min(self.routed_wave_rows),
             &SpanRates {
                 service: &self.service,
                 h2d_bytes_per_second: self.h2d_bytes_per_second,

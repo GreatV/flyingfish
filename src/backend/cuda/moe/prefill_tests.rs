@@ -2732,15 +2732,17 @@ fn prefill_stage_backtoback_gpu() -> Result<()> {
     Ok(())
 }
 
-/// Discriminating GPU test for T25.2 Step 2A:
-/// Runs one span (rows=769, coprime with 256 and 8) with forced 256-row waves
-/// and with packed waves from SpanPlan::pack_waves, with coprime activations
-/// and experts at both <= 16 rows (lane16) and > 16 rows (grouped GEMM).
-/// Asserts 0 differing bits in contributions, then verifies that an off-by-one
-/// wave base shift (and a host/device count mismatch) fail discriminantly.
+/// Packed and fixed waves agree for coprime spans at 256 and 2048 scratch rows.
 #[test]
 #[ignore = "requires GPU window, FF_Q38_GPU_WINDOW=granted"]
 fn prefill_packed_waves_gpu() -> Result<()> {
+    for wave_rows in [256, 2048] {
+        prefill_packed_waves(wave_rows)?;
+    }
+    Ok(())
+}
+
+fn prefill_packed_waves(wave_rows: usize) -> Result<()> {
     use crate::backend::cuda::contracts::view;
     use crate::experts::{
         catalogue::{ExpertGeometry, ExpertLayout},
@@ -2754,8 +2756,8 @@ fn prefill_packed_waves_gpu() -> Result<()> {
     );
     let d = crate::backend::cuda::Device::new(0)?;
     let s = &d.stream;
-    let rows = 769usize;
-    let wave_rows = 256usize;
+    let first_wave_rows = 2 * wave_rows;
+    let rows = first_wave_rows + 257;
     let mut fx = reference::fixture(MoeDims::minicpm47(rows), 19);
     let (experts, top_k, hidden, inter) = (
         fx.dims.experts,
@@ -2853,13 +2855,7 @@ fn prefill_packed_waves_gpu() -> Result<()> {
         h2d_bytes_per_second: 1e10,
     };
 
-    // Routing construction across 769 rows * 8 choices = 6152 assignments:
-    // - Resident experts (0..15), 4 choices per row (choices 0..4):
-    //   - Wave 0 covers rows 0..512 (512 * 4 = 2048 active assignments):
-    //     experts 10 and 11 get 11 rows each (<= 16 -> lane16); experts 9, 12, 13, 14 take the rest.
-    //   - Wave 1 covers rows 512..769 (257 * 4 = 1028 active assignments):
-    //     experts 0..=8 get exact per-expert acts [256, 65, 64, 33, 32, 31, 17, 16, 1] on moe_gemm_w8a16.
-    // - Staged experts (16..20, 2 cohorts of 2 experts), 4 choices per row (choices 4..8).
+    // Four resident and four staged choices per row; the final 257 rows contain tile boundaries.
     let mut ids = vec![0i32; rows * top_k];
     let mut weights = vec![bf16::ZERO; rows * top_k];
     let mut counts = vec![0u32; experts];
@@ -2867,7 +2863,7 @@ fn prefill_packed_waves_gpu() -> Result<()> {
     for r in 0..rows {
         for c in 0..top_k {
             let expert = if c < 4 {
-                if r < 512 {
+                if r < first_wave_rows {
                     if r < 11 && c == 0 {
                         10
                     } else if r < 11 && c == 1 {
@@ -2876,7 +2872,7 @@ fn prefill_packed_waves_gpu() -> Result<()> {
                         WAVE0_RESIDENT[(r + c) & 3]
                     }
                 } else {
-                    let u = r - 512;
+                    let u = r - first_wave_rows;
                     match c {
                         0 => {
                             if u < 256 {
@@ -2937,9 +2933,13 @@ fn prefill_packed_waves_gpu() -> Result<()> {
     plan.update(&counts, &resident, rows as u32, wave_rows as u32, &rates)?;
     plan.pack_waves(&counts, &ids)?;
     anyhow::ensure!(
-        plan.cohort_waves(0)? == [(0, 512, 2048), (512, 257, 1028)]
+        plan.cohort_waves(0)?
+            == [
+                (0, first_wave_rows as u32, (wave_rows * top_k) as u32),
+                (first_wave_rows as u32, 257, 1028),
+            ]
             && plan.cohort_waves(1)?.len() == 1,
-        "expected cohort 0 waves [(0,512,2048),(512,257,1028)] and cohort 1 len 1: c0={:?} c1={:?}",
+        "packed wave geometry differs at wave_rows={wave_rows}: c0={:?} c1={:?}",
         plan.cohort_waves(0)?,
         plan.cohort_waves(1)?
     );
@@ -3012,7 +3012,7 @@ fn prefill_packed_waves_gpu() -> Result<()> {
         sd: s.clone_htod(fx.shared_down.as_slice())?,
         seg: s.clone_htod(fx.shared_expert_gate.as_slice())?,
     };
-    // Split layout: rows = wave_rows (256), contribute_rows = rows (769).
+    // Scratch holds wave_rows * top_k assignments and span-wide position indices.
     let scratch_bytes =
         prefill_scratch_bytes(wave_rows, rows, top_k, experts, hidden, inter, None)?;
     let scratch_buf: CudaSlice<u8> = s.alloc_zeros(scratch_bytes as usize)?;
@@ -3063,9 +3063,10 @@ fn prefill_packed_waves_gpu() -> Result<()> {
                     .map(|&(base, w_rows, active)| (base, w_rows, Some(active)))
                     .collect()
             } else {
+                let fixed_rows = if wave_rows == 2048 { 16 } else { wave_rows };
                 (0..rows as u32)
-                    .step_by(wave_rows)
-                    .map(|base| (base, (wave_rows as u32).min(rows as u32 - base), None))
+                    .step_by(fixed_rows)
+                    .map(|base| (base, (fixed_rows as u32).min(rows as u32 - base), None))
                     .collect()
             };
             for (w_idx, (base, w_rows, wave_active)) in waves.into_iter().enumerate() {
@@ -3182,26 +3183,31 @@ fn prefill_packed_waves_gpu() -> Result<()> {
         Ok((bits, done_host))
     };
 
-    let (fixed_bits, fixed_done) = run_waves(&ops, &slots, None, false, false, false)?;
-    let (packed_bits, packed_done) = run_waves(&ops, &slots, None, true, false, false)?;
-    anyhow::ensure!(
-        fixed_done.iter().all(|&d| d == 1) && packed_done.iter().all(|&d| d == 1),
-        "incomplete done bits in fixed or packed wave run"
-    );
-    let diff_bits = fixed_bits
-        .iter()
-        .zip(&packed_bits)
-        .filter(|(a, b)| a != b)
-        .count();
-    eprintln!(
-        "prefill_packed_waves_gpu bf16 rows={rows} cohorts={total_cohorts} c0_waves={} c1_waves={} diff_bits={diff_bits}",
-        plan.cohort_waves(0)?.len(),
-        plan.cohort_waves(1)?.len()
-    );
-    anyhow::ensure!(
-        diff_bits == 0,
-        "packed waves diverged from forced 256-row waves: diff_bits={diff_bits}"
-    );
+    let bf16_bits = if wave_rows == 256 {
+        let (fixed_bits, fixed_done) = run_waves(&ops, &slots, None, false, false, false)?;
+        let (packed_bits, packed_done) = run_waves(&ops, &slots, None, true, false, false)?;
+        anyhow::ensure!(
+            fixed_done.iter().all(|&d| d == 1) && packed_done.iter().all(|&d| d == 1),
+            "incomplete done bits in fixed or packed wave run"
+        );
+        let diff_bits = fixed_bits
+            .iter()
+            .zip(&packed_bits)
+            .filter(|(a, b)| a != b)
+            .count();
+        eprintln!(
+            "prefill_packed_waves_gpu bf16 rows={rows} cohorts={total_cohorts} c0_waves={} c1_waves={} diff_bits={diff_bits}",
+            plan.cohort_waves(0)?.len(),
+            plan.cohort_waves(1)?.len()
+        );
+        anyhow::ensure!(
+            diff_bits == 0,
+            "packed waves diverged from forced {wave_rows}-row waves: diff_bits={diff_bits}"
+        );
+        Some((fixed_bits, packed_bits))
+    } else {
+        None
+    };
 
     let (fp8_fixed_bits, fp8_fixed_done) =
         run_waves(&fp8_ops, &fp8_slots, Some(fp8_slot), false, false, false)?;
@@ -3216,89 +3222,93 @@ fn prefill_packed_waves_gpu() -> Result<()> {
         .zip(&fp8_packed_bits)
         .filter(|(a, b)| a != b)
         .count();
-    let fp8_vs_bf16_diff = fp8_packed_bits
-        .iter()
-        .zip(&packed_bits)
-        .filter(|(a, b)| a != b)
-        .count();
+    let fp8_vs_bf16_diff = bf16_bits.as_ref().map(|(_, packed)| {
+        fp8_packed_bits
+            .iter()
+            .zip(packed)
+            .filter(|(a, b)| a != b)
+            .count()
+    });
     eprintln!(
-        "prefill_packed_waves_gpu fp8 rows={rows} acts={:?} fp8_wave_diff_bits={fp8_wave_diff} fp8_vs_bf16_diff_bits={fp8_vs_bf16_diff}",
+        "prefill_packed_waves_gpu fp8 rows={rows} wave_rows={wave_rows} acts={:?} fp8_wave_diff_bits={fp8_wave_diff} fp8_vs_bf16_diff_bits={fp8_vs_bf16_diff:?}",
         &counts[0..=8]
     );
     anyhow::ensure!(
-        fp8_wave_diff == 0 && fp8_vs_bf16_diff == 0,
-        "FP8 packed waves diverged: fp8_wave_diff={fp8_wave_diff} fp8_vs_bf16_diff={fp8_vs_bf16_diff}"
+        fp8_wave_diff == 0 && fp8_vs_bf16_diff.is_none_or(|diff| diff == 0),
+        "FP8 packed waves diverged: fp8_wave_diff={fp8_wave_diff} fp8_vs_bf16_diff={fp8_vs_bf16_diff:?}"
     );
 
-    // Control 0 (Step 2B): swap the two k-halves (col ^ 32) of each 64-K stage in FP8 codes; must FAIL (>0 differing bits).
-    let (k_swapped_bits, _) = run_waves(
-        &fp8_ops,
-        &k_swapped_slots,
-        Some(fp8_slot),
-        true,
-        false,
-        false,
-    )?;
-    let k_swap_diff = fp8_packed_bits
-        .iter()
-        .zip(&k_swapped_bits)
-        .filter(|(a, b)| a != b)
-        .count();
-    eprintln!(
-        "prefill_packed_waves_gpu fp8 stage k-half swap control k_swap_diff_bits={k_swap_diff} DETECTED"
-    );
-    anyhow::ensure!(
-        k_swap_diff > 0,
-        "FP8 stage k-half swap control was not detected"
-    );
+    if let Some((fixed_bits, packed_bits)) = bf16_bits {
+        // Control 0 (Step 2B): swap the two k-halves (col ^ 32) of each 64-K stage in FP8 codes; must FAIL (>0 differing bits).
+        let (k_swapped_bits, _) = run_waves(
+            &fp8_ops,
+            &k_swapped_slots,
+            Some(fp8_slot),
+            true,
+            false,
+            false,
+        )?;
+        let k_swap_diff = fp8_packed_bits
+            .iter()
+            .zip(&k_swapped_bits)
+            .filter(|(a, b)| a != b)
+            .count();
+        eprintln!(
+            "prefill_packed_waves_gpu fp8 stage k-half swap control k_swap_diff_bits={k_swap_diff} DETECTED"
+        );
+        anyhow::ensure!(
+            k_swap_diff > 0,
+            "FP8 stage k-half swap control was not detected"
+        );
 
-    // Control 1: plant an off-by-one wave base (shifted by 1 row); must FAIL (>0 differing bits).
-    let (shifted_bits, _) = run_waves(&ops, &slots, None, true, true, false)?;
-    let shifted_diff = fixed_bits
-        .iter()
-        .zip(&shifted_bits)
-        .filter(|(a, b)| a != b)
-        .count();
-    eprintln!(
-        "prefill_packed_waves_gpu off-by-one base control shifted_diff_bits={shifted_diff} DETECTED"
-    );
-    anyhow::ensure!(
-        shifted_diff > 0,
-        "off-by-one wave base control was not detected"
-    );
+        // Control 1: plant an off-by-one wave base (shifted by 1 row); must FAIL (>0 differing bits).
+        let (shifted_bits, _) = run_waves(&ops, &slots, None, true, true, false)?;
+        let shifted_diff = fixed_bits
+            .iter()
+            .zip(&shifted_bits)
+            .filter(|(a, b)| a != b)
+            .count();
+        eprintln!(
+            "prefill_packed_waves_gpu off-by-one base control shifted_diff_bits={shifted_diff} DETECTED"
+        );
+        anyhow::ensure!(
+            shifted_diff > 0,
+            "off-by-one wave base control was not detected"
+        );
 
-    // Control 3 (Step 2C): corrupted cohort slice offset (cohort * experts + experts); must FAIL (>0 differing bits).
-    let (corrupted_cohort_bits, _) = run_waves(&ops, &slots, None, true, false, true)?;
-    let cohort_offset_diff = packed_bits
-        .iter()
-        .zip(&corrupted_cohort_bits)
-        .filter(|(a, b)| a != b)
-        .count();
-    let (fp8_corrupted_cohort_bits, _) =
-        run_waves(&fp8_ops, &fp8_slots, Some(fp8_slot), true, false, true)?;
-    let fp8_cohort_offset_diff = fp8_packed_bits
-        .iter()
-        .zip(&fp8_corrupted_cohort_bits)
-        .filter(|(a, b)| a != b)
-        .count();
-    eprintln!(
-        "prefill_packed_waves_gpu cohort offset control bf16_diff_bits={cohort_offset_diff} fp8_diff_bits={fp8_cohort_offset_diff} DETECTED"
-    );
-    anyhow::ensure!(
-        cohort_offset_diff > 0 && fp8_cohort_offset_diff > 0,
-        "corrupted cohort slice offset control was not detected: bf16={cohort_offset_diff} fp8={fp8_cohort_offset_diff}"
-    );
+        // Control 3 (Step 2C): corrupted cohort slice offset (cohort * experts + experts); must FAIL (>0 differing bits).
+        let (corrupted_cohort_bits, _) = run_waves(&ops, &slots, None, true, false, true)?;
+        let cohort_offset_diff = packed_bits
+            .iter()
+            .zip(&corrupted_cohort_bits)
+            .filter(|(a, b)| a != b)
+            .count();
+        let (fp8_corrupted_cohort_bits, _) =
+            run_waves(&fp8_ops, &fp8_slots, Some(fp8_slot), true, false, true)?;
+        let fp8_cohort_offset_diff = fp8_packed_bits
+            .iter()
+            .zip(&fp8_corrupted_cohort_bits)
+            .filter(|(a, b)| a != b)
+            .count();
+        eprintln!(
+            "prefill_packed_waves_gpu cohort offset control bf16_diff_bits={cohort_offset_diff} fp8_diff_bits={fp8_cohort_offset_diff} DETECTED"
+        );
+        anyhow::ensure!(
+            cohort_offset_diff > 0 && fp8_cohort_offset_diff > 0,
+            "corrupted cohort slice offset control was not detected: bf16={cohort_offset_diff} fp8={fp8_cohort_offset_diff}"
+        );
+    }
 
-    // Control 2: mismatch host-packed active count against device count at :899; must return Err.
+    // The underdeclared host count is rejected before either routed GEMM.
     let &(base, w_rows, active) = &plan.cohort_waves(0)?[0];
     let bad_c: CudaSlice<bf16> = s.alloc_zeros(w_rows as usize * top_k * hidden)?;
     let bad_d: CudaSlice<u32> = s.alloc_zeros(w_rows as usize * top_k)?;
-    let mismatch = ops.prefill_contribute(
+    let mismatch = fp8_ops.prefill_contribute(
         s,
         MoePrefillContribute {
             expert_inter: inter as u32,
             cpu_arithmetic: &cpu_arithmetic,
-            fp8_slot: None,
+            fp8_slot: Some(fp8_slot),
             wave: Some((0, base, active - 1)),
             wait_copy: None,
             reader_event: None,
@@ -3337,12 +3347,12 @@ fn prefill_packed_waves_gpu() -> Result<()> {
                 [w_rows, top_k as u32],
                 [top_k as u64, 1],
             )?,
-            slots_gate_up: view(&slots.gu_dev, s, 0, [experts as u32], [1])?,
-            slots_down: view(&slots.dn_dev, s, 0, [experts as u32], [1])?,
-            slot_valid: view(&slots.valid, s, 0, [experts as u32], [1])?,
-            slot_generation: view(&slots.generation, s, 0, [experts as u32], [1])?,
-            slots_gate_up_host: &slots.gu_host[..experts],
-            slots_down_host: &slots.dn_host[..experts],
+            slots_gate_up: view(&fp8_slots.gu_dev, s, 0, [experts as u32], [1])?,
+            slots_down: view(&fp8_slots.dn_dev, s, 0, [experts as u32], [1])?,
+            slot_valid: view(&fp8_slots.valid, s, 0, [experts as u32], [1])?,
+            slot_generation: view(&fp8_slots.generation, s, 0, [experts as u32], [1])?,
+            slots_gate_up_host: &fp8_slots.gu_host[..experts],
+            slots_down_host: &fp8_slots.dn_host[..experts],
             shared_gate: testing::dense(&shared.sg, s, inter as u32, hidden as u32)?,
             shared_up: testing::dense(&shared.su, s, inter as u32, hidden as u32)?,
             shared_down: testing::dense(&shared.sd, s, hidden as u32, inter as u32)?,
@@ -3364,9 +3374,15 @@ fn prefill_packed_waves_gpu() -> Result<()> {
         },
         &scratch,
     );
+    let error = mismatch.expect_err("mismatched wave active count control was not detected");
     anyhow::ensure!(
-        mismatch.is_err(),
-        "mismatched wave active count control was not detected"
+        error
+            .to_string()
+            .contains("moe prefill wave count mismatch"),
+        "unexpected control error: {error:#}"
+    );
+    println!(
+        "PASS prefill_packed_wave_count_control wave_rows={wave_rows} span_rows={rows} contributions=[{rows},{top_k},{hidden}] error={error:#}"
     );
     Ok(())
 }

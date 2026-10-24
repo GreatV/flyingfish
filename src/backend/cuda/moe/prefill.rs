@@ -24,6 +24,8 @@ const SCAN_THREADS: u32 = 1024;
 const BLOCK_THREADS: u32 = 256;
 /// One 256-thread tile contains sixteen independent sixteen-lane dots.
 pub(crate) const LANE16_ROWS: u32 = BLOCK_THREADS / 16;
+/// Native W8A16 grouped GEMM tile extent along packed rows.
+pub(crate) const W8A16_TILE_ROWS: u32 = 64;
 pub(crate) const MAX_EXPERTS: usize = 1024;
 const MAX_TOP_K: usize = 32;
 /// Region alignment inside the scratch buffer.
@@ -1527,7 +1529,7 @@ impl PrefillOps {
                     .launch(cudarc::driver::LaunchConfig {
                         grid_dim: (
                             shape.0.div_ceil(128),
-                            rows.div_ceil(64),
+                            rows.div_ceil(W8A16_TILE_ROWS),
                             tensor_problems as u32,
                         ),
                         block_dim: (256, 1, 1),
