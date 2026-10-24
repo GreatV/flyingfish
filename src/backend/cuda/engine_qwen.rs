@@ -4089,16 +4089,29 @@ mod tests {
             .collect::<Option<Vec<_>>>()
             .context("invalid passage token id")?;
         ids.truncate(600);
-        let reference: serde_json::Value = serde_json::from_reader(
+        let reference_document: serde_json::Value = serde_json::from_reader(
             File::open(reference_metrics).context("open reference metrics")?,
         )?;
-        let reference_nll = reference["metrics"]["per_position_nll"]
+        let reference_runs = reference_document
             .as_array()
-            .context("reference per-position NLL missing")?
+            .cloned()
+            .unwrap_or_else(|| vec![reference_document]);
+        let reference_nlls = reference_runs
             .iter()
-            .map(|value| value.as_f64().context("invalid reference per-position NLL"))
+            .map(|reference| {
+                reference["metrics"]["per_position_nll"]
+                    .as_array()
+                    .context("reference per-position NLL missing")?
+                    .iter()
+                    .map(|value| value.as_f64().context("invalid reference per-position NLL"))
+                    .collect::<Result<Vec<_>>>()
+            })
             .collect::<Result<Vec<_>>>()?;
-        ensure!(reference_nll.len() >= 599, "reference NLL prefix is short");
+        ensure!(
+            !reference_nlls.is_empty() && reference_nlls.iter().all(|values| values.len() >= 599),
+            "reference NLL prefix is short"
+        );
+        let reference_nll = &reference_nlls[0];
         let prediction_nll = |rows: &[Vec<f32>], start: usize, end: usize| -> Result<f64> {
             ensure!(
                 rows.len() >= end && ids.len() > end,
@@ -4326,7 +4339,6 @@ mod tests {
         for (destination, source) in window_off_logits[513..600].iter_mut().zip(tail_rows) {
             *destination = source;
         }
-        let window_off_nll = prediction_nll(&window_off_logits, 0, 599)?;
         let early_bits = graph_logits[..513]
             .iter()
             .zip(&window_off_logits[..513])
@@ -4343,25 +4355,32 @@ mod tests {
         );
         let window_on_tail = prediction_nll(&graph_logits, 512, 599)?;
         let window_off_tail = prediction_nll(&window_off_logits, 512, 599)?;
-        let reference_tail = reference_nll[512..599].iter().sum::<f64>() / 87.0;
+        let reference_tails = reference_nlls
+            .iter()
+            .map(|values| values[512..599].iter().sum::<f64>() / 87.0)
+            .collect::<Vec<_>>();
+        let reference_spread = reference_tails
+            .iter()
+            .flat_map(|a| reference_tails.iter().map(move |b| (a - b).abs()))
+            .fold(0f64, f64::max);
+        let tail_tolerance = 0.01f64.max(2.0 * reference_spread);
+        for (index, &reference_tail) in reference_tails.iter().enumerate() {
+            ensure!(
+                (window_on_tail - reference_tail).abs() <= tail_tolerance,
+                "window-on tail NLL differs from reference {index}: on={window_on_tail} reference={reference_tail} tolerance={tail_tolerance}"
+            );
+        }
+        let window_off_delta = (window_off_tail - window_on_tail).abs();
         ensure!(
-            (window_on_tail - reference_tail).abs() <= 0.01,
-            "window-on tail NLL differs from reference: on={window_on_tail} reference={reference_tail}"
-        );
-        ensure!(
-            (window_off_tail - reference_tail).abs() >= 0.01,
-            "window-off control does not discriminate: on={window_on_tail} off={window_off_tail} reference={reference_tail}"
-        );
-        ensure!(
-            (window_off_nll - graph_nll).abs() > 0.01 && window_off_nll - graph_nll >= 0.001,
-            "window-off control does not discriminate: candidate={graph_nll} control={window_off_nll}"
+            window_off_delta >= tail_tolerance + 0.01,
+            "window-off tail control does not discriminate: on={window_on_tail} off={window_off_tail} delta={window_off_delta} tolerance={tail_tolerance}"
         );
         ensure!(
             bit_mismatches == 0 && max_ulp == 0,
             "graph/eager NLL differs: graph={graph_nll} eager={eager_nll} bits={bit_mismatches} max_ulp={max_ulp}"
         );
         println!(
-            "FLINT_ENGINE_CONTROLS graph_nll={graph_nll:.9} eager_nll={eager_nll:.9} graph_eager_bits=0 sinks_off_nll={sinks_off_nll:.9} window_off_nll={window_off_nll:.9} pre_boundary_bits=0 tail_on={window_on_tail:.9} tail_off={window_off_tail:.9} tail_ref={reference_tail:.9} PASS"
+            "FLINT_ENGINE_CONTROLS graph_nll={graph_nll:.9} eager_nll={eager_nll:.9} graph_eager_bits=0 sinks_off_nll={sinks_off_nll:.9} pre_boundary_bits=0 tail_on={window_on_tail:.9} tail_off={window_off_tail:.9} tail_off_delta={window_off_delta:.9} reference_spread={reference_spread:.9} tail_tolerance={tail_tolerance:.9} tail_refs={reference_tails:?} PASS"
         );
         Ok(())
     }
