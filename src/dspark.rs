@@ -94,7 +94,9 @@ impl Rules {
     }
 }
 
-pub const DEFAULT_MOE_VERIFY_ROWS: usize = 3;
+pub const MIN_MOE_VERIFY_ROWS: usize = 2;
+pub const MAX_MOE_VERIFY_ROWS: usize = 8;
+pub const MOE_VERIFY_CONFIDENCE_TAU: f32 = 0.80;
 
 impl DraftConfig {
     pub fn verify_rows(&self) -> Result<usize> {
@@ -116,12 +118,12 @@ impl DraftConfig {
             self.head_dim
         );
         ensure!(
-            (2..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&rows),
+            (MIN_MOE_VERIFY_ROWS..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&rows),
             "DSpark block_size={} verify_rows={rows} exceeds skinny and routed arithmetic bound={}",
             self.block_size,
             crate::linear_plan::MAX_SKINNY_ROWS
         );
-        Ok(rows)
+        Ok(rows.min(MAX_MOE_VERIFY_ROWS))
     }
     #[cfg(any(feature = "cuda", test))]
     pub(crate) fn target_state_bytes(&self, spec: &crate::model_spec::ModelSpec) -> Result<usize> {
@@ -375,6 +377,30 @@ pub struct Accept {
     pub bonus: u32,
 }
 
+pub fn select_verify_rows(
+    confidences: &[f32],
+    min_rows: usize,
+    max_rows: usize,
+    tau: f32,
+) -> Result<usize> {
+    ensure!(
+        min_rows >= MIN_MOE_VERIFY_ROWS
+            && min_rows <= max_rows
+            && max_rows <= confidences.len() + 1
+            && tau.is_finite()
+            && (0.0..=1.0).contains(&tau)
+            && confidences.iter().all(|v| v.is_finite()),
+        "invalid DSpark verify row selection min_rows={min_rows} max_rows={max_rows} confidences={} tau={tau}",
+        confidences.len()
+    );
+    let confident = confidences
+        .iter()
+        .take(max_rows - 1)
+        .take_while(|&&c| c >= tau)
+        .count();
+    Ok((confident + 1).max(min_rows))
+}
+
 pub fn accept(proposals: &[u32], predictions: &[u32]) -> Result<Accept> {
     ensure!(
         predictions.len() == proposals.len() + 1,
@@ -418,6 +444,44 @@ mod tests {
             }
         );
         assert!(accept(&[3, 4, 5], &[3, 4, 5]).is_err());
+        assert_eq!(
+            select_verify_rows(&[0.5; 15], MIN_MOE_VERIFY_ROWS, MAX_MOE_VERIFY_ROWS, 0.80).unwrap(),
+            2
+        );
+        assert_eq!(
+            select_verify_rows(
+                &[
+                    0.85, 0.79, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99,
+                    0.99, 0.99
+                ],
+                MIN_MOE_VERIFY_ROWS,
+                MAX_MOE_VERIFY_ROWS,
+                0.80
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            select_verify_rows(
+                &[
+                    0.95, 0.85, 0.80, 0.79, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99, 0.99,
+                    0.99, 0.99
+                ],
+                MIN_MOE_VERIFY_ROWS,
+                MAX_MOE_VERIFY_ROWS,
+                0.80
+            )
+            .unwrap(),
+            4
+        );
+        assert_eq!(
+            select_verify_rows(&[0.95; 15], MIN_MOE_VERIFY_ROWS, MAX_MOE_VERIFY_ROWS, 0.80)
+                .unwrap(),
+            MAX_MOE_VERIFY_ROWS
+        );
+        assert!(select_verify_rows(&[f32::NAN; 15], 2, 8, 0.80).is_err());
+        assert!(select_verify_rows(&[0.9; 15], 1, 8, 0.80).is_err());
+        assert!(select_verify_rows(&[0.9; 6], 2, 8, 0.80).is_err());
     }
 
     #[test]
@@ -556,7 +620,7 @@ mod tests {
                 &serde_json::json!({"eos_token_id":[248044,248046]}),
             )?;
             ensure!(
-                draft.target_rows(&model)? == 16,
+                draft.verify_rows()? == 16 && draft.target_rows(&model)? == MAX_MOE_VERIFY_ROWS,
                 "draft verify extent changed"
             );
             ensure!(

@@ -1292,7 +1292,7 @@ impl Engine {
         if model_spec.linear_format.fp8_layout().is_some() {
             blas.enable_fp8(&device.ctx)?;
         }
-        let mut draft = if draft_config.is_some() {
+        let mut draft = if let Some(draft_config) = &draft_config {
             let path = settings
                 .draft_model
                 .as_deref()
@@ -1302,7 +1302,7 @@ impl Engine {
                 &device,
                 &config,
                 capacity,
-                verify_rows,
+                draft_config.verify_rows()?,
                 &mut blas,
                 super::super::markov::ScoreRounding::F32,
             )?;
@@ -2541,8 +2541,7 @@ impl Engine {
                         .as_mut()
                         .context("MoE all-row head requires draft state")?;
                     ensure!(
-                        self.model_spec.moe.is_some()
-                            && (1..=spec.draft.config.verify_rows()?).contains(&rows),
+                        self.model_spec.moe.is_some() && (1..=spec.max_verify_rows).contains(&rows),
                         "all-row head rows={rows} outside the loaded MoE verification extent"
                     );
                     self.blas.linear_typed(

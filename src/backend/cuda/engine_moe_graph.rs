@@ -171,20 +171,11 @@ impl Engine {
 
     pub(in crate::backend::cuda::engine) fn capture_moe(&mut self) -> Result<()> {
         let verify = self.spec.is_some();
-        let rows = match &self.spec {
-            Some(spec) => spec.verify_rows,
-            None => 1,
+        let widths = match &self.spec {
+            Some(spec) => crate::dspark::MIN_MOE_VERIFY_ROWS..=spec.max_verify_rows,
+            None => 1..=1,
         };
-        let step = crate::backend::Step {
-            rows,
-            input: if verify {
-                crate::backend::Input::Ids
-            } else {
-                crate::backend::Input::Token
-            },
-            mask: crate::backend::Mask::Causal,
-            head: if verify { Head::All } else { Head::Last },
-        };
+        let max_rows = *widths.end();
         let resident = self
             .moe_slots
             .as_ref()
@@ -192,9 +183,7 @@ impl Engine {
             .all_resident();
         if resident
             && if verify {
-                self.spec
-                    .as_ref()
-                    .is_some_and(|spec| spec.verify_graph.is_some())
+                self.has_moe_verify_graphs()
             } else {
                 self.graph.is_some()
             }
@@ -207,11 +196,13 @@ impl Engine {
         ensure!(!self.poisoned, "MoE capture requires healthy state");
         ensure!(
             self.position
-                .checked_add(rows)
+                .checked_add(max_rows)
                 .is_some_and(|end| end <= self.capacity),
             "MoE capture exceeds KV capacity"
         );
-        self.prepare(rows)?;
+        for rows in widths.clone() {
+            self.prepare(rows)?;
+        }
         let stream = self.device.stream.clone();
         stream.synchronize()?;
         let saved_position = stream.clone_dtoh(&self.work.position)?;
@@ -227,92 +218,113 @@ impl Engine {
         };
         let mut decode = self.moe.take().context("MoE capture executor missing")?;
         let slots = self.moe_slots.take().context("MoE capture slots missing")?;
-        decode.segments.reserve(self.model_spec.layers.len());
         let previous_prefix = self.qwen_device_prefix;
         self.qwen_device_prefix = verify;
-        let result = (|| -> Result<Option<CudaGraph>> {
+        let mut resident_graphs = std::collections::BTreeMap::new();
+        let result = (|| -> Result<()> {
             stream.wait(&slots.refill)?;
             checkpoint.save_rows(
                 &self.state,
                 &self.work.token,
                 self.position,
-                rows,
+                max_rows,
                 &stream,
                 None,
             )?;
-            self.state.set_sequence(
-                &stream,
-                self.position as u32,
-                rows as u32,
-                self.workspace_rows as u32,
-            )?;
-            self.moe_device_decode(&mut decode, &slots, resident, step)?;
-            stream.synchronize()?;
-            checkpoint.restore(&mut self.state, &mut self.work.token, &stream)?;
-            stream.memcpy_htod(&saved_position, &mut self.work.position)?;
-            stream.memcpy_htod(&saved_length, &mut self.work.length)?;
-            self.state.set_sequence(
-                &stream,
-                self.position as u32,
-                rows as u32,
-                self.workspace_rows as u32,
-            )?;
-            stream.synchronize()?;
-            if resident {
-                let graph = record(self, |engine| {
-                    engine.moe_device_decode(&mut decode, &slots, true, step)
-                })?;
-                graph.launch()?;
+            for rows in widths {
+                let step = crate::backend::Step {
+                    rows,
+                    input: if verify {
+                        crate::backend::Input::Ids
+                    } else {
+                        crate::backend::Input::Token
+                    },
+                    mask: crate::backend::Mask::Causal,
+                    head: if verify { Head::All } else { Head::Last },
+                };
+                self.state.set_sequence(
+                    &stream,
+                    self.position as u32,
+                    rows as u32,
+                    self.workspace_rows as u32,
+                )?;
+                self.moe_device_decode(&mut decode, &slots, resident, step)?;
                 stream.synchronize()?;
-                return Ok(Some(graph));
+                checkpoint.restore(&mut self.state, &mut self.work.token, &stream)?;
+                stream.memcpy_htod(&saved_position, &mut self.work.position)?;
+                stream.memcpy_htod(&saved_length, &mut self.work.length)?;
+                self.state.set_sequence(
+                    &stream,
+                    self.position as u32,
+                    rows as u32,
+                    self.workspace_rows as u32,
+                )?;
+                stream.synchronize()?;
+                if resident {
+                    let graph = record(self, |engine| {
+                        engine.moe_device_decode(&mut decode, &slots, true, step)
+                    })?;
+                    graph.launch()?;
+                    stream.synchronize()?;
+                    resident_graphs.insert(rows, graph);
+                } else {
+                    let mut segments = Vec::with_capacity(self.model_spec.layers.len());
+                    for layer in 0..self.model_spec.layers.len() {
+                        let route = record(self, |engine| {
+                            engine.moe_route_segment(layer, &decode, step)
+                        })?;
+                        let contribute = record(self, |engine| {
+                            decode.contribute_device(
+                                &engine.device,
+                                engine.moe_ffn_binding(layer)?,
+                                slots.bindings(layer, &stream)?,
+                                qwen::matrix(
+                                    &engine.work.n,
+                                    &stream,
+                                    0,
+                                    rows,
+                                    engine.model_spec.hidden as usize,
+                                )?,
+                            )?;
+                            Ok(())
+                        })?;
+                        let join =
+                            record(self, |engine| engine.moe_join_segment(layer, &decode, step))?;
+                        segments.push(Segments {
+                            route,
+                            contribute,
+                            join,
+                        });
+                    }
+                    for segment in &segments {
+                        segment.route.launch()?;
+                        segment.contribute.launch()?;
+                        decode.warmup_completion(&self.device, rows)?;
+                        segment.join.launch()?;
+                    }
+                    stream.synchronize()?;
+                    if verify {
+                        decode.verify_segments.insert(rows, segments);
+                    } else {
+                        decode.segments = segments;
+                    }
+                }
+                let logits = if let Some(spec) = &self.spec {
+                    stream.clone_dtoh(&spec.logits.slice(..rows * self.config.vocab_size))?
+                } else {
+                    stream.clone_dtoh(&self.work.logits.slice(..self.config.vocab_size))?
+                };
+                ensure!(
+                    logits.iter().all(|value| value.to_f32().is_finite()),
+                    "nonfinite MoE capture logits"
+                );
+                checkpoint.restore(&mut self.state, &mut self.work.token, &stream)?;
+                stream.memcpy_htod(&saved_position, &mut self.work.position)?;
+                stream.memcpy_htod(&saved_length, &mut self.work.length)?;
+                stream.synchronize()?;
             }
-            for layer in 0..self.model_spec.layers.len() {
-                let route = record(self, |engine| {
-                    engine.moe_route_segment(layer, &decode, step)
-                })?;
-                let contribute = record(self, |engine| {
-                    decode.contribute_device(
-                        &engine.device,
-                        engine.moe_ffn_binding(layer)?,
-                        slots.bindings(layer, &stream)?,
-                        qwen::matrix(
-                            &engine.work.n,
-                            &stream,
-                            0,
-                            rows,
-                            engine.model_spec.hidden as usize,
-                        )?,
-                    )?;
-                    Ok(())
-                })?;
-                let join = record(self, |engine| engine.moe_join_segment(layer, &decode, step))?;
-                decode.segments.push(Segments {
-                    route,
-                    contribute,
-                    join,
-                });
-            }
-            for layer in 0..decode.segments.len() {
-                decode.segments[layer].route.launch()?;
-                decode.segments[layer].contribute.launch()?;
-                decode.warmup_completion(&self.device, rows)?;
-                decode.segments[layer].join.launch()?;
-            }
-            stream.synchronize()?;
-            Ok(None)
+            Ok(())
         })();
-        let result = result.and_then(|graph| {
-            let logits = if let Some(spec) = &self.spec {
-                stream.clone_dtoh(&spec.logits.slice(..rows * self.config.vocab_size))?
-            } else {
-                stream.clone_dtoh(&self.work.logits.slice(..self.config.vocab_size))?
-            };
-            ensure!(
-                logits.iter().all(|value| value.to_f32().is_finite()),
-                "nonfinite MoE capture logits"
-            );
-            Ok(graph)
-        });
         let restored = (|| -> Result<()> {
             checkpoint.restore(&mut self.state, &mut self.work.token, &stream)?;
             stream.memcpy_htod(&saved_position, &mut self.work.position)?;
@@ -322,6 +334,7 @@ impl Engine {
         })();
         if result.is_err() || restored.is_err() {
             decode.segments.clear();
+            decode.verify_segments.clear();
         }
         if let Some(spec) = self.spec.as_mut() {
             spec.checkpoint = Some(checkpoint);
@@ -339,11 +352,11 @@ impl Engine {
             )));
         }
         match result {
-            Ok(graph) => {
+            Ok(()) => {
                 if let Some(spec) = self.spec.as_mut() {
-                    spec.verify_graph = graph;
+                    spec.moe_verify_graphs = resident_graphs;
                 } else {
-                    self.graph = graph;
+                    self.graph = resident_graphs.remove(&1);
                 }
             }
             Err(error) => {
@@ -354,58 +367,43 @@ impl Engine {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(in crate::backend::cuda::engine) fn set_moe_verify_rows(
-        &mut self,
-        rows: usize,
-    ) -> Result<()> {
-        let max_rows = self
-            .spec
-            .as_ref()
-            .context("MoE chain missing")?
-            .draft
-            .config
-            .verify_rows()?;
-        ensure!(
-            (2..=max_rows).contains(&rows),
-            "MoE verify_rows={rows} outside 2..={max_rows}"
-        );
-        if let Some(spec) = self.spec.as_mut() {
-            if spec.verify_rows == rows {
-                return Ok(());
-            }
-            spec.verify_rows = rows;
-            spec.verify_graph = None;
-        }
-        if let Some(decode) = self.moe.as_mut() {
-            decode.segments.clear();
-        }
-        let closure = self.closure.clone();
-        closure.with_test_recapture(|| self.capture_moe())
-    }
-
     pub(in crate::backend::cuda::engine) fn has_moe_segments(&self) -> bool {
-        self.moe.as_ref().is_some_and(|decode| {
-            decode.segments.len() == self.model_spec.layers.len() && !decode.segments.is_empty()
-        })
+        let layers = self.model_spec.layers.len();
+        let Some(decode) = &self.moe else {
+            return false;
+        };
+        if let Some(spec) = &self.spec {
+            (crate::dspark::MIN_MOE_VERIFY_ROWS..=spec.max_verify_rows).all(|rows| {
+                decode
+                    .verify_segments
+                    .get(&rows)
+                    .is_some_and(|s| s.len() == layers && !s.is_empty())
+            })
+        } else {
+            decode.segments.len() == layers && !decode.segments.is_empty()
+        }
     }
 
-    pub(in crate::backend::cuda::engine) fn run_moe_graph(&mut self) -> Result<()> {
+    pub(in crate::backend::cuda::engine) fn has_moe_verify_graphs(&self) -> bool {
+        let Some(spec) = &self.spec else {
+            return false;
+        };
+        (crate::dspark::MIN_MOE_VERIFY_ROWS..=spec.max_verify_rows)
+            .all(|rows| spec.moe_verify_graphs.contains_key(&rows))
+    }
+
+    pub(in crate::backend::cuda::engine) fn run_moe_graph(&mut self, rows: usize) -> Result<()> {
         let mut decode = self.moe.take().context("MoE graph executor missing")?;
         let mut slots = self.moe_slots.take().context("MoE graph slots missing")?;
-        let rows = match &self.spec {
-            Some(spec) => spec.verify_rows,
-            None => 1,
-        };
         let mut token_open = false;
         let result = (|| -> Result<()> {
             if slots.all_resident() {
                 ensure!(slots.request_open, "MoE resident graph has no request");
                 self.device.stream.wait(&slots.refill)?;
                 if let Some(spec) = &self.spec {
-                    spec.verify_graph
-                        .as_ref()
-                        .context("MoE resident verify graph missing")?
+                    spec.moe_verify_graphs
+                        .get(&rows)
+                        .with_context(|| format!("MoE resident verify graph rows={rows} missing"))?
                         .launch()?;
                 } else {
                     self.graph
@@ -426,16 +424,24 @@ impl Engine {
                     );
                 decode.stats[4] += layers;
             } else {
+                let segments = if rows == 1 {
+                    &decode.segments
+                } else {
+                    decode
+                        .verify_segments
+                        .get(&rows)
+                        .with_context(|| format!("MoE verify graph width={rows} missing"))?
+                };
                 ensure!(
-                    decode.segments.len() == self.model_spec.layers.len(),
+                    segments.len() == self.model_spec.layers.len(),
                     "MoE graph layers={} expected={}",
-                    decode.segments.len(),
+                    segments.len(),
                     self.model_spec.layers.len()
                 );
                 slots.begin_token()?;
                 token_open = true;
                 for layer in 0..self.model_spec.layers.len() {
-                    decode.segments[layer].route.launch()?;
+                    decode.segment(rows, layer)?.route.launch()?;
                     let stream = &self.device.stream;
                     let hidden = self.model_spec.hidden as usize;
                     slots.run_graph(

@@ -1464,18 +1464,18 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
     Engine::calibrate(&target, 0, 256, Some(32), settings.clone())?;
     let mut model = Engine::load(&target, 0, 256, Some(32), settings)?;
     let stream = model.device.stream.clone();
-    let (rows, taps) = {
+    let (rows, draft_rows, taps) = {
         let spec = model.spec.as_ref().context("chain draft missing")?;
         (
+            spec.max_verify_rows,
             spec.draft.config.verify_rows()?,
             spec.draft.config.target_layer_ids.clone(),
         )
     };
     ensure!(
-        rows == 16 && model.model_spec.moe.is_some(),
+        rows == 8 && draft_rows == 16 && model.model_spec.moe.is_some(),
         "production block15 MoE fixture required"
     );
-    model.set_moe_verify_rows(rows)?;
     let snapshots = model
         .state
         .gdn
@@ -1499,7 +1499,7 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
         .as_ref()
         .context("chain missing")?
         .draft
-        .snapshot_kv(&mut initial_draft, 0, rows)?;
+        .snapshot_kv(&mut initial_draft, 0, draft_rows)?;
     for layer in 0..model
         .spec
         .as_ref()
@@ -1714,7 +1714,7 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
             spec.checkpoint
                 .as_ref()
                 .context("chain checkpoint missing")?
-                .restore_for_replay(&mut model.state, accepted, &stream)?;
+                .restore_for_replay(&mut model.state, accepted, rows, &stream)?;
             if accepted > 0 && accepted < rows {
                 model.replay_gdn_prefix(prefix, accepted)?;
             }
@@ -1766,7 +1766,7 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
                     .checkpoint
                     .as_ref()
                     .context("chain checkpoint missing")?
-                    .restore_for_replay(&mut model.state, accepted, &stream)?;
+                    .restore_for_replay(&mut model.state, accepted, rows, &stream)?;
                 model.replay_gdn_prefix(prefix, accepted)?;
                 let perturbed_s = stream.clone_dtoh(&model.state.gdn[0].s)?;
                 let perturbed_h = stream.clone_dtoh(&model.state.gdn[0].history)?;
@@ -1829,16 +1829,24 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
         );
     }
     let greedy_taps = stream.clone_htod(&greedy_taps)?;
+    let mut executed_graph_widths = std::collections::BTreeSet::new();
     for graph in [false, true] {
         model.set_spec_graph(graph)?;
-        for (matched, limit, eos) in [
-            (0usize, 16, None),
-            (7, 16, None),
-            (15, 16, None),
-            (15, 1, None),
-            (15, 8, None),
-            (15, 16, Some(greedy[3])),
-            (16, 16, None),
+        for (verify_width, matched, limit, eos) in [
+            (Some(2usize), 1usize, 8usize, None),
+            (Some(3), 2, 8, None),
+            (Some(4), 3, 8, None),
+            (Some(5), 2, 8, None),
+            (Some(5), 4, 8, None),
+            (Some(6), 5, 8, None),
+            (Some(7), 6, 8, None),
+            (Some(8), 0, 8, None),
+            (Some(8), 3, 8, None),
+            (Some(8), 7, 8, None),
+            (Some(8), 7, 1, None),
+            (Some(8), 7, 4, None),
+            (Some(8), 7, 8, Some(greedy[3])),
+            (None, 8, 8, None),
         ] {
             model.reset()?;
             model.prefill(&ids, None)?;
@@ -1853,9 +1861,9 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
             let anchor = model.token()?;
             model.set_token(anchor)?;
             model.set_spec_eos(&eos.into_iter().collect::<Vec<_>>())?;
-            if matched < rows {
-                let mut proposals = greedy[..rows - 1].to_vec();
-                if matched < rows - 1 {
+            if let Some(w) = verify_width {
+                let mut proposals = greedy[..w - 1].to_vec();
+                if matched < w - 1 {
                     proposals[matched] = (proposals[matched] + 1) % model.model_spec.vocab;
                 }
                 model
@@ -1868,15 +1876,31 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
                 super::super::super::profile::Range::new(graph, c"minicpm_chain_graph");
             let round = model.spec_round(limit, None, "chain")?;
             drop(graph_range);
+            let actual_width = round.predictions.len();
+            if let Some(w) = verify_width {
+                ensure!(
+                    actual_width == w,
+                    "Runner FAIL verify width mismatch: got {actual_width} expected {w}"
+                );
+            } else {
+                ensure!(
+                    (crate::dspark::MIN_MOE_VERIFY_ROWS..=rows).contains(&actual_width),
+                    "Runner FAIL dynamic verify width out of range: {actual_width}"
+                );
+            }
+            if graph {
+                executed_graph_widths.insert(actual_width);
+            }
             let committed = round.output.len();
             ensure!(
-                committed > 0 && committed <= rows,
+                committed > 0 && committed <= actual_width,
                 "Runner FAIL transaction committed extent"
             );
-            let mut expected = greedy[..(matched + 1).min(rows).min(limit)].to_vec();
-            if matched == rows {
-                expected.truncate(committed);
-            }
+            let mut expected = if let Some(w) = verify_width {
+                greedy[..(matched + 1).min(w).min(limit)].to_vec()
+            } else {
+                greedy[..committed].to_vec()
+            };
             if let Some(index) = expected.iter().position(|id| Some(*id) == eos) {
                 expected.truncate(index + 1);
             }
@@ -1907,7 +1931,7 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
                 .count();
             let draft = &mut model.spec.as_mut().context("chain missing")?.draft;
             let mut actual = Trace::default();
-            draft.snapshot_kv(&mut actual, ids.len(), rows)?;
+            draft.snapshot_kv(&mut actual, ids.len(), draft_rows)?;
             draft.restore_kv(ids.len(), 0)?;
             draft.inject(
                 &greedy_taps,
@@ -1920,7 +1944,7 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
                 None,
             )?;
             let mut expected_kv = Trace::default();
-            draft.snapshot_kv(&mut expected_kv, ids.len(), rows)?;
+            draft.snapshot_kv(&mut expected_kv, ids.len(), draft_rows)?;
             let mut draft_mismatches = 0;
             for layer in 0..draft.config.num_hidden_layers {
                 for name in [format!("kv_k_{layer}"), format!("kv_v_{layer}")] {
@@ -1939,12 +1963,16 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
                 + draft_mismatches;
             defects += mismatches;
             println!(
-                "{} minicpm_chain_commit graph={graph} matched={matched} limit={limit} eos={eos:?} accepted={} committed={committed} output_mismatches={output_mismatches} boundary_mismatches={boundary_mismatches} state_bit_mismatches={state_mismatches} logits_bit_mismatches={logit_mismatches} draft_kv_bit_mismatches={draft_mismatches}",
+                "{} minicpm_chain_commit graph={graph} verify_width={actual_width} forced={verify_width:?} matched={matched} limit={limit} eos={eos:?} accepted={} committed={committed} output_mismatches={output_mismatches} boundary_mismatches={boundary_mismatches} state_bit_mismatches={state_mismatches} logits_bit_mismatches={logit_mismatches} draft_kv_bit_mismatches={draft_mismatches}",
                 if mismatches == 0 { "PASS" } else { "DEFECT" },
                 round.accepted
             );
         }
     }
+    ensure!(
+        executed_graph_widths == (crate::dspark::MIN_MOE_VERIFY_ROWS..=rows).collect(),
+        "Runner FAIL not all verify widths 2..=8 executed in graph mode: {executed_graph_widths:?}"
+    );
     for graph in [false, true] {
         model.set_spec_graph(graph)?;
         model.reset()?;
@@ -1956,7 +1984,7 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
             .as_ref()
             .context("chain missing")?
             .draft
-            .snapshot_kv(&mut draft_before, ids.len(), rows)?;
+            .snapshot_kv(&mut draft_before, ids.len(), draft_rows)?;
         let pending = model.pending_token;
         let missing = if graph {
             model
@@ -2000,7 +2028,7 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
             );
         let mut draft_after = Trace::default();
         let draft = &model.spec.as_ref().context("chain missing")?.draft;
-        draft.snapshot_kv(&mut draft_after, ids.len(), rows)?;
+        draft.snapshot_kv(&mut draft_after, ids.len(), draft_rows)?;
         for layer in 0..draft.config.num_hidden_layers {
             for name in [format!("kv_k_{layer}"), format!("kv_v_{layer}")] {
                 error_mismatches += draft_before
@@ -2031,7 +2059,7 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
         "Runner FAIL planted gdn_inputs perturbation control was not detected"
     );
     println!(
-        "{} minicpm_chain_verify_end rows=16 prefixes=17,65 accepted=0..16 wrong_layer_mismatches={wrong_layer} perturbed_gdn_mismatches={perturbed_gdn_control} defects={defects}",
+        "{} minicpm_chain_verify_end rows=8 graph_widths=2..=8 prefixes=17,65 accepted=0..8 wrong_layer_mismatches={wrong_layer} perturbed_gdn_mismatches={perturbed_gdn_control} defects={defects}",
         if defects == 0 { "PASS" } else { "DEFECT" }
     );
     ensure!(
@@ -2372,11 +2400,9 @@ fn minicpm_chain_decode_gpu() -> Result<()> {
         let source = SafeTensors::deserialize(&bytes)?;
         inputs.push(Input::read(&source, case)?);
     }
-    let rows = crate::dspark::DraftConfig::read(
-        &draft,
-        &crate::model_spec::ModelSpec::read(&target)?.config(),
-    )?
-    .verify_rows()?;
+    let target_spec = crate::model_spec::ModelSpec::read(&target)?;
+    let rows = crate::dspark::DraftConfig::read(&draft, &target_spec.config())?
+        .target_rows(&target_spec)?;
     let capacity = (inputs
         .iter()
         .map(|input| input.ids.len())
@@ -2818,10 +2844,25 @@ fn chain_decode_timing(cases: &[&str], runs: usize, margins: bool) -> Result<()>
     let slots = (0..model.model_spec.layers.len())
         .map(|layer| slots.slot_count(layer as u32))
         .collect::<Result<Vec<_>>>()?;
+    let operator_bytes = model
+        .qwen
+        .as_ref()
+        .context("chain timing runtime missing")?
+        .allocated_workspace_bytes();
+    let (free, total) = model.device.ctx.mem_get_info()?;
+    let verify_segment_widths = model.moe.as_ref().map_or(0, |m| m.verify_segments.len());
+    let verify_segments: usize = model
+        .moe
+        .as_ref()
+        .map_or(0, |m| m.verify_segments.values().map(|v| v.len() * 3).sum());
     println!(
         "minicpm_chain_timing_plan {}",
         serde_json::json!({"with_draft":with_draft,
-        "capacity":capacity,"slots_per_layer":slots,"setup_seconds":setup_seconds})
+        "capacity":capacity,"slots_per_layer":slots,"gpu_slots":slots.iter().sum::<u32>(),
+        "declared_graphs":model.graphs.len(),"verify_segment_widths":verify_segment_widths,
+        "verify_segments":verify_segments,
+        "allocated_operator_workspace_bytes":operator_bytes,
+        "device_live_bytes_after_setup":total-free,"setup_seconds":setup_seconds})
     );
     let mut defects = 0;
     let margin = |model: &mut Engine| -> Result<f32> {
@@ -2884,14 +2925,19 @@ fn chain_decode_timing(cases: &[&str], runs: usize, margins: bool) -> Result<()>
             );
             let decode_tokens = ids.len() - 1;
             let ms_per_token = seconds * 1000.0 / decode_tokens as f64;
+            let mut k_histogram = std::collections::BTreeMap::new();
+            for round in &rounds {
+                *k_histogram.entry(round.predictions.len()).or_insert(0usize) += 1;
+            }
             defects += usize::from(!same);
             println!(
                 "{} minicpm_chain_decode_timing {}",
                 if same { "PASS" } else { "DEFECT" },
                 serde_json::json!({"case":case,"run":run,"measured":run>0,"with_draft":with_draft,
                     "graph":graph,"seconds":seconds,"prefill_seconds":prefill_seconds,
-                    "tokens":ids.len(),"ids":ids,"rounds":rounds,"decode_tokens":decode_tokens,
-                    "ms_per_token":ms_per_token,"margin_collection":margins,"top2_margins":top2_margins})
+                    "tokens":ids.len(),"ids":ids,"rounds":rounds,"k_histogram":k_histogram,
+                    "decode_tokens":decode_tokens,"ms_per_token":ms_per_token,
+                    "margin_collection":margins,"top2_margins":top2_margins})
             );
             if expected.is_none() {
                 expected = Some(ids);

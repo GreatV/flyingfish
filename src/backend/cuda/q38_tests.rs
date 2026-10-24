@@ -1966,6 +1966,33 @@ fn checkpoint_rejected_prefixes(device: &Device) -> Result<()> {
             stream.clone_dtoh(&state.gdn[0].s.slice(..64))? != image(0, rows / 2, 64),
             "wrong accepted-prefix row escaped the recurrent-state oracle"
         );
+        let sub_verified = 4usize;
+        upload(&mut state, &verified)?;
+        upload_gdn(&mut state, sub_verified)?;
+        checkpoint.restore_for_replay(&mut state, sub_verified, sub_verified, stream)?;
+        ensure!(
+            stream.clone_dtoh(&state.gdn[0].s)? == image(0, sub_verified, state.gdn[0].s.len())
+                && stream.clone_dtoh(&state.gdn[0].history)?
+                    == image(0, sub_verified, state.gdn[0].history.len()),
+            "full acceptance at verified_rows < active_rows clobbered GDN state"
+        );
+        checkpoint.restore_for_replay(&mut state, 2, sub_verified, stream)?;
+        ensure!(
+            stream.clone_dtoh(&state.gdn[0].s)? == image(0, 0, state.gdn[0].s.len())
+                && stream.clone_dtoh(&state.gdn[0].history)?
+                    == image(0, 0, state.gdn[0].history.len()),
+            "partial acceptance at verified_rows < active_rows did not restore origin GDN state"
+        );
+        let restored_k = stream.clone_dtoh(&state.kv[0].k)?;
+        let accepted_slot = (prefix + 1) * dim;
+        let rejected_slot = (prefix + 2) * dim;
+        ensure!(
+            restored_k[accepted_slot..accepted_slot + dim]
+                == verified[accepted_slot..accepted_slot + dim]
+                && restored_k[rejected_slot..rejected_slot + dim]
+                    == original[rejected_slot..rejected_slot + dim],
+            "partial acceptance at verified_rows < active_rows restored wrong KV range"
+        );
     }
     println!(
         "PASS CHECKPOINT_PREFIX S=[15,{},{},{}] history=[15,{},{}] kv=[{},37,{}] window_rows={rows} accepted=0..16 prefixes=5,21 cases={cases} transaction_bytes={bytes} bit_mismatches=0 wrong_prefix_control=true",

@@ -1234,7 +1234,7 @@ fn qwen_target_hidden_capture_gpu() -> Result<()> {
         )?);
         poison_capture(&mut model)?;
         s.memcpy_htod(&graph_ids, &mut model.work.ids.slice_mut(..graph_rows))?;
-        model.launch_spec_graph(SpecPhase::Verify)?;
+        model.launch_spec_graph(SpecPhase::Verify(graph_rows))?;
         let actual = s.clone_dtoh(
             &model
                 .hidden_capture

@@ -1,7 +1,22 @@
 use anyhow::{Result, ensure};
-use cudarc::driver::{CudaStream, DevicePtr, DevicePtrMut, PinnedHostSlice, sys};
+use cudarc::driver::{
+    CudaContext, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, PinnedHostSlice, ValidAsZeroBits,
+    sys,
+};
 use half::bf16;
 use std::sync::Arc;
+
+pub fn pinned_zeros<T: DeviceRepr + ValidAsZeroBits>(
+    context: &Arc<CudaContext>,
+    len: usize,
+) -> Result<PinnedHostSlice<T>> {
+    // SAFETY: flags 0 allocates CPU-readable pinned storage, initialized before creating typed slices.
+    let mut allocation = unsafe { context.alloc_pinned_with_flags(len, 0)? };
+    unsafe {
+        std::ptr::write_bytes(allocation.as_mut_ptr()?, 0, len);
+    }
+    Ok(allocation)
+}
 
 pub fn bits(s: &Arc<CudaStream>, src: &impl DevicePtr<bf16>, dst: &mut Vec<u8>) -> Result<()> {
     for x in s.clone_dtoh(src)? {
