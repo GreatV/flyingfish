@@ -21,6 +21,7 @@ pub struct Ops {
     pub flint_decode_length: CudaFunction,
     pub flint_lm_head_f32: CudaFunction,
     pub residual: CudaFunction,
+    swiglu_rounding: crate::model_spec::SwigluRounding,
 }
 
 impl Ops {
@@ -49,6 +50,17 @@ impl Ops {
         Ok(())
     }
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
+        Self::new_with_swiglu_rounding(ctx, crate::model_spec::SwigluRounding::Twice)
+    }
+
+    pub fn swiglu_rounding(&self) -> crate::model_spec::SwigluRounding {
+        self.swiglu_rounding
+    }
+
+    pub fn new_with_swiglu_rounding(
+        ctx: &Arc<CudaContext>,
+        swiglu_rounding: crate::model_spec::SwigluRounding,
+    ) -> Result<Self> {
         let embed = cubin::module(ctx, "embed")?;
         let embed_rmsnorm = cubin::module(ctx, "embed_rmsnorm")?;
         let norm = cubin::module(ctx, "norm")?;
@@ -75,6 +87,7 @@ impl Ops {
             flint_decode_length: sample.load_function("flint_decode_length")?,
             flint_lm_head_f32: sample.load_function("lm_head_f32")?,
             residual: norm.load_function("residual")?,
+            swiglu_rounding,
         })
     }
 
@@ -191,6 +204,7 @@ pub(crate) struct NormOps {
 pub(crate) struct GateOps {
     gate: CudaFunction,
     gelu: CudaFunction,
+    swiglu_rounding: crate::model_spec::SwigluRounding,
 }
 #[derive(Clone)]
 pub(crate) struct CommonOpsRef {
@@ -199,6 +213,13 @@ pub(crate) struct CommonOpsRef {
 }
 impl CommonOpsRef {
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
+        Self::new_with_swiglu_rounding(ctx, crate::model_spec::SwigluRounding::Twice)
+    }
+
+    pub fn new_with_swiglu_rounding(
+        ctx: &Arc<CudaContext>,
+        swiglu_rounding: crate::model_spec::SwigluRounding,
+    ) -> Result<Self> {
         let module = cubin::module(ctx, "q38_common")?;
         Ok(Self {
             norm: Arc::new(NormOps {
@@ -208,6 +229,7 @@ impl CommonOpsRef {
             gate: Arc::new(GateOps {
                 gate: module.load_function("q38_gate")?,
                 gelu: module.load_function("q38_gelu")?,
+                swiglu_rounding,
             }),
         })
     }
@@ -719,6 +741,10 @@ impl GateOps {
             blocks <= i32::MAX as u32 && rows.row_capacity <= u16::MAX as u32,
             "SwiGLU grid outside CUDA limits"
         );
+        let mode = match self.swiglu_rounding {
+            crate::model_spec::SwigluRounding::Twice => 2,
+            crate::model_spec::SwigluRounding::Once => 3,
+        };
         unsafe {
             stream
                 .launch_builder(&self.gate)
@@ -739,7 +765,7 @@ impl GateOps {
                 .arg(&y.0.stride[0])
                 .arg(&y.0.stride[1])
                 .arg(&y.0.stride[2])
-                .arg(&2i32)
+                .arg(&mode)
                 .launch(LaunchConfig {
                     grid_dim: (blocks, rows.row_capacity, 1),
                     block_dim: (256, 1, 1),

@@ -30,6 +30,16 @@ pub enum RouterScore {
     Softmax,
     Sigmoid,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SwigluRounding {
+    Twice,
+    Once,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoutedWeightBoundary {
+    AfterDownBf16,
+    BeforeContributionBf16,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum LinearFormat {
     Bf16,
@@ -893,6 +903,24 @@ impl TextGeometry {
 }
 
 impl ModelSpec {
+    pub fn swiglu_rounding(&self) -> SwigluRounding {
+        match self.architecture {
+            Architecture::Flint => SwigluRounding::Once,
+            Architecture::Llama | Architecture::Qwen35Text | Architecture::MiniCpmV47 => {
+                SwigluRounding::Twice
+            }
+        }
+    }
+
+    pub fn routed_weight_boundary(&self) -> RoutedWeightBoundary {
+        match self.architecture {
+            Architecture::Flint => RoutedWeightBoundary::BeforeContributionBf16,
+            Architecture::Llama | Architecture::Qwen35Text | Architecture::MiniCpmV47 => {
+                RoutedWeightBoundary::AfterDownBf16
+            }
+        }
+    }
+
     /// `Config` view for the model/CLI surface; does not relax Config::read's Llama validation.
     pub fn config(&self) -> crate::config::Config {
         crate::config::Config {

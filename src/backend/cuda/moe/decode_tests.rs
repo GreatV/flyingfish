@@ -391,6 +391,9 @@ fn invariant_decode(device: &Device) -> Result<()> {
                             slot_layout,
                             hidden: &fx.x[r * h..(r + 1) * h],
                             routing: weights[a],
+
+                            rounding: crate::model_spec::SwigluRounding::Twice,
+                            routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                         },
                         output,
                         &mut cpu_scratch,
@@ -410,6 +413,9 @@ fn invariant_decode(device: &Device) -> Result<()> {
                             },
                             hidden: &fx.x[r * h..(r + 1) * h],
                             routing: weights[a],
+
+                            rounding: crate::model_spec::SwigluRounding::Twice,
+                            routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                         },
                         output,
                         &mut cpu_scratch,

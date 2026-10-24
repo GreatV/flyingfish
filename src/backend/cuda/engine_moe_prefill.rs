@@ -1444,6 +1444,60 @@ impl Engine {
                             prefix,
                             skip,
                         });
+                        let route_ids = prefill.gpu.host_ids.as_slice()?
+                            [..rows * prefill.geometry.top_k as usize]
+                            .to_vec();
+                        let route_weights = prefill.gpu.host_weights.as_slice()?
+                            [..rows * prefill.geometry.top_k as usize]
+                            .to_vec();
+                        let route_cpu = route_ids
+                            .iter()
+                            .map(|expert| {
+                                u8::from(prefill.gpu.cpu_arithmetic[*expert as usize]) as f32
+                            })
+                            .collect::<Vec<_>>();
+                        if let Some(target) = target.as_mut() {
+                            target.trace.add(
+                                format!("{layer}.moe.ids"),
+                                vec![rows, prefill.geometry.top_k as usize],
+                                route_ids.iter().map(|value| *value as f32).collect(),
+                            )?;
+                            target.trace.add(
+                                format!("{layer}.moe.weights"),
+                                vec![rows, prefill.geometry.top_k as usize],
+                                route_weights.iter().map(|value| value.to_f32()).collect(),
+                            )?;
+                            target.trace.add(
+                                format!("{layer}.moe.cpu"),
+                                vec![rows, prefill.geometry.top_k as usize],
+                                route_cpu,
+                            )?;
+                            let span = prefill
+                                .span
+                                .as_ref()
+                                .context("prefill contribution trace has no borrowed span")?;
+                            let choices = rows * prefill.geometry.top_k as usize;
+                            let values = choices * self.model_spec.hidden as usize;
+                            let mut contributions = vec![bf16::ZERO; values];
+                            // SAFETY: the live span covers this whole routed contribution prefix.
+                            unsafe {
+                                result::memcpy_dtoh_async(
+                                    &mut contributions,
+                                    span.contributions(base as u32, rows as u32)?.ptr,
+                                    self.device.stream.cu_stream(),
+                                )?;
+                            }
+                            self.device.stream.synchronize()?;
+                            target.trace.add(
+                                format!("{layer}.moe.contributions"),
+                                vec![
+                                    rows,
+                                    prefill.geometry.top_k as usize,
+                                    self.model_spec.hidden as usize,
+                                ],
+                                contributions.iter().map(|value| value.to_f32()).collect(),
+                            )?;
+                        }
                         let name = if all_layers {
                             format!("{layer}.ffn")
                         } else {
@@ -2128,6 +2182,7 @@ mod tests {
                 .arg(&silu_device.device_ptr(stream).0)
                 .arg(&65536i32)
                 .arg(&1i32)
+                .arg(&0i32)
                 .launch(crate::backend::cuda::ops::grid(256, 256))?;
         }
         let silu_map = stream.clone_dtoh(&silu_device)?;
@@ -2136,9 +2191,9 @@ mod tests {
             .enumerate()
             .filter(|(bits, actual)| {
                 let value = bf16::from_bits(*bits as u16).to_f32();
+                let silu = value * (1.0 / (1.0 + (-value).exp()));
                 value.is_finite()
-                    && actual.to_bits()
-                        != bf16::from_f32(value * (1.0 / (1.0 + (-value).exp()))).to_bits()
+                    && actual.to_bits() != bf16::from_f32(f32::from(bf16::from_f32(silu))).to_bits()
             })
             .count();
         ensure!(
@@ -2421,6 +2476,9 @@ mod tests {
                             weights: &weights[0],
                             hidden: &x[row * hidden..(row + 1) * hidden],
                             routing: bf16::ONE,
+
+                            rounding: crate::model_spec::SwigluRounding::Twice,
+                            routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                         },
                         &mut cpu_row,
                         &mut cpu_scratch,
@@ -3146,6 +3204,9 @@ mod tests {
                             slot_layout,
                             hidden,
                             routing: weight,
+
+                            rounding: crate::model_spec::SwigluRounding::Twice,
+                            routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                         },
                         out,
                         &mut cpu_scratch,
@@ -3159,6 +3220,9 @@ mod tests {
                             weights: &native,
                             hidden,
                             routing: weight,
+
+                            rounding: crate::model_spec::SwigluRounding::Twice,
+                            routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                         },
                         out,
                         &mut cpu_scratch,

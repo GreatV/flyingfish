@@ -99,7 +99,9 @@ __device__ __forceinline__ void moe_gate_up(
     const unsigned long long* __restrict__ assignment_gen,
     const bf16* __restrict__ shared_gate, const bf16* __restrict__ shared_up,
     bf16* __restrict__ h, bf16* __restrict__ h_shared,
-    int rows, int experts, int top_k, int hidden, int inter, int shared_inter) {
+    int rows, int experts, int top_k, int hidden, int inter, int shared_inter,
+    int rounding_once) {
+  if ((unsigned)rounding_once > 1u) __trap();
   constexpr int lanes = INVARIANT ? 16 : LANES;
   if constexpr (INVARIANT) {
     if (blockDim.x != GU_NT || gridDim.y != rows || gridDim.z != top_k ||
@@ -193,10 +195,11 @@ __device__ __forceinline__ void moe_gate_up(
     const float activation = INVARIANT
         ? __fmul_rn(g, __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-g))))
         : moe_silu(g);
-    const float s = __bfloat162float(__float2bfloat16(activation));
     bf16* out = seg == top_k ? h_shared + (size_t)r * shared_inter
                              : h + ((size_t)r * top_k + seg) * inter;
-    out[j] = __float2bfloat16(s * u);
+    out[j] = rounding_once
+        ? __float2bfloat16(activation * u)
+        : __float2bfloat16(__bfloat162float(__float2bfloat16(activation)) * u);
   }
 }
 
@@ -212,7 +215,9 @@ __device__ __forceinline__ void moe_down(
     const bf16* __restrict__ shared_down,
     bf16* __restrict__ contributions, bf16* __restrict__ shared_out,
     unsigned* __restrict__ done,
-    int rows, int experts, int top_k, int hidden, int inter, int shared_inter) {
+    int rows, int experts, int top_k, int hidden, int inter, int shared_inter,
+    int routed_weight_fp32) {
+  if ((unsigned)routed_weight_fp32 > 1u) __trap();
   constexpr int lanes = INVARIANT ? 16 : LANES;
   if constexpr (INVARIANT) {
     if (blockDim.x != DN_NT || gridDim.y != rows || gridDim.z != top_k ||
@@ -280,10 +285,13 @@ __device__ __forceinline__ void moe_down(
   }
   acc = INVARIANT ? moe_pairwise16(acc, tid) : moe_group_sum(acc);
   if (lane == 0 && d < hidden && live) {
-    const float lin = __bfloat162float(__float2bfloat16(acc));
     bf16* out = routed ? contributions + ((size_t)r * top_k + seg) * (size_t)hidden
                        : shared_out + (size_t)r * (size_t)hidden;
-    out[d] = routed ? __float2bfloat16(lin * wk) : __float2bfloat16(lin);
+    out[d] = routed
+        ? __float2bfloat16(routed_weight_fp32
+                               ? acc * wk
+                               : __bfloat162float(__float2bfloat16(acc)) * wk)
+        : __float2bfloat16(__bfloat162float(__float2bfloat16(acc)));
   }
 }
 
@@ -296,8 +304,9 @@ extern "C" __global__ void __launch_bounds__(GU_NT) moe_ffn_gate_up(
     const unsigned long long* __restrict__ assignment_gen,
     const bf16* __restrict__ shared_gate, const bf16* __restrict__ shared_up,
     bf16* __restrict__ h, bf16* __restrict__ h_shared,
-    int rows, int experts, int top_k, int hidden, int inter, int shared_inter) {
-  moe_gate_up<false>(x, ids, active, slots_gate_up, slot_valid, slot_generation, assignment_gen, shared_gate, shared_up, h, h_shared, rows, experts, top_k, hidden, inter, shared_inter);
+    int rows, int experts, int top_k, int hidden, int inter, int shared_inter,
+    int rounding_once) {
+  moe_gate_up<false>(x, ids, active, slots_gate_up, slot_valid, slot_generation, assignment_gen, shared_gate, shared_up, h, h_shared, rows, experts, top_k, hidden, inter, shared_inter, rounding_once);
 }
 
 extern "C" __global__ void __launch_bounds__(GU_NT) moe_ffn_gate_up_w8a16(
@@ -309,8 +318,9 @@ extern "C" __global__ void __launch_bounds__(GU_NT) moe_ffn_gate_up_w8a16(
     const unsigned long long* __restrict__ assignment_gen,
     const bf16* __restrict__ shared_gate, const bf16* __restrict__ shared_up,
     bf16* __restrict__ h, bf16* __restrict__ h_shared,
-    int rows, int experts, int top_k, int hidden, int inter, int shared_inter) {
-  moe_gate_up<true>(x, ids, active, slots_gate_up, slot_valid, slot_generation, assignment_gen, shared_gate, shared_up, h, h_shared, rows, experts, top_k, hidden, inter, shared_inter);
+    int rows, int experts, int top_k, int hidden, int inter, int shared_inter,
+    int rounding_once) {
+  moe_gate_up<true>(x, ids, active, slots_gate_up, slot_valid, slot_generation, assignment_gen, shared_gate, shared_up, h, h_shared, rows, experts, top_k, hidden, inter, shared_inter, rounding_once);
 }
 
 extern "C" __global__ void __launch_bounds__(DN_NT) moe_ffn_down(
@@ -324,8 +334,9 @@ extern "C" __global__ void __launch_bounds__(DN_NT) moe_ffn_down(
     const bf16* __restrict__ shared_down,
     bf16* __restrict__ contributions, bf16* __restrict__ shared_out,
     unsigned* __restrict__ done,
-    int rows, int experts, int top_k, int hidden, int inter, int shared_inter) {
-  moe_down<false>(h, h_shared, ids, active, weights, slots_down, slot_valid, slot_generation, assignment_gen, shared_down, contributions, shared_out, done, rows, experts, top_k, hidden, inter, shared_inter);
+    int rows, int experts, int top_k, int hidden, int inter, int shared_inter,
+    int routed_weight_fp32) {
+  moe_down<false>(h, h_shared, ids, active, weights, slots_down, slot_valid, slot_generation, assignment_gen, shared_down, contributions, shared_out, done, rows, experts, top_k, hidden, inter, shared_inter, routed_weight_fp32);
 }
 
 extern "C" __global__ void __launch_bounds__(DN_NT) moe_ffn_down_w8a16(
@@ -339,8 +350,9 @@ extern "C" __global__ void __launch_bounds__(DN_NT) moe_ffn_down_w8a16(
     const bf16* __restrict__ shared_down,
     bf16* __restrict__ contributions, bf16* __restrict__ shared_out,
     unsigned* __restrict__ done,
-    int rows, int experts, int top_k, int hidden, int inter, int shared_inter) {
-  moe_down<true>(h, h_shared, ids, active, weights, slots_down, slot_valid, slot_generation, assignment_gen, shared_down, contributions, shared_out, done, rows, experts, top_k, hidden, inter, shared_inter);
+    int rows, int experts, int top_k, int hidden, int inter, int shared_inter,
+    int routed_weight_fp32) {
+  moe_down<true>(h, h_shared, ids, active, weights, slots_down, slot_valid, slot_generation, assignment_gen, shared_down, contributions, shared_out, done, rows, experts, top_k, hidden, inter, shared_inter, routed_weight_fp32);
 }
 
 #define MOE_INVARIANT_GU(NAME, WORD, FP8) \
@@ -349,9 +361,11 @@ extern "C" __global__ void __launch_bounds__(GU_NT) NAME( \
     const WORD* const* slots, const unsigned* valid, \
     const unsigned long long* generation, const unsigned long long* assigned, \
     const bf16* shared_gate, const bf16* shared_up, bf16* h, bf16* hs, \
-    int rows, int experts, int top_k, int hidden, int inter, int shared_inter) { \
+    int rows, int experts, int top_k, int hidden, int inter, int shared_inter, \
+    int rounding_once) { \
   moe_gate_up<FP8, true>(x, ids, active, slots, valid, generation, assigned, \
-      shared_gate, shared_up, h, hs, rows, experts, top_k, hidden, inter, shared_inter); \
+      shared_gate, shared_up, h, hs, rows, experts, top_k, hidden, inter, \
+      shared_inter, rounding_once); \
 }
 #define MOE_INVARIANT_DOWN(NAME, WORD, FP8) \
 extern "C" __global__ void __launch_bounds__(DN_NT) NAME( \
@@ -359,9 +373,11 @@ extern "C" __global__ void __launch_bounds__(DN_NT) NAME( \
     const bf16* weights, const WORD* const* slots, const unsigned* valid, \
     const unsigned long long* generation, const unsigned long long* assigned, \
     const bf16* shared_down, bf16* contributions, bf16* shared_out, unsigned* done, \
-    int rows, int experts, int top_k, int hidden, int inter, int shared_inter) { \
+    int rows, int experts, int top_k, int hidden, int inter, int shared_inter, \
+    int routed_weight_fp32) { \
   moe_down<FP8, true>(h, hs, ids, active, weights, slots, valid, generation, assigned, \
-      shared_down, contributions, shared_out, done, rows, experts, top_k, hidden, inter, shared_inter); \
+      shared_down, contributions, shared_out, done, rows, experts, top_k, hidden, inter, \
+      shared_inter, routed_weight_fp32); \
 }
 MOE_INVARIANT_GU(moe_ffn_gate_up_lane16, bf16, false)
 MOE_INVARIANT_DOWN(moe_ffn_down_lane16, bf16, false)

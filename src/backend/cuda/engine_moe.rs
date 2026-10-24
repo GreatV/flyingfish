@@ -377,28 +377,34 @@ impl Setup {
                 catalogue: self.catalogue,
                 engines: self.measured.copy_engines,
                 max_rows: u32::try_from(cpu.0.max(self.decode_rows))?,
+                swiglu_rounding: engine.model_spec.swiglu_rounding(),
+                routed_weight: engine.model_spec.routed_weight_boundary(),
             },
         )?;
         let slots_load_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
         let phase_started = std::time::Instant::now();
         engine.moe = Some(Decode::new(
             &engine.device,
-            geometry,
-            self.decode_rows,
-            self.capacity.worker_count,
-            (
-                cpu.0.max(self.decode_rows),
-                cpu.1.max(self.decode_rows * geometry.top_k as usize),
-            ),
-            engine
-                .model_spec
-                .expert_format
-                .context("MoE expert_format missing")?,
-            engine
-                .model_spec
-                .moe
-                .context("MoE shared geometry missing")?
-                .shared_intermediate,
+            DecodeOptions {
+                geometry,
+                max_rows: self.decode_rows,
+                workers: self.capacity.worker_count,
+                cpu_bounds: (
+                    cpu.0.max(self.decode_rows),
+                    cpu.1.max(self.decode_rows * geometry.top_k as usize),
+                ),
+                format: engine
+                    .model_spec
+                    .expert_format
+                    .context("MoE expert_format missing")?,
+                shared_intermediate: engine
+                    .model_spec
+                    .moe
+                    .context("MoE shared geometry missing")?
+                    .shared_intermediate,
+                swiglu_rounding: engine.model_spec.swiglu_rounding(),
+                routed_weight: engine.model_spec.routed_weight_boundary(),
+            },
         )?);
         let decode_new_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
         let phase_started = std::time::Instant::now();
@@ -461,7 +467,11 @@ impl Engine {
         );
         self.blas
             .bind_invariant(&self.device.ctx, crate::linear_plan::MAX_SKINNY_ROWS)?;
-        executor.contribute = DecodeOps::new_invariant(&self.device.ctx)?;
+        executor.contribute = DecodeOps::new_invariant_with_boundaries(
+            &self.device.ctx,
+            self.model_spec.swiglu_rounding(),
+            self.model_spec.routed_weight_boundary(),
+        )?;
         eprintln!(
             "draft_target_arithmetic lane16_routed=true skinny_shared=true skinny_typed=true rows={}",
             crate::linear_plan::MAX_SKINNY_ROWS
@@ -615,16 +625,29 @@ impl Drop for Decode {
     }
 }
 
+pub struct DecodeOptions {
+    pub geometry: ExpertGeometry,
+    pub max_rows: usize,
+    pub workers: u32,
+    pub cpu_bounds: (usize, usize),
+    pub format: crate::model_spec::ExpertFormat,
+    pub shared_intermediate: u32,
+    pub swiglu_rounding: crate::model_spec::SwigluRounding,
+    pub routed_weight: crate::model_spec::RoutedWeightBoundary,
+}
+
 impl Decode {
-    pub fn new(
-        device: &Device,
-        geometry: ExpertGeometry,
-        max_rows: usize,
-        workers: u32,
-        cpu_bounds: (usize, usize),
-        format: crate::model_spec::ExpertFormat,
-        shared_intermediate: u32,
-    ) -> Result<Self> {
+    pub fn new(device: &Device, options: DecodeOptions) -> Result<Self> {
+        let DecodeOptions {
+            geometry,
+            max_rows,
+            workers,
+            cpu_bounds,
+            format,
+            shared_intermediate,
+            swiglu_rounding,
+            routed_weight,
+        } = options;
         ensure!(
             (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&max_rows),
             "MoE decode row bound={max_rows} exceeds skinny bound={}",
@@ -659,8 +682,13 @@ impl Decode {
             max_rows,
             phase: DecodePhase::default(),
             route: RouteOps::new(context, stream)?,
-            contribute: DecodeOps::new(context)?,
-            prefill: PrefillOps::new(context, stream, format)?,
+            contribute: DecodeOps::new_with_boundaries(context, swiglu_rounding, routed_weight)?,
+            prefill: PrefillOps::new_with_swiglu_rounding(
+                context,
+                stream,
+                format,
+                swiglu_rounding,
+            )?,
             combine: CombineOps::new(context)?,
             ids: stream.alloc_zeros(choices)?,
             weights: stream.alloc_zeros(choices)?,
@@ -693,12 +721,14 @@ impl Decode {
             reader: Arc::new(context.new_event(None)?),
             mask: super::super::cubin::module(context, "moe_route")?
                 .load_function("moe_route_mask")?,
-            pool: ExpertPool::new(
+            pool: ExpertPool::new_with_boundaries(
                 workers as usize,
                 Shape::new(geometry.hidden as usize, geometry.intermediate as usize)?,
                 cpu_bounds.0,
                 cpu_bounds.1,
                 layout.fp8_slot().cloned(),
+                swiglu_rounding,
+                routed_weight,
             )?,
             stats: [0; 5],
         };
