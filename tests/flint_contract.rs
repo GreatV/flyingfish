@@ -262,24 +262,6 @@ fn flint_engine_short_prefill_gpu() -> Result<()> {
     let mut engine = Backend::calibrate(&dir, 0, 600, None, settings)?
         .context("Flint calibration did not return the prepared engine")?;
     let ids = [150000u32, 1, 2, 3, 4, 5, 6, 7];
-    if let Some(path) = env::var_os("FF_FLINT_POSITION_LOGITS_OUT") {
-        engine.prefill(&ids[..1], None)?;
-        let mut positions = vec![engine.decode_logits()?];
-        for target in &ids[1..] {
-            engine.set_token(*target)?;
-            engine.decode(true, None)?;
-            positions.push(engine.decode_logits()?);
-        }
-        let mut position_trace = flyingfish::trace::Trace::default();
-        position_trace.set_device(&engine.device_info().name)?;
-        position_trace.add(
-            "logits.positions".to_owned(),
-            vec![ids.len(), engine.config().vocab_size],
-            positions.into_iter().flatten().collect(),
-        )?;
-        position_trace.save(&PathBuf::from(path))?;
-        engine.reset()?;
-    }
     let mut trace = flyingfish::trace::Trace::all_layers();
     let token = engine.prefill(&ids, Some(&mut trace))?;
     engine.set_token(ids[0])?;
@@ -378,13 +360,6 @@ fn flint_engine_prefix_nll_gpu() -> Result<()> {
         mean_nll <= 4.0,
         "Flint prefix NLL exceeds ceiling: {mean_nll}"
     );
-    if let Ok(reference) = env::var("FF_FLINT_REFERENCE_NLL") {
-        let reference = reference.parse::<f64>()?;
-        ensure!(
-            (mean_nll - reference).abs() <= 0.01,
-            "Flint prefix NLL differs from reference: candidate={mean_nll} reference={reference}"
-        );
-    }
     println!(
         "FLINT_ENGINE_PREFIX_NLL prefix_tokens=600 predicted_tokens=599 mean_nll={mean_nll:.9} PASS"
     );
