@@ -199,12 +199,6 @@ impl SpanPlan {
             2 | 6 | 10 | 14 => 8,
             _ => 16,
         };
-        ensure!(
-            self.wave_rows.is_multiple_of(row_alignment) || self.span_rows == 1,
-            "wave rows {} cannot align {}-byte choice rows",
-            self.wave_rows,
-            weight_row_bytes
-        );
         self.expert_cohort.fill(u16::MAX);
         for &expert in &self.resident {
             self.expert_cohort[expert as usize] = 0;
@@ -1196,6 +1190,36 @@ mod tests {
         flint_plan.update(&flint_counts, &flint_resident, 1, 1, &rates)?;
         flint_plan.pack_waves(&flint_counts, &flint_decode_ids)?;
         assert_eq!(flint_plan.cohort_waves(0)?, &[(0, 1, 6)]);
+
+        for (top_k, span_rows, wave_rows, expected) in [
+            (6u32, 1u32, 1u32, vec![(0u32, 1u32, 6u32)]),
+            (6, 2, 2, vec![(0, 2, 12)]),
+            (6, 3, 3, vec![(0, 3, 18)]),
+            (6, 5, 4, vec![(0, 4, 24), (4, 1, 6)]),
+            (8, 2, 2, vec![(0, 2, 16)]),
+        ] {
+            let geometry = ExpertGeometry {
+                first_layer: 0,
+                layers: 1,
+                experts: 8,
+                hidden: 8,
+                intermediate: 4,
+                top_k,
+            };
+            let counts = [span_rows * top_k, 0, 0, 0, 0, 0, 0, 0];
+            let resident = [true, false, false, false, false, false, false, false];
+            let ids = vec![0i32; span_rows as usize * top_k as usize];
+            let mut plan = planner(&geometry, 2, &rates)?;
+            plan.update(&counts, &resident, span_rows, wave_rows, &rates)?;
+            plan.pack_waves(&counts, &ids)?;
+            assert_eq!(plan.cohort_waves(0)?, &expected[..]);
+            assert!(
+                expected
+                    .iter()
+                    .all(|&(base, _, _)| (base * top_k * 2).is_multiple_of(16)),
+                "top-k-{top_k} wave bases must keep choice rows aligned"
+            );
+        }
 
         let span_16k = 16_320u32;
         let mut ids_16k = Vec::with_capacity(span_16k as usize * top_k);

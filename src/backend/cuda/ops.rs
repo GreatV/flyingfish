@@ -888,6 +888,45 @@ impl GateOps {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::ensure;
+
+    #[test]
+    #[ignore = "GPU window; FF_Q38_GPU_WINDOW=granted required"]
+    fn argmax_f32_covers_all_launch_warps_gpu() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let device = super::super::Device::new(0)?;
+        let stream = &device.stream;
+        let ops = Ops::new(&device.ctx)?;
+        let vocab = 150_144;
+
+        let mut unique = vec![0f32; vocab];
+        unique[300] = 1.0;
+        let logits = stream.clone_htod(&unique)?;
+        let mut token = stream.alloc_zeros::<u32>(1)?;
+        ops.argmax_f32(stream, &logits, &mut token)?;
+        let actual = stream.clone_dtoh(&token)?[0];
+        ensure!(actual == 300, "warp-9 argmax mismatch: {actual}");
+
+        let mut tied = vec![0f32; vocab];
+        tied[200] = 1.0;
+        tied[1200] = 1.0;
+        let logits = stream.clone_htod(&tied)?;
+        let mut token = stream.alloc_zeros::<u32>(1)?;
+        ops.argmax_f32(stream, &logits, &mut token)?;
+        let actual = stream.clone_dtoh(&token)?[0];
+        ensure!(actual == 200, "tied argmax mismatch: {actual}");
+
+        println!("ARGMAX_F32 unique=300 tie=200 PASS");
+        Ok(())
+    }
+}
+
 /// Stateless activation choice; callers include this in their plan identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(i32)]

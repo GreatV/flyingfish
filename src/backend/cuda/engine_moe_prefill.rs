@@ -18,6 +18,14 @@ use std::ops::Range;
 mod prefetch;
 use prefetch::ReadAhead;
 
+fn route_trace_prefix(all_layers: bool, prefix: &str, layer: usize, base: usize) -> String {
+    if all_layers {
+        format!("{prefix}.{layer}.wave.{base}")
+    } else {
+        prefix.to_owned()
+    }
+}
+
 struct Span {
     base: u64,
     layout: ExpertSpanLayout,
@@ -1459,18 +1467,20 @@ impl Engine {
                             })
                             .collect::<Vec<_>>();
                         if let Some(target) = target.as_mut() {
+                            let route_prefix =
+                                route_trace_prefix(target.trace.all_layers, prefix, layer, base);
                             target.trace.add(
-                                format!("{layer}.moe.ids"),
+                                format!("{route_prefix}.moe.ids"),
                                 vec![rows, prefill.geometry.top_k as usize],
                                 route_ids.iter().map(|value| *value as f32).collect(),
                             )?;
                             target.trace.add(
-                                format!("{layer}.moe.weights"),
+                                format!("{route_prefix}.moe.weights"),
                                 vec![rows, prefill.geometry.top_k as usize],
                                 route_weights.iter().map(|value| value.to_f32()).collect(),
                             )?;
                             target.trace.add(
-                                format!("{layer}.moe.cpu"),
+                                format!("{route_prefix}.moe.cpu"),
                                 vec![rows, prefill.geometry.top_k as usize],
                                 route_cpu,
                             )?;
@@ -1491,7 +1501,7 @@ impl Engine {
                             }
                             self.device.stream.synchronize()?;
                             target.trace.add(
-                                format!("{layer}.moe.contributions"),
+                                format!("{route_prefix}.moe.contributions"),
                                 vec![
                                     rows,
                                     prefill.geometry.top_k as usize,
@@ -2068,6 +2078,18 @@ mod tests {
     use crate::cpu::expert_ffn::{
         Contribution, Fp8Contribution, Isa, Scratch, contribution, fp8_contribution,
     };
+
+    #[test]
+    fn route_trace_names_include_the_wave() -> Result<()> {
+        let mut trace = Trace::default();
+        for base in [0, 256] {
+            let prefix = route_trace_prefix(true, "layer", 13, base);
+            assert_eq!(prefix, format!("layer.13.wave.{base}"));
+            trace.add(format!("{prefix}.moe.ids"), vec![1, 6], vec![1.0; 6])?;
+        }
+        assert_eq!(route_trace_prefix(false, "prefill.2", 13, 256), "prefill.2");
+        Ok(())
+    }
 
     fn reserves(geometry: ExpertGeometry) -> Reserves {
         Reserves {

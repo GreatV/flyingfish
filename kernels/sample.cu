@@ -111,8 +111,8 @@ extern "C" __global__ void argmax_f32(const float* logits, uint32_t* token, int 
       id = other_id;
     }
   }
-  __shared__ float best_red[8];
-  __shared__ uint32_t id_red[8];
+  __shared__ float best_red[32];
+  __shared__ uint32_t id_red[32];
   if ((tid & 31) == 0) {
     best_red[tid >> 5] = best;
     id_red[tid >> 5] = id;
