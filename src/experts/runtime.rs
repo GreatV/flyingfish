@@ -267,8 +267,9 @@ impl Residency {
         );
         let slot_bytes = capacity.slot_bytes();
         let cap = admission.hard_cap(slot_bytes)?;
-        let reserve = if u64::from(capacity.host_blocks)
-            == u64::from(geometry.layers) * u64::from(geometry.experts)
+        let routed = u64::from(geometry.layers) * u64::from(geometry.experts);
+        let reserve = if u64::from(capacity.slots_total()) == routed
+            || u64::from(capacity.host_blocks) == routed
         {
             0
         } else if capacity.host_blocks > 0 {

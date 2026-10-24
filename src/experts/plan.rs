@@ -467,11 +467,11 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
     );
     let slots_per_layer = equal_slots(total_slots, geometry.layers)?;
     let host_block_slots = host_expert_bytes / slot_bytes;
+    let non_gpu = routed_slots - total_slots;
     ensure!(
-        host_block_slots >= u64::from(admission_cap),
+        non_gpu == 0 || host_block_slots >= u64::from(admission_cap),
         "host blocks {host_block_slots} cannot hold {admission_cap} reserve blocks"
     );
-    let non_gpu = routed_slots - total_slots;
     let headroom = span_borrow_slots(
         inputs.reserves,
         slot_bytes,
@@ -481,30 +481,35 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
     let host_target = non_gpu
         .checked_add(u64::from(headroom))
         .context("host headroom overflow")?;
-    let mut reserve = admission_cap;
-    let mut host_blocks = (host_block_slots - u64::from(reserve)).min(host_target);
-    if host_blocks > 0 && reserve == 0 {
-        if host_block_slots > 1 {
-            reserve = 1;
-            host_blocks = (host_block_slots - 1).min(host_target);
-        } else {
-            host_blocks = 0;
+    let (host_blocks, reserve) = if non_gpu == 0 {
+        (host_block_slots.min(host_target), 0)
+    } else {
+        let mut reserve = admission_cap;
+        let mut host_blocks = (host_block_slots - u64::from(reserve)).min(host_target);
+        if host_blocks > 0 && reserve == 0 {
+            if host_block_slots > 1 {
+                reserve = 1;
+                host_blocks = (host_block_slots - 1).min(host_target);
+            } else {
+                host_blocks = 0;
+            }
         }
-    }
-    let partial_bytes = host_blocks
-        .checked_add(u64::from(reserve))
-        .and_then(|blocks| blocks.checked_mul(slot_bytes))
-        .context("partial host arena bytes overflow")?;
-    let backed_bytes = routed_slots
-        .checked_mul(slot_bytes)
-        .context("complete host arena bytes overflow")?;
-    if routed_slots <= host_block_slots
-        && (partial_bytes > inputs.host_registration_bytes
-            || backed_bytes <= inputs.host_registration_bytes)
-    {
-        host_blocks = routed_slots;
-        reserve = 0;
-    }
+        let partial_bytes = host_blocks
+            .checked_add(u64::from(reserve))
+            .and_then(|blocks| blocks.checked_mul(slot_bytes))
+            .context("partial host arena bytes overflow")?;
+        let backed_bytes = routed_slots
+            .checked_mul(slot_bytes)
+            .context("complete host arena bytes overflow")?;
+        if routed_slots <= host_block_slots
+            && (partial_bytes > inputs.host_registration_bytes
+                || backed_bytes <= inputs.host_registration_bytes)
+        {
+            host_blocks = routed_slots;
+            reserve = 0;
+        }
+        (host_blocks, reserve)
+    };
     let host_blocks = u32::try_from(host_blocks).context("host block count exceeds u32")?;
     let hosted = u64::from(host_blocks).min(non_gpu);
     let unique_slots = total_slots
@@ -1423,12 +1428,23 @@ mod tests {
         let derived = capacity(&inputs, 0).unwrap();
         assert_eq!(derived.slots_per_layer, vec![8, 8]);
         assert_eq!(
-            derived.host_blocks, 1,
-            "the borrow headroom keeps one block above the reserve floor"
+            derived.host_blocks, 2,
+            "the borrow headroom keeps the available blocks without a decode reserve"
         );
-        assert_eq!(derived.spare_blocks, 1);
+        assert_eq!(derived.spare_blocks, 0);
         assert_eq!(derived.disk_bytes, 0);
         assert_eq!(derived.disk_workers, inputs.disk_readers);
+        inputs.host_available_bytes = reserves.host_bytes(slot).unwrap() + 16 * slot;
+        inputs.host_registration_bytes = 16 * slot;
+        let headroom =
+            span_borrow_slots(&reserves, slot, inputs.span_rows, inputs.span_rows).unwrap();
+        let ample = capacity(&inputs, 0).unwrap();
+        assert_eq!(ample.slots_per_layer, vec![8, 8]);
+        assert_eq!(ample.host_blocks, headroom);
+        assert_eq!(ample.spare_blocks, 0);
+        assert_eq!(ample.disk_bytes, 0);
+        assert_eq!(ample.disk_workers, 0);
+        assert!(ample.pinned);
     }
 
     #[test]
