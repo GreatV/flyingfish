@@ -649,7 +649,20 @@ impl ExpertWorkspaceBudget {
         crate::experts::plan::Capacity,
         crate::experts::plan::Admission,
     )> {
-        use crate::experts::plan::{Admission, admission_budget, select_span};
+        Self::select_with_peer(inputs, None, prefill_rows, candidates)
+    }
+
+    pub fn select_with_peer(
+        inputs: &crate::experts::plan::PlanInputs<'_>,
+        peer: Option<crate::experts::plan::PeerInputs<'_>>,
+        prefill_rows: u32,
+        candidates: &[Self],
+    ) -> Result<(
+        usize,
+        crate::experts::plan::Capacity,
+        crate::experts::plan::Admission,
+    )> {
+        use crate::experts::plan::{Admission, admission_budget, select_span_with_peer};
         let budget_bytes_per_token = admission_budget(
             &inputs.geometry,
             inputs.service,
@@ -657,19 +670,40 @@ impl ExpertWorkspaceBudget {
             inputs.d2h_bytes_per_second,
             inputs.copy_engines,
         )?;
-        let admission = Admission {
+        let mut admission = Admission {
             budget_bytes_per_token,
         };
         let span_candidates = candidates
             .iter()
             .map(|budget| budget.candidate.clone())
             .collect::<Vec<_>>();
-        let (index, capacity) = select_span(
+        let (index, mut capacity) = select_span_with_peer(
             inputs,
             admission.hard_cap(inputs.layout.slot_bytes())?,
             prefill_rows,
             &span_candidates,
+            peer,
         )?;
+        if capacity.gpu0_layers < inputs.geometry.layers {
+            admission.budget_bytes_per_token = admission_budget(
+                &crate::experts::catalogue::ExpertGeometry {
+                    layers: capacity.gpu0_layers,
+                    ..inputs.geometry
+                },
+                inputs.service,
+                inputs.h2d_bytes_per_second,
+                inputs.d2h_bytes_per_second,
+                inputs.copy_engines,
+            )?;
+            let (_, updated) = select_span_with_peer(
+                inputs,
+                admission.hard_cap(inputs.layout.slot_bytes())?,
+                prefill_rows,
+                &span_candidates[index..=index],
+                peer,
+            )?;
+            capacity = updated;
+        }
         Ok((index, capacity, admission))
     }
 }
@@ -1015,6 +1049,81 @@ mod admission_tests {
         };
         assert!(
             ExpertWorkspaceBudget::new(request, oversized, slot_bytes, |r| Ok(r * 13), Ok).is_err()
+        );
+
+        let peer_geom = crate::experts::catalogue::ExpertGeometry {
+            first_layer: 0,
+            layers: 4,
+            experts: 8,
+            hidden: 128,
+            intermediate: 64,
+            top_k: 2,
+        };
+        let peer_layout = crate::experts::catalogue::ExpertLayout::new(
+            crate::model_spec::ExpertFormat::Bf16,
+            &peer_geom,
+        )?;
+        let peer_slot = peer_layout.slot_bytes();
+        let mut peer_req = request;
+        peer_req.mixer.requested = None;
+        peer_req.mixer.free_after_resident = usize::try_from(peer_slot * 32 + (1 << 20))?;
+        peer_req.mixer.total = peer_req.mixer.free_after_resident;
+        let peer_cand =
+            ExpertWorkspaceBudget::new(peer_req, peer_geom, peer_slot, |r| Ok(r * 13), Ok)?;
+        let table = crate::experts::plan::ServiceTable::new(
+            "test",
+            vec![
+                crate::experts::plan::ServiceCell {
+                    workers: 1,
+                    rows: 1,
+                    experts: 1,
+                    seconds: 0.001,
+                },
+                crate::experts::plan::ServiceCell {
+                    workers: 1,
+                    rows: 16,
+                    experts: 1,
+                    seconds: 0.016,
+                },
+            ],
+        )?;
+        let plan_inputs = crate::experts::plan::PlanInputs {
+            geometry: peer_geom,
+            layout: peer_layout,
+            device_free_bytes: peer_cand.candidate.reserves.persistent_bytes(peer_slot)?
+                + u64::from(peer_cand.borrowed_slots) * peer_slot
+                + 12 * peer_slot,
+            host_available_bytes: peer_cand.candidate.reserves.host_bytes(peer_slot)?
+                + 64 * peer_slot,
+            h2d_bytes_per_second: (peer_slot as f64) * 1000.0,
+            d2h_bytes_per_second: (peer_slot as f64) * 1000.0,
+            copy_engines: 2,
+            disk_readers: 1,
+            host_registration_bytes: 64 * peer_slot,
+            service: &table,
+            reserves: &peer_cand.candidate.reserves,
+            span_rows: peer_cand.candidate.span_rows,
+            wave_rows: peer_cand.candidate.wave_rows,
+        };
+        let (_, single_cap, single_adm) =
+            ExpertWorkspaceBudget::select(&plan_inputs, 16, std::slice::from_ref(&peer_cand))?;
+        let xfer = [(8_192u64, 1e10, 1e10), (65_536u64, 1e10, 1e10)];
+        let (_, split_cap, split_adm) = ExpertWorkspaceBudget::select_with_peer(
+            &plan_inputs,
+            Some(crate::experts::plan::PeerInputs {
+                device_free_bytes: 16 * peer_slot,
+                device_reserved_bytes: 0,
+                decode_transfer: xfer[0],
+                prefill_transfers: &xfer,
+            }),
+            16,
+            std::slice::from_ref(&peer_cand),
+        )?;
+        assert_eq!(single_cap.gpu0_layers, 4);
+        assert_eq!(split_cap.gpu0_layers, 2);
+        assert_eq!(
+            split_adm.budget_bytes_per_token * 2,
+            single_adm.budget_bytes_per_token
         );
         Ok(())
     }

@@ -12,6 +12,23 @@ pub struct CombineOps {
     shared_scale: CudaFunction,
     combine: CudaFunction,
     combine_ungated: CudaFunction,
+    combine_routed: CudaFunction,
+    join_routed: CudaFunction,
+}
+
+pub struct MoeCombineRouted {
+    pub ids: Tensor<i32, 2>,
+    pub final_active: Tensor<u32, 2>,
+    pub done: Tensor<u32, 2>,
+    pub contributions: Tensor<bf16, 3>,
+    pub routed_out: TensorMut<bf16, 2>,
+}
+
+pub struct MoeJoinRouted {
+    pub routed_in: Tensor<bf16, 2>,
+    pub shared_out: Tensor<bf16, 2>,
+    pub scale: Option<Tensor<bf16, 2>>,
+    pub y: TensorMut<bf16, 2>,
 }
 
 pub struct MoeCombine {
@@ -103,6 +120,77 @@ impl MoeCombine {
     }
 }
 
+impl MoeCombineRouted {
+    fn validate(&self) -> Result<(u32, u32, u32)> {
+        let (rows, top_k) = (self.ids.shape[0], self.ids.shape[1]);
+        self.ids.validate()?;
+        ensure!(
+            self.ids.shape == [rows, top_k] && self.ids.stride == [u64::from(top_k), 1],
+            "moe combine_routed ids must be dense [rows, top_k] (got {}x{})",
+            self.ids.shape[0],
+            self.ids.shape[1]
+        );
+        for t in [&self.final_active, &self.done] {
+            t.validate()?;
+            ensure!(
+                t.shape == [rows, top_k] && t.stride == [u64::from(top_k), 1],
+                "moe combine_routed final_active/done must be dense [rows, top_k] (got {}x{})",
+                t.shape[0],
+                t.shape[1]
+            );
+        }
+        let hidden = self.routed_out.read().shape[1];
+        self.routed_out.read().validate()?;
+        ensure!(
+            self.routed_out.read().shape == [rows, hidden]
+                && self.routed_out.read().stride == [u64::from(hidden), 1],
+            "moe combine_routed routed_out must be dense [rows, hidden] (got {}x{})",
+            self.routed_out.read().shape[0],
+            self.routed_out.read().shape[1]
+        );
+        self.contributions.validate()?;
+        ensure!(
+            self.contributions.shape == [rows, top_k, hidden]
+                && self.contributions.stride[2] == 1
+                && self.contributions.stride[1] == u64::from(hidden)
+                && self.contributions.stride[0] == u64::from(top_k) * u64::from(hidden),
+            "moe combine_routed contributions must be dense [rows, top_k, hidden]"
+        );
+        ensure!(
+            (1..=32).contains(&top_k),
+            "moe combine_routed top_k {top_k} outside [1,32]"
+        );
+        Ok((rows, top_k, hidden))
+    }
+}
+
+impl MoeJoinRouted {
+    fn validate(&self) -> Result<(u32, u32)> {
+        let (rows, hidden) = (self.routed_in.shape[0], self.routed_in.shape[1]);
+        for (t, name) in [
+            (&self.routed_in, "routed_in"),
+            (&self.shared_out, "shared_out"),
+            (&self.y.read(), "y"),
+        ] {
+            t.validate()?;
+            ensure!(
+                t.shape == [rows, hidden] && t.stride == [u64::from(hidden), 1],
+                "moe join_routed {name} must be dense [rows, hidden] (got {}x{})",
+                t.shape[0],
+                t.shape[1]
+            );
+        }
+        if let Some(scale) = &self.scale {
+            scale.validate()?;
+            ensure!(
+                scale.shape == [rows, 1] && scale.stride == [1, 1],
+                "moe join_routed scale must be a dense [rows, 1] buffer"
+            );
+        }
+        Ok((rows, hidden))
+    }
+}
+
 impl CombineOps {
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
         let module = cubin::module(ctx, "moe_combine")?;
@@ -110,6 +198,8 @@ impl CombineOps {
             shared_scale: module.load_function("moe_shared_scale")?,
             combine: module.load_function("moe_combine")?,
             combine_ungated: module.load_function("moe_combine_ungated")?,
+            combine_routed: module.load_function("moe_combine_routed")?,
+            join_routed: module.load_function("moe_join_routed")?,
         })
     }
 
@@ -186,6 +276,43 @@ impl CombineOps {
                     .arg(&(hidden as i64))
                     .launch(grid(rows as usize, 256))?;
             }
+        }
+        Ok(())
+    }
+
+    pub fn combine_routed(&self, stream: &Arc<CudaStream>, input: &MoeCombineRouted) -> Result<()> {
+        let (rows, top_k, hidden) = input.validate()?;
+        // SAFETY: all validated views cover rows*top_k choices and rows*hidden output values.
+        unsafe {
+            stream
+                .launch_builder(&self.combine_routed)
+                .arg(&input.contributions.ptr)
+                .arg(&input.ids.ptr)
+                .arg(&input.done.ptr)
+                .arg(&input.final_active.ptr)
+                .arg(&input.routed_out.0.ptr)
+                .arg(&(rows as i32))
+                .arg(&(top_k as i32))
+                .arg(&(hidden as i64))
+                .launch(grid(rows as usize, 256))?;
+        }
+        Ok(())
+    }
+
+    pub fn join_routed(&self, stream: &Arc<CudaStream>, input: &MoeJoinRouted) -> Result<()> {
+        let (rows, hidden) = input.validate()?;
+        let scale_ptr = input.scale.as_ref().map_or(0u64, |s| s.ptr);
+        // SAFETY: all validated views cover rows*hidden values and optional rows scale values.
+        unsafe {
+            stream
+                .launch_builder(&self.join_routed)
+                .arg(&input.routed_in.ptr)
+                .arg(&input.shared_out.ptr)
+                .arg(&scale_ptr)
+                .arg(&input.y.0.ptr)
+                .arg(&(rows as i32))
+                .arg(&(hidden as i64))
+                .launch(grid(rows as usize, 256))?;
         }
         Ok(())
     }

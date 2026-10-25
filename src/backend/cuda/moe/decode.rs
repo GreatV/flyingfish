@@ -303,6 +303,13 @@ pub(super) fn validate_w8a16(
     Ok(dims)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LaunchMode {
+    All,
+    Routed,
+    Shared,
+}
+
 impl DecodeOps {
     #[cfg(test)]
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
@@ -372,7 +379,50 @@ impl DecodeOps {
         expert_inter: u32,
     ) -> Result<()> {
         let dims = validate(input, scratch, expert_inter)?;
-        self.launch(stream, input, scratch, dims, (&self.gate_up, &self.down))
+        self.launch(
+            stream,
+            input,
+            scratch,
+            dims,
+            (&self.gate_up, &self.down),
+            LaunchMode::All,
+        )
+    }
+
+    pub fn contribute_routed(
+        &self,
+        stream: &Arc<CudaStream>,
+        input: &MoeDecode<'_>,
+        scratch: &Scratch,
+        expert_inter: u32,
+    ) -> Result<()> {
+        let dims = validate(input, scratch, expert_inter)?;
+        self.launch(
+            stream,
+            input,
+            scratch,
+            dims,
+            (&self.gate_up, &self.down),
+            LaunchMode::Routed,
+        )
+    }
+
+    pub fn contribute_shared(
+        &self,
+        stream: &Arc<CudaStream>,
+        input: &MoeDecode<'_>,
+        scratch: &Scratch,
+        expert_inter: u32,
+    ) -> Result<()> {
+        let dims = validate(input, scratch, expert_inter)?;
+        self.launch(
+            stream,
+            input,
+            scratch,
+            dims,
+            (&self.gate_up, &self.down),
+            LaunchMode::Shared,
+        )
     }
 
     fn launch(
@@ -382,6 +432,7 @@ impl DecodeOps {
         scratch: &Scratch,
         dims: DecodeDims,
         functions: (&CudaFunction, &CudaFunction),
+        mode: LaunchMode,
     ) -> Result<()> {
         let DecodeDims {
             rows,
@@ -412,69 +463,70 @@ impl DecodeOps {
         let h_bytes = u64::from(rows) * u64::from(top_k) * u64::from(inter) * 2;
         let h_ptr = scratch.ptr;
         let hs_ptr = scratch.ptr + h_bytes;
-        unsafe {
-            stream
-                .launch_builder(functions.0)
-                .arg(&input.x.ptr)
-                .arg(&input.ids.ptr)
-                .arg(&input.active.ptr)
-                .arg(&input.slots_gate_up.ptr)
-                .arg(&input.slot_valid.ptr)
-                .arg(&input.slot_generation.ptr)
-                .arg(&input.assignment_gen.ptr)
-                .arg(&input.shared_gate.ptr)
-                .arg(&input.shared_up.ptr)
-                .arg(&h_ptr)
-                .arg(&hs_ptr)
-                .arg(&(rows as i32))
-                .arg(&(experts as i32))
-                .arg(&(top_k as i32))
-                .arg(&(hidden as i32))
-                .arg(&(inter as i32))
-                .arg(&(shared_inter as i32))
-                .arg(&(self.swiglu_rounding as i32))
-                .launch(LaunchConfig {
-                    grid_dim: (
-                        gate_inter.div_ceil(32 >> invariant),
-                        rows,
-                        top_k + 1 - invariant,
-                    ),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: hidden * 2,
-                })?;
-            stream
-                .launch_builder(functions.1)
-                .arg(&h_ptr)
-                .arg(&hs_ptr)
-                .arg(&input.ids.ptr)
-                .arg(&input.active.ptr)
-                .arg(&input.weights.ptr)
-                .arg(&input.slots_down.ptr)
-                .arg(&input.slot_valid.ptr)
-                .arg(&input.slot_generation.ptr)
-                .arg(&input.assignment_gen.ptr)
-                .arg(&input.shared_down.ptr)
-                .arg(&input.contributions.ptr)
-                .arg(&input.shared_out.read().ptr)
-                .arg(&input.done.read().ptr)
-                .arg(&(rows as i32))
-                .arg(&(experts as i32))
-                .arg(&(top_k as i32))
-                .arg(&(hidden as i32))
-                .arg(&(inter as i32))
-                .arg(&(shared_inter as i32))
-                .arg(&(self.routed_weight as i32))
-                .launch(LaunchConfig {
-                    grid_dim: (
-                        hidden.div_ceil(16 >> invariant),
-                        rows,
-                        top_k + 1 - invariant,
-                    ),
-                    block_dim: (128, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
+        if mode != LaunchMode::Shared || self.invariant.is_none() {
+            let (top_k_arg, grid_z, mode_gate_inter) = match mode {
+                LaunchMode::All => (top_k as i32, top_k + 1 - invariant, gate_inter),
+                LaunchMode::Routed => (top_k as i32, top_k, inter),
+                LaunchMode::Shared => (0i32, 1, shared_inter),
+            };
+            unsafe {
+                stream
+                    .launch_builder(functions.0)
+                    .arg(&input.x.ptr)
+                    .arg(&input.ids.ptr)
+                    .arg(&input.active.ptr)
+                    .arg(&input.slots_gate_up.ptr)
+                    .arg(&input.slot_valid.ptr)
+                    .arg(&input.slot_generation.ptr)
+                    .arg(&input.assignment_gen.ptr)
+                    .arg(&input.shared_gate.ptr)
+                    .arg(&input.shared_up.ptr)
+                    .arg(&h_ptr)
+                    .arg(&hs_ptr)
+                    .arg(&(rows as i32))
+                    .arg(&(experts as i32))
+                    .arg(&top_k_arg)
+                    .arg(&(hidden as i32))
+                    .arg(&(inter as i32))
+                    .arg(&(shared_inter as i32))
+                    .arg(&(self.swiglu_rounding as i32))
+                    .launch(LaunchConfig {
+                        grid_dim: (mode_gate_inter.div_ceil(32 >> invariant), rows, grid_z),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: hidden * 2,
+                    })?;
+                stream
+                    .launch_builder(functions.1)
+                    .arg(&h_ptr)
+                    .arg(&hs_ptr)
+                    .arg(&input.ids.ptr)
+                    .arg(&input.active.ptr)
+                    .arg(&input.weights.ptr)
+                    .arg(&input.slots_down.ptr)
+                    .arg(&input.slot_valid.ptr)
+                    .arg(&input.slot_generation.ptr)
+                    .arg(&input.assignment_gen.ptr)
+                    .arg(&input.shared_down.ptr)
+                    .arg(&input.contributions.ptr)
+                    .arg(&input.shared_out.read().ptr)
+                    .arg(&input.done.read().ptr)
+                    .arg(&(rows as i32))
+                    .arg(&(experts as i32))
+                    .arg(&top_k_arg)
+                    .arg(&(hidden as i32))
+                    .arg(&(inter as i32))
+                    .arg(&(shared_inter as i32))
+                    .arg(&(self.routed_weight as i32))
+                    .launch(LaunchConfig {
+                        grid_dim: (hidden.div_ceil(16 >> invariant), rows, grid_z),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
         }
-        if let Some((skinny, silu)) = &self.invariant {
+        if mode != LaunchMode::Routed
+            && let Some((skinny, silu)) = &self.invariant
+        {
             let shared = input.shared_out.read().ptr;
             let up = shared + u64::from(rows) * u64::from(shared_inter) * 2;
             let gemm = |weight: u64, x: u64, y: u64, columns: u32, inner: u32| -> Result<()> {
@@ -590,6 +642,26 @@ impl DecodeOps {
             scratch,
             dims,
             (&self.gate_up_w8a16, &self.down_w8a16),
+            LaunchMode::All,
+        )
+    }
+
+    pub fn contribute_routed_w8a16(
+        &self,
+        stream: &Arc<CudaStream>,
+        input: &MoeDecode<'_>,
+        slot: &crate::experts::catalogue::Fp8Slot,
+        scratch: &Scratch,
+        expert_inter: u32,
+    ) -> Result<()> {
+        let dims = validate_w8a16(input, slot, scratch, expert_inter)?;
+        self.launch(
+            stream,
+            input,
+            scratch,
+            dims,
+            (&self.gate_up_w8a16, &self.down_w8a16),
+            LaunchMode::Routed,
         )
     }
 }

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// Block id of a host expert without a host block.
-const NO_BLOCK: u32 = u32::MAX;
+pub(crate) const NO_BLOCK: u32 = u32::MAX;
 
 /// Setup sources of the host-tier load.
 pub struct LoadInputs<'a> {
@@ -199,12 +199,17 @@ fn fresh_dispatch(max_routes: usize, experts: usize, max_rows: usize) -> Dispatc
 fn host_fill_order(
     initial: &[Vec<u32>],
     geometry: &ExpertGeometry,
+    backed_layers: u32,
+    peer_complete: bool,
     host_blocks: u32,
 ) -> Vec<(u32, u32)> {
-    let inclusive =
-        u64::from(host_blocks) == u64::from(geometry.layers) * u64::from(geometry.experts);
+    let routed = u64::from(geometry.layers) * u64::from(geometry.experts);
+    let swappable = u64::from(backed_layers) * u64::from(geometry.experts);
+    let full_routed = u64::from(host_blocks) == routed;
+    let full_swappable = peer_complete && u64::from(host_blocks) == swappable;
     let mut per_layer: Vec<Vec<u32>> = Vec::with_capacity(geometry.layers as usize);
-    for set in initial {
+    for (layer, set) in initial.iter().enumerate() {
+        let inclusive = full_routed || (full_swappable && (layer as u32) < backed_layers);
         per_layer.push(
             (0..geometry.experts)
                 .filter(|expert| inclusive || !set.contains(expert))
@@ -268,8 +273,13 @@ impl Residency {
         let slot_bytes = capacity.slot_bytes();
         let cap = admission.hard_cap(slot_bytes)?;
         let routed = u64::from(geometry.layers) * u64::from(geometry.experts);
+        let peer_complete = capacity.slots_per_layer[capacity.gpu0_layers as usize..]
+            .iter()
+            .all(|&slots| slots == geometry.experts);
+        let swappable = u64::from(capacity.gpu0_layers) * u64::from(geometry.experts);
         let reserve = if u64::from(capacity.slots_total()) == routed
             || u64::from(capacity.host_blocks) == routed
+            || (peer_complete && u64::from(capacity.host_blocks) == swappable)
         {
             0
         } else if capacity.host_blocks > 0 {
@@ -322,7 +332,13 @@ impl Residency {
             }
         }
         let mut host_block = vec![vec![NO_BLOCK; experts]; layers];
-        let order = host_fill_order(initial, &geometry, capacity.host_blocks);
+        let order = host_fill_order(
+            initial,
+            &geometry,
+            capacity.gpu0_layers,
+            peer_complete,
+            capacity.host_blocks,
+        );
         let mut host_bytes = 0u64;
         for (index, &(layer, expert)) in order.iter().enumerate() {
             let block = u32::try_from(index).context("host block id exceeds u32")?;
@@ -1985,8 +2001,71 @@ mod tests {
         let lease = host.lease(&(0..16).collect::<Vec<_>>())?;
         assert!(host.claim(0).is_err());
         assert_eq!(lease.read(0)?.len(), host.block_elements());
+
+        let peer_geom = geometry();
+        let peer_layout = bf16_layout(&peer_geom)?;
+        let peer_slot = peer_layout.slot_bytes();
+        let peer_cap = Capacity {
+            layout: peer_layout,
+            span_rows: 4,
+            wave_rows: 2,
+            device_expert_bytes: 3 * peer_slot,
+            peer_expert_bytes: 8 * peer_slot,
+            gpu0_layers: 1,
+            host_expert_bytes: 8 * peer_slot,
+            slots_per_layer: vec![3, 8],
+            host_blocks: 8,
+            spare_blocks: 0,
+            disk_bytes: 0,
+            worker_count: 2,
+            disk_workers: 0,
+            prefill_staging_slots: 1,
+            pinned: true,
+        };
+        let peer_host = HostBlocks::new(8, usize::try_from(peer_slot / 2)?)?;
+        let (peer_dir, peer_catalogue) = staged(peer_geom)?;
+        let peer_reader = DiskReader::open(&peer_catalogue, peer_dir.path(), 1)?;
+        let peer_initial = vec![vec![0, 1, 2], (0..8).collect()];
+        let (mut peer_backed, _) = Residency::load(LoadInputs {
+            geometry: peer_geom,
+            capacity: peer_cap,
+            admission: Admission {
+                budget_bytes_per_token: peer_slot * 2,
+            },
+            max_rows: 8,
+            initial: &peer_initial,
+            host: Some(&peer_host),
+            catalogue: &peer_catalogue,
+            reader: &peer_reader,
+        })?;
+        assert!(peer_backed.ledger().has_full_host_backing());
+        assert!(peer_backed.host_block[0].iter().all(|&b| b != NO_BLOCK));
+        assert!(peer_backed.host_block[1].iter().all(|&b| b == NO_BLOCK));
+        assert_eq!(peer_backed.ledger().disk_bytes()?, 0);
+        let peer_blocks = peer_backed.host_block.clone();
+        assert!(peer_backed.begin_request(&frequency)?.is_empty());
+        peer_backed.begin_token()?;
+        set_scores(&mut peer_backed, 0, [0.0; 8]);
+        set_scores(&mut peer_backed, 1, [0.0; 8]);
+        peer_backed.dispatch(0, &[route(0, 0, 7)])?;
+        peer_backed.dispatch(1, &[route(0, 0, 7)])?;
+        peer_backed.scores[0][7] = 30.0;
+        let peer_moves = peer_backed.finish_token()?.to_vec();
+        assert_eq!(peer_moves.len(), 1);
+        assert!(peer_moves.iter().all(|m| m.dest_block.is_none()));
+        for movement in &peer_moves {
+            peer_backed.record_copy(&[movement.slot], 1)?;
+        }
+        assert_eq!(peer_backed.host_block, peer_blocks);
+        peer_backed.end_request()?;
+        let peer_borrow = peer_backed.borrow(2)?;
+        assert_eq!(peer_borrow.positions, vec![10, 9]);
+        assert_eq!(peer_borrow.d2h_bytes, 0);
+        assert!(peer_borrow.write_back.iter().all(|&copy| !copy));
+        peer_backed.refill()?;
+
         println!(
-            "PASS residency_complete_backing requests=2 tokens=4 borrow=2 d2h_bytes=0 spare_blocks=0 unique_union=true read_lease=true"
+            "PASS residency_complete_backing requests=2 tokens=4 borrow=2 d2h_bytes=0 spare_blocks=0 unique_union=true read_lease=true peer_swappable=true"
         );
         Ok(())
     }

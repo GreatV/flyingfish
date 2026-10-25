@@ -44,17 +44,10 @@ extern "C" __global__ void moe_shared_scale(const bf16* __restrict__ x,
   }
 }
 
-extern "C" __global__ void moe_combine(
-    const bf16* __restrict__ contributions, const bf16* __restrict__ shared_out,
-    const bf16* __restrict__ scale, const int* __restrict__ ids,
-    const unsigned* __restrict__ done, const unsigned* __restrict__ final_active,
-    bf16* __restrict__ y, int rows, int top_k, long long hidden) {
-  if (blockDim.x != 256 || top_k < 1 || top_k > 32) __trap();
-  const int row = blockIdx.x;
-  if (row < 0 || row >= rows) __trap();
-  const int tid = threadIdx.x;
-  const int a0 = row * top_k;
-  int order[32];
+__device__ __forceinline__ int moe_order_routed_row(
+    const int* __restrict__ ids, const unsigned* __restrict__ done,
+    const unsigned* __restrict__ final_active, int a0, int top_k,
+    int (&order)[32]) {
   int live = 0;
   for (int c = 0; c < top_k; ++c) {
     const unsigned want = final_active[a0 + c];
@@ -68,6 +61,22 @@ extern "C" __global__ void moe_combine(
     order[p] = c;
     ++live;
   }
+  return live;
+}
+
+extern "C" __global__ void moe_combine(
+    const bf16* __restrict__ contributions, const bf16* __restrict__ shared_out,
+    const bf16* __restrict__ scale, const int* __restrict__ ids,
+    const unsigned* __restrict__ done, const unsigned* __restrict__ final_active,
+    bf16* __restrict__ y, int rows, int top_k, long long hidden) {
+  if (blockDim.x != 256 || top_k < 1 || top_k > 32) __trap();
+  const int row = blockIdx.x;
+  if (row < 0 || row >= rows) __trap();
+  const int tid = threadIdx.x;
+  const int a0 = row * top_k;
+  int order[32];
+  const int live =
+      moe_order_routed_row(ids, done, final_active, a0, top_k, order);
   const bf16* __restrict__ sh = shared_out + (long long)row * hidden;
   bf16* __restrict__ yr = y + (long long)row * hidden;
   for (long long d = tid; d < hidden; d += blockDim.x) {
@@ -90,19 +99,8 @@ extern "C" __global__ void moe_combine_ungated(
   const int tid = threadIdx.x;
   const int a0 = row * top_k;
   int order[32];
-  int live = 0;
-  for (int c = 0; c < top_k; ++c) {
-    const unsigned want = final_active[a0 + c];
-    if (done[a0 + c] != want) __trap();
-    if (want == 0u) continue;
-    int p = live;
-    while (p > 0 && ids[a0 + order[p - 1]] > ids[a0 + c]) {
-      order[p] = order[p - 1];
-      --p;
-    }
-    order[p] = c;
-    ++live;
-  }
+  const int live =
+      moe_order_routed_row(ids, done, final_active, a0, top_k, order);
   const bf16* __restrict__ sh = shared_out + (long long)row * hidden;
   bf16* __restrict__ yr = y + (long long)row * hidden;
   for (long long d = tid; d < hidden; d += blockDim.x) {
@@ -110,5 +108,51 @@ extern "C" __global__ void moe_combine_ungated(
     for (int k = 0; k < live; ++k)
       acc += __bfloat162float(contributions[(long long)(a0 + order[k]) * hidden + d]);
     yr[d] = __hadd(__float2bfloat16(acc), sh[d]);
+  }
+}
+
+extern "C" __global__ void moe_combine_routed(
+    const bf16* __restrict__ contributions, const int* __restrict__ ids,
+    const unsigned* __restrict__ done, const unsigned* __restrict__ final_active,
+    bf16* __restrict__ routed_out, int rows, int top_k, long long hidden) {
+  if (blockDim.x != 256 || top_k < 1 || top_k > 32) __trap();
+  const int row = blockIdx.x;
+  if (row < 0 || row >= rows) __trap();
+  const int tid = threadIdx.x;
+  const int a0 = row * top_k;
+  int order[32];
+  const int live =
+      moe_order_routed_row(ids, done, final_active, a0, top_k, order);
+  bf16* __restrict__ rr = routed_out + (long long)row * hidden;
+  for (long long d = tid; d < hidden; d += blockDim.x) {
+    float acc = 0.0f;
+    for (int k = 0; k < live; ++k)
+      acc += __bfloat162float(
+          contributions[(long long)(a0 + order[k]) * hidden + d]);
+    rr[d] = __float2bfloat16(acc);
+  }
+}
+
+extern "C" __global__ void moe_join_routed(
+    const bf16* __restrict__ routed_in, const bf16* __restrict__ shared_out,
+    const bf16* __restrict__ scale, bf16* __restrict__ y, int rows,
+    long long hidden) {
+  if (blockDim.x != 256) __trap();
+  const int row = blockIdx.x;
+  if (row < 0 || row >= rows) __trap();
+  const int tid = threadIdx.x;
+  const bf16* __restrict__ rr = routed_in + (long long)row * hidden;
+  const bf16* __restrict__ sh = shared_out + (long long)row * hidden;
+  bf16* __restrict__ yr = y + (long long)row * hidden;
+  if (scale != nullptr) {
+    const bf16 s = scale[row];
+    for (long long d = tid; d < hidden; d += blockDim.x) {
+      const bf16 gated = __hmul(s, sh[d]);
+      yr[d] = __hadd(rr[d], gated);
+    }
+  } else {
+    for (long long d = tid; d < hidden; d += blockDim.x) {
+      yr[d] = __hadd(rr[d], sh[d]);
+    }
   }
 }

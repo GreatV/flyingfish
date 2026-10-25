@@ -6,7 +6,7 @@ use crate::backend::cuda::{
     contracts::{Tensor, TensorMut, view},
     linear::BoundFfn,
     moe::{
-        combine::{CombineOps, MoeCombine},
+        combine::{CombineOps, MoeCombine, MoeCombineRouted, MoeJoinRouted},
         decode::{DecodeOps, MoeDecode, decode_scratch_bytes, decode_scratch_bytes_mixed},
         prefill::{LANE16_ROWS, PrefillOps},
         route::RouteOps,
@@ -22,6 +22,60 @@ pub(super) use residency::{Prefill, Slots};
 #[path = "engine_moe_graph.rs"]
 mod graphs;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PeerSendLayout {
+    pub ids_off: usize,
+    pub ids_bytes: usize,
+    pub weights_off: usize,
+    pub weights_bytes: usize,
+    pub send_bytes: usize,
+}
+
+impl PeerSendLayout {
+    pub fn for_rows(rows: usize, hidden: usize, top_k: usize) -> Result<Self> {
+        ensure!(
+            rows > 0 && hidden > 0 && top_k > 0,
+            "zero peer send dimension rows={rows} hidden={hidden} top_k={top_k}"
+        );
+        let x_bytes = rows
+            .checked_mul(hidden)
+            .and_then(|v| v.checked_mul(size_of::<bf16>()))
+            .context("peer send x byte overflow")?;
+        ensure!(
+            x_bytes.is_multiple_of(16),
+            "peer send x bytes={x_bytes} is not 16-byte aligned"
+        );
+        let ids_off = x_bytes;
+        let ids_bytes = rows
+            .checked_mul(top_k)
+            .and_then(|v| v.checked_mul(size_of::<i32>()))
+            .context("peer send ids byte overflow")?;
+        let weights_off = ids_off
+            .checked_add(ids_bytes)
+            .and_then(|v| v.checked_next_multiple_of(16))
+            .context("peer send weights offset overflow")?;
+        let weights_bytes = rows
+            .checked_mul(top_k)
+            .and_then(|v| v.checked_mul(size_of::<bf16>()))
+            .context("peer send weights byte overflow")?;
+        let send_bytes = weights_off
+            .checked_add(weights_bytes)
+            .context("peer send total byte overflow")?;
+        Ok(Self {
+            ids_off,
+            ids_bytes,
+            weights_off,
+            weights_bytes,
+            send_bytes,
+        })
+    }
+
+    pub fn tail_bf16_elems(max_rows: usize, hidden: usize, top_k: usize) -> Result<usize> {
+        let layout = Self::for_rows(max_rows, hidden, top_k)?;
+        Ok((layout.send_bytes - layout.ids_off).div_ceil(size_of::<bf16>()))
+    }
+}
+
 pub(super) struct Setup {
     pub workspace: crate::prefill::ExpertWorkspaceBudget,
     capacity: crate::experts::plan::Capacity,
@@ -30,6 +84,8 @@ pub(super) struct Setup {
     catalogue: Arc<crate::experts::catalogue::ExpertCatalogue>,
     decode_rows: usize,
     routed_wave_rows: u32,
+    peer_wave_rows: u32,
+    peer: Option<Device>,
 }
 
 fn decode_device_bytes(
@@ -107,7 +163,7 @@ fn routed_wave_rows(
         return Ok((capacity.wave_rows, 0));
     };
     let slots = u64::from(geometry.layers) * u64::from(geometry.experts);
-    if u64::from(capacity.slots_total()) != slots {
+    if capacity.gpu0_layers != geometry.layers || u64::from(capacity.slots_total()) != slots {
         return Ok((capacity.wave_rows, 0));
     }
     ensure!(
@@ -166,6 +222,70 @@ fn routed_wave_rows(
     }
     let rows = low * alignment;
     Ok((rows, scratch(rows)? - baseline))
+}
+
+fn peer_routed_wave_rows(
+    geometry: ExpertGeometry,
+    capacity: &crate::experts::plan::Capacity,
+    shared: (u32, crate::model_spec::RoutedWeightBoundary),
+) -> Result<(u32, u64)> {
+    use super::super::moe::prefill::W8A16_TILE_ROWS;
+    let Some(fp8) = capacity.layout.fp8_slot() else {
+        return Ok((capacity.wave_rows, 0));
+    };
+    if capacity.gpu0_layers >= geometry.layers {
+        return Ok((capacity.wave_rows, 0));
+    }
+    ensure!(
+        geometry.top_k > 0 && capacity.wave_rows > 0 && capacity.wave_rows <= capacity.span_rows,
+        "invalid peer routed wave geometry"
+    );
+    let available = capacity
+        .peer_expert_bytes
+        .checked_sub(
+            u64::from(capacity.peer_slots())
+                .checked_mul(capacity.slot_bytes())
+                .context("peer expert bytes overflow")?,
+        )
+        .context("peer expert slots exceed peer budget")?;
+    let target = u64::from(geometry.experts)
+        .checked_mul(u64::from(W8A16_TILE_ROWS))
+        .context("peer routed tile extent overflow")?
+        .div_ceil(u64::from(geometry.top_k))
+        .max(u64::from(capacity.wave_rows))
+        .min(u64::from(capacity.span_rows));
+    let alignment = 8u32 >> geometry.top_k.trailing_zeros().min(3);
+    ensure!(
+        capacity.wave_rows.is_multiple_of(alignment),
+        "peer routed wave is not BF16 pointer aligned"
+    );
+    let bytes = |rows: u32| -> Result<u64> {
+        Ok(u64::try_from(residency::peer_prefill_bytes(
+            geometry,
+            capacity.span_rows,
+            rows,
+            shared,
+            Some(fp8),
+        )?)?)
+    };
+    let baseline = bytes(capacity.wave_rows)?;
+    let (mut low, mut high) = (
+        capacity.wave_rows / alignment,
+        u32::try_from(target)? / alignment,
+    );
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        let extra = bytes(mid * alignment)?
+            .checked_sub(baseline)
+            .context("peer routed scratch is not monotone")?;
+        if extra <= available {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    let rows = low * alignment;
+    Ok((rows, bytes(rows)? - baseline))
 }
 
 impl Setup {
@@ -355,8 +475,46 @@ impl Setup {
             failures.join("; ")
         );
         let registration = measured.host_registration_bytes;
+        let peer_device = device.peer()?;
+        let peer_inputs = if let Some(peer_dev) = &peer_device {
+            peer_dev.ctx.bind_to_thread()?;
+            let (peer_free, peer_total) = peer_dev.ctx.mem_get_info()?;
+            device.ctx.bind_to_thread()?;
+            let max_span = candidates
+                .iter()
+                .map(|c| c.candidate.span_rows)
+                .max()
+                .context("no candidate spans")?;
+            let max_wave = candidates
+                .iter()
+                .map(|c| c.candidate.wave_rows)
+                .max()
+                .context("no candidate waves")?;
+            let peer_decode = decode_device_bytes(geometry, shared_intermediate, decode_rows)?;
+            let peer_prefill = residency::peer_prefill_bytes(
+                geometry,
+                max_span,
+                max_wave,
+                (shared_intermediate, model.routed_weight_boundary()),
+                catalogue.layout().fp8_slot(),
+            )?;
+            let peer_tables = geometry.layers as usize * geometry.experts as usize * 28;
+            let peer_reserve = (peer_total / 16)
+                .checked_add(peer_decode)
+                .and_then(|n| n.checked_add(peer_prefill))
+                .and_then(|n| n.checked_add(peer_tables))
+                .context("peer GPU reserve overflow")?;
+            (measured.peer_transfers.len() >= 2).then_some(crate::experts::plan::PeerInputs {
+                device_free_bytes: peer_free as u64,
+                device_reserved_bytes: peer_reserve as u64,
+                decode_transfer: measured.peer_transfers[0],
+                prefill_transfers: &measured.peer_transfers[1..],
+            })
+        } else {
+            None
+        };
         let first = &candidates[0].candidate;
-        let (index, mut capacity, admission) = ExpertWorkspaceBudget::select(
+        let (index, mut capacity, admission) = ExpertWorkspaceBudget::select_with_peer(
             &PlanInputs {
                 geometry,
                 layout: catalogue.layout().clone(),
@@ -372,9 +530,13 @@ impl Setup {
                 span_rows: first.span_rows,
                 wave_rows: first.wave_rows,
             },
+            peer_inputs,
             u32::try_from(request.capacity)?,
             &candidates,
         )?;
+        let peer = (capacity.gpu0_layers < geometry.layers)
+            .then_some(peer_device)
+            .flatten();
         let mut workspace = candidates.swap_remove(index);
         let (routed_wave_rows, extra_scratch) = routed_wave_rows(
             geometry,
@@ -397,6 +559,22 @@ impl Setup {
             .device_expert_bytes
             .checked_sub(extra_scratch)
             .context("resident routed scratch exceeds device budget")?;
+        let (peer_wave_rows, peer_extra_scratch) = peer_routed_wave_rows(
+            geometry,
+            &capacity,
+            (shared_intermediate, model.routed_weight_boundary()),
+        )?;
+        capacity.peer_expert_bytes = capacity
+            .peer_expert_bytes
+            .checked_sub(peer_extra_scratch)
+            .context("peer routed scratch exceeds peer budget")?;
+        let host_backed = u64::from(capacity.host_blocks)
+            == u64::from(geometry.layers) * u64::from(geometry.experts)
+            || (capacity.slots_per_layer[capacity.gpu0_layers as usize..]
+                .iter()
+                .all(|&s| s == geometry.experts)
+                && u64::from(capacity.host_blocks)
+                    == u64::from(capacity.gpu0_layers) * u64::from(geometry.experts));
         let cpu = residency::cpu_bound(
             geometry,
             capacity.slot_bytes(),
@@ -409,10 +587,13 @@ impl Setup {
             serde_json::json!({"expert_memory_plan": {
                 "span_rows":capacity.span_rows,"wave_rows":capacity.wave_rows,
                 "routed_wave_rows":routed_wave_rows,"routed_extra_scratch_bytes":extra_scratch,
+                "peer_wave_rows":peer_wave_rows,"peer_extra_scratch_bytes":peer_extra_scratch,
                 "mixer_rows":workspace.mixer.plan.chunk,"workspace_rows":workspace.workspace_rows,
                 "borrowed_slots":workspace.borrowed_slots,"slots_per_layer":capacity.slots_per_layer,
+                "gpu0_layers":capacity.gpu0_layers,"peer_expert_bytes":capacity.peer_expert_bytes,
+                "peer_transport":peer.is_some().then(|| serde_json::json!({"decode":"captured_portable_bounce_4k","prefill":"eager_peer_memcpy_8m_68m"})),
                 "host_blocks":capacity.host_blocks,"spare_blocks":capacity.spare_blocks,
-                "host_backing_complete":u64::from(capacity.host_blocks)==u64::from(geometry.layers)*u64::from(geometry.experts),
+                "host_backing_complete":host_backed,
                 "disk_bytes":capacity.disk_bytes,"pinned":capacity.pinned,
                 "host_available_bytes":available,"host_registration_bytes":registration,
                 "device_fixed_bytes":workspace.candidate.reserves.device_fixed_bytes,
@@ -442,7 +623,21 @@ impl Setup {
             catalogue,
             decode_rows,
             routed_wave_rows,
+            peer_wave_rows,
+            peer,
         })
+    }
+
+    pub fn peer_tail_elems(&self) -> Result<usize> {
+        if self.peer.is_none() {
+            return Ok(0);
+        }
+        let geometry = self.catalogue.geometry();
+        PeerSendLayout::tail_bf16_elems(
+            self.decode_rows,
+            geometry.hidden as usize,
+            geometry.top_k as usize,
+        )
     }
 
     pub fn bind(self, engine: &mut Engine) -> Result<()> {
@@ -463,6 +658,7 @@ impl Setup {
         let phase_started = std::time::Instant::now();
         let mut slots = Slots::load(
             &engine.device,
+            self.peer.as_ref(),
             geometry,
             residency::Load {
                 capacity: &self.capacity,
@@ -483,9 +679,18 @@ impl Setup {
         )?;
         let slots_load_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
         let phase_started = std::time::Instant::now();
+        let (send_ptr, _send_guard) = engine.work.n.device_ptr(&engine.device.stream);
+        let send_cap_bytes = engine.work.n.len() * size_of::<bf16>();
+        drop(_send_guard);
         engine.moe = Some(Decode::new(
             &engine.device,
             DecodeOptions {
+                peer: self.peer.as_ref().map(|peer| PeerBind {
+                    device: peer,
+                    gpu0_layers: self.capacity.gpu0_layers,
+                    send_ptr,
+                    send_cap_bytes,
+                }),
                 geometry,
                 max_rows: self.decode_rows,
                 workers: self.capacity.worker_count,
@@ -510,7 +715,7 @@ impl Setup {
         let decode_new_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
         let phase_started = std::time::Instant::now();
         engine.moe_prefill = Some(Prefill::new(
-            &engine.device,
+            (&engine.device, self.peer.as_ref()),
             &mut slots,
             &self.capacity,
             self.workspace.candidate.reserves,
@@ -524,12 +729,19 @@ impl Setup {
                     .shared_intermediate,
                 self.workspace.workspace_rows,
                 self.workspace.mixer.plan.chunk,
-                self.routed_wave_rows,
-                engine.model_spec.routed_weight_boundary(),
+                (self.routed_wave_rows, self.peer_wave_rows),
+                (
+                    engine.model_spec.swiglu_rounding(),
+                    engine.model_spec.routed_weight_boundary(),
+                ),
             ),
         )?);
         let prefill_new_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
         engine.device.finish_upload()?;
+        if let Some(peer) = &self.peer {
+            peer.finish_upload()?;
+            engine.device.ctx.bind_to_thread()?;
+        }
         engine.moe_slots = Some(slots);
         eprintln!(
             "{}",
@@ -575,6 +787,14 @@ impl Engine {
             self.model_spec.swiglu_rounding(),
             self.model_spec.routed_weight_boundary(),
         )?;
+        if let Some(peer) = executor.peer.as_mut() {
+            peer.contribute = DecodeOps::new_invariant_with_boundaries(
+                &peer.device.ctx,
+                self.model_spec.swiglu_rounding(),
+                self.model_spec.routed_weight_boundary(),
+            )?;
+            self.device.ctx.bind_to_thread()?;
+        }
         eprintln!(
             "draft_target_arithmetic lane16_routed=true skinny_shared=true skinny_typed=true rows={}",
             crate::linear_plan::MAX_SKINNY_ROWS
@@ -618,7 +838,7 @@ impl Engine {
             } else {
                 (target.prefix.to_owned(), "ffn".to_owned())
             };
-            decode.trace(stream, target.trace, &prefix)?;
+            decode.trace(stream, slot_layer as usize, target.trace, &prefix)?;
             trace_value(trace, stream, &name, &self.work.out, rows, hidden)?;
         }
         Ok(())
@@ -638,6 +858,85 @@ pub(super) struct Dispatch<'a> {
     pub layer: u32,
 }
 
+pub(super) struct PeerBind<'a> {
+    pub device: &'a Device,
+    pub gpu0_layers: u32,
+    pub send_ptr: u64,
+    pub send_cap_bytes: usize,
+}
+
+pub(super) struct PeerBounce {
+    ptr: *mut u8,
+    routed_off: usize,
+}
+
+unsafe impl Send for PeerBounce {}
+unsafe impl Sync for PeerBounce {}
+
+impl PeerBounce {
+    fn new(max_send_bytes: usize, max_routed_bytes: usize) -> Result<Self> {
+        let routed_off = max_send_bytes.next_multiple_of(16);
+        let total = (routed_off + max_routed_bytes).next_multiple_of(16);
+        let mut raw = std::ptr::null_mut();
+        // SAFETY: CU_MEMHOSTALLOC_PORTABLE maps the pinned host bounce region into both CUDA contexts.
+        unsafe {
+            cudarc::driver::sys::cuMemHostAlloc(
+                &mut raw,
+                total,
+                cudarc::driver::sys::CU_MEMHOSTALLOC_PORTABLE,
+            )
+            .result()
+            .context("cuMemHostAlloc portable decode bounce")?;
+            std::ptr::write_bytes(raw.cast::<u8>(), 0, total);
+        }
+        Ok(Self {
+            ptr: raw.cast::<u8>(),
+            routed_off,
+        })
+    }
+
+    fn send_ptr(&self) -> *mut std::ffi::c_void {
+        self.ptr.cast()
+    }
+
+    fn routed_ptr(&self) -> *mut std::ffi::c_void {
+        unsafe { self.ptr.add(self.routed_off).cast() }
+    }
+}
+
+impl Drop for PeerBounce {
+    fn drop(&mut self) {
+        // SAFETY: ptr was allocated by cuMemHostAlloc and Decode::drop synchronizes streams first.
+        unsafe {
+            let _ = cudarc::driver::sys::cuMemFreeHost(self.ptr.cast());
+        }
+    }
+}
+
+pub(super) struct PeerDecode {
+    pub gpu0_layers: u32,
+    pub send_ptr: u64,
+    pub send_cap_bytes: usize,
+    pub device: Device,
+    pub contribute: DecodeOps,
+    pub combine: CombineOps,
+    pub mask: cudarc::driver::CudaFunction,
+    pub recv: CudaSlice<u8>,
+    pub active: CudaSlice<u32>,
+    pub final_active: CudaSlice<u32>,
+    pub generation: CudaSlice<u64>,
+    pub contributions: CudaSlice<bf16>,
+    pub done: CudaSlice<u32>,
+    pub routed_dev1: CudaSlice<bf16>,
+    pub routed_dev0: CudaSlice<bf16>,
+    pub scratch: CudaSlice<u8>,
+    pub bounce: PeerBounce,
+    pub fork: CudaEvent,
+    pub join: CudaEvent,
+    #[cfg(test)]
+    pub perturb_word: Option<(usize, u16)>,
+}
+
 pub(super) struct Decode {
     geometry: ExpertGeometry,
     shared_intermediate: u32,
@@ -648,6 +947,7 @@ pub(super) struct Decode {
     contribute: DecodeOps,
     prefill: PrefillOps,
     combine: CombineOps,
+    pub(super) peer: Option<PeerDecode>,
     ids: CudaSlice<i32>,
     weights: CudaSlice<bf16>,
     route_logits: CudaSlice<bf16>,
@@ -671,6 +971,8 @@ pub(super) struct Decode {
     mailbox: Arc<CudaStream>,
     segments: Vec<graphs::Segments>,
     verify_segments: std::collections::BTreeMap<usize, Vec<graphs::Segments>>,
+    peer_tail: Option<(usize, CudaGraph)>,
+    verify_peer_tails: std::collections::BTreeMap<usize, (usize, CudaGraph)>,
     mailbox_ready: CudaEvent,
     reader: Arc<CudaEvent>,
     mask: cudarc::driver::CudaFunction,
@@ -725,10 +1027,14 @@ impl Drop for Decode {
         self.mailbox
             .context()
             .record_err(self.mailbox.synchronize());
+        if let Some(peer) = &self.peer {
+            peer.device.ctx.record_err(peer.device.stream.synchronize());
+        }
     }
 }
 
-pub struct DecodeOptions {
+pub(super) struct DecodeOptions<'a> {
+    pub peer: Option<PeerBind<'a>>,
     pub geometry: ExpertGeometry,
     pub max_rows: usize,
     pub workers: u32,
@@ -741,8 +1047,9 @@ pub struct DecodeOptions {
 }
 
 impl Decode {
-    pub fn new(device: &Device, options: DecodeOptions) -> Result<Self> {
+    pub fn new(device: &Device, options: DecodeOptions<'_>) -> Result<Self> {
         let DecodeOptions {
+            peer: peer_info,
             geometry,
             max_rows,
             workers,
@@ -780,6 +1087,61 @@ impl Decode {
         let stream = &device.stream;
         let context = &device.ctx;
         let layout = crate::experts::catalogue::ExpertLayout::new(format, &geometry)?;
+        let scratch_bytes = usize::try_from(decode_scratch_bytes_mixed(
+            max_rows,
+            geometry.top_k as usize,
+            geometry.intermediate as usize,
+            shared_intermediate as usize,
+        ))?;
+        let peer = if let Some(bind) = peer_info {
+            let max_send = PeerSendLayout::for_rows(
+                max_rows,
+                geometry.hidden as usize,
+                geometry.top_k as usize,
+            )?;
+            ensure!(
+                bind.send_ptr != 0
+                    && bind.send_ptr.is_multiple_of(16)
+                    && bind.send_cap_bytes >= max_send.send_bytes,
+                "peer decode send region {:#x} bytes={} cannot hold max send bytes={}",
+                bind.send_ptr,
+                bind.send_cap_bytes,
+                max_send.send_bytes
+            );
+            context.bind_to_thread()?;
+            let bounce = PeerBounce::new(max_send.send_bytes, hidden * size_of::<bf16>())?;
+            let pstream = &bind.device.stream;
+            let pctx = &bind.device.ctx;
+            let untimed = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING);
+            let pd = PeerDecode {
+                gpu0_layers: bind.gpu0_layers,
+                send_ptr: bind.send_ptr,
+                send_cap_bytes: bind.send_cap_bytes,
+                device: bind.device.clone(),
+                contribute: DecodeOps::new_with_boundaries(pctx, swiglu_rounding, routed_weight)?,
+                combine: CombineOps::new(pctx)?,
+                mask: super::super::cubin::module(pctx, "moe_route")?
+                    .load_function("moe_route_mask")?,
+                recv: pstream.alloc_zeros(max_send.send_bytes)?,
+                active: pstream.alloc_zeros(choices)?,
+                final_active: pstream.clone_htod(&vec![1u32; choices])?,
+                generation: pstream.alloc_zeros(choices)?,
+                contributions: pstream.alloc_zeros(elements)?,
+                done: pstream.alloc_zeros(choices)?,
+                routed_dev1: pstream.alloc_zeros(hidden)?,
+                routed_dev0: stream.alloc_zeros(hidden)?,
+                scratch: pstream.alloc_zeros(scratch_bytes)?,
+                bounce,
+                fork: context.new_event(untimed)?,
+                join: pctx.new_event(untimed)?,
+                #[cfg(test)]
+                perturb_word: None,
+            };
+            context.bind_to_thread()?;
+            Some(pd)
+        } else {
+            None
+        };
         let decode = Self {
             geometry,
             shared_intermediate,
@@ -796,6 +1158,7 @@ impl Decode {
                 routed_weight,
             )?,
             combine: CombineOps::new(context)?,
+            peer,
             ids: stream.alloc_zeros(choices)?,
             weights: stream.alloc_zeros(choices)?,
             route_logits: stream.alloc_zeros(max_rows * geometry.experts as usize)?,
@@ -806,12 +1169,7 @@ impl Decode {
             done: stream.alloc_zeros(choices)?,
             shared: stream.alloc_zeros(hidden)?,
             scale: stream.alloc_zeros(max_rows)?,
-            scratch: stream.alloc_zeros(usize::try_from(decode_scratch_bytes_mixed(
-                max_rows,
-                geometry.top_k as usize,
-                geometry.intermediate as usize,
-                shared_intermediate as usize,
-            ))?)?,
+            scratch: stream.alloc_zeros(scratch_bytes)?,
             host_ids: pinned_zeros(context, choices)?,
             host_weights: pinned_zeros(context, choices)?,
             host_active: pinned_zeros(context, choices)?,
@@ -823,6 +1181,8 @@ impl Decode {
             mailbox: context.new_stream()?,
             segments: Vec::new(),
             verify_segments: std::collections::BTreeMap::new(),
+            peer_tail: None,
+            verify_peer_tails: std::collections::BTreeMap::new(),
             mailbox_ready: context.new_event(None)?,
             reader: Arc::new(context.new_event(None)?),
             mask: super::super::cubin::module(context, "moe_route")?
@@ -859,9 +1219,29 @@ impl Decode {
         Ok(decode)
     }
 
-    pub fn route(&mut self, device: &Device, ffn: &BoundFfn, x: Tensor<bf16, 2>) -> Result<()> {
-        self.route_device(device, ffn, x)?;
-        self.read_route(device, ffn, x)
+    pub(super) fn slot_stream<'a>(
+        &'a self,
+        device: &'a Device,
+        layer: usize,
+    ) -> &'a Arc<CudaStream> {
+        if let Some(peer) = &self.peer
+            && layer >= peer.gpu0_layers as usize
+        {
+            &peer.device.stream
+        } else {
+            &device.stream
+        }
+    }
+
+    pub fn route(
+        &mut self,
+        device: &Device,
+        layer: usize,
+        ffn: &BoundFfn,
+        x: Tensor<bf16, 2>,
+    ) -> Result<()> {
+        self.route_device(device, layer, ffn, x)?;
+        self.read_route(device, layer, ffn, x)
     }
 
     pub fn reset(&mut self) -> Result<()> {
@@ -870,7 +1250,13 @@ impl Decode {
         Ok(())
     }
 
-    fn route_device(&self, device: &Device, ffn: &BoundFfn, x: Tensor<bf16, 2>) -> Result<()> {
+    fn route_device(
+        &self,
+        device: &Device,
+        layer: usize,
+        ffn: &BoundFfn,
+        x: Tensor<bf16, 2>,
+    ) -> Result<()> {
         let BoundFfn::Moe { router, score, .. } = ffn else {
             anyhow::bail!("MoE route received a dense FFN");
         };
@@ -894,23 +1280,64 @@ impl Decode {
         );
         let k = self.geometry.top_k;
         let stream = &device.stream;
+        let (mut ids_view, mut weights_view) = if let Some(peer) = self
+            .peer
+            .as_ref()
+            .filter(|peer| layer >= peer.gpu0_layers as usize)
+        {
+            ensure!(
+                x.ptr == peer.send_ptr,
+                "peer decode layer={layer} input ptr={:#x} differs from send region {:#x}",
+                x.ptr,
+                peer.send_ptr
+            );
+            let layout = PeerSendLayout::for_rows(rows, self.geometry.hidden as usize, k as usize)?;
+            ensure!(
+                layout.send_bytes <= peer.send_cap_bytes,
+                "peer decode layer={layer} send bytes={} exceed capacity={}",
+                layout.send_bytes,
+                peer.send_cap_bytes
+            );
+            // SAFETY: send_ptr owns send_cap_bytes on GPU 0 and ids/weights offsets are 16-byte aligned past x.
+            unsafe {
+                (
+                    TensorMut::new(
+                        peer.send_ptr + layout.ids_off as u64,
+                        [rows as u32, k],
+                        [u64::from(k), 1],
+                        layout.ids_bytes as u64,
+                    )?,
+                    TensorMut::new(
+                        peer.send_ptr + layout.weights_off as u64,
+                        [rows as u32, k],
+                        [u64::from(k), 1],
+                        layout.weights_bytes as u64,
+                    )?,
+                )
+            }
+        } else {
+            (
+                TensorMut(view(
+                    &self.ids,
+                    stream,
+                    0,
+                    [rows as u32, k],
+                    [u64::from(k), 1],
+                )?),
+                TensorMut(view(
+                    &self.weights,
+                    stream,
+                    0,
+                    [rows as u32, k],
+                    [u64::from(k), 1],
+                )?),
+            )
+        };
         self.route.route(
             x,
             *router,
-            &mut TensorMut(view(
-                &self.ids,
-                stream,
-                0,
-                [rows as u32, k],
-                [u64::from(k), 1],
-            )?),
-            &mut TensorMut(view(
-                &self.weights,
-                stream,
-                0,
-                [rows as u32, k],
-                [u64::from(k), 1],
-            )?),
+            &mut ids_view,
+            &mut weights_view,
             &mut TensorMut(view(
                 &self.route_logits,
                 stream,
@@ -922,7 +1349,13 @@ impl Decode {
         )
     }
 
-    fn read_route(&mut self, device: &Device, ffn: &BoundFfn, x: Tensor<bf16, 2>) -> Result<()> {
+    fn read_route(
+        &mut self,
+        device: &Device,
+        layer: usize,
+        ffn: &BoundFfn,
+        x: Tensor<bf16, 2>,
+    ) -> Result<()> {
         let BoundFfn::Moe { router, .. } = ffn else {
             anyhow::bail!("MoE route mailbox received a dense FFN");
         };
@@ -943,8 +1376,30 @@ impl Decode {
         self.mailbox.wait(&self.reader)?;
         let count = rows * k as usize;
         {
-            let (ids, _ids) = self.ids.device_ptr(&self.mailbox);
-            let (weights, _weights) = self.weights.device_ptr(&self.mailbox);
+            let (ids_ptr, weights_ptr, _ids_guard, _weights_guard) = if let Some(peer) = self
+                .peer
+                .as_ref()
+                .filter(|peer| layer >= peer.gpu0_layers as usize)
+            {
+                ensure!(
+                    x.ptr == peer.send_ptr,
+                    "peer route mailbox layer={layer} input ptr={:#x} differs from send region {:#x}",
+                    x.ptr,
+                    peer.send_ptr
+                );
+                let layout =
+                    PeerSendLayout::for_rows(rows, self.geometry.hidden as usize, k as usize)?;
+                (
+                    peer.send_ptr + layout.ids_off as u64,
+                    peer.send_ptr + layout.weights_off as u64,
+                    None,
+                    None,
+                )
+            } else {
+                let (ids, g_ids) = self.ids.device_ptr(&self.mailbox);
+                let (weights, g_weights) = self.weights.device_ptr(&self.mailbox);
+                (ids, weights, Some(g_ids), Some(g_weights))
+            };
             let (host_ids, _ids_write) =
                 unsafe { self.host_ids.stream_synced_mut_slice(&self.mailbox) };
             let (host_weights, _weights_write) =
@@ -952,10 +1407,14 @@ impl Decode {
             let (host_x, _x_write) = unsafe { self.host_x.stream_synced_mut_slice(&self.mailbox) };
             // SAFETY: each copied prefix has its exact logical extent inside the owned mailbox.
             unsafe {
-                result::memcpy_dtoh_async(&mut host_ids[..count], ids, self.mailbox.cu_stream())?;
+                result::memcpy_dtoh_async(
+                    &mut host_ids[..count],
+                    ids_ptr,
+                    self.mailbox.cu_stream(),
+                )?;
                 result::memcpy_dtoh_async(
                     &mut host_weights[..count],
-                    weights,
+                    weights_ptr,
                     self.mailbox.cu_stream(),
                 )?;
                 result::memcpy_dtoh_async(
@@ -1039,35 +1498,50 @@ impl Decode {
         );
         validate_dispatch(rows, k, self.routed()?.1, &dispatch)?;
         let stream = &device.stream;
-        self.host_active.as_mut_slice()?[..rows * k].copy_from_slice(dispatch.active);
-        self.host_generation.as_mut_slice()?[..rows * k].copy_from_slice(dispatch.generation);
-        {
-            let (active, _active_read) =
-                unsafe { self.host_active.stream_synced_slice(&self.mailbox) };
-            let (generation, _generation_read) =
-                unsafe { self.host_generation.stream_synced_slice(&self.mailbox) };
-            let (active_ptr, _active_write) = self.active.device_ptr_mut(&self.mailbox);
-            let (generation_ptr, _generation_write) = self.generation.device_ptr_mut(&self.mailbox);
-            // SAFETY: owned pinned prefixes and device destinations each contain rows*top_k elements.
-            unsafe {
-                result::memcpy_htod_async(
-                    active_ptr,
-                    &active[..rows * k],
-                    self.mailbox.cu_stream(),
-                )?;
-                result::memcpy_htod_async(
-                    generation_ptr,
-                    &generation[..rows * k],
-                    self.mailbox.cu_stream(),
-                )?;
+        let on_peer = self
+            .peer
+            .as_ref()
+            .is_some_and(|peer| dispatch.layer >= peer.gpu0_layers);
+        if on_peer {
+            ensure!(
+                dispatch.assignments.is_empty()
+                    && dispatch.disk.is_empty()
+                    && dispatch.active.iter().all(|&a| a == 1),
+                "peer decode layer={} requires full GPU residency",
+                dispatch.layer
+            );
+        } else {
+            self.host_active.as_mut_slice()?[..rows * k].copy_from_slice(dispatch.active);
+            self.host_generation.as_mut_slice()?[..rows * k].copy_from_slice(dispatch.generation);
+            {
+                let (active, _active_read) =
+                    unsafe { self.host_active.stream_synced_slice(&self.mailbox) };
+                let (generation, _generation_read) =
+                    unsafe { self.host_generation.stream_synced_slice(&self.mailbox) };
+                let (active_ptr, _active_write) = self.active.device_ptr_mut(&self.mailbox);
+                let (generation_ptr, _generation_write) =
+                    self.generation.device_ptr_mut(&self.mailbox);
+                // SAFETY: owned pinned prefixes and device destinations each contain rows*top_k elements.
+                unsafe {
+                    result::memcpy_htod_async(
+                        active_ptr,
+                        &active[..rows * k],
+                        self.mailbox.cu_stream(),
+                    )?;
+                    result::memcpy_htod_async(
+                        generation_ptr,
+                        &generation[..rows * k],
+                        self.mailbox.cu_stream(),
+                    )?;
+                }
             }
+            self.mailbox_ready.record(&self.mailbox)?;
+            stream.wait(&self.mailbox_ready)?;
         }
-        self.mailbox_ready.record(&self.mailbox)?;
-        stream.wait(&self.mailbox_ready)?;
         if let Some(layer) = graph {
             self.segment(rows, layer)?.contribute.launch()?;
         } else {
-            self.contribute_device(device, ffn.clone(), slots, x)?;
+            self.contribute_device(device, dispatch.layer as usize, ffn.clone(), slots, x)?;
         }
         self.reader.record(stream)?;
         let reader = self.reader.clone();
@@ -1075,7 +1549,7 @@ impl Decode {
         if let Some(layer) = graph {
             self.segment(rows, layer)?.join.launch()?;
         } else {
-            self.combine_device(device, ffn, x, y)?;
+            self.combine_device(device, dispatch.layer as usize, ffn, x, y)?;
         }
         self.stats[1] += dispatch.active.iter().map(|&n| u64::from(n)).sum::<u64>();
         self.stats[4] += 1;
@@ -1086,6 +1560,7 @@ impl Decode {
     fn contribute_device(
         &mut self,
         device: &Device,
+        layer: usize,
         ffn: BoundFfn,
         slots: SlotBindings,
         x: Tensor<bf16, 2>,
@@ -1104,6 +1579,264 @@ impl Decode {
             self.geometry.hidden as usize,
         );
         let stream = &device.stream;
+        if let Some(peer) = self
+            .peer
+            .as_mut()
+            .filter(|peer| layer >= peer.gpu0_layers as usize)
+        {
+            ensure!(
+                x.ptr == peer.send_ptr,
+                "peer decode layer={layer} input ptr={:#x} differs from send region {:#x}",
+                x.ptr,
+                peer.send_ptr
+            );
+            let layout = PeerSendLayout::for_rows(rows, hidden, k)?;
+            ensure!(
+                layout.send_bytes <= peer.send_cap_bytes,
+                "peer decode layer={layer} send bytes={} exceed capacity={}",
+                layout.send_bytes,
+                peer.send_cap_bytes
+            );
+            let pstream = &peer.device.stream;
+            // SAFETY: contiguous GPU 0 send packet, portable bounce region, and GPU 1 recv slice stay live and ordered by fork/join events.
+            unsafe {
+                cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                    peer.bounce.send_ptr(),
+                    peer.send_ptr,
+                    layout.send_bytes,
+                    stream.cu_stream(),
+                )
+                .result()
+                .context("cuMemcpyDtoHAsync decode peer send 0->h")?;
+            }
+            peer.fork
+                .record(stream)
+                .context("cuEventRecord decode peer fork")?;
+            peer.device
+                .ctx
+                .bind_to_thread()
+                .context("cuCtxSetCurrent decode peer")?;
+            pstream
+                .wait(&peer.fork)
+                .context("cuStreamWaitEvent decode peer fork")?;
+            let recv_base = peer.recv.device_ptr(pstream).0;
+            unsafe {
+                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                    recv_base,
+                    peer.bounce.send_ptr(),
+                    layout.send_bytes,
+                    pstream.cu_stream(),
+                )
+                .result()
+                .context("cuMemcpyHtoDAsync decode peer recv h->1")?;
+            }
+            // SAFETY: recv_base owns layout.send_bytes on GPU 1 and x/ids/weights offsets are 16-byte aligned and disjoint.
+            let (p_x, p_ids, p_weights) = unsafe {
+                (
+                    Tensor::<bf16, 2>::new(
+                        recv_base,
+                        [rows as u32, hidden as u32],
+                        [hidden as u64, 1],
+                        layout.ids_off as u64,
+                    )?,
+                    Tensor::<i32, 2>::new(
+                        recv_base + layout.ids_off as u64,
+                        [rows as u32, k as u32],
+                        [k as u64, 1],
+                        layout.ids_bytes as u64,
+                    )?,
+                    Tensor::<bf16, 2>::new(
+                        recv_base + layout.weights_off as u64,
+                        [rows as u32, k as u32],
+                        [k as u64, 1],
+                        layout.weights_bytes as u64,
+                    )?,
+                )
+            };
+            let p_active = view(
+                &peer.active,
+                pstream,
+                0,
+                [rows as u32, k as u32],
+                [k as u64, 1],
+            )?;
+            let p_gen = view(
+                &peer.generation,
+                pstream,
+                0,
+                [rows as u32, k as u32],
+                [k as u64, 1],
+            )?;
+            // SAFETY: every table covers the expert domain and each assignment buffer covers rows*top_k on GPU 1.
+            unsafe {
+                pstream
+                    .launch_builder(&peer.mask)
+                    .arg(&p_ids.ptr)
+                    .arg(&slots.valid.ptr)
+                    .arg(&slots.generation.ptr)
+                    .arg(&p_active.ptr)
+                    .arg(&p_gen.ptr)
+                    .arg(&((rows * k) as i32))
+                    .arg(&(self.geometry.experts as i32))
+                    .launch(grid((rows * k).div_ceil(256), 256))
+                    .context("cuLaunchKernel decode peer moe_route_mask")?;
+                let (done_ptr, _write) = peer.done.device_ptr_mut(pstream);
+                result::memset_d8_async(
+                    done_ptr,
+                    0,
+                    rows * k * size_of::<u32>(),
+                    pstream.cu_stream(),
+                )
+                .context("cuMemsetD8Async decode peer done")?;
+            }
+            let p_contributions = view(
+                &peer.contributions,
+                pstream,
+                0,
+                [rows as u32, k as u32, hidden as u32],
+                [(k * hidden) as u64, hidden as u64, 1],
+            )?;
+            let mut p_routed =
+                TensorMut(qwen::matrix(&peer.routed_dev1, pstream, 0, rows, hidden)?);
+            let mut p_done = TensorMut(view(
+                &peer.done,
+                pstream,
+                0,
+                [rows as u32, k as u32],
+                [k as u64, 1],
+            )?);
+            let peer_input = MoeDecode {
+                x: p_x,
+                ids: p_ids,
+                active: p_active,
+                weights: p_weights,
+                slots_gate_up: slots.gate_up,
+                slots_down: slots.down,
+                slot_valid: slots.valid,
+                slot_generation: slots.generation,
+                assignment_gen: p_gen,
+                shared_gate: shared[0],
+                shared_up: shared[1],
+                shared_down: shared[2],
+                shared_expert_gate: shared_gate,
+                contributions: p_contributions,
+                shared_out: &mut p_routed,
+                done: &mut p_done,
+            };
+            let p_scratch = qwen::scratch(&peer.scratch, pstream);
+            if let Some(slot) = self.fp8_slot.as_ref() {
+                peer.contribute
+                    .contribute_routed_w8a16(
+                        pstream,
+                        &peer_input,
+                        slot,
+                        &p_scratch,
+                        self.geometry.intermediate,
+                    )
+                    .context("decode peer contribute_routed_w8a16")?;
+            } else {
+                peer.contribute
+                    .contribute_routed(pstream, &peer_input, &p_scratch, self.geometry.intermediate)
+                    .context("decode peer contribute_routed")?;
+            }
+            let p_final_active = view(
+                &peer.final_active,
+                pstream,
+                0,
+                [rows as u32, k as u32],
+                [k as u64, 1],
+            )?;
+            peer.combine
+                .combine_routed(
+                    pstream,
+                    &MoeCombineRouted {
+                        ids: p_ids,
+                        final_active: p_final_active,
+                        done: p_done.read(),
+                        contributions: p_contributions,
+                        routed_out: TensorMut(p_routed.read()),
+                    },
+                )
+                .context("decode peer combine_routed")?;
+            let src_routed = peer.routed_dev1.device_ptr(pstream).0;
+            let routed_bytes = rows * hidden * size_of::<bf16>();
+            // SAFETY: peer.routed_dev1 and portable bounce region stay live and ordered before join.
+            unsafe {
+                cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                    peer.bounce.routed_ptr(),
+                    src_routed,
+                    routed_bytes,
+                    pstream.cu_stream(),
+                )
+                .result()
+                .context("cuMemcpyDtoHAsync decode peer routed 1->h")?;
+            }
+            peer.join
+                .record(pstream)
+                .context("cuEventRecord decode peer join")?;
+            device
+                .ctx
+                .bind_to_thread()
+                .context("cuCtxSetCurrent decode gpu0")?;
+            let ids = view(&self.ids, stream, 0, [rows as u32, k as u32], [k as u64, 1])?;
+            let active = view(
+                &self.active,
+                stream,
+                0,
+                [rows as u32, k as u32],
+                [k as u64, 1],
+            )?;
+            let contributions = view(
+                &self.contributions,
+                stream,
+                0,
+                [rows as u32, k as u32, hidden as u32],
+                [(k * hidden) as u64, hidden as u64, 1],
+            )?;
+            let mut shared_out = TensorMut(qwen::matrix(&self.shared, stream, 0, rows, hidden)?);
+            let mut done = TensorMut(view(
+                &self.done,
+                stream,
+                0,
+                [rows as u32, k as u32],
+                [k as u64, 1],
+            )?);
+            let gpu0_input = MoeDecode {
+                x,
+                ids,
+                active,
+                weights: view(
+                    &self.weights,
+                    stream,
+                    0,
+                    [rows as u32, k as u32],
+                    [k as u64, 1],
+                )?,
+                slots_gate_up: slots.gate_up,
+                slots_down: slots.down,
+                slot_valid: slots.valid,
+                slot_generation: slots.generation,
+                assignment_gen: view(
+                    &self.generation,
+                    stream,
+                    0,
+                    [rows as u32, k as u32],
+                    [k as u64, 1],
+                )?,
+                shared_gate: shared[0],
+                shared_up: shared[1],
+                shared_down: shared[2],
+                shared_expert_gate: shared_gate,
+                contributions,
+                shared_out: &mut shared_out,
+                done: &mut done,
+            };
+            let scratch = qwen::scratch(&self.scratch, stream);
+            return self
+                .contribute
+                .contribute_shared(stream, &gpu0_input, &scratch, self.geometry.intermediate)
+                .context("decode gpu0 contribute_shared");
+        }
         {
             let (done_ptr, _write) = self.done.device_ptr_mut(stream);
             // SAFETY: done owns max_rows*top_k words and is ordered after the preceding layer's combine.
@@ -1249,6 +1982,7 @@ impl Decode {
     fn combine_device(
         &self,
         device: &Device,
+        layer: usize,
         ffn: BoundFfn,
         x: Tensor<bf16, 2>,
         y: &mut TensorMut<bf16, 2>,
@@ -1262,22 +1996,7 @@ impl Decode {
             self.geometry.hidden as usize,
         );
         let stream = &device.stream;
-        let ids = view(&self.ids, stream, 0, [rows as u32, k as u32], [k as u64, 1])?;
-        let contributions = view(
-            &self.contributions,
-            stream,
-            0,
-            [rows as u32, k as u32, hidden as u32],
-            [(k * hidden) as u64, hidden as u64, 1],
-        )?;
         let shared_out = qwen::matrix(&self.shared, stream, 0, rows, hidden)?;
-        let done = view(
-            &self.done,
-            stream,
-            0,
-            [rows as u32, k as u32],
-            [k as u64, 1],
-        )?;
         let mut gate_view = None;
         let mut scale = None;
         if let Some(gate) = shared_gate {
@@ -1286,6 +2005,73 @@ impl Decode {
             gate_view = Some(gate);
             scale = Some(written);
         }
+        if let Some(peer) = self
+            .peer
+            .as_ref()
+            .filter(|peer| layer >= peer.gpu0_layers as usize)
+        {
+            stream
+                .wait(&peer.join)
+                .context("cuStreamWaitEvent decode peer join")?;
+            let routed_in = qwen::matrix(&peer.routed_dev0, stream, 0, rows, hidden)?;
+            // SAFETY: portable bounce region was written before peer.join and routed_in is live on GPU 0.
+            unsafe {
+                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                    routed_in.ptr,
+                    peer.bounce.routed_ptr(),
+                    rows * hidden * size_of::<bf16>(),
+                    stream.cu_stream(),
+                )
+                .result()
+                .context("cuMemcpyHtoDAsync decode peer routed h->0")?;
+            }
+            #[cfg(test)]
+            if let Some((word_idx, bits)) = peer.perturb_word {
+                ensure!(
+                    word_idx < rows * hidden,
+                    "perturbed word={word_idx} outside routed_dev0 len={}",
+                    rows * hidden
+                );
+                // SAFETY: word_idx is inside the owned peer.routed_dev0 buffer on GPU 0.
+                unsafe {
+                    cudarc::driver::sys::cuMemsetD16Async(
+                        routed_in.ptr + (word_idx * 2) as u64,
+                        bits,
+                        1,
+                        stream.cu_stream(),
+                    )
+                    .result()
+                    .context("cuMemsetD16Async perturb routed_peer")?;
+                }
+            }
+            return self
+                .combine
+                .join_routed(
+                    stream,
+                    &MoeJoinRouted {
+                        routed_in,
+                        shared_out,
+                        scale: scale.map(|s| s.0),
+                        y: TensorMut(y.read()),
+                    },
+                )
+                .context("decode gpu0 join_routed");
+        }
+        let ids = view(&self.ids, stream, 0, [rows as u32, k as u32], [k as u64, 1])?;
+        let contributions = view(
+            &self.contributions,
+            stream,
+            0,
+            [rows as u32, k as u32, hidden as u32],
+            [(k * hidden) as u64, hidden as u64, 1],
+        )?;
+        let done = view(
+            &self.done,
+            stream,
+            0,
+            [rows as u32, k as u32],
+            [k as u64, 1],
+        )?;
         let final_active = view(
             &self.final_active,
             stream,
@@ -1365,7 +2151,13 @@ impl Decode {
         Ok(())
     }
 
-    pub fn trace(&self, stream: &Arc<CudaStream>, trace: &mut Trace, prefix: &str) -> Result<()> {
+    pub fn trace(
+        &self,
+        stream: &Arc<CudaStream>,
+        layer: usize,
+        trace: &mut Trace,
+        prefix: &str,
+    ) -> Result<()> {
         let (rows, k, hidden) = (
             self.phase.rows,
             self.geometry.top_k as usize,
@@ -1382,15 +2174,29 @@ impl Decode {
             vec![rows, k],
             weights.iter().map(|v| v.to_f32()).collect(),
         )?;
-        for (name, data, shape) in [
-            ("contributions", &self.contributions, vec![rows, k, hidden]),
-            ("shared", &self.shared, vec![rows, hidden]),
+        let (contrib_stream, contrib_slice, done_slice) = if let Some(peer) = self
+            .peer
+            .as_ref()
+            .filter(|peer| layer >= peer.gpu0_layers as usize)
+        {
+            (&peer.device.stream, &peer.contributions, &peer.done)
+        } else {
+            (stream, &self.contributions, &self.done)
+        };
+        for (name, data_stream, data, shape) in [
+            (
+                "contributions",
+                contrib_stream,
+                contrib_slice,
+                vec![rows, k, hidden],
+            ),
+            ("shared", stream, &self.shared, vec![rows, hidden]),
         ] {
             let len = shape.iter().product::<usize>();
             trace.add(
                 format!("{prefix}.moe.{name}"),
                 shape,
-                stream
+                data_stream
                     .clone_dtoh(&data.slice(..len))?
                     .into_iter()
                     .map(bf16::to_f32)
@@ -1400,8 +2206,8 @@ impl Decode {
         trace.add(
             format!("{prefix}.moe.done"),
             vec![rows, k],
-            stream
-                .clone_dtoh(&self.done.slice(..rows * k))?
+            contrib_stream
+                .clone_dtoh(&done_slice.slice(..rows * k))?
                 .into_iter()
                 .map(|v| v as f32)
                 .collect(),

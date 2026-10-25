@@ -240,6 +240,15 @@ pub struct PlanInputs<'a> {
     pub wave_rows: u32,
 }
 
+/// Measured peer capacity, captured 4 KiB decode bounce rate, and eager 8/68 MiB prefill rates.
+#[derive(Clone, Copy, Debug)]
+pub struct PeerInputs<'a> {
+    pub device_free_bytes: u64,
+    pub device_reserved_bytes: u64,
+    pub decode_transfer: (u64, f64, f64),
+    pub prefill_transfers: &'a [(u64, f64, f64)],
+}
+
 /// Setup capacity derived for one admission cap.
 #[derive(Clone, Debug)]
 pub struct Capacity {
@@ -247,7 +256,9 @@ pub struct Capacity {
     pub span_rows: u32,
     pub wave_rows: u32,
     pub device_expert_bytes: u64,
+    pub peer_expert_bytes: u64,
     pub host_expert_bytes: u64,
+    pub gpu0_layers: u32,
     pub slots_per_layer: Vec<u32>,
     /// Usable host blocks after reserving the per-token spare blocks.
     pub host_blocks: u32,
@@ -265,6 +276,18 @@ pub struct Capacity {
 impl Capacity {
     pub fn slots_total(&self) -> u32 {
         self.slots_per_layer.iter().sum()
+    }
+
+    pub fn gpu0_slots(&self) -> u32 {
+        self.slots_per_layer[..self.gpu0_layers as usize]
+            .iter()
+            .sum()
+    }
+
+    pub fn peer_slots(&self) -> u32 {
+        self.slots_per_layer[self.gpu0_layers as usize..]
+            .iter()
+            .sum()
     }
 
     pub fn slot_bytes(&self) -> u64 {
@@ -302,6 +325,16 @@ pub fn select_span(
     prefill_rows: u32,
     candidates: &[SpanCandidate],
 ) -> Result<(usize, Capacity)> {
+    select_span_with_peer(inputs, admission_cap, prefill_rows, candidates, None)
+}
+
+pub fn select_span_with_peer(
+    inputs: &PlanInputs<'_>,
+    admission_cap: u32,
+    prefill_rows: u32,
+    candidates: &[SpanCandidate],
+    peer: Option<PeerInputs<'_>>,
+) -> Result<(usize, Capacity)> {
     ensure!(!candidates.is_empty(), "empty span candidate list");
     let mut best: Option<(usize, u32, u32, Capacity)> = None;
     let mut failures: Vec<String> = Vec::with_capacity(candidates.len());
@@ -312,7 +345,7 @@ pub fn select_span(
             reserves: &candidate.reserves,
             ..inputs.clone()
         };
-        let capacity = match capacity(&candidate_inputs, admission_cap) {
+        let capacity = match capacity_with_peer(&candidate_inputs, admission_cap, peer) {
             Ok(capacity) => capacity,
             Err(error) => {
                 failures.push(format!("candidate {index}: {error}"));
@@ -325,10 +358,10 @@ pub fn select_span(
             prefill_rows,
             candidate.span_rows,
         )?;
-        if borrow > capacity.slots_total() - inputs.geometry.layers {
+        if borrow > capacity.gpu0_slots() - capacity.gpu0_layers {
             failures.push(format!(
                 "candidate {index}: borrow {borrow} leaves fewer than {} slots",
-                inputs.geometry.layers
+                capacity.gpu0_layers
             ));
             continue;
         }
@@ -416,8 +449,57 @@ pub fn equal_slots(total_slots: u64, layers: u32) -> Result<Vec<u32>> {
         .collect())
 }
 
+fn peer_rate(transfers: &[(u64, f64, f64)], bytes: u64) -> Result<(f64, f64)> {
+    ensure!(!transfers.is_empty(), "empty peer transfer calibration");
+    for (index, &(b, r01, r10)) in transfers.iter().enumerate() {
+        ensure!(
+            b > 0
+                && r01.is_finite()
+                && r01 > 0.0
+                && r10.is_finite()
+                && r10 > 0.0
+                && (index == 0 || b > transfers[index - 1].0),
+            "invalid peer transfer calibration cell ({b}, {r01}, {r10})"
+        );
+    }
+    if bytes <= transfers[0].0 {
+        return Ok((transfers[0].1, transfers[0].2));
+    }
+    let last = transfers.len() - 1;
+    if bytes >= transfers[last].0 {
+        return Ok((transfers[last].1, transfers[last].2));
+    }
+    for window in transfers.windows(2) {
+        let (b0, r01_0, r10_0) = window[0];
+        let (b1, r01_1, r10_1) = window[1];
+        if bytes >= b0 && bytes <= b1 {
+            let t = (bytes - b0) as f64 / (b1 - b0) as f64;
+            return Ok((r01_0 + (r01_1 - r01_0) * t, r10_0 + (r10_1 - r10_0) * t));
+        }
+    }
+    anyhow::bail!("no bracketing peer transfer cell for bytes={bytes}")
+}
+
+fn peer_hop_seconds(
+    transfers: &[(u64, f64, f64)],
+    bytes_0_to_1: u64,
+    bytes_1_to_0: u64,
+) -> Result<f64> {
+    let (r01, _) = peer_rate(transfers, bytes_0_to_1)?;
+    let (_, r10) = peer_rate(transfers, bytes_1_to_0)?;
+    Ok(bytes_0_to_1 as f64 / r01 + bytes_1_to_0 as f64 / r10)
+}
+
 /// Setup capacity from the reserves-first subtraction for one admission cap.
 pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity> {
+    capacity_with_peer(inputs, admission_cap, None)
+}
+
+pub fn capacity_with_peer(
+    inputs: &PlanInputs<'_>,
+    admission_cap: u32,
+    peer: Option<PeerInputs<'_>>,
+) -> Result<Capacity> {
     let geometry = inputs.geometry;
     ensure!(inputs.span_rows > 0, "zero span rows");
     ensure!(
@@ -459,18 +541,11 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
     let routed_slots = u64::from(geometry.layers)
         .checked_mul(u64::from(geometry.experts))
         .context("routed expert count overflow")?;
-    let total_slots = (device_expert_bytes / slot_bytes).min(routed_slots);
+    let gpu0_max_slots = (device_expert_bytes / slot_bytes).min(routed_slots);
     ensure!(
-        total_slots >= u64::from(geometry.layers),
-        "device expert bytes {device_expert_bytes} hold {total_slots} slots, below one per layer ({})",
+        gpu0_max_slots >= u64::from(geometry.layers),
+        "device expert bytes {device_expert_bytes} hold {gpu0_max_slots} slots, below one per layer ({})",
         geometry.layers
-    );
-    let slots_per_layer = equal_slots(total_slots, geometry.layers)?;
-    let host_block_slots = host_expert_bytes / slot_bytes;
-    let non_gpu = routed_slots - total_slots;
-    ensure!(
-        non_gpu == 0 || host_block_slots >= u64::from(admission_cap),
-        "host blocks {host_block_slots} cannot hold {admission_cap} reserve blocks"
     );
     let headroom = span_borrow_slots(
         inputs.reserves,
@@ -478,6 +553,68 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
         inputs.span_rows,
         inputs.span_rows,
     )?;
+    let worker_count = inputs.service.worker_count()?;
+    let mut gpu0_layers = geometry.layers;
+    let mut peer_expert_bytes = 0u64;
+    let mut total_slots = gpu0_max_slots;
+    let mut slots_per_layer = equal_slots(total_slots, geometry.layers)?;
+    if gpu0_max_slots < routed_slots
+        && let Some(peer) = peer
+    {
+        ensure!(
+            peer.device_free_bytes >= peer.device_reserved_bytes,
+            "peer persistent reserves {} B exceed peer device free bytes {}",
+            peer.device_reserved_bytes,
+            peer.device_free_bytes
+        );
+        let peer_free_expert_bytes = peer.device_free_bytes - peer.device_reserved_bytes;
+        let peer_max_slots = peer_free_expert_bytes / slot_bytes;
+        let max_peer_layers = (peer_max_slots / u64::from(geometry.experts))
+            .min(u64::from(geometry.layers.saturating_sub(1))) as u32;
+        let needed_peer_layers =
+            (routed_slots - gpu0_max_slots).div_ceil(u64::from(geometry.experts)) as u32;
+        let peer_layers = needed_peer_layers.min(max_peer_layers);
+        let candidate_gpu0_layers = geometry.layers - peer_layers;
+        let gpu0_slots =
+            gpu0_max_slots.min(u64::from(candidate_gpu0_layers) * u64::from(geometry.experts));
+        let peer_slots = u64::from(peer_layers) * u64::from(geometry.experts);
+        if peer_layers > 0 && gpu0_slots >= u64::from(candidate_gpu0_layers) + u64::from(headroom) {
+            let row_0_to_1 = u64::from(geometry.hidden) * 2 + u64::from(geometry.top_k) * 6;
+            let row_1_to_0 = u64::from(geometry.hidden) * 2;
+            let decode_hop_seconds = f64::from(peer_layers)
+                * peer_hop_seconds(
+                    std::slice::from_ref(&peer.decode_transfer),
+                    row_0_to_1,
+                    row_1_to_0,
+                )?;
+            let removed_misses = (gpu0_slots + peer_slots).saturating_sub(gpu0_max_slots);
+            let decode_miss_seconds = (removed_misses as f64 / f64::from(geometry.experts))
+                * inputs.service.seconds(1, 1, worker_count)?;
+            let prefill_hop_seconds = f64::from(peer_layers)
+                * peer_hop_seconds(
+                    peer.prefill_transfers,
+                    u64::from(inputs.span_rows) * row_0_to_1,
+                    u64::from(inputs.span_rows) * row_1_to_0,
+                )?;
+            let prefill_stream_seconds =
+                (removed_misses * slot_bytes) as f64 / inputs.h2d_bytes_per_second;
+            if decode_hop_seconds < decode_miss_seconds
+                && prefill_hop_seconds < prefill_stream_seconds
+            {
+                gpu0_layers = candidate_gpu0_layers;
+                peer_expert_bytes = peer_free_expert_bytes;
+                total_slots = gpu0_slots + peer_slots;
+                slots_per_layer = equal_slots(gpu0_slots, gpu0_layers)?;
+                slots_per_layer.resize(geometry.layers as usize, geometry.experts);
+            }
+        }
+    }
+    let host_block_slots = host_expert_bytes / slot_bytes;
+    let non_gpu = routed_slots - total_slots;
+    ensure!(
+        non_gpu == 0 || host_block_slots >= u64::from(admission_cap),
+        "host blocks {host_block_slots} cannot hold {admission_cap} reserve blocks"
+    );
     let host_target = non_gpu
         .checked_add(u64::from(headroom))
         .context("host headroom overflow")?;
@@ -498,14 +635,17 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
             .checked_add(u64::from(reserve))
             .and_then(|blocks| blocks.checked_mul(slot_bytes))
             .context("partial host arena bytes overflow")?;
-        let backed_bytes = routed_slots
+        let swappable_slots = u64::from(gpu0_layers)
+            .checked_mul(u64::from(geometry.experts))
+            .context("swappable expert slot count overflow")?;
+        let backed_bytes = swappable_slots
             .checked_mul(slot_bytes)
             .context("complete host arena bytes overflow")?;
-        if routed_slots <= host_block_slots
+        if swappable_slots <= host_block_slots
             && (partial_bytes > inputs.host_registration_bytes
                 || backed_bytes <= inputs.host_registration_bytes)
         {
-            host_blocks = routed_slots;
+            host_blocks = swappable_slots;
             reserve = 0;
         }
         (host_blocks, reserve)
@@ -527,7 +667,6 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
         .and_then(|blocks| blocks.checked_mul(slot_bytes))
         .context("host arena bytes overflow")?;
     let pinned = arena_bytes > 0 && arena_bytes <= inputs.host_registration_bytes;
-    let worker_count = inputs.service.worker_count()?;
     let disk_workers = if u64::from(host_blocks) < host_target {
         ensure!(inputs.disk_readers > 0, "no measured disk readers");
         inputs.disk_readers
@@ -539,7 +678,9 @@ pub fn capacity(inputs: &PlanInputs<'_>, admission_cap: u32) -> Result<Capacity>
         span_rows: inputs.span_rows,
         wave_rows: inputs.wave_rows,
         device_expert_bytes,
+        peer_expert_bytes,
         host_expert_bytes,
+        gpu0_layers,
         slots_per_layer,
         host_blocks,
         spare_blocks: reserve,
@@ -599,9 +740,13 @@ impl TierLedger {
     pub fn empty(layout: SlotLayout, host_blocks: u32) -> Result<Self> {
         let geometry = layout.geometry();
         let (layer_of, count) = Self::positions(&layout)?;
+        let routed = u64::from(geometry.layers) * u64::from(geometry.experts);
+        let peer_complete = (layout.gpu0_layers()..geometry.layers)
+            .all(|layer| layout.slot_count(layer).ok() == Some(geometry.experts));
+        let swappable = u64::from(layout.gpu0_layers()) * u64::from(geometry.experts);
         let ledger = Self {
-            host_backing: u64::from(host_blocks)
-                == u64::from(geometry.layers) * u64::from(geometry.experts),
+            host_backing: u64::from(host_blocks) == routed
+                || (peer_complete && u64::from(host_blocks) == swappable),
             gpu: vec![vec![false; geometry.experts as usize]; geometry.layers as usize],
             host: vec![vec![false; geometry.experts as usize]; geometry.layers as usize],
             slots: vec![EMPTY_SLOT; count],
@@ -1588,7 +1733,9 @@ mod tests {
             span_rows: 4,
             wave_rows: 2,
             device_expert_bytes: slots_per_layer.iter().map(|&n| u64::from(n)).sum::<u64>() * slot,
+            peer_expert_bytes: 0,
             host_expert_bytes: u64::from(host_blocks) * slot,
+            gpu0_layers: geometry.layers,
             slots_per_layer,
             host_blocks,
             spare_blocks: 0,
@@ -1599,6 +1746,149 @@ mod tests {
             pinned: false,
         };
         SlotLayout::new(geometry, &capacity).unwrap()
+    }
+
+    #[test]
+    fn peer_capacity_splits_layers_and_prices_measured_hops() {
+        let service = service();
+        let reserves = reserves();
+        let slot = slot();
+        let mut inputs = inputs(&service, &reserves);
+        inputs.device_free_bytes = reserves.persistent_bytes(slot).unwrap() + 11 * slot;
+        let fast_prefill = [
+            (8 * 1024 * 1024, 23e9, 23e9),
+            (68 * 1024 * 1024, 23e9, 23e9),
+        ];
+        let peer = PeerInputs {
+            device_free_bytes: 10 * slot,
+            device_reserved_bytes: 2 * slot,
+            decode_transfer: (4_096, 200e6, 200e6),
+            prefill_transfers: &fast_prefill,
+        };
+        let derived = capacity_with_peer(&inputs, 0, Some(peer)).unwrap();
+        assert_eq!(derived.gpu0_layers, 1);
+        assert_eq!(derived.slots_per_layer, vec![8, 8]);
+        assert_eq!(derived.gpu0_slots(), 8);
+        assert_eq!(derived.peer_slots(), 8);
+        assert_eq!(derived.disk_bytes, 0);
+        let slow_decode = capacity_with_peer(
+            &inputs,
+            0,
+            Some(PeerInputs {
+                decode_transfer: (4_096, 100.0, 100.0),
+                ..peer
+            }),
+        )
+        .unwrap();
+        assert_eq!(slow_decode.gpu0_layers, 2);
+        assert_eq!(slow_decode.slots_per_layer, vec![6, 5]);
+        assert_eq!(slow_decode.peer_slots(), 0);
+        let slow_prefill = [
+            (8 * 1024 * 1024, 100.0, 100.0),
+            (68 * 1024 * 1024, 100.0, 100.0),
+        ];
+        let rejected = capacity_with_peer(
+            &inputs,
+            0,
+            Some(PeerInputs {
+                prefill_transfers: &slow_prefill,
+                ..peer
+            }),
+        )
+        .unwrap();
+        assert_eq!(rejected.gpu0_layers, 2);
+        assert_eq!(rejected.slots_per_layer, vec![6, 5]);
+        assert_eq!(rejected.peer_slots(), 0);
+
+        let a4000_geom = ExpertGeometry {
+            first_layer: 0,
+            layers: 40,
+            experts: 256,
+            top_k: 8,
+            hidden: 2048,
+            intermediate: 512,
+        };
+        let a4000_layout = crate::experts::catalogue::ExpertLayout::new(
+            crate::model_spec::ExpertFormat::Fp8W8a16,
+            &a4000_geom,
+        )
+        .unwrap();
+        let fp8_slot = a4000_layout.slot_bytes();
+        assert_eq!(fp8_slot, 3_151_872);
+        let a4000_service = ServiceTable::new(
+            "a4000-7950x",
+            vec![ServiceCell {
+                workers: 8,
+                rows: 1,
+                experts: 1,
+                seconds: 0.00025,
+            }],
+        )
+        .unwrap();
+        let a4000_inputs = PlanInputs {
+            geometry: a4000_geom,
+            layout: a4000_layout,
+            device_free_bytes: reserves.persistent_bytes(fp8_slot).unwrap() + 3_500 * fp8_slot,
+            host_available_bytes: reserves.host_bytes(fp8_slot).unwrap() + 4_096 * fp8_slot,
+            h2d_bytes_per_second: 26.82e9,
+            d2h_bytes_per_second: 24.0e9,
+            copy_engines: 2,
+            disk_readers: 2,
+            host_registration_bytes: 4_096 * fp8_slot,
+            service: &a4000_service,
+            reserves: &reserves,
+            span_rows: 4096,
+            wave_rows: 256,
+        };
+        let a4000_prefill = [
+            (8 * 1024 * 1024, 5.1e9, 5.1e9),
+            (68 * 1024 * 1024, 5.1e9, 5.1e9),
+        ];
+        let a4000_peer = PeerInputs {
+            device_free_bytes: 19 * 256 * fp8_slot + 1_300_000_000,
+            device_reserved_bytes: 1_300_000_000 + 128 * fp8_slot,
+            decode_transfer: (4_096, 330e6, 330e6),
+            prefill_transfers: &a4000_prefill,
+        };
+        let a4000 = capacity_with_peer(&a4000_inputs, 0, Some(a4000_peer)).unwrap();
+        assert_eq!(a4000.gpu0_layers, 22);
+        assert_eq!(a4000.gpu0_slots(), 3_500);
+        assert_eq!(a4000.peer_slots(), 18 * 256);
+        assert_eq!(a4000.slots_total(), 3_500 + 18 * 256);
+        assert_eq!(a4000.disk_bytes, 0);
+        assert!(a4000.slots_per_layer[..22].iter().all(|&s| s < 256));
+        assert!(a4000.slots_per_layer[22..].iter().all(|&s| s == 256));
+
+        let a4000_30g_inputs = PlanInputs {
+            host_available_bytes: reserves.host_bytes(fp8_slot).unwrap() + 8_000 * fp8_slot,
+            host_registration_bytes: 8_000 * fp8_slot,
+            ..a4000_inputs.clone()
+        };
+        let a4000_30g = capacity_with_peer(&a4000_30g_inputs, 13, Some(a4000_peer)).unwrap();
+        assert_eq!(a4000_30g.gpu0_layers, 22);
+        assert_eq!(a4000_30g.host_blocks, 22 * 256);
+        assert_eq!(a4000_30g.spare_blocks, 0);
+        assert!(a4000_30g.pinned);
+        let a4000_30g_ledger = TierLedger::empty(
+            SlotLayout::new(a4000_geom, &a4000_30g).unwrap(),
+            a4000_30g.host_blocks,
+        )
+        .unwrap();
+        assert!(a4000_30g_ledger.has_full_host_backing());
+
+        // 18 removed misses * 0.25 ms = 4.5 ms/tok; old single_gpu_misses (6740/256 * 0.25 ms) = 6.58 ms/tok.
+        // At 28 MB/s bounce (18 * 8240 / 28e6 = 5.30 ms/tok), exact removed_misses rejects peer while old overcount would accept.
+        let overpriced_partial = capacity_with_peer(
+            &a4000_inputs,
+            0,
+            Some(PeerInputs {
+                decode_transfer: (4_096, 28e6, 28e6),
+                ..a4000_peer
+            }),
+        )
+        .unwrap();
+        assert_eq!(overpriced_partial.gpu0_layers, 40);
+        assert_eq!(overpriced_partial.peer_slots(), 0);
     }
 
     fn ledger_for(

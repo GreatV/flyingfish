@@ -14,17 +14,20 @@ constexpr int DN_ROWS = 16;  // down output rows per block
 constexpr int DN_NT = LANES * DN_ROWS;
 
 #define FD_GUARD_MOE_GATE_UP do {                                                  \
-  if (blockDim.x != GU_NT || gridDim.y != rows || gridDim.z != top_k + 1 ||        \
-      rows < 1 || rows > 8 || top_k < 1 || (hidden & 7) != 0 || inter < 1 ||       \
-      shared_inter < 1 || (shared_inter & 7) != 0)                                 \
-    __trap();                                                                     \
+  if (blockDim.x != GU_NT || gridDim.y != rows ||                                  \
+      (gridDim.z != top_k + 1 && gridDim.z != top_k) ||                            \
+      rows < 1 || rows > 8 || top_k < 0 || gridDim.z < 1 ||                        \
+      (hidden & 7) != 0 || inter < 1 || shared_inter < 1 ||                        \
+      (shared_inter & 7) != 0)                                                     \
+    __trap();                                                                      \
 } while (0)
 
 #define FD_GUARD_MOE_DOWN do {                                                     \
-  if (blockDim.x != DN_NT || gridDim.y != rows || gridDim.z != top_k + 1 ||        \
-      rows < 1 || rows > 8 || top_k < 1 || (inter & 7) != 0 ||                     \
-      (shared_inter & 7) != 0)                                                     \
-    __trap();                                                                     \
+  if (blockDim.x != DN_NT || gridDim.y != rows ||                                  \
+      (gridDim.z != top_k + 1 && gridDim.z != top_k) ||                            \
+      rows < 1 || rows > 8 || top_k < 0 || gridDim.z < 1 ||                        \
+      (inter & 7) != 0 || (shared_inter & 7) != 0)                                 \
+    __trap();                                                                      \
 } while (0)
 
 __device__ __forceinline__ float moe_dot8(uint4 w, uint4 a) {
