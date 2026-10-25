@@ -842,7 +842,7 @@ fn projection(
         put(
             expected,
             format!("{base}.{}", layout.scale_suffix()),
-            Dtype::BF16,
+            layout.scale_dtype(),
             layout.scale_shape(n as u32, k as u32).to_vec(),
             TensorScope::Text,
         );

@@ -1,6 +1,70 @@
 //! Published E4M3 codes and the W8A16 effective-weight rounding contract.
 //! Format: NVIDIA CUDA 13.0 Math API, __nv_fp8_e4m3 (bias 7; no infinity).
 use half::bf16;
+use safetensors::Dtype;
+
+/// Row-major scales for a published `[N, K]` FP8 weight.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Fp8BlockScale {
+    block: [u32; 2],
+    dtype: Dtype,
+}
+
+impl Fp8BlockScale {
+    pub fn new(block: [u32; 2], dtype: Dtype) -> anyhow::Result<Self> {
+        anyhow::ensure!(block.iter().all(|&v| v > 0), "zero FP8 scale block extent");
+        anyhow::ensure!(
+            matches!(dtype, Dtype::BF16 | Dtype::F32 | Dtype::F8_E8M0),
+            "unsupported FP8 block scale dtype {dtype:?}"
+        );
+        Ok(Self { block, dtype })
+    }
+
+    pub fn block(self) -> [u32; 2] {
+        self.block
+    }
+
+    pub fn dtype(self) -> Dtype {
+        self.dtype
+    }
+
+    pub fn scale_shape(self, n: u32, k: u32) -> [usize; 2] {
+        [
+            n.div_ceil(self.block[0]) as usize,
+            k.div_ceil(self.block[1]) as usize,
+        ]
+    }
+
+    pub fn scale_bytes(self, n: u32, k: u32) -> anyhow::Result<usize> {
+        use anyhow::Context;
+        anyhow::ensure!(n > 0 && k > 0, "empty FP8 weight extent");
+        self.scale_shape(n, k)
+            .into_iter()
+            .try_fold(self.dtype.bitsize() / 8, |bytes, extent| {
+                bytes.checked_mul(extent)
+            })
+            .context("FP8 block scale byte extent overflow")
+    }
+
+    pub fn validate_scale(
+        self,
+        n: u32,
+        k: u32,
+        dtype: Dtype,
+        shape: &[usize],
+        bytes: usize,
+    ) -> anyhow::Result<()> {
+        let expected_bytes = self.scale_bytes(n, k)?;
+        anyhow::ensure!(
+            dtype == self.dtype && shape == self.scale_shape(n, k) && bytes == expected_bytes,
+            "FP8 block scale mismatch: weight=[{n},{k}] block={:?} expected_dtype={:?} expected_shape={:?} expected_bytes={expected_bytes} got_dtype={dtype:?} got_shape={shape:?} got_bytes={bytes}",
+            self.block,
+            self.dtype,
+            self.scale_shape(n, k),
+        );
+        Ok(())
+    }
+}
 
 pub fn decode_e4m3(code: u8) -> f32 {
     let sign = u32::from(code & 0x80) << 24;
@@ -31,10 +95,25 @@ pub enum Fp8ScaleLayout {
 }
 
 impl Fp8ScaleLayout {
+    pub fn block_scale(self) -> Option<Fp8BlockScale> {
+        match self {
+            Self::Block128 => Some(Fp8BlockScale {
+                block: [128, 128],
+                dtype: Dtype::BF16,
+            }),
+            Self::PerChannel => None,
+        }
+    }
+
+    pub fn scale_dtype(self) -> Dtype {
+        self.block_scale()
+            .map_or(Dtype::BF16, |block| block.dtype())
+    }
+
     /// Stored scale extent for one `[n, k]` weight.
     pub fn scale_shape(self, n: u32, k: u32) -> [usize; 2] {
         match self {
-            Self::Block128 => [n.div_ceil(128) as usize, k.div_ceil(128) as usize],
+            Self::Block128 => self.block_scale().unwrap().scale_shape(n, k),
             Self::PerChannel => [n as usize, 1],
         }
     }
@@ -154,6 +233,52 @@ pub(crate) fn linear_reference(weight: &[bf16], x: &[bf16], k: usize) -> anyhow:
 mod tests {
     use super::*;
     use anyhow::Context;
+
+    #[test]
+    fn block_scale_native_extents_and_controls() -> anyhow::Result<()> {
+        for (block, dtype, n, k, shape, bytes) in [
+            ([128, 128], Dtype::F32, 2048, 4096, [16, 32], 2048),
+            ([32, 32], Dtype::F8_E8M0, 2304, 5120, [72, 160], 11520),
+            ([128, 128], Dtype::F32, 257, 385, [3, 4], 48),
+            ([32, 32], Dtype::F8_E8M0, 65, 97, [3, 4], 12),
+        ] {
+            let descriptor = Fp8BlockScale::new(block, dtype)?;
+            descriptor.validate_scale(n, k, dtype, &shape, bytes)?;
+            assert!(
+                descriptor
+                    .validate_scale(n, k, dtype, &shape, bytes - 1)
+                    .is_err()
+            );
+            assert!(
+                descriptor
+                    .validate_scale(n, k, dtype, &[shape[1], shape[0]], bytes)
+                    .is_err()
+            );
+            assert!(
+                descriptor
+                    .validate_scale(n, k, Dtype::BF16, &shape, bytes)
+                    .is_err()
+            );
+            let wrong_block = Fp8BlockScale::new([block[0] * 2, block[1]], dtype)?;
+            assert!(
+                wrong_block
+                    .validate_scale(n, k, dtype, &shape, bytes)
+                    .is_err()
+            );
+        }
+        let legacy = Fp8ScaleLayout::Block128.block_scale().unwrap();
+        legacy.validate_scale(257, 385, Dtype::BF16, &[3, 4], 24)?;
+        assert!(Fp8BlockScale::new([0, 32], Dtype::F8_E8M0).is_err());
+        assert!(Fp8BlockScale::new([32, 0], Dtype::F8_E8M0).is_err());
+        assert!(Fp8BlockScale::new([32, 32], Dtype::F8_E4M3).is_err());
+        assert!(legacy.scale_bytes(0, 128).is_err());
+        assert!(
+            Fp8BlockScale::new([1, 1], Dtype::F32)?
+                .scale_bytes(u32::MAX, u32::MAX)
+                .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     #[ignore = "CPU-only external fixture; set FF_MINICPM_REFERENCE_DIR"]
