@@ -30,6 +30,24 @@ fn trace_layer_selected(all_layers: bool, layer: usize, trace_layer: usize) -> b
     all_layers || layer == trace_layer
 }
 
+fn route_trace_choices<T>(choices: &[T], base: usize, rows: usize, top_k: usize) -> Result<&[T]> {
+    let start = base
+        .checked_mul(top_k)
+        .context("route trace choice offset overflow")?;
+    let count = rows
+        .checked_mul(top_k)
+        .context("route trace choice count overflow")?;
+    let end = start
+        .checked_add(count)
+        .context("route trace choice extent overflow")?;
+    ensure!(
+        end <= choices.len(),
+        "route trace choices base={base} rows={rows} top_k={top_k} extent={end} choices={}",
+        choices.len()
+    );
+    Ok(&choices[start..end])
+}
+
 struct Span {
     base: u64,
     layout: ExpertSpanLayout,
@@ -1459,12 +1477,22 @@ impl Engine {
                             prefix,
                             skip,
                         });
-                        let route_ids = prefill.gpu.host_ids.as_slice()?
-                            [..rows * prefill.geometry.top_k as usize]
-                            .to_vec();
-                        let route_weights = prefill.gpu.host_weights.as_slice()?
-                            [..rows * prefill.geometry.top_k as usize]
-                            .to_vec();
+                        let host_ids = prefill.gpu.host_ids.as_slice()?;
+                        let host_weights = prefill.gpu.host_weights.as_slice()?;
+                        let route_ids = route_trace_choices(
+                            host_ids,
+                            base,
+                            rows,
+                            prefill.geometry.top_k as usize,
+                        )?
+                        .to_vec();
+                        let route_weights = route_trace_choices(
+                            host_weights,
+                            base,
+                            rows,
+                            prefill.geometry.top_k as usize,
+                        )?
+                        .to_vec();
                         let route_cpu = route_ids
                             .iter()
                             .map(|expert| {
@@ -2093,6 +2121,22 @@ mod tests {
             trace.add(format!("{prefix}.moe.ids"), vec![1, 6], vec![1.0; 6])?;
         }
         assert_eq!(route_trace_prefix(false, "prefill.2", 13, 256), "prefill.2");
+        let top_k = 6;
+        let choices: Vec<i32> = (0..2 * top_k)
+            .map(|index| {
+                if index < top_k {
+                    10 + index as i32
+                } else {
+                    20 + index as i32
+                }
+            })
+            .collect();
+        let first = route_trace_choices(&choices, 0, 1, top_k)?;
+        let second = route_trace_choices(&choices, 1, 1, top_k)?;
+        assert_eq!(first, &(10..16).collect::<Vec<_>>());
+        assert_eq!(second, &(26..32).collect::<Vec<_>>());
+        assert_ne!(first, second);
+        assert!(route_trace_choices(&choices, 2, 1, top_k).is_err());
         Ok(())
     }
 
