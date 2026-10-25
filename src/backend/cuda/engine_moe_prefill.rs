@@ -1,8 +1,10 @@
 //! Layer-major prefill over borrowed expert slots.
 use super::*;
+#[cfg(test)]
 use crate::backend::cuda::moe::prefill::prefill_scratch_bytes;
 use crate::backend::cuda::moe::prefill::{
     LANE16_ROWS, MoePrefillContribute, MoePrefillFinish, PrefillOps, arithmetic_mask,
+    prefill_scratch_bytes_mixed_with_boundary,
 };
 use crate::experts::{
     plan::{Capacity, Reserves, ServiceTable},
@@ -15,6 +17,36 @@ use std::ops::Range;
 #[path = "engine_moe_prefetch.rs"]
 mod prefetch;
 use prefetch::ReadAhead;
+
+fn route_trace_prefix(all_layers: bool, prefix: &str, layer: usize, base: usize) -> String {
+    if all_layers {
+        format!("{prefix}.{layer}.wave.{base}")
+    } else {
+        prefix.to_owned()
+    }
+}
+
+fn trace_layer_selected(all_layers: bool, layer: usize, trace_layer: usize) -> bool {
+    all_layers || layer == trace_layer
+}
+
+fn route_trace_choices<T>(choices: &[T], base: usize, rows: usize, top_k: usize) -> Result<&[T]> {
+    let start = base
+        .checked_mul(top_k)
+        .context("route trace choice offset overflow")?;
+    let count = rows
+        .checked_mul(top_k)
+        .context("route trace choice count overflow")?;
+    let end = start
+        .checked_add(count)
+        .context("route trace choice extent overflow")?;
+    ensure!(
+        end <= choices.len(),
+        "route trace choices base={base} rows={rows} top_k={top_k} extent={end} choices={}",
+        choices.len()
+    );
+    Ok(&choices[start..end])
+}
 
 struct Span {
     base: u64,
@@ -36,15 +68,14 @@ impl Span {
             "prefill span view outside region={region:?} offset={offset} bytes={}",
             self.layout.bytes
         );
+        let ptr = self.base + (region.start + offset) as u64;
+        ensure!(
+            ptr != 0 && ptr.is_multiple_of(16),
+            "prefill span pointer base={:#x} region={region:?} offset={offset}",
+            self.base
+        );
         // SAFETY: the slot arena owns this borrowed range through refill; callers order all uses.
-        unsafe {
-            Tensor::new(
-                self.base + (region.start + offset) as u64,
-                shape,
-                stride,
-                (region.len() - offset) as u64,
-            )
-        }
+        unsafe { Tensor::new(ptr, shape, stride, (region.len() - offset) as u64) }
     }
 
     fn hidden(&self, region: &Range<usize>, base: u32, rows: u32) -> Result<Tensor<bf16, 2>> {
@@ -260,6 +291,7 @@ type Wave = (usize, usize, usize, bool, String);
 
 pub(in crate::backend::cuda::engine) struct Prefill {
     geometry: ExpertGeometry,
+    shared_intermediate: u32,
     capacity: Capacity,
     reserves: Reserves,
     service: ServiceTable,
@@ -272,6 +304,7 @@ pub(in crate::backend::cuda::engine) struct Prefill {
     frequency: Vec<Vec<f64>>,
     rows: u64,
     failed: bool,
+    routed_weight: crate::model_spec::RoutedWeightBoundary,
     mixer_rows: usize,
     workspace_rows: usize,
     waves: Vec<Wave>,
@@ -402,9 +435,9 @@ impl Prefill {
         reserves: Reserves,
         service: ServiceTable,
         h2d_bytes_per_second: f64,
-        windows: (usize, usize),
+        shape: (u32, usize, usize, crate::model_spec::RoutedWeightBoundary),
     ) -> Result<Self> {
-        let (workspace_rows, mixer_rows) = windows;
+        let (shared_intermediate, workspace_rows, mixer_rows, routed_weight) = shape;
         let geometry = slots.catalogue.geometry();
         ensure!(
             mixer_rows > 0 && mixer_rows <= workspace_rows,
@@ -465,6 +498,7 @@ impl Prefill {
             (geometry.experts as usize).div_ceil(capacity.prefill_staging_slots as usize) + 1;
         Ok(Self {
             geometry,
+            shared_intermediate,
             capacity: capacity.clone(),
             reserves,
             service,
@@ -475,17 +509,17 @@ impl Prefill {
             gpu: Gpu {
                 mask: super::super::super::super::cubin::module(&device.ctx, "moe_route")?
                     .load_function("moe_route_mask")?,
-                scratch: device
-                    .stream
-                    .alloc_zeros(usize::try_from(prefill_scratch_bytes(
+                scratch: device.stream.alloc_zeros(usize::try_from(
+                    prefill_scratch_bytes_mixed_with_boundary(
                         capacity.wave_rows as usize,
                         capacity.span_rows as usize,
                         geometry.top_k as usize,
                         geometry.experts as usize,
                         geometry.hidden as usize,
-                        geometry.intermediate as usize,
-                        capacity.layout.fp8_slot(),
-                    )?)?)?,
+                        (geometry.intermediate as usize, shared_intermediate as usize),
+                        (capacity.layout.fp8_slot(), routed_weight),
+                    )?,
+                )?)?,
                 tables: Tables::new(device, geometry.experts as usize, cohorts)?,
                 host_ids: pinned_zeros(&device.ctx, assignments)?,
                 host_weights: pinned_zeros(&device.ctx, assignments)?,
@@ -519,6 +553,7 @@ impl Prefill {
             frequency: vec![vec![0.0; geometry.experts as usize]; geometry.layers as usize],
             rows: 0,
             failed: false,
+            routed_weight,
             mixer_rows,
             workspace_rows,
             waves: (0..capacity.span_rows as usize)
@@ -725,7 +760,7 @@ impl Prefill {
         rows: u32,
         ffn: BoundFfn,
     ) -> Result<()> {
-        let BoundFfn::Moe { router, .. } = ffn else {
+        let BoundFfn::Moe { router, score, .. } = ffn else {
             anyhow::bail!("prefill layer={layer} has a dense FFN");
         };
         let span_rows = self
@@ -747,14 +782,17 @@ impl Prefill {
         let stream = &device.stream;
         ensure!(
             self.gpu.scratch.len() as u64
-                >= prefill_scratch_bytes(
+                >= prefill_scratch_bytes_mixed_with_boundary(
                     self.capacity.wave_rows.min(rows) as usize,
                     rows as usize,
                     self.geometry.top_k as usize,
                     self.geometry.experts as usize,
                     self.geometry.hidden as usize,
-                    self.geometry.intermediate as usize,
-                    self.capacity.layout.fp8_slot(),
+                    (
+                        self.geometry.intermediate as usize,
+                        self.shared_intermediate as usize,
+                    ),
+                    (self.capacity.layout.fp8_slot(), self.routed_weight),
                 )?,
             "prefill wave scratch bytes={} are below the rows={rows} wave={} bound",
             self.gpu.scratch.len(),
@@ -770,12 +808,12 @@ impl Prefill {
             [u64::from(self.geometry.experts), 1],
         )?);
         decode.route.route_prefill(
-            stream,
             x,
             router,
             &mut TensorMut(ids),
             &mut TensorMut(weights),
             &mut logits,
+            score,
         )?;
         let routed = slots.events.record(stream)?;
         self.gpu.mailbox.wait(&routed.event)?;
@@ -970,7 +1008,7 @@ impl Prefill {
         y: Tensor<bf16, 2>,
     ) -> Result<()> {
         let BoundFfn::Moe {
-            shared,
+            ref shared,
             shared_gate,
             ..
         } = ffn
@@ -984,6 +1022,7 @@ impl Prefill {
         decode.prefill.prefill_finish(
             &device.stream,
             MoePrefillFinish {
+                expert_inter: self.geometry.intermediate,
                 x: span.hidden(&span.layout.normalized, base, rows)?,
                 ids: span.choices(&span.layout.ids, base, rows)?,
                 final_active: span.choices(&span.layout.active, base, rows)?,
@@ -1042,7 +1081,7 @@ impl Engine {
     pub(in crate::backend::cuda::engine) fn prefill_moe_chunks(
         &mut self,
         ids: &[u32],
-        trace: Option<&mut Trace>,
+        mut trace: Option<&mut Trace>,
         keep: usize,
         after_chunk: &mut impl FnMut(&mut Self, &[u32]) -> Result<()>,
     ) -> Result<u32> {
@@ -1057,6 +1096,9 @@ impl Engine {
             self.moe_slots.is_some(),
             self.moe.is_some()
         );
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.set_device(&self.device.info.name)?;
+        }
         let mut prefill = self
             .moe_prefill
             .take()
@@ -1121,6 +1163,7 @@ impl Engine {
         after_chunk: &mut impl FnMut(&mut Self, &[u32]) -> Result<()>,
     ) -> Result<u32> {
         use crate::backend::Operator as O;
+        let flint = self.model_spec.architecture == crate::model_spec::Architecture::Flint;
         let (ids, waves) = input;
         let (mut trace, keep) = tracing;
         let start = self.position;
@@ -1196,6 +1239,7 @@ impl Engine {
                 )?;
             }
             for layer in 0..self.model_spec.layers.len() {
+                let selected_layer = trace_layer_selected(all_layers, layer, self.trace_layer);
                 for (base, rows, skip, selected, prefix) in waves.iter() {
                     let step = self.moe_wave(span_start + base, *rows)?;
                     self.select_qwen_positions()?;
@@ -1214,7 +1258,20 @@ impl Engine {
                             self.model_spec.hidden as usize,
                         )?,
                     )?;
-                    let mut target = if *selected {
+                    if flint && layer > 0 {
+                        device_copy(
+                            &self.device.stream,
+                            span.hidden(&span.layout.normalized, *base as u32, *rows as u32)?,
+                            qwen::matrix(
+                                &self.work.n,
+                                &self.device.stream,
+                                0,
+                                *rows,
+                                self.model_spec.hidden as usize,
+                            )?,
+                        )?;
+                    }
+                    let mut target = if *selected && selected_layer {
                         trace.as_deref_mut().map(|trace| Target {
                             trace,
                             prefix,
@@ -1223,8 +1280,28 @@ impl Engine {
                     } else {
                         None
                     };
+                    if flint && layer > 0 {
+                        let all = target
+                            .as_ref()
+                            .is_some_and(|target| target.trace.all_layers);
+                        let name = if all {
+                            format!("{layer}.debug.norm1")
+                        } else {
+                            "debug.norm1".to_owned()
+                        };
+                        trace_value(
+                            &mut target,
+                            &self.device.stream,
+                            &name,
+                            &self.work.n,
+                            *rows,
+                            self.model_spec.hidden as usize,
+                        )?;
+                    }
                     self.qwen_layer_begin(layer, step)?;
-                    self.run_operator(O::Norm, layer, step, &mut target)?;
+                    if !(flint && layer > 0) {
+                        self.run_operator(O::Norm, layer, step, &mut target)?;
+                    }
                     self.qwen_mixer(layer, step, &mut target)?;
                     self.run_operator(O::PostNorm, layer, step, &mut target)?;
                     device_copy(
@@ -1250,31 +1327,67 @@ impl Engine {
                         span.hidden(&span.layout.normalized, *base as u32, *rows as u32)?,
                     )?;
                 }
-                let ffn = self.moe_ffn_binding(layer)?;
-                prefill.ffn(
-                    &self.device,
-                    slots,
-                    decode,
-                    layer as u32,
-                    admitted.len() as u32,
-                    ffn,
-                )?;
+                let dense = self.model_spec.layers[layer].ffn == crate::model_spec::FfnKind::Dense;
+                let ffn = if dense {
+                    None
+                } else {
+                    let ffn = self.moe_ffn_binding(layer)?;
+                    let slot_layer = u32::try_from(self.moe_slot_layer(layer)?)?;
+                    prefill.ffn(
+                        &self.device,
+                        slots,
+                        decode,
+                        slot_layer,
+                        admitted.len() as u32,
+                        ffn.clone(),
+                    )?;
+                    Some(ffn)
+                };
                 for base in (0..admitted.len()).step_by(prefill.capacity.wave_rows as usize) {
                     let rows = (prefill.capacity.wave_rows as usize).min(admitted.len() - base);
-                    prefill.finish_wave(
-                        &self.device,
-                        decode,
-                        ffn,
-                        base as u32,
-                        rows as u32,
-                        qwen::matrix(
-                            &self.work.out,
-                            &self.device.stream,
-                            0,
-                            rows,
-                            self.model_spec.hidden as usize,
-                        )?,
-                    )?;
+                    let (wave_base, _, mixer_skip, mixer_selected, prefix) = waves
+                        .iter()
+                        .find(|wave| base >= wave.0 && base < wave.0 + wave.1)
+                        .context("prefill residual trace wave is missing")?;
+                    let skip = mixer_skip.saturating_sub(base - wave_base).min(rows);
+                    let selected = *mixer_selected && skip < rows;
+                    let step = self.moe_wave(span_start + base, rows)?;
+                    match &ffn {
+                        Some(ffn) => {
+                            prefill.finish_wave(
+                                &self.device,
+                                decode,
+                                ffn.clone(),
+                                base as u32,
+                                rows as u32,
+                                qwen::matrix(
+                                    &self.work.out,
+                                    &self.device.stream,
+                                    0,
+                                    rows,
+                                    self.model_spec.hidden as usize,
+                                )?,
+                            )?;
+                        }
+                        None => {
+                            let span = prefill
+                                .span
+                                .as_ref()
+                                .context("prefill dense FFN has no borrowed span")?;
+                            device_copy(
+                                &self.device.stream,
+                                span.hidden(&span.layout.normalized, base as u32, rows as u32)?,
+                                qwen::matrix(
+                                    &self.work.n,
+                                    &self.device.stream,
+                                    0,
+                                    rows,
+                                    self.model_spec.hidden as usize,
+                                )?,
+                            )?;
+                            self.run_ffn(layer, step, &mut None)?;
+                        }
+                    }
                     let span = prefill
                         .span
                         .as_ref()
@@ -1301,17 +1414,21 @@ impl Engine {
                         )?,
                         span.hidden(&span.layout.normalized, base as u32, rows as u32)?,
                     )?;
-                    // SAFETY: the two owned dense row windows cover rows*hidden values on this stream.
-                    unsafe {
-                        self.device
-                            .stream
-                            .launch_builder(&self.ops.residual)
-                            .arg(&mut self.work.x)
-                            .arg(&self.work.out)
-                            .arg(&(i32::try_from(rows * self.model_spec.hidden as usize)?))
-                            .launch(super::super::super::super::ops::flat(
-                                rows * self.model_spec.hidden as usize,
-                            ))?;
+                    if flint {
+                        self.run_operator(O::NextNorm, layer, step, &mut None)?;
+                    } else {
+                        // SAFETY: the two owned dense row windows cover rows*hidden values on this stream.
+                        unsafe {
+                            self.device
+                                .stream
+                                .launch_builder(&self.ops.residual)
+                                .arg(&mut self.work.x)
+                                .arg(&self.work.out)
+                                .arg(&(i32::try_from(rows * self.model_spec.hidden as usize)?))
+                                .launch(super::super::super::super::ops::flat(
+                                    rows * self.model_spec.hidden as usize,
+                                ))?;
+                        }
                     }
                     if let Some(capture) = &mut self.hidden_capture
                         && let Some(slot) = capture.layer_slots[layer]
@@ -1341,74 +1458,115 @@ impl Engine {
                         )?,
                         span.hidden(&span.layout.residual, base as u32, rows as u32)?,
                     )?;
-                }
-                for (base, rows, skip, selected, prefix) in waves.iter() {
-                    if !selected {
-                        continue;
-                    }
-                    let span = prefill
-                        .span
-                        .as_ref()
-                        .context("prefill trace has no borrowed span")?;
-                    device_copy(
-                        &self.device.stream,
-                        span.hidden(&span.layout.residual, *base as u32, *rows as u32)?,
-                        qwen::matrix(
-                            &self.work.x,
+                    if flint {
+                        device_copy(
                             &self.device.stream,
-                            0,
-                            *rows,
-                            self.model_spec.hidden as usize,
-                        )?,
-                    )?;
-                    device_copy(
-                        &self.device.stream,
-                        span.hidden(&span.layout.normalized, *base as u32, *rows as u32)?,
-                        qwen::matrix(
-                            &self.work.out,
-                            &self.device.stream,
-                            0,
-                            *rows,
-                            self.model_spec.hidden as usize,
-                        )?,
-                    )?;
-                    let mut target = trace.as_deref_mut().map(|trace| Target {
-                        trace,
-                        prefix,
-                        skip: *skip,
-                    });
-                    if layer == self.trace_layer {
-                        trace_value(
-                            &mut target,
-                            &self.device.stream,
-                            "ffn",
-                            &self.work.out,
-                            *rows,
-                            self.model_spec.hidden as usize,
+                            qwen::matrix(
+                                &self.work.n,
+                                &self.device.stream,
+                                0,
+                                rows,
+                                self.model_spec.hidden as usize,
+                            )?,
+                            span.hidden(&span.layout.normalized, base as u32, rows as u32)?,
                         )?;
                     }
-                    let layers = self.model_spec.layers.len();
-                    if !all_layers
-                        || layer == 0
-                        || layer == self.trace_layer
-                        || layer == layers / 2
-                        || layer + 1 == layers
-                        || self
-                            .hidden_capture
-                            .as_ref()
-                            .is_some_and(|capture| capture.layer_slots[layer].is_some())
-                    {
+                    if selected && selected_layer {
+                        let mut target = trace.as_deref_mut().map(|trace| Target {
+                            trace,
+                            prefix,
+                            skip,
+                        });
+                        let host_ids = prefill.gpu.host_ids.as_slice()?;
+                        let host_weights = prefill.gpu.host_weights.as_slice()?;
+                        let route_ids = route_trace_choices(
+                            host_ids,
+                            base,
+                            rows,
+                            prefill.geometry.top_k as usize,
+                        )?
+                        .to_vec();
+                        let route_weights = route_trace_choices(
+                            host_weights,
+                            base,
+                            rows,
+                            prefill.geometry.top_k as usize,
+                        )?
+                        .to_vec();
+                        let route_cpu = route_ids
+                            .iter()
+                            .map(|expert| {
+                                u8::from(prefill.gpu.cpu_arithmetic[*expert as usize]) as f32
+                            })
+                            .collect::<Vec<_>>();
+                        if let Some(target) = target.as_mut() {
+                            let route_prefix =
+                                route_trace_prefix(target.trace.all_layers, prefix, layer, base);
+                            target.trace.add(
+                                format!("{route_prefix}.moe.ids"),
+                                vec![rows, prefill.geometry.top_k as usize],
+                                route_ids.iter().map(|value| *value as f32).collect(),
+                            )?;
+                            target.trace.add(
+                                format!("{route_prefix}.moe.weights"),
+                                vec![rows, prefill.geometry.top_k as usize],
+                                route_weights.iter().map(|value| value.to_f32()).collect(),
+                            )?;
+                            target.trace.add(
+                                format!("{route_prefix}.moe.cpu"),
+                                vec![rows, prefill.geometry.top_k as usize],
+                                route_cpu,
+                            )?;
+                            let span = prefill
+                                .span
+                                .as_ref()
+                                .context("prefill contribution trace has no borrowed span")?;
+                            let choices = rows * prefill.geometry.top_k as usize;
+                            let values = choices * self.model_spec.hidden as usize;
+                            let mut contributions = vec![bf16::ZERO; values];
+                            // SAFETY: the live span covers this whole routed contribution prefix.
+                            unsafe {
+                                result::memcpy_dtoh_async(
+                                    &mut contributions,
+                                    span.contributions(base as u32, rows as u32)?.ptr,
+                                    self.device.stream.cu_stream(),
+                                )?;
+                            }
+                            self.device.stream.synchronize()?;
+                            target.trace.add(
+                                format!("{route_prefix}.moe.contributions"),
+                                vec![
+                                    rows,
+                                    prefill.geometry.top_k as usize,
+                                    self.model_spec.hidden as usize,
+                                ],
+                                contributions.iter().map(|value| value.to_f32()).collect(),
+                            )?;
+                        }
                         let name = if all_layers {
-                            &prefill.layer_names[layer]["layer.".len()..]
+                            format!("{layer}.ffn")
                         } else {
-                            &prefill.layer_names[layer]
+                            "ffn".to_owned()
                         };
                         trace_value(
                             &mut target,
                             &self.device.stream,
-                            name,
+                            &name,
+                            &self.work.out,
+                            rows,
+                            self.model_spec.hidden as usize,
+                        )?;
+                        let name = if all_layers {
+                            layer.to_string()
+                        } else {
+                            prefill.layer_names[layer].clone()
+                        };
+                        trace_value(
+                            &mut target,
+                            &self.device.stream,
+                            &name,
                             &self.work.x,
-                            *rows,
+                            rows,
                             self.model_spec.hidden as usize,
                         )?;
                     }
@@ -1435,6 +1593,19 @@ impl Engine {
                         self.model_spec.hidden as usize,
                     )?,
                 )?;
+                if flint {
+                    device_copy(
+                        &self.device.stream,
+                        span.hidden(&span.layout.normalized, *base as u32, *rows as u32)?,
+                        qwen::matrix(
+                            &self.work.n,
+                            &self.device.stream,
+                            0,
+                            *rows,
+                            self.model_spec.hidden as usize,
+                        )?,
+                    )?;
+                }
                 if span_start + base + rows == end {
                     step.head = Head::Last;
                 }
@@ -1699,7 +1870,14 @@ impl Gpu {
             )?;
         }
         if !plan.resident().is_empty() {
-            let ticket = self.cohort(device, slots, span, ops, plan, (layer, 0, ffn, None))?;
+            let ticket = self.cohort(
+                device,
+                slots,
+                span,
+                ops,
+                plan,
+                (layer, 0, ffn.clone(), None),
+            )?;
             self.resident_slots.clear();
             for &expert in plan.resident() {
                 self.resident_slots
@@ -1735,7 +1913,7 @@ impl Gpu {
                 span,
                 ops,
                 plan,
-                (layer, cohort + 1, ffn, Some(leases)),
+                (layer, cohort + 1, ffn.clone(), Some(leases)),
             )?;
             for &id in leases.release()? {
                 ensure!(
@@ -1829,7 +2007,7 @@ impl Gpu {
             0
         };
         let BoundFfn::Moe {
-            shared,
+            ref shared,
             shared_gate,
             ..
         } = ffn
@@ -1884,6 +2062,7 @@ impl Gpu {
             ops.prefill_contribute(
                 stream,
                 MoePrefillContribute {
+                    expert_inter: geometry.intermediate,
                     cpu_arithmetic: &self.cpu_arithmetic,
                     fp8_slot: slots.catalogue.layout().fp8_slot(),
                     wave: Some((cohort, base, active)),
@@ -1932,6 +2111,70 @@ mod tests {
     use crate::cpu::expert_ffn::{
         Contribution, Fp8Contribution, Isa, Scratch, contribution, fp8_contribution,
     };
+
+    #[test]
+    fn route_trace_names_include_the_wave() -> Result<()> {
+        let mut trace = Trace::default();
+        for base in [0, 256] {
+            let prefix = route_trace_prefix(true, "layer", 13, base);
+            assert_eq!(prefix, format!("layer.13.wave.{base}"));
+            trace.add(format!("{prefix}.moe.ids"), vec![1, 6], vec![1.0; 6])?;
+        }
+        assert_eq!(route_trace_prefix(false, "prefill.2", 13, 256), "prefill.2");
+        let top_k = 6;
+        let choices: Vec<i32> = (0..2 * top_k)
+            .map(|index| {
+                if index < top_k {
+                    10 + index as i32
+                } else {
+                    20 + index as i32
+                }
+            })
+            .collect();
+        let first = route_trace_choices(&choices, 0, 1, top_k)?;
+        let second = route_trace_choices(&choices, 1, 1, top_k)?;
+        assert_eq!(first, &(10..16).collect::<Vec<_>>());
+        assert_eq!(second, &(26..32).collect::<Vec<_>>());
+        assert_ne!(first, second);
+        assert!(route_trace_choices(&choices, 2, 1, top_k).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn non_all_layer_trace_records_only_the_selected_layer() -> Result<()> {
+        let mut trace = Trace::default();
+        let names = [
+            "debug.norm1",
+            "moe.ids",
+            "moe.weights",
+            "moe.cpu",
+            "moe.contributions",
+            "ffn",
+        ];
+        for layer in [13, 14] {
+            if trace_layer_selected(false, layer, 13) {
+                let prefix = route_trace_prefix(false, "prefill.2", layer, 256);
+                for name in names {
+                    trace.add(format!("{prefix}.{name}"), vec![1, 6], vec![1.0; 6])?;
+                }
+            }
+        }
+        for name in names {
+            let tensor = format!("prefill.2.{name}");
+            assert_eq!(trace.shape(&tensor)?, &[1, 6]);
+            assert_eq!(trace.values(&tensor)?, vec![1.0; 6]);
+        }
+        let duplicate = route_trace_prefix(false, "prefill.2", 14, 256);
+        for name in names {
+            assert!(
+                trace
+                    .add(format!("{duplicate}.{name}"), vec![1, 6], vec![1.0; 6])
+                    .is_err(),
+                "non-all-layer trace wrote unselected layer {name}"
+            );
+        }
+        Ok(())
+    }
 
     fn reserves(geometry: ExpertGeometry) -> Reserves {
         Reserves {
@@ -2048,6 +2291,7 @@ mod tests {
                 .arg(&silu_device.device_ptr(stream).0)
                 .arg(&65536i32)
                 .arg(&1i32)
+                .arg(&0i32)
                 .launch(crate::backend::cuda::ops::grid(256, 256))?;
         }
         let silu_map = stream.clone_dtoh(&silu_device)?;
@@ -2056,9 +2300,9 @@ mod tests {
             .enumerate()
             .filter(|(bits, actual)| {
                 let value = bf16::from_bits(*bits as u16).to_f32();
+                let silu = value * (1.0 / (1.0 + (-value).exp()));
                 value.is_finite()
-                    && actual.to_bits()
-                        != bf16::from_f32(value * (1.0 / (1.0 + (-value).exp()))).to_bits()
+                    && actual.to_bits() != bf16::from_f32(f32::from(bf16::from_f32(silu))).to_bits()
             })
             .count();
         ensure!(
@@ -2175,6 +2419,7 @@ mod tests {
                     ops.prefill_contribute(
                         stream,
                         MoePrefillContribute {
+                            expert_inter: geometry.intermediate,
                             cpu_arithmetic: &arithmetic,
                             fp8_slot: None,
                             wave: None,
@@ -2232,12 +2477,12 @@ mod tests {
                                 hidden,
                                 intermediate,
                             )?,
-                            shared_expert_gate: testing::view(
+                            shared_expert_gate: Some(testing::view(
                                 &x_device,
                                 stream,
                                 [geometry.hidden],
                                 [1],
-                            )?,
+                            )?),
                             contributions: testing::view(
                                 &contributions,
                                 stream,
@@ -2340,6 +2585,9 @@ mod tests {
                             weights: &weights[0],
                             hidden: &x[row * hidden..(row + 1) * hidden],
                             routing: bf16::ONE,
+
+                            rounding: crate::model_spec::SwigluRounding::Twice,
+                            routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                         },
                         &mut cpu_row,
                         &mut cpu_scratch,
@@ -2897,24 +3145,26 @@ mod tests {
         let ffn = engine.moe_ffn_binding(layer as usize)?;
         let BoundFfn::Moe {
             router,
-            shared,
+            score,
+            ref shared,
             shared_gate,
             ..
         } = ffn
         else {
             anyhow::bail!("prefill reference has a dense FFN");
         };
+        let shared_gate = shared_gate.context("prefill reference has no shared gate")?;
         let input = stream.clone_htod(&fixture.x)?;
         let ids = stream.alloc_zeros::<i32>(rows * 4)?;
         let weights = stream.alloc_zeros::<bf16>(rows * 4)?;
         let logits = stream.alloc_zeros::<bf16>(rows * 16)?;
         decode.route.route_prefill(
-            stream,
             qwen::matrix(&input, stream, 0, rows, 128)?,
             router,
             &mut TensorMut(view(&ids, stream, 0, [rows as u32, 4], [4, 1])?),
             &mut TensorMut(view(&weights, stream, 0, [rows as u32, 4], [4, 1])?),
             &mut TensorMut(qwen::matrix(&logits, stream, 0, rows, 16)?),
+            score,
         )?;
         let host_ids = stream.clone_dtoh(&ids)?;
         let host_weights = stream.clone_dtoh(&weights)?;
@@ -2969,6 +3219,7 @@ mod tests {
                 decode.prefill.prefill_contribute(
                     stream,
                     MoePrefillContribute {
+                        expert_inter: 64,
                         cpu_arithmetic: &arithmetic,
                         fp8_slot: slots.catalogue.layout().fp8_slot(),
                         wave: None,
@@ -2994,7 +3245,7 @@ mod tests {
                         shared_gate: shared[0],
                         shared_up: shared[1],
                         shared_down: shared[2],
-                        shared_expert_gate: shared_gate,
+                        shared_expert_gate: Some(shared_gate),
                         contributions: view(
                             &contributions,
                             stream,
@@ -3062,6 +3313,9 @@ mod tests {
                             slot_layout,
                             hidden,
                             routing: weight,
+
+                            rounding: crate::model_spec::SwigluRounding::Twice,
+                            routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                         },
                         out,
                         &mut cpu_scratch,
@@ -3075,6 +3329,9 @@ mod tests {
                             weights: &native,
                             hidden,
                             routing: weight,
+
+                            rounding: crate::model_spec::SwigluRounding::Twice,
+                            routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                         },
                         out,
                         &mut cpu_scratch,
@@ -3108,6 +3365,7 @@ mod tests {
             decode.prefill.prefill_finish(
                 stream,
                 MoePrefillFinish {
+                    expert_inter: 64,
                     x: qwen::matrix(&input, stream, base * 128, count, 128)?,
                     ids: view(&ids, stream, base * 4, [count as u32, 4], [4, 1])?,
                     final_active: view(&active, stream, base * 4, [count as u32, 4], [4, 1])?,
@@ -3123,7 +3381,7 @@ mod tests {
                     shared_gate: shared[0],
                     shared_up: shared[1],
                     shared_down: shared[2],
-                    shared_expert_gate: shared_gate,
+                    shared_expert_gate: Some(shared_gate),
                     y: TensorMut(qwen::matrix(&y, stream, base * 128, count, 128)?),
                 },
                 &qwen::scratch(&scratch, stream),
@@ -3375,7 +3633,7 @@ mod tests {
                                 &mut decode,
                                 layer as u32,
                                 rows,
-                                ffn,
+                                ffn.clone(),
                             )?;
                             if !prefill.cpu.choices.is_empty() {
                                 super::super::delay_stream(&prefill.gpu.mailbox)?;
@@ -3400,7 +3658,7 @@ mod tests {
                                 prefill.finish_wave(
                                     &engine.device,
                                     &mut decode,
-                                    ffn,
+                                    ffn.clone(),
                                     base,
                                     count,
                                     qwen::matrix(

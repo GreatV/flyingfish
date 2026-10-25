@@ -78,9 +78,9 @@ impl Backend {
         capacity: usize,
         chunk: Option<usize>,
         settings: Settings,
-    ) -> Result<()> {
+    ) -> Result<Option<Self>> {
         Self::load(dir, ordinal, capacity, chunk, settings)?;
-        Ok(())
+        Ok(None)
     }
     pub fn load(
         _dir: &Path,

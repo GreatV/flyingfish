@@ -411,7 +411,8 @@ extern "C" __global__ __launch_bounds__(256, 4) void q38_norm_capture(
     norm_body<true>(x,w,z,y,meta,row_base,row_capacity,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,zs0,zs1,zs2,mode,eps,capture,capture_pitch,capture_column);
 }
 // mode: 0 SiLU, 1 BF16 sigmoid(gate) followed by BF16 multiply,
-// 2 BF16 SiLU(x) followed by BF16 multiply by `gate`.
+// 2 BF16 SiLU(x) followed by BF16 multiply by `gate`,
+// 3 FP32 SiLU(x)*gate with one BF16 result round.
 extern "C" __global__ void q38_gate(
     const __nv_bfloat16* x,const __nv_bfloat16* gate,__nv_bfloat16* y,
     const Q38SequenceMeta* meta,uint32_t row_base,uint32_t row_capacity,
@@ -419,9 +420,9 @@ extern "C" __global__ void q38_gate(
     uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t gs0,uint64_t gs1,uint64_t gs2,
     uint64_t ys0,uint64_t ys1,uint64_t ys2,int mode) {
     q38_meta_guard(meta);
-    if(blockDim.x!=256 || blockDim.y!=1 || blockDim.z!=1 || (mode!=2 && gridDim.y!=1) || gridDim.z!=1 ||
-       !heads || !width || !row_capacity || !x || !y || mode<0 || mode>2 || (mode!=0 && !gate)) {__trap();return;}
-    if(mode==2) {
+    if(blockDim.x!=256 || blockDim.y!=1 || blockDim.z!=1 || (mode!=2 && mode!=3 && gridDim.y!=1) || gridDim.z!=1 ||
+       !heads || !width || !row_capacity || !x || !y || mode<0 || mode>3 || (mode!=0 && !gate)) {__trap();return;}
+    if(mode==2 || mode==3) {
         const uint32_t vectors=width/8;
         if(heads!=1 || width%8 || xs0!=width || xs1!=width || xs2!=1 ||
            gs0!=width || gs1!=width || gs2!=1 || ys0!=width || ys1!=width || ys2!=1 ||
@@ -442,8 +443,13 @@ extern "C" __global__ void q38_gate(
         uint4 result;
         __nv_bfloat16* rv=reinterpret_cast<__nv_bfloat16*>(&result);
         #pragma unroll
-        for(int i=0;i<8;++i)
-            rv[i]=__hmul(__float2bfloat16_rn(silu(__bfloat162float(av[i]))),bv[i]);
+        for(int i=0;i<8;++i) {
+            const float x=__bfloat162float(av[i]);
+            const float gate=__bfloat162float(bv[i]);
+            rv[i]=mode==3
+                ?__float2bfloat16_rn(silu(x)*gate)
+                :__hmul(__float2bfloat16_rn(silu(x)),bv[i]);
+        }
         reinterpret_cast<uint4*>(yrow)[vector]=result;
         return;
     }

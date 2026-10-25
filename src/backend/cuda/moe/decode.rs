@@ -17,6 +17,8 @@ pub(crate) struct DecodeOps {
     invariant: Option<(CudaFunction, CudaFunction)>,
     gate_up_w8a16: CudaFunction,
     down_w8a16: CudaFunction,
+    swiglu_rounding: crate::model_spec::SwigluRounding,
+    routed_weight: crate::model_spec::RoutedWeightBoundary,
     #[cfg(test)]
     combine: CombineOps,
 }
@@ -34,18 +36,26 @@ pub(crate) struct MoeDecode<'a> {
     pub shared_gate: Tensor<bf16, 2>,
     pub shared_up: Tensor<bf16, 2>,
     pub shared_down: Tensor<bf16, 2>,
-    pub shared_expert_gate: Tensor<bf16, 1>,
+    pub shared_expert_gate: Option<Tensor<bf16, 1>>,
     /// `[rows, top_k, hidden]` weighted BF16 contributions (dense).
     pub contributions: Tensor<bf16, 3>,
     pub shared_out: &'a mut TensorMut<bf16, 2>,
     pub done: &'a mut TensorMut<u32, 2>,
 }
 
-/// h `[rows*top_k, inter]` bf16 + h_shared `[rows, inter]` bf16, then the
-/// `[rows]` bf16 scale of moe_shared_scale; inter % 8 == 0 keeps every region
-/// 16-byte aligned.
+/// h `[rows*top_k, expert_inter]` bf16 + h_shared `[rows, shared_inter]` bf16,
+/// then the `[rows]` bf16 scale of moe_shared_scale.
 pub(crate) fn decode_scratch_bytes(rows: usize, k: usize, inter: usize) -> u64 {
-    rows as u64 * (k as u64 + 1) * inter as u64 * 2 + rows as u64 * 2
+    decode_scratch_bytes_mixed(rows, k, inter, inter)
+}
+
+pub(crate) fn decode_scratch_bytes_mixed(
+    rows: usize,
+    k: usize,
+    inter: usize,
+    shared_inter: usize,
+) -> u64 {
+    (rows as u64 * (k as u64 * inter as u64 + shared_inter as u64) + rows as u64) * 2
 }
 
 pub(super) struct DecodeDims {
@@ -54,9 +64,14 @@ pub(super) struct DecodeDims {
     top_k: u32,
     hidden: u32,
     inter: u32,
+    shared_inter: u32,
 }
 
-pub(super) fn validate(input: &MoeDecode<'_>, scratch: &Scratch) -> Result<DecodeDims> {
+pub(super) fn validate(
+    input: &MoeDecode<'_>,
+    scratch: &Scratch,
+    expert_inter: u32,
+) -> Result<DecodeDims> {
     input.x.validate()?;
     let (rows, hidden) = (input.x.shape[0], input.x.shape[1]);
     ensure!(
@@ -147,33 +162,32 @@ pub(super) fn validate(input: &MoeDecode<'_>, scratch: &Scratch) -> Result<Decod
     );
     input.shared_gate.validate().context("decode shared_gate")?;
     input.shared_up.validate().context("decode shared_up")?;
-    let inter = input.shared_gate.shape[0];
+    let shared_inter = input.shared_gate.shape[0];
     for t in [&input.shared_gate, &input.shared_up] {
         ensure!(
-            t.shape == [inter, hidden] && t.stride == [u64::from(hidden), 1],
-            "decode shared gate/up must be row-contiguous [inter, hidden] (shape {:?}, stride {:?}, inter {inter}, hidden {hidden})",
+            t.shape == [shared_inter, hidden] && t.stride == [u64::from(hidden), 1],
+            "decode shared gate/up must be row-contiguous [shared_inter, hidden] (shape {:?}, stride {:?}, shared_inter {shared_inter}, hidden {hidden})",
             t.shape,
             t.stride
         );
     }
     input.shared_down.validate().context("decode shared_down")?;
     ensure!(
-        input.shared_down.shape == [hidden, inter]
-            && input.shared_down.stride == [u64::from(inter), 1],
-        "decode shared_down must be row-contiguous [hidden, inter] (shape {:?}, stride {:?}, hidden {hidden}, inter {inter})",
+        input.shared_down.shape == [hidden, shared_inter]
+            && input.shared_down.stride == [u64::from(shared_inter), 1],
+        "decode shared_down must be row-contiguous [hidden, shared_inter] (shape {:?}, stride {:?}, hidden {hidden}, shared_inter {shared_inter})",
         input.shared_down.shape,
         input.shared_down.stride
     );
-    input
-        .shared_expert_gate
-        .validate()
-        .context("decode shared_expert_gate")?;
-    ensure!(
-        input.shared_expert_gate.shape == [hidden] && input.shared_expert_gate.stride == [1],
-        "decode shared expert gate must be a contiguous [hidden] vector (shape {:?}, stride {:?}, hidden {hidden})",
-        input.shared_expert_gate.shape,
-        input.shared_expert_gate.stride
-    );
+    if let Some(gate) = &input.shared_expert_gate {
+        gate.validate().context("decode shared_expert_gate")?;
+        ensure!(
+            gate.shape == [hidden] && gate.stride == [1],
+            "decode shared expert gate must be a contiguous [hidden] vector (shape {:?}, stride {:?}, hidden {hidden})",
+            gate.shape,
+            gate.stride
+        );
+    }
     ensure!(
         spans_disjoint(
             input.x.ptr,
@@ -230,24 +244,36 @@ pub(super) fn validate(input: &MoeDecode<'_>, scratch: &Scratch) -> Result<Decod
         "decode hidden {hidden} must be a multiple of 8"
     );
     ensure!(
-        inter.is_multiple_of(8),
-        "decode inter {inter} must be a multiple of 8"
+        expert_inter.is_multiple_of(8),
+        "decode expert inter {expert_inter} must be a multiple of 8"
+    );
+    ensure!(
+        shared_inter.is_multiple_of(8),
+        "decode shared inter {shared_inter} must be a multiple of 8"
     );
     ensure!(
         u64::from(hidden) * 2 <= 48 * 1024,
         "decode x row of {hidden} exceeds the gate_up kernel shared bytes"
     );
-    scratch.validate(decode_scratch_bytes(
-        rows as usize,
-        top_k as usize,
-        inter as usize,
-    ))?;
+    scratch
+        .validate(decode_scratch_bytes_mixed(
+            rows as usize,
+            top_k as usize,
+            expert_inter as usize,
+            shared_inter as usize,
+        ))
+        .with_context(|| {
+            format!(
+                "decode scratch rows={rows} top_k={top_k} expert_inter={expert_inter} shared_inter={shared_inter}"
+            )
+        })?;
     Ok(DecodeDims {
         rows,
         experts,
         top_k,
         hidden,
-        inter,
+        inter: expert_inter,
+        shared_inter,
     })
 }
 
@@ -255,13 +281,15 @@ pub(super) fn validate_w8a16(
     input: &MoeDecode<'_>,
     slot: &crate::experts::catalogue::Fp8Slot,
     scratch: &Scratch,
+    expert_inter: u32,
 ) -> Result<DecodeDims> {
     use crate::{
         experts::catalogue::{ExpertGeometry, ExpertLayout},
         model_spec::ExpertFormat,
     };
-    let dims = validate(input, scratch)?;
+    let dims = validate(input, scratch, expert_inter)?;
     let geometry = ExpertGeometry {
+        first_layer: 0,
         layers: 1,
         experts: dims.experts,
         hidden: dims.hidden,
@@ -276,7 +304,20 @@ pub(super) fn validate_w8a16(
 }
 
 impl DecodeOps {
+    #[cfg(test)]
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
+        Self::new_with_boundaries(
+            ctx,
+            crate::model_spec::SwigluRounding::Twice,
+            crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+        )
+    }
+
+    pub fn new_with_boundaries(
+        ctx: &Arc<CudaContext>,
+        swiglu_rounding: crate::model_spec::SwigluRounding,
+        routed_weight: crate::model_spec::RoutedWeightBoundary,
+    ) -> Result<Self> {
         let module = cubin::module(ctx, "moe_ffn")?;
         Ok(Self {
             gate_up: module.load_function("moe_ffn_gate_up")?,
@@ -284,18 +325,35 @@ impl DecodeOps {
             invariant: None,
             gate_up_w8a16: module.load_function("moe_ffn_gate_up_w8a16")?,
             down_w8a16: module.load_function("moe_ffn_down_w8a16")?,
+            swiglu_rounding,
+            routed_weight,
             #[cfg(test)]
             combine: CombineOps::new(ctx)?,
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn new_invariant(ctx: &Arc<CudaContext>) -> Result<Self> {
+        Self::new_invariant_with_boundaries(
+            ctx,
+            crate::model_spec::SwigluRounding::Twice,
+            crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+        )
+    }
+
+    pub(crate) fn new_invariant_with_boundaries(
+        ctx: &Arc<CudaContext>,
+        swiglu_rounding: crate::model_spec::SwigluRounding,
+        routed_weight: crate::model_spec::RoutedWeightBoundary,
+    ) -> Result<Self> {
         let module = cubin::module(ctx, "moe_ffn")?;
         Ok(Self {
             gate_up: module.load_function("moe_ffn_gate_up_lane16")?,
             down: module.load_function("moe_ffn_down_lane16")?,
             gate_up_w8a16: module.load_function("moe_ffn_gate_up_w8a16_lane16")?,
             down_w8a16: module.load_function("moe_ffn_down_w8a16_lane16")?,
+            swiglu_rounding,
+            routed_weight,
             invariant: Some((
                 cubin::module(ctx, "gemm_skinny")?.load_function("gemm_skinny_bf16")?,
                 cubin::module(ctx, "act")?.load_function("silu_mul_split")?,
@@ -311,8 +369,9 @@ impl DecodeOps {
         stream: &Arc<CudaStream>,
         input: &MoeDecode<'_>,
         scratch: &Scratch,
+        expert_inter: u32,
     ) -> Result<()> {
-        let dims = validate(input, scratch)?;
+        let dims = validate(input, scratch, expert_inter)?;
         self.launch(stream, input, scratch, dims, (&self.gate_up, &self.down))
     }
 
@@ -330,6 +389,7 @@ impl DecodeOps {
             top_k,
             hidden,
             inter,
+            shared_inter,
         } = dims;
         ensure!(
             self.invariant.is_some() || rows <= 8,
@@ -339,10 +399,16 @@ impl DecodeOps {
             self.invariant.is_none()
                 || (u64::from(hidden) >= 2 * u64::from(inter)
                     && hidden.is_multiple_of(256)
-                    && inter.is_multiple_of(256)),
-            "invariant shared expert requires hidden>=2*inter and 256-aligned widths: hidden={hidden} inter={inter}"
+                    && inter.is_multiple_of(256)
+                    && shared_inter.is_multiple_of(256)),
+            "invariant shared expert requires hidden>=2*expert_inter and 256-aligned widths: hidden={hidden} inter={inter} shared_inter={shared_inter}"
         );
         let invariant = u32::from(self.invariant.is_some());
+        let gate_inter = if invariant == 1 {
+            inter
+        } else {
+            inter.max(shared_inter)
+        };
         let h_bytes = u64::from(rows) * u64::from(top_k) * u64::from(inter) * 2;
         let h_ptr = scratch.ptr;
         let hs_ptr = scratch.ptr + h_bytes;
@@ -365,8 +431,14 @@ impl DecodeOps {
                 .arg(&(top_k as i32))
                 .arg(&(hidden as i32))
                 .arg(&(inter as i32))
+                .arg(&(shared_inter as i32))
+                .arg(&(self.swiglu_rounding as i32))
                 .launch(LaunchConfig {
-                    grid_dim: (inter.div_ceil(32 >> invariant), rows, top_k + 1 - invariant),
+                    grid_dim: (
+                        gate_inter.div_ceil(32 >> invariant),
+                        rows,
+                        top_k + 1 - invariant,
+                    ),
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: hidden * 2,
                 })?;
@@ -390,6 +462,8 @@ impl DecodeOps {
                 .arg(&(top_k as i32))
                 .arg(&(hidden as i32))
                 .arg(&(inter as i32))
+                .arg(&(shared_inter as i32))
+                .arg(&(self.routed_weight as i32))
                 .launch(LaunchConfig {
                     grid_dim: (
                         hidden.div_ceil(16 >> invariant),
@@ -402,7 +476,7 @@ impl DecodeOps {
         }
         if let Some((skinny, silu)) = &self.invariant {
             let shared = input.shared_out.read().ptr;
-            let up = shared + u64::from(rows) * u64::from(inter) * 2;
+            let up = shared + u64::from(rows) * u64::from(shared_inter) * 2;
             let gemm = |weight: u64, x: u64, y: u64, columns: u32, inner: u32| -> Result<()> {
                 // SAFETY: validated dense regions cover every complete weight and activation tile.
                 unsafe {
@@ -427,8 +501,14 @@ impl DecodeOps {
                 }
                 Ok(())
             };
-            gemm(input.shared_gate.ptr, input.x.ptr, shared, inter, hidden)?;
-            gemm(input.shared_up.ptr, input.x.ptr, up, inter, hidden)?;
+            gemm(
+                input.shared_gate.ptr,
+                input.x.ptr,
+                shared,
+                shared_inter,
+                hidden,
+            )?;
+            gemm(input.shared_up.ptr, input.x.ptr, up, shared_inter, hidden)?;
             // SAFETY: shared_out holds two rows*inter regions; hs_ptr is disjoint scratch.
             unsafe {
                 stream
@@ -436,10 +516,13 @@ impl DecodeOps {
                     .arg(&shared)
                     .arg(&up)
                     .arg(&hs_ptr)
-                    .arg(&((rows * inter) as i32))
-                    .launch(crate::backend::cuda::ops::flat((rows * inter) as usize))?;
+                    .arg(&((rows * shared_inter) as i32))
+                    .arg(&(self.swiglu_rounding as i32))
+                    .launch(crate::backend::cuda::ops::flat(
+                        (rows * shared_inter) as usize,
+                    ))?;
             }
-            gemm(input.shared_down.ptr, hs_ptr, shared, hidden, inter)?;
+            gemm(input.shared_down.ptr, hs_ptr, shared, hidden, shared_inter)?;
         }
         Ok(())
     }
@@ -453,22 +536,31 @@ impl DecodeOps {
         y: &mut TensorMut<bf16, 2>,
         scratch: &Scratch,
         layout: Option<&crate::experts::catalogue::Fp8Slot>,
+        expert_inter: u32,
     ) -> Result<()> {
         if let Some(slot) = layout {
-            self.contribute_w8a16(stream, input, slot, scratch)?;
+            self.contribute_w8a16(stream, input, slot, scratch, expert_inter)?;
         } else {
-            self.contribute(stream, input, scratch)?;
+            self.contribute(stream, input, scratch, expert_inter)?;
         }
         let rows = input.x.shape[0];
         let top_k = input.ids.shape[1];
-        let inter = input.shared_gate.shape[0];
-        let scale_ptr = scratch.ptr + u64::from(rows) * u64::from(top_k + 1) * u64::from(inter) * 2;
+        let scale_ptr = scratch.ptr
+            + (u64::from(rows) * u64::from(top_k) * u64::from(expert_inter)
+                + u64::from(rows) * u64::from(input.shared_gate.shape[0]))
+                * 2;
         // The contiguous shared scale has shape [rows,1] and strides [1,1].
-        let mut scale = unsafe {
-            TensorMut::<bf16, 2>::new(scale_ptr, [rows, 1], [1, 1], u64::from(rows) * 2)?
-        };
-        self.combine
-            .shared_scale(stream, input.x, input.shared_expert_gate, &mut scale)?;
+        let mut gate = None;
+        let mut scale = None;
+        if let Some(shared_gate) = input.shared_expert_gate {
+            let mut written = unsafe {
+                TensorMut::<bf16, 2>::new(scale_ptr, [rows, 1], [1, 1], u64::from(rows) * 2)?
+            };
+            self.combine
+                .shared_scale(stream, input.x, shared_gate, &mut written)?;
+            gate = Some(shared_gate);
+            scale = Some(written);
+        }
         let combine_input = MoeCombine {
             ids: input.ids,
             final_active: input.active,
@@ -476,7 +568,7 @@ impl DecodeOps {
             contributions: input.contributions,
             shared_out: input.shared_out.read(),
             x: input.x,
-            shared_expert_gate: input.shared_expert_gate,
+            shared_expert_gate: gate,
             scale,
             y: TensorMut(y.read()),
         };
@@ -489,8 +581,9 @@ impl DecodeOps {
         input: &MoeDecode<'_>,
         slot: &crate::experts::catalogue::Fp8Slot,
         scratch: &Scratch,
+        expert_inter: u32,
     ) -> Result<()> {
-        let dims = validate_w8a16(input, slot, scratch)?;
+        let dims = validate_w8a16(input, slot, scratch, expert_inter)?;
         self.launch(
             stream,
             input,

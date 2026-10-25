@@ -27,7 +27,27 @@ impl LayerDequantPlan {
         layer: u32,
         format: LinearFormat,
     ) -> Result<Self> {
-        let prefix = format!("model.language_model.layers.{layer}.");
+        let language = format!("model.language_model.layers.{layer}.");
+        let model = format!("model.layers.{layer}.");
+        let language_count = manifest
+            .entries
+            .keys()
+            .filter(|name| name.starts_with(&language))
+            .count();
+        let model_count = manifest
+            .entries
+            .keys()
+            .filter(|name| name.starts_with(&model))
+            .count();
+        ensure!(
+            language_count > 0 || model_count > 0,
+            "missing linear layer {layer}"
+        );
+        ensure!(
+            language_count == 0 || model_count == 0,
+            "layer {layer} has both model and language_model tensors"
+        );
+        let prefix = if language_count > 0 { language } else { model };
         Self::build(manifest, layer, prefix, format)
     }
 

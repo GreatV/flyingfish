@@ -471,6 +471,8 @@ pub(super) struct Load<'a> {
     pub directory: &'a Path,
     pub engines: u32,
     pub max_rows: u32,
+    pub swiglu_rounding: crate::model_spec::SwigluRounding,
+    pub routed_weight: crate::model_spec::RoutedWeightBoundary,
 }
 
 pub(in crate::backend::cuda::engine) struct Slots {
@@ -556,6 +558,7 @@ pub(super) fn delay_stream(stream: &Arc<CudaStream>) -> Result<()> {
 
 impl Slots {
     pub(super) fn load(device: &Device, geometry: ExpertGeometry, input: Load<'_>) -> Result<Self> {
+        let total_started = std::time::Instant::now();
         ensure!(
             input.catalogue.geometry() == geometry,
             "expert slot/catalogue geometry differs"
@@ -570,21 +573,27 @@ impl Slots {
             input.engines > 0,
             "expert setup has no measured copy engines"
         );
+        let phase_started = std::time::Instant::now();
         let mut storage = super::super::super::weights::ExpertStorage::new(
             &device.stream,
             &device.upload,
             geometry,
             input.capacity,
         )?;
+        let storage_new_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+        let phase_started = std::time::Instant::now();
         if input.capacity.pinned {
             storage.register_host()?;
         }
+        let host_register_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+        let phase_started = std::time::Instant::now();
         let disk = Reader::new(
             device,
             DiskReader::open(&input.catalogue, input.directory, input.engines.min(2))?,
             &input.catalogue,
         )?;
-        let (policy, _) = Residency::load(crate::experts::runtime::LoadInputs {
+        let reader_open_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+        let (policy, host_load) = Residency::load(crate::experts::runtime::LoadInputs {
             geometry,
             capacity: input.capacity.clone(),
             admission: input.admission,
@@ -594,6 +603,8 @@ impl Slots {
             catalogue: &input.catalogue,
             reader: &disk.disk,
         })?;
+        let host_fill_ms = host_load.seconds * 1000.0;
+        let phase_started = std::time::Instant::now();
         let physical_count = input.capacity.slots_total() as usize;
         let mut physical = (0..physical_count)
             .map(|_| Physical::default())
@@ -613,6 +624,8 @@ impl Slots {
             physical.iter().all(|slot| slot.pointer != 0),
             "physical expert slot map has a hole"
         );
+        let physical_map_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+        let phase_started = std::time::Instant::now();
         let transfers = Transfers::new(
             device,
             &storage,
@@ -624,6 +637,8 @@ impl Slots {
                 0
             },
         )?;
+        let transfers_new_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+        let phase_started = std::time::Instant::now();
         let events = Events::new(
             &device.ctx,
             2 * physical_count
@@ -633,6 +648,8 @@ impl Slots {
                 + 2 * input.capacity.prefill_staging_slots as usize
                 + 4,
         )?;
+        let events_new_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+        let phase_started = std::time::Instant::now();
         let logical = geometry.layers as usize * geometry.experts as usize;
         let mut slots = Self {
             storage,
@@ -658,11 +675,13 @@ impl Slots {
                 physical_count.max(input.max_rows as usize * geometry.top_k as usize),
             ),
             disk_cpu: if input.capacity.disk_workers > 0 {
-                Some(DiskExperts::new(
+                Some(DiskExperts::new_with_swiglu_rounding(
                     input.catalogue.clone(),
                     input.directory,
                     input.capacity.disk_workers,
                     input.max_rows,
+                    input.swiglu_rounding,
+                    input.routed_weight,
                 )?)
             } else {
                 None
@@ -673,6 +692,8 @@ impl Slots {
             #[cfg(test)]
             delay_request: false,
         };
+        let slots_new_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+        let phase_started = std::time::Instant::now();
         device.upload.wait(&device.stream.record_event(None)?)?;
         for layer in 0..geometry.layers {
             for expert in 0..geometry.experts {
@@ -689,6 +710,23 @@ impl Slots {
             }
         }
         slots.refill.record(&slots.transfers.h2d)?;
+        let resident_upload_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "{}",
+            serde_json::json!({"expert_slots_phase": {
+                "storage_new_ms": storage_new_ms,
+                "host_register_ms": host_register_ms,
+                "reader_open_ms": reader_open_ms,
+                "host_fill_ms": host_fill_ms,
+                "host_fill_bytes": host_load.host_bytes,
+                "physical_map_ms": physical_map_ms,
+                "transfers_new_ms": transfers_new_ms,
+                "events_new_ms": events_new_ms,
+                "slots_new_ms": slots_new_ms,
+                "resident_upload_ms": resident_upload_ms,
+                "total_ms": total_started.elapsed().as_secs_f64() * 1000.0
+            }})
+        );
         Ok(slots)
     }
 
@@ -1071,7 +1109,7 @@ impl Slots {
         x: Tensor<bf16, 2>,
         y: &mut TensorMut<bf16, 2>,
     ) -> Result<()> {
-        decode.route(device, ffn, x)?;
+        decode.route(device, &ffn, x)?;
         self.complete(device, decode, layer, ffn, (x, y), None)
     }
 
@@ -1096,11 +1134,12 @@ impl Slots {
         device: &Device,
         decode: &mut Decode,
         layer: u32,
+        graph_layer: usize,
         ffn: BoundFfn,
         activation: (Tensor<bf16, 2>, &mut TensorMut<bf16, 2>),
     ) -> Result<()> {
-        decode.read_route(device, ffn, activation.0)?;
-        self.complete(device, decode, layer, ffn, activation, Some(layer as usize))
+        decode.read_route(device, &ffn, activation.0)?;
+        self.complete(device, decode, layer, ffn, activation, Some(graph_layer))
     }
 
     fn complete(

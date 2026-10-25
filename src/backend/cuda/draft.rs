@@ -1169,6 +1169,7 @@ impl Draft {
                             .arg(&(c.num_key_value_heads as i32))
                             .arg(&(c.head_dim as i32))
                             .arg(&(self.capacity as i32))
+                            .arg(&0i32)
                             .arg(&c.rope_parameters.rope_theta)
                             .arg(&self.config.rms_norm_eps)
                             .launch(grid(
@@ -1190,6 +1191,7 @@ impl Draft {
                             capacity: self.capacity,
                             head_dim: c.head_dim,
                             causal: false,
+                            window_left: None,
                         },
                     )?;
                 }
@@ -1230,6 +1232,7 @@ impl Draft {
                     .arg(&mut self.act)
                     .arg(&(block_rows as i32))
                     .arg(&(f as i32))
+                    .arg(&(ops.swiglu_rounding() as i32))
                     .launch(flat(block_rows * f))?;
             }
             blas.linear(

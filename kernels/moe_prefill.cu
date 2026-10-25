@@ -1,12 +1,13 @@
 // Active-assignment count, exclusive scan, row permutation and weighted BF16 scatter.
 // Active expert ids, slot generations, done bits and segment positions are checked before use.
 #include <cuda_runtime.h>
+#include <type_traits>
 #include "q38_contract.cuh"
 
 using bf16 = __nv_bfloat16;
 
 // Sixteen K-strided FMA accumulators and the CPU expert's pairwise tree.
-template <bool FP8>
+template <bool FP8, class Out>
 __device__ __forceinline__ void moe_lane16(
     const unsigned long long* __restrict__ matrices, int problems,
     int first, int columns, int inner, unsigned long long scale_offset) {
@@ -23,8 +24,8 @@ __device__ __forceinline__ void moe_lane16(
       reinterpret_cast<const bf16*>(matrices[problem]) + (size_t)column * inner;
   const bf16* __restrict__ x =
       reinterpret_cast<const bf16*>(matrices[problems + problem]) + (size_t)row * inner;
-  bf16* __restrict__ y =
-      reinterpret_cast<bf16*>(matrices[2 * problems + problem]) + (size_t)row * columns;
+  Out* __restrict__ y =
+      reinterpret_cast<Out*>(matrices[2 * problems + problem]) + (size_t)row * columns;
   float sum = 0.0f;
   for (int k = lane; k < inner; k += 16) {
     if constexpr (FP8) {
@@ -40,19 +41,31 @@ __device__ __forceinline__ void moe_lane16(
   const unsigned mask = 0xFFFFu << (threadIdx.x & 16);
   for (int step = 1; step < 16; step *= 2)
     sum = __fadd_rn(sum, __shfl_down_sync(mask, sum, step, 16));
-  if (lane == 0) y[column] = __float2bfloat16_rn(sum);
+  if (lane == 0) {
+    if constexpr (std::is_same_v<Out, float>) {
+      y[column] = sum;
+    } else {
+      y[column] = __float2bfloat16_rn(sum);
+    }
+  }
 }
 
 extern "C" __global__ void moe_gemm_lane16(
     const unsigned long long* __restrict__ matrices, int problems,
     int first, int columns, int inner) {
-  moe_lane16<false>(matrices, problems, first, columns, inner, 0);
+  moe_lane16<false, bf16>(matrices, problems, first, columns, inner, 0);
 }
 
 extern "C" __global__ void moe_gemm_lane16_w8a16(
     const unsigned long long* __restrict__ matrices, int problems,
     int first, int columns, int inner, unsigned long long scale_offset) {
-  moe_lane16<true>(matrices, problems, first, columns, inner, scale_offset);
+  moe_lane16<true, bf16>(matrices, problems, first, columns, inner, scale_offset);
+}
+
+extern "C" __global__ void moe_gemm_lane16_f32(
+    const unsigned long long* matrices, int problems,
+    int first, int columns, int inner) {
+  moe_lane16<false, float>(matrices, problems, first, columns, inner, 0);
 }
 
 __device__ __forceinline__ float decode_e4m3_byte(unsigned code) {
@@ -321,6 +334,27 @@ extern "C" __global__ void moe_scatter(
   bf16* __restrict__ dst = contributions + a * hidden;
   for (long long c = threadIdx.x; c < hidden; c += blockDim.x)
     dst[c] = __float2bfloat16(__bfloat162float(src[c]) * w);
+}
+
+extern "C" __global__ void moe_scatter_f32(
+    const float* __restrict__ y_perm, const bf16* __restrict__ weights,
+    const int* __restrict__ pos_of, const unsigned* __restrict__ active,
+    bf16* __restrict__ contributions, long long assignments,
+    long long hidden, int routed_weight_fp32) {
+  if (blockDim.x != 256 || (unsigned)routed_weight_fp32 > 1u) __trap();
+  const long long a = blockIdx.x;
+  if (a >= assignments) __trap();
+  if (active[a] == 0u) return;
+  const long long pos = pos_of[a];
+  if (pos < 0 || pos >= assignments) __trap();
+  const float w = __bfloat162float(weights[a]);
+  const float* __restrict__ src = y_perm + pos * hidden;
+  bf16* __restrict__ dst = contributions + a * hidden;
+  for (long long c = threadIdx.x; c < hidden; c += blockDim.x) {
+    const float value = src[c];
+    dst[c] = __float2bfloat16(
+        routed_weight_fp32 ? value * w : __bfloat162float(__float2bfloat16(value)) * w);
+  }
 }
 
 #undef FD_MOE_GUARDS

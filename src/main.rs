@@ -544,7 +544,8 @@ fn run() -> Result<()> {
             } else {
                 cli.kernels.clone()
             };
-            Model::calibrate(&cli.model, cli.device, cli.capacity, cli.chunk, settings)
+            let _ = Model::calibrate(&cli.model, cli.device, cli.capacity, cli.chunk, settings)?;
+            Ok(())
         }
         Command::Generate {
             input,

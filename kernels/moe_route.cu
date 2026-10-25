@@ -1,5 +1,5 @@
-// MoE router: FP32 softmax over BF16 expert logits, deterministic top-k
-// (descending, exact ties by lower expert id), FP32 renormalised weights
+// MoE router: softmax or sigmoid scoring over BF16 expert logits, deterministic
+// top-k (descending, exact ties by lower expert id), FP32 renormalised weights
 // stored as BF16.
 //   moe_route_logits_bf16(x, router, logits, rows, experts, hidden):
 //     x [rows, hidden] bf16 row-major, router W [experts, hidden] bf16
@@ -13,7 +13,7 @@
 //     BF16 GEMM with FP32 accumulation; no rounding is applied here.
 //   ids [rows, top_k] i32, weights [rows, top_k] bf16.
 // moe_route_topk: one block per row; thread e < experts owns expert e. Softmax
-// runs in FP32 over the BF16 logits. top_k selection rounds each take the block
+// or sigmoid runs in FP32 over the BF16 logits. top_k rounds each take the block
 // maximum under the comparator (higher probability, then lower expert id); a
 // selected thread retires with probability -1.0f, below every softmax output.
 // The top-k probabilities are renormalised in FP32 accumulated in selection
@@ -122,6 +122,65 @@ __device__ void moe_route_select(
   }
 }
 
+__device__ void moe_route_select_sigmoid(
+    float logit, int* __restrict__ ids, bf16* __restrict__ weights,
+    int experts, int top_k) {
+  const int tid = threadIdx.x;
+  const int nthr = (int)blockDim.x;
+  const int nw = nthr >> 5;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int row = blockIdx.x;
+  const int e = tid;
+  const bool live = e < experts;
+  const float score = live ? 1.0f / (1.0f + expf(-logit)) : -1.0f;
+
+  __shared__ float s_sel_p[32];
+  __shared__ int s_sel_id[32];
+  __shared__ float s_red[32];
+  __shared__ int s_rid[32];
+  __shared__ float s_tsum;
+  if (tid == 0) s_tsum = 0.0f;
+  __syncthreads();
+
+  bool taken = false;
+  for (int r = 0; r < top_k; ++r) {
+    float v = !taken && live ? score : -1.0f;
+    int id = live ? e : 0x7fffffff;
+    for (int off = 16; off > 0; off >>= 1) {
+      const float ov = __shfl_down_sync(0xffffffffu, v, off);
+      const int oi = __shfl_down_sync(0xffffffffu, id, off);
+      if (ov > v || (ov == v && oi < id)) { v = ov; id = oi; }
+    }
+    if (lane == 0) { s_red[warp] = v; s_rid[warp] = id; }
+    __syncthreads();
+    if (warp == 0) {
+      v = lane < nw ? s_red[lane] : -1.0f;
+      id = lane < nw ? s_rid[lane] : 0x7fffffff;
+      for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_down_sync(0xffffffffu, v, off);
+        const int oi = __shfl_down_sync(0xffffffffu, id, off);
+        if (ov > v || (ov == v && oi < id)) { v = ov; id = oi; }
+      }
+      if (lane == 0) { s_red[0] = v; s_rid[0] = id; }
+    }
+    __syncthreads();
+    if (live && !taken && score == s_red[0] && e == s_rid[0]) {
+      s_sel_id[r] = e;
+      s_sel_p[r] = score;
+      s_tsum += score;
+      taken = true;
+    }
+    __syncthreads();
+  }
+
+  if (tid < top_k) {
+    ids[(size_t)row * top_k + tid] = s_sel_id[tid];
+    weights[(size_t)row * top_k + tid] =
+        __float2bfloat16(s_sel_p[tid] / (s_tsum + 1.0e-20f));
+  }
+}
+
 __device__ __forceinline__ float moe_route_dot8(uint4 a, uint4 b, float acc) {
     const __nv_bfloat162* ha = reinterpret_cast<const __nv_bfloat162*>(&a);
     const __nv_bfloat162* hb = reinterpret_cast<const __nv_bfloat162*>(&b);
@@ -204,6 +263,23 @@ extern "C" __global__ void moe_route_topk(
   if (tid < experts)
     logit = __bfloat162float(logits[(size_t)row * experts + tid]);
   moe_route_select(logit, ids, weights, experts, top_k);
+}
+
+extern "C" __global__ void moe_route_topk_sigmoid(
+    const bf16* __restrict__ logits, int* __restrict__ ids,
+    bf16* __restrict__ weights, int rows, int experts, int top_k) {
+  if ((int)blockIdx.x >= rows || experts < 1 || experts > 1024 || top_k < 1 ||
+      top_k > 32 || top_k >= experts || (blockDim.x & 31) != 0 ||
+      (int)blockDim.x < experts ||
+      (reinterpret_cast<uintptr_t>(logits) & 15) != 0)
+    __trap();
+
+  const int tid = threadIdx.x;
+  const int row = blockIdx.x;
+  float logit = -CUDART_INF_F;
+  if (tid < experts)
+    logit = __bfloat162float(logits[(size_t)row * experts + tid]);
+  moe_route_select_sigmoid(logit, ids, weights, experts, top_k);
 }
 
 // Stream-ordered publication of one native expert slot and its generation.

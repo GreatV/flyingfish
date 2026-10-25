@@ -292,13 +292,21 @@ pub(crate) fn checkpoint_bytes(spec: &ModelSpec, rows: usize) -> Result<usize> {
 }
 
 #[cfg(any(feature = "cuda", test))]
-pub(crate) fn component_spec(spec: &ModelSpec) -> ModelSpec {
+pub(crate) fn component_spec(spec: &ModelSpec) -> Result<ModelSpec> {
     let mut component = spec.clone();
+    let ffn = if spec.moe.is_some() {
+        crate::model_spec::FfnKind::Moe
+    } else {
+        crate::model_spec::FfnKind::Dense
+    };
     component.layers = vec![crate::model_spec::LayerPlan {
         mixer: crate::model_spec::Mixer::FullAttention,
         state_index: 0,
+        rope: true,
+        sliding_window: None,
+        ffn,
     }];
-    component
+    Ok(component)
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -355,7 +363,7 @@ pub(crate) fn attachment_bytes(
         memory.total - memory.weights - memory.blas,
         WEIGHT_BYTES,
         checkpoint_bytes(spec, 5)?,
-        checkpoint_bytes(&component_spec(spec), 5)?,
+        checkpoint_bytes(&component_spec(spec)?, 5)?,
         bootstrap,
         (4 * HIDDEN + VOCAB) * 2 + 8,
         if batched { batch_bytes(spec)? } else { 0 },
@@ -436,6 +444,19 @@ mod tests {
         )
         .unwrap()
     }
+
+    #[test]
+    fn mtp_component_uses_full_attention() {
+        let component = component_spec(&spec()).unwrap();
+        assert_eq!(component.layers.len(), 1);
+        let layer = &component.layers[0];
+        assert_eq!(layer.mixer, crate::model_spec::Mixer::FullAttention);
+        assert_eq!(layer.state_index, 0);
+        assert!(layer.rope);
+        assert_eq!(layer.sliding_window, None);
+        assert_eq!(layer.ffn, crate::model_spec::FfnKind::Dense);
+    }
+
     fn plan() -> MtpPlan {
         MtpPlan {
             hidden_tap: MtpHiddenTap::PreFinalNorm,

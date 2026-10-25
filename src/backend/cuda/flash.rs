@@ -1,4 +1,6 @@
+use anyhow::Context;
 use anyhow::{Result, ensure};
+use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use half::bf16;
 use std::{
@@ -25,6 +27,23 @@ unsafe extern "C" {
         causal: i32,
         stream: *mut c_void,
     ) -> i32;
+    fn ff_fa2_run_window(
+        q: *mut c_void,
+        k: *mut c_void,
+        v: *mut c_void,
+        out: *mut c_void,
+        lse: *mut c_void,
+        rows: i32,
+        start: i32,
+        q_heads: i32,
+        kv_heads: i32,
+        capacity: i32,
+        head_dim: i32,
+        q_row_stride: i64,
+        causal: i32,
+        window_left: i32,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 /// One attention problem: `rows` query rows at absolute positions
@@ -40,11 +59,13 @@ pub struct Shape {
     pub capacity: usize,
     pub head_dim: usize,
     pub causal: bool,
+    pub window_left: Option<usize>,
 }
 
 pub struct Flash {
     stream: Arc<CudaStream>,
     lse: CudaSlice<f32>,
+    sink_rescale: CudaFunction,
 }
 
 impl Flash {
@@ -62,7 +83,13 @@ impl Flash {
     /// Holds FA2's LSE, `rows * heads` f32 (FA2 writes `(b, h, seqlen_q)`); allocated once at setup.
     pub fn new(stream: Arc<CudaStream>, rows: usize, heads: usize) -> Result<Self> {
         let lse = stream.alloc_zeros(rows * heads)?;
-        Ok(Self { stream, lse })
+        let sink_rescale = super::cubin::module(stream.context(), "attention")?
+            .load_function("attention_sink_rescale")?;
+        Ok(Self {
+            stream,
+            lse,
+            sink_rescale,
+        })
     }
 
     /// Runs FA2 on one chunk. `q` is the normed, RoPE'd `[rows, q_heads,
@@ -72,6 +99,18 @@ impl Flash {
     /// `tcmqa_d256_rope_k_scatter` / `_v_scatter` write, holding every position
     /// `[0, start + rows)`.
     pub fn run(
+        &mut self,
+        q: &CudaSlice<bf16>,
+        q_row_stride: usize,
+        k: &CudaSlice<bf16>,
+        v: &CudaSlice<bf16>,
+        out: &mut CudaSlice<bf16>,
+        shape: Shape,
+    ) -> Result<()> {
+        self.run_with_window(q, q_row_stride, k, v, out, shape)
+    }
+
+    fn run_with_window(
         &mut self,
         q: &CudaSlice<bf16>,
         q_row_stride: usize,
@@ -91,6 +130,12 @@ impl Flash {
             .iter()
             .all(|&x| x <= i32::MAX as usize),
             "FA2 dimensions exceed i32"
+        );
+        ensure!(
+            shape
+                .window_left
+                .is_none_or(|window| window <= i32::MAX as usize),
+            "FA2 window exceeds i32"
         );
         ensure!(
             shape.causal,
@@ -142,27 +187,96 @@ impl Flash {
         let (v, _v) = v.device_ptr(&self.stream);
         let (out, _out) = out.device_ptr_mut(&self.stream);
         let (lse, _lse) = self.lse.device_ptr_mut(&self.stream);
-        let status = unsafe {
-            ff_fa2_run(
-                q as _,
-                k as _,
-                v as _,
-                out as _,
-                lse as _,
-                shape.rows as i32,
-                shape.start as i32,
-                shape.q_heads as i32,
-                shape.kv_heads as i32,
-                shape.capacity as i32,
-                shape.head_dim as i32,
-                q_row_stride as i64,
-                i32::from(shape.causal),
-                self.stream.cu_stream() as _,
-            )
+        let status = if let Some(window_left) = shape.window_left {
+            unsafe {
+                ff_fa2_run_window(
+                    q as _,
+                    k as _,
+                    v as _,
+                    out as _,
+                    lse as _,
+                    shape.rows as i32,
+                    shape.start as i32,
+                    shape.q_heads as i32,
+                    shape.kv_heads as i32,
+                    shape.capacity as i32,
+                    shape.head_dim as i32,
+                    q_row_stride as i64,
+                    i32::from(shape.causal),
+                    window_left as i32,
+                    self.stream.cu_stream() as _,
+                )
+            }
+        } else {
+            unsafe {
+                ff_fa2_run(
+                    q as _,
+                    k as _,
+                    v as _,
+                    out as _,
+                    lse as _,
+                    shape.rows as i32,
+                    shape.start as i32,
+                    shape.q_heads as i32,
+                    shape.kv_heads as i32,
+                    shape.capacity as i32,
+                    shape.head_dim as i32,
+                    q_row_stride as i64,
+                    i32::from(shape.causal),
+                    self.stream.cu_stream() as _,
+                )
+            }
         };
         if status != 0 {
             let error = unsafe { CStr::from_ptr(ff_fa2_error()) }.to_string_lossy();
             anyhow::bail!("FA2 launch failed: {error}");
+        }
+        Ok(())
+    }
+
+    pub fn apply_sinks(
+        &mut self,
+        sinks: &CudaSlice<bf16>,
+        output: &mut CudaSlice<bf16>,
+        rows: usize,
+        heads: usize,
+    ) -> Result<()> {
+        ensure!(
+            rows > 0 && heads > 0 && rows <= i32::MAX as usize && heads <= i32::MAX as usize,
+            "attention sink rescale dimensions exceed i32"
+        );
+        ensure!(
+            sinks.len() == heads && self.lse.len() >= rows * heads,
+            "attention sink extents differ: sinks={}, lse={}, rows={rows}, heads={heads}",
+            sinks.len(),
+            self.lse.len()
+        );
+        ensure!(
+            output.len() >= rows * heads * 128,
+            "attention sink output extent is below rows*heads*128"
+        );
+        self.stream.context().bind_to_thread()?;
+        let (lse, _lse) = self.lse.device_ptr(&self.stream);
+        let (sinks, _sinks) = sinks.device_ptr(&self.stream);
+        let (output, _output) = output.device_ptr_mut(&self.stream);
+        let elements = rows
+            .checked_mul(heads)
+            .and_then(|count| count.checked_mul(128))
+            .context("attention sink output extent overflow")?;
+        let blocks = elements.div_ceil(256).min(65_535);
+        unsafe {
+            self.stream
+                .launch_builder(&self.sink_rescale)
+                .arg(&lse)
+                .arg(&sinks)
+                .arg(&output)
+                .arg(&(rows as i32))
+                .arg(&(heads as i32))
+                .launch(LaunchConfig {
+                    grid_dim: (blocks as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
         }
         Ok(())
     }

@@ -83,6 +83,10 @@ fn placement_components(engine: &Engine, model: &Path) -> Result<usize> {
     };
     let device = &engine.device;
     let stream = &device.stream;
+    let format = engine
+        .model_spec
+        .expert_format
+        .context("placement expert_format missing")?;
     let geometry = ExpertGeometry::from_model(&engine.model_spec)?;
     ensure!(
         geometry.hidden == 2048
@@ -91,10 +95,6 @@ fn placement_components(engine: &Engine, model: &Path) -> Result<usize> {
             && geometry.experts == 256,
         "Runner FAIL placement geometry {geometry:?}"
     );
-    let format = engine
-        .model_spec
-        .expert_format
-        .context("Runner FAIL placement expert format missing")?;
     let manifest = crate::checkpoint::MappedCheckpoint::open(model)?
         .manifest(&engine.model_spec, crate::checkpoint::LoadPolicy::TextOnly)?;
     let catalogue = Arc::new(ExpertCatalogue::from_manifest(&manifest, geometry, format)?);
@@ -138,19 +138,37 @@ fn placement_components(engine: &Engine, model: &Path) -> Result<usize> {
     let x = qwen::matrix(&x_buffer, stream, 0, 1, 2048)?;
     let mut y_view = TensorMut(qwen::matrix(&y, stream, 0, 1, 2048)?);
     let ffn = engine.moe_ffn_binding(0)?;
-    let mut decode = Decode::new(device, geometry, 1, 1, (1, 8), format)?;
+    let mut decode = Decode::new(
+        device,
+        DecodeOptions {
+            geometry,
+            max_rows: 1,
+            workers: 1,
+            cpu_bounds: (1, 8),
+            format,
+            shared_intermediate: engine
+                .model_spec
+                .moe
+                .context("MoE shared geometry missing")?
+                .shared_intermediate,
+            swiglu_rounding: engine.model_spec.swiglu_rounding(),
+            routed_weight: engine.model_spec.routed_weight_boundary(),
+        },
+    )?;
     let ids = (0..8).collect::<Vec<i32>>();
     let weights = [bf16::from_f32(0.125); 8];
     stream.memcpy_htod(&ids, &mut decode.ids)?;
     stream.memcpy_htod(&weights, &mut decode.weights)?;
     stream.memcpy_htod(&[1u32; 8], &mut decode.active)?;
     stream.memcpy_htod(&[1u64; 8], &mut decode.generation)?;
-    decode.contribute_device(device, ffn, table, x)?;
-    decode.combine_device(device, ffn, x, &mut y_view)?;
-    let route = placement_graph(stream, || decode.route_device(device, ffn, x))?;
-    let contribute = placement_graph(stream, || decode.contribute_device(device, ffn, table, x))?;
+    decode.contribute_device(device, ffn.clone(), table, x)?;
+    decode.combine_device(device, ffn.clone(), x, &mut y_view)?;
+    let route = placement_graph(stream, || decode.route_device(device, &ffn, x))?;
+    let contribute = placement_graph(stream, || {
+        decode.contribute_device(device, ffn.clone(), table, x)
+    })?;
     let join = placement_graph(stream, || {
-        decode.combine_device(device, ffn, x, &mut y_view)
+        decode.combine_device(device, ffn.clone(), x, &mut y_view)
     })?;
     decode.segments.push(graphs::Segments {
         route,
@@ -187,7 +205,7 @@ fn placement_components(engine: &Engine, model: &Path) -> Result<usize> {
             } else {
                 [0, 1, 1, 1, 1, 1, 1, 1]
             };
-            decode.read_route(device, ffn, x)?;
+            decode.read_route(device, &ffn, x)?;
             let dispatch = Dispatch {
                 active: &active,
                 generation: &[1; 8],
@@ -204,7 +222,7 @@ fn placement_components(engine: &Engine, model: &Path) -> Result<usize> {
             let _range = super::super::super::profile::Range::new(true, c"placement_component");
             decode.finish_with(
                 device,
-                ffn,
+                ffn.clone(),
                 table,
                 dispatch,
                 (x, &mut y_view),
@@ -292,13 +310,11 @@ fn minicpm_placement_invariance_gpu() -> Result<()> {
     let forced: Vec<u32> =
         serde_json::from_slice(&std::fs::read(runtime.join("placement-prefix.json"))?)?;
     let spec = crate::model_spec::ModelSpec::read(&model)?;
-    let format = spec
-        .expert_format
-        .context("Runner FAIL placement expert format missing")?;
     ensure!(
         matches!(
-            format,
-            crate::model_spec::ExpertFormat::Bf16 | crate::model_spec::ExpertFormat::Fp8W8a16
+            spec.expert_format,
+            Some(crate::model_spec::ExpertFormat::Bf16)
+                | Some(crate::model_spec::ExpertFormat::Fp8W8a16)
         ) && forced.len() == 201
             && forced.iter().all(|&id| id < spec.vocab),
         "Runner FAIL placement prefix/format"
@@ -462,9 +478,10 @@ fn minicpm_placement_invariance_gpu() -> Result<()> {
             expected = Some((logits, state));
         }
     }
-    let format_tag = match format {
-        crate::model_spec::ExpertFormat::Bf16 => "BF16",
-        crate::model_spec::ExpertFormat::Fp8W8a16 => "FP8",
+    let format_tag = match spec.expert_format {
+        Some(crate::model_spec::ExpertFormat::Bf16) => "BF16",
+        Some(crate::model_spec::ExpertFormat::Fp8W8a16) => "FP8",
+        _ => "UNSUPPORTED",
     };
     println!(
         "{} placement_invariance comparisons_complete=true identity_defects={defects} format={format_tag} rows=1 graph_eager=true tiers=GPU,Host,Disk strict_graph_eager_host_disk_repeat=true gpu_cpu_max_bf16_ulp=1",
@@ -558,6 +575,9 @@ impl Bounds {
         let cross_media = match (format, video) {
             (_, true) => "football_16x_vs_sample_demo_1_16x_logits_diff",
             (crate::model_spec::ExpertFormat::Bf16, false) => "hockey_16x_vs_boat_16x_logits_diff",
+            (crate::model_spec::ExpertFormat::Bf16Separate, false) => {
+                anyhow::bail!("Flint has no MiniCPM media fixture floor")
+            }
             (crate::model_spec::ExpertFormat::Fp8W8a16, false) => same_grid,
         };
         let media = media_boundary(&controls[same_grid])?;
@@ -935,7 +955,7 @@ fn native_layer0(engine: &mut Engine, source: &SafeTensors<'_>) -> Result<usize>
     );
     engine.reset()?;
     let ffn = engine.moe_ffn_binding(0)?;
-    let BoundFfn::Moe { router, .. } = ffn else {
+    let BoundFfn::Moe { router, score, .. } = ffn else {
         anyhow::bail!("FP8 layer0 FFN is dense");
     };
     let mut decode = engine.moe.take().context("FP8 layer0 decoder missing")?;
@@ -959,7 +979,6 @@ fn native_layer0(engine: &mut Engine, source: &SafeTensors<'_>) -> Result<usize>
             )?;
             let x = qwen::matrix(&engine.work.n, stream, 0, count, h)?;
             decode.route.route_prefill(
-                stream,
                 x,
                 router,
                 &mut TensorMut(view(
@@ -977,6 +996,7 @@ fn native_layer0(engine: &mut Engine, source: &SafeTensors<'_>) -> Result<usize>
                     [k as u64, 1],
                 )?),
                 &mut TensorMut(qwen::matrix(&logits, stream, 0, count, experts)?),
+                score,
             )?;
             defects += score_chain(
                 "router_logits",
@@ -989,7 +1009,7 @@ fn native_layer0(engine: &mut Engine, source: &SafeTensors<'_>) -> Result<usize>
                 1,
                 &[h],
             )?;
-            decode.route(&engine.device, ffn, x)?;
+            decode.route(&engine.device, &ffn, x)?;
             let (actual_ids, actual_weights) = decode.routed()?;
             let mut routed = Vec::new();
             let mut reference = Vec::new();
@@ -1054,7 +1074,7 @@ fn native_layer0(engine: &mut Engine, source: &SafeTensors<'_>) -> Result<usize>
                 &engine.device,
                 &mut decode,
                 0,
-                ffn,
+                ffn.clone(),
                 (
                     x,
                     &mut TensorMut(qwen::matrix(&engine.work.out, stream, 0, count, h)?),
@@ -1312,8 +1332,8 @@ fn teacher_steps(
     Ok(steps)
 }
 
-fn native_cases(format: crate::model_spec::ExpertFormat) -> &'static [&'static str] {
-    match format {
+fn native_cases(format: crate::model_spec::ExpertFormat) -> Result<&'static [&'static str]> {
+    Ok(match format {
         crate::model_spec::ExpertFormat::Bf16 => &[
             "text_32",
             "text_1k",
@@ -1333,7 +1353,10 @@ fn native_cases(format: crate::model_spec::ExpertFormat) -> &'static [&'static s
             "video_control_clip2_16x",
             "video_control_same_grid_16x",
         ],
-    }
+        crate::model_spec::ExpertFormat::Bf16Separate => {
+            anyhow::bail!("Flint has no MiniCPM native fixtures")
+        }
+    })
 }
 
 fn check_fixtures(fixtures: &Path, model_dir: &Path, cases: &[&str]) -> Result<()> {
@@ -2087,7 +2110,7 @@ fn minicpm_native_checkpoint_fixtures_cpu() -> Result<()> {
     let format = crate::model_spec::ModelSpec::read(&model)?
         .expert_format
         .context("native fixture expert_format missing")?;
-    let cases = native_cases(format);
+    let cases = native_cases(format)?;
     check_fixtures(&fixtures, &model, cases)?;
     println!(
         "PASS minicpm_native_fixture_preflight format={format:?} cases={} video_decode=ffmpeg canvas=true floors_complete=true",
@@ -2124,7 +2147,7 @@ fn minicpm_native_prefill_profile_gpu() -> Result<()> {
     };
     Engine::calibrate(&model, 0, 4352, None, settings.clone())?;
     let mut engine = Engine::load(&model, 0, 4352, None, settings)?;
-    let cases = native_cases(crate::model_spec::ExpertFormat::Fp8W8a16);
+    let cases = native_cases(crate::model_spec::ExpertFormat::Fp8W8a16)?;
     check_fixtures(&fixtures, &model, cases)?;
     for &case in cases {
         let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
@@ -3517,7 +3540,7 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
     let format = spec
         .expert_format
         .context("native checkpoint expert_format missing")?;
-    let names = native_cases(format);
+    let names = native_cases(format)?;
     let cases = names
         .iter()
         .copied()

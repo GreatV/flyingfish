@@ -210,6 +210,9 @@ impl Probe {
         spec.layers = vec![LayerPlan {
             mixer: Mixer::FullAttention,
             state_index: 0,
+            rope: true,
+            sliding_window: None,
+            ffn: crate::model_spec::FfnKind::Dense,
         }];
         let state = StateStore::new(&spec, capacity, &self.device.stream)?;
         ensure!(

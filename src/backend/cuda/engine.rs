@@ -539,6 +539,7 @@ fn load_dispatch(architecture: crate::model_spec::Architecture) -> Result<LoadDi
         Architecture::Qwen35Text => LoadDispatch::Qwen,
         Architecture::Llama => LoadDispatch::Llama,
         Architecture::MiniCpmV47 => LoadDispatch::Qwen,
+        Architecture::Flint => LoadDispatch::Qwen,
     })
 }
 
@@ -548,6 +549,8 @@ pub struct Engine {
     capture_fail_after_layer: Option<(usize, usize)>,
     #[cfg(test)]
     capture_fail_stage: Option<CaptureFault>,
+    #[cfg(test)]
+    flint_window_capture: Option<(Vec<usize>, Vec<usize>, PathBuf)>,
     forward_rows: std::collections::BTreeSet<usize>,
     graphs: Vec<Graph>,
     closure: Rc<super::closure::Closure>,
@@ -567,6 +570,8 @@ pub struct Engine {
     moe_prefill: Option<moe::Prefill>,
     #[cfg(test)]
     moe_test_ffn: Option<super::linear::BoundFfn>,
+    flint_legacy_overflow_prefill: bool,
+    flint_frozen_decode_length: bool,
     mtp: Option<mtp::Chain>,
     mtp_state: Option<super::state::StateStore>,
     mtp_epoch: u64,
@@ -579,6 +584,7 @@ pub struct Engine {
     blas: Blas,
     flash: Option<Flash>,
     decode: Option<Attention>,
+    flint_logits: Option<CudaSlice<f32>>,
     device: Device,
     config: Config,
     model_spec: crate::model_spec::ModelSpec,
@@ -747,7 +753,8 @@ impl Engine {
         capacity: usize,
         chunk: Option<usize>,
         settings: Settings,
-    ) -> Result<()> {
+    ) -> Result<Option<Self>> {
+        let started = Instant::now();
         let spec = crate::model_spec::ModelSpec::read(dir)?;
         if spec.moe.is_some() && settings.draft_model.is_none() {
             let geometry = crate::experts::catalogue::ExpertGeometry::from_model(&spec)?;
@@ -785,10 +792,40 @@ impl Engine {
                 "{}",
                 serde_json::json!({"expert_setup_calibrated":{"budget_bytes_per_token":budget,"hard_step_cap":crate::experts::plan::Admission { budget_bytes_per_token: budget }.hard_cap(crate::experts::catalogue::ExpertLayout::new(spec.expert_format.context("MoE expert_format missing")?, &geometry)?.slot_bytes())?}})
             );
-            return Ok(());
+            if spec.architecture != crate::model_spec::Architecture::Flint {
+                return Ok(None);
+            }
         }
-        Self::load_kind(dir, ordinal, capacity, chunk, settings, true)?;
-        Ok(())
+        let mut engine = Self::load_kind(dir, ordinal, capacity, chunk, settings, true)?;
+        if spec.architecture != crate::model_spec::Architecture::Flint {
+            return Ok(None);
+        }
+        engine.finish_flint_calibration(dir, started)?;
+        Ok(Some(engine))
+    }
+
+    fn finish_flint_calibration(&mut self, dir: &Path, started: Instant) -> Result<()> {
+        let profile = super::closure::Profile::new(
+            &self.config,
+            self.capacity,
+            self.chunk,
+            None,
+            dir,
+            None,
+            None,
+        )?;
+        let bucket = crate::backend::setup::attention_bucket(self.capacity)?;
+        let path =
+            super::calibrate::cache_path(&self.runtime, &self.device.key, bucket, self.capacity);
+        self.closure.preflight(&[path])?;
+        self.closure
+            .finish(profile, &self.runtime, self.device.key.clone())?;
+        self.reset()?;
+        self.prepare_graphs()?;
+        self.closure.expect_captures(self.graphs.len())?;
+        self.check_graphs()?;
+        self.reset()?;
+        self.closure.ready(started)
     }
     fn load_kind(
         dir: &Path,
@@ -928,7 +965,8 @@ impl Engine {
             1,
             s,
         )?);
-        let ops = Ops::new(&device.ctx).context("load CUDA operator modules")?;
+        let ops = Ops::new_with_swiglu_rounding(&device.ctx, model_spec.swiglu_rounding())
+            .context("load CUDA operator modules")?;
         eprintln!("{}", serde_json::json!({"backend_device":device.info}));
         let blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
         let workspace_rows = if let Some(draft) = &draft_config {
@@ -950,12 +988,16 @@ impl Engine {
             capture_fail_after_layer: None,
             #[cfg(test)]
             capture_fail_stage: None,
+            #[cfg(test)]
+            flint_window_capture: None,
             qwen: None,
             moe: None,
             moe_slots: None,
             moe_prefill: None,
             #[cfg(test)]
             moe_test_ffn: None,
+            flint_legacy_overflow_prefill: false,
+            flint_frozen_decode_length: false,
             mtp: None,
             mtp_state: None,
             mtp_epoch: 0,
@@ -982,6 +1024,7 @@ impl Engine {
             blas,
             flash: Some(flash),
             decode: None,
+            flint_logits: None,
             device,
             config,
             model_spec,
@@ -1158,7 +1201,9 @@ impl Engine {
     }
 
     fn ensure_decode(&mut self) -> Result<()> {
-        if self.qwen.is_some() {
+        if self.qwen.is_some()
+            && self.model_spec.architecture != crate::model_spec::Architecture::Flint
+        {
             return Ok(());
         }
         if self.decode.is_some() {
@@ -1191,6 +1236,28 @@ impl Engine {
             setup.attention,
         )?;
         self.decode = Some(decode);
+        Ok(())
+    }
+
+    fn bind_recorded_decode(&mut self) -> Result<()> {
+        if self.decode.is_some() {
+            return Ok(());
+        }
+        let calibrated =
+            super::calibrate::load_recorded(&self.device, &self.runtime, self.capacity)?;
+        let setup = crate::backend::setup::Setup::select(
+            self.device.info.clone(),
+            &self.config,
+            self.capacity,
+            |_info, capacity| calibrated.choose(capacity),
+        )?;
+        self.decode = Some(Attention::new(
+            &self.device.ctx,
+            &self.device.stream,
+            &self.config,
+            self.capacity,
+            setup.attention,
+        )?);
         Ok(())
     }
 
@@ -1570,6 +1637,7 @@ impl Engine {
                             capacity: self.capacity,
                             head_dim: self.config.head_dim,
                             causal: false,
+                            window_left: None,
                         },
                     },
                     tree.ancestors(),
@@ -1602,6 +1670,7 @@ impl Engine {
                 capacity: self.capacity,
                 head_dim: c.head_dim,
                 causal: true,
+                window_left: None,
             };
             if step.head == Head::All {
                 self.spec
@@ -1727,7 +1796,7 @@ impl Engine {
     ) -> Result<()> {
         use crate::model_spec::{Architecture, Mixer};
         match (self.model_spec.architecture, mixer) {
-            (Architecture::Qwen35Text | Architecture::MiniCpmV47, _) => {
+            (Architecture::Qwen35Text | Architecture::MiniCpmV47 | Architecture::Flint, _) => {
                 self.qwen_mixer(layer, step, trace)
             }
             (Architecture::Llama, Mixer::FullAttention) => {
@@ -1923,6 +1992,7 @@ impl Engine {
                     .arg(&mut w.act)
                     .arg(&nr)
                     .arg(&fd)
+                    .arg(&(self.ops.swiglu_rounding() as i32))
                     .launch(flat(rows * f))?;
             },
             crate::backend::Operator::Down => {
@@ -2915,6 +2985,9 @@ impl Engine {
 
     pub fn decode_logits(&self) -> Result<Vec<f32>> {
         self.logits_cache.read()?;
+        if let Some(logits) = &self.flint_logits {
+            return Ok(self.device.stream.clone_dtoh(logits)?);
+        }
         let values = self
             .device
             .stream

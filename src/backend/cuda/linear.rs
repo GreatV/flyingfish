@@ -290,33 +290,42 @@ pub(crate) struct LayerLinearPlan {
     materialize: Vec<(LinearWeightRef, TensorMut<bf16, 2>)>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum BoundFfn {
     Dense,
     Moe {
         router: Tensor<bf16, 2>,
-        shared: [Tensor<bf16, 2>; 3],
-        shared_gate: Tensor<bf16, 1>,
+        score: crate::model_spec::RouterScore,
+        shared: Box<[Tensor<bf16, 2>; 3]>,
+        shared_gate: Option<Tensor<bf16, 1>>,
     },
 }
 
 impl BoundFfn {
     pub fn bind(spec: &crate::model_spec::ModelSpec, linear: &mut LayerLinearPlan) -> Result<Self> {
-        let Some(moe) = spec.moe else {
+        let Some(moe) = spec
+            .moe
+            .filter(|_| linear.projections.contains_key("mlp.gate.weight"))
+        else {
             return Ok(Self::Dense);
         };
         let h = spec.hidden;
         let i = moe.shared_intermediate;
         let router = linear.take_bf16("mlp.gate.weight", [moe.experts, h])?;
-        let shared = [
+        let shared = Box::new([
             linear.take_bf16("mlp.shared_expert.gate_proj.weight", [i, h])?,
             linear.take_bf16("mlp.shared_expert.up_proj.weight", [i, h])?,
             linear.take_bf16("mlp.shared_expert.down_proj.weight", [h, i])?,
-        ];
-        let gate = linear.take_bf16("mlp.shared_expert_gate.weight", [1, h])?;
-        let shared_gate = unsafe { Tensor::new(gate.ptr, [h], [1], gate.span_bytes)? };
+        ]);
+        let shared_gate = if moe.shared_gate {
+            let gate = linear.take_bf16("mlp.shared_expert_gate.weight", [1, h])?;
+            Some(unsafe { Tensor::new(gate.ptr, [h], [1], gate.span_bytes)? })
+        } else {
+            None
+        };
         Ok(Self::Moe {
             router,
+            score: moe.score,
             shared,
             shared_gate,
         })
@@ -330,8 +339,10 @@ impl BoundFfn {
                 shared_gate,
                 ..
             } => {
-                shared_gate.validate()?;
-                for weight in shared {
+                if let Some(gate) = shared_gate {
+                    gate.validate()?;
+                }
+                for weight in shared.iter() {
                     blas.prepare_fixed(rows, weight.shape[0], weight.shape[1])?;
                 }
                 Ok(())
@@ -1445,12 +1456,14 @@ mod tests {
             } else {
                 let BoundFfn::Moe {
                     router,
-                    shared,
+                    ref shared,
                     shared_gate,
+                    ..
                 } = bound?
                 else {
                     anyhow::bail!("MoE layer selected the dense FFN plan");
                 };
+                let shared_gate = shared_gate.context("test FFN plan has no shared-expert gate")?;
                 assert_eq!(router.shape, [256, 2048]);
                 assert_eq!(
                     shared.map(|weight| weight.shape),

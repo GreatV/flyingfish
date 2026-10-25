@@ -332,6 +332,21 @@ pub(super) fn load(
     Ok(Calibrated { cache, hit, path })
 }
 
+pub(super) fn load_recorded(d: &Device, dir: &Path, capacity: usize) -> Result<Calibrated> {
+    let bucket = attention_bucket(capacity)?;
+    let key = d.key.clone();
+    let path = cache_path(dir, &key, bucket, capacity);
+    let cache: Cache = serde_json::from_slice(&std::fs::read(&path)?)
+        .with_context(|| format!("read calibration cache {}", path.display()))?;
+    ensure!(cache.sms == d.info.sms, "attention cache SM count mismatch");
+    check(&cache, &key, capacity)?;
+    Ok(Calibrated {
+        cache,
+        hit: true,
+        path,
+    })
+}
+
 pub(super) use crate::verify::percentile;
 
 /// Uniform-attention max |actual − expected| and max error / bound over elements.
@@ -350,10 +365,11 @@ pub(super) fn uniform_attention_error(
         .iter()
         .enumerate()
         .map(|(i, v)| {
-            let row = i / c.hidden_size;
-            let head =
-                (i % c.hidden_size) / c.head_dim / (c.num_attention_heads / c.num_key_value_heads);
-            let e = expected[(row * c.num_key_value_heads + head) * c.head_dim + i % c.head_dim];
+            let width = c.num_attention_heads * c.head_dim;
+            let row = i / width;
+            let head = (i % width) / c.head_dim;
+            let kv_head = head / (c.num_attention_heads / c.num_key_value_heads);
+            let e = expected[row * c.kv_dim() + kv_head * c.head_dim + i % c.head_dim];
             let error = (v.to_f32() as f64 - e).abs();
             (
                 error,
@@ -386,9 +402,10 @@ fn measure(
     let start = Instant::now();
     let s = &d.stream;
     let trial_ms = 30;
-    let mut q = s.alloc_zeros::<bf16>(c.qkv_dim())?;
-    let zero_q = vec![bf16::ZERO; c.qkv_dim()];
-    let queries = random(c.qkv_dim(), 4);
+    let attention_width = c.num_attention_heads * c.head_dim;
+    let mut q = s.alloc_zeros::<bf16>(attention_width)?;
+    let zero_q = vec![bf16::ZERO; attention_width];
+    let queries = random(attention_width, 4);
     let k = s.clone_htod(&random(capacity * c.kv_dim(), 1))?;
     let v_values = random(capacity * c.kv_dim(), 2);
     let v_max = v_values
@@ -396,7 +413,7 @@ fn measure(
         .map(|v| v.to_f32().abs() as f64)
         .fold(0f64, f64::max);
     let v = s.clone_htod(&v_values)?;
-    let mut out = s.alloc_zeros::<bf16>(c.hidden_size)?;
+    let mut out = s.alloc_zeros::<bf16>(attention_width)?;
     let mut length = s.alloc_zeros::<i32>(1)?;
     let flush_count = d.info.l2_bytes.max(1024 * 1024);
     let mut flush = s.alloc_zeros::<bf16>(flush_count)?;
@@ -428,15 +445,16 @@ fn measure(
     {
         s.memcpy_htod(&[l as i32], &mut length)?;
         let mut expected = vec![0f64; c.kv_dim()];
-        for head in 0..c.num_key_value_heads {
+        for kv_head in 0..c.num_key_value_heads {
             let mut sum = vec![0f64; c.head_dim];
             for row in 0..l {
                 for (dim, value) in sum.iter_mut().enumerate() {
-                    *value += v_values[(head * capacity + row) * c.head_dim + dim].to_f32() as f64;
+                    *value +=
+                        v_values[(kv_head * capacity + row) * c.head_dim + dim].to_f32() as f64;
                 }
             }
             for (dim, value) in sum.iter().enumerate() {
-                expected[head * c.head_dim + dim] = *value / l as f64;
+                expected[kv_head * c.head_dim + dim] = *value / l as f64;
             }
         }
         let mut best = (f64::INFINITY, f64::INFINITY, usize::MAX);
@@ -1277,6 +1295,39 @@ pub(super) fn load_experts(
 #[cfg(test)]
 mod long_tests {
     use super::*;
+
+    #[test]
+    fn uniform_attention_error_maps_query_heads_to_kv_heads() {
+        let c = Config {
+            model_type: "llama".into(),
+            hidden_size: 2048,
+            intermediate_size: 8192,
+            num_hidden_layers: 1,
+            num_attention_heads: 16,
+            num_key_value_heads: 2,
+            head_dim: 128,
+            vocab_size: 128,
+            max_position_embeddings: 128,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            rope_scaling: None,
+            hidden_act: "silu".into(),
+            tie_word_embeddings: false,
+            torch_dtype: "bfloat16".into(),
+            eos_token_id: vec![1],
+            attention_bias: false,
+            mlp_bias: false,
+        };
+        let expected: Vec<_> = (0..c.num_key_value_heads)
+            .flat_map(|head| vec![f64::from(head as u32); c.head_dim])
+            .collect();
+        let actual: Vec<_> = (0..c.num_attention_heads)
+            .flat_map(|head| vec![bf16::from_f32(head as f32); c.head_dim])
+            .collect();
+        let (max_error, _) = uniform_attention_error(&c, &actual, &expected, c.head_dim, 1, 1.0);
+        assert_eq!(max_error, 14.0);
+    }
+
     #[test]
     fn expert_cells_guard_capacity_inputs() -> Result<()> {
         use crate::experts::{catalogue::ExpertGeometry, plan::ServiceCell};
@@ -1319,6 +1370,7 @@ mod long_tests {
             llc_bytes: 128,
         };
         let geometry = ExpertGeometry {
+            first_layer: 0,
             layers: 2,
             experts: 8,
             hidden: 16,
@@ -1762,6 +1814,7 @@ mod long_tests {
                     capacity,
                     head_dim: c.head_dim,
                     causal,
+                    window_left: None,
                 };
                 if tree {
                     op.run_tree(

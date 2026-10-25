@@ -14,8 +14,9 @@ LLM inference engine in Rust, targeting near-roofline decode and prefill on cons
 | Qwen3.8-27B | `Qwen3_5ForConditionalGeneration` | BF16, FP8 | MTP up to depth 4 |
 | MiniCPM-V-4.7 | `MiniCPMV4_7ForConditionalGeneration` | BF16, FP8 | MoE expert tiering, DSpark draft, image input |
 | MiniCPM5-2B | `LlamaForCausalLM` | BF16 | DSpark draft |
+| Flint | `FlintForCausalLM` | BF16 | MoE expert tiering, sliding-window attention with sinks |
 
-In progress: Flint, GLM-5.3-Flash and DeepSeek-V4.1-Flash.
+In progress: GLM-5.3-Flash and DeepSeek-V4.1-Flash.
 
 ## Platforms
 

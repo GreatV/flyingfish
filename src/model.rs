@@ -197,8 +197,12 @@ impl Model {
         capacity: usize,
         chunk: Option<usize>,
         settings: Settings,
-    ) -> Result<()> {
-        Backend::calibrate(dir, ordinal, capacity, chunk, settings)
+    ) -> Result<Option<Self>> {
+        let backend = Backend::calibrate(dir, ordinal, capacity, chunk, settings)?;
+        Ok(backend.map(|backend| Self {
+            config: backend.config().clone(),
+            backend,
+        }))
     }
     pub fn load(
         dir: &Path,

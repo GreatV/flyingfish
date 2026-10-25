@@ -989,6 +989,7 @@ mod tests {
 
     fn geometry() -> ExpertGeometry {
         ExpertGeometry {
+            first_layer: 0,
             layers: 2,
             experts: 8,
             hidden: 8,
@@ -999,6 +1000,7 @@ mod tests {
 
     fn three_layers() -> ExpertGeometry {
         ExpertGeometry {
+            first_layer: 0,
             layers: 3,
             experts: 8,
             hidden: 8,

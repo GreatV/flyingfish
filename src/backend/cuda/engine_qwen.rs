@@ -4,6 +4,8 @@ use crate::backend::cuda::contracts::view;
 use crate::backend::cuda::{
     attention_d256::{AttentionBindings, FullAttentionOps, FullAttentionPlan, PositionBindings},
     contracts::{RowDomain, Scratch, Tensor, TensorMut},
+    cubin,
+    decode::{GqaDecodeInput, SlidingWindow},
     gdn::{CUDA_GRID_YZ_MAX, GdnBindings, GdnOps, GdnPlan},
     linear::{BoundFfn, LayerLinearPlan, LinearWeightRef},
     ops::{CommonOpsRef, GatedRmsInput, ResidualRmsCapture, ResidualRmsInput, RmsMode, RmsOptions},
@@ -22,7 +24,7 @@ use crate::{
     model_spec::Mixer,
     op_contract::{AttentionLimits, ExecutionPhase, FullAttentionSpec, GdnSpec},
 };
-use cudarc::driver::{CudaFunction, DevicePtr};
+use cudarc::driver::{CudaFunction, DevicePtr, LaunchConfig};
 use std::collections::BTreeSet;
 
 fn all_layers(trace: &Option<Target<'_>>) -> bool {
@@ -35,6 +37,149 @@ fn debug_name(trace: &Option<Target<'_>>, layer: usize, point: &str) -> String {
     } else {
         format!("debug.{point}")
     }
+}
+
+fn norm_mode(spec: &crate::model_spec::ModelSpec) -> RmsMode {
+    if spec.architecture == crate::model_spec::Architecture::Flint {
+        RmsMode::Standard
+    } else {
+        RmsMode::ZeroCentered
+    }
+}
+
+#[cfg(test)]
+struct FlintWindowInputs<'a> {
+    spec: &'a crate::model_spec::ModelSpec,
+    layer: usize,
+    sliding: bool,
+    ring: usize,
+    position: &'a CudaSlice<i32>,
+    qkv: &'a CudaSlice<bf16>,
+    attention: &'a CudaSlice<bf16>,
+    kv: &'a Kv,
+    sinks: &'a CudaSlice<bf16>,
+}
+
+#[cfg(test)]
+fn capture_flint_window(
+    stream: &Arc<CudaStream>,
+    device_name: &str,
+    inputs: FlintWindowInputs<'_>,
+    capture: &Option<(Vec<usize>, Vec<usize>, PathBuf)>,
+) -> Result<()> {
+    let FlintWindowInputs {
+        spec,
+        layer,
+        sliding,
+        ring,
+        position,
+        qkv,
+        attention,
+        kv,
+        sinks,
+    } = inputs;
+    let Some((layers, positions, directory)) = capture else {
+        return Ok(());
+    };
+    if !layers.contains(&layer) {
+        return Ok(());
+    }
+    let host_position = stream.clone_dtoh(position)?[0];
+    ensure!(host_position >= 0, "negative Flint window position");
+    let logical_position = host_position as usize;
+    if !positions.contains(&logical_position) {
+        return Ok(());
+    }
+    let logical_length = if sliding {
+        (logical_position + 1).min(ring)
+    } else {
+        logical_position + 1
+    };
+    let first = (logical_position + 1 - logical_length) % ring;
+    let ring_slots = (0..logical_length)
+        .map(|offset| (first + offset) % ring)
+        .collect::<Vec<_>>();
+    let logical_positions = (logical_position + 1 - logical_length..=logical_position)
+        .map(|position| position as f32)
+        .collect::<Vec<_>>();
+    let head_dim = spec.head_dim as usize;
+    let q_heads = spec.q_heads as usize;
+    let q_width = spec.q_width as usize;
+    let kv_heads = spec.kv_heads as usize;
+    let kv_values = ring * kv_heads * head_dim;
+    let mut trace = Trace::default();
+    trace.set_device(device_name)?;
+    trace.add(
+        "q".to_owned(),
+        vec![q_heads, head_dim],
+        stream
+            .clone_dtoh(&qkv.slice(..q_width))?
+            .into_iter()
+            .map(bf16::to_f32)
+            .collect(),
+    )?;
+    trace.add(
+        "k".to_owned(),
+        vec![kv_heads, ring, head_dim],
+        stream
+            .clone_dtoh(&kv.k.slice(..kv_values))?
+            .into_iter()
+            .map(bf16::to_f32)
+            .collect(),
+    )?;
+    trace.add(
+        "v".to_owned(),
+        vec![kv_heads, ring, head_dim],
+        stream
+            .clone_dtoh(&kv.v.slice(..kv_values))?
+            .into_iter()
+            .map(bf16::to_f32)
+            .collect(),
+    )?;
+    trace.add(
+        "attention".to_owned(),
+        vec![q_heads, head_dim],
+        stream
+            .clone_dtoh(&attention.slice(..q_width))?
+            .into_iter()
+            .map(bf16::to_f32)
+            .collect(),
+    )?;
+    trace.add(
+        "sinks".to_owned(),
+        vec![q_heads],
+        stream
+            .clone_dtoh(sinks)?
+            .into_iter()
+            .map(bf16::to_f32)
+            .collect(),
+    )?;
+    trace.add(
+        "ring_slots".to_owned(),
+        vec![logical_length],
+        ring_slots.iter().map(|slot| *slot as f32).collect(),
+    )?;
+    trace.add(
+        "logical_positions".to_owned(),
+        vec![logical_length],
+        logical_positions,
+    )?;
+    trace.add(
+        "metadata".to_owned(),
+        vec![5],
+        vec![
+            layer as f32,
+            logical_position as f32,
+            logical_length as f32,
+            first as f32,
+            u8::from(sliding) as f32,
+        ],
+    )?;
+    std::fs::create_dir_all(directory)?;
+    trace.save(&directory.join(format!(
+        "layer{layer}_position{logical_position}.safetensors"
+    )))?;
+    Ok(())
 }
 
 fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
@@ -62,7 +207,7 @@ fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
             );
             (2048, 512, 248144, 16, 2, 40, 32, spec.linear_format)
         }
-        Architecture::Llama => anyhow::bail!(
+        Architecture::Llama | Architecture::Flint => anyhow::bail!(
             "hybrid engine does not implement architecture={:?}",
             spec.architecture
         ),
@@ -123,9 +268,65 @@ fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
     Ok(())
 }
 
+fn require_flint_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
+    use crate::model_spec::{Architecture, FfnKind, LinearFormat, Mixer};
+    ensure!(
+        spec.architecture == Architecture::Flint
+            && spec.hidden == 2048
+            && spec.intermediate == 6144
+            && spec.vocab == 150144
+            && spec.q_heads == 32
+            && spec.kv_heads == 4
+            && spec.head_dim == 128
+            && spec.q_width == 4096
+            && spec.max_position == 262144
+            && spec.rms_eps == 1e-6
+            && spec.rope_theta == 10000.0
+            && spec.rotary_dim == 128
+            && spec.linear_format == LinearFormat::Bf16
+            && spec.gdn.is_none()
+            && spec.vision.is_none(),
+        "unsupported Flint engine geometry: {spec:?}"
+    );
+    ensure!(spec.layers.len() == 49, "unsupported Flint layer count");
+    ensure!(
+        spec.layers.iter().enumerate().all(|(i, layer)| {
+            layer.mixer == Mixer::FullAttention
+                && layer.state_index as usize == i
+                && (layer.rope || layer.sliding_window.is_none())
+        }),
+        "unsupported Flint layer plan"
+    );
+    ensure!(
+        spec.layers
+            .iter()
+            .filter(|layer| layer.ffn == FfnKind::Dense)
+            .count()
+            == 2
+            && spec
+                .layers
+                .iter()
+                .filter(|layer| layer.ffn == FfnKind::Moe)
+                .count()
+                == 47,
+        "unsupported Flint FFN layer plan"
+    );
+    let moe = spec.moe.context("Flint MoE geometry missing")?;
+    ensure!(
+        moe.experts == 256
+            && moe.experts_per_tok == 6
+            && moe.expert_intermediate == 512
+            && moe.shared_intermediate == 1024
+            && moe.score == crate::model_spec::RouterScore::Sigmoid
+            && !moe.shared_gate,
+        "unsupported Flint MoE geometry: {moe:?}"
+    );
+    Ok(())
+}
+
 pub(super) struct Runtime {
-    attention: FullAttentionSpec,
-    gdn: GdnSpec,
+    attention: Option<FullAttentionSpec>,
+    gdn: Option<GdnSpec>,
     checkpoint_dir: PathBuf,
     vision: Option<super::vision_runtime::VisionRuntime>,
     vision_bytes: usize,
@@ -167,6 +368,13 @@ enum BoundMixer {
         verify: Vec<GdnPlan>,
         replay: Vec<GdnPlan>,
         decode: Box<GdnPlan>,
+    },
+    Flint {
+        q_norm: Tensor<bf16, 1>,
+        k_norm: Tensor<bf16, 1>,
+        sinks: CudaSlice<bf16>,
+        rope: CudaFunction,
+        nope: CudaFunction,
     },
 }
 
@@ -334,6 +542,13 @@ impl Runtime {
         capacity
             .checked_mul(3 * size_of::<i32>())
             .and_then(|n| n.checked_add(spec.vocab as usize * 2 + 12 + 64 * size_of::<u64>()))
+            .and_then(|n| {
+                if spec.architecture == crate::model_spec::Architecture::Flint {
+                    n.checked_add(spec.vocab as usize * 4)
+                } else {
+                    Some(n)
+                }
+            })
             .context("Q38 fixed workspace overflow")
     }
     pub(super) fn workspace(
@@ -343,6 +558,32 @@ impl Runtime {
         policy: GdnPolicy,
         verify_rows: usize,
     ) -> Result<usize> {
+        if model.architecture == crate::model_spec::Architecture::Flint {
+            let moe = model.moe.context("Flint MoE geometry missing")?;
+            let (hidden, intermediate, experts, top_k) = (
+                model.hidden as usize,
+                moe.expert_intermediate as usize,
+                moe.experts as usize,
+                moe.experts_per_tok as usize,
+            );
+            let decode = crate::backend::cuda::moe::decode::decode_scratch_bytes_mixed(
+                rows,
+                top_k,
+                intermediate,
+                moe.shared_intermediate as usize,
+            );
+            let prefill =
+                crate::backend::cuda::moe::prefill::prefill_scratch_bytes_mixed_with_boundary(
+                    rows,
+                    rows,
+                    top_k,
+                    experts,
+                    hidden,
+                    (intermediate, moe.shared_intermediate as usize),
+                    (None, model.routed_weight_boundary()),
+                )?;
+            return Ok(usize::try_from(decode.max(prefill).div_ceil(256) * 256)?);
+        }
         let attention = FullAttentionSpec::from_model(model)?;
         let gdn = GdnSpec::from_model(model)?;
         let attention_prefill =
@@ -385,12 +626,28 @@ impl Runtime {
     ) -> Result<Self> {
         let s = &engine.device.stream;
         let rows = engine.workspace_rows;
-        let attention = FullAttentionSpec::from_model(&engine.model_spec)?;
-        let gdn = GdnSpec::from_model(&engine.model_spec)?;
+        let flint = engine.model_spec.architecture == crate::model_spec::Architecture::Flint;
+        let attention = if flint {
+            None
+        } else {
+            Some(FullAttentionSpec::from_model(&engine.model_spec)?)
+        };
+        let gdn = if flint {
+            None
+        } else {
+            Some(GdnSpec::from_model(&engine.model_spec)?)
+        };
         let q_width = engine.model_spec.q_width;
-        let kv_width = attention.hkv * attention.d;
-        let gdn_policy = GdnPolicy::for_device(&engine.device.info);
-        let common = CommonOpsRef::new(&engine.device.ctx)?;
+        let kv_width = engine.model_spec.kv_heads * engine.model_spec.head_dim;
+        let gdn_policy = if flint {
+            GdnPolicy::P2
+        } else {
+            GdnPolicy::for_device(&engine.device.info)
+        };
+        let common = CommonOpsRef::new_with_swiglu_rounding(
+            &engine.device.ctx,
+            engine.model_spec.swiglu_rounding(),
+        )?;
         let positions = s.clone_htod(
             &crate::vision_input::PositionPlan::text(1, engine.capacity)?.packed_axes()?,
         )?;
@@ -409,8 +666,17 @@ impl Runtime {
         let mut layers = Vec::new();
         let w = &engine.work;
         let mw = w.mixer.as_ref().context("Q38 mixer work missing")?;
+        let rope_module = if flint {
+            Some(cubin::module(&engine.device.ctx, "rope")?)
+        } else {
+            None
+        };
         for (i, layout) in engine.model_spec.layers.iter().enumerate() {
-            let prefix = format!("model.language_model.layers.{i}.");
+            let prefix = if flint {
+                format!("model.layers.{i}.")
+            } else {
+                format!("model.language_model.layers.{i}.")
+            };
             let weight = |name: &str| vector(catalog.bf16(&format!("{prefix}{name}"))?, s);
             let plan = LayerDequantPlan::from_manifest(
                 &catalog.manifest,
@@ -422,157 +688,180 @@ impl Runtime {
             let ffn = BoundFfn::bind(&engine.model_spec, &mut linear)?;
             let mixer = match layout.mixer {
                 Mixer::FullAttention => {
-                    let kv = &engine.state.kv[layout.state_index as usize];
-                    ensure!(
-                        kv.compact.is_some() == kv_scratch.is_some(),
-                        "KV format/prefill scratch mismatch at setup"
-                    );
-                    let bind = |active_rows, positions, compact: bool| {
-                        let (k, v, cap) = if compact {
-                            (
-                                &kv.k,
-                                &kv.v,
-                                kv.compact
-                                    .as_ref()
-                                    .context("compact cache missing")?
-                                    .layout
-                                    .ring,
-                            )
-                        } else if let Some((k, v)) = &kv_scratch {
-                            (k, v, engine.capacity)
-                        } else {
-                            (&kv.k, &kv.v, engine.capacity)
-                        };
-                        FullAttentionOps::prepare(
-                            &engine.device.ctx,
-                            &attention,
-                            limits(active_rows, engine.capacity)?,
-                            AttentionBindings {
-                                compact: if compact {
-                                    kv.compact.as_ref().map(|c| c.view(&kv.k, &kv.v, s))
-                                } else {
-                                    None
-                                },
-                                q_gate: heads(&w.qkv, s, 0, active_rows, attention.hq, 512)?,
-                                k: heads(
-                                    &w.qkv,
-                                    s,
-                                    rows * (2 * q_width as usize),
-                                    active_rows,
-                                    attention.hkv,
-                                    256,
-                                )?,
-                                v: heads(
-                                    &w.qkv,
-                                    s,
-                                    rows * (2 * q_width as usize + kv_width as usize),
-                                    active_rows,
-                                    attention.hkv,
-                                    256,
-                                )?,
-                                q: TensorMut(heads(&mw.q, s, 0, active_rows, attention.hq, 256)?),
-                                gate: Some(TensorMut(heads(
-                                    &mw.gate,
-                                    s,
-                                    0,
-                                    active_rows,
-                                    attention.hq,
-                                    256,
-                                )?)),
-                                norm_mode: crate::backend::cuda::ops::RmsMode::ZeroCentered,
-                                k_cache: TensorMut(view(
-                                    k,
-                                    s,
-                                    0,
-                                    [attention.hkv, cap as u32, 256],
-                                    [(cap * 256) as u64, 256, 1],
-                                )?),
-                                v_cache: TensorMut(view(
-                                    v,
-                                    s,
-                                    0,
-                                    [attention.hkv, cap as u32, 256],
-                                    [(cap * 256) as u64, 256, 1],
-                                )?),
-                                core_out: TensorMut(heads(
-                                    &w.attn,
-                                    s,
-                                    0,
-                                    active_rows,
-                                    attention.hq,
-                                    256,
-                                )?),
-                                q_norm: weight("self_attn.q_norm.weight")?,
-                                k_norm: weight("self_attn.k_norm.weight")?,
-                                causal_mask: view(&mask, s, 0, [64], [1])?,
-                                positions,
-                            },
-                            common.clone(),
-                        )
-                    };
-                    let decode = bind(
-                        1,
-                        PositionBindings::Axes(view(&active_positions, s, 0, [1, 3], [3, 1])?),
-                        kv.compact.is_some(),
-                    )?;
-                    ensure!(
-                        decode.workspace().bytes <= scratch_buffer.len() as u64,
-                        "bound decode attention exceeds Engine scratch budget"
-                    );
-                    if layout.state_index == 0 {
-                        eprintln!(
-                            "{}",
-                            serde_json::json!({"q38_decode_attention_plan": {
-                                "segment_rows":decode.segment_rows(), "segments":decode.segments(),
-                                "max_parts":decode.max_parts(), "phase1_smem_bytes":decode.phase1_smem_bytes(),
-                                "phase2_smem_bytes":decode.phase2_smem_bytes(), "workspace_bytes":decode.workspace().bytes,
-                                "positions":"Axes"
-                            }})
+                    if flint {
+                        let module = rope_module.as_ref().context("Flint rope module missing")?;
+                        BoundMixer::Flint {
+                            q_norm: weight("self_attn.q_norm.weight")?,
+                            k_norm: weight("self_attn.k_norm.weight")?,
+                            sinks: catalog
+                                .bf16(&format!("{prefix}self_attn.softmax_offset"))?
+                                .clone(),
+                            rope: module.load_function("flint_qknorm_rope_kv")?,
+                            nope: module.load_function("flint_qknorm_kv_nope")?,
+                        }
+                    } else {
+                        let attention = *attention
+                            .as_ref()
+                            .context("full-attention layer has no specification")?;
+                        let kv = &engine.state.kv[layout.state_index as usize];
+                        ensure!(
+                            kv.compact.is_some() == kv_scratch.is_some(),
+                            "KV format/prefill scratch mismatch at setup"
                         );
-                    }
-                    let text_prefill = PrefillPlans::bind(
-                        bind(rows, PositionBindings::Linear, false)?,
-                        (rows, verify_rows),
-                        FullAttentionPlan::for_rows,
-                    )?;
-                    ensure!(
-                        text_prefill
-                            .small
-                            .iter()
-                            .all(|plan| plan.workspace().bytes <= scratch_buffer.len() as u64),
-                        "nested verify attention exceeds Engine scratch budget"
-                    );
-                    BoundMixer::Attention {
-                        image_prefill: PrefillPlans::bind(
-                            bind(
-                                rows,
-                                PositionBindings::Axes(view(
-                                    &active_positions,
-                                    s,
-                                    0,
-                                    [rows as u32, 3],
-                                    [3, 1],
-                                )?),
-                                false,
-                            )?,
+                        let bind = |active_rows, positions, compact: bool| {
+                            let (k, v, cap) = if compact {
+                                (
+                                    &kv.k,
+                                    &kv.v,
+                                    kv.compact
+                                        .as_ref()
+                                        .context("compact cache missing")?
+                                        .layout
+                                        .ring,
+                                )
+                            } else if let Some((k, v)) = &kv_scratch {
+                                (k, v, engine.capacity)
+                            } else {
+                                (&kv.k, &kv.v, engine.capacity)
+                            };
+                            FullAttentionOps::prepare(
+                                &engine.device.ctx,
+                                &attention,
+                                limits(active_rows, engine.capacity)?,
+                                AttentionBindings {
+                                    compact: if compact {
+                                        kv.compact.as_ref().map(|c| c.view(&kv.k, &kv.v, s))
+                                    } else {
+                                        None
+                                    },
+                                    q_gate: heads(&w.qkv, s, 0, active_rows, attention.hq, 512)?,
+                                    k: heads(
+                                        &w.qkv,
+                                        s,
+                                        rows * (2 * q_width as usize),
+                                        active_rows,
+                                        attention.hkv,
+                                        256,
+                                    )?,
+                                    v: heads(
+                                        &w.qkv,
+                                        s,
+                                        rows * (2 * q_width as usize + kv_width as usize),
+                                        active_rows,
+                                        attention.hkv,
+                                        256,
+                                    )?,
+                                    q: TensorMut(heads(
+                                        &mw.q,
+                                        s,
+                                        0,
+                                        active_rows,
+                                        attention.hq,
+                                        256,
+                                    )?),
+                                    gate: Some(TensorMut(heads(
+                                        &mw.gate,
+                                        s,
+                                        0,
+                                        active_rows,
+                                        attention.hq,
+                                        256,
+                                    )?)),
+                                    norm_mode: crate::backend::cuda::ops::RmsMode::ZeroCentered,
+                                    k_cache: TensorMut(view(
+                                        k,
+                                        s,
+                                        0,
+                                        [attention.hkv, cap as u32, 256],
+                                        [(cap * 256) as u64, 256, 1],
+                                    )?),
+                                    v_cache: TensorMut(view(
+                                        v,
+                                        s,
+                                        0,
+                                        [attention.hkv, cap as u32, 256],
+                                        [(cap * 256) as u64, 256, 1],
+                                    )?),
+                                    core_out: TensorMut(heads(
+                                        &w.attn,
+                                        s,
+                                        0,
+                                        active_rows,
+                                        attention.hq,
+                                        256,
+                                    )?),
+                                    q_norm: weight("self_attn.q_norm.weight")?,
+                                    k_norm: weight("self_attn.k_norm.weight")?,
+                                    causal_mask: view(&mask, s, 0, [64], [1])?,
+                                    positions,
+                                },
+                                common.clone(),
+                            )
+                        };
+                        let decode = bind(
+                            1,
+                            PositionBindings::Axes(view(&active_positions, s, 0, [1, 3], [3, 1])?),
+                            kv.compact.is_some(),
+                        )?;
+                        ensure!(
+                            decode.workspace().bytes <= scratch_buffer.len() as u64,
+                            "bound decode attention exceeds Engine scratch budget"
+                        );
+                        if layout.state_index == 0 {
+                            eprintln!(
+                                "{}",
+                                serde_json::json!({"q38_decode_attention_plan": {
+                                    "segment_rows":decode.segment_rows(), "segments":decode.segments(),
+                                    "max_parts":decode.max_parts(), "phase1_smem_bytes":decode.phase1_smem_bytes(),
+                                    "phase2_smem_bytes":decode.phase2_smem_bytes(), "workspace_bytes":decode.workspace().bytes,
+                                    "positions":"Axes"
+                                }})
+                            );
+                        }
+                        let text_prefill = PrefillPlans::bind(
+                            bind(rows, PositionBindings::Linear, false)?,
                             (rows, verify_rows),
                             FullAttentionPlan::for_rows,
-                        )?,
-                        text_prefill,
-                        compact_small: if kv.compact.is_some() {
-                            Some(PrefillPlans::bind(
-                                bind(verify_rows.min(rows), PositionBindings::Linear, true)?,
-                                (verify_rows.min(rows), verify_rows),
+                        )?;
+                        ensure!(
+                            text_prefill
+                                .small
+                                .iter()
+                                .all(|plan| plan.workspace().bytes <= scratch_buffer.len() as u64),
+                            "nested verify attention exceeds Engine scratch budget"
+                        );
+                        BoundMixer::Attention {
+                            image_prefill: PrefillPlans::bind(
+                                bind(
+                                    rows,
+                                    PositionBindings::Axes(view(
+                                        &active_positions,
+                                        s,
+                                        0,
+                                        [rows as u32, 3],
+                                        [3, 1],
+                                    )?),
+                                    false,
+                                )?,
+                                (rows, verify_rows),
                                 FullAttentionPlan::for_rows,
-                            )?)
-                        } else {
-                            None
-                        },
-                        decode: Box::new(decode),
+                            )?,
+                            text_prefill,
+                            compact_small: if kv.compact.is_some() {
+                                Some(PrefillPlans::bind(
+                                    bind(verify_rows.min(rows), PositionBindings::Linear, true)?,
+                                    (verify_rows.min(rows), verify_rows),
+                                    FullAttentionPlan::for_rows,
+                                )?)
+                            } else {
+                                None
+                            },
+                            decode: Box::new(decode),
+                        }
                     }
                 }
                 Mixer::Gdn => {
-                    let spec = gdn;
+                    let spec = gdn.context("GDN layer has no GDN specification")?;
                     let cd = spec.conv_dim()?;
                     let state = &engine.state.gdn[layout.state_index as usize];
                     let conv = catalog.bf16(&format!("{prefix}linear_attn.conv1d.weight"))?;
@@ -791,7 +1080,10 @@ impl Engine {
     ) -> Result<()> {
         let q = self.qwen.as_mut().context("Q38 runtime missing")?;
         let stream = &self.device.stream;
-        let g = q.gdn;
+        let g = *q
+            .gdn
+            .as_ref()
+            .context("GDN snapshots have no GDN specification")?;
         let cd = g.conv_dim()?;
         ensure!(
             (1..=g.snapshot_limit()? as usize).contains(&verify_rows),
@@ -856,7 +1148,7 @@ impl Engine {
         let q = self.qwen.as_mut().context("Q38 runtime missing")?;
         let inputs = &self.spec.as_ref().context("MoE chain missing")?.gdn_inputs;
         let stream = &self.device.stream;
-        let g = q.gdn;
+        let g = q.gdn.as_ref().context("GDN verify runtime missing")?;
         let cd = g.conv_dim()? as usize;
         let hv = g.hv as usize;
         ensure!(
@@ -1116,7 +1408,10 @@ impl Engine {
         mode: super::SetupMode,
         model_spec: crate::model_spec::ModelSpec,
     ) -> Result<Self> {
-        require_qwen35_geometry(&model_spec)?;
+        match model_spec.architecture {
+            crate::model_spec::Architecture::Flint => require_flint_geometry(&model_spec)?,
+            _ => require_qwen35_geometry(&model_spec)?,
+        }
         let write = mode.writes();
         let reserve_mtp = matches!(mode, super::SetupMode::Mtp { .. });
         ensure!(
@@ -1129,9 +1424,23 @@ impl Engine {
             "MoE prefix_cache=true has no delegated-expert content identity"
         );
         let started = Instant::now();
-        let attention = FullAttentionSpec::from_model(&model_spec)?;
-        let gdn = GdnSpec::from_model(&model_spec)?;
-        let kv_width = attention.hkv * attention.d;
+        let flint = model_spec.architecture == crate::model_spec::Architecture::Flint;
+        let attention = if flint {
+            None
+        } else {
+            Some(FullAttentionSpec::from_model(&model_spec)?)
+        };
+        let gdn = if flint {
+            None
+        } else {
+            Some(GdnSpec::from_model(&model_spec)?)
+        };
+        let kv_width = model_spec.kv_heads * model_spec.head_dim;
+        ensure!(
+            !flint || settings.kv_format == crate::kv::KvFormat::Bf16,
+            "Flint requires BF16 KV, received {:?}",
+            settings.kv_format
+        );
         let config = model_spec.config();
         let draft_config = settings
             .draft_model
@@ -1361,10 +1670,12 @@ impl Engine {
             let workspace = |rows| {
                 let mut target =
                     Runtime::workspace(&model_spec, rows, capacity, gdn_policy, verify_rows)?;
-                if settings.kv_format != crate::kv::KvFormat::Bf16 {
+                if !flint && settings.kv_format != crate::kv::KvFormat::Bf16 {
                     target = target.max(
                         crate::op_contract::AttentionWorkspace::new(
-                            &attention,
+                            attention
+                                .as_ref()
+                                .context("Q38 attention specification missing")?,
                             verify_rows as u32,
                             capacity as u32,
                             limits(verify_rows, capacity)?.key_chunk,
@@ -1435,11 +1746,13 @@ impl Engine {
         }
         let target_workspace =
             Runtime::workspace(&model_spec, rows, capacity, gdn_policy, verify_rows)?.max(
-                if settings.kv_format == crate::kv::KvFormat::Bf16 {
+                if flint || settings.kv_format == crate::kv::KvFormat::Bf16 {
                     0
                 } else {
                     crate::op_contract::AttentionWorkspace::new(
-                        &attention,
+                        attention
+                            .as_ref()
+                            .context("Q38 attention specification missing")?,
                         verify_rows as u32,
                         capacity as u32,
                         limits(verify_rows, capacity)?.key_chunk,
@@ -1447,6 +1760,33 @@ impl Engine {
                     .bytes as usize
                 },
             );
+        let (attention_prefill_bytes, attention_decode_bytes, attention_verify_bytes) = if flint {
+            (0, 0, 0)
+        } else {
+            let attention = attention
+                .as_ref()
+                .context("Q38 attention specification missing")?;
+            (
+                FullAttentionOps::preprocess_workspace(attention, limits(rows, capacity)?)?.bytes,
+                FullAttentionOps::workspace(attention, limits(1, capacity)?)?.bytes,
+                FullAttentionOps::workspace(attention, limits(rows.min(verify_rows), capacity)?)?
+                    .bytes,
+            )
+        };
+        let (gdn_prefill_bytes, gdn_decode_bytes) = if flint {
+            (0, 0)
+        } else {
+            let gdn = gdn.as_ref().context("Q38 GDN specification missing")?;
+            (
+                GdnOps::workspace(gdn, u32::try_from(rows)?, gdn_policy)?.bytes,
+                GdnOps::workspace(gdn, 1, GdnPolicy::P2)?.bytes,
+            )
+        };
+        let (prefill_backend, decode_backend) = if flint {
+            ("FA2 d128 sliding/full", "flash decode d128")
+        } else {
+            ("FA2 d256", "TCMQA d256")
+        };
         eprintln!(
             "{}",
             serde_json::json!({
@@ -1461,7 +1801,7 @@ impl Engine {
                 "persistent_state_bytes": state.bytes(),
                 "kv_format": settings.kv_format.tag(),
                 "kv_prefill_scratch_bytes": kv_scratch.as_ref().map_or(0,|(k,v)|(k.len()+v.len())*size_of::<bf16>()),
-                "capture_checkpoint_bytes": capture_checkpoint.as_ref().context("capture checkpoint missing")?.bytes(),
+                "capture_checkpoint_bytes": capture_checkpoint.as_ref().map_or(0, super::super::state::StateCheckpoint::bytes),
                 "target_hidden_capture_bytes": context_rows.checked_mul(capture_row_bytes).context("capture byte count overflow")?,
                 "draft_context_span_rows": context_rows,
                 "draft_workspace_row_bytes": draft_row_bytes,
@@ -1469,14 +1809,14 @@ impl Engine {
                 "target_all_row_head_bytes": target_head_bytes,
                 "layer_arena_bytes": arena_bytes,
                 "dense_prefill_prompt_bytes": dense_prompt_bytes,
-                "attention_prefill_preprocess_bytes": FullAttentionOps::preprocess_workspace(&attention, limits(rows, capacity)?)?.bytes,
+                "attention_prefill_preprocess_bytes": attention_prefill_bytes,
                 "attention_prefill_lse_bytes": rows * model_spec.q_heads as usize * size_of::<f32>(),
-                "attention_decode_workspace_bytes": FullAttentionOps::workspace(&attention, limits(1, capacity)?)?.bytes,
-                "attention_nested_verify_workspace_bytes": FullAttentionOps::workspace(&attention, limits(rows.min(verify_rows), capacity)?)?.bytes,
-                "attention_prefill_backend": "FA2 d256",
-                "attention_decode_backend": "TCMQA d256",
-                "gdn_prefill_workspace_bytes": GdnOps::workspace(&gdn, u32::try_from(rows)?, gdn_policy)?.bytes,
-                "gdn_decode_workspace_bytes": GdnOps::workspace(&gdn, 1, GdnPolicy::P2)?.bytes,
+                "attention_decode_workspace_bytes": attention_decode_bytes,
+                "attention_nested_verify_workspace_bytes": attention_verify_bytes,
+                "attention_prefill_backend": prefill_backend,
+                "attention_decode_backend": decode_backend,
+                "gdn_prefill_workspace_bytes": gdn_prefill_bytes,
+                "gdn_decode_workspace_bytes": gdn_decode_bytes,
                 "bound_prefill_max_rows": rows,
                 "bound_decode_max_rows": 1,
                 "gdn_plan": gdn_policy.identity(),
@@ -1487,6 +1827,11 @@ impl Engine {
         let scratch_buffer = s.alloc_zeros::<u8>(target_workspace)?;
         let work = Work::new(s, &model_spec, rows)?;
         let flash = Flash::new(s.clone(), rows, model_spec.q_heads as usize)?;
+        let flint_logits = if flint {
+            Some(s.alloc_zeros(model_spec.vocab as usize)?)
+        } else {
+            None
+        };
         let hidden_capture = capture_layers
             .as_ref()
             .map(|ids| HiddenCapture::new(ids, &config, context_rows, s))
@@ -1496,6 +1841,8 @@ impl Engine {
             capture_fail_after_layer: None,
             #[cfg(test)]
             capture_fail_stage: None,
+            #[cfg(test)]
+            flint_window_capture: None,
             qwen_device_prefix: false,
             forward_rows: (1..=rows.min(16)).collect(),
             graphs: if expert_setup.is_some() {
@@ -1522,6 +1869,7 @@ impl Engine {
             blas,
             flash: Some(flash),
             decode: None,
+            flint_logits,
             device,
             config,
             model_spec,
@@ -1543,6 +1891,8 @@ impl Engine {
             moe_prefill: None,
             #[cfg(test)]
             moe_test_ffn: None,
+            flint_legacy_overflow_prefill: false,
+            flint_frozen_decode_length: false,
             mtp: None,
             mtp_state: None,
             mtp_epoch: 0,
@@ -1557,6 +1907,13 @@ impl Engine {
             kv_scratch,
             verify_rows,
         )?);
+        if flint {
+            if write {
+                engine.ensure_decode()?;
+            } else {
+                engine.bind_recorded_decode()?;
+            }
+        }
         if dense_prompt_bytes > 0 {
             engine.qwen.as_mut().context("Qwen runtime missing")?.prompt = Some(
                 engine
@@ -1608,7 +1965,9 @@ impl Engine {
                 .prepare_linears(&engine.weights.head, &mut engine.blas, &profile, write)?;
             engine.closure.finish(profile, &engine.runtime, key)?;
         } else {
-            engine.closure.freeze_fixed()?;
+            if !(flint && write) {
+                engine.closure.freeze_fixed()?;
+            }
         }
         if !write {
             engine.reset()?;
@@ -1649,6 +2008,7 @@ impl Engine {
         self.work.advance(&self.ops, &self.device.stream)?;
         self.state.compact_commit(&self.device.stream, false)
     }
+
     pub(super) fn prefill_dense_layers(
         &mut self,
         ids: &[u32],
@@ -1964,12 +2324,21 @@ impl Engine {
     ) -> Result<()> {
         let q = self.qwen.as_ref().context("Q38 runtime missing")?;
         let layer = &q.layers[i];
-        let attention = q.attention;
-        let gdn = q.gdn;
+        let flint_layer = matches!(layer.mixer, BoundMixer::Flint { .. });
+        let attention = if flint_layer {
+            None
+        } else {
+            Some(q.attention.context("Q38 attention specification missing")?)
+        };
+        let gdn = if flint_layer {
+            None
+        } else {
+            Some(q.gdn.context("Q38 GDN specification missing")?)
+        };
         let q_width = self.model_spec.q_width;
-        let kv_width = attention.hkv * attention.d;
-        let conv_width = 2 * gdn.hk * gdn.dk + gdn.hv * gdn.dv;
-        let value_width = gdn.hv * gdn.dv;
+        let kv_width = self.model_spec.kv_heads * self.model_spec.head_dim;
+        let conv_width = gdn.map_or(0, |g| 2 * g.hk * g.dk + g.hv * g.dv);
+        let value_width = gdn.map_or(0, |g| g.hv * g.dv);
         let hidden = self.model_spec.hidden as usize;
         let s = &self.device.stream;
         let rows = step.rows;
@@ -1988,12 +2357,265 @@ impl Engine {
             row_capacity: rows as u32,
         };
         match &layer.mixer {
+            BoundMixer::Flint {
+                q_norm,
+                k_norm,
+                sinks,
+                rope,
+                nope,
+            } => {
+                for (role, width, offset) in [
+                    ("self_attn.q_proj.weight", q_width as usize, 0),
+                    (
+                        "self_attn.k_proj.weight",
+                        kv_width as usize,
+                        linear_rows * q_width as usize,
+                    ),
+                    (
+                        "self_attn.v_proj.weight",
+                        kv_width as usize,
+                        linear_rows * (q_width as usize + kv_width as usize),
+                    ),
+                ] {
+                    layer.linear.run(
+                        &self.blas,
+                        role,
+                        phase,
+                        matrix(&w.n, s, 0, linear_rows, hidden)?,
+                        &mut TensorMut(matrix(&w.qkv, s, offset, linear_rows, width)?),
+                    )?;
+                }
+                let state_index = self.model_spec.layers[i].state_index as usize;
+                let kv = &self.state.kv[state_index];
+                let ring = self.state.kv_ring(state_index)?;
+                let sliding = self.model_spec.layers[i].sliding_window.is_some();
+                let (function, use_rope) = if self.model_spec.layers[i].rope {
+                    (rope, true)
+                } else {
+                    (nope, false)
+                };
+                let q_source_stride = u64::from(q_width);
+                let kv_source_stride = u64::from(kv_width);
+                let k_source_offset = u64::from(linear_rows as u32) * u64::from(q_width);
+                let v_source_offset = u64::from(linear_rows as u32) * u64::from(q_width + kv_width);
+                ensure!(
+                    !use_rope || self.model_spec.layers[i].rope,
+                    "Flint RoPE function selected for NoPE layer {i}"
+                );
+                let overflow_sliding =
+                    sliding && phase == ExecutionPhase::Prefill && self.position + rows > ring;
+                if !overflow_sliding || self.flint_legacy_overflow_prefill {
+                    unsafe {
+                        s.launch_builder(function)
+                            .arg(&mut w.qkv)
+                            .arg(&kv.k)
+                            .arg(&kv.v)
+                            .arg(&q_norm.ptr)
+                            .arg(&k_norm.ptr)
+                            .arg(&w.position)
+                            .arg(&(rows as i32))
+                            .arg(&(self.model_spec.q_heads as i32))
+                            .arg(&(self.model_spec.kv_heads as i32))
+                            .arg(&(self.model_spec.head_dim as i32))
+                            .arg(&(ring as i32))
+                            .arg(&(if sliding { ring as i32 } else { 0 }))
+                            .arg(&(self.model_spec.rope_theta))
+                            .arg(&(self.model_spec.rms_eps))
+                            .arg(&q_source_stride)
+                            .arg(&k_source_offset)
+                            .arg(&kv_source_stride)
+                            .arg(&v_source_offset)
+                            .arg(&kv_source_stride)
+                            .launch(LaunchConfig {
+                                grid_dim: (
+                                    (rows
+                                        * (self.model_spec.q_heads + 2 * self.model_spec.kv_heads)
+                                            as usize) as u32,
+                                    1,
+                                    1,
+                                ),
+                                block_dim: (128, 1, 1),
+                                shared_mem_bytes: 0,
+                            })?;
+                    }
+                }
+                match phase {
+                    ExecutionPhase::Prefill => {
+                        let shape = Shape {
+                            rows,
+                            start: self.position,
+                            q_heads: self.model_spec.q_heads as usize,
+                            kv_heads: self.model_spec.kv_heads as usize,
+                            capacity: ring,
+                            head_dim: self.model_spec.head_dim as usize,
+                            causal: true,
+                            window_left: sliding.then_some(
+                                self.model_spec.layers[i].sliding_window.unwrap_or(513) as usize
+                                    - 1,
+                            ),
+                        };
+                        if overflow_sliding {
+                            // Each row is written and consumed before a later row reuses its slot.
+                            for row in 0..rows {
+                                let position = self.position + row;
+                                s.memcpy_htod(&[position as i32], &mut w.position)?;
+                                self.ops.flint_decode_length(
+                                    s,
+                                    &w.position,
+                                    &mut w.length,
+                                    ring,
+                                )?;
+                                let q_base = row * q_width as usize;
+                                let k_base =
+                                    linear_rows * q_width as usize + row * kv_width as usize;
+                                let v_base = linear_rows * (q_width as usize + kv_width as usize)
+                                    + row * kv_width as usize;
+                                if !self.flint_legacy_overflow_prefill {
+                                    unsafe {
+                                        s.launch_builder(function)
+                                            .arg(&mut w.qkv.slice_mut(q_base..w.qkv.len()))
+                                            .arg(&kv.k)
+                                            .arg(&kv.v)
+                                            .arg(&q_norm.ptr)
+                                            .arg(&k_norm.ptr)
+                                            .arg(&w.position)
+                                            .arg(&1i32)
+                                            .arg(&(self.model_spec.q_heads as i32))
+                                            .arg(&(self.model_spec.kv_heads as i32))
+                                            .arg(&(self.model_spec.head_dim as i32))
+                                            .arg(&(ring as i32))
+                                            .arg(&(ring as i32))
+                                            .arg(&(self.model_spec.rope_theta))
+                                            .arg(&(self.model_spec.rms_eps))
+                                            .arg(&q_source_stride)
+                                            .arg(&((k_base - q_base) as u64))
+                                            .arg(&kv_source_stride)
+                                            .arg(&((v_base - q_base) as u64))
+                                            .arg(&kv_source_stride)
+                                            .launch(LaunchConfig {
+                                                grid_dim: (
+                                                    self.model_spec.q_heads
+                                                        + 2 * self.model_spec.kv_heads,
+                                                    1,
+                                                    1,
+                                                ),
+                                                block_dim: (128, 1, 1),
+                                                shared_mem_bytes: 0,
+                                            })?;
+                                    }
+                                }
+                                self.ops.flint_decode_length(
+                                    s,
+                                    &w.position,
+                                    &mut w.length,
+                                    ring,
+                                )?;
+                                let decode = self
+                                    .decode
+                                    .as_mut()
+                                    .context("Flint sliding prefill decode is not bound")?;
+                                decode.run_with(
+                                    s,
+                                    GqaDecodeInput {
+                                        q: &w.qkv,
+                                        q_offset: row * q_width as usize,
+                                        k: &kv.k,
+                                        v: &kv.v,
+                                        output: &mut w.attn,
+                                        output_offset: row * q_width as usize,
+                                        length: &w.length,
+                                        sinks: Some(sinks),
+                                        window: Some(SlidingWindow {
+                                            position: &w.position,
+                                            head_stride: (ring * self.model_spec.head_dim as usize)
+                                                as i32,
+                                        }),
+                                    },
+                                )?;
+                            }
+                            s.memcpy_htod(&[self.position as i32], &mut w.position)?;
+                        } else {
+                            self.flash
+                                .as_mut()
+                                .context("Flint prefill attention is not bound")?
+                                .run(&w.qkv, q_width as usize, &kv.k, &kv.v, &mut w.attn, shape)?;
+                            self.flash
+                                .as_mut()
+                                .context("Flint prefill attention is not bound")?
+                                .apply_sinks(
+                                    sinks,
+                                    &mut w.attn,
+                                    rows,
+                                    self.model_spec.q_heads as usize,
+                                )?;
+                        }
+                    }
+                    ExecutionPhase::Decode => {
+                        if !self.flint_frozen_decode_length {
+                            self.ops
+                                .flint_decode_length(s, &w.position, &mut w.length, ring)?;
+                        }
+                        let decode = self
+                            .decode
+                            .as_mut()
+                            .context("Flint decode attention is not bound")?;
+                        if self.flint_frozen_decode_length {
+                            let tokens = (self.position + 1).min(ring);
+                            decode.set_length(s, tokens as i32, &mut w.length)?;
+                        }
+                        decode.run_with(
+                            s,
+                            GqaDecodeInput {
+                                q: &w.qkv,
+                                q_offset: 0,
+                                k: &kv.k,
+                                v: &kv.v,
+                                output: &mut w.attn,
+                                output_offset: 0,
+                                length: &w.length,
+                                sinks: Some(sinks),
+                                window: sliding.then_some(SlidingWindow {
+                                    position: &w.position,
+                                    head_stride: (ring * self.model_spec.head_dim as usize) as i32,
+                                }),
+                            },
+                        )?;
+                        #[cfg(test)]
+                        capture_flint_window(
+                            s,
+                            &self.device.info.name,
+                            FlintWindowInputs {
+                                spec: &self.model_spec,
+                                layer: i,
+                                sliding,
+                                ring,
+                                position: &w.position,
+                                qkv: &w.qkv,
+                                attention: &w.attn,
+                                kv,
+                                sinks,
+                            },
+                            &self.flint_window_capture,
+                        )?;
+                    }
+                }
+                layer.linear.run(
+                    &self.blas,
+                    "self_attn.o_proj.weight",
+                    phase,
+                    matrix(&w.attn, s, 0, linear_rows, q_width as usize)?,
+                    &mut TensorMut(matrix(&w.out, s, 0, linear_rows, hidden)?),
+                )?;
+            }
             BoundMixer::Attention {
                 image_prefill,
                 text_prefill,
                 decode,
                 compact_small,
             } => {
+                let attention = *attention
+                    .as_ref()
+                    .context("full-attention mixer has no specification")?;
                 if self.model_spec.linear_format == crate::model_spec::LinearFormat::Fp8E4m3Channel
                 {
                     self.blas.fp8_ops()?.fake_quant(
@@ -2084,6 +2706,7 @@ impl Engine {
                                 capacity: self.capacity,
                                 head_dim: 256,
                                 causal: true,
+                                window_left: None,
                             };
                             self.flash
                                 .as_mut()
@@ -2145,7 +2768,7 @@ impl Engine {
                 decode,
                 ..
             } => {
-                let spec = gdn;
+                let spec = gdn.context("GDN mixer has no GDN specification")?;
                 let conv = conv_width as usize;
                 let value = value_width as usize;
                 let hv = spec.hv as usize;
@@ -2243,6 +2866,7 @@ impl Engine {
         if all || i == self.trace_layer {
             let name = debug_name(trace, i, "mixer_out");
             let mixer_width = match &layer.mixer {
+                BoundMixer::Flint { .. } => q_width,
                 BoundMixer::Attention { .. } => q_width,
                 BoundMixer::Gdn { .. } => value_width,
             };
@@ -2253,6 +2877,7 @@ impl Engine {
                 && (!all || i == 0)
                 && let Some(t) = trace.as_mut()
             {
+                let gdn = gdn.as_ref().context("GDN trace has no GDN specification")?;
                 let state = &self.state.gdn[self.model_spec.layers[i].state_index as usize];
                 let prefix = if all {
                     format!("{}.{i}", t.prefix)
@@ -2280,9 +2905,12 @@ impl Engine {
         step: crate::backend::Step<'_>,
         trace: &mut Option<Target<'_>>,
     ) -> Result<()> {
-        let ffn = self.qwen.as_ref().map(|runtime| runtime.layers[layer].ffn);
+        let ffn = self
+            .qwen
+            .as_ref()
+            .map(|runtime| runtime.layers[layer].ffn.clone());
         #[cfg(test)]
-        let ffn = ffn.or(self.moe_test_ffn);
+        let ffn = ffn.or_else(|| self.moe_test_ffn.clone());
         if let Some(ffn @ BoundFfn::Moe { .. }) = ffn {
             return self.run_moe_ffn(layer, step.rows, ffn, trace);
         }
@@ -2291,7 +2919,8 @@ impl Engine {
             crate::backend::Operator::Activate,
             crate::backend::Operator::Down,
         ] {
-            self.run_operator(op, layer, step, trace)?;
+            self.run_operator(op, layer, step, trace)
+                .with_context(|| format!("dense FFN operator {op:?} layer={layer}"))?;
         }
         Ok(())
     }
@@ -2304,7 +2933,8 @@ impl Engine {
             .layers
             .get(layer)
             .with_context(|| format!("MoE hybrid layer={layer} is outside runtime"))?
-            .ffn;
+            .ffn
+            .clone();
         ensure!(
             matches!(ffn, BoundFfn::Moe { .. }),
             "MoE hybrid layer={layer} has a dense FFN binding"
@@ -2330,6 +2960,7 @@ impl Engine {
     ) -> Result<()> {
         use crate::backend::Operator as O;
         let q = self.qwen.as_ref().context("Q38 runtime missing")?;
+        let flint = self.model_spec.architecture == crate::model_spec::Architecture::Flint;
         let layer = &q.layers[i];
         let s = &self.device.stream;
         let w = &mut self.work;
@@ -2377,13 +3008,14 @@ impl Engine {
             }
             O::Norm => {
                 if i == 0
-                    || (self.model_spec.moe.is_some()
-                        && !self.qwen_device_prefix
-                        && step.input == crate::backend::Input::Ids)
-                    || !self
-                        .hidden_capture
-                        .as_ref()
-                        .is_some_and(|capture| capture.layer_slots[i - 1].is_some())
+                    || (!flint
+                        && ((self.model_spec.moe.is_some()
+                            && !self.qwen_device_prefix
+                            && step.input == crate::backend::Input::Ids)
+                            || !self
+                                .hidden_capture
+                                .as_ref()
+                                .is_some_and(|capture| capture.layer_slots[i - 1].is_some())))
                 {
                     q.common.norm.rms_with(
                         s,
@@ -2392,7 +3024,7 @@ impl Engine {
                         layer.input_norm,
                         &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
                         RmsOptions {
-                            mode: RmsMode::ZeroCentered,
+                            mode: norm_mode(&self.model_spec),
                             eps: self.model_spec.rms_eps,
                         },
                     )?;
@@ -2404,20 +3036,35 @@ impl Engine {
             }
             O::PostNorm | O::NextNorm => {
                 if matches!(op, O::PostNorm) {
-                    q.common.norm.rms_add_with(
-                        s,
-                        domain,
-                        ResidualRmsInput {
-                            x: &mut TensorMut(heads(&w.x, s, 0, rows, 1, h as u32)?),
-                            residual: heads(&w.out, s, 0, rows, 1, h as u32)?,
-                            weight: layer.post_norm,
-                        },
-                        &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
-                        RmsOptions {
-                            mode: RmsMode::ZeroCentered,
-                            eps: self.model_spec.rms_eps,
-                        },
-                    )?;
+                    let mode = norm_mode(&self.model_spec);
+                    if matches!(mode, RmsMode::Standard) {
+                        self.ops.rms_add_fp32_with(
+                            s,
+                            domain,
+                            ResidualRmsInput {
+                                x: &mut TensorMut(heads(&w.x, s, 0, rows, 1, h as u32)?),
+                                residual: heads(&w.out, s, 0, rows, 1, h as u32)?,
+                                weight: layer.post_norm,
+                            },
+                            &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
+                            self.model_spec.rms_eps,
+                        )?;
+                    } else {
+                        q.common.norm.rms_add_with(
+                            s,
+                            domain,
+                            ResidualRmsInput {
+                                x: &mut TensorMut(heads(&w.x, s, 0, rows, 1, h as u32)?),
+                                residual: heads(&w.out, s, 0, rows, 1, h as u32)?,
+                                weight: layer.post_norm,
+                            },
+                            &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
+                            RmsOptions {
+                                mode,
+                                eps: self.model_spec.rms_eps,
+                            },
+                        )?;
+                    }
                     if all_layers(trace) || i == self.trace_layer {
                         let name = debug_name(trace, i, "post_attention");
                         trace_value(trace, s, &name, &w.x, rows, h)?;
@@ -2453,27 +3100,39 @@ impl Engine {
                             },
                             &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
                             RmsOptions {
-                                mode: RmsMode::ZeroCentered,
+                                mode: norm_mode(&self.model_spec),
                                 eps: self.model_spec.rms_eps,
                             },
                         )?;
                     } else {
-                        unsafe {
-                            s.launch_builder(&self.ops.residual)
-                                .arg(&mut w.x)
-                                .arg(&w.out)
-                                .arg(&((rows * h) as i32))
-                                .launch(flat(rows * h))?;
+                        if matches!(norm_mode(&self.model_spec), RmsMode::Standard) {
+                            let weight = if let Some(next) = q.layers.get(i + 1) {
+                                next.input_norm
+                            } else {
+                                vector(&self.weights.norm, s)?
+                            };
+                            self.ops.rms_add_fp32_with(
+                                s,
+                                domain,
+                                ResidualRmsInput {
+                                    x: &mut TensorMut(heads(&w.x, s, 0, rows, 1, h as u32)?),
+                                    residual: heads(&w.out, s, 0, rows, 1, h as u32)?,
+                                    weight,
+                                },
+                                &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
+                                self.model_spec.rms_eps,
+                            )?;
+                        } else {
+                            unsafe {
+                                s.launch_builder(&self.ops.residual)
+                                    .arg(&mut w.x)
+                                    .arg(&w.out)
+                                    .arg(&((rows * h) as i32))
+                                    .launch(flat(rows * h))?;
+                            }
                         }
                     }
-                    if trace.is_some()
-                        && (!all_layers(trace)
-                            || [0, 3, 7, 31, 32, 47, 63].contains(&i)
-                            || self
-                                .hidden_capture
-                                .as_ref()
-                                .is_some_and(|capture| capture.layer_slots[i].is_some()))
-                    {
+                    if trace.is_some() {
                         let name = if all_layers(trace) {
                             i.to_string()
                         } else {
@@ -2503,23 +3162,37 @@ impl Engine {
                 let mut activated = TensorMut(heads(&w.act, s, 0, rows, 1, f as u32)?);
                 q.common.gate.swiglu(s, domain, gate, up, &mut activated)?;
             }
-            O::Down => layer.linear.run(
-                &self.blas,
-                "mlp.down_proj.weight",
-                phase,
-                matrix(&w.act, s, 0, linear_rows, f)?,
-                &mut TensorMut(matrix(&w.out, s, 0, linear_rows, h)?),
-            )?,
+            O::Down => {
+                layer.linear.run(
+                    &self.blas,
+                    "mlp.down_proj.weight",
+                    phase,
+                    matrix(&w.act, s, 0, linear_rows, f)?,
+                    &mut TensorMut(matrix(&w.out, s, 0, linear_rows, h)?),
+                )?;
+                if let Some(target) = trace
+                    .as_mut()
+                    .filter(|target| target.trace.all_layers || i == self.trace_layer)
+                {
+                    let name = if target.trace.all_layers {
+                        format!("{i}.ffn")
+                    } else {
+                        "ffn".to_owned()
+                    };
+                    trace_value(trace, s, &name, &w.out, rows, h)?;
+                }
+            }
             O::Head => {
                 if step.head == Head::None {
                     return Ok(());
                 }
-                if (self.model_spec.moe.is_some()
-                    && !self.qwen_device_prefix
-                    && step.input == crate::backend::Input::Ids)
-                    || !self.hidden_capture.as_ref().is_some_and(|capture| {
-                        capture.layer_slots[self.model_spec.layers.len() - 1].is_some()
-                    })
+                if !flint
+                    && ((self.model_spec.moe.is_some()
+                        && !self.qwen_device_prefix
+                        && step.input == crate::backend::Input::Ids)
+                        || !self.hidden_capture.as_ref().is_some_and(|capture| {
+                            capture.layer_slots[self.model_spec.layers.len() - 1].is_some()
+                        }))
                 {
                     q.common.norm.rms_with(
                         s,
@@ -2528,12 +3201,11 @@ impl Engine {
                         vector(&self.weights.norm, s)?,
                         &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
                         RmsOptions {
-                            mode: RmsMode::ZeroCentered,
+                            mode: norm_mode(&self.model_spec),
                             eps: self.model_spec.rms_eps,
                         },
                     )?;
                 }
-                #[cfg(test)]
                 trace_value(trace, s, "norm", &w.n, rows, h)?;
                 if step.head == Head::All {
                     let spec = self
@@ -2572,6 +3244,25 @@ impl Engine {
                             .launch(grid(rows, 1024))?;
                     }
                     spec.active_rows = rows;
+                    return Ok(());
+                }
+                if flint {
+                    let logits = self
+                        .flint_logits
+                        .as_mut()
+                        .context("Flint FP32 logits are not bound")?;
+                    let input = &w.n.slice((rows - 1) * h..rows * h);
+                    self.ops
+                        .flint_lm_head_f32(s, input, &self.weights.head, logits)?;
+                    self.ops.argmax_f32(s, logits, &mut w.token)?;
+                    if let Some(t) = trace.as_mut() {
+                        let values = s.clone_dtoh(logits)?;
+                        t.trace.add(
+                            format!("{}.logits", t.prefix),
+                            vec![1, 1, self.model_spec.vocab as usize],
+                            values,
+                        )?;
+                    }
                     return Ok(());
                 }
                 self.blas.linear_typed(
@@ -3103,6 +3794,594 @@ mod tests {
                 .is_err()
             );
         }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn zero_flint_sinks(engine: &mut Engine) -> Result<()> {
+        let stream = engine.device.stream.clone();
+        let runtime = engine
+            .qwen
+            .as_mut()
+            .context("Flint runtime missing for sink control")?;
+        for layer in &mut runtime.layers {
+            if let BoundMixer::Flint { sinks, .. } = &mut layer.mixer {
+                let zeros = vec![bf16::ZERO; sinks.len()];
+                stream.memcpy_htod(&zeros, &mut sinks.slice_mut(..))?;
+            }
+        }
+        stream.synchronize()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[cfg(feature = "cuda")]
+    fn decode_window(
+        engine: &mut Engine,
+        prefix: &[u32],
+        targets: &[u32],
+        graph: bool,
+    ) -> Result<Vec<Vec<f32>>> {
+        engine.reset()?;
+        engine.prefill(prefix, None)?;
+        let mut rows = Vec::new();
+        for target in targets {
+            engine.set_token(*target)?;
+            engine.decode(graph, None)?;
+            rows.push(engine.decode_logits()?);
+        }
+        Ok(rows)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn graph_eager_window(
+        engine: &mut Engine,
+        prefix: &[u32],
+        targets: &[u32],
+    ) -> Result<(Vec<Vec<f32>>, u64, u32)> {
+        engine.reset()?;
+        engine.prefill(prefix, None)?;
+        let stream = engine.device.stream.clone();
+        let mut checkpoint = super::super::super::state::StateCheckpoint::new(
+            &engine.state,
+            &engine.model_spec,
+            1,
+            &stream,
+        )?;
+        let mut rows = Vec::new();
+        let mut bits = 0u64;
+        let mut differing_rows = 0u32;
+        for target in targets {
+            engine.set_token(*target)?;
+            let position = engine.position;
+            let saved_position = stream.clone_dtoh(&engine.work.position)?;
+            let saved_length = stream.clone_dtoh(&engine.work.length)?;
+            let saved_pending = engine.pending_token;
+            let saved_committed = engine.committed_prefix_ids.clone();
+            let saved_resident_len = engine.resident_ids_len;
+            let saved_input_kind = engine.last_input_kind;
+            checkpoint.save(&engine.state, &engine.work.token, position, &stream, None)?;
+            engine
+                .moe_prefill
+                .as_ref()
+                .context("Flint prefill missing for graph/eager reseed")?
+                .reseed_request(
+                    engine
+                        .moe_slots
+                        .as_mut()
+                        .context("Flint slots missing for graph/eager reseed")?,
+                )?;
+            engine
+                .moe_slots
+                .as_mut()
+                .context("Flint slots missing for graph/eager freeze")?
+                .freeze_probe_admissions()?;
+            engine.decode(true, None)?;
+            let graph = engine.decode_logits()?;
+            checkpoint.restore(&mut engine.state, &mut engine.work.token, &stream)?;
+            stream.memcpy_htod(&saved_position, &mut engine.work.position)?;
+            stream.memcpy_htod(&saved_length, &mut engine.work.length)?;
+            engine.position = position;
+            engine.pending_token = saved_pending;
+            engine.committed_prefix_ids = saved_committed;
+            engine.resident_ids_len = saved_resident_len;
+            engine.last_input_kind = saved_input_kind;
+            engine.decode(false, None)?;
+            let eager = engine.decode_logits()?;
+            let row_bits = graph
+                .iter()
+                .zip(&eager)
+                .filter(|(actual, expected)| actual.to_bits() != expected.to_bits())
+                .count() as u64;
+            bits += row_bits;
+            if graph
+                .iter()
+                .zip(&eager)
+                .any(|(actual, expected)| actual.to_bits() != expected.to_bits())
+            {
+                differing_rows += 1;
+            }
+            rows.push(eager);
+        }
+        Ok((rows, bits, differing_rows))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn graph_eager_forced_prefix(
+        engine: &mut Engine,
+        ids: &[u32],
+    ) -> Result<(f64, Vec<Vec<f32>>, u64, u32)> {
+        engine.reset()?;
+        engine.prefill(&ids[..1], None)?;
+        let stream = engine.device.stream.clone();
+        let mut checkpoint = super::super::super::state::StateCheckpoint::new(
+            &engine.state,
+            &engine.model_spec,
+            1,
+            &stream,
+        )?;
+        let mut rows = vec![engine.decode_logits()?];
+        let mut total_nll = 0f64;
+        let mut bits = 0u64;
+        let mut differing_rows = 0u32;
+        for target in &ids[1..] {
+            let logits = engine.decode_logits()?;
+            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let logsumexp = logits
+                .iter()
+                .map(|value| (value - max).exp())
+                .sum::<f32>()
+                .ln();
+            total_nll += f64::from(max + logsumexp - logits[*target as usize]);
+            engine.set_token(*target)?;
+            let position = engine.position;
+            let saved_position = stream.clone_dtoh(&engine.work.position)?;
+            let saved_length = stream.clone_dtoh(&engine.work.length)?;
+            let saved_pending = engine.pending_token;
+            let saved_committed = engine.committed_prefix_ids.clone();
+            let saved_resident_len = engine.resident_ids_len;
+            let saved_input_kind = engine.last_input_kind;
+            checkpoint.save(&engine.state, &engine.work.token, position, &stream, None)?;
+            engine
+                .moe_prefill
+                .as_ref()
+                .context("Flint prefill missing for graph/eager reseed")?
+                .reseed_request(
+                    engine
+                        .moe_slots
+                        .as_mut()
+                        .context("Flint slots missing for graph/eager reseed")?,
+                )?;
+            engine
+                .moe_slots
+                .as_mut()
+                .context("Flint slots missing for graph/eager freeze")?
+                .freeze_probe_admissions()?;
+            engine.decode(true, None)?;
+            let graph = engine.decode_logits()?;
+            checkpoint.restore(&mut engine.state, &mut engine.work.token, &stream)?;
+            stream.memcpy_htod(&saved_position, &mut engine.work.position)?;
+            stream.memcpy_htod(&saved_length, &mut engine.work.length)?;
+            engine.position = position;
+            engine.pending_token = saved_pending;
+            engine.committed_prefix_ids = saved_committed;
+            engine.resident_ids_len = saved_resident_len;
+            engine.last_input_kind = saved_input_kind;
+            engine.decode(false, None)?;
+            let eager = engine.decode_logits()?;
+            let row_bits = graph
+                .iter()
+                .zip(&eager)
+                .filter(|(actual, expected)| actual.to_bits() != expected.to_bits())
+                .count() as u64;
+            if row_bits != 0 {
+                differing_rows += 1;
+            }
+            bits += row_bits;
+            rows.push(eager);
+        }
+        Ok((
+            total_nll / (ids.len() - 1) as f64,
+            rows,
+            bits,
+            differing_rows,
+        ))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn forced_prefix(
+        engine: &mut Engine,
+        ids: &[u32],
+        graph: bool,
+        expected: Option<&[Vec<f32>]>,
+    ) -> Result<(f64, Vec<Vec<f32>>, u64, u32)> {
+        engine.reset()?;
+        engine.prefill(&ids[..1], None)?;
+        let mut total_nll = 0f64;
+        let mut rows = Vec::new();
+        let mut bit_mismatches = 0u64;
+        let mut max_ulp = 0u32;
+        let read_logits = |engine: &Engine| -> Result<Vec<f32>> { engine.decode_logits() };
+        for target in &ids[1..] {
+            let logits = read_logits(engine)?;
+            let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let logsumexp = logits
+                .iter()
+                .map(|value| (value - max).exp())
+                .sum::<f32>()
+                .ln();
+            total_nll += f64::from(max + logsumexp - logits[*target as usize]);
+            if let Some(expected) = expected {
+                let row_bits = logits
+                    .iter()
+                    .zip(expected[rows.len()].iter())
+                    .filter(|(actual, reference)| actual.to_bits() != reference.to_bits())
+                    .count();
+                bit_mismatches += u64::try_from(row_bits)?;
+                if row_bits != 0 {
+                    max_ulp += 1;
+                }
+            }
+            rows.push(logits);
+            engine.set_token(*target)?;
+            engine.decode(graph, None)?;
+        }
+        let final_logits = read_logits(engine)?;
+        if let Some(expected) = expected {
+            let row_bits = final_logits
+                .iter()
+                .zip(expected[rows.len()].iter())
+                .filter(|(actual, reference)| actual.to_bits() != reference.to_bits())
+                .count();
+            bit_mismatches += u64::try_from(row_bits)?;
+            if row_bits != 0 {
+                max_ulp += 1;
+            }
+        }
+        rows.push(final_logits);
+        Ok((
+            total_nll / (ids.len() - 1) as f64,
+            rows,
+            bit_mismatches,
+            max_ulp,
+        ))
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU window; FF_MODEL, FLYINGFISH_RUNTIME_DIR and FF_FLINT_PASSAGE required"]
+    fn flint_engine_controls_and_graph_eager_nll_gpu() -> Result<()> {
+        use crate::backend::{Backend, Settings};
+        use std::{env, fs::File};
+
+        let dir = PathBuf::from(env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+        let runtime =
+            PathBuf::from(env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime missing")?);
+        let passage = PathBuf::from(env::var_os("FF_FLINT_PASSAGE").context("passage missing")?);
+        ensure!(
+            env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let reference_metrics = PathBuf::from(
+            env::var_os("FF_FLINT_REFERENCE_METRICS")
+                .context("FF_FLINT_REFERENCE_METRICS missing")?,
+        );
+        let settings = Settings {
+            runtime_dir: Some(runtime),
+            prefix_cache: false,
+            draft_model: None,
+            tree_builder: crate::backend::TreeBuilder::Serial,
+            spec_budget: crate::backend::SpecBudget::Chain,
+            spec_graph: false,
+            kv_format: crate::kv::KvFormat::Bf16,
+        };
+        let passage: serde_json::Value =
+            serde_json::from_reader(File::open(passage).context("open passage")?)?;
+        let mut ids = passage["input_ids"]
+            .as_array()
+            .context("input_ids missing")?
+            .iter()
+            .map(|value| value.as_u64().and_then(|value| u32::try_from(value).ok()))
+            .collect::<Option<Vec<_>>>()
+            .context("invalid passage token id")?;
+        ids.truncate(600);
+        let reference_document: serde_json::Value = serde_json::from_reader(
+            File::open(reference_metrics).context("open reference metrics")?,
+        )?;
+        let reference_runs = reference_document
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| vec![reference_document]);
+        let reference_nlls = reference_runs
+            .iter()
+            .map(|reference| {
+                reference["metrics"]["per_position_nll"]
+                    .as_array()
+                    .context("reference per-position NLL missing")?
+                    .iter()
+                    .map(|value| value.as_f64().context("invalid reference per-position NLL"))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            reference_nlls.len() == 4 && reference_nlls.iter().all(|values| values.len() >= 599),
+            "expected four measured Flint reference runs"
+        );
+        let prediction_nll = |rows: &[Vec<f32>], start: usize, end: usize| -> Result<f64> {
+            ensure!(
+                rows.len() >= end && ids.len() > end,
+                "prediction NLL rows={} end={end} differ",
+                rows.len()
+            );
+            let mut total = 0f64;
+            for position in start..end {
+                let logits = &rows[position];
+                let target = ids[position + 1] as usize;
+                let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let logsumexp = logits
+                    .iter()
+                    .map(|value| (value - max).exp())
+                    .sum::<f32>()
+                    .ln();
+                total += f64::from(max + logsumexp - logits[target]);
+            }
+            Ok(total / (end - start) as f64)
+        };
+        let mut ring_engine = Backend::calibrate(&dir, 0, 600, Some(520), settings.clone())?
+            .context("Flint ring calibration missing")?;
+        let ring_ids = &ids[..520];
+        let sliding_state = ring_engine.model_spec.layers[3].state_index as usize;
+        let ring = ring_engine.state.kv_ring(sliding_state)?;
+        ensure!(
+            ring_engine.chunk > ring,
+            "ring gate chunk={} does not exceed ring={ring}",
+            ring_engine.chunk
+        );
+        ring_engine.prefill(ring_ids, None)?;
+        let prefill_logits = ring_engine.decode_logits()?;
+        ensure!(
+            prefill_logits.iter().all(|value| value.is_finite()),
+            "interleaved sliding-ring prefill has nonfinite logits"
+        );
+        ring_engine.reset()?;
+        ring_engine.flint_legacy_overflow_prefill = true;
+        ring_engine.prefill(ring_ids, None)?;
+        let legacy_logits = ring_engine.decode_logits()?;
+        let legacy_bits = legacy_logits
+            .iter()
+            .zip(&prefill_logits)
+            .filter(|(actual, reference)| actual.to_bits() != reference.to_bits())
+            .count();
+        ensure!(
+            legacy_bits > 0,
+            "legacy ring-overwrite control does not discriminate: differing_logits={legacy_bits}"
+        );
+        println!(
+            "FLINT_SLIDING_RING_PREFILL chunk={} rows=520 ring={ring} interleaved_finite=true legacy_differing_logits={legacy_bits} PASS",
+            ring_engine.chunk
+        );
+        drop(ring_engine);
+
+        let mut engine = Backend::calibrate(&dir, 0, 600, None, settings.clone())?
+            .context("Flint calibration missing")?;
+
+        let (graph_nll, graph_logits, bit_mismatches, max_ulp) =
+            graph_eager_forced_prefix(&mut engine, &ids)?;
+        let eager_nll = graph_nll;
+
+        engine.reset()?;
+        zero_flint_sinks(&mut engine)?;
+        let (sinks_off_nll, _, _, _) = forced_prefix(&mut engine, &ids, true, None)?;
+        ensure!(
+            (sinks_off_nll - graph_nll).abs() > 0.01 && sinks_off_nll - graph_nll >= 0.001,
+            "sinks-off control does not discriminate: candidate={graph_nll} control={sinks_off_nll}"
+        );
+        drop(engine);
+        let window_on_tail = prediction_nll(&graph_logits, 512, 599)?;
+        let reference_means = reference_nlls
+            .iter()
+            .map(|values| values[..599].iter().sum::<f64>() / 599.0)
+            .collect::<Vec<_>>();
+        let reference_tails = reference_nlls
+            .iter()
+            .map(|values| values[512..599].iter().sum::<f64>() / 87.0)
+            .collect::<Vec<_>>();
+        let reference_spread = reference_tails
+            .iter()
+            .flat_map(|a| reference_tails.iter().map(move |b| (a - b).abs()))
+            .fold(0f64, f64::max);
+        let tail_tolerance = 0.01f64.max(2.0 * reference_spread);
+        for (index, &reference_mean) in reference_means.iter().enumerate() {
+            ensure!(
+                (graph_nll - reference_mean).abs() <= tail_tolerance,
+                "graph NLL differs from reference {index}: graph={graph_nll} reference={reference_mean} tolerance={tail_tolerance}"
+            );
+        }
+        for (index, &reference_tail) in reference_tails.iter().enumerate() {
+            ensure!(
+                (window_on_tail - reference_tail).abs() <= tail_tolerance,
+                "window-on tail NLL differs from reference {index}: on={window_on_tail} reference={reference_tail} tolerance={tail_tolerance}"
+            );
+        }
+        ensure!(
+            bit_mismatches == 0 && max_ulp == 0,
+            "graph/eager NLL differs: graph={graph_nll} eager={eager_nll} bits={bit_mismatches} max_ulp={max_ulp}"
+        );
+        println!(
+            "FLINT_ENGINE_CONTROLS graph_nll={graph_nll:.9} eager_nll={eager_nll:.9} graph_eager_bits=0 sinks_off_nll={sinks_off_nll:.9} tail_on={window_on_tail:.9} reference_spread={reference_spread:.9} tail_tolerance={tail_tolerance:.9} reference_means={reference_means:?} tail_refs={reference_tails:?} PASS"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU window; FF_MODEL, FLYINGFISH_RUNTIME_DIR, FF_FLINT_PASSAGE and FF_FLINT_WINDOW_DUMP required"]
+    fn flint_window_boundary_dump_gpu() -> Result<()> {
+        use crate::backend::{Backend, Settings};
+        use std::{env, fs::File, path::PathBuf};
+
+        let dir = PathBuf::from(env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+        let runtime =
+            PathBuf::from(env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime missing")?);
+        let passage = PathBuf::from(env::var_os("FF_FLINT_PASSAGE").context("passage missing")?);
+        let output = PathBuf::from(
+            env::var_os("FF_FLINT_WINDOW_DUMP").context("FF_FLINT_WINDOW_DUMP missing")?,
+        );
+        ensure!(
+            env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let settings = Settings {
+            runtime_dir: Some(runtime),
+            prefix_cache: false,
+            draft_model: None,
+            tree_builder: crate::backend::TreeBuilder::Serial,
+            spec_budget: crate::backend::SpecBudget::Chain,
+            spec_graph: false,
+            kv_format: crate::kv::KvFormat::Bf16,
+        };
+        let passage: serde_json::Value =
+            serde_json::from_reader(File::open(passage).context("open passage")?)?;
+        let ids = passage["input_ids"]
+            .as_array()
+            .context("input_ids missing")?
+            .iter()
+            .map(|value| value.as_u64().and_then(|value| u32::try_from(value).ok()))
+            .collect::<Option<Vec<_>>>()
+            .context("invalid passage token id")?;
+        ensure!(ids.len() >= 600, "passage is shorter than the gate");
+        let mut engine = Backend::calibrate(&dir, 0, 600, None, settings)?
+            .context("Flint calibration missing")?;
+        let capture_layers = vec![3, 5];
+        let capture_positions = vec![513, 560, 599];
+        engine.flint_window_capture = Some((
+            capture_layers.clone(),
+            capture_positions.clone(),
+            output.clone(),
+        ));
+        engine.prefill(&ids[..1], None)?;
+        for (offset, token) in ids[1..600].iter().enumerate() {
+            let position = offset + 1;
+            engine.set_token(*token)?;
+            engine.decode(false, None)?;
+            if capture_positions == [560] && position == 560 {
+                break;
+            }
+        }
+        let expected = capture_layers
+            .iter()
+            .flat_map(|layer| {
+                capture_positions
+                    .iter()
+                    .map(move |position| (layer, position))
+            })
+            .map(|(layer, position)| {
+                output.join(format!("layer{layer}_position{position}.safetensors"))
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            expected
+                .iter()
+                .all(|path| path.is_file() && path.metadata().is_ok_and(|meta| meta.len() > 0)),
+            "Flint window dump files are incomplete"
+        );
+        println!(
+            "FLINT_WINDOW_DUMP layers={capture_layers:?} positions={capture_positions:?} files={} PASS",
+            expected.len()
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU window; FF_MODEL, FLYINGFISH_RUNTIME_DIR and FF_FLINT_PASSAGE required"]
+    fn flint_decode_graph_length_gpu() -> Result<()> {
+        use crate::backend::{Backend, Settings};
+        use std::{env, fs::File, path::PathBuf};
+
+        let dir = PathBuf::from(env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+        let runtime =
+            PathBuf::from(env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime missing")?);
+        let passage = PathBuf::from(env::var_os("FF_FLINT_PASSAGE").context("passage missing")?);
+        ensure!(
+            env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let settings = Settings {
+            runtime_dir: Some(runtime),
+            prefix_cache: false,
+            draft_model: None,
+            tree_builder: crate::backend::TreeBuilder::Serial,
+            spec_budget: crate::backend::SpecBudget::Chain,
+            spec_graph: false,
+            kv_format: crate::kv::KvFormat::Bf16,
+        };
+        let passage: serde_json::Value =
+            serde_json::from_reader(File::open(passage).context("open passage")?)?;
+        let ids = passage["input_ids"]
+            .as_array()
+            .context("input_ids missing")?
+            .iter()
+            .map(|value| value.as_u64().and_then(|value| u32::try_from(value).ok()))
+            .collect::<Option<Vec<_>>>()
+            .context("invalid passage token id")?;
+        let mut engine = Backend::calibrate(&dir, 0, 1100, None, settings.clone())?
+            .context("Flint calibration missing")?;
+        let compare = |graph: Vec<Vec<f32>>, eager: &[Vec<f32>]| -> (u64, u32) {
+            let mut bits = 0u64;
+            let mut ulp = 0u32;
+            for (actual_row, expected_row) in graph.iter().zip(eager) {
+                bits += actual_row
+                    .iter()
+                    .zip(expected_row)
+                    .filter(|(actual, expected)| actual.to_bits() != expected.to_bits())
+                    .count() as u64;
+                if actual_row
+                    .iter()
+                    .zip(expected_row)
+                    .any(|(actual, expected)| actual.to_bits() != expected.to_bits())
+                {
+                    ulp += 1;
+                }
+            }
+            (bits, ulp)
+        };
+
+        let (eager_512, bits_512, ulp_512) =
+            graph_eager_window(&mut engine, &ids[..510], &ids[510..530])?;
+        ensure!(
+            ulp_512 <= 1,
+            "graph/eager decode differs across 512/513: bits={bits_512} max_ulp={ulp_512}"
+        );
+        let (_eager_1024, bits_1024, ulp_1024) =
+            graph_eager_window(&mut engine, &ids[..1020], &ids[1020..1040])?;
+        ensure!(
+            ulp_1024 <= 1,
+            "graph/eager decode differs across 1024: bits={bits_1024} max_ulp={ulp_1024}"
+        );
+
+        drop(engine);
+        let frozen_spec = crate::model_spec::ModelSpec::read(&dir)?;
+        let mut frozen_engine = Engine::load_qwen(
+            &dir,
+            0,
+            1100,
+            None,
+            settings,
+            crate::backend::cuda::engine::SetupMode::Prepare,
+            frozen_spec,
+        )?;
+        frozen_engine.flint_frozen_decode_length = true;
+        frozen_engine.finish_flint_calibration(&dir, std::time::Instant::now())?;
+        let frozen = decode_window(&mut frozen_engine, &ids[..510], &ids[510..530], true)?;
+        let (frozen_bits, frozen_ulp) = compare(frozen, &eager_512);
+        ensure!(
+            frozen_bits > 0 && frozen_ulp > 1,
+            "frozen-length negative control was not detected: bits={frozen_bits} max_ulp={frozen_ulp}"
+        );
+        println!(
+            "FLINT_DECODE_GRAPH_LENGTH rows_512=20 bits_512={bits_512} differing_rows_512={ulp_512} rows_1024=20 bits_1024={bits_1024} differing_rows_1024={ulp_1024} frozen_bits={frozen_bits} frozen_differing_rows={frozen_ulp} PASS"
+        );
         Ok(())
     }
 }

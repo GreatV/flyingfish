@@ -429,7 +429,7 @@ impl Processor {
                 );
                 ImageConfig::MiniCpm(config)
             }
-            Architecture::Llama => return Ok(None),
+            Architecture::Llama | Architecture::Flint => return Ok(None),
         };
         let image_id = match spec.architecture {
             Architecture::MiniCpmV47 => Some(ImageId::read(

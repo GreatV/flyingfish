@@ -29,6 +29,13 @@ impl RowWorkSpec {
                 false,
                 0,
             ),
+            Architecture::Flint => (
+                q.checked_add(kv.checked_mul(2).context("KV width overflow")?)
+                    .context("projection width overflow")?,
+                q,
+                true,
+                0,
+            ),
             Architecture::Qwen35Text | Architecture::MiniCpmV47 => {
                 FullAttentionSpec::from_model(spec)?;
                 let g = GdnSpec::from_model(spec)?;

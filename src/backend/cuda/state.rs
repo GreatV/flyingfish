@@ -341,6 +341,7 @@ pub(crate) struct StateStore {
     pub gdn: Vec<GdnState>,
     pub sequence: Option<CudaSlice<i32>>,
     capacity: u32,
+    kv_rings: Vec<usize>,
 }
 impl StateStore {
     pub fn new(spec: &ModelSpec, capacity: usize, stream: &Arc<CudaStream>) -> Result<Self> {
@@ -360,8 +361,8 @@ impl StateStore {
             format == crate::kv::KvFormat::Bf16 || (spec.kv_heads == 4 && spec.head_dim == 256),
             "compact cache requires four256-wide KV heads"
         );
-        let layout = format.layout(capacity, spec.kv_heads as usize, spec.head_dim as usize)?;
         let mut kv = Vec::new();
+        let mut kv_rings = Vec::new();
         let mut gdn = Vec::new();
         for layer in &spec.layers {
             match layer.mixer {
@@ -370,6 +371,18 @@ impl StateStore {
                         layer.state_index as usize == kv.len(),
                         "invalid full-state mapping"
                     );
+                    ensure!(
+                        format == crate::kv::KvFormat::Bf16 || layer.sliding_window.is_none(),
+                        "compact KV does not support sliding layer state"
+                    );
+                    let layer_capacity = layer
+                        .sliding_window
+                        .map_or(capacity, |window| window as usize);
+                    let layout = format.layout(
+                        layer_capacity,
+                        spec.kv_heads as usize,
+                        spec.head_dim as usize,
+                    )?;
                     kv.push(Kv {
                         k: stream.alloc_zeros::<bf16>(layout.ring_elements)?,
                         v: stream.alloc_zeros::<bf16>(layout.ring_elements)?,
@@ -379,6 +392,7 @@ impl StateStore {
                             Some(CompactKv::new(layout, stream)?)
                         },
                     });
+                    kv_rings.push(layout.ring);
                 }
                 Mixer::Gdn => {
                     ensure!(
@@ -394,17 +408,25 @@ impl StateStore {
                 }
             }
         }
-        let sequence = if spec.gdn.is_some() {
-            Some(stream.clone_htod(&[0i32, 1, 1, capacity as i32, 1, 0, 0, 0])?)
-        } else {
-            None
-        };
+        let sequence =
+            if spec.gdn.is_some() || spec.architecture == crate::model_spec::Architecture::Flint {
+                Some(stream.clone_htod(&[0i32, 1, 1, capacity as i32, 1, 0, 0, 0])?)
+            } else {
+                None
+            };
         Ok(Self {
             kv,
             gdn,
             sequence,
             capacity: capacity as u32,
+            kv_rings,
         })
+    }
+    pub fn kv_ring(&self, state_index: usize) -> Result<usize> {
+        self.kv_rings
+            .get(state_index)
+            .copied()
+            .context("KV ring state index is outside the layer plan")
     }
     pub fn seq_ref(&self, stream: &Arc<CudaStream>) -> Result<SeqRef> {
         let meta = self
@@ -542,6 +564,7 @@ pub(crate) struct StateCheckpoint {
     heads: usize,
     dim: usize,
     capacity: usize,
+    kv_rings: Vec<usize>,
     valid: bool,
 }
 impl StateCheckpoint {
@@ -590,6 +613,7 @@ impl StateCheckpoint {
             heads,
             dim,
             capacity: store.capacity as usize,
+            kv_rings: store.kv_rings.clone(),
             valid: false,
         })
     }
@@ -598,7 +622,8 @@ impl StateCheckpoint {
             self.kv.len() == store.kv.len()
                 && self.gdn.len() == store.gdn.len()
                 && self.sequence.is_some() == store.sequence.is_some()
-                && self.capacity == store.capacity as usize,
+                && self.capacity == store.capacity as usize
+                && self.kv_rings == store.kv_rings,
             "checkpoint/state geometry mismatch"
         );
         for (a, b) in self.gdn.iter().zip(&store.gdn) {
@@ -607,21 +632,24 @@ impl StateCheckpoint {
                 "checkpoint GDN extent mismatch"
             );
         }
-        let extent = self
-            .heads
-            .checked_mul(self.capacity)
-            .and_then(|n| n.checked_mul(self.dim))
-            .context("checkpoint extent overflow")?;
-        ensure!(
-            store.kv.iter().all(|kv| {
-                let n = kv
-                    .compact
-                    .as_ref()
-                    .map_or(extent, |c| c.layout.ring_elements);
-                kv.k.len() == n && kv.v.len() == n
-            }),
-            "checkpoint KV extent mismatch"
-        );
+        for (kv, ring) in store.kv.iter().zip(&self.kv_rings) {
+            let n = kv
+                .compact
+                .as_ref()
+                .map_or_else(
+                    || {
+                        self.heads
+                            .checked_mul(*ring)
+                            .and_then(|n| n.checked_mul(self.dim))
+                    },
+                    |c| Some(c.layout.ring_elements),
+                )
+                .context("checkpoint KV extent overflow")?;
+            ensure!(
+                kv.k.len() == n && kv.v.len() == n,
+                "checkpoint KV extent mismatch ring={ring}"
+            );
+        }
         Ok(())
     }
     pub fn save(
@@ -688,13 +716,9 @@ impl StateCheckpoint {
             stream.memcpy_dtod(&src.s, &mut dst.s)?;
             stream.memcpy_dtod(&src.history, &mut dst.history)?;
         }
-        for (src, dst) in store.kv.iter().zip(&mut self.kv) {
-            let cap = src
-                .compact
-                .as_ref()
-                .map_or(self.capacity, |c| c.layout.ring);
+        for ((src, dst), cap) in store.kv.iter().zip(&mut self.kv).zip(&self.kv_rings) {
             for (a, b) in [(&src.k, &mut dst.k), (&src.v, &mut dst.v)] {
-                if src.compact.is_none() {
+                if src.compact.is_none() && *cap == self.capacity {
                     super::copy::columns(
                         stream,
                         a,
@@ -711,7 +735,11 @@ impl StateCheckpoint {
                     continue;
                 }
                 for row in 0..active_rows {
-                    let pos = crate::kv::ring_slot(prefix + row, cap)?;
+                    let pos = if src.compact.is_some() {
+                        crate::kv::ring_slot(prefix + row, *cap)?
+                    } else {
+                        (prefix + row) % cap
+                    };
                     super::copy::columns(
                         stream,
                         a,
@@ -862,14 +890,10 @@ impl StateCheckpoint {
         if first == end {
             return Ok(());
         }
-        for (src, dst) in self.kv.iter().zip(&mut store.kv) {
-            let cap = dst
-                .compact
-                .as_ref()
-                .map_or(self.capacity, |c| c.layout.ring);
+        for ((src, dst), cap) in self.kv.iter().zip(&mut store.kv).zip(&self.kv_rings) {
             let compact = dst.compact.is_some();
             for (a, b) in [(&src.k, &mut dst.k), (&src.v, &mut dst.v)] {
-                if !compact {
+                if !compact && *cap == self.capacity {
                     super::copy::columns(
                         stream,
                         a,
@@ -886,7 +910,11 @@ impl StateCheckpoint {
                     continue;
                 }
                 for row in first..end {
-                    let pos = crate::kv::ring_slot(self.prefix + row, cap)?;
+                    let pos = if compact {
+                        crate::kv::ring_slot(self.prefix + row, *cap)?
+                    } else {
+                        (self.prefix + row) % cap
+                    };
                     super::copy::columns(
                         stream,
                         a,

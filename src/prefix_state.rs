@@ -1062,6 +1062,9 @@ mod tests {
                 } else {
                     Mixer::Gdn
                 },
+                rope: attention,
+                sliding_window: None,
+                ffn: crate::model_spec::FfnKind::Dense,
                 state_index: if attention {
                     let x = attention_index;
                     attention_index += 1;

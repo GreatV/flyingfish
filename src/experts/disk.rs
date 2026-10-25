@@ -121,6 +121,11 @@ fn visit_slices(
             visit(gate_up)?;
             visit(down)?;
         }
+        ExpertRange::Bf16Separate { gate, up, down } => {
+            visit(gate)?;
+            visit(up)?;
+            visit(down)?;
+        }
         ExpertRange::Fp8 {
             gate,
             up,
@@ -250,6 +255,14 @@ impl DiskReader {
                 read(*gate_up_bytes, down)?;
             }
             (
+                ExpertLayout::Bf16Separate { matrix_bytes, .. },
+                ExpertRange::Bf16Separate { gate, up, down },
+            ) => {
+                read(0, gate)?;
+                read(*matrix_bytes, up)?;
+                read(*matrix_bytes * 2, down)?;
+            }
+            (
                 ExpertLayout::Fp8W8a16(slot),
                 ExpertRange::Fp8 {
                     gate,
@@ -326,6 +339,8 @@ struct Work {
     layer: u32,
     hidden: Vec<bf16>,
     routes: Vec<crate::experts::runtime::Route>,
+    swiglu_rounding: crate::model_spec::SwigluRounding,
+    routed_weight: crate::model_spec::RoutedWeightBoundary,
     output: Vec<bf16>,
 }
 
@@ -357,6 +372,24 @@ impl DiskExperts {
         directory: &Path,
         workers: u32,
         max_rows: u32,
+    ) -> Result<Self> {
+        Self::new_with_swiglu_rounding(
+            catalogue,
+            directory,
+            workers,
+            max_rows,
+            crate::model_spec::SwigluRounding::Twice,
+            crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+        )
+    }
+
+    pub fn new_with_swiglu_rounding(
+        catalogue: std::sync::Arc<ExpertCatalogue>,
+        directory: &Path,
+        workers: u32,
+        max_rows: u32,
+        swiglu_rounding: crate::model_spec::SwigluRounding,
+        routed_weight: crate::model_spec::RoutedWeightBoundary,
     ) -> Result<Self> {
         let geometry = catalogue.geometry();
         ensure!(
@@ -427,6 +460,8 @@ impl DiskExperts {
                     layer: 0,
                     hidden: Vec::with_capacity(max_rows as usize * shape.hidden),
                     routes: Vec::with_capacity(max_routes),
+                    swiglu_rounding,
+                    routed_weight,
                     output: vec![bf16::ZERO; elements],
                 }),
             });
@@ -644,6 +679,8 @@ fn disk_contributions<const FP8: bool>(
                             .context("FP8 disk slot missing")?,
                         hidden: &work.hidden[first..first + shape.hidden],
                         routing: route.weight,
+                        rounding: work.swiglu_rounding,
+                        routed_weight: work.routed_weight,
                     },
                     vector,
                     scratch,
@@ -657,6 +694,8 @@ fn disk_contributions<const FP8: bool>(
                         weights,
                         hidden: &work.hidden[first..first + shape.hidden],
                         routing: route.weight,
+                        rounding: work.swiglu_rounding,
+                        routed_weight: work.routed_weight,
                     },
                     vector,
                     scratch,
@@ -684,6 +723,7 @@ mod tests {
 
     fn geometry() -> ExpertGeometry {
         ExpertGeometry {
+            first_layer: 0,
             layers: 2,
             experts: 4,
             hidden: 8,
@@ -1110,6 +1150,8 @@ mod tests {
                         )?,
                         hidden: &hidden[first..first + 8],
                         routing: route.weight,
+                        rounding: crate::model_spec::SwigluRounding::Twice,
+                        routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                     },
                     &mut expected[route.choice as usize * 8..(route.choice as usize + 1) * 8],
                     &mut scratch,
@@ -1312,6 +1354,8 @@ mod tests {
                         slot_layout: catalogue.layout().fp8_slot().context("FP8 fixture slot")?,
                         hidden: &hidden[route.row as usize * shape.hidden..][..shape.hidden],
                         routing: route.weight,
+                        rounding: crate::model_spec::SwigluRounding::Twice,
+                        routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                     },
                     &mut expected[route.choice as usize * shape.hidden..][..shape.hidden],
                     &mut scratch,
