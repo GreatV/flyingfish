@@ -39,6 +39,8 @@ Requirements:
 cargo build --release
 ```
 
+This builds `flyingfish` and `ff`. `ff` is a short alias: it runs the `flyingfish` binary in the same directory, so keep the two together.
+
 Kernels are compiled for the GPUs that `nvidia-smi` reports. To build without a GPU visible, set the target explicitly, for example `CUDA_ARCH_LIST=89`.
 
 `cargo build --no-default-features` builds the host-side code without CUDA. It has no GPU inference path.
@@ -57,13 +59,13 @@ flyingfish --model <model-dir> --runtime-dir <dir> serve --port 8080
 ```
 
 Common options:
-- `--runtime-dir` (or `FLYINGFISH_RUNTIME_DIR`) holds per-machine calibration. MoE models require it.
+- `--runtime-dir` (or `FLYINGFISH_RUNTIME_DIR`) holds per-machine calibration. MoE models require it. It must be outside any model directory.
 - `--draft-model <dir>` enables a DSpark draft model.
 - `--mtp <0-4>` sets the MTP depth. It defaults to 4 when the checkpoint has MTP weights; 0 selects plain decoding.
 - `--kv-format affine8` stores an 8-bit KV cache for long contexts. The default is `bf16`.
 - `--device <n>` selects the GPU.
 
-`flyingfish --help` lists every command and option.
+`ff` takes the same commands and options as `flyingfish`, and uses the same calibration. `flyingfish --help` lists them all.
 
 ## Development
 
