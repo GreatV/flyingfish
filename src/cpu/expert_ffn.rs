@@ -226,17 +226,30 @@ impl Scratch {
 
 type DotFn = unsafe fn(&[f32], &[bf16]) -> f32;
 type Fp8DotFn = unsafe fn(&[f32], &[u8], bf16) -> f32;
+type GateUpFn = unsafe fn(&[f32], &[usize], &[bf16], &[bf16], &mut [(f32, f32)]);
+type Fp8GateUpFn =
+    unsafe fn(&[f32], &[usize], &[u8], &[u8], (bf16, bf16), &mut [(f32, f32)], &mut [f32]);
+type DownRowsFn = unsafe fn(&[f32], &[usize], &[bf16], &mut [f32]);
+type Fp8DownRowsFn = unsafe fn(&[f32], &[usize], &[u8], bf16, &mut [f32], &mut [f32]);
 type RoundFn = unsafe fn(&[f32], &mut [bf16]);
 
 struct Arm {
     dot: DotFn,
     dot_e4m3: Fp8DotFn,
+    gate_up: GateUpFn,
+    gate_up_e4m3: Fp8GateUpFn,
+    down_rows: DownRowsFn,
+    down_rows_e4m3: Fp8DownRowsFn,
     round: RoundFn,
 }
 
 const SCALAR_ARM: Arm = Arm {
     dot: scalar_dot,
     dot_e4m3: scalar_dot_e4m3,
+    gate_up: scalar_gate_up,
+    gate_up_e4m3: scalar_gate_up_e4m3,
+    down_rows: scalar_down_rows,
+    down_rows_e4m3: scalar_down_rows_e4m3,
     round: scalar_round,
 };
 
@@ -303,12 +316,15 @@ fn compute(arm: &Arm, input: Contribution<'_>, out: &mut [bf16], scratch: &mut S
         *value = f32::from(*source);
     }
     let gate_up = &arena[weights.gate_up.clone()];
+    let offsets = [0usize];
+    let mut pair = [(0.0f32, 0.0f32)];
     for j in 0..intermediate {
         let gate = &gate_up[j * weights.gate_up_stride..][..hidden_width];
         let up = &gate_up[(intermediate + j) * weights.gate_up_stride..][..hidden_width];
         // SAFETY: the arm was selected by `Isa::detect` or checked by `Isa::available`.
-        scratch.gate[j] = unsafe { (arm.dot)(&scratch.hidden, gate) };
-        scratch.up[j] = unsafe { (arm.dot)(&scratch.hidden, up) };
+        unsafe { (arm.gate_up)(&scratch.hidden, &offsets, gate, up, &mut pair) };
+        scratch.gate[j] = pair[0].0;
+        scratch.up[j] = pair[0].1;
     }
     // SAFETY: as above.
     unsafe { (arm.round)(&scratch.gate, &mut scratch.gate_bf) };
@@ -450,13 +466,25 @@ fn compute_fp8(
     for (value, source) in scratch.hidden.iter_mut().zip(hidden) {
         *value = f32::from(*source);
     }
+    let offsets = [0usize];
+    let mut pair = [(0.0f32, 0.0f32)];
     for j in 0..intermediate {
         let gate = &rows.gate[j * hidden_width..][..hidden_width];
         let up = &rows.up[j * hidden_width..][..hidden_width];
         // SAFETY: the arm was selected by `Isa::detect` or checked by `Isa::available`.
-        scratch.gate[j] =
-            unsafe { (arm.dot_e4m3)(&scratch.hidden, gate, row_scale(rows.gate_scale, j)) };
-        scratch.up[j] = unsafe { (arm.dot_e4m3)(&scratch.hidden, up, row_scale(rows.up_scale, j)) };
+        unsafe {
+            (arm.gate_up_e4m3)(
+                &scratch.hidden,
+                &offsets,
+                gate,
+                up,
+                (row_scale(rows.gate_scale, j), row_scale(rows.up_scale, j)),
+                &mut pair,
+                &mut scratch.down,
+            );
+        }
+        scratch.gate[j] = pair[0].0;
+        scratch.up[j] = pair[0].1;
     }
     // SAFETY: as above.
     unsafe { (arm.round)(&scratch.gate, &mut scratch.gate_bf) };
@@ -547,6 +575,74 @@ fn scalar_dot_e4m3(x: &[f32], codes: &[u8], scale: bf16) -> f32 {
     pairwise(&lanes)
 }
 
+fn scalar_gate_up(
+    x_buf: &[f32],
+    row_offsets: &[usize],
+    gate: &[bf16],
+    up: &[bf16],
+    out: &mut [(f32, f32)],
+) {
+    let width = gate.len();
+    assert_eq!(width, up.len(), "gate/up width mismatch");
+    assert_eq!(row_offsets.len(), out.len(), "gate/up row count mismatch");
+    for (&offset, dst) in row_offsets.iter().zip(out.iter_mut()) {
+        let x = &x_buf[offset..offset + width];
+        *dst = (scalar_dot(x, gate), scalar_dot(x, up));
+    }
+}
+
+fn scalar_gate_up_e4m3(
+    x_buf: &[f32],
+    row_offsets: &[usize],
+    gate: &[u8],
+    up: &[u8],
+    (gate_scale, up_scale): (bf16, bf16),
+    out: &mut [(f32, f32)],
+    scratch_w: &mut [f32],
+) {
+    let width = gate.len();
+    assert_eq!(width, up.len(), "gate/up width mismatch");
+    assert_eq!(row_offsets.len(), out.len(), "gate/up row count mismatch");
+    assert!(
+        scratch_w.len() >= width,
+        "gate_up_e4m3 scratch_w smaller than width"
+    );
+    for (&offset, dst) in row_offsets.iter().zip(out.iter_mut()) {
+        let x = &x_buf[offset..offset + width];
+        *dst = (
+            scalar_dot_e4m3(x, gate, gate_scale),
+            scalar_dot_e4m3(x, up, up_scale),
+        );
+    }
+}
+
+fn scalar_down_rows(x_buf: &[f32], row_offsets: &[usize], down: &[bf16], out: &mut [f32]) {
+    let width = down.len();
+    assert_eq!(row_offsets.len(), out.len(), "down row count mismatch");
+    for (&offset, dst) in row_offsets.iter().zip(out.iter_mut()) {
+        *dst = scalar_dot(&x_buf[offset..offset + width], down);
+    }
+}
+
+fn scalar_down_rows_e4m3(
+    x_buf: &[f32],
+    row_offsets: &[usize],
+    down: &[u8],
+    down_scale: bf16,
+    out: &mut [f32],
+    scratch_w: &mut [f32],
+) {
+    let width = down.len();
+    assert_eq!(row_offsets.len(), out.len(), "down row count mismatch");
+    assert!(
+        scratch_w.len() >= width,
+        "down_rows_e4m3 scratch_w smaller than width"
+    );
+    for (&offset, dst) in row_offsets.iter().zip(out.iter_mut()) {
+        *dst = scalar_dot_e4m3(&x_buf[offset..offset + width], down, down_scale);
+    }
+}
+
 fn scalar_round(values: &[f32], out: &mut [bf16]) {
     assert_eq!(values.len(), out.len(), "round operand width mismatch");
     for (value, target) in values.iter().zip(out.iter_mut()) {
@@ -574,6 +670,17 @@ mod x86 {
             }
             k += LANES;
         }
+        unsafe { reduce_pair(low, high, x, weights, k) }
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn reduce_pair(
+        low: __m256,
+        high: __m256,
+        x: &[f32],
+        weights: &[bf16],
+        mut k: usize,
+    ) -> f32 {
         let mut lanes = [0f32; LANES];
         unsafe {
             _mm256_storeu_ps(lanes.as_mut_ptr(), low);
@@ -588,6 +695,29 @@ mod x86 {
     }
 
     #[target_feature(enable = "avx2,fma")]
+    unsafe fn reduce_pair_e4m3(
+        low: __m256,
+        high: __m256,
+        x: &[f32],
+        codes: &[u8],
+        scale: bf16,
+        mut k: usize,
+    ) -> f32 {
+        let mut lanes = [0f32; LANES];
+        unsafe {
+            _mm256_storeu_ps(lanes.as_mut_ptr(), low);
+            _mm256_storeu_ps(lanes.as_mut_ptr().add(8), high);
+        }
+        while k < x.len() {
+            let lane = k % LANES;
+            let weight = f32::from(crate::fp8::effective_weight(codes[k], scale));
+            lanes[lane] = x[k].mul_add(weight, lanes[lane]);
+            k += 1;
+        }
+        pairwise(&lanes)
+    }
+
+    #[target_feature(enable = "avx2,fma")]
     unsafe fn widen8(values: *const bf16) -> __m256 {
         unsafe {
             let packed = _mm_loadu_si128(values as *const __m128i);
@@ -595,37 +725,48 @@ mod x86 {
         }
     }
 
-    /// E4M3 byte to f32 as the scalar decode defines it: bias 7, no infinity,
-    /// magnitude 0x7f is NaN, exponent 0 decodes to mantissa / 512.
-    #[target_feature(enable = "avx2,fma")]
-    unsafe fn decode8(codes: *const u8) -> __m256 {
+    /// 16-byte in-register E4M3 decode to BF16 bit patterns (`u16x16`): bias 7, no infinity,
+    /// magnitude 0x7f is NaN (`0x7fc0`), exponent 0 decodes to mantissa / 512.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn decode16_bf16_bits(codes: *const u8) -> __m256i {
         unsafe {
-            let packed = _mm_loadl_epi64(codes as *const __m128i);
-            let value = _mm256_cvtepu8_epi32(packed);
-            let sign = _mm256_slli_epi32(_mm256_and_si256(value, _mm256_set1_epi32(0x80)), 24);
-            let magnitude = _mm256_and_si256(value, _mm256_set1_epi32(0x7f));
-            let exponent = _mm256_srli_epi32(magnitude, 3);
-            let mantissa = _mm256_and_si256(magnitude, _mm256_set1_epi32(7));
-            let normal = _mm256_castsi256_ps(_mm256_or_si256(
-                sign,
-                _mm256_or_si256(
-                    _mm256_slli_epi32(_mm256_add_epi32(exponent, _mm256_set1_epi32(120)), 23),
-                    _mm256_slli_epi32(mantissa, 20),
-                ),
-            ));
-            let subnormal = _mm256_or_ps(
-                _mm256_castsi256_ps(sign),
-                _mm256_mul_ps(_mm256_cvtepi32_ps(mantissa), _mm256_set1_ps(1.0 / 512.0)),
+            let raw = _mm_loadu_si128(codes as *const __m128i);
+            let mag8 = _mm_and_si128(raw, _mm_set1_epi8(0x7f));
+            let lut = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, -1, 17, 10, 7, 4, 3, 2, 1);
+            let adj8 = _mm_shuffle_epi8(lut, _mm_add_epi8(mag8, _mm_set1_epi8(0x78)));
+            let raw16 = _mm256_cvtepu8_epi16(raw);
+            let adj16 = _mm256_cvtepi8_epi16(adj8);
+            let sign16 = _mm256_and_si256(_mm256_slli_epi16(raw16, 8), _mm256_set1_epi16(-32768));
+            let mag16 = _mm256_and_si256(raw16, _mm256_set1_epi16(0x007f));
+            let base16 = _mm256_add_epi16(mag16, _mm256_set1_epi16(0x03c0));
+            let abs16 = _mm256_slli_epi16(_mm256_subs_epu16(base16, adj16), 4);
+            let nan_fix = _mm256_and_si256(
+                _mm256_cmpeq_epi16(mag16, _mm256_set1_epi16(0x007f)),
+                _mm256_set1_epi16(0x3c30),
             );
-            let nan = _mm256_castsi256_ps(_mm256_or_si256(sign, _mm256_set1_epi32(0x7fc0_0000)));
-            let subnormal_mask =
-                _mm256_castsi256_ps(_mm256_cmpeq_epi32(exponent, _mm256_setzero_si256()));
-            let nan_mask =
-                _mm256_castsi256_ps(_mm256_cmpeq_epi32(magnitude, _mm256_set1_epi32(0x7f)));
-            _mm256_blendv_ps(
-                _mm256_blendv_ps(normal, subnormal, subnormal_mask),
-                nan,
-                nan_mask,
+            _mm256_or_si256(sign16, _mm256_xor_si256(abs16, nan_fix))
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn decode16_vpshufb(codes: *const u8) -> (__m256, __m256) {
+        unsafe {
+            let bf16_16 = decode16_bf16_bits(codes);
+            let low16 = _mm256_castsi256_si128(bf16_16);
+            let high16 = _mm256_extracti128_si256::<1>(bf16_16);
+            let dl = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(low16), 16));
+            let dh = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(high16), 16));
+            (dl, dh)
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn decode16_scaled(codes: *const u8, factor: __m256) -> (__m256, __m256) {
+        unsafe {
+            let (dl, dh) = decode16_vpshufb(codes);
+            (
+                round_bf16x8(_mm256_mul_ps(dl, factor)),
+                round_bf16x8(_mm256_mul_ps(dh, factor)),
             )
         }
     }
@@ -651,25 +792,508 @@ mod x86 {
             unsafe {
                 let xl = _mm256_loadu_ps(x.as_ptr().add(k));
                 let xh = _mm256_loadu_ps(x.as_ptr().add(k + 8));
-                let wl = round_bf16x8(_mm256_mul_ps(decode8(codes.as_ptr().add(k)), factor));
-                let wh = round_bf16x8(_mm256_mul_ps(decode8(codes.as_ptr().add(k + 8)), factor));
+                let (wl, wh) = decode16_scaled(codes.as_ptr().add(k), factor);
                 low = _mm256_fmadd_ps(xl, wl, low);
                 high = _mm256_fmadd_ps(xh, wh, high);
             }
             k += LANES;
         }
-        let mut lanes = [0f32; LANES];
-        unsafe {
-            _mm256_storeu_ps(lanes.as_mut_ptr(), low);
-            _mm256_storeu_ps(lanes.as_mut_ptr().add(8), high);
+        unsafe { reduce_pair_e4m3(low, high, x, codes, scale, k) }
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn gate_up(
+        x_buf: &[f32],
+        row_offsets: &[usize],
+        gate: &[bf16],
+        up: &[bf16],
+        out: &mut [(f32, f32)],
+    ) {
+        let width = gate.len();
+        assert_eq!(width, up.len(), "gate/up width mismatch");
+        assert_eq!(row_offsets.len(), out.len(), "gate/up row count mismatch");
+        if row_offsets.len() == 1 {
+            let x0 = &x_buf[row_offsets[0]..row_offsets[0] + width];
+            let mut g0_l = _mm256_setzero_ps();
+            let mut g0_h = _mm256_setzero_ps();
+            let mut u0_l = _mm256_setzero_ps();
+            let mut u0_h = _mm256_setzero_ps();
+            let mut k = 0;
+            while k + LANES <= width {
+                unsafe {
+                    let x0l = _mm256_loadu_ps(x0.as_ptr().add(k));
+                    let x0h = _mm256_loadu_ps(x0.as_ptr().add(k + 8));
+                    g0_l = _mm256_fmadd_ps(x0l, widen8(gate.as_ptr().add(k)), g0_l);
+                    g0_h = _mm256_fmadd_ps(x0h, widen8(gate.as_ptr().add(k + 8)), g0_h);
+                    u0_l = _mm256_fmadd_ps(x0l, widen8(up.as_ptr().add(k)), u0_l);
+                    u0_h = _mm256_fmadd_ps(x0h, widen8(up.as_ptr().add(k + 8)), u0_h);
+                }
+                k += LANES;
+            }
+            out[0] = unsafe {
+                (
+                    reduce_pair(g0_l, g0_h, x0, gate, k),
+                    reduce_pair(u0_l, u0_h, x0, up, k),
+                )
+            };
+            return;
         }
-        while k < x.len() {
-            let lane = k % LANES;
-            let weight = f32::from(crate::fp8::effective_weight(codes[k], scale));
-            lanes[lane] = x[k].mul_add(weight, lanes[lane]);
-            k += 1;
+        if row_offsets.len() == 2 {
+            let x0 = &x_buf[row_offsets[0]..row_offsets[0] + width];
+            let x1 = &x_buf[row_offsets[1]..row_offsets[1] + width];
+            let mut g0_l = _mm256_setzero_ps();
+            let mut g0_h = _mm256_setzero_ps();
+            let mut u0_l = _mm256_setzero_ps();
+            let mut u0_h = _mm256_setzero_ps();
+            let mut g1_l = _mm256_setzero_ps();
+            let mut g1_h = _mm256_setzero_ps();
+            let mut u1_l = _mm256_setzero_ps();
+            let mut u1_h = _mm256_setzero_ps();
+            let mut k = 0;
+            while k + LANES <= width {
+                unsafe {
+                    let gl = widen8(gate.as_ptr().add(k));
+                    let gh = widen8(gate.as_ptr().add(k + 8));
+                    let ul = widen8(up.as_ptr().add(k));
+                    let uh = widen8(up.as_ptr().add(k + 8));
+                    let x0l = _mm256_loadu_ps(x0.as_ptr().add(k));
+                    let x0h = _mm256_loadu_ps(x0.as_ptr().add(k + 8));
+                    let x1l = _mm256_loadu_ps(x1.as_ptr().add(k));
+                    let x1h = _mm256_loadu_ps(x1.as_ptr().add(k + 8));
+                    g0_l = _mm256_fmadd_ps(x0l, gl, g0_l);
+                    g0_h = _mm256_fmadd_ps(x0h, gh, g0_h);
+                    u0_l = _mm256_fmadd_ps(x0l, ul, u0_l);
+                    u0_h = _mm256_fmadd_ps(x0h, uh, u0_h);
+                    g1_l = _mm256_fmadd_ps(x1l, gl, g1_l);
+                    g1_h = _mm256_fmadd_ps(x1h, gh, g1_h);
+                    u1_l = _mm256_fmadd_ps(x1l, ul, u1_l);
+                    u1_h = _mm256_fmadd_ps(x1h, uh, u1_h);
+                }
+                k += LANES;
+            }
+            out[0] = unsafe {
+                (
+                    reduce_pair(g0_l, g0_h, x0, gate, k),
+                    reduce_pair(u0_l, u0_h, x0, up, k),
+                )
+            };
+            out[1] = unsafe {
+                (
+                    reduce_pair(g1_l, g1_h, x1, gate, k),
+                    reduce_pair(u1_l, u1_h, x1, up, k),
+                )
+            };
+            return;
         }
-        pairwise(&lanes)
+        let mut cursor = 0;
+        let mut gate_tmp = [0.0f32; 4];
+        let mut up_tmp = [0.0f32; 4];
+        while cursor < row_offsets.len() {
+            let chunk = (row_offsets.len() - cursor).min(4);
+            unsafe {
+                down_rows(
+                    x_buf,
+                    &row_offsets[cursor..cursor + chunk],
+                    gate,
+                    &mut gate_tmp[..chunk],
+                );
+                down_rows(
+                    x_buf,
+                    &row_offsets[cursor..cursor + chunk],
+                    up,
+                    &mut up_tmp[..chunk],
+                );
+            }
+            for r in 0..chunk {
+                out[cursor + r] = (gate_tmp[r], up_tmp[r]);
+            }
+            cursor += chunk;
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn gate_up_e4m3(
+        x_buf: &[f32],
+        row_offsets: &[usize],
+        gate: &[u8],
+        up: &[u8],
+        (gate_scale, up_scale): (bf16, bf16),
+        out: &mut [(f32, f32)],
+        scratch_w: &mut [f32],
+    ) {
+        let width = gate.len();
+        assert_eq!(width, up.len(), "gate/up width mismatch");
+        assert_eq!(row_offsets.len(), out.len(), "gate/up row count mismatch");
+        let g_factor = _mm256_set1_ps(gate_scale.to_f32());
+        let u_factor = _mm256_set1_ps(up_scale.to_f32());
+        if row_offsets.len() == 1 {
+            let x0 = &x_buf[row_offsets[0]..row_offsets[0] + width];
+            let mut g0_l = _mm256_setzero_ps();
+            let mut g0_h = _mm256_setzero_ps();
+            let mut u0_l = _mm256_setzero_ps();
+            let mut u0_h = _mm256_setzero_ps();
+            let mut k = 0;
+            while k + LANES <= width {
+                unsafe {
+                    let x0l = _mm256_loadu_ps(x0.as_ptr().add(k));
+                    let x0h = _mm256_loadu_ps(x0.as_ptr().add(k + 8));
+                    let (gl, gh) = decode16_scaled(gate.as_ptr().add(k), g_factor);
+                    let (ul, uh) = decode16_scaled(up.as_ptr().add(k), u_factor);
+                    g0_l = _mm256_fmadd_ps(x0l, gl, g0_l);
+                    g0_h = _mm256_fmadd_ps(x0h, gh, g0_h);
+                    u0_l = _mm256_fmadd_ps(x0l, ul, u0_l);
+                    u0_h = _mm256_fmadd_ps(x0h, uh, u0_h);
+                }
+                k += LANES;
+            }
+            out[0] = unsafe {
+                (
+                    reduce_pair_e4m3(g0_l, g0_h, x0, gate, gate_scale, k),
+                    reduce_pair_e4m3(u0_l, u0_h, x0, up, up_scale, k),
+                )
+            };
+            return;
+        }
+        if row_offsets.len() == 2 {
+            let x0 = &x_buf[row_offsets[0]..row_offsets[0] + width];
+            let x1 = &x_buf[row_offsets[1]..row_offsets[1] + width];
+            let mut g0_l = _mm256_setzero_ps();
+            let mut g0_h = _mm256_setzero_ps();
+            let mut u0_l = _mm256_setzero_ps();
+            let mut u0_h = _mm256_setzero_ps();
+            let mut g1_l = _mm256_setzero_ps();
+            let mut g1_h = _mm256_setzero_ps();
+            let mut u1_l = _mm256_setzero_ps();
+            let mut u1_h = _mm256_setzero_ps();
+            let mut k = 0;
+            while k + LANES <= width {
+                unsafe {
+                    let (gl, gh) = decode16_scaled(gate.as_ptr().add(k), g_factor);
+                    let (ul, uh) = decode16_scaled(up.as_ptr().add(k), u_factor);
+                    let x0l = _mm256_loadu_ps(x0.as_ptr().add(k));
+                    let x0h = _mm256_loadu_ps(x0.as_ptr().add(k + 8));
+                    let x1l = _mm256_loadu_ps(x1.as_ptr().add(k));
+                    let x1h = _mm256_loadu_ps(x1.as_ptr().add(k + 8));
+                    g0_l = _mm256_fmadd_ps(x0l, gl, g0_l);
+                    g0_h = _mm256_fmadd_ps(x0h, gh, g0_h);
+                    u0_l = _mm256_fmadd_ps(x0l, ul, u0_l);
+                    u0_h = _mm256_fmadd_ps(x0h, uh, u0_h);
+                    g1_l = _mm256_fmadd_ps(x1l, gl, g1_l);
+                    g1_h = _mm256_fmadd_ps(x1h, gh, g1_h);
+                    u1_l = _mm256_fmadd_ps(x1l, ul, u1_l);
+                    u1_h = _mm256_fmadd_ps(x1h, uh, u1_h);
+                }
+                k += LANES;
+            }
+            out[0] = unsafe {
+                (
+                    reduce_pair_e4m3(g0_l, g0_h, x0, gate, gate_scale, k),
+                    reduce_pair_e4m3(u0_l, u0_h, x0, up, up_scale, k),
+                )
+            };
+            out[1] = unsafe {
+                (
+                    reduce_pair_e4m3(g1_l, g1_h, x1, gate, gate_scale, k),
+                    reduce_pair_e4m3(u1_l, u1_h, x1, up, up_scale, k),
+                )
+            };
+            return;
+        }
+        let mut tmp = [0.0f32; 8];
+        let count = row_offsets.len();
+        let mut cursor = 0;
+        while cursor < count {
+            let chunk = (count - cursor).min(8);
+            unsafe {
+                down_rows_e4m3(
+                    x_buf,
+                    &row_offsets[cursor..cursor + chunk],
+                    gate,
+                    gate_scale,
+                    &mut tmp[..chunk],
+                    scratch_w,
+                );
+            }
+            for r in 0..chunk {
+                out[cursor + r].0 = tmp[r];
+            }
+            unsafe {
+                down_rows_e4m3(
+                    x_buf,
+                    &row_offsets[cursor..cursor + chunk],
+                    up,
+                    up_scale,
+                    &mut tmp[..chunk],
+                    scratch_w,
+                );
+            }
+            for r in 0..chunk {
+                out[cursor + r].1 = tmp[r];
+            }
+            cursor += chunk;
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn down_rows(
+        x_buf: &[f32],
+        row_offsets: &[usize],
+        down: &[bf16],
+        out: &mut [f32],
+    ) {
+        let width = down.len();
+        assert_eq!(row_offsets.len(), out.len(), "down row count mismatch");
+        let mut cursor = 0;
+        while cursor < row_offsets.len() {
+            let chunk = (row_offsets.len() - cursor).min(4);
+            match chunk {
+                1 => {
+                    let x0 = &x_buf[row_offsets[cursor]..row_offsets[cursor] + width];
+                    out[cursor] = unsafe { dot(x0, down) };
+                }
+                2 => {
+                    let x0 = &x_buf[row_offsets[cursor]..row_offsets[cursor] + width];
+                    let x1 = &x_buf[row_offsets[cursor + 1]..row_offsets[cursor + 1] + width];
+                    let mut l0 = _mm256_setzero_ps();
+                    let mut h0 = _mm256_setzero_ps();
+                    let mut l1 = _mm256_setzero_ps();
+                    let mut h1 = _mm256_setzero_ps();
+                    let mut k = 0;
+                    while k + LANES <= width {
+                        unsafe {
+                            let wl = widen8(down.as_ptr().add(k));
+                            let wh = widen8(down.as_ptr().add(k + 8));
+                            l0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0.as_ptr().add(k)), wl, l0);
+                            h0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0.as_ptr().add(k + 8)), wh, h0);
+                            l1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1.as_ptr().add(k)), wl, l1);
+                            h1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1.as_ptr().add(k + 8)), wh, h1);
+                        }
+                        k += LANES;
+                    }
+                    out[cursor] = unsafe { reduce_pair(l0, h0, x0, down, k) };
+                    out[cursor + 1] = unsafe { reduce_pair(l1, h1, x1, down, k) };
+                }
+                3 => {
+                    let x0 = &x_buf[row_offsets[cursor]..row_offsets[cursor] + width];
+                    let x1 = &x_buf[row_offsets[cursor + 1]..row_offsets[cursor + 1] + width];
+                    let x2 = &x_buf[row_offsets[cursor + 2]..row_offsets[cursor + 2] + width];
+                    let mut l0 = _mm256_setzero_ps();
+                    let mut h0 = _mm256_setzero_ps();
+                    let mut l1 = _mm256_setzero_ps();
+                    let mut h1 = _mm256_setzero_ps();
+                    let mut l2 = _mm256_setzero_ps();
+                    let mut h2 = _mm256_setzero_ps();
+                    let mut k = 0;
+                    while k + LANES <= width {
+                        unsafe {
+                            let wl = widen8(down.as_ptr().add(k));
+                            let wh = widen8(down.as_ptr().add(k + 8));
+                            l0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0.as_ptr().add(k)), wl, l0);
+                            h0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0.as_ptr().add(k + 8)), wh, h0);
+                            l1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1.as_ptr().add(k)), wl, l1);
+                            h1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1.as_ptr().add(k + 8)), wh, h1);
+                            l2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2.as_ptr().add(k)), wl, l2);
+                            h2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2.as_ptr().add(k + 8)), wh, h2);
+                        }
+                        k += LANES;
+                    }
+                    out[cursor] = unsafe { reduce_pair(l0, h0, x0, down, k) };
+                    out[cursor + 1] = unsafe { reduce_pair(l1, h1, x1, down, k) };
+                    out[cursor + 2] = unsafe { reduce_pair(l2, h2, x2, down, k) };
+                }
+                _ => {
+                    let x0 = &x_buf[row_offsets[cursor]..row_offsets[cursor] + width];
+                    let x1 = &x_buf[row_offsets[cursor + 1]..row_offsets[cursor + 1] + width];
+                    let x2 = &x_buf[row_offsets[cursor + 2]..row_offsets[cursor + 2] + width];
+                    let x3 = &x_buf[row_offsets[cursor + 3]..row_offsets[cursor + 3] + width];
+                    let mut l0 = _mm256_setzero_ps();
+                    let mut h0 = _mm256_setzero_ps();
+                    let mut l1 = _mm256_setzero_ps();
+                    let mut h1 = _mm256_setzero_ps();
+                    let mut l2 = _mm256_setzero_ps();
+                    let mut h2 = _mm256_setzero_ps();
+                    let mut l3 = _mm256_setzero_ps();
+                    let mut h3 = _mm256_setzero_ps();
+                    let mut k = 0;
+                    while k + LANES <= width {
+                        unsafe {
+                            let wl = widen8(down.as_ptr().add(k));
+                            let wh = widen8(down.as_ptr().add(k + 8));
+                            l0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0.as_ptr().add(k)), wl, l0);
+                            h0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0.as_ptr().add(k + 8)), wh, h0);
+                            l1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1.as_ptr().add(k)), wl, l1);
+                            h1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1.as_ptr().add(k + 8)), wh, h1);
+                            l2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2.as_ptr().add(k)), wl, l2);
+                            h2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2.as_ptr().add(k + 8)), wh, h2);
+                            l3 = _mm256_fmadd_ps(_mm256_loadu_ps(x3.as_ptr().add(k)), wl, l3);
+                            h3 = _mm256_fmadd_ps(_mm256_loadu_ps(x3.as_ptr().add(k + 8)), wh, h3);
+                        }
+                        k += LANES;
+                    }
+                    out[cursor] = unsafe { reduce_pair(l0, h0, x0, down, k) };
+                    out[cursor + 1] = unsafe { reduce_pair(l1, h1, x1, down, k) };
+                    out[cursor + 2] = unsafe { reduce_pair(l2, h2, x2, down, k) };
+                    out[cursor + 3] = unsafe { reduce_pair(l3, h3, x3, down, k) };
+                }
+            }
+            cursor += chunk;
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn down_rows_e4m3(
+        x_buf: &[f32],
+        row_offsets: &[usize],
+        down: &[u8],
+        down_scale: bf16,
+        out: &mut [f32],
+        scratch_w: &mut [f32],
+    ) {
+        let width = down.len();
+        assert_eq!(row_offsets.len(), out.len(), "down row count mismatch");
+        assert!(
+            scratch_w.len() >= width,
+            "down_rows_e4m3 scratch_w smaller than width"
+        );
+        let factor = _mm256_set1_ps(down_scale.to_f32());
+        let save_decoded = row_offsets.len() > 4;
+        let mut cursor = 0;
+        while cursor < row_offsets.len() {
+            let chunk = (row_offsets.len() - cursor).min(4);
+            let use_saved = save_decoded && cursor > 0;
+            match chunk {
+                1 => {
+                    let x0 = &x_buf[row_offsets[cursor]..row_offsets[cursor] + width];
+                    let mut l0 = _mm256_setzero_ps();
+                    let mut h0 = _mm256_setzero_ps();
+                    let mut k = 0;
+                    while k + LANES <= width {
+                        unsafe {
+                            let (wl, wh) = if use_saved {
+                                (
+                                    _mm256_loadu_ps(scratch_w.as_ptr().add(k)),
+                                    _mm256_loadu_ps(scratch_w.as_ptr().add(k + 8)),
+                                )
+                            } else {
+                                decode16_scaled(down.as_ptr().add(k), factor)
+                            };
+                            l0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0.as_ptr().add(k)), wl, l0);
+                            h0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0.as_ptr().add(k + 8)), wh, h0);
+                        }
+                        k += LANES;
+                    }
+                    out[cursor] = unsafe { reduce_pair_e4m3(l0, h0, x0, down, down_scale, k) };
+                }
+                2 => {
+                    let x0 = &x_buf[row_offsets[cursor]..row_offsets[cursor] + width];
+                    let x1 = &x_buf[row_offsets[cursor + 1]..row_offsets[cursor + 1] + width];
+                    let mut l0 = _mm256_setzero_ps();
+                    let mut h0 = _mm256_setzero_ps();
+                    let mut l1 = _mm256_setzero_ps();
+                    let mut h1 = _mm256_setzero_ps();
+                    let mut k = 0;
+                    while k + LANES <= width {
+                        unsafe {
+                            let (wl, wh) = if use_saved {
+                                (
+                                    _mm256_loadu_ps(scratch_w.as_ptr().add(k)),
+                                    _mm256_loadu_ps(scratch_w.as_ptr().add(k + 8)),
+                                )
+                            } else {
+                                decode16_scaled(down.as_ptr().add(k), factor)
+                            };
+                            l0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0.as_ptr().add(k)), wl, l0);
+                            h0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0.as_ptr().add(k + 8)), wh, h0);
+                            l1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1.as_ptr().add(k)), wl, l1);
+                            h1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1.as_ptr().add(k + 8)), wh, h1);
+                        }
+                        k += LANES;
+                    }
+                    out[cursor] = unsafe { reduce_pair_e4m3(l0, h0, x0, down, down_scale, k) };
+                    out[cursor + 1] = unsafe { reduce_pair_e4m3(l1, h1, x1, down, down_scale, k) };
+                }
+                3 => {
+                    let x0 = &x_buf[row_offsets[cursor]..row_offsets[cursor] + width];
+                    let x1 = &x_buf[row_offsets[cursor + 1]..row_offsets[cursor + 1] + width];
+                    let x2 = &x_buf[row_offsets[cursor + 2]..row_offsets[cursor + 2] + width];
+                    let mut l0 = _mm256_setzero_ps();
+                    let mut h0 = _mm256_setzero_ps();
+                    let mut l1 = _mm256_setzero_ps();
+                    let mut h1 = _mm256_setzero_ps();
+                    let mut l2 = _mm256_setzero_ps();
+                    let mut h2 = _mm256_setzero_ps();
+                    let mut k = 0;
+                    while k + LANES <= width {
+                        unsafe {
+                            let (wl, wh) = if use_saved {
+                                (
+                                    _mm256_loadu_ps(scratch_w.as_ptr().add(k)),
+                                    _mm256_loadu_ps(scratch_w.as_ptr().add(k + 8)),
+                                )
+                            } else {
+                                decode16_scaled(down.as_ptr().add(k), factor)
+                            };
+                            l0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0.as_ptr().add(k)), wl, l0);
+                            h0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0.as_ptr().add(k + 8)), wh, h0);
+                            l1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1.as_ptr().add(k)), wl, l1);
+                            h1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1.as_ptr().add(k + 8)), wh, h1);
+                            l2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2.as_ptr().add(k)), wl, l2);
+                            h2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2.as_ptr().add(k + 8)), wh, h2);
+                        }
+                        k += LANES;
+                    }
+                    out[cursor] = unsafe { reduce_pair_e4m3(l0, h0, x0, down, down_scale, k) };
+                    out[cursor + 1] = unsafe { reduce_pair_e4m3(l1, h1, x1, down, down_scale, k) };
+                    out[cursor + 2] = unsafe { reduce_pair_e4m3(l2, h2, x2, down, down_scale, k) };
+                }
+                _ => {
+                    let x0 = &x_buf[row_offsets[cursor]..row_offsets[cursor] + width];
+                    let x1 = &x_buf[row_offsets[cursor + 1]..row_offsets[cursor + 1] + width];
+                    let x2 = &x_buf[row_offsets[cursor + 2]..row_offsets[cursor + 2] + width];
+                    let x3 = &x_buf[row_offsets[cursor + 3]..row_offsets[cursor + 3] + width];
+                    let mut l0 = _mm256_setzero_ps();
+                    let mut h0 = _mm256_setzero_ps();
+                    let mut l1 = _mm256_setzero_ps();
+                    let mut h1 = _mm256_setzero_ps();
+                    let mut l2 = _mm256_setzero_ps();
+                    let mut h2 = _mm256_setzero_ps();
+                    let mut l3 = _mm256_setzero_ps();
+                    let mut h3 = _mm256_setzero_ps();
+                    let mut k = 0;
+                    while k + LANES <= width {
+                        unsafe {
+                            let (wl, wh) = if use_saved {
+                                (
+                                    _mm256_loadu_ps(scratch_w.as_ptr().add(k)),
+                                    _mm256_loadu_ps(scratch_w.as_ptr().add(k + 8)),
+                                )
+                            } else {
+                                let (wl, wh) = decode16_scaled(down.as_ptr().add(k), factor);
+                                if save_decoded {
+                                    _mm256_storeu_ps(scratch_w.as_mut_ptr().add(k), wl);
+                                    _mm256_storeu_ps(scratch_w.as_mut_ptr().add(k + 8), wh);
+                                }
+                                (wl, wh)
+                            };
+                            l0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0.as_ptr().add(k)), wl, l0);
+                            h0 = _mm256_fmadd_ps(_mm256_loadu_ps(x0.as_ptr().add(k + 8)), wh, h0);
+                            l1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1.as_ptr().add(k)), wl, l1);
+                            h1 = _mm256_fmadd_ps(_mm256_loadu_ps(x1.as_ptr().add(k + 8)), wh, h1);
+                            l2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2.as_ptr().add(k)), wl, l2);
+                            h2 = _mm256_fmadd_ps(_mm256_loadu_ps(x2.as_ptr().add(k + 8)), wh, h2);
+                            l3 = _mm256_fmadd_ps(_mm256_loadu_ps(x3.as_ptr().add(k)), wl, l3);
+                            h3 = _mm256_fmadd_ps(_mm256_loadu_ps(x3.as_ptr().add(k + 8)), wh, h3);
+                        }
+                        k += LANES;
+                    }
+                    out[cursor] = unsafe { reduce_pair_e4m3(l0, h0, x0, down, down_scale, k) };
+                    out[cursor + 1] = unsafe { reduce_pair_e4m3(l1, h1, x1, down, down_scale, k) };
+                    out[cursor + 2] = unsafe { reduce_pair_e4m3(l2, h2, x2, down, down_scale, k) };
+                    out[cursor + 3] = unsafe { reduce_pair_e4m3(l3, h3, x3, down, down_scale, k) };
+                }
+            }
+            cursor += chunk;
+        }
     }
 
     #[target_feature(enable = "avx512f,avx512bf16")]
@@ -787,12 +1411,20 @@ mod x86 {
     pub(super) const AVX2: Arm = Arm {
         dot,
         dot_e4m3,
+        gate_up,
+        gate_up_e4m3,
+        down_rows,
+        down_rows_e4m3,
         round: super::scalar_round,
     };
 
     pub(super) const AVX512: Arm = Arm {
         dot: dot_512,
         dot_e4m3: dot_e4m3_512,
+        gate_up,
+        gate_up_e4m3,
+        down_rows,
+        down_rows_e4m3,
         round: round_512,
     };
 }
@@ -859,12 +1491,30 @@ struct PoolShared {
     out: Box<[AtomicU16]>,
 }
 
+#[derive(Clone, Copy)]
+struct ExpertGroup {
+    expert: u32,
+    start: u16,
+    len: u16,
+}
+
+#[derive(Clone, Copy)]
+struct GroupedItem {
+    item: u16,
+    row: u16,
+    choice: u32,
+    weight: bf16,
+}
+
 struct JobSlot {
     rows: usize,
     arena: Option<Arc<BlockLease>>,
     hidden: Vec<bf16>,
     experts: Vec<ExpertWeights>,
-    assignments: Vec<Assignment>,
+    groups: Vec<ExpertGroup>,
+    grouped_items: Vec<GroupedItem>,
+    expert_group: Vec<u16>,
+    group_cursor: Vec<u16>,
 }
 
 impl JobSlot {
@@ -874,7 +1524,10 @@ impl JobSlot {
             arena: None,
             hidden: vec![bf16::ZERO; max_rows * shape.hidden],
             experts: Vec::with_capacity(max_assignments),
-            assignments: Vec::with_capacity(max_assignments),
+            groups: Vec::with_capacity(max_assignments),
+            grouped_items: Vec::with_capacity(max_assignments),
+            expert_group: vec![u16::MAX; max_assignments],
+            group_cursor: Vec::with_capacity(max_assignments),
         }
     }
 }
@@ -884,10 +1537,15 @@ struct Local {
     hidden_f: Vec<f32>,
     hidden_rows: Vec<bool>,
     experts: Vec<ExpertWeights>,
-    items: Vec<Assignment>,
-    activated_bf: Vec<bf16>,
+    groups: Vec<ExpertGroup>,
+    grouped_items: Vec<GroupedItem>,
+    row_offsets: Vec<usize>,
+    pair_out: Vec<(f32, f32)>,
+    down_out: Vec<f32>,
     act_f: Vec<f32>,
-    block: Vec<bf16>,
+    scratch_w: Vec<f32>,
+    /// Per-worker staged `(slot_index, bf16_bits)` writes (`[block]`, 16 B/entry).
+    out_pairs: Vec<(usize, u16)>,
 }
 
 impl Local {
@@ -898,10 +1556,14 @@ impl Local {
             hidden_f: vec![0.0; max_rows * shape.hidden],
             hidden_rows: vec![false; max_rows],
             experts: Vec::with_capacity(max_assignments),
-            items: Vec::with_capacity(max_assignments),
-            activated_bf: vec![bf16::ZERO; max_assignments * shape.intermediate],
-            act_f: vec![0.0; shape.intermediate],
-            block: vec![bf16::ZERO; block],
+            groups: Vec::with_capacity(max_assignments),
+            grouped_items: Vec::with_capacity(max_assignments),
+            row_offsets: Vec::with_capacity(max_assignments),
+            pair_out: vec![(0.0, 0.0); max_assignments],
+            down_out: vec![0.0; max_assignments],
+            act_f: vec![0.0; max_assignments * shape.intermediate],
+            scratch_w: vec![0.0; shape.hidden.max(shape.intermediate)],
+            out_pairs: Vec::with_capacity(block),
         }
     }
 }
@@ -989,9 +1651,12 @@ impl ExpertPool {
             workers > 0 && workers <= 256,
             "invalid expert worker count {workers}"
         );
-        ensure!(max_rows > 0, "zero expert row capacity");
         ensure!(
-            max_assignments > 0 && max_assignments <= 1 << 16,
+            max_rows > 0 && max_rows <= usize::from(u16::MAX),
+            "invalid expert row capacity {max_rows}"
+        );
+        ensure!(
+            max_assignments > 0 && max_assignments <= usize::from(u16::MAX),
             "invalid expert assignment capacity {max_assignments}"
         );
         let isa = Isa::detect();
@@ -1153,13 +1818,57 @@ impl ExpertPool {
                 .job
                 .write()
                 .map_err(|_| anyhow::anyhow!("expert pool job lock poisoned"))?;
+            let slot = &mut *slot;
             slot.rows = rows;
             slot.arena = Some(lease);
             slot.hidden[..hidden.len()].copy_from_slice(hidden);
             slot.experts.clear();
             slot.experts.extend_from_slice(experts);
-            slot.assignments.clear();
-            slot.assignments.extend_from_slice(assignments);
+            slot.groups.clear();
+            slot.group_cursor.clear();
+            for item in assignments {
+                let expert_idx = item.expert as usize;
+                let group_idx = slot.expert_group[expert_idx];
+                if group_idx == u16::MAX {
+                    slot.expert_group[expert_idx] = slot.groups.len() as u16;
+                    slot.groups.push(ExpertGroup {
+                        expert: item.expert,
+                        start: 0,
+                        len: 1,
+                    });
+                } else {
+                    slot.groups[group_idx as usize].len += 1;
+                }
+            }
+            let mut offset = 0u16;
+            for group in &mut slot.groups {
+                group.start = offset;
+                slot.group_cursor.push(offset);
+                offset += group.len;
+            }
+            slot.grouped_items.resize(
+                assignments.len(),
+                GroupedItem {
+                    item: 0,
+                    row: 0,
+                    choice: 0,
+                    weight: bf16::ZERO,
+                },
+            );
+            for (item_idx, item) in assignments.iter().enumerate() {
+                let group_idx = slot.expert_group[item.expert as usize] as usize;
+                let dst = slot.group_cursor[group_idx] as usize;
+                slot.group_cursor[group_idx] += 1;
+                slot.grouped_items[dst] = GroupedItem {
+                    item: item_idx as u16,
+                    row: item.row as u16,
+                    choice: item.choice,
+                    weight: item.weight,
+                };
+            }
+            for group in &slot.groups {
+                slot.expert_group[group.expert as usize] = u16::MAX;
+            }
         }
         *error = None;
         self.shared.phase1.store(0, Ordering::Release);
@@ -1449,35 +2158,41 @@ fn phases<const FP8: bool>(
     fp8_slot: Option<&Fp8Slot>,
     swiglu_rounding: crate::model_spec::SwigluRounding,
 ) -> Result<()> {
+    use crate::model_spec::{RoutedWeightBoundary, SwigluRounding};
     let arm = arm_for(isa)?;
     let (hidden, intermediate) = (shape.hidden, shape.intermediate);
     let workers = shared.workers;
-    let (lease, items_len, range1, rows) = {
+    let (lease, groups_len, range1, rows) = {
         let slot = shared
             .job
             .read()
             .map_err(|_| anyhow::anyhow!("expert worker job lock poisoned"))?;
         local.experts.clear();
         local.experts.extend_from_slice(&slot.experts);
-        local.items.clear();
-        local.items.extend_from_slice(&slot.assignments);
-        let items_len = slot.assignments.len();
-        let range1 = block(index, workers, items_len * intermediate);
+        local.groups.clear();
+        local.groups.extend_from_slice(&slot.groups);
+        local.grouped_items.clear();
+        local.grouped_items.extend_from_slice(&slot.grouped_items);
+        let groups_len = local.groups.len();
+        let range1 = block(index, workers, groups_len * intermediate);
         local.hidden_rows[..slot.rows].fill(false);
         if range1.start < range1.end {
             let first = range1.start / intermediate;
             let last = (range1.end - 1) / intermediate;
-            for item in &slot.assignments[first..=last] {
-                let row = item.row as usize;
-                if !local.hidden_rows[row] {
-                    local.hidden_bf[row * hidden..][..hidden]
-                        .copy_from_slice(&slot.hidden[row * hidden..][..hidden]);
-                    local.hidden_rows[row] = true;
+            for group in &local.groups[first..=last] {
+                let items = &local.grouped_items[group.start as usize..][..group.len as usize];
+                for item in items {
+                    let row = item.row as usize;
+                    if !local.hidden_rows[row] {
+                        local.hidden_bf[row * hidden..][..hidden]
+                            .copy_from_slice(&slot.hidden[row * hidden..][..hidden]);
+                        local.hidden_rows[row] = true;
+                    }
                 }
             }
         }
         let lease = slot.arena.clone().context("job lease missing")?;
-        (lease, items_len, range1, slot.rows)
+        (lease, groups_len, range1, slot.rows)
     };
     for row in 0..rows {
         if local.hidden_rows[row] {
@@ -1489,55 +2204,100 @@ fn phases<const FP8: bool>(
             }
         }
     }
-    for unit in range1.clone() {
-        let item = &local.items[unit / intermediate];
-        let j = unit % intermediate;
-        let expert = &local.experts[item.expert as usize];
-        let block_elements = lease.block_elements();
-        let block = expert.gate_up.start / block_elements;
-        let data = lease.read(u32::try_from(block)?)?;
+    local.out_pairs.clear();
+    let block_elements = lease.block_elements();
+    let mut cursor1 = range1.start;
+    while cursor1 < range1.end {
+        let u = cursor1 / intermediate;
+        let j_start = cursor1 % intermediate;
+        let j_end = intermediate.min(j_start + (range1.end - cursor1));
+        cursor1 += j_end - j_start;
+        let group = local.groups[u];
+        let r_len = group.len as usize;
+        let group_items = &local.grouped_items[group.start as usize..][..r_len];
+        local.row_offsets.clear();
+        for item in group_items {
+            local.row_offsets.push(item.row as usize * hidden);
+        }
+        let expert = &local.experts[group.expert as usize];
+        let block_id = expert.gate_up.start / block_elements;
+        let data = lease.read(u32::try_from(block_id)?)?;
         let gate_up = &data[expert.gate_up.start % block_elements..]
             [..expert.gate_up.end - expert.gate_up.start];
-        let x = &local.hidden_f[item.row as usize * hidden..][..hidden];
-        let (gate, up) = if FP8 {
+        if FP8 {
             let slot = fp8_slot.context("FP8 worker slot missing")?;
             let bytes = native_bytes(gate_up);
-            let gate = &bytes[slot.gate.start as usize + j * hidden..][..hidden];
-            let up = &bytes[slot.up.start as usize + j * hidden..][..hidden];
-            let gate_scale = row_scale(&bytes[slot.gate_scale.start as usize..], j);
-            let up_scale = row_scale(&bytes[slot.up_scale.start as usize..], j);
-            unsafe {
-                (
-                    (arm.dot_e4m3)(x, gate, gate_scale),
-                    (arm.dot_e4m3)(x, up, up_scale),
-                )
+            let gate_base = &bytes[slot.gate.start as usize..];
+            let up_base = &bytes[slot.up.start as usize..];
+            let gate_scales = &bytes[slot.gate_scale.start as usize..];
+            let up_scales = &bytes[slot.up_scale.start as usize..];
+            for j in j_start..j_end {
+                let gate = &gate_base[j * hidden..][..hidden];
+                let up = &up_base[j * hidden..][..hidden];
+                let gate_scale = row_scale(gate_scales, j);
+                let up_scale = row_scale(up_scales, j);
+                unsafe {
+                    (arm.gate_up_e4m3)(
+                        &local.hidden_f,
+                        &local.row_offsets,
+                        gate,
+                        up,
+                        (gate_scale, up_scale),
+                        &mut local.pair_out[..r_len],
+                        &mut local.scratch_w[..hidden],
+                    );
+                }
+                for (r, item) in group_items.iter().enumerate() {
+                    let (gate, up) = local.pair_out[r];
+                    let gate = f32::from(bf16::from_f32(gate));
+                    let up = f32::from(bf16::from_f32(up));
+                    let activation = gate * (1.0 / (1.0 + (-gate).exp()));
+                    let product = match swiglu_rounding {
+                        SwigluRounding::Twice => f32::from(bf16::from_f32(activation)) * up,
+                        SwigluRounding::Once => activation * up,
+                    };
+                    let act = bf16::from_f32(product);
+                    local
+                        .out_pairs
+                        .push((item.item as usize * intermediate + j, act.to_bits()));
+                }
             }
         } else {
-            unsafe {
-                (
-                    (arm.dot)(x, &gate_up[j * expert.gate_up_stride..][..hidden]),
-                    (arm.dot)(
-                        x,
-                        &gate_up[(intermediate + j) * expert.gate_up_stride..][..hidden],
-                    ),
-                )
+            let stride = expert.gate_up_stride;
+            for j in j_start..j_end {
+                let gate = &gate_up[j * stride..][..hidden];
+                let up = &gate_up[(intermediate + j) * stride..][..hidden];
+                unsafe {
+                    (arm.gate_up)(
+                        &local.hidden_f,
+                        &local.row_offsets,
+                        gate,
+                        up,
+                        &mut local.pair_out[..r_len],
+                    );
+                }
+                for (r, item) in group_items.iter().enumerate() {
+                    let (gate, up) = local.pair_out[r];
+                    let gate = f32::from(bf16::from_f32(gate));
+                    let up = f32::from(bf16::from_f32(up));
+                    let activation = gate * (1.0 / (1.0 + (-gate).exp()));
+                    let product = match swiglu_rounding {
+                        SwigluRounding::Twice => f32::from(bf16::from_f32(activation)) * up,
+                        SwigluRounding::Once => activation * up,
+                    };
+                    let act = bf16::from_f32(product);
+                    local
+                        .out_pairs
+                        .push((item.item as usize * intermediate + j, act.to_bits()));
+                }
             }
-        };
-        let gate = bf16::from_f32(gate);
-        let up = bf16::from_f32(up);
-        let gate = f32::from(gate);
-        let up = f32::from(up);
-        let activation = gate * (1.0 / (1.0 + (-gate).exp()));
-        local.block[unit - range1.start] = bf16::from_f32(match swiglu_rounding {
-            crate::model_spec::SwigluRounding::Twice => f32::from(bf16::from_f32(activation)) * up,
-            crate::model_spec::SwigluRounding::Once => activation * up,
-        });
+        }
     }
     if shared.failed.load(Ordering::Acquire) {
         return Ok(());
     }
-    for (offset, value) in local.block[..range1.len()].iter().enumerate() {
-        shared.activated[range1.start + offset].store(value.to_bits(), Ordering::Relaxed);
+    for &(slot_idx, bits) in &local.out_pairs {
+        shared.activated[slot_idx].store(bits, Ordering::Relaxed);
     }
     shared.phase1.fetch_add(1, Ordering::Release);
     let mut spins = 0u32;
@@ -1553,72 +2313,101 @@ fn phases<const FP8: bool>(
     if shared.failed.load(Ordering::Acquire) {
         return Ok(());
     }
-    let total2 = items_len * hidden;
-    let range2 = block(index, workers, total2);
-    if range2.start < range2.end {
-        let first_item = range2.start / hidden;
-        let last_item = (range2.end - 1) / hidden;
-        let start = first_item * intermediate;
-        let end = (last_item + 1) * intermediate;
-        local.activated_bf.clear();
-        for slot in &shared.activated[start..end] {
-            local
-                .activated_bf
-                .push(bf16::from_bits(slot.load(Ordering::Relaxed)));
-        }
-        let mut cached = usize::MAX;
-        for unit in range2.clone() {
-            let item_index = unit / hidden;
-            if cached != item_index {
-                let start = (item_index - first_item) * intermediate;
-                for (value, source) in local
-                    .act_f
-                    .iter_mut()
-                    .zip(&local.activated_bf[start..start + intermediate])
-                {
-                    *value = f32::from(*source);
-                }
-                cached = item_index;
+    local.out_pairs.clear();
+    let range2 = block(index, workers, groups_len * hidden);
+    let mut cursor2 = range2.start;
+    while cursor2 < range2.end {
+        let u = cursor2 / hidden;
+        let k_start = cursor2 % hidden;
+        let k_end = hidden.min(k_start + (range2.end - cursor2));
+        cursor2 += k_end - k_start;
+        let group = local.groups[u];
+        let r_len = group.len as usize;
+        let group_items = &local.grouped_items[group.start as usize..][..r_len];
+        local.row_offsets.clear();
+        for (r, item) in group_items.iter().enumerate() {
+            let act_base = item.item as usize * intermediate;
+            let dst = &mut local.act_f[r * intermediate..][..intermediate];
+            for (val, src) in dst
+                .iter_mut()
+                .zip(&shared.activated[act_base..act_base + intermediate])
+            {
+                *val = f32::from(bf16::from_bits(src.load(Ordering::Relaxed)));
             }
-            let item = &local.items[item_index];
-            let expert = &local.experts[item.expert as usize];
-            let block = expert.down.start / lease.block_elements();
-            let data = lease.read(u32::try_from(block)?)?;
-            let down = &data[expert.down.start % lease.block_elements()..]
-                [..expert.down.end - expert.down.start];
-            let k = unit % hidden;
-            let value = if FP8 {
-                let slot = fp8_slot.context("FP8 worker slot missing")?;
-                let bytes = native_bytes(down);
-                let row = &bytes[slot.down.start as usize + k * intermediate..][..intermediate];
-                let scale = row_scale(&bytes[slot.down_scale.start as usize..], k);
-                unsafe { (arm.dot_e4m3)(&local.act_f, row, scale) }
-            } else {
+            local.row_offsets.push(r * intermediate);
+        }
+        let expert = &local.experts[group.expert as usize];
+        let block_id = expert.down.start / block_elements;
+        let data = lease.read(u32::try_from(block_id)?)?;
+        let down =
+            &data[expert.down.start % block_elements..][..expert.down.end - expert.down.start];
+        if FP8 {
+            let slot = fp8_slot.context("FP8 worker slot missing")?;
+            let bytes = native_bytes(down);
+            let down_base = &bytes[slot.down.start as usize..];
+            let down_scales = &bytes[slot.down_scale.start as usize..];
+            for k in k_start..k_end {
+                let row = &down_base[k * intermediate..][..intermediate];
+                let scale = row_scale(down_scales, k);
                 unsafe {
-                    (arm.dot)(
+                    (arm.down_rows_e4m3)(
                         &local.act_f,
-                        &down[k * expert.down_stride..][..intermediate],
-                    )
+                        &local.row_offsets,
+                        row,
+                        scale,
+                        &mut local.down_out[..r_len],
+                        &mut local.scratch_w[..intermediate],
+                    );
                 }
-            };
-            let weight = f32::from(item.weight);
-            let weighted = match shared.routed_weight {
-                crate::model_spec::RoutedWeightBoundary::AfterDownBf16 => {
-                    f32::from(bf16::from_f32(value)) * weight
+                for (r, item) in group_items.iter().enumerate() {
+                    let value = local.down_out[r];
+                    let weight = f32::from(item.weight);
+                    let scaled = match shared.routed_weight {
+                        RoutedWeightBoundary::AfterDownBf16 => {
+                            f32::from(bf16::from_f32(value)) * weight
+                        }
+                        RoutedWeightBoundary::BeforeContributionBf16 => value * weight,
+                    };
+                    let weighted = bf16::from_f32(scaled);
+                    local
+                        .out_pairs
+                        .push((item.choice as usize * hidden + k, weighted.to_bits()));
                 }
-                crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16 => value * weight,
-            };
-            local.block[unit - range2.start] = bf16::from_f32(weighted);
+            }
+        } else {
+            let stride = expert.down_stride;
+            for k in k_start..k_end {
+                let row = &down[k * stride..][..intermediate];
+                unsafe {
+                    (arm.down_rows)(
+                        &local.act_f,
+                        &local.row_offsets,
+                        row,
+                        &mut local.down_out[..r_len],
+                    );
+                }
+                for (r, item) in group_items.iter().enumerate() {
+                    let value = local.down_out[r];
+                    let weight = f32::from(item.weight);
+                    let scaled = match shared.routed_weight {
+                        RoutedWeightBoundary::AfterDownBf16 => {
+                            f32::from(bf16::from_f32(value)) * weight
+                        }
+                        RoutedWeightBoundary::BeforeContributionBf16 => value * weight,
+                    };
+                    let weighted = bf16::from_f32(scaled);
+                    local
+                        .out_pairs
+                        .push((item.choice as usize * hidden + k, weighted.to_bits()));
+                }
+            }
         }
     }
     if shared.failed.load(Ordering::Acquire) {
         return Ok(());
     }
-    for (offset, unit) in range2.clone().enumerate() {
-        let item = &local.items[unit / hidden];
-        let k = unit % hidden;
-        shared.out[item.choice as usize * hidden + k]
-            .store(local.block[offset].to_bits(), Ordering::Relaxed);
+    for &(slot_idx, bits) in &local.out_pairs {
+        shared.out[slot_idx].store(bits, Ordering::Relaxed);
     }
     Ok(())
 }
@@ -3235,6 +4024,270 @@ mod tests {
                 })
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn t28_1_pool_multi_row_bitwise_and_lane_mutant_control() -> Result<()> {
+        #[cfg(target_arch = "x86_64")]
+        if Isa::Avx2.available() {
+            let codes: Vec<u8> = (0u8..=255).collect();
+            for chunk in codes.as_chunks::<16>().0 {
+                let mut lo = [0.0f32; 8];
+                let mut hi = [0.0f32; 8];
+                unsafe {
+                    let (v0, v1) = x86::decode16_vpshufb(chunk.as_ptr());
+                    std::arch::x86_64::_mm256_storeu_ps(lo.as_mut_ptr(), v0);
+                    std::arch::x86_64::_mm256_storeu_ps(hi.as_mut_ptr(), v1);
+                }
+                for i in 0..8 {
+                    let expected_lo = crate::fp8::decode_e4m3(chunk[i]);
+                    let expected_hi = crate::fp8::decode_e4m3(chunk[8 + i]);
+                    if expected_lo.is_nan() {
+                        assert!(lo[i].is_nan(), "code={:#04x}", chunk[i]);
+                    } else {
+                        assert_eq!(
+                            lo[i].to_bits(),
+                            expected_lo.to_bits(),
+                            "code={:#04x}",
+                            chunk[i]
+                        );
+                    }
+                    if expected_hi.is_nan() {
+                        assert!(hi[i].is_nan(), "code={:#04x}", chunk[8 + i]);
+                    } else {
+                        assert_eq!(
+                            hi[i].to_bits(),
+                            expected_hi.to_bits(),
+                            "code={:#04x}",
+                            chunk[8 + i]
+                        );
+                    }
+                }
+            }
+        }
+        let mut bf16_bit_mismatches = 0usize;
+        let mut fp8_bit_mismatches = 0usize;
+        let mut bf16_mutant_mismatches = 0usize;
+        let mut fp8_mutant_mismatches = 0usize;
+
+        for shape in [production_shape(), Shape::new(40, 24)?] {
+            let bf16_arena = build_arena(&shape, 4);
+            let bf16_flat = arena_flat(&bf16_arena);
+            let bf16_experts: Vec<_> = (0..4).map(|e| weights(&shape, e)).collect();
+
+            let (fp8_codes, fp8_slot) = fp8_fixture(&shape);
+            let fp8_layout = ExpertLayout::Fp8W8a16(fp8_slot.clone());
+            let fp8_per = fp8_codes.len() / 2;
+            let fp8_arena = HostBlocks::new(4, fp8_per)?;
+            let mut fp8_slots_bytes = Vec::with_capacity(4);
+            for block in 0..4u32 {
+                let mut mutated = fp8_codes.clone();
+                for (idx, b) in mutated[..3 * shape.hidden * shape.intermediate]
+                    .iter_mut()
+                    .enumerate()
+                {
+                    *b = (((idx * 37 + 11 + block as usize * 13) % 64) as u8)
+                        | ((((idx / 7 + block as usize) & 1) as u8) << 7);
+                }
+                let mut claim = fp8_arena.claim(block)?;
+                for (dst, bytes) in claim.slice()?.iter_mut().zip(mutated.as_chunks::<2>().0) {
+                    *dst = bf16::from_le_bytes(*bytes);
+                }
+                fp8_slots_bytes.push(mutated);
+            }
+            let fp8_experts = (0..4u32)
+                .map(|block| {
+                    ExpertWeights::from_slot(shape, fp8_arena.block_range(block)?, &fp8_layout)
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let max_rows = 10usize;
+            let hidden: Vec<bf16> = (0..max_rows)
+                .flat_map(|row| hidden_row(&shape, row))
+                .collect();
+            let mut scratch = Scratch::new(&shape);
+
+            for rows in [1usize, 2, 3, 5, 8, 10] {
+                let mut assignments = Vec::new();
+                let mut choice = 0u32;
+                for r in 0..rows {
+                    assignments.push(Assignment {
+                        row: r as u32,
+                        choice,
+                        expert: 0,
+                        weight: bf16::from_f32(0.125 + 0.0625 * (r as f32)),
+                    });
+                    choice += 1;
+                }
+                for r in 0..rows.min(3) {
+                    assignments.push(Assignment {
+                        row: r as u32,
+                        choice,
+                        expert: 1,
+                        weight: bf16::from_f32(-0.25 + 0.0625 * (r as f32)),
+                    });
+                    choice += 1;
+                }
+                for r in 0..rows.min(2) {
+                    assignments.push(Assignment {
+                        row: (rows - 1 - r) as u32,
+                        choice,
+                        expert: 2,
+                        weight: bf16::from_f32(0.5 - 0.125 * (r as f32)),
+                    });
+                    choice += 1;
+                }
+                assignments.push(Assignment {
+                    row: (rows / 2) as u32,
+                    choice,
+                    expert: 3,
+                    weight: bf16::from_f32(0.375),
+                });
+
+                let mut expected_bf16 = vec![bf16::ZERO; assignments.len() * shape.hidden];
+                let mut expected_fp8 = vec![bf16::ZERO; assignments.len() * shape.hidden];
+                for item in &assignments {
+                    let row_slice = &hidden[item.row as usize * shape.hidden..][..shape.hidden];
+                    contribution(
+                        Isa::Scalar,
+                        Contribution {
+                            shape: &shape,
+                            arena: &bf16_flat,
+                            weights: &bf16_experts[item.expert as usize],
+                            hidden: row_slice,
+                            routing: item.weight,
+                            rounding: crate::model_spec::SwigluRounding::Twice,
+                            routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+                        },
+                        &mut expected_bf16[item.choice as usize * shape.hidden..][..shape.hidden],
+                        &mut scratch,
+                    )?;
+                    fp8_contribution(
+                        Isa::Scalar,
+                        Fp8Contribution {
+                            shape: &shape,
+                            slot: &fp8_slots_bytes[item.expert as usize],
+                            slot_layout: &fp8_slot,
+                            hidden: row_slice,
+                            routing: item.weight,
+                            rounding: crate::model_spec::SwigluRounding::Twice,
+                            routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+                        },
+                        &mut expected_fp8[item.choice as usize * shape.hidden..][..shape.hidden],
+                        &mut scratch,
+                    )?;
+                }
+
+                for workers in [1usize, 4] {
+                    let bf16_pool = ExpertPool::new(workers, shape, rows, assignments.len(), None)?;
+                    let mut out_bf16 = vec![bf16::ZERO; expected_bf16.len()];
+                    bf16_pool.run(Job {
+                        arena: bf16_arena.clone(),
+                        hidden: &hidden[..rows * shape.hidden],
+                        rows,
+                        experts: &bf16_experts,
+                        assignments: &assignments,
+                        out: &mut out_bf16,
+                    })?;
+                    bf16_bit_mismatches += out_bf16
+                        .iter()
+                        .zip(&expected_bf16)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+
+                    let fp8_pool = ExpertPool::new(
+                        workers,
+                        shape,
+                        rows,
+                        assignments.len(),
+                        Some(fp8_slot.clone()),
+                    )?;
+                    let mut out_fp8 = vec![bf16::ZERO; expected_fp8.len()];
+                    fp8_pool.run(Job {
+                        arena: fp8_arena.clone(),
+                        hidden: &hidden[..rows * shape.hidden],
+                        rows,
+                        experts: &fp8_experts,
+                        assignments: &assignments,
+                        out: &mut out_fp8,
+                    })?;
+                    fp8_bit_mismatches += out_fp8
+                        .iter()
+                        .zip(&expected_fp8)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+
+                    if shape == production_shape() && rows == 1 && workers == 1 {
+                        // Adjacent-lane weight permutation (k ^ 1) run through ExpertPool/Arm.
+                        let bf16_mutant_arena = build_arena(&shape, 4);
+                        {
+                            let mut claim = bf16_mutant_arena.claim(0)?;
+                            let slice = claim.slice()?;
+                            for pair in slice.as_chunks_mut::<2>().0 {
+                                pair.swap(0, 1);
+                            }
+                        }
+                        let mut out_bf16_mutant = vec![bf16::ZERO; expected_bf16.len()];
+                        bf16_pool.run(Job {
+                            arena: bf16_mutant_arena,
+                            hidden: &hidden[..rows * shape.hidden],
+                            rows,
+                            experts: &bf16_experts,
+                            assignments: &assignments,
+                            out: &mut out_bf16_mutant,
+                        })?;
+                        bf16_mutant_mismatches = out_bf16_mutant
+                            .iter()
+                            .zip(&expected_bf16)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+
+                        let fp8_mutant_arena = HostBlocks::new(4, fp8_per)?;
+                        for (block, bytes) in fp8_slots_bytes.iter().enumerate() {
+                            let mut mutated = bytes.clone();
+                            if block == 0 {
+                                for pair in mutated[..3 * shape.hidden * shape.intermediate]
+                                    .as_chunks_mut::<2>()
+                                    .0
+                                {
+                                    pair.swap(0, 1);
+                                }
+                            }
+                            let mut claim = fp8_mutant_arena.claim(block as u32)?;
+                            for (dst, pair) in
+                                claim.slice()?.iter_mut().zip(mutated.as_chunks::<2>().0)
+                            {
+                                *dst = bf16::from_le_bytes(*pair);
+                            }
+                        }
+                        let mut out_fp8_mutant = vec![bf16::ZERO; expected_fp8.len()];
+                        fp8_pool.run(Job {
+                            arena: fp8_mutant_arena,
+                            hidden: &hidden[..rows * shape.hidden],
+                            rows,
+                            experts: &fp8_experts,
+                            assignments: &assignments,
+                            out: &mut out_fp8_mutant,
+                        })?;
+                        fp8_mutant_mismatches = out_fp8_mutant
+                            .iter()
+                            .zip(&expected_fp8)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                    }
+                }
+            }
+        }
+        assert_eq!(bf16_bit_mismatches, 0, "BF16 multi-row bitwise mismatches");
+        assert_eq!(fp8_bit_mismatches, 0, "FP8 multi-row bitwise mismatches");
+        assert!(
+            bf16_mutant_mismatches > 0 && fp8_mutant_mismatches > 0,
+            "lane-permutation mutant control through ExpertPool must fail: bf16={bf16_mutant_mismatches} fp8={fp8_mutant_mismatches}"
+        );
+        println!(
+            "PASS T28_1_MULTI_ROW_GATE stored_gate_up=[1024,2048],[48,40] stored_down=[2048,512],[40,24] rows=1,2,3,5,8,10 R_e=1,2,3,5,8,10 bf16_bit_mismatches={bf16_bit_mismatches} fp8_bit_mismatches={fp8_bit_mismatches} bf16_mutant_mismatches={bf16_mutant_mismatches} fp8_mutant_mismatches={fp8_mutant_mismatches}"
+        );
         Ok(())
     }
 }
