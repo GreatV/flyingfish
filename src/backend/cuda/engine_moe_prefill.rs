@@ -26,6 +26,10 @@ fn route_trace_prefix(all_layers: bool, prefix: &str, layer: usize, base: usize)
     }
 }
 
+fn trace_layer_selected(all_layers: bool, layer: usize, trace_layer: usize) -> bool {
+    all_layers || layer == trace_layer
+}
+
 struct Span {
     base: u64,
     layout: ExpertSpanLayout,
@@ -1217,6 +1221,7 @@ impl Engine {
                 )?;
             }
             for layer in 0..self.model_spec.layers.len() {
+                let selected_layer = trace_layer_selected(all_layers, layer, self.trace_layer);
                 for (base, rows, skip, selected, prefix) in waves.iter() {
                     let step = self.moe_wave(span_start + base, *rows)?;
                     self.select_qwen_positions()?;
@@ -1248,7 +1253,7 @@ impl Engine {
                             )?,
                         )?;
                     }
-                    let mut target = if *selected {
+                    let mut target = if *selected && selected_layer {
                         trace.as_deref_mut().map(|trace| Target {
                             trace,
                             prefix,
@@ -1448,7 +1453,7 @@ impl Engine {
                             span.hidden(&span.layout.normalized, base as u32, rows as u32)?,
                         )?;
                     }
-                    if selected {
+                    if selected && selected_layer {
                         let mut target = trace.as_deref_mut().map(|trace| Target {
                             trace,
                             prefix,
@@ -2088,6 +2093,42 @@ mod tests {
             trace.add(format!("{prefix}.moe.ids"), vec![1, 6], vec![1.0; 6])?;
         }
         assert_eq!(route_trace_prefix(false, "prefill.2", 13, 256), "prefill.2");
+        Ok(())
+    }
+
+    #[test]
+    fn non_all_layer_trace_records_only_the_selected_layer() -> Result<()> {
+        let mut trace = Trace::default();
+        let names = [
+            "debug.norm1",
+            "moe.ids",
+            "moe.weights",
+            "moe.cpu",
+            "moe.contributions",
+            "ffn",
+        ];
+        for layer in [13, 14] {
+            if trace_layer_selected(false, layer, 13) {
+                let prefix = route_trace_prefix(false, "prefill.2", layer, 256);
+                for name in names {
+                    trace.add(format!("{prefix}.{name}"), vec![1, 6], vec![1.0; 6])?;
+                }
+            }
+        }
+        for name in names {
+            let tensor = format!("prefill.2.{name}");
+            assert_eq!(trace.shape(&tensor)?, &[1, 6]);
+            assert_eq!(trace.values(&tensor)?, vec![1.0; 6]);
+        }
+        let duplicate = route_trace_prefix(false, "prefill.2", 14, 256);
+        for name in names {
+            assert!(
+                trace
+                    .add(format!("{duplicate}.{name}"), vec![1, 6], vec![1.0; 6])
+                    .is_err(),
+                "non-all-layer trace wrote unselected layer {name}"
+            );
+        }
         Ok(())
     }
 
