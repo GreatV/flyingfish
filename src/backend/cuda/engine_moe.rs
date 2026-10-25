@@ -29,6 +29,7 @@ pub(super) struct Setup {
     measured: super::super::calibrate::ExpertCalibration,
     catalogue: Arc<crate::experts::catalogue::ExpertCatalogue>,
     decode_rows: usize,
+    routed_wave_rows: u32,
 }
 
 fn decode_device_bytes(
@@ -93,6 +94,78 @@ fn host_workspace(
         .and_then(|n| n.checked_add(mailboxes))
         .and_then(|n| n.checked_add(disk))
         .context("expert host workspace overflow")
+}
+
+fn routed_wave_rows(
+    geometry: ExpertGeometry,
+    capacity: &crate::experts::plan::Capacity,
+    workspace_rows: usize,
+    shared: (u32, crate::model_spec::RoutedWeightBoundary),
+) -> Result<(u32, u64)> {
+    use super::super::moe::prefill::{W8A16_TILE_ROWS, prefill_scratch_bytes_mixed_with_boundary};
+    let Some(fp8) = capacity.layout.fp8_slot() else {
+        return Ok((capacity.wave_rows, 0));
+    };
+    let slots = u64::from(geometry.layers) * u64::from(geometry.experts);
+    if u64::from(capacity.slots_total()) != slots {
+        return Ok((capacity.wave_rows, 0));
+    }
+    ensure!(
+        geometry.top_k > 0
+            && capacity.wave_rows > 0
+            && capacity.wave_rows <= capacity.span_rows
+            && capacity.wave_rows as usize <= workspace_rows,
+        "invalid resident routed wave geometry"
+    );
+    let available = capacity
+        .device_expert_bytes
+        .checked_sub(
+            slots
+                .checked_mul(capacity.slot_bytes())
+                .context("resident expert bytes overflow")?,
+        )
+        .context("resident expert slots exceed device budget")?;
+    let target = u64::from(geometry.experts)
+        .checked_mul(u64::from(W8A16_TILE_ROWS))
+        .context("resident routed tile extent overflow")?
+        .div_ceil(u64::from(geometry.top_k))
+        .max(u64::from(capacity.wave_rows))
+        .min(u64::from(capacity.span_rows))
+        .min(u64::try_from(workspace_rows)?);
+    let alignment = 8u32 >> geometry.top_k.trailing_zeros().min(3);
+    ensure!(
+        capacity.wave_rows.is_multiple_of(alignment),
+        "resident routed wave is not BF16 pointer aligned"
+    );
+    let scratch = |rows: u32| {
+        prefill_scratch_bytes_mixed_with_boundary(
+            rows as usize,
+            capacity.span_rows as usize,
+            geometry.top_k as usize,
+            geometry.experts as usize,
+            geometry.hidden as usize,
+            (geometry.intermediate as usize, shared.0 as usize),
+            (Some(fp8), shared.1),
+        )
+    };
+    let baseline = scratch(capacity.wave_rows)?;
+    let (mut low, mut high) = (
+        capacity.wave_rows / alignment,
+        u32::try_from(target)? / alignment,
+    );
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        let extra = scratch(mid * alignment)?
+            .checked_sub(baseline)
+            .context("resident routed scratch is not monotone")?;
+        if extra <= available {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    let rows = low * alignment;
+    Ok((rows, scratch(rows)? - baseline))
 }
 
 impl Setup {
@@ -283,7 +356,7 @@ impl Setup {
         );
         let registration = measured.host_registration_bytes;
         let first = &candidates[0].candidate;
-        let (index, capacity, admission) = ExpertWorkspaceBudget::select(
+        let (index, mut capacity, admission) = ExpertWorkspaceBudget::select(
             &PlanInputs {
                 geometry,
                 layout: catalogue.layout().clone(),
@@ -302,7 +375,28 @@ impl Setup {
             u32::try_from(request.capacity)?,
             &candidates,
         )?;
-        let workspace = candidates.swap_remove(index);
+        let mut workspace = candidates.swap_remove(index);
+        let (routed_wave_rows, extra_scratch) = routed_wave_rows(
+            geometry,
+            &capacity,
+            workspace.workspace_rows,
+            (shared_intermediate, model.routed_weight_boundary()),
+        )?;
+        workspace.candidate.reserves.device_fixed_bytes = workspace
+            .candidate
+            .reserves
+            .device_fixed_bytes
+            .checked_add(extra_scratch)
+            .context("resident routed fixed reserve overflow")?;
+        workspace.mixer.planned_transient_bytes = workspace
+            .mixer
+            .planned_transient_bytes
+            .checked_add(usize::try_from(extra_scratch)?)
+            .context("resident routed workspace overflow")?;
+        capacity.device_expert_bytes = capacity
+            .device_expert_bytes
+            .checked_sub(extra_scratch)
+            .context("resident routed scratch exceeds device budget")?;
         let cpu = residency::cpu_bound(
             geometry,
             capacity.slot_bytes(),
@@ -314,6 +408,7 @@ impl Setup {
             "{}",
             serde_json::json!({"expert_memory_plan": {
                 "span_rows":capacity.span_rows,"wave_rows":capacity.wave_rows,
+                "routed_wave_rows":routed_wave_rows,"routed_extra_scratch_bytes":extra_scratch,
                 "mixer_rows":workspace.mixer.plan.chunk,"workspace_rows":workspace.workspace_rows,
                 "borrowed_slots":workspace.borrowed_slots,"slots_per_layer":capacity.slots_per_layer,
                 "host_blocks":capacity.host_blocks,"spare_blocks":capacity.spare_blocks,
@@ -346,6 +441,7 @@ impl Setup {
             measured,
             catalogue,
             decode_rows,
+            routed_wave_rows,
         })
     }
 
@@ -426,6 +522,7 @@ impl Setup {
                     .shared_intermediate,
                 self.workspace.workspace_rows,
                 self.workspace.mixer.plan.chunk,
+                self.routed_wave_rows,
                 engine.model_spec.routed_weight_boundary(),
             ),
         )?);

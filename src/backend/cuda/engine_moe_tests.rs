@@ -3,6 +3,176 @@ use crate::backend::cuda::moe::reference::{MoeDims, MoeFixture, fixture};
 use crate::experts::plan::Capacity;
 
 #[test]
+fn resident_routed_wave_preserves_slots_and_shared_rows() -> Result<()> {
+    use crate::experts::{catalogue::ExpertLayout, plan::equal_slots};
+    use crate::model_spec::ExpertFormat;
+    let model = crate::model_spec::ModelSpec::minicpm(
+        &serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/minicpm-config.json"
+        )))?,
+        &serde_json::json!({"eos_token_id": [248044, 248046]}),
+    )?;
+    let geometry = ExpertGeometry::from_model(&model)?;
+    let shared = (
+        model
+            .moe
+            .context("MiniCPM MoE geometry missing")?
+            .shared_intermediate,
+        model.routed_weight_boundary(),
+    );
+    assert_eq!(shared.0, geometry.intermediate);
+    assert_eq!(
+        (geometry.experts, geometry.top_k, geometry.hidden),
+        (256, 8, 2048)
+    );
+    let layout = ExpertLayout::new(ExpertFormat::Fp8W8a16, &geometry)?;
+    use crate::backend::cuda::moe::prefill::{
+        prefill_scratch_bytes, prefill_scratch_bytes_mixed_with_boundary,
+    };
+    for rows in [16, 2048] {
+        assert_eq!(
+            prefill_scratch_bytes(rows, 16640, 8, 256, 2048, 512, layout.fp8_slot())?,
+            prefill_scratch_bytes_mixed_with_boundary(
+                rows,
+                16640,
+                8,
+                256,
+                2048,
+                (512, shared.0 as usize),
+                (layout.fp8_slot(), shared.1),
+            )?,
+        );
+    }
+    let resident_bytes = layout.slot_bytes() * 10240;
+    let mut capacity = Capacity {
+        layout,
+        span_rows: 16640,
+        wave_rows: 16,
+        device_expert_bytes: resident_bytes + 197_676_800,
+        host_expert_bytes: 1 << 30,
+        slots_per_layer: vec![256; 40],
+        host_blocks: 218,
+        spare_blocks: 0,
+        disk_bytes: 0,
+        worker_count: 16,
+        disk_workers: 0,
+        prefill_staging_slots: 2,
+        pinned: true,
+    };
+    for (span_rows, workspace_rows) in [(4352, 4096), (16640, 16384)] {
+        capacity.span_rows = span_rows;
+        let (rows, extra) = routed_wave_rows(geometry, &capacity, workspace_rows, shared)?;
+        assert_eq!((rows, extra), (2048, 197_676_800));
+        assert_eq!(capacity.device_expert_bytes - extra, resident_bytes);
+        assert_eq!(capacity.wave_rows, 16);
+        assert_eq!(capacity.slots_per_layer, vec![256; 40]);
+    }
+    for boundary in [
+        crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+        crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16,
+    ] {
+        let mixed_scratch = |rows| {
+            prefill_scratch_bytes_mixed_with_boundary(
+                rows,
+                16640,
+                8,
+                256,
+                2048,
+                (512, 1024),
+                (capacity.layout.fp8_slot(), boundary),
+            )
+        };
+        let extra = mixed_scratch(2048)? - mixed_scratch(16)?;
+        assert_ne!(extra, 197_676_800);
+        capacity.device_expert_bytes = resident_bytes + extra;
+        assert_eq!(
+            routed_wave_rows(geometry, &capacity, 16384, (1024, boundary))?,
+            (2048, extra),
+        );
+    }
+    capacity.device_expert_bytes = resident_bytes + 197_676_800;
+    capacity.device_expert_bytes -= 1;
+    let (rows, extra) = routed_wave_rows(geometry, &capacity, 16384, shared)?;
+    assert_eq!(rows, 2047);
+    assert!(capacity.device_expert_bytes - extra >= resident_bytes);
+    capacity.device_expert_bytes = resident_bytes;
+    assert_eq!(
+        routed_wave_rows(geometry, &capacity, 16384, shared)?,
+        (16, 0)
+    );
+    capacity.device_expert_bytes = resident_bytes - 1;
+    assert!(routed_wave_rows(geometry, &capacity, 16384, shared).is_err());
+    capacity.device_expert_bytes = resident_bytes + (1 << 30);
+    assert!(
+        routed_wave_rows(
+            ExpertGeometry {
+                top_k: 0,
+                ..geometry
+            },
+            &capacity,
+            16384,
+            shared
+        )
+        .is_err()
+    );
+    assert_eq!(
+        routed_wave_rows(
+            ExpertGeometry {
+                top_k: 3,
+                ..geometry
+            },
+            &capacity,
+            16384,
+            shared
+        )?
+        .0,
+        5456
+    );
+    assert_eq!(routed_wave_rows(geometry, &capacity, 1024, shared)?.0, 1024);
+    capacity.span_rows = 1023;
+    assert_eq!(routed_wave_rows(geometry, &capacity, 4096, shared)?.0, 1023);
+    capacity.span_rows = 16640;
+    capacity.wave_rows = 4096;
+    assert_eq!(
+        routed_wave_rows(geometry, &capacity, 16384, shared)?,
+        (4096, 0)
+    );
+    assert!(routed_wave_rows(geometry, &capacity, 2048, shared).is_err());
+    capacity.wave_rows = 256;
+    for (format, span, workspace, slots, host, spare) in [
+        (ExpertFormat::Fp8W8a16, 2144, 2048, 4889, 10240, 0),
+        (ExpertFormat::Fp8W8a16, 16352, 8192, 4550, 10240, 0),
+        (ExpertFormat::Bf16, 2144, 2048, 2411, 7844, 14),
+        (ExpertFormat::Bf16, 16352, 8192, 2246, 8101, 14),
+    ] {
+        capacity.layout = ExpertLayout::new(format, &geometry)?;
+        capacity.span_rows = span;
+        capacity.slots_per_layer = equal_slots(slots, geometry.layers)?;
+        capacity.device_expert_bytes = slots * capacity.slot_bytes();
+        capacity.host_blocks = host;
+        capacity.spare_blocks = spare;
+        assert_eq!(
+            routed_wave_rows(geometry, &capacity, workspace, shared)?,
+            (256, 0)
+        );
+        println!(
+            "PASS routed_wave_partial_replay format={format:?} span={span} workspace={workspace} slots={slots} shared_rows=256 routed_rows=256 extra_bytes=0"
+        );
+    }
+    capacity.slots_per_layer = vec![256; 40];
+    capacity.device_expert_bytes = 10240 * capacity.slot_bytes() + (1 << 30);
+    assert_eq!(
+        routed_wave_rows(geometry, &capacity, 8192, shared)?,
+        (256, 0)
+    );
+    println!(
+        "PASS routed_wave_full_resident target_rows=2048 shared_rows=16 extra_bytes=197676800 exact_budget=true boundary_minus_one_rows=2047 non_fp8_unchanged=true"
+    );
+    Ok(())
+}
+
+#[test]
 fn decode_phase_reset_recovers_after_completion_errors() -> Result<()> {
     let mut phase = DecodePhase::default();
     for rows in [1, 8, 16] {
@@ -876,6 +1046,7 @@ impl Engine {
                         .shared_intermediate,
                     workspace_rows,
                     8,
+                    capacity.wave_rows,
                     model_spec.routed_weight_boundary(),
                 ),
             )?)
