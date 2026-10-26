@@ -2687,6 +2687,79 @@ fn minicpm_chain_decode_gpu() -> Result<()> {
 }
 
 #[test]
+#[ignore = "exclusive CUDA; FF_MODEL, FLYINGFISH_RUNTIME_DIR and FF_FLINT_PASSAGE required"]
+fn flint_ttft_timing_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let target = PathBuf::from(std::env::var("FF_MODEL")?);
+    let runtime = PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
+    let passage = PathBuf::from(std::env::var("FF_FLINT_PASSAGE")?);
+    let source: serde_json::Value = serde_json::from_slice(&std::fs::read(passage)?)?;
+    let source = source["input_ids"]
+        .as_array()
+        .context("Flint timing passage has no input_ids")?
+        .iter()
+        .map(|value| value.as_u64().and_then(|v| u32::try_from(v).ok()))
+        .collect::<Option<Vec<_>>>()
+        .context("invalid Flint timing token id")?;
+    ensure!(!source.is_empty(), "empty Flint timing passage");
+    let row_cases: Vec<usize> = std::env::var("FF_FLINT_TIMING_ROWS")
+        .map(|value| {
+            value
+                .split(',')
+                .map(|part| part.parse::<usize>().context("invalid timing row count"))
+                .collect::<Result<Vec<_>>>()
+        })
+        .unwrap_or(Ok(vec![2048, 16384]))?;
+    ensure!(
+        row_cases.iter().all(|&rows| rows > 0 && rows <= 16384),
+        "timing rows must be positive and no greater than 16384"
+    );
+    let settings = Settings {
+        runtime_dir: Some(runtime),
+        prefix_cache: false,
+        draft_model: None,
+        tree_builder: TreeBuilder::Serial,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: false,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    let mut model = crate::backend::Backend::calibrate(&target, 0, 16384, None, settings)?
+        .context("Flint TTFT calibration missing")?;
+    for rows in row_cases {
+        let ids: Vec<_> = source.iter().cycle().take(rows).copied().collect();
+        for run in 0..2 {
+            model.reset()?;
+            let timer = Instant::now();
+            let first = model.prefill(&ids, None)?;
+            model.synchronize()?;
+            let ttft_seconds = timer.elapsed().as_secs_f64();
+            ensure!(
+                ttft_seconds.is_finite() && ttft_seconds > 0.0,
+                "invalid Flint TTFT"
+            );
+            model.check_logits()?;
+            println!(
+                "PASS flint_ttft_timing {}",
+                serde_json::json!({
+                    "case": rows,
+                    "input_layout": [1, rows],
+                    "run": run,
+                    "measured": run == 1,
+                    "ttft_seconds": ttft_seconds,
+                    "first_token": first,
+                    "chunk": model.chunk(),
+                    "graph_decode": false
+                })
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "exclusive CUDA; native BF16 fixtures and pinned runtime/decode-prefix.json"]
 fn minicpm_gdn_workspace_timing_gpu() -> Result<()> {
     ensure!(

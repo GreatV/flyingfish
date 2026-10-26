@@ -1064,6 +1064,7 @@ impl Engine {
             moe_slots: Some(slots),
             moe_prefill,
             moe_test_ffn: Some(ffn),
+            #[cfg(test)]
             flint_legacy_overflow_prefill: false,
             flint_frozen_decode_length: false,
             mtp: None,

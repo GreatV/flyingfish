@@ -41,7 +41,7 @@ mod mtp_generate;
 #[path = "engine_mtp_launch_tests.rs"]
 mod mtp_launch_tests;
 #[path = "engine_qwen.rs"]
-mod qwen;
+pub(crate) mod qwen;
 #[path = "engine_vision.rs"]
 mod vision_runtime;
 
@@ -570,6 +570,7 @@ pub struct Engine {
     moe_prefill: Option<moe::Prefill>,
     #[cfg(test)]
     moe_test_ffn: Option<super::linear::BoundFfn>,
+    #[cfg(test)]
     flint_legacy_overflow_prefill: bool,
     flint_frozen_decode_length: bool,
     mtp: Option<mtp::Chain>,
@@ -996,6 +997,7 @@ impl Engine {
             moe_prefill: None,
             #[cfg(test)]
             moe_test_ffn: None,
+            #[cfg(test)]
             flint_legacy_overflow_prefill: false,
             flint_frozen_decode_length: false,
             mtp: None,
