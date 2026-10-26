@@ -30,6 +30,7 @@ pub struct SpanPlan {
     geometry: ExpertGeometry,
     slot_bytes: u64,
     staging_slots: u32,
+    resident_group_size: u32,
     workers: u32,
     resident: Vec<u32>,
     staged: Vec<u32>,
@@ -55,6 +56,7 @@ impl SpanPlan {
         ensure!(slot_bytes > 0, "zero expert slot bytes");
         ensure!(staging_slots > 0, "zero prefill staging slots");
         ensure!(workers > 0, "zero service workers");
+        ensure!(geometry.experts > 0, "zero span experts");
         let experts = geometry.experts as usize;
         let max_cohorts = experts.div_ceil(staging_slots as usize) + 1;
         Ok(Self {
@@ -65,6 +67,7 @@ impl SpanPlan {
             geometry: *geometry,
             slot_bytes,
             staging_slots,
+            resident_group_size: geometry.experts,
             workers,
             resident: Vec::with_capacity(experts),
             staged: Vec::with_capacity(experts),
@@ -77,6 +80,17 @@ impl SpanPlan {
             wave_offsets: Vec::with_capacity(max_cohorts + 1),
             packed_waves: Vec::new(),
         })
+    }
+
+    pub fn with_resident_group_size(mut self, experts: u32) -> Result<Self> {
+        ensure!(
+            experts >= self.staging_slots.min(self.geometry.experts)
+                && experts > 0
+                && experts <= self.geometry.experts,
+            "resident group size {experts} outside staging/geometry bounds"
+        );
+        self.resident_group_size = experts;
+        Ok(self)
     }
 
     /// Rewrites the reusable cohorts from routed row counts and current residency.
@@ -190,7 +204,12 @@ impl SpanPlan {
             "routed ids hold {} choices, expected {choices}",
             ids.len()
         );
-        let num_cohorts = 1 + self.cohort_count() as usize;
+        let resident_cohorts = self.resident_cohort_count();
+        let num_cohorts = resident_cohorts + self.cohort_count() as usize;
+        ensure!(
+            num_cohorts <= experts.div_ceil(self.staging_slots as usize) + 1,
+            "resident/staged cohorts exceed the setup allocation"
+        );
         let weight_row_bytes = top_k * 2;
         let row_alignment = match weight_row_bytes % 16 {
             0 => 1,
@@ -200,25 +219,34 @@ impl SpanPlan {
             _ => 16,
         };
         self.expert_cohort.fill(u16::MAX);
-        for &expert in &self.resident {
-            self.expert_cohort[expert as usize] = 0;
+        for (cohort, chunk) in self
+            .resident
+            .chunks(self.resident_group_size as usize)
+            .enumerate()
+        {
+            let tag = u16::try_from(cohort).context("resident cohort index exceeds u16")?;
+            for &expert in chunk {
+                self.expert_cohort[expert as usize] = tag;
+            }
         }
         for (cohort, chunk) in self.staged.chunks(self.staging_slots as usize).enumerate() {
-            let tag = u16::try_from(cohort + 1).context("cohort index exceeds u16")?;
+            let tag =
+                u16::try_from(cohort + resident_cohorts).context("cohort index exceeds u16")?;
             for &expert in chunk {
                 self.expert_cohort[expert as usize] = tag;
             }
         }
         self.cohort_offsets.clear();
         self.cohort_offsets.push(0);
-        let resident_total: usize = self
+        let mut total = 0usize;
+        for chunk in self
             .resident
-            .iter()
-            .map(|&expert| counts[expert as usize] as usize)
-            .sum();
-        self.cohort_offsets.push(resident_total);
-        let mut total = resident_total;
-        for chunk in self.staged.chunks(self.staging_slots as usize) {
+            .chunks(self.resident_group_size as usize)
+            .chain(self.staged.chunks(self.staging_slots as usize))
+        {
+            if self.resident.is_empty() && self.cohort_offsets.len() == 1 {
+                self.cohort_offsets.push(0);
+            }
             let cohort_total: usize = chunk
                 .iter()
                 .map(|&expert| counts[expert as usize] as usize)
@@ -227,6 +255,9 @@ impl SpanPlan {
                 .checked_add(cohort_total)
                 .context("cohort assignment offset overflow")?;
             self.cohort_offsets.push(total);
+        }
+        if self.resident.is_empty() && self.staged.is_empty() {
+            self.cohort_offsets.push(0);
         }
         self.cohort_cursor.clear();
         self.cohort_cursor
@@ -331,6 +362,17 @@ impl SpanPlan {
 
     pub fn resident(&self) -> &[u32] {
         &self.resident
+    }
+
+    pub fn resident_cohorts(&self) -> impl Iterator<Item = &[u32]> {
+        self.resident.chunks(self.resident_group_size as usize)
+    }
+
+    pub fn resident_cohort_count(&self) -> usize {
+        self.resident
+            .len()
+            .div_ceil(self.resident_group_size as usize)
+            .max(1)
     }
 
     /// Flat staged expert list in routing order; `cohorts()` chunks it by staging slot count.
@@ -1026,6 +1068,92 @@ mod tests {
         let waits = leases.release()?;
         assert_eq!(waits, &[5, 6]);
         assert_eq!(waits.as_ptr(), first);
+        Ok(())
+    }
+
+    #[test]
+    fn resident_groups_preserve_packed_assignments() -> Result<()> {
+        let geometry = ExpertGeometry {
+            first_layer: 0,
+            layers: 1,
+            experts: 256,
+            hidden: 2048,
+            intermediate: 512,
+            top_k: 8,
+        };
+        let service = ServiceTable::new(
+            "resident_groups",
+            [1, 16, 256, 1024]
+                .into_iter()
+                .map(|rows| ServiceCell {
+                    workers: 1,
+                    rows,
+                    experts: 1,
+                    seconds: f64::from(rows) * 1e-9,
+                })
+                .collect(),
+        )?;
+        let rates = SpanRates {
+            service: &service,
+            h2d_bytes_per_second: 1e9,
+            cpu_row_limit: 16,
+        };
+        let mut counts = vec![0u32; 256];
+        let ids: Vec<i32> = (0..769 * 8)
+            .map(|choice| {
+                let row = choice / 8;
+                let expert = if choice % 8 == 7 && row < 48 {
+                    if row < 15 {
+                        200
+                    } else if row < 31 {
+                        201
+                    } else {
+                        202
+                    }
+                } else {
+                    (row * 17 + choice % 8 * 29) % 192
+                };
+                counts[expert] += 1;
+                expert as i32
+            })
+            .collect();
+        assert_eq!(&counts[200..203], &[15, 16, 17]);
+        for resident_count in [0usize, 31, 32, 33, 65, 192, 256] {
+            let resident: Vec<bool> = (0..256).map(|e| e < resident_count).collect();
+            let mut plan = planner(&geometry, 2, &rates)?.with_resident_group_size(32)?;
+            let allocation = plan.cohort_offsets.as_ptr();
+            plan.update(&counts, &resident, 769, 256, &rates)?;
+            plan.pack_waves(&counts, &ids)?;
+            assert_eq!(plan.cohort_offsets.as_ptr(), allocation);
+            assert_eq!(
+                plan.resident_cohort_count(),
+                plan.resident().len().div_ceil(32).max(1)
+            );
+            let mut covered = vec![0u8; ids.len()];
+            for (cohort, experts) in plan.resident_cohorts().enumerate().chain(
+                plan.cohorts()
+                    .enumerate()
+                    .map(|(c, experts)| (c + plan.resident_cohort_count(), experts)),
+            ) {
+                for &(base, rows, active) in plan.cohort_waves(cohort)? {
+                    assert!(active > 0 && active <= 256 * 8);
+                    let mut actual = 0;
+                    for choice in base as usize * 8..(base + rows) as usize * 8 {
+                        if experts.contains(&(ids[choice] as u32)) {
+                            covered[choice] += 1;
+                            actual += 1;
+                        }
+                    }
+                    assert_eq!(active, actual);
+                }
+            }
+            for (choice, &expert) in ids.iter().enumerate() {
+                assert_eq!(
+                    covered[choice],
+                    u8::from(!plan.cpu().contains(&(expert as u32)))
+                );
+            }
+        }
         Ok(())
     }
 
