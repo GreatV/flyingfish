@@ -398,27 +398,8 @@ pub(crate) fn checkpoint<T>(
     d: &Device,
     read: impl FnOnce(&mut Loader<'_>) -> Result<T>,
 ) -> Result<T> {
-    let started = Instant::now();
-    let phase = Instant::now();
     let mapped = MappedCheckpoint::open(dir)?;
-    let mapped_open_ms = elapsed_ms(phase);
-    let phase = Instant::now();
-    let ((value, bytes, timings), _) = checkpoint_mapped(&mapped, d, None, false, |l| {
-        let value = read(l)?;
-        Ok((value, l.bytes, l.timings))
-    })?;
-    let checkpoint_wall_ms = elapsed_ms(phase);
-    eprintln!(
-        "{}",
-        serde_json::json!({"checkpoint_load_phase": {
-            "bytes": bytes,
-            "load_wall_ms": elapsed_ms(started),
-            "mapped_open_ms": mapped_open_ms,
-            "checkpoint_wall_ms": checkpoint_wall_ms,
-            "chunk_bytes": UPLOAD_CHUNK_BYTES,
-            "timings": timings,
-        }})
-    );
+    let (value, _) = checkpoint_mapped(&mapped, d, None, false, read)?;
     Ok(value)
 }
 
