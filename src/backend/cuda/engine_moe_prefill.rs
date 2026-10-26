@@ -18,6 +18,19 @@ use std::ops::Range;
 mod prefetch;
 use prefetch::ReadAhead;
 
+fn resident_group_size(geometry: ExpertGeometry, capacity: &Capacity, wave_rows: u32) -> u32 {
+    use crate::backend::cuda::moe::prefill::W8A16_TILE_ROWS;
+    if capacity.layout.fp8_slot().is_none()
+        || u64::from(capacity.slots_total())
+            == u64::from(geometry.layers) * u64::from(geometry.experts)
+    {
+        return geometry.experts;
+    }
+    (u64::from(wave_rows) * u64::from(geometry.top_k) / u64::from(W8A16_TILE_ROWS))
+        .max(u64::from(capacity.prefill_staging_slots))
+        .min(u64::from(geometry.experts)) as u32
+}
+
 fn route_trace_prefix(all_layers: bool, prefix: &str, layer: usize, base: usize) -> String {
     if all_layers {
         format!("{prefix}.{layer}.wave.{base}")
@@ -508,6 +521,7 @@ impl Prefill {
             h2d_bytes_per_second,
         )?;
         let workers = service.worker_count()?;
+        let resident_group_size = resident_group_size(geometry, capacity, routed_wave_rows);
         let cohorts =
             (geometry.experts as usize).div_ceil(capacity.prefill_staging_slots as usize) + 1;
         Ok(Self {
@@ -595,13 +609,15 @@ impl Prefill {
                 capacity.slot_bytes(),
                 capacity.prefill_staging_slots,
                 workers,
-            )?,
+            )?
+            .with_resident_group_size(resident_group_size)?,
             forecast_plan: SpanPlan::new(
                 &geometry,
                 capacity.slot_bytes(),
                 capacity.prefill_staging_slots,
                 workers,
-            )?,
+            )?
+            .with_resident_group_size(resident_group_size)?,
             leases: StagingLeases::new(capacity.prefill_staging_slots)?,
             stats: [0; 8],
         })
@@ -1814,31 +1830,33 @@ impl Gpu {
     ) -> Result<()> {
         let geometry = slots.catalogue.geometry();
         self.tables.clear()?;
-        for &expert in plan.resident() {
-            let position = slots.policy.ledger().slot(layer, expert)?;
-            let physical = &mut slots.physical[position as usize];
-            if !physical.waited {
-                let id = slots
-                    .policy
-                    .first_read(position)?
-                    .context("prefill resident has no copy event")?;
-                ensure!(
-                    physical.copy.as_ref().is_some_and(|copy| copy.id == id),
-                    "prefill resident slot={position} copy ownership differs"
-                );
-                slots.events.wait(compute, id)?;
-                physical.waited = true;
+        for (cohort, experts) in plan.resident_cohorts().enumerate() {
+            for &expert in experts {
+                let position = slots.policy.ledger().slot(layer, expert)?;
+                let physical = &mut slots.physical[position as usize];
+                if !physical.waited {
+                    let id = slots
+                        .policy
+                        .first_read(position)?
+                        .context("prefill resident has no copy event")?;
+                    ensure!(
+                        physical.copy.as_ref().is_some_and(|copy| copy.id == id),
+                        "prefill resident slot={position} copy ownership differs"
+                    );
+                    slots.events.wait(compute, id)?;
+                    physical.waited = true;
+                }
+                self.tables.set(
+                    geometry.experts,
+                    cohort,
+                    expert,
+                    (
+                        physical.pointer,
+                        physical.pointer + slots.catalogue.layout().down_offset(),
+                    ),
+                    slots.policy.generation(layer, expert)?,
+                )?;
             }
-            self.tables.set(
-                geometry.experts,
-                0,
-                expert,
-                (
-                    physical.pointer,
-                    physical.pointer + slots.catalogue.layout().down_offset(),
-                ),
-                slots.policy.generation(layer, expert)?,
-            )?;
         }
         for (cohort, experts) in plan.cohorts().enumerate() {
             self.epoch = self
@@ -1848,15 +1866,18 @@ impl Gpu {
             for (position, &expert) in experts.iter().enumerate() {
                 self.tables.set(
                     geometry.experts,
-                    cohort + 1,
+                    cohort + plan.resident_cohort_count(),
                     expert,
                     slots.storage.staging(position as u32)?,
                     self.epoch,
                 )?;
             }
         }
-        self.tables
-            .upload(compute, 1 + plan.cohort_count() as usize, geometry.experts)
+        self.tables.upload(
+            compute,
+            plan.resident_cohort_count() + plan.cohort_count() as usize,
+            geometry.experts,
+        )
     }
 
     fn contribute(
@@ -1884,17 +1905,17 @@ impl Gpu {
                 stream.cu_stream(),
             )?;
         }
-        if !plan.resident().is_empty() {
+        for (cohort, experts) in plan.resident_cohorts().enumerate() {
             let ticket = self.cohort(
                 device,
                 slots,
                 span,
                 ops,
                 plan,
-                (layer, 0, ffn.clone(), None),
+                (layer, cohort, ffn.clone(), None),
             )?;
             self.resident_slots.clear();
-            for &expert in plan.resident() {
+            for &expert in experts {
                 self.resident_slots
                     .push(slots.policy.ledger().slot(layer, expert)?);
             }
@@ -1906,7 +1927,10 @@ impl Gpu {
             }
         }
         for (cohort, experts) in plan.cohorts().enumerate() {
-            leases.reset(u32::try_from(plan.cohort_waves(cohort + 1)?.len())?)?;
+            leases.reset(u32::try_from(
+                plan.cohort_waves(cohort + plan.resident_cohort_count())?
+                    .len(),
+            )?)?;
             for (position, &expert) in experts.iter().enumerate() {
                 if let Some(reader) = self.staging_readers[position].take() {
                     slots.transfers.h2d.wait(&reader.event)?;
@@ -1928,7 +1952,12 @@ impl Gpu {
                 span,
                 ops,
                 plan,
-                (layer, cohort + 1, ffn.clone(), Some(leases)),
+                (
+                    layer,
+                    cohort + plan.resident_cohort_count(),
+                    ffn.clone(),
+                    Some(leases),
+                ),
             )?;
             for &id in leases.release()? {
                 ensure!(
@@ -2013,9 +2042,12 @@ impl Gpu {
     ) -> Result<Ticket> {
         let (layer, cohort, ffn, mut leases) = cohort;
         let staged_slots = if leases.is_some() {
-            ensure!(cohort > 0, "prefill resident cohort has staging leases");
+            ensure!(
+                cohort >= plan.resident_cohort_count(),
+                "prefill resident cohort has staging leases"
+            );
             plan.cohorts()
-                .nth(cohort - 1)
+                .nth(cohort - plan.resident_cohort_count())
                 .context("prefill staging cohort exceeds the layer plan")?
                 .len()
         } else {
@@ -3137,6 +3169,45 @@ mod tests {
         Ok(capacity)
     }
 
+    #[test]
+    fn partial_native_resident_groups_preserve_capacity() -> Result<()> {
+        let geometry = ExpertGeometry {
+            first_layer: 0,
+            layers: 40,
+            experts: 256,
+            hidden: 2048,
+            intermediate: 512,
+            top_k: 8,
+        };
+        for format in [
+            crate::model_spec::ExpertFormat::Bf16,
+            crate::model_spec::ExpertFormat::Fp8W8a16,
+        ] {
+            let mut capacity = tier_capacity(geometry, false, format)?;
+            capacity.slots_per_layer = vec![120; 40];
+            capacity.prefill_staging_slots = 2;
+            capacity.wave_rows = 256;
+            capacity.span_rows = 16320;
+            assert_eq!(
+                resident_group_size(geometry, &capacity, 256),
+                if format == crate::model_spec::ExpertFormat::Fp8W8a16 {
+                    32
+                } else {
+                    256
+                }
+            );
+            if format == crate::model_spec::ExpertFormat::Fp8W8a16 {
+                capacity.prefill_staging_slots = 64;
+                assert_eq!(resident_group_size(geometry, &capacity, 256), 64);
+                capacity.prefill_staging_slots = 2;
+                assert_eq!(resident_group_size(geometry, &capacity, 1), 2);
+            }
+            capacity.slots_per_layer.fill(256);
+            assert_eq!(resident_group_size(geometry, &capacity, 2048), 256);
+        }
+        Ok(())
+    }
+
     struct Reference {
         ids: Vec<i32>,
         weights: Vec<bf16>,
@@ -3415,6 +3486,32 @@ mod tests {
         a.len() == b.len() && a.iter().zip(b).all(|(&a, &b)| bits(a) == bits(b))
     }
 
+    fn check_resident_reader_tickets(slots: &Slots, layer: u32, plan: &SpanPlan) -> Result<()> {
+        let mut previous = None;
+        for experts in plan.resident_cohorts() {
+            let mut group = None;
+            for &expert in experts {
+                let position = slots.policy.ledger().slot(layer, expert)?;
+                let reader = slots.physical[position as usize]
+                    .reader
+                    .as_ref()
+                    .context("resident group reader missing")?
+                    .id;
+                ensure!(
+                    group.is_none_or(|id| id == reader),
+                    "DEFECT resident group has mixed reader tickets"
+                );
+                group = Some(reader);
+            }
+            ensure!(
+                previous.is_none_or(|id| Some(id) < group),
+                "DEFECT resident group uses an earlier group's ticket"
+            );
+            previous = group;
+        }
+        Ok(())
+    }
+
     fn gate(
         row_cases: &[u32],
         variants: &[u32],
@@ -3428,6 +3525,7 @@ mod tests {
         let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
         let mut defects = 0;
         let mut total_coverage = [0u64; 5];
+        let mut ticket_control = false;
         for &variant in variants {
             for &rows in row_cases {
                 let fixture = inputs(variant, rows as usize);
@@ -3585,7 +3683,8 @@ mod tests {
                             slots.catalogue.slot_bytes(),
                             2,
                             prefill.workers,
-                        )?;
+                        )?
+                        .with_resident_group_size(resident_group_size(geometry, &capacity, 4))?;
                         expected_plan.update(
                             &counts,
                             &resident,
@@ -3650,6 +3749,38 @@ mod tests {
                                 rows,
                                 ffn.clone(),
                             )?;
+                            if let Err(error) =
+                                check_resident_reader_tickets(&slots, layer as u32, &prefill.plan)
+                            {
+                                defects += 1;
+                                println!("{error:#}");
+                            }
+                            if !ticket_control && prefill.plan.resident_cohort_count() > 1 {
+                                let mut groups = prefill.plan.resident_cohorts();
+                                let first = slots
+                                    .policy
+                                    .ledger()
+                                    .slot(layer as u32, groups.next().unwrap()[0])?;
+                                let second = slots
+                                    .policy
+                                    .ledger()
+                                    .slot(layer as u32, groups.next().unwrap()[0])?;
+                                let original = slots.physical[second as usize].reader.clone();
+                                slots.physical[second as usize].reader =
+                                    slots.physical[first as usize].reader.clone();
+                                let detected = check_resident_reader_tickets(
+                                    &slots,
+                                    layer as u32,
+                                    &prefill.plan,
+                                )
+                                .is_err();
+                                slots.physical[second as usize].reader = original;
+                                ensure!(detected, "wrong-group-ticket control was not detected");
+                                ticket_control = true;
+                                println!(
+                                    "PASS prefill_wrong_group_ticket_control layer={layer} rows={rows} restored=true"
+                                );
+                            }
                             if !prefill.cpu.choices.is_empty() {
                                 super::super::delay_stream(&prefill.gpu.mailbox)?;
                                 prefill.cpu.upload(
@@ -3836,6 +3967,10 @@ mod tests {
             "Runner FAIL prefill gate coverage={total_coverage:?} host_complete={host_complete}"
         );
         ensure!(defects == 0, "DEFECT prefill span cells={defects}");
+        ensure!(
+            format != crate::model_spec::ExpertFormat::Fp8W8a16 || ticket_control,
+            "Runner FAIL native FP8 resident group ticket control not exercised"
+        );
         println!(
             "PASS prefill_span_gate format={format:?} rows={row_cases:?} variants={variants:?} modes={modes:?} host_complete={host_complete} borrowed=true refill=true CPU_submit=true"
         );
@@ -4105,7 +4240,12 @@ mod tests {
             capacity.slot_bytes(),
             capacity.prefill_staging_slots,
             capacity.worker_count,
-        )?;
+        )?
+        .with_resident_group_size(resident_group_size(
+            geometry,
+            capacity,
+            capacity.wave_rows,
+        ))?;
         plan.update(
             &counts,
             &resident,
@@ -4120,9 +4260,7 @@ mod tests {
             },
         )?;
         let mut cohorts = Vec::new();
-        if !plan.resident().is_empty() {
-            cohorts.push(plan.resident().to_vec());
-        }
+        cohorts.extend(plan.resident_cohorts().map(<[u32]>::to_vec));
         cohorts.extend(
             plan.staged()
                 .chunks(capacity.prefill_staging_slots as usize)

@@ -2737,12 +2737,13 @@ fn prefill_stage_backtoback_gpu() -> Result<()> {
 #[ignore = "requires GPU window, FF_Q38_GPU_WINDOW=granted"]
 fn prefill_packed_waves_gpu() -> Result<()> {
     for wave_rows in [256, 2048] {
-        prefill_packed_waves(wave_rows)?;
+        prefill_packed_waves(wave_rows, false)?;
     }
+    prefill_packed_waves(256, true)?;
     Ok(())
 }
 
-fn prefill_packed_waves(wave_rows: usize) -> Result<()> {
+fn prefill_packed_waves(wave_rows: usize, grouped: bool) -> Result<()> {
     use crate::backend::cuda::contracts::view;
     use crate::experts::{
         catalogue::{ExpertGeometry, ExpertLayout},
@@ -2929,19 +2930,25 @@ fn prefill_packed_waves(wave_rows: usize) -> Result<()> {
     for flag in &mut resident[..15] {
         *flag = true;
     }
-    let mut plan = SpanPlan::new(&geometry, slot_bytes, 2, 2)?;
+    let mut plan = SpanPlan::new(&geometry, slot_bytes, 2, 2)?
+        .with_resident_group_size(if grouped { 4 } else { geometry.experts })?;
     plan.update(&counts, &resident, rows as u32, wave_rows as u32, &rates)?;
     plan.pack_waves(&counts, &ids)?;
     anyhow::ensure!(
-        plan.cohort_waves(0)?
-            == [
-                (0, first_wave_rows as u32, (wave_rows * top_k) as u32),
-                (first_wave_rows as u32, 257, 1028),
-            ]
-            && plan.cohort_waves(1)?.len() == 1,
+        grouped
+            || (plan.cohort_waves(0)?
+                == [
+                    (0, first_wave_rows as u32, (wave_rows * top_k) as u32),
+                    (first_wave_rows as u32, 257, 1028),
+                ]
+                && plan.cohort_waves(1)?.len() == 1),
         "packed wave geometry differs at wave_rows={wave_rows}: c0={:?} c1={:?}",
         plan.cohort_waves(0)?,
         plan.cohort_waves(1)?
+    );
+    anyhow::ensure!(
+        !grouped || plan.resident_cohort_count() == 4,
+        "grouped fixture must execute four resident cohorts"
     );
 
     let mut cpu_arithmetic = vec![false; experts];
@@ -2954,15 +2961,11 @@ fn prefill_packed_waves(wave_rows: usize) -> Result<()> {
 
     let ops = PrefillOps::new(&d.ctx, s, ExpertFormat::Bf16)?;
     let fp8_ops = PrefillOps::new(&d.ctx, s, ExpertFormat::Fp8W8a16)?;
-    let total_cohorts = 1 + plan.cohort_count() as usize;
-    let cohort_sets: Vec<Vec<u32>> = (0..total_cohorts)
-        .map(|cohort| {
-            if cohort == 0 {
-                plan.resident().to_vec()
-            } else {
-                plan.cohorts().nth(cohort - 1).unwrap().to_vec()
-            }
-        })
+    let total_cohorts = plan.resident_cohort_count() + plan.cohort_count() as usize;
+    let cohort_sets: Vec<Vec<u32>> = plan
+        .resident_cohorts()
+        .chain(plan.cohorts())
+        .map(<[u32]>::to_vec)
         .collect();
     let multi_cohort_slots = |gu_addrs: &[u64], dn_addrs: &[u64]| -> Result<DeviceSlots> {
         let mut gu_all = vec![0u64; total_cohorts * experts];
@@ -3261,20 +3264,22 @@ fn prefill_packed_waves(wave_rows: usize) -> Result<()> {
             "FP8 stage k-half swap control was not detected"
         );
 
-        // Control 1: plant an off-by-one wave base (shifted by 1 row); must FAIL (>0 differing bits).
-        let (shifted_bits, _) = run_waves(&ops, &slots, None, true, true, false)?;
-        let shifted_diff = fixed_bits
-            .iter()
-            .zip(&shifted_bits)
-            .filter(|(a, b)| a != b)
-            .count();
-        eprintln!(
-            "prefill_packed_waves_gpu off-by-one base control shifted_diff_bits={shifted_diff} DETECTED"
-        );
-        anyhow::ensure!(
-            shifted_diff > 0,
-            "off-by-one wave base control was not detected"
-        );
+        if !grouped {
+            // Control 1: plant an off-by-one wave base (shifted by 1 row); must FAIL (>0 differing bits).
+            let (shifted_bits, _) = run_waves(&ops, &slots, None, true, true, false)?;
+            let shifted_diff = fixed_bits
+                .iter()
+                .zip(&shifted_bits)
+                .filter(|(a, b)| a != b)
+                .count();
+            eprintln!(
+                "prefill_packed_waves_gpu off-by-one base control shifted_diff_bits={shifted_diff} DETECTED"
+            );
+            anyhow::ensure!(
+                shifted_diff > 0,
+                "off-by-one wave base control was not detected"
+            );
+        }
 
         // Control 3 (Step 2C): corrupted cohort slice offset (cohort * experts + experts); must FAIL (>0 differing bits).
         let (corrupted_cohort_bits, _) = run_waves(&ops, &slots, None, true, false, true)?;
