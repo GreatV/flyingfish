@@ -561,13 +561,9 @@ pub fn capacity_with_peer(
     if gpu0_max_slots < routed_slots
         && let Some(peer) = peer
     {
-        ensure!(
-            peer.device_free_bytes >= peer.device_reserved_bytes,
-            "peer persistent reserves {} B exceed peer device free bytes {}",
-            peer.device_reserved_bytes,
-            peer.device_free_bytes
-        );
-        let peer_free_expert_bytes = peer.device_free_bytes - peer.device_reserved_bytes;
+        let peer_free_expert_bytes = peer
+            .device_free_bytes
+            .saturating_sub(peer.device_reserved_bytes);
         let peer_max_slots = peer_free_expert_bytes / slot_bytes;
         let max_peer_layers = (peer_max_slots / u64::from(geometry.experts))
             .min(u64::from(geometry.layers.saturating_sub(1))) as u32;
@@ -1889,6 +1885,115 @@ mod tests {
         .unwrap();
         assert_eq!(overpriced_partial.gpu0_layers, 40);
         assert_eq!(overpriced_partial.peer_slots(), 0);
+    }
+
+    #[test]
+    fn peer_free_below_reserve_selects_gpu0_plan() {
+        let reserves = reserves();
+        let geom = ExpertGeometry {
+            first_layer: 0,
+            layers: 40,
+            experts: 256,
+            top_k: 8,
+            hidden: 2048,
+            intermediate: 512,
+        };
+        let layout = crate::experts::catalogue::ExpertLayout::new(
+            crate::model_spec::ExpertFormat::Fp8W8a16,
+            &geom,
+        )
+        .unwrap();
+        let fp8_slot = layout.slot_bytes();
+        let service = ServiceTable::new(
+            "a4000-7950x",
+            vec![ServiceCell {
+                workers: 8,
+                rows: 1,
+                experts: 1,
+                seconds: 0.00025,
+            }],
+        )
+        .unwrap();
+        let inputs = PlanInputs {
+            geometry: geom,
+            layout,
+            device_free_bytes: reserves.persistent_bytes(fp8_slot).unwrap() + 3_500 * fp8_slot,
+            host_available_bytes: reserves.host_bytes(fp8_slot).unwrap() + 4_096 * fp8_slot,
+            h2d_bytes_per_second: 26.82e9,
+            d2h_bytes_per_second: 24.0e9,
+            copy_engines: 2,
+            disk_readers: 2,
+            host_registration_bytes: 4_096 * fp8_slot,
+            service: &service,
+            reserves: &reserves,
+            span_rows: 4096,
+            wave_rows: 256,
+        };
+        let prefill = [
+            (8 * 1024 * 1024, 5.1e9, 5.1e9),
+            (68 * 1024 * 1024, 5.1e9, 5.1e9),
+        ];
+        let peer_reserved = 1_300_000_000 + 128 * fp8_slot;
+        let candidate = SpanCandidate {
+            span_rows: inputs.span_rows,
+            wave_rows: inputs.wave_rows,
+            reserves,
+        };
+        let (_, single_gpu) =
+            select_span(&inputs, 13, 4096, std::slice::from_ref(&candidate)).unwrap();
+        assert_eq!(single_gpu.gpu0_layers, 40);
+        assert_eq!(single_gpu.peer_expert_bytes, 0);
+        assert_eq!(single_gpu.peer_slots(), 0);
+        for free_bytes in [
+            0,
+            peer_reserved - 1,
+            peer_reserved,
+            peer_reserved + 255 * fp8_slot,
+        ] {
+            let (index, selected) = select_span_with_peer(
+                &inputs,
+                13,
+                4096,
+                std::slice::from_ref(&candidate),
+                Some(PeerInputs {
+                    device_free_bytes: free_bytes,
+                    device_reserved_bytes: peer_reserved,
+                    decode_transfer: (4_096, 330e6, 330e6),
+                    prefill_transfers: &prefill,
+                }),
+            )
+            .unwrap();
+            assert_eq!(index, 0);
+            assert_eq!(selected.gpu0_layers, single_gpu.gpu0_layers);
+            assert_eq!(selected.peer_expert_bytes, 0);
+            assert_eq!(selected.peer_slots(), 0);
+            assert_eq!(selected.slots_per_layer, single_gpu.slots_per_layer);
+            assert_eq!(selected.host_blocks, single_gpu.host_blocks);
+            assert_eq!(selected.spare_blocks, single_gpu.spare_blocks);
+            assert_eq!(selected.disk_bytes, single_gpu.disk_bytes);
+            assert_eq!(selected.pinned, single_gpu.pinned);
+            assert_eq!(
+                SlotLayout::new(geom, &selected)
+                    .unwrap()
+                    .peer_resident_bytes(),
+                0
+            );
+        }
+        let (_, one_peer_layer) = select_span_with_peer(
+            &inputs,
+            13,
+            4096,
+            std::slice::from_ref(&candidate),
+            Some(PeerInputs {
+                device_free_bytes: peer_reserved + 256 * fp8_slot,
+                device_reserved_bytes: peer_reserved,
+                decode_transfer: (4_096, 330e6, 330e6),
+                prefill_transfers: &prefill,
+            }),
+        )
+        .unwrap();
+        assert_eq!(one_peer_layer.gpu0_layers, 39);
+        assert_eq!(one_peer_layer.peer_slots(), 256);
     }
 
     fn ledger_for(
