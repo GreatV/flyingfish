@@ -47,83 +47,6 @@ fn norm_mode(spec: &crate::model_spec::ModelSpec) -> RmsMode {
     }
 }
 
-pub(crate) struct FlintKvCopy<'a> {
-    pub(crate) stream: &'a Arc<CudaStream>,
-    pub(crate) source: &'a CudaSlice<bf16>,
-    pub(crate) target: &'a mut CudaSlice<bf16>,
-    pub(crate) source_capacity: usize,
-    pub(crate) target_capacity: usize,
-}
-
-impl FlintKvCopy<'_> {
-    pub(crate) fn run(
-        self,
-        source_start: usize,
-        target_start: usize,
-        rows: usize,
-        wrap_source: bool,
-        wrap_target: bool,
-    ) -> Result<()> {
-        ensure!(rows > 0, "Flint KV copy requires rows");
-        ensure!(
-            source_start < self.source_capacity && target_start < self.target_capacity,
-            "Flint KV copy start exceeds capacity"
-        );
-        if !wrap_source {
-            ensure!(
-                source_start + rows <= self.source_capacity,
-                "Flint KV source range exceeds capacity"
-            );
-        }
-        if !wrap_target {
-            ensure!(
-                target_start + rows <= self.target_capacity,
-                "Flint KV target range exceeds capacity"
-            );
-        }
-        let source_first = if wrap_source {
-            rows.min(self.source_capacity - source_start)
-        } else {
-            rows
-        };
-        let target_first = if wrap_target {
-            rows.min(self.target_capacity - target_start)
-        } else {
-            rows
-        };
-        let first = rows.min(source_first.min(target_first));
-        for (offset, count) in [(0, first), (first, rows - first)] {
-            if count == 0 {
-                continue;
-            }
-            let source_row = if offset > 0 && wrap_source {
-                0
-            } else {
-                source_start + offset
-            };
-            let target_row = if offset > 0 && wrap_target {
-                0
-            } else {
-                target_start + offset
-            };
-            super::super::copy::columns(
-                self.stream,
-                self.source,
-                self.target,
-                super::super::copy::Rect {
-                    rows: 4,
-                    width: count * 128,
-                    src_pitch: self.source_capacity * 128,
-                    src_col: source_row * 128,
-                    dst_pitch: self.target_capacity * 128,
-                    dst_col: target_row * 128,
-                },
-            )?;
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 struct FlintWindowInputs<'a> {
     spec: &'a crate::model_spec::ModelSpec,
@@ -2574,7 +2497,7 @@ impl Engine {
                                 for (source, target) in
                                     [(&kv.k, &mut *stage_k), (&kv.v, &mut *stage_v)]
                                 {
-                                    FlintKvCopy {
+                                    super::super::copy::RingCopy {
                                         stream: s,
                                         source,
                                         target,
@@ -2632,7 +2555,7 @@ impl Engine {
                                 for (source, target) in
                                     [(&kv.k, &mut *stage_k), (&kv.v, &mut *stage_v)]
                                 {
-                                    FlintKvCopy {
+                                    super::super::copy::RingCopy {
                                         stream: s,
                                         source,
                                         target,
@@ -2675,7 +2598,7 @@ impl Engine {
                             for (source, target) in
                                 [(&mut *stage_k, &mut kv.k), (&mut *stage_v, &mut kv.v)]
                             {
-                                FlintKvCopy {
+                                super::super::copy::RingCopy {
                                     stream: s,
                                     source,
                                     target,

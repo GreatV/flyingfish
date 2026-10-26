@@ -41,7 +41,7 @@ mod mtp_generate;
 #[path = "engine_mtp_launch_tests.rs"]
 mod mtp_launch_tests;
 #[path = "engine_qwen.rs"]
-pub(crate) mod qwen;
+mod qwen;
 #[path = "engine_vision.rs"]
 mod vision_runtime;
 

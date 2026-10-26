@@ -1135,7 +1135,7 @@ fn flint_sliding_ring_prefill_interleaved_gpu() -> Result<()> {
     let mut stage_k = s.clone_htod(&stage_k)?;
     let mut stage_v = s.clone_htod(&stage_v)?;
     for (source, target) in [(&ring_k, &mut stage_k), (&ring_v, &mut stage_v)] {
-        super::engine::qwen::FlintKvCopy {
+        super::copy::RingCopy {
             stream: s,
             source,
             target,
@@ -1182,7 +1182,7 @@ fn flint_sliding_ring_prefill_interleaved_gpu() -> Result<()> {
     )?;
     flash.apply_sinks(&no_sinks, &mut staged_output, chunk, hq)?;
     for (source, target) in [(&stage_k, &mut ring_k), (&stage_v, &mut ring_v)] {
-        super::engine::qwen::FlintKvCopy {
+        super::copy::RingCopy {
             stream: s,
             source,
             target,
@@ -1250,7 +1250,7 @@ fn flint_sliding_ring_prefill_interleaved_gpu() -> Result<()> {
         "staged FA2 cosine bound"
     );
     for (source, target) in [(&ring_k, &mut stage_k), (&ring_v, &mut stage_v)] {
-        super::engine::qwen::FlintKvCopy {
+        super::copy::RingCopy {
             stream: s,
             source,
             target,
