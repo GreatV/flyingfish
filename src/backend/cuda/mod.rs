@@ -90,12 +90,37 @@ impl Device {
     }
 
     pub fn peer(&self) -> Result<Option<Self>> {
+        Ok(self.peer_with_unsupported_sm()?.0)
+    }
+
+    pub(crate) fn peer_with_unsupported_sm(&self) -> Result<(Option<Self>, Option<u32>)> {
         #[cfg(test)]
         if DISABLE_PEER.load(std::sync::atomic::Ordering::Relaxed) {
-            return Ok(None);
+            return Ok((None, None));
         }
         if self.ctx.ordinal() != 0 || CudaContext::device_count()? <= 1 {
-            return Ok(None);
+            return Ok((None, None));
+        }
+        use cudarc::driver::sys::CUdevice_attribute as A;
+        let dev = cudarc::driver::result::device::get(1)
+            .context("CUDA backend unavailable: get device 1")?;
+        // SAFETY: `dev` is returned by `cuDeviceGet(1)` on an initialized CUDA driver.
+        let capability = unsafe {
+            cudarc::driver::result::device::get_attribute(
+                dev,
+                A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+            )
+            .and_then(|major| {
+                let minor = cudarc::driver::result::device::get_attribute(
+                    dev,
+                    A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                )?;
+                Ok((major, minor))
+            })
+            .context("CUDA backend unavailable: query device 1 capability")
+        };
+        if let Err(sm) = check_peer_capability(capability)? {
+            return Ok((None, Some(sm)));
         }
         let peer = Self::new(1)?;
         let mut can_0_to_1 = 0i32;
@@ -131,7 +156,7 @@ impl Device {
             })
         );
         self.ctx.bind_to_thread()?;
-        Ok(Some(peer))
+        Ok((Some(peer), None))
     }
 
     pub fn finish_upload(&self) -> Result<()> {
@@ -149,6 +174,20 @@ impl Device {
 
 const PEER_VERIFY_BOUNCE_BYTES: usize = 65_536;
 const PEER_VERIFY_MEMCPY_BYTES: usize = 4 * 1024 * 1024;
+
+fn check_peer_capability(capability: Result<(i32, i32)>) -> Result<std::result::Result<u32, u32>> {
+    let (major, minor) = capability?;
+    ensure!(
+        (1..=99).contains(&major) && (0..=9).contains(&minor),
+        "invalid CUDA compute capability {major}.{minor}"
+    );
+    let sm = (major * 10 + minor) as u32;
+    if cubin::check(sm).is_ok() {
+        Ok(Ok(sm))
+    } else {
+        Ok(Err(sm))
+    }
+}
 
 struct PortableVerifyBounce(*mut u8);
 
@@ -526,6 +565,42 @@ mod tests {
             msg.contains("first_offset=2345679") && msg.contains("mismatch_bytes=1/4194304"),
             "unexpected verifier error: {msg}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn peer_capability_predicate_skips_unsupported_sm_and_propagates_errors_cpu() -> Result<()> {
+        let supported_sm = (50..=120)
+            .find(|&sm| cubin::check(sm).is_ok())
+            .context("built binary must include at least one native cubin architecture")?;
+        let supported = (
+            i32::try_from(supported_sm / 10)?,
+            i32::try_from(supported_sm % 10)?,
+        );
+        assert_eq!(check_peer_capability(Ok(supported))?, Ok(supported_sm));
+
+        let unsupported_sm = [75u32, 86, 89, 90, 61, 52, 10]
+            .into_iter()
+            .find(|&sm| cubin::check(sm).is_err())
+            .context("must find an architecture absent from CUDA_ARCH_LIST")?;
+        let unsupported = (
+            i32::try_from(unsupported_sm / 10)?,
+            i32::try_from(unsupported_sm % 10)?,
+        );
+        assert_eq!(check_peer_capability(Ok(unsupported))?, Err(unsupported_sm));
+
+        let driver_err = check_peer_capability(Err(anyhow::anyhow!("CUDA_ERROR_INVALID_DEVICE")))
+            .expect_err("driver failure must propagate");
+        ensure!(
+            format!("{driver_err:#}").contains("CUDA_ERROR_INVALID_DEVICE"),
+            "unexpected driver error: {driver_err:#}"
+        );
+        for invalid in [(0, 0), (-1, 5), (8, -1), (8, 10), (100, 0)] {
+            assert!(
+                check_peer_capability(Ok(invalid)).is_err(),
+                "invalid capability {invalid:?} must error"
+            );
+        }
         Ok(())
     }
 

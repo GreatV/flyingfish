@@ -475,7 +475,7 @@ impl Setup {
             failures.join("; ")
         );
         let registration = measured.host_registration_bytes;
-        let peer_device = device.peer()?;
+        let (peer_device, peer_unsupported_sm) = device.peer_with_unsupported_sm()?;
         let peer_inputs = if let Some(peer_dev) = &peer_device {
             peer_dev.ctx.bind_to_thread()?;
             let (peer_free, peer_total) = peer_dev.ctx.mem_get_info()?;
@@ -592,6 +592,7 @@ impl Setup {
                 "borrowed_slots":workspace.borrowed_slots,"slots_per_layer":capacity.slots_per_layer,
                 "gpu0_layers":capacity.gpu0_layers,"peer_expert_bytes":capacity.peer_expert_bytes,
                 "peer_transport":peer.is_some().then(|| serde_json::json!({"decode":"captured_portable_bounce_4k","prefill":"eager_peer_memcpy_8m_68m"})),
+                "peer_unsupported_sm":peer_unsupported_sm,
                 "host_blocks":capacity.host_blocks,"spare_blocks":capacity.spare_blocks,
                 "host_backing_complete":host_backed,
                 "disk_bytes":capacity.disk_bytes,"pinned":capacity.pinned,
