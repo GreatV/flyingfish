@@ -218,6 +218,7 @@ pub(crate) struct Loader<'a> {
     index: Index,
     seen: BTreeSet<String>,
     staging: PinnedHostSlice<bf16>,
+    staging_ready: cudarc::driver::CudaEvent,
     stream: Arc<CudaStream>,
     byte_staging: Option<PinnedHostSlice<u8>>,
     verify_upload: bool,
@@ -348,6 +349,7 @@ impl Loader<'_> {
                 self.timings.hash_ms += elapsed_ms(phase);
                 let len = chunk.len() / 2;
                 let phase = Instant::now();
+                self.staging_ready.synchronize()?;
                 let buf = self.staging.as_mut_slice()?;
                 decode_bf16(chunk, &mut buf[..len]);
                 self.timings.decode_ms += elapsed_ms(phase);
@@ -363,6 +365,7 @@ impl Loader<'_> {
                 let mut view = dst.slice_mut(offset..offset + len);
                 self.stream
                     .memcpy_htod(&self.staging.as_slice()?[..len], &mut view)?;
+                self.staging_ready.record(&self.stream)?;
                 self.timings.h2d_ms += elapsed_ms(phase);
                 let phase = Instant::now();
                 if self.verify_upload {
@@ -419,6 +422,9 @@ pub(super) fn checkpoint_mapped<T>(
             d.ctx.alloc_pinned::<bf16>(UPLOAD_CHUNK_BYTES / 2)?
         }
     };
+    let staging_ready = d.ctx.new_event(Some(
+        cudarc::driver::sys::CUevent_flags::CU_EVENT_BLOCKING_SYNC,
+    ))?;
     let upload_shards = if hash_uploads {
         manifest
             .map(|manifest| {
@@ -453,6 +459,7 @@ pub(super) fn checkpoint_mapped<T>(
             })
             .unwrap_or_default(),
         staging,
+        staging_ready,
         stream: d.upload.clone(),
         byte_staging: if manifest.is_some() {
             Some(unsafe { d.ctx.alloc_pinned_with_flags::<u8>(UPLOAD_CHUNK_BYTES, 0)? })
@@ -1065,5 +1072,134 @@ mod tests {
         expected.update([0]);
         assert_eq!(count, 5);
         assert_eq!(digest, format!("{:x}", expected.finalize()));
+    }
+
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn checkpoint_manifestless_upload_waits_for_staging_dma_gpu() -> Result<()> {
+        use cudarc::driver::{LaunchConfig, PushKernelArg};
+        use safetensors::tensor::{TensorView, serialize_to_file};
+
+        struct ScratchDir(std::path::PathBuf);
+        impl Drop for ScratchDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        const SPIN_PTX: &str = "\
+.version 7.0
+.target sm_80
+.address_size 64
+.visible .entry spin_ns(.param .u64 duration_ns) {
+    .reg .pred %p;
+    .reg .u64 %start, %now, %elapsed, %limit;
+    ld.param.u64 %limit, [duration_ns];
+    mov.u64 %start, %globaltimer;
+LOOP:
+    mov.u64 %now, %globaltimer;
+    sub.u64 %elapsed, %now, %start;
+    setp.lt.u64 %p, %elapsed, %limit;
+    @%p bra LOOP;
+    ret;
+}
+";
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let dir = ScratchDir(std::env::temp_dir().join(format!(
+            "ff-manifestless-upload-{}-{nanos}",
+            std::process::id()
+        )));
+        std::fs::create_dir_all(&dir.0)?;
+        let shard_path = dir.0.join("model.safetensors");
+
+        let chunk_words = UPLOAD_CHUNK_BYTES / size_of::<bf16>();
+        let b_words = 65_537usize;
+        let mut a_bytes = vec![0u8; 2 * chunk_words * size_of::<bf16>()];
+        for i in 0..chunk_words {
+            let w0 = 0x3c00u16 | ((i % 251) as u16);
+            a_bytes[2 * i..2 * i + 2].copy_from_slice(&w0.to_le_bytes());
+            let j = chunk_words + i;
+            let w1 = 0x4000u16 | (((i + 37) % 241) as u16);
+            a_bytes[2 * j..2 * j + 2].copy_from_slice(&w1.to_le_bytes());
+        }
+        let mut b_bytes = vec![0u8; b_words * size_of::<bf16>()];
+        for i in 0..b_words {
+            let wb = 0x4200u16 | (((i + 97) % 239) as u16);
+            b_bytes[2 * i..2 * i + 2].copy_from_slice(&wb.to_le_bytes());
+        }
+        serialize_to_file(
+            [
+                (
+                    "a",
+                    TensorView::new(Dtype::BF16, vec![2, chunk_words], &a_bytes)?,
+                ),
+                ("b", TensorView::new(Dtype::BF16, vec![b_words], &b_bytes)?),
+            ],
+            None,
+            &shard_path,
+        )?;
+
+        let raw_file = std::fs::read(&shard_path)?;
+        let file_tensors = SafeTensors::deserialize(&raw_file)?;
+        let expected_a = file_tensors.tensor("a")?.data();
+        let expected_b = file_tensors.tensor("b")?.data();
+
+        let device = crate::backend::cuda::Device::new(0)?;
+        let spin = device
+            .ctx
+            .load_module(cudarc::nvrtc::Ptx::from_src(SPIN_PTX))?
+            .load_function("spin_ns")?;
+        let duration_ns = 500_000_000u64;
+        let launch_cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        for (pass, expected_tracking) in [(0usize, true), (1usize, false)] {
+            ensure!(
+                device.ctx.is_event_tracking() == expected_tracking,
+                "pass={pass} expected event_tracking={expected_tracking}, observed={}",
+                device.ctx.is_event_tracking()
+            );
+            unsafe {
+                device
+                    .upload
+                    .launch_builder(&spin)
+                    .arg(&duration_ns)
+                    .launch(launch_cfg)?;
+            }
+            let (a_dev, b_dev) = checkpoint(&dir.0, &device, |l| {
+                let a = l.load(&[("a".into(), vec![2, chunk_words])])?;
+                let b = l.load(&[("b".into(), vec![b_words])])?;
+                Ok((a, b))
+            })?;
+            let got_a = device.stream.clone_dtoh(&a_dev)?;
+            let got_b = device.stream.clone_dtoh(&b_dev)?;
+            let mismatch_bytes = |got: &[bf16], expected: &[u8]| -> usize {
+                got.iter()
+                    .zip(expected.as_chunks::<2>().0)
+                    .map(|(word, bytes)| {
+                        let actual = word.to_bits().to_le_bytes();
+                        usize::from(actual[0] != bytes[0]) + usize::from(actual[1] != bytes[1])
+                    })
+                    .sum()
+            };
+            let a_mismatches = mismatch_bytes(&got_a, expected_a);
+            let b_mismatches = mismatch_bytes(&got_b, expected_b);
+            ensure!(
+                a_mismatches == 0 && b_mismatches == 0,
+                "manifest-less upload byte mismatch pass={pass} event_tracking={expected_tracking} a_byte_mismatches={a_mismatches} b_byte_mismatches={b_mismatches}"
+            );
+        }
+        println!(
+            "PASS checkpoint_manifestless_upload passes=2 chunk_bytes={UPLOAD_CHUNK_BYTES} a_bytes={} b_bytes={} byte_mismatches=0",
+            expected_a.len(),
+            expected_b.len()
+        );
+        Ok(())
     }
 }
