@@ -472,6 +472,7 @@ pub(super) struct Load<'a> {
     pub engines: u32,
     pub max_rows: u32,
     pub swiglu_rounding: crate::model_spec::SwigluRounding,
+    pub swiglu_limit: f32,
     pub routed_weight: crate::model_spec::RoutedWeightBoundary,
 }
 
@@ -682,6 +683,7 @@ impl Slots {
                     input.max_rows,
                     input.swiglu_rounding,
                     input.routed_weight,
+                    input.swiglu_limit,
                 )?)
             } else {
                 None

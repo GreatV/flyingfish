@@ -477,6 +477,7 @@ impl Setup {
                 engines: self.measured.copy_engines,
                 max_rows: u32::try_from(cpu.0.max(self.decode_rows))?,
                 swiglu_rounding: engine.model_spec.swiglu_rounding(),
+                swiglu_limit: engine.model_spec.swiglu_limit(),
                 routed_weight: engine.model_spec.routed_weight_boundary(),
             },
         )?;
@@ -502,6 +503,7 @@ impl Setup {
                     .context("MoE shared geometry missing")?
                     .shared_intermediate,
                 swiglu_rounding: engine.model_spec.swiglu_rounding(),
+                swiglu_limit: engine.model_spec.swiglu_limit(),
                 routed_weight: engine.model_spec.routed_weight_boundary(),
             },
         )?);
@@ -734,6 +736,7 @@ pub struct DecodeOptions {
     pub format: crate::model_spec::ExpertFormat,
     pub shared_intermediate: u32,
     pub swiglu_rounding: crate::model_spec::SwigluRounding,
+    pub swiglu_limit: f32,
     pub routed_weight: crate::model_spec::RoutedWeightBoundary,
 }
 
@@ -747,6 +750,7 @@ impl Decode {
             format,
             shared_intermediate,
             swiglu_rounding,
+            swiglu_limit,
             routed_weight,
         } = options;
         ensure!(
@@ -829,8 +833,11 @@ impl Decode {
                 cpu_bounds.0,
                 cpu_bounds.1,
                 layout.fp8_slot().cloned(),
-                swiglu_rounding,
-                routed_weight,
+                crate::cpu::expert_ffn::ExpertBoundaries {
+                    swiglu_rounding,
+                    swiglu_limit,
+                    routed_weight,
+                },
             )?,
             stats: [0; 5],
         };

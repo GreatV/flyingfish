@@ -1091,7 +1091,11 @@ mod tests {
             rms_eps: 1e-6,
             rope_theta: 10_000_000.0,
             rotary_dim: 128,
-            linear_format: crate::model_spec::LinearFormat::Fp8E4m3Block128,
+            linear_format: crate::model_spec::LinearFormat::fp8_block(
+                [128, 128],
+                safetensors::Dtype::BF16,
+            )
+            .unwrap(),
             eos: vec![1],
             layers,
             moe: None,
@@ -1102,6 +1106,7 @@ mod tests {
                 value_head_dim: 128,
                 conv_kernel: 4,
             }),
+            glm5_next: None,
             vision: None,
         }
     }

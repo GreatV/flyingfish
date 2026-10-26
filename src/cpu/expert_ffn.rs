@@ -16,6 +16,59 @@ const LANES: usize = 16;
 /// Spin rounds a parked worker and the calling thread run before they block.
 const SPIN_ROUNDS: u32 = 65_536;
 
+fn validate_swiglu(rounding: crate::model_spec::SwigluRounding, limit: f32) -> Result<()> {
+    if matches!(
+        rounding,
+        crate::model_spec::SwigluRounding::ClampedTwice
+            | crate::model_spec::SwigluRounding::ClampedOnce
+    ) {
+        ensure!(limit.is_finite() && limit > 0.0, "invalid SwiGLU limit");
+    }
+    Ok(())
+}
+
+#[inline]
+fn silu_mul_value(
+    gate: bf16,
+    up: bf16,
+    rounding: crate::model_spec::SwigluRounding,
+    limit: f32,
+) -> f32 {
+    let (gate, up) = match rounding {
+        crate::model_spec::SwigluRounding::ClampedTwice
+        | crate::model_spec::SwigluRounding::ClampedOnce => {
+            (gate.to_f32().min(limit), up.to_f32().clamp(-limit, limit))
+        }
+        crate::model_spec::SwigluRounding::Twice | crate::model_spec::SwigluRounding::Once => {
+            (gate.to_f32(), up.to_f32())
+        }
+    };
+    let silu = match rounding {
+        crate::model_spec::SwigluRounding::Twice | crate::model_spec::SwigluRounding::Once => {
+            gate * (1.0 / (1.0 + (-gate).exp()))
+        }
+        crate::model_spec::SwigluRounding::ClampedTwice
+        | crate::model_spec::SwigluRounding::ClampedOnce => gate / (1.0 + (-gate).exp()),
+    };
+    match rounding {
+        crate::model_spec::SwigluRounding::Twice
+        | crate::model_spec::SwigluRounding::ClampedTwice => bf16::from_f32(silu).to_f32() * up,
+        crate::model_spec::SwigluRounding::Once
+        | crate::model_spec::SwigluRounding::ClampedOnce => silu * up,
+    }
+}
+
+/// Apply the published optional clamp and the selected BF16 rounding boundary.
+pub fn silu_mul(
+    gate: bf16,
+    up: bf16,
+    rounding: crate::model_spec::SwigluRounding,
+    limit: f32,
+) -> Result<bf16> {
+    validate_swiglu(rounding, limit)?;
+    Ok(bf16::from_f32(silu_mul_value(gate, up, rounding, limit)))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Shape {
     pub hidden: usize,
@@ -111,6 +164,9 @@ impl ExpertWeights {
                 (range.start..down, down..range.end)
             }
             ExpertLayout::Fp8W8a16(_) => (range.clone(), range),
+            ExpertLayout::Fp8W8a16Block(..) => {
+                anyhow::bail!("block-scale CPU expert arithmetic is not bound yet")
+            }
         };
         Ok(Self {
             gate_up,
@@ -271,6 +327,13 @@ fn arm_for(isa: Isa) -> Result<&'static Arm> {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ExpertBoundaries {
+    pub swiglu_rounding: crate::model_spec::SwigluRounding,
+    pub swiglu_limit: f32,
+    pub routed_weight: crate::model_spec::RoutedWeightBoundary,
+}
+
 /// One routed-expert contribution input.
 pub struct Contribution<'a> {
     pub shape: &'a Shape,
@@ -279,6 +342,7 @@ pub struct Contribution<'a> {
     pub hidden: &'a [bf16],
     pub routing: bf16,
     pub rounding: crate::model_spec::SwigluRounding,
+    pub limit: f32,
     pub routed_weight: crate::model_spec::RoutedWeightBoundary,
 }
 
@@ -297,6 +361,7 @@ pub fn contribution(
         .weights
         .validate(input.shape, input.arena.len(), None)?;
     scratch.check(input.shape)?;
+    validate_swiglu(input.rounding, input.limit)?;
     compute(arm_for(isa)?, input, out, scratch);
     Ok(())
 }
@@ -309,6 +374,7 @@ fn compute(arm: &Arm, input: Contribution<'_>, out: &mut [bf16], scratch: &mut S
         hidden,
         routing,
         rounding,
+        limit,
         routed_weight,
     } = input;
     let (hidden_width, intermediate) = (shape.hidden, shape.intermediate);
@@ -331,13 +397,7 @@ fn compute(arm: &Arm, input: Contribution<'_>, out: &mut [bf16], scratch: &mut S
     // SAFETY: as above.
     unsafe { (arm.round)(&scratch.up, &mut scratch.up_bf) };
     for j in 0..intermediate {
-        let gate = f32::from(scratch.gate_bf[j]);
-        let up = f32::from(scratch.up_bf[j]);
-        let activation = gate * (1.0 / (1.0 + (-gate).exp()));
-        scratch.product[j] = match rounding {
-            crate::model_spec::SwigluRounding::Twice => f32::from(bf16::from_f32(activation)) * up,
-            crate::model_spec::SwigluRounding::Once => activation * up,
-        };
+        scratch.product[j] = silu_mul_value(scratch.gate_bf[j], scratch.up_bf[j], rounding, limit);
     }
     // SAFETY: as above.
     unsafe { (arm.round)(&scratch.product, &mut scratch.activated) };
@@ -364,6 +424,9 @@ fn compute(arm: &Arm, input: Contribution<'_>, out: &mut [bf16], scratch: &mut S
                 *value = *source * weight;
             }
         }
+        crate::model_spec::RoutedWeightBoundary::BeforeDownQuantization => {
+            unreachable!("before-down quantization execution is not bound")
+        }
     }
     // SAFETY: as above.
     unsafe { (arm.round)(&scratch.weighted, out) };
@@ -378,6 +441,7 @@ pub struct Fp8Contribution<'a> {
     pub hidden: &'a [bf16],
     pub routing: bf16,
     pub rounding: crate::model_spec::SwigluRounding,
+    pub limit: f32,
     pub routed_weight: crate::model_spec::RoutedWeightBoundary,
 }
 
@@ -389,6 +453,7 @@ struct Fp8Rows<'a> {
     up_scale: &'a [u8],
     down_scale: &'a [u8],
     rounding: crate::model_spec::SwigluRounding,
+    limit: f32,
     routed_weight: crate::model_spec::RoutedWeightBoundary,
 }
 
@@ -438,9 +503,11 @@ pub fn fp8_contribution(
         up_scale: fp8_slice(input.slot, &layout.up_scale, intermediate * 2, "up scale")?,
         down_scale: fp8_slice(input.slot, &layout.down_scale, hidden * 2, "down scale")?,
         rounding: input.rounding,
+        limit: input.limit,
         routed_weight: input.routed_weight,
     };
     scratch.check(input.shape)?;
+    validate_swiglu(input.rounding, input.limit)?;
     compute_fp8(
         arm_for(isa)?,
         input.shape,
@@ -491,13 +558,12 @@ fn compute_fp8(
     // SAFETY: as above.
     unsafe { (arm.round)(&scratch.up, &mut scratch.up_bf) };
     for j in 0..intermediate {
-        let gate = f32::from(scratch.gate_bf[j]);
-        let up = f32::from(scratch.up_bf[j]);
-        let activation = gate * (1.0 / (1.0 + (-gate).exp()));
-        scratch.product[j] = match rows.rounding {
-            crate::model_spec::SwigluRounding::Twice => f32::from(bf16::from_f32(activation)) * up,
-            crate::model_spec::SwigluRounding::Once => activation * up,
-        };
+        scratch.product[j] = silu_mul_value(
+            scratch.gate_bf[j],
+            scratch.up_bf[j],
+            rows.rounding,
+            rows.limit,
+        );
     }
     // SAFETY: as above.
     unsafe { (arm.round)(&scratch.product, &mut scratch.activated) };
@@ -523,6 +589,9 @@ fn compute_fp8(
             for (value, source) in scratch.weighted.iter_mut().zip(&scratch.down) {
                 *value = *source * weight;
             }
+        }
+        crate::model_spec::RoutedWeightBoundary::BeforeDownQuantization => {
+            unreachable!("before-down quantization execution is not bound")
         }
     }
     // SAFETY: as above.
@@ -1479,8 +1548,7 @@ struct PoolShared {
     wake: Condvar,
     error: Mutex<Option<String>>,
     workers: usize,
-    swiglu_rounding: crate::model_spec::SwigluRounding,
-    routed_weight: crate::model_spec::RoutedWeightBoundary,
+    boundaries: ExpertBoundaries,
     generation: AtomicU64,
     pending: AtomicBool,
     shutdown: AtomicBool,
@@ -1633,8 +1701,11 @@ impl ExpertPool {
             max_rows,
             max_assignments,
             fp8_slot,
-            swiglu_rounding,
-            crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+            ExpertBoundaries {
+                swiglu_rounding,
+                swiglu_limit: 0.0,
+                routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+            },
         )
     }
 
@@ -1644,9 +1715,9 @@ impl ExpertPool {
         max_rows: usize,
         max_assignments: usize,
         fp8_slot: Option<Fp8Slot>,
-        swiglu_rounding: crate::model_spec::SwigluRounding,
-        routed_weight: crate::model_spec::RoutedWeightBoundary,
+        boundaries: ExpertBoundaries,
     ) -> Result<Self> {
+        validate_swiglu(boundaries.swiglu_rounding, boundaries.swiglu_limit)?;
         ensure!(
             workers > 0 && workers <= 256,
             "invalid expert worker count {workers}"
@@ -1681,8 +1752,7 @@ impl ExpertPool {
             wake: Condvar::new(),
             error: Mutex::new(None),
             workers,
-            swiglu_rounding,
-            routed_weight,
+            boundaries,
             generation: AtomicU64::new(0),
             pending: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
@@ -2100,7 +2170,7 @@ fn worker(
                     isa,
                     &mut local,
                     fp8_slot.as_ref(),
-                    shared.swiglu_rounding,
+                    shared.boundaries,
                 )
             }));
             let message = match outcome {
@@ -2156,9 +2226,9 @@ fn phases<const FP8: bool>(
     isa: Isa,
     local: &mut Local,
     fp8_slot: Option<&Fp8Slot>,
-    swiglu_rounding: crate::model_spec::SwigluRounding,
+    boundaries: ExpertBoundaries,
 ) -> Result<()> {
-    use crate::model_spec::{RoutedWeightBoundary, SwigluRounding};
+    use crate::model_spec::RoutedWeightBoundary;
     let arm = arm_for(isa)?;
     let (hidden, intermediate) = (shape.hidden, shape.intermediate);
     let workers = shared.workers;
@@ -2249,14 +2319,14 @@ fn phases<const FP8: bool>(
                 }
                 for (r, item) in group_items.iter().enumerate() {
                     let (gate, up) = local.pair_out[r];
-                    let gate = f32::from(bf16::from_f32(gate));
-                    let up = f32::from(bf16::from_f32(up));
-                    let activation = gate * (1.0 / (1.0 + (-gate).exp()));
-                    let product = match swiglu_rounding {
-                        SwigluRounding::Twice => f32::from(bf16::from_f32(activation)) * up,
-                        SwigluRounding::Once => activation * up,
-                    };
-                    let act = bf16::from_f32(product);
+                    let gate = bf16::from_f32(gate);
+                    let up = bf16::from_f32(up);
+                    let act = bf16::from_f32(silu_mul_value(
+                        gate,
+                        up,
+                        boundaries.swiglu_rounding,
+                        boundaries.swiglu_limit,
+                    ));
                     local
                         .out_pairs
                         .push((item.item as usize * intermediate + j, act.to_bits()));
@@ -2278,14 +2348,14 @@ fn phases<const FP8: bool>(
                 }
                 for (r, item) in group_items.iter().enumerate() {
                     let (gate, up) = local.pair_out[r];
-                    let gate = f32::from(bf16::from_f32(gate));
-                    let up = f32::from(bf16::from_f32(up));
-                    let activation = gate * (1.0 / (1.0 + (-gate).exp()));
-                    let product = match swiglu_rounding {
-                        SwigluRounding::Twice => f32::from(bf16::from_f32(activation)) * up,
-                        SwigluRounding::Once => activation * up,
-                    };
-                    let act = bf16::from_f32(product);
+                    let gate = bf16::from_f32(gate);
+                    let up = bf16::from_f32(up);
+                    let act = bf16::from_f32(silu_mul_value(
+                        gate,
+                        up,
+                        boundaries.swiglu_rounding,
+                        boundaries.swiglu_limit,
+                    ));
                     local
                         .out_pairs
                         .push((item.item as usize * intermediate + j, act.to_bits()));
@@ -2362,11 +2432,14 @@ fn phases<const FP8: bool>(
                 for (r, item) in group_items.iter().enumerate() {
                     let value = local.down_out[r];
                     let weight = f32::from(item.weight);
-                    let scaled = match shared.routed_weight {
+                    let scaled = match boundaries.routed_weight {
                         RoutedWeightBoundary::AfterDownBf16 => {
                             f32::from(bf16::from_f32(value)) * weight
                         }
                         RoutedWeightBoundary::BeforeContributionBf16 => value * weight,
+                        RoutedWeightBoundary::BeforeDownQuantization => {
+                            unreachable!("before-down quantization execution is not bound")
+                        }
                     };
                     let weighted = bf16::from_f32(scaled);
                     local
@@ -2389,11 +2462,14 @@ fn phases<const FP8: bool>(
                 for (r, item) in group_items.iter().enumerate() {
                     let value = local.down_out[r];
                     let weight = f32::from(item.weight);
-                    let scaled = match shared.routed_weight {
+                    let scaled = match boundaries.routed_weight {
                         RoutedWeightBoundary::AfterDownBf16 => {
                             f32::from(bf16::from_f32(value)) * weight
                         }
                         RoutedWeightBoundary::BeforeContributionBf16 => value * weight,
+                        RoutedWeightBoundary::BeforeDownQuantization => {
+                            unreachable!("before-down quantization execution is not bound")
+                        }
                     };
                     let weighted = bf16::from_f32(scaled);
                     local
@@ -2475,6 +2551,9 @@ pub fn measure_service_table(
             {
                 *value = bf16::from_f32((1.0 + (row % 19) as f32 / 32.0) / 8.0);
             }
+        }
+        ExpertLayout::Fp8W8a16Block(..) => {
+            unreachable!("block-scale fixtures are covered by the real checkpoint gate")
         }
     }
     for expert in 0..ring_experts {
@@ -2587,6 +2666,60 @@ mod tests {
 
     fn per_expert(shape: &Shape) -> usize {
         2 * shape.intermediate * shape.hidden + shape.hidden * shape.intermediate
+    }
+
+    #[test]
+    fn clamped_swiglu_matches_model_definition_bits() -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            gate: Vec<f32>,
+            up: Vec<f32>,
+            limit: f32,
+            twice: Vec<u16>,
+            once: Vec<u16>,
+        }
+        #[derive(serde::Deserialize)]
+        struct SharedFixture {
+            swiglu: Fixture,
+        }
+        let fixture: SharedFixture =
+            serde_json::from_str(include_str!("../../tests/data/shared-ops.json")).unwrap();
+        let fixture = fixture.swiglu;
+        let mut clamp_differences = 0;
+        for (index, (&gate, &up)) in fixture.gate.iter().zip(&fixture.up).enumerate() {
+            let gate = bf16::from_f32(gate);
+            let up = bf16::from_f32(up);
+            let twice = silu_mul(
+                gate,
+                up,
+                crate::model_spec::SwigluRounding::ClampedTwice,
+                fixture.limit,
+            )?;
+            let once = silu_mul(
+                gate,
+                up,
+                crate::model_spec::SwigluRounding::ClampedOnce,
+                fixture.limit,
+            )?;
+            assert_eq!(
+                twice.to_bits(),
+                fixture.twice[index],
+                "clamped twice {index}"
+            );
+            assert_eq!(once.to_bits(), fixture.once[index], "clamped once {index}");
+            clamp_differences += usize::from(
+                silu_mul(
+                    gate,
+                    up,
+                    crate::model_spec::SwigluRounding::Twice,
+                    fixture.limit,
+                )?
+                .to_bits()
+                    != fixture.twice[index],
+            );
+        }
+        assert!(clamp_differences > 0, "clamp control does not discriminate");
+        Ok(())
     }
 
     fn build_arena(shape: &Shape, experts: usize) -> Arc<HostBlocks> {
@@ -2733,6 +2866,7 @@ mod tests {
                     routing: bf16::ONE,
 
                     rounding: crate::model_spec::SwigluRounding::Twice,
+                    limit: 0.0,
                     routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                 },
                 &mut output,
@@ -2800,6 +2934,7 @@ mod tests {
                     routing: bf16::ONE,
 
                     rounding: crate::model_spec::SwigluRounding::Twice,
+                    limit: 0.0,
                     routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                 },
                 &mut output,
@@ -2849,6 +2984,7 @@ mod tests {
                     hidden: &hidden,
                     routing: bf16::ONE,
                     rounding: crate::model_spec::SwigluRounding::Once,
+                    limit: 0.0,
                     routed_weight: crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16,
                 },
                 &mut output,
@@ -2894,6 +3030,7 @@ mod tests {
                     hidden: &hidden,
                     routing: bf16::ONE,
                     rounding: crate::model_spec::SwigluRounding::Once,
+                    limit: 0.0,
                     routed_weight: crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16,
                 },
                 &mut output,
@@ -2922,6 +3059,7 @@ mod tests {
                 hidden: &hidden,
                 routing,
                 rounding: crate::model_spec::SwigluRounding::Twice,
+                limit: 0.0,
                 routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
             },
             &mut after,
@@ -2936,6 +3074,7 @@ mod tests {
                 hidden: &hidden,
                 routing,
                 rounding: crate::model_spec::SwigluRounding::Twice,
+                limit: 0.0,
                 routed_weight: crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16,
             },
             &mut before,
@@ -2967,6 +3106,7 @@ mod tests {
                     hidden: &hidden,
                     routing,
                     rounding: crate::model_spec::SwigluRounding::Twice,
+                    limit: 0.0,
                     routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                 },
                 &mut out,
@@ -3147,6 +3287,7 @@ mod tests {
                     hidden: &hidden,
                     routing,
                     rounding: crate::model_spec::SwigluRounding::Twice,
+                    limit: 0.0,
                     routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                 },
                 &mut out,
@@ -3213,6 +3354,7 @@ mod tests {
                     routing: item.weight,
 
                     rounding: crate::model_spec::SwigluRounding::Twice,
+                    limit: 0.0,
                     routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                 },
                 &mut expected[item.choice as usize * shape.hidden..][..shape.hidden],
@@ -3299,6 +3441,7 @@ mod tests {
                     hidden: &hidden,
                     routing,
                     rounding: crate::model_spec::SwigluRounding::Twice,
+                    limit: 0.0,
                     routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                 },
                 &mut scalar,
@@ -3319,6 +3462,7 @@ mod tests {
                         hidden: &hidden,
                         routing,
                         rounding: crate::model_spec::SwigluRounding::Twice,
+                        limit: 0.0,
                         routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                     },
                     &mut out,
@@ -3340,6 +3484,7 @@ mod tests {
                     hidden: &hidden,
                     routing,
                     rounding: crate::model_spec::SwigluRounding::Twice,
+                    limit: 0.0,
                     routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                 },
                 &mut mutant,
@@ -3372,6 +3517,7 @@ mod tests {
                     hidden: &hidden,
                     routing,
                     rounding: crate::model_spec::SwigluRounding::Twice,
+                    limit: 0.0,
                     routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                 },
                 &mut scalar,
@@ -3392,6 +3538,7 @@ mod tests {
                         hidden: &hidden,
                         routing,
                         rounding: crate::model_spec::SwigluRounding::Twice,
+                        limit: 0.0,
                         routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                     },
                     &mut out,
@@ -3426,6 +3573,7 @@ mod tests {
                 hidden: &hidden,
                 routing,
                 rounding: crate::model_spec::SwigluRounding::Twice,
+                limit: 0.0,
                 routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
             },
             &mut correct,
@@ -3441,6 +3589,7 @@ mod tests {
                 hidden: &hidden,
                 routing,
                 rounding: crate::model_spec::SwigluRounding::Twice,
+                limit: 0.0,
                 routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
             },
             &mut wrong_expert,
@@ -3474,6 +3623,7 @@ mod tests {
                 hidden: &hidden,
                 routing,
                 rounding: crate::model_spec::SwigluRounding::Twice,
+                limit: 0.0,
                 routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
             },
             &mut split,
@@ -3521,6 +3671,7 @@ mod tests {
                             routing: assignment.weight,
 
                             rounding: crate::model_spec::SwigluRounding::Twice,
+                            limit: 0.0,
                             routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                         },
                         out,
@@ -3612,6 +3763,7 @@ mod tests {
                     routing: assignment.weight,
 
                     rounding: crate::model_spec::SwigluRounding::Twice,
+                    limit: 0.0,
                     routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                 },
                 out,
@@ -3762,6 +3914,7 @@ mod tests {
                     routing: assignment.weight,
 
                     rounding: crate::model_spec::SwigluRounding::Twice,
+                    limit: 0.0,
                     routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                 },
                 out,
@@ -3948,6 +4101,7 @@ mod tests {
                     routing: weight[0],
 
                     rounding: crate::model_spec::SwigluRounding::Twice,
+                    limit: 0.0,
                     routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                 },
                 &mut out,
@@ -4158,6 +4312,7 @@ mod tests {
                             hidden: row_slice,
                             routing: item.weight,
                             rounding: crate::model_spec::SwigluRounding::Twice,
+                            limit: 0.0,
                             routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                         },
                         &mut expected_bf16[item.choice as usize * shape.hidden..][..shape.hidden],
@@ -4172,6 +4327,7 @@ mod tests {
                             hidden: row_slice,
                             routing: item.weight,
                             rounding: crate::model_spec::SwigluRounding::Twice,
+                            limit: 0.0,
                             routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                         },
                         &mut expected_fp8[item.choice as usize * shape.hidden..][..shape.hidden],

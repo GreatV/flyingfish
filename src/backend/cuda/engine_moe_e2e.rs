@@ -152,6 +152,7 @@ fn placement_components(engine: &Engine, model: &Path) -> Result<usize> {
                 .context("MoE shared geometry missing")?
                 .shared_intermediate,
             swiglu_rounding: engine.model_spec.swiglu_rounding(),
+            swiglu_limit: engine.model_spec.swiglu_limit(),
             routed_weight: engine.model_spec.routed_weight_boundary(),
         },
     )?;
@@ -481,6 +482,7 @@ fn minicpm_placement_invariance_gpu() -> Result<()> {
     let format_tag = match spec.expert_format {
         Some(crate::model_spec::ExpertFormat::Bf16) => "BF16",
         Some(crate::model_spec::ExpertFormat::Fp8W8a16) => "FP8",
+        Some(crate::model_spec::ExpertFormat::Fp8W8a16Block { .. }) => "FP8_BLOCK",
         _ => "UNSUPPORTED",
     };
     println!(
@@ -579,6 +581,9 @@ impl Bounds {
                 anyhow::bail!("Flint has no MiniCPM media fixture floor")
             }
             (crate::model_spec::ExpertFormat::Fp8W8a16, false) => same_grid,
+            (crate::model_spec::ExpertFormat::Fp8W8a16Block { .. }, false) => {
+                anyhow::bail!("GLM-5.3 has no MiniCPM media bounds")
+            }
         };
         let media = media_boundary(&controls[same_grid])?;
         let cross_media = media_boundary(&controls[cross_media])?;
@@ -1344,6 +1349,7 @@ fn native_cases(format: crate::model_spec::ExpertFormat) -> Result<&'static [&'s
             "video_control_clip2_16x",
             "video_control_same_grid_16x",
         ],
+        crate::model_spec::ExpertFormat::Fp8W8a16Block { .. } => &[],
         crate::model_spec::ExpertFormat::Fp8W8a16 => &[
             "text_32",
             "text_1k",

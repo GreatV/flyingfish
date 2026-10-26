@@ -255,7 +255,8 @@ impl SlotLayout {
                     "BF16 native matrix alignment: bytes={matrix_bytes}"
                 );
             }
-            crate::experts::catalogue::ExpertLayout::Fp8W8a16(layout) => {
+            crate::experts::catalogue::ExpertLayout::Fp8W8a16(layout)
+            | crate::experts::catalogue::ExpertLayout::Fp8W8a16Block(layout, _) => {
                 for (name, range) in [
                     ("gate", &layout.gate),
                     ("up", &layout.up),

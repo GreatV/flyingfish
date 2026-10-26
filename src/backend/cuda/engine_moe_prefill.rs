@@ -2634,6 +2634,7 @@ mod tests {
                             routing: bf16::ONE,
 
                             rounding: crate::model_spec::SwigluRounding::Twice,
+                            limit: 0.0,
                             routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                         },
                         &mut cpu_row,
@@ -3401,6 +3402,7 @@ mod tests {
                             routing: weight,
 
                             rounding: crate::model_spec::SwigluRounding::Twice,
+                            limit: 0.0,
                             routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                         },
                         out,
@@ -3417,6 +3419,7 @@ mod tests {
                             routing: weight,
 
                             rounding: crate::model_spec::SwigluRounding::Twice,
+                            limit: 0.0,
                             routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                         },
                         out,

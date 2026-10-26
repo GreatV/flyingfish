@@ -101,6 +101,14 @@ impl Fp8Ops {
     fn check(codes: &Tensor<u8, 2>, scale: &Tensor<bf16, 2>, layout: Fp8ScaleLayout) -> Result<()> {
         codes.validate()?;
         scale.validate()?;
+        if let Some(descriptor) = layout.block_scale() {
+            ensure!(
+                descriptor.block() == [128, 128] && descriptor.dtype() == safetensors::Dtype::BF16,
+                "CUDA FP8 block kernel does not support block={:?} dtype={:?}",
+                descriptor.block(),
+                descriptor.dtype()
+            );
+        }
         ensure!(
             codes.shape.iter().all(|&v| v <= i32::MAX as u32)
                 && codes.stride == [u64::from(codes.shape[1]), 1],
@@ -135,7 +143,7 @@ impl Fp8Ops {
         unsafe {
             stream
                 .launch_builder(match layout {
-                    Fp8ScaleLayout::Block128 => &self.dequant[0],
+                    Fp8ScaleLayout::Block(_) => &self.dequant[0],
                     Fp8ScaleLayout::PerChannel => &self.dequant[1],
                 })
                 .arg(&codes.ptr)
@@ -168,7 +176,7 @@ impl Fp8Ops {
             stream
                 .launch_builder(
                     &match layout {
-                        Fp8ScaleLayout::Block128 => &self.small[0],
+                        Fp8ScaleLayout::Block(_) => &self.small[0],
                         Fp8ScaleLayout::PerChannel => &self.small[1],
                     }[x.shape[0] as usize - 1],
                 )
@@ -236,7 +244,11 @@ impl WeightCatalog {
                     Tensor::new(p, shape, stride, entry.bytes as u64)?
                 }))
             }
-            super::weights::StoredTensor::Fp8(w) => {
+            super::weights::StoredTensor::Bytes(w) => {
+                ensure!(
+                    entry.dtype == safetensors::Dtype::F8_E4M3,
+                    "native linear weight is not FP8: {name}"
+                );
                 let scale_name = entry
                     .scale_name
                     .as_ref()
@@ -359,7 +371,7 @@ impl LayerLinearPlan {
             .with_context(|| format!("FFN projection not bound: role={role}"))?;
         let LinearWeightRef::Bf16(weight) = projection.resident else {
             anyhow::bail!(
-                "FFN projection format mismatch: role={role} format=Fp8E4m3Block128 expected=Bf16"
+                "FFN projection format mismatch: role={role} format=Fp8E4m3Block expected=Bf16"
             );
         };
         ensure!(
@@ -521,7 +533,7 @@ mod tests {
         let format = match weight {
             LinearWeightRef::Bf16(_) => "BF16",
             LinearWeightRef::Fp8 { layout, .. } => match layout {
-                Fp8ScaleLayout::Block128 => "FP8_BLOCK128",
+                Fp8ScaleLayout::Block(_) => "FP8_BLOCK",
                 Fp8ScaleLayout::PerChannel => "FP8_PER_CHANNEL",
             },
         };
@@ -816,7 +828,13 @@ mod tests {
                     })
                     .collect();
                 let codes = stream.clone_htod(&codes)?;
-                for layout in [Fp8ScaleLayout::Block128, Fp8ScaleLayout::PerChannel] {
+                for layout in [
+                    Fp8ScaleLayout::Block(
+                        crate::fp8::Fp8BlockScale::new([128, 128], safetensors::Dtype::BF16)
+                            .expect("valid BF16 block scale"),
+                    ),
+                    Fp8ScaleLayout::PerChannel,
+                ] {
                     let [scale_rows, scale_cols] = layout.scale_shape(n as u32, k as u32);
                     let scales: Vec<_> = (0..scale_rows * scale_cols)
                         .map(|i| bf16::from_f32(2f32.powi(-7 + (i % 3) as i32)))
@@ -834,7 +852,7 @@ mod tests {
                         layout,
                     };
                     let bound = match layout {
-                        Fp8ScaleLayout::Block128 => &blas,
+                        Fp8ScaleLayout::Block(_) => &blas,
                         Fp8ScaleLayout::PerChannel => &bind_first,
                     };
                     defects += invariant_rows(device, bound, &ops, weight, (n, k))?;
@@ -1014,7 +1032,7 @@ mod tests {
             let catalog = WeightCatalog {
                 linear_format: spec.linear_format,
                 tensors: [
-                    (name.clone(), StoredTensor::Fp8(codes)),
+                    (name.clone(), StoredTensor::Bytes(codes)),
                     (scale_name.clone(), StoredTensor::Bf16(scales)),
                 ]
                 .into(),

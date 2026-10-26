@@ -56,7 +56,7 @@ impl LayerDequantPlan {
             manifest,
             0,
             "mtp.layers.0.".into(),
-            LinearFormat::Fp8E4m3Block128,
+            LinearFormat::fp8_block([128, 128], Dtype::BF16)?,
         )
     }
 
@@ -79,27 +79,28 @@ impl LayerDequantPlan {
             ensure!(e.shape.len() == 2, "linear weight is not a matrix");
             let n = u32::try_from(e.shape[0])?;
             let k = u32::try_from(e.shape[1])?;
+            let layout = format.fp8_layout().context("FP8 scale layout missing")?;
             let scale_name = format!(
                 "{}.{}",
                 name.strip_suffix(".weight").context("FP8 weight name")?,
-                format
-                    .fp8_layout()
-                    .context("BF16 plan contains an FP8 weight")?
-                    .scale_suffix()
+                layout.scale_suffix()
             );
             let scale = manifest
                 .entries
                 .get(&scale_name)
                 .context("FP8 weight missing scale")?;
+            let scale_dtype = layout.scale_dtype();
+            if let Some(block) = layout.block_scale() {
+                block.validate_scale(n, k, scale.dtype, &scale.shape, scale.bytes)?;
+            } else {
+                ensure!(
+                    scale.dtype == scale_dtype && scale.shape == layout.scale_shape(n, k),
+                    "FP8 scale layout mismatch"
+                );
+            }
             ensure!(
-                scale.dtype == Dtype::BF16
-                    && scale.shape
-                        == format
-                            .fp8_layout()
-                            .context("FP8 scale layout missing")?
-                            .scale_shape(n, k)
-                    && e.scale_name.as_ref() == Some(&scale_name),
-                "FP8 scale layout mismatch"
+                e.scale_name.as_ref() == Some(&scale_name),
+                "FP8 scale name mismatch"
             );
             let size = u64::from(n)
                 .checked_mul(u64::from(k))
@@ -134,7 +135,7 @@ impl LayerDequantPlan {
             "missing linear layer {layer}"
         );
         let plan_shape = match format {
-            LinearFormat::Fp8E4m3Block128 => !slots.is_empty(),
+            LinearFormat::Fp8E4m3Block { .. } => !slots.is_empty(),
             LinearFormat::Bf16 => slots.is_empty(),
             LinearFormat::Fp8E4m3Channel => true,
         };
@@ -182,8 +183,12 @@ mod tests {
             resident_bytes: 8192 * 2048 * 2,
         };
         let plan = LayerDequantPlan::from_manifest(&manifest, 0, LinearFormat::Bf16)?;
-        let error = LayerDequantPlan::from_manifest(&manifest, 0, LinearFormat::Fp8E4m3Block128)
-            .unwrap_err();
+        let error = LayerDequantPlan::from_manifest(
+            &manifest,
+            0,
+            LinearFormat::fp8_block([128, 128], Dtype::BF16)?,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("0 FP8 slots"), "{error}");
         assert_eq!(plan.bytes, 0);
         assert!(plan.slots.is_empty());
@@ -200,7 +205,10 @@ mod tests {
         ignored.role = role;
         manifest.entries.insert(original, ignored);
         let name = manifest.entries.keys().next().unwrap().clone();
-        for format in [LinearFormat::Fp8E4m3Block128, LinearFormat::Fp8E4m3Channel] {
+        for format in [
+            LinearFormat::fp8_block([128, 128], Dtype::BF16)?,
+            LinearFormat::Fp8E4m3Channel,
+        ] {
             let layout = format.fp8_layout().unwrap();
             let scale_name = format!(
                 "{}.{}",

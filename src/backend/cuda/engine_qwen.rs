@@ -193,7 +193,7 @@ fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
             4,
             64,
             48,
-            LinearFormat::Fp8E4m3Block128,
+            LinearFormat::fp8_block([128, 128], safetensors::Dtype::BF16)?,
         ),
         Architecture::MiniCpmV47 => {
             ensure!(
@@ -207,7 +207,7 @@ fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
             );
             (2048, 512, 248144, 16, 2, 40, 32, spec.linear_format)
         }
-        Architecture::Llama | Architecture::Flint => anyhow::bail!(
+        Architecture::Llama | Architecture::Flint | Architecture::Glm5Next => anyhow::bail!(
             "hybrid engine does not implement architecture={:?}",
             spec.architecture
         ),
@@ -3379,9 +3379,12 @@ mod tests {
                     "linear_format" => {
                         bad.linear_format = match original.linear_format {
                             crate::model_spec::LinearFormat::Bf16 => {
-                                crate::model_spec::LinearFormat::Fp8E4m3Block128
+                                crate::model_spec::LinearFormat::fp8_block(
+                                    [128, 128],
+                                    safetensors::Dtype::BF16,
+                                )?
                             }
-                            crate::model_spec::LinearFormat::Fp8E4m3Block128 => {
+                            crate::model_spec::LinearFormat::Fp8E4m3Block { .. } => {
                                 crate::model_spec::LinearFormat::Bf16
                             }
                             crate::model_spec::LinearFormat::Fp8E4m3Channel => {

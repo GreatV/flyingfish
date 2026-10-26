@@ -6,11 +6,13 @@
 use crate::backend::cuda::contracts::{Tensor, TensorMut, no_overlap};
 use crate::backend::cuda::cubin;
 use crate::backend::cuda::ops::grid;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use cudarc::cublas::{CudaBlas, sys as bs};
-use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{
+    CudaContext, CudaFunction, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg,
+};
 use half::bf16;
-use std::sync::Arc;
+use std::{any::TypeId, sync::Arc};
 
 /// Experts per `moe_route_logits_bf16` block and its block size.
 const LOGITS_EXPERTS: u32 = 32;
@@ -20,6 +22,7 @@ pub(crate) struct RouteOps {
     logits: CudaFunction,
     topk: CudaFunction,
     sigmoid_topk: CudaFunction,
+    noaux_topk: CudaFunction,
     blas: CudaBlas,
     stream: Arc<CudaStream>,
 }
@@ -36,6 +39,7 @@ impl RouteOps {
             logits: module.load_function("moe_route_logits_bf16")?,
             topk: module.load_function("moe_route_topk")?,
             sigmoid_topk: module.load_function("moe_route_topk_sigmoid")?,
+            noaux_topk: module.load_function("moe_route_topk_noaux")?,
             blas,
             stream: stream.clone(),
         })
@@ -138,6 +142,108 @@ impl RouteOps {
         self.topk(stream, &plan, logits, ids, weights, score)
     }
 
+    pub fn topk_noaux<T: DeviceRepr + Copy + 'static>(
+        &self,
+        logits: Tensor<T, 2>,
+        bias: Option<Tensor<f32, 2>>,
+        ids: &mut TensorMut<i32, 2>,
+        weights: &mut TensorMut<bf16, 2>,
+        score: crate::model_spec::RouterScore,
+        routed_scaling: f32,
+    ) -> Result<()> {
+        let (rows, experts) = (logits.shape[0], logits.shape[1]);
+        let top_k = ids.0.shape[1];
+        if TypeId::of::<T>() == TypeId::of::<bf16>() {
+            ensure!(
+                experts > 0
+                    && experts <= 1024
+                    && top_k > 0
+                    && top_k < experts
+                    && top_k <= 32
+                    && bias.is_none()
+                    && score == crate::model_spec::RouterScore::Sigmoid
+                    && routed_scaling == 1.0
+                    && logits.ptr.is_multiple_of(16),
+                "BF16 sigmoid requires zero bias, unit scaling and top_k below experts"
+            );
+            unsafe {
+                self.stream
+                    .launch_builder(&self.sigmoid_topk)
+                    .arg(&logits.ptr)
+                    .arg(&ids.0.ptr)
+                    .arg(&weights.0.ptr)
+                    .arg(&rows)
+                    .arg(&experts)
+                    .arg(&top_k)
+                    .launch(grid(rows as usize, experts.div_ceil(32) * 32))?;
+            }
+            return Ok(());
+        }
+        logits.validate()?;
+        ids.0.validate()?;
+        weights.0.validate()?;
+        ensure!(
+            experts > 0 && experts <= 1024 && top_k > 0 && top_k <= 32 && top_k <= experts,
+            "invalid noaux extents rows={rows} experts={experts} top_k={top_k}"
+        );
+        ensure!(
+            ids.0.shape == [rows, top_k] && weights.0.shape == [rows, top_k],
+            "noaux input/output shape mismatch"
+        );
+        ensure!(
+            logits.stride == [u64::from(experts), 1]
+                && ids.0.stride == [u64::from(top_k), 1]
+                && weights.0.stride == ids.0.stride,
+            "noaux requires dense logits and contiguous outputs"
+        );
+        ensure!(
+            routed_scaling.is_finite() && routed_scaling > 0.0,
+            "invalid routed scaling"
+        );
+        no_overlap(&logits, &ids.0, "logits", "ids")?;
+        no_overlap(&logits, &weights.0, "logits", "weights")?;
+        no_overlap(&ids.0, &weights.0, "ids", "weights")?;
+        if let Some(bias) = bias {
+            bias.validate()?;
+            ensure!(
+                bias.shape == [rows, experts]
+                    && bias.stride == logits.stride
+                    && bias.ptr.is_multiple_of(4),
+                "noaux bias must be an aligned dense [rows, experts] FP32 view"
+            );
+            no_overlap(&bias, &ids.0, "bias", "ids")?;
+            no_overlap(&bias, &weights.0, "bias", "weights")?;
+            no_overlap(&bias, &logits, "bias", "logits")?;
+        }
+        ensure!(
+            TypeId::of::<T>() == TypeId::of::<f32>(),
+            "noaux logits must be BF16 sigmoid or FP32"
+        );
+        let bias = bias.context("FP32 noaux requires an explicit bias input")?;
+        let score_mode = match score {
+            crate::model_spec::RouterScore::Sigmoid => 0,
+            crate::model_spec::RouterScore::SqrtSoftplus => 1,
+            crate::model_spec::RouterScore::Softmax => {
+                anyhow::bail!("noaux_tc requires a pointwise score")
+            }
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.noaux_topk)
+                .arg(&logits.ptr)
+                .arg(&bias.ptr)
+                .arg(&ids.0.ptr)
+                .arg(&weights.0.ptr)
+                .arg(&rows)
+                .arg(&experts)
+                .arg(&top_k)
+                .arg(&score_mode)
+                .arg(&routed_scaling)
+                .launch(grid(rows as usize, experts.div_ceil(32) * 32))?;
+        }
+        Ok(())
+    }
+
     fn topk(
         &self,
         stream: &Arc<CudaStream>,
@@ -147,9 +253,15 @@ impl RouteOps {
         weights: &mut TensorMut<bf16, 2>,
         score: crate::model_spec::RouterScore,
     ) -> Result<()> {
+        if score == crate::model_spec::RouterScore::Sigmoid {
+            return self.topk_noaux(logits.0, None, ids, weights, score, 1.0);
+        }
         let function = match score {
             crate::model_spec::RouterScore::Softmax => &self.topk,
-            crate::model_spec::RouterScore::Sigmoid => &self.sigmoid_topk,
+            crate::model_spec::RouterScore::SqrtSoftplus => {
+                anyhow::bail!("sqrt-softplus requires the FP32 noaux entry")
+            }
+            crate::model_spec::RouterScore::Sigmoid => unreachable!(),
         };
         unsafe {
             stream

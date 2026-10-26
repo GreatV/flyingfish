@@ -486,6 +486,219 @@ fn sigmoid_route(device: &Device, ops: &RouteOps) -> Result<()> {
     Ok(())
 }
 
+fn noaux_margin(
+    logits: &[f32],
+    bias: &[f32],
+    ids: &[i32],
+    score: crate::model_spec::RouterScore,
+) -> f32 {
+    let raw = |id: usize| match score {
+        crate::model_spec::RouterScore::Sigmoid => 1.0 / (1.0 + (-logits[id]).exp()),
+        crate::model_spec::RouterScore::SqrtSoftplus => {
+            let softplus = logits[id].max(0.0) + (-logits[id].abs()).exp().ln_1p();
+            softplus.sqrt()
+        }
+        crate::model_spec::RouterScore::Softmax => unreachable!(),
+    };
+    let last = ids[ids.len() - 1] as usize;
+    let cut = raw(last) + bias[last];
+    let next = (0..logits.len())
+        .filter(|id| !ids.contains(&(*id as i32)))
+        .map(|id| raw(id) + bias[id])
+        .fold(f32::NEG_INFINITY, f32::max);
+    cut - next
+}
+
+fn noaux_route(device: &Device, ops: &RouteOps) -> Result<()> {
+    let (rows, experts) = (2usize, 8usize);
+    let base = [0.25f32, -0.5, 1.0, 0.75, -1.25, 0.125, 0.5, -0.75];
+    let mut host_logits = base.repeat(rows);
+    host_logits[experts + 3] = host_logits[experts + 2];
+    let host_bias: Vec<f32> = (0..rows)
+        .flat_map(|_| [0.0, 0.0, 0.0, 0.0, 0.6, 0.0, 0.0, 0.4])
+        .collect();
+    let s = &device.stream;
+    let lb = testing::upload(&device.upload, host_logits.clone())?;
+    let bb = testing::upload(&device.upload, host_bias.clone())?;
+    device.finish_upload()?;
+    let modes = [
+        ("sigmoid", crate::model_spec::RouterScore::Sigmoid, 2.5),
+        (
+            "sqrtsoftplus",
+            crate::model_spec::RouterScore::SqrtSoftplus,
+            1.5,
+        ),
+    ];
+    for (mode, score, scaling) in modes {
+        for top_k in [4usize, 8] {
+            let ids = testing::zeros::<i32>(s, rows * top_k)?;
+            let weights = testing::zeros::<bf16>(s, rows * top_k)?;
+            let logits = testing::dense(&lb, s, rows as u32, experts as u32)?;
+            let bias = testing::dense(&bb, s, rows as u32, experts as u32)?;
+            let mut ids_view = testing::dense_mut(&ids, s, rows as u32, top_k as u32)?;
+            let mut weights_view = testing::dense_mut(&weights, s, rows as u32, top_k as u32)?;
+            ops.topk_noaux(
+                logits,
+                Some(bias),
+                &mut ids_view,
+                &mut weights_view,
+                score,
+                scaling,
+            )?;
+            s.synchronize()?;
+            let actual_ids = s.clone_dtoh(&ids)?;
+            let actual_weights = s.clone_dtoh(&weights)?;
+            for row in 0..rows {
+                let row_logits = &host_logits[row * experts..(row + 1) * experts];
+                let (expected_ids, expected_weights) = reference::noaux_tc_route(
+                    row_logits,
+                    &host_bias[row * experts..(row + 1) * experts],
+                    top_k,
+                    score,
+                    scaling,
+                )?;
+                ensure!(
+                    actual_ids[row * top_k..(row + 1) * top_k] == expected_ids,
+                    "noaux {mode} top_k={top_k} row={row} ids mismatch"
+                );
+                let margin = noaux_margin(
+                    row_logits,
+                    &host_bias[row * experts..(row + 1) * experts],
+                    &expected_ids,
+                    score,
+                );
+                if top_k < experts {
+                    ensure!(
+                        margin > 2.0 * f32::EPSILON,
+                        "noaux {mode} top_k={top_k} row={row} cut margin {margin:e} is below the ID detection floor"
+                    );
+                }
+                eprintln!(
+                    "MOE_ROUTE_NOAUX_MARGIN mode={mode} top_k={top_k} row={row} margin={margin:e}"
+                );
+                if row == 1 {
+                    ensure!(
+                        row_logits[2] == row_logits[3]
+                            && host_bias[experts + 2] == host_bias[experts + 3],
+                        "noaux exact-tie fixture is not tied"
+                    );
+                    let row_ids = &actual_ids[row * top_k..(row + 1) * top_k];
+                    let lower = row_ids.iter().position(|&id| id == 2);
+                    let higher = row_ids.iter().position(|&id| id == 3);
+                    ensure!(
+                        lower.is_some() && higher.is_some() && lower < higher,
+                        "noaux exact tie did not select the lower expert ID first"
+                    );
+                }
+                for (choice, (actual, expected)) in actual_weights[row * top_k..(row + 1) * top_k]
+                    .iter()
+                    .zip(&expected_weights)
+                    .enumerate()
+                {
+                    let actual = actual.to_f32();
+                    let expected = *expected;
+                    let tolerance = reference::bf16_ulp(expected) + 2.0 * f32::EPSILON;
+                    ensure!(
+                        (actual - expected).abs() <= tolerance,
+                        "noaux {mode} top_k={top_k} row={row} choice={choice} actual={actual} expected={expected} tolerance={tolerance}"
+                    );
+                }
+                if top_k == 4 && row == 0 {
+                    let (zero_bias_ids, _) = reference::noaux_tc_route(
+                        row_logits,
+                        &vec![0.0; experts],
+                        top_k,
+                        score,
+                        scaling,
+                    )?;
+                    ensure!(
+                        zero_bias_ids != expected_ids,
+                        "noaux {mode} bias control does not change selection"
+                    );
+                }
+            }
+            eprintln!("MOE_ROUTE_NOAUX mode={mode} top_k={top_k} scaling={scaling} PASS");
+        }
+    }
+    let experts = 288usize;
+    let launch = crate::backend::cuda::ops::grid(1, experts as u32);
+    ensure!(
+        launch.block_dim.0 as usize >= experts,
+        "noaux launch blockDim {} is below experts={experts}",
+        launch.block_dim.0
+    );
+    let host_logits: Vec<f32> = (0..experts)
+        .map(|index| {
+            let x = index as f32;
+            (x * 0.37).sin() + 0.25 * (x * 0.013).cos() + (index % 17) as f32 * 1e-6
+        })
+        .collect();
+    let host_bias: Vec<f32> = (0..experts)
+        .map(|index| 0.05 * (index as f32 * 0.19).cos())
+        .collect();
+    let lb = testing::upload(&device.upload, host_logits.clone())?;
+    let bb = testing::upload(&device.upload, host_bias.clone())?;
+    device.finish_upload()?;
+    for (mode, score, scaling) in modes {
+        let top_k = 8usize;
+        let ids = testing::zeros::<i32>(s, top_k)?;
+        let weights = testing::zeros::<bf16>(s, top_k)?;
+        let logits = testing::dense(&lb, s, 1, experts as u32)?;
+        let bias = testing::dense(&bb, s, 1, experts as u32)?;
+        let mut ids_view = testing::dense_mut(&ids, s, 1, top_k as u32)?;
+        let mut weights_view = testing::dense_mut(&weights, s, 1, top_k as u32)?;
+        ops.topk_noaux(
+            logits,
+            Some(bias),
+            &mut ids_view,
+            &mut weights_view,
+            score,
+            scaling,
+        )?;
+        s.synchronize()?;
+        let actual_ids = s.clone_dtoh(&ids)?;
+        let actual_weights = s.clone_dtoh(&weights)?;
+        let (expected_ids, expected_weights) =
+            reference::noaux_tc_route(&host_logits, &host_bias, top_k, score, scaling)?;
+        ensure!(
+            actual_ids == expected_ids,
+            "noaux {mode} experts={experts} ids mismatch"
+        );
+        let margin = noaux_margin(&host_logits, &host_bias, &expected_ids, score);
+        ensure!(
+            margin > 2.0 * f32::EPSILON,
+            "noaux {mode} experts={experts} cut margin {margin:e} is below the ID detection floor"
+        );
+        for (choice, (actual, expected)) in actual_weights.iter().zip(&expected_weights).enumerate()
+        {
+            let actual = actual.to_f32();
+            let expected = *expected;
+            let tolerance = reference::bf16_ulp(expected) + 2.0 * f32::EPSILON;
+            ensure!(
+                (actual - expected).abs() <= tolerance,
+                "noaux {mode} experts={experts} choice={choice} actual={actual} expected={expected} tolerance={tolerance}"
+            );
+        }
+        eprintln!(
+            "MOE_ROUTE_NOAUX_LARGE mode={mode} experts={experts} top_k={top_k} blockDim={} margin={margin:e} PASS",
+            launch.block_dim.0
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires coordinator-granted GPU window; FF_Q38_GPU_WINDOW=granted"]
+fn moe_route_noaux_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let device = Device::new(0)?;
+    let ops = RouteOps::new(&device.ctx, &device.stream)?;
+    noaux_route(&device, &ops)
+}
+
 #[test]
 #[ignore = "requires coordinator-granted GPU window; FF_Q38_GPU_WINDOW=granted"]
 fn moe_route_gpu() -> Result<()> {

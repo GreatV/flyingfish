@@ -19,7 +19,10 @@ fn g0_normalized_geometry_and_rejections() {
         })
     );
     assert_eq!(spec.moe, None);
-    assert_eq!(spec.linear_format, LinearFormat::Fp8E4m3Block128);
+    assert_eq!(
+        spec.linear_format,
+        LinearFormat::fp8_block([128, 128], safetensors::Dtype::BF16).unwrap()
+    );
     let canonical = serde_json::to_string(&spec).unwrap();
     assert_eq!(
         canonical,
