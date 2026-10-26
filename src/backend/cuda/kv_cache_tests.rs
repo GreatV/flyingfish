@@ -738,6 +738,7 @@ fn gqa32_qknorm_rope_nope_gpu() -> Result<()> {
                 .arg(&q_norm_dev)
                 .arg(&k_norm_dev)
                 .arg(&start_dev)
+                .arg(&-1i32)
                 .arg(&(rows as i32))
                 .arg(&(hq as i32))
                 .arg(&(hkv as i32))
@@ -971,6 +972,7 @@ fn flint_sliding_ring_prefill_interleaved_gpu() -> Result<()> {
                     .arg(&q_norm_dev)
                     .arg(&k_norm_dev)
                     .arg(&position)
+                    .arg(&-1i32)
                     .arg(&(rows as i32))
                     .arg(&(hq as i32))
                     .arg(&(hkv as i32))
@@ -1007,6 +1009,7 @@ fn flint_sliding_ring_prefill_interleaved_gpu() -> Result<()> {
                         .arg(&q_norm_dev)
                         .arg(&k_norm_dev)
                         .arg(&position)
+                        .arg(&-1i32)
                         .arg(&1i32)
                         .arg(&(hq as i32))
                         .arg(&(hkv as i32))
@@ -1083,6 +1086,209 @@ fn flint_sliding_ring_prefill_interleaved_gpu() -> Result<()> {
         "full-write negative control passed the interleaved bound: max={:.9e} cosine={:.9e} bound={legacy_bound:e}",
         legacy_metrics.max_abs,
         legacy_metrics.cosine
+    );
+    let chunk = 520usize;
+    let logical_k: &dyn Fn(usize) -> Vec<bf16> = &|p: usize| -> Vec<bf16> {
+        (0..kv_width)
+            .map(|i| bf16::from_f32((((i * 61 + 29 + p * 37) % 503) as f32) / 64.0 - 4.0))
+            .collect()
+    };
+    let logical_v: &dyn Fn(usize) -> Vec<bf16> = &|p: usize| -> Vec<bf16> {
+        (0..kv_width)
+            .map(|i| bf16::from_f32((((i * 47 + 41 + p * 43) % 503) as f32) / 64.0 - 4.0))
+            .collect()
+    };
+    let staged_capacity = 512 + chunk;
+    let window = ring - 1;
+    let mut flash = Flash::new(s.clone(), chunk, hq)?;
+    let mut initial_k = vec![bf16::ZERO; hkv * ring * dim];
+    let mut initial_v = vec![bf16::ZERO; hkv * ring * dim];
+    for absolute in 0..=512 {
+        let source_k = logical_k(absolute);
+        let source_v = logical_v(absolute);
+        for head in 0..hkv {
+            initial_k
+                [(head * ring + absolute % ring) * dim..(head * ring + absolute % ring + 1) * dim]
+                .copy_from_slice(&source_k[head * dim..(head + 1) * dim]);
+            initial_v
+                [(head * ring + absolute % ring) * dim..(head * ring + absolute % ring + 1) * dim]
+                .copy_from_slice(&source_v[head * dim..(head + 1) * dim]);
+        }
+    }
+    let mut ring_k = s.clone_htod(&initial_k)?;
+    let mut ring_v = s.clone_htod(&initial_v)?;
+    let mut stage_k = vec![bf16::ZERO; hkv * staged_capacity * dim];
+    let mut stage_v = vec![bf16::ZERO; hkv * staged_capacity * dim];
+    for absolute in 513..=1032 {
+        let source_k = logical_k(absolute);
+        let source_v = logical_v(absolute);
+        let storage = absolute - 1;
+        for head in 0..hkv {
+            stage_k[(head * staged_capacity + storage) * dim
+                ..(head * staged_capacity + storage + 1) * dim]
+                .copy_from_slice(&source_k[head * dim..(head + 1) * dim]);
+            stage_v[(head * staged_capacity + storage) * dim
+                ..(head * staged_capacity + storage + 1) * dim]
+                .copy_from_slice(&source_v[head * dim..(head + 1) * dim]);
+        }
+    }
+    let mut stage_k = s.clone_htod(&stage_k)?;
+    let mut stage_v = s.clone_htod(&stage_v)?;
+    for (source, target) in [(&ring_k, &mut stage_k), (&ring_v, &mut stage_v)] {
+        super::copy::RingCopy {
+            stream: s,
+            source,
+            target,
+            source_capacity: ring,
+            target_capacity: staged_capacity,
+        }
+        .run(1, 0, 512, true, false)?;
+    }
+    for (actual, logical) in [
+        (s.clone_dtoh(&stage_k)?, &logical_k),
+        (s.clone_dtoh(&stage_v)?, &logical_v),
+    ] {
+        for head in 0..hkv {
+            for position in 0..staged_capacity {
+                let expected = logical(position + 1);
+                assert_eq!(
+                    &actual[(head * staged_capacity + position) * dim
+                        ..(head * staged_capacity + position + 1) * dim],
+                    &expected[head * dim..(head + 1) * dim],
+                    "staged K/V mismatch at head={head} position={position}"
+                );
+            }
+        }
+    }
+    let staged_q = s.alloc_zeros::<bf16>(chunk * hq * dim)?;
+    let no_sinks = s.clone_htod(&vec![bf16::NEG_INFINITY; hq])?;
+    let mut staged_output = s.alloc_zeros::<bf16>(chunk * hq * dim)?;
+    flash.run(
+        &staged_q,
+        hq * dim,
+        &stage_k,
+        &stage_v,
+        &mut staged_output,
+        Shape {
+            rows: chunk,
+            start: 512,
+            q_heads: hq,
+            kv_heads: hkv,
+            capacity: staged_capacity,
+            head_dim: dim,
+            causal: true,
+            window_left: Some(window),
+        },
+    )?;
+    flash.apply_sinks(&no_sinks, &mut staged_output, chunk, hq)?;
+    for (source, target) in [(&stage_k, &mut ring_k), (&stage_v, &mut ring_v)] {
+        super::copy::RingCopy {
+            stream: s,
+            source,
+            target,
+            source_capacity: staged_capacity,
+            target_capacity: ring,
+        }
+        .run(519, 520 % ring, 513, false, true)?;
+    }
+    for (actual, logical) in [
+        (s.clone_dtoh(&ring_k)?, &logical_k),
+        (s.clone_dtoh(&ring_v)?, &logical_v),
+    ] {
+        for head in 0..hkv {
+            for position in 0..ring {
+                let expected = logical(520 + (position + ring - 520 % ring) % ring);
+                assert_eq!(
+                    &actual[(head * ring + position) * dim..(head * ring + position + 1) * dim],
+                    &expected[head * dim..(head + 1) * dim],
+                    "committed K/V mismatch at head={head} position={position}"
+                );
+            }
+        }
+    }
+    let mut prefix = vec![0.0f32; hkv * dim * 1033];
+    for head in 0..hkv {
+        for d in 0..dim {
+            for absolute in 1..=1032 {
+                let value = logical_v(absolute)[head * dim + d].to_f32();
+                prefix[(head * dim + d) * 1033 + absolute] =
+                    prefix[(head * dim + d) * 1033 + absolute - 1] + value;
+            }
+        }
+    }
+    let staged_actual = s.clone_dtoh(&staged_output)?;
+    let mut expected = vec![0.0f32; chunk * hq * dim];
+    for row in 0..chunk {
+        let absolute = 513 + row;
+        let first = absolute.saturating_sub(window);
+        let tokens = absolute - first + 1;
+        for head in 0..hq {
+            let kv_head = head / (hq / hkv);
+            for d in 0..dim {
+                let index = (kv_head * dim + d) * 1033;
+                let before = if first == 0 {
+                    0.0
+                } else {
+                    prefix[index + first - 1]
+                };
+                expected[(row * hq + head) * dim + d] =
+                    (prefix[index + absolute] - before) / tokens as f32;
+            }
+        }
+    }
+    let metrics = attention_metrics(&staged_actual, &expected);
+    let bound = super::bf16_chain_bound(3, &[dim, window + 2]) as f32 * metrics.max_reference;
+    ensure!(
+        metrics.max_abs <= bound,
+        "staged FA2 max={} bound={bound}",
+        metrics.max_abs
+    );
+    ensure!(metrics.p99_abs <= bound / 2.0, "staged FA2 p99 bound");
+    ensure!(metrics.mean_abs <= bound / 4.0, "staged FA2 mean bound");
+    ensure!(
+        metrics.cosine >= 1.0 - bound as f32,
+        "staged FA2 cosine bound"
+    );
+    for (source, target) in [(&ring_k, &mut stage_k), (&ring_v, &mut stage_v)] {
+        super::copy::RingCopy {
+            stream: s,
+            source,
+            target,
+            source_capacity: ring,
+            target_capacity: staged_capacity,
+        }
+        .run(1031 % ring, 0, 1, false, false)?;
+    }
+    let mut overwrite_output = s.alloc_zeros::<bf16>(chunk * hq * dim)?;
+    flash.run(
+        &staged_q,
+        hq * dim,
+        &stage_k,
+        &stage_v,
+        &mut overwrite_output,
+        Shape {
+            rows: chunk,
+            start: 512,
+            q_heads: hq,
+            kv_heads: hkv,
+            capacity: staged_capacity,
+            head_dim: dim,
+            causal: true,
+            window_left: Some(window),
+        },
+    )?;
+    flash.apply_sinks(&no_sinks, &mut overwrite_output, chunk, hq)?;
+    let overwrite_output = s.clone_dtoh(&overwrite_output)?;
+    ensure!(
+        staged_actual
+            .iter()
+            .zip(&overwrite_output)
+            .any(|(a, b)| a.to_bits() != b.to_bits()),
+        "early-key overwrite control does not discriminate"
+    );
+    eprintln!(
+        "FLINT_STAGED_RING chunk={chunk} staged_capacity={staged_capacity} max_abs={:.9e} p99_abs={:.9e} mean_abs={:.9e} cosine={:.9e} relative_bound={bound:e} overwrite_control=PASS",
+        metrics.max_abs, metrics.p99_abs, metrics.mean_abs, metrics.cosine
     );
     eprintln!(
         "FLINT_RING_PREFILL rows={rows} ring={ring} interleaved_max={:.9e} interleaved_cosine={:.9e} legacy_max={:.9e} legacy_cosine={:.9e} PASS",
@@ -1364,6 +1570,7 @@ fn fa2_gqa32_learned_sink_gpu() -> Result<()> {
         "FA2_GQA32_SLIDING rows={slide_rows} window={window} max_abs={:.9e} p99_abs={:.9e} mean_abs={:.9e} cosine={:.9e} relative_bound={slide_max_bound:e} one_hot_boundary=PASS",
         slide_metrics.max_abs, slide_metrics.p99_abs, slide_metrics.mean_abs, slide_metrics.cosine
     );
+
     Ok(())
 }
 

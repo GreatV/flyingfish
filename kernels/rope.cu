@@ -80,6 +80,7 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
                                                     const __nv_bfloat16* q_norm_w,
                                                     const __nv_bfloat16* k_norm_w,
                                                     const int* start,
+                                                    int cache_start,
                                                     int rows, int q_heads, int kv_heads,
                                                     int dim, int capacity,
                                                     int ring_tokens, float theta, float eps,
@@ -89,7 +90,10 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
     const bool shape = (q_heads == 16 && kv_heads == 2) ||
                        (q_heads == 32 && kv_heads == 4);
     if (!shape || dim != 128 || rows < 1 || rows > 65535 ||
-        *start < 0 || (ring_tokens == 0 && *start + rows > capacity))
+        *start < 0 || cache_start < -1 ||
+        (ring_tokens == 0 && cache_start < 0 && *start + rows > capacity) ||
+        (ring_tokens == 0 && cache_start >= 0 && cache_start + rows > capacity) ||
+        (ring_tokens > 0 && cache_start >= 0))
         __trap();
     __shared__ float smem[32];
     const int heads = q_heads + 2 * kv_heads;
@@ -113,7 +117,9 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
         base = (size_t)row * heads * dim + (size_t)head * dim;
     }
     const int position = *start + row;
-    const int cache_pos = ring_tokens > 0 ? position % ring_tokens : position;
+    const int cache_pos = ring_tokens > 0
+                              ? position % ring_tokens
+                              : (cache_start < 0 ? position : cache_start + row);
 
     if (head < q_heads + kv_heads) {
         const __nv_bfloat16* w = (head < q_heads) ? q_norm_w : k_norm_w;
@@ -206,7 +212,7 @@ extern "C" __global__ void draft_qknorm_rope_kv(__nv_bfloat16* qkv,
                                                 int rows, int q_heads, int kv_heads,
                                                 int dim, int capacity,
                                                 int ring_tokens, float theta, float eps) {
-    qknorm_rope_kv_impl<true, false>(qkv, k, v, q_norm_w, k_norm_w, start, rows,
+    qknorm_rope_kv_impl<true, false>(qkv, k, v, q_norm_w, k_norm_w, start, -1, rows,
                                      q_heads, kv_heads, dim, capacity, ring_tokens, theta, eps,
                                      0, 0, 0, 0, 0);
 }
@@ -219,7 +225,7 @@ extern "C" __global__ void qknorm_kv_nope(__nv_bfloat16* qkv,
                                           int rows, int q_heads, int kv_heads,
                                           int dim, int capacity,
                                           int ring_tokens, float, float eps) {
-    qknorm_rope_kv_impl<false, false>(qkv, k, v, q_norm_w, k_norm_w, start, rows,
+    qknorm_rope_kv_impl<false, false>(qkv, k, v, q_norm_w, k_norm_w, start, -1, rows,
                                       q_heads, kv_heads, dim, capacity, ring_tokens, 1.0f, eps,
                                       0, 0, 0, 0, 0);
 }
@@ -229,6 +235,7 @@ extern "C" __global__ void flint_qknorm_rope_kv(__nv_bfloat16* qkv,
                                                  const __nv_bfloat16* q_norm_w,
                                                  const __nv_bfloat16* k_norm_w,
                                                  const int* start,
+                                                 int cache_start,
                                                  int rows, int q_heads, int kv_heads,
                                                  int dim, int capacity,
                                                  int ring_tokens, float theta, float eps,
@@ -237,7 +244,7 @@ extern "C" __global__ void flint_qknorm_rope_kv(__nv_bfloat16* qkv,
                                                  unsigned long long k_row_stride,
                                                  unsigned long long v_offset,
                                                  unsigned long long v_row_stride) {
-    qknorm_rope_kv_impl<true, true>(qkv, k, v, q_norm_w, k_norm_w, start, rows,
+    qknorm_rope_kv_impl<true, true>(qkv, k, v, q_norm_w, k_norm_w, start, cache_start, rows,
                                      q_heads, kv_heads, dim, capacity, ring_tokens, theta, eps,
                                      q_row_stride, k_offset, k_row_stride, v_offset, v_row_stride);
 }
@@ -247,6 +254,7 @@ extern "C" __global__ void flint_qknorm_kv_nope(__nv_bfloat16* qkv,
                                                  const __nv_bfloat16* q_norm_w,
                                                  const __nv_bfloat16* k_norm_w,
                                                  const int* start,
+                                                 int cache_start,
                                                  int rows, int q_heads, int kv_heads,
                                                  int dim, int capacity,
                                                  int ring_tokens, float, float eps,
@@ -255,7 +263,7 @@ extern "C" __global__ void flint_qknorm_kv_nope(__nv_bfloat16* qkv,
                                                  unsigned long long k_row_stride,
                                                  unsigned long long v_offset,
                                                  unsigned long long v_row_stride) {
-    qknorm_rope_kv_impl<false, true>(qkv, k, v, q_norm_w, k_norm_w, start, rows,
+    qknorm_rope_kv_impl<false, true>(qkv, k, v, q_norm_w, k_norm_w, start, cache_start, rows,
                                       q_heads, kv_heads, dim, capacity, ring_tokens, 1.0f, eps,
                                       q_row_stride, k_offset, k_row_stride, v_offset, v_row_stride);
 }

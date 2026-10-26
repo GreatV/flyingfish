@@ -536,6 +536,13 @@ impl Runtime {
             .row_bytes()?
             .checked_add(spec.q_heads as usize * size_of::<f32>())
             .and_then(|n| n.checked_add(3 * size_of::<i32>()))
+            .and_then(|n| {
+                if spec.architecture == crate::model_spec::Architecture::Flint {
+                    n.checked_add(2 * 4 * 128 * size_of::<bf16>())
+                } else {
+                    Some(n)
+                }
+            })
             .context("Q38 row workspace including FA2 LSE overflow")
     }
     fn fixed_bytes(spec: &crate::model_spec::ModelSpec, capacity: usize) -> Result<usize> {
@@ -545,6 +552,7 @@ impl Runtime {
             .and_then(|n| {
                 if spec.architecture == crate::model_spec::Architecture::Flint {
                     n.checked_add(spec.vocab as usize * 4)
+                        .and_then(|n| n.checked_add(2 * 4 * 512 * 128 * size_of::<bf16>()))
                 } else {
                     Some(n)
                 }
@@ -1564,7 +1572,7 @@ impl Engine {
             settings.kv_format,
             s,
         )?;
-        let kv_scratch = if settings.kv_format == crate::kv::KvFormat::Bf16 {
+        let mut kv_scratch = if settings.kv_format == crate::kv::KvFormat::Bf16 {
             None
         } else {
             Some((
@@ -1787,6 +1795,15 @@ impl Engine {
         } else {
             ("FA2 d256", "TCMQA d256")
         };
+        if flint {
+            let elements = (512 + rows)
+                .checked_mul(kv_width as usize)
+                .context("Flint KV staging extent overflow")?;
+            kv_scratch = Some((
+                s.alloc_zeros::<bf16>(elements)?,
+                s.alloc_zeros::<bf16>(elements)?,
+            ));
+        }
         eprintln!(
             "{}",
             serde_json::json!({
@@ -1891,6 +1908,7 @@ impl Engine {
             moe_prefill: None,
             #[cfg(test)]
             moe_test_ffn: None,
+            #[cfg(test)]
             flint_legacy_overflow_prefill: false,
             flint_frozen_decode_length: false,
             mtp: None,
@@ -2322,7 +2340,7 @@ impl Engine {
         step: crate::backend::Step<'_>,
         trace: &mut Option<Target<'_>>,
     ) -> Result<()> {
-        let q = self.qwen.as_ref().context("Q38 runtime missing")?;
+        let q = self.qwen.as_mut().context("Q38 runtime missing")?;
         let layer = &q.layers[i];
         let flint_layer = matches!(layer.mixer, BoundMixer::Flint { .. });
         let attention = if flint_layer {
@@ -2386,8 +2404,8 @@ impl Engine {
                     )?;
                 }
                 let state_index = self.model_spec.layers[i].state_index as usize;
-                let kv = &self.state.kv[state_index];
                 let ring = self.state.kv_ring(state_index)?;
+                let kv = &mut self.state.kv[state_index];
                 let sliding = self.model_spec.layers[i].sliding_window.is_some();
                 let (function, use_rope) = if self.model_spec.layers[i].rope {
                     (rope, true)
@@ -2404,7 +2422,7 @@ impl Engine {
                 );
                 let overflow_sliding =
                     sliding && phase == ExecutionPhase::Prefill && self.position + rows > ring;
-                if !overflow_sliding || self.flint_legacy_overflow_prefill {
+                if !overflow_sliding {
                     unsafe {
                         s.launch_builder(function)
                             .arg(&mut w.qkv)
@@ -2413,6 +2431,7 @@ impl Engine {
                             .arg(&q_norm.ptr)
                             .arg(&k_norm.ptr)
                             .arg(&w.position)
+                            .arg(&-1i32)
                             .arg(&(rows as i32))
                             .arg(&(self.model_spec.q_heads as i32))
                             .arg(&(self.model_spec.kv_heads as i32))
@@ -2443,10 +2462,18 @@ impl Engine {
                     ExecutionPhase::Prefill => {
                         let shape = Shape {
                             rows,
-                            start: self.position,
+                            start: if overflow_sliding {
+                                self.position.min(512)
+                            } else {
+                                self.position
+                            },
                             q_heads: self.model_spec.q_heads as usize,
                             kv_heads: self.model_spec.kv_heads as usize,
-                            capacity: ring,
+                            capacity: if overflow_sliding {
+                                512 + self.workspace_rows
+                            } else {
+                                ring
+                            },
                             head_dim: self.model_spec.head_dim as usize,
                             causal: true,
                             window_left: sliding.then_some(
@@ -2455,85 +2482,137 @@ impl Engine {
                             ),
                         };
                         if overflow_sliding {
-                            // Each row is written and consumed before a later row reuses its slot.
-                            for row in 0..rows {
-                                let position = self.position + row;
-                                s.memcpy_htod(&[position as i32], &mut w.position)?;
-                                self.ops.flint_decode_length(
-                                    s,
-                                    &w.position,
-                                    &mut w.length,
-                                    ring,
-                                )?;
-                                let q_base = row * q_width as usize;
-                                let k_base =
-                                    linear_rows * q_width as usize + row * kv_width as usize;
-                                let v_base = linear_rows * (q_width as usize + kv_width as usize)
-                                    + row * kv_width as usize;
-                                if !self.flint_legacy_overflow_prefill {
-                                    unsafe {
-                                        s.launch_builder(function)
-                                            .arg(&mut w.qkv.slice_mut(q_base..w.qkv.len()))
-                                            .arg(&kv.k)
-                                            .arg(&kv.v)
-                                            .arg(&q_norm.ptr)
-                                            .arg(&k_norm.ptr)
-                                            .arg(&w.position)
-                                            .arg(&1i32)
-                                            .arg(&(self.model_spec.q_heads as i32))
-                                            .arg(&(self.model_spec.kv_heads as i32))
-                                            .arg(&(self.model_spec.head_dim as i32))
-                                            .arg(&(ring as i32))
-                                            .arg(&(ring as i32))
-                                            .arg(&(self.model_spec.rope_theta))
-                                            .arg(&(self.model_spec.rms_eps))
-                                            .arg(&q_source_stride)
-                                            .arg(&((k_base - q_base) as u64))
-                                            .arg(&kv_source_stride)
-                                            .arg(&((v_base - q_base) as u64))
-                                            .arg(&kv_source_stride)
-                                            .launch(LaunchConfig {
-                                                grid_dim: (
-                                                    self.model_spec.q_heads
-                                                        + 2 * self.model_spec.kv_heads,
-                                                    1,
-                                                    1,
-                                                ),
-                                                block_dim: (128, 1, 1),
-                                                shared_mem_bytes: 0,
-                                            })?;
+                            let history = self.position.min(512);
+                            let capacity = 512 + self.workspace_rows;
+                            let (stage_k, stage_v) = q
+                                .kv_scratch
+                                .as_mut()
+                                .context("Flint KV staging is not bound")?;
+                            ensure!(
+                                stage_k.len() == capacity * kv_width as usize
+                                    && stage_v.len() == stage_k.len(),
+                                "Flint KV staging extent differs from the setup plan"
+                            );
+                            if history > 0 {
+                                for (source, target) in
+                                    [(&kv.k, &mut *stage_k), (&kv.v, &mut *stage_v)]
+                                {
+                                    super::super::copy::RingCopy {
+                                        stream: s,
+                                        source,
+                                        target,
+                                        source_capacity: ring,
+                                        target_capacity: capacity,
                                     }
+                                    .run(
+                                        (self.position - history) % ring,
+                                        0,
+                                        history,
+                                        true,
+                                        false,
+                                    )?;
                                 }
-                                self.ops.flint_decode_length(
-                                    s,
-                                    &w.position,
-                                    &mut w.length,
-                                    ring,
+                            }
+                            unsafe {
+                                s.launch_builder(function)
+                                    .arg(&mut w.qkv)
+                                    .arg(&*stage_k)
+                                    .arg(&*stage_v)
+                                    .arg(&q_norm.ptr)
+                                    .arg(&k_norm.ptr)
+                                    .arg(&w.position)
+                                    .arg(&(history as i32))
+                                    .arg(&(rows as i32))
+                                    .arg(&(self.model_spec.q_heads as i32))
+                                    .arg(&(self.model_spec.kv_heads as i32))
+                                    .arg(&(self.model_spec.head_dim as i32))
+                                    .arg(&(capacity as i32))
+                                    .arg(&0i32)
+                                    .arg(&(self.model_spec.rope_theta))
+                                    .arg(&(self.model_spec.rms_eps))
+                                    .arg(&q_source_stride)
+                                    .arg(&k_source_offset)
+                                    .arg(&kv_source_stride)
+                                    .arg(&v_source_offset)
+                                    .arg(&kv_source_stride)
+                                    .launch(LaunchConfig {
+                                        grid_dim: (
+                                            (rows
+                                                * (self.model_spec.q_heads
+                                                    + 2 * self.model_spec.kv_heads)
+                                                    as usize)
+                                                as u32,
+                                            1,
+                                            1,
+                                        ),
+                                        block_dim: (128, 1, 1),
+                                        shared_mem_bytes: 0,
+                                    })?;
+                            }
+                            #[cfg(test)]
+                            if self.flint_legacy_overflow_prefill {
+                                let last = history + rows - 1;
+                                for (source, target) in
+                                    [(&kv.k, &mut *stage_k), (&kv.v, &mut *stage_v)]
+                                {
+                                    super::super::copy::RingCopy {
+                                        stream: s,
+                                        source,
+                                        target,
+                                        source_capacity: ring,
+                                        target_capacity: capacity,
+                                    }
+                                    .run(
+                                        last % ring,
+                                        0,
+                                        1,
+                                        false,
+                                        false,
+                                    )?;
+                                }
+                            }
+                            self.flash
+                                .as_mut()
+                                .context("Flint prefill attention is not bound")?
+                                .run(
+                                    &w.qkv,
+                                    q_width as usize,
+                                    &*stage_k,
+                                    &*stage_v,
+                                    &mut w.attn,
+                                    shape,
                                 )?;
-                                let decode = self
-                                    .decode
-                                    .as_mut()
-                                    .context("Flint sliding prefill decode is not bound")?;
-                                decode.run_with(
-                                    s,
-                                    GqaDecodeInput {
-                                        q: &w.qkv,
-                                        q_offset: row * q_width as usize,
-                                        k: &kv.k,
-                                        v: &kv.v,
-                                        output: &mut w.attn,
-                                        output_offset: row * q_width as usize,
-                                        length: &w.length,
-                                        sinks: Some(sinks),
-                                        window: Some(SlidingWindow {
-                                            position: &w.position,
-                                            head_stride: (ring * self.model_spec.head_dim as usize)
-                                                as i32,
-                                        }),
-                                    },
+                            self.flash
+                                .as_mut()
+                                .context("Flint prefill attention is not bound")?
+                                .apply_sinks(
+                                    sinks,
+                                    &mut w.attn,
+                                    rows,
+                                    self.model_spec.q_heads as usize,
+                                )?;
+                            let end = self.position + rows;
+                            let keep = end.min(ring);
+                            let source_start = history + rows - keep;
+                            let absolute_start = end - keep;
+                            for (source, target) in
+                                [(&mut *stage_k, &mut kv.k), (&mut *stage_v, &mut kv.v)]
+                            {
+                                super::super::copy::RingCopy {
+                                    stream: s,
+                                    source,
+                                    target,
+                                    source_capacity: capacity,
+                                    target_capacity: ring,
+                                }
+                                .run(
+                                    source_start,
+                                    absolute_start % ring,
+                                    keep,
+                                    false,
+                                    true,
                                 )?;
                             }
-                            s.memcpy_htod(&[self.position as i32], &mut w.position)?;
                         } else {
                             self.flash
                                 .as_mut()
