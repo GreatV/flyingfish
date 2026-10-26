@@ -60,6 +60,17 @@ impl Device {
         cubin::check(sm)?;
         eprintln!("cuda_sm={sm} native cubins selected");
         use cudarc::driver::sys::CUdevice_attribute as A;
+        let memory_clock_khz = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE)?;
+        let memory_bus_bits = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH)?;
+        let memory_bytes_per_second =
+            2.0 * (f64::from(memory_clock_khz) * 1000.0) * (f64::from(memory_bus_bits) / 8.0);
+        ensure!(
+            memory_clock_khz > 0
+                && memory_bus_bits > 0
+                && memory_bytes_per_second.is_finite()
+                && memory_bytes_per_second > 0.0,
+            "CUDA device {ordinal} reported invalid memory clock={memory_clock_khz} kHz bus={memory_bus_bits} bits"
+        );
         let info = DeviceInfo {
             name: ctx.name()?,
             arch: sm,
@@ -76,6 +87,7 @@ impl Device {
             sm_shared_bytes: ctx
                 .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR)?
                 as usize,
+            memory_bytes_per_second,
         };
         let stream = ctx.new_stream()?;
         let upload = ctx.new_stream()?;

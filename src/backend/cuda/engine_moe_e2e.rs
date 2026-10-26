@@ -369,6 +369,7 @@ fn minicpm_placement_invariance_gpu() -> Result<()> {
                 .as_mut()
                 .context("placement slots missing")?,
         )?;
+    engine.refresh_verify_schedule()?;
     engine
         .moe_slots
         .as_mut()
@@ -424,6 +425,7 @@ fn minicpm_placement_invariance_gpu() -> Result<()> {
                         .as_mut()
                         .context("placement slots missing")?,
                 )?;
+            engine.refresh_verify_schedule()?;
             saved.restore(&mut engine.state, &mut engine.work.token, &stream)?;
             engine.position = host_boundary.0;
             engine.pending_token = host_boundary.1;
@@ -1867,11 +1869,59 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
         );
     }
     let greedy_taps = stream.clone_htod(&greedy_taps)?;
-    let mut executed_graph_widths = std::collections::BTreeSet::new();
-    for graph in [false, true] {
-        model.set_spec_graph(graph)?;
-        for (verify_width, matched, limit, eos) in [
-            (Some(2usize), 1usize, 8usize, None),
+    let (cold_schedule, schedule) = {
+        let spec = model.spec.as_ref().context("chain missing")?;
+        (spec.cold_verify_schedule, spec.verify_schedule)
+    };
+    let slots_layout = model
+        .moe_slots
+        .as_ref()
+        .context("chain slots missing")?
+        .storage
+        .layout();
+    let slots_total: u32 = (0..model.model_spec.layers.len())
+        .map(|layer| slots_layout.slot_count(layer as u32))
+        .sum::<Result<u32>>()?;
+    let total_experts = u32::try_from(model.model_spec.layers.len())?
+        * model.model_spec.moe.context("chain MoE missing")?.experts;
+    let k_max = schedule.max_rows;
+    println!(
+        "minicpm_chain_schedule {}",
+        serde_json::json!({
+            "expert_format": model.model_spec.expert_format,
+            "slots_total": slots_total,
+            "total_experts": total_experts,
+            "cold_schedule": cold_schedule,
+            "prefill_schedule": schedule,
+        })
+    );
+    ensure!(
+        slots_total == total_experts || schedule != cold_schedule,
+        "Runner FAIL prefill did not refresh verify_schedule from cold prior: {schedule:?}"
+    );
+    ensure!(
+        crate::dspark::select_verify_rows(
+            &[1.0; 15],
+            crate::dspark::MIN_MOE_VERIFY_ROWS,
+            &schedule,
+        )? == k_max,
+        "Runner FAIL schedule max_rows={k_max} not enforced at unit confidence"
+    );
+    if model.model_spec.expert_format == Some(crate::model_spec::ExpertFormat::Fp8W8a16) {
+        ensure!(
+            k_max == rows,
+            "Runner FAIL FP8 chain schedule capped max_rows={k_max} below {rows}"
+        );
+    } else if slots_total < total_experts {
+        ensure!(
+            (crate::dspark::MIN_MOE_VERIFY_ROWS..rows).contains(&k_max),
+            "Runner FAIL partial-residency BF16 schedule did not cap max_rows below {rows}: {schedule:?}"
+        );
+    }
+    let max_forced = if k_max < rows { k_max + 1 } else { rows };
+    let cases: Vec<(Option<usize>, usize, usize, Option<u32>)> = if k_max == rows {
+        vec![
+            (Some(2), 1, 8, None),
             (Some(3), 2, 8, None),
             (Some(4), 3, 8, None),
             (Some(5), 2, 8, None),
@@ -1885,9 +1935,43 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
             (Some(8), 7, 4, None),
             (Some(8), 7, 8, Some(greedy[3])),
             (None, 8, 8, None),
-        ] {
+        ]
+    } else {
+        let mut list = Vec::new();
+        for w in crate::dspark::MIN_MOE_VERIFY_ROWS..=k_max {
+            list.push((Some(w), w - 1, rows, None));
+        }
+        list.push((Some(k_max), 0, rows, None));
+        list.push((Some(k_max), k_max / 2, rows, None));
+        list.push((Some(k_max), k_max - 1, 1, None));
+        list.push((Some(k_max), k_max - 1, (k_max / 2).max(1), None));
+        list.push((
+            Some(k_max),
+            k_max - 1,
+            rows,
+            Some(greedy[(k_max / 2).min(k_max - 1)]),
+        ));
+        list.push((Some(k_max + 1), k_max, rows, None));
+        list.push((Some(k_max + 1), 1, rows, None));
+        list.push((None, rows, rows, None));
+        list
+    };
+    let mut executed_graph_widths = std::collections::BTreeSet::new();
+    let mut dynamic_widths = std::collections::BTreeSet::new();
+    for graph in [false, true] {
+        model.set_spec_graph(graph)?;
+        for &(verify_width, matched, limit, eos) in &cases {
             model.reset()?;
             model.prefill(&ids, None)?;
+            ensure!(
+                model
+                    .spec
+                    .as_ref()
+                    .context("chain missing")?
+                    .verify_schedule
+                    == schedule,
+                "Runner FAIL post-prefill verify_schedule drifted across resets"
+            );
             model
                 .spec
                 .as_ref()
@@ -1922,9 +2006,10 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
                 );
             } else {
                 ensure!(
-                    (crate::dspark::MIN_MOE_VERIFY_ROWS..=rows).contains(&actual_width),
-                    "Runner FAIL dynamic verify width out of range: {actual_width}"
+                    (crate::dspark::MIN_MOE_VERIFY_ROWS..=k_max).contains(&actual_width),
+                    "Runner FAIL dynamic verify width {actual_width} exceeded schedule max_rows={k_max}"
                 );
+                dynamic_widths.insert(actual_width);
             }
             if graph {
                 executed_graph_widths.insert(actual_width);
@@ -2008,9 +2093,16 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
         }
     }
     ensure!(
-        executed_graph_widths == (crate::dspark::MIN_MOE_VERIFY_ROWS..=rows).collect(),
-        "Runner FAIL not all verify widths 2..=8 executed in graph mode: {executed_graph_widths:?}"
+        executed_graph_widths == (crate::dspark::MIN_MOE_VERIFY_ROWS..=max_forced).collect(),
+        "Runner FAIL not all expected verify widths 2..={max_forced} executed in graph mode: {executed_graph_widths:?}"
     );
+    if k_max < rows {
+        ensure!(
+            !dynamic_widths.contains(&(k_max + 1)),
+            "Runner FAIL dynamic selection chose forced-only width {} above k_max={k_max}",
+            k_max + 1
+        );
+    }
     for graph in [false, true] {
         model.set_spec_graph(graph)?;
         model.reset()?;
@@ -2889,7 +2981,14 @@ fn minicpm_chain_decode_timing_gpu() -> Result<()> {
 #[test]
 #[ignore = "exclusive CUDA, native FF_MODEL, text_1k reference and pinned calibration required"]
 fn minicpm_expert_swap_identity_gpu() -> Result<()> {
-    chain_decode_timing(&["text_1k"], 1, true)
+    let cases: &[&str] = if std::env::var_os("FF_ARGMAX_DRAFT").is_some()
+        && std::env::var_os("FF_Q38_PROBE_DIR").is_none()
+    {
+        &["text_1k", "text_4k"]
+    } else {
+        &["text_1k"]
+    };
+    chain_decode_timing(cases, 1, true)
 }
 
 #[test]
@@ -2947,7 +3046,8 @@ fn chain_decode_timing(cases: &[&str], runs: usize, margins: bool) -> Result<()>
     let setup_seconds = setup.elapsed().as_secs_f64();
     let eos = model.model_spec.eos.clone();
     let with_draft = model.spec.is_some();
-    if with_draft {
+    let spec_steps = with_draft && (!margins || identity_output.is_some());
+    if spec_steps {
         model.set_spec_graph(graph)?;
         model.set_spec_eos(&eos)?;
     }
@@ -2978,7 +3078,8 @@ fn chain_decode_timing(cases: &[&str], runs: usize, margins: bool) -> Result<()>
         "declared_graphs":model.graphs.len(),"verify_segment_widths":verify_segment_widths,
         "verify_segments":verify_segments,
         "allocated_operator_workspace_bytes":operator_bytes,
-        "device_live_bytes_after_setup":total-free,"setup_seconds":setup_seconds})
+        "device_live_bytes_after_setup":total-free,"setup_seconds":setup_seconds,
+        "cold_verify_schedule":model.spec.as_ref().map(|s| s.cold_verify_schedule)})
     );
     let mut defects = 0;
     let margin = |model: &mut Engine| -> Result<f32> {
@@ -3033,7 +3134,7 @@ fn chain_decode_timing(cases: &[&str], runs: usize, margins: bool) -> Result<()>
             let range = super::super::super::profile::Range::new(run > 0, c"minicpm_chain_decode");
             let timer = Instant::now();
             while ids.len() < 256 && !eos.contains(ids.last().context("timing output missing")?) {
-                if with_draft {
+                if spec_steps {
                     let round = model.spec_round(256 - ids.len(), None, "timing")?;
                     if margins {
                         top2_margins.push(margin(&mut model)?);
@@ -3041,7 +3142,7 @@ fn chain_decode_timing(cases: &[&str], runs: usize, margins: bool) -> Result<()>
                     ids.extend(&round.output);
                     rounds.push(round);
                 } else {
-                    ids.push(model.decode(graph, None)?);
+                    ids.push(model.decode(if with_draft { false } else { graph }, None)?);
                     if margins {
                         top2_margins.push(margin(&mut model)?);
                     }
@@ -3064,7 +3165,7 @@ fn chain_decode_timing(cases: &[&str], runs: usize, margins: bool) -> Result<()>
             ensure!(
                 !margins
                     || top2_margins.len()
-                        == if with_draft {
+                        == if spec_steps {
                             rounds.len() + 1
                         } else {
                             ids.len()
@@ -3085,8 +3186,9 @@ fn chain_decode_timing(cases: &[&str], runs: usize, margins: bool) -> Result<()>
                     "graph":graph,"seconds":seconds,"prefill_seconds":prefill_seconds,
                     "tokens":ids.len(),"ids":ids,"rounds":rounds,"k_histogram":k_histogram,
                     "decode_tokens":decode_tokens,"ms_per_token":ms_per_token,
+                    "verify_schedule":model.spec.as_ref().map(|s| s.verify_schedule),
                     "margin_collection":margins,"top2_margins":top2_margins,
-                    "margin_scope":if with_draft {"last_logits_per_round"} else {"per_output"}})
+                    "margin_scope":if spec_steps {"last_logits_per_round"} else {"per_output"}})
             );
             if expected.is_none() {
                 expected = Some(ids);
@@ -3245,6 +3347,7 @@ fn replay(
         .as_ref()
         .context("prefill missing")?
         .reseed_request(engine.moe_slots.as_mut().context("slots missing")?)?;
+    engine.refresh_verify_schedule()?;
     saved.restore(
         &mut engine.state,
         &mut engine.work.token,

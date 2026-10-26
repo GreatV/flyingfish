@@ -286,6 +286,7 @@ mod tests {
             sm_shared_bytes: 100 * 1024,
             cooperative: false,
             optin_shared_bytes: 99 * 1024,
+            memory_bytes_per_second: 448_064_000_000.0,
         };
         for (arch, sms) in [(86, 48), (89, 128), (89, 80), (90, 128)] {
             info.arch = arch;

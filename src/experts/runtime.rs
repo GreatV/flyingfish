@@ -147,7 +147,7 @@ struct PlannedMove {
 pub struct Residency {
     geometry: ExpertGeometry,
     capacity: Capacity,
-    admission: Admission,
+    pub admission: Admission,
     max_rows: u32,
     ledger: TierLedger,
     events: SlotEvents,

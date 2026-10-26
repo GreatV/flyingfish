@@ -14,6 +14,7 @@ pub struct DeviceInfo {
     pub sm_shared_bytes: usize,
     pub cooperative: bool,
     pub optin_shared_bytes: usize,
+    pub memory_bytes_per_second: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,6 +304,7 @@ mod long_tests {
             sm_shared_bytes: 100 << 10,
             cooperative: true,
             optin_shared_bytes: 99 << 10,
+            memory_bytes_per_second: 1_008_096_000_000.0,
         };
         for (merge_threads, valid) in [
             (128, true),

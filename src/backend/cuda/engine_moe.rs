@@ -86,6 +86,7 @@ pub(super) struct Setup {
     routed_wave_rows: u32,
     peer_wave_rows: u32,
     peer: Option<Device>,
+    cold_schedule: Option<crate::dspark::VerifyCostSchedule>,
 }
 
 fn decode_device_bytes(
@@ -296,11 +297,12 @@ impl Setup {
         directory: &Path,
         runtime: &Path,
         write: bool,
-        (request, decode_rows, verify_rows, context_row_bytes): (
+        (request, decode_rows, verify_rows, context_row_bytes, draft_config): (
             crate::prefill::WorkspaceRequest,
             usize,
             usize,
             usize,
+            Option<&crate::dspark::DraftConfig>,
         ),
     ) -> Result<Self> {
         use crate::experts::plan::PlanInputs;
@@ -568,13 +570,36 @@ impl Setup {
             .peer_expert_bytes
             .checked_sub(peer_extra_scratch)
             .context("peer routed scratch exceeds peer budget")?;
-        let host_backed = u64::from(capacity.host_blocks)
-            == u64::from(geometry.layers) * u64::from(geometry.experts)
-            || (capacity.slots_per_layer[capacity.gpu0_layers as usize..]
-                .iter()
-                .all(|&s| s == geometry.experts)
-                && u64::from(capacity.host_blocks)
-                    == u64::from(capacity.gpu0_layers) * u64::from(geometry.experts));
+        let host_backed = capacity.host_backed(&geometry);
+        let cold_schedule = draft_config
+            .map(|draft| {
+                crate::dspark::VerifyCostSchedule::derive(
+                    draft,
+                    model,
+                    (
+                        &capacity,
+                        admission,
+                        &measured.service,
+                        measured.copy_engines,
+                    ),
+                    (
+                        [
+                            device.info.memory_bytes_per_second,
+                            peer.as_ref()
+                                .map_or(0.0, |p| p.info.memory_bytes_per_second),
+                            measured.h2d_bytes_per_second,
+                            measured.d2h_bytes_per_second,
+                        ],
+                        [
+                            device.info.l2_bytes as u64,
+                            peer.as_ref().map_or(0, |p| p.info.l2_bytes as u64),
+                        ],
+                    ),
+                    &measured.peer_transfers,
+                    &vec![vec![0.0; geometry.experts as usize]; geometry.layers as usize],
+                )
+            })
+            .transpose()?;
         let cpu = residency::cpu_bound(
             geometry,
             capacity.slot_bytes(),
@@ -604,7 +629,8 @@ impl Setup {
                 "cpu_arithmetic_rows":super::super::moe::prefill::LANE16_ROWS,
                 "decode_rows":decode_rows,"decode_extra_device_bytes":decode_extra,
                 "context_span_rows":capacity.span_rows,"context_span_row_bytes":context_row_bytes,
-                "context_span_bytes":context_row_bytes.checked_mul(capacity.span_rows as usize).context("draft context span bytes overflow")?
+                "context_span_bytes":context_row_bytes.checked_mul(capacity.span_rows as usize).context("draft context span bytes overflow")?,
+                "dspark_verify_schedule":cold_schedule
             }})
         );
         eprintln!(
@@ -626,6 +652,7 @@ impl Setup {
             routed_wave_rows,
             peer_wave_rows,
             peer,
+            cold_schedule,
         })
     }
 
@@ -643,6 +670,10 @@ impl Setup {
 
     pub fn bind(self, engine: &mut Engine) -> Result<()> {
         let total_started = std::time::Instant::now();
+        if let (Some(spec), Some(schedule)) = (engine.spec.as_mut(), self.cold_schedule) {
+            spec.cold_verify_schedule = schedule;
+            spec.verify_schedule = schedule;
+        }
         let geometry = self.catalogue.geometry();
         let initial = crate::experts::plan::initial_residency(
             &vec![vec![0.0; geometry.experts as usize]; geometry.layers as usize],
@@ -721,7 +752,12 @@ impl Setup {
             &self.capacity,
             self.workspace.candidate.reserves,
             self.measured.service,
-            self.measured.h2d_bytes_per_second,
+            (
+                self.measured.h2d_bytes_per_second,
+                self.measured.d2h_bytes_per_second,
+                self.measured.copy_engines,
+                self.measured.peer_transfers,
+            ),
             (
                 engine
                     .model_spec
