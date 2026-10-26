@@ -10,6 +10,7 @@ pub enum Architecture {
     Qwen35Text,
     MiniCpmV47,
     Flint,
+    Glm5Next,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Mixer {
@@ -22,6 +23,10 @@ pub struct MoeConfig {
     pub experts_per_tok: u32,
     pub expert_intermediate: u32,
     pub shared_intermediate: u32,
+    #[serde(
+        default = "RouterScore::softmax",
+        skip_serializing_if = "RouterScore::is_softmax"
+    )]
     pub score: RouterScore,
     pub shared_gate: bool,
 }
@@ -29,31 +34,50 @@ pub struct MoeConfig {
 pub enum RouterScore {
     Softmax,
     Sigmoid,
+    SqrtSoftplus,
+}
+impl RouterScore {
+    fn softmax() -> Self {
+        Self::Softmax
+    }
+    fn is_softmax(&self) -> bool {
+        *self == Self::Softmax
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SwigluRounding {
     Twice,
     Once,
+    ClampedTwice,
+    ClampedOnce,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RoutedWeightBoundary {
     AfterDownBf16,
     BeforeContributionBf16,
+    BeforeDownQuantization,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum LinearFormat {
     Bf16,
-    Fp8E4m3Block128,
+    Fp8E4m3Block {
+        block: [u32; 2],
+        scale_dtype: safetensors::Dtype,
+    },
     /// compressed-tensors FP8_DYNAMIC per-output-channel weights plus token activations.
     Fp8E4m3Channel,
 }
-/// Routed-expert checkpoint layout: fused BF16 slices, separate BF16 tensors, or per-expert
-/// E4M3 weights with BF16 per-output-channel scales (compressed-tensors FP8_DYNAMIC).
+/// Routed-expert checkpoint layout: fused or separate BF16 tensors, per-channel BF16 scales,
+/// or block scales beside per-expert E4M3 weights.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ExpertFormat {
     Bf16,
     Bf16Separate,
     Fp8W8a16,
+    Fp8W8a16Block {
+        block: [u32; 2],
+        scale_dtype: safetensors::Dtype,
+    },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -63,6 +87,26 @@ pub struct GdnConfig {
     pub key_head_dim: u32,
     pub value_head_dim: u32,
     pub conv_kernel: u32,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Glm5NextConfig {
+    pub dense_layers: u32,
+    pub nextn_layers: u32,
+    pub hc_mult: u32,
+    pub hc_sinkhorn_iters: u32,
+    pub hc_eps: f32,
+    pub q_lora_rank: u32,
+    pub kv_lora_rank: u32,
+    pub qk_nope_head_dim: u32,
+    pub v_head_dim: u32,
+    pub index_heads: u32,
+    pub index_head_dim: u32,
+    pub index_topk: u32,
+    pub index_kpool: u32,
+    pub gate_lower_bound: f32,
+    pub swiglu_limit: f32,
+    pub routed_scaling_factor: f32,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LayerPlan {
@@ -102,6 +146,8 @@ pub struct ModelSpec {
     pub moe: Option<MoeConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gdn: Option<GdnConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glm5_next: Option<Glm5NextConfig>,
     #[serde(default)]
     pub vision: Option<VisionConfig>,
 }
@@ -220,8 +266,8 @@ impl VisionConfig {
                     v.newline_token
                 );
             }
-            Architecture::Llama | Architecture::Flint => {
-                bail!("vision configuration requires a multimodal architecture")
+            Architecture::Llama | Architecture::Flint | Architecture::Glm5Next => {
+                bail!("vision configuration requires a supported multimodal architecture")
             }
         }
         Ok(())
@@ -384,6 +430,11 @@ fn exact_keys(v: &Value, keys: &[&str], label: &str) -> Result<()> {
     Ok(())
 }
 impl LinearFormat {
+    pub fn fp8_block(block: [u32; 2], scale_dtype: safetensors::Dtype) -> Result<Self> {
+        crate::fp8::Fp8BlockScale::new(block, scale_dtype)?;
+        Ok(Self::Fp8E4m3Block { block, scale_dtype })
+    }
+
     fn read(root: &Value) -> Result<Self> {
         let Some(quant) = root.get("quantization_config") else {
             return Ok(Self::Bf16);
@@ -396,7 +447,7 @@ impl LinearFormat {
             equal(quant, key, val.into())?;
         }
         equal(quant, "weight_block_size", serde_json::json!([128, 128]))?;
-        Ok(Self::Fp8E4m3Block128)
+        Self::fp8_block([128, 128], safetensors::Dtype::BF16)
     }
 }
 impl ExpertFormat {
@@ -906,15 +957,24 @@ impl ModelSpec {
     pub fn swiglu_rounding(&self) -> SwigluRounding {
         match self.architecture {
             Architecture::Flint => SwigluRounding::Once,
+            Architecture::Glm5Next => SwigluRounding::ClampedTwice,
             Architecture::Llama | Architecture::Qwen35Text | Architecture::MiniCpmV47 => {
                 SwigluRounding::Twice
             }
         }
     }
 
+    pub fn swiglu_limit(&self) -> f32 {
+        self.glm5_next
+            .as_ref()
+            .map_or(0.0, |config| config.swiglu_limit)
+    }
+
     pub fn routed_weight_boundary(&self) -> RoutedWeightBoundary {
         match self.architecture {
-            Architecture::Flint => RoutedWeightBoundary::BeforeContributionBf16,
+            Architecture::Flint | Architecture::Glm5Next => {
+                RoutedWeightBoundary::BeforeContributionBf16
+            }
             Architecture::Llama | Architecture::Qwen35Text | Architecture::MiniCpmV47 => {
                 RoutedWeightBoundary::AfterDownBf16
             }
@@ -929,6 +989,7 @@ impl ModelSpec {
                 Architecture::Qwen35Text => "qwen3_5_text",
                 Architecture::MiniCpmV47 => "qwen3_5_moe_text",
                 Architecture::Flint => "flint",
+                Architecture::Glm5Next => "glm5_next_text",
             }
             .into(),
             hidden_size: self.hidden as usize,
@@ -966,6 +1027,8 @@ impl ModelSpec {
             Self::minicpm(&root, &generation)
         } else if root.get("model_type").and_then(Value::as_str) == Some("flint") {
             Self::flint(&root, &generation)
+        } else if root.get("model_type").and_then(Value::as_str) == Some("glm5_next") {
+            Self::glm5_next(&root, &generation)
         } else {
             Self::qwen(&root, &generation)
         }
@@ -992,6 +1055,7 @@ impl ModelSpec {
             vision: None,
             moe: None,
             gdn: None,
+            glm5_next: None,
             layers: (0..u(c.num_hidden_layers)?)
                 .map(|state_index| LayerPlan {
                     mixer: Mixer::FullAttention,
@@ -1042,6 +1106,9 @@ impl ModelSpec {
         let linear_format = match expert_format {
             ExpertFormat::Bf16 | ExpertFormat::Bf16Separate => LinearFormat::Bf16,
             ExpertFormat::Fp8W8a16 => LinearFormat::Fp8E4m3Channel,
+            ExpertFormat::Fp8W8a16Block { .. } => {
+                bail!("MiniCPM does not use F32 block-scale experts")
+            }
         };
         let spec = Self::from_text(
             Architecture::MiniCpmV47,
@@ -1238,6 +1305,388 @@ impl ModelSpec {
             layers,
             moe: Some(moe),
             gdn: None,
+            glm5_next: None,
+            vision: None,
+        })
+    }
+    pub fn glm5_next(root: &Value, generation: &Value) -> Result<Self> {
+        equal(root, "model_type", "glm5_next".into())?;
+        equal(
+            root,
+            "architectures",
+            serde_json::json!(["Glm5NextForConditionalGeneration"]),
+        )?;
+        equal(root, "tie_word_embeddings", false.into())?;
+        equal(root, "transformers_version", "5.16.0".into())?;
+        let quant = root
+            .get("quantization_config")
+            .context("GLM-5.3 quantization_config missing")?;
+        exact_keys(
+            quant,
+            &[
+                "activation_scheme",
+                "fmt",
+                "modules_to_not_convert",
+                "quant_method",
+                "weight_block_size",
+            ],
+            "quantization_config",
+        )?;
+        for (key, value) in [
+            ("activation_scheme", "dynamic"),
+            ("fmt", "e4m3"),
+            ("quant_method", "fp8"),
+        ] {
+            equal(quant, key, value.into())?;
+        }
+        equal(quant, "weight_block_size", serde_json::json!([128, 128]))?;
+        ensure!(
+            quant
+                .get("modules_to_not_convert")
+                .and_then(Value::as_array)
+                .is_some_and(|entries| !entries.is_empty() && entries.iter().all(Value::is_string)),
+            "quantization modules_to_not_convert must be a nonempty string array"
+        );
+
+        let t = root.get("text_config").context("missing text_config")?;
+        exact_keys(
+            t,
+            &[
+                "attention_bias",
+                "attention_dropout",
+                "dtype",
+                "eos_token_id",
+                "first_k_dense_replace",
+                "hc_eps",
+                "hc_mult",
+                "hc_sinkhorn_iters",
+                "head_dim",
+                "hidden_act",
+                "hidden_size",
+                "index_head_dim",
+                "index_kpool",
+                "index_kpool_always_select_tail",
+                "index_kpool_compress",
+                "index_n_heads",
+                "index_share_for_mtp_iteration",
+                "index_topk",
+                "indexer_rope_interleave",
+                "indexer_types",
+                "initializer_range",
+                "intermediate_size",
+                "kv_lora_rank",
+                "layer_types",
+                "linear_attn_config",
+                "max_position_embeddings",
+                "mhc",
+                "mla_use_nope",
+                "mlp_layer_types",
+                "model_type",
+                "moe_intermediate_size",
+                "moe_router_dtype",
+                "n_group",
+                "n_routed_experts",
+                "n_shared_experts",
+                "norm_topk_prob",
+                "num_attention_heads",
+                "num_experts_per_tok",
+                "num_hidden_layers",
+                "num_key_value_heads",
+                "num_nextn_predict_layers",
+                "output_router_logits",
+                "pad_token_id",
+                "q_lora_rank",
+                "qk_head_dim",
+                "qk_nope_head_dim",
+                "qk_rope_head_dim",
+                "rms_norm_eps",
+                "routed_scaling_factor",
+                "router_aux_loss_coef",
+                "scoring_func",
+                "swiglu_limit",
+                "tie_word_embeddings",
+                "topk_group",
+                "topk_method",
+                "use_cache",
+                "v_head_dim",
+                "vocab_size",
+            ],
+            "text_config",
+        )?;
+        equal(t, "model_type", "glm5_next_text".into())?;
+        for (key, value) in [
+            ("attention_bias", false.into()),
+            ("attention_dropout", 0.0.into()),
+            ("dtype", "bfloat16".into()),
+            ("hidden_act", "silu".into()),
+            ("mhc", true.into()),
+            ("mla_use_nope", true.into()),
+            ("moe_router_dtype", "float32".into()),
+            ("norm_topk_prob", true.into()),
+            ("output_router_logits", false.into()),
+            ("scoring_func", "sigmoid".into()),
+            ("tie_word_embeddings", false.into()),
+            ("topk_method", "noaux_tc".into()),
+            ("use_cache", true.into()),
+            ("index_kpool_always_select_tail", true.into()),
+            ("index_kpool_compress", true.into()),
+            ("index_share_for_mtp_iteration", true.into()),
+            ("indexer_rope_interleave", true.into()),
+        ] {
+            equal(t, key, value)?;
+        }
+        for (key, value) in [
+            ("head_dim", 0),
+            ("n_group", 1),
+            ("n_shared_experts", 1),
+            ("num_nextn_predict_layers", 1),
+            ("qk_rope_head_dim", 0),
+            ("topk_group", 1),
+        ] {
+            equal(t, key, value.into())?;
+        }
+        let hidden = positive(t, "hidden_size")?;
+        let vocab = positive(t, "vocab_size")?;
+        let depth = positive(t, "num_hidden_layers")?;
+        let dense_layers = positive(t, "first_k_dense_replace")?;
+        ensure!(
+            dense_layers < depth,
+            "first_k_dense_replace={dense_layers} must be below num_hidden_layers={depth}"
+        );
+        let q_heads = positive(t, "num_attention_heads")?;
+        let kv_heads = positive(t, "num_key_value_heads")?;
+        let qk_head_dim = positive(t, "qk_head_dim")?;
+        let qk_nope_head_dim = positive(t, "qk_nope_head_dim")?;
+        ensure!(
+            qk_head_dim == qk_nope_head_dim && q_heads == kv_heads,
+            "GLM-5.3 requires NoPE Q/K and equal Q/KV head counts"
+        );
+        let max_position = positive(t, "max_position_embeddings")?;
+        let q_width = q_heads
+            .checked_mul(qk_head_dim)
+            .context("GLM-5.3 Q width overflow")?;
+        let intermediate = positive(t, "intermediate_size")?;
+        let expert_intermediate = positive(t, "moe_intermediate_size")?;
+        let experts = positive(t, "n_routed_experts")?;
+        let experts_per_tok = positive(t, "num_experts_per_tok")?;
+        ensure!(
+            experts_per_tok <= experts,
+            "num_experts_per_tok exceeds n_routed_experts"
+        );
+        let shared_intermediate = expert_intermediate
+            .checked_mul(positive(t, "n_shared_experts")?)
+            .context("shared expert width overflow")?;
+        let float = |key: &str| -> Result<f64> {
+            t.get(key)
+                .and_then(Value::as_f64)
+                .with_context(|| format!("missing/invalid {key}"))
+        };
+        let positive_f32 = |key: &str| -> Result<f32> {
+            let value = float(key)? as f32;
+            ensure!(value.is_finite() && value > 0.0, "invalid {key}");
+            Ok(value)
+        };
+        for key in [
+            "hc_eps",
+            "initializer_range",
+            "rms_norm_eps",
+            "routed_scaling_factor",
+            "swiglu_limit",
+        ] {
+            positive_f32(key)?;
+        }
+        ensure!(
+            float("router_aux_loss_coef")?.is_finite() && float("router_aux_loss_coef")? >= 0.0,
+            "invalid router_aux_loss_coef"
+        );
+        let rms_eps = positive_f32("rms_norm_eps")?;
+        let hc_eps = positive_f32("hc_eps")?;
+        let swiglu_limit = positive_f32("swiglu_limit")?;
+        let routed_scaling_factor = positive_f32("routed_scaling_factor")?;
+        let hc_mult = positive(t, "hc_mult")?;
+        let hc_sinkhorn_iters = positive(t, "hc_sinkhorn_iters")?;
+        ensure!(hc_mult == 4, "unsupported GLM-5.3 hc_mult={hc_mult}");
+        let q_lora_rank = positive(t, "q_lora_rank")?;
+        let kv_lora_rank = positive(t, "kv_lora_rank")?;
+        let v_head_dim = positive(t, "v_head_dim")?;
+        let index_heads = positive(t, "index_n_heads")?;
+        let index_head_dim = positive(t, "index_head_dim")?;
+        let index_topk = positive(t, "index_topk")?;
+        let index_kpool = positive(t, "index_kpool")?;
+        ensure!(
+            index_topk.is_multiple_of(index_kpool),
+            "index_topk is not an index_kpool multiple"
+        );
+
+        let linear = t
+            .get("linear_attn_config")
+            .context("missing linear_attn_config")?;
+        exact_keys(
+            linear,
+            &[
+                "num_heads",
+                "gate_lower_bound",
+                "head_dim",
+                "short_conv_kernel_size",
+                "kda_layers",
+                "full_attn_layers",
+            ],
+            "linear_attn_config",
+        )?;
+        let linear_heads = positive(linear, "num_heads")?;
+        let linear_head_dim = positive(linear, "head_dim")?;
+        equal(linear, "short_conv_kernel_size", 4.into())?;
+        let gate_lower_bound = linear
+            .get("gate_lower_bound")
+            .and_then(Value::as_f64)
+            .context("missing/invalid gate_lower_bound")?;
+        ensure!(
+            gate_lower_bound.is_finite() && gate_lower_bound <= 0.0,
+            "invalid gate_lower_bound"
+        );
+        let gate_lower_bound = gate_lower_bound as f32;
+        ensure!(gate_lower_bound.is_finite(), "invalid gate_lower_bound");
+        let layer_types = t
+            .get("layer_types")
+            .and_then(Value::as_array)
+            .context("missing layer_types")?;
+        let mlp_types = t
+            .get("mlp_layer_types")
+            .and_then(Value::as_array)
+            .context("missing mlp_layer_types")?;
+        let indexer_types = t
+            .get("indexer_types")
+            .and_then(Value::as_array)
+            .context("missing indexer_types")?;
+        ensure!(
+            layer_types.len() == depth as usize
+                && mlp_types.len() == depth as usize
+                && indexer_types.len() == depth as usize,
+            "GLM-5.3 layer type extent differs from num_hidden_layers"
+        );
+        let mut kda_layers = Vec::new();
+        let mut full_attn_layers = Vec::new();
+        let mut counts = [0u32; 2];
+        let mut layers = Vec::with_capacity(depth as usize);
+        for (i, kind) in layer_types.iter().enumerate() {
+            let sparse = (i + 1).is_multiple_of(4);
+            let expected = if sparse {
+                "deepseek_sparse_attention"
+            } else {
+                "linear_attention"
+            };
+            ensure!(
+                kind.as_str() == Some(expected),
+                "unsupported mixer at layer {i}"
+            );
+            if sparse {
+                full_attn_layers.push(i);
+            } else {
+                kda_layers.push(i);
+            }
+            let expected_ffn = if i < dense_layers as usize {
+                "dense"
+            } else {
+                "sparse"
+            };
+            ensure!(
+                mlp_types[i].as_str() == Some(expected_ffn),
+                "unsupported FFN at layer {i}"
+            );
+            ensure!(
+                indexer_types[i].as_str() == Some("full"),
+                "unsupported indexer at layer {i}"
+            );
+            let (mixer, slot) = if sparse {
+                (Mixer::FullAttention, 0)
+            } else {
+                (Mixer::Gdn, 1)
+            };
+            layers.push(LayerPlan {
+                mixer,
+                state_index: counts[slot],
+                rope: false,
+                sliding_window: None,
+                ffn: if i < dense_layers as usize {
+                    FfnKind::Dense
+                } else {
+                    FfnKind::Moe
+                },
+            });
+            counts[slot] += 1;
+        }
+        ensure!(kda_layers.len() + full_attn_layers.len() == depth as usize);
+        equal(linear, "kda_layers", serde_json::to_value(&kda_layers)?)?;
+        equal(
+            linear,
+            "full_attn_layers",
+            serde_json::to_value(&full_attn_layers)?,
+        )?;
+        ensure!(
+            counts == [11, 34],
+            "unsupported GLM-5.3 mixer counts {counts:?}"
+        );
+        let pad = integer(t, "pad_token_id")?;
+        ensure!(pad < vocab, "pad_token_id outside vocabulary");
+        let eos_value = generation
+            .get("eos_token_id")
+            .filter(|value| !value.is_null())
+            .or_else(|| t.get("eos_token_id"))
+            .context("missing EOS")?;
+        Ok(Self {
+            abi_version: 1,
+            architecture: Architecture::Glm5Next,
+            hidden,
+            intermediate,
+            vocab,
+            q_heads,
+            kv_heads,
+            head_dim: qk_head_dim,
+            q_width,
+            max_position,
+            rms_eps,
+            rope_theta: 1.0,
+            rotary_dim: 0,
+            linear_format: LinearFormat::fp8_block([128, 128], safetensors::Dtype::F32)?,
+            expert_format: Some(ExpertFormat::Fp8W8a16Block {
+                block: [128, 128],
+                scale_dtype: safetensors::Dtype::F32,
+            }),
+            eos: eos(eos_value, vocab)?,
+            layers,
+            moe: Some(MoeConfig {
+                experts,
+                experts_per_tok,
+                expert_intermediate,
+                shared_intermediate,
+                score: RouterScore::Sigmoid,
+                shared_gate: false,
+            }),
+            gdn: Some(GdnConfig {
+                key_heads: linear_heads,
+                value_heads: linear_heads,
+                key_head_dim: linear_head_dim,
+                value_head_dim: linear_head_dim,
+                conv_kernel: 4,
+            }),
+            glm5_next: Some(Glm5NextConfig {
+                dense_layers,
+                nextn_layers: positive(t, "num_nextn_predict_layers")?,
+                hc_mult,
+                hc_sinkhorn_iters,
+                hc_eps,
+                q_lora_rank,
+                kv_lora_rank,
+                qk_nope_head_dim,
+                v_head_dim,
+                index_heads,
+                index_head_dim,
+                index_topk,
+                index_kpool,
+                gate_lower_bound,
+                swiglu_limit,
+                routed_scaling_factor,
+            }),
             vision: None,
         })
     }
@@ -1275,6 +1724,7 @@ impl ModelSpec {
             layers: text.layers,
             moe: text.moe,
             gdn: Some(text.gdn),
+            glm5_next: None,
             vision,
         })
     }

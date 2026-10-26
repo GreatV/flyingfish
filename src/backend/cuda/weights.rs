@@ -557,7 +557,12 @@ impl Weights {
 }
 
 impl Loader<'_> {
-    pub(super) fn load_fp8(&mut self, name: &str, shape: &[usize]) -> Result<CudaSlice<u8>> {
+    pub(super) fn load_bytes(
+        &mut self,
+        name: &str,
+        shape: &[usize],
+        dtype: Dtype,
+    ) -> Result<CudaSlice<u8>> {
         let file = self
             .index
             .weight_map
@@ -565,8 +570,8 @@ impl Loader<'_> {
             .with_context(|| format!("missing tensor {name}"))?;
         let t = self.tensors[file].tensor(name)?;
         ensure!(
-            t.dtype() == Dtype::F8_E4M3 && t.shape() == shape,
-            "FP8 dtype/shape mismatch: {name}"
+            t.dtype() == dtype && t.shape() == shape,
+            "native dtype/shape mismatch: {name}"
         );
         ensure!(
             self.seen.insert(name.into()),
@@ -578,7 +583,7 @@ impl Loader<'_> {
         let staging = self
             .byte_staging
             .as_mut()
-            .context("FP8 upload requires audited manifest")?;
+            .context("native byte upload requires audited manifest")?;
         let mut dst = unsafe { self.stream.alloc::<u8>(t.data().len())? };
         for (i, mapped_chunk) in t.data().chunks(UPLOAD_CHUNK_BYTES).enumerate() {
             let len = mapped_chunk.len();
@@ -590,10 +595,19 @@ impl Loader<'_> {
             if let Some(hasher) = self.upload_hashers.get(file) {
                 hasher.bytes(&staging.as_slice()?[..len])?;
             }
-            ensure!(
-                staging.as_slice()?[..len].iter().all(|c| c & 0x7f != 0x7f),
-                "nonfinite FP8 code in {name}"
-            );
+            let valid = match dtype {
+                Dtype::F8_E4M3 => staging.as_slice()?[..len].iter().all(|c| c & 0x7f != 0x7f),
+                Dtype::F32 => {
+                    ensure!(len % 4 == 0, "unaligned F32 chunk in {name}");
+                    staging.as_slice()?[..len]
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|c| f32::from_le_bytes(*c).is_finite())
+                }
+                _ => anyhow::bail!("unsupported native byte dtype {dtype:?} for {name}"),
+            };
+            ensure!(valid, "nonfinite native value in {name}");
             let start = i * staging.len();
             let mut view = dst.slice_mut(start..start + len);
             self.stream
@@ -601,7 +615,7 @@ impl Loader<'_> {
             let received = self.stream.clone_dtoh(&view)?;
             ensure!(
                 received.as_slice() == &staging.as_slice()?[..len],
-                "FP8 upload byte mismatch for {name}"
+                "native upload byte mismatch for {name}"
             );
         }
 
@@ -615,7 +629,7 @@ impl Loader<'_> {
 
 pub(crate) enum StoredTensor {
     Bf16(CudaSlice<bf16>),
-    Fp8(CudaSlice<u8>),
+    Bytes(CudaSlice<u8>),
 }
 pub(crate) struct WeightCatalog {
     pub linear_format: crate::model_spec::LinearFormat,
@@ -723,7 +737,16 @@ impl WeightCatalog {
                         Dtype::BF16 => {
                             StoredTensor::Bf16(loader.load(&[(name.clone(), entry.shape.clone())])?)
                         }
-                        Dtype::F8_E4M3 => StoredTensor::Fp8(loader.load_fp8(name, &entry.shape)?),
+                        Dtype::F8_E4M3 => StoredTensor::Bytes(loader.load_bytes(
+                            name,
+                            &entry.shape,
+                            entry.dtype,
+                        )?),
+                        Dtype::F32 => StoredTensor::Bytes(loader.load_bytes(
+                            name,
+                            &entry.shape,
+                            entry.dtype,
+                        )?),
                         _ => anyhow::bail!("unsupported loaded dtype for {name}"),
                     };
                     tensors.insert(name.clone(), value);
@@ -974,6 +997,75 @@ mod tests {
         expert_storage_case(crate::experts::catalogue::ExpertGeometry::from_model(
             &spec,
         )?)
+    }
+
+    #[test]
+    #[ignore = "requires CUDA"]
+    fn native_f32_upload_gpu() -> Result<()> {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!("ff-f32-upload-{}", std::process::id()));
+        let result = (|| {
+            std::fs::create_dir_all(&root)?;
+            let mut header = serde_json::to_vec(&serde_json::json!({
+                "scale": {"dtype":"F32", "shape":[2,2], "data_offsets":[0,16]}
+            }))?;
+            while !header.len().is_multiple_of(8) {
+                header.push(b' ');
+            }
+            let data: Vec<u8> = [1.0f32, -2.0, 0.5, 4.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect();
+            let mut file = std::fs::File::create(root.join("model.safetensors"))?;
+            file.write_all(&(header.len() as u64).to_le_bytes())?;
+            file.write_all(&header)?;
+            file.write_all(&data)?;
+            drop(file);
+            std::fs::write(
+                root.join("model.safetensors.index.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "metadata":{"total_size":16},
+                    "weight_map":{"scale":"model.safetensors"}
+                }))?,
+            )?;
+            let data_start = 8 + header.len() as u64;
+            let entry = TensorEntry {
+                dtype: Dtype::F32,
+                shape: vec![2, 2],
+                shard: "model.safetensors".into(),
+                bytes: 16,
+                load: true,
+                data_start,
+                data_offsets: [0, 16],
+                scope: crate::checkpoint::TensorScope::Text,
+                layer: None,
+                role: "scale".into(),
+                scale_name: None,
+            };
+            let manifest = TensorManifest {
+                entries: [("scale".to_owned(), entry)].into(),
+                resident_bytes: 16,
+            };
+            let mapped = MappedCheckpoint::open(&root)?;
+            let device = crate::backend::cuda::Device::new(0)?;
+            let (uploaded, _) =
+                checkpoint_mapped(&mapped, &device, Some(&manifest), false, |loader| {
+                    let uploaded = loader.load_bytes("scale", &[2, 2], Dtype::F32)?;
+                    ensure!(loader.bytes == 16, "F32 upload accounting mismatch");
+                    Ok(uploaded)
+                })?;
+            let observed = device.upload.clone_dtoh(&uploaded)?;
+            ensure!(
+                observed.as_slice() == data,
+                "F32 native upload changed the published bytes"
+            );
+            println!("PASS native_f32_upload shape=[2,2] bytes=16");
+            Ok(())
+        })();
+        let cleanup = std::fs::remove_dir_all(&root);
+        result?;
+        cleanup?;
+        Ok(())
     }
 
     #[test]

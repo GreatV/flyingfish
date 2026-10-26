@@ -540,6 +540,9 @@ fn load_dispatch(architecture: crate::model_spec::Architecture) -> Result<LoadDi
         Architecture::Llama => LoadDispatch::Llama,
         Architecture::MiniCpmV47 => LoadDispatch::Qwen,
         Architecture::Flint => LoadDispatch::Qwen,
+        Architecture::Glm5Next => {
+            anyhow::bail!("GLM-5.3 execution is not bound yet")
+        }
     })
 }
 

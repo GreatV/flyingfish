@@ -179,11 +179,60 @@ impl MappedCheckpoint {
         policy: LoadPolicy,
     ) -> Result<TensorManifest> {
         use crate::model_spec::Architecture;
+        if spec.architecture == Architecture::Glm5Next {
+            let mut expected = BTreeMap::new();
+            Self::glm5_next_entries(spec, &mut expected)?;
+            let views = self.views()?;
+            let mut vision_count = 0usize;
+            let mut vision_bytes = 0usize;
+            for (name, shard) in self
+                .index
+                .weight_map
+                .iter()
+                .filter(|(name, _)| name.starts_with("model.visual."))
+            {
+                let tensor = views[shard].tensor(name)?;
+                put(
+                    &mut expected,
+                    name.clone(),
+                    tensor.dtype(),
+                    tensor.shape().to_vec(),
+                    TensorScope::Vision,
+                );
+                vision_count += 1;
+                vision_bytes = vision_bytes
+                    .checked_add(tensor.data().len())
+                    .context("vision payload size overflow")?;
+            }
+            ensure!(
+                vision_count == 347 && vision_bytes == 1_127_254_016,
+                "GLM-5.3 vision scope mismatch: tensors={vision_count} bytes={vision_bytes}"
+            );
+            let planned =
+                expected
+                    .iter()
+                    .try_fold(0usize, |sum, (name, (dtype, shape, scope))| {
+                        if !policy.selects_tensor(*scope, name) {
+                            return Ok(sum);
+                        }
+                        sum.checked_add(tensor_bytes(*dtype, shape)?)
+                            .context("resident size overflow")
+                    })?;
+            return self.assemble_manifest(
+                "GLM53",
+                expected,
+                policy,
+                planned,
+                spec.linear_format.fp8_layout(),
+            );
+        }
         let label = match spec.architecture {
             Architecture::Qwen35Text => "Q38",
             Architecture::MiniCpmV47 => "MiniCPM",
             Architecture::Flint => "Flint",
-            Architecture::Llama => bail!("checkpoint manifest requires a Qwen3.5-family spec"),
+            Architecture::Llama | Architecture::Glm5Next => {
+                bail!("checkpoint manifest requires a Qwen3.5-family spec")
+            }
         };
         let mut expected = BTreeMap::new();
         Self::text_entries(spec, &mut expected)?;
@@ -219,7 +268,7 @@ impl MappedCheckpoint {
             }
             Architecture::MiniCpmV47 => Self::minicpm_vision_entries(spec, &mut expected)?,
             Architecture::Flint => {}
-            Architecture::Llama => unreachable!(),
+            Architecture::Llama | Architecture::Glm5Next => unreachable!(),
         }
         if policy.selects(TensorScope::Mtp)
             && !expected
@@ -258,12 +307,13 @@ impl MappedCheckpoint {
         let q_width = spec.q_width as usize;
         let kv_width = spec.kv_heads as usize * head_dim;
         let fp8 = spec.linear_format.fp8_layout();
-        let dense_fp8 = fp8.filter(|layout| *layout == crate::fp8::Fp8ScaleLayout::Block128);
+        let dense_fp8 = fp8.filter(|layout| layout.block_scale().is_some());
         let global_prefix = match spec.architecture {
             Architecture::Flint => "model",
             Architecture::Qwen35Text | Architecture::MiniCpmV47 | Architecture::Llama => {
                 "model.language_model"
             }
+            Architecture::Glm5Next => unreachable!("GLM has a dedicated manifest path"),
         };
         for name in [
             format!("{global_prefix}.embed_tokens.weight"),
@@ -424,6 +474,9 @@ impl MappedCheckpoint {
                         Architecture::Qwen35Text
                         | Architecture::MiniCpmV47
                         | Architecture::Llama => 2 * q_width,
+                        Architecture::Glm5Next => {
+                            unreachable!("GLM has a dedicated manifest path")
+                        }
                     };
                     projection(
                         expected,
@@ -532,6 +585,293 @@ impl MappedCheckpoint {
                         );
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn glm5_next_entries(
+        spec: &crate::model_spec::ModelSpec,
+        expected: &mut BTreeMap<String, ExpectedTensor>,
+    ) -> Result<()> {
+        use crate::model_spec::Mixer;
+        let glm = spec
+            .glm5_next
+            .as_ref()
+            .context("GLM-5.3 geometry missing")?;
+        let hidden = spec.hidden as usize;
+        let depth = spec.layers.len();
+        for name in ["model.language_model.embed_tokens.weight", "lm_head.weight"] {
+            put(
+                expected,
+                name.into(),
+                Dtype::BF16,
+                vec![spec.vocab as usize, hidden],
+                TensorScope::Text,
+            );
+        }
+        put(
+            expected,
+            "model.language_model.norm.weight".into(),
+            Dtype::BF16,
+            vec![hidden],
+            TensorScope::Text,
+        );
+        for i in 0..depth + glm.nextn_layers as usize {
+            let scope = if i < depth {
+                TensorScope::Text
+            } else {
+                TensorScope::Mtp
+            };
+            let p = format!("model.language_model.layers.{i}");
+            for name in ["input_layernorm", "post_attention_layernorm"] {
+                put(
+                    expected,
+                    format!("{p}.{name}.weight"),
+                    Dtype::BF16,
+                    vec![hidden],
+                    scope,
+                );
+            }
+            if i < depth {
+                for name in ["hc_attn_base", "hc_ffn_base"] {
+                    put(expected, format!("{p}.{name}"), Dtype::F32, vec![24], scope);
+                }
+                for name in ["hc_attn_scale", "hc_ffn_scale"] {
+                    put(expected, format!("{p}.{name}"), Dtype::F32, vec![3], scope);
+                }
+                for name in ["hc_attn_fn", "hc_ffn_fn"] {
+                    put(
+                        expected,
+                        format!("{p}.{name}"),
+                        Dtype::BF16,
+                        vec![24, 4 * hidden],
+                        scope,
+                    );
+                }
+            }
+            if i < glm.dense_layers as usize {
+                for (role, n, k) in [
+                    ("gate_proj", spec.intermediate as usize, hidden),
+                    ("up_proj", spec.intermediate as usize, hidden),
+                    ("down_proj", hidden, spec.intermediate as usize),
+                ] {
+                    projection_scoped(
+                        expected,
+                        format!("{p}.mlp.{role}"),
+                        n,
+                        k,
+                        spec.linear_format.fp8_layout(),
+                        scope,
+                    );
+                }
+            } else {
+                Self::glm5_next_moe(spec, &p, expected, scope)?;
+            }
+            let sparse = i >= depth || spec.layers[i].mixer == Mixer::FullAttention;
+            if sparse {
+                Self::glm5_next_dsa(spec, &p, expected, scope)?;
+            } else {
+                Self::glm5_next_kda(spec, &p, expected, scope)?;
+            }
+            if i >= depth {
+                for (name, shape) in [
+                    ("eh_proj.weight", vec![hidden, 2 * hidden]),
+                    ("enorm.weight", vec![hidden]),
+                    ("hnorm.weight", vec![hidden]),
+                    ("shared_head.norm.weight", vec![hidden]),
+                ] {
+                    put(expected, format!("{p}.{name}"), Dtype::BF16, shape, scope);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn glm5_next_kda(
+        spec: &crate::model_spec::ModelSpec,
+        prefix: &str,
+        expected: &mut BTreeMap<String, ExpectedTensor>,
+        scope: TensorScope,
+    ) -> Result<()> {
+        let g = spec.gdn.as_ref().context("GLM-5.3 KDA geometry missing")?;
+        let hidden = spec.hidden as usize;
+        let width = (g.value_heads * g.value_head_dim) as usize;
+        let heads = g.value_heads as usize;
+        let low_rank = g.key_head_dim as usize;
+        for (role, n, k) in [
+            ("b_proj", heads, hidden),
+            ("f_a_proj", low_rank, hidden),
+            ("f_b_proj", width, low_rank),
+            ("g_a_proj", low_rank, hidden),
+            ("g_b_proj", width, low_rank),
+            ("k_proj", width, hidden),
+            ("q_proj", width, hidden),
+            ("v_proj", width, hidden),
+            ("o_proj", hidden, width),
+        ] {
+            put(
+                expected,
+                format!("{prefix}.self_attn.{role}.weight"),
+                Dtype::BF16,
+                vec![n, k],
+                scope,
+            );
+        }
+        for role in ["k_conv1d", "q_conv1d", "v_conv1d"] {
+            put(
+                expected,
+                format!("{prefix}.self_attn.{role}.weight"),
+                Dtype::BF16,
+                vec![width, 1, g.conv_kernel as usize],
+                scope,
+            );
+        }
+        put(
+            expected,
+            format!("{prefix}.self_attn.o_norm.weight"),
+            Dtype::BF16,
+            vec![g.value_head_dim as usize],
+            scope,
+        );
+        put(
+            expected,
+            format!("{prefix}.self_attn.A_log"),
+            Dtype::F32,
+            vec![heads],
+            scope,
+        );
+        put(
+            expected,
+            format!("{prefix}.self_attn.dt_bias"),
+            Dtype::F32,
+            vec![width],
+            scope,
+        );
+        Ok(())
+    }
+
+    fn glm5_next_dsa(
+        spec: &crate::model_spec::ModelSpec,
+        prefix: &str,
+        expected: &mut BTreeMap<String, ExpectedTensor>,
+        scope: TensorScope,
+    ) -> Result<()> {
+        let glm = spec
+            .glm5_next
+            .as_ref()
+            .context("GLM-5.3 DSA geometry missing")?;
+        let hidden = spec.hidden as usize;
+        let q_lora = glm.q_lora_rank as usize;
+        let kv_lora = glm.kv_lora_rank as usize;
+        let index_dim = glm.index_head_dim as usize;
+        for (suffix, shape) in [
+            (
+                "index_kpool_compress_ape",
+                vec![glm.index_kpool as usize, index_dim],
+            ),
+            ("index_kpool_compress_gate", vec![index_dim, hidden]),
+            ("k_norm.bias", vec![index_dim]),
+            ("k_norm.weight", vec![index_dim]),
+            (
+                "weights_proj.weight",
+                vec![glm.index_heads as usize, hidden],
+            ),
+            ("wk.weight", vec![index_dim, hidden]),
+            (
+                "wq_b.weight",
+                vec![glm.index_heads as usize * index_dim, q_lora],
+            ),
+        ] {
+            put(
+                expected,
+                format!("{prefix}.self_attn.indexer.{suffix}"),
+                Dtype::BF16,
+                shape,
+                scope,
+            );
+        }
+        for (name, width) in [("kv_a_layernorm", kv_lora), ("q_a_layernorm", q_lora)] {
+            put(
+                expected,
+                format!("{prefix}.self_attn.{name}.weight"),
+                Dtype::BF16,
+                vec![width],
+                scope,
+            );
+        }
+        put(
+            expected,
+            format!("{prefix}.self_attn.kv_b_proj.weight"),
+            Dtype::BF16,
+            vec![
+                (glm.qk_nope_head_dim + glm.v_head_dim) as usize * spec.q_heads as usize,
+                kv_lora,
+            ],
+            scope,
+        );
+        for (role, n, k) in [
+            ("q_a_proj", q_lora, hidden),
+            ("q_b_proj", spec.q_width as usize, q_lora),
+            ("kv_a_proj_with_mqa", kv_lora, hidden),
+            ("o_proj", hidden, spec.q_width as usize),
+        ] {
+            projection_scoped(
+                expected,
+                format!("{prefix}.self_attn.{role}"),
+                n,
+                k,
+                spec.linear_format.fp8_layout(),
+                scope,
+            );
+        }
+        Ok(())
+    }
+
+    fn glm5_next_moe(
+        spec: &crate::model_spec::ModelSpec,
+        prefix: &str,
+        expected: &mut BTreeMap<String, ExpectedTensor>,
+        scope: TensorScope,
+    ) -> Result<()> {
+        let moe = spec.moe.context("GLM-5.3 MoE geometry missing")?;
+        let hidden = spec.hidden as usize;
+        put(
+            expected,
+            format!("{prefix}.mlp.gate.weight"),
+            Dtype::BF16,
+            vec![moe.experts as usize, hidden],
+            scope,
+        );
+        put(
+            expected,
+            format!("{prefix}.mlp.gate.e_score_correction_bias"),
+            Dtype::F32,
+            vec![moe.experts as usize],
+            scope,
+        );
+        for (role, n, k) in [
+            ("gate_proj", moe.expert_intermediate as usize, hidden),
+            ("up_proj", moe.expert_intermediate as usize, hidden),
+            ("down_proj", hidden, moe.expert_intermediate as usize),
+        ] {
+            projection_scoped(
+                expected,
+                format!("{prefix}.mlp.shared_experts.{role}"),
+                n,
+                k,
+                spec.linear_format.fp8_layout(),
+                scope,
+            );
+            for expert in 0..moe.experts {
+                projection_scoped(
+                    expected,
+                    format!("{prefix}.mlp.experts.{expert}.{role}"),
+                    n,
+                    k,
+                    spec.linear_format.fp8_layout(),
+                    scope,
+                );
             }
         }
         Ok(())
@@ -718,10 +1058,25 @@ impl MappedCheckpoint {
         expected_bytes: usize,
         fp8_layout: Option<crate::fp8::Fp8ScaleLayout>,
     ) -> Result<TensorManifest> {
-        ensure!(
-            expected.len() == self.index.weight_map.len(),
-            "{label} tensor count mismatch"
-        );
+        if expected.len() != self.index.weight_map.len() {
+            let missing: Vec<_> = expected
+                .keys()
+                .filter(|name| !self.index.weight_map.contains_key(*name))
+                .take(3)
+                .collect();
+            let unexpected: Vec<_> = self
+                .index
+                .weight_map
+                .keys()
+                .filter(|name| !expected.contains_key(*name))
+                .take(3)
+                .collect();
+            bail!(
+                "{label} tensor count mismatch: expected={} actual={} missing={missing:?} unexpected={unexpected:?}",
+                expected.len(),
+                self.index.weight_map.len()
+            );
+        }
         let views = self.views()?;
         let mut entries = BTreeMap::new();
         let mut resident_bytes = 0usize;
@@ -826,25 +1181,30 @@ fn projection(
     k: usize,
     fp8: Option<crate::fp8::Fp8ScaleLayout>,
 ) {
+    projection_scoped(expected, base, n, k, fp8, TensorScope::Text);
+}
+
+fn projection_scoped(
+    expected: &mut BTreeMap<String, ExpectedTensor>,
+    base: String,
+    n: usize,
+    k: usize,
+    fp8: Option<crate::fp8::Fp8ScaleLayout>,
+    scope: TensorScope,
+) {
     let dtype = if fp8.is_some() {
         Dtype::F8_E4M3
     } else {
         Dtype::BF16
     };
-    put(
-        expected,
-        format!("{base}.weight"),
-        dtype,
-        vec![n, k],
-        TensorScope::Text,
-    );
+    put(expected, format!("{base}.weight"), dtype, vec![n, k], scope);
     if let Some(layout) = fp8 {
         put(
             expected,
             format!("{base}.{}", layout.scale_suffix()),
             layout.scale_dtype(),
             layout.scale_shape(n as u32, k as u32).to_vec(),
-            TensorScope::Text,
+            scope,
         );
     }
 }

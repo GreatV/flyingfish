@@ -149,7 +149,7 @@ mod tests {
         };
         let root = serde_json::from_str(include_str!("../tests/data/q38-config.json"))?;
         let mut model = ModelSpec::qwen(&root, &serde_json::json!({}))?;
-        model.linear_format = LinearFormat::Fp8E4m3Block128;
+        model.linear_format = LinearFormat::fp8_block([128, 128], safetensors::Dtype::BF16)?;
         assert_eq!(model.hidden, 5120);
         let gdn = GdnSpec::from_model(&model)?;
         let row_bytes = crate::work_layout::RowWorkSpec::new(&model)?.row_bytes()?;

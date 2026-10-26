@@ -94,7 +94,7 @@ fn q38_primitives_gpu() -> Result<()> {
             resident_bytes: codes.len() + scales.len(),
         };
         super::weights::checkpoint_mapped::<()>(&mapped, &d, Some(&manifest), false, |loader| {
-            let w = loader.load_fp8("w", &[129, 257])?;
+            let w = loader.load_bytes("w", &[129, 257], safetensors::Dtype::F8_E4M3)?;
             let scale = loader.load(&[("s".into(), vec![2, 3])])?;
             ensure!(
                 d.upload.clone_dtoh(&w)? == codes,
@@ -119,7 +119,13 @@ fn q38_primitives_gpu() -> Result<()> {
     uploaded?;
     let fp8 = Fp8Ops::new(&d.ctx)?;
     // All codes, including the two NaNs, plus non-integral 128-block scale tails.
-    for layout in [Fp8ScaleLayout::Block128, Fp8ScaleLayout::PerChannel] {
+    for layout in [
+        Fp8ScaleLayout::Block(
+            crate::fp8::Fp8BlockScale::new([128, 128], safetensors::Dtype::BF16)
+                .expect("valid BF16 block scale"),
+        ),
+        Fp8ScaleLayout::PerChannel,
+    ] {
         for (n, k) in [(1u32, 256u32), (129, 257)] {
             let codes: Vec<u8> = (0..n * k).map(|i| i as u8).collect();
             let shape = layout.scale_shape(n, k).map(|v| v as u32);
@@ -140,7 +146,7 @@ fn q38_primitives_gpu() -> Result<()> {
                     let want = effective_weight(
                         codes[i],
                         scales[match layout {
-                            Fp8ScaleLayout::Block128 => {
+                            Fp8ScaleLayout::Block(_) => {
                                 ((row / 128) * k.div_ceil(128) + col / 128) as usize
                             }
                             Fp8ScaleLayout::PerChannel => row as usize,
@@ -207,7 +213,16 @@ fn q38_primitives_gpu() -> Result<()> {
         )?;
         let materialized = s.alloc_zeros::<bf16>((n * k) as usize)?;
         let mut mat = TensorMut(view(&materialized, s, [n, k], [u64::from(k), 1])?);
-        fp8.materialize(s, w, sc, Fp8ScaleLayout::Block128, &mut mat)?;
+        fp8.materialize(
+            s,
+            w,
+            sc,
+            Fp8ScaleLayout::Block(
+                crate::fp8::Fp8BlockScale::new([128, 128], safetensors::Dtype::BF16)
+                    .expect("valid BF16 block scale"),
+            ),
+            &mut mat,
+        )?;
         for m in [1u32, 2, 3, 4, 5, 63, 64, 65] {
             let row_values = [1.0f32, -1.0, 2.0, -2.0, 4.0];
             let inputs: Vec<_> = (0..m * k)
@@ -248,7 +263,10 @@ fn q38_primitives_gpu() -> Result<()> {
                         ExecutionPhase::Prefill
                     },
                     LinearWeightRef::Fp8 {
-                        layout: Fp8ScaleLayout::Block128,
+                        layout: Fp8ScaleLayout::Block(
+                            crate::fp8::Fp8BlockScale::new([128, 128], safetensors::Dtype::BF16)
+                                .expect("valid BF16 block scale"),
+                        ),
                         codes: w,
                         scale: sc,
                     },
@@ -270,7 +288,13 @@ fn q38_primitives_gpu() -> Result<()> {
         }
     }
     // Sparse inputs across scale blocks expose skipped effective-BF16 rounding.
-    for layout in [Fp8ScaleLayout::Block128, Fp8ScaleLayout::PerChannel] {
+    for layout in [
+        Fp8ScaleLayout::Block(
+            crate::fp8::Fp8BlockScale::new([128, 128], safetensors::Dtype::BF16)
+                .expect("valid BF16 block scale"),
+        ),
+        Fp8ScaleLayout::PerChannel,
+    ] {
         for (n, k) in [(129u32, 257u32), (6144, 5120), (8192, 2048)] {
             let columns: &[usize] = if k == 257 {
                 &[127, 128, 256]
@@ -335,7 +359,7 @@ fn q38_primitives_gpu() -> Result<()> {
                                     effective_weight(
                                         codes[out * k as usize + col],
                                         scales[match layout {
-                                            Fp8ScaleLayout::Block128 => {
+                                            Fp8ScaleLayout::Block(_) => {
                                                 (out / 128) * scale_cols as usize + col / 128
                                             }
                                             Fp8ScaleLayout::PerChannel => out,
@@ -425,8 +449,11 @@ fn q38_primitives_gpu() -> Result<()> {
                     ("gdn", 10240, 5120),
                     ("mlp", 17408, 5120),
                 ] {
-                    let codes =
-                        loader.load_fp8(&format!("{label}.weight"), &[n as usize, k as usize])?;
+                    let codes = loader.load_bytes(
+                        &format!("{label}.weight"),
+                        &[n as usize, k as usize],
+                        safetensors::Dtype::F8_E4M3,
+                    )?;
                     let scales = loader.load(&[(
                         format!("{label}.weight_scale_inv"),
                         vec![n.div_ceil(128) as usize, k.div_ceil(128) as usize],
@@ -456,7 +483,16 @@ fn q38_primitives_gpu() -> Result<()> {
             )?;
             let materialized = s.alloc_zeros::<bf16>((u64::from(n) * u64::from(k)) as usize)?;
             let mut mat = TensorMut(view(&materialized, s, [n, k], [u64::from(k), 1])?);
-            fp8.materialize(s, w, sc, Fp8ScaleLayout::Block128, &mut mat)?;
+            fp8.materialize(
+                s,
+                w,
+                sc,
+                Fp8ScaleLayout::Block(
+                    crate::fp8::Fp8BlockScale::new([128, 128], safetensors::Dtype::BF16)
+                        .expect("valid BF16 block scale"),
+                ),
+                &mut mat,
+            )?;
             for row in [0u32, 127, 128, n - 1] {
                 let base = row as usize * k as usize;
                 let got = s.clone_dtoh(&materialized.slice(base..base + k as usize))?;
@@ -481,7 +517,13 @@ fn q38_primitives_gpu() -> Result<()> {
                     (
                         ExecutionPhase::Decode,
                         LinearWeightRef::Fp8 {
-                            layout: Fp8ScaleLayout::Block128,
+                            layout: Fp8ScaleLayout::Block(
+                                crate::fp8::Fp8BlockScale::new(
+                                    [128, 128],
+                                    safetensors::Dtype::BF16,
+                                )
+                                .expect("valid BF16 block scale"),
+                            ),
                             codes: w,
                             scale: sc,
                         },
@@ -881,7 +923,10 @@ fn verify_projection_m4(
         [u64::from(scale_cols), 1],
     )?;
     let weight = LinearWeightRef::Fp8 {
-        layout: Fp8ScaleLayout::Block128,
+        layout: Fp8ScaleLayout::Block(
+            crate::fp8::Fp8BlockScale::new([128, 128], safetensors::Dtype::BF16)
+                .expect("valid BF16 block scale"),
+        ),
         codes: codes_view,
         scale: scales_view,
     };

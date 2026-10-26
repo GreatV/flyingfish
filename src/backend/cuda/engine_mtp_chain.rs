@@ -823,8 +823,10 @@ pub(super) mod tests {
                     && e.model_spec.layers.len() == 64
                     && e.model_spec.vocab == 248320
                     && e.model_spec.moe.is_none()
-                    && e.model_spec.linear_format
-                        == crate::model_spec::LinearFormat::Fp8E4m3Block128,
+                    && matches!(
+                        e.model_spec.linear_format,
+                        crate::model_spec::LinearFormat::Fp8E4m3Block { .. }
+                    ),
                 "Runner FAIL dense prefill model geometry/format"
             );
             ensure!(

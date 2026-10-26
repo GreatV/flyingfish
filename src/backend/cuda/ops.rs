@@ -744,6 +744,10 @@ impl GateOps {
         let mode = match self.swiglu_rounding {
             crate::model_spec::SwigluRounding::Twice => 2,
             crate::model_spec::SwigluRounding::Once => 3,
+            crate::model_spec::SwigluRounding::ClampedTwice
+            | crate::model_spec::SwigluRounding::ClampedOnce => {
+                anyhow::bail!("clamped SwiGLU execution is not bound")
+            }
         };
         unsafe {
             stream

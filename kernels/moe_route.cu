@@ -181,6 +181,74 @@ __device__ void moe_route_select_sigmoid(
   }
 }
 
+__device__ __forceinline__ void moe_route_select_noaux(
+    float logit, float bias, int* __restrict__ ids, bf16* __restrict__ weights,
+    int experts, int top_k, int score_mode, float routed_scaling) {
+  const int tid = threadIdx.x;
+  const int nthr = (int)blockDim.x;
+  const int nw = nthr >> 5;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int row = blockIdx.x;
+  const int e = tid;
+  const bool live = e < experts;
+  float score = -1.0f;
+  if (live) {
+    if (score_mode == 0) {
+      score = 1.0f / (1.0f + expf(-logit));
+    } else {
+      const float softplus = fmaxf(logit, 0.0f) + log1pf(expf(-fabsf(logit)));
+      score = sqrtf(softplus);
+    }
+  }
+  const float select_score = score + bias;
+
+  __shared__ float s_sel_p[32];
+  __shared__ int s_sel_id[32];
+  __shared__ float s_red[32];
+  __shared__ int s_rid[32];
+  __shared__ float s_tsum;
+  if (tid == 0) s_tsum = 0.0f;
+  __syncthreads();
+
+  bool taken = false;
+  for (int r = 0; r < top_k; ++r) {
+    float v = !taken && live ? select_score : -CUDART_INF_F;
+    int id = live ? e : 0x7fffffff;
+    for (int off = 16; off > 0; off >>= 1) {
+      const float ov = __shfl_down_sync(0xffffffffu, v, off);
+      const int oi = __shfl_down_sync(0xffffffffu, id, off);
+      if (ov > v || (ov == v && oi < id)) { v = ov; id = oi; }
+    }
+    if (lane == 0) { s_red[warp] = v; s_rid[warp] = id; }
+    __syncthreads();
+    if (warp == 0) {
+      v = lane < nw ? s_red[lane] : -CUDART_INF_F;
+      id = lane < nw ? s_rid[lane] : 0x7fffffff;
+      for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_down_sync(0xffffffffu, v, off);
+        const int oi = __shfl_down_sync(0xffffffffu, id, off);
+        if (ov > v || (ov == v && oi < id)) { v = ov; id = oi; }
+      }
+      if (lane == 0) { s_red[0] = v; s_rid[0] = id; }
+    }
+    __syncthreads();
+    if (live && !taken && select_score == s_red[0] && e == s_rid[0]) {
+      s_sel_id[r] = e;
+      s_sel_p[r] = score;
+      s_tsum += score;
+      taken = true;
+    }
+    __syncthreads();
+  }
+
+  if (tid < top_k) {
+    ids[(size_t)row * top_k + tid] = s_sel_id[tid];
+    weights[(size_t)row * top_k + tid] =
+        __float2bfloat16((s_sel_p[tid] / (s_tsum + 1.0e-20f)) * routed_scaling);
+  }
+}
+
 __device__ __forceinline__ float moe_route_dot8(uint4 a, uint4 b, float acc) {
     const __nv_bfloat162* ha = reinterpret_cast<const __nv_bfloat162*>(&a);
     const __nv_bfloat162* hb = reinterpret_cast<const __nv_bfloat162*>(&b);
@@ -280,6 +348,30 @@ extern "C" __global__ void moe_route_topk_sigmoid(
   if (tid < experts)
     logit = __bfloat162float(logits[(size_t)row * experts + tid]);
   moe_route_select_sigmoid(logit, ids, weights, experts, top_k);
+}
+
+extern "C" __global__ void moe_route_topk_noaux(
+    const float* __restrict__ logits, const float* __restrict__ bias,
+    int* __restrict__ ids, bf16* __restrict__ weights, int rows, int experts,
+    int top_k, int score_mode, float routed_scaling) {
+  if ((int)blockIdx.x >= rows || experts < 1 || experts > 1024 || top_k < 1 ||
+      top_k > 32 || top_k > experts || (blockDim.x & 31) != 0 ||
+      (int)blockDim.x < experts || score_mode < 0 || score_mode > 1 ||
+      !isfinite(routed_scaling) || routed_scaling <= 0.0f ||
+      (reinterpret_cast<uintptr_t>(logits) & 3) != 0 ||
+      (reinterpret_cast<uintptr_t>(bias) & 3) != 0)
+    __trap();
+
+  const int tid = threadIdx.x;
+  const int row = blockIdx.x;
+  float logit = -CUDART_INF_F;
+  float correction = 0.0f;
+  if (tid < experts) {
+    logit = logits[(size_t)row * experts + tid];
+    correction = bias[(size_t)row * experts + tid];
+  }
+  moe_route_select_noaux(logit, correction, ids, weights, experts, top_k,
+                         score_mode, routed_scaling);
 }
 
 // Stream-ordered publication of one native expert slot and its generation.

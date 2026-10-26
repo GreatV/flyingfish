@@ -393,6 +393,7 @@ fn invariant_decode(device: &Device) -> Result<()> {
                             routing: weights[a],
 
                             rounding: crate::model_spec::SwigluRounding::Twice,
+                            limit: 0.0,
                             routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                         },
                         output,
@@ -415,6 +416,7 @@ fn invariant_decode(device: &Device) -> Result<()> {
                             routing: weights[a],
 
                             rounding: crate::model_spec::SwigluRounding::Twice,
+                            limit: 0.0,
                             routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                         },
                         output,

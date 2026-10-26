@@ -1,7 +1,134 @@
 //! MoE model-definition oracle: BF16 linear/SiLU/product/contribution boundaries.
 //! Router softmax and weight renormalization use FP32; exact ties select lower expert ids.
 //! The grouped_mm form sums routed contributions in FP32, rounds to BF16, then adds gated BF16 shared output.
+use anyhow::{Result, ensure};
 use half::bf16;
+use std::{cmp::Ordering, collections::BinaryHeap};
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScoredId {
+    pub id: i32,
+    pub score: f32,
+}
+
+impl PartialEq for ScoredId {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.score.to_bits() == other.score.to_bits()
+    }
+}
+impl Eq for ScoredId {}
+impl Ord for ScoredId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score
+            .total_cmp(&other.score)
+            .reverse()
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+impl PartialOrd for ScoredId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// A max-heap whose top is the current worst selected item.
+pub(crate) struct BoundedTopK {
+    k: usize,
+    heap: BinaryHeap<ScoredId>,
+}
+
+impl BoundedTopK {
+    pub fn new(k: usize) -> Result<Self> {
+        ensure!(k > 0, "top-k bound must be positive");
+        Ok(Self {
+            k,
+            heap: BinaryHeap::with_capacity(k),
+        })
+    }
+
+    pub fn push(&mut self, item: ScoredId) -> Result<()> {
+        ensure!(item.id >= 0, "top-k id must be nonnegative");
+        ensure!(!item.score.is_nan(), "top-k score must not be NaN");
+        if self.heap.len() < self.k {
+            self.heap.push(item);
+            return Ok(());
+        }
+        let worst = self.heap.peek().expect("nonempty top-k heap");
+        let replace = item.score.total_cmp(&worst.score) == Ordering::Greater
+            || (item.score.total_cmp(&worst.score) == Ordering::Equal && item.id < worst.id);
+        if replace {
+            self.heap.pop();
+            self.heap.push(item);
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> Vec<ScoredId> {
+        let mut items = self.heap.into_vec();
+        items.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
+        items
+    }
+}
+
+fn sqrt_softplus(value: f32) -> f32 {
+    let softplus = value.max(0.0) + (-value.abs()).exp().ln_1p();
+    softplus.sqrt()
+}
+
+/// Select by score+bias, then normalize the unbiased score with the published guard and scale.
+pub(crate) fn noaux_tc_route(
+    logits: &[f32],
+    correction_bias: &[f32],
+    top_k: usize,
+    score: crate::model_spec::RouterScore,
+    routed_scaling: f32,
+) -> Result<(Vec<i32>, Vec<f32>)> {
+    ensure!(
+        !logits.is_empty() && logits.len() == correction_bias.len(),
+        "router logits/bias extents differ"
+    );
+    ensure!(top_k > 0 && top_k <= logits.len(), "invalid router top-k");
+    ensure!(
+        routed_scaling.is_finite() && routed_scaling > 0.0,
+        "invalid routed scaling"
+    );
+    ensure!(
+        score != crate::model_spec::RouterScore::Softmax,
+        "noaux_tc requires a pointwise score"
+    );
+    let mut selected = BoundedTopK::new(top_k)?;
+    let mut raw = Vec::with_capacity(logits.len());
+    for (id, (&logit, &bias)) in logits.iter().zip(correction_bias).enumerate() {
+        ensure!(
+            logit.is_finite() && bias.is_finite(),
+            "nonfinite router input"
+        );
+        let value = match score {
+            crate::model_spec::RouterScore::Sigmoid => sigmoid(logit),
+            crate::model_spec::RouterScore::SqrtSoftplus => sqrt_softplus(logit),
+            crate::model_spec::RouterScore::Softmax => unreachable!(),
+        };
+        ensure!(value.is_finite(), "nonfinite router score");
+        raw.push(value);
+        selected.push(ScoredId {
+            id: i32::try_from(id)?,
+            score: value + bias,
+        })?;
+    }
+    let selected = selected.finish();
+    let mut weights = Vec::with_capacity(top_k);
+    let mut sum = 0.0f32;
+    for item in &selected {
+        let value = raw[item.id as usize];
+        weights.push(value);
+        sum += value;
+    }
+    let denominator = sum + 1e-20;
+    for value in &mut weights {
+        *value = (*value / denominator) * routed_scaling;
+    }
+    Ok((selected.iter().map(|item| item.id).collect(), weights))
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MoeDims {
@@ -262,20 +389,21 @@ pub(crate) fn sigmoid_route_row(fx: &MoeFixture, row: usize) -> RouteRow {
     let (e, k, h) = (fx.dims.experts, fx.dims.top_k, fx.dims.hidden);
     assert!(row < fx.dims.rows);
     let logits = router_logits(&fx.router_w, &fx.x[row * h..(row + 1) * h], e);
-    let probs: Vec<_> = logits
-        .iter()
-        .map(|logit| 1.0 / (1.0 + (-logit.to_f32()).exp()))
-        .collect();
+    let logits: Vec<f32> = logits.iter().map(|value| value.to_f32()).collect();
+    let (ids, weights) = noaux_tc_route(
+        &logits,
+        &vec![0.0; e],
+        k,
+        crate::model_spec::RouterScore::Sigmoid,
+        1.0,
+    )
+    .expect("valid sigmoid route");
+    let probs: Vec<f32> = logits.iter().map(|&value| sigmoid(value)).collect();
     let order = ranking(&probs);
-    let top = &order[..k];
-    let tsum: f32 = top.iter().map(|&id| probs[id]).sum::<f32>() + 1.0e-20;
     let margin = probs[order[k - 1]] - probs[order[k]];
     RouteRow {
-        ids: top.iter().map(|&id| id as i32).collect(),
-        weights: top
-            .iter()
-            .map(|&id| bf16::from_f32(probs[id] / tsum))
-            .collect(),
+        ids,
+        weights: weights.into_iter().map(bf16::from_f32).collect(),
         probs,
         margin,
     }
@@ -339,6 +467,9 @@ fn expert_out(
                 }
                 crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16 => {
                     lin * weight.to_f32()
+                }
+                crate::model_spec::RoutedWeightBoundary::BeforeDownQuantization => {
+                    unreachable!("quantized-down boundary in the BF16 reference")
                 }
             };
             bf16::from_f32(weighted)
@@ -601,5 +732,108 @@ mod tests {
             0.001953125f32.to_bits()
         );
         assert_eq!(noise.ascending_vs_fp32.to_bits(), 0.0009765625f32.to_bits());
+    }
+
+    #[derive(serde::Deserialize)]
+    struct TopKFixture {
+        scores: Vec<f32>,
+        k: usize,
+        ids: Vec<i32>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RouterFixture {
+        mode: String,
+        logits: Vec<f32>,
+        bias: Vec<f32>,
+        top_k: usize,
+        scale: f32,
+        ids: Vec<i32>,
+        weights: Vec<f32>,
+    }
+    #[derive(serde::Deserialize)]
+    struct SharedFixture {
+        topk: TopKFixture,
+        routers: Vec<RouterFixture>,
+    }
+
+    fn shared_fixture() -> SharedFixture {
+        serde_json::from_str(include_str!("../../../../tests/data/shared-ops.json")).unwrap()
+    }
+
+    #[test]
+    fn bounded_topk_matches_model_definition_order() -> Result<()> {
+        let fixture = shared_fixture().topk;
+        let mut selected = BoundedTopK::new(fixture.k)?;
+        for (id, score) in fixture.scores.iter().copied().enumerate() {
+            selected.push(ScoredId {
+                id: i32::try_from(id)?,
+                score,
+            })?;
+        }
+        let selected = selected.finish();
+        let ids: Vec<_> = selected.iter().map(|item| item.id).collect();
+        assert_eq!(ids, fixture.ids);
+        for pair in selected.windows(2) {
+            let [a, b] = pair else { unreachable!() };
+            assert!(
+                a.score > b.score || (a.score == b.score && a.id < b.id),
+                "selection order is not score-descending/id-ascending: {a:?} {b:?}"
+            );
+        }
+        let mut tied = BoundedTopK::new(2)?;
+        for id in [2, 1, 0] {
+            tied.push(ScoredId { id, score: 1.0 })?;
+        }
+        let ids: Vec<_> = tied.finish().into_iter().map(|item| item.id).collect();
+        assert_eq!(ids, [0, 1]);
+        Ok(())
+    }
+
+    #[test]
+    fn noaux_tc_modes_match_model_definition_weights() -> Result<()> {
+        for fixture in shared_fixture().routers {
+            let mode = match fixture.mode.as_str() {
+                "sigmoid" => crate::model_spec::RouterScore::Sigmoid,
+                "sqrtsoftplus" => crate::model_spec::RouterScore::SqrtSoftplus,
+                other => anyhow::bail!("unknown score mode {other}"),
+            };
+            let (ids, weights) = noaux_tc_route(
+                &fixture.logits,
+                &fixture.bias,
+                fixture.top_k,
+                mode,
+                fixture.scale,
+            )?;
+            assert_eq!(ids, fixture.ids, "{}", fixture.mode);
+            for (index, (&actual, &expected)) in weights.iter().zip(&fixture.weights).enumerate() {
+                let tolerance = 2e-6 * expected.abs().max(1.0);
+                ensure!(
+                    (actual - expected).abs() <= tolerance,
+                    "{} weight {index}: actual={actual} expected={expected} tolerance={tolerance}",
+                    fixture.mode
+                );
+            }
+            ensure!(
+                weights.iter().all(|weight| weight.is_finite()),
+                "nonfinite route weight"
+            );
+            let sum: f32 = weights.iter().sum();
+            ensure!(
+                (sum - fixture.scale).abs() < 1e-4,
+                "{} normalized scale {sum} differs from {}",
+                fixture.mode,
+                fixture.scale
+            );
+        }
+        let (ids, weights) = noaux_tc_route(
+            &[0.1, -0.2],
+            &[0.0, 0.0],
+            2,
+            crate::model_spec::RouterScore::Sigmoid,
+            1.0,
+        )?;
+        assert_eq!(ids.len(), 2);
+        assert!((weights.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        Ok(())
     }
 }

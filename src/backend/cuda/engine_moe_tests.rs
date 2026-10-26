@@ -851,6 +851,12 @@ impl Engine {
             crate::experts::catalogue::ExpertLayout::Fp8W8a16(_) => {
                 crate::model_spec::ExpertFormat::Fp8W8a16
             }
+            crate::experts::catalogue::ExpertLayout::Fp8W8a16Block(_, block_scale) => {
+                crate::model_spec::ExpertFormat::Fp8W8a16Block {
+                    block: block_scale.block(),
+                    scale_dtype: block_scale.dtype(),
+                }
+            }
         });
         let config = model_spec.config();
         let manifest = hybrid_manifest(&model_spec)?;
@@ -893,6 +899,7 @@ impl Engine {
                 engines,
                 max_rows: cpu_bounds.0 as u32,
                 swiglu_rounding: crate::model_spec::SwigluRounding::Twice,
+                swiglu_limit: 0.0,
                 routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
             },
         )?;
@@ -1017,6 +1024,7 @@ impl Engine {
                     .context("MoE shared geometry missing")?
                     .shared_intermediate,
                 swiglu_rounding: model_spec.swiglu_rounding(),
+                swiglu_limit: model_spec.swiglu_limit(),
                 routed_weight: model_spec.routed_weight_boundary(),
             },
         )?);
@@ -1569,6 +1577,12 @@ impl TierOracle {
             crate::experts::catalogue::ExpertLayout::Fp8W8a16(_) => {
                 crate::model_spec::ExpertFormat::Fp8W8a16
             }
+            crate::experts::catalogue::ExpertLayout::Fp8W8a16Block(_, block_scale) => {
+                crate::model_spec::ExpertFormat::Fp8W8a16Block {
+                    block: block_scale.block(),
+                    scale_dtype: block_scale.dtype(),
+                }
+            }
         };
         let catalogue = native_fixture(fixture, directory, format)?;
         let geometry = catalogue.geometry();
@@ -1664,6 +1678,7 @@ impl TierOracle {
                         routing: bf16::from_f32(weights[choice]),
 
                         rounding: crate::model_spec::SwigluRounding::Twice,
+                        limit: 0.0,
                         routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                     },
                     &mut output[choice * 128..(choice + 1) * 128],
@@ -1680,6 +1695,7 @@ impl TierOracle {
                         routing: bf16::from_f32(weights[choice]),
 
                         rounding: crate::model_spec::SwigluRounding::Twice,
+                        limit: 0.0,
                         routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
                     },
                     &mut output[choice * 128..(choice + 1) * 128],
@@ -2425,6 +2441,7 @@ fn cpu_control(
                 routing: bf16::from_f32(weights[choice]),
 
                 rounding: crate::model_spec::SwigluRounding::Twice,
+                limit: 0.0,
                 routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
             },
             &mut contributions[choice * 128..(choice + 1) * 128],

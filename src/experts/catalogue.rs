@@ -2,6 +2,7 @@
 use crate::checkpoint::TensorManifest;
 use crate::model_spec::{ExpertFormat, ModelSpec};
 use anyhow::{Context, Result, ensure};
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -55,6 +56,7 @@ pub enum ExpertLayout {
     Bf16Fused { slot_bytes: u64, gate_up_bytes: u64 },
     Bf16Separate { slot_bytes: u64, matrix_bytes: u64 },
     Fp8W8a16(Fp8Slot),
+    Fp8W8a16Block(Fp8Slot, crate::fp8::Fp8BlockScale),
 }
 
 impl ExpertLayout {
@@ -152,6 +154,48 @@ impl ExpertLayout {
                     down_scale,
                 }))
             }
+            ExpertFormat::Fp8W8a16Block { block, scale_dtype } => {
+                let block_scale = crate::fp8::Fp8BlockScale::new(block, scale_dtype)?;
+                let weight = intermediate
+                    .checked_mul(hidden)
+                    .context("FP8 expert weight extent overflow")?;
+                let gate = 0..weight;
+                let up = weight..weight.checked_mul(2).context("FP8 up extent overflow")?;
+                let down = up.end..weight.checked_mul(3).context("FP8 down extent overflow")?;
+                let scale_bytes =
+                    block_scale.scale_bytes(intermediate as u32, hidden as u32)? as u64;
+                let gate_scale = down.end
+                    ..down
+                        .end
+                        .checked_add(scale_bytes)
+                        .context("FP8 gate scale extent overflow")?;
+                let up_scale = gate_scale.end
+                    ..gate_scale
+                        .end
+                        .checked_add(scale_bytes)
+                        .context("FP8 up scale extent overflow")?;
+                let down_scale = up_scale.end
+                    ..up_scale
+                        .end
+                        .checked_add(scale_bytes)
+                        .context("FP8 down scale extent overflow")?;
+                ensure!(
+                    down_scale.end.is_multiple_of(16),
+                    "FP8 block slot alignment: slot_bytes={}",
+                    down_scale.end
+                );
+                Ok(Self::Fp8W8a16Block(
+                    Fp8Slot {
+                        gate,
+                        up,
+                        down,
+                        gate_scale,
+                        up_scale,
+                        down_scale,
+                    },
+                    block_scale,
+                ))
+            }
         }
     }
 
@@ -160,6 +204,7 @@ impl ExpertLayout {
             Self::Bf16Fused { slot_bytes, .. } => *slot_bytes,
             Self::Bf16Separate { slot_bytes, .. } => *slot_bytes,
             Self::Fp8W8a16(slot) => slot.down_scale.end,
+            Self::Fp8W8a16Block(slot, _) => slot.down_scale.end,
         }
     }
 
@@ -167,7 +212,7 @@ impl ExpertLayout {
         match self {
             Self::Bf16Fused { gate_up_bytes, .. } => *gate_up_bytes,
             Self::Bf16Separate { matrix_bytes, .. } => matrix_bytes * 2,
-            Self::Fp8W8a16(_) => 0,
+            Self::Fp8W8a16(_) | Self::Fp8W8a16Block(..) => 0,
         }
     }
 
@@ -176,6 +221,7 @@ impl ExpertLayout {
             Self::Bf16Fused { .. } => None,
             Self::Bf16Separate { .. } => None,
             Self::Fp8W8a16(slot) => Some(slot),
+            Self::Fp8W8a16Block(slot, _) => Some(slot),
         }
     }
 }
@@ -357,7 +403,8 @@ fn native_entry(
     let expected = elements
         .checked_mul(match dtype {
             safetensors::Dtype::BF16 => 2,
-            safetensors::Dtype::F8_E4M3 => 1,
+            safetensors::Dtype::F32 => 4,
+            safetensors::Dtype::F8_E4M3 | safetensors::Dtype::F8_E8M0 => 1,
             other => anyhow::bail!("unsupported expert scale dtype {other:?}"),
         })
         .context("expert tensor byte extent overflow")?;
@@ -385,8 +432,39 @@ impl ExpertCatalogue {
         let layout = ExpertLayout::new(format, &geometry)?;
         let prefix = match format {
             ExpertFormat::Bf16Separate => "model",
-            ExpertFormat::Bf16 | ExpertFormat::Fp8W8a16 => "model.language_model",
+            ExpertFormat::Bf16 | ExpertFormat::Fp8W8a16 | ExpertFormat::Fp8W8a16Block { .. } => {
+                "model.language_model"
+            }
         };
+        let layer_prefix = format!("{prefix}.layers.");
+        let layer_ids: BTreeSet<u32> = manifest
+            .entries
+            .iter()
+            .filter(|(name, entry)| {
+                entry.scope == crate::checkpoint::TensorScope::Text
+                    && name.contains(".mlp.experts.")
+            })
+            .map(|(name, _)| {
+                let layer = name
+                    .strip_prefix(&layer_prefix)
+                    .and_then(|suffix| suffix.split('.').next())
+                    .with_context(|| format!("invalid routed-expert layer name {name}"))?;
+                layer
+                    .parse::<u32>()
+                    .with_context(|| format!("routed-expert layer index overflow in {name}"))
+            })
+            .collect::<Result<_>>()?;
+        let end_layer = geometry
+            .first_layer
+            .checked_add(geometry.layers)
+            .context("expert checkpoint layer overflow")?;
+        let expected_ids = (geometry.first_layer..end_layer).collect::<BTreeSet<_>>();
+        ensure!(
+            layer_ids == expected_ids,
+            "routed layer IDs {:?} differ from geometry {:?}",
+            layer_ids,
+            expected_ids
+        );
         let mut ranges = Vec::with_capacity(geometry.layers as usize);
         for layer in 0..geometry.layers {
             let checkpoint_layer = geometry
@@ -447,7 +525,12 @@ impl ExpertCatalogue {
                     }
                     ranges.push(layer_ranges);
                 }
-                ExpertLayout::Fp8W8a16(_) => {
+                ExpertLayout::Fp8W8a16(_) | ExpertLayout::Fp8W8a16Block(..) => {
+                    let block_scale = match layout {
+                        ExpertLayout::Fp8W8a16(_) => None,
+                        ExpertLayout::Fp8W8a16Block(_, block_scale) => Some(block_scale),
+                        _ => unreachable!(),
+                    };
                     let hidden = geometry.hidden as usize;
                     let intermediate = geometry.intermediate as usize;
                     let scales = geometry.experts as usize;
@@ -460,20 +543,33 @@ impl ExpertCatalogue {
                                 shape,
                             )
                         };
-                        let scale = |role: &str, rows: usize| {
+                        let scale = |role: &str, rows: usize, columns: usize| {
+                            let suffix = if block_scale.is_some() {
+                                "weight_scale_inv"
+                            } else {
+                                "weight_scale"
+                            };
+                            let role = format!("{role}.{suffix}");
+                            let shape = if let Some(descriptor) = block_scale {
+                                descriptor.scale_shape(rows as u32, columns as u32)
+                            } else {
+                                [rows, 1]
+                            };
                             native_entry(
-                                expert_entry(manifest, checkpoint_layer, prefix, expert, role)?,
-                                safetensors::Dtype::BF16,
-                                &[rows, 1],
+                                expert_entry(manifest, checkpoint_layer, prefix, expert, &role)?,
+                                block_scale.map_or(safetensors::Dtype::BF16, |descriptor| {
+                                    descriptor.dtype()
+                                }),
+                                &shape,
                             )
                         };
                         layer_ranges.push(ExpertRange::Fp8 {
                             gate: weight("gate_proj.weight", &[intermediate, hidden])?,
                             up: weight("up_proj.weight", &[intermediate, hidden])?,
                             down: weight("down_proj.weight", &[hidden, intermediate])?,
-                            gate_scale: scale("gate_proj.weight_scale", intermediate)?,
-                            up_scale: scale("up_proj.weight_scale", intermediate)?,
-                            down_scale: scale("down_proj.weight_scale", hidden)?,
+                            gate_scale: scale("gate_proj", intermediate, hidden)?,
+                            up_scale: scale("up_proj", intermediate, hidden)?,
+                            down_scale: scale("down_proj", hidden, intermediate)?,
                         });
                     }
                     ranges.push(layer_ranges);
@@ -720,6 +816,93 @@ mod tests {
         assert_eq!(catalogue.slot_bytes(), 192);
         assert!(catalogue.range(2, 0).is_err());
         assert!(catalogue.range(0, 4).is_err());
+        Ok(())
+    }
+
+    fn block_manifest() -> TensorManifest {
+        let mut entries = BTreeMap::new();
+        for (name, mut entry) in fp8_manifest().entries {
+            let name = if name.ends_with("weight_scale") {
+                entry.dtype = safetensors::Dtype::F32;
+                entry.role = entry.role.replace("weight_scale", "weight_scale_inv");
+                entry.shape = vec![2, 2];
+                entry.data_offsets[1] = entry.data_offsets[0] + 16;
+                entry.bytes = 16;
+                name.replace("weight_scale", "weight_scale_inv")
+            } else {
+                entry.shape = vec![256, 256];
+                entry.data_offsets[1] = entry.data_offsets[0] + 65_536;
+                entry.bytes = 65_536;
+                name
+            };
+            entries.insert(name, entry);
+        }
+        TensorManifest {
+            entries,
+            resident_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn block_scale_ranges_match_native_layout() -> Result<()> {
+        let geometry = ExpertGeometry {
+            hidden: 256,
+            intermediate: 256,
+            ..geometry()
+        };
+        let catalogue = ExpertCatalogue::from_manifest(
+            &block_manifest(),
+            geometry,
+            ExpertFormat::Fp8W8a16Block {
+                block: [128, 128],
+                scale_dtype: safetensors::Dtype::F32,
+            },
+        )?;
+        assert_eq!(catalogue.slot_bytes(), 196_656);
+        let layout = match catalogue.layout() {
+            ExpertLayout::Fp8W8a16Block(slot, _) => slot,
+            _ => bail!("block FP8 layout expected"),
+        };
+        assert_eq!(
+            (layout.gate_scale.start, layout.gate_scale.end),
+            (196_608, 196_624)
+        );
+        assert_eq!(
+            (layout.up_scale.start, layout.up_scale.end),
+            (196_624, 196_640)
+        );
+        assert_eq!(
+            (layout.down_scale.start, layout.down_scale.end),
+            (196_640, 196_656)
+        );
+        let ExpertRange::Fp8 { down_scale, .. } = catalogue.range(0, 1)? else {
+            bail!("FP8 range expected");
+        };
+        assert_eq!(down_scale.len, 16);
+        let e8m0 = ExpertLayout::new(
+            ExpertFormat::Fp8W8a16Block {
+                block: [32, 32],
+                scale_dtype: safetensors::Dtype::F8_E8M0,
+            },
+            &geometry,
+        )?;
+        assert_eq!(e8m0.slot_bytes(), 196_800);
+        let e8m0_scale = &e8m0.fp8_slot().unwrap().down_scale;
+        assert_eq!(e8m0_scale.end - e8m0_scale.start, 64);
+        let mut bad = block_manifest();
+        let name = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv";
+        bad.entries.get_mut(name).unwrap().dtype = safetensors::Dtype::BF16;
+        let error = ExpertCatalogue::from_manifest(
+            &bad,
+            geometry,
+            ExpertFormat::Fp8W8a16Block {
+                block: [128, 128],
+                scale_dtype: safetensors::Dtype::F32,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("expected F32"), "{error}");
         Ok(())
     }
 

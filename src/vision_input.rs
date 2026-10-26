@@ -309,8 +309,8 @@ impl MultimodalInput<'_> {
         match spec.architecture {
             Architecture::Qwen35Text => self.validate_qwen(spec, capacity),
             Architecture::MiniCpmV47 => self.validate_minicpm(spec, capacity),
-            Architecture::Llama | Architecture::Flint => {
-                bail!("packed images require a multimodal architecture")
+            Architecture::Llama | Architecture::Flint | Architecture::Glm5Next => {
+                bail!("packed images require a supported multimodal architecture")
             }
         }
     }
