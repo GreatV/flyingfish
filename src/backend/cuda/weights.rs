@@ -61,8 +61,10 @@ pub struct ExpertStorage {
     layout: SlotLayout,
     down_offset: u64,
     device: CudaSlice<bf16>,
+    peer_device: Option<CudaSlice<bf16>>,
     host: Option<Arc<HostBlocks>>,
     context: Arc<CudaContext>,
+    peer_context: Option<Arc<CudaContext>>,
     registered: bool,
 }
 
@@ -70,6 +72,7 @@ impl ExpertStorage {
     pub fn new(
         stream: &Arc<CudaStream>,
         upload: &Arc<CudaStream>,
+        peer: Option<(&Arc<CudaStream>, &Arc<CudaStream>)>,
         geometry: ExpertGeometry,
         capacity: &Capacity,
     ) -> Result<Self> {
@@ -79,7 +82,8 @@ impl ExpertStorage {
         );
         let down_offset = capacity.layout.down_offset();
         let layout = SlotLayout::new(geometry, capacity)?;
-        let bytes = layout.allocation_bytes()?;
+        let gpu0_bytes = layout.allocation_bytes()?;
+        let peer_bytes = layout.peer_resident_bytes();
         let host = (layout.host_blocks() > 0)
             .then(|| {
                 HostBlocks::new(
@@ -89,15 +93,36 @@ impl ExpertStorage {
             })
             .transpose()?;
         let allocation = stream
-            .alloc_zeros(bytes / size_of::<bf16>())
-            .with_context(|| format!("allocate native expert slots and staging: bytes={bytes}"))?;
+            .alloc_zeros(gpu0_bytes / size_of::<bf16>())
+            .with_context(|| {
+                format!("allocate native expert slots and staging on GPU 0: bytes={gpu0_bytes}")
+            })?;
         upload.wait(&stream.record_event(None)?)?;
+        let (peer_device, peer_context) = if peer_bytes > 0 {
+            let (peer_stream, peer_upload) =
+                peer.context("peer expert bytes planned without a peer device stream")?;
+            ensure!(
+                Arc::ptr_eq(peer_stream.context(), peer_upload.context()),
+                "peer expert allocation streams have different contexts"
+            );
+            let peer_alloc = peer_stream
+                .alloc_zeros(peer_bytes / size_of::<bf16>())
+                .with_context(|| {
+                    format!("allocate native expert slots on peer GPU: bytes={peer_bytes}")
+                })?;
+            peer_upload.wait(&peer_stream.record_event(None)?)?;
+            (Some(peer_alloc), Some(peer_stream.context().clone()))
+        } else {
+            (None, None)
+        };
         Ok(Self {
             layout,
             down_offset,
             device: allocation,
+            peer_device,
             host,
             context: stream.context().clone(),
+            peer_context,
             registered: false,
         })
     }
@@ -110,15 +135,42 @@ impl ExpertStorage {
         self.host.as_ref()
     }
 
+    #[cfg(test)]
+    pub fn has_peer(&self) -> bool {
+        self.peer_device.is_some()
+    }
+
     fn native_pointers(&self, range: std::ops::Range<usize>) -> Result<(u64, u64)> {
-        ensure!(
-            range.end <= self.device.len() * size_of::<bf16>(),
-            "native expert range {range:?} exceeds allocation bytes={}",
-            self.device.len() * size_of::<bf16>()
-        );
-        let (base, _read) = self.device.device_ptr(self.device.stream());
+        let peer_bytes = self.layout.peer_resident_bytes();
+        let (base, local_start) = if range.end <= peer_bytes {
+            let peer = self
+                .peer_device
+                .as_ref()
+                .context("peer expert slot requested without peer allocation")?;
+            ensure!(
+                range.end <= peer.len() * size_of::<bf16>(),
+                "peer expert range {range:?} exceeds peer allocation bytes={}",
+                peer.len() * size_of::<bf16>()
+            );
+            let (base, _read) = peer.device_ptr(peer.stream());
+            (base, range.start)
+        } else {
+            ensure!(
+                range.start >= peer_bytes,
+                "expert range {range:?} straddles peer boundary {peer_bytes}"
+            );
+            let local_start = range.start - peer_bytes;
+            let local_end = range.end - peer_bytes;
+            ensure!(
+                local_end <= self.device.len() * size_of::<bf16>(),
+                "native expert range {local_start}..{local_end} exceeds GPU 0 allocation bytes={}",
+                self.device.len() * size_of::<bf16>()
+            );
+            let (base, _read) = self.device.device_ptr(self.device.stream());
+            (base, local_start)
+        };
         let gate_up = base
-            .checked_add(range.start as u64)
+            .checked_add(local_start as u64)
             .context("native expert address overflow")?;
         let down = gate_up
             .checked_add(self.down_offset)
@@ -139,9 +191,14 @@ impl ExpertStorage {
     /// The ledger must evict and claim every slot in this range before writes begin.
     pub fn borrowed_tail(&self, slots: u32) -> Result<(u64, usize)> {
         let range = self.layout.borrowed_tail(slots)?;
+        let peer_bytes = self.layout.peer_resident_bytes();
+        let local_start = range
+            .start
+            .checked_sub(peer_bytes)
+            .context("borrowed tail lies inside peer expert range")?;
         let (base, _read) = self.device.device_ptr(self.device.stream());
         Ok((
-            base.checked_add(range.start as u64)
+            base.checked_add(local_start as u64)
                 .context("borrowed span address overflow")?,
             range.len(),
         ))
@@ -171,6 +228,11 @@ impl ExpertStorage {
         self.context
             .synchronize()
             .context("finish expert storage readers and copies")?;
+        if let Some(peer_ctx) = &self.peer_context {
+            peer_ctx
+                .synchronize()
+                .context("finish peer expert storage readers and copies")?;
+        }
         if self.registered {
             let (address, bytes) = self
                 .host
@@ -185,6 +247,11 @@ impl ExpertStorage {
         self.context
             .check_err()
             .context("expert storage deferred CUDA error")?;
+        if let Some(peer_ctx) = &self.peer_context {
+            peer_ctx
+                .check_err()
+                .context("peer expert storage deferred CUDA error")?;
+        }
         Ok(())
     }
 }
@@ -192,6 +259,9 @@ impl ExpertStorage {
 impl Drop for ExpertStorage {
     fn drop(&mut self) {
         self.context.record_err(self.context.synchronize());
+        if let Some(peer_ctx) = &self.peer_context {
+            peer_ctx.record_err(peer_ctx.synchronize());
+        }
         if self.registered {
             self.context.record_err(self.context.bind_to_thread());
             if let Some(host) = &self.host {
@@ -819,6 +889,8 @@ mod tests {
             span_rows: 8,
             wave_rows: 2,
             device_expert_bytes: u64::from(geometry.layers + 1) * slot_bytes,
+            peer_expert_bytes: 0,
+            gpu0_layers: geometry.layers,
             host_expert_bytes: 3 * slot_bytes,
             slots_per_layer: counts.clone(),
             host_blocks: 2,
@@ -830,7 +902,8 @@ mod tests {
             pinned: true,
         };
         let device = crate::backend::cuda::Device::new(0)?;
-        let mut storage = ExpertStorage::new(&device.stream, &device.upload, geometry, &capacity)?;
+        let mut storage =
+            ExpertStorage::new(&device.stream, &device.upload, None, geometry, &capacity)?;
         let host = storage.host().context("host expert arena missing")?.clone();
         let elements = slot_bytes as usize / size_of::<bf16>();
         let pattern = |i: usize, block: u32| {

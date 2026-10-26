@@ -105,6 +105,7 @@ pub(crate) struct Work {
     pub(crate) logits: CudaSlice<bf16>,
     pub(crate) token: CudaSlice<u32>,
     pub(crate) mixer: Option<MixerWork>,
+    pub(super) peer_tail_elems: usize,
 }
 
 pub(crate) struct MixerWork {
@@ -136,14 +137,26 @@ impl Work {
         spec: &crate::model_spec::ModelSpec,
         rows: usize,
     ) -> Result<Self> {
+        Self::new_with_peer_tail(stream, spec, rows, 0)
+    }
+
+    pub(super) fn new_with_peer_tail(
+        stream: &Arc<CudaStream>,
+        spec: &crate::model_spec::ModelSpec,
+        rows: usize,
+        peer_tail_elems: usize,
+    ) -> Result<Self> {
         use crate::work_layout::RowWorkSpec as W;
         let shape = W::new(spec)?;
+        let n_elems = W::elements(rows, shape.hidden)?
+            .checked_add(peer_tail_elems)
+            .context("peer send workspace overflow")?;
         Ok(Self {
             ids: stream.alloc_zeros(rows)?,
             position: stream.alloc_zeros(1)?,
             length: stream.alloc_zeros(1)?,
             x: stream.alloc_zeros(W::elements(rows, shape.hidden)?)?,
-            n: stream.alloc_zeros(W::elements(rows, shape.hidden)?)?,
+            n: stream.alloc_zeros(n_elems)?,
             qkv: stream.alloc_zeros(W::elements(rows, shape.projection)?)?,
             attn: stream.alloc_zeros(W::elements(rows, shape.mixer)?)?,
             out: stream.alloc_zeros(W::elements(rows, shape.hidden)?)?,
@@ -158,6 +171,7 @@ impl Work {
             logits: stream.alloc_zeros(spec.vocab as usize)?,
             token: stream.alloc_zeros(1)?,
             mixer: MixerWork::new(stream, &shape, rows)?,
+            peer_tail_elems,
         })
     }
     fn grow(
@@ -171,7 +185,10 @@ impl Work {
         let shape = W::new(spec)?;
         let ids = stream.alloc_zeros(rows)?;
         let x = stream.alloc_zeros(W::elements(rows, shape.hidden)?)?;
-        let n = stream.alloc_zeros(W::elements(rows, shape.hidden)?)?;
+        let n_elems = W::elements(rows, shape.hidden)?
+            .checked_add(self.peer_tail_elems)
+            .context("peer send workspace overflow")?;
+        let n = stream.alloc_zeros(n_elems)?;
         let qkv = stream.alloc_zeros(W::elements(rows, shape.projection)?)?;
         let attn = stream.alloc_zeros(W::elements(rows, shape.mixer)?)?;
         let out = stream.alloc_zeros(W::elements(rows, shape.hidden)?)?;
@@ -495,6 +512,7 @@ enum Graph {
     MoeRoute(usize),
     MoeContribute(usize),
     MoeJoin(usize),
+    MoePeerTail(usize),
     Draft,
     Verify,
     TreeDraft,
@@ -1307,15 +1325,19 @@ impl Engine {
                     })
                     .collect()
             } else {
+                let tail_start = self.moe_peer_tail_start()?;
+                let seg_end = tail_start.unwrap_or(self.model_spec.layers.len());
                 widths
                     .flat_map(|_| {
-                        (0..self.model_spec.layers.len()).flat_map(|layer| {
-                            [
-                                Graph::MoeRoute(layer),
-                                Graph::MoeContribute(layer),
-                                Graph::MoeJoin(layer),
-                            ]
-                        })
+                        (0..seg_end)
+                            .flat_map(|layer| {
+                                [
+                                    Graph::MoeRoute(layer),
+                                    Graph::MoeContribute(layer),
+                                    Graph::MoeJoin(layer),
+                                ]
+                            })
+                            .chain(tail_start.map(Graph::MoePeerTail))
                     })
                     .collect()
             };
@@ -1352,14 +1374,26 @@ impl Engine {
         }
         if let Graph::MoeRoute(layer) | Graph::MoeContribute(layer) | Graph::MoeJoin(layer) = graph
         {
-            return layer < self.model_spec.layers.len() && self.has_moe_segments();
+            let seg_end = self
+                .moe_peer_tail_start()
+                .ok()
+                .flatten()
+                .unwrap_or(self.model_spec.layers.len());
+            return layer < seg_end && self.has_moe_segments();
+        }
+        if let Graph::MoePeerTail(start) = graph {
+            return self.moe_peer_tail_start().ok().flatten() == Some(start)
+                && self.has_moe_peer_tail();
         }
         let Some(spec) = &self.spec else {
             return false;
         };
         match graph {
             Graph::Decode => self.graph.is_some(),
-            Graph::MoeRoute(_) | Graph::MoeContribute(_) | Graph::MoeJoin(_) => false,
+            Graph::MoeRoute(_)
+            | Graph::MoeContribute(_)
+            | Graph::MoeJoin(_)
+            | Graph::MoePeerTail(_) => false,
             Graph::Draft => spec.draft_graph.is_some(),
             Graph::Verify => {
                 if self.model_spec.moe.is_some() {

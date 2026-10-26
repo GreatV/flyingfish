@@ -50,6 +50,8 @@ fn resident_routed_wave_preserves_slots_and_shared_rows() -> Result<()> {
         span_rows: 16640,
         wave_rows: 16,
         device_expert_bytes: resident_bytes + 197_676_800,
+        peer_expert_bytes: 0,
+        gpu0_layers: 40,
         host_expert_bytes: 1 << 30,
         slots_per_layer: vec![256; 40],
         host_blocks: 218,
@@ -166,9 +168,89 @@ fn resident_routed_wave_preserves_slots_and_shared_rows() -> Result<()> {
         routed_wave_rows(geometry, &capacity, 8192, shared)?,
         (256, 0)
     );
-    println!(
-        "PASS routed_wave_full_resident target_rows=2048 shared_rows=16 extra_bytes=197676800 exact_budget=true boundary_minus_one_rows=2047 non_fp8_unchanged=true"
+    capacity.layout = ExpertLayout::new(ExpertFormat::Fp8W8a16, &geometry)?;
+    capacity.gpu0_layers = 20;
+    capacity.device_expert_bytes = 20 * 256 * capacity.slot_bytes();
+    capacity.peer_expert_bytes = 20 * 256 * capacity.slot_bytes();
+    assert_eq!(
+        routed_wave_rows(geometry, &capacity, 8192, shared)?,
+        (256, 0)
     );
+    capacity.span_rows = 1312;
+    capacity.wave_rows = 16;
+    capacity.gpu0_layers = 21;
+    let mut split_slots = vec![188; 21];
+    split_slots.extend(std::iter::repeat_n(256, 19));
+    capacity.slots_per_layer = split_slots;
+    capacity.device_expert_bytes = 21 * 188 * capacity.slot_bytes();
+    let peer_base = 19 * 256 * capacity.slot_bytes();
+    capacity.peer_expert_bytes = peer_base;
+    assert_eq!(peer_routed_wave_rows(geometry, &capacity, shared)?, (16, 0));
+    let fp8 = capacity
+        .layout
+        .fp8_slot()
+        .context("FP8 slot missing")?
+        .clone();
+    let peer_baseline = u64::try_from(residency::peer_prefill_bytes(
+        geometry,
+        1312,
+        16,
+        shared,
+        Some(&fp8),
+    )?)?;
+    let peer_full = u64::try_from(residency::peer_prefill_bytes(
+        geometry,
+        1312,
+        1312,
+        shared,
+        Some(&fp8),
+    )?)?;
+    let peer_extra = peer_full - peer_baseline;
+    capacity.peer_expert_bytes = peer_base + peer_extra;
+    assert_eq!(
+        peer_routed_wave_rows(geometry, &capacity, shared)?,
+        (1312, peer_extra)
+    );
+    capacity.peer_expert_bytes = peer_base + peer_extra - 1;
+    assert_eq!(peer_routed_wave_rows(geometry, &capacity, shared)?.0, 1311);
+    capacity.peer_expert_bytes = peer_base + 200_828_000;
+    let (a4000_peer_wave, a4000_peer_extra) = peer_routed_wave_rows(geometry, &capacity, shared)?;
+    assert!(a4000_peer_wave > 600 && a4000_peer_extra <= 200_828_000);
+    capacity.gpu0_layers = 40;
+    capacity.slots_per_layer = vec![256; 40];
+    assert_eq!(peer_routed_wave_rows(geometry, &capacity, shared)?, (16, 0));
+    println!(
+        "PASS routed_wave_full_resident target_rows=2048 shared_rows=16 extra_bytes=197676800 exact_budget=true boundary_minus_one_rows=2047 non_fp8_unchanged=true peer_wave={a4000_peer_wave}"
+    );
+    Ok(())
+}
+
+#[test]
+fn peer_send_layout_packs_in_place_aligned_without_overlap() -> Result<()> {
+    for (hidden, top_k, exact_gap_free) in
+        [(2048usize, 8usize, true), (128, 4, true), (128, 2, false)]
+    {
+        let max_tail = PeerSendLayout::tail_bf16_elems(16, hidden, top_k)?;
+        let workspace_bytes = (16 * hidden + max_tail) * size_of::<bf16>();
+        for rows in 1..=16usize {
+            let layout = PeerSendLayout::for_rows(rows, hidden, top_k)?;
+            let x_bytes = rows * hidden * size_of::<bf16>();
+            assert_eq!(layout.ids_off, x_bytes);
+            assert_eq!(layout.ids_off % 16, 0);
+            assert_eq!(layout.weights_off % 16, 0);
+            assert!(layout.ids_off + layout.ids_bytes <= layout.weights_off);
+            assert_eq!(layout.send_bytes, layout.weights_off + layout.weights_bytes);
+            assert!(layout.send_bytes <= workspace_bytes);
+            if exact_gap_free {
+                assert_eq!(layout.weights_off, layout.ids_off + layout.ids_bytes);
+                assert_eq!(layout.send_bytes, rows * (hidden * 2 + top_k * 6));
+            }
+        }
+    }
+    assert_eq!(PeerSendLayout::for_rows(1, 2048, 8)?.send_bytes, 4_144);
+    assert_eq!(PeerSendLayout::for_rows(9, 2048, 8)?.send_bytes, 37_296);
+    assert!(PeerSendLayout::for_rows(0, 2048, 8).is_err());
+    assert!(PeerSendLayout::for_rows(1, 4, 8).is_err());
     Ok(())
 }
 
@@ -795,6 +877,8 @@ impl Engine {
                 .clamp(8, crate::linear_plan::MAX_SKINNY_ROWS) as u32,
             wave_rows: 8,
             device_expert_bytes: layout.slot_bytes() * u64::from(count),
+            peer_expert_bytes: 0,
+            gpu0_layers: geometry.layers,
             host_expert_bytes: 0,
             slots_per_layer: vec![geometry.experts; geometry.layers as usize],
             host_blocks: 0,
@@ -879,6 +963,14 @@ impl Engine {
             (decode_rows, decode_rows * geometry.top_k as usize)
         };
         let device = Device::new(0)?;
+        let peer = if capacity.gpu0_layers < geometry.layers {
+            Some(match device.peer()? {
+                Some(peer) => peer,
+                None => Device::new(0)?,
+            })
+        } else {
+            None
+        };
         let stream = &device.stream;
         let catalogue = native_fixture(
             fixture,
@@ -889,6 +981,7 @@ impl Engine {
         )?;
         let mut slots = Slots::load(
             &device,
+            peer.as_ref(),
             geometry,
             residency::Load {
                 capacity,
@@ -912,6 +1005,9 @@ impl Engine {
         }
         slots.begin_request(&frequency)?;
         device.upload.synchronize()?;
+        if let Some(peer) = &peer {
+            peer.upload.synchronize()?;
+        }
         let mut tensors = std::collections::BTreeMap::new();
         for (name, entry) in &manifest.entries {
             let values = match entry.role.as_str() {
@@ -1002,16 +1098,35 @@ impl Engine {
             1,
             stream,
         )?);
-        let mut work = Work::new(stream, &model_spec, workspace_rows)?;
+        let peer_tail_elems = if peer.is_some() {
+            PeerSendLayout::tail_bf16_elems(
+                decode_rows,
+                geometry.hidden as usize,
+                geometry.top_k as usize,
+            )?
+        } else {
+            0
+        };
+        let mut work =
+            Work::new_with_peer_tail(stream, &model_spec, workspace_rows, peer_tail_elems)?;
         stream.memcpy_htod(&[1i32], &mut work.length)?;
         let flash = Some(Flash::new(
             stream.clone(),
             workspace_rows,
             model_spec.q_heads as usize,
         )?);
+        let (send_ptr, _send_guard) = work.n.device_ptr(stream);
+        let send_cap_bytes = work.n.len() * size_of::<bf16>();
+        drop(_send_guard);
         let moe = Some(Decode::new(
             &device,
             DecodeOptions {
+                peer: peer.as_ref().map(|peer| PeerBind {
+                    device: peer,
+                    gpu0_layers: capacity.gpu0_layers,
+                    send_ptr,
+                    send_cap_bytes,
+                }),
                 geometry,
                 max_rows: decode_rows,
                 workers: capacity.worker_count,
@@ -1041,7 +1156,7 @@ impl Engine {
                 disk_ring_slots: 0,
             };
             Some(Prefill::new(
-                &device,
+                (&device, peer.as_ref()),
                 &mut slots,
                 capacity,
                 reserves,
@@ -1054,13 +1169,21 @@ impl Engine {
                         .shared_intermediate,
                     workspace_rows,
                     8,
-                    capacity.wave_rows,
-                    model_spec.routed_weight_boundary(),
+                    (capacity.wave_rows, capacity.wave_rows),
+                    (
+                        model_spec.swiglu_rounding(),
+                        model_spec.routed_weight_boundary(),
+                    ),
                 ),
             )?)
         } else {
             None
         };
+        device.finish_upload()?;
+        if let Some(peer) = &peer {
+            peer.finish_upload()?;
+            device.ctx.bind_to_thread()?;
+        }
         let mut engine = Self {
             hidden_capture: None,
             capture_fail_after_layer: None,
@@ -1535,6 +1658,8 @@ pub(super) fn tier_capacity(
         span_rows: 8,
         wave_rows: 8,
         device_expert_bytes: slot * 8,
+        peer_expert_bytes: 0,
+        gpu0_layers: geometry.layers,
         host_expert_bytes: slot * 10,
         slots_per_layer: vec![4, 4],
         host_blocks: 8,
@@ -2460,8 +2585,8 @@ fn cpu_control(
     let decode = engine.moe.as_mut().context("CPU control decode missing")?;
     let stream = &engine.device.stream;
     let x = qwen::matrix(&engine.work.n, stream, 0, rows, 128)?;
-    decode.route(&engine.device, &ffn, x)?;
-    let duplicate_route = decode.route(&engine.device, &ffn, x).is_err();
+    decode.route(&engine.device, 0, &ffn, x)?;
+    let duplicate_route = decode.route(&engine.device, 0, &ffn, x).is_err();
     let alternate = stream.clone_htod(input)?;
     let mut probe_out = TensorMut(qwen::matrix(&engine.work.out, stream, 0, rows, 128)?);
     let dispatch = || Dispatch {
@@ -2529,7 +2654,7 @@ fn cpu_control(
         "DEFECT MoE phase controls duplicate_route={duplicate_route} different_input={different_input} duplicate_finish={duplicate_finish}"
     );
     let mut actual = Trace::default();
-    decode.trace(stream, &mut actual, "layer")?;
+    decode.trace(stream, 0, &mut actual, "layer")?;
     let observed = actual.values("layer.moe.contributions")?;
     let mismatches = observed
         .iter()
@@ -2836,6 +2961,503 @@ fn injected_layers_bind_hybrid_mixer_geometry() -> Result<()> {
     assert!(hybrid_manifest(&old).is_err());
     println!(
         "PASS eager_moe_hybrid_preflight architecture=MiniCpmV47 layers=Gdn,FullAttention q16_kv2_d256_rotary64=true gdn_hk16_hv32=true legacy_rejected=true d128_rejected=true GPU_executed=false"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA and FLYINGFISH_RUNTIME_DIR"]
+fn split_combine_matches_single_gpu_and_detects_perturbed_routed_peer_gpu() -> Result<()> {
+    let runtime = PathBuf::from(
+        std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("split combine runtime missing")?,
+    );
+    let fixture = tier_fixture(3, 8);
+    let geometry = ExpertGeometry::from_model(&hybrid_spec()?)?;
+    let mut defects = 0;
+    for format in [
+        crate::model_spec::ExpertFormat::Bf16,
+        crate::model_spec::ExpertFormat::Fp8W8a16,
+    ] {
+        let layout = crate::experts::catalogue::ExpertLayout::new(format, &geometry)?;
+        let slot = layout.slot_bytes();
+        let peer_cap = Capacity {
+            layout,
+            span_rows: 8,
+            wave_rows: 8,
+            device_expert_bytes: slot * 16,
+            peer_expert_bytes: slot * 16,
+            gpu0_layers: 1,
+            host_expert_bytes: 0,
+            slots_per_layer: vec![16, 16],
+            host_blocks: 0,
+            spare_blocks: 0,
+            disk_bytes: 0,
+            worker_count: 2,
+            disk_workers: 0,
+            prefill_staging_slots: 0,
+            pinned: false,
+        };
+        let mut single = Engine::load_moe_test(
+            &fixture,
+            &runtime.join(format!("split-single-{format:?}")),
+            8,
+            format,
+        )?;
+        let all_experts = (0..16).collect::<Vec<_>>();
+        let mut two_gpu = Engine::load_moe_placed(
+            &fixture,
+            &runtime.join(format!("split-peer-{format:?}")),
+            &peer_cap,
+            &[all_experts.clone(), all_experts],
+            crate::experts::plan::Admission {
+                budget_bytes_per_token: 0,
+            },
+            1,
+            8,
+        )?;
+        let peer_freq = vec![vec![1.0; 16]; 2];
+        for engine in [&mut single, &mut two_gpu] {
+            engine.reset()?;
+            engine
+                .moe_slots
+                .as_mut()
+                .context("split combine slots missing")?
+                .begin_request(&peer_freq)?;
+            engine.closure.freeze_fixed()?;
+            engine.declare_graphs()?;
+            engine.capture()?;
+            engine.closure.expect_captures(engine.graphs.len())?;
+            engine.check_graphs()?;
+            engine.closure.ready(Instant::now())?;
+        }
+        ensure!(
+            single
+                .moe_slots
+                .as_ref()
+                .context("single slots missing")?
+                .all_resident()
+                && single.graph.is_some()
+                && !single.has_moe_segments()
+                && single
+                    .moe
+                    .as_ref()
+                    .context("single decode missing")?
+                    .peer
+                    .is_none(),
+            "Runner FAIL single-GPU resident fixture invariant"
+        );
+        ensure!(
+            two_gpu
+                .moe_slots
+                .as_ref()
+                .context("two-GPU slots missing")?
+                .all_resident()
+                && two_gpu.graph.is_some()
+                && !two_gpu.has_moe_segments()
+                && two_gpu
+                    .moe
+                    .as_ref()
+                    .context("two-GPU decode missing")?
+                    .peer
+                    .is_some(),
+            "Runner FAIL two-GPU full residency graph invariant"
+        );
+        let run_seq = |engine: &mut Engine,
+                       freq: &[Vec<f64>],
+                       graph: bool|
+         -> Result<(Vec<f32>, Vec<u32>, [u64; 5])> {
+            engine.reset()?;
+            engine
+                .moe_slots
+                .as_mut()
+                .context("seq slots missing")?
+                .begin_request(freq)?;
+            let before = engine.moe.as_ref().context("seq decode missing")?.stats;
+            for step in 0..4 {
+                engine.set_token((step * 5 + 1) % 32)?;
+                engine.decode(graph, None)?;
+            }
+            let after = engine.moe.as_ref().context("seq decode missing")?.stats;
+            let mut delta = [0u64; 5];
+            for i in 0..5 {
+                delta[i] = after[i] - before[i];
+            }
+            Ok((engine.decode_logits()?, graph_state(engine)?, delta))
+        };
+        let (ref_logits, ref_state, single_eager_stats) = run_seq(&mut single, &peer_freq, false)?;
+        let (single_graph_logits, single_graph_state, single_graph_stats) =
+            run_seq(&mut single, &peer_freq, true)?;
+        ensure!(
+            single_eager_stats[1] == 32
+                && single_eager_stats[2] == 0
+                && single_graph_stats[1] == 32
+                && single_graph_stats[2] == 0,
+            "Runner FAIL single-GPU resident fixture stats eager={single_eager_stats:?} graph={single_graph_stats:?}"
+        );
+        let (peer_eager_logits, peer_eager_state, peer_eager_stats) =
+            run_seq(&mut two_gpu, &peer_freq, false)?;
+        let (peer_graph_logits, peer_graph_state, peer_graph_stats) =
+            run_seq(&mut two_gpu, &peer_freq, true)?;
+        ensure!(
+            peer_eager_stats[1] == 32
+                && peer_eager_stats[2] == 0
+                && peer_graph_stats[1] == 32
+                && peer_graph_stats[2] == 0,
+            "Runner FAIL two-GPU full residency stats eager={peer_eager_stats:?} graph={peer_graph_stats:?}"
+        );
+        for (label, logits, state) in [
+            ("single_graph", &single_graph_logits, &single_graph_state),
+            ("two_gpu_eager", &peer_eager_logits, &peer_eager_state),
+            ("two_gpu_graph", &peer_graph_logits, &peer_graph_state),
+        ] {
+            let logit_diff = ref_logits
+                .iter()
+                .zip(logits)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let state_diff = ref_state.iter().zip(state).filter(|(a, b)| a != b).count()
+                + ref_state.len().abs_diff(state.len());
+            defects += usize::from(logit_diff != 0 || state_diff != 0);
+            println!(
+                "{} split_combine_parity format={format:?} arm={label} logit_bit_mismatches={logit_diff} state_bit_mismatches={state_diff}",
+                if logit_diff == 0 && state_diff == 0 {
+                    "PASS"
+                } else {
+                    "DEFECT"
+                }
+            );
+        }
+        two_gpu
+            .moe
+            .as_mut()
+            .context("two-GPU decode missing")?
+            .peer
+            .as_mut()
+            .context("two-GPU peer missing")?
+            .perturb_word = Some((0, 0x7bff));
+        two_gpu.clear_moe_graphs();
+        two_gpu.closure = Rc::new(super::super::super::closure::Closure::new(
+            true,
+            "MoE split combine".into(),
+        ));
+        two_gpu.reset()?;
+        two_gpu
+            .moe_slots
+            .as_mut()
+            .context("two-GPU slots missing")?
+            .begin_request(&peer_freq)?;
+        two_gpu.closure.freeze_fixed()?;
+        two_gpu.declare_graphs()?;
+        two_gpu.capture()?;
+        two_gpu.closure.expect_captures(two_gpu.graphs.len())?;
+        two_gpu.check_graphs()?;
+        two_gpu.closure.ready(Instant::now())?;
+        for (label, graph) in [("perturbed_eager", false), ("perturbed_graph", true)] {
+            let (logits, state, _) = run_seq(&mut two_gpu, &peer_freq, graph)?;
+            let logit_diff = ref_logits
+                .iter()
+                .zip(&logits)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let state_diff = ref_state.iter().zip(&state).filter(|(a, b)| a != b).count();
+            ensure!(
+                logit_diff > 0 && state_diff > 0,
+                "Runner FAIL planted routed_peer perturbation was not detected in {label} format={format:?}"
+            );
+            println!(
+                "PASS split_combine_control format={format:?} arm={label} logit_bit_mismatches={logit_diff} state_bit_mismatches={state_diff}"
+            );
+        }
+        for fault in [
+            crate::backend::cuda::engine::CaptureFault::Begin,
+            crate::backend::cuda::engine::CaptureFault::End,
+            crate::backend::cuda::engine::CaptureFault::Instantiate,
+        ] {
+            two_gpu.poisoned = false;
+            two_gpu.clear_moe_graphs();
+            two_gpu.closure = Rc::new(super::super::super::closure::Closure::new(
+                true,
+                "MoE split combine fault".into(),
+            ));
+            two_gpu.reset()?;
+            two_gpu
+                .moe_slots
+                .as_mut()
+                .context("two-GPU slots missing")?
+                .begin_request(&peer_freq)?;
+            two_gpu.closure.freeze_fixed()?;
+            two_gpu.declare_graphs()?;
+            two_gpu.capture_fail_stage = Some(fault);
+            let err = two_gpu
+                .capture()
+                .expect_err("injected multi-device capture fault did not error");
+            two_gpu.capture_fail_stage = None;
+            let chain = format!("{err:#}");
+            ensure!(
+                chain.contains("MoE capture transaction failed")
+                    && chain.contains("injected capture")
+                    && two_gpu.graph.is_none()
+                    && !two_gpu.has_moe_segments()
+                    && !two_gpu.has_moe_peer_tail(),
+                "Runner FAIL multi-device capture fault fell back or lost context: {chain}"
+            );
+            println!(
+                "PASS multi_device_capture_no_fallback format={format:?} fault={fault:?} segments=false"
+            );
+        }
+
+        let single_partial_cap = Capacity {
+            layout: crate::experts::catalogue::ExpertLayout::new(format, &geometry)?,
+            span_rows: 8,
+            wave_rows: 8,
+            device_expert_bytes: slot * 24,
+            peer_expert_bytes: 0,
+            gpu0_layers: 2,
+            host_expert_bytes: slot * 32,
+            slots_per_layer: vec![8, 16],
+            host_blocks: 32,
+            spare_blocks: 0,
+            disk_bytes: 0,
+            worker_count: 2,
+            disk_workers: 0,
+            prefill_staging_slots: 0,
+            pinned: true,
+        };
+        let peer_partial_cap = Capacity {
+            layout: crate::experts::catalogue::ExpertLayout::new(format, &geometry)?,
+            span_rows: 8,
+            wave_rows: 8,
+            device_expert_bytes: slot * 8,
+            peer_expert_bytes: slot * 16,
+            gpu0_layers: 1,
+            host_expert_bytes: slot * 32,
+            slots_per_layer: vec![8, 16],
+            host_blocks: 32,
+            spare_blocks: 0,
+            disk_bytes: 0,
+            worker_count: 2,
+            disk_workers: 0,
+            prefill_staging_slots: 0,
+            pinned: true,
+        };
+        let partial_initial = [(0..8).collect::<Vec<_>>(), (0..16).collect::<Vec<_>>()];
+        let partial_freq = vec![
+            (0..16)
+                .map(|id| if id < 8 { 10.0 } else { 1.0 })
+                .collect::<Vec<_>>(),
+            vec![1.0; 16],
+        ];
+        let mut single_partial = Engine::load_moe_placed(
+            &fixture,
+            &runtime.join(format!("split-single-partial-{format:?}")),
+            &single_partial_cap,
+            &partial_initial,
+            crate::experts::plan::Admission {
+                budget_bytes_per_token: 0,
+            },
+            1,
+            8,
+        )?;
+        let mut two_partial = Engine::load_moe_placed(
+            &fixture,
+            &runtime.join(format!("split-peer-partial-{format:?}")),
+            &peer_partial_cap,
+            &partial_initial,
+            crate::experts::plan::Admission {
+                budget_bytes_per_token: 0,
+            },
+            1,
+            8,
+        )?;
+        for engine in [&mut single_partial, &mut two_partial] {
+            engine.reset()?;
+            engine
+                .moe_slots
+                .as_mut()
+                .context("partial split combine slots missing")?
+                .begin_request(&partial_freq)?;
+            engine.closure.freeze_fixed()?;
+            engine.declare_graphs()?;
+            engine.capture()?;
+            engine.closure.expect_captures(engine.graphs.len())?;
+            engine.check_graphs()?;
+            engine.closure.ready(Instant::now())?;
+        }
+        ensure!(
+            !single_partial
+                .moe_slots
+                .as_ref()
+                .context("single partial slots missing")?
+                .all_resident()
+                && single_partial.graph.is_none()
+                && single_partial.has_moe_segments()
+                && !single_partial.has_moe_peer_tail()
+                && single_partial.graphs.len() == 6,
+            "Runner FAIL single-GPU partial fixture invariant"
+        );
+        ensure!(
+            !two_partial
+                .moe_slots
+                .as_ref()
+                .context("two-GPU partial slots missing")?
+                .all_resident()
+                && two_partial.graph.is_none()
+                && two_partial.has_moe_segments()
+                && two_partial.has_moe_peer_tail()
+                && two_partial.graphs.len() == 4
+                && two_partial
+                    .moe
+                    .as_ref()
+                    .context("two-GPU partial decode missing")?
+                    .peer
+                    .is_some(),
+            "Runner FAIL two-GPU partial peer-tail graph invariant"
+        );
+        let (part_ref_logits, part_ref_state, part_single_eager_stats) =
+            run_seq(&mut single_partial, &partial_freq, false)?;
+        let (part_single_graph_logits, part_single_graph_state, part_single_graph_stats) =
+            run_seq(&mut single_partial, &partial_freq, true)?;
+        let (part_peer_eager_logits, part_peer_eager_state, part_peer_eager_stats) =
+            run_seq(&mut two_partial, &partial_freq, false)?;
+        let (part_peer_graph_logits, part_peer_graph_state, part_peer_graph_stats) =
+            run_seq(&mut two_partial, &partial_freq, true)?;
+        ensure!(
+            part_single_eager_stats[1] == 24
+                && part_single_eager_stats[2] == 8
+                && part_single_graph_stats == part_single_eager_stats
+                && part_peer_eager_stats == part_single_eager_stats
+                && part_peer_graph_stats == part_single_eager_stats,
+            "Runner FAIL partial peer-tail stats single_eager={part_single_eager_stats:?} single_graph={part_single_graph_stats:?} peer_eager={part_peer_eager_stats:?} peer_graph={part_peer_graph_stats:?}"
+        );
+        for (label, logits, state) in [
+            (
+                "partial_single_graph",
+                &part_single_graph_logits,
+                &part_single_graph_state,
+            ),
+            (
+                "partial_two_gpu_eager",
+                &part_peer_eager_logits,
+                &part_peer_eager_state,
+            ),
+            (
+                "partial_two_gpu_graph",
+                &part_peer_graph_logits,
+                &part_peer_graph_state,
+            ),
+        ] {
+            let logit_diff = part_ref_logits
+                .iter()
+                .zip(logits)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let state_diff = part_ref_state
+                .iter()
+                .zip(state)
+                .filter(|(a, b)| a != b)
+                .count()
+                + part_ref_state.len().abs_diff(state.len());
+            defects += usize::from(logit_diff != 0 || state_diff != 0);
+            println!(
+                "{} split_combine_parity format={format:?} arm={label} logit_bit_mismatches={logit_diff} state_bit_mismatches={state_diff}",
+                if logit_diff == 0 && state_diff == 0 {
+                    "PASS"
+                } else {
+                    "DEFECT"
+                }
+            );
+        }
+        two_partial
+            .moe
+            .as_mut()
+            .context("two-GPU partial decode missing")?
+            .peer
+            .as_mut()
+            .context("two-GPU partial peer missing")?
+            .perturb_word = Some((0, 0x7bff));
+        two_partial.clear_moe_graphs();
+        two_partial.closure = Rc::new(super::super::super::closure::Closure::new(
+            true,
+            "MoE split combine partial".into(),
+        ));
+        two_partial.reset()?;
+        two_partial
+            .moe_slots
+            .as_mut()
+            .context("two-GPU partial slots missing")?
+            .begin_request(&partial_freq)?;
+        two_partial.closure.freeze_fixed()?;
+        two_partial.declare_graphs()?;
+        two_partial.capture()?;
+        two_partial
+            .closure
+            .expect_captures(two_partial.graphs.len())?;
+        two_partial.check_graphs()?;
+        two_partial.closure.ready(Instant::now())?;
+        for (label, graph) in [
+            ("partial_perturbed_eager", false),
+            ("partial_perturbed_graph", true),
+        ] {
+            let (logits, state, _) = run_seq(&mut two_partial, &partial_freq, graph)?;
+            let logit_diff = part_ref_logits
+                .iter()
+                .zip(&logits)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let state_diff = part_ref_state
+                .iter()
+                .zip(&state)
+                .filter(|(a, b)| a != b)
+                .count();
+            ensure!(
+                logit_diff > 0 && state_diff > 0,
+                "Runner FAIL planted partial routed_peer perturbation was not detected in {label} format={format:?}"
+            );
+            println!(
+                "PASS split_combine_control format={format:?} arm={label} logit_bit_mismatches={logit_diff} state_bit_mismatches={state_diff}"
+            );
+        }
+        for fault in [
+            crate::backend::cuda::engine::CaptureFault::Begin,
+            crate::backend::cuda::engine::CaptureFault::End,
+            crate::backend::cuda::engine::CaptureFault::Instantiate,
+        ] {
+            two_partial.poisoned = false;
+            two_partial.clear_moe_graphs();
+            two_partial.closure = Rc::new(super::super::super::closure::Closure::new(
+                true,
+                "MoE split combine partial fault".into(),
+            ));
+            two_partial.reset()?;
+            two_partial
+                .moe_slots
+                .as_mut()
+                .context("two-GPU partial slots missing")?
+                .begin_request(&partial_freq)?;
+            two_partial.closure.freeze_fixed()?;
+            two_partial.declare_graphs()?;
+            two_partial.capture_fail_stage = Some(fault);
+            let err = two_partial
+                .capture()
+                .expect_err("injected partial peer-tail capture fault did not error");
+            two_partial.capture_fail_stage = None;
+            let chain = format!("{err:#}");
+            ensure!(
+                chain.contains("MoE capture transaction failed")
+                    && chain.contains("injected capture")
+                    && two_partial.graph.is_none()
+                    && !two_partial.has_moe_segments()
+                    && !two_partial.has_moe_peer_tail(),
+                "Runner FAIL partial peer-tail capture fault fell back or lost context: {chain}"
+            );
+            println!(
+                "PASS multi_device_capture_no_fallback format={format:?} fault={fault:?} segments=true"
+            );
+        }
+    }
+    ensure!(defects == 0, "DEFECT split combine cells={defects}");
+    println!(
+        "PASS split_combine_gate formats=Bf16,Fp8W8a16 eager_graph_bitwise=true perturbed_routed_peer_detected=true"
     );
     Ok(())
 }

@@ -11,7 +11,7 @@ use crate::{
     config::Config,
 };
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{PushKernelArg, sys};
+use cudarc::driver::{DevicePtr, PushKernelArg, sys};
 use half::bf16;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -837,6 +837,7 @@ struct ExpertTransfer {
 }
 
 const EXPERT_SERVICE_ROWS: [u32; 7] = [1, 2, 5, 8, 16, 32, 64];
+pub(crate) const PEER_TRANSFER_BYTES: [u64; 3] = [4_096, 8 * 1024 * 1024, 68 * 1024 * 1024];
 
 #[derive(Serialize, Deserialize)]
 struct ExpertCache {
@@ -844,6 +845,8 @@ struct ExpertCache {
     expert_format: crate::model_spec::ExpertFormat,
     slot_bytes: u64,
     key: CacheKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    peer_key: Option<CacheKey>,
     host: ExpertHost,
     geometry: crate::experts::catalogue::ExpertGeometry,
     copy_engines: u32,
@@ -851,6 +854,8 @@ struct ExpertCache {
     host_registration_bytes: u64,
     host_registration_seconds: [f64; 3],
     transfers: Vec<ExpertTransfer>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    peer_transfers: Vec<ExpertTransfer>,
     service: Vec<crate::experts::plan::ServiceCell>,
 }
 
@@ -859,6 +864,7 @@ pub(super) struct ExpertCalibration {
     pub d2h_bytes_per_second: f64,
     pub copy_engines: u32,
     pub host_registration_bytes: u64,
+    pub peer_transfers: Vec<(u64, f64, f64)>,
     pub service: crate::experts::plan::ServiceTable,
 }
 
@@ -866,6 +872,7 @@ impl ExpertCache {
     fn check(
         &self,
         key: &CacheKey,
+        peer_key: Option<&CacheKey>,
         host: &ExpertHost,
         geometry: &crate::experts::catalogue::ExpertGeometry,
         slot_bytes: u64,
@@ -888,6 +895,11 @@ impl ExpertCache {
             self.key == *key,
             "expert calibration key {:?} expected {key:?}",
             self.key
+        );
+        ensure!(
+            self.peer_key.as_ref() == peer_key,
+            "expert calibration peer key {:?} expected {peer_key:?}",
+            self.peer_key
         );
         ensure!(
             self.host == *host,
@@ -957,6 +969,42 @@ impl ExpertCache {
                 cell.bytes
             );
         }
+        let mut peer_transfers = Vec::new();
+        if peer_key.is_some() {
+            ensure!(
+                self.peer_transfers.len() == PEER_TRANSFER_BYTES.len(),
+                "expert peer transfer lattice size {} expected {}",
+                self.peer_transfers.len(),
+                PEER_TRANSFER_BYTES.len()
+            );
+            for (cell, bytes) in self.peer_transfers.iter().zip(PEER_TRANSFER_BYTES) {
+                ensure!(
+                    cell.bytes == bytes
+                        && cell
+                            .h2d_seconds
+                            .iter()
+                            .chain(&cell.d2h_seconds)
+                            .all(|&n| n.is_finite() && n > 0.0),
+                    "invalid expert peer transfer cell bytes={} expected={bytes}",
+                    cell.bytes
+                );
+                let rate_0_to_1 = cell.bytes as f64 / percentile(&cell.h2d_seconds, 0.5);
+                let rate_1_to_0 = cell.bytes as f64 / percentile(&cell.d2h_seconds, 0.5);
+                ensure!(
+                    rate_0_to_1.is_finite()
+                        && rate_1_to_0.is_finite()
+                        && rate_0_to_1 > 0.0
+                        && rate_1_to_0 > 0.0,
+                    "non-finite peer transfer rate 0->1={rate_0_to_1} 1->0={rate_1_to_0}"
+                );
+                peer_transfers.push((cell.bytes, rate_0_to_1, rate_1_to_0));
+            }
+        } else {
+            ensure!(
+                self.peer_transfers.is_empty(),
+                "unexpected expert peer transfer cells without peer device"
+            );
+        }
         let missed: Vec<_> = [1, 2, 4, geometry.top_k]
             .into_iter()
             .filter(|&n| n <= geometry.top_k)
@@ -1002,6 +1050,7 @@ impl ExpertCache {
             d2h_bytes_per_second,
             copy_engines: self.copy_engines,
             host_registration_bytes: self.host_registration_bytes,
+            peer_transfers,
             service,
         })
     }
@@ -1101,6 +1150,247 @@ fn measure_expert_transfer(d: &Device, bytes: usize) -> Result<ExpertTransfer> {
     Ok(cell)
 }
 
+fn measure_peer_transfer(d: &Device, peer: &Device, bytes: usize) -> Result<ExpertTransfer> {
+    struct PortableBuf(*mut std::ffi::c_void);
+    impl Drop for PortableBuf {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = sys::cuMemFreeHost(self.0);
+            }
+        }
+    }
+    let mut host = unsafe { d.ctx.alloc_pinned_with_flags::<u8>(bytes, 0) }
+        .with_context(|| format!("allocate peer transfer pinned bytes={bytes}"))?;
+    unsafe {
+        std::ptr::write_bytes(host.as_mut_ptr()?, 0, bytes);
+    }
+    for (index, value) in host.as_mut_slice()?.iter_mut().enumerate() {
+        *value = (index % 251) as u8;
+    }
+    let mut dev0 = d
+        .upload
+        .alloc_zeros::<u8>(bytes)
+        .with_context(|| format!("allocate peer transfer device 0 bytes={bytes}"))?;
+    let dev1 = peer
+        .upload
+        .alloc_zeros::<u8>(bytes)
+        .with_context(|| format!("allocate peer transfer device 1 bytes={bytes}"))?;
+    peer.upload.synchronize()?;
+    d.ctx.bind_to_thread()?;
+    d.upload
+        .memcpy_htod(&host, &mut dev0)
+        .with_context(|| format!("peer transfer roundtrip H2D bytes={bytes}"))?;
+    d.upload.synchronize()?;
+    let (ptr0, _g0) = dev0.device_ptr(&d.upload);
+    let (ptr1, _g1) = dev1.device_ptr(&peer.upload);
+    let captured_bounce = if bytes == 4_096 {
+        let mut raw = std::ptr::null_mut();
+        unsafe {
+            sys::cuMemHostAlloc(&mut raw, bytes, sys::CU_MEMHOSTALLOC_PORTABLE)
+                .result()
+                .with_context(|| format!("allocate portable bounce bytes={bytes}"))?;
+            std::ptr::write_bytes(raw.cast::<u8>(), 0, bytes);
+        }
+        let buf = PortableBuf(raw);
+        let ev0 = d
+            .ctx
+            .new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?;
+        let ev1 = peer
+            .ctx
+            .new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?;
+        d.upload
+            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .context("begin peer bounce 0->1 capture")?;
+        let launched = (|| -> Result<()> {
+            unsafe {
+                sys::cuMemcpyDtoHAsync_v2(buf.0, ptr0, bytes, d.upload.cu_stream())
+                    .result()
+                    .context("peer bounce capture D2H 0")?;
+            }
+            ev0.record(&d.upload)?;
+            peer.ctx.bind_to_thread()?;
+            peer.upload.wait(&ev0)?;
+            unsafe {
+                sys::cuMemcpyHtoDAsync_v2(ptr1, buf.0, bytes, peer.upload.cu_stream())
+                    .result()
+                    .context("peer bounce capture H2D 1")?;
+            }
+            ev1.record(&peer.upload)?;
+            d.ctx.bind_to_thread()?;
+            d.upload.wait(&ev1)?;
+            Ok(())
+        })();
+        let captured = d
+            .upload
+            .end_capture(sys::CUgraphInstantiate_flags(0))
+            .context("end peer bounce 0->1 capture");
+        let _ = d.ctx.bind_to_thread();
+        launched?;
+        let graph_0_to_1 = captured?.context("empty peer bounce 0->1 graph")?;
+        graph_0_to_1
+            .upload()
+            .context("upload peer bounce 0->1 graph")?;
+        d.upload
+            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .context("begin peer bounce 1->0 capture")?;
+        let launched = (|| -> Result<()> {
+            ev0.record(&d.upload)?;
+            peer.ctx.bind_to_thread()?;
+            peer.upload.wait(&ev0)?;
+            unsafe {
+                sys::cuMemcpyDtoHAsync_v2(buf.0, ptr1, bytes, peer.upload.cu_stream())
+                    .result()
+                    .context("peer bounce capture D2H 1")?;
+            }
+            ev1.record(&peer.upload)?;
+            d.ctx.bind_to_thread()?;
+            d.upload.wait(&ev1)?;
+            unsafe {
+                sys::cuMemcpyHtoDAsync_v2(ptr0, buf.0, bytes, d.upload.cu_stream())
+                    .result()
+                    .context("peer bounce capture H2D 0")?;
+            }
+            Ok(())
+        })();
+        let captured = d
+            .upload
+            .end_capture(sys::CUgraphInstantiate_flags(0))
+            .context("end peer bounce 1->0 capture");
+        let _ = d.ctx.bind_to_thread();
+        launched?;
+        let graph_1_to_0 = captured?.context("empty peer bounce 1->0 graph")?;
+        graph_1_to_0
+            .upload()
+            .context("upload peer bounce 1->0 graph")?;
+        d.upload.synchronize()?;
+        graph_0_to_1
+            .launch()
+            .context("peer bounce roundtrip launch 0->1")?;
+        d.upload.synchronize()?;
+        unsafe {
+            std::ptr::write_bytes(host.as_mut_ptr()?, 0, bytes);
+            std::ptr::write_bytes(buf.0.cast::<u8>(), 0, bytes);
+            sys::cuMemsetD8Async(ptr0, 0, bytes, d.upload.cu_stream())
+                .result()
+                .context("peer bounce zero dev0")?;
+        }
+        d.upload.synchronize()?;
+        graph_1_to_0
+            .launch()
+            .context("peer bounce roundtrip launch 1->0")?;
+        Some((graph_0_to_1, graph_1_to_0, buf))
+    } else {
+        unsafe {
+            sys::cuMemcpyPeerAsync(
+                ptr1,
+                peer.ctx.cu_ctx(),
+                ptr0,
+                d.ctx.cu_ctx(),
+                bytes,
+                d.upload.cu_stream(),
+            )
+            .result()
+            .with_context(|| format!("peer transfer roundtrip 0->1 bytes={bytes}"))?;
+            d.upload.synchronize()?;
+            std::ptr::write_bytes(host.as_mut_ptr()?, 0, bytes);
+            sys::cuMemsetD8Async(ptr0, 0, bytes, d.upload.cu_stream())
+                .result()
+                .with_context(|| format!("peer transfer roundtrip zero device 0 bytes={bytes}"))?;
+            sys::cuMemcpyPeerAsync(
+                ptr0,
+                d.ctx.cu_ctx(),
+                ptr1,
+                peer.ctx.cu_ctx(),
+                bytes,
+                d.upload.cu_stream(),
+            )
+            .result()
+            .with_context(|| format!("peer transfer roundtrip 1->0 bytes={bytes}"))?;
+        }
+        None
+    };
+    drop((_g0, _g1));
+    d.upload
+        .memcpy_dtoh(&dev0, &mut host)
+        .with_context(|| format!("peer transfer roundtrip D2H bytes={bytes}"))?;
+    d.upload
+        .synchronize()
+        .with_context(|| format!("synchronize peer transfer roundtrip bytes={bytes}"))?;
+    check_expert_transfer(host.as_slice()?)?;
+    let (ptr0, _g0) = dev0.device_ptr(&d.upload);
+    let (ptr1, _g1) = dev1.device_ptr(&peer.upload);
+    let mut cell = ExpertTransfer {
+        bytes: bytes as u64,
+        h2d_seconds: [0.0; 5],
+        d2h_seconds: [0.0; 5],
+    };
+    for reverse in [false, true] {
+        for trial in 0..6 {
+            let begin = d
+                .upload
+                .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .with_context(|| {
+                    format!(
+                        "record peer transfer begin bytes={bytes} reverse={reverse} trial={trial}"
+                    )
+                })?;
+            if let Some((graph_0_to_1, graph_1_to_0, _buf)) = &captured_bounce {
+                let graph = if reverse { graph_1_to_0 } else { graph_0_to_1 };
+                for _ in 0..16 {
+                    graph.launch().with_context(|| {
+                        format!("peer bounce timed graph launch reverse={reverse} trial={trial}")
+                    })?;
+                }
+            } else {
+                for _ in 0..16 {
+                    let (dst, dst_ctx, src, src_ctx) = if reverse {
+                        (ptr0, d.ctx.cu_ctx(), ptr1, peer.ctx.cu_ctx())
+                    } else {
+                        (ptr1, peer.ctx.cu_ctx(), ptr0, d.ctx.cu_ctx())
+                    };
+                    unsafe {
+                        sys::cuMemcpyPeerAsync(dst, dst_ctx, src, src_ctx, bytes, d.upload.cu_stream())
+                            .result()
+                            .with_context(|| {
+                                format!(
+                                    "peer transfer timed copy bytes={bytes} reverse={reverse} trial={trial}"
+                                )
+                            })?;
+                    }
+                }
+            }
+            let end = d
+                .upload
+                .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .with_context(|| {
+                    format!(
+                        "record peer transfer end bytes={bytes} reverse={reverse} trial={trial}"
+                    )
+                })?;
+            end.synchronize().with_context(|| {
+                format!(
+                    "synchronize peer transfer end bytes={bytes} reverse={reverse} trial={trial}"
+                )
+            })?;
+            let seconds = f64::from(begin.elapsed_ms(&end).with_context(|| {
+                format!("time peer transfer events bytes={bytes} reverse={reverse} trial={trial}")
+            })?) / 16000.0;
+            ensure!(
+                seconds.is_finite() && seconds > 0.0,
+                "invalid peer transfer sample seconds={seconds} bytes={bytes} reverse={reverse}"
+            );
+            if trial > 0 {
+                if reverse {
+                    cell.d2h_seconds[trial - 1] = seconds;
+                } else {
+                    cell.h2d_seconds[trial - 1] = seconds;
+                }
+            }
+        }
+    }
+    Ok(cell)
+}
+
 fn registration_extent<T>(
     maximum: u64,
     mut register: impl FnMut(u64) -> Result<Option<T>>,
@@ -1188,8 +1478,19 @@ pub(super) fn load_experts(
     let slot_bytes =
         crate::experts::catalogue::ExpertLayout::new(expert_format, &geometry)?.slot_bytes();
     let key = d.key.clone();
+    let peer = d.peer()?;
+    let peer_key = peer.as_ref().map(|p| p.key.clone());
     let host = ExpertHost::read()?;
-    let identity = super::closure::hash(&serde_json::to_vec(&(&host, geometry, expert_format))?);
+    let identity = if let Some(peer_key) = &peer_key {
+        super::closure::hash(&serde_json::to_vec(&(
+            &host,
+            geometry,
+            expert_format,
+            peer_key,
+        ))?)
+    } else {
+        super::closure::hash(&serde_json::to_vec(&(&host, geometry, expert_format))?)
+    };
     let path = dir.join(format!("experts-v3-{}-{identity}.json", key.tag()));
     let (cache, hit) = if closure.access(&path)? {
         (
@@ -1231,6 +1532,14 @@ pub(super) fn load_experts(
                 )
             })
             .collect::<Result<Vec<_>>>()?;
+        let peer_transfers = if let Some(peer) = &peer {
+            PEER_TRANSFER_BYTES
+                .into_iter()
+                .map(|bytes| measure_peer_transfer(d, peer, usize::try_from(bytes)?))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
         let missed: Vec<_> = [1, 2, 4, geometry.top_k]
             .into_iter()
             .filter(|&n| n <= geometry.top_k)
@@ -1253,6 +1562,7 @@ pub(super) fn load_experts(
             expert_format,
             slot_bytes,
             key: key.clone(),
+            peer_key: peer_key.clone(),
             host: host.clone(),
             geometry,
             copy_engines,
@@ -1260,9 +1570,10 @@ pub(super) fn load_experts(
             host_registration_bytes,
             host_registration_seconds,
             transfers,
+            peer_transfers,
             service,
         };
-        cache.check(&key, &host, &geometry, slot_bytes)?;
+        cache.check(&key, peer_key.as_ref(), &host, &geometry, slot_bytes)?;
         super::closure::write_cache(&path, &cache)?;
         (cache, false)
     };
@@ -1284,10 +1595,10 @@ pub(super) fn load_experts(
         "expert host registration profile differs from driver support={registration_supported} bytes={}",
         cache.host_registration_bytes
     );
-    let measured = cache.check(&key, &host, &geometry, slot_bytes)?;
+    let measured = cache.check(&key, peer_key.as_ref(), &host, &geometry, slot_bytes)?;
     eprintln!(
         "{}",
-        serde_json::json!({"expert_calibration":{"path":path,"cached":hit,"cells":cache,"h2d_bytes_per_second":measured.h2d_bytes_per_second,"d2h_bytes_per_second":measured.d2h_bytes_per_second}})
+        serde_json::json!({"expert_calibration":{"path":path,"cached":hit,"cells":cache,"h2d_bytes_per_second":measured.h2d_bytes_per_second,"d2h_bytes_per_second":measured.d2h_bytes_per_second,"peer_transfers":measured.peer_transfers}})
     );
     Ok(measured)
 }
@@ -1387,6 +1698,7 @@ mod long_tests {
             expert_format: crate::model_spec::ExpertFormat::Bf16,
             slot_bytes,
             key: key.clone(),
+            peer_key: None,
             host: host.clone(),
             geometry,
             copy_engines: 2,
@@ -1400,6 +1712,7 @@ mod long_tests {
                     d2h_seconds: [0.002; 5],
                 })
                 .into(),
+            peer_transfers: Vec::new(),
             service: [1, 2]
                 .into_iter()
                 .flat_map(|workers| {
@@ -1414,12 +1727,12 @@ mod long_tests {
                 })
                 .collect(),
         };
-        let measured = cache.check(&key, &host, &geometry, slot_bytes)?;
+        let measured = cache.check(&key, None, &host, &geometry, slot_bytes)?;
         cache.host_registration_bytes = 0;
         cache.host_registration_seconds = [0.001, 0.0, 0.0];
         assert_eq!(
             cache
-                .check(&key, &host, &geometry, slot_bytes)?
+                .check(&key, None, &host, &geometry, slot_bytes)?
                 .host_registration_bytes,
             0
         );
@@ -1430,20 +1743,32 @@ mod long_tests {
         let invalid_registration: ExpertCache = serde_json::from_value(invalid_registration)?;
         assert!(
             invalid_registration
-                .check(&key, &host, &geometry, slot_bytes)
+                .check(&key, None, &host, &geometry, slot_bytes)
                 .is_err()
         );
         assert_eq!(measured.host_registration_bytes, 16 * slot_bytes);
         for seconds in [[f64::NAN, 0.001, 0.001], [0.001, 0.0, 0.001]] {
             cache.host_registration_seconds = seconds;
-            assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
+            assert!(
+                cache
+                    .check(&key, None, &host, &geometry, slot_bytes)
+                    .is_err()
+            );
         }
         cache.host_registration_seconds = [0.001; 3];
         cache.expert_format = crate::model_spec::ExpertFormat::Fp8W8a16;
-        assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
+        assert!(
+            cache
+                .check(&key, None, &host, &geometry, slot_bytes)
+                .is_err()
+        );
         cache.expert_format = crate::model_spec::ExpertFormat::Bf16;
         cache.slot_bytes += 16;
-        assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
+        assert!(
+            cache
+                .check(&key, None, &host, &geometry, slot_bytes)
+                .is_err()
+        );
         cache.slot_bytes = slot_bytes;
         assert_eq!(measured.h2d_bytes_per_second, 768000.0);
         assert_eq!(measured.d2h_bytes_per_second, 384000.0);
@@ -1452,30 +1777,82 @@ mod long_tests {
         assert_eq!(measured.service.seconds(64, 1, 1)?, 0.001);
         let large = cache.service.iter().position(|c| c.rows == 64).unwrap();
         let cell = cache.service.remove(large);
-        assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
+        assert!(
+            cache
+                .check(&key, None, &host, &geometry, slot_bytes)
+                .is_err()
+        );
         cache.service.insert(large, cell);
         cache.transfers[0].d2h_seconds[0] = f64::NAN;
-        assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
+        assert!(
+            cache
+                .check(&key, None, &host, &geometry, slot_bytes)
+                .is_err()
+        );
         cache.transfers[0].d2h_seconds[0] = 0.0;
-        assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
+        assert!(
+            cache
+                .check(&key, None, &host, &geometry, slot_bytes)
+                .is_err()
+        );
         cache.transfers[0].d2h_seconds[0] = 0.002;
         cache.service[0].experts = 2;
-        assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
+        assert!(
+            cache
+                .check(&key, None, &host, &geometry, slot_bytes)
+                .is_err()
+        );
         cache.service[0].experts = 1;
         cache.copy_engines = 0;
-        assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
+        assert!(
+            cache
+                .check(&key, None, &host, &geometry, slot_bytes)
+                .is_err()
+        );
         cache.copy_engines = 2;
         cache.host.affinity = "2-3".into();
-        assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
+        assert!(
+            cache
+                .check(&key, None, &host, &geometry, slot_bytes)
+                .is_err()
+        );
         cache.host = host.clone();
         cache.geometry.hidden += 4;
-        assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
+        assert!(
+            cache
+                .check(&key, None, &host, &geometry, slot_bytes)
+                .is_err()
+        );
         cache.geometry = geometry;
         cache.key.binary_version = "changed".into();
-        assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
+        assert!(
+            cache
+                .check(&key, None, &host, &geometry, slot_bytes)
+                .is_err()
+        );
         cache.key = key.clone();
         cache.transfers[0].bytes -= 1;
-        assert!(cache.check(&key, &host, &geometry, slot_bytes).is_err());
+        assert!(
+            cache
+                .check(&key, None, &host, &geometry, slot_bytes)
+                .is_err()
+        );
+        cache.transfers[0].bytes += 1;
+        cache.peer_key = Some(key.clone());
+        assert!(
+            cache
+                .check(&key, Some(&key), &host, &geometry, slot_bytes)
+                .is_err()
+        );
+        cache.peer_transfers = PEER_TRANSFER_BYTES
+            .map(|bytes| ExpertTransfer {
+                bytes,
+                h2d_seconds: [0.001; 5],
+                d2h_seconds: [0.002; 5],
+            })
+            .into();
+        let peer_measured = cache.check(&key, Some(&key), &host, &geometry, slot_bytes)?;
+        assert_eq!(peer_measured.peer_transfers.len(), 3);
         Ok(())
     }
 
@@ -1564,8 +1941,15 @@ mod long_tests {
         let bytes = std::fs::read(&path)?;
         let modified = std::fs::metadata(&path)?.modified()?;
         let device = Device::new(0)?;
+        let peer = device.peer()?;
         let measured: ExpertCache = serde_json::from_slice(&bytes)?;
-        let measured = measured.check(&device.key, &ExpertHost::read()?, &geometry, slot_bytes)?;
+        let measured = measured.check(
+            &device.key,
+            peer.as_ref().map(|p| &p.key),
+            &ExpertHost::read()?,
+            &geometry,
+            slot_bytes,
+        )?;
         let reader = super::super::closure::Closure::new(false, "calibrate".into());
         let reused = load_experts(
             &device,

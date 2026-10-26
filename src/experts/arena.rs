@@ -219,8 +219,10 @@ impl HostBlocks {
 /// Native expert slots in rank-major, layer-minor order, followed by persistent staging.
 pub struct SlotLayout {
     geometry: ExpertGeometry,
+    gpu0_layers: u32,
     slot_bytes: usize,
     slots: Vec<Vec<Range<usize>>>,
+    peer_resident_bytes: usize,
     resident_bytes: usize,
     staging_slots: u32,
     host_blocks: u32,
@@ -278,21 +280,41 @@ impl SlotLayout {
             capacity.slots_per_layer.len(),
             geometry.layers
         );
-        let resident_count = capacity
-            .slots_per_layer
+        ensure!(
+            capacity.gpu0_layers > 0 && capacity.gpu0_layers <= geometry.layers,
+            "slot layout gpu0_layers={} outside 1..={}",
+            capacity.gpu0_layers,
+            geometry.layers
+        );
+        let gpu0_count = capacity.slots_per_layer[..capacity.gpu0_layers as usize]
             .iter()
             .try_fold(0u64, |n, &count| {
                 n.checked_add(u64::from(count))
                     .context("resident slot count overflow")
             })?;
-        let resident_extent = resident_count
+        let peer_count = capacity.slots_per_layer[capacity.gpu0_layers as usize..]
+            .iter()
+            .try_fold(0u64, |n, &count| {
+                n.checked_add(u64::from(count))
+                    .context("peer resident slot count overflow")
+            })?;
+        let gpu0_extent = gpu0_count
             .checked_mul(slot_bytes as u64)
             .filter(|&n| n <= isize::MAX as u64)
             .context("resident expert arena overflow")?;
+        let peer_extent = peer_count
+            .checked_mul(slot_bytes as u64)
+            .filter(|&n| n <= isize::MAX as u64)
+            .context("peer resident expert arena overflow")?;
         ensure!(
-            resident_extent <= capacity.device_expert_bytes,
-            "resident expert arena bytes={resident_extent} exceed budget={}",
+            gpu0_extent <= capacity.device_expert_bytes,
+            "resident expert arena bytes={gpu0_extent} exceed budget={}",
             capacity.device_expert_bytes
+        );
+        ensure!(
+            peer_extent <= capacity.peer_expert_bytes,
+            "peer resident expert arena bytes={peer_extent} exceed budget={}",
+            capacity.peer_expert_bytes
         );
         let mut slots = Vec::new();
         slots.try_reserve_exact(geometry.layers as usize)?;
@@ -307,8 +329,31 @@ impl SlotLayout {
             slots.push(layer_slots);
         }
         let mut resident_bytes = 0usize;
-        for rank in 0..capacity.slots_per_layer.iter().copied().max().unwrap_or(0) {
-            for (layer, &count) in capacity.slots_per_layer.iter().enumerate() {
+        let gpu0_layers = capacity.gpu0_layers as usize;
+        for rank in 0..capacity.slots_per_layer[gpu0_layers..]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+        {
+            for (offset, &count) in capacity.slots_per_layer[gpu0_layers..].iter().enumerate() {
+                if rank < count {
+                    let end = resident_bytes
+                        .checked_add(slot_bytes)
+                        .context("peer resident expert arena overflow")?;
+                    slots[gpu0_layers + offset].push(resident_bytes..end);
+                    resident_bytes = end;
+                }
+            }
+        }
+        let peer_resident_bytes = resident_bytes;
+        for rank in 0..capacity.slots_per_layer[..gpu0_layers]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+        {
+            for (layer, &count) in capacity.slots_per_layer[..gpu0_layers].iter().enumerate() {
                 if rank < count {
                     let end = resident_bytes
                         .checked_add(slot_bytes)
@@ -332,8 +377,10 @@ impl SlotLayout {
         );
         let layout = Self {
             geometry,
+            gpu0_layers: capacity.gpu0_layers,
             slot_bytes,
             slots,
+            peer_resident_bytes,
             resident_bytes,
             staging_slots: capacity.prefill_staging_slots,
             host_blocks,
@@ -343,11 +390,24 @@ impl SlotLayout {
     }
 
     pub fn allocation_bytes(&self) -> Result<usize> {
+        let gpu0_resident_bytes = self.gpu0_resident_bytes();
         self.slot_bytes
             .checked_mul(self.staging_slots as usize)
-            .and_then(|n| n.checked_add(self.resident_bytes))
+            .and_then(|n| n.checked_add(gpu0_resident_bytes))
             .filter(|&n| n <= isize::MAX as usize)
             .context("device expert plus staging arena extent overflow")
+    }
+
+    pub fn gpu0_resident_bytes(&self) -> usize {
+        self.resident_bytes - self.peer_resident_bytes
+    }
+
+    pub fn peer_resident_bytes(&self) -> usize {
+        self.peer_resident_bytes
+    }
+
+    pub fn gpu0_layers(&self) -> u32 {
+        self.gpu0_layers
     }
 
     pub fn geometry(&self) -> ExpertGeometry {
@@ -392,11 +452,11 @@ impl SlotLayout {
     /// Borrowed storage excludes persistent staging and retains the first slot of every layer.
     pub fn borrowed_tail(&self, slots: u32) -> Result<Range<usize>> {
         let bytes = self.slot_bytes;
-        let count = self.resident_bytes / bytes;
+        let count = (self.resident_bytes - self.peer_resident_bytes) / bytes;
         ensure!(
-            slots as usize <= count - self.geometry.layers as usize,
+            slots as usize <= count - self.gpu0_layers as usize,
             "borrowed slots={slots} exceed resident count={count} minus layers={}",
-            self.geometry.layers
+            self.gpu0_layers
         );
         Ok(self.resident_bytes - slots as usize * bytes..self.resident_bytes)
     }
@@ -490,6 +550,8 @@ mod tests {
             span_rows: 8,
             wave_rows: 2,
             device_expert_bytes: slots_per_layer.iter().map(|&n| u64::from(n)).sum::<u64>() * bytes,
+            peer_expert_bytes: 0,
+            gpu0_layers: geometry.layers,
             host_expert_bytes: 3 * bytes,
             slots_per_layer,
             host_blocks: 2,
@@ -500,6 +562,33 @@ mod tests {
             prefill_staging_slots: 2,
             pinned: false,
         })
+    }
+
+    #[test]
+    fn slot_layout_places_peer_layers_before_gpu0_tail() -> Result<()> {
+        let geometry = ExpertGeometry {
+            first_layer: 0,
+            layers: 4,
+            experts: 4,
+            hidden: 8,
+            intermediate: 4,
+            top_k: 2,
+        };
+        let mut capacity = slot_capacity(geometry, vec![4, 4, 4, 4])?;
+        let bytes = capacity.slot_bytes() as usize;
+        capacity.gpu0_layers = 2;
+        capacity.device_expert_bytes = 8 * bytes as u64;
+        capacity.peer_expert_bytes = 8 * bytes as u64;
+        let layout = SlotLayout::new(geometry, &capacity)?;
+        assert_eq!(layout.peer_resident_bytes(), 8 * bytes);
+        assert_eq!(layout.gpu0_resident_bytes(), 8 * bytes);
+        assert_eq!(layout.resident_slot(2, 0)?, 0..bytes);
+        assert_eq!(layout.resident_slot(3, 3)?, 7 * bytes..8 * bytes);
+        assert_eq!(layout.resident_slot(0, 0)?, 8 * bytes..9 * bytes);
+        assert_eq!(layout.resident_slot(1, 3)?, 15 * bytes..16 * bytes);
+        assert_eq!(layout.borrowed_tail(2)?, 14 * bytes..16 * bytes);
+        assert!(layout.borrowed_tail(9).is_err());
+        Ok(())
     }
 
     #[test]

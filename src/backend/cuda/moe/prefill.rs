@@ -18,7 +18,7 @@ use cudarc::{
 use half::bf16;
 use std::sync::{Arc, Mutex};
 
-use super::combine::{CombineOps, MoeCombine};
+use super::combine::{CombineOps, MoeCombine, MoeCombineRouted, MoeJoinRouted};
 
 const SCAN_THREADS: u32 = 1024;
 const BLOCK_THREADS: u32 = 256;
@@ -1355,7 +1355,7 @@ impl PrefillOps {
             shared_expert_gate: cohort.shared_expert_gate,
             y,
         };
-        self.finish_body(stream, fin, &plan, scratch)?;
+        self.finish_body(stream, fin, None, &plan, scratch)?;
         Ok(())
     }
 
@@ -1375,14 +1375,44 @@ impl PrefillOps {
         );
         let plan = input.validate()?;
         scratch.validate(plan.layout.bytes)?;
-        self.finish_body(stream, input, &plan, scratch)?;
+        self.finish_body(stream, input, None, &plan, scratch)?;
         Ok(())
+    }
+
+    pub fn prefill_finish_routed(
+        &self,
+        stream: &Arc<CudaStream>,
+        input: MoePrefillFinish,
+        routed_peer: Tensor<bf16, 2>,
+        scratch: &Scratch,
+    ) -> Result<()> {
+        ensure!(
+            Arc::ptr_eq(stream, &self.stream),
+            "moe prefill stream is not the PrefillOps construction stream (cuBLAS handle bound at construction)"
+        );
+        let plan = input.validate()?;
+        routed_peer.validate()?;
+        ensure!(
+            routed_peer.shape == [plan.rows, plan.hidden]
+                && routed_peer.stride == [u64::from(plan.hidden), 1],
+            "moe prefill finish routed_peer must be dense [rows, hidden] (shape {:?})",
+            routed_peer.shape
+        );
+        no_overlap(&routed_peer, &input.y.read(), "routed_peer", "y")?;
+        scratch.validate(plan.layout.bytes)?;
+        self.finish_body(stream, input, Some(routed_peer), &plan, scratch)?;
+        Ok(())
+    }
+
+    pub fn combine_routed(&self, stream: &Arc<CudaStream>, input: &MoeCombineRouted) -> Result<()> {
+        self.combine.combine_routed(stream, input)
     }
 
     fn finish_body(
         &self,
         stream: &Arc<CudaStream>,
         input: MoePrefillFinish,
+        routed_peer: Option<Tensor<bf16, 2>>,
         plan: &PrefillPlan,
         scratch: &Scratch,
     ) -> Result<()> {
@@ -1477,25 +1507,38 @@ impl PrefillOps {
             gate = Some(shared_gate);
             scale = Some(written);
         }
-        let combine_input = MoeCombine {
-            ids: input.ids,
-            final_active: input.final_active,
-            done: input.done,
-            contributions: input.contributions,
-            shared_out: unsafe {
-                Tensor::<bf16, 2>::new(
-                    shared_out_at,
-                    [rows, hidden],
-                    [u64::from(hidden), 1],
-                    u64::from(rows) * u64::from(hidden) * 2,
-                )?
-            },
-            x: input.x,
-            shared_expert_gate: gate,
-            scale,
-            y: input.y,
+        let shared_out = unsafe {
+            Tensor::<bf16, 2>::new(
+                shared_out_at,
+                [rows, hidden],
+                [u64::from(hidden), 1],
+                u64::from(rows) * u64::from(hidden) * 2,
+            )?
         };
-        self.combine.combine(stream, &combine_input)?;
+        if let Some(routed_in) = routed_peer {
+            self.combine.join_routed(
+                stream,
+                &MoeJoinRouted {
+                    routed_in,
+                    shared_out,
+                    scale: scale.map(|s| s.read()),
+                    y: input.y,
+                },
+            )?;
+        } else {
+            let combine_input = MoeCombine {
+                ids: input.ids,
+                final_active: input.final_active,
+                done: input.done,
+                contributions: input.contributions,
+                shared_out,
+                x: input.x,
+                shared_expert_gate: gate,
+                scale,
+                y: input.y,
+            };
+            self.combine.combine(stream, &combine_input)?;
+        }
         Ok(())
     }
 

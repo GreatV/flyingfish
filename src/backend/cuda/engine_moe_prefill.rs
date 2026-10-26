@@ -1,5 +1,6 @@
 //! Layer-major prefill over borrowed expert slots.
 use super::*;
+use crate::backend::cuda::moe::combine::MoeCombineRouted;
 #[cfg(test)]
 use crate::backend::cuda::moe::prefill::prefill_scratch_bytes;
 use crate::backend::cuda::moe::prefill::{
@@ -59,6 +60,151 @@ fn route_trace_choices<T>(choices: &[T], base: usize, rows: usize, top_k: usize)
         choices.len()
     );
     Ok(&choices[start..end])
+}
+
+fn record_route_trace(
+    trace: &mut Trace,
+    route_prefix: &str,
+    slice: (usize, usize, usize),
+    host: (&[i32], &[bf16], &[bool]),
+) -> Result<()> {
+    let (base, rows, top_k) = slice;
+    let (host_ids, host_weights, cpu_arithmetic) = host;
+    let route_ids = route_trace_choices(host_ids, base, rows, top_k)?;
+    let route_weights = route_trace_choices(host_weights, base, rows, top_k)?;
+    let route_cpu = route_ids
+        .iter()
+        .map(|expert| u8::from(cpu_arithmetic[*expert as usize]) as f32)
+        .collect::<Vec<_>>();
+    trace.add(
+        format!("{route_prefix}.moe.ids"),
+        vec![rows, top_k],
+        route_ids.iter().map(|value| *value as f32).collect(),
+    )?;
+    trace.add(
+        format!("{route_prefix}.moe.weights"),
+        vec![rows, top_k],
+        route_weights.iter().map(|value| value.to_f32()).collect(),
+    )?;
+    trace.add(
+        format!("{route_prefix}.moe.cpu"),
+        vec![rows, top_k],
+        route_cpu,
+    )?;
+    Ok(())
+}
+
+fn record_span_moe_trace(
+    trace: &mut Trace,
+    stream: &Arc<CudaStream>,
+    route_prefix: &str,
+    slice: (usize, usize, usize),
+    span_peer: (&Span, bool),
+) -> Result<()> {
+    let (base, rows, top_k) = slice;
+    let (span, on_peer) = span_peer;
+    let hidden = span.geometry.hidden as usize;
+    if on_peer {
+        let mut routed = vec![bf16::ZERO; rows * hidden];
+        // SAFETY: the live span covers this whole reduced routed prefix.
+        unsafe {
+            result::memcpy_dtoh_async(
+                &mut routed,
+                span.routed(base as u32, rows as u32)?.ptr,
+                stream.cu_stream(),
+            )?;
+        }
+        stream.synchronize()?;
+        trace.add(
+            format!("{route_prefix}.moe.routed"),
+            vec![rows, hidden],
+            routed.iter().map(|value| value.to_f32()).collect(),
+        )?;
+    } else {
+        let mut contributions = vec![bf16::ZERO; rows * top_k * hidden];
+        // SAFETY: the live span covers this whole routed contribution prefix.
+        unsafe {
+            result::memcpy_dtoh_async(
+                &mut contributions,
+                span.contributions(base as u32, rows as u32)?.ptr,
+                stream.cu_stream(),
+            )?;
+        }
+        stream.synchronize()?;
+        trace.add(
+            format!("{route_prefix}.moe.contributions"),
+            vec![rows, top_k, hidden],
+            contributions.iter().map(|value| value.to_f32()).collect(),
+        )?;
+    }
+    Ok(())
+}
+
+fn record_wave_hidden_trace(
+    trace: &mut Trace,
+    waves: &[Wave],
+    layer: (usize, usize, bool),
+    hidden: usize,
+    ffn_span: Option<&[bf16]>,
+    residual_span: &[bf16],
+) -> Result<()> {
+    let (layer, trace_layer, all_layers) = layer;
+    let selected_layer = trace_layer_selected(all_layers, layer, trace_layer);
+    let ffn_name = if all_layers {
+        format!("{layer}.ffn")
+    } else {
+        "ffn".to_owned()
+    };
+    let layer_name = if all_layers {
+        layer.to_string()
+    } else {
+        format!("layer.{layer}")
+    };
+    for (wave_base, wave_rows, mixer_skip, mixer_selected, prefix) in waves {
+        if !*mixer_selected {
+            continue;
+        }
+        ensure!(*mixer_skip < *wave_rows, "trace selection is empty");
+        let row_start = wave_base + mixer_skip;
+        let row_end = wave_base + wave_rows;
+        let rows = row_end - row_start;
+        if selected_layer {
+            let ffn = ffn_span.context("selected layer FFN trace buffer missing")?;
+            ensure!(
+                row_end * hidden <= ffn.len(),
+                "FFN trace slice {}..{} exceeds {}",
+                row_start * hidden,
+                row_end * hidden,
+                ffn.len()
+            );
+            trace.add(
+                format!("{prefix}.{ffn_name}"),
+                vec![1, rows, hidden],
+                ffn[row_start * hidden..row_end * hidden]
+                    .iter()
+                    .copied()
+                    .map(bf16::to_f32)
+                    .collect(),
+            )?;
+        }
+        ensure!(
+            row_end * hidden <= residual_span.len(),
+            "residual trace slice {}..{} exceeds {}",
+            row_start * hidden,
+            row_end * hidden,
+            residual_span.len()
+        );
+        trace.add(
+            format!("{prefix}.{layer_name}"),
+            vec![1, rows, hidden],
+            residual_span[row_start * hidden..row_end * hidden]
+                .iter()
+                .copied()
+                .map(bf16::to_f32)
+                .collect(),
+        )?;
+    }
+    Ok(())
 }
 
 struct Span {
@@ -148,6 +294,10 @@ impl Span {
             [rows, k, h],
             [u64::from(k) * u64::from(h), u64::from(h), 1],
         )
+    }
+
+    fn routed(&self, base: u32, rows: u32) -> Result<Tensor<bf16, 2>> {
+        self.hidden(&self.layout.contributions, base, rows)
     }
 }
 
@@ -300,6 +450,26 @@ struct Cpu {
     disk: Vec<crate::experts::runtime::Route>,
 }
 
+struct PeerPrefill {
+    device: Device,
+    ops: PrefillOps,
+    mask: CudaFunction,
+    tables: Tables,
+    plan: SpanPlan,
+    wave_rows: u32,
+    scratch: CudaSlice<u8>,
+    x: CudaSlice<bf16>,
+    routed: CudaSlice<bf16>,
+    ids: CudaSlice<i32>,
+    weights: CudaSlice<bf16>,
+    active: CudaSlice<u32>,
+    generation: CudaSlice<u64>,
+    contributions: CudaSlice<bf16>,
+    done: CudaSlice<u32>,
+    routed_event: CudaEvent,
+    join_event: CudaEvent,
+}
+
 type Wave = (usize, usize, usize, bool, String);
 
 pub(in crate::backend::cuda::engine) struct Prefill {
@@ -313,6 +483,7 @@ pub(in crate::backend::cuda::engine) struct Prefill {
     h2d_bytes_per_second: f64,
     span: Option<Span>,
     gpu: Gpu,
+    peer: Option<PeerPrefill>,
     cpu: Cpu,
     frequency: Vec<Vec<f64>>,
     rows: u64,
@@ -322,7 +493,6 @@ pub(in crate::backend::cuda::engine) struct Prefill {
     workspace_rows: usize,
     routed_wave_rows: u32,
     waves: Vec<Wave>,
-    layer_names: Vec<String>,
     counts: Vec<u32>,
     resident: Vec<bool>,
     forecast_counts: Vec<u32>,
@@ -339,7 +509,43 @@ impl Drop for Prefill {
             .mailbox
             .context()
             .record_err(self.gpu.mailbox.synchronize());
+        if let Some(peer) = &self.peer {
+            peer.device.ctx.record_err(peer.device.stream.synchronize());
+        }
     }
+}
+
+pub(in crate::backend::cuda::engine) fn peer_prefill_bytes(
+    geometry: ExpertGeometry,
+    span_rows: u32,
+    wave_rows: u32,
+    shared: (u32, crate::model_spec::RoutedWeightBoundary),
+    fp8_slot: Option<&crate::experts::catalogue::Fp8Slot>,
+) -> Result<usize> {
+    let span = span_rows as usize;
+    let wave = wave_rows as usize;
+    let hidden = geometry.hidden as usize;
+    let top_k = geometry.top_k as usize;
+    let experts = geometry.experts as usize;
+    let scratch = usize::try_from(prefill_scratch_bytes_mixed_with_boundary(
+        wave,
+        span,
+        top_k,
+        experts,
+        hidden,
+        (geometry.intermediate as usize, shared.0 as usize),
+        (fp8_slot, shared.1),
+    )?)?;
+    scratch
+        .checked_add(experts * 28)
+        .and_then(|n| n.checked_add(span * hidden * 4))
+        .and_then(|n| n.checked_add(span * top_k * 18))
+        .and_then(|n| n.checked_add(wave * top_k * hidden * 2))
+        .and_then(|n| n.checked_add(wave * top_k * 4))
+        .and_then(|n| {
+            n.checked_add(crate::backend::cuda::moe::prefill::stage_device_bytes() as usize)
+        })
+        .context("peer prefill byte reserve overflow")
 }
 
 /// CPU workspace rows/choices, constrained expert rows, and measured expert rows.
@@ -443,7 +649,7 @@ impl Prefill {
     }
 
     pub(in crate::backend::cuda::engine) fn new(
-        device: &Device,
+        devices: (&Device, Option<&Device>),
         slots: &mut Slots,
         capacity: &Capacity,
         reserves: Reserves,
@@ -453,12 +659,21 @@ impl Prefill {
             u32,
             usize,
             usize,
-            u32,
-            crate::model_spec::RoutedWeightBoundary,
+            (u32, u32),
+            (
+                crate::model_spec::SwigluRounding,
+                crate::model_spec::RoutedWeightBoundary,
+            ),
         ),
     ) -> Result<Self> {
-        let (shared_intermediate, workspace_rows, mixer_rows, routed_wave_rows, routed_weight) =
-            shape;
+        let (device, peer_device) = devices;
+        let (
+            shared_intermediate,
+            workspace_rows,
+            mixer_rows,
+            (routed_wave_rows, peer_wave_rows),
+            (swiglu_rounding, routed_weight),
+        ) = shape;
         let geometry = slots.catalogue.geometry();
         ensure!(
             mixer_rows > 0 && mixer_rows <= workspace_rows,
@@ -524,6 +739,71 @@ impl Prefill {
         let resident_group_size = resident_group_size(geometry, capacity, routed_wave_rows);
         let cohorts =
             (geometry.experts as usize).div_ceil(capacity.prefill_staging_slots as usize) + 1;
+        let peer = if capacity.gpu0_layers < geometry.layers {
+            let peer = peer_device.context("multi-GPU prefill requires peer device")?;
+            ensure!(
+                peer_wave_rows >= capacity.wave_rows
+                    && peer_wave_rows <= capacity.span_rows
+                    && (u64::from(peer_wave_rows) * u64::from(geometry.top_k) * 2)
+                        .is_multiple_of(16),
+                "peer wave rows={peer_wave_rows} outside {}..={} or unaligned",
+                capacity.wave_rows,
+                capacity.span_rows
+            );
+            let span_rows = capacity.span_rows as usize;
+            let wave_rows = peer_wave_rows as usize;
+            let hidden = geometry.hidden as usize;
+            let top_k = geometry.top_k as usize;
+            let experts = geometry.experts as usize;
+            let format = if capacity.layout.fp8_slot().is_some() {
+                crate::model_spec::ExpertFormat::Fp8W8a16
+            } else {
+                crate::model_spec::ExpertFormat::Bf16
+            };
+            Some(PeerPrefill {
+                device: peer.clone(),
+                ops: PrefillOps::new_with_boundaries(
+                    &peer.ctx,
+                    &peer.stream,
+                    format,
+                    swiglu_rounding,
+                    routed_weight,
+                )?,
+                mask: super::super::super::super::cubin::module(&peer.ctx, "moe_route")?
+                    .load_function("moe_route_mask")?,
+                tables: Tables::new(peer, experts, 1)?,
+                plan: SpanPlan::new(
+                    &geometry,
+                    capacity.slot_bytes(),
+                    capacity.prefill_staging_slots,
+                    workers,
+                )?,
+                wave_rows: peer_wave_rows,
+                scratch: peer.stream.alloc_zeros(usize::try_from(
+                    prefill_scratch_bytes_mixed_with_boundary(
+                        wave_rows,
+                        span_rows,
+                        top_k,
+                        experts,
+                        hidden,
+                        (geometry.intermediate as usize, shared_intermediate as usize),
+                        (capacity.layout.fp8_slot(), routed_weight),
+                    )?,
+                )?)?,
+                x: peer.stream.alloc_zeros(span_rows * hidden)?,
+                routed: peer.stream.alloc_zeros(span_rows * hidden)?,
+                ids: peer.stream.alloc_zeros(span_rows * top_k)?,
+                weights: peer.stream.alloc_zeros(span_rows * top_k)?,
+                active: peer.stream.alloc_zeros(span_rows * top_k)?,
+                generation: peer.stream.alloc_zeros(span_rows * top_k)?,
+                contributions: peer.stream.alloc_zeros(wave_rows * top_k * hidden)?,
+                done: peer.stream.alloc_zeros(wave_rows * top_k)?,
+                routed_event: device.ctx.new_event(None)?,
+                join_event: peer.ctx.new_event(None)?,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             geometry,
             shared_intermediate,
@@ -564,6 +844,7 @@ impl Prefill {
                     geometry.experts,
                 )?,
             },
+            peer,
             cpu: Cpu {
                 x: pinned_zeros(&device.ctx, cpu.0 * geometry.hidden as usize)?,
                 out: pinned_zeros(&device.ctx, cpu.1 * geometry.hidden as usize)?,
@@ -596,9 +877,6 @@ impl Prefill {
                         String::with_capacity("prefill.".len() + usize::MAX.ilog10() as usize + 1),
                     )
                 })
-                .collect(),
-            layer_names: (0..geometry.layers)
-                .map(|layer| format!("layer.{layer}"))
                 .collect(),
             counts: vec![0; geometry.experts as usize],
             resident: vec![false; geometry.experts as usize],
@@ -881,6 +1159,48 @@ impl Prefill {
         for (expert, resident) in self.resident.iter_mut().enumerate() {
             *resident = slots.policy.ledger().tier(layer, expert as u32)? == Tier::Gpu;
         }
+        arithmetic_mask(&self.counts, &mut self.gpu.cpu_arithmetic)?;
+        for (total, &count) in self.frequency[layer as usize].iter_mut().zip(&self.counts) {
+            *total += f64::from(count);
+        }
+        if layer == 0 {
+            self.rows += u64::from(rows);
+        }
+        if layer >= self.capacity.gpu0_layers {
+            let peer = self
+                .peer
+                .as_mut()
+                .context("peer prefill layer routed without peer executor")?;
+            peer.plan.update(
+                &self.counts,
+                &self.resident,
+                rows,
+                peer.wave_rows.min(rows),
+                &SpanRates {
+                    service: &self.service,
+                    h2d_bytes_per_second: self.h2d_bytes_per_second,
+                    cpu_row_limit: self.cpu_ceiling,
+                },
+            )?;
+            peer.plan.pack_waves(&self.counts, host_ids)?;
+            ensure!(
+                peer.plan.staged().is_empty() && peer.plan.cpu().is_empty(),
+                "peer prefill layer={layer} requires full GPU residency: staged={} cpu={}",
+                peer.plan.staged().len(),
+                peer.plan.cpu().len()
+            );
+            peer.contribute(
+                device,
+                slots,
+                span,
+                &self.gpu.cpu_arithmetic,
+                (layer, rows, ffn),
+                &mut self.gpu.resident_slots,
+            )?;
+            self.stats[0] += 1;
+            self.stats[1] += u64::from(rows);
+            return Ok(());
+        }
         self.plan.update(
             &self.counts,
             &self.resident,
@@ -894,7 +1214,6 @@ impl Prefill {
         )?;
         self.plan.pack_waves(&self.counts, host_ids)?;
         let plan = &self.plan;
-        arithmetic_mask(&self.counts, &mut self.gpu.cpu_arithmetic)?;
         for &expert in plan.cpu() {
             ensure!(
                 self.counts[expert as usize] <= self.cpu_ceiling,
@@ -902,12 +1221,6 @@ impl Prefill {
                 self.counts[expert as usize],
                 self.cpu_ceiling
             );
-        }
-        for (total, &count) in self.frequency[layer as usize].iter_mut().zip(&self.counts) {
-            *total += f64::from(count);
-        }
-        if layer == 0 {
-            self.rows += u64::from(rows);
         }
         self.gpu.read_ahead.begin_layer(slots, layer, plan)?;
         self.cpu.prepare(&self.gpu, span, slots, layer, plan)?;
@@ -997,7 +1310,7 @@ impl Prefill {
     }
 
     fn lookahead(&mut self, slots: &Slots, layer: u32, rows: u32) -> Result<bool> {
-        if layer + 1 == self.geometry.layers {
+        if layer + 1 == self.geometry.layers || layer + 1 >= self.capacity.gpu0_layers {
             return Ok(false);
         }
         let expected =
@@ -1034,10 +1347,10 @@ impl Prefill {
         device: &Device,
         decode: &mut Decode,
         ffn: BoundFfn,
-        base: u32,
-        rows: u32,
+        wave: (u32, u32, u32),
         y: Tensor<bf16, 2>,
     ) -> Result<()> {
+        let (layer, base, rows) = wave;
         let BoundFfn::Moe {
             ref shared,
             shared_gate,
@@ -1050,24 +1363,292 @@ impl Prefill {
             .span
             .as_ref()
             .context("prefill finish has no borrowed span")?;
+        let fin = MoePrefillFinish {
+            expert_inter: self.geometry.intermediate,
+            x: span.hidden(&span.layout.normalized, base, rows)?,
+            ids: span.choices(&span.layout.ids, base, rows)?,
+            final_active: span.choices(&span.layout.active, base, rows)?,
+            contributions: span.contributions(base, rows)?,
+            done: span.choices(&span.layout.done, base, rows)?,
+            experts: self.geometry.experts,
+            shared_gate: shared[0],
+            shared_up: shared[1],
+            shared_down: shared[2],
+            shared_expert_gate: shared_gate,
+            y: TensorMut(y),
+        };
+        if layer >= self.capacity.gpu0_layers {
+            decode.prefill.prefill_finish_routed(
+                &device.stream,
+                fin,
+                span.routed(base, rows)?,
+                &qwen::scratch(&self.gpu.scratch, &device.stream),
+            )?;
+            return Ok(());
+        }
         decode.prefill.prefill_finish(
             &device.stream,
-            MoePrefillFinish {
-                expert_inter: self.geometry.intermediate,
-                x: span.hidden(&span.layout.normalized, base, rows)?,
-                ids: span.choices(&span.layout.ids, base, rows)?,
-                final_active: span.choices(&span.layout.active, base, rows)?,
-                contributions: span.contributions(base, rows)?,
-                done: span.choices(&span.layout.done, base, rows)?,
-                experts: self.geometry.experts,
-                shared_gate: shared[0],
-                shared_up: shared[1],
-                shared_down: shared[2],
-                shared_expert_gate: shared_gate,
-                y: TensorMut(y),
-            },
+            fin,
             &qwen::scratch(&self.gpu.scratch, &device.stream),
         )?;
+        Ok(())
+    }
+}
+
+impl PeerPrefill {
+    fn contribute(
+        &mut self,
+        device: &Device,
+        slots: &mut Slots,
+        span: &Span,
+        cpu_arithmetic: &[bool],
+        run: (u32, u32, BoundFfn),
+        resident_slots: &mut Vec<u32>,
+    ) -> Result<()> {
+        let (layer, rows, ffn) = run;
+        let BoundFfn::Moe {
+            shared,
+            shared_gate,
+            ..
+        } = ffn
+        else {
+            anyhow::bail!("peer prefill contribute received a dense FFN");
+        };
+        let geometry = span.geometry;
+        let hidden = geometry.hidden as usize;
+        let top_k = geometry.top_k as usize;
+        let stream = &self.device.stream;
+        self.routed_event.record(&device.stream)?;
+        stream.wait(&self.routed_event)?;
+        self.device.ctx.bind_to_thread()?;
+        self.tables.clear()?;
+        for &expert in self.plan.resident() {
+            let position = slots.policy.ledger().slot(layer, expert)?;
+            let physical = &mut slots.physical[position as usize];
+            if !physical.waited {
+                let id = slots
+                    .policy
+                    .first_read(position)?
+                    .context("peer prefill resident has no copy event")?;
+                ensure!(
+                    physical.copy.as_ref().is_some_and(|copy| copy.id == id),
+                    "peer prefill resident slot={position} copy ownership differs"
+                );
+                slots.events.wait(stream, id)?;
+                physical.waited = true;
+            }
+            self.tables.set(
+                geometry.experts,
+                0,
+                expert,
+                (
+                    physical.pointer,
+                    physical.pointer + slots.catalogue.layout().down_offset(),
+                ),
+                slots.policy.generation(layer, expert)?,
+            )?;
+        }
+        self.tables.upload(stream, 1, geometry.experts)?;
+        let src_x = span.hidden(&span.layout.normalized, 0, rows)?;
+        let src_ids = span.choices::<i32>(&span.layout.ids, 0, rows)?;
+        let src_weights = span.choices::<bf16>(&span.layout.weights, 0, rows)?;
+        let dst_x = self.x.device_ptr(stream).0;
+        let dst_ids = self.ids.device_ptr(stream).0;
+        let dst_weights = self.weights.device_ptr(stream).0;
+        // SAFETY: source span views on GPU 0 and destination buffers on GPU 1 stay live and ordered on stream.
+        unsafe {
+            cudarc::driver::sys::cuMemcpyPeerAsync(
+                dst_x,
+                self.device.ctx.cu_ctx(),
+                src_x.ptr,
+                device.ctx.cu_ctx(),
+                rows as usize * hidden * 2,
+                stream.cu_stream(),
+            )
+            .result()
+            .context("cuMemcpyPeerAsync prefill x 0->1")?;
+            cudarc::driver::sys::cuMemcpyPeerAsync(
+                dst_ids,
+                self.device.ctx.cu_ctx(),
+                src_ids.ptr,
+                device.ctx.cu_ctx(),
+                rows as usize * top_k * 4,
+                stream.cu_stream(),
+            )
+            .result()
+            .context("cuMemcpyPeerAsync prefill ids 0->1")?;
+            cudarc::driver::sys::cuMemcpyPeerAsync(
+                dst_weights,
+                self.device.ctx.cu_ctx(),
+                src_weights.ptr,
+                device.ctx.cu_ctx(),
+                rows as usize * top_k * 2,
+                stream.cu_stream(),
+            )
+            .result()
+            .context("cuMemcpyPeerAsync prefill weights 0->1")?;
+        }
+        let tables = self.tables.bindings(stream, 0, geometry.experts)?;
+        let active_ptr = self.active.device_ptr(stream).0;
+        let gen_ptr = self.generation.device_ptr(stream).0;
+        let assignments = rows
+            .checked_mul(geometry.top_k)
+            .context("peer prefill assignment overflow")?;
+        // SAFETY: validated dense assignment and expert tables cover every mask element on GPU 1.
+        unsafe {
+            stream
+                .launch_builder(&self.mask)
+                .arg(&dst_ids)
+                .arg(&tables.valid.ptr)
+                .arg(&tables.generation.ptr)
+                .arg(&active_ptr)
+                .arg(&gen_ptr)
+                .arg(&(assignments as i32))
+                .arg(&(geometry.experts as i32))
+                .launch(super::super::super::super::ops::grid(
+                    assignments.div_ceil(256) as usize,
+                    256,
+                ))?;
+        }
+        let range = 0..geometry.experts as usize;
+        for &(base, wave_rows, active) in self.plan.cohort_waves(0)? {
+            let done_ptr = self.done.device_ptr(stream).0;
+            // SAFETY: done holds at least wave_rows*top_k u32 words on GPU 1.
+            unsafe {
+                result::memset_d8_async(
+                    done_ptr,
+                    0,
+                    wave_rows as usize * top_k * 4,
+                    stream.cu_stream(),
+                )?;
+            }
+            let x_wave = view(
+                &self.x,
+                stream,
+                base as usize * hidden,
+                [wave_rows, geometry.hidden],
+                [u64::from(geometry.hidden), 1],
+            )?;
+            let ids_wave = view(
+                &self.ids,
+                stream,
+                base as usize * top_k,
+                [wave_rows, geometry.top_k],
+                [u64::from(geometry.top_k), 1],
+            )?;
+            let weights_wave = view(
+                &self.weights,
+                stream,
+                base as usize * top_k,
+                [wave_rows, geometry.top_k],
+                [u64::from(geometry.top_k), 1],
+            )?;
+            let active_wave = view(
+                &self.active,
+                stream,
+                base as usize * top_k,
+                [wave_rows, geometry.top_k],
+                [u64::from(geometry.top_k), 1],
+            )?;
+            let gen_wave = view(
+                &self.generation,
+                stream,
+                base as usize * top_k,
+                [wave_rows, geometry.top_k],
+                [u64::from(geometry.top_k), 1],
+            )?;
+            let contrib_wave = view(
+                &self.contributions,
+                stream,
+                0,
+                [wave_rows, geometry.top_k, geometry.hidden],
+                [
+                    u64::from(geometry.top_k) * u64::from(geometry.hidden),
+                    u64::from(geometry.hidden),
+                    1,
+                ],
+            )?;
+            let done_wave = view(
+                &self.done,
+                stream,
+                0,
+                [wave_rows, geometry.top_k],
+                [u64::from(geometry.top_k), 1],
+            )?;
+            self.ops.prefill_contribute(
+                stream,
+                MoePrefillContribute {
+                    expert_inter: geometry.intermediate,
+                    cpu_arithmetic,
+                    fp8_slot: slots.catalogue.layout().fp8_slot(),
+                    wave: Some((0, base, active)),
+                    wait_copy: None,
+                    reader_event: None,
+                    x: x_wave,
+                    ids: ids_wave,
+                    weights: weights_wave,
+                    active: active_wave,
+                    assignment_gen: gen_wave,
+                    slots_gate_up: tables.gate_up,
+                    slots_down: tables.down,
+                    slot_valid: tables.valid,
+                    slot_generation: tables.generation,
+                    slots_gate_up_host: &self.tables.host_gate_up.as_slice()?[range.clone()],
+                    slots_down_host: &self.tables.host_down.as_slice()?[range.clone()],
+                    shared_gate: shared[0],
+                    shared_up: shared[1],
+                    shared_down: shared[2],
+                    shared_expert_gate: shared_gate,
+                    contributions: contrib_wave,
+                    done: TensorMut(done_wave),
+                },
+                &qwen::scratch(&self.scratch, stream),
+            )?;
+            let routed_wave = view(
+                &self.routed,
+                stream,
+                base as usize * hidden,
+                [wave_rows, geometry.hidden],
+                [u64::from(geometry.hidden), 1],
+            )?;
+            self.ops.combine_routed(
+                stream,
+                &MoeCombineRouted {
+                    ids: ids_wave,
+                    final_active: active_wave,
+                    contributions: contrib_wave,
+                    done: done_wave,
+                    routed_out: TensorMut(routed_wave),
+                },
+            )?;
+        }
+        let dst_routed = span.routed(0, rows)?;
+        let src_routed = self.routed.device_ptr(stream).0;
+        // SAFETY: source routed buffer on GPU 1 and destination span buffer on GPU 0 stay live and ordered on stream.
+        unsafe {
+            cudarc::driver::sys::cuMemcpyPeerAsync(
+                dst_routed.ptr,
+                device.ctx.cu_ctx(),
+                src_routed,
+                self.device.ctx.cu_ctx(),
+                rows as usize * hidden * 2,
+                stream.cu_stream(),
+            )
+            .result()
+            .context("cuMemcpyPeerAsync prefill routed 1->0")?;
+        }
+        self.join_event.record(stream)?;
+        device.stream.wait(&self.join_event)?;
+        device.ctx.bind_to_thread()?;
+        let ticket = slots.events.record(&device.stream)?;
+        resident_slots.clear();
+        for &expert in self.plan.resident() {
+            resident_slots.push(slots.policy.ledger().slot(layer, expert)?);
+        }
+        slots.policy.record_readers(resident_slots, ticket.id)?;
+        for &position in resident_slots.iter() {
+            slots.physical[position as usize].reader = Some(ticket.clone());
+        }
         Ok(())
     }
 }
@@ -1237,6 +1818,7 @@ impl Engine {
                     part += 1;
                 }
             }
+            let any_selected = waves.iter().any(|wave| wave.3);
             for (base, rows, skip, selected, prefix) in waves.iter() {
                 let step = self.moe_wave(span_start + base, *rows)?;
                 self.device.stream.memcpy_htod(
@@ -1372,7 +1954,18 @@ impl Engine {
                         admitted.len() as u32,
                         ffn.clone(),
                     )?;
-                    Some(ffn)
+                    Some((slot_layer, ffn))
+                };
+                let hidden = self.model_spec.hidden as usize;
+                let mut ffn_trace = if any_selected && selected_layer {
+                    Vec::with_capacity(admitted.len() * hidden)
+                } else {
+                    Vec::new()
+                };
+                let mut residual_trace = if any_selected {
+                    Vec::with_capacity(admitted.len() * hidden)
+                } else {
+                    Vec::new()
                 };
                 for base in (0..admitted.len()).step_by(prefill.capacity.wave_rows as usize) {
                     let rows = (prefill.capacity.wave_rows as usize).min(admitted.len() - base);
@@ -1384,20 +1977,13 @@ impl Engine {
                     let selected = *mixer_selected && skip < rows;
                     let step = self.moe_wave(span_start + base, rows)?;
                     match &ffn {
-                        Some(ffn) => {
+                        Some((slot_layer, ffn)) => {
                             prefill.finish_wave(
                                 &self.device,
                                 decode,
                                 ffn.clone(),
-                                base as u32,
-                                rows as u32,
-                                qwen::matrix(
-                                    &self.work.out,
-                                    &self.device.stream,
-                                    0,
-                                    rows,
-                                    self.model_spec.hidden as usize,
-                                )?,
+                                (*slot_layer, base as u32, rows as u32),
+                                qwen::matrix(&self.work.out, &self.device.stream, 0, rows, hidden)?,
                             )?;
                         }
                         None => {
@@ -1408,16 +1994,17 @@ impl Engine {
                             device_copy(
                                 &self.device.stream,
                                 span.hidden(&span.layout.normalized, base as u32, rows as u32)?,
-                                qwen::matrix(
-                                    &self.work.n,
-                                    &self.device.stream,
-                                    0,
-                                    rows,
-                                    self.model_spec.hidden as usize,
-                                )?,
+                                qwen::matrix(&self.work.n, &self.device.stream, 0, rows, hidden)?,
                             )?;
                             self.run_ffn(layer, step, &mut None)?;
                         }
+                    }
+                    if any_selected && selected_layer {
+                        ffn_trace.extend(
+                            self.device
+                                .stream
+                                .clone_dtoh(&self.work.out.slice(..rows * hidden))?,
+                        );
                     }
                     let span = prefill
                         .span
@@ -1426,23 +2013,11 @@ impl Engine {
                     device_copy(
                         &self.device.stream,
                         span.hidden(&span.layout.residual, base as u32, rows as u32)?,
-                        qwen::matrix(
-                            &self.work.x,
-                            &self.device.stream,
-                            0,
-                            rows,
-                            self.model_spec.hidden as usize,
-                        )?,
+                        qwen::matrix(&self.work.x, &self.device.stream, 0, rows, hidden)?,
                     )?;
                     device_copy(
                         &self.device.stream,
-                        qwen::matrix(
-                            &self.work.out,
-                            &self.device.stream,
-                            0,
-                            rows,
-                            self.model_spec.hidden as usize,
-                        )?,
+                        qwen::matrix(&self.work.out, &self.device.stream, 0, rows, hidden)?,
                         span.hidden(&span.layout.normalized, base as u32, rows as u32)?,
                     )?;
                     if flint {
@@ -1455,10 +2030,8 @@ impl Engine {
                                 .launch_builder(&self.ops.residual)
                                 .arg(&mut self.work.x)
                                 .arg(&self.work.out)
-                                .arg(&(i32::try_from(rows * self.model_spec.hidden as usize)?))
-                                .launch(super::super::super::super::ops::flat(
-                                    rows * self.model_spec.hidden as usize,
-                                ))?;
+                                .arg(&(i32::try_from(rows * hidden)?))
+                                .launch(super::super::super::super::ops::flat(rows * hidden))?;
                         }
                     }
                     if let Some(capture) = &mut self.hidden_capture
@@ -1470,137 +2043,109 @@ impl Engine {
                             &mut capture.values.slice_mut(base * capture.width..),
                             copy::Rect {
                                 rows,
-                                width: self.model_spec.hidden as usize,
-                                src_pitch: self.model_spec.hidden as usize,
+                                width: hidden,
+                                src_pitch: hidden,
                                 src_col: 0,
                                 dst_pitch: capture.width,
-                                dst_col: slot as usize * self.model_spec.hidden as usize,
+                                dst_col: slot as usize * hidden,
                             },
                         )?;
                     }
                     device_copy(
                         &self.device.stream,
-                        qwen::matrix(
-                            &self.work.x,
-                            &self.device.stream,
-                            0,
-                            rows,
-                            self.model_spec.hidden as usize,
-                        )?,
+                        qwen::matrix(&self.work.x, &self.device.stream, 0, rows, hidden)?,
                         span.hidden(&span.layout.residual, base as u32, rows as u32)?,
                     )?;
                     if flint {
                         device_copy(
                             &self.device.stream,
-                            qwen::matrix(
-                                &self.work.n,
-                                &self.device.stream,
-                                0,
-                                rows,
-                                self.model_spec.hidden as usize,
-                            )?,
+                            qwen::matrix(&self.work.n, &self.device.stream, 0, rows, hidden)?,
                             span.hidden(&span.layout.normalized, base as u32, rows as u32)?,
                         )?;
                     }
-                    if selected && selected_layer {
-                        let mut target = trace.as_deref_mut().map(|trace| Target {
+                    if any_selected {
+                        residual_trace.extend(
+                            self.device
+                                .stream
+                                .clone_dtoh(&self.work.x.slice(..rows * hidden))?,
+                        );
+                    }
+                    if all_layers
+                        && selected
+                        && selected_layer
+                        && let Some((slot_layer, _)) = &ffn
+                        && let Some(trace) = trace.as_deref_mut()
+                    {
+                        let route_prefix = route_trace_prefix(true, prefix, layer, base);
+                        let top_k = prefill.geometry.top_k as usize;
+                        record_route_trace(
                             trace,
-                            prefix,
-                            skip,
-                        });
-                        let host_ids = prefill.gpu.host_ids.as_slice()?;
-                        let host_weights = prefill.gpu.host_weights.as_slice()?;
-                        let route_ids = route_trace_choices(
-                            host_ids,
-                            base,
-                            rows,
-                            prefill.geometry.top_k as usize,
-                        )?
-                        .to_vec();
-                        let route_weights = route_trace_choices(
-                            host_weights,
-                            base,
-                            rows,
-                            prefill.geometry.top_k as usize,
-                        )?
-                        .to_vec();
-                        let route_cpu = route_ids
-                            .iter()
-                            .map(|expert| {
-                                u8::from(prefill.gpu.cpu_arithmetic[*expert as usize]) as f32
-                            })
-                            .collect::<Vec<_>>();
-                        if let Some(target) = target.as_mut() {
-                            let route_prefix =
-                                route_trace_prefix(target.trace.all_layers, prefix, layer, base);
-                            target.trace.add(
-                                format!("{route_prefix}.moe.ids"),
-                                vec![rows, prefill.geometry.top_k as usize],
-                                route_ids.iter().map(|value| *value as f32).collect(),
-                            )?;
-                            target.trace.add(
-                                format!("{route_prefix}.moe.weights"),
-                                vec![rows, prefill.geometry.top_k as usize],
-                                route_weights.iter().map(|value| value.to_f32()).collect(),
-                            )?;
-                            target.trace.add(
-                                format!("{route_prefix}.moe.cpu"),
-                                vec![rows, prefill.geometry.top_k as usize],
-                                route_cpu,
-                            )?;
-                            let span = prefill
-                                .span
-                                .as_ref()
-                                .context("prefill contribution trace has no borrowed span")?;
-                            let choices = rows * prefill.geometry.top_k as usize;
-                            let values = choices * self.model_spec.hidden as usize;
-                            let mut contributions = vec![bf16::ZERO; values];
-                            // SAFETY: the live span covers this whole routed contribution prefix.
-                            unsafe {
-                                result::memcpy_dtoh_async(
-                                    &mut contributions,
-                                    span.contributions(base as u32, rows as u32)?.ptr,
-                                    self.device.stream.cu_stream(),
-                                )?;
-                            }
-                            self.device.stream.synchronize()?;
-                            target.trace.add(
-                                format!("{route_prefix}.moe.contributions"),
-                                vec![
-                                    rows,
-                                    prefill.geometry.top_k as usize,
-                                    self.model_spec.hidden as usize,
-                                ],
-                                contributions.iter().map(|value| value.to_f32()).collect(),
-                            )?;
-                        }
-                        let name = if all_layers {
-                            format!("{layer}.ffn")
-                        } else {
-                            "ffn".to_owned()
-                        };
-                        trace_value(
-                            &mut target,
-                            &self.device.stream,
-                            &name,
-                            &self.work.out,
-                            rows,
-                            self.model_spec.hidden as usize,
+                            &route_prefix,
+                            (base, rows, top_k),
+                            (
+                                prefill.gpu.host_ids.as_slice()?,
+                                prefill.gpu.host_weights.as_slice()?,
+                                &prefill.gpu.cpu_arithmetic,
+                            ),
                         )?;
-                        let name = if all_layers {
-                            layer.to_string()
-                        } else {
-                            prefill.layer_names[layer].clone()
-                        };
-                        trace_value(
-                            &mut target,
+                        let span = prefill
+                            .span
+                            .as_ref()
+                            .context("prefill contribution trace has no borrowed span")?;
+                        record_span_moe_trace(
+                            trace,
                             &self.device.stream,
-                            &name,
-                            &self.work.x,
-                            rows,
-                            self.model_spec.hidden as usize,
+                            &route_prefix,
+                            (base, rows, top_k),
+                            (span, *slot_layer >= prefill.capacity.gpu0_layers),
                         )?;
                     }
+                }
+                if any_selected && let Some(trace) = trace.as_deref_mut() {
+                    if !all_layers
+                        && selected_layer
+                        && let Some((slot_layer, _)) = &ffn
+                    {
+                        let top_k = prefill.geometry.top_k as usize;
+                        let host_ids = prefill.gpu.host_ids.as_slice()?;
+                        let host_weights = prefill.gpu.host_weights.as_slice()?;
+                        let span = prefill
+                            .span
+                            .as_ref()
+                            .context("prefill contribution trace has no borrowed span")?;
+                        let on_peer = *slot_layer >= prefill.capacity.gpu0_layers;
+                        for (wave_base, wave_rows, mixer_skip, mixer_selected, prefix) in
+                            waves.iter()
+                        {
+                            if !*mixer_selected {
+                                continue;
+                            }
+                            let row_start = wave_base + mixer_skip;
+                            let traced_rows = wave_rows - mixer_skip;
+                            let route_prefix = route_trace_prefix(false, prefix, layer, row_start);
+                            record_route_trace(
+                                trace,
+                                &route_prefix,
+                                (row_start, traced_rows, top_k),
+                                (host_ids, host_weights, &prefill.gpu.cpu_arithmetic),
+                            )?;
+                            record_span_moe_trace(
+                                trace,
+                                &self.device.stream,
+                                &route_prefix,
+                                (row_start, traced_rows, top_k),
+                                (span, on_peer),
+                            )?;
+                        }
+                    }
+                    record_wave_hidden_trace(
+                        trace,
+                        waves,
+                        (layer, self.trace_layer, all_layers),
+                        hidden,
+                        selected_layer.then_some(ffn_trace.as_slice()),
+                        &residual_trace,
+                    )?;
                 }
             }
             for (base, rows, skip, selected, prefix) in waves.iter() {
@@ -2220,6 +2765,113 @@ mod tests {
                 "non-all-layer trace wrote unselected layer {name}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn multi_wave_span_trace_concatenates_rows_without_duplicates() -> Result<()> {
+        let hidden = 4usize;
+        let top_k = 2usize;
+        let cpu_arithmetic = [false, true, false, true];
+        let mut all_trace = Trace::all_layers();
+        let all_waves = vec![(0usize, 17usize, 0usize, true, "layer".to_owned())];
+        let host_ids: Vec<i32> = (0..17 * top_k).map(|i| (i % 4) as i32).collect();
+        let host_weights: Vec<bf16> = (0..17 * top_k)
+            .map(|i| bf16::from_f32((i + 1) as f32 * 0.125))
+            .collect();
+        let ffn_all: Vec<bf16> = (0..17 * hidden)
+            .map(|i| bf16::from_f32(100.0 + i as f32))
+            .collect();
+        let residual_all: Vec<bf16> = (0..17 * hidden)
+            .map(|i| bf16::from_f32(200.0 + i as f32))
+            .collect();
+        for (base, rows) in [(0usize, 16usize), (16usize, 1usize)] {
+            let route_prefix = route_trace_prefix(true, "layer", 0, base);
+            record_route_trace(
+                &mut all_trace,
+                &route_prefix,
+                (base, rows, top_k),
+                (&host_ids, &host_weights, &cpu_arithmetic),
+            )?;
+        }
+        record_wave_hidden_trace(
+            &mut all_trace,
+            &all_waves,
+            (0, 0, true),
+            hidden,
+            Some(&ffn_all),
+            &residual_all,
+        )?;
+        assert_eq!(all_trace.shape("layer.0.wave.0.moe.ids")?, &[16, top_k]);
+        assert_eq!(all_trace.shape("layer.0.wave.16.moe.ids")?, &[1, top_k]);
+        assert_eq!(all_trace.shape("layer.0.ffn")?, &[1, 17, hidden]);
+        assert_eq!(all_trace.shape("layer.0")?, &[1, 17, hidden]);
+        assert_eq!(
+            all_trace.values("layer.0.ffn")?,
+            ffn_all
+                .iter()
+                .copied()
+                .map(bf16::to_f32)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            all_trace.values("layer.0")?,
+            residual_all
+                .iter()
+                .copied()
+                .map(bf16::to_f32)
+                .collect::<Vec<_>>()
+        );
+
+        let mut tail_trace = Trace::default();
+        let tail_waves = vec![(0usize, 32usize, 12usize, true, "prefill.0".to_owned())];
+        let tail_ids: Vec<i32> = (0..32 * top_k).map(|i| (i % 4) as i32).collect();
+        let tail_weights: Vec<bf16> = (0..32 * top_k)
+            .map(|i| bf16::from_f32((i + 1) as f32 * 0.25))
+            .collect();
+        let ffn_tail: Vec<bf16> = (0..32 * hidden)
+            .map(|i| bf16::from_f32(300.0 + i as f32))
+            .collect();
+        let residual_l0: Vec<bf16> = (0..32 * hidden)
+            .map(|i| bf16::from_f32(400.0 + i as f32))
+            .collect();
+        let residual_l3: Vec<bf16> = (0..32 * hidden)
+            .map(|i| bf16::from_f32(500.0 + i as f32))
+            .collect();
+        record_route_trace(
+            &mut tail_trace,
+            &route_trace_prefix(false, "prefill.0", 0, 12),
+            (12, 20, top_k),
+            (&tail_ids, &tail_weights, &cpu_arithmetic),
+        )?;
+        record_wave_hidden_trace(
+            &mut tail_trace,
+            &tail_waves,
+            (0, 0, false),
+            hidden,
+            Some(&ffn_tail),
+            &residual_l0,
+        )?;
+        record_wave_hidden_trace(
+            &mut tail_trace,
+            &tail_waves,
+            (3, 0, false),
+            hidden,
+            None,
+            &residual_l3,
+        )?;
+        assert_eq!(tail_trace.shape("prefill.0.moe.ids")?, &[20, top_k]);
+        assert_eq!(tail_trace.shape("prefill.0.ffn")?, &[1, 20, hidden]);
+        assert_eq!(tail_trace.shape("prefill.0.layer.0")?, &[1, 20, hidden]);
+        assert_eq!(tail_trace.shape("prefill.0.layer.3")?, &[1, 20, hidden]);
+        assert_eq!(
+            tail_trace.values("prefill.0.layer.3")?,
+            residual_l3[12 * hidden..32 * hidden]
+                .iter()
+                .copied()
+                .map(bf16::to_f32)
+                .collect::<Vec<_>>()
+        );
         Ok(())
     }
 
@@ -3808,8 +4460,7 @@ mod tests {
                                     &engine.device,
                                     &mut decode,
                                     ffn.clone(),
-                                    base,
-                                    count,
+                                    (layer as u32, base, count),
                                     qwen::matrix(
                                         &output,
                                         &engine.device.stream,

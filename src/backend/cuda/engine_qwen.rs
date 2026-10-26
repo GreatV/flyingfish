@@ -1842,7 +1842,12 @@ impl Engine {
             })
         );
         let scratch_buffer = s.alloc_zeros::<u8>(target_workspace)?;
-        let work = Work::new(s, &model_spec, rows)?;
+        let peer_tail_elems = expert_setup
+            .as_ref()
+            .map(super::moe::Setup::peer_tail_elems)
+            .transpose()?
+            .unwrap_or(0);
+        let work = Work::new_with_peer_tail(s, &model_spec, rows, peer_tail_elems)?;
         let flash = Flash::new(s.clone(), rows, model_spec.q_heads as usize)?;
         let flint_logits = if flint {
             Some(s.alloc_zeros(model_spec.vocab as usize)?)

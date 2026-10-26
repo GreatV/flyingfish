@@ -13,7 +13,7 @@ use std::cell::RefCell;
 #[path = "engine_moe_prefill.rs"]
 mod prefill;
 pub(in crate::backend::cuda::engine) use prefill::Prefill;
-pub(super) use prefill::cpu_bound;
+pub(super) use prefill::{cpu_bound, peer_prefill_bytes};
 
 #[derive(Clone)]
 struct Ticket {
@@ -99,7 +99,12 @@ struct Reader {
 }
 
 impl Reader {
-    fn new(device: &Device, disk: DiskReader, catalogue: &ExpertCatalogue) -> Result<Self> {
+    fn new(
+        device: &Device,
+        portable: bool,
+        disk: DiskReader,
+        catalogue: &ExpertCatalogue,
+    ) -> Result<Self> {
         let slots = disk.ring_slots() as usize;
         let mut reader = Self {
             disk,
@@ -108,6 +113,11 @@ impl Reader {
             copied: vec![None; slots],
         };
         device.ctx.bind_to_thread()?;
+        let flags = if portable {
+            cudarc::driver::sys::CU_MEMHOSTREGISTER_PORTABLE
+        } else {
+            0
+        };
         for _ in 0..slots {
             let slot = reader.disk.read_expert(0, 0, catalogue)?;
             let values = reader.disk.values(slot)?;
@@ -122,7 +132,7 @@ impl Reader {
                 cudarc::driver::sys::cuMemHostRegister_v2(
                     address as *mut std::ffi::c_void,
                     bytes,
-                    0,
+                    flags,
                 )
                 .result()
             }
@@ -163,6 +173,9 @@ impl Reader {
 
 impl Drop for Reader {
     fn drop(&mut self) {
+        for ticket in self.copied.iter().flatten() {
+            self.context.record_err(ticket.event.synchronize());
+        }
         self.context.record_err(self.context.synchronize());
         self.context.record_err(self.context.bind_to_thread());
         for &address in &self.registrations {
@@ -476,12 +489,24 @@ pub(super) struct Load<'a> {
     pub routed_weight: crate::model_spec::RoutedWeightBoundary,
 }
 
+struct PeerSlots {
+    gpu0_layers: u32,
+    upload: Arc<CudaStream>,
+    gate_up: CudaSlice<u64>,
+    down: CudaSlice<u64>,
+    valid: CudaSlice<u32>,
+    generation: CudaSlice<u64>,
+    synced: CudaEvent,
+    publish: CudaFunction,
+}
+
 pub(in crate::backend::cuda::engine) struct Slots {
     pub storage: super::super::super::weights::ExpertStorage,
     gate_up: CudaSlice<u64>,
     down: CudaSlice<u64>,
     valid: CudaSlice<u32>,
     generation: CudaSlice<u64>,
+    peer: Option<PeerSlots>,
     pub published: Vec<u64>,
     policy: Residency,
     catalogue: Arc<ExpertCatalogue>,
@@ -558,7 +583,12 @@ pub(super) fn delay_stream(stream: &Arc<CudaStream>) -> Result<()> {
 }
 
 impl Slots {
-    pub(super) fn load(device: &Device, geometry: ExpertGeometry, input: Load<'_>) -> Result<Self> {
+    pub(super) fn load(
+        device: &Device,
+        peer_device: Option<&Device>,
+        geometry: ExpertGeometry,
+        input: Load<'_>,
+    ) -> Result<Self> {
         let total_started = std::time::Instant::now();
         ensure!(
             input.catalogue.geometry() == geometry,
@@ -575,9 +605,17 @@ impl Slots {
             "expert setup has no measured copy engines"
         );
         let phase_started = std::time::Instant::now();
+        let has_peer = input.capacity.gpu0_layers < geometry.layers;
+        let peer_streams = if has_peer {
+            let peer = peer_device.context("multi-GPU expert capacity requires peer device")?;
+            Some((&peer.stream, &peer.upload))
+        } else {
+            None
+        };
         let mut storage = super::super::super::weights::ExpertStorage::new(
             &device.stream,
             &device.upload,
+            peer_streams,
             geometry,
             input.capacity,
         )?;
@@ -590,6 +628,7 @@ impl Slots {
         let phase_started = std::time::Instant::now();
         let disk = Reader::new(
             device,
+            has_peer,
             DiskReader::open(&input.catalogue, input.directory, input.engines.min(2))?,
             &input.catalogue,
         )?;
@@ -652,12 +691,34 @@ impl Slots {
         let events_new_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
         let phase_started = std::time::Instant::now();
         let logical = geometry.layers as usize * geometry.experts as usize;
+        let peer = if has_peer {
+            let peer = peer_device.context("multi-GPU expert capacity requires peer device")?;
+            let gate_up = peer.stream.alloc_zeros(logical)?;
+            let down = peer.stream.alloc_zeros(logical)?;
+            let valid = peer.stream.alloc_zeros(logical)?;
+            let generation = peer.stream.alloc_zeros(logical)?;
+            peer.upload.wait(&peer.stream.record_event(None)?)?;
+            Some(PeerSlots {
+                gpu0_layers: input.capacity.gpu0_layers,
+                upload: peer.upload.clone(),
+                gate_up,
+                down,
+                valid,
+                generation,
+                synced: peer.ctx.new_event(None)?,
+                publish: super::super::super::cubin::module(&peer.ctx, "moe_route")?
+                    .load_function("moe_slot_publish")?,
+            })
+        } else {
+            None
+        };
         let mut slots = Self {
             storage,
             gate_up: device.stream.alloc_zeros(logical)?,
             down: device.stream.alloc_zeros(logical)?,
             valid: device.stream.alloc_zeros(logical)?,
             generation: device.stream.alloc_zeros(logical)?,
+            peer,
             published: vec![0; logical],
             policy,
             catalogue: input.catalogue.clone(),
@@ -702,8 +763,11 @@ impl Slots {
                 if slots.policy.ledger().tier(layer, expert)? == crate::experts::plan::Tier::Gpu {
                     let slot = slots.policy.ledger().slot(layer, expert)?;
                     let generation = slots.policy.generation(layer, expert)?;
-                    let source = if slots.policy.ledger().has_full_host_backing() {
-                        MoveSource::Host(slots.policy.host_block(layer, expert)?)
+                    let block = slots.policy.host_block(layer, expert)?;
+                    let source = if slots.policy.ledger().has_full_host_backing()
+                        && block != crate::experts::runtime::NO_BLOCK
+                    {
+                        MoveSource::Host(block)
                     } else {
                         MoveSource::Disk
                     };
@@ -740,6 +804,16 @@ impl Slots {
             geometry.layers
         );
         let offset = layer * geometry.experts as usize;
+        if let Some(peer) = &self.peer
+            && layer >= peer.gpu0_layers as usize
+        {
+            return Ok(SlotBindings {
+                gate_up: view(&peer.gate_up, stream, offset, [geometry.experts], [1])?,
+                down: view(&peer.down, stream, offset, [geometry.experts], [1])?,
+                valid: view(&peer.valid, stream, offset, [geometry.experts], [1])?,
+                generation: view(&peer.generation, stream, offset, [geometry.experts], [1])?,
+            });
+        }
         Ok(SlotBindings {
             gate_up: view(&self.gate_up, stream, offset, [geometry.experts], [1])?,
             down: view(&self.down, stream, offset, [geometry.experts], [1])?,
@@ -779,25 +853,57 @@ impl Slots {
             generation,
             previous,
         )?;
-        let tables = self.bindings(layer as usize, &self.transfers.h2d)?;
-        let stream = &self.transfers.h2d;
-        // SAFETY: checked layer/expert extents and owned tables cover both scalar updates.
-        unsafe {
-            stream
-                .launch_builder(&self.publish)
-                .arg(&tables.gate_up.ptr)
-                .arg(&tables.down.ptr)
-                .arg(&tables.valid.ptr)
-                .arg(&tables.generation.ptr)
-                .arg(&(geometry.experts as i32))
-                .arg(&(expert as i32))
-                .arg(&victim.map_or(-1, |value| value as i32))
-                .arg(&pointer)
-                .arg(&down)
-                .arg(&generation)
-                .launch(super::super::super::ops::grid(1, 1))?;
+        let on_peer = self
+            .peer
+            .as_ref()
+            .is_some_and(|peer| layer >= peer.gpu0_layers);
+        if on_peer {
+            let peer = self.peer.as_ref().context("peer slots missing")?;
+            let stream = peer.upload.clone();
+            let function = peer.publish.clone();
+            let tables = self.bindings(layer as usize, &stream)?;
+            stream.context().bind_to_thread()?;
+            // SAFETY: checked layer/expert extents and owned peer tables cover both scalar updates.
+            unsafe {
+                stream
+                    .launch_builder(&function)
+                    .arg(&tables.gate_up.ptr)
+                    .arg(&tables.down.ptr)
+                    .arg(&tables.valid.ptr)
+                    .arg(&tables.generation.ptr)
+                    .arg(&(geometry.experts as i32))
+                    .arg(&(expert as i32))
+                    .arg(&victim.map_or(-1, |value| value as i32))
+                    .arg(&pointer)
+                    .arg(&down)
+                    .arg(&generation)
+                    .launch(super::super::super::ops::grid(1, 1))?;
+            }
+            let peer = self.peer.as_ref().context("peer slots missing")?;
+            peer.synced.record(&peer.upload)?;
+            self.transfers.h2d.wait(&peer.synced)?;
+            self.transfers.h2d.context().bind_to_thread()?;
+        } else {
+            let tables = self.bindings(layer as usize, &self.transfers.h2d)?;
+            let stream = &self.transfers.h2d;
+            // SAFETY: checked layer/expert extents and owned tables cover both scalar updates.
+            unsafe {
+                stream
+                    .launch_builder(&self.publish)
+                    .arg(&tables.gate_up.ptr)
+                    .arg(&tables.down.ptr)
+                    .arg(&tables.valid.ptr)
+                    .arg(&tables.generation.ptr)
+                    .arg(&(geometry.experts as i32))
+                    .arg(&(expert as i32))
+                    .arg(&victim.map_or(-1, |value| value as i32))
+                    .arg(&pointer)
+                    .arg(&down)
+                    .arg(&generation)
+                    .launch(super::super::super::ops::grid(1, 1))?;
+            }
         }
-        let event = self.events.record(stream)?;
+        let event = self.events.record(&self.transfers.h2d)?;
         self.physical[slot as usize].copy = Some(event.clone());
         self.physical[slot as usize].reader = None;
         self.physical[slot as usize].waited = false;
@@ -818,6 +924,10 @@ impl Slots {
         generation: u64,
         source: MoveSource,
     ) -> Result<()> {
+        let on_peer = self
+            .peer
+            .as_ref()
+            .is_some_and(|peer| layer >= peer.gpu0_layers);
         self.transfers.h2d.context().bind_to_thread()?;
         let (pointer, staging, ring) = match source {
             MoveSource::Host(block) => {
@@ -832,7 +942,63 @@ impl Slots {
                 let ring = disk.read(layer, expert, &self.catalogue)?;
                 let values = disk.disk.values(ring)?;
                 let pointer = values.as_ptr() as u64;
-                // SAFETY: the registered ring guard remains alive until the copy is submitted.
+                if on_peer {
+                    let peer = self.peer.as_ref().context("peer slots missing")?;
+                    peer.upload.context().bind_to_thread()?;
+                    // SAFETY: the portable registered ring guard remains alive until the copy is submitted.
+                    unsafe {
+                        cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                            self.physical[slot as usize].pointer,
+                            pointer as *const std::ffi::c_void,
+                            usize::try_from(self.catalogue.slot_bytes())?,
+                            peer.upload.cu_stream(),
+                        )
+                        .result()
+                    }
+                    .context("copy native disk expert into its peer physical slot")?;
+                    peer.synced.record(&peer.upload)?;
+                    self.transfers.h2d.wait(&peer.synced)?;
+                    self.transfers.h2d.context().bind_to_thread()?;
+                } else {
+                    // SAFETY: the registered ring guard remains alive until the copy is submitted.
+                    unsafe {
+                        cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                            self.physical[slot as usize].pointer,
+                            pointer as *const std::ffi::c_void,
+                            usize::try_from(self.catalogue.slot_bytes())?,
+                            self.transfers.h2d.cu_stream(),
+                        )
+                        .result()
+                    }
+                    .context("copy native disk expert into its physical slot")?;
+                }
+                let copy = self.events.record(&self.transfers.h2d)?;
+                values.copied(copy.id)?;
+                disk.copied[ring as usize] = Some(copy);
+                (pointer, None, Some(ring))
+            }
+        };
+        if ring.is_none() {
+            if on_peer {
+                let peer = self.peer.as_ref().context("peer slots missing")?;
+                peer.upload.context().bind_to_thread()?;
+                // SAFETY: the source remains claimed or staged through the recorded copy.
+                unsafe {
+                    cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                        self.physical[slot as usize].pointer,
+                        pointer as *const std::ffi::c_void,
+                        usize::try_from(self.catalogue.slot_bytes())?,
+                        peer.upload.cu_stream(),
+                    )
+                    .result()
+                }
+                .context("copy native host expert into its peer physical slot")?;
+                peer.synced.record(&peer.upload)?;
+                self.transfers.h2d.wait(&peer.synced)?;
+                self.transfers.h2d.context().bind_to_thread()?;
+            } else {
+                self.transfers.h2d.context().bind_to_thread()?;
+                // SAFETY: the pinned source remains claimed or staged through the recorded copy.
                 unsafe {
                     cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
                         self.physical[slot as usize].pointer,
@@ -842,26 +1008,8 @@ impl Slots {
                     )
                     .result()
                 }
-                .context("copy native disk expert into its physical slot")?;
-                let copy = self.events.record(&self.transfers.h2d)?;
-                values.copied(copy.id)?;
-                disk.copied[ring as usize] = Some(copy);
-                (pointer, None, Some(ring))
+                .context("copy native host expert into its physical slot")?;
             }
-        };
-        if ring.is_none() {
-            self.transfers.h2d.context().bind_to_thread()?;
-            // SAFETY: the pinned source remains claimed or staged through the recorded copy.
-            unsafe {
-                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
-                    self.physical[slot as usize].pointer,
-                    pointer as *const std::ffi::c_void,
-                    usize::try_from(self.catalogue.slot_bytes())?,
-                    self.transfers.h2d.cu_stream(),
-                )
-                .result()
-            }
-            .context("copy native host expert into its physical slot")?;
         }
         let event = self.publish(layer, expert, victim, slot, generation)?;
         if let MoveSource::Host(block) = source {
@@ -1111,7 +1259,7 @@ impl Slots {
         x: Tensor<bf16, 2>,
         y: &mut TensorMut<bf16, 2>,
     ) -> Result<()> {
-        decode.route(device, &ffn, x)?;
+        decode.route(device, layer as usize, &ffn, x)?;
         self.complete(device, decode, layer, ffn, (x, y), None)
     }
 
@@ -1131,6 +1279,35 @@ impl Slots {
         Ok(())
     }
 
+    pub(super) fn record_peer_readers(&mut self, device: &Device) -> Result<()> {
+        let Some(peer) = &self.peer else {
+            return Ok(());
+        };
+        let geometry = self.catalogue.geometry();
+        let peer_slots = geometry
+            .layers
+            .saturating_sub(peer.gpu0_layers)
+            .checked_mul(geometry.experts)
+            .context("peer slot count overflow")?;
+        if peer_slots == 0 {
+            return Ok(());
+        }
+        ensure!(
+            (peer_slots as usize) <= self.physical.len(),
+            "peer slots={peer_slots} exceed physical slots={}",
+            self.physical.len()
+        );
+        self.readers.clear();
+        self.readers.extend(0..peer_slots);
+        let event = self.events.record(&device.stream)?;
+        self.policy.record_readers(&self.readers, event.id)?;
+        for physical in &mut self.physical[..peer_slots as usize] {
+            physical.waited = true;
+            physical.reader = Some(event.clone());
+        }
+        Ok(())
+    }
+
     pub(super) fn run_graph(
         &mut self,
         device: &Device,
@@ -1140,7 +1317,7 @@ impl Slots {
         ffn: BoundFfn,
         activation: (Tensor<bf16, 2>, &mut TensorMut<bf16, 2>),
     ) -> Result<()> {
-        decode.read_route(device, &ffn, activation.0)?;
+        decode.read_route(device, layer as usize, &ffn, activation.0)?;
         self.complete(device, decode, layer, ffn, activation, Some(graph_layer))
     }
 
@@ -1154,7 +1331,7 @@ impl Slots {
         graph: Option<usize>,
     ) -> Result<()> {
         self.prepare_routes(device, layer, decode)?;
-        let bindings = self.bindings(layer as usize, &device.stream)?;
+        let bindings = self.bindings(layer as usize, decode.slot_stream(device, layer as usize))?;
         let dispatch = self.policy.dispatch(layer, &self.routes)?;
         ensure!(
             dispatch.host_experts == self.host_experts,
