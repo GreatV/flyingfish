@@ -164,6 +164,8 @@ impl ExpertLayout {
                 let down = up.end..weight.checked_mul(3).context("FP8 down extent overflow")?;
                 let scale_bytes =
                     block_scale.scale_bytes(intermediate as u32, hidden as u32)? as u64;
+                let down_scale_bytes =
+                    block_scale.scale_bytes(hidden as u32, intermediate as u32)? as u64;
                 let gate_scale = down.end
                     ..down
                         .end
@@ -177,7 +179,7 @@ impl ExpertLayout {
                 let down_scale = up_scale.end
                     ..up_scale
                         .end
-                        .checked_add(scale_bytes)
+                        .checked_add(down_scale_bytes)
                         .context("FP8 down scale extent overflow")?;
                 ensure!(
                     down_scale.end.is_multiple_of(16),
@@ -845,14 +847,14 @@ mod tests {
 
     #[test]
     fn block_scale_ranges_match_native_layout() -> Result<()> {
-        let geometry = ExpertGeometry {
+        let square_geometry = ExpertGeometry {
             hidden: 256,
             intermediate: 256,
             ..geometry()
         };
         let catalogue = ExpertCatalogue::from_manifest(
             &block_manifest(),
-            geometry,
+            square_geometry,
             ExpertFormat::Fp8W8a16Block {
                 block: [128, 128],
                 scale_dtype: safetensors::Dtype::F32,
@@ -884,17 +886,52 @@ mod tests {
                 block: [32, 32],
                 scale_dtype: safetensors::Dtype::F8_E8M0,
             },
-            &geometry,
+            &square_geometry,
         )?;
         assert_eq!(e8m0.slot_bytes(), 196_800);
         let e8m0_scale = &e8m0.fp8_slot().unwrap().down_scale;
         assert_eq!(e8m0_scale.end - e8m0_scale.start, 64);
+        let mut non_square_manifest = block_manifest();
+        for (name, entry) in non_square_manifest.entries.iter_mut() {
+            let down = name.contains("down_proj");
+            if name.ends_with("weight_scale_inv") {
+                entry.shape = if down { vec![8, 1] } else { vec![1, 4] };
+                entry.bytes = if down { 32 } else { 16 };
+            } else if name.ends_with("weight") {
+                entry.shape = if down {
+                    vec![1024, 128]
+                } else {
+                    vec![128, 1024]
+                };
+                entry.bytes = 131_072;
+            }
+            entry.data_offsets[1] = entry.data_offsets[0] + entry.bytes as u64;
+        }
+        let non_square_catalogue = ExpertCatalogue::from_manifest(
+            &non_square_manifest,
+            ExpertGeometry {
+                hidden: 1024,
+                intermediate: 128,
+                ..square_geometry
+            },
+            ExpertFormat::Fp8W8a16Block {
+                block: [128, 256],
+                scale_dtype: safetensors::Dtype::F32,
+            },
+        )?;
+        assert_eq!(non_square_catalogue.slot_bytes(), 393_280);
+        let ExpertRange::Fp8 { down_scale, .. } = non_square_catalogue.range(0, 1)? else {
+            bail!("FP8 range expected");
+        };
+        assert_eq!(down_scale.len, 32);
+        let read_end = down_scale.offset + 32;
+        assert!(read_end <= non_square_catalogue.slot_bytes());
         let mut bad = block_manifest();
         let name = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv";
         bad.entries.get_mut(name).unwrap().dtype = safetensors::Dtype::BF16;
         let error = ExpertCatalogue::from_manifest(
             &bad,
-            geometry,
+            square_geometry,
             ExpertFormat::Fp8W8a16Block {
                 block: [128, 128],
                 scale_dtype: safetensors::Dtype::F32,
