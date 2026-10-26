@@ -32,7 +32,7 @@ pub(crate) fn take_phase_log() -> Vec<&'static str> {
 
 use super::contracts::{RowDomain, Scratch, SeqRef, Tensor, TensorMut};
 use super::cubin;
-use super::ops::GdnGateBindings;
+use super::ops::{GatedRmsInput, GdnGateBindings};
 use crate::gdn_plan::{
     CW_P2_CHUNK, CW_P2_MAX_GROUPS, CW_P2_VALUE_BLOCK, GdnPolicy, GdnWorkspace, Region, add, cw_p2,
     mul,
@@ -87,6 +87,7 @@ pub(crate) struct GdnBindings {
 }
 
 struct Kernels {
+    step: Option<CudaFunction>,
     gate: CudaFunction,
     conv: CudaFunction,
     conv_l2: Option<[CudaFunction; 2]>,
@@ -527,6 +528,11 @@ impl GdnOps {
             })
         };
         let kernels = Kernels {
+            step: if spec.hv == 32 {
+                Some(module("gdn_rstep")?.load_function("gdn_step_fused")?)
+            } else {
+                None
+            },
             gate: cubin::module(ctx, "q38_common")?.load_function(spec.gate_kernel()?)?,
             hist_snapshot,
             core_snapshot,
@@ -582,6 +588,12 @@ impl GdnOps {
             .into_iter()
             .chain(rstep_function)
             .chain(p2_functions)
+            .chain(
+                kernels
+                    .step
+                    .iter()
+                    .map(|f| ("fused step", f, CORE_THREADS, 0)),
+            )
         {
             ensure!(
                 threads <= max_threads && u64::from(shared) <= optin,
@@ -651,6 +663,104 @@ impl GdnOps {
             p2_h_cfg: cw_p2_grids(max_rows, spec.hv).1,
             cw_p2,
         })
+    }
+
+    pub(crate) fn run_step(
+        plan: &GdnPlan,
+        stream: &Arc<CudaStream>,
+        meta: SeqRef,
+        phase: ExecutionPhase,
+        scratch: Scratch,
+        verify: bool,
+        gated: Option<&GatedRmsInput>,
+    ) -> Result<bool> {
+        if plan.spec.hv != 32
+            || plan.snapshots.is_some()
+            || (phase != ExecutionPhase::Decode && !verify)
+        {
+            if verify {
+                Self::run_verify(plan, stream, meta, scratch)?;
+            } else {
+                Self::run(plan, stream, meta, phase, scratch)?;
+            }
+            return Ok(false);
+        }
+        meta.validate()?;
+        scratch.validate(plan.ws.bytes)?;
+        ensure!(
+            !plan.cw_p2 && (1..=16).contains(&plan.max_rows),
+            "fused GDN step requires recurrent rows 1..16"
+        );
+        ensure!(
+            phase != ExecutionPhase::Decode || plan.max_rows == 1,
+            "fused GDN decode requires one row"
+        );
+        let b = &plan.bindings;
+        let (norm, gate) = if let Some(input) = gated {
+            input.x.validate()?;
+            input.weight.validate()?;
+            input.gate.validate()?;
+            ensure!(
+                input.x.ptr == b.core_out.0.ptr
+                    && input.x.shape == b.core_out.0.shape
+                    && input.x.stride == b.core_out.0.stride
+                    && input.gate.shape == input.x.shape
+                    && input.gate.stride == input.x.stride
+                    && input.weight.shape == [DV]
+                    && input.weight.stride == [1],
+                "fused GDN gated norm layout mismatch"
+            );
+            (input.weight.ptr, input.gate.ptr)
+        } else {
+            (0, 0)
+        };
+        let conv = scratch.ptr + plan.ws.conv_out.offset;
+        let kernel = plan
+            .kernels
+            .step
+            .as_ref()
+            .context("fused GDN step not bound")?;
+        unsafe {
+            stream
+                .launch_builder(&plan.conv)
+                .arg(&b.qkv.ptr)
+                .arg(&b.conv_weight.ptr)
+                .arg(&b.history.0.ptr)
+                .arg(&conv)
+                .arg(&meta.ptr)
+                .arg(&(plan.conv_dim as i32))
+                .launch(plan.conv_cfg)?;
+            stream
+                .launch_builder(&plan.kernels.hist_update)
+                .arg(&b.qkv.ptr)
+                .arg(&b.history.0.ptr)
+                .arg(&meta.ptr)
+                .arg(&(plan.conv_dim as i32))
+                .launch(plan.hist_cfg)?;
+            stream
+                .launch_builder(kernel)
+                .arg(&conv)
+                .arg(&b.a.ptr)
+                .arg(&b.b.ptr)
+                .arg(&b.a_log.ptr)
+                .arg(&b.dt_bias.ptr)
+                .arg(&b.s.0.ptr)
+                .arg(&b.core_out.0.ptr)
+                .arg(&norm)
+                .arg(&gate)
+                .arg(&meta.ptr)
+                .arg(&(plan.max_rows as i32))
+                .arg(&b.a.stride[0])
+                .arg(&b.b.stride[0])
+                .arg(&plan.spec.l2_eps)
+                .arg(&plan.spec.rms_eps)
+                .launch(LaunchConfig {
+                    grid_dim: (1, plan.spec.hv, 1),
+                    block_dim: (CORE_THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(gated.is_some())
     }
 
     /// Issues the whole mixer on ONE stream, in the ABI §6 order.
@@ -2047,6 +2157,167 @@ mod tests {
         Ok(())
     }
 
+    fn fused_step_identity(device: &crate::backend::cuda::Device, spec: GdnSpec) -> Result<()> {
+        use super::super::ops::CommonOpsRef;
+        use cudarc::driver::sys;
+        let stream = &device.stream;
+        let common = CommonOpsRef::new(&device.ctx)?;
+        let mut defects = 0;
+        let mut cells = 0;
+        let mut previous = Vec::<f32>::new();
+        for (rows, valid) in (1..=16).map(|r| (r, r)).chain([(16, 5)]) {
+            for gated in [false, true] {
+                let mut expected: Option<(Vec<u16>, Vec<u32>)> = None;
+                for (fused, graph) in [(false, false), (true, false), (true, true)] {
+                    let buffers = GeometryBuffers::new(stream, spec, rows, valid)?;
+                    let norm = stream.clone_htod(
+                        &(0..128)
+                            .map(|i| bf16::from_f32(0.5 + (i % 113) as f32 / 128.0))
+                            .collect::<Vec<_>>(),
+                    )?;
+                    let z = stream.clone_htod(
+                        &(0..rows * spec.hv * 128)
+                            .map(|i| bf16::from_f32(((i * 17 % 263) as f32 - 131.0) / 64.0))
+                            .collect::<Vec<_>>(),
+                    )?;
+                    let plan = GdnOps::prepare(
+                        &device.ctx,
+                        &spec,
+                        rows,
+                        buffers.bindings(stream, spec, rows, 0)?,
+                        false,
+                    )?;
+                    let metadata = geometry_meta(stream, 23, valid)?;
+                    let meta = SeqRef {
+                        ptr: metadata.device_ptr(stream).0,
+                    };
+                    let workspace = stream.alloc_zeros::<u8>(plan.ws.bytes as usize)?;
+                    let scratch = || Scratch {
+                        ptr: workspace.device_ptr(stream).0,
+                        bytes: plan.ws.bytes,
+                    };
+                    let input = || -> Result<GatedRmsInput> {
+                        Ok(GatedRmsInput {
+                            x: plan.bindings.core_out.read(),
+                            weight: geometry_view(&norm, stream, [128], [1], 0)?,
+                            gate: geometry_view(
+                                &z,
+                                stream,
+                                [rows, spec.hv, 128],
+                                [u64::from(spec.hv * 128), 128, 1],
+                                0,
+                            )?,
+                        })
+                    };
+                    device.finish_upload()?;
+                    let execute = || -> Result<()> {
+                        let phase = if rows == 1 {
+                            ExecutionPhase::Decode
+                        } else {
+                            ExecutionPhase::Prefill
+                        };
+                        if fused {
+                            let norm_input = input()?;
+                            ensure!(
+                                GdnOps::run_step(
+                                    &plan,
+                                    stream,
+                                    meta,
+                                    phase,
+                                    scratch(),
+                                    rows != 1,
+                                    gated.then_some(&norm_input)
+                                )? == gated,
+                                "fused norm dispatch missing"
+                            );
+                        } else {
+                            GdnOps::run_core(&plan, stream, meta, phase, scratch(), rows != 1)?;
+                            if gated {
+                                common.norm.rms_gated(
+                                    stream,
+                                    RowDomain {
+                                        meta,
+                                        row_base: 0,
+                                        row_capacity: rows,
+                                    },
+                                    input()?,
+                                    &mut TensorMut(plan.bindings.core_out.read()),
+                                    spec.rms_eps,
+                                )?;
+                            }
+                        }
+                        Ok(())
+                    };
+                    if graph {
+                        stream.begin_capture(
+                            sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                        )?;
+                        let result = execute();
+                        let capture = stream.end_capture(sys::CUgraphInstantiate_flags(0));
+                        result?;
+                        capture?.context("empty fused GDN graph")?.launch()?;
+                    } else {
+                        execute()?;
+                    }
+                    stream.synchronize()?;
+                    let raw = stream.clone_dtoh(&buffers.out)?;
+                    ensure!(
+                        raw[..(valid * spec.hv * 128) as usize]
+                            .iter()
+                            .all(|v| v.is_finite()),
+                        "nonfinite fused GDN output"
+                    );
+                    let output = raw.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                    let state = stream.clone_dtoh(&buffers.state)?;
+                    let history = stream.clone_dtoh(&buffers.history)?;
+                    ensure!(
+                        state.iter().chain(&history).all(|v| v.is_finite()),
+                        "nonfinite fused GDN state/history"
+                    );
+                    let bits = state
+                        .iter()
+                        .chain(&history)
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>();
+                    if let Some((ref out, ref persistent)) = expected {
+                        let mismatches = output.iter().zip(out).filter(|(a, b)| a != b).count()
+                            + bits.iter().zip(persistent).filter(|(a, b)| a != b).count();
+                        defects += usize::from(mismatches != 0);
+                        cells += 1;
+                        println!(
+                            "{} GDN_FUSED_IDENTITY rows={rows} valid={valid} gated={gated} graph={graph} output_state_history_bit_mismatches={mismatches}",
+                            if mismatches == 0 { "PASS" } else { "DEFECT" }
+                        );
+                    } else {
+                        expected = Some((output, bits));
+                        if !gated && valid == rows {
+                            if rows == 16 {
+                                let mismatches = state
+                                    .iter()
+                                    .zip(&previous)
+                                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                                    .count();
+                                ensure!(mismatches > 0, "wrong accepted-row control escaped");
+                                println!(
+                                    "PASS GDN_FUSED_CONTROL accepted_rows=15 expected=16 state_bit_mismatches={mismatches}"
+                                );
+                            }
+                            previous = state;
+                        }
+                    }
+                }
+            }
+        }
+        println!(
+            "GDN_FUSED_SUMMARY cells={cells} defects={defects} byte_identity=true control=wrong_accepted_row"
+        );
+        ensure!(
+            defects == 0,
+            "DEFECT fused GDN byte identity cases={defects}"
+        );
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires an exclusive CUDA window"]
     fn mixer_smoke_gpu() -> Result<()> {
@@ -2063,6 +2334,7 @@ mod tests {
             &root,
             &serde_json::json!({"eos_token_id": [248044, 248046]}),
         )?;
+        fused_step_identity(&device, GdnSpec::from_model(&model)?)?;
         let qwen_root = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/data/q38-config.json"
