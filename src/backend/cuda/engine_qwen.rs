@@ -1216,7 +1216,15 @@ impl Engine {
                 let plan = replay
                     .get(committed - 1)
                     .context("GDN replay plan missing")?;
-                GdnOps::run_verify(plan, s, meta, scratch(&q.scratch, s))?;
+                GdnOps::run_step(
+                    plan,
+                    s,
+                    meta,
+                    ExecutionPhase::Prefill,
+                    scratch(&q.scratch, s),
+                    true,
+                    None,
+                )?;
             }
         }
         Ok(())
@@ -2921,22 +2929,28 @@ impl Engine {
                         ExecutionPhase::Decode => decode.as_ref(),
                     }
                 };
-                if self.qwen_device_prefix {
-                    GdnOps::run_verify(plan, s, meta, scratch(&q.scratch, s))?;
-                } else {
-                    GdnOps::run(plan, s, meta, phase, scratch(&q.scratch, s))?;
-                }
-                q.common.norm.rms_gated(
+                let gated = GatedRmsInput {
+                    x: heads(&w.attn, s, 0, rows, spec.hv, spec.dv)?,
+                    weight: *norm,
+                    gate: heads(&mw.gate, s, 0, rows, spec.hv, spec.dv)?,
+                };
+                if !GdnOps::run_step(
+                    plan,
                     s,
-                    domain,
-                    GatedRmsInput {
-                        x: heads(&w.attn, s, 0, rows, spec.hv, spec.dv)?,
-                        weight: *norm,
-                        gate: heads(&mw.gate, s, 0, rows, spec.hv, spec.dv)?,
-                    },
-                    &mut TensorMut(heads(&w.attn, s, 0, rows, spec.hv, spec.dv)?),
-                    spec.rms_eps,
-                )?;
+                    meta,
+                    phase,
+                    scratch(&q.scratch, s),
+                    self.qwen_device_prefix,
+                    Some(&gated),
+                )? {
+                    q.common.norm.rms_gated(
+                        s,
+                        domain,
+                        gated,
+                        &mut TensorMut(heads(&w.attn, s, 0, rows, spec.hv, spec.dv)?),
+                        spec.rms_eps,
+                    )?;
+                }
                 layer.linear.run(
                     &self.blas,
                     "linear_attn.out_proj.weight",

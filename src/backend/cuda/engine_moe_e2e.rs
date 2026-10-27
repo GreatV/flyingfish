@@ -2933,15 +2933,20 @@ fn chain_decode_timing(cases: &[&str], runs: usize, margins: bool) -> Result<()>
         + 256
         + crate::linear_plan::MAX_SKINNY_ROWS)
         .next_multiple_of(32);
+    let identity_output = if margins {
+        std::env::var_os("FF_Q38_PROBE_DIR").map(PathBuf::from)
+    } else {
+        None
+    };
+    if let Some(path) = &identity_output {
+        std::fs::create_dir_all(path)?;
+        Engine::calibrate(&target, 0, capacity, None, settings.clone())?;
+    }
     let setup = Instant::now();
     let mut model = Engine::load(&target, 0, capacity, None, settings)?;
     let setup_seconds = setup.elapsed().as_secs_f64();
     let eos = model.model_spec.eos.clone();
     let with_draft = model.spec.is_some();
-    ensure!(
-        !margins || !with_draft,
-        "swap identity requires plain decode"
-    );
     if with_draft {
         model.set_spec_graph(graph)?;
         model.set_spec_eos(&eos)?;
@@ -3007,11 +3012,32 @@ fn chain_decode_timing(cases: &[&str], runs: usize, margins: bool) -> Result<()>
                 top2_margins.push(margin(&mut model)?);
             }
             let mut rounds = Vec::new();
+            let snapshot = |model: &mut Engine, step: usize| -> Result<()> {
+                if let Some(path) = &identity_output {
+                    std::fs::write(
+                        path.join(format!("{case}-{run}-{step}.state")),
+                        chain_state(model)?,
+                    )?;
+                    let logits = model.decode_logits()?;
+                    ensure!(
+                        logits.iter().all(|x| x.is_finite()),
+                        "nonfinite identity logits"
+                    );
+                    let bytes: Vec<_> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    std::fs::write(path.join(format!("{case}-{run}-{step}.logits")), bytes)?;
+                }
+                Ok(())
+            };
+            snapshot(&mut model, 0)?;
+            let mut steps = 0;
             let range = super::super::super::profile::Range::new(run > 0, c"minicpm_chain_decode");
             let timer = Instant::now();
             while ids.len() < 256 && !eos.contains(ids.last().context("timing output missing")?) {
                 if with_draft {
                     let round = model.spec_round(256 - ids.len(), None, "timing")?;
+                    if margins {
+                        top2_margins.push(margin(&mut model)?);
+                    }
                     ids.extend(&round.output);
                     rounds.push(round);
                 } else {
@@ -3020,10 +3046,15 @@ fn chain_decode_timing(cases: &[&str], runs: usize, margins: bool) -> Result<()>
                         top2_margins.push(margin(&mut model)?);
                     }
                 }
+                steps += 1;
+                if steps <= 2 {
+                    snapshot(&mut model, steps)?;
+                }
             }
             model.synchronize()?;
             let seconds = timer.elapsed().as_secs_f64();
             drop(range);
+            snapshot(&mut model, steps)?;
             model.check_logits()?;
             ensure!(
                 seconds.is_finite() && seconds > 0.0,
@@ -3031,7 +3062,13 @@ fn chain_decode_timing(cases: &[&str], runs: usize, margins: bool) -> Result<()>
             );
             let same = expected.as_ref().is_none_or(|expected| *expected == ids);
             ensure!(
-                !margins || top2_margins.len() == ids.len(),
+                !margins
+                    || top2_margins.len()
+                        == if with_draft {
+                            rounds.len() + 1
+                        } else {
+                            ids.len()
+                        },
                 "swap identity margin extent"
             );
             let decode_tokens = ids.len() - 1;
@@ -3048,7 +3085,8 @@ fn chain_decode_timing(cases: &[&str], runs: usize, margins: bool) -> Result<()>
                     "graph":graph,"seconds":seconds,"prefill_seconds":prefill_seconds,
                     "tokens":ids.len(),"ids":ids,"rounds":rounds,"k_histogram":k_histogram,
                     "decode_tokens":decode_tokens,"ms_per_token":ms_per_token,
-                    "margin_collection":margins,"top2_margins":top2_margins})
+                    "margin_collection":margins,"top2_margins":top2_margins,
+                    "margin_scope":if with_draft {"last_logits_per_round"} else {"per_output"}})
             );
             if expected.is_none() {
                 expected = Some(ids);
