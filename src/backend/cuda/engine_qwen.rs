@@ -1983,7 +1983,7 @@ impl Engine {
         let (prefill_backend, decode_backend) = if flint {
             ("FA2 d128 sliding/full", "flash decode d128")
         } else {
-            ("FA2 d256", "TCMQA d256")
+            ("native Rust d256", "TCMQA d256")
         };
         if flint {
             let elements = (512 + rows)
