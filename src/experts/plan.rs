@@ -92,6 +92,28 @@ impl ServiceTable {
         Ok(best.map(|(_, workers)| workers).expect("best is set"))
     }
 
+    pub fn ensure_decode_worker_nondegrading(&self, top_k: u32) -> Result<()> {
+        ensure!(top_k > 0, "zero expert top-k");
+        let chosen = self.worker_count()?;
+        let candidates: std::collections::BTreeSet<u32> = self
+            .cells
+            .iter()
+            .filter(|cell| cell.rows == 1 && cell.workers <= chosen)
+            .map(|cell| cell.workers)
+            .collect();
+        for experts in 1..=top_k {
+            let chosen_seconds = self.seconds(1, experts, chosen)?;
+            for workers in &candidates {
+                let candidate_seconds = self.seconds(1, experts, *workers)?;
+                ensure!(
+                    chosen_seconds <= candidate_seconds,
+                    "chosen decode service workers={chosen} experts={experts} seconds={chosen_seconds} is slower than workers={workers} seconds={candidate_seconds}"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Largest measured row count.
     pub fn max_rows(&self) -> u32 {
         self.cells.iter().map(|cell| cell.rows).max().unwrap_or(0)
@@ -605,6 +627,9 @@ pub fn capacity_with_peer(
     peer: Option<PeerInputs<'_>>,
 ) -> Result<Capacity> {
     let geometry = inputs.geometry;
+    inputs
+        .service
+        .ensure_decode_worker_nondegrading(geometry.top_k)?;
     ensure!(inputs.span_rows > 0, "zero span rows");
     ensure!(
         inputs.wave_rows > 0 && inputs.wave_rows <= inputs.span_rows,
@@ -1769,6 +1794,20 @@ mod tests {
         assert_eq!(table.seconds(1, 2, 1).unwrap(), 0.4);
         assert!((table.seconds(1, 3, 1).unwrap_err().to_string()).contains("no bracketing cell"));
         assert_eq!(table.worker_count().unwrap(), 2);
+        table.ensure_decode_worker_nondegrading(2).unwrap();
+        let mut degrading = Vec::new();
+        for (workers, experts, seconds) in
+            [(1u32, 1u32, 0.1), (1, 2, 0.4), (2, 1, 0.2), (2, 2, 0.2)]
+        {
+            degrading.push(ServiceCell {
+                workers,
+                rows: 1,
+                experts,
+                seconds,
+            });
+        }
+        let degrading = ServiceTable::new("degrading", degrading).unwrap();
+        assert!(degrading.ensure_decode_worker_nondegrading(2).is_err());
         assert!(
             ServiceTable::new(
                 "x",
@@ -1974,12 +2013,20 @@ mod tests {
         assert_eq!(fp8_slot, 3_151_872);
         let a4000_service = ServiceTable::new(
             "a4000-7950x",
-            vec![ServiceCell {
-                workers: 8,
-                rows: 1,
-                experts: 1,
-                seconds: 0.00025,
-            }],
+            vec![
+                ServiceCell {
+                    workers: 8,
+                    rows: 1,
+                    experts: 1,
+                    seconds: 0.00025,
+                },
+                ServiceCell {
+                    workers: 8,
+                    rows: 1,
+                    experts: 8,
+                    seconds: 0.002,
+                },
+            ],
         )
         .unwrap();
         let a4000_inputs = PlanInputs {
@@ -2067,12 +2114,20 @@ mod tests {
         let fp8_slot = layout.slot_bytes();
         let service = ServiceTable::new(
             "a4000-7950x",
-            vec![ServiceCell {
-                workers: 8,
-                rows: 1,
-                experts: 1,
-                seconds: 0.00025,
-            }],
+            vec![
+                ServiceCell {
+                    workers: 8,
+                    rows: 1,
+                    experts: 1,
+                    seconds: 0.00025,
+                },
+                ServiceCell {
+                    workers: 8,
+                    rows: 1,
+                    experts: 8,
+                    seconds: 0.002,
+                },
+            ],
         )
         .unwrap();
         let inputs = PlanInputs {

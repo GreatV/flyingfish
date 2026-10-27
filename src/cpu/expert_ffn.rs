@@ -1551,6 +1551,7 @@ struct PoolShared {
     boundaries: ExpertBoundaries,
     generation: AtomicU64,
     pending: AtomicBool,
+    prewake: AtomicBool,
     shutdown: AtomicBool,
     phase1: AtomicUsize,
     finished: AtomicUsize,
@@ -1755,6 +1756,7 @@ impl ExpertPool {
             boundaries,
             generation: AtomicU64::new(0),
             pending: AtomicBool::new(false),
+            prewake: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             phase1: AtomicUsize::new(0),
             finished: AtomicUsize::new(0),
@@ -1822,6 +1824,38 @@ impl ExpertPool {
 
     pub fn isa(&self) -> Isa {
         self.isa
+    }
+
+    pub fn prewake(&self) -> Result<()> {
+        ensure!(
+            !self.shared.shutdown.load(Ordering::Acquire),
+            "expert pool worker synchronization failed"
+        );
+        ensure!(
+            !self.shared.pending.load(Ordering::Acquire),
+            "expert pool job is already pending"
+        );
+        let guard = self
+            .shared
+            .park
+            .lock()
+            .map_err(|_| anyhow::anyhow!("expert pool prewake mutex poisoned"))?;
+        self.shared.prewake.store(true, Ordering::Release);
+        drop(guard);
+        self.shared.wake.notify_all();
+        Ok(())
+    }
+
+    pub fn stop_prewake(&self) -> Result<()> {
+        let guard = self
+            .shared
+            .park
+            .lock()
+            .map_err(|_| anyhow::anyhow!("expert pool prewake mutex poisoned"))?;
+        self.shared.prewake.store(false, Ordering::Release);
+        drop(guard);
+        self.shared.wake.notify_all();
+        Ok(())
     }
 
     /// Publishes a job; the guard holds the output and the lease until finish or drop.
@@ -1941,6 +1975,7 @@ impl ExpertPool {
             }
         }
         *error = None;
+        self.shared.prewake.store(false, Ordering::Release);
         self.shared.phase1.store(0, Ordering::Release);
         self.shared.finished.store(0, Ordering::Release);
         self.shared.failed.store(false, Ordering::Release);
@@ -2148,12 +2183,18 @@ fn worker(
                     std::hint::spin_loop();
                     continue;
                 }
+                if shared.prewake.load(Ordering::Acquire) {
+                    spins = 0;
+                    std::hint::spin_loop();
+                    continue;
+                }
                 let mut guard = shared
                     .park
                     .lock()
                     .map_err(|_| anyhow::anyhow!("expert worker park mutex poisoned"))?;
                 while shared.generation.load(Ordering::Acquire) == seen
                     && !shared.shutdown.load(Ordering::Acquire)
+                    && !shared.prewake.load(Ordering::Acquire)
                 {
                     guard = shared
                         .wake
@@ -3643,7 +3684,7 @@ mod tests {
             let mut scratch = Scratch::new(&shape);
             let rows = 8usize;
             let hidden: Vec<bf16> = (0..rows * shape.hidden).map(|k| pattern(k, 0.7)).collect();
-            for experts_used in [1usize, 2, 5, 8] {
+            for experts_used in 1usize..=8 {
                 let mut assignments = Vec::new();
                 for row in 0..rows {
                     for choice in 0..8 {
@@ -3678,7 +3719,7 @@ mod tests {
                         &mut scratch,
                     )?;
                 }
-                for workers in [1usize, 2, 4, 8] {
+                for workers in [1usize, 2, 4, 8, 24] {
                     let pool = ExpertPool::new(workers, shape, rows, assignments.len(), None)?;
                     let mut out = vec![bf16::ZERO; assignments.len() * shape.hidden];
                     pool.run(Job {
@@ -3782,6 +3823,46 @@ mod tests {
             assignments: &fixture.assignments,
             out,
         }
+    }
+
+    #[test]
+    fn prewake_is_consumed_by_publish_and_stop() -> Result<()> {
+        let fixture = pool_fixture()?;
+        let pool = ExpertPool::new(24, fixture.shape, 2, fixture.assignments.len(), None)?;
+        let expected = expected_output(&fixture)?;
+        let mut normal = vec![bf16::ZERO; expected.len()];
+        pool.run(fixture_job(&fixture, &mut normal))?;
+        assert_eq!(normal, expected);
+
+        pool.prewake()?;
+        assert!(
+            pool.shared
+                .prewake
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        let mut prewoken = vec![bf16::ZERO; expected.len()];
+        let pending = pool.submit(fixture_job(&fixture, &mut prewoken))?;
+        assert!(
+            !pool
+                .shared
+                .prewake
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        pool.finish(pending)?;
+        assert_eq!(prewoken, expected);
+
+        pool.prewake()?;
+        pool.stop_prewake()?;
+        assert!(
+            !pool
+                .shared
+                .prewake
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        let mut stopped = vec![bf16::ZERO; expected.len()];
+        pool.run(fixture_job(&fixture, &mut stopped))?;
+        assert_eq!(stopped, expected);
+        Ok(())
     }
 
     #[test]
@@ -4335,7 +4416,7 @@ mod tests {
                     )?;
                 }
 
-                for workers in [1usize, 4] {
+                for workers in [1usize, 4, 24] {
                     let bf16_pool = ExpertPool::new(workers, shape, rows, assignments.len(), None)?;
                     let mut out_bf16 = vec![bf16::ZERO; expected_bf16.len()];
                     bf16_pool.run(Job {

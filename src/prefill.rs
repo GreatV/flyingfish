@@ -1081,6 +1081,12 @@ mod admission_tests {
                 },
                 crate::experts::plan::ServiceCell {
                     workers: 1,
+                    rows: 1,
+                    experts: 2,
+                    seconds: 0.002,
+                },
+                crate::experts::plan::ServiceCell {
+                    workers: 1,
                     rows: 16,
                     experts: 1,
                     seconds: 0.016,

@@ -291,13 +291,13 @@ fn expert_host_reserve_keeps_span_independent_of_cpu_ceiling() -> Result<()> {
     let slot = layout.slot_bytes();
     let service = ServiceTable::new(
         "fixture",
-        [1, 64]
+        [(1u32, 1u32), (1, 2), (64, 1), (64, 2)]
             .into_iter()
-            .map(|rows| ServiceCell {
+            .map(|(rows, experts)| ServiceCell {
                 workers: 2,
                 rows,
-                experts: 1,
-                seconds: f64::from(rows) * 0.00002,
+                experts,
+                seconds: f64::from(rows * experts) * 0.00002,
             })
             .collect(),
     )?;
@@ -413,12 +413,26 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
             let geometry = ExpertGeometry::from_model(&model)?;
             let service = ServiceTable::new(
                 "fixture",
-                vec![ServiceCell {
-                    workers: 2,
-                    rows: 1,
-                    experts: 1,
-                    seconds: 0.001,
-                }],
+                vec![
+                    ServiceCell {
+                        workers: 2,
+                        rows: 1,
+                        experts: 1,
+                        seconds: 0.001,
+                    },
+                    ServiceCell {
+                        workers: 2,
+                        rows: 1,
+                        experts: 2,
+                        seconds: 0.002,
+                    },
+                    ServiceCell {
+                        workers: 2,
+                        rows: 1,
+                        experts: 8,
+                        seconds: 0.008,
+                    },
+                ],
             )?;
             let reserves = Reserves {
                 device_fixed_bytes: 0,

@@ -1259,7 +1259,16 @@ impl Slots {
         x: Tensor<bf16, 2>,
         y: &mut TensorMut<bf16, 2>,
     ) -> Result<()> {
-        decode.route(device, layer as usize, &ffn, x)?;
+        let prewake = layer == self.catalogue.geometry().first_layer;
+        if prewake {
+            decode.pool.prewake()?;
+        }
+        if let Err(error) = decode.route(device, layer as usize, &ffn, x) {
+            if prewake {
+                decode.pool.stop_prewake()?;
+            }
+            return Err(error);
+        }
         self.complete(device, decode, layer, ffn, (x, y), None)
     }
 
@@ -1317,11 +1326,36 @@ impl Slots {
         ffn: BoundFfn,
         activation: (Tensor<bf16, 2>, &mut TensorMut<bf16, 2>),
     ) -> Result<()> {
-        decode.read_route(device, layer as usize, &ffn, activation.0)?;
+        let prewake = layer == self.catalogue.geometry().first_layer;
+        if prewake {
+            decode.pool.prewake()?;
+        }
+        if let Err(error) = decode.read_route(device, layer as usize, &ffn, activation.0) {
+            if prewake {
+                decode.pool.stop_prewake()?;
+            }
+            return Err(error);
+        }
         self.complete(device, decode, layer, ffn, activation, Some(graph_layer))
     }
 
     fn complete(
+        &mut self,
+        device: &Device,
+        decode: &mut Decode,
+        layer: u32,
+        ffn: BoundFfn,
+        activation: (Tensor<bf16, 2>, &mut TensorMut<bf16, 2>),
+        graph: Option<usize>,
+    ) -> Result<()> {
+        let result = self.complete_inner(device, decode, layer, ffn, activation, graph);
+        if result.is_err() {
+            decode.pool.stop_prewake()?;
+        }
+        result
+    }
+
+    fn complete_inner(
         &mut self,
         device: &Device,
         decode: &mut Decode,
@@ -1337,6 +1371,9 @@ impl Slots {
             dispatch.host_experts == self.host_experts,
             "host expert compact order differs from residency at layer={layer}"
         );
+        if dispatch.host.is_empty() {
+            decode.pool.stop_prewake()?;
+        }
         decode.finish_with(
             device,
             ffn,
