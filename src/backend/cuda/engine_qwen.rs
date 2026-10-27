@@ -1673,6 +1673,7 @@ impl Engine {
                     capture_row_bytes
                         .checked_add(draft_row_bytes)
                         .context("draft context row bytes overflow")?,
+                    draft.as_ref().map(|d| &d.config),
                 ),
             )?)
         } else {
@@ -3972,6 +3973,7 @@ mod tests {
                         .as_mut()
                         .context("Flint slots missing for graph/eager reseed")?,
                 )?;
+            engine.refresh_verify_schedule()?;
             engine
                 .moe_slots
                 .as_mut()
@@ -4053,6 +4055,7 @@ mod tests {
                         .as_mut()
                         .context("Flint slots missing for graph/eager reseed")?,
                 )?;
+            engine.refresh_verify_schedule()?;
             engine
                 .moe_slots
                 .as_mut()

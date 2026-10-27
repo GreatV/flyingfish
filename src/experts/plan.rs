@@ -169,6 +169,65 @@ impl ServiceTable {
             ),
         }
     }
+
+    /// Continuous bilinear interpolation over calibrated `(rows, experts)` knots, linear above the top `experts` knot.
+    pub fn estimate_seconds(&self, rows: f64, experts: f64, workers: u32) -> Result<f64> {
+        ensure!(
+            rows.is_finite()
+                && rows >= 1.0
+                && rows <= f64::from(self.max_rows())
+                && experts.is_finite()
+                && experts >= 0.0
+                && workers > 0,
+            "invalid continuous service extent rows={rows} experts={experts} workers={workers}"
+        );
+        if experts == 0.0 {
+            return Ok(0.0);
+        }
+        let knots: Vec<u32> = self
+            .cells
+            .iter()
+            .filter(|cell| cell.workers == workers)
+            .map(|cell| cell.experts)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        ensure!(
+            !knots.is_empty(),
+            "service table has no cells for workers={workers} (isa {})",
+            self.isa
+        );
+        let at_experts = |expert_knot: u32| -> Result<f64> {
+            let lo = rows.floor() as u32;
+            let hi = rows.ceil() as u32;
+            if lo == hi {
+                self.rows_time(lo, expert_knot, workers)
+            } else {
+                let lo_s = self.rows_time(lo, expert_knot, workers)?;
+                let hi_s = self.rows_time(hi, expert_knot, workers)?;
+                Ok(lo_s + (hi_s - lo_s) * (rows - f64::from(lo)))
+            }
+        };
+        let first = knots[0];
+        if experts <= f64::from(first) {
+            return Ok(at_experts(first)? * (experts / f64::from(first)));
+        }
+        let last = knots[knots.len() - 1];
+        if experts >= f64::from(last) {
+            return Ok(at_experts(last)? * (experts / f64::from(last)));
+        }
+        for window in knots.windows(2) {
+            let (lo, hi) = (window[0], window[1]);
+            if f64::from(lo) <= experts && experts <= f64::from(hi) {
+                let lo_s = at_experts(lo)?;
+                let hi_s = at_experts(hi)?;
+                return Ok(lo_s + (hi_s - lo_s) * (experts - f64::from(lo)) / f64::from(hi - lo));
+            }
+        }
+        anyhow::bail!(
+            "service table failed to bracket continuous experts={experts} for workers={workers}"
+        )
+    }
 }
 
 /// Setup reserves subtracted before any expert slot or host block.
@@ -292,6 +351,15 @@ impl Capacity {
 
     pub fn slot_bytes(&self) -> u64 {
         self.layout.slot_bytes()
+    }
+
+    pub fn host_backed(&self, geometry: &ExpertGeometry) -> bool {
+        u64::from(self.host_blocks) == u64::from(geometry.layers) * u64::from(geometry.experts)
+            || (self.slots_per_layer[self.gpu0_layers as usize..]
+                .iter()
+                .all(|&s| s == geometry.experts)
+                && u64::from(self.host_blocks)
+                    == u64::from(self.gpu0_layers) * u64::from(geometry.experts))
     }
 }
 
@@ -449,7 +517,7 @@ pub fn equal_slots(total_slots: u64, layers: u32) -> Result<Vec<u32>> {
         .collect())
 }
 
-fn peer_rate(transfers: &[(u64, f64, f64)], bytes: u64) -> Result<(f64, f64)> {
+fn validate_peer_transfers(transfers: &[(u64, f64, f64)]) -> Result<()> {
     ensure!(!transfers.is_empty(), "empty peer transfer calibration");
     for (index, &(b, r01, r10)) in transfers.iter().enumerate() {
         ensure!(
@@ -462,6 +530,11 @@ fn peer_rate(transfers: &[(u64, f64, f64)], bytes: u64) -> Result<(f64, f64)> {
             "invalid peer transfer calibration cell ({b}, {r01}, {r10})"
         );
     }
+    Ok(())
+}
+
+fn peer_rate(transfers: &[(u64, f64, f64)], bytes: u64) -> Result<(f64, f64)> {
+    validate_peer_transfers(transfers)?;
     if bytes <= transfers[0].0 {
         return Ok((transfers[0].1, transfers[0].2));
     }
@@ -488,6 +561,37 @@ fn peer_hop_seconds(
     let (r01, _) = peer_rate(transfers, bytes_0_to_1)?;
     let (_, r10) = peer_rate(transfers, bytes_1_to_0)?;
     Ok(bytes_0_to_1 as f64 / r01 + bytes_1_to_0 as f64 / r10)
+}
+
+/// Round-trip peer bounce time interpolated linearly in transfer duration across calibrated byte knots.
+pub fn peer_bounce_seconds(
+    transfers: &[(u64, f64, f64)],
+    bytes_0_to_1: u64,
+    bytes_1_to_0: u64,
+) -> Result<f64> {
+    validate_peer_transfers(transfers)?;
+    let one_way = |bytes: u64, forward: bool| -> Result<f64> {
+        let rate_of = |cell: (u64, f64, f64)| if forward { cell.1 } else { cell.2 };
+        if bytes <= transfers[0].0 {
+            return Ok(bytes as f64 / rate_of(transfers[0]));
+        }
+        let last = transfers.len() - 1;
+        if bytes >= transfers[last].0 {
+            return Ok(bytes as f64 / rate_of(transfers[last]));
+        }
+        for window in transfers.windows(2) {
+            let c0 = window[0];
+            let c1 = window[1];
+            if bytes >= c0.0 && bytes <= c1.0 {
+                let s0 = c0.0 as f64 / rate_of(c0);
+                let s1 = c1.0 as f64 / rate_of(c1);
+                let t = (bytes - c0.0) as f64 / (c1.0 - c0.0) as f64;
+                return Ok(s0 + (s1 - s0) * t);
+            }
+        }
+        anyhow::bail!("no bracketing peer transfer cell for bytes={bytes}")
+    };
+    Ok(one_way(bytes_0_to_1, true)? + one_way(bytes_1_to_0, false)?)
 }
 
 /// Setup capacity from the reserves-first subtraction for one admission cap.
@@ -1291,6 +1395,63 @@ pub fn admission_budget(
         "admission budget {bytes} outside the byte range"
     );
     Ok(bytes.floor() as u64)
+}
+
+/// Host-bounce packet layout for peer-GPU routed-expert decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerSendLayout {
+    pub ids_off: usize,
+    pub ids_bytes: usize,
+    pub weights_off: usize,
+    pub weights_bytes: usize,
+    pub send_bytes: usize,
+    pub recv_bytes: usize,
+}
+
+impl PeerSendLayout {
+    pub fn for_rows(rows: usize, hidden: usize, top_k: usize) -> Result<Self> {
+        ensure!(
+            rows > 0 && hidden > 0 && top_k > 0,
+            "zero peer send dimension rows={rows} hidden={hidden} top_k={top_k}"
+        );
+        let x_bytes = rows
+            .checked_mul(hidden)
+            .and_then(|v| v.checked_mul(size_of::<half::bf16>()))
+            .context("peer send x byte overflow")?;
+        ensure!(
+            x_bytes.is_multiple_of(16),
+            "peer send x bytes={x_bytes} is not 16-byte aligned"
+        );
+        let ids_off = x_bytes;
+        let ids_bytes = rows
+            .checked_mul(top_k)
+            .and_then(|v| v.checked_mul(size_of::<i32>()))
+            .context("peer send ids byte overflow")?;
+        let weights_off = ids_off
+            .checked_add(ids_bytes)
+            .and_then(|v| v.checked_next_multiple_of(16))
+            .context("peer send weights offset overflow")?;
+        let weights_bytes = rows
+            .checked_mul(top_k)
+            .and_then(|v| v.checked_mul(size_of::<half::bf16>()))
+            .context("peer send weights byte overflow")?;
+        let send_bytes = weights_off
+            .checked_add(weights_bytes)
+            .context("peer send total byte overflow")?;
+        Ok(Self {
+            ids_off,
+            ids_bytes,
+            weights_off,
+            weights_bytes,
+            send_bytes,
+            recv_bytes: x_bytes,
+        })
+    }
+
+    pub fn tail_bf16_elems(max_rows: usize, hidden: usize, top_k: usize) -> Result<usize> {
+        let layout = Self::for_rows(max_rows, hidden, top_k)?;
+        Ok((layout.send_bytes - layout.ids_off).div_ceil(size_of::<half::bf16>()))
+    }
 }
 
 #[cfg(test)]

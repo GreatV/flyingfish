@@ -13,7 +13,7 @@ use crate::backend::cuda::{
     },
 };
 use crate::cpu::expert_ffn::{Assignment, ExpertPool, ExpertWeights, Job, Shape};
-use crate::experts::{arena::HostBlocks, catalogue::ExpertGeometry};
+use crate::experts::{arena::HostBlocks, catalogue::ExpertGeometry, plan::PeerSendLayout};
 use cudarc::driver::{CudaEvent, DevicePtr, HostSlice, result};
 
 #[path = "engine_moe_residency.rs"]
@@ -21,60 +21,6 @@ mod residency;
 pub(super) use residency::{Prefill, Slots};
 #[path = "engine_moe_graph.rs"]
 mod graphs;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct PeerSendLayout {
-    pub ids_off: usize,
-    pub ids_bytes: usize,
-    pub weights_off: usize,
-    pub weights_bytes: usize,
-    pub send_bytes: usize,
-}
-
-impl PeerSendLayout {
-    pub fn for_rows(rows: usize, hidden: usize, top_k: usize) -> Result<Self> {
-        ensure!(
-            rows > 0 && hidden > 0 && top_k > 0,
-            "zero peer send dimension rows={rows} hidden={hidden} top_k={top_k}"
-        );
-        let x_bytes = rows
-            .checked_mul(hidden)
-            .and_then(|v| v.checked_mul(size_of::<bf16>()))
-            .context("peer send x byte overflow")?;
-        ensure!(
-            x_bytes.is_multiple_of(16),
-            "peer send x bytes={x_bytes} is not 16-byte aligned"
-        );
-        let ids_off = x_bytes;
-        let ids_bytes = rows
-            .checked_mul(top_k)
-            .and_then(|v| v.checked_mul(size_of::<i32>()))
-            .context("peer send ids byte overflow")?;
-        let weights_off = ids_off
-            .checked_add(ids_bytes)
-            .and_then(|v| v.checked_next_multiple_of(16))
-            .context("peer send weights offset overflow")?;
-        let weights_bytes = rows
-            .checked_mul(top_k)
-            .and_then(|v| v.checked_mul(size_of::<bf16>()))
-            .context("peer send weights byte overflow")?;
-        let send_bytes = weights_off
-            .checked_add(weights_bytes)
-            .context("peer send total byte overflow")?;
-        Ok(Self {
-            ids_off,
-            ids_bytes,
-            weights_off,
-            weights_bytes,
-            send_bytes,
-        })
-    }
-
-    pub fn tail_bf16_elems(max_rows: usize, hidden: usize, top_k: usize) -> Result<usize> {
-        let layout = Self::for_rows(max_rows, hidden, top_k)?;
-        Ok((layout.send_bytes - layout.ids_off).div_ceil(size_of::<bf16>()))
-    }
-}
 
 pub(super) struct Setup {
     pub workspace: crate::prefill::ExpertWorkspaceBudget,
@@ -86,6 +32,8 @@ pub(super) struct Setup {
     routed_wave_rows: u32,
     peer_wave_rows: u32,
     peer: Option<Device>,
+    non_expert_decode_bytes: u64,
+    cold_schedule: Option<crate::dspark::VerifyCostSchedule>,
 }
 
 fn decode_device_bytes(
@@ -296,11 +244,12 @@ impl Setup {
         directory: &Path,
         runtime: &Path,
         write: bool,
-        (request, decode_rows, verify_rows, context_row_bytes): (
+        (request, decode_rows, verify_rows, context_row_bytes, draft_config): (
             crate::prefill::WorkspaceRequest,
             usize,
             usize,
             usize,
+            Option<&crate::dspark::DraftConfig>,
         ),
     ) -> Result<Self> {
         use crate::experts::plan::PlanInputs;
@@ -568,13 +517,37 @@ impl Setup {
             .peer_expert_bytes
             .checked_sub(peer_extra_scratch)
             .context("peer routed scratch exceeds peer budget")?;
-        let host_backed = u64::from(capacity.host_blocks)
-            == u64::from(geometry.layers) * u64::from(geometry.experts)
-            || (capacity.slots_per_layer[capacity.gpu0_layers as usize..]
-                .iter()
-                .all(|&s| s == geometry.experts)
-                && u64::from(capacity.host_blocks)
-                    == u64::from(capacity.gpu0_layers) * u64::from(geometry.experts));
+        let host_backed = capacity.host_backed(&geometry);
+        let non_expert_decode_bytes = manifest.non_expert_decode_bytes()?;
+        let cold_schedule = draft_config
+            .map(|draft| {
+                crate::dspark::VerifyCostSchedule::derive(
+                    draft,
+                    (model, non_expert_decode_bytes),
+                    (
+                        &capacity,
+                        admission,
+                        &measured.service,
+                        measured.copy_engines,
+                    ),
+                    (
+                        [
+                            device.info.memory_bytes_per_second,
+                            peer.as_ref()
+                                .map_or(0.0, |p| p.info.memory_bytes_per_second),
+                            measured.h2d_bytes_per_second,
+                            measured.d2h_bytes_per_second,
+                        ],
+                        [
+                            device.info.l2_bytes as u64,
+                            peer.as_ref().map_or(0, |p| p.info.l2_bytes as u64),
+                        ],
+                    ),
+                    &measured.peer_transfers,
+                    &vec![vec![0.0; geometry.experts as usize]; geometry.layers as usize],
+                )
+            })
+            .transpose()?;
         let cpu = residency::cpu_bound(
             geometry,
             capacity.slot_bytes(),
@@ -604,7 +577,8 @@ impl Setup {
                 "cpu_arithmetic_rows":super::super::moe::prefill::LANE16_ROWS,
                 "decode_rows":decode_rows,"decode_extra_device_bytes":decode_extra,
                 "context_span_rows":capacity.span_rows,"context_span_row_bytes":context_row_bytes,
-                "context_span_bytes":context_row_bytes.checked_mul(capacity.span_rows as usize).context("draft context span bytes overflow")?
+                "context_span_bytes":context_row_bytes.checked_mul(capacity.span_rows as usize).context("draft context span bytes overflow")?,
+                "dspark_verify_schedule":cold_schedule
             }})
         );
         eprintln!(
@@ -626,6 +600,8 @@ impl Setup {
             routed_wave_rows,
             peer_wave_rows,
             peer,
+            non_expert_decode_bytes,
+            cold_schedule,
         })
     }
 
@@ -643,6 +619,11 @@ impl Setup {
 
     pub fn bind(self, engine: &mut Engine) -> Result<()> {
         let total_started = std::time::Instant::now();
+        if let (Some(spec), Some(schedule)) = (engine.spec.as_mut(), self.cold_schedule) {
+            spec.non_expert_decode_bytes = self.non_expert_decode_bytes;
+            spec.cold_verify_schedule = schedule;
+            spec.verify_schedule = schedule;
+        }
         let geometry = self.catalogue.geometry();
         let initial = crate::experts::plan::initial_residency(
             &vec![vec![0.0; geometry.experts as usize]; geometry.layers as usize],
@@ -721,7 +702,12 @@ impl Setup {
             &self.capacity,
             self.workspace.candidate.reserves,
             self.measured.service,
-            self.measured.h2d_bytes_per_second,
+            (
+                self.measured.h2d_bytes_per_second,
+                self.measured.d2h_bytes_per_second,
+                self.measured.copy_engines,
+                self.measured.peer_transfers,
+            ),
             (
                 engine
                     .model_spec
@@ -1760,7 +1746,7 @@ impl Decode {
                 )
                 .context("decode peer combine_routed")?;
             let src_routed = peer.routed_dev1.device_ptr(pstream).0;
-            let routed_bytes = rows * hidden * size_of::<bf16>();
+            let routed_bytes = layout.recv_bytes;
             // SAFETY: peer.routed_dev1 and portable bounce region stay live and ordered before join.
             unsafe {
                 cudarc::driver::sys::cuMemcpyDtoHAsync_v2(

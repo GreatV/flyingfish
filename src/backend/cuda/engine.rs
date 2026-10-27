@@ -366,6 +366,9 @@ struct Spec {
     tree: Option<super::tree::State>,
     tree_attention: Option<super::verification::Verification>,
     max_verify_rows: usize,
+    non_expert_decode_bytes: u64,
+    verify_schedule: crate::dspark::VerifyCostSchedule,
+    cold_verify_schedule: crate::dspark::VerifyCostSchedule,
     active_rows: usize,
     graph: bool,
     verification: Option<super::verification::Verification>,
@@ -461,6 +464,9 @@ impl Spec {
             },
             tree_attention: None,
             max_verify_rows,
+            non_expert_decode_bytes: 0,
+            verify_schedule: crate::dspark::VerifyCostSchedule::UNCONSTRAINED,
+            cold_verify_schedule: crate::dspark::VerifyCostSchedule::UNCONSTRAINED,
             active_rows: 0,
             graph: engine.spec_graph,
             draft_graph: None,
@@ -2210,6 +2216,7 @@ impl Engine {
         self.state.reset(&self.device.stream)?;
         if let Some(spec) = self.spec.as_mut() {
             spec.active_rows = 0;
+            spec.verify_schedule = spec.cold_verify_schedule;
         }
         self.position = 0;
         self.logits_cache.invalidate();
@@ -2534,6 +2541,7 @@ impl Engine {
             .context("MTP state epoch exhausted")?;
         if let Some(spec) = self.spec.as_mut() {
             spec.active_rows = 0;
+            spec.verify_schedule = spec.cold_verify_schedule;
         }
         self.poisoned = false;
         // It remains invalid until the restored pending token is actually run.
@@ -4025,17 +4033,12 @@ impl Engine {
             let draft_ms = draft_start.elapsed().as_secs_f64() * 1000.0;
             drop(draft_range);
             let base_rows = if transaction {
-                let confidences = self
-                    .spec
-                    .as_ref()
-                    .context("draft is not enabled")?
-                    .draft
-                    .confidences()?;
+                let spec = self.spec.as_ref().context("draft is not enabled")?;
+                let confidences = spec.draft.confidences()?;
                 crate::dspark::select_verify_rows(
                     &confidences,
                     crate::dspark::MIN_MOE_VERIFY_ROWS,
-                    max_rows,
-                    crate::dspark::MOE_VERIFY_CONFIDENCE_TAU,
+                    &spec.verify_schedule,
                 )?
             } else {
                 max_rows

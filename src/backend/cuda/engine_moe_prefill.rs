@@ -481,6 +481,9 @@ pub(in crate::backend::cuda::engine) struct Prefill {
     workers: u32,
     cpu_ceiling: u32,
     h2d_bytes_per_second: f64,
+    d2h_bytes_per_second: f64,
+    copy_engines: u32,
+    peer_transfers: Vec<(u64, f64, f64)>,
     span: Option<Span>,
     gpu: Gpu,
     peer: Option<PeerPrefill>,
@@ -648,13 +651,50 @@ impl Prefill {
         slots.begin_request(&self.frequency)
     }
 
+    pub(in crate::backend::cuda::engine) fn derive_verify_schedule(
+        &self,
+        draft: &crate::dspark::DraftConfig,
+        target: (&crate::model_spec::ModelSpec, u64),
+        device: &Device,
+        slots: &Slots,
+    ) -> Result<crate::dspark::VerifyCostSchedule> {
+        crate::dspark::VerifyCostSchedule::derive(
+            draft,
+            target,
+            (
+                &self.capacity,
+                slots.policy.admission,
+                &self.service,
+                self.copy_engines,
+            ),
+            (
+                [
+                    device.info.memory_bytes_per_second,
+                    self.peer
+                        .as_ref()
+                        .map_or(0.0, |p| p.device.info.memory_bytes_per_second),
+                    self.h2d_bytes_per_second,
+                    self.d2h_bytes_per_second,
+                ],
+                [
+                    device.info.l2_bytes as u64,
+                    self.peer
+                        .as_ref()
+                        .map_or(0, |p| p.device.info.l2_bytes as u64),
+                ],
+            ),
+            &self.peer_transfers,
+            &self.frequency,
+        )
+    }
+
     pub(in crate::backend::cuda::engine) fn new(
         devices: (&Device, Option<&Device>),
         slots: &mut Slots,
         capacity: &Capacity,
         reserves: Reserves,
         service: ServiceTable,
-        h2d_bytes_per_second: f64,
+        transfers: (f64, f64, u32, Vec<(u64, f64, f64)>),
         shape: (
             u32,
             usize,
@@ -667,6 +707,7 @@ impl Prefill {
         ),
     ) -> Result<Self> {
         let (device, peer_device) = devices;
+        let (h2d_bytes_per_second, d2h_bytes_per_second, copy_engines, peer_transfers) = transfers;
         let (
             shared_intermediate,
             workspace_rows,
@@ -699,8 +740,12 @@ impl Prefill {
             geometry.hidden
         );
         ensure!(
-            h2d_bytes_per_second.is_finite() && h2d_bytes_per_second > 0.0,
-            "prefill H2D rate={h2d_bytes_per_second}"
+            h2d_bytes_per_second.is_finite()
+                && h2d_bytes_per_second > 0.0
+                && d2h_bytes_per_second.is_finite()
+                && d2h_bytes_per_second > 0.0
+                && copy_engines > 0,
+            "prefill copy rates h2d={h2d_bytes_per_second} d2h={d2h_bytes_per_second} engines={copy_engines}"
         );
         ExpertSpanLayout::new(
             &reserves,
@@ -814,6 +859,9 @@ impl Prefill {
             workers,
             cpu_ceiling: cpu.2,
             h2d_bytes_per_second,
+            d2h_bytes_per_second,
+            copy_engines,
+            peer_transfers,
             span: None,
             gpu: Gpu {
                 mask: super::super::super::super::cubin::module(&device.ctx, "moe_route")?
@@ -1742,7 +1790,9 @@ impl Engine {
         if result.is_err() {
             self.poisoned = true;
         }
-        result
+        let token = result?;
+        self.refresh_verify_schedule()?;
+        Ok(token)
     }
 
     fn moe_wave(&mut self, position: usize, rows: usize) -> Result<crate::backend::Step<'static>> {
@@ -2225,6 +2275,23 @@ impl Engine {
         self.logits_cache.mark_valid();
         self.pending_token = Some(token);
         Ok(token)
+    }
+
+    pub(in crate::backend::cuda::engine) fn refresh_verify_schedule(&mut self) -> Result<()> {
+        let (Some(spec), Some(prefill), Some(slots)) = (
+            self.spec.as_mut(),
+            self.moe_prefill.as_ref(),
+            self.moe_slots.as_ref(),
+        ) else {
+            return Ok(());
+        };
+        spec.verify_schedule = prefill.derive_verify_schedule(
+            &spec.draft.config,
+            (&self.model_spec, spec.non_expert_decode_bytes),
+            &self.device,
+            slots,
+        )?;
+        Ok(())
     }
 }
 

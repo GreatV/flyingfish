@@ -98,6 +98,256 @@ pub const MIN_MOE_VERIFY_ROWS: usize = 2;
 pub const MAX_MOE_VERIFY_ROWS: usize = 8;
 pub const MOE_VERIFY_CONFIDENCE_TAU: f32 = 0.80;
 
+/// Per-request speculative verification width cap and cumulative survival floor.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VerifyCostSchedule {
+    pub max_rows: usize,
+    pub step_tau: f32,
+    pub min_survival: [f32; MAX_MOE_VERIFY_ROWS],
+}
+
+impl VerifyCostSchedule {
+    pub const UNCONSTRAINED: Self = Self {
+        max_rows: MAX_MOE_VERIFY_ROWS,
+        step_tau: MOE_VERIFY_CONFIDENCE_TAU,
+        min_survival: [0.0; MAX_MOE_VERIFY_ROWS],
+    };
+
+    pub fn derive(
+        draft: &DraftConfig,
+        target: (&crate::model_spec::ModelSpec, u64),
+        residency: (
+            &crate::experts::plan::Capacity,
+            crate::experts::plan::Admission,
+            &crate::experts::plan::ServiceTable,
+            u32,
+        ),
+        hardware: ([f64; 4], [u64; 2]),
+        peer_transfers: &[(u64, f64, f64)],
+        frequency: &[Vec<f64>],
+    ) -> Result<Self> {
+        let (target, non_expert_decode_bytes) = target;
+        ensure!(
+            non_expert_decode_bytes > 0,
+            "non-expert decode tensor bytes must be positive"
+        );
+        let max_verify_rows = draft.target_rows(target)?;
+        let geometry = crate::experts::catalogue::ExpertGeometry::from_model(target)?;
+        let (capacity, admission, service, copy_engines) = residency;
+        let ([gpu0_mem_bps, peer_mem_bps, h2d_bps, d2h_bps], [gpu0_l2_bytes, peer_l2_bytes]) =
+            hardware;
+        ensure!(
+            gpu0_mem_bps.is_finite()
+                && gpu0_mem_bps > 0.0
+                && h2d_bps.is_finite()
+                && h2d_bps > 0.0
+                && d2h_bps.is_finite()
+                && d2h_bps > 0.0
+                && copy_engines > 0,
+            "invalid verify cost bandwidths={:?} copy_engines={copy_engines}",
+            hardware.0
+        );
+        ensure!(
+            capacity.gpu0_layers <= geometry.layers
+                && capacity.slots_per_layer.len() == geometry.layers as usize,
+            "verify schedule capacity layers={} gpu0_layers={} expected={}",
+            capacity.slots_per_layer.len(),
+            capacity.gpu0_layers,
+            geometry.layers
+        );
+        if capacity.gpu0_layers < geometry.layers {
+            ensure!(
+                peer_mem_bps.is_finite() && peer_mem_bps > 0.0,
+                "invalid peer memory bandwidth={peer_mem_bps}"
+            );
+        }
+        let resident = crate::experts::plan::initial_residency(
+            frequency,
+            &capacity.slots_per_layer,
+            &geometry,
+        )?;
+        let experts = geometry.experts as usize;
+        let top_k = f64::from(geometry.top_k);
+        let uniform_p = top_k / f64::from(geometry.experts);
+        let mut probs = Vec::with_capacity(geometry.layers as usize);
+        let mut is_resident = Vec::with_capacity(geometry.layers as usize);
+        for layer in 0..geometry.layers as usize {
+            let mut flags = vec![false; experts];
+            for &expert in &resident[layer] {
+                flags[expert as usize] = true;
+            }
+            let total: f64 = frequency[layer].iter().sum();
+            let row = if total > 0.0 {
+                frequency[layer]
+                    .iter()
+                    .map(|&count| (count * top_k / total).min(1.0))
+                    .collect::<Vec<_>>()
+            } else {
+                vec![uniform_p; experts]
+            };
+            probs.push(row);
+            is_resident.push(flags);
+        }
+        let d_est = draft.round_weight_bytes()? as f64 / gpu0_mem_bps;
+        let delta_i_rej = draft.rejection_replay_bytes(target)? as f64 / gpu0_mem_bps;
+        let t_non_expert = non_expert_decode_bytes as f64 / gpu0_mem_bps;
+        let slot_bytes = capacity.slot_bytes();
+        let proj_bytes = capacity.layout.projection_bytes();
+        let workers = service.worker_count()?;
+        let max_service_rows = f64::from(service.max_rows());
+        let hard_cap = admission.hard_cap(slot_bytes)?;
+        let backed = capacity.host_backed(&geometry);
+        let t_h2d = slot_bytes as f64 / h2d_bps;
+        let t_d2h = slot_bytes as f64 / d2h_bps;
+        // Unbacked slot replacement waits on victim D2H before H2D into the same slot.
+        let t_swap_one = if backed { t_h2d } else { t_h2d + t_d2h };
+        let t_cpu1 = service.estimate_seconds(1.0, 1.0, workers)?;
+        let t_gpu1 = slot_bytes as f64 / gpu0_mem_bps;
+        let gpu0_layers = capacity.gpu0_layers as usize;
+        let mut non_resident_probs = Vec::new();
+        let mut m1_total = 0.0;
+        for layer in 0..gpu0_layers {
+            for expert in 0..experts {
+                if !is_resident[layer][expert] {
+                    let p = probs[layer][expert];
+                    non_resident_probs.push(p);
+                    m1_total += p;
+                }
+            }
+        }
+        non_resident_probs.sort_by(|a, b| b.total_cmp(a));
+        let queue_wait = if hard_cap > 0 {
+            (m1_total / f64::from(hard_cap)).max(1.0)
+        } else {
+            0.0
+        };
+        let per_miss_deferral =
+            (t_cpu1 - t_gpu1).max(0.0) + if backed { 0.0 } else { queue_wait * t_d2h };
+        let mut v_est = vec![0.0; max_verify_rows + 1];
+        for (k, v_slot) in v_est.iter_mut().enumerate().skip(1) {
+            let k_i32 = k as i32;
+            let k_f64 = k as f64;
+            let mut c_moe_gpu0 = 0.0;
+            let mut m_total = 0.0;
+            for layer in 0..gpu0_layers {
+                let mut u_l = 0.0;
+                let mut m_l = 0.0;
+                let mut m_l_1 = 0.0;
+                for expert in 0..experts {
+                    let p = probs[layer][expert];
+                    let active = 1.0 - (1.0 - p).powi(k_i32);
+                    u_l += active;
+                    if !is_resident[layer][expert] {
+                        m_l += active;
+                        m_l_1 += p;
+                    }
+                }
+                let h_l = (u_l - m_l).max(0.0);
+                let h_choices = k_f64 * (top_k - m_l_1).max(0.0);
+                let t_gpu =
+                    moe_dram_bytes(h_l, h_choices, proj_bytes, gpu0_l2_bytes) / gpu0_mem_bps;
+                m_total += m_l;
+                let t_cpu = if m_l > 0.0 {
+                    let r_bar = (k_f64 * m_l_1 / m_l).clamp(1.0, k_f64.min(max_service_rows));
+                    service.estimate_seconds(r_bar, m_l, workers)?
+                } else {
+                    0.0
+                };
+                c_moe_gpu0 += t_gpu.max(t_cpu);
+            }
+            let mut c_peer = 0.0;
+            if gpu0_layers < geometry.layers as usize {
+                let peer_layout = crate::experts::plan::PeerSendLayout::for_rows(
+                    k,
+                    geometry.hidden as usize,
+                    geometry.top_k as usize,
+                )?;
+                let bounce = crate::experts::plan::peer_bounce_seconds(
+                    peer_transfers,
+                    peer_layout.send_bytes as u64,
+                    peer_layout.recv_bytes as u64,
+                )?;
+                for probs_layer in &probs[gpu0_layers..] {
+                    let u_l: f64 = probs_layer
+                        .iter()
+                        .map(|&p| 1.0 - (1.0 - p).powi(k_i32))
+                        .sum();
+                    let peer_bytes = moe_dram_bytes(u_l, k_f64 * top_k, proj_bytes, peer_l2_bytes);
+                    c_peer += peer_bytes / peer_mem_bps + bounce;
+                }
+            }
+            let overlap = if k == 1 { 0.0 } else { d_est };
+            let c_swap = (m_total.min(f64::from(hard_cap)) * t_swap_one - overlap).max(0.0);
+            let mut delta_c_cap = 0.0;
+            if k >= 2 && hard_cap > 0 && !non_resident_probs.is_empty() {
+                let cap_1 = f64::from(hard_cap);
+                for j in 2..=k {
+                    let j_i32 = j as i32;
+                    let cap_j = (j as f64) * cap_1;
+                    let mut cum = 0.0;
+                    for &p in &non_resident_probs {
+                        let next = cum + (1.0 - (1.0 - p).powi(j_i32));
+                        let truncated = (next.min(cap_j) - cum.max(cap_1)).max(0.0);
+                        delta_c_cap += truncated * p * per_miss_deferral;
+                        cum = next;
+                        if cum >= cap_j {
+                            break;
+                        }
+                    }
+                }
+            }
+            *v_slot = t_non_expert + c_moe_gpu0 + c_peer + c_swap + delta_c_cap;
+        }
+        let mut k_max = MIN_MOE_VERIFY_ROWS;
+        let mut best_full_accept =
+            (d_est + v_est[MIN_MOE_VERIFY_ROWS]) / (MIN_MOE_VERIFY_ROWS as f64);
+        for (k, &v_k) in v_est.iter().enumerate().skip(MIN_MOE_VERIFY_ROWS + 1) {
+            let full_accept = (d_est + v_k) / (k as f64);
+            if full_accept < best_full_accept {
+                best_full_accept = full_accept;
+                k_max = k;
+            }
+        }
+        let r_ref = v_est[1];
+        ensure!(
+            r_ref.is_finite() && r_ref > 0.0,
+            "invalid verify reference token time={r_ref}"
+        );
+        let mut min_survival = [0.0f32; MAX_MOE_VERIFY_ROWS];
+        for k in (MIN_MOE_VERIFY_ROWS + 1)..=k_max {
+            let marginal = (v_est[k] - v_est[k - 1]).max(0.0) + delta_i_rej;
+            min_survival[k - 1] = (marginal / (r_ref + delta_i_rej)).clamp(0.0, 1.0) as f32;
+        }
+        for slot in &mut min_survival[k_max..MAX_MOE_VERIFY_ROWS] {
+            *slot = 1.0;
+        }
+        Ok(Self {
+            max_rows: k_max,
+            step_tau: MOE_VERIFY_CONFIDENCE_TAU,
+            min_survival,
+        })
+    }
+}
+
+fn moe_dram_bytes(distinct: f64, total_choices: f64, proj_bytes: (u64, u64), l2_bytes: u64) -> f64 {
+    if distinct <= 0.0 {
+        return 0.0;
+    }
+    let repeats = (total_choices - distinct).max(0.0);
+    let l2 = l2_bytes as f64;
+    let (gate_up_bytes, down_bytes) = (proj_bytes.0 as f64, proj_bytes.1 as f64);
+    let hit = |bytes: f64| -> f64 {
+        let working_set = distinct * bytes;
+        if working_set <= 0.0 {
+            0.0
+        } else {
+            (l2 / working_set).clamp(0.0, 1.0)
+        }
+    };
+    (distinct + repeats * (1.0 - hit(gate_up_bytes))) * gate_up_bytes
+        + (distinct + repeats * (1.0 - hit(down_bytes))) * down_bytes
+}
+
 impl DraftConfig {
     pub fn verify_rows(&self) -> Result<usize> {
         self.block_size
@@ -162,6 +412,119 @@ impl DraftConfig {
     }
     pub fn qkv_dim(&self) -> usize {
         (self.num_attention_heads + 2 * self.num_key_value_heads) * self.head_dim
+    }
+    pub fn round_weight_bytes(&self) -> Result<u64> {
+        let hidden = u64::try_from(self.hidden_size)?;
+        let inter = u64::try_from(self.intermediate_size)?;
+        let layers = u64::try_from(self.num_hidden_layers)?;
+        let q_dim = u64::try_from(
+            self.num_attention_heads
+                .checked_mul(self.head_dim)
+                .context("DSpark query width overflow")?,
+        )?;
+        let kv_dim = u64::try_from(self.kv_dim())?;
+        let head_dim = u64::try_from(self.head_dim)?;
+        let vocab = u64::try_from(self.vocab_size)?;
+        let rank = u64::try_from(self.markov_rank)?;
+        let capture = u64::try_from(self.capture_width())?;
+        let block_rows = u64::try_from(self.block_size)?;
+        let inject_elems = capture
+            .checked_mul(hidden)
+            .and_then(|n| n.checked_add(hidden))
+            .and_then(|n| {
+                let per_layer = kv_dim
+                    .checked_mul(2)
+                    .and_then(|kv2| kv2.checked_mul(hidden))
+                    .and_then(|kv_proj| kv_proj.checked_add(head_dim))?;
+                layers
+                    .checked_mul(per_layer)
+                    .and_then(|all| n.checked_add(all))
+            })
+            .context("DSpark inject weight element overflow")?;
+        let layer_elems = u64::try_from(self.qkv_dim())?
+            .checked_mul(hidden)
+            .and_then(|qkv| q_dim.checked_mul(hidden).and_then(|o| qkv.checked_add(o)))
+            .and_then(|attn| {
+                inter
+                    .checked_mul(3)
+                    .and_then(|ffn_w| ffn_w.checked_mul(hidden))
+                    .and_then(|ffn| attn.checked_add(ffn))
+            })
+            .and_then(|body| {
+                hidden
+                    .checked_mul(2)
+                    .and_then(|hn| head_dim.checked_mul(2).and_then(|qn| hn.checked_add(qn)))
+                    .and_then(|norms| body.checked_add(norms))
+            })
+            .context("DSpark block layer element overflow")?;
+        let head_elems = vocab
+            .checked_mul(hidden)
+            .and_then(|lm| lm.checked_add(hidden))
+            .context("DSpark lm_head element overflow")?;
+        let markov_step = vocab
+            .checked_mul(rank)
+            .and_then(|w2| w2.checked_add(rank))
+            .context("DSpark Markov step element overflow")?;
+        let markov_elems = block_rows
+            .checked_mul(markov_step)
+            .and_then(|all| {
+                hidden
+                    .checked_add(rank)
+                    .and_then(|conf| all.checked_add(conf))
+            })
+            .context("DSpark Markov total element overflow")?;
+        layers
+            .checked_mul(layer_elems)
+            .and_then(|body| body.checked_add(inject_elems))
+            .and_then(|n| n.checked_add(head_elems))
+            .and_then(|n| n.checked_add(markov_elems))
+            .and_then(|elems| elems.checked_mul(2))
+            .context("DSpark round weight byte overflow")
+    }
+    pub fn rejection_replay_bytes(&self, spec: &crate::model_spec::ModelSpec) -> Result<u64> {
+        let gdn_layers = u64::try_from(
+            spec.layers
+                .iter()
+                .filter(|layer| layer.mixer == crate::model_spec::Mixer::Gdn)
+                .count(),
+        )?;
+        let gdn_bytes = if gdn_layers > 0 {
+            let gdn = crate::op_contract::GdnSpec::from_model(spec)?;
+            let input_row = gdn.input_row_bytes()?;
+            gdn.image_bytes()?
+                .checked_mul(4)
+                .and_then(|state| state.checked_add(input_row))
+                .and_then(|per_layer| per_layer.checked_mul(gdn_layers))
+                .context("DSpark GDN rejection replay overflow")?
+        } else {
+            0
+        };
+        let attn_layers = u64::try_from(
+            spec.layers
+                .iter()
+                .filter(|layer| layer.mixer == crate::model_spec::Mixer::FullAttention)
+                .count(),
+        )?;
+        let target_kv_row = u64::from(spec.kv_heads)
+            .checked_mul(u64::from(spec.head_dim))
+            .and_then(|elems| elems.checked_mul(4))
+            .and_then(|row| row.checked_mul(attn_layers))
+            .context("DSpark target KV rollback byte overflow")?;
+        let draft_layers = u64::try_from(self.num_hidden_layers)?;
+        let draft_kv_row = u64::try_from(self.kv_dim())?
+            .checked_mul(4)
+            .and_then(|row| row.checked_mul(draft_layers))
+            .context("DSpark draft KV rollback byte overflow")?;
+        let target_kv_x2 = target_kv_row
+            .checked_mul(2)
+            .context("target KV rollback x2")?;
+        let draft_kv_x2 = draft_kv_row
+            .checked_mul(2)
+            .context("draft KV rollback x2")?;
+        gdn_bytes
+            .checked_add(target_kv_x2)
+            .and_then(|n| n.checked_add(draft_kv_x2))
+            .context("DSpark rejection replay byte overflow")
     }
     pub fn read(path: &Path, target: &Config) -> Result<Self> {
         let c: Self = serde_json::from_value(read_config(path)?)?;
@@ -380,25 +743,36 @@ pub struct Accept {
 pub fn select_verify_rows(
     confidences: &[f32],
     min_rows: usize,
-    max_rows: usize,
-    tau: f32,
+    schedule: &VerifyCostSchedule,
 ) -> Result<usize> {
     ensure!(
         min_rows >= MIN_MOE_VERIFY_ROWS
-            && min_rows <= max_rows
-            && max_rows <= confidences.len() + 1
-            && tau.is_finite()
-            && (0.0..=1.0).contains(&tau)
+            && min_rows <= schedule.max_rows
+            && schedule.max_rows <= MAX_MOE_VERIFY_ROWS
+            && schedule.max_rows <= confidences.len() + 1
+            && schedule.step_tau.is_finite()
+            && (0.0..=1.0).contains(&schedule.step_tau)
+            && schedule
+                .min_survival
+                .iter()
+                .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
             && confidences.iter().all(|v| v.is_finite()),
-        "invalid DSpark verify row selection min_rows={min_rows} max_rows={max_rows} confidences={} tau={tau}",
-        confidences.len()
+        "invalid DSpark verify row selection min_rows={min_rows} max_rows={} confidences={} step_tau={}",
+        schedule.max_rows,
+        confidences.len(),
+        schedule.step_tau
     );
-    let confident = confidences
-        .iter()
-        .take(max_rows - 1)
-        .take_while(|&&c| c >= tau)
-        .count();
-    Ok((confident + 1).max(min_rows))
+    let mut rows = 1usize;
+    let mut survival = 1.0f32;
+    for (idx, &c) in confidences.iter().take(schedule.max_rows - 1).enumerate() {
+        let next_rows = idx + 2;
+        survival *= c;
+        if c < schedule.step_tau || survival < schedule.min_survival[next_rows - 1] {
+            break;
+        }
+        rows = next_rows;
+    }
+    Ok(rows.max(min_rows))
 }
 
 pub fn accept(proposals: &[u32], predictions: &[u32]) -> Result<Accept> {
@@ -444,8 +818,9 @@ mod tests {
             }
         );
         assert!(accept(&[3, 4, 5], &[3, 4, 5]).is_err());
+        let unconstrained = VerifyCostSchedule::UNCONSTRAINED;
         assert_eq!(
-            select_verify_rows(&[0.5; 15], MIN_MOE_VERIFY_ROWS, MAX_MOE_VERIFY_ROWS, 0.80).unwrap(),
+            select_verify_rows(&[0.5; 15], MIN_MOE_VERIFY_ROWS, &unconstrained).unwrap(),
             2
         );
         assert_eq!(
@@ -455,8 +830,7 @@ mod tests {
                     0.99, 0.99
                 ],
                 MIN_MOE_VERIFY_ROWS,
-                MAX_MOE_VERIFY_ROWS,
-                0.80
+                &unconstrained,
             )
             .unwrap(),
             2
@@ -468,20 +842,340 @@ mod tests {
                     0.99, 0.99
                 ],
                 MIN_MOE_VERIFY_ROWS,
-                MAX_MOE_VERIFY_ROWS,
-                0.80
+                &unconstrained,
             )
             .unwrap(),
             4
         );
         assert_eq!(
-            select_verify_rows(&[0.95; 15], MIN_MOE_VERIFY_ROWS, MAX_MOE_VERIFY_ROWS, 0.80)
-                .unwrap(),
+            select_verify_rows(&[0.95; 15], MIN_MOE_VERIFY_ROWS, &unconstrained).unwrap(),
             MAX_MOE_VERIFY_ROWS
         );
-        assert!(select_verify_rows(&[f32::NAN; 15], 2, 8, 0.80).is_err());
-        assert!(select_verify_rows(&[0.9; 15], 1, 8, 0.80).is_err());
-        assert!(select_verify_rows(&[0.9; 6], 2, 8, 0.80).is_err());
+        assert!(select_verify_rows(&[f32::NAN; 15], 2, &unconstrained).is_err());
+        assert!(select_verify_rows(&[0.9; 15], 1, &unconstrained).is_err());
+        assert!(select_verify_rows(&[0.9; 6], 2, &unconstrained).is_err());
+    }
+
+    #[test]
+    fn fetch_cost_schedule_adapts_across_residency_regimes() -> Result<()> {
+        use crate::experts::{
+            catalogue::{ExpertGeometry, ExpertLayout},
+            plan::{Admission, Capacity, ServiceCell, ServiceTable, admission_budget, equal_slots},
+        };
+        use crate::model_spec::{ExpertFormat, LinearFormat, ModelSpec};
+        let bf16_model = ModelSpec::minicpm(
+            &serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/data/minicpm-config.json"
+            )))?,
+            &serde_json::json!({"eos_token_id":[248044,248046]}),
+        )?;
+        let mut fp8_model = bf16_model.clone();
+        fp8_model.linear_format = LinearFormat::Fp8E4m3Channel;
+        fp8_model.expert_format = Some(ExpertFormat::Fp8W8a16);
+        let fp8_non_expert =
+            crate::checkpoint::MappedCheckpoint::planned_non_expert_decode_bytes(&fp8_model)?;
+        let bf16_non_expert =
+            crate::checkpoint::MappedCheckpoint::planned_non_expert_decode_bytes(&bf16_model)?;
+        ensure!(
+            fp8_non_expert == 3_606_467_840 && bf16_non_expert == 3_878_872_320,
+            "unexpected MiniCPM non-expert decode tensor bytes fp8={fp8_non_expert} bf16={bf16_non_expert}"
+        );
+        let geometry = ExpertGeometry::from_model(&fp8_model)?;
+        let fp8_layout = ExpertLayout::new(ExpertFormat::Fp8W8a16, &geometry)?;
+        let bf16_layout = ExpertLayout::new(ExpertFormat::Bf16, &geometry)?;
+        ensure!(
+            fp8_layout.projection_bytes() == (2_099_200, 1_052_672)
+                && bf16_layout.projection_bytes() == (4_194_304, 2_097_152),
+            "unexpected expert projection byte split fp8={:?} bf16={:?}",
+            fp8_layout.projection_bytes(),
+            bf16_layout.projection_bytes()
+        );
+        let draft = DraftConfig {
+            model_type: "qwen3".into(),
+            architectures: vec!["Qwen3DSparkModel".into()],
+            dtype: "bfloat16".into(),
+            hidden_size: 2048,
+            intermediate_size: 6144,
+            num_hidden_layers: 5,
+            num_attention_heads: 8,
+            num_key_value_heads: 2,
+            head_dim: 256,
+            vocab_size: 248144,
+            draft_vocab_size: 248144,
+            rms_norm_eps: 1e-6,
+            block_size: 15,
+            mask_token_id: 248076,
+            target_layer_ids: vec![3, 11, 19, 27, 35],
+            num_target_layers: 40,
+            markov_rank: 256,
+            markov_head_type: "vanilla".into(),
+            projector_type: "dspark".into(),
+            rope_parameters: Rope {
+                rope_theta: 1e7,
+                rope_type: "default".into(),
+                rope_dim: Some(256),
+            },
+        };
+        let cold_freq = vec![vec![0.0; geometry.experts as usize]; geometry.layers as usize];
+        let skewed_freq: Vec<Vec<f64>> = (0..geometry.layers as usize)
+            .map(|layer| {
+                (0..geometry.experts as usize)
+                    .map(|expert| {
+                        let rank = (expert * 173 + layer * 37) % (geometry.experts as usize);
+                        1.0 / ((rank as f64 + 2.5).powf(1.05))
+                    })
+                    .collect()
+            })
+            .collect();
+        let make_table = |grid: &[(u32, u32, f64)]| -> Result<ServiceTable> {
+            ServiceTable::new(
+                "test",
+                grid.iter()
+                    .map(|&(rows, experts, seconds)| ServiceCell {
+                        workers: 24,
+                        rows,
+                        experts,
+                        seconds,
+                    })
+                    .collect(),
+            )
+        };
+        let fp8_4090_service = make_table(&[
+            (1, 1, 0.0001205),
+            (1, 2, 0.0002298),
+            (1, 4, 0.0004531),
+            (1, 8, 0.0009117),
+            (2, 1, 0.0002290),
+            (2, 2, 0.0004567),
+            (2, 4, 0.0008996),
+            (2, 8, 0.0017913),
+            (5, 1, 0.0005646),
+            (5, 2, 0.0011233),
+            (5, 4, 0.0022498),
+            (5, 8, 0.0044884),
+            (8, 1, 0.0008990),
+            (8, 2, 0.0017870),
+            (8, 4, 0.0035705),
+            (8, 8, 0.0071404),
+        ])?;
+        let rates_4090 = [1_008.1e9, 0.0, 19.66e9, 18.68e9];
+        let fp8_4090_admission = Admission {
+            budget_bytes_per_token: admission_budget(
+                &geometry,
+                &fp8_4090_service,
+                rates_4090[2],
+                rates_4090[3],
+                2,
+            )?,
+        };
+        let fp8_slot_bytes = fp8_layout.slot_bytes();
+        let full_capacity = Capacity {
+            layout: fp8_layout.clone(),
+            span_rows: 1024,
+            wave_rows: 1024,
+            device_expert_bytes: 10240 * fp8_slot_bytes,
+            peer_expert_bytes: 0,
+            host_expert_bytes: 10240 * fp8_slot_bytes,
+            gpu0_layers: 40,
+            slots_per_layer: vec![256; 40],
+            host_blocks: 10240,
+            spare_blocks: 28,
+            disk_bytes: 0,
+            worker_count: 24,
+            disk_workers: 0,
+            prefill_staging_slots: 2,
+            pinned: true,
+        };
+        let l2_4090 = [75_497_472, 0];
+        let full = VerifyCostSchedule::derive(
+            &draft,
+            (&fp8_model, fp8_non_expert),
+            (&full_capacity, fp8_4090_admission, &fp8_4090_service, 2),
+            (rates_4090, l2_4090),
+            &[],
+            &skewed_freq,
+        )?;
+        ensure!(
+            full.max_rows == MAX_MOE_VERIFY_ROWS
+                && select_verify_rows(&[0.80; 15], MIN_MOE_VERIFY_ROWS, &full)?
+                    == MAX_MOE_VERIFY_ROWS,
+            "full-resident schedule regressed: {full:?}"
+        );
+
+        let mut fp8_4090_capacity = full_capacity.clone();
+        fp8_4090_capacity.slots_per_layer = equal_slots(4634, 40)?;
+        fp8_4090_capacity.device_expert_bytes = 4634 * fp8_slot_bytes;
+        let fp8_4090 = VerifyCostSchedule::derive(
+            &draft,
+            (&fp8_model, fp8_non_expert),
+            (&fp8_4090_capacity, fp8_4090_admission, &fp8_4090_service, 2),
+            (rates_4090, l2_4090),
+            &[],
+            &skewed_freq,
+        )?;
+        ensure!(
+            fp8_4090.max_rows == MAX_MOE_VERIFY_ROWS
+                && select_verify_rows(&[0.80; 15], MIN_MOE_VERIFY_ROWS, &fp8_4090)? < 7
+                && select_verify_rows(&[0.97; 15], MIN_MOE_VERIFY_ROWS, &fp8_4090)?
+                    == MAX_MOE_VERIFY_ROWS,
+            "4090 FP8 host-backed schedule failed discriminator: {fp8_4090:?}"
+        );
+
+        let a4000_service = make_table(&[
+            (1, 1, 0.0001500),
+            (1, 2, 0.0002870),
+            (1, 4, 0.0005660),
+            (1, 8, 0.0011390),
+            (2, 1, 0.0002860),
+            (2, 2, 0.0005710),
+            (2, 4, 0.0011240),
+            (2, 8, 0.0022390),
+            (5, 1, 0.0007050),
+            (5, 2, 0.0014040),
+            (5, 4, 0.0028120),
+            (5, 8, 0.0056100),
+            (8, 1, 0.0011240),
+            (8, 2, 0.0022340),
+            (8, 4, 0.0044630),
+            (8, 8, 0.0089250),
+        ])?;
+        let rates_a4000 = [448.1e9, 448.1e9, 13.09e9, 13.09e9];
+        let a4000_admission = Admission {
+            budget_bytes_per_token: admission_budget(
+                &geometry,
+                &a4000_service,
+                rates_a4000[2],
+                rates_a4000[3],
+                2,
+            )?,
+        };
+        let mut peer_slots = equal_slots(1390, 21)?;
+        peer_slots.extend(std::iter::repeat_n(256, 19));
+        let peer_capacity = Capacity {
+            layout: fp8_layout,
+            span_rows: 1024,
+            wave_rows: 1024,
+            device_expert_bytes: 1390 * fp8_slot_bytes,
+            peer_expert_bytes: 19 * 256 * fp8_slot_bytes,
+            host_expert_bytes: 21 * 256 * fp8_slot_bytes,
+            gpu0_layers: 21,
+            slots_per_layer: peer_slots,
+            host_blocks: 21 * 256,
+            spare_blocks: 16,
+            disk_bytes: 0,
+            worker_count: 24,
+            disk_workers: 0,
+            prefill_staging_slots: 2,
+            pinned: true,
+        };
+        let peer_transfers = [
+            (4096u64, 200.0e6, 200.0e6),
+            (8 << 20, 8.2e9, 8.2e9),
+            (68 << 20, 10.6e9, 10.6e9),
+        ];
+        let fp8_peer = VerifyCostSchedule::derive(
+            &draft,
+            (&fp8_model, fp8_non_expert),
+            (&peer_capacity, a4000_admission, &a4000_service, 2),
+            (rates_a4000, [4_194_304, 4_194_304]),
+            &peer_transfers,
+            &skewed_freq,
+        )?;
+        ensure!(
+            fp8_peer.max_rows == MAX_MOE_VERIFY_ROWS
+                && select_verify_rows(&[0.80; 15], MIN_MOE_VERIFY_ROWS, &fp8_peer)? < 7
+                && select_verify_rows(&[0.97; 15], MIN_MOE_VERIFY_ROWS, &fp8_peer)?
+                    == MAX_MOE_VERIFY_ROWS,
+            "2xA4000 peer-backed schedule failed discriminator: {fp8_peer:?}"
+        );
+
+        let bf16_service = make_table(&[
+            (1, 1, 0.0001227),
+            (1, 2, 0.0002309),
+            (1, 4, 0.0004059),
+            (1, 8, 0.0008052),
+            (2, 1, 0.0001024),
+            (2, 2, 0.0002542),
+            (2, 4, 0.0005042),
+            (2, 8, 0.0010606),
+            (5, 1, 0.0001511),
+            (5, 2, 0.0004135),
+            (5, 4, 0.0008455),
+            (5, 8, 0.0019198),
+            (8, 1, 0.0001580),
+            (8, 2, 0.0003348),
+            (8, 4, 0.0006500),
+            (8, 8, 0.0013023),
+        ])?;
+        let rates_4090_bf16 = [1_008.1e9, 0.0, 19.71e9, 18.77e9];
+        let bf16_admission = Admission {
+            budget_bytes_per_token: admission_budget(
+                &geometry,
+                &bf16_service,
+                rates_4090_bf16[2],
+                rates_4090_bf16[3],
+                2,
+            )?,
+        };
+        let bf16_slot_bytes = bf16_layout.slot_bytes();
+        let bf16_unbacked_capacity = Capacity {
+            layout: bf16_layout,
+            span_rows: 1024,
+            wave_rows: 1024,
+            device_expert_bytes: 2283 * bf16_slot_bytes,
+            peer_expert_bytes: 0,
+            host_expert_bytes: 7966 * bf16_slot_bytes,
+            gpu0_layers: 40,
+            slots_per_layer: equal_slots(2283, 40)?,
+            host_blocks: 7966,
+            spare_blocks: 14,
+            disk_bytes: 0,
+            worker_count: 24,
+            disk_workers: 0,
+            prefill_staging_slots: 2,
+            pinned: true,
+        };
+        for freq in [&cold_freq, &skewed_freq] {
+            let bf16_4090 = VerifyCostSchedule::derive(
+                &draft,
+                (&bf16_model, bf16_non_expert),
+                (&bf16_unbacked_capacity, bf16_admission, &bf16_service, 2),
+                (rates_4090_bf16, l2_4090),
+                &[],
+                freq,
+            )?;
+            ensure!(
+                (MIN_MOE_VERIFY_ROWS..=6).contains(&bf16_4090.max_rows)
+                    && select_verify_rows(&[0.99; 15], MIN_MOE_VERIFY_ROWS, &bf16_4090)? <= 6,
+                "4090 BF16 unbacked schedule failed cap discriminator: {bf16_4090:?}"
+            );
+        }
+        let bf16_unbacked = VerifyCostSchedule::derive(
+            &draft,
+            (&bf16_model, bf16_non_expert),
+            (&bf16_unbacked_capacity, bf16_admission, &bf16_service, 2),
+            (rates_4090_bf16, l2_4090),
+            &[],
+            &skewed_freq,
+        )?;
+        let mut bf16_backed_control = bf16_unbacked_capacity;
+        bf16_backed_control.host_blocks = 10240;
+        let bf16_backed = VerifyCostSchedule::derive(
+            &draft,
+            (&bf16_model, bf16_non_expert),
+            (&bf16_backed_control, bf16_admission, &bf16_service, 2),
+            (rates_4090_bf16, l2_4090),
+            &[],
+            &skewed_freq,
+        )?;
+        ensure!(
+            bf16_backed.max_rows > bf16_unbacked.max_rows,
+            "negative control failed: host-backed perturbation did not relax BF16 max_rows ({:?} vs {:?})",
+            bf16_backed.max_rows,
+            bf16_unbacked.max_rows
+        );
+        Ok(())
     }
 
     #[test]

@@ -1161,7 +1161,7 @@ impl Engine {
                 capacity,
                 reserves,
                 service,
-                1_000_000_000.0,
+                (1_000_000_000.0, 1_000_000_000.0, 2, Vec::new()),
                 (
                     model_spec
                         .moe
