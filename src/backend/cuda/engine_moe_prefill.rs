@@ -475,7 +475,7 @@ type Wave = (usize, usize, usize, bool, String);
 pub(in crate::backend::cuda::engine) struct Prefill {
     geometry: ExpertGeometry,
     shared_intermediate: u32,
-    capacity: Capacity,
+    pub(in crate::backend::cuda::engine) capacity: Capacity,
     reserves: Reserves,
     service: ServiceTable,
     workers: u32,
@@ -1441,6 +1441,61 @@ impl Prefill {
         )?;
         Ok(())
     }
+
+    /// The fused finish of one wave: the shared FFN, the routed sum, the
+    /// shared sigmoid gate and the residual add in one launch. The residual
+    /// buffer is updated in place.
+    fn finish_wave_residual(
+        &mut self,
+        device: &Device,
+        decode: &mut Decode,
+        ffn: BoundFfn,
+        wave: (u32, u32, u32),
+        residual: Tensor<bf16, 2>,
+    ) -> Result<()> {
+        let (layer, base, rows) = wave;
+        let BoundFfn::Moe {
+            ref shared,
+            shared_gate,
+            ..
+        } = ffn
+        else {
+            anyhow::bail!("prefill finish received a dense FFN");
+        };
+        let span = self
+            .span
+            .as_ref()
+            .context("prefill finish has no borrowed span")?;
+        let fin = MoePrefillFinish {
+            expert_inter: self.geometry.intermediate,
+            x: span.hidden(&span.layout.normalized, base, rows)?,
+            ids: span.choices(&span.layout.ids, base, rows)?,
+            final_active: span.choices(&span.layout.active, base, rows)?,
+            contributions: span.contributions(base, rows)?,
+            done: span.choices(&span.layout.done, base, rows)?,
+            experts: self.geometry.experts,
+            shared_gate: shared[0],
+            shared_up: shared[1],
+            shared_down: shared[2],
+            shared_expert_gate: shared_gate,
+            y: TensorMut(residual),
+        };
+        if layer >= self.capacity.gpu0_layers {
+            decode.prefill.prefill_finish_routed_residual(
+                &device.stream,
+                fin,
+                span.routed(base, rows)?,
+                &qwen::scratch(&self.gpu.scratch, &device.stream),
+            )?;
+            return Ok(());
+        }
+        decode.prefill.prefill_finish_residual(
+            &device.stream,
+            fin,
+            &qwen::scratch(&self.gpu.scratch, &device.stream),
+        )?;
+        Ok(())
+    }
 }
 
 impl PeerPrefill {
@@ -2026,15 +2081,43 @@ impl Engine {
                     let skip = mixer_skip.saturating_sub(base - wave_base).min(rows);
                     let selected = *mixer_selected && skip < rows;
                     let step = self.moe_wave(span_start + base, rows)?;
+                    // The fused finish replaces the shared scale launch, the
+                    // residual launch and the three finish-wave copies with
+                    // one in-place launch on the residual; the traced FFN
+                    // output keeps the unfused path.
+                    let fused = ffn.is_some() && !flint && !(any_selected && selected_layer);
                     match &ffn {
                         Some((slot_layer, ffn)) => {
-                            prefill.finish_wave(
-                                &self.device,
-                                decode,
-                                ffn.clone(),
-                                (*slot_layer, base as u32, rows as u32),
-                                qwen::matrix(&self.work.out, &self.device.stream, 0, rows, hidden)?,
-                            )?;
+                            if fused {
+                                let residual = {
+                                    let span = prefill
+                                        .span
+                                        .as_ref()
+                                        .context("prefill fused finish has no borrowed span")?;
+                                    span.hidden(&span.layout.residual, base as u32, rows as u32)?
+                                };
+                                prefill.finish_wave_residual(
+                                    &self.device,
+                                    decode,
+                                    ffn.clone(),
+                                    (*slot_layer, base as u32, rows as u32),
+                                    residual,
+                                )?;
+                            } else {
+                                prefill.finish_wave(
+                                    &self.device,
+                                    decode,
+                                    ffn.clone(),
+                                    (*slot_layer, base as u32, rows as u32),
+                                    qwen::matrix(
+                                        &self.work.out,
+                                        &self.device.stream,
+                                        0,
+                                        rows,
+                                        hidden,
+                                    )?,
+                                )?;
+                            }
                         }
                         None => {
                             let span = prefill
@@ -2060,65 +2143,95 @@ impl Engine {
                         .span
                         .as_ref()
                         .context("prefill residual join has no borrowed span")?;
-                    device_copy(
-                        &self.device.stream,
-                        span.hidden(&span.layout.residual, base as u32, rows as u32)?,
-                        qwen::matrix(&self.work.x, &self.device.stream, 0, rows, hidden)?,
-                    )?;
-                    device_copy(
-                        &self.device.stream,
-                        qwen::matrix(&self.work.out, &self.device.stream, 0, rows, hidden)?,
-                        span.hidden(&span.layout.normalized, base as u32, rows as u32)?,
-                    )?;
-                    if flint {
-                        self.run_operator(O::NextNorm, layer, step, &mut None)?;
-                    } else {
-                        // SAFETY: the two owned dense row windows cover rows*hidden values on this stream.
-                        unsafe {
-                            self.device
-                                .stream
-                                .launch_builder(&self.ops.residual)
-                                .arg(&mut self.work.x)
-                                .arg(&self.work.out)
-                                .arg(&(i32::try_from(rows * hidden)?))
-                                .launch(super::super::super::super::ops::flat(rows * hidden))?;
+                    if !fused {
+                        device_copy(
+                            &self.device.stream,
+                            span.hidden(&span.layout.residual, base as u32, rows as u32)?,
+                            qwen::matrix(&self.work.x, &self.device.stream, 0, rows, hidden)?,
+                        )?;
+                        device_copy(
+                            &self.device.stream,
+                            qwen::matrix(&self.work.out, &self.device.stream, 0, rows, hidden)?,
+                            span.hidden(&span.layout.normalized, base as u32, rows as u32)?,
+                        )?;
+                        if flint {
+                            self.run_operator(O::NextNorm, layer, step, &mut None)?;
+                        } else {
+                            // SAFETY: the two owned dense row windows cover rows*hidden values on this stream.
+                            unsafe {
+                                self.device
+                                    .stream
+                                    .launch_builder(&self.ops.residual)
+                                    .arg(&mut self.work.x)
+                                    .arg(&self.work.out)
+                                    .arg(&(i32::try_from(rows * hidden)?))
+                                    .launch(super::super::super::super::ops::flat(rows * hidden))?;
+                            }
                         }
                     }
                     if let Some(capture) = &mut self.hidden_capture
                         && let Some(slot) = capture.layer_slots[layer]
                     {
-                        copy::columns(
-                            &self.device.stream,
-                            &self.work.x,
-                            &mut capture.values.slice_mut(base * capture.width..),
-                            copy::Rect {
-                                rows,
-                                width: hidden,
-                                src_pitch: hidden,
-                                src_col: 0,
-                                dst_pitch: capture.width,
-                                dst_col: slot as usize * hidden,
-                            },
-                        )?;
+                        let rect = copy::Rect {
+                            rows,
+                            width: hidden,
+                            src_pitch: hidden,
+                            src_col: 0,
+                            dst_pitch: capture.width,
+                            dst_col: slot as usize * hidden,
+                        };
+                        if fused {
+                            copy::columns_from(
+                                &self.device.stream,
+                                span.hidden(&span.layout.residual, base as u32, rows as u32)?
+                                    .ptr,
+                                &mut capture.values.slice_mut(base * capture.width..),
+                                rect,
+                            )?;
+                        } else {
+                            copy::columns(
+                                &self.device.stream,
+                                &self.work.x,
+                                &mut capture.values.slice_mut(base * capture.width..),
+                                rect,
+                            )?;
+                        }
                     }
-                    device_copy(
-                        &self.device.stream,
-                        qwen::matrix(&self.work.x, &self.device.stream, 0, rows, hidden)?,
-                        span.hidden(&span.layout.residual, base as u32, rows as u32)?,
-                    )?;
-                    if flint {
+                    if !fused {
                         device_copy(
                             &self.device.stream,
-                            qwen::matrix(&self.work.n, &self.device.stream, 0, rows, hidden)?,
-                            span.hidden(&span.layout.normalized, base as u32, rows as u32)?,
+                            qwen::matrix(&self.work.x, &self.device.stream, 0, rows, hidden)?,
+                            span.hidden(&span.layout.residual, base as u32, rows as u32)?,
                         )?;
+                        if flint {
+                            device_copy(
+                                &self.device.stream,
+                                qwen::matrix(&self.work.n, &self.device.stream, 0, rows, hidden)?,
+                                span.hidden(&span.layout.normalized, base as u32, rows as u32)?,
+                            )?;
+                        }
                     }
                     if any_selected {
-                        residual_trace.extend(
-                            self.device
-                                .stream
-                                .clone_dtoh(&self.work.x.slice(..rows * hidden))?,
-                        );
+                        if fused {
+                            let mut host = vec![bf16::ZERO; rows * hidden];
+                            // SAFETY: the live span covers this whole residual prefix.
+                            unsafe {
+                                result::memcpy_dtoh_async(
+                                    &mut host,
+                                    span.hidden(&span.layout.residual, base as u32, rows as u32)?
+                                        .ptr,
+                                    self.device.stream.cu_stream(),
+                                )?;
+                            }
+                            self.device.stream.synchronize()?;
+                            residual_trace.extend(host);
+                        } else {
+                            residual_trace.extend(
+                                self.device
+                                    .stream
+                                    .clone_dtoh(&self.work.x.slice(..rows * hidden))?,
+                            );
+                        }
                     }
                     if all_layers
                         && selected

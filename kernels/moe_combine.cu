@@ -111,6 +111,64 @@ extern "C" __global__ void moe_combine_ungated(
   }
 }
 
+// One 16-byte group of eight BF16 values.
+union Bf16x8 {
+  float4 v;
+  bf16 h[8];
+};
+
+// scale[row] = BF16(sigmoid(BF16(dot(x_row, seg)))) with the thread stride,
+// FP32 products and warp/shared reduction of moe_shared_scale; the value is
+// broadcast to every thread of the block through shared memory.
+__device__ __forceinline__ bf16 moe_row_scale(const bf16* __restrict__ xr,
+                                               const bf16* __restrict__ seg,
+                                               long long hidden) {
+  const int tid = threadIdx.x;
+  __shared__ float red[8];
+  __shared__ float scale;
+  float part = 0.0f;
+  for (long long c = tid; c < hidden; c += blockDim.x)
+    part += __bfloat162float(xr[c]) * __bfloat162float(seg[c]);
+  for (int off = 16; off > 0; off >>= 1)
+    part += __shfl_down_sync(0xffffffffu, part, off);
+  if ((tid & 31) == 0) red[tid >> 5] = part;
+  __syncthreads();
+  if (tid < 32) {
+    float v = tid < (blockDim.x >> 5) ? red[tid] : 0.0f;
+    for (int off = 16; off > 0; off >>= 1)
+      v += __shfl_down_sync(0xffffffffu, v, off);
+    if (tid == 0) {
+      const float sig =
+          1.0f / (1.0f + expf(-__bfloat162float(__float2bfloat16(v))));
+      scale = __bfloat162float(__float2bfloat16(sig));
+    }
+  }
+  __syncthreads();
+  return __float2bfloat16(scale);
+}
+
+// The final-active contributions of one row in ascending expert id, summed
+// in FP32 into one accumulator per element of the lane group.
+template <int VEC>
+__device__ __forceinline__ void moe_routed_acc(
+    const bf16* __restrict__ contributions, const int* __restrict__ order,
+    int live, int a0, long long hidden, long long d0, float* acc) {
+#pragma unroll
+  for (int j = 0; j < VEC; ++j) acc[j] = 0.0f;
+  for (int k = 0; k < live; ++k) {
+    const bf16* __restrict__ src =
+        contributions + (long long)(a0 + order[k]) * hidden + d0;
+    if constexpr (VEC == 8) {
+      Bf16x8 c;
+      c.v = *reinterpret_cast<const float4*>(src);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) acc[j] += __bfloat162float(c.h[j]);
+    } else {
+      acc[0] += __bfloat162float(src[0]);
+    }
+  }
+}
+
 extern "C" __global__ void moe_combine_routed(
     const bf16* __restrict__ contributions, const int* __restrict__ ids,
     const unsigned* __restrict__ done, const unsigned* __restrict__ final_active,
@@ -130,6 +188,30 @@ extern "C" __global__ void moe_combine_routed(
       acc += __bfloat162float(
           contributions[(long long)(a0 + order[k]) * hidden + d]);
     rr[d] = __float2bfloat16(acc);
+  }
+}
+
+extern "C" __global__ void moe_combine_routed_vector(
+    const bf16* __restrict__ contributions, const int* __restrict__ ids,
+    const unsigned* __restrict__ done, const unsigned* __restrict__ final_active,
+    bf16* __restrict__ routed_out, int rows, int top_k, long long hidden) {
+  if (blockDim.x != 256 || top_k < 1 || top_k > 32 || hidden % 8 != 0) __trap();
+  const int row = blockIdx.x;
+  if (row < 0 || row >= rows) __trap();
+  const int tid = threadIdx.x;
+  const int a0 = row * top_k;
+  int order[32];
+  const int live =
+      moe_order_routed_row(ids, done, final_active, a0, top_k, order);
+  bf16* __restrict__ rr = routed_out + (long long)row * hidden;
+  for (long long d0 = (long long)tid * 8; d0 < hidden;
+       d0 += (long long)blockDim.x * 8) {
+    float acc[8];
+    moe_routed_acc<8>(contributions, order, live, a0, hidden, d0, acc);
+    Bf16x8 out;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) out.h[j] = __float2bfloat16(acc[j]);
+    *reinterpret_cast<float4*>(rr + d0) = out.v;
   }
 }
 
@@ -155,4 +237,150 @@ extern "C" __global__ void moe_join_routed(
       yr[d] = __hadd(rr[d], sh[d]);
     }
   }
+}
+
+// Fused combine group: the routed sum, the shared-expert sigmoid gate and the
+// residual add in one launch, writing the residual in place.
+//   residual[row, d] = residual[row, d] + BF16(routed[row, d] + gated[d]).
+// grid = (rows, 1, 1), block = (256, 1, 1). seg == nullptr selects the
+// ungated shared expert.
+template <int VEC>
+__device__ __forceinline__ void moe_combine_residual_body(
+    const bf16* __restrict__ contributions, const bf16* __restrict__ shared_out,
+    const bf16* __restrict__ seg, const bf16* __restrict__ x, long long x_stride,
+    const int* __restrict__ ids, const unsigned* __restrict__ done,
+    const unsigned* __restrict__ final_active, bf16* __restrict__ residual,
+    int rows, int top_k, long long hidden) {
+  if (blockDim.x != 256 || top_k < 1 || top_k > 32) __trap();
+  const int row = blockIdx.x;
+  if (row < 0 || row >= rows) __trap();
+  const int tid = threadIdx.x;
+  const int a0 = row * top_k;
+  int order[32];
+  const int live =
+      moe_order_routed_row(ids, done, final_active, a0, top_k, order);
+  const bool gated = seg != nullptr;
+  bf16 scale_row = __float2bfloat16(0.0f);
+  if (gated)
+    scale_row = moe_row_scale(x + (long long)row * x_stride, seg, hidden);
+  const bf16* __restrict__ sh = shared_out + (long long)row * hidden;
+  bf16* __restrict__ res = residual + (long long)row * hidden;
+  if constexpr (VEC == 8) {
+    for (long long d0 = (long long)tid * 8; d0 < hidden;
+         d0 += (long long)blockDim.x * 8) {
+      float acc[8];
+      moe_routed_acc<8>(contributions, order, live, a0, hidden, d0, acc);
+      Bf16x8 s;
+      s.v = *reinterpret_cast<const float4*>(sh + d0);
+      Bf16x8 r;
+      r.v = *reinterpret_cast<float4*>(res + d0);
+      if (gated) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+          r.h[j] = __hadd(r.h[j], __hadd(__float2bfloat16(acc[j]),
+                                         __hmul(scale_row, s.h[j])));
+      } else {
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+          r.h[j] = __hadd(r.h[j], __hadd(__float2bfloat16(acc[j]), s.h[j]));
+      }
+      *reinterpret_cast<float4*>(res + d0) = r.v;
+    }
+  } else {
+    for (long long d = tid; d < hidden; d += blockDim.x) {
+      float acc[1];
+      moe_routed_acc<1>(contributions, order, live, a0, hidden, d, acc);
+      if (gated)
+        res[d] = __hadd(res[d], __hadd(__float2bfloat16(acc[0]),
+                                        __hmul(scale_row, sh[d])));
+      else
+        res[d] = __hadd(res[d], __hadd(__float2bfloat16(acc[0]), sh[d]));
+    }
+  }
+}
+
+// The peer join: the routed sum comes from the peer GPU, the shared expert
+// and the residual are local. Writing the residual in place.
+template <int VEC>
+__device__ __forceinline__ void moe_join_routed_residual_body(
+    const bf16* __restrict__ routed_in, const bf16* __restrict__ shared_out,
+    const bf16* __restrict__ seg, const bf16* __restrict__ x, long long x_stride,
+    bf16* __restrict__ residual, int rows, long long hidden) {
+  if (blockDim.x != 256) __trap();
+  const int row = blockIdx.x;
+  if (row < 0 || row >= rows) __trap();
+  const int tid = threadIdx.x;
+  const bool gated = seg != nullptr;
+  bf16 scale_row = __float2bfloat16(0.0f);
+  if (gated)
+    scale_row = moe_row_scale(x + (long long)row * x_stride, seg, hidden);
+  const bf16* __restrict__ sh = shared_out + (long long)row * hidden;
+  const bf16* __restrict__ rr = routed_in + (long long)row * hidden;
+  bf16* __restrict__ res = residual + (long long)row * hidden;
+  if constexpr (VEC == 8) {
+    for (long long d0 = (long long)tid * 8; d0 < hidden;
+         d0 += (long long)blockDim.x * 8) {
+      Bf16x8 s;
+      s.v = *reinterpret_cast<const float4*>(sh + d0);
+      Bf16x8 r;
+      r.v = *reinterpret_cast<const float4*>(rr + d0);
+      Bf16x8 o;
+      o.v = *reinterpret_cast<const float4*>(res + d0);
+      if (gated) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+          o.h[j] = __hadd(o.h[j], __hadd(r.h[j], __hmul(scale_row, s.h[j])));
+      } else {
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+          o.h[j] = __hadd(o.h[j], __hadd(r.h[j], s.h[j]));
+      }
+      *reinterpret_cast<float4*>(res + d0) = o.v;
+    }
+  } else {
+    for (long long d = tid; d < hidden; d += blockDim.x) {
+      if (gated)
+        res[d] = __hadd(res[d], __hadd(rr[d], __hmul(scale_row, sh[d])));
+      else
+        res[d] = __hadd(res[d], __hadd(rr[d], sh[d]));
+    }
+  }
+}
+
+extern "C" __global__ void moe_combine_residual(
+    const bf16* __restrict__ contributions, const bf16* __restrict__ shared_out,
+    const bf16* __restrict__ seg, const bf16* __restrict__ x, long long x_stride,
+    const int* __restrict__ ids, const unsigned* __restrict__ done,
+    const unsigned* __restrict__ final_active, bf16* __restrict__ residual,
+    int rows, int top_k, long long hidden) {
+  moe_combine_residual_body<8>(contributions, shared_out, seg, x, x_stride, ids,
+                                done, final_active, residual, rows, top_k,
+                                hidden);
+}
+
+extern "C" __global__ void moe_combine_residual_scalar(
+    const bf16* __restrict__ contributions, const bf16* __restrict__ shared_out,
+    const bf16* __restrict__ seg, const bf16* __restrict__ x, long long x_stride,
+    const int* __restrict__ ids, const unsigned* __restrict__ done,
+    const unsigned* __restrict__ final_active, bf16* __restrict__ residual,
+    int rows, int top_k, long long hidden) {
+  moe_combine_residual_body<1>(contributions, shared_out, seg, x, x_stride, ids,
+                               done, final_active, residual, rows, top_k,
+                               hidden);
+}
+
+extern "C" __global__ void moe_join_routed_residual(
+    const bf16* __restrict__ routed_in, const bf16* __restrict__ shared_out,
+    const bf16* __restrict__ seg, const bf16* __restrict__ x, long long x_stride,
+    bf16* __restrict__ residual, int rows, long long hidden) {
+  moe_join_routed_residual_body<8>(routed_in, shared_out, seg, x, x_stride,
+                                    residual, rows, hidden);
+}
+
+extern "C" __global__ void moe_join_routed_residual_scalar(
+    const bf16* __restrict__ routed_in, const bf16* __restrict__ shared_out,
+    const bf16* __restrict__ seg, const bf16* __restrict__ x, long long x_stride,
+    bf16* __restrict__ residual, int rows, long long hidden) {
+  moe_join_routed_residual_body<1>(routed_in, shared_out, seg, x, x_stride,
+                                   residual, rows, hidden);
 }
