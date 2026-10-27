@@ -1550,6 +1550,7 @@ struct PoolShared {
     error: Mutex<Option<String>>,
     workers: usize,
     boundaries: ExpertBoundaries,
+    // Low nine bits are the published participant count.
     generation: AtomicU64,
     pending: AtomicBool,
     prewake: AtomicBool,
@@ -1759,6 +1760,10 @@ impl ExpertPool {
             participants.participant(max_rows, max_assignments).is_ok(),
             "participant table does not cover rows={max_rows} assignments={max_assignments}"
         );
+        ensure!(
+            participants.worker_count() as usize <= workers,
+            "participant table exceeds pool worker capacity {workers}"
+        );
         let isa = Isa::detect();
         if let Some(slot) = &fp8_slot {
             let geometry = ExpertGeometry {
@@ -1829,6 +1834,10 @@ impl ExpertPool {
                         let _guard = shared.park.lock();
                         shared.shutdown.store(true, Ordering::Release);
                         shared.wake.notify_all();
+                        for worker in &shared.worker_wakes {
+                            let _guard = worker.park.lock();
+                            worker.wake.notify_all();
+                        }
                     }
                     for handle in handles {
                         let _ = handle.join();
@@ -1881,10 +1890,6 @@ impl ExpertPool {
 
     pub fn stop_prewake(&self) -> Result<()> {
         self.shared.prewake.store(false, Ordering::Release);
-        for worker in &self.shared.worker_wakes {
-            let _guard = worker.park.lock();
-            worker.wake.notify_all();
-        }
         Ok(())
     }
 
@@ -2019,7 +2024,11 @@ impl ExpertPool {
         self.shared.phase1.store(0, Ordering::Release);
         self.shared.finished.store(0, Ordering::Release);
         self.shared.failed.store(false, Ordering::Release);
-        self.shared.generation.fetch_add(1, Ordering::Release);
+        let generation = self.shared.generation.load(Ordering::Relaxed);
+        self.shared.generation.store(
+            (generation.wrapping_add(512) & !511) | participants as u64,
+            Ordering::Release,
+        );
         for worker in &self.shared.worker_wakes[..participants] {
             let _guard = worker.park.lock();
             worker.wake.notify_all();
@@ -2225,7 +2234,7 @@ fn worker(index: usize, context: WorkerContext) {
                 let current = shared.generation.load(Ordering::Acquire);
                 if current != seen {
                     seen = current;
-                    if index >= shared.participants.load(Ordering::Acquire) {
+                    if index >= (current & 511) as usize {
                         continue;
                     }
                     break;
@@ -3922,8 +3931,69 @@ mod tests {
     }
 
     #[test]
-    fn mixed_participant_pool_matches_scalar_bits() -> Result<()> {
+    #[ignore = "requires a process task cap below 256; run with TasksMax=96"]
+    fn spawn_failure_wakes_parked_workers() -> Result<()> {
+        let error = ExpertPool::new(256, Shape::new(8, 8)?, 1, 1, None)
+            .err()
+            .context("spawn failure gate requires a process task cap below 256")?;
+        ensure!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock),
+            "spawn failure gate did not reach the OS thread limit: {error:#}"
+        );
+        println!(
+            "PASS EXPERT_POOL_SPAWN_FAILURE resource_error_returned=true parked_workers_joined=true"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_nonparticipant_cannot_join_next_job_before_publication() -> Result<()> {
         let fixture = pool_fixture()?;
+        let pool = ExpertPool::new_with_boundaries(
+            4,
+            fixture.shape,
+            2,
+            4,
+            None,
+            ExpertBoundaries {
+                swiglu_rounding: crate::model_spec::SwigluRounding::Twice,
+                swiglu_limit: 0.0,
+                routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+            },
+            crate::experts::plan::ParticipantTable::uniform(2, 4, 2)?,
+        )?;
+        let mut output = vec![bf16::ZERO; fixture.assignments.len() * fixture.shape.hidden];
+        pool.run(fixture_job(&fixture, &mut output))?;
+        let shared = pool.shared.clone();
+        let context = WorkerContext {
+            shared: shared.clone(),
+            wake: shared.worker_wakes[3].clone(),
+            shape: fixture.shape,
+            isa: pool.isa,
+            max_rows: 2,
+            max_assignments: 4,
+            fp8_slot: None,
+        };
+        drop(pool);
+        shared.shutdown.store(false, Ordering::Release);
+        shared.participants.store(4, Ordering::Release);
+        let finished = shared.finished.load(Ordering::Acquire);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = shared.worker_wakes[3].park.lock().unwrap();
+            panic!("stop the resumed worker at its next park");
+        }));
+        assert!(poisoned.is_err());
+        worker(3, context);
+        assert_eq!(shared.finished.load(Ordering::Acquire), finished);
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_participant_pool_matches_scalar_bits() -> Result<()> {
+        let mut fixture = pool_fixture()?;
+        fixture.experts.push(weights(&fixture.shape, 3));
         let mut cells = Vec::new();
         for rows in [1u32, 2] {
             for (workers, groups, seconds) in [
@@ -3949,7 +4019,7 @@ mod tests {
             }
         }
         let service = crate::experts::plan::ServiceTable::new("mixed", cells)?;
-        let participants = service.participant_table(2, 4, 4)?;
+        let participants = service.participant_table(2, 4)?;
         let pool = ExpertPool::new_with_boundaries(
             4,
             fixture.shape,
@@ -3963,17 +4033,21 @@ mod tests {
             },
             participants,
         )?;
-        let expected = expected_output(&fixture)?;
-        let mut output = vec![bf16::ZERO; expected.len()];
-        let pending = pool.submit(fixture_job(&fixture, &mut output))?;
-        assert_eq!(
-            pool.shared
-                .participants
-                .load(std::sync::atomic::Ordering::Acquire),
-            2
-        );
-        pool.finish(pending)?;
-        assert_eq!(output, expected);
+        for groups in [1, 4, 2, 3, 4, 1].into_iter().cycle().take(48) {
+            for (index, assignment) in fixture.assignments.iter_mut().enumerate() {
+                assignment.expert = index as u32 % groups;
+            }
+            let expected = expected_output(&fixture)?;
+            let mut output = vec![bf16::ZERO; expected.len()];
+            pool.prewake()?;
+            let pending = pool.submit(fixture_job(&fixture, &mut output))?;
+            assert_eq!(
+                pool.shared.participants.load(Ordering::Acquire),
+                [1, 4, 2, 4][groups as usize - 1]
+            );
+            pool.finish(pending)?;
+            assert_eq!(output, expected);
+        }
         Ok(())
     }
 

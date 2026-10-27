@@ -290,7 +290,7 @@ impl Setup {
         let available = host_memory(Path::new("/"))?;
         let copies = measured.copy_engines.min(2);
         let slot = catalogue.slot_bytes();
-        let workers = measured.service.worker_count()?;
+        let workers = measured.service.pool_worker_count()?;
         let policy = crate::gdn_plan::GdnPolicy::for_device(&device.info);
         let vision = if model.vision.is_some() {
             crate::checkpoint::MappedCheckpoint::open(directory)?
@@ -668,11 +668,10 @@ impl Setup {
             cpu.0.max(self.decode_rows),
             cpu.1.max(self.decode_rows * geometry.top_k as usize),
         );
-        let participants = self.measured.service.participant_table(
-            u32::try_from(cpu_bounds.0)?,
-            u32::try_from(cpu_bounds.1)?,
-            self.capacity.worker_count,
-        )?;
+        let participants = self
+            .measured
+            .service
+            .participant_table(u32::try_from(cpu_bounds.0)?, u32::try_from(cpu_bounds.1)?)?;
         engine.moe = Some(Decode::new(
             &engine.device,
             DecodeOptions {

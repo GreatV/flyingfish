@@ -101,28 +101,29 @@ impl ServiceTable {
         Ok(best.map(|(_, workers)| workers).expect("best is set"))
     }
 
-    pub fn participant_table(
-        &self,
-        max_rows: u32,
-        max_groups: u32,
-        worker_limit: u32,
-    ) -> Result<ParticipantTable> {
+    pub fn pool_worker_count(&self) -> Result<u32> {
+        let groups = self
+            .cells
+            .iter()
+            .map(|cell| cell.experts)
+            .max()
+            .expect("nonempty service table");
+        Ok(self
+            .participant_table(self.max_rows(), groups)?
+            .worker_count())
+    }
+
+    pub fn participant_table(&self, max_rows: u32, max_groups: u32) -> Result<ParticipantTable> {
         ensure!(max_rows > 0, "zero participant rows");
         ensure!(max_groups > 0, "zero participant groups");
-        ensure!(worker_limit > 0, "zero participant worker limit");
         let workers: Vec<u32> = self
             .cells
             .iter()
             .map(|cell| cell.workers)
-            .filter(|&workers| workers <= worker_limit)
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect();
-        ensure!(
-            !workers.is_empty(),
-            "service table has no worker candidates at or below {worker_limit}"
-        );
-        let default_participants = self.worker_count()?.min(worker_limit);
+        let mut default_participants = workers[0];
         let mut mixed = std::collections::BTreeMap::new();
         let measured_rows = self.max_rows();
         for rows in 1..=measured_rows {
@@ -138,6 +139,9 @@ impl ServiceTable {
                     }
                 }
                 let participants = best.map(|(_, workers)| workers).expect("best is set");
+                if rows == 1 && groups == 1 {
+                    default_participants = participants;
+                }
                 if participants != default_participants {
                     mixed.insert((rows, groups), participants);
                 }
@@ -291,6 +295,13 @@ impl ServiceTable {
 }
 
 impl ParticipantTable {
+    pub fn worker_count(&self) -> u32 {
+        self.mixed
+            .values()
+            .copied()
+            .fold(self.default_participants, u32::max)
+    }
+
     pub fn uniform(max_rows: u32, max_groups: u32, participants: u32) -> Result<Self> {
         ensure!(
             max_rows > 0 && max_groups > 0 && participants > 0,
@@ -308,7 +319,6 @@ impl ParticipantTable {
     pub fn participant(&self, rows: usize, groups: usize) -> Result<u32> {
         let rows = u32::try_from(rows).context("participant rows exceed u32")?;
         let groups = u32::try_from(groups).context("participant groups exceed u32")?;
-        let rows = rows.min(self.measured_rows);
         let groups = groups.max(1);
         ensure!(
             rows > 0 && rows <= self.max_rows && groups <= self.max_groups,
@@ -316,6 +326,7 @@ impl ParticipantTable {
             self.max_rows,
             self.max_groups
         );
+        let rows = rows.min(self.measured_rows);
         Ok(self
             .mixed
             .get(&(rows, groups))
@@ -751,7 +762,7 @@ pub fn capacity_with_peer(
         inputs.span_rows,
         inputs.span_rows,
     )?;
-    let worker_count = inputs.service.worker_count()?;
+    let worker_count = inputs.service.pool_worker_count()?;
     let mut gpu0_layers = geometry.layers;
     let mut peer_expert_bytes = 0u64;
     let mut total_slots = gpu0_max_slots;
@@ -783,7 +794,9 @@ pub fn capacity_with_peer(
                 )?;
             let removed_misses = (gpu0_slots + peer_slots).saturating_sub(gpu0_max_slots);
             let decode_miss_seconds = (removed_misses as f64 / f64::from(geometry.experts))
-                * inputs.service.seconds(1, 1, worker_count)?;
+                * inputs
+                    .service
+                    .seconds(1, 1, inputs.service.worker_count()?)?;
             let prefill_hop_seconds = f64::from(peer_layers)
                 * peer_hop_seconds(
                     peer.prefill_transfers,
@@ -1869,7 +1882,7 @@ mod tests {
             (1, 2, 0.16),
             (1, 3, 0.24),
             (1, 4, 0.32),
-            (2, 1, 0.12),
+            (2, 1, 0.08),
             (2, 2, 0.14),
             (2, 3, 0.15),
             (2, 4, 0.24),
@@ -1886,14 +1899,24 @@ mod tests {
             });
         }
         let mixed = ServiceTable::new("mixed", mixed).unwrap();
-        let participants = mixed.participant_table(1, 4, 4).unwrap();
-        assert_eq!(participants.participant(1, 1).unwrap(), 1);
+        assert_eq!(mixed.worker_count().unwrap(), 2);
+        assert_eq!(mixed.pool_worker_count().unwrap(), 4);
+        let participants = mixed.participant_table(1, 4).unwrap();
+        assert_eq!(participants.worker_count(), 4);
+        assert_eq!(participants.participant(1, 1).unwrap(), 2);
         assert_eq!(participants.participant(1, 2).unwrap(), 4);
         assert_eq!(participants.participant(1, 3).unwrap(), 2);
         assert_eq!(participants.participant(1, 4).unwrap(), 4);
-        let extended = mixed.participant_table(4, 4, 4).unwrap();
-        assert_eq!(extended.participant(4, 1).unwrap(), 1);
+        let extended = mixed.participant_table(4, 4).unwrap();
+        assert_eq!(extended.participant(4, 1).unwrap(), 2);
         assert_eq!(extended.participant(4, 3).unwrap(), 2);
+        assert!(extended.participant(5, 1).is_err());
+        assert!(
+            ParticipantTable::uniform(2, 4, 2)
+                .unwrap()
+                .participant(3, 1)
+                .is_err()
+        );
         assert!(
             ServiceTable::new(
                 "x",
