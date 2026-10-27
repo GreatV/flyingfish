@@ -183,7 +183,7 @@ __device__ __forceinline__ void rmsnorm_row(const __nv_bfloat16* __restrict__ x,
 
 // Fused residual add + RMSNorm over one row per block. res/res_out are not
 // __restrict__: res_out == res (in-place residual stream) is supported.
-template <int VEC, bool BF16_SCALE = false, bool ROUND_RESIDUAL = true>
+template <int VEC, bool BF16_SCALE = false, bool ROUND_RESIDUAL = true, bool WEIGHTED = true>
 __device__ __forceinline__ void add_rmsnorm_row(const __nv_bfloat16* __restrict__ x,
                                                 const __nv_bfloat16* res,
                                                 const __nv_bfloat16* __restrict__ w,
@@ -248,7 +248,11 @@ __device__ __forceinline__ void add_rmsnorm_row(const __nv_bfloat16* __restrict_
       if (c < nv) {
         const size_t idx = (size_t)c * VEC;
         float ww[VEC], out[VEC];
-        ld_vec<VEC>(w + idx, ww);
+        if constexpr (WEIGHTED) ld_vec<VEC>(w + idx, ww);
+        else {
+#pragma unroll
+          for (int j = 0; j < VEC; ++j) ww[j] = 1.0f;
+        }
 #pragma unroll
         for (int j = 0; j < VEC; ++j) out[j] = norm_scale<BF16_SCALE>(rr[i * VEC + j], rstd, ww[j]);
         st_vec<VEC>(y + idx, out);
@@ -263,7 +267,11 @@ __device__ __forceinline__ void add_rmsnorm_row(const __nv_bfloat16* __restrict_
 #pragma unroll
           for (int j = 0; j < VEC; ++j) b[j] = unrounded[idx + j];
         }
-      ld_vec<VEC>(w + idx, ww);
+      if constexpr (WEIGHTED) ld_vec<VEC>(w + idx, ww);
+      else {
+#pragma unroll
+        for (int j = 0; j < VEC; ++j) ww[j] = 1.0f;
+      }
 #pragma unroll
       for (int j = 0; j < VEC; ++j) out[j] = norm_scale<BF16_SCALE>(b[j], rstd, ww[j]);
       st_vec<VEC>(y + idx, out);
@@ -370,3 +378,15 @@ __global__ __launch_bounds__(1024) void residual(__nv_bfloat16* x,
 }
 
 }  // extern "C"
+
+extern "C" __global__ void add_rmsnorm_unit(const __nv_bfloat16* x,
+    const __nv_bfloat16* res, __nv_bfloat16* y, __nv_bfloat16* res_out,
+    int rows, int dim, float eps) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const size_t off = (size_t)row * dim;
+  if ((dim & 7) == 0)
+    add_rmsnorm_row<8, false, true, false>(x + off, res + off, nullptr, y + off, res_out + off, dim, eps, nullptr);
+  else
+    add_rmsnorm_row<1, false, true, false>(x + off, res + off, nullptr, y + off, res_out + off, dim, eps, nullptr);
+}

@@ -40,10 +40,10 @@ fn elapsed_ms(started: Instant) -> f64 {
 }
 
 pub struct Layer {
-    pub input_norm: CudaSlice<bf16>,
+    pub input_norm: Option<CudaSlice<bf16>>,
     pub qkv: CudaSlice<bf16>,
     pub o: CudaSlice<bf16>,
-    pub post_norm: CudaSlice<bf16>,
+    pub post_norm: Option<CudaSlice<bf16>>,
     pub gu: CudaSlice<bf16>,
     pub down: CudaSlice<bf16>,
 }
@@ -51,7 +51,7 @@ pub struct Layer {
 pub struct Weights {
     pub embed: CudaSlice<bf16>,
     pub layers: Vec<Layer>,
-    pub norm: CudaSlice<bf16>,
+    pub norm: Option<CudaSlice<bf16>>,
     pub head: CudaSlice<bf16>,
     pub bytes: usize,
 }
@@ -580,6 +580,65 @@ fn decode_bf16(bytes: &[u8], values: &mut [bf16]) {
 }
 
 impl Weights {
+    pub fn load_loopvl(
+        dir: &Path,
+        spec: &crate::model_spec::ModelSpec,
+        d: &Device,
+    ) -> Result<(Self, CudaSlice<bf16>)> {
+        let mapped = MappedCheckpoint::open(dir)?;
+        let manifest = mapped.manifest(spec, crate::checkpoint::LoadPolicy::TextOnly)?;
+        let (weights, _) = checkpoint_mapped(&mapped, d, Some(&manifest), false, |l| {
+            let h = spec.hidden as usize;
+            let f = spec.intermediate as usize;
+            let mut layers = Vec::new();
+            for stack in ["L", "H"] {
+                for i in 0..16 {
+                    let p = format!("language_model.model.{stack}_module.layers.{i}");
+                    let qkv = l
+                        .load(&["q", "k", "v", "gate"].map(|role| {
+                            (format!("{p}.self_attn.{role}_proj.weight"), vec![h, h])
+                        }))?;
+                    let gu = l.load(
+                        &["gate", "up"]
+                            .map(|role| (format!("{p}.mlp.{role}_proj.weight"), vec![f, h])),
+                    )?;
+                    layers.push(Layer {
+                        input_norm: None,
+                        post_norm: None,
+                        qkv,
+                        gu,
+                        o: l.load(&[(format!("{p}.self_attn.o_proj.weight"), vec![h, h])])?,
+                        down: l.load(&[(format!("{p}.mlp.down_proj.weight"), vec![h, f])])?,
+                    });
+                }
+            }
+            let embed = l.load(&[(
+                "language_model.model.embed_tokens.weight".into(),
+                vec![spec.vocab as usize, h],
+            )])?;
+            let head = l.load(&[(
+                "language_model.lm_head.weight".into(),
+                vec![spec.vocab as usize, h],
+            )])?;
+            let initial = l.load(&[("language_model.model.z_L_init".into(), vec![h])])?;
+            ensure!(
+                l.bytes == manifest.resident_bytes,
+                "LoopVL upload byte count mismatch"
+            );
+            Ok((
+                Self {
+                    embed,
+                    head,
+                    norm: None,
+                    layers,
+                    bytes: l.bytes,
+                },
+                initial,
+            ))
+        })?;
+        Ok(weights)
+    }
+
     pub fn load(dir: &Path, c: &Config, d: &Device) -> Result<Self> {
         checkpoint(dir, d, |l| {
             let h = c.hidden_size;
@@ -611,10 +670,10 @@ impl Weights {
                     (format!("{prefix}.mlp.up_proj.weight"), vec![f, h]),
                 ])?;
                 layers.push(Layer {
-                    input_norm,
+                    input_norm: Some(input_norm),
                     qkv,
                     o,
-                    post_norm,
+                    post_norm: Some(post_norm),
                     gu,
                     down,
                 });
@@ -625,7 +684,7 @@ impl Weights {
             Ok(Self {
                 embed,
                 layers,
-                norm,
+                norm: Some(norm),
                 head,
                 bytes,
             })
@@ -742,7 +801,7 @@ impl WeightCatalog {
         };
         Ok(Weights {
             embed: take(embed_name)?,
-            norm: take(norm_name)?,
+            norm: Some(take(norm_name)?),
             head: take("lm_head.weight")?,
             layers: Vec::new(),
             bytes: self.bytes,

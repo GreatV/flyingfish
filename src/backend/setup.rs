@@ -145,6 +145,24 @@ pub struct Setup {
     pub attention: AttentionPlan,
 }
 
+pub fn check_decode_attention_shape(c: &Config, qpack: usize) -> Result<usize> {
+    ensure!(c.head_dim == 128, "decode attention requires head_dim 128");
+    ensure!(
+        c.num_attention_heads > 0
+            && c.num_key_value_heads > 0
+            && c.num_attention_heads.is_multiple_of(c.num_key_value_heads),
+        "decode attention requires positive Q/KV heads with Q divisible by KV, got {}/{}",
+        c.num_attention_heads,
+        c.num_key_value_heads
+    );
+    let gqa = c.num_attention_heads / c.num_key_value_heads;
+    ensure!(
+        [1, 2, 4, 8].contains(&qpack) && gqa.is_multiple_of(qpack),
+        "attention pack {qpack} must be in {{1, 2, 4, 8}} and divide GQA ratio {gqa}"
+    );
+    Ok(gqa)
+}
+
 impl Setup {
     pub fn select(
         info: DeviceInfo,
@@ -159,10 +177,7 @@ impl Setup {
             "invalid backend capacity or head dimension"
         );
         ensure!(info.warp == 32, "CUDA attention requires a 32-thread warp");
-        ensure!(
-            [1, 2, 4, 8].contains(&attention.qpack),
-            "attention pack must be 1, 2, 4 or 8"
-        );
+        check_decode_attention_shape(c, attention.qpack)?;
         ensure!(
             attention.threads >= 32
                 && attention.threads <= info.max_threads

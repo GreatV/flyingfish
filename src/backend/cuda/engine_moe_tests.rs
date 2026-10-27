@@ -1071,7 +1071,7 @@ impl Engine {
                     })
                     .collect::<Vec<_>>(),
             )?,
-            norm: stream.clone_htod(&vec![bf16::ONE; d.hidden])?,
+            norm: Some(stream.clone_htod(&vec![bf16::ONE; d.hidden])?),
             head: stream.clone_htod(
                 &(0..32 * d.hidden)
                     .map(|index| {
@@ -1191,6 +1191,7 @@ impl Engine {
             #[cfg(test)]
             flint_window_capture: None,
             qwen: None,
+            recurrent: None,
             moe,
             moe_slots: Some(slots),
             moe_prefill,

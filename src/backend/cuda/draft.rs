@@ -183,10 +183,10 @@ impl DraftWeights {
                 ])?;
                 layers.push(LayerWeights {
                     block: Layer {
-                        input_norm,
+                        input_norm: Some(input_norm),
                         qkv,
                         o,
-                        post_norm,
+                        post_norm: Some(post_norm),
                         gu,
                         down,
                     },
@@ -1135,7 +1135,11 @@ impl Draft {
                     s,
                     &self.norm,
                     &self.x,
-                    &layer.block.input_norm,
+                    layer
+                        .block
+                        .input_norm
+                        .as_ref()
+                        .context("draft input norm missing")?,
                     &mut self.n,
                     (block_rows, h),
                     self.config.rms_norm_eps,
@@ -1217,7 +1221,16 @@ impl Draft {
                 h,
                 h,
             )?;
-            add_norm(&self.out, &mut self.x, &layer.block.post_norm, &mut self.n)?;
+            add_norm(
+                &self.out,
+                &mut self.x,
+                layer
+                    .block
+                    .post_norm
+                    .as_ref()
+                    .context("draft post norm missing")?,
+                &mut self.n,
+            )?;
             blas.linear(
                 &layer.block.gu,
                 &self.n.slice(..block_rows * h),
@@ -1244,7 +1257,11 @@ impl Draft {
                 f,
             )?;
             let weight = if i + 1 < self.weights.layers.len() {
-                &self.weights.layers[i + 1].block.input_norm
+                self.weights.layers[i + 1]
+                    .block
+                    .input_norm
+                    .as_ref()
+                    .context("draft input norm missing")?
             } else {
                 &self.weights.norm
             };

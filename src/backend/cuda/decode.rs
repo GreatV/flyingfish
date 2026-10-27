@@ -7,8 +7,8 @@ use cudarc::driver::{
 use half::bf16;
 use std::sync::Arc;
 
-use crate::backend::setup::AttentionPlan;
-use cudarc::driver::DevicePtrMut;
+use crate::backend::setup::{AttentionPlan, check_decode_attention_shape};
+use cudarc::driver::{DevicePtr, DevicePtrMut};
 
 pub struct Attention {
     first: CudaFunction,
@@ -26,14 +26,14 @@ pub struct Attention {
     plan: AttentionPlan,
 }
 
-pub struct GqaDecodeInput<'a> {
+pub struct GqaDecodeInput<'a, L: DevicePtr<i32> = CudaSlice<i32>> {
     pub q: &'a CudaSlice<bf16>,
     pub q_offset: usize,
     pub k: &'a CudaSlice<bf16>,
     pub v: &'a CudaSlice<bf16>,
     pub output: &'a mut CudaSlice<bf16>,
     pub output_offset: usize,
-    pub length: &'a CudaSlice<i32>,
+    pub length: &'a L,
     pub sinks: Option<&'a CudaSlice<bf16>>,
     pub window: Option<SlidingWindow<'a>>,
 }
@@ -70,16 +70,7 @@ impl Attention {
         settings: AttentionPlan,
         log: bool,
     ) -> Result<Self> {
-        ensure!(c.head_dim == 128, "decode attention requires head_dim 128");
-        let shape = (c.num_attention_heads, c.num_key_value_heads);
-        ensure!(
-            shape == (16, 2) || shape == (32, 4),
-            "decode attention requires Q/KV heads 16/2 or 32/4, got {shape:?}"
-        );
-        ensure!(
-            [1, 2, 4, 8].contains(&settings.qpack),
-            "attention pack must be 1, 2, 4 or 8"
-        );
+        check_decode_attention_shape(c, settings.qpack)?;
         let chunk = settings.chunk;
         ensure!(
             chunk > 0 && chunk <= i32::MAX as usize - capacity,
@@ -188,7 +179,11 @@ impl Attention {
         )
     }
 
-    pub fn run_with(&mut self, stream: &Arc<CudaStream>, input: GqaDecodeInput<'_>) -> Result<()> {
+    pub fn run_with<L: DevicePtr<i32>>(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        input: GqaDecodeInput<'_, L>,
+    ) -> Result<()> {
         let GqaDecodeInput {
             q,
             q_offset,
@@ -209,6 +204,7 @@ impl Attention {
         );
         let q = q.slice(q_offset..);
         let mut output = output.slice_mut(output_offset..);
+        let (len_ptr, _len_guard) = length.device_ptr(stream);
         unsafe {
             if let Some(window) = window {
                 stream
@@ -217,7 +213,7 @@ impl Attention {
                     .arg(k)
                     .arg(v)
                     .arg(&mut self.scratch)
-                    .arg(length)
+                    .arg(&len_ptr)
                     .arg(&self.q_heads)
                     .arg(&self.kv_heads)
                     .arg(&gqa)
@@ -237,7 +233,7 @@ impl Attention {
                     .arg(k)
                     .arg(v)
                     .arg(&mut self.scratch)
-                    .arg(length)
+                    .arg(&len_ptr)
                     .arg(&self.q_heads)
                     .arg(&self.kv_heads)
                     .arg(&gqa)
@@ -255,7 +251,7 @@ impl Attention {
                     .arg(&mut self.scratch)
                     .arg(&mut output)
                     .arg(sinks)
-                    .arg(length)
+                    .arg(&len_ptr)
                     .arg(&self.q_heads)
                     .arg(&self.kv_heads)
                     .arg(&gqa)
@@ -267,7 +263,7 @@ impl Attention {
                     .launch_builder(&self.second)
                     .arg(&mut self.scratch)
                     .arg(&mut output)
-                    .arg(length)
+                    .arg(&len_ptr)
                     .arg(&self.q_heads)
                     .arg(&self.kv_heads)
                     .arg(&gqa)
