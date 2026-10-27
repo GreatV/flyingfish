@@ -271,6 +271,15 @@ impl Verification {
     }
 
     fn run_mask(&mut self, query: Query<'_>, external: Option<&CudaSlice<u64>>) -> Result<()> {
+        ensure!(
+            query.shape.rows == self.shape.rows && query.prefix.len() == 1,
+            "MQ shape does not match its calibrated M/prefix"
+        );
+        self.run_window(query, external, 0, 0)
+    }
+
+    /// `prefix` contains the device-resident absolute positions 0..capacity.
+    pub fn run_prefill(&mut self, query: Query<'_>) -> Result<()> {
         let Query {
             qkv,
             k,
@@ -280,20 +289,81 @@ impl Verification {
             shape,
         } = query;
         ensure!(
-            shape.causal == self.shape.causal && shape.rows == self.shape.rows,
+            self.implementation == MultiImpl::V1 && self.shape.causal && shape.causal,
+            "MQ prefill subchunks require causal SIMT V1"
+        );
+        ensure!(
+            shape.rows > 0
+                && shape
+                    .start
+                    .checked_add(shape.rows)
+                    .is_some_and(|end| end <= self.shape.capacity)
+                && shape.rows <= qkv.len() / 2560
+                && shape.rows <= out.len() / 2048
+                && prefix.len() == self.shape.capacity,
+            "MQ prefill range/prefix extent exceeds configured KV cache"
+        );
+        for offset in (0..shape.rows).step_by(self.shape.rows) {
+            self.run_window(
+                Query {
+                    qkv,
+                    k,
+                    v,
+                    out,
+                    prefix,
+                    shape: Shape {
+                        rows: (shape.rows - offset).min(self.shape.rows),
+                        start: shape.start + offset,
+                        ..shape
+                    },
+                },
+                None,
+                offset,
+                shape.start + offset,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn run_window(
+        &mut self,
+        query: Query<'_>,
+        external: Option<&CudaSlice<u64>>,
+        row_offset: usize,
+        prefix_offset: usize,
+    ) -> Result<()> {
+        let Query {
+            qkv,
+            k,
+            v,
+            out,
+            prefix,
+            shape,
+        } = query;
+        ensure!(
+            shape.causal == self.shape.causal && shape.rows > 0 && shape.rows <= self.shape.rows,
             "MQ shape does not match its calibrated M/mask"
         );
         ensure!(
             shape.capacity == self.shape.capacity
-                && shape.start + shape.rows <= self.shape.capacity,
+                && shape
+                    .start
+                    .checked_add(shape.rows)
+                    .is_some_and(|end| end <= self.shape.capacity),
             "MQ range exceeds configured KV cache"
         );
         ensure!(
-            shape.q_heads == 16 && shape.kv_heads == 2,
+            shape.q_heads == 16
+                && shape.kv_heads == 2
+                && shape.head_dim == 128
+                && shape.window_left.is_none(),
             "MQ head shape mismatch"
         );
         ensure!(
-            qkv.len() >= shape.rows * 2560 && out.len() >= shape.rows * 2048 && prefix.len() == 1,
+            row_offset
+                .checked_add(shape.rows)
+                .is_some_and(|end| end <= qkv.len() / 2560 && end <= out.len() / 2048)
+                && prefix_offset < prefix.len(),
             "MQ query/output/prefix buffer shape mismatch"
         );
         ensure!(
@@ -305,14 +375,17 @@ impl Verification {
         let rows = shape.rows as i32;
         let stride = (self.shape.capacity * 128) as i32;
         let chunk = p.chunk as i32;
+        let qkv = qkv.slice(row_offset * 2560..(row_offset + shape.rows) * 2560);
+        let mut out = out.slice_mut(row_offset * 2048..(row_offset + shape.rows) * 2048);
+        let prefix = prefix.slice(prefix_offset..prefix_offset + 1);
         unsafe {
             let mut first = self.stream.launch_builder(&self.first);
             first
-                .arg(qkv)
+                .arg(&qkv)
                 .arg(k)
                 .arg(v)
                 .arg(&mut self.scratch)
-                .arg(prefix)
+                .arg(&prefix)
                 .arg(&rows)
                 .arg(&16i32)
                 .arg(&2i32)
@@ -348,8 +421,8 @@ impl Verification {
             self.stream
                 .launch_builder(&self.second)
                 .arg(&mut self.scratch)
-                .arg(out)
-                .arg(prefix)
+                .arg(&mut out)
+                .arg(&prefix)
                 .arg(&rows)
                 .arg(&16i32)
                 .arg(&2i32)
