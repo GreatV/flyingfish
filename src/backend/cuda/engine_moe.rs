@@ -290,7 +290,7 @@ impl Setup {
         let available = host_memory(Path::new("/"))?;
         let copies = measured.copy_engines.min(2);
         let slot = catalogue.slot_bytes();
-        let workers = measured.service.worker_count()?;
+        let workers = measured.service.pool_worker_count()?;
         let policy = crate::gdn_plan::GdnPolicy::for_device(&device.info);
         let vision = if model.vision.is_some() {
             crate::checkpoint::MappedCheckpoint::open(directory)?
@@ -664,6 +664,14 @@ impl Setup {
         let (send_ptr, _send_guard) = engine.work.n.device_ptr(&engine.device.stream);
         let send_cap_bytes = engine.work.n.len() * size_of::<bf16>();
         drop(_send_guard);
+        let cpu_bounds = (
+            cpu.0.max(self.decode_rows),
+            cpu.1.max(self.decode_rows * geometry.top_k as usize),
+        );
+        let participants = self
+            .measured
+            .service
+            .participant_table(u32::try_from(cpu_bounds.0)?, u32::try_from(cpu_bounds.1)?)?;
         engine.moe = Some(Decode::new(
             &engine.device,
             DecodeOptions {
@@ -676,10 +684,8 @@ impl Setup {
                 geometry,
                 max_rows: self.decode_rows,
                 workers: self.capacity.worker_count,
-                cpu_bounds: (
-                    cpu.0.max(self.decode_rows),
-                    cpu.1.max(self.decode_rows * geometry.top_k as usize),
-                ),
+                cpu_bounds,
+                participants,
                 format: engine
                     .model_spec
                     .expert_format
@@ -1026,6 +1032,7 @@ pub(super) struct DecodeOptions<'a> {
     pub max_rows: usize,
     pub workers: u32,
     pub cpu_bounds: (usize, usize),
+    pub participants: crate::experts::plan::ParticipantTable,
     pub format: crate::model_spec::ExpertFormat,
     pub shared_intermediate: u32,
     pub swiglu_rounding: crate::model_spec::SwigluRounding,
@@ -1041,6 +1048,7 @@ impl Decode {
             max_rows,
             workers,
             cpu_bounds,
+            participants,
             format,
             shared_intermediate,
             swiglu_rounding,
@@ -1185,6 +1193,7 @@ impl Decode {
                     swiglu_limit,
                     routed_weight,
                 },
+                participants,
             )?,
             stats: [0; 5],
         };

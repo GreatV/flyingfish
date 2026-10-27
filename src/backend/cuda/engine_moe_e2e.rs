@@ -146,6 +146,7 @@ fn placement_components(engine: &Engine, model: &Path) -> Result<usize> {
             max_rows: 1,
             workers: 1,
             cpu_bounds: (1, 8),
+            participants: crate::experts::plan::ParticipantTable::uniform(1, 8, 1)?,
             format,
             shared_intermediate: engine
                 .model_spec

@@ -3761,13 +3761,13 @@ mod tests {
         .slot_bytes();
         let service = ServiceTable::new(
             "fixture",
-            [1, 64]
+            [(1u32, 1u32), (1, 2), (64, 1), (64, 2)]
                 .into_iter()
-                .map(|rows| crate::experts::plan::ServiceCell {
+                .map(|(rows, experts)| crate::experts::plan::ServiceCell {
                     workers: 2,
                     rows,
-                    experts: 1,
-                    seconds: f64::from(rows) * 0.00002,
+                    experts,
+                    seconds: f64::from(rows * experts) * 0.00002,
                 })
                 .collect(),
         )?;
@@ -3972,12 +3972,20 @@ mod tests {
             let host_bytes = u64::from(non_gpu + borrowed + capacity.spare_blocks) * slot_bytes;
             let service = ServiceTable::new(
                 "fixture",
-                vec![crate::experts::plan::ServiceCell {
-                    workers: capacity.worker_count,
-                    rows: 1,
-                    experts: 1,
-                    seconds: 0.00002,
-                }],
+                vec![
+                    crate::experts::plan::ServiceCell {
+                        workers: capacity.worker_count,
+                        rows: 1,
+                        experts: 1,
+                        seconds: 0.00002,
+                    },
+                    crate::experts::plan::ServiceCell {
+                        workers: capacity.worker_count,
+                        rows: 1,
+                        experts: geometry.top_k,
+                        seconds: f64::from(geometry.top_k) * 0.00002,
+                    },
+                ],
             )?;
             return crate::experts::plan::capacity(
                 &crate::experts::plan::PlanInputs {

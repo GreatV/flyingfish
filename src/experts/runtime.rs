@@ -1028,12 +1028,20 @@ mod tests {
     fn service() -> ServiceTable {
         ServiceTable::new(
             "test",
-            vec![ServiceCell {
-                workers: 1,
-                rows: 1,
-                experts: 1,
-                seconds: 0.001,
-            }],
+            vec![
+                ServiceCell {
+                    workers: 1,
+                    rows: 1,
+                    experts: 1,
+                    seconds: 0.001,
+                },
+                ServiceCell {
+                    workers: 1,
+                    rows: 1,
+                    experts: 2,
+                    seconds: 0.002,
+                },
+            ],
         )
         .unwrap()
     }
