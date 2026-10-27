@@ -475,7 +475,7 @@ type Wave = (usize, usize, usize, bool, String);
 pub(in crate::backend::cuda::engine) struct Prefill {
     geometry: ExpertGeometry,
     shared_intermediate: u32,
-    capacity: Capacity,
+    pub(in crate::backend::cuda::engine) capacity: Capacity,
     reserves: Reserves,
     service: ServiceTable,
     workers: u32,

@@ -3586,7 +3586,7 @@ fn moe_combine_residual_gpu() -> Result<()> {
 
     // The routed sum against the ascending expert order on the host.
     let routed_out: CudaSlice<bf16> = s.alloc_zeros(count)?;
-    combine.combine_routed(
+    combine.combine_routed_prefill(
         s,
         &MoeCombineRouted {
             ids: ids_view,
@@ -3680,6 +3680,407 @@ fn moe_combine_residual_gpu() -> Result<()> {
     anyhow::ensure!(
         moved == vec![7],
         "the perturbed residual lane moved {moved:?} instead of the perturbed lane alone"
+    );
+    Ok(())
+}
+
+fn check_combine_residual_shape(
+    s: &Arc<CudaStream>,
+    combine: &CombineOps,
+    dims: (usize, usize, usize),
+    gated: bool,
+) -> Result<()> {
+    use crate::backend::cuda::contracts::view;
+    let (rows, top_k, hidden) = dims;
+    let stride_x = hidden;
+    let mut ids_h = Vec::with_capacity(rows * top_k);
+    let mut active_h = Vec::with_capacity(rows * top_k);
+    for r in 0..rows {
+        for c in 0..top_k {
+            ids_h.push(((r * 17 + c * 31 + 5) % 251) as i32);
+            active_h.push(u32::from((r + c) % 5 != 0));
+        }
+    }
+    let contrib_h: Vec<bf16> = (0..rows * top_k * hidden)
+        .map(|i| bf16::from_f32(((i * 37 % 257) as f32 - 128.0) / 128.0))
+        .collect();
+    let shared_h: Vec<bf16> = (0..rows * hidden)
+        .map(|i| bf16::from_f32(((i * 53 % 241) as f32 - 120.0) / 96.0))
+        .collect();
+    let x_padded_h: Vec<bf16> = (0..rows * stride_x)
+        .map(|i| bf16::from_f32(((i * 71 % 233) as f32 - 116.0) / 64.0))
+        .collect();
+    let seg_h: Vec<bf16> = (0..hidden)
+        .map(|i| bf16::from_f32(((i * 19 % 199) as f32 - 99.0) / 256.0))
+        .collect();
+    let res_init_h: Vec<bf16> = (0..rows * hidden)
+        .map(|i| bf16::from_f32(((i * 43 % 229) as f32 - 114.0) / 32.0))
+        .collect();
+
+    let ids_d = s.clone_htod(&ids_h)?;
+    let active_d = s.clone_htod(&active_h)?;
+    let done_d = s.clone_htod(&active_h)?;
+    let contrib_d = s.clone_htod(&contrib_h)?;
+    let shared_d = s.clone_htod(&shared_h)?;
+    let x_d = s.clone_htod(&x_padded_h)?;
+    let seg_d = s.clone_htod(&seg_h)?;
+    let x_view = view(
+        &x_d,
+        s,
+        0,
+        [rows as u32, hidden as u32],
+        [stride_x as u64, 1],
+    )?;
+    let seg_view = testing::view(&seg_d, s, [hidden as u32], [1])?;
+
+    let scale_d: CudaSlice<bf16> = s.alloc_zeros(rows)?;
+    let mut scale_view = testing::dense_mut(&scale_d, s, rows as u32, 1)?;
+    if gated {
+        combine.shared_scale(s, x_view, seg_view, &mut scale_view)?;
+    }
+    let y_ref_d: CudaSlice<bf16> = s.alloc_zeros(rows * hidden)?;
+    combine.combine(
+        s,
+        &MoeCombine {
+            ids: testing::dense(&ids_d, s, rows as u32, top_k as u32)?,
+            final_active: testing::dense(&active_d, s, rows as u32, top_k as u32)?,
+            done: testing::dense(&done_d, s, rows as u32, top_k as u32)?,
+            contributions: testing::view(
+                &contrib_d,
+                s,
+                [rows as u32, top_k as u32, hidden as u32],
+                [(top_k * hidden) as u64, hidden as u64, 1],
+            )?,
+            shared_out: testing::dense(&shared_d, s, rows as u32, hidden as u32)?,
+            x: x_view,
+            shared_expert_gate: gated.then_some(seg_view),
+            scale: gated.then_some(scale_view),
+            y: testing::dense_mut(&y_ref_d, s, rows as u32, hidden as u32)?,
+        },
+    )?;
+    s.synchronize()?;
+    let y_ref = s.clone_dtoh(&y_ref_d)?;
+    let res_ref: Vec<bf16> = res_init_h
+        .iter()
+        .zip(&y_ref)
+        .map(|(&r, &y)| bf16::from_f32(r.to_f32() + y.to_f32()))
+        .collect();
+
+    {
+        let res_d = s.clone_htod(&res_init_h)?;
+        combine.combine_residual(
+            s,
+            &MoeCombineResidual {
+                ids: testing::dense(&ids_d, s, rows as u32, top_k as u32)?,
+                final_active: testing::dense(&active_d, s, rows as u32, top_k as u32)?,
+                done: testing::dense(&done_d, s, rows as u32, top_k as u32)?,
+                contributions: testing::view(
+                    &contrib_d,
+                    s,
+                    [rows as u32, top_k as u32, hidden as u32],
+                    [(top_k * hidden) as u64, hidden as u64, 1],
+                )?,
+                shared_out: testing::dense(&shared_d, s, rows as u32, hidden as u32)?,
+                x: x_view,
+                shared_expert_gate: gated.then_some(seg_view),
+                residual: testing::dense_mut(&res_d, s, rows as u32, hidden as u32)?,
+            },
+        )?;
+        s.synchronize()?;
+        let got_res = s.clone_dtoh(&res_d)?;
+        let res_bad = got_res
+            .iter()
+            .zip(&res_ref)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        anyhow::ensure!(
+            res_bad == 0,
+            "combine_residual mismatch hidden={hidden} gated={gated}: {res_bad}"
+        );
+    }
+
+    let routed_d: CudaSlice<bf16> = s.alloc_zeros(rows * hidden)?;
+    combine.combine_routed_prefill(
+        s,
+        &MoeCombineRouted {
+            ids: testing::dense(&ids_d, s, rows as u32, top_k as u32)?,
+            final_active: testing::dense(&active_d, s, rows as u32, top_k as u32)?,
+            done: testing::dense(&done_d, s, rows as u32, top_k as u32)?,
+            contributions: testing::view(
+                &contrib_d,
+                s,
+                [rows as u32, top_k as u32, hidden as u32],
+                [(top_k * hidden) as u64, hidden as u64, 1],
+            )?,
+            routed_out: testing::dense_mut(&routed_d, s, rows as u32, hidden as u32)?,
+        },
+    )?;
+    let res_join_d = s.clone_htod(&res_init_h)?;
+    combine.join_routed_residual(
+        s,
+        &MoeJoinRoutedResidual {
+            routed_in: testing::dense(&routed_d, s, rows as u32, hidden as u32)?,
+            shared_out: testing::dense(&shared_d, s, rows as u32, hidden as u32)?,
+            x: x_view,
+            shared_expert_gate: gated.then_some(seg_view),
+            residual: testing::dense_mut(&res_join_d, s, rows as u32, hidden as u32)?,
+        },
+    )?;
+    s.synchronize()?;
+    let join_res = s.clone_dtoh(&res_join_d)?;
+    let join_res_bad = join_res
+        .iter()
+        .zip(&res_ref)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    anyhow::ensure!(
+        join_res_bad == 0,
+        "join_routed_residual mismatch hidden={hidden} gated={gated}: res={join_res_bad}"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires GPU window, FF_Q38_GPU_WINDOW=granted"]
+fn prefill_combine_residual_and_routed_gpu() -> Result<()> {
+    anyhow::ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let d = crate::backend::cuda::Device::new(0)?;
+    let s = &d.stream;
+    let source: CudaSlice<bf16> = s.alloc_zeros(8)?;
+    let mut destination: CudaSlice<bf16> = s.alloc_zeros(8)?;
+    assert!(
+        crate::backend::cuda::copy::columns(
+            s,
+            &source,
+            &mut destination,
+            crate::backend::cuda::copy::Rect {
+                rows: 0,
+                width: 8,
+                src_pitch: 8,
+                src_col: 0,
+                dst_pitch: 8,
+                dst_col: 0,
+            },
+        )
+        .is_err()
+    );
+    let combine = CombineOps::new(&d.ctx)?;
+    for dims in [(37, 8, 2048), (257, 8, 2048), (19, 8, 260)] {
+        for gated in [true, false] {
+            check_combine_residual_shape(s, &combine, dims, gated)?;
+        }
+    }
+    let ops = PrefillOps::new(&d.ctx, s, crate::model_spec::ExpertFormat::Bf16)?;
+    let rows = 37usize;
+    let fx = reference::fixture(MoeDims::minicpm47(rows), 11);
+    let (experts, top_k, hidden, inter) = (
+        fx.dims.experts,
+        fx.dims.top_k,
+        fx.dims.hidden,
+        fx.dims.inter,
+    );
+    let setup = child_setup(s, &fx, vec![1u64; experts])?;
+    let mut ids = vec![0i32; rows * top_k];
+    let mut weights = vec![bf16::ZERO; rows * top_k];
+    for r in 0..rows {
+        let routed = reference::route_row(&fx, r);
+        ids[r * top_k..(r + 1) * top_k].copy_from_slice(&routed.ids);
+        weights[r * top_k..(r + 1) * top_k].copy_from_slice(&routed.weights);
+    }
+    let active = all_active(rows, top_k);
+    let gens = vec![1u64; rows * top_k];
+    let cohort = CohortBufs {
+        contributions: s.alloc_zeros(rows * top_k * hidden)?,
+        done: s.alloc_zeros(rows * top_k)?,
+    };
+    let bufs = case_bufs(s, &fx, rows, &ids, &active, &weights, &gens)?;
+    ops.prefill_contribute(
+        s,
+        contribute_input(s, &fx, rows, &bufs, &setup.slots, &setup.shared, &cohort)?,
+        &setup.scratch,
+    )?;
+    let y_standalone: CudaSlice<bf16> = s.alloc_zeros(rows * hidden)?;
+    ops.prefill_finish(
+        s,
+        MoePrefillFinish {
+            expert_inter: inter as u32,
+            x: testing::dense(&bufs.x, s, rows as u32, hidden as u32)?,
+            ids: testing::dense(&bufs.ids, s, rows as u32, top_k as u32)?,
+            final_active: testing::dense(&bufs.active, s, rows as u32, top_k as u32)?,
+            contributions: testing::view(
+                &cohort.contributions,
+                s,
+                [rows as u32, top_k as u32, hidden as u32],
+                [(top_k * hidden) as u64, hidden as u64, 1],
+            )?,
+            done: testing::view(
+                &cohort.done,
+                s,
+                [rows as u32, top_k as u32],
+                [top_k as u64, 1],
+            )?,
+            experts: experts as u32,
+            shared_gate: testing::dense(&setup.shared.sg, s, inter as u32, hidden as u32)?,
+            shared_up: testing::dense(&setup.shared.su, s, inter as u32, hidden as u32)?,
+            shared_down: testing::dense(&setup.shared.sd, s, hidden as u32, inter as u32)?,
+            shared_expert_gate: Some(testing::view(&setup.shared.seg, s, [hidden as u32], [1])?),
+            y: testing::dense_mut(&y_standalone, s, rows as u32, hidden as u32)?,
+        },
+        &setup.scratch,
+    )?;
+    let res_init: Vec<bf16> = (0..rows * hidden)
+        .map(|i| bf16::from_f32(((i * 61 % 251) as f32 - 125.0) / 32.0))
+        .collect();
+    let res_inplace = s.clone_htod(&res_init)?;
+    ops.prefill_finish_residual(
+        s,
+        MoePrefillFinish {
+            expert_inter: inter as u32,
+            x: testing::dense(&bufs.x, s, rows as u32, hidden as u32)?,
+            ids: testing::dense(&bufs.ids, s, rows as u32, top_k as u32)?,
+            final_active: testing::dense(&bufs.active, s, rows as u32, top_k as u32)?,
+            contributions: testing::view(
+                &cohort.contributions,
+                s,
+                [rows as u32, top_k as u32, hidden as u32],
+                [(top_k * hidden) as u64, hidden as u64, 1],
+            )?,
+            done: testing::view(
+                &cohort.done,
+                s,
+                [rows as u32, top_k as u32],
+                [top_k as u64, 1],
+            )?,
+            experts: experts as u32,
+            shared_gate: testing::dense(&setup.shared.sg, s, inter as u32, hidden as u32)?,
+            shared_up: testing::dense(&setup.shared.su, s, inter as u32, hidden as u32)?,
+            shared_down: testing::dense(&setup.shared.sd, s, hidden as u32, inter as u32)?,
+            shared_expert_gate: Some(testing::view(&setup.shared.seg, s, [hidden as u32], [1])?),
+            y: testing::dense_mut(&res_inplace, s, rows as u32, hidden as u32)?,
+        },
+        &setup.scratch,
+    )?;
+    let routed_buf: CudaSlice<bf16> = s.alloc_zeros(rows * hidden)?;
+    ops.combine_routed(
+        s,
+        &MoeCombineRouted {
+            ids: testing::dense(&bufs.ids, s, rows as u32, top_k as u32)?,
+            final_active: testing::dense(&bufs.active, s, rows as u32, top_k as u32)?,
+            done: testing::view(
+                &cohort.done,
+                s,
+                [rows as u32, top_k as u32],
+                [top_k as u64, 1],
+            )?,
+            contributions: testing::view(
+                &cohort.contributions,
+                s,
+                [rows as u32, top_k as u32, hidden as u32],
+                [(top_k * hidden) as u64, hidden as u64, 1],
+            )?,
+            routed_out: testing::dense_mut(&routed_buf, s, rows as u32, hidden as u32)?,
+        },
+    )?;
+    let res_routed = s.clone_htod(&res_init)?;
+    ops.prefill_finish_routed_residual(
+        s,
+        MoePrefillFinish {
+            expert_inter: inter as u32,
+            x: testing::dense(&bufs.x, s, rows as u32, hidden as u32)?,
+            ids: testing::dense(&bufs.ids, s, rows as u32, top_k as u32)?,
+            final_active: testing::dense(&bufs.active, s, rows as u32, top_k as u32)?,
+            contributions: testing::view(
+                &cohort.contributions,
+                s,
+                [rows as u32, top_k as u32, hidden as u32],
+                [(top_k * hidden) as u64, hidden as u64, 1],
+            )?,
+            done: testing::view(
+                &cohort.done,
+                s,
+                [rows as u32, top_k as u32],
+                [top_k as u64, 1],
+            )?,
+            experts: experts as u32,
+            shared_gate: testing::dense(&setup.shared.sg, s, inter as u32, hidden as u32)?,
+            shared_up: testing::dense(&setup.shared.su, s, inter as u32, hidden as u32)?,
+            shared_down: testing::dense(&setup.shared.sd, s, hidden as u32, inter as u32)?,
+            shared_expert_gate: Some(testing::view(&setup.shared.seg, s, [hidden as u32], [1])?),
+            y: testing::dense_mut(&res_routed, s, rows as u32, hidden as u32)?,
+        },
+        testing::dense(&routed_buf, s, rows as u32, hidden as u32)?,
+        &setup.scratch,
+    )?;
+    s.synchronize()?;
+    let y_host = s.clone_dtoh(&y_standalone)?;
+    let expected_res: Vec<bf16> = res_init
+        .iter()
+        .zip(&y_host)
+        .map(|(&r, &y)| bf16::from_f32(r.to_f32() + y.to_f32()))
+        .collect();
+    let got_inplace = s.clone_dtoh(&res_inplace)?;
+    let got_routed = s.clone_dtoh(&res_routed)?;
+    let inplace_bad = got_inplace
+        .iter()
+        .zip(&expected_res)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    let routed_bad = got_routed
+        .iter()
+        .zip(&expected_res)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    anyhow::ensure!(
+        inplace_bad == 0 && routed_bad == 0,
+        "prefill_finish residual mismatch inplace={inplace_bad} routed={routed_bad}"
+    );
+    let mut perturbed_init = res_init;
+    perturbed_init[hidden + 7] = bf16::from_f32(perturbed_init[hidden + 7].to_f32() + 1.0);
+    let res_perturbed = s.clone_htod(&perturbed_init)?;
+    ops.prefill_finish_residual(
+        s,
+        MoePrefillFinish {
+            expert_inter: inter as u32,
+            x: testing::dense(&bufs.x, s, rows as u32, hidden as u32)?,
+            ids: testing::dense(&bufs.ids, s, rows as u32, top_k as u32)?,
+            final_active: testing::dense(&bufs.active, s, rows as u32, top_k as u32)?,
+            contributions: testing::view(
+                &cohort.contributions,
+                s,
+                [rows as u32, top_k as u32, hidden as u32],
+                [(top_k * hidden) as u64, hidden as u64, 1],
+            )?,
+            done: testing::view(
+                &cohort.done,
+                s,
+                [rows as u32, top_k as u32],
+                [top_k as u64, 1],
+            )?,
+            experts: experts as u32,
+            shared_gate: testing::dense(&setup.shared.sg, s, inter as u32, hidden as u32)?,
+            shared_up: testing::dense(&setup.shared.su, s, inter as u32, hidden as u32)?,
+            shared_down: testing::dense(&setup.shared.sd, s, hidden as u32, inter as u32)?,
+            shared_expert_gate: Some(testing::view(&setup.shared.seg, s, [hidden as u32], [1])?),
+            y: testing::dense_mut(&res_perturbed, s, rows as u32, hidden as u32)?,
+        },
+        &setup.scratch,
+    )?;
+    s.synchronize()?;
+    let got_perturbed = s.clone_dtoh(&res_perturbed)?;
+    let perturbed_diff = got_perturbed
+        .iter()
+        .zip(&expected_res)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    anyhow::ensure!(
+        perturbed_diff == 1,
+        "perturbed residual negative control expected 1 differing word, got {perturbed_diff}"
+    );
+    println!(
+        "PASS prefill_combine_residual_and_routed rows={rows} hidden={hidden} inplace_bad=0 routed_bad=0 control_diff={perturbed_diff}"
     );
     Ok(())
 }

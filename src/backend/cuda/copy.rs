@@ -40,6 +40,7 @@ pub fn columns(
     dst: &mut impl DevicePtrMut<bf16>,
     r: Rect,
 ) -> Result<()> {
+    ensure!(r.rows > 0, "invalid CUDA column copy rectangle");
     ensure!(
         (r.rows - 1) * r.src_pitch + r.src_col + r.width <= src.len()
             && (r.rows - 1) * r.dst_pitch + r.dst_col + r.width <= dst.len(),

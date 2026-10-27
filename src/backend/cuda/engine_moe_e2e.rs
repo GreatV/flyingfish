@@ -4193,3 +4193,368 @@ fn minicpm_two_gpu_split_combine_invariance_gpu() -> Result<()> {
     );
     Ok(())
 }
+
+fn run_prefill_combine_case(
+    engine: &mut Engine,
+    case: &str,
+    ids: &[u32],
+    probe_dir: Option<&Path>,
+) -> Result<usize> {
+    let hidden = engine.model_spec.hidden as usize;
+    let total_layers = engine.model_spec.layers.len() as u32;
+    let (gpu0_layers, span_rows, wave_rows, slots_per_layer, has_peer) = {
+        let slots = engine
+            .moe_slots
+            .as_ref()
+            .context("prefill combine slots missing")?;
+        let layout = slots.storage.layout();
+        let counts = (0..total_layers)
+            .map(|l| layout.slot_count(l))
+            .collect::<Result<Vec<_>>>()?;
+        let prefill = engine
+            .moe_prefill
+            .as_ref()
+            .context("prefill combine executor missing")?;
+        (
+            prefill.capacity.gpu0_layers,
+            prefill.capacity.span_rows,
+            prefill.capacity.wave_rows,
+            counts,
+            slots.storage.has_peer(),
+        )
+    };
+    if CudaContext::device_count()? >= 2 {
+        ensure!(
+            has_peer && gpu0_layers < total_layers,
+            "Runner FAIL 2-GPU peer prefill was not engaged: has_peer={has_peer} gpu0_layers={gpu0_layers}"
+        );
+    }
+    let keep = ids.len().min(64);
+    engine.reset()?;
+    let mut trace = Trace::default();
+    let mut capture_bits = Vec::new();
+    let first_req0 = engine.prefill_moe_chunks(ids, Some(&mut trace), keep, &mut |eng, wave| {
+        if let Some(capture) = &eng.hidden_capture {
+            let ctx_rows = capture.values.len() / capture.width;
+            let base = eng.committed_prefix_ids.len() % ctx_rows;
+            let start = base * capture.width;
+            let end = (base + wave.len()) * capture.width;
+            let slice = eng
+                .device
+                .stream
+                .clone_dtoh(&capture.values.slice(start..end))?;
+            capture_bits.extend(slice.into_iter().map(bf16::to_bits));
+        }
+        Ok(())
+    })?;
+    let logits_req0: Vec<u32> = engine
+        .decode_logits()?
+        .into_iter()
+        .map(|v| {
+            ensure!(v.is_finite(), "Runner FAIL nonfinite req0 logits {case}");
+            Ok(v.to_bits())
+        })
+        .collect::<Result<_>>()?;
+    let mut layer_tail_bits = Vec::with_capacity(total_layers as usize * keep * hidden);
+    for layer in 0..total_layers as usize {
+        for v in tail(&trace, &format!("layer.{layer}"), keep * hidden)? {
+            ensure!(
+                v.is_finite(),
+                "Runner FAIL nonfinite layer.{layer} trace {case}"
+            );
+            layer_tail_bits.push(bf16::from_f32(v).to_bits());
+        }
+    }
+    let norm_tail_bits: Vec<u16> = tail(&trace, "norm", keep * hidden)?
+        .into_iter()
+        .map(|v| {
+            ensure!(v.is_finite(), "Runner FAIL nonfinite norm trace {case}");
+            Ok(bf16::from_f32(v).to_bits())
+        })
+        .collect::<Result<_>>()?;
+    if let Some(capture) = &engine.hidden_capture {
+        ensure!(
+            capture_bits.len() == ids.len() * capture.width,
+            "Runner FAIL hidden_capture extent {}/{} for {case}",
+            capture_bits.len(),
+            ids.len() * capture.width
+        );
+    }
+
+    engine.reset()?;
+    let profile = probe_dir.is_none();
+    if profile {
+        engine.profiler_start()?;
+    }
+    let prefill_range = super::super::super::profile::Range::new(profile, c"t33_prefill");
+    let first_req1 = engine.prefill(ids, None)?;
+    engine.device.stream.synchronize()?;
+    drop(prefill_range);
+    let logits_req1: Vec<u32> = engine
+        .decode_logits()?
+        .into_iter()
+        .map(|v| {
+            ensure!(v.is_finite(), "Runner FAIL nonfinite req1 logits {case}");
+            Ok(v.to_bits())
+        })
+        .collect::<Result<_>>()?;
+    let decode_range = super::super::super::profile::Range::new(profile, c"t33_eager_decode");
+    let tok1 = engine.decode(false, None)?;
+    engine.set_token(tok1)?;
+    let tok2 = engine.decode(false, None)?;
+    engine.device.stream.synchronize()?;
+    drop(decode_range);
+    if profile {
+        engine.profiler_stop()?;
+    }
+    engine.check_logits()?;
+    let logits_decode: Vec<u32> = engine
+        .decode_logits()?
+        .into_iter()
+        .map(|v| {
+            ensure!(v.is_finite(), "Runner FAIL nonfinite decode logits {case}");
+            Ok(v.to_bits())
+        })
+        .collect::<Result<_>>()?;
+    ensure!(
+        first_req0 == first_req1,
+        "DEFECT cold vs warm prefill first token mismatch {case}: {first_req0} != {first_req1}"
+    );
+
+    let Some(dir) = probe_dir else {
+        println!(
+            "PASS minicpm_prefill_combine_profile {}",
+            serde_json::json!({
+                "case": case,
+                "rows": ids.len(),
+                "capacity": engine.capacity,
+                "chunk_rows": engine.chunk,
+                "span_rows": span_rows,
+                "wave_rows": wave_rows,
+                "gpu0_layers": gpu0_layers,
+                "has_peer": has_peer,
+                "first_token": first_req1,
+                "eager_decode_tokens": [tok1, tok2],
+            })
+        );
+        return Ok(0);
+    };
+
+    let meta_path = dir.join(format!("{case}.json"));
+    let bin_path = dir.join(format!("{case}.bin"));
+    let mut payload = Vec::with_capacity(
+        (layer_tail_bits.len() + norm_tail_bits.len() + capture_bits.len()) * 2
+            + (logits_req0.len() + logits_req1.len() + logits_decode.len()) * 4,
+    );
+    for &w in layer_tail_bits
+        .iter()
+        .chain(&norm_tail_bits)
+        .chain(&capture_bits)
+    {
+        payload.extend_from_slice(&w.to_le_bytes());
+    }
+    for &w in logits_req0.iter().chain(&logits_req1).chain(&logits_decode) {
+        payload.extend_from_slice(&w.to_le_bytes());
+    }
+    let meta = serde_json::json!({
+        "case": case,
+        "rows": ids.len(),
+        "keep": keep,
+        "capacity": engine.capacity,
+        "chunk_rows": engine.chunk,
+        "span_rows": span_rows,
+        "wave_rows": wave_rows,
+        "gpu0_layers": gpu0_layers,
+        "has_peer": has_peer,
+        "slots_per_layer": slots_per_layer,
+        "layer_tail_len": layer_tail_bits.len(),
+        "norm_tail_len": norm_tail_bits.len(),
+        "capture_len": capture_bits.len(),
+        "logits_len": logits_req0.len(),
+        "first_token": first_req1,
+        "eager_decode_tokens": [tok1, tok2],
+    });
+    if !meta_path.exists() {
+        std::fs::write(&bin_path, &payload)?;
+        std::fs::write(&meta_path, serde_json::to_vec_pretty(&meta)?)?;
+        println!("PASS minicpm_prefill_combine_probe_write {meta}");
+        return Ok(0);
+    }
+
+    let expected_meta: serde_json::Value = serde_json::from_slice(&std::fs::read(&meta_path)?)?;
+    for key in [
+        "rows",
+        "keep",
+        "capacity",
+        "chunk_rows",
+        "span_rows",
+        "wave_rows",
+        "gpu0_layers",
+        "has_peer",
+        "layer_tail_len",
+        "norm_tail_len",
+        "capture_len",
+        "logits_len",
+    ] {
+        ensure!(
+            meta[key] == expected_meta[key],
+            "Runner FAIL probe geometry mismatch on {case}.{key}: candidate={} vs baseline={}",
+            meta[key],
+            expected_meta[key]
+        );
+    }
+    let expected_bytes = std::fs::read(&bin_path)?;
+    ensure!(
+        expected_bytes.len() == payload.len(),
+        "Runner FAIL probe byte length mismatch on {case}: {} vs {}",
+        payload.len(),
+        expected_bytes.len()
+    );
+    let mut cursor = 0usize;
+    let mut take_u16 = |len: usize| -> Vec<u16> {
+        let slice = &expected_bytes[cursor..cursor + len * 2];
+        cursor += len * 2;
+        slice
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| u16::from_le_bytes(*b))
+            .collect()
+    };
+    let exp_layer = take_u16(layer_tail_bits.len());
+    let exp_norm = take_u16(norm_tail_bits.len());
+    let exp_capture = take_u16(capture_bits.len());
+    let mut take_u32 = |len: usize| -> Vec<u32> {
+        let slice = &expected_bytes[cursor..cursor + len * 4];
+        cursor += len * 4;
+        slice
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_le_bytes(*b))
+            .collect()
+    };
+    let exp_req0 = take_u32(logits_req0.len());
+    let exp_req1 = take_u32(logits_req1.len());
+    let exp_dec = take_u32(logits_decode.len());
+
+    let diff_u16 = |a: &[u16], b: &[u16]| a.iter().zip(b).filter(|(x, y)| x != y).count();
+    let diff_u32 = |a: &[u32], b: &[u32]| a.iter().zip(b).filter(|(x, y)| x != y).count();
+    let layer_diff = diff_u16(&layer_tail_bits, &exp_layer);
+    let norm_diff = diff_u16(&norm_tail_bits, &exp_norm);
+    let capture_diff = diff_u16(&capture_bits, &exp_capture);
+    let req0_diff = diff_u32(&logits_req0, &exp_req0);
+    let req1_diff = diff_u32(&logits_req1, &exp_req1);
+    let dec_diff = diff_u32(&logits_decode, &exp_dec);
+
+    let mut perturbed_layer = layer_tail_bits.clone();
+    perturbed_layer[0] ^= 1;
+    let mut perturbed_logits = logits_req1.clone();
+    perturbed_logits[0] ^= 1;
+    ensure!(
+        diff_u16(&perturbed_layer, &exp_layer) > 0 && diff_u32(&perturbed_logits, &exp_req1) > 0,
+        "Runner FAIL negative control perturbation was not detected on {case}"
+    );
+
+    let defects = layer_diff + norm_diff + capture_diff + req0_diff + req1_diff + dec_diff;
+    println!(
+        "{} minicpm_prefill_combine_bit_identity {}",
+        if defects == 0 { "PASS" } else { "DEFECT" },
+        serde_json::json!({
+            "case": case,
+            "rows": ids.len(),
+            "keep": keep,
+            "capacity": engine.capacity,
+            "chunk_rows": engine.chunk,
+            "span_rows": span_rows,
+            "wave_rows": wave_rows,
+            "gpu0_layers": gpu0_layers,
+            "has_peer": has_peer,
+            "slots_per_layer": slots_per_layer,
+            "baseline_slots_per_layer": expected_meta["slots_per_layer"],
+            "layer_tail_elements": layer_tail_bits.len(),
+            "layer_tail_bit_mismatches": layer_diff,
+            "norm_tail_elements": norm_tail_bits.len(),
+            "norm_tail_bit_mismatches": norm_diff,
+            "capture_tap_elements": capture_bits.len(),
+            "capture_tap_bit_mismatches": capture_diff,
+            "logits_elements": logits_req0.len(),
+            "logits_req0_bit_mismatches": req0_diff,
+            "logits_req1_bit_mismatches": req1_diff,
+            "logits_decode_bit_mismatches": dec_diff,
+            "first_token": first_req1,
+            "negative_control_detected": true,
+        })
+    );
+    Ok(usize::from(defects != 0))
+}
+
+#[test]
+#[ignore = "requires CUDA, published MiniCPM FF_MODEL, FF_MINICPM_REFERENCE_DIR and FLYINGFISH_RUNTIME_DIR"]
+fn minicpm_prefill_combine_bit_identity_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let model = PathBuf::from(std::env::var("FF_MODEL")?);
+    let fixtures = PathBuf::from(std::env::var("FF_MINICPM_REFERENCE_DIR")?);
+    let runtime = PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
+    let draft_model = std::env::var_os("FF_ARGMAX_DRAFT").map(PathBuf::from);
+    let probe_dir = std::env::var_os("FF_Q38_PROBE_DIR").map(PathBuf::from);
+    if let Some(dir) = &probe_dir {
+        std::fs::create_dir_all(dir)?;
+    }
+    let spec = crate::model_spec::ModelSpec::read(&model)?;
+    ensure!(
+        spec.hidden == 2048
+            && spec.vocab == 248144
+            && spec.layers.len() == 40
+            && spec.expert_format.is_some(),
+        "Runner FAIL published MiniCPM geometry required"
+    );
+    let mut inputs = Vec::new();
+    for case in ["text_1k", "text_4k", "text_16k"] {
+        let path = fixtures.join(format!("{case}.safetensors"));
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("Runner FAIL required fixture {}", path.display()))?;
+        let source = SafeTensors::deserialize(&bytes)?;
+        let ids = integers(&source, "input_ids")?;
+        ensure!(
+            !ids.is_empty() && ids.iter().all(|&id| id < spec.vocab),
+            "Runner FAIL fixture {case} token extent/vocabulary"
+        );
+        inputs.push((case, ids));
+    }
+    let draft_rows = match &draft_model {
+        Some(draft) => {
+            crate::dspark::DraftConfig::read(draft, &spec.config())?.target_rows(&spec)?
+        }
+        None => 0,
+    };
+    let settings = Settings {
+        runtime_dir: Some(runtime),
+        prefix_cache: false,
+        draft_model,
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: false,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    let mut defects = 0;
+    for (case, ids) in &inputs {
+        let capacity = (ids.len() + 32 + draft_rows).next_multiple_of(32);
+        let write_mode = probe_dir
+            .as_ref()
+            .is_some_and(|dir| !dir.join(format!("{case}.json")).exists());
+        if write_mode {
+            Engine::calibrate(&model, 0, capacity, None, settings.clone())?;
+        }
+        let mut engine = Engine::load(&model, 0, capacity, None, settings.clone())?;
+        defects += run_prefill_combine_case(&mut engine, case, ids, probe_dir.as_deref())?;
+    }
+    ensure!(
+        defects == 0,
+        "DEFECT minicpm_prefill_combine_bit_identity={defects}"
+    );
+    Ok(())
+}

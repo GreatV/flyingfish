@@ -1455,7 +1455,7 @@ impl PrefillOps {
     }
 
     pub fn combine_routed(&self, stream: &Arc<CudaStream>, input: &MoeCombineRouted) -> Result<()> {
-        self.combine.combine_routed(stream, input)
+        self.combine.combine_routed_prefill(stream, input)
     }
 
     fn finish_body(

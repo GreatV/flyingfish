@@ -169,10 +169,7 @@ __device__ __forceinline__ void moe_routed_acc(
   }
 }
 
-// Routed sum of one row: BF16(FP32 sum of the final-active contributions in
-// ascending expert id). hidden % 8 == 0 selects the 16-byte group path.
-template <int VEC>
-__device__ __forceinline__ void moe_combine_routed_body(
+extern "C" __global__ void moe_combine_routed(
     const bf16* __restrict__ contributions, const int* __restrict__ ids,
     const unsigned* __restrict__ done, const unsigned* __restrict__ final_active,
     bf16* __restrict__ routed_out, int rows, int top_k, long long hidden) {
@@ -185,40 +182,37 @@ __device__ __forceinline__ void moe_combine_routed_body(
   const int live =
       moe_order_routed_row(ids, done, final_active, a0, top_k, order);
   bf16* __restrict__ rr = routed_out + (long long)row * hidden;
-  if constexpr (VEC == 8) {
-    for (long long d0 = (long long)tid * 8; d0 < hidden;
-         d0 += (long long)blockDim.x * 8) {
-      float acc[8];
-      moe_routed_acc<8>(contributions, order, live, a0, hidden, d0, acc);
-      Bf16x8 out;
-      out.v = *reinterpret_cast<float4*>(rr + d0);
-#pragma unroll
-      for (int j = 0; j < 8; ++j) out.h[j] = __float2bfloat16(acc[j]);
-      *reinterpret_cast<float4*>(rr + d0) = out.v;
-    }
-  } else {
-    for (long long d = tid; d < hidden; d += blockDim.x) {
-      float acc[1];
-      moe_routed_acc<1>(contributions, order, live, a0, hidden, d, acc);
-      rr[d] = __float2bfloat16(acc[0]);
-    }
+  for (long long d = tid; d < hidden; d += blockDim.x) {
+    float acc = 0.0f;
+    for (int k = 0; k < live; ++k)
+      acc += __bfloat162float(
+          contributions[(long long)(a0 + order[k]) * hidden + d]);
+    rr[d] = __float2bfloat16(acc);
   }
 }
 
-extern "C" __global__ void moe_combine_routed(
+extern "C" __global__ void moe_combine_routed_vector(
     const bf16* __restrict__ contributions, const int* __restrict__ ids,
     const unsigned* __restrict__ done, const unsigned* __restrict__ final_active,
     bf16* __restrict__ routed_out, int rows, int top_k, long long hidden) {
-  moe_combine_routed_body<8>(contributions, ids, done, final_active, routed_out,
-                             rows, top_k, hidden);
-}
-
-extern "C" __global__ void moe_combine_routed_scalar(
-    const bf16* __restrict__ contributions, const int* __restrict__ ids,
-    const unsigned* __restrict__ done, const unsigned* __restrict__ final_active,
-    bf16* __restrict__ routed_out, int rows, int top_k, long long hidden) {
-  moe_combine_routed_body<1>(contributions, ids, done, final_active, routed_out,
-                             rows, top_k, hidden);
+  if (blockDim.x != 256 || top_k < 1 || top_k > 32 || hidden % 8 != 0) __trap();
+  const int row = blockIdx.x;
+  if (row < 0 || row >= rows) __trap();
+  const int tid = threadIdx.x;
+  const int a0 = row * top_k;
+  int order[32];
+  const int live =
+      moe_order_routed_row(ids, done, final_active, a0, top_k, order);
+  bf16* __restrict__ rr = routed_out + (long long)row * hidden;
+  for (long long d0 = (long long)tid * 8; d0 < hidden;
+       d0 += (long long)blockDim.x * 8) {
+    float acc[8];
+    moe_routed_acc<8>(contributions, order, live, a0, hidden, d0, acc);
+    Bf16x8 out;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) out.h[j] = __float2bfloat16(acc[j]);
+    *reinterpret_cast<float4*>(rr + d0) = out.v;
+  }
 }
 
 extern "C" __global__ void moe_join_routed(

@@ -13,7 +13,7 @@ pub struct CombineOps {
     combine: CudaFunction,
     combine_ungated: CudaFunction,
     combine_routed: CudaFunction,
-    combine_routed_scalar: CudaFunction,
+    combine_routed_vector: CudaFunction,
     join_routed: CudaFunction,
     combine_residual: CudaFunction,
     combine_residual_scalar: CudaFunction,
@@ -360,7 +360,7 @@ impl CombineOps {
             combine: module.load_function("moe_combine")?,
             combine_ungated: module.load_function("moe_combine_ungated")?,
             combine_routed: module.load_function("moe_combine_routed")?,
-            combine_routed_scalar: module.load_function("moe_combine_routed_scalar")?,
+            combine_routed_vector: module.load_function("moe_combine_routed_vector")?,
             join_routed: module.load_function("moe_join_routed")?,
             combine_residual: module.load_function("moe_combine_residual")?,
             combine_residual_scalar: module.load_function("moe_combine_residual_scalar")?,
@@ -447,14 +447,28 @@ impl CombineOps {
     }
 
     pub fn combine_routed(&self, stream: &Arc<CudaStream>, input: &MoeCombineRouted) -> Result<()> {
-        let (rows, top_k, hidden) = input.validate()?;
-        // The 16-byte group path needs hidden % 8 == 0; the scalar entry point
-        // covers every other extent.
-        let kernel = if hidden % 8 == 0 {
-            &self.combine_routed
+        Self::launch_combine_routed(stream, input, &self.combine_routed)
+    }
+
+    pub fn combine_routed_prefill(
+        &self,
+        stream: &Arc<CudaStream>,
+        input: &MoeCombineRouted,
+    ) -> Result<()> {
+        let kernel = if input.routed_out.read().shape[1].is_multiple_of(8) {
+            &self.combine_routed_vector
         } else {
-            &self.combine_routed_scalar
+            &self.combine_routed
         };
+        Self::launch_combine_routed(stream, input, kernel)
+    }
+
+    fn launch_combine_routed(
+        stream: &Arc<CudaStream>,
+        input: &MoeCombineRouted,
+        kernel: &CudaFunction,
+    ) -> Result<()> {
+        let (rows, top_k, hidden) = input.validate()?;
         // SAFETY: all validated views cover rows*top_k choices and rows*hidden output values.
         unsafe {
             stream
