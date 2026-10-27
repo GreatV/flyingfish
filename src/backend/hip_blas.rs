@@ -195,7 +195,8 @@ pub struct Blas {
     lt: Handle,
     identity: Identity,
     workspace: CudaSlice<u8>,
-    plans: RefCell<BTreeMap<LinearShape, Plan>>,
+    // Every plan accumulates in FP32 and adds bias before the BF16 output rounding.
+    plans: RefCell<BTreeMap<(LinearShape, Option<u64>), Plan>>,
 }
 impl Blas {
     pub fn new(stream: Arc<CudaStream>) -> Result<Self> {
@@ -263,6 +264,7 @@ impl Blas {
             "HIP linear dimensions exceed i32: {shape:?}"
         );
         if let Some(bias) = &bias {
+            bias.check_stream(&self.stream)?;
             ensure!(
                 shape.rows > 1 && bias.len() == shape.output,
                 "HIP BF16 bias requires multirow output-width vector"
@@ -276,19 +278,13 @@ impl Blas {
                 "HIP frozen algorithm identity/shape/epilogue mismatch"
             );
         }
-        if let Some(plan) = self.plans.borrow().get(&shape) {
-            ensure!(
-                plan.choice.bias == bias.is_some(),
-                "HIP prepared shape epilogue differs"
-            );
+        let key = (shape, bias.as_ref().map(|b| b.device_ptr(&self.stream).0));
+        if let Some(plan) = self.plans.borrow().get(&key) {
             if let Some(frozen) = frozen {
                 ensure!(
                     &plan.choice == frozen,
                     "HIP frozen choice differs from prepared plan"
                 );
-            }
-            if let (Some(a), Some(b)) = (&plan.bias, &bias) {
-                ensure!(Arc::ptr_eq(a, b), "HIP prepared bias allocation differs");
             }
             return Ok(plan.choice.clone());
         }
@@ -318,7 +314,7 @@ impl Blas {
             );
         }
         let choice = plan.choice.clone();
-        self.plans.borrow_mut().insert(shape, plan);
+        self.plans.borrow_mut().insert(key, plan);
         Ok(choice)
     }
 
@@ -457,12 +453,19 @@ impl Blas {
     pub fn linear(
         &self,
         shape: LinearShape,
+        bias: Option<&CudaSlice<bf16>>,
         weight: &impl DevicePtr<bf16>,
         input: &impl DevicePtr<bf16>,
         output: &mut impl DevicePtrMut<bf16>,
     ) -> Result<()> {
+        if let Some(bias) = bias {
+            bias.check_stream(&self.stream)?;
+        }
+        let key = (shape, bias.map(|b| b.device_ptr(&self.stream).0));
         let plans = self.plans.borrow();
-        let plan = plans.get(&shape).context("HIP linear shape not prepared")?;
+        let plan = plans
+            .get(&key)
+            .context("HIP linear shape/bias binding not prepared")?;
         ensure!(
             weight.len()
                 == shape
@@ -482,6 +485,9 @@ impl Blas {
             "HIP linear storage shape mismatch"
         );
         self.stream.context().bind_to_thread()?;
+        weight.check_stream(&self.stream)?;
+        input.check_stream(&self.stream)?;
+        output.check_stream(&self.stream)?;
         let (a, _a) = weight.device_ptr(&self.stream);
         let (b, _b) = input.device_ptr(&self.stream);
         let (c, _c) = output.device_ptr_mut(&self.stream);

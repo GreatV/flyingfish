@@ -359,6 +359,7 @@ impl Stream {
         output: &mut impl DevicePtrMut<T>,
     ) -> Result<()> {
         ensure!(input.len() <= output.len(), "HIP H2D exceeds allocation");
+        output.check_stream(self)?;
         let (ptr, _guard) = output.device_ptr_mut(self);
         unsafe {
             self.copy_raw(ptr, input.as_ptr() as u64, extent::<T>(input.len())?, 1)?;
@@ -369,6 +370,7 @@ impl Stream {
         self: &Arc<Self>,
         input: &impl DevicePtr<T>,
     ) -> Result<Vec<T>> {
+        input.check_stream(self)?;
         let mut output = Vec::<T>::with_capacity(input.len());
         let (ptr, _guard) = input.device_ptr(self);
         unsafe {
@@ -391,6 +393,8 @@ impl Stream {
         output: &mut impl DevicePtrMut<T>,
     ) -> Result<()> {
         ensure!(input.len() <= output.len(), "HIP D2D exceeds allocation");
+        input.check_stream(self)?;
+        output.check_stream(self)?;
         let (src, _read) = input.device_ptr(self);
         let (dst, _write) = output.device_ptr_mut(self);
         unsafe { self.copy_raw(dst, src, extent::<T>(input.len())?, 3) }
@@ -401,6 +405,7 @@ impl Stream {
     ) -> Result<()> {
         self.context.bind_to_thread()?;
         let bytes = extent::<T>(output.len())?;
+        output.check_stream(self)?;
         let (ptr, _guard) = output.device_ptr_mut(self);
         if bytes > 0 {
             unsafe {
@@ -611,6 +616,22 @@ impl<T> Slice<T> {
     pub fn stream(&self) -> &Arc<Stream> {
         &self.allocation.stream
     }
+    /// Transfers exclusive stream ownership after fencing all prior owner-stream work.
+    pub fn handoff(&mut self, stream: &Arc<Stream>) -> Result<()> {
+        ensure!(
+            Arc::ptr_eq(&stream.context, &self.allocation.stream.context),
+            "HIP handoff context mismatch"
+        );
+        if Arc::ptr_eq(stream, &self.allocation.stream) {
+            return Ok(());
+        }
+        let allocation = Arc::get_mut(&mut self.allocation)
+            .context("HIP handoff requires exclusive allocation ownership")?;
+        let completed = allocation.stream.record_event(Some(2))?;
+        stream.wait(&completed)?;
+        allocation.stream = stream.clone();
+        Ok(())
+    }
     pub fn slice(&self, range: impl RangeBounds<usize>) -> View<'_, T> {
         let (offset, len) = bounds(range, self.len);
         View {
@@ -651,6 +672,7 @@ impl<T> ViewMut<'_, T> {
 /// The returned pointer must cover `len` elements and remain live for the guard's borrow.
 pub unsafe trait DevicePtr<T> {
     fn len(&self) -> usize;
+    fn check_stream(&self, stream: &Arc<Stream>) -> Result<()>;
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -667,11 +689,16 @@ macro_rules! pointer {
             fn len(&self) -> usize {
                 self.len
             }
-            fn device_ptr<'a>(&'a self, stream: &'a Arc<Stream>) -> (u64, PointerGuard<'a>) {
-                assert!(
-                    Arc::ptr_eq(&stream.context, &self.allocation.stream.context),
-                    "HIP pointer context mismatch"
+            fn check_stream(&self, stream: &Arc<Stream>) -> Result<()> {
+                ensure!(
+                    Arc::ptr_eq(stream, &self.allocation.stream),
+                    "HIP cross-stream access requires Slice::handoff with an explicit fence"
                 );
+                Ok(())
+            }
+            fn device_ptr<'a>(&'a self, stream: &'a Arc<Stream>) -> (u64, PointerGuard<'a>) {
+                self.check_stream(stream)
+                    .expect("HIP pointer stream ownership");
                 (
                     (self.allocation.ptr + $offset(self) * size_of::<T>()) as u64,
                     PointerGuard(PhantomData),

@@ -127,6 +127,34 @@ fn copy_gate(ctx: &Arc<CudaContext>, s: &Arc<CudaStream>, gate: &mut Gate) -> Re
     let upload = ctx.new_stream()?;
     let host = pattern(3 * 272, 7);
     let mut source = upload.alloc_zeros::<bf16>(host.len())?;
+    #[cfg(feature = "rocm")]
+    {
+        gate.check(
+            "copy.unfenced_read_rejected",
+            s.clone_dtoh(&source).is_err(),
+        );
+        gate.check(
+            "copy.unfenced_write_rejected",
+            s.memset_zeros(&mut source).is_err(),
+        );
+        gate.check(
+            "copy.unfenced_view_read_rejected",
+            s.clone_dtoh(&source.slice(8..40)).is_err(),
+        );
+        gate.check(
+            "copy.unfenced_view_write_rejected",
+            s.memset_zeros(&mut source.slice_mut(8..40)).is_err(),
+        );
+        let mut destination = s.alloc_zeros::<bf16>(host.len())?;
+        gate.check(
+            "copy.unfenced_dtod_source_rejected",
+            s.memcpy_dtod(&source, &mut destination).is_err(),
+        );
+        gate.check(
+            "copy.unfenced_dtod_destination_rejected",
+            s.memcpy_dtod(&destination, &mut source).is_err(),
+        );
+    }
     let mut staging = copy::pinned_zeros::<u8>(ctx, host.len() * 2)?;
     for (bytes, value) in staging
         .as_mut_slice()?
@@ -139,6 +167,8 @@ fn copy_gate(ctx: &Arc<CudaContext>, s: &Arc<CudaStream>, gate: &mut Gate) -> Re
     }
     copy::htod_bytes(&upload, &mut source, 0, &staging, 0, host.len() * 2)?;
     s.wait(&upload.record_event(None)?)?;
+    #[cfg(feature = "rocm")]
+    source.handoff(s)?;
     gate.check(
         "copy.typed_subview_after_upload_fence",
         s.clone_dtoh(&source.slice(8..40))? == host[8..40],
@@ -164,6 +194,33 @@ fn copy_gate(ctx: &Arc<CudaContext>, s: &Arc<CudaStream>, gate: &mut Gate) -> Re
             .copy_from_slice(&host[row * 272 + 8..row * 272 + 264]);
     }
     gate.check("copy.pitched_offsets_guards", got == expected);
+    #[cfg(feature = "rocm")]
+    {
+        gate.check(
+            "copy.previous_owner_rejected",
+            upload.clone_dtoh(&source).is_err(),
+        );
+        source.handoff(&upload)?;
+        upload.memset_zeros(&mut source)?;
+        source.handoff(s)?;
+        gate.check(
+            "copy.handoff_write_order",
+            s.clone_dtoh(&source)?.iter().all(|x| x.to_bits() == 0),
+        );
+        s.memcpy_htod(&host, &mut source)?;
+        let ops = ops::Ops::new(ctx)?;
+        let mut word = s.alloc_zeros::<i32>(1)?;
+        let mut pending = s.launch_builder(&ops.advance);
+        // A retained allocation cannot be handed off while a launch owns it.
+        pending.arg(&mut word);
+        gate.check(
+            "copy.handoff_retained_launch_rejected",
+            word.handoff(&upload).is_err(),
+        );
+        drop(pending);
+        word.handoff(&upload)?;
+        gate.check("copy.handoff_owner", Arc::ptr_eq(word.stream(), &upload));
+    }
     let mut pinned = copy::pinned_zeros::<u8>(ctx, 96)?;
     copy::dtoh_bytes(s, &source, 16, &mut pinned, 8, 64)?;
     s.synchronize()?;
@@ -842,26 +899,31 @@ fn blas_gate(s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
             let rebound = blas::Blas::new(s.clone())?;
             gate.check(
                 "blas.identity_rebind",
-                rebound.prepare(shape, db, Some(&frozen))? == choice,
+                rebound.prepare(shape, db.clone(), Some(&frozen))? == choice,
             );
             println!(
                 "HIP_BLAS_CHOICE {} cached=true measurements=0 tuned=false",
                 serde_json::to_string(&choice)?
             );
-            rebound.linear(shape, &dw, &dx, &mut dy)?;
-            let expected: Vec<_> = (0..rows * output)
-                .map(|i| {
-                    let row = i / output;
-                    let o = i % output;
-                    let sum = (0..input)
-                        .map(|k| {
-                            f64::from(w[o * input + k].to_f32())
-                                * f64::from(x[row * input + k].to_f32())
-                        })
-                        .sum::<f64>();
-                    bf16::from_f32((sum + if bias { f64::from(b[o].to_f32()) } else { 0.0 }) as f32)
-                })
-                .collect();
+            rebound.linear(shape, db.as_deref(), &dw, &dx, &mut dy)?;
+            let reference = |bias: Option<&[bf16]>| -> Vec<bf16> {
+                (0..rows * output)
+                    .map(|i| {
+                        let row = i / output;
+                        let o = i % output;
+                        let sum = (0..input)
+                            .map(|k| {
+                                f64::from(w[o * input + k].to_f32())
+                                    * f64::from(x[row * input + k].to_f32())
+                            })
+                            .sum::<f64>();
+                        bf16::from_f32(
+                            (sum + bias.map_or(0.0, |b| f64::from(b[o].to_f32()))) as f32,
+                        )
+                    })
+                    .collect()
+            };
+            let expected = reference(bias.then_some(&b[..]));
             gate.compare(
                 &format!("blas.rows{rows}.weight[{output},{input}].bias{bias}"),
                 &s.clone_dtoh(&dy)?,
@@ -869,6 +931,40 @@ fn blas_gate(s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
                 2,
                 input,
             )?;
+            if bias {
+                let second_bias: Vec<_> = pattern(output, 71)
+                    .into_iter()
+                    .map(|b| bf16::from_f32(b.to_f32() + 1.0))
+                    .collect();
+                let second = Arc::new(s.clone_htod(&second_bias)?);
+                let prepared = rebound.prepare(shape, Some(second.clone()), Some(&frozen));
+                gate.check("blas.second_bias_same_shape_prepared", prepared.is_ok());
+                let unbiased = rebound.prepare(shape, None, None);
+                gate.check("blas.unbiased_same_shape_prepared", unbiased.is_ok());
+                if prepared.is_ok() && unbiased.is_ok() {
+                    for (label, binding, values) in [
+                        ("second", Some(second.as_ref()), Some(&second_bias[..])),
+                        ("unbiased", None, None),
+                        ("first", db.as_deref(), Some(&b[..])),
+                    ] {
+                        rebound.linear(shape, binding, &dw, &dx, &mut dy)?;
+                        gate.compare(
+                            &format!("blas.binding.{label}.rows{rows}.weight[{output},{input}]"),
+                            &s.clone_dtoh(&dy)?,
+                            &reference(values),
+                            2,
+                            input,
+                        )?;
+                    }
+                }
+                let unprepared = s.clone_htod(&b)?;
+                gate.check(
+                    "blas.unprepared_bias_rejected",
+                    rebound
+                        .linear(shape, Some(&unprepared), &dw, &dx, &mut dy)
+                        .is_err(),
+                );
+            }
         }
     }
     Ok(())
