@@ -1,6 +1,7 @@
 // Active-assignment count, exclusive scan, row permutation and weighted BF16 scatter.
 // Active expert ids, slot generations, done bits and segment positions are checked before use.
 #include <cuda_runtime.h>
+#include <cuda/atomic>
 #include <type_traits>
 #include "q38_contract.cuh"
 
@@ -213,148 +214,210 @@ extern "C" __global__ void __launch_bounds__(256, 2) moe_gemm_w8a16(
   }
 }
 
-#define FD_MOE_GUARDS do {                                                              \
-  if (blockDim.x != 1024 || experts < 1 || experts > 1024) __trap();                    \
-} while (0)
+__device__ __forceinline__ bool moe_assignment_active(
+    const int* ids, const unsigned* active, const unsigned* valid,
+    long long a, int experts, int mask_from_slots) {
+  if (!mask_from_slots && active[a] == 0u) return false;
+  const int e = ids[a];
+  if (e < 0 || e >= experts) __trap();
+  return mask_from_slots ? valid[e] != 0u : true;
+}
 
-// One block counts the ACTIVE assignments into per-expert counts with shared
-// atomics and writes the active-assignment total; single block, so counts
-// needs no pre-zeroed global state.
-extern "C" __global__ void moe_count(const int* __restrict__ ids,
-                                     const unsigned* __restrict__ active,
-                                     int* __restrict__ counts,
-                                     int* __restrict__ active_total,
-                                     long long assignments, int experts,
-                                     int top_k) {
-  FD_MOE_GUARDS;
+// state[0..1024] accumulates counts; state[1024] retires CTAs; state[1025] reserves compact indices.
+extern "C" __global__ void moe_count_scan(
+    const int* __restrict__ ids, const unsigned* __restrict__ active,
+    const unsigned* __restrict__ valid,
+    const unsigned long long* __restrict__ generation,
+    const unsigned long long* __restrict__ assignment_gen,
+    const unsigned* __restrict__ done, unsigned* __restrict__ state,
+    int* __restrict__ compact, int* __restrict__ counts,
+    int* __restrict__ active_total, int* __restrict__ offsets,
+    int* __restrict__ cursor, long long assignments, int experts,
+    int top_k, int capacity, int expected_active, int mask_from_slots) {
+  if (blockDim.x != 256 || experts < 1 || experts > 1024 ||
+      top_k < 1 || top_k > 32 || capacity < 0 ||
+      (unsigned)mask_from_slots > 1u) __trap();
   __shared__ int sc[1024];
-  __shared__ int sa;
+  __shared__ unsigned last;
   const int tid = threadIdx.x;
-  sc[tid] = 0;
-  if (tid == 0) sa = 0;
+  for (int e = tid; e < 1024; e += 256) sc[e] = 0;
   __syncthreads();
-  for (long long a = tid; a < assignments; a += blockDim.x) {
-    if (active[a] == 0u) continue;
-    const int e = ids[a];
-    if (e < 0 || e >= experts) __trap();
-    atomicAdd(&sc[e], 1);
-    atomicAdd(&sa, 1);
+  for (long long base = (long long)blockIdx.x * 2048; base < assignments;
+       base += (long long)gridDim.x * 2048) {
+    for (int offset = tid; offset < 2048; offset += 256) {
+      const long long a = base + offset;
+      const bool live = a < assignments &&
+          moe_assignment_active(ids, active, valid, a, experts, mask_from_slots);
+      if (live) {
+        const int e = ids[a];
+        if (valid[e] == 0u || done[a] != 0u ||
+            (mask_from_slots && (valid[e] > 1u || generation[e] == 0u)) ||
+            (!mask_from_slots && generation[e] != assignment_gen[a])) __trap();
+        const long long row = a / top_k;
+        for (int c = 0; c < a % top_k; ++c) {
+          const long long other = row * top_k + c;
+          if (moe_assignment_active(ids, active, valid, other, experts, mask_from_slots) &&
+              ids[other] == e) __trap();
+        }
+        atomicAdd(&sc[e], 1);
+      }
+      const unsigned ballot = __ballot_sync(0xffffffffu, live);
+      if (ballot != 0u) {
+        const int lane = tid & 31;
+        const int leader = __ffs(ballot) - 1;
+        unsigned start = 0;
+        if (lane == leader) start = atomicAdd(state + 1025, __popc(ballot));
+        start = __shfl_sync(0xffffffffu, start, leader);
+        if (live) {
+          const unsigned index = start + __popc(ballot & ((1u << lane) - 1u));
+          if (index >= (unsigned)capacity) __trap();
+          compact[index] = (int)a;
+        }
+      }
+    }
   }
   __syncthreads();
-  if (tid < experts) counts[tid] = sc[tid];
-  if (tid == 0) *active_total = sa;
+  for (int e = tid; e < experts; e += 256) {
+    if (sc[e] != 0) atomicAdd(state + e, sc[e]);
+  }
+  __syncthreads();
+  // Every CTA publishes before its release RMW; the last RMW acquires the retirement chain.
+  if (tid == 0) {
+    cuda::atomic_ref<unsigned, cuda::thread_scope_device> retired(state[1024]);
+    last = retired.fetch_add(1u, cuda::memory_order_acq_rel) + 1u == gridDim.x;
+  }
+  __syncthreads();
+  if (!last) return;
+  for (int e = tid; e < experts; e += 256) {
+    sc[e] = state[e];
+    counts[e] = sc[e];
+    state[e] = 0u;
+  }
+  __syncthreads();
+  for (int d = 1; d < experts; d <<= 1) {
+    int values[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int e = tid + j * 256;
+      values[j] = e < experts && e >= d ? sc[e - d] : 0;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int e = tid + j * 256;
+      if (e < experts) sc[e] += values[j];
+    }
+    __syncthreads();
+  }
+  for (int e = tid; e < experts; e += 256) {
+    offsets[e] = e == 0 ? 0 : sc[e - 1];
+    cursor[e] = offsets[e];
+  }
+  if (tid == 0) {
+    const int total = sc[experts - 1];
+    if ((unsigned)total != state[1025] || total > capacity ||
+        (expected_active >= 0 && total != expected_active)) __trap();
+    *active_total = total;
+    offsets[experts] = total;
+    state[1025] = 0u;
+    cuda::atomic_ref<unsigned, cuda::thread_scope_device> retired(state[1024]);
+    retired.store(0u, cuda::memory_order_relaxed);
+  }
 }
 
-// Exclusive scan of counts into offsets[0..=experts] (single block,
-// Hillis-Steele over blockDim-padded counts) and the matching permute
-// cursors cursor[e] = offsets[e].
-extern "C" __global__ void moe_scan(const int* __restrict__ counts,
-                                    int* __restrict__ offsets, int* __restrict__ cursor,
-                                    int experts) {
-  FD_MOE_GUARDS;
-  __shared__ int sh[1024];
-  const int tid = threadIdx.x;
-  sh[tid] = tid < experts ? counts[tid] : 0;
-  __syncthreads();
-  for (int d = 1; d < 1024; d <<= 1) {
-    int t = 0;
-    if (tid >= d) t = sh[tid - d];
-    __syncthreads();
-    sh[tid] += t;
-    __syncthreads();
-  }
-  const int excl = tid == 0 ? 0 : sh[tid - 1];
-  if (tid < experts) {
-    offsets[tid] = excl;
-    cursor[tid] = excl;
-  }
-  if (tid == 0) offsets[experts] = sh[experts - 1];
-}
-
-// One block per assignment; active choices claim one segment position and one done bit.
-// Invalid ids, generations, duplicate choices and out-of-segment positions trap.
+// One CTA copies one compact assignment into its expert segment.
 extern "C" __global__ void moe_permute(
     const int* __restrict__ ids, const bf16* __restrict__ x,
     const int* __restrict__ offsets,
     int* __restrict__ cursor, const unsigned* __restrict__ valid,
     const unsigned long long* __restrict__ generation,
     const unsigned long long* __restrict__ assignment_gen,
-    const unsigned* __restrict__ active, unsigned* __restrict__ done,
-    int* __restrict__ pos_of, bf16* __restrict__ x_perm, int rows, int top_k,
-    int experts, long long hidden) {
+    const int* __restrict__ compact, const int* __restrict__ active_total,
+    unsigned* __restrict__ done, int* __restrict__ pos_of,
+    bf16* __restrict__ x_perm, int rows, int top_k,
+    int experts, long long hidden, int mask_from_slots) {
   if (blockDim.x != 256) __trap();
-  const int a = blockIdx.x;
+  if (blockIdx.x >= (unsigned)*active_total) return;
+  const int a = compact[blockIdx.x];
+  if (a < 0 || (long long)a >= (long long)rows * top_k) __trap();
   const int row = a / top_k;
-  const int choice = a % top_k;
-  if (choice == 0 && threadIdx.x == 0) {
-    for (int c0 = 0; c0 < top_k; ++c0) {
-      if (active[(size_t)row * top_k + c0] == 0u) continue;
-      for (int c1 = c0 + 1; c1 < top_k; ++c1) {
-        if (active[(size_t)row * top_k + c1] == 0u) continue;
-        if (ids[(size_t)row * top_k + c0] == ids[(size_t)row * top_k + c1]) __trap();
-      }
-    }
-  }
-  if (active[a] == 0u) return;
   const int e = ids[a];
-  if (row < 0 || row >= rows || e < 0 || e >= experts) __trap();
-  if (valid[e] == 0u || generation[e] != assignment_gen[a]) __trap();
-  // One cursor claim per block: thread 0 atomics and broadcasts pos; a
-  // per-thread atomicAdd would consume blockDim.x segment slots.
+  if (e < 0 || e >= experts || valid[e] == 0u ||
+      (!mask_from_slots && generation[e] != assignment_gen[a])) __trap();
   __shared__ int spos;
   if (threadIdx.x == 0) {
-    if (done[a] != 0u) __trap();
-    const int pos = atomicAdd(&cursor[e], 1);
+    if (atomicCAS(done + a, 0u, 1u) != 0u) __trap();
+    const int pos = atomicAdd(cursor + e, 1);
     if (pos < offsets[e] || pos >= offsets[e + 1]) __trap();
     pos_of[a] = pos;
-    done[a] = 1u;
     spos = pos;
   }
   __syncthreads();
-  const int pos = spos;
-  const bf16* __restrict__ xr = x + (long long)row * hidden;
-  bf16* __restrict__ dst = x_perm + (long long)pos * hidden;
-  for (long long c = threadIdx.x; c < hidden; c += blockDim.x) dst[c] = xr[c];
+  const bf16* __restrict__ src = x + (long long)row * hidden;
+  bf16* __restrict__ dst = x_perm + (long long)spos * hidden;
+  if (hidden % 8 == 0) {
+    for (long long c = threadIdx.x; c < hidden / 8; c += 256)
+      reinterpret_cast<float4*>(dst)[c] = reinterpret_cast<const float4*>(src)[c];
+  } else {
+    for (long long c = threadIdx.x; c < hidden; c += 256) dst[c] = src[c];
+  }
 }
 
-// contributions[a] = BF16(y_perm[pos_of[a]] * weights[a]) for active assignments.
+template <class T>
+__device__ __forceinline__ void moe_scatter_rows(
+    const T* __restrict__ y_perm, const bf16* __restrict__ weights,
+    const int* __restrict__ pos_of, const int* __restrict__ compact,
+    bf16* __restrict__ contributions, long long assignments,
+    long long hidden, int active_total, int routed_weight_fp32) {
+  if (blockDim.x != 256 || (unsigned)routed_weight_fp32 > 1u ||
+      blockIdx.x >= (unsigned)active_total) __trap();
+  const int a = compact[blockIdx.x];
+  if (a < 0 || a >= assignments) __trap();
+  const int pos = pos_of[a];
+  if (pos < 0 || pos >= active_total) __trap();
+  const float w = __bfloat162float(weights[a]);
+  const T* __restrict__ src = y_perm + (long long)pos * hidden;
+  bf16* __restrict__ dst = contributions + (long long)a * hidden;
+  if (hidden % 8 == 0) {
+    for (long long c = (long long)threadIdx.x * 8; c < hidden; c += 256 * 8) {
+      alignas(16) T values[8];
+      alignas(16) bf16 output[8];
+#pragma unroll
+      for (int v = 0; v < (int)(sizeof(T) * 8 / 16); ++v)
+        reinterpret_cast<float4*>(values)[v] = reinterpret_cast<const float4*>(src + c)[v];
+#pragma unroll
+      for (int v = 0; v < 8; ++v) {
+        float value;
+        if constexpr (std::is_same_v<T, bf16>) value = __bfloat162float(values[v]);
+        else value = routed_weight_fp32 ? values[v] : __bfloat162float(__float2bfloat16(values[v]));
+        output[v] = __float2bfloat16(value * w);
+      }
+      *reinterpret_cast<float4*>(dst + c) = *reinterpret_cast<float4*>(output);
+    }
+  } else {
+    for (long long c = threadIdx.x; c < hidden; c += 256) {
+      float value;
+      if constexpr (std::is_same_v<T, bf16>) value = __bfloat162float(src[c]);
+      else value = routed_weight_fp32 ? src[c] : __bfloat162float(__float2bfloat16(src[c]));
+      dst[c] = __float2bfloat16(value * w);
+    }
+  }
+}
+
 extern "C" __global__ void moe_scatter(
     const bf16* __restrict__ y_perm, const bf16* __restrict__ weights,
-    const int* __restrict__ pos_of, const unsigned* __restrict__ active,
+    const int* __restrict__ pos_of, const int* __restrict__ compact,
     bf16* __restrict__ contributions, long long assignments,
-    long long hidden) {
-  if (blockDim.x != 256) __trap();
-  const long long a = blockIdx.x;
-  if (a >= assignments) __trap();
-  if (active[a] == 0u) return;
-  const long long pos = pos_of[a];
-  if (pos < 0 || pos >= assignments) __trap();
-  const float w = __bfloat162float(weights[a]);
-  const bf16* __restrict__ src = y_perm + pos * hidden;
-  bf16* __restrict__ dst = contributions + a * hidden;
-  for (long long c = threadIdx.x; c < hidden; c += blockDim.x)
-    dst[c] = __float2bfloat16(__bfloat162float(src[c]) * w);
+    long long hidden, int active_total) {
+  moe_scatter_rows(y_perm, weights, pos_of, compact, contributions,
+                   assignments, hidden, active_total, 0);
 }
 
 extern "C" __global__ void moe_scatter_f32(
     const float* __restrict__ y_perm, const bf16* __restrict__ weights,
-    const int* __restrict__ pos_of, const unsigned* __restrict__ active,
+    const int* __restrict__ pos_of, const int* __restrict__ compact,
     bf16* __restrict__ contributions, long long assignments,
-    long long hidden, int routed_weight_fp32) {
-  if (blockDim.x != 256 || (unsigned)routed_weight_fp32 > 1u) __trap();
-  const long long a = blockIdx.x;
-  if (a >= assignments) __trap();
-  if (active[a] == 0u) return;
-  const long long pos = pos_of[a];
-  if (pos < 0 || pos >= assignments) __trap();
-  const float w = __bfloat162float(weights[a]);
-  const float* __restrict__ src = y_perm + pos * hidden;
-  bf16* __restrict__ dst = contributions + a * hidden;
-  for (long long c = threadIdx.x; c < hidden; c += blockDim.x) {
-    const float value = src[c];
-    dst[c] = __float2bfloat16(
-        routed_weight_fp32 ? value * w : __bfloat162float(__float2bfloat16(value)) * w);
-  }
+    long long hidden, int active_total, int routed_weight_fp32) {
+  moe_scatter_rows(y_perm, weights, pos_of, compact, contributions,
+                   assignments, hidden, active_total, routed_weight_fp32);
 }
-
-#undef FD_MOE_GUARDS

@@ -424,7 +424,6 @@ impl Tables {
 }
 
 struct Gpu {
-    mask: CudaFunction,
     scratch: CudaSlice<u8>,
     tables: Tables,
     host_ids: PinnedHostSlice<i32>,
@@ -864,8 +863,6 @@ impl Prefill {
             peer_transfers,
             span: None,
             gpu: Gpu {
-                mask: super::super::super::super::cubin::module(&device.ctx, "moe_route")?
-                    .load_function("moe_route_mask")?,
                 scratch: device.stream.alloc_zeros(usize::try_from(
                     prefill_scratch_bytes_mixed_with_boundary(
                         routed_wave_rows as usize,
@@ -1681,6 +1678,7 @@ impl PeerPrefill {
             self.ops.prefill_contribute(
                 stream,
                 MoePrefillContribute {
+                    mask_from_slots: false,
                     expert_inter: geometry.intermediate,
                     cpu_arithmetic,
                     fp8_slot: slots.catalogue.layout().fp8_slot(),
@@ -1691,7 +1689,7 @@ impl PeerPrefill {
                     ids: ids_wave,
                     weights: weights_wave,
                     active: active_wave,
-                    assignment_gen: gen_wave,
+                    assignment_gen: Some(gen_wave),
                     slots_gate_up: tables.gate_up,
                     slots_down: tables.down,
                     slot_valid: tables.valid,
@@ -2789,33 +2787,6 @@ impl Gpu {
         let stream = &device.stream;
         let geometry = span.geometry;
         let tables = self.tables.bindings(stream, cohort, geometry.experts)?;
-        let ids = span.choices::<i32>(&span.layout.ids, 0, plan.span_rows())?;
-        let active = span.choices::<u32>(&span.layout.active, 0, plan.span_rows())?;
-        let generation = span.choices::<u64>(&span.layout.generation, 0, plan.span_rows())?;
-        let assignments = plan
-            .span_rows()
-            .checked_mul(geometry.top_k)
-            .context("prefill mask assignment overflow")?;
-        ensure!(
-            assignments <= i32::MAX as u32,
-            "prefill mask assignments={assignments} exceed i32"
-        );
-        // SAFETY: validated dense assignment and expert tables cover every mask element.
-        unsafe {
-            stream
-                .launch_builder(&self.mask)
-                .arg(&ids.ptr)
-                .arg(&tables.valid.ptr)
-                .arg(&tables.generation.ptr)
-                .arg(&active.ptr)
-                .arg(&generation.ptr)
-                .arg(&(assignments as i32))
-                .arg(&(geometry.experts as i32))
-                .launch(super::super::super::super::ops::grid(
-                    assignments.div_ceil(256) as usize,
-                    256,
-                ))?;
-        }
         let wait_copy = if leases.is_some() {
             Some(
                 self.staging_copy
@@ -2834,6 +2805,7 @@ impl Gpu {
             ops.prefill_contribute(
                 stream,
                 MoePrefillContribute {
+                    mask_from_slots: true,
                     expert_inter: geometry.intermediate,
                     cpu_arithmetic: &self.cpu_arithmetic,
                     fp8_slot: slots.catalogue.layout().fp8_slot(),
@@ -2844,7 +2816,7 @@ impl Gpu {
                     ids: span.choices(&span.layout.ids, base, rows)?,
                     weights: span.choices(&span.layout.weights, base, rows)?,
                     active: span.choices(&span.layout.active, base, rows)?,
-                    assignment_gen: span.choices(&span.layout.generation, base, rows)?,
+                    assignment_gen: None,
                     slots_gate_up: tables.gate_up,
                     slots_down: tables.down,
                     slot_valid: tables.valid,
@@ -3063,7 +3035,7 @@ mod tests {
             normalized_row_bytes: u64::from(geometry.hidden) * 2,
             contribution_row_bytes: u64::from(geometry.top_k) * u64::from(geometry.hidden) * 2,
             done_row_bytes: u64::from(geometry.top_k) * 4,
-            route_row_bytes: u64::from(geometry.top_k) * 18,
+            route_row_bytes: u64::from(geometry.top_k) * 10,
             prefill_staging_slots: 2,
             disk_ring_slots: 2,
         }
@@ -3298,6 +3270,7 @@ mod tests {
                     ops.prefill_contribute(
                         stream,
                         MoePrefillContribute {
+                            mask_from_slots: false,
                             expert_inter: geometry.intermediate,
                             cpu_arithmetic: &arithmetic,
                             fp8_slot: None,
@@ -3308,7 +3281,12 @@ mod tests {
                             ids: testing::dense(&ids, stream, rows as u32, 1)?,
                             weights: testing::dense(&routing_device, stream, rows as u32, 1)?,
                             active: testing::dense(&active, stream, rows as u32, 1)?,
-                            assignment_gen: testing::dense(&generation, stream, rows as u32, 1)?,
+                            assignment_gen: Some(testing::dense(
+                                &generation,
+                                stream,
+                                rows as u32,
+                                1,
+                            )?),
                             slots_gate_up: testing::view(
                                 &tables.gate_up,
                                 stream,
@@ -4146,6 +4124,7 @@ mod tests {
                 decode.prefill.prefill_contribute(
                     stream,
                     MoePrefillContribute {
+                        mask_from_slots: false,
                         expert_inter: 64,
                         cpu_arithmetic: &arithmetic,
                         fp8_slot: slots.catalogue.layout().fp8_slot(),
@@ -4156,13 +4135,13 @@ mod tests {
                         ids: view(&ids, stream, base * 4, [count as u32, 4], [4, 1])?,
                         weights: view(&weights, stream, base * 4, [count as u32, 4], [4, 1])?,
                         active: view(&active, stream, base * 4, [count as u32, 4], [4, 1])?,
-                        assignment_gen: view(
+                        assignment_gen: Some(view(
                             &generation,
                             stream,
                             base * 4,
                             [count as u32, 4],
                             [4, 1],
-                        )?,
+                        )?),
                         slots_gate_up: table.gate_up,
                         slots_down: table.down,
                         slot_valid: table.valid,

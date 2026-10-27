@@ -23,7 +23,6 @@ use super::combine::{
     MoeJoinRoutedResidual,
 };
 
-const SCAN_THREADS: u32 = 1024;
 const BLOCK_THREADS: u32 = 256;
 /// One 256-thread tile contains sixteen independent sixteen-lane dots.
 pub(crate) const LANE16_ROWS: u32 = BLOCK_THREADS / 16;
@@ -49,6 +48,7 @@ const MAX_GROUPS: usize = MAX_EXPERTS + 2;
 /// Caller-owned contribution/done buffers survive cohorts; inputs stay immutable until stream completion.
 #[derive(Debug)]
 pub(crate) struct MoePrefillContribute<'a> {
+    pub mask_from_slots: bool,
     pub expert_inter: u32,
     /// Host-packed `(cohort, base, active)` wave expectation checked at the count sync.
     pub wave: Option<(usize, u32, u32)>,
@@ -63,7 +63,7 @@ pub(crate) struct MoePrefillContribute<'a> {
     pub weights: Tensor<bf16, 2>,
     /// `[rows, top_k]` THIS cohort's assignment mask.
     pub active: Tensor<u32, 2>,
-    pub assignment_gen: Tensor<u64, 2>,
+    pub assignment_gen: Option<Tensor<u64, 2>>,
     /// `[experts]` device addresses of each expert's fused gate/up blocks.
     pub slots_gate_up: Tensor<u64, 1>,
     /// `[experts]` device addresses of each expert's down blocks.
@@ -268,7 +268,13 @@ impl MoePrefillContribute<'_> {
         self.ids.validate()?;
         self.active.validate()?;
         self.weights.validate()?;
-        self.assignment_gen.validate()?;
+        ensure!(
+            self.mask_from_slots == self.assignment_gen.is_none(),
+            "moe prefill assignment generation must be present exactly for explicit masks"
+        );
+        if let Some(generation) = &self.assignment_gen {
+            generation.validate()?;
+        }
         let top_k = self.ids.shape[1];
         ensure!(
             self.ids.shape == [rows, top_k]
@@ -277,8 +283,11 @@ impl MoePrefillContribute<'_> {
                 && self.active.stride == [u64::from(top_k), 1]
                 && self.weights.shape == [rows, top_k]
                 && self.weights.stride == [u64::from(top_k), 1]
-                && self.assignment_gen.shape == [rows, top_k]
-                && self.assignment_gen.stride == [u64::from(top_k), 1],
+                && self
+                    .assignment_gen
+                    .as_ref()
+                    .is_none_or(|generation| generation.shape == [rows, top_k]
+                        && generation.stride == [u64::from(top_k), 1]),
             "moe prefill ids/active/weights/assignment_gen must be dense [rows, top_k] views (top_k {top_k})"
         );
         let experts = self.slot_valid.shape[0];
@@ -412,12 +421,9 @@ impl MoePrefillContribute<'_> {
         no_overlap(&self.ids, &self.done.read(), "ids", "done")?;
         no_overlap(&self.weights, &self.done.read(), "weights", "done")?;
         no_overlap(&self.active, &self.done.read(), "active", "done")?;
-        no_overlap(
-            &self.assignment_gen,
-            &self.done.read(),
-            "assignment_gen",
-            "done",
-        )?;
+        if let Some(generation) = &self.assignment_gen {
+            no_overlap(generation, &self.done.read(), "assignment_gen", "done")?;
+        }
         let active_rows = match self.wave {
             Some((cohort, base, expected_active)) => {
                 ensure!(
@@ -486,6 +492,8 @@ pub(crate) struct PrefillLayout {
     offsets: u64,
     cursor: u64,
     pub(crate) pos_of: u64,
+    pub(crate) compact_active: u64,
+    compact_capacity: usize,
     x_perm: u64,
     pub(crate) h1: u64,
     pub(crate) act: u64,
@@ -503,10 +511,9 @@ pub fn stage_host_pinned_bytes() -> u64 {
     (D2H_WINDOW_WORDS * 4 + (GEMM1_PTR_WORDS + GEMM2_PTR_WORDS) * 8) as u64
 }
 
-/// Persistent device bytes reserved by PrefillOps::new: the two GEMM
-/// pointer blocks.
+/// Persistent device bytes for GEMM pointer blocks and count/retirement state.
 pub fn stage_device_bytes() -> u64 {
-    ((GEMM1_PTR_WORDS + GEMM2_PTR_WORDS) * 8) as u64
+    ((GEMM1_PTR_WORDS + GEMM2_PTR_WORDS) * 8 + (MAX_EXPERTS + 2) * 4) as u64
 }
 
 #[cfg(test)]
@@ -663,6 +670,7 @@ pub(crate) fn prefill_layout_mixed(
     )?;
     let cursor = region(&mut at, experts, 4)?;
     let pos_of = region(&mut at, contribute_assignments, 4)?;
+    let compact_active = region(&mut at, assignments, 4)?;
     let x_perm = region(&mut at, routed_hidden, 2)?;
     let h1 = region(&mut at, routed_gate_up, 2)?;
     let act = region(&mut at, routed_inter, 2)?;
@@ -703,6 +711,8 @@ pub(crate) fn prefill_layout_mixed(
         offsets,
         cursor,
         pos_of,
+        compact_active,
+        compact_capacity: assignments,
         x_perm,
         h1,
         act,
@@ -859,8 +869,9 @@ impl Stage {
 
 pub(crate) struct PrefillOps {
     fp8: Option<(CudaFunction, CudaFunction)>,
-    count: CudaFunction,
-    scan: CudaFunction,
+    count_scan: CudaFunction,
+    count_state: CudaSlice<u32>,
+    count_blocks: usize,
     permute: CudaFunction,
     scatter: CudaFunction,
     scatter_f32: CudaFunction,
@@ -921,6 +932,20 @@ impl PrefillOps {
             )
             .result()?;
         }
+        let count_scan = module.load_function("moe_count_scan")?;
+        let sms = usize::try_from(
+            ctx.attribute(ds::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
+        )?;
+        let blocks_per_sm =
+            count_scan.occupancy_max_active_blocks_per_multiprocessor(BLOCK_THREADS, 0, None)?
+                as usize;
+        let count_blocks = sms
+            .checked_mul(blocks_per_sm)
+            .context("moe count CTA capacity overflow")?;
+        ensure!(
+            count_blocks > 0,
+            "moe count kernel has no resident CTA capacity"
+        );
         Ok(Self {
             fp8: (format == ExpertFormat::Fp8W8a16)
                 .then(|| -> Result<_> {
@@ -930,8 +955,9 @@ impl PrefillOps {
                     ))
                 })
                 .transpose()?,
-            count: module.load_function("moe_count")?,
-            scan: module.load_function("moe_scan")?,
+            count_scan,
+            count_state: stream.alloc_zeros(MAX_EXPERTS + 2)?,
+            count_blocks,
             permute: module.load_function("moe_permute")?,
             scatter: module.load_function("moe_scatter")?,
             scatter_f32: module.load_function("moe_scatter_f32")?,
@@ -992,28 +1018,44 @@ impl PrefillOps {
         let act_at = scratch.ptr + layout.act;
         let y_perm_at = scratch.ptr + layout.y_perm;
 
+        let compact_at = scratch.ptr + layout.compact_active;
+        let expected_active = input.wave.map(|(_, _, count)| count as i32).unwrap_or(-1);
+        let mask_from_slots = i32::from(input.mask_from_slots);
+        let assignment_gen = input
+            .assignment_gen
+            .as_ref()
+            .map_or(0, |generation| generation.ptr);
+        let count_blocks = (plan.assignments as usize)
+            .div_ceil(2048)
+            .max(1)
+            .min(self.count_blocks);
+        let permute_blocks = input
+            .wave
+            .map_or(plan.assignments as usize, |(_, _, count)| count as usize)
+            .max(1);
+        let (count_state, _state) = self.count_state.device_ptr(stream);
         unsafe {
             stream
-                .launch_builder(&self.count)
+                .launch_builder(&self.count_scan)
                 .arg(&input.ids.ptr)
                 .arg(&input.active.ptr)
+                .arg(&input.slot_valid.ptr)
+                .arg(&input.slot_generation.ptr)
+                .arg(&assignment_gen)
+                .arg(&input.done.0.ptr)
+                .arg(&count_state)
+                .arg(&compact_at)
                 .arg(&counts_at)
                 .arg(&active_total_at)
+                .arg(&offsets_at)
+                .arg(&cursor_at)
                 .arg(&(plan.assignments as i64))
                 .arg(&(experts as i32))
                 .arg(&(top_k as i32))
-                .launch(grid(1, SCAN_THREADS))?;
-        }
-        unsafe {
-            stream
-                .launch_builder(&self.scan)
-                .arg(&counts_at)
-                .arg(&offsets_at)
-                .arg(&cursor_at)
-                .arg(&(experts as i32))
-                .launch(grid(1, SCAN_THREADS))?;
-        }
-        unsafe {
+                .arg(&(layout.compact_capacity as i32))
+                .arg(&expected_active)
+                .arg(&mask_from_slots)
+                .launch(grid(count_blocks, BLOCK_THREADS))?;
             stream
                 .launch_builder(&self.permute)
                 .arg(&input.ids.ptr)
@@ -1022,8 +1064,9 @@ impl PrefillOps {
                 .arg(&cursor_at)
                 .arg(&input.slot_valid.ptr)
                 .arg(&input.slot_generation.ptr)
-                .arg(&input.assignment_gen.ptr)
-                .arg(&input.active.ptr)
+                .arg(&assignment_gen)
+                .arg(&compact_at)
+                .arg(&active_total_at)
                 .arg(&input.done.0.ptr)
                 .arg(&pos_of_at)
                 .arg(&x_perm_at)
@@ -1031,7 +1074,8 @@ impl PrefillOps {
                 .arg(&(top_k as i32))
                 .arg(&(experts as i32))
                 .arg(&(hidden as i64))
-                .launch(grid(plan.assignments as usize, BLOCK_THREADS))?;
+                .arg(&mask_from_slots)
+                .launch(grid(permute_blocks, BLOCK_THREADS))?;
         }
 
         // Count sync: the grouped-GEMM m/n/k/ld arrays are host-side in
@@ -1274,23 +1318,25 @@ impl PrefillOps {
                     .arg(&y_perm_at)
                     .arg(&input.weights.ptr)
                     .arg(&pos_of_at)
-                    .arg(&input.active.ptr)
+                    .arg(&compact_at)
                     .arg(&input.contributions.ptr)
                     .arg(&(plan.assignments as i64))
                     .arg(&(hidden as i64))
+                    .arg(&(active_total as i32))
                     .arg(&1i32)
-                    .launch(grid(plan.assignments as usize, BLOCK_THREADS))?;
+                    .launch(grid(active_total as usize, BLOCK_THREADS))?;
             } else {
                 stream
                     .launch_builder(&self.scatter)
                     .arg(&y_perm_at)
                     .arg(&input.weights.ptr)
                     .arg(&pos_of_at)
-                    .arg(&input.active.ptr)
+                    .arg(&compact_at)
                     .arg(&input.contributions.ptr)
                     .arg(&(plan.assignments as i64))
                     .arg(&(hidden as i64))
-                    .launch(grid(plan.assignments as usize, BLOCK_THREADS))?;
+                    .arg(&(active_total as i32))
+                    .launch(grid(active_total as usize, BLOCK_THREADS))?;
             }
         }
         Ok(())
@@ -1312,6 +1358,7 @@ impl PrefillOps {
             "moe prefill stream is not the PrefillOps construction stream (cuBLAS handle bound at construction)"
         );
         let cohort = MoePrefillContribute {
+            mask_from_slots: false,
             expert_inter: input.expert_inter,
             cpu_arithmetic: &[false; MAX_EXPERTS][..input.slot_valid.shape[0] as usize],
             fp8_slot: None,
@@ -1324,7 +1371,7 @@ impl PrefillOps {
             ids: input.ids,
             weights: input.weights,
             active: input.active,
-            assignment_gen: input.assignment_gen,
+            assignment_gen: Some(input.assignment_gen),
             slots_gate_up: input.slots_gate_up,
             slots_down: input.slots_down,
             slot_valid: input.slot_valid,
