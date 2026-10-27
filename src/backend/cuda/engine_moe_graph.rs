@@ -170,12 +170,17 @@ impl Engine {
             return Ok(());
         }
         let slot_layer = self.moe_slot_layer(layer)?;
+        let output = if decode.residual_output {
+            qwen::matrix(&self.work.x, stream, 0, step.rows, hidden)?
+        } else {
+            qwen::matrix(&self.work.out, stream, 0, step.rows, hidden)?
+        };
         decode.combine_device(
             &self.device,
             slot_layer,
             self.moe_ffn_binding(layer)?,
             qwen::matrix(&self.work.n, stream, 0, step.rows, hidden)?,
-            &mut TensorMut(qwen::matrix(&self.work.out, stream, 0, step.rows, hidden)?),
+            &mut TensorMut(output),
         )?;
         self.run_operator(O::NextNorm, layer, step, &mut None)?;
         if layer + 1 == self.model_spec.layers.len() {

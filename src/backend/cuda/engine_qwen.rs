@@ -3175,6 +3175,8 @@ impl Engine {
                         trace_value(trace, s, &name, &w.n, rows, h)?;
                     }
                 } else {
+                    let fused_moe_residual = matches!(layer.ffn, BoundFfn::Moe { .. })
+                        && matches!(norm_mode(&self.model_spec), RmsMode::ZeroCentered);
                     if let Some(capture) = &mut self.hidden_capture
                         && let Some(slot) = capture.layer_slots[i]
                     {
@@ -3189,61 +3191,86 @@ impl Engine {
                                 s,
                             )?
                         };
-                        self.ops.add_rmsnorm_capture(
-                            s,
-                            Some(domain),
-                            ResidualRmsCapture {
-                                input: ResidualRmsInput {
-                                    x: &mut TensorMut(heads(&w.x, s, 0, rows, 1, h as u32)?),
-                                    residual: heads(&w.out, s, 0, rows, 1, h as u32)?,
-                                    weight,
-                                },
-                                capture: &mut TensorMut(view(
-                                    &capture.values,
-                                    s,
-                                    0,
-                                    [rows as u32, capture.taps as u32, h as u32],
-                                    [capture.width as u64, h as u64, 1],
-                                )?),
-                                slot,
-                            },
-                            &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
-                            RmsOptions {
-                                mode: norm_mode(&self.model_spec),
-                                eps: self.model_spec.rms_eps,
-                            },
-                        )?;
-                    } else {
-                        if matches!(norm_mode(&self.model_spec), RmsMode::Standard) {
-                            let weight = if let Some(next) = q.layers.get(i + 1) {
-                                next.input_norm
-                            } else {
-                                vector(
-                                    self.weights
-                                        .norm
-                                        .as_ref()
-                                        .context("weighted final norm missing")?,
-                                    s,
-                                )?
-                            };
-                            self.ops.rms_add_fp32_with(
+                        if fused_moe_residual {
+                            q.common.norm.rms_with(
                                 s,
                                 domain,
-                                ResidualRmsInput {
-                                    x: &mut TensorMut(heads(&w.x, s, 0, rows, 1, h as u32)?),
-                                    residual: heads(&w.out, s, 0, rows, 1, h as u32)?,
-                                    weight,
+                                heads(&w.x, s, 0, rows, 1, h as u32)?,
+                                weight,
+                                &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
+                                RmsOptions {
+                                    mode: norm_mode(&self.model_spec),
+                                    eps: self.model_spec.rms_eps,
+                                },
+                            )?;
+                            let rect = copy::Rect {
+                                rows,
+                                width: h,
+                                src_pitch: h,
+                                src_col: 0,
+                                dst_pitch: capture.width,
+                                dst_col: slot as usize * h,
+                            };
+                            copy::columns(s, &w.x, &mut capture.values.slice_mut(..), rect)?;
+                        } else {
+                            self.ops.add_rmsnorm_capture(
+                                s,
+                                Some(domain),
+                                ResidualRmsCapture {
+                                    input: ResidualRmsInput {
+                                        x: &mut TensorMut(heads(&w.x, s, 0, rows, 1, h as u32)?),
+                                        residual: heads(&w.out, s, 0, rows, 1, h as u32)?,
+                                        weight,
+                                    },
+                                    capture: &mut TensorMut(view(
+                                        &capture.values,
+                                        s,
+                                        0,
+                                        [rows as u32, capture.taps as u32, h as u32],
+                                        [capture.width as u64, h as u64, 1],
+                                    )?),
+                                    slot,
                                 },
                                 &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
-                                self.model_spec.rms_eps,
+                                RmsOptions {
+                                    mode: norm_mode(&self.model_spec),
+                                    eps: self.model_spec.rms_eps,
+                                },
                             )?;
-                        } else {
-                            unsafe {
-                                s.launch_builder(&self.ops.residual)
-                                    .arg(&mut w.x)
-                                    .arg(&w.out)
-                                    .arg(&((rows * h) as i32))
-                                    .launch(flat(rows * h))?;
+                        }
+                    } else {
+                        if !fused_moe_residual {
+                            if matches!(norm_mode(&self.model_spec), RmsMode::Standard) {
+                                let weight = if let Some(next) = q.layers.get(i + 1) {
+                                    next.input_norm
+                                } else {
+                                    vector(
+                                        self.weights
+                                            .norm
+                                            .as_ref()
+                                            .context("weighted final norm missing")?,
+                                        s,
+                                    )?
+                                };
+                                self.ops.rms_add_fp32_with(
+                                    s,
+                                    domain,
+                                    ResidualRmsInput {
+                                        x: &mut TensorMut(heads(&w.x, s, 0, rows, 1, h as u32)?),
+                                        residual: heads(&w.out, s, 0, rows, 1, h as u32)?,
+                                        weight,
+                                    },
+                                    &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
+                                    self.model_spec.rms_eps,
+                                )?;
+                            } else {
+                                unsafe {
+                                    s.launch_builder(&self.ops.residual)
+                                        .arg(&mut w.x)
+                                        .arg(&w.out)
+                                        .arg(&((rows * h) as i32))
+                                        .launch(flat(rows * h))?;
+                                }
                             }
                         }
                     }

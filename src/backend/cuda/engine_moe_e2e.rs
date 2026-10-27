@@ -134,7 +134,7 @@ fn placement_components(engine: &Engine, model: &Path) -> Result<usize> {
         .map(|index| bf16::from_f32(((index * 37 % 131) as f32 - 65.0) / 128.0))
         .collect::<Vec<_>>();
     let x_buffer = stream.clone_htod(&input)?;
-    let y = stream.alloc_zeros::<bf16>(2048)?;
+    let mut y = stream.alloc_zeros::<bf16>(2048)?;
     let x = qwen::matrix(&x_buffer, stream, 0, 1, 2048)?;
     let mut y_view = TensorMut(qwen::matrix(&y, stream, 0, 1, 2048)?);
     let ffn = engine.moe_ffn_binding(0)?;
@@ -143,6 +143,8 @@ fn placement_components(engine: &Engine, model: &Path) -> Result<usize> {
         DecodeOptions {
             peer: None,
             geometry,
+            residual_output: engine.model_spec.architecture
+                != crate::model_spec::Architecture::Flint,
             max_rows: 1,
             workers: 1,
             cpu_bounds: (1, 8),
@@ -223,6 +225,7 @@ fn placement_components(engine: &Engine, model: &Path) -> Result<usize> {
             };
             let before = decode.stats;
             let _range = super::super::super::profile::Range::new(true, c"placement_component");
+            stream.memset_zeros(&mut y)?;
             decode.finish_with(
                 device,
                 ffn.clone(),
@@ -964,7 +967,13 @@ fn native_layer0(engine: &mut Engine, source: &SafeTensors<'_>) -> Result<usize>
     );
     engine.reset()?;
     let ffn = engine.moe_ffn_binding(0)?;
-    let BoundFfn::Moe { router, score, .. } = ffn else {
+    let BoundFfn::Moe {
+        router,
+        score,
+        shared_gate,
+        ..
+    } = ffn
+    else {
         anyhow::bail!("FP8 layer0 FFN is dense");
     };
     let mut decode = engine.moe.take().context("FP8 layer0 decoder missing")?;
@@ -1079,6 +1088,7 @@ fn native_layer0(engine: &mut Engine, source: &SafeTensors<'_>) -> Result<usize>
             decode.host_ids.as_mut_slice()?[..count * k].copy_from_slice(&ids);
             decode.host_weights.as_mut_slice()?[..count * k].copy_from_slice(&weights);
             slots.begin_token()?;
+            stream.memset_zeros(&mut engine.work.x.slice_mut(..count * h))?;
             slots.finish_routed(
                 &engine.device,
                 &mut decode,
@@ -1086,7 +1096,7 @@ fn native_layer0(engine: &mut Engine, source: &SafeTensors<'_>) -> Result<usize>
                 ffn.clone(),
                 (
                     x,
-                    &mut TensorMut(qwen::matrix(&engine.work.out, stream, 0, count, h)?),
+                    &mut TensorMut(qwen::matrix(&engine.work.x, stream, 0, count, h)?),
                 ),
             )?;
             let contributions = stream.clone_dtoh(&decode.contributions.slice(..count * k * h))?;
@@ -1103,8 +1113,19 @@ fn native_layer0(engine: &mut Engine, source: &SafeTensors<'_>) -> Result<usize>
                 &[h, h, intermediate],
             )?;
             let shared = stream.clone_dtoh(&decode.shared.slice(..count * h))?;
-            let scale = stream.clone_dtoh(&decode.scale.slice(..count))?;
-            let got = stream.clone_dtoh(&engine.work.out.slice(..count * h))?;
+            let scale_buffer = stream.alloc_zeros::<bf16>(count)?;
+            let scale = {
+                let mut written =
+                    TensorMut(view(&scale_buffer, stream, 0, [count as u32, 1], [1, 1])?);
+                decode.combine.shared_scale(
+                    stream,
+                    x,
+                    shared_gate.context("FP8 layer0 shared gate missing")?,
+                    &mut written,
+                )?;
+                stream.clone_dtoh(&scale_buffer)?
+            };
+            let got = stream.clone_dtoh(&engine.work.x.slice(..count * h))?;
             let mut mismatches = 0;
             for row in 0..count {
                 for column in 0..h {
@@ -4490,6 +4511,161 @@ fn run_prefill_combine_case(
     Ok(usize::from(defects != 0))
 }
 
+fn decode_combine_probe(engine: &mut Engine, ids: &[u32], graph: bool) -> Result<DecodeProbe> {
+    engine.reset()?;
+    let mut tokens = vec![engine.prefill(ids, None)?];
+    let mut logits = Vec::with_capacity(8 * engine.model_spec.vocab as usize);
+    for _ in 0..8 {
+        let token = engine.decode(graph, None)?;
+        tokens.push(token);
+        logits.extend(
+            engine
+                .decode_logits()?
+                .into_iter()
+                .map(|value| {
+                    ensure!(value.is_finite(), "Runner FAIL nonfinite decode logits");
+                    Ok(value.to_bits())
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
+        if tokens.len() <= 8 {
+            engine.set_token(token)?;
+        }
+    }
+    let state = chain_state(engine)?;
+    Ok(DecodeProbe {
+        tokens,
+        logits,
+        state,
+    })
+}
+
+struct DecodeProbe {
+    tokens: Vec<u32>,
+    logits: Vec<u32>,
+    state: Vec<u8>,
+}
+
+fn run_decode_combine_case(
+    engine: &mut Engine,
+    case: &str,
+    ids: &[u32],
+    probe_dir: Option<&Path>,
+) -> Result<usize> {
+    let eager_range = super::super::super::profile::Range::new(true, c"t38_decode_eager");
+    let eager = decode_combine_probe(engine, ids, false)?;
+    drop(eager_range);
+    let graph_range = super::super::super::profile::Range::new(true, c"t38_decode_graph");
+    let graph = decode_combine_probe(engine, ids, true)?;
+    drop(graph_range);
+    ensure!(
+        engine.has_moe_segments(),
+        "Runner FAIL decode graph segments missing for {case}"
+    );
+    let logits_elements = eager.logits.len();
+    let state_bytes = eager.state.len();
+    let mut defects = usize::from(eager.tokens != graph.tokens)
+        + usize::from(eager.logits != graph.logits)
+        + usize::from(eager.state != graph.state);
+    println!(
+        "{} decode_combine_graph_eager {} tokens={} logits={} state_bytes={} defects={}",
+        if defects == 0 { "PASS" } else { "DEFECT" },
+        case,
+        eager.tokens.len(),
+        logits_elements,
+        state_bytes,
+        defects
+    );
+    let Some(dir) = probe_dir else {
+        anyhow::bail!("Runner FAIL decode combine identity has no probe directory");
+    };
+    let json_path = dir.join(format!("t38-decode-{case}.json"));
+    let write_mode = !json_path.exists();
+    if write_mode {
+        let meta = serde_json::json!({
+            "tokens": eager.tokens,
+            "logits_elements": logits_elements,
+            "state_bytes": state_bytes,
+        });
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(&json_path, serde_json::to_vec_pretty(&meta)?)?;
+        for (name, probe) in [("eager", &eager), ("graph", &graph)] {
+            let logits_path = dir.join(format!("t38-decode-{case}-{name}.logits"));
+            let state_path = dir.join(format!("t38-decode-{case}-{name}.state"));
+            let mut logits_bytes = Vec::with_capacity(probe.logits.len() * 4);
+            for bits in &probe.logits {
+                logits_bytes.extend_from_slice(&bits.to_le_bytes());
+            }
+            std::fs::write(logits_path, logits_bytes)?;
+            std::fs::write(state_path, &probe.state)?;
+        }
+        return Ok(defects);
+    }
+    let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(&json_path)?)?;
+    let expected_tokens = meta["tokens"]
+        .as_array()
+        .context("decode probe tokens missing")?
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .context("decode probe token invalid")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let expected_logits_elements = meta["logits_elements"]
+        .as_u64()
+        .context("decode probe logits extent missing")? as usize;
+    let expected_state_bytes = meta["state_bytes"]
+        .as_u64()
+        .context("decode probe state extent missing")? as usize;
+    ensure!(
+        expected_logits_elements == logits_elements && expected_state_bytes == state_bytes,
+        "Runner FAIL decode probe geometry differs for {case}: logits={logits_elements}/{expected_logits_elements} state={state_bytes}/{expected_state_bytes}"
+    );
+    let load_logits = |name: &str| -> Result<Vec<u32>> {
+        Ok(
+            std::fs::read(dir.join(format!("t38-decode-{case}-{name}.logits")))?
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| u32::from_le_bytes(*bytes))
+                .collect(),
+        )
+    };
+    let token_diff = usize::from(eager.tokens != expected_tokens);
+    let mut logit_diff = 0usize;
+    let mut state_diff = 0usize;
+    for (name, probe) in [("eager", &eager), ("graph", &graph)] {
+        let expected_logits = load_logits(name)?;
+        let expected_state = std::fs::read(dir.join(format!("t38-decode-{case}-{name}.state")))?;
+        logit_diff += probe
+            .logits
+            .iter()
+            .zip(&expected_logits)
+            .filter(|(a, b)| a != b)
+            .count()
+            + usize::from(probe.logits.len() != expected_logits.len());
+        state_diff += probe
+            .state
+            .iter()
+            .zip(&expected_state)
+            .filter(|(a, b)| a != b)
+            .count()
+            + usize::from(probe.state.len() != expected_state.len());
+    }
+    defects += token_diff + logit_diff + state_diff;
+    println!(
+        "{} t38_decode_combine_identity {} token_bit_mismatches={} logits_bit_mismatches={} state_byte_mismatches={}",
+        if defects == 0 { "PASS" } else { "DEFECT" },
+        case,
+        token_diff,
+        logit_diff,
+        state_diff
+    );
+    Ok(defects)
+}
+
 #[test]
 #[ignore = "requires CUDA, published MiniCPM FF_MODEL, FF_MINICPM_REFERENCE_DIR and FLYINGFISH_RUNTIME_DIR"]
 fn minicpm_prefill_combine_bit_identity_gpu() -> Result<()> {
@@ -4556,6 +4732,104 @@ fn minicpm_prefill_combine_bit_identity_gpu() -> Result<()> {
     ensure!(
         defects == 0,
         "DEFECT minicpm_prefill_combine_bit_identity={defects}"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA, published MiniCPM FF_MODEL, text_1k fixture and FLYINGFISH_RUNTIME_DIR"]
+fn minicpm_decode_combine_identity_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let model = PathBuf::from(std::env::var("FF_MODEL")?);
+    let fixtures = PathBuf::from(std::env::var("FF_MINICPM_REFERENCE_DIR")?);
+    let runtime = PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
+    let probe_dir =
+        PathBuf::from(std::env::var_os("FF_Q38_PROBE_DIR").context("probe directory missing")?);
+    let spec = crate::model_spec::ModelSpec::read(&model)?;
+    ensure!(
+        spec.architecture == crate::model_spec::Architecture::MiniCpmV47
+            && spec.hidden == 2048
+            && spec.layers.len() == 40
+            && spec.vocab == 248144,
+        "Runner FAIL published MiniCPM decode geometry required"
+    );
+    let bytes = std::fs::read(fixtures.join("text_1k.safetensors"))?;
+    let source = SafeTensors::deserialize(&bytes)?;
+    let ids = integers(&source, "input_ids")?;
+    ensure!(
+        ids.len() == 1024 && ids.iter().all(|&id| id < spec.vocab),
+        "Runner FAIL text_1k decode fixture extent/vocabulary"
+    );
+    let settings = Settings {
+        runtime_dir: Some(runtime),
+        prefix_cache: false,
+        draft_model: None,
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: false,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    Engine::calibrate(&model, 0, ids.len() + 32, None, settings.clone())?;
+    let mut engine = Engine::load(&model, 0, ids.len() + 32, None, settings)?;
+    if CudaContext::device_count()? >= 2 {
+        let peer = engine
+            .moe
+            .as_ref()
+            .context("MiniCPM peer decode executor missing")?
+            .peer
+            .as_ref()
+            .context("MiniCPM two-GPU peer missing")?;
+        ensure!(
+            peer.gpu0_layers > 0 && peer.gpu0_layers < engine.model_spec.layers.len() as u32,
+            "Runner FAIL MiniCPM peer tail not engaged gpu0_layers={}",
+            peer.gpu0_layers
+        );
+    }
+    let defects = run_decode_combine_case(&mut engine, "minicpm-text-1k", &ids, Some(&probe_dir))?;
+    ensure!(
+        defects == 0,
+        "DEFECT minicpm_decode_combine_identity={defects}"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA, published Flint FF_MODEL and FLYINGFISH_RUNTIME_DIR"]
+fn flint_decode_combine_identity_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let model = PathBuf::from(std::env::var("FF_MODEL")?);
+    let runtime = PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
+    let probe_dir =
+        PathBuf::from(std::env::var_os("FF_Q38_PROBE_DIR").context("probe directory missing")?);
+    let spec = crate::model_spec::ModelSpec::read(&model)?;
+    ensure!(
+        spec.architecture == crate::model_spec::Architecture::Flint
+            && spec.hidden == 2048
+            && spec.layers.len() == 49,
+        "Runner FAIL published Flint decode geometry required"
+    );
+    let ids = [150000u32, 1, 2, 3, 4, 5, 6, 7];
+    let settings = Settings {
+        runtime_dir: Some(runtime),
+        prefix_cache: false,
+        draft_model: None,
+        tree_builder: TreeBuilder::Serial,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: false,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    Engine::calibrate(&model, 0, 600, None, settings.clone())?;
+    let mut engine = Engine::load(&model, 0, 600, None, settings)?;
+    let defects = run_decode_combine_case(&mut engine, "flint-short", &ids, Some(&probe_dir))?;
+    ensure!(
+        defects == 0,
+        "DEFECT flint_decode_combine_identity={defects}"
     );
     Ok(())
 }

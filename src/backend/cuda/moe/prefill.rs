@@ -1669,8 +1669,10 @@ impl PrefillOps {
                     shared_out,
                     x: input.x,
                     shared_expert_gate: input.shared_expert_gate,
-                    residual: input.y,
+                    residual: Some(input.y),
+                    y_out: None,
                 },
+                1,
             )?;
         } else {
             self.combine.combine_residual(
@@ -1683,8 +1685,10 @@ impl PrefillOps {
                     shared_out,
                     x: input.x,
                     shared_expert_gate: input.shared_expert_gate,
-                    residual: input.y,
+                    residual: Some(input.y),
+                    y_out: None,
                 },
+                1,
             )?;
         }
         Ok(())

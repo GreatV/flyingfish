@@ -3760,8 +3760,10 @@ fn moe_combine_residual_gpu() -> Result<()> {
             shared_out: shared_out_view,
             x: x_view,
             shared_expert_gate: Some(seg_view),
-            residual: testing::dense_mut(&fused, s, rows as u32, hidden as u32)?,
+            residual: Some(testing::dense_mut(&fused, s, rows as u32, hidden as u32)?),
+            y_out: None,
         },
+        1,
     )?;
     s.synchronize()?;
     let expected_host = s.clone_dtoh(&expected)?;
@@ -3805,8 +3807,15 @@ fn moe_combine_residual_gpu() -> Result<()> {
             shared_out: shared_out_view,
             x: x_view,
             shared_expert_gate: Some(seg_view),
-            residual: testing::dense_mut(&fused_join, s, rows as u32, hidden as u32)?,
+            residual: Some(testing::dense_mut(
+                &fused_join,
+                s,
+                rows as u32,
+                hidden as u32,
+            )?),
+            y_out: None,
         },
+        1,
     )?;
     s.synchronize()?;
     let expected_join_host = s.clone_dtoh(&expected_join)?;
@@ -3906,8 +3915,15 @@ fn moe_combine_residual_gpu() -> Result<()> {
             shared_out: shared_out_view,
             x: x_view,
             shared_expert_gate: Some(seg_view),
-            residual: testing::dense_mut(&perturbed, s, rows as u32, hidden as u32)?,
+            residual: Some(testing::dense_mut(
+                &perturbed,
+                s,
+                rows as u32,
+                hidden as u32,
+            )?),
+            y_out: None,
         },
+        1,
     )?;
     s.synchronize()?;
     let perturbed_bits = s.clone_dtoh(&perturbed)?;
@@ -3926,6 +3942,7 @@ fn check_combine_residual_shape(
     combine: &CombineOps,
     dims: (usize, usize, usize),
     gated: bool,
+    hidden_blocks: usize,
 ) -> Result<()> {
     use crate::backend::cuda::contracts::view;
     let (rows, top_k, hidden) = dims;
@@ -4020,8 +4037,10 @@ fn check_combine_residual_shape(
                 shared_out: testing::dense(&shared_d, s, rows as u32, hidden as u32)?,
                 x: x_view,
                 shared_expert_gate: gated.then_some(seg_view),
-                residual: testing::dense_mut(&res_d, s, rows as u32, hidden as u32)?,
+                residual: Some(testing::dense_mut(&res_d, s, rows as u32, hidden as u32)?),
+                y_out: None,
             },
+            hidden_blocks as u32,
         )?;
         s.synchronize()?;
         let got_res = s.clone_dtoh(&res_d)?;
@@ -4033,6 +4052,46 @@ fn check_combine_residual_shape(
         anyhow::ensure!(
             res_bad == 0,
             "combine_residual mismatch hidden={hidden} gated={gated}: {res_bad}"
+        );
+    }
+
+    {
+        let y_fused_d = s.alloc_zeros(rows * hidden)?;
+        combine.combine_residual(
+            s,
+            &MoeCombineResidual {
+                ids: testing::dense(&ids_d, s, rows as u32, top_k as u32)?,
+                final_active: testing::dense(&active_d, s, rows as u32, top_k as u32)?,
+                done: testing::dense(&done_d, s, rows as u32, top_k as u32)?,
+                contributions: testing::view(
+                    &contrib_d,
+                    s,
+                    [rows as u32, top_k as u32, hidden as u32],
+                    [(top_k * hidden) as u64, hidden as u64, 1],
+                )?,
+                shared_out: testing::dense(&shared_d, s, rows as u32, hidden as u32)?,
+                x: x_view,
+                shared_expert_gate: gated.then_some(seg_view),
+                residual: None,
+                y_out: Some(testing::dense_mut(
+                    &y_fused_d,
+                    s,
+                    rows as u32,
+                    hidden as u32,
+                )?),
+            },
+            hidden_blocks as u32,
+        )?;
+        s.synchronize()?;
+        let got_y = s.clone_dtoh(&y_fused_d)?;
+        let y_bad = got_y
+            .iter()
+            .zip(&y_ref)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        anyhow::ensure!(
+            y_bad == 0,
+            "combine_residual y_out mismatch hidden={hidden} gated={gated}: {y_bad}"
         );
     }
 
@@ -4060,8 +4119,15 @@ fn check_combine_residual_shape(
             shared_out: testing::dense(&shared_d, s, rows as u32, hidden as u32)?,
             x: x_view,
             shared_expert_gate: gated.then_some(seg_view),
-            residual: testing::dense_mut(&res_join_d, s, rows as u32, hidden as u32)?,
+            residual: Some(testing::dense_mut(
+                &res_join_d,
+                s,
+                rows as u32,
+                hidden as u32,
+            )?),
+            y_out: None,
         },
+        hidden_blocks as u32,
     )?;
     s.synchronize()?;
     let join_res = s.clone_dtoh(&res_join_d)?;
@@ -4073,6 +4139,36 @@ fn check_combine_residual_shape(
     anyhow::ensure!(
         join_res_bad == 0,
         "join_routed_residual mismatch hidden={hidden} gated={gated}: res={join_res_bad}"
+    );
+
+    let y_join_d = s.alloc_zeros(rows * hidden)?;
+    combine.join_routed_residual(
+        s,
+        &MoeJoinRoutedResidual {
+            routed_in: testing::dense(&routed_d, s, rows as u32, hidden as u32)?,
+            shared_out: testing::dense(&shared_d, s, rows as u32, hidden as u32)?,
+            x: x_view,
+            shared_expert_gate: gated.then_some(seg_view),
+            residual: None,
+            y_out: Some(testing::dense_mut(
+                &y_join_d,
+                s,
+                rows as u32,
+                hidden as u32,
+            )?),
+        },
+        hidden_blocks as u32,
+    )?;
+    s.synchronize()?;
+    let join_y = s.clone_dtoh(&y_join_d)?;
+    let join_y_bad = join_y
+        .iter()
+        .zip(&y_ref)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    anyhow::ensure!(
+        join_y_bad == 0,
+        "join_routed_residual y_out mismatch hidden={hidden} gated={gated}: {join_y_bad}"
     );
     Ok(())
 }
@@ -4107,7 +4203,8 @@ fn prefill_combine_residual_and_routed_gpu() -> Result<()> {
     let combine = CombineOps::new(&d.ctx)?;
     for dims in [(37, 8, 2048), (257, 8, 2048), (19, 8, 260)] {
         for gated in [true, false] {
-            check_combine_residual_shape(s, &combine, dims, gated)?;
+            check_combine_residual_shape(s, &combine, dims, gated, 1)?;
+            check_combine_residual_shape(s, &combine, dims, gated, dims.2.div_ceil(256))?;
         }
     }
     let ops = PrefillOps::new(&d.ctx, s, crate::model_spec::ExpertFormat::Bf16)?;
