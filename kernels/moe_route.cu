@@ -1,6 +1,8 @@
 // MoE router: softmax or sigmoid scoring over BF16 expert logits, deterministic
 // top-k (descending, exact ties by lower expert id), FP32 renormalised weights
 // stored as BF16.
+// moe_route_decode_bf16 publishes BF16 logits from disjoint expert-owner CTAs;
+// the last completing CTA selects top-k and resets the row completion counter.
 //   moe_route_logits_bf16(x, router, logits, rows, experts, hidden):
 //     x [rows, hidden] bf16 row-major, router W [experts, hidden] bf16
 //     row-major, logits [rows, experts] bf16 row-major; each expert logit is
@@ -32,15 +34,15 @@
 
 using bf16 = __nv_bfloat16;
 
+template<bool reverse_ties = false>
 __device__ void moe_route_select(
     float logit, int* __restrict__ ids, bf16* __restrict__ weights,
-    int experts, int top_k) {
+    int experts, int top_k, int row) {
   const int tid = threadIdx.x;
   const int nthr = (int)blockDim.x;
   const int nw = nthr >> 5;
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  const int row = blockIdx.x;
   const int e = tid;
   const bool live = e < experts;
 
@@ -91,7 +93,7 @@ __device__ void moe_route_select(
     for (int off = 16; off > 0; off >>= 1) {
       const float ov = __shfl_down_sync(0xffffffffu, v, off);
       const int oi = __shfl_down_sync(0xffffffffu, id, off);
-      if (ov > v || (ov == v && oi < id)) { v = ov; id = oi; }
+      if (ov > v || (ov == v && (reverse_ties ? oi > id : oi < id))) { v = ov; id = oi; }
     }
     if (lane == 0) { s_red[warp] = v; s_rid[warp] = id; }
     __syncthreads();
@@ -101,7 +103,7 @@ __device__ void moe_route_select(
       for (int off = 16; off > 0; off >>= 1) {
         const float ov = __shfl_down_sync(0xffffffffu, v, off);
         const int oi = __shfl_down_sync(0xffffffffu, id, off);
-        if (ov > v || (ov == v && oi < id)) { v = ov; id = oi; }
+        if (ov > v || (ov == v && (reverse_ties ? oi > id : oi < id))) { v = ov; id = oi; }
       }
       if (lane == 0) { s_red[0] = v; s_rid[0] = id; }
     }
@@ -122,15 +124,15 @@ __device__ void moe_route_select(
   }
 }
 
+template<bool reverse_ties = false>
 __device__ void moe_route_select_sigmoid(
     float logit, int* __restrict__ ids, bf16* __restrict__ weights,
-    int experts, int top_k) {
+    int experts, int top_k, int row) {
   const int tid = threadIdx.x;
   const int nthr = (int)blockDim.x;
   const int nw = nthr >> 5;
   const int lane = tid & 31;
   const int warp = tid >> 5;
-  const int row = blockIdx.x;
   const int e = tid;
   const bool live = e < experts;
   const float score = live ? 1.0f / (1.0f + expf(-logit)) : -1.0f;
@@ -150,7 +152,7 @@ __device__ void moe_route_select_sigmoid(
     for (int off = 16; off > 0; off >>= 1) {
       const float ov = __shfl_down_sync(0xffffffffu, v, off);
       const int oi = __shfl_down_sync(0xffffffffu, id, off);
-      if (ov > v || (ov == v && oi < id)) { v = ov; id = oi; }
+      if (ov > v || (ov == v && (reverse_ties ? oi > id : oi < id))) { v = ov; id = oi; }
     }
     if (lane == 0) { s_red[warp] = v; s_rid[warp] = id; }
     __syncthreads();
@@ -160,7 +162,7 @@ __device__ void moe_route_select_sigmoid(
       for (int off = 16; off > 0; off >>= 1) {
         const float ov = __shfl_down_sync(0xffffffffu, v, off);
         const int oi = __shfl_down_sync(0xffffffffu, id, off);
-        if (ov > v || (ov == v && oi < id)) { v = ov; id = oi; }
+        if (ov > v || (ov == v && (reverse_ties ? oi > id : oi < id))) { v = ov; id = oi; }
       }
       if (lane == 0) { s_red[0] = v; s_rid[0] = id; }
     }
@@ -330,7 +332,7 @@ extern "C" __global__ void moe_route_topk(
   float logit = -CUDART_INF_F;
   if (tid < experts)
     logit = __bfloat162float(logits[(size_t)row * experts + tid]);
-  moe_route_select(logit, ids, weights, experts, top_k);
+  moe_route_select(logit, ids, weights, experts, top_k, row);
 }
 
 extern "C" __global__ void moe_route_topk_sigmoid(
@@ -347,7 +349,93 @@ extern "C" __global__ void moe_route_topk_sigmoid(
   float logit = -CUDART_INF_F;
   if (tid < experts)
     logit = __bfloat162float(logits[(size_t)row * experts + tid]);
-  moe_route_select_sigmoid(logit, ids, weights, experts, top_k);
+  moe_route_select_sigmoid(logit, ids, weights, experts, top_k, row);
+}
+
+// Each expert has one ascending FP32 FMA chain and one BF16 logit store.
+// The last producer CTA for a row performs selection and resets its counter.
+template<bool reverse_ties>
+__device__ void moe_route_decode(
+    const bf16* __restrict__ x, const bf16* __restrict__ router,
+    bf16* __restrict__ logits, int* __restrict__ ids,
+    bf16* __restrict__ weights, unsigned int* __restrict__ completed,
+    int rows, int experts, int hidden, int top_k, int owners, int score_mode) {
+  if ((int)blockIdx.y >= rows || experts < 1 || experts > 1024 ||
+      hidden < 8 || (hidden & 7) != 0 || top_k < 1 || top_k > 32 ||
+      top_k >= experts || owners < 1 || owners > 32 ||
+      (owners & (owners - 1)) != 0 ||
+      (int)blockDim.x != ((experts + 31) & ~31) ||
+      (int)gridDim.x != (experts + owners - 1) / owners ||
+      score_mode < 0 || score_mode > 1 ||
+      (reinterpret_cast<uintptr_t>(x) & 15) != 0 ||
+      (reinterpret_cast<uintptr_t>(router) & 15) != 0 ||
+      (reinterpret_cast<uintptr_t>(logits) & 15) != 0)
+    __trap();
+
+  extern __shared__ uint4 tile[];
+  uint4* sw = tile;
+  uint4* sx = tile + owners * (MOE_ROUTE_WORDS + 1);
+  __shared__ unsigned int last;
+  const int tid = threadIdx.x;
+  const int row = blockIdx.y;
+  const int e0 = blockIdx.x * owners;
+  const int words = hidden >> 3;
+  const uint4* xr = reinterpret_cast<const uint4*>(x + (size_t)row * hidden);
+  const uint4* wr = reinterpret_cast<const uint4*>(router);
+  const bool owner = tid < owners && e0 + tid < experts;
+  float acc = 0.0f;
+  for (int c = 0; c < words; c += MOE_ROUTE_WORDS) {
+    const int n = min(MOE_ROUTE_WORDS, words - c);
+    for (int i = tid; i < owners * MOE_ROUTE_WORDS; i += blockDim.x) {
+      const int r = i / MOE_ROUTE_WORDS;
+      const int w = i % MOE_ROUTE_WORDS;
+      if (w < n && e0 + r < experts)
+        sw[r * (MOE_ROUTE_WORDS + 1) + w] =
+            wr[(size_t)(e0 + r) * words + c + w];
+    }
+    for (int w = tid; w < n; w += blockDim.x) sx[w] = xr[c + w];
+    __syncthreads();
+    if (owner)
+      for (int w = 0; w < n; ++w)
+        acc = moe_route_dot8(sx[w], sw[tid * (MOE_ROUTE_WORDS + 1) + w], acc);
+    __syncthreads();
+  }
+  volatile unsigned short* published = reinterpret_cast<volatile unsigned short*>(logits);
+  if (owner) {
+    published[(size_t)row * experts + e0 + tid] =
+        __bfloat16_as_ushort(__float2bfloat16(acc));
+    __threadfence();
+  }
+  __syncthreads();
+  if (tid == 0) last = atomicAdd(completed + row, 1u) == gridDim.x - 1;
+  __syncthreads();
+  if (!last) return;
+  float logit = -CUDART_INF_F;
+  if (tid < experts)
+    logit = __bfloat162float(__ushort_as_bfloat16(published[(size_t)row * experts + tid]));
+  if (score_mode == 0)
+    moe_route_select<reverse_ties>(logit, ids, weights, experts, top_k, row);
+  else
+    moe_route_select_sigmoid<reverse_ties>(logit, ids, weights, experts, top_k, row);
+  __syncthreads();
+  if (tid == 0) atomicExch(completed + row, 0u);
+}
+
+extern "C" __global__ void moe_route_decode_bf16(
+    const bf16* x, const bf16* router, bf16* logits, int* ids, bf16* weights,
+    unsigned int* completed, int rows, int experts, int hidden, int top_k,
+    int owners, int score_mode) {
+  moe_route_decode<false>(x, router, logits, ids, weights, completed, rows,
+                         experts, hidden, top_k, owners, score_mode);
+}
+
+// Gate control: exact score ties select the higher global expert id.
+extern "C" __global__ void moe_route_decode_reverse_ties(
+    const bf16* x, const bf16* router, bf16* logits, int* ids, bf16* weights,
+    unsigned int* completed, int rows, int experts, int hidden, int top_k,
+    int owners, int score_mode) {
+  moe_route_decode<true>(x, router, logits, ids, weights, completed, rows,
+                        experts, hidden, top_k, owners, score_mode);
 }
 
 extern "C" __global__ void moe_route_topk_noaux(
