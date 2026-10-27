@@ -2,7 +2,7 @@
 // rope followed by kv_write.
 // __trap() unless q_heads == 16, kv_heads == 2, dim == 128, theta
 // finite and > 0, rows >= 1, and 0 <= *start <= capacity - rows.
-#include <cuda_bf16.h>
+#include "gpu_compat.cuh"
 
 namespace rope_kv_guard {
 __device__ __forceinline__ void shape(int rows, int q_heads, int kv_heads,

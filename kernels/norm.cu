@@ -29,8 +29,7 @@
 //   * No global state; 128 B static __shared__ scratch per block. CUDA-Graph
 //     capturable.
 
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
+#include "gpu_compat.cuh"
 
 namespace {
 
@@ -40,7 +39,7 @@ constexpr int kMaxPerThread = 8;
 
 __device__ __forceinline__ float warp_reduce_sum(float v) {
 #pragma unroll
-  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(FF_WARP_MASK, v, o);
   return v;
 }
 

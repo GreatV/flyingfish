@@ -52,6 +52,157 @@ fn architectures() -> Vec<u32> {
     archs
 }
 
+const ROCM_KERNELS: &[&str] = &[
+    "embed",
+    "embed_rmsnorm",
+    "norm",
+    "add_rmsnorm_capture",
+    "rope",
+    "rope_kv",
+    "act",
+    "sample",
+    "attention",
+    "q38_common",
+];
+
+fn wave32_rdna_arch(arch: &str) -> bool {
+    let Some(number) = arch.strip_prefix("gfx") else {
+        return false;
+    };
+    number.len() == 4
+        && number.bytes().all(|byte| byte.is_ascii_digit())
+        && matches!(&number[..2], "10" | "11" | "12")
+}
+
+fn rocm_architectures() -> Vec<String> {
+    println!("cargo:rerun-if-env-changed=ROCM_ARCH_LIST");
+    let value = match env::var("ROCM_ARCH_LIST") {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(error) => panic!("ROCM_ARCH_LIST: {error}"),
+    };
+    let values = if let Some(value) = value {
+        value
+            .split([',', ' ', ';'])
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    } else {
+        let output = Command::new("rocminfo")
+            .output()
+            .expect("cannot query ROCm architectures; set ROCM_ARCH_LIST");
+        assert!(
+            output.status.success(),
+            "rocminfo architecture query failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text =
+            String::from_utf8(output.stdout).expect("rocminfo returned non-UTF8 architectures");
+        text.split(|byte: char| !byte.is_ascii_alphanumeric())
+            .filter(|value| value.starts_with("gfx"))
+            .map(|value| value.to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        !values.is_empty(),
+        "no ROCm gfx architecture found; set ROCM_ARCH_LIST"
+    );
+    let mut archs = Vec::new();
+    for arch in values {
+        assert!(
+            wave32_rdna_arch(&arch),
+            "unsupported ROCm architecture {arch}: wave32 RDNA gfx10xx/gfx11xx/gfx12xx required"
+        );
+        if !archs.contains(&arch) {
+            archs.push(arch);
+        }
+    }
+    println!("cargo:warning=ROCm architectures={archs:?} wave32 RDNA only");
+    archs
+}
+
+fn build_rocm(out: &std::path::Path) {
+    println!("cargo:rerun-if-changed=kernels/gpu_compat.cuh");
+    println!("cargo:rerun-if-changed=kernels/q38_contract.cuh");
+    println!("cargo:rerun-if-env-changed=HIP_HOME");
+    println!("cargo:rerun-if-env-changed=ROCM_PATH");
+    println!("cargo:rerun-if-env-changed=PATH");
+    let hipcc = if let Some(home) = env::var_os("HIP_HOME") {
+        PathBuf::from(home).join("bin/hipcc")
+    } else if let Some(home) = env::var_os("ROCM_PATH") {
+        PathBuf::from(home).join("bin/hipcc")
+    } else {
+        env::split_paths(&env::var_os("PATH").expect("PATH is missing"))
+            .map(|p| p.join("hipcc"))
+            .find(|p| p.is_file())
+            .expect("hipcc is missing: set HIP_HOME, ROCM_PATH or PATH")
+    };
+    let hipcc = hipcc.canonicalize().expect("cannot resolve hipcc path");
+    let version = Command::new(&hipcc)
+        .arg("--version")
+        .output()
+        .expect("cannot execute hipcc");
+    assert!(version.status.success(), "hipcc --version failed");
+    println!(
+        "cargo:warning=hipcc={} {}",
+        hipcc.display(),
+        String::from_utf8_lossy(&version.stdout).replace('\n', " | ")
+    );
+
+    let archs = rocm_architectures();
+    let temp = out.join("hipcc-tmp");
+    fs::create_dir_all(&temp).expect("cannot create hipcc temporary directory");
+    let mut index = format!(
+        "pub const ARCHES: &[&str] = &{archs:?};\npub fn hsaco(name: &str, gfx: &str) -> Option<&'static [u8]> {{\nmatch (name, gfx) {{\n"
+    );
+    for name in ROCM_KERNELS {
+        let file = PathBuf::from(format!("kernels/{name}.cu"));
+        assert!(
+            file.is_file(),
+            "ROCm allowlist kernel missing: {}",
+            file.display()
+        );
+        println!("cargo:rerun-if-changed={}", file.display());
+        for arch in &archs {
+            let filename = format!("{name}_{arch}.hsaco");
+            let hsaco = out.join(&filename);
+            let result = Command::new(&hipcc)
+                .env("TMPDIR", &temp)
+                .args(["--genco", "-O3", "--std=c++17", "-mno-wavefrontsize64"])
+                .arg(format!("--offload-arch={arch}"))
+                .arg(&file)
+                .arg("-o")
+                .arg(&hsaco)
+                .output()
+                .expect("cannot compile ROCm kernel");
+            assert!(
+                result.status.success(),
+                "hipcc failed for {} {arch}:\n{}\n{}",
+                file.display(),
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let bytes = fs::read(&hsaco).expect("cannot read ROCm code object");
+            assert!(
+                bytes.starts_with(b"__CLANG_OFFLOAD_BUNDLE__"),
+                "invalid ROCm offload bundle for {} {arch}",
+                file.display()
+            );
+            let text = String::from_utf8_lossy(&bytes);
+            let target = format!("hipv4-amdgcn-amd-amdhsa--{arch}");
+            assert!(
+                text.contains(&target),
+                "ROCm code object for {} {arch} lacks target {target}",
+                file.display()
+            );
+            index.push_str(&format!("({name:?}, {arch:?}) => Some(include_bytes!(concat!(env!(\"OUT_DIR\"), \"/\", {filename:?}))),\n"));
+        }
+    }
+    index.push_str("_ => None,\n}\n}\n");
+    fs::write(out.join("kernels.rs"), index).expect("cannot write hsaco index");
+}
+
 fn main() {
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR missing"));
     for (header, prefix, names, ty, output) in [
@@ -112,6 +263,17 @@ fn main() {
     }
     fs::write(out.join("gdn_cw_p2_shared.rs"), cw).expect("write chunkwise P2 constants");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CUDA");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_ROCM");
+    let cuda = env::var_os("CARGO_FEATURE_CUDA").is_some();
+    let rocm = env::var_os("CARGO_FEATURE_ROCM").is_some();
+    assert!(
+        !(cuda && rocm),
+        "features `cuda` and `rocm` are mutually exclusive"
+    );
+    if rocm {
+        build_rocm(&out);
+        return;
+    }
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return;
     }

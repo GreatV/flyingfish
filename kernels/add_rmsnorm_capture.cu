@@ -1,6 +1,5 @@
 // BF16 residual capture with standard RMSNorm (mode 0); hidden 2048 or 5120.
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
+#include "gpu_compat.cuh"
 #include "q38_contract.cuh"
 
 namespace add_norm_capture {
@@ -26,7 +25,7 @@ __device__ __forceinline__ void rect(int hidden, int dst_pitch, int dst_col) {
 
 __device__ __forceinline__ float warp_reduce_sum(float v) {
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(FF_WARP_MASK, v, o);
     return v;
 }
 

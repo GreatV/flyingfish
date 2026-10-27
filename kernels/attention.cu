@@ -24,8 +24,7 @@
 // Phase-2 launch: grid = n_q_heads, block = threads2 (power of two in [128, 1024]),
 //   smem = (2*nchunks + threads2)*4 bytes <= 48 KB.
 // nchunks is identical in both phases for the same (L, chunk).
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
+#include "gpu_compat.cuh"
 
 using bf16 = __nv_bfloat16;
 
@@ -154,7 +153,7 @@ __device__ __forceinline__ void fd_phase1_body(
       for (int h = 0; h < QP; ++h)
 #pragma unroll
         for (int off = TP / 2; off > 0; off >>= 1)
-          s[h] += __shfl_xor_sync(0xffffffffu, s[h], off);
+          s[h] += __shfl_xor_sync(FF_WARP_MASK, s[h], off);
 
       float cf[QP], pf[QP];
 #pragma unroll
@@ -187,14 +186,14 @@ __device__ __forceinline__ void fd_phase1_body(
   // Level 1: the two TP-lane groups of a warp exchange via shuffles; both halves hold the result.
 #pragma unroll
   for (int h = 0; h < QP; ++h) {
-    const float pm = __shfl_xor_sync(0xffffffffu, mx[h], TP);
-    const float pl = __shfl_xor_sync(0xffffffffu, ls[h], TP);
+    const float pm = __shfl_xor_sync(FF_WARP_MASK, mx[h], TP);
+    const float pl = __shfl_xor_sync(FF_WARP_MASK, ls[h], TP);
     const float M  = fmaxf(mx[h], pm);
     const float c  = __expf(mx[h] - M);        // 1 when both sentinels
     const float pc = __expf(pm - M);
     float pa[VPR];
 #pragma unroll
-    for (int j = 0; j < VPR; ++j) pa[j] = __shfl_xor_sync(0xffffffffu, acc[h][j], TP);
+    for (int j = 0; j < VPR; ++j) pa[j] = __shfl_xor_sync(FF_WARP_MASK, acc[h][j], TP);
     ls[h] = ls[h] * c + pl * pc;
 #pragma unroll
     for (int j = 0; j < VPR; ++j) acc[h][j] = acc[h][j] * c + pa[j] * pc;
@@ -545,7 +544,7 @@ __device__ __forceinline__ void fdmq_phase1_body(
       for (int h = 0; h < QP; ++h)
 #pragma unroll
         for (int off = TP / 2; off > 0; off >>= 1)
-          s[h] += __shfl_xor_sync(0xffffffffu, s[h], off);
+          s[h] += __shfl_xor_sync(FF_WARP_MASK, s[h], off);
 
       float cf[QP], pf[QP];
 #pragma unroll
@@ -573,14 +572,14 @@ __device__ __forceinline__ void fdmq_phase1_body(
   // Level 1: the two TP-lane groups of a warp exchange via shuffles; both halves hold the result.
 #pragma unroll
   for (int h = 0; h < QP; ++h) {
-    const float pm = __shfl_xor_sync(0xffffffffu, mx[h], TP);
-    const float pl = __shfl_xor_sync(0xffffffffu, ls[h], TP);
+    const float pm = __shfl_xor_sync(FF_WARP_MASK, mx[h], TP);
+    const float pl = __shfl_xor_sync(FF_WARP_MASK, ls[h], TP);
     const float M  = fmaxf(mx[h], pm);
     const float c  = __expf(mx[h] - M);        // 1 when both sentinels
     const float pc = __expf(pm - M);
     float pa[VPR];
 #pragma unroll
-    for (int j = 0; j < VPR; ++j) pa[j] = __shfl_xor_sync(0xffffffffu, acc[h][j], TP);
+    for (int j = 0; j < VPR; ++j) pa[j] = __shfl_xor_sync(FF_WARP_MASK, acc[h][j], TP);
     ls[h] = ls[h] * c + pl * pc;
 #pragma unroll
     for (int j = 0; j < VPR; ++j) acc[h][j] = acc[h][j] * c + pa[j] * pc;

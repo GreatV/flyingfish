@@ -1,3 +1,6 @@
+#[cfg(all(feature = "cuda", feature = "rocm"))]
+compile_error!("features `cuda` and `rocm` are mutually exclusive");
+
 pub mod backend;
 pub mod bench;
 pub mod checkpoint;
