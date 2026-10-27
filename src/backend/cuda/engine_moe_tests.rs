@@ -1144,6 +1144,11 @@ impl Engine {
                 max_rows: decode_rows,
                 workers: capacity.worker_count,
                 cpu_bounds,
+                participants: crate::experts::plan::ParticipantTable::uniform(
+                    u32::try_from(cpu_bounds.0)?,
+                    u32::try_from(cpu_bounds.1)?,
+                    capacity.worker_count,
+                )?,
                 format: model_spec
                     .expert_format
                     .context("MoE expert_format missing")?,

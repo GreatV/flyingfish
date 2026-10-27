@@ -27,6 +27,15 @@ pub struct ServiceTable {
     cells: Vec<ServiceCell>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParticipantTable {
+    max_rows: u32,
+    measured_rows: u32,
+    max_groups: u32,
+    default_participants: u32,
+    mixed: std::collections::BTreeMap<(u32, u32), u32>,
+}
+
 impl ServiceTable {
     pub fn new(isa: impl Into<String>, cells: Vec<ServiceCell>) -> Result<Self> {
         ensure!(!cells.is_empty(), "empty expert service table");
@@ -92,26 +101,55 @@ impl ServiceTable {
         Ok(best.map(|(_, workers)| workers).expect("best is set"))
     }
 
-    pub fn ensure_decode_worker_nondegrading(&self, top_k: u32) -> Result<()> {
-        ensure!(top_k > 0, "zero expert top-k");
-        let chosen = self.worker_count()?;
-        let candidates: std::collections::BTreeSet<u32> = self
+    pub fn participant_table(
+        &self,
+        max_rows: u32,
+        max_groups: u32,
+        worker_limit: u32,
+    ) -> Result<ParticipantTable> {
+        ensure!(max_rows > 0, "zero participant rows");
+        ensure!(max_groups > 0, "zero participant groups");
+        ensure!(worker_limit > 0, "zero participant worker limit");
+        let workers: Vec<u32> = self
             .cells
             .iter()
-            .filter(|cell| cell.rows == 1 && cell.workers <= chosen)
             .map(|cell| cell.workers)
+            .filter(|&workers| workers <= worker_limit)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .collect();
-        for experts in 1..=top_k {
-            let chosen_seconds = self.seconds(1, experts, chosen)?;
-            for workers in &candidates {
-                let candidate_seconds = self.seconds(1, experts, *workers)?;
-                ensure!(
-                    chosen_seconds <= candidate_seconds,
-                    "chosen decode service workers={chosen} experts={experts} seconds={chosen_seconds} is slower than workers={workers} seconds={candidate_seconds}"
-                );
+        ensure!(
+            !workers.is_empty(),
+            "service table has no worker candidates at or below {worker_limit}"
+        );
+        let default_participants = self.worker_count()?.min(worker_limit);
+        let mut mixed = std::collections::BTreeMap::new();
+        let measured_rows = self.max_rows();
+        for rows in 1..=measured_rows {
+            for groups in 1..=max_groups {
+                let mut best: Option<(f64, u32)> = None;
+                for worker in &workers {
+                    let seconds =
+                        self.estimate_seconds(f64::from(rows), f64::from(groups), *worker)?;
+                    if best.is_none_or(|(time, chosen)| {
+                        seconds < time || (seconds == time && *worker < chosen)
+                    }) {
+                        best = Some((seconds, *worker));
+                    }
+                }
+                let participants = best.map(|(_, workers)| workers).expect("best is set");
+                if participants != default_participants {
+                    mixed.insert((rows, groups), participants);
+                }
             }
         }
-        Ok(())
+        Ok(ParticipantTable {
+            max_rows,
+            measured_rows,
+            max_groups,
+            default_participants,
+            mixed,
+        })
     }
 
     /// Largest measured row count.
@@ -249,6 +287,40 @@ impl ServiceTable {
         anyhow::bail!(
             "service table failed to bracket continuous experts={experts} for workers={workers}"
         )
+    }
+}
+
+impl ParticipantTable {
+    pub fn uniform(max_rows: u32, max_groups: u32, participants: u32) -> Result<Self> {
+        ensure!(
+            max_rows > 0 && max_groups > 0 && participants > 0,
+            "zero participant table extent rows={max_rows} groups={max_groups} workers={participants}"
+        );
+        Ok(Self {
+            max_rows,
+            measured_rows: max_rows,
+            max_groups,
+            default_participants: participants,
+            mixed: std::collections::BTreeMap::new(),
+        })
+    }
+
+    pub fn participant(&self, rows: usize, groups: usize) -> Result<u32> {
+        let rows = u32::try_from(rows).context("participant rows exceed u32")?;
+        let groups = u32::try_from(groups).context("participant groups exceed u32")?;
+        let rows = rows.min(self.measured_rows);
+        let groups = groups.max(1);
+        ensure!(
+            rows > 0 && rows <= self.max_rows && groups <= self.max_groups,
+            "participant extent rows={rows} groups={groups} outside rows 1..={} groups 1..={}",
+            self.max_rows,
+            self.max_groups
+        );
+        Ok(self
+            .mixed
+            .get(&(rows, groups))
+            .copied()
+            .unwrap_or(self.default_participants))
     }
 }
 
@@ -627,9 +699,6 @@ pub fn capacity_with_peer(
     peer: Option<PeerInputs<'_>>,
 ) -> Result<Capacity> {
     let geometry = inputs.geometry;
-    inputs
-        .service
-        .ensure_decode_worker_nondegrading(geometry.top_k)?;
     ensure!(inputs.span_rows > 0, "zero span rows");
     ensure!(
         inputs.wave_rows > 0 && inputs.wave_rows <= inputs.span_rows,
@@ -1794,20 +1863,37 @@ mod tests {
         assert_eq!(table.seconds(1, 2, 1).unwrap(), 0.4);
         assert!((table.seconds(1, 3, 1).unwrap_err().to_string()).contains("no bracketing cell"));
         assert_eq!(table.worker_count().unwrap(), 2);
-        table.ensure_decode_worker_nondegrading(2).unwrap();
-        let mut degrading = Vec::new();
-        for (workers, experts, seconds) in
-            [(1u32, 1u32, 0.1), (1, 2, 0.4), (2, 1, 0.2), (2, 2, 0.2)]
-        {
-            degrading.push(ServiceCell {
+        let mut mixed = Vec::new();
+        for (workers, experts, seconds) in [
+            (1u32, 1u32, 0.10),
+            (1, 2, 0.16),
+            (1, 3, 0.24),
+            (1, 4, 0.32),
+            (2, 1, 0.12),
+            (2, 2, 0.14),
+            (2, 3, 0.15),
+            (2, 4, 0.24),
+            (4, 1, 0.14),
+            (4, 2, 0.12),
+            (4, 3, 0.16),
+            (4, 4, 0.20),
+        ] {
+            mixed.push(ServiceCell {
                 workers,
                 rows: 1,
                 experts,
                 seconds,
             });
         }
-        let degrading = ServiceTable::new("degrading", degrading).unwrap();
-        assert!(degrading.ensure_decode_worker_nondegrading(2).is_err());
+        let mixed = ServiceTable::new("mixed", mixed).unwrap();
+        let participants = mixed.participant_table(1, 4, 4).unwrap();
+        assert_eq!(participants.participant(1, 1).unwrap(), 1);
+        assert_eq!(participants.participant(1, 2).unwrap(), 4);
+        assert_eq!(participants.participant(1, 3).unwrap(), 2);
+        assert_eq!(participants.participant(1, 4).unwrap(), 4);
+        let extended = mixed.participant_table(4, 4, 4).unwrap();
+        assert_eq!(extended.participant(4, 1).unwrap(), 1);
+        assert_eq!(extended.participant(4, 3).unwrap(), 2);
         assert!(
             ServiceTable::new(
                 "x",
