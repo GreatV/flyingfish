@@ -57,8 +57,8 @@ pub struct MoeCombine {
     pub y: TensorMut<bf16, 2>,
 }
 
-/// The fused combine: the routed sum, the shared-expert sigmoid gate and the
-/// residual add in one launch. The residual is read and written in place.
+/// The fused combine: the routed sum, the shared-expert sigmoid gate and one
+/// output boundary in one launch.
 pub struct MoeCombineResidual {
     /// `[rows, top_k]` router expert ids (dense).
     pub ids: Tensor<i32, 2>,
@@ -75,12 +75,13 @@ pub struct MoeCombineResidual {
     /// `[hidden]` shared-expert sigmoid gate vector; absent is the ungated form.
     pub shared_expert_gate: Option<Tensor<bf16, 1>>,
     /// `[rows, hidden]` residual stream, updated in place.
-    pub residual: TensorMut<bf16, 2>,
+    pub residual: Option<TensorMut<bf16, 2>>,
+    /// `[rows, hidden]` FFN delta output.
+    pub y_out: Option<TensorMut<bf16, 2>>,
 }
 
-/// The fused peer join: the routed sum comes from the peer GPU, the
-/// shared-expert sigmoid gate and the residual add are local. The residual is
-/// read and written in place.
+/// The fused peer join: the routed sum comes from the peer GPU; the
+/// shared-expert sigmoid gate and one output boundary are local.
 pub struct MoeJoinRoutedResidual {
     /// `[rows, hidden]` routed sum produced by the peer (dense).
     pub routed_in: Tensor<bf16, 2>,
@@ -91,7 +92,9 @@ pub struct MoeJoinRoutedResidual {
     /// `[hidden]` shared-expert sigmoid gate vector; absent is the ungated form.
     pub shared_expert_gate: Option<Tensor<bf16, 1>>,
     /// `[rows, hidden]` residual stream, updated in place.
-    pub residual: TensorMut<bf16, 2>,
+    pub residual: Option<TensorMut<bf16, 2>>,
+    /// `[rows, hidden]` FFN delta output.
+    pub y_out: Option<TensorMut<bf16, 2>>,
 }
 
 impl MoeCombine {
@@ -181,15 +184,26 @@ impl MoeCombineResidual {
                 t.shape[1]
             );
         }
-        let hidden = self.residual.read().shape[1];
-        self.residual.read().validate()?;
         ensure!(
-            self.residual.read().shape == [rows, hidden]
-                && self.residual.read().stride == [u64::from(hidden), 1],
-            "moe combine_residual residual must be dense [rows, hidden] (got {}x{})",
-            self.residual.read().shape[0],
-            self.residual.read().shape[1]
+            self.residual.is_some() != self.y_out.is_some(),
+            "moe combine_residual requires exactly one residual or y_out output"
         );
+        let Some(output) = self.residual.as_ref().or(self.y_out.as_ref()) else {
+            anyhow::bail!("moe combine_residual requires one residual or y_out output");
+        };
+        let hidden = output.read().shape[1];
+        for (output, name) in [(&self.residual, "residual"), (&self.y_out, "y_out")] {
+            if let Some(output) = output {
+                output.read().validate()?;
+                ensure!(
+                    output.read().shape == [rows, hidden]
+                        && output.read().stride == [u64::from(hidden), 1],
+                    "moe combine_residual {name} must be dense [rows, hidden] (got {}x{})",
+                    output.read().shape[0],
+                    output.read().shape[1]
+                );
+            }
+        }
         self.contributions.validate()?;
         ensure!(
             self.contributions.shape == [rows, top_k, hidden]
@@ -216,34 +230,36 @@ impl MoeCombineResidual {
             (1..=32).contains(&top_k),
             "moe combine_residual top_k {top_k} outside [1,32]"
         );
-        no_overlap(
-            &self.residual.read(),
-            &self.contributions,
-            "residual",
-            "contributions",
-        )?;
-        no_overlap(
-            &self.residual.read(),
-            &self.shared_out,
-            "residual",
-            "shared_out",
-        )?;
-        no_overlap(&self.residual.read(), &self.x, "residual", "x")?;
+        let output = output.read();
+        no_overlap(&output, &self.contributions, "output", "contributions")?;
+        no_overlap(&output, &self.shared_out, "output", "shared_out")?;
+        no_overlap(&output, &self.x, "output", "x")?;
         Ok((rows, top_k, hidden))
     }
 }
 
 impl MoeJoinRoutedResidual {
     fn validate(&self) -> Result<(u32, u32)> {
-        let (rows, hidden) = (self.residual.read().shape[0], self.residual.read().shape[1]);
-        self.residual.read().validate()?;
         ensure!(
-            self.residual.read().shape == [rows, hidden]
-                && self.residual.read().stride == [u64::from(hidden), 1],
-            "moe join_routed_residual residual must be dense [rows, hidden] (got {}x{})",
-            self.residual.read().shape[0],
-            self.residual.read().shape[1]
+            self.residual.is_some() != self.y_out.is_some(),
+            "moe join_routed_residual requires exactly one residual or y_out output"
         );
+        let Some(output) = self.residual.as_ref().or(self.y_out.as_ref()) else {
+            anyhow::bail!("moe join_routed_residual requires one residual or y_out output");
+        };
+        let (rows, hidden) = (output.read().shape[0], output.read().shape[1]);
+        for (output, name) in [(&self.residual, "residual"), (&self.y_out, "y_out")] {
+            if let Some(output) = output {
+                output.read().validate()?;
+                ensure!(
+                    output.read().shape == [rows, hidden]
+                        && output.read().stride == [u64::from(hidden), 1],
+                    "moe join_routed_residual {name} must be dense [rows, hidden] (got {}x{})",
+                    output.read().shape[0],
+                    output.read().shape[1]
+                );
+            }
+        }
         for (t, name) in [
             (&self.routed_in, "routed_in"),
             (&self.shared_out, "shared_out"),
@@ -264,19 +280,10 @@ impl MoeJoinRoutedResidual {
                 "moe join_routed_residual shared gate must be dense [hidden]"
             );
         }
-        no_overlap(
-            &self.residual.read(),
-            &self.routed_in,
-            "residual",
-            "routed_in",
-        )?;
-        no_overlap(
-            &self.residual.read(),
-            &self.shared_out,
-            "residual",
-            "shared_out",
-        )?;
-        no_overlap(&self.residual.read(), &self.x, "residual", "x")?;
+        let output = output.read();
+        no_overlap(&output, &self.routed_in, "output", "routed_in")?;
+        no_overlap(&output, &self.shared_out, "output", "shared_out")?;
+        no_overlap(&output, &self.x, "output", "x")?;
         Ok((rows, hidden))
     }
 }
@@ -487,82 +494,143 @@ impl CombineOps {
     }
 
     /// The fused combine: the routed sum, the shared-expert sigmoid gate and
-    /// the residual add in one launch. The residual is updated in place.
+    /// one output boundary in one launch.
     pub fn combine_residual(
         &self,
         stream: &Arc<CudaStream>,
         input: &MoeCombineResidual,
+        hidden_blocks: u32,
     ) -> Result<()> {
         let (rows, top_k, hidden) = input.validate()?;
-        // The 16-byte group path needs hidden % 8 == 0; the scalar entry point
-        // covers every other extent.
-        let kernel = if hidden % 8 == 0 {
-            &self.combine_residual
-        } else {
-            &self.combine_residual_scalar
-        };
+        let max_blocks = hidden.div_ceil(256);
+        ensure!(
+            hidden_blocks > 0 && hidden_blocks <= max_blocks,
+            "moe combine_residual hidden blocks {hidden_blocks} outside [1,{max_blocks}]"
+        );
+        // The 16-byte group path needs hidden % 8 == 0, one hidden block and
+        // the in-place residual output; every other form uses the scalar entry.
+        let vectorized = hidden_blocks == 1 && hidden % 8 == 0 && input.y_out.is_none();
         let seg = input
             .shared_expert_gate
             .as_ref()
             .map_or(0u64, |gate| gate.ptr);
         let x_stride = input.x.stride[0];
-        // SAFETY: the validated views cover rows*top_k choices, rows*hidden shared
-        // and residual values and the hidden gate vector.
-        unsafe {
-            stream
-                .launch_builder(kernel)
-                .arg(&input.contributions.ptr)
-                .arg(&input.shared_out.ptr)
-                .arg(&seg)
-                .arg(&input.x.ptr)
-                .arg(&(x_stride as i64))
-                .arg(&input.ids.ptr)
-                .arg(&input.done.ptr)
-                .arg(&input.final_active.ptr)
-                .arg(&input.residual.0.ptr)
-                .arg(&(rows as i32))
-                .arg(&(top_k as i32))
-                .arg(&(hidden as i64))
-                .launch(grid(rows as usize, 256))?;
+        let residual_ptr = input
+            .residual
+            .as_ref()
+            .map_or(0u64, |residual| residual.0.ptr);
+        let y_out_ptr = input.y_out.as_ref().map_or(0u64, |y| y.0.ptr);
+        // SAFETY: the validated views cover rows*top_k choices, rows*hidden
+        // shared/output values and the hidden gate vector.
+        if vectorized {
+            // SAFETY: the validated views cover rows*top_k choices and
+            // rows*hidden shared/residual values.
+            unsafe {
+                stream
+                    .launch_builder(&self.combine_residual)
+                    .arg(&input.contributions.ptr)
+                    .arg(&input.shared_out.ptr)
+                    .arg(&seg)
+                    .arg(&input.x.ptr)
+                    .arg(&(x_stride as i64))
+                    .arg(&input.ids.ptr)
+                    .arg(&input.done.ptr)
+                    .arg(&input.final_active.ptr)
+                    .arg(&residual_ptr)
+                    .arg(&(rows as i32))
+                    .arg(&(top_k as i32))
+                    .arg(&(hidden as i64))
+                    .launch(grid(rows as usize, 256))?;
+            }
+        } else {
+            // SAFETY: the validated views cover rows*top_k choices and
+            // rows*hidden shared/output values.
+            unsafe {
+                stream
+                    .launch_builder(&self.combine_residual_scalar)
+                    .arg(&input.contributions.ptr)
+                    .arg(&input.shared_out.ptr)
+                    .arg(&seg)
+                    .arg(&input.x.ptr)
+                    .arg(&(x_stride as i64))
+                    .arg(&input.ids.ptr)
+                    .arg(&input.done.ptr)
+                    .arg(&input.final_active.ptr)
+                    .arg(&residual_ptr)
+                    .arg(&y_out_ptr)
+                    .arg(&(rows as i32))
+                    .arg(&(top_k as i32))
+                    .arg(&(hidden as i64))
+                    .arg(&(hidden_blocks as i32))
+                    .launch(grid(rows as usize * hidden_blocks as usize, 256))?;
+            }
         }
         Ok(())
     }
 
-    /// The fused peer join: the routed sum comes from the peer GPU, the
-    /// shared-expert sigmoid gate and the residual add are local. The residual
-    /// is updated in place.
+    /// The fused peer join: the routed sum comes from the peer GPU; the
+    /// shared-expert sigmoid gate and one output boundary are local.
     pub fn join_routed_residual(
         &self,
         stream: &Arc<CudaStream>,
         input: &MoeJoinRoutedResidual,
+        hidden_blocks: u32,
     ) -> Result<()> {
         let (rows, hidden) = input.validate()?;
-        // The 16-byte group path needs hidden % 8 == 0; the scalar entry point
-        // covers every other extent.
-        let kernel = if hidden % 8 == 0 {
-            &self.join_routed_residual
-        } else {
-            &self.join_routed_residual_scalar
-        };
+        let max_blocks = hidden.div_ceil(256);
+        ensure!(
+            hidden_blocks > 0 && hidden_blocks <= max_blocks,
+            "moe join_routed_residual hidden blocks {hidden_blocks} outside [1,{max_blocks}]"
+        );
+        // The 16-byte group path needs hidden % 8 == 0, one hidden block and
+        // the in-place residual output; every other form uses the scalar entry.
+        let vectorized = hidden_blocks == 1 && hidden % 8 == 0 && input.y_out.is_none();
         let seg = input
             .shared_expert_gate
             .as_ref()
             .map_or(0u64, |gate| gate.ptr);
         let x_stride = input.x.stride[0];
-        // SAFETY: the validated views cover rows*hidden routed, shared and
-        // residual values and the hidden gate vector.
-        unsafe {
-            stream
-                .launch_builder(kernel)
-                .arg(&input.routed_in.ptr)
-                .arg(&input.shared_out.ptr)
-                .arg(&seg)
-                .arg(&input.x.ptr)
-                .arg(&(x_stride as i64))
-                .arg(&input.residual.0.ptr)
-                .arg(&(rows as i32))
-                .arg(&(hidden as i64))
-                .launch(grid(rows as usize, 256))?;
+        let residual_ptr = input
+            .residual
+            .as_ref()
+            .map_or(0u64, |residual| residual.0.ptr);
+        let y_out_ptr = input.y_out.as_ref().map_or(0u64, |y| y.0.ptr);
+        // SAFETY: the validated views cover rows*hidden routed, shared/output
+        // values and the hidden gate vector.
+        if vectorized {
+            // SAFETY: the validated views cover rows*hidden routed, shared
+            // and residual values.
+            unsafe {
+                stream
+                    .launch_builder(&self.join_routed_residual)
+                    .arg(&input.routed_in.ptr)
+                    .arg(&input.shared_out.ptr)
+                    .arg(&seg)
+                    .arg(&input.x.ptr)
+                    .arg(&(x_stride as i64))
+                    .arg(&residual_ptr)
+                    .arg(&(rows as i32))
+                    .arg(&(hidden as i64))
+                    .launch(grid(rows as usize, 256))?;
+            }
+        } else {
+            // SAFETY: the validated views cover rows*hidden routed, shared
+            // and output values.
+            unsafe {
+                stream
+                    .launch_builder(&self.join_routed_residual_scalar)
+                    .arg(&input.routed_in.ptr)
+                    .arg(&input.shared_out.ptr)
+                    .arg(&seg)
+                    .arg(&input.x.ptr)
+                    .arg(&(x_stride as i64))
+                    .arg(&residual_ptr)
+                    .arg(&y_out_ptr)
+                    .arg(&(rows as i32))
+                    .arg(&(hidden as i64))
+                    .arg(&(hidden_blocks as i32))
+                    .launch(grid(rows as usize * hidden_blocks as usize, 256))?;
+            }
         }
         Ok(())
     }
@@ -636,12 +704,13 @@ mod tests {
                 [1],
                 u64::from(hidden) * 2,
             )?),
-            residual: TensorMut(fake::<bf16, 2>(
+            residual: Some(TensorMut(fake::<bf16, 2>(
                 0x8000,
                 [rows, hidden],
                 [u64::from(hidden), 1],
                 u64::from(rows) * u64::from(hidden) * 2,
-            )?),
+            )?)),
+            y_out: None,
         })
     }
 
@@ -671,12 +740,13 @@ mod tests {
                 [1],
                 u64::from(hidden) * 2,
             )?),
-            residual: TensorMut(fake::<bf16, 2>(
+            residual: Some(TensorMut(fake::<bf16, 2>(
                 0xd000,
                 [rows, hidden],
                 [u64::from(hidden), 1],
                 u64::from(rows) * u64::from(hidden) * 2,
-            )?),
+            )?)),
+            y_out: None,
         })
     }
 
@@ -686,8 +756,9 @@ mod tests {
         assert_eq!(input.validate().unwrap(), (4, 8, 16));
 
         let mut sparse_residual = residual_input(4, 8, 16).unwrap();
-        sparse_residual.residual =
-            TensorMut(fake::<bf16, 2>(0x8000, [4, 16], [32, 1], 4 * 32 * 2).unwrap());
+        sparse_residual.residual = Some(TensorMut(
+            fake::<bf16, 2>(0x8000, [4, 16], [32, 1], 4 * 32 * 2).unwrap(),
+        ));
         let error = sparse_residual.validate().unwrap_err().to_string();
         assert!(error.contains("residual must be dense"), "{error}");
 
@@ -703,8 +774,9 @@ mod tests {
         assert!(error.contains("shared gate must be dense"), "{error}");
 
         let mut aliased = residual_input(4, 8, 16).unwrap();
-        aliased.residual =
-            TensorMut(fake::<bf16, 2>(0x4000, [4, 16], [16, 1], 4 * 8 * 16 * 2).unwrap());
+        aliased.residual = Some(TensorMut(
+            fake::<bf16, 2>(0x4000, [4, 16], [16, 1], 4 * 8 * 16 * 2).unwrap(),
+        ));
         let error = aliased.validate().unwrap_err().to_string();
         assert!(error.contains("tensors overlap"), "{error}");
     }
@@ -715,8 +787,9 @@ mod tests {
         assert_eq!(input.validate().unwrap(), (4, 16));
 
         let mut aliased = join_input(4, 16).unwrap();
-        aliased.residual =
-            TensorMut(fake::<bf16, 2>(0x9000, [4, 16], [16, 1], 4 * 16 * 2).unwrap());
+        aliased.residual = Some(TensorMut(
+            fake::<bf16, 2>(0x9000, [4, 16], [16, 1], 4 * 16 * 2).unwrap(),
+        ));
         let error = aliased.validate().unwrap_err().to_string();
         assert!(error.contains("tensors overlap"), "{error}");
 

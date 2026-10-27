@@ -371,7 +371,7 @@ fn expert_host_reserve_keeps_span_independent_of_cpu_ceiling() -> Result<()> {
     // Each row includes a 4-byte router completion counter.
     let row =
         extra(2)? - (decode_scratch_bytes(2, 2, 64) - decode_scratch_bytes(1, 2, 64)) as usize;
-    assert_eq!(row, (32 * 2 + 26) * 2 + 32 * 2 + 2 + 4 + 16 * 2);
+    assert_eq!(row, (32 * 2 + 26) * 2 + 32 * 2 + 4 + 16 * 2);
     println!(
         "PASS expert_decode_row_reserve rows=1,8,16 extra8={} extra16={} legacy8_control=admitted full16=rejected",
         extra(8)?,
@@ -1141,6 +1141,7 @@ impl Engine {
                     send_cap_bytes,
                 }),
                 geometry,
+                residual_output: model_spec.architecture != crate::model_spec::Architecture::Flint,
                 max_rows: decode_rows,
                 workers: capacity.worker_count,
                 cpu_bounds,
@@ -2172,6 +2173,8 @@ fn compare(a: &Trace, b: &Trace) -> Result<usize> {
 }
 
 fn combine_expected(engine: &Engine, contributions: &[bf16], rows: usize) -> Result<Vec<bf16>> {
+    use crate::backend::cuda::moe::combine::MoeCombine;
+
     let stream = &engine.device.stream;
     let decode = engine.moe.as_ref().context("reference decode missing")?;
     let x = qwen::matrix(&engine.work.n, stream, 0, rows, 128)?;
@@ -2251,6 +2254,12 @@ fn tier_cell(
         .memcpy_htod(input, &mut engine.work.n.slice_mut(..input.len()))?;
     let mut trace = Trace::default();
     engine.trace_layer = layer as usize;
+    let residual = engine.device.stream.clone_dtoh(
+        &engine
+            .work
+            .x
+            .slice(..rows * engine.model_spec.hidden as usize),
+    )?;
     engine.run_ffn(
         layer as usize,
         step(rows),
@@ -2303,6 +2312,11 @@ fn tier_cell(
         .filter(|&&done| done != 1.0)
         .count();
     let expected_out = combine_expected(engine, &expected, rows)?;
+    let expected_out = expected_out
+        .into_iter()
+        .zip(&residual)
+        .map(|(ffn, residual)| bf16::from_f32(ffn.to_f32() + residual.to_f32()))
+        .collect::<Vec<_>>();
     mismatches += trace
         .values("layer.ffn")?
         .iter()
@@ -2601,6 +2615,10 @@ fn cpu_control(
         });
         miss_rows.push(row as u32);
     }
+    engine
+        .device
+        .stream
+        .memset_zeros(&mut engine.work.out.slice_mut(..rows * 128))?;
     let decode = engine.moe.as_mut().context("CPU control decode missing")?;
     let stream = &engine.device.stream;
     let x = qwen::matrix(&engine.work.n, stream, 0, rows, 128)?;
@@ -2720,10 +2738,9 @@ fn gate(row_cases: &[usize], variants: &[u32], cpu: bool) -> Result<()> {
                 "Runner FAIL same-form reference repeat differs rows={rows} variant={variant}"
             );
             let mut trace = Trace::default();
-            engine
-                .device
-                .stream
-                .memcpy_htod(input, &mut engine.work.n.slice_mut(..input.len()))?;
+            let stream = &engine.device.stream;
+            stream.memset_zeros(&mut engine.work.x.slice_mut(..input.len()))?;
+            stream.memcpy_htod(input, &mut engine.work.n.slice_mut(..input.len()))?;
             {
                 engine
                     .moe_slots

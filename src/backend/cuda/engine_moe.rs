@@ -6,7 +6,7 @@ use crate::backend::cuda::{
     contracts::{Tensor, TensorMut, view},
     linear::BoundFfn,
     moe::{
-        combine::{CombineOps, MoeCombine, MoeCombineRouted, MoeJoinRouted},
+        combine::{CombineOps, MoeCombineResidual, MoeCombineRouted, MoeJoinRoutedResidual},
         decode::{DecodeOps, MoeDecode, decode_scratch_bytes, decode_scratch_bytes_mixed},
         prefill::{LANE16_ROWS, PrefillOps},
         route::RouteOps,
@@ -52,7 +52,7 @@ fn decode_device_bytes(
         .checked_mul(2)
         .and_then(|n| n.checked_add(26))
         .and_then(|n| n.checked_mul(k))
-        .and_then(|n| n.checked_add(hidden * 2 + 2 + size_of::<u32>()))
+        .and_then(|n| n.checked_add(hidden * 2 + size_of::<u32>()))
         .and_then(|n| n.checked_add(geometry.experts as usize * 2))
         .context("expert decode row byte count overflow")?;
     let scratch = decode_scratch_bytes_mixed(
@@ -682,6 +682,8 @@ impl Setup {
                     send_cap_bytes,
                 }),
                 geometry,
+                residual_output: engine.model_spec.architecture
+                    != crate::model_spec::Architecture::Flint,
                 max_rows: self.decode_rows,
                 workers: self.capacity.worker_count,
                 cpu_bounds,
@@ -814,13 +816,18 @@ impl Engine {
         let stream = &self.device.stream;
         let hidden = self.model_spec.hidden as usize;
         let x = qwen::matrix(&self.work.n, stream, 0, rows, hidden)?;
+        let output = if decode.residual_output {
+            qwen::matrix(&self.work.x, stream, 0, rows, hidden)?
+        } else {
+            qwen::matrix(&self.work.out, stream, 0, rows, hidden)?
+        };
         slots.run(
             &self.device,
             decode,
             slot_layer,
             ffn,
             x,
-            &mut TensorMut(qwen::matrix(&self.work.out, stream, 0, rows, hidden)?),
+            &mut TensorMut(output),
         )?;
         if let Some(target) = trace
             .as_mut()
@@ -832,7 +839,12 @@ impl Engine {
                 (target.prefix.to_owned(), "ffn".to_owned())
             };
             decode.trace(stream, slot_layer as usize, target.trace, &prefix)?;
-            trace_value(trace, stream, &name, &self.work.out, rows, hidden)?;
+            let output = if decode.residual_output {
+                &self.work.x
+            } else {
+                &self.work.out
+            };
+            trace_value(trace, stream, &name, output, rows, hidden)?;
         }
         Ok(())
     }
@@ -932,6 +944,8 @@ pub(super) struct PeerDecode {
 
 pub(super) struct Decode {
     geometry: ExpertGeometry,
+    combine_blocks: u32,
+    residual_output: bool,
     shared_intermediate: u32,
     fp8_slot: Option<crate::experts::catalogue::Fp8Slot>,
     max_rows: usize,
@@ -950,7 +964,6 @@ pub(super) struct Decode {
     contributions: CudaSlice<bf16>,
     done: CudaSlice<u32>,
     shared: CudaSlice<bf16>,
-    scale: CudaSlice<bf16>,
     scratch: CudaSlice<u8>,
     host_ids: PinnedHostSlice<i32>,
     host_weights: PinnedHostSlice<bf16>,
@@ -1029,6 +1042,7 @@ impl Drop for Decode {
 pub(super) struct DecodeOptions<'a> {
     pub peer: Option<PeerBind<'a>>,
     pub geometry: ExpertGeometry,
+    pub residual_output: bool,
     pub max_rows: usize,
     pub workers: u32,
     pub cpu_bounds: (usize, usize),
@@ -1045,6 +1059,7 @@ impl Decode {
         let DecodeOptions {
             peer: peer_info,
             geometry,
+            residual_output,
             max_rows,
             workers,
             cpu_bounds,
@@ -1139,6 +1154,12 @@ impl Decode {
         };
         let decode = Self {
             geometry,
+            combine_blocks: if residual_output {
+                geometry.hidden.div_ceil(256)
+            } else {
+                1
+            },
+            residual_output,
             shared_intermediate,
             fp8_slot: layout.fp8_slot().cloned(),
             max_rows,
@@ -1163,7 +1184,6 @@ impl Decode {
             contributions: stream.alloc_zeros(elements)?,
             done: stream.alloc_zeros(choices)?,
             shared: stream.alloc_zeros(hidden)?,
-            scale: stream.alloc_zeros(max_rows)?,
             scratch: stream.alloc_zeros(scratch_bytes)?,
             host_ids: pinned_zeros(context, choices)?,
             host_weights: pinned_zeros(context, choices)?,
@@ -1204,8 +1224,7 @@ impl Decode {
             * size_of::<u32>()
             + (decode.weights.len() + decode.route_logits.len()) * size_of::<bf16>()
             + decode.generation.len() * size_of::<u64>()
-            + (decode.contributions.len() + decode.shared.len() + decode.scale.len())
-                * size_of::<bf16>()
+            + (decode.contributions.len() + decode.shared.len()) * size_of::<bf16>()
             + decode.scratch.len()
             + decode.route.workspace_bytes();
         let planned = decode_device_bytes(geometry, shared_intermediate, max_rows)?;
@@ -1994,14 +2013,11 @@ impl Decode {
         );
         let stream = &device.stream;
         let shared_out = qwen::matrix(&self.shared, stream, 0, rows, hidden)?;
-        let mut gate_view = None;
-        let mut scale = None;
-        if let Some(gate) = shared_gate {
-            let mut written = TensorMut(view(&self.scale, stream, 0, [rows as u32, 1], [1, 1])?);
-            self.combine.shared_scale(stream, x, gate, &mut written)?;
-            gate_view = Some(gate);
-            scale = Some(written);
-        }
+        let (residual, y_out) = if self.residual_output {
+            (Some(TensorMut(y.read())), None)
+        } else {
+            (None, Some(TensorMut(y.read())))
+        };
         if let Some(peer) = self
             .peer
             .as_ref()
@@ -2043,16 +2059,19 @@ impl Decode {
             }
             return self
                 .combine
-                .join_routed(
+                .join_routed_residual(
                     stream,
-                    &MoeJoinRouted {
+                    &MoeJoinRoutedResidual {
                         routed_in,
                         shared_out,
-                        scale: scale.map(|s| s.0),
-                        y: TensorMut(y.read()),
+                        x,
+                        shared_expert_gate: shared_gate,
+                        residual,
+                        y_out,
                     },
+                    self.combine_blocks,
                 )
-                .context("decode gpu0 join_routed");
+                .context("decode gpu0 join_routed_residual");
         }
         let ids = view(&self.ids, stream, 0, [rows as u32, k as u32], [k as u64, 1])?;
         let contributions = view(
@@ -2076,19 +2095,20 @@ impl Decode {
             [rows as u32, k as u32],
             [k as u64, 1],
         )?;
-        self.combine.combine(
+        self.combine.combine_residual(
             stream,
-            &MoeCombine {
+            &MoeCombineResidual {
                 ids,
                 final_active,
                 done,
                 contributions,
                 shared_out,
                 x,
-                shared_expert_gate: gate_view,
-                scale,
-                y: TensorMut(y.read()),
+                shared_expert_gate: shared_gate,
+                residual,
+                y_out,
             },
+            self.combine_blocks,
         )?;
         Ok(())
     }
