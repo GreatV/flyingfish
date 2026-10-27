@@ -599,7 +599,8 @@ impl Runtime {
         let gdn = GdnSpec::from_model(model)?;
         let attention_prefill =
             FullAttentionOps::preprocess_workspace(&attention, limits(rows, capacity)?)?;
-        let attention_decode = FullAttentionOps::workspace(&attention, limits(1, capacity)?)?;
+        let attention_decode =
+            FullAttentionOps::decode_workspace(&attention, u32::try_from(capacity)?)?;
         let attention_nested_verify =
             FullAttentionOps::workspace(&attention, limits(rows.min(verify_rows), capacity)?)?;
         let spec = gdn;
@@ -643,6 +644,23 @@ impl Runtime {
         } else {
             Some(FullAttentionSpec::from_model(&engine.model_spec)?)
         };
+        let decode_limits = attention
+            .as_ref()
+            .map(|spec| -> Result<AttentionLimits> {
+                let mut bound = limits(1, engine.capacity)?;
+                bound.key_chunk = FullAttentionOps::decode_key_chunk(
+                    &engine.device.ctx,
+                    spec,
+                    bound.capacity,
+                    engine
+                        .state
+                        .kv
+                        .first()
+                        .is_some_and(|kv| kv.compact.is_some()),
+                )?;
+                Ok(bound)
+            })
+            .transpose()?;
         let gdn = if flint {
             None
         } else {
@@ -719,7 +737,8 @@ impl Runtime {
                             kv.compact.is_some() == kv_scratch.is_some(),
                             "KV format/prefill scratch mismatch at setup"
                         );
-                        let bind = |active_rows, positions, compact: bool| {
+                        let bind = |bound: AttentionLimits, positions, compact: bool| {
+                            let active_rows = bound.max_rows as usize;
                             let (k, v, cap) = if compact {
                                 (
                                     &kv.k,
@@ -738,7 +757,7 @@ impl Runtime {
                             FullAttentionOps::prepare(
                                 &engine.device.ctx,
                                 &attention,
-                                limits(active_rows, engine.capacity)?,
+                                bound,
                                 AttentionBindings {
                                     compact: if compact {
                                         kv.compact.as_ref().map(|c| c.view(&kv.k, &kv.v, s))
@@ -810,7 +829,7 @@ impl Runtime {
                             )
                         };
                         let decode = bind(
-                            1,
+                            decode_limits.context("decode attention limits missing")?,
                             PositionBindings::Axes(view(&active_positions, s, 0, [1, 3], [3, 1])?),
                             kv.compact.is_some(),
                         )?;
@@ -830,7 +849,11 @@ impl Runtime {
                             );
                         }
                         let text_prefill = PrefillPlans::bind(
-                            bind(rows, PositionBindings::Linear, false)?,
+                            bind(
+                                limits(rows, engine.capacity)?,
+                                PositionBindings::Linear,
+                                false,
+                            )?,
                             (rows, verify_rows),
                             FullAttentionPlan::for_rows,
                         )?;
@@ -844,7 +867,7 @@ impl Runtime {
                         BoundMixer::Attention {
                             image_prefill: PrefillPlans::bind(
                                 bind(
-                                    rows,
+                                    limits(rows, engine.capacity)?,
                                     PositionBindings::Axes(view(
                                         &active_positions,
                                         s,
@@ -860,7 +883,11 @@ impl Runtime {
                             text_prefill,
                             compact_small: if kv.compact.is_some() {
                                 Some(PrefillPlans::bind(
-                                    bind(verify_rows.min(rows), PositionBindings::Linear, true)?,
+                                    bind(
+                                        limits(verify_rows.min(rows), engine.capacity)?,
+                                        PositionBindings::Linear,
+                                        true,
+                                    )?,
                                     (verify_rows.min(rows), verify_rows),
                                     FullAttentionPlan::for_rows,
                                 )?)
@@ -1788,7 +1815,7 @@ impl Engine {
                 .context("Q38 attention specification missing")?;
             (
                 FullAttentionOps::preprocess_workspace(attention, limits(rows, capacity)?)?.bytes,
-                FullAttentionOps::workspace(attention, limits(1, capacity)?)?.bytes,
+                FullAttentionOps::decode_workspace(attention, u32::try_from(capacity)?)?.bytes,
                 FullAttentionOps::workspace(attention, limits(rows.min(verify_rows), capacity)?)?
                     .bytes,
             )

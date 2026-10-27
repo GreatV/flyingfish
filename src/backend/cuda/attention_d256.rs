@@ -302,6 +302,80 @@ fn check_bindings(
 }
 
 impl FullAttentionOps {
+    pub(crate) fn decode_workspace(
+        spec: &FullAttentionSpec,
+        capacity: u32,
+    ) -> Result<WorkspaceReq> {
+        ensure!(capacity >= KT, "decode attention capacity is below KT=32");
+        Self::workspace(
+            spec,
+            AttentionLimits {
+                max_rows: 1,
+                capacity,
+                key_chunk: 128.min(capacity / KT * KT),
+                causal: 1,
+            },
+        )
+    }
+
+    pub(crate) fn decode_key_chunk(
+        ctx: &Arc<CudaContext>,
+        spec: &FullAttentionSpec,
+        capacity: u32,
+        compact: bool,
+    ) -> Result<u32> {
+        spec.validate()?;
+        ensure!(capacity >= KT, "decode attention capacity is below KT=32");
+        use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute_enum as F};
+        let sms = u64::try_from(ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?)?;
+        ensure!(sms > 0, "decode attention device has no multiprocessors");
+        let optin = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?;
+        ensure!(
+            optin >= PHASE1_SMEM as i32,
+            "decode attention phase1 shared memory exceeds opt-in limit"
+        );
+        let module = cubin::module(ctx, spec.kernel_module()?)?;
+        let function = module.load_function(if compact {
+            "tcmqa_d256_phase1_compact"
+        } else {
+            "tcmqa_d256_phase1"
+        })?;
+        function.set_attribute(
+            F::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            PHASE1_SMEM as i32,
+        )?;
+        let resident = u64::from(
+            function
+                .occupancy_max_active_blocks_per_multiprocessor(
+                    PHASE1_THREADS,
+                    PHASE1_SMEM as usize,
+                    None,
+                )
+                .context("decode attention phase1 occupancy query")?,
+        );
+        ensure!(resident > 0, "decode attention phase1 has zero occupancy");
+        let wave = (sms
+            .checked_mul(resident)
+            .context("decode attention resident grid overflow")?
+            / u64::from(spec.hkv))
+        .max(1);
+        let old = 256.min(capacity / KT * KT);
+        let chunk =
+            u32::try_from(u64::from(capacity).div_ceil(u64::from(KT) * wave) * u64::from(KT))?
+                .max(old.min(128))
+                .min(old);
+        eprintln!(
+            "{}",
+            serde_json::json!({"decode_attention_split":{
+                "sms":sms,"resident_blocks_per_sm":resident,"compact":compact,
+                "hq":spec.hq,"hkv":spec.hkv,"capacity":capacity,
+                "key_chunk":chunk,"max_parts":capacity.div_ceil(chunk),
+                "phase1_threads":PHASE1_THREADS,"phase1_smem_bytes":PHASE1_SMEM
+            }})
+        );
+        Ok(chunk)
+    }
+
     /// CPU-only checked sizing: reads no GPU state and allocates nothing.
     pub(crate) fn workspace(
         spec: &FullAttentionSpec,
@@ -1035,6 +1109,7 @@ mod tests {
         key_chunk: u32,
         axes: Option<&'a CudaSlice<i32>>,
         oracle: bool,
+        boundary_probe: Option<bool>,
     }
 
     /// Everything one run leaves behind for bitwise cross-run comparison.
@@ -1045,6 +1120,7 @@ mod tests {
         k_cache: Vec<bf16>,
         v_cache: Vec<bf16>,
         oracle_mismatches: usize,
+        probe: Option<serde_json::Value>,
     }
 
     /// One `workspace` -> `prepare` -> `run` cycle, checked against the reference at `bf16_chain_bound`.
@@ -1062,12 +1138,9 @@ mod tests {
             key_chunk,
             axes,
             oracle,
+            boundary_probe,
         } = case;
         let full = spec.rotary_dim == spec.d;
-        ensure!(
-            !oracle || full || spec == FullAttentionSpec::q38(),
-            "unsupported oracle geometry"
-        );
         let stream = &device.stream;
         let limits = AttentionLimits {
             max_rows,
@@ -1154,6 +1227,17 @@ mod tests {
             }
             for (i, v) in prefix_v.iter_mut().enumerate() {
                 *v = value(i / (prefix as usize * d), i % d);
+            }
+        }
+
+        if boundary_probe == Some(true) {
+            ensure!(prefix > 0, "boundary control requires a cached key");
+            let slot = 128.min(prefix as usize - 1);
+            let mut query = norm(&q_gate[..d], &q_norm_w, spec);
+            rope(&mut query, prefix, spec);
+            for dim in 0..d {
+                prefix_k[slot * d + dim] = bf16::from_f32(query[dim] * 8.0);
+                prefix_v[slot * d + dim] = bf16::from_f32(4.0 + (dim % 53) as f32 / 53.0);
             }
         }
 
@@ -1465,7 +1549,7 @@ mod tests {
             // Full rotary: two RMS rounds, cos/sin, two products and the sum; partial rotary: RMS and RoPE.
             let q_bound = bf16_chain_bound(if full { 6 } else { 2 }, &[d]) as f32;
             eprintln!("P1D_BINDER_Q rel={q_rel:e} bound={q_bound:e}");
-            if full {
+            if full || boundary_probe.is_some() {
                 oracle_mismatches += usize::from(q_rel > q_bound);
             } else {
                 ensure!(
@@ -1492,7 +1576,7 @@ mod tests {
                 plan.max_parts(),
                 plan.phase2_smem_bytes()
             );
-            if full {
+            if full || boundary_probe.is_some() {
                 ensure!(
                     q_roped[..live]
                         .iter()
@@ -1514,7 +1598,7 @@ mod tests {
         );
         let actual_k = stream.clone_dtoh(&dev_k_cache)?;
         let actual_v = stream.clone_dtoh(&dev_v_cache)?;
-        if full {
+        if full || boundary_probe.is_some() {
             for (actual, initial) in [(&actual_k, &k_cache), (&actual_v, &v_cache)] {
                 for head in 0..hkv {
                     let base = head * capacity as usize * d;
@@ -1536,6 +1620,18 @@ mod tests {
                 }
             }
         }
+        let probe = if boundary_probe.is_some() {
+            ensure!(valid_rows == 1, "split probe requires one live query");
+            Some(split_probe(
+                case,
+                &q_roped,
+                &got,
+                (&actual_k, &actual_v),
+                (plan.ws, &stream.clone_dtoh(&scratch)?),
+            )?)
+        } else {
+            None
+        };
         Ok(RunDump {
             gate,
             q: q_roped,
@@ -1543,7 +1639,243 @@ mod tests {
             k_cache: actual_k,
             v_cache: actual_v,
             oracle_mismatches,
+            probe,
         })
+    }
+
+    fn split_probe(
+        case: Case<'_>,
+        query: &[bf16],
+        output: &[bf16],
+        caches: (&[bf16], &[bf16]),
+        partials: (AttentionWorkspace, &[u8]),
+    ) -> Result<serde_json::Value> {
+        let (ws, bytes) = partials;
+        let (hq, hkv, d) = (case.spec.hq as usize, case.spec.hkv as usize, D as usize);
+        let keys = case.prefix as usize + 1;
+        let active = keys.div_ceil(case.key_chunk as usize);
+        let read = |offset: u64, index: usize| -> Result<f64> {
+            let start = offset as usize + index * 4;
+            let value = f32::from_le_bytes(bytes[start..start + 4].try_into()?);
+            ensure!(value.is_finite(), "nonfinite attention partial");
+            Ok(f64::from(value))
+        };
+        let mut oracle = Vec::with_capacity(hq * d);
+        let mut oracle_lse = Vec::with_capacity(hq);
+        let mut lse = Vec::with_capacity(hq);
+        for head in 0..hq {
+            let kv = head / (hq / hkv);
+            let q = &query[head * d..][..d];
+            let scores: Vec<f64> = (0..keys)
+                .map(|pos| {
+                    let base = (kv * case.capacity as usize + pos) * d;
+                    caches.0[base..base + d]
+                        .iter()
+                        .zip(q)
+                        .map(|(k, q)| f64::from(k.to_f32()) * f64::from(q.to_f32()))
+                        .sum::<f64>()
+                        * f64::from(case.spec.scale)
+                })
+                .collect();
+            let maximum = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let probabilities: Vec<f64> = scores.iter().map(|s| (s - maximum).exp()).collect();
+            let denominator = probabilities.iter().sum::<f64>();
+            oracle_lse.push(maximum + denominator.ln());
+            let mut value = vec![0.0; d];
+            for (pos, probability) in probabilities.iter().enumerate() {
+                let base = (kv * case.capacity as usize + pos) * d;
+                for (value, v) in value.iter_mut().zip(&caches.1[base..base + d]) {
+                    *value += probability * f64::from(v.to_f32()) / denominator;
+                }
+            }
+            oracle.extend(value);
+            let indices = (0..active).map(|part| {
+                ((kv * ws.max_parts as usize + part) * (hq / hkv) + head % (hq / hkv))
+                    * ws.segment_rows as usize
+            });
+            let statistics = indices
+                .map(|index| Ok((read(ws.p_max, index)?, read(ws.p_sum, index)?)))
+                .collect::<Result<Vec<_>>>()?;
+            let maximum = statistics
+                .iter()
+                .map(|v| v.0)
+                .fold(f64::NEG_INFINITY, f64::max);
+            lse.push(
+                maximum
+                    + statistics
+                        .iter()
+                        .map(|(m, s)| s * (m - maximum).exp())
+                        .sum::<f64>()
+                        .ln(),
+            );
+        }
+        let output: Vec<f64> = output[..hq * d]
+            .iter()
+            .map(|v| f64::from(v.to_f32()))
+            .collect();
+        let q_bits: Vec<u16> = query[..hq * d].iter().map(|v| v.to_bits()).collect();
+        let mut kv_bits = Vec::with_capacity(hkv * d * 2);
+        for cache in [caches.0, caches.1] {
+            for head in 0..hkv {
+                let start = (head * case.capacity as usize + case.prefix as usize) * d;
+                kv_bits.extend(cache[start..start + d].iter().map(|v| v.to_bits()));
+            }
+        }
+        ensure!(
+            output
+                .iter()
+                .chain(&oracle)
+                .chain(&lse)
+                .chain(&oracle_lse)
+                .all(|x| x.is_finite()),
+            "nonfinite split probe"
+        );
+        let error = |a: &[f64], b: &[f64]| {
+            a.iter()
+                .zip(b)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f64::max)
+        };
+        Ok(serde_json::json!({
+            "hq":hq,"hkv":hkv,"keys":keys,"capacity":case.capacity,
+            "max_rows":case.max_rows,"graph":case.graph,"control":case.boundary_probe,
+            "key_chunk":case.key_chunk,"pmax":ws.max_parts,"active_ctas":active*hkv,
+            "workspace_bytes":ws.bytes,"output":output,"lse":lse,"q_bits":q_bits,"kv_bits":kv_bits,
+            "output_error":error(&output,&oracle),"lse_error":error(&lse,&oracle_lse),
+            "oracle_output":oracle,"oracle_lse":oracle_lse
+        }))
+    }
+
+    #[test]
+    #[ignore = "requires GPU window and FF_Q38_OPREF_DUMP"]
+    fn decode_key_split_gpu() -> Result<()> {
+        let lengths: Vec<u32> = [127, 128, 129, 255, 256, 257, 4096, 16320]
+            .into_iter()
+            .chain(1025..1280)
+            .collect();
+        check_decode_key_split(&lengths, &[(24, 4), (16, 2), (8, 2)])
+    }
+
+    #[test]
+    #[ignore = "requires GPU window and FF_Q38_OPREF_DUMP; boundary/production sanitizer cases"]
+    fn decode_key_split_bounds_gpu() -> Result<()> {
+        check_decode_key_split(&[127, 128, 129, 255, 256, 257, 1025, 16320], &[(16, 2)])
+    }
+
+    fn check_decode_key_split(lengths: &[u32], geometries: &[(u32, u32)]) -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let directory = std::path::PathBuf::from(std::env::var("FF_Q38_OPREF_DUMP")?);
+        std::fs::create_dir_all(&directory)?;
+        let device = Device::new(0)?;
+        let mut records = Vec::new();
+        let mut defects = 0;
+        for &(hq, hkv) in geometries {
+            let spec = FullAttentionSpec {
+                hq,
+                hkv,
+                rotary_dim: if hq == 8 { 256 } else { 64 },
+                ..FullAttentionSpec::q38()
+            };
+            for &keys in lengths {
+                let capacity = (keys + 32).next_multiple_of(32);
+                let base = Case {
+                    spec,
+                    remap: true,
+                    graph: false,
+                    mutant: false,
+                    flash: false,
+                    prefix: keys - 1,
+                    valid_rows: 1,
+                    max_rows: 1,
+                    capacity,
+                    key_chunk: FullAttentionOps::decode_key_chunk(
+                        &device.ctx,
+                        &spec,
+                        capacity,
+                        false,
+                    )?,
+                    axes: None,
+                    oracle: true,
+                    boundary_probe: Some(false),
+                };
+                let expected = run_shape(&device, base)?;
+                defects += expected.oracle_mismatches;
+                records.push(
+                    expected
+                        .probe
+                        .as_ref()
+                        .context("split probe absent")?
+                        .clone(),
+                );
+                for (max_rows, graph) in [(8, false), (1, true), (1, false)] {
+                    let actual = run_shape(
+                        &device,
+                        Case {
+                            max_rows,
+                            graph,
+                            ..base
+                        },
+                    )?;
+                    defects += actual.oracle_mismatches;
+                    for (a, b) in [
+                        (&actual.q, &expected.q),
+                        (&actual.k_cache, &expected.k_cache),
+                        (&actual.v_cache, &expected.v_cache),
+                    ] {
+                        defects += a
+                            .iter()
+                            .zip(b)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                    }
+                    if max_rows == 1 {
+                        defects += actual
+                            .core_out
+                            .iter()
+                            .zip(&expected.core_out)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                    }
+                    records.push(actual.probe.context("split probe absent")?);
+                }
+                if [129, 257, 1025].contains(&keys) {
+                    let control = run_shape(
+                        &device,
+                        Case {
+                            boundary_probe: Some(true),
+                            ..base
+                        },
+                    )?;
+                    defects += control.oracle_mismatches;
+                    defects += usize::from(
+                        control
+                            .core_out
+                            .iter()
+                            .zip(&expected.core_out)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    );
+                    records.push(control.probe.context("control probe absent")?);
+                }
+            }
+        }
+        std::fs::write(
+            directory.join("decode-key-split.json"),
+            serde_json::to_vec(&records)?,
+        )?;
+        println!(
+            "{} decode_key_split cells={} arch={} repeats=3 defects={defects}",
+            if defects == 0 { "PASS" } else { "DEFECT" },
+            records.len(),
+            device.info.arch
+        );
+        ensure!(
+            defects == 0,
+            "DEFECT split attention identity/oracle/control"
+        );
+        Ok(())
     }
 
     fn geometry_mismatches(a: &RunDump, b: &RunDump, valid: u32, capacity: u32) -> Result<usize> {
@@ -1610,6 +1942,7 @@ mod tests {
                 graph: false,
                 mutant: false,
                 flash: false,
+                boundary_probe: None,
                 prefix: 257,
                 valid_rows,
                 max_rows,
@@ -1699,6 +2032,7 @@ mod tests {
                             remap: true,
                             graph,
                             flash,
+                            boundary_probe: None,
                             mutant: false,
                             prefix: 23,
                             valid_rows: valid,
@@ -1739,6 +2073,7 @@ mod tests {
             remap: true,
             graph: false,
             flash: false,
+            boundary_probe: None,
             mutant: false,
             prefix: 23,
             valid_rows: 8,
@@ -1807,6 +2142,7 @@ mod tests {
                 graph: false,
                 mutant: false,
                 flash: false,
+                boundary_probe: None,
                 prefix: 33,
                 valid_rows: 65,
                 max_rows: 65,
