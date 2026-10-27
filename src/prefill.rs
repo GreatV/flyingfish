@@ -408,7 +408,6 @@ pub(crate) struct ExpertSpanLayout {
     pub ids: std::ops::Range<usize>,
     pub weights: std::ops::Range<usize>,
     pub active: std::ops::Range<usize>,
-    pub generation: std::ops::Range<usize>,
     pub bytes: usize,
 }
 
@@ -439,7 +438,7 @@ impl ExpertSpanLayout {
                 && reserves.normalized_row_bytes == hidden
                 && reserves.contribution_row_bytes == hidden * choices
                 && reserves.done_row_bytes == choices * 4
-                && reserves.route_row_bytes == choices * (4 + 2 + 4 + 8),
+                && reserves.route_row_bytes == choices * (4 + 2 + 4),
             "expert span reserves disagree with geometry={geometry:?} rows={rows}"
         );
         let mut bytes = 0usize;
@@ -487,7 +486,6 @@ impl ExpertSpanLayout {
             Ok(first..bytes)
         };
         let active = region(choices * 4)?;
-        let generation = region(choices * 8)?;
         let raw = reserves.span_bytes(rows)?;
         let slot = slot_bytes;
         ensure!(
@@ -504,7 +502,6 @@ impl ExpertSpanLayout {
             ids,
             weights,
             active,
-            generation,
             bytes,
         })
     }
@@ -564,10 +561,9 @@ impl ExpertWorkspaceBudget {
                 .checked_mul(choices)
                 .context("expert contribution row overflow")?,
             done_row_bytes: choices * size_of::<u32>() as u64,
-            // ids i32, weights BF16, active u32, assignment generation u64.
+            // ids i32, weights BF16 and final-active u32.
             route_row_bytes: choices
-                * (size_of::<i32>() + size_of::<half::bf16>() + size_of::<u32>() + size_of::<u64>())
-                    as u64,
+                * (size_of::<i32>() + size_of::<half::bf16>() + size_of::<u32>()) as u64,
             prefill_staging_slots,
             disk_ring_slots,
         };
@@ -584,9 +580,13 @@ impl ExpertWorkspaceBudget {
             .checked_mul(slot_bytes)
             .context("borrowed expert slot extent overflow")?;
         // Decode retains one contribution/done row and two route snapshots.
-        let decode_mailbox_bytes = reserves
-            .route_row_bytes
-            .checked_mul(2)
+        let decode_mailbox_bytes = choices
+            .checked_mul(
+                2 * (size_of::<i32>()
+                    + size_of::<half::bf16>()
+                    + size_of::<u32>()
+                    + size_of::<u64>()) as u64,
+            )
             .and_then(|n| n.checked_add(reserves.contribution_row_bytes))
             .and_then(|n| n.checked_add(reserves.done_row_bytes))
             .context("decode mailbox extent overflow")?;
@@ -850,11 +850,11 @@ mod admission_tests {
         assert_eq!(reserves.normalized_row_bytes, 4096);
         assert_eq!(reserves.contribution_row_bytes, 32768);
         assert_eq!(reserves.done_row_bytes, 32);
-        assert_eq!(reserves.route_row_bytes, 144);
-        assert_eq!(budget.borrowed_slots, 429);
+        assert_eq!(reserves.route_row_bytes, 80);
+        assert_eq!(budget.borrowed_slots, 428);
         let fixed = 8192 + 71 * row_bytes + 71 * 937 + 4096 + 33088;
         assert_eq!(reserves.device_fixed_bytes, fixed as u64);
-        assert_eq!(reserves.span_bytes(request.span_rows)?, 65_536 * 41136);
+        assert_eq!(reserves.span_bytes(request.span_rows)?, 65_536 * 41072);
         for rows in [1, 97, request.span_rows] {
             let layout = ExpertSpanLayout::new(reserves, geometry, slot_bytes, rows)?;
             layout.validate_wave(1, 1)?;
@@ -862,7 +862,7 @@ mod admission_tests {
             if rows >= 12 {
                 assert!(layout.validate_wave(12, 8).is_err());
             }
-            assert_eq!(layout.bytes, rows as usize * 41136);
+            assert_eq!(layout.bytes, rows as usize * 41072);
             let regions = [
                 &layout.residual,
                 &layout.normalized,
@@ -871,7 +871,6 @@ mod admission_tests {
                 &layout.ids,
                 &layout.weights,
                 &layout.active,
-                &layout.generation,
             ];
             assert!(regions.iter().all(|r| r.start % 16 == 0));
             assert!(regions.windows(2).all(|r| r[0].end <= r[1].start));
@@ -879,7 +878,7 @@ mod admission_tests {
                 layout.contributions.len(),
                 layout.rows as usize * 8 * 2048 * 2
             );
-            assert_eq!(layout.generation.end, layout.bytes);
+            assert_eq!(layout.active.end, layout.bytes);
         }
         assert_eq!(
             reserves.persistent_bytes(slot_bytes)?,

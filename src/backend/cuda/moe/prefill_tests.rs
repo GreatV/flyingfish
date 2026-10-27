@@ -35,12 +35,13 @@ fn scratch_sizing_matches_region_math() {
     ] {
         let assignments = rows * top_k;
         let contribute_assignments = contribute_rows * top_k;
-        let regions: [(usize, u64); 13] = [
+        let regions: [(usize, u64); 14] = [
             (experts, 4),
             (1, 4),
             (experts + 1, 4),
             (experts, 4),
             (contribute_assignments, 4),
+            (assignments, 4),
             (assignments * hidden, 2),
             (assignments * 2 * inter, 2),
             (assignments * inter, 2),
@@ -66,19 +67,19 @@ fn scratch_sizing_matches_region_math() {
             "scratch must pad at least one region"
         );
     }
-    // Production MiniCPM prefill scratch: 24,976,384 B at 2144 rows and 25,431,040 B at 16352 rows (vs 33,312,768 B on main).
+    // Production scratch includes 8192 compact-index bytes at 256 active rows.
     assert_eq!(
         prefill_scratch_bytes(256, 2144, 8, 256, 2048, 512, None).unwrap(),
-        24_976_384
+        24_984_576
     );
     assert_eq!(
         prefill_scratch_bytes(256, 16352, 8, 256, 2048, 512, None).unwrap(),
-        25_431_040
+        25_439_232
     );
     assert!(prefill_scratch_bytes(256, 16352, 8, 256, 2048, 512, None).unwrap() <= 33_312_768);
     assert_eq!(
         prefill_scratch_bytes(4096, 4096, 8, 256, 2048, 512, None).unwrap(),
-        398_601_728
+        398_732_800
     );
     assert!(
         prefill_scratch_bytes(4096, 4096, 8, 256, 2048, 512, None).unwrap()
@@ -362,6 +363,63 @@ fn fp8_prefill_gpu() -> Result<()> {
             if bad == 0 { "PASS" } else { "DEFECT" }
         );
         defects += usize::from(bad != 0);
+        if rows == 257 {
+            let reverse_ids = ids
+                .chunks_exact(top_k)
+                .rev()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>();
+            let reverse_weights = weights
+                .chunks_exact(top_k)
+                .rev()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>();
+            let reverse_x = fx.x[..rows * hidden]
+                .chunks_exact(hidden)
+                .rev()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>();
+            let reverse_bufs = case_bufs(
+                s,
+                &fx,
+                rows,
+                &reverse_ids,
+                &vec![1; rows * top_k],
+                &reverse_weights,
+                &vec![1; rows * top_k],
+            )?;
+            raw_htod(s, reverse_bufs.x.device_ptr(s).0, &reverse_x)?;
+            for (format, tables, descriptor) in
+                [("BF16", &bf16_slots, None), ("FP8", &fp8_slots, Some(slot))]
+            {
+                let reversed = CohortBufs {
+                    contributions: s.alloc_zeros(rows * top_k * hidden)?,
+                    done: s.alloc_zeros(rows * top_k)?,
+                };
+                let mut input =
+                    contribute_input(s, &fx, rows, &reverse_bufs, tables, &shared, &reversed)?;
+                input.fp8_slot = descriptor;
+                input.cpu_arithmetic = &cpu_arithmetic;
+                input.mask_from_slots = true;
+                input.assignment_gen = None;
+                ops.prefill_contribute(s, input, &scratch)?;
+                let values = s.clone_dtoh(&reversed.contributions)?;
+                let mismatches = values
+                    .chunks_exact(top_k * hidden)
+                    .zip(expected.chunks_exact(top_k * hidden).rev())
+                    .flat_map(|(a, b)| a.iter().zip(b))
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                println!(
+                    "{} PREFILL_REVERSED_ROWS format={format} rows={rows} arithmetic={arithmetic} bit_mismatches={mismatches}",
+                    if mismatches == 0 { "PASS" } else { "DEFECT" }
+                );
+                defects += usize::from(mismatches != 0);
+            }
+        }
         for control in ["code", "scale"]
             .into_iter()
             .filter(|_| rows == 17 && arithmetic == 1)
@@ -769,6 +827,7 @@ fn contribute_input<'a>(
         fx.dims.inter,
     );
     Ok(MoePrefillContribute {
+        mask_from_slots: false,
         expert_inter: inter as u32,
         cpu_arithmetic: &[false; MAX_EXPERTS][..experts],
         fp8_slot: None,
@@ -783,7 +842,7 @@ fn contribute_input<'a>(
         slots_down: testing::view(&slots.dn_dev, s, [experts as u32], [1])?,
         slot_valid: testing::view(&slots.valid, s, [experts as u32], [1])?,
         slot_generation: testing::view(&slots.generation, s, [experts as u32], [1])?,
-        assignment_gen: testing::dense(&bufs.gens, s, rows as u32, top_k as u32)?,
+        assignment_gen: Some(testing::dense(&bufs.gens, s, rows as u32, top_k as u32)?),
         slots_gate_up_host: &slots.gu_host,
         slots_down_host: &slots.dn_host,
         shared_gate: testing::dense(&shared.sg, s, inter as u32, hidden as u32)?,
@@ -1110,7 +1169,11 @@ fn moe_prefill_gpu() -> Result<()> {
         "GPU window not acknowledged"
     );
     match std::env::var("FF_MOE_CHILD").as_deref() {
-        Ok("stale") => return stale_generation_child(),
+        Ok(
+            mode @ ("stale" | "slot-generation" | "slot-valid" | "wave-count" | "compact-capacity"),
+        ) => {
+            return prefill_guard_child(mode);
+        }
         Ok("dup") => return duplicate_ids_child(),
         Ok("oobpos") => return pos_of_oob_child(),
         Ok("k5c") => return k5c_seam_child(),
@@ -1717,16 +1780,16 @@ fn moe_prefill_gpu() -> Result<()> {
         let scatter = module.load_function("moe_scatter")?;
         let (contributions_ptr, _gc) = cohort.contributions.device_ptr(s);
         let (weights_ptr, _gw) = bufs.weights.device_ptr(s);
-        let (active_ptr, _ga) = bufs.active.device_ptr(s);
         unsafe {
             s.launch_builder(&scatter)
                 .arg(&(scratch.ptr + layout.y_perm))
                 .arg(&weights_ptr)
                 .arg(&(scratch.ptr + layout.pos_of))
-                .arg(&active_ptr)
+                .arg(&(scratch.ptr + layout.compact_active))
                 .arg(&contributions_ptr)
                 .arg(&((rows * top_k) as i64))
                 .arg(&(hidden as i64))
+                .arg(&((rows * top_k) as i32))
                 .launch(grid(rows * top_k, 256))?;
         }
         s.synchronize()?;
@@ -1962,11 +2025,8 @@ fn child_setup(s: &Arc<CudaStream>, fx: &MoeFixture, generation: Vec<u64>) -> Re
     })
 }
 
-/// A small fixture whose replaced slot (generation 2) mismatches assignment
-/// 0's routing-time snapshot (generation 1); the permute guard must trap.
-/// Exits 3 only on the trap's launch failure; every other outcome fails the
-/// test (harness exit 101).
-fn stale_generation_child() -> Result<()> {
+/// Invalid slot snapshots, validity and packed capacities trap before expert output writes.
+fn prefill_guard_child(mode: &str) -> Result<()> {
     let d = crate::backend::cuda::Device::new(0)?;
     let s = &d.stream;
     let ops = PrefillOps::new(&d.ctx, s, crate::model_spec::ExpertFormat::Bf16)?;
@@ -1975,30 +2035,40 @@ fn stale_generation_child() -> Result<()> {
     let rows = fx.dims.rows;
     let (ids, weights) = planted_uniform(rows, experts, top_k);
     let mut table_gen = vec![1u64; experts];
-    table_gen[ids[0] as usize] = 2;
-    let mut snapshot = vec![1u64; rows * top_k];
-    for r in 0..rows {
-        for c in 0..top_k {
-            snapshot[r * top_k + c] = table_gen[ids[r * top_k + c] as usize];
-        }
-    }
+    table_gen[ids[0] as usize] = if mode == "slot-generation" { 0 } else { 2 };
+    let mut snapshot: Vec<u64> = ids.iter().map(|&e| table_gen[e as usize]).collect();
     snapshot[0] = 1;
     let setup = child_setup(s, &fx, table_gen)?;
+    if mode == "slot-valid" {
+        let mut valid = vec![1u32; experts];
+        valid[ids[0] as usize] = 2;
+        raw_htod(s, setup.slots.valid.device_ptr(s).0, &valid)?;
+    }
     let active = all_active(rows, top_k);
     let case_bufs = case_bufs(s, &fx, rows, &ids, &active, &weights, &snapshot)?;
-    let y: CudaSlice<bf16> = s.alloc_zeros(rows * hidden)?;
-    let y_view = testing::dense_mut(&y, s, rows as u32, hidden as u32)?;
-    let input = moe_input(
+    let cohort = CohortBufs {
+        contributions: s.alloc_zeros(rows * top_k * hidden)?,
+        done: s.alloc_zeros(rows * top_k)?,
+    };
+    let mut input = contribute_input(
         s,
         &fx,
         rows,
         &case_bufs,
         &setup.slots,
         &setup.shared,
-        y_view,
+        &cohort,
     )?;
-    match ops.prefill(s, input, &setup.scratch) {
-        Ok(_event) => anyhow::bail!("stale generation did not trap"),
+    if mode != "stale" {
+        input.mask_from_slots = true;
+        input.assignment_gen = None;
+    }
+    if matches!(mode, "wave-count" | "compact-capacity") {
+        let missing = if mode == "wave-count" { 1 } else { top_k };
+        input.wave = Some((0, 0, (rows * top_k - missing) as u32));
+    }
+    match ops.prefill_contribute(s, input, &setup.scratch) {
+        Ok(()) => anyhow::bail!("prefill guard {mode} did not trap"),
         Err(err) if trap_launched(&err) => std::process::exit(3),
         Err(err) => anyhow::bail!("prefill failed without the trap: {err:#}"),
     }
@@ -2074,16 +2144,16 @@ fn pos_of_oob_child() -> Result<()> {
     let scatter = module.load_function("moe_scatter")?;
     let (contributions_ptr, _gc) = cohort.contributions.device_ptr(s);
     let (weights_ptr, _gw) = bufs.weights.device_ptr(s);
-    let (active_ptr, _ga) = bufs.active.device_ptr(s);
     let launched = unsafe {
         s.launch_builder(&scatter)
             .arg(&(setup.scratch.ptr + layout.y_perm))
             .arg(&weights_ptr)
             .arg(&(setup.scratch.ptr + layout.pos_of))
-            .arg(&active_ptr)
+            .arg(&(setup.scratch.ptr + layout.compact_active))
             .arg(&contributions_ptr)
             .arg(&((rows * top_k) as i64))
             .arg(&(hidden as i64))
+            .arg(&((rows * top_k) as i32))
             .launch(grid(rows * top_k, 256))
     };
     let outcome = launched
@@ -2109,21 +2179,24 @@ fn prefill_stale_generation_gpu() -> Result<()> {
         std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
         "GPU window not acknowledged"
     );
-    let status = std::process::Command::new(std::env::current_exe()?)
-        .args([
-            "moe_prefill_gpu",
-            "--ignored",
-            "--test-threads=1",
-            "--nocapture",
-        ])
-        .env("FF_Q38_GPU_WINDOW", "granted")
-        .env("FF_MOE_CHILD", "stale")
-        .status()?;
-    anyhow::ensure!(
-        status.code() == Some(3),
-        "stale-generation child exit {:?} != 3 (the permute trap was not proven)",
-        status.code()
-    );
+    for mode in ["stale", "slot-generation", "slot-valid"] {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "moe_prefill_gpu",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env("FF_Q38_GPU_WINDOW", "granted")
+            .env("FF_MOE_CHILD", mode)
+            .status()?;
+        anyhow::ensure!(
+            status.code() == Some(3),
+            "slot guard {mode} child exit {:?} != 3 (trap not proven)",
+            status.code()
+        );
+        println!("PASS prefill_slot_guard mode={mode} child_exit=3");
+    }
     Ok(())
 }
 
@@ -2182,7 +2255,227 @@ fn prefill_pos_of_bounds_gpu() -> Result<()> {
 #[test]
 fn stage_accounting_is_pinned() {
     assert_eq!(super::prefill::stage_host_pinned_bytes(), 74_084);
-    assert_eq!(super::prefill::stage_device_bytes(), 65_632);
+    assert_eq!(super::prefill::stage_device_bytes(), 69_736);
+}
+
+fn check_compact_dispatch(
+    d: &crate::backend::cuda::Device,
+    rows: usize,
+    hidden: usize,
+    live: usize,
+    from_slots: bool,
+) -> Result<()> {
+    let s = &d.stream;
+    let (experts, top_k) = (256usize, 8usize);
+    let assignments = rows * top_k;
+    let mut ids: Vec<i32> = (0..assignments)
+        .map(|a| ((a / top_k * 13 + a % top_k * 17) % 255 + 1) as i32)
+        .collect();
+    let mut active = vec![0u32; assignments];
+    if live == assignments {
+        active.fill(1);
+    } else {
+        for i in 0..live {
+            let a = (i * 37 % rows) * top_k + i % top_k;
+            active[a] = 1;
+            ids[a] = 0;
+        }
+    }
+    let expected_indices: Vec<i32> = active
+        .iter()
+        .enumerate()
+        .filter_map(|(a, &v)| (v != 0).then_some(a as i32))
+        .collect();
+    anyhow::ensure!(
+        expected_indices.len() == live,
+        "compact fixture cardinality"
+    );
+    let mut want_counts = vec![0i32; experts];
+    for &a in &expected_indices {
+        want_counts[ids[a as usize] as usize] += 1;
+    }
+    let mut want_offsets = vec![0i32; experts + 1];
+    for e in 0..experts {
+        want_offsets[e + 1] = want_offsets[e] + want_counts[e];
+    }
+    let values: Vec<bf16> = (0..rows * hidden)
+        .map(|i| bf16::from_f32(((i / hidden * 37 + i % hidden * 11) % 127) as f32 / 64.0 - 1.0))
+        .collect();
+    let weights: Vec<bf16> = (0..assignments)
+        .map(|a| bf16::from_f32((a % 29 + 1) as f32 / 32.0))
+        .collect();
+    let mut valid = vec![1u32; experts];
+    if from_slots && live != assignments {
+        valid.fill(0);
+        valid[0] = u32::from(live > 0);
+    }
+    let ids_d = s.clone_htod(&ids)?;
+    let active_d = s.clone_htod(&active)?;
+    let valid_d = s.clone_htod(&valid)?;
+    let generation = s.clone_htod(&vec![3u64; experts])?;
+    let assignment_gen = s.clone_htod(&vec![if from_slots { 0u64 } else { 3u64 }; assignments])?;
+    let weights_d = s.clone_htod(&weights)?;
+    let x = s.clone_htod(&values)?;
+    let state = s.alloc_zeros::<u32>(MAX_EXPERTS + 2)?;
+    let counts = s.alloc_zeros::<i32>(experts)?;
+    let offsets = s.alloc_zeros::<i32>(experts + 1)?;
+    let cursor = s.alloc_zeros::<i32>(experts)?;
+    let total = s.alloc_zeros::<i32>(1)?;
+    let compact = s.alloc_zeros::<i32>(live.max(1))?;
+    let done = s.alloc_zeros::<u32>(assignments)?;
+    let pos_of = s.alloc_zeros::<i32>(assignments)?;
+    let permuted = s.alloc_zeros::<bf16>(live.max(1) * hidden)?;
+    let sentinel = bf16::from_f32(-4.0);
+    let contributions = s.clone_htod(&vec![sentinel; assignments * hidden])?;
+    let module = cubin::module(&d.ctx, "moe_prefill")?;
+    let count = module.load_function("moe_count_scan")?;
+    let permute = module.load_function("moe_permute")?;
+    let scatter = module.load_function("moe_scatter")?;
+    let sms = d.ctx.attribute(
+        cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+    )? as usize;
+    let limit = sms * count.occupancy_max_active_blocks_per_multiprocessor(256, 0, None)? as usize;
+    anyhow::ensure!(limit > 0, "compact count occupancy");
+    let blocks = assignments.div_ceil(2048).max(1).min(limit);
+    let copy_out = || -> Result<Vec<u16>> {
+        if live > 0 {
+            unsafe {
+                s.launch_builder(&scatter)
+                    .arg(&permuted.device_ptr(s).0)
+                    .arg(&weights_d.device_ptr(s).0)
+                    .arg(&pos_of.device_ptr(s).0)
+                    .arg(&compact.device_ptr(s).0)
+                    .arg(&contributions.device_ptr(s).0)
+                    .arg(&(assignments as i64))
+                    .arg(&(hidden as i64))
+                    .arg(&(live as i32))
+                    .launch(grid(live, 256))?;
+            }
+        }
+        Ok(s.clone_dtoh(&contributions)?
+            .iter()
+            .map(|v| v.to_bits())
+            .collect())
+    };
+    let mut first = None;
+    for repeat in 0..3 {
+        raw_htod(s, done.device_ptr(s).0, &vec![0u32; assignments])?;
+        raw_htod(
+            s,
+            contributions.device_ptr(s).0,
+            &vec![sentinel; assignments * hidden],
+        )?;
+        let exact = if repeat == 2 { -1i32 } else { live as i32 };
+        unsafe {
+            s.launch_builder(&count)
+                .arg(&ids_d.device_ptr(s).0)
+                .arg(&active_d.device_ptr(s).0)
+                .arg(&valid_d.device_ptr(s).0)
+                .arg(&generation.device_ptr(s).0)
+                .arg(&assignment_gen.device_ptr(s).0)
+                .arg(&done.device_ptr(s).0)
+                .arg(&state.device_ptr(s).0)
+                .arg(&compact.device_ptr(s).0)
+                .arg(&counts.device_ptr(s).0)
+                .arg(&total.device_ptr(s).0)
+                .arg(&offsets.device_ptr(s).0)
+                .arg(&cursor.device_ptr(s).0)
+                .arg(&(assignments as i64))
+                .arg(&(experts as i32))
+                .arg(&(top_k as i32))
+                .arg(&(live as i32))
+                .arg(&exact)
+                .arg(&i32::from(from_slots))
+                .launch(grid(blocks, 256))?;
+        }
+        anyhow::ensure!(
+            s.clone_dtoh(&counts)? == want_counts,
+            "compact counts repeat={repeat}"
+        );
+        anyhow::ensure!(
+            s.clone_dtoh(&offsets)? == want_offsets,
+            "compact offsets repeat={repeat}"
+        );
+        anyhow::ensure!(
+            s.clone_dtoh(&total)? == [live as i32],
+            "compact active total"
+        );
+        anyhow::ensure!(
+            s.clone_dtoh(&state)?.iter().all(|&v| v == 0),
+            "compact retirement state reset"
+        );
+        let mut indices = s.clone_dtoh(&compact)?;
+        indices.truncate(live);
+        let mut sorted = indices.clone();
+        sorted.sort_unstable();
+        anyhow::ensure!(sorted == expected_indices, "compact membership/bijection");
+        if repeat == 1 && live > 0 {
+            indices.reverse();
+            raw_htod(s, compact.device_ptr(s).0, &indices)?;
+        }
+        unsafe {
+            s.launch_builder(&permute)
+                .arg(&ids_d.device_ptr(s).0)
+                .arg(&x.device_ptr(s).0)
+                .arg(&offsets.device_ptr(s).0)
+                .arg(&cursor.device_ptr(s).0)
+                .arg(&valid_d.device_ptr(s).0)
+                .arg(&generation.device_ptr(s).0)
+                .arg(&assignment_gen.device_ptr(s).0)
+                .arg(&compact.device_ptr(s).0)
+                .arg(&total.device_ptr(s).0)
+                .arg(&done.device_ptr(s).0)
+                .arg(&pos_of.device_ptr(s).0)
+                .arg(&permuted.device_ptr(s).0)
+                .arg(&(rows as i32))
+                .arg(&(top_k as i32))
+                .arg(&(experts as i32))
+                .arg(&(hidden as i64))
+                .arg(&i32::from(from_slots))
+                .launch(grid(if exact < 0 { assignments } else { live.max(1) }, 256))?;
+        }
+        let got = copy_out()?;
+        anyhow::ensure!(s.clone_dtoh(&done)? == active, "compact done mask");
+        for (a, &is_active) in active.iter().enumerate() {
+            for c in 0..hidden {
+                let expected = if is_active != 0 {
+                    bf16::from_f32(values[a / top_k * hidden + c].to_f32() * weights[a].to_f32())
+                } else {
+                    sentinel
+                };
+                anyhow::ensure!(
+                    got[a * hidden + c] == expected.to_bits(),
+                    "compact scatter a={a} c={c} repeat={repeat}"
+                );
+            }
+        }
+        if let Some(ref previous) = first {
+            anyhow::ensure!(&got == previous, "compact three-run output identity");
+        } else {
+            first = Some(got);
+        }
+    }
+    if live == 3 && !from_slots && rows == 16320 {
+        let inactive = active.iter().position(|&v| v == 0).unwrap();
+        raw_htod(s, compact.device_ptr(s).0, &[inactive as i32])?;
+        raw_htod(
+            s,
+            contributions.device_ptr(s).0,
+            &vec![sentinel; assignments * hidden],
+        )?;
+        let corrupted = copy_out()?;
+        let changed = corrupted
+            .iter()
+            .zip(first.as_ref().unwrap())
+            .filter(|(a, b)| a != b)
+            .count();
+        anyhow::ensure!(changed > 0, "compact-index corruption was not detected");
+        println!("PASS compact_index_control rows={rows} output_mismatches={changed}");
+    }
+    println!(
+        "PASS compact_dispatch rows={rows} hidden={hidden} assignments={assignments} active={live} from_slots={from_slots} count_ctas={blocks} repeats=3 counts_offsets_bits=0 output_bits=0"
+    );
+    Ok(())
 }
 
 /// Small frozen case for the prefill racecheck: rows=64, E=16, K=4, H=128,
@@ -2192,6 +2485,17 @@ fn stage_accounting_is_pinned() {
 #[ignore = "requires GPU window, FF_Q38_GPU_WINDOW=granted"]
 fn prefill_racecheck_small_gpu() -> Result<()> {
     let d = crate::backend::cuda::Device::new(0)?;
+    for (rows, hidden, active) in [
+        (1, 128, 0),
+        (257, 2048, 2056),
+        (16320, 128, 3),
+        (16320, 128, 400),
+        (19, 260, 3),
+    ] {
+        for from_slots in [false, true] {
+            check_compact_dispatch(&d, rows, hidden, active, from_slots)?;
+        }
+    }
     let s = &d.stream;
     let fx = reference::fixture(MoeDims::new(64, 16, 4, 128, 64), 0);
     let (experts, top_k, hidden, inter) = (
@@ -2739,6 +3043,23 @@ fn prefill_stage_backtoback_gpu() -> Result<()> {
 #[test]
 #[ignore = "requires GPU window, FF_Q38_GPU_WINDOW=granted"]
 fn prefill_packed_waves_gpu() -> Result<()> {
+    for mode in ["wave-count", "compact-capacity"] {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "moe_prefill_gpu",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env("FF_Q38_GPU_WINDOW", "granted")
+            .env("FF_MOE_CHILD", mode)
+            .status()?;
+        anyhow::ensure!(
+            status.code() == Some(3),
+            "packed guard {mode} exit={status}"
+        );
+        println!("PASS prefill_packed_wave_count_control mode={mode} child_exit=3");
+    }
     for wave_rows in [256, 2048] {
         prefill_packed_waves(wave_rows, false)?;
     }
@@ -3085,6 +3406,7 @@ fn prefill_packed_waves(wave_rows: usize, grouped: bool) -> Result<()> {
                 run_ops.prefill_contribute(
                     s,
                     MoePrefillContribute {
+                        mask_from_slots: false,
                         expert_inter: inter as u32,
                         cpu_arithmetic: &cpu_arithmetic,
                         fp8_slot: run_fp8_slot,
@@ -3119,13 +3441,13 @@ fn prefill_packed_waves(wave_rows: usize, grouped: bool) -> Result<()> {
                             [w_rows, top_k as u32],
                             [top_k as u64, 1],
                         )?,
-                        assignment_gen: view(
+                        assignment_gen: Some(view(
                             &gens_dev,
                             s,
                             b * top_k,
                             [w_rows, top_k as u32],
                             [top_k as u64, 1],
-                        )?,
+                        )?),
                         slots_gate_up: view(
                             &run_slots.gu_dev,
                             s,
@@ -3307,91 +3629,6 @@ fn prefill_packed_waves(wave_rows: usize, grouped: bool) -> Result<()> {
         );
     }
 
-    // The underdeclared host count is rejected before either routed GEMM.
-    let &(base, w_rows, active) = &plan.cohort_waves(0)?[0];
-    let bad_c: CudaSlice<bf16> = s.alloc_zeros(w_rows as usize * top_k * hidden)?;
-    let bad_d: CudaSlice<u32> = s.alloc_zeros(w_rows as usize * top_k)?;
-    let mismatch = fp8_ops.prefill_contribute(
-        s,
-        MoePrefillContribute {
-            expert_inter: inter as u32,
-            cpu_arithmetic: &cpu_arithmetic,
-            fp8_slot: Some(fp8_slot),
-            wave: Some((0, base, active - 1)),
-            wait_copy: None,
-            reader_event: None,
-            x: view(
-                &x_dev,
-                s,
-                base as usize * hidden,
-                [w_rows, hidden as u32],
-                [hidden as u64, 1],
-            )?,
-            ids: view(
-                &ids_dev,
-                s,
-                base as usize * top_k,
-                [w_rows, top_k as u32],
-                [top_k as u64, 1],
-            )?,
-            weights: view(
-                &weights_dev,
-                s,
-                base as usize * top_k,
-                [w_rows, top_k as u32],
-                [top_k as u64, 1],
-            )?,
-            active: view(
-                &cohort_masks[0],
-                s,
-                base as usize * top_k,
-                [w_rows, top_k as u32],
-                [top_k as u64, 1],
-            )?,
-            assignment_gen: view(
-                &gens_dev,
-                s,
-                base as usize * top_k,
-                [w_rows, top_k as u32],
-                [top_k as u64, 1],
-            )?,
-            slots_gate_up: view(&fp8_slots.gu_dev, s, 0, [experts as u32], [1])?,
-            slots_down: view(&fp8_slots.dn_dev, s, 0, [experts as u32], [1])?,
-            slot_valid: view(&fp8_slots.valid, s, 0, [experts as u32], [1])?,
-            slot_generation: view(&fp8_slots.generation, s, 0, [experts as u32], [1])?,
-            slots_gate_up_host: &fp8_slots.gu_host[..experts],
-            slots_down_host: &fp8_slots.dn_host[..experts],
-            shared_gate: testing::dense(&shared.sg, s, inter as u32, hidden as u32)?,
-            shared_up: testing::dense(&shared.su, s, inter as u32, hidden as u32)?,
-            shared_down: testing::dense(&shared.sd, s, hidden as u32, inter as u32)?,
-            shared_expert_gate: Some(testing::view(&shared.seg, s, [hidden as u32], [1])?),
-            contributions: view(
-                &bad_c,
-                s,
-                0,
-                [w_rows, top_k as u32, hidden as u32],
-                [(top_k * hidden) as u64, hidden as u64, 1],
-            )?,
-            done: TensorMut(view(
-                &bad_d,
-                s,
-                0,
-                [w_rows, top_k as u32],
-                [top_k as u64, 1],
-            )?),
-        },
-        &scratch,
-    );
-    let error = mismatch.expect_err("mismatched wave active count control was not detected");
-    anyhow::ensure!(
-        error
-            .to_string()
-            .contains("moe prefill wave count mismatch"),
-        "unexpected control error: {error:#}"
-    );
-    println!(
-        "PASS prefill_packed_wave_count_control wave_rows={wave_rows} span_rows={rows} contributions=[{rows},{top_k},{hidden}] error={error:#}"
-    );
     Ok(())
 }
 

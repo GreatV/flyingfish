@@ -49,7 +49,7 @@ fn resident_routed_wave_preserves_slots_and_shared_rows() -> Result<()> {
         layout,
         span_rows: 16640,
         wave_rows: 16,
-        device_expert_bytes: resident_bytes + 197_676_800,
+        device_expert_bytes: resident_bytes + 197_741_824,
         peer_expert_bytes: 0,
         gpu0_layers: 40,
         host_expert_bytes: 1 << 30,
@@ -65,7 +65,7 @@ fn resident_routed_wave_preserves_slots_and_shared_rows() -> Result<()> {
     for (span_rows, workspace_rows) in [(4352, 4096), (16640, 16384)] {
         capacity.span_rows = span_rows;
         let (rows, extra) = routed_wave_rows(geometry, &capacity, workspace_rows, shared)?;
-        assert_eq!((rows, extra), (2048, 197_676_800));
+        assert_eq!((rows, extra), (2048, 197_741_824));
         assert_eq!(capacity.device_expert_bytes - extra, resident_bytes);
         assert_eq!(capacity.wave_rows, 16);
         assert_eq!(capacity.slots_per_layer, vec![256; 40]);
@@ -86,14 +86,14 @@ fn resident_routed_wave_preserves_slots_and_shared_rows() -> Result<()> {
             )
         };
         let extra = mixed_scratch(2048)? - mixed_scratch(16)?;
-        assert_ne!(extra, 197_676_800);
+        assert_ne!(extra, 197_741_824);
         capacity.device_expert_bytes = resident_bytes + extra;
         assert_eq!(
             routed_wave_rows(geometry, &capacity, 16384, (1024, boundary))?,
             (2048, extra),
         );
     }
-    capacity.device_expert_bytes = resident_bytes + 197_676_800;
+    capacity.device_expert_bytes = resident_bytes + 197_741_824;
     capacity.device_expert_bytes -= 1;
     let (rows, extra) = routed_wave_rows(geometry, &capacity, 16384, shared)?;
     assert_eq!(rows, 2047);
@@ -1169,7 +1169,7 @@ impl Engine {
                 normalized_row_bytes: u64::from(geometry.hidden) * 2,
                 contribution_row_bytes: u64::from(geometry.top_k) * u64::from(geometry.hidden) * 2,
                 done_row_bytes: u64::from(geometry.top_k) * 4,
-                route_row_bytes: u64::from(geometry.top_k) * 18,
+                route_row_bytes: u64::from(geometry.top_k) * 10,
                 prefill_staging_slots: capacity.prefill_staging_slots,
                 disk_ring_slots: 0,
             };
