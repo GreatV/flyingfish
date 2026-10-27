@@ -4667,6 +4667,148 @@ fn run_decode_combine_case(
 }
 
 #[test]
+#[ignore = "requires CUDA, published MiniCPM, pinned runtime, reference fixtures and FF_Q38_PROBE_DIR"]
+fn minicpm_decode_key_split_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    let model = PathBuf::from(std::env::var("FF_MODEL")?);
+    let fixtures = PathBuf::from(std::env::var("FF_MINICPM_REFERENCE_DIR")?);
+    let output = PathBuf::from(std::env::var("FF_Q38_PROBE_DIR")?);
+    std::fs::create_dir_all(&output)?;
+    let settings = Settings {
+        runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
+        prefix_cache: false,
+        draft_model: None,
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: true,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    let mut records = Vec::new();
+    let mut defects = 0;
+    for case in ["text_1k", "text_4k", "text_16k"] {
+        let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
+        let tensors = SafeTensors::deserialize(&bytes)?;
+        let ids = integers(&tensors, "input_ids")?;
+        let capacity = (ids.len() + 288).next_multiple_of(32);
+        let mut engine = Engine::load(&model, 0, capacity, None, settings.clone())?;
+        engine.check_ready()?;
+        engine.reset()?;
+        let prefill_range =
+            super::super::super::profile::Range::new(true, c"attention_split_prefill");
+        engine.prefill(&ids, None)?;
+        engine.synchronize()?;
+        drop(prefill_range);
+        let prefill_logits = engine.decode_logits()?;
+        let oracle_error = if tensors.names().contains(&"prefill_last_logits_bf16") {
+            let reference = floats(&tensors, "prefill_last_logits_bf16")?;
+            ensure!(
+                reference.len() == prefill_logits.len(),
+                "reference logit extent"
+            );
+            Some(
+                reference
+                    .iter()
+                    .zip(&prefill_logits)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max),
+            )
+        } else {
+            ensure!(case == "text_16k", "required reference logits missing");
+            None
+        };
+        let forced = if tensors.names().contains(&"greedy_token_ids") {
+            integers(&tensors, "greedy_token_ids")?[..8].to_vec()
+        } else {
+            ids[..8].to_vec()
+        };
+        let mut expected = Vec::<Vec<f32>>::new();
+        let mut expected_state = None;
+        for (run, graph) in [false, true, false].into_iter().enumerate() {
+            engine.reset()?;
+            engine.prefill(&ids[..ids.len() - 1], None)?;
+            engine.set_token(*ids.last().context("empty split fixture")?)?;
+            let mut margins = Vec::new();
+            let mut predictions = Vec::new();
+            let mut shape_variation = 0.0f32;
+            for step in 0..9 {
+                let range =
+                    super::super::super::profile::Range::new(!graph, c"attention_split_decode");
+                let prediction = engine.decode(graph, None)?;
+                engine.synchronize()?;
+                drop(range);
+                let logits = engine.decode_logits()?;
+                ensure!(
+                    logits.iter().all(|x| x.is_finite()),
+                    "nonfinite split logits"
+                );
+                if step == 0 {
+                    shape_variation = logits
+                        .iter()
+                        .zip(&prefill_logits)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f32, f32::max);
+                }
+                let mut top = [f32::NEG_INFINITY; 2];
+                for &v in &logits {
+                    if v > top[0] {
+                        top[1] = top[0];
+                        top[0] = v;
+                    } else if v > top[1] {
+                        top[1] = v;
+                    }
+                }
+                margins.push(top[0] - top[1]);
+                predictions.push(prediction);
+                if run == 0 {
+                    std::fs::write(
+                        output.join(format!("{case}-{step}.logits")),
+                        logits
+                            .iter()
+                            .flat_map(|v| v.to_le_bytes())
+                            .collect::<Vec<_>>(),
+                    )?;
+                    expected.push(logits);
+                } else {
+                    defects += logits
+                        .iter()
+                        .zip(&expected[step])
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                }
+                if let Some(&token) = forced.get(step) {
+                    engine.set_token(token)?;
+                }
+            }
+            let state = super::tests::graph_state(&engine)?;
+            if let Some(previous) = expected_state.as_ref() {
+                defects += usize::from(&state != previous);
+            } else {
+                expected_state = Some(state);
+            }
+            records.push(
+                serde_json::json!({"case":case,"run":run,"graph":graph,"capacity":capacity,
+                "rows":ids.len(),"oracle_error":oracle_error,"shape_variation":shape_variation,
+                "predictions":predictions,"margins":margins,"forced":forced,"cumulative_defects":defects}),
+            );
+        }
+    }
+    std::fs::write(
+        output.join("decode-key-split-model.json"),
+        serde_json::to_vec_pretty(&records)?,
+    )?;
+    println!(
+        "{} minicpm_decode_key_split cells={} repeats=3 defects={defects}",
+        if defects == 0 { "PASS" } else { "DEFECT" },
+        records.len()
+    );
+    ensure!(defects == 0, "DEFECT split decode graph/repeat identity");
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires CUDA, published MiniCPM FF_MODEL, FF_MINICPM_REFERENCE_DIR and FLYINGFISH_RUNTIME_DIR"]
 fn minicpm_prefill_combine_bit_identity_gpu() -> Result<()> {
     ensure!(

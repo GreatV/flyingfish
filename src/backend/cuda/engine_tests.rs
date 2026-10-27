@@ -1779,7 +1779,7 @@ fn q38_engine_capture_gpu() -> Result<()> {
     };
     // Calibration/setup returns Frozen before production graph capture for a fixed plan.
     let image_fixture = std::env::var_os("FF_Q38_IMAGE_CAPTURE_FIXTURE");
-    let capacity = if image_fixture.is_some() { 128 } else { 32 };
+    let capacity = if image_fixture.is_some() { 128 } else { 1312 };
     let chunk = if image_fixture.is_some() { 9 } else { 8 };
     let mut engine = Engine::load_kind(&dir, 0, capacity, Some(chunk), settings, true)?;
     ensure!(engine.qwen.is_some(), "G7 fixture requires Q38");
@@ -1839,7 +1839,7 @@ fn q38_engine_capture_gpu() -> Result<()> {
         );
         ids
     } else {
-        vec![1, 2, 3, 4, 5]
+        (0..257).map(|i| 1 + i % 31).collect()
     };
     for part in ids.chunks(chunk) {
         engine.prepare(part.len())?;
