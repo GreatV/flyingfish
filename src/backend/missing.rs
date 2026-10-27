@@ -89,6 +89,9 @@ impl Backend {
         _chunk: Option<usize>,
         _settings: Settings,
     ) -> Result<Self> {
+        #[cfg(feature = "rocm")]
+        bail!("ROCm backend builds HIP kernels only; the HIP host runtime is not implemented");
+        #[cfg(not(feature = "rocm"))]
         bail!(
             "no inference backend available: CUDA backend is missing; rebuild with --features cuda"
         )

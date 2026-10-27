@@ -19,8 +19,7 @@
 //     valid_rows in [1,64], budget in [1,64], valid_rows <= budget,
 //     *prefix in [0, capacity-budget], *prefix == *expected, depth[row] in
 //     [0,7] for valid rows, gridDim.x >= valid_rows.
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
+#include "gpu_compat.cuh"
 #include <stdint.h>
 
 namespace embed_norm {
@@ -40,7 +39,7 @@ __device__ __forceinline__ void shape(int rows, int hidden, float eps, unsigned 
 
 __device__ __forceinline__ float warp_reduce_sum(float v) {
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(FF_WARP_MASK, v, o);
     return v;
 }
 

@@ -1,6 +1,5 @@
 #pragma once
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
+#include "gpu_compat.cuh"
 #include <math.h>
 #include <stdint.h>
 struct Q38SequenceFields {

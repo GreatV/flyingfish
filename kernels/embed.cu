@@ -1,4 +1,4 @@
-#include <cuda_bf16.h>
+#include "gpu_compat.cuh"
 #include <stdint.h>
 
 extern "C" __global__ void embed(const __nv_bfloat16* w, const uint32_t* ids,

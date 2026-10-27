@@ -1,4 +1,4 @@
-#include <cuda_bf16.h>
+#include "gpu_compat.cuh"
 
 extern "C" __global__ void silu_mul(const __nv_bfloat16* gu, __nv_bfloat16* y,
                                    int rows, int dim, int rounding_once) {

@@ -6,7 +6,7 @@
 // loads otherwise, same semantics.
 //
 // advance: thread 0 increments the device position scalar.
-#include <cuda_bf16.h>
+#include "gpu_compat.cuh"
 #include <stdint.h>
 
 extern "C" __global__ void argmax(const __nv_bfloat16* logits, uint32_t* token, int vocab) {
@@ -38,8 +38,8 @@ extern "C" __global__ void argmax(const __nv_bfloat16* logits, uint32_t* token, 
     }
     // warp reduce with the same comparator
     for (int off = 16; off > 0; off >>= 1) {
-        const float ob    = __shfl_down_sync(0xffffffffu, best, off);
-        const uint32_t oi = __shfl_down_sync(0xffffffffu, id, off);
+        const float ob    = __shfl_down_sync(FF_WARP_MASK, best, off);
+        const uint32_t oi = __shfl_down_sync(FF_WARP_MASK, id, off);
         if (ob > best || (ob == best && oi < id)) { best = ob; id = oi; }
     }
     __shared__ float wv[32];
@@ -56,8 +56,8 @@ extern "C" __global__ void argmax(const __nv_bfloat16* logits, uint32_t* token, 
             if (v > best || (v == best && j < id)) { best = v; id = j; }
         }
         for (int off = 16; off > 0; off >>= 1) {
-            const float ob    = __shfl_down_sync(0xffffffffu, best, off);
-            const uint32_t oi = __shfl_down_sync(0xffffffffu, id, off);
+            const float ob    = __shfl_down_sync(FF_WARP_MASK, best, off);
+            const uint32_t oi = __shfl_down_sync(FF_WARP_MASK, id, off);
             if (ob > best || (ob == best && oi < id)) { best = ob; id = oi; }
         }
         if (lane == 0) *token = id;
@@ -77,7 +77,7 @@ extern "C" __global__ void lm_head_f32(const __nv_bfloat16* __restrict__ x,
     part = fmaf(__bfloat162float(xr[c]), __bfloat162float(wr[c]), part);
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1)
-    part += __shfl_down_sync(0xffffffffu, part, off);
+    part += __shfl_down_sync(FF_WARP_MASK, part, off);
   __shared__ float red[8];
   if ((tid & 31) == 0) red[tid >> 5] = part;
   __syncthreads();
@@ -85,7 +85,7 @@ extern "C" __global__ void lm_head_f32(const __nv_bfloat16* __restrict__ x,
     float value = tid < (blockDim.x >> 5) ? red[tid] : 0.0f;
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
-      value += __shfl_xor_sync(0xffffffffu, value, off);
+      value += __shfl_xor_sync(FF_WARP_MASK, value, off);
     if (tid == 0) logits[row] = value;
   }
 }
@@ -104,8 +104,8 @@ extern "C" __global__ void argmax_f32(const float* logits, uint32_t* token, int 
   }
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) {
-    const float other_best = __shfl_down_sync(0xffffffffu, best, off);
-    const uint32_t other_id = __shfl_down_sync(0xffffffffu, id, off);
+    const float other_best = __shfl_down_sync(FF_WARP_MASK, best, off);
+    const uint32_t other_id = __shfl_down_sync(FF_WARP_MASK, id, off);
     if (other_best > best || (other_best == best && other_id < id)) {
       best = other_best;
       id = other_id;
@@ -123,8 +123,8 @@ extern "C" __global__ void argmax_f32(const float* logits, uint32_t* token, int 
     id = tid < (nthr >> 5) ? id_red[tid] : 0xFFFFFFFFu;
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
-      const float other_best = __shfl_xor_sync(0xffffffffu, best, off);
-      const uint32_t other_id = __shfl_xor_sync(0xffffffffu, id, off);
+      const float other_best = __shfl_xor_sync(FF_WARP_MASK, best, off);
+      const uint32_t other_id = __shfl_xor_sync(FF_WARP_MASK, id, off);
       if (other_best > best || (other_best == best && other_id < id)) {
         best = other_best;
         id = other_id;
@@ -171,8 +171,8 @@ extern "C" __global__ void __launch_bounds__(1024) argmax_rows_bf16(
         }
     }
     for (int off = 16; off > 0; off >>= 1) {
-        const float ob    = __shfl_down_sync(0xffffffffu, best, off);
-        const uint32_t oi = __shfl_down_sync(0xffffffffu, id, off);
+        const float ob    = __shfl_down_sync(FF_WARP_MASK, best, off);
+        const uint32_t oi = __shfl_down_sync(FF_WARP_MASK, id, off);
         if (ob > best || (ob == best && oi < id)) { best = ob; id = oi; }
     }
     __shared__ float wv[32];
@@ -189,8 +189,8 @@ extern "C" __global__ void __launch_bounds__(1024) argmax_rows_bf16(
             if (v > best || (v == best && j < id)) { best = v; id = j; }
         }
         for (int off = 16; off > 0; off >>= 1) {
-            const float ob    = __shfl_down_sync(0xffffffffu, best, off);
-            const uint32_t oi = __shfl_down_sync(0xffffffffu, id, off);
+            const float ob    = __shfl_down_sync(FF_WARP_MASK, best, off);
+            const uint32_t oi = __shfl_down_sync(FF_WARP_MASK, id, off);
             if (ob > best || (ob == best && oi < id)) { best = ob; id = oi; }
         }
         if (lane == 0) tokens[row] = id;

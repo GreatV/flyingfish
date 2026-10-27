@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 default = ["cuda"]
 cuda = ["dep:cudarc"]
+rocm = []
 
 [dependencies]
 anyhow = "1"

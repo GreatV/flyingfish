@@ -1,5 +1,5 @@
 #pragma once
-#include <cuda_bf16.h>
+#include "gpu_compat.cuh"
 #include <cstdint>
 
 #define KV_SINK_TOKENS 64
@@ -42,7 +42,7 @@ __device__ __forceinline__ float kv_source(KvCacheView b, bool is_k, int h,
   const int cap = full ? b.capacity : b.ring;
   const auto* source = full ? full : (is_k ? b.k_ring : b.v_ring);
   const float x=__bfloat162float(source[((size_t)h*cap+slot)*256+d]);
-  if (!isfinite(x)) asm volatile("trap;");
+  if (!isfinite(x)) FF_TRAP();
   return x;
 }
 
@@ -55,7 +55,7 @@ __device__ __forceinline__ void kv_pack_token(KvCacheView b, bool is_k, int h,
   }
   const float span=__fsub_rn(hi,lo);
   const float scale=span==0 ? 1.0f : __fdiv_rn(span,255.0f);
-  if(!isfinite(scale) || scale<=0) asm volatile("trap;");
+  if(!isfinite(scale) || scale<=0) FF_TRAP();
   float* stats=is_k ? b.k_stats : b.v_stats;
   const size_t i=(size_t)h*b.capacity+pos;
   stats[2*i]=lo;stats[2*i+1]=scale;
@@ -72,7 +72,7 @@ extern "C" __global__ void kv_cache_pack(KvCacheView b, const __nv_bfloat16* ful
                                            const int4* meta, int force) {
   if (!full_k && b.cursor[2] && !force) return;
   const int end=full_k ? meta[0].z : meta[0].x;
-  if(end < b.cursor[0] || end > b.capacity) asm volatile("trap;");
+  if(end < b.cursor[0] || end > b.capacity) FF_TRAP();
   const int start=b.cursor[1]+blockIdx.x*KV_GROUP_TOKENS;
   if(start>=kv_sealed(end)) return;
   const int h=blockIdx.y,d=threadIdx.x;
@@ -83,7 +83,7 @@ extern "C" __global__ void kv_cache_pack(KvCacheView b, const __nv_bfloat16* ful
       lo=fminf(lo,x);hi=fmaxf(hi,x);
     }
     const float span=__fsub_rn(hi,lo),scale=span==0 ? 1.0f : __fdiv_rn(span,255.0f);
-    if(!isfinite(scale) || scale<=0) asm volatile("trap;");
+    if(!isfinite(scale) || scale<=0) FF_TRAP();
     const size_t i=((size_t)h*((b.capacity+(KV_GROUP_TOKENS-1))/KV_GROUP_TOKENS)+start/KV_GROUP_TOKENS)*256+d;
     b.k_stats[2*i]=lo;b.k_stats[2*i+1]=scale;
     for(int r=0;r<KV_GROUP_TOKENS;++r) {
@@ -112,7 +112,7 @@ extern "C" __global__ void kv_cache_tail(KvCacheView b, const __nv_bfloat16* ful
 }
 
 extern "C" __global__ void kv_cache_cursor(KvCacheView b,const int4* meta,int mode) {
-  if(mode==1) {if(b.cursor[0]!=meta[0].x) asm volatile("trap;");b.cursor[2]=1;return;}
+  if(mode==1) {if(b.cursor[0]!=meta[0].x) FF_TRAP();b.cursor[2]=1;return;}
   if(mode==0 && b.cursor[2]) return;
   const int end=mode==3 ? meta[0].z : meta[0].x;
   b.cursor[0]=end;b.cursor[1]=kv_sealed(end);b.cursor[2]=0;b.cursor[3]=0;

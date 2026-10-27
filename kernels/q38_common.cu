@@ -1,6 +1,6 @@
 // Common norm/gate kernels. BF16-visible operations round explicitly.
 #include "q38_contract.cuh"
-#include <cuda_bf16.h>
+#include "gpu_compat.cuh"
 #include <math.h>
 extern "C" __global__ void q38_copy_finite_bf16(const __nv_bfloat16* source,
                                                __nv_bfloat16* destination,
@@ -62,12 +62,12 @@ extern "C" __global__ void q38_stage_inputs(const uint32_t* source, uint32_t* id
     positions[3 * row] = positions[3 * row + 1] = positions[3 * row + 2] = prefix + int32_t(row) + 1;
 }
 __device__ __forceinline__ float block_sum(float v,float* scratch) {
-    for(int delta=16;delta;delta/=2) v+=__shfl_down_sync(0xffffffffu,v,delta);
+    for(int delta=16;delta;delta/=2) v+=__shfl_down_sync(FF_WARP_MASK,v,delta);
     if(threadIdx.x%32==0) scratch[threadIdx.x/32]=v;
     __syncthreads();
     v=threadIdx.x<8?scratch[threadIdx.x]:0;
     if(threadIdx.x<32) {
-        for(int delta=16;delta;delta/=2) v+=__shfl_down_sync(0xffffffffu,v,delta);
+        for(int delta=16;delta;delta/=2) v+=__shfl_down_sync(FF_WARP_MASK,v,delta);
         if(threadIdx.x==0) scratch[0]=v;
     }
     __syncthreads(); return scratch[0];
@@ -122,12 +122,12 @@ __device__ __forceinline__ uint32_t norm_slices_per_block(
     return 1u;
 }
 __device__ __forceinline__ float block_inv(float v,float* scratch,uint32_t width,int mode,float eps) {
-    for(int delta=16;delta;delta/=2) v=__fadd_rn(v,__shfl_down_sync(0xffffffffu,v,delta));
+    for(int delta=16;delta;delta/=2) v=__fadd_rn(v,__shfl_down_sync(FF_WARP_MASK,v,delta));
     if(threadIdx.x%32==0) scratch[threadIdx.x/32]=v;
     __syncthreads();
     v=threadIdx.x<8?scratch[threadIdx.x]:0;
     if(threadIdx.x<32) {
-        for(int delta=16;delta;delta/=2) v=__fadd_rn(v,__shfl_down_sync(0xffffffffu,v,delta));
+        for(int delta=16;delta;delta/=2) v=__fadd_rn(v,__shfl_down_sync(FF_WARP_MASK,v,delta));
         if(threadIdx.x==0) scratch[0]=norm_inv(v,width,mode,eps);
     }
     __syncthreads(); return scratch[0];
@@ -175,16 +175,16 @@ __device__ __forceinline__ void norm_body(
         float r0=norm_term(f0.x,mode),r1=norm_term(f0.y,mode),r2=norm_term(f1.x,mode),r3=norm_term(f1.y,mode);
         #pragma unroll
         for(int delta=4;delta>=1;delta>>=1) {
-            r0=__fadd_rn(r0,__shfl_down_sync(0xffffffffu,r0,delta));
-            r1=__fadd_rn(r1,__shfl_down_sync(0xffffffffu,r1,delta));
-            r2=__fadd_rn(r2,__shfl_down_sync(0xffffffffu,r2,delta));
-            r3=__fadd_rn(r3,__shfl_down_sync(0xffffffffu,r3,delta));
+            r0=__fadd_rn(r0,__shfl_down_sync(FF_WARP_MASK,r0,delta));
+            r1=__fadd_rn(r1,__shfl_down_sync(FF_WARP_MASK,r1,delta));
+            r2=__fadd_rn(r2,__shfl_down_sync(FF_WARP_MASK,r2,delta));
+            r3=__fadd_rn(r3,__shfl_down_sync(FF_WARP_MASK,r3,delta));
         }
         float ww=__fadd_rn(__fadd_rn(r0,r2),__fadd_rn(r1,r3));
-        ww=__fadd_rn(ww,__shfl_down_sync(0xffffffffu,ww,16));
-        ww=__fadd_rn(ww,__shfl_down_sync(0xffffffffu,ww,8));
+        ww=__fadd_rn(ww,__shfl_down_sync(FF_WARP_MASK,ww,16));
+        ww=__fadd_rn(ww,__shfl_down_sync(FF_WARP_MASK,ww,8));
         float inv=(lane==0u)?norm_inv(ww,128u,mode,eps):0.0f;
-        inv=__shfl_sync(0xffffffffu,inv,0);
+        inv=__shfl_sync(FF_WARP_MASK,inv,0);
         Bf16Vec4 vw,vz,vy;
         vw.u=(mode!=2)?reinterpret_cast<const uint2*>(w)[lane]:make_uint2(0u,0u);
         vz.u=(mode==3)?reinterpret_cast<const uint2*>(zs)[lane]:make_uint2(0u,0u);
@@ -223,15 +223,15 @@ __device__ __forceinline__ void norm_body(
         #pragma unroll
         for(int delta=2;delta>=1;delta>>=1) {
             #pragma unroll
-            for(int k=0;k<8;++k) r[k]=__fadd_rn(r[k],__shfl_down_sync(0xffffffffu,r[k],delta));
+            for(int k=0;k<8;++k) r[k]=__fadd_rn(r[k],__shfl_down_sync(FF_WARP_MASK,r[k],delta));
         }
         float s4_0=__fadd_rn(r[0],r[4]),s4_1=__fadd_rn(r[1],r[5]),s4_2=__fadd_rn(r[2],r[6]),s4_3=__fadd_rn(r[3],r[7]);
         float ww=__fadd_rn(__fadd_rn(s4_0,s4_2),__fadd_rn(s4_1,s4_3));
-        ww=__fadd_rn(ww,__shfl_down_sync(0xffffffffu,ww,16));
-        ww=__fadd_rn(ww,__shfl_down_sync(0xffffffffu,ww,8));
-        ww=__fadd_rn(ww,__shfl_down_sync(0xffffffffu,ww,4));
+        ww=__fadd_rn(ww,__shfl_down_sync(FF_WARP_MASK,ww,16));
+        ww=__fadd_rn(ww,__shfl_down_sync(FF_WARP_MASK,ww,8));
+        ww=__fadd_rn(ww,__shfl_down_sync(FF_WARP_MASK,ww,4));
         float inv=(lane==0u)?norm_inv(ww,256u,mode,eps):0.0f;
-        inv=__shfl_sync(0xffffffffu,inv,0);
+        inv=__shfl_sync(FF_WARP_MASK,inv,0);
         Bf16Vec8 vw,vz,vy;
         vw.u=(mode!=2)?reinterpret_cast<const uint4*>(w)[lane]:make_uint4(0u,0u,0u,0u);
         vz.u=(mode==3)?reinterpret_cast<const uint4*>(zs)[lane]:make_uint4(0u,0u,0u,0u);
@@ -290,10 +290,10 @@ __device__ __forceinline__ void norm_body(
         }
         #pragma unroll
         for(int delta=4;delta>=1;delta>>=1) {
-            acc[0]=__fadd_rn(acc[0],__shfl_down_sync(0xffffffffu,acc[0],delta));
-            acc[1]=__fadd_rn(acc[1],__shfl_down_sync(0xffffffffu,acc[1],delta));
-            acc[2]=__fadd_rn(acc[2],__shfl_down_sync(0xffffffffu,acc[2],delta));
-            acc[3]=__fadd_rn(acc[3],__shfl_down_sync(0xffffffffu,acc[3],delta));
+            acc[0]=__fadd_rn(acc[0],__shfl_down_sync(FF_WARP_MASK,acc[0],delta));
+            acc[1]=__fadd_rn(acc[1],__shfl_down_sync(FF_WARP_MASK,acc[1],delta));
+            acc[2]=__fadd_rn(acc[2],__shfl_down_sync(FF_WARP_MASK,acc[2],delta));
+            acc[3]=__fadd_rn(acc[3],__shfl_down_sync(FF_WARP_MASK,acc[3],delta));
         }
         float ww=__fadd_rn(__fadd_rn(acc[0],acc[2]),__fadd_rn(acc[1],acc[3]));
         __shared__ float smem[4][4];
@@ -301,8 +301,8 @@ __device__ __forceinline__ void norm_body(
         __syncthreads();
         if(hw==0u) {
             if((lane&7u)==0u) ww=__fadd_rn(ww,smem[row_slot][lane>>3]);
-            ww=__fadd_rn(ww,__shfl_down_sync(0xffffffffu,ww,16));
-            ww=__fadd_rn(ww,__shfl_down_sync(0xffffffffu,ww,8));
+            ww=__fadd_rn(ww,__shfl_down_sync(FF_WARP_MASK,ww,16));
+            ww=__fadd_rn(ww,__shfl_down_sync(FF_WARP_MASK,ww,8));
             if(lane==0u) smem[row_slot][0]=norm_inv(ww,5120u,mode,eps);
         }
         __syncthreads();

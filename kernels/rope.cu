@@ -1,4 +1,4 @@
-#include <cuda_bf16.h>
+#include "gpu_compat.cuh"
 
 extern "C" __global__ void rope_table_kv(__nv_bfloat16* qkvg,
     __nv_bfloat16* k, __nv_bfloat16* v, const __nv_bfloat16* table,
@@ -169,14 +169,14 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
             }
         }
 #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) ssq += __shfl_xor_sync(0xffffffffu, ssq, o);
+        for (int o = 16; o > 0; o >>= 1) ssq += __shfl_xor_sync(FF_WARP_MASK, ssq, o);
         if ((gid & 31) == 0) smem[gid >> 5] = ssq;
         __syncthreads();
         if (gid < 32) {
             int nw = nthr >> 5;
             float t = (gid < nw) ? smem[gid] : 0.0f;
 #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) t += __shfl_xor_sync(0xffffffffu, t, o);
+            for (int o = 16; o > 0; o >>= 1) t += __shfl_xor_sync(FF_WARP_MASK, t, o);
             if (gid == 0) smem[0] = t;
         }
         __syncthreads();
