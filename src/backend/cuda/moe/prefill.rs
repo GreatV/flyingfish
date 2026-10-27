@@ -18,7 +18,10 @@ use cudarc::{
 use half::bf16;
 use std::sync::{Arc, Mutex};
 
-use super::combine::{CombineOps, MoeCombine, MoeCombineRouted, MoeJoinRouted};
+use super::combine::{
+    CombineOps, MoeCombine, MoeCombineResidual, MoeCombineRouted, MoeJoinRouted,
+    MoeJoinRoutedResidual,
+};
 
 const SCAN_THREADS: u32 = 1024;
 const BLOCK_THREADS: u32 = 256;
@@ -1404,6 +1407,53 @@ impl PrefillOps {
         Ok(())
     }
 
+    /// The fused finish over caller-owned contributions: the shared FFN, then
+    /// the routed sum, the shared sigmoid gate and the residual add in one
+    /// launch. `input.y` is the residual buffer, read and written in place.
+    pub fn prefill_finish_residual(
+        &self,
+        stream: &Arc<CudaStream>,
+        input: MoePrefillFinish,
+        scratch: &Scratch,
+    ) -> Result<()> {
+        ensure!(
+            Arc::ptr_eq(stream, &self.stream),
+            "moe prefill stream is not the PrefillOps construction stream (cuBLAS handle bound at construction)"
+        );
+        let plan = input.validate()?;
+        scratch.validate(plan.layout.bytes)?;
+        self.finish_body_residual(stream, input, None, &plan, scratch)?;
+        Ok(())
+    }
+
+    /// The fused peer finish: the routed sum comes from the peer GPU, the
+    /// shared sigmoid gate and the residual add are local. `input.y` is the
+    /// residual buffer, read and written in place.
+    pub fn prefill_finish_routed_residual(
+        &self,
+        stream: &Arc<CudaStream>,
+        input: MoePrefillFinish,
+        routed_peer: Tensor<bf16, 2>,
+        scratch: &Scratch,
+    ) -> Result<()> {
+        ensure!(
+            Arc::ptr_eq(stream, &self.stream),
+            "moe prefill stream is not the PrefillOps construction stream (cuBLAS handle bound at construction)"
+        );
+        let plan = input.validate()?;
+        routed_peer.validate()?;
+        ensure!(
+            routed_peer.shape == [plan.rows, plan.hidden]
+                && routed_peer.stride == [u64::from(plan.hidden), 1],
+            "moe prefill finish routed_peer must be dense [rows, hidden] (shape {:?})",
+            routed_peer.shape
+        );
+        no_overlap(&routed_peer, &input.y.read(), "routed_peer", "y")?;
+        scratch.validate(plan.layout.bytes)?;
+        self.finish_body_residual(stream, input, Some(routed_peer), &plan, scratch)?;
+        Ok(())
+    }
+
     pub fn combine_routed(&self, stream: &Arc<CudaStream>, input: &MoeCombineRouted) -> Result<()> {
         self.combine.combine_routed(stream, input)
     }
@@ -1416,9 +1466,59 @@ impl PrefillOps {
         plan: &PrefillPlan,
         scratch: &Scratch,
     ) -> Result<()> {
-        // Shared FFN: the gate/up group (2 problems) and the down group (1
-        // problem) share one 9-pointer block [A|B|C] per group, uploaded
-        // with a single H2D.
+        let shared_out = self.shared_ffn(stream, &input, plan, scratch)?;
+        // moe_combine's scale column over the same [rows] words; the nonzero
+        // stride keeps Tensor::validate satisfied.
+        let rows = plan.rows;
+        let scale_at = scratch.ptr + plan.layout.scale;
+        let mut gate = None;
+        let mut scale = None;
+        if let Some(shared_gate) = input.shared_expert_gate {
+            let mut written = unsafe {
+                TensorMut::<bf16, 2>::new(scale_at, [rows, 1], [1, 1], u64::from(rows) * 2)?
+            };
+            self.combine
+                .shared_scale(stream, input.x, shared_gate, &mut written)?;
+            gate = Some(shared_gate);
+            scale = Some(written);
+        }
+        if let Some(routed_in) = routed_peer {
+            self.combine.join_routed(
+                stream,
+                &MoeJoinRouted {
+                    routed_in,
+                    shared_out,
+                    scale: scale.map(|s| s.read()),
+                    y: input.y,
+                },
+            )?;
+        } else {
+            let combine_input = MoeCombine {
+                ids: input.ids,
+                final_active: input.final_active,
+                done: input.done,
+                contributions: input.contributions,
+                shared_out,
+                x: input.x,
+                shared_expert_gate: gate,
+                scale,
+                y: input.y,
+            };
+            self.combine.combine(stream, &combine_input)?;
+        }
+        Ok(())
+    }
+
+    /// The shared FFN of one wave: the gate/up group (2 problems) and the down
+    /// group (1 problem) share one 9-pointer block [A|B|C] per group, uploaded
+    /// with a single H2D. The result is the scratch-backed shared output.
+    fn shared_ffn(
+        &self,
+        stream: &Arc<CudaStream>,
+        input: &MoePrefillFinish,
+        plan: &PrefillPlan,
+        scratch: &Scratch,
+    ) -> Result<Tensor<bf16, 2>> {
         let (rows, hidden, inter) = (plan.rows, plan.hidden, plan.shared_inter);
         let h1s_at = scratch.ptr + plan.layout.h1s;
         let act_s_at = scratch.ptr + plan.layout.act_s;
@@ -1492,52 +1592,53 @@ impl PrefillOps {
                     .context("moe prefill shared down GEMM")?;
             }
         }
-
-        // moe_combine's scale column over the same [rows] words; the nonzero
-        // stride keeps Tensor::validate satisfied.
-        let scale_at = scratch.ptr + plan.layout.scale;
-        let mut gate = None;
-        let mut scale = None;
-        if let Some(shared_gate) = input.shared_expert_gate {
-            let mut written = unsafe {
-                TensorMut::<bf16, 2>::new(scale_at, [rows, 1], [1, 1], u64::from(rows) * 2)?
-            };
-            self.combine
-                .shared_scale(stream, input.x, shared_gate, &mut written)?;
-            gate = Some(shared_gate);
-            scale = Some(written);
-        }
-        let shared_out = unsafe {
+        Ok(unsafe {
             Tensor::<bf16, 2>::new(
                 shared_out_at,
                 [rows, hidden],
                 [u64::from(hidden), 1],
                 u64::from(rows) * u64::from(hidden) * 2,
             )?
-        };
+        })
+    }
+
+    /// The fused finish: the shared FFN, then the routed sum, the shared
+    /// sigmoid gate and the residual add in one launch. `input.y` is the
+    /// residual buffer, read and written in place.
+    fn finish_body_residual(
+        &self,
+        stream: &Arc<CudaStream>,
+        input: MoePrefillFinish,
+        routed_peer: Option<Tensor<bf16, 2>>,
+        plan: &PrefillPlan,
+        scratch: &Scratch,
+    ) -> Result<()> {
+        let shared_out = self.shared_ffn(stream, &input, plan, scratch)?;
         if let Some(routed_in) = routed_peer {
-            self.combine.join_routed(
+            self.combine.join_routed_residual(
                 stream,
-                &MoeJoinRouted {
+                &MoeJoinRoutedResidual {
                     routed_in,
                     shared_out,
-                    scale: scale.map(|s| s.read()),
-                    y: input.y,
+                    x: input.x,
+                    shared_expert_gate: input.shared_expert_gate,
+                    residual: input.y,
                 },
             )?;
         } else {
-            let combine_input = MoeCombine {
-                ids: input.ids,
-                final_active: input.final_active,
-                done: input.done,
-                contributions: input.contributions,
-                shared_out,
-                x: input.x,
-                shared_expert_gate: gate,
-                scale,
-                y: input.y,
-            };
-            self.combine.combine(stream, &combine_input)?;
+            self.combine.combine_residual(
+                stream,
+                &MoeCombineResidual {
+                    ids: input.ids,
+                    final_active: input.final_active,
+                    done: input.done,
+                    contributions: input.contributions,
+                    shared_out,
+                    x: input.x,
+                    shared_expert_gate: input.shared_expert_gate,
+                    residual: input.y,
+                },
+            )?;
         }
         Ok(())
     }

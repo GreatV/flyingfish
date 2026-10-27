@@ -41,6 +41,24 @@ pub fn columns(
     r: Rect,
 ) -> Result<()> {
     ensure!(
+        (r.rows - 1) * r.src_pitch + r.src_col + r.width <= src.len()
+            && (r.rows - 1) * r.dst_pitch + r.dst_col + r.width <= dst.len(),
+        "CUDA column copy exceeds buffer"
+    );
+    s.context().bind_to_thread()?;
+    let (src, _src) = src.device_ptr(s);
+    columns_from(s, src, dst, r)
+}
+
+/// The same column copy from a raw device pointer; the caller owns the source
+/// extent of `r.rows` rows of `r.src_pitch` BF16 values.
+pub fn columns_from(
+    s: &Arc<CudaStream>,
+    src: u64,
+    dst: &mut impl DevicePtrMut<bf16>,
+    r: Rect,
+) -> Result<()> {
+    ensure!(
         r.rows > 0
             && r.width > 0
             && r.src_col + r.width <= r.src_pitch
@@ -48,12 +66,10 @@ pub fn columns(
         "invalid CUDA column copy rectangle"
     );
     ensure!(
-        (r.rows - 1) * r.src_pitch + r.src_col + r.width <= src.len()
-            && (r.rows - 1) * r.dst_pitch + r.dst_col + r.width <= dst.len(),
+        (r.rows - 1) * r.dst_pitch + r.dst_col + r.width <= dst.len(),
         "CUDA column copy exceeds buffer"
     );
     s.context().bind_to_thread()?;
-    let (src, _src) = src.device_ptr(s);
     let (dst, _dst) = dst.device_ptr_mut(s);
     let params = sys::CUDA_MEMCPY2D {
         srcXInBytes: r.src_col * 2,

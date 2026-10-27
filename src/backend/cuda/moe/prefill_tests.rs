@@ -1,7 +1,10 @@
 //! CPU gates for the MoE prefill op (scratch sizing, problem grouping) and
 //! the frozen GPU gate. The GPU test is ignored by default and runs only
 //! under an acknowledged window with --include-ignored --test-threads=1.
-use super::combine::{CombineOps, MoeCombine};
+use super::combine::{
+    CombineOps, MoeCombine, MoeCombineResidual, MoeCombineRouted, MoeJoinRouted,
+    MoeJoinRoutedResidual,
+};
 use super::prefill::{
     GEMM1_PTR_WORDS, GEMM2_PTR_WORDS, MAX_EXPERTS, MoePrefill, MoePrefillContribute,
     MoePrefillFinish, PrefillOps, d2h_active_total_word, d2h_window_words, group_runs,
@@ -3388,6 +3391,295 @@ fn prefill_packed_waves(wave_rows: usize, grouped: bool) -> Result<()> {
     );
     println!(
         "PASS prefill_packed_wave_count_control wave_rows={wave_rows} span_rows={rows} contributions=[{rows},{top_k},{hidden}] error={error:#}"
+    );
+    Ok(())
+}
+
+/// Deterministic unit-interval sample stream.
+fn next_sample(state: &mut u64) -> f32 {
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    ((*state >> 40) as f32) / 8388608.0 - 1.0
+}
+
+/// The routed sum of one row in the given expert order, FP32 per element.
+fn routed_row_sum(
+    contributions: &[bf16],
+    row: usize,
+    top_k: usize,
+    hidden: usize,
+    order: &[usize],
+) -> Vec<f32> {
+    let mut acc = vec![0.0f32; hidden];
+    for &choice in order {
+        let src = &contributions[(row * top_k + choice) * hidden..][..hidden];
+        for d in 0..hidden {
+            acc[d] += src[d].to_f32();
+        }
+    }
+    acc
+}
+
+/// The fused combine group against the unfused kernel sequence: the shared
+/// scale, the combine and the residual add read as one in-place launch.
+#[test]
+#[ignore = "requires GPU window, FF_Q38_GPU_WINDOW=granted"]
+fn moe_combine_residual_gpu() -> Result<()> {
+    anyhow::ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let d = crate::backend::cuda::Device::new(0)?;
+    let s = &d.stream;
+    let combine = CombineOps::new(&d.ctx)?;
+    let norm = cubin::module(&d.ctx, "norm")?;
+    let residual_kernel = norm.load_function("residual")?;
+    // The MiniCPM-V text tower MoE hidden extent and top_k.
+    let (rows, top_k, hidden) = (512usize, 8usize, 2048usize);
+    let count = rows * hidden;
+    let mut state = 0x5eed_1234_u64;
+    let mut samples = |n: usize| -> Vec<bf16> {
+        (0..n)
+            .map(|_| bf16::from_f32(next_sample(&mut state)))
+            .collect()
+    };
+    let contributions_host = samples(rows * top_k * hidden);
+    let shared_out_host = samples(count);
+    let x_host = samples(count);
+    let seg_host = samples(hidden);
+    let residual_host = samples(count);
+    let routed_host = samples(count);
+    // Distinct expert ids per row, ascending order a permutation of the choices.
+    let ids_host: Vec<i32> = (0..rows * top_k)
+        .map(|i| ((i / top_k) * 7 + (i % top_k) * 13) as i32 % 256)
+        .collect();
+    // Every fifth choice of every row stays inactive.
+    let active_host: Vec<u32> = (0..rows * top_k)
+        .map(|i| u32::from((i / top_k + i % top_k) % 5 != 0))
+        .collect();
+
+    let contributions = testing::upload(s, contributions_host.clone())?;
+    let shared_out = testing::upload(s, shared_out_host.clone())?;
+    let x = testing::upload(s, x_host.clone())?;
+    let seg = testing::upload(s, seg_host.clone())?;
+    let routed_in = testing::upload(s, routed_host.clone())?;
+    let ids = testing::upload(s, ids_host.clone())?;
+    let active = testing::upload(s, active_host.clone())?;
+    let done = testing::upload(s, active_host.clone())?;
+    let contributions_view = testing::view(
+        &contributions,
+        s,
+        [rows as u32, top_k as u32, hidden as u32],
+        [(top_k * hidden) as u64, hidden as u64, 1],
+    )?;
+    let ids_view = testing::dense(&ids, s, rows as u32, top_k as u32)?;
+    let active_view = testing::dense(&active, s, rows as u32, top_k as u32)?;
+    let done_view = testing::dense(&done, s, rows as u32, top_k as u32)?;
+    let shared_out_view = testing::dense(&shared_out, s, rows as u32, hidden as u32)?;
+    let x_view = testing::dense(&x, s, rows as u32, hidden as u32)?;
+    let seg_view = testing::view(&seg, s, [hidden as u32], [1])?;
+
+    // The unfused sequence: the shared scale, the combine and the residual add.
+    let scale: CudaSlice<bf16> = s.alloc_zeros(rows)?;
+    let mut scale_view = testing::dense_mut(&scale, s, rows as u32, 1)?;
+    combine.shared_scale(s, x_view, seg_view, &mut scale_view)?;
+    let combined: CudaSlice<bf16> = s.alloc_zeros(count)?;
+    combine.combine(
+        s,
+        &MoeCombine {
+            ids: ids_view,
+            final_active: active_view,
+            done: done_view,
+            contributions: contributions_view,
+            shared_out: shared_out_view,
+            x: x_view,
+            shared_expert_gate: Some(seg_view),
+            scale: Some(scale_view),
+            y: testing::dense_mut(&combined, s, rows as u32, hidden as u32)?,
+        },
+    )?;
+    let mut expected: CudaSlice<bf16> = s.alloc_zeros(count)?;
+    s.memcpy_htod(&residual_host, &mut expected)?;
+    unsafe {
+        s.launch_builder(&residual_kernel)
+            .arg(&mut expected)
+            .arg(&combined)
+            .arg(&(i32::try_from(count)?))
+            .launch(crate::backend::cuda::ops::flat(count))?;
+    }
+    s.synchronize()?;
+
+    // The fused combine writes the residual in place.
+    let mut fused: CudaSlice<bf16> = s.alloc_zeros(count)?;
+    s.memcpy_htod(&residual_host, &mut fused)?;
+    combine.combine_residual(
+        s,
+        &MoeCombineResidual {
+            ids: ids_view,
+            final_active: active_view,
+            done: done_view,
+            contributions: contributions_view,
+            shared_out: shared_out_view,
+            x: x_view,
+            shared_expert_gate: Some(seg_view),
+            residual: testing::dense_mut(&fused, s, rows as u32, hidden as u32)?,
+        },
+    )?;
+    s.synchronize()?;
+    let expected_host = s.clone_dtoh(&expected)?;
+    let fused_host = s.clone_dtoh(&fused)?;
+    let mismatches = expected_host
+        .iter()
+        .zip(&fused_host)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    anyhow::ensure!(
+        mismatches == 0,
+        "fused combine_residual differs from the unfused sequence in {mismatches} of {count} values"
+    );
+
+    // The fused peer join against the unfused join and residual add.
+    let joined: CudaSlice<bf16> = s.alloc_zeros(count)?;
+    combine.join_routed(
+        s,
+        &MoeJoinRouted {
+            routed_in: testing::dense(&routed_in, s, rows as u32, hidden as u32)?,
+            shared_out: shared_out_view,
+            scale: Some(testing::dense(&scale, s, rows as u32, 1)?),
+            y: testing::dense_mut(&joined, s, rows as u32, hidden as u32)?,
+        },
+    )?;
+    let mut expected_join: CudaSlice<bf16> = s.alloc_zeros(count)?;
+    s.memcpy_htod(&residual_host, &mut expected_join)?;
+    unsafe {
+        s.launch_builder(&residual_kernel)
+            .arg(&mut expected_join)
+            .arg(&joined)
+            .arg(&(i32::try_from(count)?))
+            .launch(crate::backend::cuda::ops::flat(count))?;
+    }
+    let mut fused_join: CudaSlice<bf16> = s.alloc_zeros(count)?;
+    s.memcpy_htod(&residual_host, &mut fused_join)?;
+    combine.join_routed_residual(
+        s,
+        &MoeJoinRoutedResidual {
+            routed_in: testing::dense(&routed_in, s, rows as u32, hidden as u32)?,
+            shared_out: shared_out_view,
+            x: x_view,
+            shared_expert_gate: Some(seg_view),
+            residual: testing::dense_mut(&fused_join, s, rows as u32, hidden as u32)?,
+        },
+    )?;
+    s.synchronize()?;
+    let expected_join_host = s.clone_dtoh(&expected_join)?;
+    let fused_join_host = s.clone_dtoh(&fused_join)?;
+    let join_mismatches = expected_join_host
+        .iter()
+        .zip(&fused_join_host)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    anyhow::ensure!(
+        join_mismatches == 0,
+        "fused join_routed_residual differs from the unfused sequence in {join_mismatches} of {count} values"
+    );
+
+    // The routed sum against the ascending expert order on the host.
+    let routed_out: CudaSlice<bf16> = s.alloc_zeros(count)?;
+    combine.combine_routed(
+        s,
+        &MoeCombineRouted {
+            ids: ids_view,
+            final_active: active_view,
+            done: done_view,
+            contributions: contributions_view,
+            routed_out: testing::dense_mut(&routed_out, s, rows as u32, hidden as u32)?,
+        },
+    )?;
+    s.synchronize()?;
+    let routed_host_bits = s.clone_dtoh(&routed_out)?;
+    let mut descending_rows = 0usize;
+    for row in 0..rows {
+        let mut order: Vec<usize> = (0..top_k)
+            .filter(|&choice| active_host[row * top_k + choice] == 1)
+            .collect();
+        order.sort_by_key(|&choice| ids_host[row * top_k + choice]);
+        let ascending = routed_row_sum(&contributions_host, row, top_k, hidden, &order);
+        let mut reverse = order.clone();
+        reverse.reverse();
+        let descending = routed_row_sum(&contributions_host, row, top_k, hidden, &reverse);
+        let mut ascending_mismatch = 0usize;
+        let mut descending_mismatch = 0usize;
+        for ((got, ascending), descending) in routed_host_bits[row * hidden..(row + 1) * hidden]
+            .iter()
+            .zip(&ascending)
+            .zip(&descending)
+        {
+            if got.to_bits() != bf16::from_f32(*ascending).to_bits() {
+                ascending_mismatch += 1;
+            }
+            if got.to_bits() != bf16::from_f32(*descending).to_bits() {
+                descending_mismatch += 1;
+            }
+        }
+        anyhow::ensure!(
+            ascending_mismatch == 0,
+            "routed row {row} differs from the ascending oracle in {ascending_mismatch} of {hidden} values"
+        );
+        if descending_mismatch > 0 {
+            descending_rows += 1;
+        }
+    }
+    let _ = descending_rows;
+    // Order sensitivity of the comparator itself: an adversarial row whose
+    // FP32 routed sum rounds differently by accumulation order.
+    {
+        let mut adversarial = vec![bf16::ZERO; 4 * 2];
+        let big = bf16::from_f32(16_777_216.0);
+        for d in 0..2 {
+            adversarial[d] = big;
+            adversarial[2 + d] = bf16::from_f32(1.0);
+            adversarial[4 + d] = bf16::from_f32(-big.to_f32());
+            adversarial[6 + d] = bf16::from_f32(1.0);
+        }
+        let ascending = routed_row_sum(&adversarial, 0, 4, 2, &[0, 1, 2, 3]);
+        let descending = routed_row_sum(&adversarial, 0, 4, 2, &[3, 2, 1, 0]);
+        let differ = (0..2)
+            .filter(|&d| ascending[d].to_bits() != descending[d].to_bits())
+            .count();
+        anyhow::ensure!(
+            differ > 0,
+            "the comparator cannot distinguish accumulation order (adversarial row identical)"
+        );
+    }
+
+    // Negative control: a perturbed residual lane must move and leave the
+    // other lanes untouched.
+    let mut perturbed_host = residual_host.clone();
+    perturbed_host[7] = bf16::from_f32(perturbed_host[7].to_f32() * 0.5 + 0.25);
+    let mut perturbed: CudaSlice<bf16> = s.alloc_zeros(count)?;
+    s.memcpy_htod(&perturbed_host, &mut perturbed)?;
+    combine.combine_residual(
+        s,
+        &MoeCombineResidual {
+            ids: ids_view,
+            final_active: active_view,
+            done: done_view,
+            contributions: contributions_view,
+            shared_out: shared_out_view,
+            x: x_view,
+            shared_expert_gate: Some(seg_view),
+            residual: testing::dense_mut(&perturbed, s, rows as u32, hidden as u32)?,
+        },
+    )?;
+    s.synchronize()?;
+    let perturbed_bits = s.clone_dtoh(&perturbed)?;
+    let moved: Vec<usize> = (0..count)
+        .filter(|&index| perturbed_bits[index].to_bits() != fused_host[index].to_bits())
+        .collect();
+    anyhow::ensure!(
+        moved == vec![7],
+        "the perturbed residual lane moved {moved:?} instead of the perturbed lane alone"
     );
     Ok(())
 }
