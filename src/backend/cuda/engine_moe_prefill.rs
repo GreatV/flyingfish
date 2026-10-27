@@ -5177,6 +5177,16 @@ mod tests {
                         &ffn.output[base * 128..(base + rows) * 128],
                         &mut engine.work.out.slice_mut(..rows * 128),
                     )?;
+                    unsafe {
+                        engine
+                            .device
+                            .stream
+                            .launch_builder(&engine.ops.residual)
+                            .arg(&mut engine.work.x)
+                            .arg(&engine.work.out)
+                            .arg(&((rows * 128) as i32))
+                            .launch(flat(rows * 128))?;
+                    }
                     engine.run_operator(O::NextNorm, layer, step, &mut None)?;
                     residual[base * 128..(base + rows) * 128].copy_from_slice(
                         &engine
