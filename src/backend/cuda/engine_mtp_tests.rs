@@ -163,7 +163,7 @@ impl Probe {
         let spec = ModelSpec::read(&model)?;
         let device = Device::new(0)?;
         ensure!(
-            device.info.arch == 89,
+            device.info.arch == crate::backend::setup::DeviceArchitecture::Cuda(89),
             "M1 requires the authorized sm_89 device"
         );
         let budget = plan(

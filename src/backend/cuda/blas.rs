@@ -477,12 +477,13 @@ impl Blas {
         Ok(())
     }
 
-    pub fn new(
+    pub(crate) fn new(
         device: &Device,
         ops: &Ops,
         runtime: &Path,
         closure: Rc<super::closure::Closure>,
     ) -> Result<Self> {
+        device.info.require_cuda_tensor_ops("gemm_skinny")?;
         let stream = device.stream.clone();
         let calibration =
             linear_calibrate::Environment::new(device, ops, runtime, closure.clone())?;

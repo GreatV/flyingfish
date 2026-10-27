@@ -1,14 +1,26 @@
-use super::{cubin, flash::Shape};
+use super::cubin;
+use crate::backend::gpu::{
+    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+};
 use crate::{
     backend::setup::{AttentionPlan, MultiImpl, MultiPlan, MultiShape},
     config::Config,
 };
 use anyhow::{Result, ensure};
-use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
-};
 use half::bf16;
 use std::sync::Arc;
+
+#[derive(Clone, Copy)]
+pub struct Shape {
+    pub rows: usize,
+    pub start: usize,
+    pub q_heads: usize,
+    pub kv_heads: usize,
+    pub capacity: usize,
+    pub head_dim: usize,
+    pub causal: bool,
+    pub window_left: Option<usize>,
+}
 
 pub struct Verification {
     stream: Arc<CudaStream>,
@@ -33,6 +45,7 @@ pub struct Query<'a> {
 /// Resident phase-1 blocks per SM, queried from the driver for each loaded
 /// kernel with its real block size and dynamic shared memory. Indexed like
 /// `MultiImpl`: V1, Tcmqa, TcmqaW, TcmqaWs.
+#[cfg(feature = "cuda")]
 pub fn phase1_residency(ctx: &Arc<CudaContext>) -> Result<[usize; 4]> {
     let module = cubin::module(ctx, "tcmqa")?;
     let mut residency = [0usize; 4];
@@ -68,6 +81,11 @@ impl Verification {
             rows,
             causal,
         } = shape;
+        #[cfg(feature = "rocm")]
+        ensure!(
+            selected.implementation == MultiImpl::V1,
+            "HIP attention requires SIMT V1; TCMQA mma/ldmatrix/cp.async is unsupported"
+        );
         let plan = selected.launch;
         let implementation = selected.implementation;
         let phase1 = implementation.phase1();
@@ -105,9 +123,12 @@ impl Verification {
         );
         let chunks = capacity.div_ceil(plan.chunk);
         if implementation.short_merge() {
+            #[cfg(feature = "cuda")]
             let warp = ctx
                 .attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_WARP_SIZE)?
                 as usize;
+            #[cfg(feature = "rocm")]
+            let warp = ctx.properties.warp as usize;
             ensure!(
                 chunks <= 2 * warp && matches!(plan.merge_threads, 256 | 512),
                 "TCMQA short merge requires at most two chunks per warp lane over the full capacity and 256 or 512 threads"
@@ -170,6 +191,7 @@ impl Verification {
             );
         }
         let first = module.load_function(&symbol)?;
+        #[cfg(feature = "cuda")]
         if matches!(phase1, MultiImpl::TcmqaW | MultiImpl::TcmqaWs) {
             first.set_attribute(
                 cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,

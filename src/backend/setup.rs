@@ -2,10 +2,26 @@ use crate::config::Config;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DeviceArchitecture {
+    Cuda(u32),
+    Hip(String),
+}
+
+impl std::fmt::Display for DeviceArchitecture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cuda(sm) => sm.fmt(f),
+            Self::Hip(gfx) => gfx.fmt(f),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeviceInfo {
     pub name: String,
-    pub arch: u32,
+    pub arch: DeviceArchitecture,
     pub sms: usize,
     pub l2_bytes: usize,
     pub warp: usize,
@@ -15,6 +31,18 @@ pub struct DeviceInfo {
     pub cooperative: bool,
     pub optin_shared_bytes: usize,
     pub memory_bytes_per_second: f64,
+}
+
+impl DeviceInfo {
+    pub fn require_cuda_tensor_ops(&self, operation: &str) -> Result<()> {
+        ensure!(
+            matches!(self.arch, DeviceArchitecture::Cuda(sm) if sm >= 80) && self.warp == 32,
+            "{operation} requires implemented CUDA mma.sync/ldmatrix/cp.async; device architecture {} wave{}",
+            self.arch,
+            self.warp
+        );
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,9 +336,9 @@ mod long_tests {
             "hidden_act": "silu", "tie_word_embeddings": false, "torch_dtype": "bfloat16",
             "eos_token_id": [1]
         }))?;
-        let info = DeviceInfo {
+        let mut info = DeviceInfo {
             name: String::new(),
-            arch: 89,
+            arch: DeviceArchitecture::Cuda(89),
             sms: 128,
             l2_bytes: 72 << 20,
             warp: 32,
@@ -321,6 +349,20 @@ mod long_tests {
             optin_shared_bytes: 99 << 10,
             memory_bytes_per_second: 1_008_096_000_000.0,
         };
+        info.require_cuda_tensor_ops("gemm_skinny")?;
+        let cuda_arch = info.arch.clone();
+        info.arch = DeviceArchitecture::Hip("gfx1100".into());
+        for operation in [
+            "gemm_skinny",
+            "tcmqa",
+            "markov",
+            "moe_prefill",
+            "vision_attn",
+            "gdn_chunkwise",
+        ] {
+            assert!(info.require_cuda_tensor_ops(operation).is_err());
+        }
+        info.arch = cuda_arch;
         for (merge_threads, valid) in [
             (128, true),
             (256, true),

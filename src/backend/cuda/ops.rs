@@ -1,6 +1,6 @@
 use super::{contracts::no_overlap, cubin};
+use crate::backend::gpu::{CudaContext, CudaFunction, CudaSlice, CudaView, LaunchConfig};
 use anyhow::{Context, Result};
-use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaView, LaunchConfig};
 use std::sync::Arc;
 
 pub struct Ops {
@@ -176,22 +176,22 @@ pub fn flat(n: usize) -> LaunchConfig {
 }
 
 use super::contracts::{RowDomain, Tensor, TensorMut};
+use crate::backend::gpu::{CudaStream, PushKernelArg};
 use anyhow::ensure;
-use cudarc::driver::{CudaStream, PushKernelArg};
 use half::bf16;
 
 #[derive(Clone, Copy, Debug)]
 #[repr(i32)]
-pub(crate) enum RmsMode {
+pub enum RmsMode {
     Standard = 0,
     ZeroCentered = 1,
 }
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct RmsOptions {
+pub struct RmsOptions {
     pub mode: RmsMode,
     pub eps: f32,
 }
-pub(crate) struct GdnGateBindings<'a> {
+pub struct GdnGateBindings<'a> {
     pub a: Tensor<bf16, 2>,
     pub b: Tensor<bf16, 2>,
     pub a_log: Tensor<bf16, 1>,
@@ -199,17 +199,17 @@ pub(crate) struct GdnGateBindings<'a> {
     pub beta: &'a mut TensorMut<bf16, 2>,
     pub g: &'a mut TensorMut<f32, 2>,
 }
-pub(crate) struct NormOps {
+pub struct NormOps {
     norm: CudaFunction,
     layer_norm: CudaFunction,
 }
-pub(crate) struct GateOps {
+pub struct GateOps {
     gate: CudaFunction,
     gelu: CudaFunction,
     swiglu_rounding: crate::model_spec::SwigluRounding,
 }
 #[derive(Clone)]
-pub(crate) struct CommonOpsRef {
+pub struct CommonOpsRef {
     pub norm: Arc<NormOps>,
     pub gate: Arc<GateOps>,
 }
@@ -270,19 +270,19 @@ struct NormLaunch<'a> {
     eps: f32,
 }
 
-pub(crate) struct GatedRmsInput {
+pub struct GatedRmsInput {
     pub x: Tensor<bf16, 3>,
     pub weight: Tensor<bf16, 1>,
     pub gate: Tensor<bf16, 3>,
 }
 
-pub(crate) struct ResidualRmsInput<'a> {
+pub struct ResidualRmsInput<'a> {
     pub x: &'a mut TensorMut<bf16, 3>,
     pub residual: Tensor<bf16, 3>,
     pub weight: Tensor<bf16, 1>,
 }
 
-pub(crate) struct AddRmsNorm {
+pub struct AddRmsNorm {
     pub input: Tensor<bf16, 2>,
     pub residual: Tensor<bf16, 2>,
     pub weight: Option<Tensor<bf16, 1>>,
@@ -351,7 +351,7 @@ impl Ops {
     }
 }
 
-pub(crate) struct ResidualRmsCapture<'a> {
+pub struct ResidualRmsCapture<'a> {
     pub input: ResidualRmsInput<'a>,
     pub capture: &'a mut TensorMut<bf16, 3>,
     pub slot: u32,
@@ -963,7 +963,7 @@ impl GateOps {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
     use anyhow::ensure;
@@ -1005,7 +1005,7 @@ mod tests {
 /// Stateless activation choice; callers include this in their plan identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(i32)]
-pub(crate) enum GeluMode {
+pub enum GeluMode {
     Exact = 0,
     Tanh = 1,
 }

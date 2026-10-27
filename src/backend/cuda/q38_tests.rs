@@ -1634,7 +1634,7 @@ fn verify_attention_m4_serial_bits_gpu() -> Result<()> {
     );
     let device = Device::new(0)?;
     ensure!(
-        device.info.arch == 89,
+        device.info.arch == crate::backend::setup::DeviceArchitecture::Cuda(89),
         "VERIFY_M4 requires the authorized sm_89 device"
     );
     let ops = Ops::new(&device.ctx)?;

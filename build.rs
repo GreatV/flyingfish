@@ -201,6 +201,56 @@ fn build_rocm(out: &std::path::Path) {
     }
     index.push_str("_ => None,\n}\n}\n");
     fs::write(out.join("kernels.rs"), index).expect("cannot write hsaco index");
+    let bridge = "src/backend/hip_properties_lt.cpp";
+    let prefix = hipcc
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("hipcc installation prefix missing");
+    println!("cargo:rerun-if-changed={bridge}");
+    let object = out.join("hip_properties_lt.o");
+    let result = Command::new(&hipcc)
+        .env("TMPDIR", &temp)
+        .args(["-D__HIP_PLATFORM_AMD__", "-I"])
+        .arg(prefix.join("include"))
+        .args([
+            "-x",
+            "c++",
+            "-std=c++17",
+            "-O2",
+            "-fPIC",
+            "-c",
+            bridge,
+            "-o",
+        ])
+        .arg(&object)
+        .output()
+        .expect("cannot compile HIP properties/Lt ABI bridge");
+    assert!(
+        result.status.success(),
+        "HIP ABI bridge compilation failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let archive = out.join("libff_hip_abi.a");
+    let result = Command::new("ar")
+        .arg("crs")
+        .arg(&archive)
+        .arg(&object)
+        .output()
+        .expect("cannot archive HIP ABI bridge");
+    assert!(
+        result.status.success(),
+        "HIP ABI bridge archive failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    println!(
+        "cargo:rustc-link-search=native={}",
+        prefix.join("lib").display()
+    );
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=ff_hip_abi");
+    for library in ["amdhip64", "hipblas", "hipblaslt", "stdc++"] {
+        println!("cargo:rustc-link-lib=dylib={library}");
+    }
 }
 
 fn main() {

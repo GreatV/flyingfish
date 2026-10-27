@@ -2,6 +2,11 @@ use anyhow::Result;
 use serde::Serialize;
 pub mod setup;
 
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+pub mod gpu;
+#[cfg(feature = "rocm")]
+pub mod hip;
+
 #[cfg(feature = "cuda")]
 pub(crate) mod cuda;
 #[cfg(feature = "cuda")]

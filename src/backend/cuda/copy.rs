@@ -1,8 +1,11 @@
-use anyhow::{Result, ensure};
-use cudarc::driver::{
-    CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, PinnedHostSlice,
-    ValidAsZeroBits, sys,
+#[cfg(feature = "cuda")]
+use crate::backend::gpu::CudaSlice;
+use crate::backend::gpu::{
+    CudaContext, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, PinnedHostSlice, ValidAsZeroBits,
 };
+use anyhow::{Result, ensure};
+#[cfg(feature = "cuda")]
+use cudarc::driver::sys;
 use half::bf16;
 use std::sync::Arc;
 
@@ -72,6 +75,7 @@ pub fn columns_from(
     );
     s.context().bind_to_thread()?;
     let (dst, _dst) = dst.device_ptr_mut(s);
+    #[cfg(feature = "cuda")]
     let params = sys::CUDA_MEMCPY2D {
         srcXInBytes: r.src_col * 2,
         srcY: 0,
@@ -91,11 +95,20 @@ pub fn columns_from(
         Height: r.rows,
     };
     unsafe {
+        #[cfg(feature = "cuda")]
         sys::cuMemcpy2DAsync_v2(&params, s.cu_stream()).result()?;
+        #[cfg(feature = "rocm")]
+        s.copy_2d(
+            dst + (r.dst_col * 2) as u64,
+            src + (r.src_col * 2) as u64,
+            (r.dst_pitch * 2, r.src_pitch * 2),
+            (r.width * 2, r.rows),
+        )?;
     }
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
 pub(crate) struct RingCopy<'a> {
     pub(crate) stream: &'a Arc<CudaStream>,
     pub(crate) source: &'a CudaSlice<bf16>,
@@ -104,6 +117,7 @@ pub(crate) struct RingCopy<'a> {
     pub(crate) target_capacity: usize,
 }
 
+#[cfg(feature = "cuda")]
 impl RingCopy<'_> {
     pub(crate) fn run(
         self,
@@ -189,7 +203,7 @@ fn checked_byte_span<T>(
     Ok((byte_offset, byte_count))
 }
 
-pub fn dtoh_bytes<T: cudarc::driver::DeviceRepr>(
+pub fn dtoh_bytes<T: crate::backend::gpu::DeviceRepr>(
     s: &Arc<CudaStream>,
     src: &impl DevicePtr<T>,
     src_byte_offset: usize,
@@ -206,8 +220,9 @@ pub fn dtoh_bytes<T: cudarc::driver::DeviceRepr>(
     );
     s.context().bind_to_thread()?;
     let (src_ptr, _guard) = src.device_ptr(s);
-    let dst_ptr = dst.as_mut_ptr().map_err(anyhow::Error::from)?;
+    let dst_ptr = dst.as_mut_ptr()?;
     unsafe {
+        #[cfg(feature = "cuda")]
         sys::cuMemcpyDtoHAsync_v2(
             dst_ptr.add(dst_offset).cast(),
             src_ptr + src_offset as u64,
@@ -215,11 +230,18 @@ pub fn dtoh_bytes<T: cudarc::driver::DeviceRepr>(
             s.cu_stream(),
         )
         .result()?;
+        #[cfg(feature = "rocm")]
+        s.copy_raw(
+            dst_ptr.add(dst_offset) as u64,
+            src_ptr + src_offset as u64,
+            bytes,
+            2,
+        )?;
     }
     Ok(())
 }
 
-pub fn htod_bytes<T: cudarc::driver::DeviceRepr>(
+pub fn htod_bytes<T: crate::backend::gpu::DeviceRepr>(
     s: &Arc<CudaStream>,
     dst: &mut impl DevicePtrMut<T>,
     dst_byte_offset: usize,
@@ -236,8 +258,9 @@ pub fn htod_bytes<T: cudarc::driver::DeviceRepr>(
     );
     s.context().bind_to_thread()?;
     let (dst_ptr, _guard) = dst.device_ptr_mut(s);
-    let src_ptr = src.as_ptr().map_err(anyhow::Error::from)?;
+    let src_ptr = src.as_ptr()?;
     unsafe {
+        #[cfg(feature = "cuda")]
         sys::cuMemcpyHtoDAsync_v2(
             dst_ptr + dst_offset as u64,
             src_ptr.add(src_offset).cast(),
@@ -245,6 +268,13 @@ pub fn htod_bytes<T: cudarc::driver::DeviceRepr>(
             s.cu_stream(),
         )
         .result()?;
+        #[cfg(feature = "rocm")]
+        s.copy_raw(
+            dst_ptr + dst_offset as u64,
+            src_ptr.add(src_offset) as u64,
+            bytes,
+            1,
+        )?;
     }
     Ok(())
 }

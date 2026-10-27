@@ -2,7 +2,7 @@ pub(crate) mod attention_d256;
 pub mod blas;
 pub mod calibrate;
 mod closure;
-pub(crate) mod contracts;
+pub mod contracts;
 pub mod copy;
 pub mod cubin;
 pub mod decode;
@@ -20,7 +20,7 @@ pub(crate) mod moe;
 pub mod multi_calibrate;
 pub mod ops;
 pub mod profile;
-pub(crate) mod state;
+pub mod state;
 pub(crate) mod tree;
 pub mod verification;
 pub(crate) mod vision;
@@ -73,7 +73,7 @@ impl Device {
         );
         let info = DeviceInfo {
             name: ctx.name()?,
-            arch: sm,
+            arch: crate::backend::setup::DeviceArchitecture::Cuda(sm),
             sms: ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize,
             l2_bytes: ctx.attribute(A::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)? as usize,
             cooperative: ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH)? != 0,

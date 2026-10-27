@@ -78,20 +78,7 @@ pub(super) fn bucketed_prefill_rows(rows: u32, workspace_rows: u32) -> Result<u3
     Ok(rows.next_power_of_two().min(workspace_rows))
 }
 
-pub(crate) struct Kv {
-    pub(crate) k: CudaSlice<bf16>,
-    pub(crate) v: CudaSlice<bf16>,
-    pub(crate) compact: Option<super::state::CompactKv>,
-}
-impl Kv {
-    pub(crate) fn bytes(&self) -> usize {
-        (self.k.len() + self.v.len()) * 2
-            + self
-                .compact
-                .as_ref()
-                .map_or(0, super::state::CompactKv::bytes)
-    }
-}
+pub(crate) use super::state::Kv;
 
 pub(crate) struct Work {
     pub(crate) ids: CudaSlice<u32>,

@@ -3841,7 +3841,10 @@ mod tests {
             "patch timing checkpoint geometry mismatch"
         );
         let device = Device::new(0)?;
-        ensure!(device.info.arch == 89, "operator timing requires sm89");
+        ensure!(
+            device.info.arch == crate::backend::setup::DeviceArchitecture::Cuda(89),
+            "operator timing requires sm89"
+        );
         let stream = &device.stream;
         let ops = Ops::new(&device.ctx)?;
         let closure = Rc::new(Closure::new(false, "patch operation timing".into()));

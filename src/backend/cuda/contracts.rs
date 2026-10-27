@@ -1,10 +1,10 @@
 //! Non-owning operator views. Engine owns storage through completion of all launches.
+use crate::backend::gpu::{CudaSlice, CudaStream, DevicePtr};
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use std::sync::Arc;
 use std::{marker::PhantomData, mem::size_of};
 
-pub(crate) fn view<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
+pub fn view<T: crate::backend::gpu::DeviceRepr + Copy, const R: usize>(
     b: &CudaSlice<T>,
     s: &Arc<CudaStream>,
     offset: usize,
@@ -36,7 +36,7 @@ pub(crate) fn view<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
     unsafe { Tensor::new(ptr + (offset * size_of::<T>()) as u64, shape, stride, bytes) }
 }
 
-pub(crate) fn dense_layout<const R: usize>(shape: [u32; R]) -> Result<([u64; R], u64)> {
+pub fn dense_layout<const R: usize>(shape: [u32; R]) -> Result<([u64; R], u64)> {
     ensure!(R > 0, "empty tensor rank");
     let mut stride = [1; R];
     let mut count = 1u64;
@@ -50,7 +50,7 @@ pub(crate) fn dense_layout<const R: usize>(shape: [u32; R]) -> Result<([u64; R],
     Ok((stride, count))
 }
 
-pub(crate) fn spans_disjoint(a_ptr: u64, a_bytes: u64, b_ptr: u64, b_bytes: u64) -> Result<bool> {
+pub fn spans_disjoint(a_ptr: u64, a_bytes: u64, b_ptr: u64, b_bytes: u64) -> Result<bool> {
     let a_end = a_ptr
         .checked_add(a_bytes)
         .context("first span address overflow")?;
@@ -60,7 +60,7 @@ pub(crate) fn spans_disjoint(a_ptr: u64, a_bytes: u64, b_ptr: u64, b_bytes: u64)
     Ok(a_end <= b_ptr || b_end <= a_ptr)
 }
 
-pub(crate) fn no_overlap<T: Copy, U: Copy, const R: usize, const S: usize>(
+pub fn no_overlap<T: Copy, U: Copy, const R: usize, const S: usize>(
     a: &Tensor<T, R>,
     b: &Tensor<U, S>,
     aname: &str,
@@ -78,7 +78,7 @@ pub(crate) fn no_overlap<T: Copy, U: Copy, const R: usize, const S: usize>(
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Tensor<T, const R: usize> {
+pub struct Tensor<T, const R: usize> {
     pub ptr: u64,
     pub shape: [u32; R],
     pub stride: [u64; R],
@@ -86,7 +86,7 @@ pub(crate) struct Tensor<T, const R: usize> {
     marker: PhantomData<T>,
 }
 #[derive(Debug)]
-pub(crate) struct TensorMut<T, const R: usize>(pub Tensor<T, R>);
+pub struct TensorMut<T, const R: usize>(pub Tensor<T, R>);
 impl<T: Copy, const R: usize> Tensor<T, R> {
     /// # Safety
     /// Pointer must address storage on this context, alive until all uses complete.
@@ -177,7 +177,7 @@ impl Tensor<u32, 1> {
     }
 }
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct SeqRef {
+pub struct SeqRef {
     pub ptr: u64,
 }
 impl SeqRef {
@@ -190,7 +190,7 @@ impl SeqRef {
     }
 }
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct RowDomain {
+pub struct RowDomain {
     pub meta: SeqRef,
     pub row_base: u32,
     pub row_capacity: u32,
@@ -210,7 +210,7 @@ impl RowDomain {
     }
 }
 #[derive(Debug)]
-pub(crate) struct Scratch {
+pub struct Scratch {
     pub ptr: u64,
     pub bytes: u64,
 }
