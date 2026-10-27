@@ -2615,6 +2615,10 @@ fn cpu_control(
         });
         miss_rows.push(row as u32);
     }
+    engine
+        .device
+        .stream
+        .memset_zeros(&mut engine.work.out.slice_mut(..rows * 128))?;
     let decode = engine.moe.as_mut().context("CPU control decode missing")?;
     let stream = &engine.device.stream;
     let x = qwen::matrix(&engine.work.n, stream, 0, rows, 128)?;
@@ -2734,10 +2738,9 @@ fn gate(row_cases: &[usize], variants: &[u32], cpu: bool) -> Result<()> {
                 "Runner FAIL same-form reference repeat differs rows={rows} variant={variant}"
             );
             let mut trace = Trace::default();
-            engine
-                .device
-                .stream
-                .memcpy_htod(input, &mut engine.work.n.slice_mut(..input.len()))?;
+            let stream = &engine.device.stream;
+            stream.memset_zeros(&mut engine.work.x.slice_mut(..input.len()))?;
+            stream.memcpy_htod(input, &mut engine.work.n.slice_mut(..input.len()))?;
             {
                 engine
                     .moe_slots
