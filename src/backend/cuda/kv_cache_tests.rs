@@ -1100,7 +1100,7 @@ fn flint_sliding_ring_prefill_interleaved_gpu() -> Result<()> {
     };
     let staged_capacity = 512 + chunk;
     let window = ring - 1;
-    let mut flash = Flash::new(s.clone(), chunk, hq)?;
+    let mut flash = Flash::new(s.clone(), chunk, hq, hkv, dim)?;
     let mut initial_k = vec![bf16::ZERO; hkv * ring * dim];
     let mut initial_v = vec![bf16::ZERO; hkv * ring * dim];
     for absolute in 0..=512 {
@@ -1326,7 +1326,7 @@ fn fa2_gqa32_learned_sink_gpu() -> Result<()> {
     let mut ordinary = s.alloc_zeros::<bf16>(rows * hq * dim)?;
     let mut sink_output = s.alloc_zeros::<bf16>(rows * hq * dim)?;
     let mut negligible_output = s.alloc_zeros::<bf16>(rows * hq * dim)?;
-    let mut flash = Flash::new(s.clone(), rows.max(slide_rows), hq)?;
+    let mut flash = Flash::new(s.clone(), rows.max(slide_rows), hq, hkv, dim)?;
     let shape = Shape {
         rows,
         start,
@@ -2537,7 +2537,7 @@ fn kv_cache_kernel_gpu() -> Result<()> {
             input_k == reference_k && input_v == reference_v,
             "FA2 input oracle"
         );
-        let mut flash = Flash::new(s.clone(), rows, 24)?;
+        let mut flash = Flash::new(s.clone(), rows, 24, 4, 256)?;
         let mut result = s.alloc_zeros::<bf16>(rows * 6144)?;
         let mut reference = s.alloc_zeros::<bf16>(rows * 6144)?;
         let shape = Shape {

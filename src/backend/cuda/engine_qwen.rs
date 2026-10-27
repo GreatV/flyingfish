@@ -2039,7 +2039,13 @@ impl Engine {
             .unwrap_or(0);
         let work = Work::new_with_peer_tail(s, &model_spec, rows, peer_tail_elems)?;
         #[cfg(feature = "cuda")]
-        let flash = Flash::new(s.clone(), rows, model_spec.q_heads as usize)?;
+        let flash = Flash::new(
+            s.clone(),
+            rows,
+            model_spec.q_heads as usize,
+            model_spec.kv_heads as usize,
+            model_spec.head_dim as usize,
+        )?;
         let flint_logits = if flint {
             Some(s.alloc_zeros(model_spec.vocab as usize)?)
         } else {

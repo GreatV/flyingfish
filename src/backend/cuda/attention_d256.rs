@@ -1454,6 +1454,8 @@ mod tests {
                 stream.clone(),
                 max_rows as usize,
                 hq,
+                hkv,
+                256,
             )?)
         } else {
             None

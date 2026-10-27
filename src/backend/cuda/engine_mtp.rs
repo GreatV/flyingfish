@@ -190,7 +190,7 @@ impl MtpRuntime {
             #[cfg(test)]
             head_runs: 0,
             common,
-            flash: Flash::new(s.clone(), rows, 24)?,
+            flash: Flash::new(s.clone(), rows, 24, 4, 256)?,
         };
         runtime.prepare_rows(device, catalog, state, blas, rows)?;
         Ok(runtime)

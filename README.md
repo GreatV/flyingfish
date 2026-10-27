@@ -36,6 +36,21 @@ Requirements:
 - a CUDA toolkit with `nvcc` on `PATH` or under `CUDA_HOME`;
 - an NVIDIA driver.
 
+CUDA builds also require the device-only `nightly-2026-10-06` toolchain, with
+`rust-src`, `llvm-tools`, `llvm-bitcode-linker`, and the `nvptx64-nvidia-cuda`
+target. Install it and populate its core-build dependencies before the first
+host build:
+
+```sh
+rustup toolchain install nightly-2026-10-06 --profile minimal --component rust-src,llvm-tools,llvm-bitcode-linker,rustfmt,clippy --target nvptx64-nvidia-cuda
+RUSTFLAGS='-C target-cpu=sm_86' cargo +nightly-2026-10-06 build --manifest-path device/Cargo.toml --target nvptx64-nvidia-cuda -Z build-std=core --release --locked
+```
+
+The host build uses the stable pin and builds native attention cubins for each
+selected architecture with the device pin. Its device subprocess is offline;
+it does not install toolchains or download dependencies. No-CUDA builds do not
+invoke the device compiler.
+
 ```sh
 cargo build --release
 ```
