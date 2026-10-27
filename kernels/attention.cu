@@ -1,10 +1,10 @@
 // GQA flash-decoding attention: single-token decode (flash_decode_*) and M-token
 // block-causal verification (flash_decode_mq_*).
-// Shape: 16/2 or 32/4 GQA-8 heads, head_dim 128, bf16 data, fp32 accumulation,
-// scale = 1/sqrt(128). FD_GUARD calls __trap() on any other shape.
+// Shape: head_dim 128, n_q_heads = gqa * n_kv_heads, gqa % QP == 0, bf16 data, fp32
+// accumulation, scale = 1/sqrt(128). FD_GUARD calls __trap() on any other shape.
 //   q  : bf16 [n_q_heads][128]
 //   K,V: bf16, separate tensors, head_dim-contiguous rows
-//   o  : bf16 [16][128]
+//   o  : bf16 [n_q_heads][128]
 // Phase 1: grid (nchunks, n_q_heads/QP); one block runs an online softmax over `chunk`
 //   KV positions for QP q-heads sharing one kv head and writes the partial
 //   (m, l, acc[128]) to scratch; per-group partials merge by intra-warp shuffle, then
@@ -29,9 +29,6 @@
 
 using bf16 = __nv_bfloat16;
 
-constexpr int HQ  = 16;                 // q heads
-constexpr int HKV = 2;                  // kv heads
-constexpr int GQA = HQ / HKV;
 constexpr int DH  = 128;                // head_dim
 constexpr int TP  = 16;                 // lanes cooperating on one key position
 constexpr float SCALE = 0.08838834764831845f;   // 1/sqrt(128)
@@ -316,9 +313,10 @@ __device__ __forceinline__ void fd_phase2_body(const float* __restrict__ p_m,
 }
 
 // QP is baked into the symbol name; every other dimension and stride is an argument.
-#define FD_GUARD do { \
-  const bool shape = (n_q_heads == HQ && n_kv_heads == HKV) || (n_q_heads == 32 && n_kv_heads == 4); \
-  if (head_dim != DH || !shape || gqa != GQA) __trap(); \
+#define FD_GUARD(QP) do { \
+  if (head_dim != DH || n_q_heads <= 0 || n_kv_heads <= 0 || \
+      (n_q_heads % n_kv_heads) != 0 || gqa != (n_q_heads / n_kv_heads) || \
+      (gqa % (QP)) != 0) __trap(); \
 } while (0)
 
 template <int DH, int QP>
@@ -364,7 +362,7 @@ extern "C" __global__ void flash_decode_phase1_q##QP(                           
     float* __restrict__ scratch, const int* __restrict__ len_dev,                           \
     int n_q_heads, int n_kv_heads, int gqa, int head_dim,                                   \
     int k_head_stride, int k_pos_stride, int v_head_stride, int v_pos_stride, int chunk) {  \
-  FD_GUARD;                                                                                 \
+  FD_GUARD(QP);                                                                             \
   fd_phase1_entry<DH, QP>(q, k, v, scratch, *len_dev, chunk, n_q_heads, gqa,               \
                            k_head_stride, k_pos_stride, v_head_stride, v_pos_stride);       \
 }
@@ -381,7 +379,7 @@ extern "C" __global__ void flash_decode_window_phase1_q##QP(                    
     int n_q_heads, int n_kv_heads, int gqa, int head_dim,                                     \
     int k_head_stride, int k_pos_stride, int v_head_stride, int v_pos_stride, int chunk,      \
     const int* position, int ring_tokens) {                                                    \
-  FD_GUARD;                                                                                    \
+  FD_GUARD(QP);                                                                                \
   fd_window_phase1_entry<DH, QP>(                                                             \
       q, k, v, scratch, *len_dev, chunk, n_q_heads, gqa,                                      \
       k_head_stride, k_pos_stride, v_head_stride, v_pos_stride, position, ring_tokens);       \
@@ -435,7 +433,7 @@ extern "C" __global__ void flash_decode_phase2(float* __restrict__ scratch,
                                                 const int* __restrict__ len_dev,
                                                 int n_q_heads, int n_kv_heads, int gqa,
                                                 int head_dim, int chunk) {
-  FD_GUARD;
+  FD_GUARD(1);
   fd_phase2_entry<DH>(scratch, o, *len_dev, chunk, n_q_heads);
 }
 
@@ -445,7 +443,7 @@ extern "C" __global__ void flash_decode_sink_phase2(float* __restrict__ scratch,
                                                     const int* __restrict__ len_dev,
                                                     int n_q_heads, int n_kv_heads, int gqa,
                                                     int head_dim, int chunk) {
-  FD_GUARD;
+  FD_GUARD(1);
   fd_sink_phase2_entry<DH>(scratch, o, sinks, *len_dev, chunk, n_q_heads);
 }
 
@@ -700,7 +698,11 @@ __device__ __forceinline__ void fdmq_phase2_body(const float* __restrict__ p_m,
       __float2bfloat16(acc * inv);
 }
 
-#define FD_GUARD_MQ do { if (head_dim != DH || n_q_heads != HQ || n_kv_heads != HKV || gqa != GQA || M < 1 || M > MQ_MAX) __trap(); } while (0)
+#define FD_GUARD_MQ(QP) do { \
+  if (head_dim != DH || n_q_heads <= 0 || n_kv_heads <= 0 || \
+      (n_q_heads % n_kv_heads) != 0 || gqa != (n_q_heads / n_kv_heads) || \
+      (gqa % (QP)) != 0 || M < 1 || M > MQ_MAX) __trap(); \
+} while (0)
 
 template <int DH, int QP>
 __device__ __forceinline__ void fdmq_phase1_entry(
@@ -727,7 +729,7 @@ extern "C" __global__ void flash_decode_mq_phase1_q##QP(                        
     int n_q_heads, int n_kv_heads, int gqa, int head_dim,                                   \
     int q_tok_stride, int q_head_stride,                                                    \
     int k_head_stride, int k_pos_stride, int v_head_stride, int v_pos_stride, int chunk) {  \
-  FD_GUARD_MQ;                                                                              \
+  FD_GUARD_MQ(QP);                                                                          \
   fdmq_phase1_entry<DH, QP>(q, k, v, scratch, *len_dev, M, chunk, n_q_heads, gqa,          \
                             q_tok_stride, q_head_stride,                                    \
                             k_head_stride, k_pos_stride, v_head_stride, v_pos_stride);      \
@@ -757,7 +759,7 @@ extern "C" __global__ void flash_decode_mq_phase2(float* __restrict__ scratch,
                                                   int head_dim,
                                                   int o_tok_stride, int o_head_stride,
                                                   int chunk) {
-  FD_GUARD_MQ;
+  FD_GUARD_MQ(1);
   fdmq_phase2_entry<DH>(scratch, o, *len_dev, M, chunk, n_q_heads,
                         o_tok_stride, o_head_stride);
 }
