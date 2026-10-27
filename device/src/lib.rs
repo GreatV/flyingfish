@@ -395,8 +395,11 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                         let a = ld4::<{ ($inner / 4) * 128 }>(qb[$inner % 4]);
                         macro_rules! qk_pair {
                             ($pair:expr) => {{
-                                let b =
-                                    ld4::<{ ($inner / 4) * 128 + $pair * (32 * D) as u32 }>(kb[$inner % 4]);
+                                let b = if D == 256 {
+                                    ld4::<{ ($inner / 4) * 128 + $pair * 8192 }>(kb[$inner % 4])
+                                } else {
+                                    ld4::<{ ($inner / 4) * 128 + $pair * 4096 }>(kb[$inner % 4])
+                                };
                                 scores[$pair * 2] = mma(a, [b[0], b[1]], scores[$pair * 2]);
                                 scores[$pair * 2 + 1] = mma(a, [b[2], b[3]], scores[$pair * 2 + 1]);
                             }};
@@ -404,7 +407,11 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                         four!(qk_pair);
                     }};
                 }
-                if D == 256 { sixteen!(qk_step); } else { eight!(qk_step); }
+                if D == 256 {
+                    sixteen!(qk_step);
+                } else {
+                    eight!(qk_step);
+                }
                 wait();
                 let next_key = key + 64;
                 kp = kp.wrapping_add(64 * D);
@@ -422,16 +429,48 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                     ($n:expr) => {{
                         if $masked {
                             let col = key + $n * 8 + (lane & 3) * 2;
-                            if col >= if MODE == 1 { end } else if MODE == 2 { prefix.max(diagonal + r0 + 1).min(end) } else { (diagonal + r0 + 1).min(end) } {
+                            if col
+                                >= if MODE == 1 {
+                                    end
+                                } else if MODE == 2 {
+                                    prefix.max(diagonal + r0 + 1).min(end)
+                                } else {
+                                    (diagonal + r0 + 1).min(end)
+                                }
+                            {
                                 scores[$n][0] = f32::NEG_INFINITY;
                             }
-                            if col + 1 >= if MODE == 1 { end } else if MODE == 2 { prefix.max(diagonal + r0 + 1).min(end) } else { (diagonal + r0 + 1).min(end) } {
+                            if col + 1
+                                >= if MODE == 1 {
+                                    end
+                                } else if MODE == 2 {
+                                    prefix.max(diagonal + r0 + 1).min(end)
+                                } else {
+                                    (diagonal + r0 + 1).min(end)
+                                }
+                            {
                                 scores[$n][1] = f32::NEG_INFINITY;
                             }
-                            if col >= if MODE == 1 { end } else if MODE == 2 { prefix.max(diagonal + r1 + 1).min(end) } else { (diagonal + r1 + 1).min(end) } {
+                            if col
+                                >= if MODE == 1 {
+                                    end
+                                } else if MODE == 2 {
+                                    prefix.max(diagonal + r1 + 1).min(end)
+                                } else {
+                                    (diagonal + r1 + 1).min(end)
+                                }
+                            {
                                 scores[$n][2] = f32::NEG_INFINITY;
                             }
-                            if col + 1 >= if MODE == 1 { end } else if MODE == 2 { prefix.max(diagonal + r1 + 1).min(end) } else { (diagonal + r1 + 1).min(end) } {
+                            if col + 1
+                                >= if MODE == 1 {
+                                    end
+                                } else if MODE == 2 {
+                                    prefix.max(diagonal + r1 + 1).min(end)
+                                } else {
+                                    (diagonal + r1 + 1).min(end)
+                                }
+                            {
                                 scores[$n][3] = f32::NEG_INFINITY;
                             }
                         }
@@ -478,20 +517,34 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                         output[$n][3] *= alpha[1];
                     }};
                 }
-                if D == 256 { thirty_two!(rescale); } else { sixteen!(rescale); }
+                if D == 256 {
+                    thirty_two!(rescale);
+                } else {
+                    sixteen!(rescale);
+                }
                 macro_rules! pv_step {
                     ($inner:expr) => {{
                         let a = packed[$inner];
                         macro_rules! pv_pair {
                             ($pair:expr) => {{
-                                let b = ld4_trans::<{ ($pair / 4) * 128 + $inner * (32 * D) as u32 }>(
-                                    vb[$pair % 4],
-                                );
+                                let b = if D == 256 {
+                                    ld4_trans::<{ ($pair / 4) * 128 + $inner * 8192 }>(
+                                        vb[$pair % 4],
+                                    )
+                                } else {
+                                    ld4_trans::<{ ($pair / 4) * 128 + $inner * 4096 }>(
+                                        vb[$pair % 4],
+                                    )
+                                };
                                 output[$pair * 2] = mma(a, [b[0], b[1]], output[$pair * 2]);
                                 output[$pair * 2 + 1] = mma(a, [b[2], b[3]], output[$pair * 2 + 1]);
                             }};
                         }
-                        if D == 256 { sixteen!(pv_pair); } else { eight!(pv_pair); }
+                        if D == 256 {
+                            sixteen!(pv_pair);
+                        } else {
+                            eight!(pv_pair);
+                        }
                     }};
                 }
                 four!(pv_step);
