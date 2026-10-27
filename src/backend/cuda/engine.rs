@@ -42,6 +42,8 @@ mod mtp_generate;
 mod mtp_launch_tests;
 #[path = "engine_qwen.rs"]
 mod qwen;
+#[path = "engine_recurrent.rs"]
+mod recurrent;
 #[path = "engine_vision.rs"]
 mod vision_runtime;
 
@@ -555,6 +557,7 @@ impl SetupMode {
 enum LoadDispatch {
     Qwen,
     Llama,
+    Recurrent,
 }
 
 fn load_dispatch(architecture: crate::model_spec::Architecture) -> Result<LoadDispatch> {
@@ -564,6 +567,7 @@ fn load_dispatch(architecture: crate::model_spec::Architecture) -> Result<LoadDi
         Architecture::Llama => LoadDispatch::Llama,
         Architecture::MiniCpmV47 => LoadDispatch::Qwen,
         Architecture::Flint => LoadDispatch::Qwen,
+        Architecture::LoopVl => LoadDispatch::Recurrent,
         Architecture::Glm5Next => {
             anyhow::bail!("GLM-5.3 execution is not bound yet")
         }
@@ -592,6 +596,7 @@ pub struct Engine {
     spec: Option<Spec>,
     hidden_capture: Option<HiddenCapture>,
     qwen: Option<qwen::Runtime>,
+    recurrent: Option<recurrent::Runtime>,
     moe: Option<moe::Decode>,
     moe_slots: Option<moe::Slots>,
     moe_prefill: Option<moe::Prefill>,
@@ -888,6 +893,16 @@ impl Engine {
         let started = Instant::now();
         let model_spec = crate::model_spec::ModelSpec::read(dir)?;
         match load_dispatch(model_spec.architecture)? {
+            LoadDispatch::Recurrent => {
+                return Self::load_recurrent(
+                    dir,
+                    ordinal,
+                    capacity,
+                    requested_chunk,
+                    settings,
+                    model_spec,
+                );
+            }
             LoadDispatch::Qwen => {
                 return Self::load_qwen(
                     dir,
@@ -1019,6 +1034,7 @@ impl Engine {
             #[cfg(test)]
             flint_window_capture: None,
             qwen: None,
+            recurrent: None,
             moe: None,
             moe_slots: None,
             moe_prefill: None,
@@ -1495,6 +1511,10 @@ impl Engine {
     }
 
     fn check_step(&self, step: crate::backend::Step<'_>) -> Result<()> {
+        ensure!(
+            self.recurrent.is_none(),
+            "recurrent execution requires the prefix/decode program"
+        );
         if self.qwen.is_some() {
             ensure!(
                 matches!(step.mask, crate::backend::Mask::Causal)
@@ -1857,6 +1877,10 @@ impl Engine {
     }
 
     pub fn run_decode_step(&mut self, trace: Option<Target<'_>>) -> Result<()> {
+        if self.recurrent.is_some() {
+            self.run_recurrent(1, true, trace)?;
+            return self.work.advance(&self.ops, &self.device.stream);
+        }
         self.ensure_decode()?;
         self.forward(1, true, true, trace)?;
         if self.qwen.is_some() {
@@ -1927,7 +1951,10 @@ impl Engine {
                     tree.prepare_embed_norm(
                         &w.position,
                         &self.weights.embed,
-                        &layer.input_norm,
+                        layer
+                            .input_norm
+                            .as_ref()
+                            .context("weighted input norm missing")?,
                         super::tree::EmbedOut {
                             ids: &mut w.ids,
                             x: &mut w.x,
@@ -1942,7 +1969,12 @@ impl Engine {
                             .arg(&self.weights.embed)
                             .arg(ids)
                             .arg(&mut w.x)
-                            .arg(&layer.input_norm)
+                            .arg(
+                                layer
+                                    .input_norm
+                                    .as_ref()
+                                    .context("weighted input norm missing")?,
+                            )
                             .arg(&mut w.n)
                             .arg(&nr)
                             .arg(&hd)
@@ -2013,7 +2045,16 @@ impl Engine {
                 }
             }
             crate::backend::Operator::PostNorm => {
-                w.add_norm(&self.ops, s, &layer.post_norm, rows, c)?;
+                w.add_norm(
+                    &self.ops,
+                    s,
+                    layer
+                        .post_norm
+                        .as_ref()
+                        .context("weighted post norm missing")?,
+                    rows,
+                    c,
+                )?;
             }
             crate::backend::Operator::GateUp => {
                 self.blas
@@ -2058,9 +2099,14 @@ impl Engine {
             }
             crate::backend::Operator::NextNorm => {
                 let weight = if let Some(next) = self.weights.layers.get(i + 1) {
-                    &next.input_norm
+                    next.input_norm
+                        .as_ref()
+                        .context("weighted input norm missing")?
                 } else {
-                    &self.weights.norm
+                    self.weights
+                        .norm
+                        .as_ref()
+                        .context("weighted final norm missing")?
                 };
                 if let Some(binding) = self.hidden_capture.as_mut()
                     && let Some(slot) = binding.layer_slots[i]
@@ -2707,6 +2753,9 @@ impl Engine {
         trace: Option<&mut Trace>,
         keep: usize,
     ) -> Result<u32> {
+        if self.recurrent.is_some() {
+            return self.prefill_recurrent(ids, ids.len(), trace, keep);
+        }
         self.prefill_chunks(ids, trace, keep, |_, _| Ok(()))
     }
 
@@ -2881,6 +2930,10 @@ impl Engine {
 
     pub fn rewind(&mut self, position: usize, token: u32) -> Result<()> {
         ensure!(
+            self.recurrent.is_none(),
+            "LoopVL rewind requires rebuilding the bidirectional prefix"
+        );
+        ensure!(
             self.qwen.is_none(),
             "Q38 rewind requires a committed GDN checkpoint; scalar rewind is unsupported"
         );
@@ -2907,6 +2960,16 @@ impl Engine {
     }
 
     pub fn decode_weight_bytes(&self) -> usize {
+        if self.recurrent.is_some() {
+            return self
+                .weights
+                .layers
+                .iter()
+                .map(|l| (l.qkv.len() + l.o.len() + l.gu.len() + l.down.len()) * 2)
+                .sum::<usize>()
+                * 4
+                + (self.weights.head.len() + 2 * self.config.hidden_size) * 2;
+        }
         self.weights.bytes - self.weights.embed.len() * size_of::<bf16>()
             + self.config.hidden_size * size_of::<bf16>()
     }
@@ -3118,6 +3181,9 @@ impl Engine {
     }
 
     pub fn decode_linear(&self) -> &'static str {
+        if self.recurrent.is_some() {
+            return "BF16 skinny decode, FP32 accumulation; fixed BF16 Lt prefill";
+        }
         if self.qwen.is_some() {
             return "fp8-storage-gemv/fp32-accum; fixed-bf16-lt";
         }

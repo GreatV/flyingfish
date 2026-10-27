@@ -179,6 +179,22 @@ impl MappedCheckpoint {
         policy: LoadPolicy,
     ) -> Result<TensorManifest> {
         use crate::model_spec::Architecture;
+        if spec.architecture == Architecture::LoopVl {
+            ensure!(
+                policy == LoadPolicy::TextOnly,
+                "LoopVL L1a supports text-only loading"
+            );
+            let mut expected = BTreeMap::new();
+            Self::loopvl_entries(&mut expected);
+            let planned = expected
+                .values()
+                .filter(|(_, _, scope)| *scope == TensorScope::Text)
+                .try_fold(0usize, |sum, (dtype, shape, _)| {
+                    sum.checked_add(tensor_bytes(*dtype, shape)?)
+                        .context("LoopVL resident size overflow")
+                })?;
+            return self.assemble_manifest("LoopVL", expected, policy, planned, None);
+        }
         if spec.architecture == Architecture::Glm5Next {
             let mut expected = BTreeMap::new();
             Self::glm5_next_entries(spec, &mut expected)?;
@@ -230,7 +246,7 @@ impl MappedCheckpoint {
             Architecture::Qwen35Text => "Q38",
             Architecture::MiniCpmV47 => "MiniCPM",
             Architecture::Flint => "Flint",
-            Architecture::Llama | Architecture::Glm5Next => {
+            Architecture::Llama | Architecture::Glm5Next | Architecture::LoopVl => {
                 bail!("checkpoint manifest requires a Qwen3.5-family spec")
             }
         };
@@ -268,7 +284,7 @@ impl MappedCheckpoint {
             }
             Architecture::MiniCpmV47 => Self::minicpm_vision_entries(spec, &mut expected)?,
             Architecture::Flint => {}
-            Architecture::Llama | Architecture::Glm5Next => unreachable!(),
+            Architecture::Llama | Architecture::Glm5Next | Architecture::LoopVl => unreachable!(),
         }
         if policy.selects(TensorScope::Mtp)
             && !expected
@@ -295,6 +311,103 @@ impl MappedCheckpoint {
         )
     }
 
+    fn loopvl_entries(expected: &mut BTreeMap<String, ExpectedTensor>) {
+        use TensorScope::{Text, Vision};
+        let mut add = |name: String, shape: Vec<usize>, dtype, scope| {
+            put(expected, name, dtype, shape, scope)
+        };
+        for stack in ["L", "H"] {
+            for layer in 0..16 {
+                let p = format!("language_model.model.{stack}_module.layers.{layer}");
+                for role in ["q", "k", "v", "o", "gate"] {
+                    add(
+                        format!("{p}.self_attn.{role}_proj.weight"),
+                        vec![1536, 1536],
+                        Dtype::BF16,
+                        Text,
+                    );
+                }
+                for role in ["gate", "up"] {
+                    add(
+                        format!("{p}.mlp.{role}_proj.weight"),
+                        vec![4096, 1536],
+                        Dtype::BF16,
+                        Text,
+                    );
+                }
+                add(
+                    format!("{p}.mlp.down_proj.weight"),
+                    vec![1536, 4096],
+                    Dtype::BF16,
+                    Text,
+                );
+            }
+        }
+        for (name, shape) in [
+            (
+                "language_model.model.embed_tokens.weight",
+                vec![65536, 1536],
+            ),
+            ("language_model.lm_head.weight", vec![65536, 1536]),
+            ("language_model.model.z_L_init", vec![1536]),
+        ] {
+            add(name.into(), shape, Dtype::BF16, Text);
+        }
+        for (name, shape) in [
+            ("language_model.model.visual_anchor.raw_alpha", vec![2]),
+            ("language_model.model.visual_gate.out_proj.bias", vec![1]),
+            (
+                "language_model.model.visual_gate.out_proj.weight",
+                vec![1, 256],
+            ),
+            (
+                "language_model.model.visual_gate.query_proj.weight",
+                vec![256, 1536],
+            ),
+            (
+                "language_model.model.visual_gate.visual_proj.weight",
+                vec![256, 1536],
+            ),
+            ("projector.fc1.weight", vec![1536, 1024]),
+            ("projector.fc1.bias", vec![1536]),
+            ("projector.fc2.weight", vec![1536, 1536]),
+            ("projector.fc2.bias", vec![1536]),
+            ("projector.visual_embedding_scale", vec![]),
+        ] {
+            add(name.into(), shape, Dtype::F32, Vision);
+        }
+        for layer in 0..28 {
+            let p = format!("vision_encoder.model.encoder.layers.{layer}");
+            for (role, shape) in [
+                ("input_layernorm.weight", vec![1024]),
+                ("post_attention_layernorm.weight", vec![1024]),
+                ("self_attn.q_norm.weight", vec![128]),
+                ("self_attn.k_norm.weight", vec![128]),
+                ("self_attn.q_proj.weight", vec![2048, 1024]),
+                ("self_attn.k_proj.weight", vec![1024, 1024]),
+                ("self_attn.v_proj.weight", vec![1024, 1024]),
+                ("self_attn.o_proj.weight", vec![1024, 2048]),
+                ("mlp.gate_proj.weight", vec![3072, 1024]),
+                ("mlp.up_proj.weight", vec![3072, 1024]),
+                ("mlp.down_proj.weight", vec![1024, 3072]),
+            ] {
+                add(format!("{p}.{role}"), shape, Dtype::BF16, Vision);
+            }
+        }
+        for (name, shape) in [
+            ("embeddings.patch_embedding.weight", vec![1024, 3, 14, 14]),
+            ("embeddings.patch_embedding.bias", vec![1024]),
+            ("encoder.norm.weight", vec![1024]),
+        ] {
+            add(
+                format!("vision_encoder.model.{name}"),
+                shape,
+                Dtype::BF16,
+                Vision,
+            );
+        }
+    }
+
     fn text_entries(
         spec: &crate::model_spec::ModelSpec,
         expected: &mut BTreeMap<String, ExpectedTensor>,
@@ -313,7 +426,9 @@ impl MappedCheckpoint {
             Architecture::Qwen35Text | Architecture::MiniCpmV47 | Architecture::Llama => {
                 "model.language_model"
             }
-            Architecture::Glm5Next => unreachable!("GLM has a dedicated manifest path"),
+            Architecture::Glm5Next | Architecture::LoopVl => {
+                unreachable!("architecture has a dedicated manifest path")
+            }
         };
         for name in [
             format!("{global_prefix}.embed_tokens.weight"),
@@ -474,7 +589,7 @@ impl MappedCheckpoint {
                         Architecture::Qwen35Text
                         | Architecture::MiniCpmV47
                         | Architecture::Llama => 2 * q_width,
-                        Architecture::Glm5Next => {
+                        Architecture::Glm5Next | Architecture::LoopVl => {
                             unreachable!("GLM has a dedicated manifest path")
                         }
                     };

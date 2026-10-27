@@ -207,7 +207,10 @@ fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
             );
             (2048, 512, 248144, 16, 2, 40, 32, spec.linear_format)
         }
-        Architecture::Llama | Architecture::Flint | Architecture::Glm5Next => anyhow::bail!(
+        Architecture::Llama
+        | Architecture::Flint
+        | Architecture::Glm5Next
+        | Architecture::LoopVl => anyhow::bail!(
             "hybrid engine does not implement architecture={:?}",
             spec.architecture
         ),
@@ -1917,6 +1920,7 @@ impl Engine {
             resident_ids_len: 0,
             last_input_kind: None,
             qwen: None,
+            recurrent: None,
             moe: None,
             moe_slots: None,
             moe_prefill: None,
@@ -3177,7 +3181,13 @@ impl Engine {
                         let weight = if let Some(next) = q.layers.get(i + 1) {
                             next.input_norm
                         } else {
-                            vector(&self.weights.norm, s)?
+                            vector(
+                                self.weights
+                                    .norm
+                                    .as_ref()
+                                    .context("weighted final norm missing")?,
+                                s,
+                            )?
                         };
                         self.ops.add_rmsnorm_capture(
                             s,
@@ -3208,7 +3218,13 @@ impl Engine {
                             let weight = if let Some(next) = q.layers.get(i + 1) {
                                 next.input_norm
                             } else {
-                                vector(&self.weights.norm, s)?
+                                vector(
+                                    self.weights
+                                        .norm
+                                        .as_ref()
+                                        .context("weighted final norm missing")?,
+                                    s,
+                                )?
                             };
                             self.ops.rms_add_fp32_with(
                                 s,
@@ -3297,7 +3313,13 @@ impl Engine {
                         s,
                         domain,
                         heads(&w.x, s, 0, rows, 1, h as u32)?,
-                        vector(&self.weights.norm, s)?,
+                        vector(
+                            self.weights
+                                .norm
+                                .as_ref()
+                                .context("weighted final norm missing")?,
+                            s,
+                        )?,
                         &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
                         RmsOptions {
                             mode: norm_mode(&self.model_spec),

@@ -275,7 +275,13 @@ impl Engine {
                 row_capacity: rows as u32,
             },
             heads(&self.work.x, &s, 0, rows, 1, HIDDEN as u32)?,
-            vector(&self.weights.norm, &s)?,
+            vector(
+                self.weights
+                    .norm
+                    .as_ref()
+                    .context("weighted final norm missing")?,
+                &s,
+            )?,
             &mut TensorMut(heads(&self.work.n, &s, 0, rows, 1, HIDDEN as u32)?),
             RmsOptions {
                 mode: RmsMode::ZeroCentered,

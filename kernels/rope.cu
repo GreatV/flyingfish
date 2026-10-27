@@ -1,5 +1,37 @@
 #include <cuda_bf16.h>
 
+extern "C" __global__ void rope_table_kv(__nv_bfloat16* qkvg,
+    __nv_bfloat16* k, __nv_bfloat16* v, const __nv_bfloat16* table,
+    const int* start, int rows, int q_heads, int kv_heads, int dim,
+    int capacity, int row_stride) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int half = dim / 2;
+    const int heads = q_heads + kv_heads;
+    if (i >= rows * heads * half) return;
+    const int d = i % half;
+    const int head = (i / half) % heads;
+    const int row = i / (half * heads);
+    const int position = *start + row;
+    if (position < 0 || position >= capacity) { __trap(); return; }
+    const int off = row * row_stride + head * dim + d;
+    const __nv_bfloat16 c = table[position * dim + d];
+    const __nv_bfloat16 s = table[position * dim + half + d];
+    const __nv_bfloat16 a = qkvg[off];
+    const __nv_bfloat16 b = qkvg[off + half];
+    const __nv_bfloat16 lo = __hsub(__hmul(a,c), __hmul(b,s));
+    const __nv_bfloat16 hi = __hadd(__hmul(b,c), __hmul(a,s));
+    if (head < q_heads) {
+        qkvg[off] = lo;
+        qkvg[off + half] = hi;
+    } else {
+        const size_t dst = ((size_t)(head - q_heads) * capacity + position) * dim + d;
+        k[dst] = lo;
+        k[dst + half] = hi;
+        v[dst] = qkvg[off + kv_heads * dim];
+        v[dst + half] = qkvg[off + kv_heads * dim + half];
+    }
+}
+
 extern "C" __global__ void sequence_positions(const int* prefix, int* metadata,
                                                 int* axes, int rows, int capacity,
                                                 int rotary_shift) {

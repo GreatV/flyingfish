@@ -11,6 +11,7 @@ pub enum Architecture {
     MiniCpmV47,
     Flint,
     Glm5Next,
+    LoopVl,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Mixer {
@@ -266,7 +267,10 @@ impl VisionConfig {
                     v.newline_token
                 );
             }
-            Architecture::Llama | Architecture::Flint | Architecture::Glm5Next => {
+            Architecture::Llama
+            | Architecture::Flint
+            | Architecture::Glm5Next
+            | Architecture::LoopVl => {
                 bail!("vision configuration requires a supported multimodal architecture")
             }
         }
@@ -958,9 +962,10 @@ impl ModelSpec {
         match self.architecture {
             Architecture::Flint => SwigluRounding::Once,
             Architecture::Glm5Next => SwigluRounding::ClampedTwice,
-            Architecture::Llama | Architecture::Qwen35Text | Architecture::MiniCpmV47 => {
-                SwigluRounding::Twice
-            }
+            Architecture::Llama
+            | Architecture::Qwen35Text
+            | Architecture::MiniCpmV47
+            | Architecture::LoopVl => SwigluRounding::Twice,
         }
     }
 
@@ -975,9 +980,10 @@ impl ModelSpec {
             Architecture::Flint | Architecture::Glm5Next => {
                 RoutedWeightBoundary::BeforeContributionBf16
             }
-            Architecture::Llama | Architecture::Qwen35Text | Architecture::MiniCpmV47 => {
-                RoutedWeightBoundary::AfterDownBf16
-            }
+            Architecture::Llama
+            | Architecture::Qwen35Text
+            | Architecture::MiniCpmV47
+            | Architecture::LoopVl => RoutedWeightBoundary::AfterDownBf16,
         }
     }
 
@@ -990,6 +996,7 @@ impl ModelSpec {
                 Architecture::MiniCpmV47 => "qwen3_5_moe_text",
                 Architecture::Flint => "flint",
                 Architecture::Glm5Next => "glm5_next_text",
+                Architecture::LoopVl => "hrm_text",
             }
             .into(),
             hidden_size: self.hidden as usize,
@@ -1029,6 +1036,8 @@ impl ModelSpec {
             Self::flint(&root, &generation)
         } else if root.get("model_type").and_then(Value::as_str) == Some("glm5_next") {
             Self::glm5_next(&root, &generation)
+        } else if root.get("model_type").and_then(Value::as_str) == Some("loopvl") {
+            Self::loopvl(&root, &generation)
         } else {
             Self::qwen(&root, &generation)
         }
@@ -1065,6 +1074,137 @@ impl ModelSpec {
                     ffn: FfnKind::Dense,
                 })
                 .collect(),
+        })
+    }
+    pub fn loopvl(root: &Value, generation: &Value) -> Result<Self> {
+        equal(root, "model_type", "loopvl".into())?;
+        equal(
+            root,
+            "architectures",
+            serde_json::json!(["LoopVLForConditionalGeneration"]),
+        )?;
+        equal(root, "format_version", 2.into())?;
+        ensure!(
+            root.get("quantization_config").is_none(),
+            "LoopVL requires published BF16/F32 tensors"
+        );
+        equal(
+            root,
+            "component_dtypes",
+            serde_json::json!({"vision":"bfloat16", "language":"bfloat16", "projector":"float32", "visual_gate":"float32", "visual_anchor":"float32"}),
+        )?;
+        let t = root.get("text_config").context("missing text_config")?;
+        for (key, value) in [
+            ("model_type", "hrm_text".into()),
+            ("dtype", "bfloat16".into()),
+            ("hidden_act", "silu".into()),
+            ("prefix_lm", true.into()),
+            ("tie_word_embeddings", false.into()),
+            ("attention_bias", false.into()),
+            ("mlp_bias", false.into()),
+            ("use_cache", false.into()),
+            ("architectures", serde_json::json!(["HrmTextForCausalLM"])),
+        ] {
+            equal(t, key, value)?;
+        }
+        for (key, value) in [
+            ("hidden_size", 1536),
+            ("intermediate_size", 4096),
+            ("vocab_size", 65536),
+            ("num_attention_heads", 12),
+            ("num_key_value_heads", 12),
+            ("head_dim", 128),
+            ("H_cycles", 2),
+            ("L_cycles", 3),
+            ("num_layers_per_stack", 16),
+            ("num_hidden_layers", 128),
+            ("max_position_embeddings", 8192),
+            ("bos_token_id", 6),
+            ("eos_token_id", 11),
+            ("pad_token_id", 5),
+        ] {
+            equal(t, key, value.into())?;
+        }
+        for (key, value) in [
+            ("rms_norm_eps", 1e-6),
+            ("rope_theta", 10000.0),
+            ("embedding_scale", 39.191835884530846),
+            ("attention_dropout", 0.0),
+        ] {
+            ensure!(
+                t.get(key).and_then(Value::as_f64) == Some(value),
+                "unsupported LoopVL {key}"
+            );
+        }
+        equal(
+            t,
+            "rope_parameters",
+            serde_json::json!({"rope_type":"yarn", "rope_theta":10000, "factor":2, "original_max_position_embeddings":4096, "beta_fast":32, "beta_slow":1}),
+        )?;
+        let language = &root["loopvl_config"]["language"];
+        for key in [
+            "hidden_size",
+            "num_attention_heads",
+            "head_dim",
+            "H_cycles",
+            "L_cycles",
+            "rope_theta",
+            "rope_parameters",
+            "max_position_embeddings",
+        ] {
+            ensure!(
+                language.get(key) == t.get(key),
+                "LoopVL language/text_config mismatch: {key}"
+            );
+        }
+        let v = root.get("vision_config").context("missing vision_config")?;
+        equal(v, "model_type", "penguinvl_vision_encoder".into())?;
+        for (key, value) in [
+            ("hidden_size", 1024),
+            ("intermediate_size", 3072),
+            ("num_hidden_layers", 28),
+            ("num_attention_heads", 16),
+            ("num_key_value_heads", 8),
+            ("head_dim", 128),
+            ("patch_size", 14),
+            ("num_channels", 3),
+        ] {
+            equal(v, key, value.into())?;
+        }
+        let eos_value = generation
+            .get("eos_token_id")
+            .filter(|v| !v.is_null())
+            .unwrap_or(&t["eos_token_id"]);
+        Ok(Self {
+            abi_version: 1,
+            architecture: Architecture::LoopVl,
+            hidden: positive(t, "hidden_size")?,
+            intermediate: positive(t, "intermediate_size")?,
+            vocab: positive(t, "vocab_size")?,
+            q_heads: positive(t, "num_attention_heads")?,
+            kv_heads: positive(t, "num_key_value_heads")?,
+            head_dim: positive(t, "head_dim")?,
+            q_width: 1536,
+            max_position: positive(t, "max_position_embeddings")?,
+            rms_eps: 1e-6,
+            rope_theta: 10000.0,
+            rotary_dim: 128,
+            linear_format: LinearFormat::Bf16,
+            expert_format: None,
+            eos: eos(eos_value, 65536)?,
+            layers: (0..128)
+                .map(|state_index| LayerPlan {
+                    mixer: Mixer::FullAttention,
+                    state_index,
+                    rope: true,
+                    sliding_window: None,
+                    ffn: FfnKind::Dense,
+                })
+                .collect(),
+            moe: None,
+            gdn: None,
+            glm5_next: None,
+            vision: None,
         })
     }
     pub fn qwen(root: &Value, generation: &Value) -> Result<Self> {

@@ -70,7 +70,13 @@ impl Chain {
                     row_capacity: rows as u32,
                 },
                 heads(&e.work.x, s, 0, rows, 1, HIDDEN as u32)?,
-                vector(&e.weights.norm, s)?,
+                vector(
+                    e.weights
+                        .norm
+                        .as_ref()
+                        .context("weighted final norm missing")?,
+                    s,
+                )?,
                 &mut TensorMut(heads(&b.target, s, 0, rows, 1, HIDDEN as u32)?),
                 RmsOptions {
                     mode: RmsMode::ZeroCentered,
@@ -928,7 +934,14 @@ pub(super) mod tests {
                                     row_capacity: rows as u32,
                                 },
                                 heads(&engine.work.x, stream, 0, rows, 1, HIDDEN as u32)?,
-                                vector(&engine.weights.norm, stream)?,
+                                vector(
+                                    engine
+                                        .weights
+                                        .norm
+                                        .as_ref()
+                                        .context("weighted final norm missing")?,
+                                    stream,
+                                )?,
                                 &mut TensorMut(heads(
                                     &engine.work.n,
                                     stream,

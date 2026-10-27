@@ -7,6 +7,7 @@ pub struct Ops {
     pub embed: CudaFunction,
     pub embed_rmsnorm: CudaFunction,
     pub add_norm: CudaFunction,
+    add_norm_unit: CudaFunction,
     pub add_norm_capture: CudaFunction,
     pub add_norm_fp32: CudaFunction,
     norm_capture: CudaFunction,
@@ -73,6 +74,7 @@ impl Ops {
             embed: embed.load_function("embed")?,
             embed_rmsnorm: embed_rmsnorm.load_function("embed_rmsnorm")?,
             add_norm: norm.load_function("add_rmsnorm")?,
+            add_norm_unit: norm.load_function("add_rmsnorm_unit")?,
             add_norm_capture: add_norm_capture.load_function("add_rmsnorm_capture")?,
             add_norm_fp32: norm.load_function("add_rmsnorm_fp32")?,
             norm_capture: cubin::module(ctx, "q38_common")?.load_function("q38_norm_capture")?,
@@ -278,6 +280,75 @@ pub(crate) struct ResidualRmsInput<'a> {
     pub x: &'a mut TensorMut<bf16, 3>,
     pub residual: Tensor<bf16, 3>,
     pub weight: Tensor<bf16, 1>,
+}
+
+pub(crate) struct AddRmsNorm {
+    pub input: Tensor<bf16, 2>,
+    pub residual: Tensor<bf16, 2>,
+    pub weight: Option<Tensor<bf16, 1>>,
+    pub output: TensorMut<bf16, 2>,
+    pub sum: TensorMut<bf16, 2>,
+    pub eps: f32,
+}
+
+impl Ops {
+    pub fn add_rmsnorm(&self, stream: &Arc<CudaStream>, call: AddRmsNorm) -> Result<()> {
+        let AddRmsNorm {
+            input,
+            residual,
+            weight,
+            output,
+            sum,
+            eps,
+        } = call;
+        for t in [input, residual, output.0, sum.0] {
+            t.validate()?;
+            ensure!(
+                t.shape == input.shape && t.stride == [u64::from(t.shape[1]), 1],
+                "add_rmsnorm requires matching contiguous rows"
+            );
+        }
+        ensure!(eps.is_finite() && eps > 0.0, "invalid add_rmsnorm epsilon");
+        for t in [input, residual, sum.0] {
+            no_overlap(&t, &output.0, "residual input/sum", "norm output")?;
+        }
+        no_overlap(&input, &sum.0, "input", "sum")?;
+        if residual.ptr != sum.0.ptr {
+            no_overlap(&residual, &sum.0, "residual", "sum")?;
+        }
+        let rows = i32::try_from(input.shape[0])?;
+        let dim = i32::try_from(input.shape[1])?;
+        let function = if weight.is_some() {
+            &self.add_norm
+        } else {
+            &self.add_norm_unit
+        };
+        let mut launch = stream.launch_builder(function);
+        launch.arg(&input.ptr).arg(&residual.ptr);
+        let wp = weight.map(|w| w.ptr);
+        if let Some(w) = weight {
+            w.validate()?;
+            ensure!(
+                w.shape == [input.shape[1]] && w.stride == [1],
+                "add_rmsnorm weight extent"
+            );
+            no_overlap(&w, &output.0, "weight", "norm output")?;
+            no_overlap(&w, &sum.0, "weight", "sum")?;
+        }
+        if let Some(ptr) = wp.as_ref() {
+            launch.arg(ptr);
+        }
+        unsafe {
+            launch
+                .arg(&output.0.ptr)
+                .arg(&sum.0.ptr)
+                .arg(&rows)
+                .arg(&dim)
+                .arg(&eps)
+                .launch(grid(rows as usize, 256))?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct ResidualRmsCapture<'a> {

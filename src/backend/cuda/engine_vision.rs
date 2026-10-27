@@ -78,7 +78,8 @@ impl VisionGeometry {
             }
             crate::model_spec::Architecture::Llama
             | crate::model_spec::Architecture::Flint
-            | crate::model_spec::Architecture::Glm5Next => {
+            | crate::model_spec::Architecture::Glm5Next
+            | crate::model_spec::Architecture::LoopVl => {
                 bail!("vision configuration requires a multimodal architecture")
             }
         };
@@ -1054,7 +1055,10 @@ impl VisionWeights {
                     expected,
                 )
             }
-            Architecture::Llama | Architecture::Flint | Architecture::Glm5Next => {
+            Architecture::Llama
+            | Architecture::Flint
+            | Architecture::Glm5Next
+            | Architecture::LoopVl => {
                 bail!("vision configuration requires a multimodal architecture")
             }
         };
@@ -2156,7 +2160,10 @@ impl VisionRuntime {
                     crate::vision_input::nearest_position_ids(input.grids, vision.position_side)?;
                 (s.clone_htod(&ids)?, None)
             }
-            Architecture::Llama | Architecture::Flint | Architecture::Glm5Next => {
+            Architecture::Llama
+            | Architecture::Flint
+            | Architecture::Glm5Next
+            | Architecture::LoopVl => {
                 bail!("vision configuration requires a multimodal architecture")
             }
         };
@@ -2215,7 +2222,10 @@ impl VisionRuntime {
                         vision.patch,
                     )?;
                 }
-                Architecture::Llama | Architecture::Flint | Architecture::Glm5Next => {
+                Architecture::Llama
+                | Architecture::Flint
+                | Architecture::Glm5Next
+                | Architecture::LoopVl => {
                     bail!("vision configuration requires a multimodal architecture")
                 }
             }
