@@ -25,6 +25,123 @@ struct CommittedKv {
 }
 
 #[test]
+#[ignore = "GPU window required; D128 bidirectional and prefix-LM masks"]
+fn prefill_sequence_masks_gpu() -> Result<()> {
+    let device = Device::new(0)?;
+    let s = &device.stream;
+    let same_bits = |a: &[bf16], b: &[bf16]| {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+    };
+    for (hq, hkv, rows, prefix) in [(16, 8, 2048, None), (12, 12, 130, Some(65))] {
+        let width = hq * 128;
+        let pitch = width + 512;
+        let capacity = rows + 64;
+        let mut host_q = vec![bf16::NAN; rows * pitch];
+        for row in 0..rows {
+            for col in 0..width {
+                host_q[row * pitch + col] =
+                    bf16::from_f32(((row * 37 + col * 53 + 11) % 1009) as f32 / 512.0 - 1.0);
+            }
+        }
+        let mut host_k = vec![bf16::NAN; hkv * capacity * 128];
+        let mut host_v = host_k.clone();
+        for head in 0..hkv {
+            for row in 0..rows {
+                for col in 0..128 {
+                    let i = (head * capacity + row) * 128 + col;
+                    host_k[i] = bf16::from_f32(((i * 17 + 23) % 1013) as f32 / 512.0 - 1.0);
+                    host_v[i] = bf16::from_f32(((i * 29 + 7) % 1009) as f32 / 512.0 - 1.0);
+                }
+            }
+        }
+        let q = s.clone_htod(&host_q)?;
+        let k = s.clone_htod(&host_k)?;
+        let mut v = s.clone_htod(&host_v)?;
+        let mut output = s.alloc_zeros::<bf16>(rows * width)?;
+        let mut flash = Flash::new(s.clone(), rows, hq, hkv, 128)?;
+        let shape = Shape {
+            rows,
+            start: 0,
+            q_heads: hq,
+            kv_heads: hkv,
+            capacity,
+            head_dim: 128,
+            causal: false,
+            window_left: None,
+        };
+        let mut execute = |values: &CudaSlice<bf16>, causal: bool| -> Result<Vec<bf16>> {
+            flash.run_masked(super::flash::Query {
+                q: &q,
+                q_row_stride: pitch,
+                k: &k,
+                v: values,
+                out: &mut output,
+                shape: Shape { causal, ..shape },
+                keys: rows,
+                prefix: if causal { None } else { prefix },
+            })?;
+            let values = s.clone_dtoh(&output)?;
+            ensure!(
+                values.iter().all(|v| v.is_finite()),
+                "nonfinite masked prefill"
+            );
+            Ok(values)
+        };
+        let baseline = execute(&v, false)?;
+        let causal_baseline = execute(&v, true)?;
+        let last = prefix.unwrap_or(rows) - 1;
+        let mut changed = host_v.clone();
+        for head in 0..hkv {
+            changed[(head * capacity + last) * 128..(head * capacity + last + 1) * 128]
+                .fill(bf16::from_f32(64.0));
+        }
+        s.memcpy_htod(&changed, &mut v)?;
+        let legal = execute(&v, false)?;
+        let causal_control = execute(&v, true)?;
+        ensure!(
+            !same_bits(&legal[..width], &baseline[..width]),
+            "legal future prefix key omitted"
+        );
+        ensure!(
+            same_bits(&causal_control[..width], &causal_baseline[..width]),
+            "causal control read future key"
+        );
+        if let Some(p) = prefix {
+            let mut changed = host_v.clone();
+            for head in 0..hkv {
+                changed[(head * capacity + p + 1) * 128..(head * capacity + p + 2) * 128]
+                    .fill(bf16::from_f32(64.0));
+            }
+            s.memcpy_htod(&changed, &mut v)?;
+            let future = execute(&v, false)?;
+            ensure!(
+                same_bits(&future[..(p + 1) * width], &baseline[..(p + 1) * width]),
+                "prefix/causal suffix read future key"
+            );
+            ensure!(
+                !same_bits(
+                    &future[(p + 1) * width..(p + 2) * width],
+                    &baseline[(p + 1) * width..(p + 2) * width]
+                ),
+                "suffix omitted current key"
+            );
+        }
+        let copied_q = s.clone_dtoh(&q)?;
+        ensure!(
+            copied_q
+                .iter()
+                .zip(&host_q)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "pitched query or padding modified"
+        );
+        eprintln!(
+            "PASS prefill_sequence_masks hq={hq} hkv={hkv} rows={rows} prefix={prefix:?} causal_control_rejected=true"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "GPU window required; HD128 Flint attention gate"]
 fn gqa32_attention_window_sink_gpu() -> Result<()> {
     let device = Device::new(0)?;

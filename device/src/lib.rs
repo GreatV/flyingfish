@@ -107,11 +107,11 @@ unsafe fn shuffle(a: f32, mask: u32) -> f32 {
     f32::from_bits(x)
 }
 #[inline(always)]
-unsafe fn probability(a: f32, negative_peak: f32) -> f32 {
+unsafe fn probability<const D: usize>(a: f32, negative_peak: f32) -> f32 {
     let x;
     unsafe {
         asm!("fma.rn.ftz.f32 {x}, {a}, {scale}, {peak}; ex2.approx.ftz.f32 {x}, {x};",
-            x=out(reg32) x,a=in(reg32) a,scale=in(reg32) (core::f32::consts::LOG2_E/16.0),peak=in(reg32) negative_peak);
+            x=out(reg32) x,a=in(reg32) a,scale=in(reg32) (core::f32::consts::LOG2_E * if D == 256 { 0.0625 } else { core::f32::consts::FRAC_1_SQRT_2 / 8.0 }),peak=in(reg32) negative_peak);
     }
     x
 }
@@ -217,17 +217,26 @@ macro_rules! thirty_two {
 }
 
 #[inline(always)]
-unsafe fn copy_kv<const MASK: bool>(dst: [u32; 2], src: *const u16, row: u32, rows: u32) {
+unsafe fn copy_kv<const D: usize, const MASK: bool>(
+    dst: [u32; 2],
+    src: *const u16,
+    row: u32,
+    rows: u32,
+) {
     unsafe {
         macro_rules! transfer {
             ($i:expr) => {
                 asm!("cp.async.cg.shared.global [{dst}+{shared_offset}], [{src}+{global_offset}], 16, {bytes};",
                     dst=in(reg32) dst[$i % 2],src=in(reg64) src,
                     shared_offset=const ($i / 2) * 4096,global_offset=const $i * 2048,
-                    bytes=in(reg32) if !MASK || row + $i * 4 < rows {16u32} else {0u32});
+                    bytes=in(reg32) if !MASK || row + $i * (1024 / D as u32) < rows {16u32} else {0u32});
             };
         }
-        sixteen!(transfer);
+        if D == 256 {
+            sixteen!(transfer);
+        } else {
+            eight!(transfer);
+        }
     }
 }
 
@@ -236,43 +245,104 @@ unsafe fn copy_kv<const MASK: bool>(dst: [u32; 2], src: *const u16, row: u32, ro
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
     unsafe {
+        attention::<256, 32, 0>(p, p.start + p.rows, 0);
+    }
+}
+
+/// # Safety
+/// Launch uses 128 threads, 49152 shared bytes and buffers covering the declared extents.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_prefill_d128(p: Attention) {
+    unsafe {
+        attention::<128, 16, 0>(p, p.start + p.rows, 0);
+    }
+}
+
+/// # Safety
+/// All keys below `keys` are populated in this sequence; launch uses 128 threads and 49152 shared bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_prefill_d128_bidirectional(p: Attention, keys: u32) {
+    unsafe {
+        attention::<128, 16, 1>(p, keys, 0);
+    }
+}
+
+/// # Safety
+/// All prefix keys are populated; launch uses 128 threads and 49152 shared bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_prefill_d128_prefix(p: Attention, prefix: u32) {
+    unsafe {
+        attention::<128, 16, 2>(p, prefix.max(p.start + p.rows), prefix);
+    }
+}
+
+#[inline(always)]
+unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
+    p: Attention,
+    end: u32,
+    prefix: u32,
+) {
+    unsafe {
         let (tid, tile, head, sm): (u32, u32, u32, u32);
         asm!("mov.u32 {t}, %tid.x; mov.u32 {b}, %ctaid.x; mov.u32 {h}, %ctaid.y; mov.u32 {s}, attention_shared;",
             t=out(reg32) tid,b=out(reg32) tile,h=out(reg32) head,s=out(reg32) sm);
         let lane = tid & 31;
         let warp = tid >> 5;
         let qstart = tile * 64;
-        let end = p.start + p.rows;
         let diagonal = p.start + qstart;
-        let sk = sm + 32768;
-        let sv = sm + 65536;
-        let copy_row = tid >> 5;
-        let copy_col = lane * 8;
+        let sk = sm + (128 * D) as u32;
+        let sv = sm + (256 * D) as u32;
+        let scale = if D == 256 {
+            0.0625
+        } else {
+            core::f32::consts::FRAC_1_SQRT_2 / 8.0
+        };
+        let stop = if MODE == 1 {
+            end
+        } else if MODE == 2 {
+            end.min(prefix.max(diagonal + 64))
+        } else {
+            end.min(diagonal + 64)
+        };
+        let interior = if MODE == 1 {
+            end
+        } else if MODE == 2 {
+            end.min(prefix.max(diagonal))
+        } else {
+            end.min(diagonal)
+        };
+        let copy_row = tid / (D as u32 / 8);
+        let copy_lane = tid % (D as u32 / 8);
+        let copy_col = copy_lane * 8;
         let copy_shared = [
-            address(0, copy_row, copy_col, 256),
-            address(0, copy_row + 4, copy_col, 256),
+            address(0, copy_row, copy_col, D as u32),
+            address(0, copy_row + 1024 / D as u32, copy_col, D as u32),
         ];
-        let kv = (head / p.group) as usize * p.capacity as usize * 256;
+        let kv = (head / p.group) as usize * p.capacity as usize * D;
         let mut kp =
-            p.k.wrapping_add(kv + copy_row as usize * 256 + copy_col as usize);
+            p.k.wrapping_add(kv + copy_row as usize * D + copy_col as usize);
         let mut vp =
-            p.v.wrapping_add(kv + copy_row as usize * 256 + copy_col as usize);
+            p.v.wrapping_add(kv + copy_row as usize * D + copy_col as usize);
         macro_rules! copy_q {
             ($i:expr) => {{
-                let row = copy_row + $i * 4;
+                let row = copy_row + $i * (1024 / D as u32);
                 copy(
                     sm + copy_shared[$i % 2] + ($i / 2) * 4096,
                     p.q.wrapping_add(
                         (qstart + row) as usize * p.q_stride as usize
-                            + head as usize * 256
+                            + head as usize * D
                             + copy_col as usize,
                     ),
                     qstart + row < p.rows,
                 );
             }};
         }
-        sixteen!(copy_q);
-        copy_kv::<true>(
+        if D == 256 {
+            sixteen!(copy_q);
+        } else {
+            eight!(copy_q);
+        }
+        copy_kv::<D, true>(
             [sk + copy_shared[0], sk + copy_shared[1]],
             kp,
             copy_row,
@@ -287,24 +357,24 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
         let vr = lane & 15;
         let vc = (lane >> 4) * 8;
         let qb = [
-            address(sm, qr, qc, 256),
-            address(sm, qr, qc + 16, 256),
-            address(sm, qr, qc + 32, 256),
-            address(sm, qr, qc + 48, 256),
+            address(sm, qr, qc, D as u32),
+            address(sm, qr, qc + 16, D as u32),
+            address(sm, qr, qc + 32, D as u32),
+            address(sm, qr, qc + 48, D as u32),
         ];
         let kb = [
-            address(sk, kr, kc, 256),
-            address(sk, kr, kc + 16, 256),
-            address(sk, kr, kc + 32, 256),
-            address(sk, kr, kc + 48, 256),
+            address(sk, kr, kc, D as u32),
+            address(sk, kr, kc + 16, D as u32),
+            address(sk, kr, kc + 32, D as u32),
+            address(sk, kr, kc + 48, D as u32),
         ];
         let vb = [
-            address(sv, vr, vc, 256),
-            address(sv, vr, vc + 16, 256),
-            address(sv, vr, vc + 32, 256),
-            address(sv, vr, vc + 48, 256),
+            address(sv, vr, vc, D as u32),
+            address(sv, vr, vc + 16, D as u32),
+            address(sv, vr, vc + 32, D as u32),
+            address(sv, vr, vc + 48, D as u32),
         ];
-        let mut output = [[0.0f32; 4]; 32];
+        let mut output = [[0.0f32; 4]; OUTPUT];
         let mut peak = [f32::NEG_INFINITY; 2];
         let mut denominator = [0.0f32; 2];
         let r0 = warp * 16 + (lane >> 2);
@@ -312,7 +382,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
         let mut key = 0;
         macro_rules! tile_step {
             ($masked:expr) => {{
-                copy_kv::<$masked>(
+                copy_kv::<D, $masked>(
                     [sv + copy_shared[0], sv + copy_shared[1]],
                     vp,
                     key + copy_row,
@@ -326,7 +396,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
                         macro_rules! qk_pair {
                             ($pair:expr) => {{
                                 let b =
-                                    ld4::<{ ($inner / 4) * 128 + $pair * 8192 }>(kb[$inner % 4]);
+                                    ld4::<{ ($inner / 4) * 128 + $pair * (32 * D) as u32 }>(kb[$inner % 4]);
                                 scores[$pair * 2] = mma(a, [b[0], b[1]], scores[$pair * 2]);
                                 scores[$pair * 2 + 1] = mma(a, [b[2], b[3]], scores[$pair * 2 + 1]);
                             }};
@@ -334,16 +404,16 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
                         four!(qk_pair);
                     }};
                 }
-                sixteen!(qk_step);
+                if D == 256 { sixteen!(qk_step); } else { eight!(qk_step); }
                 wait();
                 let next_key = key + 64;
-                kp = kp.wrapping_add(64 * 256);
-                if next_key < end.min(diagonal + 64) {
+                kp = kp.wrapping_add(64 * D);
+                if next_key < stop {
                     let destinations = [sk + copy_shared[0], sk + copy_shared[1]];
                     if next_key + 64 <= end {
-                        copy_kv::<false>(destinations, kp, next_key + copy_row, end);
+                        copy_kv::<D, false>(destinations, kp, next_key + copy_row, end);
                     } else {
-                        copy_kv::<true>(destinations, kp, next_key + copy_row, end);
+                        copy_kv::<D, true>(destinations, kp, next_key + copy_row, end);
                     }
                     commit();
                 }
@@ -352,16 +422,16 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
                     ($n:expr) => {{
                         if $masked {
                             let col = key + $n * 8 + (lane & 3) * 2;
-                            if col > diagonal + r0 || col >= end {
+                            if col >= if MODE == 1 { end } else if MODE == 2 { prefix.max(diagonal + r0 + 1).min(end) } else { (diagonal + r0 + 1).min(end) } {
                                 scores[$n][0] = f32::NEG_INFINITY;
                             }
-                            if col + 1 > diagonal + r0 || col + 1 >= end {
+                            if col + 1 >= if MODE == 1 { end } else if MODE == 2 { prefix.max(diagonal + r0 + 1).min(end) } else { (diagonal + r0 + 1).min(end) } {
                                 scores[$n][1] = f32::NEG_INFINITY;
                             }
-                            if col > diagonal + r1 || col >= end {
+                            if col >= if MODE == 1 { end } else if MODE == 2 { prefix.max(diagonal + r1 + 1).min(end) } else { (diagonal + r1 + 1).min(end) } {
                                 scores[$n][2] = f32::NEG_INFINITY;
                             }
-                            if col + 1 > diagonal + r1 || col + 1 >= end {
+                            if col + 1 >= if MODE == 1 { end } else if MODE == 2 { prefix.max(diagonal + r1 + 1).min(end) } else { (diagonal + r1 + 1).min(end) } {
                                 scores[$n][3] = f32::NEG_INFINITY;
                             }
                         }
@@ -375,21 +445,21 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
                 next[1] = maximum(next[1], shuffle(next[1], 1));
                 next[1] = maximum(next[1], shuffle(next[1], 2));
                 let negative_peak = [
-                    -next[0] * (core::f32::consts::LOG2_E / 16.0),
-                    -next[1] * (core::f32::consts::LOG2_E / 16.0),
+                    -next[0] * (core::f32::consts::LOG2_E * scale),
+                    -next[1] * (core::f32::consts::LOG2_E * scale),
                 ];
                 let alpha = [
-                    probability(peak[0], negative_peak[0]),
-                    probability(peak[1], negative_peak[1]),
+                    probability::<D>(peak[0], negative_peak[0]),
+                    probability::<D>(peak[1], negative_peak[1]),
                 ];
                 let mut sum = [0.0f32; 2];
                 let mut packed = [[0u32; 4]; 4];
                 macro_rules! probabilities {
                     ($n:expr) => {{
-                        let a = probability(scores[$n][0], negative_peak[0]);
-                        let b = probability(scores[$n][1], negative_peak[0]);
-                        let c = probability(scores[$n][2], negative_peak[1]);
-                        let d = probability(scores[$n][3], negative_peak[1]);
+                        let a = probability::<D>(scores[$n][0], negative_peak[0]);
+                        let b = probability::<D>(scores[$n][1], negative_peak[0]);
+                        let c = probability::<D>(scores[$n][2], negative_peak[1]);
+                        let d = probability::<D>(scores[$n][3], negative_peak[1]);
                         sum[0] += a + b;
                         sum[1] += c + d;
                         packed[$n / 2][($n % 2) * 2] = pack(a, b);
@@ -408,35 +478,35 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
                         output[$n][3] *= alpha[1];
                     }};
                 }
-                thirty_two!(rescale);
+                if D == 256 { thirty_two!(rescale); } else { sixteen!(rescale); }
                 macro_rules! pv_step {
                     ($inner:expr) => {{
                         let a = packed[$inner];
                         macro_rules! pv_pair {
                             ($pair:expr) => {{
-                                let b = ld4_trans::<{ ($pair / 4) * 128 + $inner * 8192 }>(
+                                let b = ld4_trans::<{ ($pair / 4) * 128 + $inner * (32 * D) as u32 }>(
                                     vb[$pair % 4],
                                 );
                                 output[$pair * 2] = mma(a, [b[0], b[1]], output[$pair * 2]);
                                 output[$pair * 2 + 1] = mma(a, [b[2], b[3]], output[$pair * 2 + 1]);
                             }};
                         }
-                        sixteen!(pv_pair);
+                        if D == 256 { sixteen!(pv_pair); } else { eight!(pv_pair); }
                     }};
                 }
                 four!(pv_step);
                 wait();
             }};
         }
-        while key + 64 <= diagonal && key + 64 <= end {
+        while key + 64 <= interior {
             tile_step!(false);
             key += 64;
-            vp = vp.wrapping_add(64 * 256);
+            vp = vp.wrapping_add(64 * D);
         }
-        while key < end.min(diagonal + 64) {
+        while key < stop {
             tile_step!(true);
             key += 64;
-            vp = vp.wrapping_add(64 * 256);
+            vp = vp.wrapping_add(64 * D);
         }
         let (tid, tile, head, sm): (u32, u32, u32, u32);
         asm!("mov.u32 {t}, %tid.x; mov.u32 {b}, %ctaid.x; mov.u32 {h}, %ctaid.y; mov.u32 {s}, attention_shared;",
@@ -444,8 +514,9 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
         let lane = tid & 31;
         let warp = tid >> 5;
         let qstart = tile * 64;
-        let copy_row = tid >> 5;
-        let copy_col = lane * 8;
+        let copy_row = tid / (D as u32 / 8);
+        let copy_lane = tid % (D as u32 / 8);
+        let copy_col = copy_lane * 8;
         let r0 = warp * 16 + (lane >> 2);
         let r1 = r0 + 8;
         denominator[0] += shuffle(denominator[0], 1);
@@ -457,17 +528,17 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
             if qstart + r0 < p.rows {
                 p.lse
                     .add((head * p.rows + qstart + r0) as usize)
-                    .write(peak[0] / 16.0 + logarithm(denominator[0]));
+                    .write(peak[0] * scale + logarithm(denominator[0]));
             }
             if qstart + r1 < p.rows {
                 p.lse
                     .add((head * p.rows + qstart + r1) as usize)
-                    .write(peak[1] / 16.0 + logarithm(denominator[1]));
+                    .write(peak[1] * scale + logarithm(denominator[1]));
             }
         }
         macro_rules! stage_output {
             ($group:expr) => {{
-                let base = sm + warp * 8192 + $group * 1024 + (lane ^ $group) * 16;
+                let base = sm + warp * (32 * D) as u32 + $group * 1024 + (lane ^ $group) * 16;
                 store_shared4(
                     base,
                     [
@@ -512,18 +583,22 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
                 );
             }};
         }
-        eight!(stage_output);
+        if D == 256 {
+            eight!(stage_output);
+        } else {
+            four!(stage_output);
+        }
         barrier();
         macro_rules! write_output {
             ($step:expr) => {{
-                let row = copy_row + $step * 4;
+                let row = copy_row + $step * (1024 / D as u32);
                 if qstart + row < p.rows {
                     let base = sm
-                        + (row / 16) * 8192
-                        + (lane / 4) * 1024
+                        + (row / 16) * (32 * D) as u32
+                        + (copy_lane / 4) * 1024
                         + ((row / 8) & 1) * 512
-                        + (lane & 3) * 4;
-                    let source = ((row & 7) * 4) ^ (lane / 4);
+                        + (copy_lane & 3) * 4;
+                    let source = ((row & 7) * 4) ^ (copy_lane / 4);
                     let values = [
                         load_shared(base + source * 16),
                         load_shared(base + (source ^ 1) * 16),
@@ -531,13 +606,17 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
                         load_shared(base + (source ^ 3) * 16),
                     ];
                     let dst = p.out.wrapping_add(
-                        ((qstart + row) as usize * p.q_heads as usize + head as usize) * 256
+                        ((qstart + row) as usize * p.q_heads as usize + head as usize) * D
                             + copy_col as usize,
                     );
                     store_global4(dst, values);
                 }
             }};
         }
-        sixteen!(write_output);
+        if D == 256 {
+            sixteen!(write_output);
+        } else {
+            eight!(write_output);
+        }
     }
 }

@@ -9,7 +9,6 @@ use std::{
 };
 
 unsafe extern "C" {
-    fn ff_fa2_tile(head_dim: i32) -> i32;
     fn ff_fa2_error() -> *const c_char;
     fn ff_fa2_run(
         q: *mut c_void,
@@ -52,11 +51,22 @@ unsafe extern "C" {
 /// the row pitch is stated at the call site.
 pub use super::verification::Shape;
 
+pub struct Query<'a> {
+    pub q: &'a CudaSlice<bf16>,
+    pub q_row_stride: usize,
+    pub k: &'a CudaSlice<bf16>,
+    pub v: &'a CudaSlice<bf16>,
+    pub out: &'a mut CudaSlice<bf16>,
+    pub shape: Shape,
+    pub keys: usize,
+    pub prefix: Option<usize>,
+}
+
 pub struct Flash {
     stream: Arc<CudaStream>,
     lse: CudaSlice<f32>,
     sink_rescale: CudaFunction,
-    native: Option<CudaFunction>,
+    native: Vec<CudaFunction>,
     geometry: [usize; 3],
 }
 
@@ -80,15 +90,11 @@ unsafe impl DeviceRepr for Attention {}
 impl Flash {
     /// Query tile rows for the bound prefill family.
     pub fn tile(head_dim: usize) -> Result<usize> {
-        if head_dim == 256 {
-            return Ok(64);
-        }
-        let tile = unsafe { ff_fa2_tile(head_dim as i32) };
         ensure!(
-            tile > 0,
-            "FA2 binds head dims 128 and 256 (asked for {head_dim})"
+            matches!(head_dim, 128 | 256),
+            "prefill binds head dims 128 and 256 (asked for {head_dim})"
         );
-        Ok(tile as usize)
+        Ok(64)
     }
 
     /// LSE is F32 [heads, rows], allocated once at setup.
@@ -114,35 +120,61 @@ impl Flash {
             elements <= u32::MAX as usize,
             "prefill LSE indexing exceeds u32"
         );
-        let native = if head_dim == 256 {
+        let native = if head_dim == 256
+            || matches!(
+                (heads, kv_heads, head_dim),
+                (16, 2, 128) | (16, 8, 128) | (12, 12, 128)
+            ) {
             use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
             let ctx = stream.context();
             ensure!(
                 heads <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y)? as usize,
                 "prefill heads exceed grid limit"
             );
-            let function = super::cubin::module(ctx, "attention_native")?
-                .load_function("attention_prefill_d256")?;
-            let shared = function.get_attribute(F::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?;
-            let local = function.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
-            let registers = function.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
-            ensure!(
-                local == 0 && registers <= 255,
-                "native prefill resource limit: registers={registers} local={local}"
-            );
-            ensure!(
-                98304 + shared
-                    <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?,
-                "native prefill shared memory does not fit"
-            );
-            function.set_attribute(F::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 98304)?;
-            ensure!(
-                function.occupancy_max_active_blocks_per_multiprocessor(128, 98304, None)? > 0,
-                "native prefill has zero resident blocks"
-            );
-            Some(function)
+            let names: &[&str] = if head_dim == 256 {
+                &["attention_prefill_d256"]
+            } else {
+                &[
+                    "attention_prefill_d128",
+                    "attention_prefill_d128_bidirectional",
+                    "attention_prefill_d128_prefix",
+                ]
+            };
+            let module = super::cubin::module(ctx, "attention_native")?;
+            let dynamic_shared = (384 * head_dim) as u32;
+            let mut functions = Vec::with_capacity(names.len());
+            for name in names {
+                let function = module.load_function(name)?;
+                let shared = function.get_attribute(F::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?;
+                let local = function.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
+                let registers = function.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
+                ensure!(
+                    local == 0 && registers <= 255,
+                    "native prefill {name} resource limit: registers={registers} local={local}"
+                );
+                ensure!(
+                    dynamic_shared as i32 + shared
+                        <= ctx
+                            .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?,
+                    "native prefill {name} shared memory does not fit"
+                );
+                function.set_attribute(
+                    F::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    dynamic_shared as i32,
+                )?;
+                ensure!(
+                    function.occupancy_max_active_blocks_per_multiprocessor(
+                        128,
+                        dynamic_shared as usize,
+                        None
+                    )? > 0,
+                    "native prefill {name} has zero resident blocks"
+                );
+                functions.push(function);
+            }
+            functions
         } else {
-            None
+            Vec::new()
         };
         let lse = stream.alloc_zeros(elements)?;
         let sink_rescale = super::cubin::module(stream.context(), "attention")?
@@ -171,22 +203,65 @@ impl Flash {
         out: &mut CudaSlice<bf16>,
         shape: Shape,
     ) -> Result<()> {
+        let keys = shape
+            .start
+            .checked_add(shape.rows)
+            .context("prefill key extent overflow")?;
+        self.run_masked(Query {
+            q,
+            q_row_stride,
+            k,
+            v,
+            out,
+            shape,
+            keys,
+            prefix: None,
+        })
+    }
+
+    /// `keys` is the populated sequence extent; `prefix` enables bidirectional prefix rows.
+    pub fn run_masked(&mut self, query: Query<'_>) -> Result<()> {
+        let Query {
+            q,
+            q_row_stride,
+            k,
+            v,
+            out,
+            shape,
+            keys,
+            prefix,
+        } = query;
         ensure!(
             [shape.q_heads, shape.kv_heads, shape.head_dim] == self.geometry,
             "prefill geometry differs from setup binding"
         );
-        self.run_with_window(q, q_row_stride, k, v, out, shape)
-    }
-
-    fn run_with_window(
-        &mut self,
-        q: &CudaSlice<bf16>,
-        q_row_stride: usize,
-        k: &CudaSlice<bf16>,
-        v: &CudaSlice<bf16>,
-        out: &mut CudaSlice<bf16>,
-        shape: Shape,
-    ) -> Result<()> {
+        let end = shape
+            .start
+            .checked_add(shape.rows)
+            .context("prefill query extent overflow")?;
+        ensure!(
+            end <= keys && keys <= shape.capacity && keys <= i32::MAX as usize,
+            "prefill populated key extent does not cover queries or exceeds capacity"
+        );
+        ensure!(
+            prefix.is_none_or(|p| p <= keys),
+            "prefill prefix exceeds populated keys"
+        );
+        ensure!(
+            prefix.is_none() || !shape.causal,
+            "prefix-LM uses its own causal suffix mask"
+        );
+        let mode = if prefix.is_some() {
+            2
+        } else if shape.causal {
+            0
+        } else {
+            1
+        };
+        ensure!(
+            mode == 0 || (shape.window_left.is_none() && self.native.len() == 3),
+            "prefill mask is not bound for this geometry/window"
+        );
         ensure!(
             [
                 shape.rows,
@@ -204,10 +279,6 @@ impl Flash {
                 .window_left
                 .is_none_or(|window| window <= i32::MAX as usize),
             "FA2 window exceeds i32"
-        );
-        ensure!(
-            shape.causal,
-            "FA2 prefill is causal-only; the non-causal path selects a zero-width local window"
         );
         ensure!(
             shape.head_dim == 128 || shape.head_dim == 256,
@@ -262,10 +333,14 @@ impl Flash {
         let (v, _v) = v.device_ptr(&self.stream);
         let (out, _out) = out.device_ptr_mut(&self.stream);
         let (lse, _lse) = self.lse.device_ptr_mut(&self.stream);
-        if let Some(native) = &self.native {
+        if !self.native.is_empty() {
+            let native = self
+                .native
+                .get(mode)
+                .context("native prefill mask is not bound")?;
             ensure!(
                 shape.window_left.is_none(),
-                "D256 prefill does not bind a sliding window"
+                "native prefill does not bind a sliding window"
             );
             let args = Attention {
                 q,
@@ -280,15 +355,18 @@ impl Flash {
                 group: (shape.q_heads / shape.kv_heads) as u32,
                 start: shape.start as u32,
             };
+            let extent = prefix.unwrap_or(keys) as u32;
             unsafe {
-                self.stream
-                    .launch_builder(native)
-                    .arg(&args)
-                    .launch(LaunchConfig {
-                        grid_dim: (shape.rows.div_ceil(64) as u32, shape.q_heads as u32, 1),
-                        block_dim: (128, 1, 1),
-                        shared_mem_bytes: 98304,
-                    })?;
+                let mut launch = self.stream.launch_builder(native);
+                launch.arg(&args);
+                if mode != 0 {
+                    launch.arg(&extent);
+                }
+                launch.launch(LaunchConfig {
+                    grid_dim: (shape.rows.div_ceil(64) as u32, shape.q_heads as u32, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: (384 * shape.head_dim) as u32,
+                })?;
             }
             return Ok(());
         }
