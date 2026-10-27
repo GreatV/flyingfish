@@ -1,25 +1,22 @@
-//! MoE router op: x·Wᵀ logits, FP32 softmax over BF16 logits, top-k ids and
-//! renormalised BF16 weights (kernels/moe_route.cu). `route` computes the
-//! logits with `moe_route_logits_bf16` (one FP32 chain per expert, decode row
-//! counts); `route_prefill` computes them with one cuBLAS BF16 GEMM (FP32
-//! accumulation). Both apply `moe_route_topk` to the dense logits buffer.
+//! BF16 router logits and deterministic top-k. Decode uses one launch;
+//! prefill uses cuBLAS GEMM followed by selection over dense BF16 logits.
 use crate::backend::cuda::contracts::{Tensor, TensorMut, no_overlap};
 use crate::backend::cuda::cubin;
 use crate::backend::cuda::ops::grid;
 use anyhow::{Context, Result, ensure};
 use cudarc::cublas::{CudaBlas, sys as bs};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaStream, DeviceRepr, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, DeviceRepr, LaunchConfig,
+    PushKernelArg,
 };
 use half::bf16;
 use std::{any::TypeId, sync::Arc};
 
-/// Experts per `moe_route_logits_bf16` block and its block size.
-const LOGITS_EXPERTS: u32 = 32;
-const LOGITS_THREADS: u32 = 128;
-
 pub(crate) struct RouteOps {
-    logits: CudaFunction,
+    decode: CudaFunction,
+    launch: Vec<(u32, LaunchConfig)>,
+    completed: CudaSlice<u32>,
+    experts: u32,
     topk: CudaFunction,
     sigmoid_topk: CudaFunction,
     noaux_topk: CudaFunction,
@@ -28,15 +25,82 @@ pub(crate) struct RouteOps {
 }
 
 impl RouteOps {
-    pub fn new(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>) -> Result<Self> {
+    pub fn new(
+        ctx: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
+        experts: u32,
+        max_rows: usize,
+    ) -> Result<Self> {
+        use cudarc::driver::sys::CUdevice_attribute as A;
+        ensure!(
+            (1..=1024).contains(&experts),
+            "invalid route experts={experts}"
+        );
+        ensure!(
+            max_rows > 0 && max_rows <= u32::MAX as usize,
+            "invalid route capacity={max_rows}"
+        );
         let module = cubin::module(ctx, "moe_route")?;
+        let decode = module.load_function("moe_route_decode_bf16")?;
+        let sms = u32::try_from(ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?)?;
+        let threads = experts.div_ceil(32) * 32;
+        ensure!(sms > 0, "route device has no SMs");
+        ensure!(
+            max_rows <= usize::try_from(ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y)?)?,
+            "route capacity exceeds device grid row limit"
+        );
+        ensure!(
+            threads <= u32::try_from(ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)?)?
+                && threads <= u32::try_from(decode.max_threads_per_block()?)?,
+            "route block exceeds device or function thread limit"
+        );
+        let shared_limit =
+            ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)? as u32;
+        let static_shared = u32::try_from(decode.shared_size_bytes()?)?;
+        for owners in [1, 2, 4, 8, 16, 32] {
+            let shared = 16 * (owners * 65 + 64);
+            ensure!(
+                shared + static_shared <= shared_limit,
+                "route shared memory exceeds device limit"
+            );
+            ensure!(
+                decode.occupancy_max_active_blocks_per_multiprocessor(
+                    threads,
+                    shared as usize,
+                    None
+                )? > 0,
+                "route has zero occupancy: threads={threads} owners={owners} shared={shared}"
+            );
+        }
+        let launch = (1..=max_rows as u32)
+            .map(|rows| {
+                let target = sms.div_ceil(rows);
+                let mut owners = 1;
+                for q in [2, 4, 8, 16, 32] {
+                    if experts.div_ceil(q) >= target {
+                        owners = q;
+                    }
+                }
+                (
+                    owners,
+                    LaunchConfig {
+                        grid_dim: (experts.div_ceil(owners), rows, 1),
+                        block_dim: (threads, 1, 1),
+                        shared_mem_bytes: 16 * (owners * 65 + 64),
+                    },
+                )
+            })
+            .collect();
         let blas = CudaBlas::new(stream.clone())?;
         unsafe {
             bs::cublasSetMathMode(*blas.handle(), bs::cublasMath_t::CUBLAS_DEFAULT_MATH)
                 .result()?;
         }
         Ok(Self {
-            logits: module.load_function("moe_route_logits_bf16")?,
+            decode,
+            launch,
+            completed: stream.alloc_zeros(max_rows)?,
+            experts,
             topk: module.load_function("moe_route_topk")?,
             sigmoid_topk: module.load_function("moe_route_topk_sigmoid")?,
             noaux_topk: module.load_function("moe_route_topk_noaux")?,
@@ -45,8 +109,7 @@ impl RouteOps {
         })
     }
 
-    /// Decode routing: `moe_route_logits_bf16` into `logits` ([rows, experts]
-    /// dense), then `moe_route_topk`.
+    /// One decode launch with row-local completion counters on the bound stream.
     pub fn route(
         &self,
         x: Tensor<bf16, 2>,
@@ -57,28 +120,49 @@ impl RouteOps {
         score: crate::model_spec::RouterScore,
     ) -> Result<()> {
         let stream = &self.stream;
-        ensure!(
-            Arc::ptr_eq(stream, &self.stream),
-            "MoE route stream differs from its construction stream"
-        );
         let plan = validate(&x, &router, &ids.0, &weights.0)?;
         check_logits(&plan, &x, &router, &ids.0, &weights.0, &logits.0)?;
+        ensure!(
+            plan.experts == self.experts && plan.rows > 0,
+            "route shape differs from construction: experts={} expected={} rows={}",
+            plan.experts,
+            self.experts,
+            plan.rows
+        );
+        let &(owners, launch) = self
+            .launch
+            .get(plan.rows as usize - 1)
+            .context("route rows exceed admitted capacity")?;
+        let score_mode = match score {
+            crate::model_spec::RouterScore::Softmax => 0i32,
+            crate::model_spec::RouterScore::Sigmoid => 1,
+            crate::model_spec::RouterScore::SqrtSoftplus => {
+                anyhow::bail!("sqrt-softplus requires the FP32 noaux entry")
+            }
+        };
+        let (completed, _guard) = self.completed.device_ptr(stream);
         unsafe {
             stream
-                .launch_builder(&self.logits)
+                .launch_builder(&self.decode)
                 .arg(&x.ptr)
                 .arg(&router.ptr)
                 .arg(&logits.0.ptr)
+                .arg(&ids.0.ptr)
+                .arg(&weights.0.ptr)
+                .arg(&completed)
                 .arg(&plan.rows)
                 .arg(&plan.experts)
                 .arg(&plan.hidden)
-                .launch(LaunchConfig {
-                    grid_dim: (plan.experts.div_ceil(LOGITS_EXPERTS), plan.rows, 1),
-                    block_dim: (LOGITS_THREADS, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
+                .arg(&plan.top_k)
+                .arg(&owners)
+                .arg(&score_mode)
+                .launch(launch)?;
         }
-        self.topk(stream, &plan, logits, ids, weights, score)
+        Ok(())
+    }
+
+    pub fn workspace_bytes(&self) -> usize {
+        self.completed.len() * size_of::<u32>()
     }
 
     /// Prefill routing: logits = x·routerᵀ via one cuBLAS GEMM, then

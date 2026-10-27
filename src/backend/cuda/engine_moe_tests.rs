@@ -368,11 +368,10 @@ fn expert_host_reserve_keeps_span_independent_of_cpu_ceiling() -> Result<()> {
     assert!(crate::prefill::WorkspaceBudget::new(request, |_| Ok(0), Ok).is_err());
     assert!(decode_device_bytes(geometry, geometry.intermediate, 17).is_err());
     assert_eq!(extra(1)?, 0);
-    // Per decode row: k * (contribution row + 26 B of ids/weights/flags) + residual and
-    // shared rows + scale + one BF16 router logit per expert.
+    // Each row includes a 4-byte router completion counter.
     let row =
         extra(2)? - (decode_scratch_bytes(2, 2, 64) - decode_scratch_bytes(1, 2, 64)) as usize;
-    assert_eq!(row, (32 * 2 + 26) * 2 + 32 * 2 + 2 + 16 * 2);
+    assert_eq!(row, (32 * 2 + 26) * 2 + 32 * 2 + 2 + 4 + 16 * 2);
     println!(
         "PASS expert_decode_row_reserve rows=1,8,16 extra8={} extra16={} legacy8_control=admitted full16=rejected",
         extra(8)?,
@@ -1997,7 +1996,7 @@ fn direct(engine: &Engine, layer: usize, input: &[bf16], rows: usize) -> Result<
     let weightv = qwen::matrix(&weights, stream, 0, rows, k)?;
     let experts = router.shape[0];
     let logits = stream.alloc_zeros::<bf16>(rows * experts as usize)?;
-    RouteOps::new(ctx, stream)?.route(
+    RouteOps::new(ctx, stream, experts, rows)?.route(
         xv,
         router,
         &mut TensorMut(idv),

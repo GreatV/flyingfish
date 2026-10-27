@@ -52,7 +52,7 @@ fn decode_device_bytes(
         .checked_mul(2)
         .and_then(|n| n.checked_add(26))
         .and_then(|n| n.checked_mul(k))
-        .and_then(|n| n.checked_add(hidden * 2 + 2))
+        .and_then(|n| n.checked_add(hidden * 2 + 2 + size_of::<u32>()))
         .and_then(|n| n.checked_add(geometry.experts as usize * 2))
         .context("expert decode row byte count overflow")?;
     let scratch = decode_scratch_bytes_mixed(
@@ -362,7 +362,7 @@ impl Setup {
                 .and_then(|n| {
                     n.checked_add(geometry.layers as usize * geometry.experts as usize * 28)
                 })
-                .and_then(|n| n.checked_add(geometry.hidden as usize * 2 + 2))
+                .and_then(|n| n.checked_add(geometry.hidden as usize * 2 + 2 + size_of::<u32>()))
                 .and_then(|n| n.checked_add(decode_scratch))
                 .and_then(|n| n.checked_add(decode_extra))
                 .and_then(|n| {
@@ -1135,7 +1135,7 @@ impl Decode {
             fp8_slot: layout.fp8_slot().cloned(),
             max_rows,
             phase: DecodePhase::default(),
-            route: RouteOps::new(context, stream)?,
+            route: RouteOps::new(context, stream, geometry.experts, max_rows)?,
             contribute: DecodeOps::new_with_boundaries(context, swiglu_rounding, routed_weight)?,
             prefill: PrefillOps::new_with_boundaries(
                 context,
@@ -1197,7 +1197,8 @@ impl Decode {
             + decode.generation.len() * size_of::<u64>()
             + (decode.contributions.len() + decode.shared.len() + decode.scale.len())
                 * size_of::<bf16>()
-            + decode.scratch.len();
+            + decode.scratch.len()
+            + decode.route.workspace_bytes();
         let planned = decode_device_bytes(geometry, shared_intermediate, max_rows)?;
         ensure!(
             allocated == planned,

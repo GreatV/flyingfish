@@ -131,7 +131,7 @@ fn invariant_route(device: &Device) -> Result<()> {
     let rows = crate::linear_plan::MAX_SKINNY_ROWS;
     let (e, k, h) = (256usize, 8usize, 2048usize);
     let s = &device.stream;
-    let ops = RouteOps::new(&device.ctx, s)?;
+    let ops = RouteOps::new(&device.ctx, s, e as u32, rows)?;
     let values: Vec<_> = (0..rows * h)
         .map(|i| bf16::from_f32(((i / h * 71 + i % h * 13) % 509) as f32 / 256.0 - 254.0 / 256.0))
         .collect();
@@ -509,6 +509,306 @@ fn noaux_margin(
     cut - next
 }
 
+#[test]
+#[ignore = "requires a GPU window; FF_Q38_GPU_WINDOW=granted"]
+fn moe_route_decode_bitwise_gpu() -> Result<()> {
+    use crate::backend::cuda::contracts::view;
+    use crate::model_spec::RouterScore;
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let device = Device::new(0)?;
+    let s = &device.stream;
+    let module = cubin::module(&device.ctx, "moe_route")?;
+    let baseline_logits = module.load_function("moe_route_logits_bf16")?;
+    let tie_control = module.load_function("moe_route_decode_reverse_ties")?;
+    let mut defects = 0;
+    for (e, h, k, score) in [
+        (256usize, 2048usize, 8usize, RouterScore::Softmax),
+        (256, 2048, 6, RouterScore::Sigmoid),
+        (33, 520, 8, RouterScore::Softmax),
+        (33, 520, 6, RouterScore::Sigmoid),
+        (1024, 8, 32, RouterScore::Softmax),
+    ] {
+        let rows = 16usize;
+        let ops = RouteOps::new(&device.ctx, s, e as u32, rows)?;
+        let topk = module.load_function(if score == RouterScore::Softmax {
+            "moe_route_topk"
+        } else {
+            "moe_route_topk_sigmoid"
+        })?;
+        let ties: Vec<_> = (0..=k).map(|i| i * (e - 1) / k).collect();
+        let mut values: Vec<_> = (0..rows * h)
+            .map(|i| {
+                bf16::from_f32(((i / h * 71 + i % h * 13) % 509) as f32 / 256.0 - 254.0 / 256.0)
+            })
+            .collect();
+        values[..3 * h].fill(bf16::ZERO);
+        values[h] = bf16::ONE;
+        values[2 * h] = bf16::from_f32(1024.0);
+        let mut router: Vec<_> = (0..e * h)
+            .map(|i| {
+                bf16::from_f32(((i / h * 37 + i % h * 17) % 257) as f32 / 4096.0 - 128.0 / 4096.0)
+            })
+            .collect();
+        for expert in 0..e {
+            router[expert * h] = bf16::from_f32(if ties.contains(&expert) { 1.0 } else { -1.0 });
+        }
+        let x = s.clone_htod(&values)?;
+        let w = s.clone_htod(&router)?;
+        device.finish_upload()?;
+        let expected_logits = s.alloc_zeros::<bf16>(rows * e)?;
+        let expected_ids = s.alloc_zeros::<i32>(rows * k)?;
+        let expected_weights = s.alloc_zeros::<bf16>(rows * k)?;
+        let xv = view(&x, s, 0, [rows as u32, h as u32], [h as u64, 1])?;
+        let wv = view(&w, s, 0, [e as u32, h as u32], [h as u64, 1])?;
+        let lv = view(
+            &expected_logits,
+            s,
+            0,
+            [rows as u32, e as u32],
+            [e as u64, 1],
+        )?;
+        let iv = view(&expected_ids, s, 0, [rows as u32, k as u32], [k as u64, 1])?;
+        let wtv = view(
+            &expected_weights,
+            s,
+            0,
+            [rows as u32, k as u32],
+            [k as u64, 1],
+        )?;
+        unsafe {
+            s.launch_builder(&baseline_logits)
+                .arg(&xv.ptr)
+                .arg(&wv.ptr)
+                .arg(&lv.ptr)
+                .arg(&(rows as u32))
+                .arg(&(e as u32))
+                .arg(&(h as u32))
+                .launch(LaunchConfig {
+                    grid_dim: ((e as u32).div_ceil(32), rows as u32, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+            s.launch_builder(&topk)
+                .arg(&lv.ptr)
+                .arg(&iv.ptr)
+                .arg(&wtv.ptr)
+                .arg(&(rows as u32))
+                .arg(&(e as u32))
+                .arg(&(k as u32))
+                .launch(LaunchConfig {
+                    grid_dim: (rows as u32, 1, 1),
+                    block_dim: ((e as u32).div_ceil(32) * 32, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        let expected_logits = s.clone_dtoh(&expected_logits)?;
+        let expected_ids = s.clone_dtoh(&expected_ids)?;
+        let expected_weights = s.clone_dtoh(&expected_weights)?;
+        ensure!(
+            expected_logits
+                .iter()
+                .chain(&expected_weights)
+                .all(|v| v.is_finite()),
+            "FAIL nonfinite baseline route boundary"
+        );
+        ensure!(
+            expected_ids[..k].iter().copied().eq(0..k as i32)
+                && expected_ids[k..2 * k]
+                    .iter()
+                    .copied()
+                    .eq(ties[..k].iter().map(|&v| v as i32))
+                && expected_ids[2 * k..3 * k] == expected_ids[k..2 * k],
+            "FAIL baseline exact-tie fixture validity"
+        );
+        for r in 0..rows {
+            let selected = &expected_ids[r * k..(r + 1) * k];
+            let cut = expected_logits[r * e + selected[k - 1] as usize].to_f32();
+            let outside = (0..e)
+                .filter(|j| !selected.contains(&(*j as i32)))
+                .map(|j| expected_logits[r * e + j].to_f32())
+                .fold(f32::NEG_INFINITY, f32::max);
+            println!(
+                "ROUTE_DECODE_MARGIN score={score:?} row={r} bf16_logit_cut_margin={:e}",
+                cut - outside
+            );
+        }
+        if e == 256 {
+            let logits = s.alloc_zeros::<bf16>(e)?;
+            let ids = s.alloc_zeros::<i32>(k)?;
+            let weights = s.alloc_zeros::<bf16>(k)?;
+            let completed = s.alloc_zeros::<u32>(1)?;
+            let mode = if score == RouterScore::Softmax {
+                0i32
+            } else {
+                1
+            };
+            unsafe {
+                s.launch_builder(&tie_control)
+                    .arg(&xv.ptr)
+                    .arg(&wv.ptr)
+                    .arg(&logits)
+                    .arg(&ids)
+                    .arg(&weights)
+                    .arg(&completed)
+                    .arg(&1u32)
+                    .arg(&(e as u32))
+                    .arg(&(h as u32))
+                    .arg(&(k as u32))
+                    .arg(&2u32)
+                    .arg(&mode)
+                    .launch(LaunchConfig {
+                        grid_dim: (128, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 16 * (2 * 65 + 64),
+                    })?;
+            }
+            let logits = s.clone_dtoh(&logits)?;
+            let ids = s.clone_dtoh(&ids)?;
+            let weights = s.clone_dtoh(&weights)?;
+            let id_diff = ids
+                .iter()
+                .zip(&expected_ids)
+                .filter(|(a, b)| a != b)
+                .count();
+            ensure!(
+                logits
+                    .iter()
+                    .zip(&expected_logits)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+                    && weights
+                        .iter()
+                        .zip(&expected_weights)
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                    && id_diff == k
+                    && ids.iter().copied().eq((e - k..e).rev().map(|v| v as i32)),
+                "FAIL reversed-tie control escaped or perturbed arithmetic"
+            );
+            println!(
+                "PASS ROUTE_DECODE_CONTROL score={score:?} reverse_global_id_ties=true logits=0 weights=0 id_mismatches={id_diff}"
+            );
+        }
+        for m in 1..=rows {
+            let canary = bf16::from_bits(0x7fc1);
+            let logits = s.clone_htod(&vec![canary; (m + 1) * e])?;
+            let ids = s.clone_htod(&vec![-33i32; (m + 1) * k])?;
+            let weights = s.clone_htod(&vec![canary; (m + 1) * k])?;
+            let mut l = TensorMut(view(&logits, s, 0, [m as u32, e as u32], [e as u64, 1])?);
+            let mut i = TensorMut(view(&ids, s, 0, [m as u32, k as u32], [k as u64, 1])?);
+            let mut wt = TensorMut(view(&weights, s, 0, [m as u32, k as u32], [k as u64, 1])?);
+            let mut run = || {
+                ops.route(
+                    xv.prefix_rows(m as u32)?,
+                    wv,
+                    &mut i,
+                    &mut wt,
+                    &mut l,
+                    score,
+                )
+            };
+            for graph in [false, true] {
+                if graph {
+                    s.synchronize()?;
+                    s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                    let result = run();
+                    let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                    result?;
+                    let captured = captured?.context("empty fused route graph")?;
+                    for _ in 0..3 {
+                        captured.launch()?;
+                    }
+                } else {
+                    for _ in 0..3 {
+                        run()?;
+                    }
+                }
+                let actual_logits = s.clone_dtoh(&logits)?;
+                let actual_ids = s.clone_dtoh(&ids)?;
+                let actual_weights = s.clone_dtoh(&weights)?;
+                ensure!(
+                    actual_logits[..m * e]
+                        .iter()
+                        .chain(&actual_weights[..m * k])
+                        .all(|v| v.is_finite()),
+                    "FAIL nonfinite fused route boundary"
+                );
+                let bounds = actual_logits[m * e..]
+                    .iter()
+                    .chain(&actual_weights[m * k..])
+                    .all(|v| v.to_bits() == canary.to_bits())
+                    && actual_ids[m * k..].iter().all(|&v| v == -33);
+                let logit_diff = actual_logits[..m * e]
+                    .iter()
+                    .zip(&expected_logits)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                let id_diff = actual_ids[..m * k]
+                    .iter()
+                    .zip(&expected_ids)
+                    .filter(|(a, b)| a != b)
+                    .count();
+                let weight_diff = actual_weights[..m * k]
+                    .iter()
+                    .zip(&expected_weights)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                let pass = bounds && logit_diff == 0 && id_diff == 0 && weight_diff == 0;
+                defects += usize::from(!pass);
+                println!(
+                    "{} ROUTE_DECODE_BITWISE sm={} x=[{m},{h}] router=[{e},{h}] k={k} score={score:?} graph={graph} repeats=3 logits={logit_diff} ids={id_diff} weights={weight_diff} bounds={bounds}",
+                    if pass { "PASS" } else { "DEFECT" },
+                    device.info.arch
+                );
+            }
+        }
+        let mut instances = Vec::new();
+        for stream in [s.clone(), device.ctx.new_stream()?] {
+            let independent = RouteOps::new(&device.ctx, &stream, e as u32, rows)?;
+            let logits = stream.alloc_zeros::<bf16>(rows * e)?;
+            let ids = stream.alloc_zeros::<i32>(rows * k)?;
+            let weights = stream.alloc_zeros::<bf16>(rows * k)?;
+            let mut l = testing::dense_mut(&logits, &stream, rows as u32, e as u32)?;
+            let mut i = testing::dense_mut(&ids, &stream, rows as u32, k as u32)?;
+            let mut wt = testing::dense_mut(&weights, &stream, rows as u32, k as u32)?;
+            for _ in 0..3 {
+                independent.route(xv, wv, &mut i, &mut wt, &mut l, score)?;
+            }
+            instances.push((independent, stream, logits, ids, weights));
+        }
+        for (_ops, stream, logits, ids, weights) in instances {
+            let actual_logits = stream.clone_dtoh(&logits)?;
+            let actual_ids = stream.clone_dtoh(&ids)?;
+            let actual_weights = stream.clone_dtoh(&weights)?;
+            ensure!(
+                actual_logits
+                    .iter()
+                    .chain(&actual_weights)
+                    .all(|v| v.is_finite()),
+                "FAIL nonfinite independent-stream boundary"
+            );
+            let pass = actual_logits
+                .iter()
+                .zip(&expected_logits)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+                && actual_ids == expected_ids
+                && actual_weights
+                    .iter()
+                    .zip(&expected_weights)
+                    .all(|(a, b)| a.to_bits() == b.to_bits());
+            defects += usize::from(!pass);
+            println!(
+                "{} ROUTE_DECODE_STREAMS x=[{rows},{h}] router=[{e},{h}] score={score:?} repeats=3",
+                if pass { "PASS" } else { "DEFECT" }
+            );
+        }
+    }
+    println!("ROUTE_DECODE_BITWISE_SUMMARY defects={defects}");
+    ensure!(defects == 0, "fused router DEFECT cells={defects}");
+    Ok(())
+}
+
 fn noaux_route(device: &Device, ops: &RouteOps) -> Result<()> {
     let (rows, experts) = (2usize, 8usize);
     let base = [0.25f32, -0.5, 1.0, 0.75, -1.25, 0.125, 0.5, -0.75];
@@ -683,6 +983,46 @@ fn noaux_route(device: &Device, ops: &RouteOps) -> Result<()> {
             "MOE_ROUTE_NOAUX_LARGE mode={mode} experts={experts} top_k={top_k} blockDim={} margin={margin:e} PASS",
             launch.block_dim.0
         );
+        s.begin_capture(
+            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        )?;
+        let result = ops.topk_noaux(
+            logits,
+            Some(bias),
+            &mut ids_view,
+            &mut weights_view,
+            score,
+            scaling,
+        );
+        let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+        result?;
+        let captured = captured?.context("empty noaux graph")?;
+        for _ in 0..3 {
+            captured.launch()?;
+        }
+        let graph_ids = s.clone_dtoh(&ids)?;
+        let graph_weights = s.clone_dtoh(&weights)?;
+        let unchanged_logits = s.clone_dtoh(&lb)?;
+        let unchanged_bias = s.clone_dtoh(&bb)?;
+        ensure!(
+            graph_ids == actual_ids
+                && graph_weights
+                    .iter()
+                    .zip(&actual_weights)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+                && unchanged_logits
+                    .iter()
+                    .zip(&host_logits)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+                && unchanged_bias
+                    .iter()
+                    .zip(&host_bias)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "noaux graph/input bitwise mismatch"
+        );
+        println!(
+            "PASS ROUTE_NOAUX_BITWISE mode={mode} logits=[1,{experts}] top_k={top_k} eager_graph=true repeats=3"
+        );
     }
     Ok(())
 }
@@ -695,7 +1035,7 @@ fn moe_route_noaux_gpu() -> Result<()> {
         "GPU window not acknowledged"
     );
     let device = Device::new(0)?;
-    let ops = RouteOps::new(&device.ctx, &device.stream)?;
+    let ops = RouteOps::new(&device.ctx, &device.stream, 288, 2)?;
     noaux_route(&device, &ops)
 }
 
@@ -709,7 +1049,7 @@ fn moe_route_gpu() -> Result<()> {
     let d = Device::new(0)?;
     invariant_route(&d)?;
     let s = &d.stream;
-    let ops = RouteOps::new(&d.ctx, s)?;
+    let ops = RouteOps::new(&d.ctx, s, 256, 4096)?;
     sigmoid_route(&d, &ops)?;
     let dims = MoeDims::minicpm47(4096);
     let (e, k, h) = (dims.experts, dims.top_k, dims.hidden);
@@ -929,7 +1269,7 @@ fn moe_route_prefill_gpu() -> Result<()> {
     );
     let d = Device::new(0)?;
     let s = &d.stream;
-    let ops = RouteOps::new(&d.ctx, s)?;
+    let ops = RouteOps::new(&d.ctx, s, 256, 4096)?;
     official_router_logits(&d, &ops)?;
     let dims = MoeDims::minicpm47(4096);
     let (e, k, h) = (dims.experts, dims.top_k, dims.hidden);
