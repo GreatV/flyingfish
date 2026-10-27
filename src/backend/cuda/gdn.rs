@@ -103,6 +103,10 @@ struct Kernels {
     p2: Option<ChunkwiseP2>,
 }
 
+fn fused_step_geometry(spec: &GdnSpec) -> bool {
+    (spec.hk, spec.dk, spec.dv, spec.hv) == (16, 128, 128, 32)
+}
+
 /// The two chunkwise-P2 stages, launched A then H on one stream with nothing between:
 /// A fills the workspace slot, H walks the chunks in order.
 struct ChunkwiseP2 {
@@ -528,7 +532,7 @@ impl GdnOps {
             })
         };
         let kernels = Kernels {
-            step: if spec.hv == 32 {
+            step: if fused_step_geometry(spec) {
                 Some(module("gdn_rstep")?.load_function("gdn_step_fused")?)
             } else {
                 None
@@ -1160,6 +1164,23 @@ fn check_bindings(b: &GdnBindings, rows: u32, conv_dim: u32, hv: u32) -> Result<
 mod tests {
     use super::prep_grids;
     use cudarc::driver::{DevicePtr, LaunchConfig};
+
+    #[test]
+    fn fused_step_requires_compiled_geometry() {
+        let spec = GdnSpec {
+            hv: 32,
+            ..GdnSpec::q38()
+        };
+        assert!(fused_step_geometry(&spec));
+        for incompatible in [
+            GdnSpec { hk: 8, ..spec },
+            GdnSpec { dk: 64, ..spec },
+            GdnSpec { dv: 64, ..spec },
+            GdnSpec { hv: 48, ..spec },
+        ] {
+            assert!(!fused_step_geometry(&incompatible));
+        }
+    }
 
     fn cfg(d: (u32, u32, u32)) -> LaunchConfig {
         LaunchConfig {
