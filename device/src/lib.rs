@@ -488,8 +488,8 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                     -next[1] * (core::f32::consts::LOG2_E * scale),
                 ];
                 let alpha = [
-                    probability::<D>(peak[0], negative_peak[0]),
-                    probability::<D>(peak[1], negative_peak[1]),
+                    probability::<D>(peak[0] - next[0], 0.0),
+                    probability::<D>(peak[1] - next[1], 0.0),
                 ];
                 let mut sum = [0.0f32; 2];
                 let mut packed = [[0u32; 4]; 4];
