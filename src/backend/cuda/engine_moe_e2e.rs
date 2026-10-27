@@ -1838,7 +1838,26 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
             }
         );
     }
-    let ids: Vec<_> = (0..17).map(|row| (row * 263 + 17) as u32).collect();
+    let mut ids = crate::serve::detok::Shared::load(&target)?.encode(
+        "Explain the thermodynamic efficiency limit of a regenerative Brayton cycle, \
+         derive the pressure ratio that maximizes specific work for an ideal gas with gamma = 1.4, \
+         and write a Rust function `fn optimal_pressure_ratio(t_min: f64, t_max: f64, gamma: f64) -> f64` \
+         with unit assertions. Then compare SQLite WAL checkpointing against PostgreSQL MVCC vacuuming \
+         under concurrent read-heavy OLTP workloads, summarize the Byzantine fault tolerance safety proof \
+         for three-phase commit vs HotStuff quorum certificates, and translate the summary into concise \
+         Chinese, Japanese, and French bullet points with numerical latency examples. Finally, analyze \
+         CRISPR-Cas9 off-target cleavage kinetics using Michaelis-Menten enzyme rate equations, derive \
+         the discrete Fourier transform convolution theorem over finite cyclic groups Z/NZ, implement \
+         an iterative Cooley-Tukey radix-2 FFT butterfly loop in C99, outline the Black-Scholes-Merton \
+         partial differential equation boundary conditions for a European call option under constant volatility, \
+         and discuss tectonic plate subduction zone seismic wave attenuation across oceanic lithosphere.",
+    )?;
+    ids.truncate(224);
+    ensure!(
+        ids.len() == 224,
+        "chain verify prompt too short: {}",
+        ids.len()
+    );
     model.reset()?;
     model.prefill(&ids, None)?;
     let mut greedy = Vec::new();
@@ -2189,7 +2208,7 @@ fn minicpm_chain_verify_gpu() -> Result<()> {
         "Runner FAIL planted gdn_inputs perturbation control was not detected"
     );
     println!(
-        "{} minicpm_chain_verify_end rows=8 graph_widths=2..=8 prefixes=17,65 accepted=0..8 wrong_layer_mismatches={wrong_layer} perturbed_gdn_mismatches={perturbed_gdn_control} defects={defects}",
+        "{} minicpm_chain_verify_end rows=8 graph_widths=2..={max_forced} prefixes=17,65,193 accepted=0..8 wrong_layer_mismatches={wrong_layer} perturbed_gdn_mismatches={perturbed_gdn_control} defects={defects}",
         if defects == 0 { "PASS" } else { "DEFECT" }
     );
     ensure!(

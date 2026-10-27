@@ -210,6 +210,23 @@ impl ExpertLayout {
         }
     }
 
+    pub fn projection_bytes(&self) -> (u64, u64) {
+        match self {
+            Self::Bf16Fused {
+                slot_bytes,
+                gate_up_bytes,
+            } => (*gate_up_bytes, *slot_bytes - *gate_up_bytes),
+            Self::Bf16Separate { matrix_bytes, .. } => (*matrix_bytes * 2, *matrix_bytes),
+            Self::Fp8W8a16(slot) | Self::Fp8W8a16Block(slot, _) => (
+                (slot.gate.end - slot.gate.start)
+                    + (slot.up.end - slot.up.start)
+                    + (slot.gate_scale.end - slot.gate_scale.start)
+                    + (slot.up_scale.end - slot.up_scale.start),
+                (slot.down.end - slot.down.start) + (slot.down_scale.end - slot.down_scale.start),
+            ),
+        }
+    }
+
     pub fn down_offset(&self) -> u64 {
         match self {
             Self::Bf16Fused { gate_up_bytes, .. } => *gate_up_bytes,

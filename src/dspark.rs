@@ -115,7 +115,7 @@ impl VerifyCostSchedule {
 
     pub fn derive(
         draft: &DraftConfig,
-        target: &crate::model_spec::ModelSpec,
+        target: (&crate::model_spec::ModelSpec, u64),
         residency: (
             &crate::experts::plan::Capacity,
             crate::experts::plan::Admission,
@@ -126,6 +126,11 @@ impl VerifyCostSchedule {
         peer_transfers: &[(u64, f64, f64)],
         frequency: &[Vec<f64>],
     ) -> Result<Self> {
+        let (target, non_expert_decode_bytes) = target;
+        ensure!(
+            non_expert_decode_bytes > 0,
+            "non-expert decode tensor bytes must be positive"
+        );
         let max_verify_rows = draft.target_rows(target)?;
         let geometry = crate::experts::catalogue::ExpertGeometry::from_model(target)?;
         let (capacity, admission, service, copy_engines) = residency;
@@ -185,8 +190,9 @@ impl VerifyCostSchedule {
         }
         let d_est = draft.round_weight_bytes()? as f64 / gpu0_mem_bps;
         let delta_i_rej = draft.rejection_replay_bytes(target)? as f64 / gpu0_mem_bps;
-        let t_non_expert = target_decode_non_expert_bytes(target)? as f64 / gpu0_mem_bps;
+        let t_non_expert = non_expert_decode_bytes as f64 / gpu0_mem_bps;
         let slot_bytes = capacity.slot_bytes();
+        let proj_bytes = capacity.layout.projection_bytes();
         let workers = service.worker_count()?;
         let max_service_rows = f64::from(service.max_rows());
         let hard_cap = admission.hard_cap(slot_bytes)?;
@@ -211,9 +217,9 @@ impl VerifyCostSchedule {
         }
         non_resident_probs.sort_by(|a, b| b.total_cmp(a));
         let queue_wait = if hard_cap > 0 {
-            (m1_total / f64::from(hard_cap)).clamp(1.0, crate::experts::plan::F_SEED_SCALE)
+            (m1_total / f64::from(hard_cap)).max(1.0)
         } else {
-            1.0
+            0.0
         };
         let per_miss_deferral =
             (t_cpu1 - t_gpu1).max(0.0) + if backed { 0.0 } else { queue_wait * t_d2h };
@@ -239,7 +245,7 @@ impl VerifyCostSchedule {
                 let h_l = (u_l - m_l).max(0.0);
                 let h_choices = k_f64 * (top_k - m_l_1).max(0.0);
                 let t_gpu =
-                    moe_dram_bytes(h_l, h_choices, slot_bytes, gpu0_l2_bytes) / gpu0_mem_bps;
+                    moe_dram_bytes(h_l, h_choices, proj_bytes, gpu0_l2_bytes) / gpu0_mem_bps;
                 m_total += m_l;
                 let t_cpu = if m_l > 0.0 {
                     let r_bar = (k_f64 * m_l_1 / m_l).clamp(1.0, k_f64.min(max_service_rows));
@@ -251,20 +257,22 @@ impl VerifyCostSchedule {
             }
             let mut c_peer = 0.0;
             if gpu0_layers < geometry.layers as usize {
-                let send_bytes =
-                    (k as u64) * (u64::from(geometry.hidden) * 2 + u64::from(geometry.top_k) * 6);
-                let recv_bytes = (k as u64) * u64::from(geometry.hidden) * 2;
+                let peer_layout = crate::experts::plan::PeerSendLayout::for_rows(
+                    k,
+                    geometry.hidden as usize,
+                    geometry.top_k as usize,
+                )?;
                 let bounce = crate::experts::plan::peer_bounce_seconds(
                     peer_transfers,
-                    send_bytes,
-                    recv_bytes,
+                    peer_layout.send_bytes as u64,
+                    peer_layout.recv_bytes as u64,
                 )?;
                 for probs_layer in &probs[gpu0_layers..] {
                     let u_l: f64 = probs_layer
                         .iter()
                         .map(|&p| 1.0 - (1.0 - p).powi(k_i32))
                         .sum();
-                    let peer_bytes = moe_dram_bytes(u_l, k_f64 * top_k, slot_bytes, peer_l2_bytes);
+                    let peer_bytes = moe_dram_bytes(u_l, k_f64 * top_k, proj_bytes, peer_l2_bytes);
                     c_peer += peer_bytes / peer_mem_bps + bounce;
                 }
             }
@@ -321,165 +329,23 @@ impl VerifyCostSchedule {
     }
 }
 
-fn moe_dram_bytes(distinct: f64, total_choices: f64, slot_bytes: u64, l2_bytes: u64) -> f64 {
+fn moe_dram_bytes(distinct: f64, total_choices: f64, proj_bytes: (u64, u64), l2_bytes: u64) -> f64 {
     if distinct <= 0.0 {
         return 0.0;
     }
     let repeats = (total_choices - distinct).max(0.0);
-    let reuse_experts = 0.5 * (distinct - 1.0).max(0.0);
     let l2 = l2_bytes as f64;
-    let gate_up_bytes = slot_bytes as f64 * (2.0 / 3.0);
-    let down_bytes = slot_bytes as f64 * (1.0 / 3.0);
-    let hit = |proj_bytes: f64| -> f64 {
-        let reuse_bytes = reuse_experts * proj_bytes;
-        if reuse_bytes <= l2 {
-            1.0
-        } else if l2 > 0.0 {
-            l2 / reuse_bytes
-        } else {
+    let (gate_up_bytes, down_bytes) = (proj_bytes.0 as f64, proj_bytes.1 as f64);
+    let hit = |bytes: f64| -> f64 {
+        let working_set = distinct * bytes;
+        if working_set <= 0.0 {
             0.0
+        } else {
+            (l2 / working_set).clamp(0.0, 1.0)
         }
     };
     (distinct + repeats * (1.0 - hit(gate_up_bytes))) * gate_up_bytes
         + (distinct + repeats * (1.0 - hit(down_bytes))) * down_bytes
-}
-
-fn linear_weight_bytes(format: crate::model_spec::LinearFormat, n: u32, k: u32) -> Result<u64> {
-    let elems = u64::from(n)
-        .checked_mul(u64::from(k))
-        .context("linear weight element overflow")?;
-    match format {
-        crate::model_spec::LinearFormat::Bf16 => {
-            elems.checked_mul(2).context("linear BF16 byte overflow")
-        }
-        crate::model_spec::LinearFormat::Fp8E4m3Block { block, scale_dtype } => {
-            let scale = u64::try_from(
-                crate::fp8::Fp8BlockScale::new(block, scale_dtype)?.scale_bytes(n, k)?,
-            )?;
-            elems
-                .checked_add(scale)
-                .context("linear FP8 block byte overflow")
-        }
-        crate::model_spec::LinearFormat::Fp8E4m3Channel => u64::from(n)
-            .checked_mul(4)
-            .and_then(|scale| elems.checked_add(scale))
-            .context("linear FP8 channel byte overflow"),
-    }
-}
-
-pub fn target_decode_non_expert_bytes(spec: &crate::model_spec::ModelSpec) -> Result<u64> {
-    use crate::model_spec::{Architecture, FfnKind, Mixer};
-    let hidden = spec.hidden;
-    let mut total = u64::from(spec.vocab)
-        .checked_mul(u64::from(hidden))
-        .and_then(|elems| elems.checked_mul(2))
-        .context("target lm_head byte overflow")?;
-    let gdn = if spec.layers.iter().any(|layer| layer.mixer == Mixer::Gdn) {
-        Some(crate::op_contract::GdnSpec::from_model(spec)?)
-    } else {
-        None
-    };
-    let q_proj_rows = if matches!(
-        spec.architecture,
-        Architecture::Qwen35Text | Architecture::MiniCpmV47
-    ) {
-        spec.q_width
-            .checked_mul(2)
-            .context("gated Q projection width overflow")?
-    } else {
-        spec.q_width
-    };
-    let kv_rows = spec
-        .kv_heads
-        .checked_mul(spec.head_dim)
-        .context("KV projection width overflow")?;
-    let qkv_rows = kv_rows
-        .checked_mul(2)
-        .and_then(|kv2| q_proj_rows.checked_add(kv2))
-        .context("QKV projection width overflow")?;
-    for layer in &spec.layers {
-        let mixer_bytes = match layer.mixer {
-            Mixer::FullAttention => linear_weight_bytes(spec.linear_format, qkv_rows, hidden)?
-                .checked_add(linear_weight_bytes(
-                    spec.linear_format,
-                    hidden,
-                    spec.q_width,
-                )?)
-                .context("attention projection byte overflow")?,
-            Mixer::Gdn => {
-                let gdn = gdn.as_ref().context("GDN spec missing")?;
-                let v_dim = gdn
-                    .hv
-                    .checked_mul(gdn.dv)
-                    .context("GDN value width overflow")?;
-                let qkvz_rows = gdn
-                    .conv_dim()?
-                    .checked_add(v_dim)
-                    .context("GDN qkvz width overflow")?;
-                let ab_bytes = u64::from(gdn.hv)
-                    .checked_mul(2)
-                    .and_then(|ab| ab.checked_mul(u64::from(hidden)))
-                    .and_then(|elems| elems.checked_mul(2))
-                    .context("GDN gate projection byte overflow")?;
-                let state_rw = gdn
-                    .image_bytes()?
-                    .checked_mul(2)
-                    .context("GDN state read/write overflow")?;
-                linear_weight_bytes(spec.linear_format, qkvz_rows, hidden)?
-                    .checked_add(linear_weight_bytes(spec.linear_format, hidden, v_dim)?)
-                    .and_then(|n| n.checked_add(ab_bytes))
-                    .and_then(|n| n.checked_add(state_rw))
-                    .context("GDN layer byte overflow")?
-            }
-        };
-        let ffn_bytes = match layer.ffn {
-            FfnKind::Dense => {
-                let gate_up = spec
-                    .intermediate
-                    .checked_mul(2)
-                    .context("dense gate_up width overflow")?;
-                linear_weight_bytes(spec.linear_format, gate_up, hidden)?
-                    .checked_add(linear_weight_bytes(
-                        spec.linear_format,
-                        hidden,
-                        spec.intermediate,
-                    )?)
-                    .context("dense FFN byte overflow")?
-            }
-            FfnKind::Moe => {
-                let moe = spec.moe.context("MoE config missing")?;
-                let router = u64::from(moe.experts)
-                    .checked_mul(u64::from(hidden))
-                    .and_then(|elems| elems.checked_mul(2))
-                    .context("MoE router byte overflow")?;
-                let shared_gate_up = moe
-                    .shared_intermediate
-                    .checked_mul(2)
-                    .context("MoE shared gate_up overflow")?;
-                let shared = linear_weight_bytes(spec.linear_format, shared_gate_up, hidden)?
-                    .checked_add(linear_weight_bytes(
-                        spec.linear_format,
-                        hidden,
-                        moe.shared_intermediate,
-                    )?)
-                    .context("MoE shared FFN byte overflow")?;
-                let gate_scalar = if moe.shared_gate {
-                    u64::from(hidden) * 2
-                } else {
-                    0
-                };
-                router
-                    .checked_add(shared)
-                    .and_then(|n| n.checked_add(gate_scalar))
-                    .context("MoE non-expert FFN byte overflow")?
-            }
-        };
-        total = total
-            .checked_add(mixer_bytes)
-            .and_then(|n| n.checked_add(ffn_bytes))
-            .context("target decode non-expert byte overflow")?;
-    }
-    Ok(total)
 }
 
 impl DraftConfig {
@@ -1007,9 +873,24 @@ mod tests {
         let mut fp8_model = bf16_model.clone();
         fp8_model.linear_format = LinearFormat::Fp8E4m3Channel;
         fp8_model.expert_format = Some(ExpertFormat::Fp8W8a16);
+        let fp8_non_expert =
+            crate::checkpoint::MappedCheckpoint::planned_non_expert_decode_bytes(&fp8_model)?;
+        let bf16_non_expert =
+            crate::checkpoint::MappedCheckpoint::planned_non_expert_decode_bytes(&bf16_model)?;
+        ensure!(
+            fp8_non_expert == 3_606_467_840 && bf16_non_expert == 3_878_872_320,
+            "unexpected MiniCPM non-expert decode tensor bytes fp8={fp8_non_expert} bf16={bf16_non_expert}"
+        );
         let geometry = ExpertGeometry::from_model(&fp8_model)?;
         let fp8_layout = ExpertLayout::new(ExpertFormat::Fp8W8a16, &geometry)?;
         let bf16_layout = ExpertLayout::new(ExpertFormat::Bf16, &geometry)?;
+        ensure!(
+            fp8_layout.projection_bytes() == (2_099_200, 1_052_672)
+                && bf16_layout.projection_bytes() == (4_194_304, 2_097_152),
+            "unexpected expert projection byte split fp8={:?} bf16={:?}",
+            fp8_layout.projection_bytes(),
+            bf16_layout.projection_bytes()
+        );
         let draft = DraftConfig {
             model_type: "qwen3".into(),
             architectures: vec!["Qwen3DSparkModel".into()],
@@ -1109,7 +990,7 @@ mod tests {
         let l2_4090 = [75_497_472, 0];
         let full = VerifyCostSchedule::derive(
             &draft,
-            &fp8_model,
+            (&fp8_model, fp8_non_expert),
             (&full_capacity, fp8_4090_admission, &fp8_4090_service, 2),
             (rates_4090, l2_4090),
             &[],
@@ -1127,7 +1008,7 @@ mod tests {
         fp8_4090_capacity.device_expert_bytes = 4634 * fp8_slot_bytes;
         let fp8_4090 = VerifyCostSchedule::derive(
             &draft,
-            &fp8_model,
+            (&fp8_model, fp8_non_expert),
             (&fp8_4090_capacity, fp8_4090_admission, &fp8_4090_service, 2),
             (rates_4090, l2_4090),
             &[],
@@ -1195,7 +1076,7 @@ mod tests {
         ];
         let fp8_peer = VerifyCostSchedule::derive(
             &draft,
-            &fp8_model,
+            (&fp8_model, fp8_non_expert),
             (&peer_capacity, a4000_admission, &a4000_service, 2),
             (rates_a4000, [4_194_304, 4_194_304]),
             &peer_transfers,
@@ -1258,7 +1139,7 @@ mod tests {
         for freq in [&cold_freq, &skewed_freq] {
             let bf16_4090 = VerifyCostSchedule::derive(
                 &draft,
-                &bf16_model,
+                (&bf16_model, bf16_non_expert),
                 (&bf16_unbacked_capacity, bf16_admission, &bf16_service, 2),
                 (rates_4090_bf16, l2_4090),
                 &[],
@@ -1272,7 +1153,7 @@ mod tests {
         }
         let bf16_unbacked = VerifyCostSchedule::derive(
             &draft,
-            &bf16_model,
+            (&bf16_model, bf16_non_expert),
             (&bf16_unbacked_capacity, bf16_admission, &bf16_service, 2),
             (rates_4090_bf16, l2_4090),
             &[],
@@ -1282,7 +1163,7 @@ mod tests {
         bf16_backed_control.host_blocks = 10240;
         let bf16_backed = VerifyCostSchedule::derive(
             &draft,
-            &bf16_model,
+            (&bf16_model, bf16_non_expert),
             (&bf16_backed_control, bf16_admission, &bf16_service, 2),
             (rates_4090_bf16, l2_4090),
             &[],

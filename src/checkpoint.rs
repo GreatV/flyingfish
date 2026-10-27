@@ -1108,20 +1108,7 @@ impl MappedCheckpoint {
             let end = start
                 .checked_add(t.data().len() as u64)
                 .context("tensor offset overflow")?;
-            let layer = name
-                .strip_prefix("model.layers.")
-                .or_else(|| name.strip_prefix("model.language_model.layers."))
-                .and_then(|s| s.split('.').next())
-                .map(str::parse::<u32>)
-                .transpose()?;
-            let role = if let Some(layer) = layer {
-                name.strip_prefix(&format!("model.layers.{layer}."))
-                    .or_else(|| name.strip_prefix(&format!("model.language_model.layers.{layer}.")))
-                    .unwrap_or(name)
-                    .to_owned()
-            } else {
-                name.clone()
-            };
+            let (layer, role) = split_layer_role(name)?;
             let scale_name = if dtype == Dtype::F8_E4M3 {
                 Some(format!(
                     "{}.{}",
@@ -1287,11 +1274,102 @@ impl TensorEntry {
     pub(crate) fn is_routed_expert(&self) -> bool {
         self.role.starts_with("mlp.experts.")
     }
+
+    pub(crate) fn is_non_expert_loaded(&self) -> bool {
+        self.load && !self.is_routed_expert()
+    }
 }
+
+fn split_layer_role(name: &str) -> Result<(Option<u32>, String)> {
+    let layer = name
+        .strip_prefix("model.layers.")
+        .or_else(|| name.strip_prefix("model.language_model.layers."))
+        .and_then(|s| s.split('.').next())
+        .map(str::parse::<u32>)
+        .transpose()?;
+    let role = if let Some(layer) = layer {
+        name.strip_prefix(&format!("model.layers.{layer}."))
+            .or_else(|| name.strip_prefix(&format!("model.language_model.layers.{layer}.")))
+            .unwrap_or(name)
+            .to_owned()
+    } else {
+        name.to_owned()
+    };
+    Ok((layer, role))
+}
+
+fn is_embed_tokens_role(name: &str) -> bool {
+    name == "embed_tokens.weight" || name.ends_with(".embed_tokens.weight")
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct TensorManifest {
     pub entries: BTreeMap<String, TensorEntry>,
     pub resident_bytes: usize,
+}
+
+impl TensorManifest {
+    /// Loaded text-tower non-expert tensor bytes scanned during decode (excludes token embedding lookup).
+    pub fn non_expert_decode_bytes(&self) -> Result<u64> {
+        self.entries
+            .values()
+            .filter(|entry| {
+                entry.is_non_expert_loaded()
+                    && entry.scope == TensorScope::Text
+                    && !is_embed_tokens_role(&entry.role)
+            })
+            .try_fold(0u64, |sum, entry| {
+                sum.checked_add(u64::try_from(entry.bytes)?)
+                    .context("non-expert decode byte count overflow")
+            })
+    }
+}
+
+impl MappedCheckpoint {
+    #[cfg(test)]
+    pub(crate) fn planned_non_expert_decode_bytes(
+        spec: &crate::model_spec::ModelSpec,
+    ) -> Result<u64> {
+        let mut expected = BTreeMap::new();
+        if spec.architecture == crate::model_spec::Architecture::Glm5Next {
+            Self::glm5_next_entries(spec, &mut expected)?;
+        } else {
+            Self::text_entries(spec, &mut expected)?;
+        }
+        let mut entries = BTreeMap::new();
+        let mut resident_bytes = 0usize;
+        for (name, (dtype, shape, scope)) in expected {
+            let bytes = tensor_bytes(dtype, &shape)?;
+            let load = LoadPolicy::TextOnly.selects_tensor(scope, &name);
+            if load {
+                resident_bytes = resident_bytes
+                    .checked_add(bytes)
+                    .context("planned resident byte count overflow")?;
+            }
+            let (layer, role) = split_layer_role(&name)?;
+            entries.insert(
+                name,
+                TensorEntry {
+                    dtype,
+                    shape,
+                    shard: String::new(),
+                    bytes,
+                    load,
+                    data_start: 0,
+                    data_offsets: [0, bytes as u64],
+                    scope,
+                    layer,
+                    role,
+                    scale_name: None,
+                },
+            );
+        }
+        TensorManifest {
+            entries,
+            resident_bytes,
+        }
+        .non_expert_decode_bytes()
+    }
 }
 
 #[cfg(test)]

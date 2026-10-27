@@ -278,7 +278,7 @@ impl Drop for ExpertStorage {
 use crate::checkpoint::{Index, MappedCheckpoint, TensorEntry, TensorManifest};
 
 fn upload_entry(entry: &TensorEntry) -> bool {
-    entry.load && !entry.is_routed_expert()
+    entry.is_non_expert_loaded()
 }
 
 pub(crate) struct Loader<'a> {

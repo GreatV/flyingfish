@@ -654,7 +654,7 @@ impl Prefill {
     pub(in crate::backend::cuda::engine) fn derive_verify_schedule(
         &self,
         draft: &crate::dspark::DraftConfig,
-        target: &crate::model_spec::ModelSpec,
+        target: (&crate::model_spec::ModelSpec, u64),
         device: &Device,
         slots: &Slots,
     ) -> Result<crate::dspark::VerifyCostSchedule> {
@@ -2287,7 +2287,7 @@ impl Engine {
         };
         spec.verify_schedule = prefill.derive_verify_schedule(
             &spec.draft.config,
-            &self.model_spec,
+            (&self.model_spec, spec.non_expert_decode_bytes),
             &self.device,
             slots,
         )?;

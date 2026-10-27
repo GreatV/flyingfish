@@ -13,7 +13,7 @@ use crate::backend::cuda::{
     },
 };
 use crate::cpu::expert_ffn::{Assignment, ExpertPool, ExpertWeights, Job, Shape};
-use crate::experts::{arena::HostBlocks, catalogue::ExpertGeometry};
+use crate::experts::{arena::HostBlocks, catalogue::ExpertGeometry, plan::PeerSendLayout};
 use cudarc::driver::{CudaEvent, DevicePtr, HostSlice, result};
 
 #[path = "engine_moe_residency.rs"]
@@ -21,60 +21,6 @@ mod residency;
 pub(super) use residency::{Prefill, Slots};
 #[path = "engine_moe_graph.rs"]
 mod graphs;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct PeerSendLayout {
-    pub ids_off: usize,
-    pub ids_bytes: usize,
-    pub weights_off: usize,
-    pub weights_bytes: usize,
-    pub send_bytes: usize,
-}
-
-impl PeerSendLayout {
-    pub fn for_rows(rows: usize, hidden: usize, top_k: usize) -> Result<Self> {
-        ensure!(
-            rows > 0 && hidden > 0 && top_k > 0,
-            "zero peer send dimension rows={rows} hidden={hidden} top_k={top_k}"
-        );
-        let x_bytes = rows
-            .checked_mul(hidden)
-            .and_then(|v| v.checked_mul(size_of::<bf16>()))
-            .context("peer send x byte overflow")?;
-        ensure!(
-            x_bytes.is_multiple_of(16),
-            "peer send x bytes={x_bytes} is not 16-byte aligned"
-        );
-        let ids_off = x_bytes;
-        let ids_bytes = rows
-            .checked_mul(top_k)
-            .and_then(|v| v.checked_mul(size_of::<i32>()))
-            .context("peer send ids byte overflow")?;
-        let weights_off = ids_off
-            .checked_add(ids_bytes)
-            .and_then(|v| v.checked_next_multiple_of(16))
-            .context("peer send weights offset overflow")?;
-        let weights_bytes = rows
-            .checked_mul(top_k)
-            .and_then(|v| v.checked_mul(size_of::<bf16>()))
-            .context("peer send weights byte overflow")?;
-        let send_bytes = weights_off
-            .checked_add(weights_bytes)
-            .context("peer send total byte overflow")?;
-        Ok(Self {
-            ids_off,
-            ids_bytes,
-            weights_off,
-            weights_bytes,
-            send_bytes,
-        })
-    }
-
-    pub fn tail_bf16_elems(max_rows: usize, hidden: usize, top_k: usize) -> Result<usize> {
-        let layout = Self::for_rows(max_rows, hidden, top_k)?;
-        Ok((layout.send_bytes - layout.ids_off).div_ceil(size_of::<bf16>()))
-    }
-}
 
 pub(super) struct Setup {
     pub workspace: crate::prefill::ExpertWorkspaceBudget,
@@ -86,6 +32,7 @@ pub(super) struct Setup {
     routed_wave_rows: u32,
     peer_wave_rows: u32,
     peer: Option<Device>,
+    non_expert_decode_bytes: u64,
     cold_schedule: Option<crate::dspark::VerifyCostSchedule>,
 }
 
@@ -571,11 +518,12 @@ impl Setup {
             .checked_sub(peer_extra_scratch)
             .context("peer routed scratch exceeds peer budget")?;
         let host_backed = capacity.host_backed(&geometry);
+        let non_expert_decode_bytes = manifest.non_expert_decode_bytes()?;
         let cold_schedule = draft_config
             .map(|draft| {
                 crate::dspark::VerifyCostSchedule::derive(
                     draft,
-                    model,
+                    (model, non_expert_decode_bytes),
                     (
                         &capacity,
                         admission,
@@ -652,6 +600,7 @@ impl Setup {
             routed_wave_rows,
             peer_wave_rows,
             peer,
+            non_expert_decode_bytes,
             cold_schedule,
         })
     }
@@ -671,6 +620,7 @@ impl Setup {
     pub fn bind(self, engine: &mut Engine) -> Result<()> {
         let total_started = std::time::Instant::now();
         if let (Some(spec), Some(schedule)) = (engine.spec.as_mut(), self.cold_schedule) {
+            spec.non_expert_decode_bytes = self.non_expert_decode_bytes;
             spec.cold_verify_schedule = schedule;
             spec.verify_schedule = schedule;
         }
@@ -1796,7 +1746,7 @@ impl Decode {
                 )
                 .context("decode peer combine_routed")?;
             let src_routed = peer.routed_dev1.device_ptr(pstream).0;
-            let routed_bytes = rows * hidden * size_of::<bf16>();
+            let routed_bytes = layout.recv_bytes;
             // SAFETY: peer.routed_dev1 and portable bounce region stay live and ordered before join.
             unsafe {
                 cudarc::driver::sys::cuMemcpyDtoHAsync_v2(

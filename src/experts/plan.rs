@@ -1397,6 +1397,63 @@ pub fn admission_budget(
     Ok(bytes.floor() as u64)
 }
 
+/// Host-bounce packet layout for peer-GPU routed-expert decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerSendLayout {
+    pub ids_off: usize,
+    pub ids_bytes: usize,
+    pub weights_off: usize,
+    pub weights_bytes: usize,
+    pub send_bytes: usize,
+    pub recv_bytes: usize,
+}
+
+impl PeerSendLayout {
+    pub fn for_rows(rows: usize, hidden: usize, top_k: usize) -> Result<Self> {
+        ensure!(
+            rows > 0 && hidden > 0 && top_k > 0,
+            "zero peer send dimension rows={rows} hidden={hidden} top_k={top_k}"
+        );
+        let x_bytes = rows
+            .checked_mul(hidden)
+            .and_then(|v| v.checked_mul(size_of::<half::bf16>()))
+            .context("peer send x byte overflow")?;
+        ensure!(
+            x_bytes.is_multiple_of(16),
+            "peer send x bytes={x_bytes} is not 16-byte aligned"
+        );
+        let ids_off = x_bytes;
+        let ids_bytes = rows
+            .checked_mul(top_k)
+            .and_then(|v| v.checked_mul(size_of::<i32>()))
+            .context("peer send ids byte overflow")?;
+        let weights_off = ids_off
+            .checked_add(ids_bytes)
+            .and_then(|v| v.checked_next_multiple_of(16))
+            .context("peer send weights offset overflow")?;
+        let weights_bytes = rows
+            .checked_mul(top_k)
+            .and_then(|v| v.checked_mul(size_of::<half::bf16>()))
+            .context("peer send weights byte overflow")?;
+        let send_bytes = weights_off
+            .checked_add(weights_bytes)
+            .context("peer send total byte overflow")?;
+        Ok(Self {
+            ids_off,
+            ids_bytes,
+            weights_off,
+            weights_bytes,
+            send_bytes,
+            recv_bytes: x_bytes,
+        })
+    }
+
+    pub fn tail_bf16_elems(max_rows: usize, hidden: usize, top_k: usize) -> Result<usize> {
+        let layout = Self::for_rows(max_rows, hidden, top_k)?;
+        Ok((layout.send_bytes - layout.ids_off).div_ceil(size_of::<half::bf16>()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
