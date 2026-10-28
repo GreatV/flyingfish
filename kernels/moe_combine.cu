@@ -8,8 +8,7 @@
 //   y[row] = BF16(routed[row] + BF16(scale*shared_out[row])).
 // __trap() on top_k outside [1,32], done[a] != final_active[a] (a choice
 // must be contributed exactly once), or row out of range.
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
+#include "gpu_compat.cuh"
 
 using bf16 = __nv_bfloat16;
 
@@ -28,14 +27,14 @@ extern "C" __global__ void moe_shared_scale(const bf16* __restrict__ x,
   for (long long c = tid; c < hidden; c += blockDim.x)
     part += __bfloat162float(xr[c]) * __bfloat162float(seg[c]);
   for (int off = 16; off > 0; off >>= 1)
-    part += __shfl_down_sync(0xffffffffu, part, off);
+    part += __shfl_down_sync(FF_WARP_MASK, part, off);
   __shared__ float red[8];
   if ((tid & 31) == 0) red[tid >> 5] = part;
   __syncthreads();
   if (tid < 32) {
     float v = tid < (blockDim.x >> 5) ? red[tid] : 0.0f;
     for (int off = 16; off > 0; off >>= 1)
-      v += __shfl_down_sync(0xffffffffu, v, off);
+      v += __shfl_down_sync(FF_WARP_MASK, v, off);
     if (tid == 0) {
       const float sig =
           1.0f / (1.0f + expf(-__bfloat162float(__float2bfloat16(v))));
@@ -130,13 +129,13 @@ __device__ __forceinline__ bf16 moe_row_scale(const bf16* __restrict__ xr,
   for (long long c = tid; c < hidden; c += blockDim.x)
     part += __bfloat162float(xr[c]) * __bfloat162float(seg[c]);
   for (int off = 16; off > 0; off >>= 1)
-    part += __shfl_down_sync(0xffffffffu, part, off);
+    part += __shfl_down_sync(FF_WARP_MASK, part, off);
   if ((tid & 31) == 0) red[tid >> 5] = part;
   __syncthreads();
   if (tid < 32) {
     float v = tid < (blockDim.x >> 5) ? red[tid] : 0.0f;
     for (int off = 16; off > 0; off >>= 1)
-      v += __shfl_down_sync(0xffffffffu, v, off);
+      v += __shfl_down_sync(FF_WARP_MASK, v, off);
     if (tid == 0) {
       const float sig =
           1.0f / (1.0f + expf(-__bfloat162float(__float2bfloat16(v))));
