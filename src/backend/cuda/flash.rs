@@ -123,7 +123,7 @@ impl Flash {
         let native = if head_dim == 256
             || matches!(
                 (heads, kv_heads, head_dim),
-                (16, 2, 128) | (16, 8, 128) | (12, 12, 128)
+                (16, 2, 128) | (16, 8, 128) | (12, 12, 128) | (32, 4, 128)
             ) {
             use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
             let ctx = stream.context();
@@ -133,6 +133,8 @@ impl Flash {
             );
             let names: &[&str] = if head_dim == 256 {
                 &["attention_prefill_d256"]
+            } else if (heads, kv_heads) == (32, 4) {
+                &["attention_prefill_d128", "attention_prefill_d128_window"]
             } else {
                 &[
                     "attention_prefill_d128",
@@ -334,14 +336,15 @@ impl Flash {
         let (out, _out) = out.device_ptr_mut(&self.stream);
         let (lse, _lse) = self.lse.device_ptr_mut(&self.stream);
         if !self.native.is_empty() {
+            ensure!(
+                shape.window_left.is_none() || self.geometry == [32, 4, 128],
+                "native prefill window is not bound for this geometry"
+            );
+            let window = shape.window_left.is_some();
             let native = self
                 .native
-                .get(mode)
+                .get(if window { 1 } else { mode })
                 .context("native prefill mask is not bound")?;
-            ensure!(
-                shape.window_left.is_none(),
-                "native prefill does not bind a sliding window"
-            );
             let args = Attention {
                 q,
                 k,
@@ -355,11 +358,11 @@ impl Flash {
                 group: (shape.q_heads / shape.kv_heads) as u32,
                 start: shape.start as u32,
             };
-            let extent = prefix.unwrap_or(keys) as u32;
+            let extent = shape.window_left.or(prefix).unwrap_or(keys) as u32;
             unsafe {
                 let mut launch = self.stream.launch_builder(native);
                 launch.arg(&args);
-                if mode != 0 {
+                if mode != 0 || window {
                     launch.arg(&extent);
                 }
                 launch.launch(LaunchConfig {

@@ -276,6 +276,15 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d128_prefix(p: Attention, pr
     }
 }
 
+/// # Safety
+/// Window is an inclusive left distance; launch uses 128 threads and 49152 shared bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_prefill_d128_window(p: Attention, window: u32) {
+    unsafe {
+        attention::<128, 16, 3>(p, p.start + p.rows, window);
+    }
+}
+
 #[inline(always)]
 unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
     p: Attention,
@@ -319,10 +328,15 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
             address(0, copy_row + 1024 / D as u32, copy_col, D as u32),
         ];
         let kv = (head / p.group) as usize * p.capacity as usize * D;
+        let first = if MODE == 3 {
+            diagonal.saturating_sub(prefix) / 64 * 64
+        } else {
+            0
+        };
         let mut kp =
-            p.k.wrapping_add(kv + copy_row as usize * D + copy_col as usize);
+            p.k.wrapping_add(kv + (first + copy_row) as usize * D + copy_col as usize);
         let mut vp =
-            p.v.wrapping_add(kv + copy_row as usize * D + copy_col as usize);
+            p.v.wrapping_add(kv + (first + copy_row) as usize * D + copy_col as usize);
         macro_rules! copy_q {
             ($i:expr) => {{
                 let row = copy_row + $i * (1024 / D as u32);
@@ -345,7 +359,7 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
         copy_kv::<D, true>(
             [sk + copy_shared[0], sk + copy_shared[1]],
             kp,
-            copy_row,
+            first + copy_row,
             end,
         );
         commit();
@@ -379,7 +393,7 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
         let mut denominator = [0.0f32; 2];
         let r0 = warp * 16 + (lane >> 2);
         let r1 = r0 + 8;
-        let mut key = 0;
+        let mut key = first;
         macro_rules! tile_step {
             ($masked:expr) => {{
                 copy_kv::<D, $masked>(
@@ -427,7 +441,7 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                 let mut next = peak;
                 macro_rules! mask_max {
                     ($n:expr) => {{
-                        if $masked {
+                        if $masked || MODE == 3 {
                             let col = key + $n * 8 + (lane & 3) * 2;
                             if col
                                 >= if MODE == 1 {
@@ -474,6 +488,23 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                                 scores[$n][3] = f32::NEG_INFINITY;
                             }
                         }
+                        if MODE == 3 {
+                            let col = key + $n * 8 + (lane & 3) * 2;
+                            let lo0 = (diagonal + r0).saturating_sub(prefix);
+                            let lo1 = (diagonal + r1).saturating_sub(prefix);
+                            if col < lo0 {
+                                scores[$n][0] = f32::NEG_INFINITY;
+                            }
+                            if col + 1 < lo0 {
+                                scores[$n][1] = f32::NEG_INFINITY;
+                            }
+                            if col < lo1 {
+                                scores[$n][2] = f32::NEG_INFINITY;
+                            }
+                            if col + 1 < lo1 {
+                                scores[$n][3] = f32::NEG_INFINITY;
+                            }
+                        }
                         next[0] = maximum(next[0], maximum(scores[$n][0], scores[$n][1]));
                         next[1] = maximum(next[1], maximum(scores[$n][2], scores[$n][3]));
                     }};
@@ -483,14 +514,22 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                 next[0] = maximum(next[0], shuffle(next[0], 2));
                 next[1] = maximum(next[1], shuffle(next[1], 1));
                 next[1] = maximum(next[1], shuffle(next[1], 2));
-                let negative_peak = [
+                let mut negative_peak = [
                     -next[0] * (core::f32::consts::LOG2_E * scale),
                     -next[1] * (core::f32::consts::LOG2_E * scale),
                 ];
-                let alpha = [
+                let mut alpha = [
                     probability::<D>(peak[0] - next[0], 0.0),
                     probability::<D>(peak[1] - next[1], 0.0),
                 ];
+                if MODE == 3 {
+                    for row in 0..2 {
+                        if next[row] == f32::NEG_INFINITY {
+                            negative_peak[row] = 0.0;
+                            alpha[row] = 0.0;
+                        }
+                    }
+                }
                 let mut sum = [0.0f32; 2];
                 let mut packed = [[0u32; 4]; 4];
                 macro_rules! probabilities {
