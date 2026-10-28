@@ -26,7 +26,10 @@
         3560,
         3831
       ],
-      "limits": null
+      "limits": {
+        "max_normalized": 0.1778548945574394,
+        "rms_normalized": 0.05875116893664398
+      }
     },
     {
       "name": "prefix17",
@@ -49,7 +52,10 @@
         3560,
         3831
       ],
-      "limits": null
+      "limits": {
+        "max_normalized": 0.24587591191184732,
+        "rms_normalized": 0.06668452619466679
+      }
     },
     {
       "name": "prefix129",
@@ -72,7 +78,10 @@
         3560,
         3831
       ],
-      "limits": null
+      "limits": {
+        "max_normalized": 0.7726059638554557,
+        "rms_normalized": 0.13725765188887756
+      }
     },
     {
       "name": "prefix1024",
@@ -95,7 +104,10 @@
         3560,
         3831
       ],
-      "limits": null
+      "limits": {
+        "max_normalized": 0.6179080842007493,
+        "rms_normalized": 0.14046490673605155
+      }
     }
   ]
 }
