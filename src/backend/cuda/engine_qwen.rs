@@ -539,7 +539,8 @@ impl Runtime {
     }
     #[cfg(test)]
     pub(super) fn position_values(&self, stream: &Arc<CudaStream>) -> Result<Vec<i32>> {
-        Ok(stream.clone_dtoh(&self.positions)?)
+        let values = stream.clone_dtoh(&self.positions)?;
+        Ok(values)
     }
     pub(super) fn vision_bytes(&self) -> usize {
         self.vision_bytes
