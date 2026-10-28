@@ -3,8 +3,7 @@
 // __trap() unless valid_rows in [1,64], budget in [1,64], valid_rows <= budget,
 // q_heads == 16, kv_heads == 2, dim == 128, theta finite and > 0,
 // 0 <= *prefix <= capacity - budget, and positions[row] >= 0 for every valid row.
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
+#include "../gpu_compat.cuh"
 
 namespace tree_meta {
 using bf16 = __nv_bfloat16;

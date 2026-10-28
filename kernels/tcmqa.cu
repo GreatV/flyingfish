@@ -73,8 +73,7 @@
 // are fixed per capture; M and chunk are identical in both phases. Phase 1 may
 // launch with grid.x = nchunks_max; blocks with blockIdx.x >= ceil((L+M)/chunk)
 // return before writing.
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
+#include "gpu_compat.cuh"
 
 using bf16 = __nv_bfloat16;
 
@@ -91,6 +90,111 @@ constexpr int PAD = 8;                  // smem row padding (elements) vs ldmatr
 constexpr int LDS = DH + PAD;           // padded smem row stride = 136
 constexpr float SCALE = 0.08838834764831845f;   // 1/sqrt(128)
 
+#if defined(__HIP__)
+using Bf16Fragment = short __attribute__((ext_vector_type(16)));
+using AccFragment = float __attribute__((ext_vector_type(8)));
+
+// LDS: Q[64,128], K[16,128], V[16,128], P[64,16], ancestors[64].
+template <int MT_, int NT_, int LDSQ, int LDSK, int LDSV, bool SWZ>
+__device__ __forceinline__ void tcmqa_phase1_body(
+    const bf16* __restrict__ q, const bf16* __restrict__ Kc, const bf16* __restrict__ Vc,
+    float* __restrict__ p_m, float* __restrict__ p_l, float* __restrict__ p_o,
+    const unsigned long long* __restrict__ anc,
+    int L, int M, int chunk, int nchunks,
+    int q_tok_stride, int q_head_stride,
+    int k_head_stride, int k_pos_stride, int v_head_stride, int v_pos_stride) {
+    static_assert(MT_ == 64 && NT_ == 128);
+    extern __shared__ __align__(16) unsigned char storage[];
+    auto* qs = reinterpret_cast<unsigned short*>(storage);
+    auto* ks = qs + 64 * 128;
+    auto* vs = ks + 16 * 128;
+    auto* ps = vs + 16 * 128;
+    auto* masks = reinterpret_cast<unsigned long long*>(ps + 64 * 16);
+    const int tid = threadIdx.x, wave = tid / 32, lane = tid % 32;
+    const int kv = blockIdx.y, row_base = blockIdx.z * 64;
+    if (tid < M) masks[tid] = anc[tid];
+    for (int cell = tid; cell < 64 * 128; cell += 128) {
+        const int pair = row_base + cell / 128;
+        const int head = kv * 8 + pair / M, token = pair % M;
+        qs[cell] = pair < 8 * M ? reinterpret_cast<const unsigned short*>(q)[
+            (size_t)token * q_tok_stride + (size_t)head * q_head_stride + cell % 128] : 0;
+    }
+    __syncthreads();
+    float maxima[8], sums[8];
+    AccFragment output[8] = {};
+#pragma unroll
+    for (int g = 0; g < 8; ++g) { maxima[g] = -3.0e38f; sums[g] = 0.0f; }
+    const int end = min((int)(blockIdx.x + 1) * chunk, L + M);
+    for (int pos = blockIdx.x * chunk; pos < end; pos += 16) {
+        for (int cell = tid; cell < 16 * 128; cell += 128) {
+            const int key = pos + cell / 128, d = cell % 128;
+            ks[cell] = key < end ? reinterpret_cast<const unsigned short*>(Kc)[
+                (size_t)kv * k_head_stride + (size_t)key * k_pos_stride + d] : 0;
+            vs[cell] = key < end ? reinterpret_cast<const unsigned short*>(Vc)[
+                (size_t)kv * v_head_stride + (size_t)key * v_pos_stride + d] : 0;
+        }
+        __syncthreads();
+        AccFragment score = {};
+#pragma unroll
+        for (int panel = 0; panel < 8; ++panel) {
+            Bf16Fragment a, b;
+#pragma unroll
+            for (int k = 0; k < 16; ++k) {
+                a[k] = qs[(wave * 16 + lane % 16) * 128 + panel * 16 + k];
+                b[k] = ks[(lane % 16) * 128 + panel * 16 + k];
+            }
+            score = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, score);
+        }
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            const int row = wave * 16 + 2 * g + lane / 16;
+            const int pair = row_base + row, key = pos + lane % 16;
+            const bool visible = pair < 8 * M && key < end &&
+                (key < L || ((masks[pair % M] >> (key - L)) & 1ULL));
+            const float value = visible ? score[g] * SCALE : -INFINITY;
+            float mx = value;
+#pragma unroll
+            for (int offset = 8; offset > 0; offset >>= 1)
+                mx = fmaxf(mx, __shfl_xor(mx, offset, 16));
+            const float next = fmaxf(maxima[g], mx);
+            const float alpha = __expf(maxima[g] - next);
+            const float probability = visible ? __expf(value - next) : 0.0f;
+            float sum = probability;
+#pragma unroll
+            for (int offset = 8; offset > 0; offset >>= 1)
+                sum += __shfl_xor(sum, offset, 16);
+            sums[g] = sums[g] * alpha + sum;
+            maxima[g] = next;
+#pragma unroll
+            for (int d = 0; d < 8; ++d) output[d][g] *= alpha;
+            reinterpret_cast<bf16*>(ps)[row * 16 + lane % 16] = __float2bfloat16(probability);
+        }
+        __syncthreads();
+        Bf16Fragment probability;
+#pragma unroll
+        for (int k = 0; k < 16; ++k)
+            probability[k] = ps[(wave * 16 + lane % 16) * 16 + k];
+#pragma unroll
+        for (int tile = 0; tile < 8; ++tile) {
+            Bf16Fragment value;
+#pragma unroll
+            for (int k = 0; k < 16; ++k) value[k] = vs[k * 128 + tile * 16 + lane % 16];
+            output[tile] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(probability, value, output[tile]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        const int pair = row_base + wave * 16 + 2 * g + lane / 16;
+        if (pair < 8 * M) {
+            const size_t part = ((size_t)kv * nchunks + blockIdx.x) * 8 * M + pair;
+            if (lane % 16 == 0) { p_m[part] = maxima[g]; p_l[part] = sums[g]; }
+#pragma unroll
+            for (int d = 0; d < 8; ++d) p_o[part * 128 + d * 16 + lane % 16] = output[d][g];
+        }
+    }
+}
+#else
 __device__ __forceinline__ unsigned smem_u32(const void* p) {
   return (unsigned)__cvta_generic_to_shared(p);
 }
@@ -296,8 +400,8 @@ __device__ __forceinline__ void tcmqa_phase1_body(
     }
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
-      rmax[half] = fmaxf(rmax[half], __shfl_xor_sync(0xffffffffu, rmax[half], 1));
-      rmax[half] = fmaxf(rmax[half], __shfl_xor_sync(0xffffffffu, rmax[half], 2));
+      rmax[half] = fmaxf(rmax[half], __shfl_xor_sync(FF_WARP_MASK, rmax[half], 1));
+      rmax[half] = fmaxf(rmax[half], __shfl_xor_sync(FF_WARP_MASK, rmax[half], 2));
     }
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
@@ -313,8 +417,8 @@ __device__ __forceinline__ void tcmqa_phase1_body(
         pn[n][half * 2 + 1] = p1;
         rsum += p0 + p1;
       }
-      rsum += __shfl_xor_sync(0xffffffffu, rsum, 1);
-      rsum += __shfl_xor_sync(0xffffffffu, rsum, 2);
+      rsum += __shfl_xor_sync(FF_WARP_MASK, rsum, 1);
+      rsum += __shfl_xor_sync(FF_WARP_MASK, rsum, 2);
       ls[half] = ls[half] * cf + rsum;
 #pragma unroll
       for (int n = 0; n < 16; ++n) {
@@ -371,6 +475,8 @@ __device__ __forceinline__ void tcmqa_phase1_body(
           make_float2(acc[nd][2], acc[nd][3]);
   }
 }
+
+#endif
 
 // One block per (query, head) pair; blockIdx.x = eh = qi*n_q_heads + qh.
 // Partial index: part(ch) = (kv*nchunks + ch)*8*M + qh_local*M + qi,
@@ -478,16 +584,16 @@ __device__ __forceinline__ void tcmqa_phase2_short_body(
     }
     float mx = fmaxf(m0, m1);
     for (int s = warpSize / 2; s > 0; s >>= 1) {
-      const float other = __shfl_down_sync(0xffffffffu, mx, s);
+      const float other = __shfl_down_sync(FF_WARP_MASK, mx, s);
       if (tid < s) mx = fmaxf(mx, other);
     }
-    mx = __shfl_sync(0xffffffffu, mx, 0);
+    mx = __shfl_sync(FF_WARP_MASK, mx, 0);
     float p0 = 0.0f, p1 = 0.0f;
     if (tid < nchunks) p0 += l0 * __expf(sm[tid] - mx);
     if (hi < nchunks) p1 += l1 * __expf(sm[hi] - mx);
     float sum = p0 + p1;
     for (int s = warpSize / 2; s > 0; s >>= 1) {
-      const float other = __shfl_down_sync(0xffffffffu, sum, s);
+      const float other = __shfl_down_sync(FF_WARP_MASK, sum, s);
       if (tid < s) sum += other;
     }
     if (tid == 0) {
@@ -564,6 +670,7 @@ extern "C" __global__ void __launch_bounds__(NT) tcmqa_phase1(
                              k_head_stride, k_pos_stride, v_head_stride, v_pos_stride);
 }
 
+#if !defined(__HIP__)
 // Wide pair-tile variant: one 128-row tile per block; 8 warps share one K/V
 // smem tile set.
 extern "C" __global__ void __launch_bounds__(256) tcmqa_phase1_w(
@@ -578,6 +685,8 @@ extern "C" __global__ void __launch_bounds__(256) tcmqa_phase1_w(
                                q_tok_stride, q_head_stride,
                                k_head_stride, k_pos_stride, v_head_stride, v_pos_stride);
 }
+
+#endif
 
 __device__ __forceinline__ void tcmqa_phase2_entry(float* __restrict__ scratch,
                                                    bf16* __restrict__ o, int L, int M,
@@ -625,6 +734,7 @@ extern "C" __global__ void tcmqa_phase2_short(
                           o_tok_stride, o_head_stride);
 }
 
+#if !defined(__HIP__)
 // Reduced-smem wide variant: Q/K tiles unpadded (stride DH, swizzled), V tile
 // stride LDS; smem = (128 + 32) * 128 * 2 + 32 * 136 * 2 + 512 = 50176 B.
 __device__ __forceinline__ void tcmqa_phase1_entry_ws(
@@ -657,6 +767,8 @@ extern "C" __global__ void __launch_bounds__(256) tcmqa_phase1_ws(
                         q_tok_stride, q_head_stride,
                         k_head_stride, k_pos_stride, v_head_stride, v_pos_stride);
 }
+
+#endif
 
 #undef FD_GUARD_P1
 #undef FD_GUARD_P1W

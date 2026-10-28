@@ -1,19 +1,29 @@
 use super::{
     Device,
-    attention_d256::{
-        AttentionBindings, FullAttentionOps, FullAttentionPlan, MASK_LEN, PositionBindings,
-    },
     blas::Blas,
-    contracts::{Scratch, SeqRef, TensorMut, view},
     copy::{Rect, columns},
-    flash::Shape,
-    ops::{CommonOpsRef, Ops, RmsMode, flat, grid},
+    ops::{Ops, flat, grid},
+    verification::Shape,
     verification::Verification,
     weights::{Layer, checkpoint},
 };
+#[cfg(feature = "cuda")]
+use super::{
+    attention_d256::{
+        AttentionBindings, FullAttentionOps, FullAttentionPlan, MASK_LEN, PositionBindings,
+    },
+    contracts::{Scratch, SeqRef},
+};
+#[cfg(feature = "cuda")]
+use super::{
+    contracts::{TensorMut, view},
+    ops::{CommonOpsRef, RmsMode},
+};
+#[cfg(feature = "cuda")]
+use crate::backend::gpu::DevicePtr;
+use crate::backend::gpu::{CudaSlice, CudaStream, DevicePtrMut, PushKernelArg};
 use crate::{config::Config, dspark::DraftConfig, trace::Trace};
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut, PushKernelArg};
 use half::bf16;
 use std::{path::Path, sync::Arc};
 
@@ -30,18 +40,21 @@ enum Output {
 
 enum Attention {
     Cached(Verification),
+    #[cfg(feature = "cuda")]
     Block(BlockAttention),
 }
 
+#[cfg(feature = "cuda")]
 struct BlockAttention {
     layers: Vec<FullAttentionPlan>,
     metadata: CudaSlice<i32>,
     positions: CudaSlice<i32>,
     mask: CudaSlice<u64>,
     scratch: CudaSlice<u8>,
-    prepare: cudarc::driver::CudaFunction,
+    prepare: crate::backend::gpu::CudaFunction,
 }
 
+#[cfg(feature = "cuda")]
 impl BlockAttention {
     fn new(draft: &Draft, device: &Device) -> Result<Self> {
         use crate::op_contract::{AttentionLimits, FullAttentionSpec};
@@ -239,12 +252,12 @@ pub struct Draft {
     rows: usize,
     stream: Arc<CudaStream>,
     attention: Option<Attention>,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     position_shift: i32,
-    qknorm_rope_kv: cudarc::driver::CudaFunction,
-    norm: cudarc::driver::CudaFunction,
-    add_norm: cudarc::driver::CudaFunction,
-    context_rope: cudarc::driver::CudaFunction,
+    qknorm_rope_kv: crate::backend::gpu::CudaFunction,
+    norm: crate::backend::gpu::CudaFunction,
+    add_norm: crate::backend::gpu::CudaFunction,
+    context_rope: crate::backend::gpu::CudaFunction,
     ids: CudaSlice<u32>,
     mask_ids: Vec<u32>,
     position: CudaSlice<i32>,
@@ -265,10 +278,10 @@ pub struct Draft {
     scores: CudaSlice<bf16>,
     combined: Option<CudaSlice<f32>>,
     confidence_values: CudaSlice<f32>,
-    host_confidence: cudarc::driver::PinnedHostSlice<u8>,
+    host_confidence: crate::backend::gpu::PinnedHostSlice<u8>,
     forced_tokens: CudaSlice<u32>,
-    sum_argmax: cudarc::driver::CudaFunction,
-    concat_dot_sigmoid: cudarc::driver::CudaFunction,
+    sum_argmax: crate::backend::gpu::CudaFunction,
+    concat_dot_sigmoid: crate::backend::gpu::CudaFunction,
     prev: CudaSlice<bf16>,
     token: CudaSlice<u32>,
     tokens: CudaSlice<u32>,
@@ -276,7 +289,7 @@ pub struct Draft {
 
 fn norm(
     s: &Arc<CudaStream>,
-    kernel: &cudarc::driver::CudaFunction,
+    kernel: &crate::backend::gpu::CudaFunction,
     input: &CudaSlice<bf16>,
     weight: &CudaSlice<bf16>,
     output: &mut CudaSlice<bf16>,
@@ -298,6 +311,7 @@ fn norm(
 }
 
 impl Draft {
+    #[cfg(feature = "cuda")]
     pub(super) fn prepare_linears(
         &self,
         head: &CudaSlice<bf16>,
@@ -335,12 +349,19 @@ impl Draft {
         }
         Ok(())
     }
+    #[cfg(feature = "cuda")]
     pub(super) fn calibrate_shape(
         &self,
         blas: &mut Blas,
-        input: &cudarc::driver::CudaView<'_, bf16>,
+        input: &crate::backend::gpu::CudaView<'_, bf16>,
         shape: crate::backend::setup::LinearShape,
     ) -> Result<()> {
+        blas.calibrate_shape(&self.calibration_weight(shape)?, input, shape)
+    }
+    pub(super) fn calibration_weight(
+        &self,
+        shape: crate::backend::setup::LinearShape,
+    ) -> Result<crate::backend::gpu::CudaView<'_, bf16>> {
         let c = &self.config;
         let h = c.hidden_size;
         let kv = c.kv_dim();
@@ -358,7 +379,7 @@ impl Draft {
             .into_iter()
             .find(|(output, input, _)| *output == shape.output && *input == shape.input)
             .with_context(|| format!("unknown draft calibration shape: {shape:?}"))?;
-        blas.calibrate_shape(&weight, input, shape)
+        Ok(weight)
     }
     pub(super) fn reset_setup(&mut self) -> Result<()> {
         let block_rows = self.config.block_size;
@@ -414,6 +435,8 @@ impl Draft {
         blas: &mut Blas,
         score_rounding: super::markov::ScoreRounding,
     ) -> Result<Self> {
+        #[cfg(feature = "rocm")]
+        let _ = blas;
         let config = DraftConfig::read(path, c)?;
         ensure!(
             rows > config.block_size && capacity >= rows,
@@ -446,6 +469,7 @@ impl Draft {
                 });
             }
         }
+        #[cfg(feature = "cuda")]
         for (n, o, i) in [
             (block_rows, qkv, h),
             (block_rows, h, h),
@@ -488,7 +512,7 @@ impl Draft {
             rows,
             stream: s.clone(),
             attention: None,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             position_shift: 0,
             qknorm_rope_kv,
             norm: norm_module.load_function(norm_name)?,
@@ -674,13 +698,14 @@ impl Draft {
         let s = &self.stream;
         let h = c.hidden_size;
         let kv = c.kv_dim();
-        let linear_rows = if self.score_rounding == super::markov::ScoreRounding::F32 {
-            super::engine::bucketed_prefill_rows(rows as u32, self.rows as u32)? as usize
-        } else {
-            blas.prepare(rows, h, c.capture_width())?;
-            blas.prepare(rows, kv, h)?;
-            rows
-        };
+        let linear_rows =
+            if cfg!(feature = "rocm") || self.score_rounding == super::markov::ScoreRounding::F32 {
+                super::engine::bucketed_prefill_rows(rows as u32, self.rows as u32)? as usize
+            } else {
+                blas.prepare(rows, h, c.capture_width())?;
+                blas.prepare(rows, kv, h)?;
+                rows
+            };
         ensure!(
             input.len() >= linear_rows * c.capture_width(),
             "draft injection input={} rows={rows} linear_rows={linear_rows} capture_width={}",
@@ -834,6 +859,7 @@ impl Draft {
         if self.attention.is_some() {
             return Ok(());
         }
+        #[cfg(feature = "cuda")]
         if self.config.head_dim == 256 {
             self.attention = Some(Attention::Block(BlockAttention::new(self, d)?));
             return Ok(());
@@ -846,6 +872,7 @@ impl Draft {
         geometry.rope_theta = self.config.rope_parameters.rope_theta;
         geometry.rms_norm_eps = self.config.rms_norm_eps;
         let c = &geometry;
+        #[cfg(feature = "cuda")]
         let measured = super::multi_calibrate::load(
             d,
             ops,
@@ -858,7 +885,15 @@ impl Draft {
             },
             closure,
         )?;
+        #[cfg(feature = "cuda")]
         let (plan, selection) = measured.choose(self.capacity)?;
+        #[cfg(feature = "rocm")]
+        let plan = {
+            let _ = (ops, dir);
+            closure.bind_fixed()?;
+            super::verification::hip_tcmqa_plan(&d.ctx, self.capacity, block_rows)?
+        };
+        #[cfg(feature = "cuda")]
         eprintln!(
             "{}",
             serde_json::json!({"backend_setup":{"role":"draft","rows":block_rows,"causal":false,"attention":plan,"selection":selection,"calibration":measured}})
@@ -984,7 +1019,8 @@ impl Draft {
             0,
             self.config.block_size * size_of::<f32>(),
         )?;
-        Ok(self.stream.clone_dtoh(&self.tokens)?)
+        let values = self.stream.clone_dtoh(&self.tokens)?;
+        Ok(values)
     }
 
     pub fn confidences(&self) -> Result<Vec<f32>> {
@@ -999,7 +1035,10 @@ impl Draft {
         Ok(chunks.iter().map(|b| f32::from_le_bytes(*b)).collect())
     }
 
-    pub fn copy_proposals(&self, ids: &mut cudarc::driver::CudaViewMut<'_, u32>) -> Result<()> {
+    pub fn copy_proposals(
+        &self,
+        ids: &mut crate::backend::gpu::CudaViewMut<'_, u32>,
+    ) -> Result<()> {
         self.stream.memcpy_dtod(&self.tokens, ids)?;
         Ok(())
     }
@@ -1010,6 +1049,7 @@ impl Draft {
             "draft bit comparison range exceeds KV"
         );
         let s = &self.stream;
+        #[cfg(feature = "cuda")]
         if let Some(Attention::Block(attention)) = &self.attention {
             for values in [&attention.metadata, &attention.positions] {
                 out.extend(s.clone_dtoh(values)?.iter().flat_map(|v| v.to_le_bytes()));
@@ -1107,6 +1147,7 @@ impl Draft {
                 .arg(&(h as i32))
                 .launch(flat(block_rows * h))?;
         }
+        #[cfg(feature = "cuda")]
         if let Some(Attention::Block(attention)) = &mut self.attention {
             let shift = {
                 #[cfg(test)]
@@ -1199,6 +1240,7 @@ impl Draft {
                         },
                     )?;
                 }
+                #[cfg(feature = "cuda")]
                 Attention::Block(attention) => {
                     let (metadata, _meta_hold) = attention.metadata.device_ptr(s);
                     let (scratch, _scratch_hold) = attention.scratch.device_ptr(s);
@@ -1455,7 +1497,7 @@ impl Draft {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
     use anyhow::Context;

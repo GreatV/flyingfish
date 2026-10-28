@@ -1,8 +1,10 @@
 use super::{Device, EmbedOut, Kv, State};
+use crate::backend::gpu::CudaSlice;
 use crate::config::Config;
 use crate::tree::Tree;
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaSlice, sys};
+#[cfg(feature = "cuda")]
+use cudarc::driver::sys;
 use half::bf16;
 use std::path::PathBuf;
 
@@ -108,7 +110,10 @@ fn tree_prepare_embed_norm_replay_serves_wider_tree() -> Result<()> {
     s.synchronize()?;
     reset(&mut x, &mut y, &mut ids, &mut qkv, &mut kv)?;
     s.synchronize()?;
+    #[cfg(feature = "cuda")]
     s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+    #[cfg(feature = "rocm")]
+    let capture = s.begin_capture()?;
     let launched = prepare(
         &state,
         &mut prefix,
@@ -118,7 +123,10 @@ fn tree_prepare_embed_norm_replay_serves_wider_tree() -> Result<()> {
         &mut qkv,
         &mut kv,
     );
+    #[cfg(feature = "cuda")]
     let captured = s.end_capture(sys::CUgraphInstantiate_flags(0));
+    #[cfg(feature = "rocm")]
+    let captured = capture.finish().map(Some);
     launched?;
     let graph = captured?.context("empty tree segment graph")?;
     graph.upload()?;

@@ -109,6 +109,10 @@ impl MultiImpl {
 
     /// Dynamic shared memory the phase-1 kernel is launched with.
     pub fn phase1_smem_bytes(self) -> usize {
+        #[cfg(feature = "rocm")]
+        if matches!(self, Self::Tcmqa | Self::TcmqaShort) {
+            return (64 * 128 + 16 * 128 * 2 + 64 * 16) * 2 + 64 * 8;
+        }
         match self {
             MultiImpl::V1 => 0,
             MultiImpl::Tcmqa | MultiImpl::TcmqaShort => 35328,

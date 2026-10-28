@@ -53,8 +53,7 @@
 // CUDA Graph: P and PT are fixed per capture; the request arrays and output
 // buffers are pointers fixed per capture whose contents change between
 // replays. No device scalars are read; no global state.
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
+#include "gpu_compat.cuh"
 
 constexpr int MK2_DIM   = 256;
 constexpr int MK2_VT    = 256;                  // vocab rows per phase-1 block
@@ -74,6 +73,7 @@ __device__ __forceinline__ float markov_score(float dot, bf16 base, int rounding
 } while (0)
 
 namespace mk2p1 {
+#if !defined(__HIP__)
 
 __device__ __forceinline__ unsigned smem_u32(const void* p) {
   return (unsigned)__cvta_generic_to_shared(p);
@@ -108,6 +108,8 @@ __device__ __forceinline__ void cp_wait() {
 }
 __device__ __forceinline__ void cp_wait0() { cp_wait<0>(); }
 
+#endif
+
 // Sorted top-4 as a register-resident list, score-desc / id-asc (strictly
 // greater wins, tie -> smaller id). Accessed only with literal indices, never
 // address-taken; insertion bubbles the candidate through the four slots.
@@ -131,6 +133,7 @@ struct T4 {
   }
 };
 
+#if !defined(__HIP__)
 // 16B-segment XOR swizzle within a 512 B smem row: logical 16-byte segment
 // `seg` of row `row` lives at physical segment (seg ^ (row % 32)).
 __device__ __forceinline__ int swz(int seg, int row) { return seg ^ (row & 31); }
@@ -157,13 +160,13 @@ struct ActState {
     float ps[4]; unsigned pi[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      ps[j] = __shfl_xor_sync(0xffffffffu, t[Q].s[j], off);
-      pi[j] = __shfl_xor_sync(0xffffffffu, t[Q].i[j], off);
+      ps[j] = __shfl_xor_sync(FF_WARP_MASK, t[Q].s[j], off);
+      pi[j] = __shfl_xor_sync(FF_WARP_MASK, t[Q].i[j], off);
     }
 #pragma unroll
     for (int j = 0; j < 4; ++j) t[Q].insert(ps[j], pi[j]);
-    const float pm = __shfl_xor_sync(0xffffffffu, m[Q], off);
-    const float pl = __shfl_xor_sync(0xffffffffu, l[Q], off);
+    const float pm = __shfl_xor_sync(FF_WARP_MASK, m[Q], off);
+    const float pl = __shfl_xor_sync(FF_WARP_MASK, l[Q], off);
     const float mn = fmaxf(m[Q], pm);
     l[Q] = l[Q] * __expf(m[Q] - mn) + pl * __expf(pm - mn);
     m[Q] = mn;
@@ -182,8 +185,8 @@ struct ActState {
     for (int off = 4; off <= 16; off <<= 1) {
 #pragma unroll
       for (int q = 0; q < 2; ++q) {
-        const float pm = __shfl_xor_sync(0xffffffffu, m[q], off);
-        const float pl = __shfl_xor_sync(0xffffffffu, l[q], off);
+        const float pm = __shfl_xor_sync(FF_WARP_MASK, m[q], off);
+        const float pl = __shfl_xor_sync(FF_WARP_MASK, l[q], off);
         const float mn = fmaxf(m[q], pm);
         l[q] = l[q] * __expf(m[q] - mn) + pl * __expf(pm - mn);
         m[q] = mn;
@@ -192,9 +195,118 @@ struct ActState {
   }
 };
 
+#endif
 }  // namespace mk2p1
 
 using namespace mk2p1;
+
+#if defined(__HIP__)
+using MarkovBf16 = short __attribute__((ext_vector_type(16)));
+using MarkovAcc = float __attribute__((ext_vector_type(8)));
+
+template <int PT>
+__device__ void markov_wmma(
+    const bf16* B, const bf16* w1, const bf16* w2,
+    const unsigned* tokens, const int* rows, float* top, float* lse,
+    int V, int P, int rounding) {
+  __shared__ unsigned short weights[8][16][32];
+  __shared__ unsigned short inputs[16][32];
+  __shared__ float scores[16][256];
+  const int tid = threadIdx.x, wave = tid / 32, lane = tid % 32;
+  const int base = blockIdx.x * 256;
+  for (int request = 0; request < P; request += 16) {
+    for (int half = 0; half < 2; ++half) {
+      MarkovAcc acc = {};
+      for (int panel = 0; panel < 8; ++panel) {
+        for (int cell = lane; cell < 16 * 32; cell += 32) {
+          const int v = base + wave * 32 + half * 16 + cell / 32;
+          weights[wave][cell / 32][cell % 32] = v < V ?
+              reinterpret_cast<const unsigned short*>(w2)[(size_t)v * 256 + panel * 32 + cell % 32] : 0;
+        }
+        for (int cell = tid; cell < 16 * 32; cell += 256) {
+          const int p = request + cell / 32;
+          inputs[cell / 32][cell % 32] = p < P ?
+              reinterpret_cast<const unsigned short*>(w1)[(size_t)tokens[p] * 256 + panel * 32 + cell % 32] : 0;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int piece = 0; piece < 2; ++piece) {
+          MarkovBf16 a, b;
+#pragma unroll
+          for (int k = 0; k < 16; ++k) {
+            a[k] = weights[wave][lane % 16][piece * 16 + k];
+            b[k] = inputs[lane % 16][piece * 16 + k];
+          }
+          acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+        }
+        __syncthreads();
+      }
+#pragma unroll
+      for (int g = 0; g < 8; ++g) {
+        const int local = wave * 32 + half * 16 + 2 * g + lane / 16;
+        const int v = base + local, p = request + lane % 16;
+        scores[lane % 16][local] = v < V && p < P ?
+            markov_score(acc[g], B[(size_t)rows[p] * V + v], rounding) : -INFINITY;
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int part = 0; part < 2; ++part) {
+      const int local_p = wave + part * 8, p = request + local_p;
+      T4 t; t.init();
+      float m = -INFINITY;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int local = j * 32 + lane, v = base + local;
+        const float value = scores[local_p][local];
+        if (v < V) { t.insert(value, v); m = fmaxf(m, value); }
+      }
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor(m, off));
+      float sum = 0.0f;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int local = j * 32 + lane;
+        if (base + local < V && p < P) sum += __expf(scores[local_p][local] - m);
+      }
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1) {
+        float ss[4]; unsigned ii[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          ss[j] = __shfl_xor(t.s[j], off);
+          ii[j] = __shfl_xor(t.i[j], off);
+        }
+#pragma unroll
+        for (int j = 0; j < 4; ++j) t.insert(ss[j], ii[j]);
+        sum += __shfl_xor(sum, off);
+      }
+      if (lane == 0 && p < P) {
+        const size_t index = (size_t)blockIdx.x * PT + p;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          top[index * 8 + 2 * j] = t.s[j];
+          top[index * 8 + 2 * j + 1] = __uint_as_float(t.i[j]);
+        }
+        lse[index * 2] = m; lse[index * 2 + 1] = sum;
+      }
+    }
+    __syncthreads();
+  }
+}
+#define HIP_MARKOV_ENTRY(PT) \
+extern "C" __global__ void __launch_bounds__(256) markov2_top4_phase1_p##PT( \
+    const bf16* B, const bf16* w1, const bf16* w2, const unsigned* tokens, \
+    const int* rows, float* top, float* lse, int V, int in, int P, int score_rounding) { \
+  MK2_GUARD_P1(PT); \
+  markov_wmma<PT>(B, w1, w2, tokens, rows, top, lse, V, P, score_rounding); \
+}
+HIP_MARKOV_ENTRY(1)
+HIP_MARKOV_ENTRY(8)
+HIP_MARKOV_ENTRY(64)
+#undef HIP_MARKOV_ENTRY
+#else
+
 
 // PT = 64. Warp w owns acts [w*8, w*8+8) and sweeps all 256 block rows in
 // 16-row chunks. w2 is cp.async-staged through a 4-buffer swizzled pipeline
@@ -684,6 +796,7 @@ extern "C" __global__ void __launch_bounds__(MK2_NT, 2) markov2_top4_phase1_preF
                                  scratch_lse, P, V, score_rounding);
 }
 
+#endif
 #undef MK2_GUARD_P1
 
 // Per act p = blockIdx.x: thread t folds phase-1 partials b in {t, t+256} &
@@ -723,13 +836,13 @@ __device__ __forceinline__ void markov2_p2_body(
     float ps[4]; unsigned pi[4];
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-      ps[j] = __shfl_xor_sync(0xffffffffu, t4.s[j], off);
-      pi[j] = __shfl_xor_sync(0xffffffffu, t4.i[j], off);
+      ps[j] = __shfl_xor_sync(FF_WARP_MASK, t4.s[j], off);
+      pi[j] = __shfl_xor_sync(FF_WARP_MASK, t4.i[j], off);
     }
 #pragma unroll
     for (int j = 0; j < 4; ++j) t4.insert(ps[j], pi[j]);
-    const float pm = __shfl_xor_sync(0xffffffffu, m, off);
-    const float pl = __shfl_xor_sync(0xffffffffu, l, off);
+    const float pm = __shfl_xor_sync(FF_WARP_MASK, m, off);
+    const float pl = __shfl_xor_sync(FF_WARP_MASK, l, off);
     const float mn = fmaxf(m, pm);
     l = l * __expf(m - mn) + pl * __expf(pm - mn);
     m = mn;
@@ -753,13 +866,13 @@ __device__ __forceinline__ void markov2_p2_body(
       float ps[4]; unsigned pi[4];
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
-        ps[j] = __shfl_xor_sync(0xffffffffu, w4.s[j], off);
-        pi[j] = __shfl_xor_sync(0xffffffffu, w4.i[j], off);
+        ps[j] = __shfl_xor_sync(FF_WARP_MASK, w4.s[j], off);
+        pi[j] = __shfl_xor_sync(FF_WARP_MASK, w4.i[j], off);
       }
 #pragma unroll
       for (int j = 0; j < 4; ++j) w4.insert(ps[j], pi[j]);
-      const float pm = __shfl_xor_sync(0xffffffffu, wm, off);
-      const float pl = __shfl_xor_sync(0xffffffffu, wl, off);
+      const float pm = __shfl_xor_sync(FF_WARP_MASK, wm, off);
+      const float pl = __shfl_xor_sync(FF_WARP_MASK, wl, off);
       const float mn = fmaxf(wm, pm);
       wl = wl * __expf(wm - mn) + pl * __expf(pm - mn);
       wm = mn;
@@ -828,8 +941,8 @@ extern "C" __global__ void sum_argmax(const bf16* base, const bf16* bias,
     if (score > best || (score == best && (unsigned)v < id)) { best = score; id = unsigned(v); }
   }
   for (int offset = 16; offset; offset >>= 1) {
-    const float other = __shfl_down_sync(0xffffffffu,best,offset);
-    const unsigned other_id = __shfl_down_sync(0xffffffffu,id,offset);
+    const float other = __shfl_down_sync(FF_WARP_MASK,best,offset);
+    const unsigned other_id = __shfl_down_sync(FF_WARP_MASK,id,offset);
     if (lane + offset < 32 && (other > best || (other == best && other_id < id))) { best = other; id = other_id; }
   }
   if (lane == 0) { values[warp] = best; ids[warp] = id; }
@@ -837,8 +950,8 @@ extern "C" __global__ void sum_argmax(const bf16* base, const bf16* bias,
   if (warp == 0) {
     best = values[lane]; id = ids[lane];
     for (int offset = 16; offset; offset >>= 1) {
-      const float other = __shfl_down_sync(0xffffffffu,best,offset);
-      const unsigned other_id = __shfl_down_sync(0xffffffffu,id,offset);
+      const float other = __shfl_down_sync(FF_WARP_MASK,best,offset);
+      const unsigned other_id = __shfl_down_sync(FF_WARP_MASK,id,offset);
       if (lane + offset < 32 && (other > best || (other == best && other_id < id))) { best = other; id = other_id; }
     }
     if (lane == 0) *token = id;
@@ -861,13 +974,13 @@ extern "C" __global__ void concat_dot_sigmoid(const bf16* hidden, const bf16* em
                                  : embeddings[(size_t)parent * rank + i - width];
     sum += __bfloat162float(value) * __bfloat162float(weight[i]);
   }
-  for (int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(0xffffffffu,sum,offset);
+  for (int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(FF_WARP_MASK,sum,offset);
   __shared__ float partials[8];
   if (lane == 0) partials[warp] = sum;
   __syncthreads();
   if (warp == 0) {
     sum = lane < 8 ? partials[lane] : 0.0f;
-    for (int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(0xffffffffu,sum,offset);
+    for (int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(FF_WARP_MASK,sum,offset);
     if (lane == 0) {
       const float logit = __bfloat162float(__float2bfloat16(sum + __bfloat162float(*bias)));
       output[row] = __bfloat162float(__float2bfloat16(1.0f / (1.0f + expf(-logit))));

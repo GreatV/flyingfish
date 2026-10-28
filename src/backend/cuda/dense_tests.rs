@@ -124,6 +124,8 @@ fn dense_runtime_gpu() -> Result<()> {
         );
         if wmma_cells(&info) {
             wmma_gate(&s, &mut gate)?;
+            tcmqa_gate(&ctx, &s, &c, &mut gate)?;
+            markov_gate(&ctx, &s, &mut gate)?;
         } else {
             println!("WMMA cells NOT_COVERED arch={}", info.arch);
         }
@@ -702,12 +704,31 @@ fn attention_reference(
     start: usize,
     capacity: usize,
 ) -> Vec<bf16> {
+    let masks: Vec<_> = (0..rows)
+        .map(|row| u64::MAX >> (63 - row.min(63)))
+        .collect();
+    masked_attention_reference(q, k, v, start, capacity, &masks)
+}
+
+fn masked_attention_reference(
+    q: &[bf16],
+    k: &[bf16],
+    v: &[bf16],
+    start: usize,
+    capacity: usize,
+    masks: &[u64],
+) -> Vec<bf16> {
+    let rows = masks.len();
     let mut out = vec![bf16::ZERO; rows * 2048];
     for row in 0..rows {
         for head in 0..16 {
             let kh = head / 8;
-            let len = start + row + 1;
-            let scores: Vec<_> = (0..len)
+            let positions: Vec<_> = (0..start + rows)
+                .filter(|&pos| pos < start || masks[row] & (1u64 << (pos - start)) != 0)
+                .collect();
+            let scores: Vec<_> = positions
+                .iter()
+                .copied()
                 .map(|pos| {
                     (0..128)
                         .map(|d| {
@@ -725,7 +746,9 @@ fn attention_reference(
                 let value = probabilities
                     .iter()
                     .enumerate()
-                    .map(|(pos, &p)| p * f64::from(v[(kh * capacity + pos) * 128 + d].to_f32()))
+                    .map(|(j, &p)| {
+                        p * f64::from(v[(kh * capacity + positions[j]) * 128 + d].to_f32())
+                    })
                     .sum::<f64>()
                     / sum;
                 out[row * 2048 + head * 128 + d] = bf16::from_f32(value as f32);
@@ -733,6 +756,174 @@ fn attention_reference(
         }
     }
     out
+}
+
+#[cfg(feature = "rocm")]
+fn tcmqa_gate(
+    ctx: &Arc<CudaContext>,
+    s: &Arc<CudaStream>,
+    c: &Config,
+    gate: &mut Gate,
+) -> Result<()> {
+    for (capacity, rows, start) in [
+        (129usize, 1usize, 127usize),
+        (129, 3, 63),
+        (129, 7, 1),
+        (129, 8, 64),
+        (129, 16, 113),
+        (129, 33, 63),
+        (129, 64, 65),
+        (4096, 8, 4088),
+    ] {
+        let q = pattern(rows * 2560, 7);
+        let k = pattern(2 * capacity * 128, 9);
+        let v = pattern(2 * capacity * 128, 11);
+        let mut dq = s.clone_htod(&q)?;
+        let dk = s.clone_htod(&k)?;
+        let dv = s.clone_htod(&v)?;
+        let prefix = s.clone_htod(&[start as i32])?;
+        let guard = bf16::from_f32(13.0);
+        let mut output = s.clone_htod(&vec![guard; (rows + 1) * 2048])?;
+        for causal in [true, false] {
+            let masks: Vec<_> = (0..rows)
+                .map(|row| {
+                    if causal {
+                        u64::MAX >> (63 - row)
+                    } else {
+                        1 | (1u64 << row) | (1u64 << (row / 2))
+                    }
+                })
+                .collect();
+            let expected = masked_attention_reference(&q, &k, &v, start, capacity, &masks);
+            let shape = verification::Shape {
+                rows,
+                start,
+                q_heads: 16,
+                kv_heads: 2,
+                capacity,
+                head_dim: 128,
+                causal,
+                window_left: None,
+            };
+            let mut mq = verification::Verification::with_plan(
+                ctx,
+                s,
+                c,
+                MultiShape {
+                    rows,
+                    capacity,
+                    causal,
+                },
+                MultiPlan {
+                    implementation: MultiImpl::Tcmqa,
+                    launch: AttentionPlan {
+                        chunk: 64,
+                        qpack: 8,
+                        threads: 128,
+                        merge_threads: 256,
+                    },
+                },
+            )?;
+            let mut ancestors = s.clone_htod(&masks)?;
+            if causal {
+                mq.run(&dq, &dk, &dv, &mut output, &prefix, shape)?;
+            } else {
+                mq.run_tree(
+                    verification::Query {
+                        qkv: &dq,
+                        k: &dk,
+                        v: &dv,
+                        out: &mut output,
+                        prefix: &prefix,
+                        shape,
+                    },
+                    &ancestors,
+                )?;
+            }
+            gate.compare(
+                &format!("tcmqa.{capacity}.{rows}.{start}.causal{causal}"),
+                &s.clone_dtoh(&output.slice(..rows * 2048))?,
+                &expected,
+                2,
+                capacity + 128,
+            )?;
+            gate.check(
+                "tcmqa.output_guard",
+                s.clone_dtoh(&output.slice(rows * 2048..))?
+                    .iter()
+                    .all(|&x| x == guard),
+            );
+            if !causal {
+                let same_query: Vec<_> = q[..2560]
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(rows * 2560)
+                    .collect();
+                s.memcpy_htod(&same_query, &mut dq)?;
+                s.memcpy_htod(&vec![1u64; rows], &mut ancestors)?;
+                mq.run_tree(
+                    verification::Query {
+                        qkv: &dq,
+                        k: &dk,
+                        v: &dv,
+                        out: &mut output,
+                        prefix: &prefix,
+                        shape,
+                    },
+                    &ancestors,
+                )?;
+                let actual = s.clone_dtoh(&output.slice(..rows * 2048))?;
+                gate.check(
+                    "tcmqa.batch_position_identity",
+                    actual
+                        .as_chunks::<2048>()
+                        .0
+                        .iter()
+                        .all(|row| row == &actual[..2048]),
+                );
+                s.memcpy_htod(&q, &mut dq)?;
+                if rows == 7 {
+                    let mut mutant_v = v.clone();
+                    for head in 0..2 {
+                        mutant_v
+                            [(head * capacity + start) * 128..(head * capacity + start + 1) * 128]
+                            .fill(bf16::from_f32(16.0));
+                    }
+                    let mutant_v = s.clone_htod(&mutant_v)?;
+                    let reference = masked_attention_reference(
+                        &q,
+                        &k,
+                        &s.clone_dtoh(&mutant_v)?,
+                        start,
+                        capacity,
+                        &vec![1; rows],
+                    );
+                    s.memcpy_htod(&vec![2u64; rows], &mut ancestors)?;
+                    mq.run_tree(
+                        verification::Query {
+                            qkv: &dq,
+                            k: &dk,
+                            v: &mutant_v,
+                            out: &mut output,
+                            prefix: &prefix,
+                            shape,
+                        },
+                        &ancestors,
+                    )?;
+                    let actual = s.clone_dtoh(&output.slice(..rows * 2048))?;
+                    gate.check(
+                        "tcmqa.ancestor_index_mutant_rejected",
+                        actual
+                            .iter()
+                            .zip(reference)
+                            .any(|(a, b)| (a.to_f32() - b.to_f32()).abs() > 1.0),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn attention_gate(
@@ -1304,6 +1495,201 @@ fn wmma_gate(s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
                     actual.to_bits() == expected.to_bits()
                 },
             );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "rocm")]
+fn markov_gate(ctx: &Arc<CudaContext>, s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
+    let module = cubin::module(ctx, "markov")?;
+    let first = [1, 8, 64].map(|p| module.load_function(&format!("markov2_top4_phase1_p{p}")));
+    let first = first.into_iter().collect::<Result<Vec<_>>>()?;
+    let second = module.load_function("markov2_top4_phase2")?;
+    let coefficient = |index: usize, period: usize| {
+        let v = index * 31 % period;
+        (if v.is_multiple_of(2) { 1.0 } else { -1.0 }) * 2f32.powi((v % 5) as i32 - 4)
+    };
+    let e: Vec<_> = (0..256)
+        .map(|k| ((k * 17 % 257) as f32 - 128.0) / 256.0)
+        .collect();
+    let g: Vec<_> = (0..256)
+        .map(|k| ((k * 29 % 263) as f32 - 131.0) / 256.0)
+        .collect();
+    let dot: f64 = e
+        .iter()
+        .zip(&g)
+        .map(|(&a, &b)| f64::from(a) * f64::from(b))
+        .sum();
+    for vocab in [263usize, 130560] {
+        let w1: Vec<_> = (0..vocab * 256)
+            .map(|i| bf16::from_f32(coefficient(i / 256, 257) * e[i % 256]))
+            .collect();
+        let w2: Vec<_> = (0..vocab * 256)
+            .map(|i| bf16::from_f32(coefficient(i / 256, 263) * g[i % 256]))
+            .collect();
+        let base: Vec<_> = (0..7 * vocab)
+            .map(|i| {
+                bf16::from_f32(
+                    ((i % vocab * 47 + i / vocab * 31) % 269) as f32 / 32.0 - 134.0 / 32.0,
+                )
+            })
+            .collect();
+        let dw1 = s.clone_htod(&w1)?;
+        let dw2 = s.clone_htod(&w2)?;
+        let db = s.clone_htod(&base)?;
+        let mut identities = std::collections::BTreeMap::new();
+        for rounding in [0i32, 1] {
+            for p in [1usize, 3, 8, 17, 64] {
+                let requests: Vec<_> = (0..p)
+                    .map(|j| {
+                        let id = (j * 3 + p) % 7;
+                        ((id * 5 % 7) as i32, ((id * 1009 + 257) % vocab) as u32)
+                    })
+                    .collect();
+                let tokens = s.clone_htod(&requests.iter().map(|r| r.1).collect::<Vec<_>>())?;
+                let rows = s.clone_htod(&requests.iter().map(|r| r.0).collect::<Vec<_>>())?;
+                let (index, pt) = if p == 1 {
+                    (0, 1)
+                } else if p <= 8 {
+                    (1, 8)
+                } else {
+                    (2, 64)
+                };
+                let mut partial_top = s.alloc_zeros::<f32>(vocab.div_ceil(256) * pt * 8)?;
+                let mut partial_lse = s.alloc_zeros::<f32>(vocab.div_ceil(256) * pt * 2)?;
+                let mut top = s.alloc_zeros::<u32>(p * 4)?;
+                let mut logp = s.alloc_zeros::<f32>(p * 4)?;
+                let mut lse = s.alloc_zeros::<f32>(p)?;
+                unsafe {
+                    s.launch_builder(&first[index])
+                        .arg(&db)
+                        .arg(&dw1)
+                        .arg(&dw2)
+                        .arg(&tokens)
+                        .arg(&rows)
+                        .arg(&mut partial_top)
+                        .arg(&mut partial_lse)
+                        .arg(&(vocab as i32))
+                        .arg(&256i32)
+                        .arg(&(p as i32))
+                        .arg(&rounding)
+                        .launch(ops::grid(vocab.div_ceil(256), 256))?;
+                    s.launch_builder(&second)
+                        .arg(&partial_top)
+                        .arg(&partial_lse)
+                        .arg(&mut top)
+                        .arg(&mut logp)
+                        .arg(&mut lse)
+                        .arg(&(vocab as i32))
+                        .arg(&(p as i32))
+                        .arg(&(pt as i32))
+                        .launch(ops::grid(p, 256))?;
+                }
+                let top = s.clone_dtoh(&top)?;
+                let logp = s.clone_dtoh(&logp)?;
+                let lse = s.clone_dtoh(&lse)?;
+                ensure!(
+                    logp.iter().chain(&lse).all(|v| v.is_finite()),
+                    "RUNNER_FAIL Markov nonfinite output"
+                );
+                for (j, &(row, token)) in requests.iter().enumerate() {
+                    let scores: Vec<_> = (0..vocab)
+                        .map(|v| {
+                            let bias = bf16::from_f32(
+                                (dot * f64::from(coefficient(token as usize, 257))
+                                    * f64::from(coefficient(v, 263)))
+                                    as f32,
+                            )
+                            .to_f32();
+                            let score = bias + base[row as usize * vocab + v].to_f32();
+                            if rounding == 0 {
+                                bf16::from_f32(score).to_f32()
+                            } else {
+                                score
+                            }
+                        })
+                        .collect();
+                    let mut order: Vec<_> = (0..vocab as u32).collect();
+                    order.sort_unstable_by(|&a, &b| {
+                        scores[b as usize]
+                            .total_cmp(&scores[a as usize])
+                            .then(a.cmp(&b))
+                    });
+                    let mx = f64::from(scores[order[0] as usize]);
+                    let expected_lse = mx
+                        + scores
+                            .iter()
+                            .map(|&x| (f64::from(x) - mx).exp())
+                            .sum::<f64>()
+                            .ln();
+                    let error = (f64::from(lse[j]) - expected_lse).abs().max(
+                        (0..4)
+                            .map(|k| {
+                                (f64::from(logp[j * 4 + k])
+                                    - (f64::from(scores[order[k] as usize]) - expected_lse))
+                                    .abs()
+                            })
+                            .fold(0.0, f64::max),
+                    );
+                    let name = format!("markov.v{vocab}.p{p}.round{rounding}.row{j}");
+                    println!(
+                        "MARKOV_ERROR name={name} lse_logp_max={error:e} bound=1e-4 margin4_5={}",
+                        scores[order[3] as usize] - scores[order[4] as usize]
+                    );
+                    gate.check(&name, top[j * 4..j * 4 + 4] == order[..4] && error <= 1e-4);
+                    let bits: Vec<_> = top[j * 4..j * 4 + 4]
+                        .iter()
+                        .copied()
+                        .chain(logp[j * 4..j * 4 + 4].iter().map(|x| x.to_bits()))
+                        .chain([lse[j].to_bits()])
+                        .collect();
+                    let key = (rounding, row, token);
+                    if let Some(previous) = identities.insert(key, bits.clone()) {
+                        gate.check("markov.batch_position_identity", previous == bits);
+                    }
+                }
+                if vocab == 263 && p == 3 && rounding == 0 {
+                    let wrong_rows =
+                        s.clone_htod(&requests.iter().map(|r| (r.0 + 1) % 7).collect::<Vec<_>>())?;
+                    let mut mutant_top = s.alloc_zeros::<u32>(p * 4)?;
+                    let mut mutant_logp = s.alloc_zeros::<f32>(p * 4)?;
+                    let mut mutant_lse = s.alloc_zeros::<f32>(p)?;
+                    unsafe {
+                        s.launch_builder(&first[index])
+                            .arg(&db)
+                            .arg(&dw1)
+                            .arg(&dw2)
+                            .arg(&tokens)
+                            .arg(&wrong_rows)
+                            .arg(&mut partial_top)
+                            .arg(&mut partial_lse)
+                            .arg(&(vocab as i32))
+                            .arg(&256i32)
+                            .arg(&(p as i32))
+                            .arg(&rounding)
+                            .launch(ops::grid(vocab.div_ceil(256), 256))?;
+                        s.launch_builder(&second)
+                            .arg(&partial_top)
+                            .arg(&partial_lse)
+                            .arg(&mut mutant_top)
+                            .arg(&mut mutant_logp)
+                            .arg(&mut mutant_lse)
+                            .arg(&(vocab as i32))
+                            .arg(&(p as i32))
+                            .arg(&(pt as i32))
+                            .launch(ops::grid(p, 256))?;
+                    }
+                    gate.check(
+                        "markov.request_row_mutant_rejected",
+                        s.clone_dtoh(&mutant_top)? != top
+                            || s.clone_dtoh(&mutant_lse)?
+                                .iter()
+                                .zip(&lse)
+                                .any(|(a, b)| (a - b).abs() > 1e-4),
+                    );
+                }
+            }
         }
     }
     Ok(())

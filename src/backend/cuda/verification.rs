@@ -33,6 +33,38 @@ pub struct Verification {
     plan: AttentionPlan,
 }
 
+#[cfg(feature = "rocm")]
+pub(super) fn hip_tcmqa_plan(
+    ctx: &Arc<CudaContext>,
+    capacity: usize,
+    rows: usize,
+) -> Result<MultiPlan> {
+    ctx.require_wmma()?;
+    ensure!(
+        (1..=64).contains(&rows) && capacity >= rows,
+        "HIP TCMQA rows/capacity outside supported extent"
+    );
+    let function = cubin::module(ctx, "tcmqa")?.load_function("tcmqa_phase1")?;
+    let occupancy = function.occupancy_max_active_blocks_per_multiprocessor(
+        128,
+        MultiImpl::Tcmqa.phase1_smem_bytes(),
+        None,
+    )?;
+    ensure!(occupancy > 0, "HIP TCMQA phase1 has zero occupancy");
+    let groups = 2 * (8 * rows).div_ceil(64);
+    let partitions = (ctx.device_info()?.sms * occupancy as usize).div_ceil(groups);
+    let chunk = capacity.div_ceil(partitions).next_multiple_of(64).max(64);
+    Ok(MultiPlan {
+        implementation: MultiImpl::Tcmqa,
+        launch: AttentionPlan {
+            chunk,
+            qpack: 8,
+            threads: 128,
+            merge_threads: 256,
+        },
+    })
+}
+
 pub struct Query<'a> {
     pub qkv: &'a CudaSlice<bf16>,
     pub k: &'a CudaSlice<bf16>,
@@ -82,10 +114,13 @@ impl Verification {
             causal,
         } = shape;
         #[cfg(feature = "rocm")]
-        ensure!(
-            selected.implementation == MultiImpl::V1,
-            "HIP attention requires SIMT V1; TCMQA mma/ldmatrix/cp.async is unsupported"
-        );
+        if selected.implementation != MultiImpl::V1 {
+            ctx.require_wmma()?;
+            ensure!(
+                selected.implementation == MultiImpl::Tcmqa,
+                "HIP TCMQA requires the native 64-pair WMMA plan"
+            );
+        }
         let plan = selected.launch;
         let implementation = selected.implementation;
         let phase1 = implementation.phase1();
@@ -198,6 +233,16 @@ impl Verification {
                 implementation.phase1_smem_bytes() as i32,
             )?;
         }
+        #[cfg(feature = "rocm")]
+        ensure!(
+            first_smem <= ctx.properties.shared_bytes as usize
+                && first.occupancy_max_active_blocks_per_multiprocessor(
+                    plan.threads,
+                    first_smem,
+                    None
+                )? > 0,
+            "HIP MQ phase1 has zero occupancy or exceeds LDS"
+        );
         let second = module.load_function(if implementation == MultiImpl::V1 {
             "flash_decode_mq_phase2"
         } else if implementation.short_merge() {

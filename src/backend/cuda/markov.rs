@@ -1,7 +1,7 @@
 use super::{Device, cubin};
 use crate::backend::Top4;
+use crate::backend::gpu::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use half::bf16;
 use std::sync::Arc;
 
@@ -71,12 +71,16 @@ impl Markov {
             d.info.shared_bytes >= 32768,
             "Markov v2 kernels require 32768 bytes static shared memory"
         );
+        #[cfg(feature = "cuda")]
         let calibration = super::markov_calibrate::load(d, ops, dir, closure, shape)?;
+        #[cfg(feature = "cuda")]
         let (p1, p8) = (calibration.choice(1)?, calibration.choice(8)?);
+        #[cfg(feature = "cuda")]
         let first = [p1.symbol(1), p8.symbol(8), "markov2_top4_phase1_p64"]
             .iter()
             .map(|name| module.load_function(name))
             .collect::<std::result::Result<_, _>>()?;
+        #[cfg(feature = "cuda")]
         eprintln!(
             "{}",
             serde_json::json!({"markov_phase1_selection":{
@@ -86,6 +90,23 @@ impl Markov {
                 "cached": calibration.cached(),
                 "path": calibration.path()}})
         );
+        #[cfg(feature = "rocm")]
+        let first = {
+            let _ = (ops, dir);
+            d.ctx.require_wmma()?;
+            closure.bind_fixed()?;
+            let functions = [1, 8, 64]
+                .into_iter()
+                .map(|p| module.load_function(&format!("markov2_top4_phase1_p{p}")))
+                .collect::<Result<Vec<_>>>()?;
+            for function in &functions {
+                ensure!(
+                    function.occupancy_max_active_blocks_per_multiprocessor(256, 0, None)? > 0,
+                    "HIP Markov has zero occupancy"
+                );
+            }
+            functions
+        };
         Ok(Self {
             stream: s.clone(),
             first,
@@ -242,6 +263,7 @@ pub(super) unsafe fn phase1_launch(
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
 pub(super) fn phase1_bits(
     s: &Arc<CudaStream>,
     function: &CudaFunction,
@@ -266,6 +288,6 @@ fn check_requests(requests: &[(u8, u32)], shape: MarkovShape) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 #[path = "markov_tests.rs"]
 mod tests;

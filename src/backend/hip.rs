@@ -495,6 +495,28 @@ impl Stream {
         }
         Ok(output)
     }
+    pub fn memcpy_dtoh<T: DeviceRepr>(
+        self: &Arc<Self>,
+        input: &impl DevicePtr<T>,
+        output: &mut [T],
+    ) -> Result<()> {
+        self.require_eager("device-to-host copy")?;
+        ensure!(
+            input.len() <= output.len(),
+            "HIP D2H exceeds host destination"
+        );
+        input.check_stream(self)?;
+        let (ptr, _guard) = input.device_ptr(self);
+        unsafe {
+            self.copy_raw(
+                output.as_mut_ptr() as u64,
+                ptr,
+                extent::<T>(input.len())?,
+                2,
+            )?;
+        }
+        self.synchronize()
+    }
     pub fn memcpy_dtod<T: DeviceRepr>(
         self: &Arc<Self>,
         input: &impl DevicePtr<T>,
@@ -824,6 +846,9 @@ fn bounds(range: impl RangeBounds<usize>, len: usize) -> (usize, usize) {
     (start, end - start)
 }
 impl<T> Slice<T> {
+    pub fn context(&self) -> &Arc<Context> {
+        self.allocation.stream.context()
+    }
     pub fn len(&self) -> usize {
         self.len
     }
@@ -895,7 +920,25 @@ impl<T> View<'_, T> {
         self.len == 0
     }
 }
-impl<T> ViewMut<'_, T> {
+impl<'a, T> ViewMut<'a, T> {
+    pub fn split_at_mut(&mut self, mid: usize) -> (ViewMut<'_, T>, ViewMut<'_, T>) {
+        assert!(mid <= self.len, "HIP mutable split exceeds view");
+        let allocation: &'a Arc<Allocation> = self.allocation;
+        (
+            ViewMut {
+                allocation,
+                offset: self.offset,
+                len: mid,
+                marker: PhantomData,
+            },
+            ViewMut {
+                allocation,
+                offset: self.offset + mid,
+                len: self.len - mid,
+                marker: PhantomData,
+            },
+        )
+    }
     pub fn len(&self) -> usize {
         self.len
     }
