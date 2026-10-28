@@ -816,6 +816,10 @@ impl Engine {
             self.device.ctx.bind_to_thread()?;
         }
         executor.pool.set_form(crate::cpu::expert_ffn::Form::Lane16);
+        self.moe_slots
+            .as_mut()
+            .context("invariant expert slots missing")?
+            .set_form(crate::cpu::expert_ffn::Form::Lane16)?;
         eprintln!(
             "draft_target_arithmetic lane16_routed=true skinny_shared=true skinny_typed=true rows={}",
             crate::linear_plan::MAX_SKINNY_ROWS

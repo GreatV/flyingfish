@@ -604,6 +604,13 @@ pub(super) fn delay_stream(stream: &Arc<CudaStream>) -> Result<()> {
 }
 
 impl Slots {
+    pub(super) fn set_form(&mut self, form: crate::cpu::expert_ffn::Form) -> Result<()> {
+        if let Some(disk) = &mut self.disk_cpu {
+            disk.set_form(form)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn load(
         device: &Device,
         peer_device: Option<&Device>,

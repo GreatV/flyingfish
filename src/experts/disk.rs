@@ -467,12 +467,24 @@ impl DiskExperts {
                     swiglu_rounding,
                     swiglu_limit,
                     routed_weight,
-                    form: crate::cpu::expert_ffn::Form::Lane16,
+                    form: crate::cpu::expert_ffn::Form::Lane8,
                     output: vec![bf16::ZERO; elements],
                 }),
             });
         }
         Ok(pool)
+    }
+
+    pub fn set_form(&mut self, form: crate::cpu::expert_ffn::Form) -> Result<()> {
+        self.check_ready()?;
+        for worker in &mut self.workers {
+            worker
+                .work
+                .as_mut()
+                .expect("preflight checked reusable job")
+                .form = form;
+        }
+        Ok(())
     }
 
     pub fn check_ready(&self) -> Result<()> {
@@ -1121,7 +1133,12 @@ mod tests {
         let hidden = (0..24)
             .map(|index| bf16::from_f32(((index * 11) % 29) as f32 / 32.0))
             .collect::<Vec<_>>();
-        for layer in [1, 0, 1] {
+        for (layer, form) in [
+            (1, crate::cpu::expert_ffn::Form::Lane8),
+            (0, crate::cpu::expert_ffn::Form::Lane16),
+            (1, crate::cpu::expert_ffn::Form::Lane8),
+        ] {
+            pool.set_form(form)?;
             let routes = [
                 Route {
                     row: 1,
@@ -1151,7 +1168,7 @@ mod tests {
                 contribution(
                     Isa::detect(),
                     Contribution {
-                        form: crate::cpu::expert_ffn::Form::Lane16,
+                        form,
                         shape: &shape,
                         arena: &values,
                         weights: &crate::cpu::expert_ffn::ExpertWeights::from_slot(
@@ -1344,7 +1361,12 @@ mod tests {
         let hidden = (0..3 * shape.hidden)
             .map(|k| bf16::from_f32(((k * 11 % 29) as f32 - 13.0) / 32.0))
             .collect::<Vec<_>>();
-        for layer in [1, 0, 1] {
+        for (layer, form) in [
+            (1, crate::cpu::expert_ffn::Form::Lane8),
+            (0, crate::cpu::expert_ffn::Form::Lane16),
+            (1, crate::cpu::expert_ffn::Form::Lane8),
+        ] {
+            pool.set_form(form)?;
             let routes = [(1, 5, 3, 0.25), (0, 1, 0, 0.5), (2, 4, 3, 0.75)].map(
                 |(row, choice, expert, weight)| Route {
                     row,
@@ -1361,7 +1383,7 @@ mod tests {
                 fp8_contribution(
                     Isa::Scalar,
                     Fp8Contribution {
-                        form: crate::cpu::expert_ffn::Form::Lane16,
+                        form,
                         shape: &shape,
                         slot: native_bytes(&values),
                         slot_layout: catalogue.layout().fp8_slot().context("FP8 fixture slot")?,
