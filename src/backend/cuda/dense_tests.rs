@@ -1320,6 +1320,68 @@ fn copy_gate(ctx: &Arc<CudaContext>, s: &Arc<CudaStream>, gate: &mut Gate) -> Re
         )
         .is_err(),
     );
+    let mut raw_input = copy::pinned_zeros::<u32>(ctx, 263)?;
+    for (i, value) in raw_input.as_mut_slice()?.iter_mut().enumerate() {
+        *value = ((i * 17 % 251) as u32) << 16 | (i * 29 % 257) as u32;
+    }
+    let mut raw_output = copy::pinned_zeros::<u32>(ctx, 263)?;
+    let raw_source = s.clone_htod(&[0xa5a5_a5a5u32; 269])?;
+    let raw_target = s.clone_htod(&[0x5a5a_5a5au32; 269])?;
+    let (src, _src) = raw_source.device_ptr(s);
+    let (dst, _dst) = raw_target.device_ptr(s);
+    upload.wait(&s.record_event(None)?)?;
+    {
+        #[cfg(feature = "cuda")]
+        use cudarc::driver::HostSlice;
+        let (input, _read) = unsafe { raw_input.stream_synced_slice(&upload) };
+        // Both allocations are ordered after their initialization and retained through the final fence.
+        unsafe { copy::htod_async(src + 12, input, upload.as_ref())? };
+    }
+    s.wait(&upload.record_event(None)?)?;
+    unsafe {
+        copy::dtod_raw(dst + 12, src + 12, 263 * 4, s.as_ref())?;
+        copy::memset_bytes(dst + 12 + 7 * 4, 0xab, 7, s.as_ref())?;
+        copy::memset_words(dst + 12 + 19 * 4, 0x1122_3344, 5, s.as_ref())?;
+    }
+    let completed = s.record_event(None)?;
+    upload.wait(&completed)?;
+    {
+        #[cfg(feature = "cuda")]
+        use cudarc::driver::HostSlice;
+        let (output, _write) = unsafe { raw_output.stream_synced_mut_slice(&upload) };
+        // The read follows the compute event and the pinned output is unread until synchronization.
+        unsafe { copy::dtoh_async(output, dst + 12, upload.as_ref())? };
+    }
+    upload.synchronize()?;
+    gate.check("copy.raw_event_complete", completed.try_is_complete()?);
+    let mut raw_expected = raw_input
+        .as_slice()?
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    raw_expected[28..35].fill(0xab);
+    raw_expected[76..96].copy_from_slice(&0x1122_3344u32.to_le_bytes().repeat(5));
+    let raw_actual = raw_output
+        .as_slice()?
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    gate.check("copy.raw_fenced_mailbox", raw_actual == raw_expected);
+    raw_expected[76] ^= 1;
+    gate.check("copy.raw_wrong_word_control", raw_actual != raw_expected);
+    let guarded = s.clone_dtoh(&raw_target)?;
+    gate.check(
+        "copy.raw_guards",
+        guarded[..3]
+            .iter()
+            .chain(&guarded[266..])
+            .all(|&v| v == 0x5a5a_5a5a),
+    );
+    #[cfg(feature = "rocm")]
+    gate.check(
+        "copy.raw_safe_api_still_rejects_foreign_owner",
+        upload.clone_dtoh(&raw_source).is_err(),
+    );
     let model = crate::model_spec::ModelSpec::from_llama(&config()?)?;
     let mut state = state::StateStore::new(&model, 129, s)?;
     gate.check(

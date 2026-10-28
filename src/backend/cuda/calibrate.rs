@@ -1475,6 +1475,11 @@ fn registration_extent<T>(
 }
 
 fn measure_host_registration(d: &Device, bytes: u64, slot_bytes: u64) -> Result<(u64, [f64; 3])> {
+    let (status_field, success_status, oom_status) = if cfg!(feature = "cuda") {
+        ("cuda_result", "CUDA_SUCCESS", "CUDA_ERROR_OUT_OF_MEMORY")
+    } else {
+        ("hip_result", "hipSuccess", "hipErrorOutOfMemory")
+    };
     if !host_registration_supported(d)? {
         return Ok((0, [0.0; 3]));
     }
@@ -1509,14 +1514,14 @@ fn measure_host_registration(d: &Device, bytes: u64, slot_bytes: u64) -> Result<
                 eprintln!(
                     "{}",
                     serde_json::json!({"host_registration_capacity_probe": {
-                        "bytes":extent,"cuda_result":"CUDA_ERROR_OUT_OF_MEMORY",
+                        "bytes":extent,(status_field):oom_status,
                         "register_seconds":registered
                     }})
                 );
                 return Ok(None);
             }
             return Err(error)
-                .with_context(|| format!("measure CUDA host registration: bytes={extent}"));
+                .with_context(|| format!("measure host registration: bytes={extent}"));
         }
         let start = Instant::now();
         // SAFETY: pointer is the successfully registered prefix and has no DMA users.
@@ -1535,7 +1540,7 @@ fn measure_host_registration(d: &Device, bytes: u64, slot_bytes: u64) -> Result<
         "{}",
         serde_json::json!({"host_registration_measurement": {
             "bytes":extent,"allocation_bytes":bytes,"allocation_seconds":allocated,
-            "cuda_result":if extent > 0 {"CUDA_SUCCESS"} else {"CUDA_ERROR_OUT_OF_MEMORY"},
+            (status_field):if extent > 0 {success_status} else {oom_status},
             "register_seconds":registered,"unregister_seconds":unregistered
         }})
     );

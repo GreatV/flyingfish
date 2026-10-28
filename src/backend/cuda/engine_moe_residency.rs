@@ -1,5 +1,6 @@
 //! Native expert DMA ownership and the CPU residency runtime.
 use super::*;
+use crate::backend::gpu::CudaFunction;
 use crate::experts::{
     arena::{BlockLease, WriteClaim},
     catalogue::ExpertCatalogue,
@@ -7,7 +8,6 @@ use crate::experts::{
     plan::Tier,
     runtime::{MoveSource, PromptMove, Residency},
 };
-use cudarc::driver::CudaFunction;
 use std::cell::RefCell;
 
 #[path = "engine_moe_prefill.rs"]
@@ -113,6 +113,7 @@ impl Reader {
             copied: vec![None; slots],
         };
         device.ctx.bind_to_thread()?;
+        #[cfg(feature = "cuda")]
         let flags = if portable {
             cudarc::driver::sys::CU_MEMHOSTREGISTER_PORTABLE
         } else {
@@ -128,15 +129,19 @@ impl Reader {
                 "disk ring registration repeated address={address:#x}"
             );
             // SAFETY: the reader owns every stable ring allocation through unregister.
-            unsafe {
+            #[cfg(feature = "cuda")]
+            let result = unsafe {
                 cudarc::driver::sys::cuMemHostRegister_v2(
                     address as *mut std::ffi::c_void,
                     bytes,
                     flags,
                 )
                 .result()
-            }
-            .with_context(|| format!("register expert disk ring: slot={slot} bytes={bytes}"))?;
+            };
+            #[cfg(feature = "rocm")]
+            let result = unsafe { device.ctx.register_host(address, bytes, portable) };
+            result
+                .with_context(|| format!("register expert disk ring: slot={slot} bytes={bytes}"))?;
             reader.registrations.push(address);
         }
         Ok(reader)
@@ -180,9 +185,13 @@ impl Drop for Reader {
         self.context.record_err(self.context.bind_to_thread());
         for &address in &self.registrations {
             // SAFETY: all ring DMA is complete and the owned allocation is still live.
-            self.context.record_err(unsafe {
+            #[cfg(feature = "cuda")]
+            let result = unsafe {
                 cudarc::driver::sys::cuMemHostUnregister(address as *mut std::ffi::c_void).result()
-            });
+            };
+            #[cfg(feature = "rocm")]
+            let result = unsafe { self.context.unregister_host(address) };
+            self.context.record_err(result);
         }
     }
 }
@@ -413,13 +422,12 @@ impl Transfers {
         self.d2h.context().bind_to_thread()?;
         // SAFETY: the full native slot and its claimed host or pinned destination stay owned.
         unsafe {
-            cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+            copy::dtoh_raw(
                 destination as *mut std::ffi::c_void,
                 pointer,
                 bytes,
-                self.d2h.cu_stream(),
+                self.d2h.as_ref(),
             )
-            .result()
         }
         .with_context(|| format!("expert write-back: block={block} bytes={bytes}"))?;
         let completed = events.record(&self.d2h)?;
@@ -947,13 +955,12 @@ impl Slots {
                     peer.upload.context().bind_to_thread()?;
                     // SAFETY: the portable registered ring guard remains alive until the copy is submitted.
                     unsafe {
-                        cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                        copy::htod_raw(
                             self.physical[slot as usize].pointer,
                             pointer as *const std::ffi::c_void,
                             usize::try_from(self.catalogue.slot_bytes())?,
-                            peer.upload.cu_stream(),
+                            peer.upload.as_ref(),
                         )
-                        .result()
                     }
                     .context("copy native disk expert into its peer physical slot")?;
                     peer.synced.record(&peer.upload)?;
@@ -962,13 +969,12 @@ impl Slots {
                 } else {
                     // SAFETY: the registered ring guard remains alive until the copy is submitted.
                     unsafe {
-                        cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                        copy::htod_raw(
                             self.physical[slot as usize].pointer,
                             pointer as *const std::ffi::c_void,
                             usize::try_from(self.catalogue.slot_bytes())?,
-                            self.transfers.h2d.cu_stream(),
+                            self.transfers.h2d.as_ref(),
                         )
-                        .result()
                     }
                     .context("copy native disk expert into its physical slot")?;
                 }
@@ -984,13 +990,12 @@ impl Slots {
                 peer.upload.context().bind_to_thread()?;
                 // SAFETY: the source remains claimed or staged through the recorded copy.
                 unsafe {
-                    cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                    copy::htod_raw(
                         self.physical[slot as usize].pointer,
                         pointer as *const std::ffi::c_void,
                         usize::try_from(self.catalogue.slot_bytes())?,
-                        peer.upload.cu_stream(),
+                        peer.upload.as_ref(),
                     )
-                    .result()
                 }
                 .context("copy native host expert into its peer physical slot")?;
                 peer.synced.record(&peer.upload)?;
@@ -1000,13 +1005,12 @@ impl Slots {
                 self.transfers.h2d.context().bind_to_thread()?;
                 // SAFETY: the pinned source remains claimed or staged through the recorded copy.
                 unsafe {
-                    cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                    copy::htod_raw(
                         self.physical[slot as usize].pointer,
                         pointer as *const std::ffi::c_void,
                         usize::try_from(self.catalogue.slot_bytes())?,
-                        self.transfers.h2d.cu_stream(),
+                        self.transfers.h2d.as_ref(),
                     )
-                    .result()
                 }
                 .context("copy native host expert into its physical slot")?;
             }

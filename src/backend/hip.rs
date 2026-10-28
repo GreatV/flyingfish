@@ -41,6 +41,7 @@ unsafe extern "C" {
     fn hipEventDestroy(event: Handle) -> i32;
     fn hipEventRecord(event: Handle, stream: Handle) -> i32;
     fn hipEventSynchronize(event: Handle) -> i32;
+    fn hipEventQuery(event: Handle) -> i32;
     fn hipEventElapsedTime(ms: *mut f32, start: Handle, end: Handle) -> i32;
     fn hipMalloc(ptr: *mut Handle, bytes: usize) -> i32;
     fn hipFree(ptr: Handle) -> i32;
@@ -253,6 +254,9 @@ impl Context {
     pub fn synchronize(&self) -> Result<()> {
         self.bind_to_thread()?;
         unsafe { check(hipDeviceSynchronize(), "hipDeviceSynchronize") }
+    }
+    pub(crate) fn record_err(&self, result: Result<()>) {
+        drop_result(result);
     }
     pub fn mem_get_info(&self) -> Result<(usize, usize)> {
         self.bind_to_thread()?;
@@ -657,6 +661,17 @@ impl Stream {
             )
         }
     }
+    /// # Safety
+    /// `ptr` must address `bytes` writable bytes ordered on this stream.
+    pub(crate) unsafe fn memset_bytes(&self, ptr: u64, value: u8, bytes: usize) -> Result<()> {
+        self.context.bind_to_thread()?;
+        unsafe {
+            check(
+                hipMemsetAsync(ptr as Handle, i32::from(value), bytes, self.raw()),
+                "hipMemsetAsync",
+            )
+        }
+    }
     pub fn launch_builder<'a>(self: &'a Arc<Self>, function: &'a Function) -> Launch<'a> {
         Launch {
             stream: self,
@@ -793,6 +808,15 @@ impl std::fmt::Debug for Event {
     }
 }
 impl Event {
+    pub(crate) fn try_is_complete(&self) -> Result<bool> {
+        self.context.bind_to_thread()?;
+        let status = unsafe { hipEventQuery(self.handle as Handle) };
+        if status == 600 {
+            return Ok(false);
+        }
+        check(status, "hipEventQuery")?;
+        Ok(true)
+    }
     pub fn record(&self, stream: &Arc<Stream>) -> Result<()> {
         stream.require_eager("event record")?;
         ensure!(
@@ -1066,6 +1090,33 @@ pub struct PinnedHostSlice<T> {
     marker: PhantomData<T>,
 }
 impl<T> PinnedHostSlice<T> {
+    /// # Safety
+    /// All writers must have completed and the span stays live through stream completion.
+    pub(crate) unsafe fn stream_synced_slice(&self, stream: &Arc<Stream>) -> (&[T], ()) {
+        assert!(
+            Arc::ptr_eq(&self.context, stream.context()),
+            "HIP pinned context mismatch"
+        );
+        (
+            unsafe { std::slice::from_raw_parts(self.ptr as *const T, self.len) },
+            (),
+        )
+    }
+    /// # Safety
+    /// All prior accesses must have completed and the span stays exclusive through stream completion.
+    pub(crate) unsafe fn stream_synced_mut_slice(
+        &mut self,
+        stream: &Arc<Stream>,
+    ) -> (&mut [T], ()) {
+        assert!(
+            Arc::ptr_eq(&self.context, stream.context()),
+            "HIP pinned context mismatch"
+        );
+        (
+            unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut T, self.len) },
+            (),
+        )
+    }
     pub fn len(&self) -> usize {
         self.len
     }

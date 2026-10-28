@@ -108,10 +108,10 @@ fn record_span_moe_trace(
         let mut routed = vec![bf16::ZERO; rows * hidden];
         // SAFETY: the live span covers this whole reduced routed prefix.
         unsafe {
-            result::memcpy_dtoh_async(
+            copy::dtoh_async(
                 &mut routed,
                 span.routed(base as u32, rows as u32)?.ptr,
-                stream.cu_stream(),
+                stream.as_ref(),
             )?;
         }
         stream.synchronize()?;
@@ -124,10 +124,10 @@ fn record_span_moe_trace(
         let mut contributions = vec![bf16::ZERO; rows * top_k * hidden];
         // SAFETY: the live span covers this whole routed contribution prefix.
         unsafe {
-            result::memcpy_dtoh_async(
+            copy::dtoh_async(
                 &mut contributions,
                 span.contributions(base as u32, rows as u32)?.ptr,
-                stream.cu_stream(),
+                stream.as_ref(),
             )?;
         }
         stream.synchronize()?;
@@ -375,25 +375,17 @@ impl Tables {
             let (down, _down) = self.down.device_ptr_mut(stream);
             let (valid, _valid) = self.valid.device_ptr_mut(stream);
             let (generation, _generation) = self.generation.device_ptr_mut(stream);
-            result::memcpy_htod_async(
-                gu,
-                &self.host_gate_up.as_slice()?[..words],
-                stream.cu_stream(),
-            )?;
-            result::memcpy_htod_async(
-                down,
-                &self.host_down.as_slice()?[..words],
-                stream.cu_stream(),
-            )?;
-            result::memcpy_htod_async(
+            copy::htod_async(gu, &self.host_gate_up.as_slice()?[..words], stream.as_ref())?;
+            copy::htod_async(down, &self.host_down.as_slice()?[..words], stream.as_ref())?;
+            copy::htod_async(
                 valid,
                 &self.host_valid.as_slice()?[..words],
-                stream.cu_stream(),
+                stream.as_ref(),
             )?;
-            result::memcpy_htod_async(
+            copy::htod_async(
                 generation,
                 &self.host_generation.as_slice()?[..words],
-                stream.cu_stream(),
+                stream.as_ref(),
             )?;
         }
         Ok(())
@@ -1037,7 +1029,7 @@ impl Prefill {
                             8,
                         ),
                     ] {
-                        result::memset_d8_async(pointer, 0, bytes, device.stream.cu_stream())?;
+                        copy::memset_bytes(pointer, 0, bytes, device.stream.as_ref())?;
                     }
                 }
                 slots.published[logical] = 0;
@@ -1174,15 +1166,15 @@ impl Prefill {
         let choices = rows as usize * self.geometry.top_k as usize;
         // SAFETY: the route receipt copies exactly the live prefix into persistent pinned buffers.
         unsafe {
-            result::memcpy_dtoh_async(
+            copy::dtoh_async(
                 &mut self.gpu.host_ids.as_mut_slice()?[..choices],
                 ids.ptr,
-                self.gpu.mailbox.cu_stream(),
+                self.gpu.mailbox.as_ref(),
             )?;
-            result::memcpy_dtoh_async(
+            copy::dtoh_async(
                 &mut self.gpu.host_weights.as_mut_slice()?[..choices],
                 weights.ptr,
-                self.gpu.mailbox.cu_stream(),
+                self.gpu.mailbox.as_ref(),
             )?;
         }
         self.gpu.mailbox.synchronize()?;
@@ -1339,13 +1331,12 @@ impl Prefill {
             .upload(&self.gpu.mailbox, stream, span, &mut slots.events)?;
         // SAFETY: the complete routed union contains exactly rows*top_k u32 words.
         unsafe {
-            cudarc::driver::sys::cuMemsetD32Async(
+            copy::memset_words(
                 span.base + span.layout.active.start as u64,
                 1,
                 choices,
-                stream.cu_stream(),
-            )
-            .result()?;
+                stream.as_ref(),
+            )?;
         }
         self.stats[0] += 1;
         self.stats[1] += u64::from(rows);
@@ -1615,12 +1606,7 @@ impl PeerPrefill {
             let done_ptr = self.done.device_ptr(stream).0;
             // SAFETY: done holds at least wave_rows*top_k u32 words on GPU 1.
             unsafe {
-                result::memset_d8_async(
-                    done_ptr,
-                    0,
-                    wave_rows as usize * top_k * 4,
-                    stream.cu_stream(),
-                )?;
+                copy::memset_bytes(done_ptr, 0, wave_rows as usize * top_k * 4, stream.as_ref())?;
             }
             let x_wave = view(
                 &self.x,
@@ -1768,13 +1754,7 @@ fn device_copy(
     let bytes = source.shape[0] as usize * source.shape[1] as usize * 2;
     // SAFETY: both validated views cover the same dense extent and stay owned through this stream.
     unsafe {
-        cudarc::driver::sys::cuMemcpyDtoDAsync_v2(
-            target.ptr,
-            source.ptr,
-            bytes,
-            stream.cu_stream(),
-        )
-        .result()?;
+        copy::dtod_raw(target.ptr, source.ptr, bytes, stream.as_ref())?;
     }
     Ok(())
 }
@@ -2214,11 +2194,11 @@ impl Engine {
                             let mut host = vec![bf16::ZERO; rows * hidden];
                             // SAFETY: the live span covers this whole residual prefix.
                             unsafe {
-                                result::memcpy_dtoh_async(
+                                copy::dtoh_async(
                                     &mut host,
                                     span.hidden(&span.layout.residual, base as u32, rows as u32)?
                                         .ptr,
-                                    self.device.stream.cu_stream(),
+                                    self.device.stream.as_ref(),
                                 )?;
                             }
                             self.device.stream.synchronize()?;
@@ -2477,10 +2457,10 @@ impl Cpu {
                         + (row * geometry.hidden as usize * 2) as u64;
                     // SAFETY: the routed row and compact pinned destination both hold hidden BF16 values.
                     unsafe {
-                        result::memcpy_dtoh_async(
+                        copy::dtoh_async(
                             &mut self.x.as_mut_slice()?[first..first + geometry.hidden as usize],
                             source,
-                            gpu.mailbox.cu_stream(),
+                            gpu.mailbox.as_ref(),
                         )?;
                     }
                 }
@@ -2523,17 +2503,17 @@ impl Cpu {
         for (index, &choice) in self.choices.iter().enumerate() {
             // SAFETY: each compact CPU result owns exactly one routed contribution and completion word.
             unsafe {
-                result::memcpy_htod_async(
+                copy::htod_async(
                     span.base
                         + span.layout.contributions.start as u64
                         + u64::from(choice) * hidden as u64 * 2,
                     &values[index * hidden..(index + 1) * hidden],
-                    mailbox.cu_stream(),
+                    mailbox.as_ref(),
                 )?;
-                result::memcpy_htod_async(
+                copy::htod_async(
                     span.base + span.layout.done.start as u64 + u64::from(choice) * 4,
                     &done[index..index + 1],
-                    mailbox.cu_stream(),
+                    mailbox.as_ref(),
                 )?;
             }
         }
@@ -2621,11 +2601,11 @@ impl Gpu {
         }
         // SAFETY: done is reset once for the whole layer before any cohort writes it.
         unsafe {
-            result::memset_d8_async(
+            copy::memset_bytes(
                 span.base + span.layout.done.start as u64,
                 0,
                 plan.span_rows() as usize * span.geometry.top_k as usize * 4,
-                stream.cu_stream(),
+                stream.as_ref(),
             )?;
         }
         for (cohort, experts) in plan.resident_cohorts().enumerate() {
@@ -2720,13 +2700,12 @@ impl Gpu {
                 let source = values.as_ptr() as u64;
                 // SAFETY: the registered disk ring remains leased until its H2D event.
                 unsafe {
-                    cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                    copy::htod_raw(
                         pointer,
                         source as *const std::ffi::c_void,
                         bytes,
-                        slots.transfers.h2d.cu_stream(),
-                    )
-                    .result()?;
+                        slots.transfers.h2d.as_ref(),
+                    )?;
                 }
                 let copied = slots.events.record(&slots.transfers.h2d)?;
                 values.copied(copied.id)?;
@@ -2739,13 +2718,12 @@ impl Gpu {
         };
         // SAFETY: the native expert's claimed or staged source remains live through the copy event.
         unsafe {
-            cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+            copy::htod_raw(
                 pointer,
                 source as *const std::ffi::c_void,
                 bytes,
-                slots.transfers.h2d.cu_stream(),
-            )
-            .result()?;
+                slots.transfers.h2d.as_ref(),
+            )?;
         }
         if let Some((block, stage)) = host {
             let copied = slots.events.record(&slots.transfers.h2d)?;
@@ -4648,15 +4626,15 @@ mod tests {
                         let mut done = vec![0u32; rows as usize * 4];
                         // SAFETY: the borrowed span covers both live prefixes through stream synchronization.
                         unsafe {
-                            result::memcpy_dtoh_async(
+                            copy::dtoh_async(
                                 &mut contributions,
                                 span.contributions(0, rows)?.ptr,
-                                engine.device.stream.cu_stream(),
+                                engine.device.stream.as_ref(),
                             )?;
-                            result::memcpy_dtoh_async(
+                            copy::dtoh_async(
                                 &mut done,
                                 span.choices::<u32>(&span.layout.done, 0, rows)?.ptr,
-                                engine.device.stream.cu_stream(),
+                                engine.device.stream.as_ref(),
                             )?;
                         }
                         engine.device.stream.synchronize()?;
@@ -4881,10 +4859,10 @@ mod tests {
             let mut actual = vec![bf16::ZERO; rows * 4 * 128];
             // SAFETY: the borrowed span owns all live contribution rows until refill.
             unsafe {
-                result::memcpy_dtoh_async(
+                copy::dtoh_async(
                     &mut actual,
                     span.contributions(0, rows as u32)?.ptr,
-                    engine.device.stream.cu_stream(),
+                    engine.device.stream.as_ref(),
                 )?;
             }
             engine.device.stream.synchronize()?;

@@ -23,6 +23,8 @@ static_assert(offsetof(Properties, warp) == 536);
 static_assert(offsetof(Properties, max_grid_y) == 580);
 static_assert(offsetof(Properties, async_engines) == 584);
 static_assert(hipErrorOutOfMemory == 2);
+static_assert(hipErrorNotReady == 600);
+static_assert(hipHostMallocPortable == 1 && hipHostRegisterPortable == 1);
 static_assert(sizeof(hipblasLtMatmulAlgo_t) == 24 && alignof(hipblasLtMatmulAlgo_t) == 8);
 static_assert(sizeof(hipblasLtMatmulHeuristicResult_t) == 56);
 static_assert(alignof(hipblasLtMatmulHeuristicResult_t) == 8);
