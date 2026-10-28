@@ -1111,7 +1111,7 @@ impl Slots {
         Ok(())
     }
 
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
     pub(in crate::backend::cuda::engine) fn capture_placement(
         &self,
     ) -> Result<Vec<(Tier, Option<u32>)>> {
@@ -1158,7 +1158,7 @@ impl Slots {
         self.policy.begin_token()
     }
 
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
     pub(in crate::backend::cuda::engine) fn freeze_probe_admissions(&mut self) -> Result<()> {
         self.transfers.finish()?;
         self.policy.freeze_probe_admissions()
@@ -1423,7 +1423,7 @@ impl Slots {
         Ok(())
     }
 
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
     pub(super) fn finish_routed(
         &mut self,
         device: &Device,

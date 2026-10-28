@@ -3625,6 +3625,9 @@ mod tests {
             crate::model_spec::ExpertFormat::Bf16,
         )?;
         capacity.slots_per_layer.fill(geometry.experts);
+        capacity.spare_blocks = 0;
+        capacity.host_expert_bytes = u64::from(capacity.host_blocks) * capacity.slot_bytes();
+        capacity.disk_bytes = 0;
         capacity.device_expert_bytes = capacity.slot_bytes()
             * (u64::from(geometry.layers) * u64::from(geometry.experts)
                 + u64::from(capacity.prefill_staging_slots));
