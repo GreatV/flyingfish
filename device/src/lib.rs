@@ -140,6 +140,16 @@ unsafe fn pack(a: f32, b: f32) -> u32 {
     x
 }
 #[inline(always)]
+unsafe fn pack_residual(a: f32, b: f32, high: u32) -> u32 {
+    let ah: f32;
+    let bh: f32;
+    unsafe {
+        asm!("{{ .reg .b16 lo, hi; mov.b32 {{lo, hi}}, {high}; cvt.f32.bf16 {ah}, lo; cvt.f32.bf16 {bh}, hi; }}",
+            high=in(reg32) high,ah=out(reg32) ah,bh=out(reg32) bh);
+        pack(a - ah, b - bh)
+    }
+}
+#[inline(always)]
 unsafe fn store_shared4(p: u32, x: [u32; 4]) {
     unsafe {
         asm!("st.shared.v4.b32 [{p}], {{{a},{b},{c},{d}}};",
@@ -532,6 +542,7 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                 }
                 let mut sum = [0.0f32; 2];
                 let mut packed = [[0u32; 4]; 4];
+                let mut residual = [[0u32; 4]; 4];
                 macro_rules! probabilities {
                     ($n:expr) => {{
                         let a = probability::<D>(scores[$n][0], negative_peak[0]);
@@ -542,6 +553,12 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                         sum[1] += c + d;
                         packed[$n / 2][($n % 2) * 2] = pack(a, b);
                         packed[$n / 2][($n % 2) * 2 + 1] = pack(c, d);
+                        if D == 128 {
+                            residual[$n / 2][($n % 2) * 2] =
+                                pack_residual(a, b, packed[$n / 2][($n % 2) * 2]);
+                            residual[$n / 2][($n % 2) * 2 + 1] =
+                                pack_residual(c, d, packed[$n / 2][($n % 2) * 2 + 1]);
+                        }
                     }};
                 }
                 eight!(probabilities);
@@ -577,6 +594,12 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                                 };
                                 output[$pair * 2] = mma(a, [b[0], b[1]], output[$pair * 2]);
                                 output[$pair * 2 + 1] = mma(a, [b[2], b[3]], output[$pair * 2 + 1]);
+                                if D == 128 {
+                                    output[$pair * 2] =
+                                        mma(residual[$inner], [b[0], b[1]], output[$pair * 2]);
+                                    output[$pair * 2 + 1] =
+                                        mma(residual[$inner], [b[2], b[3]], output[$pair * 2 + 1]);
+                                }
                             }};
                         }
                         if D == 256 {
