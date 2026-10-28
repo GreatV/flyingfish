@@ -1444,6 +1444,10 @@ impl Engine {
         mut trace: Option<&mut Trace>,
     ) -> Result<u32> {
         self.closure.assert_ready()?;
+        #[cfg(feature = "cuda")]
+        if self.recurrent.is_some() {
+            return self.prefill_recurrent_media(input, trace);
+        }
         ensure!(
             !trace.as_ref().is_some_and(|t| t.all_layers) || input.input_ids.len() <= self.chunk,
             "all-layer multimodal trace requires one complete prompt chunk"

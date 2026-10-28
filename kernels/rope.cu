@@ -14,12 +14,14 @@ extern "C" __global__ void rope_table_kv(__nv_bfloat16* qkvg,
     const int position = *start + row;
     if (position < 0 || position >= capacity) { __trap(); return; }
     const int off = row * row_stride + head * dim + d;
-    const __nv_bfloat16 c = table[position * dim + d];
-    const __nv_bfloat16 s = table[position * dim + half + d];
+    const __nv_bfloat16 c0 = table[position * 2 * dim + d];
+    const __nv_bfloat16 s0 = table[position * 2 * dim + half + d];
+    const __nv_bfloat16 c1 = table[position * 2 * dim + dim + d];
+    const __nv_bfloat16 s1 = table[position * 2 * dim + dim + half + d];
     const __nv_bfloat16 a = qkvg[off];
     const __nv_bfloat16 b = qkvg[off + half];
-    const __nv_bfloat16 lo = __hsub(__hmul(a,c), __hmul(b,s));
-    const __nv_bfloat16 hi = __hadd(__hmul(b,c), __hmul(a,s));
+    const __nv_bfloat16 lo = __hsub(__hmul(a,c0), __hmul(b,s0));
+    const __nv_bfloat16 hi = __hadd(__hmul(b,c1), __hmul(a,s1));
     if (head < q_heads) {
         qkvg[off] = lo;
         qkvg[off + half] = hi;
@@ -30,6 +32,30 @@ extern "C" __global__ void rope_table_kv(__nv_bfloat16* qkvg,
         v[dst] = qkvg[off + kv_heads * dim];
         v[dst + half] = qkvg[off + kv_heads * dim + half];
     }
+}
+
+extern "C" __global__ void rope_2d_qk(__nv_bfloat16* qkv, const int* positions,
+    int rows, int q_heads, int kv_heads, int dim, int row_stride, float theta) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int half = dim / 2;
+    const int heads = q_heads + kv_heads;
+    if (!qkv || !positions || rows < 1 || heads < 1 || dim < 2 || (dim & 1) ||
+        row_stride < (q_heads + 2 * kv_heads) * dim || i >= rows * heads * half) return;
+    const int d = i % half;
+    const int head = (i / half) % heads;
+    const int row = i / (half * heads);
+    const int off = row * row_stride + head * dim + d;
+    const float inv = 1.0f / powf(theta, float(2 * d) / float(dim));
+    const float angle0 = float(positions[row]) * inv;
+    const float angle1 = float(positions[rows + row]) * inv;
+    const __nv_bfloat16 c0 = __float2bfloat16_rn(cosf(angle0));
+    const __nv_bfloat16 s0 = __float2bfloat16_rn(sinf(angle0));
+    const __nv_bfloat16 c1 = __float2bfloat16_rn(cosf(angle1));
+    const __nv_bfloat16 s1 = __float2bfloat16_rn(sinf(angle1));
+    const __nv_bfloat16 a = qkv[off];
+    const __nv_bfloat16 b = qkv[off + half];
+    qkv[off] = __hsub(__hmul(a, c0), __hmul(b, s0));
+    qkv[off + half] = __hadd(__hmul(b, c1), __hmul(a, s1));
 }
 
 extern "C" __global__ void sequence_positions(const int* prefix, int* metadata,

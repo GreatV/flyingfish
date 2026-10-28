@@ -309,13 +309,80 @@ impl MultimodalInput<'_> {
         match spec.architecture {
             Architecture::Qwen35Text => self.validate_qwen(spec, capacity),
             Architecture::MiniCpmV47 => self.validate_minicpm(spec, capacity),
-            Architecture::Llama
-            | Architecture::Flint
-            | Architecture::Glm5Next
-            | Architecture::LoopVl => {
+            Architecture::LoopVl => {
+                self.validate_loopvl(spec.vocab, spec.max_position as usize, capacity)
+            }
+            Architecture::Llama | Architecture::Flint | Architecture::Glm5Next => {
                 bail!("packed images require a supported multimodal architecture")
             }
         }
+    }
+
+    fn validate_loopvl(
+        &self,
+        vocab: u32,
+        max_position: usize,
+        capacity: usize,
+    ) -> Result<PositionPlan> {
+        let rows = self.input_ids.len();
+        ensure!(
+            rows > 0 && rows < capacity && capacity <= max_position,
+            "LoopVL image prompt exceeds KV capacity"
+        );
+        ensure!(
+            self.modality_ids.len() == rows && self.input_ids.iter().all(|&id| id < vocab),
+            "LoopVL input ids or modality extent invalid"
+        );
+        ensure!(self.grids.len() == 1, "LoopVL requires one image grid");
+        let grid = self.grids[0];
+        let count = usize::try_from(u64::from(grid.h) * u64::from(grid.w))?;
+        ensure!(
+            grid.t == 1 && grid.h > 0 && grid.w > 0 && (1..=2048).contains(&count),
+            "LoopVL image grid exceeds the 2048-row vision workspace"
+        );
+        ensure!(
+            self.pixel_values.len() == count * 588
+                && self.pixel_values.iter().all(|x| x.is_finite()),
+            "LoopVL pixels require finite row-major [patch,3,14,14] values"
+        );
+        let begin = self
+            .modality_ids
+            .iter()
+            .position(|&m| m == 1)
+            .context("LoopVL image tokens missing")?;
+        let end = begin
+            .checked_add(count)
+            .context("LoopVL image span overflow")?;
+        ensure!(
+            end < rows
+                && self
+                    .modality_ids
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &m)| m == u8::from((begin..end).contains(&i))),
+            "LoopVL requires one contiguous image span followed by instruction tokens"
+        );
+        let mut plan = PositionPlan::text(rows, capacity)?;
+        let next = begin + grid.h.max(grid.w) as usize;
+        for p in begin..end {
+            plan.axes[0][p] = i32::try_from(begin + (p - begin) / grid.w as usize)?;
+            plan.axes[1][p] = i32::try_from(begin + (p - begin) % grid.w as usize)?;
+        }
+        for p in end..rows {
+            let value = i32::try_from(next + p - end)?;
+            plan.axes[0][p] = value;
+            plan.axes[1][p] = value;
+        }
+        plan.rope_delta = next as i64 - end as i64;
+        plan.patch_rows = count;
+        plan.feature_rows = count;
+        plan.slots.push(ImageSlot {
+            tokens: begin..end,
+            patches: 0..count,
+            features: 0..count,
+            grid,
+        });
+        Ok(plan)
     }
 
     fn validate_qwen(&self, spec: &ModelSpec, capacity: usize) -> Result<PositionPlan> {
@@ -984,5 +1051,166 @@ impl VisionPositions {
             }
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod loopvl_tests {
+    use super::*;
+
+    #[test]
+    fn loopvl_compact_positions_and_media_bounds() -> Result<()> {
+        for (h, w) in [(19, 29), (34, 60)] {
+            let count = h * w;
+            let begin = 7;
+            let rows = begin + count + 22;
+            let tokens = vec![1; rows];
+            let mut modality = vec![0; rows];
+            modality[begin..begin + count].fill(1);
+            let pixels = vec![0.25; count * 588];
+            let grids = [ImageGrid {
+                t: 1,
+                h: h as u32,
+                w: w as u32,
+            }];
+            let input = MultimodalInput {
+                input_ids: &tokens,
+                modality_ids: &modality,
+                pixel_values: &pixels,
+                grids: &grids,
+            };
+            let plan = input.validate_loopvl(65536, 8192, rows + 32)?;
+            for p in 0..count {
+                assert_eq!(plan.axes[0][begin + p], (begin + p / w) as i32);
+                assert_eq!(plan.axes[1][begin + p], (begin + p % w) as i32);
+            }
+            assert_eq!(plan.axes[0][begin + count], (begin + h.max(w)) as i32);
+            assert_eq!(plan.decode_position(rows)?, (begin + h.max(w) + 22) as i32);
+            assert_eq!(plan.slots()[0].tokens, begin..begin + count);
+            assert!(input.validate_loopvl(65536, 8192, rows).is_err());
+            assert!(
+                MultimodalInput {
+                    pixel_values: &pixels[..pixels.len() - 1],
+                    ..input
+                }
+                .validate_loopvl(65536, 8192, rows + 32)
+                .is_err()
+            );
+            let mut invalid_modality = modality.clone();
+            invalid_modality[begin + count] = 1;
+            assert!(
+                MultimodalInput {
+                    modality_ids: &invalid_modality,
+                    ..input
+                }
+                .validate_loopvl(65536, 8192, rows + 32)
+                .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    fn delegate_grid(width: u32, height: u32, minimum: u32, maximum: u32) -> Result<(u32, u32)> {
+        let aspect = f64::from(height) / f64::from(width);
+        let raw_area = f64::from(width) * f64::from(height);
+        let min_pixels = f64::from(minimum) * 14.0 * 14.0 * 1.5;
+        let max_pixels = f64::from(maximum) * 14.0 * 14.0 * 0.95;
+        let target = if raw_area > max_pixels {
+            (max_pixels / 1.0).max(min_pixels)
+        } else {
+            raw_area
+        };
+        let aligned = |area: f64, ceil: bool| {
+            let w = (area / aspect).sqrt();
+            let h = w * aspect;
+            let align = |v: f64| {
+                let units = if ceil {
+                    (v / 14.0).ceil()
+                } else {
+                    (v / 14.0).round_ties_even()
+                };
+                (units as u32).max(1) * 14
+            };
+            (align(h), align(w))
+        };
+        let (mut h, mut w) = aligned(target, false);
+        if f64::from(h * w) < min_pixels {
+            let w_min = (min_pixels / aspect).sqrt();
+            let h_min = w_min * aspect;
+            h = ((h_min / 14.0).ceil() as u32).max(1) * 14;
+            w = ((w_min / 14.0).ceil() as u32).max(1) * 14;
+        }
+        Ok((h / 14, w / 14))
+    }
+
+    fn dynamic_grid(width: u32, height: u32, minimum: u32, maximum: u32) -> Result<(u32, u32)> {
+        ensure!(width > 0 && height > 0, "image extent");
+        ensure!(minimum > 0 && maximum >= minimum, "visual token budget");
+        let mut delegate_min = ((f64::from(minimum) / 1.5).floor() as u32).max(1);
+        let mut delegate_max = ((f64::from(maximum) / 0.95).ceil() as u32).max(delegate_min);
+        for _ in 0..12 {
+            let (gh, gw) = delegate_grid(width, height, delegate_min, delegate_max)?;
+            let count = gh * gw;
+            if (minimum..=maximum).contains(&count) {
+                return Ok((gh, gw));
+            }
+            if count > maximum {
+                delegate_max = delegate_min.max(
+                    (f64::from(delegate_max) * f64::from(maximum) / f64::from(count) * 0.98).floor()
+                        as u32,
+                );
+            } else {
+                delegate_min = delegate_max.min(
+                    (f64::from(delegate_min) * f64::from(minimum) / f64::from(count) * 1.02).ceil()
+                        as u32,
+                );
+            }
+        }
+        bail!("dynamic visual token budget did not converge")
+    }
+
+    fn pack_2x3(input: &[f32]) -> Vec<f32> {
+        let mut output = vec![0.0; 6 * 588];
+        for patch in 0..6 {
+            let pr = patch / 3;
+            let pc = patch % 3;
+            for channel in 0..3 {
+                for y in 0..14 {
+                    for x in 0..14 {
+                        let source = channel * 28 * 42 + (pr * 14 + y) * 42 + pc * 14 + x;
+                        let target = patch * 588 + channel * 196 + y * 14 + x;
+                        output[target] = input[source];
+                    }
+                }
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn loopvl_dynamic_grid_and_patch_packing() -> Result<()> {
+        assert_eq!(dynamic_grid(406, 266, 256, 2048)?, (19, 29));
+        assert_eq!(dynamic_grid(840, 476, 256, 2048)?, (34, 60));
+        for &(w, h) in &[(17, 4099), (4099, 17), (28, 28)] {
+            let (gh, gw) = dynamic_grid(w, h, 256, 2048)?;
+            assert!((256..=2048).contains(&(gh * gw)));
+        }
+        assert!(dynamic_grid(0, 28, 256, 2048).is_err());
+        let input: Vec<f32> = (0..3 * 28 * 42).map(|v| v as f32).collect();
+        let packed = pack_2x3(&input);
+        for patch in 0..6 {
+            for channel in 0..3 {
+                for y in 0..14 {
+                    for x in 0..14 {
+                        let source =
+                            channel * 28 * 42 + (patch / 3 * 14 + y) * 42 + patch % 3 * 14 + x;
+                        let target = patch * 588 + channel * 196 + y * 14 + x;
+                        assert_eq!(packed[target], input[source]);
+                    }
+                }
+            }
+        }
+        println!("PASS loopvl_dynamic_grid grids=19x29,34x60 patch_rows=6x588");
+        Ok(())
     }
 }
