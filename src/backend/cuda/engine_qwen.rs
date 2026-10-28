@@ -1966,7 +1966,7 @@ impl Runtime {
                 ops.per_layer_projection.shape[1],
             )?;
         }
-        blas.prepare_fixed(1, vocab, hidden)?;
+        blas.prepare_fixed(rows, vocab, hidden)?;
         self.prepared.insert(rows);
         Ok(())
     }
@@ -4412,6 +4412,16 @@ impl Engine {
                                 block_dim: (128, 1, 1),
                                 shared_mem_bytes: 0,
                             })?;
+                    }
+                    if all_layers(trace) || i == self.trace_layer {
+                        trace_value(
+                            trace,
+                            s,
+                            &debug_name(trace, i, "qkv_prepared"),
+                            &w.qkv,
+                            rows,
+                            q_stride,
+                        )?;
                     }
                     flash.run(
                         &w.qkv,
