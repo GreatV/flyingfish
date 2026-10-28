@@ -32,7 +32,6 @@ def load_model(directory):
     with patch.object(architecture, "_initialize_missing_keys", record_initialization):
         model, loading = architecture.from_pretrained(
             directory, dtype=torch.bfloat16, device_map="cuda:0", attn_implementation="eager",
-            quantization_config=transformers.FineGrainedFP8Config(dequantize=False),
             output_loading_info=True, local_files_only=True,
         )
     check(initialization_calls == [True], "reference initialization call count")
