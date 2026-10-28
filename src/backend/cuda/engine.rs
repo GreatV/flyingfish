@@ -118,19 +118,16 @@ pub(crate) struct Work {
     pub(crate) act: CudaSlice<bf16>,
     pub(crate) logits: CudaSlice<bf16>,
     pub(crate) token: CudaSlice<u32>,
-    #[cfg(feature = "cuda")]
     pub(crate) mixer: Option<MixerWork>,
     #[cfg(feature = "cuda")]
     pub(super) peer_tail_elems: usize,
 }
 
-#[cfg(feature = "cuda")]
 pub(crate) struct MixerWork {
     pub(crate) q: CudaSlice<bf16>,
     pub(crate) gate: CudaSlice<bf16>,
     pub(crate) ab: CudaSlice<bf16>,
 }
-#[cfg(feature = "cuda")]
 impl MixerWork {
     fn new(
         stream: &Arc<CudaStream>,
@@ -188,7 +185,6 @@ impl Work {
             act: stream.alloc_zeros(W::elements(rows, shape.intermediate)?)?,
             logits: stream.alloc_zeros(spec.vocab as usize)?,
             token: stream.alloc_zeros(1)?,
-            #[cfg(feature = "cuda")]
             mixer: MixerWork::new(stream, &shape, rows)?,
             #[cfg(feature = "cuda")]
             peer_tail_elems,
@@ -224,7 +220,6 @@ impl Work {
                 .context("MLP width overflow")?,
         )?)?;
         let act = stream.alloc_zeros(W::elements(rows, shape.intermediate)?)?;
-        #[cfg(feature = "cuda")]
         let mixer = MixerWork::new(stream, &shape, rows)?;
         self.ids = ids;
         self.x = x;
@@ -234,10 +229,7 @@ impl Work {
         self.out = out;
         self.gu = gu;
         self.act = act;
-        #[cfg(feature = "cuda")]
-        {
-            self.mixer = mixer;
-        }
+        self.mixer = mixer;
         Ok(())
     }
 

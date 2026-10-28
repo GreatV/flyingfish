@@ -256,6 +256,7 @@ pub struct Blas {
     identity: Identity,
     workspace: CudaSlice<u8>,
     skinny: Option<CudaFunction>,
+    fp8: Option<crate::backend::gpu::linear::Fp8Ops>,
     // Every plan accumulates in FP32 and adds bias before the BF16 output rounding.
     plans: RefCell<BTreeMap<Binding, Arc<Plan>>>,
 }
@@ -297,6 +298,7 @@ impl Blas {
             identity,
             workspace,
             skinny,
+            fp8: None,
             plans: RefCell::new(BTreeMap::new()),
         };
         let handles =
@@ -330,6 +332,23 @@ impl Blas {
 
     pub(crate) fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
+    }
+
+    pub(crate) fn enable_fp8(
+        &mut self,
+        context: &Arc<crate::backend::gpu::CudaContext>,
+    ) -> Result<()> {
+        ensure!(self.fp8.is_none(), "FP8 operators already bound");
+        ensure!(
+            Arc::ptr_eq(context, self.stream.context()),
+            "FP8 context differs from HIP BLAS"
+        );
+        self.fp8 = Some(crate::backend::gpu::linear::Fp8Ops::new(context)?);
+        Ok(())
+    }
+
+    pub(crate) fn fp8_ops(&self) -> Result<&crate::backend::gpu::linear::Fp8Ops> {
+        self.fp8.as_ref().context("FP8 operators not bound")
     }
 
     pub fn prepare_choice(
