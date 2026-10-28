@@ -579,6 +579,7 @@ fn dense_runtime_gpu() -> Result<()> {
     norm_gate(&ctx, &s, &ops, &mut gate)?;
     rope_gate(&s, &ops, &mut gate)?;
     activation_sample(&s, &ops, &mut gate)?;
+    #[cfg(feature = "cuda")]
     attention_gate(&ctx, &s, &c, &mut gate)?;
     conversion_gate(&ctx, &s, &mut gate)?;
     #[cfg(feature = "rocm")]
@@ -594,6 +595,7 @@ fn dense_runtime_gpu() -> Result<()> {
             "RUNNER_FAIL gate WMMA selection differs from runtime capability"
         );
         if wmma_cells(&info) {
+            attention_gate(&ctx, &s, &c, &mut gate)?;
             wmma_gate(&s, &mut gate)?;
             fp8_encoding_gate(&ctx, &s, &mut gate)?;
             for layout in [
