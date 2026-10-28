@@ -1,4 +1,4 @@
-#![cfg(feature = "cuda")]
+#![cfg(any(feature = "cuda", feature = "rocm"))]
 
 use anyhow::{Context, Result, ensure};
 use flyingfish::{
@@ -26,7 +26,24 @@ fn dense_model_identity_gpu() -> Result<()> {
         prefix_cache: false,
         kv_format: KvFormat::Bf16,
     };
-    let mut model = Model::load(&target, 0, 256, Some(16), settings)?;
+    #[cfg(feature = "cuda")]
+    let chunk = 16;
+    #[cfg(feature = "rocm")]
+    let chunk = 33;
+    #[cfg(feature = "rocm")]
+    drop(Model::calibrate(
+        &target,
+        0,
+        256,
+        Some(chunk),
+        settings.clone(),
+    )?);
+    let mut model = Model::load(&target, 0, 256, Some(chunk), settings)?;
+    #[cfg(feature = "rocm")]
+    ensure!(
+        model.capture().is_err(),
+        "HIP graph capture must reject unsupported requests"
+    );
     ensure!(
         model.config.hidden_size == 2048
             && model.config.num_hidden_layers == 42
@@ -39,11 +56,18 @@ fn dense_model_identity_gpu() -> Result<()> {
             .map(|i| ((i * 269 + 23) % 130560) as u32)
             .collect();
         let mut eager = Vec::new();
-        for graph in [false, true] {
+        #[cfg(feature = "cuda")]
+        let modes = [false, true];
+        #[cfg(feature = "rocm")]
+        let modes = [false, false];
+        for (repeat, graph) in modes.into_iter().enumerate() {
             model.reset()?;
             let mut token = model.prefill(&ids, None)?;
-            let mut file =
-                std::fs::File::create_new(output.join(format!("rows{rows}-graph{graph}.bin")))?;
+            #[cfg(feature = "cuda")]
+            let name = format!("rows{rows}-graph{graph}.bin");
+            #[cfg(feature = "rocm")]
+            let name = format!("rows{rows}-eager{repeat}.bin");
+            let mut file = std::fs::File::create_new(output.join(name))?;
             let mut margin = f32::INFINITY;
             for step in 0..16 {
                 if graph && step == 1 {
@@ -65,10 +89,10 @@ fn dense_model_identity_gpu() -> Result<()> {
                 );
                 margin = margin.min(logits[order[0]] - logits[order[1]]);
                 let bits: Vec<_> = logits.into_iter().map(f32::to_bits).collect();
-                if graph {
+                if repeat == 1 {
                     ensure!(
                         eager.get(step).context("eager step missing")? == &(token, bits.clone()),
-                        "graph/eager token or logit bits differ rows={rows} step={step}"
+                        "repeated execution token or logit bits differ rows={rows} step={step}"
                     );
                 } else {
                     eager.push((token, bits.clone()));
@@ -85,6 +109,11 @@ fn dense_model_identity_gpu() -> Result<()> {
             );
         }
     }
+    #[cfg(feature = "cuda")]
     println!("DENSE_MODEL_IDENTITY cells=6 graph_eager_bit_identity=true PASS");
+    #[cfg(feature = "rocm")]
+    println!(
+        "DENSE_MODEL_IDENTITY cells=6 eager_repeat_bit_identity=true unsupported_graph_rejected=true chunk=33 PASS"
+    );
     Ok(())
 }

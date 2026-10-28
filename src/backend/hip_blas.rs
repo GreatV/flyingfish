@@ -1,5 +1,5 @@
 //! BF16 HIP library plans are bound by library algorithm index, not heuristic order.
-use super::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+use crate::backend::gpu::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use crate::backend::{hip::drop_result, setup::LinearShape};
 use anyhow::{Context, Result, ensure};
 use half::bf16;
@@ -247,7 +247,7 @@ impl Blas {
         &self.identity
     }
 
-    pub fn prepare(
+    pub fn prepare_choice(
         &self,
         shape: LinearShape,
         bias: Option<Arc<CudaSlice<bf16>>>,
@@ -450,7 +450,7 @@ impl Blas {
         Ok(())
     }
 
-    pub fn linear(
+    pub fn linear_with_bias(
         &self,
         shape: LinearShape,
         bias: Option<&CudaSlice<bf16>>,
@@ -585,5 +585,44 @@ impl Drop for Blas {
                 drop_result(check(hipblasDestroy(self.handle), "hipblasDestroy"));
             }
         }
+    }
+}
+
+impl Blas {
+    pub fn prepare(&self, rows: usize, output: usize, input: usize) -> Result<()> {
+        let shape = LinearShape {
+            rows,
+            output,
+            input,
+        };
+        ensure!(
+            self.plans.borrow().contains_key(&(shape, None)),
+            "HIP linear shape is outside the frozen setup closure: {shape:?}"
+        );
+        Ok(())
+    }
+    pub fn linear(
+        &self,
+        weight: &impl DevicePtr<bf16>,
+        x: &impl DevicePtr<bf16>,
+        y: &mut impl DevicePtrMut<bf16>,
+        rows: usize,
+        output: usize,
+        input: usize,
+    ) -> Result<()> {
+        self.linear_with_bias(
+            LinearShape {
+                rows,
+                output,
+                input,
+            },
+            None,
+            weight,
+            x,
+            y,
+        )
+    }
+    pub fn decode_impl(&self) -> &'static str {
+        "HIP BLAS BF16 with FP32 accumulation"
     }
 }

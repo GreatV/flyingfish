@@ -636,8 +636,8 @@ fn attention_gate(
         merge_threads: 256,
     };
     for capacity in [129usize, 4096] {
-        for rows in [1usize, 3, 16] {
-            for start in [0usize, 127, capacity - rows] {
+        for rows in [1usize, 3, 16, 17, 33] {
+            for start in [0usize, 1, 127, capacity - rows] {
                 if start + rows > capacity {
                     continue;
                 }
@@ -658,7 +658,8 @@ fn attention_gate(
                 let dk = s.clone_htod(&k)?;
                 let mut dv = s.clone_htod(&v)?;
                 let prefix = s.clone_htod(&[start as i32])?;
-                let mut output = s.alloc_zeros::<bf16>(rows * 2048)?;
+                let guard = bf16::from_f32(13.0);
+                let mut output = s.clone_htod(&vec![guard; (rows + 1) * 2048])?;
                 let shape = verification::Shape {
                     rows,
                     start,
@@ -674,7 +675,7 @@ fn attention_gate(
                     s,
                     c,
                     MultiShape {
-                        rows,
+                        rows: rows.min(16),
                         capacity,
                         causal: true,
                     },
@@ -683,21 +684,51 @@ fn attention_gate(
                         launch: plan,
                     },
                 )?;
-                mq.run(&dq, &dk, &dv, &mut output, &prefix, shape)?;
+                let positions: Vec<i32> = (0..capacity as i32).collect();
+                let positions = s.clone_htod(&positions)?;
+                mq.run_prefill(verification::Query {
+                    qkv: &dq,
+                    k: &dk,
+                    v: &dv,
+                    out: &mut output,
+                    prefix: &positions,
+                    shape,
+                })?;
+                let actual = s.clone_dtoh(&output.slice(..rows * 2048))?;
                 gate.compare(
-                    &format!("attention.mq.{capacity}.{rows}.{start}"),
-                    &s.clone_dtoh(&output)?,
+                    &format!("attention.prefill.{capacity}.{rows}.{start}"),
+                    &actual,
                     &expected,
                     2,
                     capacity + 128,
                 )?;
+                gate.check(
+                    "attention.prefill.output_guard",
+                    s.clone_dtoh(&output.slice(rows * 2048..))?
+                        .iter()
+                        .all(|x| *x == guard),
+                );
+                gate.check(
+                    "attention.prefill.positions_unchanged",
+                    s.clone_dtoh(&positions)?
+                        .iter()
+                        .copied()
+                        .eq(0..capacity as i32),
+                );
+                if rows <= 16 {
+                    mq.run(&dq, &dk, &dv, &mut output, &prefix, shape)?;
+                    gate.check(
+                        "attention.prefill.single_chunk_identity",
+                        s.clone_dtoh(&output.slice(..rows * 2048))? == actual,
+                    );
+                }
                 if rows == 1 {
                     let mut single = decode::Attention::new(ctx, s, c, capacity, plan)?;
                     let length = s.clone_htod(&[(start + 1) as i32])?;
                     single.run(s, &dq, &dk, &dv, &mut output, &length)?;
                     gate.compare(
                         &format!("attention.decode.{capacity}.{start}"),
-                        &s.clone_dtoh(&output)?,
+                        &s.clone_dtoh(&output.slice(..rows * 2048))?,
                         &expected,
                         2,
                         capacity + 128,
@@ -712,7 +743,7 @@ fn attention_gate(
                     let mut control = Gate::default();
                     let incorrectly_passed = control.compare(
                         "EXPECTED_MUTANT.V_slots0_1",
-                        &s.clone_dtoh(&output)?,
+                        &s.clone_dtoh(&output.slice(..rows * 2048))?,
                         &expected,
                         2,
                         capacity + 128,
@@ -894,18 +925,18 @@ fn blas_gate(s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
                 None
             };
             let library = blas::Blas::new(s.clone())?;
-            let choice = library.prepare(shape, db.clone(), None)?;
+            let choice = library.prepare_choice(shape, db.clone(), None)?;
             let frozen: blas::Choice = serde_json::from_slice(&serde_json::to_vec(&choice)?)?;
             let rebound = blas::Blas::new(s.clone())?;
             gate.check(
                 "blas.identity_rebind",
-                rebound.prepare(shape, db.clone(), Some(&frozen))? == choice,
+                rebound.prepare_choice(shape, db.clone(), Some(&frozen))? == choice,
             );
             println!(
                 "HIP_BLAS_CHOICE {} cached=true measurements=0 tuned=false",
                 serde_json::to_string(&choice)?
             );
-            rebound.linear(shape, db.as_deref(), &dw, &dx, &mut dy)?;
+            rebound.linear_with_bias(shape, db.as_deref(), &dw, &dx, &mut dy)?;
             let reference = |bias: Option<&[bf16]>| -> Vec<bf16> {
                 (0..rows * output)
                     .map(|i| {
@@ -937,9 +968,9 @@ fn blas_gate(s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
                     .map(|b| bf16::from_f32(b.to_f32() + 1.0))
                     .collect();
                 let second = Arc::new(s.clone_htod(&second_bias)?);
-                let prepared = rebound.prepare(shape, Some(second.clone()), Some(&frozen));
+                let prepared = rebound.prepare_choice(shape, Some(second.clone()), Some(&frozen));
                 gate.check("blas.second_bias_same_shape_prepared", prepared.is_ok());
-                let unbiased = rebound.prepare(shape, None, None);
+                let unbiased = rebound.prepare_choice(shape, None, None);
                 gate.check("blas.unbiased_same_shape_prepared", unbiased.is_ok());
                 if prepared.is_ok() && unbiased.is_ok() {
                     for (label, binding, values) in [
@@ -947,7 +978,7 @@ fn blas_gate(s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
                         ("unbiased", None, None),
                         ("first", db.as_deref(), Some(&b[..])),
                     ] {
-                        rebound.linear(shape, binding, &dw, &dx, &mut dy)?;
+                        rebound.linear_with_bias(shape, binding, &dw, &dx, &mut dy)?;
                         gate.compare(
                             &format!("blas.binding.{label}.rows{rows}.weight[{output},{input}]"),
                             &s.clone_dtoh(&dy)?,
@@ -961,7 +992,7 @@ fn blas_gate(s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
                 gate.check(
                     "blas.unprepared_bias_rejected",
                     rebound
-                        .linear(shape, Some(&unprepared), &dw, &dx, &mut dy)
+                        .linear_with_bias(shape, Some(&unprepared), &dw, &dx, &mut dy)
                         .is_err(),
                 );
             }

@@ -3029,12 +3029,12 @@ impl Engine {
         }
         Ok(())
     }
-    pub(super) fn run_ffn(
+    pub(super) fn run_moe_if_bound(
         &mut self,
         layer: usize,
         step: crate::backend::Step<'_>,
         trace: &mut Option<Target<'_>>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let ffn = self
             .qwen
             .as_ref()
@@ -3042,17 +3042,10 @@ impl Engine {
         #[cfg(test)]
         let ffn = ffn.or_else(|| self.moe_test_ffn.clone());
         if let Some(ffn @ BoundFfn::Moe { .. }) = ffn {
-            return self.run_moe_ffn(layer, step.rows, ffn, trace);
+            self.run_moe_ffn(layer, step.rows, ffn, trace)?;
+            return Ok(true);
         }
-        for op in [
-            crate::backend::Operator::GateUp,
-            crate::backend::Operator::Activate,
-            crate::backend::Operator::Down,
-        ] {
-            self.run_operator(op, layer, step, trace)
-                .with_context(|| format!("dense FFN operator {op:?} layer={layer}"))?;
-        }
-        Ok(())
+        Ok(false)
     }
 
     pub(super) fn moe_ffn_binding(&self, layer: usize) -> Result<BoundFfn> {

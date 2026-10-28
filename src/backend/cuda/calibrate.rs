@@ -19,7 +19,7 @@ use std::{
     fs::File,
     hash::Hasher,
     io::Read,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::OnceLock,
     time::{Duration, Instant},
 };
@@ -113,46 +113,7 @@ impl Calibrated {
     }
 }
 
-pub fn runtime_dir(path: &Path, model: &Path, create: bool) -> Result<PathBuf> {
-    let full = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let mut parent = full.as_path();
-    let mut suffix = Vec::new();
-    while !parent.exists() {
-        suffix.push(
-            parent
-                .file_name()
-                .context("invalid runtime directory")?
-                .to_os_string(),
-        );
-        parent = parent
-            .parent()
-            .context("runtime directory has no existing ancestor")?;
-    }
-    let mut resolved = parent.canonicalize()?;
-    for part in suffix.iter().rev() {
-        resolved.push(part);
-    }
-    let model = model.canonicalize()?;
-    ensure!(
-        !resolved.starts_with(&model)
-            && !resolved
-                .components()
-                .any(|c| matches!(c, Component::Normal(p) if p == "models")),
-        "runtime directory must be outside all readonly models directories"
-    );
-    if create {
-        std::fs::create_dir_all(&resolved)?;
-    }
-    ensure!(
-        !resolved.exists() || resolved.is_dir(),
-        "runtime path is not a directory"
-    );
-    Ok(resolved)
-}
+pub use super::closure::runtime_dir;
 
 fn driver_release(text: &str) -> Result<String> {
     text.lines()
