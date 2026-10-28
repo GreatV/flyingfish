@@ -438,7 +438,7 @@ impl Blas {
             bias_binding: bias.filter(|_| rounding == LinearBiasMode::BeforeOutputRound),
             output_f32: bias.is_some() && rounding == LinearBiasMode::AfterOutputRound,
         };
-        if shape.rows > 1 || bias.is_some() {
+        if !plan.output_f32 && (shape.rows > 1 || bias.is_some()) {
             self.prepare_lt(&mut plan, frozen)?;
         }
         if let Some(frozen) = frozen {
@@ -489,7 +489,7 @@ impl Blas {
             check(
                 hipblasLtMatrixLayoutCreate(
                     &mut plan.c,
-                    if plan.output_f32 { 0 } else { 14 },
+                    14,
                     s.output as u64,
                     s.rows as u64,
                     s.output as i64,
@@ -663,12 +663,13 @@ impl Blas {
         let [a, b, c] = pointers;
         let (alpha, beta) = (1f32, 0f32);
         unsafe {
-            if shape.rows == 1 && !plan.choice.bias {
+            if plan.output_f32 || (shape.rows == 1 && !plan.choice.bias) {
                 self.bf16_gemm(
                     shape,
                     [a, b, c],
                     [shape.input, shape.input, shape.output],
                     None,
+                    plan.output_f32,
                 )?;
             } else {
                 let (workspace, _work) = self.workspace.device_ptr(&self.stream);
@@ -698,7 +699,7 @@ impl Blas {
         Ok(())
     }
 
-    /// BF16 operands/output, FP32 accumulation, W transpose, alpha=1 and beta=0.
+    /// BF16 operands, BF16 or F32 output, FP32 accumulation, W transpose, alpha=1 and beta=0.
     /// # Safety
     /// Pointers cover the strided matrices, or `batch` device pointer arrays.
     /// Their allocations and ordering remain valid until the stream completes.
@@ -708,6 +709,7 @@ impl Blas {
         pointers: [u64; 3],
         strides: [usize; 3],
         batch: Option<usize>,
+        output_f32: bool,
     ) -> Result<()> {
         ensure!(
             [shape.rows, shape.output, shape.input]
@@ -722,6 +724,10 @@ impl Blas {
                     .all(|p| *p != 0 && p.is_multiple_of(if batch.is_some() { 8 } else { 2 }))
                 && batch.is_none_or(|n| n > 0 && n <= i32::MAX as usize),
             "HIP BF16 GEMM shape, stride, pointer or batch extent is invalid"
+        );
+        ensure!(
+            !output_f32 || pointers[2].is_multiple_of(4),
+            "HIP F32 GEMM output alignment is invalid"
         );
         self.stream.context().bind_to_thread()?;
         self.stream.retain(&self.handles);
@@ -747,7 +753,7 @@ impl Blas {
                         ldb,
                         (&beta as *const f32).cast(),
                         c as *mut Handle,
-                        14,
+                        if output_f32 { 0 } else { 14 },
                         ldc,
                         batch as i32,
                         2,
@@ -773,7 +779,7 @@ impl Blas {
                         ldb,
                         (&beta as *const f32).cast(),
                         c as Handle,
-                        14,
+                        if output_f32 { 0 } else { 14 },
                         ldc,
                         2,
                         160,

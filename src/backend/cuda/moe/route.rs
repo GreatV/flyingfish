@@ -253,6 +253,7 @@ impl RouteOps {
                 [router.ptr, x.ptr, logits.0.ptr],
                 [plan.hidden as usize, plan.hidden as usize, experts as usize],
                 None,
+                false,
             )?;
         }
         self.topk(stream, &plan, logits, ids, weights, score)

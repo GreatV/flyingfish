@@ -1871,6 +1871,7 @@ impl PrefillOps {
                             usize::try_from(arrays.ldc[group])?,
                         ],
                         Some(size),
+                        false,
                     )?;
                 }
                 offset = end;
