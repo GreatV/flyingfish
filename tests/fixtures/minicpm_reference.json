@@ -211,5 +211,40 @@
         "rms": 0.5570921897888184
       }
     }
+  },
+  "media_limit_rule": "Twice the worst full-vocabulary reference difference across published FP8 media, expert-order, mixed-precision, cross-GPU and vision-implementation arms. RMS upper bound sqrt(max_abs * mean_abs). Normalize by each fixture minimum reference row RMS; same-box repeats are exact. Frozen before the first HIP full-model media run.",
+  "media_reference_floor": {
+    "cells": 512,
+    "max_abs": 2.7421875,
+    "rms_upper": 0.8795869967055052,
+    "max_abs_limit": 5.484375,
+    "rms_abs_limit": 1.7591739934110104
+  },
+  "media_limits": {
+    "video_control_clip2_16x": {
+      "max_normalized": 2.491196031256907,
+      "rms_normalized": 0.7990787046246606,
+      "reference_min_row_rms": 2.201502784681668
+    },
+    "image_boat_16x": {
+      "max_normalized": 2.504003450722965,
+      "rms_normalized": 0.8031868261968355,
+      "reference_min_row_rms": 2.190242588689936
+    },
+    "image_hockey_16x": {
+      "max_normalized": 2.544424746890297,
+      "rms_normalized": 0.8161524044072119,
+      "reference_min_row_rms": 2.155447908885025
+    },
+    "video_football_16x": {
+      "max_normalized": 2.6622952448653017,
+      "rms_normalized": 0.8539606714618961,
+      "reference_min_row_rms": 2.06001757715549
+    },
+    "video_control_same_grid_16x": {
+      "max_normalized": 2.3636120371132994,
+      "rms_normalized": 0.7581547261452647,
+      "reference_min_row_rms": 2.320336380880052
+    }
   }
 }
