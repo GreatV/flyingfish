@@ -205,7 +205,13 @@ impl MappedCheckpoint {
             return self.assemble_manifest("LoopVL", expected, policy, planned, None);
         }
         if spec.architecture == Architecture::Gemma4 {
-            bail!("Gemma 4 checkpoint manifest is not bound");
+            ensure!(
+                policy == LoadPolicy::TextOnly,
+                "Gemma 4 supports text-only loading"
+            );
+            let expected = self.gemma4_expected(spec)?;
+            let planned = Self::planned_bytes(&expected, policy)?;
+            return self.assemble_manifest("Gemma4", expected, policy, planned, None);
         }
         if spec.architecture == Architecture::Glm5Next {
             let mut expected = BTreeMap::new();
@@ -423,6 +429,140 @@ impl MappedCheckpoint {
                 Vision,
             );
         }
+    }
+
+    fn gemma4_expected(
+        &self,
+        spec: &crate::model_spec::ModelSpec,
+    ) -> Result<BTreeMap<String, ExpectedTensor>> {
+        let mut expected = BTreeMap::new();
+        Self::gemma4_entries(spec, &mut expected)?;
+        let views = self.views()?;
+        for (name, shard) in &self.index.weight_map {
+            let scope = if name.starts_with("model.vision_tower.")
+                || name.starts_with("model.embed_vision.")
+            {
+                TensorScope::Vision
+            } else if name.starts_with("model.audio_tower.")
+                || name.starts_with("model.embed_audio.")
+            {
+                TensorScope::Audio
+            } else {
+                continue;
+            };
+            let tensor = views[shard].tensor(name)?;
+            put(
+                &mut expected,
+                name.clone(),
+                tensor.dtype(),
+                tensor.shape().to_vec(),
+                scope,
+            );
+        }
+        Ok(expected)
+    }
+
+    fn planned_bytes(
+        expected: &BTreeMap<String, ExpectedTensor>,
+        policy: LoadPolicy,
+    ) -> Result<usize> {
+        expected
+            .iter()
+            .try_fold(0usize, |sum, (name, (dtype, shape, scope))| {
+                if !policy.selects_tensor(*scope, name) {
+                    return Ok(sum);
+                }
+                sum.checked_add(tensor_bytes(*dtype, shape)?)
+                    .context("resident size overflow")
+            })
+    }
+
+    fn gemma4_entries(
+        spec: &crate::model_spec::ModelSpec,
+        expected: &mut BTreeMap<String, ExpectedTensor>,
+    ) -> Result<()> {
+        let config = spec
+            .gemma4
+            .context("Gemma 4 configuration missing from the spec")?;
+        let hidden = spec.hidden as usize;
+        let depth = spec.layers.len();
+        let ple = config.per_layer_input as usize;
+        let q_heads = spec.q_heads as usize;
+        let kv_heads = spec.kv_heads as usize;
+        let text = "model.language_model";
+        let mut add = |name: String, shape: Vec<usize>, scope| {
+            put(expected, name, Dtype::BF16, shape, scope);
+        };
+        for (name, shape) in [
+            ("embed_tokens", vec![spec.vocab as usize, hidden]),
+            (
+                "embed_tokens_per_layer",
+                vec![spec.vocab as usize, depth * ple],
+            ),
+            ("per_layer_model_projection", vec![depth * ple, hidden]),
+        ] {
+            add(format!("{text}.{name}.weight"), shape, TensorScope::Text);
+        }
+        add(
+            format!("{text}.norm.weight"),
+            vec![hidden],
+            TensorScope::Text,
+        );
+        add(
+            format!("{text}.per_layer_projection_norm.weight"),
+            vec![ple],
+            TensorScope::Text,
+        );
+        for (i, layer) in spec.layers.iter().enumerate() {
+            let g = layer
+                .geometry
+                .with_context(|| format!("Gemma 4 layer {i} has no geometry"))?;
+            let (head_dim, inter) = (g.head_dim as usize, g.intermediate as usize);
+            let p = format!("{text}.layers.{i}");
+            let own = if g.kv_reader {
+                TensorScope::Dormant
+            } else {
+                TensorScope::Text
+            };
+            for name in [
+                "input_layernorm",
+                "post_attention_layernorm",
+                "pre_feedforward_layernorm",
+                "post_feedforward_layernorm",
+                "post_per_layer_input_norm",
+            ] {
+                add(
+                    format!("{p}.{name}.weight"),
+                    vec![hidden],
+                    TensorScope::Text,
+                );
+            }
+            add(format!("{p}.layer_scalar"), vec![1], TensorScope::Text);
+            for (name, shape) in [
+                ("mlp.gate_proj", vec![inter, hidden]),
+                ("mlp.up_proj", vec![inter, hidden]),
+                ("mlp.down_proj", vec![hidden, inter]),
+                ("per_layer_input_gate", vec![ple, hidden]),
+                ("per_layer_projection", vec![hidden, ple]),
+                ("self_attn.q_proj", vec![q_heads * head_dim, hidden]),
+                ("self_attn.o_proj", vec![hidden, q_heads * head_dim]),
+            ] {
+                add(format!("{p}.{name}.weight"), shape, TensorScope::Text);
+            }
+            add(
+                format!("{p}.self_attn.q_norm.weight"),
+                vec![head_dim],
+                TensorScope::Text,
+            );
+            for (name, shape) in [
+                ("self_attn.k_proj", vec![kv_heads * head_dim, hidden]),
+                ("self_attn.v_proj", vec![kv_heads * head_dim, hidden]),
+                ("self_attn.k_norm", vec![head_dim]),
+            ] {
+                add(format!("{p}.{name}.weight"), shape, own);
+            }
+        }
+        Ok(())
     }
 
     fn text_entries(
@@ -1886,6 +2026,8 @@ pub enum TensorScope {
     Text,
     Vision,
     Mtp,
+    Audio,
+    Dormant,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2530,6 +2672,132 @@ mod component_tests {
         )?;
         assert!(has_mtp_component(&root).is_err());
         std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    fn gemma4_spec(text: &str, shared: Option<u32>) -> Result<crate::model_spec::ModelSpec> {
+        let mut root: serde_json::Value = serde_json::from_str(text)?;
+        if let Some(shared) = shared {
+            root["text_config"]["num_kv_shared_layers"] = shared.into();
+        }
+        crate::model_spec::ModelSpec::gemma4(&root, &serde_json::json!({"eos_token_id": 1}))
+    }
+
+    #[test]
+    fn gemma4_plan_matches_the_published_tensor_counts() -> Result<()> {
+        for (text, text_tensors, dormant, resident) in [
+            (
+                include_str!("../tests/data/gemma4-e2b-config.json"),
+                600usize,
+                60usize,
+                9_257_138_758usize,
+            ),
+            (
+                include_str!("../tests/data/gemma4-e4b-config.json"),
+                719,
+                54,
+                14_926_026_836,
+            ),
+        ] {
+            let spec = gemma4_spec(text, None)?;
+            let mut expected = BTreeMap::new();
+            MappedCheckpoint::gemma4_entries(&spec, &mut expected)?;
+            let count = |scope| expected.values().filter(|e| e.2 == scope).count();
+            ensure!(
+                count(TensorScope::Text) + count(TensorScope::Dormant) == text_tensors
+                    && count(TensorScope::Dormant) == dormant
+                    && MappedCheckpoint::planned_bytes(&expected, LoadPolicy::TextOnly)?
+                        == resident,
+                "Gemma 4 plan: text={} dormant={}",
+                count(TensorScope::Text),
+                count(TensorScope::Dormant)
+            );
+            ensure!(
+                !expected.contains_key("lm_head.weight"),
+                "tied head must not expect lm_head"
+            );
+            let mut shifted = BTreeMap::new();
+            let moved = gemma4_spec(text, Some(3))?;
+            MappedCheckpoint::gemma4_entries(&moved, &mut shifted)?;
+            ensure!(
+                shifted
+                    .values()
+                    .filter(|e| e.2 == TensorScope::Dormant)
+                    .count()
+                    == 9,
+                "shared-layer count must move the Dormant set"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "CPU-only real checkpoint; set FF_MODEL to a Gemma 4 E2B/E4B directory"]
+    fn gemma4_manifest_matches_the_checkpoint_and_rejects_mutants() -> Result<()> {
+        let dir =
+            std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+        let spec = crate::model_spec::ModelSpec::read(&dir)?;
+        let checkpoint = MappedCheckpoint::open(&dir)?;
+        let manifest = checkpoint.manifest(&spec, LoadPolicy::TextOnly)?;
+        let (total, vision, audio, dormant, resident) = match spec.hidden {
+            1536 => (2011, 659, 752, 60, 9_257_138_758),
+            2560 => (2130, 659, 752, 54, 14_926_026_836),
+            hidden => bail!("unexpected Gemma 4 hidden size {hidden}"),
+        };
+        let count = |scope| {
+            manifest
+                .entries
+                .values()
+                .filter(|entry| entry.scope == scope)
+                .count()
+        };
+        ensure!(
+            manifest.entries.len() == total
+                && count(TensorScope::Vision) == vision
+                && count(TensorScope::Audio) == audio
+                && count(TensorScope::Dormant) == dormant
+                && manifest.resident_bytes == resident
+                && manifest
+                    .entries
+                    .values()
+                    .all(|e| e.load == (e.scope == TensorScope::Text)),
+            "Gemma 4 manifest: entries={} vision={} audio={} dormant={} resident={}",
+            manifest.entries.len(),
+            count(TensorScope::Vision),
+            count(TensorScope::Audio),
+            count(TensorScope::Dormant),
+            manifest.resident_bytes
+        );
+        let layer = format!("model.language_model.layers.{}.mlp.up_proj.weight", 3);
+        type Mutation = fn(&mut BTreeMap<String, ExpectedTensor>, &str);
+        let mutants: [(&str, Mutation); 3] = [
+            ("missing", |e, name| {
+                e.remove(name);
+            }),
+            ("shape", |e, name| {
+                e.get_mut(name).expect("expected tensor").1[0] += 1;
+            }),
+            ("extra", |e, _| {
+                put(
+                    e,
+                    "model.language_model.extra.weight".into(),
+                    Dtype::BF16,
+                    vec![1],
+                    TensorScope::Text,
+                );
+            }),
+        ];
+        for (label, mutate) in mutants {
+            let mut expected = checkpoint.gemma4_expected(&spec)?;
+            mutate(&mut expected, &layer);
+            let planned = MappedCheckpoint::planned_bytes(&expected, LoadPolicy::TextOnly)?;
+            ensure!(
+                checkpoint
+                    .assemble_manifest("Gemma4", expected, LoadPolicy::TextOnly, planned, None)
+                    .is_err(),
+                "{label} mutant was accepted"
+            );
+        }
         Ok(())
     }
 }
