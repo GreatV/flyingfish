@@ -4580,8 +4580,6 @@ fn minicpm_prefill_combine_bit_identity_gpu() -> Result<()> {
     Ok(())
 }
 
-#[test]
-#[ignore = "requires CUDA, published MiniCPM FF_MODEL, text_1k fixture and FLYINGFISH_RUNTIME_DIR"]
 /// T43 acceptance: two requests with a reset between them, on a tree whose `Engine::reset` does
 /// NOT restore the setup placement. The numbers must still agree, because the host tier now
 /// computes the same bits as the resident tier for the form the engine would select.
@@ -4621,6 +4619,11 @@ fn minicpm_decode_reset_sequence_identity_gpu() -> Result<()> {
     };
     Engine::calibrate(&model, 0, ids.len() + 32, None, settings.clone())?;
     let mut engine = Engine::load(&model, 0, ids.len() + 32, None, settings)?;
+    let setup = engine
+        .moe_slots
+        .as_ref()
+        .context("decode reset slots missing")?
+        .capture_placement()?;
     let first = decode_combine_probe(&mut engine, &ids, false)?;
     let after_first = engine
         .moe_slots
@@ -4634,11 +4637,12 @@ fn minicpm_decode_reset_sequence_identity_gpu() -> Result<()> {
         .as_ref()
         .context("decode reset slots missing")?
         .capture_placement()?;
-    let moved = after_first
+    let moved = setup
         .iter()
-        .zip(&after_second)
+        .zip(&after_first)
         .filter(|((left, _), (right, _))| {
-            (*left == crate::experts::plan::Tier::Gpu) != (*right == crate::experts::plan::Tier::Gpu)
+            (*left == crate::experts::plan::Tier::Gpu)
+                != (*right == crate::experts::plan::Tier::Gpu)
         })
         .count();
     let token_mismatches = first
@@ -4673,6 +4677,8 @@ fn minicpm_decode_reset_sequence_identity_gpu() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[ignore = "requires CUDA, published MiniCPM FF_MODEL, text_1k fixture and FLYINGFISH_RUNTIME_DIR"]
 fn minicpm_decode_combine_identity_gpu() -> Result<()> {
     ensure!(
         std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),

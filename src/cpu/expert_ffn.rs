@@ -340,10 +340,29 @@ struct Fp8Pair<'a> {
 
 type DotFn = unsafe fn(&[f32], &[bf16], Form) -> f32;
 type Fp8DotFn = unsafe fn(&[f32], &[u8], bf16, Form) -> f32;
-type GateUpFn = unsafe fn(&[f32], &[usize], &[bf16], &[bf16], &mut [(f32, f32)], Form);
-type Fp8GateUpFn = unsafe fn(&[f32], &[usize], Fp8Pair<'_>, (bf16, bf16), &mut [(f32, f32)], Form);
-type DownRowsFn = unsafe fn(&[f32], &[usize], &[bf16], &mut [f32], Form);
-type Fp8DownRowsFn = unsafe fn(&[f32], &[usize], &[u8], bf16, &mut [f32], &mut [f32], Form);
+type GateUpFn = unsafe fn(
+    &[f32],
+    &[usize],
+    &[bf16],
+    &[bf16],
+    usize,
+    usize,
+    &mut [(f32, f32)],
+    Form,
+);
+type Fp8GateUpFn = unsafe fn(
+    &[f32],
+    &[usize],
+    Fp8Pair<'_>,
+    (bf16, bf16),
+    usize,
+    &mut [(f32, f32)],
+    Form,
+);
+type DownRowsFn =
+    unsafe fn(&[f32], &[usize], &[bf16], usize, usize, &mut [f32], Form);
+type Fp8DownRowsFn =
+    unsafe fn(&[f32], &[usize], &[u8], bf16, usize, &mut [f32], &mut [f32], Form);
 type RoundFn = unsafe fn(&[f32], &mut [bf16], Form);
 
 struct Arm {
@@ -780,15 +799,21 @@ fn scalar_gate_up(
     row_offsets: &[usize],
     gate: &[bf16],
     up: &[bf16],
+    stride: usize,
+    outputs: usize,
     out: &mut [(f32, f32)],
     form: Form,
 ) {
-    let width = gate.len();
-    assert_eq!(width, up.len(), "gate/up width mismatch");
-    assert_eq!(row_offsets.len(), out.len(), "gate/up row count mismatch");
-    for (&offset, dst) in row_offsets.iter().zip(out.iter_mut()) {
-        let x = &x_buf[offset..offset + width];
-        *dst = (scalar_dot(x, gate, form), scalar_dot(x, up, form));
+    let block = row_offsets.len();
+    assert_eq!(out.len(), block * outputs, "gate/up block extent mismatch");
+    for (j, slot) in out.chunks_mut(block).enumerate() {
+        for (&offset, dst) in row_offsets.iter().zip(slot.iter_mut()) {
+            let x = &x_buf[offset..offset + stride];
+            *dst = (
+                scalar_dot(x, &gate[j * stride..][..stride], form),
+                scalar_dot(x, &up[j * stride..][..stride], form),
+            );
+        }
     }
 }
 
@@ -825,13 +850,21 @@ fn scalar_down_rows(
     x_buf: &[f32],
     row_offsets: &[usize],
     down: &[bf16],
+    stride: usize,
+    outputs: usize,
     out: &mut [f32],
     form: Form,
 ) {
-    let width = down.len();
-    assert_eq!(row_offsets.len(), out.len(), "down row count mismatch");
-    for (&offset, dst) in row_offsets.iter().zip(out.iter_mut()) {
-        *dst = scalar_dot(&x_buf[offset..offset + width], down, form);
+    let block = row_offsets.len();
+    assert_eq!(out.len(), block * outputs, "down block extent mismatch");
+    for (d, slot) in out.chunks_mut(block).enumerate() {
+        for (&offset, dst) in row_offsets.iter().zip(slot.iter_mut()) {
+            *dst = scalar_dot(
+                &x_buf[offset..offset + stride],
+                &down[d * stride..][..stride],
+                form,
+            );
+        }
     }
 }
 
@@ -1032,12 +1065,106 @@ mod x86 {
         row_offsets: &[usize],
         gate: &[bf16],
         up: &[bf16],
+        stride: usize,
+        outputs: usize,
         out: &mut [(f32, f32)],
         form: Form,
     ) {
+        let block = row_offsets.len();
+        assert_eq!(out.len(), block * outputs, "gate/up block extent mismatch");
         if form == Form::Lane8 {
-            return scalar_gate_up(x_buf, row_offsets, gate, up, out, form);
+            return gate_up_lane8(x_buf, row_offsets, gate, up, stride, outputs, out);
         }
+        for (j, slot) in out.chunks_mut(block).enumerate() {
+            let g = &gate[j * stride..][..stride];
+            let u = &up[j * stride..][..stride];
+            gate_up_lane16_rows(x_buf, row_offsets, g, u, slot, form);
+        }
+    }
+
+    /// The production kernel's 8-lane form, vectorized across OUTPUTS. Each lane owns one
+    /// `__m256` over eight outputs; every vector adds its sequential eight-step chain, so the
+    /// per-output accumulation order is exactly the GPU's `acc += dot8(v)`.
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn gate_up_lane8(
+        x_buf: &[f32],
+        row_offsets: &[usize],
+        gate: &[bf16],
+        up: &[bf16],
+        stride: usize,
+        outputs: usize,
+        out: &mut [(f32, f32)],
+    ) {
+        let block = row_offsets.len();
+        let vectors = stride / (LANES / 2);
+        let mut partials = [0f32; LANES * LANES / 2];
+        for (r, &offset) in row_offsets.iter().enumerate() {
+            let x = &x_buf[offset..offset + stride];
+            for j0 in (0..outputs).step_by(LANES / 2) {
+                let width = (outputs - j0).min(LANES / 2);
+                for (slot, base) in [(0usize, gate), (1, up)] {
+                    for lane in 0..LANES / 2 {
+                        let mut acc = _mm256_setzero_ps();
+                        let mut v = lane;
+                        while v < vectors {
+                            let mut chain = _mm256_setzero_ps();
+                            for step in 0..LANES / 2 {
+                                let index = v * (LANES / 2) + step;
+                                let broadcast = _mm256_set1_ps(x[index]);
+                                let mut gathered = [0f32; LANES / 2];
+                                for m in 0..LANES / 2 {
+                                    gathered[m] = f32::from(base[(j0 + m) * stride + index]);
+                                }
+                                let weights = _mm256_loadu_ps(gathered.as_ptr());
+                                chain = _mm256_fmadd_ps(broadcast, weights, chain);
+                            }
+                            acc = _mm256_add_ps(acc, chain);
+                            v += LANES / 2;
+                        }
+                        let mut lane_values = [0f32; LANES / 2];
+                        _mm256_storeu_ps(lane_values.as_mut_ptr(), acc);
+                        for m in 0..LANES / 2 {
+                            partials[(lane * LANES / 2 + m) * 2 + slot] = lane_values[m];
+                        }
+                    }
+                }
+                for m in 0..width {
+                    let lane_values = [
+                        partials[m * 2],
+                        partials[(LANES / 2 + m) * 2],
+                        partials[(2 * LANES / 2 + m) * 2],
+                        partials[(3 * LANES / 2 + m) * 2],
+                        partials[(4 * LANES / 2 + m) * 2],
+                        partials[(5 * LANES / 2 + m) * 2],
+                        partials[(6 * LANES / 2 + m) * 2],
+                        partials[(7 * LANES / 2 + m) * 2],
+                    ];
+                    let up_values = [
+                        partials[m * 2 + 1],
+                        partials[(LANES / 2 + m) * 2 + 1],
+                        partials[(2 * LANES / 2 + m) * 2 + 1],
+                        partials[(3 * LANES / 2 + m) * 2 + 1],
+                        partials[(4 * LANES / 2 + m) * 2 + 1],
+                        partials[(5 * LANES / 2 + m) * 2 + 1],
+                        partials[(6 * LANES / 2 + m) * 2 + 1],
+                        partials[(7 * LANES / 2 + m) * 2 + 1],
+                    ];
+                    out[(j0 + m) * block + r] = (group_sum(&lane_values), group_sum(&up_values));
+                }
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn gate_up_lane16_rows(
+        x_buf: &[f32],
+        row_offsets: &[usize],
+        gate: &[bf16],
+        up: &[bf16],
+        out: &mut [(f32, f32)],
+        form: Form,
+    ) {
+        let width = gate.len();
         let width = gate.len();
         assert_eq!(width, up.len(), "gate/up width mismatch");
         assert_eq!(row_offsets.len(), out.len(), "gate/up row count mismatch");
@@ -1286,12 +1413,35 @@ mod x86 {
         x_buf: &[f32],
         row_offsets: &[usize],
         down: &[bf16],
+        stride: usize,
+        outputs: usize,
         out: &mut [f32],
         form: Form,
     ) {
         if form == Form::Lane8 {
-            return scalar_down_rows(x_buf, row_offsets, down, out, form);
+            return scalar_down_rows(x_buf, row_offsets, down, stride, outputs, out, form);
         }
+        let block = row_offsets.len();
+        assert_eq!(out.len(), block * outputs, "down block extent mismatch");
+        for (d, slot) in out.chunks_mut(block).enumerate() {
+            down_rows_lane16(
+                x_buf,
+                row_offsets,
+                &down[d * stride..][..stride],
+                slot,
+                form,
+            );
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn down_rows_lane16(
+        x_buf: &[f32],
+        row_offsets: &[usize],
+        down: &[bf16],
+        out: &mut [f32],
+        form: Form,
+    ) {
         let width = down.len();
         assert_eq!(row_offsets.len(), out.len(), "down row count mismatch");
         let mut cursor = 0;
