@@ -285,7 +285,7 @@ impl Setup {
             runtime,
             geometry,
             model.expert_format.context("MoE expert_format missing")?,
-            if cfg!(feature = "cuda") && draft_config.is_some() {
+            if draft_config.is_some() {
                 crate::cpu::expert_ffn::Form::Lane16
             } else {
                 crate::cpu::expert_ffn::Form::Lane8
