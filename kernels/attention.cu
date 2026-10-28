@@ -787,7 +787,7 @@ __device__ void run(Problem p, uint32_t extent) {
   constexpr int BQ = D == 256 ? 16 : 32;
   constexpr int BK = D == 256 ? 32 : 64;
   constexpr int SCORE_TILES = D == 256 ? 1 : 2;
-  constexpr int QK_TERMS = D == 256 ? 4 : 16;
+  constexpr int QK_TERMS = D == 256 ? 1 : 16;
   __shared__ __align__(16) unsigned short memory[(BQ + 2*BK)*D + 2*BQ*BK + 2*BQ];
   auto* qs = memory;
   auto* ks = qs + BQ*D;
@@ -828,7 +828,7 @@ __device__ void run(Problem p, uint32_t extent) {
     A score_correction[SCORE_TILES] = {};
     const int key_slab = D == 256 ? wave%2 : (wave%2)*2;
     if (D == 128 || wave < 2) {
-#pragma unroll
+#pragma clang loop unroll_count(D == 256 ? 1 : 8)
       for (int part = 0; part < D/QK_TERMS; ++part) {
         B a;
 #pragma unroll
