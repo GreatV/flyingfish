@@ -93,6 +93,10 @@ pub(super) fn bucketed_prefill_rows(rows: u32, workspace_rows: u32) -> Result<u3
     Ok(rows.next_power_of_two().min(workspace_rows))
 }
 
+pub(super) fn spec_workspace_rows(chunk: usize, budget: SpecBudget, verify_rows: usize) -> usize {
+    budget.workspace_rows(chunk).max(verify_rows)
+}
+
 pub(crate) use super::state::Kv;
 
 pub(crate) struct Work {
@@ -1310,7 +1314,9 @@ impl Engine {
                     .transpose()?
                     .unwrap_or(0),
         )?;
-        let rows = self.spec_budget.workspace_rows(plan.chunk).max(
+        let rows = spec_workspace_rows(
+            plan.chunk,
+            self.spec_budget,
             self.spec
                 .as_ref()
                 .map(|spec| spec.draft.config.verify_rows())
@@ -5717,7 +5723,11 @@ impl Engine {
         let workspace_rows = draft_config
             .as_ref()
             .map(|draft| {
-                Ok::<_, anyhow::Error>(settings.spec_budget.workspace_rows(draft.verify_rows()?))
+                Ok::<_, anyhow::Error>(spec_workspace_rows(
+                    1,
+                    settings.spec_budget,
+                    draft.verify_rows()?,
+                ))
             })
             .transpose()?
             .unwrap_or(1);

@@ -1295,13 +1295,17 @@ impl Profile {
                 });
             }
             linear.extend(draft_shapes(draft, injection_limit(small_rows, draft.verify_rows()?)).0);
-            for &rows in &rows {
+            let workspace = super::engine::spec_workspace_rows(chunk, budget, draft.verify_rows()?);
+            let injection_rows = (1..=workspace)
+                .map(|rows| super::engine::bucketed_prefill_rows(rows as u32, workspace as u32))
+                .collect::<Result<BTreeSet<_>>>()?;
+            for rows in injection_rows {
                 for (output, input) in [
                     (draft.hidden_size, draft.capture_width()),
                     (draft.kv_dim(), draft.hidden_size),
                 ] {
                     linear.insert(LinearShape {
-                        rows,
+                        rows: rows as usize,
                         output,
                         input,
                     });

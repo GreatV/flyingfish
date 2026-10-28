@@ -163,7 +163,12 @@ fn dense_dspark_identity_gpu() -> Result<()> {
     let output = PathBuf::from(std::env::var("FF_DENSE_EVIDENCE")?);
     let runtime = PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
     let mut cells = 0;
-    for budget in [SpecBudget::Chain, SpecBudget::Tree16] {
+    for (budget, chunk) in [
+        (SpecBudget::Tree32, 17),
+        (SpecBudget::Tree16, 9),
+        (SpecBudget::Chain, 33),
+        (SpecBudget::Tree16, 33),
+    ] {
         let settings = Settings {
             tree_builder: TreeBuilder::Waves,
             spec_budget: budget,
@@ -177,10 +182,10 @@ fn dense_dspark_identity_gpu() -> Result<()> {
             &target,
             0,
             256,
-            Some(33),
+            Some(chunk),
             settings.clone(),
         )?);
-        let mut model = Model::load(&target, 0, 256, Some(33), settings)?;
+        let mut model = Model::load(&target, 0, 256, Some(chunk), settings)?;
         ensure!(
             model.draft_config()?.block_size == 7 && model.draft_config()?.markov_rank == 256,
             "MiniCPM5-2B DSpark block7/rank256 required"
@@ -194,9 +199,9 @@ fn dense_dspark_identity_gpu() -> Result<()> {
                 model.reset()?;
                 model.set_spec_graph(graph)?;
                 let first = model.prefill(&ids, None)?;
-                let mut file = std::fs::File::create_new(
-                    output.join(format!("dspark-{budget:?}-rows{rows}-repeat{repeat}.bin")),
-                )?;
+                let mut file = std::fs::File::create_new(output.join(format!(
+                    "dspark-{budget:?}-chunk{chunk}-rows{rows}-repeat{repeat}.bin"
+                )))?;
                 file.write_all(&first.to_le_bytes())?;
                 let mut min_margin = f32::INFINITY;
                 let mut compared_logits = 0;
@@ -261,7 +266,7 @@ fn dense_dspark_identity_gpu() -> Result<()> {
                 file.flush()?;
                 model.check_ready()?;
                 println!(
-                    "DENSE_DSPARK_IDENTITY budget={budget:?} prefix={rows} graph={graph} repeat={repeat} rounds=4 compared_logits={compared_logits} min_top_two_margin={min_margin} token_logits_state_bit_identity=true PASS"
+                    "DENSE_DSPARK_IDENTITY budget={budget:?} chunk={chunk} prefix={rows} graph={graph} repeat={repeat} rounds=4 compared_logits={compared_logits} min_top_two_margin={min_margin} token_logits_state_bit_identity=true PASS"
                 );
                 cells += 1;
             }
@@ -323,7 +328,7 @@ fn dense_dspark_identity_gpu() -> Result<()> {
                 );
                 model.check_ready()?;
                 println!(
-                    "DENSE_DSPARK_TREE graph={graph} prefix=17 path=0,2,5,8 padding_nan_invariant=true invalid_path_rejected=true kv_compaction_bit_identity=true PASS"
+                    "DENSE_DSPARK_TREE chunk={chunk} graph={graph} prefix=17 path=0,2,5,8 padding_nan_invariant=true invalid_path_rejected=true kv_compaction_bit_identity=true PASS"
                 );
             }
         }
