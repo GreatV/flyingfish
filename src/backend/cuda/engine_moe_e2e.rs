@@ -4631,12 +4631,16 @@ fn minicpm_decode_reset_sequence_identity_gpu() -> Result<()> {
         .context("decode reset slots missing")?
         .capture_placement()?;
     engine.reset()?;
-    let second = decode_combine_probe(&mut engine, &ids, true)?;
-    let after_second = engine
+    let after_reset = engine
         .moe_slots
         .as_ref()
         .context("decode reset slots missing")?
         .capture_placement()?;
+    ensure!(
+        after_reset == after_first,
+        "Runner FAIL reset changed expert placement"
+    );
+    let second = decode_combine_probe(&mut engine, &ids, true)?;
     let moved = setup
         .iter()
         .zip(&after_first)
@@ -4645,6 +4649,16 @@ fn minicpm_decode_reset_sequence_identity_gpu() -> Result<()> {
                 != (*right == crate::experts::plan::Tier::Gpu)
         })
         .count();
+    ensure!(
+        moved > 0,
+        "Runner FAIL reset sequence did not change GPU placement"
+    );
+    ensure!(
+        first.tokens.len() == second.tokens.len()
+            && first.logits.len() == second.logits.len()
+            && first.state.len() == second.state.len(),
+        "Runner FAIL reset sequence extents differ"
+    );
     let token_mismatches = first
         .tokens
         .iter()
