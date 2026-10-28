@@ -74,9 +74,13 @@ def reference(case):
         score = q[head].float() @ k[kv].float().T / d**0.5
         score.masked_fill_(~mask, -torch.inf)
         actual = (score.softmax(-1) @ v[kv].float()).bfloat16().float()
-        one = torch.stack([(q[head, row:row + 1].float() @ k[kv].float().T / d**0.5)
-                           .masked_fill(~mask[row:row + 1], -torch.inf).softmax(-1)
-                           @ v[kv].float() for row in range(len(selected))]).squeeze(1).bfloat16().float()
+        one = torch.cat([(q[head, row:row + 17].float() @ k[kv].float().T / d**0.5)
+                         .masked_fill(~mask[row:row + 17], -torch.inf).softmax(-1)
+                         @ v[kv].float() for row in range(0, len(selected), 17)]).bfloat16().float()
+        for _ in range(2):
+            again = q[head].float() @ k[kv].float().T / d**0.5
+            again.masked_fill_(~mask, -torch.inf)
+            assert torch.equal((again.softmax(-1) @ v[kv].float()).bfloat16().float(), actual)
         outputs.append(expected.cpu()); lses.append(lse.cpu())
         baseline.append(actual.cpu()); baseline_lse.append(score.logsumexp(-1).cpu())
         variations.append(one.cpu())
