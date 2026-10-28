@@ -69,6 +69,11 @@ const ROCM_KERNELS: &[&str] = &[
     "moe_ffn",
     "moe_combine",
     "moe_prefill",
+    "gdn/gdn_conv",
+    "gdn/gdn_prep",
+    "gdn/gdn_recurrent",
+    "gdn/gdn_rstep",
+    "gdn/gdn_chunked",
     "tcmqa",
     "markov",
     "tree/meta",
@@ -135,6 +140,7 @@ fn rocm_architectures() -> Vec<String> {
 fn build_rocm(out: &std::path::Path) {
     println!("cargo:rerun-if-changed=kernels/gpu_compat.cuh");
     println!("cargo:rerun-if-changed=kernels/q38_contract.cuh");
+    println!("cargo:rerun-if-changed=kernels/gdn/gdn_recurrent.cuh");
     println!("cargo:rerun-if-env-changed=HIP_HOME");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
     println!("cargo:rerun-if-env-changed=PATH");
@@ -167,6 +173,11 @@ fn build_rocm(out: &std::path::Path) {
         "pub const ARCHES: &[&str] = &{archs:?};\npub fn hsaco(name: &str, gfx: &str) -> Option<&'static [u8]> {{\nmatch (name, gfx) {{\n"
     );
     for name in ROCM_KERNELS {
+        let (suffix, defines): (&str, &[&str]) = if name.starts_with("gdn/") {
+            ("_h32", &["-DGDN_HEADS=32"])
+        } else {
+            ("", &[])
+        };
         let file = PathBuf::from(format!("kernels/{name}.cu"));
         assert!(
             file.is_file(),
@@ -182,11 +193,12 @@ fn build_rocm(out: &std::path::Path) {
             {
                 continue;
             }
-            let filename = format!("{}_{arch}.hsaco", name.replace('/', "_"));
+            let filename = format!("{}{suffix}_{arch}.hsaco", name.replace('/', "_"));
             let hsaco = out.join(&filename);
             let result = Command::new(&hipcc)
                 .env("TMPDIR", &temp)
                 .args(["--genco", "-O3", "--std=c++17", "-mno-wavefrontsize64"])
+                .args(defines)
                 .arg(format!("--offload-arch={arch}"))
                 .arg(&file)
                 .arg("-o")
@@ -213,7 +225,8 @@ fn build_rocm(out: &std::path::Path) {
                 "ROCm code object for {} {arch} lacks target {target}",
                 file.display()
             );
-            index.push_str(&format!("({name:?}, {arch:?}) => Some(include_bytes!(concat!(env!(\"OUT_DIR\"), \"/\", {filename:?}))),\n"));
+            let module = format!("{name}{suffix}");
+            index.push_str(&format!("({module:?}, {arch:?}) => Some(include_bytes!(concat!(env!(\"OUT_DIR\"), \"/\", {filename:?}))),\n"));
         }
     }
     index.push_str("_ => None,\n}\n}\n");

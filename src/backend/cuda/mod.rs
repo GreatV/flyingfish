@@ -16,7 +16,6 @@ pub mod draft;
 pub mod engine;
 #[cfg(feature = "cuda")]
 pub mod flash;
-#[cfg(feature = "cuda")]
 pub(crate) mod gdn;
 #[cfg(test)]
 #[cfg(feature = "cuda")]

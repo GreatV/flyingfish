@@ -15,8 +15,7 @@
 // Rows at or beyond valid_rows carry q=k=v=beta=0, g=0; S is bit-unchanged by them.
 // launch: grid (VSPLIT, NUM_V_HEADS); each block owns S[:, j0:j0+VW] in registers and
 //         walks every chunk sequentially.
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
+#include "../gpu_compat.cuh"
 #include <stdint.h>
 #include "../q38_contract.cuh"
 

@@ -14,8 +14,7 @@
 // [1, bound], bound <= 16 (h32) or 5 (h48).
 // launch: grid (VSPLIT, NUM_V_HEADS), block GDN_THREADS.
 #pragma once
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
+#include "../gpu_compat.cuh"
 #include <stdint.h>
 #include "../q38_contract.cuh"
 

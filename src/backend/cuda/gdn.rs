@@ -33,13 +33,13 @@ pub(crate) fn take_phase_log() -> Vec<&'static str> {
 use super::contracts::{RowDomain, Scratch, SeqRef, Tensor, TensorMut};
 use super::cubin;
 use super::ops::{GatedRmsInput, GdnGateBindings};
+use crate::backend::gpu::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use crate::gdn_plan::{
     CW_P2_CHUNK, CW_P2_MAX_GROUPS, CW_P2_VALUE_BLOCK, GdnPolicy, GdnWorkspace, Region, add, cw_p2,
     mul,
 };
 use crate::op_contract::{ExecutionPhase, GdnSpec, WorkspaceReq};
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use half::bf16;
 use std::mem::size_of;
 use std::sync::Arc;
@@ -473,13 +473,25 @@ impl GdnOps {
             spec.hv
         );
         check_bindings(&bindings, max_rows, conv_dim, spec.hv)?;
+        #[cfg(feature = "rocm")]
+        ensure!(
+            spec.hv == 32 && !cw_p2,
+            "HIP GDN requires hv32 and the FP32 chunked/recurrent policy"
+        );
 
+        #[cfg(feature = "cuda")]
         use cudarc::driver::sys::CUdevice_attribute as Attribute;
+        #[cfg(feature = "cuda")]
         let sms =
             u32::try_from(ctx.attribute(Attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?)?;
+        #[cfg(feature = "rocm")]
+        let sms = u32::try_from(ctx.properties.compute_units)?;
         ensure!(sms > 0, "GDN device has no multiprocessors");
+        #[cfg(feature = "cuda")]
         let optin =
             ctx.attribute(Attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)? as u64;
+        #[cfg(feature = "rocm")]
+        let optin = ctx.properties.optin_shared_bytes;
         for (name, bytes) in [
             ("recurrent", u64::from(RECURRENT_SMEM)),
             ("chunked", u64::from(CHUNKED_SMEM)),
@@ -505,6 +517,7 @@ impl GdnOps {
 
         // The dynamic shared memory opt-in is applied to every core at setup; a launch without it
         // fails with `invalid argument`.
+        #[cfg(feature = "cuda")]
         for (function, bytes) in [(&f_recurrent, RECURRENT_SMEM), (&f_chunked, CHUNKED_SMEM)] {
             if bytes > 48 * 1024 {
                 function.set_attribute(
@@ -557,8 +570,12 @@ impl GdnOps {
             recurrent: f_recurrent,
             p2,
         };
+        #[cfg(feature = "cuda")]
         let max_threads =
             u32::try_from(ctx.attribute(Attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)?)?;
+        #[cfg(feature = "rocm")]
+        let max_threads = u32::try_from(ctx.properties.max_threads)?;
+        #[cfg(feature = "cuda")]
         ensure!(
             ctx.attribute(Attribute::CU_DEVICE_ATTRIBUTE_WARP_SIZE)? == 32,
             "GDN requires 32-thread warps"
@@ -1160,7 +1177,7 @@ fn check_bindings(b: &GdnBindings, rows: u32, conv_dim: u32, hv: u32) -> Result<
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::prep_grids;
     use cudarc::driver::{DevicePtr, LaunchConfig};
