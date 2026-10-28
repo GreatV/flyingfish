@@ -5037,7 +5037,7 @@ impl Engine {
                 .arg(&w.act)
                 .arg(
                     &ops.per_layer_inputs
-                        .slice(i * rows * width..(i + 1) * rows * width),
+                        .slice(i * linear_rows * width..(i + 1) * linear_rows * width),
                 )
                 .arg(&mut w.gu)
                 .arg(&((rows * width) as i32))
@@ -5167,8 +5167,8 @@ impl Engine {
                     self.blas.linear_typed(
                         phase,
                         LinearWeightRef::Bf16(ops.per_layer_projection),
-                        matrix(&w.x, s, 0, rows, h)?,
-                        &mut TensorMut(matrix(&w.gu, s, 0, rows, depth * width)?),
+                        matrix(&w.x, s, 0, linear_rows, h)?,
+                        &mut TensorMut(matrix(&w.gu, s, 0, linear_rows, depth * width)?),
                     )?;
                     let identity_scale = bf16::from_f32((width as f32).sqrt()).to_f32();
                     let context_scale = bf16::from_f32(1.0 / (h as f32).sqrt()).to_f32();
@@ -5180,7 +5180,7 @@ impl Engine {
                             .arg(&w.gu)
                             .arg(&ops.per_layer_norm.ptr)
                             .arg(&mut ops.per_layer_inputs)
-                            .arg(&(rows as i32))
+                            .arg(&(linear_rows as i32))
                             .arg(&(depth as i32))
                             .arg(&(width as i32))
                             .arg(&identity_scale)
@@ -5188,7 +5188,7 @@ impl Engine {
                             .arg(&combine_scale)
                             .arg(&self.model_spec.rms_eps)
                             .launch(LaunchConfig {
-                                grid_dim: ((rows * depth) as u32, 1, 1),
+                                grid_dim: ((linear_rows * depth) as u32, 1, 1),
                                 block_dim: (128, 1, 1),
                                 shared_mem_bytes: 0,
                             })?;
@@ -5535,20 +5535,20 @@ impl Engine {
                             self.blas.linear_typed(
                                 phase,
                                 LinearWeightRef::Bf16(matrix(&self.weights.head, s, 0, vocab, h)?),
-                                matrix(&w.n, s, 0, rows, h)?,
-                                &mut TensorMut(matrix(&ops.logits, s, 0, rows, vocab)?),
+                                matrix(&w.n, s, 0, linear_rows, h)?,
+                                &mut TensorMut(matrix(&ops.logits, s, 0, linear_rows, vocab)?),
                             )?;
                             unsafe {
                                 s.launch_builder(&ops.softcap)
                                     .arg(&mut ops.logits)
-                                    .arg(&((rows * vocab) as i64))
+                                    .arg(&((linear_rows * vocab) as i64))
                                     .arg(
                                         &self
                                             .model_spec
                                             .logit_softcap
                                             .context("softcap missing")?,
                                     )
-                                    .launch(flat(rows * vocab))?;
+                                    .launch(flat(linear_rows * vocab))?;
                             }
                             return Ok(());
                         }
