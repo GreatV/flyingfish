@@ -1740,7 +1740,10 @@ impl Engine {
         trace: Option<Target<'_>>,
     ) -> Result<()> {
         let previous = self.qwen_device_prefix;
-        if self.qwen.is_some() && step.head == Head::All {
+        if self.qwen.is_some()
+            && step.head == Head::All
+            && self.model_spec.architecture != crate::model_spec::Architecture::Gemma4
+        {
             self.qwen_device_prefix = true;
         }
         let result = self.run_step_inner(step, trace);
@@ -1764,13 +1767,15 @@ impl Engine {
             self.ensure_decode()?;
         } else if step.head == Head::All && matches!(step.mask, crate::backend::Mask::Causal) {
             {
-                ensure!(
-                    step.rows <= crate::linear_plan::MAX_SKINNY_ROWS,
-                    "chain verification rows={} exceeds skinny bound={}",
-                    step.rows,
-                    crate::linear_plan::MAX_SKINNY_ROWS
-                );
-                self.ensure_verification()?;
+                if self.model_spec.architecture != crate::model_spec::Architecture::Gemma4 {
+                    ensure!(
+                        step.rows <= crate::linear_plan::MAX_SKINNY_ROWS,
+                        "chain verification rows={} exceeds skinny bound={}",
+                        step.rows,
+                        crate::linear_plan::MAX_SKINNY_ROWS
+                    );
+                    self.ensure_verification()?;
+                }
                 if self.qwen.is_some() {
                     self.state.set_sequence(
                         &self.device.stream,
