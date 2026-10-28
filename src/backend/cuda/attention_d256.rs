@@ -1457,7 +1457,7 @@ mod tests {
             None
         };
         device.finish_upload()?;
-        let mut execute = || -> Result<()> {
+        let execute = || -> Result<()> {
             #[cfg(feature = "cuda")]
             if let Some(op) = flash_op.as_mut() {
                 FullAttentionOps::preprocess(
@@ -1497,8 +1497,10 @@ mod tests {
                 },
             )
         };
+        #[cfg(feature = "cuda")]
+        let mut execute = execute;
         if graph {
-            super::super::moe::testing::capture(stream, &mut execute)?.launch()?;
+            super::super::moe::testing::capture(stream, execute)?.launch()?;
         } else {
             execute()?;
         }

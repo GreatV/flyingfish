@@ -238,8 +238,10 @@ fn hip_gdn_runtime_gpu() -> Result<()> {
         let read = |offset: u64, count: usize| -> Result<Vec<f64>> {
             let start = offset as usize;
             let result: Vec<_> = bytes[start..start + count * 4]
-                .chunks_exact(4)
-                .map(|v| f64::from(f32::from_le_bytes(v.try_into().unwrap())))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f64::from(f32::from_le_bytes(*v)))
                 .collect();
             ensure!(
                 result.iter().all(|v| v.is_finite()),
@@ -255,8 +257,10 @@ fn hip_gdn_runtime_gpu() -> Result<()> {
             read(ws.g.offset, n * heads)?,
         ];
         let conv_actual: Vec<_> = bytes[ws.conv_out.offset as usize..][..n * cd * 2]
-            .chunks_exact(2)
-            .map(|v| bf16::from_bits(u16::from_le_bytes(v.try_into().unwrap())))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|v| bf16::from_bits(u16::from_le_bytes(*v)))
             .collect();
         let mut conv_ref = Vec::with_capacity(n * cd);
         for row in 0..n {
