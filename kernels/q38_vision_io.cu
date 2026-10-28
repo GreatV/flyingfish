@@ -42,7 +42,12 @@ extern "C" __global__ void q38_vision_position_add(
             int32_t index = indices[off];
             float w = weights[off];
             if (index < 0 || index >= 2304 || !isfinite(w)) { __trap(); return; }
+#if defined(__HIP__)
+            const float product = __bfloat162float(table[uint64_t(index) * 1152 + d]) * w;
+            sum = sum + product;
+#else
             sum = __fadd_rn(sum, __fmul_rn(__bfloat162float(table[uint64_t(index) * 1152 + d]), w));
+#endif
         }
         if (!isfinite(sum)) { __trap(); return; }
         interpolated[i] = sum;
