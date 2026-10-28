@@ -52,10 +52,16 @@ struct Stats {
     max_ulp: u32,
     bit_equal: usize,
     beyond_mutant: usize,
+    exempt: usize,
 }
 
 impl Stats {
     fn new(candidate: &[bf16], reference: &[bf16]) -> Result<Self> {
+        Self::with_floor(candidate, reference, None)
+    }
+
+    /// An element within `floor[i]` of the reference counts as matching (dated amendment 2026-10-28, gemma/reports/agy.md).
+    fn with_floor(candidate: &[bf16], reference: &[bf16], floor: Option<&[f32]>) -> Result<Self> {
         ensure!(
             candidate.len() == reference.len() && !candidate.is_empty(),
             "RUNNER_FAIL candidate and reference extents differ"
@@ -72,12 +78,17 @@ impl Stats {
             max_ulp: 0,
             bit_equal: 0,
             beyond_mutant: 0,
+            exempt: 0,
         };
-        for (c, r) in candidate.iter().zip(reference) {
+        for (i, (c, r)) in candidate.iter().zip(reference).enumerate() {
             let ulp = ordered(*c).abs_diff(ordered(*r));
-            stats.max_ulp = stats.max_ulp.max(ulp);
-            stats.bit_equal += usize::from(ulp == 0);
-            stats.beyond_mutant += usize::from(ulp > MUTANT_ULP);
+            let within = floor.is_some_and(|f| (c.to_f32() - r.to_f32()).abs() <= f[i]);
+            stats.exempt += usize::from(within && ulp > 0);
+            if !within {
+                stats.max_ulp = stats.max_ulp.max(ulp);
+                stats.beyond_mutant += usize::from(ulp > MUTANT_ULP);
+            }
+            stats.bit_equal += usize::from(ulp == 0 || within);
         }
         Ok(stats)
     }
@@ -92,10 +103,11 @@ impl Stats {
 
     fn line(&self, name: &str) -> String {
         format!(
-            "{name} elements={} max_ulp={} bit_equal={:.6} beyond_{}ulp={:.6}",
+            "{name} elements={} max_ulp={} bit_equal={:.6} exempt_within_floor={} beyond_{}ulp={:.6}",
             self.elements,
             self.max_ulp,
             self.bit_equal as f64 / self.elements as f64,
+            self.exempt,
             MUTANT_ULP,
             self.beyond_mutant as f64 / self.elements as f64
         )
@@ -124,6 +136,7 @@ fn gelu_tanh_gated_activation_matches_the_definition_gpu() -> Result<()> {
             let key = format!("r{rows}.d{dim}");
             let gate = tensor(&data, &format!("{key}.gate"))?;
             let up = tensor(&data, &format!("{key}.up"))?;
+            let (gate_host, up_host) = (gate, up);
             let reference = tensor(&data, &format!("{key}.out"))?;
             let packed: Vec<bf16> = (0..rows)
                 .flat_map(|r| {
@@ -156,9 +169,14 @@ fn gelu_tanh_gated_activation_matches_the_definition_gpu() -> Result<()> {
                 }
                 Ok((s.clone_dtoh(&y)?, s.clone_dtoh(&z)?))
             };
+            let floor: Vec<f32> = gate_host
+                .iter()
+                .zip(up_host)
+                .map(|(g, u)| g.to_f32().abs() * u.to_f32().abs() * 2f32.powi(-23))
+                .collect();
             let (fused_out, split_out) = run(2)?;
             for (kernel, out) in [("silu_mul", &fused_out), ("silu_mul_split", &split_out)] {
-                let stats = Stats::new(out, reference)?;
+                let stats = Stats::with_floor(out, reference, Some(&floor))?;
                 println!(
                     "GEMMA4_GELU_TANH {}",
                     stats.line(&format!("{kernel}.{key}"))
@@ -170,7 +188,7 @@ fn gelu_tanh_gated_activation_matches_the_definition_gpu() -> Result<()> {
             }
             let (silu_fused, silu_split) = run(0)?;
             for (kernel, out) in [("silu_mul", &silu_fused), ("silu_mul_split", &silu_split)] {
-                let stats = Stats::new(out, reference)?;
+                let stats = Stats::with_floor(out, reference, Some(&floor))?;
                 println!(
                     "GEMMA4_GELU_TANH_MUTANT silu {}",
                     stats.line(&format!("{kernel}.{key}"))
@@ -335,5 +353,197 @@ fn softcap_tied_head_and_embedding_scale_match_the_definition_gpu() -> Result<()
     undetected += usize::from(!(stats.is_detected_mutant() && !stats.passes()));
     println!("GEMMA4_HEAD {tag} defects={defects} undetected_mutants={undetected}");
     ensure!(defects == 0 && undetected == 0, "GEMMA4_HEAD FAIL");
+    Ok(())
+}
+
+fn rms_f32(x: &[f32], weight: &[bf16]) -> Vec<bf16> {
+    let mean = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+    let inv = 1.0 / (mean + 1e-6).sqrt();
+    x.iter()
+        .zip(weight)
+        .map(|(v, w)| bf16::from_f32(v * inv * w.to_f32()))
+        .collect()
+}
+
+#[test]
+#[ignore = "requires CUDA and FF_GEMMA4_FIXTURES"]
+fn unrounded_norm_and_branch_boundary_match_the_definition_gpu() -> Result<()> {
+    use super::contracts::{RowDomain, SeqRef, Tensor, TensorMut};
+    use super::ops::{CommonOpsRef, RmsMode, RmsOptions};
+    use crate::backend::gpu::{CudaSlice, CudaStream};
+    use cudarc::driver::DevicePtr;
+    use std::sync::Arc;
+    fn heads(
+        b: &CudaSlice<bf16>,
+        s: &Arc<CudaStream>,
+        rows: usize,
+        h: u32,
+        d: u32,
+    ) -> Result<Tensor<bf16, 3>> {
+        let bytes = (b.len() * 2) as u64;
+        // SAFETY: the allocation outlives every launch in this test and the extent is the whole buffer.
+        unsafe {
+            Tensor::new(
+                b.device_ptr(s).0,
+                [u32::try_from(rows)?, h, d],
+                [u64::from(h) * u64::from(d), u64::from(d), 1],
+                bytes,
+            )
+        }
+    }
+    fn vector(b: &CudaSlice<bf16>, s: &Arc<CudaStream>) -> Result<Tensor<bf16, 1>> {
+        // SAFETY: as above.
+        unsafe {
+            Tensor::new(
+                b.device_ptr(s).0,
+                [u32::try_from(b.len())?],
+                [1],
+                (b.len() * 2) as u64,
+            )
+        }
+    }
+    let device = Device::new(0)?;
+    let s = &device.stream;
+    let common = CommonOpsRef::new(&device.ctx)?;
+    let data = fixture("norm.safetensors")?;
+    let (mut cases, mut defects, mut undetected) = (0, 0, 0);
+    let options = RmsOptions {
+        mode: RmsMode::Unrounded,
+        eps: 1e-6,
+    };
+
+    for rows in [1usize, 17, 64] {
+        let meta = s.clone_htod(&[0i32, rows as i32, rows as i32, rows as i32, 1, 0, 0, 0])?;
+        let domain = RowDomain {
+            meta: SeqRef {
+                ptr: meta.device_ptr(s).0,
+            },
+            row_base: 0,
+            row_capacity: rows as u32,
+        };
+        for (h, d) in [(1usize, 256usize), (1, 512), (2, 256), (2, 512)] {
+            let key = format!("ns.r{rows}.h{h}.d{d}");
+            let x = s.clone_htod(tensor(&data, &format!("{key}.x"))?)?;
+            let reference = tensor(&data, &format!("{key}.out"))?;
+            let run = |weight: &[bf16]| -> Result<Vec<bf16>> {
+                let weight = s.clone_htod(weight)?;
+                let y = s.alloc_zeros::<bf16>(rows * h * d)?;
+                common.norm.rms_with(
+                    s,
+                    domain,
+                    heads(&x, s, rows, h as u32, d as u32)?,
+                    vector(&weight, s)?,
+                    &mut TensorMut(heads(&y, s, rows, h as u32, d as u32)?),
+                    options,
+                )?;
+                Ok(s.clone_dtoh(&y)?)
+            };
+            let stats = Stats::new(&run(&vec![bf16::ONE; d])?, reference)?;
+            println!("GEMMA4_V_NORM {}", stats.line(&key));
+            defects += usize::from(!stats.passes());
+            let scaled = tensor(&data, &format!("kw{d}"))?;
+            let stats = Stats::new(&run(scaled)?, reference)?;
+            println!("GEMMA4_V_NORM_MUTANT scaled {}", stats.line(&key));
+            undetected += usize::from(!(stats.is_detected_mutant() && !stats.passes()));
+            cases += 1;
+        }
+    }
+
+    let module = cubin::module(&device.ctx, "q38_common")?;
+    let branch = module.load_function("rms_branch_add")?;
+    for tag in ["e2b", "e4b"] {
+        let weight = |name: &str| tensor(&data, &format!("br.{tag}.{name}"));
+        let hidden = weight("w_post_attn")?.len();
+        let scalar = s.clone_htod(weight("scalar")?)?;
+        for rows in [1usize, 17, 64] {
+            let key = format!("br.{tag}.r{rows}");
+            let (xh, bh) = (
+                tensor(&data, &format!("{key}.x"))?,
+                tensor(&data, &format!("{key}.b"))?,
+            );
+            let b = s.clone_htod(bh)?;
+            for (label, w_branch, w_norm, with_scalar, out_key, n_key) in [
+                (
+                    "post_attention",
+                    "w_post_attn",
+                    "w_pre_ff",
+                    false,
+                    "out_a",
+                    "n_a",
+                ),
+                ("layer_end", "w_post_ff", "w_next", true, "out_b", "n_b"),
+            ] {
+                let (w_branch, w_norm) = (
+                    s.clone_htod(weight(w_branch)?)?,
+                    s.clone_htod(weight(w_norm)?)?,
+                );
+                let expected_x = tensor(&data, &format!("{key}.{out_key}"))?;
+                let expected_n = tensor(&data, &format!("{key}.{n_key}"))?;
+                let run = |use_scalar: bool| -> Result<(Vec<bf16>, Vec<bf16>)> {
+                    let mut x = s.clone_htod(xh)?;
+                    let mut n = s.alloc_zeros::<bf16>(rows * hidden)?;
+                    let null = 0u64;
+                    unsafe {
+                        let mut launch = s.launch_builder(&branch);
+                        launch.arg(&mut x).arg(&b).arg(&w_branch);
+                        if use_scalar {
+                            launch.arg(&scalar);
+                        } else {
+                            launch.arg(&null);
+                        }
+                        launch
+                            .arg(&w_norm)
+                            .arg(&mut n)
+                            .arg(&(hidden as u32))
+                            .arg(&1e-6f32)
+                            .launch(super::ops::grid(rows, 256))?;
+                    }
+                    Ok((s.clone_dtoh(&x)?, s.clone_dtoh(&n)?))
+                };
+                let (got_x, got_n) = run(with_scalar)?;
+                for (name, got, reference) in [("x", &got_x, expected_x), ("n", &got_n, expected_n)]
+                {
+                    let stats = Stats::new(got, reference)?;
+                    println!(
+                        "GEMMA4_BRANCH_NORM {}",
+                        stats.line(&format!("{key}.{label}.{name}"))
+                    );
+                    defects += usize::from(!stats.passes());
+                }
+                if with_scalar {
+                    let (got_x, _) = run(false)?;
+                    let stats = Stats::new(&got_x, expected_x)?;
+                    println!(
+                        "GEMMA4_BRANCH_NORM_MUTANT scalar_omitted {}",
+                        stats.line(&format!("{key}.{label}.x"))
+                    );
+                    undetected += usize::from(!(stats.is_detected_mutant() && !stats.passes()));
+                }
+                let summed: Vec<bf16> = xh
+                    .iter()
+                    .zip(bh)
+                    .map(|(a, b)| bf16::from_f32(a.to_f32() + b.to_f32()))
+                    .collect();
+                let w = weight(if with_scalar {
+                    "w_post_ff"
+                } else {
+                    "w_post_attn"
+                })?;
+                let llama: Vec<bf16> = summed
+                    .chunks(hidden)
+                    .flat_map(|row| rms_f32(&row.iter().map(|v| v.to_f32()).collect::<Vec<_>>(), w))
+                    .collect();
+                let stats = Stats::new(&llama, expected_x)?;
+                println!(
+                    "GEMMA4_BRANCH_NORM_MUTANT norm_after_add {}",
+                    stats.line(&format!("{key}.{label}.x"))
+                );
+                undetected += usize::from(!(stats.is_detected_mutant() && !stats.passes()));
+            }
+            cases += 1;
+        }
+    }
+    println!("GEMMA4_NORM cases={cases} defects={defects} undetected_mutants={undetected}");
+    ensure!(defects == 0 && undetected == 0, "GEMMA4_NORM FAIL");
     Ok(())
 }

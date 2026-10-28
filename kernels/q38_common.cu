@@ -601,3 +601,34 @@ extern "C" __global__ void q38_gelu(
         y[row*ys0+head*ys1+uint64_t(d)*ys2]=__float2bfloat16_rn(__fmul_rn(__fmul_rn(0.5f,value),cdf));
     }
 }
+// x = bf16(bf16(x + bf16(rms(b)*wb)) * scalar) in place, then n = rms(x)*wn; scalar and wn may be null.
+// rms(v)*w: F32 v*rsqrt(mean(v^2)+eps)*w with one BF16 rounding. One block of 256 threads per row.
+extern "C" __global__ __launch_bounds__(256) void rms_branch_add(
+    __nv_bfloat16* x,const __nv_bfloat16* b,const __nv_bfloat16* wb,const __nv_bfloat16* scalar,
+    const __nv_bfloat16* wn,__nv_bfloat16* n,uint32_t width,float eps) {
+    if(blockDim.x!=256 || !x || !b || !wb || !width || !(eps>0.0f) || (wn && !n)) {__trap();return;}
+    __shared__ float scratch[8];
+    const uint64_t base=uint64_t(blockIdx.x)*width;
+    const __nv_bfloat16 zero=__float2bfloat16_rn(0.0f);
+    float sum=0.0f;
+    for(uint32_t i=threadIdx.x;i<width;i+=256) {
+        float v=__bfloat162float(b[base+i]);
+        sum=__fadd_rn(sum,__fmul_rn(v,v));
+    }
+    float inv=block_inv(sum,scratch,width,5,eps);
+    for(uint32_t i=threadIdx.x;i<width;i+=256) {
+        __nv_bfloat16 r=__hadd(x[base+i],norm_scale(__bfloat162float(b[base+i]),inv,wb[i],zero,5));
+        if(scalar) r=__hmul(r,*scalar);
+        x[base+i]=r;
+    }
+    if(!wn) return;
+    __syncthreads();
+    sum=0.0f;
+    for(uint32_t i=threadIdx.x;i<width;i+=256) {
+        float v=__bfloat162float(x[base+i]);
+        sum=__fadd_rn(sum,__fmul_rn(v,v));
+    }
+    inv=block_inv(sum,scratch,width,5,eps);
+    for(uint32_t i=threadIdx.x;i<width;i+=256)
+        n[base+i]=norm_scale(__bfloat162float(x[base+i]),inv,wn[i],zero,5);
+}
