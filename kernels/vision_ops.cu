@@ -92,3 +92,65 @@ extern "C" __global__ void vision_bucket_position_add(
         output[i] = __hadd(patches[i], table[uint64_t(index) * width + i % width]);
     }
 }
+
+extern "C" __global__ void vision_upcast_f32(
+    const __nv_bfloat16* input, float* output, uint32_t count) {
+    if (!vision_flat_launch() || !input || !output || !count) { __trap(); return; }
+    for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < count; i += gridDim.x * 256) {
+        output[i] = __bfloat162float(input[i]);
+    }
+}
+
+extern "C" __global__ void vision_bias_f32(
+    const float* input, const float* bias, float* output, uint32_t rows, uint32_t width) {
+    if (!vision_flat_launch() || !input || !bias || !output || !rows || !width) { __trap(); return; }
+    uint32_t count = rows * width;
+    for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < count; i += gridDim.x * 256) {
+        output[i] = __fadd_rn(input[i], bias[i % width]);
+    }
+}
+
+extern "C" __global__ void vision_bias_gelu_f32(
+    const float* input, const float* bias, float* output, uint32_t rows, uint32_t width) {
+    if (!vision_flat_launch() || !input || !bias || !output || !rows || !width) { __trap(); return; }
+    uint32_t count = rows * width;
+    const float scale = 0.70710678118654752440f;
+    for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < count; i += gridDim.x * 256) {
+        float x = __fadd_rn(input[i], bias[i % width]);
+        output[i] = __fmul_rn(0.5f * x, __fadd_rn(1.0f, erff(__fmul_rn(x, scale))));
+    }
+}
+
+// One FP32 RMS normalization and scale, with independent FP32 and BF16 outputs.
+extern "C" __global__ void vision_rms_scale_f32(
+    const float* input, const float* scale, float* output_f32,
+    __nv_bfloat16* output_bf16, uint32_t width, float eps) {
+    if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
+        gridDim.y != 1 || gridDim.z != 1 || !input || !scale ||
+        !output_f32 || !output_bf16 || !width || !(eps > 0.0f)) { __trap(); return; }
+    uint32_t row = blockIdx.x;
+    __shared__ float partial[8];
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < width; i += 256) {
+        float x = input[uint64_t(row) * width + i];
+        sum = __fadd_rn(sum, __fmul_rn(x, x));
+    }
+    for (int delta = 16; delta; delta >>= 1)
+        sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffu, sum, delta));
+    if ((threadIdx.x & 31) == 0) partial[threadIdx.x >> 5] = sum;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        sum = threadIdx.x < 8 ? partial[threadIdx.x] : 0.0f;
+        for (int delta = 16; delta; delta >>= 1)
+            sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffu, sum, delta));
+        if (threadIdx.x == 0) partial[0] = rsqrtf(__fadd_rn(sum / float(width), eps));
+    }
+    __syncthreads();
+    float rstd = partial[0];
+    for (uint32_t i = threadIdx.x; i < width; i += 256) {
+        float normalized = __fmul_rn(input[uint64_t(row) * width + i], rstd);
+        float scaled = __fmul_rn(normalized, *scale);
+        output_f32[uint64_t(row) * width + i] = scaled;
+        output_bf16[uint64_t(row) * width + i] = __float2bfloat16_rn(scaled);
+    }
+}

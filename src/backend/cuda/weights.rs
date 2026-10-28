@@ -56,6 +56,37 @@ pub struct Weights {
     pub bytes: usize,
 }
 
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) struct LoopvlVisionLayer {
+    pub input_norm: CudaSlice<bf16>,
+    pub post_norm: CudaSlice<bf16>,
+    pub q_norm: CudaSlice<bf16>,
+    pub k_norm: CudaSlice<bf16>,
+    pub qkv: CudaSlice<bf16>,
+    pub o: CudaSlice<bf16>,
+    pub gu: CudaSlice<bf16>,
+    pub down: CudaSlice<bf16>,
+}
+
+#[cfg(all(test, feature = "cuda"))]
+pub(crate) struct LoopvlVisionWeights {
+    pub layers: Vec<LoopvlVisionLayer>,
+    pub patch_weight: CudaSlice<bf16>,
+    pub patch_bias: CudaSlice<bf16>,
+    pub norm: CudaSlice<bf16>,
+    pub fc1_weight: CudaSlice<u8>,
+    pub fc1_bias: CudaSlice<u8>,
+    pub fc2_weight: CudaSlice<u8>,
+    pub fc2_bias: CudaSlice<u8>,
+    pub visual_scale: CudaSlice<u8>,
+    pub gate_visual: CudaSlice<u8>,
+    pub gate_query: CudaSlice<u8>,
+    pub gate_out: CudaSlice<u8>,
+    pub gate_bias: CudaSlice<u8>,
+    pub raw_alpha: CudaSlice<u8>,
+    pub bytes: usize,
+}
+
 /// Stable native expert slots, persistent staging and host data plus spare blocks.
 pub struct ExpertStorage {
     layout: SlotLayout,
@@ -745,6 +776,96 @@ impl Weights {
                 bytes,
             })
         })
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+impl LoopvlVisionWeights {
+    pub(crate) fn load(
+        dir: &Path,
+        spec: &crate::model_spec::ModelSpec,
+        d: &Device,
+    ) -> Result<Self> {
+        let mapped = MappedCheckpoint::open(dir)?;
+        let manifest = mapped.manifest(spec, crate::checkpoint::LoadPolicy::VisionOnly)?;
+        let (weights, _) = checkpoint_mapped(&mapped, d, Some(&manifest), false, |l| {
+            let mut layers = Vec::new();
+            for layer in 0..28 {
+                let p = format!("vision_encoder.model.encoder.layers.{layer}");
+                let qkv = l.load(&["q", "k", "v"].map(|role| {
+                    (
+                        format!("{p}.self_attn.{role}_proj.weight"),
+                        if role == "q" {
+                            vec![2048, 1024]
+                        } else {
+                            vec![1024, 1024]
+                        },
+                    )
+                }))?;
+                let gu = l.load(
+                    &["gate", "up"]
+                        .map(|role| (format!("{p}.mlp.{role}_proj.weight"), vec![3072, 1024])),
+                )?;
+                layers.push(LoopvlVisionLayer {
+                    input_norm: l.load(&[(format!("{p}.input_layernorm.weight"), vec![1024])])?,
+                    post_norm: l
+                        .load(&[(format!("{p}.post_attention_layernorm.weight"), vec![1024])])?,
+                    q_norm: l.load(&[(format!("{p}.self_attn.q_norm.weight"), vec![128])])?,
+                    k_norm: l.load(&[(format!("{p}.self_attn.k_norm.weight"), vec![128])])?,
+                    qkv,
+                    o: l.load(&[(format!("{p}.self_attn.o_proj.weight"), vec![1024, 2048])])?,
+                    gu,
+                    down: l.load(&[(format!("{p}.mlp.down_proj.weight"), vec![1024, 3072])])?,
+                });
+            }
+            let f32 = |l: &mut Loader<'_>, name: &str, shape: &[usize]| {
+                l.load_bytes(name, shape, Dtype::F32)
+            };
+            let weights = Self {
+                layers,
+                patch_weight: l.load(&[(
+                    "vision_encoder.model.embeddings.patch_embedding.weight".into(),
+                    vec![1024, 3, 14, 14],
+                )])?,
+                patch_bias: l.load(&[(
+                    "vision_encoder.model.embeddings.patch_embedding.bias".into(),
+                    vec![1024],
+                )])?,
+                norm: l.load(&[(
+                    "vision_encoder.model.encoder.norm.weight".into(),
+                    vec![1024],
+                )])?,
+                fc1_weight: f32(l, "projector.fc1.weight", &[1536, 1024])?,
+                fc1_bias: f32(l, "projector.fc1.bias", &[1536])?,
+                fc2_weight: f32(l, "projector.fc2.weight", &[1536, 1536])?,
+                fc2_bias: f32(l, "projector.fc2.bias", &[1536])?,
+                visual_scale: f32(l, "projector.visual_embedding_scale", &[])?,
+                gate_visual: f32(
+                    l,
+                    "language_model.model.visual_gate.visual_proj.weight",
+                    &[256, 1536],
+                )?,
+                gate_query: f32(
+                    l,
+                    "language_model.model.visual_gate.query_proj.weight",
+                    &[256, 1536],
+                )?,
+                gate_out: f32(
+                    l,
+                    "language_model.model.visual_gate.out_proj.weight",
+                    &[1, 256],
+                )?,
+                gate_bias: f32(l, "language_model.model.visual_gate.out_proj.bias", &[1])?,
+                raw_alpha: f32(l, "language_model.model.visual_anchor.raw_alpha", &[2])?,
+                bytes: l.bytes,
+            };
+            ensure!(
+                weights.bytes == manifest.resident_bytes,
+                "LoopVL vision upload byte count mismatch"
+            );
+            Ok(weights)
+        })?;
+        Ok(weights)
     }
 }
 

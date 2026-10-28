@@ -6,6 +6,12 @@ use crate::backend::cuda::{
     linear::LinearWeightRef,
     ops::{AddRmsNorm, CommonOpsRef},
 };
+#[cfg(test)]
+use crate::backend::cuda::{
+    linear::LinearBiasMode,
+    ops::{RmsMode, RmsOptions},
+    weights::LoopvlVisionWeights,
+};
 use cudarc::driver::{CudaFunction, DevicePtr};
 
 pub(super) const ROWWISE_PREFIX_LIMIT: usize = 64;
@@ -38,6 +44,11 @@ fn matrix(
         [u32::try_from(rows)?, u32::try_from(width)?],
         [width as u64, 1],
     )
+}
+
+#[cfg(test)]
+fn vector(b: &CudaSlice<bf16>, s: &Arc<CudaStream>, width: usize) -> Result<Tensor<bf16, 1>> {
+    view(b, s, 0, [u32::try_from(width)?], [1])
 }
 
 fn linear(
@@ -87,6 +98,396 @@ fn yarn_table(capacity: usize) -> Vec<bf16> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+struct VisionWorkspace {
+    x: CudaSlice<bf16>,
+    n: CudaSlice<bf16>,
+    qkv: CudaSlice<bf16>,
+    attn: CudaSlice<bf16>,
+    out: CudaSlice<bf16>,
+    gu: CudaSlice<bf16>,
+    act: CudaSlice<bf16>,
+    k: CudaSlice<bf16>,
+    v: CudaSlice<bf16>,
+    positions: CudaSlice<i32>,
+    lengths: CudaSlice<i32>,
+    start: CudaSlice<i32>,
+    meta: CudaSlice<i32>,
+    f32_a: CudaSlice<f32>,
+    f32_b: CudaSlice<f32>,
+    f32_c: CudaSlice<f32>,
+    projected_f32: CudaSlice<f32>,
+    projected_bf16: CudaSlice<bf16>,
+}
+
+#[cfg(test)]
+impl VisionWorkspace {
+    fn new(s: &Arc<CudaStream>, rows: usize) -> Result<Self> {
+        Ok(Self {
+            x: s.alloc_zeros(rows * 1024)?,
+            n: s.alloc_zeros(rows * 1024)?,
+            qkv: s.alloc_zeros(rows * 4096)?,
+            attn: s.alloc_zeros(rows * 2048)?,
+            out: s.alloc_zeros(rows * 1024)?,
+            gu: s.alloc_zeros(rows * 6144)?,
+            act: s.alloc_zeros(rows * 3072)?,
+            k: s.alloc_zeros(rows * 1024)?,
+            v: s.alloc_zeros(rows * 1024)?,
+            positions: s.alloc_zeros(rows * 2)?,
+            lengths: s.alloc_zeros(rows)?,
+            start: s.alloc_zeros(1)?,
+            meta: s.clone_htod(&[0i32, rows as i32, rows as i32, rows as i32, 1, 0, 0, 0])?,
+            f32_a: s.alloc_zeros(rows * 1536)?,
+            f32_b: s.alloc_zeros(rows * 1536)?,
+            f32_c: s.alloc_zeros(rows * 1536)?,
+            projected_f32: s.alloc_zeros(rows * 1536)?,
+            projected_bf16: s.alloc_zeros(rows * 1536)?,
+        })
+    }
+}
+
+#[cfg(test)]
+struct VisionEncoderCall<'a> {
+    weights: &'a LoopvlVisionWeights,
+    pixels: &'a CudaSlice<bf16>,
+    rows: usize,
+    grid_h: usize,
+    grid_w: usize,
+}
+
+#[cfg(test)]
+struct VisionRuntime {
+    encoder_calls: std::cell::Cell<usize>,
+    projector_calls: std::cell::Cell<usize>,
+    rope_2d: CudaFunction,
+    kv_write: CudaFunction,
+    upcast: CudaFunction,
+    bias: CudaFunction,
+    bias_gelu: CudaFunction,
+    rms_scale: CudaFunction,
+    common: CommonOpsRef,
+    ops: Ops,
+}
+
+#[cfg(test)]
+fn f32_weight(
+    bytes: &CudaSlice<u8>,
+    s: &Arc<CudaStream>,
+    rows: usize,
+    width: usize,
+) -> Result<Tensor<f32, 2>> {
+    ensure!(
+        bytes.len() == rows * width * 4,
+        "FP32 weight byte extent mismatch"
+    );
+    unsafe {
+        Tensor::new(
+            bytes.device_ptr(s).0,
+            [rows as u32, width as u32],
+            [width as u64, 1],
+            bytes.len() as u64,
+        )
+    }
+}
+
+#[cfg(test)]
+fn matrix32(
+    b: &CudaSlice<f32>,
+    s: &Arc<CudaStream>,
+    rows: usize,
+    width: usize,
+) -> Result<Tensor<f32, 2>> {
+    view(
+        b,
+        s,
+        0,
+        [u32::try_from(rows)?, u32::try_from(width)?],
+        [width as u64, 1],
+    )
+}
+
+#[cfg(test)]
+impl VisionRuntime {
+    fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
+        let rope = cubin::module(ctx, "rope")?;
+        let vision = cubin::module(ctx, "vision_ops")?;
+        Ok(Self {
+            encoder_calls: std::cell::Cell::new(0),
+            projector_calls: std::cell::Cell::new(0),
+            rope_2d: rope.load_function("rope_2d_qk")?,
+            kv_write: rope.load_function("kv_write")?,
+            upcast: vision.load_function("vision_upcast_f32")?,
+            bias: vision.load_function("vision_bias_f32")?,
+            bias_gelu: vision.load_function("vision_bias_gelu_f32")?,
+            rms_scale: vision.load_function("vision_rms_scale_f32")?,
+            common: CommonOpsRef::new(ctx)?,
+            ops: Ops::new_with_swiglu_rounding(ctx, crate::model_spec::SwigluRounding::Twice)?,
+        })
+    }
+
+    #[cfg(test)]
+    fn run_encoder(
+        &self,
+        blas: &mut Blas,
+        attention: &mut Attention,
+        s: &Arc<CudaStream>,
+        work: &mut VisionWorkspace,
+        call: VisionEncoderCall<'_>,
+    ) -> Result<()> {
+        self.encoder_calls.set(self.encoder_calls.get() + 1);
+        let VisionEncoderCall {
+            weights,
+            pixels,
+            rows,
+            grid_h,
+            grid_w,
+        } = call;
+        ensure!(
+            rows > 0 && rows == grid_h * grid_w && pixels.len() == rows * 588,
+            "PenguinVL pixel/grid shape mismatch"
+        );
+        for (output, input) in [
+            (1024usize, 588usize),
+            (4096, 1024),
+            (1024, 2048),
+            (6144, 1024),
+            (1024, 3072),
+        ] {
+            blas.prepare_fixed(rows as u32, output as u32, input as u32)?;
+        }
+        blas.prepare_biased(
+            rows as u32,
+            1024,
+            588,
+            vector(&weights.patch_bias, s, 1024)?,
+            LinearBiasMode::BeforeOutputRound,
+        )?;
+        blas.linear_biased(
+            matrix(&weights.patch_weight, s, 1024, 588)?,
+            vector(&weights.patch_bias, s, 1024)?,
+            matrix(pixels, s, rows, 588)?,
+            &mut TensorMut(matrix(&work.x, s, rows, 1024)?),
+            LinearBiasMode::BeforeOutputRound,
+        )?;
+        let positions: Vec<i32> = (0..grid_h)
+            .flat_map(|r| (0..grid_w).map(move |c| (r, c)))
+            .flat_map(|(r, c)| [r as i32, c as i32])
+            .collect();
+        let axis0: Vec<i32> = positions.iter().step_by(2).copied().collect();
+        let axis1: Vec<i32> = positions.iter().skip(1).step_by(2).copied().collect();
+        s.memcpy_htod(&axis0, &mut work.positions.slice_mut(..rows))?;
+        s.memcpy_htod(&axis1, &mut work.positions.slice_mut(rows..rows * 2))?;
+        s.memcpy_htod(&vec![rows as i32; rows], &mut work.lengths)?;
+        let domain = RowDomain {
+            meta: SeqRef {
+                ptr: work.meta.device_ptr(s).0,
+            },
+            row_base: 0,
+            row_capacity: rows as u32,
+        };
+        let rms = |weight: &CudaSlice<bf16>, input: &CudaSlice<bf16>, output: &CudaSlice<bf16>| {
+            self.common.norm.rms_with(
+                s,
+                domain,
+                view(input, s, 0, [rows as u32, 1, 1024], [1024, 1024, 1])?,
+                vector(weight, s, 1024)?,
+                &mut TensorMut(view(output, s, 0, [rows as u32, 1, 1024], [1024, 1024, 1])?),
+                RmsOptions {
+                    mode: RmsMode::Standard,
+                    eps: 1e-6,
+                },
+            )
+        };
+        rms(&weights.layers[0].input_norm, &work.x, &work.n)?;
+        for (index, layer) in weights.layers.iter().enumerate() {
+            linear(
+                blas,
+                s,
+                &layer.qkv,
+                matrix(&work.n, s, rows, 1024)?,
+                matrix(&work.qkv, s, rows, 4096)?,
+            )?;
+            for (offset, heads, weight) in
+                [(0usize, 16usize, &layer.q_norm), (2048, 8, &layer.k_norm)]
+            {
+                let qk = view(
+                    &work.qkv,
+                    s,
+                    offset,
+                    [rows as u32, heads as u32, 128],
+                    [4096, 128, 1],
+                )?;
+                self.common.norm.rms_with(
+                    s,
+                    domain,
+                    qk,
+                    vector(weight, s, 128)?,
+                    &mut TensorMut(qk),
+                    RmsOptions {
+                        mode: RmsMode::Standard,
+                        eps: 1e-6,
+                    },
+                )?;
+            }
+            unsafe {
+                s.launch_builder(&self.rope_2d)
+                    .arg(&mut work.qkv)
+                    .arg(&work.positions)
+                    .arg(&(rows as i32))
+                    .arg(&16i32)
+                    .arg(&8i32)
+                    .arg(&128i32)
+                    .arg(&4096i32)
+                    .arg(&1_000_000.0f32)
+                    .launch(flat(rows * 24 * 64))?;
+                s.launch_builder(&self.kv_write)
+                    .arg(&work.qkv)
+                    .arg(&mut work.k)
+                    .arg(&mut work.v)
+                    .arg(&work.start)
+                    .arg(&(rows as i32))
+                    .arg(&16i32)
+                    .arg(&8i32)
+                    .arg(&128i32)
+                    .arg(&(rows as i32))
+                    .launch(flat(rows * 1024))?;
+            }
+            for row in 0..rows {
+                attention.run_with(
+                    s,
+                    GqaDecodeInput {
+                        q: &work.qkv,
+                        q_offset: row * 4096,
+                        k: &work.k,
+                        v: &work.v,
+                        output: &mut work.attn,
+                        output_offset: row * 2048,
+                        length: &work.lengths.slice(row..row + 1),
+                        sinks: None,
+                        window: None,
+                    },
+                )?;
+            }
+            linear(
+                blas,
+                s,
+                &layer.o,
+                matrix(&work.attn, s, rows, 2048)?,
+                matrix(&work.out, s, rows, 1024)?,
+            )?;
+            self.ops.add_rmsnorm(
+                s,
+                AddRmsNorm {
+                    input: matrix(&work.out, s, rows, 1024)?,
+                    residual: matrix(&work.x, s, rows, 1024)?,
+                    weight: Some(vector(&layer.post_norm, s, 1024)?),
+                    output: TensorMut(matrix(&work.n, s, rows, 1024)?),
+                    sum: TensorMut(matrix(&work.x, s, rows, 1024)?),
+                    eps: 1e-6,
+                },
+            )?;
+            linear(
+                blas,
+                s,
+                &layer.gu,
+                matrix(&work.n, s, rows, 1024)?,
+                matrix(&work.gu, s, rows, 6144)?,
+            )?;
+            unsafe {
+                s.launch_builder(&self.ops.act)
+                    .arg(&work.gu)
+                    .arg(&mut work.act)
+                    .arg(&(rows as i32))
+                    .arg(&3072i32)
+                    .arg(&0i32)
+                    .launch(flat(rows * 3072))?;
+            }
+            linear(
+                blas,
+                s,
+                &layer.down,
+                matrix(&work.act, s, rows, 3072)?,
+                matrix(&work.out, s, rows, 1024)?,
+            )?;
+            let next = weights
+                .layers
+                .get(index + 1)
+                .map(|next| &next.input_norm)
+                .unwrap_or(&weights.norm);
+            self.ops.add_rmsnorm(
+                s,
+                AddRmsNorm {
+                    input: matrix(&work.out, s, rows, 1024)?,
+                    residual: matrix(&work.x, s, rows, 1024)?,
+                    weight: Some(vector(next, s, 1024)?),
+                    output: TensorMut(matrix(&work.n, s, rows, 1024)?),
+                    sum: TensorMut(matrix(&work.x, s, rows, 1024)?),
+                    eps: 1e-6,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn run_projector(
+        &self,
+        blas: &Blas,
+        weights: &LoopvlVisionWeights,
+        s: &Arc<CudaStream>,
+        work: &mut VisionWorkspace,
+        rows: usize,
+    ) -> Result<()> {
+        self.projector_calls.set(self.projector_calls.get() + 1);
+        ensure!(rows > 0, "vision projector requires rows");
+        unsafe {
+            s.launch_builder(&self.upcast)
+                .arg(&work.n)
+                .arg(&mut work.f32_a)
+                .arg(&((rows * 1024) as i32))
+                .launch(flat(rows * 1024))?;
+        }
+        blas.linear_f32(
+            f32_weight(&weights.fc1_weight, s, 1536, 1024)?,
+            matrix32(&work.f32_a, s, rows, 1024)?,
+            &mut TensorMut(matrix32(&work.f32_b, s, rows, 1536)?),
+        )?;
+        unsafe {
+            let f32_b = work.f32_b.device_ptr(s).0;
+            s.launch_builder(&self.bias_gelu)
+                .arg(&f32_b)
+                .arg(&f32_weight(&weights.fc1_bias, s, 1, 1536)?.ptr)
+                .arg(&mut work.f32_b)
+                .arg(&(rows as i32))
+                .arg(&1536i32)
+                .launch(flat(rows * 1536))?;
+        }
+        blas.linear_f32(
+            f32_weight(&weights.fc2_weight, s, 1536, 1536)?,
+            matrix32(&work.f32_b, s, rows, 1536)?,
+            &mut TensorMut(matrix32(&work.f32_c, s, rows, 1536)?),
+        )?;
+        unsafe {
+            let f32_c = work.f32_c.device_ptr(s).0;
+            s.launch_builder(&self.bias)
+                .arg(&f32_c)
+                .arg(&f32_weight(&weights.fc2_bias, s, 1, 1536)?.ptr)
+                .arg(&mut work.f32_c)
+                .arg(&(rows as i32))
+                .arg(&1536i32)
+                .launch(flat(rows * 1536))?;
+            s.launch_builder(&self.rms_scale)
+                .arg(&work.f32_c)
+                .arg(&f32_weight(&weights.visual_scale, s, 1, 1)?.ptr)
+                .arg(&mut work.projected_f32)
+                .arg(&mut work.projected_bf16)
+                .arg(&1536i32)
+                .arg(&1e-6f32)
+                .launch(grid(rows, 256))?;
+        }
+        Ok(())
+    }
 }
 
 impl Engine {
@@ -688,6 +1089,145 @@ mod tests {
             if pass { "PASS" } else { "DEFECT" }
         );
         Ok(pass)
+    }
+
+    #[test]
+    #[ignore = "authorized GPU window; FF_MODEL and FF_LOOPVL_FIXTURES"]
+    fn loopvl_vision_gpu() -> Result<()> {
+        let dir =
+            PathBuf::from(std::env::var_os("FF_MODEL").context("Runner FAIL FF_MODEL missing")?);
+        let fixtures = PathBuf::from(
+            std::env::var_os("FF_LOOPVL_FIXTURES")
+                .context("Runner FAIL FF_LOOPVL_FIXTURES missing")?,
+        );
+        let spec = crate::model_spec::ModelSpec::read(&dir)?;
+        let d = Device::new(0)?;
+        let s = &d.stream;
+        let weights = LoopvlVisionWeights::load(&dir, &spec, &d)?;
+        ensure!(
+            weights.gate_visual.len() == 256 * 1536 * 4
+                && weights.gate_query.len() == 256 * 1536 * 4
+                && weights.gate_out.len() == 256 * 4
+                && weights.gate_bias.len() == 4
+                && weights.raw_alpha.len() == 8,
+            "Runner FAIL reinjection weight extents"
+        );
+        let runtime = VisionRuntime::new(&d.ctx)?;
+        let closure = Rc::new(crate::backend::cuda::closure::Closure::new(
+            false,
+            "LoopVL vision test".into(),
+        ));
+        let mut blas = Blas::new(&d, &runtime.ops, Path::new(""), closure)?;
+        blas.bind_invariant(&d.ctx, 1)?;
+        let mut defects = 0;
+        let mut outputs = Vec::new();
+        for case in ["image_hockey", "image_boat", "control_same_grid_boat"] {
+            let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
+            let source = SafeTensors::deserialize(&bytes)?;
+            let pixels = floats(&source, "pixel_values")?;
+            let grid = ids(&source, "grid_sizes")?;
+            let input_ids = ids(&source, "input_ids")?;
+            ensure!(grid.len() == 3 && grid[0] == 1, "Runner FAIL {case} grid");
+            let (grid_h, grid_w) = (grid[1] as usize, grid[2] as usize);
+            let rows = grid_h * grid_w;
+            ensure!(
+                pixels.len() == rows * 588,
+                "Runner FAIL {case} pixel extent"
+            );
+            let pixels: Vec<bf16> = pixels.into_iter().map(bf16::from_f32).collect();
+            let pixels = s.clone_htod(&pixels)?;
+            let mut work = VisionWorkspace::new(s, rows)?;
+            let mut config = spec.config();
+            config.num_attention_heads = 16;
+            config.num_key_value_heads = 8;
+            let plan = crate::backend::setup::AttentionPlan {
+                chunk: 64,
+                qpack: 1,
+                threads: 128,
+                merge_threads: 128,
+            };
+            let mut attention = Attention::new(&d.ctx, s, &config, rows, plan)?;
+            let encoder_before = runtime.encoder_calls.get();
+            runtime.run_encoder(
+                &mut blas,
+                &mut attention,
+                s,
+                &mut work,
+                VisionEncoderCall {
+                    weights: &weights,
+                    pixels: &pixels,
+                    rows,
+                    grid_h,
+                    grid_w,
+                },
+            )?;
+            let projector_before = runtime.projector_calls.get();
+            runtime.run_projector(&blas, &weights, s, &mut work, rows)?;
+            ensure!(
+                runtime.encoder_calls.get() == encoder_before + 1
+                    && runtime.projector_calls.get() == projector_before + 1,
+                "DEFECT {case} media call count"
+            );
+            let raw: Vec<f32> = s
+                .clone_dtoh(&work.n)?
+                .into_iter()
+                .map(bf16::to_f32)
+                .collect();
+            let raw_reference = floats(&source, "vision_raw_features")?;
+            defects += usize::from(!compare(
+                &format!("{case} encoder"),
+                &raw,
+                &raw_reference,
+                [f32::MAX, 0.08, 0.035],
+            )?);
+            let projected = s.clone_dtoh(&work.projected_f32)?;
+            let projected_reference = floats(&source, "visual_projected")?;
+            defects += usize::from(!compare(
+                &format!("{case} encoder_projector"),
+                &projected,
+                &projected_reference,
+                [f32::MAX, 0.08, 0.035],
+            )?);
+            let projected_bf16 = s.clone_dtoh(&work.projected_bf16)?;
+            let raw_bf16: Vec<bf16> = raw_reference.iter().copied().map(bf16::from_f32).collect();
+            s.memcpy_htod(&raw_bf16, &mut work.n)?;
+            runtime.run_projector(&blas, &weights, s, &mut work, rows)?;
+            let isolated = s.clone_dtoh(&work.projected_f32)?;
+            defects += usize::from(!compare(
+                &format!("{case} isolated_projector"),
+                &isolated,
+                &projected_reference,
+                [1e-4, f32::MAX, 1e-5],
+            )?);
+            println!(
+                "PASS {case} media_calls encoder=1 projector=1 isolated_projector=1 rows={rows}"
+            );
+            outputs.push((case, input_ids, grid, projected_bf16));
+        }
+        let hockey = &outputs[0];
+        let control = &outputs[2];
+        ensure!(
+            hockey.1 == control.1 && hockey.2 == control.2,
+            "Runner FAIL same-grid control inputs differ"
+        );
+        let media_difference = hockey
+            .3
+            .iter()
+            .zip(&control.3)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        defects += usize::from(media_difference == 0);
+        println!(
+            "{} media_same_grid projected_differing={media_difference}",
+            if media_difference > 0 {
+                "PASS"
+            } else {
+                "DEFECT"
+            }
+        );
+        ensure!(defects == 0, "DEFECT loopvl_vision_gpu failures={defects}");
+        println!("PASS loopvl_vision_gpu fixtures=3 controls=media_reachability");
+        Ok(())
     }
 
     #[test]
