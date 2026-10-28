@@ -6,7 +6,7 @@ use half::bf16;
 use std::ops::Range;
 use std::sync::{
     Arc, Condvar, Mutex, RwLock,
-    atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering},
 };
 use std::thread::{self, JoinHandle};
 
@@ -17,27 +17,13 @@ const LANES: usize = 16;
 /// lane16 kernel: 16 lanes, each accumulating one element per 16, reduced by the 1/2/4/8 pairwise
 /// tree. `Lane8` is the production kernel: 8 lanes, each accumulating one 8-element vector per 8,
 /// reduced by the 4/2/1 group tree. Both round differently, so the CPU must not mix them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Form {
     Lane16,
     Lane8,
 }
 
 impl Form {
-    pub(crate) fn into_u8(self) -> u8 {
-        match self {
-            Self::Lane16 => 0,
-            Self::Lane8 => 1,
-        }
-    }
-
-    pub(crate) fn from_u8(value: u8) -> Self {
-        match value {
-            1 => Self::Lane8,
-            _ => Self::Lane16,
-        }
-    }
-
     /// The GPU tree for this form: pairwise 1/2/4/8 for `Lane16`, group 4/2/1 for `Lane8`.
     fn reduce(self, lanes: &mut [f32; LANES]) -> f32 {
         match self {
@@ -389,9 +375,6 @@ pub struct ExpertBoundaries {
     pub swiglu_rounding: crate::model_spec::SwigluRounding,
     pub swiglu_limit: f32,
     pub routed_weight: crate::model_spec::RoutedWeightBoundary,
-    /// The GPU reduction form the host tier must reproduce: the draft-attached lane16 kernel
-    /// or the production 8-lane kernel.
-    pub form: Form,
 }
 
 /// One routed-expert contribution input.
@@ -1811,6 +1794,7 @@ pub struct ExpertPool {
 }
 
 pub struct Job<'a> {
+    pub form: Form,
     pub arena: Arc<HostBlocks>,
     pub hidden: &'a [bf16],
     pub rows: usize,
@@ -1846,8 +1830,6 @@ struct PoolShared {
     error: Mutex<Option<String>>,
     workers: usize,
     boundaries: ExpertBoundaries,
-    /// Live reduction form; `ExpertPool::set_form` flips it when a draft is attached.
-    form: AtomicU8,
     // Low nine bits are the published participant count.
     generation: AtomicU64,
     pending: AtomicBool,
@@ -1893,6 +1875,7 @@ struct GroupedItem {
 }
 
 struct JobSlot {
+    form: Form,
     rows: usize,
     arena: Option<Arc<BlockLease>>,
     hidden: Vec<bf16>,
@@ -1906,6 +1889,7 @@ struct JobSlot {
 impl JobSlot {
     fn new(shape: &Shape, max_rows: usize, max_assignments: usize) -> Self {
         Self {
+            form: Form::Lane16,
             rows: 0,
             arena: None,
             hidden: vec![bf16::ZERO; max_rows * shape.hidden],
@@ -2023,7 +2007,6 @@ impl ExpertPool {
                 swiglu_rounding,
                 swiglu_limit: 0.0,
                 routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
-                form: Form::Lane16,
             },
             crate::experts::plan::ParticipantTable::uniform(
                 u32::try_from(max_rows)?,
@@ -2086,7 +2069,6 @@ impl ExpertPool {
             error: Mutex::new(None),
             workers,
             boundaries,
-            form: AtomicU8::new(boundaries.form.into_u8()),
             generation: AtomicU64::new(0),
             pending: AtomicBool::new(false),
             prewake: AtomicBool::new(false),
@@ -2171,12 +2153,6 @@ impl ExpertPool {
         self.isa
     }
 
-    /// Sets the reduction form the host tier must reproduce. Called when a draft is attached
-    /// (`Engine::bind_invariant_arithmetic`) or detached.
-    pub fn set_form(&self, form: Form) {
-        self.shared.form.store(form.into_u8(), Ordering::Relaxed);
-    }
-
     pub fn prewake(&self) -> Result<()> {
         ensure!(
             !self.shared.shutdown.load(Ordering::Acquire),
@@ -2205,6 +2181,22 @@ impl ExpertPool {
             !self.shared.shutdown.load(Ordering::Acquire),
             "expert pool worker synchronization failed"
         );
+        ensure!(
+            !self.shared.pending.swap(true, Ordering::AcqRel),
+            "expert pool job is already pending"
+        );
+        if let Err(error) = self.publish(&job) {
+            self.shared.pending.store(false, Ordering::Release);
+            return Err(error);
+        }
+        Ok(PendingJob {
+            pool: self,
+            out: Some(job.out),
+            armed: true,
+        })
+    }
+
+    fn publish(&self, job: &Job<'_>) -> Result<()> {
         let Job {
             arena,
             hidden,
@@ -2212,31 +2204,10 @@ impl ExpertPool {
             experts,
             assignments,
             out,
+            form,
         } = job;
-        ensure!(
-            !self.shared.pending.swap(true, Ordering::AcqRel),
-            "expert pool job is already pending"
-        );
-        if let Err(error) = self.publish(&arena, hidden, rows, experts, assignments, out.len()) {
-            self.shared.pending.store(false, Ordering::Release);
-            return Err(error);
-        }
-        Ok(PendingJob {
-            pool: self,
-            out: Some(out),
-            armed: true,
-        })
-    }
-
-    fn publish(
-        &self,
-        arena: &Arc<HostBlocks>,
-        hidden: &[bf16],
-        rows: usize,
-        experts: &[ExpertWeights],
-        assignments: &[Assignment],
-        out_len: usize,
-    ) -> Result<()> {
+        let rows = *rows;
+        let out_len = out.len();
         self.validate(
             arena.elements(),
             hidden.len(),
@@ -2266,13 +2237,14 @@ impl ExpertPool {
                 .map_err(|_| anyhow::anyhow!("expert pool job lock poisoned"))?;
             let slot = &mut *slot;
             slot.rows = rows;
+            slot.form = *form;
             slot.arena = Some(lease);
             slot.hidden[..hidden.len()].copy_from_slice(hidden);
             slot.experts.clear();
             slot.experts.extend_from_slice(experts);
             slot.groups.clear();
             slot.group_cursor.clear();
-            for item in assignments {
+            for item in *assignments {
                 let expert_idx = item.expert as usize;
                 let group_idx = slot.expert_group[expert_idx];
                 if group_idx == u16::MAX {
@@ -2644,7 +2616,7 @@ fn phases<const FP8: bool>(
     let arm = arm_for(isa)?;
     let (hidden, intermediate) = (shape.hidden, shape.intermediate);
     let workers = shared.participants.load(Ordering::Acquire);
-    let (lease, groups_len, range1, rows) = {
+    let (lease, groups_len, range1, rows, form) = {
         let slot = shared
             .job
             .read()
@@ -2674,7 +2646,7 @@ fn phases<const FP8: bool>(
             }
         }
         let lease = slot.arena.clone().context("job lease missing")?;
-        (lease, groups_len, range1, slot.rows)
+        (lease, groups_len, range1, slot.rows, slot.form)
     };
     for row in 0..rows {
         if local.hidden_rows[row] {
@@ -2729,7 +2701,7 @@ fn phases<const FP8: bool>(
                         },
                         (gate_scale, up_scale),
                         &mut local.pair_out[..r_len],
-                        Form::from_u8(shared.form.load(Ordering::Relaxed)),
+                        form,
                     );
                 }
                 for (r, item) in group_items.iter().enumerate() {
@@ -2741,7 +2713,7 @@ fn phases<const FP8: bool>(
                         up,
                         boundaries.swiglu_rounding,
                         boundaries.swiglu_limit,
-                        Form::from_u8(shared.form.load(Ordering::Relaxed)),
+                        form,
                     ));
                     local
                         .out_pairs
@@ -2760,7 +2732,7 @@ fn phases<const FP8: bool>(
                         gate,
                         up,
                         &mut local.pair_out[..r_len],
-                        Form::from_u8(shared.form.load(Ordering::Relaxed)),
+                        form,
                     );
                 }
                 for (r, item) in group_items.iter().enumerate() {
@@ -2772,7 +2744,7 @@ fn phases<const FP8: bool>(
                         up,
                         boundaries.swiglu_rounding,
                         boundaries.swiglu_limit,
-                        Form::from_u8(shared.form.load(Ordering::Relaxed)),
+                        form,
                     ));
                     local
                         .out_pairs
@@ -2845,7 +2817,7 @@ fn phases<const FP8: bool>(
                         scale,
                         &mut local.down_out[..r_len],
                         &mut local.scratch_w[..intermediate],
-                        Form::from_u8(shared.form.load(Ordering::Relaxed)),
+                        form,
                     );
                 }
                 for (r, item) in group_items.iter().enumerate() {
@@ -2876,7 +2848,7 @@ fn phases<const FP8: bool>(
                         &local.row_offsets,
                         row,
                         &mut local.down_out[..r_len],
-                        Form::from_u8(shared.form.load(Ordering::Relaxed)),
+                        form,
                     );
                 }
                 for (r, item) in group_items.iter().enumerate() {
@@ -2915,6 +2887,7 @@ pub fn measure_service_table(
     rows: &[u32],
     missed: &[u32],
     format: crate::model_spec::ExpertFormat,
+    form: Form,
 ) -> Result<Vec<crate::experts::plan::ServiceCell>> {
     Shape::new(shape.hidden, shape.intermediate)?;
     let rows_max = *rows.iter().max().context("empty service row lattice")? as usize;
@@ -3015,6 +2988,7 @@ pub fn measure_service_table(
                         .collect::<Result<Vec<_>>>()?;
                     let started = std::time::Instant::now();
                     pool.run(Job {
+                        form,
                         arena: arena.clone(),
                         hidden: &hidden[..rows as usize * shape.hidden],
                         rows: rows as usize,
@@ -3041,7 +3015,7 @@ pub fn measure_service_table(
             }
             eprintln!(
                 "{}",
-                serde_json::json!({"expert_service_setup":{"workers":workers,"rows":rows,"cells":missed.len(),"wall_seconds":row_started.elapsed().as_secs_f64()}})
+                serde_json::json!({"expert_service_setup":{"form":form,"workers":workers,"rows":rows,"cells":missed.len(),"wall_seconds":row_started.elapsed().as_secs_f64()}})
             );
         }
     }
@@ -3399,6 +3373,7 @@ mod tests {
         }];
         let experts = [expert.clone()];
         let pending = pool.submit(Job {
+            form: Form::Lane16,
             arena,
             hidden: &hidden,
             rows: 1,
@@ -3468,6 +3443,7 @@ mod tests {
         )?];
         let pool = ExpertPool::new(2, shape, 1, 1, Some(slot.clone()))?;
         pool.run(Job {
+            form: Form::Lane16,
             arena,
             hidden: &hidden,
             rows: 1,
@@ -3516,6 +3492,7 @@ mod tests {
             crate::model_spec::SwigluRounding::Once,
         )?;
         pool.run(Job {
+            form: Form::Lane16,
             arena,
             hidden: &hidden,
             rows: 1,
@@ -3880,6 +3857,7 @@ mod tests {
             let pool = ExpertPool::new(workers, shape, 2, 6, Some(slot.clone()))?;
             let mut out = vec![bf16::ZERO; expected.len()];
             let pending = pool.submit(Job {
+                form: Form::Lane16,
                 arena: arena.clone(),
                 hidden: &hidden,
                 rows: 2,
@@ -3896,6 +3874,7 @@ mod tests {
             malformed[0].gate_up.end += 1;
             assert!(
                 pool.run(Job {
+                    form: Form::Lane16,
                     arena: arena.clone(),
                     hidden: &hidden,
                     rows: 2,
@@ -3920,6 +3899,7 @@ mod tests {
         let pool = ExpertPool::new(4, shape, 2, 6, Some(slot))?;
         let mut wrong = vec![bf16::ZERO; expected.len()];
         pool.run(Job {
+            form: Form::Lane16,
             arena,
             hidden: &hidden,
             rows: 2,
@@ -4205,6 +4185,7 @@ mod tests {
                     let pool = ExpertPool::new(workers, shape, rows, assignments.len(), None)?;
                     let mut out = vec![bf16::ZERO; assignments.len() * shape.hidden];
                     pool.run(Job {
+                        form: Form::Lane16,
                         arena: arena.clone(),
                         hidden: &hidden,
                         rows,
@@ -4218,6 +4199,7 @@ mod tests {
                     shuffled.reverse();
                     let mut out = vec![bf16::ZERO; assignments.len() * shape.hidden];
                     pool.run(Job {
+                        form: Form::Lane16,
                         arena: arena.clone(),
                         hidden: &hidden,
                         rows,
@@ -4299,6 +4281,7 @@ mod tests {
 
     fn fixture_job<'a>(fixture: &'a PoolFixture, out: &'a mut [bf16]) -> Job<'a> {
         Job {
+            form: Form::Lane16,
             arena: fixture.arena.clone(),
             hidden: &fixture.hidden,
             rows: 2,
@@ -4379,7 +4362,6 @@ mod tests {
                 swiglu_rounding: crate::model_spec::SwigluRounding::Twice,
                 swiglu_limit: 0.0,
                 routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
-                form: Form::Lane8,
             },
             crate::experts::plan::ParticipantTable::uniform(2, 4, 2)?,
         )?;
@@ -4449,7 +4431,6 @@ mod tests {
                 swiglu_rounding: crate::model_spec::SwigluRounding::Twice,
                 swiglu_limit: 0.0,
                 routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
-                form: Form::Lane16,
             },
             participants,
         )?;
@@ -4587,39 +4568,43 @@ mod tests {
                 weight: bf16::from_f32(0.125),
             })
             .collect();
-        let mut scratch = Scratch::new(&shape);
-        let mut expected = vec![bf16::ZERO; assignments.len() * shape.hidden];
-        for assignment in &assignments {
-            let out = &mut expected[assignment.choice as usize * shape.hidden..][..shape.hidden];
-            contribution(
-                Isa::Scalar,
-                Contribution {
-                    form: Form::Lane16,
-                    shape: &shape,
-                    arena: &arena_flat(&arena),
-                    weights: &experts[assignment.expert as usize],
-                    hidden: &hidden,
-                    routing: assignment.weight,
-
-                    rounding: crate::model_spec::SwigluRounding::Twice,
-                    limit: 0.0,
-                    routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
-                },
-                out,
-                &mut scratch,
-            )?;
-        }
         let pool = ExpertPool::new(4, shape, 1, assignments.len(), None)?;
-        let mut out = vec![bf16::ZERO; assignments.len() * shape.hidden];
-        pool.run(Job {
-            arena,
-            hidden: &hidden,
-            rows: 1,
-            experts: &experts,
-            assignments: &assignments,
-            out: &mut out,
-        })?;
-        assert_eq!(out, expected);
+        let mut scratch = Scratch::new(&shape);
+        for form in [Form::Lane8, Form::Lane16, Form::Lane8] {
+            let mut expected = vec![bf16::ZERO; assignments.len() * shape.hidden];
+            for assignment in &assignments {
+                let out =
+                    &mut expected[assignment.choice as usize * shape.hidden..][..shape.hidden];
+                contribution(
+                    Isa::Scalar,
+                    Contribution {
+                        form,
+                        shape: &shape,
+                        arena: &arena_flat(&arena),
+                        weights: &experts[assignment.expert as usize],
+                        hidden: &hidden,
+                        routing: assignment.weight,
+
+                        rounding: crate::model_spec::SwigluRounding::Twice,
+                        limit: 0.0,
+                        routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+                    },
+                    out,
+                    &mut scratch,
+                )?;
+            }
+            let mut out = vec![bf16::ZERO; assignments.len() * shape.hidden];
+            pool.run(Job {
+                form,
+                arena: arena.clone(),
+                hidden: &hidden,
+                rows: 1,
+                experts: &experts,
+                assignments: &assignments,
+                out: &mut out,
+            })?;
+            assert_eq!(out, expected, "per-job form {form:?}");
+        }
         Ok(())
     }
 
@@ -4638,6 +4623,7 @@ mod tests {
         };
         let mut out = vec![bf16::ZERO; shape.hidden];
         pool.run(Job {
+            form: Form::Lane16,
             arena: arena.clone(),
             hidden: &hidden,
             rows: 1,
@@ -4648,6 +4634,7 @@ mod tests {
         assert!(ExpertPool::new(0, shape, 1, 1, None).is_err());
         assert!(
             pool.run(Job {
+                form: Form::Lane16,
                 arena: arena.clone(),
                 hidden: &hidden,
                 rows: 2,
@@ -4659,6 +4646,7 @@ mod tests {
         );
         assert!(
             pool.run(Job {
+                form: Form::Lane16,
                 arena: arena.clone(),
                 hidden: &hidden[..shape.hidden - 1],
                 rows: 1,
@@ -4671,6 +4659,7 @@ mod tests {
         let bad_row = Assignment { row: 1, ..good };
         assert!(
             pool.run(Job {
+                form: Form::Lane16,
                 arena: arena.clone(),
                 hidden: &hidden,
                 rows: 1,
@@ -4683,6 +4672,7 @@ mod tests {
         let bad_expert = Assignment { expert: 1, ..good };
         assert!(
             pool.run(Job {
+                form: Form::Lane16,
                 arena: arena.clone(),
                 hidden: &hidden,
                 rows: 1,
@@ -4695,6 +4685,7 @@ mod tests {
         let duplicate = Assignment { choice: 0, ..good };
         assert!(
             pool.run(Job {
+                form: Form::Lane16,
                 arena: arena.clone(),
                 hidden: &hidden,
                 rows: 1,
@@ -4707,6 +4698,7 @@ mod tests {
         let bad_choice = Assignment { choice: 1, ..good };
         assert!(
             pool.run(Job {
+                form: Form::Lane16,
                 arena,
                 hidden: &hidden,
                 rows: 1,
@@ -4848,6 +4840,7 @@ mod tests {
             &[1, 2, 5, 8],
             &[1, 2, 4, 8],
             crate::model_spec::ExpertFormat::Bf16,
+            Form::Lane16,
         )?;
         for cell in cells {
             let cold_bytes = f64::from(cell.experts) * per as f64 * 2.0;
@@ -5030,6 +5023,7 @@ mod tests {
                     let bf16_pool = ExpertPool::new(workers, shape, rows, assignments.len(), None)?;
                     let mut out_bf16 = vec![bf16::ZERO; expected_bf16.len()];
                     bf16_pool.run(Job {
+                        form: Form::Lane16,
                         arena: bf16_arena.clone(),
                         hidden: &hidden[..rows * shape.hidden],
                         rows,
@@ -5052,6 +5046,7 @@ mod tests {
                     )?;
                     let mut out_fp8 = vec![bf16::ZERO; expected_fp8.len()];
                     fp8_pool.run(Job {
+                        form: Form::Lane16,
                         arena: fp8_arena.clone(),
                         hidden: &hidden[..rows * shape.hidden],
                         rows,
@@ -5077,6 +5072,7 @@ mod tests {
                         }
                         let mut out_bf16_mutant = vec![bf16::ZERO; expected_bf16.len()];
                         bf16_pool.run(Job {
+                            form: Form::Lane16,
                             arena: bf16_mutant_arena,
                             hidden: &hidden[..rows * shape.hidden],
                             rows,
@@ -5110,6 +5106,7 @@ mod tests {
                         }
                         let mut out_fp8_mutant = vec![bf16::ZERO; expected_fp8.len()];
                         fp8_pool.run(Job {
+                            form: Form::Lane16,
                             arena: fp8_mutant_arena,
                             hidden: &hidden[..rows * shape.hidden],
                             rows,

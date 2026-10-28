@@ -856,6 +856,7 @@ impl Engine {
                 &runtime,
                 geometry,
                 spec.expert_format.context("MoE expert_format missing")?,
+                crate::cpu::expert_ffn::Form::Lane8,
                 &closure,
             )?;
             let budget = crate::experts::plan::admission_budget(

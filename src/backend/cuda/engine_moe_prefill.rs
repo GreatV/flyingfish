@@ -1275,6 +1275,7 @@ impl Prefill {
             } else {
                 Some(
                     decode.pool.submit(Job {
+                        form: crate::cpu::expert_ffn::Form::Lane16,
                         arena: slots
                             .transfers
                             .host
@@ -1294,7 +1295,13 @@ impl Prefill {
                 Ok(())
             } else {
                 match slots.disk_cpu.as_mut() {
-                    Some(pool) => pool.start(layer, cpu_hidden, cpu_rows, &self.cpu.disk),
+                    Some(pool) => pool.start(crate::experts::disk::Job {
+                        layer,
+                        hidden: cpu_hidden,
+                        rows: cpu_rows,
+                        routes: &self.cpu.disk,
+                        form: crate::cpu::expert_ffn::Form::Lane16,
+                    }),
                     None => Err(anyhow::anyhow!("prefill disk CPU routes have no workers")),
                 }
             };
@@ -3338,6 +3345,7 @@ mod tests {
             let gpu = run_gpu(&tables, &host_gate_up, &host_down)?;
             let mut cpu = vec![bf16::ZERO; rows * hidden];
             let pending = pool.submit(Job {
+                form: crate::cpu::expert_ffn::Form::Lane16,
                 arena: host.clone(),
                 hidden: x,
                 rows,
@@ -3347,7 +3355,13 @@ mod tests {
             })?;
             pool.finish(pending)?;
             let mut from_disk = vec![bf16::ZERO; rows * hidden];
-            disk.start(0, x, rows, &routes)?;
+            disk.start(crate::experts::disk::Job {
+                layer: 0,
+                hidden: x,
+                rows,
+                routes: &routes,
+                form: crate::cpu::expert_ffn::Form::Lane16,
+            })?;
             disk.finish(&mut from_disk)?;
             if boundary {
                 let staged = stream.clone_htod(&native)?;
@@ -3414,7 +3428,7 @@ mod tests {
                     contribution(
                         Isa::detect(),
                         Contribution {
-                            form: crate::cpu::expert_ffn::Form::Lane8,
+                            form: crate::cpu::expert_ffn::Form::Lane16,
                             shape: &shape,
                             arena: &native,
                             weights: &weights[0],
@@ -3866,6 +3880,24 @@ mod tests {
 
     fn inputs(variant: u32, rows: usize) -> MoeFixture {
         let mut fixture = tier_fixture(variant, 8);
+        if variant == 11 {
+            // Lane16: (2^24 + a) - 2^24 = 0; Lane8: (2^24 - 2^24) + a = a.
+            for row in fixture.x.as_chunks_mut::<128>().0 {
+                row[16] = bf16::from_f32(16_777_216.0);
+                row[32] = bf16::ONE;
+                row[48] = bf16::from_f32(16_777_216.0);
+            }
+            fixture.gate_up.fill(bf16::ZERO);
+            for expert in 0..16 {
+                for j in 0..64 {
+                    let gate = &mut fixture.gate_up[(expert * 128 + j) * 128..][..128];
+                    gate[16] = bf16::ONE;
+                    gate[32] = bf16::from_f32((1 + (j + expert) % 7) as f32 / 8.0);
+                    gate[48] = bf16::from_f32(-1.0);
+                    fixture.gate_up[(expert * 128 + 64 + j) * 128 + 32] = bf16::ONE;
+                }
+            }
+        }
         let source = fixture.x.clone();
         let pattern = (0..rows).map(|row| {
             if row + 7 < rows {
@@ -4020,6 +4052,7 @@ mod tests {
         fixture: &MoeFixture,
         layer: u32,
         wave: usize,
+        form: crate::cpu::expert_ffn::Form,
         cohorts: impl FnOnce(&[i32]) -> Result<(Vec<u32>, Vec<Vec<u32>>)>,
     ) -> Result<Reference> {
         let stream = &engine.device.stream;
@@ -4191,7 +4224,7 @@ mod tests {
                     fp8_contribution(
                         Isa::detect(),
                         Fp8Contribution {
-                            form: crate::cpu::expert_ffn::Form::Lane8,
+                            form,
                             shape: &shape,
                             slot: &native_slot,
                             slot_layout,
@@ -4209,7 +4242,7 @@ mod tests {
                     contribution(
                         Isa::detect(),
                         Contribution {
-                            form: crate::cpu::expert_ffn::Form::Lane8,
+                            form,
                             shape: &shape,
                             arena: &arena,
                             weights: &native,
@@ -4327,6 +4360,8 @@ mod tests {
         let mut defects = 0;
         let mut total_coverage = [0u64; 5];
         let mut ticket_control = false;
+        let mut placement_choices = [0usize; 2];
+        let mut old_form_mismatches = 0usize;
         for &variant in variants {
             for &rows in row_cases {
                 let fixture = inputs(variant, rows as usize);
@@ -4347,12 +4382,22 @@ mod tests {
                 )?
                 .2;
                 for layer in 0..2 {
-                    let first = reference(&oracle, &fixture, layer, 4, |_| {
-                        Ok((vec![], vec![(0..16).collect()]))
-                    })?;
-                    let second = reference(&oracle, &fixture, layer, 4, |_| {
-                        Ok((vec![], vec![(0..16).collect()]))
-                    })?;
+                    let first = reference(
+                        &oracle,
+                        &fixture,
+                        layer,
+                        4,
+                        crate::cpu::expert_ffn::Form::Lane16,
+                        |_| Ok((vec![], vec![(0..16).collect()])),
+                    )?;
+                    let second = reference(
+                        &oracle,
+                        &fixture,
+                        layer,
+                        4,
+                        crate::cpu::expert_ffn::Form::Lane16,
+                        |_| Ok((vec![], vec![(0..16).collect()])),
+                    )?;
                     ensure!(
                         first.ids == second.ids
                             && same_bits(&first.weights, &second.weights, |x| u32::from(
@@ -4622,9 +4667,39 @@ mod tests {
                             }
                             engine.device.stream.synchronize()?;
                         }
-                        let reference = reference(&oracle, &fixture, layer as u32, 4, |_| {
-                            Ok((expected_plan.cpu().to_vec(), vec![(0..16).collect()]))
-                        })?;
+                        if old_form_mismatches == 0 && !expected_plan.cpu().is_empty() {
+                            let legacy = reference(
+                                &oracle,
+                                &fixture,
+                                layer as u32,
+                                4,
+                                crate::cpu::expert_ffn::Form::Lane8,
+                                |_| Ok((expected_plan.cpu().to_vec(), vec![(0..16).collect()])),
+                            )?;
+                            for (choice, &expert) in legacy.ids.iter().enumerate() {
+                                if expected_plan.cpu().contains(&(expert as u32))
+                                    && counts[expert as usize] <= LANE16_ROWS
+                                {
+                                    old_form_mismatches += legacy.contributions
+                                        [choice * 128..(choice + 1) * 128]
+                                        .iter()
+                                        .zip(
+                                            &all_resident.contributions
+                                                [choice * 128..(choice + 1) * 128],
+                                        )
+                                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                                        .count();
+                                }
+                            }
+                        }
+                        let reference = reference(
+                            &oracle,
+                            &fixture,
+                            layer as u32,
+                            4,
+                            crate::cpu::expert_ffn::Form::Lane16,
+                            |_| Ok((expected_plan.cpu().to_vec(), vec![(0..16).collect()])),
+                        )?;
                         let actual = engine.device.stream.clone_dtoh(&output)?;
                         let span = prefill.span.as_ref().context("prefill gate span missing")?;
                         let mut contributions = vec![bf16::ZERO; rows as usize * 4 * 128];
@@ -4683,6 +4758,31 @@ mod tests {
                             .enumerate()
                         {
                             let cpu = expected_plan.cpu().contains(&(expert as u32));
+                            if cpu {
+                                ensure!(
+                                    counts[expert as usize] <= LANE16_ROWS,
+                                    "CPU prefill expert exceeds lane16 counterpart rows={}",
+                                    counts[expert as usize]
+                                );
+                                let tier =
+                                    slots.policy.ledger().tier(layer as u32, expert as u32)?;
+                                placement_choices[usize::from(tier == Tier::Disk)] += 1;
+                                let moved = values
+                                    .iter()
+                                    .zip(
+                                        &all_resident.contributions
+                                            [choice * 128..(choice + 1) * 128],
+                                    )
+                                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                                    .count();
+                                defects += usize::from(moved != 0);
+                                if moved != 0 {
+                                    println!(
+                                        "DEFECT prefill_placement_move format={format:?} layer={layer} expert={expert} tier={tier:?} choice={choice} bit_mismatches={moved}"
+                                    );
+                                }
+                            }
+
                             cohort_mismatches[usize::from(cpu)] += values
                                 .iter()
                                 .zip(&reference.contributions[choice * 128..(choice + 1) * 128])
@@ -4772,6 +4872,18 @@ mod tests {
                 && (host_complete || total_coverage[2] > 0 && total_coverage[4] > 0),
             "Runner FAIL prefill gate coverage={total_coverage:?} host_complete={host_complete}"
         );
+        ensure!(
+            placement_choices[0] > 0 && (host_complete || placement_choices[1] > 0),
+            "Runner FAIL prefill placement coverage={placement_choices:?}"
+        );
+        ensure!(
+            old_form_mismatches > 0,
+            "Runner FAIL old global Lane8 control not detected"
+        );
+        println!(
+            "PASS prefill_placement_move format={format:?} host_choices={} disk_choices={} bit_mismatches={defects} old_global_lane8_mismatches={old_form_mismatches}",
+            placement_choices[0], placement_choices[1]
+        );
         ensure!(defects == 0, "DEFECT prefill span cells={defects}");
         ensure!(
             format != crate::model_spec::ExpertFormat::Fp8W8a16 || ticket_control,
@@ -4788,7 +4900,7 @@ mod tests {
     fn prefill_span_smoke_gpu() -> Result<()> {
         gate(
             &[17],
-            &[3],
+            &[11],
             &[(false, 1)],
             false,
             crate::model_spec::ExpertFormat::Bf16,
@@ -4859,9 +4971,14 @@ mod tests {
                 rows as u32,
                 engine.moe_ffn_binding(layer as usize)?,
             )?;
-            let expected = reference(&oracle, &fixture, layer, 4, |_| {
-                Ok((prefill.plan.cpu().to_vec(), vec![(0..16).collect()]))
-            })?;
+            let expected = reference(
+                &oracle,
+                &fixture,
+                layer,
+                4,
+                crate::cpu::expert_ffn::Form::Lane16,
+                |_| Ok((prefill.plan.cpu().to_vec(), vec![(0..16).collect()])),
+            )?;
             let span = prefill.span.as_ref().context("span missing")?;
             let mut actual = vec![bf16::ZERO; rows * 4 * 128];
             // SAFETY: the borrowed span owns all live contribution rows until refill.
@@ -4908,7 +5025,7 @@ mod tests {
     fn prefill_span_gpu() -> Result<()> {
         gate(
             &[17, 263],
-            &[3, 7],
+            &[3, 7, 11],
             &[(false, 1), (false, 2), (true, 1), (true, 2)],
             false,
             crate::model_spec::ExpertFormat::Bf16,
@@ -4920,7 +5037,7 @@ mod tests {
     fn prefill_borrow_host_gpu() -> Result<()> {
         gate(
             &[17],
-            &[3, 7],
+            &[3, 7, 11],
             &[(false, 1), (false, 2), (true, 1), (true, 2)],
             true,
             crate::model_spec::ExpertFormat::Bf16,
@@ -4932,14 +5049,14 @@ mod tests {
     fn fp8_prefill_residency_gpu() -> Result<()> {
         gate(
             &[17, 263],
-            &[3, 7],
+            &[3, 7, 11],
             &[(false, 1), (true, 2)],
             false,
             crate::model_spec::ExpertFormat::Fp8W8a16,
         )?;
         gate(
             &[17],
-            &[3, 7],
+            &[3, 7, 11],
             &[(false, 1), (true, 2)],
             true,
             crate::model_spec::ExpertFormat::Fp8W8a16,
@@ -5146,6 +5263,7 @@ mod tests {
                     &fixture,
                     layer as u32,
                     wave,
+                    crate::cpu::expert_ffn::Form::Lane16,
                     |ids| match placement {
                         Some(capacity) => reference_cohorts(ids, layer as u32, capacity),
                         None => Ok((vec![], vec![(0..16).collect()])),
