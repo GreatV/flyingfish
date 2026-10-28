@@ -285,6 +285,11 @@ impl Setup {
             runtime,
             geometry,
             model.expert_format.context("MoE expert_format missing")?,
+            if cfg!(feature = "cuda") && draft_config.is_some() {
+                crate::cpu::expert_ffn::Form::Lane16
+            } else {
+                crate::cpu::expert_ffn::Form::Lane8
+            },
             &calibration,
         )?;
         let expert_calibration_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
@@ -815,6 +820,7 @@ impl Engine {
             )?;
             self.device.ctx.bind_to_thread()?;
         }
+        executor.form = crate::cpu::expert_ffn::Form::Lane16;
         eprintln!(
             "draft_target_arithmetic lane16_routed=true skinny_shared=true skinny_typed=true rows={}",
             crate::linear_plan::MAX_SKINNY_ROWS
@@ -963,6 +969,7 @@ pub(super) struct PeerDecode {
 }
 
 pub(super) struct Decode {
+    form: crate::cpu::expert_ffn::Form,
     geometry: ExpertGeometry,
     combine_blocks: u32,
     residual_output: bool,
@@ -1176,6 +1183,7 @@ impl Decode {
             None
         };
         let decode = Self {
+            form: crate::cpu::expert_ffn::Form::Lane8,
             geometry,
             combine_blocks: if residual_output {
                 geometry.hidden.div_ceil(256)
@@ -2152,6 +2160,7 @@ impl Decode {
                     dma.ready_weights(dispatch.experts)?;
                 }
                 self.pool.run(Job {
+                    form: self.form,
                     arena: dispatch
                         .host
                         .as_ref()
@@ -2174,10 +2183,13 @@ impl Decode {
                 .as_deref_mut()
                 .context("disk routes have no bound CPU workers")?
                 .run(
-                    dispatch.layer,
-                    cpu_hidden,
-                    dispatch.miss_rows.len(),
-                    dispatch.disk,
+                    crate::experts::disk::Job {
+                        layer: dispatch.layer,
+                        hidden: cpu_hidden,
+                        rows: dispatch.miss_rows.len(),
+                        routes: dispatch.disk,
+                        form: self.form,
+                    },
                     output,
                     contribute,
                 )?;

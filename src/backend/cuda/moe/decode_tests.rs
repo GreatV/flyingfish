@@ -376,56 +376,65 @@ fn invariant_decode(device: &Device) -> Result<()> {
                 }
             }
         }
-        let mut cpu_output = vec![bf16::ZERO; max_rows * k * h];
-        for r in 0..max_rows {
-            for c in 0..k {
-                let a = r * k + c;
-                let expert = ids[a] as usize;
-                let output = &mut cpu_output[a * h..(a + 1) * h];
-                if let Some(slot_layout) = slot {
-                    let start = expert * world.slot_bytes as usize;
-                    cpu::fp8_contribution(
-                        cpu::Isa::detect(),
-                        cpu::Fp8Contribution {
-                            shape: &shape,
-                            slot: &world.slots[start..start + world.slot_bytes as usize],
-                            slot_layout,
-                            hidden: &fx.x[r * h..(r + 1) * h],
-                            routing: weights[a],
+        let mut cpu_pass =
+            |isa: cpu::Isa, form: cpu::Form, cpu_output: &mut Vec<bf16>| -> Result<()> {
+                for r in 0..max_rows {
+                    for c in 0..k {
+                        let a = r * k + c;
+                        let expert = ids[a] as usize;
+                        let output = &mut cpu_output[a * h..(a + 1) * h];
+                        if let Some(slot_layout) = slot {
+                            let start = expert * world.slot_bytes as usize;
+                            cpu::fp8_contribution(
+                                isa,
+                                cpu::Fp8Contribution {
+                                    form,
+                                    shape: &shape,
+                                    slot: &world.slots[start..start + world.slot_bytes as usize],
+                                    slot_layout,
+                                    hidden: &fx.x[r * h..(r + 1) * h],
+                                    routing: weights[a],
 
-                            rounding: crate::model_spec::SwigluRounding::Twice,
-                            limit: 0.0,
-                            routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
-                        },
-                        output,
-                        &mut cpu_scratch,
-                    )?;
-                } else {
-                    cpu::contribution(
-                        cpu::Isa::detect(),
-                        cpu::Contribution {
-                            shape: &shape,
-                            arena: &arena,
-                            weights: &cpu::ExpertWeights {
-                                gate_up: expert * 2 * i * h..(expert + 1) * 2 * i * h,
-                                gate_up_stride: h,
-                                down: fx.gate_up.len() + expert * h * i
-                                    ..fx.gate_up.len() + (expert + 1) * h * i,
-                                down_stride: i,
-                            },
-                            hidden: &fx.x[r * h..(r + 1) * h],
-                            routing: weights[a],
+                                    rounding: crate::model_spec::SwigluRounding::Twice,
+                                    limit: 0.0,
+                                    routed_weight:
+                                        crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+                                },
+                                output,
+                                &mut cpu_scratch,
+                            )?;
+                        } else {
+                            cpu::contribution(
+                                isa,
+                                cpu::Contribution {
+                                    form,
+                                    shape: &shape,
+                                    arena: &arena,
+                                    weights: &cpu::ExpertWeights {
+                                        gate_up: expert * 2 * i * h..(expert + 1) * 2 * i * h,
+                                        gate_up_stride: h,
+                                        down: fx.gate_up.len() + expert * h * i
+                                            ..fx.gate_up.len() + (expert + 1) * h * i,
+                                        down_stride: i,
+                                    },
+                                    hidden: &fx.x[r * h..(r + 1) * h],
+                                    routing: weights[a],
 
-                            rounding: crate::model_spec::SwigluRounding::Twice,
-                            limit: 0.0,
-                            routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
-                        },
-                        output,
-                        &mut cpu_scratch,
-                    )?;
+                                    rounding: crate::model_spec::SwigluRounding::Twice,
+                                    limit: 0.0,
+                                    routed_weight:
+                                        crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+                                },
+                                output,
+                                &mut cpu_scratch,
+                            )?;
+                        }
+                    }
                 }
-            }
-        }
+                Ok(())
+            };
+        let mut cpu_output = vec![bf16::ZERO; max_rows * k * h];
+        cpu_pass(cpu::Isa::detect(), cpu::Form::Lane16, &mut cpu_output)?;
         let mismatches = cpu_output
             .iter()
             .zip(&serial[0])
@@ -457,6 +466,131 @@ fn invariant_decode(device: &Device) -> Result<()> {
         );
         println!(
             "PASS INVARIANT_MOE_CONTROL format={format:?} legacy_lane8=true bit_mismatches={mismatches}"
+        );
+        // Lane8 arm: the CPU must reproduce the production kernel's 8-lane 4/2/1 tree, not just
+        // the lane16 one. The legacy kernel traps above eight rows, so the arm stops there.
+        let mut legacy_serial: [Vec<bf16>; 3] = std::array::from_fn(|_| Vec::new());
+        for r in 0..max_rows {
+            let one = Gate {
+                ops: &legacy,
+                combine: gate.combine,
+                s: gate.s,
+                x: row(gate.x, r)?,
+                shared_gate: gate.shared_gate,
+                shared_up: gate.shared_up,
+                shared_down: gate.shared_down,
+                seg: gate.seg,
+                valid: gate.valid,
+                scratch: Scratch {
+                    ptr: gate.scratch.ptr,
+                    bytes: gate.scratch.bytes,
+                },
+                top_k: gate.top_k,
+                hidden: gate.hidden,
+                expert_inter: gate.expert_inter,
+                inter: gate.inter,
+            };
+            let route = Routing {
+                ids: row(routing.ids, r)?,
+                weights: row(routing.weights, r)?,
+                active: row(routing.active, r)?,
+                agen: row(routing.agen, r)?,
+                ..routing
+            };
+            for (all, values) in legacy_serial
+                .iter_mut()
+                .zip(one.stages(1, &route, slot, false)?)
+            {
+                all.extend(values);
+            }
+        }
+        for rows in 1..=8 {
+            for graph in [false, true] {
+                let values = Gate {
+                    ops: &legacy,
+                    scratch: Scratch {
+                        ptr: gate.scratch.ptr,
+                        bytes: gate.scratch.bytes,
+                    },
+                    ..gate
+                }
+                .stages(rows, &routing, slot, graph)?;
+                let mismatches = values
+                    .iter()
+                    .zip(&legacy_serial)
+                    .map(|(got, reference)| {
+                        got.iter()
+                            .zip(reference)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count()
+                    })
+                    .sum::<usize>();
+                defects += usize::from(mismatches != 0);
+                println!(
+                    "{} INVARIANT_MOE_LANE8_GPU format={format:?} rows={rows} graph={graph} bit_mismatches={mismatches}",
+                    if mismatches == 0 { "PASS" } else { "DEFECT" }
+                );
+            }
+        }
+        for isa in [cpu::Isa::Avx2, cpu::Isa::Avx512Bf16] {
+            if !isa.available() {
+                println!("INVARIANT_MOE_CPU_ISA_UNAVAILABLE isa={}", isa.name());
+                continue;
+            }
+            for (form, reference) in [
+                (cpu::Form::Lane16, &serial[0]),
+                (cpu::Form::Lane8, &legacy_serial[0]),
+            ] {
+                let mut forced = vec![bf16::ZERO; max_rows * k * h];
+                cpu_pass(isa, form, &mut forced)?;
+                let mismatches = forced
+                    .iter()
+                    .zip(reference)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                defects += usize::from(mismatches != 0);
+                println!(
+                    "{} INVARIANT_MOE_CPU_FORCED format={format:?} form={form:?} rows={max_rows} isa={} forced=true bit_mismatches={mismatches}",
+                    if mismatches == 0 { "PASS" } else { "DEFECT" },
+                    isa.name()
+                );
+            }
+        }
+        let mut cpu_lane8 = vec![bf16::ZERO; max_rows * k * h];
+        cpu_pass(cpu::Isa::detect(), cpu::Form::Lane8, &mut cpu_lane8)?;
+        let lane8_mismatches = cpu_lane8
+            .iter()
+            .zip(&legacy_serial[0])
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let lane16_vs_lane8 = cpu_output
+            .iter()
+            .zip(&cpu_lane8)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        println!("LANE16_VS_LANE8_CPU bit_mismatches={lane16_vs_lane8}");
+        for (index, (a, b)) in cpu_lane8.iter().zip(&legacy_serial[0]).enumerate() {
+            if a.to_bits() != b.to_bits() {
+                println!(
+                    "LANE8_FIRST_MISMATCH index={index} row={} choice={} dim={} cpu={} gpu={}",
+                    index / (k * h),
+                    (index / h) % k,
+                    index % h,
+                    a.to_f32(),
+                    b.to_f32()
+                );
+                break;
+            }
+        }
+        defects += usize::from(lane8_mismatches != 0);
+        println!(
+            "{} INVARIANT_MOE_CPU_LANE8 format={format:?} rows={max_rows} isa={} tree=4/2/1 bit_mismatches={lane8_mismatches}",
+            if lane8_mismatches == 0 {
+                "PASS"
+            } else {
+                "DEFECT"
+            },
+            cpu::Isa::detect().name()
         );
     }
     println!(

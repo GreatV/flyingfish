@@ -7,6 +7,7 @@ use super::{
 #[cfg(feature = "rocm")]
 use crate::backend::gpu::DevicePtr;
 use crate::backend::setup::CacheKey;
+use crate::cpu::expert_ffn::Form;
 #[cfg(feature = "cuda")]
 use crate::{
     backend::setup::{
@@ -823,6 +824,7 @@ pub(crate) const PEER_TRANSFER_BYTES: [u64; 3] = [4_096, 8 * 1024 * 1024, 68 * 1
 #[derive(Serialize, Deserialize)]
 struct ExpertCache {
     schema: u32,
+    form: Form,
     expert_format: crate::model_spec::ExpertFormat,
     slot_bytes: u64,
     key: CacheKey,
@@ -857,11 +859,17 @@ impl ExpertCache {
         host: &ExpertHost,
         geometry: &crate::experts::catalogue::ExpertGeometry,
         slot_bytes: u64,
+        form: Form,
     ) -> Result<ExpertCalibration> {
         ensure!(
-            self.schema == 3,
-            "expert calibration schema {} expected 3",
+            self.schema == 4,
+            "expert calibration schema {} expected 4",
             self.schema
+        );
+        ensure!(
+            self.form == form,
+            "expert calibration form {:?} expected {form:?}",
+            self.form
         );
         ensure!(
             self.slot_bytes == slot_bytes
@@ -1551,7 +1559,7 @@ fn expert_cache_path(dir: &Path, key: &CacheKey, identity: &str) -> PathBuf {
     let tag = key.tag();
     #[cfg(feature = "rocm")]
     let tag = super::closure::hash(tag.as_bytes());
-    dir.join(format!("experts-v3-{tag}-{identity}.json"))
+    dir.join(format!("experts-v4-{tag}-{identity}.json"))
 }
 
 pub(super) fn load_experts(
@@ -1559,6 +1567,7 @@ pub(super) fn load_experts(
     dir: &Path,
     geometry: crate::experts::catalogue::ExpertGeometry,
     expert_format: crate::model_spec::ExpertFormat,
+    form: Form,
     closure: &super::closure::Closure,
 ) -> Result<ExpertCalibration> {
     let slot_bytes =
@@ -1572,10 +1581,16 @@ pub(super) fn load_experts(
             &host,
             geometry,
             expert_format,
+            form,
             peer_key,
         ))?)
     } else {
-        super::closure::hash(&serde_json::to_vec(&(&host, geometry, expert_format))?)
+        super::closure::hash(&serde_json::to_vec(&(
+            &host,
+            geometry,
+            expert_format,
+            form,
+        ))?)
     };
     let path = expert_cache_path(dir, &key, &identity);
     let (cache, hit) = if closure.access(&path)? {
@@ -1639,9 +1654,11 @@ pub(super) fn load_experts(
             &EXPERT_SERVICE_ROWS,
             &missed,
             expert_format,
+            form,
         )?;
         let cache = ExpertCache {
-            schema: 3,
+            schema: 4,
+            form,
             expert_format,
             slot_bytes,
             key: key.clone(),
@@ -1656,7 +1673,7 @@ pub(super) fn load_experts(
             peer_transfers,
             service,
         };
-        cache.check(&key, peer_key.as_ref(), &host, &geometry, slot_bytes)?;
+        cache.check(&key, peer_key.as_ref(), &host, &geometry, slot_bytes, form)?;
         super::closure::write_cache(&path, &cache)?;
         (cache, false)
     };
@@ -1672,7 +1689,7 @@ pub(super) fn load_experts(
         "expert host registration profile differs from driver support={registration_supported} bytes={}",
         cache.host_registration_bytes
     );
-    let measured = cache.check(&key, peer_key.as_ref(), &host, &geometry, slot_bytes)?;
+    let measured = cache.check(&key, peer_key.as_ref(), &host, &geometry, slot_bytes, form)?;
     eprintln!(
         "{}",
         serde_json::json!({"expert_calibration":{"path":path,"cached":hit,"cells":cache,"h2d_bytes_per_second":measured.h2d_bytes_per_second,"d2h_bytes_per_second":measured.d2h_bytes_per_second,"peer_transfers":measured.peer_transfers}})
@@ -1766,7 +1783,7 @@ mod long_tests {
         #[cfg(feature = "cuda")]
         assert_eq!(
             expert_cache_path(Path::new(""), &key, "0123456789abcdef"),
-            PathBuf::from(format!("experts-v3-{}-0123456789abcdef.json", key.tag()))
+            PathBuf::from(format!("experts-v4-{}-0123456789abcdef.json", key.tag()))
         );
         let host = ExpertHost {
             cpu: "fixture".into(),
@@ -1789,7 +1806,8 @@ mod long_tests {
         )?
         .slot_bytes();
         let mut cache = ExpertCache {
-            schema: 3,
+            schema: 4,
+            form: Form::Lane16,
             expert_format: crate::model_spec::ExpertFormat::Bf16,
             slot_bytes,
             key: key.clone(),
@@ -1822,12 +1840,20 @@ mod long_tests {
                 })
                 .collect(),
         };
-        let measured = cache.check(&key, None, &host, &geometry, slot_bytes)?;
+        let serialized = serde_json::to_vec(&cache)?;
+        let decoded: ExpertCache = serde_json::from_slice(&serialized)?;
+        assert_eq!(decoded.form, Form::Lane16);
+        let mismatch = decoded
+            .check(&key, None, &host, &geometry, slot_bytes, Form::Lane8)
+            .err()
+            .context("mismatched expert calibration form accepted")?;
+        assert!(format!("{mismatch:#}").contains("expert calibration form"));
+        let measured = cache.check(&key, None, &host, &geometry, slot_bytes, Form::Lane16)?;
         cache.host_registration_bytes = 0;
         cache.host_registration_seconds = [0.001, 0.0, 0.0];
         assert_eq!(
             cache
-                .check(&key, None, &host, &geometry, slot_bytes)?
+                .check(&key, None, &host, &geometry, slot_bytes, Form::Lane16)?
                 .host_registration_bytes,
             0
         );
@@ -1838,7 +1864,7 @@ mod long_tests {
         let invalid_registration: ExpertCache = serde_json::from_value(invalid_registration)?;
         assert!(
             invalid_registration
-                .check(&key, None, &host, &geometry, slot_bytes)
+                .check(&key, None, &host, &geometry, slot_bytes, Form::Lane16)
                 .is_err()
         );
         assert_eq!(measured.host_registration_bytes, 16 * slot_bytes);
@@ -1846,7 +1872,7 @@ mod long_tests {
             cache.host_registration_seconds = seconds;
             assert!(
                 cache
-                    .check(&key, None, &host, &geometry, slot_bytes)
+                    .check(&key, None, &host, &geometry, slot_bytes, Form::Lane16)
                     .is_err()
             );
         }
@@ -1854,14 +1880,14 @@ mod long_tests {
         cache.expert_format = crate::model_spec::ExpertFormat::Fp8W8a16;
         assert!(
             cache
-                .check(&key, None, &host, &geometry, slot_bytes)
+                .check(&key, None, &host, &geometry, slot_bytes, Form::Lane16)
                 .is_err()
         );
         cache.expert_format = crate::model_spec::ExpertFormat::Bf16;
         cache.slot_bytes += 16;
         assert!(
             cache
-                .check(&key, None, &host, &geometry, slot_bytes)
+                .check(&key, None, &host, &geometry, slot_bytes, Form::Lane16)
                 .is_err()
         );
         cache.slot_bytes = slot_bytes;
@@ -1874,69 +1900,69 @@ mod long_tests {
         let cell = cache.service.remove(large);
         assert!(
             cache
-                .check(&key, None, &host, &geometry, slot_bytes)
+                .check(&key, None, &host, &geometry, slot_bytes, Form::Lane16)
                 .is_err()
         );
         cache.service.insert(large, cell);
         cache.transfers[0].d2h_seconds[0] = f64::NAN;
         assert!(
             cache
-                .check(&key, None, &host, &geometry, slot_bytes)
+                .check(&key, None, &host, &geometry, slot_bytes, Form::Lane16)
                 .is_err()
         );
         cache.transfers[0].d2h_seconds[0] = 0.0;
         assert!(
             cache
-                .check(&key, None, &host, &geometry, slot_bytes)
+                .check(&key, None, &host, &geometry, slot_bytes, Form::Lane16)
                 .is_err()
         );
         cache.transfers[0].d2h_seconds[0] = 0.002;
         cache.service[0].experts = 2;
         assert!(
             cache
-                .check(&key, None, &host, &geometry, slot_bytes)
+                .check(&key, None, &host, &geometry, slot_bytes, Form::Lane16)
                 .is_err()
         );
         cache.service[0].experts = 1;
         cache.copy_engines = 0;
         assert!(
             cache
-                .check(&key, None, &host, &geometry, slot_bytes)
+                .check(&key, None, &host, &geometry, slot_bytes, Form::Lane16)
                 .is_err()
         );
         cache.copy_engines = 2;
         cache.host.affinity = "2-3".into();
         assert!(
             cache
-                .check(&key, None, &host, &geometry, slot_bytes)
+                .check(&key, None, &host, &geometry, slot_bytes, Form::Lane16)
                 .is_err()
         );
         cache.host = host.clone();
         cache.geometry.hidden += 4;
         assert!(
             cache
-                .check(&key, None, &host, &geometry, slot_bytes)
+                .check(&key, None, &host, &geometry, slot_bytes, Form::Lane16)
                 .is_err()
         );
         cache.geometry = geometry;
         cache.key.binary_version = "changed".into();
         assert!(
             cache
-                .check(&key, None, &host, &geometry, slot_bytes)
+                .check(&key, None, &host, &geometry, slot_bytes, Form::Lane16)
                 .is_err()
         );
         cache.key = key.clone();
         cache.transfers[0].bytes -= 1;
         assert!(
             cache
-                .check(&key, None, &host, &geometry, slot_bytes)
+                .check(&key, None, &host, &geometry, slot_bytes, Form::Lane16)
                 .is_err()
         );
         cache.transfers[0].bytes += 1;
         cache.peer_key = Some(key.clone());
         assert!(
             cache
-                .check(&key, Some(&key), &host, &geometry, slot_bytes)
+                .check(&key, Some(&key), &host, &geometry, slot_bytes, Form::Lane16)
                 .is_err()
         );
         cache.peer_transfers = PEER_TRANSFER_BYTES
@@ -1946,7 +1972,8 @@ mod long_tests {
                 d2h_seconds: [0.002; 5],
             })
             .into();
-        let peer_measured = cache.check(&key, Some(&key), &host, &geometry, slot_bytes)?;
+        let peer_measured =
+            cache.check(&key, Some(&key), &host, &geometry, slot_bytes, Form::Lane16)?;
         assert_eq!(peer_measured.peer_transfers.len(), 3);
         Ok(())
     }
@@ -1979,6 +2006,7 @@ mod long_tests {
             &[1],
             &[1],
             crate::model_spec::ExpertFormat::Bf16,
+            Form::Lane8,
         )?;
         let table = crate::experts::plan::ServiceTable::new(&host.isa, cells)?;
         ensure!(
@@ -2046,6 +2074,7 @@ mod long_tests {
             &ExpertHost::read()?,
             &geometry,
             slot_bytes,
+            Form::Lane8,
         )?;
         let reader = super::super::closure::Closure::new(false, "calibrate".into());
         let reused = load_experts(
@@ -2053,6 +2082,7 @@ mod long_tests {
             &runtime,
             geometry,
             spec.expert_format.context("MoE expert_format missing")?,
+            Form::Lane8,
             &reader,
         )?;
         assert_eq!(measured.h2d_bytes_per_second, reused.h2d_bytes_per_second);
@@ -2113,6 +2143,27 @@ mod long_tests {
                 "scope":"calibration capacity probe; model weights and inference workspace not loaded"})
         );
         let mut invalid: ExpertCache = serde_json::from_slice(&bytes)?;
+        invalid.form = Form::Lane16;
+        std::fs::write(&path, serde_json::to_vec(&invalid)?)?;
+        let wrong_form = load_experts(
+            &device,
+            &runtime,
+            geometry,
+            spec.expert_format.context("MoE expert_format missing")?,
+            Form::Lane8,
+            &reader,
+        );
+        let error = wrong_form
+            .err()
+            .context("mismatched calibration form accepted at load")?;
+        ensure!(
+            format!("{error:#}").contains("expert calibration form"),
+            "unexpected calibration error: {error:#}"
+        );
+        println!(
+            "PASS expert_setup_form_control measured=Lane8 mismatched=Lane16 rejected={error}"
+        );
+        invalid.form = Form::Lane8;
         invalid.transfers[0].d2h_seconds[0] = 0.0;
         std::fs::write(&path, serde_json::to_vec(&invalid)?)?;
         let rejected = load_experts(
@@ -2120,6 +2171,7 @@ mod long_tests {
             &runtime,
             geometry,
             spec.expert_format.context("MoE expert_format missing")?,
+            Form::Lane8,
             &reader,
         );
         std::fs::write(&path, &bytes)?;

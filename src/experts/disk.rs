@@ -342,6 +342,7 @@ struct Work {
     swiglu_rounding: crate::model_spec::SwigluRounding,
     swiglu_limit: f32,
     routed_weight: crate::model_spec::RoutedWeightBoundary,
+    form: crate::cpu::expert_ffn::Form,
     output: Vec<bf16>,
 }
 
@@ -358,6 +359,14 @@ struct Worker {
 }
 
 /// Bounded native disk reads and CPU contributions, with one persistent reader per worker.
+pub struct Job<'a> {
+    pub layer: u32,
+    pub hidden: &'a [bf16],
+    pub rows: usize,
+    pub routes: &'a [crate::experts::runtime::Route],
+    pub form: crate::cpu::expert_ffn::Form,
+}
+
 pub struct DiskExperts {
     geometry: crate::experts::catalogue::ExpertGeometry,
     max_rows: usize,
@@ -466,6 +475,7 @@ impl DiskExperts {
                     swiglu_rounding,
                     swiglu_limit,
                     routed_weight,
+                    form: crate::cpu::expert_ffn::Form::Lane8,
                     output: vec![bf16::ZERO; elements],
                 }),
             });
@@ -485,13 +495,14 @@ impl DiskExperts {
         Ok(())
     }
 
-    pub fn start(
-        &mut self,
-        layer: u32,
-        hidden: &[bf16],
-        rows: usize,
-        routes: &[crate::experts::runtime::Route],
-    ) -> Result<()> {
+    pub fn start(&mut self, job: Job<'_>) -> Result<()> {
+        let Job {
+            layer,
+            hidden,
+            rows,
+            routes,
+            form,
+        } = job;
         self.check_ready()?;
         ensure!(
             layer < self.geometry.layers
@@ -525,6 +536,7 @@ impl DiskExperts {
         for (index, worker) in self.workers.iter_mut().enumerate() {
             let mut work = worker.work.take().expect("preflight checked reusable job");
             work.layer = layer;
+            work.form = form;
             work.hidden.clear();
             work.hidden.extend_from_slice(hidden);
             work.routes.clear();
@@ -556,14 +568,11 @@ impl DiskExperts {
 
     pub fn run(
         &mut self,
-        layer: u32,
-        hidden: &[bf16],
-        rows: usize,
-        routes: &[crate::experts::runtime::Route],
+        job: Job<'_>,
         output: &mut [bf16],
         contribute: impl FnOnce(&mut [bf16]) -> Result<()>,
     ) -> Result<()> {
-        self.start(layer, hidden, rows, routes)?;
+        self.start(job)?;
         let result = contribute(output);
         let disk = self.collect(if result.is_ok() { Some(output) } else { None });
         match (result, disk) {
@@ -686,6 +695,7 @@ fn disk_contributions<const FP8: bool>(
                         rounding: work.swiglu_rounding,
                         limit: work.swiglu_limit,
                         routed_weight: work.routed_weight,
+                        form: work.form,
                     },
                     vector,
                     scratch,
@@ -702,6 +712,7 @@ fn disk_contributions<const FP8: bool>(
                         rounding: work.swiglu_rounding,
                         limit: work.swiglu_limit,
                         routed_weight: work.routed_weight,
+                        form: work.form,
                     },
                     vector,
                     scratch,
@@ -1117,7 +1128,11 @@ mod tests {
         let hidden = (0..24)
             .map(|index| bf16::from_f32(((index * 11) % 29) as f32 / 32.0))
             .collect::<Vec<_>>();
-        for layer in [1, 0, 1] {
+        for (layer, form) in [
+            (1, crate::cpu::expert_ffn::Form::Lane8),
+            (0, crate::cpu::expert_ffn::Form::Lane16),
+            (1, crate::cpu::expert_ffn::Form::Lane8),
+        ] {
             let routes = [
                 Route {
                     row: 1,
@@ -1147,6 +1162,7 @@ mod tests {
                 contribution(
                     Isa::detect(),
                     Contribution {
+                        form,
                         shape: &shape,
                         arena: &values,
                         weights: &crate::cpu::expert_ffn::ExpertWeights::from_slot(
@@ -1165,11 +1181,32 @@ mod tests {
                 )?;
             }
             assert!(
-                pool.start(layer, &hidden, 3, &[routes[0], routes[0]])
-                    .is_err()
+                pool.start(Job {
+                    layer,
+                    hidden: &hidden,
+                    rows: 3,
+                    routes: &[routes[0], routes[0]],
+                    form
+                })
+                .is_err()
             );
-            pool.start(layer, &hidden, 3, &routes)?;
-            assert!(pool.start(layer, &hidden, 3, &routes).is_err());
+            pool.start(Job {
+                layer,
+                hidden: &hidden,
+                rows: 3,
+                routes: &routes,
+                form,
+            })?;
+            assert!(
+                pool.start(Job {
+                    layer,
+                    hidden: &hidden,
+                    rows: 3,
+                    routes: &routes,
+                    form
+                })
+                .is_err()
+            );
             pool.finish(&mut output)?;
             assert_eq!(output, expected);
             assert!(pool.finish(&mut output).is_err());
@@ -1190,20 +1227,50 @@ mod tests {
             weight: bf16::from_f32(0.5),
         });
         let mut expected = vec![bf16::ZERO; 16];
-        pool.run(0, &hidden, 1, &routes, &mut expected, |_| Ok(()))?;
+        pool.run(
+            Job {
+                layer: 0,
+                hidden: &hidden,
+                rows: 1,
+                routes: &routes,
+                form: crate::cpu::expert_ffn::Form::Lane8,
+            },
+            &mut expected,
+            |_| Ok(()),
+        )?;
         assert!(expected.iter().all(|value| value.to_f32().is_finite()));
         assert!(expected.iter().any(|&value| value != bf16::ZERO));
         for fault in ["ready_weights", "pool.run"] {
             let mut output = vec![bf16::from_f32(-99.0); 16];
             let error = pool
-                .run(0, &hidden, 1, &routes, &mut output, |_| bail!("{fault}"))
+                .run(
+                    Job {
+                        layer: 0,
+                        hidden: &hidden,
+                        rows: 1,
+                        routes: &routes,
+                        form: crate::cpu::expert_ffn::Form::Lane8,
+                    },
+                    &mut output,
+                    |_| bail!("{fault}"),
+                )
                 .expect_err("host error must be returned");
             assert!(format!("{error:#}").contains(fault));
             assert!(!pool.running);
             pool.check_ready()?;
             assert!(pool.workers.iter().all(|worker| worker.work.is_some()));
             assert!(output.iter().all(|&value| value == bf16::from_f32(-99.0)));
-            pool.run(0, &hidden, 1, &routes, &mut output, |_| Ok(()))?;
+            pool.run(
+                Job {
+                    layer: 0,
+                    hidden: &hidden,
+                    rows: 1,
+                    routes: &routes,
+                    form: crate::cpu::expert_ffn::Form::Lane8,
+                },
+                &mut output,
+                |_| Ok(()),
+            )?;
             assert_eq!(output, expected);
         }
         let path = dir.path().join("native.bin");
@@ -1211,9 +1278,17 @@ mod tests {
         std::fs::write(&path, [])?;
         let mut output = vec![bf16::ZERO; 16];
         let error = pool
-            .run(0, &hidden, 1, &routes, &mut output, |_| {
-                bail!("host failure")
-            })
+            .run(
+                Job {
+                    layer: 0,
+                    hidden: &hidden,
+                    rows: 1,
+                    routes: &routes,
+                    form: crate::cpu::expert_ffn::Form::Lane8,
+                },
+                &mut output,
+                |_| bail!("host failure"),
+            )
             .expect_err("host and disk errors must both be returned");
         let error = format!("{error:#}");
         assert!(
@@ -1223,7 +1298,17 @@ mod tests {
         assert!(!pool.running);
         assert!(pool.workers.iter().all(|worker| worker.work.is_some()));
         std::fs::write(&path, native)?;
-        pool.run(0, &hidden, 1, &routes, &mut output, |_| Ok(()))?;
+        pool.run(
+            Job {
+                layer: 0,
+                hidden: &hidden,
+                rows: 1,
+                routes: &routes,
+                form: crate::cpu::expert_ffn::Form::Lane8,
+            },
+            &mut output,
+            |_| Ok(()),
+        )?;
         assert_eq!(output, expected);
         Ok(())
     }
@@ -1238,12 +1323,30 @@ mod tests {
         let (input, receiver) = std::sync::mpsc::sync_channel(1);
         drop(receiver);
         stopped.input = Some(input);
-        assert!(pool.start(0, &[bf16::ZERO; 8], 1, &[]).is_err());
+        assert!(
+            pool.start(Job {
+                layer: 0,
+                hidden: &[bf16::ZERO; 8],
+                rows: 1,
+                routes: &[],
+                form: crate::cpu::expert_ffn::Form::Lane8
+            })
+            .is_err()
+        );
         assert!(!pool.running);
         assert!(pool.failed);
         assert!(pool.check_ready().is_err());
         assert!(pool.workers.iter().all(|worker| worker.work.is_some()));
-        assert!(pool.start(0, &[bf16::ZERO; 8], 1, &[]).is_err());
+        assert!(
+            pool.start(Job {
+                layer: 0,
+                hidden: &[bf16::ZERO; 8],
+                rows: 1,
+                routes: &[],
+                form: crate::cpu::expert_ffn::Form::Lane8
+            })
+            .is_err()
+        );
         Ok(())
     }
 
@@ -1251,7 +1354,13 @@ mod tests {
     fn disk_partial_finish_drains_other_workers() -> Result<()> {
         let (dir, catalogue) = native_workers("partial-finish")?;
         let mut pool = DiskExperts::new(catalogue, dir.path(), 2, 1)?;
-        pool.start(0, &[bf16::ZERO; 8], 1, &[])?;
+        pool.start(Job {
+            layer: 0,
+            hidden: &[bf16::ZERO; 8],
+            rows: 1,
+            routes: &[],
+            form: crate::cpu::expert_ffn::Form::Lane8,
+        })?;
         let (sender, output) = std::sync::mpsc::sync_channel(1);
         drop(sender);
         drop(std::mem::replace(&mut pool.workers[0].output, output));
@@ -1260,7 +1369,16 @@ mod tests {
         assert!(pool.failed);
         assert!(pool.check_ready().is_err());
         assert!(pool.workers[1].work.is_some());
-        assert!(pool.start(0, &[bf16::ZERO; 8], 1, &[]).is_err());
+        assert!(
+            pool.start(Job {
+                layer: 0,
+                hidden: &[bf16::ZERO; 8],
+                rows: 1,
+                routes: &[],
+                form: crate::cpu::expert_ffn::Form::Lane8
+            })
+            .is_err()
+        );
         Ok(())
     }
 
@@ -1276,13 +1394,25 @@ mod tests {
             expert,
             weight: bf16::from_f32(0.5),
         });
-        pool.start(0, &hidden, 1, &routes)?;
+        pool.start(Job {
+            layer: 0,
+            hidden: &hidden,
+            rows: 1,
+            routes: &routes,
+            form: crate::cpu::expert_ffn::Form::Lane8,
+        })?;
         assert!(pool.finish(&mut []).is_err());
         assert!(!pool.running);
         pool.check_ready()?;
         assert!(pool.workers.iter().all(|worker| worker.work.is_some()));
         let mut output = [bf16::ZERO; 16];
-        pool.start(0, &hidden, 1, &routes)?;
+        pool.start(Job {
+            layer: 0,
+            hidden: &hidden,
+            rows: 1,
+            routes: &routes,
+            form: crate::cpu::expert_ffn::Form::Lane8,
+        })?;
         pool.finish(&mut output)?;
         assert!(output.iter().any(|&value| value != bf16::ZERO));
         Ok(())
@@ -1339,7 +1469,11 @@ mod tests {
         let hidden = (0..3 * shape.hidden)
             .map(|k| bf16::from_f32(((k * 11 % 29) as f32 - 13.0) / 32.0))
             .collect::<Vec<_>>();
-        for layer in [1, 0, 1] {
+        for (layer, form) in [
+            (1, crate::cpu::expert_ffn::Form::Lane8),
+            (0, crate::cpu::expert_ffn::Form::Lane16),
+            (1, crate::cpu::expert_ffn::Form::Lane8),
+        ] {
             let routes = [(1, 5, 3, 0.25), (0, 1, 0, 0.5), (2, 4, 3, 0.75)].map(
                 |(row, choice, expert, weight)| Route {
                     row,
@@ -1356,6 +1490,7 @@ mod tests {
                 fp8_contribution(
                     Isa::Scalar,
                     Fp8Contribution {
+                        form,
                         shape: &shape,
                         slot: native_bytes(&values),
                         slot_layout: catalogue.layout().fp8_slot().context("FP8 fixture slot")?,
@@ -1369,7 +1504,13 @@ mod tests {
                     &mut scratch,
                 )?;
             }
-            pool.start(layer, &hidden, 3, &routes)?;
+            pool.start(Job {
+                layer,
+                hidden: &hidden,
+                rows: 3,
+                routes: &routes,
+                form,
+            })?;
             pool.finish(&mut actual)?;
             assert_eq!(
                 actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),

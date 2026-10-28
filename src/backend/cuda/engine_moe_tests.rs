@@ -1847,6 +1847,7 @@ impl TierOracle {
                 fp8_contribution(
                     Isa::detect(),
                     Fp8Contribution {
+                        form: crate::cpu::expert_ffn::Form::Lane16,
                         shape: &shape,
                         slot: native_bytes(&values),
                         slot_layout,
@@ -1864,6 +1865,7 @@ impl TierOracle {
                 contribution(
                     Isa::detect(),
                     Contribution {
+                        form: crate::cpu::expert_ffn::Form::Lane16,
                         shape: &shape,
                         arena: &values,
                         weights: &native,
@@ -2627,6 +2629,7 @@ fn cpu_control(
         contribution(
             Isa::detect(),
             Contribution {
+                form: crate::cpu::expert_ffn::Form::Lane16,
                 shape: &shape,
                 arena: lease.read(expert)?,
                 weights: &local,

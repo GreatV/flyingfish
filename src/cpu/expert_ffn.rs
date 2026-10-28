@@ -13,6 +13,33 @@ use std::thread::{self, JoinHandle};
 /// Partial-sum lanes shared by every arm; the scalar arm defines this order.
 const LANES: usize = 16;
 
+/// The reduction form the GPU kernel would select for these rows. `Lane16` is the draft-attached
+/// lane16 kernel: 16 lanes, each accumulating one element per 16, reduced by the 1/2/4/8 pairwise
+/// tree. `Lane8` is the production kernel: 8 lanes, each accumulating one 8-element vector per 8,
+/// reduced by the 4/2/1 group tree. Both round differently, so the CPU must not mix them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Form {
+    Lane16,
+    Lane8,
+}
+
+impl Form {
+    /// The GPU tree for this form: pairwise 1/2/4/8 for `Lane16`, group 4/2/1 for `Lane8`.
+    fn reduce(self, lanes: &mut [f32; LANES]) -> f32 {
+        match self {
+            Self::Lane16 => pairwise(lanes),
+            Self::Lane8 => group_sum(&lanes[..LANES / 2]),
+        }
+    }
+}
+
+/// The production kernel's group tree: `v += shfl_down(v, 4)`, then 2, then 1.
+fn group_sum(lanes: &[f32]) -> f32 {
+    assert_eq!(lanes.len(), LANES / 2, "group tree needs eight lanes");
+    ((lanes[0] + lanes[4]) + (lanes[2] + lanes[6]))
+        + ((lanes[1] + lanes[5]) + (lanes[3] + lanes[7]))
+}
+
 /// Spin rounds a parked worker and the calling thread run before they block.
 const SPIN_ROUNDS: u32 = 65_536;
 
@@ -33,6 +60,7 @@ fn silu_mul_value(
     up: bf16,
     rounding: crate::model_spec::SwigluRounding,
     limit: f32,
+    form: Form,
 ) -> f32 {
     let (gate, up) = match rounding {
         crate::model_spec::SwigluRounding::ClampedTwice
@@ -43,12 +71,11 @@ fn silu_mul_value(
             (gate.to_f32(), up.to_f32())
         }
     };
-    let silu = match rounding {
-        crate::model_spec::SwigluRounding::Twice | crate::model_spec::SwigluRounding::Once => {
-            gate * (1.0 / (1.0 + (-gate).exp()))
-        }
-        crate::model_spec::SwigluRounding::ClampedTwice
-        | crate::model_spec::SwigluRounding::ClampedOnce => gate / (1.0 + (-gate).exp()),
+    // The lane16 kernel computes `g * (1/(1+exp(-g)))`; the production kernel computes
+    // `g / (1+exp(-g))`. The two round differently, so the form selects the expression.
+    let silu = match form {
+        Form::Lane16 => gate * (1.0 / (1.0 + (-gate).exp())),
+        Form::Lane8 => gate / (1.0 + (-gate).exp()),
     };
     match rounding {
         crate::model_spec::SwigluRounding::Twice
@@ -64,9 +91,12 @@ pub fn silu_mul(
     up: bf16,
     rounding: crate::model_spec::SwigluRounding,
     limit: f32,
+    form: Form,
 ) -> Result<bf16> {
     validate_swiglu(rounding, limit)?;
-    Ok(bf16::from_f32(silu_mul_value(gate, up, rounding, limit)))
+    Ok(bf16::from_f32(silu_mul_value(
+        gate, up, rounding, limit, form,
+    )))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,7 +149,7 @@ impl Isa {
         }
     }
 
-    fn available(self) -> bool {
+    pub(crate) fn available(self) -> bool {
         match self {
             Self::Scalar => true,
             #[cfg(target_arch = "x86_64")]
@@ -280,14 +310,27 @@ impl Scratch {
     }
 }
 
-type DotFn = unsafe fn(&[f32], &[bf16]) -> f32;
-type Fp8DotFn = unsafe fn(&[f32], &[u8], bf16) -> f32;
-type GateUpFn = unsafe fn(&[f32], &[usize], &[bf16], &[bf16], &mut [(f32, f32)]);
-type Fp8GateUpFn =
-    unsafe fn(&[f32], &[usize], &[u8], &[u8], (bf16, bf16), &mut [(f32, f32)], &mut [f32]);
-type DownRowsFn = unsafe fn(&[f32], &[usize], &[bf16], &mut [f32]);
-type Fp8DownRowsFn = unsafe fn(&[f32], &[usize], &[u8], bf16, &mut [f32], &mut [f32]);
-type RoundFn = unsafe fn(&[f32], &mut [bf16]);
+/// The arm and the reduction form it must use; the form is engine state, not shape state.
+#[derive(Clone, Copy)]
+struct Plan {
+    arm: &'static Arm,
+    form: Form,
+}
+
+/// One FP8 gate/up code pair and the scratch its weights are decoded into.
+struct Fp8Pair<'a> {
+    gate: &'a [u8],
+    up: &'a [u8],
+    scratch_w: &'a mut [f32],
+}
+
+type DotFn = unsafe fn(&[f32], &[bf16], Form) -> f32;
+type Fp8DotFn = unsafe fn(&[f32], &[u8], bf16, Form) -> f32;
+type GateUpFn = unsafe fn(&[f32], &[usize], &[bf16], &[bf16], &mut [(f32, f32)], Form);
+type Fp8GateUpFn = unsafe fn(&[f32], &[usize], Fp8Pair<'_>, (bf16, bf16), &mut [(f32, f32)], Form);
+type DownRowsFn = unsafe fn(&[f32], &[usize], &[bf16], &mut [f32], Form);
+type Fp8DownRowsFn = unsafe fn(&[f32], &[usize], &[u8], bf16, &mut [f32], &mut [f32], Form);
+type RoundFn = unsafe fn(&[f32], &mut [bf16], Form);
 
 struct Arm {
     dot: DotFn,
@@ -344,6 +387,8 @@ pub struct Contribution<'a> {
     pub rounding: crate::model_spec::SwigluRounding,
     pub limit: f32,
     pub routed_weight: crate::model_spec::RoutedWeightBoundary,
+    /// The GPU reduction form this contribution must reproduce.
+    pub form: Form,
 }
 
 /// One `(row, choice)` contribution with the model-definition BF16 boundaries.
@@ -376,6 +421,7 @@ fn compute(arm: &Arm, input: Contribution<'_>, out: &mut [bf16], scratch: &mut S
         rounding,
         limit,
         routed_weight,
+        form,
     } = input;
     let (hidden_width, intermediate) = (shape.hidden, shape.intermediate);
     for (value, source) in scratch.hidden.iter_mut().zip(hidden) {
@@ -388,19 +434,20 @@ fn compute(arm: &Arm, input: Contribution<'_>, out: &mut [bf16], scratch: &mut S
         let gate = &gate_up[j * weights.gate_up_stride..][..hidden_width];
         let up = &gate_up[(intermediate + j) * weights.gate_up_stride..][..hidden_width];
         // SAFETY: the arm was selected by `Isa::detect` or checked by `Isa::available`.
-        unsafe { (arm.gate_up)(&scratch.hidden, &offsets, gate, up, &mut pair) };
+        unsafe { (arm.gate_up)(&scratch.hidden, &offsets, gate, up, &mut pair, form) };
         scratch.gate[j] = pair[0].0;
         scratch.up[j] = pair[0].1;
     }
     // SAFETY: as above.
-    unsafe { (arm.round)(&scratch.gate, &mut scratch.gate_bf) };
+    unsafe { (arm.round)(&scratch.gate, &mut scratch.gate_bf, form) };
     // SAFETY: as above.
-    unsafe { (arm.round)(&scratch.up, &mut scratch.up_bf) };
+    unsafe { (arm.round)(&scratch.up, &mut scratch.up_bf, form) };
     for j in 0..intermediate {
-        scratch.product[j] = silu_mul_value(scratch.gate_bf[j], scratch.up_bf[j], rounding, limit);
+        scratch.product[j] =
+            silu_mul_value(scratch.gate_bf[j], scratch.up_bf[j], rounding, limit, form);
     }
     // SAFETY: as above.
-    unsafe { (arm.round)(&scratch.product, &mut scratch.activated) };
+    unsafe { (arm.round)(&scratch.product, &mut scratch.activated, form) };
     for (value, source) in scratch.activated_f.iter_mut().zip(&scratch.activated) {
         *value = f32::from(*source);
     }
@@ -408,13 +455,13 @@ fn compute(arm: &Arm, input: Contribution<'_>, out: &mut [bf16], scratch: &mut S
     for k in 0..hidden_width {
         let row = &down[k * weights.down_stride..][..intermediate];
         // SAFETY: as above.
-        scratch.down[k] = unsafe { (arm.dot)(&scratch.activated_f, row) };
+        scratch.down[k] = unsafe { (arm.dot)(&scratch.activated_f, row, form) };
     }
     let weight = f32::from(routing);
     match routed_weight {
         crate::model_spec::RoutedWeightBoundary::AfterDownBf16 => {
             // SAFETY: as above.
-            unsafe { (arm.round)(&scratch.down, &mut scratch.down_bf) };
+            unsafe { (arm.round)(&scratch.down, &mut scratch.down_bf, form) };
             for (value, source) in scratch.weighted.iter_mut().zip(&scratch.down_bf) {
                 *value = f32::from(*source) * weight;
             }
@@ -429,7 +476,7 @@ fn compute(arm: &Arm, input: Contribution<'_>, out: &mut [bf16], scratch: &mut S
         }
     }
     // SAFETY: as above.
-    unsafe { (arm.round)(&scratch.weighted, out) };
+    unsafe { (arm.round)(&scratch.weighted, out, form) };
 }
 
 /// One routed-expert contribution over one native FP8 slot: E4M3 weights scaled per output
@@ -443,6 +490,8 @@ pub struct Fp8Contribution<'a> {
     pub rounding: crate::model_spec::SwigluRounding,
     pub limit: f32,
     pub routed_weight: crate::model_spec::RoutedWeightBoundary,
+    /// The GPU reduction form this contribution must reproduce.
+    pub form: Form,
 }
 
 struct Fp8Rows<'a> {
@@ -509,7 +558,10 @@ pub fn fp8_contribution(
     scratch.check(input.shape)?;
     validate_swiglu(input.rounding, input.limit)?;
     compute_fp8(
-        arm_for(isa)?,
+        Plan {
+            arm: arm_for(isa)?,
+            form: input.form,
+        },
         input.shape,
         rows,
         input.hidden,
@@ -521,7 +573,7 @@ pub fn fp8_contribution(
 }
 
 fn compute_fp8(
-    arm: &Arm,
+    plan: Plan,
     shape: &Shape,
     rows: Fp8Rows<'_>,
     hidden: &[bf16],
@@ -529,6 +581,7 @@ fn compute_fp8(
     out: &mut [bf16],
     scratch: &mut Scratch,
 ) {
+    let Plan { arm, form } = plan;
     let (hidden_width, intermediate) = (shape.hidden, shape.intermediate);
     for (value, source) in scratch.hidden.iter_mut().zip(hidden) {
         *value = f32::from(*source);
@@ -543,44 +596,54 @@ fn compute_fp8(
             (arm.gate_up_e4m3)(
                 &scratch.hidden,
                 &offsets,
-                gate,
-                up,
+                Fp8Pair {
+                    gate,
+                    up,
+                    scratch_w: &mut scratch.down,
+                },
                 (row_scale(rows.gate_scale, j), row_scale(rows.up_scale, j)),
                 &mut pair,
-                &mut scratch.down,
+                form,
             );
         }
         scratch.gate[j] = pair[0].0;
         scratch.up[j] = pair[0].1;
     }
     // SAFETY: as above.
-    unsafe { (arm.round)(&scratch.gate, &mut scratch.gate_bf) };
+    unsafe { (arm.round)(&scratch.gate, &mut scratch.gate_bf, form) };
     // SAFETY: as above.
-    unsafe { (arm.round)(&scratch.up, &mut scratch.up_bf) };
+    unsafe { (arm.round)(&scratch.up, &mut scratch.up_bf, form) };
     for j in 0..intermediate {
         scratch.product[j] = silu_mul_value(
             scratch.gate_bf[j],
             scratch.up_bf[j],
             rows.rounding,
             rows.limit,
+            form,
         );
     }
     // SAFETY: as above.
-    unsafe { (arm.round)(&scratch.product, &mut scratch.activated) };
+    unsafe { (arm.round)(&scratch.product, &mut scratch.activated, form) };
     for (value, source) in scratch.activated_f.iter_mut().zip(&scratch.activated) {
         *value = f32::from(*source);
     }
     for k in 0..hidden_width {
         let row = &rows.down[k * intermediate..][..intermediate];
         // SAFETY: as above.
-        scratch.down[k] =
-            unsafe { (arm.dot_e4m3)(&scratch.activated_f, row, row_scale(rows.down_scale, k)) };
+        scratch.down[k] = unsafe {
+            (arm.dot_e4m3)(
+                &scratch.activated_f,
+                row,
+                row_scale(rows.down_scale, k),
+                form,
+            )
+        };
     }
     let weight = f32::from(routing);
     match rows.routed_weight {
         crate::model_spec::RoutedWeightBoundary::AfterDownBf16 => {
             // SAFETY: as above.
-            unsafe { (arm.round)(&scratch.down, &mut scratch.down_bf) };
+            unsafe { (arm.round)(&scratch.down, &mut scratch.down_bf, form) };
             for (value, source) in scratch.weighted.iter_mut().zip(&scratch.down_bf) {
                 *value = f32::from(*source) * weight;
             }
@@ -595,7 +658,7 @@ fn compute_fp8(
         }
     }
     // SAFETY: as above.
-    unsafe { (arm.round)(&scratch.weighted, out) };
+    unsafe { (arm.round)(&scratch.weighted, out, form) };
 }
 
 fn pairwise(lanes: &[f32; LANES]) -> f32 {
@@ -606,42 +669,93 @@ fn pairwise(lanes: &[f32; LANES]) -> f32 {
     low + high
 }
 
-fn scalar_dot(x: &[f32], weights: &[bf16]) -> f32 {
+fn scalar_dot(x: &[f32], weights: &[bf16], form: Form) -> f32 {
     assert_eq!(x.len(), weights.len(), "dot operand width mismatch");
     let mut lanes = [0f32; LANES];
-    let mut k = 0;
-    while k + LANES <= x.len() {
-        for lane in 0..LANES {
-            lanes[lane] = x[k + lane].mul_add(f32::from(weights[k + lane]), lanes[lane]);
+    match form {
+        Form::Lane16 => {
+            let mut k = 0;
+            while k + LANES <= x.len() {
+                for lane in 0..LANES {
+                    lanes[lane] = x[k + lane].mul_add(f32::from(weights[k + lane]), lanes[lane]);
+                }
+                k += LANES;
+            }
+            while k < x.len() {
+                let lane = k % LANES;
+                lanes[lane] = x[k].mul_add(f32::from(weights[k]), lanes[lane]);
+                k += 1;
+            }
         }
-        k += LANES;
+        Form::Lane8 => {
+            // The production kernel: lane L owns the 8-element vector at v = L, L+8, ...; each
+            // vector is summed in index order from zero, then added to the lane accumulator.
+            let vectors = x.len() / (LANES / 2);
+            let mut accs = [0.0f32; LANES / 2];
+            for v in 0..vectors {
+                let mut inner = 0.0f32;
+                for step in 0..LANES / 2 {
+                    let index = v * (LANES / 2) + step;
+                    inner = x[index].mul_add(f32::from(weights[index]), inner);
+                }
+                accs[v % (LANES / 2)] += inner;
+            }
+            for (lane, value) in lanes.iter_mut().zip(accs) {
+                *lane = value;
+            }
+            let mut k = vectors * (LANES / 2);
+            while k < x.len() {
+                let lane = k % (LANES / 2);
+                lanes[lane] = x[k].mul_add(f32::from(weights[k]), lanes[lane]);
+                k += 1;
+            }
+        }
     }
-    while k < x.len() {
-        let lane = k % LANES;
-        lanes[lane] = x[k].mul_add(f32::from(weights[k]), lanes[lane]);
-        k += 1;
-    }
-    pairwise(&lanes)
+    form.reduce(&mut lanes)
 }
 
-fn scalar_dot_e4m3(x: &[f32], codes: &[u8], scale: bf16) -> f32 {
+fn scalar_dot_e4m3(x: &[f32], codes: &[u8], scale: bf16, form: Form) -> f32 {
     assert_eq!(x.len(), codes.len(), "dot operand width mismatch");
     let mut lanes = [0f32; LANES];
-    let mut k = 0;
-    while k + LANES <= x.len() {
-        for lane in 0..LANES {
-            let weight = f32::from(crate::fp8::effective_weight(codes[k + lane], scale));
-            lanes[lane] = x[k + lane].mul_add(weight, lanes[lane]);
+    let weight = |index: usize| f32::from(crate::fp8::effective_weight(codes[index], scale));
+    match form {
+        Form::Lane16 => {
+            let mut k = 0;
+            while k + LANES <= x.len() {
+                for lane in 0..LANES {
+                    lanes[lane] = x[k + lane].mul_add(weight(k + lane), lanes[lane]);
+                }
+                k += LANES;
+            }
+            while k < x.len() {
+                let lane = k % LANES;
+                lanes[lane] = x[k].mul_add(weight(k), lanes[lane]);
+                k += 1;
+            }
         }
-        k += LANES;
+        Form::Lane8 => {
+            let vectors = x.len() / (LANES / 2);
+            let mut accs = [0.0f32; LANES / 2];
+            for v in 0..vectors {
+                let mut inner = 0.0f32;
+                for step in 0..LANES / 2 {
+                    let index = v * (LANES / 2) + step;
+                    inner = x[index].mul_add(weight(index), inner);
+                }
+                accs[v % (LANES / 2)] += inner;
+            }
+            for (lane, value) in lanes.iter_mut().zip(accs) {
+                *lane = value;
+            }
+            let mut k = vectors * (LANES / 2);
+            while k < x.len() {
+                let lane = k % (LANES / 2);
+                lanes[lane] = x[k].mul_add(weight(k), lanes[lane]);
+                k += 1;
+            }
+        }
     }
-    while k < x.len() {
-        let lane = k % LANES;
-        let weight = f32::from(crate::fp8::effective_weight(codes[k], scale));
-        lanes[lane] = x[k].mul_add(weight, lanes[lane]);
-        k += 1;
-    }
-    pairwise(&lanes)
+    form.reduce(&mut lanes)
 }
 
 fn scalar_gate_up(
@@ -650,25 +764,30 @@ fn scalar_gate_up(
     gate: &[bf16],
     up: &[bf16],
     out: &mut [(f32, f32)],
+    form: Form,
 ) {
     let width = gate.len();
     assert_eq!(width, up.len(), "gate/up width mismatch");
     assert_eq!(row_offsets.len(), out.len(), "gate/up row count mismatch");
     for (&offset, dst) in row_offsets.iter().zip(out.iter_mut()) {
         let x = &x_buf[offset..offset + width];
-        *dst = (scalar_dot(x, gate), scalar_dot(x, up));
+        *dst = (scalar_dot(x, gate, form), scalar_dot(x, up, form));
     }
 }
 
 fn scalar_gate_up_e4m3(
     x_buf: &[f32],
     row_offsets: &[usize],
-    gate: &[u8],
-    up: &[u8],
+    pair: Fp8Pair<'_>,
     (gate_scale, up_scale): (bf16, bf16),
     out: &mut [(f32, f32)],
-    scratch_w: &mut [f32],
+    form: Form,
 ) {
+    let Fp8Pair {
+        gate,
+        up,
+        scratch_w,
+    } = pair;
     let width = gate.len();
     assert_eq!(width, up.len(), "gate/up width mismatch");
     assert_eq!(row_offsets.len(), out.len(), "gate/up row count mismatch");
@@ -679,17 +798,23 @@ fn scalar_gate_up_e4m3(
     for (&offset, dst) in row_offsets.iter().zip(out.iter_mut()) {
         let x = &x_buf[offset..offset + width];
         *dst = (
-            scalar_dot_e4m3(x, gate, gate_scale),
-            scalar_dot_e4m3(x, up, up_scale),
+            scalar_dot_e4m3(x, gate, gate_scale, form),
+            scalar_dot_e4m3(x, up, up_scale, form),
         );
     }
 }
 
-fn scalar_down_rows(x_buf: &[f32], row_offsets: &[usize], down: &[bf16], out: &mut [f32]) {
+fn scalar_down_rows(
+    x_buf: &[f32],
+    row_offsets: &[usize],
+    down: &[bf16],
+    out: &mut [f32],
+    form: Form,
+) {
     let width = down.len();
     assert_eq!(row_offsets.len(), out.len(), "down row count mismatch");
     for (&offset, dst) in row_offsets.iter().zip(out.iter_mut()) {
-        *dst = scalar_dot(&x_buf[offset..offset + width], down);
+        *dst = scalar_dot(&x_buf[offset..offset + width], down, form);
     }
 }
 
@@ -700,6 +825,7 @@ fn scalar_down_rows_e4m3(
     down_scale: bf16,
     out: &mut [f32],
     scratch_w: &mut [f32],
+    form: Form,
 ) {
     let width = down.len();
     assert_eq!(row_offsets.len(), out.len(), "down row count mismatch");
@@ -708,11 +834,11 @@ fn scalar_down_rows_e4m3(
         "down_rows_e4m3 scratch_w smaller than width"
     );
     for (&offset, dst) in row_offsets.iter().zip(out.iter_mut()) {
-        *dst = scalar_dot_e4m3(&x_buf[offset..offset + width], down, down_scale);
+        *dst = scalar_dot_e4m3(&x_buf[offset..offset + width], down, down_scale, form);
     }
 }
 
-fn scalar_round(values: &[f32], out: &mut [bf16]) {
+fn scalar_round(values: &[f32], out: &mut [bf16], _form: Form) {
     assert_eq!(values.len(), out.len(), "round operand width mismatch");
     for (value, target) in values.iter().zip(out.iter_mut()) {
         *target = bf16::from_f32(*value);
@@ -721,11 +847,95 @@ fn scalar_round(values: &[f32], out: &mut [bf16]) {
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::{Arm, LANES, bf16, pairwise};
+    use super::{Arm, Form, Fp8Pair, LANES, bf16};
     use std::arch::x86_64::*;
 
+    /// Input row r contains GPU lane r's eight consecutive dot elements.
     #[target_feature(enable = "avx2,fma")]
-    pub(super) unsafe fn dot(x: &[f32], weights: &[bf16]) -> f32 {
+    unsafe fn transpose8(rows: [__m256; 8]) -> [__m256; 8] {
+        let mut pairs = [_mm256_setzero_ps(); 8];
+        for j in 0..4 {
+            pairs[2 * j] = _mm256_unpacklo_ps(rows[2 * j], rows[2 * j + 1]);
+            pairs[2 * j + 1] = _mm256_unpackhi_ps(rows[2 * j], rows[2 * j + 1]);
+        }
+        let mut quads = [_mm256_setzero_ps(); 8];
+        for j in 0..2 {
+            let b = j * 4;
+            quads[b] = _mm256_shuffle_ps::<0x44>(pairs[b], pairs[b + 2]);
+            quads[b + 1] = _mm256_shuffle_ps::<0xee>(pairs[b], pairs[b + 2]);
+            quads[b + 2] = _mm256_shuffle_ps::<0x44>(pairs[b + 1], pairs[b + 3]);
+            quads[b + 3] = _mm256_shuffle_ps::<0xee>(pairs[b + 1], pairs[b + 3]);
+        }
+        let mut cols = [_mm256_setzero_ps(); 8];
+        for j in 0..4 {
+            cols[j] = _mm256_permute2f128_ps::<0x20>(quads[j], quads[j + 4]);
+            cols[j + 4] = _mm256_permute2f128_ps::<0x31>(quads[j], quads[j + 4]);
+        }
+        cols
+    }
+
+    /// Each SIMD element is one GPU lane; each dot8 starts at zero before its lane add.
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn lane8_partials(x: &[f32], mut load: impl FnMut(usize) -> __m256) -> [f32; LANES] {
+        let mut acc = _mm256_setzero_ps();
+        let mut k = 0;
+        while k + 8 <= x.len() {
+            let count = ((x.len() - k) / 8).min(8);
+            let mut xs = [_mm256_setzero_ps(); 8];
+            let mut ws = [_mm256_setzero_ps(); 8];
+            for j in 0..count {
+                xs[j] = unsafe { _mm256_loadu_ps(x.as_ptr().add(k + j * 8)) };
+                ws[j] = load(k + j * 8);
+            }
+            let xs = unsafe { transpose8(xs) };
+            let ws = unsafe { transpose8(ws) };
+            let mut chain = _mm256_setzero_ps();
+            for j in 0..8 {
+                chain = _mm256_fmadd_ps(xs[j], ws[j], chain);
+            }
+            acc = _mm256_add_ps(acc, chain);
+            k += count * 8;
+        }
+        let mut lanes = [0.0; LANES];
+        unsafe { _mm256_storeu_ps(lanes.as_mut_ptr(), acc) };
+        lanes
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn dot_lane8(x: &[f32], weights: &[bf16]) -> f32 {
+        assert_eq!(x.len(), weights.len(), "dot operand width mismatch");
+        let mut lanes = unsafe { lane8_partials(x, |k| widen8(weights.as_ptr().add(k))) };
+        for k in (x.len() / 8 * 8)..x.len() {
+            lanes[k % 8] = x[k].mul_add(weights[k].to_f32(), lanes[k % 8]);
+        }
+        Form::Lane8.reduce(&mut lanes)
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn dot_e4m3_lane8(x: &[f32], codes: &[u8], scale: bf16) -> f32 {
+        assert_eq!(x.len(), codes.len(), "dot operand width mismatch");
+        let factor = _mm256_set1_ps(scale.to_f32());
+        let mut lanes = unsafe {
+            lane8_partials(x, |k| {
+                let raw = _mm_loadl_epi64(codes.as_ptr().add(k).cast());
+                let mut packed = [0u8; 16];
+                _mm_storeu_si128(packed.as_mut_ptr().cast(), raw);
+                let (w, _) = decode16_scaled(packed.as_ptr(), factor);
+                w
+            })
+        };
+        for k in (x.len() / 8 * 8)..x.len() {
+            let weight = crate::fp8::effective_weight(codes[k], scale).to_f32();
+            lanes[k % 8] = x[k].mul_add(weight, lanes[k % 8]);
+        }
+        Form::Lane8.reduce(&mut lanes)
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn dot(x: &[f32], weights: &[bf16], form: Form) -> f32 {
+        if form == Form::Lane8 {
+            return unsafe { dot_lane8(x, weights) };
+        }
         assert_eq!(x.len(), weights.len(), "dot operand width mismatch");
         let mut low = _mm256_setzero_ps();
         let mut high = _mm256_setzero_ps();
@@ -739,7 +949,7 @@ mod x86 {
             }
             k += LANES;
         }
-        unsafe { reduce_pair(low, high, x, weights, k) }
+        unsafe { reduce_pair(low, high, x, weights, k, form) }
     }
 
     #[target_feature(enable = "avx2,fma")]
@@ -749,6 +959,7 @@ mod x86 {
         x: &[f32],
         weights: &[bf16],
         mut k: usize,
+        form: Form,
     ) -> f32 {
         let mut lanes = [0f32; LANES];
         unsafe {
@@ -760,7 +971,7 @@ mod x86 {
             lanes[lane] = x[k].mul_add(f32::from(weights[k]), lanes[lane]);
             k += 1;
         }
-        pairwise(&lanes)
+        form.reduce(&mut lanes)
     }
 
     #[target_feature(enable = "avx2,fma")]
@@ -771,6 +982,7 @@ mod x86 {
         codes: &[u8],
         scale: bf16,
         mut k: usize,
+        form: Form,
     ) -> f32 {
         let mut lanes = [0f32; LANES];
         unsafe {
@@ -783,7 +995,7 @@ mod x86 {
             lanes[lane] = x[k].mul_add(weight, lanes[lane]);
             k += 1;
         }
-        pairwise(&lanes)
+        form.reduce(&mut lanes)
     }
 
     #[target_feature(enable = "avx2,fma")]
@@ -851,7 +1063,10 @@ mod x86 {
     }
 
     #[target_feature(enable = "avx2,fma")]
-    pub(super) unsafe fn dot_e4m3(x: &[f32], codes: &[u8], scale: bf16) -> f32 {
+    pub(super) unsafe fn dot_e4m3(x: &[f32], codes: &[u8], scale: bf16, form: Form) -> f32 {
+        if form == Form::Lane8 {
+            return unsafe { dot_e4m3_lane8(x, codes, scale) };
+        }
         assert_eq!(x.len(), codes.len(), "dot operand width mismatch");
         let factor = _mm256_set1_ps(scale.to_f32());
         let mut low = _mm256_setzero_ps();
@@ -867,7 +1082,7 @@ mod x86 {
             }
             k += LANES;
         }
-        unsafe { reduce_pair_e4m3(low, high, x, codes, scale, k) }
+        unsafe { reduce_pair_e4m3(low, high, x, codes, scale, k, form) }
     }
 
     #[target_feature(enable = "avx2,fma")]
@@ -877,7 +1092,16 @@ mod x86 {
         gate: &[bf16],
         up: &[bf16],
         out: &mut [(f32, f32)],
+        form: Form,
     ) {
+        if form == Form::Lane8 {
+            assert_eq!(row_offsets.len(), out.len(), "gate/up row count mismatch");
+            for (&offset, value) in row_offsets.iter().zip(out) {
+                let x = &x_buf[offset..offset + gate.len()];
+                *value = unsafe { (dot_lane8(x, gate), dot_lane8(x, up)) };
+            }
+            return;
+        }
         let width = gate.len();
         assert_eq!(width, up.len(), "gate/up width mismatch");
         assert_eq!(row_offsets.len(), out.len(), "gate/up row count mismatch");
@@ -901,8 +1125,8 @@ mod x86 {
             }
             out[0] = unsafe {
                 (
-                    reduce_pair(g0_l, g0_h, x0, gate, k),
-                    reduce_pair(u0_l, u0_h, x0, up, k),
+                    reduce_pair(g0_l, g0_h, x0, gate, k, form),
+                    reduce_pair(u0_l, u0_h, x0, up, k, form),
                 )
             };
             return;
@@ -942,14 +1166,14 @@ mod x86 {
             }
             out[0] = unsafe {
                 (
-                    reduce_pair(g0_l, g0_h, x0, gate, k),
-                    reduce_pair(u0_l, u0_h, x0, up, k),
+                    reduce_pair(g0_l, g0_h, x0, gate, k, form),
+                    reduce_pair(u0_l, u0_h, x0, up, k, form),
                 )
             };
             out[1] = unsafe {
                 (
-                    reduce_pair(g1_l, g1_h, x1, gate, k),
-                    reduce_pair(u1_l, u1_h, x1, up, k),
+                    reduce_pair(g1_l, g1_h, x1, gate, k, form),
+                    reduce_pair(u1_l, u1_h, x1, up, k, form),
                 )
             };
             return;
@@ -965,12 +1189,14 @@ mod x86 {
                     &row_offsets[cursor..cursor + chunk],
                     gate,
                     &mut gate_tmp[..chunk],
+                    form,
                 );
                 down_rows(
                     x_buf,
                     &row_offsets[cursor..cursor + chunk],
                     up,
                     &mut up_tmp[..chunk],
+                    form,
                 );
             }
             for r in 0..chunk {
@@ -984,12 +1210,29 @@ mod x86 {
     pub(super) unsafe fn gate_up_e4m3(
         x_buf: &[f32],
         row_offsets: &[usize],
-        gate: &[u8],
-        up: &[u8],
+        pair: Fp8Pair<'_>,
         (gate_scale, up_scale): (bf16, bf16),
         out: &mut [(f32, f32)],
-        scratch_w: &mut [f32],
+        form: Form,
     ) {
+        if form == Form::Lane8 {
+            assert_eq!(row_offsets.len(), out.len(), "gate/up row count mismatch");
+            for (&offset, value) in row_offsets.iter().zip(out) {
+                let x = &x_buf[offset..offset + pair.gate.len()];
+                *value = unsafe {
+                    (
+                        dot_e4m3_lane8(x, pair.gate, gate_scale),
+                        dot_e4m3_lane8(x, pair.up, up_scale),
+                    )
+                };
+            }
+            return;
+        }
+        let Fp8Pair {
+            gate,
+            up,
+            scratch_w,
+        } = pair;
         let width = gate.len();
         assert_eq!(width, up.len(), "gate/up width mismatch");
         assert_eq!(row_offsets.len(), out.len(), "gate/up row count mismatch");
@@ -1017,8 +1260,8 @@ mod x86 {
             }
             out[0] = unsafe {
                 (
-                    reduce_pair_e4m3(g0_l, g0_h, x0, gate, gate_scale, k),
-                    reduce_pair_e4m3(u0_l, u0_h, x0, up, up_scale, k),
+                    reduce_pair_e4m3(g0_l, g0_h, x0, gate, gate_scale, k, form),
+                    reduce_pair_e4m3(u0_l, u0_h, x0, up, up_scale, k, form),
                 )
             };
             return;
@@ -1056,14 +1299,14 @@ mod x86 {
             }
             out[0] = unsafe {
                 (
-                    reduce_pair_e4m3(g0_l, g0_h, x0, gate, gate_scale, k),
-                    reduce_pair_e4m3(u0_l, u0_h, x0, up, up_scale, k),
+                    reduce_pair_e4m3(g0_l, g0_h, x0, gate, gate_scale, k, form),
+                    reduce_pair_e4m3(u0_l, u0_h, x0, up, up_scale, k, form),
                 )
             };
             out[1] = unsafe {
                 (
-                    reduce_pair_e4m3(g1_l, g1_h, x1, gate, gate_scale, k),
-                    reduce_pair_e4m3(u1_l, u1_h, x1, up, up_scale, k),
+                    reduce_pair_e4m3(g1_l, g1_h, x1, gate, gate_scale, k, form),
+                    reduce_pair_e4m3(u1_l, u1_h, x1, up, up_scale, k, form),
                 )
             };
             return;
@@ -1081,6 +1324,7 @@ mod x86 {
                     gate_scale,
                     &mut tmp[..chunk],
                     scratch_w,
+                    form,
                 );
             }
             for r in 0..chunk {
@@ -1094,6 +1338,7 @@ mod x86 {
                     up_scale,
                     &mut tmp[..chunk],
                     scratch_w,
+                    form,
                 );
             }
             for r in 0..chunk {
@@ -1109,7 +1354,15 @@ mod x86 {
         row_offsets: &[usize],
         down: &[bf16],
         out: &mut [f32],
+        form: Form,
     ) {
+        if form == Form::Lane8 {
+            assert_eq!(row_offsets.len(), out.len(), "down row count mismatch");
+            for (&offset, value) in row_offsets.iter().zip(out) {
+                *value = unsafe { dot_lane8(&x_buf[offset..offset + down.len()], down) };
+            }
+            return;
+        }
         let width = down.len();
         assert_eq!(row_offsets.len(), out.len(), "down row count mismatch");
         let mut cursor = 0;
@@ -1118,7 +1371,7 @@ mod x86 {
             match chunk {
                 1 => {
                     let x0 = &x_buf[row_offsets[cursor]..row_offsets[cursor] + width];
-                    out[cursor] = unsafe { dot(x0, down) };
+                    out[cursor] = unsafe { dot(x0, down, form) };
                 }
                 2 => {
                     let x0 = &x_buf[row_offsets[cursor]..row_offsets[cursor] + width];
@@ -1139,8 +1392,8 @@ mod x86 {
                         }
                         k += LANES;
                     }
-                    out[cursor] = unsafe { reduce_pair(l0, h0, x0, down, k) };
-                    out[cursor + 1] = unsafe { reduce_pair(l1, h1, x1, down, k) };
+                    out[cursor] = unsafe { reduce_pair(l0, h0, x0, down, k, form) };
+                    out[cursor + 1] = unsafe { reduce_pair(l1, h1, x1, down, k, form) };
                 }
                 3 => {
                     let x0 = &x_buf[row_offsets[cursor]..row_offsets[cursor] + width];
@@ -1166,9 +1419,9 @@ mod x86 {
                         }
                         k += LANES;
                     }
-                    out[cursor] = unsafe { reduce_pair(l0, h0, x0, down, k) };
-                    out[cursor + 1] = unsafe { reduce_pair(l1, h1, x1, down, k) };
-                    out[cursor + 2] = unsafe { reduce_pair(l2, h2, x2, down, k) };
+                    out[cursor] = unsafe { reduce_pair(l0, h0, x0, down, k, form) };
+                    out[cursor + 1] = unsafe { reduce_pair(l1, h1, x1, down, k, form) };
+                    out[cursor + 2] = unsafe { reduce_pair(l2, h2, x2, down, k, form) };
                 }
                 _ => {
                     let x0 = &x_buf[row_offsets[cursor]..row_offsets[cursor] + width];
@@ -1199,10 +1452,10 @@ mod x86 {
                         }
                         k += LANES;
                     }
-                    out[cursor] = unsafe { reduce_pair(l0, h0, x0, down, k) };
-                    out[cursor + 1] = unsafe { reduce_pair(l1, h1, x1, down, k) };
-                    out[cursor + 2] = unsafe { reduce_pair(l2, h2, x2, down, k) };
-                    out[cursor + 3] = unsafe { reduce_pair(l3, h3, x3, down, k) };
+                    out[cursor] = unsafe { reduce_pair(l0, h0, x0, down, k, form) };
+                    out[cursor + 1] = unsafe { reduce_pair(l1, h1, x1, down, k, form) };
+                    out[cursor + 2] = unsafe { reduce_pair(l2, h2, x2, down, k, form) };
+                    out[cursor + 3] = unsafe { reduce_pair(l3, h3, x3, down, k, form) };
                 }
             }
             cursor += chunk;
@@ -1217,7 +1470,17 @@ mod x86 {
         down_scale: bf16,
         out: &mut [f32],
         scratch_w: &mut [f32],
+        form: Form,
     ) {
+        if form == Form::Lane8 {
+            assert_eq!(row_offsets.len(), out.len(), "down row count mismatch");
+            for (&offset, value) in row_offsets.iter().zip(out) {
+                *value = unsafe {
+                    dot_e4m3_lane8(&x_buf[offset..offset + down.len()], down, down_scale)
+                };
+            }
+            return;
+        }
         let width = down.len();
         assert_eq!(row_offsets.len(), out.len(), "down row count mismatch");
         assert!(
@@ -1251,7 +1514,8 @@ mod x86 {
                         }
                         k += LANES;
                     }
-                    out[cursor] = unsafe { reduce_pair_e4m3(l0, h0, x0, down, down_scale, k) };
+                    out[cursor] =
+                        unsafe { reduce_pair_e4m3(l0, h0, x0, down, down_scale, k, form) };
                 }
                 2 => {
                     let x0 = &x_buf[row_offsets[cursor]..row_offsets[cursor] + width];
@@ -1278,8 +1542,10 @@ mod x86 {
                         }
                         k += LANES;
                     }
-                    out[cursor] = unsafe { reduce_pair_e4m3(l0, h0, x0, down, down_scale, k) };
-                    out[cursor + 1] = unsafe { reduce_pair_e4m3(l1, h1, x1, down, down_scale, k) };
+                    out[cursor] =
+                        unsafe { reduce_pair_e4m3(l0, h0, x0, down, down_scale, k, form) };
+                    out[cursor + 1] =
+                        unsafe { reduce_pair_e4m3(l1, h1, x1, down, down_scale, k, form) };
                 }
                 3 => {
                     let x0 = &x_buf[row_offsets[cursor]..row_offsets[cursor] + width];
@@ -1311,9 +1577,12 @@ mod x86 {
                         }
                         k += LANES;
                     }
-                    out[cursor] = unsafe { reduce_pair_e4m3(l0, h0, x0, down, down_scale, k) };
-                    out[cursor + 1] = unsafe { reduce_pair_e4m3(l1, h1, x1, down, down_scale, k) };
-                    out[cursor + 2] = unsafe { reduce_pair_e4m3(l2, h2, x2, down, down_scale, k) };
+                    out[cursor] =
+                        unsafe { reduce_pair_e4m3(l0, h0, x0, down, down_scale, k, form) };
+                    out[cursor + 1] =
+                        unsafe { reduce_pair_e4m3(l1, h1, x1, down, down_scale, k, form) };
+                    out[cursor + 2] =
+                        unsafe { reduce_pair_e4m3(l2, h2, x2, down, down_scale, k, form) };
                 }
                 _ => {
                     let x0 = &x_buf[row_offsets[cursor]..row_offsets[cursor] + width];
@@ -1355,10 +1624,14 @@ mod x86 {
                         }
                         k += LANES;
                     }
-                    out[cursor] = unsafe { reduce_pair_e4m3(l0, h0, x0, down, down_scale, k) };
-                    out[cursor + 1] = unsafe { reduce_pair_e4m3(l1, h1, x1, down, down_scale, k) };
-                    out[cursor + 2] = unsafe { reduce_pair_e4m3(l2, h2, x2, down, down_scale, k) };
-                    out[cursor + 3] = unsafe { reduce_pair_e4m3(l3, h3, x3, down, down_scale, k) };
+                    out[cursor] =
+                        unsafe { reduce_pair_e4m3(l0, h0, x0, down, down_scale, k, form) };
+                    out[cursor + 1] =
+                        unsafe { reduce_pair_e4m3(l1, h1, x1, down, down_scale, k, form) };
+                    out[cursor + 2] =
+                        unsafe { reduce_pair_e4m3(l2, h2, x2, down, down_scale, k, form) };
+                    out[cursor + 3] =
+                        unsafe { reduce_pair_e4m3(l3, h3, x3, down, down_scale, k, form) };
                 }
             }
             cursor += chunk;
@@ -1366,7 +1639,10 @@ mod x86 {
     }
 
     #[target_feature(enable = "avx512f,avx512bf16")]
-    pub(super) unsafe fn dot_512(x: &[f32], weights: &[bf16]) -> f32 {
+    pub(super) unsafe fn dot_512(x: &[f32], weights: &[bf16], form: Form) -> f32 {
+        if form == Form::Lane8 {
+            return unsafe { dot_lane8(x, weights) };
+        }
         assert_eq!(x.len(), weights.len(), "dot operand width mismatch");
         let mut acc = _mm512_setzero_ps();
         let mut k = 0;
@@ -1384,7 +1660,7 @@ mod x86 {
             lanes[lane] = x[k].mul_add(f32::from(weights[k]), lanes[lane]);
             k += 1;
         }
-        pairwise(&lanes)
+        form.reduce(&mut lanes)
     }
 
     #[target_feature(enable = "avx512f,avx512bf16")]
@@ -1436,7 +1712,10 @@ mod x86 {
     }
 
     #[target_feature(enable = "avx512f,avx512bf16")]
-    pub(super) unsafe fn dot_e4m3_512(x: &[f32], codes: &[u8], scale: bf16) -> f32 {
+    pub(super) unsafe fn dot_e4m3_512(x: &[f32], codes: &[u8], scale: bf16, form: Form) -> f32 {
+        if form == Form::Lane8 {
+            return unsafe { dot_e4m3_lane8(x, codes, scale) };
+        }
         assert_eq!(x.len(), codes.len(), "dot operand width mismatch");
         let factor = _mm512_set1_ps(scale.to_f32());
         let mut acc = _mm512_setzero_ps();
@@ -1457,11 +1736,11 @@ mod x86 {
             lanes[lane] = x[k].mul_add(weight, lanes[lane]);
             k += 1;
         }
-        pairwise(&lanes)
+        form.reduce(&mut lanes)
     }
 
     #[target_feature(enable = "avx512f,avx512bf16")]
-    pub(super) unsafe fn round_512(values: &[f32], out: &mut [bf16]) {
+    pub(super) unsafe fn round_512(values: &[f32], out: &mut [bf16], _form: Form) {
         assert_eq!(values.len(), out.len(), "round operand width mismatch");
         let mut k = 0;
         while k + 32 <= values.len() {
@@ -1515,6 +1794,7 @@ pub struct ExpertPool {
 }
 
 pub struct Job<'a> {
+    pub form: Form,
     pub arena: Arc<HostBlocks>,
     pub hidden: &'a [bf16],
     pub rows: usize,
@@ -1595,6 +1875,7 @@ struct GroupedItem {
 }
 
 struct JobSlot {
+    form: Form,
     rows: usize,
     arena: Option<Arc<BlockLease>>,
     hidden: Vec<bf16>,
@@ -1608,6 +1889,7 @@ struct JobSlot {
 impl JobSlot {
     fn new(shape: &Shape, max_rows: usize, max_assignments: usize) -> Self {
         Self {
+            form: Form::Lane16,
             rows: 0,
             arena: None,
             hidden: vec![bf16::ZERO; max_rows * shape.hidden],
@@ -1899,6 +2181,22 @@ impl ExpertPool {
             !self.shared.shutdown.load(Ordering::Acquire),
             "expert pool worker synchronization failed"
         );
+        ensure!(
+            !self.shared.pending.swap(true, Ordering::AcqRel),
+            "expert pool job is already pending"
+        );
+        if let Err(error) = self.publish(&job) {
+            self.shared.pending.store(false, Ordering::Release);
+            return Err(error);
+        }
+        Ok(PendingJob {
+            pool: self,
+            out: Some(job.out),
+            armed: true,
+        })
+    }
+
+    fn publish(&self, job: &Job<'_>) -> Result<()> {
         let Job {
             arena,
             hidden,
@@ -1906,31 +2204,10 @@ impl ExpertPool {
             experts,
             assignments,
             out,
+            form,
         } = job;
-        ensure!(
-            !self.shared.pending.swap(true, Ordering::AcqRel),
-            "expert pool job is already pending"
-        );
-        if let Err(error) = self.publish(&arena, hidden, rows, experts, assignments, out.len()) {
-            self.shared.pending.store(false, Ordering::Release);
-            return Err(error);
-        }
-        Ok(PendingJob {
-            pool: self,
-            out: Some(out),
-            armed: true,
-        })
-    }
-
-    fn publish(
-        &self,
-        arena: &Arc<HostBlocks>,
-        hidden: &[bf16],
-        rows: usize,
-        experts: &[ExpertWeights],
-        assignments: &[Assignment],
-        out_len: usize,
-    ) -> Result<()> {
+        let rows = *rows;
+        let out_len = out.len();
         self.validate(
             arena.elements(),
             hidden.len(),
@@ -1960,13 +2237,14 @@ impl ExpertPool {
                 .map_err(|_| anyhow::anyhow!("expert pool job lock poisoned"))?;
             let slot = &mut *slot;
             slot.rows = rows;
+            slot.form = *form;
             slot.arena = Some(lease);
             slot.hidden[..hidden.len()].copy_from_slice(hidden);
             slot.experts.clear();
             slot.experts.extend_from_slice(experts);
             slot.groups.clear();
             slot.group_cursor.clear();
-            for item in assignments {
+            for item in *assignments {
                 let expert_idx = item.expert as usize;
                 let group_idx = slot.expert_group[expert_idx];
                 if group_idx == u16::MAX {
@@ -2338,7 +2616,7 @@ fn phases<const FP8: bool>(
     let arm = arm_for(isa)?;
     let (hidden, intermediate) = (shape.hidden, shape.intermediate);
     let workers = shared.participants.load(Ordering::Acquire);
-    let (lease, groups_len, range1, rows) = {
+    let (lease, groups_len, range1, rows, form) = {
         let slot = shared
             .job
             .read()
@@ -2368,7 +2646,7 @@ fn phases<const FP8: bool>(
             }
         }
         let lease = slot.arena.clone().context("job lease missing")?;
-        (lease, groups_len, range1, slot.rows)
+        (lease, groups_len, range1, slot.rows, slot.form)
     };
     for row in 0..rows {
         if local.hidden_rows[row] {
@@ -2416,11 +2694,14 @@ fn phases<const FP8: bool>(
                     (arm.gate_up_e4m3)(
                         &local.hidden_f,
                         &local.row_offsets,
-                        gate,
-                        up,
+                        Fp8Pair {
+                            gate,
+                            up,
+                            scratch_w: &mut local.scratch_w[..hidden],
+                        },
                         (gate_scale, up_scale),
                         &mut local.pair_out[..r_len],
-                        &mut local.scratch_w[..hidden],
+                        form,
                     );
                 }
                 for (r, item) in group_items.iter().enumerate() {
@@ -2432,6 +2713,7 @@ fn phases<const FP8: bool>(
                         up,
                         boundaries.swiglu_rounding,
                         boundaries.swiglu_limit,
+                        form,
                     ));
                     local
                         .out_pairs
@@ -2450,6 +2732,7 @@ fn phases<const FP8: bool>(
                         gate,
                         up,
                         &mut local.pair_out[..r_len],
+                        form,
                     );
                 }
                 for (r, item) in group_items.iter().enumerate() {
@@ -2461,6 +2744,7 @@ fn phases<const FP8: bool>(
                         up,
                         boundaries.swiglu_rounding,
                         boundaries.swiglu_limit,
+                        form,
                     ));
                     local
                         .out_pairs
@@ -2533,6 +2817,7 @@ fn phases<const FP8: bool>(
                         scale,
                         &mut local.down_out[..r_len],
                         &mut local.scratch_w[..intermediate],
+                        form,
                     );
                 }
                 for (r, item) in group_items.iter().enumerate() {
@@ -2563,6 +2848,7 @@ fn phases<const FP8: bool>(
                         &local.row_offsets,
                         row,
                         &mut local.down_out[..r_len],
+                        form,
                     );
                 }
                 for (r, item) in group_items.iter().enumerate() {
@@ -2601,6 +2887,7 @@ pub fn measure_service_table(
     rows: &[u32],
     missed: &[u32],
     format: crate::model_spec::ExpertFormat,
+    form: Form,
 ) -> Result<Vec<crate::experts::plan::ServiceCell>> {
     Shape::new(shape.hidden, shape.intermediate)?;
     let rows_max = *rows.iter().max().context("empty service row lattice")? as usize;
@@ -2701,6 +2988,7 @@ pub fn measure_service_table(
                         .collect::<Result<Vec<_>>>()?;
                     let started = std::time::Instant::now();
                     pool.run(Job {
+                        form,
                         arena: arena.clone(),
                         hidden: &hidden[..rows as usize * shape.hidden],
                         rows: rows as usize,
@@ -2727,7 +3015,7 @@ pub fn measure_service_table(
             }
             eprintln!(
                 "{}",
-                serde_json::json!({"expert_service_setup":{"workers":workers,"rows":rows,"cells":missed.len(),"wall_seconds":row_started.elapsed().as_secs_f64()}})
+                serde_json::json!({"expert_service_setup":{"form":form,"workers":workers,"rows":rows,"cells":missed.len(),"wall_seconds":row_started.elapsed().as_secs_f64()}})
             );
         }
     }
@@ -2775,6 +3063,88 @@ mod tests {
     }
 
     #[test]
+    fn lane8_simd_dot_and_row_paths_match_scalar_bits() -> Result<()> {
+        let form = Form::Lane8;
+        for isa in [Isa::Avx2, Isa::Avx512Bf16] {
+            if !isa.available() {
+                println!("LANE8_CPU_UNAVAILABLE isa={}", isa.name());
+                continue;
+            }
+            let arm = arm_for(isa)?;
+            for width in [1, 7, 8, 24, 40, 64, 72, 128, 2048, 4096] {
+                let x: Vec<f32> = (0..5 * width).map(|k| pattern(k, 0.17).to_f32()).collect();
+                let gate: Vec<bf16> = (0..width).map(|k| pattern(k, 0.31)).collect();
+                let up: Vec<bf16> = (0..width).map(|k| pattern(k, 0.43)).collect();
+                let codes: Vec<u8> = (0..width)
+                    .map(|k| ((k * 37 + 19) % 126) as u8 | if k % 3 == 0 { 128 } else { 0 })
+                    .collect();
+                let scale = bf16::from_f32(0.11328125);
+                let mut scratch = vec![0.0; width];
+                for count in [1, 2, 5] {
+                    let offsets: Vec<usize> = (0..count).map(|r| r * width).collect();
+                    let mut pair = vec![(0.0, 0.0); count];
+                    let mut down = vec![0.0; count];
+                    unsafe {
+                        (arm.gate_up)(&x, &offsets, &gate, &up, &mut pair, form);
+                        (arm.down_rows)(&x, &offsets, &gate, &mut down, form);
+                    }
+                    for (r, &offset) in offsets.iter().enumerate() {
+                        let row = &x[offset..offset + width];
+                        let g = scalar_dot(row, &gate, form);
+                        let u = scalar_dot(row, &up, form);
+                        assert_eq!(pair[r].0.to_bits(), g.to_bits());
+                        assert_eq!(pair[r].1.to_bits(), u.to_bits());
+                        assert_eq!(down[r].to_bits(), g.to_bits());
+                        assert_eq!(
+                            unsafe { (arm.dot)(row, &gate, form) }.to_bits(),
+                            g.to_bits()
+                        );
+                    }
+                    unsafe {
+                        (arm.gate_up_e4m3)(
+                            &x,
+                            &offsets,
+                            Fp8Pair {
+                                gate: &codes,
+                                up: &codes,
+                                scratch_w: &mut scratch,
+                            },
+                            (scale, scale),
+                            &mut pair,
+                            form,
+                        );
+                        (arm.down_rows_e4m3)(
+                            &x,
+                            &offsets,
+                            &codes,
+                            scale,
+                            &mut down,
+                            &mut scratch,
+                            form,
+                        );
+                    }
+                    for (r, &offset) in offsets.iter().enumerate() {
+                        let row = &x[offset..offset + width];
+                        let reference = scalar_dot_e4m3(row, &codes, scale, form);
+                        assert_eq!(pair[r].0.to_bits(), reference.to_bits());
+                        assert_eq!(pair[r].1.to_bits(), reference.to_bits());
+                        assert_eq!(down[r].to_bits(), reference.to_bits());
+                        assert_eq!(
+                            unsafe { (arm.dot_e4m3)(row, &codes, scale, form) }.to_bits(),
+                            reference.to_bits()
+                        );
+                    }
+                }
+            }
+            println!(
+                "PASS LANE8_CPU_SIMD isa={} widths=1,7,8,24,40,64,72,128,2048,4096 rows=1,2,5 formats=bf16,fp8 bit_mismatches=0",
+                isa.name()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn clamped_swiglu_matches_model_definition_bits() -> Result<()> {
         #[derive(serde::Deserialize)]
         struct Fixture {
@@ -2800,12 +3170,14 @@ mod tests {
                 up,
                 crate::model_spec::SwigluRounding::ClampedTwice,
                 fixture.limit,
+                Form::Lane8,
             )?;
             let once = silu_mul(
                 gate,
                 up,
                 crate::model_spec::SwigluRounding::ClampedOnce,
                 fixture.limit,
+                Form::Lane8,
             )?;
             assert_eq!(
                 twice.to_bits(),
@@ -2819,6 +3191,7 @@ mod tests {
                     up,
                     crate::model_spec::SwigluRounding::Twice,
                     fixture.limit,
+                    Form::Lane16,
                 )?
                 .to_bits()
                     != fixture.twice[index],
@@ -2965,6 +3338,7 @@ mod tests {
             contribution(
                 isa,
                 Contribution {
+                    form: Form::Lane16,
                     shape: &shape,
                     arena: &flat,
                     weights: &expert,
@@ -2999,6 +3373,7 @@ mod tests {
         }];
         let experts = [expert.clone()];
         let pending = pool.submit(Job {
+            form: Form::Lane16,
             arena,
             hidden: &hidden,
             rows: 1,
@@ -3033,6 +3408,7 @@ mod tests {
             fp8_contribution(
                 isa,
                 Fp8Contribution {
+                    form: Form::Lane16,
                     shape: &shape,
                     slot: &native,
                     slot_layout: &slot,
@@ -3067,6 +3443,7 @@ mod tests {
         )?];
         let pool = ExpertPool::new(2, shape, 1, 1, Some(slot.clone()))?;
         pool.run(Job {
+            form: Form::Lane16,
             arena,
             hidden: &hidden,
             rows: 1,
@@ -3084,6 +3461,7 @@ mod tests {
             contribution(
                 isa,
                 Contribution {
+                    form: Form::Lane16,
                     shape: &shape,
                     arena: &flat,
                     weights: &expert,
@@ -3114,6 +3492,7 @@ mod tests {
             crate::model_spec::SwigluRounding::Once,
         )?;
         pool.run(Job {
+            form: Form::Lane16,
             arena,
             hidden: &hidden,
             rows: 1,
@@ -3130,6 +3509,7 @@ mod tests {
             fp8_contribution(
                 isa,
                 Fp8Contribution {
+                    form: Form::Lane16,
                     shape: &shape,
                     slot: &native,
                     slot_layout: &slot,
@@ -3159,6 +3539,7 @@ mod tests {
         contribution(
             Isa::Scalar,
             Contribution {
+                form: Form::Lane16,
                 shape: &shape,
                 arena: &flat,
                 weights: &expert,
@@ -3174,6 +3555,7 @@ mod tests {
         contribution(
             Isa::Scalar,
             Contribution {
+                form: Form::Lane16,
                 shape: &shape,
                 arena: &flat,
                 weights: &expert,
@@ -3206,6 +3588,7 @@ mod tests {
             contribution(
                 Isa::Scalar,
                 Contribution {
+                    form: Form::Lane16,
                     shape: &shape,
                     arena: &arena_flat(&arena),
                     weights: &weights(&shape, expert),
@@ -3298,7 +3681,7 @@ mod tests {
                 continue;
             }
             // SAFETY: the arm was selected by `Isa::detect` or checked by `Isa::available`.
-            let value = unsafe { (arm_for(isa)?.dot_e4m3)(&x, &codes, scale) };
+            let value = unsafe { (arm_for(isa)?.dot_e4m3)(&x, &codes, scale, Form::Lane16) };
             assert_eq!(value, rounded, "{} feeds the unrounded weight", isa.name());
         }
         Ok(())
@@ -3387,6 +3770,7 @@ mod tests {
             fp8_contribution(
                 Isa::Scalar,
                 Fp8Contribution {
+                    form: Form::Lane16,
                     shape: &shape,
                     slot: &slot,
                     slot_layout: &layout,
@@ -3453,6 +3837,7 @@ mod tests {
             fp8_contribution(
                 Isa::Scalar,
                 Fp8Contribution {
+                    form: Form::Lane16,
                     shape: &shape,
                     slot: &codes,
                     slot_layout: &slot,
@@ -3472,6 +3857,7 @@ mod tests {
             let pool = ExpertPool::new(workers, shape, 2, 6, Some(slot.clone()))?;
             let mut out = vec![bf16::ZERO; expected.len()];
             let pending = pool.submit(Job {
+                form: Form::Lane16,
                 arena: arena.clone(),
                 hidden: &hidden,
                 rows: 2,
@@ -3488,6 +3874,7 @@ mod tests {
             malformed[0].gate_up.end += 1;
             assert!(
                 pool.run(Job {
+                    form: Form::Lane16,
                     arena: arena.clone(),
                     hidden: &hidden,
                     rows: 2,
@@ -3512,6 +3899,7 @@ mod tests {
         let pool = ExpertPool::new(4, shape, 2, 6, Some(slot))?;
         let mut wrong = vec![bf16::ZERO; expected.len()];
         pool.run(Job {
+            form: Form::Lane16,
             arena,
             hidden: &hidden,
             rows: 2,
@@ -3541,6 +3929,7 @@ mod tests {
             fp8_contribution(
                 Isa::Scalar,
                 Fp8Contribution {
+                    form: Form::Lane16,
                     shape: &shape,
                     slot: &slot,
                     slot_layout: &layout,
@@ -3562,6 +3951,7 @@ mod tests {
                 fp8_contribution(
                     isa,
                     Fp8Contribution {
+                        form: Form::Lane16,
                         shape: &shape,
                         slot: &slot,
                         slot_layout: &layout,
@@ -3584,6 +3974,7 @@ mod tests {
             fp8_contribution(
                 Isa::Scalar,
                 Fp8Contribution {
+                    form: Form::Lane16,
                     shape: &shape,
                     slot: &mutated,
                     slot_layout: &layout,
@@ -3617,6 +4008,7 @@ mod tests {
             contribution(
                 Isa::Scalar,
                 Contribution {
+                    form: Form::Lane16,
                     shape: &shape,
                     arena: &arena_flat(&arena),
                     weights: &weights0,
@@ -3638,6 +4030,7 @@ mod tests {
                 contribution(
                     isa,
                     Contribution {
+                        form: Form::Lane16,
                         shape: &shape,
                         arena: &arena_flat(&arena),
                         weights: &weights0,
@@ -3673,6 +4066,7 @@ mod tests {
         contribution(
             Isa::Scalar,
             Contribution {
+                form: Form::Lane16,
                 shape: &shape,
                 arena: &arena_flat(&arena),
                 weights: &weights(&shape, 0),
@@ -3689,6 +4083,7 @@ mod tests {
         contribution(
             Isa::Scalar,
             Contribution {
+                form: Form::Lane16,
                 shape: &shape,
                 arena: &arena_flat(&arena),
                 weights: &weights(&shape, 1),
@@ -3723,6 +4118,7 @@ mod tests {
         contribution(
             Isa::Scalar,
             Contribution {
+                form: Form::Lane16,
                 shape: &shape,
                 arena: &shifted,
                 weights: &shifted_weights,
@@ -3770,6 +4166,7 @@ mod tests {
                     contribution(
                         Isa::Scalar,
                         Contribution {
+                            form: Form::Lane16,
                             shape: &shape,
                             arena: &arena_flat(&arena),
                             weights: &experts[assignment.expert as usize],
@@ -3788,6 +4185,7 @@ mod tests {
                     let pool = ExpertPool::new(workers, shape, rows, assignments.len(), None)?;
                     let mut out = vec![bf16::ZERO; assignments.len() * shape.hidden];
                     pool.run(Job {
+                        form: Form::Lane16,
                         arena: arena.clone(),
                         hidden: &hidden,
                         rows,
@@ -3801,6 +4199,7 @@ mod tests {
                     shuffled.reverse();
                     let mut out = vec![bf16::ZERO; assignments.len() * shape.hidden];
                     pool.run(Job {
+                        form: Form::Lane16,
                         arena: arena.clone(),
                         hidden: &hidden,
                         rows,
@@ -3862,6 +4261,7 @@ mod tests {
             contribution(
                 Isa::Scalar,
                 Contribution {
+                    form: Form::Lane16,
                     shape,
                     arena: &flat,
                     weights: &fixture.experts[assignment.expert as usize],
@@ -3881,6 +4281,7 @@ mod tests {
 
     fn fixture_job<'a>(fixture: &'a PoolFixture, out: &'a mut [bf16]) -> Job<'a> {
         Job {
+            form: Form::Lane16,
             arena: fixture.arena.clone(),
             hidden: &fixture.hidden,
             rows: 2,
@@ -4167,38 +4568,43 @@ mod tests {
                 weight: bf16::from_f32(0.125),
             })
             .collect();
-        let mut scratch = Scratch::new(&shape);
-        let mut expected = vec![bf16::ZERO; assignments.len() * shape.hidden];
-        for assignment in &assignments {
-            let out = &mut expected[assignment.choice as usize * shape.hidden..][..shape.hidden];
-            contribution(
-                Isa::Scalar,
-                Contribution {
-                    shape: &shape,
-                    arena: &arena_flat(&arena),
-                    weights: &experts[assignment.expert as usize],
-                    hidden: &hidden,
-                    routing: assignment.weight,
-
-                    rounding: crate::model_spec::SwigluRounding::Twice,
-                    limit: 0.0,
-                    routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
-                },
-                out,
-                &mut scratch,
-            )?;
-        }
         let pool = ExpertPool::new(4, shape, 1, assignments.len(), None)?;
-        let mut out = vec![bf16::ZERO; assignments.len() * shape.hidden];
-        pool.run(Job {
-            arena,
-            hidden: &hidden,
-            rows: 1,
-            experts: &experts,
-            assignments: &assignments,
-            out: &mut out,
-        })?;
-        assert_eq!(out, expected);
+        let mut scratch = Scratch::new(&shape);
+        for form in [Form::Lane8, Form::Lane16, Form::Lane8] {
+            let mut expected = vec![bf16::ZERO; assignments.len() * shape.hidden];
+            for assignment in &assignments {
+                let out =
+                    &mut expected[assignment.choice as usize * shape.hidden..][..shape.hidden];
+                contribution(
+                    Isa::Scalar,
+                    Contribution {
+                        form,
+                        shape: &shape,
+                        arena: &arena_flat(&arena),
+                        weights: &experts[assignment.expert as usize],
+                        hidden: &hidden,
+                        routing: assignment.weight,
+
+                        rounding: crate::model_spec::SwigluRounding::Twice,
+                        limit: 0.0,
+                        routed_weight: crate::model_spec::RoutedWeightBoundary::AfterDownBf16,
+                    },
+                    out,
+                    &mut scratch,
+                )?;
+            }
+            let mut out = vec![bf16::ZERO; assignments.len() * shape.hidden];
+            pool.run(Job {
+                form,
+                arena: arena.clone(),
+                hidden: &hidden,
+                rows: 1,
+                experts: &experts,
+                assignments: &assignments,
+                out: &mut out,
+            })?;
+            assert_eq!(out, expected, "per-job form {form:?}");
+        }
         Ok(())
     }
 
@@ -4217,6 +4623,7 @@ mod tests {
         };
         let mut out = vec![bf16::ZERO; shape.hidden];
         pool.run(Job {
+            form: Form::Lane16,
             arena: arena.clone(),
             hidden: &hidden,
             rows: 1,
@@ -4227,6 +4634,7 @@ mod tests {
         assert!(ExpertPool::new(0, shape, 1, 1, None).is_err());
         assert!(
             pool.run(Job {
+                form: Form::Lane16,
                 arena: arena.clone(),
                 hidden: &hidden,
                 rows: 2,
@@ -4238,6 +4646,7 @@ mod tests {
         );
         assert!(
             pool.run(Job {
+                form: Form::Lane16,
                 arena: arena.clone(),
                 hidden: &hidden[..shape.hidden - 1],
                 rows: 1,
@@ -4250,6 +4659,7 @@ mod tests {
         let bad_row = Assignment { row: 1, ..good };
         assert!(
             pool.run(Job {
+                form: Form::Lane16,
                 arena: arena.clone(),
                 hidden: &hidden,
                 rows: 1,
@@ -4262,6 +4672,7 @@ mod tests {
         let bad_expert = Assignment { expert: 1, ..good };
         assert!(
             pool.run(Job {
+                form: Form::Lane16,
                 arena: arena.clone(),
                 hidden: &hidden,
                 rows: 1,
@@ -4274,6 +4685,7 @@ mod tests {
         let duplicate = Assignment { choice: 0, ..good };
         assert!(
             pool.run(Job {
+                form: Form::Lane16,
                 arena: arena.clone(),
                 hidden: &hidden,
                 rows: 1,
@@ -4286,6 +4698,7 @@ mod tests {
         let bad_choice = Assignment { choice: 1, ..good };
         assert!(
             pool.run(Job {
+                form: Form::Lane16,
                 arena,
                 hidden: &hidden,
                 rows: 1,
@@ -4361,6 +4774,7 @@ mod tests {
             contribution(
                 isa,
                 Contribution {
+                    form: Form::Lane16,
                     shape: &shape,
                     arena: &arena,
                     weights: &weights,
@@ -4426,6 +4840,7 @@ mod tests {
             &[1, 2, 5, 8],
             &[1, 2, 4, 8],
             crate::model_spec::ExpertFormat::Bf16,
+            Form::Lane16,
         )?;
         for cell in cells {
             let cold_bytes = f64::from(cell.experts) * per as f64 * 2.0;
@@ -4573,6 +4988,7 @@ mod tests {
                     contribution(
                         Isa::Scalar,
                         Contribution {
+                            form: Form::Lane16,
                             shape: &shape,
                             arena: &bf16_flat,
                             weights: &bf16_experts[item.expert as usize],
@@ -4588,6 +5004,7 @@ mod tests {
                     fp8_contribution(
                         Isa::Scalar,
                         Fp8Contribution {
+                            form: Form::Lane16,
                             shape: &shape,
                             slot: &fp8_slots_bytes[item.expert as usize],
                             slot_layout: &fp8_slot,
@@ -4606,6 +5023,7 @@ mod tests {
                     let bf16_pool = ExpertPool::new(workers, shape, rows, assignments.len(), None)?;
                     let mut out_bf16 = vec![bf16::ZERO; expected_bf16.len()];
                     bf16_pool.run(Job {
+                        form: Form::Lane16,
                         arena: bf16_arena.clone(),
                         hidden: &hidden[..rows * shape.hidden],
                         rows,
@@ -4628,6 +5046,7 @@ mod tests {
                     )?;
                     let mut out_fp8 = vec![bf16::ZERO; expected_fp8.len()];
                     fp8_pool.run(Job {
+                        form: Form::Lane16,
                         arena: fp8_arena.clone(),
                         hidden: &hidden[..rows * shape.hidden],
                         rows,
@@ -4653,6 +5072,7 @@ mod tests {
                         }
                         let mut out_bf16_mutant = vec![bf16::ZERO; expected_bf16.len()];
                         bf16_pool.run(Job {
+                            form: Form::Lane16,
                             arena: bf16_mutant_arena,
                             hidden: &hidden[..rows * shape.hidden],
                             rows,
@@ -4686,6 +5106,7 @@ mod tests {
                         }
                         let mut out_fp8_mutant = vec![bf16::ZERO; expected_fp8.len()];
                         fp8_pool.run(Job {
+                            form: Form::Lane16,
                             arena: fp8_mutant_arena,
                             hidden: &hidden[..rows * shape.hidden],
                             rows,
