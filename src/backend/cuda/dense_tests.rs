@@ -875,7 +875,11 @@ fn tcmqa_gate(
                 let actual = s.clone_dtoh(&output.slice(..rows * 2048))?;
                 gate.check(
                     "tcmqa.batch_position_identity",
-                    actual.chunks_exact(2048).all(|row| row == &actual[..2048]),
+                    actual
+                        .as_chunks::<2048>()
+                        .0
+                        .iter()
+                        .all(|row| row == &actual[..2048]),
                 );
                 s.memcpy_htod(&q, &mut dq)?;
                 if rows == 7 {

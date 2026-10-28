@@ -400,8 +400,8 @@ __device__ __forceinline__ void tcmqa_phase1_body(
     }
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
-      rmax[half] = fmaxf(rmax[half], __shfl_xor_sync(0xffffffffu, rmax[half], 1));
-      rmax[half] = fmaxf(rmax[half], __shfl_xor_sync(0xffffffffu, rmax[half], 2));
+      rmax[half] = fmaxf(rmax[half], __shfl_xor_sync(FF_WARP_MASK, rmax[half], 1));
+      rmax[half] = fmaxf(rmax[half], __shfl_xor_sync(FF_WARP_MASK, rmax[half], 2));
     }
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
@@ -417,8 +417,8 @@ __device__ __forceinline__ void tcmqa_phase1_body(
         pn[n][half * 2 + 1] = p1;
         rsum += p0 + p1;
       }
-      rsum += __shfl_xor_sync(0xffffffffu, rsum, 1);
-      rsum += __shfl_xor_sync(0xffffffffu, rsum, 2);
+      rsum += __shfl_xor_sync(FF_WARP_MASK, rsum, 1);
+      rsum += __shfl_xor_sync(FF_WARP_MASK, rsum, 2);
       ls[half] = ls[half] * cf + rsum;
 #pragma unroll
       for (int n = 0; n < 16; ++n) {
@@ -584,16 +584,16 @@ __device__ __forceinline__ void tcmqa_phase2_short_body(
     }
     float mx = fmaxf(m0, m1);
     for (int s = warpSize / 2; s > 0; s >>= 1) {
-      const float other = __shfl_down_sync(0xffffffffu, mx, s);
+      const float other = __shfl_down_sync(FF_WARP_MASK, mx, s);
       if (tid < s) mx = fmaxf(mx, other);
     }
-    mx = __shfl_sync(0xffffffffu, mx, 0);
+    mx = __shfl_sync(FF_WARP_MASK, mx, 0);
     float p0 = 0.0f, p1 = 0.0f;
     if (tid < nchunks) p0 += l0 * __expf(sm[tid] - mx);
     if (hi < nchunks) p1 += l1 * __expf(sm[hi] - mx);
     float sum = p0 + p1;
     for (int s = warpSize / 2; s > 0; s >>= 1) {
-      const float other = __shfl_down_sync(0xffffffffu, sum, s);
+      const float other = __shfl_down_sync(FF_WARP_MASK, sum, s);
       if (tid < s) sum += other;
     }
     if (tid == 0) {
