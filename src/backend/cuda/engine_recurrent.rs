@@ -120,6 +120,9 @@ struct VisionWorkspace {
     f32_c: CudaSlice<f32>,
     projected_f32: CudaSlice<f32>,
     projected_bf16: CudaSlice<bf16>,
+    instruction: CudaSlice<bf16>,
+    gates: CudaSlice<bf16>,
+    gate_query: CudaSlice<f32>,
 }
 
 #[cfg(test)]
@@ -144,6 +147,9 @@ impl VisionWorkspace {
             f32_c: s.alloc_zeros(rows * 1536)?,
             projected_f32: s.alloc_zeros(rows * 1536)?,
             projected_bf16: s.alloc_zeros(rows * 1536)?,
+            instruction: s.alloc_zeros(1536)?,
+            gates: s.alloc_zeros(rows)?,
+            gate_query: s.alloc_zeros(256)?,
         })
     }
 }
@@ -158,7 +164,20 @@ struct VisionEncoderCall<'a> {
 }
 
 #[cfg(test)]
+struct ReinjectCall<'a> {
+    weights: &'a LoopvlVisionWeights,
+    states: &'a mut CudaSlice<bf16>,
+    anchor: &'a CudaSlice<bf16>,
+    visual_begin: usize,
+    visual_rows: usize,
+    instruction_begin: usize,
+    instruction_end: usize,
+    cycle: usize,
+}
+
+#[cfg(test)]
 struct VisionRuntime {
+    reinjection_calls: std::cell::Cell<usize>,
     encoder_calls: std::cell::Cell<usize>,
     projector_calls: std::cell::Cell<usize>,
     rope_2d: CudaFunction,
@@ -167,6 +186,10 @@ struct VisionRuntime {
     bias: CudaFunction,
     bias_gelu: CudaFunction,
     rms_scale: CudaFunction,
+    add_row_silu: CudaFunction,
+    gate_round: CudaFunction,
+    masked_mean: CudaFunction,
+    anchor: CudaFunction,
     common: CommonOpsRef,
     ops: Ops,
 }
@@ -214,6 +237,7 @@ impl VisionRuntime {
         let rope = cubin::module(ctx, "rope")?;
         let vision = cubin::module(ctx, "vision_ops")?;
         Ok(Self {
+            reinjection_calls: std::cell::Cell::new(0),
             encoder_calls: std::cell::Cell::new(0),
             projector_calls: std::cell::Cell::new(0),
             rope_2d: rope.load_function("rope_2d_qk")?,
@@ -222,6 +246,10 @@ impl VisionRuntime {
             bias: vision.load_function("vision_bias_f32")?,
             bias_gelu: vision.load_function("vision_bias_gelu_f32")?,
             rms_scale: vision.load_function("vision_rms_scale_f32")?,
+            add_row_silu: vision.load_function("vision_add_row_silu_f32")?,
+            gate_round: vision.load_function("vision_gate_round_bf16")?,
+            masked_mean: vision.load_function("vision_masked_mean_bf16")?,
+            anchor: vision.load_function("vision_anchor_reinject_bf16")?,
             common: CommonOpsRef::new(ctx)?,
             ops: Ops::new_with_swiglu_rounding(ctx, crate::model_spec::SwigluRounding::Twice)?,
         })
@@ -485,6 +513,104 @@ impl VisionRuntime {
                 .arg(&1536i32)
                 .arg(&1e-6f32)
                 .launch(grid(rows, 256))?;
+        }
+        Ok(())
+    }
+
+    fn run_reinject(
+        &self,
+        blas: &Blas,
+        s: &Arc<CudaStream>,
+        work: &mut VisionWorkspace,
+        call: ReinjectCall<'_>,
+    ) -> Result<()> {
+        let ReinjectCall {
+            weights,
+            states,
+            anchor,
+            visual_begin,
+            visual_rows,
+            instruction_begin,
+            instruction_end,
+            cycle,
+        } = call;
+        ensure!(
+            visual_rows > 0
+                && visual_begin + visual_rows <= states.len() / 1536
+                && anchor.len() == visual_rows * 1536
+                && instruction_begin < instruction_end
+                && instruction_end <= states.len() / 1536,
+            "reinjection mask extent"
+        );
+        self.reinjection_calls.set(self.reinjection_calls.get() + 1);
+        unsafe {
+            s.launch_builder(&self.masked_mean)
+                .arg(&*states)
+                .arg(&mut work.instruction)
+                .arg(&(instruction_begin as i32))
+                .arg(&(instruction_end as i32))
+                .arg(&1536i32)
+                .launch(flat(1536))?;
+            s.launch_builder(&self.upcast)
+                .arg(&states.slice(visual_begin * 1536..(visual_begin + visual_rows) * 1536))
+                .arg(&mut work.f32_a)
+                .arg(&((visual_rows * 1536) as i32))
+                .launch(flat(visual_rows * 1536))?;
+            s.launch_builder(&self.upcast)
+                .arg(&work.instruction)
+                .arg(&mut work.f32_c)
+                .arg(&1536i32)
+                .launch(flat(1536))?;
+        }
+        blas.linear_f32(
+            f32_weight(&weights.gate_visual, s, 256, 1536)?,
+            matrix32(&work.f32_a, s, visual_rows, 1536)?,
+            &mut TensorMut(matrix32(&work.f32_b, s, visual_rows, 256)?),
+        )?;
+        blas.linear_f32(
+            f32_weight(&weights.gate_query, s, 256, 1536)?,
+            matrix32(&work.f32_c, s, 1, 1536)?,
+            &mut TensorMut(matrix32(&work.gate_query, s, 1, 256)?),
+        )?;
+        unsafe {
+            let gate_b = work.f32_b.device_ptr(s).0;
+            s.launch_builder(&self.add_row_silu)
+                .arg(&gate_b)
+                .arg(&work.gate_query)
+                .arg(&gate_b)
+                .arg(&((visual_rows * 256) as i32))
+                .arg(&256i32)
+                .launch(flat(visual_rows * 256))?;
+        }
+        blas.linear_f32(
+            f32_weight(&weights.gate_out, s, 1, 256)?,
+            matrix32(&work.f32_b, s, visual_rows, 256)?,
+            &mut TensorMut(matrix32(&work.f32_c, s, visual_rows, 1)?),
+        )?;
+        unsafe {
+            let score = work.f32_c.device_ptr(s).0;
+            let state_ptr = states.device_ptr(s).0 + (visual_begin * 1536 * 2) as u64;
+            s.launch_builder(&self.bias)
+                .arg(&score)
+                .arg(&f32_weight(&weights.gate_bias, s, 1, 1)?.ptr)
+                .arg(&score)
+                .arg(&(visual_rows as i32))
+                .arg(&1i32)
+                .launch(flat(visual_rows))?;
+            s.launch_builder(&self.gate_round)
+                .arg(&score)
+                .arg(&mut work.gates)
+                .arg(&(visual_rows as i32))
+                .launch(flat(visual_rows))?;
+            s.launch_builder(&self.anchor)
+                .arg(&state_ptr)
+                .arg(anchor)
+                .arg(&work.gates)
+                .arg(&f32_weight(&weights.raw_alpha, s, 1, 2)?.ptr)
+                .arg(&(visual_rows as i32))
+                .arg(&1536i32)
+                .arg(&(cycle as i32))
+                .launch(flat(visual_rows * 1536))?;
         }
         Ok(())
     }
@@ -1091,6 +1217,31 @@ mod tests {
         Ok(pass)
     }
 
+    fn reinject_reference(
+        initial: &[bf16],
+        visual_begin: usize,
+        visual_rows: usize,
+        gates: &[bf16],
+        alpha: f32,
+    ) -> Vec<bf16> {
+        let mut output = initial.to_vec();
+        let alpha = bf16::from_f32(alpha);
+        for (row, gate) in gates.iter().enumerate().take(visual_rows) {
+            let gate =
+                bf16::from_f32((f64::from(alpha.to_f32()) * f64::from(gate.to_f32())) as f32);
+            for column in 0..1536 {
+                let index = (visual_begin + row) * 1536 + column;
+                let delta = bf16::from_f32(
+                    (f64::from(gate.to_f32()) * f64::from(initial[index].to_f32())) as f32,
+                );
+                output[index] = bf16::from_f32(
+                    (f64::from(initial[index].to_f32()) + f64::from(delta.to_f32())) as f32,
+                );
+            }
+        }
+        output
+    }
+
     #[test]
     #[ignore = "authorized GPU window; FF_MODEL and FF_LOOPVL_FIXTURES"]
     fn loopvl_vision_gpu() -> Result<()> {
@@ -1101,9 +1252,11 @@ mod tests {
                 .context("Runner FAIL FF_LOOPVL_FIXTURES missing")?,
         );
         let spec = crate::model_spec::ModelSpec::read(&dir)?;
+        let mapped = crate::checkpoint::MappedCheckpoint::open(&dir)?;
+        let checkpoint_views = mapped.views()?;
         let d = Device::new(0)?;
         let s = &d.stream;
-        let weights = LoopvlVisionWeights::load(&dir, &spec, &d)?;
+        let mut weights = LoopvlVisionWeights::load(&dir, &spec, &d)?;
         ensure!(
             weights.gate_visual.len() == 256 * 1536 * 4
                 && weights.gate_query.len() == 256 * 1536 * 4
@@ -1199,6 +1352,170 @@ mod tests {
                 &projected_reference,
                 [1e-4, f32::MAX, 1e-5],
             )?);
+            if case == "image_hockey" {
+                let projected = s.clone_dtoh(&work.projected_bf16)?;
+                let embedding = checkpoint_views["model.safetensors"]
+                    .tensor("language_model.model.embed_tokens.weight")?;
+                let mut initial = vec![bf16::from_f32(0.0); input_ids.len() * 1536];
+                let embedding_scale = 39.191835884530846f64 as f32;
+                for position in 0..input_ids.len() {
+                    for column in 0..1536 {
+                        let index = position * 1536 + column;
+                        initial[index] = if (6..6 + rows).contains(&position) {
+                            bf16::from_f32(
+                                projected[(position - 6) * 1536 + column].to_f32()
+                                    * embedding_scale,
+                            )
+                        } else {
+                            let offset = (input_ids[position] as usize * 1536 + column) * 2;
+                            bf16::from_f32(
+                                bf16::from_bits(u16::from_le_bytes(
+                                    embedding.data()[offset..offset + 2].try_into()?,
+                                ))
+                                .to_f32()
+                                    * embedding_scale,
+                            )
+                        };
+                    }
+                }
+                let anchor = initial[6 * 1536..(6 + rows) * 1536].to_vec();
+                let anchor_dev = s.clone_htod(&anchor)?;
+                let mut device_states = s.clone_htod(&initial)?;
+                runtime.run_reinject(
+                    &blas,
+                    s,
+                    &mut work,
+                    ReinjectCall {
+                        weights: &weights,
+                        states: &mut device_states,
+                        anchor: &anchor_dev,
+                        visual_begin: 6,
+                        visual_rows: rows,
+                        instruction_begin: 6 + rows,
+                        instruction_end: input_ids.len(),
+                        cycle: 0,
+                    },
+                )?;
+                let gates = s.clone_dtoh(&work.gates)?;
+                let gates_f32: Vec<f32> = gates.iter().map(|v| v.to_f32()).collect();
+                defects += usize::from(!compare(
+                    "cycle0_gate",
+                    &gates_f32,
+                    &floats(&source, "gate_h0")?,
+                    [0.08, f32::MAX, 0.005],
+                )?);
+                let alphas = floats(&source, "alpha_h0_h1")?;
+                let actual = s.clone_dtoh(&device_states)?;
+                let expected = reinject_reference(&initial, 6, rows, &gates, alphas[0]);
+                let bit_mismatches = actual
+                    .iter()
+                    .zip(&expected)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                defects += usize::from(bit_mismatches != 0);
+                println!(
+                    "{} cycle0_reinjection bit_mismatches={bit_mismatches}",
+                    if bit_mismatches == 0 {
+                        "PASS"
+                    } else {
+                        "DEFECT"
+                    }
+                );
+                let saved_alpha = s.clone_dtoh(&weights.raw_alpha)?;
+                s.memcpy_htod(&[0u8; 8], &mut weights.raw_alpha)?;
+                ensure!(
+                    s.clone_dtoh(&weights.raw_alpha)? == [0u8; 8],
+                    "Runner FAIL zero alpha upload"
+                );
+                let mut zero_states = s.clone_htod(&initial)?;
+                runtime.run_reinject(
+                    &blas,
+                    s,
+                    &mut work,
+                    ReinjectCall {
+                        weights: &weights,
+                        states: &mut zero_states,
+                        anchor: &anchor_dev,
+                        visual_begin: 6,
+                        visual_rows: rows,
+                        instruction_begin: 6 + rows,
+                        instruction_end: input_ids.len(),
+                        cycle: 0,
+                    },
+                )?;
+                let zero = s.clone_dtoh(&zero_states)?;
+                let zero_gates = s.clone_dtoh(&work.gates)?;
+                let expected_zero = reinject_reference(&initial, 6, rows, &zero_gates, 0.25);
+                let bit_mismatches = zero
+                    .iter()
+                    .zip(&expected_zero)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                defects += usize::from(bit_mismatches != 0);
+                println!(
+                    "{} control5_zero_alpha_replica bit_mismatches={bit_mismatches}",
+                    if bit_mismatches == 0 {
+                        "PASS"
+                    } else {
+                        "DEFECT"
+                    }
+                );
+                let zero_f32: Vec<f32> = zero.iter().map(|v| v.to_f32()).collect();
+                let expected_f32: Vec<f32> = expected.iter().map(|v| v.to_f32()).collect();
+                let control_passes_good_bound = compare(
+                    "control5_zero_alpha_vs_reinjected",
+                    &zero_f32,
+                    &expected_f32,
+                    [f32::MAX, 0.20, 0.06],
+                )?;
+                defects += usize::from(control_passes_good_bound);
+                let skipped_f32: Vec<f32> = initial.iter().map(|v| v.to_f32()).collect();
+                let skip_passes_good_bound = compare(
+                    "control5_skip_h0_vs_reinjected",
+                    &skipped_f32,
+                    &expected_f32,
+                    [f32::MAX, 0.20, 0.06],
+                )?;
+                defects += usize::from(skip_passes_good_bound);
+                println!("PASS control5 zero_alpha_and_skip_h0 detected=true");
+                s.memcpy_htod(&saved_alpha, &mut weights.raw_alpha)?;
+                let mut cycle1_states = s.clone_htod(&initial)?;
+                runtime.run_reinject(
+                    &blas,
+                    s,
+                    &mut work,
+                    ReinjectCall {
+                        weights: &weights,
+                        states: &mut cycle1_states,
+                        anchor: &anchor_dev,
+                        visual_begin: 6,
+                        visual_rows: rows,
+                        instruction_begin: 6 + rows,
+                        instruction_end: input_ids.len(),
+                        cycle: 1,
+                    },
+                )?;
+                let cycle1 = s.clone_dtoh(&cycle1_states)?;
+                let expected1 = reinject_reference(&initial, 6, rows, &gates, alphas[1]);
+                let bit_mismatches = cycle1
+                    .iter()
+                    .zip(&expected1)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                defects += usize::from(bit_mismatches != 0);
+                println!(
+                    "{} cycle1_reinjection bit_mismatches={bit_mismatches}",
+                    if bit_mismatches == 0 {
+                        "PASS"
+                    } else {
+                        "DEFECT"
+                    }
+                );
+                ensure!(
+                    runtime.reinjection_calls.get() == 3,
+                    "DEFECT reinjection did not execute h0/h1 and control"
+                );
+            }
             println!(
                 "PASS {case} media_calls encoder=1 projector=1 isolated_projector=1 rows={rows}"
             );

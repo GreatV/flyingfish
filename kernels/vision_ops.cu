@@ -154,3 +154,63 @@ extern "C" __global__ void vision_rms_scale_f32(
         output_bf16[uint64_t(row) * width + i] = __float2bfloat16_rn(scaled);
     }
 }
+
+extern "C" __global__ void vision_add_row_silu_f32(
+    const float* input, const float* row, float* output, uint32_t count, uint32_t width) {
+    if (!vision_flat_launch() || !input || !row || !output || !count || !width ||
+        count % width) { __trap(); return; }
+    for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < count; i += gridDim.x * 256) {
+        float x = __fadd_rn(input[i], row[i % width]);
+        output[i] = __fdiv_rn(x, __fadd_rn(1.0f, expf(-x)));
+    }
+}
+
+extern "C" __global__ void vision_gate_round_bf16(
+    const float* score, __nv_bfloat16* gate, uint32_t count) {
+    if (!vision_flat_launch() || !score || !gate || !count) { __trap(); return; }
+    for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < count; i += gridDim.x * 256) {
+        float x = score[i];
+        float bounded = fminf(fmaxf(x, -8.0f), 8.0f);
+        float surrogate_score = __fadd_rn(x, __fsub_rn(bounded, x));
+        float raw = __fmul_rn(2.0f, __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-x))));
+        float surrogate = __fmul_rn(
+            2.0f, __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-surrogate_score))));
+        gate[i] = __float2bfloat16_rn(__fsub_rn(__fadd_rn(raw, surrogate), surrogate));
+    }
+}
+
+// BF16 sum and denominator, followed by one BF16 division per instruction column.
+extern "C" __global__ void vision_masked_mean_bf16(
+    const __nv_bfloat16* states, __nv_bfloat16* output,
+    int begin, int end, int width) {
+    if (!vision_flat_launch() || !states || !output || begin < 0 || end <= begin ||
+        width != 1536) { __trap(); return; }
+    for (int column = blockIdx.x * 256 + threadIdx.x; column < width;
+         column += gridDim.x * 256) {
+        float sum = 0.0f;
+        for (int row = begin; row < end; ++row)
+            sum = __fadd_rn(sum, __bfloat162float(states[uint64_t(row) * width + column]));
+        __nv_bfloat16 total = __float2bfloat16_rn(sum);
+        __nv_bfloat16 denominator = __float2bfloat16_rn(float(end - begin));
+        output[column] = __float2bfloat16_rn(
+            __fdiv_rn(__bfloat162float(total), __bfloat162float(denominator)));
+    }
+}
+
+// alpha and both products round to BF16 before the BF16 residual addition.
+extern "C" __global__ void vision_anchor_reinject_bf16(
+    __nv_bfloat16* states, const __nv_bfloat16* anchor,
+    const __nv_bfloat16* gates, const float* raw_alpha,
+    int visual_rows, int width, int cycle) {
+    if (!vision_flat_launch() || !states || !anchor || !gates || !raw_alpha ||
+        visual_rows < 1 || width != 1536 || cycle < 0 || cycle > 1) { __trap(); return; }
+    float alpha_f32 = __fmul_rn(
+        0.5f, __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-raw_alpha[cycle]))));
+    __nv_bfloat16 alpha = __float2bfloat16_rn(alpha_f32);
+    uint32_t count = uint32_t(visual_rows) * width;
+    for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < count; i += gridDim.x * 256) {
+        __nv_bfloat16 scaled_gate = __hmul(alpha, gates[i / width]);
+        __nv_bfloat16 delta = __hmul(scaled_gate, anchor[i]);
+        states[i] = __hadd(states[i], delta);
+    }
+}

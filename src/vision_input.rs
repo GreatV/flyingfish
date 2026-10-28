@@ -986,3 +986,112 @@ impl VisionPositions {
         Ok(result)
     }
 }
+
+#[cfg(test)]
+mod loopvl_tests {
+    use super::*;
+
+    fn delegate_grid(width: u32, height: u32, minimum: u32, maximum: u32) -> Result<(u32, u32)> {
+        let aspect = f64::from(height) / f64::from(width);
+        let raw_area = f64::from(width) * f64::from(height);
+        let min_pixels = f64::from(minimum) * 14.0 * 14.0 * 1.5;
+        let max_pixels = f64::from(maximum) * 14.0 * 14.0 * 0.95;
+        let target = if raw_area > max_pixels {
+            (max_pixels / 1.0).max(min_pixels)
+        } else {
+            raw_area
+        };
+        let aligned = |area: f64, ceil: bool| {
+            let w = (area / aspect).sqrt();
+            let h = w * aspect;
+            let align = |v: f64| {
+                let units = if ceil {
+                    (v / 14.0).ceil()
+                } else {
+                    (v / 14.0).round_ties_even()
+                };
+                (units as u32).max(1) * 14
+            };
+            (align(h), align(w))
+        };
+        let (mut h, mut w) = aligned(target, false);
+        if f64::from(h * w) < min_pixels {
+            let w_min = (min_pixels / aspect).sqrt();
+            let h_min = w_min * aspect;
+            h = ((h_min / 14.0).ceil() as u32).max(1) * 14;
+            w = ((w_min / 14.0).ceil() as u32).max(1) * 14;
+        }
+        Ok((h / 14, w / 14))
+    }
+
+    fn dynamic_grid(width: u32, height: u32, minimum: u32, maximum: u32) -> Result<(u32, u32)> {
+        ensure!(width > 0 && height > 0, "image extent");
+        ensure!(minimum > 0 && maximum >= minimum, "visual token budget");
+        let mut delegate_min = ((f64::from(minimum) / 1.5).floor() as u32).max(1);
+        let mut delegate_max = ((f64::from(maximum) / 0.95).ceil() as u32).max(delegate_min);
+        for _ in 0..12 {
+            let (gh, gw) = delegate_grid(width, height, delegate_min, delegate_max)?;
+            let count = gh * gw;
+            if (minimum..=maximum).contains(&count) {
+                return Ok((gh, gw));
+            }
+            if count > maximum {
+                delegate_max = delegate_min.max(
+                    (f64::from(delegate_max) * f64::from(maximum) / f64::from(count) * 0.98).floor()
+                        as u32,
+                );
+            } else {
+                delegate_min = delegate_max.min(
+                    (f64::from(delegate_min) * f64::from(minimum) / f64::from(count) * 1.02).ceil()
+                        as u32,
+                );
+            }
+        }
+        bail!("dynamic visual token budget did not converge")
+    }
+
+    fn pack_2x3(input: &[f32]) -> Vec<f32> {
+        let mut output = vec![0.0; 6 * 588];
+        for patch in 0..6 {
+            let pr = patch / 3;
+            let pc = patch % 3;
+            for channel in 0..3 {
+                for y in 0..14 {
+                    for x in 0..14 {
+                        let source = channel * 28 * 42 + (pr * 14 + y) * 42 + pc * 14 + x;
+                        let target = patch * 588 + channel * 196 + y * 14 + x;
+                        output[target] = input[source];
+                    }
+                }
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn loopvl_dynamic_grid_and_patch_packing() -> Result<()> {
+        assert_eq!(dynamic_grid(406, 266, 256, 2048)?, (19, 29));
+        assert_eq!(dynamic_grid(840, 476, 256, 2048)?, (34, 60));
+        for &(w, h) in &[(17, 4099), (4099, 17), (28, 28)] {
+            let (gh, gw) = dynamic_grid(w, h, 256, 2048)?;
+            assert!((256..=2048).contains(&(gh * gw)));
+        }
+        assert!(dynamic_grid(0, 28, 256, 2048).is_err());
+        let input: Vec<f32> = (0..3 * 28 * 42).map(|v| v as f32).collect();
+        let packed = pack_2x3(&input);
+        for patch in 0..6 {
+            for channel in 0..3 {
+                for y in 0..14 {
+                    for x in 0..14 {
+                        let source =
+                            channel * 28 * 42 + (patch / 3 * 14 + y) * 42 + patch % 3 * 14 + x;
+                        let target = patch * 588 + channel * 196 + y * 14 + x;
+                        assert_eq!(packed[target], input[source]);
+                    }
+                }
+            }
+        }
+        println!("PASS loopvl_dynamic_grid grids=19x29,34x60 patch_rows=6x588");
+        Ok(())
+    }
+}
