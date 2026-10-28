@@ -945,6 +945,11 @@ mod tests {
         ))?;
         ensure!(!cases.is_empty(), "attention fixtures empty");
         let ctx = crate::backend::gpu::CudaContext::new(0)?;
+        #[cfg(feature = "cuda")]
+        // SAFETY: every allocation, launch and copy uses the single test stream.
+        unsafe {
+            ctx.disable_event_tracking();
+        }
         let stream = ctx.new_stream()?;
         let mut defects = mask_controls(&stream, &limits)?;
         for case in &cases {
