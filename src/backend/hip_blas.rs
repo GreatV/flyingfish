@@ -1468,7 +1468,7 @@ mod tests {
     fn linear_own_operand_fp64_gpu() -> Result<()> {
         let device = crate::backend::cuda::Device::new(0)?;
         let s = &device.stream;
-        let blas = Blas::new(s.clone())?;
+        let mut blas = Blas::new(s.clone())?;
         let mut cells = 0;
         let mut defects = 0;
         for (bf16_input, geometry) in [
@@ -1504,9 +1504,37 @@ mod tests {
                             &x.iter().map(|v| bf16::from_f32(*v)).collect::<Vec<_>>(),
                         )?;
                         let mut dy = s.alloc_zeros::<bf16>(rows * output)?;
-                        let choice = blas.prepare_choice(shape, None, None)?;
-                        println!("HIP_AUDIT_CHOICE {}", serde_json::to_string(&choice)?);
-                        blas.linear_with_bias(shape, None, &dw, &dx, &mut dy)?;
+                        if input == 588 {
+                            let bias = s.alloc_zeros::<bf16>(output)?;
+                            let bias = view(&bias, s, 0, [output as u32], [1])?;
+                            blas.prepare_biased(
+                                rows as u32,
+                                output as u32,
+                                input as u32,
+                                bias,
+                                LinearBiasMode::AfterOutputRound,
+                            )?;
+                            blas.linear_biased(
+                                view(&dw, s, 0, [output as u32, input as u32], [input as u64, 1])?,
+                                bias,
+                                view(&dx, s, 0, [rows as u32, input as u32], [input as u64, 1])?,
+                                &mut TensorMut(view(
+                                    &dy,
+                                    s,
+                                    0,
+                                    [rows as u32, output as u32],
+                                    [output as u64, 1],
+                                )?),
+                                LinearBiasMode::AfterOutputRound,
+                            )?;
+                            println!(
+                                "HIP_AUDIT_PATCH shape={shape:?} compute=FP32 output=FP32 bias=AfterOutputRound zero_bias=true"
+                            );
+                        } else {
+                            let choice = blas.prepare_choice(shape, None, None)?;
+                            println!("HIP_AUDIT_CHOICE {}", serde_json::to_string(&choice)?);
+                            blas.linear_with_bias(shape, None, &dw, &dx, &mut dy)?;
+                        }
                         s.clone_dtoh(&dy)?
                             .into_iter()
                             .map(bf16::to_f32)
