@@ -117,11 +117,23 @@ unsafe fn probability<const D: usize>(a: f32, negative_peak: f32, scale: f32) ->
 }
 #[inline(always)]
 unsafe fn logarithm(a: f32) -> f32 {
-    let x: f32;
-    unsafe {
-        asm!("lg2.approx.f32 {x}, {a};",x=out(reg32) x,a=in(reg32) a);
+    let bits = a.to_bits();
+    let mut exponent = ((bits >> 23) & 0xff) as i32 - 127;
+    let mut mantissa = f32::from_bits((bits & 0x007f_ffff) | 0x3f80_0000);
+    if mantissa > core::f32::consts::SQRT_2 {
+        mantissa *= 0.5;
+        exponent += 1;
     }
-    x * core::f32::consts::LN_2
+    let t = (mantissa - 1.0) / (mantissa + 1.0);
+    let square = t * t;
+    let series = 1.0
+        + square
+            * (1.0 / 3.0
+                + square
+                    * (1.0 / 5.0
+                        + square
+                            * (1.0 / 7.0 + square * (1.0 / 9.0 + square * (1.0 / 11.0)))));
+    2.0 * t * series + exponent as f32 * core::f32::consts::LN_2
 }
 #[inline(always)]
 unsafe fn reciprocal(a: f32) -> f32 {
