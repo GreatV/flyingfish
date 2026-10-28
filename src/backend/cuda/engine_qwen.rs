@@ -1959,6 +1959,13 @@ impl Runtime {
             layer.linear.prepare(blas, rows)?;
             layer.ffn.prepare(blas, rows)?;
         }
+        if let Some(ops) = &self.gemma {
+            blas.prepare_fixed(
+                rows,
+                ops.per_layer_projection.shape[0],
+                ops.per_layer_projection.shape[1],
+            )?;
+        }
         blas.prepare_fixed(1, vocab, hidden)?;
         self.prepared.insert(rows);
         Ok(())
