@@ -888,6 +888,23 @@ fn native_path(
     Ok(out)
 }
 
+fn checkpoint_tensor(dir: &std::path::Path, name: &str) -> Result<Vec<bf16>> {
+    let bytes = std::fs::read(dir.join("model.safetensors"))?;
+    let tensors = SafeTensors::deserialize(&bytes)?;
+    let view = tensors.tensor(name)?;
+    ensure!(
+        view.dtype() == safetensors::Dtype::BF16,
+        "{name} is not BF16"
+    );
+    Ok(view
+        .data()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| bf16::from_le_bytes(*b))
+        .collect())
+}
+
 #[test]
 #[ignore = "requires Gemma 4 model-definition fixtures, FROZEN.json, model weights and a GPU window"]
 fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
@@ -919,6 +936,23 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         .runtime_dir
         .clone()
         .context("runtime directory missing")?;
+    let spec = crate::model_spec::ModelSpec::read(&dir)?;
+    let device = Device::new(0)?;
+    let catalog = super::weights::WeightCatalog::load(&dir, &spec, &device)?;
+    for name in [
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.q_norm.weight",
+        "self_attn.k_norm.weight",
+    ] {
+        let full = format!("model.language_model.layers.0.{name}");
+        let actual = catalog.bf16(&full)?;
+        let actual = device.stream.clone_dtoh(actual)?;
+        let expected = checkpoint_tensor(&dir, &full)?;
+        ensure!(actual == expected, "published tensor mismatch: {full}");
+    }
+    drop(catalog);
     let mut engine = super::engine::Engine::load(&dir, 0, 640, Some(640), settings)?;
     let first_ids: Vec<u32> = serde_json::from_value(ids["short"][0].clone())?;
     let mut trace = crate::trace::Trace::all_layers();
