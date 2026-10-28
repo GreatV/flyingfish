@@ -207,6 +207,17 @@ pub fn columns_from(
     );
     s.context().bind_to_thread()?;
     let (dst, _dst) = dst.device_ptr_mut(s);
+    columns_raw(s, src, dst, r)
+}
+
+fn columns_raw(s: &Arc<CudaStream>, src: u64, dst: u64, r: Rect) -> Result<()> {
+    ensure!(
+        r.rows > 0
+            && r.width > 0
+            && r.src_col + r.width <= r.src_pitch
+            && r.dst_col + r.width <= r.dst_pitch,
+        "invalid CUDA column copy rectangle"
+    );
     #[cfg(feature = "cuda")]
     let params = sys::CUDA_MEMCPY2D {
         srcXInBytes: r.src_col * 2,
@@ -252,6 +263,17 @@ pub(crate) struct RingCopy<'a> {
 }
 
 #[cfg(feature = "cuda")]
+pub(crate) struct RingCopyCall {
+    pub(crate) src: u64,
+    pub(crate) dst: u64,
+    pub(crate) source_start: usize,
+    pub(crate) target_start: usize,
+    pub(crate) rows: usize,
+    pub(crate) wrap_source: bool,
+    pub(crate) wrap_target: bool,
+}
+
+#[cfg(feature = "cuda")]
 impl RingCopy<'_> {
     pub(crate) fn run(
         self,
@@ -261,6 +283,32 @@ impl RingCopy<'_> {
         wrap_source: bool,
         wrap_target: bool,
     ) -> Result<()> {
+        let (src, dst) = {
+            let (src, _src) = self.source.device_ptr(self.stream);
+            let (dst, _dst) = self.target.device_ptr_mut(self.stream);
+            (src, dst)
+        };
+        self.run_raw(RingCopyCall {
+            src,
+            dst,
+            source_start,
+            target_start,
+            rows,
+            wrap_source,
+            wrap_target,
+        })
+    }
+
+    pub(crate) fn run_raw(self, call: RingCopyCall) -> Result<()> {
+        let RingCopyCall {
+            src,
+            dst,
+            source_start,
+            target_start,
+            rows,
+            wrap_source,
+            wrap_target,
+        } = call;
         ensure!(
             rows > 0 && rows <= self.source_capacity && rows <= self.target_capacity,
             "ring row copy extent exceeds capacity"
@@ -300,10 +348,10 @@ impl RingCopy<'_> {
             let count = remaining
                 .min(self.source_capacity - source_row)
                 .min(self.target_capacity - target_row);
-            columns(
+            columns_raw(
                 self.stream,
-                self.source,
-                self.target,
+                src,
+                dst,
                 Rect {
                     rows: self.heads,
                     width: count * self.head_dim,

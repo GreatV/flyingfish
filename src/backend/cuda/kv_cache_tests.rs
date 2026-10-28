@@ -57,7 +57,38 @@ fn ring_copy_geometry_gpu() -> Result<()> {
             }
             for graph in [false, true] {
                 let mut target = s.clone_htod(&empty)?;
-                let mut execute = |start| {
+                if graph {
+                    let (src, dst) = {
+                        let (src, _src) = source.device_ptr(s);
+                        let (dst, _dst) = target.device_ptr(s);
+                        (src, dst)
+                    };
+                    s.synchronize()?;
+                    s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                    let result = super::copy::RingCopy {
+                        stream: s,
+                        source: &source,
+                        target: &mut target,
+                        source_capacity,
+                        target_capacity,
+                        heads,
+                        head_dim,
+                    }
+                    .run_raw(super::copy::RingCopyCall {
+                        src,
+                        dst,
+                        source_start,
+                        target_start,
+                        rows,
+                        wrap_source,
+                        wrap_target,
+                    });
+                    let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                    result?;
+                    let captured = captured?.context("ring staging graph is empty")?;
+                    captured.launch()?;
+                    captured.launch()?;
+                } else {
                     super::copy::RingCopy {
                         stream: s,
                         source: &source,
@@ -67,18 +98,13 @@ fn ring_copy_geometry_gpu() -> Result<()> {
                         heads,
                         head_dim,
                     }
-                    .run(start, target_start, rows, wrap_source, wrap_target)
-                };
-                if graph {
-                    s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-                    let result = execute(source_start);
-                    let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
-                    result?;
-                    let captured = captured?.context("ring staging graph is empty")?;
-                    captured.launch()?;
-                    captured.launch()?;
-                } else {
-                    execute(source_start)?;
+                    .run(
+                        source_start,
+                        target_start,
+                        rows,
+                        wrap_source,
+                        wrap_target,
+                    )?;
                 }
                 let actual = s.clone_dtoh(&target)?;
                 ensure!(
