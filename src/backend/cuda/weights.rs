@@ -228,7 +228,7 @@ impl ExpertStorage {
                 .with_context(|| format!("register expert host arena: bytes={bytes}"))?;
             #[cfg(feature = "rocm")]
             self.context
-                .register_host(address as u64, bytes, false)
+                .register_host(address, bytes, false)
                 .with_context(|| format!("register expert host arena: bytes={bytes}"))?;
         }
         self.registered = true;
@@ -305,7 +305,7 @@ impl Drop for ExpertStorage {
         {
             let (address, _) = host.host_span();
             crate::backend::hip::drop_result(
-                unsafe { self.context.unregister_host(address as u64) }
+                unsafe { self.context.unregister_host(address) }
                     .context("unregister expert host storage"),
             );
         }
