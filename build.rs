@@ -75,6 +75,7 @@ const ROCM_KERNELS: &[&str] = &[
     "gdn/gdn_rstep",
     "gdn/gdn_chunked",
     "tcmqa",
+    "tcmqa_d256",
     "markov",
     "tree/meta",
     "tree/tree_rope_kv",
@@ -175,6 +176,11 @@ fn build_rocm(out: &std::path::Path) {
     for name in ROCM_KERNELS {
         let (suffix, defines): (&str, &[&str]) = if name.starts_with("gdn/") {
             ("_h32", &["-DGDN_HEADS=32"])
+        } else if *name == "tcmqa_d256" {
+            (
+                "_q16_kv2",
+                &["-DATTENTION_Q_HEADS=16", "-DATTENTION_KV_HEADS=2"],
+            )
         } else {
             ("", &[])
         };
@@ -188,7 +194,7 @@ fn build_rocm(out: &std::path::Path) {
         for arch in &archs {
             if matches!(
                 *name,
-                "gemm_skinny" | "tcmqa" | "markov" | "fp8_linear" | "moe_prefill"
+                "gemm_skinny" | "tcmqa" | "tcmqa_d256" | "markov" | "fp8_linear" | "moe_prefill"
             ) && !arch.starts_with("gfx11")
             {
                 continue;

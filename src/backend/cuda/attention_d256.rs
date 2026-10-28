@@ -6,9 +6,9 @@
 use super::contracts::{RowDomain, Scratch, SeqRef, Tensor, TensorMut};
 use super::cubin;
 use super::ops::{CommonOpsRef, RmsMode, RmsOptions};
+use crate::backend::gpu::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use crate::op_contract::{AttentionLimits, AttentionWorkspace, FullAttentionSpec, WorkspaceReq};
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use half::bf16;
 use std::mem::size_of;
 use std::sync::Arc;
@@ -23,7 +23,10 @@ const PHASE1_THREADS: u32 = 128;
 const PHASE2_THREADS: u32 = D;
 const PREP_THREADS: u32 = 256;
 /// `(MT + 2*KT) * (D + 8) * 2 + 64*8` from `kernels/tcmqa_d256.cu`.
+#[cfg(feature = "cuda")]
 const PHASE1_SMEM: u32 = 68096;
+#[cfg(feature = "rocm")]
+const PHASE1_SMEM: u32 = 62720;
 pub(super) const MASK_LEN: u32 = 64;
 
 fn rotary_query_extent(spec: &FullAttentionSpec, rows: u32) -> Result<u32> {
@@ -326,10 +329,19 @@ impl FullAttentionOps {
     ) -> Result<u32> {
         spec.validate()?;
         ensure!(capacity >= KT, "decode attention capacity is below KT=32");
+        #[cfg(feature = "rocm")]
+        ctx.require_wmma().context("HD256 decode attention")?;
+        #[cfg(feature = "cuda")]
         use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute_enum as F};
+        #[cfg(feature = "cuda")]
         let sms = u64::try_from(ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?)?;
+        #[cfg(feature = "rocm")]
+        let sms = u64::try_from(ctx.properties.compute_units)?;
         ensure!(sms > 0, "decode attention device has no multiprocessors");
+        #[cfg(feature = "cuda")]
         let optin = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?;
+        #[cfg(feature = "rocm")]
+        let optin = i32::try_from(ctx.properties.optin_shared_bytes)?;
         ensure!(
             optin >= PHASE1_SMEM as i32,
             "decode attention phase1 shared memory exceeds opt-in limit"
@@ -340,6 +352,7 @@ impl FullAttentionOps {
         } else {
             "tcmqa_d256_phase1"
         })?;
+        #[cfg(feature = "cuda")]
         function.set_attribute(
             F::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
             PHASE1_SMEM as i32,
@@ -413,6 +426,8 @@ impl FullAttentionOps {
         spec.validate()?;
         check_limits(limits)?;
         check_bindings(&bindings, limits, spec)?;
+        #[cfg(feature = "rocm")]
+        ctx.require_wmma().context("HD256 full attention")?;
         let ws = AttentionWorkspace::new(spec, limits.max_rows, limits.capacity, limits.key_chunk)?;
         let segment_rows = u32::try_from(ws.segment_rows)?;
         let max_parts = u32::try_from(ws.max_parts)?;
@@ -425,9 +440,13 @@ impl FullAttentionOps {
                 .context("phase-2 shared memory overflow")?,
         )
         .context("phase-2 shared memory exceeds u32")?;
+        #[cfg(feature = "cuda")]
         use cudarc::driver::sys::CUdevice_attribute as Attribute;
+        #[cfg(feature = "cuda")]
         let optin =
             ctx.attribute(Attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)? as u64;
+        #[cfg(feature = "rocm")]
+        let optin = ctx.properties.optin_shared_bytes;
         for (name, bytes) in [
             ("phase 1", u64::from(PHASE1_SMEM)),
             ("phase 2", u64::from(phase2_smem)),
@@ -458,6 +477,7 @@ impl FullAttentionOps {
                 "tcmqa_d256_phase1"
             })?;
             let phase2 = module.load_function("tcmqa_d256_phase2")?;
+            #[cfg(feature = "cuda")]
             for (function, bytes) in [(&phase1, PHASE1_SMEM), (&phase2, phase2_smem)] {
                 if bytes > 48 * 1024 {
                     function.set_attribute(
@@ -829,8 +849,8 @@ mod tests {
     use super::*;
     use crate::backend::cuda::moe::testing::view;
     use crate::backend::cuda::{Device, bf16_chain_bound};
+    use crate::backend::gpu::{CudaSlice, DevicePtr};
     use crate::op_contract::SequenceMeta;
-    use cudarc::driver::{CudaSlice, DevicePtr};
 
     #[test]
     fn new_head_geometry_rejects_old_kv_projection_and_cache_strides() -> Result<()> {
@@ -1276,7 +1296,9 @@ mod tests {
         let dev_v = stream.clone_htod(&v_proj)?;
         let dev_q = stream.alloc_zeros::<bf16>(max_rows as usize * hq * d)?;
         let dev_gate = stream.alloc_zeros::<bf16>(max_rows as usize * hq * d)?;
-        let mut dev_out = stream.clone_htod(&vec![nan; max_rows as usize * hq * d])?;
+        let dev_out = stream.clone_htod(&vec![nan; max_rows as usize * hq * d])?;
+        #[cfg(feature = "cuda")]
+        let mut dev_out = dev_out;
         let dev_k_cache = stream.clone_htod(&k_cache)?;
         let dev_v_cache = stream.clone_htod(&v_cache)?;
         let dev_q_norm = stream.clone_htod(&q_norm_w)?;
@@ -1403,6 +1425,7 @@ mod tests {
         };
         let common = CommonOpsRef::new(&device.ctx)?;
         let mut plan = FullAttentionOps::prepare(&device.ctx, &spec, limits, bindings, common)?;
+        #[cfg(feature = "cuda")]
         if mutant {
             let root = std::path::PathBuf::from(
                 std::env::var_os("FF_Q38_PROBE_DIR").context("FF_Q38_PROBE_DIR is required")?,
@@ -1416,6 +1439,13 @@ mod tests {
                 .context("geometry fixture unexpectedly shares kernels")?
                 .qg_split = module.load_function("tcmqa_d256_qg_split")?;
         }
+        #[cfg(feature = "rocm")]
+        if mutant {
+            plan.bindings.k_cache.0.stride[0] -= u64::from(D);
+        }
+        #[cfg(feature = "rocm")]
+        ensure!(!flash, "HIP external Flash fixture is unsupported");
+        #[cfg(feature = "cuda")]
         let mut flash_op = if flash {
             Some(super::super::flash::Flash::new(
                 stream.clone(),
@@ -1427,6 +1457,7 @@ mod tests {
         };
         device.finish_upload()?;
         let mut execute = || -> Result<()> {
+            #[cfg(feature = "cuda")]
             if let Some(op) = flash_op.as_mut() {
                 FullAttentionOps::preprocess(
                     &plan,
@@ -1437,7 +1468,7 @@ mod tests {
                         bytes: request.bytes,
                     },
                 )?;
-                op.run(
+                return op.run(
                     &dev_q,
                     hq * d,
                     &dev_k_cache,
@@ -1453,26 +1484,20 @@ mod tests {
                         causal: true,
                         window_left: None,
                     },
-                )
-            } else {
-                FullAttentionOps::run(
-                    &plan,
-                    stream,
-                    meta_ref,
-                    Scratch {
-                        ptr: scratch_ptr,
-                        bytes: request.bytes,
-                    },
-                )
+                );
             }
+            FullAttentionOps::run(
+                &plan,
+                stream,
+                meta_ref,
+                Scratch {
+                    ptr: scratch_ptr,
+                    bytes: request.bytes,
+                },
+            )
         };
         if graph {
-            use cudarc::driver::sys;
-            stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-            let run = execute();
-            let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
-            run?;
-            captured?.context("empty geometry graph")?.launch()?;
+            super::super::moe::testing::capture(stream, &mut execute)?.launch()?;
         } else {
             execute()?;
         }
@@ -1988,6 +2013,103 @@ mod tests {
             if defects == 0 { "PASS" } else { "DEFECT" }
         );
         ensure!(defects == 0, "full rotary attention defects={defects}");
+        Ok(())
+    }
+
+    #[cfg(feature = "rocm")]
+    #[test]
+    #[ignore = "requires HIP GPU lease and FF_Q38_GPU_WINDOW=granted"]
+    fn hip_hd256_gpu() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let device = Device::new(0)?;
+        let model = crate::model_spec::ModelSpec::minicpm(
+            &serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/data/minicpm-config.json"
+            )))?,
+            &serde_json::json!({"eos_token_id": [248044, 248046]}),
+        )?;
+        let spec = FullAttentionSpec::from_model(&model)?;
+        ensure!(
+            spec.hq == 16 && spec.hkv == 2 && spec.d == 256,
+            "fixture geometry"
+        );
+        let mut cases = 0;
+        let mut defects = 0;
+        for (rows, valid, prefix) in [
+            (1, 1, 257),
+            (3, 3, 23),
+            (17, 17, 127),
+            (37, 33, 263),
+            (65, 65, 23),
+            (129, 127, 257),
+        ] {
+            for chunk in [128, 256] {
+                let base = Case {
+                    spec,
+                    remap: true,
+                    graph: false,
+                    mutant: false,
+                    flash: false,
+                    prefix,
+                    valid_rows: valid,
+                    max_rows: rows,
+                    capacity: 4096,
+                    key_chunk: chunk,
+                    axes: None,
+                    oracle: true,
+                    boundary_probe: None,
+                };
+                let reference = run_shape(&device, base)?;
+                let graph = run_shape(
+                    &device,
+                    Case {
+                        graph: true,
+                        ..base
+                    },
+                )?;
+                let mismatches = reference
+                    .core_out
+                    .iter()
+                    .zip(&graph.core_out)
+                    .chain(reference.q.iter().zip(&graph.q))
+                    .chain(reference.k_cache.iter().zip(&graph.k_cache))
+                    .chain(reference.v_cache.iter().zip(&graph.v_cache))
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                let bad = reference.oracle_mismatches + graph.oracle_mismatches + mismatches;
+                println!(
+                    "HIP_HD256 rows={rows} valid={valid} prefix={prefix} key_chunk={chunk} mismatches={bad}"
+                );
+                cases += 2;
+                defects += usize::from(bad != 0);
+                if rows == 3 && chunk == 128 {
+                    let mutant = run_shape(
+                        &device,
+                        Case {
+                            mutant: true,
+                            oracle: false,
+                            ..base
+                        },
+                    )?;
+                    let differences = reference
+                        .core_out
+                        .iter()
+                        .zip(&mutant.core_out)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    ensure!(differences > 0, "HD256 KV head-stride mutant escaped");
+                    println!(
+                        "PASS HIP_HD256_CONTROL wrong_kv_head_stride differences={differences}"
+                    );
+                }
+            }
+        }
+        println!("HIP_HD256_SUMMARY cases={cases} defects={defects}");
+        ensure!(defects == 0, "HD256 defects={defects}");
         Ok(())
     }
 

@@ -1,4 +1,3 @@
-#[cfg(feature = "cuda")]
 pub(crate) mod attention_d256;
 #[cfg(feature = "cuda")]
 pub mod blas;
