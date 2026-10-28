@@ -853,6 +853,7 @@ unsafe fn attention_d512<const SPLIT: bool>(
         let mut output = [[0.0f32; 4]; 16];
         let mut peak = [f32::NEG_INFINITY; 2];
         let mut denominator = [0.0f32; 2];
+        let mut compensation = [0.0f32; 2];
         let mut key = begin;
         while key < stop {
             macro_rules! v_copy {
@@ -976,8 +977,13 @@ unsafe fn attention_d512<const SPLIT: bool>(
                 }};
             }
             four!(probabilities);
-            denominator[0] = denominator[0] * alpha[0] + sum[0];
-            denominator[1] = denominator[1] * alpha[1] + sum[1];
+            for i in 0..2 {
+                let scaled = denominator[i] * alpha[i];
+                let adjusted = sum[i] - compensation[i] * alpha[i];
+                let next = scaled + adjusted;
+                compensation[i] = (next - scaled) - adjusted;
+                denominator[i] = next;
+            }
             peak = next;
             macro_rules! rescale {
                 ($i:expr) => {{
@@ -1012,9 +1018,12 @@ unsafe fn attention_d512<const SPLIT: bool>(
             wait();
             key += 32;
         }
-        for x in &mut denominator {
-            *x += shuffle(*x, 1);
-            *x += shuffle(*x, 2);
+        for i in 0..2 {
+            denominator[i] += shuffle(denominator[i], 1);
+            denominator[i] += shuffle(denominator[i], 2);
+            compensation[i] += shuffle(compensation[i], 1);
+            compensation[i] += shuffle(compensation[i], 2);
+            denominator[i] -= compensation[i];
         }
         if SPLIT {
             macro_rules! write_partial {
