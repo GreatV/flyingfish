@@ -3588,6 +3588,44 @@ mod tests {
                     let x = s.clone_htod(&host)?;
                     let y = s.alloc_zeros::<bf16>((rows * width) as usize)?;
                     if rows == 1 {
+                        let zero = s.alloc_zeros::<bf16>(width as usize)?;
+                        blas.prepare_biased(
+                            rows,
+                            width,
+                            input,
+                            dense(&zero, s, [width])?,
+                            LinearBiasMode::AfterOutputRound,
+                        )?;
+                        blas.linear_biased(
+                            dense(&patch.weight, s, [width, input])?,
+                            dense(&zero, s, [width])?,
+                            dense(&x, s, [rows, input])?,
+                            &mut TensorMut(dense(&y, s, [rows, width])?),
+                            LinearBiasMode::AfterOutputRound,
+                        )?;
+                        let actual = s.clone_dtoh(&y)?;
+                        let wrong = actual
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, value)| {
+                                value.to_bits()
+                                    != bf16::from_f32(if *i < width as usize / 2 {
+                                        1.0
+                                    } else {
+                                        -1.0
+                                    })
+                                    .to_bits()
+                            })
+                            .count();
+                        patch_defects += usize::from(wrong != 0);
+                        println!(
+                            "{} VISION_PATCH_ZERO_BIAS input={input} bit_mismatches={wrong} positive_bits={} negative_bits={}",
+                            if wrong == 0 { "PASS" } else { "DEFECT" },
+                            actual[0].to_bits(),
+                            actual[width as usize / 2].to_bits()
+                        );
+                    }
+                    if rows == 1 {
                         ensure!(
                             patch
                                 .run(

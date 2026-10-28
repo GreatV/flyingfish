@@ -26,6 +26,9 @@ extern "C" __global__ void q38_vision_position_add(
     const __nv_bfloat16* patches, const __nv_bfloat16* bias,
     __nv_bfloat16* trace_patches, __nv_bfloat16* hidden, float* interpolated,
     uint32_t rows) {
+#if defined(__HIP__)
+#pragma clang fp contract(off)
+#endif
     if (!flat_launch() || !table || !indices || !weights || !patches ||
         !hidden || !interpolated || !rows || (trace_patches && !bias)) { __trap(); return; }
     uint64_t count = uint64_t(rows) * 1152;
