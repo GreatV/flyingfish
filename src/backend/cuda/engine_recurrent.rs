@@ -1460,6 +1460,54 @@ mod tests {
         ));
         let mut blas = Blas::new(&d, &runtime.ops, Path::new(""), closure)?;
         blas.bind_invariant(&d.ctx, 1)?;
+        let x: Vec<_> = (0..1024)
+            .map(|i| bf16::from_f32([1.0, 3.0, -1.0, -3.0, 1.0][i * 37 % 5]))
+            .collect();
+        let norm_weight = &weights.layers[0].post_norm;
+        let host_weight = s.clone_dtoh(norm_weight)?;
+        let square_sum: f32 = x.iter().map(|v| v.to_f32() * v.to_f32()).sum();
+        let inverse = (square_sum / 1024.0 + 1e-6).sqrt().recip();
+        let expected: Vec<_> = x
+            .iter()
+            .zip(&host_weight)
+            .map(|(x, w)| {
+                bf16::from_f32(bf16::from_f32(x.to_f32() * inverse).to_f32() * w.to_f32())
+            })
+            .collect();
+        let input = s.clone_htod(&x)?;
+        let residual = s.alloc_zeros::<bf16>(1024)?;
+        let output = s.alloc_zeros::<bf16>(1024)?;
+        let sum = s.alloc_zeros::<bf16>(1024)?;
+        let control = Ops::new(&d.ctx)?;
+        for (name, ops) in [
+            ("candidate", &runtime.ops),
+            ("old_binding_control", &control),
+        ] {
+            ops.add_rmsnorm(
+                s,
+                AddRmsNorm {
+                    input: matrix(&input, s, 1, 1024)?,
+                    residual: matrix(&residual, s, 1, 1024)?,
+                    weight: Some(vector(norm_weight, s, 1024)?),
+                    output: TensorMut(matrix(&output, s, 1, 1024)?),
+                    sum: TensorMut(matrix(&sum, s, 1, 1024)?),
+                    eps: 1e-6,
+                },
+            )?;
+            let actual = s.clone_dtoh(&output)?;
+            let differences = actual
+                .iter()
+                .zip(&expected)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            ensure!(
+                (differences == 0) == (name == "candidate"),
+                "DEFECT vision_norm_rounding {name} bit_mismatches={differences}"
+            );
+            println!(
+                "PASS vision_norm_rounding {name} stored=[1,1024] bit_mismatches={differences}"
+            );
+        }
         let mut defects = 0;
         let mut outputs = Vec::new();
         for case in ["image_hockey", "image_boat", "control_same_grid_boat"] {
