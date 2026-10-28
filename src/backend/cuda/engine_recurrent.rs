@@ -25,6 +25,7 @@ pub(super) struct Runtime {
     common: CommonOpsRef,
     program: Vec<(bool, usize)>,
     vision: VisionRuntime,
+    vision_attention: Flash,
     vision_weights: LoopvlVisionWeights,
     media: Option<Media>,
     #[cfg(test)]
@@ -669,8 +670,11 @@ impl Engine {
         let row_bytes = crate::work_layout::RowWorkSpec::new(&model_spec)?.row_bytes()?
             + 4 * config.hidden_size
             + config.num_attention_heads * 4;
-        let fixed =
-            manifest.resident_bytes + rows * row_bytes + capacity * 256 * 2 + 8 * 1024 * 1024;
+        let fixed = manifest.resident_bytes
+            + rows * row_bytes
+            + capacity * 256 * 2
+            + 2048 * 16 * 4
+            + 8 * 1024 * 1024;
         let per_token = model_spec.layers.len() * 2 * config.kv_dim() * 2;
         let available = free
             .checked_sub(total / 16 + fixed)
@@ -729,6 +733,7 @@ impl Engine {
             common: CommonOpsRef::new(&device.ctx)?,
             program: (0..8).map(|call| (call % 4 == 3, call * 16)).collect(),
             vision: VisionRuntime::new(&device.ctx)?,
+            vision_attention: Flash::new(s.clone(), 2048, 16, 8, 128)?,
             vision_weights,
             media: None,
             #[cfg(test)]
@@ -823,10 +828,10 @@ impl Engine {
         let slot = plan.slots()[0].clone();
         let rows = slot.tokens.len();
         let (free, total) = self.device.ctx.mem_get_info()?;
-        // Workspace, pixels, anchor and attention LSE: 73,130 B/patch plus 4,132 B.
+        // Workspace, pixels and anchor: 73,066 B/patch plus 4,132 B.
         ensure!(
             free.checked_sub(total / 16)
-                .is_some_and(|n| rows * 73_130 + 4_132 <= n),
+                .is_some_and(|n| rows * 73_066 + 4_132 <= n),
             "LoopVL vision request exceeds device memory budget"
         );
         let s = &self.device.stream;
@@ -842,7 +847,6 @@ impl Engine {
             "LoopVL pixels overflow BF16"
         );
         let pixels = s.clone_htod(&pixels)?;
-        let mut attention = Flash::new(s.clone(), rows, 16, 8, 128)?;
         let runtime = self
             .recurrent
             .as_mut()
@@ -850,7 +854,7 @@ impl Engine {
         let result = (|| -> Result<()> {
             runtime.vision.run_encoder(
                 &mut self.blas,
-                &mut attention,
+                &mut runtime.vision_attention,
                 s,
                 &mut work,
                 VisionEncoderCall {
@@ -870,7 +874,9 @@ impl Engine {
             )?;
             let axes = plan.packed_axes()?;
             let positions = axes
-                .chunks_exact(3)
+                .as_chunks::<3>()
+                .0
+                .iter()
                 .map(|p| [p[0] as usize, p[1] as usize])
                 .collect::<Vec<_>>();
             #[cfg(test)]
