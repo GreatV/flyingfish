@@ -106,6 +106,18 @@ pub(crate) struct FullAttentionPlan {
 }
 
 impl FullAttentionPlan {
+    pub(crate) fn with_single_row_segments(mut self) -> Result<Self> {
+        ensure!(
+            self.limits.causal == 1,
+            "single-row query segments require causal attention"
+        );
+        self.segment_rows = 1;
+        self.segments = self.limits.max_rows;
+        self.phase1_cfg.grid_dim.2 = (self.spec.hq / self.spec.hkv).div_ceil(SEG_MAX);
+        self.phase2_cfg.grid_dim.0 = self.spec.hq;
+        Ok(self)
+    }
+
     /// Setup-only prefix view with the original coordinate mode and addresses.
     pub(crate) fn for_rows(&self, rows: u32) -> Result<Self> {
         ensure!(
@@ -307,13 +319,14 @@ fn check_bindings(
 impl FullAttentionOps {
     pub(crate) fn decode_workspace(
         spec: &FullAttentionSpec,
+        rows: u32,
         capacity: u32,
     ) -> Result<WorkspaceReq> {
         ensure!(capacity >= KT, "decode attention capacity is below KT=32");
         Self::workspace(
             spec,
             AttentionLimits {
-                max_rows: 1,
+                max_rows: rows,
                 capacity,
                 key_chunk: 128.min(capacity / KT * KT),
                 causal: 1,

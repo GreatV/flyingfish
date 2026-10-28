@@ -822,7 +822,7 @@ impl StateCheckpoint {
         stream.memcpy_dtod(&self.token, token)?;
         Ok(())
     }
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(test)]
     pub(super) fn select_prefix(
         &self,
         store: &mut StateStore,
@@ -872,7 +872,6 @@ impl StateCheckpoint {
         }
         self.restore_kv_rows(store, accepted, self.active_rows, stream)
     }
-    #[cfg(feature = "cuda")]
     pub(super) fn restore_for_replay(
         &self,
         store: &mut StateStore,

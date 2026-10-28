@@ -285,7 +285,7 @@ impl Setup {
             runtime,
             geometry,
             model.expert_format.context("MoE expert_format missing")?,
-            if cfg!(feature = "cuda") && draft_config.is_some() {
+            if draft_config.is_some() {
                 crate::cpu::expert_ffn::Form::Lane16
             } else {
                 crate::cpu::expert_ffn::Form::Lane8
@@ -789,7 +789,6 @@ pub(super) struct SlotBindings {
 }
 
 impl Engine {
-    #[cfg(feature = "cuda")]
     pub(super) fn bind_invariant_arithmetic(&mut self) -> Result<()> {
         self.closure.bind_fixed()?;
         let executor = self

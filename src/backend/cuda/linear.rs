@@ -104,6 +104,7 @@ impl Fp8Ops {
         weight: LinearWeightRef,
         x: Tensor<bf16, 2>,
         y: &TensorMut<bf16, 2>,
+        invariant: bool,
     ) -> Result<ChannelProjection> {
         let LinearWeightRef::Fp8 {
             codes,
@@ -127,7 +128,7 @@ impl Fp8Ops {
             rows <= i32::MAX as u32,
             "HIP per-channel row extent exceeds i32"
         );
-        let tiled = rows > 1;
+        let tiled = rows > 1 && !invariant;
         let grid = if tiled {
             (output.div_ceil(64), rows.div_ceil(16))
         } else {
@@ -643,6 +644,7 @@ impl LayerLinearPlan {
         role: &str,
         x: Tensor<bf16, 2>,
         y: &TensorMut<bf16, 2>,
+        invariant: bool,
     ) -> Result<()> {
         let projection = self
             .projections
@@ -652,7 +654,7 @@ impl LayerLinearPlan {
             validate_call(weight.shape, x, &y.0)?;
             return disjoint(&weight, &y.0);
         }
-        let call = ops.bind_channel(projection.resident, x, y)?;
+        let call = ops.bind_channel(projection.resident, x, y, invariant)?;
         let key = (x.shape[0], x.ptr, y.0.ptr);
         let mut calls = projection.calls.borrow_mut();
         ensure!(

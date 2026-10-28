@@ -257,6 +257,7 @@ pub struct Blas {
     workspace: CudaSlice<u8>,
     skinny: Option<CudaFunction>,
     fp8: Option<crate::backend::gpu::linear::Fp8Ops>,
+    invariant_rows: usize,
     // Every plan accumulates in FP32 and adds bias before the BF16 output rounding.
     plans: RefCell<BTreeMap<Binding, Arc<Plan>>>,
 }
@@ -299,6 +300,7 @@ impl Blas {
             workspace,
             skinny,
             fp8: None,
+            invariant_rows: 0,
             plans: RefCell::new(BTreeMap::new()),
         };
         let handles =
@@ -570,7 +572,15 @@ impl Blas {
         if let Some(bias) = bias {
             bias.check_stream(&self.stream)?;
         }
-        let key = (shape, bias.map(|b| b.device_ptr(&self.stream).0));
+        let binding = LinearShape {
+            rows: if (1..=self.invariant_rows).contains(&shape.rows) {
+                1
+            } else {
+                shape.rows
+            },
+            ..shape
+        };
+        let key = (binding, bias.map(|b| b.device_ptr(&self.stream).0));
         let plans = self.plans.borrow();
         let plan = plans
             .get(&key)
@@ -607,6 +617,20 @@ impl Blas {
     }
 
     fn library_raw(&self, plan: &Arc<Plan>, shape: LinearShape, pointers: [u64; 3]) -> Result<()> {
+        if (2..=self.invariant_rows).contains(&shape.rows) {
+            for row in 0..shape.rows {
+                self.library_raw(
+                    plan,
+                    LinearShape { rows: 1, ..shape },
+                    [
+                        pointers[0],
+                        pointers[1] + (row * shape.input * size_of::<bf16>()) as u64,
+                        pointers[2] + (row * shape.output * size_of::<bf16>()) as u64,
+                    ],
+                )?;
+            }
+            return Ok(());
+        }
         self.stream.context().bind_to_thread()?;
         self.stream.retain(plan);
         let [a, b, c] = pointers;
@@ -835,7 +859,11 @@ impl Blas {
     pub(crate) fn prepare_fixed(&self, rows: u32, output: u32, input: u32) -> Result<()> {
         self.prepare_choice(
             LinearShape {
-                rows: rows as usize,
+                rows: if (1..=self.invariant_rows).contains(&(rows as usize)) {
+                    1
+                } else {
+                    rows as usize
+                },
                 output: output as usize,
                 input: input as usize,
             },
@@ -900,8 +928,16 @@ impl Blas {
             return self.wmma_raw(shape, shape.input, [w.ptr, x.ptr, y.0.ptr, 0]);
         }
         let plans = self.plans.borrow();
+        let binding = LinearShape {
+            rows: if (1..=self.invariant_rows).contains(&shape.rows) {
+                1
+            } else {
+                shape.rows
+            },
+            ..shape
+        };
         let plan = plans
-            .get(&(shape, None))
+            .get(&(binding, None))
             .context("HIP fixed linear shape not prepared")?;
         if plan.choice.implementation == Implementation::Wmma {
             return self.wmma_raw(shape, shape.input, [w.ptr, x.ptr, y.0.ptr, 0]);
@@ -1018,9 +1054,27 @@ fn binary_key() -> Result<String> {
 }
 
 impl Blas {
+    pub(crate) fn bind_invariant(
+        &mut self,
+        ctx: &Arc<crate::backend::gpu::CudaContext>,
+        rows: usize,
+    ) -> Result<()> {
+        ctx.require_wmma()?;
+        ensure!(
+            (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&rows),
+            "HIP invariant row bound exceeds skinny capacity: {rows}"
+        );
+        self.invariant_rows = rows;
+        Ok(())
+    }
+
     pub fn prepare(&self, rows: usize, output: usize, input: usize) -> Result<()> {
         let shape = LinearShape {
-            rows,
+            rows: if (1..=self.invariant_rows).contains(&rows) {
+                1
+            } else {
+                rows
+            },
             output,
             input,
         };

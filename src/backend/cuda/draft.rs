@@ -7,19 +7,16 @@ use super::{
     verification::Verification,
     weights::{Layer, checkpoint},
 };
-#[cfg(feature = "cuda")]
 use super::{
     attention_d256::{
         AttentionBindings, FullAttentionOps, FullAttentionPlan, MASK_LEN, PositionBindings,
     },
     contracts::{Scratch, SeqRef},
 };
-#[cfg(feature = "cuda")]
 use super::{
     contracts::{TensorMut, view},
     ops::{CommonOpsRef, RmsMode},
 };
-#[cfg(feature = "cuda")]
 use crate::backend::gpu::DevicePtr;
 use crate::backend::gpu::{CudaSlice, CudaStream, DevicePtrMut, PushKernelArg};
 use crate::{config::Config, dspark::DraftConfig, trace::Trace};
@@ -40,11 +37,9 @@ enum Output {
 
 enum Attention {
     Cached(Verification),
-    #[cfg(feature = "cuda")]
     Block(BlockAttention),
 }
 
-#[cfg(feature = "cuda")]
 struct BlockAttention {
     layers: Vec<FullAttentionPlan>,
     metadata: CudaSlice<i32>,
@@ -54,7 +49,6 @@ struct BlockAttention {
     prepare: crate::backend::gpu::CudaFunction,
 }
 
-#[cfg(feature = "cuda")]
 impl BlockAttention {
     fn new(draft: &Draft, device: &Device) -> Result<Self> {
         use crate::op_contract::{AttentionLimits, FullAttentionSpec};
@@ -252,7 +246,7 @@ pub struct Draft {
     rows: usize,
     stream: Arc<CudaStream>,
     attention: Option<Attention>,
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(test)]
     position_shift: i32,
     qknorm_rope_kv: crate::backend::gpu::CudaFunction,
     norm: crate::backend::gpu::CudaFunction,
@@ -512,7 +506,7 @@ impl Draft {
             rows,
             stream: s.clone(),
             attention: None,
-            #[cfg(all(test, feature = "cuda"))]
+            #[cfg(test)]
             position_shift: 0,
             qknorm_rope_kv,
             norm: norm_module.load_function(norm_name)?,
@@ -859,7 +853,6 @@ impl Draft {
         if self.attention.is_some() {
             return Ok(());
         }
-        #[cfg(feature = "cuda")]
         if self.config.head_dim == 256 {
             self.attention = Some(Attention::Block(BlockAttention::new(self, d)?));
             return Ok(());
@@ -1049,7 +1042,6 @@ impl Draft {
             "draft bit comparison range exceeds KV"
         );
         let s = &self.stream;
-        #[cfg(feature = "cuda")]
         if let Some(Attention::Block(attention)) = &self.attention {
             for values in [&attention.metadata, &attention.positions] {
                 out.extend(s.clone_dtoh(values)?.iter().flat_map(|v| v.to_le_bytes()));
@@ -1147,7 +1139,6 @@ impl Draft {
                 .arg(&(h as i32))
                 .launch(flat(block_rows * h))?;
         }
-        #[cfg(feature = "cuda")]
         if let Some(Attention::Block(attention)) = &mut self.attention {
             let shift = {
                 #[cfg(test)]
@@ -1240,7 +1231,6 @@ impl Draft {
                         },
                     )?;
                 }
-                #[cfg(feature = "cuda")]
                 Attention::Block(attention) => {
                     let (metadata, _meta_hold) = attention.metadata.device_ptr(s);
                     let (scratch, _scratch_hold) = attention.scratch.device_ptr(s);

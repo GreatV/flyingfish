@@ -871,8 +871,9 @@ fn fp8_published_expert_gpu() -> Result<()> {
         "fp8_channel_bf16_simt",
         "fp8_channel_bf16_wmma",
         "bound_channel",
+        "bound_channel_invariant",
     ] {
-        let function = if name == "bound_channel" {
+        let function = if name.starts_with("bound_channel") {
             None
         } else {
             Some(module.load_function(name)?)
@@ -890,7 +891,7 @@ fn fp8_published_expert_gpu() -> Result<()> {
             let mut output = s.clone_htod(&vec![sentinel; rows * 2048 + 16])?;
             let input_view = contracts::view(&input, &s, 0, [rows as u32, 2048], [2048, 1])?;
             let hidden_view = contracts::view(&hidden, &s, 0, [rows as u32, 512], [512, 1])?;
-            let bound = if name == "bound_channel" {
+            let bound = if name.starts_with("bound_channel") {
                 let bind = |stage: usize, x, y, n: u32, k: u32| {
                     channel_ops.bind_channel(
                         linear::LinearWeightRef::Fp8 {
@@ -912,6 +913,7 @@ fn fp8_published_expert_gpu() -> Result<()> {
                             [rows as u32, n],
                             [u64::from(n), 1],
                         )?),
+                        name == "bound_channel_invariant",
                     )
                 };
                 Some([

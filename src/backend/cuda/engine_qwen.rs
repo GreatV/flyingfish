@@ -617,9 +617,16 @@ impl Runtime {
             FullAttentionOps::preprocess_workspace(&attention, limits(rows, capacity)?)?
         };
         let attention_decode =
-            FullAttentionOps::decode_workspace(&attention, u32::try_from(capacity)?)?;
-        let attention_nested_verify =
-            FullAttentionOps::workspace(&attention, limits(rows.min(verify_rows), capacity)?)?;
+            FullAttentionOps::decode_workspace(&attention, 1, u32::try_from(capacity)?)?;
+        let attention_nested_verify = if cfg!(feature = "rocm") {
+            FullAttentionOps::decode_workspace(
+                &attention,
+                u32::try_from(rows.min(verify_rows))?,
+                u32::try_from(capacity)?,
+            )?
+        } else {
+            FullAttentionOps::workspace(&attention, limits(rows.min(verify_rows), capacity)?)?
+        };
         let spec = gdn;
         let prefill = GdnOps::workspace(&spec, u32::try_from(rows)?, policy)?;
         let decode = GdnOps::workspace(&spec, 1, GdnPolicy::P2)?;
@@ -651,8 +658,9 @@ impl Runtime {
         arena: Option<CudaSlice<u8>>,
         scratch_buffer: CudaSlice<u8>,
         kv_scratch: Option<(CudaSlice<bf16>, CudaSlice<bf16>)>,
-        verify_rows: usize,
+        verification: (usize, bool),
     ) -> Result<Self> {
+        let (verify_rows, invariant) = verification;
         let s = &engine.device.stream;
         let rows = engine.workspace_rows;
         let flint = engine.model_spec.architecture == crate::model_spec::Architecture::Flint;
@@ -879,7 +887,28 @@ impl Runtime {
                                 false,
                             )?,
                             (rows, verify_rows),
-                            FullAttentionPlan::for_rows,
+                            |plan, rows| {
+                                if cfg!(feature = "rocm") && invariant {
+                                    bind(
+                                        AttentionLimits {
+                                            max_rows: rows,
+                                            ..decode_limits
+                                                .context("verify attention limits missing")?
+                                        },
+                                        PositionBindings::Axes(view(
+                                            &active_positions,
+                                            s,
+                                            0,
+                                            [rows, 3],
+                                            [3, 1],
+                                        )?),
+                                        false,
+                                    )?
+                                    .with_single_row_segments()
+                                } else {
+                                    plan.for_rows(rows)
+                                }
+                            },
                         )?;
                         ensure!(
                             text_prefill
@@ -1042,11 +1071,11 @@ impl Runtime {
             verify_rows,
         };
         #[cfg(feature = "rocm")]
-        runtime.bind_linear_calls(engine)?;
+        runtime.bind_linear_calls(engine, invariant)?;
         Ok(runtime)
     }
     #[cfg(feature = "rocm")]
-    fn bind_linear_calls(&self, engine: &Engine) -> Result<()> {
+    fn bind_linear_calls(&self, engine: &Engine, invariant: bool) -> Result<()> {
         if engine.model_spec.linear_format.fp8_layout().is_none() {
             return Ok(());
         }
@@ -1063,6 +1092,7 @@ impl Runtime {
             .collect::<Result<BTreeSet<_>>>()?;
         for rows in buckets {
             let rows = rows as usize;
+            let invariant = invariant && rows <= crate::linear_plan::MAX_SKINNY_ROWS;
             for layer in &self.layers {
                 let input = matrix(&work.n, stream, 0, rows, hidden)?;
                 let (role, width) = match &layer.mixer {
@@ -1081,6 +1111,7 @@ impl Runtime {
                                 role,
                                 input,
                                 &TensorMut(matrix(&work.qkv, stream, offset, rows, width)?),
+                                invariant,
                             )?;
                         }
                         ("self_attn.o_proj.weight", q_width)
@@ -1110,6 +1141,7 @@ impl Runtime {
                                 role,
                                 input,
                                 &TensorMut(matrix(buffer, stream, offset, rows, width)?),
+                                invariant,
                             )?;
                         }
                         ("linear_attn.out_proj.weight", value)
@@ -1120,6 +1152,7 @@ impl Runtime {
                     role,
                     matrix(&work.attn, stream, 0, rows, width)?,
                     &TensorMut(matrix(&work.out, stream, 0, rows, hidden)?),
+                    invariant,
                 )?;
             }
         }
@@ -1224,7 +1257,7 @@ impl Engine {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", test))]
     pub(super) fn bind_gdn_snapshots(
         &mut self,
         snapshots: &[super::super::state::GdnState],
@@ -1344,7 +1377,6 @@ impl Engine {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     pub(super) fn replay_gdn_prefix(&mut self, start: usize, committed: usize) -> Result<()> {
         ensure!(committed > 0, "GDN replay requires committed > 0");
         let s = &self.device.stream;
@@ -1586,10 +1618,9 @@ impl Engine {
         #[cfg(feature = "rocm")]
         ensure!(
             model_spec.architecture == crate::model_spec::Architecture::MiniCpmV47
-                && settings.draft_model.is_none()
                 && !settings.prefix_cache
                 && settings.kv_format == crate::kv::KvFormat::Bf16,
-            "HIP hybrid setup requires MiniCPM-V-4.7 text with BF16 KV, no draft or persistent prefix cache"
+            "HIP hybrid setup requires MiniCPM-V-4.7 text with BF16 KV and no persistent prefix cache"
         );
         ensure!(
             model_spec.moe.is_none() || !reserve_mtp,
@@ -1966,9 +1997,21 @@ impl Engine {
                     FullAttentionOps::preprocess_workspace(attention, limits(rows, capacity)?)?
                         .bytes
                 },
-                FullAttentionOps::decode_workspace(attention, u32::try_from(capacity)?)?.bytes,
-                FullAttentionOps::workspace(attention, limits(rows.min(verify_rows), capacity)?)?
-                    .bytes,
+                FullAttentionOps::decode_workspace(attention, 1, u32::try_from(capacity)?)?.bytes,
+                if cfg!(feature = "rocm") {
+                    FullAttentionOps::decode_workspace(
+                        attention,
+                        u32::try_from(rows.min(verify_rows))?,
+                        u32::try_from(capacity)?,
+                    )?
+                    .bytes
+                } else {
+                    FullAttentionOps::workspace(
+                        attention,
+                        limits(rows.min(verify_rows), capacity)?,
+                    )?
+                    .bytes
+                },
             )
         };
         let (gdn_prefill_bytes, gdn_decode_bytes) = if flint {
@@ -1982,6 +2025,8 @@ impl Engine {
         };
         let (prefill_backend, decode_backend) = if flint {
             ("FA2 d128 sliding/full", "flash decode d128")
+        } else if cfg!(feature = "rocm") {
+            ("TCMQA d256", "TCMQA d256")
         } else {
             ("native Rust d256", "TCMQA d256")
         };
@@ -2139,7 +2184,7 @@ impl Engine {
             arena,
             scratch_buffer,
             kv_scratch,
-            verify_rows,
+            (verify_rows, draft_config.is_some()),
         )?);
         #[cfg(feature = "cuda")]
         if flint {
@@ -2172,7 +2217,11 @@ impl Engine {
             engine.declare_graphs()?;
         }
         #[cfg(feature = "rocm")]
-        engine.initialize_hip_hybrid(dir)?;
+        engine.initialize_hip_hybrid(dir, settings.draft_model.as_deref(), context_rows)?;
+        #[cfg(feature = "rocm")]
+        if engine.spec.is_some() {
+            engine.bind_invariant_arithmetic()?;
+        }
         engine.prepare(1)?;
         engine.prepare_prefill_plans()?;
         engine
@@ -2243,7 +2292,12 @@ impl Engine {
         Ok(())
     }
     #[cfg(feature = "rocm")]
-    fn initialize_hip_hybrid(&self, model: &Path) -> Result<()> {
+    fn initialize_hip_hybrid(
+        &self,
+        model: &Path,
+        draft_path: Option<&Path>,
+        context_rows: usize,
+    ) -> Result<()> {
         use super::super::closure::{Profile, hash, write_cache};
         use crate::backend::{gpu::blas::Choice, setup::LinearShape};
         let runtime = self.qwen.as_ref().context("HIP hybrid runtime missing")?;
@@ -2267,7 +2321,19 @@ impl Engine {
                 }
             }
         }
-        let profile = Profile::hip_hybrid(linear, self.capacity, self.workspace_rows, model)?;
+        let draft = self
+            .spec
+            .as_ref()
+            .map(|spec| -> Result<_> {
+                Ok((
+                    &spec.draft.config,
+                    draft_path.context("HIP hybrid draft path missing")?,
+                    context_rows,
+                ))
+            })
+            .transpose()?;
+        let profile =
+            Profile::hip_hybrid(linear, self.capacity, self.workspace_rows, model, draft)?;
         let identity = self.blas.identity().clone();
         let tag = hash(&serde_json::to_vec(&(&identity, &profile))?);
         let path = self.runtime.join(format!("hip-hybrid-{tag}.json"));
@@ -2308,7 +2374,7 @@ impl Engine {
                 let weight = if shape.output == self.config.vocab_size
                     && shape.input == self.config.hidden_size
                 {
-                    &self.weights.head
+                    Some(&self.weights.head)
                 } else {
                     runtime
                         .catalog
@@ -2328,11 +2394,19 @@ impl Engine {
                                 _ => None,
                             }
                         })
-                        .with_context(|| {
-                            format!("HIP hybrid calibration weight missing: {shape:?}")
-                        })?
                 };
-                choices.push(self.blas.calibrate_shape(shape, weight, &input)?);
+                let choice = if let Some(weight) = weight {
+                    self.blas.calibrate_shape(shape, weight, &input)?
+                } else {
+                    let draft = &self
+                        .spec
+                        .as_ref()
+                        .context("HIP hybrid calibration shape lacks target/draft weight")?
+                        .draft;
+                    self.blas
+                        .calibrate_shape(shape, &draft.calibration_weight(shape)?, &input)?
+                };
+                choices.push(choice);
             }
             write_cache(&path, &choices)?;
             choices
