@@ -69,7 +69,7 @@ pub struct Score {
 }
 
 impl Score {
-    pub fn unit(window_tokens: Option<usize>) -> Result<Self> {
+    pub fn from_tokens(scale: f32, window_tokens: Option<usize>) -> Result<Self> {
         let window_left = window_tokens
             .map(|tokens| {
                 tokens
@@ -77,10 +77,7 @@ impl Score {
                     .context("attention window must contain a token")
             })
             .transpose()?;
-        Ok(Self {
-            scale: 1.0,
-            window_left,
-        })
+        Ok(Self { scale, window_left })
     }
 }
 
@@ -139,7 +136,19 @@ impl Flash {
         head_dim: usize,
     ) -> Result<Self> {
         ensure!(head_dim != 512, "D512 requires an explicit score binding");
-        Self::bind(stream, rows, heads, kv_heads, head_dim, None)
+        let scale = if head_dim == 256 {
+            0.0625
+        } else {
+            std::f32::consts::FRAC_1_SQRT_2 / 8.0
+        };
+        Self::new_with_score(
+            stream,
+            rows,
+            heads,
+            kv_heads,
+            head_dim,
+            Score::from_tokens(scale, None)?,
+        )
     }
 
     pub fn new_with_score(
@@ -151,8 +160,8 @@ impl Flash {
         score: Score,
     ) -> Result<Self> {
         ensure!(
-            matches!(head_dim, 256 | 512),
-            "explicit score binding requires D256 or D512"
+            matches!(head_dim, 128 | 256 | 512),
+            "score binding requires D128, D256 or D512"
         );
         ensure!(
             score.scale.is_finite() && score.scale > 0.0,
@@ -166,7 +175,25 @@ impl Flash {
             head_dim != 512 || score.window_left.is_none(),
             "D512 binds full causal attention"
         );
-        Self::bind(stream, rows, heads, kv_heads, head_dim, Some(score))
+        let legacy_scale = if head_dim == 256 {
+            0.0625
+        } else {
+            std::f32::consts::FRAC_1_SQRT_2 / 8.0
+        };
+        let explicit =
+            head_dim == 512 || score.scale != legacy_scale || score.window_left.is_some();
+        ensure!(
+            head_dim != 128 || !explicit,
+            "D128 explicit score is not bound"
+        );
+        Self::bind(
+            stream,
+            rows,
+            heads,
+            kv_heads,
+            head_dim,
+            explicit.then_some(score),
+        )
     }
 
     fn bind(
@@ -639,9 +666,9 @@ mod tests {
 
     #[test]
     fn unit_window_excludes_first_expired_key() {
-        assert!(Score::unit(Some(0)).is_err());
+        assert!(Score::from_tokens(1.0, Some(0)).is_err());
         for tokens in [1usize, 512, 1024] {
-            let score = Score::unit(Some(tokens)).unwrap();
+            let score = Score::from_tokens(1.0, Some(tokens)).unwrap();
             let left = score.window_left.unwrap();
             for query in [0usize, tokens - 1, tokens, tokens + 1, 4095] {
                 for key in 0..=query {
