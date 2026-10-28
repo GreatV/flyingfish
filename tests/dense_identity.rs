@@ -158,6 +158,17 @@ fn hybrid_model_identity_gpu() -> Result<()> {
         std::env::var("FF_DENSE_GPU_WINDOW").as_deref() == Ok("granted"),
         "GPU window not acknowledged"
     );
+    #[cfg(feature = "rocm")]
+    {
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("fixtures/minicpm_reference.json"))?;
+        for case in fixtures["cases"]
+            .as_array()
+            .context("hybrid fixture cases missing")?
+        {
+            frozen_hybrid_limits(case)?;
+        }
+    }
     let target = PathBuf::from(std::env::var("FF_ARGMAX_MODEL")?);
     let specification = flyingfish::model_spec::ModelSpec::read(&target)?;
     ensure!(
@@ -266,15 +277,7 @@ fn hybrid_model_reference_outputs() -> Result<()> {
         let rows = case["rows"]
             .as_u64()
             .context("hybrid fixture rows missing")?;
-        let limits: ReferenceLimits = serde_json::from_value(case["limits"].clone())
-            .context("hybrid reference limits must be frozen before HIP model execution")?;
-        ensure!(
-            limits.max_normalized.is_finite()
-                && limits.max_normalized >= 0.0
-                && limits.rms_normalized.is_finite()
-                && limits.rms_normalized >= 0.0,
-            "invalid hybrid reference limits"
-        );
+        let limits = frozen_hybrid_limits(case)?;
         let bytes =
             std::fs::read(reference.join(format!("{name}-chunk{rows}-repeat0.safetensors")))?;
         let tensors = safetensors::SafeTensors::deserialize(&bytes)?;
@@ -354,6 +357,19 @@ fn hybrid_model_reference_outputs() -> Result<()> {
     println!("HYBRID_MODEL_REFERENCE_OUTPUTS cells={cells} defects={defects} limits_frozen=true");
     ensure!(defects == 0, "hybrid model reference defects={defects}");
     Ok(())
+}
+
+fn frozen_hybrid_limits(case: &serde_json::Value) -> Result<ReferenceLimits> {
+    let limits: ReferenceLimits = serde_json::from_value(case["limits"].clone())
+        .context("hybrid reference limits must be frozen before HIP model execution")?;
+    ensure!(
+        limits.max_normalized.is_finite()
+            && limits.max_normalized >= 0.0
+            && limits.rms_normalized.is_finite()
+            && limits.rms_normalized >= 0.0,
+        "invalid hybrid reference limits"
+    );
+    Ok(limits)
 }
 
 #[test]
