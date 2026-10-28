@@ -11,7 +11,7 @@ use crate::backend::cuda::{
     ops::{RmsMode, RmsOptions},
     weights::LoopvlVisionWeights,
 };
-use cudarc::driver::{CudaFunction, DevicePtr};
+use crate::backend::gpu::{CudaFunction, DevicePtr};
 
 pub(super) struct Runtime {
     initial: CudaSlice<bf16>,
@@ -697,7 +697,10 @@ impl Engine {
             "LoopVL fixed setup".into(),
         ));
         let runtime = settings.runtime_dir.clone().unwrap_or_default();
+        #[cfg(feature = "cuda")]
         let mut blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
+        #[cfg(feature = "rocm")]
+        let mut blas = Blas::new(s.clone())?;
         blas.bind_invariant(&device.ctx, 1)?;
         for n in [1] {
             for (output, input) in [
