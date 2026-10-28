@@ -1,14 +1,50 @@
 //! Shared helpers for the GPU-gate tests.
 use crate::backend::cuda::contracts::{Tensor, TensorMut, dense_layout};
+use crate::backend::gpu::{CudaSlice, CudaStream, DevicePtr, DeviceRepr, ValidAsZeroBits};
 use anyhow::Result;
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DeviceRepr, ValidAsZeroBits};
 use std::sync::Arc;
+
+pub(crate) fn capture(
+    stream: &Arc<CudaStream>,
+    operation: impl FnOnce() -> Result<()>,
+) -> Result<crate::backend::gpu::CudaGraph> {
+    #[cfg(feature = "cuda")]
+    {
+        use anyhow::Context;
+        use cudarc::driver::sys;
+        stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+        let result = operation();
+        let graph = stream.end_capture(sys::CUgraphInstantiate_flags(0));
+        result?;
+        graph?.context("empty MoE gate graph")
+    }
+    #[cfg(feature = "rocm")]
+    {
+        let capture = stream.begin_capture()?;
+        operation()?;
+        capture.finish()
+    }
+}
 
 pub(crate) fn upload<T: DeviceRepr>(
     stream: &Arc<CudaStream>,
     values: Vec<T>,
 ) -> Result<CudaSlice<T>> {
     Ok(stream.clone_htod(&values)?)
+}
+
+pub(crate) fn upload_device<T: DeviceRepr>(
+    device: &crate::backend::cuda::Device,
+    values: Vec<T>,
+) -> Result<CudaSlice<T>> {
+    let result = upload(&device.upload, values)?;
+    #[cfg(feature = "rocm")]
+    let result = {
+        let mut result = result;
+        result.handoff(&device.stream)?;
+        result
+    };
+    Ok(result)
 }
 
 pub(crate) fn zeros<T: DeviceRepr + ValidAsZeroBits>(

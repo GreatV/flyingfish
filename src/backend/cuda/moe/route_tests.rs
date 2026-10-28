@@ -5,8 +5,8 @@ use super::route::RouteOps;
 use super::testing;
 use crate::backend::cuda::contracts::TensorMut;
 use crate::backend::cuda::{Device, cubin};
+use crate::backend::gpu::{CudaSlice, LaunchConfig, PushKernelArg};
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 use half::bf16;
 use std::collections::HashMap;
 
@@ -196,15 +196,7 @@ fn invariant_route(device: &Device) -> Result<()> {
         for graph in [false, true] {
             if graph {
                 s.synchronize()?;
-                s.begin_capture(
-                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-                )?;
-                let launched = execute();
-                let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
-                launched?;
-                captured?
-                    .context("empty invariant router graph")?
-                    .launch()?;
+                testing::capture(s, &mut execute)?.launch()?;
             } else {
                 execute()?;
             }
@@ -239,8 +231,8 @@ fn invariant_route(device: &Device) -> Result<()> {
             );
         }
     }
-    let rx = crate::backend::cuda::calibrate::random(rows * h, 11);
-    let rw = crate::backend::cuda::calibrate::random(e * h, 12);
+    let rx = crate::backend::cuda::random(rows * h, 11);
+    let rw = crate::backend::cuda::random(e * h, 12);
     let (dx, dw) = (s.clone_htod(&rx)?, s.clone_htod(&rw)?);
     ops.route(
         view(&dx, s, 0, [rows as u32, h as u32], [h as u64, 1])?,
@@ -327,8 +319,8 @@ fn sigmoid_route(device: &Device, ops: &RouteOps) -> Result<()> {
     let (e, k, h) = (dims.experts, dims.top_k, dims.hidden);
     let fx = reference::fixture(dims, 3);
     let s = &device.stream;
-    let xb = testing::upload(&device.upload, fx.x.clone())?;
-    let rb = testing::upload(&device.upload, fx.router_w.clone())?;
+    let xb = testing::upload_device(device, fx.x.clone())?;
+    let rb = testing::upload_device(device, fx.router_w.clone())?;
     device.finish_upload()?;
     let mut idsb = testing::zeros::<i32>(s, dims.rows * k)?;
     let mut wb = testing::zeros::<bf16>(s, dims.rows * k)?;
@@ -711,11 +703,7 @@ fn moe_route_decode_bitwise_gpu() -> Result<()> {
             for graph in [false, true] {
                 if graph {
                     s.synchronize()?;
-                    s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-                    let result = run();
-                    let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
-                    result?;
-                    let captured = captured?.context("empty fused route graph")?;
+                    let captured = testing::capture(s, &mut run)?;
                     for _ in 0..3 {
                         captured.launch()?;
                     }
@@ -818,8 +806,8 @@ fn noaux_route(device: &Device, ops: &RouteOps) -> Result<()> {
         .flat_map(|_| [0.0, 0.0, 0.0, 0.0, 0.6, 0.0, 0.0, 0.4])
         .collect();
     let s = &device.stream;
-    let lb = testing::upload(&device.upload, host_logits.clone())?;
-    let bb = testing::upload(&device.upload, host_bias.clone())?;
+    let lb = testing::upload_device(device, host_logits.clone())?;
+    let bb = testing::upload_device(device, host_bias.clone())?;
     device.finish_upload()?;
     let modes = [
         ("sigmoid", crate::model_spec::RouterScore::Sigmoid, 2.5),
@@ -936,8 +924,8 @@ fn noaux_route(device: &Device, ops: &RouteOps) -> Result<()> {
     let host_bias: Vec<f32> = (0..experts)
         .map(|index| 0.05 * (index as f32 * 0.19).cos())
         .collect();
-    let lb = testing::upload(&device.upload, host_logits.clone())?;
-    let bb = testing::upload(&device.upload, host_bias.clone())?;
+    let lb = testing::upload_device(device, host_logits.clone())?;
+    let bb = testing::upload_device(device, host_bias.clone())?;
     device.finish_upload()?;
     for (mode, score, scaling) in modes {
         let top_k = 8usize;
@@ -983,20 +971,16 @@ fn noaux_route(device: &Device, ops: &RouteOps) -> Result<()> {
             "MOE_ROUTE_NOAUX_LARGE mode={mode} experts={experts} top_k={top_k} blockDim={} margin={margin:e} PASS",
             launch.block_dim.0
         );
-        s.begin_capture(
-            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-        )?;
-        let result = ops.topk_noaux(
-            logits,
-            Some(bias),
-            &mut ids_view,
-            &mut weights_view,
-            score,
-            scaling,
-        );
-        let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
-        result?;
-        let captured = captured?.context("empty noaux graph")?;
+        let captured = testing::capture(s, || {
+            ops.topk_noaux(
+                logits,
+                Some(bias),
+                &mut ids_view,
+                &mut weights_view,
+                score,
+                scaling,
+            )
+        })?;
         for _ in 0..3 {
             captured.launch()?;
         }
@@ -1059,8 +1043,8 @@ fn moe_route_gpu() -> Result<()> {
         .map(|row| (row, reference::route_row(&fx, row)))
         .collect();
 
-    let xb = testing::upload(&d.upload, fx.x.clone())?;
-    let mut rb = testing::upload(&d.upload, fx.router_w.clone())?;
+    let xb = testing::upload_device(&d, fx.x.clone())?;
+    let mut rb = testing::upload_device(&d, fx.router_w.clone())?;
     d.finish_upload()?;
     let mut idsb = testing::zeros::<i32>(s, dims.rows * k)?;
     let mut wb = testing::zeros::<bf16>(s, dims.rows * k)?;
@@ -1300,8 +1284,8 @@ fn moe_route_prefill_gpu() -> Result<()> {
         );
     }
 
-    let xb = testing::upload(&d.upload, fx.x.clone())?;
-    let rb = testing::upload(&d.upload, fx.router_w.clone())?;
+    let xb = testing::upload_device(&d, fx.x.clone())?;
+    let rb = testing::upload_device(&d, fx.router_w.clone())?;
     d.finish_upload()?;
     let mut idsb = testing::zeros::<i32>(s, dims.rows * k)?;
     let mut wb = testing::zeros::<bf16>(s, dims.rows * k)?;

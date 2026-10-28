@@ -3,12 +3,15 @@
 use crate::backend::cuda::contracts::{Tensor, TensorMut, no_overlap};
 use crate::backend::cuda::cubin;
 use crate::backend::cuda::ops::grid;
-use anyhow::{Context, Result, ensure};
-use cudarc::cublas::{CudaBlas, sys as bs};
-use cudarc::driver::{
+#[cfg(feature = "rocm")]
+use crate::backend::gpu::blas::Blas as CudaBlas;
+use crate::backend::gpu::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, DeviceRepr, LaunchConfig,
     PushKernelArg,
 };
+use anyhow::{Context, Result, ensure};
+#[cfg(feature = "cuda")]
+use cudarc::cublas::{CudaBlas, sys as bs};
 use half::bf16;
 use std::{any::TypeId, sync::Arc};
 
@@ -31,6 +34,7 @@ impl RouteOps {
         experts: u32,
         max_rows: usize,
     ) -> Result<Self> {
+        #[cfg(feature = "cuda")]
         use cudarc::driver::sys::CUdevice_attribute as A;
         ensure!(
             (1..=1024).contains(&experts),
@@ -42,20 +46,33 @@ impl RouteOps {
         );
         let module = cubin::module(ctx, "moe_route")?;
         let decode = module.load_function("moe_route_decode_bf16")?;
-        let sms = u32::try_from(ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?)?;
+        #[cfg(feature = "cuda")]
+        let (sms, grid_y, max_threads, shared_limit) = (
+            ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
+            ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y)?,
+            ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)?,
+            ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)?,
+        );
+        #[cfg(feature = "rocm")]
+        let (sms, grid_y, max_threads, shared_limit) = (
+            ctx.properties.compute_units,
+            ctx.properties.max_grid_y,
+            ctx.properties.max_threads,
+            ctx.properties.shared_bytes,
+        );
+        let sms = u32::try_from(sms)?;
         let threads = experts.div_ceil(32) * 32;
         ensure!(sms > 0, "route device has no SMs");
         ensure!(
-            max_rows <= usize::try_from(ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y)?)?,
+            max_rows <= usize::try_from(grid_y)?,
             "route capacity exceeds device grid row limit"
         );
         ensure!(
-            threads <= u32::try_from(ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)?)?
+            threads <= u32::try_from(max_threads)?
                 && threads <= u32::try_from(decode.max_threads_per_block()?)?,
             "route block exceeds device or function thread limit"
         );
-        let shared_limit =
-            ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)? as u32;
+        let shared_limit = u32::try_from(shared_limit)?;
         let static_shared = u32::try_from(decode.shared_size_bytes()?)?;
         for owners in [1, 2, 4, 8, 16, 32] {
             let shared = 16 * (owners * 65 + 64);
@@ -92,6 +109,7 @@ impl RouteOps {
             })
             .collect();
         let blas = CudaBlas::new(stream.clone())?;
+        #[cfg(feature = "cuda")]
         unsafe {
             bs::cublasSetMathMode(*blas.handle(), bs::cublasMath_t::CUBLAS_DEFAULT_MATH)
                 .result()?;
@@ -197,9 +215,10 @@ impl RouteOps {
 
         // opA=T/opB=N: router[H,E] * x[H,rows] -> logits[E,rows], column-major.
         // CUBLAS_COMPUTE_32F/CUBLAS_GEMM_DEFAULT; lda=ldb=H, ldc=E.
-        let alpha = 1f32;
-        let beta = 0f32;
+        #[cfg(feature = "cuda")]
         unsafe {
+            let alpha = 1f32;
+            let beta = 0f32;
             bs::cublasGemmEx(
                 *self.blas.handle(),
                 bs::cublasOperation_t::CUBLAS_OP_T,
@@ -222,6 +241,19 @@ impl RouteOps {
                 bs::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
             )
             .result()?;
+        }
+        #[cfg(feature = "rocm")]
+        unsafe {
+            self.blas.bf16_gemm(
+                crate::backend::setup::LinearShape {
+                    rows: rows as usize,
+                    output: experts as usize,
+                    input: plan.hidden as usize,
+                },
+                [router.ptr, x.ptr, logits.0.ptr],
+                [plan.hidden as usize, plan.hidden as usize, experts as usize],
+                None,
+            )?;
         }
         self.topk(stream, &plan, logits, ids, weights, score)
     }

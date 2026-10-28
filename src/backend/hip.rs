@@ -91,10 +91,32 @@ unsafe extern "C" {
     fn ff_hip_device_properties(device: i32, output: *mut Properties) -> i32;
 }
 
+#[derive(Debug)]
+pub(crate) struct RuntimeError {
+    pub status: i32,
+    operation: String,
+    message: String,
+}
+impl std::fmt::Display for RuntimeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: HIP status {}: {}",
+            self.operation, self.status, self.message
+        )
+    }
+}
+impl std::error::Error for RuntimeError {}
+
 pub(super) fn check(status: i32, operation: &str) -> Result<()> {
     if status != 0 {
         let text = unsafe { CStr::from_ptr(hipGetErrorString(status)) }.to_string_lossy();
-        anyhow::bail!("{operation}: HIP status {status}: {text}");
+        return Err(RuntimeError {
+            status,
+            operation: operation.into(),
+            message: text.into_owned(),
+        }
+        .into());
     }
     Ok(())
 }
@@ -123,6 +145,7 @@ pub struct Properties {
     pub cooperative: i32,
     pub driver_version: i32,
     pub runtime_version: i32,
+    pub max_grid_y: i32,
 }
 
 pub struct Context {
@@ -192,7 +215,8 @@ impl Context {
                 && properties.unit_shared_bytes > 0
                 && properties.l2_bytes >= 0
                 && properties.memory_clock_khz > 0
-                && properties.memory_bus_bits > 0,
+                && properties.memory_bus_bits > 0
+                && properties.max_grid_y > 0,
             "invalid HIP device resource attributes"
         );
         Ok(Arc::new(Self {
@@ -733,6 +757,13 @@ pub struct Event {
     handle: usize,
     context: Arc<Context>,
 }
+impl std::fmt::Debug for Event {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Event")
+            .field("handle", &self.handle)
+            .finish()
+    }
+}
 impl Event {
     pub fn record(&self, stream: &Arc<Stream>) -> Result<()> {
         stream.require_eager("event record")?;
@@ -790,7 +821,7 @@ pub unsafe trait ValidAsZeroBits: DeviceRepr {}
 macro_rules! plain {
     ($($t:ty),*) => { $(unsafe impl DeviceRepr for $t {} unsafe impl ValidAsZeroBits for $t {})* };
 }
-plain!(u8, u16, u32, u64, i32, f32, half::bf16);
+plain!(u8, u16, u32, u64, i32, i64, f32, half::bf16);
 
 fn extent<T>(len: usize) -> Result<usize> {
     len.checked_mul(size_of::<T>())
@@ -1072,6 +1103,17 @@ pub struct Function {
     module: Arc<Module>,
 }
 impl Function {
+    pub fn shared_size_bytes(&self) -> Result<i32> {
+        self.module.context.bind_to_thread()?;
+        let mut value = 0;
+        unsafe {
+            check(
+                hipFuncGetAttribute(&mut value, 1, self.handle as Handle),
+                "hipFuncGetAttribute(sharedSizeBytes)",
+            )?;
+        }
+        Ok(value)
+    }
     pub fn max_threads_per_block(&self) -> Result<i32> {
         self.module.context.bind_to_thread()?;
         let mut value = 0;

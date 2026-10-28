@@ -59,6 +59,28 @@ unsafe extern "C" {
         compute: i32,
         algo: i32,
     ) -> i32;
+    fn hipblasGemmBatchedEx(
+        handle: Handle,
+        ta: i32,
+        tb: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: *const c_void,
+        a: *const *const c_void,
+        at: i32,
+        lda: i32,
+        b: *const *const c_void,
+        bt: i32,
+        ldb: i32,
+        beta: *const c_void,
+        c: *mut Handle,
+        ct: i32,
+        ldc: i32,
+        batch: i32,
+        compute: i32,
+        algo: i32,
+    ) -> i32;
     fn hipblasLtCreate(handle: *mut Handle) -> i32;
     fn hipblasLtDestroy(handle: Handle) -> i32;
     fn hipblasLtGetVersion(handle: Handle, version: *mut i32) -> i32;
@@ -562,29 +584,11 @@ impl Blas {
         let (alpha, beta) = (1f32, 0f32);
         unsafe {
             if shape.rows == 1 {
-                check(
-                    hipblasGemmEx(
-                        self.handles.handle,
-                        112,
-                        111,
-                        shape.output as i32,
-                        1,
-                        shape.input as i32,
-                        (&alpha as *const f32).cast(),
-                        a as *const c_void,
-                        14,
-                        shape.input as i32,
-                        b as *const c_void,
-                        14,
-                        shape.input as i32,
-                        (&beta as *const f32).cast(),
-                        c as Handle,
-                        14,
-                        shape.output as i32,
-                        2,
-                        160,
-                    ),
-                    "hipblasGemmEx",
+                self.bf16_gemm(
+                    shape,
+                    [a, b, c],
+                    [shape.input, shape.input, shape.output],
+                    None,
                 )?;
             } else {
                 let (workspace, _work) = self.workspace.device_ptr(&self.stream);
@@ -608,6 +612,93 @@ impl Blas {
                         self.stream.raw(),
                     ),
                     "hipblasLtMatmul",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// BF16 operands/output, FP32 accumulation, W transpose, alpha=1 and beta=0.
+    /// # Safety
+    /// Pointers cover the strided matrices, or `batch` device pointer arrays.
+    /// Their allocations and ordering remain valid until the stream completes.
+    pub(crate) unsafe fn bf16_gemm(
+        &self,
+        shape: LinearShape,
+        pointers: [u64; 3],
+        strides: [usize; 3],
+        batch: Option<usize>,
+    ) -> Result<()> {
+        ensure!(
+            [shape.rows, shape.output, shape.input]
+                .into_iter()
+                .chain(strides)
+                .all(|n| n > 0 && n <= i32::MAX as usize)
+                && strides[0] >= shape.input
+                && strides[1] >= shape.input
+                && strides[2] >= shape.output
+                && pointers
+                    .iter()
+                    .all(|p| *p != 0 && p.is_multiple_of(if batch.is_some() { 8 } else { 2 }))
+                && batch.is_none_or(|n| n > 0 && n <= i32::MAX as usize),
+            "HIP BF16 GEMM shape, stride, pointer or batch extent is invalid"
+        );
+        self.stream.context().bind_to_thread()?;
+        self.stream.retain(&self.handles);
+        let (alpha, beta) = (1f32, 0f32);
+        let [a, b, c] = pointers;
+        let [lda, ldb, ldc] = strides.map(|n| n as i32);
+        unsafe {
+            if let Some(batch) = batch {
+                check(
+                    hipblasGemmBatchedEx(
+                        self.handles.handle,
+                        112,
+                        111,
+                        shape.output as i32,
+                        shape.rows as i32,
+                        shape.input as i32,
+                        (&alpha as *const f32).cast(),
+                        a as *const *const c_void,
+                        14,
+                        lda,
+                        b as *const *const c_void,
+                        14,
+                        ldb,
+                        (&beta as *const f32).cast(),
+                        c as *mut Handle,
+                        14,
+                        ldc,
+                        batch as i32,
+                        2,
+                        160,
+                    ),
+                    "hipblasGemmBatchedEx",
+                )?;
+            } else {
+                check(
+                    hipblasGemmEx(
+                        self.handles.handle,
+                        112,
+                        111,
+                        shape.output as i32,
+                        shape.rows as i32,
+                        shape.input as i32,
+                        (&alpha as *const f32).cast(),
+                        a as *const c_void,
+                        14,
+                        lda,
+                        b as *const c_void,
+                        14,
+                        ldb,
+                        (&beta as *const f32).cast(),
+                        c as Handle,
+                        14,
+                        ldc,
+                        2,
+                        160,
+                    ),
+                    "hipblasGemmEx",
                 )?;
             }
         }

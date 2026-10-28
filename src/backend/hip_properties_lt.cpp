@@ -14,10 +14,12 @@ struct Properties {
     int32_t warp, compute_units, max_threads, shared_bytes, unit_shared_bytes;
     int32_t l2_bytes, memory_clock_khz, memory_bus_bits, cooperative;
     int32_t driver_version, runtime_version;
+    int32_t max_grid_y;
 };
 static_assert(sizeof(Properties) == 584 && alignof(Properties) == 8);
 static_assert(offsetof(Properties, optin_shared_bytes) == 528);
 static_assert(offsetof(Properties, warp) == 536);
+static_assert(offsetof(Properties, max_grid_y) == 580);
 static_assert(sizeof(hipblasLtMatmulAlgo_t) == 24 && alignof(hipblasLtMatmulAlgo_t) == 8);
 static_assert(sizeof(hipblasLtMatmulHeuristicResult_t) == 56);
 static_assert(alignof(hipblasLtMatmulHeuristicResult_t) == 8);
@@ -25,7 +27,9 @@ static_assert(offsetof(hipblasLtMatmulHeuristicResult_t, workspaceSize) == 24);
 static_assert(offsetof(hipblasLtMatmulHeuristicResult_t, state) == 32);
 static_assert(offsetof(hipblasLtMatmulHeuristicResult_t, wavesCount) == 36);
 static_assert(HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK == 0);
+static_assert(HIP_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES == 1);
 static_assert(hipStreamCaptureModeThreadLocal == 1);
+static_assert(hipErrorLaunchFailure == 719);
 static_assert(HIP_R_32F == 0 && HIP_R_16BF == 14);
 static_assert(HIPBLAS_COMPUTE_32F == 2);
 static_assert(HIPBLAS_OP_N == 111 && HIPBLAS_OP_T == 112);
@@ -47,11 +51,12 @@ extern "C" int ff_hip_device_properties(int device, Properties* output) {
         hipDeviceAttributeMaxThreadsPerBlock, hipDeviceAttributeMaxSharedMemoryPerBlock,
         hipDeviceAttributeMaxSharedMemoryPerMultiprocessor, hipDeviceAttributeL2CacheSize,
         hipDeviceAttributeMemoryClockRate, hipDeviceAttributeMemoryBusWidth,
-        hipDeviceAttributeCooperativeLaunch
+        hipDeviceAttributeCooperativeLaunch, hipDeviceAttributeMaxGridDimY
     };
     int* values[] = {&output->warp, &output->compute_units, &output->max_threads,
         &output->shared_bytes, &output->unit_shared_bytes, &output->l2_bytes,
-        &output->memory_clock_khz, &output->memory_bus_bits, &output->cooperative};
+        &output->memory_clock_khz, &output->memory_bus_bits, &output->cooperative,
+        &output->max_grid_y};
     for (size_t i = 0; i < sizeof(attributes) / sizeof(attributes[0]); ++i) {
         status = hipDeviceGetAttribute(values[i], attributes[i], device);
         if (status != hipSuccess) return status;

@@ -40,7 +40,7 @@ __device__ __forceinline__ void moe_lane16(
       sum = __fmaf_rn(__bfloat162float(x[k]), __bfloat162float(weight[k]), sum);
     }
   }
-  const unsigned mask = 0xFFFFu << (threadIdx.x & 16);
+  const auto mask = (FF_WARP_MASK & 0xffffu) << (threadIdx.x & 16);
   for (int step = 1; step < 16; step *= 2)
     sum = __fadd_rn(sum, __shfl_down_sync(mask, sum, step, 16));
   if (lane == 0) {

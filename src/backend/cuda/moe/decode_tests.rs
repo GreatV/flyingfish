@@ -6,13 +6,14 @@ use super::reference::{self, Combine, MoeDims};
 use super::testing;
 use crate::backend::cuda::Device;
 use crate::backend::cuda::contracts::{Scratch, Tensor, TensorMut};
+use crate::backend::gpu::{CudaSlice, CudaStream, DevicePtr};
 use crate::{
     experts::catalogue::{ExpertGeometry, ExpertLayout},
     model_spec::ExpertFormat,
 };
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::sys::CUresult;
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DriverError};
+#[cfg(feature = "cuda")]
+use cudarc::driver::{DriverError, sys::CUresult};
 use half::bf16;
 use std::process::Command;
 use std::sync::Arc;
@@ -581,15 +582,7 @@ impl Gate<'_> {
         execute()?;
         if graph {
             self.s.synchronize()?;
-            self.s.begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )?;
-            let launched = execute();
-            let captured = self
-                .s
-                .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
-            launched?;
-            captured?.context("empty invariant FFN graph")?.launch()?;
+            testing::capture(self.s, &mut execute)?.launch()?;
         }
         self.s.synchronize()?;
         let completed = self.s.clone_dtoh(&io._done_dev)?;
@@ -720,6 +713,7 @@ fn trap_exit(outcome: Result<()>) -> ! {
             eprintln!("FF_MOE_CHILD: launch completed; trap did not fire");
             std::process::exit(101);
         }
+        #[cfg(feature = "cuda")]
         Err(error) => match error.downcast_ref::<DriverError>() {
             Some(&DriverError(CUresult::CUDA_ERROR_LAUNCH_FAILED)) => std::process::exit(3),
             _ => {
@@ -727,6 +721,17 @@ fn trap_exit(outcome: Result<()>) -> ! {
                 std::process::exit(101);
             }
         },
+        #[cfg(feature = "rocm")]
+        Err(error) => {
+            if error
+                .downcast_ref::<crate::backend::hip::RuntimeError>()
+                .is_some_and(|error| error.status == 719)
+            {
+                std::process::exit(3);
+            }
+            eprintln!("FF_MOE_CHILD: {error:?}");
+            std::process::exit(101);
+        }
     }
 }
 
@@ -842,13 +847,13 @@ fn decode_expert_ffn_gpu() -> Result<()> {
     );
     let (eu, ku, hu, iu) = (e as u32, k as u32, h as u32, i as u32);
 
-    let x_dev = testing::upload(&device.upload, fx.x.clone())?;
-    let gu_dev = testing::upload(&device.upload, fx.gate_up.clone())?;
-    let dn_dev = testing::upload(&device.upload, fx.down.clone())?;
-    let sg_dev = testing::upload(&device.upload, fx.shared_gate.clone())?;
-    let su_dev = testing::upload(&device.upload, fx.shared_up.clone())?;
-    let sd_dev = testing::upload(&device.upload, fx.shared_down.clone())?;
-    let se_dev = testing::upload(&device.upload, fx.shared_expert_gate.clone())?;
+    let x_dev = testing::upload_device(&device, fx.x.clone())?;
+    let gu_dev = testing::upload_device(&device, fx.gate_up.clone())?;
+    let dn_dev = testing::upload_device(&device, fx.down.clone())?;
+    let sg_dev = testing::upload_device(&device, fx.shared_gate.clone())?;
+    let su_dev = testing::upload_device(&device, fx.shared_up.clone())?;
+    let sd_dev = testing::upload_device(&device, fx.shared_down.clone())?;
+    let se_dev = testing::upload_device(&device, fx.shared_expert_gate.clone())?;
     device.finish_upload()?;
 
     let mut ids_host = Vec::with_capacity(8 * k);
@@ -1024,13 +1029,13 @@ fn decode_expert_ffn_gpu() -> Result<()> {
             mixed.dims.top_k,
             mixed.dims.experts,
         );
-        let x_m = testing::upload(&device.upload, mixed.x.clone())?;
-        let gu_m = testing::upload(&device.upload, mixed.gate_up.clone())?;
-        let dn_m = testing::upload(&device.upload, mixed.down.clone())?;
-        let sg_m = testing::upload(&device.upload, mixed.shared_gate.clone())?;
-        let su_m = testing::upload(&device.upload, mixed.shared_up.clone())?;
-        let sd_m = testing::upload(&device.upload, mixed.shared_down.clone())?;
-        let se_m = testing::upload(&device.upload, mixed.shared_expert_gate.clone())?;
+        let x_m = testing::upload_device(&device, mixed.x.clone())?;
+        let gu_m = testing::upload_device(&device, mixed.gate_up.clone())?;
+        let dn_m = testing::upload_device(&device, mixed.down.clone())?;
+        let sg_m = testing::upload_device(&device, mixed.shared_gate.clone())?;
+        let su_m = testing::upload_device(&device, mixed.shared_up.clone())?;
+        let sd_m = testing::upload_device(&device, mixed.shared_down.clone())?;
+        let se_m = testing::upload_device(&device, mixed.shared_expert_gate.clone())?;
         device.finish_upload()?;
         let routed = reference::route_row(&mixed, 0);
         let ids_m = testing::upload(s, routed.ids.clone())?;
@@ -1158,7 +1163,7 @@ fn decode_expert_ffn_gpu() -> Result<()> {
             rolled.copy_within(base + h..base + block, base);
             rolled[base + block - h..base + block].copy_from_slice(&first);
         }
-        let rolled_dev = testing::upload(&device.upload, rolled)?;
+        let rolled_dev = testing::upload_device(&device, rolled)?;
         device.finish_upload()?;
         let rolled_base = rolled_dev.device_ptr(s).0;
         let rolled_table = testing::slots(s, e, rolled_base, gu_stride, dn_base, dn_stride)?;
@@ -1391,14 +1396,14 @@ fn decode_expert_ffn_w8a16_gpu() -> Result<()> {
     fxq.gate_up = world.effective_gate_up.clone();
     fxq.down = world.effective_down.clone();
 
-    let x_dev = testing::upload(&device.upload, fx.x.clone())?;
-    let sg_dev = testing::upload(&device.upload, fx.shared_gate.clone())?;
-    let su_dev = testing::upload(&device.upload, fx.shared_up.clone())?;
-    let sd_dev = testing::upload(&device.upload, fx.shared_down.clone())?;
-    let se_dev = testing::upload(&device.upload, fx.shared_expert_gate.clone())?;
-    let slots_dev = testing::upload(&device.upload, world.slots.clone())?;
-    let gu_eff_dev = testing::upload(&device.upload, world.effective_gate_up.clone())?;
-    let dn_eff_dev = testing::upload(&device.upload, world.effective_down.clone())?;
+    let x_dev = testing::upload_device(&device, fx.x.clone())?;
+    let sg_dev = testing::upload_device(&device, fx.shared_gate.clone())?;
+    let su_dev = testing::upload_device(&device, fx.shared_up.clone())?;
+    let sd_dev = testing::upload_device(&device, fx.shared_down.clone())?;
+    let se_dev = testing::upload_device(&device, fx.shared_expert_gate.clone())?;
+    let slots_dev = testing::upload_device(&device, world.slots.clone())?;
+    let gu_eff_dev = testing::upload_device(&device, world.effective_gate_up.clone())?;
+    let dn_eff_dev = testing::upload_device(&device, world.effective_down.clone())?;
     device.finish_upload()?;
 
     let mut ids_host = Vec::with_capacity(4 * k);

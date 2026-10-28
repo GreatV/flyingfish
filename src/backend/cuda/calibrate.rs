@@ -340,14 +340,7 @@ pub(super) fn uniform_attention_error(
         .fold((0f64, 0f64), |(a, r), (e, q)| (a.max(e), r.max(q)))
 }
 
-pub(super) fn random(n: usize, mut state: u32) -> Vec<bf16> {
-    (0..n)
-        .map(|_| {
-            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-            bf16::from_f32((state >> 8) as f32 / 16777216.0 - 0.5)
-        })
-        .collect()
-}
+pub(super) use super::random;
 
 fn measure(
     d: &Device,

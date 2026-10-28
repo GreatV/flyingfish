@@ -28,7 +28,6 @@ mod linear_calibrate;
 mod markov;
 #[cfg(feature = "cuda")]
 mod markov_calibrate;
-#[cfg(feature = "cuda")]
 pub(crate) mod moe;
 #[cfg(feature = "cuda")]
 pub mod multi_calibrate;
@@ -530,6 +529,16 @@ fn verify_peer_transport(
     }
 
     Ok(())
+}
+
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn random(n: usize, mut state: u32) -> Vec<half::bf16> {
+    (0..n)
+        .map(|_| {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            half::bf16::from_f32((state >> 8) as f32 / 16777216.0 - 0.5)
+        })
+        .collect()
 }
 
 /// γ_n = n·u / (1 − n·u).

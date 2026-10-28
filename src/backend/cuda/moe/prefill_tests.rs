@@ -16,8 +16,8 @@ use super::testing;
 use crate::backend::cuda::contracts::{Scratch, TensorMut};
 use crate::backend::cuda::cubin;
 use crate::backend::cuda::ops::grid;
+use crate::backend::gpu::{CudaSlice, CudaStream, DevicePtr, PushKernelArg};
 use anyhow::Result;
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, PushKernelArg};
 use half::bf16;
 use std::sync::Arc;
 
@@ -868,6 +868,9 @@ fn contribute_input<'a>(
 fn raw_dtoh<T>(s: &Arc<CudaStream>, src: u64, dst: &mut [T]) -> Result<()> {
     s.context().bind_to_thread()?;
     unsafe {
+        #[cfg(feature = "rocm")]
+        s.copy_raw(dst.as_mut_ptr() as u64, src, std::mem::size_of_val(dst), 2)?;
+        #[cfg(feature = "cuda")]
         cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
             dst.as_mut_ptr().cast(),
             src,
@@ -883,6 +886,9 @@ fn raw_dtoh<T>(s: &Arc<CudaStream>, src: u64, dst: &mut [T]) -> Result<()> {
 fn raw_htod<T>(s: &Arc<CudaStream>, dst: u64, src: &[T]) -> Result<()> {
     s.context().bind_to_thread()?;
     unsafe {
+        #[cfg(feature = "rocm")]
+        s.copy_raw(dst, src.as_ptr() as u64, std::mem::size_of_val(src), 1)?;
+        #[cfg(feature = "cuda")]
         cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
             dst,
             src.as_ptr().cast(),
@@ -1428,13 +1434,13 @@ fn moe_prefill_gpu() -> Result<()> {
             mixed.dims.top_k,
             mixed.dims.experts,
         );
-        let x_m = testing::upload(&d.upload, mixed.x.clone())?;
-        let gu_m = testing::upload(&d.upload, mixed.gate_up.clone())?;
-        let dn_m = testing::upload(&d.upload, mixed.down.clone())?;
-        let sg_m = testing::upload(&d.upload, mixed.shared_gate.clone())?;
-        let su_m = testing::upload(&d.upload, mixed.shared_up.clone())?;
-        let sd_m = testing::upload(&d.upload, mixed.shared_down.clone())?;
-        let seg_m = testing::upload(&d.upload, mixed.shared_expert_gate.clone())?;
+        let x_m = testing::upload_device(&d, mixed.x.clone())?;
+        let gu_m = testing::upload_device(&d, mixed.gate_up.clone())?;
+        let dn_m = testing::upload_device(&d, mixed.down.clone())?;
+        let sg_m = testing::upload_device(&d, mixed.shared_gate.clone())?;
+        let su_m = testing::upload_device(&d, mixed.shared_up.clone())?;
+        let sd_m = testing::upload_device(&d, mixed.shared_down.clone())?;
+        let seg_m = testing::upload_device(&d, mixed.shared_expert_gate.clone())?;
         d.finish_upload()?;
         let routed0 = reference::route_row(&mixed, 0);
         let routed1 = reference::route_row(&mixed, 1);
@@ -1937,6 +1943,7 @@ fn moe_prefill_gpu() -> Result<()> {
 }
 
 /// True when the error chain reports the device-side trap's launch failure.
+#[cfg(feature = "cuda")]
 fn trap_launched(err: &anyhow::Error) -> bool {
     const MARKERS: [&str; 4] = [
         "illegal instruction",
@@ -1948,6 +1955,12 @@ fn trap_launched(err: &anyhow::Error) -> bool {
         let text = cause.to_string().to_lowercase();
         MARKERS.iter().any(|marker| text.contains(marker))
     })
+}
+
+#[cfg(feature = "rocm")]
+fn trap_launched(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<crate::backend::hip::RuntimeError>()
+        .is_some_and(|error| error.status == 719)
 }
 
 /// Child shared setup: fixture-sized slot tables, shared expert buffers and
@@ -2331,9 +2344,12 @@ fn check_compact_dispatch(
     let count = module.load_function("moe_count_scan")?;
     let permute = module.load_function("moe_permute")?;
     let scatter = module.load_function("moe_scatter")?;
+    #[cfg(feature = "cuda")]
     let sms = d.ctx.attribute(
         cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
     )? as usize;
+    #[cfg(feature = "rocm")]
+    let sms = d.ctx.properties.compute_units as usize;
     let limit = sms * count.occupancy_max_active_blocks_per_multiprocessor(256, 0, None)? as usize;
     anyhow::ensure!(limit > 0, "compact count occupancy");
     let blocks = assignments.div_ceil(2048).max(1).min(limit);

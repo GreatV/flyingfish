@@ -76,7 +76,7 @@ __device__ __forceinline__ uint4 moe_load8(const bf16* base, const unsigned char
 
 // Sixteen scalar FMA lanes, paired in ascending 1/2/4/8 order.
 __device__ __forceinline__ float moe_pairwise16(float sum, int tid) {
-  const unsigned mask = 0xffffu << (tid & 16);
+  const auto mask = (FF_WARP_MASK & 0xffffu) << (tid & 16);
   for (int step = 1; step < 16; step *= 2)
     sum = __fadd_rn(sum, __shfl_down_sync(mask, sum, step, 16));
   return sum;
