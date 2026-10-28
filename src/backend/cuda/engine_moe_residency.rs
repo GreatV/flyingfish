@@ -897,7 +897,7 @@ impl Slots {
             #[cfg(feature = "rocm")]
             let tables = self.bindings(layer as usize, self.gate_up.stream())?;
             let stream = &self.transfers.h2d;
-            // SAFETY: apply_move waits slot copy/reader tickets on h2d; checked table updates precede the publication ticket waited by prepare_layer.
+            // SAFETY: apply_move waits slot copy/reader tickets on h2d; checked table updates precede the publication ticket waited by prepare_routes.
             unsafe {
                 stream
                     .launch_builder(&self.publish)
