@@ -2277,7 +2277,7 @@ impl Engine {
         let draft = self
             .spec
             .as_ref()
-            .map(|spec| {
+            .map(|spec| -> Result<_> {
                 Ok((
                     &spec.draft.config,
                     draft_path.context("HIP hybrid draft path missing")?,
