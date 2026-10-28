@@ -1009,8 +1009,8 @@ fn wmma_gate(s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
     let blas = blas::Blas::new(s.clone())?;
     s.context().require_wmma()?;
     for (output, input, padding) in [
-        (19usize, 257usize, 0usize),
-        (23, 263, 8),
+        (19usize, 259usize, 0usize),
+        (23, 269, 8),
         (2560, 2048, 0),
         (2048, 2048, 0),
         (12288, 2048, 0),
@@ -1018,6 +1018,12 @@ fn wmma_gate(s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
         (130560, 2048, 0),
     ] {
         let stride = input + padding;
+        for period in [257, 263] {
+            ensure!(
+                input % period != 0 && stride % period != 0 && output % period != 0,
+                "RUNNER_FAIL WMMA fixture period divides a matrix stride"
+            );
+        }
         let weights = pattern(output * stride, 137);
         let dw = s.clone_htod(&weights)?;
         for rows in [1usize, 3, 7, 8, 15, 16] {
