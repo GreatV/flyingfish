@@ -592,6 +592,9 @@ fn load_dispatch(architecture: crate::model_spec::Architecture) -> Result<LoadDi
         Architecture::LoopVl => LoadDispatch::Recurrent,
         Architecture::DeepseekV41 => LoadDispatch::Deepseek,
         Architecture::Glm5Next => LoadDispatch::Qwen,
+        Architecture::Gemma4 => {
+            anyhow::bail!("Gemma 4 execution is not bound yet")
+        }
     })
 }
 

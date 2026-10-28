@@ -1057,6 +1057,7 @@ mod tests {
         for i in 0..4 {
             let attention = i % 2 == 1;
             layers.push(LayerPlan {
+                geometry: None,
                 mixer: if attention {
                     Mixer::FullAttention
                 } else {
@@ -1108,6 +1109,7 @@ mod tests {
             }),
             glm5_next: None,
             deepseek_v41: None,
+            gemma4: None,
             vision: None,
         }
     }

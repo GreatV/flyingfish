@@ -132,6 +132,9 @@ impl RowWorkSpec {
                     0,
                 )
             }
+            Architecture::Gemma4 => {
+                anyhow::bail!("Gemma 4 row work is not bound yet")
+            }
             Architecture::Qwen35Text | Architecture::MiniCpmV47 => {
                 FullAttentionSpec::from_model(spec)?;
                 let g = GdnSpec::from_model(spec)?;

@@ -13,6 +13,7 @@ pub enum Architecture {
     Glm5Next,
     LoopVl,
     DeepseekV41,
+    Gemma4,
 }
 impl Architecture {
     /// Architectures with a bound MTP decode path.
@@ -186,6 +187,28 @@ pub struct LayerPlan {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sliding_window: Option<u32>,
     pub ffn: FfnKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry: Option<LayerGeometry>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RopeSpec {
+    pub theta: f32,
+    pub pairs: u32,
+    pub pair_stride: u32,
+    pub denominator: u32,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LayerGeometry {
+    pub head_dim: u32,
+    pub intermediate: u32,
+    pub rope: RopeSpec,
+    pub kv_reader: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Gemma4Config {
+    pub softcap: f32,
+    pub per_layer_input: u32,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FfnKind {
@@ -220,6 +243,7 @@ pub struct ModelSpec {
     pub glm5_next: Option<Glm5NextConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deepseek_v41: Option<DeepseekV41Config>,
+    pub gemma4: Option<Gemma4Config>,
     #[serde(default)]
     pub vision: Option<VisionConfig>,
 }
@@ -341,7 +365,8 @@ impl VisionConfig {
             Architecture::Llama
             | Architecture::Flint
             | Architecture::Glm5Next
-            | Architecture::LoopVl => {
+            | Architecture::LoopVl
+            | Architecture::Gemma4 => {
                 bail!("vision configuration requires a supported multimodal architecture")
             }
             Architecture::DeepseekV41 => {
@@ -980,6 +1005,7 @@ impl TextGeometry {
                 "unsupported mixer at layer {i}: {kind:?}"
             );
             layers.push(LayerPlan {
+                geometry: None,
                 mixer,
                 state_index: counts[slot],
                 rope: full,
@@ -1072,7 +1098,8 @@ impl ModelSpec {
             Architecture::Llama
             | Architecture::Qwen35Text
             | Architecture::MiniCpmV47
-            | Architecture::LoopVl => SwigluRounding::Twice,
+            | Architecture::LoopVl
+            | Architecture::Gemma4 => SwigluRounding::Twice,
         }
     }
 
@@ -1103,7 +1130,8 @@ impl ModelSpec {
             Architecture::Llama
             | Architecture::Qwen35Text
             | Architecture::MiniCpmV47
-            | Architecture::LoopVl => RoutedWeightBoundary::AfterDownBf16,
+            | Architecture::LoopVl
+            | Architecture::Gemma4 => RoutedWeightBoundary::AfterDownBf16,
         }
     }
 
@@ -1118,6 +1146,7 @@ impl ModelSpec {
                 Architecture::Glm5Next => "glm5_next_text",
                 Architecture::LoopVl => "hrm_text",
                 Architecture::DeepseekV41 => "deepseek_v41_text",
+                Architecture::Gemma4 => "gemma4_text",
             }
             .into(),
             hidden_size: self.hidden as usize,
@@ -1131,8 +1160,13 @@ impl ModelSpec {
             rms_norm_eps: self.rms_eps,
             rope_theta: self.rope_theta,
             rope_scaling: None,
-            hidden_act: "silu".into(),
-            tie_word_embeddings: false,
+            hidden_act: if self.architecture == Architecture::Gemma4 {
+                "gelu_pytorch_tanh"
+            } else {
+                "silu"
+            }
+            .into(),
+            tie_word_embeddings: self.architecture == Architecture::Gemma4,
             torch_dtype: "bfloat16".into(),
             eos_token_id: self.eos.clone(),
             attention_bias: false,
@@ -1161,6 +1195,8 @@ impl ModelSpec {
             Self::loopvl(&root, &generation)
         } else if root.get("model_type").and_then(Value::as_str) == Some("deepseek_v41") {
             Self::deepseek_v41(&root, &generation)
+        } else if root.get("model_type").and_then(Value::as_str) == Some("gemma4") {
+            Self::gemma4(&root, &generation)
         } else {
             Self::qwen(&root, &generation)
         }
@@ -1189,8 +1225,10 @@ impl ModelSpec {
             gdn: None,
             glm5_next: None,
             deepseek_v41: None,
+            gemma4: None,
             layers: (0..u(c.num_hidden_layers)?)
                 .map(|state_index| LayerPlan {
+                    geometry: None,
                     mixer: Mixer::FullAttention,
                     state_index,
                     rope: true,
@@ -1318,6 +1356,7 @@ impl ModelSpec {
             eos: eos(eos_value, 65536)?,
             layers: (0..128)
                 .map(|state_index| LayerPlan {
+                    geometry: None,
                     mixer: Mixer::FullAttention,
                     state_index,
                     rope: true,
@@ -1329,6 +1368,7 @@ impl ModelSpec {
             gdn: None,
             glm5_next: None,
             deepseek_v41: None,
+            gemma4: None,
             vision: None,
         })
     }
@@ -1518,6 +1558,7 @@ impl ModelSpec {
                 "unsupported Flint layer type at {i}: {kind:?}"
             );
             layers.push(LayerPlan {
+                geometry: None,
                 mixer: Mixer::FullAttention,
                 state_index: u32::try_from(i).context("Flint layer index overflows u32")?,
                 rope: !full,
@@ -1575,6 +1616,260 @@ impl ModelSpec {
             gdn: None,
             glm5_next: None,
             deepseek_v41: None,
+            gemma4: None,
+            vision: None,
+        })
+    }
+    pub fn gemma4(root: &Value, generation: &Value) -> Result<Self> {
+        for (key, value) in [
+            ("model_type", "gemma4".into()),
+            (
+                "architectures",
+                serde_json::json!(["Gemma4ForConditionalGeneration"]),
+            ),
+            ("tie_word_embeddings", true.into()),
+            ("dtype", "bfloat16".into()),
+        ] {
+            equal(root, key, value)?;
+        }
+        exact_keys(
+            root,
+            &[
+                "architectures",
+                "audio_config",
+                "audio_token_id",
+                "boa_token_id",
+                "boi_token_id",
+                "dtype",
+                "eoa_token_id",
+                "eoa_token_index",
+                "eoi_token_id",
+                "image_token_id",
+                "initializer_range",
+                "model_type",
+                "text_config",
+                "tie_word_embeddings",
+                "transformers_version",
+                "video_token_id",
+                "vision_config",
+                "vision_soft_tokens_per_image",
+            ],
+            "gemma4 config",
+        )?;
+        let t = root.get("text_config").context("missing text_config")?;
+        exact_keys(
+            t,
+            &[
+                "attention_bias",
+                "attention_dropout",
+                "attention_k_eq_v",
+                "bos_token_id",
+                "dtype",
+                "enable_moe_block",
+                "eos_token_id",
+                "expert_intermediate_size",
+                "final_logit_softcapping",
+                "global_head_dim",
+                "head_dim",
+                "hidden_activation",
+                "hidden_size",
+                "hidden_size_per_layer_input",
+                "initializer_range",
+                "intermediate_size",
+                "layer_types",
+                "max_position_embeddings",
+                "model_type",
+                "num_attention_heads",
+                "num_experts",
+                "num_global_key_value_heads",
+                "num_hidden_layers",
+                "num_key_value_heads",
+                "num_kv_shared_layers",
+                "pad_token_id",
+                "rms_norm_eps",
+                "rope_parameters",
+                "sliding_window",
+                "tie_word_embeddings",
+                "top_k_experts",
+                "use_bidirectional_attention",
+                "use_cache",
+                "use_double_wide_mlp",
+                "vocab_size",
+                "vocab_size_per_layer_input",
+            ],
+            "gemma4 text_config",
+        )?;
+        for (key, value) in [
+            ("model_type", "gemma4_text".into()),
+            ("dtype", "bfloat16".into()),
+            ("attention_bias", false.into()),
+            ("attention_dropout", 0.0.into()),
+            ("attention_k_eq_v", false.into()),
+            ("enable_moe_block", false.into()),
+            ("expert_intermediate_size", Value::Null),
+            ("num_experts", Value::Null),
+            ("top_k_experts", Value::Null),
+            ("num_global_key_value_heads", Value::Null),
+            ("use_bidirectional_attention", Value::Null),
+            ("hidden_activation", "gelu_pytorch_tanh".into()),
+            ("tie_word_embeddings", true.into()),
+            ("final_logit_softcapping", 30.0.into()),
+            ("head_dim", 256.into()),
+            ("global_head_dim", 512.into()),
+            ("hidden_size_per_layer_input", 256.into()),
+            ("vocab_size", 262144.into()),
+            ("vocab_size_per_layer_input", 262144.into()),
+            ("rms_norm_eps", 1e-6.into()),
+            ("bos_token_id", 2.into()),
+            ("pad_token_id", 0.into()),
+            ("use_cache", true.into()),
+        ] {
+            equal(t, key, value)?;
+        }
+        let rope = t
+            .get("rope_parameters")
+            .context("missing rope_parameters")?;
+        exact_keys(
+            rope,
+            &["full_attention", "sliding_attention"],
+            "gemma4 rope_parameters",
+        )?;
+        let full_rope = &rope["full_attention"];
+        exact_keys(
+            full_rope,
+            &["partial_rotary_factor", "rope_theta", "rope_type"],
+            "gemma4 full_attention rope",
+        )?;
+        equal(full_rope, "rope_type", "proportional".into())?;
+        equal(full_rope, "partial_rotary_factor", 0.25.into())?;
+        equal(full_rope, "rope_theta", 1000000.0.into())?;
+        let sliding_rope = &rope["sliding_attention"];
+        exact_keys(
+            sliding_rope,
+            &["rope_theta", "rope_type"],
+            "gemma4 sliding_attention rope",
+        )?;
+        equal(sliding_rope, "rope_type", "default".into())?;
+        equal(sliding_rope, "rope_theta", 10000.0.into())?;
+        const SLIDING_HEAD_DIM: u32 = 256;
+        const GLOBAL_HEAD_DIM: u32 = 512;
+        let sliding = RopeSpec {
+            theta: 10000.0,
+            pairs: SLIDING_HEAD_DIM / 2,
+            pair_stride: SLIDING_HEAD_DIM / 2,
+            denominator: SLIDING_HEAD_DIM,
+        };
+        let global = RopeSpec {
+            theta: 1000000.0,
+            pairs: GLOBAL_HEAD_DIM / 8,
+            pair_stride: GLOBAL_HEAD_DIM / 2,
+            denominator: GLOBAL_HEAD_DIM,
+        };
+        let hidden = positive(t, "hidden_size")?;
+        let base = positive(t, "intermediate_size")?;
+        let depth = positive(t, "num_hidden_layers")?;
+        let shared = integer(t, "num_kv_shared_layers")?;
+        ensure!(
+            shared < depth,
+            "num_kv_shared_layers {shared} leaves no KV-owning layer"
+        );
+        let first_shared = depth - shared;
+        let window = positive(t, "sliding_window")?;
+        let q_heads = positive(t, "num_attention_heads")?;
+        let kv_heads = positive(t, "num_key_value_heads")?;
+        ensure!(
+            q_heads.is_multiple_of(kv_heads),
+            "num_attention_heads is not a multiple of num_key_value_heads"
+        );
+        let double_wide = t
+            .get("use_double_wide_mlp")
+            .and_then(Value::as_bool)
+            .context("missing/invalid use_double_wide_mlp")?;
+        let types = t
+            .get("layer_types")
+            .and_then(Value::as_array)
+            .context("missing layer_types")?;
+        ensure!(
+            types.len() == depth as usize,
+            "layer_types length differs from num_hidden_layers"
+        );
+        let mut publishers = [None; 2];
+        let mut layers = Vec::with_capacity(types.len());
+        for (i, kind) in types.iter().enumerate() {
+            let i = i as u32;
+            let (full, slot) = match kind.as_str() {
+                Some("sliding_attention") => (false, 0),
+                Some("full_attention") => (true, 1),
+                _ => bail!("unsupported Gemma 4 layer type at {i}: {kind:?}"),
+            };
+            let reader = i >= first_shared;
+            if !reader {
+                publishers[slot] = Some(i);
+            }
+            let state_index = if reader {
+                publishers[slot].with_context(|| {
+                    format!("KV-shared layer {i} has no publisher of its layer type")
+                })?
+            } else {
+                i
+            };
+            layers.push(LayerPlan {
+                mixer: Mixer::FullAttention,
+                state_index,
+                rope: true,
+                sliding_window: (!full).then_some(window),
+                ffn: FfnKind::Dense,
+                geometry: Some(LayerGeometry {
+                    head_dim: if full {
+                        GLOBAL_HEAD_DIM
+                    } else {
+                        SLIDING_HEAD_DIM
+                    },
+                    intermediate: if reader && double_wide {
+                        base.checked_mul(2)
+                            .context("double-wide MLP overflows u32")?
+                    } else {
+                        base
+                    },
+                    rope: if full { global } else { sliding },
+                    kv_reader: reader,
+                }),
+            });
+        }
+        let vocab = 262144;
+        let eos_value = generation
+            .get("eos_token_id")
+            .filter(|x| !x.is_null())
+            .or_else(|| t.get("eos_token_id"))
+            .context("missing Gemma 4 EOS")?;
+        Ok(Self {
+            abi_version: 1,
+            architecture: Architecture::Gemma4,
+            hidden,
+            intermediate: base,
+            vocab,
+            q_heads,
+            kv_heads,
+            head_dim: SLIDING_HEAD_DIM,
+            q_width: q_heads
+                .checked_mul(SLIDING_HEAD_DIM)
+                .context("Q width overflows u32")?,
+            max_position: positive(t, "max_position_embeddings")?,
+            rms_eps: 1e-6,
+            rope_theta: sliding.theta,
+            rotary_dim: SLIDING_HEAD_DIM,
+            linear_format: LinearFormat::Bf16,
+            expert_format: None,
+            eos: eos(eos_value, vocab)?,
+            layers,
+            moe: None,
+            gdn: None,
+            glm5_next: None,
+            deepseek_v41: None,
+            gemma4: Some(Gemma4Config {
+                softcap: 30.0,
+                per_layer_input: 256,
+            }),
             vision: None,
         })
     }
@@ -1872,6 +2167,7 @@ impl ModelSpec {
                 (Mixer::Gdn, 1)
             };
             layers.push(LayerPlan {
+                geometry: None,
                 mixer,
                 state_index: counts[slot],
                 rope: false,
@@ -1957,6 +2253,7 @@ impl ModelSpec {
                 routed_scaling_factor,
             }),
             deepseek_v41: None,
+            gemma4: None,
             vision: None,
         })
     }
@@ -2416,6 +2713,7 @@ impl ModelSpec {
             gdn: Some(text.gdn),
             glm5_next: None,
             deepseek_v41: None,
+            gemma4: None,
             vision,
         })
     }

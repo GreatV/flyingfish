@@ -80,7 +80,8 @@ impl VisionGeometry {
             | crate::model_spec::Architecture::Flint
             | crate::model_spec::Architecture::Glm5Next
             | crate::model_spec::Architecture::LoopVl
-            | crate::model_spec::Architecture::DeepseekV41 => {
+            | crate::model_spec::Architecture::DeepseekV41
+            | crate::model_spec::Architecture::Gemma4 => {
                 bail!("vision configuration requires a multimodal architecture")
             }
         };
@@ -1059,7 +1060,8 @@ impl VisionWeights {
             Architecture::Llama
             | Architecture::Flint
             | Architecture::Glm5Next
-            | Architecture::LoopVl => {
+            | Architecture::LoopVl
+            | Architecture::Gemma4 => {
                 bail!("vision configuration requires a multimodal architecture")
             }
             Architecture::DeepseekV41 => {
@@ -2170,7 +2172,8 @@ impl VisionRuntime {
             Architecture::Llama
             | Architecture::Flint
             | Architecture::Glm5Next
-            | Architecture::LoopVl => {
+            | Architecture::LoopVl
+            | Architecture::Gemma4 => {
                 bail!("vision configuration requires a multimodal architecture")
             }
             Architecture::DeepseekV41 => {
@@ -2235,7 +2238,8 @@ impl VisionRuntime {
                 Architecture::Llama
                 | Architecture::Flint
                 | Architecture::Glm5Next
-                | Architecture::LoopVl => {
+                | Architecture::LoopVl
+                | Architecture::Gemma4 => {
                     bail!("vision configuration requires a multimodal architecture")
                 }
                 Architecture::DeepseekV41 => {

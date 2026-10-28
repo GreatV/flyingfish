@@ -204,6 +204,9 @@ impl MappedCheckpoint {
                 })?;
             return self.assemble_manifest("LoopVL", expected, policy, planned, None);
         }
+        if spec.architecture == Architecture::Gemma4 {
+            bail!("Gemma 4 checkpoint manifest is not bound");
+        }
         if spec.architecture == Architecture::Glm5Next {
             let mut expected = BTreeMap::new();
             Self::glm5_next_entries(spec, &mut expected)?;
@@ -254,7 +257,10 @@ impl MappedCheckpoint {
             Architecture::Qwen35Text => "Q38",
             Architecture::MiniCpmV47 => "MiniCPM",
             Architecture::Flint => "Flint",
-            Architecture::Llama | Architecture::Glm5Next | Architecture::LoopVl => {
+            Architecture::Llama
+            | Architecture::Glm5Next
+            | Architecture::LoopVl
+            | Architecture::Gemma4 => {
                 bail!("checkpoint manifest requires a Qwen3.5-family spec")
             }
             Architecture::DeepseekV41 => {
@@ -295,7 +301,10 @@ impl MappedCheckpoint {
             }
             Architecture::MiniCpmV47 => Self::minicpm_vision_entries(spec, &mut expected)?,
             Architecture::Flint => {}
-            Architecture::Llama | Architecture::Glm5Next | Architecture::LoopVl => unreachable!(),
+            Architecture::Llama
+            | Architecture::Glm5Next
+            | Architecture::LoopVl
+            | Architecture::Gemma4 => unreachable!(),
             Architecture::DeepseekV41 => {
                 unreachable!("DeepSeek-V4.1 has a dedicated manifest path")
             }
@@ -434,7 +443,10 @@ impl MappedCheckpoint {
             Architecture::Qwen35Text | Architecture::MiniCpmV47 | Architecture::Llama => {
                 "model.language_model"
             }
-            Architecture::Glm5Next | Architecture::LoopVl | Architecture::DeepseekV41 => {
+            Architecture::Glm5Next
+            | Architecture::LoopVl
+            | Architecture::DeepseekV41
+            | Architecture::Gemma4 => {
                 unreachable!("architecture has a dedicated manifest path")
             }
         };
@@ -597,8 +609,8 @@ impl MappedCheckpoint {
                         Architecture::Qwen35Text
                         | Architecture::MiniCpmV47
                         | Architecture::Llama => 2 * q_width,
-                        Architecture::Glm5Next | Architecture::LoopVl => {
-                            unreachable!("GLM has a dedicated manifest path")
+                        Architecture::Glm5Next | Architecture::LoopVl | Architecture::Gemma4 => {
+                            unreachable!("architecture has a dedicated manifest path")
                         }
                         Architecture::DeepseekV41 => {
                             unreachable!("DeepSeek-V4.1 has a dedicated manifest path")

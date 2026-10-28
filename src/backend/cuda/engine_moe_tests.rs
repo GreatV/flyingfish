@@ -849,6 +849,7 @@ pub(super) fn hybrid_spec() -> Result<crate::model_spec::ModelSpec> {
     });
     spec.layers = vec![
         LayerPlan {
+            geometry: None,
             mixer: Mixer::Gdn,
             state_index: 0,
             rope: false,
@@ -856,6 +857,7 @@ pub(super) fn hybrid_spec() -> Result<crate::model_spec::ModelSpec> {
             ffn: crate::model_spec::FfnKind::Moe,
         },
         LayerPlan {
+            geometry: None,
             mixer: Mixer::FullAttention,
             state_index: 0,
             rope: true,
