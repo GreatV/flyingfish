@@ -77,5 +77,26 @@
       }
     }
   ],
-  "limit_rule": "Twice the per-fixture maximum reference variation across same-device chunk shapes and CUDA/HIP; three exact repeats per shape. Frozen before the first HIP model candidate; shifted-vocabulary control exceeds each maximum bound."
+  "limit_rule": "Twice the per-fixture maximum reference variation across same-device chunk shapes and CUDA/HIP; three exact repeats per shape. Frozen before the first HIP model candidate; shifted-vocabulary control exceeds each maximum bound.",
+  "media_limits": {
+    "image_hockey": {
+      "max_normalized": 0.9645815128630935,
+      "rms_normalized": 0.14139979421490959
+    },
+    "image_boat": {
+      "max_normalized": 0.7815779719678922,
+      "rms_normalized": 0.13664030695426238
+    }
+  },
+  "media_reference_floor": {
+    "image_hockey": {
+      "max_normalized": 0.48229075643154673,
+      "rms_normalized": 0.07069989710745479
+    },
+    "image_boat": {
+      "max_normalized": 0.3907889859839461,
+      "rms_normalized": 0.06832015347713119
+    }
+  },
+  "media_limit_rule": "Twice each fixture maximum reference variation across HIP eager/SDPA attention and full/last-row head projection, plus CUDA eager; three exact repeats per variant. Frozen before the first HIP media candidate. Shifted-vocabulary control exceeds each maximum bound."
 }
