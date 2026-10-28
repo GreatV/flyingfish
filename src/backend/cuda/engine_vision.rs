@@ -3611,6 +3611,17 @@ mod tests {
                             LinearBiasMode::AfterOutputRound,
                         )?;
                         let actual = s.clone_dtoh(&y)?;
+                        #[cfg(feature = "rocm")]
+                        {
+                            let raw = blas.projection_rounding_probe(width as usize)?;
+                            println!(
+                                "VISION_PATCH_F32 input={input} positive={} negative={} positive_bits={} negative_bits={}",
+                                raw[0],
+                                raw[width as usize / 2],
+                                raw[0].to_bits(),
+                                raw[width as usize / 2].to_bits()
+                            );
+                        }
                         let wrong = actual
                             .iter()
                             .enumerate()
