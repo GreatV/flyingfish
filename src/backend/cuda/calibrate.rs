@@ -1953,6 +1953,7 @@ mod long_tests {
 
     #[test]
     #[ignore = "requires exclusive CUDA calibration"]
+    #[cfg(feature = "cuda")]
     fn expert_setup_smoke_gpu() -> Result<()> {
         let device = Device::new(0)?;
         let untimed_begin = device
@@ -1993,6 +1994,7 @@ mod long_tests {
 
     #[test]
     #[ignore = "requires exclusive CUDA calibration and an empty runtime directory"]
+    #[cfg(feature = "cuda")]
     fn expert_setup_measurements_gpu() -> Result<()> {
         let model = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
         let runtime = PathBuf::from(
@@ -2130,6 +2132,7 @@ mod long_tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     fn calibration_expected(
         c: &Config,
         values: &[bf16],
@@ -2170,6 +2173,7 @@ mod long_tests {
         expected
     }
 
+    #[cfg(feature = "cuda")]
     fn calibration_attention_cell(
         d: &Device,
         ops: &Ops,
@@ -2353,6 +2357,7 @@ mod long_tests {
 
     #[test]
     #[ignore = "exclusive CUDA, FF_ARGMAX_MODEL and an empty FLYINGFISH_RUNTIME_DIR"]
+    #[cfg(feature = "cuda")]
     fn calibration_identity_capacity_gpu() -> Result<()> {
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -2429,6 +2434,7 @@ mod long_tests {
     }
 
     #[test]
+    #[cfg(feature = "cuda")]
     fn cache_requires_measured_bucket_and_complete_candidates() -> Result<()> {
         assert_eq!(
             driver_release(
