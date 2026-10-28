@@ -335,6 +335,12 @@ impl Stream {
             .expect("HIP resource registry poisoned");
         resources.retain(|r| r.strong_count() != 0);
         resources.push(Arc::downgrade(&resource));
+        if self.capturing.load(Ordering::Acquire) {
+            self.captured
+                .lock()
+                .expect("HIP capture resources poisoned")
+                .push(resource);
+        }
     }
     pub(super) fn retain<T: Any + Send + Sync>(&self, resource: &Arc<T>) {
         if self.capturing.load(Ordering::Acquire) {
@@ -359,17 +365,16 @@ impl Stream {
                 .is_ok(),
             "HIP stream capture already active"
         );
-        let resources = self
-            .resources
-            .lock()
-            .expect("HIP resource registry poisoned")
-            .iter()
-            .filter_map(Weak::upgrade)
-            .collect();
-        *self
-            .captured
-            .lock()
-            .expect("HIP capture resources poisoned") = resources;
+        {
+            let resources = self
+                .resources
+                .lock()
+                .expect("HIP resource registry poisoned");
+            self.captured
+                .lock()
+                .expect("HIP capture resources poisoned")
+                .extend(resources.iter().filter_map(Weak::upgrade));
+        }
         let status = unsafe { hipStreamBeginCapture(self.raw(), 1) };
         if status != 0 {
             self.capturing.store(false, Ordering::Release);
