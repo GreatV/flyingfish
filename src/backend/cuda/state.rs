@@ -646,6 +646,19 @@ impl StateStore {
             }
             match layer.mixer {
                 Mixer::FullAttention => {
+                    let geometry = layer.geometry.as_ref();
+                    if geometry.is_some_and(|g| g.kv_reader) {
+                        let publisher = layer.state_index as usize;
+                        ensure!(publisher < kv.len(), "invalid shared KV publisher");
+                        let ring = kv_rings[publisher];
+                        kv.push(Kv {
+                            k: stream.alloc_zeros::<bf16>(0)?,
+                            v: stream.alloc_zeros::<bf16>(0)?,
+                            compact: None,
+                        });
+                        kv_rings.push(ring);
+                        continue;
+                    }
                     ensure!(
                         layer.state_index as usize == kv.len(),
                         "invalid full-state mapping"
@@ -657,11 +670,9 @@ impl StateStore {
                     let layer_capacity = layer
                         .sliding_window
                         .map_or(capacity, |window| window as usize);
-                    let layout = format.layout(
-                        layer_capacity,
-                        spec.kv_heads as usize,
-                        spec.head_dim as usize,
-                    )?;
+                    let head_dim = geometry.map_or(spec.head_dim, |g| g.head_dim);
+                    let layout =
+                        format.layout(layer_capacity, spec.kv_heads as usize, head_dim as usize)?;
                     kv.push(Kv {
                         k: stream.alloc_zeros::<bf16>(layout.ring_elements)?,
                         v: stream.alloc_zeros::<bf16>(layout.ring_elements)?,
@@ -690,6 +701,7 @@ impl StateStore {
         let sequence = if spec.gdn.is_some()
             || spec.architecture == crate::model_spec::Architecture::Flint
             || spec.architecture == crate::model_spec::Architecture::DeepseekV41
+            || spec.architecture == crate::model_spec::Architecture::Gemma4
         {
             Some(stream.clone_htod(&[0i32, 1, 1, capacity as i32, 1, 0, 0, 0])?)
         } else {

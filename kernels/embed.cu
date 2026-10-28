@@ -29,3 +29,42 @@ extern "C" __global__ void embed_streams(const __nv_bfloat16* w, const uint32_t*
     if (i < rows * mult * dim)
         y[i] = w[(uint64_t)ids[i / (mult * dim)] * dim + i % dim];
 }
+
+// out = bf16(bf16(rms(bf16(context*context_scale))*wn + bf16(table[id]*identity_scale))*combine_scale).
+extern "C" __global__ void per_layer_input(const uint32_t* ids,
+    const __nv_bfloat16* table, const __nv_bfloat16* context,
+    const __nv_bfloat16* wn, __nv_bfloat16* out, int rows, int layers, int width,
+    float identity_scale, float context_scale, float combine_scale, float eps) {
+    if (width <= 0 || layers <= 0 || rows <= 0 || blockDim.x != 128) { __trap(); return; }
+    const int row = blockIdx.x / layers;
+    const int layer = blockIdx.x % layers;
+    if (row >= rows) return;
+    const size_t base = ((size_t)row * layers + layer) * width;
+    const size_t token = (size_t)ids[row] * layers * width + (size_t)layer * width;
+    const __nv_bfloat16 is = __float2bfloat16_rn(identity_scale);
+    const __nv_bfloat16 cs = __float2bfloat16_rn(context_scale);
+    __shared__ float partial[4];
+    float sum = 0.0f;
+    for (int d = threadIdx.x; d < width; d += blockDim.x) {
+        out[base + d] = __hmul(table[token + d], is);
+        const float x = __bfloat162float(__hmul(context[base + d], cs));
+        sum += x * x;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_xor_sync(0xffffffff, sum, offset);
+    if ((threadIdx.x & 31) == 0) partial[threadIdx.x >> 5] = sum;
+    __syncthreads();
+    if (threadIdx.x < 4) {
+        float x = partial[threadIdx.x];
+        for (int offset = 2; offset > 0; offset >>= 1) x += __shfl_xor_sync(0xf, x, offset);
+        if (threadIdx.x == 0) partial[0] = x;
+    }
+    __syncthreads();
+    const float rstd = rsqrtf(partial[0] / width + eps);
+    const __nv_bfloat16 combine = __float2bfloat16_rn(combine_scale);
+    for (int d = threadIdx.x; d < width; d += blockDim.x) {
+        const float x = __bfloat162float(__hmul(context[base + d], cs));
+        const __nv_bfloat16 n = __float2bfloat16_rn(x * rstd * __bfloat162float(wn[d]));
+        out[base + d] = __hmul(__hadd(n, out[base + d]), combine);
+    }
+}

@@ -133,7 +133,36 @@ impl RowWorkSpec {
                 )
             }
             Architecture::Gemma4 => {
-                anyhow::bail!("Gemma 4 row work is not bound yet")
+                let mut head_dim = 0usize;
+                for layer in &spec.layers {
+                    let geometry = layer.geometry.as_ref().with_context(|| {
+                        format!(
+                            "missing per-layer attention geometry at {}",
+                            layer.state_index
+                        )
+                    })?;
+                    head_dim = head_dim.max(geometry.head_dim as usize);
+                    intermediate = intermediate.max(geometry.intermediate as usize);
+                }
+                if let Some(width) = spec.per_layer_input {
+                    intermediate = intermediate.max(spec.layers.len() * width as usize);
+                }
+                let q = (spec.q_heads as usize)
+                    .checked_mul(head_dim)
+                    .context("per-layer Q width overflow")?;
+                let kv = (spec.kv_heads as usize)
+                    .checked_mul(head_dim)
+                    .context("per-layer KV width overflow")?;
+                (
+                    q.checked_add(
+                        kv.checked_mul(2)
+                            .context("per-layer KV projection overflow")?,
+                    )
+                    .context("per-layer projection width overflow")?,
+                    q,
+                    false,
+                    0,
+                )
             }
             Architecture::Qwen35Text | Architecture::MiniCpmV47 => {
                 FullAttentionSpec::from_model(spec)?;

@@ -592,9 +592,7 @@ fn load_dispatch(architecture: crate::model_spec::Architecture) -> Result<LoadDi
         Architecture::LoopVl => LoadDispatch::Recurrent,
         Architecture::DeepseekV41 => LoadDispatch::Deepseek,
         Architecture::Glm5Next => LoadDispatch::Qwen,
-        Architecture::Gemma4 => {
-            anyhow::bail!("Gemma 4 execution is not bound yet")
-        }
+        Architecture::Gemma4 => LoadDispatch::Qwen,
     })
 }
 
@@ -1093,13 +1091,17 @@ impl Engine {
         let chunk = workspace_rows;
         let mut work = Work::new(s, &model_spec, workspace_rows)?;
         s.memcpy_htod(&[1i32], &mut work.length)?;
-        let flash = Flash::new(
-            s.clone(),
-            workspace_rows,
-            config.num_attention_heads,
-            config.num_key_value_heads,
-            config.head_dim,
-        )?;
+        let flash = if model_spec.architecture == crate::model_spec::Architecture::Gemma4 {
+            None
+        } else {
+            Some(Flash::new(
+                s.clone(),
+                workspace_rows,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+            )?)
+        };
         s.synchronize()?;
         let mut engine = Self {
             #[cfg(test)]
@@ -1165,7 +1167,7 @@ impl Engine {
             ops,
             blas,
             #[cfg(feature = "cuda")]
-            flash: Some(flash),
+            flash,
             decode: None,
             logits_f32: None,
             device,
@@ -1664,7 +1666,9 @@ impl Engine {
         if self.qwen.is_some() {
             ensure!(
                 matches!(step.mask, crate::backend::Mask::Causal)
-                    && (step.head != Head::All || self.model_spec.moe.is_some()),
+                    && (step.head != Head::All
+                        || self.model_spec.moe.is_some()
+                        || self.model_spec.architecture == crate::model_spec::Architecture::Gemma4),
                 "hybrid forward requires causal mask and a bound MoE chain for head={:?}",
                 step.head
             );
@@ -1691,6 +1695,7 @@ impl Engine {
         if step.input == crate::backend::Input::Ids
             && step.head == Head::All
             && matches!(step.mask, crate::backend::Mask::Causal)
+            && self.model_spec.architecture != crate::model_spec::Architecture::Gemma4
         {
             let spec = self
                 .spec
@@ -1941,6 +1946,45 @@ impl Engine {
         self.profile_rounds = enabled;
     }
 
+    #[cfg(test)]
+    pub(crate) fn gemma_prefill_all(&mut self, ids: &[u32]) -> Result<()> {
+        ensure!(!ids.is_empty(), "Gemma 4 prefill requires token IDs");
+        self.device.stream.memcpy_htod(ids, &mut self.work.ids)?;
+        self.run_step(
+            crate::backend::Step {
+                rows: ids.len(),
+                input: crate::backend::Input::Ids,
+                head: Head::All,
+                mask: crate::backend::Mask::Causal,
+            },
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gemma_decode_all(&mut self, token: u32) -> Result<()> {
+        self.device
+            .stream
+            .memcpy_htod(&[token], &mut self.work.token)?;
+        self.run_step(
+            crate::backend::Step {
+                rows: 1,
+                input: crate::backend::Input::Token,
+                head: Head::All,
+                mask: crate::backend::Mask::Causal,
+            },
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gemma_all_logits(&self, row: usize) -> Result<Vec<bf16>> {
+        self.qwen
+            .as_ref()
+            .context("Gemma 4 runtime missing")?
+            .gemma_logits(&self.device.stream, row, self.model_spec.vocab as usize)
+    }
+
     pub fn verification_logits(&self, row: usize) -> Result<Vec<f32>> {
         let spec = self.spec.as_ref().context("draft state is not enabled")?;
         ensure!(
@@ -2009,7 +2053,7 @@ impl Engine {
                     self.run_hc_stage(position, kind, layer, step)?
                 }
                 crate::model::LayerStage::PerLayerInput => {
-                    anyhow::bail!("per-layer input stage has no bound runtime")
+                    self.qwen_per_layer_input(layer, step, trace)?
                 }
             }
             #[cfg(test)]
@@ -2080,7 +2124,8 @@ impl Engine {
                 Architecture::Qwen35Text
                 | Architecture::MiniCpmV47
                 | Architecture::Flint
-                | Architecture::Glm5Next,
+                | Architecture::Glm5Next
+                | Architecture::Gemma4,
                 _,
             ) => self.qwen_mixer(layer, step, trace),
             (Architecture::Llama, Mixer::FullAttention) => {

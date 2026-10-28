@@ -4,6 +4,7 @@ use crate::backend::cuda::contracts::view;
 use crate::backend::cuda::{
     attention_d256::{AttentionBindings, FullAttentionOps, FullAttentionPlan, PositionBindings},
     contracts::{RowDomain, Scratch, Tensor, TensorMut},
+    flash::Score,
     gdn::{
         CUDA_GRID_YZ_MAX, GdnBindings, GdnConvWeights, GdnDecayWeights, GdnGateInput, GdnOps,
         GdnPlan,
@@ -51,7 +52,9 @@ fn debug_name(trace: &Option<Target<'_>>, layer: usize, point: &str) -> String {
 fn norm_mode(spec: &crate::model_spec::ModelSpec) -> RmsMode {
     if matches!(
         spec.architecture,
-        crate::model_spec::Architecture::Flint | crate::model_spec::Architecture::Glm5Next
+        crate::model_spec::Architecture::Flint
+            | crate::model_spec::Architecture::Glm5Next
+            | crate::model_spec::Architecture::Gemma4
     ) {
         RmsMode::Standard
     } else {
@@ -530,11 +533,56 @@ impl GlmDsaOutputs {
         }
         Ok(())
     }
+fn require_gemma_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
+    ensure!(
+        spec.architecture == crate::model_spec::Architecture::Gemma4
+            && spec.linear_format == crate::model_spec::LinearFormat::Bf16
+            && spec.moe.is_none()
+            && spec.gdn.is_none()
+            && spec.per_layer_input == Some(256),
+        "unsupported Gemma 4 execution geometry"
+    );
+    for layer in &spec.layers {
+        let g = layer
+            .geometry
+            .as_ref()
+            .context("Gemma 4 layer geometry missing")?;
+        let full = g.head_dim == 512;
+        ensure!(
+            (full || g.head_dim == 256)
+                && layer.sliding_window.is_some() != full
+                && layer.mixer == Mixer::FullAttention
+                && g.intermediate > 0
+                && g.rope.pair_stride == g.head_dim / 2
+                && g.rope.denominator == g.head_dim
+                && g.rope.pairs == if full { 64 } else { 128 },
+            "unsupported Gemma 4 layer geometry: {g:?}"
+        );
+    }
+    Ok(())
+}
+
+struct GemmaOps {
+    scaled_embed: CudaFunction,
+    softcap: CudaFunction,
+    gated_activation: CudaFunction,
+    rope: CudaFunction,
+    branch_add: CudaFunction,
+    multiply: CudaFunction,
+    per_layer: CudaFunction,
+    rope_tables: [CudaSlice<bf16>; 2],
+    per_layer_table: Tensor<bf16, 2>,
+    per_layer_projection: Tensor<bf16, 2>,
+    per_layer_norm: Tensor<bf16, 1>,
+    per_layer_inputs: CudaSlice<bf16>,
+    #[cfg(test)]
+    logits: CudaSlice<bf16>,
 }
 
 pub(super) struct Runtime {
     attention: Option<FullAttentionSpec>,
     gdn: Option<GdnSpec>,
+    gemma: Option<GemmaOps>,
     checkpoint_dir: PathBuf,
     vision: Option<super::vision_runtime::VisionRuntime>,
     vision_bytes: usize,
@@ -566,6 +614,10 @@ struct Layer {
     native: Option<NativeFfn>,
     input_norm: Tensor<bf16, 1>,
     post_norm: Tensor<bf16, 1>,
+    pre_ffn_norm: Option<Tensor<bf16, 1>>,
+    post_ffn_norm: Option<Tensor<bf16, 1>>,
+    post_ple_norm: Option<Tensor<bf16, 1>>,
+    layer_scalar: Option<Tensor<bf16, 1>>,
     mixer: BoundMixer,
 }
 
@@ -681,6 +733,12 @@ enum BoundMixer {
         decode: Box<FullAttentionPlan>,
         #[cfg(feature = "cuda")]
         compact_small: Option<PrefillPlans<FullAttentionPlan>>,
+    },
+    Gemma {
+        flash: Flash,
+        q_norm: Tensor<bf16, 1>,
+        k_norm: Option<Tensor<bf16, 1>>,
+        full: bool,
     },
     Gdn {
         norm: Tensor<bf16, 1>,
@@ -1077,6 +1135,9 @@ impl Runtime {
                 )?;
             return Ok(usize::try_from(decode.max(prefill).div_ceil(256) * 256)?);
         }
+        if model.architecture == crate::model_spec::Architecture::Gemma4 {
+            return Ok(0);
+        }
         let attention = if model.architecture == crate::model_spec::Architecture::Glm5Next {
             None
         } else {
@@ -1158,7 +1219,9 @@ impl Runtime {
         let s = &engine.device.stream;
         let rows = engine.workspace_rows;
         let flint = engine.model_spec.architecture == crate::model_spec::Architecture::Flint;
+        let gemma = engine.model_spec.architecture == crate::model_spec::Architecture::Gemma4;
         let attention = if flint
+            || gemma
             || engine.model_spec.architecture == crate::model_spec::Architecture::Glm5Next
         {
             None
@@ -1182,7 +1245,7 @@ impl Runtime {
                 Ok(bound)
             })
             .transpose()?;
-        let gdn = if flint {
+        let gdn = if flint || gemma {
             None
         } else {
             Some(GdnSpec::from_model(&engine.model_spec)?)
@@ -1217,8 +1280,69 @@ impl Runtime {
         let mut layers = Vec::new();
         let w = &engine.work;
         let mw = w.mixer.as_ref().context("Q38 mixer work missing")?;
-        let rope_module = if flint {
+        #[cfg(feature = "cuda")]
+        let rope_module = if flint || gemma {
             Some(cubin::module(&engine.device.ctx, "rope")?)
+        } else {
+            None
+        };
+        let gemma_ops = if gemma {
+            let width = engine
+                .model_spec
+                .per_layer_input
+                .context("PLE width missing")? as usize;
+            let depth = engine.model_spec.layers.len();
+            let mut tables = Vec::new();
+            for full in [false, true] {
+                let geometry = engine
+                    .model_spec
+                    .layers
+                    .iter()
+                    .find_map(|layer| layer.geometry.filter(|g| (g.head_dim == 512) == full))
+                    .context("per-layer RoPE geometry missing")?;
+                tables
+                    .push(s.clone_htod(&geometry.rope.table(geometry.head_dim, engine.capacity)?)?);
+            }
+            let rope_tables: [CudaSlice<bf16>; 2] = tables
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("two per-layer RoPE tables required"))?;
+            let act = cubin::module(&engine.device.ctx, "act")?;
+            let embed = cubin::module(&engine.device.ctx, "embed")?;
+            Some(GemmaOps {
+                scaled_embed: embed.load_function("embed_scale_broadcast")?,
+                softcap: act.load_function("softcap")?,
+                gated_activation: act.load_function("silu_mul_split")?,
+                rope: rope_module
+                    .as_ref()
+                    .context("table RoPE module missing")?
+                    .load_function("qknorm_rope_table_kv")?,
+                branch_add: cubin::module(&engine.device.ctx, "q38_common")?
+                    .load_function("rms_branch_add")?,
+                multiply: act.load_function("multiply")?,
+                per_layer: embed.load_function("per_layer_input")?,
+                rope_tables,
+                per_layer_table: matrix(
+                    catalog.bf16("model.language_model.embed_tokens_per_layer.weight")?,
+                    s,
+                    0,
+                    engine.model_spec.vocab as usize,
+                    depth * width,
+                )?,
+                per_layer_projection: matrix(
+                    catalog.bf16("model.language_model.per_layer_model_projection.weight")?,
+                    s,
+                    0,
+                    depth * width,
+                    engine.model_spec.hidden as usize,
+                )?,
+                per_layer_norm: vector(
+                    catalog.bf16("model.language_model.per_layer_projection_norm.weight")?,
+                    s,
+                )?,
+                per_layer_inputs: s.alloc_zeros(rows * depth * width)?,
+                #[cfg(test)]
+                logits: s.alloc_zeros(rows * engine.model_spec.vocab as usize)?,
+            })
         } else {
             None
         };
@@ -1307,6 +1431,32 @@ impl Runtime {
                                 rope: module.load_function("flint_qknorm_rope_kv")?,
                                 nope: module.load_function("flint_qknorm_kv_nope")?,
                             }
+                        }
+                    } else if gemma {
+                        let geometry = layout
+                            .geometry
+                            .context("Gemma 4 attention geometry missing")?;
+                        let full = geometry.head_dim == 512;
+                        BoundMixer::Gemma {
+                            flash: Flash::new_with_score(
+                                s.clone(),
+                                rows,
+                                engine.model_spec.q_heads as usize,
+                                engine.model_spec.kv_heads as usize,
+                                geometry.head_dim as usize,
+                                Score::from_tokens(
+                                    1.0,
+                                    layout.sliding_window.map(|window| window as usize),
+                                )?,
+                                engine.capacity,
+                            )?,
+                            q_norm: weight("self_attn.q_norm.weight")?,
+                            k_norm: if geometry.kv_reader {
+                                None
+                            } else {
+                                Some(weight("self_attn.k_norm.weight")?)
+                            },
+                            full,
                         }
                     } else {
                         let attention = *attention
@@ -1617,6 +1767,16 @@ impl Runtime {
                 native,
                 input_norm: weight("input_layernorm.weight")?,
                 post_norm: weight("post_attention_layernorm.weight")?,
+                pre_ffn_norm: gemma
+                    .then(|| weight("pre_feedforward_layernorm.weight"))
+                    .transpose()?,
+                post_ffn_norm: gemma
+                    .then(|| weight("post_feedforward_layernorm.weight"))
+                    .transpose()?,
+                post_ple_norm: gemma
+                    .then(|| weight("post_per_layer_input_norm.weight"))
+                    .transpose()?,
+                layer_scalar: gemma.then(|| weight("layer_scalar")).transpose()?,
                 mixer,
             });
         }
@@ -1624,6 +1784,7 @@ impl Runtime {
         let runtime = Self {
             attention,
             gdn,
+            gemma: gemma_ops,
             checkpoint_dir: checkpoint_dir
                 .canonicalize()
                 .context("resolve Q38 checkpoint directory")?,
@@ -1806,6 +1967,21 @@ impl Runtime {
         let bound = bucketed_prefill_rows(rows, self.workspace_rows)?;
         self.prepare_dimensions(blas, bound, vocab, hidden)
     }
+    #[cfg(test)]
+    pub(super) fn gemma_logits(
+        &self,
+        stream: &Arc<CudaStream>,
+        row: usize,
+        vocab: usize,
+    ) -> Result<Vec<bf16>> {
+        let ops = self.gemma.as_ref().context("Gemma 4 operations missing")?;
+        ensure!(
+            row < ops.logits.len() / vocab,
+            "Gemma 4 logit row outside binding"
+        );
+        Ok(stream.clone_dtoh(&ops.logits.slice(row * vocab..(row + 1) * vocab))?)
+    }
+
     fn linear_rows(&self, rows: u32, phase: ExecutionPhase) -> Result<u32> {
         if phase == ExecutionPhase::Decode {
             return Ok(rows);
@@ -2230,6 +2406,7 @@ impl Engine {
         match model_spec.architecture {
             crate::model_spec::Architecture::Flint => require_flint_geometry(&model_spec)?,
             crate::model_spec::Architecture::Glm5Next => require_glm_geometry(&model_spec)?,
+            crate::model_spec::Architecture::Gemma4 => require_gemma_geometry(&model_spec)?,
             _ => require_qwen35_geometry(&model_spec)?,
         }
         let write = mode.writes();
@@ -2260,12 +2437,13 @@ impl Engine {
         let started = Instant::now();
         let flint = model_spec.architecture == crate::model_spec::Architecture::Flint;
         let glm = model_spec.architecture == crate::model_spec::Architecture::Glm5Next;
-        let attention = if flint || glm {
+        let gemma = model_spec.architecture == crate::model_spec::Architecture::Gemma4;
+        let attention = if flint || glm || gemma {
             None
         } else {
             Some(FullAttentionSpec::from_model(&model_spec)?)
         };
-        let gdn = if flint {
+        let gdn = if flint || gemma {
             None
         } else {
             Some(GdnSpec::from_model(&model_spec)?)
@@ -2641,6 +2819,7 @@ impl Engine {
             );
         let (attention_prefill_bytes, attention_decode_bytes, attention_verify_bytes) = if flint
             || glm
+            || gemma
         {
             (0, 0, 0)
         } else {
@@ -2671,7 +2850,7 @@ impl Engine {
                 },
             )
         };
-        let (gdn_prefill_bytes, gdn_decode_bytes) = if flint {
+        let (gdn_prefill_bytes, gdn_decode_bytes) = if flint || gemma {
             (0, 0)
         } else {
             let gdn = gdn.as_ref().context("Q38 GDN specification missing")?;
@@ -2680,7 +2859,12 @@ impl Engine {
                 GdnOps::workspace(gdn, 1, GdnPolicy::P2)?.bytes,
             )
         };
-        let (prefill_backend, decode_backend) = if flint {
+        let (prefill_backend, decode_backend) = if gemma {
+            (
+                "native Rust D256-window/D512",
+                "native Rust D256-window/D512",
+            )
+        } else if flint {
             ("native d128 sliding/full", "flash decode d128")
         } else if glm {
             ("native DSA + KDA", "native DSA + KDA")
@@ -2689,10 +2873,10 @@ impl Engine {
         } else {
             ("native Rust d256", "TCMQA d256")
         };
-        if flint {
+        if flint || gemma {
             let elements = (512 + rows)
                 .checked_mul(kv_width as usize)
-                .context("Flint KV staging extent overflow")?;
+                .context("sliding KV staging extent overflow")?;
             kv_scratch = Some((
                 s.alloc_zeros::<bf16>(elements)?,
                 s.alloc_zeros::<bf16>(elements)?,
@@ -3731,8 +3915,14 @@ impl Engine {
         let q = self.qwen.as_mut().context("Q38 runtime missing")?;
         let layer = &q.layers[i];
         let flint_layer = matches!(layer.mixer, BoundMixer::Flint { .. });
-        let attention = q.attention;
-        let gdn = if flint_layer {
+        let flint_layer = matches!(layer.mixer, BoundMixer::Flint { .. });
+        let gemma_layer = matches!(layer.mixer, BoundMixer::Gemma { .. });
+        let attention = if flint_layer || gemma_layer {
+            None
+        } else {
+            Some(q.attention.context("Q38 attention specification missing")?)
+        };
+        let gdn = if flint_layer || gemma_layer {
             None
         } else {
             Some(q.gdn.context("Q38 GDN specification missing")?)
@@ -3755,6 +3945,7 @@ impl Engine {
         {
             return self.glm_dsa_mixer(i, step);
         }
+        let layer = &mut q.layers[i];
         let w = &mut self.work;
         let mw = w.mixer.as_ref().context("Q38 mixer work missing")?;
         let meta = self.state.seq_ref(s)?;
@@ -3763,7 +3954,7 @@ impl Engine {
             row_base: 0,
             row_capacity: rows as u32,
         };
-        match &layer.mixer {
+        match &mut layer.mixer {
             BoundMixer::Dsa { .. } => {
                 anyhow::bail!("GLM DSA mixer escaped its production dispatch")
             }
@@ -4081,6 +4272,182 @@ impl Engine {
                     "self_attn.o_proj.weight",
                     phase,
                     matrix(&w.attn, s, 0, linear_rows, q_width as usize)?,
+                    &mut TensorMut(matrix(&w.out, s, 0, linear_rows, hidden)?),
+                )?;
+            }
+            BoundMixer::Gemma {
+                flash,
+                q_norm,
+                k_norm,
+                full,
+            } => {
+                let ops = q.gemma.as_ref().context("Gemma 4 operations missing")?;
+                let layout = &self.model_spec.layers[i];
+                let geometry = layout
+                    .geometry
+                    .context("Gemma 4 attention geometry missing")?;
+                let d = geometry.head_dim as usize;
+                let hq = self.model_spec.q_heads as usize;
+                let hkv = self.model_spec.kv_heads as usize;
+                let q_width = hq * d;
+                let kv_width = hkv * d;
+                let reader = geometry.kv_reader;
+                if reader {
+                    layer.linear.run(
+                        &self.blas,
+                        "self_attn.q_proj.weight",
+                        phase,
+                        matrix(&w.n, s, 0, linear_rows, hidden)?,
+                        &mut TensorMut(matrix(&w.qkv, s, 0, linear_rows, q_width)?),
+                    )?;
+                } else {
+                    for (role, width, offset) in [
+                        ("self_attn.q_proj.weight", q_width, 0),
+                        ("self_attn.k_proj.weight", kv_width, linear_rows * q_width),
+                        (
+                            "self_attn.v_proj.weight",
+                            kv_width,
+                            linear_rows * (q_width + kv_width),
+                        ),
+                    ] {
+                        layer.linear.run(
+                            &self.blas,
+                            role,
+                            phase,
+                            matrix(&w.n, s, 0, linear_rows, hidden)?,
+                            &mut TensorMut(matrix(&w.qkv, s, offset, linear_rows, width)?),
+                        )?;
+                    }
+                }
+                let state_index = layout.state_index as usize;
+                let ring = self.state.kv_ring(state_index)?;
+                let sliding = layout.sliding_window.is_some();
+                let overflow = sliding && self.position + rows > ring;
+                let history = if overflow { self.position.min(ring) } else { 0 };
+                let cache_capacity = if overflow {
+                    ring + self.workspace_rows
+                } else {
+                    ring
+                };
+                {
+                    let kv = &mut self.state.kv[state_index];
+                    let (stage_k, stage_v) = if overflow {
+                        let (stage_k, stage_v) = q
+                            .kv_scratch
+                            .as_mut()
+                            .context("sliding KV staging is not bound")?;
+                        if history > 0 {
+                            for (source, target) in [(&kv.k, &mut *stage_k), (&kv.v, &mut *stage_v)]
+                            {
+                                super::super::copy::RingCopy {
+                                    stream: s,
+                                    source,
+                                    target,
+                                    source_capacity: ring,
+                                    target_capacity: cache_capacity,
+                                    heads: hkv,
+                                    head_dim: d,
+                                }
+                                .run(
+                                    (self.position - history) % ring,
+                                    0,
+                                    history,
+                                    true,
+                                    false,
+                                )?;
+                            }
+                        }
+                        (stage_k, stage_v)
+                    } else {
+                        (&mut kv.k, &mut kv.v)
+                    };
+                    let q_stride = if reader {
+                        q_width
+                    } else {
+                        q_width + 2 * kv_width
+                    };
+                    let prep_heads = if reader { 0 } else { hkv };
+                    let cache_start = if overflow { history as i32 } else { -1 };
+                    unsafe {
+                        s.launch_builder(&ops.rope)
+                            .arg(&mut w.qkv)
+                            .arg(&*stage_k)
+                            .arg(&*stage_v)
+                            .arg(&q_norm.ptr)
+                            .arg(&k_norm.as_ref().unwrap_or(q_norm).ptr)
+                            .arg(&ops.rope_tables[usize::from(*full)])
+                            .arg(&w.position)
+                            .arg(&cache_start)
+                            .arg(&(rows as i32))
+                            .arg(&(hq as i32))
+                            .arg(&(prep_heads as i32))
+                            .arg(&(d as i32))
+                            .arg(&(cache_capacity as i32))
+                            .arg(&0i32)
+                            .arg(&self.model_spec.rms_eps)
+                            .arg(&(q_stride as u64))
+                            .arg(&((linear_rows * q_width) as u64))
+                            .arg(&(kv_width as u64))
+                            .arg(&((linear_rows * (q_width + kv_width)) as u64))
+                            .arg(&(kv_width as u64))
+                            .launch(LaunchConfig {
+                                grid_dim: ((rows * (hq + 2 * prep_heads)) as u32, 1, 1),
+                                block_dim: (128, 1, 1),
+                                shared_mem_bytes: 0,
+                            })?;
+                    }
+                    flash.run(
+                        &w.qkv,
+                        q_stride,
+                        stage_k,
+                        stage_v,
+                        &mut w.attn,
+                        Shape {
+                            rows,
+                            start: if overflow { history } else { self.position },
+                            q_heads: hq,
+                            kv_heads: hkv,
+                            capacity: cache_capacity,
+                            head_dim: d,
+                            causal: true,
+                            window_left: layout.sliding_window.map(|window| window as usize - 1),
+                        },
+                    )?;
+                }
+                if overflow && !reader {
+                    let kv = &mut self.state.kv[state_index];
+                    let (stage_k, stage_v) = q
+                        .kv_scratch
+                        .as_ref()
+                        .context("sliding KV staging is not bound")?;
+                    let end = history + rows;
+                    let keep = end.min(ring);
+                    let source_start = end - keep;
+                    let absolute_start = self.position + rows - keep;
+                    for (source, target) in [(stage_k, &mut kv.k), (stage_v, &mut kv.v)] {
+                        super::super::copy::RingCopy {
+                            stream: s,
+                            source,
+                            target,
+                            source_capacity: cache_capacity,
+                            target_capacity: ring,
+                            heads: hkv,
+                            head_dim: d,
+                        }
+                        .run(
+                            source_start,
+                            absolute_start % ring,
+                            keep,
+                            false,
+                            true,
+                        )?;
+                    }
+                }
+                layer.linear.run(
+                    &self.blas,
+                    "self_attn.o_proj.weight",
+                    phase,
+                    matrix(&w.attn, s, 0, linear_rows, q_width)?,
                     &mut TensorMut(matrix(&w.out, s, 0, linear_rows, hidden)?),
                 )?;
             }
@@ -4441,6 +4808,9 @@ impl Engine {
             let name = debug_name(trace, i, "mixer_out");
             let mixer_width = match &layer.mixer {
                 BoundMixer::Flint { .. } => q_width,
+                BoundMixer::Gemma { full, .. } => {
+                    self.model_spec.q_heads * if *full { 512 } else { 256 }
+                }
                 BoundMixer::Attention { .. } => q_width,
                 BoundMixer::Gdn { .. } => value_width,
                 BoundMixer::Dsa { .. } => q_width,
@@ -4583,6 +4953,110 @@ impl Engine {
         )
     }
 
+    pub(super) fn qwen_per_layer_input(
+        &mut self,
+        i: usize,
+        step: crate::backend::Step<'_>,
+        trace: &mut Option<Target<'_>>,
+    ) -> Result<()> {
+        let q = self.qwen.as_mut().context("Q38 runtime missing")?;
+        let s = &self.device.stream;
+        let w = &mut self.work;
+        let rows = step.rows;
+        let h = self.model_spec.hidden as usize;
+        let width = self
+            .model_spec
+            .per_layer_input
+            .context("PLE width missing")? as usize;
+        let phase = if step.input == crate::backend::Input::Token {
+            ExecutionPhase::Decode
+        } else {
+            ExecutionPhase::Prefill
+        };
+        let linear_rows = q.linear_rows(rows as u32, phase)? as usize;
+        let next_norm = if let Some(next) = q.layers.get(i + 1) {
+            next.input_norm
+        } else {
+            vector(
+                self.weights
+                    .norm
+                    .as_ref()
+                    .context("weighted final norm missing")?,
+                s,
+            )?
+        };
+        let layer = &mut q.layers[i];
+        let ops = q.gemma.as_ref().context("Gemma 4 operations missing")?;
+        let null = 0u64;
+        unsafe {
+            s.launch_builder(&ops.branch_add)
+                .arg(&mut w.x)
+                .arg(&w.out)
+                .arg(&layer.post_ffn_norm.context("post-FFN norm missing")?.ptr)
+                .arg(&null)
+                .arg(&null)
+                .arg(&mut w.n)
+                .arg(&(h as u32))
+                .arg(&self.model_spec.rms_eps)
+                .launch(grid(rows, 256))?;
+        }
+        layer.linear.run(
+            &self.blas,
+            "per_layer_input_gate.weight",
+            phase,
+            matrix(&w.x, s, 0, linear_rows, h)?,
+            &mut TensorMut(matrix(&w.gu, s, 0, linear_rows, width)?),
+        )?;
+        q.common.gate.gelu(
+            s,
+            heads(&w.gu, s, 0, rows, 1, width as u32)?,
+            &mut TensorMut(heads(&w.act, s, 0, rows, 1, width as u32)?),
+            crate::backend::cuda::ops::GeluMode::Tanh,
+        )?;
+        unsafe {
+            s.launch_builder(&ops.multiply)
+                .arg(&w.act)
+                .arg(
+                    &ops.per_layer_inputs
+                        .slice(i * rows * width..(i + 1) * rows * width),
+                )
+                .arg(&mut w.gu)
+                .arg(&((rows * width) as i32))
+                .launch(flat(rows * width))?;
+        }
+        layer.linear.run(
+            &self.blas,
+            "per_layer_projection.weight",
+            phase,
+            matrix(&w.gu, s, 0, linear_rows, width)?,
+            &mut TensorMut(matrix(&w.out, s, 0, linear_rows, h)?),
+        )?;
+        unsafe {
+            s.launch_builder(&ops.branch_add)
+                .arg(&mut w.x)
+                .arg(&w.out)
+                .arg(&layer.post_ple_norm.context("post-PLE norm missing")?.ptr)
+                .arg(&layer.layer_scalar.context("layer scalar missing")?.ptr)
+                .arg(&next_norm.ptr)
+                .arg(&mut w.n)
+                .arg(&(h as u32))
+                .arg(&self.model_spec.rms_eps)
+                .launch(grid(rows, 256))?;
+        }
+        if all_layers(trace) || i == self.trace_layer {
+            trace_value(
+                trace,
+                s,
+                &debug_name(trace, i, "per_layer_input"),
+                &w.out,
+                rows,
+                h,
+            )?;
+            trace_value(trace, s, &debug_name(trace, i, "layer_out"), &w.x, rows, h)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn qwen_operator(
         &mut self,
         op: crate::backend::Operator,
@@ -4591,14 +5065,22 @@ impl Engine {
         trace: &mut Option<Target<'_>>,
     ) -> Result<()> {
         use crate::backend::Operator as O;
-        let q = self.qwen.as_ref().context("Q38 runtime missing")?;
+        let q = self.qwen.as_mut().context("Q38 runtime missing")?;
         let flint = self.model_spec.architecture == crate::model_spec::Architecture::Flint;
+        let gemma = self.model_spec.architecture == crate::model_spec::Architecture::Gemma4;
         let layer = &q.layers[i];
         let s = &self.device.stream;
         let w = &mut self.work;
         let rows = step.rows;
         let h = self.model_spec.hidden as usize;
-        let f = self.model_spec.intermediate as usize;
+        let f = if gemma {
+            self.model_spec.layers[i]
+                .geometry
+                .context("Gemma 4 FFN geometry missing")?
+                .intermediate as usize
+        } else {
+            self.model_spec.intermediate as usize
+        };
         let phase = if step.input == crate::backend::Input::Token {
             ExecutionPhase::Decode
         } else {
@@ -4619,13 +5101,32 @@ impl Engine {
                     &w.ids
                 };
                 unsafe {
-                    s.launch_builder(&self.ops.embed)
+                    if gemma {
+                        let scale = bf16::from_f32((h as f32).sqrt()).to_f32();
+                        s.launch_builder(
+                            &q.gemma
+                                .as_ref()
+                                .context("Gemma 4 operations missing")?
+                                .scaled_embed,
+                        )
                         .arg(&self.weights.embed)
                         .arg(ids)
+                        .arg(&w.gu)
                         .arg(&mut w.x)
+                        .arg(&mut w.n)
                         .arg(&(rows as i32))
                         .arg(&(h as i32))
+                        .arg(&scale)
                         .launch(flat(rows * h))?;
+                    } else {
+                        s.launch_builder(&self.ops.embed)
+                            .arg(&self.weights.embed)
+                            .arg(ids)
+                            .arg(&mut w.x)
+                            .arg(&(rows as i32))
+                            .arg(&(h as i32))
+                            .launch(flat(rows * h))?;
+                    }
                 }
                 if step.input == crate::backend::Input::Ids
                     && let Some(images) = &self.images
@@ -4637,6 +5138,43 @@ impl Engine {
                     )?;
                 }
                 trace_value(trace, s, "embed", &w.x, rows, h)?;
+                if gemma {
+                    let ops = q.gemma.as_mut().context("Gemma 4 operations missing")?;
+                    let depth = self.model_spec.layers.len();
+                    let width = self
+                        .model_spec
+                        .per_layer_input
+                        .context("PLE width missing")? as usize;
+                    self.blas.linear_typed(
+                        phase,
+                        LinearWeightRef::Bf16(ops.per_layer_projection),
+                        matrix(&w.x, s, 0, rows, h)?,
+                        &mut TensorMut(matrix(&w.gu, s, 0, rows, depth * width)?),
+                    )?;
+                    let identity_scale = bf16::from_f32((width as f32).sqrt()).to_f32();
+                    let context_scale = bf16::from_f32(1.0 / (h as f32).sqrt()).to_f32();
+                    let combine_scale = bf16::from_f32(std::f32::consts::FRAC_1_SQRT_2).to_f32();
+                    unsafe {
+                        s.launch_builder(&ops.per_layer)
+                            .arg(ids)
+                            .arg(&ops.per_layer_table.ptr)
+                            .arg(&w.gu)
+                            .arg(&ops.per_layer_norm.ptr)
+                            .arg(&mut ops.per_layer_inputs)
+                            .arg(&(rows as i32))
+                            .arg(&(depth as i32))
+                            .arg(&(width as i32))
+                            .arg(&identity_scale)
+                            .arg(&context_scale)
+                            .arg(&combine_scale)
+                            .arg(&self.model_spec.rms_eps)
+                            .launch(LaunchConfig {
+                                grid_dim: ((rows * depth) as u32, 1, 1),
+                                block_dim: (128, 1, 1),
+                                shared_mem_bytes: 0,
+                            })?;
+                    }
+                }
             }
             O::Norm => {
                 if self.model_spec.architecture == crate::model_spec::Architecture::Glm5Next {
@@ -4705,35 +5243,63 @@ impl Engine {
                     }
                     return Ok(());
                 }
+                if gemma && matches!(op, O::NextNorm) {
+                    if trace.is_some() {
+                        let name = if all_layers(trace) {
+                            i.to_string()
+                        } else {
+                            format!("layer.{i}")
+                        };
+                        trace_value(trace, s, &name, &w.x, rows, h)?;
+                    }
+                    return Ok(());
+                }
                 if matches!(op, O::PostNorm) {
-                    let mode = norm_mode(&self.model_spec);
-                    if matches!(mode, RmsMode::Standard) {
-                        self.ops.rms_add_fp32_with(
-                            s,
-                            domain,
-                            ResidualRmsInput {
-                                x: &mut TensorMut(heads(&w.x, s, 0, rows, 1, h as u32)?),
-                                residual: heads(&w.out, s, 0, rows, 1, h as u32)?,
-                                weight: layer.post_norm,
-                            },
-                            &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
-                            self.model_spec.rms_eps,
-                        )?;
+                    if gemma {
+                        let ops = q.gemma.as_ref().context("Gemma 4 operations missing")?;
+                        let null = 0u64;
+                        unsafe {
+                            s.launch_builder(&ops.branch_add)
+                                .arg(&mut w.x)
+                                .arg(&w.out)
+                                .arg(&layer.post_norm.ptr)
+                                .arg(&null)
+                                .arg(&layer.pre_ffn_norm.context("pre-FFN norm missing")?.ptr)
+                                .arg(&mut w.n)
+                                .arg(&(h as u32))
+                                .arg(&self.model_spec.rms_eps)
+                                .launch(grid(rows, 256))?;
+                        }
                     } else {
-                        q.common.norm.rms_add_with(
-                            s,
-                            domain,
-                            ResidualRmsInput {
-                                x: &mut TensorMut(heads(&w.x, s, 0, rows, 1, h as u32)?),
-                                residual: heads(&w.out, s, 0, rows, 1, h as u32)?,
-                                weight: layer.post_norm,
-                            },
-                            &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
-                            RmsOptions {
-                                mode,
-                                eps: self.model_spec.rms_eps,
-                            },
-                        )?;
+                        let mode = norm_mode(&self.model_spec);
+                        if matches!(mode, RmsMode::Standard) {
+                            self.ops.rms_add_fp32_with(
+                                s,
+                                domain,
+                                ResidualRmsInput {
+                                    x: &mut TensorMut(heads(&w.x, s, 0, rows, 1, h as u32)?),
+                                    residual: heads(&w.out, s, 0, rows, 1, h as u32)?,
+                                    weight: layer.post_norm,
+                                },
+                                &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
+                                self.model_spec.rms_eps,
+                            )?;
+                        } else {
+                            q.common.norm.rms_add_with(
+                                s,
+                                domain,
+                                ResidualRmsInput {
+                                    x: &mut TensorMut(heads(&w.x, s, 0, rows, 1, h as u32)?),
+                                    residual: heads(&w.out, s, 0, rows, 1, h as u32)?,
+                                    weight: layer.post_norm,
+                                },
+                                &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
+                                RmsOptions {
+                                    mode,
+                                    eps: self.model_spec.rms_eps,
+                                },
+                            )?;
+                        }
                     }
                     if all_layers(trace) || i == self.trace_layer {
                         let name = debug_name(trace, i, "post_attention");
@@ -4869,7 +5435,20 @@ impl Engine {
                 let gate = heads(&w.gu, s, 0, rows, 1, f as u32)?;
                 let up = heads(&w.gu, s, self.workspace_rows * f, rows, 1, f as u32)?;
                 let mut activated = TensorMut(heads(&w.act, s, 0, rows, 1, f as u32)?);
-                q.common.gate.swiglu(s, domain, gate, up, &mut activated)?;
+                if gemma {
+                    let ops = q.gemma.as_ref().context("Gemma 4 operations missing")?;
+                    unsafe {
+                        s.launch_builder(&ops.gated_activation)
+                            .arg(&w.gu)
+                            .arg(&w.gu.slice(self.workspace_rows * f..))
+                            .arg(&mut w.act)
+                            .arg(&((rows * f) as i32))
+                            .arg(&2i32)
+                            .launch(flat(rows * f))?;
+                    }
+                } else {
+                    q.common.gate.swiglu(s, domain, gate, up, &mut activated)?;
+                }
             }
             O::Down => {
                 layer.linear.run(
@@ -4929,6 +5508,34 @@ impl Engine {
                 }
                 trace_value(trace, s, "norm", &w.n, rows, h)?;
                 if step.head == Head::All {
+                    if gemma {
+                        #[cfg(test)]
+                        {
+                            let ops = q.gemma.as_mut().context("Gemma 4 operations missing")?;
+                            let vocab = self.model_spec.vocab as usize;
+                            self.blas.linear_typed(
+                                phase,
+                                LinearWeightRef::Bf16(matrix(&self.weights.head, s, 0, vocab, h)?),
+                                matrix(&w.n, s, 0, rows, h)?,
+                                &mut TensorMut(matrix(&ops.logits, s, 0, rows, vocab)?),
+                            )?;
+                            unsafe {
+                                s.launch_builder(&ops.softcap)
+                                    .arg(&mut ops.logits)
+                                    .arg(&((rows * vocab) as i64))
+                                    .arg(
+                                        &self
+                                            .model_spec
+                                            .logit_softcap
+                                            .context("softcap missing")?,
+                                    )
+                                    .launch(flat(rows * vocab))?;
+                            }
+                            return Ok(());
+                        }
+                        #[cfg(not(test))]
+                        anyhow::bail!("Gemma 4 all-row head is only bound in model gates");
+                    }
                     let spec = self
                         .spec
                         .as_mut()
@@ -5000,6 +5607,16 @@ impl Engine {
                 #[cfg(test)]
                 if let Some(calls) = &q.glm_calls {
                     calls.borrow_mut()[0][9] += 1;
+                }
+                if gemma {
+                    let ops = q.gemma.as_ref().context("Gemma 4 operations missing")?;
+                    unsafe {
+                        s.launch_builder(&ops.softcap)
+                            .arg(&mut w.logits)
+                            .arg(&(self.model_spec.vocab as i64))
+                            .arg(&self.model_spec.logit_softcap.context("softcap missing")?)
+                            .launch(flat(self.model_spec.vocab as usize))?;
+                    }
                 }
                 unsafe {
                     s.launch_builder(&self.ops.argmax)

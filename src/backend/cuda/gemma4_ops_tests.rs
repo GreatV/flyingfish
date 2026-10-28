@@ -779,3 +779,201 @@ fn proportional_and_default_rope_tables_match_the_definition_gpu() -> Result<()>
     ensure!(defects == 0 && undetected == 0, "GEMMA4_ROPE FAIL");
     Ok(())
 }
+
+fn model_metrics(
+    actual: &[bf16],
+    expected: &[bf16],
+    ids: &[u32],
+    bounds: &serde_json::Value,
+) -> Result<(bool, String)> {
+    ensure!(
+        actual.len() == expected.len(),
+        "model logit extent mismatch"
+    );
+    ensure!(!ids.is_empty(), "model metric requires rows");
+    ensure!(
+        actual
+            .iter()
+            .chain(expected)
+            .all(|v| v.to_f32().is_finite()),
+        "Runner FAIL non-finite model logits"
+    );
+    let vocab = expected.len() / ids.len();
+    ensure!(
+        expected.len() == ids.len() * vocab,
+        "model logit rows mismatch"
+    );
+    let mut maximum = 0.0f64;
+    let mut squared = 0.0f64;
+    let mut losses = [0.0f64; 2];
+    let mut qualified = 0usize;
+    let mut id_defects = 0usize;
+    let margin_cut = bounds["margin_cut"].as_f64().context("margin cut")?;
+    for row in 0..ids.len() {
+        let a = &actual[row * vocab..(row + 1) * vocab];
+        let b = &expected[row * vocab..(row + 1) * vocab];
+        let mut reference_best = 0usize;
+        for (a, b) in a.iter().zip(b) {
+            let delta = f64::from(a.to_f32() - b.to_f32());
+            maximum = maximum.max(delta.abs());
+            squared += delta * delta;
+        }
+        let mut best = [f32::NEG_INFINITY; 2];
+        let mut candidate = 0usize;
+        let mut candidate_best = f32::NEG_INFINITY;
+        for (i, (av, bv)) in a.iter().zip(b).enumerate() {
+            let score = bv.to_f32();
+            if score > best[0] {
+                best[1] = best[0];
+                best[0] = score;
+                reference_best = i;
+            } else if score > best[1] {
+                best[1] = score;
+            }
+            if av.to_f32() > candidate_best {
+                candidate_best = av.to_f32();
+                candidate = i;
+            }
+        }
+        if f64::from(best[0] - best[1]) > margin_cut {
+            qualified += 1;
+            id_defects += usize::from(candidate != reference_best);
+        }
+        if row + 1 < ids.len() {
+            let target = ids[row + 1] as usize;
+            for (side, values) in [0, 1].map(|side| (side, if side == 0 { a } else { b })) {
+                let peak = values
+                    .iter()
+                    .map(|v| v.to_f32())
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let sum = values
+                    .iter()
+                    .map(|v| (v.to_f32() - peak).exp() as f64)
+                    .sum::<f64>();
+                losses[side] += -(values[target].to_f32() - peak) as f64 + sum.ln();
+            }
+        }
+    }
+    let count = ids.len().saturating_sub(1).max(1) as f64;
+    let nll_delta = (losses[0] / count - losses[1] / count).abs();
+    let rmse = (squared / actual.len() as f64).sqrt();
+    let pass = maximum <= bounds["output_max"].as_f64().context("output max")?
+        && rmse <= bounds["output_rmse"].as_f64().context("output rmse")?
+        && nll_delta <= bounds["nll_max"].as_f64().context("NLL max")?
+        && id_defects == 0;
+    Ok((
+        pass,
+        format!(
+            "output_max={maximum} output_rmse={rmse} nll_delta={nll_delta} qualified_ids={qualified} id_defects={id_defects}"
+        ),
+    ))
+}
+
+fn native_path(
+    engine: &mut super::engine::Engine,
+    ids: &[u32],
+    prefill: usize,
+) -> Result<Vec<bf16>> {
+    let mut out = Vec::new();
+    if prefill > 0 {
+        engine.gemma_prefill_all(&ids[..prefill])?;
+        for row in 0..prefill {
+            out.extend(engine.gemma_all_logits(row)?);
+        }
+    }
+    for token in &ids[prefill..] {
+        engine.gemma_decode_all(*token)?;
+        out.extend(engine.gemma_all_logits(0)?);
+    }
+    Ok(out)
+}
+
+#[test]
+#[ignore = "requires Gemma 4 model-definition fixtures, FROZEN.json, model weights and a GPU window"]
+fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
+    let dir = std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+    let fixtures = std::path::PathBuf::from(
+        std::env::var_os("FF_GEMMA4_FIXTURES").context("FF_GEMMA4_FIXTURES missing")?,
+    );
+    let frozen: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixtures.join("FROZEN.json"))?)?;
+    ensure!(
+        frozen["status"] == "FROZEN",
+        "model thresholds are not frozen"
+    );
+    let ids: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixtures.join("ids.json"))?)?;
+    let data = fixture("reference.safetensors")?;
+    let settings = crate::backend::Settings {
+        tree_builder: crate::backend::TreeBuilder::Waves,
+        spec_budget: crate::backend::SpecBudget::Chain,
+        spec_graph: true,
+        draft_model: None,
+        prefix_cache: false,
+        kv_format: crate::kv::KvFormat::Bf16,
+        runtime_dir: Some(std::path::PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR missing")?,
+        )),
+    };
+    let mut engine = super::engine::Engine::load(&dir, 0, 640, Some(640), settings)?;
+    let mut defects = 0usize;
+    for (tag, prefill) in [("a", 0usize), ("b", 0), ("wrap", 512)] {
+        let sequence: Vec<u32> = if tag == "wrap" {
+            serde_json::from_value(ids["wrap"].clone())?
+        } else {
+            serde_json::from_value(ids["short"][if tag == "a" { 0 } else { 1 }].clone())?
+        };
+        let bounds = &frozen["families"][tag];
+        for (mode, cached) in [("prefill", false), ("decode", true)] {
+            engine.reset()?;
+            let actual = if cached {
+                native_path(&mut engine, &sequence, prefill)?
+            } else {
+                native_path(&mut engine, &sequence, sequence.len())?
+            };
+            let expected = tensor(&data, &format!("{tag}.{mode}"))?;
+            let expected_rows = if cached {
+                sequence.len() - prefill
+            } else if tag == "wrap" {
+                8
+            } else {
+                sequence.len()
+            };
+            let target_ids = &sequence[sequence.len() - expected_rows..];
+            let actual = actual[actual.len() - expected.len()..].to_vec();
+            let (pass, line) = model_metrics(&actual, expected, target_ids, bounds)?;
+            println!("GEMMA4_MODEL {tag} {mode} {line}");
+            defects += usize::from(!pass);
+        }
+        if tag == "wrap" {
+            engine.reset()?;
+            let eager = native_path(&mut engine, &sequence, 512)?;
+            engine.reset()?;
+            engine.gemma_prefill_all(&sequence[..512])?;
+            engine.capture()?;
+            for (row, _) in sequence[512..].iter().enumerate() {
+                engine.decode(true, None)?;
+                let actual = engine.decode_logits()?;
+                let expected =
+                    &tensor(&data, "wrap.decode")?[row * actual.len()..(row + 1) * actual.len()];
+                let eager = &eager[row * actual.len()..(row + 1) * actual.len()];
+                ensure!(
+                    actual
+                        .iter()
+                        .map(|v| bf16::from_f32(*v))
+                        .collect::<Vec<_>>()
+                        == eager,
+                    "graph/eager logits differ at wrap row {row}"
+                );
+                let actual: Vec<bf16> = actual.iter().map(|v| bf16::from_f32(*v)).collect();
+                let (pass, line) =
+                    model_metrics(&actual, expected, &sequence[512..=512 + row], bounds)?;
+                println!("GEMMA4_MODEL wrap graph row={row} {line}");
+                defects += usize::from(!pass);
+            }
+        }
+    }
+    ensure!(defects == 0, "GEMMA4_MODEL defects={defects}");
+    println!("GEMMA4_MODEL PASS prefill decode wrap graph");
+    Ok(())
+}

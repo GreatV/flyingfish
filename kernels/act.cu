@@ -87,6 +87,13 @@ extern "C" __global__ void silu_mul_split_clamped(
     reinterpret_cast<uint4*>(y + row * width)[vector] = result;
 }
 
+// y = bf16(a * b), elementwise.
+extern "C" __global__ void multiply(const __nv_bfloat16* a, const __nv_bfloat16* b,
+                                    __nv_bfloat16* y, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) y[i] = __hmul(a[i], b[i]);
+}
+
 // x = bf16(bf16(tanh(bf16(x / cap))) * cap), in place.
 extern "C" __global__ void softcap(__nv_bfloat16* x, long long count, float cap) {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
