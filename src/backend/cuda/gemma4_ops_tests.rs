@@ -59,6 +59,7 @@ struct Stats {
     elements: usize,
     max_ulp: u32,
     bit_equal: usize,
+    strict_equal: usize,
     beyond_mutant: usize,
     exempt: usize,
     worst: Option<(usize, f32, f32)>,
@@ -69,7 +70,7 @@ impl Stats {
         Self::with_floor(candidate, reference, None)
     }
 
-    /// An element within `floor[i]` of the reference counts as matching (dated amendment 2026-10-28, gemma/reports/agy.md).
+    /// An element within `floor[i]` of the reference counts as matching.
     fn with_floor(candidate: &[bf16], reference: &[bf16], floor: Option<&[f32]>) -> Result<Self> {
         ensure!(
             candidate.len() == reference.len() && !candidate.is_empty(),
@@ -86,6 +87,7 @@ impl Stats {
             elements: candidate.len(),
             max_ulp: 0,
             bit_equal: 0,
+            strict_equal: 0,
             beyond_mutant: 0,
             exempt: 0,
             worst: None,
@@ -102,6 +104,7 @@ impl Stats {
                 stats.beyond_mutant += usize::from(ulp > MUTANT_ULP);
             }
             stats.bit_equal += usize::from(ulp == 0 || within);
+            stats.strict_equal += usize::from(ulp == 0);
         }
         Ok(stats)
     }
@@ -116,12 +119,15 @@ impl Stats {
 
     fn line(&self, name: &str) -> String {
         format!(
-            "{name} elements={} max_ulp={} worst={:?} bit_equal={:.6} exempt_within_floor={} beyond_{}ulp={:.6}",
+            "{name} elements={} max_ulp={} worst={:?} bit_equal={:.6} strict_equal={} strict_fraction={:.6} exempt_within_floor={} exempt_fraction={:.6} beyond_{}ulp={:.6}",
             self.elements,
             self.max_ulp,
             self.worst,
             self.bit_equal as f64 / self.elements as f64,
+            self.strict_equal,
+            self.strict_equal as f64 / self.elements as f64,
             self.exempt,
+            self.exempt as f64 / self.elements as f64,
             MUTANT_ULP,
             self.beyond_mutant as f64 / self.elements as f64
         )
@@ -716,6 +722,7 @@ fn proportional_and_default_rope_tables_match_the_definition_gpu() -> Result<()>
             let reference = tensor(&data, &format!("{key}.out"))?;
             let cos_ref = tensor(&data, &format!("rope.{tag}.cos"))?;
             let sin_ref = tensor(&data, &format!("rope.{tag}.sin"))?;
+            // F_out = a*(F_cs+U(c)) + b*(F_cs+U(s)) + U(a|c|) + U(b|s|) + U(|out_ref|).
             let out_floor: Vec<f32> = (0..positions.len() * heads * d)
                 .map(|e| {
                     let (row, lane) = (e / (heads * d), e % d);
@@ -735,6 +742,7 @@ fn proportional_and_default_rope_tables_match_the_definition_gpu() -> Result<()>
                         + sin_operand * fs
                         + bf16_ulp(cos_operand * c.abs())
                         + bf16_ulp(sin_operand * sn.abs())
+                        + bf16_ulp(reference[e].to_f32())
                 })
                 .collect();
             let stats =
