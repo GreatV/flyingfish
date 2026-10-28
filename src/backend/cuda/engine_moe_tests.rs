@@ -5147,9 +5147,27 @@ fn minicpm_chain_verify(chunk: usize) -> Result<()> {
 }
 
 #[test]
-#[ignore = "GPU lease, published MiniCPM FP8, media fixtures/reference, output and pinned runtime"]
-fn minicpm_media_identity_gpu() -> Result<()> {
+#[ignore = "GPU lease, published hybrid FP8, media fixtures/reference, output and pinned runtime"]
+fn hybrid_media_identity_gpu() -> Result<()> {
     let model = PathBuf::from(std::env::var_os("FF_MODEL").context("media model missing")?);
+    let specification = crate::model_spec::ModelSpec::read(&model)?;
+    let qwen = specification.architecture == crate::model_spec::Architecture::Qwen35Text;
+    ensure!(
+        qwen || specification.architecture == crate::model_spec::Architecture::MiniCpmV47,
+        "media gate architecture unsupported"
+    );
+    let vocab = specification.vocab as usize;
+    let cases: &[&str] = if qwen {
+        &["image_hockey", "image_boat"]
+    } else {
+        &[
+            "image_hockey_16x",
+            "image_boat_16x",
+            "video_football_16x",
+            "video_control_same_grid_16x",
+            "video_control_clip2_16x",
+        ]
+    };
     let input_dir = PathBuf::from(
         std::env::var_os("FF_MINICPM_REFERENCE_DIR").context("media inputs missing")?,
     );
@@ -5169,10 +5187,11 @@ fn minicpm_media_identity_gpu() -> Result<()> {
         kv_format: crate::kv::KvFormat::Bf16,
     };
     #[cfg(feature = "rocm")]
-    let limits: serde_json::Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/minicpm_reference.json"
-    )))?;
+    let limits: serde_json::Value = serde_json::from_str(if qwen {
+        include_str!("../../../tests/fixtures/q38_reference.json")
+    } else {
+        include_str!("../../../tests/fixtures/minicpm_reference.json")
+    })?;
     #[cfg(feature = "rocm")]
     ensure!(
         limits["media_limits"].is_object(),
@@ -5181,32 +5200,29 @@ fn minicpm_media_identity_gpu() -> Result<()> {
     Engine::calibrate(&model, 0, 4352, Some(129), settings.clone())?;
     let mut engine = Engine::load(&model, 0, 4352, Some(129), settings)?;
     ensure!(
-        engine.model_spec.hidden == 2048
-            && engine.model_spec.vocab == 248144
-            && engine.model_spec.layers.len() == 40,
-        "published media model geometry required"
+        engine.model_spec.vocab as usize == vocab,
+        "media vocabulary mismatch"
     );
     let mut first_logits = Vec::new();
     let mut defects = 0;
-    for case in [
-        "image_hockey_16x",
-        "image_boat_16x",
-        "video_football_16x",
-        "video_control_same_grid_16x",
-        "video_control_clip2_16x",
-    ] {
-        let bytes = std::fs::read(input_dir.join(format!("{case}.safetensors")))?;
+    for &case in cases {
+        let filename = if qwen {
+            format!("{case}-input.safetensors")
+        } else {
+            format!("{case}.safetensors")
+        };
+        let bytes = std::fs::read(input_dir.join(filename))?;
         let input = Input::read(&SafeTensors::deserialize(&bytes)?, case)?;
         let bytes = std::fs::read(reference.join(format!("{case}.safetensors")))?;
         let source = SafeTensors::deserialize(&bytes)?;
         ensure!(
-            source.tensor("logits")?.shape() == [32, 248144],
+            source.tensor("logits")?.shape() == [32, vocab],
             "media reference logits must be [32,248144]"
         );
         let expected = floats(&source, "logits")?;
         let forced = integers(&source, "tokens")?;
         ensure!(
-            forced.len() == 32 && forced.iter().all(|&id| id < 248144),
+            forced.len() == 32 && forced.iter().all(|&id| id < vocab as u32),
             "media reference token extent/range"
         );
         let mut eager = Vec::new();
@@ -5229,7 +5245,7 @@ fn minicpm_media_identity_gpu() -> Result<()> {
                 );
                 let actual = engine.decode_logits()?;
                 ensure!(
-                    actual.len() == 248144 && actual.iter().all(|v| v.is_finite()),
+                    actual.len() == vocab && actual.iter().all(|v| v.is_finite()),
                     "nonfinite or incomplete media logits"
                 );
                 let bits = actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
@@ -5238,9 +5254,10 @@ fn minicpm_media_identity_gpu() -> Result<()> {
                 } else {
                     cell_defects += usize::from(eager[step] != (token, bits));
                 }
-                let wanted = &expected[step * 248144..(step + 1) * 248144];
-                let scale =
-                    (wanted.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / 248144.0).sqrt();
+                let wanted = &expected[step * vocab..(step + 1) * vocab];
+                let scale = (wanted.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>()
+                    / vocab as f64)
+                    .sqrt();
                 ensure!(scale.is_finite() && scale > 0.0, "media reference RMS");
                 let (mut largest, mut square) = (0.0f64, 0.0f64);
                 let mut top = [f32::NEG_INFINITY; 2];
@@ -5255,7 +5272,7 @@ fn minicpm_media_identity_gpu() -> Result<()> {
                     }
                 }
                 max_error = max_error.max(largest / scale);
-                rms_error = rms_error.max((square / 248144.0).sqrt() / scale);
+                rms_error = rms_error.max((square / vocab as f64).sqrt() / scale);
                 min_margin = min_margin.min(top[0] - top[1]);
                 predictions.push(token);
                 captured.extend(actual);
@@ -5286,7 +5303,7 @@ fn minicpm_media_identity_gpu() -> Result<()> {
             );
             engine.check_ready()?;
             if repeat == 0 {
-                first_logits.push(captured[..248144].to_vec());
+                first_logits.push(captured[..vocab].to_vec());
                 println!(
                     "MEDIA_DECODED {case} {:?}",
                     crate::tokenizer::decode(&model, &predictions)?
@@ -5294,7 +5311,7 @@ fn minicpm_media_identity_gpu() -> Result<()> {
             }
             let mut trace = Trace::default();
             trace.set_device(&engine.device.info.name)?;
-            trace.add("logits".into(), vec![32, 248144], captured)?;
+            trace.add("logits".into(), vec![32, vocab], captured)?;
             trace.add(
                 "tokens".into(),
                 vec![32],
@@ -5315,7 +5332,10 @@ fn minicpm_media_identity_gpu() -> Result<()> {
         "different media produced identical full-vocabulary outputs"
     );
     println!(
-        "MEDIA_IDENTITY cells=15 defects={defects} media_inputs=5 encoder_calls=15 graph_eager_repeat=true"
+        "MEDIA_IDENTITY cells={} defects={defects} media_inputs={} encoder_calls={} graph_eager_repeat=true",
+        3 * cases.len(),
+        cases.len(),
+        3 * cases.len()
     );
     ensure!(defects == 0, "media identity or model-definition DEFECT");
     Ok(())
