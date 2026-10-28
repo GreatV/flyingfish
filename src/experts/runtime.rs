@@ -239,7 +239,7 @@ fn host_fill_order(
 }
 
 impl Residency {
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
     pub(crate) fn freeze_probe_admissions(&mut self) -> Result<()> {
         ensure!(!self.token_open, "placement probe has an open token");
         self.admission.budget_bytes_per_token = 0;

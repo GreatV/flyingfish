@@ -1184,7 +1184,7 @@ impl Runtime {
     }
 }
 impl Engine {
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
     pub(super) fn inject_moe_test_positions(&mut self, axes: [&[i32]; 3]) -> Result<()> {
         let rows = axes[0].len();
         let first = *axes[0]
@@ -2211,6 +2211,30 @@ impl Engine {
             engine.closure.ready(started)?;
         }
         Ok(engine)
+    }
+    #[cfg(all(test, feature = "rocm"))]
+    pub(super) fn prepare_hip_fixture(&self) -> Result<()> {
+        let q = self
+            .qwen
+            .as_ref()
+            .context("fixture hybrid runtime missing")?;
+        for rows in 1..=self.workspace_rows as u32 {
+            for layer in &q.layers {
+                for shape in layer.linear.library_shapes(rows) {
+                    self.blas
+                        .prepare_fixed(rows, shape.output as u32, shape.input as u32)?;
+                }
+                if let BoundFfn::Moe { shared, .. } = &layer.ffn {
+                    for weight in shared {
+                        self.blas
+                            .prepare_fixed(rows, weight.shape[0], weight.shape[1])?;
+                    }
+                }
+            }
+            self.blas
+                .prepare_fixed(rows, self.model_spec.vocab, self.model_spec.hidden)?;
+        }
+        Ok(())
     }
     #[cfg(feature = "rocm")]
     fn initialize_hip_hybrid(&self, model: &Path) -> Result<()> {

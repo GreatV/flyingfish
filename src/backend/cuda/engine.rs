@@ -1485,7 +1485,6 @@ impl Engine {
         if matches!(graph, Graph::Decode) {
             return self.graph.is_some();
         }
-        #[cfg(feature = "cuda")]
         if let Graph::MoeRoute(layer) | Graph::MoeContribute(layer) | Graph::MoeJoin(layer) = graph
         {
             let seg_end = self

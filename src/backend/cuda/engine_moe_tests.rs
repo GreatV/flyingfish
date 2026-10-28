@@ -1056,6 +1056,7 @@ impl Engine {
             tensors,
             manifest,
             bytes,
+            #[cfg(feature = "cuda")]
             upload_content_sha256: None,
             upload_hashed_bytes: None,
             load_wall_ms: 0.0,
@@ -1103,7 +1104,10 @@ impl Engine {
             true,
             "MoE layer gate".into(),
         ));
+        #[cfg(feature = "cuda")]
         let blas = Blas::new(&device, &ops, runtime, closure.clone())?;
+        #[cfg(feature = "rocm")]
+        let blas = Blas::new(stream.clone())?;
         let state = super::super::super::state::StateStore::new(&model_spec, 32, stream)?;
         let capture_checkpoint = Some(super::super::super::state::StateCheckpoint::new(
             &state,
@@ -1123,6 +1127,7 @@ impl Engine {
         let mut work =
             Work::new_with_peer_tail(stream, &model_spec, workspace_rows, peer_tail_elems)?;
         stream.memcpy_htod(&[1i32], &mut work.length)?;
+        #[cfg(feature = "cuda")]
         let flash = Some(Flash::new(
             stream.clone(),
             workspace_rows,
@@ -1130,6 +1135,7 @@ impl Engine {
         )?);
         let (send_ptr, _send_guard) = work.n.device_ptr(stream);
         let send_cap_bytes = work.n.len() * size_of::<bf16>();
+        #[cfg(feature = "cuda")]
         drop(_send_guard);
         let moe = Some(Decode::new(
             &device,
@@ -1207,20 +1213,26 @@ impl Engine {
             hidden_capture: None,
             capture_fail_after_layer: None,
             capture_fail_stage: None,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             flint_window_capture: None,
             qwen: None,
+            #[cfg(feature = "cuda")]
             recurrent: None,
             moe,
             moe_slots: Some(slots),
             moe_prefill,
             moe_test_ffn: Some(ffn),
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             flint_legacy_overflow_prefill: false,
+            #[cfg(feature = "cuda")]
             flint_frozen_decode_length: false,
+            #[cfg(feature = "cuda")]
             mtp: None,
+            #[cfg(feature = "cuda")]
             mtp_state: None,
+            #[cfg(feature = "cuda")]
             mtp_epoch: 0,
+            #[cfg(feature = "cuda")]
             images: None,
             qwen_device_prefix: false,
             forward_rows: (1..=workspace_rows).collect(),
@@ -1241,9 +1253,14 @@ impl Engine {
             work,
             ops,
             blas,
+            #[cfg(feature = "cuda")]
             flash,
             decode: None,
             flint_logits: None,
+            #[cfg(feature = "rocm")]
+            prefill_attention: None,
+            #[cfg(feature = "rocm")]
+            prefill_prefixes: stream.alloc_zeros(0)?,
             device,
             config,
             model_spec,
@@ -1252,7 +1269,9 @@ impl Engine {
             workspace_rows,
             trace_layer: 0,
             position: 0,
+            #[cfg(feature = "cuda")]
             prefix_identity: None,
+            #[cfg(feature = "cuda")]
             prefix_identity_load_ms: 0.0,
             logits_cache: PrefixLogitsCache::default(),
             committed_prefix_ids: Vec::new(),
@@ -1264,12 +1283,17 @@ impl Engine {
             &engine.model_spec,
             workspace_rows,
             32,
+            #[cfg(feature = "cuda")]
             crate::gdn_plan::GdnPolicy::for_device(&engine.device.info),
+            #[cfg(feature = "rocm")]
+            crate::gdn_plan::GdnPolicy::P2,
             8,
         )?)?;
         engine.qwen = Some(qwen::Runtime::new(
             &engine, runtime, catalog, None, scratch, None, 8,
         )?);
+        #[cfg(feature = "rocm")]
+        engine.prepare_hip_fixture()?;
         for rows in 1..=workspace_rows {
             engine.prepare_qwen(rows)?;
             engine.prepare_prefill_rows(rows)?;
@@ -1505,13 +1529,17 @@ fn graph_gate(format: crate::model_spec::ExpertFormat) -> Result<()> {
                 reference.set_token(token)?;
                 candidate.set_token(token)?;
                 {
-                    let _range =
-                        super::super::super::profile::Range::new(true, c"moe_graph_reference");
+                    let _range = super::super::super::profile::Range::new(
+                        cfg!(feature = "cuda"),
+                        c"moe_graph_reference",
+                    );
                     reference.decode(false, None)?;
                 }
                 {
-                    let _range =
-                        super::super::super::profile::Range::new(true, c"moe_graph_candidate");
+                    let _range = super::super::super::profile::Range::new(
+                        cfg!(feature = "cuda"),
+                        c"moe_graph_candidate",
+                    );
                     candidate.decode(true, None)?;
                 }
                 let a = reference.decode_logits()?;
@@ -2213,7 +2241,8 @@ fn combine_expected(engine: &Engine, contributions: &[bf16], rows: usize) -> Res
         },
     )?;
     stream.synchronize()?;
-    Ok(stream.clone_dtoh(&expected_out)?)
+    let output = stream.clone_dtoh(&expected_out)?;
+    Ok(output)
 }
 
 fn tier_cell(
@@ -2401,7 +2430,10 @@ fn tier_gate(
                 .end_request()?;
             let (mut host_choices, mut disk_choices, mut admissions) = (0, 0, 0);
             let mut event = 1;
-            let _range = super::super::super::profile::Range::new(true, c"engine_moe_residency");
+            let _range = super::super::super::profile::Range::new(
+                cfg!(feature = "cuda"),
+                c"engine_moe_residency",
+            );
             for (request, (target, rows)) in tier_schedule().into_iter().enumerate() {
                 let mut frequency = vec![vec![0.0; 16]; 2];
                 for layer in &mut frequency {
@@ -2747,7 +2779,10 @@ fn gate(row_cases: &[usize], variants: &[u32], cpu: bool) -> Result<()> {
                     .as_mut()
                     .context("gate slots absent")?
                     .begin_token()?;
-                let _range = super::super::super::profile::Range::new(true, c"engine_moe_ffn");
+                let _range = super::super::super::profile::Range::new(
+                    cfg!(feature = "cuda"),
+                    c"engine_moe_ffn",
+                );
                 engine.run_ffn(
                     0,
                     step(rows),
@@ -2796,7 +2831,8 @@ fn gate(row_cases: &[usize], variants: &[u32], cpu: bool) -> Result<()> {
             );
         }
         let axes = [0, 1];
-        let _range = super::super::super::profile::Range::new(true, c"engine_moe_hybrid");
+        let _range =
+            super::super::super::profile::Range::new(cfg!(feature = "cuda"), c"engine_moe_hybrid");
         for layer in 0..2 {
             let mut trace = Trace::default();
             engine.trace_layer = layer;
@@ -3001,6 +3037,7 @@ fn injected_layers_bind_hybrid_mixer_geometry() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
 #[test]
 #[ignore = "requires CUDA and FLYINGFISH_RUNTIME_DIR"]
 fn split_combine_matches_single_gpu_and_detects_perturbed_routed_peer_gpu() -> Result<()> {
@@ -3495,5 +3532,730 @@ fn split_combine_matches_single_gpu_and_detects_perturbed_routed_peer_gpu() -> R
     println!(
         "PASS split_combine_gate formats=Bf16,Fp8W8a16 eager_graph_bitwise=true perturbed_routed_peer_detected=true"
     );
+    Ok(())
+}
+
+pub(super) fn placement_compare(
+    label: &str,
+    a: &[f32],
+    b: &[f32],
+    bf16_ulp_limit: Option<u16>,
+) -> Result<usize> {
+    ensure!(
+        !a.is_empty() && a.len() == b.len(),
+        "Runner FAIL {label} extent"
+    );
+    ensure!(
+        a.iter().chain(b).all(|v| v.is_finite()),
+        "Runner FAIL {label} nonfinite"
+    );
+    let mismatches = a
+        .iter()
+        .zip(b)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    let first = a
+        .iter()
+        .zip(b)
+        .position(|(a, b)| a.to_bits() != b.to_bits());
+    let max_abs = a
+        .iter()
+        .zip(b)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let ordered = |value: f32| {
+        let bits = bf16::from_f32(value).to_bits();
+        if bits & 0x8000 == 0 {
+            bits | 0x8000
+        } else {
+            !bits
+        }
+    };
+    let max_bf16_ulp = a
+        .iter()
+        .zip(b)
+        .map(|(&a, &b)| ordered(a).abs_diff(ordered(b)))
+        .max()
+        .context("empty comparison")?;
+    let passed = match bf16_ulp_limit {
+        Some(limit) => max_bf16_ulp <= limit,
+        None => mismatches == 0,
+    };
+    println!(
+        "{} placement_comparison {}",
+        if passed { "PASS" } else { "DEFECT" },
+        serde_json::json!({
+            "label":label,"elements":a.len(),"bit_mismatches":mismatches,"first":first,
+            "first_a":first.map(|i|a[i]),"first_b":first.map(|i|b[i]),"max_abs":max_abs,"max_bf16_ulp":max_bf16_ulp,
+            "strict_bits":bf16_ulp_limit.is_none(),"bf16_ulp_limit":bf16_ulp_limit,"passed":passed
+        })
+    );
+    Ok(usize::from(!passed))
+}
+
+fn placement_graph(
+    stream: &Arc<CudaStream>,
+    launch: impl FnOnce() -> Result<()>,
+) -> Result<CudaGraph> {
+    stream.synchronize()?;
+    #[cfg(feature = "cuda")]
+    stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+    #[cfg(feature = "rocm")]
+    let capture = stream.begin_capture()?;
+    let launched = launch();
+    #[cfg(feature = "cuda")]
+    let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
+    #[cfg(feature = "rocm")]
+    let captured = capture.finish().map(Some);
+    launched?;
+    let graph = captured?.context("Runner FAIL empty placement graph")?;
+    graph.upload()?;
+    stream.synchronize()?;
+    Ok(graph)
+}
+
+pub(super) fn placement_components(engine: &Engine, model: &Path) -> Result<usize> {
+    use crate::experts::{
+        catalogue::ExpertCatalogue,
+        disk::{DiskExperts, DiskReader},
+    };
+    let device = &engine.device;
+    let stream = &device.stream;
+    let format = engine
+        .model_spec
+        .expert_format
+        .context("placement expert_format missing")?;
+    let geometry = ExpertGeometry::from_model(&engine.model_spec)?;
+    ensure!(
+        geometry.hidden == 2048
+            && geometry.intermediate == 512
+            && geometry.top_k == 8
+            && geometry.experts == 256,
+        "Runner FAIL placement geometry {geometry:?}"
+    );
+    let manifest = crate::checkpoint::MappedCheckpoint::open(model)?
+        .manifest(&engine.model_spec, crate::checkpoint::LoadPolicy::TextOnly)?;
+    let catalogue = Arc::new(ExpertCatalogue::from_manifest(&manifest, geometry, format)?);
+    let reader = DiskReader::open(&catalogue, model, 1)?;
+    let elements = usize::try_from(catalogue.slot_bytes() / 2)?;
+    let host = HostBlocks::new(1, elements)?;
+    let mut gpu_weights = Vec::new();
+    for expert in 0..8 {
+        let index = reader.read_expert(0, expert, &catalogue)?;
+        let lease = reader.values(index)?;
+        if expert == 0 {
+            host.claim(0)?.slice()?.copy_from_slice(&lease);
+        }
+        gpu_weights.push(stream.clone_htod(lease.values())?);
+    }
+    let mut gate_ptrs = vec![0u64; 256];
+    let mut down_ptrs = vec![0u64; 256];
+    let mut valid = vec![0u32; 256];
+    let mut generations = vec![0u64; 256];
+    for (expert, weights) in gpu_weights.iter().enumerate() {
+        gate_ptrs[expert] = weights.device_ptr(stream).0;
+        down_ptrs[expert] = gate_ptrs[expert] + catalogue.layout().down_offset();
+        valid[expert] = 1;
+        generations[expert] = 1;
+    }
+    let gates = stream.clone_htod(&gate_ptrs)?;
+    let downs = stream.clone_htod(&down_ptrs)?;
+    let valid = stream.clone_htod(&valid)?;
+    let generations = stream.clone_htod(&generations)?;
+    let table = SlotBindings {
+        gate_up: view(&gates, stream, 0, [256], [1])?,
+        down: view(&downs, stream, 0, [256], [1])?,
+        valid: view(&valid, stream, 0, [256], [1])?,
+        generation: view(&generations, stream, 0, [256], [1])?,
+    };
+    let input = (0..2048)
+        .map(|index| bf16::from_f32(((index * 37 % 131) as f32 - 65.0) / 128.0))
+        .collect::<Vec<_>>();
+    let x_buffer = stream.clone_htod(&input)?;
+    let mut y = stream.alloc_zeros::<bf16>(2048)?;
+    let x = qwen::matrix(&x_buffer, stream, 0, 1, 2048)?;
+    let mut y_view = TensorMut(qwen::matrix(&y, stream, 0, 1, 2048)?);
+    let ffn = engine.moe_ffn_binding(0)?;
+    let mut decode = placement_decode(engine)?;
+    let ids = (0..8).collect::<Vec<i32>>();
+    let weights = [bf16::from_f32(0.125); 8];
+    stream.memcpy_htod(&ids, &mut decode.ids)?;
+    stream.memcpy_htod(&weights, &mut decode.weights)?;
+    stream.memcpy_htod(&[1u32; 8], &mut decode.active)?;
+    stream.memcpy_htod(&[1u64; 8], &mut decode.generation)?;
+    decode.contribute_device(device, 0, ffn.clone(), table, x)?;
+    decode.combine_device(device, 0, ffn.clone(), x, &mut y_view)?;
+    let route = placement_graph(stream, || decode.route_device(device, 0, &ffn, x))?;
+    let contribute = placement_graph(stream, || {
+        decode.contribute_device(device, 0, ffn.clone(), table, x)
+    })?;
+    let join = placement_graph(stream, || {
+        decode.combine_device(device, 0, ffn.clone(), x, &mut y_view)
+    })?;
+    decode.segments.push(graphs::Segments {
+        route,
+        contribute,
+        join,
+    });
+    let native = [ExpertWeights::from_slot(
+        Shape::new(2048, 512)?,
+        host.block_range(0)?,
+        catalogue.layout(),
+    )?];
+    let mut disk = DiskExperts::new(catalogue.clone(), model, 1, 1)?;
+    let assignment = [Assignment {
+        row: 0,
+        choice: 0,
+        expert: 0,
+        weight: weights[0],
+    }];
+    let disk_route = [crate::experts::runtime::Route {
+        row: 0,
+        choice: 0,
+        expert: 0,
+        weight: weights[0],
+    }];
+    let mut defects = 0;
+    let mut eager = Vec::new();
+    for tier in 0..3 {
+        let mut reference: Option<Vec<f32>> = None;
+        for (repeat, graph) in [
+            (0, false),
+            (1, false),
+            (2, false),
+            (0, true),
+            (1, true),
+            (2, true),
+        ] {
+            stream.memcpy_htod(&ids, &mut decode.ids)?;
+            stream.memcpy_htod(&weights, &mut decode.weights)?;
+            let active = if tier == 0 {
+                [1; 8]
+            } else {
+                [0, 1, 1, 1, 1, 1, 1, 1]
+            };
+            decode.read_route(device, 0, &ffn, x)?;
+            let dispatch = Dispatch {
+                active: &active,
+                generation: &[1; 8],
+                host: Some(host.clone()),
+                experts: &native,
+                assignments: if tier == 1 { &assignment } else { &[] },
+                miss_rows: if tier == 0 { &[] } else { &[0] },
+                host_dma: None,
+                disk: if tier == 2 { &disk_route } else { &[] },
+                disk_cpu: Some(&mut disk),
+                layer: 0,
+            };
+            let before = decode.stats;
+            let _range = super::super::super::profile::Range::new(
+                cfg!(feature = "cuda"),
+                c"placement_component",
+            );
+            stream.memset_zeros(&mut y)?;
+            decode.finish_with(
+                device,
+                ffn.clone(),
+                table,
+                dispatch,
+                (x, &mut y_view),
+                graph.then_some(0),
+            )?;
+            stream.synchronize()?;
+            ensure!(
+                decode.stats[1] - before[1] == if tier == 0 { 8 } else { 7 }
+                    && decode.stats[2] - before[2] == u64::from(tier != 0),
+                "Runner FAIL forced tier coverage"
+            );
+            let done = stream.clone_dtoh(&decode.done)?;
+            ensure!(done == [1; 8], "Runner FAIL placement completion words");
+            ensure!(
+                stream.clone_dtoh(&decode.ids)? == ids
+                    && stream.clone_dtoh(&decode.weights)? == weights,
+                "Runner FAIL placement changed frozen routing"
+            );
+            let mut values = stream
+                .clone_dtoh(&decode.contributions)?
+                .into_iter()
+                .map(bf16::to_f32)
+                .collect::<Vec<_>>();
+            values.extend(stream.clone_dtoh(&y)?.into_iter().map(bf16::to_f32));
+            println!(
+                "PASS placement_path tier={tier} graph={graph} repeat={repeat} gpu_choices={} cpu_choices={} disk_choices={} graph_launches={} input=[1,2048] contributions=[1,8,2048] output=[1,2048]",
+                decode.stats[1] - before[1],
+                u64::from(tier == 1),
+                u64::from(tier == 2),
+                if graph { 2 } else { 0 }
+            );
+            if let Some(previous) = &reference {
+                defects += placement_compare(
+                    &format!(
+                        "tier{tier}_{}",
+                        if graph { "graph_eager" } else { "self_repeat" }
+                    ),
+                    previous,
+                    &values,
+                    None,
+                )?;
+            } else {
+                reference = Some(values);
+            }
+        }
+        eager.push(reference.context("missing eager placement")?);
+    }
+    defects += placement_compare(
+        "gpu_host_contribution",
+        &eager[0][..2048],
+        &eager[1][..2048],
+        Some(1),
+    )?;
+    defects += placement_compare(
+        "host_disk_contribution",
+        &eager[1][..2048],
+        &eager[2][..2048],
+        None,
+    )?;
+    defects += placement_compare(
+        "gpu_host_output",
+        &eager[0][16384..],
+        &eager[1][16384..],
+        Some(1),
+    )?;
+    defects += placement_compare(
+        "host_disk_output",
+        &eager[1][16384..],
+        &eager[2][16384..],
+        None,
+    )?;
+    Ok(defects)
+}
+
+fn placement_decode(engine: &Engine) -> Result<Decode> {
+    let geometry = ExpertGeometry::from_model(&engine.model_spec)?;
+    let format = engine
+        .model_spec
+        .expert_format
+        .context("placement expert format")?;
+    let device = &engine.device;
+    Decode::new(
+        device,
+        DecodeOptions {
+            peer: None,
+            geometry,
+            residual_output: engine.model_spec.architecture
+                != crate::model_spec::Architecture::Flint,
+            max_rows: 1,
+            workers: 1,
+            cpu_bounds: (1, 8),
+            participants: crate::experts::plan::ParticipantTable::uniform(1, 8, 1)?,
+            format,
+            shared_intermediate: engine
+                .model_spec
+                .moe
+                .context("MoE shared geometry missing")?
+                .shared_intermediate,
+            swiglu_rounding: engine.model_spec.swiglu_rounding(),
+            swiglu_limit: engine.model_spec.swiglu_limit(),
+            routed_weight: engine.model_spec.routed_weight_boundary(),
+        },
+    )
+}
+
+fn published_residency(engine: &Engine, model: &Path) -> Result<usize> {
+    use crate::experts::{catalogue::ExpertCatalogue, plan::Tier};
+    let device = &engine.device;
+    let stream = &device.stream;
+    let geometry = ExpertGeometry::from_model(&engine.model_spec)?;
+    let format = engine
+        .model_spec
+        .expert_format
+        .context("published expert format")?;
+    let manifest = crate::checkpoint::MappedCheckpoint::open(model)?
+        .manifest(&engine.model_spec, crate::checkpoint::LoadPolicy::TextOnly)?;
+    let catalogue = Arc::new(ExpertCatalogue::from_manifest(&manifest, geometry, format)?);
+    let slot = catalogue.slot_bytes();
+    let capacity = Capacity {
+        layout: catalogue.layout().clone(),
+        span_rows: 8,
+        wave_rows: 8,
+        device_expert_bytes: slot * u64::from(geometry.layers * 4),
+        peer_expert_bytes: 0,
+        gpu0_layers: geometry.layers,
+        host_expert_bytes: slot * u64::from(geometry.layers * 4 + 2),
+        slots_per_layer: vec![4; geometry.layers as usize],
+        host_blocks: geometry.layers * 4,
+        spare_blocks: 2,
+        disk_bytes: slot * u64::from(geometry.layers * (geometry.experts - 8)),
+        worker_count: 1,
+        disk_workers: 1,
+        prefill_staging_slots: 0,
+        pinned: true,
+    };
+    let initial = vec![vec![0, 1, 2, 3]; geometry.layers as usize];
+    let mut slots = Slots::load(
+        device,
+        None,
+        geometry,
+        residency::Load {
+            capacity: &capacity,
+            admission: crate::experts::plan::Admission {
+                budget_bytes_per_token: slot * 2,
+            },
+            initial: &initial,
+            catalogue,
+            directory: model,
+            engines: 2,
+            max_rows: 1,
+            swiglu_rounding: engine.model_spec.swiglu_rounding(),
+            swiglu_limit: engine.model_spec.swiglu_limit(),
+            routed_weight: engine.model_spec.routed_weight_boundary(),
+        },
+    )?;
+    device.finish_upload()?;
+    slots.freeze_probe_admissions()?;
+    let mut decode = placement_decode(engine)?;
+    let ffn = engine.moe_ffn_binding(0)?;
+    let input = (0..2048)
+        .map(|i| bf16::from_f32(((i * 37 % 131) as f32 - 65.0) / 128.0))
+        .collect::<Vec<_>>();
+    let x = stream.clone_htod(&input)?;
+    let mut y = stream.alloc_zeros::<bf16>(2048)?;
+    let x = qwen::matrix(&x, stream, 0, 1, 2048)?;
+    let mut out = TensorMut(qwen::matrix(&y, stream, 0, 1, 2048)?);
+    let ids = [0i32, 3, 4, 7, 8, 11, 12, 15];
+    let weights = [bf16::from_f32(0.125); 8];
+    let reference_slots = engine
+        .moe_slots
+        .as_ref()
+        .context("resident reference slots")?;
+    ensure!(
+        reference_slots.all_resident(),
+        "Runner FAIL published reference is not resident"
+    );
+    let generations = ids.map(|id| reference_slots.published[id as usize]);
+    stream.memcpy_htod(&ids, &mut decode.ids)?;
+    stream.memcpy_htod(&weights, &mut decode.weights)?;
+    stream.memcpy_htod(&[1u32; 8], &mut decode.active)?;
+    stream.memcpy_htod(&generations, &mut decode.generation)?;
+    decode.contribute_device(
+        device,
+        0,
+        ffn.clone(),
+        reference_slots.bindings(0, stream)?,
+        x,
+    )?;
+    let reference = stream
+        .clone_dtoh(&decode.contributions)?
+        .into_iter()
+        .map(bf16::to_f32)
+        .collect::<Vec<_>>();
+    stream.memcpy_htod(&[0u32; 8], &mut decode.active)?;
+    let table = slots.bindings(0, stream)?;
+    let route = placement_graph(stream, || decode.route_device(device, 0, &ffn, x))?;
+    let contribute = placement_graph(stream, || {
+        decode.contribute_device(device, 0, ffn.clone(), table, x)
+    })?;
+    let join = placement_graph(stream, || {
+        decode.combine_device(device, 0, ffn.clone(), x, &mut out)
+    })?;
+    decode.segments.push(graphs::Segments {
+        route,
+        contribute,
+        join,
+    });
+    let mut defects = 0;
+    let mut previous_generation = Vec::new();
+    for (request, target) in [[0u32, 1, 2, 3], [8, 9, 10, 11], [12, 13, 14, 15]]
+        .into_iter()
+        .enumerate()
+    {
+        let mut frequency = vec![vec![0.0; geometry.experts as usize]; geometry.layers as usize];
+        for layer in &mut frequency {
+            layer[..4].fill(1.0);
+        }
+        frequency[0].fill(0.0);
+        for id in target {
+            frequency[0][id as usize] = 1.0;
+        }
+        slots.delay_copies();
+        slots.begin_request(&frequency)?;
+        let placement = slots.capture_placement()?;
+        let tiers = ids.map(|id| placement[id as usize].0);
+        ensure!(
+            tiers.contains(&Tier::Gpu) && tiers.iter().any(|tier| *tier != Tier::Gpu),
+            "Runner FAIL forced mixed placement request={request} tiers={tiers:?}"
+        );
+        if request == 0 {
+            ensure!(
+                tiers.contains(&Tier::Host) && tiers.contains(&Tier::Disk),
+                "Runner FAIL native host/disk tiers absent"
+            );
+        }
+        let mut eager: Option<Vec<f32>> = None;
+        for graph in [false, true] {
+            for repeat in 0..3 {
+                slots.begin_token()?;
+                stream.memcpy_htod(&ids, &mut decode.ids)?;
+                stream.memcpy_htod(&weights, &mut decode.weights)?;
+                stream.memset_zeros(&mut y)?;
+                if graph {
+                    slots.run_graph(device, &mut decode, 0, 0, ffn.clone(), (x, &mut out))?;
+                } else {
+                    decode.read_route(device, 0, &ffn, x)?;
+                    slots.finish_routed(device, &mut decode, 0, ffn.clone(), (x, &mut out))?;
+                }
+                let values = stream
+                    .clone_dtoh(&decode.contributions)?
+                    .into_iter()
+                    .map(bf16::to_f32)
+                    .collect::<Vec<_>>();
+                ensure!(
+                    stream.clone_dtoh(&decode.done)? == [1; 8],
+                    "Runner FAIL native completion words"
+                );
+                defects += placement_compare(
+                    "published_resident_vs_forced",
+                    &reference,
+                    &values,
+                    Some(1),
+                )?;
+                if let Some(expected) = &eager {
+                    defects +=
+                        placement_compare("published_tier_repeat_graph", expected, &values, None)?;
+                } else {
+                    eager = Some(values);
+                }
+
+                slots.finish_token()?;
+                println!(
+                    "PASS published_residency request={request} graph={graph} repeat={repeat} tiers={tiers:?} native_slot_bytes={slot} input=[1,2048] contributions=[1,8,2048]"
+                );
+            }
+        }
+        if request > 0 {
+            ensure!(
+                slots.published != previous_generation,
+                "DEFECT request refill did not advance generations"
+            );
+        }
+        previous_generation.clone_from(&slots.published);
+        slots.end_request()?;
+    }
+    let mut trace = Trace::default();
+    slots.trace(&mut trace)?;
+    ensure!(
+        trace.values("stats.copy_wait_pending")?[0] > 0.0,
+        "Runner FAIL publication delay was not observed"
+    );
+    println!(
+        "PUBLISHED_RESIDENCY cells=18 defects={defects} pinned=true requests=3 refill_generation=true"
+    );
+    Ok(defects)
+}
+
+#[test]
+#[ignore = "GPU lease, published MiniCPM-V-4.7 FP8 and pinned FLYINGFISH_RUNTIME_DIR"]
+fn published_residency_gpu() -> Result<()> {
+    let model = PathBuf::from(std::env::var_os("FF_MODEL").context("published model missing")?);
+    let runtime = PathBuf::from(
+        std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("published runtime missing")?,
+    );
+    let settings = Settings {
+        runtime_dir: Some(runtime),
+        prefix_cache: false,
+        draft_model: None,
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: true,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    let engine = Engine::load(&model, 0, 8192, Some(129), settings)?;
+    engine.check_ready()?;
+    let mut defects = placement_components(&engine, &model)?;
+    defects += published_residency(&engine, &model)?;
+    ensure!(defects == 0, "DEFECT published residency cells={defects}");
+    Ok(())
+}
+
+std::thread_local! {
+    pub(super) static MEMORY_BUDGET: std::cell::Cell<Option<(usize, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+#[test]
+#[ignore = "GPU lease, published FP8 model, frozen model-definition outputs and pinned runtime"]
+fn published_streamed_model_gpu() -> Result<()> {
+    let fixtures: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/minicpm_reference.json"
+    )))?;
+    let cases = fixtures["cases"]
+        .as_array()
+        .context("published reference cases")?;
+    let model = PathBuf::from(std::env::var_os("FF_MODEL").context("published model missing")?);
+    let reference = PathBuf::from(
+        std::env::var_os("FF_DENSE_REFERENCE").context("published reference missing")?,
+    );
+    let runtime = PathBuf::from(
+        std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("published runtime missing")?,
+    );
+    let settings = Settings {
+        runtime_dir: Some(runtime),
+        prefix_cache: false,
+        draft_model: None,
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: true,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    MEMORY_BUDGET.set(Some((24 << 30, 4 << 30)));
+    let loaded = Engine::load(&model, 0, 8192, Some(129), settings);
+    MEMORY_BUDGET.set(None);
+    let mut engine = loaded?;
+    engine.check_ready()?;
+    let cap = &engine
+        .moe_prefill
+        .as_ref()
+        .context("streamed prefill missing")?
+        .capacity;
+    ensure!(
+        cap.pinned
+            && cap.disk_bytes > 0
+            && cap.host_blocks > 0
+            && cap.slots_per_layer.iter().all(|&n| n < 256),
+        "Runner FAIL forced planner did not produce pinned-host/disk partial residency: {cap:?}"
+    );
+    println!(
+        "PUBLISHED_STREAMED_PLAN slots={:?} host_blocks={} disk_bytes={} pinned={} device_limit={} host_limit={}",
+        cap.slots_per_layer,
+        cap.host_blocks,
+        cap.disk_bytes,
+        cap.pinned,
+        24u64 << 30,
+        4u64 << 30
+    );
+    let mut defects = 0;
+    let mut cells = 0;
+    for rows in [1024usize, 4096] {
+        let case = cases
+            .iter()
+            .find(|case| case["rows"].as_u64() == Some(rows as u64))
+            .context("published fixture rows")?;
+        let max_limit = case["limits"]["max_normalized"]
+            .as_f64()
+            .context("frozen max limit")?;
+        let rms_limit = case["limits"]["rms_normalized"]
+            .as_f64()
+            .context("frozen RMS limit")?;
+        ensure!(
+            max_limit.is_finite() && max_limit > 0.0 && rms_limit.is_finite() && rms_limit > 0.0,
+            "Runner FAIL invalid frozen limits"
+        );
+        let bytes =
+            std::fs::read(reference.join(format!("text{rows}-chunk{rows}-repeat0.safetensors")))?;
+        let tensors = safetensors::SafeTensors::deserialize(&bytes)?;
+        let tensor = tensors.tensor("logits")?;
+        ensure!(
+            tensor.dtype() == safetensors::Dtype::F32 && tensor.shape() == [4, 248144],
+            "Runner FAIL reference must be F32[4,248144]"
+        );
+        let expected = tensor
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&word| f32::from_le_bytes(word))
+            .collect::<Vec<_>>();
+        ensure!(
+            expected.iter().all(|v| v.is_finite()),
+            "Runner FAIL reference nonfinite"
+        );
+        let ids = (0..rows)
+            .map(|i| ((i * 269 + 23) % 248144) as u32)
+            .collect::<Vec<_>>();
+        let mut eager = Vec::new();
+        for (repeat, graph) in [false, true, false].into_iter().enumerate() {
+            engine.reset()?;
+            let mut token = engine.prefill(&ids, None)?;
+            let mut maximum = 0.0f64;
+            let mut rms = 0.0f64;
+            let mut min_margin = f32::INFINITY;
+            let mut cell_defects = 0;
+            for step in 0..4 {
+                if step > 0 {
+                    engine.set_token([115, 1301, 3809][step - 1])?;
+                    token = engine.decode(graph, None)?;
+                }
+                ensure!(
+                    engine.position == rows + step,
+                    "DEFECT streamed absolute position"
+                );
+                let logits = engine.decode_logits()?;
+                ensure!(
+                    logits.len() == 248144 && logits.iter().all(|v| v.is_finite()),
+                    "Runner FAIL streamed logits"
+                );
+                let bits = logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                if repeat == 0 {
+                    eager.push((token, bits));
+                } else {
+                    cell_defects += usize::from(eager[step] != (token, bits));
+                }
+                let reference = &expected[step * 248144..(step + 1) * 248144];
+                let scale = (reference.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>()
+                    / 248144.0)
+                    .sqrt();
+                ensure!(
+                    scale.is_finite() && scale > 0.0,
+                    "Runner FAIL reference scale"
+                );
+                let mut error_max = 0.0f64;
+                let mut error_square = 0.0f64;
+                for (&actual, &wanted) in logits.iter().zip(reference) {
+                    let error = f64::from(actual) - f64::from(wanted);
+                    error_max = error_max.max(error.abs());
+                    error_square += error * error;
+                }
+                maximum = maximum.max(error_max / scale);
+                rms = rms.max((error_square / 248144.0).sqrt() / scale);
+                let mut order = (0..248144).collect::<Vec<_>>();
+                order.sort_unstable_by(|&a, &b| {
+                    reference[b].total_cmp(&reference[a]).then(a.cmp(&b))
+                });
+                let margin = reference[order[0]] - reference[order[1]];
+                min_margin = min_margin.min(margin);
+                cell_defects += usize::from(
+                    token as usize != order[0] && f64::from(margin) > 2.0 * max_limit * scale,
+                );
+            }
+            cell_defects += usize::from(maximum > max_limit || rms > rms_limit);
+            let position = engine.position;
+            ensure!(
+                engine
+                    .prefill(&vec![1; engine.capacity - position + 1], None)
+                    .is_err()
+                    && engine.position == position,
+                "DEFECT streamed prefill exceeded capacity or mutated position"
+            );
+            let stats = engine
+                .moe_prefill
+                .as_ref()
+                .context("streamed prefill stats")?
+                .stats;
+            ensure!(
+                stats[2] > 0 && stats[6] + stats[7] > 0,
+                "Runner FAIL native streaming/refill not exercised: {stats:?}"
+            );
+            engine.check_ready()?;
+            defects += cell_defects;
+            cells += 1;
+            println!(
+                "PUBLISHED_STREAMED_MODEL rows={rows} decode_prefix={rows} graph={graph} repeat={repeat} max_normalized={maximum:e} rms_normalized={rms:e} max_limit={max_limit} rms_limit={rms_limit} min_margin={min_margin} stats={stats:?} defects={cell_defects}"
+            );
+        }
+    }
+    println!(
+        "PUBLISHED_STREAMED_MODEL cells={cells} defects={defects} frozen_model_definition_limits=true"
+    );
+    ensure!(defects == 0, "DEFECT streamed model cells={defects}");
     Ok(())
 }

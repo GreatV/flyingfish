@@ -1,7 +1,7 @@
 //! Layer-major prefill over borrowed expert slots.
 use super::*;
 use crate::backend::cuda::moe::combine::MoeCombineRouted;
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 use crate::backend::cuda::moe::prefill::prefill_scratch_bytes;
 use crate::backend::cuda::moe::prefill::{
     LANE16_ROWS, MoePrefillContribute, MoePrefillFinish, PrefillOps, arithmetic_mask,
@@ -2819,7 +2819,7 @@ impl Gpu {
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 mod tests {
     use super::super::super::tests::{
         graph_state, hybrid_spec, tier_capacity, tier_fixture, tier_service,
@@ -3239,8 +3239,10 @@ mod tests {
                 let contributions = stream.alloc_zeros::<bf16>(rows * hidden)?;
                 let done = stream.alloc_zeros::<u32>(rows)?;
                 {
-                    let _range =
-                        crate::backend::cuda::profile::Range::new(true, c"expert_tier_grouped");
+                    let _range = crate::backend::cuda::profile::Range::new(
+                        cfg!(feature = "cuda"),
+                        c"expert_tier_grouped",
+                    );
                     ops.prefill_contribute(
                         stream,
                         MoePrefillContribute {
@@ -3330,7 +3332,8 @@ mod tests {
                     stream.clone_dtoh(&done)?.iter().all(|&value| value == 1),
                     "grouped expert did not complete every assignment"
                 );
-                Ok(stream.clone_dtoh(&contributions)?)
+                let output = stream.clone_dtoh(&contributions)?;
+                Ok(output)
             };
             let gpu = run_gpu(&tables, &host_gate_up, &host_down)?;
             let mut cpu = vec![bf16::ZERO; rows * hidden];
@@ -3622,6 +3625,9 @@ mod tests {
             crate::model_spec::ExpertFormat::Bf16,
         )?;
         capacity.slots_per_layer.fill(geometry.experts);
+        capacity.spare_blocks = 0;
+        capacity.host_expert_bytes = u64::from(capacity.host_blocks) * capacity.slot_bytes();
+        capacity.disk_bytes = 0;
         capacity.device_expert_bytes = capacity.slot_bytes()
             * (u64::from(geometry.layers) * u64::from(geometry.experts)
                 + u64::from(capacity.prefill_staging_slots));
@@ -4156,12 +4162,8 @@ mod tests {
                 stream.synchronize()?;
                 // SAFETY: the resident oracle owns this initialized native slot until this read completes.
                 unsafe {
-                    cudarc::driver::sys::cuMemcpyDtoH_v2(
-                        native_slot.as_mut_ptr().cast(),
-                        pointers[expert].0,
-                        native_slot.len(),
-                    )
-                    .result()?;
+                    copy::dtoh_async(&mut native_slot, pointers[expert].0, stream)?;
+                    stream.synchronize()?;
                 }
                 Vec::new()
             } else {
@@ -4420,8 +4422,10 @@ mod tests {
                         super::super::delay_stream(&slots.transfers.d2h)?;
                     }
                     {
-                        let _range =
-                            crate::backend::cuda::profile::Range::new(true, c"engine_moe_borrow");
+                        let _range = crate::backend::cuda::profile::Range::new(
+                            cfg!(feature = "cuda"),
+                            c"engine_moe_borrow",
+                        );
                         prefill.begin(&engine.device, &mut slots, rows)?;
                     }
                     let span = prefill.span.as_ref().context("prefill gate span missing")?;
@@ -4535,8 +4539,10 @@ mod tests {
                         }
                         let ffn = engine.moe_ffn_binding(layer)?;
                         {
-                            let _range =
-                                crate::backend::cuda::profile::Range::new(true, c"engine_moe_span");
+                            let _range = crate::backend::cuda::profile::Range::new(
+                                cfg!(feature = "cuda"),
+                                c"engine_moe_span",
+                            );
                             prefill.ffn(
                                 &engine.device,
                                 &mut slots,
@@ -4704,8 +4710,10 @@ mod tests {
                         );
                     }
                     {
-                        let _range =
-                            crate::backend::cuda::profile::Range::new(true, c"engine_moe_refill");
+                        let _range = crate::backend::cuda::profile::Range::new(
+                            cfg!(feature = "cuda"),
+                            c"engine_moe_refill",
+                        );
                         prefill.end(&engine.device, &mut slots)?;
                         engine.device.stream.synchronize()?;
                     }
@@ -5318,8 +5326,10 @@ mod tests {
             engine.reset()?;
             let mut hidden = Vec::new();
             {
-                let _range =
-                    crate::backend::cuda::profile::Range::new(true, c"engine_moe_layer_order");
+                let _range = crate::backend::cuda::profile::Range::new(
+                    cfg!(feature = "cuda"),
+                    c"engine_moe_layer_order",
+                );
                 engine.prefill_chunks(&ids, None, 0, |engine, values| {
                     hidden.extend(
                         engine

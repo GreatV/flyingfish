@@ -290,6 +290,23 @@ impl Setup {
         let expert_calibration_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
         let phase_started = std::time::Instant::now();
         let available = host_memory(Path::new("/"))?;
+        #[cfg(test)]
+        let (available, request) = tests::MEMORY_BUDGET.with(|budget| -> Result<_> {
+            let Some((device_bytes, host_bytes)) = budget.get() else {
+                return Ok((available, request));
+            };
+            ensure!(
+                device_bytes <= request.free_after_resident && host_bytes <= available,
+                "residency fixture budget exceeds available memory"
+            );
+            Ok((
+                host_bytes,
+                crate::prefill::WorkspaceRequest {
+                    free_after_resident: device_bytes,
+                    ..request
+                },
+            ))
+        })?;
         let copies = measured.copy_engines.min(2);
         let slot = catalogue.slot_bytes();
         let workers = measured.service.pool_worker_count()?;
@@ -1462,7 +1479,7 @@ impl Decode {
         ))
     }
 
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(test)]
     pub fn finish(
         &mut self,
         device: &Device,
@@ -2329,7 +2346,7 @@ fn validate_dispatch(
     Ok(())
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 #[path = "engine_moe_tests.rs"]
 mod tests;
 
