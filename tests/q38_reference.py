@@ -37,6 +37,8 @@ def load_model(directory):
     check(initialization_calls == [True], "reference initialization call count")
     for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs"):
         check(key in loading and not loading[key], f"unclean reference {key}: {loading.get(key)}")
+    loading = {key: list(loading[key]) for key in
+               ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")}
     loading["newly_initialized_keys"] = initialized
     projections = [module for module in model.modules() if isinstance(module, FP8Linear)]
     check(projections, "no published FP8 projections loaded")
