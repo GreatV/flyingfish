@@ -617,9 +617,16 @@ impl Runtime {
             FullAttentionOps::preprocess_workspace(&attention, limits(rows, capacity)?)?
         };
         let attention_decode =
-            FullAttentionOps::decode_workspace(&attention, u32::try_from(capacity)?)?;
-        let attention_nested_verify =
-            FullAttentionOps::workspace(&attention, limits(rows.min(verify_rows), capacity)?)?;
+            FullAttentionOps::decode_workspace(&attention, 1, u32::try_from(capacity)?)?;
+        let attention_nested_verify = if cfg!(feature = "rocm") {
+            FullAttentionOps::decode_workspace(
+                &attention,
+                u32::try_from(rows.min(verify_rows))?,
+                u32::try_from(capacity)?,
+            )?
+        } else {
+            FullAttentionOps::workspace(&attention, limits(rows.min(verify_rows), capacity)?)?
+        };
         let spec = gdn;
         let prefill = GdnOps::workspace(&spec, u32::try_from(rows)?, policy)?;
         let decode = GdnOps::workspace(&spec, 1, GdnPolicy::P2)?;
@@ -651,8 +658,9 @@ impl Runtime {
         arena: Option<CudaSlice<u8>>,
         scratch_buffer: CudaSlice<u8>,
         kv_scratch: Option<(CudaSlice<bf16>, CudaSlice<bf16>)>,
-        verify_rows: usize,
+        verification: (usize, bool),
     ) -> Result<Self> {
+        let (verify_rows, invariant) = verification;
         let s = &engine.device.stream;
         let rows = engine.workspace_rows;
         let flint = engine.model_spec.architecture == crate::model_spec::Architecture::Flint;
@@ -879,7 +887,21 @@ impl Runtime {
                                 false,
                             )?,
                             (rows, verify_rows),
-                            FullAttentionPlan::for_rows,
+                            |plan, rows| {
+                                if cfg!(feature = "rocm") && invariant {
+                                    bind(
+                                        AttentionLimits {
+                                            max_rows: rows,
+                                            ..decode_limits
+                                                .context("verify attention limits missing")?
+                                        },
+                                        PositionBindings::Linear,
+                                        false,
+                                    )
+                                } else {
+                                    plan.for_rows(rows)
+                                }
+                            },
                         )?;
                         ensure!(
                             text_prefill
@@ -1966,9 +1988,21 @@ impl Engine {
                     FullAttentionOps::preprocess_workspace(attention, limits(rows, capacity)?)?
                         .bytes
                 },
-                FullAttentionOps::decode_workspace(attention, u32::try_from(capacity)?)?.bytes,
-                FullAttentionOps::workspace(attention, limits(rows.min(verify_rows), capacity)?)?
-                    .bytes,
+                FullAttentionOps::decode_workspace(attention, 1, u32::try_from(capacity)?)?.bytes,
+                if cfg!(feature = "rocm") {
+                    FullAttentionOps::decode_workspace(
+                        attention,
+                        u32::try_from(rows.min(verify_rows))?,
+                        u32::try_from(capacity)?,
+                    )?
+                    .bytes
+                } else {
+                    FullAttentionOps::workspace(
+                        attention,
+                        limits(rows.min(verify_rows), capacity)?,
+                    )?
+                    .bytes
+                },
             )
         };
         let (gdn_prefill_bytes, gdn_decode_bytes) = if flint {
@@ -2141,7 +2175,7 @@ impl Engine {
             arena,
             scratch_buffer,
             kv_scratch,
-            verify_rows,
+            (verify_rows, draft_config.is_some()),
         )?);
         #[cfg(feature = "cuda")]
         if flint {

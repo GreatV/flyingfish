@@ -4416,7 +4416,7 @@ fn minicpm_chain_verify(chunk: usize) -> Result<()> {
     let mut defects = 0;
     let mut wrong_layer = 0;
     let mut perturbed_gdn_control = 0;
-    for prefix in [7usize, 17, 65] {
+    for prefix in [7usize, 17, 65, 125, 129] {
         model.reset()?;
         let ids: Vec<_> = (0..prefix).map(|row| (row * 263 + 17) as u32).collect();
         let mut trace = Trace::all_layers();

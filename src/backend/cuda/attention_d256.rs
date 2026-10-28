@@ -307,13 +307,14 @@ fn check_bindings(
 impl FullAttentionOps {
     pub(crate) fn decode_workspace(
         spec: &FullAttentionSpec,
+        rows: u32,
         capacity: u32,
     ) -> Result<WorkspaceReq> {
         ensure!(capacity >= KT, "decode attention capacity is below KT=32");
         Self::workspace(
             spec,
             AttentionLimits {
-                max_rows: 1,
+                max_rows: rows,
                 capacity,
                 key_chunk: 128.min(capacity / KT * KT),
                 causal: 1,
