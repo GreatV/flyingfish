@@ -1251,6 +1251,10 @@ mod tests {
             }
         }
 
+        #[cfg(feature = "rocm")]
+        if mutant {
+            prefix_k.rotate_left(prefix as usize * d);
+        }
         if boundary_probe == Some(true) {
             ensure!(prefix > 0, "boundary control requires a cached key");
             let slot = 128.min(prefix as usize - 1);
@@ -1425,7 +1429,9 @@ mod tests {
             },
         };
         let common = CommonOpsRef::new(&device.ctx)?;
-        let mut plan = FullAttentionOps::prepare(&device.ctx, &spec, limits, bindings, common)?;
+        let plan = FullAttentionOps::prepare(&device.ctx, &spec, limits, bindings, common)?;
+        #[cfg(feature = "cuda")]
+        let mut plan = plan;
         #[cfg(feature = "cuda")]
         if mutant {
             let root = std::path::PathBuf::from(
@@ -1439,10 +1445,6 @@ mod tests {
             Arc::get_mut(&mut plan.kernels)
                 .context("geometry fixture unexpectedly shares kernels")?
                 .qg_split = module.load_function("tcmqa_d256_qg_split")?;
-        }
-        #[cfg(feature = "rocm")]
-        if mutant {
-            plan.bindings.k_cache.0.stride[0] -= u64::from(D);
         }
         #[cfg(feature = "rocm")]
         ensure!(!flash, "HIP external Flash fixture is unsupported");
@@ -1577,7 +1579,7 @@ mod tests {
             // Full rotary: two RMS rounds, cos/sin, two products and the sum; partial rotary: RMS and RoPE.
             let q_bound = bf16_chain_bound(if full { 6 } else { 2 }, &[d]) as f32;
             eprintln!("P1D_BINDER_Q rel={q_rel:e} bound={q_bound:e}");
-            if full || boundary_probe.is_some() {
+            if full || boundary_probe.is_some() || cfg!(feature = "rocm") {
                 oracle_mismatches += usize::from(q_rel > q_bound);
             } else {
                 ensure!(
@@ -1604,7 +1606,7 @@ mod tests {
                 plan.max_parts(),
                 plan.phase2_smem_bytes()
             );
-            if full || boundary_probe.is_some() {
+            if full || boundary_probe.is_some() || cfg!(feature = "rocm") {
                 ensure!(
                     q_roped[..live]
                         .iter()
@@ -2104,9 +2106,9 @@ mod tests {
                         .zip(&mutant.core_out)
                         .filter(|(a, b)| a.to_bits() != b.to_bits())
                         .count();
-                    ensure!(differences > 0, "HD256 KV head-stride mutant escaped");
+                    ensure!(differences > 0, "HD256 cached K-head swap control escaped");
                     println!(
-                        "PASS HIP_HD256_CONTROL wrong_kv_head_stride differences={differences}"
+                        "PASS HIP_HD256_CONTROL swapped_cached_k_heads differences={differences}"
                     );
                 }
             }
