@@ -1,10 +1,14 @@
 //! HIP allocations retain their device and synchronize before releasing storage.
 use anyhow::{Context as _, Result, ensure};
 use std::{
+    any::Any,
     ffi::{CStr, CString, c_char, c_void},
     marker::PhantomData,
     ops::{Bound, RangeBounds},
-    sync::Arc,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 type Handle = *mut c_void;
@@ -20,6 +24,19 @@ unsafe extern "C" {
     fn hipStreamDestroy(stream: Handle) -> i32;
     fn hipStreamSynchronize(stream: Handle) -> i32;
     fn hipStreamWaitEvent(stream: Handle, event: Handle, flags: u32) -> i32;
+    fn hipStreamBeginCapture(stream: Handle, mode: i32) -> i32;
+    fn hipStreamEndCapture(stream: Handle, graph: *mut Handle) -> i32;
+    fn hipGraphInstantiate(
+        exec: *mut Handle,
+        graph: Handle,
+        error: *mut Handle,
+        log: *mut c_char,
+        size: usize,
+    ) -> i32;
+    fn hipGraphLaunch(exec: Handle, stream: Handle) -> i32;
+    fn hipGraphUpload(exec: Handle, stream: Handle) -> i32;
+    fn hipGraphExecDestroy(exec: Handle) -> i32;
+    fn hipGraphDestroy(graph: Handle) -> i32;
     fn hipEventCreateWithFlags(event: *mut Handle, flags: u32) -> i32;
     fn hipEventDestroy(event: Handle) -> i32;
     fn hipEventRecord(event: Handle, stream: Handle) -> i32;
@@ -229,6 +246,9 @@ impl Context {
         Ok(Arc::new(Stream {
             handle: handle as usize,
             context: self.clone(),
+            resources: Mutex::new(Vec::new()),
+            captured: Mutex::new(Vec::new()),
+            capturing: AtomicBool::new(false),
         }))
     }
     pub fn new_event(self: &Arc<Self>, flags: Option<u32>) -> Result<Event> {
@@ -302,8 +322,77 @@ impl Context {
 pub struct Stream {
     handle: usize,
     context: Arc<Context>,
+    resources: Mutex<Vec<Weak<dyn Any + Send + Sync>>>,
+    captured: Mutex<Vec<Arc<dyn Any + Send + Sync>>>,
+    capturing: AtomicBool,
 }
 impl Stream {
+    pub(super) fn register<T: Any + Send + Sync>(&self, resource: &Arc<T>) {
+        let resource: Arc<dyn Any + Send + Sync> = resource.clone();
+        let mut resources = self
+            .resources
+            .lock()
+            .expect("HIP resource registry poisoned");
+        resources.retain(|r| r.strong_count() != 0);
+        resources.push(Arc::downgrade(&resource));
+        if self.capturing.load(Ordering::Acquire) {
+            self.captured
+                .lock()
+                .expect("HIP capture resources poisoned")
+                .push(resource);
+        }
+    }
+    pub(super) fn retain<T: Any + Send + Sync>(&self, resource: &Arc<T>) {
+        if self.capturing.load(Ordering::Acquire) {
+            self.captured
+                .lock()
+                .expect("HIP capture resources poisoned")
+                .push(resource.clone());
+        }
+    }
+    pub(super) fn require_eager(&self, operation: &str) -> Result<()> {
+        ensure!(
+            !self.capturing.load(Ordering::Acquire),
+            "HIP {operation} is forbidden during graph capture"
+        );
+        Ok(())
+    }
+    pub fn begin_capture(self: &Arc<Self>) -> Result<Capture> {
+        self.synchronize()?;
+        ensure!(
+            self.capturing
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "HIP stream capture already active"
+        );
+        {
+            let resources = self
+                .resources
+                .lock()
+                .expect("HIP resource registry poisoned");
+            self.captured
+                .lock()
+                .expect("HIP capture resources poisoned")
+                .extend(resources.iter().filter_map(Weak::upgrade));
+        }
+        let status = unsafe { hipStreamBeginCapture(self.raw(), 1) };
+        if status != 0 {
+            self.capturing.store(false, Ordering::Release);
+            let resources = std::mem::take(
+                &mut *self
+                    .captured
+                    .lock()
+                    .expect("HIP capture resources poisoned"),
+            );
+            drop(resources);
+            check(status, "hipStreamBeginCapture")?;
+        }
+        Ok(Capture {
+            stream: self.clone(),
+            active: true,
+            thread: PhantomData,
+        })
+    }
     pub fn context(&self) -> &Arc<Context> {
         &self.context
     }
@@ -311,10 +400,12 @@ impl Stream {
         self.handle as Handle
     }
     pub fn synchronize(&self) -> Result<()> {
+        self.require_eager("stream synchronize")?;
         self.context.bind_to_thread()?;
         unsafe { check(hipStreamSynchronize(self.raw()), "hipStreamSynchronize") }
     }
     pub fn wait(&self, event: &Event) -> Result<()> {
+        self.require_eager("event wait")?;
         ensure!(
             Arc::ptr_eq(&self.context, &event.context),
             "HIP event device differs from stream"
@@ -335,6 +426,7 @@ impl Stream {
     /// # Safety
     /// Contents must be initialized before a device or host read.
     pub unsafe fn alloc<T: DeviceRepr>(self: &Arc<Self>, len: usize) -> Result<Slice<T>> {
+        self.require_eager("allocation")?;
         self.context.bind_to_thread()?;
         let bytes = extent::<T>(len)?;
         let mut ptr = std::ptr::null_mut();
@@ -343,11 +435,13 @@ impl Stream {
                 check(hipMalloc(&mut ptr, bytes), "hipMalloc")?;
             }
         }
+        let allocation = Arc::new(Allocation {
+            ptr: ptr as usize,
+            stream: self.clone(),
+        });
+        self.register(&allocation);
         Ok(Slice {
-            allocation: Arc::new(Allocation {
-                ptr: ptr as usize,
-                stream: self.clone(),
-            }),
+            allocation,
             len,
             marker: PhantomData,
         })
@@ -370,6 +464,7 @@ impl Stream {
         input: &[T],
         output: &mut impl DevicePtrMut<T>,
     ) -> Result<()> {
+        self.require_eager("host-to-device copy")?;
         ensure!(input.len() <= output.len(), "HIP H2D exceeds allocation");
         output.check_stream(self)?;
         let (ptr, _guard) = output.device_ptr_mut(self);
@@ -382,6 +477,7 @@ impl Stream {
         self: &Arc<Self>,
         input: &impl DevicePtr<T>,
     ) -> Result<Vec<T>> {
+        self.require_eager("device-to-host copy")?;
         input.check_stream(self)?;
         let mut output = Vec::<T>::with_capacity(input.len());
         let (ptr, _guard) = input.device_ptr(self);
@@ -432,6 +528,9 @@ impl Stream {
     /// # Safety
     /// Both spans must be valid for `bytes` and ordered on this stream through completion.
     pub unsafe fn copy_raw(&self, dst: u64, src: u64, bytes: usize, kind: i32) -> Result<()> {
+        if kind != 3 {
+            self.require_eager("host copy")?;
+        }
         self.context.bind_to_thread()?;
         if bytes > 0 {
             unsafe {
@@ -503,12 +602,118 @@ impl Drop for Stream {
     }
 }
 
+pub struct Capture {
+    stream: Arc<Stream>,
+    active: bool,
+    thread: PhantomData<std::rc::Rc<()>>,
+}
+impl Capture {
+    fn end(&mut self) -> Result<Graph> {
+        self.stream.context.bind_to_thread()?;
+        let mut graph = std::ptr::null_mut();
+        let status = unsafe { hipStreamEndCapture(self.stream.raw(), &mut graph) };
+        self.active = false;
+        self.stream.capturing.store(false, Ordering::Release);
+        let resources = std::mem::take(
+            &mut *self
+                .stream
+                .captured
+                .lock()
+                .expect("HIP capture resources poisoned"),
+        );
+        let graph = Graph {
+            graph: graph as usize,
+            exec: 0,
+            stream: self.stream.clone(),
+            _resources: resources,
+            exclusive: PhantomData,
+        };
+        check(status, "hipStreamEndCapture")?;
+        ensure!(graph.graph != 0, "HIP capture returned an empty graph");
+        Ok(graph)
+    }
+    pub fn finish(mut self) -> Result<Graph> {
+        let mut graph = self.end()?;
+        let mut exec = std::ptr::null_mut();
+        let status = unsafe {
+            hipGraphInstantiate(
+                &mut exec,
+                graph.graph as Handle,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        graph.exec = exec as usize;
+        check(status, "hipGraphInstantiate")?;
+        ensure!(
+            graph.exec != 0,
+            "HIP instantiate returned an empty executable"
+        );
+        Ok(graph)
+    }
+}
+impl Drop for Capture {
+    fn drop(&mut self) {
+        if self.active {
+            drop_result(self.end().map(drop));
+        }
+    }
+}
+
+pub struct Graph {
+    graph: usize,
+    exec: usize,
+    stream: Arc<Stream>,
+    _resources: Vec<Arc<dyn Any + Send + Sync>>,
+    exclusive: PhantomData<std::cell::Cell<()>>,
+}
+impl Graph {
+    pub fn launch(&self) -> Result<()> {
+        self.stream.require_eager("graph launch")?;
+        self.stream.context.bind_to_thread()?;
+        unsafe {
+            check(
+                hipGraphLaunch(self.exec as Handle, self.stream.raw()),
+                "hipGraphLaunch",
+            )
+        }
+    }
+    pub fn upload(&self) -> Result<()> {
+        self.stream.require_eager("graph upload")?;
+        self.stream.context.bind_to_thread()?;
+        unsafe {
+            check(
+                hipGraphUpload(self.exec as Handle, self.stream.raw()),
+                "hipGraphUpload",
+            )
+        }
+    }
+}
+impl Drop for Graph {
+    fn drop(&mut self) {
+        drop_result(self.stream.synchronize());
+        if self.exec != 0 {
+            drop_result(unsafe {
+                check(
+                    hipGraphExecDestroy(self.exec as Handle),
+                    "hipGraphExecDestroy",
+                )
+            });
+        }
+        if self.graph != 0 {
+            drop_result(unsafe { check(hipGraphDestroy(self.graph as Handle), "hipGraphDestroy") });
+        }
+    }
+}
+
 pub struct Event {
     handle: usize,
     context: Arc<Context>,
 }
 impl Event {
     pub fn record(&self, stream: &Arc<Stream>) -> Result<()> {
+        stream.require_eager("event record")?;
         ensure!(
             Arc::ptr_eq(&self.context, &stream.context),
             "HIP event/stream context mismatch"
@@ -637,11 +842,29 @@ impl<T> Slice<T> {
         if Arc::ptr_eq(stream, &self.allocation.stream) {
             return Ok(());
         }
-        let allocation = Arc::get_mut(&mut self.allocation)
-            .context("HIP handoff requires exclusive allocation ownership")?;
-        let completed = allocation.stream.record_event(Some(2))?;
+        ensure!(
+            Arc::strong_count(&self.allocation) == 1,
+            "HIP handoff requires exclusive allocation ownership"
+        );
+        let completed = self.allocation.stream.record_event(Some(2))?;
         stream.wait(&completed)?;
+        let previous = std::mem::replace(
+            &mut self.allocation,
+            Arc::new(Allocation {
+                ptr: 0,
+                stream: stream.clone(),
+            }),
+        );
+        let mut allocation = match Arc::try_unwrap(previous) {
+            Ok(allocation) => allocation,
+            Err(previous) => {
+                self.allocation = previous;
+                anyhow::bail!("HIP handoff raced with graph retention");
+            }
+        };
         allocation.stream = stream.clone();
+        self.allocation = Arc::new(allocation);
+        stream.register(&self.allocation);
         Ok(())
     }
     pub fn slice(&self, range: impl RangeBounds<usize>) -> View<'_, T> {
@@ -682,6 +905,7 @@ impl<T> ViewMut<'_, T> {
 }
 /// # Safety
 /// The returned pointer must cover `len` elements and remain live for the guard's borrow.
+/// During capture its storage must be retained by the stream, or `check_stream` must reject access.
 pub unsafe trait DevicePtr<T> {
     fn len(&self) -> usize;
     fn check_stream(&self, stream: &Arc<Stream>) -> Result<()>;
@@ -877,6 +1101,7 @@ impl Launch<'_> {
     }
     /// # Safety
     /// Raw pointer arguments, aliasing, launch shape and inter-stream dependencies must match the kernel contract.
+    /// Captured raw pointer arguments must remain live until the graph is destroyed.
     pub unsafe fn launch(&mut self, config: LaunchConfig) -> Result<()> {
         ensure!(
             Arc::ptr_eq(&self.stream.context, &self.function.module.context),
@@ -896,6 +1121,7 @@ impl Launch<'_> {
             "empty HIP launch dimension"
         );
         self.stream.context.bind_to_thread()?;
+        self.stream.retain(&self.function.module);
         let mut pointers = [std::ptr::null_mut(); 32];
         for (pointer, argument) in pointers
             .iter_mut()

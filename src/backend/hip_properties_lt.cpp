@@ -25,6 +25,7 @@ static_assert(offsetof(hipblasLtMatmulHeuristicResult_t, workspaceSize) == 24);
 static_assert(offsetof(hipblasLtMatmulHeuristicResult_t, state) == 32);
 static_assert(offsetof(hipblasLtMatmulHeuristicResult_t, wavesCount) == 36);
 static_assert(HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK == 0);
+static_assert(hipStreamCaptureModeThreadLocal == 1);
 static_assert(HIP_R_32F == 0 && HIP_R_16BF == 14);
 static_assert(HIPBLAS_COMPUTE_32F == 2);
 static_assert(HIPBLAS_OP_N == 111 && HIPBLAS_OP_T == 112);

@@ -163,6 +163,7 @@ pub struct Choice {
 }
 
 struct Plan {
+    context: Arc<crate::backend::hip::Context>,
     desc: Handle,
     a: Handle,
     b: Handle,
@@ -172,8 +173,12 @@ struct Plan {
     choice: Choice,
     bias: Option<Arc<CudaSlice<bf16>>>,
 }
+// Published descriptors are immutable; mutation requires exclusive Arc ownership.
+unsafe impl Send for Plan {}
+unsafe impl Sync for Plan {}
 impl Drop for Plan {
     fn drop(&mut self) {
+        drop_result(self.context.bind_to_thread());
         unsafe {
             for layout in [self.a, self.b, self.c] {
                 if !layout.is_null() {
@@ -199,15 +204,38 @@ impl Drop for Plan {
     }
 }
 
-pub struct Blas {
-    stream: Arc<CudaStream>,
+struct Handles {
     handle: Handle,
     lt: Handle,
+    stream: Arc<CudaStream>,
+}
+// Blas alone submits library calls; graph references retain ownership for destruction.
+unsafe impl Send for Handles {}
+unsafe impl Sync for Handles {}
+impl Drop for Handles {
+    fn drop(&mut self) {
+        drop_result(self.stream.synchronize());
+        unsafe {
+            if !self.lt.is_null() {
+                drop_result(check(hipblasLtDestroy(self.lt), "hipblasLtDestroy"));
+            }
+            if !self.handle.is_null() {
+                drop_result(check(hipblasDestroy(self.handle), "hipblasDestroy"));
+            }
+        }
+    }
+}
+
+type Binding = (LinearShape, Option<u64>);
+
+pub struct Blas {
+    stream: Arc<CudaStream>,
+    handles: Arc<Handles>,
     identity: Identity,
     workspace: CudaSlice<u8>,
     skinny: Option<CudaFunction>,
     // Every plan accumulates in FP32 and adds bias before the BF16 output rounding.
-    plans: RefCell<BTreeMap<(LinearShape, Option<u64>), Plan>>,
+    plans: RefCell<BTreeMap<Binding, Arc<Plan>>>,
 }
 impl Blas {
     pub fn new(stream: Arc<CudaStream>) -> Result<Self> {
@@ -238,33 +266,39 @@ impl Blas {
             None
         };
         let mut result = Self {
+            handles: Arc::new(Handles {
+                stream: stream.clone(),
+                handle: std::ptr::null_mut(),
+                lt: std::ptr::null_mut(),
+            }),
             stream,
-            handle: std::ptr::null_mut(),
-            lt: std::ptr::null_mut(),
             identity,
             workspace,
             skinny,
             plans: RefCell::new(BTreeMap::new()),
         };
+        let handles =
+            Arc::get_mut(&mut result.handles).context("HIP library handles already shared")?;
         unsafe {
-            check(hipblasCreate(&mut result.handle), "hipblasCreate")?;
+            check(hipblasCreate(&mut handles.handle), "hipblasCreate")?;
             check(
-                hipblasSetStream(result.handle, result.stream.raw()),
+                hipblasSetStream(handles.handle, result.stream.raw()),
                 "hipblasSetStream",
             )?;
-            check(hipblasLtCreate(&mut result.lt), "hipblasLtCreate")?;
+            check(hipblasLtCreate(&mut handles.lt), "hipblasLtCreate")?;
             check(
-                hipblasLtGetVersion(result.lt, &mut result.identity.library),
+                hipblasLtGetVersion(handles.lt, &mut result.identity.library),
                 "hipblasLtGetVersion",
             )?;
             let mut revision = [0i8; 128];
             check(
-                hipblasLtGetGitRevision(result.lt, revision.as_mut_ptr()),
+                hipblasLtGetGitRevision(handles.lt, revision.as_mut_ptr()),
                 "hipblasLtGetGitRevision",
             )?;
             result.identity.revision = CStr::from_ptr(revision.as_ptr()).to_str()?.into();
         }
         ensure!(result.identity.library > 0, "hipBLASLt version is invalid");
+        result.stream.register(&result.handles);
         Ok(result)
     }
 
@@ -278,6 +312,7 @@ impl Blas {
         bias: Option<Arc<CudaSlice<bf16>>>,
         frozen: Option<&Choice>,
     ) -> Result<Choice> {
+        self.stream.require_eager("library plan preparation")?;
         self.stream.context().bind_to_thread()?;
         ensure!(
             shape.rows > 0
@@ -315,6 +350,7 @@ impl Blas {
             return Ok(plan.choice.clone());
         }
         let mut plan = Plan {
+            context: self.stream.context().clone(),
             desc: std::ptr::null_mut(),
             a: std::ptr::null_mut(),
             b: std::ptr::null_mut(),
@@ -342,7 +378,7 @@ impl Blas {
             );
         }
         let choice = plan.choice.clone();
-        self.plans.borrow_mut().insert(key, plan);
+        self.plans.borrow_mut().insert(key, Arc::new(plan));
         Ok(choice)
     }
 
@@ -408,7 +444,7 @@ impl Blas {
             let mut count = 0;
             check(
                 hipblasLtMatmulAlgoGetHeuristic(
-                    self.lt,
+                    self.handles.lt,
                     plan.desc,
                     plan.a,
                     plan.b,
@@ -456,7 +492,7 @@ impl Blas {
             let mut required = 0;
             check(
                 ff_hip_lt_supported(
-                    self.lt,
+                    self.handles.lt,
                     plan.desc,
                     plan.a,
                     plan.b,
@@ -494,6 +530,7 @@ impl Blas {
         let plan = plans
             .get(&key)
             .context("HIP linear shape/bias binding not prepared")?;
+        self.stream.retain(plan);
         if plan.choice.implementation == Implementation::Wmma {
             return self.wmma((shape, shape.input), bias, weight, input, output);
         }
@@ -527,7 +564,7 @@ impl Blas {
             if shape.rows == 1 {
                 check(
                     hipblasGemmEx(
-                        self.handle,
+                        self.handles.handle,
                         112,
                         111,
                         shape.output as i32,
@@ -553,7 +590,7 @@ impl Blas {
                 let (workspace, _work) = self.workspace.device_ptr(&self.stream);
                 check(
                     hipblasLtMatmul(
-                        self.lt,
+                        self.handles.lt,
                         plan.desc,
                         (&alpha as *const f32).cast(),
                         a as *const c_void,
@@ -736,10 +773,12 @@ impl Blas {
             Implementation::Library
         };
         self.validate_choice(&choice)?;
-        self.plans
-            .borrow_mut()
+        let mut plans = self.plans.borrow_mut();
+        let plan = plans
             .get_mut(&(shape, None))
-            .context("HIP calibrated plan missing")?
+            .context("HIP calibrated plan missing")?;
+        Arc::get_mut(plan)
+            .context("HIP captured plan cannot be recalibrated")?
             .choice = choice.clone();
         eprintln!(
             "{}",
@@ -774,20 +813,6 @@ fn binary_key() -> Result<String> {
         hash.write(&bytes[..count]);
     }
     Ok(format!("hash64-{:016x}", hash.finish()))
-}
-impl Drop for Blas {
-    fn drop(&mut self) {
-        drop_result(self.stream.synchronize());
-        self.plans.borrow_mut().clear();
-        unsafe {
-            if !self.lt.is_null() {
-                drop_result(check(hipblasLtDestroy(self.lt), "hipblasLtDestroy"));
-            }
-            if !self.handle.is_null() {
-                drop_result(check(hipblasDestroy(self.handle), "hipblasDestroy"));
-            }
-        }
-    }
 }
 
 impl Blas {
