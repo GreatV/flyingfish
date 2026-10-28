@@ -39,7 +39,7 @@ static_assert(hipStreamCaptureModeThreadLocal == 1);
 static_assert(hipErrorLaunchFailure == 719);
 static_assert(HIP_R_32F == 0 && HIP_R_16BF == 14);
 static_assert(HIPBLAS_COMPUTE_32F == 2);
-static_assert(HIP_R_64F == 1 && HIPBLAS_COMPUTE_64F == 4);
+static_assert(HIP_R_64F == 1 && HIPBLAS_COMPUTE_64F == 7);
 static_assert(HIPBLAS_OP_N == 111 && HIPBLAS_OP_T == 112);
 static_assert(HIPBLAS_GEMM_DEFAULT == 160 && HIPBLASLT_EPILOGUE_BIAS == 4);
 static_assert(HIPBLASLT_MATMUL_DESC_TRANSA == 0 && HIPBLASLT_MATMUL_DESC_EPILOGUE == 2);

@@ -1350,7 +1350,7 @@ mod tests {
                     cp as Handle,
                     1,
                     shape.output as i32,
-                    4,
+                    7,
                     160,
                 ),
                 "HIP audit FP64 product",
