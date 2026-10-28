@@ -34,6 +34,24 @@ fn recurrent_geometry_rejects_incompatible_mask_and_cycle_counts() -> Result<()>
             "accepted {key}"
         );
     }
+    let ids = vec![1; 580];
+    let mut modalities = vec![0; ids.len()];
+    modalities[6..557].fill(1);
+    let packed = flyingfish::serve::image::PreparedInput {
+        modality_ids: modalities,
+        pixel_values: (0..551 * 588).map(|i| (i % 17) as f32 / 17.0).collect(),
+        grids: vec![flyingfish::vision_input::ImageGrid { t: 1, h: 19, w: 29 }],
+    };
+    let path =
+        std::env::temp_dir().join(format!("loopvl-image-{}.safetensors", std::process::id()));
+    packed.save(&spec, &ids, &path)?;
+    let result = flyingfish::serve::image::PreparedInput::read(&spec, &path, &ids);
+    std::fs::remove_file(path)?;
+    let loaded = result?;
+    assert_eq!(loaded.pixel_values, packed.pixel_values);
+    assert_eq!(loaded.modality_ids, packed.modality_ids);
+    let positions = loaded.input(&ids).validate(&spec, 8192)?;
+    assert_eq!(positions.decode_position(580)?, 58);
     Ok(())
 }
 
