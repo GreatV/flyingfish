@@ -205,8 +205,14 @@ extern "C" __global__ void vision_anchor_reinject_bf16(
     __nv_bfloat16 alpha = __float2bfloat16_rn(alpha_f32);
     uint32_t count = uint32_t(visual_rows) * width;
     for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < count; i += gridDim.x * 256) {
+#if defined(__HIP__)
+        __nv_bfloat16 scaled_gate = __hmul_rn(alpha, gates[i / width]);
+        __nv_bfloat16 delta = __hmul_rn(scaled_gate, anchor[i]);
+        states[i] = __hadd_rn(states[i], delta);
+#else
         __nv_bfloat16 scaled_gate = __hmul(alpha, gates[i / width]);
         __nv_bfloat16 delta = __hmul(scaled_gate, anchor[i]);
         states[i] = __hadd(states[i], delta);
+#endif
     }
 }
