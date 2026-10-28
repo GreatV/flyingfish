@@ -766,7 +766,7 @@ extern "C" __global__ void flash_decode_mq_phase2(float* __restrict__ scratch,
 #undef FD_MQ_P1_EXPORTS
 #undef FD_GUARD_MQ
 
-#if defined(__HIP__)
+#if defined(__HIP__) && defined(__GFX11__)
 namespace prefill {
 struct Problem {
   const bf16* q;
