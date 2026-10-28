@@ -714,13 +714,27 @@ fn proportional_and_default_rope_tables_match_the_definition_gpu() -> Result<()>
             let key = format!("rope.{tag}.h{heads}");
             let x = tensor(&data, &format!("{key}.x"))?;
             let reference = tensor(&data, &format!("{key}.out"))?;
+            let cos_ref = tensor(&data, &format!("rope.{tag}.cos"))?;
+            let sin_ref = tensor(&data, &format!("rope.{tag}.sin"))?;
             let out_floor: Vec<f32> = (0..positions.len() * heads * d)
                 .map(|e| {
                     let (row, lane) = (e / (heads * d), e % d);
                     let i = lane % half;
                     let base = e - lane;
-                    let operands = x[base + i].to_f32().abs() + x[base + half + i].to_f32().abs();
-                    cs_floor[row * half + i] * operands
+                    let (a, b) = (
+                        x[base + i].to_f32().abs(),
+                        x[base + half + i].to_f32().abs(),
+                    );
+                    let (c, sn) = (cos_ref[row * d + i].to_f32(), sin_ref[row * d + i].to_f32());
+                    let (fc, fs) = (
+                        cs_floor[row * half + i] + bf16_ulp(c),
+                        cs_floor[row * half + i] + bf16_ulp(sn),
+                    );
+                    let (cos_operand, sin_operand) = if lane < half { (a, b) } else { (b, a) };
+                    cos_operand * fc
+                        + sin_operand * fs
+                        + bf16_ulp(cos_operand * c.abs())
+                        + bf16_ulp(sin_operand * sn.abs())
                 })
                 .collect();
             let stats =
