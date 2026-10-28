@@ -2364,15 +2364,22 @@ mod tests {
                     }
                     engine.prefill_multimodal(&input, None)?;
                     let wrong = engine.decode_logits()?;
-                    let detected = !image_compare(
+                    let oracle_detected = !image_compare(
                         &format!("control{control}_image_candidate"),
                         &wrong,
                         &oracle_prefill,
                         prefill_limits,
                     )?;
+                    let r3_detected = !image_compare(
+                        &format!("control{control}_image_r3_candidate"),
+                        &wrong,
+                        &reference[..65536],
+                        image_limits(&case_floor["T"]["prefill_last_logits"])?,
+                    )?;
+                    let detected = oracle_detected || r3_detected;
                     defects += usize::from(!detected);
                     println!(
-                        "{} control{control}_image_logits_detected={detected}",
+                        "{} control{control}_image_logits_detected={detected} oracle_detected={oracle_detected} r3_detected={r3_detected}",
                         if detected { "PASS" } else { "DEFECT" }
                     );
                     let runtime = engine.recurrent.as_mut().context("recurrent runtime")?;
