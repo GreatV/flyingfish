@@ -339,7 +339,6 @@ impl Closure {
         );
         Ok(false)
     }
-    #[cfg(feature = "cuda")]
     pub(super) fn measurement(&self) -> Result<()> {
         if self.stage.get() != Stage::Setup || !self.write {
             if self.stage.get() == Stage::Ready {

@@ -1,5 +1,7 @@
 //! BF16 HIP library plans are bound by library algorithm index, not heuristic order.
-use crate::backend::gpu::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+use crate::backend::gpu::{
+    CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, PushKernelArg,
+};
 use crate::backend::{hip::drop_result, setup::LinearShape};
 use anyhow::{Context, Result, ensure};
 use half::bf16;
@@ -143,13 +145,21 @@ pub struct Identity {
     pub binary: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Implementation {
+    Library,
+    Wmma,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Choice {
     pub identity: Identity,
     pub shape: LinearShape,
     pub bias: bool,
     pub algorithm: Option<i32>,
     pub workspace: usize,
+    pub implementation: Implementation,
+    pub setup_median_ms: Option<[f64; 2]>,
 }
 
 struct Plan {
@@ -195,6 +205,7 @@ pub struct Blas {
     lt: Handle,
     identity: Identity,
     workspace: CudaSlice<u8>,
+    skinny: Option<CudaFunction>,
     // Every plan accumulates in FP32 and adds bias before the BF16 output rounding.
     plans: RefCell<BTreeMap<(LinearShape, Option<u64>), Plan>>,
 }
@@ -213,12 +224,26 @@ impl Blas {
             binary: binary_key()?,
         };
         let workspace = stream.alloc_zeros(4 * 1024 * 1024)?;
+        let skinny = if stream.context().supports_wmma() {
+            let function = crate::backend::gpu::cubin::module(stream.context(), "gemm_skinny")?
+                .load_function("gemm_skinny_bf16")?;
+            ensure!(
+                function.max_threads_per_block()? >= 128
+                    && p.shared_bytes >= 8192
+                    && function.occupancy_max_active_blocks_per_multiprocessor(128, 0, None)? > 0,
+                "HIP BF16 WMMA requires 128 threads and 8192 bytes resident LDS"
+            );
+            Some(function)
+        } else {
+            None
+        };
         let mut result = Self {
             stream,
             handle: std::ptr::null_mut(),
             lt: std::ptr::null_mut(),
             identity,
             workspace,
+            skinny,
             plans: RefCell::new(BTreeMap::new()),
         };
         unsafe {
@@ -277,6 +302,7 @@ impl Blas {
                     && frozen.bias == bias.is_some(),
                 "HIP frozen algorithm identity/shape/epilogue mismatch"
             );
+            self.validate_choice(frozen)?;
         }
         let key = (shape, bias.as_ref().map(|b| b.device_ptr(&self.stream).0));
         if let Some(plan) = self.plans.borrow().get(&key) {
@@ -301,6 +327,8 @@ impl Blas {
                 bias: bias.is_some(),
                 algorithm: None,
                 workspace: 0,
+                implementation: frozen.map_or(Implementation::Library, |c| c.implementation),
+                setup_median_ms: frozen.and_then(|c| c.setup_median_ms),
             },
             bias,
         };
@@ -466,6 +494,9 @@ impl Blas {
         let plan = plans
             .get(&key)
             .context("HIP linear shape/bias binding not prepared")?;
+        if plan.choice.implementation == Implementation::Wmma {
+            return self.wmma((shape, shape.input), bias, weight, input, output);
+        }
         ensure!(
             weight.len()
                 == shape
@@ -544,6 +575,177 @@ impl Blas {
             }
         }
         Ok(())
+    }
+
+    fn validate_choice(&self, choice: &Choice) -> Result<()> {
+        if choice.implementation == Implementation::Wmma {
+            self.stream.context().require_wmma()?;
+            ensure!(
+                self.wmma_candidate(choice.shape) && choice.setup_median_ms.is_some(),
+                "HIP WMMA choice lacks supported shape or setup trials"
+            );
+        }
+        if let Some(times) = choice.setup_median_ms {
+            ensure!(
+                self.wmma_candidate(choice.shape)
+                    && times.iter().all(|t| t.is_finite() && *t > 0.0)
+                    && choice.implementation
+                        == if times[1] < times[0] {
+                            Implementation::Wmma
+                        } else {
+                            Implementation::Library
+                        },
+                "HIP linear setup candidate times/winner mismatch"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn wmma_candidate(&self, shape: LinearShape) -> bool {
+        self.skinny.is_some()
+            && (1..=16).contains(&shape.rows)
+            && shape.input > 0
+            && shape.output > 0
+            && shape.input <= i32::MAX as usize - 127
+            && shape.output <= i32::MAX as usize - 15
+    }
+
+    pub fn wmma(
+        &self,
+        layout: (LinearShape, usize),
+        bias: Option<&CudaSlice<bf16>>,
+        weight: &impl DevicePtr<bf16>,
+        input: &impl DevicePtr<bf16>,
+        output: &mut impl DevicePtrMut<bf16>,
+    ) -> Result<()> {
+        self.stream.context().require_wmma()?;
+        let (shape, stride) = layout;
+        ensure!(
+            self.wmma_candidate(shape) && stride >= shape.input,
+            "HIP WMMA shape/stride unsupported"
+        );
+        let required = (shape.output - 1)
+            .checked_mul(stride)
+            .and_then(|n| n.checked_add(shape.input))
+            .context("HIP WMMA weight extent overflow")?;
+        ensure!(
+            weight.len() >= required
+                && input.len() == shape.rows * shape.input
+                && output.len() == shape.rows * shape.output,
+            "HIP WMMA storage extent mismatch"
+        );
+        weight.check_stream(&self.stream)?;
+        input.check_stream(&self.stream)?;
+        output.check_stream(&self.stream)?;
+        let bias_ptr = if let Some(bias) = bias {
+            bias.check_stream(&self.stream)?;
+            ensure!(bias.len() == shape.output, "HIP WMMA bias width mismatch");
+            bias.device_ptr(&self.stream).0
+        } else {
+            0
+        };
+        let function = self
+            .skinny
+            .as_ref()
+            .context("HIP WMMA function not bound")?;
+        let (w, _w) = weight.device_ptr(&self.stream);
+        let (x, _x) = input.device_ptr(&self.stream);
+        let (y, _y) = output.device_ptr_mut(&self.stream);
+        unsafe {
+            self.stream
+                .launch_builder(function)
+                .arg(&w)
+                .arg(&x)
+                .arg(&y)
+                .arg(&bias_ptr)
+                .arg(&(shape.output as i32))
+                .arg(&(shape.input as i32))
+                .arg(&(stride as u64))
+                .arg(&(shape.rows as i32))
+                .launch(crate::backend::gpu::ops::grid(
+                    shape.output.div_ceil(16),
+                    128,
+                ))?;
+        }
+        Ok(())
+    }
+
+    pub fn calibrate_shape(
+        &self,
+        shape: LinearShape,
+        weight: &impl DevicePtr<bf16>,
+        input: &impl DevicePtr<bf16>,
+    ) -> Result<Choice> {
+        let mut choice = self.prepare_choice(shape, None, None)?;
+        if !self.wmma_candidate(shape) {
+            return Ok(choice);
+        }
+        ensure!(
+            choice.setup_median_ms.is_none(),
+            "HIP linear shape already calibrated"
+        );
+        let mut output = self.stream.alloc_zeros::<bf16>(shape.rows * shape.output)?;
+        self.linear_with_bias(shape, None, weight, input, &mut output)?;
+        let reference = self.stream.clone_dtoh(&output)?;
+        self.wmma((shape, shape.input), None, weight, input, &mut output)?;
+        let actual = self.stream.clone_dtoh(&output)?;
+        ensure!(
+            reference.iter().chain(&actual).all(|v| v.is_finite()),
+            "HIP linear setup produced nonfinite output"
+        );
+        let signal: f64 = reference
+            .iter()
+            .map(|v| f64::from(v.to_f32()).powi(2))
+            .sum();
+        ensure!(signal > 0.0, "HIP linear setup has zero reference signal");
+        let error: f64 = reference
+            .iter()
+            .zip(&actual)
+            .map(|(a, b)| (f64::from(a.to_f32()) - f64::from(b.to_f32())).powi(2))
+            .sum();
+        let bound = crate::backend::cuda::bf16_chain_bound(1, &[shape.input]);
+        ensure!(
+            (error / signal).sqrt() <= bound,
+            "HIP WMMA setup exceeds BF16 numerical bound {bound}"
+        );
+        let begin = self.stream.context().new_event(None)?;
+        let end = self.stream.context().new_event(None)?;
+        let mut times = [0.0; 2];
+        for (candidate, median) in times.iter_mut().enumerate() {
+            let mut samples = Vec::with_capacity(12);
+            for sample in 0..14 {
+                begin.record(&self.stream)?;
+                if candidate == 0 {
+                    self.linear_with_bias(shape, None, weight, input, &mut output)?;
+                } else {
+                    self.wmma((shape, shape.input), None, weight, input, &mut output)?;
+                }
+                end.record(&self.stream)?;
+                end.synchronize()?;
+                if sample >= 2 {
+                    samples.push(f64::from(begin.elapsed_ms(&end)?));
+                }
+            }
+            samples.sort_by(f64::total_cmp);
+            *median = (samples[5] + samples[6]) * 0.5;
+        }
+        choice.setup_median_ms = Some(times);
+        choice.implementation = if times[1] < times[0] {
+            Implementation::Wmma
+        } else {
+            Implementation::Library
+        };
+        self.validate_choice(&choice)?;
+        self.plans
+            .borrow_mut()
+            .get_mut(&(shape, None))
+            .context("HIP calibrated plan missing")?
+            .choice = choice.clone();
+        eprintln!(
+            "{}",
+            serde_json::json!({"hip_linear_setup":{"choice":choice,"samples":12,"untuned":true,"relative_rmse":(error/signal).sqrt()}})
+        );
+        Ok(choice)
     }
 }
 

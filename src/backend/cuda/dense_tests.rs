@@ -112,6 +112,20 @@ fn dense_runtime_gpu() -> Result<()> {
     conversion_gate(&ctx, &s, &mut gate)?;
     #[cfg(feature = "rocm")]
     blas_gate(&s, &mut gate)?;
+    #[cfg(feature = "rocm")]
+    {
+        let supports_wmma = ctx.supports_wmma();
+        let info = ctx.device_info()?;
+        ensure!(
+            wmma_cells(&info) == supports_wmma,
+            "RUNNER_FAIL gate WMMA selection differs from runtime capability"
+        );
+        if wmma_cells(&info) {
+            wmma_gate(&s, &mut gate)?;
+        } else {
+            println!("WMMA cells NOT_COVERED arch={}", info.arch);
+        }
+    }
     s.synchronize()?;
     println!(
         "DENSE_RUNTIME_RESULT cells={} defects={} result={}",
@@ -996,6 +1010,202 @@ fn blas_gate(s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
                         .is_err(),
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "rocm")]
+fn wmma_cells(info: &crate::backend::setup::DeviceInfo) -> bool {
+    use crate::backend::setup::DeviceArchitecture;
+    info.warp == 32
+        && matches!(&info.arch, DeviceArchitecture::Hip(gfx) if gfx.starts_with("gfx11"))
+}
+
+#[cfg(feature = "rocm")]
+#[test]
+fn dense_cells_exclude_unsupported_wmma() {
+    use crate::backend::setup::{DeviceArchitecture, DeviceInfo};
+    let mut info = DeviceInfo {
+        name: "gate fixture".into(),
+        arch: DeviceArchitecture::Hip("gfx1100".into()),
+        sms: 48,
+        l2_bytes: 6 * 1024 * 1024,
+        warp: 32,
+        max_threads: 1024,
+        shared_bytes: 65536,
+        sm_shared_bytes: 65536,
+        cooperative: true,
+        optin_shared_bytes: 65536,
+        memory_bytes_per_second: 1.0,
+    };
+    assert!(wmma_cells(&info));
+    for gfx in ["gfx1030", "gfx1200"] {
+        info.arch = DeviceArchitecture::Hip(gfx.into());
+        assert!(
+            !wmma_cells(&info),
+            "unsupported WMMA cells selected for {gfx}"
+        );
+    }
+    info.arch = DeviceArchitecture::Hip("gfx1100".into());
+    info.warp = 64;
+    assert!(!wmma_cells(&info));
+}
+
+#[cfg(feature = "rocm")]
+fn wmma_gate(s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
+    use crate::backend::setup::LinearShape;
+    let blas = blas::Blas::new(s.clone())?;
+    s.context().require_wmma()?;
+    for (output, input, padding) in [
+        (19usize, 259usize, 0usize),
+        (23, 269, 8),
+        (2560, 2048, 0),
+        (2048, 2048, 0),
+        (12288, 2048, 0),
+        (2048, 6144, 0),
+        (130560, 2048, 0),
+    ] {
+        let stride = input + padding;
+        for period in [257, 263] {
+            ensure!(
+                input % period != 0 && stride % period != 0 && output % period != 0,
+                "RUNNER_FAIL WMMA fixture period divides a matrix stride"
+            );
+        }
+        let weights = pattern(output * stride, 137);
+        let dw = s.clone_htod(&weights)?;
+        for rows in [1usize, 3, 7, 8, 15, 16] {
+            let shape = LinearShape {
+                rows,
+                output,
+                input,
+            };
+            let mut values = pattern(rows * input, 173);
+            let sparse = output >= 2048;
+            if sparse {
+                for (i, value) in values.iter_mut().enumerate() {
+                    let row = i / input;
+                    let k = i % input;
+                    if !(0..7).any(|j| (row * 263 + j * 257 + 17) % input == k) {
+                        *value = bf16::ZERO;
+                    }
+                }
+            }
+            let dx = s.clone_htod(&values)?;
+            let bias = pattern(output, 181);
+            let db = s.clone_htod(&bias)?;
+            let expected: Vec<_> = (0..rows)
+                .flat_map(|row| {
+                    let terms: Vec<_> = if sparse {
+                        (0..7).map(|j| (row * 263 + j * 257 + 17) % input).collect()
+                    } else {
+                        (0..input).collect()
+                    };
+                    let w = &weights;
+                    let x = &values;
+                    let b = &bias;
+                    (0..output).map(move |o| {
+                        let sum: f64 = terms
+                            .iter()
+                            .map(|&k| {
+                                f64::from(w[o * stride + k].to_f32())
+                                    * f64::from(x[row * input + k].to_f32())
+                            })
+                            .sum();
+                        bf16::from_f32((sum + f64::from(b[o].to_f32())) as f32)
+                    })
+                })
+                .collect();
+            let canary = bf16::from_bits(0x42a5);
+            let mut dy = s.clone_htod(&vec![canary; rows * output + 34])?;
+            blas.wmma(
+                (shape, stride),
+                Some(&db),
+                &dw,
+                &dx,
+                &mut dy.slice_mut(17..17 + rows * output),
+            )?;
+            let actual = s.clone_dtoh(&dy)?;
+            gate.check(
+                "wmma.output_canaries",
+                actual[..17]
+                    .iter()
+                    .chain(&actual[17 + rows * output..])
+                    .all(|v| v.to_bits() == canary.to_bits()),
+            );
+            gate.compare(
+                &format!("wmma.rows{rows}.W[{output},{stride}].K{input}"),
+                &actual[17..17 + rows * output],
+                &expected,
+                2,
+                input,
+            )?;
+            if padding > 0 && rows == 7 {
+                blas.wmma(
+                    (shape, stride - 1),
+                    Some(&db),
+                    &dw,
+                    &dx,
+                    &mut dy.slice_mut(17..17 + rows * output),
+                )?;
+                let mutant = s.clone_dtoh(&dy)?;
+                let error = mutant[17..17 + rows * output]
+                    .iter()
+                    .zip(&expected)
+                    .map(|(a, b)| {
+                        f64::from((a.to_f32() - b.to_f32()).abs())
+                            / (1.0 + f64::from(b.to_f32().abs()))
+                    })
+                    .fold(0.0f64, f64::max);
+                gate.check(
+                    "mutant.wmma_weight_stride_rejected",
+                    error > crate::backend::cuda::bf16_chain_bound(2, &[input]) + 1e-5,
+                );
+            }
+        }
+    }
+    let shape = LinearShape {
+        rows: 3,
+        output: 5,
+        input: 128,
+    };
+    let mut weights = vec![bf16::ZERO; shape.output * shape.input];
+    for (o, first, second) in [
+        (0, 1.0, 0.00390625),
+        (1, 1.0, 0.01171875),
+        (2, f32::INFINITY, 0.0),
+        (3, f32::NAN, 0.0),
+        (4, f32::NEG_INFINITY, 0.0),
+    ] {
+        weights[o * shape.input] = bf16::from_f32(first);
+        weights[o * shape.input + 1] = bf16::from_f32(second);
+    }
+    let mut input = vec![bf16::ZERO; shape.rows * shape.input];
+    for row in 0..shape.rows {
+        input[row * shape.input..row * shape.input + 2].fill(bf16::ONE);
+    }
+    let dw = s.clone_htod(&weights)?;
+    let dx = s.clone_htod(&input)?;
+    let db = s.clone_htod(&vec![bf16::from_f32(0.00390625); shape.output])?;
+    let mut dy = s.alloc_zeros::<bf16>(shape.rows * shape.output)?;
+    for bias in [None, Some(&db)] {
+        blas.wmma((shape, shape.input), bias, &dw, &dx, &mut dy)?;
+        for (i, actual) in s.clone_dtoh(&dy)?.iter().enumerate() {
+            let o = i % shape.output;
+            let expected = bf16::from_f32(
+                weights[o * shape.input].to_f32()
+                    + weights[o * shape.input + 1].to_f32()
+                    + if bias.is_some() { 0.00390625 } else { 0.0 },
+            );
+            gate.check(
+                &format!("wmma.tie_nan_inf.bias{}.element{i}", bias.is_some()),
+                if expected.is_nan() {
+                    actual.is_nan()
+                } else {
+                    actual.to_bits() == expected.to_bits()
+                },
+            );
         }
     }
     Ok(())
