@@ -2941,7 +2941,6 @@ impl Engine {
         );
         ensure!(!ids.is_empty(), "empty input token ids");
         let all_layers = trace.as_ref().is_some_and(|t| t.all_layers);
-        #[cfg(feature = "cuda")]
         ensure!(
             !all_layers
                 || (self.qwen.is_some()
@@ -2950,8 +2949,6 @@ impl Engine {
                     && keep == ids.len()),
             "all-layer trace requires one complete Qwen prefill from position zero"
         );
-        #[cfg(feature = "rocm")]
-        ensure!(!all_layers, "HIP all-layer trace is unsupported");
         ensure!(
             self.position + ids.len() <= self.capacity,
             "prefill exceeds KV capacity"

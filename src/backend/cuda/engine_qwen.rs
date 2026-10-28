@@ -1980,6 +1980,8 @@ impl Engine {
         };
         let (prefill_backend, decode_backend) = if flint {
             ("FA2 d128 sliding/full", "flash decode d128")
+        } else if cfg!(feature = "rocm") {
+            ("TCMQA d256", "TCMQA d256")
         } else {
             ("native Rust d256", "TCMQA d256")
         };
