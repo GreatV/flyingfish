@@ -757,6 +757,21 @@ mod tests {
                 .as_f64()
                 .context("missing frozen attention limit")
         };
+        if lse_error > limit("lse_max")? {
+            let (index, (&actual, &expected)) = lse
+                .iter()
+                .zip(&reference_lse)
+                .enumerate()
+                .max_by(|(_, (a, b)), (_, (c, d))| {
+                    ((**a - **b).abs() / (1.0 + b.abs()))
+                        .total_cmp(&((**c - **d).abs() / (1.0 + d.abs())))
+                })
+                .context("LSE reference empty")?;
+            println!(
+                "FFA_LSE_DEFECT name={} row={} head={} actual={actual:.17e} expected={expected:.17e}",
+                case.name, selected[index / case.hq], index % case.hq
+            );
+        }
         defects += usize::from(
             maximum > limit("output_max")?
                 || rms > limit("output_rms")?
