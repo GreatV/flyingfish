@@ -1933,6 +1933,14 @@ mod tests {
             runtime_dir: None,
         };
         let mut engine = Engine::load(&dir, 0, 8192, None, settings)?;
+        let dump = std::env::var_os("FF_Q38_PROBE_DIR").map(PathBuf::from);
+        if let Some(out) = &dump {
+            std::fs::create_dir_all(out)?;
+            ensure!(
+                !out.canonicalize()?.starts_with(dir.canonicalize()?),
+                "probe output is inside model directory"
+            );
+        }
         let mut defects = 0;
         let mut media_outputs = Vec::new();
         for (case, rows, steps) in [
@@ -2035,11 +2043,18 @@ mod tests {
                 }
                 let mut trajectory = Vec::with_capacity(reference.len());
                 for step in 0..steps {
+                    let mut step_trace = Trace::default();
                     if step > 0 {
                         engine.set_token(tokens[step - 1])?;
-                        engine.decode(graph, None)?;
+                        let capture =
+                            (!graph && dump.is_some()).then_some((&mut step_trace, "decode"));
+                        engine.decode(graph, capture)?;
                     }
                     let actual = engine.decode_logits()?;
+                    if !graph && let Some(out) = &dump {
+                        step_trace.add("logits".into(), vec![65536], actual.clone())?;
+                        step_trace.save(&out.join(format!("{case}-step{step}.safetensors")))?;
+                    }
                     trajectory.extend_from_slice(&actual);
                     defects += usize::from(!compare(
                         &format!("{case} step={step} graph={graph}"),
