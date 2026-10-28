@@ -892,9 +892,12 @@ impl Slots {
             self.transfers.h2d.wait(&peer.synced)?;
             self.transfers.h2d.context().bind_to_thread()?;
         } else {
+            #[cfg(feature = "cuda")]
             let tables = self.bindings(layer as usize, &self.transfers.h2d)?;
+            #[cfg(feature = "rocm")]
+            let tables = self.bindings(layer as usize, self.gate_up.stream())?;
             let stream = &self.transfers.h2d;
-            // SAFETY: checked layer/expert extents and owned tables cover both scalar updates.
+            // SAFETY: table extents are checked; h2d waits prior readers and records publication completion.
             unsafe {
                 stream
                     .launch_builder(&self.publish)
