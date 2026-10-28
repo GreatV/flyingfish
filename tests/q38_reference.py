@@ -21,7 +21,7 @@ def load_model(directory):
           (5120, 64, 24, 4, 256, 248320), "Qwen published geometry mismatch")
     architecture = getattr(transformers, config.architectures[0])
     index = json.loads((directory / "model.safetensors.index.json").read_text())
-    native_bytes = index["metadata"]["total_size"]
+    native_bytes = sum((directory / shard).stat().st_size for shard in set(index["weight_map"].values()))
     free_bytes, _ = torch.cuda.mem_get_info()
     resident = native_bytes + 8 * 1024**3 <= free_bytes
     initialized, initialization_calls = [], []
