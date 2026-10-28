@@ -42,10 +42,9 @@ fn check(spec: &ModelSpec, e: &Expect) -> Result<()> {
             && spec.layers.len() == e.layers,
         "normalized Gemma 4 geometry: {spec:?}"
     );
-    let gemma4 = spec.gemma4.context("Gemma 4 head configuration missing")?;
     ensure!(
-        gemma4.softcap == 30.0 && gemma4.per_layer_input == 256,
-        "Gemma 4 head configuration: {gemma4:?}"
+        spec.logit_softcap == Some(30.0) && spec.per_layer_input == Some(256),
+        "Gemma 4 head configuration"
     );
     ensure!(
         spec.config().tie_word_embeddings && spec.config().hidden_act == "gelu_pytorch_tanh",
@@ -140,49 +139,33 @@ fn gemma4_reader_rejects_unsupported_configurations() -> Result<()> {
         mutant["text_config"][key] = value;
         mutant
     };
-    for (mutant, needle) in [
-        (text("attention_k_eq_v", json!(true)), "attention_k_eq_v"),
-        (text("enable_moe_block", json!(true)), "enable_moe_block"),
-        (
-            text("hidden_activation", json!("silu")),
-            "hidden_activation",
-        ),
-        (
-            text("final_logit_softcapping", json!(50.0)),
-            "final_logit_softcapping",
-        ),
-        (
-            text("num_kv_shared_layers", json!(35)),
-            "no KV-owning layer",
-        ),
-        (
-            text("unknown_field", json!(1)),
-            "unknown gemma4 text_config key unknown_field",
-        ),
-    ] {
-        let error = ModelSpec::gemma4(&mutant, &Value::Null)
-            .unwrap_err()
-            .to_string();
-        ensure!(error.contains(needle), "{needle}: {error}");
-    }
     let mut proportional = root.clone();
     proportional["text_config"]["rope_parameters"]["full_attention"]["rope_type"] =
         json!("default");
-    let error = ModelSpec::gemma4(&proportional, &Value::Null)
-        .unwrap_err()
-        .to_string();
-    ensure!(error.contains("rope_type"), "rope_type: {error}");
     let mut orphan = root.clone();
-    let types = orphan["text_config"]["layer_types"]
+    for kind in orphan["text_config"]["layer_types"]
         .as_array_mut()
-        .context("layer_types")?;
-    for kind in types.iter_mut().take(15) {
+        .context("layer_types")?
+        .iter_mut()
+        .take(15)
+    {
         *kind = json!("sliding_attention");
     }
-    let error = ModelSpec::gemma4(&orphan, &Value::Null)
-        .unwrap_err()
-        .to_string();
-    ensure!(error.contains("no publisher"), "publisher: {error}");
+    for (label, mutant) in [
+        ("k_eq_v", text("attention_k_eq_v", json!(true))),
+        ("moe", text("enable_moe_block", json!(true))),
+        ("activation", text("hidden_activation", json!("silu"))),
+        ("softcap", text("final_logit_softcapping", json!(50.0))),
+        ("no owner", text("num_kv_shared_layers", json!(35))),
+        ("unknown key", text("unknown_field", json!(1))),
+        ("rope type", proportional),
+        ("no publisher", orphan),
+    ] {
+        ensure!(
+            ModelSpec::gemma4(&mutant, &Value::Null).is_err(),
+            "{label} mutant was accepted"
+        );
+    }
     Ok(())
 }
 
@@ -192,7 +175,9 @@ fn existing_specs_serialize_without_the_gemma4_fields() -> Result<()> {
     let spec = ModelSpec::flint(&root, &json!({"eos_token_id": [150001]}))?;
     let text = serde_json::to_string(&spec)?;
     ensure!(
-        !text.contains("geometry") && !text.contains("gemma4"),
+        !text.contains("geometry")
+            && !text.contains("logit_softcap")
+            && !text.contains("per_layer_input"),
         "Flint spec serialization gained Gemma 4 fields"
     );
     Ok(())

@@ -481,12 +481,12 @@ impl MappedCheckpoint {
         spec: &crate::model_spec::ModelSpec,
         expected: &mut BTreeMap<String, ExpectedTensor>,
     ) -> Result<()> {
-        let config = spec
-            .gemma4
-            .context("Gemma 4 configuration missing from the spec")?;
         let hidden = spec.hidden as usize;
         let depth = spec.layers.len();
-        let ple = config.per_layer_input as usize;
+        let ple = spec
+            .per_layer_input
+            .context("Gemma 4 per-layer input width missing from the spec")?
+            as usize;
         let q_heads = spec.q_heads as usize;
         let kv_heads = spec.kv_heads as usize;
         let text = "model.language_model";

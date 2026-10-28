@@ -1109,7 +1109,8 @@ mod tests {
             }),
             glm5_next: None,
             deepseek_v41: None,
-            gemma4: None,
+            logit_softcap: None,
+            per_layer_input: None,
             vision: None,
         }
     }

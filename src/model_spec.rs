@@ -204,12 +204,6 @@ pub struct LayerGeometry {
     pub rope: RopeSpec,
     pub kv_reader: bool,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Gemma4Config {
-    pub softcap: f32,
-    pub per_layer_input: u32,
-}
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FfnKind {
     Dense,
@@ -243,7 +237,9 @@ pub struct ModelSpec {
     pub glm5_next: Option<Glm5NextConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deepseek_v41: Option<DeepseekV41Config>,
-    pub gemma4: Option<Gemma4Config>,
+    pub logit_softcap: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_layer_input: Option<u32>,
     #[serde(default)]
     pub vision: Option<VisionConfig>,
 }
@@ -1225,7 +1221,8 @@ impl ModelSpec {
             gdn: None,
             glm5_next: None,
             deepseek_v41: None,
-            gemma4: None,
+            logit_softcap: None,
+            per_layer_input: None,
             layers: (0..u(c.num_hidden_layers)?)
                 .map(|state_index| LayerPlan {
                     geometry: None,
@@ -1368,7 +1365,8 @@ impl ModelSpec {
             gdn: None,
             glm5_next: None,
             deepseek_v41: None,
-            gemma4: None,
+            logit_softcap: None,
+            per_layer_input: None,
             vision: None,
         })
     }
@@ -1616,7 +1614,8 @@ impl ModelSpec {
             gdn: None,
             glm5_next: None,
             deepseek_v41: None,
-            gemma4: None,
+            logit_softcap: None,
+            per_layer_input: None,
             vision: None,
         })
     }
@@ -1866,10 +1865,8 @@ impl ModelSpec {
             gdn: None,
             glm5_next: None,
             deepseek_v41: None,
-            gemma4: Some(Gemma4Config {
-                softcap: 30.0,
-                per_layer_input: 256,
-            }),
+            logit_softcap: Some(30.0),
+            per_layer_input: Some(256),
             vision: None,
         })
     }
@@ -2253,7 +2250,8 @@ impl ModelSpec {
                 routed_scaling_factor,
             }),
             deepseek_v41: None,
-            gemma4: None,
+            logit_softcap: None,
+            per_layer_input: None,
             vision: None,
         })
     }
@@ -2713,7 +2711,8 @@ impl ModelSpec {
             gdn: Some(text.gdn),
             glm5_next: None,
             deepseek_v41: None,
-            gemma4: None,
+            logit_softcap: None,
+            per_layer_input: None,
             vision,
         })
     }
