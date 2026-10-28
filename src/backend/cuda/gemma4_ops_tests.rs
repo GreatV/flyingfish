@@ -627,6 +627,20 @@ fn proportional_and_default_rope_tables_match_the_definition_gpu() -> Result<()>
     for (tag, d, spec) in [("sliding", 256usize, sliding), ("full", 512usize, full)] {
         let half = d / 2;
         let table = spec.table(d as u32, CAPACITY)?;
+        // |angle error| <= p * inv_i * 2^-24 (inverse frequency) + p * inv_i * 2^-24 (product), both F32 roundings.
+        let cs_floor: Vec<f32> = positions
+            .iter()
+            .flat_map(|&p| {
+                (0..half).map(move |i| {
+                    if (i as u32) < spec.pairs {
+                        let inv = 1.0 / spec.theta.powf((2 * i) as f32 / spec.denominator as f32);
+                        p as f32 * inv * 2f32.powi(-23)
+                    } else {
+                        0.0
+                    }
+                })
+            })
+            .collect();
         for (name, reference) in [("cos", 0usize), ("sin", half)] {
             let want = tensor(&data, &format!("rope.{tag}.{name}"))?;
             let got: Vec<bf16> = positions
@@ -641,7 +655,7 @@ fn proportional_and_default_rope_tables_match_the_definition_gpu() -> Result<()>
                 .chunks(d)
                 .flat_map(|row| row[..half].iter().copied())
                 .collect();
-            let stats = Stats::new(&got, &want_half)?;
+            let stats = Stats::with_floor(&got, &want_half, Some(&cs_floor))?;
             println!("GEMMA4_ROPE_TABLE {}", stats.line(&format!("{tag}.{name}")));
             defects += usize::from(!stats.passes());
         }
@@ -700,7 +714,17 @@ fn proportional_and_default_rope_tables_match_the_definition_gpu() -> Result<()>
             let key = format!("rope.{tag}.h{heads}");
             let x = tensor(&data, &format!("{key}.x"))?;
             let reference = tensor(&data, &format!("{key}.out"))?;
-            let stats = Stats::new(&run(&table_device, x, heads)?, reference)?;
+            let out_floor: Vec<f32> = (0..positions.len() * heads * d)
+                .map(|e| {
+                    let (row, lane) = (e / (heads * d), e % d);
+                    let i = lane % half;
+                    let base = e - lane;
+                    let operands = x[base + i].to_f32().abs() + x[base + half + i].to_f32().abs();
+                    cs_floor[row * half + i] * operands
+                })
+                .collect();
+            let stats =
+                Stats::with_floor(&run(&table_device, x, heads)?, reference, Some(&out_floor))?;
             println!("GEMMA4_ROPE {}", stats.line(&key));
             defects += usize::from(!stats.passes());
             for (name, mutant) in &mutants {
