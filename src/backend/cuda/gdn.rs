@@ -25,7 +25,7 @@ pub(crate) fn record_phase(which: &'static str) {
     PHASE_LOG.lock().unwrap().push(which);
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 pub(crate) fn take_phase_log() -> Vec<&'static str> {
     std::mem::take(&mut *PHASE_LOG.lock().unwrap())
 }

@@ -1,7 +1,7 @@
 //! Layer-major prefill over borrowed expert slots.
 use super::*;
 use crate::backend::cuda::moe::combine::MoeCombineRouted;
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 use crate::backend::cuda::moe::prefill::prefill_scratch_bytes;
 use crate::backend::cuda::moe::prefill::{
     LANE16_ROWS, MoePrefillContribute, MoePrefillFinish, PrefillOps, arithmetic_mask,
@@ -598,17 +598,17 @@ pub(in crate::backend::cuda::engine) fn cpu_bound(
 }
 
 impl Prefill {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(in crate::backend::cuda::engine) fn allocated_workspace_bytes(&self) -> u64 {
         self.gpu.scratch.len() as u64
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(in crate::backend::cuda::engine) fn capture_frequency(&self) -> Vec<Vec<f64>> {
         self.frequency.clone()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(in crate::backend::cuda::engine) fn capture_resident_limit(
         &self,
         rows: usize,
@@ -626,7 +626,7 @@ impl Prefill {
             .context("capture borrow exceeds resident slots")
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(in crate::backend::cuda::engine) fn reference_geometry(&self) -> [usize; 4] {
         [
             self.capacity.span_rows as usize,
@@ -636,7 +636,7 @@ impl Prefill {
         ]
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(in crate::backend::cuda::engine) fn reseed_request(&self, slots: &mut Slots) -> Result<()> {
         slots.end_request()?;
         slots.begin_request(&self.frequency)
@@ -1548,35 +1548,32 @@ impl PeerPrefill {
         let dst_weights = self.weights.device_ptr(stream).0;
         // SAFETY: source span views on GPU 0 and destination buffers on GPU 1 stay live and ordered on stream.
         unsafe {
-            cudarc::driver::sys::cuMemcpyPeerAsync(
+            copy::peer_raw(
                 dst_x,
-                self.device.ctx.cu_ctx(),
+                self.device.ctx.as_ref(),
                 src_x.ptr,
-                device.ctx.cu_ctx(),
+                device.ctx.as_ref(),
                 rows as usize * hidden * 2,
-                stream.cu_stream(),
+                stream.as_ref(),
             )
-            .result()
             .context("cuMemcpyPeerAsync prefill x 0->1")?;
-            cudarc::driver::sys::cuMemcpyPeerAsync(
+            copy::peer_raw(
                 dst_ids,
-                self.device.ctx.cu_ctx(),
+                self.device.ctx.as_ref(),
                 src_ids.ptr,
-                device.ctx.cu_ctx(),
+                device.ctx.as_ref(),
                 rows as usize * top_k * 4,
-                stream.cu_stream(),
+                stream.as_ref(),
             )
-            .result()
             .context("cuMemcpyPeerAsync prefill ids 0->1")?;
-            cudarc::driver::sys::cuMemcpyPeerAsync(
+            copy::peer_raw(
                 dst_weights,
-                self.device.ctx.cu_ctx(),
+                self.device.ctx.as_ref(),
                 src_weights.ptr,
-                device.ctx.cu_ctx(),
+                device.ctx.as_ref(),
                 rows as usize * top_k * 2,
-                stream.cu_stream(),
+                stream.as_ref(),
             )
-            .result()
             .context("cuMemcpyPeerAsync prefill weights 0->1")?;
         }
         let tables = self.tables.bindings(stream, 0, geometry.experts)?;
@@ -1713,15 +1710,14 @@ impl PeerPrefill {
         let src_routed = self.routed.device_ptr(stream).0;
         // SAFETY: source routed buffer on GPU 1 and destination span buffer on GPU 0 stay live and ordered on stream.
         unsafe {
-            cudarc::driver::sys::cuMemcpyPeerAsync(
+            copy::peer_raw(
                 dst_routed.ptr,
-                device.ctx.cu_ctx(),
+                device.ctx.as_ref(),
                 src_routed,
-                self.device.ctx.cu_ctx(),
+                self.device.ctx.as_ref(),
                 rows as usize * hidden * 2,
-                stream.cu_stream(),
+                stream.as_ref(),
             )
-            .result()
             .context("cuMemcpyPeerAsync prefill routed 1->0")?;
         }
         self.join_event.record(stream)?;
@@ -2823,7 +2819,7 @@ impl Gpu {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::super::super::tests::{
         graph_state, hybrid_spec, tier_capacity, tier_fixture, tier_service,

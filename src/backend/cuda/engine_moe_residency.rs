@@ -531,9 +531,9 @@ pub(in crate::backend::cuda::engine) struct Slots {
     readers: Vec<u32>,
     disk_cpu: Option<DiskExperts>,
     pub request_open: bool,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pending_reads: u64,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     delay_request: bool,
 }
 
@@ -572,7 +572,7 @@ fn check_lifetime(expected: [Option<u64>; 2], owned: [Option<u64>; 2]) -> Result
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 pub(super) fn delay_stream(stream: &Arc<CudaStream>) -> Result<()> {
     unsafe extern "C" fn delay(_: *mut std::ffi::c_void) {
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -758,9 +758,9 @@ impl Slots {
                 None
             },
             request_open: false,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             pending_reads: 0,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             delay_request: false,
         };
         let slots_new_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
@@ -1084,7 +1084,7 @@ impl Slots {
         self.moves
             .extend_from_slice(self.policy.begin_request(frequency)?);
         for index in 0..self.moves.len() {
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             if index + 1 == self.moves.len() && std::mem::take(&mut self.delay_request) {
                 delay_stream(&self.transfers.h2d)?;
             }
@@ -1095,7 +1095,7 @@ impl Slots {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(in crate::backend::cuda::engine) fn capture_placement(
         &self,
     ) -> Result<Vec<(Tier, Option<u32>)>> {
@@ -1115,7 +1115,7 @@ impl Slots {
         Ok(placement)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(in crate::backend::cuda::engine) fn pin_capture_request(
         &mut self,
         frequency: &[Vec<f64>],
@@ -1142,7 +1142,7 @@ impl Slots {
         self.policy.begin_token()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(in crate::backend::cuda::engine) fn freeze_probe_admissions(&mut self) -> Result<()> {
         self.transfers.finish()?;
         self.policy.freeze_probe_admissions()
@@ -1169,7 +1169,7 @@ impl Slots {
             });
         }
         for index in 0..self.moves.len() {
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             if index + 1 == self.moves.len() && std::mem::take(&mut self.delay_request) {
                 delay_stream(&self.transfers.h2d)?;
             }
@@ -1210,7 +1210,7 @@ impl Slots {
                         physical.copy.as_ref().is_some_and(|copy| copy.id == id),
                         "slot={slot} copy event differs from residency id={id}"
                     );
-                    #[cfg(test)]
+                    #[cfg(all(test, feature = "cuda"))]
                     if !physical
                         .copy
                         .as_ref()
@@ -1407,7 +1407,7 @@ impl Slots {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(super) fn finish_routed(
         &mut self,
         device: &Device,
@@ -1419,7 +1419,7 @@ impl Slots {
         self.complete(device, decode, layer, ffn, activation, None)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(super) fn trace(&self, trace: &mut Trace) -> Result<()> {
         let geometry = self.catalogue.geometry();
         self.policy.ledger().check()?;
@@ -1483,13 +1483,13 @@ impl Slots {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(super) fn delay_copies(&mut self) {
         self.delay_request = true;
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
 

@@ -375,7 +375,7 @@ impl DraftConfig {
         );
         Ok(rows.min(MAX_MOE_VERIFY_ROWS))
     }
-    #[cfg(any(feature = "cuda", test))]
+    #[cfg(any(feature = "cuda", feature = "rocm", test))]
     pub(crate) fn target_state_bytes(&self, spec: &crate::model_spec::ModelSpec) -> Result<usize> {
         let rows = self.target_rows(spec)?;
         let layers = spec
@@ -693,7 +693,7 @@ fn read_config(path: &Path) -> Result<serde_json::Value> {
     Ok(value)
 }
 
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
 pub(crate) fn read_capture_layers(path: &Path, target: &Config) -> Result<Vec<usize>> {
     let value = read_config(path)?;
     ensure!(

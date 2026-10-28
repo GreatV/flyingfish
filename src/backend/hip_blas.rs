@@ -855,6 +855,16 @@ impl Blas {
         Ok(())
     }
 
+    pub(crate) fn linear_typed(
+        &self,
+        phase: crate::op_contract::ExecutionPhase,
+        weight: crate::backend::gpu::linear::LinearWeightRef,
+        x: crate::backend::gpu::contracts::Tensor<bf16, 2>,
+        y: &mut crate::backend::gpu::contracts::TensorMut<bf16, 2>,
+    ) -> Result<()> {
+        self.linear_typed_bound(phase, weight, x, y, 0)
+    }
+
     pub(crate) fn linear_typed_bound(
         &self,
         phase: crate::op_contract::ExecutionPhase,

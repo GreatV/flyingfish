@@ -830,6 +830,7 @@ pub(crate) struct WeightCatalog {
     pub tensors: BTreeMap<String, StoredTensor>,
     pub manifest: TensorManifest,
     pub bytes: usize,
+    #[cfg(feature = "cuda")]
     pub upload_content_sha256: Option<String>,
     pub upload_hashed_bytes: Option<usize>,
     pub load_wall_ms: f64,
@@ -869,6 +870,7 @@ impl WeightCatalog {
         Self::load_inner(dir, spec, d, crate::checkpoint::LoadPolicy::TextOnly, false)
     }
 
+    #[cfg(feature = "cuda")]
     pub fn load_for_prefix_cache(
         dir: &Path,
         spec: &crate::model_spec::ModelSpec,
@@ -876,6 +878,7 @@ impl WeightCatalog {
     ) -> Result<Self> {
         Self::load_inner(dir, spec, d, crate::checkpoint::LoadPolicy::TextOnly, true)
     }
+    #[cfg(feature = "cuda")]
     pub fn load_with_policy(
         dir: &Path,
         spec: &crate::model_spec::ModelSpec,
@@ -972,6 +975,7 @@ impl WeightCatalog {
             tensors,
             manifest,
             bytes,
+            #[cfg(feature = "cuda")]
             upload_content_sha256: upload_digest.as_ref().map(|x| x.1.clone()),
             upload_hashed_bytes: upload_digest.map(|x| x.0),
             load_wall_ms,

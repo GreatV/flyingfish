@@ -426,7 +426,10 @@ impl Setup {
             failures.join("; ")
         );
         let registration = measured.host_registration_bytes;
+        #[cfg(feature = "cuda")]
         let (peer_device, peer_unsupported_sm) = device.peer_with_unsupported_sm()?;
+        #[cfg(feature = "rocm")]
+        let (peer_device, peer_unsupported_sm) = (device.peer()?, None::<u32>);
         let peer_inputs = if let Some(peer_dev) = &peer_device {
             peer_dev.ctx.bind_to_thread()?;
             let (peer_free, peer_total) = peer_dev.ctx.mem_get_info()?;
@@ -663,9 +666,11 @@ impl Setup {
         )?;
         let slots_load_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
         let phase_started = std::time::Instant::now();
-        let (send_ptr, _send_guard) = engine.work.n.device_ptr(&engine.device.stream);
+        let send_ptr = {
+            let (pointer, _guard) = engine.work.n.device_ptr(&engine.device.stream);
+            pointer
+        };
         let send_cap_bytes = engine.work.n.len() * size_of::<bf16>();
-        drop(_send_guard);
         let cpu_bounds = (
             cpu.0.max(self.decode_rows),
             cpu.1.max(self.decode_rows * geometry.top_k as usize),
@@ -762,6 +767,7 @@ pub(super) struct SlotBindings {
 }
 
 impl Engine {
+    #[cfg(feature = "cuda")]
     pub(super) fn bind_invariant_arithmetic(&mut self) -> Result<()> {
         self.closure.bind_fixed()?;
         let executor = self
@@ -935,7 +941,7 @@ pub(super) struct PeerDecode {
     pub bounce: PeerBounce,
     pub fork: CudaEvent,
     pub join: CudaEvent,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub perturb_word: Option<(usize, u16)>,
 }
 
@@ -1144,7 +1150,7 @@ impl Decode {
                 bounce,
                 fork: context.new_event(untimed)?,
                 join: pctx.new_event(untimed)?,
-                #[cfg(test)]
+                #[cfg(all(test, feature = "cuda"))]
                 perturb_word: None,
             };
             context.bind_to_thread()?;
@@ -1456,7 +1462,7 @@ impl Decode {
         ))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub fn finish(
         &mut self,
         device: &Device,
@@ -2029,7 +2035,7 @@ impl Decode {
                 )
                 .context("cuMemcpyHtoDAsync decode peer routed h->0")?;
             }
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             if let Some((word_idx, bits)) = peer.perturb_word {
                 ensure!(
                     word_idx < rows * hidden,
@@ -2319,10 +2325,10 @@ fn validate_dispatch(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 #[path = "engine_moe_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 #[path = "engine_moe_e2e.rs"]
 mod e2e;

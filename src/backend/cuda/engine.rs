@@ -1,9 +1,7 @@
-#[cfg(feature = "cuda")]
 use super::copy;
 #[cfg(feature = "cuda")]
 use super::flash::Flash;
 use crate::backend::TreeBuilder;
-#[cfg(feature = "cuda")]
 use crate::backend::gpu::{CudaContext, PinnedHostSlice};
 use crate::backend::gpu::{CudaGraph, CudaSlice, CudaStream, DevicePtrMut, PushKernelArg};
 #[cfg(feature = "cuda")]
@@ -40,7 +38,6 @@ use std::{
 };
 
 #[path = "engine_moe.rs"]
-#[cfg(feature = "cuda")]
 mod moe;
 #[path = "engine_mtp.rs"]
 #[cfg(feature = "cuda")]
@@ -53,7 +50,6 @@ mod mtp_generate;
 #[cfg(feature = "cuda")]
 mod mtp_launch_tests;
 #[path = "engine_qwen.rs"]
-#[cfg(feature = "cuda")]
 mod qwen;
 #[path = "engine_recurrent.rs"]
 #[cfg(feature = "cuda")]
@@ -381,13 +377,11 @@ struct Spec {
     tree_draft_graph: Option<CudaGraph>,
     draft_graph: Option<CudaGraph>,
     verify_graph: Option<CudaGraph>,
-    #[cfg(feature = "cuda")]
     moe_verify_graphs: std::collections::BTreeMap<usize, CudaGraph>,
     inject_graphs: Vec<Option<CudaGraph>>,
     tree: Option<super::tree::State>,
     tree_attention: Option<super::verification::Verification>,
     max_verify_rows: usize,
-    #[cfg(feature = "cuda")]
     non_expert_decode_bytes: u64,
     verify_schedule: crate::dspark::VerifyCostSchedule,
     cold_verify_schedule: crate::dspark::VerifyCostSchedule,
@@ -399,7 +393,6 @@ struct Spec {
     predictions: CudaSlice<u32>,
     row_counts: CudaSlice<i32>,
     checkpoint: Option<super::state::StateCheckpoint>,
-    #[cfg(feature = "cuda")]
     gdn_inputs: Vec<super::state::GdnVerifyInput>,
 }
 
@@ -456,7 +449,6 @@ impl Spec {
                 super::state::StateCheckpoint::new(&engine.state, &engine.model_spec, rows, stream)
             })
             .transpose()?;
-        #[cfg(feature = "cuda")]
         let gdn_inputs = if checkpoint.is_some() {
             let gdn_spec = crate::op_contract::GdnSpec::from_model(&engine.model_spec)?;
             engine
@@ -488,7 +480,6 @@ impl Spec {
             },
             tree_attention: None,
             max_verify_rows,
-            #[cfg(feature = "cuda")]
             non_expert_decode_bytes: 0,
             verify_schedule: crate::dspark::VerifyCostSchedule::UNCONSTRAINED,
             cold_verify_schedule: crate::dspark::VerifyCostSchedule::UNCONSTRAINED,
@@ -496,7 +487,6 @@ impl Spec {
             graph: engine.spec_graph,
             draft_graph: None,
             verify_graph: None,
-            #[cfg(feature = "cuda")]
             moe_verify_graphs: std::collections::BTreeMap::new(),
             inject_graphs: (0..max_verify_rows).map(|_| None).collect(),
             verification: None,
@@ -505,10 +495,8 @@ impl Spec {
             predictions: stream.alloc_zeros(rows)?,
             row_counts,
             checkpoint,
-            #[cfg(feature = "cuda")]
             gdn_inputs,
         };
-        #[cfg(feature = "cuda")]
         if let Some(checkpoint) = &spec.checkpoint {
             let actual = checkpoint.bytes()
                 + spec
@@ -543,13 +531,9 @@ impl Spec {
 #[serde(rename_all = "snake_case")]
 enum Graph {
     Decode,
-    #[cfg(feature = "cuda")]
     MoeRoute(usize),
-    #[cfg(feature = "cuda")]
     MoeContribute(usize),
-    #[cfg(feature = "cuda")]
     MoeJoin(usize),
-    #[cfg(feature = "cuda")]
     MoePeerTail(usize),
     Draft,
     Verify,
@@ -612,14 +596,12 @@ fn load_dispatch(architecture: crate::model_spec::Architecture) -> Result<LoadDi
 }
 
 pub struct Engine {
-    #[cfg(feature = "cuda")]
     qwen_device_prefix: bool,
     #[cfg(test)]
     capture_fail_after_layer: Option<(usize, usize)>,
     #[cfg(test)]
     capture_fail_stage: Option<CaptureFault>,
-    #[cfg(test)]
-    #[cfg(feature = "cuda")]
+    #[cfg(all(test, feature = "cuda"))]
     flint_window_capture: Option<(Vec<usize>, Vec<usize>, PathBuf)>,
     forward_rows: std::collections::BTreeSet<usize>,
     graphs: Vec<Graph>,
@@ -634,21 +616,15 @@ pub struct Engine {
     runtime: PathBuf,
     spec: Option<Spec>,
     hidden_capture: Option<HiddenCapture>,
-    #[cfg(feature = "cuda")]
     qwen: Option<qwen::Runtime>,
     #[cfg(feature = "cuda")]
     recurrent: Option<recurrent::Runtime>,
-    #[cfg(feature = "cuda")]
     moe: Option<moe::Decode>,
-    #[cfg(feature = "cuda")]
     moe_slots: Option<moe::Slots>,
-    #[cfg(feature = "cuda")]
     moe_prefill: Option<moe::Prefill>,
     #[cfg(test)]
-    #[cfg(feature = "cuda")]
     moe_test_ffn: Option<super::linear::BoundFfn>,
-    #[cfg(test)]
-    #[cfg(feature = "cuda")]
+    #[cfg(all(test, feature = "cuda"))]
     flint_legacy_overflow_prefill: bool,
     #[cfg(feature = "cuda")]
     flint_frozen_decode_length: bool,
@@ -669,7 +645,6 @@ pub struct Engine {
     #[cfg(feature = "cuda")]
     flash: Option<Flash>,
     decode: Option<Attention>,
-    #[cfg(feature = "cuda")]
     flint_logits: Option<CudaSlice<f32>>,
     device: Device,
     config: Config,
@@ -1105,25 +1080,17 @@ impl Engine {
             #[cfg(feature = "cuda")]
             capture_fail_stage: None,
             #[cfg(test)]
-            #[cfg(feature = "cuda")]
             flint_window_capture: None,
-            #[cfg(feature = "cuda")]
             qwen: None,
             #[cfg(feature = "cuda")]
             recurrent: None,
-            #[cfg(feature = "cuda")]
             moe: None,
-            #[cfg(feature = "cuda")]
             moe_slots: None,
-            #[cfg(feature = "cuda")]
             moe_prefill: None,
             #[cfg(test)]
-            #[cfg(feature = "cuda")]
             moe_test_ffn: None,
             #[cfg(test)]
-            #[cfg(feature = "cuda")]
             flint_legacy_overflow_prefill: false,
-            #[cfg(feature = "cuda")]
             flint_frozen_decode_length: false,
             #[cfg(feature = "cuda")]
             mtp: None,
@@ -1133,7 +1100,6 @@ impl Engine {
             mtp_epoch: 0,
             #[cfg(feature = "cuda")]
             images: None,
-            #[cfg(feature = "cuda")]
             qwen_device_prefix: false,
             forward_rows: std::collections::BTreeSet::new(),
             #[cfg(feature = "cuda")]
@@ -1166,7 +1132,6 @@ impl Engine {
             #[cfg(feature = "cuda")]
             flash: Some(flash),
             decode: None,
-            #[cfg(feature = "cuda")]
             flint_logits: None,
             device,
             config,
@@ -1342,13 +1307,11 @@ impl Engine {
         self.grow_rows(rows, plan.chunk).with_context(|| {
             format!("allocate prefill workspace: required={required} available={available}")
         })?;
-        #[cfg(feature = "cuda")]
         self.prepare_prefill_plans()?;
         self.poisoned = false;
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     fn prepare_prefill_plans(&mut self) -> Result<()> {
         if self.qwen.is_none() {
             self.prepare(self.chunk)?;
@@ -1454,7 +1417,6 @@ impl Engine {
             if self.spec.as_ref().is_some_and(|spec| !spec.graph) {
                 break 'plans Vec::new();
             }
-            #[cfg(feature = "cuda")]
             if self.model_spec.moe.is_some() {
                 let widths = match &self.spec {
                     Some(spec) => crate::dspark::MIN_MOE_VERIFY_ROWS..=spec.max_verify_rows,
@@ -1543,14 +1505,12 @@ impl Engine {
         };
         match graph {
             Graph::Decode => self.graph.is_some(),
-            #[cfg(feature = "cuda")]
             Graph::MoeRoute(_)
             | Graph::MoeContribute(_)
             | Graph::MoeJoin(_)
             | Graph::MoePeerTail(_) => false,
             Graph::Draft => spec.draft_graph.is_some(),
             Graph::Verify => {
-                #[cfg(feature = "cuda")]
                 if self.model_spec.moe.is_some() {
                     return self.has_moe_verify_graphs();
                 }
@@ -1566,7 +1526,6 @@ impl Engine {
         }
     }
     fn spec_verify_graph_ready(&self) -> bool {
-        #[cfg(feature = "cuda")]
         if self.has_moe_segments() {
             return true;
         }
@@ -1657,7 +1616,6 @@ impl Engine {
             self.recurrent.is_none(),
             "recurrent execution requires the prefix/decode program"
         );
-        #[cfg(feature = "cuda")]
         if self.qwen.is_some() {
             ensure!(
                 matches!(step.mask, crate::backend::Mask::Causal)
@@ -1726,7 +1684,6 @@ impl Engine {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     pub fn run_step(
         &mut self,
         step: crate::backend::Step<'_>,
@@ -1738,7 +1695,7 @@ impl Engine {
         }
         let result = self.run_step_inner(step, trace);
         self.qwen_device_prefix = previous;
-        if self.qwen.is_some() && result.is_err() {
+        if (cfg!(feature = "rocm") || self.qwen.is_some()) && result.is_err() {
             self.poisoned = true;
         }
         result
@@ -1764,7 +1721,6 @@ impl Engine {
                     crate::linear_plan::MAX_SKINNY_ROWS
                 );
                 self.ensure_verification()?;
-                #[cfg(feature = "cuda")]
                 if self.qwen.is_some() {
                     self.state.set_sequence(
                         &self.device.stream,
@@ -1775,7 +1731,6 @@ impl Engine {
                 }
             }
         }
-        #[cfg(feature = "cuda")]
         if let Some(slots) = self.moe_slots.as_mut() {
             slots.begin_token()?;
         }
@@ -1786,14 +1741,12 @@ impl Engine {
             }
             self.run_operator(crate::backend::Operator::Head, 0, step, &mut trace)
         })();
-        #[cfg(feature = "cuda")]
         let completed = if let Some(slots) = self.moe_slots.as_mut() {
             slots.finish_token()
         } else {
             Ok(())
         };
         executed?;
-        #[cfg(feature = "cuda")]
         completed?;
         if step.head == Head::None {
             self.logits_cache.invalidate();
@@ -1974,7 +1927,6 @@ impl Engine {
             layer < self.config.num_hidden_layers,
             "backend layer {layer} is outside model"
         );
-        #[cfg(feature = "cuda")]
         if self.qwen.is_some() {
             self.qwen_layer_begin(layer, step)?;
         }
@@ -2028,7 +1980,6 @@ impl Engine {
     ) -> Result<()> {
         use crate::model_spec::{Architecture, Mixer};
         match (self.model_spec.architecture, mixer) {
-            #[cfg(feature = "cuda")]
             (Architecture::Qwen35Text | Architecture::MiniCpmV47 | Architecture::Flint, _) => {
                 self.qwen_mixer(layer, step, trace)
             }
@@ -2052,7 +2003,6 @@ impl Engine {
         }
         self.ensure_decode()?;
         self.forward(1, true, true, trace)?;
-        #[cfg(feature = "cuda")]
         if self.qwen.is_some() {
             return self.qwen_advance();
         }
@@ -2071,7 +2021,6 @@ impl Engine {
             i < self.config.num_hidden_layers,
             "backend operator layer {i} is outside model"
         );
-        #[cfg(feature = "cuda")]
         if self.qwen.is_some() {
             return self.qwen_operator(op, i, step, trace);
         }
@@ -2436,19 +2385,19 @@ impl Engine {
     }
 
     pub fn reset(&mut self) -> Result<()> {
-        #[cfg(feature = "cuda")]
         self.check_moe_reset()?;
         self.poisoned = true;
-        #[cfg(feature = "cuda")]
         {
             if let Some(slots) = self.moe_slots.as_mut()
                 && slots.request_open
             {
                 slots.end_request()?;
             }
+            #[cfg(feature = "cuda")]
             if let Some(chain) = self.mtp.as_mut() {
                 chain.invalidate_verify();
             }
+            #[cfg(feature = "cuda")]
             {
                 self.mtp_epoch = self
                     .mtp_epoch
@@ -2459,11 +2408,12 @@ impl Engine {
             if let Some(decode) = self.moe.as_mut() {
                 decode.reset()?;
             }
-            self.images = None;
+            #[cfg(feature = "cuda")]
+            {
+                self.images = None;
+            }
             self.reset_qwen_positions()?;
         }
-        #[cfg(feature = "rocm")]
-        self.device.stream.synchronize()?;
         self.state.reset(&self.device.stream)?;
         if let Some(spec) = self.spec.as_mut() {
             spec.active_rows = 0;
@@ -3002,7 +2952,6 @@ impl Engine {
             ids.iter().all(|&x| (x as usize) < self.config.vocab_size),
             "input token id outside vocabulary"
         );
-        #[cfg(feature = "cuda")]
         if self.model_spec.moe.is_some() {
             return self.prefill_moe_chunks(ids, trace, keep, &mut after_chunk);
         }
@@ -3020,7 +2969,6 @@ impl Engine {
             let skip = trace_start.saturating_sub(self.position).min(chunk.len());
             let selected = trace.is_some() && skip < chunk.len();
             self.prepare_prefill_rows(chunk.len())?;
-            #[cfg(feature = "cuda")]
             if self.qwen.is_some() {
                 self.state.set_sequence(
                     &self.device.stream,
@@ -3072,7 +3020,6 @@ impl Engine {
         self.device
             .stream
             .memcpy_htod(&[(self.position + 1) as i32], &mut self.work.length)?;
-        #[cfg(feature = "cuda")]
         if self.qwen.is_some() && self.position < self.capacity {
             self.state.set_sequence(
                 &self.device.stream,
@@ -3109,22 +3056,24 @@ impl Engine {
         };
         if graph {
             {
-                #[cfg(feature = "cuda")]
                 let result = if self.moe.is_some() {
                     self.run_moe_graph(1)
                 } else {
-                    self.graph
+                    #[cfg(feature = "cuda")]
+                    let launched = self
+                        .graph
                         .as_ref()
                         .context("decode graph is not captured")?
                         .launch()
-                        .map_err(Into::into)
+                        .map_err(Into::into);
+                    #[cfg(feature = "rocm")]
+                    let launched = self
+                        .graph
+                        .as_ref()
+                        .context("decode graph is not captured")?
+                        .launch();
+                    launched
                 };
-                #[cfg(feature = "rocm")]
-                let result = self
-                    .graph
-                    .as_ref()
-                    .context("decode graph is not captured")?
-                    .launch();
                 if let Err(error) = result {
                     self.poisoned = true;
                     return Err(error);
@@ -3162,7 +3111,6 @@ impl Engine {
             self.recurrent.is_none(),
             "LoopVL rewind requires rebuilding the bidirectional prefix"
         );
-        #[cfg(feature = "cuda")]
         ensure!(
             self.qwen.is_none(),
             "Q38 rewind requires a committed GDN checkpoint; scalar rewind is unsupported"
@@ -3227,7 +3175,6 @@ impl Engine {
     }
 
     pub fn capture(&mut self) -> Result<()> {
-        #[cfg(feature = "cuda")]
         if self.moe.is_some() {
             return self.capture_moe();
         }
@@ -3438,7 +3385,6 @@ impl Engine {
         if self.recurrent.is_some() {
             return "BF16 skinny decode, FP32 accumulation; fixed BF16 Lt prefill";
         }
-        #[cfg(feature = "cuda")]
         if self.qwen.is_some() {
             return "fp8-storage-gemv/fp32-accum; fixed-bf16-lt";
         }
@@ -3479,7 +3425,6 @@ impl Drop for Engine {
 impl Engine {
     fn ensure_verification(&mut self) -> Result<()> {
         let spec = self.spec.as_mut().context("draft state is not enabled")?;
-        #[cfg(feature = "cuda")]
         if self.qwen.is_some() {
             ensure!(
                 spec.checkpoint.is_some() && spec.gdn_inputs.len() == self.state.gdn.len(),
@@ -4111,7 +4056,6 @@ impl Engine {
     }
 
     fn ensure_spec_graph(&mut self, phase: SpecPhase, start: usize) -> Result<()> {
-        #[cfg(feature = "cuda")]
         if self.model_spec.moe.is_some() && matches!(phase, SpecPhase::Verify(_)) {
             ensure!(
                 self.has_moe_segments() || self.has_moe_verify_graphs(),
@@ -4182,7 +4126,6 @@ impl Engine {
     }
 
     fn launch_spec_graph(&mut self, phase: SpecPhase) -> Result<()> {
-        #[cfg(feature = "cuda")]
         if self.model_spec.moe.is_some()
             && let SpecPhase::Verify(rows) = phase
         {
@@ -5222,7 +5165,6 @@ impl Engine {
         if self.graphs.is_empty() {
             return Ok(());
         }
-        #[cfg(feature = "cuda")]
         if self.moe.is_some() {
             if self.spec.is_none() {
                 return self.capture();
@@ -5458,7 +5400,6 @@ impl Engine {
         step: crate::backend::Step<'_>,
         trace: &mut Option<Target<'_>>,
     ) -> Result<()> {
-        #[cfg(feature = "cuda")]
         if self.run_moe_if_bound(layer, step, trace)? {
             return Ok(());
         }
@@ -5666,6 +5607,17 @@ impl Engine {
         let started = Instant::now();
         let write = mode.writes();
         let model_spec = crate::model_spec::ModelSpec::read(dir)?;
+        if model_spec.architecture == crate::model_spec::Architecture::MiniCpmV47 {
+            return Self::load_qwen(
+                dir,
+                ordinal,
+                capacity,
+                requested_chunk,
+                settings,
+                mode,
+                model_spec,
+            );
+        }
         ensure!(
             model_spec.architecture == crate::model_spec::Architecture::Llama,
             "HIP dense setup requires Llama; architecture {:?} is unsupported",
@@ -5740,6 +5692,14 @@ impl Engine {
             s,
         )?);
         let mut engine = Self {
+            qwen_device_prefix: false,
+            qwen: None,
+            moe: None,
+            moe_slots: None,
+            moe_prefill: None,
+            flint_logits: None,
+            #[cfg(test)]
+            moe_test_ffn: None,
             graphs: Vec::new(),
             spec: None,
             hidden_capture: None,
@@ -5967,6 +5927,9 @@ impl Engine {
     }
 
     fn prepare(&mut self, rows: usize) -> Result<()> {
+        if self.qwen.is_some() {
+            return self.prepare_qwen(rows);
+        }
         let rows = bucketed_prefill_rows(rows as u32, self.workspace_rows as u32)? as usize;
         let c = &self.config;
         for (output, input) in [
@@ -5979,26 +5942,14 @@ impl Engine {
         }
         Ok(())
     }
-    fn prepare_prefill_rows(&mut self, rows: usize) -> Result<()> {
-        self.prepare(rows)
-    }
     fn ensure_decode(&self) -> Result<()> {
+        if self.qwen.is_some() {
+            return Ok(());
+        }
         ensure!(
             self.decode.is_some(),
             "HIP decode was not bound during setup"
         );
         Ok(())
-    }
-
-    pub fn run_step(
-        &mut self,
-        step: crate::backend::Step<'_>,
-        trace: Option<Target<'_>>,
-    ) -> Result<()> {
-        let result = self.run_step_inner(step, trace);
-        if result.is_err() {
-            self.poisoned = true;
-        }
-        result
     }
 }

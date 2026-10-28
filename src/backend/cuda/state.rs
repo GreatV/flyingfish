@@ -544,12 +544,10 @@ impl StateStore {
     }
 }
 
-#[cfg(feature = "cuda")]
 pub struct GdnVerifyInput {
     pub qkv: CudaSlice<bf16>,
     pub ab: CudaSlice<bf16>,
 }
-#[cfg(feature = "cuda")]
 impl GdnVerifyInput {
     pub fn new(spec: &GdnSpec, slots: usize, stream: &Arc<CudaStream>) -> Result<Self> {
         let conv_dim = usize::try_from(spec.conv_dim()?)?;

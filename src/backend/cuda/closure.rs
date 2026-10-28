@@ -376,7 +376,6 @@ impl Closure {
         Ok(())
     }
     /// A fixed operator plan has no measured choices or calibration files.
-    #[cfg(feature = "cuda")]
     pub fn freeze_fixed(&self) -> Result<()> {
         ensure!(
             self.stage.get() == Stage::Setup

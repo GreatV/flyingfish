@@ -157,6 +157,7 @@ pub struct Context {
     ordinal: usize,
     pub properties: Properties,
     architecture: String,
+    deferred_error: Mutex<Option<String>>,
 }
 
 impl Context {
@@ -228,6 +229,7 @@ impl Context {
             ordinal,
             properties,
             architecture,
+            deferred_error: Mutex::new(None),
         }))
     }
     pub fn architecture(&self) -> &str {
@@ -256,7 +258,27 @@ impl Context {
         unsafe { check(hipDeviceSynchronize(), "hipDeviceSynchronize") }
     }
     pub(crate) fn record_err(&self, result: Result<()>) {
-        drop_result(result);
+        if let Err(error) = result {
+            eprintln!("HIP deferred resource error: {error:#}");
+            let mut deferred = self
+                .deferred_error
+                .lock()
+                .expect("HIP deferred error mutex poisoned");
+            if deferred.is_none() {
+                *deferred = Some(format!("{error:#}"));
+            }
+        }
+    }
+    pub(crate) fn check_err(&self) -> Result<()> {
+        if let Some(error) = self
+            .deferred_error
+            .lock()
+            .expect("HIP deferred error mutex poisoned")
+            .take()
+        {
+            anyhow::bail!("HIP deferred resource error: {error}");
+        }
+        Ok(())
     }
     pub fn mem_get_info(&self) -> Result<(usize, usize)> {
         self.bind_to_thread()?;

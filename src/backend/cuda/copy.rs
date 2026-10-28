@@ -88,6 +88,38 @@ pub(crate) unsafe fn dtod_raw(dst: u64, src: u64, bytes: usize, stream: &CudaStr
 }
 
 /// # Safety
+/// Both device spans stay live and all reads and writes are ordered through completion.
+pub(crate) unsafe fn peer_raw(
+    dst: u64,
+    dst_context: &CudaContext,
+    src: u64,
+    src_context: &CudaContext,
+    bytes: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    unsafe {
+        sys::cuMemcpyPeerAsync(
+            dst,
+            dst_context.cu_ctx(),
+            src,
+            src_context.cu_ctx(),
+            bytes,
+            stream.cu_stream(),
+        )
+        .result()?;
+        Ok(())
+    }
+    #[cfg(feature = "rocm")]
+    anyhow::bail!(
+        "HIP peer copy is not implemented: src_device={} dst_device={} stream_device={} src={src:#x} dst={dst:#x} bytes={bytes}",
+        src_context.ordinal(),
+        dst_context.ordinal(),
+        stream.context().ordinal()
+    )
+}
+
+/// # Safety
 /// The destination contains `bytes` live bytes and prior readers are ordered on `stream`.
 pub(crate) unsafe fn memset_bytes(
     dst: u64,

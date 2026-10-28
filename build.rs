@@ -63,6 +63,7 @@ const ROCM_KERNELS: &[&str] = &[
     "sample",
     "attention",
     "q38_common",
+    "q38_vision_io",
     "gemm_skinny",
     "fp8_linear",
     "moe_route",

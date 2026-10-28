@@ -2,7 +2,7 @@ use crate::config::Config;
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
 pub(crate) fn dense_prompt_bytes(
     spec: &crate::model_spec::ModelSpec,
     capacity: usize,
@@ -398,7 +398,7 @@ pub struct ExpertWorkspaceBudget {
 }
 
 #[derive(Debug)]
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
 pub(crate) struct ExpertSpanLayout {
     pub rows: u32,
     pub residual: std::ops::Range<usize>,
@@ -411,7 +411,7 @@ pub(crate) struct ExpertSpanLayout {
     pub bytes: usize,
 }
 
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
 impl ExpertSpanLayout {
     pub fn validate_wave(&self, wave_rows: u32, workspace_rows: usize) -> Result<()> {
         ensure!(

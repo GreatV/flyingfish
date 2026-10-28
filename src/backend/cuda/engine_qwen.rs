@@ -4,8 +4,6 @@ use crate::backend::cuda::contracts::view;
 use crate::backend::cuda::{
     attention_d256::{AttentionBindings, FullAttentionOps, FullAttentionPlan, PositionBindings},
     contracts::{RowDomain, Scratch, Tensor, TensorMut},
-    cubin,
-    decode::{GqaDecodeInput, SlidingWindow},
     gdn::{CUDA_GRID_YZ_MAX, GdnBindings, GdnOps, GdnPlan},
     linear::{BoundFfn, LayerLinearPlan, LinearWeightRef},
     ops::{CommonOpsRef, GatedRmsInput, ResidualRmsCapture, ResidualRmsInput, RmsMode, RmsOptions},
@@ -18,13 +16,20 @@ pub(super) fn default_chunk(admitted: usize) -> usize {
     admitted.min(CUDA_GRID_YZ_MAX as usize / CHUNK_ALIGNMENT * CHUNK_ALIGNMENT)
 }
 
+#[cfg(feature = "cuda")]
+use crate::backend::cuda::{
+    cubin,
+    decode::{GqaDecodeInput, SlidingWindow},
+};
+#[cfg(feature = "cuda")]
+use crate::backend::gpu::LaunchConfig;
+use crate::backend::gpu::{CudaFunction, DevicePtr};
 use crate::gdn_plan::GdnPolicy;
 use crate::{
     linear_plan::LayerDequantPlan,
     model_spec::Mixer,
     op_contract::{AttentionLimits, ExecutionPhase, FullAttentionSpec, GdnSpec},
 };
-use cudarc::driver::{CudaFunction, DevicePtr, LaunchConfig};
 use std::collections::BTreeSet;
 
 fn all_layers(trace: &Option<Target<'_>>) -> bool {
@@ -47,7 +52,7 @@ fn norm_mode(spec: &crate::model_spec::ModelSpec) -> RmsMode {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 struct FlintWindowInputs<'a> {
     spec: &'a crate::model_spec::ModelSpec,
     layer: usize,
@@ -60,7 +65,7 @@ struct FlintWindowInputs<'a> {
     sinks: &'a CudaSlice<bf16>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 fn capture_flint_window(
     stream: &Arc<CudaStream>,
     device_name: &str,
@@ -331,7 +336,9 @@ pub(super) struct Runtime {
     attention: Option<FullAttentionSpec>,
     gdn: Option<GdnSpec>,
     checkpoint_dir: PathBuf,
+    #[cfg(feature = "cuda")]
     vision: Option<super::vision_runtime::VisionRuntime>,
+    #[cfg(feature = "cuda")]
     vision_bytes: usize,
     #[cfg(test)]
     pub(super) vision_encode_calls: usize,
@@ -341,6 +348,7 @@ pub(super) struct Runtime {
     catalog: WeightCatalog,
     arena: Option<CudaSlice<u8>>,
     scratch: CudaSlice<u8>,
+    #[cfg(feature = "cuda")]
     kv_scratch: Option<(CudaSlice<bf16>, CudaSlice<bf16>)>,
     pub(super) prompt: Option<CudaSlice<bf16>>,
     mask: CudaSlice<u64>,
@@ -349,6 +357,7 @@ pub(super) struct Runtime {
     advance: CudaFunction,
     prepared: BTreeSet<u32>,
     workspace_rows: u32,
+    #[cfg(feature = "cuda")]
     verify_rows: usize,
 }
 struct Layer {
@@ -360,9 +369,11 @@ struct Layer {
 }
 enum BoundMixer {
     Attention {
+        #[cfg(feature = "cuda")]
         image_prefill: PrefillPlans<FullAttentionPlan>,
         text_prefill: PrefillPlans<FullAttentionPlan>,
         decode: Box<FullAttentionPlan>,
+        #[cfg(feature = "cuda")]
         compact_small: Option<PrefillPlans<FullAttentionPlan>>,
     },
     Gdn {
@@ -372,6 +383,7 @@ enum BoundMixer {
         replay: Vec<GdnPlan>,
         decode: Box<GdnPlan>,
     },
+    #[cfg(feature = "cuda")]
     Flint {
         q_norm: Tensor<bf16, 1>,
         k_norm: Tensor<bf16, 1>,
@@ -488,6 +500,7 @@ pub(super) fn limits(rows: usize, capacity: usize) -> Result<AttentionLimits> {
         causal: 1,
     })
 }
+#[cfg(feature = "cuda")]
 fn nested_verify_tcmqa(device_prefix: bool, rows: usize, bound: usize) -> Result<bool> {
     if !device_prefix {
         return Ok(false);
@@ -499,7 +512,7 @@ fn nested_verify_tcmqa(device_prefix: bool, rows: usize, bound: usize) -> Result
     Ok(true)
 }
 impl Runtime {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(super) fn allocated_workspace_bytes(&self) -> u64 {
         self.scratch.len() as u64
     }
@@ -527,10 +540,11 @@ impl Runtime {
     pub(super) fn checkpoint_path(&self) -> &Path {
         &self.checkpoint_dir
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(super) fn position_values(&self, stream: &Arc<CudaStream>) -> Result<Vec<i32>> {
         Ok(stream.clone_dtoh(&self.positions)?)
     }
+    #[cfg(feature = "cuda")]
     pub(super) fn vision_bytes(&self) -> usize {
         self.vision_bytes
     }
@@ -597,8 +611,11 @@ impl Runtime {
         }
         let attention = FullAttentionSpec::from_model(model)?;
         let gdn = GdnSpec::from_model(model)?;
-        let attention_prefill =
-            FullAttentionOps::preprocess_workspace(&attention, limits(rows, capacity)?)?;
+        let attention_prefill = if cfg!(feature = "rocm") {
+            FullAttentionOps::workspace(&attention, limits(rows, capacity)?)?
+        } else {
+            FullAttentionOps::preprocess_workspace(&attention, limits(rows, capacity)?)?
+        };
         let attention_decode =
             FullAttentionOps::decode_workspace(&attention, u32::try_from(capacity)?)?;
         let attention_nested_verify =
@@ -695,6 +712,7 @@ impl Runtime {
         let mut layers = Vec::new();
         let w = &engine.work;
         let mw = w.mixer.as_ref().context("Q38 mixer work missing")?;
+        #[cfg(feature = "cuda")]
         let rope_module = if flint {
             Some(cubin::module(&engine.device.ctx, "rope")?)
         } else {
@@ -718,15 +736,21 @@ impl Runtime {
             let mixer = match layout.mixer {
                 Mixer::FullAttention => {
                     if flint {
-                        let module = rope_module.as_ref().context("Flint rope module missing")?;
-                        BoundMixer::Flint {
-                            q_norm: weight("self_attn.q_norm.weight")?,
-                            k_norm: weight("self_attn.k_norm.weight")?,
-                            sinks: catalog
-                                .bf16(&format!("{prefix}self_attn.softmax_offset"))?
-                                .clone(),
-                            rope: module.load_function("flint_qknorm_rope_kv")?,
-                            nope: module.load_function("flint_qknorm_kv_nope")?,
+                        #[cfg(feature = "rocm")]
+                        anyhow::bail!("HIP Flint mixer is not implemented");
+                        #[cfg(feature = "cuda")]
+                        {
+                            let module =
+                                rope_module.as_ref().context("Flint rope module missing")?;
+                            BoundMixer::Flint {
+                                q_norm: weight("self_attn.q_norm.weight")?,
+                                k_norm: weight("self_attn.k_norm.weight")?,
+                                sinks: catalog
+                                    .bf16(&format!("{prefix}self_attn.softmax_offset"))?
+                                    .clone(),
+                                rope: module.load_function("flint_qknorm_rope_kv")?,
+                                nope: module.load_function("flint_qknorm_kv_nope")?,
+                            }
                         }
                     } else {
                         let attention = *attention
@@ -865,6 +889,7 @@ impl Runtime {
                             "nested verify attention exceeds Engine scratch budget"
                         );
                         BoundMixer::Attention {
+                            #[cfg(feature = "cuda")]
                             image_prefill: PrefillPlans::bind(
                                 bind(
                                     limits(rows, engine.capacity)?,
@@ -881,6 +906,7 @@ impl Runtime {
                                 FullAttentionPlan::for_rows,
                             )?,
                             text_prefill,
+                            #[cfg(feature = "cuda")]
                             compact_small: if kv.compact.is_some() {
                                 Some(PrefillPlans::bind(
                                     bind(
@@ -981,13 +1007,15 @@ impl Runtime {
             });
         }
         let module = crate::backend::cuda::cubin::module(&engine.device.ctx, "q38_common")?;
-        Ok(Self {
+        let runtime = Self {
             attention,
             gdn,
             checkpoint_dir: checkpoint_dir
                 .canonicalize()
                 .context("resolve Q38 checkpoint directory")?,
+            #[cfg(feature = "cuda")]
             vision: None,
+            #[cfg(feature = "cuda")]
             vision_bytes: 0,
             #[cfg(test)]
             vision_encode_calls: 0,
@@ -1001,6 +1029,7 @@ impl Runtime {
             catalog,
             arena,
             scratch: scratch_buffer,
+            #[cfg(feature = "cuda")]
             kv_scratch,
             prompt: None,
             mask,
@@ -1009,8 +1038,92 @@ impl Runtime {
             advance: module.load_function("q38_advance")?,
             prepared: BTreeSet::new(),
             workspace_rows: u32::try_from(rows)?,
+            #[cfg(feature = "cuda")]
             verify_rows,
-        })
+        };
+        #[cfg(feature = "rocm")]
+        runtime.bind_linear_calls(engine)?;
+        Ok(runtime)
+    }
+    #[cfg(feature = "rocm")]
+    fn bind_linear_calls(&self, engine: &Engine) -> Result<()> {
+        if engine.model_spec.linear_format.fp8_layout().is_none() {
+            return Ok(());
+        }
+        let ops = engine.blas.fp8_ops()?;
+        let stream = &engine.device.stream;
+        let work = &engine.work;
+        let mixer = work.mixer.as_ref().context("HIP mixer workspace missing")?;
+        let hidden = engine.model_spec.hidden as usize;
+        let q_width = engine.model_spec.q_width as usize;
+        let kv_width = (engine.model_spec.kv_heads * engine.model_spec.head_dim) as usize;
+        let extent = engine.workspace_rows;
+        let buckets = (1..=self.workspace_rows)
+            .map(|rows| bucketed_prefill_rows(rows, self.workspace_rows))
+            .collect::<Result<BTreeSet<_>>>()?;
+        for rows in buckets {
+            let rows = rows as usize;
+            for layer in &self.layers {
+                let input = matrix(&work.n, stream, 0, rows, hidden)?;
+                let (role, width) = match &layer.mixer {
+                    BoundMixer::Attention { .. } => {
+                        for (role, width, offset) in [
+                            ("self_attn.q_proj.weight", 2 * q_width, 0),
+                            ("self_attn.k_proj.weight", kv_width, extent * 2 * q_width),
+                            (
+                                "self_attn.v_proj.weight",
+                                kv_width,
+                                extent * (2 * q_width + kv_width),
+                            ),
+                        ] {
+                            layer.linear.bind_call(
+                                ops,
+                                role,
+                                input,
+                                &TensorMut(matrix(&work.qkv, stream, offset, rows, width)?),
+                            )?;
+                        }
+                        ("self_attn.o_proj.weight", q_width)
+                    }
+                    BoundMixer::Gdn { .. } => {
+                        let spec = self.gdn.as_ref().context("HIP GDN shape missing")?;
+                        let value = (spec.hv * spec.dv) as usize;
+                        let heads = spec.hv as usize;
+                        for (role, buffer, width, offset) in [
+                            (
+                                "linear_attn.in_proj_qkv.weight",
+                                &work.qkv,
+                                spec.conv_dim()? as usize,
+                                0,
+                            ),
+                            ("linear_attn.in_proj_z.weight", &mixer.gate, value, 0),
+                            ("linear_attn.in_proj_a.weight", &mixer.ab, heads, 0),
+                            (
+                                "linear_attn.in_proj_b.weight",
+                                &mixer.ab,
+                                heads,
+                                extent * heads,
+                            ),
+                        ] {
+                            layer.linear.bind_call(
+                                ops,
+                                role,
+                                input,
+                                &TensorMut(matrix(buffer, stream, offset, rows, width)?),
+                            )?;
+                        }
+                        ("linear_attn.out_proj.weight", value)
+                    }
+                };
+                layer.linear.bind_call(
+                    ops,
+                    role,
+                    matrix(&work.attn, stream, 0, rows, width)?,
+                    &TensorMut(matrix(&work.out, stream, 0, rows, hidden)?),
+                )?;
+            }
+        }
+        Ok(())
     }
     fn prepare(
         &mut self,
@@ -1071,7 +1184,7 @@ impl Runtime {
     }
 }
 impl Engine {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(super) fn inject_moe_test_positions(&mut self, axes: [&[i32]; 3]) -> Result<()> {
         let rows = axes[0].len();
         let first = *axes[0]
@@ -1111,6 +1224,7 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     pub(super) fn bind_gdn_snapshots(
         &mut self,
         snapshots: &[super::super::state::GdnState],
@@ -1230,6 +1344,7 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     pub(super) fn replay_gdn_prefix(&mut self, start: usize, committed: usize) -> Result<()> {
         ensure!(committed > 0, "GDN replay requires committed > 0");
         let s = &self.device.stream;
@@ -1275,6 +1390,7 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     pub fn prefill_multimodal(
         &mut self,
         input: &crate::vision_input::MultimodalInput<'_>,
@@ -1293,6 +1409,7 @@ impl Engine {
         result
     }
 
+    #[cfg(feature = "cuda")]
     pub(super) fn prepare_multimodal(
         &mut self,
         input: &crate::vision_input::MultimodalInput<'_>,
@@ -1340,6 +1457,7 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     pub fn prepare_resident_vision(&mut self) -> Result<()> {
         if self.model_spec.vision.is_some() {
             self.prepare_vision_weights(0)?;
@@ -1347,6 +1465,7 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn check_resident_vision_budget(
         dir: &Path,
         options: &crate::spec::Options,
@@ -1388,6 +1507,7 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     fn prepare_vision_weights(&mut self, request_bytes: usize) -> Result<()> {
         let kv_bytes = self
             .state
@@ -1459,7 +1579,18 @@ impl Engine {
             _ => require_qwen35_geometry(&model_spec)?,
         }
         let write = mode.writes();
+        #[cfg(feature = "cuda")]
         let reserve_mtp = matches!(mode, super::SetupMode::Mtp { .. });
+        #[cfg(feature = "rocm")]
+        let reserve_mtp = false;
+        #[cfg(feature = "rocm")]
+        ensure!(
+            model_spec.architecture == crate::model_spec::Architecture::MiniCpmV47
+                && settings.draft_model.is_none()
+                && !settings.prefix_cache
+                && settings.kv_format == crate::kv::KvFormat::Bf16,
+            "HIP hybrid setup requires MiniCPM-V-4.7 text with BF16 KV, no draft or persistent prefix cache"
+        );
         ensure!(
             model_spec.moe.is_none() || !reserve_mtp,
             "MoE MTP attachment is not bound: architecture={:?}",
@@ -1500,6 +1631,7 @@ impl Engine {
             settings.kv_format
         );
         let verify_rows = match mode {
+            #[cfg(feature = "cuda")]
             super::SetupMode::Mtp { verify_rows } => verify_rows,
             _ => draft_config
                 .as_ref()
@@ -1554,6 +1686,7 @@ impl Engine {
             "invalid Q38 capacity"
         );
         // Reject an incomplete operator plan before allocating model weights.
+        #[cfg(feature = "cuda")]
         Runtime::workspace(&model_spec, 1, capacity, GdnPolicy::P2, verify_rows)?;
         let runtime = settings
             .runtime_dir
@@ -1570,13 +1703,19 @@ impl Engine {
         ));
         let device = Device::new(ordinal)?;
         let gdn_policy = GdnPolicy::for_device(&device.info);
+        #[cfg(feature = "rocm")]
+        Runtime::workspace(&model_spec, 1, capacity, gdn_policy, verify_rows)?;
         let prefix_cache = settings.prefix_cache;
+        #[cfg(feature = "cuda")]
         let mut catalog = if prefix_cache {
             WeightCatalog::load_for_prefix_cache(dir, &model_spec, &device)?
         } else {
             WeightCatalog::load(dir, &model_spec, &device)?
         };
+        #[cfg(feature = "rocm")]
+        let mut catalog = WeightCatalog::load(dir, &model_spec, &device)?;
         let prefix_identity_load_ms = catalog.load_wall_ms;
+        #[cfg(feature = "cuda")]
         let mut prefix_identity = if prefix_cache {
             let upload_sha = catalog
                 .upload_content_sha256
@@ -1599,6 +1738,7 @@ impl Engine {
         } else {
             None
         };
+        #[cfg(feature = "cuda")]
         if let Some(identity) = prefix_identity.as_mut() {
             identity.attention_kv_dtype = settings.kv_format.tag().into();
         }
@@ -1624,6 +1764,7 @@ impl Engine {
             1,
             s,
         )?);
+        #[cfg(feature = "cuda")]
         let arena_bytes = (0..model_spec.layers.len())
             .map(|i| {
                 LayerDequantPlan::from_manifest(
@@ -1637,13 +1778,18 @@ impl Engine {
             .into_iter()
             .max()
             .context("missing Q38 layers")?;
+        #[cfg(feature = "rocm")]
+        let arena_bytes = 0u64;
         let arena = if arena_bytes == 0 {
             None
         } else {
             Some(s.alloc_zeros::<u8>(usize::try_from(arena_bytes)?)?)
         };
         let ops = Ops::new(&device.ctx)?;
+        #[cfg(feature = "cuda")]
         let mut blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
+        #[cfg(feature = "rocm")]
+        let mut blas = Blas::new(device.stream.clone())?;
         if model_spec.linear_format.fp8_layout().is_some() {
             blas.enable_fp8(&device.ctx)?;
         }
@@ -1814,7 +1960,12 @@ impl Engine {
                 .as_ref()
                 .context("Q38 attention specification missing")?;
             (
-                FullAttentionOps::preprocess_workspace(attention, limits(rows, capacity)?)?.bytes,
+                if cfg!(feature = "rocm") {
+                    FullAttentionOps::workspace(attention, limits(rows, capacity)?)?.bytes
+                } else {
+                    FullAttentionOps::preprocess_workspace(attention, limits(rows, capacity)?)?
+                        .bytes
+                },
                 FullAttentionOps::decode_workspace(attention, u32::try_from(capacity)?)?.bytes,
                 FullAttentionOps::workspace(attention, limits(rows.min(verify_rows), capacity)?)?
                     .bytes,
@@ -1887,6 +2038,7 @@ impl Engine {
             .transpose()?
             .unwrap_or(0);
         let work = Work::new_with_peer_tail(s, &model_spec, rows, peer_tail_elems)?;
+        #[cfg(feature = "cuda")]
         let flash = Flash::new(s.clone(), rows, model_spec.q_heads as usize)?;
         let flint_logits = if flint {
             Some(s.alloc_zeros(model_spec.vocab as usize)?)
@@ -1902,7 +2054,7 @@ impl Engine {
             capture_fail_after_layer: None,
             #[cfg(test)]
             capture_fail_stage: None,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             flint_window_capture: None,
             qwen_device_prefix: false,
             forward_rows: (1..=rows.min(16)).collect(),
@@ -1928,9 +2080,14 @@ impl Engine {
             work,
             ops,
             blas,
+            #[cfg(feature = "cuda")]
             flash: Some(flash),
             decode: None,
             flint_logits,
+            #[cfg(feature = "rocm")]
+            prefill_attention: None,
+            #[cfg(feature = "rocm")]
+            prefill_prefixes: s.alloc_zeros(0)?,
             device,
             config,
             model_spec,
@@ -1939,7 +2096,9 @@ impl Engine {
             workspace_rows: rows,
             trace_layer: 0,
             position: 0,
+            #[cfg(feature = "cuda")]
             prefix_identity,
+            #[cfg(feature = "cuda")]
             prefix_identity_load_ms,
             logits_cache: PrefixLogitsCache::default(),
             committed_prefix_ids: Vec::new(),
@@ -1947,18 +2106,24 @@ impl Engine {
             resident_ids_len: 0,
             last_input_kind: None,
             qwen: None,
+            #[cfg(feature = "cuda")]
             recurrent: None,
             moe: None,
             moe_slots: None,
             moe_prefill: None,
             #[cfg(test)]
             moe_test_ffn: None,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             flint_legacy_overflow_prefill: false,
+            #[cfg(feature = "cuda")]
             flint_frozen_decode_length: false,
+            #[cfg(feature = "cuda")]
             mtp: None,
+            #[cfg(feature = "cuda")]
             mtp_state: None,
+            #[cfg(feature = "cuda")]
             mtp_epoch: 0,
+            #[cfg(feature = "cuda")]
             images: None,
         };
         engine.qwen = Some(Runtime::new(
@@ -1970,6 +2135,7 @@ impl Engine {
             kv_scratch,
             verify_rows,
         )?);
+        #[cfg(feature = "cuda")]
         if flint {
             if write {
                 engine.ensure_decode()?;
@@ -1992,6 +2158,7 @@ impl Engine {
         if let Some(setup) = expert_setup {
             setup.bind(&mut engine)?;
         }
+        #[cfg(feature = "cuda")]
         if engine.spec.is_some() {
             engine.bind_invariant_arithmetic()?;
         }
@@ -2005,6 +2172,7 @@ impl Engine {
             .as_ref()
             .context("Q38 runtime missing")?
             .ensure_complete()?;
+        #[cfg(feature = "cuda")]
         if let Some(spec) = &engine.spec {
             let profile = super::super::closure::Profile::draft(
                 &spec.draft.config,
@@ -2032,6 +2200,8 @@ impl Engine {
                 engine.closure.freeze_fixed()?;
             }
         }
+        #[cfg(feature = "rocm")]
+        engine.closure.freeze_fixed()?;
         if !write {
             engine.reset()?;
             engine.prepare_graphs()?;
@@ -2072,6 +2242,7 @@ impl Engine {
         self.state.compact_commit(&self.device.stream, false)
     }
 
+    #[cfg(feature = "cuda")]
     pub(super) fn prefill_dense_layers(
         &mut self,
         ids: &[u32],
@@ -2139,6 +2310,7 @@ impl Engine {
         result
     }
 
+    #[cfg(feature = "cuda")]
     pub(super) fn dense_prefill_chunk(
         &mut self,
         ids: &[u32],
@@ -2182,6 +2354,7 @@ impl Engine {
         Ok(end)
     }
 
+    #[cfg(feature = "cuda")]
     fn dense_prefill_embed(
         &mut self,
         ids: &[u32],
@@ -2228,6 +2401,7 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     fn dense_prefill_layer(
         &mut self,
         layer: usize,
@@ -2300,6 +2474,7 @@ impl Engine {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     fn dense_prefill_finish(
         &mut self,
         ids: &[u32],
@@ -2370,6 +2545,12 @@ impl Engine {
         i: usize,
         step: crate::backend::Step<'_>,
     ) -> Result<()> {
+        #[cfg(feature = "rocm")]
+        ensure!(
+            i < self.model_spec.layers.len() && step.rows > 0,
+            "HIP layer begin has invalid layer/rows"
+        );
+        #[cfg(feature = "cuda")]
         if step.input == crate::backend::Input::Ids
             && !self.blas.direct_fp8_rows().contains(&step.rows)
         {
@@ -2387,7 +2568,10 @@ impl Engine {
     ) -> Result<()> {
         let q = self.qwen.as_mut().context("Q38 runtime missing")?;
         let layer = &q.layers[i];
+        #[cfg(feature = "cuda")]
         let flint_layer = matches!(layer.mixer, BoundMixer::Flint { .. });
+        #[cfg(feature = "rocm")]
+        let flint_layer = false;
         let attention = if flint_layer {
             None
         } else {
@@ -2420,6 +2604,7 @@ impl Engine {
             row_capacity: rows as u32,
         };
         match &layer.mixer {
+            #[cfg(feature = "cuda")]
             BoundMixer::Flint {
                 q_norm,
                 k_norm,
@@ -2732,9 +2917,11 @@ impl Engine {
                 )?;
             }
             BoundMixer::Attention {
+                #[cfg(feature = "cuda")]
                 image_prefill,
                 text_prefill,
                 decode,
+                #[cfg(feature = "cuda")]
                 compact_small,
             } => {
                 let attention = *attention
@@ -2771,90 +2958,112 @@ impl Engine {
                 }
                 match phase {
                     ExecutionPhase::Prefill => {
-                        if nested_verify_tcmqa(self.qwen_device_prefix, rows, q.verify_rows)? {
-                            let kv = &self.state.kv[self.model_spec.layers[i].state_index as usize];
-                            let plans = if kv.compact.is_some() {
-                                compact_small
-                                    .as_ref()
-                                    .context("compact verify plan missing")?
-                            } else if self.model_spec.moe.is_some() {
-                                image_prefill
+                        #[cfg(feature = "rocm")]
+                        {
+                            ensure!(
+                                self.state.kv[self.model_spec.layers[i].state_index as usize]
+                                    .compact
+                                    .is_none(),
+                                "HIP HD256 prefill requires BF16 KV"
+                            );
+                            let plan = text_prefill.select(rows, &FullAttentionPlan::for_rows)?;
+                            FullAttentionOps::run(&plan, s, meta, scratch(&q.scratch, s))?;
+                        }
+                        #[cfg(feature = "cuda")]
+                        {
+                            if nested_verify_tcmqa(self.qwen_device_prefix, rows, q.verify_rows)? {
+                                let kv =
+                                    &self.state.kv[self.model_spec.layers[i].state_index as usize];
+                                let plans = if kv.compact.is_some() {
+                                    compact_small
+                                        .as_ref()
+                                        .context("compact verify plan missing")?
+                                } else if self.model_spec.moe.is_some() {
+                                    image_prefill
+                                } else {
+                                    text_prefill
+                                };
+                                let narrowed = plans.select(rows, &FullAttentionPlan::for_rows)?;
+                                FullAttentionOps::run(&narrowed, s, meta, scratch(&q.scratch, s))?;
                             } else {
-                                text_prefill
-                            };
-                            let narrowed = plans.select(rows, &FullAttentionPlan::for_rows)?;
-                            FullAttentionOps::run(&narrowed, s, meta, scratch(&q.scratch, s))?;
-                        } else {
-                            let kv = &self.state.kv[self.model_spec.layers[i].state_index as usize];
-                            if let Some(c) = &kv.compact {
-                                let (k, v) = q
-                                    .kv_scratch
-                                    .as_ref()
-                                    .context("compact KV prefill scratch missing")?;
-                                ensure!(
-                                    self.images.is_none(),
-                                    "8-bit KV is qualified for text only"
-                                );
-                                c.dequant_prefix(
-                                    c.view(&kv.k, &kv.v, s),
-                                    meta,
-                                    k,
-                                    v,
-                                    self.position,
+                                let kv =
+                                    &self.state.kv[self.model_spec.layers[i].state_index as usize];
+                                if let Some(c) = &kv.compact {
+                                    let (k, v) = q
+                                        .kv_scratch
+                                        .as_ref()
+                                        .context("compact KV prefill scratch missing")?;
+                                    ensure!(
+                                        self.images.is_none(),
+                                        "8-bit KV is qualified for text only"
+                                    );
+                                    c.dequant_prefix(
+                                        c.view(&kv.k, &kv.v, s),
+                                        meta,
+                                        k,
+                                        v,
+                                        self.position,
+                                        s,
+                                    )?;
+                                }
+                                let plans = if self.images.is_some() {
+                                    image_prefill
+                                } else {
+                                    text_prefill
+                                };
+                                let narrowed = plans.select(rows, &FullAttentionPlan::for_rows)?;
+                                let prefill: &FullAttentionPlan = &narrowed;
+                                FullAttentionOps::preprocess(
+                                    prefill,
                                     s,
-                                )?;
-                            }
-                            let plans = if self.images.is_some() {
-                                image_prefill
-                            } else {
-                                text_prefill
-                            };
-                            let narrowed = plans.select(rows, &FullAttentionPlan::for_rows)?;
-                            let prefill: &FullAttentionPlan = &narrowed;
-                            FullAttentionOps::preprocess(prefill, s, meta, scratch(&q.scratch, s))?;
-                            let kv = &self.state.kv[self.model_spec.layers[i].state_index as usize];
-                            let (k_cache, v_cache) = if kv.compact.is_some() {
-                                let (k, v) = q
-                                    .kv_scratch
-                                    .as_ref()
-                                    .context("compact KV prefill scratch missing")?;
-                                (k, v)
-                            } else {
-                                (&kv.k, &kv.v)
-                            };
-                            let shape = Shape {
-                                rows,
-                                start: self.position,
-                                q_heads: attention.hq as usize,
-                                kv_heads: attention.hkv as usize,
-                                capacity: self.capacity,
-                                head_dim: 256,
-                                causal: true,
-                                window_left: None,
-                            };
-                            self.flash
-                                .as_mut()
-                                .context("Q38 prefill attention is not bound")?
-                                .run(
-                                    &mw.q,
-                                    q_width as usize,
-                                    k_cache,
-                                    v_cache,
-                                    &mut w.attn,
-                                    shape,
-                                )?;
-                            if let Some(c) = &kv.compact {
-                                let (k, v) = q
-                                    .kv_scratch
-                                    .as_ref()
-                                    .context("compact KV prefill scratch missing")?;
-                                c.finish(
-                                    c.view(&kv.k, &kv.v, s),
                                     meta,
-                                    Some((k, v, rows)),
-                                    true,
-                                    s,
+                                    scratch(&q.scratch, s),
                                 )?;
+                                let kv =
+                                    &self.state.kv[self.model_spec.layers[i].state_index as usize];
+                                let (k_cache, v_cache) = if kv.compact.is_some() {
+                                    let (k, v) = q
+                                        .kv_scratch
+                                        .as_ref()
+                                        .context("compact KV prefill scratch missing")?;
+                                    (k, v)
+                                } else {
+                                    (&kv.k, &kv.v)
+                                };
+                                let shape = Shape {
+                                    rows,
+                                    start: self.position,
+                                    q_heads: attention.hq as usize,
+                                    kv_heads: attention.hkv as usize,
+                                    capacity: self.capacity,
+                                    head_dim: 256,
+                                    causal: true,
+                                    window_left: None,
+                                };
+                                self.flash
+                                    .as_mut()
+                                    .context("Q38 prefill attention is not bound")?
+                                    .run(
+                                        &mw.q,
+                                        q_width as usize,
+                                        k_cache,
+                                        v_cache,
+                                        &mut w.attn,
+                                        shape,
+                                    )?;
+                                if let Some(c) = &kv.compact {
+                                    let (k, v) = q
+                                        .kv_scratch
+                                        .as_ref()
+                                        .context("compact KV prefill scratch missing")?;
+                                    c.finish(
+                                        c.view(&kv.k, &kv.v, s),
+                                        meta,
+                                        Some((k, v, rows)),
+                                        true,
+                                        s,
+                                    )?;
+                                }
                             }
                         }
                     }
@@ -2996,6 +3205,7 @@ impl Engine {
         if all || i == self.trace_layer {
             let name = debug_name(trace, i, "mixer_out");
             let mixer_width = match &layer.mixer {
+                #[cfg(feature = "cuda")]
                 BoundMixer::Flint { .. } => q_width,
                 BoundMixer::Attention { .. } => q_width,
                 BoundMixer::Gdn { .. } => value_width,
@@ -3118,6 +3328,7 @@ impl Engine {
                         .arg(&(h as i32))
                         .launch(flat(rows * h))?;
                 }
+                #[cfg(feature = "cuda")]
                 if step.input == crate::backend::Input::Ids
                     && let Some(images) = &self.images
                 {
@@ -3467,7 +3678,7 @@ impl Engine {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::default_chunk;
 

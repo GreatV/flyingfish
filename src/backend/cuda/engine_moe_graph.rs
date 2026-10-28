@@ -337,7 +337,7 @@ impl Engine {
         Ok(first)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(in crate::backend::cuda::engine) fn clear_moe_graphs(&mut self) {
         self.graph = None;
         self.graphs.clear();
