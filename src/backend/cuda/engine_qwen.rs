@@ -4385,6 +4385,16 @@ impl Engine {
                     };
                     let prep_heads = if reader { 0 } else { hkv };
                     let cache_start = if overflow { history as i32 } else { -1 };
+                    if all_layers(trace) || i == self.trace_layer {
+                        trace_value(
+                            trace,
+                            s,
+                            &debug_name(trace, i, "qkv_projected"),
+                            &w.qkv,
+                            linear_rows,
+                            q_stride,
+                        )?;
+                    }
                     unsafe {
                         s.launch_builder(&ops.rope)
                             .arg(&mut w.qkv)
