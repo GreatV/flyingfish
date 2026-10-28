@@ -5293,6 +5293,7 @@ fn minicpm_media_identity_gpu() -> Result<()> {
                 );
             }
             let mut trace = Trace::default();
+            trace.set_device(&engine.device.info.name)?;
             trace.add("logits".into(), vec![32, 248144], captured)?;
             trace.add(
                 "tokens".into(),
