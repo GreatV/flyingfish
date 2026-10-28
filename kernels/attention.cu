@@ -824,6 +824,7 @@ __device__ void run(Problem p, uint32_t extent) {
     }
     __syncthreads();
     A scores[SCORE_TILES] = {};
+    A score_correction[SCORE_TILES] = {};
     const int key_slab = D == 256 ? wave%2 : (wave%2)*2;
     if (D == 128 || wave < 2) {
 #pragma unroll
@@ -836,7 +837,15 @@ __device__ void run(Problem p, uint32_t extent) {
           B b;
 #pragma unroll
           for (int j = 0; j < 16; ++j) b[j] = ks[((key_slab+tile)*16+lane%16)*D+part*16+j];
-          scores[tile] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a,b,scores[tile]);
+          if constexpr (D == 256) {
+            const A partial = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a,b,A{});
+            const A delta = partial-score_correction[tile];
+            const A next = scores[tile]+delta;
+            score_correction[tile] = (next-scores[tile])-delta;
+            scores[tile] = next;
+          } else {
+            scores[tile] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a,b,scores[tile]);
+          }
         }
       }
     }
@@ -861,11 +870,11 @@ __device__ void run(Problem p, uint32_t extent) {
     if (tid < BQ) {
       float next = peak;
       for (int key = 0; key < BK; ++key) next = fmaxf(next,score_memory[tid*BK+key]);
-      const float rescale = isfinite(next) ? expf(peak-next) : 0.0f;
+      const float rescale = isfinite(next) ? __expf(peak-next) : 0.0f;
       denominator *= rescale;
       correction *= rescale;
       for (int key = 0; key < BK; ++key) {
-        const float value = isfinite(next) ? expf(score_memory[tid*BK+key]-next) : 0.0f;
+        const float value = isfinite(next) ? __expf(score_memory[tid*BK+key]-next) : 0.0f;
         const float y = value-correction, sum = denominator+y;
         correction = (sum-denominator)-y;
         denominator = sum;

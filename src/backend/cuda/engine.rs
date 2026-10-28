@@ -1292,7 +1292,9 @@ impl Engine {
         self.grow_rows(rows, plan.chunk).with_context(|| {
             format!("allocate prefill workspace: required={required} available={available}")
         })?;
-        self.prepare_prefill_plans()?;
+        if cfg!(feature = "cuda") || self.qwen.is_some() {
+            self.prepare_prefill_plans()?;
+        }
         self.poisoned = false;
         Ok(())
     }
@@ -5714,6 +5716,7 @@ impl Engine {
         engine.size_workspace(requested_chunk)?;
         engine.declare_graphs()?;
         engine.initialize_hip(dir, settings.draft_model.as_deref())?;
+        engine.prepare_prefill_plans()?;
         if let Some(spec) = &mut engine.spec {
             spec.draft.setup_attention(
                 &engine.device,
