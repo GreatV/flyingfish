@@ -3,6 +3,87 @@ use std::{env, fs, path::PathBuf, process::Command};
 #[path = "src/build_arch.rs"]
 mod build_arch;
 
+fn compile_device(
+    out: &std::path::Path,
+    nvcc: &std::path::Path,
+    archs: &[u32],
+    index: &mut String,
+) {
+    println!("cargo:rerun-if-changed=device");
+    let pin = fs::read_to_string("device/rust-toolchain.toml").expect("read device toolchain");
+    let pin = pin
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("channel = \"")
+                .and_then(|s| s.strip_suffix('"'))
+        })
+        .expect("device toolchain channel missing");
+    let ptxas = nvcc.with_file_name("ptxas");
+    for &sm in archs {
+        let target = out.join(format!("device-sm{sm}"));
+        let mut command = Command::new("rustup");
+        command.args([
+            "run",
+            pin,
+            "cargo",
+            "build",
+            "--manifest-path",
+            "device/Cargo.toml",
+            "--target",
+            "nvptx64-nvidia-cuda",
+            "-Z",
+            "build-std=core",
+            "--release",
+            "--offline",
+        ]);
+        for key in [
+            "RUSTUP_TOOLCHAIN",
+            "RUSTC",
+            "RUSTDOC",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_MAKEFLAGS",
+        ] {
+            command.env_remove(key);
+        }
+        let result = command
+            .env("CARGO_TARGET_DIR", &target)
+            .env("RUSTFLAGS", format!("-C target-cpu=sm_{sm}"))
+            .output()
+            .expect("cannot run the installed device toolchain; see README prerequisites");
+        assert!(
+            result.status.success(),
+            "device build {pin} sm_{sm} failed:\n{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        println!(
+            "cargo:warning=device {pin} sm_{sm}: {}",
+            String::from_utf8_lossy(&result.stderr).replace('\n', " | ")
+        );
+        let filename = format!("attention_native_sm{sm}.cubin");
+        let result = Command::new(&ptxas)
+            .args(["-O3", "-v"])
+            .arg(format!("-arch=sm_{sm}"))
+            .arg(target.join("nvptx64-nvidia-cuda/release/flyingfish_device.ptx"))
+            .arg("-o")
+            .arg(out.join(&filename))
+            .output()
+            .expect("cannot assemble native Rust attention");
+        assert!(
+            result.status.success(),
+            "native attention ptxas sm_{sm} failed:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        println!(
+            "cargo:warning=native attention sm_{sm}: {}",
+            String::from_utf8_lossy(&result.stderr).replace('\n', " | ")
+        );
+        index.push_str(&format!("(\"attention_native\", {sm}) => Some(include_bytes!(concat!(env!(\"OUT_DIR\"), \"/\", {filename:?}))),\n"));
+    }
+}
+
 fn architectures() -> Vec<u32> {
     let mut selected: Option<(String, Vec<u32>)> = None;
     for key in [
@@ -473,6 +554,7 @@ fn main() {
             }
         }
     }
+    compile_device(&out, &nvcc, &archs, &mut index);
     index.push_str("_ => None,\n}\n}\n");
     fs::write(out.join("kernels.rs"), index).expect("cannot write cubin index");
     println!("cargo:rerun-if-changed=third_party/flash-attention/adapter.cu");

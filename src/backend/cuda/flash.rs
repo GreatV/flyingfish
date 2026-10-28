@@ -1,7 +1,7 @@
 use anyhow::Context;
 use anyhow::{Result, ensure};
 use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr};
 use half::bf16;
 use std::{
     ffi::{CStr, c_char, c_void},
@@ -9,7 +9,6 @@ use std::{
 };
 
 unsafe extern "C" {
-    fn ff_fa2_tile(head_dim: i32) -> i32;
     fn ff_fa2_error() -> *const c_char;
     fn ff_fa2_run(
         q: *mut c_void,
@@ -52,37 +51,146 @@ unsafe extern "C" {
 /// the row pitch is stated at the call site.
 pub use super::verification::Shape;
 
+pub struct Query<'a> {
+    pub q: &'a CudaSlice<bf16>,
+    pub q_row_stride: usize,
+    pub k: &'a CudaSlice<bf16>,
+    pub v: &'a CudaSlice<bf16>,
+    pub out: &'a mut CudaSlice<bf16>,
+    pub shape: Shape,
+    pub keys: usize,
+    pub prefix: Option<usize>,
+}
+
 pub struct Flash {
     stream: Arc<CudaStream>,
     lse: CudaSlice<f32>,
     sink_rescale: CudaFunction,
+    native: Vec<CudaFunction>,
+    geometry: [usize; 3],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Attention {
+    q: u64,
+    k: u64,
+    v: u64,
+    out: u64,
+    lse: u64,
+    rows: u32,
+    capacity: u32,
+    q_stride: u32,
+    q_heads: u32,
+    group: u32,
+    start: u32,
+}
+unsafe impl DeviceRepr for Attention {}
+
 impl Flash {
-    /// FA2's `kBlockM` for a head dim on the current device: 64 for d128 and
-    /// 128 or 64 for d256, per FA2's own hdim256 shared-memory query.
+    /// Query tile rows for the bound prefill family.
     pub fn tile(head_dim: usize) -> Result<usize> {
-        let tile = unsafe { ff_fa2_tile(head_dim as i32) };
         ensure!(
-            tile > 0,
-            "FA2 binds head dims 128 and 256 (asked for {head_dim})"
+            matches!(head_dim, 128 | 256),
+            "prefill binds head dims 128 and 256 (asked for {head_dim})"
         );
-        Ok(tile as usize)
+        Ok(64)
     }
 
-    /// Holds FA2's LSE, `rows * heads` f32 (FA2 writes `(b, h, seqlen_q)`); allocated once at setup.
-    pub fn new(stream: Arc<CudaStream>, rows: usize, heads: usize) -> Result<Self> {
-        let lse = stream.alloc_zeros(rows * heads)?;
+    /// LSE is F32 [heads, rows], allocated once at setup.
+    pub fn new(
+        stream: Arc<CudaStream>,
+        rows: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<Self> {
+        ensure!(
+            rows > 0 && heads > 0 && kv_heads > 0 && heads.is_multiple_of(kv_heads),
+            "invalid prefill attention geometry"
+        );
+        ensure!(
+            matches!(head_dim, 128 | 256),
+            "unsupported prefill attention head dimension {head_dim}"
+        );
+        let elements = rows
+            .checked_mul(heads)
+            .context("prefill LSE extent overflow")?;
+        ensure!(
+            elements <= u32::MAX as usize,
+            "prefill LSE indexing exceeds u32"
+        );
+        let native = if head_dim == 256
+            || matches!(
+                (heads, kv_heads, head_dim),
+                (16, 2, 128) | (16, 8, 128) | (12, 12, 128) | (32, 4, 128)
+            ) {
+            use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
+            let ctx = stream.context();
+            ensure!(
+                heads <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y)? as usize,
+                "prefill heads exceed grid limit"
+            );
+            let names: &[&str] = if head_dim == 256 {
+                &["attention_prefill_d256"]
+            } else if (heads, kv_heads) == (32, 4) {
+                &["attention_prefill_d128", "attention_prefill_d128_window"]
+            } else {
+                &[
+                    "attention_prefill_d128",
+                    "attention_prefill_d128_bidirectional",
+                    "attention_prefill_d128_prefix",
+                ]
+            };
+            let module = super::cubin::module(ctx, "attention_native")?;
+            let dynamic_shared = (384 * head_dim) as u32;
+            let mut functions = Vec::with_capacity(names.len());
+            for name in names {
+                let function = module.load_function(name)?;
+                let shared = function.get_attribute(F::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?;
+                let local = function.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
+                let registers = function.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
+                ensure!(
+                    local == 0 && registers <= 255,
+                    "native prefill {name} resource limit: registers={registers} local={local}"
+                );
+                ensure!(
+                    dynamic_shared as i32 + shared
+                        <= ctx
+                            .attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?,
+                    "native prefill {name} shared memory does not fit"
+                );
+                function.set_attribute(
+                    F::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    dynamic_shared as i32,
+                )?;
+                ensure!(
+                    function.occupancy_max_active_blocks_per_multiprocessor(
+                        128,
+                        dynamic_shared as usize,
+                        None
+                    )? > 0,
+                    "native prefill {name} has zero resident blocks"
+                );
+                functions.push(function);
+            }
+            functions
+        } else {
+            Vec::new()
+        };
+        let lse = stream.alloc_zeros(elements)?;
         let sink_rescale = super::cubin::module(stream.context(), "attention")?
             .load_function("attention_sink_rescale")?;
         Ok(Self {
             stream,
             lse,
             sink_rescale,
+            native,
+            geometry: [heads, kv_heads, head_dim],
         })
     }
 
-    /// Runs FA2 on one chunk. `q` is the normed, RoPE'd `[rows, q_heads,
+    /// Runs prefill attention on one chunk. `q` is the normed, RoPE'd `[rows, q_heads,
     /// head_dim]` view (head stride `head_dim`); `q_row_stride` is its element
     /// pitch between rows — 6144 for the Q38 split Q, not a fused qkv. `k` and
     /// `v` are the head-major caches `[kv_heads, capacity, head_dim]` that
@@ -97,18 +205,65 @@ impl Flash {
         out: &mut CudaSlice<bf16>,
         shape: Shape,
     ) -> Result<()> {
-        self.run_with_window(q, q_row_stride, k, v, out, shape)
+        let keys = shape
+            .start
+            .checked_add(shape.rows)
+            .context("prefill key extent overflow")?;
+        self.run_masked(Query {
+            q,
+            q_row_stride,
+            k,
+            v,
+            out,
+            shape,
+            keys,
+            prefix: None,
+        })
     }
 
-    fn run_with_window(
-        &mut self,
-        q: &CudaSlice<bf16>,
-        q_row_stride: usize,
-        k: &CudaSlice<bf16>,
-        v: &CudaSlice<bf16>,
-        out: &mut CudaSlice<bf16>,
-        shape: Shape,
-    ) -> Result<()> {
+    /// `keys` is the populated sequence extent; `prefix` enables bidirectional prefix rows.
+    pub fn run_masked(&mut self, query: Query<'_>) -> Result<()> {
+        let Query {
+            q,
+            q_row_stride,
+            k,
+            v,
+            out,
+            shape,
+            keys,
+            prefix,
+        } = query;
+        ensure!(
+            [shape.q_heads, shape.kv_heads, shape.head_dim] == self.geometry,
+            "prefill geometry differs from setup binding"
+        );
+        let end = shape
+            .start
+            .checked_add(shape.rows)
+            .context("prefill query extent overflow")?;
+        ensure!(
+            end <= keys && keys <= shape.capacity && keys <= i32::MAX as usize,
+            "prefill populated key extent does not cover queries or exceeds capacity"
+        );
+        ensure!(
+            prefix.is_none_or(|p| p <= keys),
+            "prefill prefix exceeds populated keys"
+        );
+        ensure!(
+            prefix.is_none() || !shape.causal,
+            "prefix-LM uses its own causal suffix mask"
+        );
+        let mode = if prefix.is_some() {
+            2
+        } else if shape.causal {
+            0
+        } else {
+            1
+        };
+        ensure!(
+            mode == 0 || (shape.window_left.is_none() && self.native.len() == 3),
+            "prefill mask is not bound for this geometry/window"
+        );
         ensure!(
             [
                 shape.rows,
@@ -128,10 +283,6 @@ impl Flash {
             "FA2 window exceeds i32"
         );
         ensure!(
-            shape.causal,
-            "FA2 prefill is causal-only; the non-causal path selects a zero-width local window"
-        );
-        ensure!(
             shape.head_dim == 128 || shape.head_dim == 256,
             "FA2 binds head dims 128 and 256 (got {})",
             shape.head_dim
@@ -149,14 +300,21 @@ impl Flash {
             "FA2 range exceeds cache"
         );
         ensure!(
-            q_row_stride >= shape.q_heads * shape.head_dim,
+            q_row_stride >= shape.q_heads * shape.head_dim
+                && q_row_stride <= u32::MAX as usize
+                && q_row_stride.is_multiple_of(8),
             "FA2 Q row pitch {q_row_stride} is below one head row"
         );
         ensure!(
             shape.rows * shape.q_heads <= self.lse.len(),
             "FA2 LSE buffer is too small"
         );
-        let q_span = shape.rows.saturating_sub(1) * q_row_stride + shape.q_heads * shape.head_dim;
+        let q_span = shape
+            .rows
+            .saturating_sub(1)
+            .checked_mul(q_row_stride)
+            .and_then(|span| span.checked_add(shape.q_heads * shape.head_dim))
+            .context("prefill Q extent overflow")?;
         ensure!(q_span <= q.len(), "FA2 Q buffer is too small");
         let cache_span = shape
             .capacity
@@ -177,6 +335,44 @@ impl Flash {
         let (v, _v) = v.device_ptr(&self.stream);
         let (out, _out) = out.device_ptr_mut(&self.stream);
         let (lse, _lse) = self.lse.device_ptr_mut(&self.stream);
+        if !self.native.is_empty() {
+            ensure!(
+                shape.window_left.is_none() || self.geometry == [32, 4, 128],
+                "native prefill window is not bound for this geometry"
+            );
+            let window = shape.window_left.is_some();
+            let native = self
+                .native
+                .get(if window { 1 } else { mode })
+                .context("native prefill mask is not bound")?;
+            let args = Attention {
+                q,
+                k,
+                v,
+                out,
+                lse,
+                rows: shape.rows as u32,
+                capacity: shape.capacity as u32,
+                q_stride: q_row_stride as u32,
+                q_heads: shape.q_heads as u32,
+                group: (shape.q_heads / shape.kv_heads) as u32,
+                start: shape.start as u32,
+            };
+            let extent = shape.window_left.or(prefix).unwrap_or(keys) as u32;
+            unsafe {
+                let mut launch = self.stream.launch_builder(native);
+                launch.arg(&args);
+                if mode != 0 || window {
+                    launch.arg(&extent);
+                }
+                launch.launch(LaunchConfig {
+                    grid_dim: (shape.rows.div_ceil(64) as u32, shape.q_heads as u32, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: (384 * shape.head_dim) as u32,
+                })?;
+            }
+            return Ok(());
+        }
         let status = if let Some(window_left) = shape.window_left {
             unsafe {
                 ff_fa2_run_window(
@@ -269,5 +465,19 @@ impl Flash {
                 })?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Attention;
+
+    #[test]
+    fn native_prefill_parameter_layout() {
+        assert_eq!(std::mem::size_of::<Attention>(), 64);
+        assert_eq!(std::mem::align_of::<Attention>(), 8);
+        assert_eq!(std::mem::offset_of!(Attention, rows), 40);
+        assert_eq!(std::mem::offset_of!(Attention, q_stride), 48);
+        assert_eq!(std::mem::offset_of!(Attention, start), 60);
     }
 }

@@ -1132,6 +1132,8 @@ impl Engine {
             stream.clone(),
             workspace_rows,
             model_spec.q_heads as usize,
+            model_spec.kv_heads as usize,
+            model_spec.head_dim as usize,
         )?);
         let (send_ptr, _send_guard) = work.n.device_ptr(stream);
         let send_cap_bytes = work.n.len() * size_of::<bf16>();

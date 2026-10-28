@@ -1070,7 +1070,13 @@ impl Engine {
         let chunk = workspace_rows;
         let mut work = Work::new(s, &model_spec, workspace_rows)?;
         s.memcpy_htod(&[1i32], &mut work.length)?;
-        let flash = Flash::new(s.clone(), workspace_rows, config.num_attention_heads)?;
+        let flash = Flash::new(
+            s.clone(),
+            workspace_rows,
+            config.num_attention_heads,
+            config.num_key_value_heads,
+            config.head_dim,
+        )?;
         s.synchronize()?;
         let mut engine = Self {
             #[cfg(test)]
@@ -1240,6 +1246,8 @@ impl Engine {
                 self.device.stream.clone(),
                 rows,
                 self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.config.head_dim,
             )?);
         }
         self.workspace_rows = rows;
