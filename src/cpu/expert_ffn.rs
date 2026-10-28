@@ -240,7 +240,7 @@ pub struct Scratch {
 }
 
 impl Scratch {
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(all(test, any(feature = "cuda", feature = "rocm")))]
     pub(crate) fn stages(&self) -> [&[bf16]; 4] {
         [&self.gate_bf, &self.up_bf, &self.activated, &self.down_bf]
     }

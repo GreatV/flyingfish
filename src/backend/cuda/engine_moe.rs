@@ -1462,7 +1462,7 @@ impl Decode {
         ))
     }
 
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(test)]
     pub fn finish(
         &mut self,
         device: &Device,
@@ -2329,7 +2329,7 @@ fn validate_dispatch(
     Ok(())
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 #[path = "engine_moe_tests.rs"]
 mod tests;
 

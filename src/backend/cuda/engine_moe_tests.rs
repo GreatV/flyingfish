@@ -1056,6 +1056,7 @@ impl Engine {
             tensors,
             manifest,
             bytes,
+            #[cfg(feature = "cuda")]
             upload_content_sha256: None,
             upload_hashed_bytes: None,
             load_wall_ms: 0.0,
@@ -1103,7 +1104,10 @@ impl Engine {
             true,
             "MoE layer gate".into(),
         ));
+        #[cfg(feature = "cuda")]
         let blas = Blas::new(&device, &ops, runtime, closure.clone())?;
+        #[cfg(feature = "rocm")]
+        let blas = Blas::new(stream.clone())?;
         let state = super::super::super::state::StateStore::new(&model_spec, 32, stream)?;
         let capture_checkpoint = Some(super::super::super::state::StateCheckpoint::new(
             &state,
@@ -1123,6 +1127,7 @@ impl Engine {
         let mut work =
             Work::new_with_peer_tail(stream, &model_spec, workspace_rows, peer_tail_elems)?;
         stream.memcpy_htod(&[1i32], &mut work.length)?;
+        #[cfg(feature = "cuda")]
         let flash = Some(Flash::new(
             stream.clone(),
             workspace_rows,
@@ -1130,6 +1135,7 @@ impl Engine {
         )?);
         let (send_ptr, _send_guard) = work.n.device_ptr(stream);
         let send_cap_bytes = work.n.len() * size_of::<bf16>();
+        #[cfg(feature = "cuda")]
         drop(_send_guard);
         let moe = Some(Decode::new(
             &device,
@@ -1207,20 +1213,26 @@ impl Engine {
             hidden_capture: None,
             capture_fail_after_layer: None,
             capture_fail_stage: None,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             flint_window_capture: None,
             qwen: None,
+            #[cfg(feature = "cuda")]
             recurrent: None,
             moe,
             moe_slots: Some(slots),
             moe_prefill,
             moe_test_ffn: Some(ffn),
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             flint_legacy_overflow_prefill: false,
+            #[cfg(feature = "cuda")]
             flint_frozen_decode_length: false,
+            #[cfg(feature = "cuda")]
             mtp: None,
+            #[cfg(feature = "cuda")]
             mtp_state: None,
+            #[cfg(feature = "cuda")]
             mtp_epoch: 0,
+            #[cfg(feature = "cuda")]
             images: None,
             qwen_device_prefix: false,
             forward_rows: (1..=workspace_rows).collect(),
@@ -1241,9 +1253,14 @@ impl Engine {
             work,
             ops,
             blas,
+            #[cfg(feature = "cuda")]
             flash,
             decode: None,
             flint_logits: None,
+            #[cfg(feature = "rocm")]
+            prefill_attention: None,
+            #[cfg(feature = "rocm")]
+            prefill_prefixes: stream.alloc_zeros(0)?,
             device,
             config,
             model_spec,
@@ -1252,7 +1269,9 @@ impl Engine {
             workspace_rows,
             trace_layer: 0,
             position: 0,
+            #[cfg(feature = "cuda")]
             prefix_identity: None,
+            #[cfg(feature = "cuda")]
             prefix_identity_load_ms: 0.0,
             logits_cache: PrefixLogitsCache::default(),
             committed_prefix_ids: Vec::new(),
@@ -1264,12 +1283,17 @@ impl Engine {
             &engine.model_spec,
             workspace_rows,
             32,
+            #[cfg(feature = "cuda")]
             crate::gdn_plan::GdnPolicy::for_device(&engine.device.info),
+            #[cfg(feature = "rocm")]
+            crate::gdn_plan::GdnPolicy::P2,
             8,
         )?)?;
         engine.qwen = Some(qwen::Runtime::new(
             &engine, runtime, catalog, None, scratch, None, 8,
         )?);
+        #[cfg(feature = "rocm")]
+        engine.prepare_hip_fixture()?;
         for rows in 1..=workspace_rows {
             engine.prepare_qwen(rows)?;
             engine.prepare_prefill_rows(rows)?;
@@ -1505,13 +1529,17 @@ fn graph_gate(format: crate::model_spec::ExpertFormat) -> Result<()> {
                 reference.set_token(token)?;
                 candidate.set_token(token)?;
                 {
-                    let _range =
-                        super::super::super::profile::Range::new(true, c"moe_graph_reference");
+                    let _range = super::super::super::profile::Range::new(
+                        cfg!(feature = "cuda"),
+                        c"moe_graph_reference",
+                    );
                     reference.decode(false, None)?;
                 }
                 {
-                    let _range =
-                        super::super::super::profile::Range::new(true, c"moe_graph_candidate");
+                    let _range = super::super::super::profile::Range::new(
+                        cfg!(feature = "cuda"),
+                        c"moe_graph_candidate",
+                    );
                     candidate.decode(true, None)?;
                 }
                 let a = reference.decode_logits()?;
@@ -2213,7 +2241,8 @@ fn combine_expected(engine: &Engine, contributions: &[bf16], rows: usize) -> Res
         },
     )?;
     stream.synchronize()?;
-    Ok(stream.clone_dtoh(&expected_out)?)
+    let output = stream.clone_dtoh(&expected_out)?;
+    Ok(output)
 }
 
 fn tier_cell(
@@ -2401,7 +2430,10 @@ fn tier_gate(
                 .end_request()?;
             let (mut host_choices, mut disk_choices, mut admissions) = (0, 0, 0);
             let mut event = 1;
-            let _range = super::super::super::profile::Range::new(true, c"engine_moe_residency");
+            let _range = super::super::super::profile::Range::new(
+                cfg!(feature = "cuda"),
+                c"engine_moe_residency",
+            );
             for (request, (target, rows)) in tier_schedule().into_iter().enumerate() {
                 let mut frequency = vec![vec![0.0; 16]; 2];
                 for layer in &mut frequency {
@@ -2747,7 +2779,10 @@ fn gate(row_cases: &[usize], variants: &[u32], cpu: bool) -> Result<()> {
                     .as_mut()
                     .context("gate slots absent")?
                     .begin_token()?;
-                let _range = super::super::super::profile::Range::new(true, c"engine_moe_ffn");
+                let _range = super::super::super::profile::Range::new(
+                    cfg!(feature = "cuda"),
+                    c"engine_moe_ffn",
+                );
                 engine.run_ffn(
                     0,
                     step(rows),
@@ -2796,7 +2831,8 @@ fn gate(row_cases: &[usize], variants: &[u32], cpu: bool) -> Result<()> {
             );
         }
         let axes = [0, 1];
-        let _range = super::super::super::profile::Range::new(true, c"engine_moe_hybrid");
+        let _range =
+            super::super::super::profile::Range::new(cfg!(feature = "cuda"), c"engine_moe_hybrid");
         for layer in 0..2 {
             let mut trace = Trace::default();
             engine.trace_layer = layer;
@@ -3001,6 +3037,7 @@ fn injected_layers_bind_hybrid_mixer_geometry() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
 #[test]
 #[ignore = "requires CUDA and FLYINGFISH_RUNTIME_DIR"]
 fn split_combine_matches_single_gpu_and_detects_perturbed_routed_peer_gpu() -> Result<()> {

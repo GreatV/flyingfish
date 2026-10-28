@@ -531,9 +531,9 @@ pub(in crate::backend::cuda::engine) struct Slots {
     readers: Vec<u32>,
     disk_cpu: Option<DiskExperts>,
     pub request_open: bool,
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(test)]
     pending_reads: u64,
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(test)]
     delay_request: bool,
 }
 
@@ -572,7 +572,7 @@ fn check_lifetime(expected: [Option<u64>; 2], owned: [Option<u64>; 2]) -> Result
     Ok(())
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 pub(super) fn delay_stream(stream: &Arc<CudaStream>) -> Result<()> {
     unsafe extern "C" fn delay(_: *mut std::ffi::c_void) {
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -580,12 +580,25 @@ pub(super) fn delay_stream(stream: &Arc<CudaStream>) -> Result<()> {
     stream.context().bind_to_thread()?;
     // SAFETY: the callback uses no CUDA API, shared data, or outstanding device work.
     unsafe {
+        #[cfg(feature = "cuda")]
         cudarc::driver::sys::cuLaunchHostFunc(
             stream.cu_stream(),
             Some(delay),
             std::ptr::null_mut(),
         )
         .result()?;
+        #[cfg(feature = "rocm")]
+        {
+            unsafe extern "C" {
+                fn hipLaunchHostFunc(
+                    stream: *mut std::ffi::c_void,
+                    callback: unsafe extern "C" fn(*mut std::ffi::c_void),
+                    data: *mut std::ffi::c_void,
+                ) -> i32;
+            }
+            let status = hipLaunchHostFunc(stream.raw(), delay, std::ptr::null_mut());
+            ensure!(status == 0, "HIP delayed-copy callback status={status}");
+        }
     }
     Ok(())
 }
@@ -758,9 +771,9 @@ impl Slots {
                 None
             },
             request_open: false,
-            #[cfg(all(test, feature = "cuda"))]
+            #[cfg(test)]
             pending_reads: 0,
-            #[cfg(all(test, feature = "cuda"))]
+            #[cfg(test)]
             delay_request: false,
         };
         let slots_new_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
@@ -1087,7 +1100,7 @@ impl Slots {
         self.moves
             .extend_from_slice(self.policy.begin_request(frequency)?);
         for index in 0..self.moves.len() {
-            #[cfg(all(test, feature = "cuda"))]
+            #[cfg(test)]
             if index + 1 == self.moves.len() && std::mem::take(&mut self.delay_request) {
                 delay_stream(&self.transfers.h2d)?;
             }
@@ -1172,7 +1185,7 @@ impl Slots {
             });
         }
         for index in 0..self.moves.len() {
-            #[cfg(all(test, feature = "cuda"))]
+            #[cfg(test)]
             if index + 1 == self.moves.len() && std::mem::take(&mut self.delay_request) {
                 delay_stream(&self.transfers.h2d)?;
             }
@@ -1213,7 +1226,7 @@ impl Slots {
                         physical.copy.as_ref().is_some_and(|copy| copy.id == id),
                         "slot={slot} copy event differs from residency id={id}"
                     );
-                    #[cfg(all(test, feature = "cuda"))]
+                    #[cfg(test)]
                     if !physical
                         .copy
                         .as_ref()
@@ -1422,7 +1435,7 @@ impl Slots {
         self.complete(device, decode, layer, ffn, activation, None)
     }
 
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(test)]
     pub(super) fn trace(&self, trace: &mut Trace) -> Result<()> {
         let geometry = self.catalogue.geometry();
         self.policy.ledger().check()?;
@@ -1486,13 +1499,13 @@ impl Slots {
         Ok(())
     }
 
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(test)]
     pub(super) fn delay_copies(&mut self) {
         self.delay_request = true;
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1524,6 +1537,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "authorized GPU window; device traps run in separate processes"]
     fn slot_publication_epochs_gpu() -> Result<()> {
