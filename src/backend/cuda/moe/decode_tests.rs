@@ -655,7 +655,9 @@ impl Gate<'_> {
             )?;
         }
         self.s.synchronize()?;
-        Ok(self.s.clone_dtoh(&io.y_dev)?)
+        self.s
+            .clone_dtoh(&io.y_dev)
+            .context("read MoE decode output")
     }
 
     /// contribute, then shared_scale and combine called directly.
@@ -691,7 +693,9 @@ impl Gate<'_> {
             self.combine.combine(self.s, &combine_input)?;
         }
         self.s.synchronize()?;
-        Ok(self.s.clone_dtoh(&io.y_dev)?)
+        self.s
+            .clone_dtoh(&io.y_dev)
+            .context("read MoE decode output")
     }
 
     /// contribute only, synchronized; trap children discriminate the error.
@@ -700,7 +704,7 @@ impl Gate<'_> {
         let input = self.input(rows, rt, io.contributions, &mut io.shared_out, &mut io.done)?;
         self.ops
             .contribute(self.s, &input, &self.scratch, self.expert_inter)?;
-        Ok(self.s.synchronize()?)
+        self.s.synchronize().context("synchronize MoE contribution")
     }
 }
 
@@ -1366,7 +1370,9 @@ impl W8Gate<'_> {
             )?;
         }
         self.s.synchronize()?;
-        Ok(self.s.clone_dtoh(&io.y_dev)?)
+        self.s
+            .clone_dtoh(&io.y_dev)
+            .context("read MoE decode output")
     }
 }
 

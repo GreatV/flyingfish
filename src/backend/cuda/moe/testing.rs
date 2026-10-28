@@ -1,7 +1,7 @@
 //! Shared helpers for the GPU-gate tests.
 use crate::backend::cuda::contracts::{Tensor, TensorMut, dense_layout};
 use crate::backend::gpu::{CudaSlice, CudaStream, DevicePtr, DeviceRepr, ValidAsZeroBits};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::Arc;
 
 pub(crate) fn capture(
@@ -30,7 +30,9 @@ pub(crate) fn upload<T: DeviceRepr>(
     stream: &Arc<CudaStream>,
     values: Vec<T>,
 ) -> Result<CudaSlice<T>> {
-    Ok(stream.clone_htod(&values)?)
+    stream
+        .clone_htod(&values)
+        .context("upload MoE gate fixture")
 }
 
 pub(crate) fn upload_device<T: DeviceRepr>(
@@ -51,7 +53,7 @@ pub(crate) fn zeros<T: DeviceRepr + ValidAsZeroBits>(
     stream: &Arc<CudaStream>,
     len: usize,
 ) -> Result<CudaSlice<T>> {
-    Ok(stream.alloc_zeros(len)?)
+    stream.alloc_zeros(len).context("allocate MoE gate output")
 }
 
 pub(crate) fn view<T: DeviceRepr + Copy, const R: usize>(

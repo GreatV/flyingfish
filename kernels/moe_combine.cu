@@ -10,6 +10,11 @@
 // must be contributed exactly once), or row out of range.
 #include "gpu_compat.cuh"
 
+#if defined(__HIP__)
+#define __hadd __hadd_rn
+#define __hmul __hmul_rn
+#endif
+
 using bf16 = __nv_bfloat16;
 
 // scale[row] = BF16(sigmoid(BF16(dot(x_row, shared_expert_gate)))).
