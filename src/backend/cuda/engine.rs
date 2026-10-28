@@ -5740,15 +5740,40 @@ impl Engine {
                 "HIP setup linear closure is incomplete or duplicated"
             );
             for choice in &setup.linear {
+                ensure!(
+                    !self.blas.wmma_candidate(choice.shape) || choice.setup_median_ms.is_some(),
+                    "HIP linear closure lacks WMMA/library setup selection"
+                );
                 self.blas.prepare_choice(choice.shape, None, Some(choice))?;
             }
             setup
         } else {
-            let linear = profile
-                .linear
-                .iter()
-                .map(|&shape| self.blas.prepare_choice(shape, None, None))
-                .collect::<Result<Vec<_>>>()?;
+            let mut linear = Vec::with_capacity(profile.linear.len());
+            for &shape in &profile.linear {
+                if self.blas.wmma_candidate(shape) {
+                    self.closure.measurement()?;
+                    let values: Vec<_> = (0..shape.rows * shape.input)
+                        .map(|i| bf16::from_f32(((i * 17 + 31) % 257) as f32 / 256.0 - 0.5))
+                        .collect();
+                    let input = self.device.stream.clone_htod(&values)?;
+                    let c = &self.config;
+                    let layer = &self.weights.layers[0];
+                    let weight = [
+                        (&self.weights.head, c.vocab_size, c.hidden_size),
+                        (&layer.qkv, c.qkv_dim(), c.hidden_size),
+                        (&layer.o, c.hidden_size, c.hidden_size),
+                        (&layer.gu, 2 * c.intermediate_size, c.hidden_size),
+                        (&layer.down, c.hidden_size, c.intermediate_size),
+                    ]
+                    .into_iter()
+                    .find(|(_, output, input)| *output == shape.output && *input == shape.input)
+                    .map(|(weight, _, _)| weight)
+                    .context("HIP calibration shape has no model weight binding")?;
+                    linear.push(self.blas.calibrate_shape(shape, weight, &input)?);
+                } else {
+                    linear.push(self.blas.prepare_choice(shape, None, None)?);
+                }
+            }
             let setup = HipSetup {
                 identity: identity.clone(),
                 profile,
@@ -5784,7 +5809,7 @@ impl Engine {
             .finish_with_key(setup.profile, manifest, identity)?;
         eprintln!(
             "{}",
-            serde_json::json!({"hip_setup": {"cached": cached, "measurements": 0, "decode": decode, "prefill": prefill, "prefill_rows": prepared_rows, "gemm_rows": self.chunk, "calibration": "untuned correctness-only"}})
+            serde_json::json!({"hip_setup": {"cached": cached, "measurements": if cached { 0 } else { setup.linear.iter().filter(|c| c.setup_median_ms.is_some()).count() }, "decode": decode, "prefill": prefill, "prefill_rows": prepared_rows, "gemm_rows": self.chunk, "calibration": "untuned correctness-only"}})
         );
         Ok(())
     }

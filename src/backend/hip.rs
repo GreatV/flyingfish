@@ -285,6 +285,18 @@ impl Context {
         ensure!(self.properties.warp == 32, "{operation} requires wave32");
         Ok(())
     }
+    pub fn supports_wmma(&self) -> bool {
+        self.properties.warp == 32 && self.architecture.starts_with("gfx11")
+    }
+    pub fn require_wmma(&self) -> Result<()> {
+        ensure!(
+            self.supports_wmma(),
+            "HIP BF16 WMMA requires gfx11 wave32; detected {} wave{}",
+            self.architecture,
+            self.properties.warp
+        );
+        Ok(())
+    }
 }
 
 pub struct Stream {

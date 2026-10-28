@@ -1,3 +1,71 @@
+#if defined(__HIP__)
+#include "gpu_compat.cuh"
+
+using bf16 = __nv_bfloat16;
+using Bf16Fragment = short __attribute__((ext_vector_type(16)));
+using AccFragment = float __attribute__((ext_vector_type(8)));
+
+// Four wave32 groups reduce disjoint K intervals; W[out,ldw], X[m,in], Y[m,out].
+extern "C" __global__ __launch_bounds__(128) void gemm_skinny_bf16(
+    const bf16* __restrict__ W, const bf16* __restrict__ X,
+    bf16* __restrict__ Y, const bf16* __restrict__ bias,
+    int out_features, int in_features, unsigned long ldw, int m) {
+    if (blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 ||
+        gridDim.x != (out_features + 15) / 16 || gridDim.y != 1 || gridDim.z != 1 ||
+        m < 1 || m > 16 || in_features < 1 || out_features < 1 || ldw < in_features)
+        __trap();
+    __shared__ unsigned short staging[4096];
+    const int tid = threadIdx.x;
+    const int wave = tid / 32;
+    const int lane = tid % 32;
+    const int base = blockIdx.x * 16;
+    const int panels = (in_features + 127) / 128;
+    unsigned short* weights = staging + wave * 1024;
+    unsigned short* inputs = weights + 512;
+    AccFragment acc = {};
+    for (int panel = 0; panel < panels; ++panel) {
+        const int begin = (wave * panels + panel) * 32;
+        for (int cell = lane; cell < 512; cell += 32) {
+            const int row = cell / 32;
+            const int k = begin + cell % 32;
+            weights[cell] = base + row < out_features && k < in_features
+                ? reinterpret_cast<const unsigned short*>(W)[(size_t)(base + row) * ldw + k] : 0;
+            inputs[cell] = row < m && k < in_features
+                ? reinterpret_cast<const unsigned short*>(X)[(size_t)row * in_features + k] : 0;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            Bf16Fragment a, b;
+#pragma unroll
+            for (int k = 0; k < 16; ++k) {
+                a[k] = weights[(lane % 16) * 32 + half * 16 + k];
+                b[k] = inputs[(lane % 16) * 32 + half * 16 + k];
+            }
+            acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+        }
+        __syncthreads();
+    }
+    float* partials = reinterpret_cast<float*>(staging);
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        const int row = 2 * g + lane / 16;
+        partials[wave * 256 + row * 16 + lane % 16] = acc[g];
+    }
+    __syncthreads();
+    for (int cell = tid; cell < 256; cell += 128) {
+        const int output = base + cell / 16;
+        const int row = cell % 16;
+        if (output < out_features && row < m) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int w = 0; w < 4; ++w) sum += partials[w * 256 + cell];
+            if (bias) sum += __bfloat162float(bias[output]);
+            Y[(size_t)row * out_features + output] = __float2bfloat16(sum);
+        }
+    }
+}
+#else
 // Skinny GEMM on bf16 tensor cores: M activation rows share one streaming weight read.
 //   Y[m, out] = X[m, in] @ W[out, in]^T
 //   W: bf16 row-major [out,in], row stride ldw elements (packed: ldw == in).
@@ -206,3 +274,5 @@ extern "C" __global__ void __launch_bounds__(NT_) gemm_skinny_bf16(
 }
 
 #undef FD_GUARD_SKINNY
+
+#endif
