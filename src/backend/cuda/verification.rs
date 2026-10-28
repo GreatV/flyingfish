@@ -82,10 +82,13 @@ impl Verification {
             causal,
         } = shape;
         #[cfg(feature = "rocm")]
-        ensure!(
-            selected.implementation == MultiImpl::V1,
-            "HIP attention requires SIMT V1; TCMQA mma/ldmatrix/cp.async is unsupported"
-        );
+        if selected.implementation != MultiImpl::V1 {
+            ctx.require_wmma()?;
+            ensure!(
+                selected.implementation == MultiImpl::Tcmqa,
+                "HIP TCMQA requires the native 64-pair WMMA plan"
+            );
+        }
         let plan = selected.launch;
         let implementation = selected.implementation;
         let phase1 = implementation.phase1();
@@ -198,6 +201,16 @@ impl Verification {
                 implementation.phase1_smem_bytes() as i32,
             )?;
         }
+        #[cfg(feature = "rocm")]
+        ensure!(
+            first_smem <= ctx.properties.shared_bytes as usize
+                && first.occupancy_max_active_blocks_per_multiprocessor(
+                    plan.threads,
+                    first_smem,
+                    None
+                )? > 0,
+            "HIP MQ phase1 has zero occupancy or exceeds LDS"
+        );
         let second = module.load_function(if implementation == MultiImpl::V1 {
             "flash_decode_mq_phase2"
         } else if implementation.short_merge() {

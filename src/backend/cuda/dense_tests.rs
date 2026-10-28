@@ -124,6 +124,7 @@ fn dense_runtime_gpu() -> Result<()> {
         );
         if wmma_cells(&info) {
             wmma_gate(&s, &mut gate)?;
+            tcmqa_gate(&ctx, &s, &c, &mut gate)?;
         } else {
             println!("WMMA cells NOT_COVERED arch={}", info.arch);
         }
@@ -702,12 +703,31 @@ fn attention_reference(
     start: usize,
     capacity: usize,
 ) -> Vec<bf16> {
+    let masks: Vec<_> = (0..rows)
+        .map(|row| u64::MAX >> (63 - row.min(63)))
+        .collect();
+    masked_attention_reference(q, k, v, start, capacity, &masks)
+}
+
+fn masked_attention_reference(
+    q: &[bf16],
+    k: &[bf16],
+    v: &[bf16],
+    start: usize,
+    capacity: usize,
+    masks: &[u64],
+) -> Vec<bf16> {
+    let rows = masks.len();
     let mut out = vec![bf16::ZERO; rows * 2048];
     for row in 0..rows {
         for head in 0..16 {
             let kh = head / 8;
-            let len = start + row + 1;
-            let scores: Vec<_> = (0..len)
+            let positions: Vec<_> = (0..start + rows)
+                .filter(|&pos| pos < start || masks[row] & (1u64 << (pos - start)) != 0)
+                .collect();
+            let scores: Vec<_> = positions
+                .iter()
+                .copied()
                 .map(|pos| {
                     (0..128)
                         .map(|d| {
@@ -725,7 +745,9 @@ fn attention_reference(
                 let value = probabilities
                     .iter()
                     .enumerate()
-                    .map(|(pos, &p)| p * f64::from(v[(kh * capacity + pos) * 128 + d].to_f32()))
+                    .map(|(j, &p)| {
+                        p * f64::from(v[(kh * capacity + positions[j]) * 128 + d].to_f32())
+                    })
                     .sum::<f64>()
                     / sum;
                 out[row * 2048 + head * 128 + d] = bf16::from_f32(value as f32);
@@ -733,6 +755,170 @@ fn attention_reference(
         }
     }
     out
+}
+
+#[cfg(feature = "rocm")]
+fn tcmqa_gate(
+    ctx: &Arc<CudaContext>,
+    s: &Arc<CudaStream>,
+    c: &Config,
+    gate: &mut Gate,
+) -> Result<()> {
+    for (capacity, rows, start) in [
+        (129usize, 1usize, 127usize),
+        (129, 3, 63),
+        (129, 7, 1),
+        (129, 8, 64),
+        (129, 16, 113),
+        (129, 33, 63),
+        (129, 64, 65),
+        (4096, 8, 4088),
+    ] {
+        let q = pattern(rows * 2560, 7);
+        let k = pattern(2 * capacity * 128, 9);
+        let v = pattern(2 * capacity * 128, 11);
+        let mut dq = s.clone_htod(&q)?;
+        let dk = s.clone_htod(&k)?;
+        let dv = s.clone_htod(&v)?;
+        let prefix = s.clone_htod(&[start as i32])?;
+        let guard = bf16::from_f32(13.0);
+        let mut output = s.clone_htod(&vec![guard; (rows + 1) * 2048])?;
+        for causal in [true, false] {
+            let masks: Vec<_> = (0..rows)
+                .map(|row| {
+                    if causal {
+                        u64::MAX >> (63 - row)
+                    } else {
+                        1 | (1u64 << row) | (1u64 << (row / 2))
+                    }
+                })
+                .collect();
+            let expected = masked_attention_reference(&q, &k, &v, start, capacity, &masks);
+            let shape = verification::Shape {
+                rows,
+                start,
+                q_heads: 16,
+                kv_heads: 2,
+                capacity,
+                head_dim: 128,
+                causal,
+                window_left: None,
+            };
+            let mut mq = verification::Verification::with_plan(
+                ctx,
+                s,
+                c,
+                MultiShape {
+                    rows,
+                    capacity,
+                    causal,
+                },
+                MultiPlan {
+                    implementation: MultiImpl::Tcmqa,
+                    launch: AttentionPlan {
+                        chunk: 64,
+                        qpack: 8,
+                        threads: 128,
+                        merge_threads: 256,
+                    },
+                },
+            )?;
+            let mut ancestors = s.clone_htod(&masks)?;
+            if causal {
+                mq.run(&dq, &dk, &dv, &mut output, &prefix, shape)?;
+            } else {
+                mq.run_tree(
+                    verification::Query {
+                        qkv: &dq,
+                        k: &dk,
+                        v: &dv,
+                        out: &mut output,
+                        prefix: &prefix,
+                        shape,
+                    },
+                    &ancestors,
+                )?;
+            }
+            gate.compare(
+                &format!("tcmqa.{capacity}.{rows}.{start}.causal{causal}"),
+                &s.clone_dtoh(&output.slice(..rows * 2048))?,
+                &expected,
+                2,
+                capacity + 128,
+            )?;
+            gate.check(
+                "tcmqa.output_guard",
+                s.clone_dtoh(&output.slice(rows * 2048..))?
+                    .iter()
+                    .all(|&x| x == guard),
+            );
+            if !causal {
+                let same_query: Vec<_> = q[..2560]
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(rows * 2560)
+                    .collect();
+                s.memcpy_htod(&same_query, &mut dq)?;
+                s.memcpy_htod(&vec![1u64; rows], &mut ancestors)?;
+                mq.run_tree(
+                    verification::Query {
+                        qkv: &dq,
+                        k: &dk,
+                        v: &dv,
+                        out: &mut output,
+                        prefix: &prefix,
+                        shape,
+                    },
+                    &ancestors,
+                )?;
+                let actual = s.clone_dtoh(&output.slice(..rows * 2048))?;
+                gate.check(
+                    "tcmqa.batch_position_identity",
+                    actual.chunks_exact(2048).all(|row| row == &actual[..2048]),
+                );
+                s.memcpy_htod(&q, &mut dq)?;
+                if rows == 7 {
+                    let mut mutant_v = v.clone();
+                    for head in 0..2 {
+                        mutant_v
+                            [(head * capacity + start) * 128..(head * capacity + start + 1) * 128]
+                            .fill(bf16::from_f32(16.0));
+                    }
+                    let mutant_v = s.clone_htod(&mutant_v)?;
+                    let reference = masked_attention_reference(
+                        &q,
+                        &k,
+                        &s.clone_dtoh(&mutant_v)?,
+                        start,
+                        capacity,
+                        &vec![1; rows],
+                    );
+                    s.memcpy_htod(&vec![2u64; rows], &mut ancestors)?;
+                    mq.run_tree(
+                        verification::Query {
+                            qkv: &dq,
+                            k: &dk,
+                            v: &mutant_v,
+                            out: &mut output,
+                            prefix: &prefix,
+                            shape,
+                        },
+                        &ancestors,
+                    )?;
+                    let actual = s.clone_dtoh(&output.slice(..rows * 2048))?;
+                    gate.check(
+                        "tcmqa.ancestor_index_mutant_rejected",
+                        actual
+                            .iter()
+                            .zip(reference)
+                            .any(|(a, b)| (a.to_f32() - b.to_f32()).abs() > 1.0),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn attention_gate(
