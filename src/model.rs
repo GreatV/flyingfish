@@ -340,13 +340,15 @@ pub const LAYER: [crate::backend::Operator; 10] = [
     crate::backend::Operator::NextNorm,
 ];
 
-/// Model-independent layer skeleton. A mixer replaces the four Llama attention steps.
+/// Model-independent layer skeleton. A mixer replaces the four Llama attention steps; the
+/// per-layer-input stage follows the FFN when the spec carries a per-layer input width.
 #[derive(Clone, Copy, Debug)]
 pub enum LayerStage {
     Common(crate::backend::Operator),
     Mixer(crate::model_spec::Mixer),
     Ffn,
     Hc(HcStage),
+    PerLayerInput,
 }
 
 /// Manifold-constrained hyper-connection stage around a residual branch.
@@ -444,6 +446,7 @@ pub fn hc_stage_plan(stage: usize, kind: HcStage, policy: HcPrePolicy) -> Result
 pub enum LayerProgram {
     Standard([LayerStage; 5]),
     Hc([LayerStage; 9]),
+    PerLayerInput([LayerStage; 6]),
 }
 
 pub fn layer_program(
@@ -457,6 +460,16 @@ pub fn layer_program(
         .get(layer)
         .context("layer outside model plan")?
         .mixer;
+    if spec.per_layer_input.is_some() {
+        return Ok(LayerProgram::PerLayerInput([
+            LayerStage::Common(O::Norm),
+            LayerStage::Mixer(mixer),
+            LayerStage::Common(O::PostNorm),
+            LayerStage::Ffn,
+            LayerStage::PerLayerInput,
+            LayerStage::Common(O::NextNorm),
+        ]));
+    }
     match spec.architecture {
         crate::model_spec::Architecture::DeepseekV41
         | crate::model_spec::Architecture::Glm5Next => Ok(LayerProgram::Hc([
@@ -474,7 +487,8 @@ pub fn layer_program(
         | crate::model_spec::Architecture::Qwen35Text
         | crate::model_spec::Architecture::MiniCpmV47
         | crate::model_spec::Architecture::Flint
-        | crate::model_spec::Architecture::LoopVl => Ok(LayerProgram::Standard([
+        | crate::model_spec::Architecture::LoopVl
+        | crate::model_spec::Architecture::Gemma4 => Ok(LayerProgram::Standard([
             LayerStage::Common(O::Norm),
             LayerStage::Mixer(mixer),
             LayerStage::Common(O::PostNorm),

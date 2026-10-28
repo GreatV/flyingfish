@@ -1994,6 +1994,7 @@ impl Engine {
         let stages: &[crate::model::LayerStage] = match &program {
             crate::model::LayerProgram::Standard(stages) => &stages[..],
             crate::model::LayerProgram::Hc(stages) => &stages[..],
+            crate::model::LayerProgram::PerLayerInput(stages) => &stages[..],
         };
         for (position, &stage) in stages.iter().enumerate() {
             match stage {
@@ -2006,6 +2007,9 @@ impl Engine {
                 crate::model::LayerStage::Ffn => self.run_ffn(layer, step, trace)?,
                 crate::model::LayerStage::Hc(kind) => {
                     self.run_hc_stage(position, kind, layer, step)?
+                }
+                crate::model::LayerStage::PerLayerInput => {
+                    anyhow::bail!("per-layer input stage has no bound runtime")
                 }
             }
             #[cfg(test)]

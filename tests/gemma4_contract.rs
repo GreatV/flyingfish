@@ -1,6 +1,10 @@
 //! Gemma 4 model-contract gates.
 use anyhow::{Context, Result, ensure};
-use flyingfish::model_spec::{Architecture, FfnKind, LayerGeometry, ModelSpec, RopeSpec};
+use flyingfish::{
+    backend::Operator,
+    model::{LayerStage, layer_program},
+    model_spec::{Architecture, FfnKind, LayerGeometry, Mixer, ModelSpec, RopeSpec},
+};
 use serde_json::{Value, json};
 
 const E2B: &str = include_str!("data/gemma4-e2b-config.json");
@@ -179,6 +183,43 @@ fn existing_specs_serialize_without_the_gemma4_fields() -> Result<()> {
             && !text.contains("logit_softcap")
             && !text.contains("per_layer_input"),
         "Flint spec serialization gained Gemma 4 fields"
+    );
+    Ok(())
+}
+
+#[test]
+fn per_layer_input_stage_follows_the_ffn_only_when_the_spec_carries_it() -> Result<()> {
+    for text in [E2B, E4B] {
+        let (_, mut spec) = read(text)?;
+        for layer in 0..spec.layers.len() {
+            let program = layer_program(&spec, layer)?;
+            ensure!(
+                program.len() == 6
+                    && matches!(program[0], LayerStage::Common(Operator::Norm))
+                    && matches!(program[1], LayerStage::Mixer(Mixer::FullAttention))
+                    && matches!(program[2], LayerStage::Common(Operator::PostNorm))
+                    && matches!(program[3], LayerStage::Ffn)
+                    && matches!(program[4], LayerStage::PerLayerInput)
+                    && matches!(program[5], LayerStage::Common(Operator::NextNorm)),
+                "layer {layer}: {program:?}"
+            );
+        }
+        spec.per_layer_input = None;
+        let program = layer_program(&spec, 0)?;
+        ensure!(
+            program.len() == 5
+                && !program
+                    .iter()
+                    .any(|stage| matches!(stage, LayerStage::PerLayerInput))
+                && matches!(program[4], LayerStage::Common(Operator::NextNorm)),
+            "specs without a per-layer input width keep the five-stage program: {program:?}"
+        );
+    }
+    let root: Value = serde_json::from_str(include_str!("data/flint-config.json"))?;
+    let flint = ModelSpec::flint(&root, &json!({"eos_token_id": [150001]}))?;
+    ensure!(
+        layer_program(&flint, 0)?.len() == 5,
+        "Flint program arity changed"
     );
     Ok(())
 }
