@@ -314,7 +314,12 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_window(
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128_window(p: Attention, window: u32) {
     unsafe {
-        attention::<128, 16, 3>(p, p.start + p.rows, window, core::f32::consts::FRAC_1_SQRT_2 / 8.0);
+        attention::<128, 16, 3>(
+            p,
+            p.start + p.rows,
+            window,
+            core::f32::consts::FRAC_1_SQRT_2 / 8.0,
+        );
     }
 }
 
@@ -356,11 +361,6 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
             address(0, copy_row, copy_col, D as u32),
             address(0, copy_row + 1024 / D as u32, copy_col, D as u32),
         ];
-        let first = if MODE == 3 {
-            diagonal.saturating_sub(prefix) / 64 * 64
-        } else {
-            0
-        };
         let kv = (head / p.group) as usize * p.capacity as usize * D;
         let first = if MODE == 3 {
             diagonal.saturating_sub(prefix) / 64 * 64
