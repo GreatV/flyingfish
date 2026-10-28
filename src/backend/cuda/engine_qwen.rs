@@ -1148,6 +1148,28 @@ impl Runtime {
                     &TensorMut(matrix(&work.out, stream, 0, rows, hidden)?),
                     invariant,
                 )?;
+                if matches!(layer.ffn, BoundFfn::Dense) {
+                    let intermediate = engine.model_spec.intermediate as usize;
+                    for (role, offset) in [
+                        ("mlp.gate_proj.weight", 0),
+                        ("mlp.up_proj.weight", extent * intermediate),
+                    ] {
+                        layer.linear.bind_call(
+                            ops,
+                            role,
+                            input,
+                            &TensorMut(matrix(&work.gu, stream, offset, rows, intermediate)?),
+                            invariant,
+                        )?;
+                    }
+                    layer.linear.bind_call(
+                        ops,
+                        "mlp.down_proj.weight",
+                        matrix(&work.act, stream, 0, rows, intermediate)?,
+                        &TensorMut(matrix(&work.out, stream, 0, rows, hidden)?),
+                        invariant,
+                    )?;
+                }
             }
         }
         Ok(())
