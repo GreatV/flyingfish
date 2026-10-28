@@ -523,6 +523,9 @@ impl Stream {
     /// # Safety
     /// Both spans must be valid for `bytes` and ordered on this stream through completion.
     pub unsafe fn copy_raw(&self, dst: u64, src: u64, bytes: usize, kind: i32) -> Result<()> {
+        if kind != 3 {
+            self.require_eager("host copy")?;
+        }
         self.context.bind_to_thread()?;
         if bytes > 0 {
             unsafe {
@@ -877,6 +880,7 @@ impl<T> ViewMut<'_, T> {
 }
 /// # Safety
 /// The returned pointer must cover `len` elements and remain live for the guard's borrow.
+/// During capture its storage must be retained by the stream, or `check_stream` must reject access.
 pub unsafe trait DevicePtr<T> {
     fn len(&self) -> usize;
     fn check_stream(&self, stream: &Arc<Stream>) -> Result<()>;
@@ -1072,6 +1076,7 @@ impl Launch<'_> {
     }
     /// # Safety
     /// Raw pointer arguments, aliasing, launch shape and inter-stream dependencies must match the kernel contract.
+    /// Captured raw pointer arguments must remain live until the graph is destroyed.
     pub unsafe fn launch(&mut self, config: LaunchConfig) -> Result<()> {
         ensure!(
             Arc::ptr_eq(&self.stream.context, &self.function.module.context),

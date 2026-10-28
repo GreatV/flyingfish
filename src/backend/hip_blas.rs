@@ -226,6 +226,8 @@ impl Drop for Handles {
     }
 }
 
+type Binding = (LinearShape, Option<u64>);
+
 pub struct Blas {
     stream: Arc<CudaStream>,
     handles: Arc<Handles>,
@@ -233,7 +235,7 @@ pub struct Blas {
     workspace: CudaSlice<u8>,
     skinny: Option<CudaFunction>,
     // Every plan accumulates in FP32 and adds bias before the BF16 output rounding.
-    plans: RefCell<BTreeMap<(LinearShape, Option<u64>), Arc<Plan>>>,
+    plans: RefCell<BTreeMap<Binding, Arc<Plan>>>,
 }
 impl Blas {
     pub fn new(stream: Arc<CudaStream>) -> Result<Self> {
