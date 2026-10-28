@@ -203,7 +203,7 @@ fn hybrid_model_identity_gpu() -> Result<()> {
         for (repeat, graph) in [false, true, false].into_iter().enumerate() {
             let mut cell_defects = 0;
             model.reset()?;
-            let mut token = reference_prefill(&mut model, &ids)?;
+            let mut token = model.prefill(&ids, None)?;
             let mut file = std::fs::File::create_new(
                 output.join(format!("text{rows}-repeat{repeat}-graph{graph}.bin")),
             )?;
