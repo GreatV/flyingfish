@@ -357,16 +357,15 @@ impl FullAttentionOps {
             F::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
             PHASE1_SMEM as i32,
         )?;
-        let resident = u64::from(
-            function
-                .occupancy_max_active_blocks_per_multiprocessor(
-                    PHASE1_THREADS,
-                    PHASE1_SMEM as usize,
-                    None,
-                )
-                .context("decode attention phase1 occupancy query")?,
-        );
+        let resident = function
+            .occupancy_max_active_blocks_per_multiprocessor(
+                PHASE1_THREADS,
+                PHASE1_SMEM as usize,
+                None,
+            )
+            .context("decode attention phase1 occupancy query")?;
         ensure!(resident > 0, "decode attention phase1 has zero occupancy");
+        let resident = resident as u64;
         let wave = (sms
             .checked_mul(resident)
             .context("decode attention resident grid overflow")?
