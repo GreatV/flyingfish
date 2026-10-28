@@ -223,3 +223,210 @@ fn per_layer_input_stage_follows_the_ffn_only_when_the_spec_carries_it() -> Resu
     );
     Ok(())
 }
+
+struct Fixtures {
+    bytes: Vec<u8>,
+}
+
+impl Fixtures {
+    fn read(file: &str) -> Result<Self> {
+        let dir = std::env::var_os("FF_GEMMA4_FIXTURES").context("FF_GEMMA4_FIXTURES missing")?;
+        Ok(Self {
+            bytes: std::fs::read(std::path::Path::new(&dir).join(file))?,
+        })
+    }
+
+    fn tensor(&self, name: &str) -> Result<Vec<f32>> {
+        let tensors = safetensors::SafeTensors::deserialize(&self.bytes)?;
+        let view = tensors.tensor(name)?;
+        ensure!(
+            view.dtype() == safetensors::Dtype::BF16,
+            "{name} is not BF16"
+        );
+        Ok(view
+            .data()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| half::bf16::from_le_bytes(*b).to_f32())
+            .collect())
+    }
+}
+
+struct Layout {
+    heads: usize,
+    kv_heads: usize,
+    d: usize,
+}
+
+/// REFERENCE_ATTENTION: test-side F32/F64 attention over one layer's bound K/V `[kv_heads, keys, d]`; no attention kernel is launched.
+fn reference_attention(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    layout: &Layout,
+    positions: &[usize],
+    window: Option<usize>,
+    scale: f64,
+) -> Vec<f32> {
+    let Layout { heads, kv_heads, d } = *layout;
+    let group = heads / kv_heads;
+    let span = k.len() / (kv_heads * d);
+    let mut out = vec![0f32; positions.len() * heads * d];
+    for (row, &i) in positions.iter().enumerate() {
+        let lo = window.map_or(0, |w| (i + 1).saturating_sub(w));
+        for h in 0..heads {
+            let kv = h / group;
+            let query = &q[(i * heads + h) * d..(i * heads + h + 1) * d];
+            let scores: Vec<f64> = (lo..=i)
+                .map(|j| {
+                    let key = &k[(kv * span + j) * d..(kv * span + j + 1) * d];
+                    query
+                        .iter()
+                        .zip(key)
+                        .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                        .sum::<f64>()
+                        * scale
+                })
+                .collect();
+            let peak = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let weights: Vec<f64> = scores.iter().map(|s| (s - peak).exp()).collect();
+            let total: f64 = weights.iter().sum();
+            for e in 0..d {
+                let acc: f64 = (lo..=i)
+                    .zip(&weights)
+                    .map(|(j, w)| w * f64::from(v[(kv * span + j) * d + e]))
+                    .sum();
+                out[(row * heads + h) * d + e] = (acc / total) as f32;
+            }
+        }
+    }
+    out
+}
+
+/// Frozen bound (PLAN G4-S2a §4): cosine >= 0.9999 and max abs error <= 2^-6 * max|reference|, per head.
+fn heads_pass(got: &[f32], reference: &[f32], layout: &Layout, rows: usize) -> Vec<bool> {
+    let Layout { heads, d, .. } = *layout;
+    (0..heads)
+        .map(|h| {
+            let (mut dot, mut a, mut b, mut worst, mut peak) = (0f64, 0f64, 0f64, 0f64, 0f64);
+            for row in 0..rows {
+                for e in 0..d {
+                    let (x, y) = (
+                        f64::from(got[(row * heads + h) * d + e]),
+                        f64::from(reference[(row * heads + h) * d + e]),
+                    );
+                    dot += x * y;
+                    a += x * x;
+                    b += y * y;
+                    worst = worst.max((x - y).abs());
+                    peak = peak.max(y.abs());
+                }
+            }
+            let cosine = dot / (a.sqrt() * b.sqrt());
+            cosine.is_finite() && cosine >= 0.9999 && worst <= peak / 64.0
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "CPU-only; requires FF_GEMMA4_FIXTURES"]
+fn kv_sharing_window_and_scale_match_the_definition_reference_attention() -> Result<()> {
+    let fixtures = Fixtures::read("attn.safetensors")?;
+    let positions: Vec<usize> = [0usize, 1, 255, 511, 512, 513, 1023, 1024, 1025, 1535]
+        .into_iter()
+        .chain((0..17).map(|k| 520 + 61 * k))
+        .collect();
+    const T: usize = 1536;
+    let (mut defects, mut undetected, mut cases) = (0, 0, 0);
+    for (tag, text, sample) in [
+        ("e2b", E2B, [0usize, 4, 13, 14, 15, 19, 34]),
+        ("e4b", E4B, [0usize, 5, 22, 23, 24, 29, 41]),
+    ] {
+        let (_, spec) = read(text)?;
+        let heads = spec.q_heads as usize;
+        let kv_heads = spec.kv_heads as usize;
+        let mut slots: Vec<Option<(Vec<f32>, Vec<f32>)>> = vec![None; spec.layers.len()];
+        for &l in &sample {
+            if !geometry(&spec, l)?.kv_reader {
+                slots[l] = Some((
+                    fixtures.tensor(&format!("att.{tag}.l{l}.k"))?,
+                    fixtures.tensor(&format!("att.{tag}.l{l}.v"))?,
+                ));
+            }
+        }
+        for &l in &sample {
+            let g = geometry(&spec, l)?;
+            let layout = Layout {
+                heads,
+                kv_heads,
+                d: g.head_dim as usize,
+            };
+            let q = fixtures.tensor(&format!("att.{tag}.l{l}.q"))?;
+            let reference = fixtures.tensor(&format!("att.{tag}.l{l}.out"))?;
+            ensure!(q.len() == T * heads * layout.d, "{tag} l{l} q extent");
+            let window = spec.layers[l].sliding_window.map(|w| w as usize);
+            let bound = |slot: usize| -> Result<&(Vec<f32>, Vec<f32>)> {
+                slots[slot]
+                    .as_ref()
+                    .with_context(|| format!("{tag} layer {l}: slot {slot} was never written"))
+            };
+            let run = |slot: usize, window: Option<usize>, scale: f64| -> Result<Vec<bool>> {
+                let (k, v) = bound(slot)?;
+                let got = reference_attention(&q, k, v, &layout, &positions, window, scale);
+                Ok(heads_pass(&got, &reference, &layout, positions.len()))
+            };
+            let slot = spec.layers[l].state_index as usize;
+            let ok = run(slot, window, 1.0)?;
+            println!(
+                "GEMMA4_ATTENTION REFERENCE_ATTENTION {tag} layer={l} kind={} reader={} slot={slot} heads_passing={}/{}",
+                if window.is_some() { "sliding" } else { "full" },
+                g.kv_reader,
+                ok.iter().filter(|x| **x).count(),
+                heads
+            );
+            defects += usize::from(!ok.iter().all(|x| *x));
+            let mut mutants: Vec<(&str, Vec<bool>)> = vec![(
+                "scale_inv_sqrt_d",
+                run(slot, window, 1.0 / (layout.d as f64).sqrt())?,
+            )];
+            if let Some(w) = window {
+                mutants.push(("window_minus_1", run(slot, Some(w - 1), 1.0)?));
+                mutants.push(("window_plus_1", run(slot, Some(w + 1), 1.0)?));
+            }
+            if g.kv_reader {
+                let other = sample
+                    .iter()
+                    .copied()
+                    .find(|&o| {
+                        o != slot
+                            && geometry(&spec, o)
+                                .is_ok_and(|x| !x.kv_reader && x.head_dim == g.head_dim)
+                    })
+                    .context("no second owner of the same layer type in the sample")?;
+                mutants.push(("reader_bound_to_other_owner", run(other, window, 1.0)?));
+                let zeros = (
+                    vec![0f32; T * kv_heads * layout.d],
+                    vec![0f32; T * kv_heads * layout.d],
+                );
+                let got =
+                    reference_attention(&q, &zeros.0, &zeros.1, &layout, &positions, window, 1.0);
+                mutants.push((
+                    "reader_bound_to_own_unwritten_slot",
+                    heads_pass(&got, &reference, &layout, positions.len()),
+                ));
+            }
+            for (name, passes) in mutants {
+                let failing = passes.iter().filter(|x| !**x).count();
+                println!(
+                    "GEMMA4_ATTENTION_MUTANT {name} {tag} layer={l} heads_failing={failing}/{heads}"
+                );
+                undetected += usize::from(failing == 0);
+            }
+            cases += 1;
+        }
+    }
+    println!("GEMMA4_ATTENTION cases={cases} defects={defects} undetected_mutants={undetected}");
+    ensure!(defects == 0 && undetected == 0, "GEMMA4_ATTENTION FAIL");
+    Ok(())
+}
