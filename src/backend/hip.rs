@@ -148,6 +148,8 @@ pub struct Properties {
     pub driver_version: i32,
     pub runtime_version: i32,
     pub max_grid_y: i32,
+    pub async_engines: i32,
+    pub host_register_supported: i32,
 }
 
 pub struct Context {

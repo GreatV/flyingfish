@@ -4,7 +4,6 @@ pub mod blas;
 #[cfg(feature = "rocm")]
 #[path = "../hip_blas.rs"]
 pub mod blas;
-#[cfg(feature = "cuda")]
 pub mod calibrate;
 mod closure;
 pub mod contracts;
@@ -799,5 +798,12 @@ impl Device {
     pub fn finish_upload(&self) -> Result<()> {
         self.stream.wait(&self.upload.record_event(Some(2))?)?;
         self.stream.synchronize()
+    }
+    pub fn peer(&self) -> Result<Option<Self>> {
+        anyhow::ensure!(
+            CudaContext::device_count()? == 1,
+            "HIP expert peer transport is not implemented for multiple devices"
+        );
+        Ok(None)
     }
 }
