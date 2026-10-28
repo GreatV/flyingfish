@@ -4326,9 +4326,17 @@ pub(super) fn restore_chain_state(model: &mut Engine, mut values: &[u8]) -> Resu
 #[test]
 #[ignore = "requires GPU, published target/draft and an owned FLYINGFISH_RUNTIME_DIR"]
 fn minicpm_chain_verify_gpu() -> Result<()> {
+    let mut defects = 0;
     for chunk in [9, 17, 33] {
-        minicpm_chain_verify(chunk)?;
+        if let Err(error) = minicpm_chain_verify(chunk) {
+            if !error.to_string().starts_with("DEFECT") {
+                return Err(error);
+            }
+            println!("DEFECT minicpm_chain_chunk chunk={chunk} error={error}");
+            defects += 1;
+        }
     }
+    ensure!(defects == 0, "DEFECT hybrid chain chunks={defects}");
     Ok(())
 }
 
@@ -4490,9 +4498,10 @@ fn minicpm_chain_verify(chunk: usize) -> Result<()> {
         let mut logits = Vec::new();
         let mut captures = Vec::new();
         let mut predictions = Vec::new();
-        for token in &inputs {
+        let mut scalar_trace = Trace::all_layers();
+        for (row, token) in inputs.iter().enumerate() {
             model.set_token(*token)?;
-            model.advance(false, None)?;
+            model.advance(false, (row == 0).then_some((&mut scalar_trace, "scalar")))?;
             logits.extend(stream.clone_dtoh(&model.work.logits)?);
             predictions.push(model.token()?);
             captures.extend(
@@ -4540,6 +4549,7 @@ fn minicpm_chain_verify(chunk: usize) -> Result<()> {
             .context("chain checkpoint missing")?
             .restore(&mut model.state, &mut model.work.token, &stream)?;
         model.bind_gdn_verify_inputs(rows)?;
+        let mut batch_trace = Trace::all_layers();
         model.position = prefix;
         model.committed_prefix_ids.truncate(prefix);
         model.set_token(inputs[0])?;
@@ -4553,9 +4563,37 @@ fn minicpm_chain_verify(chunk: usize) -> Result<()> {
                 mask: crate::backend::Mask::Causal,
                 head: Head::All,
             },
-            None,
+            Some(Target {
+                trace: &mut batch_trace,
+                prefix: "batch",
+                skip: 0,
+            }),
         )?;
         let full_verify_state = chain_state(&model)?;
+        for layer in 0..model.model_spec.layers.len() {
+            for point in ["norm1", "mixer_out", "o_proj", "post_attention", "norm2"] {
+                let expected = scalar_trace.values(&format!("scalar.{layer}.debug.{point}"))?;
+                let actual = batch_trace.values(&format!("batch.{layer}.debug.{point}"))?;
+                ensure!(
+                    actual.len() == rows * expected.len(),
+                    "chain boundary trace extent"
+                );
+                let mismatches = actual
+                    .iter()
+                    .zip(&expected)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                let maximum = actual
+                    .iter()
+                    .zip(&expected)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                println!(
+                    "CHAIN_BOUNDARY chunk={chunk} prefix={prefix} layer={layer} point={point} row0_mismatches={mismatches} max_abs={maximum}"
+                );
+                defects += mismatches;
+            }
+        }
         let spec = model.spec.as_ref().context("chain missing")?;
         let actual = stream.clone_dtoh(&spec.logits)?;
         let logit_mismatches = actual
@@ -4860,8 +4898,10 @@ fn minicpm_chain_verify(chunk: usize) -> Result<()> {
                     .context("chain missing")?
                     .forced_proposals = Some(proposals);
             }
-            let graph_range =
-                super::super::super::profile::Range::new(graph, c"minicpm_chain_graph");
+            let graph_range = super::super::super::profile::Range::new(
+                graph && cfg!(feature = "cuda"),
+                c"minicpm_chain_graph",
+            );
             let round = model.spec_round(limit, None, "chain")?;
             drop(graph_range);
             let actual_width = round.predictions.len();
