@@ -25,6 +25,98 @@ struct CommittedKv {
 }
 
 #[test]
+#[ignore = "GPU window required; head-major KV ring staging"]
+fn ring_copy_geometry_gpu() -> Result<()> {
+    let device = Device::new(0)?;
+    let s = &device.stream;
+    let source_capacity = 513;
+    let target_capacity = 1025;
+    let rows = 511;
+    let sentinel = bf16::from_bits(0x7fc1);
+    for (heads, head_dim) in [(4, 128), (1, 256), (2, 256), (8, 256), (1, 512), (8, 512)] {
+        let host: Vec<_> = (0..heads * source_capacity * head_dim)
+            .map(|i| bf16::from_f32(((i * 37 + 11) % 1009) as f32 / 256.0 - 2.0))
+            .collect();
+        let source = s.clone_htod(&host)?;
+        let empty = vec![sentinel; heads * target_capacity * head_dim + 32];
+        for (source_start, target_start, wrap_source, wrap_target) in [
+            (2, 17, false, false),
+            (503, 0, true, false),
+            (2, 1019, false, true),
+            (503, 1019, true, true),
+        ] {
+            let mut expected = empty.clone();
+            for head in 0..heads {
+                for row in 0..rows {
+                    let src = (head * source_capacity + (source_start + row) % source_capacity)
+                        * head_dim;
+                    let dst = (head * target_capacity + (target_start + row) % target_capacity)
+                        * head_dim;
+                    expected[dst..dst + head_dim].copy_from_slice(&host[src..src + head_dim]);
+                }
+            }
+            for graph in [false, true] {
+                let mut target = s.clone_htod(&empty)?;
+                let mut execute = |start| {
+                    super::copy::RingCopy {
+                        stream: s,
+                        source: &source,
+                        target: &mut target,
+                        source_capacity,
+                        target_capacity,
+                        heads,
+                        head_dim,
+                    }
+                    .run(start, target_start, rows, wrap_source, wrap_target)
+                };
+                if graph {
+                    s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                    let result = execute(source_start);
+                    let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                    result?;
+                    let captured = captured?.context("ring staging graph is empty")?;
+                    captured.launch()?;
+                    captured.launch()?;
+                } else {
+                    execute(source_start)?;
+                }
+                let actual = s.clone_dtoh(&target)?;
+                ensure!(
+                    actual
+                        .iter()
+                        .zip(&expected)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "ring staging differs heads={heads} dim={head_dim} source_start={source_start} target_start={target_start} graph={graph}"
+                );
+            }
+        }
+        let mut wrong = s.clone_htod(&empty)?;
+        super::copy::RingCopy {
+            stream: s,
+            source: &source,
+            target: &mut wrong,
+            source_capacity,
+            target_capacity,
+            heads,
+            head_dim,
+        }
+        .run(504, 0, rows, true, false)?;
+        let wrong = s.clone_dtoh(&wrong)?;
+        ensure!(
+            wrong[..head_dim]
+                .iter()
+                .zip(&host[503 * head_dim..504 * head_dim])
+                .any(|(a, b)| a.to_bits() != b.to_bits()),
+            "shifted ring source control did not discriminate"
+        );
+        eprintln!(
+            "PASS ring_copy_geometry heads={heads} dim={head_dim} rows={rows} source_capacity={source_capacity} target_capacity={target_capacity} graph_eager_exact=true shifted_source_rejected=true"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "GPU window required; D128 bidirectional and prefix-LM masks"]
 fn prefill_sequence_masks_gpu() -> Result<()> {
     let device = Device::new(0)?;
@@ -1258,6 +1350,8 @@ fn flint_sliding_ring_prefill_interleaved_gpu() -> Result<()> {
             target,
             source_capacity: ring,
             target_capacity: staged_capacity,
+            heads: hkv,
+            head_dim: dim,
         }
         .run(1, 0, 512, true, false)?;
     }
@@ -1305,6 +1399,8 @@ fn flint_sliding_ring_prefill_interleaved_gpu() -> Result<()> {
             target,
             source_capacity: staged_capacity,
             target_capacity: ring,
+            heads: hkv,
+            head_dim: dim,
         }
         .run(519, 520 % ring, 513, false, true)?;
     }
@@ -1373,6 +1469,8 @@ fn flint_sliding_ring_prefill_interleaved_gpu() -> Result<()> {
             target,
             source_capacity: ring,
             target_capacity: staged_capacity,
+            heads: hkv,
+            head_dim: dim,
         }
         .run(1031 % ring, 0, 1, false, false)?;
     }

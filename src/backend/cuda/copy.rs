@@ -247,6 +247,8 @@ pub(crate) struct RingCopy<'a> {
     pub(crate) target: &'a mut CudaSlice<bf16>,
     pub(crate) source_capacity: usize,
     pub(crate) target_capacity: usize,
+    pub(crate) heads: usize,
+    pub(crate) head_dim: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -259,61 +261,61 @@ impl RingCopy<'_> {
         wrap_source: bool,
         wrap_target: bool,
     ) -> Result<()> {
-        ensure!(rows > 0, "ring row copy requires rows");
+        ensure!(
+            rows > 0 && rows <= self.source_capacity && rows <= self.target_capacity,
+            "ring row copy extent exceeds capacity"
+        );
+        ensure!(
+            self.heads > 0 && self.head_dim > 0,
+            "ring row copy requires nonzero head geometry"
+        );
+        for (capacity, len) in [
+            (self.source_capacity, self.source.len()),
+            (self.target_capacity, self.target.len()),
+        ] {
+            ensure!(
+                capacity
+                    .checked_mul(self.head_dim)
+                    .and_then(|n| n.checked_mul(self.heads))
+                    .is_some_and(|n| n <= len && n <= usize::MAX / 2),
+                "ring row copy geometry exceeds buffer"
+            );
+        }
         ensure!(
             source_start < self.source_capacity && target_start < self.target_capacity,
             "ring row copy start exceeds capacity"
         );
-        if !wrap_source {
-            ensure!(
-                source_start + rows <= self.source_capacity,
-                "ring row copy source range exceeds capacity"
-            );
-        }
-        if !wrap_target {
-            ensure!(
-                target_start + rows <= self.target_capacity,
-                "ring row copy target range exceeds capacity"
-            );
-        }
-        let source_first = if wrap_source {
-            rows.min(self.source_capacity - source_start)
-        } else {
-            rows
-        };
-        let target_first = if wrap_target {
-            rows.min(self.target_capacity - target_start)
-        } else {
-            rows
-        };
-        let first = rows.min(source_first.min(target_first));
-        for (offset, count) in [(0, first), (first, rows - first)] {
-            if count == 0 {
-                continue;
-            }
-            let source_row = if offset > 0 && wrap_source {
-                0
-            } else {
-                source_start + offset
-            };
-            let target_row = if offset > 0 && wrap_target {
-                0
-            } else {
-                target_start + offset
-            };
+        ensure!(
+            wrap_source || rows <= self.source_capacity - source_start,
+            "ring row copy source range exceeds capacity"
+        );
+        ensure!(
+            wrap_target || rows <= self.target_capacity - target_start,
+            "ring row copy target range exceeds capacity"
+        );
+        let mut remaining = rows;
+        let mut source_row = source_start;
+        let mut target_row = target_start;
+        while remaining > 0 {
+            let count = remaining
+                .min(self.source_capacity - source_row)
+                .min(self.target_capacity - target_row);
             columns(
                 self.stream,
                 self.source,
                 self.target,
                 Rect {
-                    rows: 4,
-                    width: count * 128,
-                    src_pitch: self.source_capacity * 128,
-                    src_col: source_row * 128,
-                    dst_pitch: self.target_capacity * 128,
-                    dst_col: target_row * 128,
+                    rows: self.heads,
+                    width: count * self.head_dim,
+                    src_pitch: self.source_capacity * self.head_dim,
+                    src_col: source_row * self.head_dim,
+                    dst_pitch: self.target_capacity * self.head_dim,
+                    dst_col: target_row * self.head_dim,
                 },
             )?;
+            remaining -= count;
+            source_row = (source_row + count) % self.source_capacity;
+            target_row = (target_row + count) % self.target_capacity;
         }
         Ok(())
     }
