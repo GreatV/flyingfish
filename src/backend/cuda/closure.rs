@@ -1,8 +1,7 @@
+#[cfg(feature = "cuda")]
+use crate::backend::setup::CacheKey;
 use crate::{
-    backend::{
-        SpecBudget,
-        setup::{CacheKey, LinearShape},
-    },
+    backend::{SpecBudget, setup::LinearShape},
     config::Config,
 };
 use anyhow::{Context, Result, ensure};
@@ -13,7 +12,7 @@ use std::{
     fs,
     hash::Hasher,
     io::Write,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::Instant,
 };
 
@@ -70,9 +69,9 @@ fn attention(budget: Option<SpecBudget>) -> Vec<Attention> {
 }
 
 #[derive(PartialEq, Eq, Serialize, Deserialize)]
-struct Manifest {
+struct Manifest<K> {
     schema: u32,
-    key: CacheKey,
+    key: K,
     profile: Profile,
     files: Vec<(String, String)>,
 }
@@ -113,10 +112,12 @@ pub(super) fn small_rows(chunk: usize, capacity: usize) -> usize {
     chunk.min(capacity).min(16)
 }
 
+#[cfg(feature = "cuda")]
 pub(super) fn injection_limit(small_rows: usize, verify_rows: usize) -> usize {
     small_rows.max(verify_rows)
 }
 
+#[cfg(feature = "cuda")]
 pub(super) fn forward_rows(
     small_rows: usize,
     budget: Option<SpecBudget>,
@@ -135,6 +136,7 @@ pub(super) fn forward_rows(
     Ok(rows)
 }
 
+#[cfg(feature = "cuda")]
 fn draft_shapes(
     draft: &crate::dspark::DraftConfig,
     injection_rows: usize,
@@ -170,6 +172,7 @@ fn draft_shapes(
     (linear, pairs)
 }
 
+#[cfg(feature = "cuda")]
 fn shapes(
     c: &Config,
     small_rows: usize,
@@ -217,6 +220,7 @@ fn shapes(
 }
 
 impl Profile {
+    #[cfg(feature = "cuda")]
     pub(super) fn draft(
         config: &crate::dspark::DraftConfig,
         capacity: usize,
@@ -242,6 +246,7 @@ impl Profile {
             draft: Some(hash(&fs::read(draft.join("config.json"))?)),
         })
     }
+    #[cfg(feature = "cuda")]
     pub fn new(
         c: &Config,
         capacity: usize,
@@ -277,6 +282,7 @@ impl Profile {
                 .transpose()?,
         })
     }
+    #[cfg(feature = "cuda")]
     pub fn path(&self, dir: &Path, key: &CacheKey) -> Result<PathBuf> {
         Ok(dir.join(format!(
             "closure-v1-{}-{}.json",
@@ -333,6 +339,7 @@ impl Closure {
         );
         Ok(false)
     }
+    #[cfg(feature = "cuda")]
     pub(super) fn measurement(&self) -> Result<()> {
         if self.stage.get() != Stage::Setup || !self.write {
             if self.stage.get() == Stage::Ready {
@@ -346,6 +353,7 @@ impl Closure {
         self.measurements.set(self.measurements.get() + 1);
         Ok(())
     }
+    #[cfg(feature = "cuda")]
     fn before_ready(&self, action: &str) -> Result<()> {
         if self.stage.get() == Stage::Ready {
             self.late_attempts.set(self.late_attempts.get() + 1);
@@ -356,6 +364,7 @@ impl Closure {
         );
         Ok(())
     }
+    #[cfg(feature = "cuda")]
     pub fn bind_fixed(&self) -> Result<()> {
         if self.stage.get() == Stage::Ready {
             self.late_attempts.set(self.late_attempts.get() + 1);
@@ -366,12 +375,14 @@ impl Closure {
         );
         Ok(())
     }
+    #[cfg(feature = "cuda")]
     pub fn capture(&self) -> Result<()> {
         self.before_ready("production Graph capture")?;
         self.captures.set(self.captures.get() + 1);
         Ok(())
     }
     /// A fixed operator plan has no measured choices or calibration files.
+    #[cfg(feature = "cuda")]
     pub fn freeze_fixed(&self) -> Result<()> {
         ensure!(
             self.stage.get() == Stage::Setup
@@ -386,12 +397,21 @@ impl Closure {
         );
         Ok(())
     }
+    #[cfg(feature = "cuda")]
     pub(super) fn finish(&self, profile: Profile, dir: &Path, key: CacheKey) -> Result<()> {
+        let path = profile.path(dir, &key)?;
+        self.finish_with_key(profile, path, key)
+    }
+    pub(super) fn finish_with_key<K: Serialize + for<'de> Deserialize<'de> + PartialEq>(
+        &self,
+        profile: Profile,
+        path: PathBuf,
+        key: K,
+    ) -> Result<()> {
         ensure!(
             self.stage.get() == Stage::Setup,
             "closure was already frozen"
         );
-        let path = profile.path(dir, &key)?;
         let files = self
             .files
             .borrow()
@@ -416,7 +436,7 @@ impl Closure {
         if self.write {
             write_cache(&path, &manifest)?;
         } else {
-            let expected: Manifest = serde_json::from_slice(
+            let expected: Manifest<K> = serde_json::from_slice(
                 &fs::read(&path).with_context(|| format!("read closure {}", path.display()))?,
             )?;
             ensure!(
@@ -467,7 +487,7 @@ impl Closure {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
 
@@ -1175,5 +1195,88 @@ mod tests {
         assert!(closure.assert_ready().is_err());
         closure.expect_captures(0)?;
         Ok(())
+    }
+}
+
+pub fn runtime_dir(path: &Path, model: &Path, create: bool) -> Result<PathBuf> {
+    let full = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut parent = full.as_path();
+    let mut suffix = Vec::new();
+    while !parent.exists() {
+        suffix.push(
+            parent
+                .file_name()
+                .context("invalid runtime directory")?
+                .to_os_string(),
+        );
+        parent = parent
+            .parent()
+            .context("runtime directory has no existing ancestor")?;
+    }
+    let mut resolved = parent.canonicalize()?;
+    for part in suffix.iter().rev() {
+        resolved.push(part);
+    }
+    let model = model.canonicalize()?;
+    ensure!(
+        !resolved.starts_with(&model)
+            && !resolved
+                .components()
+                .any(|c| matches!(c, Component::Normal(p) if p == "models")),
+        "runtime directory must be outside all readonly models directories"
+    );
+    if create {
+        std::fs::create_dir_all(&resolved)?;
+    }
+    ensure!(
+        !resolved.exists() || resolved.is_dir(),
+        "runtime path is not a directory"
+    );
+    Ok(resolved)
+}
+
+#[cfg(feature = "rocm")]
+impl Profile {
+    pub(super) fn hip(c: &Config, capacity: usize, chunk: usize, model: &Path) -> Result<Self> {
+        let small_rows = small_rows(chunk, capacity);
+        let rows = (1..=chunk)
+            .map(|n| {
+                super::engine::bucketed_prefill_rows(n as u32, chunk as u32).map(|n| n as usize)
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        let mut linear = BTreeSet::new();
+        for rows in rows {
+            for (output, input) in [
+                (c.qkv_dim(), c.hidden_size),
+                (c.hidden_size, c.hidden_size),
+                (2 * c.intermediate_size, c.hidden_size),
+                (c.hidden_size, c.intermediate_size),
+            ] {
+                linear.insert(LinearShape {
+                    rows,
+                    output,
+                    input,
+                });
+            }
+        }
+        linear.insert(LinearShape {
+            rows: 1,
+            output: c.vocab_size,
+            input: c.hidden_size,
+        });
+        Ok(Self {
+            pairs: linear.iter().map(|s| (s.output, s.input)).collect(),
+            linear,
+            attention: attention(None),
+            capacity,
+            small_rows,
+            budget: None,
+            model: hash(&fs::read(model.join("config.json"))?),
+            draft: None,
+        })
     }
 }

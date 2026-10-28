@@ -12,7 +12,7 @@ use std::{
 pub struct Trace {
     tensors: BTreeMap<String, (Vec<usize>, Vec<u8>)>,
     device: Option<String>,
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     pub(crate) all_layers: bool,
 }
 
@@ -20,7 +20,7 @@ impl Trace {
     /// Capture every Qwen mixer boundary for comparison with reference traces.
     pub fn all_layers() -> Self {
         Self {
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "rocm"))]
             all_layers: true,
             ..Self::default()
         }

@@ -1,14 +1,15 @@
 use super::Device;
-use crate::{
-    config::Config,
-    experts::{
-        arena::{HostBlocks, SlotLayout},
-        catalogue::ExpertGeometry,
-        plan::Capacity,
-    },
+use crate::backend::gpu::{CudaSlice, CudaStream, PinnedHostSlice};
+use crate::config::Config;
+#[cfg(feature = "cuda")]
+use crate::experts::{
+    arena::{HostBlocks, SlotLayout},
+    catalogue::ExpertGeometry,
+    plan::Capacity,
 };
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice, sys};
+#[cfg(feature = "cuda")]
+use cudarc::driver::{CudaContext, DevicePtr, sys};
 use half::bf16;
 use safetensors::{Dtype, SafeTensors};
 use sha2::{Digest, Sha256};
@@ -57,6 +58,7 @@ pub struct Weights {
 }
 
 /// Stable native expert slots, persistent staging and host data plus spare blocks.
+#[cfg(feature = "cuda")]
 pub struct ExpertStorage {
     layout: SlotLayout,
     down_offset: u64,
@@ -68,6 +70,7 @@ pub struct ExpertStorage {
     registered: bool,
 }
 
+#[cfg(feature = "cuda")]
 impl ExpertStorage {
     pub fn new(
         stream: &Arc<CudaStream>,
@@ -135,7 +138,7 @@ impl ExpertStorage {
         self.host.as_ref()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub fn has_peer(&self) -> bool {
         self.peer_device.is_some()
     }
@@ -223,7 +226,7 @@ impl ExpertStorage {
     }
 
     /// Completes all context readers and copies before releasing page-lock registration.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     fn finish(&mut self) -> Result<()> {
         self.context
             .synchronize()
@@ -256,6 +259,7 @@ impl ExpertStorage {
     }
 }
 
+#[cfg(feature = "cuda")]
 impl Drop for ExpertStorage {
     fn drop(&mut self) {
         self.context.record_err(self.context.synchronize());
@@ -275,8 +279,11 @@ impl Drop for ExpertStorage {
     }
 }
 
-use crate::checkpoint::{Index, MappedCheckpoint, TensorEntry, TensorManifest};
+#[cfg(feature = "cuda")]
+use crate::checkpoint::TensorEntry;
+use crate::checkpoint::{Index, MappedCheckpoint, TensorManifest};
 
+#[cfg(feature = "cuda")]
 fn upload_entry(entry: &TensorEntry) -> bool {
     entry.is_non_expert_loaded()
 }
@@ -288,8 +295,11 @@ pub(crate) struct Loader<'a> {
     index: Index,
     seen: BTreeSet<String>,
     staging: PinnedHostSlice<bf16>,
-    staging_ready: cudarc::driver::CudaEvent,
+    staging_ready: crate::backend::gpu::CudaEvent,
     stream: Arc<CudaStream>,
+    #[cfg(feature = "rocm")]
+    compute: Arc<CudaStream>,
+    #[cfg(feature = "cuda")]
     byte_staging: Option<PinnedHostSlice<u8>>,
     verify_upload: bool,
     upload_hashers: BTreeMap<String, UploadHashWorker>,
@@ -459,6 +469,8 @@ impl Loader<'_> {
                 .checked_add(t.data().len())
                 .context("uploaded byte count overflow")?;
         }
+        #[cfg(feature = "rocm")]
+        dst.handoff(&self.compute)?;
         Ok(dst)
     }
 }
@@ -489,12 +501,23 @@ pub(super) fn checkpoint_mapped<T>(
             d.ctx
                 .alloc_pinned_with_flags::<bf16>(UPLOAD_CHUNK_BYTES / 2, 0)?
         } else {
-            d.ctx.alloc_pinned::<bf16>(UPLOAD_CHUNK_BYTES / 2)?
+            #[cfg(feature = "cuda")]
+            {
+                d.ctx.alloc_pinned::<bf16>(UPLOAD_CHUNK_BYTES / 2)?
+            }
+            #[cfg(feature = "rocm")]
+            {
+                d.ctx
+                    .alloc_pinned_with_flags::<bf16>(UPLOAD_CHUNK_BYTES / 2, 0)?
+            }
         }
     };
+    #[cfg(feature = "cuda")]
     let staging_ready = d.ctx.new_event(Some(
         cudarc::driver::sys::CUevent_flags::CU_EVENT_BLOCKING_SYNC,
     ))?;
+    #[cfg(feature = "rocm")]
+    let staging_ready = d.ctx.new_event(Some(1))?;
     let upload_shards = if hash_uploads {
         manifest
             .map(|manifest| {
@@ -531,6 +554,9 @@ pub(super) fn checkpoint_mapped<T>(
         staging,
         staging_ready,
         stream: d.upload.clone(),
+        #[cfg(feature = "rocm")]
+        compute: d.stream.clone(),
+        #[cfg(feature = "cuda")]
         byte_staging: if manifest.is_some() {
             Some(unsafe { d.ctx.alloc_pinned_with_flags::<u8>(UPLOAD_CHUNK_BYTES, 0)? })
         } else {
@@ -580,6 +606,7 @@ fn decode_bf16(bytes: &[u8], values: &mut [bf16]) {
 }
 
 impl Weights {
+    #[cfg(feature = "cuda")]
     pub fn load_loopvl(
         dir: &Path,
         spec: &crate::model_spec::ModelSpec,
@@ -693,6 +720,7 @@ impl Weights {
 }
 
 impl Loader<'_> {
+    #[cfg(feature = "cuda")]
     pub(super) fn load_bytes(
         &mut self,
         name: &str,
@@ -763,10 +791,12 @@ impl Loader<'_> {
     }
 }
 
+#[cfg(feature = "cuda")]
 pub(crate) enum StoredTensor {
     Bf16(CudaSlice<bf16>),
     Bytes(CudaSlice<u8>),
 }
+#[cfg(feature = "cuda")]
 pub(crate) struct WeightCatalog {
     pub linear_format: crate::model_spec::LinearFormat,
     pub tensors: BTreeMap<String, StoredTensor>,
@@ -776,6 +806,7 @@ pub(crate) struct WeightCatalog {
     pub upload_hashed_bytes: Option<usize>,
     pub load_wall_ms: f64,
 }
+#[cfg(feature = "cuda")]
 impl WeightCatalog {
     /// Move shared global tensors into the existing Engine weight owner.
     pub fn take_globals(&mut self) -> Result<Weights> {
@@ -927,7 +958,7 @@ impl WeightCatalog {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
     use half::bf16;

@@ -925,18 +925,18 @@ fn blas_gate(s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
                 None
             };
             let library = blas::Blas::new(s.clone())?;
-            let choice = library.prepare(shape, db.clone(), None)?;
+            let choice = library.prepare_choice(shape, db.clone(), None)?;
             let frozen: blas::Choice = serde_json::from_slice(&serde_json::to_vec(&choice)?)?;
             let rebound = blas::Blas::new(s.clone())?;
             gate.check(
                 "blas.identity_rebind",
-                rebound.prepare(shape, db.clone(), Some(&frozen))? == choice,
+                rebound.prepare_choice(shape, db.clone(), Some(&frozen))? == choice,
             );
             println!(
                 "HIP_BLAS_CHOICE {} cached=true measurements=0 tuned=false",
                 serde_json::to_string(&choice)?
             );
-            rebound.linear(shape, db.as_deref(), &dw, &dx, &mut dy)?;
+            rebound.linear_with_bias(shape, db.as_deref(), &dw, &dx, &mut dy)?;
             let reference = |bias: Option<&[bf16]>| -> Vec<bf16> {
                 (0..rows * output)
                     .map(|i| {
@@ -968,9 +968,9 @@ fn blas_gate(s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
                     .map(|b| bf16::from_f32(b.to_f32() + 1.0))
                     .collect();
                 let second = Arc::new(s.clone_htod(&second_bias)?);
-                let prepared = rebound.prepare(shape, Some(second.clone()), Some(&frozen));
+                let prepared = rebound.prepare_choice(shape, Some(second.clone()), Some(&frozen));
                 gate.check("blas.second_bias_same_shape_prepared", prepared.is_ok());
-                let unbiased = rebound.prepare(shape, None, None);
+                let unbiased = rebound.prepare_choice(shape, None, None);
                 gate.check("blas.unbiased_same_shape_prepared", unbiased.is_ok());
                 if prepared.is_ok() && unbiased.is_ok() {
                     for (label, binding, values) in [
@@ -978,7 +978,7 @@ fn blas_gate(s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
                         ("unbiased", None, None),
                         ("first", db.as_deref(), Some(&b[..])),
                     ] {
-                        rebound.linear(shape, binding, &dw, &dx, &mut dy)?;
+                        rebound.linear_with_bias(shape, binding, &dw, &dx, &mut dy)?;
                         gate.compare(
                             &format!("blas.binding.{label}.rows{rows}.weight[{output},{input}]"),
                             &s.clone_dtoh(&dy)?,
@@ -992,7 +992,7 @@ fn blas_gate(s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
                 gate.check(
                     "blas.unprepared_bias_rejected",
                     rebound
-                        .linear(shape, Some(&unprepared), &dw, &dx, &mut dy)
+                        .linear_with_bias(shape, Some(&unprepared), &dw, &dx, &mut dy)
                         .is_err(),
                 );
             }
