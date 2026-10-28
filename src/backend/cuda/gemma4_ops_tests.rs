@@ -954,6 +954,17 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
     }
     drop(catalog);
     let mut engine = super::engine::Engine::load(&dir, 0, 640, Some(640), settings)?;
+    let probe_input = tensor(&data, "stage.a.input_layernorm")?;
+    let projected = engine.gemma_linear_probe("self_attn.q_proj.weight", probe_input)?;
+    let expected = tensor(&data, "stage.a.q_proj")?;
+    let delta: Vec<f32> = projected
+        .iter()
+        .zip(expected)
+        .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+        .collect();
+    let maximum = delta.iter().copied().fold(0.0f32, f32::max);
+    let rmse = (delta.iter().map(|v| v * v).sum::<f32>() / delta.len() as f32).sqrt();
+    println!("GEMMA4_LINEAR_PROBE output_max={maximum} output_rmse={rmse}");
     let first_ids: Vec<u32> = serde_json::from_value(ids["short"][0].clone())?;
     let mut trace = crate::trace::Trace::all_layers();
     engine.gemma_prefill_trace(&first_ids, &mut trace)?;

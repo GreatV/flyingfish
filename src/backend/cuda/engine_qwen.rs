@@ -4992,6 +4992,30 @@ impl Engine {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn gemma_linear_probe(&mut self, role: &str, input: &[bf16]) -> Result<Vec<bf16>> {
+        let q = self.qwen.as_ref().context("Q38 runtime missing")?;
+        let layer = &q.layers[0];
+        let s = &self.device.stream;
+        let hidden = self.model_spec.hidden as usize;
+        ensure!(
+            input.len().is_multiple_of(hidden),
+            "linear probe input extent"
+        );
+        let rows = input.len() / hidden;
+        let x = s.clone_htod(input)?;
+        let output_width = self.model_spec.q_width as usize;
+        let y = s.alloc_zeros(rows * output_width)?;
+        layer.linear.run(
+            &self.blas,
+            role,
+            ExecutionPhase::Prefill,
+            matrix(&x, s, 0, rows, hidden)?,
+            &mut TensorMut(matrix(&y, s, 0, rows, output_width)?),
+        )?;
+        Ok(s.clone_dtoh(&y)?)
+    }
+
     pub(super) fn qwen_per_layer_input(
         &mut self,
         i: usize,
