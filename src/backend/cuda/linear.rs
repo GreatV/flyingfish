@@ -483,6 +483,25 @@ impl BoundFfn {
 }
 
 impl LayerLinearPlan {
+    #[cfg(feature = "rocm")]
+    pub fn library_shapes(
+        &self,
+        rows: u32,
+    ) -> impl Iterator<Item = crate::backend::setup::LinearShape> + '_ {
+        self.projections.values().filter_map(move |projection| {
+            let LinearWeightRef::Bf16(weight) = projection.resident else {
+                return None;
+            };
+            (rows as usize > projection.invariant_rows).then_some(
+                crate::backend::setup::LinearShape {
+                    rows: rows as usize,
+                    output: weight.shape[0] as usize,
+                    input: weight.shape[1] as usize,
+                },
+            )
+        })
+    }
+
     fn take_bf16(&mut self, role: &str, expected: [u32; 2]) -> Result<Tensor<bf16, 2>> {
         let projection = self
             .projections
@@ -701,6 +720,66 @@ impl LayerLinearPlan {
         };
         blas.linear_typed_bound(phase, weight, x, y, p.invariant_rows)
     }
+}
+
+#[cfg(all(test, feature = "rocm"))]
+#[test]
+fn hip_projection_closure_excludes_native_and_invariant_calls() -> Result<()> {
+    use crate::backend::setup::LinearShape;
+    let weights = [
+        (
+            LinearWeightRef::Bf16(unsafe {
+                Tensor::new(0x1000, [512, 2048], [2048, 1], 512 * 2048 * 2)?
+            }),
+            0,
+        ),
+        (
+            LinearWeightRef::Bf16(unsafe {
+                Tensor::new(0x1000, [32, 2048], [2048, 1], 32 * 2048 * 2)?
+            }),
+            8,
+        ),
+        (
+            LinearWeightRef::Fp8 {
+                codes: unsafe { Tensor::new(0x1000, [512, 2048], [2048, 1], 512 * 2048)? },
+                scale: unsafe { Tensor::new(0x2000, [512, 1], [1, 1], 512 * 2)? },
+                layout: Fp8ScaleLayout::PerChannel,
+            },
+            0,
+        ),
+    ];
+    let plan = LayerLinearPlan {
+        projections: weights
+            .into_iter()
+            .enumerate()
+            .map(|(i, (resident, invariant_rows))| {
+                (
+                    i.to_string(),
+                    BoundProjection {
+                        resident,
+                        invariant_rows,
+                        calls: Default::default(),
+                    },
+                )
+            })
+            .collect(),
+    };
+    for rows in [1, 3, 8, 9, 17, 32] {
+        let mut expected = vec![LinearShape {
+            rows: rows as usize,
+            output: 512,
+            input: 2048,
+        }];
+        if rows > 8 {
+            expected.push(LinearShape {
+                rows: rows as usize,
+                output: 32,
+                input: 2048,
+            });
+        }
+        assert_eq!(plan.library_shapes(rows).collect::<Vec<_>>(), expected);
+    }
+    Ok(())
 }
 
 #[cfg(all(test, feature = "cuda"))]

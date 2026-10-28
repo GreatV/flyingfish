@@ -407,6 +407,89 @@ fn hip_gdn_runtime_gpu() -> Result<()> {
             ensure!(differences > 0, "GDN head0-for-head1 control escaped");
             println!("PASS HIP_GDN_CONTROL wrong_state_head differences={differences}");
         }
+        if rows == 1 {
+            let norm = pattern(128, 101);
+            let z = pattern(heads * 128, 103);
+            let dn = stream.clone_htod(&norm)?;
+            let dz = stream.clone_htod(&z)?;
+            let gated = ops::GatedRmsInput {
+                x: view(
+                    &dout,
+                    stream,
+                    [1, spec.hv, 128],
+                    [heads as u64 * 128, 128, 1],
+                )?,
+                weight: view(&dn, stream, [128], [1])?,
+                gate: view(&dz, stream, [1, spec.hv, 128], [heads as u64 * 128, 128, 1])?,
+            };
+            for with_norm in [false, true] {
+                stream.memcpy_htod(&initial, &mut ds)?;
+                stream.memcpy_htod(&history, &mut dh)?;
+                let execute_fused = || -> Result<()> {
+                    ensure!(
+                        GdnOps::run_step(
+                            &plan,
+                            stream,
+                            meta,
+                            phase,
+                            Scratch {
+                                ptr: scratch.device_ptr(stream).0,
+                                bytes: ws.bytes,
+                            },
+                            false,
+                            with_norm.then_some(&gated)
+                        )? == with_norm,
+                        "fused GDN gated output contract"
+                    );
+                    Ok(())
+                };
+                execute_fused()?;
+                let fused = stream.clone_dtoh(&dout)?;
+                let fused_state = stream.clone_dtoh(&ds)?;
+                let fused_hist = stream.clone_dtoh(&dh)?;
+                let mut expected = expected.clone();
+                if with_norm {
+                    for (head, values) in expected.as_chunks_mut::<128>().0.iter_mut().enumerate() {
+                        let variance =
+                            values.iter().map(|v| v.to_f64().powi(2)).sum::<f64>() / 128.0;
+                        let inv = 1.0 / (variance + f64::from(spec.rms_eps)).sqrt();
+                        for (d, value) in values.iter_mut().enumerate() {
+                            let normalized = bf16::from_f64(value.to_f64() * inv);
+                            let scaled = bf16::from_f64(normalized.to_f64() * norm[d].to_f64());
+                            let gate = z[head * 128 + d].to_f64();
+                            *value = bf16::from_f64(scaled.to_f64() * gate / (1.0 + (-gate).exp()));
+                        }
+                    }
+                }
+                gate.compare(
+                    &format!("gdn.fused.norm{with_norm}"),
+                    &fused,
+                    &expected,
+                    if with_norm { 4 } else { 1 },
+                    640,
+                )?;
+                gate.check(
+                    "gdn.fused_state",
+                    fused_state.iter().zip(&expected_state).all(|(a, b)| {
+                        a.is_finite() && (f64::from(*a) - b).abs() / (1.0 + b.abs()) <= bound
+                    }),
+                );
+                gate.check("gdn.fused_history", fused_hist == hist);
+                stream.memcpy_htod(&initial, &mut ds)?;
+                stream.memcpy_htod(&history, &mut dh)?;
+                capture(stream, execute_fused)?.launch()?;
+                gate.check(
+                    "gdn.fused_graph_bits",
+                    stream
+                        .clone_dtoh(&dout)?
+                        .iter()
+                        .zip(&fused)
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                        && stream.clone_dtoh(&ds)? == fused_state
+                        && stream.clone_dtoh(&dh)? == fused_hist,
+                );
+            }
+        }
         println!(
             "HIP_GDN rows={rows} valid={valid} norm_ratio={norm_ratio:e} state_error={error:e} state_bound={bound:e}"
         );
@@ -1280,6 +1363,37 @@ fn copy_gate(ctx: &Arc<CudaContext>, s: &Arc<CudaStream>, gate: &mut Gate) -> Re
         drop(pending);
         word.handoff(&upload)?;
         gate.check("copy.handoff_owner", Arc::ptr_eq(word.stream(), &upload));
+        ctx.record_err(Err(anyhow::anyhow!("planted resource failure")));
+        gate.check(
+            "context.deferred_error_propagates",
+            ctx.check_err().is_err(),
+        );
+        gate.check("context.deferred_error_consumed", ctx.check_err().is_ok());
+        let table: Vec<i32> = (0..129).flat_map(|p| [p; 3]).collect();
+        let table = s.clone_htod(&table)?;
+        let metadata = s.clone_htod(&[23i32, 33, 56, 129, 1, 0, 0, 0])?;
+        let mut active = s.clone_htod(&[-7i32; 37 * 3 + 7])?;
+        let gather = cubin::module(ctx, "q38_vision_io")?.load_function("q38_text_positions")?;
+        unsafe {
+            s.launch_builder(&gather)
+                .arg(&table)
+                .arg(&mut active)
+                .arg(&metadata)
+                .arg(&37u32)
+                .launch(ops::grid(1, 256))?;
+        }
+        let positions = s.clone_dtoh(&active)?;
+        gate.check(
+            "positions.text_prefix",
+            positions[..33 * 3]
+                .iter()
+                .copied()
+                .eq((23..56).flat_map(|p| [p; 3])),
+        );
+        gate.check(
+            "positions.text_tail_guards",
+            positions[33 * 3..].iter().all(|&p| p == -7),
+        );
     }
     let mut pinned = copy::pinned_zeros::<u8>(ctx, 96)?;
     copy::dtoh_bytes(s, &source, 16, &mut pinned, 8, 64)?;

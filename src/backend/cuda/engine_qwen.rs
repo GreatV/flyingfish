@@ -2165,6 +2165,8 @@ impl Engine {
         if engine.model_spec.moe.is_some() {
             engine.declare_graphs()?;
         }
+        #[cfg(feature = "rocm")]
+        engine.initialize_hip_hybrid(dir)?;
         engine.prepare(1)?;
         engine.prepare_prefill_plans()?;
         engine
@@ -2200,8 +2202,6 @@ impl Engine {
                 engine.closure.freeze_fixed()?;
             }
         }
-        #[cfg(feature = "rocm")]
-        engine.closure.freeze_fixed()?;
         if !write {
             engine.reset()?;
             engine.prepare_graphs()?;
@@ -2211,6 +2211,113 @@ impl Engine {
             engine.closure.ready(started)?;
         }
         Ok(engine)
+    }
+    #[cfg(feature = "rocm")]
+    fn initialize_hip_hybrid(&self, model: &Path) -> Result<()> {
+        use super::super::closure::{Profile, hash, write_cache};
+        use crate::backend::{gpu::blas::Choice, setup::LinearShape};
+        let runtime = self.qwen.as_ref().context("HIP hybrid runtime missing")?;
+        let buckets = (1..=runtime.workspace_rows)
+            .map(|rows| bucketed_prefill_rows(rows, runtime.workspace_rows))
+            .collect::<Result<BTreeSet<_>>>()?;
+        let mut linear = BTreeSet::from([LinearShape {
+            rows: 1,
+            output: self.config.vocab_size,
+            input: self.config.hidden_size,
+        }]);
+        for rows in buckets {
+            for layer in &runtime.layers {
+                linear.extend(layer.linear.library_shapes(rows));
+                if let BoundFfn::Moe { shared, .. } = &layer.ffn {
+                    linear.extend(shared.iter().map(|weight| LinearShape {
+                        rows: rows as usize,
+                        output: weight.shape[0] as usize,
+                        input: weight.shape[1] as usize,
+                    }));
+                }
+            }
+        }
+        let profile = Profile::hip_hybrid(linear, self.capacity, self.workspace_rows, model)?;
+        let identity = self.blas.identity().clone();
+        let tag = hash(&serde_json::to_vec(&(&identity, &profile))?);
+        let path = self.runtime.join(format!("hip-hybrid-{tag}.json"));
+        let manifest = self.runtime.join(format!("hip-closure-{tag}.json"));
+        self.closure.preflight(&[path.clone(), manifest.clone()])?;
+        let cached = self.closure.access(&path)?;
+        let choices: Vec<Choice> = if cached {
+            let choices: Vec<Choice> = serde_json::from_slice(&std::fs::read(&path)?)?;
+            ensure!(
+                choices
+                    .iter()
+                    .map(|choice| choice.shape)
+                    .collect::<BTreeSet<_>>()
+                    == profile.linear
+                    && choices.len() == profile.linear.len(),
+                "HIP hybrid linear closure is incomplete or duplicated"
+            );
+            for choice in &choices {
+                ensure!(
+                    !self.blas.wmma_candidate(choice.shape) || choice.setup_median_ms.is_some(),
+                    "HIP hybrid closure lacks WMMA/library setup selection"
+                );
+                self.blas.prepare_choice(choice.shape, None, Some(choice))?;
+            }
+            choices
+        } else {
+            let mut choices = Vec::with_capacity(profile.linear.len());
+            for &shape in &profile.linear {
+                if !self.blas.wmma_candidate(shape) {
+                    choices.push(self.blas.prepare_choice(shape, None, None)?);
+                    continue;
+                }
+                self.closure.measurement()?;
+                let values: Vec<_> = (0..shape.rows * shape.input)
+                    .map(|i| bf16::from_f32(((i * 17 + 31) % 257) as f32 / 256.0 - 0.5))
+                    .collect();
+                let input = self.device.stream.clone_htod(&values)?;
+                let weight = if shape.output == self.config.vocab_size
+                    && shape.input == self.config.hidden_size
+                {
+                    &self.weights.head
+                } else {
+                    runtime
+                        .catalog
+                        .manifest
+                        .entries
+                        .iter()
+                        .find_map(|(name, entry)| {
+                            if entry.shape != [shape.output, shape.input]
+                                || !name.ends_with(".weight")
+                            {
+                                return None;
+                            }
+                            match runtime.catalog.tensors.get(name) {
+                                Some(super::super::weights::StoredTensor::Bf16(weight)) => {
+                                    Some(weight)
+                                }
+                                _ => None,
+                            }
+                        })
+                        .with_context(|| {
+                            format!("HIP hybrid calibration weight missing: {shape:?}")
+                        })?
+                };
+                choices.push(self.blas.calibrate_shape(shape, weight, &input)?);
+            }
+            write_cache(&path, &choices)?;
+            choices
+        };
+        self.closure.finish_with_key(profile, manifest, identity)?;
+        eprintln!(
+            "{}",
+            serde_json::json!({"hip_hybrid_setup":{
+                "cached":cached,
+                "measurements":if cached {0} else {choices.iter().filter(|c|c.setup_median_ms.is_some()).count()},
+                "calibration":"untuned correctness-only",
+                "full_weight_materialization_bytes":0
+            }})
+        );
+        Ok(())
     }
     pub(super) fn prepare_qwen(&mut self, rows: usize) -> Result<()> {
         self.qwen.as_mut().context("Q38 runtime missing")?.prepare(

@@ -376,6 +376,7 @@ impl Closure {
         Ok(())
     }
     /// A fixed operator plan has no measured choices or calibration files.
+    #[cfg(feature = "cuda")]
     pub fn freeze_fixed(&self) -> Result<()> {
         ensure!(
             self.stage.get() == Stage::Setup
@@ -523,6 +524,28 @@ pub fn runtime_dir(path: &Path, model: &Path, create: bool) -> Result<PathBuf> {
 
 #[cfg(feature = "rocm")]
 impl Profile {
+    pub(super) fn hip_hybrid(
+        linear: BTreeSet<LinearShape>,
+        capacity: usize,
+        workspace_rows: usize,
+        model: &Path,
+    ) -> Result<Self> {
+        ensure!(
+            workspace_rows > 0 && workspace_rows <= capacity,
+            "HIP hybrid profile workspace exceeds capacity"
+        );
+        Ok(Self {
+            pairs: linear.iter().map(|s| (s.output, s.input)).collect(),
+            linear,
+            attention: vec![Attention::Decode],
+            capacity,
+            small_rows: workspace_rows,
+            budget: None,
+            model: hash(&fs::read(model.join("config.json"))?),
+            draft: None,
+        })
+    }
+
     pub(super) fn hip(
         c: &Config,
         capacity: usize,

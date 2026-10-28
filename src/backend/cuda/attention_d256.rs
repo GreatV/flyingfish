@@ -2091,6 +2091,34 @@ mod tests {
                 );
                 cases += 2;
                 defects += usize::from(bad != 0);
+                let positions: Vec<i32> = (0..rows)
+                    .flat_map(|row| [prefix as i32 + row as i32; 3])
+                    .collect();
+                let positions = device.stream.clone_htod(&positions)?;
+                for captured in [false, true] {
+                    let axes = run_shape(
+                        &device,
+                        Case {
+                            axes: Some(&positions),
+                            graph: captured,
+                            ..base
+                        },
+                    )?;
+                    let mismatch = reference
+                        .core_out
+                        .iter()
+                        .zip(&axes.core_out)
+                        .chain(reference.q.iter().zip(&axes.q))
+                        .chain(reference.k_cache.iter().zip(&axes.k_cache))
+                        .chain(reference.v_cache.iter().zip(&axes.v_cache))
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    println!(
+                        "HIP_HD256_AXES rows={rows} valid={valid} prefix={prefix} key_chunk={chunk} graph={captured} mismatches={mismatch}"
+                    );
+                    cases += 1;
+                    defects += usize::from(mismatch != 0 || axes.oracle_mismatches != 0);
+                }
                 if rows == 3 && chunk == 128 {
                     let mutant = run_shape(
                         &device,
