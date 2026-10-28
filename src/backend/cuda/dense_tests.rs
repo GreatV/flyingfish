@@ -125,6 +125,7 @@ fn dense_runtime_gpu() -> Result<()> {
         if wmma_cells(&info) {
             wmma_gate(&s, &mut gate)?;
             tcmqa_gate(&ctx, &s, &c, &mut gate)?;
+            markov_gate(&ctx, &s, &mut gate)?;
         } else {
             println!("WMMA cells NOT_COVERED arch={}", info.arch);
         }
@@ -1494,6 +1495,201 @@ fn wmma_gate(s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
                     actual.to_bits() == expected.to_bits()
                 },
             );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "rocm")]
+fn markov_gate(ctx: &Arc<CudaContext>, s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
+    let module = cubin::module(ctx, "markov")?;
+    let first = [1, 8, 64].map(|p| module.load_function(&format!("markov2_top4_phase1_p{p}")));
+    let first = first.into_iter().collect::<Result<Vec<_>>>()?;
+    let second = module.load_function("markov2_top4_phase2")?;
+    let coefficient = |index: usize, period: usize| {
+        let v = index * 31 % period;
+        (if v.is_multiple_of(2) { 1.0 } else { -1.0 }) * 2f32.powi((v % 5) as i32 - 4)
+    };
+    let e: Vec<_> = (0..256)
+        .map(|k| ((k * 17 % 257) as f32 - 128.0) / 256.0)
+        .collect();
+    let g: Vec<_> = (0..256)
+        .map(|k| ((k * 29 % 263) as f32 - 131.0) / 256.0)
+        .collect();
+    let dot: f64 = e
+        .iter()
+        .zip(&g)
+        .map(|(&a, &b)| f64::from(a) * f64::from(b))
+        .sum();
+    for vocab in [263usize, 130560] {
+        let w1: Vec<_> = (0..vocab * 256)
+            .map(|i| bf16::from_f32(coefficient(i / 256, 257) * e[i % 256]))
+            .collect();
+        let w2: Vec<_> = (0..vocab * 256)
+            .map(|i| bf16::from_f32(coefficient(i / 256, 263) * g[i % 256]))
+            .collect();
+        let base: Vec<_> = (0..7 * vocab)
+            .map(|i| {
+                bf16::from_f32(
+                    ((i % vocab * 47 + i / vocab * 31) % 269) as f32 / 32.0 - 134.0 / 32.0,
+                )
+            })
+            .collect();
+        let dw1 = s.clone_htod(&w1)?;
+        let dw2 = s.clone_htod(&w2)?;
+        let db = s.clone_htod(&base)?;
+        let mut identities = std::collections::BTreeMap::new();
+        for rounding in [0i32, 1] {
+            for p in [1usize, 3, 8, 17, 64] {
+                let requests: Vec<_> = (0..p)
+                    .map(|j| {
+                        let id = (j * 3 + p) % 7;
+                        ((id * 5 % 7) as i32, ((id * 1009 + 257) % vocab) as u32)
+                    })
+                    .collect();
+                let tokens = s.clone_htod(&requests.iter().map(|r| r.1).collect::<Vec<_>>())?;
+                let rows = s.clone_htod(&requests.iter().map(|r| r.0).collect::<Vec<_>>())?;
+                let (index, pt) = if p == 1 {
+                    (0, 1)
+                } else if p <= 8 {
+                    (1, 8)
+                } else {
+                    (2, 64)
+                };
+                let mut partial_top = s.alloc_zeros::<f32>(vocab.div_ceil(256) * pt * 8)?;
+                let mut partial_lse = s.alloc_zeros::<f32>(vocab.div_ceil(256) * pt * 2)?;
+                let mut top = s.alloc_zeros::<u32>(p * 4)?;
+                let mut logp = s.alloc_zeros::<f32>(p * 4)?;
+                let mut lse = s.alloc_zeros::<f32>(p)?;
+                unsafe {
+                    s.launch_builder(&first[index])
+                        .arg(&db)
+                        .arg(&dw1)
+                        .arg(&dw2)
+                        .arg(&tokens)
+                        .arg(&rows)
+                        .arg(&mut partial_top)
+                        .arg(&mut partial_lse)
+                        .arg(&(vocab as i32))
+                        .arg(&256i32)
+                        .arg(&(p as i32))
+                        .arg(&rounding)
+                        .launch(ops::grid(vocab.div_ceil(256), 256))?;
+                    s.launch_builder(&second)
+                        .arg(&partial_top)
+                        .arg(&partial_lse)
+                        .arg(&mut top)
+                        .arg(&mut logp)
+                        .arg(&mut lse)
+                        .arg(&(vocab as i32))
+                        .arg(&(p as i32))
+                        .arg(&(pt as i32))
+                        .launch(ops::grid(p, 256))?;
+                }
+                let top = s.clone_dtoh(&top)?;
+                let logp = s.clone_dtoh(&logp)?;
+                let lse = s.clone_dtoh(&lse)?;
+                ensure!(
+                    logp.iter().chain(&lse).all(|v| v.is_finite()),
+                    "RUNNER_FAIL Markov nonfinite output"
+                );
+                for (j, &(row, token)) in requests.iter().enumerate() {
+                    let scores: Vec<_> = (0..vocab)
+                        .map(|v| {
+                            let bias = bf16::from_f32(
+                                (dot * f64::from(coefficient(token as usize, 257))
+                                    * f64::from(coefficient(v, 263)))
+                                    as f32,
+                            )
+                            .to_f32();
+                            let score = bias + base[row as usize * vocab + v].to_f32();
+                            if rounding == 0 {
+                                bf16::from_f32(score).to_f32()
+                            } else {
+                                score
+                            }
+                        })
+                        .collect();
+                    let mut order: Vec<_> = (0..vocab as u32).collect();
+                    order.sort_unstable_by(|&a, &b| {
+                        scores[b as usize]
+                            .total_cmp(&scores[a as usize])
+                            .then(a.cmp(&b))
+                    });
+                    let mx = f64::from(scores[order[0] as usize]);
+                    let expected_lse = mx
+                        + scores
+                            .iter()
+                            .map(|&x| (f64::from(x) - mx).exp())
+                            .sum::<f64>()
+                            .ln();
+                    let error = (f64::from(lse[j]) - expected_lse).abs().max(
+                        (0..4)
+                            .map(|k| {
+                                (f64::from(logp[j * 4 + k])
+                                    - (f64::from(scores[order[k] as usize]) - expected_lse))
+                                    .abs()
+                            })
+                            .fold(0.0, f64::max),
+                    );
+                    let name = format!("markov.v{vocab}.p{p}.round{rounding}.row{j}");
+                    println!(
+                        "MARKOV_ERROR name={name} lse_logp_max={error:e} bound=1e-4 margin4_5={}",
+                        scores[order[3] as usize] - scores[order[4] as usize]
+                    );
+                    gate.check(&name, top[j * 4..j * 4 + 4] == order[..4] && error <= 1e-4);
+                    let bits: Vec<_> = top[j * 4..j * 4 + 4]
+                        .iter()
+                        .copied()
+                        .chain(logp[j * 4..j * 4 + 4].iter().map(|x| x.to_bits()))
+                        .chain([lse[j].to_bits()])
+                        .collect();
+                    let key = (rounding, row, token);
+                    if let Some(previous) = identities.insert(key, bits.clone()) {
+                        gate.check("markov.batch_position_identity", previous == bits);
+                    }
+                }
+                if vocab == 263 && p == 3 && rounding == 0 {
+                    let wrong_rows =
+                        s.clone_htod(&requests.iter().map(|r| (r.0 + 1) % 7).collect::<Vec<_>>())?;
+                    let mut mutant_top = s.alloc_zeros::<u32>(p * 4)?;
+                    let mut mutant_logp = s.alloc_zeros::<f32>(p * 4)?;
+                    let mut mutant_lse = s.alloc_zeros::<f32>(p)?;
+                    unsafe {
+                        s.launch_builder(&first[index])
+                            .arg(&db)
+                            .arg(&dw1)
+                            .arg(&dw2)
+                            .arg(&tokens)
+                            .arg(&wrong_rows)
+                            .arg(&mut partial_top)
+                            .arg(&mut partial_lse)
+                            .arg(&(vocab as i32))
+                            .arg(&256i32)
+                            .arg(&(p as i32))
+                            .arg(&rounding)
+                            .launch(ops::grid(vocab.div_ceil(256), 256))?;
+                        s.launch_builder(&second)
+                            .arg(&partial_top)
+                            .arg(&partial_lse)
+                            .arg(&mut mutant_top)
+                            .arg(&mut mutant_logp)
+                            .arg(&mut mutant_lse)
+                            .arg(&(vocab as i32))
+                            .arg(&(p as i32))
+                            .arg(&(pt as i32))
+                            .launch(ops::grid(p, 256))?;
+                    }
+                    gate.check(
+                        "markov.request_row_mutant_rejected",
+                        s.clone_dtoh(&mutant_top)? != top
+                            || s.clone_dtoh(&mutant_lse)?
+                                .iter()
+                                .zip(&lse)
+                                .any(|(a, b)| (a - b).abs() > 1e-4),
+                    );
+                }
+            }
         }
     }
     Ok(())

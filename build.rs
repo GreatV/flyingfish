@@ -65,6 +65,7 @@ const ROCM_KERNELS: &[&str] = &[
     "q38_common",
     "gemm_skinny",
     "tcmqa",
+    "markov",
 ];
 
 fn wave32_rdna_arch(arch: &str) -> bool {
@@ -167,7 +168,7 @@ fn build_rocm(out: &std::path::Path) {
         );
         println!("cargo:rerun-if-changed={}", file.display());
         for arch in &archs {
-            if matches!(*name, "gemm_skinny" | "tcmqa") && !arch.starts_with("gfx11") {
+            if matches!(*name, "gemm_skinny" | "tcmqa" | "markov") && !arch.starts_with("gfx11") {
                 continue;
             }
             let filename = format!("{name}_{arch}.hsaco");
