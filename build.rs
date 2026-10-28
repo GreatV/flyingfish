@@ -172,6 +172,36 @@ fn wave32_rdna_arch(arch: &str) -> bool {
         && matches!(&number[..2], "10" | "11" | "12")
 }
 
+fn rocm_agent_names(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix("Name:"))
+        .map(str::trim)
+        .filter(|name| name.starts_with("gfx"))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn rocm_probe_uses_concrete_agent_names() {
+    let output = "  Name: AMD Ryzen CPU\n\
+                  Name: gfx1100\n\
+                  Marketing Name: AMD Radeon Graphics\n\
+                  Name: amdgcn-amd-amdhsa--gfx1100\n\
+                  Name: amdgcn-amd-amdhsa--gfx11-generic\n";
+    assert_eq!(rocm_agent_names(output), ["gfx1100"]);
+    for architecture in ["gfx1030", "gfx1100", "gfx1200", "gfx90a", "gfx942", "gfx11"] {
+        assert_eq!(
+            rocm_agent_names(&format!("Name: {architecture}")),
+            [architecture]
+        );
+        assert_eq!(
+            wave32_rdna_arch(architecture),
+            matches!(architecture, "gfx1030" | "gfx1100" | "gfx1200")
+        );
+    }
+    assert!(rocm_agent_names("Name: amdgcn-amd-amdhsa--gfx11-generic").is_empty());
+}
+
 fn rocm_architectures() -> Vec<String> {
     println!("cargo:rerun-if-env-changed=ROCM_ARCH_LIST");
     let value = match env::var("ROCM_ARCH_LIST") {
@@ -197,10 +227,7 @@ fn rocm_architectures() -> Vec<String> {
         );
         let text =
             String::from_utf8(output.stdout).expect("rocminfo returned non-UTF8 architectures");
-        text.split(|byte: char| !byte.is_ascii_alphanumeric())
-            .filter(|value| value.starts_with("gfx"))
-            .map(|value| value.to_owned())
-            .collect::<Vec<_>>()
+        rocm_agent_names(&text)
     };
     assert!(
         !values.is_empty(),
