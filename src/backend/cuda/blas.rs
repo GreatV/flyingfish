@@ -368,8 +368,8 @@ impl Blas {
                     "Lt identity gate".into(),
                 )),
             )?;
-            let w = stream.clone_htod(&super::calibrate::random(output * input, 13))?;
-            let x = stream.clone_htod(&super::calibrate::random(8 * input, 17))?;
+            let w = stream.clone_htod(&super::random(output * input, 13))?;
+            let x = stream.clone_htod(&super::random(8 * input, 17))?;
             blas.calibrate_shape(&w, &x.slice(..), shape)?;
             let candidates = blas.candidates(shape)?;
             let Some(other) = candidates
@@ -1240,9 +1240,8 @@ mod tests {
             )?;
             cold.prepare(128, output, shape.input)?;
             assert!(cold.skinny_plans.borrow().is_empty());
-            let w =
-                stream.clone_htod(&super::super::calibrate::random(output * shape.input, 13))?;
-            let x = stream.clone_htod(&super::super::calibrate::random(shape.input, 17))?;
+            let w = stream.clone_htod(&super::super::random(output * shape.input, 13))?;
+            let x = stream.clone_htod(&super::super::random(shape.input, 17))?;
             cold.calibrate_shape(&w, &x.slice(..), shape)?;
             let mut y = stream.alloc_zeros::<bf16>(output)?;
             cold.skinny(&w, &x.slice(..), &mut y.slice_mut(..), shape)?;

@@ -13,6 +13,15 @@ use std::{
 
 type Handle = *mut c_void;
 
+const HIP_STREAM_NON_BLOCKING: u32 = 1;
+const HIP_EVENT_DISABLE_TIMING: u32 = 2;
+const HIP_STREAM_CAPTURE_THREAD_LOCAL: i32 = 1;
+const HIP_ERROR_NOT_READY: i32 = 600;
+const HIP_FUNC_SHARED_SIZE_BYTES: i32 = 1;
+pub(crate) const HIP_MEMCPY_HOST_TO_DEVICE: i32 = 1;
+pub(crate) const HIP_MEMCPY_DEVICE_TO_HOST: i32 = 2;
+pub(crate) const HIP_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
+
 unsafe extern "C" {
     fn hipInit(flags: u32) -> i32;
     fn hipSetDevice(device: i32) -> i32;
@@ -158,6 +167,8 @@ pub struct Context {
     pub properties: Properties,
     architecture: String,
     deferred_error: Mutex<Option<String>>,
+    #[cfg(test)]
+    pub(crate) device_synchronizations: std::sync::atomic::AtomicUsize,
 }
 
 impl Context {
@@ -230,6 +241,8 @@ impl Context {
             properties,
             architecture,
             deferred_error: Mutex::new(None),
+            #[cfg(test)]
+            device_synchronizations: std::sync::atomic::AtomicUsize::new(0),
         }))
     }
     pub fn architecture(&self) -> &str {
@@ -254,6 +267,8 @@ impl Context {
         unsafe { check(hipSetDevice(self.ordinal as i32), "hipSetDevice") }
     }
     pub fn synchronize(&self) -> Result<()> {
+        #[cfg(test)]
+        self.device_synchronizations.fetch_add(1, Ordering::Relaxed);
         self.bind_to_thread()?;
         unsafe { check(hipDeviceSynchronize(), "hipDeviceSynchronize") }
     }
@@ -317,7 +332,7 @@ impl Context {
         let mut handle = std::ptr::null_mut();
         unsafe {
             check(
-                hipStreamCreateWithFlags(&mut handle, 1),
+                hipStreamCreateWithFlags(&mut handle, HIP_STREAM_NON_BLOCKING),
                 "hipStreamCreateWithFlags",
             )?;
         }
@@ -353,11 +368,13 @@ impl Context {
         self.bind_to_thread()?;
         let bytes = extent::<T>(len)?;
         ensure!(bytes > 0, "empty HIP pinned allocation");
+        let completed = self.new_event(Some(HIP_EVENT_DISABLE_TIMING))?;
         let mut ptr = std::ptr::null_mut();
         unsafe {
             check(hipHostMalloc(&mut ptr, bytes, flags), "hipHostMalloc")?;
         }
         Ok(PinnedHostSlice {
+            completed,
             ptr: ptr as usize,
             len,
             context: self.clone(),
@@ -453,7 +470,7 @@ impl Stream {
                 .expect("HIP capture resources poisoned")
                 .extend(resources.iter().filter_map(Weak::upgrade));
         }
-        let status = unsafe { hipStreamBeginCapture(self.raw(), 1) };
+        let status = unsafe { hipStreamBeginCapture(self.raw(), HIP_STREAM_CAPTURE_THREAD_LOCAL) };
         if status != 0 {
             self.capturing.store(false, Ordering::Release);
             let resources = std::mem::take(
@@ -547,7 +564,12 @@ impl Stream {
         output.check_stream(self)?;
         let (ptr, _guard) = output.device_ptr_mut(self);
         unsafe {
-            self.copy_raw(ptr, input.as_ptr() as u64, extent::<T>(input.len())?, 1)?;
+            self.copy_raw(
+                ptr,
+                input.as_ptr() as u64,
+                extent::<T>(input.len())?,
+                HIP_MEMCPY_HOST_TO_DEVICE,
+            )?;
         }
         self.synchronize()
     }
@@ -564,7 +586,7 @@ impl Stream {
                 output.as_mut_ptr() as u64,
                 ptr,
                 extent::<T>(input.len())?,
-                2,
+                HIP_MEMCPY_DEVICE_TO_HOST,
             )?;
         }
         self.synchronize()?;
@@ -590,7 +612,7 @@ impl Stream {
                 output.as_mut_ptr() as u64,
                 ptr,
                 extent::<T>(input.len())?,
-                2,
+                HIP_MEMCPY_DEVICE_TO_HOST,
             )?;
         }
         self.synchronize()
@@ -605,7 +627,14 @@ impl Stream {
         output.check_stream(self)?;
         let (src, _read) = input.device_ptr(self);
         let (dst, _write) = output.device_ptr_mut(self);
-        unsafe { self.copy_raw(dst, src, extent::<T>(input.len())?, 3) }
+        unsafe {
+            self.copy_raw(
+                dst,
+                src,
+                extent::<T>(input.len())?,
+                HIP_MEMCPY_DEVICE_TO_DEVICE,
+            )
+        }
     }
     pub fn memset_zeros<T: DeviceRepr + ValidAsZeroBits>(
         self: &Arc<Self>,
@@ -833,7 +862,7 @@ impl Event {
     pub(crate) fn try_is_complete(&self) -> Result<bool> {
         self.context.bind_to_thread()?;
         let status = unsafe { hipEventQuery(self.handle as Handle) };
-        if status == 600 {
+        if status == HIP_ERROR_NOT_READY {
             return Ok(false);
         }
         check(status, "hipEventQuery")?;
@@ -976,7 +1005,10 @@ impl<T> Slice<T> {
             Arc::strong_count(&self.allocation) == 1,
             "HIP handoff requires exclusive allocation ownership"
         );
-        let completed = self.allocation.stream.record_event(Some(2))?;
+        let completed = self
+            .allocation
+            .stream
+            .record_event(Some(HIP_EVENT_DISABLE_TIMING))?;
         stream.wait(&completed)?;
         let previous = std::mem::replace(
             &mut self.allocation,
@@ -1105,7 +1137,20 @@ unsafe impl<T> DevicePtrMut<T> for ViewMut<'_, T> {
     }
 }
 
+pub(crate) struct PinnedAccess<'a> {
+    completed: &'a Event,
+    stream: &'a Arc<Stream>,
+}
+impl Drop for PinnedAccess<'_> {
+    fn drop(&mut self) {
+        self.stream
+            .context
+            .record_err(self.completed.record(self.stream));
+    }
+}
+
 pub struct PinnedHostSlice<T> {
+    completed: Event,
     ptr: usize,
     len: usize,
     context: Arc<Context>,
@@ -1114,29 +1159,44 @@ pub struct PinnedHostSlice<T> {
 impl<T> PinnedHostSlice<T> {
     /// # Safety
     /// All writers must have completed and the span stays live through stream completion.
-    pub(crate) unsafe fn stream_synced_slice(&self, stream: &Arc<Stream>) -> (&[T], ()) {
+    pub(crate) unsafe fn stream_synced_slice<'a>(
+        &'a self,
+        stream: &'a Arc<Stream>,
+    ) -> (&'a [T], PinnedAccess<'a>) {
         assert!(
             Arc::ptr_eq(&self.context, stream.context()),
             "HIP pinned context mismatch"
         );
+        stream
+            .wait(&self.completed)
+            .expect("HIP pinned access event wait");
         (
             unsafe { std::slice::from_raw_parts(self.ptr as *const T, self.len) },
-            (),
+            PinnedAccess {
+                completed: &self.completed,
+                stream,
+            },
         )
     }
     /// # Safety
     /// All prior accesses must have completed and the span stays exclusive through stream completion.
-    pub(crate) unsafe fn stream_synced_mut_slice(
-        &mut self,
-        stream: &Arc<Stream>,
-    ) -> (&mut [T], ()) {
+    pub(crate) unsafe fn stream_synced_mut_slice<'a>(
+        &'a mut self,
+        stream: &'a Arc<Stream>,
+    ) -> (&'a mut [T], PinnedAccess<'a>) {
         assert!(
             Arc::ptr_eq(&self.context, stream.context()),
             "HIP pinned context mismatch"
         );
+        stream
+            .wait(&self.completed)
+            .expect("HIP pinned access event wait");
         (
             unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut T, self.len) },
-            (),
+            PinnedAccess {
+                completed: &self.completed,
+                stream,
+            },
         )
     }
     pub fn len(&self) -> usize {
@@ -1146,11 +1206,11 @@ impl<T> PinnedHostSlice<T> {
         self.len == 0
     }
     pub fn as_slice(&self) -> Result<&[T]> {
-        self.context.synchronize()?;
+        self.completed.synchronize()?;
         Ok(unsafe { std::slice::from_raw_parts(self.ptr as *const T, self.len) })
     }
     pub fn as_mut_slice(&mut self) -> Result<&mut [T]> {
-        self.context.synchronize()?;
+        self.completed.synchronize()?;
         Ok(unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut T, self.len) })
     }
     pub fn as_ptr(&self) -> Result<*const T> {
@@ -1209,7 +1269,11 @@ impl Function {
         let mut value = 0;
         unsafe {
             check(
-                hipFuncGetAttribute(&mut value, 1, self.handle as Handle),
+                hipFuncGetAttribute(
+                    &mut value,
+                    HIP_FUNC_SHARED_SIZE_BYTES,
+                    self.handle as Handle,
+                ),
                 "hipFuncGetAttribute(sharedSizeBytes)",
             )?;
         }

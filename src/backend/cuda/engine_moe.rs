@@ -1433,7 +1433,7 @@ impl Decode {
             let (host_weights, _weights_write) =
                 unsafe { self.host_weights.stream_synced_mut_slice(&self.mailbox) };
             let (host_x, _x_write) = unsafe { self.host_x.stream_synced_mut_slice(&self.mailbox) };
-            // SAFETY: each copied prefix has its exact logical extent inside the owned mailbox.
+            // SAFETY: mailbox waits self.reader after compute writes; mailbox synchronization completes these owned-prefix reads.
             unsafe {
                 copy::dtoh_async(&mut host_ids[..count], ids_ptr, self.mailbox.as_ref())?;
                 copy::dtoh_async(
@@ -1545,14 +1545,18 @@ impl Decode {
                 #[cfg(feature = "cuda")]
                 let (active_ptr, _active_write) = self.active.device_ptr_mut(&self.mailbox);
                 #[cfg(feature = "rocm")]
-                let (active_ptr, _active_write) = self.active.device_ptr(self.active.stream());
+                let active_owner = self.active.stream().clone();
+                #[cfg(feature = "rocm")]
+                let (active_ptr, _active_write) = self.active.device_ptr_mut(&active_owner);
                 #[cfg(feature = "cuda")]
                 let (generation_ptr, _generation_write) =
                     self.generation.device_ptr_mut(&self.mailbox);
                 #[cfg(feature = "rocm")]
+                let generation_owner = self.generation.stream().clone();
+                #[cfg(feature = "rocm")]
                 let (generation_ptr, _generation_write) =
-                    self.generation.device_ptr(self.generation.stream());
-                // SAFETY: owned pinned prefixes and device destinations each contain rows*top_k elements.
+                    self.generation.device_ptr_mut(&generation_owner);
+                // SAFETY: read_route waits self.reader before mailbox writes; compute waits self.mailbox_ready before reading the owned rows*top_k spans.
                 unsafe {
                     copy::htod_async(active_ptr, &active[..rows * k], self.mailbox.as_ref())?;
                     copy::htod_async(

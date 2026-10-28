@@ -352,7 +352,12 @@ pub fn dtoh_bytes<T: crate::backend::gpu::DeviceRepr>(
     );
     s.context().bind_to_thread()?;
     let (src_ptr, _guard) = src.device_ptr(s);
+    #[cfg(feature = "cuda")]
     let dst_ptr = dst.as_mut_ptr()?;
+    #[cfg(feature = "rocm")]
+    let (dst_slice, _write) = unsafe { dst.stream_synced_mut_slice(s) };
+    #[cfg(feature = "rocm")]
+    let dst_ptr = dst_slice.as_mut_ptr();
     unsafe {
         #[cfg(feature = "cuda")]
         sys::cuMemcpyDtoHAsync_v2(
@@ -390,7 +395,12 @@ pub fn htod_bytes<T: crate::backend::gpu::DeviceRepr>(
     );
     s.context().bind_to_thread()?;
     let (dst_ptr, _guard) = dst.device_ptr_mut(s);
+    #[cfg(feature = "cuda")]
     let src_ptr = src.as_ptr()?;
+    #[cfg(feature = "rocm")]
+    let (src_slice, _read) = unsafe { src.stream_synced_slice(s) };
+    #[cfg(feature = "rocm")]
+    let src_ptr = src_slice.as_ptr();
     unsafe {
         #[cfg(feature = "cuda")]
         sys::cuMemcpyHtoDAsync_v2(

@@ -1506,8 +1506,12 @@ fn copy_gate(ctx: &Arc<CudaContext>, s: &Arc<CudaStream>, gate: &mut Gate) -> Re
         // The read follows the compute event and the pinned output is unread until synchronization.
         unsafe { copy::dtoh_async(output, dst + 12, upload.as_ref())? };
     }
+    #[cfg(feature = "cuda")]
     upload.synchronize()?;
-    gate.check("copy.raw_event_complete", completed.try_is_complete()?);
+    #[cfg(feature = "rocm")]
+    let syncs_before = ctx
+        .device_synchronizations
+        .load(std::sync::atomic::Ordering::Relaxed);
     let mut raw_expected = raw_input
         .as_slice()?
         .iter()
@@ -1521,6 +1525,17 @@ fn copy_gate(ctx: &Arc<CudaContext>, s: &Arc<CudaStream>, gate: &mut Gate) -> Re
         .flat_map(|word| word.to_le_bytes())
         .collect::<Vec<_>>();
     gate.check("copy.raw_fenced_mailbox", raw_actual == raw_expected);
+    gate.check("copy.raw_event_complete", completed.try_is_complete()?);
+    #[cfg(feature = "rocm")]
+    {
+        raw_output.as_mut_slice()?;
+        gate.check(
+            "copy.pinned_access_buffer_event_only",
+            ctx.device_synchronizations
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == syncs_before,
+        );
+    }
     raw_expected[76] ^= 1;
     gate.check("copy.raw_wrong_word_control", raw_actual != raw_expected);
     let guarded = s.clone_dtoh(&raw_target)?;

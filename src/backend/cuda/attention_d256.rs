@@ -22,7 +22,7 @@ const SEG_MAX: u32 = 64;
 const PHASE1_THREADS: u32 = 128;
 const PHASE2_THREADS: u32 = D;
 const PREP_THREADS: u32 = 256;
-/// `(MT + 2*KT) * (D + 8) * 2 + 64*8` from `kernels/tcmqa_d256.cu`.
+/// CUDA `(MT + 2*KT) * (D + 8) * 2 + 64*8` bytes; HIP tile layout uses 62720 bytes.
 #[cfg(feature = "cuda")]
 const PHASE1_SMEM: u32 = 68096;
 #[cfg(feature = "rocm")]

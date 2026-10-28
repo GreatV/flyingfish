@@ -366,7 +366,7 @@ pub(super) fn uniform_attention_error(
 }
 
 #[cfg(feature = "cuda")]
-pub(super) use super::random;
+use super::random;
 
 #[cfg(feature = "cuda")]
 fn measure(
@@ -1680,11 +1680,12 @@ pub(super) fn load_experts(
     Ok(measured)
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 mod long_tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "cuda")]
     fn uniform_attention_error_maps_query_heads_to_kv_heads() {
         let c = Config {
             model_type: "llama".into(),

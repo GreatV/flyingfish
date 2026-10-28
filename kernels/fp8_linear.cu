@@ -1,6 +1,6 @@
 // Row-major E4M3 codes; BF16 block-128 or per-output-channel scales.
-// M1..16 entry points form the rounded weight in registers, accumulate FP32 and
-// write BF16 with no matrix scratch; larger M materializes effective BF16 weights.
+// CUDA M1..16 rounds weights in registers; larger M materializes BF16 weights.
+// HIP channel projections decode BF16-rounded weights in SIMT registers or WMMA tiles.
 // Format: __nv_fp8_e4m3 (CUDA Math API).
 #include "gpu_compat.cuh"
 #if !defined(__HIP__)
@@ -290,38 +290,6 @@ __device__ void fp8_small_hip(
         if (lane == 0) y[(size_t)m * n + row] = __float2bfloat16(value);
     }
 }
-#define HIP_FP8_SMALL(NAME, M, CHANNEL) \
-extern "C" __global__ void NAME( \
-    const uint8_t* w, const __nv_bfloat16* scales, const __nv_bfloat16* x, \
-    __nv_bfloat16* y, int n, int k) { \
-    if (n <= 0 || k <= 0 || blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 || \
-        gridDim.x != (uint64_t(n)+3)/4 || gridDim.y != 1 || gridDim.z != 1 || \
-        !aligned16(w) || !aligned16(scales) || !aligned16(x) || !aligned16(y)) __trap(); \
-    fp8_small_hip<M, CHANNEL>(w,scales,x,y,n,k); \
-}
-HIP_FP8_SMALL(fp8_gemv_bf16, 1, false)
-HIP_FP8_SMALL(fp8_gemv_bf16_per_channel, 1, true)
-#define HIP_FP8_ROW(M) \
-HIP_FP8_SMALL(fp8_skinny_bf16_m##M, M, false) \
-HIP_FP8_SMALL(fp8_skinny_bf16_m##M##_per_channel, M, true)
-HIP_FP8_ROW(2)
-HIP_FP8_ROW(3)
-HIP_FP8_ROW(4)
-HIP_FP8_ROW(5)
-HIP_FP8_ROW(6)
-HIP_FP8_ROW(7)
-HIP_FP8_ROW(8)
-HIP_FP8_ROW(9)
-HIP_FP8_ROW(10)
-HIP_FP8_ROW(11)
-HIP_FP8_ROW(12)
-HIP_FP8_ROW(13)
-HIP_FP8_ROW(14)
-HIP_FP8_ROW(15)
-HIP_FP8_ROW(16)
-#undef HIP_FP8_ROW
-#undef HIP_FP8_SMALL
-
 extern "C" __global__ void fp8_channel_bf16_simt(
         const uint8_t* w, const __nv_bfloat16* scales, const __nv_bfloat16* x,
         __nv_bfloat16* y, int m, int n, int k) {
@@ -347,10 +315,8 @@ extern "C" __global__ void fp8_channel_bf16_wmma(
     for (int k0 = 0; k0 < k; k0 += 32) {
         for (int cell = tid; cell < 64 * 32; cell += 128) {
             const int row = n0 + cell / 32, col = k0 + cell % 32;
-            const float boost = row < n && __bfloat162float(scales[row]) < 0x1p-64f
-                ? 0x1p64f : 1.0f;
             weight[cell / 32][cell % 32] = row < n && col < k
-                ? __float2bfloat16(__bfloat162float(weight_at<true>(w,scales,row,col,k,1)) * boost)
+                ? fp8_channel_tile_weight(w[(size_t)row*k+col], scales[row])
                 : __float2bfloat16(0.0f);
         }
         for (int cell = tid; cell < 16 * 32; cell += 128) {
@@ -375,7 +341,7 @@ extern "C" __global__ void fp8_channel_bf16_wmma(
     for (int j = 0; j < 8; ++j) {
         const int row = m0 + lane % 16, col = n0 + wave * 16 + 2*j + lane/16;
         if (row < m && col < n) {
-            const float unscale = __bfloat162float(scales[col]) < 0x1p-64f ? 0x1p-64f : 1.0f;
+            const float unscale = fp8_channel_tile_unscale(scales[col]);
             y[(size_t)row*n+col] = __float2bfloat16(acc[j] * unscale);
         }
     }

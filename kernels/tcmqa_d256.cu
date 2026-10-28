@@ -318,7 +318,7 @@ extern "C" __global__ void tcmqa_d256_v_scatter(const __nv_bfloat16* __restrict_
 // Pair p = q_in_group*seg_rows + local_row; the tile covers pairs [rt*MT, rt*MT+MT).
 // Warp w owns MMA rows [w*16, w*16+16).
 // Launch: grid(Pmax, HKV, ceil(GQA*seg_rows/MT)), block NT,
-//         dynamic smem SMEM_NARROW (> 48 KiB, host opts in).
+//         CUDA dynamic smem SMEM_NARROW; HIP dynamic smem 62720 bytes.
 #if defined(__HIP__)
 using AttentionBf16 = short __attribute__((ext_vector_type(16)));
 using AttentionAcc = float __attribute__((ext_vector_type(8)));

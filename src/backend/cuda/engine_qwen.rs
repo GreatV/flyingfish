@@ -2312,9 +2312,7 @@ impl Engine {
             "{}",
             serde_json::json!({"hip_hybrid_setup":{
                 "cached":cached,
-                "measurements":if cached {0} else {choices.iter().filter(|c|c.setup_median_ms.is_some()).count()},
-                "calibration":"untuned correctness-only",
-                "full_weight_materialization_bytes":0
+                "measurements":if cached {0} else {choices.iter().filter(|c|c.setup_median_ms.is_some()).count()}
             }})
         );
         Ok(())

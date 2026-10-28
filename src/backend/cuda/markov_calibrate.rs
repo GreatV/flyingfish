@@ -4,11 +4,10 @@ use std::{
 };
 
 use super::{
-    Device,
-    calibrate::random,
-    cubin,
+    Device, cubin,
     markov::MarkovShape,
     ops::{Ops, grid},
+    random,
 };
 use crate::backend::setup::CacheKey;
 use anyhow::{Context, Result, ensure};

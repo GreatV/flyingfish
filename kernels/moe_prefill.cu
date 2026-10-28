@@ -112,11 +112,8 @@ extern "C" __global__ void __launch_bounds__(256) moe_gemm_w8a16(
   for (int k0 = 0; k0 < inner; k0 += 32) {
     for (int cell = tid; cell < 128 * 32; cell += 256) {
       const int n = n0 + cell / 32, k = k0 + cell % 32;
-      const float boost = n < columns && __bfloat162float(scales[n]) < 0x1p-64f
-          ? 0x1p64f : 1.0f;
       weight[cell / 32][cell % 32] = n < columns
-          ? __float2bfloat16(__bfloat162float(__float2bfloat16_rn(
-                e4m3_decode(codes[(size_t)n * inner + k]) * __bfloat162float(scales[n]))) * boost)
+          ? fp8_channel_tile_weight(codes[(size_t)n * inner + k], scales[n])
           : __float2bfloat16(0.0f);
     }
     for (int cell = tid; cell < 64 * 32; cell += 256) {
@@ -149,7 +146,7 @@ extern "C" __global__ void __launch_bounds__(256) moe_gemm_w8a16(
       const int m = m0 + tile * 16 + lane % 16;
       const int n = n0 + wave * 16 + 2 * j + lane / 16;
       if (m < rows && n < columns) {
-        const float unscale = __bfloat162float(scales[n]) < 0x1p-64f ? 0x1p-64f : 1.0f;
+        const float unscale = fp8_channel_tile_unscale(scales[n]);
         y[(size_t)m * columns + n] = __float2bfloat16(acc[tile][j] * unscale);
       }
     }

@@ -5085,7 +5085,7 @@ impl Engine {
         if write {
             let c = &self.config;
             for &shape in &profile.linear {
-                let values = super::calibrate::random(shape.rows * shape.input, 1);
+                let values = super::random(shape.rows * shape.input, 1);
                 let input = self.device.stream.clone_htod(&values)?;
                 let layer = &self.weights.layers[0];
                 let weight = if shape.output == c.vocab_size && shape.input == c.hidden_size {

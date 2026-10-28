@@ -39,17 +39,31 @@ def load_model(directory):
         return model
 
     architecture = getattr(transformers, config.architectures[0])
-    with patch("transformers.integrations.accelerate.dispatch_model", dispatch):
+    initialized = []
+    initialization_calls = []
+    initialize = architecture._initialize_missing_keys
+
+    def record_initialization(model, *args, **kwargs):
+        initialization_calls.append(True)
+        initialized.extend(name for name, value in model.state_dict(keep_vars=True).items()
+                           if not getattr(value, "_is_hf_initialized", False))
+        check(not initialized, f"newly initialized model keys: {initialized}")
+        return initialize(model, *args, **kwargs)
+
+    with patch("transformers.integrations.accelerate.dispatch_model", dispatch), \
+            patch.object(architecture, "_initialize_missing_keys", record_initialization):
         model, loading = architecture.from_pretrained(
             directory, dtype=torch.bfloat16, device_map=placement,
             output_loading_info=True, local_files_only=True,
         )
     check(placements == [True], "reference placement call count")
+    check(initialization_calls == [True], "reference initialization call count")
     clean = {}
     for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs"):
         check(key in loading and not loading[key], f"unclean model load {key}: {loading.get(key)}")
         clean[key] = []
-    clean["newly_initialized_keys"] = []
+    clean["newly_initialized_keys"] = initialized
+    check(not clean["newly_initialized_keys"], "newly initialized model keys")
     for name, value in list(model.named_parameters()) + list(model.named_buffers()):
         if not value.is_meta:
             set_module_tensor_to_device(model, name, "cuda:0")
@@ -102,7 +116,9 @@ def load_model(directory):
         experts.register_forward_pre_hook(onload)
         experts.register_forward_hook(release)
     model.eval()
-    print("MINICPM_REFERENCE_LOAD missing=0 unexpected=0 initialized=0 errors=0 PASS", flush=True)
+    print(f"MINICPM_REFERENCE_LOAD missing={len(clean['missing_keys'])} "
+          f"unexpected={len(clean['unexpected_keys'])} initialized={len(clean['newly_initialized_keys'])} "
+          f"errors={len(clean['error_msgs'])} PASS", flush=True)
     return model, clean, calls
 
 

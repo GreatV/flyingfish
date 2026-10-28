@@ -1914,7 +1914,12 @@ unsafe fn dtoh_window(
         window.len()
     );
     stream.context().bind_to_thread()?;
+    #[cfg(feature = "cuda")]
     let dst = window.as_mut_ptr()?;
+    #[cfg(feature = "rocm")]
+    let (span, _write) = unsafe { window.stream_synced_mut_slice(stream) };
+    #[cfg(feature = "rocm")]
+    let dst = span.as_mut_ptr();
     unsafe {
         #[cfg(feature = "rocm")]
         stream.copy_raw(dst as u64, src, words * size_of::<i32>(), 2)?;
@@ -1946,7 +1951,12 @@ unsafe fn htod_ptrs(
         src.len()
     );
     stream.context().bind_to_thread()?;
+    #[cfg(feature = "cuda")]
     let host = src.as_ptr()?;
+    #[cfg(feature = "rocm")]
+    let (span, _read) = unsafe { src.stream_synced_slice(stream) };
+    #[cfg(feature = "rocm")]
+    let host = span.as_ptr();
     unsafe {
         #[cfg(feature = "rocm")]
         stream.copy_raw(dst, host as u64, words * size_of::<u64>(), 1)?;
