@@ -3971,9 +3971,11 @@ fn published_residency(engine: &Engine, model: &Path) -> Result<usize> {
     {
         let mut frequency = vec![vec![0.0; geometry.experts as usize]; geometry.layers as usize];
         for layer in &mut frequency {
-            for id in target {
-                layer[id as usize] = 1.0;
-            }
+            layer[..4].fill(1.0);
+        }
+        frequency[0].fill(0.0);
+        for id in target {
+            frequency[0][id as usize] = 1.0;
         }
         slots.delay_copies();
         slots.begin_request(&frequency)?;
@@ -4072,5 +4074,189 @@ fn published_residency_gpu() -> Result<()> {
     let mut defects = placement_components(&engine, &model)?;
     defects += published_residency(&engine, &model)?;
     ensure!(defects == 0, "DEFECT published residency cells={defects}");
+    Ok(())
+}
+
+std::thread_local! {
+    pub(super) static MEMORY_BUDGET: std::cell::Cell<Option<(usize, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+#[test]
+#[ignore = "GPU lease, published FP8 model, frozen model-definition outputs and pinned runtime"]
+fn published_streamed_model_gpu() -> Result<()> {
+    let fixtures: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/minicpm_reference.json"
+    )))?;
+    let cases = fixtures["cases"]
+        .as_array()
+        .context("published reference cases")?;
+    let model = PathBuf::from(std::env::var_os("FF_MODEL").context("published model missing")?);
+    let reference = PathBuf::from(
+        std::env::var_os("FF_DENSE_REFERENCE").context("published reference missing")?,
+    );
+    let runtime = PathBuf::from(
+        std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("published runtime missing")?,
+    );
+    let settings = Settings {
+        runtime_dir: Some(runtime),
+        prefix_cache: false,
+        draft_model: None,
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: true,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    MEMORY_BUDGET.set(Some((24 << 30, 4 << 30)));
+    let loaded = Engine::load(&model, 0, 8192, Some(129), settings);
+    MEMORY_BUDGET.set(None);
+    let mut engine = loaded?;
+    engine.check_ready()?;
+    let cap = &engine
+        .moe_prefill
+        .as_ref()
+        .context("streamed prefill missing")?
+        .capacity;
+    ensure!(
+        cap.pinned
+            && cap.disk_bytes > 0
+            && cap.host_blocks > 0
+            && cap.slots_per_layer.iter().all(|&n| n < 256),
+        "Runner FAIL forced planner did not produce pinned-host/disk partial residency: {cap:?}"
+    );
+    println!(
+        "PUBLISHED_STREAMED_PLAN slots={:?} host_blocks={} disk_bytes={} pinned={} device_limit={} host_limit={}",
+        cap.slots_per_layer,
+        cap.host_blocks,
+        cap.disk_bytes,
+        cap.pinned,
+        24u64 << 30,
+        4u64 << 30
+    );
+    let mut defects = 0;
+    let mut cells = 0;
+    for rows in [1024usize, 4096] {
+        let case = cases
+            .iter()
+            .find(|case| case["rows"].as_u64() == Some(rows as u64))
+            .context("published fixture rows")?;
+        let max_limit = case["limits"]["max_normalized"]
+            .as_f64()
+            .context("frozen max limit")?;
+        let rms_limit = case["limits"]["rms_normalized"]
+            .as_f64()
+            .context("frozen RMS limit")?;
+        ensure!(
+            max_limit.is_finite() && max_limit > 0.0 && rms_limit.is_finite() && rms_limit > 0.0,
+            "Runner FAIL invalid frozen limits"
+        );
+        let bytes =
+            std::fs::read(reference.join(format!("text{rows}-chunk{rows}-repeat0.safetensors")))?;
+        let tensors = safetensors::SafeTensors::deserialize(&bytes)?;
+        let tensor = tensors.tensor("logits")?;
+        ensure!(
+            tensor.dtype() == safetensors::Dtype::F32 && tensor.shape() == [4, 248144],
+            "Runner FAIL reference must be F32[4,248144]"
+        );
+        let expected = tensor
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&word| f32::from_le_bytes(word))
+            .collect::<Vec<_>>();
+        ensure!(
+            expected.iter().all(|v| v.is_finite()),
+            "Runner FAIL reference nonfinite"
+        );
+        let ids = (0..rows)
+            .map(|i| ((i * 269 + 23) % 248144) as u32)
+            .collect::<Vec<_>>();
+        let mut eager = Vec::new();
+        for (repeat, graph) in [false, true, false].into_iter().enumerate() {
+            engine.reset()?;
+            engine.prefill(&ids[..17], None)?;
+            let mut token = engine.prefill(&ids[17..], None)?;
+            let mut maximum = 0.0f64;
+            let mut rms = 0.0f64;
+            let mut min_margin = f32::INFINITY;
+            let mut cell_defects = 0;
+            for step in 0..4 {
+                if step > 0 {
+                    engine.set_token([115, 1301, 3809][step - 1])?;
+                    token = engine.decode(graph, None)?;
+                }
+                ensure!(
+                    engine.position == rows + step,
+                    "DEFECT streamed absolute position"
+                );
+                let logits = engine.decode_logits()?;
+                ensure!(
+                    logits.len() == 248144 && logits.iter().all(|v| v.is_finite()),
+                    "Runner FAIL streamed logits"
+                );
+                let bits = logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                if repeat == 0 {
+                    eager.push((token, bits));
+                } else {
+                    cell_defects += usize::from(eager[step] != (token, bits));
+                }
+                let reference = &expected[step * 248144..(step + 1) * 248144];
+                let scale = (reference.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>()
+                    / 248144.0)
+                    .sqrt();
+                ensure!(
+                    scale.is_finite() && scale > 0.0,
+                    "Runner FAIL reference scale"
+                );
+                let mut error_max = 0.0f64;
+                let mut error_square = 0.0f64;
+                for (&actual, &wanted) in logits.iter().zip(reference) {
+                    let error = f64::from(actual) - f64::from(wanted);
+                    error_max = error_max.max(error.abs());
+                    error_square += error * error;
+                }
+                maximum = maximum.max(error_max / scale);
+                rms = rms.max((error_square / 248144.0).sqrt() / scale);
+                let mut order = (0..248144).collect::<Vec<_>>();
+                order.sort_unstable_by(|&a, &b| {
+                    reference[b].total_cmp(&reference[a]).then(a.cmp(&b))
+                });
+                let margin = reference[order[0]] - reference[order[1]];
+                min_margin = min_margin.min(margin);
+                cell_defects += usize::from(
+                    token as usize != order[0] && f64::from(margin) > 2.0 * max_limit * scale,
+                );
+            }
+            cell_defects += usize::from(maximum > max_limit || rms > rms_limit);
+            let position = engine.position;
+            ensure!(
+                engine
+                    .prefill(&vec![1; engine.capacity - position + 1], None)
+                    .is_err()
+                    && engine.position == position,
+                "DEFECT streamed prefill exceeded capacity or mutated position"
+            );
+            let stats = engine
+                .moe_prefill
+                .as_ref()
+                .context("streamed prefill stats")?
+                .stats;
+            ensure!(
+                stats[2] > 0 && stats[6] + stats[7] > 0,
+                "Runner FAIL native streaming/refill not exercised: {stats:?}"
+            );
+            engine.check_ready()?;
+            defects += cell_defects;
+            cells += 1;
+            println!(
+                "PUBLISHED_STREAMED_MODEL rows={rows} prefix=17 graph={graph} repeat={repeat} max_normalized={maximum:e} rms_normalized={rms:e} max_limit={max_limit} rms_limit={rms_limit} min_margin={min_margin} stats={stats:?} defects={cell_defects}"
+            );
+        }
+    }
+    println!(
+        "PUBLISHED_STREAMED_MODEL cells={cells} defects={defects} frozen_model_definition_limits=true"
+    );
+    ensure!(defects == 0, "DEFECT streamed model cells={defects}");
     Ok(())
 }
