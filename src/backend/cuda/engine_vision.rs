@@ -2361,7 +2361,8 @@ mod tests {
             window: None,
         };
         let (bytes, scratch) = tower_bytes(&q38_geometry(), &packings)?;
-        let expected = 12 * 18464
+        let row_bytes = if cfg!(feature = "rocm") { 23072 } else { 18464 };
+        let expected = 12 * row_bytes
             + 12 * (1152 * 5 + 3456 + 4304) * 2
             + 128 * 1152 * 2
             + 3 * 5120 * 2
