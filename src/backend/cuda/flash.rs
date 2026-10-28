@@ -62,12 +62,37 @@ pub struct Query<'a> {
     pub prefix: Option<usize>,
 }
 
+#[derive(Clone, Copy)]
+pub struct Score {
+    pub scale: f32,
+    pub window_left: Option<usize>,
+}
+
+impl Score {
+    pub fn unit(window_tokens: Option<usize>) -> Result<Self> {
+        let window_left = window_tokens
+            .map(|tokens| {
+                tokens
+                    .checked_sub(1)
+                    .context("attention window must contain a token")
+            })
+            .transpose()?;
+        Ok(Self {
+            scale: 1.0,
+            window_left,
+        })
+    }
+}
+
 pub struct Flash {
     stream: Arc<CudaStream>,
     lse: CudaSlice<f32>,
     sink_rescale: CudaFunction,
     native: Vec<CudaFunction>,
     geometry: [usize; 3],
+    score: Option<Score>,
+    tile: usize,
+    shared: u32,
 }
 
 #[repr(C)]
@@ -91,15 +116,16 @@ impl Flash {
     /// Query tile rows for the bound prefill family.
     pub fn tile(head_dim: usize) -> Result<usize> {
         ensure!(
-            matches!(head_dim, 128 | 256),
-            "prefill binds head dims 128 and 256 (asked for {head_dim})"
+            matches!(head_dim, 128 | 256 | 512),
+            "prefill binds head dims 128, 256 and 512 (asked for {head_dim})"
         );
         #[cfg(feature = "cuda")]
         {
-            Ok(64)
+            Ok(if head_dim == 512 { 16 } else { 64 })
         }
         #[cfg(feature = "rocm")]
         {
+            ensure!(head_dim != 512, "HIP D512 attention is not bound");
             Ok(if head_dim == 256 { 16 } else { 32 })
         }
     }
@@ -112,14 +138,64 @@ impl Flash {
         kv_heads: usize,
         head_dim: usize,
     ) -> Result<Self> {
+        ensure!(head_dim != 512, "D512 requires an explicit score binding");
+        Self::bind(stream, rows, heads, kv_heads, head_dim, None)
+    }
+
+    pub fn new_with_score(
+        stream: Arc<CudaStream>,
+        rows: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        score: Score,
+    ) -> Result<Self> {
+        ensure!(
+            matches!(head_dim, 256 | 512),
+            "explicit score binding requires D256 or D512"
+        );
+        ensure!(
+            score.scale.is_finite() && score.scale > 0.0,
+            "invalid attention score multiplier"
+        );
+        ensure!(
+            score.window_left.is_none_or(|w| w <= i32::MAX as usize),
+            "attention window exceeds indexing range"
+        );
+        ensure!(
+            head_dim != 512 || score.window_left.is_none(),
+            "D512 binds full causal attention"
+        );
+        Self::bind(stream, rows, heads, kv_heads, head_dim, Some(score))
+    }
+
+    fn bind(
+        stream: Arc<CudaStream>,
+        rows: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        score: Option<Score>,
+    ) -> Result<Self> {
+        let tile = Self::tile(head_dim)?;
+        #[cfg(feature = "cuda")]
+        let dynamic_shared = if head_dim == 512 {
+            90112
+        } else {
+            (384 * head_dim) as u32
+        };
         ensure!(
             rows > 0 && heads > 0 && kv_heads > 0 && heads.is_multiple_of(kv_heads),
             "invalid prefill attention geometry"
         );
         ensure!(
-            matches!(head_dim, 128 | 256),
+            matches!(head_dim, 128 | 256 | 512),
             "unsupported prefill attention head dimension {head_dim}"
         );
+        #[cfg(feature = "rocm")]
+        let dynamic_shared = 0;
+        #[cfg(feature = "rocm")]
+        ensure!(score.is_none(), "HIP explicit attention score is not bound");
         let elements = rows
             .checked_mul(heads)
             .context("prefill LSE extent overflow")?;
@@ -128,7 +204,7 @@ impl Flash {
             "prefill LSE indexing exceeds u32"
         );
         #[cfg(feature = "cuda")]
-        let native = if head_dim == 256
+        let native = if matches!(head_dim, 256 | 512)
             || matches!(
                 (heads, kv_heads, head_dim),
                 (16, 2, 128) | (16, 8, 128) | (12, 12, 128) | (32, 4, 128)
@@ -139,7 +215,11 @@ impl Flash {
                 heads <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y)? as usize,
                 "prefill heads exceed grid limit"
             );
-            let names: &[&str] = if head_dim == 256 {
+            let names: &[&str] = if head_dim == 512 {
+                &["attention_prefill_d512"]
+            } else if score.is_some() {
+                &["attention_prefill_d256_window"]
+            } else if head_dim == 256 {
                 &["attention_prefill_d256"]
             } else if (heads, kv_heads) == (32, 4) {
                 &["attention_prefill_d128", "attention_prefill_d128_window"]
@@ -151,7 +231,6 @@ impl Flash {
                 ]
             };
             let module = super::cubin::module(ctx, "attention_native")?;
-            let dynamic_shared = (384 * head_dim) as u32;
             let mut functions = Vec::with_capacity(names.len());
             for name in names {
                 let function = module.load_function(name)?;
@@ -240,6 +319,9 @@ impl Flash {
             sink_rescale,
             native,
             geometry: [heads, kv_heads, head_dim],
+            score,
+            tile,
+            shared: dynamic_shared,
         })
     }
 
@@ -336,8 +418,8 @@ impl Flash {
             "prefill window exceeds i32"
         );
         ensure!(
-            shape.head_dim == 128 || shape.head_dim == 256,
-            "prefill binds head dims 128 and 256 (got {})",
+            matches!(shape.head_dim, 128 | 256 | 512),
+            "prefill binds head dims 128, 256 and 512 (got {})",
             shape.head_dim
         );
         ensure!(shape.rows > 0, "prefill needs at least one query row");
@@ -398,6 +480,10 @@ impl Flash {
                 .native
                 .get(if window { 1 } else { mode })
                 .context("native prefill mask is not bound")?;
+            ensure!(
+                shape.window_left == self.score.and_then(|score| score.window_left),
+                "native prefill window differs from setup binding"
+            );
             let args = Attention {
                 q,
                 k,
@@ -415,26 +501,34 @@ impl Flash {
             unsafe {
                 let mut launch = self.stream.launch_builder(native);
                 launch.arg(&args);
+                if let Some(score) = &self.score {
+                    let window = score.window_left.map_or(u32::MAX, |w| w as u32);
+                    if shape.head_dim == 256 {
+                        launch.arg(&window);
+                    }
+                    launch.arg(&score.scale);
+                    launch.launch(LaunchConfig {
+                        grid_dim: (
+                            shape.rows.div_ceil(self.tile) as u32,
+                            shape.q_heads as u32,
+                            1,
+                        ),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: self.shared,
+                    })?;
+                    return Ok(());
+                }
                 if mode != 0 || window {
                     launch.arg(&extent);
                 }
                 launch.launch(LaunchConfig {
                     grid_dim: (
-                        shape.rows.div_ceil(Self::tile(shape.head_dim)?) as u32,
+                        shape.rows.div_ceil(self.tile) as u32,
                         shape.q_heads as u32,
                         1,
                     ),
                     block_dim: (128, 1, 1),
-                    shared_mem_bytes: {
-                        #[cfg(feature = "cuda")]
-                        {
-                            (384 * shape.head_dim) as u32
-                        }
-                        #[cfg(feature = "rocm")]
-                        {
-                            0
-                        }
-                    },
+                    shared_mem_bytes: self.shared,
                 })?;
             }
             return Ok(());
@@ -542,6 +636,20 @@ impl Flash {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit_window_excludes_first_expired_key() {
+        assert!(Score::unit(Some(0)).is_err());
+        for tokens in [1usize, 512, 1024] {
+            let score = Score::unit(Some(tokens)).unwrap();
+            let left = score.window_left.unwrap();
+            for query in [0usize, tokens - 1, tokens, tokens + 1, 4095] {
+                for key in 0..=query {
+                    assert_eq!(key >= query.saturating_sub(left), key + tokens > query);
+                }
+            }
+        }
+    }
 
     #[test]
     fn native_prefill_parameter_layout() {

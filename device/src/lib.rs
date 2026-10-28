@@ -107,11 +107,11 @@ unsafe fn shuffle(a: f32, mask: u32) -> f32 {
     f32::from_bits(x)
 }
 #[inline(always)]
-unsafe fn probability<const D: usize>(a: f32, negative_peak: f32) -> f32 {
+unsafe fn probability(a: f32, negative_peak: f32, scale: f32) -> f32 {
     let x;
     unsafe {
         asm!("fma.rn.ftz.f32 {x}, {a}, {scale}, {peak}; ex2.approx.ftz.f32 {x}, {x};",
-            x=out(reg32) x,a=in(reg32) a,scale=in(reg32) (core::f32::consts::LOG2_E * if D == 256 { 0.0625 } else { core::f32::consts::FRAC_1_SQRT_2 / 8.0 }),peak=in(reg32) negative_peak);
+            x=out(reg32) x,a=in(reg32) a,scale=in(reg32) (core::f32::consts::LOG2_E * scale),peak=in(reg32) negative_peak);
     }
     x
 }
@@ -255,7 +255,7 @@ unsafe fn copy_kv<const D: usize, const MASK: bool>(
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
     unsafe {
-        attention::<256, 32, 0>(p, p.start + p.rows, 0);
+        attention::<256, 32, 0>(p, p.start + p.rows, 0, 0.0625);
     }
 }
 
@@ -264,7 +264,12 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128(p: Attention) {
     unsafe {
-        attention::<128, 16, 0>(p, p.start + p.rows, 0);
+        attention::<128, 16, 0>(
+            p,
+            p.start + p.rows,
+            0,
+            core::f32::consts::FRAC_1_SQRT_2 / 8.0,
+        );
     }
 }
 
@@ -273,7 +278,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d128(p: Attention) {
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128_bidirectional(p: Attention, keys: u32) {
     unsafe {
-        attention::<128, 16, 1>(p, keys, 0);
+        attention::<128, 16, 1>(p, keys, 0, core::f32::consts::FRAC_1_SQRT_2 / 8.0);
     }
 }
 
@@ -282,7 +287,25 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d128_bidirectional(p: Attent
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128_prefix(p: Attention, prefix: u32) {
     unsafe {
-        attention::<128, 16, 2>(p, prefix.max(p.start + p.rows), prefix);
+        attention::<128, 16, 2>(
+            p,
+            prefix.max(p.start + p.rows),
+            prefix,
+            core::f32::consts::FRAC_1_SQRT_2 / 8.0,
+        );
+    }
+}
+
+/// # Safety
+/// Launch uses 128 threads and 98304 shared bytes; window is an inclusive left distance.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_prefill_d256_window(
+    p: Attention,
+    window: u32,
+    scale: f32,
+) {
+    unsafe {
+        attention::<256, 32, 3>(p, p.start + p.rows, window, scale);
     }
 }
 
@@ -300,6 +323,7 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
     p: Attention,
     end: u32,
     prefix: u32,
+    scale: f32,
 ) {
     unsafe {
         let (tid, tile, head, sm): (u32, u32, u32, u32);
@@ -311,11 +335,6 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
         let diagonal = p.start + qstart;
         let sk = sm + (128 * D) as u32;
         let sv = sm + (256 * D) as u32;
-        let scale = if D == 256 {
-            0.0625
-        } else {
-            core::f32::consts::FRAC_1_SQRT_2 / 8.0
-        };
         let stop = if MODE == 1 {
             end
         } else if MODE == 2 {
@@ -337,6 +356,11 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
             address(0, copy_row, copy_col, D as u32),
             address(0, copy_row + 1024 / D as u32, copy_col, D as u32),
         ];
+        let first = if MODE == 3 {
+            diagonal.saturating_sub(prefix) / 64 * 64
+        } else {
+            0
+        };
         let kv = (head / p.group) as usize * p.capacity as usize * D;
         let first = if MODE == 3 {
             diagonal.saturating_sub(prefix) / 64 * 64
@@ -545,10 +569,10 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                 let mut residual = [[0u32; 4]; 4];
                 macro_rules! probabilities {
                     ($n:expr) => {{
-                        let a = probability::<D>(scores[$n][0], negative_peak[0]);
-                        let b = probability::<D>(scores[$n][1], negative_peak[0]);
-                        let c = probability::<D>(scores[$n][2], negative_peak[1]);
-                        let d = probability::<D>(scores[$n][3], negative_peak[1]);
+                        let a = probability(scores[$n][0], negative_peak[0], scale);
+                        let b = probability(scores[$n][1], negative_peak[0], scale);
+                        let c = probability(scores[$n][2], negative_peak[1], scale);
+                        let d = probability(scores[$n][3], negative_peak[1], scale);
                         sum[0] += a + b;
                         sum[1] += c + d;
                         packed[$n / 2][($n % 2) * 2] = pack(a, b);
@@ -732,6 +756,260 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
             sixteen!(write_output);
         } else {
             eight!(write_output);
+        }
+    }
+}
+
+/// # Safety
+/// Launch uses 128 threads, 90112 shared bytes and buffers covering the declared extents.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_prefill_d512(p: Attention, scale: f32) {
+    unsafe {
+        let (tid, tile, head, sm): (u32, u32, u32, u32);
+        asm!("mov.u32 {t}, %tid.x; mov.u32 {b}, %ctaid.x; mov.u32 {h}, %ctaid.y; mov.u32 {s}, attention_shared;",
+            t=out(reg32) tid,b=out(reg32) tile,h=out(reg32) head,s=out(reg32) sm);
+        let lane = tid & 31;
+        let warp = tid >> 5;
+        let qstart = tile * 16;
+        let end = p.start + p.rows;
+        let stop = end.min(p.start + qstart + 16);
+        let sk = sm + 16384;
+        let sv = sm + 49152;
+        let partial = sm + 81920;
+        let kv = (head / p.group) as usize * p.capacity as usize * 512;
+        let copy_row = tid / 64;
+        let copy_col = (tid % 64) * 8;
+        macro_rules! q_copy {
+            ($i:expr) => {{
+                let row = copy_row + $i * 2;
+                copy(
+                    address(sm, row, copy_col, 512),
+                    p.q.wrapping_add(
+                        (qstart + row) as usize * p.q_stride as usize
+                            + head as usize * 512
+                            + copy_col as usize,
+                    ),
+                    qstart + row < p.rows,
+                );
+            }};
+        }
+        macro_rules! k_copy {
+            ($i:expr) => {{
+                let row = copy_row + $i * 2;
+                copy(
+                    address(sk, row, copy_col, 512),
+                    p.k.wrapping_add(kv + row as usize * 512 + copy_col as usize),
+                    row < end,
+                );
+            }};
+        }
+        eight!(q_copy);
+        sixteen!(k_copy);
+        commit();
+        wait();
+        let r0 = lane >> 2;
+        let r1 = r0 + 8;
+        let mut output = [[0.0f32; 4]; 16];
+        let mut peak = [f32::NEG_INFINITY; 2];
+        let mut denominator = [0.0f32; 2];
+        let mut key = 0;
+        while key < stop {
+            macro_rules! v_copy {
+                ($i:expr) => {{
+                    let row = copy_row + $i * 2;
+                    copy(
+                        address(sv, row, copy_col, 512),
+                        p.v.wrapping_add(kv + (key + row) as usize * 512 + copy_col as usize),
+                        key + row < end,
+                    );
+                }};
+            }
+            sixteen!(v_copy);
+            commit();
+            let mut scores = [[0.0f32; 4]; 4];
+            macro_rules! qk_step {
+                ($i:expr) => {{
+                    let a = ld4::<0>(address(
+                        sm,
+                        lane & 15,
+                        warp * 128 + $i * 16 + (lane >> 4) * 8,
+                        512,
+                    ));
+                    macro_rules! pair {
+                        ($pair:expr) => {{
+                            let b = ld4::<0>(address(
+                                sk,
+                                (lane & 7) + (lane >> 4) * 8 + $pair * 16,
+                                warp * 128 + $i * 16 + ((lane >> 3) & 1) * 8,
+                                512,
+                            ));
+                            scores[$pair * 2] = mma(a, [b[0], b[1]], scores[$pair * 2]);
+                            scores[$pair * 2 + 1] = mma(a, [b[2], b[3]], scores[$pair * 2 + 1]);
+                        }};
+                    }
+                    pair!(0);
+                    pair!(1);
+                }};
+            }
+            eight!(qk_step);
+            wait();
+            macro_rules! publish {
+                ($i:expr) => {{
+                    let col = $i * 8 + (lane & 3) * 2;
+                    for j in 0..4 {
+                        let row = if j < 2 { r0 } else { r1 };
+                        let addr = partial + (warp * 512 + row * 32 + col + (j as u32 & 1)) * 4;
+                        asm!("st.shared.f32 [{p}], {x};",p=in(reg32) addr,x=in(reg32) scores[$i][j]);
+                    }
+                }};
+            }
+            four!(publish);
+            barrier();
+            macro_rules! reduce {
+                ($i:expr) => {{
+                    let col = $i * 8 + (lane & 3) * 2;
+                    for j in 0..4 {
+                        let row = if j < 2 { r0 } else { r1 };
+                        let addr = partial + (row * 32 + col + (j as u32 & 1)) * 4;
+                        let a = f32::from_bits(load_shared(addr));
+                        let b = f32::from_bits(load_shared(addr + 2048));
+                        let c = f32::from_bits(load_shared(addr + 4096));
+                        let d = f32::from_bits(load_shared(addr + 6144));
+                        scores[$i][j] = ((a + b) + c) + d;
+                        if key + col + (j as u32 & 1) >= (p.start + qstart + row + 1).min(end) {
+                            scores[$i][j] = f32::NEG_INFINITY;
+                        }
+                    }
+                }};
+            }
+            four!(reduce);
+            barrier();
+            if key + 32 < stop {
+                macro_rules! next_copy {
+                    ($i:expr) => {{
+                        let row = copy_row + $i * 2;
+                        copy(
+                            address(sk, row, copy_col, 512),
+                            p.k.wrapping_add(
+                                kv + (key + 32 + row) as usize * 512 + copy_col as usize,
+                            ),
+                            key + 32 + row < end,
+                        );
+                    }};
+                }
+                sixteen!(next_copy);
+                commit();
+            }
+            let mut next = peak;
+            macro_rules! maxima {
+                ($i:expr) => {{
+                    next[0] = maximum(next[0], maximum(scores[$i][0], scores[$i][1]));
+                    next[1] = maximum(next[1], maximum(scores[$i][2], scores[$i][3]));
+                }};
+            }
+            four!(maxima);
+            for x in &mut next {
+                *x = maximum(*x, shuffle(*x, 1));
+                *x = maximum(*x, shuffle(*x, 2));
+            }
+            let alpha = [
+                probability(peak[0] - next[0], 0.0, scale),
+                probability(peak[1] - next[1], 0.0, scale),
+            ];
+            let mut sum = [0.0; 2];
+            let mut packed = [[0u32; 4]; 2];
+            macro_rules! probabilities {
+                ($i:expr) => {{
+                    let a = probability(
+                        scores[$i][0],
+                        -next[0] * core::f32::consts::LOG2_E * scale,
+                        scale,
+                    );
+                    let b = probability(
+                        scores[$i][1],
+                        -next[0] * core::f32::consts::LOG2_E * scale,
+                        scale,
+                    );
+                    let c = probability(
+                        scores[$i][2],
+                        -next[1] * core::f32::consts::LOG2_E * scale,
+                        scale,
+                    );
+                    let d = probability(
+                        scores[$i][3],
+                        -next[1] * core::f32::consts::LOG2_E * scale,
+                        scale,
+                    );
+                    sum[0] += a + b;
+                    sum[1] += c + d;
+                    packed[$i / 2][($i % 2) * 2] = pack(a, b);
+                    packed[$i / 2][($i % 2) * 2 + 1] = pack(c, d);
+                }};
+            }
+            four!(probabilities);
+            denominator[0] = denominator[0] * alpha[0] + sum[0];
+            denominator[1] = denominator[1] * alpha[1] + sum[1];
+            peak = next;
+            macro_rules! rescale {
+                ($i:expr) => {{
+                    output[$i][0] *= alpha[0];
+                    output[$i][1] *= alpha[0];
+                    output[$i][2] *= alpha[1];
+                    output[$i][3] *= alpha[1];
+                }};
+            }
+            sixteen!(rescale);
+            macro_rules! pv_step {
+                ($inner:expr) => {{
+                    macro_rules! pair {
+                        ($pair:expr) => {{
+                            let b = ld4_trans::<0>(address(
+                                sv,
+                                (lane & 15) + $inner * 16,
+                                warp * 128 + $pair * 16 + (lane >> 4) * 8,
+                                512,
+                            ));
+                            output[$pair * 2] =
+                                mma(packed[$inner], [b[0], b[1]], output[$pair * 2]);
+                            output[$pair * 2 + 1] =
+                                mma(packed[$inner], [b[2], b[3]], output[$pair * 2 + 1]);
+                        }};
+                    }
+                    eight!(pair);
+                }};
+            }
+            pv_step!(0);
+            pv_step!(1);
+            wait();
+            key += 32;
+        }
+        for x in &mut denominator {
+            *x += shuffle(*x, 1);
+            *x += shuffle(*x, 2);
+        }
+        let inv = [reciprocal(denominator[0]), reciprocal(denominator[1])];
+        macro_rules! write {
+            ($i:expr) => {{
+                let col = warp * 128 + $i * 8 + (lane & 3) * 2;
+                if qstart + r0 < p.rows {
+                    let dst = p.out.wrapping_add(((qstart + r0) as usize * p.q_heads as usize + head as usize)*512 + col as usize);
+                    asm!("st.global.u32 [{p}], {x};",p=in(reg64) dst,x=in(reg32) pack(output[$i][0]*inv[0],output[$i][1]*inv[0]));
+                }
+                if qstart + r1 < p.rows {
+                    let dst = p.out.wrapping_add(((qstart + r1) as usize * p.q_heads as usize + head as usize)*512 + col as usize);
+                    asm!("st.global.u32 [{p}], {x};",p=in(reg64) dst,x=in(reg32) pack(output[$i][2]*inv[1],output[$i][3]*inv[1]));
+                }
+            }};
+        }
+        sixteen!(write);
+        if warp == 0 && lane & 3 == 0 {
+            for i in 0..2 {
+                let row = qstart + if i == 0 { r0 } else { r1 };
+                if row < p.rows {
+                    let value = peak[i] * scale + logarithm(denominator[i]);
+                    *p.lse.add(head as usize * p.rows as usize + row as usize) = value;
+                }
+            }
         }
     }
 }
