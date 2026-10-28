@@ -1444,6 +1444,7 @@ impl Engine {
         mut trace: Option<&mut Trace>,
     ) -> Result<u32> {
         self.closure.assert_ready()?;
+        #[cfg(feature = "cuda")]
         if self.recurrent.is_some() {
             return self.prefill_recurrent_media(input, trace);
         }
