@@ -128,7 +128,7 @@ def media_reference(model, args, loading, calls):
             inputs = dict(processor(text=[text], images=[picture], return_tensors="pt"))
             check(inputs["image_grid_thw"].shape == (1, 3)
                   and int(inputs["image_grid_thw"][0, 0]) == 1, "image grid layout")
-            inputs["target_sizes"] = inputs["image_grid_thw"][:, 1:].contiguous()
+            inputs["target_sizes"] = inputs["image_grid_thw"][:, 1:].clone().contiguous()
             forced = None
         else:
             inputs = load_file(args.forced_reference / (name + "-input.safetensors"))
