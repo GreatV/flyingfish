@@ -59,5 +59,13 @@ fn published_loopvl_manifest_accounts_for_all_components() -> Result<()> {
         3_266_619_408
     );
     println!("PASS loopvl_manifest tensors=580 text=259 skipped=321 missing=0 unexpected=0");
+    let mapped = MappedCheckpoint::open(&path)?;
+    let full = mapped.manifest(&spec, LoadPolicy::TextWithVision)?;
+    assert_eq!(full.entries.values().filter(|e| e.load).count(), 580);
+    assert_eq!(full.resident_bytes, 3_266_619_408);
+    let vision = mapped.manifest(&spec, LoadPolicy::VisionOnly)?;
+    assert_eq!(vision.entries.values().filter(|e| e.load).count(), 321);
+    assert_eq!(vision.resident_bytes, 901_028_880);
+    println!("PASS loopvl_vision_manifest full=580 vision=321 f32=10 missing=0 unexpected=0");
     Ok(())
 }

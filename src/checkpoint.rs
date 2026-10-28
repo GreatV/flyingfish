@@ -181,15 +181,18 @@ impl MappedCheckpoint {
         use crate::model_spec::Architecture;
         if spec.architecture == Architecture::LoopVl {
             ensure!(
-                policy == LoadPolicy::TextOnly,
-                "LoopVL L1a supports text-only loading"
+                matches!(
+                    policy,
+                    LoadPolicy::TextOnly | LoadPolicy::TextWithVision | LoadPolicy::VisionOnly
+                ),
+                "LoopVL load policy requires text and/or vision"
             );
             let mut expected = BTreeMap::new();
             Self::loopvl_entries(&mut expected);
             let planned = expected
-                .values()
-                .filter(|(_, _, scope)| *scope == TensorScope::Text)
-                .try_fold(0usize, |sum, (dtype, shape, _)| {
+                .iter()
+                .filter(|(name, (_, _, scope))| policy.selects_tensor(*scope, name))
+                .try_fold(0usize, |sum, (_, (dtype, shape, _))| {
                     sum.checked_add(tensor_bytes(*dtype, shape)?)
                         .context("LoopVL resident size overflow")
                 })?;
