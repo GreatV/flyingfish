@@ -403,10 +403,19 @@ fn fp8_published_expert_gpu() -> Result<()> {
         device_weight_bytes == 3 * 512 * 2048 + 2 * (512 + 512 + 2048),
         "RUNNER_FAIL native storage footprint"
     );
+    let channel_ops = linear::Fp8Ops::new(&ctx)?;
     let mut gate = Gate::default();
     let sentinel = bf16::from_bits(0x7fc1);
-    for name in ["fp8_channel_bf16_simt", "fp8_channel_bf16_wmma"] {
-        let function = module.load_function(name)?;
+    for name in [
+        "fp8_channel_bf16_simt",
+        "fp8_channel_bf16_wmma",
+        "bound_channel",
+    ] {
+        let function = if name == "bound_channel" {
+            None
+        } else {
+            Some(module.load_function(name)?)
+        };
         let tiled = name.ends_with("wmma");
         let mut longest = None;
         for rows in [33usize, 17, 16, 9, 8, 3, 1] {
@@ -418,25 +427,81 @@ fn fp8_published_expert_gpu() -> Result<()> {
             let mut hidden = s.clone_htod(&vec![sentinel; rows * 512 + 16])?;
             let mut hidden_before_quantize = s.alloc_zeros::<bf16>(rows * 512)?;
             let mut output = s.clone_htod(&vec![sentinel; rows * 2048 + 16])?;
+            let input_view = contracts::view(&input, &s, 0, [rows as u32, 2048], [2048, 1])?;
+            let hidden_view = contracts::view(&hidden, &s, 0, [rows as u32, 512], [512, 1])?;
+            let bound = if name == "bound_channel" {
+                let bind = |stage: usize, x, y, n: u32, k: u32| {
+                    channel_ops.bind_channel(
+                        linear::LinearWeightRef::Fp8 {
+                            codes: contracts::view(
+                                &weights[stage].2,
+                                &s,
+                                0,
+                                [n, k],
+                                [u64::from(k), 1],
+                            )?,
+                            scale: contracts::view(&weights[stage].3, &s, 0, [n, 1], [1, 1])?,
+                            layout: crate::fp8::Fp8ScaleLayout::PerChannel,
+                        },
+                        x,
+                        &contracts::TensorMut(contracts::view(
+                            y,
+                            &s,
+                            0,
+                            [rows as u32, n],
+                            [u64::from(n), 1],
+                        )?),
+                    )
+                };
+                Some([
+                    bind(0, input_view, &g, 512, 2048)?,
+                    bind(1, input_view, &u, 512, 2048)?,
+                    bind(2, hidden_view, &output, 2048, 512)?,
+                ])
+            } else {
+                None
+            };
             let mut run = || -> Result<()> {
                 s.memcpy_dtod(&original, &mut input)?;
-                fp8_quantize(&s, &quantize, &mut input, rows, 2048)?;
-                fp8_channel_launch(
-                    &s,
-                    (&function, tiled),
-                    (&weights[0].2, &weights[0].3),
-                    &input,
-                    &mut g,
-                    (rows, 512, 2048),
-                )?;
-                fp8_channel_launch(
-                    &s,
-                    (&function, tiled),
-                    (&weights[1].2, &weights[1].3),
-                    &input,
-                    &mut u,
-                    (rows, 512, 2048),
-                )?;
+                if bound.is_some() {
+                    channel_ops.fake_quant(&s, &mut contracts::TensorMut(input_view), None)?;
+                } else {
+                    fp8_quantize(&s, &quantize, &mut input, rows, 2048)?;
+                }
+                if let Some(bound) = &bound {
+                    bound[0].run(&s)
+                } else {
+                    fp8_channel_launch(
+                        &s,
+                        (
+                            function
+                                .as_ref()
+                                .context("direct projection function missing")?,
+                            tiled,
+                        ),
+                        (&weights[0].2, &weights[0].3),
+                        &input,
+                        &mut g,
+                        (rows, 512, 2048),
+                    )
+                }?;
+                if let Some(bound) = &bound {
+                    bound[1].run(&s)
+                } else {
+                    fp8_channel_launch(
+                        &s,
+                        (
+                            function
+                                .as_ref()
+                                .context("direct projection function missing")?,
+                            tiled,
+                        ),
+                        (&weights[1].2, &weights[1].3),
+                        &input,
+                        &mut u,
+                        (rows, 512, 2048),
+                    )
+                }?;
                 unsafe {
                     s.launch_builder(&act)
                         .arg(&g)
@@ -447,15 +512,28 @@ fn fp8_published_expert_gpu() -> Result<()> {
                         .launch(ops::flat(rows * 512))?;
                 }
                 s.memcpy_dtod(&hidden.slice(..rows * 512), &mut hidden_before_quantize)?;
-                fp8_quantize(&s, &quantize, &mut hidden, rows, 512)?;
-                fp8_channel_launch(
-                    &s,
-                    (&function, tiled),
-                    (&weights[2].2, &weights[2].3),
-                    &hidden,
-                    &mut output,
-                    (rows, 2048, 512),
-                )
+                if bound.is_some() {
+                    channel_ops.fake_quant(&s, &mut contracts::TensorMut(hidden_view), None)?;
+                } else {
+                    fp8_quantize(&s, &quantize, &mut hidden, rows, 512)?;
+                }
+                if let Some(bound) = &bound {
+                    bound[2].run(&s)
+                } else {
+                    fp8_channel_launch(
+                        &s,
+                        (
+                            function
+                                .as_ref()
+                                .context("direct projection function missing")?,
+                            tiled,
+                        ),
+                        (&weights[2].2, &weights[2].3),
+                        &hidden,
+                        &mut output,
+                        (rows, 2048, 512),
+                    )
+                }
             };
             run()?;
             let capture = s.begin_capture()?;

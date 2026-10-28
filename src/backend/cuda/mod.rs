@@ -21,7 +21,6 @@ pub(crate) mod gdn;
 #[cfg(test)]
 #[cfg(feature = "cuda")]
 mod kv_cache_tests;
-#[cfg(feature = "cuda")]
 pub(crate) mod linear;
 #[cfg(feature = "cuda")]
 mod linear_calibrate;

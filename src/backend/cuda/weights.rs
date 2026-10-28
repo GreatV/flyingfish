@@ -279,11 +279,9 @@ impl Drop for ExpertStorage {
     }
 }
 
-#[cfg(feature = "cuda")]
 use crate::checkpoint::TensorEntry;
 use crate::checkpoint::{Index, MappedCheckpoint, TensorManifest};
 
-#[cfg(feature = "cuda")]
 fn upload_entry(entry: &TensorEntry) -> bool {
     entry.is_non_expert_loaded()
 }
@@ -299,7 +297,6 @@ pub(crate) struct Loader<'a> {
     stream: Arc<CudaStream>,
     #[cfg(feature = "rocm")]
     compute: Arc<CudaStream>,
-    #[cfg(feature = "cuda")]
     byte_staging: Option<PinnedHostSlice<u8>>,
     verify_upload: bool,
     upload_hashers: BTreeMap<String, UploadHashWorker>,
@@ -556,7 +553,6 @@ pub(super) fn checkpoint_mapped<T>(
         stream: d.upload.clone(),
         #[cfg(feature = "rocm")]
         compute: d.stream.clone(),
-        #[cfg(feature = "cuda")]
         byte_staging: if manifest.is_some() {
             Some(unsafe { d.ctx.alloc_pinned_with_flags::<u8>(UPLOAD_CHUNK_BYTES, 0)? })
         } else {
@@ -720,7 +716,6 @@ impl Weights {
 }
 
 impl Loader<'_> {
-    #[cfg(feature = "cuda")]
     pub(super) fn load_bytes(
         &mut self,
         name: &str,
@@ -787,16 +782,16 @@ impl Loader<'_> {
             .bytes
             .checked_add(t.data().len())
             .context("uploaded byte count overflow")?;
+        #[cfg(feature = "rocm")]
+        dst.handoff(&self.compute)?;
         Ok(dst)
     }
 }
 
-#[cfg(feature = "cuda")]
 pub(crate) enum StoredTensor {
     Bf16(CudaSlice<bf16>),
     Bytes(CudaSlice<u8>),
 }
-#[cfg(feature = "cuda")]
 pub(crate) struct WeightCatalog {
     pub linear_format: crate::model_spec::LinearFormat,
     pub tensors: BTreeMap<String, StoredTensor>,
@@ -806,7 +801,6 @@ pub(crate) struct WeightCatalog {
     pub upload_hashed_bytes: Option<usize>,
     pub load_wall_ms: f64,
 }
-#[cfg(feature = "cuda")]
 impl WeightCatalog {
     /// Move shared global tensors into the existing Engine weight owner.
     pub fn take_globals(&mut self) -> Result<Weights> {

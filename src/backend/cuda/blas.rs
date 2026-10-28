@@ -896,7 +896,7 @@ impl Blas {
     pub(crate) fn enable_fp8(&mut self, ctx: &Arc<cudarc::driver::CudaContext>) -> Result<()> {
         ensure!(self.fp8.is_none(), "FP8 operators already bound");
         let fp8 = match self.invariant_rows {
-            0 => super::linear::Fp8Ops::new(ctx)?,
+            0 => crate::backend::gpu::linear::Fp8Ops::new(ctx)?,
             rows => super::linear::Fp8Ops::for_rows(ctx, rows)?,
         };
         fp8.require_rows(*self.direct_fp8_rows().end())?;
