@@ -606,6 +606,10 @@ mod q38_tests;
 
 #[cfg(test)]
 #[cfg(feature = "cuda")]
+mod gemma4_ops_tests;
+
+#[cfg(test)]
+#[cfg(feature = "cuda")]
 mod tests {
     use super::*;
 
