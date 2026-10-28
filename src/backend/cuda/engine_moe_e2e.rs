@@ -4751,6 +4751,112 @@ fn minicpm_decode_combine_identity_gpu() -> Result<()> {
     Ok(())
 }
 
+fn flint_live_state(engine: &Engine, probe: &DecodeProbe) -> Result<Vec<u8>> {
+    let live = engine.position;
+    let dim = engine.model_spec.head_dim as usize;
+    let mut values = Vec::new();
+    let mut offset = 0usize;
+    for layer in 0..engine.state.kv.len() {
+        let ring = engine.state.kv_ring(layer)?;
+        for _ in ["k", "v"] {
+            for _ in 0..engine.model_spec.kv_heads {
+                let live_len = live * dim * 2;
+                let ring_len = ring * dim * 2;
+                let end = offset
+                    .checked_add(ring_len)
+                    .context("Flint state extent overflow")?;
+                ensure!(end <= probe.state.len(), "Flint state extent is short");
+                values.extend_from_slice(&probe.state[offset..offset + live_len]);
+                offset = end;
+            }
+        }
+    }
+    ensure!(
+        offset == probe.state.len(),
+        "Flint state trailing bytes differ: consumed={offset} total={}",
+        probe.state.len()
+    );
+    Ok(values)
+}
+
+fn flint_order_difference(
+    engine: &Engine,
+    first: &DecodeProbe,
+    second: &DecodeProbe,
+) -> Result<serde_json::Value> {
+    ensure!(
+        first.tokens.len() == second.tokens.len() && first.logits.len() == second.logits.len(),
+        "Runner FAIL Flint order-control logit extents differ"
+    );
+    let first_state = flint_live_state(engine, first)?;
+    let second_state = flint_live_state(engine, second)?;
+    ensure!(
+        first_state.len() == second_state.len(),
+        "Runner FAIL Flint order-control state extents differ"
+    );
+    let token_mismatches = first
+        .tokens
+        .iter()
+        .zip(&second.tokens)
+        .filter(|(a, b)| a != b)
+        .count();
+    let logit_mismatches = first
+        .logits
+        .iter()
+        .zip(&second.logits)
+        .filter(|(a, b)| a != b)
+        .count();
+    let mut state_mismatches = 0;
+    let mut first_state_location = None;
+    let mut offset = 0;
+    let live = engine.position;
+    let dim = engine.model_spec.head_dim as usize;
+    for layer in 0..engine.state.kv.len() {
+        for tensor in ["k", "v"] {
+            for head in 0..engine.model_spec.kv_heads {
+                let segment_len = live * dim * 2;
+                for (relative, (a, b)) in first_state[offset..offset + segment_len]
+                    .iter()
+                    .zip(&second_state[offset..offset + segment_len])
+                    .enumerate()
+                {
+                    if a != b {
+                        state_mismatches += 1;
+                        first_state_location.get_or_insert((
+                            layer,
+                            tensor,
+                            head,
+                            relative / (dim * 2),
+                            relative / 2 % dim,
+                        ));
+                    }
+                }
+                offset += segment_len;
+            }
+        }
+    }
+    let (layer, tensor, head, position, dim) =
+        first_state_location.unwrap_or((usize::MAX, "", 0, 0, 0));
+    Ok(serde_json::json!({
+        "token_mismatches": token_mismatches,
+        "logit_mismatches": logit_mismatches,
+        "logit_elements": first.logits.len(),
+        "state_mismatches": state_mismatches,
+        "state_bytes": first_state.len(),
+        "first_state": if first_state_location.is_some() {
+            serde_json::json!({
+                "layer": layer,
+                "tensor": tensor,
+                "head": head,
+                "position": position,
+                "dim": dim,
+            })
+        } else {
+            serde_json::Value::Null
+        }
+    }))
+}
+
 #[test]
 #[ignore = "requires CUDA, published Flint FF_MODEL and FLYINGFISH_RUNTIME_DIR"]
 fn flint_decode_combine_identity_gpu() -> Result<()> {
@@ -4760,8 +4866,6 @@ fn flint_decode_combine_identity_gpu() -> Result<()> {
     );
     let model = PathBuf::from(std::env::var("FF_MODEL")?);
     let runtime = PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
-    let probe_dir =
-        PathBuf::from(std::env::var_os("FF_Q38_PROBE_DIR").context("probe directory missing")?);
     let spec = crate::model_spec::ModelSpec::read(&model)?;
     ensure!(
         spec.architecture == crate::model_spec::Architecture::Flint
@@ -4781,10 +4885,41 @@ fn flint_decode_combine_identity_gpu() -> Result<()> {
     };
     Engine::calibrate(&model, 0, 600, None, settings.clone())?;
     let mut engine = Engine::load(&model, 0, 600, None, settings)?;
-    let defects = run_decode_combine_case(&mut engine, "flint-short", &ids, Some(&probe_dir))?;
+    let mut order_defects = 0;
+    for (first_mode, second_mode) in [(false, false), (false, true), (true, false), (true, true)] {
+        let first = decode_combine_probe(&mut engine, &ids, first_mode)?;
+        let placement = engine
+            .moe_slots
+            .as_ref()
+            .context("Flint placement slots missing")?
+            .capture_placement()?;
+        engine.reset()?;
+        let after_reset = engine
+            .moe_slots
+            .as_ref()
+            .context("Flint placement slots missing")?
+            .capture_placement()?;
+        ensure!(
+            placement == after_reset,
+            "Runner FAIL Flint reset changed placement"
+        );
+        let second = decode_combine_probe(&mut engine, &ids, second_mode)?;
+        let difference = flint_order_difference(&engine, &first, &second)?;
+        let passed = difference["token_mismatches"] == 0
+            && difference["logit_mismatches"] == 0
+            && difference["state_mismatches"] == 0;
+        order_defects += usize::from(!passed);
+        println!(
+            "{} T43_FLINT_ORDER first={} second={} reset_preserves_placement=true {}",
+            if passed { "PASS" } else { "DEFECT" },
+            first_mode,
+            second_mode,
+            difference
+        );
+    }
     ensure!(
-        defects == 0,
-        "DEFECT flint_decode_combine_identity={defects}"
+        order_defects == 0,
+        "DEFECT flint_decode_combine_identity order={order_defects}"
     );
     Ok(())
 }
