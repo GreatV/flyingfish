@@ -861,11 +861,11 @@ __device__ void run(Problem p, uint32_t extent) {
     if (tid < BQ) {
       float next = peak;
       for (int key = 0; key < BK; ++key) next = fmaxf(next,score_memory[tid*BK+key]);
-      const float rescale = isfinite(next) ? __expf(peak-next) : 0.0f;
+      const float rescale = isfinite(next) ? expf(peak-next) : 0.0f;
       denominator *= rescale;
       correction *= rescale;
       for (int key = 0; key < BK; ++key) {
-        const float value = isfinite(next) ? __expf(score_memory[tid*BK+key]-next) : 0.0f;
+        const float value = isfinite(next) ? expf(score_memory[tid*BK+key]-next) : 0.0f;
         const float y = value-correction, sum = denominator+y;
         correction = (sum-denominator)-y;
         denominator = sum;

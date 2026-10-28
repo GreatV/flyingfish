@@ -769,7 +769,9 @@ mod tests {
                 .context("LSE reference empty")?;
             println!(
                 "FFA_LSE_DEFECT name={} row={} head={} actual={actual:.17e} expected={expected:.17e}",
-                case.name, selected[index / case.hq], index % case.hq
+                case.name,
+                selected[index / case.hq],
+                index % case.hq
             );
         }
         defects += usize::from(
