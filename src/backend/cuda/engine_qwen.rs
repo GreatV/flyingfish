@@ -895,7 +895,13 @@ impl Runtime {
                                             ..decode_limits
                                                 .context("verify attention limits missing")?
                                         },
-                                        PositionBindings::Linear,
+                                        PositionBindings::Axes(view(
+                                            &active_positions,
+                                            s,
+                                            0,
+                                            [rows, 3],
+                                            [3, 1],
+                                        )?),
                                         false,
                                     )
                                 } else {
