@@ -112,12 +112,10 @@ pub(super) fn small_rows(chunk: usize, capacity: usize) -> usize {
     chunk.min(capacity).min(16)
 }
 
-#[cfg(feature = "cuda")]
 pub(super) fn injection_limit(small_rows: usize, verify_rows: usize) -> usize {
     small_rows.max(verify_rows)
 }
 
-#[cfg(feature = "cuda")]
 pub(super) fn forward_rows(
     small_rows: usize,
     budget: Option<SpecBudget>,
@@ -136,7 +134,6 @@ pub(super) fn forward_rows(
     Ok(rows)
 }
 
-#[cfg(feature = "cuda")]
 fn draft_shapes(
     draft: &crate::dspark::DraftConfig,
     injection_rows: usize,
@@ -165,6 +162,9 @@ fn draft_shapes(
         })
         .collect();
     let pairs = all.iter().map(|s| (s.output, s.input)).collect();
+    #[cfg(feature = "rocm")]
+    let linear = all;
+    #[cfg(feature = "cuda")]
     let linear = all
         .into_iter()
         .filter(|shape| super::linear_calibrate::supports(*shape))
@@ -362,7 +362,6 @@ impl Closure {
         );
         Ok(())
     }
-    #[cfg(feature = "cuda")]
     pub fn bind_fixed(&self) -> Result<()> {
         if self.stage.get() == Stage::Ready {
             self.late_attempts.set(self.late_attempts.get() + 1);
@@ -1238,7 +1237,14 @@ pub fn runtime_dir(path: &Path, model: &Path, create: bool) -> Result<PathBuf> {
 
 #[cfg(feature = "rocm")]
 impl Profile {
-    pub(super) fn hip(c: &Config, capacity: usize, chunk: usize, model: &Path) -> Result<Self> {
+    pub(super) fn hip(
+        c: &Config,
+        capacity: usize,
+        chunk: usize,
+        model: &Path,
+        budget: Option<SpecBudget>,
+        draft_path: Option<&Path>,
+    ) -> Result<Self> {
         let small_rows = small_rows(chunk, capacity);
         let rows = (1..=chunk)
             .map(|n| {
@@ -1246,7 +1252,7 @@ impl Profile {
             })
             .collect::<Result<BTreeSet<_>>>()?;
         let mut linear = BTreeSet::new();
-        for rows in rows {
+        for &rows in &rows {
             for (output, input) in [
                 (c.qkv_dim(), c.hidden_size),
                 (c.hidden_size, c.hidden_size),
@@ -1265,15 +1271,54 @@ impl Profile {
             output: c.vocab_size,
             input: c.hidden_size,
         });
+        let draft = draft_path
+            .map(|path| crate::dspark::DraftConfig::read(path, c))
+            .transpose()?;
+        if let Some(draft) = &draft {
+            let budget = budget.context("HIP draft profile lacks a spec budget")?;
+            let verify = if budget.is_tree() {
+                budget.rows()
+            } else {
+                draft.verify_rows()?
+            };
+            for (output, input) in [
+                (c.qkv_dim(), c.hidden_size),
+                (c.hidden_size, c.hidden_size),
+                (2 * c.intermediate_size, c.hidden_size),
+                (c.hidden_size, c.intermediate_size),
+                (c.vocab_size, c.hidden_size),
+            ] {
+                linear.insert(LinearShape {
+                    rows: verify,
+                    output,
+                    input,
+                });
+            }
+            linear.extend(draft_shapes(draft, injection_limit(small_rows, draft.verify_rows()?)).0);
+            for &rows in &rows {
+                for (output, input) in [
+                    (draft.hidden_size, draft.capture_width()),
+                    (draft.kv_dim(), draft.hidden_size),
+                ] {
+                    linear.insert(LinearShape {
+                        rows,
+                        output,
+                        input,
+                    });
+                }
+            }
+        }
         Ok(Self {
             pairs: linear.iter().map(|s| (s.output, s.input)).collect(),
             linear,
-            attention: attention(None),
+            attention: attention(budget),
             capacity,
             small_rows,
-            budget: None,
+            budget: budget.map(SpecBudget::rows),
             model: hash(&fs::read(model.join("config.json"))?),
-            draft: None,
+            draft: draft_path
+                .map(|p| std::fs::read(p.join("config.json")).map(|v| hash(&v)))
+                .transpose()?,
         })
     }
 }

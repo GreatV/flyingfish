@@ -12,7 +12,6 @@ pub mod contracts;
 pub mod copy;
 pub mod cubin;
 pub mod decode;
-#[cfg(feature = "cuda")]
 pub mod draft;
 pub mod engine;
 #[cfg(feature = "cuda")]
@@ -26,7 +25,6 @@ mod kv_cache_tests;
 pub(crate) mod linear;
 #[cfg(feature = "cuda")]
 mod linear_calibrate;
-#[cfg(feature = "cuda")]
 mod markov;
 #[cfg(feature = "cuda")]
 mod markov_calibrate;
@@ -35,10 +33,8 @@ pub(crate) mod moe;
 #[cfg(feature = "cuda")]
 pub mod multi_calibrate;
 pub mod ops;
-#[cfg(feature = "cuda")]
 pub mod profile;
 pub mod state;
-#[cfg(feature = "cuda")]
 pub(crate) mod tree;
 pub mod verification;
 #[cfg(feature = "cuda")]

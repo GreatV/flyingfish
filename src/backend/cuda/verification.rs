@@ -33,6 +33,38 @@ pub struct Verification {
     plan: AttentionPlan,
 }
 
+#[cfg(feature = "rocm")]
+pub(super) fn hip_tcmqa_plan(
+    ctx: &Arc<CudaContext>,
+    capacity: usize,
+    rows: usize,
+) -> Result<MultiPlan> {
+    ctx.require_wmma()?;
+    ensure!(
+        (1..=64).contains(&rows) && capacity >= rows,
+        "HIP TCMQA rows/capacity outside supported extent"
+    );
+    let function = cubin::module(ctx, "tcmqa")?.load_function("tcmqa_phase1")?;
+    let occupancy = function.occupancy_max_active_blocks_per_multiprocessor(
+        128,
+        MultiImpl::Tcmqa.phase1_smem_bytes(),
+        None,
+    )?;
+    ensure!(occupancy > 0, "HIP TCMQA phase1 has zero occupancy");
+    let groups = 2 * (8 * rows).div_ceil(64);
+    let partitions = (ctx.device_info()?.sms * occupancy as usize).div_ceil(groups);
+    let chunk = capacity.div_ceil(partitions).next_multiple_of(64).max(64);
+    Ok(MultiPlan {
+        implementation: MultiImpl::Tcmqa,
+        launch: AttentionPlan {
+            chunk,
+            qpack: 8,
+            threads: 128,
+            merge_threads: 256,
+        },
+    })
+}
+
 pub struct Query<'a> {
     pub qkv: &'a CudaSlice<bf16>,
     pub k: &'a CudaSlice<bf16>,

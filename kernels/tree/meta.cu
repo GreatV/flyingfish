@@ -1,5 +1,4 @@
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
+#include "../gpu_compat.cuh"
 #include <stdint.h>
 #include <limits.h>
 

@@ -151,6 +151,187 @@ struct ReferenceFixtures {
     cases: Vec<ReferenceCase>,
 }
 
+#[test]
+#[ignore = "requires GPU lease, target/draft weights and runtime/evidence directories"]
+fn dense_dspark_identity_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_DENSE_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let target = PathBuf::from(std::env::var("FF_ARGMAX_MODEL")?);
+    let draft = PathBuf::from(std::env::var("FF_ARGMAX_DRAFT")?);
+    let output = PathBuf::from(std::env::var("FF_DENSE_EVIDENCE")?);
+    let runtime = PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
+    let mut cells = 0;
+    for budget in [SpecBudget::Chain, SpecBudget::Tree16] {
+        let settings = Settings {
+            tree_builder: TreeBuilder::Waves,
+            spec_budget: budget,
+            spec_graph: true,
+            draft_model: Some(draft.clone()),
+            runtime_dir: Some(runtime.clone()),
+            prefix_cache: false,
+            kv_format: KvFormat::Bf16,
+        };
+        drop(Model::calibrate(
+            &target,
+            0,
+            256,
+            Some(33),
+            settings.clone(),
+        )?);
+        let mut model = Model::load(&target, 0, 256, Some(33), settings)?;
+        ensure!(
+            model.draft_config()?.block_size == 7 && model.draft_config()?.markov_rank == 256,
+            "MiniCPM5-2B DSpark block7/rank256 required"
+        );
+        for rows in [1usize, 17, 129] {
+            let ids: Vec<_> = (0..rows)
+                .map(|i| ((i * 269 + 23) % 130560) as u32)
+                .collect();
+            let mut expected = Vec::new();
+            for (repeat, graph) in [false, true, true].into_iter().enumerate() {
+                model.reset()?;
+                model.set_spec_graph(graph)?;
+                let first = model.prefill(&ids, None)?;
+                let mut file = std::fs::File::create_new(
+                    output.join(format!("dspark-{budget:?}-rows{rows}-repeat{repeat}.bin")),
+                )?;
+                file.write_all(&first.to_le_bytes())?;
+                let mut min_margin = f32::INFINITY;
+                let mut compared_logits = 0;
+                for (round_index, limit) in [1usize, 3, 8, 5].into_iter().enumerate() {
+                    let start = model.position();
+                    let round = model.spec_round(limit, None, "")?;
+                    ensure!(
+                        round.committed == round.output.len()
+                            && round.committed > 0
+                            && round.committed <= limit
+                            && model.position() == start + round.committed,
+                        "DSpark commit position/output extent mismatch"
+                    );
+                    let mut all_logits = Vec::new();
+                    for (row, &prediction) in round.predictions.iter().enumerate() {
+                        let logits = model.verification_logits(row)?;
+                        ensure!(
+                            logits.len() == 130560 && logits.iter().all(|x| x.is_finite()),
+                            "RUNNER_FAIL DSpark logits"
+                        );
+                        let mut order: Vec<_> = (0..logits.len()).collect();
+                        order.sort_unstable_by(|&a, &b| {
+                            logits[b].total_cmp(&logits[a]).then(a.cmp(&b))
+                        });
+                        ensure!(
+                            prediction as usize == order[0],
+                            "DSpark prediction differs from full-logit argmax"
+                        );
+                        min_margin = min_margin.min(logits[order[0]] - logits[order[1]]);
+                        compared_logits += logits.len();
+                        all_logits.extend(logits.into_iter().map(f32::to_bits));
+                    }
+                    if !budget.is_tree() {
+                        let accepted =
+                            flyingfish::dspark::accept(&round.proposals, &round.predictions)?;
+                        let mut output = round.proposals[..accepted.proposals].to_vec();
+                        output.push(accepted.bonus);
+                        output.truncate(limit);
+                        ensure!(
+                            round.output == output
+                                && round.accepted == accepted.proposals.min(output.len() - 1),
+                            "chain acceptance differs from CPU prefix selection"
+                        );
+                    }
+                    let state = model.spec_state_bits(start, round.committed)?;
+                    let result = (round.output.clone(), all_logits, state);
+                    if repeat == 0 {
+                        expected.push(result);
+                    } else {
+                        ensure!(
+                            expected.get(round_index) == Some(&result),
+                            "DSpark graph/eager/repeat token, logits or KV/state bits differ budget={budget:?} prefix={rows} round={round_index}"
+                        );
+                    }
+                    for token in round.output {
+                        file.write_all(&token.to_le_bytes())?;
+                    }
+                    for value in model.decode_logits()? {
+                        file.write_all(&value.to_bits().to_le_bytes())?;
+                    }
+                }
+                file.flush()?;
+                model.check_ready()?;
+                println!(
+                    "DENSE_DSPARK_IDENTITY budget={budget:?} prefix={rows} graph={graph} repeat={repeat} rounds=4 compared_logits={compared_logits} min_top_two_margin={min_margin} token_logits_state_bit_identity=true PASS"
+                );
+                cells += 1;
+            }
+        }
+        if budget.is_tree() {
+            for graph in [false, true] {
+                model.reset()?;
+                model.set_spec_graph(graph)?;
+                let prefix: Vec<_> = (0..17).map(|i| ((i * 269 + 23) % 130560) as u32).collect();
+                let anchor = model.prefill(&prefix, None)?;
+                let tokens = [anchor, 29, 37, 43, 53, 61, 71, 79, 89];
+                let parents = [-1, 0, 0, 1, 1, 2, 2, 5, 5];
+                let tree = flyingfish::tree::Tree::edges(&tokens, &parents, 17, 256)?;
+                let predictions = model.verify_tree(&tree, None)?;
+                let clean: Vec<_> = (0..tokens.len())
+                    .map(|r| model.verification_logits(r))
+                    .collect::<Result<_>>()?;
+                model.poison_tree_padding(&tree)?;
+                ensure!(
+                    model.verify_tree(&tree, None)? == predictions,
+                    "poisoned tree padding changed predictions"
+                );
+                for (row, expected) in clean.iter().enumerate() {
+                    ensure!(
+                        model.verification_logits(row)? == *expected,
+                        "poisoned tree padding changed valid logits"
+                    );
+                }
+                let mut forced = vec![997; tokens.len()];
+                forced[0] = tokens[2];
+                forced[2] = tokens[5];
+                forced[5] = tokens[8];
+                let plan = tree.select(&forced, 4, &[])?;
+                ensure!(
+                    plan.rows == [0, 2, 5, 8],
+                    "tree fixture did not select a noncontiguous path"
+                );
+                let expected = model.tree_kv_path(&plan.rows)?;
+                ensure!(
+                    expected != model.tree_kv_path(&[0, 1, 2, 3])?,
+                    "tree KV indexing control lacks signal"
+                );
+                let mut mutant = plan.clone();
+                mutant.rows[1] = 1;
+                ensure!(
+                    model
+                        .commit_tree_fixture(&tree, &mutant, &[], &forced)
+                        .is_err(),
+                    "wrong tree path was accepted"
+                );
+                ensure!(
+                    model.position() == 17 && model.tree_kv_path(&plan.rows)? == expected,
+                    "rejected tree commit mutated KV/position"
+                );
+                model.commit_tree_fixture(&tree, &plan, &[], &forced)?;
+                ensure!(
+                    model.kv_snapshot(17, 4)? == expected && model.position() == 21,
+                    "tree gather/scatter changed selected KV rows"
+                );
+                model.check_ready()?;
+                println!(
+                    "DENSE_DSPARK_TREE graph={graph} prefix=17 path=0,2,5,8 padding_nan_invariant=true invalid_path_rejected=true kv_compaction_bit_identity=true PASS"
+                );
+            }
+        }
+    }
+    println!("DENSE_DSPARK_IDENTITY cells={cells} defects=0 PASS");
+    Ok(())
+}
+
 #[derive(serde::Deserialize)]
 struct ReferenceCase {
     name: String,

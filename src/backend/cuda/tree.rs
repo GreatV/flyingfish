@@ -1,12 +1,14 @@
-use super::{Device, cubin, engine::Kv, ops::flat, ops::grid};
+use super::{Device, cubin, ops::flat, ops::grid, state::Kv};
+use crate::backend::gpu::{
+    CudaFunction, CudaSlice, CudaStream, DevicePtr, DeviceRepr, PushKernelArg,
+};
 use crate::{
     config::Config,
     tree::{Commit, Tree},
 };
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{
-    CudaFunction, CudaSlice, CudaStream, DevicePtr, DeviceRepr, PushKernelArg, sys,
-};
+#[cfg(feature = "cuda")]
+use cudarc::driver::sys;
 use half::bf16;
 use std::sync::Arc;
 
@@ -109,6 +111,9 @@ impl State {
             "invalid tree vocabulary or RoPE theta"
         );
         let stream = device.stream.clone();
+        #[cfg(feature = "rocm")]
+        stream.require_eager("tree allocation")?;
+        #[cfg(feature = "cuda")]
         ensure!(
             stream.capture_status()? == sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE,
             "tree State allocation is forbidden during stream capture"
@@ -168,6 +173,9 @@ impl State {
     }
 
     fn outside_capture(&self) -> Result<()> {
+        #[cfg(feature = "rocm")]
+        self.stream.require_eager("tree metadata mutation")?;
+        #[cfg(feature = "cuda")]
         ensure!(
             self.stream.capture_status()?
                 == sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_NONE,

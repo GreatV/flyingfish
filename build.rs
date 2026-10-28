@@ -66,6 +66,8 @@ const ROCM_KERNELS: &[&str] = &[
     "gemm_skinny",
     "tcmqa",
     "markov",
+    "tree/meta",
+    "tree/tree_rope_kv",
 ];
 
 fn wave32_rdna_arch(arch: &str) -> bool {
@@ -171,7 +173,7 @@ fn build_rocm(out: &std::path::Path) {
             if matches!(*name, "gemm_skinny" | "tcmqa" | "markov") && !arch.starts_with("gfx11") {
                 continue;
             }
-            let filename = format!("{name}_{arch}.hsaco");
+            let filename = format!("{}_{arch}.hsaco", name.replace('/', "_"));
             let hsaco = out.join(&filename);
             let result = Command::new(&hipcc)
                 .env("TMPDIR", &temp)
