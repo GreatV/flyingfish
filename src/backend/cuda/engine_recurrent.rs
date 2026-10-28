@@ -2052,6 +2052,7 @@ mod tests {
                     }
                     let actual = engine.decode_logits()?;
                     if !graph && let Some(out) = &dump {
+                        step_trace.set_device(&engine.device.info.name)?;
                         step_trace.add("logits".into(), vec![65536], actual.clone())?;
                         step_trace.save(&out.join(format!("{case}-step{step}.safetensors")))?;
                     }
