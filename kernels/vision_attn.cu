@@ -105,7 +105,7 @@ __device__ __forceinline__ void guard_geometry(const int* cu, const int* kb, int
 using Bf16Fragment = short __attribute__((ext_vector_type(16)));
 using AccFragment = float __attribute__((ext_vector_type(8)));
 
-// LDS holds Q[64,80], K[16,80], V[16,80], P[64,16]; external rows retain D=72.
+// LDS holds Q[64,80], K[64,80], V[64,80], P[64,64]; external rows retain D=72.
 template <int MT, int KT, int NW>
 __device__ __forceinline__ void vision_attn_body(
     const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v,
@@ -119,11 +119,11 @@ __device__ __forceinline__ void vision_attn_body(
   const int base = cu[image], rows = cu[image + 1] - base;
   const int query_base = blockIdx.x * MT;
   if (query_base >= rows) return;
-  __shared__ unsigned short storage[(MT + 32) * PADDED_D + MT * 16];
+  __shared__ unsigned short storage[(MT + 2 * KT) * PADDED_D + MT * KT];
   auto* qs = storage;
   auto* ks = qs + MT * PADDED_D;
-  auto* vs = ks + 16 * PADDED_D;
-  auto* ps = vs + 16 * PADDED_D;
+  auto* vs = ks + KT * PADDED_D;
+  auto* ps = vs + KT * PADDED_D;
   for (int cell = tid; cell < MT * PADDED_D; cell += NW * 32) {
     const int row = query_base + cell / PADDED_D, d = cell % PADDED_D;
     qs[cell] = row < rows && d < D ? reinterpret_cast<const unsigned short*>(q)[
@@ -134,38 +134,54 @@ __device__ __forceinline__ void vision_attn_body(
   AccFragment output[PADDED_D / 16] = {};
 #pragma unroll
   for (int g = 0; g < 8; ++g) { maxima[g] = -3.0e38f; sums[g] = 0.0f; }
-  for (int key_base = 0; key_base < rows; key_base += 16) {
-    for (int cell = tid; cell < 16 * PADDED_D; cell += NW * 32) {
+  for (int key_base = 0; key_base < rows; key_base += KT) {
+    for (int cell = tid; cell < KT * PADDED_D; cell += NW * 32) {
       const int row = key_base + cell / PADDED_D, d = cell % PADDED_D;
       const size_t offset = ((size_t)head * kb[nblocks] + kb[image] + row) * D + d;
       ks[cell] = row < rows && d < D ? reinterpret_cast<const unsigned short*>(k)[offset] : 0;
       vs[cell] = row < rows && d < D ? reinterpret_cast<const unsigned short*>(v)[offset] : 0;
     }
     __syncthreads();
-    AccFragment score = {};
+    AccFragment score[KT / 16] = {};
 #pragma unroll
     for (int panel = 0; panel < PADDED_D / 16; ++panel) {
-      Bf16Fragment query, key;
+      Bf16Fragment query;
 #pragma unroll
       for (int d = 0; d < 16; ++d) {
         query[d] = qs[(wave * 16 + lane % 16) * PADDED_D + panel * 16 + d];
-        key[d] = ks[(lane % 16) * PADDED_D + panel * 16 + d];
       }
-      score = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(query, key, score);
+#pragma unroll
+      for (int tile = 0; tile < KT / 16; ++tile) {
+        Bf16Fragment key;
+#pragma unroll
+        for (int d = 0; d < 16; ++d)
+          key[d] = ks[(tile * 16 + lane % 16) * PADDED_D + panel * 16 + d];
+        score[tile] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(query, key, score[tile]);
+      }
     }
 #pragma unroll
     for (int g = 0; g < 8; ++g) {
       const int row = wave * 16 + 2 * g + lane / 16;
-      const bool visible = query_base + row < rows && key_base + lane % 16 < rows;
-      const float value = visible ? score[g] * SCALE : -INFINITY;
-      float maximum = value;
+      float values[KT / 16];
+      float maximum = -INFINITY;
+#pragma unroll
+      for (int tile = 0; tile < KT / 16; ++tile) {
+        const bool visible = query_base + row < rows && key_base + tile * 16 + lane % 16 < rows;
+        values[tile] = visible ? score[tile][g] * SCALE : -INFINITY;
+        maximum = fmaxf(maximum, values[tile]);
+      }
 #pragma unroll
       for (int offset = 8; offset > 0; offset >>= 1)
         maximum = fmaxf(maximum, __shfl_xor(maximum, offset, 16));
       const float next = fmaxf(maxima[g], maximum);
       const float alpha = __expf(maxima[g] - next);
-      const float probability = visible ? __expf(value - next) : 0.0f;
-      float sum = probability;
+      float sum = 0.0f;
+#pragma unroll
+      for (int tile = 0; tile < KT / 16; ++tile) {
+        const float probability = __expf(values[tile] - next);
+        sum += probability;
+        reinterpret_cast<bf16*>(ps)[row * KT + tile * 16 + lane % 16] = __float2bfloat16(probability);
+      }
 #pragma unroll
       for (int offset = 8; offset > 0; offset >>= 1)
         sum += __shfl_xor(sum, offset, 16);
@@ -173,20 +189,22 @@ __device__ __forceinline__ void vision_attn_body(
       sums[g] = sums[g] * alpha + sum;
 #pragma unroll
       for (int d = 0; d < PADDED_D / 16; ++d) output[d][g] *= alpha;
-      reinterpret_cast<bf16*>(ps)[row * 16 + lane % 16] = __float2bfloat16(probability);
     }
     __syncthreads();
-    Bf16Fragment probability;
 #pragma unroll
-    for (int key = 0; key < 16; ++key)
-      probability[key] = ps[(wave * 16 + lane % 16) * 16 + key];
-#pragma unroll
-    for (int panel = 0; panel < PADDED_D / 16; ++panel) {
-      Bf16Fragment value;
+    for (int tile = 0; tile < KT / 16; ++tile) {
+      Bf16Fragment probability;
 #pragma unroll
       for (int key = 0; key < 16; ++key)
-        value[key] = vs[key * PADDED_D + panel * 16 + lane % 16];
-      output[panel] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(probability, value, output[panel]);
+        probability[key] = ps[(wave * 16 + lane % 16) * KT + tile * 16 + key];
+#pragma unroll
+      for (int panel = 0; panel < PADDED_D / 16; ++panel) {
+        Bf16Fragment value;
+#pragma unroll
+        for (int key = 0; key < 16; ++key)
+          value[key] = vs[(tile * 16 + key) * PADDED_D + panel * 16 + lane % 16];
+        output[panel] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(probability, value, output[panel]);
+      }
     }
     __syncthreads();
   }
