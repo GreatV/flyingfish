@@ -1041,8 +1041,6 @@ impl Runtime {
             #[cfg(feature = "cuda")]
             verify_rows,
         };
-        #[cfg(feature = "rocm")]
-        runtime.bind_linear_calls(engine)?;
         Ok(runtime)
     }
     #[cfg(feature = "rocm")]
@@ -1063,6 +1061,7 @@ impl Runtime {
             .collect::<Result<BTreeSet<_>>>()?;
         for rows in buckets {
             let rows = rows as usize;
+            let invariant = engine.spec.is_some() && rows <= crate::linear_plan::MAX_SKINNY_ROWS;
             for layer in &self.layers {
                 let input = matrix(&work.n, stream, 0, rows, hidden)?;
                 let (role, width) = match &layer.mixer {
@@ -1081,6 +1080,7 @@ impl Runtime {
                                 role,
                                 input,
                                 &TensorMut(matrix(&work.qkv, stream, offset, rows, width)?),
+                                invariant,
                             )?;
                         }
                         ("self_attn.o_proj.weight", q_width)
@@ -1110,6 +1110,7 @@ impl Runtime {
                                 role,
                                 input,
                                 &TensorMut(matrix(buffer, stream, offset, rows, width)?),
+                                invariant,
                             )?;
                         }
                         ("linear_attn.out_proj.weight", value)
@@ -1120,6 +1121,7 @@ impl Runtime {
                     role,
                     matrix(&work.attn, stream, 0, rows, width)?,
                     &TensorMut(matrix(&work.out, stream, 0, rows, hidden)?),
+                    invariant,
                 )?;
             }
         }
@@ -2177,6 +2179,12 @@ impl Engine {
         if engine.spec.is_some() {
             engine.bind_invariant_arithmetic()?;
         }
+        #[cfg(feature = "rocm")]
+        engine
+            .qwen
+            .as_ref()
+            .context("HIP runtime missing")?
+            .bind_linear_calls(&engine)?;
         engine.prepare(1)?;
         engine.prepare_prefill_plans()?;
         engine
