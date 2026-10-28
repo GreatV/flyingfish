@@ -837,11 +837,29 @@ impl<T> Slice<T> {
         if Arc::ptr_eq(stream, &self.allocation.stream) {
             return Ok(());
         }
-        let allocation = Arc::get_mut(&mut self.allocation)
-            .context("HIP handoff requires exclusive allocation ownership")?;
-        let completed = allocation.stream.record_event(Some(2))?;
+        ensure!(
+            Arc::strong_count(&self.allocation) == 1,
+            "HIP handoff requires exclusive allocation ownership"
+        );
+        let completed = self.allocation.stream.record_event(Some(2))?;
         stream.wait(&completed)?;
+        let previous = std::mem::replace(
+            &mut self.allocation,
+            Arc::new(Allocation {
+                ptr: 0,
+                stream: stream.clone(),
+            }),
+        );
+        let mut allocation = match Arc::try_unwrap(previous) {
+            Ok(allocation) => allocation,
+            Err(previous) => {
+                self.allocation = previous;
+                anyhow::bail!("HIP handoff raced with graph retention");
+            }
+        };
         allocation.stream = stream.clone();
+        self.allocation = Arc::new(allocation);
+        stream.register(&self.allocation);
         Ok(())
     }
     pub fn slice(&self, range: impl RangeBounds<usize>) -> View<'_, T> {
