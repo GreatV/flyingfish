@@ -780,22 +780,23 @@ static_assert(sizeof(Problem) == 64);
 using B = short __attribute__((ext_vector_type(16)));
 using A = float __attribute__((ext_vector_type(8)));
 
-// Q[BQ,D], K[BK,D], V[BK,D], P_hi[BQ,BK], P_lo[BQ,BK], alpha[BQ].
-// K storage holds F32 scores after the QK barrier.
+// D256 uses eight-lane FP32 QK dots and BF16 WMMA PV.
+// D128 reuses K storage for scores and keeps two BF16 probability planes.
 template<int D, int MODE>
 __device__ void run(Problem p, uint32_t extent) {
   constexpr int BQ = D == 256 ? 16 : 32;
   constexpr int BK = D == 256 ? 32 : 64;
-  constexpr int SCORE_TILES = D == 256 ? 1 : 2;
-  constexpr int QK_TERMS = D == 256 ? 1 : 16;
-  __shared__ __align__(16) unsigned short memory[(BQ + 2*BK)*D + 2*BQ*BK + 2*BQ];
+  constexpr int KS = D == 256 ? D+8 : D;
+  constexpr int PLANES = D == 256 ? 1 : 2;
+  __shared__ __align__(16) unsigned short memory[BQ*D + BK*KS + BK*D +
+      PLANES*BQ*BK + 2*BQ + (D == 256 ? 2*BQ*BK : 0)];
   auto* qs = memory;
   auto* ks = qs + BQ*D;
-  auto* vs = ks + BK*D;
+  auto* vs = ks + BK*KS;
   auto* high = vs + BK*D;
   auto* low = high + BQ*BK;
-  auto* alpha = reinterpret_cast<float*>(low + BQ*BK);
-  auto* score_memory = reinterpret_cast<float*>(ks);
+  auto* alpha = reinterpret_cast<float*>(high + PLANES*BQ*BK);
+  auto* score_memory = D == 256 ? alpha+BQ : reinterpret_cast<float*>(ks);
   const int tid = threadIdx.x, wave = tid/32, lane = tid%32;
   const uint32_t head = blockIdx.y, kv = head/p.group, query_base = blockIdx.x*BQ;
   if (blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 ||
@@ -820,54 +821,53 @@ __device__ void run(Problem p, uint32_t extent) {
     for (int cell = tid; cell < BK*D; cell += 128) {
       const uint32_t key = base + cell/D;
       const size_t offset = ((size_t)kv*p.capacity + key)*D + cell%D;
-      ks[cell] = key < end ? reinterpret_cast<const unsigned short*>(p.k)[offset] : 0;
+      ks[(cell/D)*KS+cell%D] = key < end ? reinterpret_cast<const unsigned short*>(p.k)[offset] : 0;
       vs[cell] = key < end ? reinterpret_cast<const unsigned short*>(p.v)[offset] : 0;
     }
     __syncthreads();
-    A scores[SCORE_TILES] = {};
-    A score_correction[SCORE_TILES] = {};
-    const int key_slab = D == 256 ? wave%2 : (wave%2)*2;
-    if (D == 128 || wave < 2) {
-#pragma clang loop unroll_count(D == 256 ? 1 : 8)
-      for (int part = 0; part < D/QK_TERMS; ++part) {
+    const auto store_score = [&](int row, int column, float value) {
+      const uint32_t key = base+column, query = p.start+query_base+row;
+      const bool visible = query_base+row < p.rows && key < end &&
+          (MODE == 1 || (MODE == 2 ? key < max(extent,query+1) : key <= query)) &&
+          (MODE != 3 || query-key <= extent);
+      score_memory[row*BK+column] = visible ? value*(D == 256 ? 0.0625f : SCALE) : -INFINITY;
+    };
+    if constexpr (D == 256) {
+      for (int cell = tid/8; cell < BQ*BK; cell += 16) {
+        float dot = 0.0f;
+#pragma unroll
+        for (int dimension = tid%8; dimension < D; dimension += 8) {
+          const float q = __uint_as_float(uint32_t(qs[(cell/BK)*D+dimension]) << 16);
+          const float k = __uint_as_float(uint32_t(ks[(cell%BK)*KS+dimension]) << 16);
+          dot = fmaf(q,k,dot);
+        }
+        dot += __shfl_down(dot,4,8);
+        dot += __shfl_down(dot,2,8);
+        dot += __shfl_down(dot,1,8);
+        if (tid%8 == 0) store_score(cell/BK,cell%BK,dot);
+      }
+    } else {
+      A scores[2] = {};
+      const int key_slab = (wave%2)*2;
+#pragma unroll
+      for (int part = 0; part < D/16; ++part) {
         B a;
 #pragma unroll
-        for (int j = 0; j < 16; ++j) a[j] = j < QK_TERMS
-            ? qs[(q_slab*16+lane%16)*D+part*QK_TERMS+j] : 0;
+        for (int j = 0; j < 16; ++j) a[j] = qs[(q_slab*16+lane%16)*D+part*16+j];
 #pragma unroll
-        for (int tile = 0; tile < SCORE_TILES; ++tile) {
+        for (int tile = 0; tile < 2; ++tile) {
           B b;
 #pragma unroll
-          for (int j = 0; j < 16; ++j) b[j] = j < QK_TERMS
-              ? ks[((key_slab+tile)*16+lane%16)*D+part*QK_TERMS+j] : 0;
-          if constexpr (D == 256) {
-            const A partial = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a,b,A{});
-            const A delta = partial-score_correction[tile];
-            const A next = scores[tile]+delta;
-            score_correction[tile] = (next-scores[tile])-delta;
-            scores[tile] = next;
-          } else {
-            scores[tile] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a,b,scores[tile]);
-          }
+          for (int j = 0; j < 16; ++j) b[j] = ks[((key_slab+tile)*16+lane%16)*KS+part*16+j];
+          scores[tile] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a,b,scores[tile]);
         }
       }
-    }
-    __syncthreads();
-    if (D == 128 || wave < 2) {
+      __syncthreads();
 #pragma unroll
-      for (int tile = 0; tile < SCORE_TILES; ++tile) {
+      for (int tile = 0; tile < 2; ++tile)
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-          const int row = q_slab*16+2*j+lane/16;
-          const uint32_t key = base+(key_slab+tile)*16+lane%16;
-          const uint32_t query = p.start+query_base+row;
-          const bool visible = query_base+row < p.rows && key < end &&
-              (MODE == 1 || (MODE == 2 ? key < max(extent,query+1) : key <= query)) &&
-              (MODE != 3 || query-key <= extent);
-          score_memory[row*BK+(key_slab+tile)*16+lane%16] = visible
-              ? scores[tile][j]*(D == 256 ? 0.0625f : SCALE) : -INFINITY;
-        }
-      }
+        for (int j = 0; j < 8; ++j)
+          store_score(q_slab*16+2*j+lane/16,(key_slab+tile)*16+lane%16,scores[tile][j]);
     }
     __syncthreads();
     if (tid < BQ) {
@@ -883,8 +883,10 @@ __device__ void run(Problem p, uint32_t extent) {
         denominator = sum;
         const bf16 hi = __float2bfloat16(value);
         high[tid*BK+key] = reinterpret_cast<const unsigned short&>(hi);
-        const bf16 lo = __float2bfloat16(value-__bfloat162float(hi));
-        low[tid*BK+key] = reinterpret_cast<const unsigned short&>(lo);
+        if constexpr (D == 128) {
+          const bf16 lo = __float2bfloat16(value-__bfloat162float(hi));
+          low[tid*BK+key] = reinterpret_cast<const unsigned short&>(lo);
+        }
       }
       peak = next;
       alpha[tid] = rescale;
@@ -901,7 +903,7 @@ __device__ void run(Problem p, uint32_t extent) {
 #pragma unroll
       for (int j = 0; j < 16; ++j) {
         ph[j] = high[(q_slab*16+lane%16)*BK+tile*16+j];
-        pl[j] = low[(q_slab*16+lane%16)*BK+tile*16+j];
+        if constexpr (D == 128) pl[j] = low[(q_slab*16+lane%16)*BK+tile*16+j];
       }
 #pragma unroll
       for (int panel = 0; panel < 4; ++panel) {
