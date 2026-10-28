@@ -1,4 +1,8 @@
+#if defined(__HIP__)
+#include "gpu_compat.cuh"
+#else
 #include <cuda_bf16.h>
+#endif
 #include <stdint.h>
 #include <math.h>
 

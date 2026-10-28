@@ -55,7 +55,6 @@ mod qwen;
 #[cfg(feature = "cuda")]
 mod recurrent;
 #[path = "engine_vision.rs"]
-#[cfg(feature = "cuda")]
 mod vision_runtime;
 
 fn trace_value(
@@ -634,7 +633,6 @@ pub struct Engine {
     mtp_state: Option<super::state::StateStore>,
     #[cfg(feature = "cuda")]
     mtp_epoch: u64,
-    #[cfg(feature = "cuda")]
     images: Option<vision_runtime::EncodedImages>,
     weights: Weights,
     state: super::state::StateStore,
@@ -1105,7 +1103,6 @@ impl Engine {
             mtp_state: None,
             #[cfg(feature = "cuda")]
             mtp_epoch: 0,
-            #[cfg(feature = "cuda")]
             images: None,
             qwen_device_prefix: false,
             forward_rows: std::collections::BTreeSet::new(),
@@ -2416,10 +2413,7 @@ impl Engine {
             if let Some(decode) = self.moe.as_mut() {
                 decode.reset()?;
             }
-            #[cfg(feature = "cuda")]
-            {
-                self.images = None;
-            }
+            self.images = None;
             self.reset_qwen_positions()?;
         }
         self.state.reset(&self.device.stream)?;
@@ -3139,10 +3133,7 @@ impl Engine {
     }
 
     pub fn weight_bytes(&self) -> usize {
-        #[cfg(feature = "cuda")]
         let extra = self.qwen.as_ref().map_or(0, qwen::Runtime::vision_bytes);
-        #[cfg(feature = "rocm")]
-        let extra = 0;
         self.weights.bytes + extra
     }
 
@@ -5425,12 +5416,6 @@ impl Engine {
 
 #[cfg(feature = "rocm")]
 impl Engine {
-    pub(crate) fn check_resident_vision_budget(_: &Path, _: &crate::spec::Options) -> Result<()> {
-        anyhow::bail!("HIP check_resident_vision_budget is unsupported")
-    }
-    pub fn prepare_resident_vision(&mut self) -> Result<()> {
-        anyhow::bail!("HIP prepare_resident_vision is unsupported")
-    }
     pub(crate) fn load_mtp(
         _: &std::path::Path,
         _: &crate::spec::Options,
@@ -5462,13 +5447,6 @@ impl Engine {
         _graph: bool,
     ) -> Result<crate::mtp::Output> {
         anyhow::bail!("HIP generate_mtp is unsupported")
-    }
-    pub fn prefill_multimodal(
-        &mut self,
-        _input: &crate::vision_input::MultimodalInput<'_>,
-        _trace: Option<&mut Trace>,
-    ) -> Result<u32> {
-        anyhow::bail!("HIP prefill_multimodal is unsupported")
     }
     pub fn profiler_start(&self) -> Result<()> {
         anyhow::bail!("HIP profiler_start is unsupported")
@@ -5700,6 +5678,7 @@ impl Engine {
             s,
         )?);
         let mut engine = Self {
+            images: None,
             qwen_device_prefix: false,
             qwen: None,
             moe: None,

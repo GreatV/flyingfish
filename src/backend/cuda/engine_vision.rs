@@ -1,4 +1,5 @@
 //! Vision weights, patch/position preparation, and image-feature splice for Engine.
+use crate::backend::gpu::{CudaFunction, CudaSlice, CudaStream, DevicePtr, PushKernelArg};
 use crate::{
     backend::cuda::{
         Device,
@@ -17,7 +18,6 @@ use crate::{
     vision_input::{ImageGrid, MultimodalInput, PositionPlan, SpliceRange, VisionPositions},
 };
 use anyhow::{Context, Result, bail, ensure};
-use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, PushKernelArg};
 use half::bf16;
 use std::{mem::size_of, sync::Arc};
 
@@ -111,7 +111,7 @@ impl VisionGeometry {
     }
 }
 
-fn dense<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
+fn dense<T: crate::backend::gpu::DeviceRepr + Copy, const R: usize>(
     buffer: &CudaSlice<T>,
     stream: &Arc<CudaStream>,
     shape: [u32; R],
@@ -135,7 +135,7 @@ fn dense<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
     }
 }
 
-fn dense_at<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
+fn dense_at<T: crate::backend::gpu::DeviceRepr + Copy, const R: usize>(
     buffer: &CudaSlice<T>,
     stream: &Arc<CudaStream>,
     shape: [u32; R],
@@ -162,7 +162,7 @@ fn dense_at<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
 
 /// Stage view: exact-length `dense` when the extent covers the whole allocation, otherwise the
 /// offset-0 prefix `dense_at`.
-fn stage_view<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
+fn stage_view<T: crate::backend::gpu::DeviceRepr + Copy, const R: usize>(
     buffer: &CudaSlice<T>,
     stream: &Arc<CudaStream>,
     shape: [u32; R],
@@ -2322,6 +2322,23 @@ impl EncodedImages {
 mod tests {
     use super::*;
 
+    fn test_blas(
+        device: &Device,
+        output: &std::path::Path,
+        closure: std::rc::Rc<crate::backend::cuda::closure::Closure>,
+    ) -> Result<Blas> {
+        #[cfg(feature = "cuda")]
+        {
+            let ops = crate::backend::cuda::ops::Ops::new(&device.ctx)?;
+            Blas::new(device, &ops, output, closure)
+        }
+        #[cfg(feature = "rocm")]
+        {
+            let _ = (output, closure);
+            Blas::new(device.stream.clone())
+        }
+    }
+
     fn q38_geometry() -> VisionGeometry {
         VisionGeometry {
             spec: VisionSpec::q38(),
@@ -2452,13 +2469,7 @@ mod tests {
         assert_eq!(&got[9..], &[-1; 6]);
         s.memcpy_htod(&[5i32, 1, 6, 12, 1, 0, 0, 0], &mut meta)?;
         s.synchronize()?;
-        s.begin_capture(
-            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-        )?;
-        launch()?;
-        let graph = s
-            .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-            .context("empty position graph")?;
+        let graph = crate::backend::cuda::moe::testing::capture(s, launch)?;
         graph.launch()?;
         assert_eq!(&s.clone_dtoh(&active)?[..3], &image_axes[15..18]);
         let text: Vec<i32> = (0..12).flat_map(|p| [p; 3]).collect();
@@ -2785,7 +2796,7 @@ mod tests {
     #[ignore = "requires FF_MINICPM_VISION_WINDOW=granted, FF_MODEL, FF_MINICPM_REFERENCE_DIR, \
                 FF_MINICPM_VISION_OUTPUT_DIR, FF_MINICPM_TOLERANCES and FF_MINICPM_VISION_REFERENCE"]
     fn minicpm_vision_tower_gpu() -> Result<()> {
-        use crate::backend::cuda::{closure::Closure, ops::Ops};
+        use crate::backend::cuda::closure::Closure;
         use std::{collections::BTreeMap, path::PathBuf, rc::Rc};
         ensure!(
             std::env::var("FF_MINICPM_VISION_WINDOW").as_deref() == Ok("granted"),
@@ -2819,10 +2830,8 @@ mod tests {
         let device = Device::new(0)?;
         let s = &device.stream;
         let common = CommonOpsRef::new(&device.ctx)?;
-        let ops = Ops::new(&device.ctx)?;
-        let mut blas = Blas::new(
+        let mut blas = test_blas(
             &device,
-            &ops,
             &output,
             Rc::new(Closure::new(false, "minicpm vision gate".into())),
         )?;
@@ -3170,7 +3179,7 @@ mod tests {
     #[test]
     #[ignore = "requires FF_Q38_VISION_WINDOW=granted, FF_Q38_MODEL, FF_Q38_MERGER_INPUT_DIR and FF_Q38_VISION_OUTPUT_DIR"]
     fn vision_merger_stages_gpu() -> Result<()> {
-        use crate::backend::cuda::{closure::Closure, ops::Ops};
+        use crate::backend::cuda::closure::Closure;
         use std::{path::PathBuf, rc::Rc};
         ensure!(
             std::env::var("FF_Q38_VISION_WINDOW").as_deref() == Ok("granted"),
@@ -3189,10 +3198,8 @@ mod tests {
         let device = Device::new(0)?;
         let s = &device.stream;
         let common = CommonOpsRef::new(&device.ctx)?;
-        let ops = Ops::new(&device.ctx)?;
-        let mut blas = Blas::new(
+        let mut blas = test_blas(
             &device,
-            &ops,
             &output,
             Rc::new(Closure::new(false, "merger stages".into())),
         )?;
@@ -3428,11 +3435,9 @@ mod tests {
         for graph in [false, true] {
             for trace in [false, true] {
                 let captured = if graph {
-                    s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-                    let result = execute(trace);
-                    let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
-                    result?;
-                    Some(captured?.context("empty patch position graph")?)
+                    Some(crate::backend::cuda::moe::testing::capture(s, || {
+                        execute(trace)
+                    })?)
                 } else {
                     None
                 };
@@ -3479,8 +3484,8 @@ mod tests {
     #[test]
     #[ignore = "requires FF_Q38_VISION_WINDOW=granted and FF_Q38_VISION_OUTPUT_DIR"]
     fn vision_merger_bias_rounding_gpu() -> Result<()> {
-        use crate::backend::cuda::{closure::Closure, ops::Ops};
-        use cudarc::driver::DevicePtr;
+        use crate::backend::cuda::closure::Closure;
+        use crate::backend::gpu::DevicePtr;
         use std::{path::PathBuf, rc::Rc, time::Instant};
         ensure!(
             std::env::var("FF_Q38_VISION_WINDOW").as_deref() == Ok("granted"),
@@ -3493,9 +3498,8 @@ mod tests {
         std::fs::create_dir_all(&output)?;
         let device = Device::new(0)?;
         let s = &device.stream;
-        let ops = Ops::new(&device.ctx)?;
         let closure = Rc::new(Closure::new(false, "merger bias rounding".into()));
-        let mut blas = Blas::new(&device, &ops, &output, closure.clone())?;
+        let mut blas = test_blas(&device, &output, closure.clone())?;
         for rows in [1u32, 37, 1120, 7104] {
             blas.prepare_fixed(rows, HIDDEN, PATCH)?;
         }
@@ -3568,6 +3572,7 @@ mod tests {
                         resident_bytes: bytes,
                     },
                     bytes,
+                    #[cfg(feature = "cuda")]
                     upload_content_sha256: None,
                     upload_hashed_bytes: None,
                     load_wall_ms: 0.0,
@@ -3803,10 +3808,11 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "requires exclusive sm89 vision window and the native Qwen checkpoint"]
     fn vision_patch_operation_timing_gpu() -> Result<()> {
-        use crate::backend::cuda::{closure::Closure, ops::Ops};
+        use crate::backend::cuda::closure::Closure;
         use std::{path::PathBuf, rc::Rc, time::Instant};
         ensure!(
             std::env::var("FF_Q38_VISION_WINDOW").as_deref() == Ok("granted"),
@@ -3846,9 +3852,8 @@ mod tests {
             "operator timing requires sm89"
         );
         let stream = &device.stream;
-        let ops = Ops::new(&device.ctx)?;
         let closure = Rc::new(Closure::new(false, "patch operation timing".into()));
-        let blas = Blas::new(&device, &ops, &output, closure.clone())?;
+        let blas = test_blas(&device, &output, closure.clone())?;
         let mut catalog = WeightCatalog::load_with_policy(
             &directory,
             &model,
@@ -3972,7 +3977,7 @@ mod tests {
     #[test]
     #[ignore = "requires local vision GPU window and model/fixture/output paths; full tower diagnostics"]
     fn vision_tower_gpu() -> Result<()> {
-        use crate::backend::cuda::{closure::Closure, ops::Ops};
+        use crate::backend::cuda::closure::Closure;
         use safetensors::{Dtype, SafeTensors};
         use std::{path::PathBuf, rc::Rc, time::Instant};
         ensure!(
@@ -3993,9 +3998,8 @@ mod tests {
         let device = Device::new(0)?;
         let s = &device.stream;
         let common = CommonOpsRef::new(&device.ctx)?;
-        let ops = Ops::new(&device.ctx)?;
         let closure = Rc::new(Closure::new(false, "vision prefix diagnostic".into()));
-        let mut blas = Blas::new(&device, &ops, &output, closure.clone())?;
+        let mut blas = test_blas(&device, &output, closure.clone())?;
         let mut catalog = WeightCatalog::load_with_policy(
             &model_dir,
             &model,

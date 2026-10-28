@@ -1234,7 +1234,6 @@ impl Engine {
             mtp_state: None,
             #[cfg(feature = "cuda")]
             mtp_epoch: 0,
-            #[cfg(feature = "cuda")]
             images: None,
             qwen_device_prefix: false,
             forward_rows: (1..=workspace_rows).collect(),

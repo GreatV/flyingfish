@@ -32,7 +32,6 @@ pub mod profile;
 pub mod state;
 pub(crate) mod tree;
 pub mod verification;
-#[cfg(feature = "cuda")]
 pub(crate) mod vision;
 pub mod weights;
 

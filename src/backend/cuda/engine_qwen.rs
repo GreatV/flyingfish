@@ -336,9 +336,7 @@ pub(super) struct Runtime {
     attention: Option<FullAttentionSpec>,
     gdn: Option<GdnSpec>,
     checkpoint_dir: PathBuf,
-    #[cfg(feature = "cuda")]
     vision: Option<super::vision_runtime::VisionRuntime>,
-    #[cfg(feature = "cuda")]
     vision_bytes: usize,
     #[cfg(test)]
     pub(super) vision_encode_calls: usize,
@@ -369,7 +367,6 @@ struct Layer {
 }
 enum BoundMixer {
     Attention {
-        #[cfg(feature = "cuda")]
         image_prefill: PrefillPlans<FullAttentionPlan>,
         text_prefill: PrefillPlans<FullAttentionPlan>,
         decode: Box<FullAttentionPlan>,
@@ -544,7 +541,6 @@ impl Runtime {
     pub(super) fn position_values(&self, stream: &Arc<CudaStream>) -> Result<Vec<i32>> {
         Ok(stream.clone_dtoh(&self.positions)?)
     }
-    #[cfg(feature = "cuda")]
     pub(super) fn vision_bytes(&self) -> usize {
         self.vision_bytes
     }
@@ -918,7 +914,6 @@ impl Runtime {
                             "nested verify attention exceeds Engine scratch budget"
                         );
                         BoundMixer::Attention {
-                            #[cfg(feature = "cuda")]
                             image_prefill: PrefillPlans::bind(
                                 bind(
                                     limits(rows, engine.capacity)?,
@@ -1042,9 +1037,7 @@ impl Runtime {
             checkpoint_dir: checkpoint_dir
                 .canonicalize()
                 .context("resolve Q38 checkpoint directory")?,
-            #[cfg(feature = "cuda")]
             vision: None,
-            #[cfg(feature = "cuda")]
             vision_bytes: 0,
             #[cfg(test)]
             vision_encode_calls: 0,
@@ -1422,7 +1415,6 @@ impl Engine {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     pub fn prefill_multimodal(
         &mut self,
         input: &crate::vision_input::MultimodalInput<'_>,
@@ -1441,7 +1433,6 @@ impl Engine {
         result
     }
 
-    #[cfg(feature = "cuda")]
     pub(super) fn prepare_multimodal(
         &mut self,
         input: &crate::vision_input::MultimodalInput<'_>,
@@ -1489,7 +1480,6 @@ impl Engine {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     pub fn prepare_resident_vision(&mut self) -> Result<()> {
         if self.model_spec.vision.is_some() {
             self.prepare_vision_weights(0)?;
@@ -1497,7 +1487,6 @@ impl Engine {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     pub(crate) fn check_resident_vision_budget(
         dir: &Path,
         options: &crate::spec::Options,
@@ -1539,7 +1528,6 @@ impl Engine {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     fn prepare_vision_weights(&mut self, request_bytes: usize) -> Result<()> {
         let kv_bytes = self
             .state
@@ -1547,11 +1535,14 @@ impl Engine {
             .iter()
             .map(|v| (v.k.len() + v.v.len()) * size_of::<bf16>())
             .sum::<usize>();
+        #[cfg(feature = "cuda")]
         let mtp_bytes = if self.mtp.is_some() {
             crate::mtp::attachment_bytes(&self.model_spec, self.capacity, self.chunk, true)?
         } else {
             0
         };
+        #[cfg(feature = "rocm")]
+        let mtp_bytes = 0usize;
         let q = self.qwen.as_mut().context("Q38 runtime missing")?;
         if q.vision.is_none() {
             let manifest = crate::checkpoint::MappedCheckpoint::open(&q.checkpoint_dir)?
@@ -2174,7 +2165,6 @@ impl Engine {
             mtp_state: None,
             #[cfg(feature = "cuda")]
             mtp_epoch: 0,
-            #[cfg(feature = "cuda")]
             images: None,
         };
         engine.qwen = Some(Runtime::new(
@@ -3126,7 +3116,6 @@ impl Engine {
                 )?;
             }
             BoundMixer::Attention {
-                #[cfg(feature = "cuda")]
                 image_prefill,
                 text_prefill,
                 decode,
@@ -3175,7 +3164,12 @@ impl Engine {
                                     .is_none(),
                                 "HIP HD256 prefill requires BF16 KV"
                             );
-                            let plan = text_prefill.select(rows, &FullAttentionPlan::for_rows)?;
+                            let plans = if self.images.is_some() {
+                                image_prefill
+                            } else {
+                                text_prefill
+                            };
+                            let plan = plans.select(rows, &FullAttentionPlan::for_rows)?;
                             FullAttentionOps::run(&plan, s, meta, scratch(&q.scratch, s))?;
                         }
                         #[cfg(feature = "cuda")]
@@ -3537,7 +3531,6 @@ impl Engine {
                         .arg(&(h as i32))
                         .launch(flat(rows * h))?;
                 }
-                #[cfg(feature = "cuda")]
                 if step.input == crate::backend::Input::Ids
                     && let Some(images) = &self.images
                 {

@@ -21,9 +21,11 @@ use super::contracts::{Scratch, Tensor, TensorMut, dense_layout};
 use super::cubin;
 use super::linear::LinearBiasMode;
 use super::ops::{CommonOpsRef, GeluMode};
+use crate::backend::gpu::{
+    CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
+};
 use crate::op_contract::WorkspaceReq;
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
 use half::bf16;
 use std::sync::Arc;
 
@@ -331,6 +333,8 @@ impl VisionAttnOps {
         bindings: VisionAttnBindings,
     ) -> Result<VisionAttnPlan> {
         spec.validate()?;
+        #[cfg(feature = "rocm")]
+        device.ctx.require_wmma().context("D72 vision attention")?;
         let grids = packing.grids();
         let cu = packing.cu_seqlens();
         let kb = packing.k_bases();
@@ -481,12 +485,7 @@ impl VisionAttnOps {
 
         for &(src, dst, bytes) in &plan.copies {
             unsafe {
-                cudarc::driver::result::memcpy_dtod_async(
-                    (k_pad + dst) as _,
-                    (k_source + src) as _,
-                    bytes as usize,
-                    stream.cu_stream() as _,
-                )?;
+                super::copy::dtod_raw(k_pad + dst, k_source + src, bytes as usize, stream)?;
             }
         }
 
@@ -701,11 +700,14 @@ mod tests {
 mod probe {
     //! GPU probe of `workspace` -> `prepare` -> `run` for the attention stage and the merger, with negative controls.
     use super::*;
+    #[cfg(feature = "cuda")]
     use crate::backend::cuda::closure::Closure;
     use crate::backend::cuda::moe::testing::view;
+    #[cfg(feature = "cuda")]
     use crate::backend::cuda::ops::Ops;
     use crate::backend::cuda::{Device, bf16_chain_bound};
-    use cudarc::driver::DevicePtr;
+    use crate::backend::gpu::DevicePtr;
+    #[cfg(feature = "cuda")]
     use std::rc::Rc;
 
     /// From `kernels/vision_rope.cu` / `kernels/vision_attn.cu` (private there).
@@ -1120,9 +1122,14 @@ mod probe {
             out: TensorMut(view(&dev_out, s, mk(tokens, fc2), [fc2 as u64, 1])?),
         };
         let common = CommonOpsRef::new(&device.ctx)?;
+        #[cfg(feature = "cuda")]
         let ops = Ops::new(&device.ctx)?;
+        #[cfg(feature = "cuda")]
         let closure = Rc::new(Closure::new(false, "vision binder probe".into()));
+        #[cfg(feature = "cuda")]
         let mut blas = Blas::new(&device, &ops, &std::env::temp_dir(), closure)?;
+        #[cfg(feature = "rocm")]
+        let mut blas = Blas::new(s.clone())?;
         let mplan =
             VisionMergerOps::prepare(&VisionSpec::q38(), merger_bindings, common, &mut blas)?;
         let mreq = VisionMergerOps::workspace(&VisionSpec::q38(), mrows as u32)?;

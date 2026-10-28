@@ -14,7 +14,11 @@
 // Not in-place: q_out/k_out must not alias q/k.
 //
 // Launch: grid(ceil(rows*HQ / 256)), block 256. One thread per (row, head).
+#if defined(__HIP__)
+#include "gpu_compat.cuh"
+#else
 #include <cuda_bf16.h>
+#endif
 #include <stdint.h>
 
 namespace vision_rope {

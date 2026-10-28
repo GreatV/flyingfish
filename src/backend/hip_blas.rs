@@ -1,4 +1,5 @@
 //! BF16 HIP library plans are bound by library algorithm index, not heuristic order.
+use crate::backend::gpu::linear::LinearBiasMode;
 use crate::backend::gpu::{
     CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, PushKernelArg,
 };
@@ -193,7 +194,8 @@ struct Plan {
     preference: Handle,
     algorithm: Algorithm,
     choice: Choice,
-    bias: Option<Arc<CudaSlice<bf16>>>,
+    _bias_owner: Option<Arc<CudaSlice<bf16>>>,
+    bias_binding: Option<u64>,
 }
 // Published descriptors are immutable; mutation requires exclusive Arc ownership.
 unsafe impl Send for Plan {}
@@ -248,7 +250,7 @@ impl Drop for Handles {
     }
 }
 
-type Binding = (LinearShape, Option<u64>);
+type Binding = (LinearShape, Option<u64>, LinearBiasMode);
 
 pub struct Blas {
     stream: Arc<CudaStream>,
@@ -256,9 +258,9 @@ pub struct Blas {
     identity: Identity,
     workspace: CudaSlice<u8>,
     skinny: Option<CudaFunction>,
+    bias_add: Option<CudaFunction>,
     fp8: Option<crate::backend::gpu::linear::Fp8Ops>,
     invariant_rows: usize,
-    // Every plan accumulates in FP32 and adds bias before the BF16 output rounding.
     plans: RefCell<BTreeMap<Binding, Arc<Plan>>>,
 }
 impl Blas {
@@ -299,6 +301,7 @@ impl Blas {
             identity,
             workspace,
             skinny,
+            bias_add: None,
             fp8: None,
             invariant_rows: 0,
             plans: RefCell::new(BTreeMap::new()),
@@ -359,6 +362,28 @@ impl Blas {
         bias: Option<Arc<CudaSlice<bf16>>>,
         frozen: Option<&Choice>,
     ) -> Result<Choice> {
+        if let Some(bias) = &bias {
+            bias.check_stream(&self.stream)?;
+            ensure!(bias.len() == shape.output, "HIP BF16 bias width mismatch");
+        }
+        let pointer = bias.as_ref().map(|b| b.device_ptr(&self.stream).0);
+        self.prepare_binding(
+            shape,
+            pointer,
+            bias,
+            LinearBiasMode::BeforeOutputRound,
+            frozen,
+        )
+    }
+
+    fn prepare_binding(
+        &self,
+        shape: LinearShape,
+        bias: Option<u64>,
+        owner: Option<Arc<CudaSlice<bf16>>>,
+        rounding: LinearBiasMode,
+        frozen: Option<&Choice>,
+    ) -> Result<Choice> {
         self.stream.require_eager("library plan preparation")?;
         self.stream.context().bind_to_thread()?;
         ensure!(
@@ -370,13 +395,6 @@ impl Blas {
                     .all(|&n| n <= i32::MAX as usize),
             "HIP linear dimensions exceed i32: {shape:?}"
         );
-        if let Some(bias) = &bias {
-            bias.check_stream(&self.stream)?;
-            ensure!(
-                shape.rows > 1 && bias.len() == shape.output,
-                "HIP BF16 bias requires multirow output-width vector"
-            );
-        }
         if let Some(frozen) = frozen {
             ensure!(
                 frozen.identity == self.identity
@@ -386,7 +404,7 @@ impl Blas {
             );
             self.validate_choice(frozen)?;
         }
-        let key = (shape, bias.as_ref().map(|b| b.device_ptr(&self.stream).0));
+        let key = (shape, bias, rounding);
         if let Some(plan) = self.plans.borrow().get(&key) {
             if let Some(frozen) = frozen {
                 ensure!(
@@ -413,9 +431,10 @@ impl Blas {
                 implementation: frozen.map_or(Implementation::Library, |c| c.implementation),
                 setup_median_ms: frozen.and_then(|c| c.setup_median_ms),
             },
-            bias,
+            _bias_owner: owner,
+            bias_binding: bias.filter(|_| rounding == LinearBiasMode::BeforeOutputRound),
         };
-        if shape.rows > 1 {
+        if shape.rows > 1 || bias.is_some() {
             self.prepare_lt(&mut plan, frozen)?;
         }
         if let Some(frozen) = frozen {
@@ -438,9 +457,9 @@ impl Blas {
             )?;
             let transpose = 112i32;
             desc_attribute(plan.desc, 0, &transpose)?;
-            if let Some(bias) = &plan.bias {
+            if let Some(bias) = plan.bias_binding {
                 desc_attribute(plan.desc, 2, &4u32)?;
-                desc_attribute(plan.desc, 3, &bias.device_ptr(&self.stream).0)?;
+                desc_attribute(plan.desc, 3, &bias)?;
                 desc_attribute(plan.desc, 4, &14i32)?;
             }
             check(
@@ -573,14 +592,18 @@ impl Blas {
             bias.check_stream(&self.stream)?;
         }
         let binding = LinearShape {
-            rows: if (1..=self.invariant_rows).contains(&shape.rows) {
+            rows: if bias.is_none() && (1..=self.invariant_rows).contains(&shape.rows) {
                 1
             } else {
                 shape.rows
             },
             ..shape
         };
-        let key = (binding, bias.map(|b| b.device_ptr(&self.stream).0));
+        let key = (
+            binding,
+            bias.map(|b| b.device_ptr(&self.stream).0),
+            LinearBiasMode::BeforeOutputRound,
+        );
         let plans = self.plans.borrow();
         let plan = plans
             .get(&key)
@@ -617,7 +640,7 @@ impl Blas {
     }
 
     fn library_raw(&self, plan: &Arc<Plan>, shape: LinearShape, pointers: [u64; 3]) -> Result<()> {
-        if (2..=self.invariant_rows).contains(&shape.rows) {
+        if !plan.choice.bias && (2..=self.invariant_rows).contains(&shape.rows) {
             for row in 0..shape.rows {
                 self.library_raw(
                     plan,
@@ -636,7 +659,7 @@ impl Blas {
         let [a, b, c] = pointers;
         let (alpha, beta) = (1f32, 0f32);
         unsafe {
-            if shape.rows == 1 {
+            if shape.rows == 1 && !plan.choice.bias {
                 self.bf16_gemm(
                     shape,
                     [a, b, c],
@@ -873,6 +896,95 @@ impl Blas {
         Ok(())
     }
 
+    pub(crate) fn prepare_request_fixed(&self, rows: u32, output: u32, input: u32) -> Result<()> {
+        self.prepare_fixed(rows, output, input)
+    }
+
+    pub(crate) fn prepare_biased(
+        &mut self,
+        rows: u32,
+        output: u32,
+        input: u32,
+        bias: crate::backend::gpu::contracts::Tensor<bf16, 1>,
+        mode: LinearBiasMode,
+    ) -> Result<()> {
+        bias.validate()?;
+        ensure!(
+            bias.shape == [output] && bias.stride == [1],
+            "linear bias shape mismatch"
+        );
+        self.prepare_binding(
+            LinearShape {
+                rows: rows as usize,
+                output: output as usize,
+                input: input as usize,
+            },
+            Some(bias.ptr),
+            None,
+            mode,
+            None,
+        )?;
+        if mode == LinearBiasMode::AfterOutputRound && self.bias_add.is_none() {
+            self.bias_add = Some(
+                crate::backend::gpu::cubin::module(self.stream.context(), "q38_common")?
+                    .load_function("q38_bias_add")?,
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn linear_biased(
+        &self,
+        weight: crate::backend::gpu::contracts::Tensor<bf16, 2>,
+        bias: crate::backend::gpu::contracts::Tensor<bf16, 1>,
+        input: crate::backend::gpu::contracts::Tensor<bf16, 2>,
+        output: &mut crate::backend::gpu::contracts::TensorMut<bf16, 2>,
+        mode: LinearBiasMode,
+    ) -> Result<()> {
+        use crate::backend::gpu::linear;
+        weight.validate()?;
+        bias.validate()?;
+        linear::validate_call(weight.shape, input, &output.0)?;
+        ensure!(
+            weight.stride == [u64::from(weight.shape[1]), 1]
+                && bias.shape == [weight.shape[0]]
+                && bias.stride == [1],
+            "biased linear layout mismatch"
+        );
+        linear::disjoint(&weight, &output.0)?;
+        linear::disjoint(&bias, &output.0)?;
+        let shape = LinearShape {
+            rows: input.shape[0] as usize,
+            output: weight.shape[0] as usize,
+            input: weight.shape[1] as usize,
+        };
+        let plans = self.plans.borrow();
+        let plan = plans
+            .get(&(shape, Some(bias.ptr), mode))
+            .context("HIP biased linear shape/binding/rounding not prepared")?;
+        self.library_raw(plan, shape, [weight.ptr, input.ptr, output.0.ptr])?;
+        if mode == LinearBiasMode::AfterOutputRound {
+            let add = self
+                .bias_add
+                .as_ref()
+                .context("HIP bias add kernel not prepared")?;
+            let count = u64::from(output.0.shape[0]) * u64::from(output.0.shape[1]);
+            unsafe {
+                self.stream
+                    .launch_builder(add)
+                    .arg(&output.0.ptr)
+                    .arg(&bias.ptr)
+                    .arg(&count)
+                    .arg(&output.0.shape[1])
+                    .launch(crate::backend::gpu::ops::grid(
+                        count.div_ceil(256).min(65535) as usize,
+                        256,
+                    ))?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn prepare_skinny(&self, shape: LinearShape) -> Result<()> {
         self.stream
             .require_eager("invariant WMMA plan preparation")?;
@@ -937,7 +1049,7 @@ impl Blas {
             ..shape
         };
         let plan = plans
-            .get(&(binding, None))
+            .get(&(binding, None, LinearBiasMode::BeforeOutputRound))
             .context("HIP fixed linear shape not prepared")?;
         if plan.choice.implementation == Implementation::Wmma {
             return self.wmma_raw(shape, shape.input, [w.ptr, x.ptr, y.0.ptr, 0]);
@@ -1013,7 +1125,7 @@ impl Blas {
         self.validate_choice(&choice)?;
         let mut plans = self.plans.borrow_mut();
         let plan = plans
-            .get_mut(&(shape, None))
+            .get_mut(&(shape, None, LinearBiasMode::BeforeOutputRound))
             .context("HIP calibrated plan missing")?;
         Arc::get_mut(plan)
             .context("HIP captured plan cannot be recalibrated")?
@@ -1079,7 +1191,9 @@ impl Blas {
             input,
         };
         ensure!(
-            self.plans.borrow().contains_key(&(shape, None)),
+            self.plans
+                .borrow()
+                .contains_key(&(shape, None, LinearBiasMode::BeforeOutputRound)),
             "HIP linear shape is outside the frozen setup closure: {shape:?}"
         );
         Ok(())
