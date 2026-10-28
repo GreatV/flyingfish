@@ -1608,10 +1608,13 @@ impl Engine {
         let reserve_mtp = false;
         #[cfg(feature = "rocm")]
         ensure!(
-            model_spec.architecture == crate::model_spec::Architecture::MiniCpmV47
-                && !settings.prefix_cache
+            matches!(
+                model_spec.architecture,
+                crate::model_spec::Architecture::MiniCpmV47
+                    | crate::model_spec::Architecture::Qwen35Text
+            ) && !settings.prefix_cache
                 && settings.kv_format == crate::kv::KvFormat::Bf16,
-            "HIP hybrid setup requires MiniCPM-V-4.7 text with BF16 KV and no persistent prefix cache"
+            "HIP hybrid setup requires MiniCPM-V-4.7 or Qwen3.8 with BF16 KV and no persistent prefix cache"
         );
         ensure!(
             model_spec.moe.is_none() || !reserve_mtp,

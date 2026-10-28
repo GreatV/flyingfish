@@ -5593,7 +5593,11 @@ impl Engine {
         let started = Instant::now();
         let write = mode.writes();
         let model_spec = crate::model_spec::ModelSpec::read(dir)?;
-        if model_spec.architecture == crate::model_spec::Architecture::MiniCpmV47 {
+        if matches!(
+            model_spec.architecture,
+            crate::model_spec::Architecture::MiniCpmV47
+                | crate::model_spec::Architecture::Qwen35Text
+        ) {
             return Self::load_qwen(
                 dir,
                 ordinal,

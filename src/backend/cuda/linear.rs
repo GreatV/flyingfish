@@ -30,6 +30,8 @@ pub(crate) struct Fp8Ops {
     #[cfg(feature = "rocm")]
     channel: [CudaFunction; 2],
     #[cfg(feature = "rocm")]
+    block: [CudaFunction; 2],
+    #[cfg(feature = "rocm")]
     context: Arc<CudaContext>,
     fake_quant: CudaFunction,
 }
@@ -83,40 +85,41 @@ impl Fp8Ops {
             module.load_function("fp8_channel_bf16_simt")?,
             module.load_function("fp8_channel_bf16_wmma")?,
         ];
-        for function in &channel {
+        let block = [
+            module.load_function("fp8_block_bf16_simt")?,
+            module.load_function("fp8_block_bf16_wmma")?,
+        ];
+        for function in channel.iter().chain(&block) {
             ensure!(
                 function.max_threads_per_block()? >= 128
                     && function.occupancy_max_active_blocks_per_multiprocessor(128, 0, None)? > 0,
-                "HIP per-channel FP8 requires a resident 128-thread block"
+                "HIP native FP8 requires a resident 128-thread block"
             );
         }
         Ok(Self {
             channel,
+            block,
             context: ctx.clone(),
             fake_quant: module.load_function("e4m3_fake_quant_bf16")?,
         })
     }
 
     #[cfg(feature = "rocm")]
-    pub fn bind_channel(
+    pub fn bind_native(
         &self,
         weight: LinearWeightRef,
         x: Tensor<bf16, 2>,
         y: &TensorMut<bf16, 2>,
         invariant: bool,
-    ) -> Result<ChannelProjection> {
+    ) -> Result<Fp8Projection> {
         let LinearWeightRef::Fp8 {
             codes,
             scale,
             layout,
         } = weight
         else {
-            anyhow::bail!("HIP native per-channel projection requires FP8 weight");
+            anyhow::bail!("HIP native projection requires FP8 weight");
         };
-        ensure!(
-            layout == Fp8ScaleLayout::PerChannel,
-            "HIP native projection requires per-channel scales"
-        );
         Self::check(&codes, &scale, layout)?;
         validate_call(codes.shape, x, &y.0)?;
         disjoint(&codes, &y.0)?;
@@ -137,8 +140,13 @@ impl Fp8Ops {
             grid.1 <= self.context.properties.max_grid_y as u32,
             "HIP per-channel launch exceeds device grid limits"
         );
-        Ok(ChannelProjection {
-            function: self.channel[usize::from(tiled)].clone(),
+        Ok(Fp8Projection {
+            function: if layout == Fp8ScaleLayout::PerChannel {
+                &self.channel
+            } else {
+                &self.block
+            }[usize::from(tiled)]
+            .clone(),
             context: self.context.clone(),
             pointers: [codes.ptr, scale.ptr, x.ptr, y.0.ptr],
             shape: [rows as i32, output as i32, inner as i32],
@@ -276,7 +284,7 @@ impl Fp8Ops {
     }
 }
 #[cfg(feature = "rocm")]
-pub(crate) struct ChannelProjection {
+pub(crate) struct Fp8Projection {
     function: CudaFunction,
     context: Arc<CudaContext>,
     pointers: [u64; 4],
@@ -284,7 +292,7 @@ pub(crate) struct ChannelProjection {
     launch: crate::backend::gpu::LaunchConfig,
 }
 #[cfg(feature = "rocm")]
-impl ChannelProjection {
+impl Fp8Projection {
     pub fn run(&self, stream: &Arc<CudaStream>) -> Result<()> {
         ensure!(
             Arc::ptr_eq(&self.context, stream.context()),
@@ -410,7 +418,7 @@ struct BoundProjection {
     #[cfg(feature = "cuda")]
     prefill: Tensor<bf16, 2>,
     #[cfg(feature = "rocm")]
-    calls: std::cell::RefCell<std::collections::BTreeMap<(u32, u64, u64), ChannelProjection>>,
+    calls: std::cell::RefCell<std::collections::BTreeMap<(u32, u64, u64), Fp8Projection>>,
     invariant_rows: usize,
 }
 /// Setup-bound views for a layer. Engine retains catalog/arena storage; run does
@@ -536,7 +544,7 @@ impl LayerLinearPlan {
         #[cfg(feature = "rocm")]
         ensure!(
             arena.is_none(),
-            "HIP native channel layers do not use a dequantization arena"
+            "HIP native FP8 layers do not use a dequantization arena"
         );
         let prefix = &plan.prefix;
         let mut projections = std::collections::BTreeMap::new();
@@ -567,18 +575,6 @@ impl LayerLinearPlan {
                     w
                 }
             };
-            #[cfg(feature = "rocm")]
-            ensure!(
-                matches!(
-                    resident,
-                    LinearWeightRef::Bf16(_)
-                        | LinearWeightRef::Fp8 {
-                            layout: Fp8ScaleLayout::PerChannel,
-                            ..
-                        }
-                ),
-                "HIP layer projection requires BF16 or per-channel FP8: {name}"
-            );
             let role = &name[prefix.len()..];
             let invariant_rows = if matches!(
                 role,
@@ -653,7 +649,7 @@ impl LayerLinearPlan {
             validate_call(weight.shape, x, &y.0)?;
             return disjoint(&weight, &y.0);
         }
-        let call = ops.bind_channel(projection.resident, x, y, invariant)?;
+        let call = ops.bind_native(projection.resident, x, y, invariant)?;
         let key = (x.shape[0], x.ptr, y.0.ptr);
         let mut calls = projection.calls.borrow_mut();
         ensure!(

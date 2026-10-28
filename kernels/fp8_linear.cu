@@ -1,6 +1,6 @@
 // Row-major E4M3 codes; BF16 block-128 or per-output-channel scales.
 // CUDA M1..16 rounds weights in registers; larger M materializes BF16 weights.
-// HIP channel projections decode BF16-rounded weights in SIMT registers or WMMA tiles.
+// HIP projections decode BF16-rounded weights in SIMT registers or WMMA tiles.
 // Format: __nv_fp8_e4m3 (CUDA Math API).
 #include "gpu_compat.cuh"
 #if !defined(__HIP__)
@@ -290,19 +290,21 @@ __device__ void fp8_small_hip(
         if (lane == 0) y[(size_t)m * n + row] = __float2bfloat16(value);
     }
 }
-extern "C" __global__ void fp8_channel_bf16_simt(
+template<bool PER_CHANNEL>
+__device__ void fp8_simt_hip(
         const uint8_t* w, const __nv_bfloat16* scales, const __nv_bfloat16* x,
         __nv_bfloat16* y, int m, int n, int k) {
     if (m <= 0 || n <= 0 || k <= 0 || blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 ||
         gridDim.x != (uint64_t(n)+3)/4 || gridDim.y != uint64_t(m) || gridDim.z != 1 ||
         !aligned16(w) || !aligned16(scales) || !aligned16(x) || !aligned16(y)) __trap();
-    fp8_small_hip<1,true>(w,scales,x+(size_t)blockIdx.y*k,y+(size_t)blockIdx.y*n,n,k);
+    fp8_small_hip<1,PER_CHANNEL>(w,scales,x+(size_t)blockIdx.y*k,y+(size_t)blockIdx.y*n,n,k);
 }
 
 using ChannelBf16 = short __attribute__((ext_vector_type(16)));
 using ChannelAcc = float __attribute__((ext_vector_type(8)));
 
-extern "C" __global__ void fp8_channel_bf16_wmma(
+template<bool PER_CHANNEL>
+__device__ void fp8_wmma_hip(
         const uint8_t* w, const __nv_bfloat16* scales, const __nv_bfloat16* x,
         __nv_bfloat16* y, int m, int n, int k) {
     if (m <= 0 || n <= 0 || k <= 0 || blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 ||
@@ -311,12 +313,13 @@ extern "C" __global__ void fp8_channel_bf16_wmma(
     __shared__ __nv_bfloat16 weight[64][32], input[16][32];
     const int tid = threadIdx.x, wave = tid / 32, lane = tid % 32;
     const int n0 = blockIdx.x * 64, m0 = blockIdx.y * 16;
-    ChannelAcc acc = {};
+    ChannelAcc acc = {}, partial = {};
     for (int k0 = 0; k0 < k; k0 += 32) {
         for (int cell = tid; cell < 64 * 32; cell += 128) {
             const int row = n0 + cell / 32, col = k0 + cell % 32;
+            const size_t scale = PER_CHANNEL ? row : (size_t)(row/128)*((k+127)/128)+col/128;
             weight[cell / 32][cell % 32] = row < n && col < k
-                ? fp8_channel_tile_weight(w[(size_t)row*k+col], scales[row])
+                ? fp8_channel_tile_weight(w[(size_t)row*k+col], scales[scale])
                 : __float2bfloat16(0.0f);
         }
         for (int cell = tid; cell < 16 * 32; cell += 128) {
@@ -333,19 +336,47 @@ extern "C" __global__ void fp8_channel_bf16_wmma(
                 a[j] = reinterpret_cast<const unsigned short*>(weight[wave*16+lane%16])[part*16+j];
                 b[j] = reinterpret_cast<const unsigned short*>(input[lane%16])[part*16+j];
             }
-            acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a,b,acc);
+            if constexpr (PER_CHANNEL)
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a,b,acc);
+            else
+                partial = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a,b,partial);
         }
         __syncthreads();
+        if constexpr (!PER_CHANNEL) {
+            if ((k0+32)%128 == 0 || k0+32 >= k) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int col = n0 + wave*16 + 2*j + lane/16;
+                    const float unscale = col < n
+                        ? fp8_channel_tile_unscale(scales[(size_t)(col/128)*((k+127)/128)+k0/128])
+                        : 1.0f;
+                    acc[j] += partial[j] * unscale;
+                    partial[j] = 0.0f;
+                }
+            }
+        }
     }
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
         const int row = m0 + lane % 16, col = n0 + wave * 16 + 2*j + lane/16;
         if (row < m && col < n) {
-            const float unscale = fp8_channel_tile_unscale(scales[col]);
+            const float unscale = PER_CHANNEL ? fp8_channel_tile_unscale(scales[col]) : 1.0f;
             y[(size_t)row*n+col] = __float2bfloat16(acc[j] * unscale);
         }
     }
 }
+
+#define HIP_FP8_PROJECTION(NAME, IMPL, PER_CHANNEL) \
+extern "C" __global__ void NAME( \
+        const uint8_t* w, const __nv_bfloat16* scales, const __nv_bfloat16* x, \
+        __nv_bfloat16* y, int m, int n, int k) { \
+    IMPL<PER_CHANNEL>(w,scales,x,y,m,n,k); \
+}
+HIP_FP8_PROJECTION(fp8_channel_bf16_simt, fp8_simt_hip, true)
+HIP_FP8_PROJECTION(fp8_channel_bf16_wmma, fp8_wmma_hip, true)
+HIP_FP8_PROJECTION(fp8_block_bf16_simt, fp8_simt_hip, false)
+HIP_FP8_PROJECTION(fp8_block_bf16_wmma, fp8_wmma_hip, false)
+#undef HIP_FP8_PROJECTION
 
 __device__ __forceinline__ uint8_t channel_e4m3_finite(float value) {
     const uint32_t bits = __float_as_uint(value);
