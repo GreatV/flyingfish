@@ -8,7 +8,6 @@ __device__ __forceinline__ bool flat_launch() {
            gridDim.y == 1 && gridDim.z == 1;
 }
 
-#if !defined(__HIP__)
 extern "C" __global__ void q38_vision_cast_patches(
     const float* input, __nv_bfloat16* output, uint64_t count) {
     if (!flat_launch() || !input || !output || !count || count % 1536) { __trap(); return; }
@@ -105,7 +104,6 @@ extern "C" __global__ void q38_vision_residual(
          i+=uint64_t(gridDim.x)*256) hidden[i]=__hadd(hidden[i],delta[i]);
 }
 
-#endif
 
 // Both buffers have stable addresses. Only SequenceMeta advances in decode graphs.
 extern "C" __global__ void q38_text_positions(

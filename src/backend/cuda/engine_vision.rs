@@ -3636,8 +3636,8 @@ mod tests {
                             LinearBiasMode::AfterOutputRound => 1.0,
                             LinearBiasMode::BeforeOutputRound => 1.0 + 2.0 * half_ulp.to_f32(),
                         };
-                        let wrong = s
-                            .clone_dtoh(&y)?
+                        let actual = s.clone_dtoh(&y)?;
+                        let wrong = actual
                             .iter()
                             .enumerate()
                             .filter(|(index, value)| {
@@ -3655,8 +3655,10 @@ mod tests {
                         );
                         patch_defects += usize::from(wrong != 0);
                         println!(
-                            "{} vision_patch_bias_rounding projection={prefix} stored_shape={stored_shape:?} rows={rows} width={width} input={input} mode={mode:?} bit_mismatches={wrong}",
-                            if wrong == 0 { "PASS" } else { "DEFECT" }
+                            "{} vision_patch_bias_rounding projection={prefix} stored_shape={stored_shape:?} rows={rows} width={width} input={input} mode={mode:?} bit_mismatches={wrong} positive_bits={} negative_bits={}",
+                            if wrong == 0 { "PASS" } else { "DEFECT" },
+                            actual[0].to_bits(),
+                            actual[width as usize / 2].to_bits()
                         );
                     }
                     let expected: Vec<_> = (0..rows as usize * width as usize)
