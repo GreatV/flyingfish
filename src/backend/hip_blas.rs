@@ -196,8 +196,9 @@ struct Plan {
     choice: Choice,
     _bias_owner: Option<Arc<CudaSlice<bf16>>>,
     bias_binding: Option<u64>,
+    output_f32: Option<std::sync::Mutex<CudaSlice<f32>>>,
 }
-// Published descriptors are immutable; mutation requires exclusive Arc ownership.
+// Published descriptors are immutable; output scratch is locked on the bound stream.
 unsafe impl Send for Plan {}
 unsafe impl Sync for Plan {}
 impl Drop for Plan {
@@ -433,6 +434,18 @@ impl Blas {
             },
             _bias_owner: owner,
             bias_binding: bias.filter(|_| rounding == LinearBiasMode::BeforeOutputRound),
+            output_f32: if bias.is_some() && rounding == LinearBiasMode::AfterOutputRound {
+                Some(std::sync::Mutex::new(
+                    self.stream.alloc_zeros(
+                        shape
+                            .rows
+                            .checked_mul(shape.output)
+                            .context("HIP rounded output extent overflow")?,
+                    )?,
+                ))
+            } else {
+                None
+            },
         };
         if shape.rows > 1 || bias.is_some() {
             self.prepare_lt(&mut plan, frozen)?;
@@ -485,7 +498,7 @@ impl Blas {
             check(
                 hipblasLtMatrixLayoutCreate(
                     &mut plan.c,
-                    14,
+                    if plan.output_f32.is_some() { 0 } else { 14 },
                     s.output as u64,
                     s.rows as u64,
                     s.output as i64,
@@ -962,8 +975,15 @@ impl Blas {
         let plan = plans
             .get(&(shape, Some(bias.ptr), mode))
             .context("HIP biased linear shape/binding/rounding not prepared")?;
-        self.library_raw(plan, shape, [weight.ptr, input.ptr, output.0.ptr])?;
         if mode == LinearBiasMode::AfterOutputRound {
+            let mut storage = plan
+                .output_f32
+                .as_ref()
+                .context("HIP rounded projection buffer not prepared")?
+                .lock()
+                .map_err(|_| anyhow::anyhow!("HIP rounded projection buffer poisoned"))?;
+            let (unrounded, _write) = storage.device_ptr_mut(&self.stream);
+            self.library_raw(plan, shape, [weight.ptr, input.ptr, unrounded])?;
             let add = self
                 .bias_add
                 .as_ref()
@@ -972,6 +992,7 @@ impl Blas {
             unsafe {
                 self.stream
                     .launch_builder(add)
+                    .arg(&unrounded)
                     .arg(&output.0.ptr)
                     .arg(&bias.ptr)
                     .arg(&count)
@@ -981,6 +1002,8 @@ impl Blas {
                         256,
                     ))?;
             }
+        } else {
+            self.library_raw(plan, shape, [weight.ptr, input.ptr, output.0.ptr])?;
         }
         Ok(())
     }

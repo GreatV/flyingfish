@@ -428,7 +428,7 @@ impl VisionIo {
         let input = dense(packed, stream, [rows, patch.shape[1]])?;
         let bias = dense(&patch.bias, stream, [width])?;
         disjoint(&bias, &output)?;
-        if bilinear.is_some() {
+        if cfg!(feature = "cuda") && bilinear.is_some() {
             blas.linear_typed(
                 crate::op_contract::ExecutionPhase::Prefill,
                 LinearWeightRef::Bf16(dense(&patch.weight, stream, patch.shape)?),
@@ -447,8 +447,8 @@ impl VisionIo {
                     indices: dense(indices, stream, [4, rows])?,
                     weights: dense(&bilinear.coefficients, stream, [4, rows])?,
                     patches: output,
-                    bias: Some(bias),
-                    trace_patches,
+                    bias: cfg!(feature = "cuda").then_some(bias),
+                    trace_patches: cfg!(feature = "cuda") && trace_patches,
                 },
                 &mut hidden,
                 &mut TensorMut(dense(&bilinear.values, stream, [rows, width])?),
@@ -2168,7 +2168,7 @@ impl VisionRuntime {
             }
         };
         let hidden = geometry.hidden() as usize;
-        if bilinear.is_some() {
+        if cfg!(feature = "cuda") && bilinear.is_some() {
             blas.prepare_request_fixed(row_count, geometry.hidden(), geometry.patch)?;
         } else {
             self.weights.patch.prepare(s, blas, row_count)?;
@@ -3404,7 +3404,10 @@ mod tests {
         let hidden = s.alloc_zeros::<bf16>((rows * width) as usize)?;
         let indices = s.clone_htod(&indices)?;
         let tables = if bilinear {
+            #[cfg(feature = "cuda")]
             blas.prepare_fixed(rows, width, patch.shape[1])?;
+            #[cfg(feature = "rocm")]
+            patch.prepare(s, blas, rows)?;
             Some(BilinearTables {
                 coefficients: s.clone_htod(&coefficients)?,
                 values: s.alloc_zeros((rows * width) as usize)?,
