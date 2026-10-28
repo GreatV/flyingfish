@@ -1585,10 +1585,7 @@ impl Engine {
             "engine state is poisoned; reset/reload is required"
         );
         self.closure.assert_ready()?;
-        #[cfg(feature = "cuda")]
         self.check_graphs()?;
-        #[cfg(feature = "rocm")]
-        ensure!(self.graph.is_some(), "HIP decode graph is missing");
         Ok(())
     }
     pub fn config(&self) -> &Config {
