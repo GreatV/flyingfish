@@ -183,12 +183,14 @@ fn hybrid_model_identity_gpu() -> Result<()> {
         "MiniCPM-V-4.7 geometry required"
     );
     let mut cells = 0;
+    let mut defects = 0;
     for rows in [33, 1024, 4096] {
         let ids: Vec<_> = (0..rows)
             .map(|i| ((i * 269 + 23) % 248144) as u32)
             .collect();
         let mut first = Vec::new();
         for (repeat, graph) in [false, true, false].into_iter().enumerate() {
+            let mut cell_defects = 0;
             model.reset()?;
             let mut token = reference_prefill(&mut model, &ids)?;
             let mut file = std::fs::File::create_new(
@@ -214,19 +216,13 @@ fn hybrid_model_identity_gpu() -> Result<()> {
                 );
                 let mut order: Vec<_> = (0..logits.len()).collect();
                 order.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]).then(a.cmp(&b)));
-                ensure!(
-                    token as usize == order[0],
-                    "hybrid argmax differs from full logits"
-                );
+                cell_defects += usize::from(token as usize != order[0]);
                 margin = margin.min(logits[order[0]] - logits[order[1]]);
                 let bits: Vec<_> = logits.into_iter().map(f32::to_bits).collect();
                 if repeat == 0 {
                     first.push((token, bits.clone()));
                 } else {
-                    ensure!(
-                        first[step] == (token, bits.clone()),
-                        "hybrid repeat/graph token-logit bit identity rows={rows} step={step}"
-                    );
+                    cell_defects += usize::from(first[step] != (token, bits.clone()));
                 }
                 file.write_all(&token.to_le_bytes())?;
                 for value in bits {
@@ -236,12 +232,127 @@ fn hybrid_model_identity_gpu() -> Result<()> {
             file.flush()?;
             model.check_ready()?;
             cells += 1;
+            defects += cell_defects;
             println!(
-                "HYBRID_MODEL_IDENTITY rows={rows} chunk=129 repeat={repeat} graph={graph} steps=4 min_top_two_margin={margin} bit_identity=true PASS"
+                "HYBRID_MODEL_IDENTITY rows={rows} chunk=129 repeat={repeat} graph={graph} steps=4 min_top_two_margin={margin} defects={cell_defects} result={}",
+                if cell_defects == 0 { "PASS" } else { "DEFECT" }
             );
         }
     }
-    println!("HYBRID_MODEL_IDENTITY cells={cells} defects=0 PASS");
+    println!("HYBRID_MODEL_IDENTITY cells={cells} defects={defects}");
+    ensure!(defects == 0, "hybrid model identity defects={defects}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires FF_DENSE_REFERENCE and captured hybrid-model FF_DENSE_EVIDENCE"]
+fn hybrid_model_reference_outputs() -> Result<()> {
+    let reference = PathBuf::from(std::env::var("FF_DENSE_REFERENCE")?);
+    let output = PathBuf::from(std::env::var("FF_DENSE_EVIDENCE")?);
+    let fixtures: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/minicpm_reference.json"))?;
+    let cases = fixtures["cases"]
+        .as_array()
+        .context("hybrid fixture cases missing")?;
+    let steps = fixtures["steps"]
+        .as_u64()
+        .context("hybrid fixture steps missing")? as usize;
+    let mut cells = 0;
+    let mut defects = 0;
+    for case in cases {
+        let name = case["name"]
+            .as_str()
+            .context("hybrid fixture name missing")?;
+        let rows = case["rows"]
+            .as_u64()
+            .context("hybrid fixture rows missing")?;
+        let limits: ReferenceLimits = serde_json::from_value(case["limits"].clone())
+            .context("hybrid reference limits must be frozen before HIP model execution")?;
+        ensure!(
+            limits.max_normalized.is_finite()
+                && limits.max_normalized >= 0.0
+                && limits.rms_normalized.is_finite()
+                && limits.rms_normalized >= 0.0,
+            "invalid hybrid reference limits"
+        );
+        let bytes =
+            std::fs::read(reference.join(format!("{name}-chunk{rows}-repeat0.safetensors")))?;
+        let tensors = safetensors::SafeTensors::deserialize(&bytes)?;
+        let view = tensors.tensor("logits")?;
+        let vocab = 248144;
+        ensure!(
+            view.dtype() == safetensors::Dtype::F32 && view.shape() == [steps, vocab],
+            "RUNNER_FAIL hybrid reference requires F32[steps,248144]"
+        );
+        let expected: Vec<_> = view
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&x| f32::from_le_bytes(x))
+            .collect();
+        ensure!(
+            expected.iter().all(|v| v.is_finite()),
+            "RUNNER_FAIL nonfinite hybrid reference"
+        );
+        for (repeat, graph) in [false, true, false].into_iter().enumerate() {
+            let actual =
+                std::fs::read(output.join(format!("text{rows}-repeat{repeat}-graph{graph}.bin")))?;
+            let stride = 4 * (vocab + 1);
+            ensure!(
+                actual.len() == steps * stride,
+                "RUNNER_FAIL hybrid capture extent"
+            );
+            let (mut maximum, mut rms) = (0.0f64, 0.0f64);
+            let mut margin_defects = 0;
+            let mut min_margin = f32::INFINITY;
+            for (step, record) in actual.chunks_exact(stride).enumerate() {
+                let token = u32::from_le_bytes(record[..4].try_into()?);
+                let expected = &expected[step * vocab..(step + 1) * vocab];
+                let scale = (expected.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>()
+                    / vocab as f64)
+                    .sqrt();
+                ensure!(
+                    scale.is_finite() && scale > 0.0,
+                    "RUNNER_FAIL hybrid reference RMS"
+                );
+                let (mut max_error, mut sum_error) = (0.0f64, 0.0f64);
+                for (&word, &value) in record[4..].as_chunks::<4>().0.iter().zip(expected) {
+                    let observed = f32::from_le_bytes(word);
+                    ensure!(
+                        observed.is_finite(),
+                        "RUNNER_FAIL hybrid candidate nonfinite"
+                    );
+                    let error = f64::from(observed) - f64::from(value);
+                    max_error = max_error.max(error.abs());
+                    sum_error += error * error;
+                }
+                maximum = maximum.max(max_error / scale);
+                rms = rms.max((sum_error / vocab as f64).sqrt() / scale);
+                let mut order: Vec<_> = (0..vocab).collect();
+                order
+                    .sort_unstable_by(|&a, &b| expected[b].total_cmp(&expected[a]).then(a.cmp(&b)));
+                let margin = expected[order[0]] - expected[order[1]];
+                min_margin = min_margin.min(margin);
+                margin_defects += usize::from(
+                    token as usize != order[0]
+                        && f64::from(margin) > 2.0 * limits.max_normalized * scale,
+                );
+            }
+            let bad = usize::from(maximum > limits.max_normalized || rms > limits.rms_normalized)
+                + margin_defects;
+            defects += bad;
+            cells += 1;
+            println!(
+                "HYBRID_MODEL_REFERENCE name={name} repeat={repeat} graph={graph} max_normalized={maximum:e} rms_normalized={rms:e} max_limit={} rms_limit={} min_margin={min_margin} margin_defects={margin_defects} result={}",
+                limits.max_normalized,
+                limits.rms_normalized,
+                if bad == 0 { "PASS" } else { "DEFECT" }
+            );
+        }
+    }
+    println!("HYBRID_MODEL_REFERENCE_OUTPUTS cells={cells} defects={defects} limits_frozen=true");
+    ensure!(defects == 0, "hybrid model reference defects={defects}");
     Ok(())
 }
 
