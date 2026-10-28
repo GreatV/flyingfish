@@ -197,6 +197,40 @@ pub struct RopeSpec {
     pub pair_stride: u32,
     pub denominator: u32,
 }
+impl RopeSpec {
+    /// `[capacity, head_dim]` rows of `cos[0..head_dim/2] | sin[0..head_dim/2]`; frequencies
+    /// `theta^(-2i/denominator)` for the first `pairs` indices and zero (cos 1, sin 0) for the rest,
+    /// evaluated in F32; element `i` pairs with `i + head_dim/2`.
+    pub fn table(&self, head_dim: u32, capacity: usize) -> Result<Vec<half::bf16>> {
+        let half = head_dim / 2;
+        ensure!(
+            head_dim.is_multiple_of(2) && self.pair_stride == half && self.pairs <= half,
+            "rope spec {self:?} does not fit head_dim {head_dim}"
+        );
+        let inv: Vec<f32> = (0..half)
+            .map(|i| {
+                if i < self.pairs {
+                    1.0 / self.theta.powf((2 * i) as f32 / self.denominator as f32)
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let mut table = Vec::with_capacity(capacity * head_dim as usize);
+        for position in 0..capacity {
+            let position = position as f32;
+            table.extend(
+                inv.iter()
+                    .map(|f| half::bf16::from_f32((position * f).cos())),
+            );
+            table.extend(
+                inv.iter()
+                    .map(|f| half::bf16::from_f32((position * f).sin())),
+            );
+        }
+        Ok(table)
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LayerGeometry {
     pub head_dim: u32,

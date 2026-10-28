@@ -38,6 +38,14 @@ fn fixture(file: &str) -> Result<Fixture> {
         .collect()
 }
 
+fn bf16_ulp(v: f32) -> f32 {
+    if v == 0.0 {
+        0.0
+    } else {
+        2f32.powi(v.abs().log2().floor() as i32 - 7)
+    }
+}
+
 fn ordered(x: bf16) -> i32 {
     let bits = i32::from(x.to_bits());
     if bits & 0x8000 != 0 {
@@ -53,6 +61,7 @@ struct Stats {
     bit_equal: usize,
     beyond_mutant: usize,
     exempt: usize,
+    worst: Option<(usize, f32, f32)>,
 }
 
 impl Stats {
@@ -79,12 +88,16 @@ impl Stats {
             bit_equal: 0,
             beyond_mutant: 0,
             exempt: 0,
+            worst: None,
         };
         for (i, (c, r)) in candidate.iter().zip(reference).enumerate() {
             let ulp = ordered(*c).abs_diff(ordered(*r));
             let within = floor.is_some_and(|f| (c.to_f32() - r.to_f32()).abs() <= f[i]);
             stats.exempt += usize::from(within && ulp > 0);
             if !within {
+                if ulp > stats.max_ulp {
+                    stats.worst = Some((i, c.to_f32(), r.to_f32()));
+                }
                 stats.max_ulp = stats.max_ulp.max(ulp);
                 stats.beyond_mutant += usize::from(ulp > MUTANT_ULP);
             }
@@ -103,9 +116,10 @@ impl Stats {
 
     fn line(&self, name: &str) -> String {
         format!(
-            "{name} elements={} max_ulp={} bit_equal={:.6} exempt_within_floor={} beyond_{}ulp={:.6}",
+            "{name} elements={} max_ulp={} worst={:?} bit_equal={:.6} exempt_within_floor={} beyond_{}ulp={:.6}",
             self.elements,
             self.max_ulp,
+            self.worst,
             self.bit_equal as f64 / self.elements as f64,
             self.exempt,
             MUTANT_ULP,
@@ -473,6 +487,7 @@ fn unrounded_norm_and_branch_boundary_match_the_definition_gpu() -> Result<()> {
                 ),
                 ("layer_end", "w_post_ff", "w_next", true, "out_b", "n_b"),
             ] {
+                let w_norm_host = weight(w_norm)?;
                 let (w_branch, w_norm) = (
                     s.clone_htod(weight(w_branch)?)?,
                     s.clone_htod(weight(w_norm)?)?,
@@ -501,9 +516,37 @@ fn unrounded_norm_and_branch_boundary_match_the_definition_gpu() -> Result<()> {
                     Ok((s.clone_dtoh(&x)?, s.clone_dtoh(&n)?))
                 };
                 let (got_x, got_n) = run(with_scalar)?;
-                for (name, got, reference) in [("x", &got_x, expected_x), ("n", &got_n, expected_n)]
-                {
-                    let stats = Stats::new(got, reference)?;
+                let scale = if with_scalar {
+                    weight("scalar")?[0].to_f32().abs()
+                } else {
+                    1.0
+                };
+                let floor_x: Vec<f32> = xh
+                    .iter()
+                    .map(|v| 2.0 * scale * bf16_ulp(v.to_f32()))
+                    .collect();
+                let floor_n: Vec<f32> = expected_x
+                    .chunks(hidden)
+                    .zip(floor_x.chunks(hidden))
+                    .zip(expected_n.chunks(hidden))
+                    .flat_map(|((row, fx), n_ref)| {
+                        let mean = row.iter().map(|v| v.to_f32() * v.to_f32()).sum::<f32>()
+                            / hidden as f32;
+                        let inv = 1.0 / (mean + 1e-6).sqrt();
+                        row.iter()
+                            .enumerate()
+                            .map(|(i, _)| {
+                                inv * w_norm_host[i].to_f32().abs() * fx[i]
+                                    + bf16_ulp(n_ref[i].to_f32())
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                for (name, got, reference, floor) in [
+                    ("x", &got_x, expected_x, &floor_x),
+                    ("n", &got_n, expected_n, &floor_n),
+                ] {
+                    let stats = Stats::with_floor(got, reference, Some(floor))?;
                     println!(
                         "GEMMA4_BRANCH_NORM {}",
                         stats.line(&format!("{key}.{label}.{name}"))
@@ -545,5 +588,148 @@ fn unrounded_norm_and_branch_boundary_match_the_definition_gpu() -> Result<()> {
     }
     println!("GEMMA4_NORM cases={cases} defects={defects} undetected_mutants={undetected}");
     ensure!(defects == 0 && undetected == 0, "GEMMA4_NORM FAIL");
+    Ok(())
+}
+
+fn rope_positions() -> Vec<u32> {
+    [0u32, 1, 511, 512, 513, 1023, 1024, 131071]
+        .into_iter()
+        .chain((0..56u32).map(|i| (i * 997 + 13) % 131072))
+        .collect()
+}
+
+#[test]
+#[ignore = "requires CUDA and FF_GEMMA4_FIXTURES"]
+fn proportional_and_default_rope_tables_match_the_definition_gpu() -> Result<()> {
+    use crate::model_spec::RopeSpec;
+    const CAPACITY: usize = 131072;
+    let device = Device::new(0)?;
+    let s = &device.stream;
+    let rope = cubin::module(&device.ctx, "rope")?.load_function("rope_table_kv")?;
+    let data = fixture("rope.safetensors")?;
+    let positions = rope_positions();
+    let positions_device =
+        s.clone_htod(&positions.iter().map(|&p| p as i32).collect::<Vec<_>>())?;
+    let dummy = s.alloc_zeros::<bf16>(16)?;
+    let sliding = RopeSpec {
+        theta: 10000.0,
+        pairs: 128,
+        pair_stride: 128,
+        denominator: 256,
+    };
+    let full = RopeSpec {
+        theta: 1000000.0,
+        pairs: 64,
+        pair_stride: 256,
+        denominator: 512,
+    };
+    let (mut cases, mut defects, mut undetected) = (0, 0, 0);
+    for (tag, d, spec) in [("sliding", 256usize, sliding), ("full", 512usize, full)] {
+        let half = d / 2;
+        let table = spec.table(d as u32, CAPACITY)?;
+        for (name, reference) in [("cos", 0usize), ("sin", half)] {
+            let want = tensor(&data, &format!("rope.{tag}.{name}"))?;
+            let got: Vec<bf16> = positions
+                .iter()
+                .flat_map(|&p| {
+                    table[p as usize * d + reference..p as usize * d + reference + half]
+                        .iter()
+                        .copied()
+                })
+                .collect();
+            let want_half: Vec<bf16> = want
+                .chunks(d)
+                .flat_map(|row| row[..half].iter().copied())
+                .collect();
+            let stats = Stats::new(&got, &want_half)?;
+            println!("GEMMA4_ROPE_TABLE {}", stats.line(&format!("{tag}.{name}")));
+            defects += usize::from(!stats.passes());
+        }
+        let table_device = s.clone_htod(&table)?;
+        let run = |table: &cudarc::driver::CudaSlice<bf16>,
+                   x: &[bf16],
+                   heads: usize|
+         -> Result<Vec<bf16>> {
+            let mut x = s.clone_htod(x)?;
+            for row in 0..positions.len() {
+                let mut view = x.slice_mut(row * heads * d..(row + 1) * heads * d);
+                let start = positions_device.slice(row..row + 1);
+                unsafe {
+                    s.launch_builder(&rope)
+                        .arg(&mut view)
+                        .arg(&dummy)
+                        .arg(&dummy)
+                        .arg(table)
+                        .arg(&start)
+                        .arg(&1i32)
+                        .arg(&(heads as i32))
+                        .arg(&0i32)
+                        .arg(&(d as i32))
+                        .arg(&(CAPACITY as i32))
+                        .arg(&((heads * d) as i32))
+                        .launch(flat(heads * half))?;
+                }
+            }
+            Ok(s.clone_dtoh(&x)?)
+        };
+        let mutants: Vec<(&str, cudarc::driver::CudaSlice<bf16>)> = if tag == "full" {
+            [
+                ("rotate_all_512", RopeSpec { pairs: 256, ..spec }),
+                (
+                    "denominator_256",
+                    RopeSpec {
+                        denominator: 256,
+                        ..spec
+                    },
+                ),
+                (
+                    "denominator_128",
+                    RopeSpec {
+                        denominator: 128,
+                        ..spec
+                    },
+                ),
+            ]
+            .into_iter()
+            .map(|(name, mutant)| Ok((name, s.clone_htod(&mutant.table(d as u32, CAPACITY)?)?)))
+            .collect::<Result<_>>()?
+        } else {
+            Vec::new()
+        };
+        for heads in [1usize, 2, 8] {
+            let key = format!("rope.{tag}.h{heads}");
+            let x = tensor(&data, &format!("{key}.x"))?;
+            let reference = tensor(&data, &format!("{key}.out"))?;
+            let stats = Stats::new(&run(&table_device, x, heads)?, reference)?;
+            println!("GEMMA4_ROPE {}", stats.line(&key));
+            defects += usize::from(!stats.passes());
+            for (name, mutant) in &mutants {
+                let stats = Stats::new(&run(mutant, x, heads)?, reference)?;
+                println!("GEMMA4_ROPE_MUTANT {name} {}", stats.line(&key));
+                undetected += usize::from(!(stats.is_detected_mutant() && !stats.passes()));
+            }
+            if tag == "full" {
+                let mut stride = x.to_vec();
+                for (r, &p) in positions.iter().enumerate() {
+                    for h in 0..heads {
+                        let base = (r * heads + h) * d;
+                        for i in 0..64usize {
+                            let row = p as usize * d;
+                            let (c, sn) = (table[row + i].to_f32(), table[row + half + i].to_f32());
+                            let (a, b) = (x[base + i].to_f32(), x[base + 64 + i].to_f32());
+                            stride[base + i] = bf16::from_f32(a * c - b * sn);
+                            stride[base + 64 + i] = bf16::from_f32(b * c + a * sn);
+                        }
+                    }
+                }
+                let stats = Stats::new(&stride, reference)?;
+                println!("GEMMA4_ROPE_MUTANT pair_stride_64 {}", stats.line(&key));
+                undetected += usize::from(!(stats.is_detected_mutant() && !stats.passes()));
+            }
+            cases += 1;
+        }
+    }
+    println!("GEMMA4_ROPE cases={cases} defects={defects} undetected_mutants={undetected}");
+    ensure!(defects == 0 && undetected == 0, "GEMMA4_ROPE FAIL");
     Ok(())
 }
