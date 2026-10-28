@@ -621,6 +621,7 @@ impl Capture {
             exec: 0,
             stream: self.stream.clone(),
             _resources: resources,
+            exclusive: PhantomData,
         };
         check(status, "hipStreamEndCapture")?;
         ensure!(graph.graph != 0, "HIP capture returned an empty graph");
@@ -660,6 +661,7 @@ pub struct Graph {
     exec: usize,
     stream: Arc<Stream>,
     _resources: Vec<Arc<dyn Any + Send + Sync>>,
+    exclusive: PhantomData<std::cell::Cell<()>>,
 }
 impl Graph {
     pub fn launch(&self) -> Result<()> {
