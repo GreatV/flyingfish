@@ -1724,6 +1724,24 @@ LOOP:
         Ok(())
     }
 
+    fn ensure_no_other_compute_app() -> Result<()> {
+        let output = std::process::Command::new("nvidia-smi")
+            .args(["--query-compute-apps=pid", "--format=csv,noheader"])
+            .output()?;
+        ensure!(output.status.success(), "RUNNER_FAIL nvidia-smi");
+        let own = std::process::id();
+        let others: Vec<u32> = std::str::from_utf8(&output.stdout)?
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .filter(|&pid| pid != own)
+            .collect();
+        ensure!(
+            others.is_empty(),
+            "RUNNER_FAIL co-tenant compute app: {others:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires CUDA and a Gemma 4 E2B/E4B directory in FF_MODEL"]
     fn gemma4_catalog_uploads_exactly_the_text_set_gpu() -> Result<()> {
@@ -1737,6 +1755,7 @@ LOOP:
             2560 => (665, 14_926_026_836),
             hidden => anyhow::bail!("unexpected Gemma 4 hidden size {hidden}"),
         };
+        ensure_no_other_compute_app()?;
         let device = crate::backend::cuda::Device::new(0)?;
         let (free_before, _) = device.ctx.mem_get_info()?;
         let catalog = WeightCatalog::load(&dir, &spec, &device)?;
@@ -1779,6 +1798,25 @@ LOOP:
             embed.len(),
             per_layer.len()
         );
+        let (bf16_bytes, native_bytes) = catalog.tensors.values().fold(
+            (0usize, 0usize),
+            |(bf16_bytes, native_bytes), tensor| match tensor {
+                StoredTensor::Bf16(values) => (bf16_bytes + values.len() * 2, native_bytes),
+                StoredTensor::Bytes(values) => (bf16_bytes, native_bytes + values.len()),
+            },
+        );
+        ensure!(
+            bf16_bytes + native_bytes == resident && catalog.bytes == resident,
+            "allocator ledger mismatch: bf16={bf16_bytes} native={native_bytes} expected={resident}"
+        );
+        println!(
+            "GEMMA4_ALLOCATOR PASS tensors={} bf16_bytes={} native_bytes={} total={}",
+            loaded.len(),
+            bf16_bytes,
+            native_bytes,
+            bf16_bytes + native_bytes
+        );
+        ensure_no_other_compute_app()?;
         let used = free_before
             .checked_sub(free_after)
             .context("device free memory grew during the load")?;
