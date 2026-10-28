@@ -630,20 +630,31 @@ fn fp8_projection_gate(
     layout: crate::fp8::Fp8ScaleLayout,
 ) -> Result<()> {
     let module = cubin::module(ctx, "fp8_linear")?;
-    let mut shapes = vec![(263usize, 257usize), (512, 2048), (2048, 512)];
+    let mut shapes = vec![
+        (263usize, 257usize, false),
+        (512, 2048, false),
+        (2048, 512, false),
+        (263, 257, true),
+    ];
     let kind = if layout == crate::fp8::Fp8ScaleLayout::PerChannel {
         "channel"
     } else {
-        shapes.push((17408, 5120));
+        shapes.push((17408, 5120, false));
         "block"
     };
-    for (n, k) in shapes {
+    for (n, k, tiny) in shapes {
         let codes: Vec<u8> = (0..n * k)
             .map(|i| ((i * 17 % 257) % 127) as u8 | (u8::from(i * 29 % 263 > 131) << 7))
             .collect();
         let count = layout.scale_shape(n as u32, k as u32).iter().product();
         let scales: Vec<_> = (0..count)
-            .map(|i| bf16::from_f32((1 + i * 31 % 263) as f32 / 65536.0))
+            .map(|i| {
+                if tiny {
+                    bf16::from_bits((1 + i * 31 % 263) as u16)
+                } else {
+                    bf16::from_f32((1 + i * 31 % 263) as f32 / 65536.0)
+                }
+            })
             .collect();
         let max_rows = if n > 2048 { 3 } else { 33 };
         let input = pattern(max_rows * k, 19);
@@ -691,7 +702,7 @@ fn fp8_projection_gate(
                 let graph = capture.finish()?;
                 graph.launch()?;
                 let replay = stream.clone_dtoh(&y)?;
-                let label = format!("fp8.{kind}.{name}.M{rows}.W[{n},{k}]");
+                let label = format!("fp8.{kind}.{name}.M{rows}.W[{n},{k}].tiny{tiny}");
                 ensure!(
                     eager[..rows * n].iter().all(|v| v.is_finite()),
                     "RUNNER_FAIL {label}: nonfinite output"

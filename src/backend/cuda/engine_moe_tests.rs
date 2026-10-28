@@ -5217,7 +5217,7 @@ fn hybrid_media_identity_gpu() -> Result<()> {
         let source = SafeTensors::deserialize(&bytes)?;
         ensure!(
             source.tensor("logits")?.shape() == [32, vocab],
-            "media reference logits must be [32,248144]"
+            "media reference logits must be [32,vocab]"
         );
         let expected = floats(&source, "logits")?;
         let forced = integers(&source, "tokens")?;
