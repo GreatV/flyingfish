@@ -1,7 +1,7 @@
 //! Host objects selected at compile time; operator sources are shared.
 pub use super::cuda::blas;
 pub(crate) use super::cuda::linear;
-pub use super::cuda::{contracts, copy, cubin, decode, ops, state, verification};
+pub use super::cuda::{contracts, copy, cubin, decode, flash, ops, state, verification};
 #[cfg(feature = "rocm")]
 pub use super::hip::{
     Context as CudaContext, DevicePtr, DevicePtrMut, DeviceRepr, Event as CudaEvent,

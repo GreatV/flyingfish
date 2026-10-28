@@ -945,7 +945,7 @@ mod tests {
         ))?;
         ensure!(!cases.is_empty(), "attention fixtures empty");
         let ctx = crate::backend::gpu::CudaContext::new(0)?;
-        let stream = ctx.default_stream();
+        let stream = ctx.new_stream()?;
         let mut defects = mask_controls(&stream, &limits)?;
         for case in &cases {
             let bound = &limits["limits"][format!("{}-{}", case.d, case.mode)];
