@@ -159,6 +159,12 @@ fn hybrid_model_identity_gpu() -> Result<()> {
         "GPU window not acknowledged"
     );
     let target = PathBuf::from(std::env::var("FF_ARGMAX_MODEL")?);
+    let specification = flyingfish::model_spec::ModelSpec::read(&target)?;
+    ensure!(
+        specification.linear_format == flyingfish::model_spec::LinearFormat::Fp8E4m3Channel
+            && specification.expert_format == Some(flyingfish::model_spec::ExpertFormat::Fp8W8a16),
+        "hybrid gate requires published per-channel FP8 projections and experts"
+    );
     let output = PathBuf::from(std::env::var("FF_DENSE_EVIDENCE")?);
     let runtime = PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
     let settings = reference_settings(&runtime);
