@@ -256,15 +256,25 @@ fn build_rocm(out: &std::path::Path) {
         "pub const ARCHES: &[&str] = &{archs:?};\npub fn hsaco(name: &str, gfx: &str) -> Option<&'static [u8]> {{\nmatch (name, gfx) {{\n"
     );
     for name in ROCM_KERNELS {
-        let (suffix, defines): (&str, &[&str]) = if name.starts_with("gdn/") {
-            ("_h32", &["-DGDN_HEADS=32"])
+        let variants: &[(&str, &[&str])] = if name.starts_with("gdn/") {
+            &[("_h32", &["-DGDN_HEADS=32"])]
         } else if *name == "tcmqa_d256" {
-            (
-                "_q16_kv2",
-                &["-DATTENTION_Q_HEADS=16", "-DATTENTION_KV_HEADS=2"],
-            )
+            &[
+                (
+                    "_q16_kv2",
+                    &["-DATTENTION_Q_HEADS=16", "-DATTENTION_KV_HEADS=2"],
+                ),
+                (
+                    "_q8_kv2",
+                    &[
+                        "-DATTENTION_Q_HEADS=8",
+                        "-DATTENTION_KV_HEADS=2",
+                        "-DATTENTION_ROTARY_DIM=256",
+                    ],
+                ),
+            ]
         } else {
-            ("", &[])
+            &[("", &[])]
         };
         let file = PathBuf::from(format!("kernels/{name}.cu"));
         assert!(
@@ -273,48 +283,55 @@ fn build_rocm(out: &std::path::Path) {
             file.display()
         );
         println!("cargo:rerun-if-changed={}", file.display());
-        for arch in &archs {
-            if matches!(
-                *name,
-                "gemm_skinny" | "tcmqa" | "tcmqa_d256" | "markov" | "fp8_linear" | "moe_prefill"
-            ) && !arch.starts_with("gfx11")
-            {
-                continue;
+        for (suffix, defines) in variants {
+            for arch in &archs {
+                if matches!(
+                    *name,
+                    "gemm_skinny"
+                        | "tcmqa"
+                        | "tcmqa_d256"
+                        | "markov"
+                        | "fp8_linear"
+                        | "moe_prefill"
+                ) && !arch.starts_with("gfx11")
+                {
+                    continue;
+                }
+                let filename = format!("{}{suffix}_{arch}.hsaco", name.replace('/', "_"));
+                let hsaco = out.join(&filename);
+                let result = Command::new(&hipcc)
+                    .env("TMPDIR", &temp)
+                    .args(["--genco", "-O3", "--std=c++17", "-mno-wavefrontsize64"])
+                    .args(*defines)
+                    .arg(format!("--offload-arch={arch}"))
+                    .arg(&file)
+                    .arg("-o")
+                    .arg(&hsaco)
+                    .output()
+                    .expect("cannot compile ROCm kernel");
+                assert!(
+                    result.status.success(),
+                    "hipcc failed for {} {arch}:\n{}\n{}",
+                    file.display(),
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                let bytes = fs::read(&hsaco).expect("cannot read ROCm code object");
+                assert!(
+                    bytes.starts_with(b"__CLANG_OFFLOAD_BUNDLE__"),
+                    "invalid ROCm offload bundle for {} {arch}",
+                    file.display()
+                );
+                let text = String::from_utf8_lossy(&bytes);
+                let target = format!("hipv4-amdgcn-amd-amdhsa--{arch}");
+                assert!(
+                    text.contains(&target),
+                    "ROCm code object for {} {arch} lacks target {target}",
+                    file.display()
+                );
+                let module = format!("{name}{suffix}");
+                index.push_str(&format!("({module:?}, {arch:?}) => Some(include_bytes!(concat!(env!(\"OUT_DIR\"), \"/\", {filename:?}))),\n"));
             }
-            let filename = format!("{}{suffix}_{arch}.hsaco", name.replace('/', "_"));
-            let hsaco = out.join(&filename);
-            let result = Command::new(&hipcc)
-                .env("TMPDIR", &temp)
-                .args(["--genco", "-O3", "--std=c++17", "-mno-wavefrontsize64"])
-                .args(defines)
-                .arg(format!("--offload-arch={arch}"))
-                .arg(&file)
-                .arg("-o")
-                .arg(&hsaco)
-                .output()
-                .expect("cannot compile ROCm kernel");
-            assert!(
-                result.status.success(),
-                "hipcc failed for {} {arch}:\n{}\n{}",
-                file.display(),
-                String::from_utf8_lossy(&result.stdout),
-                String::from_utf8_lossy(&result.stderr)
-            );
-            let bytes = fs::read(&hsaco).expect("cannot read ROCm code object");
-            assert!(
-                bytes.starts_with(b"__CLANG_OFFLOAD_BUNDLE__"),
-                "invalid ROCm offload bundle for {} {arch}",
-                file.display()
-            );
-            let text = String::from_utf8_lossy(&bytes);
-            let target = format!("hipv4-amdgcn-amd-amdhsa--{arch}");
-            assert!(
-                text.contains(&target),
-                "ROCm code object for {} {arch} lacks target {target}",
-                file.display()
-            );
-            let module = format!("{name}{suffix}");
-            index.push_str(&format!("({module:?}, {arch:?}) => Some(include_bytes!(concat!(env!(\"OUT_DIR\"), \"/\", {filename:?}))),\n"));
         }
     }
     index.push_str("_ => None,\n}\n}\n");
