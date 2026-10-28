@@ -164,6 +164,8 @@ fn dense_dspark_identity_gpu() -> Result<()> {
     let runtime = PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
     let mut cells = 0;
     for (budget, chunk) in [
+        (SpecBudget::Tree32, 9),
+        (SpecBudget::Tree64, 17),
         (SpecBudget::Tree32, 17),
         (SpecBudget::Tree16, 9),
         (SpecBudget::Chain, 33),

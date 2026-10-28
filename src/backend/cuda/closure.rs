@@ -134,6 +134,7 @@ pub(super) fn forward_rows(
     Ok(rows)
 }
 
+#[cfg(feature = "cuda")]
 fn draft_shapes(
     draft: &crate::dspark::DraftConfig,
     injection_rows: usize,
@@ -162,9 +163,6 @@ fn draft_shapes(
         })
         .collect();
     let pairs = all.iter().map(|s| (s.output, s.input)).collect();
-    #[cfg(feature = "rocm")]
-    let linear = all;
-    #[cfg(feature = "cuda")]
     let linear = all
         .into_iter()
         .filter(|shape| super::linear_calibrate::supports(*shape))
@@ -483,7 +481,171 @@ impl Closure {
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+pub fn runtime_dir(path: &Path, model: &Path, create: bool) -> Result<PathBuf> {
+    let full = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut parent = full.as_path();
+    let mut suffix = Vec::new();
+    while !parent.exists() {
+        suffix.push(
+            parent
+                .file_name()
+                .context("invalid runtime directory")?
+                .to_os_string(),
+        );
+        parent = parent
+            .parent()
+            .context("runtime directory has no existing ancestor")?;
+    }
+    let mut resolved = parent.canonicalize()?;
+    for part in suffix.iter().rev() {
+        resolved.push(part);
+    }
+    let model = model.canonicalize()?;
+    ensure!(
+        !resolved.starts_with(&model)
+            && !resolved
+                .components()
+                .any(|c| matches!(c, Component::Normal(p) if p == "models")),
+        "runtime directory must be outside all readonly models directories"
+    );
+    if create {
+        std::fs::create_dir_all(&resolved)?;
+    }
+    ensure!(
+        !resolved.exists() || resolved.is_dir(),
+        "runtime path is not a directory"
+    );
+    Ok(resolved)
+}
+
+#[cfg(feature = "rocm")]
+impl Profile {
+    pub(super) fn hip(
+        c: &Config,
+        capacity: usize,
+        chunk: usize,
+        model: &Path,
+        budget: Option<SpecBudget>,
+        draft_path: Option<&Path>,
+    ) -> Result<Self> {
+        let draft = draft_path
+            .map(|path| crate::dspark::DraftConfig::read(path, c))
+            .transpose()?;
+        ensure!(
+            draft.is_some() == budget.is_some(),
+            "HIP draft/budget profile mismatch"
+        );
+        let verify_rows = draft
+            .as_ref()
+            .map(|d| d.verify_rows())
+            .transpose()?
+            .unwrap_or(1);
+        let workspace = super::engine::spec_workspace_rows(chunk, budget, verify_rows);
+        ensure!(
+            workspace <= capacity,
+            "HIP profile workspace exceeds capacity"
+        );
+        let bucket = |rows: usize| -> Result<usize> {
+            Ok(super::engine::bucketed_prefill_rows(
+                u32::try_from(rows)?,
+                u32::try_from(workspace)?,
+            )? as usize)
+        };
+        let small_rows = small_rows(chunk, capacity);
+        let rows = (1..=workspace)
+            .map(bucket)
+            .collect::<Result<BTreeSet<_>>>()?;
+        let mut linear = BTreeSet::new();
+        for &rows in &rows {
+            for (output, input) in [
+                (c.qkv_dim(), c.hidden_size),
+                (c.hidden_size, c.hidden_size),
+                (2 * c.intermediate_size, c.hidden_size),
+                (c.hidden_size, c.intermediate_size),
+            ] {
+                linear.insert(LinearShape {
+                    rows,
+                    output,
+                    input,
+                });
+            }
+        }
+        linear.insert(LinearShape {
+            rows: bucket(1)?,
+            output: c.vocab_size,
+            input: c.hidden_size,
+        });
+        if let Some(draft) = &draft {
+            let budget = budget.context("HIP draft profile lacks a spec budget")?;
+            let verify = bucket(if budget.is_tree() {
+                budget.rows()
+            } else {
+                verify_rows
+            })?;
+            for (output, input) in [
+                (c.qkv_dim(), c.hidden_size),
+                (c.hidden_size, c.hidden_size),
+                (2 * c.intermediate_size, c.hidden_size),
+                (c.hidden_size, c.intermediate_size),
+                (c.vocab_size, c.hidden_size),
+            ] {
+                linear.insert(LinearShape {
+                    rows: verify,
+                    output,
+                    input,
+                });
+            }
+            for (requested, output, input) in [
+                (draft.block_size, draft.qkv_dim(), draft.hidden_size),
+                (draft.block_size, draft.hidden_size, draft.hidden_size),
+                (
+                    draft.block_size,
+                    2 * draft.intermediate_size,
+                    draft.hidden_size,
+                ),
+                (draft.block_size, draft.hidden_size, draft.intermediate_size),
+                (draft.block_size, draft.vocab_size, draft.hidden_size),
+                (1, draft.vocab_size, draft.markov_rank),
+            ] {
+                linear.insert(LinearShape {
+                    rows: bucket(requested)?,
+                    output,
+                    input,
+                });
+            }
+            for rows in rows {
+                for (output, input) in [
+                    (draft.hidden_size, draft.capture_width()),
+                    (draft.kv_dim(), draft.hidden_size),
+                ] {
+                    linear.insert(LinearShape {
+                        rows,
+                        output,
+                        input,
+                    });
+                }
+            }
+        }
+        Ok(Self {
+            pairs: linear.iter().map(|s| (s.output, s.input)).collect(),
+            linear,
+            attention: attention(budget),
+            capacity,
+            small_rows,
+            budget: budget.map(SpecBudget::rows),
+            model: hash(&fs::read(model.join("config.json"))?),
+            draft: draft_path
+                .map(|p| std::fs::read(p.join("config.json")).map(|v| hash(&v)))
+                .transpose()?,
+        })
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -514,6 +676,79 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "rocm")]
+    fn hip_workspace_covers_every_linear_family() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("hip-profile-{}", std::process::id()));
+        fs::create_dir(&root)?;
+        let result = (|| -> Result<()> {
+            let model = root.join("target");
+            let draft = root.join("draft");
+            fs::create_dir(&model)?;
+            fs::create_dir(&draft)?;
+            fs::write(
+                model.join("config.json"),
+                serde_json::to_vec(&config_value())?,
+            )?;
+            fs::write(
+                draft.join("config.json"),
+                serde_json::to_vec(&draft_value())?,
+            )?;
+            let c = config()?;
+            let mut missing = 0;
+            for (budget, chunk, boundary, verify) in [
+                (SpecBudget::Tree32, 9, 16, 32),
+                (SpecBudget::Tree64, 17, 32, 64),
+                (SpecBudget::Chain, 1, 8, 8),
+            ] {
+                let profile = Profile::hip(&c, 256, chunk, &model, Some(budget), Some(&draft))?;
+                for (name, row, output, input) in [
+                    ("target.prefill.qkv", boundary, 2560, 2048),
+                    ("target.prefill.o", boundary, 2048, 2048),
+                    ("target.prefill.gate_up", boundary, 12288, 2048),
+                    ("target.prefill.down", boundary, 2048, 6144),
+                    ("target.decode.qkv", 1, 2560, 2048),
+                    ("target.decode.head", 1, 130560, 2048),
+                    ("target.verify.qkv", verify, 2560, 2048),
+                    ("target.verify.head", verify, 130560, 2048),
+                    ("draft.inject.fc", boundary, 2048, 10240),
+                    ("draft.inject.kv", boundary, 256, 2048),
+                    ("draft.forward.qkv", 7, 2560, 2048),
+                    ("draft.forward.o", 7, 2048, 2048),
+                    ("draft.forward.gate_up", 7, 12288, 2048),
+                    ("draft.forward.down", 7, 2048, 6144),
+                    ("draft.forward.head", 7, 130560, 2048),
+                    ("markov.rank", 1, 130560, 256),
+                ] {
+                    let present = profile.linear.contains(&LinearShape {
+                        rows: row,
+                        output,
+                        input,
+                    });
+                    println!(
+                        "HIP_PROFILE_FAMILY budget={budget:?} chunk={chunk} name={name} row={row} present={present}"
+                    );
+                    missing += usize::from(!present);
+                }
+                let workspace = if budget == SpecBudget::Chain {
+                    8
+                } else {
+                    budget.rows()
+                };
+                ensure!(
+                    profile.linear.iter().all(|s| s.rows <= workspace),
+                    "profile exceeds allocation"
+                );
+            }
+            ensure!(missing == 0, "HIP profile missing family cells={missing}");
+            println!("HIP_PROFILE_FAMILIES cells=48 missing=0 PASS");
+            Ok(())
+        })();
+        fs::remove_dir_all(&root)?;
+        result
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
     fn draft_linear_closure_covers_all_execution_sites() -> Result<()> {
         let source = include_str!("draft.rs");
         for (function, sites) in [("inject_block", 3), ("block", 6)] {
@@ -636,6 +871,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cuda")]
     fn draft_mlp_closure_covers_distinct_intermediate_size() -> Result<()> {
         let c = config()?;
         let mut draft_value = draft_value();
@@ -719,6 +955,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cuda")]
     fn shape_closure_covers_prefill_and_all_commits() -> Result<()> {
         let c = config()?;
         let draft_value = draft_value();
@@ -995,6 +1232,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cuda")]
     fn calibration_excludes_unaligned_inputs() -> Result<()> {
         let mut c = config()?;
         for (hidden, intermediate) in [(384, 768), (512, 640)] {
@@ -1040,6 +1278,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cuda")]
     fn coverage_keeps_all_uncalibrated_pairs() -> Result<()> {
         let mut c = config()?;
         c.hidden_size = 384;
@@ -1077,6 +1316,7 @@ mod tests {
         Ok(())
     }
     #[test]
+    #[cfg(feature = "cuda")]
     fn missing_cache_is_read_only() -> Result<()> {
         let closure = Closure::new(false, "flyingfish calibrate".into());
         let missing = std::env::current_exe()?.join("missing-choice.json");
@@ -1091,6 +1331,7 @@ mod tests {
         Ok(())
     }
     #[test]
+    #[cfg(feature = "cuda")]
     fn complete_manifest_rejects_changed_cache() -> Result<()> {
         let exe = std::env::current_exe()?;
         let root = exe
@@ -1167,6 +1408,7 @@ mod tests {
         result
     }
     #[test]
+    #[cfg(feature = "cuda")]
     fn frozen_and_ready_reject_setup() -> Result<()> {
         let closure = Closure::new(false, "calibrate".into());
         assert!(closure.measurement().is_err());
@@ -1180,6 +1422,7 @@ mod tests {
         Ok(())
     }
     #[test]
+    #[cfg(feature = "cuda")]
     fn fixed_binding_covers_setup_and_frozen_without_counting_captures() -> Result<()> {
         let closure = Closure::new(false, "fixed setup".into());
         closure.bind_fixed()?;
@@ -1191,138 +1434,5 @@ mod tests {
         assert!(closure.assert_ready().is_err());
         closure.expect_captures(0)?;
         Ok(())
-    }
-}
-
-pub fn runtime_dir(path: &Path, model: &Path, create: bool) -> Result<PathBuf> {
-    let full = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let mut parent = full.as_path();
-    let mut suffix = Vec::new();
-    while !parent.exists() {
-        suffix.push(
-            parent
-                .file_name()
-                .context("invalid runtime directory")?
-                .to_os_string(),
-        );
-        parent = parent
-            .parent()
-            .context("runtime directory has no existing ancestor")?;
-    }
-    let mut resolved = parent.canonicalize()?;
-    for part in suffix.iter().rev() {
-        resolved.push(part);
-    }
-    let model = model.canonicalize()?;
-    ensure!(
-        !resolved.starts_with(&model)
-            && !resolved
-                .components()
-                .any(|c| matches!(c, Component::Normal(p) if p == "models")),
-        "runtime directory must be outside all readonly models directories"
-    );
-    if create {
-        std::fs::create_dir_all(&resolved)?;
-    }
-    ensure!(
-        !resolved.exists() || resolved.is_dir(),
-        "runtime path is not a directory"
-    );
-    Ok(resolved)
-}
-
-#[cfg(feature = "rocm")]
-impl Profile {
-    pub(super) fn hip(
-        c: &Config,
-        capacity: usize,
-        chunk: usize,
-        model: &Path,
-        budget: Option<SpecBudget>,
-        draft_path: Option<&Path>,
-    ) -> Result<Self> {
-        let small_rows = small_rows(chunk, capacity);
-        let rows = (1..=chunk)
-            .map(|n| {
-                super::engine::bucketed_prefill_rows(n as u32, chunk as u32).map(|n| n as usize)
-            })
-            .collect::<Result<BTreeSet<_>>>()?;
-        let mut linear = BTreeSet::new();
-        for &rows in &rows {
-            for (output, input) in [
-                (c.qkv_dim(), c.hidden_size),
-                (c.hidden_size, c.hidden_size),
-                (2 * c.intermediate_size, c.hidden_size),
-                (c.hidden_size, c.intermediate_size),
-            ] {
-                linear.insert(LinearShape {
-                    rows,
-                    output,
-                    input,
-                });
-            }
-        }
-        linear.insert(LinearShape {
-            rows: 1,
-            output: c.vocab_size,
-            input: c.hidden_size,
-        });
-        let draft = draft_path
-            .map(|path| crate::dspark::DraftConfig::read(path, c))
-            .transpose()?;
-        if let Some(draft) = &draft {
-            let budget = budget.context("HIP draft profile lacks a spec budget")?;
-            let verify = if budget.is_tree() {
-                budget.rows()
-            } else {
-                draft.verify_rows()?
-            };
-            for (output, input) in [
-                (c.qkv_dim(), c.hidden_size),
-                (c.hidden_size, c.hidden_size),
-                (2 * c.intermediate_size, c.hidden_size),
-                (c.hidden_size, c.intermediate_size),
-                (c.vocab_size, c.hidden_size),
-            ] {
-                linear.insert(LinearShape {
-                    rows: verify,
-                    output,
-                    input,
-                });
-            }
-            linear.extend(draft_shapes(draft, injection_limit(small_rows, draft.verify_rows()?)).0);
-            let workspace = super::engine::spec_workspace_rows(chunk, budget, draft.verify_rows()?);
-            let injection_rows = (1..=workspace)
-                .map(|rows| super::engine::bucketed_prefill_rows(rows as u32, workspace as u32))
-                .collect::<Result<BTreeSet<_>>>()?;
-            for rows in injection_rows {
-                for (output, input) in [
-                    (draft.hidden_size, draft.capture_width()),
-                    (draft.kv_dim(), draft.hidden_size),
-                ] {
-                    linear.insert(LinearShape {
-                        rows: rows as usize,
-                        output,
-                        input,
-                    });
-                }
-            }
-        }
-        Ok(Self {
-            pairs: linear.iter().map(|s| (s.output, s.input)).collect(),
-            linear,
-            attention: attention(budget),
-            capacity,
-            small_rows,
-            budget: budget.map(SpecBudget::rows),
-            model: hash(&fs::read(model.join("config.json"))?),
-            draft: draft_path
-                .map(|p| std::fs::read(p.join("config.json")).map(|v| hash(&v)))
-                .transpose()?,
-        })
     }
 }

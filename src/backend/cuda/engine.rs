@@ -93,8 +93,14 @@ pub(super) fn bucketed_prefill_rows(rows: u32, workspace_rows: u32) -> Result<u3
     Ok(rows.next_power_of_two().min(workspace_rows))
 }
 
-pub(super) fn spec_workspace_rows(chunk: usize, budget: SpecBudget, verify_rows: usize) -> usize {
-    budget.workspace_rows(chunk).max(verify_rows)
+pub(super) fn spec_workspace_rows(
+    chunk: usize,
+    budget: Option<SpecBudget>,
+    verify_rows: usize,
+) -> usize {
+    budget
+        .map_or(chunk, |budget| budget.workspace_rows(chunk))
+        .max(verify_rows)
 }
 
 pub(crate) use super::state::Kv;
@@ -1316,19 +1322,17 @@ impl Engine {
         )?;
         let rows = spec_workspace_rows(
             plan.chunk,
-            self.spec_budget,
+            if cfg!(feature = "cuda") || self.spec.is_some() {
+                Some(self.spec_budget)
+            } else {
+                None
+            },
             self.spec
                 .as_ref()
                 .map(|spec| spec.draft.config.verify_rows())
                 .transpose()?
                 .unwrap_or(1),
         );
-        #[cfg(feature = "rocm")]
-        let rows = if self.spec.is_none() {
-            plan.chunk
-        } else {
-            rows
-        };
         let required = rows
             .checked_mul(plan.row_bytes)
             .context("workspace byte count overflow")?;
@@ -5725,7 +5729,7 @@ impl Engine {
             .map(|draft| {
                 Ok::<_, anyhow::Error>(spec_workspace_rows(
                     1,
-                    settings.spec_budget,
+                    Some(settings.spec_budget),
                     draft.verify_rows()?,
                 ))
             })
