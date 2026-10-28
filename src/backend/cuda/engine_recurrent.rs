@@ -249,6 +249,8 @@ impl VisionRuntime {
     fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
         let rope = cubin::module(ctx, "rope")?;
         let vision = cubin::module(ctx, "vision_ops")?;
+        let mut ops = Ops::new_with_swiglu_rounding(ctx, crate::model_spec::SwigluRounding::Twice)?;
+        ops.add_norm = cubin::module(ctx, "norm")?.load_function("add_rmsnorm_bf16")?;
         Ok(Self {
             #[cfg(test)]
             reinjection_calls: std::cell::Cell::new(0),
@@ -267,7 +269,7 @@ impl VisionRuntime {
             masked_mean: vision.load_function("vision_masked_mean_bf16")?,
             anchor: vision.load_function("vision_anchor_reinject_bf16")?,
             common: CommonOpsRef::new(ctx)?,
-            ops: Ops::new_with_swiglu_rounding(ctx, crate::model_spec::SwigluRounding::Twice)?,
+            ops,
         })
     }
 
