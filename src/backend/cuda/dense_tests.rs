@@ -81,6 +81,340 @@ fn config() -> Result<Config> {
     }))?)
 }
 
+#[cfg(feature = "rocm")]
+fn gdn_core_reference(
+    rows: usize,
+    heads: usize,
+    initial: &[f32],
+    prepared: [&[f64]; 5],
+) -> (Vec<bf16>, Vec<f64>) {
+    let [q, k, v, beta, g] = prepared;
+    let mut state: Vec<_> = initial.iter().map(|x| f64::from(*x)).collect();
+    let mut out = vec![bf16::ZERO; rows * heads * 128];
+    for row in 0..rows {
+        for head in 0..heads {
+            let base = (row * heads + head) * 128;
+            let s = &mut state[head * 128 * 128..][..128 * 128];
+            let decay = g[row * heads + head].exp();
+            for value in s.iter_mut() {
+                *value *= decay;
+            }
+            for column in 0..128 {
+                let dot: f64 = (0..128).map(|d| k[base + d] * s[d * 128 + column]).sum();
+                let delta = (v[base + column] - dot) * beta[row * heads + head];
+                for d in 0..128 {
+                    s[d * 128 + column] += k[base + d] * delta;
+                }
+                let value: f64 = (0..128).map(|d| q[base + d] * s[d * 128 + column]).sum();
+                out[base + column] = bf16::from_f64(value);
+            }
+        }
+    }
+    (out, state)
+}
+
+#[cfg(feature = "rocm")]
+#[test]
+#[ignore = "requires HIP GPU lease and FF_DENSE_GPU_WINDOW=granted"]
+fn hip_gdn_runtime_gpu() -> Result<()> {
+    use crate::backend::cuda::gdn::{GdnBindings, GdnOps};
+    use crate::backend::cuda::moe::testing::{capture, view};
+    use crate::gdn_plan::GdnWorkspace;
+    use crate::op_contract::{ExecutionPhase, GdnSpec};
+    use contracts::{Scratch, SeqRef, TensorMut};
+    ensure!(
+        std::env::var("FF_DENSE_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    let device = crate::backend::cuda::Device::new(0)?;
+    let stream = &device.stream;
+    let model = crate::model_spec::ModelSpec::minicpm(
+        &serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/minicpm-config.json"
+        )))?,
+        &serde_json::json!({"eos_token_id":[248044,248046]}),
+    )?;
+    let spec = GdnSpec::from_model(&model)?;
+    let (heads, cd) = (spec.hv as usize, spec.conv_dim()? as usize);
+    ensure!(
+        heads == 32 && cd == 8192 && spec.hk == 16,
+        "GDN fixture geometry"
+    );
+    let mut gate = Gate::default();
+    for (rows, valid) in [
+        (1u32, 1u32),
+        (3, 3),
+        (17, 17),
+        (37, 33),
+        (129, 127),
+        (257, 257),
+    ] {
+        let n = valid as usize;
+        let mut qkv = pattern(rows as usize * cd, 71);
+        qkv[n * cd..].fill(bf16::NAN);
+        let conv = pattern(cd * 4, 73);
+        let a = pattern(rows as usize * heads, 79);
+        let b = pattern(rows as usize * heads, 83);
+        let a_log: Vec<_> = (0..heads)
+            .map(|h| bf16::from_f32(-3.0 + h as f32 / 128.0))
+            .collect();
+        let dt = pattern(heads, 89);
+        let history: Vec<_> = pattern(cd * 3, 97).iter().map(|v| v.to_f32()).collect();
+        let initial: Vec<_> = (0..heads * 128 * 128)
+            .map(|i| ((i * 19 % 251) as f32 - 125.0) / 1024.0)
+            .collect();
+        let dqkv = stream.clone_htod(&qkv)?;
+        let dc = stream.clone_htod(&conv)?;
+        let da = stream.clone_htod(&a)?;
+        let db = stream.clone_htod(&b)?;
+        let dal = stream.clone_htod(&a_log)?;
+        let ddt = stream.clone_htod(&dt)?;
+        let mut dh = stream.clone_htod(&history)?;
+        let mut ds = stream.clone_htod(&initial)?;
+        let dout =
+            stream.clone_htod(&vec![bf16::from_bits(0x7fc5); rows as usize * heads * 128])?;
+        let metadata =
+            stream.clone_htod(&[23i32, valid as i32, 23 + valid as i32, 8192, 1, 0, 0, 0])?;
+        let meta = SeqRef {
+            ptr: metadata.device_ptr(stream).0,
+        };
+        let ws = GdnWorkspace::new(&spec, rows, false)?;
+        let scratch = stream.clone_htod(&vec![0xa5u8; ws.bytes as usize + 256])?;
+        let plan = GdnOps::prepare(
+            &device.ctx,
+            &spec,
+            rows,
+            GdnBindings {
+                qkv: view(&dqkv, stream, [rows, cd as u32], [cd as u64, 1])?,
+                a: view(&da, stream, [rows, spec.hv], [heads as u64, 1])?,
+                b: view(&db, stream, [rows, spec.hv], [heads as u64, 1])?,
+                conv_weight: view(&dc, stream, [cd as u32, 4], [4, 1])?,
+                a_log: view(&dal, stream, [spec.hv], [1])?,
+                dt_bias: view(&ddt, stream, [spec.hv], [1])?,
+                core_out: TensorMut(view(
+                    &dout,
+                    stream,
+                    [rows, spec.hv, 128],
+                    [heads as u64 * 128, 128, 1],
+                )?),
+                s: TensorMut(view(&ds, stream, [spec.hv, 128, 128], [128 * 128, 128, 1])?),
+                history: TensorMut(view(&dh, stream, [cd as u32, 3], [3, 1])?),
+            },
+            false,
+        )?;
+        let phase = if rows == 1 {
+            ExecutionPhase::Decode
+        } else {
+            ExecutionPhase::Prefill
+        };
+        let execute = || {
+            GdnOps::run(
+                &plan,
+                stream,
+                meta,
+                phase,
+                Scratch {
+                    ptr: scratch.device_ptr(stream).0,
+                    bytes: ws.bytes,
+                },
+            )
+        };
+        execute()?;
+        let actual = stream.clone_dtoh(&dout)?;
+        let state = stream.clone_dtoh(&ds)?;
+        let hist = stream.clone_dtoh(&dh)?;
+        let bytes = stream.clone_dtoh(&scratch)?;
+        gate.check(
+            "gdn.output_guard",
+            actual[n * heads * 128..]
+                .iter()
+                .all(|v| v.to_bits() == 0x7fc5),
+        );
+        gate.check(
+            "gdn.scratch_guard",
+            bytes[ws.bytes as usize..].iter().all(|v| *v == 0xa5),
+        );
+        let read = |offset: u64, count: usize| -> Result<Vec<f64>> {
+            let start = offset as usize;
+            let result: Vec<_> = bytes[start..start + count * 4]
+                .chunks_exact(4)
+                .map(|v| f64::from(f32::from_le_bytes(v.try_into().unwrap())))
+                .collect();
+            ensure!(
+                result.iter().all(|v| v.is_finite()),
+                "RUNNER_FAIL nonfinite GDN workspace"
+            );
+            Ok(result)
+        };
+        let prepared = [
+            read(ws.q_fp32.offset, n * heads * 128)?,
+            read(ws.k_fp32.offset, n * heads * 128)?,
+            read(ws.v_fp32.offset, n * heads * 128)?,
+            read(ws.beta_fp32.offset, n * heads)?,
+            read(ws.g.offset, n * heads)?,
+        ];
+        let conv_actual: Vec<_> = bytes[ws.conv_out.offset as usize..][..n * cd * 2]
+            .chunks_exact(2)
+            .map(|v| bf16::from_bits(u16::from_le_bytes(v.try_into().unwrap())))
+            .collect();
+        let mut conv_ref = Vec::with_capacity(n * cd);
+        for row in 0..n {
+            for ch in 0..cd {
+                let value: f64 = (0..4)
+                    .map(|tap| {
+                        let index = row + tap;
+                        let x = if index < 3 {
+                            history[ch * 3 + index]
+                        } else {
+                            qkv[(index - 3) * cd + ch].to_f32()
+                        };
+                        f64::from(x) * f64::from(conv[ch * 4 + tap].to_f32())
+                    })
+                    .sum();
+                let rounded = bf16::from_f64(value).to_f64();
+                conv_ref.push(bf16::from_f64(rounded / (1.0 + (-rounded).exp())));
+            }
+        }
+        gate.compare(&format!("gdn.conv.{rows}"), &conv_actual, &conv_ref, 2, 4)?;
+        let mut norm_ratio = 0f64;
+        let norm_bound = crate::backend::cuda::gamma(136, 2f64.powi(-24));
+        for row in 0..n {
+            for head in 0..heads {
+                for (side, prepared_side) in prepared[..2].iter().enumerate() {
+                    let base = row * cd + (side * 16 + head / 2) * 128;
+                    let source = &conv_actual[base..base + 128];
+                    let scale = (source.iter().map(|v| v.to_f64().powi(2)).sum::<f64>()
+                        + f64::from(spec.l2_eps))
+                    .sqrt()
+                    .recip()
+                        / if side == 0 { 128f64.sqrt() } else { 1.0 };
+                    for (d, value) in source.iter().enumerate() {
+                        let expected = value.to_f64() * scale;
+                        let error =
+                            (prepared_side[(row * heads + head) * 128 + d] - expected).abs();
+                        norm_ratio = norm_ratio.max(if expected == 0.0 {
+                            if error == 0.0 { 0.0 } else { f64::INFINITY }
+                        } else {
+                            error / (expected.abs() * norm_bound)
+                        });
+                    }
+                }
+            }
+        }
+        gate.check("gdn.qk_norm", norm_ratio <= 1.0);
+        let actual_beta: Vec<_> = prepared[3].iter().map(|v| bf16::from_f64(*v)).collect();
+        let expected_beta: Vec<_> = b[..n * heads]
+            .iter()
+            .map(|v| bf16::from_f64(1.0 / (1.0 + (-v.to_f64()).exp())))
+            .collect();
+        gate.compare(
+            &format!("gdn.beta.{rows}"),
+            &actual_beta,
+            &expected_beta,
+            1,
+            1,
+        )?;
+        let gate_bound = crate::backend::cuda::gamma(8, 2f64.powi(-24));
+        let gate_error = prepared[4]
+            .iter()
+            .enumerate()
+            .map(|(i, actual)| {
+                let h = i % heads;
+                let t = f64::from(a[i].to_f32() + dt[h].to_f32());
+                let expected = -a_log[h].to_f64().exp() * t.exp().ln_1p();
+                (actual - expected).abs() / (1.0 + expected.abs())
+            })
+            .fold(0f64, f64::max);
+        gate.check("gdn.decay_gate", gate_error <= gate_bound);
+        gate.check(
+            "gdn.value_widen",
+            prepared[2].iter().enumerate().all(|(i, v)| {
+                *v == conv_actual[(i / (heads * 128)) * cd + 4096 + i % (heads * 128)].to_f64()
+            }),
+        );
+        let (expected, expected_state) =
+            gdn_core_reference(n, heads, &initial, prepared.each_ref().map(Vec::as_slice));
+        gate.compare(
+            &format!("gdn.core.{rows}"),
+            &actual[..n * heads * 128],
+            &expected,
+            1,
+            n * 512,
+        )?;
+        let bound = crate::backend::cuda::gamma(n * 512 + 128, 2f64.powi(-24));
+        let error = state
+            .iter()
+            .zip(&expected_state)
+            .try_fold(0f64, |e, (a, b)| {
+                ensure!(
+                    a.is_finite() && b.is_finite(),
+                    "RUNNER_FAIL GDN state nonfinite"
+                );
+                Ok::<_, anyhow::Error>(e.max((f64::from(*a) - b).abs() / (1.0 + b.abs())))
+            })?;
+        gate.check("gdn.state", error <= bound);
+        let history_bad = hist
+            .iter()
+            .enumerate()
+            .filter(|(i, v)| {
+                let (ch, tap) = (i / 3, i % 3);
+                let index = n + tap;
+                let expected = if index < 3 {
+                    history[ch * 3 + index]
+                } else {
+                    qkv[(index - 3) * cd + ch].to_f32()
+                };
+                v.to_bits() != expected.to_bits()
+            })
+            .count();
+        gate.check("gdn.raw_history", history_bad == 0);
+        stream.memcpy_htod(&initial, &mut ds)?;
+        stream.memcpy_htod(&history, &mut dh)?;
+        let graph = capture(stream, execute)?;
+        for replay in 0..2 {
+            if replay != 0 {
+                stream.memcpy_htod(&initial, &mut ds)?;
+                stream.memcpy_htod(&history, &mut dh)?;
+            }
+            graph.launch()?;
+            let observed = stream.clone_dtoh(&dout)?;
+            let observed_state = stream.clone_dtoh(&ds)?;
+            let observed_hist = stream.clone_dtoh(&dh)?;
+            gate.check(
+                "gdn.graph_bits",
+                observed
+                    .iter()
+                    .zip(&actual)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+                    && observed_state
+                        .iter()
+                        .zip(&state)
+                        .chain(observed_hist.iter().zip(&hist))
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+            );
+        }
+        if rows == 3 {
+            let differences = state[..128 * 128]
+                .iter()
+                .zip(&state[128 * 128..2 * 128 * 128])
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            ensure!(differences > 0, "GDN head0-for-head1 control escaped");
+            println!("PASS HIP_GDN_CONTROL wrong_state_head differences={differences}");
+        }
+        println!(
+            "HIP_GDN rows={rows} valid={valid} norm_ratio={norm_ratio:e} state_error={error:e} state_bound={bound:e}"
+        );
+    }
+    println!(
+        "HIP_GDN_SUMMARY cells={} defects={}",
+        gate.cells, gate.defects
+    );
+    ensure!(gate.defects == 0, "GDN defects={}", gate.defects);
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires GPU lease and FF_DENSE_GPU_WINDOW=granted"]
 fn dense_runtime_gpu() -> Result<()> {
