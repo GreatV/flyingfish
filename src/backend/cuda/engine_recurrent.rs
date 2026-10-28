@@ -1828,6 +1828,7 @@ mod tests {
             let mut eager_free = Vec::new();
             for graph in [false, true] {
                 let mut trajectory = Vec::with_capacity(reference.len());
+                let mut trajectory_ids = Vec::new();
                 engine.reset()?;
                 let mut trace = Trace::default();
                 engine.prefill(&prompt, Some(&mut trace))?;
@@ -1881,6 +1882,7 @@ mod tests {
                         [0.60, f32::MAX, f32::MAX],
                     )?);
                     let prediction = engine.token()?;
+                    trajectory_ids.push(prediction);
                     let margin = margins[step];
                     let pass = margin < 0.35 || prediction == predictions[step];
                     defects += usize::from(!pass);
@@ -1912,6 +1914,21 @@ mod tests {
                     &reference,
                     [0.60, 0.20, 0.06],
                 )?);
+                if let Some(output) = std::env::var_os("FF_Q38_PROBE_DIR") {
+                    let output = PathBuf::from(output);
+                    std::fs::create_dir_all(&output)?;
+                    ensure!(
+                        !output.canonicalize()?.starts_with(dir.canonicalize()?),
+                        "probe output is inside model directory"
+                    );
+                    let bytes: Vec<_> = trajectory_ids
+                        .iter()
+                        .copied()
+                        .chain(trajectory.iter().map(|v| v.to_bits()))
+                        .flat_map(u32::to_le_bytes)
+                        .collect();
+                    std::fs::write(output.join(format!("{case}-graph{graph}.bin")), bytes)?;
+                }
                 engine.reset()?;
                 let mut generated = vec![engine.prefill(&prompt, None)?];
                 for _ in 1..32 {
