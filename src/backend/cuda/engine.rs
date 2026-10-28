@@ -2229,7 +2229,7 @@ impl Engine {
                             .context("tree State is not enabled")?;
                         tree.prepare_embed_norm(
                             &w.position,
-                            &self.weights.embed,
+                            self.weights.embedding(),
                             layer
                                 .input_norm
                                 .as_ref()
@@ -2246,7 +2246,7 @@ impl Engine {
                     let ids = if use_token { &w.token } else { &w.ids };
                     unsafe {
                         s.launch_builder(&self.ops.embed_rmsnorm)
-                            .arg(&self.weights.embed)
+                            .arg(self.weights.embedding())
                             .arg(ids)
                             .arg(&mut w.x)
                             .arg(
@@ -3331,7 +3331,7 @@ impl Engine {
                 * 4
                 + (self.weights.head.len() + 2 * self.config.hidden_size) * 2;
         }
-        self.weights.bytes - self.weights.embed.len() * size_of::<bf16>()
+        self.weights.bytes - self.weights.embedding().len() * size_of::<bf16>()
             + self.config.hidden_size * size_of::<bf16>()
     }
 
@@ -4198,7 +4198,7 @@ impl Engine {
                         &self.work.token,
                         &self.work.position,
                         start,
-                        (&self.weights.embed, &self.weights.head),
+                        (self.weights.embedding(), &self.weights.head),
                         super::draft::Compute {
                             ops: &self.ops,
                             blas: &mut self.blas,
@@ -4359,7 +4359,7 @@ impl Engine {
                 &self.work.token,
                 &self.work.position,
                 start,
-                (&self.weights.embed, &self.weights.head),
+                (self.weights.embedding(), &self.weights.head),
                 super::draft::Compute {
                     ops: &self.ops,
                     blas: &mut self.blas,
@@ -4534,7 +4534,7 @@ impl Engine {
                 spec.draft.propose(
                     anchor,
                     start,
-                    (&self.weights.embed, &self.weights.head),
+                    (self.weights.embedding(), &self.weights.head),
                     super::draft::Compute {
                         ops: &self.ops,
                         blas: &mut self.blas,
@@ -4856,7 +4856,7 @@ impl Engine {
             spec.draft.forward_base(
                 anchor,
                 start,
-                (&self.weights.embed, &self.weights.head),
+                (self.weights.embedding(), &self.weights.head),
                 super::draft::Compute {
                     ops: &self.ops,
                     blas: &mut self.blas,
@@ -5107,7 +5107,7 @@ impl Engine {
         spec.draft.propose(
             anchor,
             position,
-            (&self.weights.embed, &self.weights.head),
+            (self.weights.embedding(), &self.weights.head),
             super::draft::Compute {
                 ops: &self.ops,
                 blas: &mut self.blas,

@@ -1164,22 +1164,26 @@ impl Engine {
         let mut linear = LayerLinearPlan::bind(&plan, &catalog, None, stream)?;
         let ffn = BoundFfn::bind(&model_spec, &mut linear)?;
         let weights = Weights {
-            embed: stream.clone_htod(
-                &(0..32 * d.hidden)
-                    .map(|index| {
-                        let (token, column) = (index / d.hidden, index % d.hidden);
-                        if column < 8 {
-                            if token % 8 == column {
-                                bf16::ONE
+            embed: Some(
+                stream.clone_htod(
+                    &(0..32 * d.hidden)
+                        .map(|index| {
+                            let (token, column) = (index / d.hidden, index % d.hidden);
+                            if column < 8 {
+                                if token % 8 == column {
+                                    bf16::ONE
+                                } else {
+                                    bf16::ZERO
+                                }
                             } else {
-                                bf16::ZERO
+                                bf16::from_f32(
+                                    (((token * 37 + column * 11) % 53) as f32 - 26.0) / 64.0,
+                                )
                             }
-                        } else {
-                            bf16::from_f32((((token * 37 + column * 11) % 53) as f32 - 26.0) / 64.0)
-                        }
-                    })
-                    .collect::<Vec<_>>(),
-            )?,
+                        })
+                        .collect::<Vec<_>>(),
+                )?,
+            ),
             norm: Some(stream.clone_htod(&vec![bf16::ONE; d.hidden])?),
             head: stream.clone_htod(
                 &(0..32 * d.hidden)

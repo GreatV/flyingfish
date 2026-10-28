@@ -1025,7 +1025,7 @@ impl Engine {
                 (&self.weights.embed, 0, 0)
             };
             s.launch_builder(&r.embed)
-                .arg(&self.weights.embed)
+                .arg(self.weights.embedding())
                 .arg(if token { &w.token } else { &w.ids })
                 .arg(&r.initial)
                 .arg(&mut r.high)

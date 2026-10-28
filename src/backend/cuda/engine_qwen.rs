@@ -5109,7 +5109,7 @@ impl Engine {
                                 .context("Gemma 4 operations missing")?
                                 .scaled_embed,
                         )
-                        .arg(&self.weights.embed)
+                        .arg(self.weights.embedding())
                         .arg(ids)
                         .arg(&w.gu)
                         .arg(&mut w.x)
@@ -5120,7 +5120,7 @@ impl Engine {
                         .launch(flat(rows * h))?;
                     } else {
                         s.launch_builder(&self.ops.embed)
-                            .arg(&self.weights.embed)
+                            .arg(self.weights.embedding())
                             .arg(ids)
                             .arg(&mut w.x)
                             .arg(&(rows as i32))
