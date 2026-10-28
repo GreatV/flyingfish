@@ -1310,8 +1310,11 @@ fn record(
 
 fn prefix_bytes(rows: usize, geometry: &VisionGeometry) -> Result<usize> {
     ensure!(rows > 0, "empty vision prefix");
-    rows.checked_mul(geometry.patch as usize * 6 + geometry.hidden() as usize * 8 + 4 * 8)
-        .context("vision prefix byte overflow")
+    let projection_bytes = if cfg!(feature = "rocm") { 4 } else { 0 };
+    rows.checked_mul(
+        geometry.patch as usize * 6 + geometry.hidden() as usize * (8 + projection_bytes) + 4 * 8,
+    )
+    .context("vision prefix byte overflow")
 }
 
 /// One stage's split-QKV pack: the projection planes, the head-major destinations and the packing.
@@ -2484,7 +2487,8 @@ mod tests {
     }
     #[test]
     fn prefix_budget_is_checked_and_counts_each_live_buffer() {
-        assert_eq!(prefix_bytes(256, &q38_geometry()).unwrap(), 256 * 18464);
+        let row_bytes = if cfg!(feature = "rocm") { 23072 } else { 18464 };
+        assert_eq!(prefix_bytes(256, &q38_geometry()).unwrap(), 256 * row_bytes);
         assert!(prefix_bytes(0, &q38_geometry()).is_err());
         assert!(prefix_bytes(usize::MAX, &q38_geometry()).is_err());
     }

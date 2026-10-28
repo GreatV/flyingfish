@@ -196,9 +196,9 @@ struct Plan {
     choice: Choice,
     _bias_owner: Option<Arc<CudaSlice<bf16>>>,
     bias_binding: Option<u64>,
-    output_f32: Option<std::sync::Mutex<CudaSlice<f32>>>,
+    output_f32: bool,
 }
-// Published descriptors are immutable; output scratch is locked on the bound stream.
+// Published descriptors are immutable; mutation requires exclusive Arc ownership.
 unsafe impl Send for Plan {}
 unsafe impl Sync for Plan {}
 impl Drop for Plan {
@@ -260,6 +260,7 @@ pub struct Blas {
     workspace: CudaSlice<u8>,
     skinny: Option<CudaFunction>,
     bias_add: Option<CudaFunction>,
+    rounded_output: RefCell<Option<CudaSlice<f32>>>,
     fp8: Option<crate::backend::gpu::linear::Fp8Ops>,
     invariant_rows: usize,
     plans: RefCell<BTreeMap<Binding, Arc<Plan>>>,
@@ -303,6 +304,7 @@ impl Blas {
             workspace,
             skinny,
             bias_add: None,
+            rounded_output: RefCell::new(None),
             fp8: None,
             invariant_rows: 0,
             plans: RefCell::new(BTreeMap::new()),
@@ -434,18 +436,7 @@ impl Blas {
             },
             _bias_owner: owner,
             bias_binding: bias.filter(|_| rounding == LinearBiasMode::BeforeOutputRound),
-            output_f32: if bias.is_some() && rounding == LinearBiasMode::AfterOutputRound {
-                Some(std::sync::Mutex::new(
-                    self.stream.alloc_zeros(
-                        shape
-                            .rows
-                            .checked_mul(shape.output)
-                            .context("HIP rounded output extent overflow")?,
-                    )?,
-                ))
-            } else {
-                None
-            },
+            output_f32: bias.is_some() && rounding == LinearBiasMode::AfterOutputRound,
         };
         if shape.rows > 1 || bias.is_some() {
             self.prepare_lt(&mut plan, frozen)?;
@@ -498,7 +489,7 @@ impl Blas {
             check(
                 hipblasLtMatrixLayoutCreate(
                     &mut plan.c,
-                    if plan.output_f32.is_some() { 0 } else { 14 },
+                    if plan.output_f32 { 0 } else { 14 },
                     s.output as u64,
                     s.rows as u64,
                     s.output as i64,
@@ -926,6 +917,16 @@ impl Blas {
             bias.shape == [output] && bias.stride == [1],
             "linear bias shape mismatch"
         );
+        self.stream.require_eager("biased projection preparation")?;
+        if mode == LinearBiasMode::AfterOutputRound {
+            let count = (rows as usize)
+                .checked_mul(output as usize)
+                .context("HIP rounded output extent overflow")?;
+            let buffer = self.rounded_output.get_mut();
+            if buffer.as_ref().is_none_or(|b| b.len() < count) {
+                *buffer = Some(self.stream.alloc_zeros(count)?);
+            }
+        }
         self.prepare_binding(
             LinearShape {
                 rows: rows as usize,
@@ -976,12 +977,17 @@ impl Blas {
             .get(&(shape, Some(bias.ptr), mode))
             .context("HIP biased linear shape/binding/rounding not prepared")?;
         if mode == LinearBiasMode::AfterOutputRound {
-            let mut storage = plan
-                .output_f32
-                .as_ref()
-                .context("HIP rounded projection buffer not prepared")?
-                .lock()
-                .map_err(|_| anyhow::anyhow!("HIP rounded projection buffer poisoned"))?;
+            let mut buffer = self
+                .rounded_output
+                .try_borrow_mut()
+                .context("HIP rounded projection buffer already borrowed")?;
+            let storage = buffer
+                .as_mut()
+                .context("HIP rounded projection buffer not prepared")?;
+            ensure!(
+                storage.len() >= shape.rows * shape.output,
+                "HIP rounded projection buffer capacity exceeded"
+            );
             let (unrounded, _write) = storage.device_ptr_mut(&self.stream);
             self.library_raw(plan, shape, [weight.ptr, input.ptr, unrounded])?;
             let add = self
