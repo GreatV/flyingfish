@@ -502,6 +502,17 @@ fn fp8_published_expert_gpu() -> Result<()> {
                     .zip(&reference)
                     .filter(|(a, (value, bound))| (f64::from(a.to_f32()) - value).abs() > *bound)
                     .count();
+                let first = actual
+                    .iter()
+                    .zip(&reference)
+                    .enumerate()
+                    .find(|(_, (a, (v, b)))| (f64::from(a.to_f32()) - v).abs() > *b);
+                if let Some((index, (value, (expected, bound)))) = first {
+                    println!(
+                        "FP8_EXPERT_ERROR name={label}.stage{stage} count={errors} first={index} actual={} expected={expected:e} bound={bound:e}",
+                        value.to_f32()
+                    );
+                }
                 gate.check(&format!("{label}.stage{stage}.fp64"), errors == 0);
             }
             let activated = eager[1][..rows * 512]

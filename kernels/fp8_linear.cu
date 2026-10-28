@@ -347,8 +347,11 @@ extern "C" __global__ void fp8_channel_bf16_wmma(
     for (int k0 = 0; k0 < k; k0 += 32) {
         for (int cell = tid; cell < 64 * 32; cell += 128) {
             const int row = n0 + cell / 32, col = k0 + cell % 32;
+            const float boost = row < n && __bfloat162float(scales[row]) < 0x1p-64f
+                ? 0x1p64f : 1.0f;
             weight[cell / 32][cell % 32] = row < n && col < k
-                ? weight_at<true>(w,scales,row,col,k,1) : __float2bfloat16(0.0f);
+                ? __float2bfloat16(__bfloat162float(weight_at<true>(w,scales,row,col,k,1)) * boost)
+                : __float2bfloat16(0.0f);
         }
         for (int cell = tid; cell < 16 * 32; cell += 128) {
             const int row = m0 + cell / 32, col = k0 + cell % 32;
@@ -371,7 +374,10 @@ extern "C" __global__ void fp8_channel_bf16_wmma(
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
         const int row = m0 + lane % 16, col = n0 + wave * 16 + 2*j + lane/16;
-        if (row < m && col < n) y[(size_t)row*n+col] = __float2bfloat16(acc[j]);
+        if (row < m && col < n) {
+            const float unscale = __bfloat162float(scales[col]) < 0x1p-64f ? 0x1p-64f : 1.0f;
+            y[(size_t)row*n+col] = __float2bfloat16(acc[j] * unscale);
+        }
     }
 }
 
