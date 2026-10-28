@@ -1,0 +1,8 @@
+{
+  "steps": 4,
+  "cases": [
+    {"name": "text33", "rows": 33, "chunks": [33, 17], "forced": [115, 1301, 3809]},
+    {"name": "text1024", "rows": 1024, "chunks": [1024, 257], "forced": [115, 1301, 3809]},
+    {"name": "text4096", "rows": 4096, "chunks": [4096, 1024], "forced": [115, 1301, 3809]}
+  ]
+}

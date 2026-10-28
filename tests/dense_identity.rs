@@ -152,6 +152,94 @@ struct ReferenceFixtures {
 }
 
 #[test]
+#[ignore = "requires GPU lease, published MiniCPM-V-4.7 FP8 and runtime/evidence directories"]
+fn hybrid_model_identity_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_DENSE_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let target = PathBuf::from(std::env::var("FF_ARGMAX_MODEL")?);
+    let output = PathBuf::from(std::env::var("FF_DENSE_EVIDENCE")?);
+    let runtime = PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
+    let settings = reference_settings(&runtime);
+    drop(Model::calibrate(
+        &target,
+        0,
+        8192,
+        Some(129),
+        settings.clone(),
+    )?);
+    let mut model = Model::load(&target, 0, 8192, Some(129), settings)?;
+    ensure!(
+        model.config.hidden_size == 2048
+            && model.config.num_hidden_layers == 40
+            && model.config.vocab_size == 248144,
+        "MiniCPM-V-4.7 geometry required"
+    );
+    let mut cells = 0;
+    for rows in [33, 1024, 4096] {
+        let ids: Vec<_> = (0..rows)
+            .map(|i| ((i * 269 + 23) % 248144) as u32)
+            .collect();
+        let mut first = Vec::new();
+        for (repeat, graph) in [false, true, false].into_iter().enumerate() {
+            model.reset()?;
+            let mut token = reference_prefill(&mut model, &ids)?;
+            let mut file = std::fs::File::create_new(
+                output.join(format!("text{rows}-repeat{repeat}-graph{graph}.bin")),
+            )?;
+            let mut margin = f32::INFINITY;
+            for step in 0..4 {
+                if step > 0 {
+                    model.set_token([115, 1301, 3809][step - 1])?;
+                    if graph && step == 1 {
+                        model.capture()?;
+                    }
+                    token = model.decode(graph, None)?;
+                }
+                ensure!(
+                    model.position() == rows + step,
+                    "hybrid absolute position mismatch"
+                );
+                let logits = model.decode_logits()?;
+                ensure!(
+                    logits.len() == 248144 && logits.iter().all(|v| v.is_finite()),
+                    "hybrid logits extent/nonfinite"
+                );
+                let mut order: Vec<_> = (0..logits.len()).collect();
+                order.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]).then(a.cmp(&b)));
+                ensure!(
+                    token as usize == order[0],
+                    "hybrid argmax differs from full logits"
+                );
+                margin = margin.min(logits[order[0]] - logits[order[1]]);
+                let bits: Vec<_> = logits.into_iter().map(f32::to_bits).collect();
+                if repeat == 0 {
+                    first.push((token, bits.clone()));
+                } else {
+                    ensure!(
+                        first[step] == (token, bits.clone()),
+                        "hybrid repeat/graph token-logit bit identity rows={rows} step={step}"
+                    );
+                }
+                file.write_all(&token.to_le_bytes())?;
+                for value in bits {
+                    file.write_all(&value.to_le_bytes())?;
+                }
+            }
+            file.flush()?;
+            model.check_ready()?;
+            cells += 1;
+            println!(
+                "HYBRID_MODEL_IDENTITY rows={rows} chunk=129 repeat={repeat} graph={graph} steps=4 min_top_two_margin={margin} bit_identity=true PASS"
+            );
+        }
+    }
+    println!("HYBRID_MODEL_IDENTITY cells={cells} defects=0 PASS");
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires GPU lease, target/draft weights and runtime/evidence directories"]
 fn dense_dspark_identity_gpu() -> Result<()> {
     ensure!(
