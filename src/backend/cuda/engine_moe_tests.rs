@@ -1292,7 +1292,13 @@ impl Engine {
             8,
         )?)?;
         engine.qwen = Some(qwen::Runtime::new(
-            &engine, runtime, catalog, None, scratch, None, 8,
+            &engine,
+            runtime,
+            catalog,
+            None,
+            scratch,
+            None,
+            (8, false),
         )?);
         #[cfg(feature = "rocm")]
         engine.prepare_hip_fixture()?;

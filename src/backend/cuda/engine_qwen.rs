@@ -1063,10 +1063,12 @@ impl Runtime {
             #[cfg(feature = "cuda")]
             verify_rows,
         };
+        #[cfg(feature = "rocm")]
+        runtime.bind_linear_calls(engine, invariant)?;
         Ok(runtime)
     }
     #[cfg(feature = "rocm")]
-    fn bind_linear_calls(&self, engine: &Engine) -> Result<()> {
+    fn bind_linear_calls(&self, engine: &Engine, invariant: bool) -> Result<()> {
         if engine.model_spec.linear_format.fp8_layout().is_none() {
             return Ok(());
         }
@@ -1083,7 +1085,7 @@ impl Runtime {
             .collect::<Result<BTreeSet<_>>>()?;
         for rows in buckets {
             let rows = rows as usize;
-            let invariant = engine.spec.is_some() && rows <= crate::linear_plan::MAX_SKINNY_ROWS;
+            let invariant = invariant && rows <= crate::linear_plan::MAX_SKINNY_ROWS;
             for layer in &self.layers {
                 let input = matrix(&work.n, stream, 0, rows, hidden)?;
                 let (role, width) = match &layer.mixer {
@@ -2213,12 +2215,6 @@ impl Engine {
         if engine.spec.is_some() {
             engine.bind_invariant_arithmetic()?;
         }
-        #[cfg(feature = "rocm")]
-        engine
-            .qwen
-            .as_ref()
-            .context("HIP runtime missing")?
-            .bind_linear_calls(&engine)?;
         engine.prepare(1)?;
         engine.prepare_prefill_plans()?;
         engine
