@@ -4419,7 +4419,7 @@ impl Engine {
                             s,
                             &debug_name(trace, i, "qkv_prepared"),
                             &w.qkv,
-                            rows,
+                            linear_rows,
                             q_stride,
                         )?;
                     }
