@@ -1,0 +1,102 @@
+{
+  "steps": 8,
+  "cases": [
+    {
+      "name": "short",
+      "rows": 33,
+      "chunks": [
+        33,
+        17
+      ],
+      "forced": [
+        51,
+        127,
+        521,
+        1031,
+        2053,
+        4099,
+        8209
+      ],
+      "reference_floor": {
+        "max_normalized": 0.056108782594668255,
+        "rms_normalized": 0.008139064002242161
+      },
+      "limits": {
+        "max_normalized": 0.11221756518933651,
+        "rms_normalized": 0.016278128004484322
+      }
+    },
+    {
+      "name": "tail",
+      "rows": 129,
+      "chunks": [
+        129,
+        33
+      ],
+      "forced": [
+        79,
+        257,
+        523,
+        1033,
+        2063,
+        4111,
+        8219
+      ],
+      "reference_floor": {
+        "max_normalized": 0.03321978495937388,
+        "rms_normalized": 0.006166981405206237
+      },
+      "limits": {
+        "max_normalized": 0.06643956991874776,
+        "rms_normalized": 0.012333962810412474
+      }
+    },
+    {
+      "name": "long",
+      "rows": 1024,
+      "chunks": [
+        1024,
+        129
+      ],
+      "forced": [
+        83,
+        263,
+        541,
+        1039,
+        2069,
+        4127,
+        8221
+      ],
+      "reference_floor": {
+        "max_normalized": 0.046819330409240224,
+        "rms_normalized": 0.00824140813334885
+      },
+      "limits": {
+        "max_normalized": 0.09363866081848045,
+        "rms_normalized": 0.0164828162666977
+      }
+    }
+  ],
+  "limit_rule": "Twice the per-fixture maximum reference variation across same-device chunk shapes and CUDA/HIP; three exact repeats per shape. Frozen before the first HIP model candidate; shifted-vocabulary control exceeds each maximum bound.",
+  "media_limits": {
+    "image_hockey": {
+      "max_normalized": 0.9645815128630935,
+      "rms_normalized": 0.14139979421490959
+    },
+    "image_boat": {
+      "max_normalized": 0.7815779719678922,
+      "rms_normalized": 0.13664030695426238
+    }
+  },
+  "media_reference_floor": {
+    "image_hockey": {
+      "max_normalized": 0.48229075643154673,
+      "rms_normalized": 0.07069989710745479
+    },
+    "image_boat": {
+      "max_normalized": 0.3907889859839461,
+      "rms_normalized": 0.06832015347713119
+    }
+  },
+  "media_limit_rule": "Twice each fixture maximum reference variation across HIP eager/SDPA attention and full/last-row head projection, plus CUDA eager; three exact repeats per variant. Frozen before the first HIP media candidate. Shifted-vocabulary control exceeds each maximum bound."
+}

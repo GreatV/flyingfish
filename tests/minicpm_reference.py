@@ -146,7 +146,8 @@ def sequence(model, ids, forced, chunk, steps):
     for step in range(steps):
         if step:
             row = forward([forced[step - 1]])
-        check(row.numel() == 248144 and torch.isfinite(row).all(), "invalid full-vocabulary logits")
+        check(row.numel() == model.config.text_config.vocab_size and torch.isfinite(row).all(),
+              "invalid full-vocabulary logits")
         values = torch.topk(row, 2).values
         logits.append(row)
         tokens.append(int(row.argmax()))

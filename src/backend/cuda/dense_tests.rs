@@ -117,6 +117,22 @@ fn gdn_core_reference(
 #[test]
 #[ignore = "requires HIP GPU lease and FF_DENSE_GPU_WINDOW=granted"]
 fn hip_gdn_runtime_gpu() -> Result<()> {
+    let minicpm = crate::model_spec::ModelSpec::minicpm(
+        &serde_json::from_str(include_str!("../../../tests/data/minicpm-config.json"))?,
+        &serde_json::json!({"eos_token_id":[248044,248046]}),
+    )?;
+    let qwen = crate::model_spec::ModelSpec::qwen(
+        &serde_json::from_str(include_str!("../../../tests/data/q38-config.json"))?,
+        &serde_json::json!({}),
+    )?;
+    for model in [minicpm, qwen] {
+        hip_gdn_case(model)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "rocm")]
+fn hip_gdn_case(model: crate::model_spec::ModelSpec) -> Result<()> {
     use crate::backend::cuda::gdn::{GdnBindings, GdnOps};
     use crate::backend::cuda::moe::testing::{capture, view};
     use crate::gdn_plan::GdnWorkspace;
@@ -128,17 +144,10 @@ fn hip_gdn_runtime_gpu() -> Result<()> {
     );
     let device = crate::backend::cuda::Device::new(0)?;
     let stream = &device.stream;
-    let model = crate::model_spec::ModelSpec::minicpm(
-        &serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/data/minicpm-config.json"
-        )))?,
-        &serde_json::json!({"eos_token_id":[248044,248046]}),
-    )?;
     let spec = GdnSpec::from_model(&model)?;
     let (heads, cd) = (spec.hv as usize, spec.conv_dim()? as usize);
     ensure!(
-        heads == 32 && cd == 8192 && spec.hk == 16,
+        matches!((heads, cd, spec.hk), (32, 8192, 16) | (48, 10240, 16)),
         "GDN fixture geometry"
     );
     let mut gate = Gate::default();
@@ -146,8 +155,8 @@ fn hip_gdn_runtime_gpu() -> Result<()> {
         let mut store = state::StateStore::new(&model, 129, stream)?;
         gate.check(
             "gdn.store_layout",
-            store.gdn.len() == 30
-                && store.kv.len() == 10
+            store.gdn.len() == if heads == 32 { 30 } else { 48 }
+                && store.kv.len() == if heads == 32 { 10 } else { 16 }
                 && store
                     .gdn
                     .iter()
@@ -326,7 +335,8 @@ fn hip_gdn_runtime_gpu() -> Result<()> {
         for row in 0..n {
             for head in 0..heads {
                 for (side, prepared_side) in prepared[..2].iter().enumerate() {
-                    let base = row * cd + (side * 16 + head / 2) * 128;
+                    let key_heads = spec.hk as usize;
+                    let base = row * cd + (side * key_heads + head / (heads / key_heads)) * 128;
                     let source = &conv_actual[base..base + 128];
                     let scale = (source.iter().map(|v| v.to_f64().powi(2)).sum::<f64>()
                         + f64::from(spec.l2_eps))
@@ -447,7 +457,7 @@ fn hip_gdn_runtime_gpu() -> Result<()> {
             ensure!(differences > 0, "GDN head0-for-head1 control escaped");
             println!("PASS HIP_GDN_CONTROL wrong_state_head differences={differences}");
         }
-        if rows == 1 {
+        if rows == 1 && heads == 32 {
             let norm = pattern(128, 101);
             let z = pattern(heads * 128, 103);
             let dn = stream.clone_htod(&norm)?;
@@ -531,11 +541,11 @@ fn hip_gdn_runtime_gpu() -> Result<()> {
             }
         }
         println!(
-            "HIP_GDN rows={rows} valid={valid} norm_ratio={norm_ratio:e} state_error={error:e} state_bound={bound:e}"
+            "HIP_GDN heads={heads} rows={rows} valid={valid} norm_ratio={norm_ratio:e} state_error={error:e} state_bound={bound:e}"
         );
     }
     println!(
-        "HIP_GDN_SUMMARY cells={} defects={}",
+        "HIP_GDN_SUMMARY heads={heads} cells={} defects={}",
         gate.cells, gate.defects
     );
     ensure!(gate.defects == 0, "GDN defects={}", gate.defects);
@@ -586,7 +596,15 @@ fn dense_runtime_gpu() -> Result<()> {
         if wmma_cells(&info) {
             wmma_gate(&s, &mut gate)?;
             fp8_encoding_gate(&ctx, &s, &mut gate)?;
-            fp8_channel_gate(&ctx, &s, &mut gate)?;
+            for layout in [
+                crate::fp8::Fp8ScaleLayout::PerChannel,
+                crate::fp8::Fp8ScaleLayout::Block(crate::fp8::Fp8BlockScale::new(
+                    [128, 128],
+                    safetensors::Dtype::BF16,
+                )?),
+            ] {
+                fp8_projection_gate(&ctx, &s, &mut gate, layout)?;
+            }
             tcmqa_gate(&ctx, &s, &c, &mut gate)?;
             markov_gate(&ctx, &s, &mut gate)?;
         } else {
@@ -605,32 +623,57 @@ fn dense_runtime_gpu() -> Result<()> {
 }
 
 #[cfg(feature = "rocm")]
-fn fp8_channel_gate(
+fn fp8_projection_gate(
     ctx: &Arc<CudaContext>,
     stream: &Arc<CudaStream>,
     gate: &mut Gate,
+    layout: crate::fp8::Fp8ScaleLayout,
 ) -> Result<()> {
     let module = cubin::module(ctx, "fp8_linear")?;
-    for (n, k) in [(263usize, 257usize), (512, 2048), (2048, 512)] {
+    let mut shapes = vec![
+        (263usize, 257usize, false),
+        (512, 2048, false),
+        (2048, 512, false),
+        (263, 257, true),
+    ];
+    let kind = if layout == crate::fp8::Fp8ScaleLayout::PerChannel {
+        "channel"
+    } else {
+        shapes.push((17408, 5120, false));
+        "block"
+    };
+    for (n, k, tiny) in shapes {
         let codes: Vec<u8> = (0..n * k)
             .map(|i| ((i * 17 % 257) % 127) as u8 | (u8::from(i * 29 % 263 > 131) << 7))
             .collect();
-        let scales: Vec<_> = (0..n)
-            .map(|i| bf16::from_f32((1 + i * 31 % 263) as f32 / 65536.0))
+        let count = layout.scale_shape(n as u32, k as u32).iter().product();
+        let scales: Vec<_> = (0..count)
+            .map(|i| {
+                if tiny {
+                    bf16::from_bits((1 + i * 31 % 263) as u16)
+                } else {
+                    bf16::from_f32((1 + i * 31 % 263) as f32 / 65536.0)
+                }
+            })
             .collect();
-        let input = pattern(33 * k, 19);
-        let reference = fp8_channel_reference(&codes, &scales, &input, k)?;
+        let max_rows = if n > 2048 { 3 } else { 33 };
+        let input = pattern(max_rows * k, 19);
+        let reference = fp8_projection_reference(&codes, &scales, &input, k, layout)?;
         let weights = stream.clone_htod(&codes)?;
         let scale = stream.clone_htod(&scales)?;
         let x = stream.clone_htod(&input)?;
-        let wrong: Vec<_> = scales.iter().cycle().skip(1).take(n).copied().collect();
+        let wrong: Vec<_> = scales.iter().cycle().skip(1).take(count).copied().collect();
         let wrong_scale = stream.clone_htod(&wrong)?;
         let sentinel = bf16::from_bits(0x7fc1);
-        for name in ["fp8_channel_bf16_simt", "fp8_channel_bf16_wmma"] {
-            let function = module.load_function(name)?;
+        for mode in ["simt", "wmma"] {
+            let name = format!("fp8_{kind}_bf16_{mode}");
+            let function = module.load_function(&name)?;
             let tiled = name.ends_with("wmma");
             let mut longest = None;
             for rows in [33usize, 17, 16, 9, 8, 3, 1] {
+                if rows > max_rows {
+                    continue;
+                }
                 let mut y = stream.clone_htod(&vec![sentinel; rows * n + 16])?;
                 let launch = |y: &mut CudaSlice<bf16>, scales: &CudaSlice<bf16>| unsafe {
                     stream
@@ -659,7 +702,7 @@ fn fp8_channel_gate(
                 let graph = capture.finish()?;
                 graph.launch()?;
                 let replay = stream.clone_dtoh(&y)?;
-                let label = format!("fp8.channel.{name}.M{rows}.W[{n},{k}]");
+                let label = format!("fp8.{kind}.{name}.M{rows}.W[{n},{k}].tiny{tiny}");
                 ensure!(
                     eager[..rows * n].iter().all(|v| v.is_finite()),
                     "RUNNER_FAIL {label}: nonfinite output"
@@ -716,25 +759,41 @@ fn fp8_channel_gate(
 }
 
 #[cfg(feature = "rocm")]
-fn fp8_channel_reference(
+fn fp8_projection_reference(
     codes: &[u8],
     scales: &[bf16],
     input: &[bf16],
     k: usize,
+    layout: crate::fp8::Fp8ScaleLayout,
 ) -> Result<Vec<(f64, f64)>> {
     ensure!(
-        k > 0 && codes.len() == scales.len() * k && input.len().is_multiple_of(k),
+        k > 0 && codes.len().is_multiple_of(k) && input.len().is_multiple_of(k),
         "RUNNER_FAIL FP8 reference extents"
     );
-    let mut reference = Vec::with_capacity(input.len() / k * scales.len());
+    let n = codes.len() / k;
+    let shape = layout.scale_shape(n as u32, k as u32);
+    ensure!(scales.len() == shape[0] * shape[1], "FP8 reference scales");
+    let mut reference = Vec::with_capacity(input.len() / k * n);
     let nu = (k + 6) as f64 * 2f64.powi(-24);
     for x in input.chunks_exact(k) {
-        for (row, &scale) in codes.chunks_exact(k).zip(scales) {
-            let (value, absolute) = row.iter().zip(x).fold((0.0f64, 0.0f64), |a, (&w, x)| {
-                let product = f64::from(crate::fp8::effective_weight(w, scale).to_f32())
-                    * f64::from(x.to_f32());
-                (a.0 + product, a.1 + product.abs())
-            });
+        for (i, row) in codes.chunks_exact(k).enumerate() {
+            let (value, absolute) =
+                row.iter()
+                    .zip(x)
+                    .enumerate()
+                    .fold((0.0f64, 0.0f64), |a, (j, (&w, x))| {
+                        let index = match layout {
+                            crate::fp8::Fp8ScaleLayout::PerChannel => i,
+                            crate::fp8::Fp8ScaleLayout::Block(block) => {
+                                let [bn, bk] = block.block();
+                                i / bn as usize * shape[1] + j / bk as usize
+                            }
+                        };
+                        let scale = scales[index];
+                        let product = f64::from(crate::fp8::effective_weight(w, scale).to_f32())
+                            * f64::from(x.to_f32());
+                        (a.0 + product, a.1 + product.abs())
+                    });
             let bound = value.abs() / 256.0 + (nu / (1.0 - nu)) * absolute + 2f64.powi(-134);
             reference.push((value, bound));
         }
@@ -893,7 +952,7 @@ fn fp8_published_expert_gpu() -> Result<()> {
             let hidden_view = contracts::view(&hidden, &s, 0, [rows as u32, 512], [512, 1])?;
             let bound = if name.starts_with("bound_channel") {
                 let bind = |stage: usize, x, y, n: u32, k: u32| {
-                    channel_ops.bind_channel(
+                    channel_ops.bind_native(
                         linear::LinearWeightRef::Fp8 {
                             codes: contracts::view(
                                 &weights[stage].2,
@@ -1027,11 +1086,12 @@ fn fp8_published_expert_gpu() -> Result<()> {
             for (stage, input_index, output_index, k) in
                 [(0, 0, 1, 2048), (1, 0, 2, 2048), (2, 3, 4, 512)]
             {
-                let reference = fp8_channel_reference(
+                let reference = fp8_projection_reference(
                     weights[stage].0,
                     &weights[stage].1,
                     &eager[input_index][..rows * k],
                     k,
+                    crate::fp8::Fp8ScaleLayout::PerChannel,
                 )?;
                 let actual = &eager[output_index][..reference.len()];
                 ensure!(

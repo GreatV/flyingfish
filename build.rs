@@ -287,9 +287,10 @@ fn build_rocm(out: &std::path::Path) {
     );
     for name in ROCM_KERNELS {
         let variants: &[(&str, &[&str])] = if name.starts_with("gdn/") {
-            &[("_h32", &["-DGDN_HEADS=32"])]
+            &[("", &[]), ("_h32", &["-DGDN_HEADS=32"])]
         } else if *name == "tcmqa_d256" {
             &[
+                ("", &[]),
                 (
                     "_q16_kv2",
                     &["-DATTENTION_Q_HEADS=16", "-DATTENTION_KV_HEADS=2"],

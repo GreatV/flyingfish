@@ -537,9 +537,10 @@ impl Runtime {
     pub(super) fn checkpoint_path(&self) -> &Path {
         &self.checkpoint_dir
     }
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(test)]
     pub(super) fn position_values(&self, stream: &Arc<CudaStream>) -> Result<Vec<i32>> {
-        Ok(stream.clone_dtoh(&self.positions)?)
+        let values = stream.clone_dtoh(&self.positions)?;
+        Ok(values)
     }
     pub(super) fn vision_bytes(&self) -> usize {
         self.vision_bytes
@@ -1147,6 +1148,28 @@ impl Runtime {
                     &TensorMut(matrix(&work.out, stream, 0, rows, hidden)?),
                     invariant,
                 )?;
+                if matches!(layer.ffn, BoundFfn::Dense) {
+                    let intermediate = engine.model_spec.intermediate as usize;
+                    for (role, offset) in [
+                        ("mlp.gate_proj.weight", 0),
+                        ("mlp.up_proj.weight", extent * intermediate),
+                    ] {
+                        layer.linear.bind_call(
+                            ops,
+                            role,
+                            input,
+                            &TensorMut(matrix(&work.gu, stream, offset, rows, intermediate)?),
+                            invariant,
+                        )?;
+                    }
+                    layer.linear.bind_call(
+                        ops,
+                        "mlp.down_proj.weight",
+                        matrix(&work.act, stream, 0, rows, intermediate)?,
+                        &TensorMut(matrix(&work.out, stream, 0, rows, hidden)?),
+                        invariant,
+                    )?;
+                }
             }
         }
         Ok(())
@@ -1608,10 +1631,13 @@ impl Engine {
         let reserve_mtp = false;
         #[cfg(feature = "rocm")]
         ensure!(
-            model_spec.architecture == crate::model_spec::Architecture::MiniCpmV47
-                && !settings.prefix_cache
+            matches!(
+                model_spec.architecture,
+                crate::model_spec::Architecture::MiniCpmV47
+                    | crate::model_spec::Architecture::Qwen35Text
+            ) && !settings.prefix_cache
                 && settings.kv_format == crate::kv::KvFormat::Bf16,
-            "HIP hybrid setup requires MiniCPM-V-4.7 text with BF16 KV and no persistent prefix cache"
+            "HIP hybrid setup requires MiniCPM-V-4.7 or Qwen3.8 with BF16 KV and no persistent prefix cache"
         );
         ensure!(
             model_spec.moe.is_none() || !reserve_mtp,
