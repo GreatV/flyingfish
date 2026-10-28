@@ -917,6 +917,7 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
     };
     let mut engine = super::engine::Engine::load(&dir, 0, 640, Some(640), settings)?;
     let mut defects = 0usize;
+    let mut first = true;
     for (tag, prefill) in [("a", 0usize), ("b", 0), ("wrap", 512)] {
         let sequence: Vec<u32> = if tag == "wrap" {
             serde_json::from_value(ids["wrap"].clone())?
@@ -925,7 +926,10 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         };
         let bounds = &frozen["families"][tag];
         for (mode, cached) in [("prefill", false), ("decode", true)] {
-            engine.reset()?;
+            if !first {
+                engine.reset()?;
+            }
+            first = false;
             let actual = if cached {
                 native_path(&mut engine, &sequence, prefill)?
             } else {
