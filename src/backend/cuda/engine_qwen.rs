@@ -537,7 +537,7 @@ impl Runtime {
     pub(super) fn checkpoint_path(&self) -> &Path {
         &self.checkpoint_dir
     }
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(test)]
     pub(super) fn position_values(&self, stream: &Arc<CudaStream>) -> Result<Vec<i32>> {
         Ok(stream.clone_dtoh(&self.positions)?)
     }
