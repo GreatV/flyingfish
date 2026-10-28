@@ -973,7 +973,6 @@ impl Blas {
     pub(super) fn has_fixed_plan(&self, rows: u32) -> bool {
         self.plans.borrow().keys().any(|key| key.0 == rows as usize)
     }
-    #[cfg(test)]
     pub(crate) fn linear_f32(
         &self,
         weight: super::contracts::Tensor<f32, 2>,

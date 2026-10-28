@@ -309,13 +309,80 @@ impl MultimodalInput<'_> {
         match spec.architecture {
             Architecture::Qwen35Text => self.validate_qwen(spec, capacity),
             Architecture::MiniCpmV47 => self.validate_minicpm(spec, capacity),
-            Architecture::Llama
-            | Architecture::Flint
-            | Architecture::Glm5Next
-            | Architecture::LoopVl => {
+            Architecture::LoopVl => {
+                self.validate_loopvl(spec.vocab, spec.max_position as usize, capacity)
+            }
+            Architecture::Llama | Architecture::Flint | Architecture::Glm5Next => {
                 bail!("packed images require a supported multimodal architecture")
             }
         }
+    }
+
+    fn validate_loopvl(
+        &self,
+        vocab: u32,
+        max_position: usize,
+        capacity: usize,
+    ) -> Result<PositionPlan> {
+        let rows = self.input_ids.len();
+        ensure!(
+            rows > 0 && rows < capacity && capacity <= max_position,
+            "LoopVL image prompt exceeds KV capacity"
+        );
+        ensure!(
+            self.modality_ids.len() == rows && self.input_ids.iter().all(|&id| id < vocab),
+            "LoopVL input ids or modality extent invalid"
+        );
+        ensure!(self.grids.len() == 1, "LoopVL requires one image grid");
+        let grid = self.grids[0];
+        let count = usize::try_from(u64::from(grid.h) * u64::from(grid.w))?;
+        ensure!(
+            grid.t == 1 && grid.h > 0 && grid.w > 0 && (1..=2048).contains(&count),
+            "LoopVL image grid exceeds the 2048-row vision workspace"
+        );
+        ensure!(
+            self.pixel_values.len() == count * 588
+                && self.pixel_values.iter().all(|x| x.is_finite()),
+            "LoopVL pixels require finite row-major [patch,3,14,14] values"
+        );
+        let begin = self
+            .modality_ids
+            .iter()
+            .position(|&m| m == 1)
+            .context("LoopVL image tokens missing")?;
+        let end = begin
+            .checked_add(count)
+            .context("LoopVL image span overflow")?;
+        ensure!(
+            end < rows
+                && self
+                    .modality_ids
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &m)| m == u8::from((begin..end).contains(&i))),
+            "LoopVL requires one contiguous image span followed by instruction tokens"
+        );
+        let mut plan = PositionPlan::text(rows, capacity)?;
+        let next = begin + grid.h.max(grid.w) as usize;
+        for p in begin..end {
+            plan.axes[0][p] = i32::try_from(begin + (p - begin) / grid.w as usize)?;
+            plan.axes[1][p] = i32::try_from(begin + (p - begin) % grid.w as usize)?;
+        }
+        for p in end..rows {
+            let value = i32::try_from(next + p - end)?;
+            plan.axes[0][p] = value;
+            plan.axes[1][p] = value;
+        }
+        plan.rope_delta = next as i64 - end as i64;
+        plan.patch_rows = count;
+        plan.feature_rows = count;
+        plan.slots.push(ImageSlot {
+            tokens: begin..end,
+            patches: 0..count,
+            features: 0..count,
+            grid,
+        });
+        Ok(plan)
     }
 
     fn validate_qwen(&self, spec: &ModelSpec, capacity: usize) -> Result<PositionPlan> {
@@ -990,6 +1057,58 @@ impl VisionPositions {
 #[cfg(test)]
 mod loopvl_tests {
     use super::*;
+
+    #[test]
+    fn loopvl_compact_positions_and_media_bounds() -> Result<()> {
+        for (h, w) in [(19, 29), (34, 60)] {
+            let count = h * w;
+            let begin = 7;
+            let rows = begin + count + 22;
+            let tokens = vec![1; rows];
+            let mut modality = vec![0; rows];
+            modality[begin..begin + count].fill(1);
+            let pixels = vec![0.25; count * 588];
+            let grids = [ImageGrid {
+                t: 1,
+                h: h as u32,
+                w: w as u32,
+            }];
+            let input = MultimodalInput {
+                input_ids: &tokens,
+                modality_ids: &modality,
+                pixel_values: &pixels,
+                grids: &grids,
+            };
+            let plan = input.validate_loopvl(65536, 8192, rows + 32)?;
+            for p in 0..count {
+                assert_eq!(plan.axes[0][begin + p], (begin + p / w) as i32);
+                assert_eq!(plan.axes[1][begin + p], (begin + p % w) as i32);
+            }
+            assert_eq!(plan.axes[0][begin + count], (begin + h.max(w)) as i32);
+            assert_eq!(plan.decode_position(rows)?, (begin + h.max(w) + 22) as i32);
+            assert_eq!(plan.slots()[0].tokens, begin..begin + count);
+            assert!(input.validate_loopvl(65536, 8192, rows).is_err());
+            assert!(
+                MultimodalInput {
+                    pixel_values: &pixels[..pixels.len() - 1],
+                    ..input
+                }
+                .validate_loopvl(65536, 8192, rows + 32)
+                .is_err()
+            );
+            let mut invalid_modality = modality.clone();
+            invalid_modality[begin + count] = 1;
+            assert!(
+                MultimodalInput {
+                    modality_ids: &invalid_modality,
+                    ..input
+                }
+                .validate_loopvl(65536, 8192, rows + 32)
+                .is_err()
+            );
+        }
+        Ok(())
+    }
 
     fn delegate_grid(width: u32, height: u32, minimum: u32, maximum: u32) -> Result<(u32, u32)> {
         let aspect = f64::from(height) / f64::from(width);

@@ -164,6 +164,9 @@ impl PlannedImage {
 }
 
 fn patch_width(spec: &ModelSpec) -> Result<usize> {
+    if spec.architecture == Architecture::LoopVl {
+        return Ok(3 * 14 * 14);
+    }
     spec.vision
         .as_ref()
         .context("image input requires a vision configuration")?

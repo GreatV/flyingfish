@@ -14,12 +14,14 @@ extern "C" __global__ void rope_table_kv(__nv_bfloat16* qkvg,
     const int position = *start + row;
     if (position < 0 || position >= capacity) { __trap(); return; }
     const int off = row * row_stride + head * dim + d;
-    const __nv_bfloat16 c = table[position * dim + d];
-    const __nv_bfloat16 s = table[position * dim + half + d];
+    const __nv_bfloat16 c0 = table[position * 2 * dim + d];
+    const __nv_bfloat16 s0 = table[position * 2 * dim + half + d];
+    const __nv_bfloat16 c1 = table[position * 2 * dim + dim + d];
+    const __nv_bfloat16 s1 = table[position * 2 * dim + dim + half + d];
     const __nv_bfloat16 a = qkvg[off];
     const __nv_bfloat16 b = qkvg[off + half];
-    const __nv_bfloat16 lo = __hsub(__hmul(a,c), __hmul(b,s));
-    const __nv_bfloat16 hi = __hadd(__hmul(b,c), __hmul(a,s));
+    const __nv_bfloat16 lo = __hsub(__hmul(a,c0), __hmul(b,s0));
+    const __nv_bfloat16 hi = __hadd(__hmul(b,c1), __hmul(a,s1));
     if (head < q_heads) {
         qkvg[off] = lo;
         qkvg[off + half] = hi;

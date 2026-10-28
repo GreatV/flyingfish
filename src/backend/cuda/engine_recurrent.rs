@@ -6,7 +6,6 @@ use crate::backend::cuda::{
     linear::LinearWeightRef,
     ops::{AddRmsNorm, CommonOpsRef},
 };
-#[cfg(test)]
 use crate::backend::cuda::{
     linear::LinearBiasMode,
     ops::{RmsMode, RmsOptions},
@@ -14,21 +13,40 @@ use crate::backend::cuda::{
 };
 use cudarc::driver::{CudaFunction, DevicePtr};
 
-pub(super) const ROWWISE_PREFIX_LIMIT: usize = 64;
-
 pub(super) struct Runtime {
     initial: CudaSlice<bf16>,
     high: CudaSlice<bf16>,
     low: CudaSlice<bf16>,
     rope: CudaSlice<bf16>,
-    lengths: CudaSlice<i32>,
+    prefix: usize,
     meta: CudaSlice<i32>,
     embed: CudaFunction,
     rotary: CudaFunction,
     common: CommonOpsRef,
     program: Vec<(bool, usize)>,
+    vision: VisionRuntime,
+    vision_weights: LoopvlVisionWeights,
+    media: Option<Media>,
     #[cfg(test)]
     control: u8,
+}
+
+struct Media {
+    work: VisionWorkspace,
+    anchor: CudaSlice<bf16>,
+    slot: crate::vision_input::ImageSlot,
+}
+
+impl Runtime {
+    pub(super) fn reset(&mut self, s: &Arc<CudaStream>, capacity: usize) -> Result<()> {
+        self.media = None;
+        self.prefix = 0;
+        s.memcpy_htod(
+            &yarn_table(&(0..capacity).map(|p| [p, p]).collect::<Vec<_>>()),
+            &mut self.rope,
+        )?;
+        Ok(())
+    }
 }
 
 fn matrix(
@@ -46,7 +64,6 @@ fn matrix(
     )
 }
 
-#[cfg(test)]
 fn vector(b: &CudaSlice<bf16>, s: &Arc<CudaStream>, width: usize) -> Result<Tensor<bf16, 1>> {
     view(b, s, 0, [u32::try_from(width)?], [1])
 }
@@ -71,7 +88,7 @@ fn linear(
     )
 }
 
-fn yarn_table(capacity: usize) -> Vec<bf16> {
+fn yarn_table(positions: &[[usize; 2]]) -> Vec<bf16> {
     let correction = |rotations: f32| {
         128.0 * (4096.0 / (rotations * 2.0 * std::f32::consts::PI)).ln() / (2.0 * 10000.0f32.ln())
     };
@@ -85,12 +102,14 @@ fn yarn_table(capacity: usize) -> Vec<bf16> {
         })
         .collect();
     let scale = (0.1 * 2.0f64.ln() + 1.0) as f32;
-    (0..capacity)
-        .flat_map(|p| {
+    positions
+        .iter()
+        .flat_map(|axes| {
             let inv = &inv;
-            (0..128).map(move |d| {
+            (0..256).map(move |d| {
+                let p = axes[d / 128];
                 let angle = p as f32 * inv[d % 64];
-                bf16::from_f32(if d < 64 {
+                bf16::from_f32(if d % 128 < 64 {
                     angle.cos() * scale
                 } else {
                     angle.sin() * scale
@@ -100,7 +119,6 @@ fn yarn_table(capacity: usize) -> Vec<bf16> {
         .collect()
 }
 
-#[cfg(test)]
 struct VisionWorkspace {
     x: CudaSlice<bf16>,
     n: CudaSlice<bf16>,
@@ -112,7 +130,6 @@ struct VisionWorkspace {
     k: CudaSlice<bf16>,
     v: CudaSlice<bf16>,
     positions: CudaSlice<i32>,
-    lengths: CudaSlice<i32>,
     start: CudaSlice<i32>,
     meta: CudaSlice<i32>,
     f32_a: CudaSlice<f32>,
@@ -125,7 +142,6 @@ struct VisionWorkspace {
     gate_query: CudaSlice<f32>,
 }
 
-#[cfg(test)]
 impl VisionWorkspace {
     fn new(s: &Arc<CudaStream>, rows: usize) -> Result<Self> {
         Ok(Self {
@@ -139,7 +155,6 @@ impl VisionWorkspace {
             k: s.alloc_zeros(rows * 1024)?,
             v: s.alloc_zeros(rows * 1024)?,
             positions: s.alloc_zeros(rows * 2)?,
-            lengths: s.alloc_zeros(rows)?,
             start: s.alloc_zeros(1)?,
             meta: s.clone_htod(&[0i32, rows as i32, rows as i32, rows as i32, 1, 0, 0, 0])?,
             f32_a: s.alloc_zeros(rows * 1536)?,
@@ -154,7 +169,6 @@ impl VisionWorkspace {
     }
 }
 
-#[cfg(test)]
 struct VisionEncoderCall<'a> {
     weights: &'a LoopvlVisionWeights,
     pixels: &'a CudaSlice<bf16>,
@@ -163,7 +177,6 @@ struct VisionEncoderCall<'a> {
     grid_w: usize,
 }
 
-#[cfg(test)]
 struct ReinjectCall<'a> {
     weights: &'a LoopvlVisionWeights,
     states: &'a mut CudaSlice<bf16>,
@@ -175,10 +188,12 @@ struct ReinjectCall<'a> {
     cycle: usize,
 }
 
-#[cfg(test)]
 struct VisionRuntime {
+    #[cfg(test)]
     reinjection_calls: std::cell::Cell<usize>,
+    #[cfg(test)]
     encoder_calls: std::cell::Cell<usize>,
+    #[cfg(test)]
     projector_calls: std::cell::Cell<usize>,
     rope_2d: CudaFunction,
     kv_write: CudaFunction,
@@ -194,7 +209,6 @@ struct VisionRuntime {
     ops: Ops,
 }
 
-#[cfg(test)]
 fn f32_weight(
     bytes: &CudaSlice<u8>,
     s: &Arc<CudaStream>,
@@ -215,7 +229,6 @@ fn f32_weight(
     }
 }
 
-#[cfg(test)]
 fn matrix32(
     b: &CudaSlice<f32>,
     s: &Arc<CudaStream>,
@@ -231,14 +244,16 @@ fn matrix32(
     )
 }
 
-#[cfg(test)]
 impl VisionRuntime {
     fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
         let rope = cubin::module(ctx, "rope")?;
         let vision = cubin::module(ctx, "vision_ops")?;
         Ok(Self {
+            #[cfg(test)]
             reinjection_calls: std::cell::Cell::new(0),
+            #[cfg(test)]
             encoder_calls: std::cell::Cell::new(0),
+            #[cfg(test)]
             projector_calls: std::cell::Cell::new(0),
             rope_2d: rope.load_function("rope_2d_qk")?,
             kv_write: rope.load_function("kv_write")?,
@@ -255,15 +270,15 @@ impl VisionRuntime {
         })
     }
 
-    #[cfg(test)]
     fn run_encoder(
         &self,
         blas: &mut Blas,
-        attention: &mut Attention,
+        attention: &mut Flash,
         s: &Arc<CudaStream>,
         work: &mut VisionWorkspace,
         call: VisionEncoderCall<'_>,
     ) -> Result<()> {
+        #[cfg(test)]
         self.encoder_calls.set(self.encoder_calls.get() + 1);
         let VisionEncoderCall {
             weights,
@@ -283,7 +298,7 @@ impl VisionRuntime {
             (6144, 1024),
             (1024, 3072),
         ] {
-            blas.prepare_fixed(rows as u32, output as u32, input as u32)?;
+            blas.prepare_request_fixed(rows as u32, output as u32, input as u32)?;
         }
         blas.prepare_biased(
             rows as u32,
@@ -307,7 +322,6 @@ impl VisionRuntime {
         let axis1: Vec<i32> = positions.iter().skip(1).step_by(2).copied().collect();
         s.memcpy_htod(&axis0, &mut work.positions.slice_mut(..rows))?;
         s.memcpy_htod(&axis1, &mut work.positions.slice_mut(rows..rows * 2))?;
-        s.memcpy_htod(&vec![rows as i32; rows], &mut work.lengths)?;
         let domain = RowDomain {
             meta: SeqRef {
                 ptr: work.meta.device_ptr(s).0,
@@ -382,22 +396,23 @@ impl VisionRuntime {
                     .arg(&(rows as i32))
                     .launch(flat(rows * 1024))?;
             }
-            for row in 0..rows {
-                attention.run_with(
-                    s,
-                    GqaDecodeInput {
-                        q: &work.qkv,
-                        q_offset: row * 4096,
-                        k: &work.k,
-                        v: &work.v,
-                        output: &mut work.attn,
-                        output_offset: row * 2048,
-                        length: &work.lengths.slice(row..row + 1),
-                        sinks: None,
-                        window: None,
-                    },
-                )?;
-            }
+            attention.run(
+                &work.qkv,
+                4096,
+                &work.k,
+                &work.v,
+                &mut work.attn,
+                super::super::flash::Shape {
+                    rows,
+                    start: 0,
+                    q_heads: 16,
+                    kv_heads: 8,
+                    capacity: rows,
+                    head_dim: 128,
+                    causal: false,
+                    window_left: None,
+                },
+            )?;
             linear(
                 blas,
                 s,
@@ -467,6 +482,7 @@ impl VisionRuntime {
         work: &mut VisionWorkspace,
         rows: usize,
     ) -> Result<()> {
+        #[cfg(test)]
         self.projector_calls.set(self.projector_calls.get() + 1);
         ensure!(rows > 0, "vision projector requires rows");
         unsafe {
@@ -542,6 +558,7 @@ impl VisionRuntime {
                 && instruction_end <= states.len() / 1536,
             "reinjection mask extent"
         );
+        #[cfg(test)]
         self.reinjection_calls.set(self.reinjection_calls.get() + 1);
         unsafe {
             s.launch_builder(&self.masked_mean)
@@ -639,20 +656,21 @@ impl Engine {
             settings.kv_format == crate::kv::KvFormat::Bf16,
             "LoopVL requires BF16 KV"
         );
-        let rows = ROWWISE_PREFIX_LIMIT.min(capacity - 1);
+        let rows = capacity - 1;
         ensure!(
             requested_chunk.is_none_or(|n| n == rows),
-            "LoopVL bidirectional prefix cannot be chunked; ROWWISE_PREFIX_LIMIT={rows}"
+            "LoopVL bidirectional prefix requires a whole-prompt workspace of {rows} rows"
         );
         let device = Device::new(ordinal)?;
         let config = model_spec.config();
         let manifest = crate::checkpoint::MappedCheckpoint::open(dir)?
-            .manifest(&model_spec, crate::checkpoint::LoadPolicy::TextOnly)?;
+            .manifest(&model_spec, crate::checkpoint::LoadPolicy::TextWithVision)?;
         let (free, total) = device.ctx.mem_get_info()?;
         let row_bytes = crate::work_layout::RowWorkSpec::new(&model_spec)?.row_bytes()?
-            + 4 * config.hidden_size;
+            + 4 * config.hidden_size
+            + config.num_attention_heads * 4;
         let fixed =
-            manifest.resident_bytes + rows * row_bytes + capacity * 128 * 2 + 8 * 1024 * 1024;
+            manifest.resident_bytes + rows * row_bytes + capacity * 256 * 2 + 8 * 1024 * 1024;
         let per_token = model_spec.layers.len() * 2 * config.kv_dim() * 2;
         let available = free
             .checked_sub(total / 16 + fixed)
@@ -663,6 +681,7 @@ impl Engine {
             "LoopVL KV_CAPACITY_LIMIT={admitted}; requested={capacity}"
         );
         let (weights, initial) = Weights::load_loopvl(dir, &model_spec, &device)?;
+        let vision_weights = LoopvlVisionWeights::load(dir, &model_spec, &device)?;
         let s = &device.stream;
         let state = super::super::state::StateStore::new(&model_spec, capacity, s)?;
         let checkpoint = super::super::state::StateCheckpoint::new(&state, &model_spec, 1, s)?;
@@ -674,7 +693,7 @@ impl Engine {
         let runtime = settings.runtime_dir.clone().unwrap_or_default();
         let mut blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
         blas.bind_invariant(&device.ctx, 1)?;
-        for n in 1..=rows {
+        for n in [1] {
             for (output, input) in [
                 (4 * config.hidden_size, config.hidden_size),
                 (config.hidden_size, config.hidden_size),
@@ -699,18 +718,24 @@ impl Engine {
             initial,
             high: s.alloc_zeros(rows * config.hidden_size)?,
             low: s.alloc_zeros(rows * config.hidden_size)?,
-            rope: s.clone_htod(&yarn_table(capacity))?,
-            lengths: s.alloc_zeros(rows)?,
-            // Elementwise gate metadata spans the workspace; attention uses lengths.
+            rope: s.clone_htod(&yarn_table(
+                &(0..capacity).map(|p| [p, p]).collect::<Vec<_>>(),
+            ))?,
+            prefix: 0,
+            // Elementwise metadata spans the workspace; attention uses the request prefix.
             meta: s.clone_htod(&[0i32, rows as i32, rows as i32, capacity as i32, 1, 0, 0, 0])?,
             embed: cubin::module(&device.ctx, "embed")?.load_function("embed_scale_broadcast")?,
             rotary: cubin::module(&device.ctx, "rope")?.load_function("rope_table_kv")?,
             common: CommonOpsRef::new(&device.ctx)?,
             program: (0..8).map(|call| (call % 4 == 3, call * 16)).collect(),
+            vision: VisionRuntime::new(&device.ctx)?,
+            vision_weights,
+            media: None,
             #[cfg(test)]
             control: 0,
         };
         let work = Work::new(s, &model_spec, rows)?;
+        let flash = Flash::new(s.clone(), rows, 12, 12, 128)?;
         let mut engine = Self {
             #[cfg(test)]
             capture_fail_after_layer: None,
@@ -752,7 +777,7 @@ impl Engine {
             work,
             ops,
             blas,
-            flash: None,
+            flash: Some(flash),
             decode: Some(decode),
             flint_logits: None,
             device,
@@ -780,6 +805,102 @@ impl Engine {
         Ok(engine)
     }
 
+    pub(super) fn prefill_recurrent_media(
+        &mut self,
+        input: &crate::vision_input::MultimodalInput<'_>,
+        trace: Option<&mut Trace>,
+    ) -> Result<u32> {
+        self.closure.assert_ready()?;
+        ensure!(
+            !self.poisoned && self.position == 0,
+            "LoopVL image prefill requires reset"
+        );
+        let plan = input.validate(&self.model_spec, self.capacity)?;
+        ensure!(
+            input.input_ids.len() <= self.chunk,
+            "LoopVL image prompt exceeds prefix workspace"
+        );
+        let slot = plan.slots()[0].clone();
+        let rows = slot.tokens.len();
+        let (free, total) = self.device.ctx.mem_get_info()?;
+        // Workspace, pixels, anchor and attention LSE: 73,130 B/patch plus 4,132 B.
+        ensure!(
+            free.checked_sub(total / 16)
+                .is_some_and(|n| rows * 73_130 + 4_132 <= n),
+            "LoopVL vision request exceeds device memory budget"
+        );
+        let s = &self.device.stream;
+        let mut work = VisionWorkspace::new(s, rows)?;
+        let pixels = input
+            .pixel_values
+            .iter()
+            .copied()
+            .map(bf16::from_f32)
+            .collect::<Vec<_>>();
+        ensure!(
+            pixels.iter().all(|p| p.is_finite()),
+            "LoopVL pixels overflow BF16"
+        );
+        let pixels = s.clone_htod(&pixels)?;
+        let mut attention = Flash::new(s.clone(), rows, 16, 8, 128)?;
+        let runtime = self
+            .recurrent
+            .as_mut()
+            .context("recurrent runtime missing")?;
+        let result = (|| -> Result<()> {
+            runtime.vision.run_encoder(
+                &mut self.blas,
+                &mut attention,
+                s,
+                &mut work,
+                VisionEncoderCall {
+                    weights: &runtime.vision_weights,
+                    pixels: &pixels,
+                    rows,
+                    grid_h: slot.grid.h as usize,
+                    grid_w: slot.grid.w as usize,
+                },
+            )?;
+            runtime.vision.run_projector(
+                &self.blas,
+                &runtime.vision_weights,
+                s,
+                &mut work,
+                rows,
+            )?;
+            let axes = plan.packed_axes()?;
+            let positions = axes
+                .chunks_exact(3)
+                .map(|p| [p[0] as usize, p[1] as usize])
+                .collect::<Vec<_>>();
+            #[cfg(test)]
+            let positions = if runtime.control == 4 {
+                (0..self.capacity).map(|p| [p, p]).collect()
+            } else if runtime.control == 7 {
+                positions.into_iter().map(|p| [p[1], p[0]]).collect()
+            } else {
+                positions
+            };
+            s.memcpy_htod(&yarn_table(&positions), &mut runtime.rope)?;
+            runtime.media = Some(Media {
+                work,
+                anchor: s.alloc_zeros(rows * 1536)?,
+                slot,
+            });
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.poisoned = true;
+            return Err(error);
+        }
+        self.prefill_recurrent(
+            input.input_ids,
+            input.input_ids.len(),
+            trace,
+            input.input_ids.len(),
+        )
+    }
+
     pub(super) fn prefill_recurrent(
         &mut self,
         ids: &[u32],
@@ -794,7 +915,7 @@ impl Engine {
         );
         ensure!(
             !ids.is_empty() && ids.len() <= self.chunk,
-            "LoopVL ROWWISE_PREFIX_LIMIT={} exceeded: rows={}",
+            "LoopVL prefix workspace={} exceeded: rows={}",
             self.chunk,
             ids.len()
         );
@@ -806,26 +927,21 @@ impl Engine {
             ids.iter().all(|&v| v < self.model_spec.vocab),
             "LoopVL input id outside vocabulary"
         );
+        for (output, input) in [
+            (4 * self.config.hidden_size, self.config.hidden_size),
+            (self.config.hidden_size, self.config.hidden_size),
+            (2 * self.config.intermediate_size, self.config.hidden_size),
+            (self.config.hidden_size, self.config.intermediate_size),
+        ] {
+            self.blas
+                .prepare_request_fixed(ids.len() as u32, output as u32, input as u32)?;
+        }
         let s = &self.device.stream;
         s.memcpy_htod(ids, &mut self.work.ids.slice_mut(..ids.len()))?;
-        let lengths: Vec<_> = (0..ids.len())
-            .map(|r| {
-                if r < prefix {
-                    prefix as i32
-                } else {
-                    (r + 1) as i32
-                }
-            })
-            .collect();
-        s.memcpy_htod(
-            &lengths,
-            &mut self
-                .recurrent
-                .as_mut()
-                .context("recurrent runtime missing")?
-                .lengths
-                .slice_mut(..ids.len()),
-        )?;
+        self.recurrent
+            .as_mut()
+            .context("recurrent runtime missing")?
+            .prefix = prefix;
         if let Err(e) = self.run_recurrent(
             ids.len(),
             false,
@@ -873,6 +989,17 @@ impl Engine {
             row_capacity: rows as u32,
         };
         unsafe {
+            let (visual, visual_begin, visual_rows) = if !token {
+                r.media.as_ref().map_or((&self.weights.embed, 0, 0), |m| {
+                    (
+                        &m.work.projected_bf16,
+                        m.slot.tokens.start as i32,
+                        m.slot.tokens.len() as i32,
+                    )
+                })
+            } else {
+                (&self.weights.embed, 0, 0)
+            };
             s.launch_builder(&r.embed)
                 .arg(&self.weights.embed)
                 .arg(if token { &w.token } else { &w.ids })
@@ -882,9 +1009,44 @@ impl Engine {
                 .arg(&(rows as i32))
                 .arg(&(h as i32))
                 .arg(&(39.191835884530846f64 as f32))
+                .arg(visual)
+                .arg(&visual_begin)
+                .arg(&visual_rows)
                 .launch(flat(rows * h))?;
         }
+        if !token && let Some(media) = &mut r.media {
+            s.memcpy_dtod(
+                &r.high
+                    .slice(media.slot.tokens.start * h..media.slot.tokens.end * h),
+                &mut media.anchor,
+            )?;
+        }
         for &(high, offset) in &r.program {
+            #[cfg(test)]
+            let skip_reinjection = r.control == 5 && offset == 0;
+            #[cfg(not(test))]
+            let skip_reinjection = false;
+            if !token
+                && !skip_reinjection
+                && offset % 64 == 0
+                && let Some(media) = &mut r.media
+            {
+                r.vision.run_reinject(
+                    &self.blas,
+                    s,
+                    &mut media.work,
+                    ReinjectCall {
+                        weights: &r.vision_weights,
+                        states: &mut r.high,
+                        anchor: &media.anchor,
+                        visual_begin: media.slot.tokens.start,
+                        visual_rows: media.slot.tokens.len(),
+                        instruction_begin: media.slot.tokens.end,
+                        instruction_end: r.prefix,
+                        cycle: offset / 64,
+                    },
+                )?;
+            }
             let (target, other) = if high {
                 (&mut r.high, &r.low)
             } else {
@@ -929,12 +1091,7 @@ impl Engine {
                         .arg(&((4 * h) as i32))
                         .launch(flat(rows * (qh + kh) * (dim / 2)))?;
                 }
-                for row in 0..rows {
-                    let length = if token {
-                        w.length.slice(..)
-                    } else {
-                        r.lengths.slice(row..row + 1)
-                    };
+                if token {
                     self.decode
                         .as_mut()
                         .context("decode attention missing")?
@@ -942,16 +1099,39 @@ impl Engine {
                             s,
                             GqaDecodeInput {
                                 q: &w.qkv,
-                                q_offset: row * 4 * h,
+                                q_offset: 0,
                                 k: &kv.k,
                                 v: &kv.v,
                                 output: &mut w.attn,
-                                output_offset: row * h,
-                                length: &length,
+                                output_offset: 0,
+                                length: &w.length,
                                 sinks: None,
                                 window: None,
                             },
                         )?;
+                } else {
+                    self.flash
+                        .as_mut()
+                        .context("native prefix attention missing")?
+                        .run_masked(super::super::flash::Query {
+                            q: &w.qkv,
+                            q_row_stride: 4 * h,
+                            k: &kv.k,
+                            v: &kv.v,
+                            out: &mut w.attn,
+                            keys: rows,
+                            prefix: Some(r.prefix),
+                            shape: super::super::flash::Shape {
+                                rows,
+                                start: 0,
+                                q_heads: qh,
+                                kv_heads: kh,
+                                capacity: self.capacity,
+                                head_dim: dim,
+                                causal: false,
+                                window_left: None,
+                            },
+                        })?;
                 }
                 let attn = view(
                     &w.attn,
@@ -1290,16 +1470,7 @@ mod tests {
             let pixels: Vec<bf16> = pixels.into_iter().map(bf16::from_f32).collect();
             let pixels = s.clone_htod(&pixels)?;
             let mut work = VisionWorkspace::new(s, rows)?;
-            let mut config = spec.config();
-            config.num_attention_heads = 16;
-            config.num_key_value_heads = 8;
-            let plan = crate::backend::setup::AttentionPlan {
-                chunk: 64,
-                qpack: 1,
-                threads: 128,
-                merge_threads: 128,
-            };
-            let mut attention = Attention::new(&d.ctx, s, &config, rows, plan)?;
+            let mut attention = Flash::new(s.clone(), rows, 16, 8, 128)?;
             let encoder_before = runtime.encoder_calls.get();
             runtime.run_encoder(
                 &mut blas,
@@ -1591,6 +1762,17 @@ mod tests {
                 engine.reset()?;
                 let mut trace = Trace::default();
                 engine.prefill(&prompt, Some(&mut trace))?;
+                ensure!(
+                    engine
+                        .recurrent
+                        .as_ref()
+                        .context("recurrent runtime")?
+                        .vision
+                        .encoder_calls
+                        .get()
+                        == 0,
+                    "DEFECT text-only request called the vision encoder"
+                );
                 let prefill = engine.decode_logits()?;
                 defects += usize::from(!compare(
                     &format!("{case} prefill graph={graph}"),
@@ -1692,10 +1874,8 @@ mod tests {
         );
         engine.reset()?;
         ensure!(
-            engine
-                .prefill(&[6; ROWWISE_PREFIX_LIMIT + 1], None)
-                .is_err(),
-            "DEFECT ROWWISE_PREFIX_LIMIT accepted excess row"
+            engine.prefill(&vec![6; engine.capacity], None).is_err(),
+            "DEFECT prefix workspace accepted capacity rows"
         );
         ensure!(
             engine.position == 0,
@@ -1723,7 +1903,257 @@ mod tests {
             "DEFECT loopvl_text_gpu comparisons_failed={defects}"
         );
         println!(
-            "PASS loopvl_text_gpu fixtures=3 teacher_forced_steps=32 modes=eager,graph prefill_limit=64 controls=1,2,3,6"
+            "PASS loopvl_text_gpu fixtures=3 teacher_forced_steps=32 modes=eager,graph native_prefix=true controls=1,2,3,6"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn loopvl_image_gpu() -> Result<()> {
+        let dir =
+            PathBuf::from(std::env::var_os("FF_MODEL").context("Runner FAIL FF_MODEL missing")?);
+        let fixtures = PathBuf::from(
+            std::env::var_os("FF_LOOPVL_FIXTURES")
+                .context("Runner FAIL FF_LOOPVL_FIXTURES missing")?,
+        );
+        let settings = Settings {
+            tree_builder: TreeBuilder::Waves,
+            spec_budget: SpecBudget::Chain,
+            spec_graph: false,
+            draft_model: None,
+            prefix_cache: false,
+            kv_format: crate::kv::KvFormat::Bf16,
+            runtime_dir: None,
+        };
+        let mut engine = Engine::load(&dir, 0, 8192, None, settings)?;
+        let mut defects = 0;
+        let mut media_outputs = Vec::new();
+        for (case, rows, steps) in [
+            ("image_hockey", 580, 29),
+            ("image_boat", 2069, 22),
+            ("control_same_grid_boat", 580, 32),
+        ] {
+            let bytes = std::fs::read(fixtures.join(format!("{case}.safetensors")))?;
+            let source = SafeTensors::deserialize(&bytes)?;
+            let prompt = ids(&source, "input_ids")?;
+            let tokens = ids(&source, "oracle_greedy_ids")?;
+            let predictions = ids(&source, "oracle_argmax_ids")?;
+            let reference = floats(&source, "oracle_step_logits")?;
+            let margins = floats(&source, "oracle_top2_margins")?;
+            let pixels = floats(&source, "pixel_values")?;
+            let grid = ids(&source, "grid_sizes")?;
+            let lengths = ids(&source, "header_and_instruction_lengths")?;
+            ensure!(
+                prompt.len() == rows
+                    && tokens.len() == steps
+                    && predictions.len() == steps
+                    && margins.len() == steps
+                    && source.tensor("oracle_step_logits")?.shape() == [steps, 65536]
+                    && grid.len() == 3
+                    && lengths.len() == 2,
+                "Runner FAIL {case} fixture extent"
+            );
+            let grids = [crate::vision_input::ImageGrid {
+                t: grid[0],
+                h: grid[1],
+                w: grid[2],
+            }];
+            let begin = lengths[0] as usize;
+            let count = grid[1] as usize * grid[2] as usize;
+            ensure!(
+                begin + count + lengths[1] as usize == rows,
+                "Runner FAIL {case} image span"
+            );
+            let mut modality = vec![0; rows];
+            modality[begin..begin + count].fill(1);
+            let input = crate::vision_input::MultimodalInput {
+                input_ids: &prompt,
+                modality_ids: &modality,
+                pixel_values: &pixels,
+                grids: &grids,
+            };
+            let mut eager = Vec::new();
+            let mut eager_ids = Vec::new();
+            let mut eager_free = Vec::new();
+            for graph in [false, true] {
+                engine.reset()?;
+                let runtime = &engine
+                    .recurrent
+                    .as_ref()
+                    .context("recurrent runtime")?
+                    .vision;
+                let calls = (
+                    runtime.encoder_calls.get(),
+                    runtime.projector_calls.get(),
+                    runtime.reinjection_calls.get(),
+                );
+                let mut trace = Trace::default();
+                engine.prefill_multimodal(&input, Some(&mut trace))?;
+                let runtime = &engine
+                    .recurrent
+                    .as_ref()
+                    .context("recurrent runtime")?
+                    .vision;
+                let reached = runtime.encoder_calls.get() == calls.0 + 1
+                    && runtime.projector_calls.get() == calls.1 + 1
+                    && runtime.reinjection_calls.get() == calls.2 + 2;
+                defects += usize::from(!reached);
+                println!(
+                    "{} {case} graph={graph} encoder_projector_reinjection_delta=1,1,2 media_reached={reached}",
+                    if reached { "PASS" } else { "DEFECT" }
+                );
+                let prefill = engine.decode_logits()?;
+                defects += usize::from(!compare(
+                    &format!("{case} prefill graph={graph}"),
+                    &prefill,
+                    &reference[..65536],
+                    [0.50, 0.15, 0.06],
+                )?);
+                let low = floats(&source, "l_last_row_cycles")?;
+                let high = floats(&source, "h_last_row_cycles")?;
+                for call in 0..8 {
+                    let tap = trace.values(&format!("prefill.stack.{call}"))?;
+                    let oracle = if call % 4 == 3 {
+                        &high[(call / 4) * 1536..(call / 4 + 1) * 1536]
+                    } else {
+                        let i = call - call / 4;
+                        &low[i * 1536..(i + 1) * 1536]
+                    };
+                    defects += usize::from(!compare(
+                        &format!("{case} stack={call}"),
+                        &tap[(rows - 1) * 1536..],
+                        oracle,
+                        [f32::MAX, 0.20, 0.06],
+                    )?);
+                }
+                let mut trajectory = Vec::with_capacity(reference.len());
+                for step in 0..steps {
+                    if step > 0 {
+                        engine.set_token(tokens[step - 1])?;
+                        engine.decode(graph, None)?;
+                    }
+                    let actual = engine.decode_logits()?;
+                    trajectory.extend_from_slice(&actual);
+                    defects += usize::from(!compare(
+                        &format!("{case} step={step} graph={graph}"),
+                        &actual,
+                        &reference[step * 65536..(step + 1) * 65536],
+                        [0.60, f32::MAX, f32::MAX],
+                    )?);
+                    let prediction = engine.token()?;
+                    let pass = margins[step] < 0.35 || prediction == predictions[step];
+                    defects += usize::from(!pass);
+                    println!(
+                        "{} {case} step={step} graph={graph} id={prediction} oracle={} margin={}",
+                        if pass { "PASS" } else { "DEFECT" },
+                        predictions[step],
+                        margins[step]
+                    );
+                    if graph {
+                        let bits = actual
+                            .iter()
+                            .zip(&eager[step])
+                            .filter(|(a, b): &(&f32, &f32)| a.to_bits() != b.to_bits())
+                            .count();
+                        defects += usize::from(bits != 0 || prediction != eager_ids[step]);
+                        println!(
+                            "{} {case} step={step} graph_eager_bit_mismatches={bits}",
+                            if bits == 0 { "PASS" } else { "DEFECT" }
+                        );
+                    } else {
+                        eager.push(actual);
+                        eager_ids.push(prediction);
+                    }
+                }
+                defects += usize::from(!compare(
+                    &format!("{case} trajectory=[{steps},65536] graph={graph}"),
+                    &trajectory,
+                    &reference,
+                    [0.60, 0.20, 0.06],
+                )?);
+                engine.reset()?;
+                let mut generated = vec![engine.prefill_multimodal(&input, None)?];
+                for _ in 1..steps {
+                    generated.push(engine.decode(graph, None)?);
+                }
+                let text = crate::tokenizer::decode(&dir, &generated)?;
+                println!("TRAJECTORY {case} graph={graph} ids={generated:?} text={text:?}");
+                if graph {
+                    defects += usize::from(generated != eager_free);
+                    println!(
+                        "{} {case} free_running_graph_eager_ids_equal={}",
+                        if generated == eager_free {
+                            "PASS"
+                        } else {
+                            "DEFECT"
+                        },
+                        generated == eager_free
+                    );
+                } else {
+                    eager_free = generated.clone();
+                    media_outputs.push((prefill, generated, text));
+                }
+            }
+            if case == "image_hockey" {
+                for control in [4, 7, 5, 8] {
+                    engine.reset()?;
+                    let runtime = engine.recurrent.as_mut().context("recurrent runtime")?;
+                    runtime.control = control;
+                    let alpha = engine
+                        .device
+                        .stream
+                        .clone_dtoh(&runtime.vision_weights.raw_alpha)?;
+                    if control == 8 {
+                        engine
+                            .device
+                            .stream
+                            .memcpy_htod(&[0u8; 8], &mut runtime.vision_weights.raw_alpha)?;
+                    }
+                    engine.prefill_multimodal(&input, None)?;
+                    let wrong = engine.decode_logits()?;
+                    let detected = !compare(
+                        &format!("control{control}_image_candidate"),
+                        &wrong,
+                        &reference[..65536],
+                        [0.50, 0.15, 0.06],
+                    )?;
+                    defects += usize::from(!detected);
+                    println!(
+                        "{} control{control}_image_logits_detected={detected}",
+                        if detected { "PASS" } else { "DEFECT" }
+                    );
+                    let runtime = engine.recurrent.as_mut().context("recurrent runtime")?;
+                    runtime.control = 0;
+                    engine
+                        .device
+                        .stream
+                        .memcpy_htod(&alpha, &mut runtime.vision_weights.raw_alpha)?;
+                }
+            }
+        }
+        let shift = media_outputs[0]
+            .0
+            .iter()
+            .zip(&media_outputs[2].0)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let distinct = media_outputs
+            .iter()
+            .enumerate()
+            .all(|(i, a)| media_outputs[..i].iter().all(|b| a.1 != b.1 && a.2 != b.2));
+        defects += usize::from(shift < 4.0 || !distinct);
+        println!(
+            "{} same_grid_media_logit_shift={shift} min=4 distinct_ids_and_text={distinct}",
+            if shift >= 4.0 && distinct {
+                "PASS"
+            } else {
+                "DEFECT"
+            }
+        );
+        ensure!(defects == 0, "DEFECT loopvl_image_gpu failures={defects}");
+        println!(
+            "PASS loopvl_image_gpu fixtures=3 teacher_forced_steps=29,22,32 graph_eager_bits=0 controls=4,5 media_reached=true"
         );
         Ok(())
     }

@@ -2380,6 +2380,10 @@ impl Engine {
                 decode.reset()?;
             }
             self.images = None;
+            #[cfg(feature = "cuda")]
+            if let Some(recurrent) = self.recurrent.as_mut() {
+                recurrent.reset(&self.device.stream, self.capacity)?;
+            }
             self.reset_qwen_positions()?;
         }
         self.state.reset(&self.device.stream)?;
