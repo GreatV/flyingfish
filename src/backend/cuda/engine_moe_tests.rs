@@ -3922,7 +3922,7 @@ fn published_residency(engine: &Engine, model: &Path) -> Result<usize> {
     let mut y = stream.alloc_zeros::<bf16>(2048)?;
     let x = qwen::matrix(&x, stream, 0, 1, 2048)?;
     let mut out = TensorMut(qwen::matrix(&y, stream, 0, 1, 2048)?);
-    let ids = [0i32, 1, 4, 5, 8, 9, 12, 13];
+    let ids = [0i32, 3, 4, 7, 8, 11, 12, 15];
     let weights = [bf16::from_f32(0.125); 8];
     let reference_slots = engine
         .moe_slots
@@ -4175,8 +4175,7 @@ fn published_streamed_model_gpu() -> Result<()> {
         let mut eager = Vec::new();
         for (repeat, graph) in [false, true, false].into_iter().enumerate() {
             engine.reset()?;
-            engine.prefill(&ids[..17], None)?;
-            let mut token = engine.prefill(&ids[17..], None)?;
+            let mut token = engine.prefill(&ids, None)?;
             let mut maximum = 0.0f64;
             let mut rms = 0.0f64;
             let mut min_margin = f32::INFINITY;
@@ -4250,7 +4249,7 @@ fn published_streamed_model_gpu() -> Result<()> {
             defects += cell_defects;
             cells += 1;
             println!(
-                "PUBLISHED_STREAMED_MODEL rows={rows} prefix=17 graph={graph} repeat={repeat} max_normalized={maximum:e} rms_normalized={rms:e} max_limit={max_limit} rms_limit={rms_limit} min_margin={min_margin} stats={stats:?} defects={cell_defects}"
+                "PUBLISHED_STREAMED_MODEL rows={rows} decode_prefix={rows} graph={graph} repeat={repeat} max_normalized={maximum:e} rms_normalized={rms:e} max_limit={max_limit} rms_limit={rms_limit} min_margin={min_margin} stats={stats:?} defects={cell_defects}"
             );
         }
     }
