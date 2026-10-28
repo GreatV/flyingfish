@@ -2052,112 +2052,121 @@ mod tests {
             )))?,
             &serde_json::json!({"eos_token_id": [248044, 248046]}),
         )?;
-        let spec = FullAttentionSpec::from_model(&model)?;
-        ensure!(
-            spec.hq == 16 && spec.hkv == 2 && spec.d == 256,
-            "fixture geometry"
-        );
-        let mut cases = 0;
-        let mut defects = 0;
-        for (rows, valid, prefix) in [
-            (1, 1, 257),
-            (3, 3, 23),
-            (17, 17, 127),
-            (37, 33, 263),
-            (65, 65, 23),
-            (129, 127, 257),
-        ] {
-            for chunk in [128, 256] {
-                let base = Case {
-                    spec,
-                    remap: true,
-                    graph: false,
-                    mutant: false,
-                    flash: false,
-                    prefix,
-                    valid_rows: valid,
-                    max_rows: rows,
-                    capacity: 4096,
-                    key_chunk: chunk,
-                    axes: None,
-                    oracle: true,
-                    boundary_probe: None,
-                };
-                let reference = run_shape(&device, base)?;
-                let graph = run_shape(
-                    &device,
-                    Case {
-                        graph: true,
-                        ..base
-                    },
-                )?;
-                let mismatches = reference
-                    .core_out
-                    .iter()
-                    .zip(&graph.core_out)
-                    .chain(reference.q.iter().zip(&graph.q))
-                    .chain(reference.k_cache.iter().zip(&graph.k_cache))
-                    .chain(reference.v_cache.iter().zip(&graph.v_cache))
-                    .filter(|(a, b)| a.to_bits() != b.to_bits())
-                    .count();
-                let bad = reference.oracle_mismatches + graph.oracle_mismatches + mismatches;
-                println!(
-                    "HIP_HD256 rows={rows} valid={valid} prefix={prefix} key_chunk={chunk} mismatches={bad}"
-                );
-                cases += 2;
-                defects += usize::from(bad != 0);
-                let positions: Vec<i32> = (0..rows)
-                    .flat_map(|row| [prefix as i32 + row as i32; 3])
-                    .collect();
-                let positions = device.stream.clone_htod(&positions)?;
-                for captured in [false, true] {
-                    let axes = run_shape(
+        let qwen = crate::model_spec::ModelSpec::qwen(
+            &serde_json::from_str(include_str!("../../../tests/data/q38-config.json"))?,
+            &serde_json::json!({}),
+        )?;
+        for model in [model, qwen] {
+            let spec = FullAttentionSpec::from_model(&model)?;
+            ensure!(
+                matches!((spec.hq, spec.hkv), (16, 2) | (24, 4)) && spec.d == 256,
+                "fixture geometry"
+            );
+            let mut cases = 0;
+            let mut defects = 0;
+            for (rows, valid, prefix) in [
+                (1, 1, 257),
+                (3, 3, 23),
+                (17, 17, 127),
+                (37, 33, 263),
+                (65, 65, 23),
+                (129, 127, 257),
+            ] {
+                for chunk in [128, 256] {
+                    let base = Case {
+                        spec,
+                        remap: true,
+                        graph: false,
+                        mutant: false,
+                        flash: false,
+                        prefix,
+                        valid_rows: valid,
+                        max_rows: rows,
+                        capacity: 4096,
+                        key_chunk: chunk,
+                        axes: None,
+                        oracle: true,
+                        boundary_probe: None,
+                    };
+                    let reference = run_shape(&device, base)?;
+                    let graph = run_shape(
                         &device,
                         Case {
-                            axes: Some(&positions),
-                            graph: captured,
+                            graph: true,
                             ..base
                         },
                     )?;
-                    let mismatch = reference
+                    let mismatches = reference
                         .core_out
                         .iter()
-                        .zip(&axes.core_out)
-                        .chain(reference.q.iter().zip(&axes.q))
-                        .chain(reference.k_cache.iter().zip(&axes.k_cache))
-                        .chain(reference.v_cache.iter().zip(&axes.v_cache))
+                        .zip(&graph.core_out)
+                        .chain(reference.q.iter().zip(&graph.q))
+                        .chain(reference.k_cache.iter().zip(&graph.k_cache))
+                        .chain(reference.v_cache.iter().zip(&graph.v_cache))
                         .filter(|(a, b)| a.to_bits() != b.to_bits())
                         .count();
+                    let bad = reference.oracle_mismatches + graph.oracle_mismatches + mismatches;
                     println!(
-                        "HIP_HD256_AXES rows={rows} valid={valid} prefix={prefix} key_chunk={chunk} graph={captured} mismatches={mismatch}"
+                        "HIP_HD256 rows={rows} valid={valid} prefix={prefix} key_chunk={chunk} mismatches={bad}"
                     );
-                    cases += 1;
-                    defects += usize::from(mismatch != 0 || axes.oracle_mismatches != 0);
-                }
-                if rows == 3 && chunk == 128 {
-                    let mutant = run_shape(
-                        &device,
-                        Case {
-                            mutant: true,
-                            oracle: false,
-                            ..base
-                        },
-                    )?;
-                    let differences = reference
-                        .core_out
-                        .iter()
-                        .zip(&mutant.core_out)
-                        .filter(|(a, b)| a.to_bits() != b.to_bits())
-                        .count();
-                    ensure!(differences > 0, "HD256 cached K-head swap control escaped");
-                    println!(
-                        "PASS HIP_HD256_CONTROL swapped_cached_k_heads differences={differences}"
-                    );
+                    cases += 2;
+                    defects += usize::from(bad != 0);
+                    let positions: Vec<i32> = (0..rows)
+                        .flat_map(|row| [prefix as i32 + row as i32; 3])
+                        .collect();
+                    let positions = device.stream.clone_htod(&positions)?;
+                    for captured in [false, true] {
+                        let axes = run_shape(
+                            &device,
+                            Case {
+                                axes: Some(&positions),
+                                graph: captured,
+                                ..base
+                            },
+                        )?;
+                        let mismatch = reference
+                            .core_out
+                            .iter()
+                            .zip(&axes.core_out)
+                            .chain(reference.q.iter().zip(&axes.q))
+                            .chain(reference.k_cache.iter().zip(&axes.k_cache))
+                            .chain(reference.v_cache.iter().zip(&axes.v_cache))
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                        println!(
+                            "HIP_HD256_AXES rows={rows} valid={valid} prefix={prefix} key_chunk={chunk} graph={captured} mismatches={mismatch}"
+                        );
+                        cases += 1;
+                        defects += usize::from(mismatch != 0 || axes.oracle_mismatches != 0);
+                    }
+                    if rows == 3 && chunk == 128 {
+                        let mutant = run_shape(
+                            &device,
+                            Case {
+                                mutant: true,
+                                oracle: false,
+                                ..base
+                            },
+                        )?;
+                        let differences = reference
+                            .core_out
+                            .iter()
+                            .zip(&mutant.core_out)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                        ensure!(differences > 0, "HD256 cached K-head swap control escaped");
+                        println!(
+                            "PASS HIP_HD256_CONTROL swapped_cached_k_heads differences={differences}"
+                        );
+                    }
                 }
             }
+            println!(
+                "HIP_HD256_SUMMARY hq={} hkv={} cases={cases} defects={defects}",
+                spec.hq, spec.hkv
+            );
+            ensure!(defects == 0, "HD256 defects={defects}");
         }
-        println!("HIP_HD256_SUMMARY cases={cases} defects={defects}");
-        ensure!(defects == 0, "HD256 defects={defects}");
         Ok(())
     }
 

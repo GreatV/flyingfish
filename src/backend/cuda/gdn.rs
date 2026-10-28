@@ -475,8 +475,8 @@ impl GdnOps {
         check_bindings(&bindings, max_rows, conv_dim, spec.hv)?;
         #[cfg(feature = "rocm")]
         ensure!(
-            spec.hv == 32 && !cw_p2,
-            "HIP GDN requires hv32 and the FP32 chunked/recurrent policy"
+            matches!(spec.hv, 32 | 48) && !cw_p2,
+            "HIP GDN requires hv32/hv48 and the FP32 chunked/recurrent policy"
         );
 
         #[cfg(feature = "cuda")]

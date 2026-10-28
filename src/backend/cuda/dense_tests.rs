@@ -117,6 +117,22 @@ fn gdn_core_reference(
 #[test]
 #[ignore = "requires HIP GPU lease and FF_DENSE_GPU_WINDOW=granted"]
 fn hip_gdn_runtime_gpu() -> Result<()> {
+    let minicpm = crate::model_spec::ModelSpec::minicpm(
+        &serde_json::from_str(include_str!("../../../tests/data/minicpm-config.json"))?,
+        &serde_json::json!({"eos_token_id":[248044,248046]}),
+    )?;
+    let qwen = crate::model_spec::ModelSpec::qwen(
+        &serde_json::from_str(include_str!("../../../tests/data/q38-config.json"))?,
+        &serde_json::json!({}),
+    )?;
+    for model in [minicpm, qwen] {
+        hip_gdn_case(model)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "rocm")]
+fn hip_gdn_case(model: crate::model_spec::ModelSpec) -> Result<()> {
     use crate::backend::cuda::gdn::{GdnBindings, GdnOps};
     use crate::backend::cuda::moe::testing::{capture, view};
     use crate::gdn_plan::GdnWorkspace;
@@ -128,17 +144,10 @@ fn hip_gdn_runtime_gpu() -> Result<()> {
     );
     let device = crate::backend::cuda::Device::new(0)?;
     let stream = &device.stream;
-    let model = crate::model_spec::ModelSpec::minicpm(
-        &serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/data/minicpm-config.json"
-        )))?,
-        &serde_json::json!({"eos_token_id":[248044,248046]}),
-    )?;
     let spec = GdnSpec::from_model(&model)?;
     let (heads, cd) = (spec.hv as usize, spec.conv_dim()? as usize);
     ensure!(
-        heads == 32 && cd == 8192 && spec.hk == 16,
+        matches!((heads, cd, spec.hk), (32, 8192, 16) | (48, 10240, 16)),
         "GDN fixture geometry"
     );
     let mut gate = Gate::default();
@@ -146,8 +155,8 @@ fn hip_gdn_runtime_gpu() -> Result<()> {
         let mut store = state::StateStore::new(&model, 129, stream)?;
         gate.check(
             "gdn.store_layout",
-            store.gdn.len() == 30
-                && store.kv.len() == 10
+            store.gdn.len() == if heads == 32 { 30 } else { 48 }
+                && store.kv.len() == if heads == 32 { 10 } else { 16 }
                 && store
                     .gdn
                     .iter()
@@ -447,7 +456,7 @@ fn hip_gdn_runtime_gpu() -> Result<()> {
             ensure!(differences > 0, "GDN head0-for-head1 control escaped");
             println!("PASS HIP_GDN_CONTROL wrong_state_head differences={differences}");
         }
-        if rows == 1 {
+        if rows == 1 && heads == 32 {
             let norm = pattern(128, 101);
             let z = pattern(heads * 128, 103);
             let dn = stream.clone_htod(&norm)?;
@@ -531,11 +540,11 @@ fn hip_gdn_runtime_gpu() -> Result<()> {
             }
         }
         println!(
-            "HIP_GDN rows={rows} valid={valid} norm_ratio={norm_ratio:e} state_error={error:e} state_bound={bound:e}"
+            "HIP_GDN heads={heads} rows={rows} valid={valid} norm_ratio={norm_ratio:e} state_error={error:e} state_bound={bound:e}"
         );
     }
     println!(
-        "HIP_GDN_SUMMARY cells={} defects={}",
+        "HIP_GDN_SUMMARY heads={heads} cells={} defects={}",
         gate.cells, gate.defects
     );
     ensure!(gate.defects == 0, "GDN defects={}", gate.defects);
