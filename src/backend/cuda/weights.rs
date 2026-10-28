@@ -292,17 +292,22 @@ impl Drop for ExpertStorage {
 #[cfg(feature = "rocm")]
 impl Drop for ExpertStorage {
     fn drop(&mut self) {
-        crate::backend::hip::drop_result("finish expert storage", self.context.synchronize());
+        crate::backend::hip::drop_result(
+            self.context.synchronize().context("finish expert storage"),
+        );
         if let Some(peer) = &self.peer_context {
-            crate::backend::hip::drop_result("finish peer expert storage", peer.synchronize());
+            crate::backend::hip::drop_result(
+                peer.synchronize().context("finish peer expert storage"),
+            );
         }
         if self.registered
             && let Some(host) = &self.host
         {
             let (address, _) = host.host_span();
-            crate::backend::hip::drop_result("unregister expert host storage", unsafe {
-                self.context.unregister_host(address as u64)
-            });
+            crate::backend::hip::drop_result(
+                unsafe { self.context.unregister_host(address as u64) }
+                    .context("unregister expert host storage"),
+            );
         }
     }
 }
