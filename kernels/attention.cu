@@ -787,6 +787,7 @@ __device__ void run(Problem p, uint32_t extent) {
   constexpr int BQ = D == 256 ? 16 : 32;
   constexpr int BK = D == 256 ? 32 : 64;
   constexpr int SCORE_TILES = D == 256 ? 1 : 2;
+  constexpr int QK_TERMS = D == 256 ? 4 : 16;
   __shared__ __align__(16) unsigned short memory[(BQ + 2*BK)*D + 2*BQ*BK + 2*BQ];
   auto* qs = memory;
   auto* ks = qs + BQ*D;
@@ -828,15 +829,17 @@ __device__ void run(Problem p, uint32_t extent) {
     const int key_slab = D == 256 ? wave%2 : (wave%2)*2;
     if (D == 128 || wave < 2) {
 #pragma unroll
-      for (int part = 0; part < D/16; ++part) {
+      for (int part = 0; part < D/QK_TERMS; ++part) {
         B a;
 #pragma unroll
-        for (int j = 0; j < 16; ++j) a[j] = qs[(q_slab*16+lane%16)*D+part*16+j];
+        for (int j = 0; j < 16; ++j) a[j] = j < QK_TERMS
+            ? qs[(q_slab*16+lane%16)*D+part*QK_TERMS+j] : 0;
 #pragma unroll
         for (int tile = 0; tile < SCORE_TILES; ++tile) {
           B b;
 #pragma unroll
-          for (int j = 0; j < 16; ++j) b[j] = ks[((key_slab+tile)*16+lane%16)*D+part*16+j];
+          for (int j = 0; j < 16; ++j) b[j] = j < QK_TERMS
+              ? ks[((key_slab+tile)*16+lane%16)*D+part*QK_TERMS+j] : 0;
           if constexpr (D == 256) {
             const A partial = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a,b,A{});
             const A delta = partial-score_correction[tile];
