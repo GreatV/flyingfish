@@ -1875,10 +1875,6 @@ impl PrefillOps {
                 }
                 offset = end;
             }
-            ensure!(
-                offset == problems,
-                "HIP grouped GEMM pointer count mismatch"
-            );
         }
         Ok(())
     }

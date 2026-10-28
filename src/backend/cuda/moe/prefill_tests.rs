@@ -346,11 +346,39 @@ fn fp8_prefill_gpu() -> Result<()> {
             .zip(&expected)
             .filter(|(a, b)| a.to_bits() != b.to_bits())
             .count();
-        let gemm_bad = canonical()?
+        let actual_gemms = canonical()?;
+        let gemm_bad = actual_gemms
             .iter()
             .zip(&expected_gemms)
             .filter(|(a, b)| a != b)
             .count();
+        if let Some(first) = actual_gemms
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(expected_gemms.as_chunks::<2>().0)
+            .position(|(a, b)| a != b)
+        {
+            let assignment = first / (2 * inter + hidden);
+            let column = first % (2 * inter + hidden);
+            let actual = bf16::from_le_bytes(actual_gemms[2 * first..2 * first + 2].try_into()?);
+            let expected =
+                bf16::from_le_bytes(expected_gemms[2 * first..2 * first + 2].try_into()?);
+            if column < 2 * inter {
+                let row = assignment / top_k;
+                let expert = ids[assignment] as usize;
+                let weight = &fx.gate_up[(expert * 2 * inter + column) * hidden..][..hidden];
+                let input = &fx.x[row * hidden..][..hidden];
+                let exact = weight
+                    .iter()
+                    .zip(input)
+                    .map(|(w, x)| w.to_f64() * x.to_f64())
+                    .sum::<f64>();
+                eprintln!(
+                    "FP8_GEMM_DIAGNOSTIC assignment={assignment} expert={expert} column={column} actual={actual:e} library={expected:e} fp64={exact:e}"
+                );
+            }
+        }
         let done_bad = s
             .clone_dtoh(&candidate.done)?
             .iter()
@@ -4065,6 +4093,59 @@ fn check_combine_residual_shape(
             .zip(&res_ref)
             .filter(|(a, b)| a.to_bits() != b.to_bits())
             .count();
+        if res_bad > 0 {
+            let first = got_res
+                .iter()
+                .zip(&res_ref)
+                .position(|(a, b)| a.to_bits() != b.to_bits())
+                .unwrap();
+            let scales = s.clone_dtoh(&scale_d)?;
+            let zeros = s.alloc_zeros::<bf16>(rows * top_k * hidden)?;
+            let ones = s.clone_htod(&vec![bf16::ONE; rows * hidden])?;
+            let diagnostic = s.alloc_zeros::<bf16>(rows * hidden)?;
+            combine.combine_residual(
+                s,
+                &MoeCombineResidual {
+                    ids: testing::dense(&ids_d, s, rows as u32, top_k as u32)?,
+                    final_active: testing::dense(&active_d, s, rows as u32, top_k as u32)?,
+                    done: testing::dense(&done_d, s, rows as u32, top_k as u32)?,
+                    contributions: testing::view(
+                        &zeros,
+                        s,
+                        [rows as u32, top_k as u32, hidden as u32],
+                        [(top_k * hidden) as u64, hidden as u64, 1],
+                    )?,
+                    shared_out: testing::dense(&ones, s, rows as u32, hidden as u32)?,
+                    x: x_view,
+                    shared_expert_gate: gated.then_some(seg_view),
+                    residual: None,
+                    y_out: Some(testing::dense_mut(
+                        &diagnostic,
+                        s,
+                        rows as u32,
+                        hidden as u32,
+                    )?),
+                },
+                hidden_blocks as u32,
+            )?;
+            let scale_fused = s.clone_dtoh(&diagnostic)?;
+            eprintln!(
+                "COMBINE_DIAGNOSTIC row={} column={} initial={} y_ref={} actual={} expected={} scale_separate={} scale_fused={} scale_bit_differences={}",
+                first / hidden,
+                first % hidden,
+                res_init_h[first],
+                y_ref[first],
+                got_res[first],
+                res_ref[first],
+                scales[first / hidden],
+                scale_fused[first],
+                scale_fused
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, value)| value.to_bits() != scales[*i / hidden].to_bits())
+                    .count()
+            );
+        }
         anyhow::ensure!(
             res_bad == 0,
             "combine_residual mismatch hidden={hidden} gated={gated}: {res_bad}"
