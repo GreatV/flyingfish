@@ -1,9 +1,11 @@
 //! Published-checkpoint text, media and teacher-forced decode acceptance gate.
 use super::*;
-use crate::vision_input::{ImageGrid, MultimodalInput};
 use safetensors::{Dtype, SafeTensors};
 
-use super::tests::{chain_state, placement_compare, placement_components, restore_chain_state};
+use super::tests::{
+    Input, chain_state, floats, integers, placement_compare, placement_components,
+    restore_chain_state,
+};
 
 #[test]
 #[ignore = "exclusive CUDA, published BF16 FF_MODEL, text fixtures and pinned runtime/placement-prefix.json"]
@@ -487,53 +489,6 @@ impl Bounds {
     }
 }
 
-fn floats(source: &SafeTensors<'_>, name: &str) -> Result<Vec<f32>> {
-    let tensor = source.tensor(name)?;
-    let values = match tensor.dtype() {
-        Dtype::BF16 => tensor
-            .data()
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|v| bf16::from_bits(u16::from_le_bytes(*v)).to_f32())
-            .collect::<Vec<_>>(),
-        Dtype::F32 => tensor
-            .data()
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|v| f32::from_le_bytes(*v))
-            .collect(),
-        dtype => anyhow::bail!("reference {name} has floating dtype {dtype:?}"),
-    };
-    ensure!(
-        values.iter().all(|v| v.is_finite()),
-        "nonfinite reference {name}"
-    );
-    Ok(values)
-}
-
-fn integers(source: &SafeTensors<'_>, name: &str) -> Result<Vec<u32>> {
-    let tensor = source.tensor(name)?;
-    match tensor.dtype() {
-        Dtype::I64 => tensor
-            .data()
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .map(|v| Ok(u32::try_from(i64::from_le_bytes(*v))?))
-            .collect(),
-        Dtype::I32 => tensor
-            .data()
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|v| Ok(u32::try_from(i32::from_le_bytes(*v))?))
-            .collect(),
-        dtype => anyhow::bail!("reference {name} has integer dtype {dtype:?}"),
-    }
-}
-
 fn metrics(a: &[f32], b: &[f32]) -> Result<[f64; 4]> {
     ensure!(
         !a.is_empty() && a.len() == b.len(),
@@ -855,185 +810,6 @@ fn native_layer0(engine: &mut Engine, source: &SafeTensors<'_>) -> Result<usize>
     engine.moe = Some(decode);
     engine.moe_slots = Some(slots);
     result
-}
-
-struct Input {
-    ids: Vec<u32>,
-    modalities: Vec<u8>,
-    pixels: Vec<f32>,
-    grids: Vec<ImageGrid>,
-}
-
-impl Input {
-    fn read(source: &SafeTensors<'_>, case: &str) -> Result<Self> {
-        let ids = integers(source, "input_ids")?;
-        ensure!(
-            source.tensor("input_ids")?.shape() == [1, ids.len()],
-            "input ids layout"
-        );
-        let mut input = Self {
-            ids,
-            modalities: Vec::new(),
-            pixels: Vec::new(),
-            grids: Vec::new(),
-        };
-        let (pixels, sizes) = match case.split('_').next() {
-            Some("text") => return Ok(input),
-            Some("image") => ("pixel_values", "target_sizes"),
-            Some("video") => ("pixel_values_videos", "target_sizes_videos"),
-            _ => anyhow::bail!("unknown native fixture case={case}"),
-        };
-        input.modalities = integers(source, "mm_token_type_ids")?
-            .into_iter()
-            .map(|v| Ok(u8::try_from(v)?))
-            .collect::<Result<_>>()?;
-        input.pixels = floats(source, pixels)?;
-        let sizes = integers(source, sizes)?;
-        ensure!(
-            sizes.len().is_multiple_of(2),
-            "reference target_sizes layout"
-        );
-        input.grids = sizes
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|s| ImageGrid {
-                t: 1,
-                h: s[0],
-                w: s[1],
-            })
-            .collect();
-        Ok(input)
-    }
-
-    fn video(source: &SafeTensors<'_>, model: &Path, case: &str) -> Result<Self> {
-        use crate::serve::{
-            detok::Shared,
-            image::{Processor, VideoOptions},
-        };
-        let reference = Self::read(source, case)?;
-        let directory = PathBuf::from(
-            std::env::var_os("FF_VIDEO_REF_DIR").context("FF_VIDEO_REF_DIR missing")?,
-        );
-        let clip = match case {
-            "video_football_16x" => "football_4s",
-            "video_control_clip2_16x" => "sample_demo_1",
-            "video_control_same_grid_16x" => "boat_pan_4s",
-            _ => anyhow::bail!("unknown video fixture case={case}"),
-        };
-        let floor: serde_json::Value = serde_json::from_slice(&std::fs::read(
-            directory.join("preprocess_video_noise_floor.json"),
-        )?)?;
-        let measured = floor["cases"]
-            .as_object()
-            .context("video pixel floor cases missing")?;
-        ensure!(!measured.is_empty(), "video pixel floor has no cases");
-        let tolerance = measured
-            .iter()
-            .try_fold(0.0f64, |bound, (name, cell)| -> Result<f64> {
-                Ok(bound.max(
-                    cell["tv_vs_pil_diff"]["max_abs"]
-                        .as_f64()
-                        .with_context(|| format!("video pixel floor {name} max_abs missing"))?,
-                ))
-            })? as f32
-            + 4.0 * f32::EPSILON;
-        ensure!(
-            tolerance.is_finite() && tolerance > 0.0,
-            "invalid video pixel floor {case}"
-        );
-        let spec = crate::model_spec::ModelSpec::read(model)?;
-        let vision = spec.vision.as_ref().context("video vision spec missing")?;
-        let first = reference
-            .ids
-            .iter()
-            .position(|&id| id == vision.start_token)
-            .context("video opening marker missing")?;
-        let last = reference
-            .ids
-            .iter()
-            .rposition(|&id| id == vision.end_token)
-            .context("video closing marker missing")?;
-        ensure!(first < last, "video marker extent {case}");
-        let mut prompt = reference.ids[..first].to_vec();
-        prompt.push(vision.video_token);
-        prompt.extend_from_slice(&reference.ids[last + 1..]);
-        let tokenizer = Shared::load(model)?;
-        let processor =
-            Processor::load(model, Some(&tokenizer))?.context("video processor missing")?;
-        let bytes = std::fs::read(directory.join("inputs").join(format!("{clip}.mp4")))?;
-        let url = format!("data:video/mp4;base64,{}", base64::encode(bytes));
-        let planned = processor.plan_video(
-            &url,
-            VideoOptions {
-                max_num_frames: 4,
-                stack_frames: 1,
-                max_slice_nums: Some(1),
-            },
-            4352,
-        )?;
-        let video = processor.prepare_planned_video(planned)?;
-        let frames = video.frames.len();
-        let (ids, prepared) = processor.expand(&prompt, Vec::new(), vec![video], 4352)?;
-        let input = Self {
-            ids,
-            modalities: prepared.modality_ids,
-            pixels: prepared.pixel_values,
-            grids: prepared.grids,
-        };
-        ensure!(
-            input.ids == reference.ids
-                && input.modalities == reference.modalities
-                && input.grids == reference.grids,
-            "video preprocessing ids/modality/grid mismatch {case}"
-        );
-        ensure!(
-            input.pixels.len() == reference.pixels.len()
-                && input.pixels.iter().all(|value| value.is_finite()),
-            "video pixel extent/finite check {case}"
-        );
-        let error = input
-            .pixels
-            .iter()
-            .zip(&reference.pixels)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        ensure!(
-            error <= tolerance,
-            "video preprocess {case} pixel max={error} > {tolerance}"
-        );
-        let axes = input.packed().validate(&spec, 4352)?.packed_axes()?;
-        let expected = integers(source, "canvas_position_ids")?;
-        ensure!(
-            expected.len() == 3 * input.ids.len(),
-            "video reference canvas extent {case}"
-        );
-        ensure!(
-            (0..3).all(
-                |axis| (0..input.ids.len()).all(|row| i64::from(axes[3 * row + axis])
-                    == i64::from(expected[axis * input.ids.len() + row]))
-            ),
-            "video canvas mismatch {case}"
-        );
-        ensure!(
-            frames == integers(source, "sampled_frame_indices")?.len(),
-            "video frame count mismatch {case}"
-        );
-        println!(
-            "PASS minicpm_video_preprocess {case} frames={frames} modality=2 ids={} pixel_max={error} measured_floor={tolerance}",
-            input.ids.len()
-        );
-        Ok(input)
-    }
-
-    fn packed(&self) -> MultimodalInput<'_> {
-        MultimodalInput {
-            input_ids: &self.ids,
-            modality_ids: &self.modalities,
-            pixel_values: &self.pixels,
-            grids: &self.grids,
-        }
-    }
 }
 
 fn teacher_steps(
