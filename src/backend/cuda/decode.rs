@@ -1,14 +1,14 @@
 use super::cubin;
-use crate::config::Config;
-use anyhow::{Result, ensure};
-use cudarc::driver::{
+use crate::backend::gpu::{
     CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
+use crate::config::Config;
+use anyhow::{Result, ensure};
 use half::bf16;
 use std::sync::Arc;
 
+use crate::backend::gpu::{DevicePtr, DevicePtrMut};
 use crate::backend::setup::{AttentionPlan, check_decode_attention_shape};
-use cudarc::driver::{DevicePtr, DevicePtrMut};
 
 pub struct Attention {
     first: CudaFunction,
@@ -291,7 +291,10 @@ impl Attention {
         stream.context().bind_to_thread()?;
         let bits = u32::try_from(value)?;
         unsafe {
+            #[cfg(feature = "cuda")]
             cudarc::driver::sys::cuMemsetD32Async(ptr, bits, 1, stream.cu_stream()).result()?;
+            #[cfg(feature = "rocm")]
+            stream.memset_words(ptr, bits, 1)?;
         }
         Ok(())
     }

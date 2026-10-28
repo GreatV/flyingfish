@@ -1,20 +1,27 @@
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+use anyhow::Context;
 use anyhow::Result;
 use serde::Serialize;
 pub mod setup;
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+pub mod gpu;
+#[cfg(feature = "rocm")]
+pub mod hip;
+
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub(crate) mod cuda;
 #[cfg(feature = "cuda")]
 pub use cuda::cubin::bytes as kernel_cubin;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub use cuda::engine::Engine as Backend;
 #[cfg(feature = "cuda")]
 pub use cuda::engine::TextPrefixSaveOutput;
 #[cfg(feature = "cuda")]
 pub use cuda::engine::{TextPrefixRestoreIntent, TextPrefixSaveRequest};
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(any(feature = "cuda", feature = "rocm")))]
 mod missing;
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(any(feature = "cuda", feature = "rocm")))]
 pub use missing::Backend;
 
 #[derive(Clone, Debug)]
@@ -149,27 +156,30 @@ pub enum TreeBuilder {
     Waves,
 }
 
-#[cfg(feature = "cuda")]
-pub struct Event(cudarc::driver::CudaEvent);
-#[cfg(not(feature = "cuda"))]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+pub struct Event(gpu::CudaEvent);
+#[cfg(not(any(feature = "cuda", feature = "rocm")))]
 pub enum Event {}
 
-#[cfg(feature = "cuda")]
-pub struct Logits(cudarc::driver::CudaSlice<half::bf16>);
-#[cfg(not(feature = "cuda"))]
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+pub struct Logits(gpu::CudaSlice<half::bf16>);
+#[cfg(not(any(feature = "cuda", feature = "rocm")))]
 pub enum Logits {}
 
 impl Event {
     pub fn synchronize(&self) -> Result<()> {
-        #[cfg(feature = "cuda")]
-        return Ok(self.0.synchronize()?);
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
+        return self.0.synchronize().context("synchronize backend event");
+        #[cfg(not(any(feature = "cuda", feature = "rocm")))]
         match *self {}
     }
     pub fn elapsed_ms(&self, end: &Self) -> Result<f32> {
-        #[cfg(feature = "cuda")]
-        return Ok(self.0.elapsed_ms(&end.0)?);
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
+        return self
+            .0
+            .elapsed_ms(&end.0)
+            .context("query backend event elapsed time");
+        #[cfg(not(any(feature = "cuda", feature = "rocm")))]
         {
             let _ = end;
             match *self {}

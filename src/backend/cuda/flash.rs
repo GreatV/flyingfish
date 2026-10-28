@@ -50,17 +50,7 @@ unsafe extern "C" {
 /// `[start, start + rows)` against the head-major KV caches of `capacity`
 /// positions. Q rows are `q_heads * head_dim` wide with head stride `head_dim`;
 /// the row pitch is stated at the call site.
-#[derive(Clone, Copy)]
-pub struct Shape {
-    pub rows: usize,
-    pub start: usize,
-    pub q_heads: usize,
-    pub kv_heads: usize,
-    pub capacity: usize,
-    pub head_dim: usize,
-    pub causal: bool,
-    pub window_left: Option<usize>,
-}
+pub use super::verification::Shape;
 
 pub struct Flash {
     stream: Arc<CudaStream>,

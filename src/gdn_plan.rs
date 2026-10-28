@@ -104,7 +104,7 @@ impl GdnPolicy {
     pub const P2: Self = Self { cw_p2: true };
     pub const fn for_device(info: &DeviceInfo) -> Self {
         Self {
-            cw_p2: info.arch >= 80
+            cw_p2: matches!(info.arch, crate::backend::setup::DeviceArchitecture::Cuda(sm) if sm >= 80)
                 && info.sms > 0
                 && info.warp == 32
                 && info.max_threads >= 256
@@ -277,7 +277,7 @@ mod tests {
     fn every_prefill_step_above_the_verify_floor_takes_the_chunkwise_core() {
         let mut info = DeviceInfo {
             name: String::new(),
-            arch: 86,
+            arch: crate::backend::setup::DeviceArchitecture::Cuda(86),
             sms: 48,
             l2_bytes: 0,
             warp: 32,
@@ -289,7 +289,7 @@ mod tests {
             memory_bytes_per_second: 448_064_000_000.0,
         };
         for (arch, sms) in [(86, 48), (89, 128), (89, 80), (90, 128)] {
-            info.arch = arch;
+            info.arch = crate::backend::setup::DeviceArchitecture::Cuda(arch);
             info.sms = sms;
             let policy = GdnPolicy::for_device(&info);
             assert_eq!(policy, GdnPolicy::P2);

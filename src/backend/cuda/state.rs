@@ -1,20 +1,32 @@
 //! Engine-owned persistent mixer state; operators receive non-owning layer views.
-use super::{
-    contracts::{SeqRef, Tensor},
-    engine::Kv,
+use super::contracts::SeqRef;
+#[cfg(feature = "cuda")]
+use super::contracts::Tensor;
+use crate::backend::gpu::{
+    CudaFunction, CudaSlice, CudaStream, DevicePtr, DeviceRepr, PushKernelArg,
 };
 use crate::{
     model_spec::{Mixer, ModelSpec},
     op_contract::{GdnSpec, SequenceMeta},
 };
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaFunction, CudaSlice, CudaStream, DevicePtr, DeviceRepr, PushKernelArg};
 use half::bf16;
 use std::sync::Arc;
 
+pub struct Kv {
+    pub k: CudaSlice<bf16>,
+    pub v: CudaSlice<bf16>,
+    pub compact: Option<CompactKv>,
+}
+impl Kv {
+    pub fn bytes(&self) -> usize {
+        (self.k.len() + self.v.len()) * 2 + self.compact.as_ref().map_or(0, CompactKv::bytes)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
-pub(crate) struct CacheView {
+pub struct CacheView {
     pub k_code: u64,
     pub v_code: u64,
     pub k_stats: u64,
@@ -54,7 +66,7 @@ impl CacheView {
     }
 }
 
-pub(crate) struct CompactKv {
+pub struct CompactKv {
     pub k_code: CudaSlice<u8>,
     pub v_code: CudaSlice<u8>,
     pub k_stats: CudaSlice<f32>,
@@ -156,7 +168,7 @@ impl CompactKv {
                 .arg(&v)
                 .arg(&meta.ptr)
                 .arg(&force)
-                .launch(cudarc::driver::LaunchConfig {
+                .launch(crate::backend::gpu::LaunchConfig {
                     grid_dim: (rows.div_ceil(crate::kv::GROUP_TOKENS) as u32 + 1, 4, 1),
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
@@ -221,13 +233,15 @@ impl CompactKv {
     }
 }
 
+#[cfg(feature = "cuda")]
 struct PrefixTransfer<'a> {
     stream: &'a Arc<CudaStream>,
-    ring: &'a mut cudarc::driver::PinnedHostSlice<u8>,
+    ring: &'a mut crate::backend::gpu::PinnedHostSlice<u8>,
     restore: Option<&'a [u8]>,
     bytes: Vec<u8>,
     offset: usize,
 }
+#[cfg(feature = "cuda")]
 impl PrefixTransfer<'_> {
     fn segment<T: DeviceRepr>(
         &mut self,
@@ -262,13 +276,14 @@ impl PrefixTransfer<'_> {
         Ok(())
     }
 }
+#[cfg(feature = "cuda")]
 impl Kv {
     pub(super) fn compact_prefix_block(
         &mut self,
         span: std::ops::Range<usize>,
         prefix: usize,
         stream: &Arc<CudaStream>,
-        ring: &mut cudarc::driver::PinnedHostSlice<u8>,
+        ring: &mut crate::backend::gpu::PinnedHostSlice<u8>,
         restore: Option<&[u8]>,
     ) -> Result<Vec<u8>> {
         let c = self
@@ -332,11 +347,11 @@ impl Kv {
     }
 }
 
-pub(crate) struct GdnState {
+pub struct GdnState {
     pub s: CudaSlice<f32>,
     pub history: CudaSlice<f32>,
 }
-pub(crate) struct StateStore {
+pub struct StateStore {
     pub kv: Vec<Kv>,
     pub gdn: Vec<GdnState>,
     pub sequence: Option<CudaSlice<i32>>,
@@ -353,6 +368,11 @@ impl StateStore {
         format: crate::kv::KvFormat,
         stream: &Arc<CudaStream>,
     ) -> Result<Self> {
+        #[cfg(feature = "rocm")]
+        ensure!(
+            format == crate::kv::KvFormat::Bf16 && spec.gdn.is_none(),
+            "HIP StateStore supports BF16 attention KV only; compact KV/GDN state is unsupported"
+        );
         ensure!(
             capacity > 0 && capacity <= spec.max_position as usize && capacity <= i32::MAX as usize,
             "invalid state capacity"
@@ -525,10 +545,12 @@ impl StateStore {
     }
 }
 
-pub(crate) struct GdnVerifyInput {
+#[cfg(feature = "cuda")]
+pub struct GdnVerifyInput {
     pub qkv: CudaSlice<bf16>,
     pub ab: CudaSlice<bf16>,
 }
+#[cfg(feature = "cuda")]
 impl GdnVerifyInput {
     pub fn new(spec: &GdnSpec, slots: usize, stream: &Arc<CudaStream>) -> Result<Self> {
         let conv_dim = usize::try_from(spec.conv_dim()?)?;
@@ -553,7 +575,8 @@ impl GdnVerifyInput {
 
 /// Preallocated snapshot for capture/warmup. Only the KV slots that can be written
 /// are copied; every recurrent state/history element is copied.
-pub(crate) struct StateCheckpoint {
+#[cfg(feature = "cuda")]
+pub struct StateCheckpoint {
     kv: Vec<Kv>,
     gdn: Vec<GdnState>,
     sequence: Option<CudaSlice<i32>>,
@@ -567,6 +590,7 @@ pub(crate) struct StateCheckpoint {
     kv_rings: Vec<usize>,
     valid: bool,
 }
+#[cfg(feature = "cuda")]
 impl StateCheckpoint {
     pub fn new(
         store: &StateStore,

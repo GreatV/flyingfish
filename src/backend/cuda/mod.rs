@@ -1,38 +1,62 @@
+#[cfg(feature = "cuda")]
 pub(crate) mod attention_d256;
+#[cfg(feature = "cuda")]
 pub mod blas;
+#[cfg(feature = "rocm")]
+#[path = "../hip_blas.rs"]
+pub mod blas;
+#[cfg(feature = "cuda")]
 pub mod calibrate;
 mod closure;
-pub(crate) mod contracts;
+pub mod contracts;
 pub mod copy;
 pub mod cubin;
 pub mod decode;
+#[cfg(feature = "cuda")]
 pub mod draft;
 pub mod engine;
+#[cfg(feature = "cuda")]
 pub mod flash;
+#[cfg(feature = "cuda")]
 pub(crate) mod gdn;
 #[cfg(test)]
+#[cfg(feature = "cuda")]
 mod kv_cache_tests;
+#[cfg(feature = "cuda")]
 pub(crate) mod linear;
+#[cfg(feature = "cuda")]
 mod linear_calibrate;
+#[cfg(feature = "cuda")]
 mod markov;
+#[cfg(feature = "cuda")]
 mod markov_calibrate;
+#[cfg(feature = "cuda")]
 pub(crate) mod moe;
+#[cfg(feature = "cuda")]
 pub mod multi_calibrate;
 pub mod ops;
+#[cfg(feature = "cuda")]
 pub mod profile;
-pub(crate) mod state;
+pub mod state;
+#[cfg(feature = "cuda")]
 pub(crate) mod tree;
 pub mod verification;
+#[cfg(feature = "cuda")]
 pub(crate) mod vision;
 pub mod weights;
 
-use crate::backend::setup::{CacheKey, DeviceInfo};
-use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaContext, CudaStream};
+use crate::backend::gpu::{CudaContext, CudaStream};
+#[cfg(feature = "cuda")]
+use crate::backend::setup::CacheKey;
+use crate::backend::setup::DeviceInfo;
+#[cfg(feature = "cuda")]
+use anyhow::ensure;
+use anyhow::{Context, Result};
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct Device {
+    #[cfg(feature = "cuda")]
     key: CacheKey,
     pub info: DeviceInfo,
     pub ctx: Arc<CudaContext>,
@@ -41,6 +65,7 @@ pub struct Device {
 }
 
 impl Device {
+    #[cfg(feature = "cuda")]
     pub fn new(ordinal: usize) -> Result<Self> {
         ensure!(
             unsafe { cudarc::driver::sys::is_culib_present() },
@@ -73,7 +98,7 @@ impl Device {
         );
         let info = DeviceInfo {
             name: ctx.name()?,
-            arch: sm,
+            arch: crate::backend::setup::DeviceArchitecture::Cuda(sm),
             sms: ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as usize,
             l2_bytes: ctx.attribute(A::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)? as usize,
             cooperative: ctx.attribute(A::CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH)? != 0,
@@ -101,10 +126,12 @@ impl Device {
         })
     }
 
+    #[cfg(feature = "cuda")]
     pub fn peer(&self) -> Result<Option<Self>> {
         Ok(self.peer_with_unsupported_sm()?.0)
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn peer_with_unsupported_sm(&self) -> Result<(Option<Self>, Option<u32>)> {
         #[cfg(test)]
         if DISABLE_PEER.load(std::sync::atomic::Ordering::Relaxed) {
@@ -171,6 +198,7 @@ impl Device {
         Ok((Some(peer), None))
     }
 
+    #[cfg(feature = "cuda")]
     pub fn finish_upload(&self) -> Result<()> {
         let event = self.upload.record_event(Some(
             cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING,
@@ -184,9 +212,12 @@ impl Device {
     }
 }
 
+#[cfg(feature = "cuda")]
 const PEER_VERIFY_BOUNCE_BYTES: usize = 65_536;
+#[cfg(feature = "cuda")]
 const PEER_VERIFY_MEMCPY_BYTES: usize = 4 * 1024 * 1024;
 
+#[cfg(feature = "cuda")]
 fn check_peer_capability(capability: Result<(i32, i32)>) -> Result<std::result::Result<u32, u32>> {
     let (major, minor) = capability?;
     ensure!(
@@ -201,8 +232,10 @@ fn check_peer_capability(capability: Result<(i32, i32)>) -> Result<std::result::
     }
 }
 
+#[cfg(feature = "cuda")]
 struct PortableVerifyBounce(*mut u8);
 
+#[cfg(feature = "cuda")]
 impl PortableVerifyBounce {
     fn new(bytes: usize) -> Result<Self> {
         let mut raw = std::ptr::null_mut();
@@ -230,6 +263,7 @@ impl PortableVerifyBounce {
     }
 }
 
+#[cfg(feature = "cuda")]
 impl Drop for PortableVerifyBounce {
     fn drop(&mut self) {
         // SAFETY: pointer comes from cuMemHostAlloc and streams are synchronized before drop.
@@ -239,12 +273,14 @@ impl Drop for PortableVerifyBounce {
     }
 }
 
+#[cfg(feature = "cuda")]
 fn peer_verify_pattern(len: usize) -> Vec<u8> {
     (0..len)
         .map(|i| ((i.wrapping_mul(131).wrapping_add(17)) ^ (i >> 7) ^ (i >> 15) ^ (i >> 23)) as u8)
         .collect()
 }
 
+#[cfg(feature = "cuda")]
 fn check_peer_roundtrip_bytes(
     form: &str,
     expected: &[u8],
@@ -276,6 +312,7 @@ fn check_peer_roundtrip_bytes(
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
 fn assert_peer_access_disabled(
     dev0: &Device,
     dev1: &Device,
@@ -314,6 +351,7 @@ fn assert_peer_access_disabled(
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
 fn verify_peer_transport(
     dev0: &Device,
     dev1: &Device,
@@ -499,6 +537,7 @@ fn verify_peer_transport(
 }
 
 /// γ_n = n·u / (1 − n·u).
+#[cfg(feature = "cuda")]
 pub(crate) fn gamma(n: usize, u: f64) -> f64 {
     let nu = n as f64 * u;
     nu / (1.0 - nu)
@@ -506,12 +545,14 @@ pub(crate) fn gamma(n: usize, u: f64) -> f64 {
 
 /// Max |a − b| relative to the compared magnitude, for two chains that each apply `roundings`
 /// BF16 roundings and FP32 reductions of the given lengths: 2·(roundings·2^-8 + Σ γ_K(2^-24)).
+#[cfg(feature = "cuda")]
 pub(crate) fn bf16_chain_bound(roundings: u32, reductions: &[usize]) -> f64 {
     let accumulation: f64 = reductions.iter().map(|&k| gamma(k, 2f64.powi(-24))).sum();
     2.0 * (f64::from(roundings) * 2f64.powi(-8) + accumulation)
 }
 
 #[cfg(test)]
+#[cfg(feature = "cuda")]
 pub(crate) fn time_prepared_operation(
     stream: &Arc<CudaStream>,
     mut reset: impl FnMut() -> Result<()>,
@@ -543,13 +584,16 @@ pub(crate) fn time_prepared_operation(
 }
 
 #[cfg(test)]
+#[cfg(feature = "cuda")]
 pub(crate) static DISABLE_PEER: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
+#[cfg(feature = "cuda")]
 mod q38_tests;
 
 #[cfg(test)]
+#[cfg(feature = "cuda")]
 mod tests {
     use super::*;
 
@@ -734,5 +778,26 @@ mod tests {
             "PASS peer_transport_gate production_default=ok peer_access_enabled_rejected=true planted_byte_flip_detected=true"
         );
         Ok(())
+    }
+}
+
+#[cfg(feature = "rocm")]
+impl Device {
+    pub fn new(ordinal: usize) -> Result<Self> {
+        let ctx = CudaContext::new(ordinal)
+            .with_context(|| format!("HIP initialize device {ordinal}"))?;
+        let info = ctx.device_info()?;
+        let stream = ctx.new_stream()?;
+        let upload = ctx.new_stream()?;
+        Ok(Self {
+            info,
+            ctx,
+            stream,
+            upload,
+        })
+    }
+    pub fn finish_upload(&self) -> Result<()> {
+        self.stream.wait(&self.upload.record_event(Some(2))?)?;
+        self.stream.synchronize()
     }
 }

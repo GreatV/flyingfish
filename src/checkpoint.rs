@@ -48,7 +48,7 @@ struct Header(#[serde(deserialize_with = "unique_map")] BTreeMap<String, serde_j
 pub struct MappedCheckpoint {
     pub(crate) index: Index,
     maps: BTreeMap<String, Mmap>,
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     files: BTreeMap<String, File>,
 }
 
@@ -82,7 +82,7 @@ impl MappedCheckpoint {
         ensure!(!index.weight_map.is_empty(), "empty checkpoint index");
         let base = dir.canonicalize()?;
         let mut maps = BTreeMap::new();
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "rocm"))]
         let mut files = BTreeMap::new();
         let mut seen = BTreeSet::new();
         for shard in index.weight_map.values().collect::<BTreeSet<_>>() {
@@ -124,7 +124,7 @@ impl MappedCheckpoint {
                 );
             }
             maps.insert(shard.clone(), map);
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "rocm"))]
             files.insert(shard.clone(), file);
         }
         ensure!(
@@ -134,12 +134,12 @@ impl MappedCheckpoint {
         Ok(Self {
             index,
             maps,
-            #[cfg(feature = "cuda")]
+            #[cfg(any(feature = "cuda", feature = "rocm"))]
             files,
         })
     }
     /// Reads a validated mapped range through its file descriptor without faulting mapping pages.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
     pub(crate) fn read_mapped_range(
         &self,
         shard: &str,
