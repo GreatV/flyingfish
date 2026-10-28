@@ -113,7 +113,19 @@ fn dense_runtime_gpu() -> Result<()> {
     #[cfg(feature = "rocm")]
     blas_gate(&s, &mut gate)?;
     #[cfg(feature = "rocm")]
-    wmma_gate(&s, &mut gate)?;
+    {
+        let supports_wmma = ctx.supports_wmma();
+        let info = ctx.device_info()?;
+        ensure!(
+            wmma_cells(&info) == supports_wmma,
+            "RUNNER_FAIL gate WMMA selection differs from runtime capability"
+        );
+        if wmma_cells(&info) {
+            wmma_gate(&s, &mut gate)?;
+        } else {
+            println!("WMMA cells NOT_COVERED arch={}", info.arch);
+        }
+    }
     s.synchronize()?;
     println!(
         "DENSE_RUNTIME_RESULT cells={} defects={} result={}",
@@ -1001,6 +1013,43 @@ fn blas_gate(s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "rocm")]
+fn wmma_cells(info: &crate::backend::setup::DeviceInfo) -> bool {
+    use crate::backend::setup::DeviceArchitecture;
+    info.warp == 32
+        && matches!(&info.arch, DeviceArchitecture::Hip(gfx) if gfx.starts_with("gfx11"))
+}
+
+#[cfg(feature = "rocm")]
+#[test]
+fn dense_cells_exclude_unsupported_wmma() {
+    use crate::backend::setup::{DeviceArchitecture, DeviceInfo};
+    let mut info = DeviceInfo {
+        name: "gate fixture".into(),
+        arch: DeviceArchitecture::Hip("gfx1100".into()),
+        sms: 48,
+        l2_bytes: 6 * 1024 * 1024,
+        warp: 32,
+        max_threads: 1024,
+        shared_bytes: 65536,
+        sm_shared_bytes: 65536,
+        cooperative: true,
+        optin_shared_bytes: 65536,
+        memory_bytes_per_second: 1.0,
+    };
+    assert!(wmma_cells(&info));
+    for gfx in ["gfx1030", "gfx1200"] {
+        info.arch = DeviceArchitecture::Hip(gfx.into());
+        assert!(
+            !wmma_cells(&info),
+            "unsupported WMMA cells selected for {gfx}"
+        );
+    }
+    info.arch = DeviceArchitecture::Hip("gfx1100".into());
+    info.warp = 64;
+    assert!(!wmma_cells(&info));
 }
 
 #[cfg(feature = "rocm")]
