@@ -1,6 +1,5 @@
 //! Engine-owned persistent mixer state; operators receive non-owning layer views.
 use super::contracts::SeqRef;
-#[cfg(feature = "cuda")]
 use super::contracts::Tensor;
 use crate::backend::gpu::{
     CudaFunction, CudaSlice, CudaStream, DevicePtr, DeviceRepr, PushKernelArg,
@@ -575,7 +574,6 @@ impl GdnVerifyInput {
 
 /// Preallocated snapshot for capture/warmup. Only the KV slots that can be written
 /// are copied; every recurrent state/history element is copied.
-#[cfg(feature = "cuda")]
 pub struct StateCheckpoint {
     kv: Vec<Kv>,
     gdn: Vec<GdnState>,
@@ -590,7 +588,6 @@ pub struct StateCheckpoint {
     kv_rings: Vec<usize>,
     valid: bool,
 }
-#[cfg(feature = "cuda")]
 impl StateCheckpoint {
     pub fn new(
         store: &StateStore,
@@ -827,7 +824,7 @@ impl StateCheckpoint {
         stream.memcpy_dtod(&self.token, token)?;
         Ok(())
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(super) fn select_prefix(
         &self,
         store: &mut StateStore,
@@ -877,6 +874,7 @@ impl StateCheckpoint {
         }
         self.restore_kv_rows(store, accepted, self.active_rows, stream)
     }
+    #[cfg(feature = "cuda")]
     pub(super) fn restore_for_replay(
         &self,
         store: &mut StateStore,

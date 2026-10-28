@@ -6,7 +6,7 @@ use super::flash::Flash;
 use crate::backend::TreeBuilder;
 #[cfg(feature = "cuda")]
 use crate::backend::gpu::{CudaContext, PinnedHostSlice};
-use crate::backend::gpu::{CudaSlice, CudaStream, DevicePtrMut, PushKernelArg};
+use crate::backend::gpu::{CudaGraph, CudaSlice, CudaStream, DevicePtrMut, PushKernelArg};
 #[cfg(feature = "cuda")]
 use crate::prefix_state::{
     PrefixBoundary, PrefixBuilder, PrefixGeometry, PrefixIdentity, PrefixRecordKind,
@@ -31,7 +31,7 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaGraph, sys};
+use cudarc::driver::sys;
 use half::bf16;
 use std::{
     path::{Path, PathBuf},
@@ -555,7 +555,6 @@ enum Graph {
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg(feature = "cuda")]
 enum CaptureFault {
     Begin,
     End,
@@ -610,10 +609,8 @@ pub struct Engine {
     #[cfg(feature = "cuda")]
     qwen_device_prefix: bool,
     #[cfg(test)]
-    #[cfg(feature = "cuda")]
     capture_fail_after_layer: Option<(usize, usize)>,
     #[cfg(test)]
-    #[cfg(feature = "cuda")]
     capture_fail_stage: Option<CaptureFault>,
     #[cfg(test)]
     #[cfg(feature = "cuda")]
@@ -622,7 +619,6 @@ pub struct Engine {
     #[cfg(feature = "cuda")]
     graphs: Vec<Graph>,
     closure: Rc<super::closure::Closure>,
-    #[cfg(feature = "cuda")]
     graph: Option<CudaGraph>,
     poisoned: bool,
     spec_budget: SpecBudget,
@@ -667,7 +663,6 @@ pub struct Engine {
     images: Option<vision_runtime::EncodedImages>,
     weights: Weights,
     state: super::state::StateStore,
-    #[cfg(feature = "cuda")]
     capture_checkpoint: Option<super::state::StateCheckpoint>,
     work: Work,
     ops: Ops,
@@ -1569,6 +1564,8 @@ impl Engine {
         self.closure.assert_ready()?;
         #[cfg(feature = "cuda")]
         self.check_graphs()?;
+        #[cfg(feature = "rocm")]
+        ensure!(self.graph.is_some(), "HIP decode graph is missing");
         Ok(())
     }
     pub fn config(&self) -> &Config {
@@ -1983,13 +1980,12 @@ impl Engine {
                 crate::model::LayerStage::Ffn => self.run_ffn(layer, step, trace)?,
             }
         }
-        #[cfg(all(test, feature = "cuda"))]
+        #[cfg(test)]
         self.check_capture_layer(layer)?;
         Ok(())
     }
 
     #[cfg(test)]
-    #[cfg(feature = "cuda")]
     fn check_capture_layer(&mut self, layer: usize) -> Result<()> {
         if let Some((fail_layer, remaining)) = &mut self.capture_fail_after_layer
             && *fail_layer == layer
@@ -3068,8 +3064,7 @@ impl Engine {
             !graph || self.spec.is_none(),
             "graph decode is not declared for draft-enabled engines"
         );
-        #[cfg(feature = "rocm")]
-        ensure!(!graph, "HIP graphs are unsupported; select eager execution");
+
         self.closure.assert_ready()?;
         ensure!(
             !self.poisoned,
@@ -3085,8 +3080,8 @@ impl Engine {
             None => self.token()?,
         };
         if graph {
-            #[cfg(feature = "cuda")]
             {
+                #[cfg(feature = "cuda")]
                 let result = if self.moe.is_some() {
                     self.run_moe_graph(1)
                 } else {
@@ -3096,6 +3091,12 @@ impl Engine {
                         .launch()
                         .map_err(Into::into)
                 };
+                #[cfg(feature = "rocm")]
+                let result = self
+                    .graph
+                    .as_ref()
+                    .context("decode graph is not captured")?
+                    .launch();
                 if let Err(error) = result {
                     self.poisoned = true;
                     return Err(error);
@@ -3197,11 +3198,12 @@ impl Engine {
             .sum()
     }
 
-    #[cfg(feature = "cuda")]
     pub fn capture(&mut self) -> Result<()> {
+        #[cfg(feature = "cuda")]
         if self.moe.is_some() {
             return self.capture_moe();
         }
+        #[cfg(feature = "cuda")]
         ensure!(
             self.spec.is_none(),
             "graph decode is not declared for draft-enabled engines"
@@ -3210,6 +3212,7 @@ impl Engine {
             return Ok(());
         }
         self.closure.capture()?;
+        #[cfg(feature = "cuda")]
         if let Some(chain) = self.mtp.as_mut() {
             chain.invalidate_verify();
         }
@@ -3239,10 +3242,16 @@ impl Engine {
                 self.capture_fail_stage != Some(CaptureFault::Begin),
                 "injected capture begin failure"
             );
+            #[cfg(feature = "cuda")]
             s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+            #[cfg(feature = "rocm")]
+            let capture = s.begin_capture()?;
             let launches = self.run_decode_step(None);
             // End capture even when a host-side launch check fails.
+            #[cfg(feature = "cuda")]
             let captured = s.end_capture(sys::CUgraphInstantiate_flags(0));
+            #[cfg(feature = "rocm")]
+            let captured = capture.finish().map(Some);
             launches?;
             #[cfg(test)]
             ensure!(
@@ -5471,9 +5480,6 @@ impl Engine {
         let _ = row;
         anyhow::bail!("HIP verification_logits is unsupported")
     }
-    pub fn capture(&mut self) -> Result<()> {
-        anyhow::bail!("HIP graphs is unsupported")
-    }
     pub fn profiler_start(&self) -> Result<()> {
         anyhow::bail!("HIP profiler_start is unsupported")
     }
@@ -5592,6 +5598,102 @@ struct HipSetup {
     prefill: crate::backend::setup::AttentionPlan,
 }
 
+#[cfg(all(test, feature = "rocm"))]
+#[test]
+#[ignore = "requires GPU lease, FF_ARGMAX_MODEL and FLYINGFISH_RUNTIME_DIR"]
+fn hip_engine_capture_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_DENSE_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let model = PathBuf::from(std::env::var("FF_ARGMAX_MODEL")?);
+    let settings = Settings {
+        tree_builder: crate::backend::TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: true,
+        draft_model: None,
+        runtime_dir: Some(std::env::var("FLYINGFISH_RUNTIME_DIR")?.into()),
+        prefix_cache: false,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    drop(Engine::calibrate(
+        &model,
+        0,
+        256,
+        Some(33),
+        settings.clone(),
+    )?);
+    for (stage, layer) in [
+        (None, None),
+        (Some(CaptureFault::Begin), None),
+        (Some(CaptureFault::End), None),
+        (Some(CaptureFault::Instantiate), None),
+        (None, Some((3, 1))),
+        (None, Some((3, 2))),
+    ] {
+        let mut engine = Engine::load(&model, 0, 256, Some(33), settings.clone())?;
+        let ids: Vec<_> = (0..17).map(|i| ((i * 269 + 23) % 130560) as u32).collect();
+        engine.prefill(&ids, None)?;
+        let s = engine.device.stream.clone();
+        let snapshot = |engine: &Engine| -> Result<_> {
+            let mut kv = Vec::new();
+            for layer in &engine.state.kv {
+                kv.extend(s.clone_dtoh(&layer.k)?);
+                kv.extend(s.clone_dtoh(&layer.v)?);
+            }
+            Ok((
+                kv,
+                s.clone_dtoh(&engine.work.token)?,
+                s.clone_dtoh(&engine.work.position)?,
+                s.clone_dtoh(&engine.work.length)?,
+            ))
+        };
+        let before = snapshot(&engine)?;
+        engine.graph = None;
+        engine.closure = Rc::new(super::closure::Closure::new(false, "calibrate".into()));
+        engine.initialize_hip(&model)?;
+        engine.capture_fail_stage = stage;
+        engine.capture_fail_after_layer = layer;
+        let result = engine.capture();
+        ensure!(
+            snapshot(&engine)? == before
+                && engine.position == 17
+                && engine.committed_prefix_ids == ids,
+            "HIP capture failed to restore KV/token/position/length"
+        );
+        if stage.is_some() || layer.is_some() {
+            ensure!(
+                result.is_err() && engine.graph.is_none() && engine.poisoned,
+                "injected capture fault did not poison/dispose"
+            );
+            ensure!(
+                engine.decode(false, None).is_err(),
+                "poisoned engine decoded"
+            );
+        } else {
+            result?;
+            ensure!(
+                engine.graph.is_some() && !engine.poisoned,
+                "successful capture did not publish graph"
+            );
+        }
+        engine.capture_fail_stage = None;
+        engine.capture_fail_after_layer = None;
+        engine.reset()?;
+        ensure!(
+            !engine.poisoned && engine.position == 0,
+            "capture failure reset did not recover"
+        );
+        engine.closure.ready(Instant::now())?;
+        engine.prefill(&ids, None)?;
+        engine.decode(false, None)?;
+        println!(
+            "HIP_CAPTURE_TRANSACTION stage={stage:?} layer={layer:?} exact_restore=true reset_eager_recovery=true PASS"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(feature = "rocm")]
 impl Engine {
     pub fn calibrate(
@@ -5671,7 +5773,19 @@ impl Engine {
         let workspace_rows = plan.chunk;
         let work = Work::new(s, &model_spec, workspace_rows)?;
         let prefill_prefixes = s.clone_htod(&(0..capacity as i32).collect::<Vec<_>>())?;
+        let capture_checkpoint = Some(super::state::StateCheckpoint::new(
+            &state,
+            &model_spec,
+            1,
+            s,
+        )?);
         let mut engine = Self {
+            graph: None,
+            capture_checkpoint,
+            #[cfg(test)]
+            capture_fail_after_layer: None,
+            #[cfg(test)]
+            capture_fail_stage: None,
             forward_rows: (1..=workspace_rows.min(16)).collect(),
             closure,
             poisoned: false,
@@ -5701,7 +5815,9 @@ impl Engine {
         };
         engine.initialize_hip(dir)?;
         engine.reset()?;
-        engine.closure.expect_captures(0)?;
+        engine.capture()?;
+        engine.reset()?;
+        engine.closure.expect_captures(1)?;
         engine.closure.ready(started)?;
         Ok(engine)
     }

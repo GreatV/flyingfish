@@ -39,11 +39,6 @@ fn dense_model_identity_gpu() -> Result<()> {
         settings.clone(),
     )?);
     let mut model = Model::load(&target, 0, 256, Some(chunk), settings)?;
-    #[cfg(feature = "rocm")]
-    ensure!(
-        model.capture().is_err(),
-        "HIP graph capture must reject unsupported requests"
-    );
     ensure!(
         model.config.hidden_size == 2048
             && model.config.num_hidden_layers == 42
@@ -56,17 +51,11 @@ fn dense_model_identity_gpu() -> Result<()> {
             .map(|i| ((i * 269 + 23) % 130560) as u32)
             .collect();
         let mut eager = Vec::new();
-        #[cfg(feature = "cuda")]
         let modes = [false, true];
-        #[cfg(feature = "rocm")]
-        let modes = [false, false];
         for (repeat, graph) in modes.into_iter().enumerate() {
             model.reset()?;
             let mut token = model.prefill(&ids, None)?;
-            #[cfg(feature = "cuda")]
             let name = format!("rows{rows}-graph{graph}.bin");
-            #[cfg(feature = "rocm")]
-            let name = format!("rows{rows}-eager{repeat}.bin");
             let mut file = std::fs::File::create_new(output.join(name))?;
             let mut margin = f32::INFINITY;
             for step in 0..16 {
@@ -109,12 +98,49 @@ fn dense_model_identity_gpu() -> Result<()> {
             );
         }
     }
-    #[cfg(feature = "cuda")]
-    println!("DENSE_MODEL_IDENTITY cells=6 graph_eager_bit_identity=true PASS");
-    #[cfg(feature = "rocm")]
+    let prefix: Vec<_> = (0..255).map(|i| ((i * 269 + 23) % 130560) as u32).collect();
+    let mut boundary = None;
+    for graph in [false, true] {
+        model.reset()?;
+        let pending = model.prefill(&prefix, None)?;
+        let token = model.decode(graph, None)?;
+        let logits: Vec<_> = model
+            .decode_logits()?
+            .into_iter()
+            .map(f32::to_bits)
+            .collect();
+        ensure!(
+            model.position() == 256,
+            "decode did not reach exact KV capacity"
+        );
+        ensure!(
+            model.decode(graph, None).is_err(),
+            "decode exceeded KV capacity"
+        );
+        model.rewind(255, pending)?;
+        ensure!(model.decode(graph, None)? == token, "rewind token identity");
+        ensure!(
+            model
+                .decode_logits()?
+                .into_iter()
+                .map(f32::to_bits)
+                .eq(logits.iter().copied()),
+            "rewind full-logit identity"
+        );
+        if let Some(expected) = &boundary {
+            ensure!(
+                expected == &(token, logits.clone()),
+                "graph/eager capacity token/logit identity"
+            );
+        } else {
+            boundary = Some((token, logits));
+        }
+        model.check_ready()?;
+    }
     println!(
-        "DENSE_MODEL_IDENTITY cells=6 eager_repeat_bit_identity=true unsupported_graph_rejected=true chunk=33 PASS"
+        "DENSE_GRAPH_BOUNDARY capacity=256 rewind=255 graph_eager_bit_identity=true overflow_rejected=true PASS"
     );
+    println!("DENSE_MODEL_IDENTITY cells=6 graph_eager_bit_identity=true PASS");
     Ok(())
 }
 

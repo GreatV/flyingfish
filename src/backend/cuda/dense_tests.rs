@@ -113,6 +113,8 @@ fn dense_runtime_gpu() -> Result<()> {
     #[cfg(feature = "rocm")]
     blas_gate(&s, &mut gate)?;
     #[cfg(feature = "rocm")]
+    graph_gate(&ctx, &s, &mut gate)?;
+    #[cfg(feature = "rocm")]
     {
         let supports_wmma = ctx.supports_wmma();
         let info = ctx.device_info()?;
@@ -134,6 +136,102 @@ fn dense_runtime_gpu() -> Result<()> {
         if gate.defects == 0 { "PASS" } else { "DEFECT" }
     );
     ensure!(gate.defects == 0, "dense runtime defects={}", gate.defects);
+    Ok(())
+}
+
+#[cfg(feature = "rocm")]
+fn graph_gate(ctx: &Arc<CudaContext>, s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
+    use crate::backend::setup::LinearShape;
+    let shape = LinearShape {
+        rows: 3,
+        input: 259,
+        output: 32,
+    };
+    let blas = blas::Blas::new(s.clone())?;
+    let bias = Arc::new(s.clone_htod(&pattern(32, 17))?);
+    blas.prepare_choice(shape, Some(bias.clone()), None)?;
+    let weight = s.clone_htod(&pattern(32 * 259, 3))?;
+    let input = s.clone_htod(&pattern(3 * 259, 7))?;
+    let norm_weight = s.clone_htod(&pattern(32, 11))?;
+    let mut linear = s.alloc_zeros::<bf16>(96)?;
+    let mut output = s.alloc_zeros::<bf16>(96)?;
+    let norm = cubin::module(ctx, "norm")?.load_function("rms_norm")?;
+    let mut run = || -> Result<()> {
+        blas.linear_with_bias(shape, Some(&bias), &weight, &input, &mut linear)?;
+        unsafe {
+            s.launch_builder(&norm)
+                .arg(&linear)
+                .arg(&norm_weight)
+                .arg(&mut output)
+                .arg(&3i32)
+                .arg(&32i32)
+                .arg(&1e-6f32)
+                .launch(ops::grid(3, 256))?;
+        }
+        Ok(())
+    };
+    run()?;
+    let capture = s.begin_capture()?;
+    run()?;
+    let graph = capture.finish()?;
+    let expected = s.clone_dtoh(&output)?;
+    ensure!(
+        expected.iter().all(|v| v.is_finite()) && expected.iter().any(|v| v.to_f32() != 0.0),
+        "RUNNER_FAIL graph reference"
+    );
+    drop((blas, bias, weight, input, norm_weight, linear, norm));
+    graph.upload()?;
+    for repeat in 0..3 {
+        s.memset_zeros(&mut output)?;
+        gate.check(
+            "graph.missing_launch_control_rejected",
+            s.clone_dtoh(&output)? != expected,
+        );
+        graph.launch()?;
+        gate.check(
+            &format!("graph.retained_library_module_allocations.{repeat}"),
+            s.clone_dtoh(&output)? == expected,
+        );
+    }
+    let other = ctx.new_stream()?;
+    gate.check(
+        "graph.retained_allocation_handoff_rejected",
+        output.handoff(&other).is_err(),
+    );
+    drop(graph);
+    output.handoff(&other)?;
+    gate.check(
+        "graph.destroy_releases_allocation",
+        other.clone_dtoh(&output)? == expected,
+    );
+    output.handoff(s)?;
+    let capture = s.begin_capture()?;
+    gate.check(
+        "graph.capture_allocation_rejected",
+        s.alloc_zeros::<u32>(1).is_err(),
+    );
+    gate.check(
+        "graph.capture_htod_rejected",
+        s.memcpy_htod(&expected, &mut output).is_err(),
+    );
+    gate.check(
+        "graph.capture_dtoh_rejected",
+        s.clone_dtoh(&output).is_err(),
+    );
+    s.memset_zeros(&mut output)?;
+    drop(capture);
+    gate.check(
+        "graph.aborted_capture_not_executed",
+        s.clone_dtoh(&output)? == expected,
+    );
+    let capture = s.begin_capture()?;
+    s.memset_zeros(&mut output)?;
+    let graph = capture.finish()?;
+    graph.launch()?;
+    gate.check(
+        "graph.capture_after_abort",
+        s.clone_dtoh(&output)?.iter().all(|v| v.to_bits() == 0),
+    );
     Ok(())
 }
 

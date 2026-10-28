@@ -352,7 +352,6 @@ impl Closure {
         self.measurements.set(self.measurements.get() + 1);
         Ok(())
     }
-    #[cfg(feature = "cuda")]
     fn before_ready(&self, action: &str) -> Result<()> {
         if self.stage.get() == Stage::Ready {
             self.late_attempts.set(self.late_attempts.get() + 1);
@@ -374,7 +373,6 @@ impl Closure {
         );
         Ok(())
     }
-    #[cfg(feature = "cuda")]
     pub fn capture(&self) -> Result<()> {
         self.before_ready("production Graph capture")?;
         self.captures.set(self.captures.get() + 1);
