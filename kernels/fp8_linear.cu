@@ -2,9 +2,10 @@
 // M1..16 entry points form the rounded weight in registers, accumulate FP32 and
 // write BF16 with no matrix scratch; larger M materializes effective BF16 weights.
 // Format: __nv_fp8_e4m3 (CUDA Math API).
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
+#include "gpu_compat.cuh"
+#if !defined(__HIP__)
 #include <cuda_fp8.h>
+#endif
 #include <stdint.h>
 #include "q38_contract.cuh"
 
@@ -13,7 +14,11 @@ __device__ __forceinline__ __nv_bfloat16 weight_at(
         const uint8_t* w, const __nv_bfloat16* scales, uint64_t n,
         uint64_t k, uint64_t in, uint64_t scale_stride) {
     const float s = PER_CHANNEL
+        #if defined(__HIP__)
+        ? __bfloat162float(scales[n])
+        #else
         ? __bfloat162float(__ldg(scales + n))
+        #endif
         : __bfloat162float(scales[(n/128)*scale_stride + k/128]);
     return __float2bfloat16_rn(e4m3_decode(w[n*in+k]) * s);
 }
@@ -43,6 +48,7 @@ extern "C" __global__ void fp8_dequant_bf16_per_channel(
         __nv_bfloat16* __restrict__ out, int n, int k) {
     fp8_dequant<true>(w, scales, out, n, k);
 }
+#if !defined(__HIP__)
 __device__ __forceinline__ float2 gemv_decode_pair(uint16_t packed) {
 #if __CUDA_ARCH__ >= 890
     uint32_t halfs;
@@ -259,6 +265,129 @@ FP8_SKINNY_ENTRY(14)
 FP8_SKINNY_ENTRY(15)
 FP8_SKINNY_ENTRY(16)
 #undef FP8_SKINNY_ENTRY
+#else
+template<int M, bool PER_CHANNEL>
+__device__ void fp8_small_hip(
+        const uint8_t* w, const __nv_bfloat16* scales,
+        const __nv_bfloat16* x, __nv_bfloat16* y, int n, int k) {
+    const int row = blockIdx.x * 4 + threadIdx.x / 32;
+    const int lane = threadIdx.x % 32;
+    if (row >= n) return;
+    float sums[M] = {};
+    for (int col = lane; col < k; col += 32) {
+        const float weight = __bfloat162float(weight_at<PER_CHANNEL>(
+            w, scales, row, col, k, (uint64_t(k) + 127) / 128));
+#pragma unroll
+        for (int m = 0; m < M; ++m)
+            sums[m] = fmaf(weight, __bfloat162float(x[(size_t)m * k + col]), sums[m]);
+    }
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+        float value = sums[m];
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            value += __shfl_down(value, offset);
+        if (lane == 0) y[(size_t)m * n + row] = __float2bfloat16(value);
+    }
+}
+#define HIP_FP8_SMALL(NAME, M, CHANNEL) \
+extern "C" __global__ void NAME( \
+    const uint8_t* w, const __nv_bfloat16* scales, const __nv_bfloat16* x, \
+    __nv_bfloat16* y, int n, int k) { \
+    if (n <= 0 || k <= 0 || blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 || \
+        gridDim.x != (uint64_t(n)+3)/4 || gridDim.y != 1 || gridDim.z != 1 || \
+        !aligned16(w) || !aligned16(scales) || !aligned16(x) || !aligned16(y)) __trap(); \
+    fp8_small_hip<M, CHANNEL>(w,scales,x,y,n,k); \
+}
+HIP_FP8_SMALL(fp8_gemv_bf16, 1, false)
+HIP_FP8_SMALL(fp8_gemv_bf16_per_channel, 1, true)
+#define HIP_FP8_ROW(M) \
+HIP_FP8_SMALL(fp8_skinny_bf16_m##M, M, false) \
+HIP_FP8_SMALL(fp8_skinny_bf16_m##M##_per_channel, M, true)
+HIP_FP8_ROW(2)
+HIP_FP8_ROW(3)
+HIP_FP8_ROW(4)
+HIP_FP8_ROW(5)
+HIP_FP8_ROW(6)
+HIP_FP8_ROW(7)
+HIP_FP8_ROW(8)
+HIP_FP8_ROW(9)
+HIP_FP8_ROW(10)
+HIP_FP8_ROW(11)
+HIP_FP8_ROW(12)
+HIP_FP8_ROW(13)
+HIP_FP8_ROW(14)
+HIP_FP8_ROW(15)
+HIP_FP8_ROW(16)
+#undef HIP_FP8_ROW
+#undef HIP_FP8_SMALL
+
+extern "C" __global__ void fp8_channel_bf16_simt(
+        const uint8_t* w, const __nv_bfloat16* scales, const __nv_bfloat16* x,
+        __nv_bfloat16* y, int m, int n, int k) {
+    if (m <= 0 || n <= 0 || k <= 0 || blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 ||
+        gridDim.x != (uint64_t(n)+3)/4 || gridDim.y != uint64_t(m) || gridDim.z != 1 ||
+        !aligned16(w) || !aligned16(scales) || !aligned16(x) || !aligned16(y)) __trap();
+    fp8_small_hip<1,true>(w,scales,x+(size_t)blockIdx.y*k,y+(size_t)blockIdx.y*n,n,k);
+}
+
+using ChannelBf16 = short __attribute__((ext_vector_type(16)));
+using ChannelAcc = float __attribute__((ext_vector_type(8)));
+
+extern "C" __global__ void fp8_channel_bf16_wmma(
+        const uint8_t* w, const __nv_bfloat16* scales, const __nv_bfloat16* x,
+        __nv_bfloat16* y, int m, int n, int k) {
+    if (m <= 0 || n <= 0 || k <= 0 || blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 ||
+        gridDim.x != (uint64_t(n)+63)/64 || gridDim.y != (uint64_t(m)+15)/16 || gridDim.z != 1 ||
+        !aligned16(w) || !aligned16(scales) || !aligned16(x) || !aligned16(y)) __trap();
+    __shared__ __nv_bfloat16 weight[64][32], input[16][32];
+    const int tid = threadIdx.x, wave = tid / 32, lane = tid % 32;
+    const int n0 = blockIdx.x * 64, m0 = blockIdx.y * 16;
+    ChannelAcc acc = {};
+    for (int k0 = 0; k0 < k; k0 += 32) {
+        for (int cell = tid; cell < 64 * 32; cell += 128) {
+            const int row = n0 + cell / 32, col = k0 + cell % 32;
+            weight[cell / 32][cell % 32] = row < n && col < k
+                ? weight_at<true>(w,scales,row,col,k,1) : __float2bfloat16(0.0f);
+        }
+        for (int cell = tid; cell < 16 * 32; cell += 128) {
+            const int row = m0 + cell / 32, col = k0 + cell % 32;
+            input[cell / 32][cell % 32] = row < m && col < k
+                ? x[(size_t)row*k+col] : __float2bfloat16(0.0f);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int part = 0; part < 2; ++part) {
+            ChannelBf16 a,b;
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                a[j] = reinterpret_cast<const unsigned short*>(weight[wave*16+lane%16])[part*16+j];
+                b[j] = reinterpret_cast<const unsigned short*>(input[lane%16])[part*16+j];
+            }
+            acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a,b,acc);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int row = m0 + lane % 16, col = n0 + wave * 16 + 2*j + lane/16;
+        if (row < m && col < n) y[(size_t)row*n+col] = __float2bfloat16(acc[j]);
+    }
+}
+
+__device__ __forceinline__ uint8_t channel_e4m3_finite(float value) {
+    const uint32_t bits = __float_as_uint(value);
+    const uint32_t sign = (bits >> 24) & 128;
+    const float magnitude = fabsf(value);
+    if (magnitude < 0.015625f)
+        return uint8_t(sign | uint32_t(nearbyintf(magnitude * 512.0f)));
+    const uint32_t absolute = bits & 0x7fffffffu;
+    uint32_t rounded = absolute >> 20;
+    const uint32_t remainder = absolute & 0xfffffu;
+    rounded += remainder > 0x80000u || (remainder == 0x80000u && (rounded & 1));
+    return uint8_t(sign | min(126u, rounded - 960u));
+}
+#endif
 
 // scale and normalized quotient round to BF16 before E4M3 conversion.
 extern "C" __global__ void e4m3_fake_quant_bf16(
@@ -286,7 +415,7 @@ extern "C" __global__ void e4m3_fake_quant_bf16(
         amax = fmaxf(amax, fabsf(value));
     }
     for (int shift = 16; shift > 0; shift /= 2)
-        amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, shift));
+        amax = fmaxf(amax, __shfl_down_sync(FF_WARP_MASK, amax, shift));
     if (lane == 0) maxima[threadIdx.x / 32] = amax;
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -299,8 +428,12 @@ extern "C" __global__ void e4m3_fake_quant_bf16(
     for (uint64_t col = threadIdx.x; col < uint64_t(cols); col += 256) {
         const float value = __bfloat162float(x[base + col]);
         const float normalized = __bfloat162float(__float2bfloat16_rn(value / scale));
+        #if defined(__HIP__)
+        const uint8_t code = channel_e4m3_finite(fminf(448.0f, fmaxf(-448.0f, normalized)));
+        #else
         const uint8_t code = __nv_cvt_float_to_fp8(
             fminf(448.0f, fmaxf(-448.0f, normalized)), __NV_SATFINITE, __NV_E4M3);
+        #endif
         x[base + col] = __float2bfloat16_rn(e4m3_decode(code) * scale);
     }
 }

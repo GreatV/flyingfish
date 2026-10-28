@@ -124,6 +124,8 @@ fn dense_runtime_gpu() -> Result<()> {
         );
         if wmma_cells(&info) {
             wmma_gate(&s, &mut gate)?;
+            fp8_encoding_gate(&ctx, &s, &mut gate)?;
+            fp8_channel_gate(&ctx, &s, &mut gate)?;
             tcmqa_gate(&ctx, &s, &c, &mut gate)?;
             markov_gate(&ctx, &s, &mut gate)?;
         } else {
@@ -138,6 +140,219 @@ fn dense_runtime_gpu() -> Result<()> {
         if gate.defects == 0 { "PASS" } else { "DEFECT" }
     );
     ensure!(gate.defects == 0, "dense runtime defects={}", gate.defects);
+    Ok(())
+}
+
+#[cfg(feature = "rocm")]
+fn fp8_channel_gate(
+    ctx: &Arc<CudaContext>,
+    stream: &Arc<CudaStream>,
+    gate: &mut Gate,
+) -> Result<()> {
+    let module = cubin::module(ctx, "fp8_linear")?;
+    for (n, k) in [(263usize, 257usize), (512, 2048), (2048, 512)] {
+        let codes: Vec<u8> = (0..n * k)
+            .map(|i| ((i * 17 % 257) % 127) as u8 | (u8::from(i * 29 % 263 > 131) << 7))
+            .collect();
+        let scales: Vec<_> = (0..n)
+            .map(|i| bf16::from_f32((1 + i * 31 % 263) as f32 / 65536.0))
+            .collect();
+        let input = pattern(33 * k, 19);
+        let mut reference = Vec::with_capacity(33 * n);
+        let nu = (k + 6) as f64 * 2f64.powi(-24);
+        for x in input.chunks_exact(k) {
+            for (row, &scale) in codes.chunks_exact(k).zip(&scales) {
+                let (value, absolute) = row.iter().zip(x).fold((0.0f64, 0.0f64), |a, (&w, x)| {
+                    let product = f64::from(crate::fp8::effective_weight(w, scale).to_f32())
+                        * f64::from(x.to_f32());
+                    (a.0 + product, a.1 + product.abs())
+                });
+                let bound = value.abs() / 256.0 + (nu / (1.0 - nu)) * absolute + 2f64.powi(-134);
+                reference.push((value, bound));
+            }
+        }
+        let weights = stream.clone_htod(&codes)?;
+        let scale = stream.clone_htod(&scales)?;
+        let x = stream.clone_htod(&input)?;
+        let wrong: Vec<_> = scales.iter().cycle().skip(1).take(n).copied().collect();
+        let wrong_scale = stream.clone_htod(&wrong)?;
+        let sentinel = bf16::from_bits(0x7fc1);
+        for name in ["fp8_channel_bf16_simt", "fp8_channel_bf16_wmma"] {
+            let function = module.load_function(name)?;
+            let tiled = name.ends_with("wmma");
+            let mut longest = None;
+            for rows in [33usize, 17, 16, 9, 8, 3, 1] {
+                let mut y = stream.clone_htod(&vec![sentinel; rows * n + 16])?;
+                let launch = |y: &mut CudaSlice<bf16>, scales: &CudaSlice<bf16>| unsafe {
+                    stream
+                        .launch_builder(&function)
+                        .arg(&weights)
+                        .arg(scales)
+                        .arg(&x)
+                        .arg(y)
+                        .arg(&(rows as i32))
+                        .arg(&(n as i32))
+                        .arg(&(k as i32))
+                        .launch(LaunchConfig {
+                            grid_dim: if tiled {
+                                (n.div_ceil(64) as u32, rows.div_ceil(16) as u32, 1)
+                            } else {
+                                (n.div_ceil(4) as u32, rows as u32, 1)
+                            },
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                };
+                launch(&mut y, &scale)?;
+                let eager = stream.clone_dtoh(&y)?;
+                let capture = stream.begin_capture()?;
+                launch(&mut y, &scale)?;
+                let graph = capture.finish()?;
+                graph.launch()?;
+                let replay = stream.clone_dtoh(&y)?;
+                let label = format!("fp8.channel.{name}.M{rows}.W[{n},{k}]");
+                ensure!(
+                    eager[..rows * n].iter().all(|v| v.is_finite()),
+                    "RUNNER_FAIL {label}: nonfinite output"
+                );
+                let errors = eager[..rows * n]
+                    .iter()
+                    .zip(&reference)
+                    .filter(|(a, (value, bound))| (f64::from(a.to_f32()) - value).abs() > *bound)
+                    .count();
+                println!(
+                    "FP8_CHANNEL_REFERENCE name={label} elements={} defects={errors} fp64=true",
+                    rows * n
+                );
+                gate.check(&label, errors == 0);
+                gate.check(
+                    &format!("{label}.graph_identity_guard"),
+                    eager
+                        .iter()
+                        .zip(&replay)
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                        && eager[rows * n..]
+                            .iter()
+                            .all(|v| v.to_bits() == sentinel.to_bits()),
+                );
+                if let Some(previous) = &longest {
+                    let previous: &Vec<bf16> = previous;
+                    gate.check(
+                        &format!("{label}.batch_position_identity"),
+                        eager[..rows * n]
+                            .iter()
+                            .zip(previous)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    );
+                } else {
+                    longest = Some(eager[..rows * n].to_vec());
+                }
+                if rows == 1 {
+                    launch(&mut y, &wrong_scale)?;
+                    let mutant = stream.clone_dtoh(&y)?;
+                    gate.check(
+                        &format!("{label}.scale_index_mutant_rejected"),
+                        mutant[..n]
+                            .iter()
+                            .zip(&reference)
+                            .any(|(a, (value, bound))| {
+                                (f64::from(a.to_f32()) - value).abs() > *bound
+                            }),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "rocm")]
+fn fp8_encoding_gate(
+    ctx: &Arc<CudaContext>,
+    stream: &Arc<CudaStream>,
+    gate: &mut Gate,
+) -> Result<()> {
+    let module = cubin::module(ctx, "fp8_linear")?;
+    let decode = module.load_function("fp8_dequant_bf16_per_channel")?;
+    let codes = stream.clone_htod(&(0..=255u8).collect::<Vec<_>>())?;
+    let scales = stream.clone_htod(&vec![bf16::ONE; 256])?;
+    let mut decoded = stream.alloc_zeros::<bf16>(256)?;
+    unsafe {
+        stream
+            .launch_builder(&decode)
+            .arg(&codes)
+            .arg(&scales)
+            .arg(&mut decoded)
+            .arg(&256i32)
+            .arg(&1i32)
+            .launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    let actual = stream.clone_dtoh(&decoded)?;
+    for (code, value) in actual.into_iter().enumerate() {
+        let expected = bf16::from_f32(crate::fp8::decode_e4m3(code as u8));
+        let equal = if expected.is_nan() {
+            value.is_nan() && value.is_sign_negative() == expected.is_sign_negative()
+        } else {
+            value.to_bits() == expected.to_bits()
+        };
+        gate.check(&format!("fp8.decode.code{code:02x}"), equal);
+    }
+
+    let width = 269usize;
+    let mut values = vec![bf16::ZERO; 4 * width];
+    for code in 0..126u8 {
+        let midpoint = 0.5 * (crate::fp8::decode_e4m3(code) + crate::fp8::decode_e4m3(code + 1));
+        values[2 * usize::from(code)] = bf16::from_f32(midpoint);
+        values[2 * usize::from(code) + 1] = bf16::from_f32(-midpoint);
+    }
+    values[252] = bf16::from_f32(448.0);
+    values[253] = bf16::from_f32(-448.0);
+    values[254] = bf16::NEG_ZERO;
+    for i in 0..width {
+        values[2 * width + i] = bf16::from_bits(1 + (i % 127) as u16);
+        values[3 * width + i] = bf16::from_f32(
+            (((i * 17) % 257) as f32 - 128.0) / 256.0 + (((i * 29) % 263) as f32 - 131.0) / 512.0,
+        );
+    }
+    let expected = values
+        .chunks_exact(width)
+        .map(crate::fp8::fake_quant_reference)
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flat_map(|(_, _, row)| row)
+        .collect::<Vec<_>>();
+    let mut input = stream.clone_htod(&values)?;
+    let quantize = module.load_function("e4m3_fake_quant_bf16")?;
+    unsafe {
+        stream
+            .launch_builder(&quantize)
+            .arg(&mut input)
+            .arg(&4i32)
+            .arg(&(width as i32))
+            .arg(&0u64)
+            .arg(&0u32)
+            .arg(&4u32)
+            .launch(LaunchConfig {
+                grid_dim: (4, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    let actual = stream.clone_dtoh(&input)?;
+    for row in 0..4 {
+        let range = row * width..(row + 1) * width;
+        gate.check(
+            &format!("fp8.quantize.row{row}.rne_zero_subnormal"),
+            actual[range.clone()]
+                .iter()
+                .zip(&expected[range])
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+        );
+    }
     Ok(())
 }
 

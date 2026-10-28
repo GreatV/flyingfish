@@ -64,6 +64,7 @@ const ROCM_KERNELS: &[&str] = &[
     "attention",
     "q38_common",
     "gemm_skinny",
+    "fp8_linear",
     "tcmqa",
     "markov",
     "tree/meta",
@@ -170,7 +171,9 @@ fn build_rocm(out: &std::path::Path) {
         );
         println!("cargo:rerun-if-changed={}", file.display());
         for arch in &archs {
-            if matches!(*name, "gemm_skinny" | "tcmqa" | "markov") && !arch.starts_with("gfx11") {
+            if matches!(*name, "gemm_skinny" | "tcmqa" | "markov" | "fp8_linear")
+                && !arch.starts_with("gfx11")
+            {
                 continue;
             }
             let filename = format!("{}_{arch}.hsaco", name.replace('/', "_"));
