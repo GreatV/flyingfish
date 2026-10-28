@@ -4333,7 +4333,7 @@ pub(super) fn restore_chain_state(model: &mut Engine, mut values: &[u8]) -> Resu
 #[ignore = "requires GPU, published target/draft and an owned FLYINGFISH_RUNTIME_DIR"]
 fn minicpm_chain_verify_gpu() -> Result<()> {
     let mut defects = 0;
-    for chunk in [9, 17, 33] {
+    for chunk in [33, 9, 17] {
         if let Err(error) = minicpm_chain_verify(chunk) {
             if !error.to_string().starts_with("DEFECT") {
                 return Err(error);
@@ -4763,8 +4763,9 @@ fn minicpm_chain_verify(chunk: usize) -> Result<()> {
         .as_mut()
         .context("checkpoint missing")?
         .save(&model.state, &model.work.token, ids.len(), &stream, None)?;
-    for _ in 0..rows {
-        greedy.push(model.decode(false, None)?);
+    let mut greedy_trace = Trace::all_layers();
+    for row in 0..rows {
+        greedy.push(model.decode(false, (row == 2).then_some((&mut greedy_trace, "greedy")))?);
         greedy_states.push(chain_state(&model)?);
         greedy_logits.push(stream.clone_dtoh(&model.work.logits)?);
         greedy_taps.extend(
@@ -4908,7 +4909,40 @@ fn minicpm_chain_verify(chunk: usize) -> Result<()> {
                 graph && cfg!(feature = "cuda"),
                 c"minicpm_chain_graph",
             );
-            let round = model.spec_round(limit, None, "chain")?;
+            let traced = !graph && verify_width == Some(5) && matched == 2;
+            let mut commit_trace = Trace::all_layers();
+            let round = model.spec_round(limit, traced.then_some(&mut commit_trace), "chain")?;
+            if traced {
+                let names = (0..model.model_spec.layers.len())
+                    .flat_map(|layer| {
+                        ["norm1", "mixer_out", "o_proj", "post_attention", "norm2"]
+                            .map(move |point| format!("{layer}.debug.{point}"))
+                    })
+                    .chain(std::iter::once("norm".to_owned()));
+                for name in names {
+                    let expected = greedy_trace.values(&format!("greedy.{name}"))?;
+                    let actual = commit_trace.values(&format!("chain.{name}"))?;
+                    ensure!(
+                        actual.len() == 5 * expected.len(),
+                        "commit boundary trace extent"
+                    );
+                    let actual = &actual[2 * expected.len()..3 * expected.len()];
+                    let mismatches = actual
+                        .iter()
+                        .zip(&expected)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    let maximum = actual
+                        .iter()
+                        .zip(&expected)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    println!(
+                        "CHAIN_COMMIT_BOUNDARY chunk={chunk} row=2 point={name} mismatches={mismatches} max_abs={maximum}"
+                    );
+                    defects += mismatches;
+                }
+            }
             drop(graph_range);
             let actual_width = round.predictions.len();
             if let Some(w) = verify_width {
@@ -5101,7 +5135,7 @@ fn minicpm_chain_verify(chunk: usize) -> Result<()> {
         "Runner FAIL planted gdn_inputs perturbation control was not detected"
     );
     println!(
-        "{} minicpm_chain_verify_end chunk={chunk} rows=8 graph_widths=2..={max_forced} prefixes=7,17,65,224 accepted=0..8 wrong_layer_mismatches={wrong_layer} perturbed_gdn_mismatches={perturbed_gdn_control} defects={defects}",
+        "{} minicpm_chain_verify_end chunk={chunk} rows=8 graph_widths=2..={max_forced} prefixes=7,17,65,125,129,224 accepted=0..8 wrong_layer_mismatches={wrong_layer} perturbed_gdn_mismatches={perturbed_gdn_control} defects={defects}",
         if defects == 0 { "PASS" } else { "DEFECT" }
     );
     ensure!(

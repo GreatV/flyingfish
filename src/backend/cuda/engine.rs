@@ -4421,7 +4421,11 @@ impl Engine {
                         head: Head::All,
                         mask: crate::backend::Mask::Causal,
                     },
-                    None,
+                    trace.as_deref_mut().map(|trace| Target {
+                        trace,
+                        prefix,
+                        skip: 0,
+                    }),
                 )?;
             }
             let predictions = self.device.stream.clone_dtoh(
