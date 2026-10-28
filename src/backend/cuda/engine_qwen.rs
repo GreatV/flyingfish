@@ -1279,7 +1279,11 @@ impl Runtime {
         )?;
         let mut layers = Vec::new();
         let w = &engine.work;
-        let mw = w.mixer.as_ref().context("Q38 mixer work missing")?;
+        let mw = if gemma {
+            None
+        } else {
+            Some(w.mixer.as_ref().context("Q38 mixer work missing")?)
+        };
         #[cfg(feature = "cuda")]
         let rope_module = if flint || gemma {
             Some(cubin::module(&engine.device.ctx, "rope")?)
@@ -1462,6 +1466,7 @@ impl Runtime {
                         let attention = *attention
                             .as_ref()
                             .context("full-attention layer has no specification")?;
+                        let mw = mw.context("Q38 mixer work missing")?;
                         let kv = &engine.state.kv[layout.state_index as usize];
                         ensure!(
                             kv.compact.is_some() == kv_scratch.is_some(),
@@ -1661,6 +1666,7 @@ impl Runtime {
                     } else {
                         "linear_attn."
                     };
+                    let mw = mw.context("Q38 mixer work missing")?;
                     let cd = spec.conv_dim()?;
                     let a_width = spec.ab_width()? as usize - spec.hv as usize;
                     let state = &engine.state.gdn[layout.state_index as usize];
@@ -3947,7 +3953,11 @@ impl Engine {
         }
         let layer = &mut q.layers[i];
         let w = &mut self.work;
-        let mw = w.mixer.as_ref().context("Q38 mixer work missing")?;
+        let mw = if gemma_layer {
+            None
+        } else {
+            Some(w.mixer.as_ref().context("Q38 mixer work missing")?)
+        };
         let meta = self.state.seq_ref(s)?;
         let domain = RowDomain {
             meta,
@@ -4458,6 +4468,7 @@ impl Engine {
                 #[cfg(feature = "cuda")]
                 compact_small,
             } => {
+                let mw = mw.context("Q38 mixer work missing")?;
                 let attention = *attention
                     .as_ref()
                     .context("full-attention mixer has no specification")?;
@@ -4671,6 +4682,7 @@ impl Engine {
                 decode,
                 ..
             } => {
+                let mw = mw.context("Q38 mixer work missing")?;
                 let spec = gdn.context("GDN mixer has no GDN specification")?;
                 let conv = conv_width as usize;
                 let value = value_width as usize;
