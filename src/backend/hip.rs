@@ -46,6 +46,8 @@ unsafe extern "C" {
     fn hipFree(ptr: Handle) -> i32;
     fn hipHostMalloc(ptr: *mut Handle, bytes: usize, flags: u32) -> i32;
     fn hipHostFree(ptr: Handle) -> i32;
+    fn hipHostRegister(ptr: Handle, bytes: usize, flags: u32) -> i32;
+    fn hipHostUnregister(ptr: Handle) -> i32;
     fn hipMemcpyAsync(
         dst: Handle,
         src: *const c_void,
@@ -257,6 +259,30 @@ impl Context {
             check(hipMemGetInfo(&mut free, &mut total), "hipMemGetInfo")?;
         }
         Ok((free, total))
+    }
+    /// # Safety
+    /// The host span must remain live and exclusively registered until unregister completes.
+    pub unsafe fn register_host(&self, address: u64, bytes: usize, portable: bool) -> Result<()> {
+        ensure!(
+            address != 0 && bytes > 0,
+            "HIP host registration requires a nonempty span"
+        );
+        address
+            .checked_add(bytes as u64)
+            .context("HIP host registration extent overflow")?;
+        self.bind_to_thread()?;
+        unsafe {
+            check(
+                hipHostRegister(address as Handle, bytes, u32::from(portable)),
+                "hipHostRegister",
+            )
+        }
+    }
+    /// # Safety
+    /// Address must name a live registration with all device accesses completed.
+    pub unsafe fn unregister_host(&self, address: u64) -> Result<()> {
+        self.bind_to_thread()?;
+        unsafe { check(hipHostUnregister(address as Handle), "hipHostUnregister") }
     }
     pub fn new_stream(self: &Arc<Self>) -> Result<Arc<Stream>> {
         self.bind_to_thread()?;

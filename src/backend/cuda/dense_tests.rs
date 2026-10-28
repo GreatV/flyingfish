@@ -1848,6 +1848,30 @@ fn blas_gate(s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
                 serde_json::to_string(&choice)?
             );
             rebound.linear_with_bias(shape, db.as_deref(), &dw, &dx, &mut dy)?;
+            if !bias {
+                let original = s.clone_dtoh(&dy)?;
+                let weight =
+                    contracts::view(&dw, s, 0, [output as u32, input as u32], [input as u64, 1])?;
+                let x = contracts::view(&dx, s, 0, [rows as u32, input as u32], [input as u64, 1])?;
+                let mut y = contracts::TensorMut(contracts::view(
+                    &dy,
+                    s,
+                    0,
+                    [rows as u32, output as u32],
+                    [output as u64, 1],
+                )?);
+                rebound.linear_typed_bound(
+                    crate::op_contract::ExecutionPhase::Prefill,
+                    linear::LinearWeightRef::Bf16(weight),
+                    x,
+                    &mut y,
+                    0,
+                )?;
+                gate.check(
+                    "blas.typed_library_identity",
+                    original == s.clone_dtoh(&dy)?,
+                );
+            }
             let reference = |bias: Option<&[bf16]>| -> Vec<bf16> {
                 (0..rows * output)
                     .map(|i| {

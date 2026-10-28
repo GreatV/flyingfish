@@ -328,6 +328,10 @@ impl Blas {
         &self.identity
     }
 
+    pub(crate) fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
     pub fn prepare_choice(
         &self,
         shape: LinearShape,
@@ -552,7 +556,6 @@ impl Blas {
         let plan = plans
             .get(&key)
             .context("HIP linear shape/bias binding not prepared")?;
-        self.stream.retain(plan);
         if plan.choice.implementation == Implementation::Wmma {
             return self.wmma((shape, shape.input), bias, weight, input, output);
         }
@@ -581,6 +584,13 @@ impl Blas {
         let (a, _a) = weight.device_ptr(&self.stream);
         let (b, _b) = input.device_ptr(&self.stream);
         let (c, _c) = output.device_ptr_mut(&self.stream);
+        self.library_raw(plan, shape, [a, b, c])
+    }
+
+    fn library_raw(&self, plan: &Arc<Plan>, shape: LinearShape, pointers: [u64; 3]) -> Result<()> {
+        self.stream.context().bind_to_thread()?;
+        self.stream.retain(plan);
+        let [a, b, c] = pointers;
         let (alpha, beta) = (1f32, 0f32);
         unsafe {
             if shape.rows == 1 {
@@ -772,13 +782,18 @@ impl Blas {
         } else {
             0
         };
+        let (w, _w) = weight.device_ptr(&self.stream);
+        let (x, _x) = input.device_ptr(&self.stream);
+        let (y, _y) = output.device_ptr_mut(&self.stream);
+        self.wmma_raw(shape, stride, [w, x, y, bias_ptr])
+    }
+
+    fn wmma_raw(&self, shape: LinearShape, stride: usize, pointers: [u64; 4]) -> Result<()> {
         let function = self
             .skinny
             .as_ref()
             .context("HIP WMMA function not bound")?;
-        let (w, _w) = weight.device_ptr(&self.stream);
-        let (x, _x) = input.device_ptr(&self.stream);
-        let (y, _y) = output.device_ptr_mut(&self.stream);
+        let [w, x, y, bias_ptr] = pointers;
         unsafe {
             self.stream
                 .launch_builder(function)
@@ -796,6 +811,73 @@ impl Blas {
                 ))?;
         }
         Ok(())
+    }
+
+    pub(crate) fn prepare_fixed(&self, rows: u32, output: u32, input: u32) -> Result<()> {
+        self.prepare_choice(
+            LinearShape {
+                rows: rows as usize,
+                output: output as usize,
+                input: input as usize,
+            },
+            None,
+            None,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn prepare_skinny(&self, shape: LinearShape) -> Result<()> {
+        self.stream
+            .require_eager("invariant WMMA plan preparation")?;
+        ensure!(
+            self.wmma_candidate(shape),
+            "HIP invariant WMMA shape unsupported: {shape:?}"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn linear_typed_bound(
+        &self,
+        phase: crate::op_contract::ExecutionPhase,
+        weight: crate::backend::gpu::linear::LinearWeightRef,
+        x: crate::backend::gpu::contracts::Tensor<bf16, 2>,
+        y: &mut crate::backend::gpu::contracts::TensorMut<bf16, 2>,
+        invariant_rows: usize,
+    ) -> Result<()> {
+        use crate::backend::gpu::linear;
+        let linear::LinearWeightRef::Bf16(w) = weight else {
+            anyhow::bail!("HIP FP8 projection requires a setup-bound channel call");
+        };
+        if phase == crate::op_contract::ExecutionPhase::Decode {
+            ensure!(x.shape[0] == 1, "Decode requires M1");
+        }
+        w.validate()?;
+        linear::validate_call(w.shape, x, &y.0)?;
+        linear::disjoint(&w, &y.0)?;
+        ensure!(
+            w.stride == [u64::from(w.shape[1]), 1],
+            "HIP BF16 weight requires row-major layout"
+        );
+        let shape = LinearShape {
+            rows: x.shape[0] as usize,
+            output: w.shape[0] as usize,
+            input: w.shape[1] as usize,
+        };
+        if (1..=invariant_rows).contains(&shape.rows) {
+            ensure!(
+                self.wmma_candidate(shape),
+                "HIP invariant WMMA shape unsupported: {shape:?}"
+            );
+            return self.wmma_raw(shape, shape.input, [w.ptr, x.ptr, y.0.ptr, 0]);
+        }
+        let plans = self.plans.borrow();
+        let plan = plans
+            .get(&(shape, None))
+            .context("HIP fixed linear shape not prepared")?;
+        if plan.choice.implementation == Implementation::Wmma {
+            return self.wmma_raw(shape, shape.input, [w.ptr, x.ptr, y.0.ptr, 0]);
+        }
+        self.library_raw(plan, shape, [w.ptr, x.ptr, y.0.ptr])
     }
 
     pub fn calibrate_shape(

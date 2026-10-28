@@ -1,5 +1,4 @@
 //! Typed Linear views; all BF16 plans execute through the shared Blas handle.
-#[cfg(feature = "cuda")]
 use super::contracts::Scratch;
 use super::contracts::{RowDomain, Tensor, TensorMut};
 use super::weights::WeightCatalog;
@@ -406,22 +405,23 @@ impl crate::linear_plan::LayerDequantPlan {
     }
 }
 
-#[cfg(feature = "cuda")]
 struct BoundProjection {
     resident: LinearWeightRef,
+    #[cfg(feature = "cuda")]
     prefill: Tensor<bf16, 2>,
+    #[cfg(feature = "rocm")]
+    calls: std::cell::RefCell<std::collections::BTreeMap<(u32, u64, u64), ChannelProjection>>,
     invariant_rows: usize,
 }
 /// Setup-bound views for a layer. Engine retains catalog/arena storage; run does
 /// not construct tensor names, allocate scratch or invoke a Lt heuristic.
-#[cfg(feature = "cuda")]
 pub(crate) struct LayerLinearPlan {
     projections: std::collections::BTreeMap<String, BoundProjection>,
+    #[cfg(feature = "cuda")]
     materialize: Vec<(LinearWeightRef, TensorMut<bf16, 2>)>,
 }
 
 #[derive(Clone, Debug)]
-#[cfg(feature = "cuda")]
 pub(crate) enum BoundFfn {
     Dense,
     Moe {
@@ -432,7 +432,6 @@ pub(crate) enum BoundFfn {
     },
 }
 
-#[cfg(feature = "cuda")]
 impl BoundFfn {
     pub fn bind(spec: &crate::model_spec::ModelSpec, linear: &mut LayerLinearPlan) -> Result<Self> {
         let Some(moe) = spec
@@ -483,7 +482,6 @@ impl BoundFfn {
     }
 }
 
-#[cfg(feature = "cuda")]
 impl LayerLinearPlan {
     fn take_bf16(&mut self, role: &str, expected: [u32; 2]) -> Result<Tensor<bf16, 2>> {
         let projection = self
@@ -510,13 +508,20 @@ impl LayerLinearPlan {
         arena: Option<&Scratch>,
         stream: &Arc<CudaStream>,
     ) -> Result<Self> {
+        #[cfg(feature = "cuda")]
         if plan.bytes > 0 {
             arena
                 .context("FP8 layer has no materialization arena")?
                 .validate(plan.bytes)?;
         }
+        #[cfg(feature = "rocm")]
+        ensure!(
+            arena.is_none(),
+            "HIP native channel layers do not use a dequantization arena"
+        );
         let prefix = &plan.prefix;
         let mut projections = std::collections::BTreeMap::new();
+        #[cfg(feature = "cuda")]
         let mut materialize = Vec::new();
         for (name, entry) in &catalog.manifest.entries {
             if !entry.load
@@ -528,6 +533,7 @@ impl LayerLinearPlan {
                 continue;
             }
             let resident = catalog.linear_ref(name, stream)?;
+            #[cfg(feature = "cuda")]
             let prefill = match &resident {
                 LinearWeightRef::Bf16(w) => *w,
                 LinearWeightRef::Fp8 { .. } => {
@@ -542,6 +548,18 @@ impl LayerLinearPlan {
                     w
                 }
             };
+            #[cfg(feature = "rocm")]
+            ensure!(
+                matches!(
+                    resident,
+                    LinearWeightRef::Bf16(_)
+                        | LinearWeightRef::Fp8 {
+                            layout: Fp8ScaleLayout::PerChannel,
+                            ..
+                        }
+                ),
+                "HIP layer projection requires BF16 or per-channel FP8: {name}"
+            );
             let role = &name[prefix.len()..];
             let invariant_rows = if matches!(
                 role,
@@ -559,35 +577,74 @@ impl LayerLinearPlan {
                 role.to_owned(),
                 BoundProjection {
                     resident,
+                    #[cfg(feature = "cuda")]
                     prefill,
+                    #[cfg(feature = "rocm")]
+                    calls: std::cell::RefCell::new(std::collections::BTreeMap::new()),
                     invariant_rows,
                 },
             );
         }
+        #[cfg(feature = "cuda")]
         ensure!(
             materialize.len() == plan.slots.len(),
             "layer linear plan does not cover materialization slots"
         );
         Ok(Self {
             projections,
+            #[cfg(feature = "cuda")]
             materialize,
         })
     }
     pub fn prepare(&self, blas: &super::blas::Blas, rows: u32) -> Result<()> {
         for p in self.projections.values() {
+            #[cfg(feature = "cuda")]
+            let weight = p.prefill;
+            #[cfg(feature = "rocm")]
+            let LinearWeightRef::Bf16(weight) = p.resident else {
+                continue;
+            };
             if p.invariant_rows > 0 {
                 blas.prepare_skinny(crate::backend::setup::LinearShape {
                     rows: (rows as usize).min(p.invariant_rows),
-                    output: p.prefill.shape[0] as usize,
-                    input: p.prefill.shape[1] as usize,
+                    output: weight.shape[0] as usize,
+                    input: weight.shape[1] as usize,
                 })?;
             }
             if rows as usize > p.invariant_rows {
-                blas.prepare_fixed(rows, p.prefill.shape[0], p.prefill.shape[1])?;
+                blas.prepare_fixed(rows, weight.shape[0], weight.shape[1])?;
             }
         }
         Ok(())
     }
+    #[cfg(feature = "rocm")]
+    pub fn bind_call(
+        &self,
+        ops: &Fp8Ops,
+        role: &str,
+        x: Tensor<bf16, 2>,
+        y: &TensorMut<bf16, 2>,
+    ) -> Result<()> {
+        let projection = self
+            .projections
+            .get(role)
+            .with_context(|| format!("layer projection not bound: {role}"))?;
+        if let LinearWeightRef::Bf16(weight) = projection.resident {
+            validate_call(weight.shape, x, &y.0)?;
+            return disjoint(&weight, &y.0);
+        }
+        let call = ops.bind_channel(projection.resident, x, y)?;
+        let key = (x.shape[0], x.ptr, y.0.ptr);
+        let mut calls = projection.calls.borrow_mut();
+        ensure!(
+            !calls.contains_key(&key),
+            "HIP layer projection call already bound: {role}"
+        );
+        calls.insert(key, call);
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
     pub fn materialize(
         &mut self,
         blas: &super::blas::Blas,
@@ -619,6 +676,22 @@ impl LayerLinearPlan {
             .projections
             .get(role)
             .with_context(|| format!("layer projection not bound: {role}"))?;
+        #[cfg(feature = "rocm")]
+        if let LinearWeightRef::Fp8 { codes, .. } = p.resident {
+            validate_call(codes.shape, x, &y.0)?;
+            ensure!(
+                phase != crate::op_contract::ExecutionPhase::Decode || x.shape[0] == 1,
+                "Decode requires M1"
+            );
+            let calls = p.calls.borrow();
+            let call = calls
+                .get(&(x.shape[0], x.ptr, y.0.ptr))
+                .context("HIP native layer projection is outside the frozen setup closure")?;
+            return call.run(blas.stream());
+        }
+        #[cfg(feature = "rocm")]
+        let weight = p.resident;
+        #[cfg(feature = "cuda")]
         let weight = if phase == crate::op_contract::ExecutionPhase::Prefill
             && !blas.direct_fp8_rows().contains(&(x.shape[0] as usize))
         {

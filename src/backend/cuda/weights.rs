@@ -1,7 +1,6 @@
 use super::Device;
-use crate::backend::gpu::{CudaSlice, CudaStream, PinnedHostSlice};
+use crate::backend::gpu::{CudaContext, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice};
 use crate::config::Config;
-#[cfg(feature = "cuda")]
 use crate::experts::{
     arena::{HostBlocks, SlotLayout},
     catalogue::ExpertGeometry,
@@ -9,7 +8,7 @@ use crate::experts::{
 };
 use anyhow::{Context, Result, ensure};
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaContext, DevicePtr, sys};
+use cudarc::driver::sys;
 use half::bf16;
 use safetensors::{Dtype, SafeTensors};
 use sha2::{Digest, Sha256};
@@ -58,7 +57,6 @@ pub struct Weights {
 }
 
 /// Stable native expert slots, persistent staging and host data plus spare blocks.
-#[cfg(feature = "cuda")]
 pub struct ExpertStorage {
     layout: SlotLayout,
     down_offset: u64,
@@ -70,7 +68,6 @@ pub struct ExpertStorage {
     registered: bool,
 }
 
-#[cfg(feature = "cuda")]
 impl ExpertStorage {
     pub fn new(
         stream: &Arc<CudaStream>,
@@ -87,6 +84,11 @@ impl ExpertStorage {
         let layout = SlotLayout::new(geometry, capacity)?;
         let gpu0_bytes = layout.allocation_bytes()?;
         let peer_bytes = layout.peer_resident_bytes();
+        #[cfg(feature = "rocm")]
+        ensure!(
+            peer.is_none() && peer_bytes == 0,
+            "HIP expert peer storage is not implemented"
+        );
         let host = (layout.host_blocks() > 0)
             .then(|| {
                 HostBlocks::new(
@@ -219,8 +221,16 @@ impl ExpertStorage {
             .bind_to_thread()
             .context("bind expert host registration context")?;
         // SAFETY: the exact owned allocation remains alive until unregister after all device uses.
-        unsafe { sys::cuMemHostRegister_v2(address as *mut std::ffi::c_void, bytes, 0).result() }
-            .with_context(|| format!("register expert host arena: bytes={bytes}"))?;
+        unsafe {
+            #[cfg(feature = "cuda")]
+            sys::cuMemHostRegister_v2(address as *mut std::ffi::c_void, bytes, 0)
+                .result()
+                .with_context(|| format!("register expert host arena: bytes={bytes}"))?;
+            #[cfg(feature = "rocm")]
+            self.context
+                .register_host(address as u64, bytes, false)
+                .with_context(|| format!("register expert host arena: bytes={bytes}"))?;
+        }
         self.registered = true;
         Ok(())
     }
@@ -275,6 +285,24 @@ impl Drop for ExpertStorage {
                     sys::cuMemHostUnregister(address as *mut std::ffi::c_void).result()
                 });
             }
+        }
+    }
+}
+
+#[cfg(feature = "rocm")]
+impl Drop for ExpertStorage {
+    fn drop(&mut self) {
+        crate::backend::hip::drop_result("finish expert storage", self.context.synchronize());
+        if let Some(peer) = &self.peer_context {
+            crate::backend::hip::drop_result("finish peer expert storage", peer.synchronize());
+        }
+        if self.registered
+            && let Some(host) = &self.host
+        {
+            let (address, _) = host.host_span();
+            crate::backend::hip::drop_result("unregister expert host storage", unsafe {
+                self.context.unregister_host(address as u64)
+            });
         }
     }
 }
