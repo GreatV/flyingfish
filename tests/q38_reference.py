@@ -7,7 +7,6 @@ from unittest.mock import patch
 import torch
 import transformers
 from safetensors.torch import load_file, save_file
-from PIL import Image
 from accelerate.utils import set_module_tensor_to_device
 from transformers.integrations.finegrained_fp8 import FP8Linear
 from minicpm_reference import check, sequence
@@ -108,7 +107,10 @@ def media_sequence(model, inputs, forced, steps):
 
 
 def media_reference(model, args, loading, calls):
-    processor = transformers.AutoProcessor.from_pretrained(args.model, local_files_only=True)
+    tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, local_files_only=True)
+    processor = None
+    if args.forced_reference is None:
+        processor = transformers.AutoProcessor.from_pretrained(args.model, local_files_only=True)
     encoder = []
     handle = model.model.visual.register_forward_hook(lambda *_: encoder.append(True))
     report = dict(loading=loading, cells=[], torch=torch.__version__, transformers=transformers.__version__)
@@ -116,6 +118,7 @@ def media_reference(model, args, loading, calls):
     for path in args.images:
         name = "image_" + path.stem
         if args.forced_reference is None:
+            from PIL import Image
             with Image.open(path) as source:
                 picture = source.convert("RGB").resize((256, 256))
             messages = [{"role": "user", "content": [{"type": "image"},
@@ -148,7 +151,7 @@ def media_reference(model, args, loading, calls):
             save_file(result, args.output / (name + suffix + ".safetensors"))
             cell = dict(name=name, repeat=repeat, encoder_calls=1, steps=32,
                         rows=inputs["input_ids"].numel(), min_margin=float(result["margins"].min()),
-                        text=processor.tokenizer.decode(result["tokens"], skip_special_tokens=True))
+                        text=tokenizer.decode(result["tokens"], skip_special_tokens=True))
             report["cells"].append(cell)
             print("Q38_MEDIA_REFERENCE " + json.dumps(cell), flush=True)
         outputs.append(first)
