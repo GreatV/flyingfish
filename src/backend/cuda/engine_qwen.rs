@@ -903,7 +903,8 @@ impl Runtime {
                                             [3, 1],
                                         )?),
                                         false,
-                                    )
+                                    )?
+                                    .with_single_row_segments()
                                 } else {
                                     plan.for_rows(rows)
                                 }
