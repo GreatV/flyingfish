@@ -131,8 +131,7 @@ unsafe fn logarithm(a: f32) -> f32 {
             * (1.0 / 3.0
                 + square
                     * (1.0 / 5.0
-                        + square
-                            * (1.0 / 7.0 + square * (1.0 / 9.0 + square * (1.0 / 11.0)))));
+                        + square * (1.0 / 7.0 + square * (1.0 / 9.0 + square * (1.0 / 11.0)))));
     2.0 * t * series + exponent as f32 * core::f32::consts::LN_2
 }
 #[inline(always)]
