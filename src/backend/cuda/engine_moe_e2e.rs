@@ -4582,6 +4582,97 @@ fn minicpm_prefill_combine_bit_identity_gpu() -> Result<()> {
 
 #[test]
 #[ignore = "requires CUDA, published MiniCPM FF_MODEL, text_1k fixture and FLYINGFISH_RUNTIME_DIR"]
+/// T43 acceptance: two requests with a reset between them, on a tree whose `Engine::reset` does
+/// NOT restore the setup placement. The numbers must still agree, because the host tier now
+/// computes the same bits as the resident tier for the form the engine would select.
+#[test]
+#[ignore = "exclusive CUDA, published MiniCPM FF_MODEL, text fixtures and pinned runtime"]
+fn minicpm_decode_reset_sequence_identity_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let model = PathBuf::from(std::env::var("FF_MODEL")?);
+    let fixtures = PathBuf::from(std::env::var("FF_MINICPM_REFERENCE_DIR")?);
+    let runtime = PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
+    let spec = crate::model_spec::ModelSpec::read(&model)?;
+    ensure!(
+        spec.architecture == crate::model_spec::Architecture::MiniCpmV47
+            && spec.hidden == 2048
+            && spec.layers.len() == 40
+            && spec.vocab == 248144,
+        "Runner FAIL published MiniCPM decode geometry required"
+    );
+    let bytes = std::fs::read(fixtures.join("text_1k.safetensors"))?;
+    let source = SafeTensors::deserialize(&bytes)?;
+    let ids = integers(&source, "input_ids")?;
+    ensure!(
+        ids.len() == 1024 && ids.iter().all(|&id| id < spec.vocab),
+        "Runner FAIL text_1k decode fixture extent/vocabulary"
+    );
+    let settings = Settings {
+        runtime_dir: Some(runtime),
+        prefix_cache: false,
+        draft_model: None,
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: false,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    Engine::calibrate(&model, 0, ids.len() + 32, None, settings.clone())?;
+    let mut engine = Engine::load(&model, 0, ids.len() + 32, None, settings)?;
+    let first = decode_combine_probe(&mut engine, &ids, false)?;
+    let after_first = engine
+        .moe_slots
+        .as_ref()
+        .context("decode reset slots missing")?
+        .capture_placement()?;
+    engine.reset()?;
+    let second = decode_combine_probe(&mut engine, &ids, true)?;
+    let after_second = engine
+        .moe_slots
+        .as_ref()
+        .context("decode reset slots missing")?
+        .capture_placement()?;
+    let moved = after_first
+        .iter()
+        .zip(&after_second)
+        .filter(|((left, _), (right, _))| {
+            (*left == crate::experts::plan::Tier::Gpu) != (*right == crate::experts::plan::Tier::Gpu)
+        })
+        .count();
+    let token_mismatches = first
+        .tokens
+        .iter()
+        .zip(&second.tokens)
+        .filter(|(a, b)| a != b)
+        .count();
+    let logit_mismatches = first
+        .logits
+        .iter()
+        .zip(&second.logits)
+        .filter(|(a, b)| a != b)
+        .count();
+    let state_mismatches = first
+        .state
+        .iter()
+        .zip(&second.state)
+        .filter(|(a, b)| a != b)
+        .count();
+    println!(
+        "RESET_SEQUENCE placement_moved={moved} tokens={} logits={} state_bytes={} token_mismatches={token_mismatches} logit_mismatches={logit_mismatches} state_byte_mismatches={state_mismatches}",
+        first.tokens.len(),
+        first.logits.len(),
+        first.state.len()
+    );
+    ensure!(
+        token_mismatches == 0 && logit_mismatches == 0 && state_mismatches == 0,
+        "DEFECT reset_sequence token={token_mismatches} logits={logit_mismatches} state={state_mismatches}"
+    );
+    println!("PASS RESET_SEQUENCE identity=true placement_independent=true");
+    Ok(())
+}
+
 fn minicpm_decode_combine_identity_gpu() -> Result<()> {
     ensure!(
         std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),

@@ -341,8 +341,7 @@ struct Fp8Pair<'a> {
 type DotFn = unsafe fn(&[f32], &[bf16], Form) -> f32;
 type Fp8DotFn = unsafe fn(&[f32], &[u8], bf16, Form) -> f32;
 type GateUpFn = unsafe fn(&[f32], &[usize], &[bf16], &[bf16], &mut [(f32, f32)], Form);
-type Fp8GateUpFn =
-    unsafe fn(&[f32], &[usize], Fp8Pair<'_>, (bf16, bf16), &mut [(f32, f32)], Form);
+type Fp8GateUpFn = unsafe fn(&[f32], &[usize], Fp8Pair<'_>, (bf16, bf16), &mut [(f32, f32)], Form);
 type DownRowsFn = unsafe fn(&[f32], &[usize], &[bf16], &mut [f32], Form);
 type Fp8DownRowsFn = unsafe fn(&[f32], &[usize], &[u8], bf16, &mut [f32], &mut [f32], Form);
 type RoundFn = unsafe fn(&[f32], &mut [bf16], Form);
@@ -801,7 +800,11 @@ fn scalar_gate_up_e4m3(
     out: &mut [(f32, f32)],
     form: Form,
 ) {
-    let Fp8Pair { gate, up, scratch_w } = pair;
+    let Fp8Pair {
+        gate,
+        up,
+        scratch_w,
+    } = pair;
     let width = gate.len();
     assert_eq!(width, up.len(), "gate/up width mismatch");
     assert_eq!(row_offsets.len(), out.len(), "gate/up row count mismatch");
@@ -861,11 +864,19 @@ fn scalar_round(values: &[f32], out: &mut [bf16], _form: Form) {
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::{Arm, Fp8Pair, Form, LANES, bf16};
+    use super::{
+        Arm, Form, Fp8Pair, LANES, bf16, scalar_dot, scalar_dot_e4m3, scalar_down_rows,
+        scalar_down_rows_e4m3, scalar_gate_up, scalar_gate_up_e4m3,
+    };
     use std::arch::x86_64::*;
 
     #[target_feature(enable = "avx2,fma")]
     pub(super) unsafe fn dot(x: &[f32], weights: &[bf16], form: Form) -> f32 {
+        // The 8-lane form sums each 8-element vector sequentially from zero before adding it to
+        // its lane accumulator; that chain has no SIMD form, so it takes the scalar path.
+        if form == Form::Lane8 {
+            return scalar_dot(x, weights, form);
+        }
         assert_eq!(x.len(), weights.len(), "dot operand width mismatch");
         let mut low = _mm256_setzero_ps();
         let mut high = _mm256_setzero_ps();
@@ -994,6 +1005,9 @@ mod x86 {
 
     #[target_feature(enable = "avx2,fma")]
     pub(super) unsafe fn dot_e4m3(x: &[f32], codes: &[u8], scale: bf16, form: Form) -> f32 {
+        if form == Form::Lane8 {
+            return scalar_dot_e4m3(x, codes, scale, form);
+        }
         assert_eq!(x.len(), codes.len(), "dot operand width mismatch");
         let factor = _mm256_set1_ps(scale.to_f32());
         let mut low = _mm256_setzero_ps();
@@ -1021,6 +1035,9 @@ mod x86 {
         out: &mut [(f32, f32)],
         form: Form,
     ) {
+        if form == Form::Lane8 {
+            return scalar_gate_up(x_buf, row_offsets, gate, up, out, form);
+        }
         let width = gate.len();
         assert_eq!(width, up.len(), "gate/up width mismatch");
         assert_eq!(row_offsets.len(), out.len(), "gate/up row count mismatch");
@@ -1134,7 +1151,21 @@ mod x86 {
         out: &mut [(f32, f32)],
         form: Form,
     ) {
-        let Fp8Pair { gate, up, scratch_w } = pair;
+        if form == Form::Lane8 {
+            return scalar_gate_up_e4m3(
+                x_buf,
+                row_offsets,
+                pair,
+                (gate_scale, up_scale),
+                out,
+                form,
+            );
+        }
+        let Fp8Pair {
+            gate,
+            up,
+            scratch_w,
+        } = pair;
         let width = gate.len();
         assert_eq!(width, up.len(), "gate/up width mismatch");
         assert_eq!(row_offsets.len(), out.len(), "gate/up row count mismatch");
@@ -1258,6 +1289,9 @@ mod x86 {
         out: &mut [f32],
         form: Form,
     ) {
+        if form == Form::Lane8 {
+            return scalar_down_rows(x_buf, row_offsets, down, out, form);
+        }
         let width = down.len();
         assert_eq!(row_offsets.len(), out.len(), "down row count mismatch");
         let mut cursor = 0;
@@ -1367,6 +1401,17 @@ mod x86 {
         scratch_w: &mut [f32],
         form: Form,
     ) {
+        if form == Form::Lane8 {
+            return scalar_down_rows_e4m3(
+                x_buf,
+                row_offsets,
+                down,
+                down_scale,
+                out,
+                scratch_w,
+                form,
+            );
+        }
         let width = down.len();
         assert_eq!(row_offsets.len(), out.len(), "down row count mismatch");
         assert!(
@@ -1526,6 +1571,9 @@ mod x86 {
 
     #[target_feature(enable = "avx512f,avx512bf16")]
     pub(super) unsafe fn dot_512(x: &[f32], weights: &[bf16], form: Form) -> f32 {
+        if form == Form::Lane8 {
+            return scalar_dot(x, weights, form);
+        }
         assert_eq!(x.len(), weights.len(), "dot operand width mismatch");
         let mut acc = _mm512_setzero_ps();
         let mut k = 0;
@@ -1596,6 +1644,9 @@ mod x86 {
 
     #[target_feature(enable = "avx512f,avx512bf16")]
     pub(super) unsafe fn dot_e4m3_512(x: &[f32], codes: &[u8], scale: bf16, form: Form) -> f32 {
+        if form == Form::Lane8 {
+            return scalar_dot_e4m3(x, codes, scale, form);
+        }
         assert_eq!(x.len(), codes.len(), "dot operand width mismatch");
         let factor = _mm512_set1_ps(scale.to_f32());
         let mut acc = _mm512_setzero_ps();
