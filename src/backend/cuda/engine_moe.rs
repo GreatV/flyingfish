@@ -789,7 +789,6 @@ pub(super) struct SlotBindings {
 }
 
 impl Engine {
-    #[cfg(feature = "cuda")]
     pub(super) fn bind_invariant_arithmetic(&mut self) -> Result<()> {
         self.closure.bind_fixed()?;
         let executor = self

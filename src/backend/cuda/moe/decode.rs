@@ -348,7 +348,6 @@ impl DecodeOps {
         )
     }
 
-    #[cfg(any(feature = "cuda", test))]
     pub(crate) fn new_invariant_with_boundaries(
         ctx: &Arc<CudaContext>,
         swiglu_rounding: crate::model_spec::SwigluRounding,

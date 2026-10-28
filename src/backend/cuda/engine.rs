@@ -4481,7 +4481,6 @@ impl Engine {
             )?;
             self.logits_cache.mark_valid();
             if transaction {
-                #[cfg(feature = "cuda")]
                 {
                     let spec = self.spec.as_mut().context("MoE chain missing")?;
                     spec.checkpoint

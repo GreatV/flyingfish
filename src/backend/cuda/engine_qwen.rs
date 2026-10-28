@@ -1224,7 +1224,7 @@ impl Engine {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", test))]
     pub(super) fn bind_gdn_snapshots(
         &mut self,
         snapshots: &[super::super::state::GdnState],
@@ -1344,7 +1344,6 @@ impl Engine {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     pub(super) fn replay_gdn_prefix(&mut self, start: usize, committed: usize) -> Result<()> {
         ensure!(committed > 0, "GDN replay requires committed > 0");
         let s = &self.device.stream;
@@ -1586,10 +1585,9 @@ impl Engine {
         #[cfg(feature = "rocm")]
         ensure!(
             model_spec.architecture == crate::model_spec::Architecture::MiniCpmV47
-                && settings.draft_model.is_none()
                 && !settings.prefix_cache
                 && settings.kv_format == crate::kv::KvFormat::Bf16,
-            "HIP hybrid setup requires MiniCPM-V-4.7 text with BF16 KV, no draft or persistent prefix cache"
+            "HIP hybrid setup requires MiniCPM-V-4.7 text with BF16 KV and no persistent prefix cache"
         );
         ensure!(
             model_spec.moe.is_none() || !reserve_mtp,
@@ -2172,7 +2170,11 @@ impl Engine {
             engine.declare_graphs()?;
         }
         #[cfg(feature = "rocm")]
-        engine.initialize_hip_hybrid(dir)?;
+        engine.initialize_hip_hybrid(dir, settings.draft_model.as_deref(), context_rows)?;
+        #[cfg(feature = "rocm")]
+        if engine.spec.is_some() {
+            engine.bind_invariant_arithmetic()?;
+        }
         engine.prepare(1)?;
         engine.prepare_prefill_plans()?;
         engine
@@ -2243,7 +2245,12 @@ impl Engine {
         Ok(())
     }
     #[cfg(feature = "rocm")]
-    fn initialize_hip_hybrid(&self, model: &Path) -> Result<()> {
+    fn initialize_hip_hybrid(
+        &self,
+        model: &Path,
+        draft_path: Option<&Path>,
+        context_rows: usize,
+    ) -> Result<()> {
         use super::super::closure::{Profile, hash, write_cache};
         use crate::backend::{gpu::blas::Choice, setup::LinearShape};
         let runtime = self.qwen.as_ref().context("HIP hybrid runtime missing")?;
@@ -2267,7 +2274,19 @@ impl Engine {
                 }
             }
         }
-        let profile = Profile::hip_hybrid(linear, self.capacity, self.workspace_rows, model)?;
+        let draft = self
+            .spec
+            .as_ref()
+            .map(|spec| {
+                Ok((
+                    &spec.draft.config,
+                    draft_path.context("HIP hybrid draft path missing")?,
+                    context_rows,
+                ))
+            })
+            .transpose()?;
+        let profile =
+            Profile::hip_hybrid(linear, self.capacity, self.workspace_rows, model, draft)?;
         let identity = self.blas.identity().clone();
         let tag = hash(&serde_json::to_vec(&(&identity, &profile))?);
         let path = self.runtime.join(format!("hip-hybrid-{tag}.json"));
@@ -2308,7 +2327,7 @@ impl Engine {
                 let weight = if shape.output == self.config.vocab_size
                     && shape.input == self.config.hidden_size
                 {
-                    &self.weights.head
+                    Some(&self.weights.head)
                 } else {
                     runtime
                         .catalog
@@ -2328,11 +2347,19 @@ impl Engine {
                                 _ => None,
                             }
                         })
-                        .with_context(|| {
-                            format!("HIP hybrid calibration weight missing: {shape:?}")
-                        })?
                 };
-                choices.push(self.blas.calibrate_shape(shape, weight, &input)?);
+                let choice = if let Some(weight) = weight {
+                    self.blas.calibrate_shape(shape, weight, &input)?
+                } else {
+                    let draft = &self
+                        .spec
+                        .as_ref()
+                        .context("HIP hybrid calibration shape lacks target/draft weight")?
+                        .draft;
+                    self.blas
+                        .calibrate_shape(shape, &draft.calibration_weight(shape)?, &input)?
+                };
+                choices.push(choice);
             }
             write_cache(&path, &choices)?;
             choices

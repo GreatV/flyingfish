@@ -525,24 +525,73 @@ pub fn runtime_dir(path: &Path, model: &Path, create: bool) -> Result<PathBuf> {
 #[cfg(feature = "rocm")]
 impl Profile {
     pub(super) fn hip_hybrid(
-        linear: BTreeSet<LinearShape>,
+        mut linear: BTreeSet<LinearShape>,
         capacity: usize,
         workspace_rows: usize,
         model: &Path,
+        draft: Option<(&crate::dspark::DraftConfig, &Path, usize)>,
     ) -> Result<Self> {
         ensure!(
             workspace_rows > 0 && workspace_rows <= capacity,
             "HIP hybrid profile workspace exceeds capacity"
         );
+        if let Some((draft, _, context_rows)) = draft {
+            ensure!(
+                context_rows >= draft.verify_rows()? && context_rows <= capacity,
+                "HIP hybrid draft workspace exceeds capacity"
+            );
+            let buckets = (1..=u32::try_from(context_rows)?)
+                .map(|rows| super::engine::bucketed_prefill_rows(rows, context_rows as u32))
+                .collect::<Result<BTreeSet<_>>>()?;
+            for rows in buckets {
+                for (output, input) in [
+                    (draft.hidden_size, draft.capture_width()),
+                    (draft.kv_dim(), draft.hidden_size),
+                ] {
+                    linear.insert(LinearShape {
+                        rows: rows as usize,
+                        output,
+                        input,
+                    });
+                }
+            }
+            for (output, input) in [
+                (draft.qkv_dim(), draft.hidden_size),
+                (draft.hidden_size, draft.hidden_size),
+                (2 * draft.intermediate_size, draft.hidden_size),
+                (draft.hidden_size, draft.intermediate_size),
+                (draft.vocab_size, draft.hidden_size),
+                (draft.vocab_size, draft.markov_rank),
+            ] {
+                linear.insert(LinearShape {
+                    rows: 1,
+                    output,
+                    input,
+                });
+            }
+            linear = linear
+                .into_iter()
+                .map(|shape| LinearShape {
+                    rows: if shape.rows <= crate::linear_plan::MAX_SKINNY_ROWS {
+                        1
+                    } else {
+                        shape.rows
+                    },
+                    ..shape
+                })
+                .collect();
+        }
         Ok(Self {
             pairs: linear.iter().map(|s| (s.output, s.input)).collect(),
             linear,
             attention: vec![Attention::Decode],
             capacity,
             small_rows: workspace_rows,
-            budget: None,
+            budget: draft.map(|_| SpecBudget::Chain.rows()),
             model: hash(&fs::read(model.join("config.json"))?),
-            draft: None,
+            draft: draft
+                .map(|(_, path, _)| fs::read(path.join("config.json")).map(|v| hash(&v)))
+                .transpose()?,
         })
     }
 
