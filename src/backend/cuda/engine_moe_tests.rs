@@ -1,6 +1,8 @@
 use super::*;
 use crate::backend::cuda::moe::reference::{MoeDims, MoeFixture, fixture};
 use crate::experts::plan::Capacity;
+use crate::vision_input::{ImageGrid, MultimodalInput};
+use safetensors::{Dtype, SafeTensors};
 
 #[test]
 fn resident_routed_wave_preserves_slots_and_shared_rows() -> Result<()> {
@@ -1234,7 +1236,6 @@ impl Engine {
             mtp_state: None,
             #[cfg(feature = "cuda")]
             mtp_epoch: 0,
-            #[cfg(feature = "cuda")]
             images: None,
             qwen_device_prefix: false,
             forward_rows: (1..=workspace_rows).collect(),
@@ -5143,4 +5144,406 @@ fn minicpm_chain_verify(chunk: usize) -> Result<()> {
         "DEFECT production chain verification cells={defects}"
     );
     Ok(())
+}
+
+#[test]
+#[ignore = "GPU lease, published MiniCPM FP8, media fixtures/reference, output and pinned runtime"]
+fn minicpm_media_identity_gpu() -> Result<()> {
+    let model = PathBuf::from(std::env::var_os("FF_MODEL").context("media model missing")?);
+    let input_dir = PathBuf::from(
+        std::env::var_os("FF_MINICPM_REFERENCE_DIR").context("media inputs missing")?,
+    );
+    let reference =
+        PathBuf::from(std::env::var_os("FF_DENSE_REFERENCE").context("media reference missing")?);
+    let output =
+        PathBuf::from(std::env::var_os("FF_DENSE_EVIDENCE").context("media output missing")?);
+    let settings = Settings {
+        runtime_dir: Some(PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("media runtime missing")?,
+        )),
+        prefix_cache: false,
+        draft_model: None,
+        tree_builder: TreeBuilder::Waves,
+        spec_budget: SpecBudget::Chain,
+        spec_graph: true,
+        kv_format: crate::kv::KvFormat::Bf16,
+    };
+    #[cfg(feature = "rocm")]
+    let limits: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/minicpm_reference.json"
+    )))?;
+    #[cfg(feature = "rocm")]
+    ensure!(
+        limits["media_limits"].is_object(),
+        "media limits are not frozen"
+    );
+    Engine::calibrate(&model, 0, 4352, Some(129), settings.clone())?;
+    let mut engine = Engine::load(&model, 0, 4352, Some(129), settings)?;
+    ensure!(
+        engine.model_spec.hidden == 2048
+            && engine.model_spec.vocab == 248144
+            && engine.model_spec.layers.len() == 40,
+        "published media model geometry required"
+    );
+    let mut first_logits = Vec::new();
+    let mut defects = 0;
+    for case in [
+        "image_hockey_16x",
+        "image_boat_16x",
+        "video_football_16x",
+        "video_control_same_grid_16x",
+        "video_control_clip2_16x",
+    ] {
+        let bytes = std::fs::read(input_dir.join(format!("{case}.safetensors")))?;
+        let input = Input::read(&SafeTensors::deserialize(&bytes)?, case)?;
+        let bytes = std::fs::read(reference.join(format!("{case}.safetensors")))?;
+        let source = SafeTensors::deserialize(&bytes)?;
+        ensure!(
+            source.tensor("logits")?.shape() == [32, 248144],
+            "media reference logits must be [32,248144]"
+        );
+        let expected = floats(&source, "logits")?;
+        let forced = integers(&source, "tokens")?;
+        ensure!(
+            forced.len() == 32 && forced.iter().all(|&id| id < 248144),
+            "media reference token extent/range"
+        );
+        let mut eager = Vec::new();
+        for (repeat, graph) in [false, true, false].into_iter().enumerate() {
+            engine.reset()?;
+            let mut token = engine.prefill_multimodal(&input.packed(), None)?;
+            let mut captured = Vec::with_capacity(expected.len());
+            let mut predictions = Vec::with_capacity(32);
+            let (mut max_error, mut rms_error) = (0.0f64, 0.0f64);
+            let mut min_margin = f32::INFINITY;
+            let mut cell_defects = 0;
+            for step in 0..32 {
+                if step > 0 {
+                    engine.set_token(forced[step - 1])?;
+                    token = engine.decode(graph, None)?;
+                }
+                ensure!(
+                    engine.position == input.ids.len() + step,
+                    "media absolute position mismatch"
+                );
+                let actual = engine.decode_logits()?;
+                ensure!(
+                    actual.len() == 248144 && actual.iter().all(|v| v.is_finite()),
+                    "nonfinite or incomplete media logits"
+                );
+                let bits = actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                if repeat == 0 {
+                    eager.push((token, bits));
+                } else {
+                    cell_defects += usize::from(eager[step] != (token, bits));
+                }
+                let wanted = &expected[step * 248144..(step + 1) * 248144];
+                let scale =
+                    (wanted.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / 248144.0).sqrt();
+                ensure!(scale.is_finite() && scale > 0.0, "media reference RMS");
+                let (mut largest, mut square) = (0.0f64, 0.0f64);
+                let mut top = [f32::NEG_INFINITY; 2];
+                for (&a, &b) in actual.iter().zip(wanted) {
+                    let error = f64::from(a) - f64::from(b);
+                    largest = largest.max(error.abs());
+                    square += error * error;
+                    if b > top[0] {
+                        top = [b, top[0]];
+                    } else if b > top[1] {
+                        top[1] = b;
+                    }
+                }
+                max_error = max_error.max(largest / scale);
+                rms_error = rms_error.max((square / 248144.0).sqrt() / scale);
+                min_margin = min_margin.min(top[0] - top[1]);
+                predictions.push(token);
+                captured.extend(actual);
+            }
+            #[cfg(feature = "rocm")]
+            {
+                let bound = &limits["media_limits"][case];
+                let maximum = bound["max_normalized"]
+                    .as_f64()
+                    .context("media max bound")?;
+                let rms = bound["rms_normalized"]
+                    .as_f64()
+                    .context("media RMS bound")?;
+                ensure!(
+                    maximum.is_finite() && rms.is_finite(),
+                    "nonfinite media bounds"
+                );
+                cell_defects += usize::from(max_error > maximum || rms_error > rms);
+            }
+            let calls = engine
+                .qwen
+                .as_ref()
+                .context("media runtime absent")?
+                .vision_encode_calls;
+            ensure!(
+                calls == 1,
+                "media encoder calls={calls}, expected one per request"
+            );
+            engine.check_ready()?;
+            if repeat == 0 {
+                first_logits.push(captured[..248144].to_vec());
+                println!(
+                    "MEDIA_DECODED {case} {:?}",
+                    crate::tokenizer::decode(&model, &predictions)?
+                );
+            }
+            let mut trace = Trace::default();
+            trace.set_device(&engine.device.info.name)?;
+            trace.add("logits".into(), vec![32, 248144], captured)?;
+            trace.add(
+                "tokens".into(),
+                vec![32],
+                predictions.iter().map(|&v| v as f32).collect(),
+            )?;
+            trace.save(&output.join(format!("{case}-repeat{repeat}.safetensors")))?;
+            println!(
+                "MEDIA_IDENTITY case={case} graph={graph} repeat={repeat} encoder_calls={calls} steps=32 max_normalized={max_error:e} rms_normalized={rms_error:e} min_reference_margin={min_margin} defects={cell_defects}"
+            );
+            defects += cell_defects;
+        }
+    }
+    ensure!(
+        first_logits
+            .iter()
+            .enumerate()
+            .all(|(i, a)| first_logits[i + 1..].iter().all(|b| a != b)),
+        "different media produced identical full-vocabulary outputs"
+    );
+    println!(
+        "MEDIA_IDENTITY cells=15 defects={defects} media_inputs=5 encoder_calls=15 graph_eager_repeat=true"
+    );
+    ensure!(defects == 0, "media identity or model-definition DEFECT");
+    Ok(())
+}
+
+pub(super) fn floats(source: &SafeTensors<'_>, name: &str) -> Result<Vec<f32>> {
+    let tensor = source.tensor(name)?;
+    let values = match tensor.dtype() {
+        Dtype::BF16 => tensor
+            .data()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|v| bf16::from_bits(u16::from_le_bytes(*v)).to_f32())
+            .collect::<Vec<_>>(),
+        Dtype::F32 => tensor
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| f32::from_le_bytes(*v))
+            .collect(),
+        dtype => anyhow::bail!("reference {name} has floating dtype {dtype:?}"),
+    };
+    ensure!(
+        values.iter().all(|v| v.is_finite()),
+        "nonfinite reference {name}"
+    );
+    Ok(values)
+}
+
+pub(super) fn integers(source: &SafeTensors<'_>, name: &str) -> Result<Vec<u32>> {
+    let tensor = source.tensor(name)?;
+    match tensor.dtype() {
+        Dtype::I64 => tensor
+            .data()
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|v| Ok(u32::try_from(i64::from_le_bytes(*v))?))
+            .collect(),
+        Dtype::I32 => tensor
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| Ok(u32::try_from(i32::from_le_bytes(*v))?))
+            .collect(),
+        dtype => anyhow::bail!("reference {name} has integer dtype {dtype:?}"),
+    }
+}
+
+pub(super) struct Input {
+    pub(super) ids: Vec<u32>,
+    pub(super) modalities: Vec<u8>,
+    pub(super) pixels: Vec<f32>,
+    pub(super) grids: Vec<ImageGrid>,
+}
+
+impl Input {
+    pub(super) fn read(source: &SafeTensors<'_>, case: &str) -> Result<Self> {
+        let ids = integers(source, "input_ids")?;
+        ensure!(
+            source.tensor("input_ids")?.shape() == [1, ids.len()],
+            "input ids layout"
+        );
+        let mut input = Self {
+            ids,
+            modalities: Vec::new(),
+            pixels: Vec::new(),
+            grids: Vec::new(),
+        };
+        let (pixels, sizes) = match case.split('_').next() {
+            Some("text") => return Ok(input),
+            Some("image") => ("pixel_values", "target_sizes"),
+            Some("video") => ("pixel_values_videos", "target_sizes_videos"),
+            _ => anyhow::bail!("unknown native fixture case={case}"),
+        };
+        input.modalities = integers(source, "mm_token_type_ids")?
+            .into_iter()
+            .map(|v| Ok(u8::try_from(v)?))
+            .collect::<Result<_>>()?;
+        input.pixels = floats(source, pixels)?;
+        let sizes = integers(source, sizes)?;
+        ensure!(
+            sizes.len().is_multiple_of(2),
+            "reference target_sizes layout"
+        );
+        input.grids = sizes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|s| ImageGrid {
+                t: 1,
+                h: s[0],
+                w: s[1],
+            })
+            .collect();
+        Ok(input)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(super) fn video(source: &SafeTensors<'_>, model: &Path, case: &str) -> Result<Self> {
+        use crate::serve::{
+            detok::Shared,
+            image::{Processor, VideoOptions},
+        };
+        let reference = Self::read(source, case)?;
+        let directory = PathBuf::from(
+            std::env::var_os("FF_VIDEO_REF_DIR").context("FF_VIDEO_REF_DIR missing")?,
+        );
+        let clip = match case {
+            "video_football_16x" => "football_4s",
+            "video_control_clip2_16x" => "sample_demo_1",
+            "video_control_same_grid_16x" => "boat_pan_4s",
+            _ => anyhow::bail!("unknown video fixture case={case}"),
+        };
+        let floor: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            directory.join("preprocess_video_noise_floor.json"),
+        )?)?;
+        let measured = floor["cases"]
+            .as_object()
+            .context("video pixel floor cases missing")?;
+        ensure!(!measured.is_empty(), "video pixel floor has no cases");
+        let tolerance = measured
+            .iter()
+            .try_fold(0.0f64, |bound, (name, cell)| -> Result<f64> {
+                Ok(bound.max(
+                    cell["tv_vs_pil_diff"]["max_abs"]
+                        .as_f64()
+                        .with_context(|| format!("video pixel floor {name} max_abs missing"))?,
+                ))
+            })? as f32
+            + 4.0 * f32::EPSILON;
+        ensure!(
+            tolerance.is_finite() && tolerance > 0.0,
+            "invalid video pixel floor {case}"
+        );
+        let spec = crate::model_spec::ModelSpec::read(model)?;
+        let vision = spec.vision.as_ref().context("video vision spec missing")?;
+        let first = reference
+            .ids
+            .iter()
+            .position(|&id| id == vision.start_token)
+            .context("video opening marker missing")?;
+        let last = reference
+            .ids
+            .iter()
+            .rposition(|&id| id == vision.end_token)
+            .context("video closing marker missing")?;
+        ensure!(first < last, "video marker extent {case}");
+        let mut prompt = reference.ids[..first].to_vec();
+        prompt.push(vision.video_token);
+        prompt.extend_from_slice(&reference.ids[last + 1..]);
+        let tokenizer = Shared::load(model)?;
+        let processor =
+            Processor::load(model, Some(&tokenizer))?.context("video processor missing")?;
+        let bytes = std::fs::read(directory.join("inputs").join(format!("{clip}.mp4")))?;
+        let url = format!("data:video/mp4;base64,{}", base64::encode(bytes));
+        let planned = processor.plan_video(
+            &url,
+            VideoOptions {
+                max_num_frames: 4,
+                stack_frames: 1,
+                max_slice_nums: Some(1),
+            },
+            4352,
+        )?;
+        let video = processor.prepare_planned_video(planned)?;
+        let frames = video.frames.len();
+        let (ids, prepared) = processor.expand(&prompt, Vec::new(), vec![video], 4352)?;
+        let input = Self {
+            ids,
+            modalities: prepared.modality_ids,
+            pixels: prepared.pixel_values,
+            grids: prepared.grids,
+        };
+        ensure!(
+            input.ids == reference.ids
+                && input.modalities == reference.modalities
+                && input.grids == reference.grids,
+            "video preprocessing ids/modality/grid mismatch {case}"
+        );
+        ensure!(
+            input.pixels.len() == reference.pixels.len()
+                && input.pixels.iter().all(|value| value.is_finite()),
+            "video pixel extent/finite check {case}"
+        );
+        let error = input
+            .pixels
+            .iter()
+            .zip(&reference.pixels)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        ensure!(
+            error <= tolerance,
+            "video preprocess {case} pixel max={error} > {tolerance}"
+        );
+        let axes = input.packed().validate(&spec, 4352)?.packed_axes()?;
+        let expected = integers(source, "canvas_position_ids")?;
+        ensure!(
+            expected.len() == 3 * input.ids.len(),
+            "video reference canvas extent {case}"
+        );
+        ensure!(
+            (0..3).all(
+                |axis| (0..input.ids.len()).all(|row| i64::from(axes[3 * row + axis])
+                    == i64::from(expected[axis * input.ids.len() + row]))
+            ),
+            "video canvas mismatch {case}"
+        );
+        ensure!(
+            frames == integers(source, "sampled_frame_indices")?.len(),
+            "video frame count mismatch {case}"
+        );
+        println!(
+            "PASS minicpm_video_preprocess {case} frames={frames} modality=2 ids={} pixel_max={error} measured_floor={tolerance}",
+            input.ids.len()
+        );
+        Ok(input)
+    }
+
+    pub(super) fn packed(&self) -> MultimodalInput<'_> {
+        MultimodalInput {
+            input_ids: &self.ids,
+            modality_ids: &self.modalities,
+            pixel_values: &self.pixels,
+            grids: &self.grids,
+        }
+    }
 }

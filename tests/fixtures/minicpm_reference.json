@@ -78,5 +78,173 @@
     }
   ],
   "limit_rule": "1.25 * CUDA engine/model-definition error + 2 * max(HIP shape spread, CUDA shape spread, cross-environment primary spread); per fixture and metric, before first HIP engine run",
-  "cuda_baseline_commit": "ff88d5d4"
+  "cuda_baseline_commit": "ff88d5d4",
+  "vision_tower_limit_rule": "Half-BF16-ULP bound: 1.25 * CUDA engine versus HIP model-definition + 2 * HIP model-definition shape spread; packed bounds use packed versus standalone in each arm; RMS is the reference scale. Frozen before the first HIP tower run.",
+  "vision_tower": {
+    "image_hockey_16x": {
+      "merger_out": {
+        "k": 217.5,
+        "rms": 0.10184203833341599
+      },
+      "vision_layer_06_out": {
+        "k": 35.0,
+        "rms": 0.5748075842857361
+      },
+      "vision_patch_embeddings": {
+        "k": 2.5,
+        "rms": 0.6711167693138123
+      },
+      "vision_tower_out": {
+        "k": 216.875,
+        "rms": 1.643311858177185
+      },
+      "vit_merger_out": {
+        "k": 80.0,
+        "rms": 0.42600134015083313
+      },
+      "merger_out_packed": {
+        "k": 849.0,
+        "rms": 0.10184203833341599
+      }
+    },
+    "image_boat_16x": {
+      "merger_out": {
+        "k": 294.5,
+        "rms": 0.08862931281328201
+      },
+      "vision_layer_06_out": {
+        "k": 112.0625,
+        "rms": 0.5629919767379761
+      },
+      "vision_patch_embeddings": {
+        "k": 10.0,
+        "rms": 0.687582790851593
+      },
+      "vision_tower_out": {
+        "k": 271.0,
+        "rms": 1.6492069959640503
+      },
+      "vit_merger_out": {
+        "k": 208.0,
+        "rms": 0.4326878488063812
+      },
+      "merger_out_packed": {
+        "k": 362.25,
+        "rms": 0.08862931281328201
+      }
+    },
+    "video_football_16x": {
+      "merger_out": {
+        "k": 425.0,
+        "rms": 0.07395793497562408
+      },
+      "vision_layer_06_out": {
+        "k": 88.625,
+        "rms": 0.5562501549720764
+      },
+      "vision_patch_embeddings": {
+        "k": 2.5,
+        "rms": 0.6790481805801392
+      },
+      "vision_tower_out": {
+        "k": 285.0,
+        "rms": 1.6504473686218262
+      },
+      "vit_merger_out": {
+        "k": 208.0,
+        "rms": 0.4329427480697632
+      },
+      "vit_merger_in": {
+        "k": 88.625,
+        "rms": 0.5562501549720764
+      }
+    },
+    "video_control_same_grid_16x": {
+      "merger_out": {
+        "k": 695.0,
+        "rms": 0.09764469414949417
+      },
+      "vision_layer_06_out": {
+        "k": 111.0,
+        "rms": 0.553162157535553
+      },
+      "vision_patch_embeddings": {
+        "k": 5.0,
+        "rms": 0.7093796133995056
+      },
+      "vision_tower_out": {
+        "k": 313.875,
+        "rms": 1.6414546966552734
+      },
+      "vit_merger_out": {
+        "k": 208.0,
+        "rms": 0.4291877746582031
+      },
+      "vit_merger_in": {
+        "k": 111.0,
+        "rms": 0.553162157535553
+      }
+    },
+    "video_control_clip2_16x": {
+      "merger_out": {
+        "k": 216.25,
+        "rms": 0.09594018757343292
+      },
+      "vision_layer_06_out": {
+        "k": 94.0,
+        "rms": 0.5570921897888184
+      },
+      "vision_patch_embeddings": {
+        "k": 5.0,
+        "rms": 0.6706316471099854
+      },
+      "vision_tower_out": {
+        "k": 223.5,
+        "rms": 1.6465463638305664
+      },
+      "vit_merger_out": {
+        "k": 208.0,
+        "rms": 0.4183579385280609
+      },
+      "vit_merger_in": {
+        "k": 94.0,
+        "rms": 0.5570921897888184
+      }
+    }
+  },
+  "media_limit_rule": "Twice the worst full-vocabulary reference difference across published FP8 media, expert-order, mixed-precision, cross-GPU and vision-implementation arms. RMS upper bound sqrt(max_abs * mean_abs). Normalize by each fixture minimum reference row RMS; same-box repeats are exact. Frozen before the first HIP full-model media run.",
+  "media_reference_floor": {
+    "cells": 512,
+    "max_abs": 2.7421875,
+    "rms_upper": 0.8795869967055052,
+    "max_abs_limit": 5.484375,
+    "rms_abs_limit": 1.7591739934110104
+  },
+  "media_limits": {
+    "video_control_clip2_16x": {
+      "max_normalized": 2.491196031256907,
+      "rms_normalized": 0.7990787046246606,
+      "reference_min_row_rms": 2.201502784681668
+    },
+    "image_boat_16x": {
+      "max_normalized": 2.504003450722965,
+      "rms_normalized": 0.8031868261968355,
+      "reference_min_row_rms": 2.190242588689936
+    },
+    "image_hockey_16x": {
+      "max_normalized": 2.544424746890297,
+      "rms_normalized": 0.8161524044072119,
+      "reference_min_row_rms": 2.155447908885025
+    },
+    "video_football_16x": {
+      "max_normalized": 2.6622952448653017,
+      "rms_normalized": 0.8539606714618961,
+      "reference_min_row_rms": 2.06001757715549
+    },
+    "video_control_same_grid_16x": {
+      "max_normalized": 2.3636120371132994,
+      "rms_normalized": 0.7581547261452647,
+      "reference_min_row_rms": 2.320336380880052
+    }
+  }
 }

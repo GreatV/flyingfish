@@ -9,7 +9,6 @@ use half::bf16;
 use std::sync::Arc;
 /// Explicit visible bias boundary; the caller's numerical contract selects it.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-#[cfg(feature = "cuda")]
 pub(crate) enum LinearBiasMode {
     BeforeOutputRound,
     AfterOutputRound,

@@ -10,8 +10,12 @@
 //   o        token-major  [row][head][72]
 // Launch: grid(ceil(max_block_rows / MT), HQ, nblocks), block NW*32,
 //         static smem (MT + 2*KT)*LDS*2 B. One CTA owns MT query rows of one head.
+#if defined(__HIP__)
+#include "gpu_compat.cuh"
+#else
 #include <cuda_bf16.h>
 #include <math_constants.h>
+#endif
 #include <stdint.h>
 
 namespace vision_attn {
@@ -30,6 +34,7 @@ constexpr float SCALE = 0.11785113066434860f;
 static_assert(D % 8 == 0, "D must be a multiple of 8 (k8 QK steps, n8 PV slices)");
 static_assert(LDS % 8 == 0, "row stride must stay 16B-aligned for ldmatrix/cp.async");
 
+#if !defined(__HIP__)
 __device__ __forceinline__ unsigned smem_u32(const void* p) {
   return (unsigned)__cvta_generic_to_shared(p);
 }
@@ -78,6 +83,7 @@ __device__ __forceinline__ void cp_wait0() { asm volatile("cp.async.wait_group 0
 __device__ __forceinline__ bool vision_key_visible(int q_local, int k_local, int n) {
   return k_local < n;
 }
+#endif
 
 // Device-side geometry checks; trap on a launch that would write outside the block's rows.
 template <int KT>
@@ -95,6 +101,127 @@ __device__ __forceinline__ void guard_geometry(const int* cu, const int* kb, int
   }
 }
 
+#if defined(__HIP__)
+using Bf16Fragment = short __attribute__((ext_vector_type(16)));
+using AccFragment = float __attribute__((ext_vector_type(8)));
+
+// LDS holds Q[64,80], K[64,80], V[64,80], P[64,64]; external rows retain D=72.
+template <int MT, int KT, int NW>
+__device__ __forceinline__ void vision_attn_body(
+    const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v,
+    bf16* __restrict__ o, const int* __restrict__ cu, const int* __restrict__ kb,
+    int nblocks) {
+  static_assert(MT == 64 && KT == 64 && NW == 4);
+  constexpr int PADDED_D = 80;
+  const int tid = threadIdx.x, wave = tid / 32, lane = tid % 32;
+  const int image = blockIdx.z, head = blockIdx.y;
+  if (image >= nblocks || head >= HQ) return;
+  const int base = cu[image], rows = cu[image + 1] - base;
+  const int query_base = blockIdx.x * MT;
+  if (query_base >= rows) return;
+  __shared__ unsigned short storage[(MT + 2 * KT) * PADDED_D + MT * KT];
+  auto* qs = storage;
+  auto* ks = qs + MT * PADDED_D;
+  auto* vs = ks + KT * PADDED_D;
+  auto* ps = vs + KT * PADDED_D;
+  for (int cell = tid; cell < MT * PADDED_D; cell += NW * 32) {
+    const int row = query_base + cell / PADDED_D, d = cell % PADDED_D;
+    qs[cell] = row < rows && d < D ? reinterpret_cast<const unsigned short*>(q)[
+        ((size_t)head * cu[nblocks] + base + row) * D + d] : 0;
+  }
+  __syncthreads();
+  float maxima[8], sums[8];
+  AccFragment output[PADDED_D / 16] = {};
+#pragma unroll
+  for (int g = 0; g < 8; ++g) { maxima[g] = -3.0e38f; sums[g] = 0.0f; }
+  for (int key_base = 0; key_base < rows; key_base += KT) {
+    for (int cell = tid; cell < KT * PADDED_D; cell += NW * 32) {
+      const int row = key_base + cell / PADDED_D, d = cell % PADDED_D;
+      const size_t offset = ((size_t)head * kb[nblocks] + kb[image] + row) * D + d;
+      ks[cell] = row < rows && d < D ? reinterpret_cast<const unsigned short*>(k)[offset] : 0;
+      vs[cell] = row < rows && d < D ? reinterpret_cast<const unsigned short*>(v)[offset] : 0;
+    }
+    __syncthreads();
+    AccFragment score[KT / 16] = {};
+#pragma unroll
+    for (int panel = 0; panel < PADDED_D / 16; ++panel) {
+      Bf16Fragment query;
+#pragma unroll
+      for (int d = 0; d < 16; ++d) {
+        query[d] = qs[(wave * 16 + lane % 16) * PADDED_D + panel * 16 + d];
+      }
+#pragma unroll
+      for (int tile = 0; tile < KT / 16; ++tile) {
+        Bf16Fragment key;
+#pragma unroll
+        for (int d = 0; d < 16; ++d)
+          key[d] = ks[(tile * 16 + lane % 16) * PADDED_D + panel * 16 + d];
+        score[tile] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(query, key, score[tile]);
+      }
+    }
+#pragma unroll
+    for (int g = 0; g < 8; ++g) {
+      const int row = wave * 16 + 2 * g + lane / 16;
+      float values[KT / 16];
+      float maximum = -INFINITY;
+#pragma unroll
+      for (int tile = 0; tile < KT / 16; ++tile) {
+        const bool visible = query_base + row < rows && key_base + tile * 16 + lane % 16 < rows;
+        values[tile] = visible ? score[tile][g] * SCALE : -INFINITY;
+        maximum = fmaxf(maximum, values[tile]);
+      }
+#pragma unroll
+      for (int offset = 8; offset > 0; offset >>= 1)
+        maximum = fmaxf(maximum, __shfl_xor(maximum, offset, 16));
+      const float next = fmaxf(maxima[g], maximum);
+      const float alpha = __expf(maxima[g] - next);
+      float sum = 0.0f;
+#pragma unroll
+      for (int tile = 0; tile < KT / 16; ++tile) {
+        const float probability = __expf(values[tile] - next);
+        sum += probability;
+        reinterpret_cast<bf16*>(ps)[row * KT + tile * 16 + lane % 16] = __float2bfloat16(probability);
+      }
+#pragma unroll
+      for (int offset = 8; offset > 0; offset >>= 1)
+        sum += __shfl_xor(sum, offset, 16);
+      maxima[g] = next;
+      sums[g] = sums[g] * alpha + sum;
+#pragma unroll
+      for (int d = 0; d < PADDED_D / 16; ++d) output[d][g] *= alpha;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int tile = 0; tile < KT / 16; ++tile) {
+      Bf16Fragment probability;
+#pragma unroll
+      for (int key = 0; key < 16; ++key)
+        probability[key] = ps[(wave * 16 + lane % 16) * KT + tile * 16 + key];
+#pragma unroll
+      for (int panel = 0; panel < PADDED_D / 16; ++panel) {
+        Bf16Fragment value;
+#pragma unroll
+        for (int key = 0; key < 16; ++key)
+          value[key] = vs[(tile * 16 + key) * PADDED_D + panel * 16 + lane % 16];
+        output[panel] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(probability, value, output[panel]);
+      }
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int g = 0; g < 8; ++g) {
+    const int row = query_base + wave * 16 + 2 * g + lane / 16;
+    if (row < rows) {
+#pragma unroll
+      for (int panel = 0; panel < PADDED_D / 16; ++panel) {
+        const int d = panel * 16 + lane % 16;
+        if (d < D) o[((size_t)(base + row) * HQ + head) * D + d] =
+            __float2bfloat16(output[panel][g] / sums[g]);
+      }
+    }
+  }
+}
+#else
 template <int MT, int KT, int NW>
 __device__ __forceinline__ void vision_attn_body(
     const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v,
@@ -297,6 +424,7 @@ __device__ __forceinline__ void vision_attn_body(
   }
 }
 
+#endif
 }  // namespace vision_attn
 
 #define VISION_ATTN_ENTRY(NAME, MT, KT, NW, MINB)                          \

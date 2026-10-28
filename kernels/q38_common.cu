@@ -12,10 +12,17 @@ extern "C" __global__ void q38_copy_finite_bf16(const __nv_bfloat16* source,
         destination[i]=value;
     }
 }
+#if defined(__HIP__)
+extern "C" __global__ void q38_bias_add(const float* input,__nv_bfloat16* y,const __nv_bfloat16* bias,uint64_t count,uint32_t width) {
+    for(uint64_t i=uint64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=uint64_t(gridDim.x)*blockDim.x)
+        y[i]=__hadd(__float2bfloat16_rn(input[i]),bias[i%width]);
+}
+#else
 extern "C" __global__ void q38_bias_add(__nv_bfloat16* y,const __nv_bfloat16* bias,uint64_t count,uint32_t width) {
     for(uint64_t i=uint64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=uint64_t(gridDim.x)*blockDim.x)
         y[i]=__hadd(y[i],bias[i%width]);
 }
+#endif
 extern "C" __global__ void q38_advance(Q38SequenceMeta* meta) {
     q38_meta_guard(meta);
     if(threadIdx.x==0 && blockIdx.x==0) { ++meta->prefix; ++meta->key_count; }

@@ -8,7 +8,6 @@ __device__ __forceinline__ bool flat_launch() {
            gridDim.y == 1 && gridDim.z == 1;
 }
 
-#if !defined(__HIP__)
 extern "C" __global__ void q38_vision_cast_patches(
     const float* input, __nv_bfloat16* output, uint64_t count) {
     if (!flat_launch() || !input || !output || !count || count % 1536) { __trap(); return; }
@@ -27,6 +26,9 @@ extern "C" __global__ void q38_vision_position_add(
     const __nv_bfloat16* patches, const __nv_bfloat16* bias,
     __nv_bfloat16* trace_patches, __nv_bfloat16* hidden, float* interpolated,
     uint32_t rows) {
+#if defined(__HIP__)
+#pragma clang fp contract(off)
+#endif
     if (!flat_launch() || !table || !indices || !weights || !patches ||
         !hidden || !interpolated || !rows || (trace_patches && !bias)) { __trap(); return; }
     uint64_t count = uint64_t(rows) * 1152;
@@ -40,7 +42,12 @@ extern "C" __global__ void q38_vision_position_add(
             int32_t index = indices[off];
             float w = weights[off];
             if (index < 0 || index >= 2304 || !isfinite(w)) { __trap(); return; }
+#if defined(__HIP__)
+            const float product = __bfloat162float(table[uint64_t(index) * 1152 + d]) * w;
+            sum = sum + product;
+#else
             sum = __fadd_rn(sum, __fmul_rn(__bfloat162float(table[uint64_t(index) * 1152 + d]), w));
+#endif
         }
         if (!isfinite(sum)) { __trap(); return; }
         interpolated[i] = sum;
@@ -105,7 +112,6 @@ extern "C" __global__ void q38_vision_residual(
          i+=uint64_t(gridDim.x)*256) hidden[i]=__hadd(hidden[i],delta[i]);
 }
 
-#endif
 
 // Both buffers have stable addresses. Only SequenceMeta advances in decode graphs.
 extern "C" __global__ void q38_text_positions(

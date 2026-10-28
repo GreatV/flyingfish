@@ -878,7 +878,6 @@ impl WeightCatalog {
     ) -> Result<Self> {
         Self::load_inner(dir, spec, d, crate::checkpoint::LoadPolicy::TextOnly, true)
     }
-    #[cfg(feature = "cuda")]
     pub fn load_with_policy(
         dir: &Path,
         spec: &crate::model_spec::ModelSpec,

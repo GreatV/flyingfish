@@ -145,6 +145,9 @@ const ROCM_KERNELS: &[&str] = &[
     "attention",
     "q38_common",
     "q38_vision_io",
+    "vision_attn",
+    "vision_rope",
+    "vision_ops",
     "gemm_skinny",
     "fp8_linear",
     "moe_route",
@@ -320,6 +323,7 @@ fn build_rocm(out: &std::path::Path) {
                         | "markov"
                         | "fp8_linear"
                         | "moe_prefill"
+                        | "vision_attn"
                 ) && !arch.starts_with("gfx11")
                 {
                     continue;
