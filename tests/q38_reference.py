@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 import transformers
 from safetensors.torch import save_file
+from accelerate.utils import set_module_tensor_to_device
 from transformers.integrations.finegrained_fp8 import FP8Linear
 from minicpm_reference import check, sequence
 
@@ -19,6 +20,10 @@ def load_model(directory):
            text.num_key_value_heads, text.head_dim, text.vocab_size) ==
           (5120, 64, 24, 4, 256, 248320), "Qwen published geometry mismatch")
     architecture = getattr(transformers, config.architectures[0])
+    index = json.loads((directory / "model.safetensors.index.json").read_text())
+    native_bytes = index["metadata"]["total_size"]
+    free_bytes, _ = torch.cuda.mem_get_info()
+    resident = native_bytes + 8 * 1024**3 <= free_bytes
     initialized, initialization_calls = [], []
     initialize = architecture._initialize_missing_keys
 
@@ -31,7 +36,8 @@ def load_model(directory):
 
     with patch.object(architecture, "_initialize_missing_keys", record_initialization):
         model, loading = architecture.from_pretrained(
-            directory, dtype=torch.bfloat16, device_map="cuda:0", attn_implementation="eager",
+            directory, dtype=torch.bfloat16, device_map="cuda:0" if resident else "cpu",
+            attn_implementation="eager",
             output_loading_info=True, local_files_only=True,
         )
     check(initialization_calls == [True], "reference initialization call count")
@@ -45,11 +51,16 @@ def load_model(directory):
     for module in projections:
         check(module.weight.dtype == torch.float8_e4m3fn and tuple(module.block_size) == (128, 128),
               "reference changed native FP8 storage")
+    if not resident:
+        native_weights = {id(module.weight) for module in projections}
+        for name, value in list(model.named_parameters()) + list(model.named_buffers()):
+            if id(value) not in native_weights:
+                set_module_tensor_to_device(model, name, "cuda:0")
 
     def forward(module, inputs):
         n, k = module.weight.shape
         check(n % 128 == 0 and k % 128 == 0, "reference block tail not declared")
-        weights = module.weight.float().view(n // 128, 128, k // 128, 128)
+        weights = module.weight.to(inputs.device).float().view(n // 128, 128, k // 128, 128)
         weights = (weights * module.weight_scale_inv.float()[:, None, :, None]).bfloat16().view(n, k)
         return torch.nn.functional.linear(inputs, weights, module.bias)
 
@@ -62,7 +73,8 @@ def load_model(directory):
         layer.register_forward_hook(count)
     model.eval()
     print(f"Q38_REFERENCE_LOAD projections={len(projections)} missing=0 unexpected=0 "
-          "initialized=0 errors=0 native_fp8_resident=true bounded_bf16_projection=true PASS", flush=True)
+          f"initialized=0 errors=0 native_fp8_resident={resident} "
+          f"native_bytes={native_bytes} free_bytes={free_bytes} bounded_bf16_projection=true PASS", flush=True)
     return model, loading, calls
 
 
