@@ -142,6 +142,46 @@ fn hip_gdn_runtime_gpu() -> Result<()> {
         "GDN fixture geometry"
     );
     let mut gate = Gate::default();
+    {
+        let mut store = state::StateStore::new(&model, 129, stream)?;
+        gate.check(
+            "gdn.store_layout",
+            store.gdn.len() == 30
+                && store.kv.len() == 10
+                && store
+                    .gdn
+                    .iter()
+                    .all(|s| s.s.len() == heads * 128 * 128 && s.history.len() == cd * 3),
+        );
+        for state in &mut store.gdn {
+            stream.memcpy_htod(&vec![0.25f32; state.s.len()], &mut state.s)?;
+            stream.memcpy_htod(&vec![-0.5f32; state.history.len()], &mut state.history)?;
+        }
+        store.set_sequence(stream, 23, 17, 17)?;
+        gate.check(
+            "gdn.store_sequence",
+            stream.clone_dtoh(store.sequence.as_ref().context("GDN sequence missing")?)?
+                == [23, 17, 40, 129, 1, 0, 0, 0],
+        );
+        store.reset(stream)?;
+        let mut cleared = true;
+        for state in &store.gdn {
+            cleared &= stream
+                .clone_dtoh(&state.s)?
+                .iter()
+                .all(|v| v.to_bits() == 0)
+                && stream
+                    .clone_dtoh(&state.history)?
+                    .iter()
+                    .all(|v| v.to_bits() == 0);
+        }
+        gate.check("gdn.store_reset", cleared);
+        gate.check(
+            "gdn.store_compact_rejected",
+            state::StateStore::new_with_format(&model, 129, crate::kv::KvFormat::Affine8, stream)
+                .is_err(),
+        );
+    }
     for (rows, valid) in [
         (1u32, 1u32),
         (3, 3),

@@ -369,8 +369,8 @@ impl StateStore {
     ) -> Result<Self> {
         #[cfg(feature = "rocm")]
         ensure!(
-            format == crate::kv::KvFormat::Bf16 && spec.gdn.is_none(),
-            "HIP StateStore supports BF16 attention KV only; compact KV/GDN state is unsupported"
+            format == crate::kv::KvFormat::Bf16,
+            "HIP StateStore supports BF16 attention KV only; compact KV is unsupported"
         );
         ensure!(
             capacity > 0 && capacity <= spec.max_position as usize && capacity <= i32::MAX as usize,
