@@ -956,8 +956,10 @@ mod tests {
             0,
             0,
         ])?;
-        let (ptr, hold) = buffer.device_ptr(stream);
-        drop(hold);
+        let ptr = {
+            let (ptr, _hold) = buffer.device_ptr(stream);
+            ptr
+        };
         Ok((buffer, SeqRef { ptr }))
     }
 
