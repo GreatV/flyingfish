@@ -1219,7 +1219,6 @@ impl Engine {
             #[cfg(all(test, feature = "cuda"))]
             flint_window_capture: None,
             qwen: None,
-            #[cfg(feature = "cuda")]
             recurrent: None,
             moe,
             moe_slots: Some(slots),

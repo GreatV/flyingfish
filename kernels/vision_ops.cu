@@ -1,8 +1,4 @@
-#if defined(__HIP__)
 #include "gpu_compat.cuh"
-#else
-#include <cuda_bf16.h>
-#endif
 #include <stdint.h>
 #include <math.h>
 
@@ -136,13 +132,13 @@ extern "C" __global__ void vision_rms_scale_f32(
         sum = __fadd_rn(sum, __fmul_rn(x, x));
     }
     for (int delta = 16; delta; delta >>= 1)
-        sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffu, sum, delta));
+        sum = __fadd_rn(sum, __shfl_down_sync(FF_WARP_MASK, sum, delta));
     if ((threadIdx.x & 31) == 0) partial[threadIdx.x >> 5] = sum;
     __syncthreads();
     if (threadIdx.x < 32) {
         sum = threadIdx.x < 8 ? partial[threadIdx.x] : 0.0f;
         for (int delta = 16; delta; delta >>= 1)
-            sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffu, sum, delta));
+            sum = __fadd_rn(sum, __shfl_down_sync(FF_WARP_MASK, sum, delta));
         if (threadIdx.x == 0) partial[0] = rsqrtf(__fadd_rn(sum / float(width), eps));
     }
     __syncthreads();

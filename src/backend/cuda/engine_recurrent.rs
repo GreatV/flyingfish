@@ -751,11 +751,11 @@ impl Engine {
             capture_fail_after_layer: None,
             #[cfg(test)]
             capture_fail_stage: None,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             flint_window_capture: None,
             #[cfg(test)]
             moe_test_ffn: None,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             flint_legacy_overflow_prefill: false,
             qwen_device_prefix: false,
             forward_rows: (1..=rows).collect(),
@@ -776,9 +776,13 @@ impl Engine {
             moe: None,
             moe_slots: None,
             moe_prefill: None,
+            #[cfg(feature = "cuda")]
             flint_frozen_decode_length: false,
+            #[cfg(feature = "cuda")]
             mtp: None,
+            #[cfg(feature = "cuda")]
             mtp_state: None,
+            #[cfg(feature = "cuda")]
             mtp_epoch: 0,
             images: None,
             weights,
@@ -798,7 +802,9 @@ impl Engine {
             workspace_rows: rows,
             trace_layer: 0,
             position: 0,
+            #[cfg(feature = "cuda")]
             prefix_identity: None,
+            #[cfg(feature = "cuda")]
             prefix_identity_load_ms: 0.0,
             logits_cache: PrefixLogitsCache::default(),
             committed_prefix_ids: Vec::new(),
@@ -1457,11 +1463,15 @@ mod tests {
             "Runner FAIL reinjection weight extents"
         );
         let runtime = VisionRuntime::new(&d.ctx)?;
+        #[cfg(feature = "cuda")]
         let closure = Rc::new(crate::backend::cuda::closure::Closure::new(
             false,
             "LoopVL vision test".into(),
         ));
+        #[cfg(feature = "cuda")]
         let mut blas = Blas::new(&d, &runtime.ops, Path::new(""), closure)?;
+        #[cfg(feature = "rocm")]
+        let mut blas = Blas::new(s.clone())?;
         blas.bind_invariant(&d.ctx, 1)?;
         let x: Vec<_> = (0..1024)
             .map(|i| bf16::from_f32([1.0, 3.0, -1.0, -3.0, 1.0][i * 37 % 5]))

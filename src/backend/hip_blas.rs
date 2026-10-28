@@ -1315,3 +1315,272 @@ impl Blas {
         "HIP BLAS BF16 with FP32 accumulation"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::gpu::contracts::{TensorMut, view};
+
+    fn fp64_product(blas: &Blas, shape: LinearShape, w: &[f64], x: &[f64]) -> Result<Vec<f64>> {
+        let s = &blas.stream;
+        let a = s.clone_htod(w)?;
+        let b = s.clone_htod(x)?;
+        let mut c = s.alloc_zeros::<f64>(shape.rows * shape.output)?;
+        let (ap, _a) = a.device_ptr(s);
+        let (bp, _b) = b.device_ptr(s);
+        let (cp, _c) = c.device_ptr_mut(s);
+        let (alpha, beta) = (1f64, 0f64);
+        unsafe {
+            check(
+                hipblasGemmEx(
+                    blas.handles.handle,
+                    112,
+                    111,
+                    shape.output as i32,
+                    shape.rows as i32,
+                    shape.input as i32,
+                    (&alpha as *const f64).cast(),
+                    ap as *const c_void,
+                    1,
+                    shape.input as i32,
+                    bp as *const c_void,
+                    1,
+                    shape.input as i32,
+                    (&beta as *const f64).cast(),
+                    cp as Handle,
+                    1,
+                    shape.output as i32,
+                    4,
+                    160,
+                ),
+                "HIP audit FP64 product",
+            )?;
+        }
+        let result = s.clone_dtoh(&c)?;
+        for row in [0, shape.rows / 2, shape.rows - 1] {
+            for col in [0, shape.output / 2, shape.output - 1] {
+                let pairs = w[col * shape.input..(col + 1) * shape.input]
+                    .iter()
+                    .zip(&x[row * shape.input..(row + 1) * shape.input]);
+                let (sum, magnitude) = pairs.fold((0.0, 0.0), |(sum, mag), (a, b)| {
+                    (sum + a * b, mag + (a * b).abs())
+                });
+                let nu = shape.input as f64 * 2f64.powi(-53);
+                ensure!(
+                    (result[row * shape.output + col] - sum).abs()
+                        <= 2.0 * nu / (1.0 - nu) * magnitude,
+                    "Runner FAIL FP64 product disagrees with independent CPU dot"
+                );
+            }
+        }
+        Ok(result)
+    }
+
+    fn interval_distance(dot: f64, value: f32, bf16_output: bool) -> f64 {
+        if !bf16_output {
+            return (dot - f64::from(value)).abs();
+        }
+        let bits = bf16::from_f32(value).to_bits();
+        let (below, above) = if value == 0.0 {
+            (
+                -f64::from(bf16::from_bits(1).to_f32()),
+                f64::from(bf16::from_bits(1).to_f32()),
+            )
+        } else {
+            let (lo, hi) = if value > 0.0 {
+                (bits - 1, bits + 1)
+            } else {
+                (bits + 1, bits - 1)
+            };
+            (
+                f64::from(bf16::from_bits(lo).to_f32()),
+                f64::from(bf16::from_bits(hi).to_f32()),
+            )
+        };
+        let lo = (below + f64::from(value)) * 0.5;
+        let hi = (above + f64::from(value)) * 0.5;
+        (lo - dot).max(dot - hi).max(0.0)
+    }
+
+    fn audit(
+        blas: &Blas,
+        shape: LinearShape,
+        operands: [&[f32]; 2],
+        actual: &[f32],
+        bf16_output: bool,
+    ) -> Result<usize> {
+        let [w, x] =
+            operands.map(|values| values.iter().copied().map(f64::from).collect::<Vec<_>>());
+        let dot = fp64_product(blas, shape, &w, &x)?;
+        let sums = fp64_product(
+            blas,
+            shape,
+            &w.iter().map(|v| v.abs()).collect::<Vec<_>>(),
+            &x.iter().map(|v| v.abs()).collect::<Vec<_>>(),
+        )?;
+        let nu = shape.input as f64 * 2f64.powi(-24);
+        let gamma = nu / (1.0 - nu);
+        let mut outside = 0;
+        let mut mutant = 0;
+        for (index, ((value, exact), magnitude)) in actual.iter().zip(&dot).zip(&sums).enumerate() {
+            ensure!(
+                value.is_finite() && exact.is_finite() && magnitude.is_finite(),
+                "Runner FAIL audit nonfinite value"
+            );
+            outside +=
+                usize::from(interval_distance(*exact, *value, bf16_output) > gamma * magnitude);
+            let wrong = actual[(index + shape.output) % actual.len()];
+            mutant +=
+                usize::from(interval_distance(*exact, wrong, bf16_output) > gamma * magnitude);
+        }
+        println!(
+            "HIP_OWN_OPERAND_FP64 shape=[{},{},{}] bf16_output={bf16_output} entries={} outside={outside} gamma_K={gamma} row_mutant_outside={mutant}",
+            shape.rows,
+            shape.output,
+            shape.input,
+            actual.len()
+        );
+        if shape.rows > 1 {
+            ensure!(
+                mutant > 0,
+                "Runner FAIL own-operand row mutant was not detected"
+            );
+        }
+        Ok(outside)
+    }
+
+    fn fixture(count: usize, seed: usize, bf16_input: bool) -> Vec<f32> {
+        (0..count)
+            .map(|i| {
+                let v = ((i * seed % 4099) as f32 - 2049.0) / 719.0;
+                let v = if i % 17 == 3 { v * 1_048_576.0 } else { v };
+                if bf16_input {
+                    bf16::from_f32(v).to_f32()
+                } else {
+                    v
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "authorized HIP window; production projection shapes and own-operand FP64 bounds"]
+    fn linear_own_operand_fp64_gpu() -> Result<()> {
+        let device = crate::backend::cuda::Device::new(0)?;
+        let s = &device.stream;
+        let blas = Blas::new(s.clone())?;
+        let mut cells = 0;
+        let mut defects = 0;
+        for (bf16_input, geometry) in [
+            (
+                true,
+                &[
+                    (1024, 588),
+                    (4096, 1024),
+                    (1024, 2048),
+                    (6144, 1024),
+                    (1024, 3072),
+                ][..],
+            ),
+            (
+                false,
+                &[(1536, 1024), (1536, 1536), (256, 1536), (1, 256)][..],
+            ),
+        ] {
+            for &(output, input) in geometry {
+                for rows in [551, 2040] {
+                    let shape = LinearShape {
+                        rows,
+                        output,
+                        input,
+                    };
+                    let w = fixture(output * input, 37, bf16_input);
+                    let x = fixture(rows * input, 53, bf16_input);
+                    let actual = if bf16_input {
+                        let dw = s.clone_htod(
+                            &w.iter().map(|v| bf16::from_f32(*v)).collect::<Vec<_>>(),
+                        )?;
+                        let dx = s.clone_htod(
+                            &x.iter().map(|v| bf16::from_f32(*v)).collect::<Vec<_>>(),
+                        )?;
+                        let mut dy = s.alloc_zeros::<bf16>(rows * output)?;
+                        let choice = blas.prepare_choice(shape, None, None)?;
+                        println!("HIP_AUDIT_CHOICE {}", serde_json::to_string(&choice)?);
+                        blas.linear_with_bias(shape, None, &dw, &dx, &mut dy)?;
+                        s.clone_dtoh(&dy)?
+                            .into_iter()
+                            .map(bf16::to_f32)
+                            .collect::<Vec<_>>()
+                    } else {
+                        fp32_cell(&blas, shape, &w, &x)?
+                    };
+                    defects += audit(&blas, shape, [&w, &x], &actual, bf16_input)?;
+                    cells += 1;
+                }
+            }
+        }
+        let shape = LinearShape {
+            rows: 1,
+            output: 256,
+            input: 1536,
+        };
+        let w = fixture(shape.output * shape.input, 37, false);
+        let x = fixture(shape.input, 53, false);
+        let actual = fp32_cell(&blas, shape, &w, &x)?;
+        defects += audit(&blas, shape, [&w, &x], &actual, false)?;
+        cells += 1;
+        println!(
+            "HIP_LINEAR_AUDIT cells={cells} defects={defects} limits=gamma_K_sum_abs_products frozen=true"
+        );
+        ensure!(
+            defects == 0,
+            "DEFECT HIP own-operand FP64 audit entries={defects}"
+        );
+        Ok(())
+    }
+
+    fn fp32_cell(blas: &Blas, shape: LinearShape, w: &[f32], x: &[f32]) -> Result<Vec<f32>> {
+        let s = &blas.stream;
+        let dw = s.clone_htod(w)?;
+        let dx = s.clone_htod(x)?;
+        let dy = s.alloc_zeros::<f32>(shape.rows * shape.output)?;
+        let weight = view(
+            &dw,
+            s,
+            0,
+            [shape.output as u32, shape.input as u32],
+            [shape.input as u64, 1],
+        )?;
+        let input = view(
+            &dx,
+            s,
+            0,
+            [shape.rows as u32, shape.input as u32],
+            [shape.input as u64, 1],
+        )?;
+        let mut output = TensorMut(view(
+            &dy,
+            s,
+            0,
+            [shape.rows as u32, shape.output as u32],
+            [shape.output as u64, 1],
+        )?);
+        blas.linear_f32(weight, input, &mut output)?;
+        let eager = s.clone_dtoh(&dy)?;
+        let capture = s.begin_capture()?;
+        blas.linear_f32(weight, input, &mut output)?;
+        let graph = capture.finish()?;
+        for _ in 0..2 {
+            graph.launch()?;
+            let replay = s.clone_dtoh(&dy)?;
+            ensure!(
+                eager
+                    .iter()
+                    .zip(replay)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "DEFECT FP32 graph/repeat bits"
+            );
+        }
+        Ok(eager)
+    }
+}
