@@ -371,7 +371,7 @@ __device__ __forceinline__ void phase1_body(
     }
     __syncthreads();
     AttentionAcc dot[KT / 16] = {};
-#pragma unroll
+#pragma unroll 1
     for (int block = 0; block < DH / 16; ++block) {
       AttentionBf16 query;
 #pragma unroll
