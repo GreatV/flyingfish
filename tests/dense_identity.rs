@@ -131,7 +131,7 @@ struct ReferenceCase {
     rows: usize,
     capacity: usize,
     forced: Vec<u32>,
-    limits: Option<ReferenceLimits>,
+    limits: ReferenceLimits,
 }
 
 #[derive(serde::Deserialize)]
@@ -183,10 +183,15 @@ fn dense_model_reference_gpu() -> Result<()> {
     let runtime = PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
     let fixtures: ReferenceFixtures =
         serde_json::from_str(include_str!("fixtures/dense_reference.json"))?;
-    #[cfg(feature = "rocm")]
     ensure!(
-        fixtures.cases.iter().all(|c| c.limits.is_some()),
-        "HIP model comparison requires committed numerical limits"
+        fixtures
+            .cases
+            .iter()
+            .all(|c| c.limits.max_normalized.is_finite()
+                && c.limits.max_normalized >= 0.0
+                && c.limits.rms_normalized.is_finite()
+                && c.limits.rms_normalized >= 0.0),
+        "model comparison requires finite nonnegative committed limits"
     );
     let mut defects = 0;
     let mut cells = 0;
@@ -233,6 +238,7 @@ fn dense_model_reference_gpu() -> Result<()> {
             let mut max_normalized = 0.0f64;
             let mut rms_normalized = 0.0f64;
             let mut id_disagreements = 0;
+            let mut argmax_defects = 0;
             let mut margin_excluded_ids = 0;
             let mut min_margin = f32::INFINITY;
             let mut file = std::fs::File::create_new(
@@ -272,11 +278,7 @@ fn dense_model_reference_gpu() -> Result<()> {
                 min_margin = min_margin.min(margin);
                 if token as usize != order[0] {
                     id_disagreements += 1;
-                    if case
-                        .limits
-                        .as_ref()
-                        .is_some_and(|l| f64::from(margin) > 2.0 * l.max_normalized * scale)
-                    {
+                    if f64::from(margin) > 2.0 * case.limits.max_normalized * scale {
                         margin_excluded_ids += 1;
                     }
                 }
@@ -286,21 +288,20 @@ fn dense_model_reference_gpu() -> Result<()> {
                     .max_by(|(a, x), (b, y)| x.total_cmp(y).then(b.cmp(a)))
                     .context("empty logits")?
                     .0;
-                defects += usize::from(token as usize != actual_argmax);
+                argmax_defects += usize::from(token as usize != actual_argmax);
                 file.write_all(&token.to_le_bytes())?;
                 for value in logits {
                     file.write_all(&value.to_le_bytes())?;
                 }
             }
             file.flush()?;
-            let numerical_defect = case.limits.as_ref().is_some_and(|l| {
-                max_normalized > l.max_normalized || rms_normalized > l.rms_normalized
-            });
-            defects += usize::from(numerical_defect) + margin_excluded_ids;
+            let numerical_defect = max_normalized > case.limits.max_normalized
+                || rms_normalized > case.limits.rms_normalized;
+            defects += usize::from(numerical_defect) + margin_excluded_ids + argmax_defects;
             cells += 1;
             println!(
                 "{}",
-                serde_json::json!({"dense_model_reference":{"case":case.name,"chunk":chunk,"steps":fixtures.steps,"max_normalized":max_normalized,"rms_normalized":rms_normalized,"id_disagreements":id_disagreements,"margin_excluded_ids":margin_excluded_ids,"min_reference_margin":min_margin,"result":if case.limits.is_none(){"MEASURED"}else if numerical_defect || margin_excluded_ids>0{"DEFECT"}else{"PASS"}}})
+                serde_json::json!({"dense_model_reference":{"case":case.name,"chunk":chunk,"steps":fixtures.steps,"max_normalized":max_normalized,"rms_normalized":rms_normalized,"id_disagreements":id_disagreements,"margin_excluded_ids":margin_excluded_ids,"argmax_defects":argmax_defects,"min_reference_margin":min_margin,"result":if numerical_defect || margin_excluded_ids>0 || argmax_defects>0{"DEFECT"}else{"PASS"}}})
             );
             model.reset()?;
             let mut greedy = Vec::new();
@@ -315,10 +316,7 @@ fn dense_model_reference_gpu() -> Result<()> {
             model.check_ready()?;
         }
     }
-    println!(
-        "DENSE_MODEL_REFERENCE cells={cells} defects={defects} limits_frozen={}",
-        fixtures.cases.iter().all(|c| c.limits.is_some())
-    );
+    println!("DENSE_MODEL_REFERENCE cells={cells} defects={defects} limits_frozen=true");
     ensure!(
         defects == 0,
         "dense model reference candidate defects={defects}"
