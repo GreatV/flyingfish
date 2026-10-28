@@ -1967,6 +1967,29 @@ impl Engine {
     }
 
     #[cfg(test)]
+    pub(crate) fn gemma_prefill_trace(
+        &mut self,
+        ids: &[u32],
+        trace: &mut crate::trace::Trace,
+    ) -> Result<()> {
+        ensure!(!ids.is_empty(), "Gemma 4 prefill requires token IDs");
+        self.device.stream.memcpy_htod(ids, &mut self.work.ids)?;
+        self.run_step(
+            crate::backend::Step {
+                rows: ids.len(),
+                input: crate::backend::Input::Ids,
+                head: Head::All,
+                mask: crate::backend::Mask::Causal,
+            },
+            Some(Target {
+                trace,
+                prefix: "",
+                skip: 0,
+            }),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn gemma_decode_all(&mut self, token: u32) -> Result<()> {
         self.device
             .stream

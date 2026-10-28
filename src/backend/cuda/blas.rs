@@ -1228,8 +1228,12 @@ impl Blas {
                         w.shape[1] as usize,
                         0,
                     ))
-                    .context("fixed Lt plan missing; bind before run/capture")?;
-
+                    .with_context(|| {
+                        format!(
+                            "fixed Lt plan missing; bind before run/capture rows={} output={} input={}",
+                            x.shape[0], w.shape[0], w.shape[1]
+                        )
+                    })?;
                 let alpha = 1f32;
                 let beta = 0f32;
                 let (workspace, _guard) = self.workspace.device_ptr(&self.stream);

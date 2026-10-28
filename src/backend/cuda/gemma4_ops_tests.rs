@@ -915,9 +915,18 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
             std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR missing")?,
         )),
     };
+    let runtime = settings
+        .runtime_dir
+        .clone()
+        .context("runtime directory missing")?;
     let mut engine = super::engine::Engine::load(&dir, 0, 640, Some(640), settings)?;
+    let first_ids: Vec<u32> = serde_json::from_value(ids["short"][0].clone())?;
+    let mut trace = crate::trace::Trace::all_layers();
+    engine.gemma_prefill_trace(&first_ids, &mut trace)?;
+    trace.set_device(&engine.device_info().name)?;
+    trace.save(&runtime.join("native-trace.safetensors"))?;
     let mut defects = 0usize;
-    let mut first = true;
+    let mut first = false;
     for (tag, prefill) in [("a", 0usize), ("b", 0), ("wrap", 512)] {
         let sequence: Vec<u32> = if tag == "wrap" {
             serde_json::from_value(ids["wrap"].clone())?
