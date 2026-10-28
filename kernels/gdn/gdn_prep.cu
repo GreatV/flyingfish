@@ -1,7 +1,6 @@
 // BF16 convolution outputs widen before FP32 Q/K L2 normalization.
 // Q/K expand to value heads; Q is scaled by 1/sqrt(DK).
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
+#include "../gpu_compat.cuh"
 #include <stdint.h>
 #include "../q38_contract.cuh"
 
@@ -55,8 +54,8 @@ extern "C" __global__ void gdn_prep_l2_fp32(
     float ks = k * k;
     #pragma unroll
     for (int delta = 16; delta > 0; delta >>= 1) {
-        qs += __shfl_down_sync(0xffffffff, qs, delta);
-        ks += __shfl_down_sync(0xffffffff, ks, delta);
+        qs += __shfl_down_sync(FF_WARP_MASK, qs, delta);
+        ks += __shfl_down_sync(FF_WARP_MASK, ks, delta);
     }
     __shared__ float sums[2][GDN_PREP_DK / 32];
     if (lane == 0) {
@@ -69,8 +68,8 @@ extern "C" __global__ void gdn_prep_l2_fp32(
         ks = lane < GDN_PREP_DK / 32 ? sums[1][lane] : 0.0f;
         #pragma unroll
         for (int delta = 16; delta > 0; delta >>= 1) {
-            qs += __shfl_down_sync(0xffffffff, qs, delta);
-            ks += __shfl_down_sync(0xffffffff, ks, delta);
+            qs += __shfl_down_sync(FF_WARP_MASK, qs, delta);
+            ks += __shfl_down_sync(FF_WARP_MASK, ks, delta);
         }
         if (lane == 0) {
             sums[0][0] = rsqrtf(qs + l2_eps);

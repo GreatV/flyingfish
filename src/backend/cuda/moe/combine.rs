@@ -1,8 +1,8 @@
 //! Single deterministic MoE combine over per-(row, choice) contributions.
 use crate::backend::cuda::contracts::{Tensor, TensorMut, no_overlap};
 use crate::backend::cuda::cubin;
+use crate::backend::gpu::{CudaContext, CudaFunction, CudaStream, PushKernelArg};
 use anyhow::{Result, ensure};
-use cudarc::driver::{CudaContext, CudaFunction, CudaStream, PushKernelArg};
 use half::bf16;
 use std::sync::Arc;
 

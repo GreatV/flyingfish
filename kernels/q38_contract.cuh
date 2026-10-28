@@ -33,3 +33,16 @@ __device__ __forceinline__ float e4m3_decode(uint8_t code) {
     if (e == 0) return __uint_as_float(__float_as_uint(float(m) * (1.0f/512.0f)) | sign);
     return __uint_as_float(sign | ((e + 120) << 23) | (m << 20));
 }
+
+#if defined(__HIP__)
+// BF16-rounded channel weights below 2^-64 are scaled by 2^64 inside WMMA tiles.
+__device__ __forceinline__ __nv_bfloat16 fp8_channel_tile_weight(
+    uint8_t code, __nv_bfloat16 channel_scale) {
+    const float scale = __bfloat162float(channel_scale);
+    const float boost = scale < 0x1p-64f ? 0x1p64f : 1.0f;
+    return __float2bfloat16(__bfloat162float(__float2bfloat16_rn(e4m3_decode(code) * scale)) * boost);
+}
+__device__ __forceinline__ float fp8_channel_tile_unscale(__nv_bfloat16 channel_scale) {
+    return __bfloat162float(channel_scale) < 0x1p-64f ? 0x1p-64f : 1.0f;
+}
+#endif

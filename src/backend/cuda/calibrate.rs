@@ -1,32 +1,42 @@
+use super::Device;
+#[cfg(feature = "cuda")]
 use super::{
-    Device,
     decode::Attention,
     ops::{Ops, grid},
 };
+#[cfg(feature = "rocm")]
+use crate::backend::gpu::DevicePtr;
+use crate::backend::setup::CacheKey;
+#[cfg(feature = "cuda")]
 use crate::{
     backend::setup::{
-        ATTENTION_LENGTHS, AttentionPlan, CacheKey, Selection, attention_bucket, attention_chunks,
+        ATTENTION_LENGTHS, AttentionPlan, Selection, attention_bucket, attention_chunks,
         attention_lengths,
     },
     config::Config,
 };
 use anyhow::{Context, Result, ensure};
+#[cfg(feature = "cuda")]
 use cudarc::driver::{DevicePtr, PushKernelArg, sys};
+#[cfg(feature = "cuda")]
 use half::bf16;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "cuda")]
 use std::{
-    collections::hash_map::DefaultHasher,
-    fs::File,
-    hash::Hasher,
-    io::Read,
-    path::{Path, PathBuf},
-    sync::OnceLock,
-    time::{Duration, Instant},
+    collections::hash_map::DefaultHasher, fs::File, hash::Hasher, io::Read, sync::OnceLock,
+    time::Duration,
 };
 
+use std::{
+    path::{Path, PathBuf},
+    time::Instant,
+};
+
+#[cfg(feature = "cuda")]
 const LENGTHS: [usize; 5] = ATTENTION_LENGTHS;
 
 #[derive(Clone, Serialize, Deserialize)]
+#[cfg(feature = "cuda")]
 struct Trial {
     length: usize,
     plan: AttentionPlan,
@@ -40,18 +50,21 @@ struct Trial {
 }
 
 #[derive(Serialize, Deserialize)]
+#[cfg(feature = "cuda")]
 struct Occupancy {
     plan: AttentionPlan,
     blocks: usize,
     active_per_sm: usize,
 }
 
+#[cfg(feature = "cuda")]
 impl Occupancy {
     fn fits(&self, sms: usize) -> bool {
         self.blocks <= sms * self.active_per_sm
     }
 }
 
+#[cfg(feature = "cuda")]
 fn plans(bucket: usize) -> Vec<AttentionPlan> {
     let mut plans = Vec::new();
     for &chunk in attention_chunks(bucket) {
@@ -72,6 +85,7 @@ fn plans(bucket: usize) -> Vec<AttentionPlan> {
 }
 
 #[derive(Serialize, Deserialize)]
+#[cfg(feature = "cuda")]
 struct Cache {
     schema: u32,
     key: CacheKey,
@@ -86,12 +100,14 @@ struct Cache {
 }
 
 #[derive(Serialize)]
+#[cfg(feature = "cuda")]
 pub struct Calibrated {
     cache: Cache,
     hit: bool,
     path: PathBuf,
 }
 
+#[cfg(feature = "cuda")]
 impl Calibrated {
     pub fn choose(&self, capacity: usize) -> Result<(AttentionPlan, Selection)> {
         let bucket = attention_bucket(capacity)?;
@@ -113,8 +129,10 @@ impl Calibrated {
     }
 }
 
+#[cfg(feature = "cuda")]
 pub use super::closure::runtime_dir;
 
+#[cfg(feature = "cuda")]
 fn driver_release(text: &str) -> Result<String> {
     text.lines()
         .find_map(|line| line.strip_prefix("NVRM version:"))
@@ -131,6 +149,7 @@ fn driver_release(text: &str) -> Result<String> {
         .context("NVRM version line has no NVIDIA driver release")
 }
 
+#[cfg(feature = "cuda")]
 pub(super) fn key(ctx: &cudarc::driver::CudaContext) -> Result<CacheKey> {
     static DRIVER: OnceLock<std::result::Result<String, String>> = OnceLock::new();
     let version = DRIVER
@@ -175,10 +194,12 @@ pub(super) fn key(ctx: &cudarc::driver::CudaContext) -> Result<CacheKey> {
     })
 }
 
+#[cfg(feature = "cuda")]
 fn rank(t: &Trial) -> (f64, f64, usize) {
     (t.median_us, t.p90_us, usize::MAX - t.plan.chunk)
 }
 
+#[cfg(feature = "cuda")]
 fn check(cache: &Cache, key: &CacheKey, capacity: usize) -> Result<()> {
     let bucket = attention_bucket(capacity)?;
     let evaluation_lengths = attention_lengths(capacity, 0)?;
@@ -255,6 +276,7 @@ fn check(cache: &Cache, key: &CacheKey, capacity: usize) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
 pub(super) fn cache_path(dir: &Path, key: &CacheKey, bucket: usize, capacity: usize) -> PathBuf {
     dir.join(format!(
         "attention-long-v3-b{bucket}-c{capacity}-{}.json",
@@ -262,6 +284,7 @@ pub(super) fn cache_path(dir: &Path, key: &CacheKey, bucket: usize, capacity: us
     ))
 }
 
+#[cfg(feature = "cuda")]
 pub(super) fn load(
     d: &Device,
     ops: &Ops,
@@ -293,6 +316,7 @@ pub(super) fn load(
     Ok(Calibrated { cache, hit, path })
 }
 
+#[cfg(feature = "cuda")]
 pub(super) fn load_recorded(d: &Device, dir: &Path, capacity: usize) -> Result<Calibrated> {
     let bucket = attention_bucket(capacity)?;
     let key = d.key.clone();
@@ -313,6 +337,7 @@ pub(super) use crate::verify::percentile;
 /// Uniform-attention max |actual − expected| and max error / bound over elements.
 /// Bound: a + half_ulp_bf16(|expected| + a), a = γ_{chunk + ⌈keys/chunk⌉}(2^-23)·max|V| for the
 /// split-KV sums of at most `chunk` and ⌈keys/chunk⌉ FP32 terms, the reciprocal and the product.
+#[cfg(feature = "cuda")]
 pub(super) fn uniform_attention_error(
     c: &Config,
     actual: &[bf16],
@@ -340,15 +365,10 @@ pub(super) fn uniform_attention_error(
         .fold((0f64, 0f64), |(a, r), (e, q)| (a.max(e), r.max(q)))
 }
 
-pub(super) fn random(n: usize, mut state: u32) -> Vec<bf16> {
-    (0..n)
-        .map(|_| {
-            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-            bf16::from_f32((state >> 8) as f32 / 16777216.0 - 0.5)
-        })
-        .collect()
-}
+#[cfg(feature = "cuda")]
+use super::random;
 
+#[cfg(feature = "cuda")]
 fn measure(
     d: &Device,
     ops: &Ops,
@@ -1032,6 +1052,94 @@ fn check_expert_transfer(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn expert_key(device: &Device) -> Result<CacheKey> {
+    #[cfg(feature = "cuda")]
+    {
+        Ok(device.key.clone())
+    }
+    #[cfg(feature = "rocm")]
+    {
+        let blas = super::blas::Blas::new(device.stream.clone())?;
+        let identity = blas.identity();
+        Ok(CacheKey {
+            device_uuid: identity.device_uuid.clone(),
+            driver_version: serde_json::to_string(identity)?,
+            binary_version: identity.binary.clone(),
+            cublaslt_version: usize::try_from(identity.library)?,
+        })
+    }
+}
+
+fn copy_engines(device: &Device) -> Result<u32> {
+    #[cfg(feature = "cuda")]
+    let count = device
+        .ctx
+        .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT)?;
+    #[cfg(feature = "rocm")]
+    let count = device.ctx.properties.async_engines;
+    ensure!(
+        count > 0,
+        "expert device reports no asynchronous copy engine"
+    );
+    Ok(u32::try_from(count)?)
+}
+
+fn host_registration_supported(device: &Device) -> Result<bool> {
+    #[cfg(feature = "cuda")]
+    let supported = device
+        .ctx
+        .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED)?;
+    #[cfg(feature = "rocm")]
+    let supported = device.ctx.properties.host_register_supported;
+    ensure!(
+        matches!(supported, 0 | 1),
+        "invalid expert device host-registration capability {supported}"
+    );
+    Ok(supported != 0)
+}
+
+fn copy_expert_transfer(
+    device: &Device,
+    host: &mut crate::backend::gpu::PinnedHostSlice<u8>,
+    allocation: &mut crate::backend::gpu::CudaSlice<u8>,
+    download: bool,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        if download {
+            device.upload.memcpy_dtoh(allocation, host)?;
+        } else {
+            device.upload.memcpy_htod(host, allocation)?;
+        }
+        Ok(())
+    }
+    #[cfg(feature = "rocm")]
+    {
+        ensure!(
+            host.len() == allocation.len(),
+            "expert transfer extent mismatch"
+        );
+        let (gpu, _guard) = allocation.device_ptr(&device.upload);
+        let cpu = host.as_mut_ptr()? as u64;
+        let (dst, src, kind) = if download {
+            (cpu, gpu, 2)
+        } else {
+            (gpu, cpu, 1)
+        };
+        // Both owners outlive the upload stream's final synchronization.
+        unsafe { device.upload.copy_raw(dst, src, host.len(), kind) }
+    }
+}
+
+#[cfg(feature = "rocm")]
+fn measure_peer_transfer(
+    _device: &Device,
+    _peer: &Device,
+    _bytes: usize,
+) -> Result<ExpertTransfer> {
+    anyhow::bail!("HIP expert peer transfer calibration is not implemented")
+}
+
 fn measure_expert_transfer(d: &Device, bytes: usize) -> Result<ExpertTransfer> {
     let mut host = unsafe { d.ctx.alloc_pinned_with_flags::<u8>(bytes, 0) }
         .with_context(|| format!("allocate expert transfer pinned bytes={bytes}"))?;
@@ -1045,16 +1153,18 @@ fn measure_expert_transfer(d: &Device, bytes: usize) -> Result<ExpertTransfer> {
         .upload
         .alloc_zeros::<u8>(bytes)
         .with_context(|| format!("allocate expert transfer device bytes={bytes}"))?;
-    d.upload
-        .memcpy_htod(&host, &mut device)
+    copy_expert_transfer(d, &mut host, &mut device, false)
         .with_context(|| format!("expert transfer roundtrip H2D bytes={bytes}"))?;
-    d.upload
-        .memcpy_dtoh(&device, &mut host)
+    copy_expert_transfer(d, &mut host, &mut device, true)
         .with_context(|| format!("expert transfer roundtrip D2H bytes={bytes}"))?;
     d.upload
         .synchronize()
         .with_context(|| format!("synchronize expert transfer roundtrip bytes={bytes}"))?;
     check_expert_transfer(host.as_slice()?)?;
+    #[cfg(feature = "cuda")]
+    let event_flags = sys::CUevent_flags::CU_EVENT_DEFAULT;
+    #[cfg(feature = "rocm")]
+    let event_flags = 0;
     let mut cell = ExpertTransfer {
         bytes: bytes as u64,
         h2d_seconds: [0.0; 5],
@@ -1062,31 +1172,23 @@ fn measure_expert_transfer(d: &Device, bytes: usize) -> Result<ExpertTransfer> {
     };
     for download in [false, true] {
         for trial in 0..6 {
-            let begin = d
-                .upload
-                .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
-                .with_context(|| {
-                    format!(
-                        "record expert transfer begin bytes={bytes} d2h={download} trial={trial}"
-                    )
-                })?;
+            let begin = d.upload.record_event(Some(event_flags)).with_context(|| {
+                format!("record expert transfer begin bytes={bytes} d2h={download} trial={trial}")
+            })?;
             for _ in 0..16 {
                 if download {
-                    d.upload.memcpy_dtoh(&device, &mut host).with_context(|| {
+                    copy_expert_transfer(d, &mut host, &mut device, true).with_context(|| {
                         format!("expert transfer timed D2H bytes={bytes} trial={trial}")
                     })?;
                 } else {
-                    d.upload.memcpy_htod(&host, &mut device).with_context(|| {
+                    copy_expert_transfer(d, &mut host, &mut device, false).with_context(|| {
                         format!("expert transfer timed H2D bytes={bytes} trial={trial}")
                     })?;
                 }
             }
-            let end = d
-                .upload
-                .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
-                .with_context(|| {
-                    format!("record expert transfer end bytes={bytes} d2h={download} trial={trial}")
-                })?;
+            let end = d.upload.record_event(Some(event_flags)).with_context(|| {
+                format!("record expert transfer end bytes={bytes} d2h={download} trial={trial}")
+            })?;
             end.synchronize().with_context(|| {
                 format!(
                     "synchronize expert transfer end bytes={bytes} d2h={download} trial={trial}"
@@ -1111,6 +1213,7 @@ fn measure_expert_transfer(d: &Device, bytes: usize) -> Result<ExpertTransfer> {
     Ok(cell)
 }
 
+#[cfg(feature = "cuda")]
 fn measure_peer_transfer(d: &Device, peer: &Device, bytes: usize) -> Result<ExpertTransfer> {
     struct PortableBuf(*mut std::ffi::c_void);
     impl Drop for PortableBuf {
@@ -1372,10 +1475,12 @@ fn registration_extent<T>(
 }
 
 fn measure_host_registration(d: &Device, bytes: u64, slot_bytes: u64) -> Result<(u64, [f64; 3])> {
-    if d.ctx
-        .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED)?
-        == 0
-    {
+    let (status_field, success_status, oom_status) = if cfg!(feature = "cuda") {
+        ("cuda_result", "CUDA_SUCCESS", "CUDA_ERROR_OUT_OF_MEMORY")
+    } else {
+        ("hip_result", "hipSuccess", "hipErrorOutOfMemory")
+    };
+    if !host_registration_supported(d)? {
         return Ok((0, [0.0; 3]));
     }
     ensure!(
@@ -1393,25 +1498,38 @@ fn measure_host_registration(d: &Device, bytes: u64, slot_bytes: u64) -> Result<
         let extent = usize::try_from(slots * slot_bytes)?;
         let start = Instant::now();
         // SAFETY: every prefix stays within the owned mapping and has no DMA users.
+        #[cfg(feature = "cuda")]
         let result = unsafe { sys::cuMemHostRegister_v2(pointer, extent, 0).result() };
+        #[cfg(feature = "rocm")]
+        let result = unsafe { d.ctx.register_host(pointer as u64, extent, false) };
         let registered = start.elapsed().as_secs_f64();
         if let Err(error) = result {
-            if error.0 == sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY {
+            #[cfg(feature = "cuda")]
+            let out_of_memory = error.0 == sys::CUresult::CUDA_ERROR_OUT_OF_MEMORY;
+            #[cfg(feature = "rocm")]
+            let out_of_memory = error
+                .downcast_ref::<crate::backend::hip::RuntimeError>()
+                .is_some_and(|error| error.status == 2);
+            if out_of_memory {
                 eprintln!(
                     "{}",
                     serde_json::json!({"host_registration_capacity_probe": {
-                        "bytes":extent,"cuda_result":"CUDA_ERROR_OUT_OF_MEMORY",
+                        "bytes":extent,(status_field):oom_status,
                         "register_seconds":registered
                     }})
                 );
                 return Ok(None);
             }
             return Err(error)
-                .with_context(|| format!("measure CUDA host registration: bytes={extent}"));
+                .with_context(|| format!("measure host registration: bytes={extent}"));
         }
         let start = Instant::now();
         // SAFETY: pointer is the successfully registered prefix and has no DMA users.
-        unsafe { sys::cuMemHostUnregister(pointer).result() }
+        #[cfg(feature = "cuda")]
+        let result = unsafe { sys::cuMemHostUnregister(pointer).result() };
+        #[cfg(feature = "rocm")]
+        let result = unsafe { d.ctx.unregister_host(pointer as u64) };
+        result
             .with_context(|| format!("unregister host registration measurement: bytes={extent}"))?;
         Ok(Some([registered, start.elapsed().as_secs_f64()]))
     })?;
@@ -1422,11 +1540,18 @@ fn measure_host_registration(d: &Device, bytes: u64, slot_bytes: u64) -> Result<
         "{}",
         serde_json::json!({"host_registration_measurement": {
             "bytes":extent,"allocation_bytes":bytes,"allocation_seconds":allocated,
-            "cuda_result":if extent > 0 {"CUDA_SUCCESS"} else {"CUDA_ERROR_OUT_OF_MEMORY"},
+            (status_field):if extent > 0 {success_status} else {oom_status},
             "register_seconds":registered,"unregister_seconds":unregistered
         }})
     );
     Ok((extent, [allocated, registered, unregistered]))
+}
+
+fn expert_cache_path(dir: &Path, key: &CacheKey, identity: &str) -> PathBuf {
+    let tag = key.tag();
+    #[cfg(feature = "rocm")]
+    let tag = super::closure::hash(tag.as_bytes());
+    dir.join(format!("experts-v3-{tag}-{identity}.json"))
 }
 
 pub(super) fn load_experts(
@@ -1438,9 +1563,9 @@ pub(super) fn load_experts(
 ) -> Result<ExpertCalibration> {
     let slot_bytes =
         crate::experts::catalogue::ExpertLayout::new(expert_format, &geometry)?.slot_bytes();
-    let key = d.key.clone();
+    let key = expert_key(d)?;
     let peer = d.peer()?;
-    let peer_key = peer.as_ref().map(|p| p.key.clone());
+    let peer_key = peer.as_ref().map(expert_key).transpose()?;
     let host = ExpertHost::read()?;
     let identity = if let Some(peer_key) = &peer_key {
         super::closure::hash(&serde_json::to_vec(&(
@@ -1452,7 +1577,7 @@ pub(super) fn load_experts(
     } else {
         super::closure::hash(&serde_json::to_vec(&(&host, geometry, expert_format))?)
     };
-    let path = dir.join(format!("experts-v3-{}-{identity}.json", key.tag()));
+    let path = expert_cache_path(dir, &key, &identity);
     let (cache, hit) = if closure.access(&path)? {
         (
             serde_json::from_slice::<ExpertCache>(&std::fs::read(&path)?)
@@ -1470,10 +1595,7 @@ pub(super) fn load_experts(
             ring_bytes <= available / 2,
             "expert service ring {ring_bytes} B exceeds half of effective available host memory {available} B"
         );
-        let copy_engines = u32::try_from(
-            d.ctx
-                .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT)?,
-        )?;
+        let copy_engines = copy_engines(d)?;
         let registration_slots = ((available - available / 16) / slot_bytes)
             .min(u64::from(geometry.layers) * u64::from(geometry.experts));
         let (host_registration_bytes, host_registration_seconds) =
@@ -1538,19 +1660,13 @@ pub(super) fn load_experts(
         super::closure::write_cache(&path, &cache)?;
         (cache, false)
     };
-    let measured_engines = u32::try_from(
-        d.ctx
-            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT)?,
-    )?;
+    let measured_engines = copy_engines(d)?;
     ensure!(
         cache.copy_engines == measured_engines,
         "expert cache engine count {} differs from driver {measured_engines}",
         cache.copy_engines
     );
-    let registration_supported = d
-        .ctx
-        .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_HOST_REGISTER_SUPPORTED)?
-        != 0;
+    let registration_supported = host_registration_supported(d)?;
     ensure!(
         registration_supported || cache.host_registration_bytes == 0,
         "expert host registration profile differs from driver support={registration_supported} bytes={}",
@@ -1569,6 +1685,7 @@ mod long_tests {
     use super::*;
 
     #[test]
+    #[cfg(feature = "cuda")]
     fn uniform_attention_error_maps_query_heads_to_kv_heads() {
         let c = Config {
             model_type: "llama".into(),
@@ -1634,6 +1751,23 @@ mod long_tests {
             binary_version: "fixture".into(),
             cublaslt_version: 130201,
         };
+        #[cfg(feature = "rocm")]
+        {
+            let mut long = key.clone();
+            long.driver_version = "identity".repeat(128);
+            let path = expert_cache_path(Path::new(""), &long, "0123456789abcdef");
+            assert!(path.as_os_str().len() < 255);
+            long.driver_version.push('1');
+            assert_ne!(
+                path,
+                expert_cache_path(Path::new(""), &long, "0123456789abcdef")
+            );
+        }
+        #[cfg(feature = "cuda")]
+        assert_eq!(
+            expert_cache_path(Path::new(""), &key, "0123456789abcdef"),
+            PathBuf::from(format!("experts-v3-{}-0123456789abcdef.json", key.tag()))
+        );
         let host = ExpertHost {
             cpu: "fixture".into(),
             isa: "fixture".into(),
@@ -1819,6 +1953,7 @@ mod long_tests {
 
     #[test]
     #[ignore = "requires exclusive CUDA calibration"]
+    #[cfg(feature = "cuda")]
     fn expert_setup_smoke_gpu() -> Result<()> {
         let device = Device::new(0)?;
         let untimed_begin = device
@@ -1859,6 +1994,7 @@ mod long_tests {
 
     #[test]
     #[ignore = "requires exclusive CUDA calibration and an empty runtime directory"]
+    #[cfg(feature = "cuda")]
     fn expert_setup_measurements_gpu() -> Result<()> {
         let model = PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
         let runtime = PathBuf::from(
@@ -1996,6 +2132,7 @@ mod long_tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     fn calibration_expected(
         c: &Config,
         values: &[bf16],
@@ -2036,6 +2173,7 @@ mod long_tests {
         expected
     }
 
+    #[cfg(feature = "cuda")]
     fn calibration_attention_cell(
         d: &Device,
         ops: &Ops,
@@ -2219,6 +2357,7 @@ mod long_tests {
 
     #[test]
     #[ignore = "exclusive CUDA, FF_ARGMAX_MODEL and an empty FLYINGFISH_RUNTIME_DIR"]
+    #[cfg(feature = "cuda")]
     fn calibration_identity_capacity_gpu() -> Result<()> {
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -2295,6 +2434,7 @@ mod long_tests {
     }
 
     #[test]
+    #[cfg(feature = "cuda")]
     fn cache_requires_measured_bucket_and_complete_candidates() -> Result<()> {
         assert_eq!(
             driver_release(

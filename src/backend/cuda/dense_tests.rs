@@ -81,6 +81,467 @@ fn config() -> Result<Config> {
     }))?)
 }
 
+#[cfg(feature = "rocm")]
+fn gdn_core_reference(
+    rows: usize,
+    heads: usize,
+    initial: &[f32],
+    prepared: [&[f64]; 5],
+) -> (Vec<bf16>, Vec<f64>) {
+    let [q, k, v, beta, g] = prepared;
+    let mut state: Vec<_> = initial.iter().map(|x| f64::from(*x)).collect();
+    let mut out = vec![bf16::ZERO; rows * heads * 128];
+    for row in 0..rows {
+        for head in 0..heads {
+            let base = (row * heads + head) * 128;
+            let s = &mut state[head * 128 * 128..][..128 * 128];
+            let decay = g[row * heads + head].exp();
+            for value in s.iter_mut() {
+                *value *= decay;
+            }
+            for column in 0..128 {
+                let dot: f64 = (0..128).map(|d| k[base + d] * s[d * 128 + column]).sum();
+                let delta = (v[base + column] - dot) * beta[row * heads + head];
+                for d in 0..128 {
+                    s[d * 128 + column] += k[base + d] * delta;
+                }
+                let value: f64 = (0..128).map(|d| q[base + d] * s[d * 128 + column]).sum();
+                out[base + column] = bf16::from_f64(value);
+            }
+        }
+    }
+    (out, state)
+}
+
+#[cfg(feature = "rocm")]
+#[test]
+#[ignore = "requires HIP GPU lease and FF_DENSE_GPU_WINDOW=granted"]
+fn hip_gdn_runtime_gpu() -> Result<()> {
+    use crate::backend::cuda::gdn::{GdnBindings, GdnOps};
+    use crate::backend::cuda::moe::testing::{capture, view};
+    use crate::gdn_plan::GdnWorkspace;
+    use crate::op_contract::{ExecutionPhase, GdnSpec};
+    use contracts::{Scratch, SeqRef, TensorMut};
+    ensure!(
+        std::env::var("FF_DENSE_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    let device = crate::backend::cuda::Device::new(0)?;
+    let stream = &device.stream;
+    let model = crate::model_spec::ModelSpec::minicpm(
+        &serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/minicpm-config.json"
+        )))?,
+        &serde_json::json!({"eos_token_id":[248044,248046]}),
+    )?;
+    let spec = GdnSpec::from_model(&model)?;
+    let (heads, cd) = (spec.hv as usize, spec.conv_dim()? as usize);
+    ensure!(
+        heads == 32 && cd == 8192 && spec.hk == 16,
+        "GDN fixture geometry"
+    );
+    let mut gate = Gate::default();
+    {
+        let mut store = state::StateStore::new(&model, 129, stream)?;
+        gate.check(
+            "gdn.store_layout",
+            store.gdn.len() == 30
+                && store.kv.len() == 10
+                && store
+                    .gdn
+                    .iter()
+                    .all(|s| s.s.len() == heads * 128 * 128 && s.history.len() == cd * 3),
+        );
+        for state in &mut store.gdn {
+            stream.memcpy_htod(&vec![0.25f32; state.s.len()], &mut state.s)?;
+            stream.memcpy_htod(&vec![-0.5f32; state.history.len()], &mut state.history)?;
+        }
+        store.set_sequence(stream, 23, 17, 17)?;
+        gate.check(
+            "gdn.store_sequence",
+            stream.clone_dtoh(store.sequence.as_ref().context("GDN sequence missing")?)?
+                == [23, 17, 40, 129, 1, 0, 0, 0],
+        );
+        store.reset(stream)?;
+        let mut cleared = true;
+        for state in &store.gdn {
+            cleared &= stream
+                .clone_dtoh(&state.s)?
+                .iter()
+                .all(|v| v.to_bits() == 0)
+                && stream
+                    .clone_dtoh(&state.history)?
+                    .iter()
+                    .all(|v| v.to_bits() == 0);
+        }
+        gate.check("gdn.store_reset", cleared);
+        gate.check(
+            "gdn.store_compact_rejected",
+            state::StateStore::new_with_format(&model, 129, crate::kv::KvFormat::Affine8, stream)
+                .is_err(),
+        );
+    }
+    for (rows, valid) in [
+        (1u32, 1u32),
+        (3, 3),
+        (17, 17),
+        (37, 33),
+        (129, 127),
+        (257, 257),
+    ] {
+        let n = valid as usize;
+        let mut qkv = pattern(rows as usize * cd, 71);
+        qkv[n * cd..].fill(bf16::NAN);
+        let conv = pattern(cd * 4, 73);
+        let a = pattern(rows as usize * heads, 79);
+        let b = pattern(rows as usize * heads, 83);
+        let a_log: Vec<_> = (0..heads)
+            .map(|h| bf16::from_f32(-3.0 + h as f32 / 128.0))
+            .collect();
+        let dt = pattern(heads, 89);
+        let history: Vec<_> = pattern(cd * 3, 97).iter().map(|v| v.to_f32()).collect();
+        let initial: Vec<_> = (0..heads * 128 * 128)
+            .map(|i| ((i * 19 % 251) as f32 - 125.0) / 1024.0)
+            .collect();
+        let dqkv = stream.clone_htod(&qkv)?;
+        let dc = stream.clone_htod(&conv)?;
+        let da = stream.clone_htod(&a)?;
+        let db = stream.clone_htod(&b)?;
+        let dal = stream.clone_htod(&a_log)?;
+        let ddt = stream.clone_htod(&dt)?;
+        let mut dh = stream.clone_htod(&history)?;
+        let mut ds = stream.clone_htod(&initial)?;
+        let dout =
+            stream.clone_htod(&vec![bf16::from_bits(0x7fc5); rows as usize * heads * 128])?;
+        let metadata =
+            stream.clone_htod(&[23i32, valid as i32, 23 + valid as i32, 8192, 1, 0, 0, 0])?;
+        let meta = SeqRef {
+            ptr: metadata.device_ptr(stream).0,
+        };
+        let ws = GdnWorkspace::new(&spec, rows, false)?;
+        let scratch = stream.clone_htod(&vec![0xa5u8; ws.bytes as usize + 256])?;
+        let plan = GdnOps::prepare(
+            &device.ctx,
+            &spec,
+            rows,
+            GdnBindings {
+                qkv: view(&dqkv, stream, [rows, cd as u32], [cd as u64, 1])?,
+                a: view(&da, stream, [rows, spec.hv], [heads as u64, 1])?,
+                b: view(&db, stream, [rows, spec.hv], [heads as u64, 1])?,
+                conv_weight: view(&dc, stream, [cd as u32, 4], [4, 1])?,
+                a_log: view(&dal, stream, [spec.hv], [1])?,
+                dt_bias: view(&ddt, stream, [spec.hv], [1])?,
+                core_out: TensorMut(view(
+                    &dout,
+                    stream,
+                    [rows, spec.hv, 128],
+                    [heads as u64 * 128, 128, 1],
+                )?),
+                s: TensorMut(view(&ds, stream, [spec.hv, 128, 128], [128 * 128, 128, 1])?),
+                history: TensorMut(view(&dh, stream, [cd as u32, 3], [3, 1])?),
+            },
+            false,
+        )?;
+        let phase = if rows == 1 {
+            ExecutionPhase::Decode
+        } else {
+            ExecutionPhase::Prefill
+        };
+        let execute = || {
+            GdnOps::run(
+                &plan,
+                stream,
+                meta,
+                phase,
+                Scratch {
+                    ptr: scratch.device_ptr(stream).0,
+                    bytes: ws.bytes,
+                },
+            )
+        };
+        execute()?;
+        let actual = stream.clone_dtoh(&dout)?;
+        let state = stream.clone_dtoh(&ds)?;
+        let hist = stream.clone_dtoh(&dh)?;
+        let bytes = stream.clone_dtoh(&scratch)?;
+        gate.check(
+            "gdn.output_guard",
+            actual[n * heads * 128..]
+                .iter()
+                .all(|v| v.to_bits() == 0x7fc5),
+        );
+        gate.check(
+            "gdn.scratch_guard",
+            bytes[ws.bytes as usize..].iter().all(|v| *v == 0xa5),
+        );
+        let read = |offset: u64, count: usize| -> Result<Vec<f64>> {
+            let start = offset as usize;
+            let result: Vec<_> = bytes[start..start + count * 4]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f64::from(f32::from_le_bytes(*v)))
+                .collect();
+            ensure!(
+                result.iter().all(|v| v.is_finite()),
+                "RUNNER_FAIL nonfinite GDN workspace"
+            );
+            Ok(result)
+        };
+        let prepared = [
+            read(ws.q_fp32.offset, n * heads * 128)?,
+            read(ws.k_fp32.offset, n * heads * 128)?,
+            read(ws.v_fp32.offset, n * heads * 128)?,
+            read(ws.beta_fp32.offset, n * heads)?,
+            read(ws.g.offset, n * heads)?,
+        ];
+        let conv_actual: Vec<_> = bytes[ws.conv_out.offset as usize..][..n * cd * 2]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|v| bf16::from_bits(u16::from_le_bytes(*v)))
+            .collect();
+        let mut conv_ref = Vec::with_capacity(n * cd);
+        for row in 0..n {
+            for ch in 0..cd {
+                let value: f64 = (0..4)
+                    .map(|tap| {
+                        let index = row + tap;
+                        let x = if index < 3 {
+                            history[ch * 3 + index]
+                        } else {
+                            qkv[(index - 3) * cd + ch].to_f32()
+                        };
+                        f64::from(x) * f64::from(conv[ch * 4 + tap].to_f32())
+                    })
+                    .sum();
+                let rounded = bf16::from_f64(value).to_f64();
+                conv_ref.push(bf16::from_f64(rounded / (1.0 + (-rounded).exp())));
+            }
+        }
+        gate.compare(&format!("gdn.conv.{rows}"), &conv_actual, &conv_ref, 2, 4)?;
+        let mut norm_ratio = 0f64;
+        let norm_bound = crate::backend::cuda::gamma(136, 2f64.powi(-24));
+        for row in 0..n {
+            for head in 0..heads {
+                for (side, prepared_side) in prepared[..2].iter().enumerate() {
+                    let base = row * cd + (side * 16 + head / 2) * 128;
+                    let source = &conv_actual[base..base + 128];
+                    let scale = (source.iter().map(|v| v.to_f64().powi(2)).sum::<f64>()
+                        + f64::from(spec.l2_eps))
+                    .sqrt()
+                    .recip()
+                        / if side == 0 { 128f64.sqrt() } else { 1.0 };
+                    for (d, value) in source.iter().enumerate() {
+                        let expected = value.to_f64() * scale;
+                        let error =
+                            (prepared_side[(row * heads + head) * 128 + d] - expected).abs();
+                        norm_ratio = norm_ratio.max(if expected == 0.0 {
+                            if error == 0.0 { 0.0 } else { f64::INFINITY }
+                        } else {
+                            error / (expected.abs() * norm_bound)
+                        });
+                    }
+                }
+            }
+        }
+        gate.check("gdn.qk_norm", norm_ratio <= 1.0);
+        let actual_beta: Vec<_> = prepared[3].iter().map(|v| bf16::from_f64(*v)).collect();
+        let expected_beta: Vec<_> = b[..n * heads]
+            .iter()
+            .map(|v| bf16::from_f64(1.0 / (1.0 + (-v.to_f64()).exp())))
+            .collect();
+        gate.compare(
+            &format!("gdn.beta.{rows}"),
+            &actual_beta,
+            &expected_beta,
+            1,
+            1,
+        )?;
+        let gate_bound = crate::backend::cuda::gamma(8, 2f64.powi(-24));
+        let gate_error = prepared[4]
+            .iter()
+            .enumerate()
+            .map(|(i, actual)| {
+                let h = i % heads;
+                let t = f64::from(a[i].to_f32() + dt[h].to_f32());
+                let expected = -a_log[h].to_f64().exp() * t.exp().ln_1p();
+                (actual - expected).abs() / (1.0 + expected.abs())
+            })
+            .fold(0f64, f64::max);
+        gate.check("gdn.decay_gate", gate_error <= gate_bound);
+        gate.check(
+            "gdn.value_widen",
+            prepared[2].iter().enumerate().all(|(i, v)| {
+                *v == conv_actual[(i / (heads * 128)) * cd + 4096 + i % (heads * 128)].to_f64()
+            }),
+        );
+        let (expected, expected_state) =
+            gdn_core_reference(n, heads, &initial, prepared.each_ref().map(Vec::as_slice));
+        gate.compare(
+            &format!("gdn.core.{rows}"),
+            &actual[..n * heads * 128],
+            &expected,
+            1,
+            n * 512,
+        )?;
+        let bound = crate::backend::cuda::gamma(n * 512 + 128, 2f64.powi(-24));
+        let error = state
+            .iter()
+            .zip(&expected_state)
+            .try_fold(0f64, |e, (a, b)| {
+                ensure!(
+                    a.is_finite() && b.is_finite(),
+                    "RUNNER_FAIL GDN state nonfinite"
+                );
+                Ok::<_, anyhow::Error>(e.max((f64::from(*a) - b).abs() / (1.0 + b.abs())))
+            })?;
+        gate.check("gdn.state", error <= bound);
+        let history_bad = hist
+            .iter()
+            .enumerate()
+            .filter(|(i, v)| {
+                let (ch, tap) = (i / 3, i % 3);
+                let index = n + tap;
+                let expected = if index < 3 {
+                    history[ch * 3 + index]
+                } else {
+                    qkv[(index - 3) * cd + ch].to_f32()
+                };
+                v.to_bits() != expected.to_bits()
+            })
+            .count();
+        gate.check("gdn.raw_history", history_bad == 0);
+        stream.memcpy_htod(&initial, &mut ds)?;
+        stream.memcpy_htod(&history, &mut dh)?;
+        let graph = capture(stream, execute)?;
+        for replay in 0..2 {
+            if replay != 0 {
+                stream.memcpy_htod(&initial, &mut ds)?;
+                stream.memcpy_htod(&history, &mut dh)?;
+            }
+            graph.launch()?;
+            let observed = stream.clone_dtoh(&dout)?;
+            let observed_state = stream.clone_dtoh(&ds)?;
+            let observed_hist = stream.clone_dtoh(&dh)?;
+            gate.check(
+                "gdn.graph_bits",
+                observed
+                    .iter()
+                    .zip(&actual)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+                    && observed_state
+                        .iter()
+                        .zip(&state)
+                        .chain(observed_hist.iter().zip(&hist))
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+            );
+        }
+        if rows == 3 {
+            let differences = state[..128 * 128]
+                .iter()
+                .zip(&state[128 * 128..2 * 128 * 128])
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            ensure!(differences > 0, "GDN head0-for-head1 control escaped");
+            println!("PASS HIP_GDN_CONTROL wrong_state_head differences={differences}");
+        }
+        if rows == 1 {
+            let norm = pattern(128, 101);
+            let z = pattern(heads * 128, 103);
+            let dn = stream.clone_htod(&norm)?;
+            let dz = stream.clone_htod(&z)?;
+            let gated = ops::GatedRmsInput {
+                x: view(
+                    &dout,
+                    stream,
+                    [1, spec.hv, 128],
+                    [heads as u64 * 128, 128, 1],
+                )?,
+                weight: view(&dn, stream, [128], [1])?,
+                gate: view(&dz, stream, [1, spec.hv, 128], [heads as u64 * 128, 128, 1])?,
+            };
+            for with_norm in [false, true] {
+                stream.memcpy_htod(&initial, &mut ds)?;
+                stream.memcpy_htod(&history, &mut dh)?;
+                let execute_fused = || -> Result<()> {
+                    ensure!(
+                        GdnOps::run_step(
+                            &plan,
+                            stream,
+                            meta,
+                            phase,
+                            Scratch {
+                                ptr: scratch.device_ptr(stream).0,
+                                bytes: ws.bytes,
+                            },
+                            false,
+                            with_norm.then_some(&gated)
+                        )? == with_norm,
+                        "fused GDN gated output contract"
+                    );
+                    Ok(())
+                };
+                execute_fused()?;
+                let fused = stream.clone_dtoh(&dout)?;
+                let fused_state = stream.clone_dtoh(&ds)?;
+                let fused_hist = stream.clone_dtoh(&dh)?;
+                let mut expected = expected.clone();
+                if with_norm {
+                    for (head, values) in expected.as_chunks_mut::<128>().0.iter_mut().enumerate() {
+                        let variance =
+                            values.iter().map(|v| v.to_f64().powi(2)).sum::<f64>() / 128.0;
+                        let inv = 1.0 / (variance + f64::from(spec.rms_eps)).sqrt();
+                        for (d, value) in values.iter_mut().enumerate() {
+                            let normalized = bf16::from_f64(value.to_f64() * inv);
+                            let scaled = bf16::from_f64(normalized.to_f64() * norm[d].to_f64());
+                            let gate = z[head * 128 + d].to_f64();
+                            *value = bf16::from_f64(scaled.to_f64() * gate / (1.0 + (-gate).exp()));
+                        }
+                    }
+                }
+                gate.compare(
+                    &format!("gdn.fused.norm{with_norm}"),
+                    &fused,
+                    &expected,
+                    if with_norm { 4 } else { 1 },
+                    640,
+                )?;
+                gate.check(
+                    "gdn.fused_state",
+                    fused_state.iter().zip(&expected_state).all(|(a, b)| {
+                        a.is_finite() && (f64::from(*a) - b).abs() / (1.0 + b.abs()) <= bound
+                    }),
+                );
+                gate.check("gdn.fused_history", fused_hist == hist);
+                stream.memcpy_htod(&initial, &mut ds)?;
+                stream.memcpy_htod(&history, &mut dh)?;
+                capture(stream, execute_fused)?.launch()?;
+                gate.check(
+                    "gdn.fused_graph_bits",
+                    stream
+                        .clone_dtoh(&dout)?
+                        .iter()
+                        .zip(&fused)
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                        && stream.clone_dtoh(&ds)? == fused_state
+                        && stream.clone_dtoh(&dh)? == fused_hist,
+                );
+            }
+        }
+        println!(
+            "HIP_GDN rows={rows} valid={valid} norm_ratio={norm_ratio:e} state_error={error:e} state_bound={bound:e}"
+        );
+    }
+    println!(
+        "HIP_GDN_SUMMARY cells={} defects={}",
+        gate.cells, gate.defects
+    );
+    ensure!(gate.defects == 0, "GDN defects={}", gate.defects);
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires GPU lease and FF_DENSE_GPU_WINDOW=granted"]
 fn dense_runtime_gpu() -> Result<()> {
@@ -124,6 +585,8 @@ fn dense_runtime_gpu() -> Result<()> {
         );
         if wmma_cells(&info) {
             wmma_gate(&s, &mut gate)?;
+            fp8_encoding_gate(&ctx, &s, &mut gate)?;
+            fp8_channel_gate(&ctx, &s, &mut gate)?;
             tcmqa_gate(&ctx, &s, &c, &mut gate)?;
             markov_gate(&ctx, &s, &mut gate)?;
         } else {
@@ -138,6 +601,612 @@ fn dense_runtime_gpu() -> Result<()> {
         if gate.defects == 0 { "PASS" } else { "DEFECT" }
     );
     ensure!(gate.defects == 0, "dense runtime defects={}", gate.defects);
+    Ok(())
+}
+
+#[cfg(feature = "rocm")]
+fn fp8_channel_gate(
+    ctx: &Arc<CudaContext>,
+    stream: &Arc<CudaStream>,
+    gate: &mut Gate,
+) -> Result<()> {
+    let module = cubin::module(ctx, "fp8_linear")?;
+    for (n, k) in [(263usize, 257usize), (512, 2048), (2048, 512)] {
+        let codes: Vec<u8> = (0..n * k)
+            .map(|i| ((i * 17 % 257) % 127) as u8 | (u8::from(i * 29 % 263 > 131) << 7))
+            .collect();
+        let scales: Vec<_> = (0..n)
+            .map(|i| bf16::from_f32((1 + i * 31 % 263) as f32 / 65536.0))
+            .collect();
+        let input = pattern(33 * k, 19);
+        let reference = fp8_channel_reference(&codes, &scales, &input, k)?;
+        let weights = stream.clone_htod(&codes)?;
+        let scale = stream.clone_htod(&scales)?;
+        let x = stream.clone_htod(&input)?;
+        let wrong: Vec<_> = scales.iter().cycle().skip(1).take(n).copied().collect();
+        let wrong_scale = stream.clone_htod(&wrong)?;
+        let sentinel = bf16::from_bits(0x7fc1);
+        for name in ["fp8_channel_bf16_simt", "fp8_channel_bf16_wmma"] {
+            let function = module.load_function(name)?;
+            let tiled = name.ends_with("wmma");
+            let mut longest = None;
+            for rows in [33usize, 17, 16, 9, 8, 3, 1] {
+                let mut y = stream.clone_htod(&vec![sentinel; rows * n + 16])?;
+                let launch = |y: &mut CudaSlice<bf16>, scales: &CudaSlice<bf16>| unsafe {
+                    stream
+                        .launch_builder(&function)
+                        .arg(&weights)
+                        .arg(scales)
+                        .arg(&x)
+                        .arg(y)
+                        .arg(&(rows as i32))
+                        .arg(&(n as i32))
+                        .arg(&(k as i32))
+                        .launch(LaunchConfig {
+                            grid_dim: if tiled {
+                                (n.div_ceil(64) as u32, rows.div_ceil(16) as u32, 1)
+                            } else {
+                                (n.div_ceil(4) as u32, rows as u32, 1)
+                            },
+                            block_dim: (128, 1, 1),
+                            shared_mem_bytes: 0,
+                        })
+                };
+                launch(&mut y, &scale)?;
+                let eager = stream.clone_dtoh(&y)?;
+                let capture = stream.begin_capture()?;
+                launch(&mut y, &scale)?;
+                let graph = capture.finish()?;
+                graph.launch()?;
+                let replay = stream.clone_dtoh(&y)?;
+                let label = format!("fp8.channel.{name}.M{rows}.W[{n},{k}]");
+                ensure!(
+                    eager[..rows * n].iter().all(|v| v.is_finite()),
+                    "RUNNER_FAIL {label}: nonfinite output"
+                );
+                let errors = eager[..rows * n]
+                    .iter()
+                    .zip(&reference)
+                    .filter(|(a, (value, bound))| (f64::from(a.to_f32()) - value).abs() > *bound)
+                    .count();
+                println!(
+                    "FP8_CHANNEL_REFERENCE name={label} elements={} defects={errors} fp64=true",
+                    rows * n
+                );
+                gate.check(&label, errors == 0);
+                gate.check(
+                    &format!("{label}.graph_identity_guard"),
+                    eager
+                        .iter()
+                        .zip(&replay)
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                        && eager[rows * n..]
+                            .iter()
+                            .all(|v| v.to_bits() == sentinel.to_bits()),
+                );
+                if let Some(previous) = &longest {
+                    let previous: &Vec<bf16> = previous;
+                    gate.check(
+                        &format!("{label}.batch_position_identity"),
+                        eager[..rows * n]
+                            .iter()
+                            .zip(previous)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    );
+                } else {
+                    longest = Some(eager[..rows * n].to_vec());
+                }
+                if rows == 1 {
+                    launch(&mut y, &wrong_scale)?;
+                    let mutant = stream.clone_dtoh(&y)?;
+                    gate.check(
+                        &format!("{label}.scale_index_mutant_rejected"),
+                        mutant[..n]
+                            .iter()
+                            .zip(&reference)
+                            .any(|(a, (value, bound))| {
+                                (f64::from(a.to_f32()) - value).abs() > *bound
+                            }),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "rocm")]
+fn fp8_channel_reference(
+    codes: &[u8],
+    scales: &[bf16],
+    input: &[bf16],
+    k: usize,
+) -> Result<Vec<(f64, f64)>> {
+    ensure!(
+        k > 0 && codes.len() == scales.len() * k && input.len().is_multiple_of(k),
+        "RUNNER_FAIL FP8 reference extents"
+    );
+    let mut reference = Vec::with_capacity(input.len() / k * scales.len());
+    let nu = (k + 6) as f64 * 2f64.powi(-24);
+    for x in input.chunks_exact(k) {
+        for (row, &scale) in codes.chunks_exact(k).zip(scales) {
+            let (value, absolute) = row.iter().zip(x).fold((0.0f64, 0.0f64), |a, (&w, x)| {
+                let product = f64::from(crate::fp8::effective_weight(w, scale).to_f32())
+                    * f64::from(x.to_f32());
+                (a.0 + product, a.1 + product.abs())
+            });
+            let bound = value.abs() / 256.0 + (nu / (1.0 - nu)) * absolute + 2f64.powi(-134);
+            reference.push((value, bound));
+        }
+    }
+    Ok(reference)
+}
+
+#[cfg(feature = "rocm")]
+fn fp8_channel_launch(
+    s: &Arc<CudaStream>,
+    function: (&CudaFunction, bool),
+    weights: (&CudaSlice<u8>, &CudaSlice<bf16>),
+    input: &CudaSlice<bf16>,
+    output: &mut CudaSlice<bf16>,
+    shape: (usize, usize, usize),
+) -> Result<()> {
+    let (rows, n, k) = shape;
+    unsafe {
+        s.launch_builder(function.0)
+            .arg(weights.0)
+            .arg(weights.1)
+            .arg(input)
+            .arg(output)
+            .arg(&(rows as i32))
+            .arg(&(n as i32))
+            .arg(&(k as i32))
+            .launch(LaunchConfig {
+                grid_dim: if function.1 {
+                    (n.div_ceil(64) as u32, rows.div_ceil(16) as u32, 1)
+                } else {
+                    (n.div_ceil(4) as u32, rows as u32, 1)
+                },
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "rocm")]
+fn fp8_quantize(
+    s: &Arc<CudaStream>,
+    function: &CudaFunction,
+    input: &mut CudaSlice<bf16>,
+    rows: usize,
+    width: usize,
+) -> Result<()> {
+    unsafe {
+        s.launch_builder(function)
+            .arg(input)
+            .arg(&(rows as i32))
+            .arg(&(width as i32))
+            .arg(&0u64)
+            .arg(&0u32)
+            .arg(&(rows as u32))
+            .launch(ops::grid(rows, 256))?;
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "rocm")]
+#[ignore = "requires GPU lease, FF_MODEL published per-channel FP8 checkpoint and FF_DENSE_EVIDENCE"]
+fn fp8_published_expert_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_DENSE_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let path = std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL required")?);
+    let spec = crate::model_spec::ModelSpec::read(&path)?;
+    let moe = spec.moe.context("RUNNER_FAIL expert geometry missing")?;
+    ensure!(
+        spec.architecture == crate::model_spec::Architecture::MiniCpmV47
+            && spec.linear_format == crate::model_spec::LinearFormat::Fp8E4m3Channel
+            && spec.hidden == 2048
+            && moe.expert_intermediate == 512
+            && moe.experts == 256
+            && moe.experts_per_tok == 8,
+        "RUNNER_FAIL published MiniCPM per-channel geometry"
+    );
+    let mapped = crate::checkpoint::MappedCheckpoint::open(&path)?;
+    let views = mapped.views()?;
+    let ctx = CudaContext::new(0)?;
+    ctx.require_wmma()?;
+    let s = ctx.new_stream()?;
+    let module = cubin::module(&ctx, "fp8_linear")?;
+    let quantize = module.load_function("e4m3_fake_quant_bf16")?;
+    let act = cubin::module(&ctx, "act")?.load_function("silu_mul_split")?;
+    let mut weights = Vec::new();
+    for (role, n, k) in [
+        ("gate", 512usize, 2048usize),
+        ("up", 512, 2048),
+        ("down", 2048, 512),
+    ] {
+        let name = format!("model.language_model.layers.0.mlp.experts.0.{role}_proj.weight");
+        let scale_name = format!("{name}_scale");
+        let w = views[&mapped.index.weight_map[&name]].tensor(&name)?;
+        let scale = views[&mapped.index.weight_map[&scale_name]].tensor(&scale_name)?;
+        ensure!(
+            w.dtype() == safetensors::Dtype::F8_E4M3
+                && w.shape() == [n, k]
+                && scale.dtype() == safetensors::Dtype::BF16
+                && scale.shape() == [n, 1],
+            "RUNNER_FAIL native FP8 projection layout {name}"
+        );
+        let host_scale = scale
+            .data()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&b| bf16::from_bits(u16::from_le_bytes(b)))
+            .collect::<Vec<_>>();
+        ensure!(
+            w.data().iter().all(|v| v & 127 != 127)
+                && host_scale.iter().all(|v| v.is_finite() && *v > bf16::ZERO),
+            "RUNNER_FAIL nonfinite published projection {name}"
+        );
+        weights.push((
+            w.data(),
+            host_scale.clone(),
+            s.clone_htod(w.data())?,
+            s.clone_htod(&host_scale)?,
+        ));
+    }
+    let device_weight_bytes: usize = weights.iter().map(|w| w.2.len() + 2 * w.3.len()).sum();
+    ensure!(
+        device_weight_bytes == 3 * 512 * 2048 + 2 * (512 + 512 + 2048),
+        "RUNNER_FAIL native storage footprint"
+    );
+    let channel_ops = linear::Fp8Ops::new(&ctx)?;
+    let mut gate = Gate::default();
+    let sentinel = bf16::from_bits(0x7fc1);
+    for name in [
+        "fp8_channel_bf16_simt",
+        "fp8_channel_bf16_wmma",
+        "bound_channel",
+    ] {
+        let function = if name == "bound_channel" {
+            None
+        } else {
+            Some(module.load_function(name)?)
+        };
+        let tiled = name.ends_with("wmma");
+        let mut longest = None;
+        for rows in [33usize, 17, 16, 9, 8, 3, 1] {
+            let host_input = pattern(rows * 2048, 23);
+            let original = s.clone_htod(&host_input)?;
+            let mut input = s.alloc_zeros::<bf16>(rows * 2048)?;
+            let mut g = s.clone_htod(&vec![sentinel; rows * 512 + 16])?;
+            let mut u = s.clone_htod(&vec![sentinel; rows * 512 + 16])?;
+            let mut hidden = s.clone_htod(&vec![sentinel; rows * 512 + 16])?;
+            let mut hidden_before_quantize = s.alloc_zeros::<bf16>(rows * 512)?;
+            let mut output = s.clone_htod(&vec![sentinel; rows * 2048 + 16])?;
+            let input_view = contracts::view(&input, &s, 0, [rows as u32, 2048], [2048, 1])?;
+            let hidden_view = contracts::view(&hidden, &s, 0, [rows as u32, 512], [512, 1])?;
+            let bound = if name == "bound_channel" {
+                let bind = |stage: usize, x, y, n: u32, k: u32| {
+                    channel_ops.bind_channel(
+                        linear::LinearWeightRef::Fp8 {
+                            codes: contracts::view(
+                                &weights[stage].2,
+                                &s,
+                                0,
+                                [n, k],
+                                [u64::from(k), 1],
+                            )?,
+                            scale: contracts::view(&weights[stage].3, &s, 0, [n, 1], [1, 1])?,
+                            layout: crate::fp8::Fp8ScaleLayout::PerChannel,
+                        },
+                        x,
+                        &contracts::TensorMut(contracts::view(
+                            y,
+                            &s,
+                            0,
+                            [rows as u32, n],
+                            [u64::from(n), 1],
+                        )?),
+                    )
+                };
+                Some([
+                    bind(0, input_view, &g, 512, 2048)?,
+                    bind(1, input_view, &u, 512, 2048)?,
+                    bind(2, hidden_view, &output, 2048, 512)?,
+                ])
+            } else {
+                None
+            };
+            let mut run = || -> Result<()> {
+                s.memcpy_dtod(&original, &mut input)?;
+                if bound.is_some() {
+                    channel_ops.fake_quant(&s, &mut contracts::TensorMut(input_view), None)?;
+                } else {
+                    fp8_quantize(&s, &quantize, &mut input, rows, 2048)?;
+                }
+                if let Some(bound) = &bound {
+                    bound[0].run(&s)
+                } else {
+                    fp8_channel_launch(
+                        &s,
+                        (
+                            function
+                                .as_ref()
+                                .context("direct projection function missing")?,
+                            tiled,
+                        ),
+                        (&weights[0].2, &weights[0].3),
+                        &input,
+                        &mut g,
+                        (rows, 512, 2048),
+                    )
+                }?;
+                if let Some(bound) = &bound {
+                    bound[1].run(&s)
+                } else {
+                    fp8_channel_launch(
+                        &s,
+                        (
+                            function
+                                .as_ref()
+                                .context("direct projection function missing")?,
+                            tiled,
+                        ),
+                        (&weights[1].2, &weights[1].3),
+                        &input,
+                        &mut u,
+                        (rows, 512, 2048),
+                    )
+                }?;
+                unsafe {
+                    s.launch_builder(&act)
+                        .arg(&g)
+                        .arg(&u)
+                        .arg(&mut hidden)
+                        .arg(&((rows * 512) as i32))
+                        .arg(&0i32)
+                        .launch(ops::flat(rows * 512))?;
+                }
+                s.memcpy_dtod(&hidden.slice(..rows * 512), &mut hidden_before_quantize)?;
+                if bound.is_some() {
+                    channel_ops.fake_quant(&s, &mut contracts::TensorMut(hidden_view), None)?;
+                } else {
+                    fp8_quantize(&s, &quantize, &mut hidden, rows, 512)?;
+                }
+                if let Some(bound) = &bound {
+                    bound[2].run(&s)
+                } else {
+                    fp8_channel_launch(
+                        &s,
+                        (
+                            function
+                                .as_ref()
+                                .context("direct projection function missing")?,
+                            tiled,
+                        ),
+                        (&weights[2].2, &weights[2].3),
+                        &hidden,
+                        &mut output,
+                        (rows, 2048, 512),
+                    )
+                }
+            };
+            run()?;
+            let capture = s.begin_capture()?;
+            run()?;
+            let graph = capture.finish()?;
+            let eager = [&input, &g, &u, &hidden, &output, &hidden_before_quantize]
+                .map(|v| s.clone_dtoh(v))
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+            let label = format!("fp8.expert0.{name}.M{rows}");
+            for repeat in 0..2 {
+                graph.launch()?;
+                for (buffer, expected) in
+                    [&input, &g, &u, &hidden, &output, &hidden_before_quantize]
+                        .into_iter()
+                        .zip(&eager)
+                {
+                    let actual = s.clone_dtoh(buffer)?;
+                    gate.check(
+                        &format!("{label}.graph{repeat}"),
+                        actual
+                            .iter()
+                            .zip(expected)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    );
+                }
+            }
+            for (stage, input_index, output_index, k) in
+                [(0, 0, 1, 2048), (1, 0, 2, 2048), (2, 3, 4, 512)]
+            {
+                let reference = fp8_channel_reference(
+                    weights[stage].0,
+                    &weights[stage].1,
+                    &eager[input_index][..rows * k],
+                    k,
+                )?;
+                let actual = &eager[output_index][..reference.len()];
+                ensure!(
+                    actual.iter().all(|v| v.is_finite()),
+                    "RUNNER_FAIL {label} nonfinite stage{stage}"
+                );
+                let errors = actual
+                    .iter()
+                    .zip(&reference)
+                    .filter(|(a, (value, bound))| (f64::from(a.to_f32()) - value).abs() > *bound)
+                    .count();
+                let first = actual
+                    .iter()
+                    .zip(&reference)
+                    .enumerate()
+                    .find(|(_, (a, (v, b)))| (f64::from(a.to_f32()) - v).abs() > *b);
+                if let Some((index, (value, (expected, bound)))) = first {
+                    println!(
+                        "FP8_EXPERT_ERROR name={label}.stage{stage} count={errors} first={index} actual={} expected={expected:e} bound={bound:e}",
+                        value.to_f32()
+                    );
+                }
+                gate.check(&format!("{label}.stage{stage}.fp64"), errors == 0);
+            }
+            let activated = eager[1][..rows * 512]
+                .iter()
+                .zip(&eager[2])
+                .map(|(g, u)| {
+                    let v = g.to_f32();
+                    let silu = bf16::from_f32(v / (1.0 + (-v).exp()));
+                    bf16::from_f32(silu.to_f32() * u.to_f32())
+                })
+                .collect::<Vec<_>>();
+            gate.compare(&format!("{label}.swiglu"), &eager[5], &activated, 2, 1)?;
+            for (which, before, after, width) in [
+                ("input", host_input, &eager[0], 2048usize),
+                ("down", eager[5].clone(), &eager[3], 512),
+            ] {
+                let reference = before
+                    .chunks_exact(width)
+                    .map(crate::fp8::fake_quant_reference)
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .flat_map(|(_, _, v)| v)
+                    .collect::<Vec<_>>();
+                gate.check(
+                    &format!("{label}.quantize.{which}.bits"),
+                    reference.len() == rows * width
+                        && reference
+                            .iter()
+                            .zip(after)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                );
+            }
+            gate.check(
+                &format!("{label}.guards"),
+                [(1, 512), (2, 512), (3, 512), (4, 2048)]
+                    .iter()
+                    .all(|&(i, width)| {
+                        eager[i][rows * width..]
+                            .iter()
+                            .all(|v| v.to_bits() == sentinel.to_bits())
+                    }),
+            );
+            if let Some(previous) = &longest {
+                let previous: &Vec<bf16> = previous;
+                gate.check(
+                    &format!("{label}.batch_identity"),
+                    eager[4][..rows * 2048]
+                        .iter()
+                        .zip(previous)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                );
+            } else {
+                longest = Some(eager[4][..rows * 2048].to_vec());
+            }
+        }
+    }
+    println!(
+        "FP8_PUBLISHED_EXPERT cells={} defects={} native_weight_bytes={device_weight_bytes} gpu_weight_materialization_bytes=0",
+        gate.cells, gate.defects
+    );
+    ensure!(
+        gate.defects == 0,
+        "published expert defects={}",
+        gate.defects
+    );
+    Ok(())
+}
+
+#[cfg(feature = "rocm")]
+fn fp8_encoding_gate(
+    ctx: &Arc<CudaContext>,
+    stream: &Arc<CudaStream>,
+    gate: &mut Gate,
+) -> Result<()> {
+    let module = cubin::module(ctx, "fp8_linear")?;
+    let decode = module.load_function("fp8_dequant_bf16_per_channel")?;
+    let codes = stream.clone_htod(&(0..=255u8).collect::<Vec<_>>())?;
+    let scales = stream.clone_htod(&vec![bf16::ONE; 256])?;
+    let mut decoded = stream.alloc_zeros::<bf16>(256)?;
+    unsafe {
+        stream
+            .launch_builder(&decode)
+            .arg(&codes)
+            .arg(&scales)
+            .arg(&mut decoded)
+            .arg(&256i32)
+            .arg(&1i32)
+            .launch(LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    let actual = stream.clone_dtoh(&decoded)?;
+    for (code, value) in actual.into_iter().enumerate() {
+        let expected = bf16::from_f32(crate::fp8::decode_e4m3(code as u8));
+        let equal = if expected.is_nan() {
+            value.is_nan() && value.is_sign_negative() == expected.is_sign_negative()
+        } else {
+            value.to_bits() == expected.to_bits()
+        };
+        gate.check(&format!("fp8.decode.code{code:02x}"), equal);
+    }
+
+    let width = 269usize;
+    let mut values = vec![bf16::ZERO; 4 * width];
+    for code in 0..126u8 {
+        let midpoint = 0.5 * (crate::fp8::decode_e4m3(code) + crate::fp8::decode_e4m3(code + 1));
+        values[2 * usize::from(code)] = bf16::from_f32(midpoint);
+        values[2 * usize::from(code) + 1] = bf16::from_f32(-midpoint);
+    }
+    values[252] = bf16::from_f32(448.0);
+    values[253] = bf16::from_f32(-448.0);
+    values[254] = bf16::NEG_ZERO;
+    for i in 0..width {
+        values[2 * width + i] = bf16::from_bits(1 + (i % 127) as u16);
+        values[3 * width + i] = bf16::from_f32(
+            (((i * 17) % 257) as f32 - 128.0) / 256.0 + (((i * 29) % 263) as f32 - 131.0) / 512.0,
+        );
+    }
+    let expected = values
+        .chunks_exact(width)
+        .map(crate::fp8::fake_quant_reference)
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flat_map(|(_, _, row)| row)
+        .collect::<Vec<_>>();
+    let mut input = stream.clone_htod(&values)?;
+    let quantize = module.load_function("e4m3_fake_quant_bf16")?;
+    unsafe {
+        stream
+            .launch_builder(&quantize)
+            .arg(&mut input)
+            .arg(&4i32)
+            .arg(&(width as i32))
+            .arg(&0u64)
+            .arg(&0u32)
+            .arg(&4u32)
+            .launch(LaunchConfig {
+                grid_dim: (4, 1, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    let actual = stream.clone_dtoh(&input)?;
+    for row in 0..4 {
+        let range = row * width..(row + 1) * width;
+        gate.check(
+            &format!("fp8.quantize.row{row}.rne_zero_subnormal"),
+            actual[range.clone()]
+                .iter()
+                .zip(&expected[range])
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+        );
+    }
     Ok(())
 }
 
@@ -334,6 +1403,37 @@ fn copy_gate(ctx: &Arc<CudaContext>, s: &Arc<CudaStream>, gate: &mut Gate) -> Re
         drop(pending);
         word.handoff(&upload)?;
         gate.check("copy.handoff_owner", Arc::ptr_eq(word.stream(), &upload));
+        ctx.record_err(Err(anyhow::anyhow!("planted resource failure")));
+        gate.check(
+            "context.deferred_error_propagates",
+            ctx.check_err().is_err(),
+        );
+        gate.check("context.deferred_error_consumed", ctx.check_err().is_ok());
+        let table: Vec<i32> = (0..129).flat_map(|p| [p; 3]).collect();
+        let table = s.clone_htod(&table)?;
+        let metadata = s.clone_htod(&[23i32, 33, 56, 129, 1, 0, 0, 0])?;
+        let mut active = s.clone_htod(&[-7i32; 37 * 3 + 7])?;
+        let gather = cubin::module(ctx, "q38_vision_io")?.load_function("q38_text_positions")?;
+        unsafe {
+            s.launch_builder(&gather)
+                .arg(&table)
+                .arg(&mut active)
+                .arg(&metadata)
+                .arg(&37u32)
+                .launch(ops::grid(1, 256))?;
+        }
+        let positions = s.clone_dtoh(&active)?;
+        gate.check(
+            "positions.text_prefix",
+            positions[..33 * 3]
+                .iter()
+                .copied()
+                .eq((23..56).flat_map(|p| [p; 3])),
+        );
+        gate.check(
+            "positions.text_tail_guards",
+            positions[33 * 3..].iter().all(|&p| p == -7),
+        );
     }
     let mut pinned = copy::pinned_zeros::<u8>(ctx, 96)?;
     copy::dtoh_bytes(s, &source, 16, &mut pinned, 8, 64)?;
@@ -373,6 +1473,83 @@ fn copy_gate(ctx: &Arc<CudaContext>, s: &Arc<CudaStream>, gate: &mut Gate) -> Re
             },
         )
         .is_err(),
+    );
+    let mut raw_input = copy::pinned_zeros::<u32>(ctx, 263)?;
+    for (i, value) in raw_input.as_mut_slice()?.iter_mut().enumerate() {
+        *value = ((i * 17 % 251) as u32) << 16 | (i * 29 % 257) as u32;
+    }
+    let mut raw_output = copy::pinned_zeros::<u32>(ctx, 263)?;
+    let raw_source = s.clone_htod(&[0xa5a5_a5a5u32; 269])?;
+    let raw_target = s.clone_htod(&[0x5a5a_5a5au32; 269])?;
+    let (src, _src) = raw_source.device_ptr(s);
+    let (dst, _dst) = raw_target.device_ptr(s);
+    upload.wait(&s.record_event(None)?)?;
+    {
+        #[cfg(feature = "cuda")]
+        use cudarc::driver::HostSlice;
+        let (input, _read) = unsafe { raw_input.stream_synced_slice(&upload) };
+        // Both allocations are ordered after their initialization and retained through the final fence.
+        unsafe { copy::htod_async(src + 12, input, upload.as_ref())? };
+    }
+    s.wait(&upload.record_event(None)?)?;
+    unsafe {
+        copy::dtod_raw(dst + 12, src + 12, 263 * 4, s.as_ref())?;
+        copy::memset_bytes(dst + 12 + 7 * 4, 0xab, 7, s.as_ref())?;
+        copy::memset_words(dst + 12 + 19 * 4, 0x1122_3344, 5, s.as_ref())?;
+    }
+    let completed = s.record_event(None)?;
+    upload.wait(&completed)?;
+    {
+        #[cfg(feature = "cuda")]
+        use cudarc::driver::HostSlice;
+        let (output, _write) = unsafe { raw_output.stream_synced_mut_slice(&upload) };
+        // The read follows the compute event and the pinned output is unread until synchronization.
+        unsafe { copy::dtoh_async(output, dst + 12, upload.as_ref())? };
+    }
+    #[cfg(feature = "cuda")]
+    upload.synchronize()?;
+    #[cfg(feature = "rocm")]
+    let syncs_before = ctx
+        .device_synchronizations
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let mut raw_expected = raw_input
+        .as_slice()?
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    raw_expected[28..35].fill(0xab);
+    raw_expected[76..96].copy_from_slice(&0x1122_3344u32.to_le_bytes().repeat(5));
+    let raw_actual = raw_output
+        .as_slice()?
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    gate.check("copy.raw_fenced_mailbox", raw_actual == raw_expected);
+    gate.check("copy.raw_event_complete", completed.try_is_complete()?);
+    #[cfg(feature = "rocm")]
+    {
+        raw_output.as_mut_slice()?;
+        gate.check(
+            "copy.pinned_access_buffer_event_only",
+            ctx.device_synchronizations
+                .load(std::sync::atomic::Ordering::Relaxed)
+                == syncs_before,
+        );
+    }
+    raw_expected[76] ^= 1;
+    gate.check("copy.raw_wrong_word_control", raw_actual != raw_expected);
+    let guarded = s.clone_dtoh(&raw_target)?;
+    gate.check(
+        "copy.raw_guards",
+        guarded[..3]
+            .iter()
+            .chain(&guarded[266..])
+            .all(|&v| v == 0x5a5a_5a5a),
+    );
+    #[cfg(feature = "rocm")]
+    gate.check(
+        "copy.raw_safe_api_still_rejects_foreign_owner",
+        upload.clone_dtoh(&raw_source).is_err(),
     );
     let model = crate::model_spec::ModelSpec::from_llama(&config()?)?;
     let mut state = state::StateStore::new(&model, 129, s)?;
@@ -1240,6 +2417,30 @@ fn blas_gate(s: &Arc<CudaStream>, gate: &mut Gate) -> Result<()> {
                 serde_json::to_string(&choice)?
             );
             rebound.linear_with_bias(shape, db.as_deref(), &dw, &dx, &mut dy)?;
+            if !bias {
+                let original = s.clone_dtoh(&dy)?;
+                let weight =
+                    contracts::view(&dw, s, 0, [output as u32, input as u32], [input as u64, 1])?;
+                let x = contracts::view(&dx, s, 0, [rows as u32, input as u32], [input as u64, 1])?;
+                let mut y = contracts::TensorMut(contracts::view(
+                    &dy,
+                    s,
+                    0,
+                    [rows as u32, output as u32],
+                    [output as u64, 1],
+                )?);
+                rebound.linear_typed_bound(
+                    crate::op_contract::ExecutionPhase::Prefill,
+                    linear::LinearWeightRef::Bf16(weight),
+                    x,
+                    &mut y,
+                    0,
+                )?;
+                gate.check(
+                    "blas.typed_library_identity",
+                    original == s.clone_dtoh(&dy)?,
+                );
+            }
             let reference = |bias: Option<&[bf16]>| -> Vec<bf16> {
                 (0..rows * output)
                     .map(|i| {

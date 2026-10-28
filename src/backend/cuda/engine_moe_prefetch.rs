@@ -72,16 +72,12 @@ impl ReadAhead {
                     for (previous, copy) in copied.iter_mut().zip(&request.reader.copied) {
                         *previous = copy.is_some();
                     }
-                    let result = request
-                        .reader
-                        .context
-                        .bind_to_thread()
-                        .map_err(anyhow::Error::from)
-                        .and_then(|()| {
-                            request
-                                .reader
-                                .read(request.layer, request.expert, &request.catalogue)
-                        });
+                    let result = (|| {
+                        request.reader.context.bind_to_thread()?;
+                        request
+                            .reader
+                            .read(request.layer, request.expert, &request.catalogue)
+                    })();
                     request.reclaimed.clear();
                     for (slot, &was_copied) in copied.iter().enumerate() {
                         if was_copied && request.reader.copied[slot].is_none() {

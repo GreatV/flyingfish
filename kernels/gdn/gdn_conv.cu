@@ -6,8 +6,7 @@
 // history[] is read-only here and written by gdn_conv_hist_update. Taps x[r-3..r] are
 // read directly, one load per tap; conv weights are per-thread registers.
 #include "../q38_contract.cuh"
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
+#include "../gpu_compat.cuh"
 #include <stdint.h>
 
 #ifndef GDN_HEADS
@@ -77,14 +76,14 @@ __device__ __forceinline__ void gdn_conv_impl(
                 float sum = source * source;
                 #pragma unroll
                 for (int delta = 16; delta > 0; delta >>= 1)
-                    sum += __shfl_down_sync(0xffffffff, sum, delta);
+                    sum += __shfl_down_sync(FF_WARP_MASK, sum, delta);
                 if (lane == 0) sums[group][warp] = sum;
                 __syncthreads();
                 if (warp == 0) {
                     sum = lane < 4 ? sums[group][lane] : 0.0f;
                     #pragma unroll
                     for (int delta = 16; delta > 0; delta >>= 1)
-                        sum += __shfl_down_sync(0xffffffff, sum, delta);
+                        sum += __shfl_down_sync(FF_WARP_MASK, sum, delta);
                     if (lane == 0) sums[group][0] = rsqrtf(sum + l2_eps);
                 }
                 __syncthreads();

@@ -368,8 +368,8 @@ impl Blas {
                     "Lt identity gate".into(),
                 )),
             )?;
-            let w = stream.clone_htod(&super::calibrate::random(output * input, 13))?;
-            let x = stream.clone_htod(&super::calibrate::random(8 * input, 17))?;
+            let w = stream.clone_htod(&super::random(output * input, 13))?;
+            let x = stream.clone_htod(&super::random(8 * input, 17))?;
             blas.calibrate_shape(&w, &x.slice(..), shape)?;
             let candidates = blas.candidates(shape)?;
             let Some(other) = candidates
@@ -896,7 +896,7 @@ impl Blas {
     pub(crate) fn enable_fp8(&mut self, ctx: &Arc<cudarc::driver::CudaContext>) -> Result<()> {
         ensure!(self.fp8.is_none(), "FP8 operators already bound");
         let fp8 = match self.invariant_rows {
-            0 => super::linear::Fp8Ops::new(ctx)?,
+            0 => crate::backend::gpu::linear::Fp8Ops::new(ctx)?,
             rows => super::linear::Fp8Ops::for_rows(ctx, rows)?,
         };
         fp8.require_rows(*self.direct_fp8_rows().end())?;
@@ -1240,9 +1240,8 @@ mod tests {
             )?;
             cold.prepare(128, output, shape.input)?;
             assert!(cold.skinny_plans.borrow().is_empty());
-            let w =
-                stream.clone_htod(&super::super::calibrate::random(output * shape.input, 13))?;
-            let x = stream.clone_htod(&super::super::calibrate::random(shape.input, 17))?;
+            let w = stream.clone_htod(&super::super::random(output * shape.input, 13))?;
+            let x = stream.clone_htod(&super::super::random(shape.input, 17))?;
             cold.calibrate_shape(&w, &x.slice(..), shape)?;
             let mut y = stream.alloc_zeros::<bf16>(output)?;
             cold.skinny(&w, &x.slice(..), &mut y.slice_mut(..), shape)?;

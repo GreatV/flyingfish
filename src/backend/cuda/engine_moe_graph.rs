@@ -18,13 +18,19 @@ fn record(
         engine.capture_fail_stage != Some(CaptureFault::Begin),
         "injected capture begin failure"
     );
+    #[cfg(feature = "cuda")]
     stream
         .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
         .context("cuStreamBeginCapture")?;
+    #[cfg(feature = "rocm")]
+    let capture = stream.begin_capture()?;
     let launched = launch(engine);
+    #[cfg(feature = "cuda")]
     let captured = stream
         .end_capture(sys::CUgraphInstantiate_flags(0))
         .context("cuStreamEndCapture");
+    #[cfg(feature = "rocm")]
+    let captured = capture.finish().map(Some);
     launched?;
     #[cfg(test)]
     ensure!(
@@ -331,7 +337,7 @@ impl Engine {
         Ok(first)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(in crate::backend::cuda::engine) fn clear_moe_graphs(&mut self) {
         self.graph = None;
         self.graphs.clear();

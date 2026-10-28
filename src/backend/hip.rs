@@ -13,6 +13,15 @@ use std::{
 
 type Handle = *mut c_void;
 
+const HIP_STREAM_NON_BLOCKING: u32 = 1;
+const HIP_EVENT_DISABLE_TIMING: u32 = 2;
+const HIP_STREAM_CAPTURE_THREAD_LOCAL: i32 = 1;
+const HIP_ERROR_NOT_READY: i32 = 600;
+const HIP_FUNC_SHARED_SIZE_BYTES: i32 = 1;
+pub(crate) const HIP_MEMCPY_HOST_TO_DEVICE: i32 = 1;
+pub(crate) const HIP_MEMCPY_DEVICE_TO_HOST: i32 = 2;
+pub(crate) const HIP_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
+
 unsafe extern "C" {
     fn hipInit(flags: u32) -> i32;
     fn hipSetDevice(device: i32) -> i32;
@@ -41,11 +50,14 @@ unsafe extern "C" {
     fn hipEventDestroy(event: Handle) -> i32;
     fn hipEventRecord(event: Handle, stream: Handle) -> i32;
     fn hipEventSynchronize(event: Handle) -> i32;
+    fn hipEventQuery(event: Handle) -> i32;
     fn hipEventElapsedTime(ms: *mut f32, start: Handle, end: Handle) -> i32;
     fn hipMalloc(ptr: *mut Handle, bytes: usize) -> i32;
     fn hipFree(ptr: Handle) -> i32;
     fn hipHostMalloc(ptr: *mut Handle, bytes: usize, flags: u32) -> i32;
     fn hipHostFree(ptr: Handle) -> i32;
+    fn hipHostRegister(ptr: Handle, bytes: usize, flags: u32) -> i32;
+    fn hipHostUnregister(ptr: Handle) -> i32;
     fn hipMemcpyAsync(
         dst: Handle,
         src: *const c_void,
@@ -91,10 +103,32 @@ unsafe extern "C" {
     fn ff_hip_device_properties(device: i32, output: *mut Properties) -> i32;
 }
 
+#[derive(Debug)]
+pub(crate) struct RuntimeError {
+    pub status: i32,
+    operation: String,
+    message: String,
+}
+impl std::fmt::Display for RuntimeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: HIP status {}: {}",
+            self.operation, self.status, self.message
+        )
+    }
+}
+impl std::error::Error for RuntimeError {}
+
 pub(super) fn check(status: i32, operation: &str) -> Result<()> {
     if status != 0 {
         let text = unsafe { CStr::from_ptr(hipGetErrorString(status)) }.to_string_lossy();
-        anyhow::bail!("{operation}: HIP status {status}: {text}");
+        return Err(RuntimeError {
+            status,
+            operation: operation.into(),
+            message: text.into_owned(),
+        }
+        .into());
     }
     Ok(())
 }
@@ -123,12 +157,18 @@ pub struct Properties {
     pub cooperative: i32,
     pub driver_version: i32,
     pub runtime_version: i32,
+    pub max_grid_y: i32,
+    pub async_engines: i32,
+    pub host_register_supported: i32,
 }
 
 pub struct Context {
     ordinal: usize,
     pub properties: Properties,
     architecture: String,
+    deferred_error: Mutex<Option<String>>,
+    #[cfg(test)]
+    pub(crate) device_synchronizations: std::sync::atomic::AtomicUsize,
 }
 
 impl Context {
@@ -192,13 +232,17 @@ impl Context {
                 && properties.unit_shared_bytes > 0
                 && properties.l2_bytes >= 0
                 && properties.memory_clock_khz > 0
-                && properties.memory_bus_bits > 0,
+                && properties.memory_bus_bits > 0
+                && properties.max_grid_y > 0,
             "invalid HIP device resource attributes"
         );
         Ok(Arc::new(Self {
             ordinal,
             properties,
             architecture,
+            deferred_error: Mutex::new(None),
+            #[cfg(test)]
+            device_synchronizations: std::sync::atomic::AtomicUsize::new(0),
         }))
     }
     pub fn architecture(&self) -> &str {
@@ -223,8 +267,33 @@ impl Context {
         unsafe { check(hipSetDevice(self.ordinal as i32), "hipSetDevice") }
     }
     pub fn synchronize(&self) -> Result<()> {
+        #[cfg(test)]
+        self.device_synchronizations.fetch_add(1, Ordering::Relaxed);
         self.bind_to_thread()?;
         unsafe { check(hipDeviceSynchronize(), "hipDeviceSynchronize") }
+    }
+    pub(crate) fn record_err(&self, result: Result<()>) {
+        if let Err(error) = result {
+            eprintln!("HIP deferred resource error: {error:#}");
+            let mut deferred = self
+                .deferred_error
+                .lock()
+                .expect("HIP deferred error mutex poisoned");
+            if deferred.is_none() {
+                *deferred = Some(format!("{error:#}"));
+            }
+        }
+    }
+    pub(crate) fn check_err(&self) -> Result<()> {
+        if let Some(error) = self
+            .deferred_error
+            .lock()
+            .expect("HIP deferred error mutex poisoned")
+            .take()
+        {
+            anyhow::bail!("HIP deferred resource error: {error}");
+        }
+        Ok(())
     }
     pub fn mem_get_info(&self) -> Result<(usize, usize)> {
         self.bind_to_thread()?;
@@ -234,12 +303,36 @@ impl Context {
         }
         Ok((free, total))
     }
+    /// # Safety
+    /// The host span must remain live and exclusively registered until unregister completes.
+    pub unsafe fn register_host(&self, address: u64, bytes: usize, portable: bool) -> Result<()> {
+        ensure!(
+            address != 0 && bytes > 0,
+            "HIP host registration requires a nonempty span"
+        );
+        address
+            .checked_add(bytes as u64)
+            .context("HIP host registration extent overflow")?;
+        self.bind_to_thread()?;
+        unsafe {
+            check(
+                hipHostRegister(address as Handle, bytes, u32::from(portable)),
+                "hipHostRegister",
+            )
+        }
+    }
+    /// # Safety
+    /// Address must name a live registration with all device accesses completed.
+    pub unsafe fn unregister_host(&self, address: u64) -> Result<()> {
+        self.bind_to_thread()?;
+        unsafe { check(hipHostUnregister(address as Handle), "hipHostUnregister") }
+    }
     pub fn new_stream(self: &Arc<Self>) -> Result<Arc<Stream>> {
         self.bind_to_thread()?;
         let mut handle = std::ptr::null_mut();
         unsafe {
             check(
-                hipStreamCreateWithFlags(&mut handle, 1),
+                hipStreamCreateWithFlags(&mut handle, HIP_STREAM_NON_BLOCKING),
                 "hipStreamCreateWithFlags",
             )?;
         }
@@ -275,11 +368,13 @@ impl Context {
         self.bind_to_thread()?;
         let bytes = extent::<T>(len)?;
         ensure!(bytes > 0, "empty HIP pinned allocation");
+        let completed = self.new_event(Some(HIP_EVENT_DISABLE_TIMING))?;
         let mut ptr = std::ptr::null_mut();
         unsafe {
             check(hipHostMalloc(&mut ptr, bytes, flags), "hipHostMalloc")?;
         }
         Ok(PinnedHostSlice {
+            completed,
             ptr: ptr as usize,
             len,
             context: self.clone(),
@@ -375,7 +470,7 @@ impl Stream {
                 .expect("HIP capture resources poisoned")
                 .extend(resources.iter().filter_map(Weak::upgrade));
         }
-        let status = unsafe { hipStreamBeginCapture(self.raw(), 1) };
+        let status = unsafe { hipStreamBeginCapture(self.raw(), HIP_STREAM_CAPTURE_THREAD_LOCAL) };
         if status != 0 {
             self.capturing.store(false, Ordering::Release);
             let resources = std::mem::take(
@@ -469,7 +564,12 @@ impl Stream {
         output.check_stream(self)?;
         let (ptr, _guard) = output.device_ptr_mut(self);
         unsafe {
-            self.copy_raw(ptr, input.as_ptr() as u64, extent::<T>(input.len())?, 1)?;
+            self.copy_raw(
+                ptr,
+                input.as_ptr() as u64,
+                extent::<T>(input.len())?,
+                HIP_MEMCPY_HOST_TO_DEVICE,
+            )?;
         }
         self.synchronize()
     }
@@ -486,7 +586,7 @@ impl Stream {
                 output.as_mut_ptr() as u64,
                 ptr,
                 extent::<T>(input.len())?,
-                2,
+                HIP_MEMCPY_DEVICE_TO_HOST,
             )?;
         }
         self.synchronize()?;
@@ -512,7 +612,7 @@ impl Stream {
                 output.as_mut_ptr() as u64,
                 ptr,
                 extent::<T>(input.len())?,
-                2,
+                HIP_MEMCPY_DEVICE_TO_HOST,
             )?;
         }
         self.synchronize()
@@ -527,7 +627,14 @@ impl Stream {
         output.check_stream(self)?;
         let (src, _read) = input.device_ptr(self);
         let (dst, _write) = output.device_ptr_mut(self);
-        unsafe { self.copy_raw(dst, src, extent::<T>(input.len())?, 3) }
+        unsafe {
+            self.copy_raw(
+                dst,
+                src,
+                extent::<T>(input.len())?,
+                HIP_MEMCPY_DEVICE_TO_DEVICE,
+            )
+        }
     }
     pub fn memset_zeros<T: DeviceRepr + ValidAsZeroBits>(
         self: &Arc<Self>,
@@ -602,6 +709,17 @@ impl Stream {
             check(
                 hipMemsetD32Async(ptr as Handle, value as i32, count, self.raw()),
                 "hipMemsetD32Async",
+            )
+        }
+    }
+    /// # Safety
+    /// `ptr` must address `bytes` writable bytes ordered on this stream.
+    pub(crate) unsafe fn memset_bytes(&self, ptr: u64, value: u8, bytes: usize) -> Result<()> {
+        self.context.bind_to_thread()?;
+        unsafe {
+            check(
+                hipMemsetAsync(ptr as Handle, i32::from(value), bytes, self.raw()),
+                "hipMemsetAsync",
             )
         }
     }
@@ -733,7 +851,23 @@ pub struct Event {
     handle: usize,
     context: Arc<Context>,
 }
+impl std::fmt::Debug for Event {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Event")
+            .field("handle", &self.handle)
+            .finish()
+    }
+}
 impl Event {
+    pub(crate) fn try_is_complete(&self) -> Result<bool> {
+        self.context.bind_to_thread()?;
+        let status = unsafe { hipEventQuery(self.handle as Handle) };
+        if status == HIP_ERROR_NOT_READY {
+            return Ok(false);
+        }
+        check(status, "hipEventQuery")?;
+        Ok(true)
+    }
     pub fn record(&self, stream: &Arc<Stream>) -> Result<()> {
         stream.require_eager("event record")?;
         ensure!(
@@ -790,7 +924,7 @@ pub unsafe trait ValidAsZeroBits: DeviceRepr {}
 macro_rules! plain {
     ($($t:ty),*) => { $(unsafe impl DeviceRepr for $t {} unsafe impl ValidAsZeroBits for $t {})* };
 }
-plain!(u8, u16, u32, u64, i32, f32, half::bf16);
+plain!(u8, u16, u32, u64, i32, i64, f32, half::bf16);
 
 fn extent<T>(len: usize) -> Result<usize> {
     len.checked_mul(size_of::<T>())
@@ -871,7 +1005,10 @@ impl<T> Slice<T> {
             Arc::strong_count(&self.allocation) == 1,
             "HIP handoff requires exclusive allocation ownership"
         );
-        let completed = self.allocation.stream.record_event(Some(2))?;
+        let completed = self
+            .allocation
+            .stream
+            .record_event(Some(HIP_EVENT_DISABLE_TIMING))?;
         stream.wait(&completed)?;
         let previous = std::mem::replace(
             &mut self.allocation,
@@ -1000,13 +1137,68 @@ unsafe impl<T> DevicePtrMut<T> for ViewMut<'_, T> {
     }
 }
 
+pub(crate) struct PinnedAccess<'a> {
+    completed: &'a Event,
+    stream: &'a Arc<Stream>,
+}
+impl Drop for PinnedAccess<'_> {
+    fn drop(&mut self) {
+        self.stream
+            .context
+            .record_err(self.completed.record(self.stream));
+    }
+}
+
 pub struct PinnedHostSlice<T> {
+    completed: Event,
     ptr: usize,
     len: usize,
     context: Arc<Context>,
     marker: PhantomData<T>,
 }
 impl<T> PinnedHostSlice<T> {
+    /// # Safety
+    /// All writers must have completed and the span stays live through stream completion.
+    pub(crate) unsafe fn stream_synced_slice<'a>(
+        &'a self,
+        stream: &'a Arc<Stream>,
+    ) -> (&'a [T], PinnedAccess<'a>) {
+        assert!(
+            Arc::ptr_eq(&self.context, stream.context()),
+            "HIP pinned context mismatch"
+        );
+        stream
+            .wait(&self.completed)
+            .expect("HIP pinned access event wait");
+        (
+            unsafe { std::slice::from_raw_parts(self.ptr as *const T, self.len) },
+            PinnedAccess {
+                completed: &self.completed,
+                stream,
+            },
+        )
+    }
+    /// # Safety
+    /// All prior accesses must have completed and the span stays exclusive through stream completion.
+    pub(crate) unsafe fn stream_synced_mut_slice<'a>(
+        &'a mut self,
+        stream: &'a Arc<Stream>,
+    ) -> (&'a mut [T], PinnedAccess<'a>) {
+        assert!(
+            Arc::ptr_eq(&self.context, stream.context()),
+            "HIP pinned context mismatch"
+        );
+        stream
+            .wait(&self.completed)
+            .expect("HIP pinned access event wait");
+        (
+            unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut T, self.len) },
+            PinnedAccess {
+                completed: &self.completed,
+                stream,
+            },
+        )
+    }
     pub fn len(&self) -> usize {
         self.len
     }
@@ -1014,11 +1206,11 @@ impl<T> PinnedHostSlice<T> {
         self.len == 0
     }
     pub fn as_slice(&self) -> Result<&[T]> {
-        self.context.synchronize()?;
+        self.completed.synchronize()?;
         Ok(unsafe { std::slice::from_raw_parts(self.ptr as *const T, self.len) })
     }
     pub fn as_mut_slice(&mut self) -> Result<&mut [T]> {
-        self.context.synchronize()?;
+        self.completed.synchronize()?;
         Ok(unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut T, self.len) })
     }
     pub fn as_ptr(&self) -> Result<*const T> {
@@ -1072,6 +1264,21 @@ pub struct Function {
     module: Arc<Module>,
 }
 impl Function {
+    pub fn shared_size_bytes(&self) -> Result<i32> {
+        self.module.context.bind_to_thread()?;
+        let mut value = 0;
+        unsafe {
+            check(
+                hipFuncGetAttribute(
+                    &mut value,
+                    HIP_FUNC_SHARED_SIZE_BYTES,
+                    self.handle as Handle,
+                ),
+                "hipFuncGetAttribute(sharedSizeBytes)",
+            )?;
+        }
+        Ok(value)
+    }
     pub fn max_threads_per_block(&self) -> Result<i32> {
         self.module.context.bind_to_thread()?;
         let mut value = 0;

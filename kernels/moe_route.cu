@@ -28,8 +28,8 @@
 // moe_route_topk static shared memory: two 32-word reduction stages plus 32
 // selected (id, probability) slots; launch grid = rows, block = experts
 // rounded up to a warp multiple (<= 1024).
-#include <cuda_bf16.h>
-#include <math_constants.h>
+#include "gpu_compat.cuh"
+#include <math.h>
 #include <stdint.h>
 
 using bf16 = __nv_bfloat16;
@@ -54,13 +54,13 @@ __device__ void moe_route_select(
 
   float v = logit;
   for (int off = 16; off > 0; off >>= 1)
-    v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
+    v = fmaxf(v, __shfl_down_sync(FF_WARP_MASK, v, off));
   if (lane == 0) s_red[warp] = v;
   __syncthreads();
-  v = warp == 0 && lane < nw ? s_red[lane] : -CUDART_INF_F;
+  v = warp == 0 && lane < nw ? s_red[lane] : -INFINITY;
   if (warp == 0) {
     for (int off = 16; off > 0; off >>= 1)
-      v = fmaxf(v, __shfl_down_sync(0xffffffffu, v, off));
+      v = fmaxf(v, __shfl_down_sync(FF_WARP_MASK, v, off));
     if (lane == 0) s_red[0] = v;
   }
   __syncthreads();
@@ -71,13 +71,13 @@ __device__ void moe_route_select(
   const float ev = live ? expf(logit - max_logit) : 0.0f;
   v = ev;
   for (int off = 16; off > 0; off >>= 1)
-    v += __shfl_down_sync(0xffffffffu, v, off);
+    v += __shfl_down_sync(FF_WARP_MASK, v, off);
   if (lane == 0) s_red[warp] = v;
   __syncthreads();
   v = warp == 0 && lane < nw ? s_red[lane] : 0.0f;
   if (warp == 0) {
     for (int off = 16; off > 0; off >>= 1)
-      v += __shfl_down_sync(0xffffffffu, v, off);
+      v += __shfl_down_sync(FF_WARP_MASK, v, off);
     if (lane == 0) s_red[0] = v;
   }
   __syncthreads();
@@ -91,18 +91,18 @@ __device__ void moe_route_select(
     v = !taken && live ? prob : -1.0f;
     int id = live ? e : 0x7fffffff;
     for (int off = 16; off > 0; off >>= 1) {
-      const float ov = __shfl_down_sync(0xffffffffu, v, off);
-      const int oi = __shfl_down_sync(0xffffffffu, id, off);
+      const float ov = __shfl_down_sync(FF_WARP_MASK, v, off);
+      const int oi = __shfl_down_sync(FF_WARP_MASK, id, off);
       if (ov > v || (ov == v && (reverse_ties ? oi > id : oi < id))) { v = ov; id = oi; }
     }
     if (lane == 0) { s_red[warp] = v; s_rid[warp] = id; }
     __syncthreads();
     if (warp == 0) {
-      v = lane < nw ? s_red[lane] : -CUDART_INF_F;
+      v = lane < nw ? s_red[lane] : -INFINITY;
       id = lane < nw ? s_rid[lane] : 0x7fffffff;
       for (int off = 16; off > 0; off >>= 1) {
-        const float ov = __shfl_down_sync(0xffffffffu, v, off);
-        const int oi = __shfl_down_sync(0xffffffffu, id, off);
+        const float ov = __shfl_down_sync(FF_WARP_MASK, v, off);
+        const int oi = __shfl_down_sync(FF_WARP_MASK, id, off);
         if (ov > v || (ov == v && (reverse_ties ? oi > id : oi < id))) { v = ov; id = oi; }
       }
       if (lane == 0) { s_red[0] = v; s_rid[0] = id; }
@@ -150,8 +150,8 @@ __device__ void moe_route_select_sigmoid(
     float v = !taken && live ? score : -1.0f;
     int id = live ? e : 0x7fffffff;
     for (int off = 16; off > 0; off >>= 1) {
-      const float ov = __shfl_down_sync(0xffffffffu, v, off);
-      const int oi = __shfl_down_sync(0xffffffffu, id, off);
+      const float ov = __shfl_down_sync(FF_WARP_MASK, v, off);
+      const int oi = __shfl_down_sync(FF_WARP_MASK, id, off);
       if (ov > v || (ov == v && (reverse_ties ? oi > id : oi < id))) { v = ov; id = oi; }
     }
     if (lane == 0) { s_red[warp] = v; s_rid[warp] = id; }
@@ -160,8 +160,8 @@ __device__ void moe_route_select_sigmoid(
       v = lane < nw ? s_red[lane] : -1.0f;
       id = lane < nw ? s_rid[lane] : 0x7fffffff;
       for (int off = 16; off > 0; off >>= 1) {
-        const float ov = __shfl_down_sync(0xffffffffu, v, off);
-        const int oi = __shfl_down_sync(0xffffffffu, id, off);
+        const float ov = __shfl_down_sync(FF_WARP_MASK, v, off);
+        const int oi = __shfl_down_sync(FF_WARP_MASK, id, off);
         if (ov > v || (ov == v && (reverse_ties ? oi > id : oi < id))) { v = ov; id = oi; }
       }
       if (lane == 0) { s_red[0] = v; s_rid[0] = id; }
@@ -215,21 +215,21 @@ __device__ __forceinline__ void moe_route_select_noaux(
 
   bool taken = false;
   for (int r = 0; r < top_k; ++r) {
-    float v = !taken && live ? select_score : -CUDART_INF_F;
+    float v = !taken && live ? select_score : -INFINITY;
     int id = live ? e : 0x7fffffff;
     for (int off = 16; off > 0; off >>= 1) {
-      const float ov = __shfl_down_sync(0xffffffffu, v, off);
-      const int oi = __shfl_down_sync(0xffffffffu, id, off);
+      const float ov = __shfl_down_sync(FF_WARP_MASK, v, off);
+      const int oi = __shfl_down_sync(FF_WARP_MASK, id, off);
       if (ov > v || (ov == v && oi < id)) { v = ov; id = oi; }
     }
     if (lane == 0) { s_red[warp] = v; s_rid[warp] = id; }
     __syncthreads();
     if (warp == 0) {
-      v = lane < nw ? s_red[lane] : -CUDART_INF_F;
+      v = lane < nw ? s_red[lane] : -INFINITY;
       id = lane < nw ? s_rid[lane] : 0x7fffffff;
       for (int off = 16; off > 0; off >>= 1) {
-        const float ov = __shfl_down_sync(0xffffffffu, v, off);
-        const int oi = __shfl_down_sync(0xffffffffu, id, off);
+        const float ov = __shfl_down_sync(FF_WARP_MASK, v, off);
+        const int oi = __shfl_down_sync(FF_WARP_MASK, id, off);
         if (ov > v || (ov == v && oi < id)) { v = ov; id = oi; }
       }
       if (lane == 0) { s_red[0] = v; s_rid[0] = id; }
@@ -329,7 +329,7 @@ extern "C" __global__ void moe_route_topk(
 
   const int tid = threadIdx.x;
   const int row = blockIdx.x;
-  float logit = -CUDART_INF_F;
+  float logit = -INFINITY;
   if (tid < experts)
     logit = __bfloat162float(logits[(size_t)row * experts + tid]);
   moe_route_select(logit, ids, weights, experts, top_k, row);
@@ -346,7 +346,7 @@ extern "C" __global__ void moe_route_topk_sigmoid(
 
   const int tid = threadIdx.x;
   const int row = blockIdx.x;
-  float logit = -CUDART_INF_F;
+  float logit = -INFINITY;
   if (tid < experts)
     logit = __bfloat162float(logits[(size_t)row * experts + tid]);
   moe_route_select_sigmoid(logit, ids, weights, experts, top_k, row);
@@ -410,7 +410,7 @@ __device__ void moe_route_decode(
   if (tid == 0) last = atomicAdd(completed + row, 1u) == gridDim.x - 1;
   __syncthreads();
   if (!last) return;
-  float logit = -CUDART_INF_F;
+  float logit = -INFINITY;
   if (tid < experts)
     logit = __bfloat162float(__ushort_as_bfloat16(published[(size_t)row * experts + tid]));
   if (score_mode == 0)
@@ -452,7 +452,7 @@ extern "C" __global__ void moe_route_topk_noaux(
 
   const int tid = threadIdx.x;
   const int row = blockIdx.x;
-  float logit = -CUDART_INF_F;
+  float logit = -INFINITY;
   float correction = 0.0f;
   if (tid < experts) {
     logit = logits[(size_t)row * experts + tid];

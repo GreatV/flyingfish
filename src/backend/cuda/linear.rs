@@ -1,15 +1,15 @@
 //! Typed Linear views; all BF16 plans execute through the shared Blas handle.
-use super::{
-    contracts::{RowDomain, Scratch, Tensor, TensorMut},
-    weights::WeightCatalog,
-};
+use super::contracts::Scratch;
+use super::contracts::{RowDomain, Tensor, TensorMut};
+use super::weights::WeightCatalog;
+use crate::backend::gpu::{CudaContext, CudaFunction, CudaStream, DevicePtr, PushKernelArg};
 use crate::fp8::Fp8ScaleLayout;
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaContext, CudaFunction, CudaStream, DevicePtr, PushKernelArg};
 use half::bf16;
 use std::sync::Arc;
 /// Explicit visible bias boundary; the caller's numerical contract selects it.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[cfg(feature = "cuda")]
 pub(crate) enum LinearBiasMode {
     BeforeOutputRound,
     AfterOutputRound,
@@ -24,11 +24,18 @@ pub(crate) enum LinearWeightRef {
     },
 }
 pub(crate) struct Fp8Ops {
+    #[cfg(feature = "cuda")]
     dequant: [CudaFunction; 2],
+    #[cfg(feature = "cuda")]
     small: [Vec<CudaFunction>; 2],
+    #[cfg(feature = "rocm")]
+    channel: [CudaFunction; 2],
+    #[cfg(feature = "rocm")]
+    context: Arc<CudaContext>,
     fake_quant: CudaFunction,
 }
 impl Fp8Ops {
+    #[cfg(feature = "cuda")]
     pub(super) fn require_rows(&self, rows: usize) -> Result<()> {
         ensure!(
             rows > 0 && self.small.iter().all(|table| table.len() >= rows),
@@ -37,9 +44,11 @@ impl Fp8Ops {
         );
         Ok(())
     }
+    #[cfg(feature = "cuda")]
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
         Self::for_rows(ctx, crate::mtp::MAX_VERIFY_ROWS)
     }
+    #[cfg(feature = "cuda")]
     pub(super) fn for_rows(ctx: &Arc<CudaContext>, rows: usize) -> Result<Self> {
         ensure!(
             (1..=crate::linear_plan::MAX_SKINNY_ROWS).contains(&rows),
@@ -65,6 +74,79 @@ impl Fp8Ops {
                 module.load_function("fp8_dequant_bf16_per_channel")?,
             ],
             small: [load("")?, load("_per_channel")?],
+        })
+    }
+    #[cfg(feature = "rocm")]
+    pub fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
+        ctx.require_wmma()?;
+        let module = super::cubin::module(ctx, "fp8_linear")?;
+        let channel = [
+            module.load_function("fp8_channel_bf16_simt")?,
+            module.load_function("fp8_channel_bf16_wmma")?,
+        ];
+        for function in &channel {
+            ensure!(
+                function.max_threads_per_block()? >= 128
+                    && function.occupancy_max_active_blocks_per_multiprocessor(128, 0, None)? > 0,
+                "HIP per-channel FP8 requires a resident 128-thread block"
+            );
+        }
+        Ok(Self {
+            channel,
+            context: ctx.clone(),
+            fake_quant: module.load_function("e4m3_fake_quant_bf16")?,
+        })
+    }
+
+    #[cfg(feature = "rocm")]
+    pub fn bind_channel(
+        &self,
+        weight: LinearWeightRef,
+        x: Tensor<bf16, 2>,
+        y: &TensorMut<bf16, 2>,
+    ) -> Result<ChannelProjection> {
+        let LinearWeightRef::Fp8 {
+            codes,
+            scale,
+            layout,
+        } = weight
+        else {
+            anyhow::bail!("HIP native per-channel projection requires FP8 weight");
+        };
+        ensure!(
+            layout == Fp8ScaleLayout::PerChannel,
+            "HIP native projection requires per-channel scales"
+        );
+        Self::check(&codes, &scale, layout)?;
+        validate_call(codes.shape, x, &y.0)?;
+        disjoint(&codes, &y.0)?;
+        disjoint(&scale, &y.0)?;
+        let [rows, inner] = x.shape;
+        let output = codes.shape[0];
+        ensure!(
+            rows <= i32::MAX as u32,
+            "HIP per-channel row extent exceeds i32"
+        );
+        let tiled = rows > 1;
+        let grid = if tiled {
+            (output.div_ceil(64), rows.div_ceil(16))
+        } else {
+            (output.div_ceil(4), rows)
+        };
+        ensure!(
+            grid.1 <= self.context.properties.max_grid_y as u32,
+            "HIP per-channel launch exceeds device grid limits"
+        );
+        Ok(ChannelProjection {
+            function: self.channel[usize::from(tiled)].clone(),
+            context: self.context.clone(),
+            pointers: [codes.ptr, scale.ptr, x.ptr, y.0.ptr],
+            shape: [rows as i32, output as i32, inner as i32],
+            launch: crate::backend::gpu::LaunchConfig {
+                grid_dim: (grid.0, grid.1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            },
         })
     }
     pub fn fake_quant(
@@ -123,6 +205,7 @@ impl Fp8Ops {
         );
         Ok(())
     }
+    #[cfg(feature = "cuda")]
     pub fn materialize(
         &self,
         stream: &Arc<CudaStream>,
@@ -158,6 +241,7 @@ impl Fp8Ops {
         }
         Ok(())
     }
+    #[cfg(feature = "cuda")]
     pub fn small_gemm(
         &self,
         stream: &Arc<CudaStream>,
@@ -187,6 +271,36 @@ impl Fp8Ops {
                 .arg(&(codes.shape[0] as i32))
                 .arg(&(codes.shape[1] as i32))
                 .launch(super::ops::grid(codes.shape[0].div_ceil(4) as usize, 128))?;
+        }
+        Ok(())
+    }
+}
+#[cfg(feature = "rocm")]
+pub(crate) struct ChannelProjection {
+    function: CudaFunction,
+    context: Arc<CudaContext>,
+    pointers: [u64; 4],
+    shape: [i32; 3],
+    launch: crate::backend::gpu::LaunchConfig,
+}
+#[cfg(feature = "rocm")]
+impl ChannelProjection {
+    pub fn run(&self, stream: &Arc<CudaStream>) -> Result<()> {
+        ensure!(
+            Arc::ptr_eq(&self.context, stream.context()),
+            "HIP per-channel projection context mismatch"
+        );
+        unsafe {
+            stream
+                .launch_builder(&self.function)
+                .arg(&self.pointers[0])
+                .arg(&self.pointers[1])
+                .arg(&self.pointers[2])
+                .arg(&self.pointers[3])
+                .arg(&self.shape[0])
+                .arg(&self.shape[1])
+                .arg(&self.shape[2])
+                .launch(self.launch)?;
         }
         Ok(())
     }
@@ -272,6 +386,7 @@ impl WeightCatalog {
         }
     }
 }
+#[cfg(feature = "cuda")]
 impl crate::linear_plan::LayerDequantPlan {
     pub(crate) fn weight(&self, name: &str, arena: &Scratch) -> Result<LinearWeightRef> {
         arena.validate(self.bytes)?;
@@ -292,13 +407,17 @@ impl crate::linear_plan::LayerDequantPlan {
 
 struct BoundProjection {
     resident: LinearWeightRef,
+    #[cfg(feature = "cuda")]
     prefill: Tensor<bf16, 2>,
+    #[cfg(feature = "rocm")]
+    calls: std::cell::RefCell<std::collections::BTreeMap<(u32, u64, u64), ChannelProjection>>,
     invariant_rows: usize,
 }
 /// Setup-bound views for a layer. Engine retains catalog/arena storage; run does
 /// not construct tensor names, allocate scratch or invoke a Lt heuristic.
 pub(crate) struct LayerLinearPlan {
     projections: std::collections::BTreeMap<String, BoundProjection>,
+    #[cfg(feature = "cuda")]
     materialize: Vec<(LinearWeightRef, TensorMut<bf16, 2>)>,
 }
 
@@ -364,6 +483,25 @@ impl BoundFfn {
 }
 
 impl LayerLinearPlan {
+    #[cfg(feature = "rocm")]
+    pub fn library_shapes(
+        &self,
+        rows: u32,
+    ) -> impl Iterator<Item = crate::backend::setup::LinearShape> + '_ {
+        self.projections.values().filter_map(move |projection| {
+            let LinearWeightRef::Bf16(weight) = projection.resident else {
+                return None;
+            };
+            (rows as usize > projection.invariant_rows).then_some(
+                crate::backend::setup::LinearShape {
+                    rows: rows as usize,
+                    output: weight.shape[0] as usize,
+                    input: weight.shape[1] as usize,
+                },
+            )
+        })
+    }
+
     fn take_bf16(&mut self, role: &str, expected: [u32; 2]) -> Result<Tensor<bf16, 2>> {
         let projection = self
             .projections
@@ -389,13 +527,20 @@ impl LayerLinearPlan {
         arena: Option<&Scratch>,
         stream: &Arc<CudaStream>,
     ) -> Result<Self> {
+        #[cfg(feature = "cuda")]
         if plan.bytes > 0 {
             arena
                 .context("FP8 layer has no materialization arena")?
                 .validate(plan.bytes)?;
         }
+        #[cfg(feature = "rocm")]
+        ensure!(
+            arena.is_none(),
+            "HIP native channel layers do not use a dequantization arena"
+        );
         let prefix = &plan.prefix;
         let mut projections = std::collections::BTreeMap::new();
+        #[cfg(feature = "cuda")]
         let mut materialize = Vec::new();
         for (name, entry) in &catalog.manifest.entries {
             if !entry.load
@@ -407,6 +552,7 @@ impl LayerLinearPlan {
                 continue;
             }
             let resident = catalog.linear_ref(name, stream)?;
+            #[cfg(feature = "cuda")]
             let prefill = match &resident {
                 LinearWeightRef::Bf16(w) => *w,
                 LinearWeightRef::Fp8 { .. } => {
@@ -421,6 +567,18 @@ impl LayerLinearPlan {
                     w
                 }
             };
+            #[cfg(feature = "rocm")]
+            ensure!(
+                matches!(
+                    resident,
+                    LinearWeightRef::Bf16(_)
+                        | LinearWeightRef::Fp8 {
+                            layout: Fp8ScaleLayout::PerChannel,
+                            ..
+                        }
+                ),
+                "HIP layer projection requires BF16 or per-channel FP8: {name}"
+            );
             let role = &name[prefix.len()..];
             let invariant_rows = if matches!(
                 role,
@@ -438,35 +596,74 @@ impl LayerLinearPlan {
                 role.to_owned(),
                 BoundProjection {
                     resident,
+                    #[cfg(feature = "cuda")]
                     prefill,
+                    #[cfg(feature = "rocm")]
+                    calls: std::cell::RefCell::new(std::collections::BTreeMap::new()),
                     invariant_rows,
                 },
             );
         }
+        #[cfg(feature = "cuda")]
         ensure!(
             materialize.len() == plan.slots.len(),
             "layer linear plan does not cover materialization slots"
         );
         Ok(Self {
             projections,
+            #[cfg(feature = "cuda")]
             materialize,
         })
     }
     pub fn prepare(&self, blas: &super::blas::Blas, rows: u32) -> Result<()> {
         for p in self.projections.values() {
+            #[cfg(feature = "cuda")]
+            let weight = p.prefill;
+            #[cfg(feature = "rocm")]
+            let LinearWeightRef::Bf16(weight) = p.resident else {
+                continue;
+            };
             if p.invariant_rows > 0 {
                 blas.prepare_skinny(crate::backend::setup::LinearShape {
                     rows: (rows as usize).min(p.invariant_rows),
-                    output: p.prefill.shape[0] as usize,
-                    input: p.prefill.shape[1] as usize,
+                    output: weight.shape[0] as usize,
+                    input: weight.shape[1] as usize,
                 })?;
             }
             if rows as usize > p.invariant_rows {
-                blas.prepare_fixed(rows, p.prefill.shape[0], p.prefill.shape[1])?;
+                blas.prepare_fixed(rows, weight.shape[0], weight.shape[1])?;
             }
         }
         Ok(())
     }
+    #[cfg(feature = "rocm")]
+    pub fn bind_call(
+        &self,
+        ops: &Fp8Ops,
+        role: &str,
+        x: Tensor<bf16, 2>,
+        y: &TensorMut<bf16, 2>,
+    ) -> Result<()> {
+        let projection = self
+            .projections
+            .get(role)
+            .with_context(|| format!("layer projection not bound: {role}"))?;
+        if let LinearWeightRef::Bf16(weight) = projection.resident {
+            validate_call(weight.shape, x, &y.0)?;
+            return disjoint(&weight, &y.0);
+        }
+        let call = ops.bind_channel(projection.resident, x, y)?;
+        let key = (x.shape[0], x.ptr, y.0.ptr);
+        let mut calls = projection.calls.borrow_mut();
+        ensure!(
+            !calls.contains_key(&key),
+            "HIP layer projection call already bound: {role}"
+        );
+        calls.insert(key, call);
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
     pub fn materialize(
         &mut self,
         blas: &super::blas::Blas,
@@ -498,6 +695,22 @@ impl LayerLinearPlan {
             .projections
             .get(role)
             .with_context(|| format!("layer projection not bound: {role}"))?;
+        #[cfg(feature = "rocm")]
+        if let LinearWeightRef::Fp8 { codes, .. } = p.resident {
+            validate_call(codes.shape, x, &y.0)?;
+            ensure!(
+                phase != crate::op_contract::ExecutionPhase::Decode || x.shape[0] == 1,
+                "Decode requires M1"
+            );
+            let calls = p.calls.borrow();
+            let call = calls
+                .get(&(x.shape[0], x.ptr, y.0.ptr))
+                .context("HIP native layer projection is outside the frozen setup closure")?;
+            return call.run(blas.stream());
+        }
+        #[cfg(feature = "rocm")]
+        let weight = p.resident;
+        #[cfg(feature = "cuda")]
         let weight = if phase == crate::op_contract::ExecutionPhase::Prefill
             && !blas.direct_fp8_rows().contains(&(x.shape[0] as usize))
         {
@@ -509,7 +722,67 @@ impl LayerLinearPlan {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "rocm"))]
+#[test]
+fn hip_projection_closure_excludes_native_and_invariant_calls() -> Result<()> {
+    use crate::backend::setup::LinearShape;
+    let weights = [
+        (
+            LinearWeightRef::Bf16(unsafe {
+                Tensor::new(0x1000, [512, 2048], [2048, 1], 512 * 2048 * 2)?
+            }),
+            0,
+        ),
+        (
+            LinearWeightRef::Bf16(unsafe {
+                Tensor::new(0x1000, [32, 2048], [2048, 1], 32 * 2048 * 2)?
+            }),
+            8,
+        ),
+        (
+            LinearWeightRef::Fp8 {
+                codes: unsafe { Tensor::new(0x1000, [512, 2048], [2048, 1], 512 * 2048)? },
+                scale: unsafe { Tensor::new(0x2000, [512, 1], [1, 1], 512 * 2)? },
+                layout: Fp8ScaleLayout::PerChannel,
+            },
+            0,
+        ),
+    ];
+    let plan = LayerLinearPlan {
+        projections: weights
+            .into_iter()
+            .enumerate()
+            .map(|(i, (resident, invariant_rows))| {
+                (
+                    i.to_string(),
+                    BoundProjection {
+                        resident,
+                        invariant_rows,
+                        calls: Default::default(),
+                    },
+                )
+            })
+            .collect(),
+    };
+    for rows in [1, 3, 8, 9, 17, 32] {
+        let mut expected = vec![LinearShape {
+            rows: rows as usize,
+            output: 512,
+            input: 2048,
+        }];
+        if rows > 8 {
+            expected.push(LinearShape {
+                rows: rows as usize,
+                output: 32,
+                input: 2048,
+            });
+        }
+        assert_eq!(plan.library_shapes(rows).collect::<Vec<_>>(), expected);
+    }
+    Ok(())
+}
+
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
     use crate::backend::cuda::{

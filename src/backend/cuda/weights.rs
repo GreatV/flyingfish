@@ -1,7 +1,6 @@
 use super::Device;
-use crate::backend::gpu::{CudaSlice, CudaStream, PinnedHostSlice};
+use crate::backend::gpu::{CudaContext, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice};
 use crate::config::Config;
-#[cfg(feature = "cuda")]
 use crate::experts::{
     arena::{HostBlocks, SlotLayout},
     catalogue::ExpertGeometry,
@@ -9,7 +8,7 @@ use crate::experts::{
 };
 use anyhow::{Context, Result, ensure};
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaContext, DevicePtr, sys};
+use cudarc::driver::sys;
 use half::bf16;
 use safetensors::{Dtype, SafeTensors};
 use sha2::{Digest, Sha256};
@@ -58,7 +57,6 @@ pub struct Weights {
 }
 
 /// Stable native expert slots, persistent staging and host data plus spare blocks.
-#[cfg(feature = "cuda")]
 pub struct ExpertStorage {
     layout: SlotLayout,
     down_offset: u64,
@@ -70,7 +68,6 @@ pub struct ExpertStorage {
     registered: bool,
 }
 
-#[cfg(feature = "cuda")]
 impl ExpertStorage {
     pub fn new(
         stream: &Arc<CudaStream>,
@@ -87,6 +84,11 @@ impl ExpertStorage {
         let layout = SlotLayout::new(geometry, capacity)?;
         let gpu0_bytes = layout.allocation_bytes()?;
         let peer_bytes = layout.peer_resident_bytes();
+        #[cfg(feature = "rocm")]
+        ensure!(
+            peer.is_none() && peer_bytes == 0,
+            "HIP expert peer storage is not implemented"
+        );
         let host = (layout.host_blocks() > 0)
             .then(|| {
                 HostBlocks::new(
@@ -219,8 +221,16 @@ impl ExpertStorage {
             .bind_to_thread()
             .context("bind expert host registration context")?;
         // SAFETY: the exact owned allocation remains alive until unregister after all device uses.
-        unsafe { sys::cuMemHostRegister_v2(address as *mut std::ffi::c_void, bytes, 0).result() }
-            .with_context(|| format!("register expert host arena: bytes={bytes}"))?;
+        unsafe {
+            #[cfg(feature = "cuda")]
+            sys::cuMemHostRegister_v2(address as *mut std::ffi::c_void, bytes, 0)
+                .result()
+                .with_context(|| format!("register expert host arena: bytes={bytes}"))?;
+            #[cfg(feature = "rocm")]
+            self.context
+                .register_host(address, bytes, false)
+                .with_context(|| format!("register expert host arena: bytes={bytes}"))?;
+        }
         self.registered = true;
         Ok(())
     }
@@ -279,11 +289,32 @@ impl Drop for ExpertStorage {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "rocm")]
+impl Drop for ExpertStorage {
+    fn drop(&mut self) {
+        crate::backend::hip::drop_result(
+            self.context.synchronize().context("finish expert storage"),
+        );
+        if let Some(peer) = &self.peer_context {
+            crate::backend::hip::drop_result(
+                peer.synchronize().context("finish peer expert storage"),
+            );
+        }
+        if self.registered
+            && let Some(host) = &self.host
+        {
+            let (address, _) = host.host_span();
+            crate::backend::hip::drop_result(
+                unsafe { self.context.unregister_host(address) }
+                    .context("unregister expert host storage"),
+            );
+        }
+    }
+}
+
 use crate::checkpoint::TensorEntry;
 use crate::checkpoint::{Index, MappedCheckpoint, TensorManifest};
 
-#[cfg(feature = "cuda")]
 fn upload_entry(entry: &TensorEntry) -> bool {
     entry.is_non_expert_loaded()
 }
@@ -299,7 +330,6 @@ pub(crate) struct Loader<'a> {
     stream: Arc<CudaStream>,
     #[cfg(feature = "rocm")]
     compute: Arc<CudaStream>,
-    #[cfg(feature = "cuda")]
     byte_staging: Option<PinnedHostSlice<u8>>,
     verify_upload: bool,
     upload_hashers: BTreeMap<String, UploadHashWorker>,
@@ -556,7 +586,6 @@ pub(super) fn checkpoint_mapped<T>(
         stream: d.upload.clone(),
         #[cfg(feature = "rocm")]
         compute: d.stream.clone(),
-        #[cfg(feature = "cuda")]
         byte_staging: if manifest.is_some() {
             Some(unsafe { d.ctx.alloc_pinned_with_flags::<u8>(UPLOAD_CHUNK_BYTES, 0)? })
         } else {
@@ -720,7 +749,6 @@ impl Weights {
 }
 
 impl Loader<'_> {
-    #[cfg(feature = "cuda")]
     pub(super) fn load_bytes(
         &mut self,
         name: &str,
@@ -787,26 +815,26 @@ impl Loader<'_> {
             .bytes
             .checked_add(t.data().len())
             .context("uploaded byte count overflow")?;
+        #[cfg(feature = "rocm")]
+        dst.handoff(&self.compute)?;
         Ok(dst)
     }
 }
 
-#[cfg(feature = "cuda")]
 pub(crate) enum StoredTensor {
     Bf16(CudaSlice<bf16>),
     Bytes(CudaSlice<u8>),
 }
-#[cfg(feature = "cuda")]
 pub(crate) struct WeightCatalog {
     pub linear_format: crate::model_spec::LinearFormat,
     pub tensors: BTreeMap<String, StoredTensor>,
     pub manifest: TensorManifest,
     pub bytes: usize,
+    #[cfg(feature = "cuda")]
     pub upload_content_sha256: Option<String>,
     pub upload_hashed_bytes: Option<usize>,
     pub load_wall_ms: f64,
 }
-#[cfg(feature = "cuda")]
 impl WeightCatalog {
     /// Move shared global tensors into the existing Engine weight owner.
     pub fn take_globals(&mut self) -> Result<Weights> {
@@ -842,6 +870,7 @@ impl WeightCatalog {
         Self::load_inner(dir, spec, d, crate::checkpoint::LoadPolicy::TextOnly, false)
     }
 
+    #[cfg(feature = "cuda")]
     pub fn load_for_prefix_cache(
         dir: &Path,
         spec: &crate::model_spec::ModelSpec,
@@ -849,6 +878,7 @@ impl WeightCatalog {
     ) -> Result<Self> {
         Self::load_inner(dir, spec, d, crate::checkpoint::LoadPolicy::TextOnly, true)
     }
+    #[cfg(feature = "cuda")]
     pub fn load_with_policy(
         dir: &Path,
         spec: &crate::model_spec::ModelSpec,
@@ -945,6 +975,7 @@ impl WeightCatalog {
             tensors,
             manifest,
             bytes,
+            #[cfg(feature = "cuda")]
             upload_content_sha256: upload_digest.as_ref().map(|x| x.1.clone()),
             upload_hashed_bytes: upload_digest.map(|x| x.0),
             load_wall_ms,

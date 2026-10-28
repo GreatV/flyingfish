@@ -1,7 +1,8 @@
 // Active-assignment count, exclusive scan, row permutation and weighted BF16 scatter.
 // Active expert ids, slot generations, done bits and segment positions are checked before use.
-#include <cuda_runtime.h>
+#if !defined(__HIP__)
 #include <cuda/atomic>
+#endif
 #include <type_traits>
 #include "q38_contract.cuh"
 
@@ -39,7 +40,7 @@ __device__ __forceinline__ void moe_lane16(
       sum = __fmaf_rn(__bfloat162float(x[k]), __bfloat162float(weight[k]), sum);
     }
   }
-  const unsigned mask = 0xFFFFu << (threadIdx.x & 16);
+  const auto mask = (FF_WARP_MASK & 0xffffu) << (threadIdx.x & 16);
   for (int step = 1; step < 16; step *= 2)
     sum = __fadd_rn(sum, __shfl_down_sync(mask, sum, step, 16));
   if (lane == 0) {
@@ -86,6 +87,72 @@ __device__ __forceinline__ unsigned decode_e4m3x2(unsigned short pair, float sca
   return (unsigned)lo | ((unsigned)hi << 16);
 }
 
+#if defined(__HIP__)
+using MoeBf16 = short __attribute__((ext_vector_type(16)));
+using MoeAcc = float __attribute__((ext_vector_type(8)));
+
+// Eight wave32 groups own 16 output columns and four 16-row activation tiles each.
+extern "C" __global__ void __launch_bounds__(256) moe_gemm_w8a16(
+    const unsigned long long* __restrict__ matrices, int problems,
+    int tensor_problems, int columns, int inner, unsigned long long scale_offset) {
+  if (blockDim.x != 256 || tensor_problems < 1 || tensor_problems > problems ||
+      columns < 1 || inner < 1 || (inner & 63) != 0 || blockIdx.z >= tensor_problems)
+    __trap();
+  const int problem = blockIdx.z;
+  const int rows = matrices[3 * problems + problem];
+  const int n0 = blockIdx.x * 128, m0 = blockIdx.y * 64;
+  if (m0 >= rows) return;
+  const unsigned char* codes = reinterpret_cast<const unsigned char*>(matrices[problem]);
+  const bf16* scales = reinterpret_cast<const bf16*>(codes + scale_offset);
+  const bf16* x = reinterpret_cast<const bf16*>(matrices[problems + problem]);
+  bf16* y = reinterpret_cast<bf16*>(matrices[2 * problems + problem]);
+  __shared__ bf16 weight[128][32], input[64][32];
+  const int tid = threadIdx.x, wave = tid / 32, lane = tid % 32;
+  MoeAcc acc[4] = {};
+  for (int k0 = 0; k0 < inner; k0 += 32) {
+    for (int cell = tid; cell < 128 * 32; cell += 256) {
+      const int n = n0 + cell / 32, k = k0 + cell % 32;
+      weight[cell / 32][cell % 32] = n < columns
+          ? fp8_channel_tile_weight(codes[(size_t)n * inner + k], scales[n])
+          : __float2bfloat16(0.0f);
+    }
+    for (int cell = tid; cell < 64 * 32; cell += 256) {
+      const int m = m0 + cell / 32, k = k0 + cell % 32;
+      input[cell / 32][cell % 32] = m < rows ? x[(size_t)m * inner + k]
+                                                     : __float2bfloat16(0.0f);
+    }
+    __syncthreads();
+#pragma unroll
+    for (int part = 0; part < 2; ++part) {
+      MoeBf16 a;
+#pragma unroll
+      for (int j = 0; j < 16; ++j)
+        a[j] = reinterpret_cast<const unsigned short*>(weight[wave * 16 + lane % 16])[part * 16 + j];
+#pragma unroll
+      for (int tile = 0; tile < 4; ++tile) {
+        MoeBf16 b;
+#pragma unroll
+        for (int j = 0; j < 16; ++j)
+          b[j] = reinterpret_cast<const unsigned short*>(input[tile * 16 + lane % 16])[part * 16 + j];
+        acc[tile] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc[tile]);
+      }
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int tile = 0; tile < 4; ++tile) {
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int m = m0 + tile * 16 + lane % 16;
+      const int n = n0 + wave * 16 + 2 * j + lane / 16;
+      if (m < rows && n < columns) {
+        const float unscale = fp8_channel_tile_unscale(scales[n]);
+        y[(size_t)m * columns + n] = __float2bfloat16(acc[tile][j] * unscale);
+      }
+    }
+  }
+}
+#else
 // A 128x64, B 64x64; eight warps own 16x64 outputs, 2-stage cp.async with k16 MMA steps.
 extern "C" __global__ void __launch_bounds__(256, 2) moe_gemm_w8a16(
     const unsigned long long* __restrict__ matrices, int problems,
@@ -214,6 +281,8 @@ extern "C" __global__ void __launch_bounds__(256, 2) moe_gemm_w8a16(
   }
 }
 
+#endif
+
 __device__ __forceinline__ bool moe_assignment_active(
     const int* ids, const unsigned* active, const unsigned* valid,
     long long a, int experts, int mask_from_slots) {
@@ -261,13 +330,13 @@ extern "C" __global__ void moe_count_scan(
         }
         atomicAdd(&sc[e], 1);
       }
-      const unsigned ballot = __ballot_sync(0xffffffffu, live);
+      const unsigned ballot = __ballot_sync(FF_WARP_MASK, live);
       if (ballot != 0u) {
         const int lane = tid & 31;
         const int leader = __ffs(ballot) - 1;
         unsigned start = 0;
         if (lane == leader) start = atomicAdd(state + 1025, __popc(ballot));
-        start = __shfl_sync(0xffffffffu, start, leader);
+        start = __shfl_sync(FF_WARP_MASK, start, leader);
         if (live) {
           const unsigned index = start + __popc(ballot & ((1u << lane) - 1u));
           if (index >= (unsigned)capacity) __trap();
@@ -283,8 +352,13 @@ extern "C" __global__ void moe_count_scan(
   __syncthreads();
   // Every CTA publishes before its release RMW; the last RMW acquires the retirement chain.
   if (tid == 0) {
+#if defined(__HIP__)
+    last = __hip_atomic_fetch_add(state + 1024, 1u, __ATOMIC_ACQ_REL,
+                                  __HIP_MEMORY_SCOPE_AGENT) + 1u == gridDim.x;
+#else
     cuda::atomic_ref<unsigned, cuda::thread_scope_device> retired(state[1024]);
     last = retired.fetch_add(1u, cuda::memory_order_acq_rel) + 1u == gridDim.x;
+#endif
   }
   __syncthreads();
   if (!last) return;
@@ -320,8 +394,12 @@ extern "C" __global__ void moe_count_scan(
     *active_total = total;
     offsets[experts] = total;
     state[1025] = 0u;
+#if defined(__HIP__)
+    __hip_atomic_store(state + 1024, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+#else
     cuda::atomic_ref<unsigned, cuda::thread_scope_device> retired(state[1024]);
     retired.store(0u, cuda::memory_order_relaxed);
+#endif
   }
 }
 

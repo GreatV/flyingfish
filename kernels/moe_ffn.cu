@@ -2,7 +2,6 @@
 // gate_up: grid(ceil(I/32),rows,K+1), block256, smem=H*2; down: grid(ceil(H/16),rows,K+1), block128.
 // Active assignments require valid slots, matching generations and distinct expert ids.
 // Expert row pointers and shared weights are 16-byte aligned.
-#include <cuda_runtime.h>
 #include "q38_contract.cuh"
 
 using bf16 = __nv_bfloat16;
@@ -48,7 +47,7 @@ __device__ __forceinline__ float moe_dot8(uint4 w, uint4 a) {
 __device__ __forceinline__ float moe_group_sum(float v) {
 #pragma unroll
   for (int off = LANES / 2; off > 0; off >>= 1)
-    v += __shfl_down_sync(0xffffffffu, v, off, LANES);
+    v += __shfl_down_sync(FF_WARP_MASK, v, off, LANES);
   return v;
 }
 
@@ -77,7 +76,7 @@ __device__ __forceinline__ uint4 moe_load8(const bf16* base, const unsigned char
 
 // Sixteen scalar FMA lanes, paired in ascending 1/2/4/8 order.
 __device__ __forceinline__ float moe_pairwise16(float sum, int tid) {
-  const unsigned mask = 0xffffu << (tid & 16);
+  const auto mask = (FF_WARP_MASK & 0xffffu) << (tid & 16);
   for (int step = 1; step < 16; step *= 2)
     sum = __fadd_rn(sum, __shfl_down_sync(mask, sum, step, 16));
   return sum;

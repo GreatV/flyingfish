@@ -51,8 +51,8 @@ void gdn_step_fused(const __nv_bfloat16* conv, const __nv_bfloat16* a,
             qs = qv * qv; ks = kv * kv;
             #pragma unroll
             for (int delta = 16; delta > 0; delta >>= 1) {
-                qs += __shfl_down_sync(0xffffffff, qs, delta);
-                ks += __shfl_down_sync(0xffffffff, ks, delta);
+                qs += __shfl_down_sync(FF_WARP_MASK, qs, delta);
+                ks += __shfl_down_sync(FF_WARP_MASK, ks, delta);
             }
             if (lane == 0) { sums[0][group] = qs; sums[1][group] = ks; }
         }
@@ -62,8 +62,8 @@ void gdn_step_fused(const __nv_bfloat16* conv, const __nv_bfloat16* a,
             ks = lane < 4 ? sums[1][lane] : 0.0f;
             #pragma unroll
             for (int delta = 16; delta > 0; delta >>= 1) {
-                qs += __shfl_down_sync(0xffffffff, qs, delta);
-                ks += __shfl_down_sync(0xffffffff, ks, delta);
+                qs += __shfl_down_sync(FF_WARP_MASK, qs, delta);
+                ks += __shfl_down_sync(FF_WARP_MASK, ks, delta);
             }
             if (lane == 0) {
                 sums[0][0] = rsqrtf(qs + l2_eps);
@@ -128,12 +128,12 @@ void gdn_step_fused(const __nv_bfloat16* conv, const __nv_bfloat16* a,
                 for (int shift = 4; shift >= 1; shift >>= 1)
                     #pragma unroll
                     for (int j = 0; j < 4; ++j)
-                        squares[j] = __fadd_rn(squares[j], __shfl_down_sync(0xffffffff, squares[j], shift));
+                        squares[j] = __fadd_rn(squares[j], __shfl_down_sync(FF_WARP_MASK, squares[j], shift));
                 float sum = __fadd_rn(__fadd_rn(squares[0], squares[2]), __fadd_rn(squares[1], squares[3]));
-                sum = __fadd_rn(sum, __shfl_down_sync(0xffffffff, sum, 16));
-                sum = __fadd_rn(sum, __shfl_down_sync(0xffffffff, sum, 8));
+                sum = __fadd_rn(sum, __shfl_down_sync(FF_WARP_MASK, sum, 16));
+                sum = __fadd_rn(sum, __shfl_down_sync(FF_WARP_MASK, sum, 8));
                 float inv = lane == 0 ? rsqrtf(__fadd_rn(__fmul_rn(sum, 1.0f / 128.0f), rms_eps)) : 0.0f;
-                inv = __shfl_sync(0xffffffff, inv, 0);
+                inv = __shfl_sync(FF_WARP_MASK, inv, 0);
                 #pragma unroll
                 for (int j = 0; j < 4; ++j) {
                     const int d = lane * 4 + j;

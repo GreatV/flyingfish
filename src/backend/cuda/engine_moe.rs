@@ -12,9 +12,11 @@ use crate::backend::cuda::{
         route::RouteOps,
     },
 };
+use crate::backend::gpu::{CudaEvent, CudaFunction, DevicePtr};
 use crate::cpu::expert_ffn::{Assignment, ExpertPool, ExpertWeights, Job, Shape};
 use crate::experts::{arena::HostBlocks, catalogue::ExpertGeometry, plan::PeerSendLayout};
-use cudarc::driver::{CudaEvent, DevicePtr, HostSlice, result};
+#[cfg(feature = "cuda")]
+use cudarc::driver::HostSlice;
 
 #[path = "engine_moe_residency.rs"]
 mod residency;
@@ -424,7 +426,10 @@ impl Setup {
             failures.join("; ")
         );
         let registration = measured.host_registration_bytes;
+        #[cfg(feature = "cuda")]
         let (peer_device, peer_unsupported_sm) = device.peer_with_unsupported_sm()?;
+        #[cfg(feature = "rocm")]
+        let (peer_device, peer_unsupported_sm) = (device.peer()?, None::<u32>);
         let peer_inputs = if let Some(peer_dev) = &peer_device {
             peer_dev.ctx.bind_to_thread()?;
             let (peer_free, peer_total) = peer_dev.ctx.mem_get_info()?;
@@ -661,9 +666,11 @@ impl Setup {
         )?;
         let slots_load_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
         let phase_started = std::time::Instant::now();
-        let (send_ptr, _send_guard) = engine.work.n.device_ptr(&engine.device.stream);
+        let send_ptr = {
+            let (pointer, _guard) = engine.work.n.device_ptr(&engine.device.stream);
+            pointer
+        };
         let send_cap_bytes = engine.work.n.len() * size_of::<bf16>();
-        drop(_send_guard);
         let cpu_bounds = (
             cpu.0.max(self.decode_rows),
             cpu.1.max(self.decode_rows * geometry.top_k as usize),
@@ -760,6 +767,7 @@ pub(super) struct SlotBindings {
 }
 
 impl Engine {
+    #[cfg(feature = "cuda")]
     pub(super) fn bind_invariant_arithmetic(&mut self) -> Result<()> {
         self.closure.bind_fixed()?;
         let executor = self
@@ -873,30 +881,34 @@ pub(super) struct PeerBind<'a> {
 pub(super) struct PeerBounce {
     ptr: *mut u8,
     routed_off: usize,
+    _allocation: PinnedHostSlice<u8>,
 }
 
 unsafe impl Send for PeerBounce {}
 unsafe impl Sync for PeerBounce {}
 
 impl PeerBounce {
-    fn new(max_send_bytes: usize, max_routed_bytes: usize) -> Result<Self> {
+    fn new(
+        context: &Arc<CudaContext>,
+        max_send_bytes: usize,
+        max_routed_bytes: usize,
+    ) -> Result<Self> {
         let routed_off = max_send_bytes.next_multiple_of(16);
         let total = (routed_off + max_routed_bytes).next_multiple_of(16);
-        let mut raw = std::ptr::null_mut();
-        // SAFETY: CU_MEMHOSTALLOC_PORTABLE maps the pinned host bounce region into both CUDA contexts.
+        #[cfg(feature = "cuda")]
+        let portable = cudarc::driver::sys::CU_MEMHOSTALLOC_PORTABLE;
+        #[cfg(feature = "rocm")]
+        let portable = 1;
+        // The portable allocation is owned through the last peer DMA completion.
+        let mut allocation = unsafe { context.alloc_pinned_with_flags::<u8>(total, portable)? };
+        let raw = allocation.as_mut_ptr()?;
         unsafe {
-            cudarc::driver::sys::cuMemHostAlloc(
-                &mut raw,
-                total,
-                cudarc::driver::sys::CU_MEMHOSTALLOC_PORTABLE,
-            )
-            .result()
-            .context("cuMemHostAlloc portable decode bounce")?;
-            std::ptr::write_bytes(raw.cast::<u8>(), 0, total);
+            std::ptr::write_bytes(raw, 0, total);
         }
         Ok(Self {
             ptr: raw.cast::<u8>(),
             routed_off,
+            _allocation: allocation,
         })
     }
 
@@ -909,15 +921,6 @@ impl PeerBounce {
     }
 }
 
-impl Drop for PeerBounce {
-    fn drop(&mut self) {
-        // SAFETY: ptr was allocated by cuMemHostAlloc and Decode::drop synchronizes streams first.
-        unsafe {
-            let _ = cudarc::driver::sys::cuMemFreeHost(self.ptr.cast());
-        }
-    }
-}
-
 pub(super) struct PeerDecode {
     pub gpu0_layers: u32,
     pub send_ptr: u64,
@@ -925,7 +928,7 @@ pub(super) struct PeerDecode {
     pub device: Device,
     pub contribute: DecodeOps,
     pub combine: CombineOps,
-    pub mask: cudarc::driver::CudaFunction,
+    pub mask: CudaFunction,
     pub recv: CudaSlice<u8>,
     pub active: CudaSlice<u32>,
     pub final_active: CudaSlice<u32>,
@@ -938,7 +941,7 @@ pub(super) struct PeerDecode {
     pub bounce: PeerBounce,
     pub fork: CudaEvent,
     pub join: CudaEvent,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub perturb_word: Option<(usize, u16)>,
 }
 
@@ -981,7 +984,7 @@ pub(super) struct Decode {
     verify_peer_tails: std::collections::BTreeMap<usize, (usize, CudaGraph)>,
     mailbox_ready: CudaEvent,
     reader: Arc<CudaEvent>,
-    mask: cudarc::driver::CudaFunction,
+    mask: CudaFunction,
     pub stats: [u64; 5],
 }
 
@@ -1119,10 +1122,13 @@ impl Decode {
                 max_send.send_bytes
             );
             context.bind_to_thread()?;
-            let bounce = PeerBounce::new(max_send.send_bytes, hidden * size_of::<bf16>())?;
+            let bounce = PeerBounce::new(context, max_send.send_bytes, hidden * size_of::<bf16>())?;
             let pstream = &bind.device.stream;
             let pctx = &bind.device.ctx;
+            #[cfg(feature = "cuda")]
             let untimed = Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DISABLE_TIMING);
+            #[cfg(feature = "rocm")]
+            let untimed = Some(2);
             let pd = PeerDecode {
                 gpu0_layers: bind.gpu0_layers,
                 send_ptr: bind.send_ptr,
@@ -1144,7 +1150,7 @@ impl Decode {
                 bounce,
                 fork: context.new_event(untimed)?,
                 join: pctx.new_event(untimed)?,
-                #[cfg(test)]
+                #[cfg(all(test, feature = "cuda"))]
                 perturb_word: None,
             };
             context.bind_to_thread()?;
@@ -1412,8 +1418,14 @@ impl Decode {
                     None,
                 )
             } else {
+                #[cfg(feature = "cuda")]
                 let (ids, g_ids) = self.ids.device_ptr(&self.mailbox);
+                #[cfg(feature = "rocm")]
+                let (ids, g_ids) = self.ids.device_ptr(self.ids.stream());
+                #[cfg(feature = "cuda")]
                 let (weights, g_weights) = self.weights.device_ptr(&self.mailbox);
+                #[cfg(feature = "rocm")]
+                let (weights, g_weights) = self.weights.device_ptr(self.weights.stream());
                 (ids, weights, Some(g_ids), Some(g_weights))
             };
             let (host_ids, _ids_write) =
@@ -1421,22 +1433,18 @@ impl Decode {
             let (host_weights, _weights_write) =
                 unsafe { self.host_weights.stream_synced_mut_slice(&self.mailbox) };
             let (host_x, _x_write) = unsafe { self.host_x.stream_synced_mut_slice(&self.mailbox) };
-            // SAFETY: each copied prefix has its exact logical extent inside the owned mailbox.
+            // SAFETY: mailbox waits self.reader after compute writes; mailbox synchronization completes these owned-prefix reads.
             unsafe {
-                result::memcpy_dtoh_async(
-                    &mut host_ids[..count],
-                    ids_ptr,
-                    self.mailbox.cu_stream(),
-                )?;
-                result::memcpy_dtoh_async(
+                copy::dtoh_async(&mut host_ids[..count], ids_ptr, self.mailbox.as_ref())?;
+                copy::dtoh_async(
                     &mut host_weights[..count],
                     weights_ptr,
-                    self.mailbox.cu_stream(),
+                    self.mailbox.as_ref(),
                 )?;
-                result::memcpy_dtoh_async(
+                copy::dtoh_async(
                     &mut host_x[..rows * self.geometry.hidden as usize],
                     x.ptr,
-                    self.mailbox.cu_stream(),
+                    self.mailbox.as_ref(),
                 )?;
             }
         }
@@ -1454,7 +1462,7 @@ impl Decode {
         ))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub fn finish(
         &mut self,
         device: &Device,
@@ -1534,20 +1542,27 @@ impl Decode {
                     unsafe { self.host_active.stream_synced_slice(&self.mailbox) };
                 let (generation, _generation_read) =
                     unsafe { self.host_generation.stream_synced_slice(&self.mailbox) };
+                #[cfg(feature = "cuda")]
                 let (active_ptr, _active_write) = self.active.device_ptr_mut(&self.mailbox);
+                #[cfg(feature = "rocm")]
+                let active_owner = self.active.stream().clone();
+                #[cfg(feature = "rocm")]
+                let (active_ptr, _active_write) = self.active.device_ptr_mut(&active_owner);
+                #[cfg(feature = "cuda")]
                 let (generation_ptr, _generation_write) =
                     self.generation.device_ptr_mut(&self.mailbox);
-                // SAFETY: owned pinned prefixes and device destinations each contain rows*top_k elements.
+                #[cfg(feature = "rocm")]
+                let generation_owner = self.generation.stream().clone();
+                #[cfg(feature = "rocm")]
+                let (generation_ptr, _generation_write) =
+                    self.generation.device_ptr_mut(&generation_owner);
+                // SAFETY: read_route waits self.reader before mailbox writes; compute waits self.mailbox_ready before reading the owned rows*top_k spans.
                 unsafe {
-                    result::memcpy_htod_async(
-                        active_ptr,
-                        &active[..rows * k],
-                        self.mailbox.cu_stream(),
-                    )?;
-                    result::memcpy_htod_async(
+                    copy::htod_async(active_ptr, &active[..rows * k], self.mailbox.as_ref())?;
+                    copy::htod_async(
                         generation_ptr,
                         &generation[..rows * k],
-                        self.mailbox.cu_stream(),
+                        self.mailbox.as_ref(),
                     )?;
                 }
             }
@@ -1616,13 +1631,12 @@ impl Decode {
             let pstream = &peer.device.stream;
             // SAFETY: contiguous GPU 0 send packet, portable bounce region, and GPU 1 recv slice stay live and ordered by fork/join events.
             unsafe {
-                cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                copy::dtoh_raw(
                     peer.bounce.send_ptr(),
                     peer.send_ptr,
                     layout.send_bytes,
-                    stream.cu_stream(),
+                    stream.as_ref(),
                 )
-                .result()
                 .context("cuMemcpyDtoHAsync decode peer send 0->h")?;
             }
             peer.fork
@@ -1637,13 +1651,12 @@ impl Decode {
                 .context("cuStreamWaitEvent decode peer fork")?;
             let recv_base = peer.recv.device_ptr(pstream).0;
             unsafe {
-                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                copy::htod_raw(
                     recv_base,
                     peer.bounce.send_ptr(),
                     layout.send_bytes,
-                    pstream.cu_stream(),
+                    pstream.as_ref(),
                 )
-                .result()
                 .context("cuMemcpyHtoDAsync decode peer recv h->1")?;
             }
             // SAFETY: recv_base owns layout.send_bytes on GPU 1 and x/ids/weights offsets are 16-byte aligned and disjoint.
@@ -1697,13 +1710,8 @@ impl Decode {
                     .launch(grid((rows * k).div_ceil(256), 256))
                     .context("cuLaunchKernel decode peer moe_route_mask")?;
                 let (done_ptr, _write) = peer.done.device_ptr_mut(pstream);
-                result::memset_d8_async(
-                    done_ptr,
-                    0,
-                    rows * k * size_of::<u32>(),
-                    pstream.cu_stream(),
-                )
-                .context("cuMemsetD8Async decode peer done")?;
+                copy::memset_bytes(done_ptr, 0, rows * k * size_of::<u32>(), pstream.as_ref())
+                    .context("cuMemsetD8Async decode peer done")?;
             }
             let p_contributions = view(
                 &peer.contributions,
@@ -1778,13 +1786,12 @@ impl Decode {
             let routed_bytes = layout.recv_bytes;
             // SAFETY: peer.routed_dev1 and portable bounce region stay live and ordered before join.
             unsafe {
-                cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+                copy::dtoh_raw(
                     peer.bounce.routed_ptr(),
                     src_routed,
                     routed_bytes,
-                    pstream.cu_stream(),
+                    pstream.as_ref(),
                 )
-                .result()
                 .context("cuMemcpyDtoHAsync decode peer routed 1->h")?;
             }
             peer.join
@@ -1857,12 +1864,7 @@ impl Decode {
             let (done_ptr, _write) = self.done.device_ptr_mut(stream);
             // SAFETY: done owns max_rows*top_k words and is ordered after the preceding layer's combine.
             unsafe {
-                result::memset_d8_async(
-                    done_ptr,
-                    0,
-                    rows * k * size_of::<u32>(),
-                    stream.cu_stream(),
-                )?
+                copy::memset_bytes(done_ptr, 0, rows * k * size_of::<u32>(), stream.as_ref())?
             };
         }
         let ids = view(&self.ids, stream, 0, [rows as u32, k as u32], [k as u64, 1])?;
@@ -1975,15 +1977,15 @@ impl Decode {
                 done_values[choice] = 1;
                 // SAFETY: each validated CPU choice owns its contribution and done word; mailboxes live through publication.
                 unsafe {
-                    result::memcpy_htod_async(
+                    copy::htod_async(
                         contributions.ptr + (first * 2) as u64,
                         &values[first..first + hidden],
-                        self.mailbox.cu_stream(),
+                        self.mailbox.as_ref(),
                     )?;
-                    result::memcpy_htod_async(
+                    copy::htod_async(
                         done.ptr + (choice * 4) as u64,
                         &done_values[choice..choice + 1],
-                        self.mailbox.cu_stream(),
+                        self.mailbox.as_ref(),
                     )?;
                 }
             }
@@ -2029,16 +2031,15 @@ impl Decode {
             let routed_in = qwen::matrix(&peer.routed_dev0, stream, 0, rows, hidden)?;
             // SAFETY: portable bounce region was written before peer.join and routed_in is live on GPU 0.
             unsafe {
-                cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                copy::htod_raw(
                     routed_in.ptr,
                     peer.bounce.routed_ptr(),
                     rows * hidden * size_of::<bf16>(),
-                    stream.cu_stream(),
+                    stream.as_ref(),
                 )
-                .result()
                 .context("cuMemcpyHtoDAsync decode peer routed h->0")?;
             }
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             if let Some((word_idx, bits)) = peer.perturb_word {
                 ensure!(
                     word_idx < rows * hidden,
@@ -2328,10 +2329,10 @@ fn validate_dispatch(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 #[path = "engine_moe_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 #[path = "engine_moe_e2e.rs"]
 mod e2e;

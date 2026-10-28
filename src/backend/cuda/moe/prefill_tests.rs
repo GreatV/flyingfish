@@ -16,8 +16,8 @@ use super::testing;
 use crate::backend::cuda::contracts::{Scratch, TensorMut};
 use crate::backend::cuda::cubin;
 use crate::backend::cuda::ops::grid;
-use anyhow::Result;
-use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, PushKernelArg};
+use crate::backend::gpu::{CudaSlice, CudaStream, DevicePtr, PushKernelArg};
+use anyhow::{Context, Result};
 use half::bf16;
 use std::sync::Arc;
 
@@ -346,17 +346,75 @@ fn fp8_prefill_gpu() -> Result<()> {
             .zip(&expected)
             .filter(|(a, b)| a.to_bits() != b.to_bits())
             .count();
-        let gemm_bad = canonical()?
+        let actual_gemms = canonical()?;
+        let gemm_bad = actual_gemms
             .iter()
             .zip(&expected_gemms)
             .filter(|(a, b)| a != b)
             .count();
+        if let Some(first) = actual_gemms
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(expected_gemms.as_chunks::<2>().0)
+            .position(|(a, b)| a != b)
+        {
+            let assignment = first / (2 * inter + hidden);
+            let column = first % (2 * inter + hidden);
+            let actual = bf16::from_le_bytes(actual_gemms[2 * first..2 * first + 2].try_into()?);
+            let expected =
+                bf16::from_le_bytes(expected_gemms[2 * first..2 * first + 2].try_into()?);
+            if column < 2 * inter {
+                let row = assignment / top_k;
+                let expert = ids[assignment] as usize;
+                let weight = &fx.gate_up[(expert * 2 * inter + column) * hidden..][..hidden];
+                let input = &fx.x[row * hidden..][..hidden];
+                let exact = weight
+                    .iter()
+                    .zip(input)
+                    .map(|(w, x)| w.to_f64() * x.to_f64())
+                    .sum::<f64>();
+                eprintln!(
+                    "FP8_GEMM_DIAGNOSTIC assignment={assignment} expert={expert} column={column} actual={actual:e} library={expected:e} fp64={exact:e}"
+                );
+            }
+        }
         let done_bad = s
             .clone_dtoh(&candidate.done)?
             .iter()
             .filter(|&&v| v != 1)
             .count();
+        #[cfg(feature = "cuda")]
         let bad = output_bad + gemm_bad + done_bad;
+        #[cfg(feature = "rocm")]
+        let bad = {
+            let positions = s.clone_dtoh(
+                &scratch_buf
+                    .slice(layout.pos_of as usize..layout.pos_of as usize + rows * top_k * 4),
+            )?;
+            let activation = s.clone_dtoh(
+                &scratch_buf
+                    .slice(layout.act as usize..layout.act as usize + rows * top_k * inter * 2),
+            )?;
+            let activation = activation
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| bf16::from_le_bytes(*b))
+                .collect::<Vec<_>>();
+            let mut ordered = Vec::with_capacity(activation.len());
+            for position in positions.as_chunks::<4>().0 {
+                let p = u32::from_le_bytes(*position) as usize;
+                ordered.extend_from_slice(&activation[p * inter..(p + 1) * inter]);
+            }
+            hip_fp8_prefill_reference(&fx, &ids, &weights, &actual_gemms, &ordered, &actual)?
+                + done_bad
+                + if arithmetic == 2 {
+                    output_bad + gemm_bad
+                } else {
+                    0
+                }
+        };
         println!(
             "FP8_PREFILL rows={rows} arithmetic={arithmetic} expert_subset={experts} top_k={top_k} native_gate=[{inter},{hidden}] native_up=[{inter},{hidden}] native_down=[{hidden},{inter}] native_slot_bytes={} expert_materialization_bytes=0 gemm_byte_mismatches={gemm_bad} contribution_bit_mismatches={output_bad} done_mismatches={done_bad} {}",
             native_layout.slot_bytes(),
@@ -409,7 +467,11 @@ fn fp8_prefill_gpu() -> Result<()> {
                 let values = s.clone_dtoh(&reversed.contributions)?;
                 let mismatches = values
                     .chunks_exact(top_k * hidden)
-                    .zip(expected.chunks_exact(top_k * hidden).rev())
+                    .zip(
+                        if format == "FP8" { &actual } else { &expected }
+                            .chunks_exact(top_k * hidden)
+                            .rev(),
+                    )
                     .flat_map(|(a, b)| a.iter().zip(b))
                     .filter(|(a, b)| a.to_bits() != b.to_bits())
                     .count();
@@ -463,7 +525,7 @@ fn fp8_prefill_gpu() -> Result<()> {
             let changed = s
                 .clone_dtoh(&mutant.contributions)?
                 .iter()
-                .zip(&expected)
+                .zip(&actual)
                 .filter(|(a, b)| a.to_bits() != b.to_bits())
                 .count();
             ensure!(changed > 0, "FP8 expert swap control undetected");
@@ -473,11 +535,114 @@ fn fp8_prefill_gpu() -> Result<()> {
         }
     }
     println!(
-        "FP8_PREFILL_SUMMARY cases=15 defects={defects} exact_bf16_grouped={}",
-        defects == 0
+        "FP8_PREFILL_SUMMARY cases=15 defects={defects} reference={}",
+        if cfg!(feature = "rocm") {
+            "fp64_stages_lane16_bits"
+        } else {
+            "bf16_grouped_bits"
+        }
     );
     ensure!(defects == 0, "FP8 prefill DEFECT cases={defects}");
     Ok(())
+}
+
+#[cfg(feature = "rocm")]
+fn hip_fp8_prefill_reference(
+    fx: &MoeFixture,
+    ids: &[i32],
+    weights: &[bf16],
+    gemms: &[u8],
+    activation: &[bf16],
+    contributions: &[bf16],
+) -> Result<usize> {
+    let (h, inter, top_k) = (fx.dims.hidden, fx.dims.inter, fx.dims.top_k);
+    let width = 2 * inter + h;
+    anyhow::ensure!(
+        gemms.len() == ids.len() * width * 2
+            && activation.len() == ids.len() * inter
+            && contributions.len() == ids.len() * h
+            && weights.len() == ids.len(),
+        "Runner FAIL FP8 staged reference extents"
+    );
+    let values = gemms
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| bf16::from_le_bytes(*b))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        values
+            .iter()
+            .chain(activation)
+            .chain(contributions)
+            .all(|v| v.is_finite()),
+        "Runner FAIL FP8 staged nonfinite value"
+    );
+    let mut errors = [0usize; 4];
+    let mut activated_error = 0.0f64;
+    for (a, &expert) in ids.iter().enumerate() {
+        let expert = usize::try_from(expert)?;
+        anyhow::ensure!(
+            expert < fx.dims.experts,
+            "Runner FAIL FP8 expert reference index"
+        );
+        let row = a / top_k;
+        let observed = &values[a * width..(a + 1) * width];
+        let input = &fx.x[row * h..(row + 1) * h];
+        let act = &activation[a * inter..(a + 1) * inter];
+        for (stage, weight, input, actual) in [
+            (
+                0,
+                &fx.gate_up[expert * 2 * inter * h..(expert + 1) * 2 * inter * h],
+                input,
+                &observed[..2 * inter],
+            ),
+            (
+                1,
+                &fx.down[expert * h * inter..(expert + 1) * h * inter],
+                act,
+                &observed[2 * inter..],
+            ),
+        ] {
+            let k = input.len();
+            let nu = (k + 6) as f64 * 2f64.powi(-24);
+            for (column, (w, actual)) in weight.chunks_exact(k).zip(actual).enumerate() {
+                let (value, absolute) =
+                    w.iter().zip(input).fold((0.0f64, 0.0f64), |sum, (w, x)| {
+                        let product = w.to_f64() * x.to_f64();
+                        (sum.0 + product, sum.1 + product.abs())
+                    });
+                let bound = value.abs() / 256.0 + nu / (1.0 - nu) * absolute + 2f64.powi(-134);
+                if (actual.to_f64() - value).abs() > bound {
+                    if errors[stage] == 0 {
+                        eprintln!(
+                            "FP8_PREFILL_FP64_ERROR assignment={a} stage={stage} column={column} actual={actual:e} expected={value:e} bound={bound:e}"
+                        );
+                    }
+                    errors[stage] += 1;
+                }
+            }
+        }
+        for d in 0..inter {
+            let g = observed[d].to_f32();
+            let silu = bf16::from_f32(g / (1.0 + (-g).exp()));
+            let expected = bf16::from_f32(silu.to_f32() * observed[inter + d].to_f32()).to_f64();
+            activated_error =
+                activated_error.max((act[d].to_f64() - expected).abs() / (1.0 + expected.abs()));
+        }
+        for d in 0..h {
+            let expected = bf16::from_f32(observed[2 * inter + d].to_f32() * weights[a].to_f32());
+            errors[3] += usize::from(expected.to_bits() != contributions[a * h + d].to_bits());
+        }
+    }
+    let normalized = activated_error;
+    let activation_bound = crate::backend::cuda::bf16_chain_bound(2, &[1]) + 1e-5;
+    errors[2] = usize::from(normalized > activation_bound);
+    println!(
+        "FP8_PREFILL_FP64 assignments={} projection_bound=abs(v)/256+gamma(K+6)*sum_abs+2^-134 swiglu_normalized={normalized:e} swiglu_bound={activation_bound:e} errors={errors:?}",
+        ids.len()
+    );
+    Ok(errors.into_iter().sum())
 }
 
 /// Stage capacities: the D2H window holds counts[E], the 256-byte-aligned
@@ -868,6 +1033,9 @@ fn contribute_input<'a>(
 fn raw_dtoh<T>(s: &Arc<CudaStream>, src: u64, dst: &mut [T]) -> Result<()> {
     s.context().bind_to_thread()?;
     unsafe {
+        #[cfg(feature = "rocm")]
+        s.copy_raw(dst.as_mut_ptr() as u64, src, std::mem::size_of_val(dst), 2)?;
+        #[cfg(feature = "cuda")]
         cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
             dst.as_mut_ptr().cast(),
             src,
@@ -883,6 +1051,9 @@ fn raw_dtoh<T>(s: &Arc<CudaStream>, src: u64, dst: &mut [T]) -> Result<()> {
 fn raw_htod<T>(s: &Arc<CudaStream>, dst: u64, src: &[T]) -> Result<()> {
     s.context().bind_to_thread()?;
     unsafe {
+        #[cfg(feature = "rocm")]
+        s.copy_raw(dst, src.as_ptr() as u64, std::mem::size_of_val(src), 1)?;
+        #[cfg(feature = "cuda")]
         cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
             dst,
             src.as_ptr().cast(),
@@ -1043,7 +1214,7 @@ fn capture_shared_out(
     let layout = prefill_layout(rows, rows, top_k, experts, hidden, inter, None)?;
     let mut host = vec![bf16::ZERO; rows * hidden];
     raw_dtoh(ctx.s, ctx.scratch.ptr + layout.shared_out, &mut host)?;
-    Ok(ctx.s.clone_htod(&host)?)
+    ctx.s.clone_htod(&host).context("upload MoE gate metadata")
 }
 
 /// One wrapper-style join over caller-owned buffers: sigmoid gate once per
@@ -1428,13 +1599,13 @@ fn moe_prefill_gpu() -> Result<()> {
             mixed.dims.top_k,
             mixed.dims.experts,
         );
-        let x_m = testing::upload(&d.upload, mixed.x.clone())?;
-        let gu_m = testing::upload(&d.upload, mixed.gate_up.clone())?;
-        let dn_m = testing::upload(&d.upload, mixed.down.clone())?;
-        let sg_m = testing::upload(&d.upload, mixed.shared_gate.clone())?;
-        let su_m = testing::upload(&d.upload, mixed.shared_up.clone())?;
-        let sd_m = testing::upload(&d.upload, mixed.shared_down.clone())?;
-        let seg_m = testing::upload(&d.upload, mixed.shared_expert_gate.clone())?;
+        let x_m = testing::upload_device(&d, mixed.x.clone())?;
+        let gu_m = testing::upload_device(&d, mixed.gate_up.clone())?;
+        let dn_m = testing::upload_device(&d, mixed.down.clone())?;
+        let sg_m = testing::upload_device(&d, mixed.shared_gate.clone())?;
+        let su_m = testing::upload_device(&d, mixed.shared_up.clone())?;
+        let sd_m = testing::upload_device(&d, mixed.shared_down.clone())?;
+        let seg_m = testing::upload_device(&d, mixed.shared_expert_gate.clone())?;
         d.finish_upload()?;
         let routed0 = reference::route_row(&mixed, 0);
         let routed1 = reference::route_row(&mixed, 1);
@@ -1937,6 +2108,7 @@ fn moe_prefill_gpu() -> Result<()> {
 }
 
 /// True when the error chain reports the device-side trap's launch failure.
+#[cfg(feature = "cuda")]
 fn trap_launched(err: &anyhow::Error) -> bool {
     const MARKERS: [&str; 4] = [
         "illegal instruction",
@@ -1948,6 +2120,12 @@ fn trap_launched(err: &anyhow::Error) -> bool {
         let text = cause.to_string().to_lowercase();
         MARKERS.iter().any(|marker| text.contains(marker))
     })
+}
+
+#[cfg(feature = "rocm")]
+fn trap_launched(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<crate::backend::hip::RuntimeError>()
+        .is_some_and(|error| error.status == 719)
 }
 
 /// Child shared setup: fixture-sized slot tables, shared expert buffers and
@@ -1971,13 +2149,11 @@ fn child_setup(s: &Arc<CudaStream>, fx: &MoeFixture, generation: Vec<u64>) -> Re
     let gu: CudaSlice<bf16> = s.clone_htod(fx.gate_up.as_slice())?;
     let dn: CudaSlice<bf16> = s.clone_htod(fx.down.as_slice())?;
     let gu_ptr = {
-        let (ptr, guard) = gu.device_ptr(s);
-        drop(guard);
+        let (ptr, _guard) = gu.device_ptr(s);
         ptr
     };
     let dn_ptr = {
-        let (ptr, guard) = dn.device_ptr(s);
-        drop(guard);
+        let (ptr, _guard) = dn.device_ptr(s);
         ptr
     };
     let slots = device_slots(
@@ -2008,8 +2184,7 @@ fn child_setup(s: &Arc<CudaStream>, fx: &MoeFixture, generation: Vec<u64>) -> Re
     )?;
     let scratch_buf: CudaSlice<u8> = s.alloc_zeros(scratch_bytes as usize)?;
     let scratch_ptr = {
-        let (ptr, guard) = scratch_buf.device_ptr(s);
-        drop(guard);
+        let (ptr, _guard) = scratch_buf.device_ptr(s);
         ptr
     };
     let scratch = Scratch {
@@ -2158,7 +2333,7 @@ fn pos_of_oob_child() -> Result<()> {
     };
     let outcome = launched
         .and_then(|_| s.synchronize())
-        .map_err(anyhow::Error::from);
+        .context("synchronize MoE guard control");
     eprintln!(
         "moe_prefill K2 out-of-range pos_of rows={rows} planted pos_of[0]={} assignments={}",
         planted[0],
@@ -2331,9 +2506,12 @@ fn check_compact_dispatch(
     let count = module.load_function("moe_count_scan")?;
     let permute = module.load_function("moe_permute")?;
     let scatter = module.load_function("moe_scatter")?;
+    #[cfg(feature = "cuda")]
     let sms = d.ctx.attribute(
         cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
     )? as usize;
+    #[cfg(feature = "rocm")]
+    let sms = d.ctx.properties.compute_units as usize;
     let limit = sms * count.occupancy_max_active_blocks_per_multiprocessor(256, 0, None)? as usize;
     anyhow::ensure!(limit > 0, "compact count occupancy");
     let blocks = assignments.div_ceil(2048).max(1).min(limit);
@@ -2688,7 +2866,7 @@ fn prefill_reset_done_gpu() -> Result<()> {
         };
         let outcome = ops
             .prefill_finish(s, fin, &scratch)
-            .and_then(|_| s.synchronize().map_err(anyhow::Error::from));
+            .and_then(|_| s.synchronize().context("synchronize MoE guard control"));
         eprintln!("moe_prefill reset-done child outcome: {outcome:?}");
         let trapped = match &outcome {
             Err(err) => {
@@ -3360,7 +3538,7 @@ fn prefill_packed_waves(wave_rows: usize, grouped: bool) -> Result<()> {
                 .iter()
                 .map(|&e| u32::from(set.contains(&(e as u32))))
                 .collect();
-            Ok(s.clone_htod(&mask)?)
+            s.clone_htod(&mask).context("upload MoE gate mask")
         })
         .collect::<Result<_>>()?;
     let copy_event = d.ctx.new_event(None)?;
@@ -4049,6 +4227,59 @@ fn check_combine_residual_shape(
             .zip(&res_ref)
             .filter(|(a, b)| a.to_bits() != b.to_bits())
             .count();
+        if res_bad > 0 {
+            let first = got_res
+                .iter()
+                .zip(&res_ref)
+                .position(|(a, b)| a.to_bits() != b.to_bits())
+                .unwrap();
+            let scales = s.clone_dtoh(&scale_d)?;
+            let zeros = s.alloc_zeros::<bf16>(rows * top_k * hidden)?;
+            let ones = s.clone_htod(&vec![bf16::ONE; rows * hidden])?;
+            let diagnostic = s.alloc_zeros::<bf16>(rows * hidden)?;
+            combine.combine_residual(
+                s,
+                &MoeCombineResidual {
+                    ids: testing::dense(&ids_d, s, rows as u32, top_k as u32)?,
+                    final_active: testing::dense(&active_d, s, rows as u32, top_k as u32)?,
+                    done: testing::dense(&done_d, s, rows as u32, top_k as u32)?,
+                    contributions: testing::view(
+                        &zeros,
+                        s,
+                        [rows as u32, top_k as u32, hidden as u32],
+                        [(top_k * hidden) as u64, hidden as u64, 1],
+                    )?,
+                    shared_out: testing::dense(&ones, s, rows as u32, hidden as u32)?,
+                    x: x_view,
+                    shared_expert_gate: gated.then_some(seg_view),
+                    residual: None,
+                    y_out: Some(testing::dense_mut(
+                        &diagnostic,
+                        s,
+                        rows as u32,
+                        hidden as u32,
+                    )?),
+                },
+                hidden_blocks as u32,
+            )?;
+            let scale_fused = s.clone_dtoh(&diagnostic)?;
+            eprintln!(
+                "COMBINE_DIAGNOSTIC row={} column={} initial={} y_ref={} actual={} expected={} scale_separate={} scale_fused={} scale_bit_differences={}",
+                first / hidden,
+                first % hidden,
+                res_init_h[first],
+                y_ref[first],
+                got_res[first],
+                res_ref[first],
+                scales[first / hidden],
+                scale_fused[first],
+                scale_fused
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, value)| value.to_bits() != scales[*i / hidden].to_bits())
+                    .count()
+            );
+        }
         anyhow::ensure!(
             res_bad == 0,
             "combine_residual mismatch hidden={hidden} gated={gated}: {res_bad}"

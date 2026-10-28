@@ -17,7 +17,7 @@
 // set. causal_mask is u64[64]; the caller supplies the visible block-key bits.
 // Kernels read prefix/valid_rows from the device SequenceMeta. Grids are sized from
 // max_rows; segments with no live rows exit without writing.
-#include <cuda_bf16.h>
+#include "gpu_compat.cuh"
 #include <cstdint>
 #ifndef ATTENTION_Q_HEADS
 #define ATTENTION_Q_HEADS 24
@@ -56,8 +56,14 @@ static_assert(KT * NSLICE % NT == 0, "KV tile staging must divide the block");
 
 // Narrow-tile dynamic shared memory: Q [MT][LDS], K [KT][LDS], V [KT][LDS],
 // causal mask [64] u64. The host opts this in before the first launch.
+#if defined(__HIP__)
+constexpr int SMEM_NARROW = (MT * DH + KT * DH + MT * KT) * 2 +
+                          (MT * KT + 3 * MT) * 4 + M_CAP * 8;
+static_assert(SMEM_NARROW == 62720, "wave32 shared memory budget");
+#else
 constexpr int SMEM_NARROW = (MT + 2 * KT) * LDS * 2 + M_CAP * 8;
 static_assert(SMEM_NARROW == 68096, "narrow-tile shared memory budget");
+#endif
 
 // Partial RoPE: only the first ROTARY dims rotate, in (j, j+ROTARY/2) pairs.
 #ifndef ATTENTION_ROTARY_DIM
@@ -67,6 +73,7 @@ constexpr int ROTARY = ATTENTION_ROTARY_DIM;
 constexpr int RHALF  = ROTARY / 2;
 constexpr float THETA = 1.0e7f;
 
+#if !defined(__HIP__)
 __device__ __forceinline__ unsigned smem_u32(const void* p) {
   return (unsigned)__cvta_generic_to_shared(p);
 }
@@ -106,6 +113,8 @@ __device__ __forceinline__ void cp_commit() {
 __device__ __forceinline__ void cp_wait0() {
   asm volatile("cp.async.wait_group 0;\n");
 }
+
+#endif
 
 // Device-side invariants only. prepare() does the host-side shape/stride work.
 __device__ __forceinline__ void guard_meta(const int4* meta) {
@@ -309,7 +318,139 @@ extern "C" __global__ void tcmqa_d256_v_scatter(const __nv_bfloat16* __restrict_
 // Pair p = q_in_group*seg_rows + local_row; the tile covers pairs [rt*MT, rt*MT+MT).
 // Warp w owns MMA rows [w*16, w*16+16).
 // Launch: grid(Pmax, HKV, ceil(GQA*seg_rows/MT)), block NT,
-//         dynamic smem SMEM_NARROW (> 48 KiB, host opts in).
+//         CUDA dynamic smem SMEM_NARROW; HIP dynamic smem 62720 bytes.
+#if defined(__HIP__)
+using AttentionBf16 = short __attribute__((ext_vector_type(16)));
+using AttentionAcc = float __attribute__((ext_vector_type(8)));
+
+template<bool COMPACT = false>
+__device__ __forceinline__ void phase1_body(
+    const bf16* __restrict__ q, const bf16* __restrict__ kc, const bf16* __restrict__ vc,
+    float* __restrict__ p_max, float* __restrict__ p_sum, float* __restrict__ p_out,
+    const unsigned long long* __restrict__ causal_mask, const int4* __restrict__ meta,
+    int q_tok_stride, int k_head_stride, int k_pos_stride,
+    int v_head_stride, int v_pos_stride,
+    int key_chunk, int Pmax, int seg_rows, int row_base, KvCacheView cache = {}) {
+  const int part = blockIdx.x, kv = blockIdx.y, row0 = blockIdx.z * MT;
+  const int m = min(seg_rows, meta[0].y - row_base), L = meta[0].x + row_base;
+  if (m <= 0 || part >= (L + m + key_chunk - 1) / key_chunk) return;
+  const int tid = threadIdx.x, wave = tid / 32, lane = tid % 32;
+  const int nrows = GQA * seg_rows, owned = wave * 16 + lane % 16;
+  const int pos_beg = part * key_chunk, pos_end = min(pos_beg + key_chunk, L + m);
+  extern __shared__ __align__(16) bf16 tcm_sm[];
+  bf16* qs = tcm_sm;
+  bf16* kvs = qs + MT * DH;
+  bf16* ps = kvs + KT * DH;
+  float* scores = reinterpret_cast<float*>(ps + MT * KT);
+  float* maxima = scores + MT * KT;
+  float* sums = maxima + MT;
+  float* factors = sums + MT;
+  auto* masks = reinterpret_cast<unsigned long long*>(factors + MT);
+  static_assert((MT * DH + KT * DH + MT * KT) * 2 +
+                (MT * KT + 3 * MT) * 4 + M_CAP * 8 == 62720);
+  for (int i = tid; i < M_CAP; i += NT) masks[i] = causal_mask[i];
+  for (int i = tid; i < MT * DH; i += NT) {
+    const int row = i / DH, d = i % DH, pair = row0 + row;
+    const int local = pair % seg_rows, qg = pair / seg_rows;
+    qs[i] = pair < nrows && local < m
+      ? q[(size_t)local * q_tok_stride + (size_t)(kv * GQA + qg) * DH + d]
+      : __float2bfloat16(0.0f);
+  }
+  if (tid < MT) { maxima[tid] = -3.0e38f; sums[tid] = 0.0f; }
+  __syncthreads();
+  AttentionAcc output[DH / 16] = {};
+  for (int begin = pos_beg; begin < pos_end; begin += KT) {
+    for (int i = tid; i < KT * DH; i += NT) {
+      const int pos = begin + i / DH, d = i % DH;
+      if constexpr (COMPACT) {
+        kvs[i] = pos < pos_end ? kv_load(cache, true, kv, pos, d) : __float2bfloat16(0.0f);
+      } else {
+        kvs[i] = pos < pos_end ? kc[(size_t)kv * k_head_stride + (size_t)pos * k_pos_stride + d]
+                              : __float2bfloat16(0.0f);
+      }
+    }
+    __syncthreads();
+    AttentionAcc dot[KT / 16] = {};
+#pragma unroll 1
+    for (int block = 0; block < DH / 16; ++block) {
+      AttentionBf16 query;
+#pragma unroll
+      for (int j = 0; j < 16; ++j)
+        query[j] = reinterpret_cast<const unsigned short*>(qs + owned * DH)[block * 16 + j];
+#pragma unroll
+      for (int tile = 0; tile < KT / 16; ++tile) {
+        AttentionBf16 key;
+#pragma unroll
+        for (int j = 0; j < 16; ++j)
+          key[j] = reinterpret_cast<const unsigned short*>(kvs + (tile * 16 + lane % 16) * DH)[block * 16 + j];
+        dot[tile] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(key, query, dot[tile]);
+      }
+    }
+#pragma unroll
+    for (int tile = 0; tile < KT / 16; ++tile)
+#pragma unroll
+      for (int j = 0; j < 8; ++j)
+        scores[owned * KT + tile * 16 + 2 * j + lane / 16] = dot[tile][j] * SCALE;
+    __syncthreads();
+    if (tid < MT) {
+      const int local = (row0 + tid) % seg_rows;
+      float next = maxima[tid];
+      for (int j = 0; j < KT; ++j) {
+        const int pos = begin + j, relative = pos - L;
+        const bool visible = pos < pos_end && (relative < 0 ||
+          (relative < seg_rows && ((masks[local] >> relative) & 1ull)));
+        if (!visible) scores[tid * KT + j] = -INFINITY;
+        next = fmaxf(next, scores[tid * KT + j]);
+      }
+      const float factor = __expf(maxima[tid] - next);
+      float sum = 0.0f;
+      for (int j = 0; j < KT; ++j) {
+        const float probability = __expf(scores[tid * KT + j] - next);
+        ps[tid * KT + j] = __float2bfloat16(probability);
+        sum += probability;
+      }
+      maxima[tid] = next;
+      sums[tid] = sums[tid] * factor + sum;
+      factors[tid] = factor;
+    }
+    for (int i = tid; i < KT * DH; i += NT) {
+      const int pos = begin + i / DH, d = i % DH;
+      if constexpr (COMPACT) {
+        kvs[i] = pos < pos_end ? kv_load(cache, false, kv, pos, d) : __float2bfloat16(0.0f);
+      } else {
+        kvs[i] = pos < pos_end ? vc[(size_t)kv * v_head_stride + (size_t)pos * v_pos_stride + d]
+                              : __float2bfloat16(0.0f);
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int tile = 0; tile < DH / 16; ++tile) {
+      output[tile] *= factors[owned];
+#pragma unroll
+      for (int block = 0; block < KT / 16; ++block) {
+        AttentionBf16 value, probability;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+          value[j] = reinterpret_cast<const unsigned short*>(kvs)[(block * 16 + j) * DH + tile * 16 + lane % 16];
+          probability[j] = reinterpret_cast<const unsigned short*>(ps + owned * KT)[block * 16 + j];
+        }
+        output[tile] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(value, probability, output[tile]);
+      }
+    }
+    __syncthreads();
+  }
+  const int pair = row0 + owned, local = pair % seg_rows;
+  if (pair < nrows && local < m) {
+    const size_t element = (size_t)(kv * Pmax + part) * nrows + pair;
+    if (lane < 16) { p_max[element] = maxima[owned]; p_sum[element] = sums[owned]; }
+#pragma unroll
+    for (int tile = 0; tile < DH / 16; ++tile)
+#pragma unroll
+      for (int j = 0; j < 8; ++j)
+        p_out[element * DH + tile * 16 + 2 * j + lane / 16] = output[tile][j];
+  }
+}
+#else
 template<bool COMPACT = false>
 __device__ __forceinline__ void phase1_body(
     const bf16* __restrict__ q, const bf16* __restrict__ kc, const bf16* __restrict__ vc,
@@ -478,8 +619,8 @@ __device__ __forceinline__ void phase1_body(
     }
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
-      rmax[half] = fmaxf(rmax[half], __shfl_xor_sync(0xffffffffu, rmax[half], 1));
-      rmax[half] = fmaxf(rmax[half], __shfl_xor_sync(0xffffffffu, rmax[half], 2));
+      rmax[half] = fmaxf(rmax[half], __shfl_xor_sync(FF_WARP_MASK, rmax[half], 1));
+      rmax[half] = fmaxf(rmax[half], __shfl_xor_sync(FF_WARP_MASK, rmax[half], 2));
     }
 #pragma unroll
     for (int half = 0; half < 2; ++half) {
@@ -495,8 +636,8 @@ __device__ __forceinline__ void phase1_body(
         pn[n][half * 2 + 1] = p1;
         rsum += p0 + p1;
       }
-      rsum += __shfl_xor_sync(0xffffffffu, rsum, 1);
-      rsum += __shfl_xor_sync(0xffffffffu, rsum, 2);
+      rsum += __shfl_xor_sync(FF_WARP_MASK, rsum, 1);
+      rsum += __shfl_xor_sync(FF_WARP_MASK, rsum, 2);
       ls[half] = ls[half] * cf + rsum;
       // rescale the accumulators of this row half
 #pragma unroll
@@ -559,6 +700,7 @@ __device__ __forceinline__ void phase1_body(
   }
 }
 
+#endif
 extern "C" __global__ void __launch_bounds__(NT) tcmqa_d256_phase1(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ k_cache,
     const __nv_bfloat16* __restrict__ v_cache,

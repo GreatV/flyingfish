@@ -1,11 +1,9 @@
-#[cfg(feature = "cuda")]
 pub(crate) mod attention_d256;
 #[cfg(feature = "cuda")]
 pub mod blas;
 #[cfg(feature = "rocm")]
 #[path = "../hip_blas.rs"]
 pub mod blas;
-#[cfg(feature = "cuda")]
 pub mod calibrate;
 mod closure;
 pub mod contracts;
@@ -16,19 +14,16 @@ pub mod draft;
 pub mod engine;
 #[cfg(feature = "cuda")]
 pub mod flash;
-#[cfg(feature = "cuda")]
 pub(crate) mod gdn;
 #[cfg(test)]
 #[cfg(feature = "cuda")]
 mod kv_cache_tests;
-#[cfg(feature = "cuda")]
 pub(crate) mod linear;
 #[cfg(feature = "cuda")]
 mod linear_calibrate;
 mod markov;
 #[cfg(feature = "cuda")]
 mod markov_calibrate;
-#[cfg(feature = "cuda")]
 pub(crate) mod moe;
 #[cfg(feature = "cuda")]
 pub mod multi_calibrate;
@@ -532,6 +527,16 @@ fn verify_peer_transport(
     Ok(())
 }
 
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn random(n: usize, mut state: u32) -> Vec<half::bf16> {
+    (0..n)
+        .map(|_| {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            half::bf16::from_f32((state >> 8) as f32 / 16777216.0 - 0.5)
+        })
+        .collect()
+}
+
 /// γ_n = n·u / (1 − n·u).
 pub(crate) fn gamma(n: usize, u: f64) -> f64 {
     let nu = n as f64 * u;
@@ -793,5 +798,12 @@ impl Device {
     pub fn finish_upload(&self) -> Result<()> {
         self.stream.wait(&self.upload.record_event(Some(2))?)?;
         self.stream.synchronize()
+    }
+    pub fn peer(&self) -> Result<Option<Self>> {
+        anyhow::ensure!(
+            CudaContext::device_count()? == 1,
+            "HIP expert peer transport is not implemented for multiple devices"
+        );
+        Ok(None)
     }
 }

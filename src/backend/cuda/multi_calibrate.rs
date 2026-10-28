@@ -1,8 +1,8 @@
 use super::{
     Device, calibrate,
-    calibrate::random,
     flash::Shape,
     ops::{Ops, grid},
+    random,
     verification::{Query, Verification, phase1_residency},
 };
 use crate::{

@@ -59,6 +59,28 @@ unsafe extern "C" {
         compute: i32,
         algo: i32,
     ) -> i32;
+    fn hipblasGemmBatchedEx(
+        handle: Handle,
+        ta: i32,
+        tb: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: *const c_void,
+        a: *const *const c_void,
+        at: i32,
+        lda: i32,
+        b: *const *const c_void,
+        bt: i32,
+        ldb: i32,
+        beta: *const c_void,
+        c: *mut Handle,
+        ct: i32,
+        ldc: i32,
+        batch: i32,
+        compute: i32,
+        algo: i32,
+    ) -> i32;
     fn hipblasLtCreate(handle: *mut Handle) -> i32;
     fn hipblasLtDestroy(handle: Handle) -> i32;
     fn hipblasLtGetVersion(handle: Handle, version: *mut i32) -> i32;
@@ -234,6 +256,7 @@ pub struct Blas {
     identity: Identity,
     workspace: CudaSlice<u8>,
     skinny: Option<CudaFunction>,
+    fp8: Option<crate::backend::gpu::linear::Fp8Ops>,
     // Every plan accumulates in FP32 and adds bias before the BF16 output rounding.
     plans: RefCell<BTreeMap<Binding, Arc<Plan>>>,
 }
@@ -275,6 +298,7 @@ impl Blas {
             identity,
             workspace,
             skinny,
+            fp8: None,
             plans: RefCell::new(BTreeMap::new()),
         };
         let handles =
@@ -304,6 +328,27 @@ impl Blas {
 
     pub fn identity(&self) -> &Identity {
         &self.identity
+    }
+
+    pub(crate) fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
+    pub(crate) fn enable_fp8(
+        &mut self,
+        context: &Arc<crate::backend::gpu::CudaContext>,
+    ) -> Result<()> {
+        ensure!(self.fp8.is_none(), "FP8 operators already bound");
+        ensure!(
+            Arc::ptr_eq(context, self.stream.context()),
+            "FP8 context differs from HIP BLAS"
+        );
+        self.fp8 = Some(crate::backend::gpu::linear::Fp8Ops::new(context)?);
+        Ok(())
+    }
+
+    pub(crate) fn fp8_ops(&self) -> Result<&crate::backend::gpu::linear::Fp8Ops> {
+        self.fp8.as_ref().context("FP8 operators not bound")
     }
 
     pub fn prepare_choice(
@@ -530,7 +575,6 @@ impl Blas {
         let plan = plans
             .get(&key)
             .context("HIP linear shape/bias binding not prepared")?;
-        self.stream.retain(plan);
         if plan.choice.implementation == Implementation::Wmma {
             return self.wmma((shape, shape.input), bias, weight, input, output);
         }
@@ -559,32 +603,21 @@ impl Blas {
         let (a, _a) = weight.device_ptr(&self.stream);
         let (b, _b) = input.device_ptr(&self.stream);
         let (c, _c) = output.device_ptr_mut(&self.stream);
+        self.library_raw(plan, shape, [a, b, c])
+    }
+
+    fn library_raw(&self, plan: &Arc<Plan>, shape: LinearShape, pointers: [u64; 3]) -> Result<()> {
+        self.stream.context().bind_to_thread()?;
+        self.stream.retain(plan);
+        let [a, b, c] = pointers;
         let (alpha, beta) = (1f32, 0f32);
         unsafe {
             if shape.rows == 1 {
-                check(
-                    hipblasGemmEx(
-                        self.handles.handle,
-                        112,
-                        111,
-                        shape.output as i32,
-                        1,
-                        shape.input as i32,
-                        (&alpha as *const f32).cast(),
-                        a as *const c_void,
-                        14,
-                        shape.input as i32,
-                        b as *const c_void,
-                        14,
-                        shape.input as i32,
-                        (&beta as *const f32).cast(),
-                        c as Handle,
-                        14,
-                        shape.output as i32,
-                        2,
-                        160,
-                    ),
-                    "hipblasGemmEx",
+                self.bf16_gemm(
+                    shape,
+                    [a, b, c],
+                    [shape.input, shape.input, shape.output],
+                    None,
                 )?;
             } else {
                 let (workspace, _work) = self.workspace.device_ptr(&self.stream);
@@ -608,6 +641,93 @@ impl Blas {
                         self.stream.raw(),
                     ),
                     "hipblasLtMatmul",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// BF16 operands/output, FP32 accumulation, W transpose, alpha=1 and beta=0.
+    /// # Safety
+    /// Pointers cover the strided matrices, or `batch` device pointer arrays.
+    /// Their allocations and ordering remain valid until the stream completes.
+    pub(crate) unsafe fn bf16_gemm(
+        &self,
+        shape: LinearShape,
+        pointers: [u64; 3],
+        strides: [usize; 3],
+        batch: Option<usize>,
+    ) -> Result<()> {
+        ensure!(
+            [shape.rows, shape.output, shape.input]
+                .into_iter()
+                .chain(strides)
+                .all(|n| n > 0 && n <= i32::MAX as usize)
+                && strides[0] >= shape.input
+                && strides[1] >= shape.input
+                && strides[2] >= shape.output
+                && pointers
+                    .iter()
+                    .all(|p| *p != 0 && p.is_multiple_of(if batch.is_some() { 8 } else { 2 }))
+                && batch.is_none_or(|n| n > 0 && n <= i32::MAX as usize),
+            "HIP BF16 GEMM shape, stride, pointer or batch extent is invalid"
+        );
+        self.stream.context().bind_to_thread()?;
+        self.stream.retain(&self.handles);
+        let (alpha, beta) = (1f32, 0f32);
+        let [a, b, c] = pointers;
+        let [lda, ldb, ldc] = strides.map(|n| n as i32);
+        unsafe {
+            if let Some(batch) = batch {
+                check(
+                    hipblasGemmBatchedEx(
+                        self.handles.handle,
+                        112,
+                        111,
+                        shape.output as i32,
+                        shape.rows as i32,
+                        shape.input as i32,
+                        (&alpha as *const f32).cast(),
+                        a as *const *const c_void,
+                        14,
+                        lda,
+                        b as *const *const c_void,
+                        14,
+                        ldb,
+                        (&beta as *const f32).cast(),
+                        c as *mut Handle,
+                        14,
+                        ldc,
+                        batch as i32,
+                        2,
+                        160,
+                    ),
+                    "hipblasGemmBatchedEx",
+                )?;
+            } else {
+                check(
+                    hipblasGemmEx(
+                        self.handles.handle,
+                        112,
+                        111,
+                        shape.output as i32,
+                        shape.rows as i32,
+                        shape.input as i32,
+                        (&alpha as *const f32).cast(),
+                        a as *const c_void,
+                        14,
+                        lda,
+                        b as *const c_void,
+                        14,
+                        ldb,
+                        (&beta as *const f32).cast(),
+                        c as Handle,
+                        14,
+                        ldc,
+                        2,
+                        160,
+                    ),
+                    "hipblasGemmEx",
                 )?;
             }
         }
@@ -681,13 +801,18 @@ impl Blas {
         } else {
             0
         };
+        let (w, _w) = weight.device_ptr(&self.stream);
+        let (x, _x) = input.device_ptr(&self.stream);
+        let (y, _y) = output.device_ptr_mut(&self.stream);
+        self.wmma_raw(shape, stride, [w, x, y, bias_ptr])
+    }
+
+    fn wmma_raw(&self, shape: LinearShape, stride: usize, pointers: [u64; 4]) -> Result<()> {
         let function = self
             .skinny
             .as_ref()
             .context("HIP WMMA function not bound")?;
-        let (w, _w) = weight.device_ptr(&self.stream);
-        let (x, _x) = input.device_ptr(&self.stream);
-        let (y, _y) = output.device_ptr_mut(&self.stream);
+        let [w, x, y, bias_ptr] = pointers;
         unsafe {
             self.stream
                 .launch_builder(function)
@@ -705,6 +830,83 @@ impl Blas {
                 ))?;
         }
         Ok(())
+    }
+
+    pub(crate) fn prepare_fixed(&self, rows: u32, output: u32, input: u32) -> Result<()> {
+        self.prepare_choice(
+            LinearShape {
+                rows: rows as usize,
+                output: output as usize,
+                input: input as usize,
+            },
+            None,
+            None,
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn prepare_skinny(&self, shape: LinearShape) -> Result<()> {
+        self.stream
+            .require_eager("invariant WMMA plan preparation")?;
+        ensure!(
+            self.wmma_candidate(shape),
+            "HIP invariant WMMA shape unsupported: {shape:?}"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn linear_typed(
+        &self,
+        phase: crate::op_contract::ExecutionPhase,
+        weight: crate::backend::gpu::linear::LinearWeightRef,
+        x: crate::backend::gpu::contracts::Tensor<bf16, 2>,
+        y: &mut crate::backend::gpu::contracts::TensorMut<bf16, 2>,
+    ) -> Result<()> {
+        self.linear_typed_bound(phase, weight, x, y, 0)
+    }
+
+    pub(crate) fn linear_typed_bound(
+        &self,
+        phase: crate::op_contract::ExecutionPhase,
+        weight: crate::backend::gpu::linear::LinearWeightRef,
+        x: crate::backend::gpu::contracts::Tensor<bf16, 2>,
+        y: &mut crate::backend::gpu::contracts::TensorMut<bf16, 2>,
+        invariant_rows: usize,
+    ) -> Result<()> {
+        use crate::backend::gpu::linear;
+        let linear::LinearWeightRef::Bf16(w) = weight else {
+            anyhow::bail!("HIP FP8 projection requires a setup-bound channel call");
+        };
+        if phase == crate::op_contract::ExecutionPhase::Decode {
+            ensure!(x.shape[0] == 1, "Decode requires M1");
+        }
+        w.validate()?;
+        linear::validate_call(w.shape, x, &y.0)?;
+        linear::disjoint(&w, &y.0)?;
+        ensure!(
+            w.stride == [u64::from(w.shape[1]), 1],
+            "HIP BF16 weight requires row-major layout"
+        );
+        let shape = LinearShape {
+            rows: x.shape[0] as usize,
+            output: w.shape[0] as usize,
+            input: w.shape[1] as usize,
+        };
+        if (1..=invariant_rows).contains(&shape.rows) {
+            ensure!(
+                self.wmma_candidate(shape),
+                "HIP invariant WMMA shape unsupported: {shape:?}"
+            );
+            return self.wmma_raw(shape, shape.input, [w.ptr, x.ptr, y.0.ptr, 0]);
+        }
+        let plans = self.plans.borrow();
+        let plan = plans
+            .get(&(shape, None))
+            .context("HIP fixed linear shape not prepared")?;
+        if plan.choice.implementation == Implementation::Wmma {
+            return self.wmma_raw(shape, shape.input, [w.ptr, x.ptr, y.0.ptr, 0]);
+        }
+        self.library_raw(plan, shape, [w.ptr, x.ptr, y.0.ptr])
     }
 
     pub fn calibrate_shape(

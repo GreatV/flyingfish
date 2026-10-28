@@ -6,8 +6,8 @@ use crate::backend::cuda::contracts::{Scratch, Tensor, TensorMut, spans_disjoint
 use crate::backend::cuda::cubin;
 #[cfg(test)]
 use crate::backend::cuda::moe::combine::{CombineOps, MoeCombine};
+use crate::backend::gpu::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use half::bf16;
 use std::sync::Arc;
 
@@ -348,11 +348,14 @@ impl DecodeOps {
         )
     }
 
+    #[cfg(any(feature = "cuda", test))]
     pub(crate) fn new_invariant_with_boundaries(
         ctx: &Arc<CudaContext>,
         swiglu_rounding: crate::model_spec::SwigluRounding,
         routed_weight: crate::model_spec::RoutedWeightBoundary,
     ) -> Result<Self> {
+        #[cfg(feature = "rocm")]
+        ctx.require_wmma()?;
         let module = cubin::module(ctx, "moe_ffn")?;
         Ok(Self {
             gate_up: module.load_function("moe_ffn_gate_up_lane16")?,
@@ -531,6 +534,7 @@ impl DecodeOps {
             let up = shared + u64::from(rows) * u64::from(shared_inter) * 2;
             let gemm = |weight: u64, x: u64, y: u64, columns: u32, inner: u32| -> Result<()> {
                 // SAFETY: validated dense regions cover every complete weight and activation tile.
+                #[cfg(feature = "cuda")]
                 unsafe {
                     stream
                         .launch_builder(skinny)
@@ -550,6 +554,23 @@ impl DecodeOps {
                             },
                             false,
                         )?)?;
+                }
+                #[cfg(feature = "rocm")]
+                unsafe {
+                    stream
+                        .launch_builder(skinny)
+                        .arg(&weight)
+                        .arg(&x)
+                        .arg(&y)
+                        .arg(&0u64)
+                        .arg(&(columns as i32))
+                        .arg(&(inner as i32))
+                        .arg(&u64::from(inner))
+                        .arg(&(rows as i32))
+                        .launch(crate::backend::cuda::ops::grid(
+                            columns.div_ceil(16) as usize,
+                            128,
+                        ))?;
                 }
                 Ok(())
             };

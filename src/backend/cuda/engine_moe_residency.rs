@@ -1,5 +1,6 @@
 //! Native expert DMA ownership and the CPU residency runtime.
 use super::*;
+use crate::backend::gpu::CudaFunction;
 use crate::experts::{
     arena::{BlockLease, WriteClaim},
     catalogue::ExpertCatalogue,
@@ -7,7 +8,6 @@ use crate::experts::{
     plan::Tier,
     runtime::{MoveSource, PromptMove, Residency},
 };
-use cudarc::driver::CudaFunction;
 use std::cell::RefCell;
 
 #[path = "engine_moe_prefill.rs"]
@@ -113,6 +113,7 @@ impl Reader {
             copied: vec![None; slots],
         };
         device.ctx.bind_to_thread()?;
+        #[cfg(feature = "cuda")]
         let flags = if portable {
             cudarc::driver::sys::CU_MEMHOSTREGISTER_PORTABLE
         } else {
@@ -128,15 +129,19 @@ impl Reader {
                 "disk ring registration repeated address={address:#x}"
             );
             // SAFETY: the reader owns every stable ring allocation through unregister.
-            unsafe {
+            #[cfg(feature = "cuda")]
+            let result = unsafe {
                 cudarc::driver::sys::cuMemHostRegister_v2(
                     address as *mut std::ffi::c_void,
                     bytes,
                     flags,
                 )
                 .result()
-            }
-            .with_context(|| format!("register expert disk ring: slot={slot} bytes={bytes}"))?;
+            };
+            #[cfg(feature = "rocm")]
+            let result = unsafe { device.ctx.register_host(address, bytes, portable) };
+            result
+                .with_context(|| format!("register expert disk ring: slot={slot} bytes={bytes}"))?;
             reader.registrations.push(address);
         }
         Ok(reader)
@@ -180,9 +185,13 @@ impl Drop for Reader {
         self.context.record_err(self.context.bind_to_thread());
         for &address in &self.registrations {
             // SAFETY: all ring DMA is complete and the owned allocation is still live.
-            self.context.record_err(unsafe {
+            #[cfg(feature = "cuda")]
+            let result = unsafe {
                 cudarc::driver::sys::cuMemHostUnregister(address as *mut std::ffi::c_void).result()
-            });
+            };
+            #[cfg(feature = "rocm")]
+            let result = unsafe { self.context.unregister_host(address) };
+            self.context.record_err(result);
         }
     }
 }
@@ -413,13 +422,12 @@ impl Transfers {
         self.d2h.context().bind_to_thread()?;
         // SAFETY: the full native slot and its claimed host or pinned destination stay owned.
         unsafe {
-            cudarc::driver::sys::cuMemcpyDtoHAsync_v2(
+            copy::dtoh_raw(
                 destination as *mut std::ffi::c_void,
                 pointer,
                 bytes,
-                self.d2h.cu_stream(),
+                self.d2h.as_ref(),
             )
-            .result()
         }
         .with_context(|| format!("expert write-back: block={block} bytes={bytes}"))?;
         let completed = events.record(&self.d2h)?;
@@ -523,9 +531,9 @@ pub(in crate::backend::cuda::engine) struct Slots {
     readers: Vec<u32>,
     disk_cpu: Option<DiskExperts>,
     pub request_open: bool,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pending_reads: u64,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     delay_request: bool,
 }
 
@@ -564,7 +572,7 @@ fn check_lifetime(expected: [Option<u64>; 2], owned: [Option<u64>; 2]) -> Result
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 pub(super) fn delay_stream(stream: &Arc<CudaStream>) -> Result<()> {
     unsafe extern "C" fn delay(_: *mut std::ffi::c_void) {
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -750,9 +758,9 @@ impl Slots {
                 None
             },
             request_open: false,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             pending_reads: 0,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             delay_request: false,
         };
         let slots_new_ms = phase_started.elapsed().as_secs_f64() * 1000.0;
@@ -884,9 +892,12 @@ impl Slots {
             self.transfers.h2d.wait(&peer.synced)?;
             self.transfers.h2d.context().bind_to_thread()?;
         } else {
+            #[cfg(feature = "cuda")]
             let tables = self.bindings(layer as usize, &self.transfers.h2d)?;
+            #[cfg(feature = "rocm")]
+            let tables = self.bindings(layer as usize, self.gate_up.stream())?;
             let stream = &self.transfers.h2d;
-            // SAFETY: checked layer/expert extents and owned tables cover both scalar updates.
+            // SAFETY: apply_move waits slot copy/reader tickets on h2d; checked table updates precede the publication ticket waited by prepare_routes.
             unsafe {
                 stream
                     .launch_builder(&self.publish)
@@ -947,13 +958,12 @@ impl Slots {
                     peer.upload.context().bind_to_thread()?;
                     // SAFETY: the portable registered ring guard remains alive until the copy is submitted.
                     unsafe {
-                        cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                        copy::htod_raw(
                             self.physical[slot as usize].pointer,
                             pointer as *const std::ffi::c_void,
                             usize::try_from(self.catalogue.slot_bytes())?,
-                            peer.upload.cu_stream(),
+                            peer.upload.as_ref(),
                         )
-                        .result()
                     }
                     .context("copy native disk expert into its peer physical slot")?;
                     peer.synced.record(&peer.upload)?;
@@ -962,13 +972,12 @@ impl Slots {
                 } else {
                     // SAFETY: the registered ring guard remains alive until the copy is submitted.
                     unsafe {
-                        cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                        copy::htod_raw(
                             self.physical[slot as usize].pointer,
                             pointer as *const std::ffi::c_void,
                             usize::try_from(self.catalogue.slot_bytes())?,
-                            self.transfers.h2d.cu_stream(),
+                            self.transfers.h2d.as_ref(),
                         )
-                        .result()
                     }
                     .context("copy native disk expert into its physical slot")?;
                 }
@@ -984,13 +993,12 @@ impl Slots {
                 peer.upload.context().bind_to_thread()?;
                 // SAFETY: the source remains claimed or staged through the recorded copy.
                 unsafe {
-                    cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                    copy::htod_raw(
                         self.physical[slot as usize].pointer,
                         pointer as *const std::ffi::c_void,
                         usize::try_from(self.catalogue.slot_bytes())?,
-                        peer.upload.cu_stream(),
+                        peer.upload.as_ref(),
                     )
-                    .result()
                 }
                 .context("copy native host expert into its peer physical slot")?;
                 peer.synced.record(&peer.upload)?;
@@ -1000,13 +1008,12 @@ impl Slots {
                 self.transfers.h2d.context().bind_to_thread()?;
                 // SAFETY: the pinned source remains claimed or staged through the recorded copy.
                 unsafe {
-                    cudarc::driver::sys::cuMemcpyHtoDAsync_v2(
+                    copy::htod_raw(
                         self.physical[slot as usize].pointer,
                         pointer as *const std::ffi::c_void,
                         usize::try_from(self.catalogue.slot_bytes())?,
-                        self.transfers.h2d.cu_stream(),
+                        self.transfers.h2d.as_ref(),
                     )
-                    .result()
                 }
                 .context("copy native host expert into its physical slot")?;
             }
@@ -1080,7 +1087,7 @@ impl Slots {
         self.moves
             .extend_from_slice(self.policy.begin_request(frequency)?);
         for index in 0..self.moves.len() {
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             if index + 1 == self.moves.len() && std::mem::take(&mut self.delay_request) {
                 delay_stream(&self.transfers.h2d)?;
             }
@@ -1091,7 +1098,7 @@ impl Slots {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(in crate::backend::cuda::engine) fn capture_placement(
         &self,
     ) -> Result<Vec<(Tier, Option<u32>)>> {
@@ -1111,7 +1118,7 @@ impl Slots {
         Ok(placement)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(in crate::backend::cuda::engine) fn pin_capture_request(
         &mut self,
         frequency: &[Vec<f64>],
@@ -1138,7 +1145,7 @@ impl Slots {
         self.policy.begin_token()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(in crate::backend::cuda::engine) fn freeze_probe_admissions(&mut self) -> Result<()> {
         self.transfers.finish()?;
         self.policy.freeze_probe_admissions()
@@ -1165,7 +1172,7 @@ impl Slots {
             });
         }
         for index in 0..self.moves.len() {
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             if index + 1 == self.moves.len() && std::mem::take(&mut self.delay_request) {
                 delay_stream(&self.transfers.h2d)?;
             }
@@ -1206,7 +1213,7 @@ impl Slots {
                         physical.copy.as_ref().is_some_and(|copy| copy.id == id),
                         "slot={slot} copy event differs from residency id={id}"
                     );
-                    #[cfg(test)]
+                    #[cfg(all(test, feature = "cuda"))]
                     if !physical
                         .copy
                         .as_ref()
@@ -1403,7 +1410,7 @@ impl Slots {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(super) fn finish_routed(
         &mut self,
         device: &Device,
@@ -1415,7 +1422,7 @@ impl Slots {
         self.complete(device, decode, layer, ffn, activation, None)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(super) fn trace(&self, trace: &mut Trace) -> Result<()> {
         let geometry = self.catalogue.geometry();
         self.policy.ledger().check()?;
@@ -1479,13 +1486,13 @@ impl Slots {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(super) fn delay_copies(&mut self) {
         self.delay_request = true;
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
 

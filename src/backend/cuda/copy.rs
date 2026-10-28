@@ -21,6 +21,138 @@ pub fn pinned_zeros<T: DeviceRepr + ValidAsZeroBits>(
     Ok(allocation)
 }
 
+/// # Safety
+/// Both spans stay live through completion; the caller orders all other accesses.
+pub(crate) unsafe fn dtoh_async<T: DeviceRepr>(
+    dst: &mut [T],
+    src: u64,
+    stream: &CudaStream,
+) -> Result<()> {
+    unsafe { dtoh_raw(dst.as_mut_ptr().cast(), src, size_of_val(dst), stream) }
+}
+
+/// # Safety
+/// Both spans stay live through completion; the caller orders all other accesses.
+pub(crate) unsafe fn htod_async<T: DeviceRepr>(
+    dst: u64,
+    src: &[T],
+    stream: &CudaStream,
+) -> Result<()> {
+    unsafe { htod_raw(dst, src.as_ptr().cast(), size_of_val(src), stream) }
+}
+
+/// # Safety
+/// The spans contain `bytes` valid bytes and stay live and ordered through completion.
+pub(crate) unsafe fn dtoh_raw(
+    dst: *mut std::ffi::c_void,
+    src: u64,
+    bytes: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    unsafe {
+        #[cfg(feature = "cuda")]
+        sys::cuMemcpyDtoHAsync_v2(dst, src, bytes, stream.cu_stream()).result()?;
+        #[cfg(feature = "rocm")]
+        stream.copy_raw(dst as u64, src, bytes, 2)?;
+    }
+    Ok(())
+}
+
+/// # Safety
+/// The spans contain `bytes` valid bytes and stay live and ordered through completion.
+pub(crate) unsafe fn htod_raw(
+    dst: u64,
+    src: *const std::ffi::c_void,
+    bytes: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    unsafe {
+        #[cfg(feature = "cuda")]
+        sys::cuMemcpyHtoDAsync_v2(dst, src, bytes, stream.cu_stream()).result()?;
+        #[cfg(feature = "rocm")]
+        stream.copy_raw(dst, src as u64, bytes, 1)?;
+    }
+    Ok(())
+}
+
+/// # Safety
+/// The device spans contain `bytes` valid bytes and stay live and ordered through completion.
+pub(crate) unsafe fn dtod_raw(dst: u64, src: u64, bytes: usize, stream: &CudaStream) -> Result<()> {
+    unsafe {
+        #[cfg(feature = "cuda")]
+        sys::cuMemcpyDtoDAsync_v2(dst, src, bytes, stream.cu_stream()).result()?;
+        #[cfg(feature = "rocm")]
+        stream.copy_raw(dst, src, bytes, 3)?;
+    }
+    Ok(())
+}
+
+/// # Safety
+/// Both device spans stay live and all reads and writes are ordered through completion.
+pub(crate) unsafe fn peer_raw(
+    dst: u64,
+    dst_context: &CudaContext,
+    src: u64,
+    src_context: &CudaContext,
+    bytes: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    unsafe {
+        sys::cuMemcpyPeerAsync(
+            dst,
+            dst_context.cu_ctx(),
+            src,
+            src_context.cu_ctx(),
+            bytes,
+            stream.cu_stream(),
+        )
+        .result()?;
+        Ok(())
+    }
+    #[cfg(feature = "rocm")]
+    anyhow::bail!(
+        "HIP peer copy is not implemented: src_device={} dst_device={} stream_device={} src={src:#x} dst={dst:#x} bytes={bytes}",
+        src_context.ordinal(),
+        dst_context.ordinal(),
+        stream.context().ordinal()
+    )
+}
+
+/// # Safety
+/// The destination contains `bytes` live bytes and prior readers are ordered on `stream`.
+pub(crate) unsafe fn memset_bytes(
+    dst: u64,
+    value: u8,
+    bytes: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    unsafe {
+        #[cfg(feature = "cuda")]
+        sys::cuMemsetD8Async(dst, value, bytes, stream.cu_stream()).result()?;
+        #[cfg(feature = "rocm")]
+        stream.memset_bytes(dst, value, bytes)?;
+    }
+    Ok(())
+}
+
+/// # Safety
+/// The aligned destination contains `count` live words and prior readers are ordered on `stream`.
+pub(crate) unsafe fn memset_words(
+    dst: u64,
+    value: u32,
+    count: usize,
+    stream: &CudaStream,
+) -> Result<()> {
+    unsafe {
+        #[cfg(feature = "cuda")]
+        sys::cuMemsetD32Async(dst, value, count, stream.cu_stream()).result()?;
+        #[cfg(feature = "rocm")]
+        stream.memset_words(dst, value, count)?;
+    }
+    Ok(())
+}
+
 pub fn bits(s: &Arc<CudaStream>, src: &impl DevicePtr<bf16>, dst: &mut Vec<u8>) -> Result<()> {
     for x in s.clone_dtoh(src)? {
         dst.extend_from_slice(&x.to_bits().to_le_bytes());
@@ -220,7 +352,12 @@ pub fn dtoh_bytes<T: crate::backend::gpu::DeviceRepr>(
     );
     s.context().bind_to_thread()?;
     let (src_ptr, _guard) = src.device_ptr(s);
+    #[cfg(feature = "cuda")]
     let dst_ptr = dst.as_mut_ptr()?;
+    #[cfg(feature = "rocm")]
+    let (dst_slice, _write) = unsafe { dst.stream_synced_mut_slice(s) };
+    #[cfg(feature = "rocm")]
+    let dst_ptr = dst_slice.as_mut_ptr();
     unsafe {
         #[cfg(feature = "cuda")]
         sys::cuMemcpyDtoHAsync_v2(
@@ -258,7 +395,12 @@ pub fn htod_bytes<T: crate::backend::gpu::DeviceRepr>(
     );
     s.context().bind_to_thread()?;
     let (dst_ptr, _guard) = dst.device_ptr_mut(s);
+    #[cfg(feature = "cuda")]
     let src_ptr = src.as_ptr()?;
+    #[cfg(feature = "rocm")]
+    let (src_slice, _read) = unsafe { src.stream_synced_slice(s) };
+    #[cfg(feature = "rocm")]
+    let src_ptr = src_slice.as_ptr();
     unsafe {
         #[cfg(feature = "cuda")]
         sys::cuMemcpyHtoDAsync_v2(

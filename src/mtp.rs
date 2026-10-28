@@ -236,13 +236,13 @@ fn scratch_bytes(capacity: usize, rows: usize) -> Result<usize> {
     )?;
     Ok(prep.max(repair))
 }
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
 pub(crate) struct AttachmentBudget {
     pub fixed_bytes: usize,
     pub row_bytes: usize,
     capacity: usize,
 }
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
 impl AttachmentBudget {
     pub fn new(spec: &ModelSpec, capacity: usize) -> Result<Self> {
         let row_bytes = runtime_row_bytes(spec)?
@@ -264,7 +264,7 @@ impl AttachmentBudget {
     }
 }
 
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
 pub(crate) fn checkpoint_bytes(spec: &ModelSpec, rows: usize) -> Result<usize> {
     use crate::{model_spec::Mixer, op_contract::GdnSpec};
     ensure!(rows > 0, "empty checkpoint window");
@@ -291,7 +291,7 @@ pub(crate) fn checkpoint_bytes(spec: &ModelSpec, rows: usize) -> Result<usize> {
     Ok(bytes)
 }
 
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
 pub(crate) fn component_spec(spec: &ModelSpec) -> Result<ModelSpec> {
     let mut component = spec.clone();
     let ffn = if spec.moe.is_some() {
@@ -309,7 +309,7 @@ pub(crate) fn component_spec(spec: &ModelSpec) -> Result<ModelSpec> {
     Ok(component)
 }
 
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
 pub(crate) fn snapshot_bytes(spec: &ModelSpec) -> Result<usize> {
     let layers = spec
         .layers
@@ -329,7 +329,7 @@ pub(crate) fn snapshot_bytes(spec: &ModelSpec) -> Result<usize> {
     .context("snapshot layer byte overflow")
 }
 
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
 pub(crate) fn batch_bytes(spec: &ModelSpec) -> Result<usize> {
     checkpoint_bytes(spec, 5)?
         .checked_add(snapshot_bytes(spec)?)
@@ -339,7 +339,7 @@ pub(crate) fn batch_bytes(spec: &ModelSpec) -> Result<usize> {
 
 /// Additional resident and workspace bytes, excluding the Engine's shared BLAS.
 /// The ordinary workspace planner applies its existing reserve to this total.
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
 pub(crate) fn attachment_bytes(
     spec: &ModelSpec,
     capacity: usize,

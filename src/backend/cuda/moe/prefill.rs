@@ -5,15 +5,19 @@
 use crate::backend::cuda::contracts::{Scratch, Tensor, TensorMut, no_overlap};
 use crate::backend::cuda::cubin;
 use crate::backend::cuda::ops::grid;
+#[cfg(feature = "rocm")]
+use crate::backend::gpu::blas::Blas as CudaBlas;
+use crate::backend::gpu::{
+    CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice,
+    PushKernelArg,
+};
 use crate::experts::catalogue::{ExpertGeometry, ExpertLayout, Fp8Slot};
 use crate::model_spec::ExpertFormat;
 use anyhow::{Context, Result, ensure};
+#[cfg(feature = "cuda")]
 use cudarc::{
     cublas::{CudaBlas, sys as bs},
-    driver::{
-        CudaContext, CudaEvent, CudaFunction, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice,
-        PushKernelArg, sys as ds,
-    },
+    driver::sys as ds,
 };
 use half::bf16;
 use std::sync::{Arc, Mutex};
@@ -827,14 +831,22 @@ struct Stage {
     runs: Vec<(u32, u32)>,
     offsets: Vec<i32>,
     arrays: GemmArrays,
+    #[cfg(feature = "cuda")]
     transa: Vec<bs::cublasOperation_t>,
+    #[cfg(feature = "cuda")]
     transb: Vec<bs::cublasOperation_t>,
+    #[cfg(feature = "cuda")]
     alpha: Vec<f32>,
+    #[cfg(feature = "cuda")]
     beta: Vec<f32>,
 }
 
 impl Stage {
     fn new(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        let event_flags = ds::CUevent_flags::CU_EVENT_DISABLE_TIMING;
+        #[cfg(feature = "rocm")]
+        let event_flags = 2;
         // SAFETY: the stage owns its pinned mirrors and initializes every transmitted word before upload.
         let stage = unsafe {
             Stage {
@@ -843,8 +855,8 @@ impl Stage {
                 gemm1_dev: stream.alloc_zeros::<u64>(GEMM1_PTR_WORDS)?,
                 gemm2_host: ctx.alloc_pinned_with_flags::<u64>(GEMM2_PTR_WORDS, 0)?,
                 gemm2_dev: stream.alloc_zeros::<u64>(GEMM2_PTR_WORDS)?,
-                gemm1_copy_done: ctx.new_event(Some(ds::CUevent_flags::CU_EVENT_DISABLE_TIMING))?,
-                gemm2_copy_done: ctx.new_event(Some(ds::CUevent_flags::CU_EVENT_DISABLE_TIMING))?,
+                gemm1_copy_done: ctx.new_event(Some(event_flags))?,
+                gemm2_copy_done: ctx.new_event(Some(event_flags))?,
                 order: Vec::with_capacity(MAX_EXPERTS),
                 runs: Vec::with_capacity(MAX_EXPERTS),
                 offsets: Vec::with_capacity(MAX_EXPERTS),
@@ -857,9 +869,13 @@ impl Stage {
                     ldc: Vec::with_capacity(MAX_GROUPS),
                     size: Vec::with_capacity(MAX_GROUPS),
                 },
+                #[cfg(feature = "cuda")]
                 transa: vec![bs::cublasOperation_t::CUBLAS_OP_T; MAX_GROUPS],
+                #[cfg(feature = "cuda")]
                 transb: vec![bs::cublasOperation_t::CUBLAS_OP_N; MAX_GROUPS],
+                #[cfg(feature = "cuda")]
                 alpha: vec![1f32; MAX_GROUPS],
+                #[cfg(feature = "cuda")]
                 beta: vec![0f32; MAX_GROUPS],
             }
         };
@@ -922,9 +938,14 @@ impl PrefillOps {
         swiglu_rounding: crate::model_spec::SwigluRounding,
         routed_weight: crate::model_spec::RoutedWeightBoundary,
     ) -> Result<Self> {
+        #[cfg(feature = "rocm")]
+        if format == ExpertFormat::Fp8W8a16 {
+            ctx.require_wmma()?;
+        }
         let module = cubin::module(ctx, "moe_prefill")?;
         let act = cubin::module(ctx, "act")?;
         let blas = CudaBlas::new(stream.clone())?;
+        #[cfg(feature = "cuda")]
         unsafe {
             bs::cublasSetMathMode(
                 *blas.handle(),
@@ -933,9 +954,12 @@ impl PrefillOps {
             .result()?;
         }
         let count_scan = module.load_function("moe_count_scan")?;
+        #[cfg(feature = "cuda")]
         let sms = usize::try_from(
             ctx.attribute(ds::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
         )?;
+        #[cfg(feature = "rocm")]
+        let sms = usize::try_from(ctx.properties.compute_units)?;
         let blocks_per_sm =
             count_scan.occupancy_max_active_blocks_per_multiprocessor(BLOCK_THREADS, 0, None)?
                 as usize;
@@ -1721,7 +1745,7 @@ impl PrefillOps {
                     .arg(&(shape.0 as i32))
                     .arg(&(shape.1 as i32))
                     .arg(&scale_offset)
-                    .launch(cudarc::driver::LaunchConfig {
+                    .launch(crate::backend::gpu::LaunchConfig {
                         grid_dim: (
                             shape.0.div_ceil(128),
                             rows.div_ceil(W8A16_TILE_ROWS),
@@ -1771,7 +1795,7 @@ impl PrefillOps {
             if scale_offset.is_some() {
                 launch.arg(&offset);
             }
-            launch.launch(cudarc::driver::LaunchConfig {
+            launch.launch(crate::backend::gpu::LaunchConfig {
                 grid_dim: (
                     shape.0.div_ceil(LANE16_ROWS),
                     rows,
@@ -1794,6 +1818,7 @@ impl PrefillOps {
         if n == 0 {
             return Ok(());
         }
+        #[cfg(feature = "cuda")]
         unsafe {
             bs::cublasGemmGroupedBatchedEx(
                 *self.blas.handle(),
@@ -1819,6 +1844,38 @@ impl PrefillOps {
             )
             .result()?;
         }
+        #[cfg(feature = "rocm")]
+        {
+            let mut offset = 0usize;
+            for group in 0..n {
+                let size = usize::try_from(arrays.size[group])?;
+                let end = offset
+                    .checked_add(size)
+                    .context("HIP grouped GEMM extent overflow")?;
+                ensure!(end <= problems, "HIP grouped GEMM pointer extent exceeded");
+                unsafe {
+                    self.blas.bf16_gemm(
+                        crate::backend::setup::LinearShape {
+                            rows: usize::try_from(arrays.n[group])?,
+                            output: usize::try_from(arrays.m[group])?,
+                            input: usize::try_from(arrays.k[group])?,
+                        },
+                        [
+                            block + offset as u64 * 8,
+                            block + (problems + offset) as u64 * 8,
+                            block + (2 * problems + offset) as u64 * 8,
+                        ],
+                        [
+                            usize::try_from(arrays.lda[group])?,
+                            usize::try_from(arrays.ldb[group])?,
+                            usize::try_from(arrays.ldc[group])?,
+                        ],
+                        Some(size),
+                    )?;
+                }
+                offset = end;
+            }
+        }
         Ok(())
     }
 }
@@ -1834,7 +1891,10 @@ fn elem(count: u64) -> u64 {
 unsafe fn zero_words(stream: &Arc<CudaStream>, dst: u64, words: usize) -> Result<()> {
     stream.context().bind_to_thread()?;
     unsafe {
+        #[cfg(feature = "cuda")]
         ds::cuMemsetD32Async(dst, 0, words, stream.cu_stream()).result()?;
+        #[cfg(feature = "rocm")]
+        stream.memset_words(dst, 0, words)?;
     }
     Ok(())
 }
@@ -1854,8 +1914,16 @@ unsafe fn dtoh_window(
         window.len()
     );
     stream.context().bind_to_thread()?;
+    #[cfg(feature = "cuda")]
     let dst = window.as_mut_ptr()?;
+    #[cfg(feature = "rocm")]
+    let (span, _write) = unsafe { window.stream_synced_mut_slice(stream) };
+    #[cfg(feature = "rocm")]
+    let dst = span.as_mut_ptr();
     unsafe {
+        #[cfg(feature = "rocm")]
+        stream.copy_raw(dst as u64, src, words * size_of::<i32>(), 2)?;
+        #[cfg(feature = "cuda")]
         ds::cuMemcpyDtoHAsync_v2(
             dst.cast(),
             src,
@@ -1883,8 +1951,16 @@ unsafe fn htod_ptrs(
         src.len()
     );
     stream.context().bind_to_thread()?;
+    #[cfg(feature = "cuda")]
     let host = src.as_ptr()?;
+    #[cfg(feature = "rocm")]
+    let (span, _read) = unsafe { src.stream_synced_slice(stream) };
+    #[cfg(feature = "rocm")]
+    let host = span.as_ptr();
     unsafe {
+        #[cfg(feature = "rocm")]
+        stream.copy_raw(dst, host as u64, words * size_of::<u64>(), 1)?;
+        #[cfg(feature = "cuda")]
         ds::cuMemcpyHtoDAsync_v2(
             dst,
             host.cast(),
