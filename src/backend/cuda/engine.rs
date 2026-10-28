@@ -3232,7 +3232,6 @@ impl Engine {
         if self.moe.is_some() {
             return self.capture_moe();
         }
-        #[cfg(feature = "cuda")]
         ensure!(
             self.spec.is_none(),
             "graph decode is not declared for draft-enabled engines"
@@ -3637,10 +3636,11 @@ impl Engine {
             self.run_step(step, trace)?;
         }
         let spec = self.spec.as_ref().context("draft State is not enabled")?;
-        Ok(self
+        let values = self
             .device
             .stream
-            .clone_dtoh(&spec.predictions.slice(..tree.nodes().len()))?)
+            .clone_dtoh(&spec.predictions.slice(..tree.nodes().len()))?;
+        Ok(values)
     }
 
     fn ensure_tree_verify_graph(&mut self, step: crate::backend::Step<'_>) -> Result<()> {

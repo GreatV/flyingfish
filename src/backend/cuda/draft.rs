@@ -252,7 +252,7 @@ pub struct Draft {
     rows: usize,
     stream: Arc<CudaStream>,
     attention: Option<Attention>,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     position_shift: i32,
     qknorm_rope_kv: crate::backend::gpu::CudaFunction,
     norm: crate::backend::gpu::CudaFunction,
@@ -512,7 +512,7 @@ impl Draft {
             rows,
             stream: s.clone(),
             attention: None,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             position_shift: 0,
             qknorm_rope_kv,
             norm: norm_module.load_function(norm_name)?,
@@ -1019,7 +1019,8 @@ impl Draft {
             0,
             self.config.block_size * size_of::<f32>(),
         )?;
-        Ok(self.stream.clone_dtoh(&self.tokens)?)
+        let values = self.stream.clone_dtoh(&self.tokens)?;
+        Ok(values)
     }
 
     pub fn confidences(&self) -> Result<Vec<f32>> {
