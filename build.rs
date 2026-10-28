@@ -34,7 +34,6 @@ fn compile_device(
             "-Z",
             "build-std=core",
             "--release",
-            "--locked",
             "--offline",
         ]);
         for key in [

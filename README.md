@@ -43,7 +43,7 @@ host build:
 
 ```sh
 rustup toolchain install nightly-2026-10-06 --profile minimal --component rust-src,llvm-tools,llvm-bitcode-linker,rustfmt,clippy --target nvptx64-nvidia-cuda
-RUSTFLAGS='-C target-cpu=sm_86' cargo +nightly-2026-10-06 build --manifest-path device/Cargo.toml --target nvptx64-nvidia-cuda -Z build-std=core --release --locked
+RUSTFLAGS='-C target-cpu=sm_86' cargo +nightly-2026-10-06 build --manifest-path device/Cargo.toml --target nvptx64-nvidia-cuda -Z build-std=core --release
 ```
 
 The host build uses the stable pin and builds native attention cubins for each
