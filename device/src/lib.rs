@@ -107,7 +107,7 @@ unsafe fn shuffle(a: f32, mask: u32) -> f32 {
     f32::from_bits(x)
 }
 #[inline(always)]
-unsafe fn probability(a: f32, negative_peak: f32, scale: f32) -> f32 {
+unsafe fn probability<const D: usize>(a: f32, negative_peak: f32, scale: f32) -> f32 {
     let x;
     unsafe {
         asm!("fma.rn.ftz.f32 {x}, {a}, {scale}, {peak}; ex2.approx.ftz.f32 {x}, {x};",
@@ -314,7 +314,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_window(
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128_window(p: Attention, window: u32) {
     unsafe {
-        attention::<128, 16, 3>(p, p.start + p.rows, window);
+        attention::<128, 16, 3>(p, p.start + p.rows, window, core::f32::consts::FRAC_1_SQRT_2 / 8.0);
     }
 }
 
@@ -553,8 +553,8 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                     -next[1] * (core::f32::consts::LOG2_E * scale),
                 ];
                 let mut alpha = [
-                    probability::<D>(peak[0] - next[0], 0.0),
-                    probability::<D>(peak[1] - next[1], 0.0),
+                    probability::<{ D }>(peak[0] - next[0], 0.0, scale),
+                    probability::<{ D }>(peak[1] - next[1], 0.0, scale),
                 ];
                 if MODE == 3 {
                     for row in 0..2 {
@@ -569,10 +569,10 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                 let mut residual = [[0u32; 4]; 4];
                 macro_rules! probabilities {
                     ($n:expr) => {{
-                        let a = probability(scores[$n][0], negative_peak[0], scale);
-                        let b = probability(scores[$n][1], negative_peak[0], scale);
-                        let c = probability(scores[$n][2], negative_peak[1], scale);
-                        let d = probability(scores[$n][3], negative_peak[1], scale);
+                        let a = probability::<{ D }>(scores[$n][0], negative_peak[0], scale);
+                        let b = probability::<{ D }>(scores[$n][1], negative_peak[0], scale);
+                        let c = probability::<{ D }>(scores[$n][2], negative_peak[1], scale);
+                        let d = probability::<{ D }>(scores[$n][3], negative_peak[1], scale);
                         sum[0] += a + b;
                         sum[1] += c + d;
                         packed[$n / 2][($n % 2) * 2] = pack(a, b);
@@ -945,7 +945,7 @@ unsafe fn attention_d512<const SPLIT: bool>(
             let mut negative_peak = [0.0; 2];
             for i in 0..2 {
                 if next[i] != f32::NEG_INFINITY {
-                    alpha[i] = probability(peak[i] - next[i], 0.0, scale);
+                    alpha[i] = probability::<512>(peak[i] - next[i], 0.0, scale);
                     negative_peak[i] = -next[i] * core::f32::consts::LOG2_E * scale;
                 }
             }
@@ -953,10 +953,10 @@ unsafe fn attention_d512<const SPLIT: bool>(
             let mut packed = [[0u32; 4]; 2];
             macro_rules! probabilities {
                 ($i:expr) => {{
-                    let a = probability(scores[$i][0], negative_peak[0], scale);
-                    let b = probability(scores[$i][1], negative_peak[0], scale);
-                    let c = probability(scores[$i][2], negative_peak[1], scale);
-                    let d = probability(scores[$i][3], negative_peak[1], scale);
+                    let a = probability::<512>(scores[$i][0], negative_peak[0], scale);
+                    let b = probability::<512>(scores[$i][1], negative_peak[0], scale);
+                    let c = probability::<512>(scores[$i][2], negative_peak[1], scale);
+                    let d = probability::<512>(scores[$i][3], negative_peak[1], scale);
                     sum[0] += a + b;
                     sum[1] += c + d;
                     packed[$i / 2][($i % 2) * 2] = pack(a, b);
@@ -1088,7 +1088,7 @@ pub unsafe extern "ptx-kernel" fn attention_merge_d512(
             let source = partials.add(base + part as usize * 514);
             let denominator = *source.add(513);
             if denominator > 0.0 {
-                let weight = probability(*source.add(512) - peak, 0.0, 1.0);
+                let weight = probability::<512>(*source.add(512) - peak, 0.0, 1.0);
                 sum += weight * denominator;
                 for (i, value) in output.iter_mut().enumerate() {
                     *value += weight * *source.add(tid as usize * 4 + i);
