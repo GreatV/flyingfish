@@ -2817,6 +2817,7 @@ mod tests {
             std::env::var_os("FF_MINICPM_VISION_OUTPUT_DIR")
                 .context("vision output directory missing")?,
         );
+        #[cfg(feature = "cuda")]
         let tolerance_path = PathBuf::from(
             std::env::var_os("FF_MINICPM_TOLERANCES").context("tolerance file missing")?,
         );
@@ -2824,8 +2825,15 @@ mod tests {
             std::env::var_os("FF_MINICPM_VISION_REFERENCE")
                 .context("reference directory missing")?,
         );
+        #[cfg(feature = "cuda")]
         let tolerances: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&tolerance_path)?)?;
+        #[cfg(feature = "rocm")]
+        let tolerances = serde_json::from_str::<serde_json::Value>(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/minicpm_reference.json"
+        )))?["vision_tower"]
+            .clone();
         std::fs::create_dir_all(&output)?;
         let model = ModelSpec::read(&model_dir)?;
         ensure!(
@@ -3612,17 +3620,6 @@ mod tests {
                             LinearBiasMode::AfterOutputRound,
                         )?;
                         let actual = s.clone_dtoh(&y)?;
-                        #[cfg(feature = "rocm")]
-                        {
-                            let raw = blas.projection_rounding_probe(width as usize)?;
-                            println!(
-                                "VISION_PATCH_F32 input={input} positive={} negative={} positive_bits={} negative_bits={}",
-                                raw[0],
-                                raw[width as usize / 2],
-                                raw[0].to_bits(),
-                                raw[width as usize / 2].to_bits()
-                            );
-                        }
                         let wrong = actual
                             .iter()
                             .enumerate()

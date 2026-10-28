@@ -1030,13 +1030,6 @@ impl Blas {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn projection_rounding_probe(&self, count: usize) -> Result<Vec<f32>> {
-        let buffer = self.rounded_output.borrow();
-        let values = buffer.as_ref().context("rounded projection missing")?;
-        self.stream.clone_dtoh(&values.slice(..count))
-    }
-
     pub(crate) fn linear_typed(
         &self,
         phase: crate::op_contract::ExecutionPhase,
