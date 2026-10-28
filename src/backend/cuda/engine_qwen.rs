@@ -4386,6 +4386,7 @@ impl Engine {
                     let prep_heads = if reader { 0 } else { hkv };
                     let cache_start = if overflow { history as i32 } else { -1 };
                     if all_layers(trace) || i == self.trace_layer {
+                        s.synchronize()?;
                         trace_value(
                             trace,
                             s,
@@ -4424,6 +4425,7 @@ impl Engine {
                             })?;
                     }
                     if all_layers(trace) || i == self.trace_layer {
+                        s.synchronize()?;
                         trace_value(
                             trace,
                             s,
