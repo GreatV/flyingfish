@@ -1,8 +1,82 @@
 {
   "steps": 4,
   "cases": [
-    {"name": "text33", "rows": 33, "chunks": [33, 17], "forced": [115, 1301, 3809]},
-    {"name": "text1024", "rows": 1024, "chunks": [1024, 257], "forced": [115, 1301, 3809]},
-    {"name": "text4096", "rows": 4096, "chunks": [4096, 1024], "forced": [115, 1301, 3809]}
-  ]
+    {
+      "name": "text33",
+      "rows": 33,
+      "chunks": [
+        33,
+        17
+      ],
+      "forced": [
+        115,
+        1301,
+        3809
+      ],
+      "CUDA_engine_error": {
+        "max_normalized": 0.5488503320778411,
+        "rms_normalized": 0.10480276303023076
+      },
+      "reference_floor": {
+        "max_normalized": 0.5159054069214558,
+        "rms_normalized": 0.09369742775172918
+      },
+      "limits": {
+        "max_normalized": 1.717873728940213,
+        "rms_normalized": 0.3183983092912468
+      }
+    },
+    {
+      "name": "text1024",
+      "rows": 1024,
+      "chunks": [
+        1024,
+        257
+      ],
+      "forced": [
+        115,
+        1301,
+        3809
+      ],
+      "CUDA_engine_error": {
+        "max_normalized": 0.42818706511531324,
+        "rms_normalized": 0.07163456820609752
+      },
+      "reference_floor": {
+        "max_normalized": 0.4396311477633304,
+        "rms_normalized": 0.08947390346465574
+      },
+      "limits": {
+        "max_normalized": 1.4144961269208025,
+        "rms_normalized": 0.26849101718693336
+      }
+    },
+    {
+      "name": "text4096",
+      "rows": 4096,
+      "chunks": [
+        4096,
+        1024
+      ],
+      "forced": [
+        115,
+        1301,
+        3809
+      ],
+      "CUDA_engine_error": {
+        "max_normalized": 0.32976537746857043,
+        "rms_normalized": 0.07139911297793702
+      },
+      "reference_floor": {
+        "max_normalized": 0.297963879571933,
+        "rms_normalized": 0.05172875539465794
+      },
+      "limits": {
+        "max_normalized": 1.008134480979579,
+        "rms_normalized": 0.19270640201173717
+      }
+    }
+  ],
+  "limit_rule": "1.25 * CUDA engine/model-definition error + 2 * max(HIP shape spread, CUDA shape spread, cross-environment primary spread); per fixture and metric, before first HIP engine run",
+  "cuda_baseline_commit": "ff88d5d4"
 }
