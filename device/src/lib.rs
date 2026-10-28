@@ -764,6 +764,30 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
 /// Launch uses 128 threads, 90112 shared bytes and buffers covering the declared extents.
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d512(p: Attention, scale: f32) {
+    unsafe { attention_d512::<false>(p, scale, core::ptr::null_mut(), 1, 0) }
+}
+
+/// # Safety
+/// Partials cover [rows, heads, parts, 514] F32 values; chunk is a multiple of 32.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_partial_d512(
+    p: Attention,
+    scale: f32,
+    partials: *mut f32,
+    parts: u32,
+    chunk: u32,
+) {
+    unsafe { attention_d512::<true>(p, scale, partials, parts, chunk) }
+}
+
+#[inline(always)]
+unsafe fn attention_d512<const SPLIT: bool>(
+    p: Attention,
+    scale: f32,
+    partials: *mut f32,
+    parts: u32,
+    chunk: u32,
+) {
     unsafe {
         let (tid, tile, head, sm): (u32, u32, u32, u32);
         asm!("mov.u32 {t}, %tid.x; mov.u32 {b}, %ctaid.x; mov.u32 {h}, %ctaid.y; mov.u32 {s}, attention_shared;",
@@ -772,7 +796,12 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d512(p: Attention, scale: f3
         let warp = tid >> 5;
         let qstart = tile * 16;
         let end = p.start + p.rows;
-        let stop = end.min(p.start + qstart + 16);
+        let part: u32;
+        asm!("mov.u32 {p}, %ctaid.z;", p=out(reg32) part);
+        let begin = if SPLIT { part * chunk } else { 0 };
+        let stop = end
+            .min(p.start + qstart + 16)
+            .min(if SPLIT { begin + chunk } else { end });
         let sk = sm + 16384;
         let sv = sm + 49152;
         let partial = sm + 81920;
@@ -798,8 +827,8 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d512(p: Attention, scale: f3
                 let row = copy_row + $i * 2;
                 copy(
                     address(sk, row, copy_col, 512),
-                    p.k.wrapping_add(kv + row as usize * 512 + copy_col as usize),
-                    row < end,
+                    p.k.wrapping_add(kv + (begin + row) as usize * 512 + copy_col as usize),
+                    begin + row < stop,
                 );
             }};
         }
@@ -812,7 +841,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d512(p: Attention, scale: f3
         let mut output = [[0.0f32; 4]; 16];
         let mut peak = [f32::NEG_INFINITY; 2];
         let mut denominator = [0.0f32; 2];
-        let mut key = 0;
+        let mut key = begin;
         while key < stop {
             macro_rules! v_copy {
                 ($i:expr) => {{
@@ -912,34 +941,22 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d512(p: Attention, scale: f3
                 *x = maximum(*x, shuffle(*x, 1));
                 *x = maximum(*x, shuffle(*x, 2));
             }
-            let alpha = [
-                probability(peak[0] - next[0], 0.0, scale),
-                probability(peak[1] - next[1], 0.0, scale),
-            ];
+            let mut alpha = [0.0; 2];
+            let mut negative_peak = [0.0; 2];
+            for i in 0..2 {
+                if next[i] != f32::NEG_INFINITY {
+                    alpha[i] = probability(peak[i] - next[i], 0.0, scale);
+                    negative_peak[i] = -next[i] * core::f32::consts::LOG2_E * scale;
+                }
+            }
             let mut sum = [0.0; 2];
             let mut packed = [[0u32; 4]; 2];
             macro_rules! probabilities {
                 ($i:expr) => {{
-                    let a = probability(
-                        scores[$i][0],
-                        -next[0] * core::f32::consts::LOG2_E * scale,
-                        scale,
-                    );
-                    let b = probability(
-                        scores[$i][1],
-                        -next[0] * core::f32::consts::LOG2_E * scale,
-                        scale,
-                    );
-                    let c = probability(
-                        scores[$i][2],
-                        -next[1] * core::f32::consts::LOG2_E * scale,
-                        scale,
-                    );
-                    let d = probability(
-                        scores[$i][3],
-                        -next[1] * core::f32::consts::LOG2_E * scale,
-                        scale,
-                    );
+                    let a = probability(scores[$i][0], negative_peak[0], scale);
+                    let b = probability(scores[$i][1], negative_peak[0], scale);
+                    let c = probability(scores[$i][2], negative_peak[1], scale);
+                    let d = probability(scores[$i][3], negative_peak[1], scale);
                     sum[0] += a + b;
                     sum[1] += c + d;
                     packed[$i / 2][($i % 2) * 2] = pack(a, b);
@@ -987,6 +1004,40 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d512(p: Attention, scale: f3
             *x += shuffle(*x, 1);
             *x += shuffle(*x, 2);
         }
+        if SPLIT {
+            macro_rules! write_partial {
+                ($i:expr) => {{
+                    let col = warp * 128 + $i * 8 + (lane & 3) * 2;
+                    for j in 0..4 {
+                        let row = qstart + if j < 2 { r0 } else { r1 };
+                        if row < p.rows {
+                            let offset = ((row as usize * p.q_heads as usize + head as usize)
+                                * parts as usize
+                                + part as usize)
+                                * 514
+                                + col as usize
+                                + (j & 1);
+                            *partials.add(offset) = output[$i][j];
+                        }
+                    }
+                }};
+            }
+            sixteen!(write_partial);
+            if warp == 0 && lane & 3 == 0 {
+                for i in 0..2 {
+                    let row = qstart + if i == 0 { r0 } else { r1 };
+                    if row < p.rows {
+                        let offset = ((row as usize * p.q_heads as usize + head as usize)
+                            * parts as usize
+                            + part as usize)
+                            * 514;
+                        *partials.add(offset + 512) = peak[i] * scale;
+                        *partials.add(offset + 513) = denominator[i];
+                    }
+                }
+            }
+            return;
+        }
         let inv = [reciprocal(denominator[0]), reciprocal(denominator[1])];
         macro_rules! write {
             ($i:expr) => {{
@@ -1010,6 +1061,49 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d512(p: Attention, scale: f3
                     *p.lse.add(head as usize * p.rows as usize + row as usize) = value;
                 }
             }
+        }
+    }
+}
+
+/// # Safety
+/// Launch uses 128 threads per [row, head], with partials [rows, heads, parts, 514].
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_merge_d512(
+    p: Attention,
+    partials: *const f32,
+    parts: u32,
+) {
+    unsafe {
+        let (tid, row, head): (u32, u32, u32);
+        asm!("mov.u32 {t}, %tid.x; mov.u32 {r}, %ctaid.x; mov.u32 {h}, %ctaid.y;",
+            t=out(reg32) tid,r=out(reg32) row,h=out(reg32) head);
+        let base = (row as usize * p.q_heads as usize + head as usize) * parts as usize * 514;
+        let mut peak = f32::NEG_INFINITY;
+        for part in 0..parts {
+            peak = maximum(peak, *partials.add(base + part as usize * 514 + 512));
+        }
+        let mut sum = 0.0f32;
+        let mut output = [0.0f32; 4];
+        for part in 0..parts {
+            let source = partials.add(base + part as usize * 514);
+            let denominator = *source.add(513);
+            if denominator > 0.0 {
+                let weight = probability(*source.add(512) - peak, 0.0, 1.0);
+                sum += weight * denominator;
+                for (i, value) in output.iter_mut().enumerate() {
+                    *value += weight * *source.add(tid as usize * 4 + i);
+                }
+            }
+        }
+        let inv = reciprocal(sum);
+        let dst = p
+            .out
+            .add((row as usize * p.q_heads as usize + head as usize) * 512 + tid as usize * 4);
+        let a = pack(output[0] * inv, output[1] * inv);
+        let b = pack(output[2] * inv, output[3] * inv);
+        asm!("st.global.v2.u32 [{p}], {{{a},{b}}};", p=in(reg64) dst,a=in(reg32) a,b=in(reg32) b);
+        if tid == 0 {
+            *p.lse.add(head as usize * p.rows as usize + row as usize) = peak + logarithm(sum);
         }
     }
 }

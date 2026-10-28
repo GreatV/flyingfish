@@ -90,6 +90,95 @@ pub struct Flash {
     score: Option<Score>,
     tile: usize,
     shared: u32,
+    split: Option<Split>,
+}
+
+struct Split {
+    partial: CudaFunction,
+    merge: CudaFunction,
+    workspace: CudaSlice<f32>,
+    capacity: usize,
+    parts: u32,
+    chunk: u32,
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn split_extent(capacity: usize, heads: usize, resident: usize) -> Result<(usize, usize)> {
+    ensure!(
+        capacity > 0 && capacity <= i32::MAX as usize,
+        "invalid split attention capacity"
+    );
+    ensure!(
+        heads > 0 && resident > 0,
+        "invalid split attention occupancy"
+    );
+    let wave = resident.div_ceil(heads).min(capacity.div_ceil(32));
+    let chunk = capacity
+        .div_ceil(wave)
+        .div_ceil(32)
+        .checked_mul(32)
+        .context("split attention chunk overflow")?;
+    Ok((capacity.div_ceil(chunk), chunk))
+}
+
+#[cfg(feature = "cuda")]
+impl Split {
+    fn new(stream: &Arc<CudaStream>, rows: usize, heads: usize, capacity: usize) -> Result<Self> {
+        use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
+        let ctx = stream.context();
+        let module = super::cubin::module(ctx, "attention_native")?;
+        let partial = module.load_function("attention_partial_d512")?;
+        let merge = module.load_function("attention_merge_d512")?;
+        for (function, shared) in [(&partial, 90112), (&merge, 0)] {
+            let local = function.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
+            let regs = function.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
+            ensure!(
+                local == 0 && regs <= 255,
+                "D512 split resource limit: regs={regs} local={local}"
+            );
+            ensure!(
+                shared + function.get_attribute(F::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?
+                    <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?,
+                "D512 split shared memory does not fit"
+            );
+            function.set_attribute(F::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared)?;
+        }
+        let resident =
+            partial.occupancy_max_active_blocks_per_multiprocessor(128, 90112, None)? as usize;
+        let sms = usize::try_from(ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?)?;
+        let (parts, chunk) = split_extent(
+            capacity,
+            heads,
+            sms.checked_mul(resident)
+                .context("D512 resident grid overflow")?,
+        )?;
+        ensure!(
+            parts <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z)? as usize,
+            "D512 split grid exceeds device limit"
+        );
+        let elements = rows
+            .min(16)
+            .checked_mul(heads)
+            .and_then(|v| v.checked_mul(parts))
+            .and_then(|v| v.checked_mul(514))
+            .context("D512 partial workspace overflow")?;
+        eprintln!(
+            "{}",
+            serde_json::json!({"native_attention_split":{
+                "head_dim":512,"capacity":capacity,"heads":heads,"max_rows":rows.min(16),
+                "sms":sms,"resident_blocks_per_sm":resident,"parts":parts,"chunk":chunk,
+                "workspace_bytes":elements.checked_mul(4).context("D512 workspace bytes overflow")?
+            }})
+        );
+        Ok(Self {
+            partial,
+            merge,
+            workspace: stream.alloc_zeros(elements)?,
+            capacity,
+            parts: u32::try_from(parts)?,
+            chunk: u32::try_from(chunk)?,
+        })
+    }
 }
 
 #[repr(C)]
@@ -148,6 +237,7 @@ impl Flash {
             kv_heads,
             head_dim,
             Score::from_tokens(scale, None)?,
+            rows,
         )
     }
 
@@ -158,6 +248,7 @@ impl Flash {
         kv_heads: usize,
         head_dim: usize,
         score: Score,
+        capacity: usize,
     ) -> Result<Self> {
         ensure!(
             matches!(head_dim, 128 | 256 | 512),
@@ -193,6 +284,7 @@ impl Flash {
             kv_heads,
             head_dim,
             explicit.then_some(score),
+            capacity,
         )
     }
 
@@ -203,6 +295,7 @@ impl Flash {
         kv_heads: usize,
         head_dim: usize,
         score: Option<Score>,
+        capacity: usize,
     ) -> Result<Self> {
         let tile = Self::tile(head_dim)?;
         #[cfg(feature = "cuda")]
@@ -223,6 +316,8 @@ impl Flash {
         let dynamic_shared = 0;
         #[cfg(feature = "rocm")]
         ensure!(score.is_none(), "HIP explicit attention score is not bound");
+        #[cfg(feature = "rocm")]
+        ensure!(capacity >= rows, "HIP attention capacity is below query workspace");
         let elements = rows
             .checked_mul(heads)
             .context("prefill LSE extent overflow")?;
@@ -337,6 +432,14 @@ impl Flash {
                 })
                 .collect::<Result<Vec<_>>>()?
         };
+        #[cfg(feature = "rocm")]
+        let split = None;
+        #[cfg(feature = "cuda")]
+        let split = if head_dim == 512 {
+            Some(Split::new(&stream, rows, heads, capacity)?)
+        } else {
+            None
+        };
         let lse = stream.alloc_zeros(elements)?;
         let sink_rescale = super::cubin::module(stream.context(), "attention")?
             .load_function("attention_sink_rescale")?;
@@ -349,6 +452,7 @@ impl Flash {
             score,
             tile,
             shared: dynamic_shared,
+            split,
         })
     }
 
@@ -524,6 +628,41 @@ impl Flash {
                 group: (shape.q_heads / shape.kv_heads) as u32,
                 start: shape.start as u32,
             };
+            if let Some(split) = &mut self.split {
+                ensure!(
+                    shape.capacity == split.capacity,
+                    "D512 capacity differs from setup binding"
+                );
+                if shape.rows <= 16 && split.parts > 1 {
+                    let (partials, _partials) = split.workspace.device_ptr_mut(&self.stream);
+                    let scale = self.score.context("D512 score is not bound")?.scale;
+                    unsafe {
+                        self.stream
+                            .launch_builder(&split.partial)
+                            .arg(&args)
+                            .arg(&scale)
+                            .arg(&partials)
+                            .arg(&split.parts)
+                            .arg(&split.chunk)
+                            .launch(LaunchConfig {
+                                grid_dim: (1, shape.q_heads as u32, split.parts),
+                                block_dim: (128, 1, 1),
+                                shared_mem_bytes: 90112,
+                            })?;
+                        self.stream
+                            .launch_builder(&split.merge)
+                            .arg(&args)
+                            .arg(&partials)
+                            .arg(&split.parts)
+                            .launch(LaunchConfig {
+                                grid_dim: (shape.rows as u32, shape.q_heads as u32, 1),
+                                block_dim: (128, 1, 1),
+                                shared_mem_bytes: 0,
+                            })?;
+                    }
+                    return Ok(());
+                }
+            }
             let extent = shape.window_left.or(prefix).unwrap_or(keys) as u32;
             unsafe {
                 let mut launch = self.stream.launch_builder(native);
@@ -663,6 +802,29 @@ impl Flash {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_chunks_cover_each_key_once() {
+        for capacity in [1usize, 31, 32, 33, 129, 131072, 262144] {
+            for heads in [8, 16, 32] {
+                for resident in [1, 48, 128] {
+                    let (parts, chunk) = split_extent(capacity, heads, resident).unwrap();
+                    assert!(chunk.is_multiple_of(32));
+                    assert_eq!(parts, capacity.div_ceil(chunk));
+                    assert!((parts - 1) * chunk < capacity);
+                    assert!(parts * chunk >= capacity);
+                    for key in [0, capacity / 2, capacity - 1] {
+                        let part = key / chunk;
+                        assert!(part < parts && key < (part + 1) * chunk);
+                    }
+                }
+            }
+        }
+        assert!(split_extent(0, 8, 128).is_err());
+        assert!(split_extent(1, 0, 128).is_err());
+        assert!(split_extent(1, 8, 0).is_err());
+        assert!(split_extent(usize::MAX, 8, 128).is_err());
+    }
 
     #[test]
     fn unit_window_excludes_first_expired_key() {
