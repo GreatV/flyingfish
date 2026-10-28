@@ -158,19 +158,7 @@ fn fp8_channel_gate(
             .map(|i| bf16::from_f32((1 + i * 31 % 263) as f32 / 65536.0))
             .collect();
         let input = pattern(33 * k, 19);
-        let mut reference = Vec::with_capacity(33 * n);
-        let nu = (k + 6) as f64 * 2f64.powi(-24);
-        for x in input.chunks_exact(k) {
-            for (row, &scale) in codes.chunks_exact(k).zip(&scales) {
-                let (value, absolute) = row.iter().zip(x).fold((0.0f64, 0.0f64), |a, (&w, x)| {
-                    let product = f64::from(crate::fp8::effective_weight(w, scale).to_f32())
-                        * f64::from(x.to_f32());
-                    (a.0 + product, a.1 + product.abs())
-                });
-                let bound = value.abs() / 256.0 + (nu / (1.0 - nu)) * absolute + 2f64.powi(-134);
-                reference.push((value, bound));
-            }
-        }
+        let reference = fp8_channel_reference(&codes, &scales, &input, k)?;
         let weights = stream.clone_htod(&codes)?;
         let scale = stream.clone_htod(&scales)?;
         let x = stream.clone_htod(&input)?;
@@ -263,6 +251,322 @@ fn fp8_channel_gate(
             }
         }
     }
+    Ok(())
+}
+
+#[cfg(feature = "rocm")]
+fn fp8_channel_reference(
+    codes: &[u8],
+    scales: &[bf16],
+    input: &[bf16],
+    k: usize,
+) -> Result<Vec<(f64, f64)>> {
+    ensure!(
+        k > 0 && codes.len() == scales.len() * k && input.len().is_multiple_of(k),
+        "RUNNER_FAIL FP8 reference extents"
+    );
+    let mut reference = Vec::with_capacity(input.len() / k * scales.len());
+    let nu = (k + 6) as f64 * 2f64.powi(-24);
+    for x in input.chunks_exact(k) {
+        for (row, &scale) in codes.chunks_exact(k).zip(scales) {
+            let (value, absolute) = row.iter().zip(x).fold((0.0f64, 0.0f64), |a, (&w, x)| {
+                let product = f64::from(crate::fp8::effective_weight(w, scale).to_f32())
+                    * f64::from(x.to_f32());
+                (a.0 + product, a.1 + product.abs())
+            });
+            let bound = value.abs() / 256.0 + (nu / (1.0 - nu)) * absolute + 2f64.powi(-134);
+            reference.push((value, bound));
+        }
+    }
+    Ok(reference)
+}
+
+#[cfg(feature = "rocm")]
+fn fp8_channel_launch(
+    s: &Arc<CudaStream>,
+    function: (&CudaFunction, bool),
+    weights: (&CudaSlice<u8>, &CudaSlice<bf16>),
+    input: &CudaSlice<bf16>,
+    output: &mut CudaSlice<bf16>,
+    shape: (usize, usize, usize),
+) -> Result<()> {
+    let (rows, n, k) = shape;
+    unsafe {
+        s.launch_builder(function.0)
+            .arg(weights.0)
+            .arg(weights.1)
+            .arg(input)
+            .arg(output)
+            .arg(&(rows as i32))
+            .arg(&(n as i32))
+            .arg(&(k as i32))
+            .launch(LaunchConfig {
+                grid_dim: if function.1 {
+                    (n.div_ceil(64) as u32, rows.div_ceil(16) as u32, 1)
+                } else {
+                    (n.div_ceil(4) as u32, rows as u32, 1)
+                },
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "rocm")]
+fn fp8_quantize(
+    s: &Arc<CudaStream>,
+    function: &CudaFunction,
+    input: &mut CudaSlice<bf16>,
+    rows: usize,
+    width: usize,
+) -> Result<()> {
+    unsafe {
+        s.launch_builder(function)
+            .arg(input)
+            .arg(&(rows as i32))
+            .arg(&(width as i32))
+            .arg(&0u64)
+            .arg(&0u32)
+            .arg(&(rows as u32))
+            .launch(ops::grid(rows, 256))?;
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "rocm")]
+#[ignore = "requires GPU lease, FF_MODEL published per-channel FP8 checkpoint and FF_DENSE_EVIDENCE"]
+fn fp8_published_expert_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_DENSE_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let path = std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL required")?);
+    let spec = crate::model_spec::ModelSpec::read(&path)?;
+    let moe = spec.moe.context("RUNNER_FAIL expert geometry missing")?;
+    ensure!(
+        spec.architecture == crate::model_spec::Architecture::MiniCpmV47
+            && spec.linear_format == crate::model_spec::LinearFormat::Fp8E4m3Channel
+            && spec.hidden == 2048
+            && moe.expert_intermediate == 512
+            && moe.experts == 256
+            && moe.experts_per_tok == 8,
+        "RUNNER_FAIL published MiniCPM per-channel geometry"
+    );
+    let mapped = crate::checkpoint::MappedCheckpoint::open(&path)?;
+    let views = mapped.views()?;
+    let ctx = CudaContext::new(0)?;
+    ctx.require_wmma()?;
+    let s = ctx.new_stream()?;
+    let module = cubin::module(&ctx, "fp8_linear")?;
+    let quantize = module.load_function("e4m3_fake_quant_bf16")?;
+    let act = cubin::module(&ctx, "act")?.load_function("silu_mul_split")?;
+    let mut weights = Vec::new();
+    for (role, n, k) in [
+        ("gate", 512usize, 2048usize),
+        ("up", 512, 2048),
+        ("down", 2048, 512),
+    ] {
+        let name = format!("model.language_model.layers.0.mlp.experts.0.{role}_proj.weight");
+        let scale_name = format!("{name}_scale");
+        let w = views[&mapped.index.weight_map[&name]].tensor(&name)?;
+        let scale = views[&mapped.index.weight_map[&scale_name]].tensor(&scale_name)?;
+        ensure!(
+            w.dtype() == safetensors::Dtype::F8_E4M3
+                && w.shape() == [n, k]
+                && scale.dtype() == safetensors::Dtype::BF16
+                && scale.shape() == [n, 1],
+            "RUNNER_FAIL native FP8 projection layout {name}"
+        );
+        let host_scale = scale
+            .data()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&b| bf16::from_bits(u16::from_le_bytes(b)))
+            .collect::<Vec<_>>();
+        ensure!(
+            w.data().iter().all(|v| v & 127 != 127)
+                && host_scale.iter().all(|v| v.is_finite() && *v > bf16::ZERO),
+            "RUNNER_FAIL nonfinite published projection {name}"
+        );
+        weights.push((
+            w.data(),
+            host_scale.clone(),
+            s.clone_htod(w.data())?,
+            s.clone_htod(&host_scale)?,
+        ));
+    }
+    let device_weight_bytes: usize = weights.iter().map(|w| w.2.len() + 2 * w.3.len()).sum();
+    ensure!(
+        device_weight_bytes == 3 * 512 * 2048 + 2 * (512 + 512 + 2048),
+        "RUNNER_FAIL native storage footprint"
+    );
+    let mut gate = Gate::default();
+    let sentinel = bf16::from_bits(0x7fc1);
+    for name in ["fp8_channel_bf16_simt", "fp8_channel_bf16_wmma"] {
+        let function = module.load_function(name)?;
+        let tiled = name.ends_with("wmma");
+        let mut longest = None;
+        for rows in [33usize, 17, 16, 9, 8, 3, 1] {
+            let host_input = pattern(rows * 2048, 23);
+            let original = s.clone_htod(&host_input)?;
+            let mut input = s.alloc_zeros::<bf16>(rows * 2048)?;
+            let mut g = s.clone_htod(&vec![sentinel; rows * 512 + 16])?;
+            let mut u = s.clone_htod(&vec![sentinel; rows * 512 + 16])?;
+            let mut hidden = s.clone_htod(&vec![sentinel; rows * 512 + 16])?;
+            let mut hidden_before_quantize = s.alloc_zeros::<bf16>(rows * 512)?;
+            let mut output = s.clone_htod(&vec![sentinel; rows * 2048 + 16])?;
+            let mut run = || -> Result<()> {
+                s.memcpy_dtod(&original, &mut input)?;
+                fp8_quantize(&s, &quantize, &mut input, rows, 2048)?;
+                fp8_channel_launch(
+                    &s,
+                    (&function, tiled),
+                    (&weights[0].2, &weights[0].3),
+                    &input,
+                    &mut g,
+                    (rows, 512, 2048),
+                )?;
+                fp8_channel_launch(
+                    &s,
+                    (&function, tiled),
+                    (&weights[1].2, &weights[1].3),
+                    &input,
+                    &mut u,
+                    (rows, 512, 2048),
+                )?;
+                unsafe {
+                    s.launch_builder(&act)
+                        .arg(&g)
+                        .arg(&u)
+                        .arg(&mut hidden)
+                        .arg(&((rows * 512) as i32))
+                        .arg(&0i32)
+                        .launch(ops::flat(rows * 512))?;
+                }
+                s.memcpy_dtod(&hidden.slice(..rows * 512), &mut hidden_before_quantize)?;
+                fp8_quantize(&s, &quantize, &mut hidden, rows, 512)?;
+                fp8_channel_launch(
+                    &s,
+                    (&function, tiled),
+                    (&weights[2].2, &weights[2].3),
+                    &hidden,
+                    &mut output,
+                    (rows, 2048, 512),
+                )
+            };
+            run()?;
+            let capture = s.begin_capture()?;
+            run()?;
+            let graph = capture.finish()?;
+            let eager = [&input, &g, &u, &hidden, &output, &hidden_before_quantize]
+                .map(|v| s.clone_dtoh(v))
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+            let label = format!("fp8.expert0.{name}.M{rows}");
+            for repeat in 0..2 {
+                graph.launch()?;
+                for (buffer, expected) in
+                    [&input, &g, &u, &hidden, &output, &hidden_before_quantize]
+                        .into_iter()
+                        .zip(&eager)
+                {
+                    let actual = s.clone_dtoh(buffer)?;
+                    gate.check(
+                        &format!("{label}.graph{repeat}"),
+                        actual
+                            .iter()
+                            .zip(expected)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    );
+                }
+            }
+            for (stage, input_index, output_index, k) in
+                [(0, 0, 1, 2048), (1, 0, 2, 2048), (2, 3, 4, 512)]
+            {
+                let reference = fp8_channel_reference(
+                    weights[stage].0,
+                    &weights[stage].1,
+                    &eager[input_index][..rows * k],
+                    k,
+                )?;
+                let actual = &eager[output_index][..reference.len()];
+                ensure!(
+                    actual.iter().all(|v| v.is_finite()),
+                    "RUNNER_FAIL {label} nonfinite stage{stage}"
+                );
+                let errors = actual
+                    .iter()
+                    .zip(&reference)
+                    .filter(|(a, (value, bound))| (f64::from(a.to_f32()) - value).abs() > *bound)
+                    .count();
+                gate.check(&format!("{label}.stage{stage}.fp64"), errors == 0);
+            }
+            let activated = eager[1][..rows * 512]
+                .iter()
+                .zip(&eager[2])
+                .map(|(g, u)| {
+                    let v = g.to_f32();
+                    let silu = bf16::from_f32(v / (1.0 + (-v).exp()));
+                    bf16::from_f32(silu.to_f32() * u.to_f32())
+                })
+                .collect::<Vec<_>>();
+            gate.compare(&format!("{label}.swiglu"), &eager[5], &activated, 2, 1)?;
+            for (which, before, after, width) in [
+                ("input", host_input, &eager[0], 2048usize),
+                ("down", eager[5].clone(), &eager[3], 512),
+            ] {
+                let reference = before
+                    .chunks_exact(width)
+                    .map(crate::fp8::fake_quant_reference)
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .flat_map(|(_, _, v)| v)
+                    .collect::<Vec<_>>();
+                gate.check(
+                    &format!("{label}.quantize.{which}.bits"),
+                    reference.len() == rows * width
+                        && reference
+                            .iter()
+                            .zip(after)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                );
+            }
+            gate.check(
+                &format!("{label}.guards"),
+                [(1, 512), (2, 512), (3, 512), (4, 2048)]
+                    .iter()
+                    .all(|&(i, width)| {
+                        eager[i][rows * width..]
+                            .iter()
+                            .all(|v| v.to_bits() == sentinel.to_bits())
+                    }),
+            );
+            if let Some(previous) = &longest {
+                let previous: &Vec<bf16> = previous;
+                gate.check(
+                    &format!("{label}.batch_identity"),
+                    eager[4][..rows * 2048]
+                        .iter()
+                        .zip(previous)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                );
+            } else {
+                longest = Some(eager[4][..rows * 2048].to_vec());
+            }
+        }
+    }
+    println!(
+        "FP8_PUBLISHED_EXPERT cells={} defects={} native_weight_bytes={device_weight_bytes} gpu_weight_materialization_bytes=0",
+        gate.cells, gate.defects
+    );
+    ensure!(
+        gate.defects == 0,
+        "published expert defects={}",
+        gate.defects
+    );
     Ok(())
 }
 
