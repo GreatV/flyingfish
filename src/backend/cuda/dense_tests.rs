@@ -335,7 +335,8 @@ fn hip_gdn_case(model: crate::model_spec::ModelSpec) -> Result<()> {
         for row in 0..n {
             for head in 0..heads {
                 for (side, prepared_side) in prepared[..2].iter().enumerate() {
-                    let base = row * cd + (side * 16 + head / 2) * 128;
+                    let key_heads = spec.hk as usize;
+                    let base = row * cd + (side * key_heads + head / (heads / key_heads)) * 128;
                     let source = &conv_actual[base..base + 128];
                     let scale = (source.iter().map(|v| v.to_f64().powi(2)).sum::<f64>()
                         + f64::from(spec.l2_eps))
