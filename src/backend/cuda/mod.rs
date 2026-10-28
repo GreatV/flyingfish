@@ -64,16 +64,16 @@ impl Device {
     #[cfg(feature = "cuda")]
     pub fn new(ordinal: usize) -> Result<Self> {
         ensure!(
-            unsafe { cudarc::driver::sys::is_culib_present() },
-            "CUDA backend unavailable: CUDA driver library is missing"
+            std::panic::catch_unwind(|| unsafe { cudarc::driver::sys::culib() }).is_ok(),
+            "CUDA backend unavailable: initialize retained CUDA driver library"
         );
         ensure!(
-            unsafe { cudarc::cublas::sys::is_culib_present() },
-            "CUDA backend unavailable: cuBLAS library is missing"
+            std::panic::catch_unwind(|| unsafe { cudarc::cublas::sys::culib() }).is_ok(),
+            "CUDA backend unavailable: initialize retained cuBLAS library"
         );
         ensure!(
-            unsafe { cudarc::cublaslt::sys::is_culib_present() },
-            "CUDA backend unavailable: cuBLASLt library is missing"
+            std::panic::catch_unwind(|| unsafe { cudarc::cublaslt::sys::culib() }).is_ok(),
+            "CUDA backend unavailable: initialize retained cuBLASLt library"
         );
         let ctx = CudaContext::new(ordinal)
             .with_context(|| format!("CUDA backend unavailable: initialize device {ordinal}"))?;
