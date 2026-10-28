@@ -1,8 +1,81 @@
 {
   "steps": 8,
   "cases": [
-    {"name": "short", "rows": 33, "chunks": [33, 17], "forced": [51, 127, 521, 1031, 2053, 4099, 8209]},
-    {"name": "tail", "rows": 129, "chunks": [129, 33], "forced": [79, 257, 523, 1033, 2063, 4111, 8219]},
-    {"name": "long", "rows": 1024, "chunks": [1024, 129], "forced": [83, 263, 541, 1039, 2069, 4127, 8221]}
-  ]
+    {
+      "name": "short",
+      "rows": 33,
+      "chunks": [
+        33,
+        17
+      ],
+      "forced": [
+        51,
+        127,
+        521,
+        1031,
+        2053,
+        4099,
+        8209
+      ],
+      "reference_floor": {
+        "max_normalized": 0.056108782594668255,
+        "rms_normalized": 0.008139064002242161
+      },
+      "limits": {
+        "max_normalized": 0.11221756518933651,
+        "rms_normalized": 0.016278128004484322
+      }
+    },
+    {
+      "name": "tail",
+      "rows": 129,
+      "chunks": [
+        129,
+        33
+      ],
+      "forced": [
+        79,
+        257,
+        523,
+        1033,
+        2063,
+        4111,
+        8219
+      ],
+      "reference_floor": {
+        "max_normalized": 0.03321978495937388,
+        "rms_normalized": 0.006166981405206237
+      },
+      "limits": {
+        "max_normalized": 0.06643956991874776,
+        "rms_normalized": 0.012333962810412474
+      }
+    },
+    {
+      "name": "long",
+      "rows": 1024,
+      "chunks": [
+        1024,
+        129
+      ],
+      "forced": [
+        83,
+        263,
+        541,
+        1039,
+        2069,
+        4127,
+        8221
+      ],
+      "reference_floor": {
+        "max_normalized": 0.046819330409240224,
+        "rms_normalized": 0.00824140813334885
+      },
+      "limits": {
+        "max_normalized": 0.09363866081848045,
+        "rms_normalized": 0.0164828162666977
+      }
+    }
+  ],
+  "limit_rule": "Twice the per-fixture maximum reference variation across same-device chunk shapes and CUDA/HIP; three exact repeats per shape. Frozen before the first HIP model candidate; shifted-vocabulary control exceeds each maximum bound."
 }
