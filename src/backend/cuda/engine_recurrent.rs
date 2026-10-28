@@ -308,14 +308,14 @@ impl VisionRuntime {
             1024,
             588,
             vector(&weights.patch_bias, s, 1024)?,
-            LinearBiasMode::BeforeOutputRound,
+            LinearBiasMode::AfterOutputRound,
         )?;
         blas.linear_biased(
             matrix(&weights.patch_weight, s, 1024, 588)?,
             vector(&weights.patch_bias, s, 1024)?,
             matrix(pixels, s, rows, 588)?,
             &mut TensorMut(matrix(&work.x, s, rows, 1024)?),
-            LinearBiasMode::BeforeOutputRound,
+            LinearBiasMode::AfterOutputRound,
         )?;
         let positions: Vec<i32> = (0..grid_h)
             .flat_map(|r| (0..grid_w).map(move |c| (r, c)))
