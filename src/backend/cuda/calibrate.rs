@@ -1547,6 +1547,13 @@ fn measure_host_registration(d: &Device, bytes: u64, slot_bytes: u64) -> Result<
     Ok((extent, [allocated, registered, unregistered]))
 }
 
+fn expert_cache_path(dir: &Path, key: &CacheKey, identity: &str) -> PathBuf {
+    let tag = key.tag();
+    #[cfg(feature = "rocm")]
+    let tag = super::closure::hash(tag.as_bytes());
+    dir.join(format!("experts-v3-{tag}-{identity}.json"))
+}
+
 pub(super) fn load_experts(
     d: &Device,
     dir: &Path,
@@ -1570,7 +1577,7 @@ pub(super) fn load_experts(
     } else {
         super::closure::hash(&serde_json::to_vec(&(&host, geometry, expert_format))?)
     };
-    let path = dir.join(format!("experts-v3-{}-{identity}.json", key.tag()));
+    let path = expert_cache_path(dir, &key, &identity);
     let (cache, hit) = if closure.access(&path)? {
         (
             serde_json::from_slice::<ExpertCache>(&std::fs::read(&path)?)
@@ -1743,6 +1750,23 @@ mod long_tests {
             binary_version: "fixture".into(),
             cublaslt_version: 130201,
         };
+        #[cfg(feature = "rocm")]
+        {
+            let mut long = key.clone();
+            long.driver_version = "identity".repeat(128);
+            let path = expert_cache_path(Path::new(""), &long, "0123456789abcdef");
+            assert!(path.as_os_str().len() < 255);
+            long.driver_version.push('1');
+            assert_ne!(
+                path,
+                expert_cache_path(Path::new(""), &long, "0123456789abcdef")
+            );
+        }
+        #[cfg(feature = "cuda")]
+        assert_eq!(
+            expert_cache_path(Path::new(""), &key, "0123456789abcdef"),
+            PathBuf::from(format!("experts-v3-{}-0123456789abcdef.json", key.tag()))
+        );
         let host = ExpertHost {
             cpu: "fixture".into(),
             isa: "fixture".into(),
