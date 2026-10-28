@@ -151,31 +151,47 @@ struct ReferenceFixtures {
     cases: Vec<ReferenceCase>,
 }
 
+fn hybrid_reference_fixtures() -> Result<(serde_json::Value, flyingfish::model_spec::ModelSpec)> {
+    use flyingfish::model_spec::{Architecture, ExpertFormat, LinearFormat, ModelSpec};
+    let specification = ModelSpec::read(&PathBuf::from(std::env::var("FF_ARGMAX_MODEL")?))?;
+    let source = match specification.architecture {
+        Architecture::Qwen35Text => {
+            ensure!(
+                specification.expert_format.is_none(),
+                "Qwen dense fixture required"
+            );
+            include_str!("fixtures/q38_reference.json")
+        }
+        Architecture::MiniCpmV47 => {
+            ensure!(
+                specification.linear_format == LinearFormat::Fp8E4m3Channel
+                    && specification.expert_format == Some(ExpertFormat::Fp8W8a16),
+                "MiniCPM fixture requires published channel FP8 projections and experts"
+            );
+            include_str!("fixtures/minicpm_reference.json")
+        }
+        _ => anyhow::bail!("hybrid reference architecture unsupported"),
+    };
+    Ok((serde_json::from_str(source)?, specification))
+}
+
 #[test]
-#[ignore = "requires GPU lease, published MiniCPM-V-4.7 FP8 and runtime/evidence directories"]
+#[ignore = "requires GPU lease, published hybrid FP8 model and runtime/evidence directories"]
 fn hybrid_model_identity_gpu() -> Result<()> {
     ensure!(
         std::env::var("FF_DENSE_GPU_WINDOW").as_deref() == Ok("granted"),
         "GPU window not acknowledged"
     );
-    #[cfg(feature = "rocm")]
-    {
-        let fixtures: serde_json::Value =
-            serde_json::from_str(include_str!("fixtures/minicpm_reference.json"))?;
-        for case in fixtures["cases"]
-            .as_array()
-            .context("hybrid fixture cases missing")?
-        {
-            frozen_hybrid_limits(case)?;
-        }
+    let (fixtures, specification) = hybrid_reference_fixtures()?;
+    let cases = fixtures["cases"]
+        .as_array()
+        .context("hybrid cases missing")?;
+    for case in cases {
+        frozen_hybrid_limits(case)?;
     }
     let target = PathBuf::from(std::env::var("FF_ARGMAX_MODEL")?);
-    let specification = flyingfish::model_spec::ModelSpec::read(&target)?;
-    ensure!(
-        specification.linear_format == flyingfish::model_spec::LinearFormat::Fp8E4m3Channel
-            && specification.expert_format == Some(flyingfish::model_spec::ExpertFormat::Fp8W8a16),
-        "hybrid gate requires published per-channel FP8 projections and experts"
-    );
+    let vocab = specification.vocab as usize;
+    let steps = fixtures["steps"].as_u64().context("hybrid steps missing")? as usize;
     let output = PathBuf::from(std::env::var("FF_DENSE_EVIDENCE")?);
     let runtime = PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
     let settings = reference_settings(&runtime);
@@ -188,17 +204,16 @@ fn hybrid_model_identity_gpu() -> Result<()> {
     )?);
     let mut model = Model::load(&target, 0, 8192, Some(129), settings)?;
     ensure!(
-        model.config.hidden_size == 2048
-            && model.config.num_hidden_layers == 40
-            && model.config.vocab_size == 248144,
-        "MiniCPM-V-4.7 geometry required"
+        model.config.vocab_size as usize == vocab,
+        "hybrid vocabulary mismatch"
     );
     let mut cells = 0;
     let mut defects = 0;
-    for rows in [33, 1024, 4096] {
-        let ids: Vec<_> = (0..rows)
-            .map(|i| ((i * 269 + 23) % 248144) as u32)
-            .collect();
+    for case in cases {
+        let rows = case["rows"].as_u64().context("hybrid rows missing")? as usize;
+        let forced: Vec<u32> = serde_json::from_value(case["forced"].clone())?;
+        ensure!(forced.len() + 1 == steps, "hybrid forced extent mismatch");
+        let ids: Vec<_> = (0..rows).map(|i| ((i * 269 + 23) % vocab) as u32).collect();
         let mut first = Vec::new();
         for (repeat, graph) in [false, true, false].into_iter().enumerate() {
             let mut cell_defects = 0;
@@ -208,9 +223,9 @@ fn hybrid_model_identity_gpu() -> Result<()> {
                 output.join(format!("text{rows}-repeat{repeat}-graph{graph}.bin")),
             )?;
             let mut margin = f32::INFINITY;
-            for step in 0..4 {
+            for step in 0..steps {
                 if step > 0 {
-                    model.set_token([115, 1301, 3809][step - 1])?;
+                    model.set_token(forced[step - 1])?;
                     if graph && step == 1 {
                         model.capture()?;
                     }
@@ -222,7 +237,7 @@ fn hybrid_model_identity_gpu() -> Result<()> {
                 );
                 let logits = model.decode_logits()?;
                 ensure!(
-                    logits.len() == 248144 && logits.iter().all(|v| v.is_finite()),
+                    logits.len() == vocab && logits.iter().all(|v| v.is_finite()),
                     "hybrid logits extent/nonfinite"
                 );
                 let mut order: Vec<_> = (0..logits.len()).collect();
@@ -245,7 +260,7 @@ fn hybrid_model_identity_gpu() -> Result<()> {
             cells += 1;
             defects += cell_defects;
             println!(
-                "HYBRID_MODEL_IDENTITY rows={rows} chunk=129 repeat={repeat} graph={graph} steps=4 min_top_two_margin={margin} defects={cell_defects} result={}",
+                "HYBRID_MODEL_IDENTITY rows={rows} chunk=129 repeat={repeat} graph={graph} steps={steps} min_top_two_margin={margin} defects={cell_defects} result={}",
                 if cell_defects == 0 { "PASS" } else { "DEFECT" }
             );
         }
@@ -260,8 +275,7 @@ fn hybrid_model_identity_gpu() -> Result<()> {
 fn hybrid_model_reference_outputs() -> Result<()> {
     let reference = PathBuf::from(std::env::var("FF_DENSE_REFERENCE")?);
     let output = PathBuf::from(std::env::var("FF_DENSE_EVIDENCE")?);
-    let fixtures: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/minicpm_reference.json"))?;
+    let (fixtures, specification) = hybrid_reference_fixtures()?;
     let cases = fixtures["cases"]
         .as_array()
         .context("hybrid fixture cases missing")?;
@@ -282,10 +296,10 @@ fn hybrid_model_reference_outputs() -> Result<()> {
             std::fs::read(reference.join(format!("{name}-chunk{rows}-repeat0.safetensors")))?;
         let tensors = safetensors::SafeTensors::deserialize(&bytes)?;
         let view = tensors.tensor("logits")?;
-        let vocab = 248144;
+        let vocab = specification.vocab as usize;
         ensure!(
             view.dtype() == safetensors::Dtype::F32 && view.shape() == [steps, vocab],
-            "RUNNER_FAIL hybrid reference requires F32[steps,248144]"
+            "RUNNER_FAIL hybrid reference requires F32[steps,vocab]"
         );
         let expected: Vec<_> = view
             .data()
