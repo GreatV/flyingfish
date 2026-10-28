@@ -16,12 +16,14 @@ struct Properties {
     int32_t driver_version, runtime_version;
     int32_t max_grid_y;
     int32_t async_engines, host_register_supported;
+    int32_t max_grid_x;
 };
-static_assert(sizeof(Properties) == 592 && alignof(Properties) == 8);
+static_assert(sizeof(Properties) == 600 && alignof(Properties) == 8);
 static_assert(offsetof(Properties, optin_shared_bytes) == 528);
 static_assert(offsetof(Properties, warp) == 536);
 static_assert(offsetof(Properties, max_grid_y) == 580);
 static_assert(offsetof(Properties, async_engines) == 584);
+static_assert(offsetof(Properties, max_grid_x) == 592);
 static_assert(hipErrorOutOfMemory == 2);
 static_assert(hipErrorNotReady == 600);
 static_assert(hipHostMallocPortable == 1 && hipHostRegisterPortable == 1);
@@ -57,12 +59,13 @@ extern "C" int ff_hip_device_properties(int device, Properties* output) {
         hipDeviceAttributeMaxSharedMemoryPerMultiprocessor, hipDeviceAttributeL2CacheSize,
         hipDeviceAttributeMemoryClockRate, hipDeviceAttributeMemoryBusWidth,
         hipDeviceAttributeCooperativeLaunch, hipDeviceAttributeMaxGridDimY,
-        hipDeviceAttributeAsyncEngineCount, hipDeviceAttributeHostRegisterSupported
+        hipDeviceAttributeAsyncEngineCount, hipDeviceAttributeHostRegisterSupported,
+        hipDeviceAttributeMaxGridDimX
     };
     int* values[] = {&output->warp, &output->compute_units, &output->max_threads,
         &output->shared_bytes, &output->unit_shared_bytes, &output->l2_bytes,
         &output->memory_clock_khz, &output->memory_bus_bits, &output->cooperative,
-        &output->max_grid_y, &output->async_engines, &output->host_register_supported};
+        &output->max_grid_y, &output->async_engines, &output->host_register_supported, &output->max_grid_x};
     for (size_t i = 0; i < sizeof(attributes) / sizeof(attributes[0]); ++i) {
         status = hipDeviceGetAttribute(values[i], attributes[i], device);
         if (status != hipSuccess) return status;

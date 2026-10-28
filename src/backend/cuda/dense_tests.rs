@@ -2199,7 +2199,6 @@ fn attention_gate(
                 let dq = s.clone_htod(&q)?;
                 let dk = s.clone_htod(&k)?;
                 let mut dv = s.clone_htod(&v)?;
-                let prefix = s.clone_htod(&[start as i32])?;
                 let guard = bf16::from_f32(13.0);
                 let mut output = s.clone_htod(&vec![guard; (rows + 1) * 2048])?;
                 let shape = verification::Shape {
@@ -2212,30 +2211,9 @@ fn attention_gate(
                     causal: true,
                     window_left: None,
                 };
-                let mut mq = verification::Verification::with_plan(
-                    ctx,
-                    s,
-                    c,
-                    MultiShape {
-                        rows: rows.min(16),
-                        capacity,
-                        causal: true,
-                    },
-                    MultiPlan {
-                        implementation: MultiImpl::V1,
-                        launch: plan,
-                    },
-                )?;
-                let positions: Vec<i32> = (0..capacity as i32).collect();
-                let positions = s.clone_htod(&positions)?;
-                mq.run_prefill(verification::Query {
-                    qkv: &dq,
-                    k: &dk,
-                    v: &dv,
-                    out: &mut output,
-                    prefix: &positions,
-                    shape,
-                })?;
+                let mut prefill =
+                    crate::backend::cuda::flash::Flash::new(s.clone(), rows, 16, 2, 128)?;
+                prefill.run(&dq, 2560, &dk, &dv, &mut output, shape)?;
                 let actual = s.clone_dtoh(&output.slice(..rows * 2048))?;
                 gate.compare(
                     &format!("attention.prefill.{capacity}.{rows}.{start}"),
@@ -2250,20 +2228,24 @@ fn attention_gate(
                         .iter()
                         .all(|x| *x == guard),
                 );
+                #[cfg(feature = "cuda")]
+                s.begin_capture(
+                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )?;
+                #[cfg(feature = "rocm")]
+                let capture = s.begin_capture()?;
+                prefill.run(&dq, 2560, &dk, &dv, &mut output, shape)?;
+                #[cfg(feature = "cuda")]
+                let graph = s
+                    .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
+                    .context("prefill graph missing")?;
+                #[cfg(feature = "rocm")]
+                let graph = capture.finish()?;
+                graph.launch()?;
                 gate.check(
-                    "attention.prefill.positions_unchanged",
-                    s.clone_dtoh(&positions)?
-                        .iter()
-                        .copied()
-                        .eq(0..capacity as i32),
+                    "attention.prefill.graph_identity",
+                    s.clone_dtoh(&output.slice(..rows * 2048))? == actual,
                 );
-                if rows <= 16 {
-                    mq.run(&dq, &dk, &dv, &mut output, &prefix, shape)?;
-                    gate.check(
-                        "attention.prefill.single_chunk_identity",
-                        s.clone_dtoh(&output.slice(..rows * 2048))? == actual,
-                    );
-                }
                 if rows == 1 {
                     let mut single = decode::Attention::new(ctx, s, c, capacity, plan)?;
                     let length = s.clone_htod(&[(start + 1) as i32])?;
@@ -2281,7 +2263,7 @@ fn attention_gate(
                         v.swap(d, 128 + d);
                     }
                     s.memcpy_htod(&v, &mut dv)?;
-                    mq.run(&dq, &dk, &dv, &mut output, &prefix, shape)?;
+                    prefill.run(&dq, 2560, &dk, &dv, &mut output, shape)?;
                     let mut control = Gate::default();
                     let incorrectly_passed = control.compare(
                         "EXPECTED_MUTANT.V_slots0_1",

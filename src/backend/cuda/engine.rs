@@ -1,5 +1,4 @@
 use super::copy;
-#[cfg(feature = "cuda")]
 use super::flash::Flash;
 use crate::backend::TreeBuilder;
 use crate::backend::gpu::{CudaContext, PinnedHostSlice};
@@ -640,7 +639,6 @@ pub struct Engine {
     work: Work,
     ops: Ops,
     blas: Blas,
-    #[cfg(feature = "cuda")]
     flash: Option<Flash>,
     decode: Option<Attention>,
     flint_logits: Option<CudaSlice<f32>>,
@@ -661,10 +659,6 @@ pub struct Engine {
     pending_token: Option<u32>,
     resident_ids_len: usize,
     last_input_kind: Option<PrefixLastInputKind>,
-    #[cfg(feature = "rocm")]
-    prefill_attention: Option<super::verification::Verification>,
-    #[cfg(feature = "rocm")]
-    prefill_prefixes: CudaSlice<i32>,
 }
 
 #[cfg(feature = "cuda")]
@@ -1154,10 +1148,6 @@ impl Engine {
             pending_token: None,
             resident_ids_len: 0,
             last_input_kind: None,
-            #[cfg(feature = "rocm")]
-            prefill_attention: None,
-            #[cfg(feature = "rocm")]
-            prefill_prefixes: s.clone_htod(&(0..capacity as i32).collect::<Vec<_>>())?,
         };
         if let Some(path) = settings.draft_model {
             let path = path.canonicalize()?;
@@ -1225,7 +1215,6 @@ impl Engine {
 
     fn grow_rows(&mut self, rows: usize, chunk: usize) -> Result<()> {
         let old_rows = self.workspace_rows;
-        #[cfg(feature = "cuda")]
         let old_chunk = self.chunk;
         ensure!(rows >= old_rows, "workspace cannot shrink during load");
         if rows != old_rows {
@@ -1238,8 +1227,7 @@ impl Engine {
                 capture.grow(rows, &self.device.stream)?;
             }
         }
-        #[cfg(feature = "cuda")]
-        if rows != old_rows || chunk != old_chunk {
+        if rows != old_rows || chunk != old_chunk || self.flash.is_none() {
             self.flash = Some(Flash::new(
                 self.device.stream.clone(),
                 rows,
@@ -1263,16 +1251,7 @@ impl Engine {
             requested_chunk,
             free,
             total,
-            {
-                #[cfg(feature = "cuda")]
-                {
-                    Flash::tile(self.config.head_dim)?
-                }
-                #[cfg(feature = "rocm")]
-                {
-                    16
-                }
-            },
+            Flash::tile(self.config.head_dim)?,
             self.hidden_capture
                 .as_ref()
                 .map_or(0, |capture| capture.width * 2)
@@ -1855,32 +1834,17 @@ impl Engine {
                     .context("verification attention has not been initialized")?
                     .run(&w.qkv, &kv.k, &kv.v, &mut w.attn, &w.position, shape);
             }
-            #[cfg(feature = "cuda")]
-            {
-                self.flash
-                    .as_mut()
-                    .context("Llama prefill attention is not bound")?
-                    .run(
-                        &w.qkv,
-                        (c.num_attention_heads + 2 * c.num_key_value_heads) * c.head_dim,
-                        &kv.k,
-                        &kv.v,
-                        &mut w.attn,
-                        shape,
-                    )
-            }
-            #[cfg(feature = "rocm")]
-            self.prefill_attention
+            self.flash
                 .as_mut()
-                .context("HIP prefill attention is not bound")?
-                .run_prefill(super::verification::Query {
-                    qkv: &w.qkv,
-                    k: &kv.k,
-                    v: &kv.v,
-                    out: &mut w.attn,
-                    prefix: &self.prefill_prefixes,
+                .context("dense prefill attention is not bound")?
+                .run(
+                    &w.qkv,
+                    (c.num_attention_heads + 2 * c.num_key_value_heads) * c.head_dim,
+                    &kv.k,
+                    &kv.v,
+                    &mut w.attn,
                     shape,
-                })
+                )
         }
     }
 
@@ -5469,7 +5433,7 @@ struct HipSetup {
     profile: super::closure::Profile,
     linear: Vec<super::blas::Choice>,
     decode: crate::backend::setup::AttentionPlan,
-    prefill: crate::backend::setup::AttentionPlan,
+    prefill: usize,
 }
 
 #[cfg(all(test, feature = "rocm"))]
@@ -5674,7 +5638,6 @@ impl Engine {
             "HIP DSpark workspace exceeds KV capacity"
         );
         let work = Work::new(s, &model_spec, workspace_rows)?;
-        let prefill_prefixes = s.clone_htod(&(0..capacity as i32).collect::<Vec<_>>())?;
         let capture_checkpoint = Some(super::state::StateCheckpoint::new(
             &state,
             &model_spec,
@@ -5728,8 +5691,7 @@ impl Engine {
             pending_token: None,
             resident_ids_len: 0,
             last_input_kind: None,
-            prefill_attention: None,
-            prefill_prefixes,
+            flash: None,
         };
         if let Some(path) = &settings.draft_model {
             let draft = super::draft::Draft::new(
@@ -5785,7 +5747,6 @@ impl Engine {
 
     fn initialize_hip(&mut self, model: &Path, draft_path: Option<&Path>) -> Result<()> {
         use super::closure::{Profile, hash, write_cache};
-        use crate::backend::setup::{MultiImpl, MultiPlan, MultiShape};
         let budget = self.spec.as_ref().map(|_| self.spec_budget);
         self.forward_rows = super::closure::forward_rows(
             super::closure::small_rows(self.chunk, self.capacity),
@@ -5806,10 +5767,8 @@ impl Engine {
         let manifest = self.runtime.join(format!("hip-closure-{tag}.json"));
         self.closure.preflight(&[path.clone(), manifest.clone()])?;
         let cached = self.closure.access(&path)?;
-        let prepared_rows = self.chunk.min(16);
         let decode = super::verification::hip_plan(&self.device.ctx, self.capacity, 1, false)?;
-        let prefill =
-            super::verification::hip_plan(&self.device.ctx, self.capacity, prepared_rows, true)?;
+        let prefill = Flash::tile(self.config.head_dim)?;
         let setup = if cached {
             let setup: HipSetup = serde_json::from_slice(&std::fs::read(&path)?)?;
             ensure!(
@@ -5894,25 +5853,11 @@ impl Engine {
             self.capacity,
             setup.decode,
         )?);
-        self.prefill_attention = Some(super::verification::Verification::with_plan(
-            &self.device.ctx,
-            &self.device.stream,
-            &self.config,
-            MultiShape {
-                capacity: self.capacity,
-                rows: prepared_rows,
-                causal: true,
-            },
-            MultiPlan {
-                implementation: MultiImpl::V1,
-                launch: setup.prefill,
-            },
-        )?);
         self.closure
             .finish_with_key(setup.profile, manifest, identity)?;
         eprintln!(
             "{}",
-            serde_json::json!({"hip_setup": {"cached": cached, "measurements": if cached { 0 } else { setup.linear.iter().filter(|c| c.setup_median_ms.is_some()).count() }, "decode": decode, "prefill": prefill, "prefill_rows": prepared_rows, "gemm_rows": self.chunk, "calibration": "untuned correctness-only"}})
+            serde_json::json!({"hip_setup": {"cached": cached, "measurements": if cached { 0 } else { setup.linear.iter().filter(|c| c.setup_median_ms.is_some()).count() }, "decode": decode, "prefill": prefill, "prefill_tile_rows": prefill, "gemm_rows": self.chunk, "calibration": "untuned correctness-only"}})
         );
         Ok(())
     }
