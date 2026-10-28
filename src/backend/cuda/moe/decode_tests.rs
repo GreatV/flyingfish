@@ -387,6 +387,7 @@ fn invariant_decode(device: &Device) -> Result<()> {
                     cpu::fp8_contribution(
                         cpu::Isa::detect(),
                         cpu::Fp8Contribution {
+                            form: cpu::Form::Lane16,
                             shape: &shape,
                             slot: &world.slots[start..start + world.slot_bytes as usize],
                             slot_layout,
@@ -404,6 +405,7 @@ fn invariant_decode(device: &Device) -> Result<()> {
                     cpu::contribution(
                         cpu::Isa::detect(),
                         cpu::Contribution {
+                            form: cpu::Form::Lane16,
                             shape: &shape,
                             arena: &arena,
                             weights: &cpu::ExpertWeights {

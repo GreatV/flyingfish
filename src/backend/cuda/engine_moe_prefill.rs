@@ -3414,6 +3414,7 @@ mod tests {
                     contribution(
                         Isa::detect(),
                         Contribution {
+                            form: crate::cpu::expert_ffn::Form::Lane8,
                             shape: &shape,
                             arena: &native,
                             weights: &weights[0],
@@ -4190,6 +4191,7 @@ mod tests {
                     fp8_contribution(
                         Isa::detect(),
                         Fp8Contribution {
+                            form: crate::cpu::expert_ffn::Form::Lane8,
                             shape: &shape,
                             slot: &native_slot,
                             slot_layout,
@@ -4207,6 +4209,7 @@ mod tests {
                     contribution(
                         Isa::detect(),
                         Contribution {
+                            form: crate::cpu::expert_ffn::Form::Lane8,
                             shape: &shape,
                             arena: &arena,
                             weights: &native,

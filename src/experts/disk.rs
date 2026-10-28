@@ -342,6 +342,7 @@ struct Work {
     swiglu_rounding: crate::model_spec::SwigluRounding,
     swiglu_limit: f32,
     routed_weight: crate::model_spec::RoutedWeightBoundary,
+    form: crate::cpu::expert_ffn::Form,
     output: Vec<bf16>,
 }
 
@@ -466,6 +467,7 @@ impl DiskExperts {
                     swiglu_rounding,
                     swiglu_limit,
                     routed_weight,
+                    form: crate::cpu::expert_ffn::Form::Lane16,
                     output: vec![bf16::ZERO; elements],
                 }),
             });
@@ -686,6 +688,7 @@ fn disk_contributions<const FP8: bool>(
                         rounding: work.swiglu_rounding,
                         limit: work.swiglu_limit,
                         routed_weight: work.routed_weight,
+                        form: work.form,
                     },
                     vector,
                     scratch,
@@ -702,6 +705,7 @@ fn disk_contributions<const FP8: bool>(
                         rounding: work.swiglu_rounding,
                         limit: work.swiglu_limit,
                         routed_weight: work.routed_weight,
+                        form: work.form,
                     },
                     vector,
                     scratch,
@@ -1147,6 +1151,7 @@ mod tests {
                 contribution(
                     Isa::detect(),
                     Contribution {
+                        form: crate::cpu::expert_ffn::Form::Lane16,
                         shape: &shape,
                         arena: &values,
                         weights: &crate::cpu::expert_ffn::ExpertWeights::from_slot(
@@ -1356,6 +1361,7 @@ mod tests {
                 fp8_contribution(
                     Isa::Scalar,
                     Fp8Contribution {
+                        form: crate::cpu::expert_ffn::Form::Lane16,
                         shape: &shape,
                         slot: native_bytes(&values),
                         slot_layout: catalogue.layout().fp8_slot().context("FP8 fixture slot")?,
