@@ -79,7 +79,7 @@ def load_model(directory):
 
 
 @torch.inference_mode()
-def media_sequence(model, inputs, forced, steps):
+def media_sequence(model, inputs, forced, steps, head_all=False):
     model.model.rope_deltas = None
     ids = inputs["input_ids"].cuda()
     cache = transformers.cache_utils.DynamicCache(config=model.config.text_config)
@@ -95,7 +95,7 @@ def media_sequence(model, inputs, forced, steps):
                                                        dtype=torch.long, device="cuda"),
                              past_key_values=cache, use_cache=True)
         positions = model._prepare_position_ids_for_generation(ids, arguments)[..., -ids.shape[1]:]
-        result = model(input_ids=ids, position_ids=positions, logits_to_keep=1, **arguments)
+        result = model(input_ids=ids, position_ids=positions, logits_to_keep=0 if head_all and step == 0 else 1, **arguments)
         cache = result.past_key_values
         row = result.logits[0, -1].float().cpu().contiguous()
         check(row.shape == (248320,) and torch.isfinite(row).all(), "invalid Qwen media logits")
@@ -134,27 +134,32 @@ def media_reference(model, args, loading, calls):
             inputs = load_file(args.forced_reference / (name + "-input.safetensors"))
             forced = load_file(args.forced_reference / (name + ".safetensors"))["tokens"].tolist()
         save_file(inputs, args.output / (name + "-input.safetensors"))
-        first = None
-        for repeat in range(args.repeats):
-            before, layers = len(encoder), calls.copy()
-            result = media_sequence(model, inputs, forced, 32)
-            check(len(encoder) == before + 1, "image encoder call count")
-            check(all(x - y == 32 for x, y in zip(calls, layers)), "image language layer call count")
-            if first is None:
-                first = result["logits"]
-                if forced is None:
-                    forced = result["tokens"].tolist()
-            else:
-                check(torch.equal(first.view(torch.int32), result["logits"].view(torch.int32)),
-                      "image reference repeat bits differ")
-            suffix = "" if repeat == 0 else f"-repeat{repeat}"
-            save_file(result, args.output / (name + suffix + ".safetensors"))
-            cell = dict(name=name, repeat=repeat, encoder_calls=1, steps=32,
-                        rows=inputs["input_ids"].numel(), min_margin=float(result["margins"].min()),
-                        text=tokenizer.decode(result["tokens"], skip_special_tokens=True))
-            report["cells"].append(cell)
-            print("Q38_MEDIA_REFERENCE " + json.dumps(cell), flush=True)
-        outputs.append(first)
+        primary = None
+        for variant in ("eager", "sdpa", "all-head"):
+            model.set_attn_implementation("sdpa" if variant == "sdpa" else "eager")
+            first = None
+            for repeat in range(args.repeats):
+                before, layers = len(encoder), calls.copy()
+                result = media_sequence(model, inputs, forced, 32, variant == "all-head")
+                check(len(encoder) == before + 1, "image encoder call count")
+                check(all(x - y == 32 for x, y in zip(calls, layers)), "image language layer call count")
+                if first is None:
+                    first = result["logits"]
+                    if forced is None:
+                        forced = result["tokens"].tolist()
+                else:
+                    check(torch.equal(first.view(torch.int32), result["logits"].view(torch.int32)),
+                          "image reference repeat bits differ")
+                suffix = ("" if variant == "eager" else "-" + variant) + ("" if repeat == 0 else f"-repeat{repeat}")
+                save_file(result, args.output / (name + suffix + ".safetensors"))
+                cell = dict(name=name, variant=variant, repeat=repeat, encoder_calls=1, steps=32,
+                            rows=inputs["input_ids"].numel(), min_margin=float(result["margins"].min()),
+                            text=tokenizer.decode(result["tokens"], skip_special_tokens=True))
+                report["cells"].append(cell)
+                print("Q38_MEDIA_REFERENCE " + json.dumps(cell), flush=True)
+            if variant == "eager":
+                primary = first
+        outputs.append(primary)
     check(len(outputs) >= 2 and all(not torch.equal(a, b) for i, a in enumerate(outputs)
                                    for b in outputs[i + 1:]), "two-image control failed")
     handle.remove()
