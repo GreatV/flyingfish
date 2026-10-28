@@ -1129,7 +1129,6 @@ impl Engine {
         let mut work =
             Work::new_with_peer_tail(stream, &model_spec, workspace_rows, peer_tail_elems)?;
         stream.memcpy_htod(&[1i32], &mut work.length)?;
-        #[cfg(feature = "cuda")]
         let flash = Some(Flash::new(
             stream.clone(),
             workspace_rows,
@@ -1256,14 +1255,9 @@ impl Engine {
             work,
             ops,
             blas,
-            #[cfg(feature = "cuda")]
             flash,
             decode: None,
             flint_logits: None,
-            #[cfg(feature = "rocm")]
-            prefill_attention: None,
-            #[cfg(feature = "rocm")]
-            prefill_prefixes: stream.alloc_zeros(0)?,
             device,
             config,
             model_spec,

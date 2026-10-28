@@ -160,6 +160,7 @@ pub struct Properties {
     pub max_grid_y: i32,
     pub async_engines: i32,
     pub host_register_supported: i32,
+    pub max_grid_x: i32,
 }
 
 pub struct Context {
@@ -233,7 +234,8 @@ impl Context {
                 && properties.l2_bytes >= 0
                 && properties.memory_clock_khz > 0
                 && properties.memory_bus_bits > 0
-                && properties.max_grid_y > 0,
+                && properties.max_grid_y > 0
+                && properties.max_grid_x > 0,
             "invalid HIP device resource attributes"
         );
         Ok(Arc::new(Self {

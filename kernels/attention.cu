@@ -765,3 +765,177 @@ extern "C" __global__ void flash_decode_mq_phase2(float* __restrict__ scratch,
 
 #undef FD_MQ_P1_EXPORTS
 #undef FD_GUARD_MQ
+
+#if defined(__HIP__) && defined(__GFX11__)
+namespace prefill {
+struct Problem {
+  const bf16* q;
+  const bf16* k;
+  const bf16* v;
+  bf16* out;
+  float* lse;
+  uint32_t rows, capacity, q_stride, q_heads, group, start;
+};
+static_assert(sizeof(Problem) == 64);
+using B = short __attribute__((ext_vector_type(16)));
+using A = float __attribute__((ext_vector_type(8)));
+
+// D256 uses eight-lane FP32 QK dots and BF16 WMMA PV.
+// D128 reuses K storage for scores and keeps two BF16 probability planes.
+template<int D, int MODE>
+__device__ void run(Problem p, uint32_t extent) {
+  constexpr int BQ = D == 256 ? 16 : 32;
+  constexpr int BK = D == 256 ? 32 : 64;
+  constexpr int KS = D == 256 ? D+8 : D;
+  constexpr int PLANES = D == 256 ? 1 : 2;
+  __shared__ __align__(16) unsigned short memory[BQ*D + BK*KS + BK*D +
+      PLANES*BQ*BK + 2*BQ + (D == 256 ? 2*BQ*BK : 0)];
+  auto* qs = memory;
+  auto* ks = qs + BQ*D;
+  auto* vs = ks + BK*KS;
+  auto* high = vs + BK*D;
+  auto* low = high + BQ*BK;
+  auto* alpha = reinterpret_cast<float*>(high + PLANES*BQ*BK);
+  auto* score_memory = D == 256 ? alpha+BQ : reinterpret_cast<float*>(ks);
+  const int tid = threadIdx.x, wave = tid/32, lane = tid%32;
+  const uint32_t head = blockIdx.y, kv = head/p.group, query_base = blockIdx.x*BQ;
+  if (blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 ||
+      gridDim.x != (p.rows+BQ-1)/BQ || gridDim.y != p.q_heads || gridDim.z != 1 ||
+      p.group == 0 || p.rows == 0 || p.start > p.capacity || p.rows > p.capacity-p.start) __trap();
+  const uint32_t end = MODE == 1 ? extent : (MODE == 2 ? max(extent,p.start+p.rows) : p.start+p.rows);
+  const uint32_t first = MODE == 3 && p.start+query_base > extent
+      ? (p.start+query_base-extent)/BK*BK : 0;
+  const uint32_t limit = MODE == 1 ? end : min(end, MODE == 2
+      ? max(extent,p.start+query_base+BQ) : p.start+query_base+BQ);
+  for (int cell = tid; cell < BQ*D; cell += 128) {
+    const uint32_t row = query_base + cell/D;
+    qs[cell] = row < p.rows ? reinterpret_cast<const unsigned short*>(p.q)[
+        (size_t)row*p.q_stride + head*D + cell%D] : 0;
+  }
+  float peak = -INFINITY, denominator = 0.0f, correction = 0.0f;
+  A output[4] = {};
+  const int q_slab = D == 256 ? 0 : wave/2;
+  const int channel = D == 256 ? wave*64 : (wave%2)*64;
+  __syncthreads();
+  for (uint32_t base = first; base < limit; base += BK) {
+    for (int cell = tid; cell < BK*D; cell += 128) {
+      const uint32_t key = base + cell/D;
+      const size_t offset = ((size_t)kv*p.capacity + key)*D + cell%D;
+      ks[(cell/D)*KS+cell%D] = key < end ? reinterpret_cast<const unsigned short*>(p.k)[offset] : 0;
+      vs[cell] = key < end ? reinterpret_cast<const unsigned short*>(p.v)[offset] : 0;
+    }
+    __syncthreads();
+    const auto store_score = [&](int row, int column, float value) {
+      const uint32_t key = base+column, query = p.start+query_base+row;
+      const bool visible = query_base+row < p.rows && key < end &&
+          (MODE == 1 || (MODE == 2 ? key < max(extent,query+1) : key <= query)) &&
+          (MODE != 3 || query-key <= extent);
+      score_memory[row*BK+column] = visible ? value*(D == 256 ? 0.0625f : SCALE) : -INFINITY;
+    };
+    if constexpr (D == 256) {
+      for (int cell = tid/8; cell < BQ*BK; cell += 16) {
+        float dot = 0.0f;
+#pragma unroll
+        for (int dimension = tid%8; dimension < D; dimension += 8) {
+          const float q = __uint_as_float(uint32_t(qs[(cell/BK)*D+dimension]) << 16);
+          const float k = __uint_as_float(uint32_t(ks[(cell%BK)*KS+dimension]) << 16);
+          dot = fmaf(q,k,dot);
+        }
+        dot += __shfl_down(dot,4,8);
+        dot += __shfl_down(dot,2,8);
+        dot += __shfl_down(dot,1,8);
+        if (tid%8 == 0) store_score(cell/BK,cell%BK,dot);
+      }
+    } else {
+      A scores[2] = {};
+      const int key_slab = (wave%2)*2;
+#pragma unroll
+      for (int part = 0; part < D/16; ++part) {
+        B a;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) a[j] = qs[(q_slab*16+lane%16)*D+part*16+j];
+#pragma unroll
+        for (int tile = 0; tile < 2; ++tile) {
+          B b;
+#pragma unroll
+          for (int j = 0; j < 16; ++j) b[j] = ks[((key_slab+tile)*16+lane%16)*KS+part*16+j];
+          scores[tile] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a,b,scores[tile]);
+        }
+      }
+      __syncthreads();
+#pragma unroll
+      for (int tile = 0; tile < 2; ++tile)
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+          store_score(q_slab*16+2*j+lane/16,(key_slab+tile)*16+lane%16,scores[tile][j]);
+    }
+    __syncthreads();
+    if (tid < BQ) {
+      float next = peak;
+      for (int key = 0; key < BK; ++key) next = fmaxf(next,score_memory[tid*BK+key]);
+      const float rescale = isfinite(next) ? __expf(peak-next) : 0.0f;
+      denominator *= rescale;
+      correction *= rescale;
+      for (int key = 0; key < BK; ++key) {
+        const float value = isfinite(next) ? __expf(score_memory[tid*BK+key]-next) : 0.0f;
+        const float y = value-correction, sum = denominator+y;
+        correction = (sum-denominator)-y;
+        denominator = sum;
+        const bf16 hi = __float2bfloat16(value);
+        high[tid*BK+key] = reinterpret_cast<const unsigned short&>(hi);
+        if constexpr (D == 128) {
+          const bf16 lo = __float2bfloat16(value-__bfloat162float(hi));
+          low[tid*BK+key] = reinterpret_cast<const unsigned short&>(lo);
+        }
+      }
+      peak = next;
+      alpha[tid] = rescale;
+    }
+    __syncthreads();
+#pragma unroll
+    for (int panel = 0; panel < 4; ++panel) {
+#pragma unroll
+      for (int j = 0; j < 8; ++j) output[panel][j] *= alpha[q_slab*16+2*j+lane/16];
+    }
+#pragma unroll
+    for (int tile = 0; tile < BK/16; ++tile) {
+      B ph, pl;
+#pragma unroll
+      for (int j = 0; j < 16; ++j) {
+        ph[j] = high[(q_slab*16+lane%16)*BK+tile*16+j];
+        if constexpr (D == 128) pl[j] = low[(q_slab*16+lane%16)*BK+tile*16+j];
+      }
+#pragma unroll
+      for (int panel = 0; panel < 4; ++panel) {
+        B value;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) value[j] = vs[(tile*16+j)*D+channel+panel*16+lane%16];
+        output[panel] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(ph,value,output[panel]);
+        if constexpr (D == 128)
+          output[panel] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(pl,value,output[panel]);
+      }
+    }
+    __syncthreads();
+  }
+  if (tid < BQ) {
+    alpha[tid] = denominator > 0 ? 1.0f/denominator : 0.0f;
+    if (query_base+tid < p.rows) p.lse[(size_t)head*p.rows+query_base+tid] = peak+logf(denominator);
+  }
+  __syncthreads();
+#pragma unroll
+  for (int panel = 0; panel < 4; ++panel) {
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const uint32_t row = query_base+q_slab*16+2*j+lane/16;
+      if (row < p.rows) p.out[((size_t)row*p.q_heads+head)*D+channel+panel*16+lane%16] =
+          __float2bfloat16(output[panel][j]*alpha[q_slab*16+2*j+lane/16]);
+    }
+  }
+}
+}
+extern "C" __global__ void attention_prefill_d256(prefill::Problem p) { prefill::run<256,0>(p,0); }
+extern "C" __global__ void attention_prefill_d128(prefill::Problem p) { prefill::run<128,0>(p,0); }
+extern "C" __global__ void attention_prefill_d128_bidirectional(prefill::Problem p, uint32_t keys) { prefill::run<128,1>(p,keys); }
+extern "C" __global__ void attention_prefill_d128_prefix(prefill::Problem p, uint32_t prefix) { prefill::run<128,2>(p,prefix); }
+extern "C" __global__ void attention_prefill_d128_window(prefill::Problem p, uint32_t window) { prefill::run<128,3>(p,window); }
+#endif

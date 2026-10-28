@@ -2043,7 +2043,7 @@ impl Engine {
         let (prefill_backend, decode_backend) = if flint {
             ("FA2 d128 sliding/full", "flash decode d128")
         } else if cfg!(feature = "rocm") {
-            ("TCMQA d256", "TCMQA d256")
+            ("native HIP d256", "TCMQA d256")
         } else {
             ("native Rust d256", "TCMQA d256")
         };
@@ -2100,7 +2100,6 @@ impl Engine {
             .transpose()?
             .unwrap_or(0);
         let work = Work::new_with_peer_tail(s, &model_spec, rows, peer_tail_elems)?;
-        #[cfg(feature = "cuda")]
         let flash = Flash::new(
             s.clone(),
             rows,
@@ -2148,14 +2147,9 @@ impl Engine {
             work,
             ops,
             blas,
-            #[cfg(feature = "cuda")]
             flash: Some(flash),
             decode: None,
             flint_logits,
-            #[cfg(feature = "rocm")]
-            prefill_attention: None,
-            #[cfg(feature = "rocm")]
-            prefill_prefixes: s.alloc_zeros(0)?,
             device,
             config,
             model_spec,
@@ -3196,7 +3190,38 @@ impl Engine {
                                 text_prefill
                             };
                             let plan = plans.select(rows, &FullAttentionPlan::for_rows)?;
-                            FullAttentionOps::run(&plan, s, meta, scratch(&q.scratch, s))?;
+                            if self.qwen_device_prefix {
+                                FullAttentionOps::run(&plan, s, meta, scratch(&q.scratch, s))?;
+                            } else {
+                                FullAttentionOps::preprocess(
+                                    &plan,
+                                    s,
+                                    meta,
+                                    scratch(&q.scratch, s),
+                                )?;
+                                let kv =
+                                    &self.state.kv[self.model_spec.layers[i].state_index as usize];
+                                self.flash
+                                    .as_mut()
+                                    .context("HIP prefill attention is not bound")?
+                                    .run(
+                                        &mw.q,
+                                        q_width as usize,
+                                        &kv.k,
+                                        &kv.v,
+                                        &mut w.attn,
+                                        Shape {
+                                            rows,
+                                            start: self.position,
+                                            q_heads: attention.hq as usize,
+                                            kv_heads: attention.hkv as usize,
+                                            capacity: self.capacity,
+                                            head_dim: 256,
+                                            causal: true,
+                                            window_left: None,
+                                        },
+                                    )?;
+                            }
                         }
                         #[cfg(feature = "cuda")]
                         {

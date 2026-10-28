@@ -12,7 +12,6 @@ pub mod cubin;
 pub mod decode;
 pub mod draft;
 pub mod engine;
-#[cfg(feature = "cuda")]
 pub mod flash;
 pub(crate) mod gdn;
 #[cfg(test)]

@@ -1,0 +1,58 @@
+{
+  "rule": "Twice the maximum A-only FP32/BF16 reference deviation from independent FP64 across HIP/CUDA and full/17-query shapes; three exact FP32 repeats. Frozen before candidate execution.",
+  "reference_cells": 280,
+  "floors": {
+    "256-causal": {
+      "output_max": 0.0025993622507483162,
+      "output_rms": 0.0009503995957980008,
+      "lse_max": 7.377256003956999e-08
+    },
+    "128-causal": {
+      "output_max": 0.002597354760845685,
+      "output_rms": 0.0009314501713196761,
+      "lse_max": 1.257072487798918e-07
+    },
+    "128-bidirectional": {
+      "output_max": 0.002597450480208654,
+      "output_rms": 0.0009513930344227761,
+      "lse_max": 1.1080672907853879e-07
+    },
+    "128-prefix": {
+      "output_max": 0.0025973572062818915,
+      "output_rms": 0.0009334625992207433,
+      "lse_max": 1.1990819047306686e-07
+    },
+    "128-window": {
+      "output_max": 0.002597354760845685,
+      "output_rms": 0.0009314501713196761,
+      "lse_max": 1.257072487798918e-07
+    }
+  },
+  "limits": {
+    "256-causal": {
+      "output_max": 0.0051987245014966325,
+      "output_rms": 0.0019007991915960015,
+      "lse_max": 1.4754512007913998e-07
+    },
+    "128-causal": {
+      "output_max": 0.00519470952169137,
+      "output_rms": 0.0018629003426393522,
+      "lse_max": 2.514144975597836e-07
+    },
+    "128-bidirectional": {
+      "output_max": 0.005194900960417308,
+      "output_rms": 0.0019027860688455521,
+      "lse_max": 2.2161345815707758e-07
+    },
+    "128-prefix": {
+      "output_max": 0.005194714412563783,
+      "output_rms": 0.0018669251984414865,
+      "lse_max": 2.398163809461337e-07
+    },
+    "128-window": {
+      "output_max": 0.00519470952169137,
+      "output_rms": 0.0018629003426393522,
+      "lse_max": 2.514144975597836e-07
+    }
+  }
+}
