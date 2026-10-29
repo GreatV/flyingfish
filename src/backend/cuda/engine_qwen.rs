@@ -20,6 +20,7 @@ pub(super) fn default_chunk(admitted: usize) -> usize {
     admitted.min(CUDA_GRID_YZ_MAX as usize / CHUNK_ALIGNMENT * CHUNK_ALIGNMENT)
 }
 
+#[cfg(feature = "cuda")]
 use crate::backend::cuda::{
     cubin,
     decode::{GqaDecodeInput, SlidingWindow},
@@ -1282,7 +1283,6 @@ impl Runtime {
         } else {
             Some(w.mixer.as_ref().context("Q38 mixer work missing")?)
         };
-        #[cfg(feature = "cuda")]
         let rope_module = if flint || gemma {
             Some(cubin::module(&engine.device.ctx, "rope")?)
         } else {

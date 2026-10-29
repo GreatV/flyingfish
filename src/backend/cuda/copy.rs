@@ -299,7 +299,7 @@ impl RingCopy<'_> {
             [self.heads, self.head_dim],
         )
     }
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn run_raw(self, call: RingCopyCall) -> Result<()> {
         let lengths = [self.source.len(), self.target.len()];
         call.run(
