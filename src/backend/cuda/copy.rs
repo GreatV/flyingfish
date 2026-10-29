@@ -1,7 +1,7 @@
-use crate::backend::gpu::{CudaFunction, CudaSlice, PushKernelArg};
 use crate::backend::gpu::{
     CudaContext, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, PinnedHostSlice, ValidAsZeroBits,
 };
+use crate::backend::gpu::{CudaFunction, CudaSlice, PushKernelArg};
 use anyhow::{Result, ensure};
 #[cfg(feature = "cuda")]
 use cudarc::driver::sys;

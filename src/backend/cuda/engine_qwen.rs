@@ -3976,7 +3976,6 @@ impl Engine {
         let q = self.qwen.as_mut().context("Q38 runtime missing")?;
         let layer = &q.layers[i];
         let flint_layer = matches!(layer.mixer, BoundMixer::Flint { .. });
-        let flint_layer = matches!(layer.mixer, BoundMixer::Flint { .. });
         let gemma_layer = matches!(layer.mixer, BoundMixer::Gemma { .. });
         let attention = if flint_layer || gemma_layer {
             None

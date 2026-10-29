@@ -995,7 +995,7 @@ fn oracle_layer_distance(
     oracle: &ReferenceFixture,
     reference_layers: &ReferenceFixture,
     family: &str,
-    token: usize,
+    row: Option<usize>,
     layer: usize,
 ) -> Result<bool> {
     let name = format!("layers.{family}");
@@ -1028,21 +1028,82 @@ fn oracle_layer_distance(
     let candidate_rmse = (candidate_sq / candidate_values.len() as f64).sqrt();
     let reference_rmse = (reference_sq / reference_values.len() as f64).sqrt();
     let beyond = candidate_max > 2.0 * reference_max || candidate_rmse > 2.0 * reference_rmse;
+    let row = row.map_or_else(|| "all".to_owned(), |row| row.to_string());
     println!(
-        "GEMMA4_ORACLE_LAYER token={token} layer={layer} candidate_max={candidate_max} candidate_rmse={candidate_rmse} reference_max={reference_max} reference_rmse={reference_rmse} beyond_2x={beyond}"
+        "GEMMA4_ORACLE_LAYER row={row} rows={} layer={layer} candidate_max={candidate_max} candidate_rmse={candidate_rmse} reference_max={reference_max} reference_rmse={reference_rmse} beyond_2x={beyond}",
+        candidate_values.len() / oracle[name.as_str()].0[2]
     );
     Ok(beyond)
 }
 
+fn row_nll(values: impl Iterator<Item = f32> + Clone, target: f32) -> f64 {
+    let peak = values.clone().fold(f32::NEG_INFINITY, f32::max);
+    let sum = values.map(|value| (value - peak).exp() as f64).sum::<f64>();
+    -(target - peak) as f64 + sum.ln()
+}
+
 fn oracle_token_nll(
     actual: &[bf16],
-    expected: &[f32],
-    ids: &[u32],
+    reference: &[bf16],
+    oracle: &[f32],
+    target: Option<usize>,
+    row: usize,
+) -> Result<[f64; 3]> {
+    ensure!(
+        actual.len() == reference.len() && actual.len() == oracle.len(),
+        "oracle token logit extent mismatch"
+    );
+    let losses = if let Some(target) = target {
+        [
+            row_nll(
+                actual.iter().map(|value| value.to_f32()),
+                actual[target].to_f32(),
+            ),
+            row_nll(
+                reference.iter().map(|value| value.to_f32()),
+                reference[target].to_f32(),
+            ),
+            row_nll(oracle.iter().copied(), oracle[target]),
+        ]
+    } else {
+        [0.0; 3]
+    };
+    println!(
+        "GEMMA4_ORACLE_TOKEN row={row} target={target:?} candidate_nll={} reference_nll={} oracle_nll={} candidate_delta={} reference_delta={}",
+        losses[0],
+        losses[1],
+        losses[2],
+        losses[0] - losses[2],
+        losses[1] - losses[2]
+    );
+    Ok(losses)
+}
+
+fn oracle_nll_summary(
+    actual: &[bf16],
+    reference_values: &[bf16],
+    oracle_values: &[f32],
+    sequence: &[u32],
     bounds: &serde_json::Value,
-    token: usize,
+    losses: [f64; 3],
 ) -> Result<()> {
-    let (_, line) = model_metrics(actual, expected, ids, bounds)?;
-    println!("GEMMA4_ORACLE_TOKEN token={token} {line}");
+    let count = sequence.len().saturating_sub(1).max(1) as f64;
+    let candidate_sum = (losses[0] / count - losses[2] / count).abs();
+    let reference_sum = (losses[1] / count - losses[2] / count).abs();
+    let (_, candidate_line, candidate_cell) =
+        model_metrics(actual, oracle_values, sequence, bounds)?;
+    let (_, reference_line, reference_cell) =
+        model_metrics(reference_values, oracle_values, sequence, bounds)?;
+    ensure!(
+        candidate_sum.to_bits() == candidate_cell.to_bits()
+            && reference_sum.to_bits() == reference_cell.to_bits(),
+        "per-row NLL contributions do not reconcile with the cell metric"
+    );
+    println!(
+        "GEMMA4_ORACLE_NLL_SUM candidate_sum={candidate_sum} reference_sum={reference_sum} candidate_cell={candidate_cell} reference_cell={reference_cell} reconciled=true"
+    );
+    println!("GEMMA4_ORACLE_NLL_CELL candidate {candidate_line}");
+    println!("GEMMA4_ORACLE_NLL_CELL reference {reference_line}");
     Ok(())
 }
 
@@ -1075,52 +1136,86 @@ fn localize_oracle_cell(
             let mut beyond = false;
             for layer in 0..layers {
                 beyond |=
-                    oracle_layer_distance(&trace, oracle, reference_layers, family, 0, layer)?;
+                    oracle_layer_distance(&trace, oracle, reference_layers, family, None, layer)?;
             }
             if !beyond {
-                let expected = reference(oracle, &format!("{family}.prefill"))?.as_f32();
-                for (row, &id) in sequence.iter().enumerate() {
+                let name = format!("{family}.prefill");
+                let oracle_values = reference(oracle, &name)?.as_f32();
+                let reference_values = reference_bf16(reference_layers, &name)?;
+                let vocab = oracle_values.len() / sequence.len();
+                let mut actual_values = Vec::with_capacity(oracle_values.len());
+                let mut losses = [0.0; 3];
+                for row in 0..sequence.len() {
                     let actual = engine.gemma_all_logits(row)?;
-                    oracle_token_nll(
+                    let contribution = oracle_token_nll(
                         &actual,
-                        &expected[row * actual.len()..(row + 1) * actual.len()],
-                        &[id],
-                        bounds,
+                        &reference_values[row * vocab..(row + 1) * vocab],
+                        &oracle_values[row * vocab..(row + 1) * vocab],
+                        sequence.get(row + 1).map(|target| *target as usize),
                         row,
                     )?;
+                    actual_values.extend(actual);
+                    for (sum, value) in losses.iter_mut().zip(contribution) {
+                        *sum += value;
+                    }
                 }
+                oracle_nll_summary(
+                    &actual_values,
+                    reference_values,
+                    &oracle_values,
+                    &sequence,
+                    bounds,
+                    losses,
+                )?;
             }
         }
         "decode" => {
+            let name = format!("{family}.decode");
+            let oracle_values = reference(oracle, &name)?.as_f32();
+            let reference_values = reference_bf16(reference_layers, &name)?;
+            let vocab = oracle_values.len() / sequence.len();
+            let mut actual_values = Vec::with_capacity(oracle_values.len());
+            let mut losses = [0.0; 3];
+            let mut beyond = false;
             for (row, &id) in sequence.iter().enumerate() {
                 let mut trace = crate::trace::Trace::all_layers();
                 engine.gemma_decode_trace(id, &mut trace)?;
-                let mut beyond = false;
                 for layer in 0..layers {
                     beyond |= oracle_layer_distance(
                         &trace,
                         oracle,
                         reference_layers,
                         family,
-                        row,
+                        Some(row),
                         layer,
                     )?;
                 }
-                if !beyond {
-                    let expected = reference(oracle, &format!("{family}.decode"))?.as_f32();
-                    let actual: Vec<bf16> = engine
-                        .decode_logits()?
-                        .into_iter()
-                        .map(bf16::from_f32)
-                        .collect();
-                    oracle_token_nll(
-                        &actual,
-                        &expected[row * actual.len()..(row + 1) * actual.len()],
-                        &[id],
-                        bounds,
-                        row,
-                    )?;
+                let actual: Vec<bf16> = engine
+                    .decode_logits()?
+                    .into_iter()
+                    .map(bf16::from_f32)
+                    .collect();
+                let contribution = oracle_token_nll(
+                    &actual,
+                    &reference_values[row * vocab..(row + 1) * vocab],
+                    &oracle_values[row * vocab..(row + 1) * vocab],
+                    sequence.get(row + 1).map(|target| *target as usize),
+                    row,
+                )?;
+                actual_values.extend(actual);
+                for (sum, value) in losses.iter_mut().zip(contribution) {
+                    *sum += value;
                 }
+            }
+            if !beyond {
+                oracle_nll_summary(
+                    &actual_values,
+                    reference_values,
+                    &oracle_values,
+                    &sequence,
+                    bounds,
+                    losses,
+                )?;
             }
         }
         _ => anyhow::bail!("unknown oracle cell mode {mode}"),
@@ -1133,7 +1228,7 @@ fn model_metrics(
     expected: &[f32],
     ids: &[u32],
     bounds: &serde_json::Value,
-) -> Result<(bool, String)> {
+) -> Result<(bool, String, f64)> {
     ensure!(
         actual.len() == expected.len(),
         "model logit extent mismatch"
@@ -1186,21 +1281,8 @@ fn model_metrics(
         }
         if row + 1 < ids.len() {
             let target = ids[row + 1] as usize;
-            let candidate_peak = a
-                .iter()
-                .map(|v| v.to_f32())
-                .fold(f32::NEG_INFINITY, f32::max);
-            let candidate_sum = a
-                .iter()
-                .map(|v| (v.to_f32() - candidate_peak).exp() as f64)
-                .sum::<f64>();
-            losses[0] += -(a[target].to_f32() - candidate_peak) as f64 + candidate_sum.ln();
-            let reference_peak = b.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let reference_sum = b
-                .iter()
-                .map(|v| (v - reference_peak).exp() as f64)
-                .sum::<f64>();
-            losses[1] += -(b[target] - reference_peak) as f64 + reference_sum.ln();
+            losses[0] += row_nll(a.iter().map(|value| value.to_f32()), a[target].to_f32());
+            losses[1] += row_nll(b.iter().copied(), b[target]);
         }
     }
     let count = ids.len().saturating_sub(1).max(1) as f64;
@@ -1215,6 +1297,7 @@ fn model_metrics(
         format!(
             "output_max={maximum} output_rmse={rmse} nll_delta={nll_delta} qualified_ids={qualified} id_defects={id_defects}"
         ),
+        nll_delta,
     ))
 }
 
@@ -1269,7 +1352,7 @@ fn f32_reference_distances_differ_from_bf16_rounding() -> Result<()> {
         "nll_max": 1e9,
         "margin_cut": 0.0
     });
-    let (pass, line) = model_metrics(&actual, &oracle, &ids, &bounds)?;
+    let (pass, line, _) = model_metrics(&actual, &oracle, &ids, &bounds)?;
     ensure!(
         !pass && line.starts_with("output_max=0.0009765625"),
         "F32 oracle distance was not scored: {line}"
@@ -1278,7 +1361,7 @@ fn f32_reference_distances_differ_from_bf16_rounding() -> Result<()> {
         .iter()
         .map(|value| bf16::from_f32(*value).to_f32())
         .collect();
-    let (pass, line) = model_metrics(&actual, &rounded, &ids, &bounds)?;
+    let (pass, line, _) = model_metrics(&actual, &rounded, &ids, &bounds)?;
     ensure!(
         pass && line.starts_with("output_max=0 "),
         "BF16 rounding did not hide the sub-ulp distance: {line}"
@@ -1551,7 +1634,7 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
             };
             let target_ids = &sequence[sequence.len() - expected_rows..];
             let actual = actual[actual.len() - expected.len()..].to_vec();
-            let (pass, line) = model_metrics(&actual, &expected, target_ids, bounds)?;
+            let (pass, line, _) = model_metrics(&actual, &expected, target_ids, bounds)?;
             println!("GEMMA4_MODEL {tag} {mode} {line}");
             defects += usize::from(!pass);
         }
@@ -1619,7 +1702,7 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
                 );
                 graph_logits.extend(actual.iter().map(|v| bf16::from_f32(*v)));
             }
-            let (pass, line) = model_metrics(
+            let (pass, line, _) = model_metrics(
                 &graph_logits,
                 &reference(&data, "wrap.decode")?.as_f32(),
                 &sequence[512..],
