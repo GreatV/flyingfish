@@ -769,8 +769,8 @@ mod tests {
             }
         }
 
-        /// FP64 output before the BF16 rounding.
-        fn forward_f64(&self, fx: &Fixture) -> Vec<f64> {
+        // 2026-10-29: the oracle includes blocked BF16 P and pre-rotary BF16 stores; limits are unchanged.
+        fn forward_f64(&self, fx: &Fixture, round_stores: bool) -> Vec<f64> {
             let mut out = vec![0.0f64; self.heads * self.head_dim];
             for head in 0..self.heads {
                 let q: Vec<f64> = (0..self.head_dim)
@@ -785,18 +785,38 @@ mod tests {
                     }
                     scores.push(dot * self.scale);
                 }
-                let sink = f64::from(fx.sink[head]);
-                let max = scores.iter().copied().fold(sink, f64::max);
-                let mut denom = (sink - max).exp();
-                for score in scores.iter().take(self.slots) {
-                    denom += (score - max).exp();
-                }
+                let mut maximum = f64::NEG_INFINITY;
+                let mut denom = 0.0;
                 let mut acc = vec![0.0f64; self.head_dim];
-                for (s, score) in scores.iter().take(self.slots).enumerate() {
-                    let row = fx.slot_ids[s] as usize;
-                    let weight = (score - max).exp() / denom;
-                    for (d, a) in acc.iter_mut().enumerate() {
-                        *a += weight * fx.value(row, d);
+                for (block, values) in scores.chunks(64).enumerate() {
+                    let next = values.iter().copied().fold(maximum, f64::max);
+                    let rescale = (maximum - next).exp();
+                    denom *= rescale;
+                    for a in &mut acc {
+                        *a *= rescale;
+                    }
+                    let mut block_sum = 0.0;
+                    for (offset, score) in values.iter().enumerate() {
+                        let row = fx.slot_ids[block * 64 + offset] as usize;
+                        let probability = (score - next).exp();
+                        block_sum += probability;
+                        let stored = if round_stores {
+                            f64::from(bf16::from_f32(probability as f32).to_f32())
+                        } else {
+                            probability
+                        };
+                        for (d, a) in acc.iter_mut().enumerate() {
+                            *a += stored * fx.value(row, d);
+                        }
+                    }
+                    denom += block_sum;
+                    maximum = next;
+                }
+                denom += (f64::from(fx.sink[head]) - maximum).exp();
+                for a in &mut acc {
+                    *a /= denom;
+                    if round_stores {
+                        *a = f64::from(bf16::from_f32(*a as f32).to_f32());
                     }
                 }
                 let tail = self.head_dim - self.rope_tail;
@@ -815,7 +835,7 @@ mod tests {
 
         /// BF16 output of the op.
         fn forward(&self, fx: &Fixture) -> Vec<bf16> {
-            self.forward_f64(fx)
+            self.forward_f64(fx, true)
                 .iter()
                 .map(|value| bf16::from_f32(*value as f32))
                 .collect()
@@ -1065,10 +1085,9 @@ mod tests {
             with_sink, without_sink,
             "latent window attention sink control escaped"
         );
-        // The sink is a denominator term: the output of every head stays
-        // proportional to the output without the sink.
-        let raw_with = oracle.forward_f64(&fx);
-        let raw_without = oracle.forward_f64(&zero_sink);
+        // Before the BF16 stores, the sink scales each head by one denominator factor.
+        let raw_with = oracle.forward_f64(&fx, false);
+        let raw_without = oracle.forward_f64(&zero_sink, false);
         for head in 0..4 {
             let start = head * 64;
             let peak = (start..start + 64)
@@ -1162,10 +1181,16 @@ mod tests {
         let device = Device::new(0)?;
         let s = &device.stream;
         let ops = LatentWindowAttention::new(&device.ctx)?;
+        let mut omitted_store_controls = 0;
         for &slots in &[1usize, 64, 128] {
             let fx = fixture(HEADS, HEAD_DIM, WINDOW, slots, 7);
             let oracle = Oracle::new(HEADS, HEAD_DIM, slots, ROPE_TAIL);
             let expected = oracle.forward(&fx);
+            let omitted: Vec<_> = oracle
+                .forward_f64(&fx, false)
+                .into_iter()
+                .map(|value| bf16::from_f32(value as f32))
+                .collect();
             let qb = testing::upload(&device.upload, fx.q.clone())?;
             let cb = testing::upload(&device.upload, fx.codes.clone())?;
             let sb = testing::upload(&device.upload, fx.scales.clone())?;
@@ -1244,6 +1269,16 @@ mod tests {
                     );
                 }
             }
+            let omitted_store_mismatches = host
+                .iter()
+                .zip(&omitted)
+                .filter(|(actual, mutant)| {
+                    bf16_ulp_distance(**actual, **mutant) > OUTPUT_ULP_TOL
+                        && (f64::from(actual.to_f32()) - f64::from(mutant.to_f32())).abs()
+                            > OUTPUT_ABS_TOL
+                })
+                .count();
+            omitted_store_controls += omitted_store_mismatches;
             let mut caught = 0usize;
             for head in 0..HEADS {
                 for d in 0..HEAD_DIM {
@@ -1260,7 +1295,17 @@ mod tests {
                 caught > 0,
                 "latent window attention planted wrong slot exclusion was not caught (slots {slots})"
             );
+            println!(
+                "LATENT_WINDOW_ORACLE slots={slots} heads=64 width=512 ulp_limit=1 abs_limit=3e-5 wrong_slot_mismatches={caught} omitted_store_mismatches={omitted_store_mismatches}"
+            );
         }
+        ensure!(
+            omitted_store_controls > 0,
+            "latent window attention omitted BF16 stores control escaped"
+        );
+        println!(
+            "PASS LATENT_WINDOW_ORACLE cases=3 fp64_reductions=true bf16_store_boundaries=true omitted_store_mismatches={omitted_store_controls}"
+        );
         Ok(())
     }
 }
