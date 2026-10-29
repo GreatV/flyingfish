@@ -732,7 +732,7 @@ enum BoundMixer {
         compact_small: Option<PrefillPlans<FullAttentionPlan>>,
     },
     Gemma {
-        flash: Flash,
+        flash: Box<Flash>,
         q_norm: Tensor<bf16, 1>,
         k_norm: Option<Tensor<bf16, 1>>,
         full: bool,
@@ -1453,7 +1453,7 @@ impl Runtime {
                         #[cfg(feature = "cuda")]
                         flash.bind_position(&engine.work.position)?;
                         BoundMixer::Gemma {
-                            flash,
+                            flash: Box::new(flash),
                             q_norm: weight("self_attn.q_norm.weight")?,
                             k_norm: if geometry.kv_reader {
                                 None
