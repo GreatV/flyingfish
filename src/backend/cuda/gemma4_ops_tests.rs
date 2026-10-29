@@ -696,7 +696,14 @@ fn proportional_and_default_rope_tables_match_the_definition_gpu() -> Result<()>
             println!("GEMMA4_ROPE_TABLE {}", stats.line(&format!("{tag}.{name}")));
             defects += usize::from(!stats.passes());
         }
-        let table_device = s.clone_htod(&table.repeat(2))?;
+        let upload = |table: &[bf16]| {
+            let paired: Vec<_> = table
+                .chunks_exact(d)
+                .flat_map(|row| row.iter().chain(row).copied())
+                .collect();
+            s.clone_htod(&paired)
+        };
+        let table_device = upload(&table)?;
         let run = |table: &crate::backend::gpu::CudaSlice<bf16>,
                    x: &[bf16],
                    heads: usize|
@@ -742,7 +749,7 @@ fn proportional_and_default_rope_tables_match_the_definition_gpu() -> Result<()>
                 ),
             ]
             .into_iter()
-            .map(|(name, mutant)| Ok((name, s.clone_htod(&mutant.table(d as u32, CAPACITY)?)?)))
+            .map(|(name, mutant)| Ok((name, upload(&mutant.table(d as u32, CAPACITY)?)?)))
             .collect::<Result<_>>()?
         } else {
             Vec::new()
