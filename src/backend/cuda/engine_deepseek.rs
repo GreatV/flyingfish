@@ -10833,7 +10833,12 @@ mod tests {
             }
         );
         let (mut attn_exempt, mut attn_defect) = (0usize, 0usize);
-        for (tf, &position) in tf_positions.iter().enumerate() {
+        // 2026-10-29: diagnostic positions do not change frozen position indices.
+        for &position in &tf_positions {
+            let tf = TF_POSITIONS
+                .iter()
+                .position(|&frozen| frozen == position)
+                .unwrap_or(TF_POSITIONS.len());
             let decode = position == SEED_POSITIONS;
             let (records, index): (&StepRecords, usize) = if position < SEED_POSITIONS {
                 (&seed_steps, position)
@@ -11209,6 +11214,24 @@ mod tests {
             // as a diagnostic.
             if isolated_attn {
                 s.memcpy_htod(want_attn, &mut engine.work.out.slice_mut(..HIDDEN))?;
+                // 2026-10-29: rule A includes post/comb and all residual copies.
+                let post: Vec<f32> = records.mixes[0].1
+                    [index * STREAM_COPIES..(index + 1) * STREAM_COPIES]
+                    .iter()
+                    .map(|&v| v as f32)
+                    .collect();
+                let comb: Vec<f32> = records.mixes[0].2[index * STREAM_COPIES * STREAM_COPIES
+                    ..(index + 1) * STREAM_COPIES * STREAM_COPIES]
+                    .iter()
+                    .map(|&v| v as f32)
+                    .collect();
+                let runtime = engine.hc.as_mut().context(runtime_missing)?;
+                s.memcpy_htod(&input_row, &mut runtime.stream.slice_mut(..STREAM_WIDTH))?;
+                s.memcpy_htod(&post, &mut runtime.mix_post.slice_mut(..STREAM_COPIES))?;
+                s.memcpy_htod(
+                    &comb,
+                    &mut runtime.mix_comb.slice_mut(..STREAM_COPIES * STREAM_COPIES),
+                )?;
             }
             engine.run_hc_stage(3, HcStage::Post, 0, step)?;
             let stream = s.clone_dtoh(&engine.hc.as_ref().context(runtime_missing)?.stream)?;
@@ -11249,6 +11272,27 @@ mod tests {
             println!(
                 "LAYER0 expand_operand pos={position} differing={expand_differing} of {STREAM_WIDTH} max_ulp={expand_ulps}"
             );
+            // 2026-10-29: rule A isolates FFN mixes/collapse from attention stores.
+            let ffn_stream = if isolated_ffn {
+                let pre: Vec<f32> = records.mixes[0].0
+                    [index * STREAM_COPIES..(index + 1) * STREAM_COPIES]
+                    .iter()
+                    .map(|&v| v as f32)
+                    .collect();
+                let runtime = engine.hc.as_mut().context(runtime_missing)?;
+                s.memcpy_htod(want_expand, &mut runtime.stream.slice_mut(..STREAM_WIDTH))?;
+                s.memcpy_htod(
+                    &pre,
+                    &mut runtime
+                        .attn_pre
+                        .as_mut()
+                        .context("mHC attention pre-mix missing")?
+                        .slice_mut(..STREAM_COPIES),
+                )?;
+                want_expand
+            } else {
+                &stream
+            };
             // Program stage 4 (HcPre): the FFN mixes and the collapse with the
             // attention's own pre-mix.
             engine.run_hc_stage(4, HcStage::Pre, 0, step)?;
@@ -11258,7 +11302,7 @@ mod tests {
             let mix_comb: Vec<f32> =
                 s.clone_dtoh(&runtime.mix_comb.slice(..STREAM_COPIES * STREAM_COPIES))?;
             let want = &records.mixes[1];
-            let (pre_f64, post_f64) = hc_mixes_f64(&stream, &hc_ffn_bytes, &params);
+            let (pre_f64, post_f64) = hc_mixes_f64(ffn_stream, &hc_ffn_bytes, &params);
             let pre_rows = &want.0[index * STREAM_COPIES..(index + 1) * STREAM_COPIES];
             let post_rows = &want.1[index * STREAM_COPIES..(index + 1) * STREAM_COPIES];
             ffn_pre.f64s(position, &mix_pre, pre_rows, band("ffn_pre", tf));

@@ -860,7 +860,7 @@ impl NormOps {
         } = call;
         let mode = match (mode, z.is_some(), gate_mode) {
             (Some(RmsMode::Standard), true, Some(GatedRmsMode::SiluBf16)) => 3,
-            (Some(RmsMode::Standard), true, Some(GatedRmsMode::SigmoidF32)) => 5,
+            (Some(RmsMode::Standard), true, Some(GatedRmsMode::SigmoidF32)) => 3,
             (Some(RmsMode::ZeroCentered), true, None) => 4,
             (Some(mode), false, None) => mode as i32,
             (None, false, None) => 2,
@@ -897,10 +897,10 @@ impl NormOps {
             .checked_mul(x.shape[1])
             .filter(|&n| n <= i32::MAX as u32)
             .ok_or_else(|| anyhow::anyhow!("norm grid overflow"))?;
-        let (kernel, mode) = if mode == 5 {
-            (&self.norm_sigmoid, 3)
+        let kernel = if gate_mode == Some(GatedRmsMode::SigmoidF32) {
+            &self.norm_sigmoid
         } else {
-            (&self.norm, mode)
+            &self.norm
         };
         let spb = norm_slices_per_block(rows.row_capacity, &x, wp, zp, zs, &y.0, mode);
         let blocks = slices.div_ceil(spb);
@@ -1246,6 +1246,124 @@ impl GateOps {
 mod tests {
     use super::*;
     use anyhow::ensure;
+
+    #[test]
+    #[ignore = "GPU window; FF_Q38_GPU_WINDOW=granted required"]
+    fn norm_unrounded_and_sigmoid_dispatch_gpu() -> Result<()> {
+        use super::super::contracts::view;
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let device = super::super::Device::new(0)?;
+        let s = &device.stream;
+        let common = CommonOpsRef::new(&device.ctx)?;
+        let mut cases = 0;
+        for width in [512usize, 1280, 5120] {
+            for rows in [1usize, 3] {
+                let pattern = |count, phase| -> Vec<bf16> {
+                    (0..count)
+                        .map(|i| bf16::from_f32(((i * 37 + phase) % 251) as f32 / 64.0 - 2.0))
+                        .collect()
+                };
+                let input = pattern(rows * width, 11);
+                let weight = pattern(width, 17);
+                let gate = pattern(rows * width, 83);
+                let w = s.clone_htod(&weight)?;
+                let z = s.clone_htod(&gate)?;
+                let metadata = s.clone_htod(&[0i32, rows as i32, rows as i32, 16, 0, 0, 0, 0])?;
+                let domain = RowDomain {
+                    meta: super::super::contracts::SeqRef {
+                        ptr: view(&metadata, s, 0, [8], [1])?.ptr,
+                    },
+                    row_base: 0,
+                    row_capacity: rows as u32,
+                };
+                let shape = [rows as u32, 1, width as u32];
+                let stride = [width as u64, width as u64, 1];
+                for sigmoid in [false, true] {
+                    for in_place in [false, true] {
+                        let x = s.clone_htod(&input)?;
+                        let output = s.alloc_zeros::<bf16>(rows * width)?;
+                        let xv = view(&x, s, 0, shape, stride)?;
+                        let mut yv = TensorMut(view(
+                            if in_place { &x } else { &output },
+                            s,
+                            0,
+                            shape,
+                            stride,
+                        )?);
+                        let wv = view(&w, s, 0, [width as u32], [1])?;
+                        if sigmoid {
+                            common.norm.rms_gated(
+                                s,
+                                domain,
+                                GatedRmsInput {
+                                    x: xv,
+                                    weight: wv,
+                                    gate: view(&z, s, 0, shape, stride)?,
+                                    mode: GatedRmsMode::SigmoidF32,
+                                },
+                                &mut yv,
+                                1e-6,
+                            )?;
+                        } else {
+                            common.norm.rms_with(
+                                s,
+                                domain,
+                                xv,
+                                wv,
+                                &mut yv,
+                                RmsOptions {
+                                    mode: RmsMode::Unrounded,
+                                    eps: 1e-6,
+                                },
+                            )?;
+                        }
+                        s.synchronize().context("norm dispatcher launch failed")?;
+                        let got = s.clone_dtoh(if in_place { &x } else { &output })?;
+                        let unit = f32::EPSILON / 2.0;
+                        let operations = (2 * width + 16) as f32;
+                        let gamma = operations * unit / (1.0 - operations * unit);
+                        let mut outside = 0;
+                        let mut gate_control = 0;
+                        for row in 0..rows {
+                            let values = &input[row * width..(row + 1) * width];
+                            let sum: f32 = values.iter().map(|v| v.to_f32() * v.to_f32()).sum();
+                            let inv = (sum / width as f32 + 1e-6).sqrt().recip();
+                            for col in 0..width {
+                                let index = row * width + col;
+                                let ungated = (values[col].to_f32() * inv) * weight[col].to_f32();
+                                let expected = if sigmoid {
+                                    ungated / (1.0 + (-gate[index].to_f32()).exp())
+                                } else {
+                                    ungated
+                                };
+                                let bound =
+                                    expected.abs() * (1.0 / 256.0 + gamma) + f32::MIN_POSITIVE;
+                                outside += usize::from(
+                                    !got[index].is_finite()
+                                        || (got[index].to_f32() - expected).abs() > bound,
+                                );
+                                gate_control += usize::from((ungated - expected).abs() > bound);
+                            }
+                        }
+                        ensure!(
+                            outside == 0,
+                            "norm dispatcher outside={outside} width={width} rows={rows} sigmoid={sigmoid} in_place={in_place}"
+                        );
+                        ensure!(!sigmoid || gate_control > 0, "ungated control escaped");
+                        println!(
+                            "PASS NORM_DISPATCH shape=[{rows},1,{width}] sigmoid={sigmoid} in_place={in_place} outside={outside} ungated_control={gate_control}"
+                        );
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        println!("PASS NORM_DISPATCH cases={cases}");
+        Ok(())
+    }
 
     #[test]
     #[ignore = "GPU window; FF_Q38_GPU_WINDOW=granted required"]
