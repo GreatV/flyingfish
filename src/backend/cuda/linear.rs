@@ -1320,14 +1320,17 @@ fn hip_projection_closure_excludes_native_and_invariant_calls() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::cuda::{
-        Device, blas::Blas, closure::Closure, ops::Ops, weights::StoredTensor,
-    };
+    use crate::backend::cuda::Device;
+    #[cfg(feature = "cuda")]
+    use crate::backend::cuda::{blas::Blas, closure::Closure, ops::Ops, weights::StoredTensor};
+    #[cfg(feature = "cuda")]
     use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope};
+    #[cfg(feature = "cuda")]
     use crate::op_contract::ExecutionPhase;
+    #[cfg(feature = "cuda")]
     use std::{path::PathBuf, rc::Rc};
 
     #[test]
@@ -1759,6 +1762,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     fn invariant_rows(
         device: &Device,
         blas: &Blas,
@@ -2007,6 +2011,7 @@ mod tests {
         Ok(defects)
     }
 
+    #[cfg(feature = "cuda")]
     fn invariant_linears(device: &Device, root: &std::path::Path) -> Result<()> {
         use crate::backend::cuda::contracts::view;
         let stream = &device.stream;
@@ -2133,6 +2138,7 @@ mod tests {
 
     #[test]
     #[ignore = "GPU window, official FP8 model, T13 and projection reference required"]
+    #[cfg(feature = "cuda")]
     fn channel_projection_gpu() -> Result<()> {
         use super::super::moe::testing::view;
         use crate::fp8::{effective_weight, linear_reference};
@@ -2416,6 +2422,7 @@ mod tests {
 
     #[test]
     #[ignore = "GPU window and FF_MINICPM_REFERENCE_DIR required"]
+    #[cfg(feature = "cuda")]
     fn token_quantization_gpu() -> Result<()> {
         use super::super::moe::testing::view;
         use crate::fp8::fake_quant_reference;
@@ -2568,7 +2575,6 @@ mod tests {
     fn token_quantization_live_rows_gpu() -> Result<()> {
         use super::super::{contracts::SeqRef, moe::testing::view};
         use crate::fp8::fake_quant_reference;
-        use cudarc::driver::{DevicePtr, sys};
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
             "GPU window required"
@@ -2609,13 +2615,7 @@ mod tests {
                 device.finish_upload()?;
                 let execute = || op.fake_quant(stream, &mut TensorMut(x_view), Some(domain));
                 let captured = if graph {
-                    stream.begin_capture(
-                        sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-                    )?;
-                    let run = execute();
-                    let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
-                    run?;
-                    Some(captured?.context("empty live-row quantization graph")?)
+                    Some(super::super::moe::testing::capture(stream, execute)?)
                 } else {
                     None
                 };
@@ -2669,6 +2669,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cuda")]
     fn moe_ffn_binding_uses_native_router_and_shared_layouts() -> Result<()> {
         let spec = crate::model_spec::ModelSpec::minicpm(
             &serde_json::from_str(include_str!(concat!(
@@ -2743,6 +2744,7 @@ mod tests {
 
     #[test]
     #[ignore = "coordinator-granted GPU window and FF_Q38_PROBE_DIR required"]
+    #[cfg(feature = "cuda")]
     fn mixer_geometry_linear_gpu() -> Result<()> {
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
