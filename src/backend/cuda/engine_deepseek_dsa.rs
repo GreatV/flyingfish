@@ -181,7 +181,7 @@ impl Norm {
             self.weight,
             &mut TensorMut(self.values),
             RmsOptions {
-                mode: deepseek_rms_mode(),
+                mode: RmsMode::Unrounded,
                 eps,
             },
         )
