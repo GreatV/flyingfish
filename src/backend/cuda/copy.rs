@@ -1,4 +1,3 @@
-#[cfg(feature = "cuda")]
 use crate::backend::gpu::CudaSlice;
 use crate::backend::gpu::{
     CudaContext, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, PinnedHostSlice, ValidAsZeroBits,
@@ -207,6 +206,17 @@ pub fn columns_from(
     );
     s.context().bind_to_thread()?;
     let (dst, _dst) = dst.device_ptr_mut(s);
+    columns_raw(s, src, dst, r)
+}
+
+fn columns_raw(s: &Arc<CudaStream>, src: u64, dst: u64, r: Rect) -> Result<()> {
+    ensure!(
+        r.rows > 0
+            && r.width > 0
+            && r.src_col + r.width <= r.src_pitch
+            && r.dst_col + r.width <= r.dst_pitch,
+        "invalid CUDA column copy rectangle"
+    );
     #[cfg(feature = "cuda")]
     let params = sys::CUDA_MEMCPY2D {
         srcXInBytes: r.src_col * 2,
@@ -240,18 +250,28 @@ pub fn columns_from(
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
-pub(crate) struct RingCopy<'a> {
-    pub(crate) stream: &'a Arc<CudaStream>,
-    pub(crate) source: &'a CudaSlice<bf16>,
-    pub(crate) target: &'a mut CudaSlice<bf16>,
-    pub(crate) source_capacity: usize,
-    pub(crate) target_capacity: usize,
+pub struct RingCopy<'a> {
+    pub stream: &'a Arc<CudaStream>,
+    pub source: &'a CudaSlice<bf16>,
+    pub target: &'a mut CudaSlice<bf16>,
+    pub source_capacity: usize,
+    pub target_capacity: usize,
+    pub heads: usize,
+    pub head_dim: usize,
 }
 
-#[cfg(feature = "cuda")]
+struct RingCopyCall {
+    src: u64,
+    dst: u64,
+    source_start: usize,
+    target_start: usize,
+    rows: usize,
+    wrap_source: bool,
+    wrap_target: bool,
+}
+
 impl RingCopy<'_> {
-    pub(crate) fn run(
+    pub fn run(
         self,
         source_start: usize,
         target_start: usize,
@@ -259,61 +279,98 @@ impl RingCopy<'_> {
         wrap_source: bool,
         wrap_target: bool,
     ) -> Result<()> {
-        ensure!(rows > 0, "ring row copy requires rows");
+        let lengths = [self.source.len(), self.target.len()];
+        let (src, _src) = self.source.device_ptr(self.stream);
+        let (dst, _dst) = self.target.device_ptr_mut(self.stream);
+        RingCopyCall {
+            src,
+            dst,
+            source_start,
+            target_start,
+            rows,
+            wrap_source,
+            wrap_target,
+        }
+        .run(
+            self.stream,
+            [self.source_capacity, self.target_capacity],
+            lengths,
+            [self.heads, self.head_dim],
+        )
+    }
+}
+
+impl RingCopyCall {
+    fn run(
+        self,
+        stream: &Arc<CudaStream>,
+        capacities: [usize; 2],
+        lengths: [usize; 2],
+        geometry: [usize; 2],
+    ) -> Result<()> {
+        let [source_capacity, target_capacity] = capacities;
+        let [heads, head_dim] = geometry;
+        let RingCopyCall {
+            src,
+            dst,
+            source_start,
+            target_start,
+            rows,
+            wrap_source,
+            wrap_target,
+        } = self;
         ensure!(
-            source_start < self.source_capacity && target_start < self.target_capacity,
+            rows > 0 && rows <= source_capacity && rows <= target_capacity,
+            "ring row copy extent exceeds capacity"
+        );
+        ensure!(
+            heads > 0 && head_dim > 0,
+            "ring row copy requires nonzero head geometry"
+        );
+        for (capacity, len) in capacities.into_iter().zip(lengths) {
+            ensure!(
+                capacity
+                    .checked_mul(head_dim)
+                    .and_then(|n| n.checked_mul(heads))
+                    .is_some_and(|n| n <= len && n <= usize::MAX / 2),
+                "ring row copy geometry exceeds buffer"
+            );
+        }
+        ensure!(
+            source_start < source_capacity && target_start < target_capacity,
             "ring row copy start exceeds capacity"
         );
-        if !wrap_source {
-            ensure!(
-                source_start + rows <= self.source_capacity,
-                "ring row copy source range exceeds capacity"
-            );
-        }
-        if !wrap_target {
-            ensure!(
-                target_start + rows <= self.target_capacity,
-                "ring row copy target range exceeds capacity"
-            );
-        }
-        let source_first = if wrap_source {
-            rows.min(self.source_capacity - source_start)
-        } else {
-            rows
-        };
-        let target_first = if wrap_target {
-            rows.min(self.target_capacity - target_start)
-        } else {
-            rows
-        };
-        let first = rows.min(source_first.min(target_first));
-        for (offset, count) in [(0, first), (first, rows - first)] {
-            if count == 0 {
-                continue;
-            }
-            let source_row = if offset > 0 && wrap_source {
-                0
-            } else {
-                source_start + offset
-            };
-            let target_row = if offset > 0 && wrap_target {
-                0
-            } else {
-                target_start + offset
-            };
-            columns(
-                self.stream,
-                self.source,
-                self.target,
+        ensure!(
+            wrap_source || rows <= source_capacity - source_start,
+            "ring row copy source range exceeds capacity"
+        );
+        ensure!(
+            wrap_target || rows <= target_capacity - target_start,
+            "ring row copy target range exceeds capacity"
+        );
+        let mut remaining = rows;
+        let mut source_row = source_start;
+        let mut target_row = target_start;
+        while remaining > 0 {
+            let count = remaining
+                .min(source_capacity - source_row)
+                .min(target_capacity - target_row);
+            columns_raw(
+                stream,
+                src,
+                dst,
                 Rect {
-                    rows: 4,
-                    width: count * 128,
-                    src_pitch: self.source_capacity * 128,
-                    src_col: source_row * 128,
-                    dst_pitch: self.target_capacity * 128,
-                    dst_col: target_row * 128,
+                    rows: heads,
+                    width: count * head_dim,
+                    src_pitch: source_capacity * head_dim,
+                    src_col: source_row * head_dim,
+                    dst_pitch: target_capacity * head_dim,
+                    dst_col: target_row * head_dim,
                 },
             )?;
+            remaining -= count;
+            source_row = (source_row + count) % source_capacity;
+            target_row = (target_row + count) % target_capacity;
         }
         Ok(())
     }
@@ -419,4 +476,275 @@ pub fn htod_bytes<T: crate::backend::gpu::DeviceRepr>(
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(feature = "cuda")]
+    use anyhow::Context;
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU lease; ring-copy allocation event ordering"]
+    fn ring_copy_cross_stream_order_gpu() -> Result<()> {
+        use cudarc::driver::sys;
+        let ctx = CudaContext::new(0)?;
+        let write = ctx.new_stream()?;
+        let read = ctx.new_stream()?;
+        ensure!(
+            ctx.is_event_tracking(),
+            "allocation event tracking is disabled"
+        );
+        let head_dim = 128;
+        let elements = 5 * head_dim;
+        let host: Vec<_> = (0..elements)
+            .map(|i| bf16::from_f32(((i * 13 + 7) % 113) as f32))
+            .collect();
+        let mut source = write.clone_htod(&host)?;
+        let mut target = write.alloc_zeros::<bf16>(elements)?;
+        let mut snapshot = read.alloc_zeros::<bf16>(elements)?;
+        let target_ptr = target.device_ptr(&write).0;
+        let snapshot_ptr = snapshot.device_ptr(&read).0;
+        ctx.synchronize()?;
+        write.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+        let scheduled = (|| -> Result<()> {
+            unsafe {
+                sys::cuMemsetD8Async(target_ptr, 0, elements * 2, write.cu_stream()).result()?
+            };
+            // All prior accesses completed before capture; allocation events start at this graph node.
+            for buffer in [&mut source, &mut target, &mut snapshot] {
+                unsafe { ctx.disable_event_tracking() };
+                let (_, read_access) = buffer.device_ptr(&write);
+                unsafe { ctx.enable_event_tracking() };
+                drop(read_access);
+                unsafe { ctx.disable_event_tracking() };
+                let (_, write_access) = buffer.device_ptr_mut(&write);
+                unsafe { ctx.enable_event_tracking() };
+                drop(write_access);
+            }
+            ctx.check_err().context("ring allocation event priming")?;
+            RingCopy {
+                stream: &write,
+                source: &source,
+                target: &mut target,
+                source_capacity: 5,
+                target_capacity: 5,
+                heads: 1,
+                head_dim,
+            }
+            .run(1, 0, 3, false, false)
+            .context("ring producer enqueue")?;
+            ctx.check_err().context("ring producer allocation events")?;
+            read.memcpy_dtod(&target, &mut snapshot)
+                .context("ring consumer enqueue")?;
+            ctx.check_err().context("ring consumer allocation events")?;
+            let joined = read.record_event(None).context("ring join event")?;
+            write.wait(&joined).context("ring join wait")?;
+            Ok(())
+        })();
+        let captured = write.end_capture(sys::CUgraphInstantiate_flags(0));
+        scheduled?;
+        let graph = captured?.context("ring ordering capture is empty")?;
+        let mut count = 0;
+        unsafe {
+            sys::cuGraphGetNodes(graph.cu_graph(), std::ptr::null_mut(), &mut count).result()?
+        };
+        let mut nodes = vec![std::ptr::null_mut(); count];
+        unsafe { sys::cuGraphGetNodes(graph.cu_graph(), nodes.as_mut_ptr(), &mut count).result()? };
+        let mut copies = Vec::new();
+        for node in nodes {
+            let mut kind = sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_EMPTY;
+            unsafe { sys::cuGraphNodeGetType(node, &mut kind).result()? };
+            if kind == sys::CUgraphNodeType::CU_GRAPH_NODE_TYPE_MEMCPY {
+                let mut params = std::mem::MaybeUninit::uninit();
+                unsafe {
+                    sys::cuGraphMemcpyNodeGetParams(node, params.as_mut_ptr()).result()?;
+                    copies.push((node, params.assume_init().dstDevice));
+                }
+            }
+        }
+        let producer = copies
+            .iter()
+            .find(|(_, dst)| *dst == target_ptr)
+            .context("ring producer copy absent")?
+            .0;
+        let consumer = copies
+            .iter()
+            .find(|(_, dst)| *dst == snapshot_ptr)
+            .context("ring cross-stream consumer is outside the captured dependency")?
+            .0;
+        let mut count = 0;
+        unsafe {
+            sys::cuGraphGetEdges_v2(
+                graph.cu_graph(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut count,
+            )
+            .result()?;
+        }
+        let mut from = vec![std::ptr::null_mut(); count];
+        let mut to = vec![std::ptr::null_mut(); count];
+        unsafe {
+            sys::cuGraphGetEdges_v2(
+                graph.cu_graph(),
+                from.as_mut_ptr(),
+                to.as_mut_ptr(),
+                std::ptr::null_mut(),
+                &mut count,
+            )
+            .result()?
+        };
+        let mut pending = vec![producer];
+        let mut visited = Vec::new();
+        while let Some(node) = pending.pop() {
+            if visited.contains(&node) {
+                continue;
+            }
+            visited.push(node);
+            pending.extend(
+                from.iter()
+                    .zip(&to)
+                    .filter_map(|(&a, &b)| (a == node).then_some(b)),
+            );
+        }
+        ensure!(
+            visited.contains(&consumer),
+            "ring read has no dependency on the copy write"
+        );
+        graph.launch()?;
+        write.synchronize()?;
+        let actual = read.clone_dtoh(&snapshot)?;
+        ensure!(
+            actual[..3 * head_dim] == host[head_dim..4 * head_dim]
+                && actual[3 * head_dim..].iter().all(|x| *x == bf16::ZERO),
+            "ring cross-stream copy differs"
+        );
+        println!(
+            "PASS ring_copy_cross_stream_order captured_dependency=true copied_elements=384 untouched_elements=256 event_tracking=true"
+        );
+        Ok(())
+    }
+    #[test]
+    #[ignore = "GPU window required; head-major KV ring staging"]
+    fn ring_copy_geometry_gpu() -> Result<()> {
+        let device = crate::backend::cuda::Device::new(0)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let source_capacity = 513;
+        let target_capacity = 1025;
+        let rows = 511;
+        let sentinel = bf16::from_bits(0x7fc1);
+        for (heads, head_dim) in [(4, 128), (1, 256), (2, 256), (8, 256), (1, 512), (8, 512)] {
+            let host: Vec<_> = (0..heads * source_capacity * head_dim)
+                .map(|i| bf16::from_f32(((i * 37 + 11) % 1009) as f32 / 256.0 - 2.0))
+                .collect();
+            let source = s.clone_htod(&host)?;
+            let empty = vec![sentinel; heads * target_capacity * head_dim + 32];
+            for (source_start, target_start, wrap_source, wrap_target) in [
+                (2, 17, false, false),
+                (503, 0, true, false),
+                (2, 1019, false, true),
+                (503, 1019, true, true),
+            ] {
+                let mut expected = empty.clone();
+                for head in 0..heads {
+                    for row in 0..rows {
+                        let src = (head * source_capacity + (source_start + row) % source_capacity)
+                            * head_dim;
+                        let dst = (head * target_capacity + (target_start + row) % target_capacity)
+                            * head_dim;
+                        expected[dst..dst + head_dim].copy_from_slice(&host[src..src + head_dim]);
+                    }
+                }
+                for graph in [false, true] {
+                    let mut target = s.clone_htod(&empty)?;
+                    if graph {
+                        s.synchronize()?;
+                        #[cfg(feature = "cuda")]
+                    s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                        #[cfg(feature = "rocm")]
+                        let capture = s.begin_capture()?;
+                        let result = RingCopy {
+                            stream: s,
+                            source: &source,
+                            target: &mut target,
+                            source_capacity,
+                            target_capacity,
+                            heads,
+                            head_dim,
+                        }
+                        .run(
+                            source_start,
+                            target_start,
+                            rows,
+                            wrap_source,
+                            wrap_target,
+                        );
+                        #[cfg(feature = "cuda")]
+                        let captured = s
+                            .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))
+                            .map_err(anyhow::Error::from)
+                            .and_then(|g| g.context("ring staging graph is empty"));
+                        #[cfg(feature = "rocm")]
+                        let captured = capture.finish();
+                        result?;
+                        let captured = captured?;
+                        captured.launch()?;
+                        captured.launch()?;
+                    } else {
+                        RingCopy {
+                            stream: s,
+                            source: &source,
+                            target: &mut target,
+                            source_capacity,
+                            target_capacity,
+                            heads,
+                            head_dim,
+                        }
+                        .run(
+                            source_start,
+                            target_start,
+                            rows,
+                            wrap_source,
+                            wrap_target,
+                        )?;
+                    }
+                    let actual = s.clone_dtoh(&target)?;
+                    ensure!(
+                        actual
+                            .iter()
+                            .zip(&expected)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "ring staging differs heads={heads} dim={head_dim} source_start={source_start} target_start={target_start} graph={graph}"
+                    );
+                }
+            }
+            let mut wrong = s.clone_htod(&empty)?;
+            RingCopy {
+                stream: s,
+                source: &source,
+                target: &mut wrong,
+                source_capacity,
+                target_capacity,
+                heads,
+                head_dim,
+            }
+            .run(504, 0, rows, true, false)?;
+            let wrong = s.clone_dtoh(&wrong)?;
+            ensure!(
+                wrong[..head_dim]
+                    .iter()
+                    .zip(&host[503 * head_dim..504 * head_dim])
+                    .any(|(a, b)| a.to_bits() != b.to_bits()),
+                "shifted ring source control did not discriminate"
+            );
+            eprintln!(
+                "PASS ring_copy_geometry heads={heads} dim={head_dim} rows={rows} source_capacity={source_capacity} target_capacity={target_capacity} graph_eager_exact=true shifted_source_rejected=true"
+            );
+        }
+        Ok(())
+    }
 }

@@ -2954,6 +2954,8 @@ impl Engine {
                                         target,
                                         source_capacity: ring,
                                         target_capacity: capacity,
+                                        heads: self.model_spec.kv_heads as usize,
+                                        head_dim: self.model_spec.head_dim as usize,
                                     }
                                     .run(
                                         (self.position - history) % ring,
@@ -3012,6 +3014,8 @@ impl Engine {
                                         target,
                                         source_capacity: ring,
                                         target_capacity: capacity,
+                                        heads: self.model_spec.kv_heads as usize,
+                                        head_dim: self.model_spec.head_dim as usize,
                                     }
                                     .run(
                                         last % ring,
@@ -3055,6 +3059,8 @@ impl Engine {
                                     target,
                                     source_capacity: capacity,
                                     target_capacity: ring,
+                                    heads: self.model_spec.kv_heads as usize,
+                                    head_dim: self.model_spec.head_dim as usize,
                                 }
                                 .run(
                                     source_start,
