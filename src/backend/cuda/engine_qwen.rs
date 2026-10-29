@@ -5004,7 +5004,6 @@ impl Engine {
         layer: usize,
         rows: usize,
     ) -> Result<(Vec<bf16>, Vec<bf16>)> {
-        ensure!(self.position == rows, "KV probe requires initial prefill");
         let layout = &self.model_spec.layers[layer];
         let d = layout
             .geometry
@@ -5012,11 +5011,13 @@ impl Engine {
             .head_dim as usize;
         let hkv = self.model_spec.kv_heads as usize;
         let kv = &self.state.kv[layout.state_index as usize];
+        let ring = self.state.kv_ring(layout.state_index as usize)?;
+        ensure!(rows <= ring, "KV probe rows exceed the cache ring");
         let s = &self.device.stream;
         let mut k = Vec::with_capacity(hkv * rows * d);
         let mut v = Vec::with_capacity(hkv * rows * d);
         for head in 0..hkv {
-            let base = head * self.state.kv_ring(layout.state_index as usize)? * d;
+            let base = head * ring * d;
             k.extend(s.clone_dtoh(&kv.k.slice(base..base + rows * d))?);
             v.extend(s.clone_dtoh(&kv.v.slice(base..base + rows * d))?);
         }
