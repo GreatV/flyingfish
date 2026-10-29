@@ -1,5 +1,5 @@
 use super::*;
-use crate::backend::cuda::{Device, attention_metrics};
+use crate::backend::cuda::Device;
 use crate::{
     backend::setup::{AttentionPlan, MultiImpl, MultiPlan, MultiShape},
     config::Config,
@@ -4002,4 +4002,56 @@ fn d128_gqa32_learned_sink_gpu() -> Result<()> {
     );
 
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct AttentionMetrics {
+    max_abs: f32,
+    p99_abs: f32,
+    mean_abs: f32,
+    cosine: f32,
+    max_reference: f32,
+}
+
+fn attention_metrics(actual: &[half::bf16], expected: &[f32]) -> AttentionMetrics {
+    assert_eq!(actual.len(), expected.len());
+    let mut errors: Vec<_> = actual
+        .iter()
+        .zip(expected)
+        .map(|(actual, expected)| (actual.to_f32() - expected).abs())
+        .collect();
+    errors.sort_by(f32::total_cmp);
+    let max_abs = errors.last().copied().unwrap_or_default();
+    let p99_abs = errors[(expected.len() * 99).div_ceil(100) - 1];
+    let mean_abs = errors.iter().sum::<f32>() / errors.len() as f32;
+    let dot = actual
+        .iter()
+        .zip(expected)
+        .map(|(actual, expected)| actual.to_f32() * expected)
+        .sum::<f32>();
+    let actual_norm = actual
+        .iter()
+        .map(|value| value.to_f32() * value.to_f32())
+        .sum::<f32>()
+        .sqrt();
+    let expected_norm = expected
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    let cosine = if actual_norm == 0.0 && expected_norm == 0.0 {
+        1.0
+    } else {
+        dot / (actual_norm * expected_norm)
+    };
+    AttentionMetrics {
+        max_abs,
+        p99_abs,
+        mean_abs,
+        cosine,
+        max_reference: expected
+            .iter()
+            .map(|value| value.abs())
+            .fold(0f32, f32::max),
+    }
 }

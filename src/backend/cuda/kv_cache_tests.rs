@@ -1,4 +1,3 @@
-use super::attention_metrics;
 use super::state::{CacheView, StateCheckpoint, StateStore};
 use super::{
     Device, cubin,
