@@ -1023,25 +1023,32 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
             raw_v.extend(raw[base..base + d].iter().map(|v| bf16::from_f32(*v)));
         }
     }
-    let raw_stats = Stats::new(&raw_v, reference_v)?;
+    let unit_weight = vec![bf16::ONE; d];
+    let expected_v: Vec<bf16> = raw_v
+        .chunks(d)
+        .flat_map(|row| {
+            rms_f32(
+                &row.iter().map(|v| v.to_f32()).collect::<Vec<_>>(),
+                &unit_weight,
+            )
+        })
+        .collect();
+    let raw_stats = Stats::new(&raw_v, &expected_v)?;
     println!("GEMMA4_KV_SCATTER_CONTROL raw_v {}", raw_stats.line("v"));
     ensure!(
         raw_stats.is_detected_mutant(),
         "GEMMA4_KV_SCATTER raw-V control is not discriminating"
     );
-    let mut scatter_defects = 0usize;
+    let stats = Stats::new(&native_v, &expected_v)?;
+    println!("GEMMA4_KV_SCATTER {}", stats.line("v"));
+    ensure!(stats.passes(), "GEMMA4_KV_SCATTER v DEFECT");
     for (name, actual, expected) in [
         ("v", &native_v, reference_v),
         ("k", &native_k, tensor(&data, "stage.a.k_rope")?),
     ] {
         let stats = Stats::new(actual, expected)?;
-        println!("GEMMA4_KV_SCATTER {}", stats.line(name));
-        scatter_defects += usize::from(!stats.passes());
+        println!("GEMMA4_KV_REFERENCE {}", stats.line(name));
     }
-    ensure!(
-        scatter_defects == 0,
-        "GEMMA4_KV_SCATTER defects={scatter_defects}"
-    );
     let mut defects = 0usize;
     let mut graph_defects = 0usize;
     let mut first = false;
