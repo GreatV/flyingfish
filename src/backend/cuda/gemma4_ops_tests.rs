@@ -1000,9 +1000,29 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
     trace.set_device(&engine.device_info().name)?;
     trace.save(&runtime.join("native-trace.safetensors"))?;
     let (native_k, native_v) = engine.gemma_kv_rows(0, first_ids.len())?;
+    let reference_v = tensor(&data, "stage.a.v_norm")?;
+    let v_shape = &data["stage.a.v_norm"].0;
+    let (hkv, d) = (v_shape[0], v_shape[2]);
+    let rows = first_ids.len();
+    let q_width = native_projected.len() / rows;
+    let kv_width = hkv * d;
+    let q_stride = q_width + 2 * kv_width;
+    let mut raw_v = Vec::with_capacity(reference_v.len());
+    for head in 0..hkv {
+        for row in 0..rows {
+            let base = row * q_stride + q_width + kv_width + head * d;
+            raw_v.extend_from_slice(&raw[base..base + d]);
+        }
+    }
+    let raw_stats = Stats::new(&raw_v, reference_v)?;
+    println!("GEMMA4_KV_SCATTER_CONTROL raw_v {}", raw_stats.line("v"));
+    ensure!(
+        raw_stats.is_detected_mutant(),
+        "GEMMA4_KV_SCATTER raw-V control is not discriminating"
+    );
     for (name, actual, expected) in [
         ("k", &native_k, tensor(&data, "stage.a.k_rope")?),
-        ("v", &native_v, tensor(&data, "stage.a.v_norm")?),
+        ("v", &native_v, reference_v),
     ] {
         let stats = Stats::new(actual, expected)?;
         println!("GEMMA4_KV_SCATTER {}", stats.line(name));
