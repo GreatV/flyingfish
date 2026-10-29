@@ -295,6 +295,9 @@ impl Bounds {
             (crate::model_spec::ExpertFormat::Fp8W8a16Block { .. }, false) => {
                 anyhow::bail!("GLM-5.3 has no MiniCPM media bounds")
             }
+            (crate::model_spec::ExpertFormat::Fp4E2m1Block { .. }, false) => {
+                anyhow::bail!("DeepSeek-V4.1 has no MiniCPM media bounds")
+            }
         };
         let media = media_boundary(&controls[same_grid])?;
         let cross_media = media_boundary(&controls[cross_media])?;
@@ -864,6 +867,9 @@ fn native_cases(format: crate::model_spec::ExpertFormat) -> Result<&'static [&'s
         ],
         crate::model_spec::ExpertFormat::Bf16Separate => {
             anyhow::bail!("Flint has no MiniCPM native fixtures")
+        }
+        crate::model_spec::ExpertFormat::Fp4E2m1Block { .. } => {
+            anyhow::bail!("DeepSeek-V4.1 has no MiniCPM native fixtures")
         }
     })
 }

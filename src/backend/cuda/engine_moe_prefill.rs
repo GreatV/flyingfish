@@ -3049,7 +3049,7 @@ mod tests {
         drop(checkpoint);
         let expert = 160u32;
         let reader = DiskReader::open(&catalogue, &directory, 1)?;
-        let slot = reader.read_expert(0, expert, &catalogue)?;
+        let slot = reader.read_expert(0, expert, &catalogue, catalogue.slot_bytes())?;
         let native = reader.values(slot)?.values().to_vec();
         let hidden = geometry.hidden as usize;
         let intermediate = geometry.intermediate as usize;

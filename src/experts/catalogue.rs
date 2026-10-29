@@ -37,11 +37,33 @@ pub enum ExpertRange {
         up_scale: NativeRange,
         down_scale: NativeRange,
     },
+    /// Per-expert 2-D E2M1 weights packed two codes per byte with one E8M0
+    /// scale per 32 elements of each row.
+    E2m1 {
+        gate: NativeRange,
+        up: NativeRange,
+        down: NativeRange,
+        gate_scale: NativeRange,
+        up_scale: NativeRange,
+        down_scale: NativeRange,
+    },
 }
 
 /// Byte ranges of the six FP8 slices inside one expert slot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fp8Slot {
+    pub gate: Range<u64>,
+    pub up: Range<u64>,
+    pub down: Range<u64>,
+    pub gate_scale: Range<u64>,
+    pub up_scale: Range<u64>,
+    pub down_scale: Range<u64>,
+}
+
+/// Byte ranges of the six E2M1 slices inside one expert slot: packed codes
+/// `[rows, cols/2]` and per-row-per-32-column E8M0 scales.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct E2m1Slot {
     pub gate: Range<u64>,
     pub up: Range<u64>,
     pub down: Range<u64>,
@@ -57,6 +79,7 @@ pub enum ExpertLayout {
     Bf16Separate { slot_bytes: u64, matrix_bytes: u64 },
     Fp8W8a16(Fp8Slot),
     Fp8W8a16Block(Fp8Slot, crate::fp8::Fp8BlockScale),
+    Fp4E2m1Block(E2m1Slot, crate::fp8::Fp8BlockScale),
 }
 
 impl ExpertLayout {
@@ -198,6 +221,52 @@ impl ExpertLayout {
                     block_scale,
                 ))
             }
+            ExpertFormat::Fp4E2m1Block { block, scale_dtype } => {
+                ensure!(
+                    block == [1, 32] && scale_dtype == safetensors::Dtype::F8_E8M0,
+                    "E2M1 expert layout requires the published per-row-per-32-column E8M0 scales, got block {block:?} dtype {scale_dtype:?}"
+                );
+                let block_scale = crate::fp8::Fp8BlockScale::new(block, scale_dtype)?;
+                let gate_scale_bytes =
+                    u64::try_from(block_scale.scale_bytes(intermediate as u32, hidden as u32)?)?;
+                let up_scale_bytes = gate_scale_bytes;
+                let down_scale_bytes =
+                    u64::try_from(block_scale.scale_bytes(hidden as u32, intermediate as u32)?)?;
+                let gate_bytes = intermediate
+                    .checked_mul(hidden.div_ceil(2))
+                    .context("E2M1 gate code extent overflow")?;
+                let up_bytes = gate_bytes;
+                let down_bytes = hidden
+                    .checked_mul(intermediate.div_ceil(2))
+                    .context("E2M1 down code extent overflow")?;
+                let next = |start: u64, bytes: u64, what: &str| {
+                    start
+                        .checked_add(bytes)
+                        .with_context(|| format!("E2M1 slot {what} extent overflow"))
+                };
+                let gate = 0..gate_bytes;
+                let up = gate.end..next(gate.end, up_bytes, "up codes")?;
+                let down = up.end..next(up.end, down_bytes, "down codes")?;
+                let gate_scale = down.end..next(down.end, gate_scale_bytes, "gate scales")?;
+                let up_scale = gate_scale.end..next(gate_scale.end, up_scale_bytes, "up scales")?;
+                let down_scale = up_scale.end..next(up_scale.end, down_scale_bytes, "down scales")?;
+                ensure!(
+                    down_scale.end.is_multiple_of(16),
+                    "E2M1 slot alignment: slot_bytes={}",
+                    down_scale.end
+                );
+                Ok(Self::Fp4E2m1Block(
+                    E2m1Slot {
+                        gate,
+                        up,
+                        down,
+                        gate_scale,
+                        up_scale,
+                        down_scale,
+                    },
+                    block_scale,
+                ))
+            }
         }
     }
 
@@ -207,6 +276,7 @@ impl ExpertLayout {
             Self::Bf16Separate { slot_bytes, .. } => *slot_bytes,
             Self::Fp8W8a16(slot) => slot.down_scale.end,
             Self::Fp8W8a16Block(slot, _) => slot.down_scale.end,
+            Self::Fp4E2m1Block(slot, _) => slot.down_scale.end,
         }
     }
 
@@ -224,6 +294,13 @@ impl ExpertLayout {
                     + (slot.up_scale.end - slot.up_scale.start),
                 (slot.down.end - slot.down.start) + (slot.down_scale.end - slot.down_scale.start),
             ),
+            Self::Fp4E2m1Block(slot, _) => (
+                slot.gate.end - slot.gate.start + slot.up.end - slot.up.start + slot.gate_scale.end
+                    - slot.gate_scale.start
+                    + slot.up_scale.end
+                    - slot.up_scale.start,
+                slot.down.end - slot.down.start + slot.down_scale.end - slot.down_scale.start,
+            ),
         }
     }
 
@@ -232,6 +309,7 @@ impl ExpertLayout {
             Self::Bf16Fused { gate_up_bytes, .. } => *gate_up_bytes,
             Self::Bf16Separate { matrix_bytes, .. } => matrix_bytes * 2,
             Self::Fp8W8a16(_) | Self::Fp8W8a16Block(..) => 0,
+            Self::Fp4E2m1Block(slot, _) => slot.down.start,
         }
     }
 
@@ -241,6 +319,7 @@ impl ExpertLayout {
             Self::Bf16Separate { .. } => None,
             Self::Fp8W8a16(slot) => Some(slot),
             Self::Fp8W8a16Block(slot, _) => Some(slot),
+            Self::Fp4E2m1Block(..) => None,
         }
     }
 }
@@ -423,7 +502,7 @@ fn native_entry(
         .checked_mul(match dtype {
             safetensors::Dtype::BF16 => 2,
             safetensors::Dtype::F32 => 4,
-            safetensors::Dtype::F8_E4M3 | safetensors::Dtype::F8_E8M0 => 1,
+            safetensors::Dtype::F8_E4M3 | safetensors::Dtype::F8_E8M0 | safetensors::Dtype::I8 => 1,
             other => anyhow::bail!("unsupported expert scale dtype {other:?}"),
         })
         .context("expert tensor byte extent overflow")?;
@@ -454,14 +533,20 @@ impl ExpertCatalogue {
             ExpertFormat::Bf16 | ExpertFormat::Fp8W8a16 | ExpertFormat::Fp8W8a16Block { .. } => {
                 "model.language_model"
             }
+            // Audited DeepSeek-V4.1 names: layers.{l}.ffn.experts.{e}.w{1,3}.
+            ExpertFormat::Fp4E2m1Block { .. } => "",
         };
-        let layer_prefix = format!("{prefix}.layers.");
+        let layer_prefix = if prefix.is_empty() {
+            "layers.".to_owned()
+        } else {
+            format!("{prefix}.layers.")
+        };
         let layer_ids: BTreeSet<u32> = manifest
             .entries
             .iter()
             .filter(|(name, entry)| {
                 entry.scope == crate::checkpoint::TensorScope::Text
-                    && name.contains(".mlp.experts.")
+                    && (name.contains(".mlp.experts.") || name.contains(".ffn.experts."))
             })
             .map(|(name, _)| {
                 let layer = name
@@ -589,6 +674,59 @@ impl ExpertCatalogue {
                             gate_scale: scale("gate_proj", intermediate, hidden)?,
                             up_scale: scale("up_proj", intermediate, hidden)?,
                             down_scale: scale("down_proj", hidden, intermediate)?,
+                        });
+                    }
+                    ranges.push(layer_ranges);
+                }
+                ExpertLayout::Fp4E2m1Block(_, block_scale) => {
+                    let hidden = geometry.hidden as usize;
+                    let intermediate = geometry.intermediate as usize;
+                    let mut layer_ranges = Vec::with_capacity(geometry.experts as usize);
+                    for expert in 0..geometry.experts {
+                        let native =
+                            |role: &str, dtype: safetensors::Dtype, rows: usize, cols: usize| {
+                                let name = format!(
+                                    "layers.{checkpoint_layer}.ffn.experts.{expert}.{role}"
+                                );
+                                native_entry(
+                                    manifest.entries.get(&name).with_context(|| {
+                                        format!("expert tensor missing: {name}")
+                                    })?,
+                                    dtype,
+                                    &[rows, cols],
+                                )
+                                .with_context(|| format!("E2M1 expert tensor {name}"))
+                            };
+                        let scale = |role: &str, rows: usize, cols: usize| {
+                            native(
+                                &format!("{role}.scale"),
+                                block_scale.dtype(),
+                                block_scale.scale_shape(rows as u32, cols as u32)[0],
+                                block_scale.scale_shape(rows as u32, cols as u32)[1],
+                            )
+                        };
+                        layer_ranges.push(ExpertRange::E2m1 {
+                            gate: native(
+                                "w1.weight",
+                                safetensors::Dtype::I8,
+                                intermediate,
+                                hidden.div_ceil(2),
+                            )?,
+                            up: native(
+                                "w3.weight",
+                                safetensors::Dtype::I8,
+                                intermediate,
+                                hidden.div_ceil(2),
+                            )?,
+                            down: native(
+                                "w2.weight",
+                                safetensors::Dtype::I8,
+                                hidden,
+                                intermediate.div_ceil(2),
+                            )?,
+                            gate_scale: scale("w1", intermediate, hidden)?,
+                            up_scale: scale("w3", intermediate, hidden)?,
+                            down_scale: scale("w2", hidden, intermediate)?,
                         });
                     }
                     ranges.push(layer_ranges);
@@ -998,50 +1136,146 @@ mod tests {
         Ok(())
     }
 
+    /// E2M1 manifest: the audited DeepSeek-V4.1 names `layers.{l}.ffn.experts.
+    /// {e}.w{1,3}.{weight,scale}` with packed `[rows, cols/2]` I8 codes and
+    /// `[rows, cols/32]` E8M0 scales, in emit order.
+    fn e2m1_manifest() -> TensorManifest {
+        let mut entries = BTreeMap::new();
+        let mut next = 0u64;
+        for layer in 0..2u32 {
+            for expert in 0..4u32 {
+                let name = |role: &str| format!("layers.{layer}.ffn.experts.{expert}.{role}");
+                for (role, rows, cols, dtype) in [
+                    ("w1.weight", 4usize, 4usize, safetensors::Dtype::I8),
+                    ("w3.weight", 4, 4, safetensors::Dtype::I8),
+                    ("w2.weight", 8, 2, safetensors::Dtype::I8),
+                    ("w1.scale", 4, 1, safetensors::Dtype::F8_E8M0),
+                    ("w3.scale", 4, 1, safetensors::Dtype::F8_E8M0),
+                    ("w2.scale", 8, 1, safetensors::Dtype::F8_E8M0),
+                ] {
+                    let len = (rows * cols) as u64;
+                    entries.insert(
+                        name(role),
+                        typed(
+                            role,
+                            dtype,
+                            vec![rows, cols],
+                            "e2m1-0.safetensors",
+                            next,
+                            len,
+                        ),
+                    );
+                    next += len;
+                }
+            }
+        }
+        TensorManifest {
+            entries,
+            resident_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn e2m1_ranges_use_the_audited_deepseek_names() -> Result<()> {
+        let geometry = ExpertGeometry {
+            first_layer: 0,
+            layers: 2,
+            experts: 4,
+            hidden: 8,
+            intermediate: 4,
+            top_k: 2,
+        };
+        let format = ExpertFormat::Fp4E2m1Block {
+            block: [1, 32],
+            scale_dtype: safetensors::Dtype::F8_E8M0,
+        };
+        let catalogue = ExpertCatalogue::from_manifest(&e2m1_manifest(), geometry, format)?;
+        // 16 code bytes x3 + 4/4/8 scale bytes.
+        assert_eq!(catalogue.slot_bytes(), 64);
+        assert_eq!(catalogue.layout().down_offset(), 32);
+        assert_eq!(catalogue.layout().projection_bytes(), (40, 24));
+        let ExpertRange::E2m1 {
+            gate,
+            up,
+            down,
+            gate_scale,
+            up_scale,
+            down_scale,
+        } = catalogue.range(1, 2)?
+        else {
+            bail!("E2M1 range expected");
+        };
+        let base = 64 + (4 + 2) * 64;
+        assert_eq!((gate.offset, gate.len), (base, 16));
+        assert_eq!((up.offset, up.len), (base + 16, 16));
+        assert_eq!((down.offset, down.len), (base + 32, 16));
+        assert_eq!((gate_scale.offset, gate_scale.len), (base + 48, 4));
+        assert_eq!((up_scale.offset, up_scale.len), (base + 52, 4));
+        assert_eq!((down_scale.offset, down_scale.len), (base + 56, 8));
+        assert_eq!(gate.shard.as_ref(), "e2m1-0.safetensors");
+        let mut wrong_dtype = e2m1_manifest();
+        wrong_dtype
+            .entries
+            .get_mut("layers.0.ffn.experts.0.w1.weight")
+            .unwrap()
+            .dtype = safetensors::Dtype::BF16;
+        let error = ExpertCatalogue::from_manifest(&wrong_dtype, geometry, format).unwrap_err();
+        assert!(format!("{error:#}").contains("expected I8"), "{error}");
+        let mut missing = e2m1_manifest();
+        missing.entries.remove("layers.1.ffn.experts.3.w2.scale");
+        let error = ExpertCatalogue::from_manifest(&missing, geometry, format).unwrap_err();
+        assert!(format!("{error:#}").contains("w2.scale"), "{error}");
+        let wrong_block = ExpertFormat::Fp4E2m1Block {
+            block: [32, 32],
+            scale_dtype: safetensors::Dtype::F8_E8M0,
+        };
+        let error =
+            ExpertCatalogue::from_manifest(&e2m1_manifest(), geometry, wrong_block).unwrap_err();
+        assert!(format!("{error:#}").contains("E8M0"), "{error}");
+        Ok(())
+    }
+
     #[test]
     fn manifest_mismatches_name_the_tensor() -> Result<()> {
         let mut bad = manifest();
         let name = "model.language_model.layers.1.mlp.experts.down_proj";
         bad.entries.get_mut(name).unwrap().shape = vec![4, 4, 8];
-        let error = ExpertCatalogue::from_manifest(&bad, geometry(), ExpertFormat::Bf16)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("mlp.experts.down_proj"), "{error}");
+        let error =
+            ExpertCatalogue::from_manifest(&bad, geometry(), ExpertFormat::Bf16).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("mlp.experts.down_proj"),
+            "{error}"
+        );
         let mut bad = manifest();
         bad.entries
             .remove("model.language_model.layers.0.mlp.experts.gate_up_proj");
-        let error = ExpertCatalogue::from_manifest(&bad, geometry(), ExpertFormat::Bf16)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("gate_up_proj"), "{error}");
+        let error =
+            ExpertCatalogue::from_manifest(&bad, geometry(), ExpertFormat::Bf16).unwrap_err();
+        assert!(format!("{error:#}").contains("gate_up_proj"), "{error}");
         let mut bad = manifest();
         let name = "model.language_model.layers.0.mlp.experts.gate_up_proj";
         bad.entries.get_mut(name).unwrap().dtype = safetensors::Dtype::F32;
-        let error = ExpertCatalogue::from_manifest(&bad, geometry(), ExpertFormat::Bf16)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("expected BF16"), "{error}");
+        let error =
+            ExpertCatalogue::from_manifest(&bad, geometry(), ExpertFormat::Bf16).unwrap_err();
+        assert!(format!("{error:#}").contains("expected BF16"), "{error}");
         let mut bad = fp8_manifest();
         let name = "model.language_model.layers.0.mlp.experts.2.gate_proj.weight_scale";
         bad.entries.get_mut(name).unwrap().dtype = safetensors::Dtype::F32;
-        let error = ExpertCatalogue::from_manifest(&bad, geometry(), ExpertFormat::Fp8W8a16)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("weight_scale"), "{error}");
+        let error =
+            ExpertCatalogue::from_manifest(&bad, geometry(), ExpertFormat::Fp8W8a16).unwrap_err();
+        assert!(format!("{error:#}").contains("weight_scale"), "{error}");
         let mut bad = fp8_manifest();
         bad.entries
             .remove("model.language_model.layers.1.mlp.experts.3.down_proj.weight");
-        let error = ExpertCatalogue::from_manifest(&bad, geometry(), ExpertFormat::Fp8W8a16)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("down_proj.weight"), "{error}");
+        let error =
+            ExpertCatalogue::from_manifest(&bad, geometry(), ExpertFormat::Fp8W8a16).unwrap_err();
+        assert!(format!("{error:#}").contains("down_proj.weight"), "{error}");
         let mut bad = manifest();
         bad.entries
             .remove("model.language_model.layers.0.mlp.experts.gate_up_proj");
-        let error = ExpertCatalogue::from_manifest(&bad, geometry(), ExpertFormat::Fp8W8a16)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("gate_proj.weight"), "{error}");
+        let error =
+            ExpertCatalogue::from_manifest(&bad, geometry(), ExpertFormat::Fp8W8a16).unwrap_err();
+        assert!(format!("{error:#}").contains("gate_proj.weight"), "{error}");
         Ok(())
     }
 

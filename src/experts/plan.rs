@@ -404,6 +404,82 @@ pub struct PlanInputs<'a> {
     pub wave_rows: u32,
 }
 
+/// Native storage capacity with GPU-only arithmetic and one layer of live swaps.
+pub fn staging_capacity(
+    geometry: ExpertGeometry,
+    layout: crate::experts::catalogue::ExpertLayout,
+    rows: u32,
+    device_bytes: u64,
+    host_bytes: u64,
+    copy_engines: u32,
+) -> Result<(Capacity, Admission)> {
+    ensure!(
+        rows > 0 && geometry.layers > 0 && geometry.top_k > 0,
+        "zero native staging extent"
+    );
+    ensure!(copy_engines > 0, "native staging has no copy engine");
+    let live = rows
+        .checked_mul(geometry.top_k)
+        .context("native live route count overflow")?
+        .min(geometry.experts);
+    let slot = layout.slot_bytes();
+    ensure!(slot > 0, "zero native slot bytes");
+    let total = u64::from(geometry.layers) * u64::from(geometry.experts);
+    let slots = (device_bytes / slot).min(total);
+    let slots_per_layer = equal_slots(slots, geometry.layers)?;
+    ensure!(
+        slots_per_layer.iter().all(|&n| n >= live),
+        "native GPU slots cannot hold {live} distinct routes per layer"
+    );
+    let copies = u64::from(copy_engines.min(2));
+    let host_io = (3 * copies)
+        .checked_mul(slot)
+        .context("native copy stage bytes overflow")?;
+    let host_expert_bytes = host_bytes
+        .checked_sub(host_io)
+        .context("native host budget cannot hold copy stages")?;
+    let non_gpu = total - slots;
+    let (host_blocks, spare_blocks) = if non_gpu == 0 {
+        (0, 0)
+    } else {
+        let blocks = host_expert_bytes / slot;
+        ensure!(
+            blocks > u64::from(live),
+            "native host budget cannot hold {live} live swaps and a host expert"
+        );
+        (
+            u32::try_from((blocks - u64::from(live)).min(non_gpu))?,
+            live,
+        )
+    };
+    let disk_bytes = (non_gpu - u64::from(host_blocks))
+        .checked_mul(slot)
+        .context("native disk extent overflow")?;
+    let admission = Admission {
+        budget_bytes_per_token: u64::from(spare_blocks) * slot,
+    };
+    Ok((
+        Capacity {
+            layout,
+            span_rows: rows,
+            wave_rows: rows,
+            device_expert_bytes: device_bytes,
+            peer_expert_bytes: 0,
+            host_expert_bytes,
+            gpu0_layers: geometry.layers,
+            slots_per_layer,
+            host_blocks,
+            spare_blocks,
+            disk_bytes,
+            worker_count: 0,
+            disk_workers: 0,
+            prefill_staging_slots: 0,
+            pinned: false,
+        },
+        admission,
+    ))
+}
+
 /// Measured peer capacity, captured 4 KiB decode bounce rate, and eager 8/68 MiB prefill rates.
 #[derive(Clone, Copy, Debug)]
 pub struct PeerInputs<'a> {
@@ -1563,6 +1639,46 @@ impl PeerSendLayout {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_staging_capacity_bounds_real_expert_geometry() -> Result<()> {
+        let geometry = ExpertGeometry {
+            first_layer: 0,
+            layers: 40,
+            experts: 384,
+            hidden: 5120,
+            intermediate: 2304,
+            top_k: 6,
+        };
+        let layout = crate::experts::catalogue::ExpertLayout::new(
+            crate::model_spec::ExpertFormat::Fp4E2m1Block {
+                block: [1, 32],
+                scale_dtype: safetensors::Dtype::F8_E8M0,
+            },
+            &geometry,
+        )?;
+        let slot = layout.slot_bytes();
+        let (capacity, admission) =
+            staging_capacity(geometry, layout.clone(), 16, 80 << 30, 24 << 30, 2)?;
+        assert_eq!(capacity.spare_blocks, 96);
+        assert_eq!(admission.hard_cap(slot)?, 96);
+        assert!(capacity.slots_per_layer.iter().all(|&n| n >= 96));
+        assert!(u64::from(capacity.slots_total()) * slot <= 80 << 30);
+        assert!(u64::from(capacity.host_blocks + capacity.spare_blocks + 6) * slot <= 24 << 30);
+        assert!(
+            staging_capacity(
+                geometry,
+                layout.clone(),
+                16,
+                40 * 96 * slot - 1,
+                24 << 30,
+                2
+            )
+            .is_err()
+        );
+        assert!(staging_capacity(geometry, layout, 16, 80 << 30, 102 * slot, 2).is_err());
+        Ok(())
+    }
+
     use super::*;
 
     fn geometry() -> ExpertGeometry {
@@ -2461,5 +2577,361 @@ mod tests {
         }
         assert!(ledger.check().is_ok());
         assert!(ledger.admit_host(1, initial[1][1], initial[1][1]).is_err());
+    }
+}
+
+/// Per-machine E2M1 tier calibration record, in the runtime-dir record convention the
+/// expert service tables use: a schema tag, the format and slot extent, the machine key,
+/// the geometry and the measured per-layer per-expert hit fractions.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TierCalibration {
+    pub schema: u32,
+    pub expert_format: String,
+    pub slot_bytes: u64,
+    pub key: DeviceKey,
+    pub host: HostKey,
+    pub geometry: ExpertGeometry,
+    /// Per layer, per expert hit fraction in [0, 1]; row length = geometry.experts.
+    /// This is the all-history per-expert frequency, which carries no admission signal
+    /// on a trace that uses every expert; use `hits_by_window`.
+    pub hits: Vec<Vec<f64>>,
+    /// Residency-window hit fractions: `hits_by_window[w][layer][expert]` for a window of
+    /// the previous `w` positions. The admission path is given the window explicitly.
+    pub hits_by_window: std::collections::BTreeMap<u32, Vec<Vec<f64>>>,
+}
+
+/// The device half of the record key, matching the service-table key.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeviceKey {
+    pub device_uuid: String,
+    pub driver_version: String,
+    pub binary_version: String,
+}
+
+/// The host half of the record key, matching the service-table host block.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HostKey {
+    pub cpu: String,
+    pub isa: String,
+    pub affinity: String,
+    pub threads: u32,
+    pub llc_bytes: u64,
+}
+
+impl TierCalibration {
+    /// Reads the persisted record; a missing or malformed file is a named error.
+    pub fn load(path: &std::path::Path) -> Result<Self> {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("tier calibration {} unreadable", path.display()))?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("tier calibration {} malformed", path.display()))
+    }
+
+    /// Writes the record.
+    pub fn store(&self, path: &std::path::Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes = serde_json::to_vec(self).context("tier calibration encode failed")?;
+        std::fs::write(path, bytes)
+            .with_context(|| format!("tier calibration {} unwritable", path.display()))
+    }
+}
+
+/// Where the tier admission budget came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionSource {
+    /// The persisted per-machine hit fractions.
+    Calibration,
+    /// The capacity-only derivation the tiers already have.
+    CapacityOnly,
+}
+
+/// Admission budget and its source; the source is reported, never silently defaulted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TierAdmission {
+    pub budget_bytes_per_token: u64,
+    pub source: AdmissionSource,
+}
+
+/// Chunk size for aligned O_DIRECT reads, derived from the persisted device geometry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DiskGeometry {
+    /// Logical block size of the tier device, bytes.
+    pub block_bytes: u64,
+    /// Measured sustained sequential read rate, bytes/second.
+    pub read_bytes_per_second: f64,
+    /// Persisted bench_disk measurement: (chunk bytes, measured bytes/second), ascending.
+    pub measured: Vec<(u64, f64)>,
+    /// Fraction of the measured peak a chunk must reach.
+    pub efficient_fraction: f64,
+}
+
+impl DiskGeometry {
+    /// The smallest measured chunk that reaches `efficient_fraction` of the measured peak,
+    /// rounded up to the device block. Errors by name when the measurement is absent.
+    pub fn chunk_bytes(&self) -> Result<u64> {
+        ensure!(
+            self.block_bytes > 0 && self.block_bytes.is_multiple_of(512),
+            "disk geometry block size {} is not a 512-byte multiple",
+            self.block_bytes
+        );
+        ensure!(
+            self.read_bytes_per_second.is_finite() && self.read_bytes_per_second > 0.0,
+            "disk geometry read rate {} is not positive",
+            self.read_bytes_per_second
+        );
+        ensure!(
+            !self.measured.is_empty(),
+            "disk geometry has no persisted bench_disk measurement"
+        );
+        ensure!(
+            (0.0..=1.0).contains(&self.efficient_fraction),
+            "disk geometry efficient fraction {} outside (0, 1)",
+            self.efficient_fraction
+        );
+        let peak = self
+            .measured
+            .iter()
+            .map(|&(_, rate)| rate)
+            .fold(0.0f64, f64::max);
+        ensure!(
+            peak > 0.0,
+            "disk geometry measured peak rate is not positive"
+        );
+        let target = peak * self.efficient_fraction;
+        let mut chosen = None;
+        for &(chunk, rate) in &self.measured {
+            ensure!(
+                chunk > 0 && chunk.is_multiple_of(self.block_bytes),
+                "measured chunk {chunk} is not a block multiple"
+            );
+            if rate >= target {
+                chosen = Some(chunk);
+                break;
+            }
+        }
+        let chunk = chosen.context("no measured chunk reaches the efficient fraction")?;
+        Ok(chunk)
+    }
+}
+
+/// Admission from the persisted hit fractions: the per-token budget is the hit-weighted
+/// expert bytes the tier must serve, rounded up to whole experts.
+pub fn admission_from_calibration(
+    geometry: &ExpertGeometry,
+    slot_bytes: u64,
+    calibration: &TierCalibration,
+    window: u32,
+) -> Result<TierAdmission> {
+    ensure!(slot_bytes > 0, "zero expert slot bytes");
+    let hits = calibration
+        .hits_by_window
+        .get(&window)
+        .context("tier calibration has no hit fractions for this residency window")?;
+    ensure!(
+        hits.len() == geometry.layers as usize,
+        "tier calibration has {} layers, expected {}",
+        hits.len(),
+        geometry.layers
+    );
+    let mut budget = 0f64;
+    for (layer, row) in hits.iter().enumerate() {
+        ensure!(
+            row.len() == geometry.experts as usize,
+            "tier calibration layer {layer} has {} experts, expected {}",
+            row.len(),
+            geometry.experts
+        );
+        for (expert, hit) in row.iter().enumerate() {
+            ensure!(
+                hit.is_finite() && (0.0..=1.0).contains(hit),
+                "tier calibration layer {layer} expert {expert} hit {hit} outside [0, 1]"
+            );
+            budget += hit * slot_bytes as f64;
+        }
+    }
+    let experts = budget / slot_bytes as f64;
+    Ok(TierAdmission {
+        budget_bytes_per_token: experts.ceil() as u64 * slot_bytes,
+        source: AdmissionSource::Calibration,
+    })
+}
+
+/// Capacity-only admission: the hard expert cap the tier can hold.
+pub fn admission_capacity_only(
+    geometry: &ExpertGeometry,
+    slot_bytes: u64,
+    slots_per_layer: &[u32],
+) -> Result<TierAdmission> {
+    ensure!(slot_bytes > 0, "zero expert slot bytes");
+    ensure!(
+        slots_per_layer.len() == geometry.layers as usize,
+        "slot plan has {} layers, expected {}",
+        slots_per_layer.len(),
+        geometry.layers
+    );
+    let mut budget = 0u64;
+    for (layer, &slots) in slots_per_layer.iter().enumerate() {
+        ensure!(
+            slots <= geometry.experts,
+            "slot plan layer {layer} holds {slots} experts, expected at most {}",
+            geometry.experts
+        );
+        budget = budget
+            .checked_add(slot_bytes.saturating_mul(u64::from(slots)))
+            .context("capacity-only admission budget overflow")?;
+    }
+    Ok(TierAdmission {
+        budget_bytes_per_token: budget,
+        source: AdmissionSource::CapacityOnly,
+    })
+}
+
+/// The named error when neither the calibration nor a capacity plan is available.
+pub fn admission_missing(geometry: &ExpertGeometry) -> anyhow::Error {
+    anyhow::anyhow!(
+        "E2M1 tier admission is unbound: no per-machine tier calibration and no capacity plan for {} layers x {} experts",
+        geometry.layers,
+        geometry.experts
+    )
+}
+
+#[cfg(test)]
+mod tier_tests {
+    use super::*;
+
+    fn geometry() -> ExpertGeometry {
+        ExpertGeometry {
+            first_layer: 0,
+            layers: 2,
+            experts: 4,
+            hidden: 32,
+            intermediate: 32,
+            top_k: 2,
+        }
+    }
+
+    fn calibration(hits: Vec<Vec<f64>>) -> TierCalibration {
+        let mut hits_by_window = std::collections::BTreeMap::new();
+        hits_by_window.insert(1, hits.clone());
+        TierCalibration {
+            schema: 3,
+            expert_format: "Fp4E2m1Block".into(),
+            slot_bytes: 18_800_640,
+            key: DeviceKey {
+                device_uuid: "test".into(),
+                driver_version: "test".into(),
+                binary_version: "test".into(),
+            },
+            host: HostKey {
+                cpu: "test".into(),
+                isa: "test".into(),
+                affinity: "test".into(),
+                threads: 1,
+                llc_bytes: 0,
+            },
+            geometry: geometry(),
+            hits,
+            hits_by_window,
+        }
+    }
+
+    #[test]
+    fn calibration_admission_is_the_hit_weighted_expert_budget() -> Result<()> {
+        let geometry = geometry();
+        let slot = 100u64;
+        let admission = admission_from_calibration(
+            &geometry,
+            slot,
+            &calibration(vec![vec![1.0, 0.0, 0.5, 0.0], vec![0.0, 0.0, 0.0, 1.0]]),
+            1,
+        )?;
+        // 2.5 experts' worth of hits over 2 layers rounds up to 3 experts/layer.
+        assert_eq!(admission.source, AdmissionSource::Calibration);
+        assert_eq!(admission.budget_bytes_per_token, 3 * slot);
+        Ok(())
+    }
+
+    #[test]
+    fn capacity_only_admission_is_the_hard_expert_cap() -> Result<()> {
+        let geometry = geometry();
+        let admission = admission_capacity_only(&geometry, 100, &[4, 2])?;
+        assert_eq!(admission.source, AdmissionSource::CapacityOnly);
+        assert_eq!(admission.budget_bytes_per_token, 600);
+        Ok(())
+    }
+
+    #[test]
+    fn calibration_shape_errors_are_named() -> Result<()> {
+        let geometry = geometry();
+        let error = admission_from_calibration(&geometry, 100, &calibration(vec![vec![0.5; 4]]), 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("tier calibration has 1 layers"), "{error}");
+        let error = admission_from_calibration(
+            &geometry,
+            100,
+            &calibration(vec![vec![0.5; 3], vec![0.5; 4]]),
+            1,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("layer 0 has 3 experts"), "{error}");
+        let error = admission_from_calibration(
+            &geometry,
+            100,
+            &calibration(vec![vec![1.5, 0.0, 0.0, 0.0], vec![0.0; 4]]),
+            1,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("outside [0, 1]"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn missing_admission_names_both_sources() {
+        let error = admission_missing(&geometry()).to_string();
+        assert!(error.contains("no per-machine tier calibration"), "{error}");
+        assert!(error.contains("no capacity plan"), "{error}");
+    }
+
+    fn disk_geometry(measured: Vec<(u64, f64)>) -> DiskGeometry {
+        DiskGeometry {
+            block_bytes: 4096,
+            read_bytes_per_second: 1.0,
+            measured,
+            efficient_fraction: 0.9,
+        }
+    }
+
+    #[test]
+    fn chunk_size_is_the_smallest_measured_chunk_at_the_efficient_fraction() -> Result<()> {
+        let measured = vec![(4096, 0.5), (8192, 0.95), (16384, 1.0)];
+        // Peak 1.0, target 0.9: 8192 is the first measured chunk that reaches it.
+        assert_eq!(disk_geometry(measured).chunk_bytes()?, 8192);
+        // Peak 0.2, target 0.18: 8192 is the first chunk that reaches it.
+        assert_eq!(
+            disk_geometry(vec![(4096, 0.1), (8192, 0.2)]).chunk_bytes()?,
+            8192
+        );
+        let error = disk_geometry(vec![]).chunk_bytes().unwrap_err().to_string();
+        assert!(
+            error.contains("no persisted bench_disk measurement"),
+            "{error}"
+        );
+        let error = disk_geometry(vec![(1024, 1.0)])
+            .chunk_bytes()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a block multiple"), "{error}");
+        let bad = DiskGeometry {
+            efficient_fraction: 1.5,
+            ..disk_geometry(vec![(4096, 1.0)])
+        };
+        let error = bad.chunk_bytes().unwrap_err().to_string();
+        assert!(error.contains("efficient fraction"), "{error}");
+        Ok(())
     }
 }

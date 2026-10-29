@@ -343,7 +343,7 @@ impl Residency {
         for (index, &(layer, expert)) in order.iter().enumerate() {
             let block = u32::try_from(index).context("host block id exceeds u32")?;
             let arena = host.context("host arena missing for the host fill")?;
-            let slot = reader.read_expert(layer, expert, catalogue)?;
+            let slot = reader.read_expert(layer, expert, catalogue, catalogue.slot_bytes())?;
             let values = reader.values(slot)?;
             let mut claim = arena.claim(block)?;
             claim.slice()?.copy_from_slice(&values);
@@ -740,6 +740,152 @@ impl Residency {
         Ok(dispatch)
     }
 
+    /// Resolves every non-GPU expert selected by the current dispatch before
+    /// the layer's device launch. Victims are chosen only from experts not
+    /// routed by this token.
+    pub fn resolve(&mut self, layer: u32, experts: &[u32]) -> Result<Vec<Published>> {
+        ensure!(self.token_open, "resolve outside a token");
+        ensure!(
+            layer < self.geometry.layers,
+            "expert layer {layer} outside {}",
+            self.geometry.layers
+        );
+        let l = layer as usize;
+        ensure!(self.dispatched[l], "layer {layer} resolved before dispatch");
+        let mut unique = experts.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        for &expert in &unique {
+            ensure!(
+                expert < self.geometry.experts,
+                "resolve expert {expert} of layer {layer} outside {}",
+                self.geometry.experts
+            );
+        }
+        self.drain_released()?;
+        self.victims.clear();
+        for expert in 0..self.geometry.experts {
+            if !self.routed[l][expert as usize] && self.ledger.tier(layer, expert)? == Tier::Gpu {
+                self.victims.push(expert);
+            }
+        }
+        self.victims.sort_by(|&a, &b| {
+            self.scores[l][a as usize]
+                .total_cmp(&self.scores[l][b as usize])
+                .then(a.cmp(&b))
+        });
+        let backed = self.ledger.has_full_host_backing();
+        let mut pool =
+            u32::try_from(self.free_blocks.len()).context("free host blocks exceed u32")?;
+        self.published.clear();
+        for expert in unique {
+            if self.ledger.tier(layer, expert)? == Tier::Gpu {
+                continue;
+            }
+            let empty = self.ledger.empty_slot(layer)?;
+            let victim = if empty.is_some() {
+                anyhow::bail!(
+                    "layer {layer} has an empty slot; synchronous tier resolution requires a victim"
+                )
+            } else {
+                let victim = *self
+                    .victims
+                    .first()
+                    .context("no unrouted GPU victim for a synchronous expert miss")?;
+                self.victims.remove(0);
+                Some(victim)
+            };
+            let source_block = match self.ledger.tier(layer, expert)? {
+                Tier::Host => {
+                    let block = self.host_block[l][expert as usize];
+                    ensure!(
+                        block != NO_BLOCK,
+                        "host expert {expert} of layer {layer} has no block"
+                    );
+                    Some(block)
+                }
+                Tier::Disk | Tier::Gpu => None,
+            };
+            let (slot, dest_block, dest_wait) = match victim {
+                Some(victim) => {
+                    let slot = self.ledger.slot(layer, victim)?;
+                    let (dest_block, dest_wait) = match self.ledger.tier(layer, expert)? {
+                        Tier::Host if backed => (None, None),
+                        Tier::Host => {
+                            ensure!(pool >= 1, "synchronous host swap needs a free block");
+                            pool -= 1;
+                            let free = self.pool_block()?;
+                            (Some(free.id), free.wait)
+                        }
+                        Tier::Disk => {
+                            if pool > self.reserve {
+                                pool -= 1;
+                                let free = self.pool_block()?;
+                                (Some(free.id), free.wait)
+                            } else {
+                                (None, None)
+                            }
+                        }
+                        Tier::Gpu => unreachable!("resolved expert is not GPU resident"),
+                    };
+                    match self.ledger.tier(layer, expert)? {
+                        Tier::Host => {
+                            self.ledger.admit_host(layer, expert, victim)?;
+                            if !backed {
+                                self.host_block[l][expert as usize] = NO_BLOCK;
+                                self.host_block[l][victim as usize] =
+                                    dest_block.context("host swap has no destination block")?;
+                                self.released.push(ReleasedBlock {
+                                    block: source_block.context("host swap source missing")?,
+                                    slot,
+                                    event: None,
+                                });
+                            }
+                        }
+                        Tier::Disk => {
+                            self.ledger
+                                .admit_disk(layer, expert, victim, dest_block.is_some())?;
+                            if let Some(block) = dest_block {
+                                self.host_block[l][victim as usize] = block;
+                            }
+                        }
+                        Tier::Gpu => unreachable!("resolved expert is not GPU resident"),
+                    }
+                    (slot, dest_block, dest_wait)
+                }
+                None => {
+                    let slot = self.ledger.install(layer, expert)?;
+                    if self.ledger.tier(layer, expert)? == Tier::Host && !backed {
+                        let block = source_block.context("host miss without a source block")?;
+                        self.host_block[l][expert as usize] = NO_BLOCK;
+                        self.released.push(ReleasedBlock {
+                            block,
+                            slot,
+                            event: None,
+                        });
+                    }
+                    (slot, None, None)
+                }
+            };
+            self.next_generation += 1;
+            self.generation[l][expert as usize] = self.next_generation;
+            self.published.push(Published {
+                layer,
+                expert,
+                victim: victim.expect("synchronous tier victim is present"),
+                from_host: source_block.is_some(),
+                source_block,
+                dest_block,
+                dest_wait,
+                slot,
+                generation: self.next_generation,
+            });
+        }
+        self.missed[l].retain(|expert| !self.published.iter().any(|p| p.expert == *expert));
+        self.ledger.check()?;
+        Ok(std::mem::take(&mut self.published))
+    }
+
     /// Publishes at most the hard per-token cap after validating block requirements.
     pub fn finish_token(&mut self) -> Result<&[Published]> {
         ensure!(self.token_open, "no token open");
@@ -996,11 +1142,47 @@ impl Residency {
     }
 }
 
+/// Issues the aligned disk reads for one layer's tier misses ahead of the token's dispatch.
+/// The reads land in the disk ring; the caller reclaims each slot after its device copy.
+pub fn prefetch_dispatch(
+    reader: &DiskReader,
+    catalogue: &ExpertCatalogue,
+    layer: u32,
+    dispatch: &Dispatch,
+    geometry: &crate::experts::plan::DiskGeometry,
+) -> Result<Vec<u32>> {
+    let chunk_bytes = geometry.chunk_bytes()?;
+    let mut slots = Vec::new();
+    for route in &dispatch.disk {
+        let ring = reader.read_expert(layer, route.expert, catalogue, chunk_bytes)?;
+        slots.push(ring);
+    }
+    Ok(slots)
+}
+
+/// First-layer hookup: the worker prewake is notified before the tier prefetch for a
+/// layer's misses is issued, so the disk reads overlap the pool wake instead of being
+/// serialized behind it. Returns the ring slots the caller must reclaim after each copy.
+pub fn prewake_first_layer(
+    reader: &DiskReader,
+    catalogue: &ExpertCatalogue,
+    pool: &crate::cpu::expert_ffn::ExpertPool,
+    layer: u32,
+    dispatch: &Dispatch,
+    geometry: &crate::experts::plan::DiskGeometry,
+) -> Result<Vec<u32>> {
+    pool.prewake()?;
+    let slots = prefetch_dispatch(reader, catalogue, layer, dispatch, geometry)?;
+    Ok(slots)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope};
     use crate::experts::plan::{PlanInputs, Reserves, ServiceCell, ServiceTable, capacity};
+    use crate::model_spec::ExpertFormat;
+    use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
     fn geometry() -> ExpertGeometry {
@@ -1248,6 +1430,25 @@ mod tests {
             expert,
             weight: bf16::from_f32(1.0),
         }
+    }
+
+    #[test]
+    fn synchronous_host_swap_recycles_source_after_copy() -> Result<()> {
+        let mut state = build(4, 1)?;
+        for iteration in 0..8u64 {
+            let expert = (0..8)
+                .find(|&id| state.ledger().tier(0, id).is_ok_and(|t| t == Tier::Host))
+                .context("host expert missing")?;
+            state.begin_token()?;
+            state.dispatch(0, &[route(0, 0, expert)])?;
+            let moves = state.resolve(0, &[expert])?;
+            assert_eq!(moves.len(), 1);
+            assert_eq!(state.released.len(), 1);
+            assert!(state.validate_released().is_err());
+            state.record_copy(&[moves[0].slot], iteration + 1)?;
+            state.finish_token()?;
+        }
+        Ok(())
     }
 
     fn set_scores(residency: &mut Residency, layer: usize, scores: [f64; 8]) {
@@ -2074,6 +2275,144 @@ mod tests {
 
         println!(
             "PASS residency_complete_backing requests=2 tokens=4 borrow=2 d2h_bytes=0 spare_blocks=0 unique_union=true read_lease=true peer_swappable=true"
+        );
+        Ok(())
+    }
+
+    fn e2m1_native_manifest(
+        layers: u32,
+        experts: u32,
+        rows: usize,
+        cols: usize,
+    ) -> (TensorManifest, Vec<u8>) {
+        let mut entries = BTreeMap::new();
+        let mut native = Vec::new();
+        let mut next = 0u64;
+        for layer in 0..layers {
+            for expert in 0..experts {
+                let name = |role: &str| format!("layers.{layer}.ffn.experts.{expert}.{role}");
+                for (role, r, c, dtype) in [
+                    ("w1.weight", rows, cols / 2, safetensors::Dtype::I8),
+                    ("w3.weight", rows, cols / 2, safetensors::Dtype::I8),
+                    ("w2.weight", cols, rows / 2, safetensors::Dtype::I8),
+                    ("w1.scale", rows, cols / 32, safetensors::Dtype::F8_E8M0),
+                    ("w3.scale", rows, cols / 32, safetensors::Dtype::F8_E8M0),
+                    ("w2.scale", cols, rows / 32, safetensors::Dtype::F8_E8M0),
+                ] {
+                    let len = (r * c) as u64;
+                    entries.insert(
+                        name(role),
+                        TensorEntry {
+                            dtype,
+                            shape: vec![r, c],
+                            shard: "e2m1.bin".into(),
+                            bytes: len as usize,
+                            load: true,
+                            data_start: 0,
+                            data_offsets: [next, next + len],
+                            scope: TensorScope::Text,
+                            layer: None,
+                            role: role.into(),
+                            scale_name: None,
+                        },
+                    );
+                    let start = native.len();
+                    native.resize(start + len as usize, 0);
+                    // Each expert's region carries its own seed, so the wrong-slot control can
+                    // distinguish two neighbouring experts.
+                    for (index, slot) in native[start..].iter_mut().enumerate() {
+                        *slot = ((index + expert as usize * 7919) % 251) as u8;
+                    }
+                    next += len;
+                }
+            }
+        }
+        (
+            TensorManifest {
+                entries,
+                resident_bytes: 0,
+            },
+            native,
+        )
+    }
+
+    fn slot_bytes_of(values: &[bf16]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_bits().to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn prefetch_dispatch_lands_the_native_slot_and_rejects_the_wrong_one() -> Result<()> {
+        let geometry = ExpertGeometry {
+            first_layer: 0,
+            layers: 1,
+            experts: 2,
+            hidden: 32,
+            intermediate: 32,
+            top_k: 2,
+        };
+        let (manifest, native) = e2m1_native_manifest(geometry.layers, geometry.experts, 32, 32);
+        let dir = std::env::temp_dir().join(format!(
+            "flyingfish-prefetch-{}-{}",
+            std::process::id(),
+            "native"
+        ));
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("e2m1.bin"), &native)?;
+        let catalogue = Arc::new(ExpertCatalogue::from_manifest(
+            &manifest,
+            geometry,
+            ExpertFormat::Fp4E2m1Block {
+                block: [1, 32],
+                scale_dtype: safetensors::Dtype::F8_E8M0,
+            },
+        )?);
+        let reader = crate::experts::disk::DiskReader::open(&catalogue, &dir, 2)?;
+        let disk_geometry = crate::experts::plan::DiskGeometry {
+            block_bytes: 4096,
+            read_bytes_per_second: 1.0,
+            measured: vec![(4096, 1.0)],
+            efficient_fraction: 0.9,
+        };
+        let dispatch = Dispatch {
+            active: Vec::new(),
+            generation: Vec::new(),
+            host: Vec::new(),
+            host_experts: Vec::new(),
+            disk: vec![Route {
+                row: 0,
+                choice: 0,
+                expert: 1,
+                weight: bf16::ZERO,
+            }],
+            miss_rows: Vec::new(),
+        };
+        let chunk = disk_geometry.chunk_bytes()?;
+        let slots = prefetch_dispatch(&reader, &catalogue, 0, &dispatch, &disk_geometry)?;
+        ensure!(
+            slots.len() == dispatch.disk.len(),
+            "prefetch_dispatch returned {} slots for {} disk routes",
+            slots.len(),
+            dispatch.disk.len()
+        );
+        // The slot packs the expert's six native ranges in the manifest's order, so the slot's
+        // bytes are that expert's region of the shard.
+        let per_expert = native.len() / (geometry.layers as usize * geometry.experts as usize);
+        let held = slot_bytes_of(&reader.values(slots[0])?);
+        assert_eq!(held[..per_expert], native[per_expert..per_expert * 2]);
+        // Planted control: the neighbouring expert's native region must not compare equal.
+        let other_slot = reader.read_expert(0, 0, &catalogue, chunk)?;
+        let other = slot_bytes_of(&reader.values(other_slot)?);
+        ensure!(
+            other[..per_expert] != held[..per_expert],
+            "wrong-slot control: expert 0 and expert 1 compared equal"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        println!(
+            "PASS prefetch_dispatch_native_slot slots={} per_expert_bytes={per_expert} chunk={chunk} wrong_slot_detected=true",
+            slots.len()
         );
         Ok(())
     }
