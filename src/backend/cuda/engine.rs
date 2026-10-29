@@ -2012,6 +2012,15 @@ impl Engine {
     }
 
     #[cfg(test)]
+    pub(crate) fn gemma_hidden_state(&self) -> Result<(Vec<bf16>, Vec<bf16>)> {
+        let h = self.model_spec.hidden as usize;
+        Ok((
+            self.device.stream.clone_dtoh(&self.work.x.slice(..h))?,
+            self.device.stream.clone_dtoh(&self.work.n.slice(..h))?,
+        ))
+    }
+
+    #[cfg(test)]
     pub(crate) fn gemma_all_logits(&self, row: usize) -> Result<Vec<bf16>> {
         self.qwen
             .as_ref()

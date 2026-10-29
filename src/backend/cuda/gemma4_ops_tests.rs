@@ -1090,11 +1090,13 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
             let eager_prefill_kv = engine.gemma_kv_rows(0, 512)?;
             let mut eager = Vec::new();
             let mut eager_decode0_kv = None;
+            let mut eager_decode0_hidden = None;
             for (row, &token) in sequence[512..].iter().enumerate() {
                 engine.gemma_decode_all(token)?;
                 eager.extend(engine.gemma_all_logits(0)?);
                 if row == 0 {
                     eager_decode0_kv = Some(engine.gemma_kv_rows(0, 512)?);
+                    eager_decode0_hidden = Some(engine.gemma_hidden_state()?);
                 }
             }
             engine.reset()?;
@@ -1116,6 +1118,13 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
                         &actual_kv == eager_decode0_kv.as_ref().context("eager KV row missing")?;
                     graph_state_defects += usize::from(!decode_equal);
                     println!("GEMMA4_GRAPH_KV decode0 equal={decode_equal}");
+                    let actual_hidden = engine.gemma_hidden_state()?;
+                    let hidden_equal = &actual_hidden
+                        == eager_decode0_hidden
+                            .as_ref()
+                            .context("eager hidden row missing")?;
+                    graph_state_defects += usize::from(!hidden_equal);
+                    println!("GEMMA4_GRAPH_HIDDEN decode0 equal={hidden_equal}");
                 }
                 let actual = engine.decode_logits()?;
                 let eager = &eager[row * actual.len()..(row + 1) * actual.len()];
