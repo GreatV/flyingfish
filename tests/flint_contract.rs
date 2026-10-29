@@ -190,7 +190,7 @@ fn flint_manifest_and_separate_experts_match_the_checkpoint() -> Result<()> {
     }
 
     let reader = DiskReader::open(&catalogue, &dir, 1)?;
-    let ring = reader.read_expert(0, 0, &catalogue)?;
+    let ring = reader.read_expert(0, 0, &catalogue, catalogue.slot_bytes())?;
     let values = reader.values(ring)?;
     let matrix_words = 512 * 2048;
     for (index, role) in [(0, "gate_proj"), (1, "up_proj"), (2, "down_proj")] {

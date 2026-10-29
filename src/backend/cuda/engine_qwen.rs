@@ -530,6 +530,7 @@ impl Runtime {
         }
         Ok(())
     }
+    #[cfg(feature = "cuda")]
     pub(super) fn checkpoint_path(&self) -> &Path {
         &self.checkpoint_dir
     }
