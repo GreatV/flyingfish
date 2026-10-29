@@ -4475,6 +4475,24 @@ impl Engine {
                             linear_rows,
                             q_stride,
                         )?;
+                        if hkv == 1 && d == 512 {
+                            trace_value(
+                                trace,
+                                s,
+                                &debug_name(trace, i, "k_prepared"),
+                                stage_k,
+                                rows,
+                                d,
+                            )?;
+                            trace_value(
+                                trace,
+                                s,
+                                &debug_name(trace, i, "v_prepared"),
+                                stage_v,
+                                rows,
+                                d,
+                            )?;
+                        }
                     }
                     flash.run(
                         &w.qkv,
