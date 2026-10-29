@@ -950,7 +950,7 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
     ] {
         let actual = catalog.bf16(full)?;
         let actual = device.stream.clone_dtoh(actual)?;
-        let expected = checkpoint_tensor(&dir, &full)?;
+        let expected = checkpoint_tensor(&dir, full)?;
         ensure!(actual == expected, "published tensor mismatch: {full}");
     }
     drop(catalog);
