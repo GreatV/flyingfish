@@ -6320,6 +6320,14 @@ impl Engine {
     }
 
     fn prepare(&mut self, rows: usize) -> Result<()> {
+        if self.model_spec.architecture == crate::model_spec::Architecture::DeepseekV41 {
+            ensure!(
+                (1..=self.workspace_rows).contains(&rows),
+                "DeepSeek-V4.1 prepare rows {rows} exceed the native workspace {}",
+                self.workspace_rows
+            );
+            return self.ensure_decode();
+        }
         if self.qwen.is_some() {
             return self.prepare_qwen(rows);
         }
