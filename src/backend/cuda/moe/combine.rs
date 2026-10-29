@@ -12,6 +12,7 @@ pub struct CombineOps {
     shared_scale: CudaFunction,
     combine: CudaFunction,
     combine_ungated: CudaFunction,
+    combine_accum: CudaFunction,
     combine_routed: CudaFunction,
     combine_routed_vector: CudaFunction,
     join_routed: CudaFunction,
@@ -80,8 +81,64 @@ pub struct MoeCombineResidual {
     pub y_out: Option<TensorMut<bf16, 2>>,
 }
 
-/// The fused peer join: the routed sum comes from the peer GPU; the
-/// shared-expert sigmoid gate and one output boundary are local.
+/// The FP32-accumulated combine of the DeepSeek-V4.1 MoE: per-choice BF16
+/// contributions plus one weight-1 shared row, one BF16 round at the output.
+pub enum Accumulator {
+    /// The routed sum rounds to BF16 before the shared join (the family
+    /// gated/ungated boundary).
+    Bf16,
+    /// FP32 accumulation of the contributions and the weight-1 shared row,
+    // one BF16 round at the output (model.py MoE.forward).
+    Fp32,
+}
+
+pub struct MoeCombineAccum {
+    /// `[rows, top_k, hidden]` weighted BF16 contributions (dense).
+    pub contributions: Tensor<bf16, 3>,
+    /// `[rows, hidden]` shared-expert output (dense).
+    pub shared_out: Tensor<bf16, 2>,
+    /// `[rows, hidden]` output.
+    pub y: TensorMut<bf16, 2>,
+    // Selected once at the binding; both boundaries are the same launch.
+    pub accumulator: Accumulator,
+}
+
+impl MoeCombineAccum {
+    fn validate(&self) -> Result<(u32, u32, u32)> {
+        let (rows, top_k) = (self.contributions.shape[0], self.contributions.shape[1]);
+        let hidden = self.contributions.shape[2];
+        self.contributions.validate()?;
+        ensure!(
+            self.contributions.shape == [rows, top_k, hidden]
+                && self.contributions.stride[2] == 1
+                && self.contributions.stride[1] == u64::from(hidden)
+                && self.contributions.stride[0] == u64::from(top_k) * u64::from(hidden),
+            "moe combine f32 contributions must be dense [rows, top_k, hidden]"
+        );
+        self.shared_out.validate()?;
+        ensure!(
+            self.shared_out.shape == [rows, hidden]
+                && self.shared_out.stride == [u64::from(hidden), 1],
+            "moe combine f32 shared_out must be dense [rows, hidden]"
+        );
+        self.y.read().validate()?;
+        ensure!(
+            self.y.read().shape == [rows, hidden] && self.y.read().stride == [u64::from(hidden), 1],
+            "moe combine f32 y must be dense [rows, hidden]"
+        );
+        ensure!(
+            rows >= 1 && (1..=32).contains(&top_k) && hidden >= 1 && hidden.is_multiple_of(8),
+            "moe combine f32 extents rows={rows} top_k={top_k} hidden={hidden} (hidden must be a multiple of 8)"
+        );
+        no_overlap(&self.contributions, &self.y.0, "contributions", "y")?;
+        no_overlap(&self.shared_out, &self.y.0, "shared_out", "y")?;
+        Ok((rows, top_k, hidden))
+    }
+}
+
+/// The fused peer join: the routed sum comes from the peer GPU, the
+/// shared-expert sigmoid gate and the residual add are local. The residual is
+/// read and written in place.
 pub struct MoeJoinRoutedResidual {
     /// `[rows, hidden]` routed sum produced by the peer (dense).
     pub routed_in: Tensor<bf16, 2>,
@@ -366,6 +423,7 @@ impl CombineOps {
             shared_scale: module.load_function("moe_shared_scale")?,
             combine: module.load_function("moe_combine")?,
             combine_ungated: module.load_function("moe_combine_ungated")?,
+            combine_accum: module.load_function("moe_combine_accum")?,
             combine_routed: module.load_function("moe_combine_routed")?,
             combine_routed_vector: module.load_function("moe_combine_routed_vector")?,
             join_routed: module.load_function("moe_join_routed")?,
@@ -449,6 +507,31 @@ impl CombineOps {
                     .arg(&(hidden as i64))
                     .launch(grid(rows as usize, 256))?;
             }
+        }
+        Ok(())
+    }
+
+    /// The FP32-accumulated combine: per-choice BF16 contributions plus one
+    /// weight-1 shared row, one BF16 round at the output (the DeepSeek-V4.1
+    /// model definition MoE.forward accumulator).
+    pub fn combine_accum(&self, stream: &Arc<CudaStream>, input: &MoeCombineAccum) -> Result<()> {
+        let (rows, top_k, hidden) = input.validate()?;
+        let fp32 = match input.accumulator {
+            Accumulator::Fp32 => 1i32,
+            Accumulator::Bf16 => 0i32,
+        };
+        // SAFETY: validated views cover rows*top_k contributions and rows*hidden outputs.
+        unsafe {
+            stream
+                .launch_builder(&self.combine_accum)
+                .arg(&input.contributions.ptr)
+                .arg(&input.shared_out.ptr)
+                .arg(&input.y.0.ptr)
+                .arg(&(rows as i32))
+                .arg(&(top_k as i32))
+                .arg(&(hidden as i64))
+                .arg(&fp32)
+                .launch(grid(rows as usize, 256))?;
         }
         Ok(())
     }

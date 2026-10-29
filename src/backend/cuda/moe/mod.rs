@@ -14,3 +14,8 @@ mod decode_tests;
 mod prefill_tests;
 #[cfg(test)]
 mod route_tests;
+
+#[cfg(feature = "cuda")]
+pub mod w4a8;
+#[cfg(feature = "cuda")]
+pub mod w8a8;

@@ -531,3 +531,61 @@ extern "C" __global__ void moe_join_routed_residual_scalar(
       routed_in, shared_out, seg, x, x_stride, residual, y_out, rows, hidden,
       hidden_blocks);
 }
+
+// Combine with the accumulator precision as a parameter: fp32_accum 1
+// accumulates the per-choice BF16 contributions and one weight-1 shared row
+// in FP32 and rounds the output to BF16 once (model.py MoE.forward); 0
+// rounds the routed sum to BF16 before the shared join (the family
+// gated/ungated boundary). No activation bookkeeping: the caller wrote
+// every (row, choice) slot before this launch.
+extern "C" __global__ void moe_combine_accum(
+    const bf16* __restrict__ contributions, const bf16* __restrict__ shared,
+    bf16* __restrict__ y, int rows, int top_k, long long hidden,
+    int fp32_accum) {
+  if (blockDim.x != 256 || gridDim.y != 1 || gridDim.z != 1 || top_k < 1 ||
+      top_k > 32 || hidden % 8 != 0 || (unsigned)fp32_accum > 1u)
+    __trap();
+  const int row = blockIdx.x;
+  if (row < 0 || row >= rows) __trap();
+  const int tid = threadIdx.x;
+  const bf16* __restrict__ cr =
+      contributions + (long long)row * top_k * hidden;
+  const bf16* __restrict__ sh = shared + (long long)row * hidden;
+  bf16* __restrict__ yr = y + (long long)row * hidden;
+  for (long long d0 = (long long)tid * 8; d0 < hidden;
+       d0 += (long long)blockDim.x * 8) {
+    Bf16x8 s;
+    s.v = *reinterpret_cast<const float4*>(sh + d0);
+    // The definition's order (model.py MoE.forward): the routed rows accumulate
+    // into a zero FP32 accumulator and the shared row is added last.
+    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    float routed[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int k = 0; k < top_k; ++k) {
+      Bf16x8 c;
+      c.v = *reinterpret_cast<const float4*>(cr + (long long)k * hidden + d0);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        acc[j] += __bfloat162float(c.h[j]);
+        routed[j] += __bfloat162float(c.h[j]);
+      }
+    }
+    if (fp32_accum == 1) {
+#pragma unroll
+      for (int j = 0; j < 8; ++j) acc[j] += __bfloat162float(s.h[j]);
+    }
+    Bf16x8 out;
+    if (fp32_accum == 0) {
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        // The family's BF16 boundary: the routed sum rounds to BF16 before
+        // the shared join, which itself rounds once.
+        const bf16 routed_bf16 = __float2bfloat16(routed[j]);
+        acc[j] = __bfloat162float(__float2bfloat16(
+            __bfloat162float(routed_bf16) + __bfloat162float(s.h[j])));
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) out.h[j] = __float2bfloat16(acc[j]);
+    *reinterpret_cast<float4*>(yr + d0) = out.v;
+  }
+}

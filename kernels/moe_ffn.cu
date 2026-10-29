@@ -2,6 +2,8 @@
 // gate_up: grid(ceil(I/32),rows,K+1), block256, smem=H*2; down: grid(ceil(H/16),rows,K+1), block128.
 // Active assignments require valid slots, matching generations and distinct expert ids.
 // Expert row pointers and shared weights are 16-byte aligned.
+#include <cuda_runtime.h>
+#include <cuda_fp8.h>
 #include "q38_contract.cuh"
 
 using bf16 = __nv_bfloat16;
@@ -390,3 +392,373 @@ MOE_INVARIANT_DOWN(moe_ffn_down_w8a16_lane16, unsigned char, true)
 
 #undef FD_GUARD_MOE_GATE_UP
 #undef FD_GUARD_MOE_DOWN
+
+// ---------------------------------------------------------------------------
+// W4A8 routed experts: E2M1 weights with one E8M0 scale per 32 elements of
+// each row, E4M3 activations with one E8M0 scale per 32 elements along K.
+// The packed byte at column j carries the element 2j in its low nibble and
+// the element 2j+1 in its high nibble; the E2M1 code is one sign bit, two
+// exponent bits and one mantissa bit.
+// Semantics per the DeepSeek-V4.1-Flash model definition (publisher
+// inference/model.py Expert.forward, kernel.py act_quant and fp4_gemm):
+//   - the activation is quantized dynamically: the amax over 32 elements is
+//     floored at 1e-4, the E8M0 scale is 2^ceil(log2(amax/448)) and the codes
+//     are E4M3 round-to-nearest-even;
+//   - the 32-element dot is scaled by the activation and the weight scale
+//     outside the dot;
+//   - the gate branch is clamped from above, the up branch on both sides, the
+//     SiLU stays in FP32 and multiplies the up branch in FP32;
+//   - the routed weight multiplies that FP32 product and the result takes one
+//     BF16 cast, which is the down-input row.
+// act quant: grid(ceil(groups/8)), block256, smem=0.
+// gate_up: grid(ceil(I/8)), block256, smem=K+K/32; down: grid(ceil(H/8)),
+// block256, smem=I+I/32. One warp owns one output row.
+
+#define W4A8_SCALE_BLOCK 32  // elements per E8M0 scale
+#define W4A8_ELEMS 8         // elements per chunk
+#define W4A8_THREADS 256     // threads per W4A8 block
+#define W4A8_WARPS 8         // output rows per W4A8 block
+
+// E2M1 magnitude from the three low bits: 0, 0.5, 1, 1.5, 2, 3, 4 and 6.
+__device__ __forceinline__ float moe_e2m1(unsigned nibble) {
+  const unsigned u = nibble & 7u;
+  unsigned bits = 0x3F000000u + u * 0x400000u;
+  if (u == 0u) bits = 0u;
+  else if (u == 1u) bits = 0x3F000000u;
+  return __uint_as_float(bits | ((nibble & 8u) << 28));
+}
+
+// ceil(log2(v)) of a positive normal float and 2^exponent live in
+// q38_contract.cuh (act_quant_log2_ceil / act_quant_pow2).
+
+// Warp sum; every lane receives the total.
+__device__ __forceinline__ float moe_warp_sum(float v) {
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    v += __shfl_xor_sync(0xffffffffu, v, off);
+  return v;
+}
+
+// Quantize one BF16 row to E4M3 codes with one E8M0 scale per 32 elements.
+__device__ __forceinline__ void moe_act_quant(
+    const bf16* __restrict__ x, unsigned char* __restrict__ codes,
+    unsigned char* __restrict__ scales, int k) {
+  if (k < 1 || (k % W4A8_SCALE_BLOCK) != 0 ||
+      blockDim.x != W4A8_THREADS || blockDim.x % 32 != 0)
+    __trap();
+  const int groups = k / W4A8_SCALE_BLOCK;
+  const int group = int(blockIdx.x) * (int(blockDim.x) / 32) + int(threadIdx.x / 32);
+  if (group >= groups) return;
+  const int lane = int(threadIdx.x % 32);
+  const size_t base = (size_t)group * W4A8_SCALE_BLOCK;
+  const float value = __bfloat162float(x[base + lane]);
+  unsigned char code, scale_code;
+  act_quant32(value, &code, &scale_code);
+  codes[base + lane] = code;
+  if (lane == 0) scales[group] = scale_code;
+}
+
+extern "C" __global__ __launch_bounds__(W4A8_THREADS) void moe_act_quant_e4m0(
+    const bf16* __restrict__ x, unsigned char* __restrict__ codes,
+    unsigned char* __restrict__ scales, int k) {
+  moe_act_quant(x, codes, scales, k);
+}
+
+// One warp per output row: the row of packed E2M1 weights is read in 4-byte
+// chunks, the activation chunk is read from shared memory, and the block
+// scales multiply the chunk sums.
+__device__ __forceinline__ float moe_w4a8_dot(
+    const unsigned char* __restrict__ weight_row,
+    const unsigned char* __restrict__ weight_scales,
+    const unsigned char* __restrict__ act_codes,
+    const unsigned char* __restrict__ act_scales, int chunks) {
+  float acc = 0.0f;
+  for (int chunk = int(threadIdx.x % 32); chunk < chunks; chunk += 32) {
+    const unsigned word =
+        *reinterpret_cast<const unsigned*>(weight_row + (size_t)chunk * 4);
+    const unsigned lo = *reinterpret_cast<const unsigned*>(act_codes + (size_t)chunk * 8);
+    const unsigned hi = *reinterpret_cast<const unsigned*>(act_codes + (size_t)chunk * 8 + 4);
+    unsigned bytes[8];
+    bytes[0] = lo & 0xFFu;
+    bytes[1] = (lo >> 8) & 0xFFu;
+    bytes[2] = (lo >> 16) & 0xFFu;
+    bytes[3] = lo >> 24;
+    bytes[4] = hi & 0xFFu;
+    bytes[5] = (hi >> 8) & 0xFFu;
+    bytes[6] = (hi >> 16) & 0xFFu;
+    bytes[7] = hi >> 24;
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const unsigned byte = (word >> (8 * i)) & 0xFFu;
+      const float a_lo = e4m3_decode((unsigned char)bytes[2 * i]);
+      const float a_hi = e4m3_decode((unsigned char)bytes[2 * i + 1]);
+      sum = fmaf(moe_e2m1(byte & 0xFu), a_lo, sum);
+      sum = fmaf(moe_e2m1(byte >> 4), a_hi, sum);
+    }
+    const int group = chunk / (W4A8_SCALE_BLOCK / W4A8_ELEMS);
+    acc = fmaf(sum, e8m0_decode(act_scales[group]) * e8m0_decode(weight_scales[group]), acc);
+  }
+  return acc;
+}
+
+__device__ __forceinline__ void moe_w4a8_gate_up(
+    const unsigned char* __restrict__ act_codes,
+    const unsigned char* __restrict__ act_scales,
+    const unsigned char* __restrict__ gate_codes,
+    const unsigned char* __restrict__ gate_scales,
+    const unsigned char* __restrict__ up_codes,
+    const unsigned char* __restrict__ up_scales,
+    bf16* __restrict__ h, int hidden, int inter, float swiglu_limit,
+    float route_weight) {
+  if (blockDim.x != W4A8_THREADS || hidden < 1 || inter < 1 ||
+      (hidden % W4A8_SCALE_BLOCK) != 0 || !(swiglu_limit > 0.0f) ||
+      !isfinite(route_weight) ||
+      gridDim.x != (unsigned)((inter + W4A8_WARPS - 1) / W4A8_WARPS))
+    __trap();
+  const int groups = hidden / W4A8_SCALE_BLOCK;
+  extern __shared__ __align__(16) unsigned char w4a8_gate_up_act[];
+  unsigned char* s_codes = w4a8_gate_up_act;
+  unsigned char* s_scales = w4a8_gate_up_act + hidden;
+  for (int i = int(threadIdx.x); i < hidden; i += W4A8_THREADS)
+    s_codes[i] = act_codes[i];
+  for (int i = int(threadIdx.x); i < groups; i += W4A8_THREADS)
+    s_scales[i] = act_scales[i];
+  __syncthreads();
+  const int row = int(blockIdx.x) * W4A8_WARPS + int(threadIdx.x / 32);
+  if (row >= inter) return;
+  const int chunks = hidden / W4A8_ELEMS;
+  const float gate = moe_warp_sum(moe_w4a8_dot(
+      gate_codes + (size_t)row * (size_t)(hidden / 2),
+      gate_scales + (size_t)row * (size_t)groups, s_codes, s_scales, chunks));
+  const float up = moe_warp_sum(moe_w4a8_dot(
+      up_codes + (size_t)row * (size_t)(hidden / 2),
+      up_scales + (size_t)row * (size_t)groups, s_codes, s_scales, chunks));
+  if (int(threadIdx.x % 32) != 0) return;
+  float g = __bfloat162float(__float2bfloat16_rn(gate));
+  float u = __bfloat162float(__float2bfloat16_rn(up));
+  g = fminf(g, swiglu_limit);
+  u = fmaxf(fminf(u, swiglu_limit), -swiglu_limit);
+  // The definition's boundary (model.py Expert.forward): FP32 silu times the up
+  // branch, the route weight in FP32, then one BF16 cast before w2.
+  const float silu = g / (1.0f + expf(-g));
+  h[row] = __float2bfloat16_rn((silu * u) * route_weight);
+}
+
+__device__ __forceinline__ void moe_w4a8_down(
+    const unsigned char* __restrict__ act_codes,
+    const unsigned char* __restrict__ act_scales,
+    const unsigned char* __restrict__ down_codes,
+    const unsigned char* __restrict__ down_scales,
+    bf16* __restrict__ out, int hidden, int inter) {
+  if (blockDim.x != W4A8_THREADS || hidden < 1 || inter < 1 ||
+      (inter % W4A8_SCALE_BLOCK) != 0 ||
+      gridDim.x != (unsigned)((hidden + W4A8_WARPS - 1) / W4A8_WARPS))
+    __trap();
+  const int groups = inter / W4A8_SCALE_BLOCK;
+  extern __shared__ __align__(16) unsigned char w4a8_down_act[];
+  unsigned char* s_codes = w4a8_down_act;
+  unsigned char* s_scales = w4a8_down_act + inter;
+  for (int i = int(threadIdx.x); i < inter; i += W4A8_THREADS)
+    s_codes[i] = act_codes[i];
+  for (int i = int(threadIdx.x); i < groups; i += W4A8_THREADS)
+    s_scales[i] = act_scales[i];
+  __syncthreads();
+  const int row = int(blockIdx.x) * W4A8_WARPS + int(threadIdx.x / 32);
+  if (row >= hidden) return;
+  const int chunks = inter / W4A8_ELEMS;
+  const float acc = moe_warp_sum(moe_w4a8_dot(
+      down_codes + (size_t)row * (size_t)(inter / 2),
+      down_scales + (size_t)row * (size_t)groups, s_codes, s_scales, chunks));
+  if (int(threadIdx.x % 32) == 0) out[row] = __float2bfloat16_rn(acc);
+}
+
+extern "C" __global__ __launch_bounds__(W4A8_THREADS) void moe_ffn_gate_up_e2m1_e8m0(
+    const unsigned char* __restrict__ act_codes,
+    const unsigned char* __restrict__ act_scales,
+    const unsigned char* __restrict__ gate_codes,
+    const unsigned char* __restrict__ gate_scales,
+    const unsigned char* __restrict__ up_codes,
+    const unsigned char* __restrict__ up_scales,
+    bf16* __restrict__ h, int hidden, int inter, float swiglu_limit,
+    float route_weight) {
+  moe_w4a8_gate_up(act_codes, act_scales, gate_codes, gate_scales, up_codes,
+                   up_scales, h, hidden, inter, swiglu_limit, route_weight);
+}
+
+extern "C" __global__ __launch_bounds__(W4A8_THREADS) void moe_ffn_down_e2m1_e8m0(
+    const unsigned char* __restrict__ act_codes,
+    const unsigned char* __restrict__ act_scales,
+    const unsigned char* __restrict__ down_codes,
+    const unsigned char* __restrict__ down_scales,
+    bf16* __restrict__ out, int hidden, int inter) {
+  moe_w4a8_down(act_codes, act_scales, down_codes, down_scales, out, hidden,
+                inter);
+}
+
+// Device-side routed dispatch: the id and the routed weight are read from
+// device memory; `slots` holds six addresses per expert in the order
+// gate_codes, gate_scales, up_codes, up_scales, down_codes, down_scales. An
+// id outside [0, experts) or a zero slot_valid entry traps the launch (the
+// unresident-expert failure class; the launch grid stays host-known).
+extern "C" __global__ __launch_bounds__(W4A8_THREADS) void moe_ffn_dispatch_gate_up_e2m1_e8m0(
+    const unsigned char* __restrict__ act_codes,
+    const unsigned char* __restrict__ act_scales,
+    const unsigned long long* __restrict__ slots,
+    const unsigned* __restrict__ slot_valid,
+    const int* __restrict__ ids, const float* __restrict__ route_weights,
+    unsigned long long id_index, int experts, bf16* __restrict__ h, int hidden,
+    int inter, float swiglu_limit) {
+  const int e = ids[id_index];
+  if ((unsigned)e >= (unsigned)experts || slot_valid[e] == 0u) __trap();
+  const unsigned long long* slot = slots + (size_t)e * 6u;
+  moe_w4a8_gate_up(
+      act_codes, act_scales,
+      reinterpret_cast<const unsigned char*>(slot[0]),
+      reinterpret_cast<const unsigned char*>(slot[1]),
+      reinterpret_cast<const unsigned char*>(slot[2]),
+      reinterpret_cast<const unsigned char*>(slot[3]), h, hidden, inter,
+      swiglu_limit, route_weights[id_index]);
+}
+
+extern "C" __global__ __launch_bounds__(W4A8_THREADS) void moe_ffn_dispatch_down_e2m1_e8m0(
+    const unsigned char* __restrict__ act_codes,
+    const unsigned char* __restrict__ act_scales,
+    const unsigned long long* __restrict__ slots,
+    const unsigned* __restrict__ slot_valid,
+    const int* __restrict__ ids, unsigned long long id_index, int experts,
+    bf16* __restrict__ out, int hidden, int inter) {
+  const int e = ids[id_index];
+  if ((unsigned)e >= (unsigned)experts || slot_valid[e] == 0u) __trap();
+  const unsigned long long* slot = slots + (size_t)e * 6u;
+  moe_w4a8_down(act_codes, act_scales,
+                reinterpret_cast<const unsigned char*>(slot[4]),
+                reinterpret_cast<const unsigned char*>(slot[5]), out, hidden,
+                inter);
+}
+
+// ---------------------------------------------------------------------------
+// W8A8 shared expert: E4M3 weights with one E8M0 scale per 32x32 weight
+// block and an E4M3 activation with one E8M0 scale per 32 elements along K.
+// The weight scale grid is [ceil(rows/32), ceil(k/32)]; the scale of the
+// block (row/32, k/32) multiplies the 32-element dot of that block.
+// Semantics per the DeepSeek-V4.1-Flash model definition (publisher
+// inference/kernel.py fp8_gemm and act_quant, model.py Expert.forward):
+//   - the activation is quantized dynamically: the amax over 32 elements is
+//     floored at 1e-4, the E8M0 scale is 2^ceil(log2(amax/448)) and the codes
+//     are E4M3 round-to-nearest-even;
+//   - the 32-element dot is scaled by the activation scale and the weight
+//     block scale outside the dot;
+//   - the gate branch is clamped from above, the up branch on both sides, the
+//     SiLU stays in FP32 and multiplies the up branch in FP32, one BF16 cast;
+//   - the down input is the BF16 hidden state and the output is BF16.
+// act quant: grid(ceil(groups/8)), block256, smem=0.
+// gate_up: grid(ceil(I/8)), block256, smem=K+K/32; down: grid(ceil(H/8)),
+// block256, smem=I+I/32. One warp owns one output row.
+
+#define W8A8_BLOCK 32     // rows and columns of one weight scale block
+#define W8A8_LANE_ELEMS 8 // elements of one K block per lane
+
+// One warp owns one output row. Each 32-element K block is split over four
+// lanes of eight elements and the block scale multiplies the block sum.
+__device__ __forceinline__ float moe_w8a8_dot(
+    const unsigned char* __restrict__ weight_row,
+    const unsigned char* __restrict__ weight_scales,
+    const unsigned char* __restrict__ act_codes,
+    const unsigned char* __restrict__ act_scales, int groups) {
+  const int lane = int(threadIdx.x % 32);
+  const int sub = lane & 3;
+  const int stride = lane >> 2;
+  float acc = 0.0f;
+  for (int base = 0; base < groups; base += 8) {
+    const int block = base + stride;
+    float sum = 0.0f;
+    if (block < groups) {
+      const unsigned char* w =
+          weight_row + (size_t)block * W8A8_BLOCK + sub * W8A8_LANE_ELEMS;
+      const unsigned char* a =
+          act_codes + (size_t)block * W8A8_BLOCK + sub * W8A8_LANE_ELEMS;
+#pragma unroll
+      for (int i = 0; i < W8A8_LANE_ELEMS; ++i)
+        sum = fmaf(e4m3_decode(w[i]), e4m3_decode(a[i]), sum);
+    }
+    sum += __shfl_xor_sync(0xffffffffu, sum, 1, 4);
+    sum += __shfl_xor_sync(0xffffffffu, sum, 2, 4);
+    if (sub == 0 && block < groups) {
+      const float scale =
+          e8m0_decode(act_scales[block]) * e8m0_decode(weight_scales[block]);
+      acc = fmaf(sum, scale, acc);
+    }
+  }
+  return acc;
+}
+
+extern "C" __global__ __launch_bounds__(W4A8_THREADS) void moe_ffn_gate_up_e4m3_block32(
+    const unsigned char* __restrict__ act_codes,
+    const unsigned char* __restrict__ act_scales,
+    const unsigned char* __restrict__ gate_codes,
+    const unsigned char* __restrict__ gate_scales,
+    const unsigned char* __restrict__ up_codes,
+    const unsigned char* __restrict__ up_scales,
+    bf16* __restrict__ h, int hidden, int inter, float swiglu_limit) {
+  if (blockDim.x != W4A8_THREADS || hidden < 1 || inter < 1 ||
+      (hidden % W8A8_BLOCK) != 0 || !(swiglu_limit > 0.0f) ||
+      gridDim.x != (unsigned)((inter + W4A8_WARPS - 1) / W4A8_WARPS))
+    __trap();
+  const int groups = hidden / W8A8_BLOCK;
+  extern __shared__ __align__(16) unsigned char w8a8_gate_up_act[];
+  unsigned char* s_codes = w8a8_gate_up_act;
+  unsigned char* s_scales = w8a8_gate_up_act + hidden;
+  for (int i = int(threadIdx.x); i < hidden; i += W4A8_THREADS)
+    s_codes[i] = act_codes[i];
+  for (int i = int(threadIdx.x); i < groups; i += W4A8_THREADS)
+    s_scales[i] = act_scales[i];
+  __syncthreads();
+  const int row = int(blockIdx.x) * W4A8_WARPS + int(threadIdx.x / 32);
+  if (row >= inter) return;
+  const float gate = moe_warp_sum(moe_w8a8_dot(
+      gate_codes + (size_t)row * (size_t)hidden,
+      gate_scales + (size_t)(row >> 5) * (size_t)groups,
+      s_codes, s_scales, groups));
+  const float up = moe_warp_sum(moe_w8a8_dot(
+      up_codes + (size_t)row * (size_t)hidden,
+      up_scales + (size_t)(row >> 5) * (size_t)groups,
+      s_codes, s_scales, groups));
+  if (int(threadIdx.x % 32) != 0) return;
+  float g = __bfloat162float(__float2bfloat16_rn(gate));
+  float u = __bfloat162float(__float2bfloat16_rn(up));
+  g = fminf(g, swiglu_limit);
+  u = fmaxf(fminf(u, swiglu_limit), -swiglu_limit);
+  // The definition's boundary (model.py Expert.forward): FP32 silu times the up
+  // branch, then one BF16 cast before w2.
+  const float silu = g / (1.0f + expf(-g));
+  h[row] = __float2bfloat16_rn(silu * u);
+}
+
+extern "C" __global__ __launch_bounds__(W4A8_THREADS) void moe_ffn_down_e4m3_block32(
+    const unsigned char* __restrict__ act_codes,
+    const unsigned char* __restrict__ act_scales,
+    const unsigned char* __restrict__ down_codes,
+    const unsigned char* __restrict__ down_scales,
+    bf16* __restrict__ out, int hidden, int inter) {
+  if (blockDim.x != W4A8_THREADS || hidden < 1 || inter < 1 ||
+      (inter % W8A8_BLOCK) != 0 ||
+      gridDim.x != (unsigned)((hidden + W4A8_WARPS - 1) / W4A8_WARPS))
+    __trap();
+  const int groups = inter / W8A8_BLOCK;
+  extern __shared__ __align__(16) unsigned char w8a8_down_act[];
+  unsigned char* s_codes = w8a8_down_act;
+  unsigned char* s_scales = w8a8_down_act + inter;
+  for (int i = int(threadIdx.x); i < inter; i += W4A8_THREADS)
+    s_codes[i] = act_codes[i];
+  for (int i = int(threadIdx.x); i < groups; i += W4A8_THREADS)
+    s_scales[i] = act_scales[i];
+  __syncthreads();
+  const int row = int(blockIdx.x) * W4A8_WARPS + int(threadIdx.x / 32);
+  if (row >= hidden) return;
+  const float acc = moe_warp_sum(moe_w8a8_dot(
+      down_codes + (size_t)row * (size_t)inter,
+      down_scales + (size_t)(row >> 5) * (size_t)groups,
+      s_codes, s_scales, groups));
+  if (int(threadIdx.x % 32) == 0) out[row] = __float2bfloat16_rn(acc);
+}
