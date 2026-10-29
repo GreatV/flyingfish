@@ -1002,10 +1002,20 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         let rmse = (delta.iter().map(|v| v * v).sum::<f32>() / delta.len() as f32).sqrt();
         println!("GEMMA4_LINEAR_NATIVE_PROBE {role} output_max={maximum} output_rmse={rmse}");
     }
-    trace.set_device(&engine.device_info().name)?;
-    trace.save(&runtime.join("native-trace.safetensors"))?;
     let (native_k, native_v) = engine.gemma_kv_rows(0, first_ids.len())?;
     let reference_v = tensor(&data, "stage.a.v_norm")?;
+    trace.add(
+        "debug.native_k".into(),
+        v_shape.clone(),
+        native_k.iter().map(|v| v.to_f32()).collect(),
+    )?;
+    trace.add(
+        "debug.native_v".into(),
+        v_shape.clone(),
+        native_v.iter().map(|v| v.to_f32()).collect(),
+    )?;
+    trace.set_device(&engine.device_info().name)?;
+    trace.save(&runtime.join("native-trace.safetensors"))?;
     let mut raw_v = Vec::with_capacity(reference_v.len());
     for row in 0..rows {
         for head in 0..hkv {
