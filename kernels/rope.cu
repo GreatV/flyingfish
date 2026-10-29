@@ -20,8 +20,13 @@ extern "C" __global__ void rope_table_kv(__nv_bfloat16* qkvg,
     const __nv_bfloat16 s1 = table[position * 2 * dim + dim + half + d];
     const __nv_bfloat16 a = qkvg[off];
     const __nv_bfloat16 b = qkvg[off + half];
+#if defined(__HIP__)
+    const __nv_bfloat16 lo = __hsub_rn(__hmul_rn(a,c0), __hmul_rn(b,s0));
+    const __nv_bfloat16 hi = __hadd_rn(__hmul_rn(b,c1), __hmul_rn(a,s1));
+#else
     const __nv_bfloat16 lo = __hsub(__hmul(a,c0), __hmul(b,s0));
     const __nv_bfloat16 hi = __hadd(__hmul(b,c1), __hmul(a,s1));
+#endif
     if (head < q_heads) {
         qkvg[off] = lo;
         qkvg[off + half] = hi;
@@ -54,8 +59,13 @@ extern "C" __global__ void rope_2d_qk(__nv_bfloat16* qkv, const int* positions,
     const __nv_bfloat16 s1 = __float2bfloat16_rn(sinf(angle1));
     const __nv_bfloat16 a = qkv[off];
     const __nv_bfloat16 b = qkv[off + half];
+#if defined(__HIP__)
+    qkv[off] = __hsub_rn(__hmul_rn(a, c0), __hmul_rn(b, s0));
+    qkv[off + half] = __hadd_rn(__hmul_rn(b, c1), __hmul_rn(a, s1));
+#else
     qkv[off] = __hsub(__hmul(a, c0), __hmul(b, s0));
     qkv[off + half] = __hadd(__hmul(b, c1), __hmul(a, s1));
+#endif
 }
 
 extern "C" __global__ void sequence_positions(const int* prefix, int* metadata,
