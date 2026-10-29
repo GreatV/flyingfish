@@ -1070,14 +1070,21 @@ fn oracle_store_distance(
     store: &str,
 ) -> Result<bool> {
     ensure!(
-        candidate_values.len() == reference_values.len()
-            && candidate_values.len() == oracle_values.len()
-            && candidate_values.len().is_multiple_of(rows)
+        reference_values.len() == oracle_values.len()
+            && reference_values.len().is_multiple_of(rows)
             && row < rows,
         "oracle store extent mismatch at {store}"
     );
-    let width = candidate_values.len() / rows;
-    let candidate_values = &candidate_values[row * width..(row + 1) * width];
+    let width = reference_values.len() / rows;
+    ensure!(
+        candidate_values.len() == reference_values.len() || candidate_values.len() == width,
+        "oracle store candidate extent mismatch at {store}"
+    );
+    let candidate_values = if candidate_values.len() == width {
+        candidate_values
+    } else {
+        &candidate_values[row * width..(row + 1) * width]
+    };
     let reference_values = &reference_values[row * width..(row + 1) * width];
     let oracle_values = &oracle_values[row * width..(row + 1) * width];
     let (mut candidate_max, mut reference_max) = (0.0f64, 0.0f64);
@@ -1346,6 +1353,47 @@ fn oracle_first_layer_rule_a(
             first_beyond = Some("layer_output");
         }
     }
+    let widen = |values: Vec<bf16>| {
+        values
+            .into_iter()
+            .map(|value| value.to_f32())
+            .collect::<Vec<_>>()
+    };
+    let norm1 = reference_bf16(reference_layers, &format!("{prefix}.input_layernorm"))?;
+    let attention_stores = [
+        (
+            "q_proj",
+            widen(engine.gemma_linear_probe("self_attn.q_proj.weight", norm1)?),
+        ),
+        (
+            "k_proj",
+            widen(engine.gemma_linear_probe("self_attn.k_proj.weight", norm1)?),
+        ),
+        (
+            "v_proj",
+            widen(engine.gemma_linear_probe("self_attn.v_proj.weight", norm1)?),
+        ),
+    ];
+    let mut first_attention_beyond = None;
+    for (store, candidate) in attention_stores {
+        let stage_name = format!("{prefix}.{store}");
+        let reference_values = reference(reference_layers, &stage_name)?.as_f32();
+        let oracle_values = reference(oracle, &stage_name)?.as_f32();
+        for row in selected_rows {
+            if oracle_store_distance(
+                "attention_operand_rule_a",
+                &candidate,
+                &reference_values,
+                &oracle_values,
+                *row,
+                rows,
+                store,
+            )? && first_attention_beyond.is_none()
+            {
+                first_attention_beyond = Some(store);
+            }
+        }
+    }
     let pre_ffn = reference_bf16(
         reference_layers,
         &format!("{prefix}.pre_feedforward_layernorm"),
@@ -1357,12 +1405,6 @@ fn oracle_first_layer_rule_a(
     let up = engine.gemma_linear_probe("mlp.up_proj.weight", pre_ffn)?;
     let (activation, product) = engine.gemma_mlp_activation_probe(reference_gate, reference_up)?;
     let down = engine.gemma_linear_probe("mlp.down_proj.weight", reference_product)?;
-    let widen = |values: Vec<bf16>| {
-        values
-            .into_iter()
-            .map(|value| value.to_f32())
-            .collect::<Vec<_>>()
-    };
     let operand_stores = [
         ("mlp_gate_proj", widen(gate)),
         ("mlp_up_proj", widen(up)),
@@ -1391,7 +1433,7 @@ fn oracle_first_layer_rule_a(
         }
     }
     println!(
-        "GEMMA4_ORACLE_FIRST_LAYER first_beyond={first_beyond:?} mlp_operand_first_beyond={first_operand_beyond:?}"
+        "GEMMA4_ORACLE_FIRST_LAYER first_beyond={first_beyond:?} attention_operand_first_beyond={first_attention_beyond:?} mlp_operand_first_beyond={first_operand_beyond:?}"
     );
     Ok(())
 }
