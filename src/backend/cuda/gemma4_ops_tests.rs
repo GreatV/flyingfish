@@ -1011,7 +1011,7 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
     for head in 0..hkv {
         for row in 0..rows {
             let base = row * q_stride + q_width + kv_width + head * d;
-            raw_v.extend_from_slice(&raw[base..base + d]);
+            raw_v.extend(raw[base..base + d].iter().map(|v| bf16::from_f32(*v)));
         }
     }
     let raw_stats = Stats::new(&raw_v, reference_v)?;
