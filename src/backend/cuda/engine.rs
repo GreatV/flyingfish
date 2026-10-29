@@ -1963,7 +1963,9 @@ impl Engine {
                 mask: crate::backend::Mask::Causal,
             },
             None,
-        )
+        )?;
+        self.position += ids.len();
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1986,7 +1988,9 @@ impl Engine {
                 prefix: "",
                 skip: 0,
             }),
-        )
+        )?;
+        self.position += ids.len();
+        Ok(())
     }
 
     #[cfg(test)]
@@ -2002,7 +2006,9 @@ impl Engine {
                 mask: crate::backend::Mask::Causal,
             },
             None,
-        )
+        )?;
+        self.position += 1;
+        Ok(())
     }
 
     #[cfg(test)]
