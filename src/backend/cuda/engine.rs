@@ -2071,7 +2071,7 @@ impl Engine {
             .gemma_logits(&self.device.stream, row, self.model_spec.vocab as usize)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn gemma_linear_plan_receipt(&self) -> Result<serde_json::Value> {
         self.blas.bound_plan_receipt()
     }

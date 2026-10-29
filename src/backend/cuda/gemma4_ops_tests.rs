@@ -1447,20 +1447,23 @@ fn oracle_first_layer_rule_a(
     };
     let norm1 = reference_bf16(reference_layers, &format!("{prefix}.input_layernorm"))?;
     let k_projection = engine.gemma_linear_probe("self_attn.k_proj.weight", norm1)?;
-    let plans = engine.gemma_linear_plan_receipt()?;
-    for output in [256usize, 2048] {
-        let selected: Vec<_> = plans["lt"]
-            .as_array()
-            .context("Lt plan list missing")?
-            .iter()
-            .filter(|plan| {
-                plan["rows"] == rows && plan["output"] == output && plan["input"] == 1536
-            })
-            .collect();
-        println!(
-            "GEMMA4_LINEAR_PLAN rows={rows} output={output} input=1536 {}",
-            serde_json::to_string(&selected)?
-        );
+    #[cfg(feature = "cuda")]
+    {
+        let plans = engine.gemma_linear_plan_receipt()?;
+        for output in [256usize, 2048] {
+            let selected: Vec<_> = plans["lt"]
+                .as_array()
+                .context("Lt plan list missing")?
+                .iter()
+                .filter(|plan| {
+                    plan["rows"] == rows && plan["output"] == output && plan["input"] == 1536
+                })
+                .collect();
+            println!(
+                "GEMMA4_LINEAR_PLAN rows={rows} output={output} input=1536 {}",
+                serde_json::to_string(&selected)?
+            );
+        }
     }
     let model_dir = std::path::PathBuf::from(
         std::env::var_os("FF_MODEL").context("FF_MODEL missing for K rule B")?,
