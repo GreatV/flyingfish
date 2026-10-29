@@ -1,4 +1,6 @@
 use crate::backend::gpu::CudaSlice;
+#[cfg(feature = "cuda")]
+use crate::backend::gpu::{CudaFunction, PushKernelArg};
 use crate::backend::gpu::{
     CudaContext, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, PinnedHostSlice, ValidAsZeroBits,
 };
@@ -298,6 +300,56 @@ impl RingCopy<'_> {
             lengths,
             [self.heads, self.head_dim],
         )
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn run_dynamic(
+        self,
+        function: &CudaFunction,
+        position: &CudaSlice<i32>,
+        rows: usize,
+        to_ring: bool,
+    ) -> Result<()> {
+        ensure!(position.len() == 1, "dynamic ring position must be scalar");
+        ensure!(rows > 0, "dynamic ring copy requires query rows");
+        ensure!(
+            self.heads > 0 && self.head_dim > 0,
+            "dynamic ring copy requires nonzero head geometry"
+        );
+        for (capacity, len) in [
+            (self.source_capacity, self.source.len()),
+            (self.target_capacity, self.target.len()),
+        ] {
+            ensure!(
+                capacity
+                    .checked_mul(self.head_dim)
+                    .and_then(|n| n.checked_mul(self.heads))
+                    .is_some_and(|n| n <= len && n <= i32::MAX as usize),
+                "dynamic ring copy geometry exceeds buffer"
+            );
+        }
+        let ring = if to_ring {
+            self.target_capacity
+        } else {
+            self.source_capacity
+        };
+        let (src, _src) = self.source.device_ptr(self.stream);
+        let (dst, _dst) = self.target.device_ptr_mut(self.stream);
+        unsafe {
+            self.stream
+                .launch_builder(function)
+                .arg(&src)
+                .arg(&dst)
+                .arg(position)
+                .arg(&i32::try_from(rows)?)
+                .arg(&i32::try_from(self.source_capacity)?)
+                .arg(&i32::try_from(self.target_capacity)?)
+                .arg(&i32::try_from(self.heads)?)
+                .arg(&i32::try_from(self.head_dim)?)
+                .arg(&i32::from(to_ring))
+                .launch(super::ops::flat(self.heads * ring * self.head_dim))?;
+        }
+        Ok(())
     }
 }
 

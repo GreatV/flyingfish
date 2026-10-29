@@ -161,10 +161,10 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
                              : ((q_heads == 16 && kv_heads == 2) ||
                                 (q_heads == 32 && kv_heads == 4));
     if (!shape || (!TABLE && dim != 128) || (TABLE && !table) || rows < 1 || rows > 65535 ||
-        *start < 0 || cache_start < -1 ||
+        *start < 0 || cache_start < -2 ||
         (ring_tokens == 0 && cache_start < 0 && *start + rows > capacity) ||
         (ring_tokens == 0 && cache_start >= 0 && cache_start + rows > capacity) ||
-        (ring_tokens > 0 && cache_start >= 0))
+        (ring_tokens > 0 && cache_start >= 0) || (!TABLE && cache_start == -2))
         __trap();
     __shared__ float smem[32];
     const int heads = q_heads + 2 * kv_heads;
@@ -188,9 +188,11 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
         base = (size_t)row * heads * dim + (size_t)head * dim;
     }
     const int position = *start + row;
-    const int cache_pos = ring_tokens > 0
-                              ? position % ring_tokens
-                              : (cache_start < 0 ? position : cache_start + row);
+    const int cache_pos = ring_tokens > 0 && cache_start == -2
+                              ? min(position, ring_tokens) + row
+                              : ring_tokens > 0
+                                  ? position % ring_tokens
+                                  : (cache_start < 0 ? position : cache_start + row);
 
     if (head < q_heads + kv_heads) {
         const __nv_bfloat16* w = (head < q_heads) ? q_norm_w : k_norm_w;
@@ -455,4 +457,35 @@ extern "C" __global__ void rope_pair_tail(
   const float b = __bfloat162float(x[d + 1]);
   x[d] = __float2bfloat16_rn(a * c - b * s);
   x[d + 1] = __float2bfloat16_rn(a * s + b * c);
+}
+
+extern "C" __global__ void dynamic_ring_copy(const __nv_bfloat16* source,
+                                              __nv_bfloat16* target,
+                                              const int* position, int rows,
+                                              int source_capacity, int target_capacity,
+                                              int heads, int dim, int to_ring) {
+    const int ring = to_ring ? target_capacity : source_capacity;
+    const int absolute = *position;
+    const int history = min(absolute, ring);
+    int count, source_start, target_start;
+    if (to_ring) {
+        const int end = history + rows;
+        count = min(end, ring);
+        source_start = end - count;
+        target_start = absolute + rows - count;
+    } else {
+        count = history;
+        source_start = absolute - history;
+        target_start = 0;
+    }
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= heads * ring * dim) return;
+    const int head = i / (ring * dim);
+    const int row = (i / dim) % ring;
+    const int d = i % dim;
+    if (row >= count) return;
+    const int source_row = to_ring ? source_start + row : (source_start + row) % source_capacity;
+    const int target_row = to_ring ? (target_start + row) % target_capacity : target_start + row;
+    target[((size_t)head * target_capacity + target_row) * dim + d] =
+        source[((size_t)head * source_capacity + source_row) * dim + d];
 }

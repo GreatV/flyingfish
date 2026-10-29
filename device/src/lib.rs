@@ -32,7 +32,7 @@ pub struct Attention {
 #[inline(always)]
 unsafe fn resolve_position(mut p: Attention) -> Attention {
     if !p.position.is_null() {
-        unsafe { p.start = *p.position };
+        unsafe { p.start = core::cmp::min(*p.position, p.start) };
     }
     p
 }

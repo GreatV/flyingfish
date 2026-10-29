@@ -564,6 +564,7 @@ struct GemmaOps {
     softcap: CudaFunction,
     gated_activation: CudaFunction,
     rope: CudaFunction,
+    ring_copy: CudaFunction,
     branch_add: CudaFunction,
     multiply: CudaFunction,
     per_layer: CudaFunction,
@@ -1317,6 +1318,10 @@ impl Runtime {
                     .as_ref()
                     .context("table RoPE module missing")?
                     .load_function("qknorm_rope_table_kv")?,
+                ring_copy: rope_module
+                    .as_ref()
+                    .context("table RoPE module missing")?
+                    .load_function("dynamic_ring_copy")?,
                 branch_add: cubin::module(&engine.device.ctx, "q38_common")?
                     .load_function("rms_branch_add")?,
                 multiply: act.load_function("multiply")?,
@@ -4339,7 +4344,8 @@ impl Engine {
                 let state_index = layout.state_index as usize;
                 let ring = self.state.kv_ring(state_index)?;
                 let sliding = layout.sliding_window.is_some();
-                let overflow = sliding && self.position + rows > ring;
+                let decode = phase == ExecutionPhase::Decode;
+                let overflow = sliding && (decode || self.position + rows > ring);
                 let history = if overflow { self.position.min(ring) } else { 0 };
                 let cache_capacity = if overflow {
                     ring + self.workspace_rows
@@ -4353,10 +4359,10 @@ impl Engine {
                             .kv_scratch
                             .as_mut()
                             .context("sliding KV staging is not bound")?;
-                        if history > 0 {
+                        if history > 0 || decode {
                             for (source, target) in [(&kv.k, &mut *stage_k), (&kv.v, &mut *stage_v)]
                             {
-                                super::super::copy::RingCopy {
+                                let copy = super::super::copy::RingCopy {
                                     stream: s,
                                     source,
                                     target,
@@ -4364,14 +4370,18 @@ impl Engine {
                                     target_capacity: cache_capacity,
                                     heads: hkv,
                                     head_dim: d,
+                                };
+                                if decode {
+                                    copy.run_dynamic(&ops.ring_copy, &w.position, rows, false)?;
+                                } else {
+                                    copy.run(
+                                        (self.position - history) % ring,
+                                        0,
+                                        history,
+                                        true,
+                                        false,
+                                    )?;
                                 }
-                                .run(
-                                    (self.position - history) % ring,
-                                    0,
-                                    history,
-                                    true,
-                                    false,
-                                )?;
                             }
                         }
                         (stage_k, stage_v)
@@ -4380,7 +4390,14 @@ impl Engine {
                     };
                     let q_stride = q_width;
                     let prep_heads = if reader { 0 } else { hkv };
-                    let cache_start = if overflow { history as i32 } else { -1 };
+                    let cache_start = if overflow && decode {
+                        -2
+                    } else if overflow {
+                        history as i32
+                    } else {
+                        -1
+                    };
+                    let ring_tokens = if overflow && decode { ring as i32 } else { 0 };
                     if trace.is_some() && (all_layers(trace) || i == self.trace_layer) {
                         if self.graph.is_none() {
                             s.synchronize()?;
@@ -4414,7 +4431,7 @@ impl Engine {
                             .arg(&(prep_heads as i32))
                             .arg(&(d as i32))
                             .arg(&(cache_capacity as i32))
-                            .arg(&0i32)
+                            .arg(&ring_tokens)
                             .arg(&self.model_spec.rms_eps)
                             .arg(&(q_stride as u64))
                             .arg(&((linear_rows * q_width) as u64))
@@ -4448,7 +4465,13 @@ impl Engine {
                         &mut w.attn,
                         Shape {
                             rows,
-                            start: if overflow { history } else { self.position },
+                            start: if overflow && decode {
+                                ring
+                            } else if overflow {
+                                history
+                            } else {
+                                self.position
+                            },
                             q_heads: hq,
                             kv_heads: hkv,
                             capacity: cache_capacity,
@@ -4469,7 +4492,7 @@ impl Engine {
                     let source_start = end - keep;
                     let absolute_start = self.position + rows - keep;
                     for (source, target) in [(stage_k, &mut kv.k), (stage_v, &mut kv.v)] {
-                        super::super::copy::RingCopy {
+                        let copy = super::super::copy::RingCopy {
                             stream: s,
                             source,
                             target,
@@ -4477,14 +4500,12 @@ impl Engine {
                             target_capacity: ring,
                             heads: hkv,
                             head_dim: d,
+                        };
+                        if decode {
+                            copy.run_dynamic(&ops.ring_copy, &w.position, rows, true)?;
+                        } else {
+                            copy.run(source_start, absolute_start % ring, keep, false, true)?;
                         }
-                        .run(
-                            source_start,
-                            absolute_start % ring,
-                            keep,
-                            false,
-                            true,
-                        )?;
                     }
                 }
                 layer.linear.run(
