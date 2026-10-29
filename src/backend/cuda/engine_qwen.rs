@@ -5119,12 +5119,41 @@ impl Engine {
             matrix(&w.x, s, 0, linear_rows, h)?,
             &mut TensorMut(matrix(&w.gu, s, 0, linear_rows, width)?),
         )?;
+        if all_layers(trace) || i == self.trace_layer {
+            trace_value(
+                trace,
+                s,
+                &debug_name(trace, i, "ple_gate"),
+                &w.gu,
+                rows,
+                width,
+            )?;
+        }
         q.common.gate.gelu(
             s,
             heads(&w.gu, s, 0, rows, 1, width as u32)?,
             &mut TensorMut(heads(&w.act, s, 0, rows, 1, width as u32)?),
             crate::backend::cuda::ops::GeluMode::Tanh,
         )?;
+        if all_layers(trace) || i == self.trace_layer {
+            trace_value(
+                trace,
+                s,
+                &debug_name(trace, i, "ple_act"),
+                &w.act,
+                rows,
+                width,
+            )?;
+            trace_value(
+                trace,
+                s,
+                &debug_name(trace, i, "ple_identity"),
+                &ops.per_layer_inputs
+                    .slice(i * linear_rows * width..(i + 1) * linear_rows * width),
+                rows,
+                width,
+            )?;
+        }
         unsafe {
             s.launch_builder(&ops.multiply)
                 .arg(&w.act)
@@ -5135,6 +5164,16 @@ impl Engine {
                 .arg(&mut w.gu)
                 .arg(&((rows * width) as i32))
                 .launch(flat(rows * width))?;
+        }
+        if all_layers(trace) || i == self.trace_layer {
+            trace_value(
+                trace,
+                s,
+                &debug_name(trace, i, "ple_product"),
+                &w.gu,
+                rows,
+                width,
+            )?;
         }
         layer.linear.run(
             &self.blas,
