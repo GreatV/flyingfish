@@ -1209,6 +1209,13 @@ impl Blas {
                     "BF16 linear requires row-major weight"
                 );
                 if (1..=self.invariant_rows.max(invariant_rows)).contains(&(x.shape[0] as usize)) {
+                    #[cfg(test)]
+                    if std::env::var_os("FF_ORACLE_ROWS").is_some() {
+                        eprintln!(
+                            "GEMMA4_LINEAR_LAUNCH backend=skinny phase={phase:?} rows={} output={} input={}",
+                            x.shape[0], w.shape[0], w.shape[1]
+                        );
+                    }
                     return self.skinny_raw(
                         w.ptr,
                         x.ptr,
@@ -1234,6 +1241,13 @@ impl Blas {
                             x.shape[0], w.shape[0], w.shape[1]
                         )
                     })?;
+                #[cfg(test)]
+                if std::env::var_os("FF_ORACLE_ROWS").is_some() {
+                    eprintln!(
+                        "GEMMA4_LINEAR_LAUNCH backend=lt phase={phase:?} rows={} output={} input={}",
+                        x.shape[0], w.shape[0], w.shape[1]
+                    );
+                }
                 let alpha = 1f32;
                 let beta = 0f32;
                 let (workspace, _guard) = self.workspace.device_ptr(&self.stream);

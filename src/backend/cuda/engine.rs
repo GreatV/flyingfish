@@ -2072,6 +2072,11 @@ impl Engine {
     }
 
     #[cfg(test)]
+    pub(crate) fn gemma_linear_plan_receipt(&self) -> Result<serde_json::Value> {
+        self.blas.bound_plan_receipt()
+    }
+
+    #[cfg(test)]
     pub(crate) fn gemma_final_probe(&mut self, input: &[bf16]) -> Result<Vec<bf16>> {
         let width = self.model_spec.hidden as usize;
         ensure!(
@@ -2156,6 +2161,65 @@ impl Engine {
         self.device
             .stream
             .clone_dtoh(&self.work.x.slice(..input.len()))
+            .map_err(Into::into)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gemma_first_layer_decode_probe(
+        &mut self,
+        ids: &[u32],
+        row: usize,
+        input: &[bf16],
+        trace: &mut crate::trace::Trace,
+    ) -> Result<Vec<bf16>> {
+        let width = self.model_spec.hidden as usize;
+        ensure!(
+            row < ids.len() && input.len() == ids.len() * width,
+            "Gemma first-layer decode probe extent"
+        );
+        if row == 0 {
+            self.reset()?;
+        } else {
+            let mut prefix_trace = crate::trace::Trace::default();
+            self.gemma_first_layer_probe(&ids[..row], &input[..row * width], &mut prefix_trace)?;
+        }
+        self.position = row;
+        self.set_token(ids[row])?;
+        self.device
+            .stream
+            .memcpy_htod(&[row as i32], &mut self.work.position)?;
+        self.device
+            .stream
+            .memcpy_htod(&[(row + 1) as i32], &mut self.work.length)?;
+        self.state.set_sequence(
+            &self.device.stream,
+            row as u32,
+            1,
+            self.workspace_rows as u32,
+        )?;
+        let step = crate::backend::Step {
+            rows: 1,
+            input: crate::backend::Input::Token,
+            head: Head::None,
+            mask: crate::backend::Mask::Causal,
+        };
+        self.run_operator(crate::backend::Operator::Embed, 0, step, &mut None)?;
+        self.device.stream.memcpy_htod(
+            &input[row * width..(row + 1) * width],
+            &mut self.work.x.slice_mut(..width),
+        )?;
+        self.run_layer(
+            0,
+            step,
+            &mut Some(Target {
+                trace,
+                prefix: "layer_rule_a",
+                skip: 0,
+            }),
+        )?;
+        self.device
+            .stream
+            .clone_dtoh(&self.work.x.slice(..width))
             .map_err(Into::into)
     }
 

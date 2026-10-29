@@ -1127,6 +1127,71 @@ fn oracle_store_distance(
     Ok(beyond)
 }
 
+fn k_projection_rule_b(
+    candidate: &[bf16],
+    input: &[bf16],
+    reference: &[bf16],
+    weight: &[bf16],
+    row: usize,
+) -> Result<()> {
+    let hidden = 1536usize;
+    let width = 256usize;
+    ensure!(
+        candidate.len() == reference.len()
+            && candidate.len().is_multiple_of(width)
+            && input.len() == candidate.len() / width * hidden
+            && weight.len() == width * hidden
+            && row < candidate.len() / width,
+        "K projection rule-B extent"
+    );
+    let gamma = hidden as f64 * 2f64.powi(-24);
+    let mut differing = 0usize;
+    let mut outside = [0usize; 2];
+    let mut max_excess = 0.0f64;
+    let mut max_excess_index = 0usize;
+    for column in 0..width {
+        let index = row * width + column;
+        if candidate[index].to_bits() == reference[index].to_bits() {
+            continue;
+        }
+        differing += 1;
+        let mut sum = 0.0f64;
+        let mut absolute = 0.0f64;
+        for k in 0..hidden {
+            let product = input[row * hidden + k].to_f64() * weight[column * hidden + k].to_f64();
+            sum += product;
+            absolute += product.abs();
+        }
+        let interval = gamma * absolute;
+        let low = bf16::from_f64(sum - interval).to_f64();
+        let high = bf16::from_f64(sum + interval).to_f64();
+        let candidate_value = candidate[index].to_f64();
+        let reference_value = reference[index].to_f64();
+        let candidate_inside = candidate_value >= low && candidate_value <= high;
+        let reference_inside = reference_value >= low && reference_value <= high;
+        outside[0] += usize::from(!candidate_inside);
+        outside[1] += usize::from(!reference_inside);
+        let excess = (low - candidate_value)
+            .max(candidate_value - high)
+            .max(low - reference_value)
+            .max(reference_value - high)
+            .max(0.0);
+        if excess > max_excess {
+            max_excess = excess;
+            max_excess_index = column;
+        }
+        println!(
+            "GEMMA4_K_RULE_B row={row} index={column} candidate={candidate_value} reference={reference_value} fp64_sum={sum} fp64_bf16={} interval_low={low} interval_high={high} candidate_inside={candidate_inside} reference_inside={reference_inside} excess={excess}",
+            bf16::from_f64(sum).to_f64()
+        );
+    }
+    println!(
+        "GEMMA4_K_RULE_B_SUMMARY row={row} differing={differing} candidate_outside={} reference_outside={} max_excess={max_excess} max_excess_index={max_excess_index}",
+        outside[0], outside[1]
+    );
+    Ok(())
+}
+
 fn row_nll(values: impl Iterator<Item = f32> + Clone, target: f32) -> f64 {
     let peak = values.clone().fold(f32::NEG_INFINITY, f32::max);
     let sum = values.map(|value| (value - peak).exp() as f64).sum::<f64>();
@@ -1360,15 +1425,39 @@ fn oracle_first_layer_rule_a(
             .collect::<Vec<_>>()
     };
     let norm1 = reference_bf16(reference_layers, &format!("{prefix}.input_layernorm"))?;
+    let k_projection = engine.gemma_linear_probe("self_attn.k_proj.weight", norm1)?;
+    let plans = engine.gemma_linear_plan_receipt()?;
+    for output in [256usize, 2048] {
+        let selected: Vec<_> = plans["lt"]
+            .as_array()
+            .context("Lt plan list missing")?
+            .iter()
+            .filter(|plan| {
+                plan["rows"] == rows && plan["output"] == output && plan["input"] == 1536
+            })
+            .collect();
+        println!(
+            "GEMMA4_LINEAR_PLAN rows={rows} output={output} input=1536 {}",
+            serde_json::to_string(&selected)?
+        );
+    }
+    let model_dir = std::path::PathBuf::from(
+        std::env::var_os("FF_MODEL").context("FF_MODEL missing for K rule B")?,
+    );
+    let k_weight = checkpoint_tensor(
+        &model_dir,
+        "model.language_model.layers.0.self_attn.k_proj.weight",
+    )?;
+    let reference_k = reference_bf16(reference_layers, &format!("{prefix}.k_proj"))?;
+    for row in selected_rows {
+        k_projection_rule_b(&k_projection, norm1, reference_k, &k_weight, *row)?;
+    }
     let attention_stores = [
         (
             "q_proj",
             widen(engine.gemma_linear_probe("self_attn.q_proj.weight", norm1)?),
         ),
-        (
-            "k_proj",
-            widen(engine.gemma_linear_probe("self_attn.k_proj.weight", norm1)?),
-        ),
+        ("k_proj", widen(k_projection)),
         (
             "v_proj",
             widen(engine.gemma_linear_probe("self_attn.v_proj.weight", norm1)?),
