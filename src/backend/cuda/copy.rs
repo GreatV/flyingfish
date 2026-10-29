@@ -260,7 +260,6 @@ pub struct RingCopy<'a> {
     pub head_dim: usize,
 }
 
-#[cfg(test)]
 pub(crate) struct RingCopyCall {
     pub(crate) src: u64,
     pub(crate) dst: u64,
@@ -361,7 +360,6 @@ impl RingCopy<'_> {
     }
 }
 
-#[cfg(test)]
 impl RingCopyCall {
     fn run(
         self,
