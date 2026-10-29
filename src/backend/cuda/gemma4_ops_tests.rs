@@ -665,7 +665,7 @@ fn proportional_and_default_rope_tables_match_the_definition_gpu() -> Result<()>
             println!("GEMMA4_ROPE_TABLE {}", stats.line(&format!("{tag}.{name}")));
             defects += usize::from(!stats.passes());
         }
-        let table_device = s.clone_htod(&table)?;
+        let table_device = s.clone_htod(&table.repeat(2))?;
         let run = |table: &cudarc::driver::CudaSlice<bf16>,
                    x: &[bf16],
                    heads: usize|
