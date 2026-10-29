@@ -5035,7 +5035,17 @@ impl Engine {
         );
         let rows = input.len() / hidden;
         let x = s.clone_htod(input)?;
-        let output_width = self.model_spec.q_width as usize;
+        let output_width = match role {
+            "self_attn.q_proj.weight" => self.model_spec.q_width as usize,
+            "self_attn.k_proj.weight" | "self_attn.v_proj.weight" => {
+                self.model_spec.kv_heads as usize
+                    * self.model_spec.layers[0]
+                        .geometry
+                        .context("Gemma 4 attention geometry missing")?
+                        .head_dim as usize
+            }
+            _ => anyhow::bail!("unsupported Gemma linear probe role {role}"),
+        };
         let y = s.alloc_zeros(rows * output_width)?;
         layer.linear.run(
             &self.blas,
