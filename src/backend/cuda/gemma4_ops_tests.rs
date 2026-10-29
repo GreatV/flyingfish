@@ -1015,8 +1015,8 @@ fn oracle_layer_distance(
     let (mut candidate_sq, mut reference_sq) = (0.0f64, 0.0f64);
     for ((candidate, oracle), reference) in candidate_values
         .iter()
-        .zip(&oracle_values)
-        .zip(&reference_values)
+        .zip(oracle_values)
+        .zip(reference_values)
     {
         let candidate_delta = f64::from(*candidate - *oracle);
         let reference_delta = f64::from(*reference - *oracle);
