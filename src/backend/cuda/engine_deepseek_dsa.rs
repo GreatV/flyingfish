@@ -973,3 +973,706 @@ impl Binding<'_> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(serde::Deserialize)]
+    struct Pool {
+        owner: usize,
+        ratio: usize,
+        values: Vec<f32>,
+        scores: Vec<f32>,
+        pooled: Vec<u16>,
+        bound: f64,
+    }
+    #[derive(serde::Deserialize)]
+    struct Codec {
+        owner: usize,
+        kind: String,
+        codes: Vec<u8>,
+        scales: Vec<u8>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Index {
+        owner: usize,
+        keys: Vec<u8>,
+        key_scales: Vec<u8>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Record {
+        reference_only: bool,
+        candidate_seen: bool,
+        compressions: Vec<Pool>,
+        codecs: Vec<Codec>,
+        indexes: Vec<Index>,
+    }
+
+    fn spec() -> Result<ModelSpec> {
+        ModelSpec::deepseek_v41(
+            &serde_json::from_str(include_str!(
+                "../../../tests/data/deepseek41-flash-config.json"
+            ))?,
+            &serde_json::Value::Null,
+        )
+    }
+
+    struct PublicationFixture<'a> {
+        record: &'a Record,
+        owner: usize,
+        width: usize,
+        graph: bool,
+    }
+    fn publication_case(
+        ctx: &Arc<CudaContext>,
+        fixture: PublicationFixture<'_>,
+    ) -> Result<(usize, usize)> {
+        let PublicationFixture {
+            record,
+            owner,
+            width,
+            graph,
+        } = fixture;
+        let s = ctx.new_stream()?;
+        let spec = spec()?;
+        let mut state = LatentCompressedState::new(&spec, 136, width, &s)?;
+        let pool = record
+            .compressions
+            .iter()
+            .find(|v| v.owner == owner)
+            .context("pool fixture absent")?;
+        let codec = record
+            .codecs
+            .iter()
+            .find(|v| v.owner == owner && v.kind == "compressed_kv")
+            .context("codec fixture absent")?;
+        let keys = record
+            .indexes
+            .iter()
+            .find(|v| v.owner == owner)
+            .context("index fixture absent")?;
+        let mut metadata = s.clone_htod(&[0i32, 1, 1, 136, 1, 0, 0, 0])?;
+        let seq = SeqRef {
+            ptr: metadata.device_ptr(&s).0,
+        };
+        let mut scratch = Scratch::new(&s, width, 136)?;
+        let frequency = s.clone_htod(&rotary_inv_freq(
+            &spec,
+            spec.deepseek_v41.as_ref().unwrap(),
+            pool.ratio as u8,
+        )?)?;
+        let kv = state
+            .kv
+            .iter()
+            .find(|v| v.owner == owner)
+            .context("owner absent")?;
+        let module = crate::backend::cuda::cubin::module(ctx, "latent_compress")?;
+        let begin = module.load_function("latent_publication_begin")?;
+        let commit = module.load_function("latent_publication_commit")?;
+        let ticket_kernel = module.load_function("latent_selection_ticket")?;
+        let p = Publication {
+            sequence: seq,
+            generation: state.generation.device_ptr(&s).0,
+            ticket: kv.ticket.device_ptr(&s).0,
+            cursor: kv.cursor.device_ptr(&s).0,
+            count: kv.count.device_ptr(&s).0,
+            groups: scratch.group_meta.device_ptr(&s).0,
+            frequencies: frequency.device_ptr(&s).0,
+            angles: scratch.group_angles.device_ptr(&s).0,
+            payload: [
+                scratch.kv_codes.device_ptr(&s).0,
+                scratch.kv_scales.device_ptr(&s).0,
+                scratch.key_codes.device_ptr(&s).0,
+                scratch.key_scales.device_ptr(&s).0,
+            ],
+            cache: [
+                kv.codes.device_ptr(&s).0,
+                kv.scales.device_ptr(&s).0,
+                kv.index_codes.device_ptr(&s).0,
+                kv.index_scales.device_ptr(&s).0,
+            ],
+            owner: owner as i32,
+            ratio: pool.ratio as i32,
+            rows: width as i32,
+            capacity: (kv.codes.len() / 256) as i32,
+        };
+        let compress = if pool.ratio == 2 {
+            Some(LatentCompressPlan::new(
+                ctx,
+                CompressionInputs {
+                    values: dense(&scratch.values, &s, [width as u32, 512])?,
+                    scores: dense(&scratch.gates, &s, [width as u32, 512])?,
+                    sequence: seq,
+                },
+                CompressionBuffers {
+                    tail_values: dense(&kv.tail_values, &s, [2, 512])?,
+                    tail_scores: dense(&kv.tail_scores, &s, [2, 512])?,
+                    cursor: dense(&kv.cursor, &s, [1])?,
+                    pooled: dense(&scratch.pooled, &s, [width.div_ceil(2) as u32, 512])?,
+                },
+            )?)
+        } else {
+            None
+        };
+        let tickets = state
+            .index
+            .iter()
+            .filter(|v| state.owners[v.owner].is_some_and(|m| m.kv == owner))
+            .map(|v| Ticket {
+                sequence: seq,
+                generation: p.generation,
+                kv: p.ticket,
+                index: v.ticket.device_ptr(&s).0,
+                owners: LatentOwners {
+                    kv: owner,
+                    index: v.owner,
+                    ratio: pool.ratio,
+                },
+            })
+            .collect::<Vec<_>>();
+        let launch = || -> Result<()> {
+            p.begin(&s, &begin)?;
+            if let Some(compress) = &compress {
+                compress.run(&s)?;
+            }
+            p.commit(&s, &commit)?;
+            for ticket in &tickets {
+                ticket.run(&s, &ticket_kernel, 1)?;
+                ticket.run(&s, &ticket_kernel, 0)?;
+            }
+            Ok(())
+        };
+        let captured = if graph {
+            s.begin_capture(
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )?;
+            launch()?;
+            Some(
+                s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
+                    .context("publication graph absent")?,
+            )
+        } else {
+            None
+        };
+        let mut cases = 0;
+        let mut defects = 0;
+        for repeat in 0..2 {
+            state.reset(&s)?;
+            for position in (0..129).step_by(width) {
+                let rows = width.min(129 - position);
+                let first = position / pool.ratio;
+                let end = (position + rows) / pool.ratio;
+                s.memcpy_htod(
+                    &[
+                        position as i32,
+                        rows as i32,
+                        (position + rows) as i32,
+                        136,
+                        1,
+                        0,
+                        0,
+                        0,
+                    ],
+                    &mut metadata,
+                )?;
+                let mut values = vec![0.0f32; width * 512];
+                values[..rows * 512]
+                    .copy_from_slice(&pool.values[position * 512..(position + rows) * 512]);
+                s.memcpy_htod(&values, &mut scratch.values)?;
+                if pool.ratio == 2 {
+                    let mut scores = vec![0.0f32; width * 512];
+                    scores[..rows * 512]
+                        .copy_from_slice(&pool.scores[position * 512..(position + rows) * 512]);
+                    s.memcpy_htod(&scores, &mut scratch.gates)?;
+                }
+                for (source, destination, stride) in [
+                    (&codec.codes, &mut scratch.kv_codes, 256),
+                    (&codec.scales, &mut scratch.kv_scales, 32),
+                    (&keys.keys, &mut scratch.key_codes, 64),
+                    (&keys.key_scales, &mut scratch.key_scales, 4),
+                ] {
+                    let mut bytes = vec![0; destination.len()];
+                    bytes[..(end - first) * stride]
+                        .copy_from_slice(&source[first * stride..end * stride]);
+                    s.memcpy_htod(&bytes, destination)?;
+                }
+                if let Some(graph) = &captured {
+                    graph.launch()?;
+                } else {
+                    launch()?;
+                }
+                let kv = state.kv.iter().find(|v| v.owner == owner).unwrap();
+                ensure!(
+                    s.clone_dtoh(&kv.count)? == [end as u32]
+                        && s.clone_dtoh(&kv.cursor)? == [(position + rows) as u32],
+                    "publication count/cursor DEFECT"
+                );
+                let generation = s.clone_dtoh(&state.generation)?[0];
+                ensure!(
+                    s.clone_dtoh(&kv.ticket)?
+                        == [
+                            owner as u32,
+                            generation,
+                            (position + rows) as u32,
+                            end as u32
+                        ],
+                    "publication ticket DEFECT"
+                );
+                for (expected, actual, stride) in [
+                    (&codec.codes, &kv.codes, 256),
+                    (&codec.scales, &kv.scales, 32),
+                    (&keys.keys, &kv.index_codes, 64),
+                    (&keys.key_scales, &kv.index_scales, 4),
+                ] {
+                    let got = s.clone_dtoh(actual)?;
+                    ensure!(
+                        got[..end * stride] == expected[..end * stride],
+                        "published native cache bytes DEFECT owner{owner} position{position}"
+                    );
+                    ensure!(
+                        got[end * stride..].iter().all(|&v| v == 0) || repeat > 0,
+                        "publication wrote beyond committed capacity"
+                    );
+                }
+                if pool.ratio == 2 {
+                    let got = s.clone_dtoh(&scratch.pooled)?;
+                    for (value, want) in got[..(end - first) * 512]
+                        .iter()
+                        .zip(&pool.pooled[first * 512..end * 512])
+                    {
+                        defects += usize::from(
+                            f64::from((value.to_f32() - bf16::from_bits(*want).to_f32()).abs())
+                                > pool.bound,
+                        );
+                    }
+                    for (tail, values) in [
+                        (&kv.tail_values, &pool.values),
+                        (&kv.tail_scores, &pool.scores),
+                    ] {
+                        let actual = s.clone_dtoh(tail)?;
+                        for parity in 0..2 {
+                            let last = (0..position + rows).rev().find(|p| p % 2 == parity);
+                            if let Some(last) = last {
+                                ensure!(
+                                    actual[parity * 512..(parity + 1) * 512]
+                                        == values[last * 512..(last + 1) * 512],
+                                    "publication tail DEFECT"
+                                );
+                            }
+                        }
+                    }
+                }
+                cases += 1;
+            }
+        }
+        println!(
+            "DSA_PUBLICATION owner={owner} width={width} graph={graph} cases={cases} defects={defects} reset_repeats=2"
+        );
+        Ok((cases, defects))
+    }
+
+    fn trap_control(kind: &str) -> Result<()> {
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        let spec = spec()?;
+        let mut state = LatentCompressedState::new(&spec, 136, 1, s)?;
+        let mut meta = s.clone_htod(&[2i32, 1, 3, 136, 1, 0, 0, 0])?;
+        let seq = SeqRef {
+            ptr: meta.device_ptr(s).0,
+        };
+        let module = crate::backend::cuda::cubin::module(&device.ctx, "latent_compress")?;
+        let kv = &mut state.kv[0];
+        s.memcpy_htod(&[2, 1, 3, 1], &mut kv.ticket)?;
+        s.memcpy_htod(&[1], &mut kv.count)?;
+        s.memcpy_htod(&[3], &mut kv.cursor)?;
+        let index = &mut state.index[0];
+        s.memcpy_htod(&[2, 2, 1, 2, 3], &mut index.ticket)?;
+        println!("DSA_CONTROL_ARMED kind={kind}");
+        if kind == "stale-cursor" {
+            s.memcpy_htod(&[2, 1, 2, 1], &mut kv.ticket)?;
+            s.memcpy_htod(&[2, 1, 3, 136, 1, 0, 0, 0], &mut meta)?;
+            let scratch = Scratch::new(s, 1, 136)?;
+            let frequencies = s.clone_htod(&[1.0f32; 32])?;
+            let p = Publication {
+                sequence: seq,
+                generation: state.generation.device_ptr(s).0,
+                ticket: kv.ticket.device_ptr(s).0,
+                cursor: kv.cursor.device_ptr(s).0,
+                count: kv.count.device_ptr(s).0,
+                groups: scratch.group_meta.device_ptr(s).0,
+                frequencies: frequencies.device_ptr(s).0,
+                angles: scratch.group_angles.device_ptr(s).0,
+                payload: [0; 4],
+                cache: [0; 4],
+                owner: 2,
+                ratio: 2,
+                rows: 1,
+                capacity: 68,
+            };
+            p.begin(s, &module.load_function("latent_publication_begin")?)?;
+        } else {
+            let owners = match kind {
+                "wrong-kv-owner" => LatentOwners {
+                    kv: 8,
+                    index: 2,
+                    ratio: 2,
+                },
+                "wrong-index-owner" => LatentOwners {
+                    kv: 2,
+                    index: 8,
+                    ratio: 2,
+                },
+                "stale-generation" => {
+                    s.memcpy_htod(&[2], &mut state.generation)?;
+                    LatentOwners {
+                        kv: 2,
+                        index: 2,
+                        ratio: 2,
+                    }
+                }
+                _ => anyhow::bail!("unknown DSA control"),
+            };
+            Ticket {
+                sequence: seq,
+                generation: state.generation.device_ptr(s).0,
+                kv: kv.ticket.device_ptr(s).0,
+                index: index.ticket.device_ptr(s).0,
+                owners,
+            }
+            .run(s, &module.load_function("latent_selection_ticket")?, 0)?;
+        }
+        s.synchronize()?;
+        anyhow::bail!("DSA control escaped device validation")
+    }
+
+    #[test]
+    #[ignore]
+    fn deepseek_dsa_publication_gpu() -> Result<()> {
+        ensure!(
+            std::env::var("FF_DS41_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        if let Ok(kind) = std::env::var("D1_DSA_CONTROL") {
+            return trap_control(&kind);
+        }
+        let record: Record =
+            serde_json::from_slice(&std::fs::read(std::env::var("D1_OP_REFERENCE")?)?)?;
+        ensure!(
+            record.reference_only && !record.candidate_seen,
+            "publication fixture not reference-only"
+        );
+        let ctx = CudaContext::new(0)?;
+        let mut cases = 0;
+        let mut defects = 0;
+        for owner in [2, 8, 14, 20] {
+            for width in [1, 5, 8] {
+                for graph in [false, true] {
+                    let (n, bad) = publication_case(
+                        &ctx,
+                        PublicationFixture {
+                            record: &record,
+                            owner,
+                            width,
+                            graph,
+                        },
+                    )?;
+                    cases += n;
+                    defects += bad;
+                }
+            }
+        }
+        for kind in [
+            "wrong-kv-owner",
+            "wrong-index-owner",
+            "stale-cursor",
+            "stale-generation",
+        ] {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "backend::cuda::engine::deepseek::dsa::tests::deepseek_dsa_publication_gpu",
+                    "--exact",
+                    "--include-ignored",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env("D1_DSA_CONTROL", kind)
+                .output()?;
+            let raw = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            println!("DSA_CONTROL {kind} rc={:?}\n{raw}", output.status.code());
+            ensure!(
+                !output.status.success()
+                    && raw.contains("DSA_CONTROL_ARMED")
+                    && raw.contains("CUDA_ERROR_LAUNCH_FAILED"),
+                "DSA control failed validity or escaped: {kind}"
+            );
+        }
+        println!("DSA_PUBLICATION_RESULT cases={cases} defects={defects} controls=4");
+        ensure!(defects == 0, "DSA publication DEFECT");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    #[derive(serde::Deserialize)]
+    struct LayerInput {
+        layer: usize,
+        input: Vec<u16>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Inputs {
+        reference_only: bool,
+        rows: usize,
+        width: usize,
+        layers: Vec<LayerInput>,
+    }
+
+    fn mixer_weights(
+        loader: &mut crate::backend::cuda::weights::Loader,
+        layer: usize,
+        g: &MixerGeometry,
+    ) -> Result<MixerWeights> {
+        let p = format!("layers.{layer}.attn");
+        let fp8 = |loader: &mut crate::backend::cuda::weights::Loader,
+                   name: &str,
+                   n: usize,
+                   k: usize|
+         -> Result<Fp8Projection> {
+            Ok(Fp8Projection {
+                codes: loader.load_bytes(
+                    &format!("{p}.{name}.weight"),
+                    &[n, k],
+                    safetensors::Dtype::F8_E4M3,
+                )?,
+                scale: loader.load_bytes(
+                    &format!("{p}.{name}.scale"),
+                    &[n.div_ceil(32), k.div_ceil(32)],
+                    safetensors::Dtype::F8_E8M0,
+                )?,
+            })
+        };
+        Ok(MixerWeights {
+            wq_a: fp8(loader, "wq_a", g.q_lora, g.hidden)?,
+            wq_b: fp8(loader, "wq_b", g.heads * g.head_dim, g.q_lora)?,
+            wkv: fp8(loader, "wkv", g.head_dim, g.hidden)?,
+            wo_b: fp8(loader, "wo_b", g.hidden, g.o_groups * g.o_rank)?,
+            q_norm: loader.load_bytes(
+                &format!("{p}.q_norm.weight"),
+                &[g.q_lora],
+                safetensors::Dtype::BF16,
+            )?,
+            kv_norm: loader.load_bytes(
+                &format!("{p}.kv_norm.weight"),
+                &[g.head_dim],
+                safetensors::Dtype::BF16,
+            )?,
+            attn_sink: loader.load_bytes(
+                &format!("{p}.attn_sink"),
+                &[g.heads],
+                safetensors::Dtype::F32,
+            )?,
+            wo_a: loader.load_bytes(
+                &format!("{p}.wo_a.weight"),
+                &[g.o_groups * g.o_rank, g.o_in],
+                safetensors::Dtype::F8_E4M3,
+            )?,
+            wo_a_scale: loader.load_bytes(
+                &format!("{p}.wo_a.scale"),
+                &[g.o_groups * g.o_rank / 32, g.o_in / 32],
+                safetensors::Dtype::F8_E8M0,
+            )?,
+        })
+    }
+
+    fn final_state(
+        state: &LatentCompressedState,
+        s: &Arc<CudaStream>,
+        last_rows: usize,
+    ) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        for kv in &state.kv {
+            let count = s.clone_dtoh(&kv.count)?[0] as usize;
+            for (data, width) in [
+                (&kv.codes, 256),
+                (&kv.scales, 32),
+                (&kv.index_codes, 64),
+                (&kv.index_scales, 4),
+            ] {
+                bytes.extend(s.clone_dtoh(&data.slice(..count * width))?);
+            }
+            for data in [&kv.tail_values, &kv.tail_scores] {
+                for value in s.clone_dtoh(data)? {
+                    bytes.extend(value.to_bits().to_le_bytes());
+                }
+            }
+            ensure!(
+                s.clone_dtoh(&kv.cursor)? == [129],
+                "live owner cursor missed a token"
+            );
+            ensure!(
+                count == 129 / kv.ratio,
+                "live owner committed count differs"
+            );
+        }
+        for selection in &state.index {
+            for value in s.clone_dtoh(
+                &selection
+                    .positions
+                    .slice((last_rows - 1) * 512..last_rows * 512),
+            )? {
+                bytes.extend(value.to_le_bytes());
+            }
+        }
+        Ok(bytes)
+    }
+
+    #[test]
+    #[ignore]
+    fn deepseek_dsa_live_chain_gpu() -> Result<()> {
+        ensure!(
+            std::env::var("FF_DS41_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let dir = std::env::var_os("F3_MODEL").context("F3_MODEL required")?;
+        let input: Inputs =
+            serde_json::from_slice(&std::fs::read(std::env::var("D1_LIVE_INPUTS")?)?)?;
+        ensure!(
+            input.reference_only && input.rows == 129 && input.width == 5120,
+            "live DSA fixture shape"
+        );
+        let expected = [2, 3, 8, 9, 14, 15, 20, 21, 24, 25, 28, 29, 32, 33, 36, 37];
+        ensure!(
+            input.layers.iter().map(|v| v.layer).eq(expected),
+            "live DSA owner/consumer fixture coverage"
+        );
+        ensure!(
+            input.layers.iter().all(|v| v.input.len() == 129 * 5120),
+            "live DSA input extent"
+        );
+        let root: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/data/deepseek41-flash-config.json"
+        ))?;
+        let spec = ModelSpec::deepseek_v41(&root, &serde_json::Value::Null)?;
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        let ops = Ops::new_with_swiglu_rounding(&device.ctx, spec.swiglu_rounding())?;
+        let runtime = PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime directory required")?,
+        );
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(crate::backend::cuda::closure::Closure::new(
+                false,
+                "DSA live gate".into(),
+            )),
+        )?;
+        blas.enable_fp8(&device.ctx)?;
+        let mut state = StateStore::new(&spec, 136, s)?;
+        state.compressed = Some(LatentCompressedState::new(&spec, 136, 8, s)?);
+        let mut mixer = DeepseekMixer::new(&device.ctx, s, &spec, 40, 8)?;
+        let mut work = Work::new(s, &spec, 8)?;
+        let checkpoint = crate::checkpoint::MappedCheckpoint::open(Path::new(&dir))?;
+        let manifest = checkpoint.manifest(&spec, crate::checkpoint::LoadPolicy::TextOnly)?;
+        let weights = crate::backend::cuda::weights::checkpoint_mapped(
+            &checkpoint,
+            &device,
+            Some(&manifest),
+            false,
+            |loader| {
+                let weights = load_weights(loader, &spec)?;
+                for layer in 0..40 {
+                    mixer.bind_layer(layer, mixer_weights(loader, layer, &mixer.geometry)?)?;
+                }
+                for (name, entry) in &manifest.entries {
+                    if entry.load
+                        && entry.scope == crate::checkpoint::TensorScope::Text
+                        && !name.contains(".attn.")
+                    {
+                        loader.defer(name)?;
+                    }
+                }
+                Ok(weights)
+            },
+        )?
+        .0;
+        mixer.dsa = Some(Runtime::new(
+            (&device, &blas, &spec, &state, &mixer, &work),
+            weights,
+        )?);
+        let mut baseline: Option<(Vec<Vec<u16>>, Vec<u8>)> = None;
+        let mut defects = 0;
+        let mut cases = 0;
+        for width in [1, 5, 8] {
+            for repeat in 0..2 {
+                state.reset(s)?;
+                let mut outputs = vec![Vec::<u16>::new(); input.layers.len()];
+                for position in (0..129).step_by(width) {
+                    let rows = width.min(129 - position);
+                    state.set_sequence(s, position as u32, rows as u32, 8)?;
+                    for (slot, layer) in input.layers.iter().enumerate() {
+                        let x = layer.input[position * 5120..(position + rows) * 5120]
+                            .iter()
+                            .copied()
+                            .map(bf16::from_bits)
+                            .collect::<Vec<_>>();
+                        s.memcpy_htod(&x, &mut work.n.slice_mut(..rows * 5120))?;
+                        mixer.run(
+                            s,
+                            &blas,
+                            &ops,
+                            state.latent_ring(layer.layer)?,
+                            MixerStep {
+                                position,
+                                rows,
+                                x: &work.n,
+                                qkv: &mut work.qkv,
+                                out: &mut work.out,
+                                seq: state.seq_ref(s)?,
+                            },
+                            layer.layer,
+                        )?;
+                        let result = s.clone_dtoh(&work.out.slice(..rows * 5120))?;
+                        ensure!(
+                            result.iter().all(|v| v.is_finite()),
+                            "live DSA nonfinite model output"
+                        );
+                        outputs[slot].extend(result.iter().map(|v| v.to_bits()));
+                        cases += 1;
+                    }
+                }
+                let state_bytes =
+                    final_state(state.compressed.as_ref().unwrap(), s, 1 + (129 - 1) % width)?;
+                if let Some((base, state_base)) = &baseline {
+                    let output_bad = outputs
+                        .iter()
+                        .flatten()
+                        .zip(base.iter().flatten())
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    let state_bad = state_bytes
+                        .iter()
+                        .zip(state_base)
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    defects += output_bad + state_bad;
+                    println!(
+                        "DSA_LIVE_CHAIN width={width} repeat={repeat} output_bits_differ={output_bad} state_bytes_differ={state_bad}"
+                    );
+                } else {
+                    baseline = Some((outputs, state_bytes));
+                }
+            }
+        }
+        println!("DSA_LIVE_CHAIN_RESULT cases={cases} owners=8 consumers=8 defects={defects}");
+        ensure!(defects == 0, "live DSA chunk/reset invariance DEFECT");
+        Ok(())
+    }
+}
