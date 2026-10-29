@@ -4823,7 +4823,7 @@ mod tests {
             .filter(|(actual, reference)| actual.to_bits() != reference.to_bits())
             .count();
         ensure!(
-            attention_bits > 0,
+            attention_bits > 0 && legacy_bits > 0,
             "legacy ring-overwrite control does not discriminate: differing_attention={attention_bits} differing_logits={legacy_bits}"
         );
         println!(

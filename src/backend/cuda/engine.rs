@@ -3248,7 +3248,6 @@ impl Engine {
 
     pub fn decode_logits(&self) -> Result<Vec<f32>> {
         self.logits_cache.read()?;
-        #[cfg(feature = "cuda")]
         if let Some(logits) = &self.flint_logits {
             return Ok(self.device.stream.clone_dtoh(logits)?);
         }
