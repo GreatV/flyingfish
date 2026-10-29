@@ -11,7 +11,7 @@ use crate::backend::cuda::{
     ops::{RmsMode, RmsOptions},
     weights::LoopvlVisionWeights,
 };
-use cudarc::driver::{CudaFunction, DevicePtr};
+use crate::backend::gpu::{CudaFunction, DevicePtr};
 
 pub(super) struct Runtime {
     initial: CudaSlice<bf16>,
@@ -697,7 +697,10 @@ impl Engine {
             "LoopVL fixed setup".into(),
         ));
         let runtime = settings.runtime_dir.clone().unwrap_or_default();
+        #[cfg(feature = "cuda")]
         let mut blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
+        #[cfg(feature = "rocm")]
+        let mut blas = Blas::new(s.clone())?;
         blas.bind_invariant(&device.ctx, 1)?;
         for n in [1] {
             for (output, input) in [
@@ -748,11 +751,11 @@ impl Engine {
             capture_fail_after_layer: None,
             #[cfg(test)]
             capture_fail_stage: None,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             flint_window_capture: None,
             #[cfg(test)]
             moe_test_ffn: None,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "cuda"))]
             flint_legacy_overflow_prefill: false,
             qwen_device_prefix: false,
             forward_rows: (1..=rows).collect(),
@@ -773,9 +776,13 @@ impl Engine {
             moe: None,
             moe_slots: None,
             moe_prefill: None,
+            #[cfg(feature = "cuda")]
             flint_frozen_decode_length: false,
+            #[cfg(feature = "cuda")]
             mtp: None,
+            #[cfg(feature = "cuda")]
             mtp_state: None,
+            #[cfg(feature = "cuda")]
             mtp_epoch: 0,
             images: None,
             weights,
@@ -795,7 +802,9 @@ impl Engine {
             workspace_rows: rows,
             trace_layer: 0,
             position: 0,
+            #[cfg(feature = "cuda")]
             prefix_identity: None,
+            #[cfg(feature = "cuda")]
             prefix_identity_load_ms: 0.0,
             logits_cache: PrefixLogitsCache::default(),
             committed_prefix_ids: Vec::new(),
@@ -1271,6 +1280,145 @@ mod tests {
     use safetensors::{Dtype, SafeTensors};
 
     #[test]
+    #[ignore = "authorized GPU window; rotary rounding and KV indexing"]
+    fn recurrent_rotary_rounding_gpu() -> Result<()> {
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        let module = cubin::module(&device.ctx, "rope")?;
+        let rows = 37usize;
+        let dim = 128usize;
+        let capacity = 64usize;
+        let start = 3usize;
+        let pattern = |n: usize, seed: usize| -> Vec<bf16> {
+            (0..n)
+                .map(|i| bf16::from_f32(((i * seed % 4099) as f32 - 2049.0) / 509.0))
+                .collect()
+        };
+        let round = |x: f32| bf16::from_f32(x).to_f32();
+        let mut defects = 0usize;
+        for table_mode in [true, false] {
+            let (qh, kh, stride) = if table_mode {
+                (12, 12, 6144)
+            } else {
+                (16, 8, 4096)
+            };
+            let input = pattern(rows * stride, 37);
+            let mut expected = input.clone();
+            let mut data = s.clone_htod(&input)?;
+            let sentinel = bf16::from_f32(-17.0);
+            let mut expected_k = vec![sentinel; kh * capacity * dim];
+            let mut expected_v = expected_k.clone();
+            let mut k = s.clone_htod(&expected_k)?;
+            let mut v = s.clone_htod(&expected_v)?;
+            let table = pattern(capacity * 2 * dim, 53);
+            let positions: Vec<i32> = (0..2 * rows)
+                .map(|i| {
+                    if i < rows {
+                        (i * 3 % 17) as i32
+                    } else {
+                        (i * 5 % 19) as i32
+                    }
+                })
+                .collect();
+            for row in 0..rows {
+                for head in 0..qh + kh {
+                    for d in 0..dim / 2 {
+                        let off = row * stride + head * dim + d;
+                        let a = input[off].to_f32();
+                        let b = input[off + dim / 2].to_f32();
+                        let (c0, s0, c1, s1) = if table_mode {
+                            let p = (start + row) * 2 * dim + d;
+                            (
+                                table[p].to_f32(),
+                                table[p + dim / 2].to_f32(),
+                                table[p + dim].to_f32(),
+                                table[p + dim + dim / 2].to_f32(),
+                            )
+                        } else {
+                            let x = positions[row] as f32;
+                            let y = positions[rows + row] as f32;
+                            (
+                                round(x.cos()),
+                                round(x.sin()),
+                                round(y.cos()),
+                                round(y.sin()),
+                            )
+                        };
+                        let lo = bf16::from_f32(round(a * c0) - round(b * s0));
+                        let hi = bf16::from_f32(round(b * c1) + round(a * s1));
+                        if !table_mode || head < qh {
+                            expected[off] = lo;
+                            expected[off + dim / 2] = hi;
+                        } else {
+                            let dst = ((head - qh) * capacity + start + row) * dim + d;
+                            expected_k[dst] = lo;
+                            expected_k[dst + dim / 2] = hi;
+                            expected_v[dst] = input[off + kh * dim];
+                            expected_v[dst + dim / 2] = input[off + kh * dim + dim / 2];
+                        }
+                    }
+                }
+            }
+            if table_mode {
+                let function = module.load_function("rope_table_kv")?;
+                let table = s.clone_htod(&table)?;
+                let start = s.clone_htod(&[start as i32])?;
+                unsafe {
+                    s.launch_builder(&function)
+                        .arg(&mut data)
+                        .arg(&mut k)
+                        .arg(&mut v)
+                        .arg(&table)
+                        .arg(&start)
+                        .arg(&(rows as i32))
+                        .arg(&(qh as i32))
+                        .arg(&(kh as i32))
+                        .arg(&(dim as i32))
+                        .arg(&(capacity as i32))
+                        .arg(&(stride as i32))
+                        .launch(flat(rows * (qh + kh) * (dim / 2)))?;
+                }
+            } else {
+                let function = module.load_function("rope_2d_qk")?;
+                let positions = s.clone_htod(&positions)?;
+                unsafe {
+                    s.launch_builder(&function)
+                        .arg(&mut data)
+                        .arg(&positions)
+                        .arg(&(rows as i32))
+                        .arg(&(qh as i32))
+                        .arg(&(kh as i32))
+                        .arg(&(dim as i32))
+                        .arg(&(stride as i32))
+                        .arg(&1.0f32)
+                        .launch(flat(rows * (qh + kh) * (dim / 2)))?;
+                }
+            }
+            for (name, actual, expected) in [
+                ("qkv", s.clone_dtoh(&data)?, expected),
+                ("k", s.clone_dtoh(&k)?, expected_k),
+                ("v", s.clone_dtoh(&v)?, expected_v),
+            ] {
+                let mismatches = actual
+                    .iter()
+                    .zip(&expected)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                println!(
+                    "ROTARY_ROUNDING table={table_mode} buffer={name} rows={rows} stride={stride} bit_mismatches={mismatches} limit=0"
+                );
+                defects += mismatches;
+            }
+        }
+        ensure!(
+            defects == 0,
+            "DEFECT rotary BF16 rounding mismatches={defects}"
+        );
+        println!("PASS recurrent_rotary_rounding_gpu cells=6 bit_mismatches=0");
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "authorized GPU window; shared decode head geometry"]
     fn recurrent_decode_shapes_gpu() -> Result<()> {
         let d = Device::new(0)?;
@@ -1454,11 +1602,15 @@ mod tests {
             "Runner FAIL reinjection weight extents"
         );
         let runtime = VisionRuntime::new(&d.ctx)?;
+        #[cfg(feature = "cuda")]
         let closure = Rc::new(crate::backend::cuda::closure::Closure::new(
             false,
             "LoopVL vision test".into(),
         ));
+        #[cfg(feature = "cuda")]
         let mut blas = Blas::new(&d, &runtime.ops, Path::new(""), closure)?;
+        #[cfg(feature = "rocm")]
+        let mut blas = Blas::new(s.clone())?;
         blas.bind_invariant(&d.ctx, 1)?;
         let x: Vec<_> = (0..1024)
             .map(|i| bf16::from_f32([1.0, 3.0, -1.0, -3.0, 1.0][i * 37 % 5]))
@@ -1815,6 +1967,7 @@ mod tests {
             let mut eager_free = Vec::new();
             for graph in [false, true] {
                 let mut trajectory = Vec::with_capacity(reference.len());
+                let mut trajectory_ids = Vec::new();
                 engine.reset()?;
                 let mut trace = Trace::default();
                 engine.prefill(&prompt, Some(&mut trace))?;
@@ -1868,6 +2021,7 @@ mod tests {
                         [0.60, f32::MAX, f32::MAX],
                     )?);
                     let prediction = engine.token()?;
+                    trajectory_ids.push(prediction);
                     let margin = margins[step];
                     let pass = margin < 0.35 || prediction == predictions[step];
                     defects += usize::from(!pass);
@@ -1899,6 +2053,21 @@ mod tests {
                     &reference,
                     [0.60, 0.20, 0.06],
                 )?);
+                if let Some(output) = std::env::var_os("FF_Q38_PROBE_DIR") {
+                    let output = PathBuf::from(output);
+                    std::fs::create_dir_all(&output)?;
+                    ensure!(
+                        !output.canonicalize()?.starts_with(dir.canonicalize()?),
+                        "probe output is inside model directory"
+                    );
+                    let bytes: Vec<_> = trajectory_ids
+                        .iter()
+                        .copied()
+                        .chain(trajectory.iter().map(|v| v.to_bits()))
+                        .flat_map(u32::to_le_bytes)
+                        .collect();
+                    std::fs::write(output.join(format!("{case}-graph{graph}.bin")), bytes)?;
+                }
                 engine.reset()?;
                 let mut generated = vec![engine.prefill(&prompt, None)?];
                 for _ in 1..32 {

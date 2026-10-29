@@ -56,7 +56,6 @@ pub struct Weights {
     pub bytes: usize,
 }
 
-#[cfg(feature = "cuda")]
 pub(crate) struct LoopvlVisionLayer {
     pub input_norm: CudaSlice<bf16>,
     pub post_norm: CudaSlice<bf16>,
@@ -68,7 +67,6 @@ pub(crate) struct LoopvlVisionLayer {
     pub down: CudaSlice<bf16>,
 }
 
-#[cfg(feature = "cuda")]
 pub(crate) struct LoopvlVisionWeights {
     pub layers: Vec<LoopvlVisionLayer>,
     pub patch_weight: CudaSlice<bf16>,
@@ -666,7 +664,6 @@ fn decode_bf16(bytes: &[u8], values: &mut [bf16]) {
 }
 
 impl Weights {
-    #[cfg(feature = "cuda")]
     pub fn load_loopvl(
         dir: &Path,
         spec: &crate::model_spec::ModelSpec,
@@ -779,7 +776,6 @@ impl Weights {
     }
 }
 
-#[cfg(feature = "cuda")]
 impl LoopvlVisionWeights {
     pub(crate) fn load(
         dir: &Path,

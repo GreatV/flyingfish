@@ -51,7 +51,6 @@ mod mtp_launch_tests;
 #[path = "engine_qwen.rs"]
 mod qwen;
 #[path = "engine_recurrent.rs"]
-#[cfg(feature = "cuda")]
 mod recurrent;
 #[path = "engine_vision.rs"]
 mod vision_runtime;
@@ -615,7 +614,6 @@ pub struct Engine {
     spec: Option<Spec>,
     hidden_capture: Option<HiddenCapture>,
     qwen: Option<qwen::Runtime>,
-    #[cfg(feature = "cuda")]
     recurrent: Option<recurrent::Runtime>,
     moe: Option<moe::Decode>,
     moe_slots: Option<moe::Slots>,
@@ -1081,7 +1079,6 @@ impl Engine {
             #[cfg(test)]
             flint_window_capture: None,
             qwen: None,
-            #[cfg(feature = "cuda")]
             recurrent: None,
             moe: None,
             moe_slots: None,
@@ -1597,7 +1594,6 @@ impl Engine {
     }
 
     fn check_step(&self, step: crate::backend::Step<'_>) -> Result<()> {
-        #[cfg(feature = "cuda")]
         ensure!(
             self.recurrent.is_none(),
             "recurrent execution requires the prefix/decode program"
@@ -1967,7 +1963,6 @@ impl Engine {
     }
 
     pub fn run_decode_step(&mut self, trace: Option<Target<'_>>) -> Result<()> {
-        #[cfg(feature = "cuda")]
         if self.recurrent.is_some() {
             self.run_recurrent(1, true, trace)?;
             return self.work.advance(&self.ops, &self.device.stream);
@@ -2380,7 +2375,6 @@ impl Engine {
                 decode.reset()?;
             }
             self.images = None;
-            #[cfg(feature = "cuda")]
             if let Some(recurrent) = self.recurrent.as_mut() {
                 recurrent.reset(&self.device.stream, self.capacity)?;
             }
@@ -2884,7 +2878,6 @@ impl Engine {
         trace: Option<&mut Trace>,
         keep: usize,
     ) -> Result<u32> {
-        #[cfg(feature = "cuda")]
         if self.recurrent.is_some() {
             return self.prefill_recurrent(ids, ids.len(), trace, keep);
         }
@@ -3075,7 +3068,6 @@ impl Engine {
     }
 
     pub fn rewind(&mut self, position: usize, token: u32) -> Result<()> {
-        #[cfg(feature = "cuda")]
         ensure!(
             self.recurrent.is_none(),
             "LoopVL rewind requires rebuilding the bidirectional prefix"
@@ -3108,7 +3100,6 @@ impl Engine {
     }
 
     pub fn decode_weight_bytes(&self) -> usize {
-        #[cfg(feature = "cuda")]
         if self.recurrent.is_some() {
             return self
                 .weights
@@ -3347,7 +3338,6 @@ impl Engine {
     }
 
     pub fn decode_linear(&self) -> &'static str {
-        #[cfg(feature = "cuda")]
         if self.recurrent.is_some() {
             return "BF16 skinny decode, FP32 accumulation; fixed BF16 Lt prefill";
         }
@@ -5563,6 +5553,16 @@ impl Engine {
         let started = Instant::now();
         let write = mode.writes();
         let model_spec = crate::model_spec::ModelSpec::read(dir)?;
+        if model_spec.architecture == crate::model_spec::Architecture::LoopVl {
+            return Self::load_recurrent(
+                dir,
+                ordinal,
+                capacity,
+                requested_chunk,
+                settings,
+                model_spec,
+            );
+        }
         if matches!(
             model_spec.architecture,
             crate::model_spec::Architecture::MiniCpmV47
@@ -5654,6 +5654,7 @@ impl Engine {
             images: None,
             qwen_device_prefix: false,
             qwen: None,
+            recurrent: None,
             moe: None,
             moe_slots: None,
             moe_prefill: None,
