@@ -1002,6 +1002,10 @@ fn oracle_layer_distance(
     let oracle_values = reference(oracle, &name)?.as_f32();
     let reference_values = reference(reference_layers, &name)?.as_f32();
     let candidate_values = trace.values(&format!(".{layer}"))?;
+    let oracle_values =
+        &oracle_values[layer * candidate_values.len()..(layer + 1) * candidate_values.len()];
+    let reference_values =
+        &reference_values[layer * candidate_values.len()..(layer + 1) * candidate_values.len()];
     ensure!(
         candidate_values.len() == oracle_values.len()
             && candidate_values.len() == reference_values.len(),
