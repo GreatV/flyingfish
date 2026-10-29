@@ -1147,7 +1147,8 @@ impl ModelSpec {
             | Architecture::Qwen35Text
             | Architecture::MiniCpmV47
             | Architecture::Flint
-            | Architecture::LoopVl => 0.0,
+            | Architecture::LoopVl
+            | Architecture::Gemma4 => 0.0,
         }
     }
 
@@ -2622,6 +2623,7 @@ impl ModelSpec {
         let mut layers = Vec::with_capacity(depth as usize);
         for index in 0..depth {
             layers.push(LayerPlan {
+                geometry: None,
                 mixer: Mixer::FullAttention,
                 state_index: index,
                 rope: true,
@@ -2706,6 +2708,8 @@ impl ModelSpec {
                 vision_patch,
                 vision_downsample_ratio,
             }),
+            logit_softcap: None,
+            per_layer_input: None,
             vision: None,
         })
     }

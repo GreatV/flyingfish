@@ -617,7 +617,7 @@ extern "C" __global__ __launch_bounds__(256) void rms_branch_add(
     }
     float inv=block_inv(sum,scratch,width,5,eps);
     for(uint32_t i=threadIdx.x;i<width;i+=256) {
-        __nv_bfloat16 r=__hadd(x[base+i],norm_scale(__bfloat162float(b[base+i]),inv,wb[i],zero,5));
+        __nv_bfloat16 r=__hadd(x[base+i],norm_scale<false>(__bfloat162float(b[base+i]),inv,wb[i],zero,5));
         if(scalar) r=__hmul(r,*scalar);
         x[base+i]=r;
     }
@@ -630,5 +630,5 @@ extern "C" __global__ __launch_bounds__(256) void rms_branch_add(
     }
     inv=block_inv(sum,scratch,width,5,eps);
     for(uint32_t i=threadIdx.x;i<width;i+=256)
-        n[base+i]=norm_scale(__bfloat162float(x[base+i]),inv,wn[i],zero,5);
+        n[base+i]=norm_scale<false>(__bfloat162float(x[base+i]),inv,wn[i],zero,5);
 }

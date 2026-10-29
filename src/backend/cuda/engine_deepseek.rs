@@ -2610,7 +2610,15 @@ impl Engine {
             } else {
                 &self.work.ids
             };
-            return runtime.begin_forward(&self.device.stream, step.rows, ids, &self.weights.embed);
+            return runtime.begin_forward(
+                &self.device.stream,
+                step.rows,
+                ids,
+                self.weights
+                    .embed
+                    .as_ref()
+                    .context("DeepSeek-V4.1 embedding missing")?,
+            );
         }
         if matches!(
             op,
@@ -3354,7 +3362,7 @@ impl Engine {
             mtp_epoch: 0,
             images: None,
             weights: Weights {
-                embed: dense.embed,
+                embed: Some(dense.embed),
                 head: dense.head,
                 norm: Some(dense.norm),
                 layers: Vec::new(),
@@ -7156,7 +7164,7 @@ mod tests {
             mtp_epoch: 0,
             images: None,
             weights: Weights {
-                embed: testing::upload(&device.upload, table.clone())?,
+                embed: Some(testing::upload(&device.upload, table.clone())?),
                 layers: Vec::new(),
                 norm: None,
                 head: s.alloc_zeros(1)?,
@@ -7986,7 +7994,10 @@ mod tests {
             mtp_epoch: 0,
             images: None,
             weights: Weights {
-                embed: testing::upload(&device.upload, vec![bf16::ZERO; 8 * MIX_HIDDEN])?,
+                embed: Some(testing::upload(
+                    &device.upload,
+                    vec![bf16::ZERO; 8 * MIX_HIDDEN],
+                )?),
                 layers: Vec::new(),
                 norm: None,
                 head: s.alloc_zeros(1)?,
@@ -9093,7 +9104,10 @@ mod tests {
             mtp_epoch: 0,
             images: None,
             weights: Weights {
-                embed: testing::upload(&device.upload, vec![bf16::ZERO; 8 * FF_HIDDEN])?,
+                embed: Some(testing::upload(
+                    &device.upload,
+                    vec![bf16::ZERO; 8 * FF_HIDDEN],
+                )?),
                 layers: Vec::new(),
                 norm: None,
                 head: s.alloc_zeros(1)?,

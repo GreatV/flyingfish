@@ -531,6 +531,8 @@ impl GlmDsaOutputs {
         }
         Ok(())
     }
+}
+
 fn require_gemma_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
     ensure!(
         spec.architecture == crate::model_spec::Architecture::Gemma4
@@ -2885,39 +2887,38 @@ impl Engine {
                     .bytes as usize
                 },
             );
-        let (attention_prefill_bytes, attention_decode_bytes, attention_verify_bytes) = if flint
-            || glm
-            || gemma
-        {
-            (0, 0, 0)
-        } else {
-            let attention = attention
-                .as_ref()
-                .context("Q38 attention specification missing")?;
-            (
-                if cfg!(feature = "rocm") {
-                    FullAttentionOps::workspace(attention, limits(rows, capacity)?)?.bytes
-                } else {
-                    FullAttentionOps::preprocess_workspace(attention, limits(rows, capacity)?)?
+        let (attention_prefill_bytes, attention_decode_bytes, attention_verify_bytes) =
+            if flint || glm || gemma {
+                (0, 0, 0)
+            } else {
+                let attention = attention
+                    .as_ref()
+                    .context("Q38 attention specification missing")?;
+                (
+                    if cfg!(feature = "rocm") {
+                        FullAttentionOps::workspace(attention, limits(rows, capacity)?)?.bytes
+                    } else {
+                        FullAttentionOps::preprocess_workspace(attention, limits(rows, capacity)?)?
+                            .bytes
+                    },
+                    FullAttentionOps::decode_workspace(attention, 1, u32::try_from(capacity)?)?
+                        .bytes,
+                    if cfg!(feature = "rocm") {
+                        FullAttentionOps::decode_workspace(
+                            attention,
+                            u32::try_from(rows.min(verify_rows))?,
+                            u32::try_from(capacity)?,
+                        )?
                         .bytes
-                },
-                FullAttentionOps::decode_workspace(attention, 1, u32::try_from(capacity)?)?.bytes,
-                if cfg!(feature = "rocm") {
-                    FullAttentionOps::decode_workspace(
-                        attention,
-                        u32::try_from(rows.min(verify_rows))?,
-                        u32::try_from(capacity)?,
-                    )?
-                    .bytes
-                } else {
-                    FullAttentionOps::workspace(
-                        attention,
-                        limits(rows.min(verify_rows), capacity)?,
-                    )?
-                    .bytes
-                },
-            )
-        };
+                    } else {
+                        FullAttentionOps::workspace(
+                            attention,
+                            limits(rows.min(verify_rows), capacity)?,
+                        )?
+                        .bytes
+                    },
+                )
+            };
         let (gdn_prefill_bytes, gdn_decode_bytes) = if flint || gemma {
             (0, 0)
         } else {
