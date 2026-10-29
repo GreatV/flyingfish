@@ -751,11 +751,11 @@ impl Engine {
             capture_fail_after_layer: None,
             #[cfg(test)]
             capture_fail_stage: None,
-            #[cfg(all(test, feature = "cuda"))]
+            #[cfg(test)]
             flint_window_capture: None,
             #[cfg(test)]
             moe_test_ffn: None,
-            #[cfg(all(test, feature = "cuda"))]
+            #[cfg(test)]
             flint_legacy_overflow_prefill: false,
             qwen_device_prefix: false,
             forward_rows: (1..=rows).collect(),
@@ -776,7 +776,6 @@ impl Engine {
             moe: None,
             moe_slots: None,
             moe_prefill: None,
-            #[cfg(feature = "cuda")]
             flint_frozen_decode_length: false,
             #[cfg(feature = "cuda")]
             mtp: None,

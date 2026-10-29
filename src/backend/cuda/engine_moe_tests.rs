@@ -1216,7 +1216,7 @@ impl Engine {
             hidden_capture: None,
             capture_fail_after_layer: None,
             capture_fail_stage: None,
-            #[cfg(all(test, feature = "cuda"))]
+            #[cfg(test)]
             flint_window_capture: None,
             qwen: None,
             recurrent: None,
@@ -1224,9 +1224,8 @@ impl Engine {
             moe_slots: Some(slots),
             moe_prefill,
             moe_test_ffn: Some(ffn),
-            #[cfg(all(test, feature = "cuda"))]
+            #[cfg(test)]
             flint_legacy_overflow_prefill: false,
-            #[cfg(feature = "cuda")]
             flint_frozen_decode_length: false,
             #[cfg(feature = "cuda")]
             mtp: None,

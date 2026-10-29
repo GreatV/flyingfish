@@ -443,6 +443,7 @@ pub(super) fn hip_plan(
     capacity: usize,
     rows: usize,
     multi: bool,
+    q_heads: usize,
 ) -> Result<AttentionPlan> {
     ctx.require_simt("dense attention setup")?;
     ensure!(
@@ -457,6 +458,10 @@ pub(super) fn hip_plan(
         "flash_decode_mq"
     };
     let qpack = 8;
+    ensure!(
+        q_heads > 0 && q_heads.is_multiple_of(qpack),
+        "HIP attention query heads must be divisible by qpack"
+    );
     let first = module.load_function(&format!("{prefix}_phase1_q{qpack}"))?;
     let second = module.load_function(&format!("{prefix}_phase2"))?;
     let threads = 128u32
@@ -475,7 +480,7 @@ pub(super) fn hip_plan(
         resident > 0 && p.compute_units > 0,
         "HIP attention reports zero resident blocks/compute units"
     );
-    let target = (p.compute_units as usize * resident).div_ceil(rows * 16 / qpack);
+    let target = (p.compute_units as usize * resident).div_ceil(rows * q_heads / qpack);
     let chunk = capacity.div_ceil(target).max(128).div_ceil(32) * 32;
     let merge_threads = 128;
     let merge_shared = (2 * capacity.div_ceil(chunk) + merge_threads as usize) * 4;

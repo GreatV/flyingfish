@@ -16,12 +16,10 @@ pub(super) fn default_chunk(admitted: usize) -> usize {
     admitted.min(CUDA_GRID_YZ_MAX as usize / CHUNK_ALIGNMENT * CHUNK_ALIGNMENT)
 }
 
-#[cfg(feature = "cuda")]
 use crate::backend::cuda::{
     cubin,
     decode::{GqaDecodeInput, SlidingWindow},
 };
-#[cfg(feature = "cuda")]
 use crate::backend::gpu::LaunchConfig;
 use crate::backend::gpu::{CudaFunction, DevicePtr};
 use crate::gdn_plan::GdnPolicy;
@@ -52,7 +50,7 @@ fn norm_mode(spec: &crate::model_spec::ModelSpec) -> RmsMode {
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 struct FlintWindowInputs<'a> {
     spec: &'a crate::model_spec::ModelSpec,
     layer: usize,
@@ -65,7 +63,7 @@ struct FlintWindowInputs<'a> {
     sinks: &'a CudaSlice<bf16>,
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 fn capture_flint_window(
     stream: &Arc<CudaStream>,
     device_name: &str,
@@ -346,7 +344,6 @@ pub(super) struct Runtime {
     catalog: WeightCatalog,
     arena: Option<CudaSlice<u8>>,
     scratch: CudaSlice<u8>,
-    #[cfg(feature = "cuda")]
     kv_scratch: Option<(CudaSlice<bf16>, CudaSlice<bf16>)>,
     pub(super) prompt: Option<CudaSlice<bf16>>,
     mask: CudaSlice<u64>,
@@ -380,7 +377,6 @@ enum BoundMixer {
         replay: Vec<GdnPlan>,
         decode: Box<GdnPlan>,
     },
-    #[cfg(feature = "cuda")]
     Flint {
         q_norm: Tensor<bf16, 1>,
         k_norm: Tensor<bf16, 1>,
@@ -509,7 +505,7 @@ fn nested_verify_tcmqa(device_prefix: bool, rows: usize, bound: usize) -> Result
     Ok(true)
 }
 impl Runtime {
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(test)]
     pub(super) fn allocated_workspace_bytes(&self) -> u64 {
         self.scratch.len() as u64
     }
@@ -717,7 +713,6 @@ impl Runtime {
         let mut layers = Vec::new();
         let w = &engine.work;
         let mw = w.mixer.as_ref().context("Q38 mixer work missing")?;
-        #[cfg(feature = "cuda")]
         let rope_module = if flint {
             Some(cubin::module(&engine.device.ctx, "rope")?)
         } else {
@@ -741,18 +736,23 @@ impl Runtime {
             let mixer = match layout.mixer {
                 Mixer::FullAttention => {
                     if flint {
-                        #[cfg(feature = "rocm")]
-                        anyhow::bail!("HIP Flint mixer is not implemented");
-                        #[cfg(feature = "cuda")]
                         {
                             let module =
                                 rope_module.as_ref().context("Flint rope module missing")?;
+                            let offset =
+                                catalog.bf16(&format!("{prefix}self_attn.softmax_offset"))?;
+                            #[cfg(feature = "cuda")]
+                            let sinks = offset.clone();
+                            #[cfg(feature = "rocm")]
+                            let sinks = {
+                                let mut sinks = s.alloc_zeros(offset.len())?;
+                                s.memcpy_dtod(offset, &mut sinks)?;
+                                sinks
+                            };
                             BoundMixer::Flint {
                                 q_norm: weight("self_attn.q_norm.weight")?,
                                 k_norm: weight("self_attn.k_norm.weight")?,
-                                sinks: catalog
-                                    .bf16(&format!("{prefix}self_attn.softmax_offset"))?
-                                    .clone(),
+                                sinks,
                                 rope: module.load_function("flint_qknorm_rope_kv")?,
                                 nope: module.load_function("flint_qknorm_kv_nope")?,
                             }
@@ -1052,7 +1052,6 @@ impl Runtime {
             catalog,
             arena,
             scratch: scratch_buffer,
-            #[cfg(feature = "cuda")]
             kv_scratch,
             prompt: None,
             mask,
@@ -1090,6 +1089,9 @@ impl Runtime {
             for layer in &self.layers {
                 let input = matrix(&work.n, stream, 0, rows, hidden)?;
                 let (role, width) = match &layer.mixer {
+                    BoundMixer::Flint { .. } => {
+                        anyhow::bail!("Flint FP8 mixer binding is unsupported")
+                    }
                     BoundMixer::Attention { .. } => {
                         for (role, width, offset) in [
                             ("self_attn.q_proj.weight", 2 * q_width, 0),
@@ -1638,9 +1640,10 @@ impl Engine {
                 model_spec.architecture,
                 crate::model_spec::Architecture::MiniCpmV47
                     | crate::model_spec::Architecture::Qwen35Text
+                    | crate::model_spec::Architecture::Flint
             ) && !settings.prefix_cache
                 && settings.kv_format == crate::kv::KvFormat::Bf16,
-            "HIP hybrid setup requires MiniCPM-V-4.7 or Qwen3.8 with BF16 KV and no persistent prefix cache"
+            "HIP hybrid setup requires MiniCPM-V-4.7, Qwen3.8 or Flint with BF16 KV and no persistent prefix cache"
         );
         ensure!(
             model_spec.moe.is_none() || !reserve_mtp,
@@ -2044,7 +2047,7 @@ impl Engine {
             )
         };
         let (prefill_backend, decode_backend) = if flint {
-            ("FA2 d128 sliding/full", "flash decode d128")
+            ("native d128 sliding/full", "flash decode d128")
         } else if cfg!(feature = "rocm") {
             ("native HIP d256", "TCMQA d256")
         } else {
@@ -2124,7 +2127,7 @@ impl Engine {
             capture_fail_after_layer: None,
             #[cfg(test)]
             capture_fail_stage: None,
-            #[cfg(all(test, feature = "cuda"))]
+            #[cfg(test)]
             flint_window_capture: None,
             qwen_device_prefix: false,
             forward_rows: (1..=rows.min(16)).collect(),
@@ -2177,9 +2180,8 @@ impl Engine {
             moe_prefill: None,
             #[cfg(test)]
             moe_test_ffn: None,
-            #[cfg(all(test, feature = "cuda"))]
+            #[cfg(test)]
             flint_legacy_overflow_prefill: false,
-            #[cfg(feature = "cuda")]
             flint_frozen_decode_length: false,
             #[cfg(feature = "cuda")]
             mtp: None,
@@ -2305,7 +2307,7 @@ impl Engine {
     }
     #[cfg(feature = "rocm")]
     fn initialize_hip_hybrid(
-        &self,
+        &mut self,
         model: &Path,
         draft_path: Option<&Path>,
         context_rows: usize,
@@ -2423,12 +2425,31 @@ impl Engine {
             write_cache(&path, &choices)?;
             choices
         };
+        let decode = if self.model_spec.architecture == crate::model_spec::Architecture::Flint {
+            let plan = super::super::verification::hip_plan(
+                &self.device.ctx,
+                self.capacity,
+                1,
+                false,
+                self.config.num_attention_heads,
+            )?;
+            self.decode = Some(Attention::new(
+                &self.device.ctx,
+                &self.device.stream,
+                &self.config,
+                self.capacity,
+                plan,
+            )?);
+            Some(plan)
+        } else {
+            None
+        };
         self.closure.finish_with_key(profile, manifest, identity)?;
         eprintln!(
             "{}",
             serde_json::json!({"hip_hybrid_setup":{
                 "cached":cached,
-                "measurements":if cached {0} else {choices.iter().filter(|c|c.setup_median_ms.is_some()).count()}
+                "measurements":if cached {0} else {choices.iter().filter(|c|c.setup_median_ms.is_some()).count()}, "decode":decode, "calibration":"untuned correctness-only"
             }})
         );
         Ok(())
@@ -2789,10 +2810,7 @@ impl Engine {
     ) -> Result<()> {
         let q = self.qwen.as_mut().context("Q38 runtime missing")?;
         let layer = &q.layers[i];
-        #[cfg(feature = "cuda")]
         let flint_layer = matches!(layer.mixer, BoundMixer::Flint { .. });
-        #[cfg(feature = "rocm")]
-        let flint_layer = false;
         let attention = if flint_layer {
             None
         } else {
@@ -2825,7 +2843,6 @@ impl Engine {
             row_capacity: rows as u32,
         };
         match &layer.mixer {
-            #[cfg(feature = "cuda")]
             BoundMixer::Flint {
                 q_norm,
                 k_norm,
@@ -2877,8 +2894,8 @@ impl Engine {
                     unsafe {
                         s.launch_builder(function)
                             .arg(&mut w.qkv)
-                            .arg(&kv.k)
-                            .arg(&kv.v)
+                            .arg(&mut kv.k)
+                            .arg(&mut kv.v)
                             .arg(&q_norm.ptr)
                             .arg(&k_norm.ptr)
                             .arg(&w.position)
@@ -2969,8 +2986,8 @@ impl Engine {
                             unsafe {
                                 s.launch_builder(function)
                                     .arg(&mut w.qkv)
-                                    .arg(&*stage_k)
-                                    .arg(&*stage_v)
+                                    .arg(&mut *stage_k)
+                                    .arg(&mut *stage_v)
                                     .arg(&q_norm.ptr)
                                     .arg(&k_norm.ptr)
                                     .arg(&w.position)
@@ -3467,7 +3484,6 @@ impl Engine {
         if all || i == self.trace_layer {
             let name = debug_name(trace, i, "mixer_out");
             let mixer_width = match &layer.mixer {
-                #[cfg(feature = "cuda")]
                 BoundMixer::Flint { .. } => q_width,
                 BoundMixer::Attention { .. } => q_width,
                 BoundMixer::Gdn { .. } => value_width,
@@ -3939,7 +3955,7 @@ impl Engine {
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 mod tests {
     use super::default_chunk;
 
@@ -4230,6 +4246,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     fn nested_verify_routes_only_small_rows_to_tcmqa() -> Result<()> {
         for rows in [1, 4, 65, 2048] {
@@ -4440,7 +4457,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     fn zero_flint_sinks(engine: &mut Engine) -> Result<()> {
         let stream = engine.device.stream.clone();
         let runtime = engine
@@ -4457,8 +4473,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
-    #[cfg(feature = "cuda")]
     fn decode_window(
         engine: &mut Engine,
         prefix: &[u32],
@@ -4476,7 +4490,6 @@ mod tests {
         Ok(rows)
     }
 
-    #[cfg(feature = "cuda")]
     fn graph_eager_window(
         engine: &mut Engine,
         prefix: &[u32],
@@ -4550,7 +4563,6 @@ mod tests {
         Ok((rows, bits, differing_rows))
     }
 
-    #[cfg(feature = "cuda")]
     fn graph_eager_forced_prefix(
         engine: &mut Engine,
         ids: &[u32],
@@ -4633,7 +4645,6 @@ mod tests {
         ))
     }
 
-    #[cfg(feature = "cuda")]
     fn forced_prefix(
         engine: &mut Engine,
         ids: &[u32],
@@ -4692,7 +4703,6 @@ mod tests {
         ))
     }
 
-    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "GPU window; FF_MODEL, FLYINGFISH_RUNTIME_DIR and FF_FLINT_PASSAGE required"]
     fn flint_engine_controls_and_graph_eager_nll_gpu() -> Result<()> {
@@ -4858,7 +4868,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "GPU window; FF_MODEL, FLYINGFISH_RUNTIME_DIR, FF_FLINT_PASSAGE and FF_FLINT_WINDOW_DUMP required"]
     fn flint_window_boundary_dump_gpu() -> Result<()> {
@@ -4937,7 +4946,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "GPU window; FF_MODEL, FLYINGFISH_RUNTIME_DIR and FF_FLINT_PASSAGE required"]
     fn flint_decode_graph_length_gpu() -> Result<()> {

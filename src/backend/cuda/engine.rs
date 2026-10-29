@@ -598,7 +598,7 @@ pub struct Engine {
     capture_fail_after_layer: Option<(usize, usize)>,
     #[cfg(test)]
     capture_fail_stage: Option<CaptureFault>,
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(test)]
     flint_window_capture: Option<(Vec<usize>, Vec<usize>, PathBuf)>,
     forward_rows: std::collections::BTreeSet<usize>,
     graphs: Vec<Graph>,
@@ -620,9 +620,8 @@ pub struct Engine {
     moe_prefill: Option<moe::Prefill>,
     #[cfg(test)]
     moe_test_ffn: Option<super::linear::BoundFfn>,
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(test)]
     flint_legacy_overflow_prefill: bool,
-    #[cfg(feature = "cuda")]
     flint_frozen_decode_length: bool,
     #[cfg(feature = "cuda")]
     mtp: Option<mtp::Chain>,
@@ -872,23 +871,29 @@ impl Engine {
         Ok(Some(engine))
     }
 
-    #[cfg(feature = "cuda")]
-    fn finish_flint_calibration(&mut self, dir: &Path, started: Instant) -> Result<()> {
-        let profile = super::closure::Profile::new(
-            &self.config,
-            self.capacity,
-            self.chunk,
-            None,
-            dir,
-            None,
-            None,
-        )?;
-        let bucket = crate::backend::setup::attention_bucket(self.capacity)?;
-        let path =
-            super::calibrate::cache_path(&self.runtime, &self.device.key, bucket, self.capacity);
-        self.closure.preflight(&[path])?;
-        self.closure
-            .finish(profile, &self.runtime, self.device.key.clone())?;
+    fn finish_flint_calibration(&mut self, _dir: &Path, started: Instant) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        {
+            let profile = super::closure::Profile::new(
+                &self.config,
+                self.capacity,
+                self.chunk,
+                None,
+                _dir,
+                None,
+                None,
+            )?;
+            let bucket = crate::backend::setup::attention_bucket(self.capacity)?;
+            let path = super::calibrate::cache_path(
+                &self.runtime,
+                &self.device.key,
+                bucket,
+                self.capacity,
+            );
+            self.closure.preflight(&[path])?;
+            self.closure
+                .finish(profile, &self.runtime, self.device.key.clone())?;
+        }
         self.reset()?;
         self.prepare_graphs()?;
         self.closure.expect_captures(self.graphs.len())?;
@@ -5537,9 +5542,12 @@ impl Engine {
         chunk: Option<usize>,
         settings: Settings,
     ) -> Result<Option<Self>> {
-        Ok(Some(Self::load_kind(
-            dir, ordinal, capacity, chunk, settings, true,
-        )?))
+        let started = Instant::now();
+        let mut engine = Self::load_kind(dir, ordinal, capacity, chunk, settings, true)?;
+        if engine.model_spec.architecture == crate::model_spec::Architecture::Flint {
+            engine.finish_flint_calibration(dir, started)?;
+        }
+        Ok(Some(engine))
     }
 
     fn load_kind_for(
@@ -5567,6 +5575,7 @@ impl Engine {
             model_spec.architecture,
             crate::model_spec::Architecture::MiniCpmV47
                 | crate::model_spec::Architecture::Qwen35Text
+                | crate::model_spec::Architecture::Flint
         ) {
             return Self::load_qwen(
                 dir,
@@ -5658,6 +5667,11 @@ impl Engine {
             moe: None,
             moe_slots: None,
             moe_prefill: None,
+            #[cfg(test)]
+            flint_window_capture: None,
+            #[cfg(test)]
+            flint_legacy_overflow_prefill: false,
+            flint_frozen_decode_length: false,
             flint_logits: None,
             #[cfg(test)]
             moe_test_ffn: None,
@@ -5775,7 +5789,13 @@ impl Engine {
         let manifest = self.runtime.join(format!("hip-closure-{tag}.json"));
         self.closure.preflight(&[path.clone(), manifest.clone()])?;
         let cached = self.closure.access(&path)?;
-        let decode = super::verification::hip_plan(&self.device.ctx, self.capacity, 1, false)?;
+        let decode = super::verification::hip_plan(
+            &self.device.ctx,
+            self.capacity,
+            1,
+            false,
+            self.config.num_attention_heads,
+        )?;
         let prefill = Flash::tile(self.config.head_dim)?;
         let setup = if cached {
             let setup: HipSetup = serde_json::from_slice(&std::fs::read(&path)?)?;
