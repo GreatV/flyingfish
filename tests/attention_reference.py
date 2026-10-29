@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import torch
+import numpy as np
 from safetensors.torch import save_file
 
 
@@ -92,23 +93,109 @@ def reference(case):
                 selected=torch.tensor(selected))
 
 
+def extended_cases():
+    cases = {}
+
+    def add(d, hq, hkv, rows, start, scale, window, padded):
+        case = dict(d=d, hq=hq, hkv=hkv, rows=rows, start=start, keys=start + rows,
+                    capacity=start + rows + 64, pitch=hq*d + (512 if padded else 0),
+                    scale=scale, mode='window' if window is not None else 'causal',
+                    extent=window if window is not None else 0)
+        cases.setdefault(tuple(case.values()), case)
+
+    lengths = (1, 5, 15, 16, 17, 31, 32, 33, 63, 64, 65, 257)
+    for group, (hq, hkv) in enumerate(((8, 1), (8, 2), (16, 8), (32, 16))):
+        for window in (512, 1024):
+            starts = (0, 1, 31, 63, window-1, window, window+1, 4095)
+            for scale in (1.0, 0.0625):
+                for i, rows in enumerate(lengths):
+                    for padded in (False, True):
+                        add(256, hq, hkv, rows, starts[(i+group) % len(starts)], scale, window-1, padded)
+                for start in (window-1, window, window+1):
+                    for rows in (1, 5, 65):
+                        add(256, hq, hkv, rows, start, scale, window-1, False)
+                for rows in (16384, 65536):
+                    for padded in (False, True):
+                        add(256, hq, hkv, rows, 0, scale, window-1, padded)
+        for rows in (1, 5, 65):
+            for scale in (1.0, 0.0625):
+                for window in (None, 512):
+                    add(256, hq, hkv, rows, 4095, scale, window, True)
+    for group, (hq, hkv, limit) in enumerate(((8, 1, 131072), (8, 2, 131072), (16, 1, 262144), (32, 4, 262144))):
+        for i, rows in enumerate(lengths):
+            for padded in (False, True):
+                add(512, hq, hkv, rows, (0, 1, 31, 63, 4095)[(i+group) % 5], 1.0, None, padded)
+        for rows in (16384, 65536):
+            for padded in (False, True):
+                add(512, hq, hkv, rows, 0, 1.0, None, padded)
+        for rows in (1, 5, 16):
+            for padded in (False, True):
+                add(512, hq, hkv, rows, limit-rows, 1.0, None, padded)
+    assert len(cases) == 764
+    return [dict(case, name=f'e-cell{i}-seed{seed}', seed=seed)
+            for seed in (47, 71) for i, case in enumerate(cases.values())]
+
+
+def extended_pattern(positions, heads, dim, seed, kind, head_offset=0):
+    row = np.asarray(positions, dtype=np.int64)[None, :, None]
+    head = np.arange(head_offset, head_offset+heads)[:, None, None]
+    channel = np.arange(dim)[None, None, :]
+    if kind == 'q':
+        value = ((row*37 + head*53 + channel*seed + 11) % 1009 - 504) / 512.
+    elif kind == 'k':
+        value = ((row*17 + head*41 + channel*(seed+2) + 23) % 1013 - 506) / 512.
+    else:
+        value = ((row*29 + head*67 + channel*(seed+4) + 7) % 1009 - 504) / 512.
+    bits = value.astype(np.float32).view(np.uint32)
+    rounded = ((bits + np.uint32(0x7fff) + ((bits >> 16) & 1)) >> 16) << 16
+    return rounded.view(np.float32).astype(np.float64)
+
+
+def extended_reference(case):
+    rows, d, hq, hkv = (case[k] for k in ('rows', 'd', 'hq', 'hkv'))
+    selected = np.arange(rows) if rows <= 257 else np.unique([0, 1, 15, 16, 31, 63, 64, rows//2, rows-2, rows-1])
+    query = selected + case['start']
+    first = max(0, int(query.min()) - case['extent']) if case['mode'] == 'window' else 0
+    keys = np.arange(first, int(query.max())+1)
+    legal = keys[None, :] <= query[:, None]
+    if case['mode'] == 'window':
+        legal &= keys[None, :] >= np.maximum(0, query[:, None] - case['extent'])
+    q = extended_pattern(query, hq, d, case['seed'], 'q')
+    output = np.empty((len(selected), hq, d), np.float64)
+    lse = np.empty((len(selected), hq), np.float64)
+    for kv in range(hkv):
+        k = extended_pattern(keys, 1, d, case['seed'], 'k', kv)[0]
+        v = extended_pattern(keys, 1, d, case['seed'], 'v', kv)[0]
+        for head in range(kv*(hq//hkv), (kv+1)*(hq//hkv)):
+            scores = np.where(legal, (q[head] @ k.T)*case['scale'], -np.inf)
+            peak = scores.max(1)
+            probability = np.exp(scores-peak[:, None])
+            total = probability.sum(1)
+            output[:, head] = probability @ v / total[:, None]
+            lse[:, head] = peak + np.log(total)
+    return {name: torch.from_numpy(value) for name, value in
+            dict(output=output, lse=lse, selected=selected.astype(np.int64)).items()}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--family', choices=('native', 'extended'), default='native')
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
     torch.set_num_threads(4)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    cases = fixtures()
+    cases = extended_cases() if args.family == 'extended' else fixtures()
     (args.output / 'cases.json').write_text(json.dumps(cases, indent=2) + '\n')
     for case in cases:
-        data = reference(case)
+        data = extended_reference(case) if args.family == 'extended' else reference(case)
         assert all(torch.isfinite(value).all() for value in data.values())
         save_file(data, args.output / (case['name'] + '.safetensors'))
         print('ATTENTION_REFERENCE', case['name'], case['d'], case['mode'], case['rows'], flush=True)
     (args.output / 'report.json').write_text(json.dumps(dict(cells=len(cases), torch=torch.__version__,
-        device=torch.cuda.get_device_name(), reference='independent FP64 softmax', timing=False)) + '\n')
+        device='CPU' if args.family == 'extended' else torch.cuda.get_device_name(),
+        reference='independent FP64 softmax', timing=False)) + '\n')
 
 
 if __name__ == '__main__':

@@ -729,7 +729,7 @@ impl Stream {
         Launch {
             stream: self,
             function,
-            arguments: [[0; 8]; 32],
+            arguments: [[0; 9]; 32],
             allocations: std::array::from_fn(|_| None),
             count: 0,
         }
@@ -1268,6 +1268,18 @@ pub struct Function {
     module: Arc<Module>,
 }
 impl Function {
+    pub fn local_size_bytes(&self) -> Result<i32> {
+        self.module.context.bind_to_thread()?;
+        let mut value = 0;
+        unsafe {
+            check(
+                hipFuncGetAttribute(&mut value, 3, self.handle as Handle),
+                "hipFuncGetAttribute(localSizeBytes)",
+            )?;
+        }
+        Ok(value)
+    }
+
     pub fn shared_size_bytes(&self) -> Result<i32> {
         self.module.context.bind_to_thread()?;
         let mut value = 0;
@@ -1326,7 +1338,7 @@ pub struct LaunchConfig {
 pub struct Launch<'a> {
     stream: &'a Arc<Stream>,
     function: &'a Function,
-    arguments: [[u64; 8]; 32],
+    arguments: [[u64; 9]; 32],
     allocations: [Option<Arc<Allocation>>; 32],
     count: usize,
 }
@@ -1340,8 +1352,8 @@ impl Launch<'_> {
             "HIP_KERNEL_ARGUMENT_LIMIT=32"
         );
         assert!(
-            size_of::<T>() <= 64 && align_of::<T>() <= 8,
-            "HIP_ARGUMENT_BYTES_LIMIT=64 alignment_limit=8"
+            size_of::<T>() <= 72 && align_of::<T>() <= 8,
+            "HIP_ARGUMENT_BYTES_LIMIT=72 alignment_limit=8"
         );
         let bytes = &mut self.arguments[self.count];
         unsafe {

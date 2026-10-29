@@ -1,6 +1,4 @@
-use crate::backend::gpu::CudaSlice;
-#[cfg(feature = "cuda")]
-use crate::backend::gpu::{CudaFunction, PushKernelArg};
+use crate::backend::gpu::{CudaFunction, CudaSlice, PushKernelArg};
 use crate::backend::gpu::{
     CudaContext, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, PinnedHostSlice, ValidAsZeroBits,
 };
@@ -301,8 +299,6 @@ impl RingCopy<'_> {
             [self.heads, self.head_dim],
         )
     }
-
-    #[cfg(feature = "cuda")]
     pub(crate) fn run_dynamic(
         self,
         function: &CudaFunction,
