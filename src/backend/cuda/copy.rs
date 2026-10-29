@@ -260,14 +260,15 @@ pub struct RingCopy<'a> {
     pub head_dim: usize,
 }
 
+#[cfg(test)]
 pub(crate) struct RingCopyCall {
-    src: u64,
-    dst: u64,
-    source_start: usize,
-    target_start: usize,
-    rows: usize,
-    wrap_source: bool,
-    wrap_target: bool,
+    pub(crate) src: u64,
+    pub(crate) dst: u64,
+    pub(crate) source_start: usize,
+    pub(crate) target_start: usize,
+    pub(crate) rows: usize,
+    pub(crate) wrap_source: bool,
+    pub(crate) wrap_target: bool,
 }
 
 impl RingCopy<'_> {
@@ -299,6 +300,7 @@ impl RingCopy<'_> {
             [self.heads, self.head_dim],
         )
     }
+    #[cfg(test)]
     pub(crate) fn run_raw(self, call: RingCopyCall) -> Result<()> {
         let lengths = [self.source.len(), self.target.len()];
         call.run(
@@ -359,6 +361,7 @@ impl RingCopy<'_> {
     }
 }
 
+#[cfg(test)]
 impl RingCopyCall {
     fn run(
         self,
