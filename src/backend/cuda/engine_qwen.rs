@@ -4792,7 +4792,10 @@ mod tests {
             "ring gate chunk={} does not exceed ring={ring}",
             ring_engine.chunk
         );
-        ring_engine.prefill(ring_ids, None)?;
+        ring_engine.trace_layer = 3;
+        let mut ring_trace = Trace::default();
+        ring_engine.prefill(ring_ids, Some(&mut ring_trace))?;
+        let ring_attention = ring_trace.values("prefill.0.debug.mixer_out")?;
         let prefill_logits = ring_engine.decode_logits()?;
         ensure!(
             prefill_logits.iter().all(|value| value.is_finite()),
@@ -4800,7 +4803,19 @@ mod tests {
         );
         ring_engine.reset()?;
         ring_engine.flint_legacy_overflow_prefill = true;
-        ring_engine.prefill(ring_ids, None)?;
+        let mut legacy_trace = Trace::default();
+        ring_engine.prefill(ring_ids, Some(&mut legacy_trace))?;
+        let legacy_attention = legacy_trace.values("prefill.0.debug.mixer_out")?;
+        ensure!(
+            ring_attention.len() == ring_ids.len() * ring_engine.model_spec.q_width as usize
+                && legacy_attention.len() == ring_attention.len(),
+            "ring control attention extent differs"
+        );
+        let attention_bits = legacy_attention
+            .iter()
+            .zip(&ring_attention)
+            .filter(|(actual, reference)| actual.to_bits() != reference.to_bits())
+            .count();
         let legacy_logits = ring_engine.decode_logits()?;
         let legacy_bits = legacy_logits
             .iter()
@@ -4808,11 +4823,11 @@ mod tests {
             .filter(|(actual, reference)| actual.to_bits() != reference.to_bits())
             .count();
         ensure!(
-            legacy_bits > 0,
-            "legacy ring-overwrite control does not discriminate: differing_logits={legacy_bits}"
+            attention_bits > 0,
+            "legacy ring-overwrite control does not discriminate: differing_attention={attention_bits} differing_logits={legacy_bits}"
         );
         println!(
-            "FLINT_SLIDING_RING_PREFILL chunk={} rows=520 ring={ring} interleaved_finite=true legacy_differing_logits={legacy_bits} PASS",
+            "FLINT_SLIDING_RING_PREFILL chunk={} rows=520 ring={ring} interleaved_finite=true legacy_differing_attention={attention_bits} legacy_differing_logits={legacy_bits} PASS",
             ring_engine.chunk
         );
         drop(ring_engine);
