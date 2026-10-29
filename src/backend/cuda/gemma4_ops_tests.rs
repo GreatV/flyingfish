@@ -1192,6 +1192,38 @@ fn k_projection_rule_b(
     Ok(())
 }
 
+fn oracle_store_set(
+    channel: &str,
+    prefix: &str,
+    stores: &[(&'static str, Vec<f32>)],
+    oracle: &ReferenceFixture,
+    reference_layers: &ReferenceFixture,
+    selected_rows: &[usize],
+    rows: usize,
+) -> Result<Option<&'static str>> {
+    let mut first_beyond = None;
+    for (store, candidate) in stores {
+        let stage_name = format!("{prefix}.{store}");
+        let reference_values = reference(reference_layers, &stage_name)?.as_f32();
+        let oracle_values = reference(oracle, &stage_name)?.as_f32();
+        for row in selected_rows {
+            if oracle_store_distance(
+                channel,
+                candidate,
+                &reference_values,
+                &oracle_values,
+                *row,
+                rows,
+                store,
+            )? && first_beyond.is_none()
+            {
+                first_beyond = Some(*store);
+            }
+        }
+    }
+    Ok(first_beyond)
+}
+
 fn row_nll(values: impl Iterator<Item = f32> + Clone, target: f32) -> f64 {
     let peak = values.clone().fold(f32::NEG_INFINITY, f32::max);
     let sum = values.map(|value| (value - peak).exp() as f64).sum::<f64>();
@@ -1334,7 +1366,7 @@ fn oracle_first_layer_rule_a(
         "first-layer raw QKV extent mismatch"
     );
     let input: Vec<f32> = input.iter().map(|value| value.to_f32()).collect();
-    let mut stores = vec![
+    let stores = vec![
         ("embed", input),
         ("input_layernorm", trace.values("layer_rule_a.debug.norm1")?),
         ("q_proj", raw[..rows * q_width].to_vec()),
@@ -1381,26 +1413,15 @@ fn oracle_first_layer_rule_a(
     ];
     let layer_name = format!("layers.{family}");
     let layer_values = trace.values("layer_rule_a.layer.0")?;
-    let mut first_beyond = None;
-    for (store, candidate) in stores.drain(..) {
-        let stage_name = format!("{prefix}.{store}");
-        let reference_values = reference(reference_layers, &stage_name)?.as_f32();
-        let oracle_values = reference(oracle, &stage_name)?.as_f32();
-        for row in selected_rows {
-            if oracle_store_distance(
-                "first_layer_rule_a",
-                &candidate,
-                &reference_values,
-                &oracle_values,
-                *row,
-                rows,
-                store,
-            )? && first_beyond.is_none()
-            {
-                first_beyond = Some(store);
-            }
-        }
-    }
+    let mut first_beyond = oracle_store_set(
+        "first_layer_rule_a",
+        &prefix,
+        &stores,
+        oracle,
+        reference_layers,
+        selected_rows,
+        rows,
+    )?;
     let reference_values = reference(reference_layers, &layer_name)?.as_f32();
     let oracle_values = reference(oracle, &layer_name)?.as_f32();
     let hidden = layer_values.len() / rows;
@@ -2109,9 +2130,9 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
     let mut graph_defects = 0usize;
     let mut graph_state_defects = 0usize;
     let mut first = false;
-    for (tag, prefill) in [("a", 0usize), ("b", 0), ("wrap", 512)] {
-        let sequence: Vec<u32> = if tag == "wrap" {
-            serde_json::from_value(ids["wrap"].clone())?
+    for (tag, prefill) in [("a", 0usize), ("b", 0), ("wrap", 512), ("long", 0)] {
+        let sequence: Vec<u32> = if matches!(tag, "wrap" | "long") {
+            serde_json::from_value(ids[tag].clone())?
         } else {
             serde_json::from_value(ids["short"][if tag == "a" { 0 } else { 1 }].clone())?
         };
@@ -2126,14 +2147,9 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
             } else {
                 native_path(&mut engine, &sequence, sequence.len())?
             };
-            let expected = reference(&data, &format!("{tag}.{mode}"))?.as_f32();
-            let expected_rows = if cached {
-                sequence.len() - prefill
-            } else if tag == "wrap" {
-                8
-            } else {
-                sequence.len()
-            };
+            let tensor_name = format!("{tag}.{mode}");
+            let expected_rows = data[tensor_name.as_str()].0[0];
+            let expected = reference(&data, &tensor_name)?.as_f32();
             let target_ids = &sequence[sequence.len() - expected_rows..];
             let actual = actual[actual.len() - expected.len()..].to_vec();
             let (pass, line, _) = model_metrics(&actual, &expected, target_ids, bounds)?;
