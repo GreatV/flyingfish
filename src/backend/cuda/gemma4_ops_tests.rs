@@ -967,9 +967,17 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         .filter(|(a, b)| a != b)
         .count();
     println!(
-        "GEMMA4_D512_TABLE mismatches={mismatches} actual={:?} expected={:?}",
+        "GEMMA4_D512_TABLE mismatches={mismatches} actual={:?} expected={:?} first={:?}",
         &actual_table[..16],
-        &expected_table[..16]
+        &expected_table[..16],
+        actual_table
+            .iter()
+            .zip(&expected_table)
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .take(8)
+            .map(|(i, (a, b))| (i, *a, *b))
+            .collect::<Vec<_>>()
     );
     ensure!(mismatches == 0, "D512 RoPE table content mismatch");
     let probe_input = tensor(&data, "stage.a.input_layernorm")?;
