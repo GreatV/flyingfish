@@ -4378,11 +4378,7 @@ impl Engine {
                     } else {
                         (&mut kv.k, &mut kv.v)
                     };
-                    let q_stride = if reader {
-                        q_width
-                    } else {
-                        q_width + 2 * kv_width
-                    };
+                    let q_stride = q_width;
                     let prep_heads = if reader { 0 } else { hkv };
                     let cache_start = if overflow { history as i32 } else { -1 };
                     if trace.is_some() && (all_layers(trace) || i == self.trace_layer) {
@@ -4394,8 +4390,13 @@ impl Engine {
                             s,
                             &debug_name(trace, i, "qkv_projected"),
                             &w.qkv,
-                            linear_rows,
-                            q_stride,
+                            1,
+                            linear_rows
+                                * if reader {
+                                    q_width
+                                } else {
+                                    q_width + 2 * kv_width
+                                },
                         )?;
                     }
                     unsafe {
@@ -5014,12 +5015,21 @@ impl Engine {
         let ring = self.state.kv_ring(layout.state_index as usize)?;
         ensure!(rows <= ring, "KV probe rows exceed the cache ring");
         let s = &self.device.stream;
-        let mut k = Vec::with_capacity(hkv * rows * d);
-        let mut v = Vec::with_capacity(hkv * rows * d);
+        let mut k_major = Vec::with_capacity(hkv * rows * d);
+        let mut v_major = Vec::with_capacity(hkv * rows * d);
         for head in 0..hkv {
             let base = head * ring * d;
-            k.extend(s.clone_dtoh(&kv.k.slice(base..base + rows * d))?);
-            v.extend(s.clone_dtoh(&kv.v.slice(base..base + rows * d))?);
+            k_major.extend(s.clone_dtoh(&kv.k.slice(base..base + rows * d))?);
+            v_major.extend(s.clone_dtoh(&kv.v.slice(base..base + rows * d))?);
+        }
+        let mut k = Vec::with_capacity(k_major.len());
+        let mut v = Vec::with_capacity(v_major.len());
+        for row in 0..rows {
+            for head in 0..hkv {
+                let base = (head * rows + row) * d;
+                k.extend_from_slice(&k_major[base..base + d]);
+                v.extend_from_slice(&v_major[base..base + d]);
+            }
         }
         Ok((k, v))
     }

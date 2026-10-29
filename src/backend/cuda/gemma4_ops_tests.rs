@@ -975,6 +975,11 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         .collect();
     let native_projected = engine.gemma_linear_probe("self_attn.q_proj.weight", &native_input)?;
     let raw = trace.values(".0.debug.qkv_projected")?;
+    let rows = first_ids.len();
+    let q_width = native_projected.len() / rows;
+    let v_shape = &data["stage.a.v_norm"].0;
+    let (hkv, d) = (v_shape[1], v_shape[2]);
+    let kv_width = hkv * d;
     let delta: Vec<f32> = native_projected
         .iter()
         .zip(&raw)
@@ -984,13 +989,13 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
     let rmse = (delta.iter().map(|v| v * v).sum::<f32>() / delta.len() as f32).sqrt();
     println!("GEMMA4_LINEAR_NATIVE_PROBE output_max={maximum} output_rmse={rmse}");
     for (role, offset) in [
-        ("self_attn.k_proj.weight", 2048usize),
-        ("self_attn.v_proj.weight", 2304),
+        ("self_attn.k_proj.weight", rows * q_width),
+        ("self_attn.v_proj.weight", rows * (q_width + kv_width)),
     ] {
         let projected = engine.gemma_linear_probe(role, &native_input)?;
         let delta: Vec<f32> = projected
             .iter()
-            .zip(&raw[offset..offset + 256])
+            .zip(&raw[offset..offset + rows * kv_width])
             .map(|(a, b)| (a.to_f32() - b).abs())
             .collect();
         let maximum = delta.iter().copied().fold(0.0f32, f32::max);
@@ -1001,16 +1006,10 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
     trace.save(&runtime.join("native-trace.safetensors"))?;
     let (native_k, native_v) = engine.gemma_kv_rows(0, first_ids.len())?;
     let reference_v = tensor(&data, "stage.a.v_norm")?;
-    let v_shape = &data["stage.a.v_norm"].0;
-    let (hkv, d) = (v_shape[0], v_shape[2]);
-    let rows = first_ids.len();
-    let q_width = native_projected.len() / rows;
-    let kv_width = hkv * d;
-    let q_stride = q_width + 2 * kv_width;
     let mut raw_v = Vec::with_capacity(reference_v.len());
-    for head in 0..hkv {
-        for row in 0..rows {
-            let base = row * q_stride + q_width + kv_width + head * d;
+    for row in 0..rows {
+        for head in 0..hkv {
+            let base = rows * (q_width + kv_width) + row * kv_width + head * d;
             raw_v.extend(raw[base..base + d].iter().map(|v| bf16::from_f32(*v)));
         }
     }
