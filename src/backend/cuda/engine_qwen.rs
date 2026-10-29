@@ -50,15 +50,12 @@ fn debug_name(trace: &Option<Target<'_>>, layer: usize, point: &str) -> String {
 }
 
 fn norm_mode(spec: &crate::model_spec::ModelSpec) -> RmsMode {
-    if matches!(
-        spec.architecture,
-        crate::model_spec::Architecture::Flint
-            | crate::model_spec::Architecture::Glm5Next
-            | crate::model_spec::Architecture::Gemma4
-    ) {
-        RmsMode::Standard
-    } else {
-        RmsMode::ZeroCentered
+    match spec.architecture {
+        crate::model_spec::Architecture::Gemma4 => RmsMode::Unrounded,
+        crate::model_spec::Architecture::Flint | crate::model_spec::Architecture::Glm5Next => {
+            RmsMode::Standard
+        }
+        _ => RmsMode::ZeroCentered,
     }
 }
 
