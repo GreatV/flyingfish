@@ -606,16 +606,23 @@ impl Flash {
         let (lse, _lse) = self.lse.device_ptr_mut(&self.stream);
         if !self.native.is_empty() {
             ensure!(
-                shape.window_left.is_none() || self.geometry == [32, 4, 128],
+                shape.window_left.is_none()
+                    || self.geometry == [32, 4, 128]
+                    || (self.geometry[2] == 256 && self.score.is_some()),
                 "native prefill window is not bound for this geometry"
             );
             let window = shape.window_left.is_some();
             let native = self
                 .native
-                .get(if window { 1 } else { mode })
+                .get(if window && self.score.is_none() {
+                    1
+                } else {
+                    mode
+                })
                 .context("native prefill mask is not bound")?;
             ensure!(
-                shape.window_left == self.score.and_then(|score| score.window_left),
+                self.score
+                    .is_none_or(|score| shape.window_left == score.window_left),
                 "native prefill window differs from setup binding"
             );
             let args = Attention {
