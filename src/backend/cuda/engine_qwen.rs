@@ -4999,6 +4999,31 @@ impl Engine {
     }
 
     #[cfg(test)]
+    pub(crate) fn gemma_kv_rows(
+        &self,
+        layer: usize,
+        rows: usize,
+    ) -> Result<(Vec<bf16>, Vec<bf16>)> {
+        ensure!(self.position == rows, "KV probe requires initial prefill");
+        let layout = &self.model_spec.layers[layer];
+        let d = layout
+            .geometry
+            .context("Gemma 4 attention geometry missing")?
+            .head_dim as usize;
+        let hkv = self.model_spec.kv_heads as usize;
+        let kv = &self.state.kv[layout.state_index as usize];
+        let s = &self.device.stream;
+        let mut k = Vec::with_capacity(hkv * rows * d);
+        let mut v = Vec::with_capacity(hkv * rows * d);
+        for head in 0..hkv {
+            let base = head * self.state.kv_ring(layout.state_index as usize)? * d;
+            k.extend(s.clone_dtoh(&kv.k.slice(base..base + rows * d))?);
+            v.extend(s.clone_dtoh(&kv.v.slice(base..base + rows * d))?);
+        }
+        Ok((k, v))
+    }
+
+    #[cfg(test)]
     pub(crate) fn gemma_linear_probe(&mut self, role: &str, input: &[bf16]) -> Result<Vec<bf16>> {
         let q = self.qwen.as_ref().context("Q38 runtime missing")?;
         let layer = &q.layers[0];

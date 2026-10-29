@@ -999,7 +999,17 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
     }
     trace.set_device(&engine.device_info().name)?;
     trace.save(&runtime.join("native-trace.safetensors"))?;
+    let (native_k, native_v) = engine.gemma_kv_rows(0, first_ids.len())?;
+    for (name, actual, expected) in [
+        ("k", &native_k, tensor(&data, "stage.a.k_rope")?),
+        ("v", &native_v, tensor(&data, "stage.a.v_norm")?),
+    ] {
+        let stats = Stats::new(actual, expected)?;
+        println!("GEMMA4_KV_SCATTER {}", stats.line(name));
+        ensure!(stats.passes(), "GEMMA4_KV_SCATTER {name} DEFECT");
+    }
     let mut defects = 0usize;
+    let mut graph_defects = 0usize;
     let mut first = false;
     for (tag, prefill) in [("a", 0usize), ("b", 0), ("wrap", 512)] {
         let sequence: Vec<u32> = if tag == "wrap" {
@@ -1044,13 +1054,15 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
                 let expected =
                     &tensor(&data, "wrap.decode")?[row * actual.len()..(row + 1) * actual.len()];
                 let eager = &eager[row * actual.len()..(row + 1) * actual.len()];
-                ensure!(
-                    actual
-                        .iter()
-                        .map(|v| bf16::from_f32(*v))
-                        .collect::<Vec<_>>()
-                        == eager,
-                    "graph/eager logits differ at wrap row {row}"
+                let graph_equal = actual
+                    .iter()
+                    .map(|v| bf16::from_f32(*v))
+                    .collect::<Vec<_>>()
+                    == eager;
+                graph_defects += usize::from(!graph_equal);
+                println!(
+                    "GEMMA4_GRAPH_EAGER wrap row={row} {}",
+                    if graph_equal { "PASS" } else { "DEFECT" }
                 );
                 let actual: Vec<bf16> = actual.iter().map(|v| bf16::from_f32(*v)).collect();
                 let (pass, line) =
@@ -1061,6 +1073,10 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         }
     }
     ensure!(defects == 0, "GEMMA4_MODEL defects={defects}");
+    ensure!(
+        graph_defects == 0,
+        "GEMMA4_GRAPH_EAGER defects={graph_defects}"
+    );
     println!("GEMMA4_MODEL PASS prefill decode wrap graph");
     Ok(())
 }
