@@ -1191,18 +1191,18 @@ mod tests {
                 .into_iter()
                 .map(|value| bf16::from_f32(value as f32))
                 .collect();
-            let qb = testing::upload(&device.upload, fx.q.clone())?;
-            let cb = testing::upload(&device.upload, fx.codes.clone())?;
-            let sb = testing::upload(&device.upload, fx.scales.clone())?;
-            let idb = testing::upload(&device.upload, fx.slot_ids.clone())?;
-            let skb = testing::upload(&device.upload, fx.sink.clone())?;
-            let rb = testing::upload(&device.upload, fx.inv_rotary.clone())?;
+            let qb = testing::upload_device(&device, fx.q.clone())?;
+            let cb = testing::upload_device(&device, fx.codes.clone())?;
+            let sb = testing::upload_device(&device, fx.scales.clone())?;
+            let idb = testing::upload_device(&device, fx.slot_ids.clone())?;
+            let skb = testing::upload_device(&device, fx.sink.clone())?;
+            let rb = testing::upload_device(&device, fx.inv_rotary.clone())?;
             // Discriminating control: one visible slot replaced by the next ring
             // slot must change the output.
             let mut wrong_ids = fx.slot_ids.clone();
             let last = wrong_ids.len() - 1;
             wrong_ids[last] = (wrong_ids[last] + 1) % WINDOW as i32;
-            let widb = testing::upload(&device.upload, wrong_ids)?;
+            let widb = testing::upload_device(&device, wrong_ids)?;
             device.finish_upload()?;
             let out = testing::zeros::<bf16>(s, HEADS * HEAD_DIM)?;
             let wrong_out = testing::zeros::<bf16>(s, HEADS * HEAD_DIM)?;

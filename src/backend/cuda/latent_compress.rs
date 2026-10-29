@@ -515,12 +515,25 @@ mod tests {
                         trace_operands(&ctx, &cell.values, &cell.scores, initial, [graph, false])?;
                     let mut bad = 0;
                     let mut maximum = 0.0f64;
-                    for (&got, &want) in result.pooled.iter().zip(&cell.pooled) {
+                    for (index, (&got, &want)) in result.pooled.iter().zip(&cell.pooled).enumerate()
+                    {
                         let distance = (f64::from(bf16::from_bits(got).to_f32())
                             - f64::from(bf16::from_bits(want).to_f32()))
                         .abs();
                         maximum = maximum.max(distance);
-                        bad += usize::from(distance > cell.bound);
+                        if distance > cell.bound {
+                            let row = index / 512 * 2;
+                            let column = index % 512;
+                            println!(
+                                "COMPRESSOR_STORE owner={} initial={initial} graph={graph} row={row} column={column} candidate={got} publisher={want} v0={:?} v1={:?} s0={:?} s1={:?}",
+                                cell.owner,
+                                cell.values[row * 512 + column],
+                                cell.values[(row + 1) * 512 + column],
+                                cell.scores[row * 512 + column],
+                                cell.scores[(row + 1) * 512 + column]
+                            );
+                            bad += 1;
+                        }
                     }
                     let repeat = result
                         .pooled

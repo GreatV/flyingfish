@@ -871,16 +871,16 @@ mod tests {
         for index in 0..FIXTURES {
             let fx = fixture(index);
             let expected = oracle.forward(&fx);
-            let xb = testing::upload(&device.upload, fx.x.clone())?;
-            let gb = testing::upload(&device.upload, fx.gate_codes.clone())?;
-            let gs = testing::upload(&device.upload, fx.gate_scales.clone())?;
-            let ub = testing::upload(&device.upload, fx.up_codes.clone())?;
-            let us = testing::upload(&device.upload, fx.up_scales.clone())?;
-            let db = testing::upload(&device.upload, fx.down_codes.clone())?;
-            let ds = testing::upload(&device.upload, fx.down_scales.clone())?;
+            let xb = testing::upload_device(&device, fx.x.clone())?;
+            let gb = testing::upload_device(&device, fx.gate_codes.clone())?;
+            let gs = testing::upload_device(&device, fx.gate_scales.clone())?;
+            let ub = testing::upload_device(&device, fx.up_codes.clone())?;
+            let us = testing::upload_device(&device, fx.up_scales.clone())?;
+            let db = testing::upload_device(&device, fx.down_codes.clone())?;
+            let ds = testing::upload_device(&device, fx.down_scales.clone())?;
             let swapped =
                 transposed_scales(&fx.gate_scales, INTERMEDIATE.div_ceil(32), HIDDEN / 32);
-            let sb = testing::upload(&device.upload, swapped)?;
+            let sb = testing::upload_device(&device, swapped)?;
             device.finish_upload()?;
             let out = testing::zeros::<bf16>(s, HIDDEN)?;
             let wrong_out = testing::zeros::<bf16>(s, HIDDEN)?;

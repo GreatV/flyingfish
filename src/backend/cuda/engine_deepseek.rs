@@ -7190,7 +7190,7 @@ mod tests {
             mtp_epoch: 0,
             images: None,
             weights: Weights {
-                embed: Some(testing::upload(&device.upload, table.clone())?),
+                embed: Some(testing::upload_device(&device, table.clone())?),
                 layers: Vec::new(),
                 norm: None,
                 head: s.alloc_zeros(1)?,
@@ -7974,19 +7974,19 @@ mod tests {
             0,
             MixerWeights {
                 wq_a: Fp8Projection {
-                    codes: testing::upload(&device.upload, fixture.wq_a.codes.clone())?,
-                    scale: testing::upload(&device.upload, fixture.wq_a.scales.clone())?,
+                    codes: testing::upload_device(&device, fixture.wq_a.codes.clone())?,
+                    scale: testing::upload_device(&device, fixture.wq_a.scales.clone())?,
                 },
-                q_norm: testing::upload(&device.upload, mix_bytes(&fixture.q_norm))?,
+                q_norm: testing::upload_device(&device, mix_bytes(&fixture.q_norm))?,
                 wq_b: Fp8Projection {
-                    codes: testing::upload(&device.upload, fixture.wq_b.codes.clone())?,
-                    scale: testing::upload(&device.upload, fixture.wq_b.scales.clone())?,
+                    codes: testing::upload_device(&device, fixture.wq_b.codes.clone())?,
+                    scale: testing::upload_device(&device, fixture.wq_b.scales.clone())?,
                 },
                 wkv: Fp8Projection {
-                    codes: testing::upload(&device.upload, fixture.wkv.codes.clone())?,
-                    scale: testing::upload(&device.upload, fixture.wkv.scales.clone())?,
+                    codes: testing::upload_device(&device, fixture.wkv.codes.clone())?,
+                    scale: testing::upload_device(&device, fixture.wkv.scales.clone())?,
                 },
-                kv_norm: testing::upload(&device.upload, mix_bytes(&fixture.kv_norm))?,
+                kv_norm: testing::upload_device(&device, mix_bytes(&fixture.kv_norm))?,
                 attn_sink: testing::upload(
                     &device.upload,
                     fixture
@@ -7995,11 +7995,11 @@ mod tests {
                         .flat_map(|v| v.to_le_bytes())
                         .collect::<Vec<_>>(),
                 )?,
-                wo_a: testing::upload(&device.upload, fixture.wo_a_codes.clone())?,
-                wo_a_scale: testing::upload(&device.upload, fixture.wo_a_scales.clone())?,
+                wo_a: testing::upload_device(&device, fixture.wo_a_codes.clone())?,
+                wo_a_scale: testing::upload_device(&device, fixture.wo_a_scales.clone())?,
                 wo_b: Fp8Projection {
-                    codes: testing::upload(&device.upload, fixture.wo_b.codes.clone())?,
-                    scale: testing::upload(&device.upload, fixture.wo_b.scales.clone())?,
+                    codes: testing::upload_device(&device, fixture.wo_b.codes.clone())?,
+                    scale: testing::upload_device(&device, fixture.wo_b.scales.clone())?,
                 },
             },
         )?;
@@ -8028,10 +8028,7 @@ mod tests {
             mtp_epoch: 0,
             images: None,
             weights: Weights {
-                embed: Some(testing::upload(
-                    &device.upload,
-                    vec![bf16::ZERO; 8 * MIX_HIDDEN],
-                )?),
+                embed: Some(testing::upload_device(&device, vec![bf16::ZERO; 8 * MIX_HIDDEN])?),
                 layers: Vec::new(),
                 norm: None,
                 head: s.alloc_zeros(1)?,
@@ -8807,8 +8804,8 @@ mod tests {
                 row_base: 0,
                 row_capacity: ROWS as u32,
             };
-            let gb = testing::upload(&device.upload, mix_bytes(&gate))?;
-            let ub = testing::upload(&device.upload, mix_bytes(&up))?;
+            let gb = testing::upload_device(&device, mix_bytes(&gate))?;
+            let ub = testing::upload_device(&device, mix_bytes(&up))?;
             let mut yb = testing::zeros::<u8>(s, ROWS * WIDTH * 2)?;
             device.finish_upload()?;
             let dense3 = |slice: &crate::backend::gpu::CudaSlice<u8>| -> Result<Tensor<bf16, 3>> {
@@ -9081,7 +9078,7 @@ mod tests {
         let state = crate::backend::cuda::state::StateStore::new(&spec, FF_ROWS + 8, s)?;
         let work = Work::new(s, &spec, FF_ROWS)?;
         let mut ffn = DeepseekFfn::new(&device.ctx, s, &spec, 1, FF_ROWS)?;
-        let upload = |bytes: Vec<u8>| testing::upload(&device.upload, bytes);
+        let upload = |bytes: Vec<u8>| testing::upload_device(&device, bytes);
         let (sg, sgs, ug, ugs, dg, dgs) = &fixture.shared;
         ffn.bind_layer(
             s,
@@ -9146,10 +9143,7 @@ mod tests {
             mtp_epoch: 0,
             images: None,
             weights: Weights {
-                embed: Some(testing::upload(
-                    &device.upload,
-                    vec![bf16::ZERO; 8 * FF_HIDDEN],
-                )?),
+                embed: Some(testing::upload_device(&device, vec![bf16::ZERO; 8 * FF_HIDDEN])?),
                 layers: Vec::new(),
                 norm: None,
                 head: s.alloc_zeros(1)?,

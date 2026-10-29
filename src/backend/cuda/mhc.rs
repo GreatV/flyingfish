@@ -1185,13 +1185,13 @@ mod tests {
             } else {
                 fx.fn_w.clone()
             };
-            let xb = testing::upload(&device.upload, fx.stream.clone())?;
-            let fnb_f32 = testing::upload(&device.upload, fx.fn_w.clone())?;
-            let fnb_bf16 = testing::upload(&device.upload, fn_bf16_stored)?;
-            let baseb = testing::upload(&device.upload, fx.base.clone())?;
-            let scaleb = testing::upload(&device.upload, fx.scale.clone())?;
-            let subb = testing::upload(&device.upload, fx.sublayer.clone())?;
-            let resb = testing::upload(&device.upload, fx.residual.clone())?;
+            let xb = testing::upload_device(&device, fx.stream.clone())?;
+            let fnb_f32 = testing::upload_device(&device, fx.fn_w.clone())?;
+            let fnb_bf16 = testing::upload_device(&device, fn_bf16_stored)?;
+            let baseb = testing::upload_device(&device, fx.base.clone())?;
+            let scaleb = testing::upload_device(&device, fx.scale.clone())?;
+            let subb = testing::upload_device(&device, fx.sublayer.clone())?;
+            let resb = testing::upload_device(&device, fx.residual.clone())?;
             device.finish_upload()?;
             let pre = testing::zeros::<f32>(s, (ROWS * MULT) as usize)?;
             let post = testing::zeros::<f32>(s, (ROWS * MULT) as usize)?;
@@ -1536,10 +1536,10 @@ mod tests {
         let comb: Vec<f32> = (0..ROWS as usize)
             .flat_map(|_| comb_row.iter().flat_map(|r| r.iter().copied()))
             .collect();
-        let subb = testing::upload(&device.upload, sublayer.clone())?;
-        let resb = testing::upload(&device.upload, residual.clone())?;
-        let postb = testing::upload(&device.upload, post.clone())?;
-        let combb = testing::upload(&device.upload, comb.clone())?;
+        let subb = testing::upload_device(&device, sublayer.clone())?;
+        let resb = testing::upload_device(&device, residual.clone())?;
+        let postb = testing::upload_device(&device, post.clone())?;
+        let combb = testing::upload_device(&device, comb.clone())?;
         device.finish_upload()?;
         let updated = testing::zeros::<bf16>(s, n_stream)?;
         ops.update(
