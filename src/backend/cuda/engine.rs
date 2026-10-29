@@ -3272,7 +3272,20 @@ impl Engine {
             .sum()
     }
 
+    /// Whether decode has a bound graph path; DeepSeek-V4.1 decodes eagerly.
+    pub fn graph_decode(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        if self.deepseek_mixer.is_some() {
+            return false;
+        }
+        true
+    }
+
     pub fn capture(&mut self) -> Result<()> {
+        ensure!(
+            self.graph_decode(),
+            "DeepSeek-V4.1 decode has no bound graph path"
+        );
         if self.moe.is_some() {
             return self.capture_moe();
         }

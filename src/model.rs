@@ -260,6 +260,9 @@ impl Model {
     pub fn kv_read_bytes(&self, tokens: usize) -> usize {
         self.backend.kv_read_bytes(tokens)
     }
+    pub fn graph_decode(&self) -> bool {
+        self.backend.graph_decode()
+    }
     pub fn capture(&mut self) -> Result<()> {
         self.backend.capture()
     }
