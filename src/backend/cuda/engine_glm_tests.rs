@@ -24,9 +24,6 @@ impl Reference {
         let floor = record["publisher_path_floor"]["largest_pair_mean_position_max_abs"]
             .as_f64()
             .context("missing publisher path floor")?;
-        let limit = record["publisher_path_floor"]["candidate_mean_nll_limit"]
-            .as_f64()
-            .context("missing composition limit")?;
         ensure!(
             record["round"] == "r2"
                 && record["frozen"] == true
@@ -43,8 +40,7 @@ impl Reference {
                 && tokens.len() == 600
                 && tokens.iter().all(|&id| id < 154880)
                 && floor.is_finite()
-                && floor > 0.0
-                && limit == 2.0 * floor,
+                && floor > 0.0,
             "Runner FAIL frozen GLM composition contract"
         );
         let loads = record["clean_load_summary"]
@@ -100,12 +96,55 @@ impl Reference {
                 ensure!(schedule == vec![1; 599], "Runner FAIL singleton arm {arm}");
             }
         }
+        let mut means = [0.0; 5];
+        for (arm, mean) in ["R1", "R2", "R3", "R4", "R5"].into_iter().zip(&mut means) {
+            let file = std::fs::File::open(root.join(format!("{arm}-logits.fp32")))?;
+            ensure!(
+                file.metadata()?.len() == 599 * 154880 * 4,
+                "Runner FAIL reference extent {arm}"
+            );
+            let mut reader = BufReader::new(file);
+            for &target in &tokens[1..] {
+                *mean += nll(&read_logits(&mut reader, 154880)?, target as usize)?;
+            }
+            *mean /= 599.0;
+        }
+        let limit = nll_limit(&means)?;
+        ensure!(
+            (limit - 0.04456232760365619).abs() < 1e-12,
+            "Runner FAIL frozen reference NLL limit {limit:.17}"
+        );
+        println!(
+            "G1_REFERENCE_NLL means={means:?} limit={limit:.17} logit_spread_diagnostic={floor:.17}"
+        );
         Ok(Self {
             record,
             tokens,
             limit,
         })
     }
+}
+
+fn read_logits(reader: &mut impl Read, width: usize) -> Result<Vec<f32>> {
+    let mut bytes = vec![0; width * 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|v| f32::from_le_bytes(*v))
+        .collect())
+}
+
+fn nll_limit(means: &[f64; 5]) -> Result<f64> {
+    ensure!(
+        means.iter().all(|v| v.is_finite()),
+        "Runner FAIL reference NLL non-finite"
+    );
+    let low = means.iter().copied().fold(f64::INFINITY, f64::min);
+    let high = means.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    ensure!(high > low, "Runner FAIL reference NLL floor absent");
+    Ok(2.0 * (high - low))
 }
 
 fn nll(logits: &[f32], target: usize) -> Result<f64> {
@@ -211,14 +250,7 @@ impl<'a> Score<'a> {
         let mut distances = Vec::new();
         let mut reference_losses = Vec::new();
         for (arm, reader) in self.readers.iter_mut().enumerate() {
-            let mut bytes = vec![0u8; logits.len() * 4];
-            reader.read_exact(&mut bytes)?;
-            let values: Vec<_> = bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|v| f32::from_le_bytes(*v))
-                .collect();
+            let values = read_logits(reader, logits.len())?;
             let reference_loss = nll(&values, target)?;
             self.reference_nll[arm] += reference_loss;
             reference_losses.push(reference_loss);
@@ -329,6 +361,11 @@ fn live_state(engine: &Engine, end: usize) -> Result<()> {
 
 #[test]
 fn composition_controls_reject_label_shift_and_skipped_layer() -> Result<()> {
+    let limit = nll_limit(&[1.0, 1.0, 1.01, 1.02, 1.015])?;
+    assert!((limit - 0.04).abs() < 1e-12);
+    assert!(0.05 > limit && 0.05 < 2.0 * 1.2718517780303955);
+    check_reset_meta(&[0, 1, 1, 37, 0, 0, 0, 0], 37)?;
+    assert!(check_reset_meta(&[0, 0, 0, 37, 0, 0, 0, 0], 37).is_err());
     let logits = [2.0, 1.0, -1.0];
     assert!(nll(&[-1.0, 2.0, 1.0], 0)? - nll(&logits, 0)? > 2.0);
     assert!((nll(&[102.0, 101.0, 99.0], 0)? - nll(&logits, 0)?).abs() < 1e-12);
@@ -340,6 +377,25 @@ fn composition_controls_reject_label_shift_and_skipped_layer() -> Result<()> {
     assert!(check_counts(&calls, 7).is_err());
     calls[17][3] += 2;
     assert!(check_counts(&calls, 7).is_err());
+    Ok(())
+}
+
+fn check_reset_meta(meta: &[i32], capacity: u32) -> Result<()> {
+    // Metadata describes the scheduled first token, with no completed prefix.
+    ensure!(
+        meta == [0, 1, 1, capacity as i32, 0, 0, 0, 0],
+        "DEFECT stale DSA reset meta={meta:?}"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "frozen r2 reference logits; CPU only"]
+fn glm_composition_reference() -> Result<()> {
+    let root =
+        PathBuf::from(std::env::var_os("G1_COMPOSITION_REFERENCE").context("reference missing")?);
+    Reference::load(&root)?;
+    println!("PASS G1_REFERENCE_NLL arms=5 rows=599 candidate_inputs=0");
     Ok(())
 }
 
@@ -467,10 +523,7 @@ fn glm_composition_gpu() -> Result<()> {
         );
     }
     for state in &engine.state.dsa {
-        ensure!(
-            stream.clone_dtoh(&state.meta)?[2] == 0,
-            "DEFECT stale DSA reset"
-        );
+        check_reset_meta(&stream.clone_dtoh(&state.meta)?, engine.capacity as u32)?;
     }
     engine.prefill(&reference.tokens[..1], None)?;
     ensure!(
@@ -553,7 +606,25 @@ fn glm_dsa_publication_gpu() -> Result<()> {
     }
     ensure!(mutant == 11, "Runner FAIL global-only advance control");
     state.reset(s)?;
-    state.set_sequence(s, 0, 1, 16)?;
+    let mut old_assertion_rejections = 0;
+    for dsa in &mut state.dsa {
+        let meta = s.clone_dtoh(&dsa.meta)?;
+        check_reset_meta(&meta, 37)?;
+        old_assertion_rejections += usize::from(meta[2] != 0);
+        dsa.reset(s)?;
+        ensure!(
+            check_reset_meta(&s.clone_dtoh(&dsa.meta)?, 37).is_err(),
+            "Runner FAIL unscheduled DSA reset control"
+        );
+    }
+    ensure!(
+        old_assertion_rejections == 11,
+        "Runner FAIL old reset assertion control"
+    );
+    state.reset(s)?;
+    println!(
+        "PASS G1_DSA_RESET layers=11 scheduled_key_count=1 completed_prefix=0 old_assertion_rejections={old_assertion_rejections} unscheduled_reset_rejections=11"
+    );
     let plan = DsaPlan::new(
         &device.ctx,
         &device.info,
