@@ -636,7 +636,7 @@ impl Prefill {
         ]
     }
 
-    #[cfg(all(test, feature = "cuda"))]
+    #[cfg(test)]
     pub(in crate::backend::cuda::engine) fn reseed_request(&self, slots: &mut Slots) -> Result<()> {
         slots.end_request()?;
         slots.begin_request(&self.frequency)

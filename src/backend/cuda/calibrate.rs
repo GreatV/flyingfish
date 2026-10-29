@@ -673,6 +673,24 @@ pub(super) fn host_memory(root: &Path) -> Result<u64> {
             mount.display()
         );
     }
+    let limits = std::fs::read_to_string(root.join("proc/self/limits"))?;
+    let resident_limit = limits
+        .lines()
+        .find_map(|line| line.strip_prefix("Max resident set"))
+        .and_then(|line| line.split_whitespace().next())
+        .context("expert process has no resident-set limit")?;
+    if resident_limit != "unlimited" {
+        let status = std::fs::read_to_string(root.join("proc/self/status"))?;
+        let resident = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmRSS:"))
+            .and_then(|line| line.split_whitespace().next())
+            .context("expert process has no VmRSS")?
+            .parse::<u64>()?
+            .checked_mul(1024)
+            .context("expert resident bytes overflow")?;
+        available = available.min(resident_limit.parse::<u64>()?.saturating_sub(resident));
+    }
     Ok(available)
 }
 
