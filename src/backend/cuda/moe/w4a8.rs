@@ -36,6 +36,7 @@ const W4A8_SHARED_LIMIT: u64 = 48 * 1024 - 1024;
 /// One routed expert's W4A8 weights: E2M1 codes packed two values per byte
 /// with one E8M0 scale per 32 elements of each row.
 #[derive(Clone, Copy)]
+#[cfg(test)]
 pub struct W4A8ExpertWeights {
     /// `[intermediate, hidden/2]` E2M1 gate codes.
     pub gate_codes: Tensor<u8, 2>,
@@ -53,6 +54,7 @@ pub struct W4A8ExpertWeights {
 
 /// Inputs of one routed expert's W4A8 decode contribution.
 #[derive(Clone, Copy)]
+#[cfg(test)]
 pub struct W4A8Inputs<'a> {
     /// `[hidden]` BF16 token activation.
     pub x: Tensor<bf16, 1>,

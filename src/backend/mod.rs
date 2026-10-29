@@ -19,35 +19,8 @@ pub use cuda::engine::Engine as Backend;
 pub use cuda::engine::TextPrefixSaveOutput;
 #[cfg(feature = "cuda")]
 pub use cuda::engine::{TextPrefixRestoreIntent, TextPrefixSaveRequest};
-// Disclosed unwired-surface keepalives: HcRounding::PostCombBf16,
-// HcFnDtype::Bf16 and HcCombOrientation::Transposed have no production
-// constructor until the GLM-5.3 engine load path lands; the plain w4a8
-// per-expert run surface is exercised only by its standalone kernel gate
-// (the engine load drives the dispatch entries); Accumulator::Bf16 of the
-// parameterized combine has no production consumer until the ungated
-// family callers migrate onto moe_combine_accum.
-#[cfg(feature = "cuda")]
-pub use cuda::gated_residual::{GatedResidualPlan, GatedResidualViews};
-#[cfg(feature = "cuda")]
-pub use cuda::index_score::{
-    IndexCandidatesPlan, IndexCandidatesViews, IndexPositionOrder, IndexScorePlan, IndexScoreViews,
-};
-#[cfg(feature = "cuda")]
-pub use cuda::latent_compress::{CompressionBuffers, CompressionInputs, LatentCompressPlan};
-#[cfg(feature = "cuda")]
-pub use cuda::linear::Bf16F32Plan;
 #[cfg(feature = "cuda")]
 pub use cuda::mhc::{HcCombOrientation, HcFnDtype, HcRounding};
-#[cfg(feature = "cuda")]
-pub use cuda::moe::combine::Accumulator;
-#[cfg(feature = "cuda")]
-pub use cuda::moe::w4a8::{W4A8ExpertWeights, W4A8Inputs};
-#[cfg(feature = "cuda")]
-pub use cuda::quantize::{
-    Fp4PackPlan, Fp4PackViews, Fp8LookupPlan, Fp8LookupProjection, Fp8LookupViews,
-};
-#[cfg(feature = "cuda")]
-pub use cuda::selection::{DsaSelectionPlan, DsaTopKInput, DsaTopKOutput};
 #[cfg(not(any(feature = "cuda", feature = "rocm")))]
 mod missing;
 #[cfg(not(any(feature = "cuda", feature = "rocm")))]
