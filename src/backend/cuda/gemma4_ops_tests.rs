@@ -961,10 +961,17 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         .rope
         .table(512, 14)?;
     let actual_table = engine.gemma_rope_table(true, &[0, 1, 13])?;
-    ensure!(
-        actual_table == expected_table,
-        "D512 RoPE table content mismatch"
+    let mismatches = actual_table
+        .iter()
+        .zip(&expected_table)
+        .filter(|(a, b)| a != b)
+        .count();
+    println!(
+        "GEMMA4_D512_TABLE mismatches={mismatches} actual={:?} expected={:?}",
+        &actual_table[..16],
+        &expected_table[..16]
     );
+    ensure!(mismatches == 0, "D512 RoPE table content mismatch");
     let probe_input = tensor(&data, "stage.a.input_layernorm")?;
     let projected = engine.gemma_linear_probe("self_attn.q_proj.weight", probe_input)?;
     let expected = tensor(&data, "stage.a.q_proj")?;
