@@ -1,7 +1,7 @@
 //! Gemma 4 per-operation GPU gates against fixtures written by the model definition.
 //! Fixture directory: FF_GEMMA4_FIXTURES.
 use super::{Device, cubin, ops::flat};
-use crate::backend::gpu::PushKernelArg;
+use crate::backend::gpu::{LaunchConfig, PushKernelArg};
 use anyhow::{Context, Result, ensure};
 use half::bf16;
 use safetensors::SafeTensors;
@@ -777,6 +777,86 @@ fn proportional_and_default_rope_tables_match_the_definition_gpu() -> Result<()>
     }
     println!("GEMMA4_ROPE cases={cases} defects={defects} undetected_mutants={undetected}");
     ensure!(defects == 0 && undetected == 0, "GEMMA4_ROPE FAIL");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUDA, D512 model-definition fixtures and the published model"]
+fn d512_table_kv_preparation_matches_definition_gpu() -> Result<()> {
+    let device = Device::new(0)?;
+    let s = &device.stream;
+    let data = fixture("reference.safetensors")?;
+    let dir = std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+    let spec = crate::model_spec::ModelSpec::read(&dir)?;
+    let geometry = spec.layers[4]
+        .geometry
+        .context("D512 layer geometry missing")?;
+    let (rows, d, capacity) = (14usize, 512usize, 640usize);
+    let q = tensor(&data, "stage.a.q_proj")?;
+    let k = tensor(&data, "stage.a.k_proj")?;
+    let v = tensor(&data, "stage.a.v_proj")?;
+    let mut qkv = Vec::with_capacity(rows * 3 * d);
+    qkv.extend_from_slice(&q[..rows * d]);
+    qkv.extend_from_slice(k);
+    qkv.extend_from_slice(v);
+    let mut qkv = s.clone_htod(&qkv)?;
+    let mut cache_k = s.alloc_zeros::<bf16>(capacity * d)?;
+    let mut cache_v = s.alloc_zeros::<bf16>(capacity * d)?;
+    let q_norm = s.clone_htod(&checkpoint_tensor(
+        &dir,
+        "model.language_model.layers.4.self_attn.q_norm.weight",
+    )?)?;
+    let k_norm = s.clone_htod(&checkpoint_tensor(
+        &dir,
+        "model.language_model.layers.4.self_attn.k_norm.weight",
+    )?)?;
+    let table = s.clone_htod(&geometry.rope.table(d as u32, capacity)?)?;
+    let start = s.clone_htod(&[0i32])?;
+    let function = cubin::module(&device.ctx, "rope")?.load_function("qknorm_rope_table_kv")?;
+    unsafe {
+        s.launch_builder(&function)
+            .arg(&mut qkv)
+            .arg(&mut cache_k)
+            .arg(&mut cache_v)
+            .arg(&q_norm)
+            .arg(&k_norm)
+            .arg(&table)
+            .arg(&start)
+            .arg(&-1i32)
+            .arg(&(rows as i32))
+            .arg(&1i32)
+            .arg(&1i32)
+            .arg(&(d as i32))
+            .arg(&(capacity as i32))
+            .arg(&0i32)
+            .arg(&1e-6f32)
+            .arg(&(d as u64))
+            .arg(&((rows * d) as u64))
+            .arg(&(d as u64))
+            .arg(&((rows * 2 * d) as u64))
+            .arg(&(d as u64))
+            .launch(LaunchConfig {
+                grid_dim: (3 * rows as u32, 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            })?;
+    }
+    let got_q = s.clone_dtoh(&qkv.slice(..rows * d))?;
+    let got_k = s.clone_dtoh(&cache_k.slice(..rows * d))?;
+    let got_v = s.clone_dtoh(&cache_v.slice(..rows * d))?;
+    let q_rope = tensor(&data, "stage.a.q_rope")?;
+    let expected = [
+        ("q", got_q, &q_rope[..rows * d]),
+        ("k", got_k, tensor(&data, "stage.a.k_rope")?),
+        ("v", got_v, tensor(&data, "stage.a.v_norm")?),
+    ];
+    let mut defects = 0;
+    for (name, actual, expected) in expected {
+        let stats = Stats::new(&actual, expected)?;
+        println!("GEMMA4_D512_PREP {name} {}", stats.line(name));
+        defects += usize::from(!stats.passes());
+    }
+    ensure!(defects == 0, "GEMMA4_D512_PREP defects={defects}");
     Ok(())
 }
 
