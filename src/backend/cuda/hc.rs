@@ -252,7 +252,7 @@ impl HcRuntime {
     }
 
     /// Host copy of one sublayer's fn, base and scale bytes as uploaded.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn sublayer_weight_host(
         &self,
         s: &Arc<CudaStream>,
