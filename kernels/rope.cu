@@ -244,21 +244,21 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
         __syncthreads();
 
         if constexpr (ROTARY) {
-          if (gid < dim / 2) {
+          for (int d = gid; d < dim / 2; d += nthr) {
             if constexpr (TABLE) {
-              const __nv_bfloat16 c = table[(size_t)position * dim + gid];
-              const __nv_bfloat16 s = table[(size_t)position * dim + dim / 2 + gid];
-              const __nv_bfloat16 a = qkv[base + gid];
-              const __nv_bfloat16 b = qkv[base + gid + dim / 2];
+              const __nv_bfloat16 c = table[(size_t)position * dim + d];
+              const __nv_bfloat16 s = table[(size_t)position * dim + dim / 2 + d];
+              const __nv_bfloat16 a = qkv[base + d];
+              const __nv_bfloat16 b = qkv[base + d + dim / 2];
               const __nv_bfloat16 lo = __hsub(__hmul(a, c), __hmul(b, s));
               const __nv_bfloat16 hi = __hadd(__hmul(b, c), __hmul(a, s));
-              qkv[base + gid] = lo;
-              qkv[base + gid + dim / 2] = hi;
+              qkv[base + d] = lo;
+              qkv[base + d + dim / 2] = hi;
               if (head >= q_heads) {
                 const int kv_head = head - q_heads;
                 const size_t dst = ((size_t)kv_head * capacity + cache_pos) * dim;
-                k[dst + gid] = lo;
-                k[dst + gid + dim / 2] = hi;
+                k[dst + d] = lo;
+                k[dst + d + dim / 2] = hi;
               }
             } else {
             const float inv = 1.0f / powf(theta, float(2 * gid) / dim);
