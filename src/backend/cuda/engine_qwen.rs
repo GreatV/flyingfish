@@ -5121,32 +5121,77 @@ impl Engine {
         let layer = &q.layers[0];
         let s = &self.device.stream;
         let hidden = self.model_spec.hidden as usize;
-        ensure!(
-            input.len().is_multiple_of(hidden),
-            "linear probe input extent"
-        );
-        let rows = input.len() / hidden;
-        let x = s.clone_htod(input)?;
-        let output_width = match role {
-            "self_attn.q_proj.weight" => self.model_spec.q_width as usize,
-            "self_attn.k_proj.weight" | "self_attn.v_proj.weight" => {
+        let intermediate = self.model_spec.layers[0]
+            .geometry
+            .context("Gemma 4 FFN geometry missing")?
+            .intermediate as usize;
+        let (input_width, output_width) = match role {
+            "self_attn.q_proj.weight" => (hidden, self.model_spec.q_width as usize),
+            "self_attn.k_proj.weight" | "self_attn.v_proj.weight" => (
+                hidden,
                 self.model_spec.kv_heads as usize
                     * self.model_spec.layers[0]
                         .geometry
                         .context("Gemma 4 attention geometry missing")?
-                        .head_dim as usize
-            }
+                        .head_dim as usize,
+            ),
+            "mlp.gate_proj.weight" | "mlp.up_proj.weight" => (hidden, intermediate),
+            "mlp.down_proj.weight" => (intermediate, hidden),
             _ => anyhow::bail!("unsupported Gemma linear probe role {role}"),
         };
+        ensure!(
+            input.len().is_multiple_of(input_width),
+            "linear probe input extent"
+        );
+        let rows = input.len() / input_width;
+        let x = s.clone_htod(input)?;
         let y = s.alloc_zeros(rows * output_width)?;
         layer.linear.run(
             &self.blas,
             role,
             ExecutionPhase::Prefill,
-            matrix(&x, s, 0, rows, hidden)?,
+            matrix(&x, s, 0, rows, input_width)?,
             &mut TensorMut(matrix(&y, s, 0, rows, output_width)?),
         )?;
         s.clone_dtoh(&y).context("Gemma device readback failed")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gemma_mlp_activation_probe(
+        &self,
+        gate: &[bf16],
+        up: &[bf16],
+    ) -> Result<(Vec<bf16>, Vec<bf16>)> {
+        ensure!(
+            !gate.is_empty() && gate.len() == up.len(),
+            "Gemma MLP activation probe extent"
+        );
+        let q = self.qwen.as_ref().context("Q38 runtime missing")?;
+        let ops = q.gemma.as_ref().context("Gemma 4 operations missing")?;
+        let s = &self.device.stream;
+        let gate = s.clone_htod(gate)?;
+        let up = s.clone_htod(up)?;
+        let ones = s.clone_htod(&vec![bf16::ONE; gate.len()])?;
+        let mut activation = s.alloc_zeros::<bf16>(gate.len())?;
+        let mut product = s.alloc_zeros::<bf16>(gate.len())?;
+        let count = i32::try_from(gate.len())?;
+        unsafe {
+            s.launch_builder(&ops.gated_activation)
+                .arg(&gate)
+                .arg(&ones)
+                .arg(&mut activation)
+                .arg(&count)
+                .arg(&2i32)
+                .launch(flat(gate.len()))?;
+            s.launch_builder(&ops.gated_activation)
+                .arg(&gate)
+                .arg(&up)
+                .arg(&mut product)
+                .arg(&count)
+                .arg(&2i32)
+                .launch(flat(gate.len()))?;
+        }
+        Ok((s.clone_dtoh(&activation)?, s.clone_dtoh(&product)?))
     }
 
     pub(super) fn qwen_per_layer_input(
@@ -5667,6 +5712,21 @@ impl Engine {
                         &mut TensorMut(matrix(&w.gu, s, offset, linear_rows, f)?),
                     )?;
                 }
+                if gemma && (all_layers(trace) || i == self.trace_layer) {
+                    trace_value(trace, s, &debug_name(trace, i, "mlp_gate"), &w.gu, rows, f)?;
+                    let name = debug_name(trace, i, "mlp_up");
+                    if let Some(target) = trace.as_mut() {
+                        ensure!(target.skip < rows, "trace selection is empty");
+                        let start = self.workspace_rows * f + target.skip * f;
+                        let values =
+                            s.clone_dtoh(&w.gu.slice(start..start + (rows - target.skip) * f))?;
+                        target.trace.add(
+                            format!("{}.{name}", target.prefix),
+                            vec![1, rows - target.skip, f],
+                            values.into_iter().map(|value| value.to_f32()).collect(),
+                        )?;
+                    }
+                }
             }
             O::Activate => {
                 let gate = heads(&w.gu, s, 0, rows, 1, f as u32)?;
@@ -5685,6 +5745,39 @@ impl Engine {
                     }
                 } else {
                     q.common.gate.swiglu(s, domain, gate, up, &mut activated)?;
+                }
+                #[cfg(test)]
+                if gemma && (all_layers(trace) || i == self.trace_layer) {
+                    let ops = q.gemma.as_ref().context("Gemma 4 operations missing")?;
+                    let ones = s.clone_htod(&vec![bf16::ONE; rows * f])?;
+                    let mut activation = s.alloc_zeros::<bf16>(rows * f)?;
+                    unsafe {
+                        s.launch_builder(&ops.gated_activation)
+                            .arg(&w.gu)
+                            .arg(&ones)
+                            .arg(&mut activation)
+                            .arg(&((rows * f) as i32))
+                            .arg(&2i32)
+                            .launch(flat(rows * f))?;
+                    }
+                    trace_value(
+                        trace,
+                        s,
+                        &debug_name(trace, i, "mlp_activation"),
+                        &activation,
+                        rows,
+                        f,
+                    )?;
+                }
+                if gemma && (all_layers(trace) || i == self.trace_layer) {
+                    trace_value(
+                        trace,
+                        s,
+                        &debug_name(trace, i, "mlp_product"),
+                        &w.act,
+                        rows,
+                        f,
+                    )?;
                 }
             }
             O::Down => {

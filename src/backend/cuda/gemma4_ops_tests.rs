@@ -1084,13 +1084,22 @@ fn oracle_store_distance(
     let (mut candidate_sq, mut reference_sq) = (0.0f64, 0.0f64);
     let mut reference_bit_equal = 0usize;
     let mut oracle_rounded_bit_equal = 0usize;
-    for ((candidate, reference), oracle) in candidate_values
+    let mut max_index = 0usize;
+    let (mut candidate_at_max, mut reference_at_max, mut oracle_at_max) = (0.0f64, 0.0f64, 0.0f64);
+    for (index, ((candidate, reference), oracle)) in candidate_values
         .iter()
         .zip(reference_values)
         .zip(oracle_values)
+        .enumerate()
     {
         let candidate_delta = f64::from(*candidate - *oracle);
         let reference_delta = f64::from(*reference - *oracle);
+        if candidate_delta.abs() > candidate_max {
+            max_index = index;
+            candidate_at_max = f64::from(*candidate);
+            reference_at_max = f64::from(*reference);
+            oracle_at_max = f64::from(*oracle);
+        }
         candidate_max = candidate_max.max(candidate_delta.abs());
         reference_max = reference_max.max(reference_delta.abs());
         candidate_sq += candidate_delta * candidate_delta;
@@ -1102,8 +1111,11 @@ fn oracle_store_distance(
     let candidate_rmse = (candidate_sq / width as f64).sqrt();
     let reference_rmse = (reference_sq / width as f64).sqrt();
     let beyond = candidate_max > 2.0 * reference_max || candidate_rmse > 2.0 * reference_rmse;
+    let interval = 2.0 * (reference_at_max - oracle_at_max).abs();
+    let interval_low = oracle_at_max - interval;
+    let interval_high = oracle_at_max + interval;
     println!(
-        "GEMMA4_ORACLE_STORE channel={channel} row={row} store={store} width={width} candidate_max={candidate_max} candidate_rmse={candidate_rmse} reference_max={reference_max} reference_rmse={reference_rmse} reference_bit_equal={reference_bit_equal} oracle_rounded_bit_equal={oracle_rounded_bit_equal} beyond_2x={beyond}"
+        "GEMMA4_ORACLE_STORE channel={channel} row={row} store={store} width={width} candidate_max={candidate_max} candidate_rmse={candidate_rmse} reference_max={reference_max} reference_rmse={reference_rmse} reference_bit_equal={reference_bit_equal} oracle_rounded_bit_equal={oracle_rounded_bit_equal} max_index={max_index} candidate_value={candidate_at_max} reference_value={reference_at_max} oracle_value={oracle_at_max} interval_low={interval_low} interval_high={interval_high} beyond_2x={beyond}"
     );
     Ok(beyond)
 }
@@ -1271,6 +1283,19 @@ fn oracle_first_layer_rule_a(
             "pre_feedforward_layernorm",
             trace.values("layer_rule_a.debug.norm2")?,
         ),
+        (
+            "mlp_gate_proj",
+            trace.values("layer_rule_a.debug.mlp_gate")?,
+        ),
+        ("mlp_up_proj", trace.values("layer_rule_a.debug.mlp_up")?),
+        (
+            "mlp_activation",
+            trace.values("layer_rule_a.debug.mlp_activation")?,
+        ),
+        (
+            "mlp_product",
+            trace.values("layer_rule_a.debug.mlp_product")?,
+        ),
         ("mlp", trace.values("layer_rule_a.ffn")?),
         (
             "per_layer_input_gate",
@@ -1321,7 +1346,53 @@ fn oracle_first_layer_rule_a(
             first_beyond = Some("layer_output");
         }
     }
-    println!("GEMMA4_ORACLE_FIRST_LAYER first_beyond={first_beyond:?}");
+    let pre_ffn = reference_bf16(
+        reference_layers,
+        &format!("{prefix}.pre_feedforward_layernorm"),
+    )?;
+    let reference_gate = reference_bf16(reference_layers, &format!("{prefix}.mlp_gate_proj"))?;
+    let reference_up = reference_bf16(reference_layers, &format!("{prefix}.mlp_up_proj"))?;
+    let reference_product = reference_bf16(reference_layers, &format!("{prefix}.mlp_product"))?;
+    let gate = engine.gemma_linear_probe("mlp.gate_proj.weight", pre_ffn)?;
+    let up = engine.gemma_linear_probe("mlp.up_proj.weight", pre_ffn)?;
+    let (activation, product) = engine.gemma_mlp_activation_probe(reference_gate, reference_up)?;
+    let down = engine.gemma_linear_probe("mlp.down_proj.weight", reference_product)?;
+    let widen = |values: Vec<bf16>| {
+        values
+            .into_iter()
+            .map(|value| value.to_f32())
+            .collect::<Vec<_>>()
+    };
+    let operand_stores = [
+        ("mlp_gate_proj", widen(gate)),
+        ("mlp_up_proj", widen(up)),
+        ("mlp_activation", widen(activation)),
+        ("mlp_product", widen(product)),
+        ("mlp", widen(down)),
+    ];
+    let mut first_operand_beyond = None;
+    for (store, candidate) in operand_stores {
+        let stage_name = format!("{prefix}.{store}");
+        let reference_values = reference(reference_layers, &stage_name)?.as_f32();
+        let oracle_values = reference(oracle, &stage_name)?.as_f32();
+        for row in selected_rows {
+            if oracle_store_distance(
+                "mlp_operand_rule_a",
+                &candidate,
+                &reference_values,
+                &oracle_values,
+                *row,
+                rows,
+                store,
+            )? && first_operand_beyond.is_none()
+            {
+                first_operand_beyond = Some(store);
+            }
+        }
+    }
+    println!(
+        "GEMMA4_ORACLE_FIRST_LAYER first_beyond={first_beyond:?} mlp_operand_first_beyond={first_operand_beyond:?}"
+    );
     Ok(())
 }
 
