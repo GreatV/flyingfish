@@ -1258,6 +1258,8 @@ fn flint_sliding_ring_prefill_interleaved_gpu() -> Result<()> {
             target,
             source_capacity: ring,
             target_capacity: staged_capacity,
+            heads: hkv,
+            head_dim: dim,
         }
         .run(1, 0, 512, true, false)?;
     }
@@ -1305,6 +1307,8 @@ fn flint_sliding_ring_prefill_interleaved_gpu() -> Result<()> {
             target,
             source_capacity: staged_capacity,
             target_capacity: ring,
+            heads: hkv,
+            head_dim: dim,
         }
         .run(519, 520 % ring, 513, false, true)?;
     }
@@ -1373,6 +1377,8 @@ fn flint_sliding_ring_prefill_interleaved_gpu() -> Result<()> {
             target,
             source_capacity: ring,
             target_capacity: staged_capacity,
+            heads: hkv,
+            head_dim: dim,
         }
         .run(1031 % ring, 0, 1, false, false)?;
     }
