@@ -2352,17 +2352,13 @@ impl DeepseekFfn {
             }
             let ids = s.clone_dtoh(&self.ids.slice(..rows * top_k))?;
             let weights = s.clone_dtoh(&self.route_weights.slice(..rows * top_k))?;
-            let misses = slots.resolve_deepseek(
+            slots.resolve_deepseek(
                 u32::try_from(layer).context("DeepSeek-V4.1 tier layer overflow")?,
                 &ids,
                 &weights,
             )?;
             slots.wait_refill(s)?;
             self.sync_tier(s, layer, slots)?;
-            println!(
-                "DEEPSEEK_TIER_RESOLVE layer={layer} rows={rows} selected={} misses={misses}",
-                ids.len()
-            );
         }
         let g = &self.geometry;
         let bound = self
