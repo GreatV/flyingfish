@@ -968,6 +968,21 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
     let first_ids: Vec<u32> = serde_json::from_value(ids["short"][0].clone())?;
     let mut trace = crate::trace::Trace::all_layers();
     engine.gemma_prefill_trace(&first_ids, &mut trace)?;
+    let native_input: Vec<bf16> = trace
+        .values(".0.debug.norm1")?
+        .into_iter()
+        .map(bf16::from_f32)
+        .collect();
+    let native_projected = engine.gemma_linear_probe("self_attn.q_proj.weight", &native_input)?;
+    let raw = trace.values(".0.debug.qkv_projected")?;
+    let delta: Vec<f32> = native_projected
+        .iter()
+        .zip(&raw)
+        .map(|(a, b)| (a.to_f32() - b).abs())
+        .collect();
+    let maximum = delta.iter().copied().fold(0.0f32, f32::max);
+    let rmse = (delta.iter().map(|v| v * v).sum::<f32>() / delta.len() as f32).sqrt();
+    println!("GEMMA4_LINEAR_NATIVE_PROBE output_max={maximum} output_rmse={rmse}");
     trace.set_device(&engine.device_info().name)?;
     trace.save(&runtime.join("native-trace.safetensors"))?;
     let mut defects = 0usize;
