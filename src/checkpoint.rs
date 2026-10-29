@@ -1936,6 +1936,7 @@ pub struct TensorEntry {
     pub scale_name: Option<String>,
 }
 impl TensorEntry {
+    #[cfg(any(feature = "cuda", feature = "rocm", test))]
     pub(crate) fn native_byte_storage(&self) -> bool {
         matches!(self.dtype, Dtype::F8_E4M3 | Dtype::F32)
             || (self.dtype == Dtype::BF16
