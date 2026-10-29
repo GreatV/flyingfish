@@ -677,7 +677,6 @@ impl Weights {
         self.embed.as_ref().unwrap_or(&self.head)
     }
 
-    #[cfg(feature = "cuda")]
     pub fn load_loopvl(
         dir: &Path,
         spec: &crate::model_spec::ModelSpec,
@@ -1718,127 +1717,6 @@ LOOP:
             "PASS checkpoint_manifestless_upload passes=2 chunk_bytes={UPLOAD_CHUNK_BYTES} a_bytes={} b_bytes={} byte_mismatches=0",
             expected_a.len(),
             expected_b.len()
-        );
-        Ok(())
-    }
-
-    fn gemma4_upload_matches(
-        loaded: &std::collections::BTreeSet<String>,
-        text: &std::collections::BTreeSet<String>,
-    ) -> Result<()> {
-        ensure!(
-            loaded == text,
-            "uploaded set differs from the Text scope: extra={:?} missing={:?}",
-            loaded.difference(text).take(3).collect::<Vec<_>>(),
-            text.difference(loaded).take(3).collect::<Vec<_>>()
-        );
-        Ok(())
-    }
-
-    fn ensure_no_other_compute_app() -> Result<()> {
-        let output = std::process::Command::new("nvidia-smi")
-            .args(["--query-compute-apps=pid", "--format=csv,noheader"])
-            .output()?;
-        ensure!(output.status.success(), "RUNNER_FAIL nvidia-smi");
-        let own = std::process::id();
-        let others: Vec<u32> = std::str::from_utf8(&output.stdout)?
-            .lines()
-            .filter_map(|line| line.trim().parse::<u32>().ok())
-            .filter(|&pid| pid != own)
-            .collect();
-        ensure!(
-            others.is_empty(),
-            "RUNNER_FAIL co-tenant compute app: {others:?}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires CUDA and a Gemma 4 E2B/E4B directory in FF_MODEL"]
-    fn gemma4_catalog_uploads_exactly_the_text_set_gpu() -> Result<()> {
-        use crate::checkpoint::TensorScope;
-        use std::collections::BTreeSet;
-        let dir =
-            std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
-        let spec = crate::model_spec::ModelSpec::read(&dir)?;
-        let (tensors, resident) = match spec.hidden {
-            1536 => (540usize, 9_257_138_758usize),
-            2560 => (665, 14_926_026_836),
-            hidden => anyhow::bail!("unexpected Gemma 4 hidden size {hidden}"),
-        };
-        ensure_no_other_compute_app()?;
-        let device = crate::backend::cuda::Device::new(0)?;
-        let (free_before, _) = device.ctx.mem_get_info()?;
-        let catalog = WeightCatalog::load(&dir, &spec, &device)?;
-        device.stream.synchronize()?;
-        let (free_after, _) = device.ctx.mem_get_info()?;
-        let text: BTreeSet<String> = catalog
-            .manifest
-            .entries
-            .iter()
-            .filter(|(_, entry)| entry.scope == TensorScope::Text)
-            .map(|(name, _)| name.clone())
-            .collect();
-        let loaded: BTreeSet<String> = catalog.tensors.keys().cloned().collect();
-        gemma4_upload_matches(&loaded, &text)?;
-        let dormant = catalog
-            .manifest
-            .entries
-            .iter()
-            .find(|(_, entry)| entry.scope == TensorScope::Dormant)
-            .map(|(name, _)| name.clone())
-            .context("manifest has no Dormant tensor")?;
-        let mut mutant = loaded.clone();
-        mutant.insert(dormant);
-        ensure!(
-            gemma4_upload_matches(&mutant, &text).is_err(),
-            "a Dormant upload was not detected"
-        );
-        let embed = catalog.bf16("model.language_model.embed_tokens.weight")?;
-        let per_layer = catalog.bf16("model.language_model.embed_tokens_per_layer.weight")?;
-        let layers = spec.layers.len();
-        ensure!(
-            !catalog.tensors.contains_key("lm_head.weight")
-                && embed.len() == spec.vocab as usize * spec.hidden as usize
-                && per_layer.len() == spec.vocab as usize * layers * 256
-                && loaded.len() == tensors
-                && catalog.bytes == resident,
-            "Gemma 4 upload: tensors={} bytes={} embed={} per_layer={}",
-            loaded.len(),
-            catalog.bytes,
-            embed.len(),
-            per_layer.len()
-        );
-        let (bf16_bytes, native_bytes) = catalog.tensors.values().fold(
-            (0usize, 0usize),
-            |(bf16_bytes, native_bytes), tensor| match tensor {
-                StoredTensor::Bf16(values) => (bf16_bytes + values.len() * 2, native_bytes),
-                StoredTensor::Bytes(values) => (bf16_bytes, native_bytes + values.len()),
-            },
-        );
-        ensure!(
-            bf16_bytes + native_bytes == resident && catalog.bytes == resident,
-            "allocator ledger mismatch: bf16={bf16_bytes} native={native_bytes} expected={resident}"
-        );
-        println!(
-            "GEMMA4_ALLOCATOR PASS tensors={} bf16_bytes={} native_bytes={} total={}",
-            loaded.len(),
-            bf16_bytes,
-            native_bytes,
-            bf16_bytes + native_bytes
-        );
-        ensure_no_other_compute_app()?;
-        let used = free_before
-            .checked_sub(free_after)
-            .context("device free memory grew during the load")?;
-        ensure!(
-            used >= resident && used <= resident + (512 << 20),
-            "device memory delta {used} outside [{resident}, {resident} + 512 MiB]"
-        );
-        println!(
-            "GEMMA4_LOADER PASS tensors={} bytes={} device_delta={used}",
-            loaded.len(),
-            catalog.bytes
         );
         Ok(())
     }

@@ -5894,6 +5894,7 @@ impl Engine {
             crate::model_spec::Architecture::MiniCpmV47
                 | crate::model_spec::Architecture::Qwen35Text
                 | crate::model_spec::Architecture::Flint
+                | crate::model_spec::Architecture::Gemma4
         ) {
             return Self::load_qwen(
                 dir,

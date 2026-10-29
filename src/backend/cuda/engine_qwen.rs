@@ -1455,7 +1455,6 @@ impl Runtime {
                             )?,
                             engine.capacity,
                         )?;
-                        #[cfg(feature = "cuda")]
                         flash.bind_position(&engine.work.position)?;
                         BoundMixer::Gemma {
                             flash: Box::new(flash),
@@ -1858,6 +1857,9 @@ impl Runtime {
                     BoundMixer::Flint { .. } => {
                         anyhow::bail!("Flint FP8 mixer binding is unsupported")
                     }
+                    BoundMixer::Gemma { .. } => {
+                        anyhow::bail!("HIP Gemma FP8 projections are not bound")
+                    }
                     BoundMixer::Attention { .. } => {
                         for (role, width, offset) in [
                             ("self_attn.q_proj.weight", 2 * q_width, 0),
@@ -1997,7 +1999,9 @@ impl Runtime {
             row < ops.logits.len() / vocab,
             "Gemma 4 logit row outside binding"
         );
-        Ok(stream.clone_dtoh(&ops.logits.slice(row * vocab..(row + 1) * vocab))?)
+        stream
+            .clone_dtoh(&ops.logits.slice(row * vocab..(row + 1) * vocab))
+            .context("Gemma device readback failed")
     }
 
     #[cfg(test)]
@@ -2458,9 +2462,10 @@ impl Engine {
                 crate::model_spec::Architecture::MiniCpmV47
                     | crate::model_spec::Architecture::Qwen35Text
                     | crate::model_spec::Architecture::Flint
+                    | crate::model_spec::Architecture::Gemma4
             ) && !settings.prefix_cache
                 && settings.kv_format == crate::kv::KvFormat::Bf16,
-            "HIP hybrid setup requires MiniCPM-V-4.7, Qwen3.8 or Flint with BF16 KV and no persistent prefix cache"
+            "HIP hybrid setup requires MiniCPM-V-4.7, Qwen3.8, Flint or Gemma 4 with BF16 KV and no persistent prefix cache"
         );
         ensure!(
             model_spec.moe.is_none() || !reserve_mtp,
@@ -3229,7 +3234,21 @@ impl Engine {
             output: self.config.vocab_size,
             input: self.config.hidden_size,
         }]);
+        if runtime.gemma.is_some() {
+            linear.extend((1..=runtime.workspace_rows).map(|rows| LinearShape {
+                rows: rows as usize,
+                output: self.config.vocab_size,
+                input: self.config.hidden_size,
+            }));
+        }
         for rows in buckets {
+            if let Some(ops) = &runtime.gemma {
+                linear.insert(LinearShape {
+                    rows: rows as usize,
+                    output: ops.per_layer_projection.shape[0] as usize,
+                    input: ops.per_layer_projection.shape[1] as usize,
+                });
+            }
             for layer in &runtime.layers {
                 linear.extend(layer.linear.library_shapes(rows));
                 if let BoundFfn::Moe { shared, .. } = &layer.ffn {
@@ -5123,7 +5142,7 @@ impl Engine {
             matrix(&x, s, 0, rows, hidden)?,
             &mut TensorMut(matrix(&y, s, 0, rows, output_width)?),
         )?;
-        Ok(s.clone_dtoh(&y)?)
+        s.clone_dtoh(&y).context("Gemma device readback failed")
     }
 
     pub(super) fn qwen_per_layer_input(

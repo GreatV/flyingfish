@@ -142,7 +142,7 @@ fn tensor<'a>(fixture: &'a Fixture, name: &str) -> Result<&'a [bf16]> {
 }
 
 #[test]
-#[ignore = "requires CUDA and FF_GEMMA4_FIXTURES"]
+#[ignore = "requires a GPU and FF_GEMMA4_FIXTURES"]
 fn gelu_tanh_gated_activation_matches_the_definition_gpu() -> Result<()> {
     let device = Device::new(0)?;
     let s = &device.stream;
@@ -252,8 +252,9 @@ fn embedding_table(dir: &std::path::Path) -> Result<Vec<bf16>> {
 }
 
 #[test]
-#[ignore = "requires CUDA, FF_GEMMA4_FIXTURES and a Gemma 4 E2B/E4B directory in FF_MODEL"]
+#[ignore = "requires a GPU, FF_GEMMA4_FIXTURES and a Gemma 4 E2B/E4B directory in FF_MODEL"]
 fn softcap_tied_head_and_embedding_scale_match_the_definition_gpu() -> Result<()> {
+    #[cfg(feature = "cuda")]
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, sys as bs};
     let dir = std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
     let spec = crate::model_spec::ModelSpec::read(&dir)?;
@@ -293,7 +294,8 @@ fn softcap_tied_head_and_embedding_scale_match_the_definition_gpu() -> Result<()
                 .arg(&scale)
                 .launch(flat(ids.len() * hidden))?;
         }
-        Ok(s.clone_dtoh(&embedded)?)
+        s.clone_dtoh(&embedded)
+            .context("Gemma device readback failed")
     };
     let scale = bf16::from_f32((hidden as f32).sqrt()).to_f32();
     let stats = Stats::new(&scale_for(scale)?, reference)?;
@@ -308,7 +310,9 @@ fn softcap_tied_head_and_embedding_scale_match_the_definition_gpu() -> Result<()
     let capped = tensor(&data, &format!("head.{tag}.capped"))?;
     let rows = h_host.len() / hidden;
     let h = s.clone_htod(h_host)?;
+    #[cfg(feature = "cuda")]
     let blas = CudaBlas::new(s.clone())?;
+    #[cfg(feature = "cuda")]
     let product = |alpha: bf16| -> Result<Vec<bf16>> {
         let mut y = s.alloc_zeros::<bf16>(rows * vocab)?;
         let config = GemmConfig {
@@ -326,7 +330,31 @@ fn softcap_tied_head_and_embedding_scale_match_the_definition_gpu() -> Result<()
         unsafe {
             blas.gemm(config, &table, &h, &mut y)?;
         }
-        Ok(s.clone_dtoh(&y)?)
+        s.clone_dtoh(&y).context("Gemma device readback failed")
+    };
+    #[cfg(feature = "rocm")]
+    let blas = crate::backend::gpu::blas::Blas::new(s.clone())?;
+    #[cfg(feature = "rocm")]
+    blas.prepare_choice(
+        crate::backend::setup::LinearShape {
+            rows,
+            output: vocab,
+            input: hidden,
+        },
+        None,
+        None,
+    )?;
+    #[cfg(feature = "rocm")]
+    let product = |alpha: bf16| -> Result<Vec<bf16>> {
+        let mut y = s.alloc_zeros::<bf16>(rows * vocab)?;
+        blas.linear(&table, &h, &mut y, rows, vocab, hidden)?;
+        let mut values = s.clone_dtoh(&y)?;
+        if alpha != bf16::ONE {
+            for value in &mut values {
+                *value = bf16::from_f32(value.to_f32() * alpha.to_f32());
+            }
+        }
+        Ok(values)
     };
     let reduction = |out: &[bf16], reference: &[bf16]| -> (f64, f64) {
         let (mut dot, mut a, mut b, mut worst, mut peak) = (0f64, 0f64, 0f64, 0f64, 0f64);
@@ -363,7 +391,7 @@ fn softcap_tied_head_and_embedding_scale_match_the_definition_gpu() -> Result<()
                 .arg(&cap)
                 .launch(flat(input.len()))?;
         }
-        Ok(s.clone_dtoh(&x)?)
+        s.clone_dtoh(&x).context("Gemma device readback failed")
     };
     let stats = Stats::new(&run_cap(raw, cap)?, capped)?;
     println!("GEMMA4_SOFTCAP {}", stats.line(tag));
@@ -386,12 +414,12 @@ fn rms_f32(x: &[f32], weight: &[bf16]) -> Vec<bf16> {
 }
 
 #[test]
-#[ignore = "requires CUDA and FF_GEMMA4_FIXTURES"]
+#[ignore = "requires a GPU and FF_GEMMA4_FIXTURES"]
 fn unrounded_norm_and_branch_boundary_match_the_definition_gpu() -> Result<()> {
     use super::contracts::{RowDomain, SeqRef, Tensor, TensorMut};
     use super::ops::{CommonOpsRef, RmsMode, RmsOptions};
+    use crate::backend::gpu::DevicePtr;
     use crate::backend::gpu::{CudaSlice, CudaStream};
-    use cudarc::driver::DevicePtr;
     use std::sync::Arc;
     fn heads(
         b: &CudaSlice<bf16>,
@@ -456,7 +484,7 @@ fn unrounded_norm_and_branch_boundary_match_the_definition_gpu() -> Result<()> {
                     &mut TensorMut(heads(&y, s, rows, h as u32, d as u32)?),
                     options,
                 )?;
-                Ok(s.clone_dtoh(&y)?)
+                s.clone_dtoh(&y).context("Gemma device readback failed")
             };
             let stats = Stats::new(&run(&vec![bf16::ONE; d])?, reference)?;
             println!("GEMMA4_V_NORM {}", stats.line(&key));
@@ -605,7 +633,7 @@ fn rope_positions() -> Vec<u32> {
 }
 
 #[test]
-#[ignore = "requires CUDA and FF_GEMMA4_FIXTURES"]
+#[ignore = "requires a GPU and FF_GEMMA4_FIXTURES"]
 fn proportional_and_default_rope_tables_match_the_definition_gpu() -> Result<()> {
     use crate::model_spec::RopeSpec;
     const CAPACITY: usize = 131072;
@@ -666,7 +694,7 @@ fn proportional_and_default_rope_tables_match_the_definition_gpu() -> Result<()>
             defects += usize::from(!stats.passes());
         }
         let table_device = s.clone_htod(&table.repeat(2))?;
-        let run = |table: &cudarc::driver::CudaSlice<bf16>,
+        let run = |table: &crate::backend::gpu::CudaSlice<bf16>,
                    x: &[bf16],
                    heads: usize|
          -> Result<Vec<bf16>> {
@@ -690,9 +718,9 @@ fn proportional_and_default_rope_tables_match_the_definition_gpu() -> Result<()>
                         .launch(flat(heads * half))?;
                 }
             }
-            Ok(s.clone_dtoh(&x)?)
+            s.clone_dtoh(&x).context("Gemma device readback failed")
         };
-        let mutants: Vec<(&str, cudarc::driver::CudaSlice<bf16>)> = if tag == "full" {
+        let mutants: Vec<(&str, crate::backend::gpu::CudaSlice<bf16>)> = if tag == "full" {
             [
                 ("rotate_all_256", RopeSpec { pairs: 256, ..spec }),
                 (
@@ -1285,5 +1313,133 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         "GEMMA4_GRAPH_EAGER defects={graph_defects} state_defects={graph_state_defects}"
     );
     println!("GEMMA4_MODEL PASS prefill decode wrap graph");
+    Ok(())
+}
+
+fn gemma4_upload_matches(
+    loaded: &std::collections::BTreeSet<String>,
+    text: &std::collections::BTreeSet<String>,
+) -> Result<()> {
+    ensure!(
+        loaded == text,
+        "uploaded set differs from the Text scope: extra={:?} missing={:?}",
+        loaded.difference(text).take(3).collect::<Vec<_>>(),
+        text.difference(loaded).take(3).collect::<Vec<_>>()
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn ensure_no_other_compute_app() -> Result<()> {
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-compute-apps=pid", "--format=csv,noheader"])
+        .output()?;
+    ensure!(output.status.success(), "RUNNER_FAIL nvidia-smi");
+    let own = std::process::id();
+    let others: Vec<u32> = std::str::from_utf8(&output.stdout)?
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .filter(|&pid| pid != own)
+        .collect();
+    ensure!(
+        others.is_empty(),
+        "RUNNER_FAIL co-tenant compute app: {others:?}"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an otherwise idle GPU and a Gemma 4 E2B/E4B directory in FF_MODEL"]
+fn gemma4_catalog_uploads_exactly_the_text_set_gpu() -> Result<()> {
+    use super::weights::{StoredTensor, WeightCatalog};
+    use crate::checkpoint::TensorScope;
+    use std::collections::BTreeSet;
+    let dir = std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+    let spec = crate::model_spec::ModelSpec::read(&dir)?;
+    let (tensors, resident) = match spec.hidden {
+        1536 => (540usize, 9_257_138_758usize),
+        2560 => (665, 14_926_026_836),
+        hidden => anyhow::bail!("unexpected Gemma 4 hidden size {hidden}"),
+    };
+    #[cfg(feature = "cuda")]
+    ensure_no_other_compute_app()?;
+    let device = crate::backend::cuda::Device::new(0)?;
+    let (free_before, _) = device.ctx.mem_get_info()?;
+    let catalog = WeightCatalog::load(&dir, &spec, &device)?;
+    device.stream.synchronize()?;
+    let (free_after, _) = device.ctx.mem_get_info()?;
+    let text: BTreeSet<String> = catalog
+        .manifest
+        .entries
+        .iter()
+        .filter(|(_, entry)| entry.scope == TensorScope::Text)
+        .map(|(name, _)| name.clone())
+        .collect();
+    let loaded: BTreeSet<String> = catalog.tensors.keys().cloned().collect();
+    gemma4_upload_matches(&loaded, &text)?;
+    let dormant = catalog
+        .manifest
+        .entries
+        .iter()
+        .find(|(_, entry)| entry.scope == TensorScope::Dormant)
+        .map(|(name, _)| name.clone())
+        .context("manifest has no Dormant tensor")?;
+    let mut mutant = loaded.clone();
+    mutant.insert(dormant);
+    ensure!(
+        gemma4_upload_matches(&mutant, &text).is_err(),
+        "a Dormant upload was not detected"
+    );
+    let embed = catalog.bf16("model.language_model.embed_tokens.weight")?;
+    let per_layer = catalog.bf16("model.language_model.embed_tokens_per_layer.weight")?;
+    let layers = spec.layers.len();
+    ensure!(
+        !catalog.tensors.contains_key("lm_head.weight")
+            && embed.len() == spec.vocab as usize * spec.hidden as usize
+            && per_layer.len() == spec.vocab as usize * layers * 256
+            && loaded.len() == tensors
+            && catalog.bytes == resident,
+        "Gemma 4 upload: tensors={} bytes={} embed={} per_layer={}",
+        loaded.len(),
+        catalog.bytes,
+        embed.len(),
+        per_layer.len()
+    );
+    let (bf16_bytes, native_bytes) =
+        catalog
+            .tensors
+            .values()
+            .fold(
+                (0usize, 0usize),
+                |(bf16_bytes, native_bytes), tensor| match tensor {
+                    StoredTensor::Bf16(values) => (bf16_bytes + values.len() * 2, native_bytes),
+                    StoredTensor::Bytes(values) => (bf16_bytes, native_bytes + values.len()),
+                },
+            );
+    ensure!(
+        bf16_bytes + native_bytes == resident && catalog.bytes == resident,
+        "allocator ledger mismatch: bf16={bf16_bytes} native={native_bytes} expected={resident}"
+    );
+    println!(
+        "GEMMA4_ALLOCATOR PASS tensors={} bf16_bytes={} native_bytes={} total={}",
+        loaded.len(),
+        bf16_bytes,
+        native_bytes,
+        bf16_bytes + native_bytes
+    );
+    #[cfg(feature = "cuda")]
+    ensure_no_other_compute_app()?;
+    let used = free_before
+        .checked_sub(free_after)
+        .context("device free memory grew during the load")?;
+    ensure!(
+        used >= resident && used <= resident + (512 << 20),
+        "device memory delta {used} outside [{resident}, {resident} + 512 MiB]"
+    );
+    println!(
+        "GEMMA4_LOADER PASS tensors={} bytes={} device_delta={used}",
+        loaded.len(),
+        catalog.bytes
+    );
     Ok(())
 }
