@@ -2158,7 +2158,11 @@ impl Engine {
                 skip: 0,
             }),
         )?;
-        Ok(self.device.stream.clone_dtoh(&self.work.x.slice(..input.len()))?)
+        let values = self
+            .device
+            .stream
+            .clone_dtoh(&self.work.x.slice(..input.len()))?;
+        Ok(values)
     }
 
     pub fn verification_logits(&self, row: usize) -> Result<Vec<f32>> {
