@@ -52,6 +52,7 @@ pub struct MappedCheckpoint {
     files: BTreeMap<String, File>,
 }
 
+/// MTP tensors are present and the checkpoint architecture has a bound MTP decode path.
 pub fn has_mtp_component(dir: &Path) -> Result<bool> {
     let path = dir.join("model.safetensors.index.json");
     let index = if path.is_file() {
@@ -59,7 +60,12 @@ pub fn has_mtp_component(dir: &Path) -> Result<bool> {
     } else {
         MappedCheckpoint::open(dir)?.index
     };
-    Ok(index.weight_map.keys().any(|name| name.starts_with("mtp.")))
+    if !index.weight_map.keys().any(|name| name.starts_with("mtp.")) {
+        return Ok(false);
+    }
+    Ok(crate::model_spec::ModelSpec::read(dir)?
+        .architecture
+        .mtp_decode())
 }
 
 impl MappedCheckpoint {
@@ -2029,7 +2035,19 @@ mod component_tests {
             &path,
             br#"{"weight_map":{"mtp.fc.weight":"model.safetensors"}}"#,
         )?;
+        std::fs::write(
+            root.join("config.json"),
+            include_str!("../tests/data/q38-config.json"),
+        )?;
         assert!(has_mtp_component(&root)?);
+        std::fs::write(
+            root.join("config.json"),
+            include_str!("../tests/data/deepseek41-flash-config.json"),
+        )?;
+        assert!(
+            !has_mtp_component(&root)?,
+            "DeepSeek-V4.1 mtp.* tensors selected an unbound MTP decode"
+        );
         std::fs::write(
             &path,
             br#"{"weight_map":{"mtp.fc.weight":"a","mtp.fc.weight":"b"}}"#,

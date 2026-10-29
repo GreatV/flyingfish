@@ -513,7 +513,10 @@ fn resolve_mtp(requested: Option<u8>, component: bool, plain_selected: bool) -> 
                 !plain_selected,
                 "MTP cannot combine --draft-model, --dump, --trace-layer or --image-tensors"
             );
-            ensure!(component, "checkpoint has no MTP component");
+            ensure!(
+                component,
+                "checkpoint has no MTP component with a bound decode path"
+            );
             Ok(Some(depth))
         }
         None => Ok((component && !plain_selected).then_some(4)),

@@ -54,7 +54,7 @@ impl Engine {
         );
         let spec = crate::model_spec::ModelSpec::read(dir)?;
         ensure!(
-            spec.architecture == crate::model_spec::Architecture::Qwen35Text,
+            spec.architecture.mtp_decode(),
             "MTP generation is supported only for Qwen3.8 text"
         );
         if let Some(ids) = prompt {

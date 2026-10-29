@@ -14,6 +14,12 @@ pub enum Architecture {
     LoopVl,
     DeepseekV41,
 }
+impl Architecture {
+    /// Architectures with a bound MTP decode path.
+    pub fn mtp_decode(self) -> bool {
+        self == Self::Qwen35Text
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Mixer {
     FullAttention,
