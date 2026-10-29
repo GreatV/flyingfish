@@ -1,9 +1,58 @@
 //! Shared row-work geometry; excludes weights, persistent state and operator scratch.
 use crate::{
     model_spec::{Architecture, ModelSpec},
-    op_contract::{FullAttentionSpec, GdnSpec},
+    op_contract::{DsaSpec, FullAttentionSpec, GdnSpec},
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
+use std::ops::Range;
+
+#[derive(Debug)]
+pub struct DsaRowLayout {
+    pub query: Range<usize>,
+    pub query_residual: Range<usize>,
+    pub latent: Range<usize>,
+    pub index_query: Range<usize>,
+    pub index_weights: Range<usize>,
+    pub packed: Range<usize>,
+}
+
+impl DsaRowLayout {
+    pub fn new(spec: &ModelSpec, rows: usize) -> Result<Self> {
+        ensure!(
+            rows > 0 && rows <= i32::MAX as usize,
+            "invalid DSA row extent"
+        );
+        let d = DsaSpec::from_model(spec)?;
+        let glm = spec.glm5_next.as_ref().context("DSA geometry missing")?;
+        let mut end = 0u32;
+        let mut span = |width: u32| -> Result<Range<usize>> {
+            ensure!(width > 0, "empty DSA projection width");
+            let start = end;
+            end = end
+                .checked_add(width)
+                .context("DSA projection width overflow")?;
+            Ok(RowWorkSpec::elements(rows, start as usize)?
+                ..RowWorkSpec::elements(rows, end as usize)?)
+        };
+        Ok(Self {
+            query: span(
+                d.q_heads
+                    .checked_mul(d.qk_dim)
+                    .context("DSA query width overflow")?,
+            )?,
+            query_residual: span(glm.q_lora_rank)?,
+            latent: span(d.latent_dim)?,
+            index_query: span(
+                d.index_heads
+                    .checked_mul(d.index_dim)
+                    .context("DSA index width overflow")?,
+            )?,
+            index_weights: span(d.index_heads)?,
+            packed: span(d.packed_width())?,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RowWorkSpec {
     pub hidden: usize,
@@ -38,7 +87,30 @@ impl RowWorkSpec {
                 0,
             ),
             Architecture::Glm5Next => {
-                anyhow::bail!("GLM-5.3 row work is not bound yet")
+                let g = spec.gdn.as_ref().context("GLM KDA geometry missing")?;
+                let d = DsaSpec::from_model(spec)?;
+                let key = g
+                    .key_heads
+                    .checked_mul(g.key_head_dim)
+                    .context("KDA key width overflow")?;
+                let value = g
+                    .value_heads
+                    .checked_mul(g.value_head_dim)
+                    .context("KDA value width overflow")?;
+                let kda_projection = key
+                    .checked_mul(2)
+                    .and_then(|n| n.checked_add(value))
+                    .context("KDA projection width overflow")?;
+                let dsa_projection = DsaRowLayout::new(spec, 1)?.packed.end;
+                let ab = value
+                    .checked_add(g.value_heads)
+                    .context("KDA gate width overflow")?;
+                (
+                    (kda_projection as usize).max(dsa_projection),
+                    value.max(d.q_heads * d.v_dim) as usize,
+                    true,
+                    ab as usize,
+                )
             }
             Architecture::DeepseekV41 => {
                 let moe = spec
@@ -72,7 +144,7 @@ impl RowWorkSpec {
                     full.max(gqkv),
                     q.max((g.hv * g.dv) as usize),
                     true,
-                    (2 * g.hv) as usize,
+                    g.ab_width()? as usize,
                 )
             }
         };

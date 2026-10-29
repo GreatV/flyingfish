@@ -199,7 +199,59 @@ pub struct MoeSharedW8A8 {
     down: CudaFunction,
 }
 
+pub(crate) struct W8A8BlockCall<'a> {
+    pub projections: &'a [super::super::linear::NativeProjection; 3],
+    pub fp8: &'a super::super::linear::Fp8Ops,
+    pub common: &'a super::super::ops::CommonOpsRef,
+    pub rows: super::super::contracts::RowDomain,
+    pub x: Tensor<bf16, 2>,
+    pub gate: Tensor<bf16, 2>,
+    pub up: Tensor<bf16, 2>,
+    pub activation: Tensor<bf16, 2>,
+    pub out: Tensor<bf16, 2>,
+}
+
 impl MoeSharedW8A8 {
+    pub(crate) fn run_block(stream: &Arc<CudaStream>, call: W8A8BlockCall<'_>) -> Result<()> {
+        let W8A8BlockCall {
+            projections,
+            fp8,
+            common,
+            rows,
+            x,
+            gate,
+            up,
+            activation,
+            out,
+        } = call;
+        projections[0].run(fp8, stream, x, &TensorMut(gate))?;
+        projections[1].run(fp8, stream, x, &TensorMut(up))?;
+        let tensor3 = |tensor: Tensor<bf16, 2>| -> Result<Tensor<bf16, 3>> {
+            tensor.validate()?;
+            let [m, n] = tensor.shape;
+            ensure!(
+                tensor.stride == [u64::from(n), 1],
+                "W8A8 block activation must be dense"
+            );
+            unsafe {
+                Tensor::new(
+                    tensor.ptr,
+                    [m, 1, n],
+                    [u64::from(n), u64::from(n), 1],
+                    tensor.span_bytes,
+                )
+            }
+        };
+        common.gate.swiglu(
+            stream,
+            rows,
+            tensor3(gate)?,
+            tensor3(up)?,
+            &mut TensorMut(tensor3(activation)?),
+        )?;
+        projections[2].run(fp8, stream, activation, &TensorMut(out))
+    }
+
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
         let module = cubin::module(ctx, "moe_ffn")?;
         Ok(Self {

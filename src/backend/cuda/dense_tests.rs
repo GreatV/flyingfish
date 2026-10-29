@@ -1,5 +1,7 @@
 use super::*;
 use crate::backend::cuda::Device;
+#[cfg(feature = "rocm")]
+use crate::backend::cuda::gdn;
 use crate::{
     backend::setup::{AttentionPlan, MultiImpl, MultiPlan, MultiShape},
     config::Config,
@@ -239,11 +241,18 @@ fn hip_gdn_case(model: crate::model_spec::ModelSpec) -> Result<()> {
             rows,
             GdnBindings {
                 qkv: view(&dqkv, stream, [rows, cd as u32], [cd as u64, 1])?,
-                a: view(&da, stream, [rows, spec.hv], [heads as u64, 1])?,
+                a: gdn::GdnGateInput::PerHead(view(
+                    &da,
+                    stream,
+                    [rows, spec.hv],
+                    [heads as u64, 1],
+                )?),
                 b: view(&db, stream, [rows, spec.hv], [heads as u64, 1])?,
-                conv_weight: view(&dc, stream, [cd as u32, 4], [4, 1])?,
-                a_log: view(&dal, stream, [spec.hv], [1])?,
-                dt_bias: view(&ddt, stream, [spec.hv], [1])?,
+                conv_weight: gdn::GdnConvWeights::Fused(view(&dc, stream, [cd as u32, 4], [4, 1])?),
+                decay: gdn::GdnDecayWeights::Bf16 {
+                    a_log: view(&dal, stream, [spec.hv], [1])?,
+                    dt_bias: view(&ddt, stream, [spec.hv], [1])?,
+                },
                 core_out: TensorMut(view(
                     &dout,
                     stream,
@@ -466,6 +475,7 @@ fn hip_gdn_case(model: crate::model_spec::ModelSpec) -> Result<()> {
             let dn = stream.clone_htod(&norm)?;
             let dz = stream.clone_htod(&z)?;
             let gated = ops::GatedRmsInput {
+                mode: ops::GatedRmsMode::SiluBf16,
                 x: view(
                     &dout,
                     stream,

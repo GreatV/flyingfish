@@ -14,6 +14,8 @@ pub struct CombineOps {
     combine_ungated: CudaFunction,
     #[cfg(feature = "cuda")]
     combine_accum: CudaFunction,
+    #[cfg(feature = "cuda")]
+    combine_bf16: CudaFunction,
     combine_routed: CudaFunction,
     combine_routed_vector: CudaFunction,
     join_routed: CudaFunction,
@@ -430,6 +432,8 @@ impl CombineOps {
             combine_ungated: module.load_function("moe_combine_ungated")?,
             #[cfg(feature = "cuda")]
             combine_accum: module.load_function("moe_combine_accum")?,
+            #[cfg(feature = "cuda")]
+            combine_bf16: module.load_function("moe_combine_bf16")?,
             combine_routed: module.load_function("moe_combine_routed")?,
             combine_routed_vector: module.load_function("moe_combine_routed_vector")?,
             join_routed: module.load_function("moe_join_routed")?,
@@ -470,6 +474,30 @@ impl CombineOps {
                 .arg(&(rows as i32))
                 .arg(&(hidden as i64))
                 .arg(&(x.stride[0] as i64))
+                .launch(grid(rows as usize, 256))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn combine_bf16(&self, stream: &Arc<CudaStream>, input: &MoeCombine) -> Result<()> {
+        let (rows, top_k, hidden) = input.validate()?;
+        ensure!(
+            input.shared_expert_gate.is_none() && input.scale.is_none(),
+            "BF16 combine requires an ungated shared expert"
+        );
+        unsafe {
+            stream
+                .launch_builder(&self.combine_bf16)
+                .arg(&input.contributions.ptr)
+                .arg(&input.shared_out.ptr)
+                .arg(&input.ids.ptr)
+                .arg(&input.done.ptr)
+                .arg(&input.final_active.ptr)
+                .arg(&input.y.0.ptr)
+                .arg(&(rows as i32))
+                .arg(&(top_k as i32))
+                .arg(&(hidden as i64))
                 .launch(grid(rows as usize, 256))?;
         }
         Ok(())

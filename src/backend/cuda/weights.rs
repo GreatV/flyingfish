@@ -916,11 +916,14 @@ impl Loader<'_> {
             let valid = match dtype {
                 Dtype::F8_E4M3 => staging.as_slice()?[..len].iter().all(|c| c & 0x7f != 0x7f),
                 Dtype::F8_E8M0 => staging.as_slice()?[..len].iter().all(|c| *c != 0xff),
-                Dtype::BF16 => staging.as_slice()?[..len]
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .all(|c| u16::from_le_bytes(*c) & 0x7f80 != 0x7f80),
+                Dtype::BF16 => {
+                    ensure!(len % 2 == 0, "unaligned BF16 chunk in {name}");
+                    staging.as_slice()?[..len]
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .all(|c| bf16::from_bits(u16::from_le_bytes(*c)).is_finite())
+                }
                 Dtype::F32 => {
                     ensure!(len % 4 == 0, "unaligned F32 chunk in {name}");
                     staging.as_slice()?[..len]
@@ -959,6 +962,26 @@ pub(crate) enum StoredTensor {
     Bf16(CudaSlice<bf16>),
     Bytes(CudaSlice<u8>),
 }
+impl StoredTensor {
+    fn load(loader: &mut Loader<'_>, name: &str, entry: &TensorEntry) -> Result<Self> {
+        if entry.native_byte_storage() {
+            Ok(Self::Bytes(loader.load_bytes(
+                name,
+                &entry.shape,
+                entry.dtype,
+            )?))
+        } else {
+            ensure!(
+                entry.dtype == Dtype::BF16,
+                "unsupported loaded dtype for {name}"
+            );
+            Ok(Self::Bf16(
+                loader.load(&[(name.to_owned(), entry.shape.clone())])?,
+            ))
+        }
+    }
+}
+
 pub(crate) struct WeightCatalog {
     pub linear_format: crate::model_spec::LinearFormat,
     pub tensors: BTreeMap<String, StoredTensor>,
@@ -1063,22 +1086,7 @@ impl WeightCatalog {
                         );
                         continue;
                     }
-                    let value = match entry.dtype {
-                        Dtype::BF16 => {
-                            StoredTensor::Bf16(loader.load(&[(name.clone(), entry.shape.clone())])?)
-                        }
-                        Dtype::F8_E4M3 => StoredTensor::Bytes(loader.load_bytes(
-                            name,
-                            &entry.shape,
-                            entry.dtype,
-                        )?),
-                        Dtype::F32 => StoredTensor::Bytes(loader.load_bytes(
-                            name,
-                            &entry.shape,
-                            entry.dtype,
-                        )?),
-                        _ => anyhow::bail!("unsupported loaded dtype for {name}"),
-                    };
+                    let value = StoredTensor::load(loader, name, entry)?;
                     tensors.insert(name.clone(), value);
                 }
                 Ok((tensors, loader.bytes, loader.timings))
@@ -1384,7 +1392,11 @@ mod tests {
             let device = crate::backend::cuda::Device::new(0)?;
             let (uploaded, _) =
                 checkpoint_mapped(&mapped, &device, Some(&manifest), false, |loader| {
-                    let uploaded = loader.load_bytes("scale", &[2, 2], Dtype::F32)?;
+                    let StoredTensor::Bytes(uploaded) =
+                        StoredTensor::load(loader, "scale", &manifest.entries["scale"])?
+                    else {
+                        anyhow::bail!("native F32 upload used typed storage");
+                    };
                     ensure!(loader.bytes == 16, "F32 upload accounting mismatch");
                     Ok(uploaded)
                 })?;
@@ -1394,6 +1406,83 @@ mod tests {
                 "F32 native upload changed the published bytes"
             );
             println!("PASS native_f32_upload shape=[2,2] bytes=16");
+            for role in ["hc_attn_fn", "hc_ffn_fn"] {
+                let model = crate::model_spec::ModelSpec::glm5_next(
+                    &serde_json::from_str(include_str!(
+                        "../../../tests/data/glm53-flash-config.json"
+                    ))?,
+                    &serde_json::Value::Null,
+                )?;
+                let mult = model
+                    .glm5_next
+                    .as_ref()
+                    .context("mHC spec missing")?
+                    .hc_mult as usize;
+                let shape = vec![mult * (mult + 2), mult * model.hidden as usize];
+                let data: Vec<u8> = (0..shape.iter().product::<usize>())
+                    .flat_map(|i| {
+                        bf16::from_f32(((i * 37 + 11) % 251) as f32 / 64.0 - 2.0)
+                            .to_bits()
+                            .to_le_bytes()
+                    })
+                    .collect();
+                let name = format!("model.language_model.layers.0.{role}");
+                let mut header = serde_json::to_vec(&serde_json::json!({
+                    &name: {"dtype":"BF16", "shape":shape, "data_offsets":[0,data.len()]}
+                }))?;
+                while !header.len().is_multiple_of(8) {
+                    header.push(b' ');
+                }
+                let mut file = std::fs::File::create(root.join("model.safetensors"))?;
+                file.write_all(&(header.len() as u64).to_le_bytes())?;
+                file.write_all(&header)?;
+                file.write_all(&data)?;
+                drop(file);
+                std::fs::write(
+                    root.join("model.safetensors.index.json"),
+                    serde_json::to_vec(&serde_json::json!({
+                        "metadata":{"total_size":data.len()}, "weight_map":{&name:"model.safetensors"}
+                    }))?,
+                )?;
+                let entry = TensorEntry {
+                    dtype: Dtype::BF16,
+                    shape: shape.clone(),
+                    shard: "model.safetensors".into(),
+                    bytes: data.len(),
+                    load: true,
+                    data_start: 8 + header.len() as u64,
+                    data_offsets: [0, data.len() as u64],
+                    scope: crate::checkpoint::TensorScope::Text,
+                    layer: Some(0),
+                    role: role.into(),
+                    scale_name: None,
+                };
+                let manifest = TensorManifest {
+                    entries: [(name.clone(), entry)].into(),
+                    resident_bytes: data.len(),
+                };
+                let mapped = MappedCheckpoint::open(&root)?;
+                let (uploaded, _) =
+                    checkpoint_mapped(&mapped, &device, Some(&manifest), false, |loader| {
+                        let value = StoredTensor::load(loader, &name, &manifest.entries[&name])?;
+                        let StoredTensor::Bytes(uploaded) = value else {
+                            anyhow::bail!("mHC BF16 upload used typed storage: {role}");
+                        };
+                        ensure!(
+                            loader.bytes == data.len(),
+                            "mHC upload byte accounting mismatch"
+                        );
+                        Ok(uploaded)
+                    })?;
+                ensure!(
+                    device.upload.clone_dtoh(&uploaded)? == data,
+                    "mHC native bytes changed: {role}"
+                );
+                println!(
+                    "PASS native_mhc_upload role={role} dtype=BF16 shape={shape:?} bytes={} bit_changes=0",
+                    data.len()
+                );
+            }
             Ok(())
         })();
         let cleanup = std::fs::remove_dir_all(&root);

@@ -52,6 +52,35 @@ __device__ __forceinline__ AFrag p1_a_kdec(const float* kh, size_t ld, int row0,
     return f;
 }
 
+template<bool Residual = false>
+__device__ __forceinline__ float p1_kdec_channel(const float* kh, size_t ld, int row0,
+                                                int valid, int ci, int dk,
+                                                const float* g, int head, int channel,
+                                                int last) {
+    const int gr = row0 + ci;
+    if (gr >= valid) return 0.0f;
+    const float gl = g[((size_t)last * P2_HEADS + head) * P2_DV + channel];
+    const float gi = g[((size_t)gr * P2_HEADS + head) * P2_DV + channel];
+    return kh[(size_t)gr * ld + dk] * __expf(gl - gi);
+}
+
+template<bool Residual = false>
+__device__ __forceinline__ AFrag p1_a_kdec_channel(const float* kh, size_t ld, int row0,
+                                                  int valid, const float* g, int head,
+                                                  int channel, int last, int dk, int t2) {
+    const int c0 = t2;
+    AFrag f;
+    f.r[0] = p1_pack<Residual>(p1_kdec_channel(kh, ld, row0, valid, c0, dk, g, head, channel, last),
+                               p1_kdec_channel(kh, ld, row0, valid, c0 + 1, dk, g, head, channel, last));
+    f.r[1] = p1_pack<Residual>(p1_kdec_channel(kh, ld, row0, valid, c0, dk + 8, g, head, channel, last),
+                               p1_kdec_channel(kh, ld, row0, valid, c0 + 1, dk + 8, g, head, channel, last));
+    f.r[2] = p1_pack<Residual>(p1_kdec_channel(kh, ld, row0, valid, c0 + 8, dk, g, head, channel, last),
+                               p1_kdec_channel(kh, ld, row0, valid, c0 + 9, dk, g, head, channel, last));
+    f.r[3] = p1_pack<Residual>(p1_kdec_channel(kh, ld, row0, valid, c0 + 8, dk + 8, g, head, channel, last),
+                               p1_kdec_channel(kh, ld, row0, valid, c0 + 9, dk + 8, g, head, channel, last));
+    return f;
+}
+
 // A from a BF16 buffer (T, encoded qk, materialized W), shared or global; same register
 // order as p1_a_rows.
 __device__ __forceinline__ AFrag p1_a_sbf(const __nv_bfloat16* base, int ld, int row0,

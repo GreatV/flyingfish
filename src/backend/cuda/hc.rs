@@ -3,15 +3,17 @@
 //! nine-stage layer program (model.py Block; modeling_glm5_next.py; mHC
 //! arXiv 2512.24880).
 use crate::backend::cuda::contracts::{Tensor, TensorMut, dense_layout, view};
-use crate::backend::cuda::cubin;
 use crate::backend::cuda::mhc::{
     HcCombOrientation, HcFnDtype, HcFnW, HcMixes, HcParams, HcRounding, HcUpdate, HcWeights,
     MhcOps, mix_rows, validate_params,
 };
 use crate::backend::cuda::ops::flat;
+use crate::backend::cuda::{copy, cubin};
+use crate::backend::gpu::{
+    CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, PushKernelArg,
+};
 use crate::model::{HcPrePolicy, HcPreSource, HcSublayer};
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, PushKernelArg};
 use half::bf16;
 use std::{mem::size_of, sync::Arc};
 
@@ -29,6 +31,26 @@ pub struct HcBinding {
     pub orientation: HcCombOrientation,
     /// fn projection storage dtype.
     pub fn_dtype: HcFnDtype,
+}
+
+pub fn glm_binding(spec: &crate::model_spec::ModelSpec) -> Result<HcBinding> {
+    let config = spec
+        .glm5_next
+        .as_ref()
+        .context("GLM configuration missing")?;
+    Ok(HcBinding {
+        params: HcParams {
+            mult: config.hc_mult,
+            hidden: spec.hidden,
+            iters: config.hc_sinkhorn_iters,
+            eps: config.hc_eps,
+            norm_eps: spec.rms_eps,
+        },
+        policy: crate::model::hc_pre_policy(spec.architecture)?,
+        rounding: HcRounding::PostCombBf16,
+        orientation: HcCombOrientation::Transposed,
+        fn_dtype: HcFnDtype::Bf16,
+    })
 }
 
 /// Owned device weight bytes of one mHC sublayer instance: fn in the bound
@@ -63,6 +85,8 @@ pub struct HcRuntime {
     pub(crate) attn_pre: Option<CudaSlice<f32>>,
     /// `[rows, mult]` f32 pre mixer output of the in-flight sublayer.
     pub(crate) mix_pre: CudaSlice<f32>,
+    /// `[rows, mult]` f32 uniform coefficients for the final stream mean.
+    head_pre: CudaSlice<f32>,
     /// `[rows, mult]` f32 post mixer output of the in-flight sublayer.
     pub(crate) mix_post: CudaSlice<f32>,
     /// `[rows, mult*mult]` f32 combination matrix, rows indexed `[j=out, k=in]`.
@@ -148,6 +172,7 @@ impl HcRuntime {
                 None
             },
             mix_pre: s.alloc_zeros(rows * mult)?,
+            head_pre: s.clone_htod(&vec![1.0 / mult as f32; rows * mult])?,
             mix_post: s.alloc_zeros(rows * mult)?,
             mix_comb: s.alloc_zeros(rows * mult * mult)?,
             one_hot: if carries {
@@ -227,7 +252,7 @@ impl HcRuntime {
     }
 
     /// Host copy of one sublayer's fn, base and scale bytes as uploaded.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn sublayer_weight_host(
         &self,
         s: &Arc<CudaStream>,
@@ -357,8 +382,7 @@ impl HcRuntime {
         Ok(())
     }
 
-    /// Model-final head collapse: the stream collapses with the last
-    /// sublayer's own pre-mix (model.py:1271), no carry update.
+    /// Carried-policy final pre-mix; own-policy uniform residual-stream mean.
     pub fn collapse_final(
         &self,
         s: &Arc<CudaStream>,
@@ -368,7 +392,11 @@ impl HcRuntime {
         self.check_rows(rows)?;
         let mult = self.binding.params.mult;
         let pre_view = view(
-            &self.mix_pre,
+            if self.binding.policy.attention == HcPreSource::Carried {
+                &self.mix_pre
+            } else {
+                &self.head_pre
+            },
             s,
             0,
             [rows as u32, mult],
@@ -424,6 +452,42 @@ impl HcRuntime {
             &self.stream_next.slice(..count),
             &mut self.stream.slice_mut(..count),
         )?;
+        Ok(())
+    }
+
+    /// `mult` copies of each embedded row and the one-hot carried pre-mix on copy 0.
+    pub fn begin_embedded(
+        &mut self,
+        s: &Arc<CudaStream>,
+        rows: usize,
+        embedded: &CudaSlice<bf16>,
+    ) -> Result<()> {
+        self.check_rows(rows)?;
+        let mult = self.binding.params.mult as usize;
+        let hidden = self.binding.params.hidden as usize;
+        for copy in 0..mult {
+            copy::columns(
+                s,
+                embedded,
+                &mut self.stream.slice_mut(..rows * mult * hidden),
+                copy::Rect {
+                    rows,
+                    width: hidden,
+                    src_pitch: hidden,
+                    src_col: 0,
+                    dst_pitch: mult * hidden,
+                    dst_col: copy * hidden,
+                },
+            )?;
+        }
+        if let Some(carry) = &mut self.carry {
+            let count = rows * mult;
+            let one_hot = self
+                .one_hot
+                .as_ref()
+                .context("mHC carry is bound without its one-hot pre-mix buffer")?;
+            s.memcpy_dtod(&one_hot.slice(..count), &mut carry.slice_mut(..count))?;
+        }
         Ok(())
     }
 
@@ -490,6 +554,7 @@ impl HcRuntime {
             self.attn_pre = Some(s.alloc_zeros(rows * mult)?);
         }
         self.mix_pre = s.alloc_zeros(rows * mult)?;
+        self.head_pre = s.clone_htod(&vec![1.0 / mult as f32; rows * mult])?;
         self.mix_post = s.alloc_zeros(rows * mult)?;
         self.mix_comb = s.alloc_zeros(rows * mult * mult)?;
         self.rows = rows;

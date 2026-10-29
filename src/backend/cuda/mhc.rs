@@ -6,8 +6,8 @@
 //! split/sinkhorn semantics are pinned by the black-box publisher fixtures.
 use crate::backend::cuda::contracts::{Tensor, TensorMut, dense_layout, no_overlap};
 use crate::backend::cuda::cubin;
+use crate::backend::gpu::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use anyhow::{Result, ensure};
-use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use half::bf16;
 use std::sync::Arc;
 

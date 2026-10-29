@@ -1171,6 +1171,14 @@ impl MappedCheckpoint {
             .context("GLM-5.3 geometry missing")?;
         let hidden = spec.hidden as usize;
         let depth = spec.layers.len();
+        let hc_width = (glm.hc_mult as usize)
+            .checked_mul(hidden)
+            .context("GLM HC input width overflow")?;
+        let hc_coefficients = glm
+            .hc_mult
+            .checked_add(2)
+            .and_then(|n| n.checked_mul(glm.hc_mult))
+            .context("GLM HC coefficient width overflow")? as usize;
         for name in ["model.language_model.embed_tokens.weight", "lm_head.weight"] {
             put(
                 expected,
@@ -1205,7 +1213,13 @@ impl MappedCheckpoint {
             }
             if i < depth {
                 for name in ["hc_attn_base", "hc_ffn_base"] {
-                    put(expected, format!("{p}.{name}"), Dtype::F32, vec![24], scope);
+                    put(
+                        expected,
+                        format!("{p}.{name}"),
+                        Dtype::F32,
+                        vec![hc_coefficients],
+                        scope,
+                    );
                 }
                 for name in ["hc_attn_scale", "hc_ffn_scale"] {
                     put(expected, format!("{p}.{name}"), Dtype::F32, vec![3], scope);
@@ -1215,7 +1229,7 @@ impl MappedCheckpoint {
                         expected,
                         format!("{p}.{name}"),
                         Dtype::BF16,
-                        vec![24, 4 * hidden],
+                        vec![hc_coefficients, hc_width],
                         scope,
                     );
                 }
@@ -1266,7 +1280,10 @@ impl MappedCheckpoint {
     ) -> Result<()> {
         let g = spec.gdn.as_ref().context("GLM-5.3 KDA geometry missing")?;
         let hidden = spec.hidden as usize;
-        let width = (g.value_heads * g.value_head_dim) as usize;
+        let width = g
+            .value_heads
+            .checked_mul(g.value_head_dim)
+            .context("GLM KDA projection width overflow")? as usize;
         let heads = g.value_heads as usize;
         let low_rank = g.key_head_dim as usize;
         for (role, n, k) in [
@@ -1335,6 +1352,15 @@ impl MappedCheckpoint {
         let q_lora = glm.q_lora_rank as usize;
         let kv_lora = glm.kv_lora_rank as usize;
         let index_dim = glm.index_head_dim as usize;
+        let kv_width = glm
+            .qk_nope_head_dim
+            .checked_add(glm.v_head_dim)
+            .and_then(|n| n.checked_mul(spec.q_heads))
+            .context("GLM DSA expanded KV width overflow")? as usize;
+        let output_width = spec
+            .q_heads
+            .checked_mul(glm.v_head_dim)
+            .context("GLM DSA output width overflow")? as usize;
         for (suffix, shape) in [
             (
                 "index_kpool_compress_ape",
@@ -1374,17 +1400,14 @@ impl MappedCheckpoint {
             expected,
             format!("{prefix}.self_attn.kv_b_proj.weight"),
             Dtype::BF16,
-            vec![
-                (glm.qk_nope_head_dim + glm.v_head_dim) as usize * spec.q_heads as usize,
-                kv_lora,
-            ],
+            vec![kv_width, kv_lora],
             scope,
         );
         for (role, n, k) in [
             ("q_a_proj", q_lora, hidden),
             ("q_b_proj", spec.q_width as usize, q_lora),
             ("kv_a_proj_with_mqa", kv_lora, hidden),
-            ("o_proj", hidden, spec.q_width as usize),
+            ("o_proj", hidden, output_width),
         ] {
             projection_scoped(
                 expected,
@@ -1913,6 +1936,20 @@ pub struct TensorEntry {
     pub scale_name: Option<String>,
 }
 impl TensorEntry {
+    #[cfg(any(feature = "cuda", feature = "rocm", test))]
+    pub(crate) fn native_byte_storage(&self) -> bool {
+        matches!(self.dtype, Dtype::F8_E4M3 | Dtype::F32)
+            || (self.dtype == Dtype::BF16
+                && matches!(self.role.as_str(), "hc_attn_fn" | "hc_ffn_fn"))
+    }
+
+    pub(crate) fn is_linear_projection(&self) -> bool {
+        self.is_non_expert_loaded()
+            && self.shape.len() == 2
+            && (self.role.ends_with(".weight")
+                || self.role == "self_attn.indexer.index_kpool_compress_gate")
+    }
+
     pub(crate) fn is_routed_expert(&self) -> bool {
         self.role.starts_with("mlp.experts.")
     }
@@ -1953,6 +1990,40 @@ pub struct TensorManifest {
 }
 
 impl TensorManifest {
+    pub(crate) fn validate_dsa_layer(
+        &self,
+        spec: &crate::model_spec::ModelSpec,
+        layer: u32,
+        prefix: &str,
+    ) -> Result<()> {
+        let mut expected = BTreeMap::new();
+        MappedCheckpoint::glm5_next_dsa(
+            spec,
+            prefix.trim_end_matches('.'),
+            &mut expected,
+            TensorScope::Text,
+        )?;
+        for (name, (dtype, shape, scope)) in expected {
+            let entry = self
+                .entries
+                .get(&name)
+                .with_context(|| format!("DSA layer {layer} missing binding {name}"))?;
+            ensure!(
+                entry.load
+                    && entry.scope == scope
+                    && entry.layer == Some(layer)
+                    && entry.role == name[prefix.len()..]
+                    && entry.dtype == dtype
+                    && entry.shape == shape
+                    && entry.bytes == tensor_bytes(dtype, &shape)?
+                    && entry.data_offsets[1].checked_sub(entry.data_offsets[0])
+                        == Some(u64::try_from(entry.bytes)?),
+                "DSA layer {layer} native binding mismatch: {name}"
+            );
+        }
+        Ok(())
+    }
+
     /// Loaded text-tower non-expert tensor bytes scanned during decode (excludes token embedding lookup).
     pub fn non_expert_decode_bytes(&self) -> Result<u64> {
         self.entries
@@ -2019,6 +2090,399 @@ impl MappedCheckpoint {
 #[cfg(test)]
 mod component_tests {
     use super::*;
+
+    fn binding_literals<'a>(source: &'a str, begin: &str, end: &str) -> Result<Vec<&'a str>> {
+        let body = source
+            .split_once(begin)
+            .with_context(|| format!("binding census scope missing: {begin}"))?
+            .1
+            .split_once(end)
+            .with_context(|| format!("binding census scope end missing: {end}"))?
+            .0;
+        Ok(body.split('"').skip(1).step_by(2).collect())
+    }
+
+    fn glm_consumer_roles(
+        mixer: crate::model_spec::Mixer,
+        dense: bool,
+    ) -> Result<BTreeSet<String>> {
+        let engine = include_str!("backend/cuda/engine_qwen.rs");
+        let linear = include_str!("backend/cuda/linear.rs");
+        let gdn = include_str!("backend/cuda/gdn.rs");
+        let mut roles = BTreeSet::new();
+        for role in binding_literals(engine, "layers.push(Layer {", "let module =")? {
+            if role.ends_with(".weight") {
+                roles.insert(role.to_owned());
+            }
+        }
+        let hc = binding_literals(
+            engine,
+            "fn take_glm_hc_weights(",
+            "pub(super) struct GlmDsaOutputs",
+        )?;
+        for base in hc.iter().filter(|name| name.starts_with("hc_")) {
+            for suffix in hc.iter().filter_map(|name| name.strip_prefix("{base}")) {
+                roles.insert(format!("{base}{suffix}"));
+            }
+        }
+        let (begin, end) = if mixer == crate::model_spec::Mixer::FullAttention {
+            ("fn glm_dsa_mixer(", "pub(super) fn qwen_mixer(")
+        } else {
+            ("fn project_kda(", "pub(super) fn matrix(")
+        };
+        for role in binding_literals(engine, begin, end)? {
+            if role.starts_with("self_attn.") {
+                roles.insert(role.to_owned());
+            }
+        }
+        if mixer == crate::model_spec::Mixer::FullAttention {
+            let aux = binding_literals(engine, "let aux = |name: &str|", "} else if flint {")?;
+            for role in aux {
+                if let Some(role) = role.strip_prefix("{prefix}") {
+                    if role != "self_attn.{name}" {
+                        roles.insert(role.to_owned());
+                    }
+                } else if role.ends_with(".weight") || role.ends_with(".bias") {
+                    roles.insert(format!("self_attn.{role}"));
+                }
+            }
+        } else {
+            for role in binding_literals(
+                engine,
+                "pub(super) fn qwen_mixer(",
+                "pub(super) fn run_moe_if_bound(",
+            )? {
+                if role.starts_with("self_attn.") {
+                    roles.insert(role.to_owned());
+                }
+            }
+            for role in binding_literals(engine, "Mixer::Gdn => {", "layers.push(Layer {")? {
+                if role.starts_with("self_attn.") && role.ends_with(".weight") {
+                    roles.insert(role.to_owned());
+                }
+            }
+            for role in binding_literals(
+                gdn,
+                "impl GdnDecayWeights {",
+                "pub(crate) enum GdnConvWeights",
+            )? {
+                if let Some(role) = role.strip_prefix("{prefix}") {
+                    roles.insert(format!("self_attn.{role}"));
+                }
+            }
+            for role in binding_literals(
+                gdn,
+                "impl GdnConvWeights {",
+                "pub(crate) struct GdnBindings",
+            )? {
+                if role.ends_with("_conv1d") {
+                    roles.insert(format!("self_attn.{role}.weight"));
+                }
+            }
+        }
+        let ffn = if dense {
+            binding_literals(engine, "O::GateUp => {", "O::Head => {")?
+        } else {
+            binding_literals(linear, "pub fn bind(spec:", "let shared =")?
+        };
+        for role in ffn {
+            if role.starts_with("mlp.") {
+                roles.insert(role.to_owned());
+            }
+        }
+        if !dense {
+            for role in binding_literals(engine, "impl NativeFfn {", "enum BoundMixer")? {
+                if let Some(role) = role.strip_prefix("model.language_model.layers.{layer}.") {
+                    roles.insert(role.to_owned());
+                }
+            }
+        }
+        ensure!(!roles.is_empty(), "empty GLM consumer role census");
+        Ok(roles)
+    }
+
+    #[test]
+    #[ignore = "requires the published GLM safetensors index"]
+    fn glm_production_binding_index() -> Result<()> {
+        let directory = std::env::var_os("FF_GLM_MODEL").context("FF_GLM_MODEL is required")?;
+        let directory = Path::new(&directory);
+        let spec = crate::model_spec::ModelSpec::read(directory)?;
+        ensure!(
+            spec.architecture == crate::model_spec::Architecture::Glm5Next,
+            "GLM census architecture mismatch"
+        );
+        let index: Index = serde_json::from_slice(&std::fs::read(
+            directory.join("model.safetensors.index.json"),
+        )?)?;
+        let mut inventory = BTreeMap::new();
+        MappedCheckpoint::glm5_next_entries(&spec, &mut inventory)?;
+        let mut requested = BTreeSet::new();
+        let mut missing = Vec::new();
+        let mut resolve = |name: String| {
+            if requested.insert(name.clone()) && !index.weight_map.contains_key(&name) {
+                missing.push(name);
+            }
+        };
+        for role in binding_literals(
+            include_str!("backend/cuda/weights.rs"),
+            "pub fn take_globals(",
+            "pub fn load(",
+        )? {
+            if role.starts_with("model.language_model.") || role == "lm_head.weight" {
+                resolve(role.to_owned());
+            }
+        }
+        for (layer, plan) in spec.layers.iter().enumerate() {
+            let prefix = format!("model.language_model.layers.{layer}.");
+            for role in
+                glm_consumer_roles(plan.mixer, plan.ffn == crate::model_spec::FfnKind::Dense)?
+            {
+                resolve(format!("{prefix}{role}"));
+            }
+            for (name, (_, _, scope)) in &inventory {
+                if *scope == TensorScope::Text && name.starts_with(&prefix) {
+                    resolve(name.clone());
+                }
+            }
+        }
+        let first = missing.first().map_or("none", String::as_str);
+        println!(
+            "GLM_BINDING_CENSUS requested={} resolved={} missing={} first_missing={first} layers={} upload_bytes=0",
+            requested.len(),
+            requested.len() - missing.len(),
+            missing.len(),
+            spec.layers.len()
+        );
+        ensure!(
+            missing.is_empty(),
+            "GLM binding requests are missing from the official index: {first}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires the published GLM checkpoint"]
+    fn glm_published_native_storage() -> Result<()> {
+        let root = std::env::var_os("FF_GLM_MODEL").context("FF_GLM_MODEL is required")?;
+        let root = std::path::Path::new(&root);
+        let spec = crate::model_spec::ModelSpec::read(root)?;
+        let mapped = MappedCheckpoint::open(root)?;
+        let manifest = mapped.manifest(&spec, LoadPolicy::TextOnly)?;
+        let mut counts = [0usize; 2];
+        for (name, entry) in &manifest.entries {
+            if !entry.load || !entry.role.starts_with("hc_") {
+                continue;
+            }
+            ensure!(
+                entry.native_byte_storage(),
+                "mHC native storage missing: {name}"
+            );
+            match entry.dtype {
+                Dtype::BF16 => counts[0] += 1,
+                Dtype::F32 => counts[1] += 1,
+                dtype => anyhow::bail!("unexpected published mHC dtype {dtype:?}: {name}"),
+            }
+        }
+        ensure!(
+            counts == [90, 180],
+            "published mHC census mismatch: {counts:?}"
+        );
+        println!("PASS glm_published_native_storage bf16_fn=90 f32=180 conversion=0");
+        Ok(())
+    }
+
+    #[test]
+    fn glm_native_manifest_preserves_roles_and_projection_extents() -> Result<()> {
+        let root = serde_json::from_str(include_str!("../tests/data/glm53-flash-config.json"))?;
+        let mut spec = crate::model_spec::ModelSpec::glm5_next(&root, &serde_json::Value::Null)?;
+        let mut tensors = BTreeMap::new();
+        MappedCheckpoint::glm5_next_entries(&spec, &mut tensors)?;
+        assert_eq!(tensors.len(), 75_761);
+        for (scope, count, bytes) in [
+            (TensorScope::Text, 74_001, 319_706_118_392usize),
+            (TensorScope::Mtp, 1_760, 7_493_399_168),
+        ] {
+            let entries: Vec<_> = tensors.values().filter(|entry| entry.2 == scope).collect();
+            assert_eq!(entries.len(), count);
+            let total = entries.iter().try_fold(0usize, |sum, (dtype, shape, _)| {
+                sum.checked_add(tensor_bytes(*dtype, shape)?)
+                    .context("manifest byte overflow")
+            })?;
+            assert_eq!(total, bytes);
+        }
+        let mut manifest = TensorManifest {
+            entries: BTreeMap::new(),
+            resident_bytes: 0,
+        };
+        for (name, (dtype, shape, scope)) in &tensors {
+            let (layer, role) = split_layer_role(name)?;
+            if !layer.is_some_and(|i| (i + 1).is_multiple_of(4)) || !role.starts_with("self_attn.")
+            {
+                continue;
+            }
+            let bytes = tensor_bytes(*dtype, shape)?;
+            manifest.entries.insert(
+                name.clone(),
+                TensorEntry {
+                    dtype: *dtype,
+                    shape: shape.clone(),
+                    shard: "native.safetensors".into(),
+                    bytes,
+                    load: true,
+                    data_start: 0,
+                    data_offsets: [0, bytes as u64],
+                    scope: *scope,
+                    layer,
+                    role,
+                    scale_name: (*dtype == Dtype::F8_E4M3).then(|| format!("{}_scale_inv", name)),
+                },
+            );
+            manifest.resident_bytes += bytes;
+        }
+        for layer in (3..45).step_by(4) {
+            let plan = crate::linear_plan::LayerDequantPlan::from_model(&manifest, layer, &spec)?;
+            assert!(plan.slots.is_empty());
+            assert_eq!(plan.bytes, 0);
+            assert_eq!(
+                manifest
+                    .entries
+                    .iter()
+                    .filter(|(name, entry)| name.starts_with(&plan.prefix)
+                        && entry.dtype == Dtype::F8_E4M3)
+                    .count(),
+                4
+            );
+            let admitted: Vec<_> = manifest
+                .entries
+                .iter()
+                .filter(|(name, e)| name.starts_with(&plan.prefix) && e.is_linear_projection())
+                .collect();
+            assert_eq!(admitted.len(), 9);
+            let old_suffix_count = admitted
+                .iter()
+                .filter(|(name, _)| name.ends_with(".weight"))
+                .count();
+            assert_eq!(old_suffix_count, 8);
+            let gate = format!("{}self_attn.indexer.index_kpool_compress_gate", plan.prefix);
+            assert!(manifest.entries[&gate].is_linear_projection());
+            let entry = manifest.entries.remove(&gate).unwrap();
+            assert!(
+                crate::linear_plan::LayerDequantPlan::from_model(&manifest, layer, &spec).is_err()
+            );
+            manifest.entries.insert(gate.clone(), entry);
+            manifest.entries.get_mut(&gate).unwrap().shape.swap(0, 1);
+            assert!(
+                crate::linear_plan::LayerDequantPlan::from_model(&manifest, layer, &spec).is_err()
+            );
+            manifest.entries.get_mut(&gate).unwrap().shape.swap(0, 1);
+            manifest.entries.get_mut(&gate).unwrap().load = false;
+            assert!(
+                crate::linear_plan::LayerDequantPlan::from_model(&manifest, layer, &spec).is_err()
+            );
+            manifest.entries.get_mut(&gate).unwrap().load = true;
+        }
+        println!(
+            "PASS glm_dsa_native_binding layers=11 projections_per_layer=9 fp8_slots=4 old_suffix_control=8 missing_shape_unloaded_controls=33"
+        );
+        for (layer, role, dtype, shape) in [
+            (2, "hc_attn_fn", Dtype::BF16, vec![24, 16384]),
+            (2, "hc_attn_base", Dtype::F32, vec![24]),
+            (2, "self_attn.q_proj.weight", Dtype::BF16, vec![8192, 4096]),
+            (
+                2,
+                "self_attn.q_conv1d.weight",
+                Dtype::BF16,
+                vec![8192, 1, 4],
+            ),
+            (2, "self_attn.A_log", Dtype::F32, vec![64]),
+            (2, "self_attn.dt_bias", Dtype::F32, vec![8192]),
+            (
+                3,
+                "self_attn.q_a_proj.weight",
+                Dtype::F8_E4M3,
+                vec![1536, 4096],
+            ),
+            (
+                3,
+                "self_attn.q_a_proj.weight_scale_inv",
+                Dtype::F32,
+                vec![12, 32],
+            ),
+            (
+                3,
+                "self_attn.kv_b_proj.weight",
+                Dtype::BF16,
+                vec![32768, 512],
+            ),
+            (
+                3,
+                "self_attn.o_proj.weight",
+                Dtype::F8_E4M3,
+                vec![4096, 16384],
+            ),
+            (3, "mlp.gate.weight", Dtype::BF16, vec![288, 4096]),
+            (3, "mlp.gate.e_score_correction_bias", Dtype::F32, vec![288]),
+        ] {
+            let name = format!("model.language_model.layers.{layer}.{role}");
+            assert_eq!(tensors[&name], (dtype, shape, TensorScope::Text), "{name}");
+            assert_eq!(split_layer_role(&name)?, (Some(layer), role.to_owned()));
+        }
+        let mut hc_native = 0;
+        let mut old_dtype_control = 0;
+        for (name, (dtype, shape, scope)) in &tensors {
+            let (layer, role) = split_layer_role(name)?;
+            if !role.starts_with("hc_") {
+                continue;
+            }
+            let bytes = tensor_bytes(*dtype, shape)?;
+            let entry = TensorEntry {
+                dtype: *dtype,
+                shape: shape.clone(),
+                shard: "native.safetensors".into(),
+                bytes,
+                load: *scope == TensorScope::Text,
+                data_start: 0,
+                data_offsets: [0, bytes as u64],
+                scope: *scope,
+                layer,
+                role,
+                scale_name: None,
+            };
+            assert!(
+                entry.native_byte_storage(),
+                "mHC native storage missing: {name}"
+            );
+            hc_native += 1;
+            old_dtype_control += usize::from(*dtype == Dtype::BF16);
+            if *dtype == Dtype::BF16 {
+                let mut ordinary = entry;
+                ordinary.role = "self_attn.q_proj.weight".into();
+                assert!(
+                    !ordinary.native_byte_storage(),
+                    "ordinary BF16 changed storage"
+                );
+            }
+        }
+        assert_eq!(hc_native, 270);
+        assert_eq!(old_dtype_control, 90);
+        println!("PASS glm_hc_native_storage entries=270 bf16_fn=90 f32=180 old_dtype_control=90");
+        spec.glm5_next.as_mut().unwrap().v_head_dim = 128;
+        tensors.clear();
+        MappedCheckpoint::glm5_next_dsa(&spec, "layer", &mut tensors, TensorScope::Text)?;
+        assert_eq!(tensors["layer.self_attn.kv_b_proj.weight"].1, [24576, 512]);
+        assert_eq!(tensors["layer.self_attn.o_proj.weight"].1, [4096, 8192]);
+        spec.glm5_next.as_mut().unwrap().v_head_dim = u32::MAX;
+        assert!(
+            MappedCheckpoint::glm5_next_dsa(&spec, "layer", &mut tensors, TensorScope::Text)
+                .is_err()
+        );
+        spec.glm5_next.as_mut().unwrap().hc_mult = u32::MAX;
+        assert!(MappedCheckpoint::glm5_next_entries(&spec, &mut tensors).is_err());
+        println!(
+            "PASS glm_native_manifest text=74001 mtp=1760 native_roles=12 asymmetric_value_control=true overflow_controls=2"
+        );
+        Ok(())
+    }
 
     #[test]
     fn mtp_presence_comes_from_checkpoint_tensor_names() -> Result<()> {

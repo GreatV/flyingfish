@@ -14,13 +14,23 @@ pub(crate) mod cuda;
 #[cfg(feature = "cuda")]
 pub use cuda::cubin::bytes as kernel_cubin;
 #[cfg(any(feature = "cuda", feature = "rocm"))]
+pub use cuda::dsa::{
+    DsaAppendInput, DsaAttentionInput, DsaCheckpoint, DsaIndexInput, DsaIndexOutput, DsaPlan,
+    DsaState, DsaStateView, DsaTopKInput, DsaTopKOutput,
+};
+#[cfg(any(feature = "cuda", feature = "rocm"))]
 pub use cuda::engine::Engine as Backend;
 #[cfg(feature = "cuda")]
 pub use cuda::engine::TextPrefixSaveOutput;
 #[cfg(feature = "cuda")]
 pub use cuda::engine::{TextPrefixRestoreIntent, TextPrefixSaveRequest};
-#[cfg(feature = "cuda")]
-pub use cuda::mhc::{HcCombOrientation, HcFnDtype, HcRounding};
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+pub use cuda::hc::{HcBinding, HcLayerWeights, HcRuntime, HcSublayerWeights};
+#[cfg(any(feature = "cuda", feature = "rocm"))]
+pub use cuda::mhc::{
+    HcCombOrientation, HcFnDtype, HcFnW, HcMixes, HcParams, HcRounding, HcUpdate, HcWeights,
+    MhcOps, mix_rows, validate_params,
+};
 #[cfg(not(any(feature = "cuda", feature = "rocm")))]
 mod missing;
 #[cfg(not(any(feature = "cuda", feature = "rocm")))]

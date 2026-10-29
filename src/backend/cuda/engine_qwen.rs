@@ -4,10 +4,13 @@ use crate::backend::cuda::contracts::view;
 use crate::backend::cuda::{
     attention_d256::{AttentionBindings, FullAttentionOps, FullAttentionPlan, PositionBindings},
     contracts::{RowDomain, Scratch, Tensor, TensorMut},
-    gdn::{CUDA_GRID_YZ_MAX, GdnBindings, GdnOps, GdnPlan},
+    gdn::{
+        CUDA_GRID_YZ_MAX, GdnBindings, GdnConvWeights, GdnDecayWeights, GdnGateInput, GdnOps,
+        GdnPlan,
+    },
     linear::{BoundFfn, LayerLinearPlan, LinearWeightRef},
     ops::{CommonOpsRef, GatedRmsInput, ResidualRmsCapture, ResidualRmsInput, RmsMode, RmsOptions},
-    weights::WeightCatalog,
+    weights::{StoredTensor, WeightCatalog},
 };
 /// The workspace alignment the default-chunk cap must preserve; the same value the budget call passes.
 const CHUNK_ALIGNMENT: usize = 32;
@@ -19,10 +22,13 @@ pub(super) fn default_chunk(admitted: usize) -> usize {
 use crate::backend::cuda::{
     cubin,
     decode::{GqaDecodeInput, SlidingWindow},
+    dsa::{DsaAppendInput, DsaAttentionInput, DsaIndexInput, DsaIndexOutput, DsaPlan},
 };
 use crate::backend::gpu::LaunchConfig;
 use crate::backend::gpu::{CudaFunction, DevicePtr};
+use crate::backend::{HcLayerWeights, HcRuntime, HcSublayerWeights};
 use crate::gdn_plan::GdnPolicy;
+use crate::work_layout::DsaRowLayout;
 use crate::{
     linear_plan::LayerDequantPlan,
     model_spec::Mixer,
@@ -43,7 +49,10 @@ fn debug_name(trace: &Option<Target<'_>>, layer: usize, point: &str) -> String {
 }
 
 fn norm_mode(spec: &crate::model_spec::ModelSpec) -> RmsMode {
-    if spec.architecture == crate::model_spec::Architecture::Flint {
+    if matches!(
+        spec.architecture,
+        crate::model_spec::Architecture::Flint | crate::model_spec::Architecture::Glm5Next
+    ) {
         RmsMode::Standard
     } else {
         RmsMode::ZeroCentered
@@ -278,6 +287,104 @@ fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
     Ok(())
 }
 
+fn require_glm_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
+    use crate::model_spec::{Architecture, LinearFormat};
+    ensure!(
+        spec.architecture == Architecture::Glm5Next,
+        "GLM runtime received architecture={:?}",
+        spec.architecture
+    );
+    let glm = spec
+        .glm5_next
+        .as_ref()
+        .context("GLM-5.3 geometry missing")?;
+    for (name, value, expected) in [
+        ("hidden_size", spec.hidden, 4096),
+        ("intermediate_size", spec.intermediate, 12288),
+        ("vocab_size", spec.vocab, 154_880),
+        ("num_attention_heads", spec.q_heads, 64),
+        ("num_key_value_heads", spec.kv_heads, 64),
+        ("head_dim", spec.head_dim, 256),
+        ("q_width", spec.q_width, 16_384),
+        ("max_position_embeddings", spec.max_position, 1_048_576),
+        ("rotary_dim", spec.rotary_dim, 0),
+    ] {
+        ensure!(value == expected, "GLM runtime implements {name}={value}");
+    }
+    ensure!(
+        spec.layers.len() == 45,
+        "GLM runtime implements {} layers",
+        spec.layers.len()
+    );
+    ensure!(
+        spec.rms_eps == 1e-5,
+        "GLM runtime implements rms_norm_eps={}",
+        spec.rms_eps
+    );
+    ensure!(
+        spec.rope_theta == 1.0,
+        "GLM runtime implements rope_theta={}",
+        spec.rope_theta
+    );
+    ensure!(
+        spec.linear_format == LinearFormat::fp8_block([128, 128], safetensors::Dtype::F32)?,
+        "GLM runtime implements linear_format={:?}",
+        spec.linear_format
+    );
+    let moe = spec.moe.context("GLM MoE geometry missing")?;
+    ensure!(
+        moe.experts == 288
+            && moe.experts_per_tok == 8
+            && moe.expert_intermediate == 2048
+            && moe.shared_intermediate == 2048
+            && moe.score == crate::model_spec::RouterScore::Sigmoid
+            && !moe.shared_gate,
+        "GLM runtime implements MoE geometry {moe:?}"
+    );
+    let gdn = spec.gdn.context("GLM KDA geometry missing")?;
+    ensure!(
+        gdn.key_heads == 64
+            && gdn.value_heads == 64
+            && gdn.key_head_dim == 128
+            && gdn.value_head_dim == 128
+            && gdn.conv_kernel == 4,
+        "GLM runtime implements KDA geometry {gdn:?}"
+    );
+    ensure!(
+        glm.dense_layers == 3
+            && glm.nextn_layers == 1
+            && glm.hc_mult == 4
+            && glm.hc_sinkhorn_iters == 20
+            && glm.hc_eps == 1e-6
+            && glm.q_lora_rank == 1536
+            && glm.kv_lora_rank == 512
+            && glm.qk_nope_head_dim == 256
+            && glm.v_head_dim == 256
+            && glm.index_heads == 32
+            && glm.index_head_dim == 128
+            && glm.index_topk == 2048
+            && glm.index_kpool == 4
+            && glm.gate_lower_bound == -5.0
+            && glm.swiglu_limit == 10.0
+            && glm.routed_scaling_factor == 2.5,
+        "GLM runtime implements text geometry {glm:?}"
+    );
+    crate::op_contract::DsaSpec::from_model(spec)?.validate()?;
+    ensure!(
+        spec.layers
+            .iter()
+            .enumerate()
+            .all(|(layer, plan)| plan.mixer
+                == if (layer + 1).is_multiple_of(4) {
+                    Mixer::FullAttention
+                } else {
+                    Mixer::Gdn
+                }),
+        "GLM runtime implements the published KDA/DSA schedule"
+    );
+    Ok(())
+}
+
 fn require_flint_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
     use crate::model_spec::{Architecture, FfnKind, LinearFormat, Mixer};
     ensure!(
@@ -334,6 +441,96 @@ fn require_flint_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
     Ok(())
 }
 
+fn take_glm_hc_weights(
+    catalog: &mut WeightCatalog,
+    spec: &crate::model_spec::ModelSpec,
+) -> Result<Vec<HcLayerWeights>> {
+    let mut weights = Vec::with_capacity(spec.layers.len());
+    let hidden = spec.hidden as usize;
+    for layer in 0..spec.layers.len() {
+        let prefix = format!("model.language_model.layers.{layer}");
+        let mut take = |suffix: &str, dtype: safetensors::Dtype, shape: &[usize]| {
+            let name = format!("{prefix}.{suffix}");
+            let entry = catalog
+                .manifest
+                .entries
+                .get(&name)
+                .with_context(|| format!("missing GLM mHC tensor {name}"))?;
+            ensure!(
+                entry.dtype == dtype && entry.shape == shape,
+                "GLM mHC tensor mismatch {name}: dtype={:?} shape={:?}",
+                entry.dtype,
+                entry.shape
+            );
+            match catalog.tensors.remove(&name) {
+                Some(StoredTensor::Bytes(value)) => Ok(value),
+                _ => anyhow::bail!("GLM mHC tensor is not uploaded native bytes: {name}"),
+            }
+        };
+        let mut sublayer = |base: &str| -> Result<HcSublayerWeights> {
+            Ok(HcSublayerWeights {
+                fn_w: take(
+                    &format!("{base}_fn"),
+                    safetensors::Dtype::BF16,
+                    &[24, 4 * hidden],
+                )?,
+                base: take(&format!("{base}_base"), safetensors::Dtype::F32, &[24])?,
+                scale: take(&format!("{base}_scale"), safetensors::Dtype::F32, &[3])?,
+            })
+        };
+        weights.push(HcLayerWeights {
+            attn: sublayer("hc_attn")?,
+            ffn: sublayer("hc_ffn")?,
+        });
+    }
+    Ok(weights)
+}
+
+pub(super) struct GlmDsaOutputs {
+    packed: CudaSlice<bf16>,
+    pub(super) selected: CudaSlice<i32>,
+    pub(super) scores: CudaSlice<f32>,
+    pub(super) margins: CudaSlice<f32>,
+    pub(super) indices: CudaSlice<i32>,
+}
+
+impl GlmDsaOutputs {
+    fn new(rows: usize, s: &Arc<CudaStream>) -> Result<Self> {
+        Ok(Self {
+            packed: s.alloc_zeros(rows * 257)?,
+            selected: s.alloc_zeros(rows * 512)?,
+            scores: s.alloc_zeros(rows * 512)?,
+            margins: s.alloc_zeros(rows)?,
+            indices: s.alloc_zeros(rows * 2051)?,
+        })
+    }
+
+    fn pack_index(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        input: &CudaSlice<bf16>,
+        starts: [usize; 2],
+        rows: usize,
+    ) -> Result<()> {
+        for (column, start) in starts.into_iter().enumerate() {
+            super::super::copy::columns(
+                stream,
+                &input.slice(start..start + rows * 128),
+                &mut self.packed,
+                super::super::copy::Rect {
+                    rows,
+                    width: 128,
+                    src_pitch: 128,
+                    src_col: 0,
+                    dst_pitch: 257,
+                    dst_col: column * 128,
+                },
+            )?;
+        }
+        Ok(())
+    }
+}
+
 pub(super) struct Runtime {
     attention: Option<FullAttentionSpec>,
     gdn: Option<GdnSpec>,
@@ -342,6 +539,8 @@ pub(super) struct Runtime {
     vision_bytes: usize,
     #[cfg(test)]
     pub(super) vision_encode_calls: usize,
+    #[cfg(test)]
+    pub(super) glm_calls: Option<std::cell::RefCell<Vec<[usize; 10]>>>,
     positions: CudaSlice<i32>,
     active_positions: CudaSlice<i32>,
     gather_positions: CudaFunction,
@@ -362,9 +561,117 @@ pub(super) struct Runtime {
 struct Layer {
     linear: LayerLinearPlan,
     ffn: BoundFfn,
+    #[cfg(feature = "cuda")]
+    native: Option<NativeFfn>,
     input_norm: Tensor<bf16, 1>,
     post_norm: Tensor<bf16, 1>,
     mixer: BoundMixer,
+}
+
+#[cfg(feature = "cuda")]
+struct NativeFfn {
+    #[cfg(test)]
+    wrong_route: bool,
+    slot_layer: u32,
+    plans: Vec<super::super::moe::decode::NativeMoe>,
+    pointers: CudaSlice<u64>,
+    valid: CudaSlice<u32>,
+    _bias: CudaSlice<u8>,
+}
+
+#[cfg(feature = "cuda")]
+impl NativeFfn {
+    fn new(
+        engine: &Engine,
+        catalog: &WeightCatalog,
+        layer: usize,
+        ffn: &BoundFfn,
+        rows: usize,
+    ) -> Result<Option<Self>> {
+        use super::super::moe::decode::{NativeMoe, NativeMoeGeometry, NativeMoeWeights};
+        let BoundFfn::Native { router, shared } = ffn else {
+            return Ok(None);
+        };
+        let spec = &engine.model_spec;
+        let moe = spec.moe.context("native MoE specification missing")?;
+        let glm = spec
+            .glm5_next
+            .as_ref()
+            .context("GLM configuration missing")?;
+        let stream = &engine.device.stream;
+        let experts = moe.experts as usize;
+        let name = format!("model.language_model.layers.{layer}.mlp.gate.e_score_correction_bias");
+        let geometry = crate::experts::catalogue::ExpertGeometry::from_model(spec)?;
+        let slot_layer = u32::try_from(layer)?
+            .checked_sub(geometry.first_layer)
+            .context("native expert layer precedes first routed layer")?;
+        let entry = catalog
+            .manifest
+            .entries
+            .get(&name)
+            .context("native router bias manifest missing")?;
+        ensure!(
+            entry.dtype == safetensors::Dtype::F32 && entry.shape == [experts],
+            "native router bias requires FP32 [experts]"
+        );
+        let StoredTensor::Bytes(source) = catalog
+            .tensors
+            .get(&name)
+            .context("native router bias not uploaded")?
+        else {
+            anyhow::bail!("native router bias storage is not FP32 bytes");
+        };
+        let mut bias = stream.alloc_zeros::<u8>(rows * experts * 4)?;
+        for row in 0..rows {
+            stream.memcpy_dtod(
+                source,
+                &mut bias.slice_mut(row * experts * 4..(row + 1) * experts * 4),
+            )?;
+        }
+        let pointers = stream.alloc_zeros::<u64>(experts * 6)?;
+        let valid = stream.alloc_zeros::<u32>(experts)?;
+        let mut plans = Vec::with_capacity(rows);
+        for count in 1..=rows {
+            let (bias_ptr, _guard) = bias.device_ptr(stream);
+            let bias_view = unsafe {
+                Tensor::new(
+                    bias_ptr,
+                    [count as u32, moe.experts],
+                    [u64::from(moe.experts), 1],
+                    (count * experts * 4) as u64,
+                )?
+            };
+            plans.push(NativeMoe::new(
+                &engine.device.ctx,
+                stream,
+                NativeMoeGeometry {
+                    hidden: spec.hidden,
+                    intermediate: moe.expert_intermediate,
+                    experts: moe.experts,
+                    top_k: moe.experts_per_tok,
+                    scaling: glm.routed_scaling_factor,
+                    limit: glm.swiglu_limit,
+                },
+                NativeMoeWeights {
+                    router: *router,
+                    bias: bias_view,
+                    slots: view(&pointers, stream, 0, [moe.experts, 6], [6, 1])?,
+                    valid: view(&valid, stream, 0, [moe.experts], [1])?,
+                    shared: **shared,
+                },
+                count as u32,
+            )?);
+        }
+        Ok(Some(Self {
+            #[cfg(test)]
+            wrong_route: false,
+            slot_layer,
+            plans,
+            pointers,
+            valid,
+            _bias: bias,
+        }))
+    }
 }
 enum BoundMixer {
     Attention {
@@ -380,6 +687,16 @@ enum BoundMixer {
         verify: Vec<GdnPlan>,
         replay: Vec<GdnPlan>,
         decode: Box<GdnPlan>,
+    },
+    Dsa {
+        q_norm: Tensor<bf16, 1>,
+        kv_norm: Tensor<bf16, 1>,
+        k_norm: Tensor<bf16, 1>,
+        k_bias: Tensor<bf16, 1>,
+        ape: Tensor<bf16, 2>,
+        kv_b: Tensor<bf16, 2>,
+        prefill: PrefillPlans<DsaPlan>,
+        decode: Box<DsaPlan>,
     },
     Flint {
         q_norm: Tensor<bf16, 1>,
@@ -447,6 +764,96 @@ impl<T> PrefillPlans<T> {
         Ok(Narrowed::Owned(narrow(&self.full, rows as u32)?))
     }
 }
+fn project_kda(
+    linear: &LayerLinearPlan,
+    blas: &super::super::blas::Blas,
+    s: &Arc<CudaStream>,
+    phase: ExecutionPhase,
+    w: &mut Work,
+    spec: GdnSpec,
+    shape: [usize; 3],
+) -> Result<()> {
+    let [linear_rows, capacity, hidden] = shape;
+    ensure!(
+        matches!(
+            spec.gate_mode,
+            crate::op_contract::GdnGateMode::PerChannel { .. }
+        ),
+        "native KDA projection requires per-channel geometry"
+    );
+    spec.validate()?;
+    let value = (spec.hv * spec.dv) as usize;
+    let conv = spec.conv_dim()? as usize;
+    let hv = spec.hv as usize;
+    let a_width = spec.ab_width()? as usize - hv;
+    let mw = w.mixer.as_ref().context("KDA mixer workspace missing")?;
+    let input = matrix(&w.n, s, 0, linear_rows, hidden)?;
+    for (part, role) in [
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        linear.run(
+            blas,
+            role,
+            phase,
+            input,
+            &mut TensorMut(matrix(&w.gu, s, 0, linear_rows, value)?),
+        )?;
+        super::super::copy::columns(
+            s,
+            &w.gu,
+            &mut w.qkv,
+            super::super::copy::Rect {
+                rows: linear_rows,
+                width: value,
+                src_pitch: value,
+                src_col: 0,
+                dst_pitch: conv,
+                dst_col: part * value,
+            },
+        )?;
+    }
+    for (low_role, expand_role, output) in [
+        (
+            "self_attn.f_a_proj.weight",
+            "self_attn.f_b_proj.weight",
+            &mw.ab,
+        ),
+        (
+            "self_attn.g_a_proj.weight",
+            "self_attn.g_b_proj.weight",
+            &mw.gate,
+        ),
+    ] {
+        linear.run(
+            blas,
+            low_role,
+            phase,
+            input,
+            &mut TensorMut(matrix(&w.act, s, 0, linear_rows, spec.dk as usize)?),
+        )?;
+        linear.run(
+            blas,
+            expand_role,
+            phase,
+            matrix(&w.act, s, 0, linear_rows, spec.dk as usize)?,
+            &mut TensorMut(matrix(output, s, 0, linear_rows, value)?),
+        )?;
+    }
+    linear.run(
+        blas,
+        "self_attn.b_proj.weight",
+        phase,
+        input,
+        &mut TensorMut(matrix(&mw.ab, s, capacity * a_width, linear_rows, hv)?),
+    )?;
+    Ok(())
+}
+
 pub(super) fn matrix(
     b: &CudaSlice<bf16>,
     s: &Arc<CudaStream>,
@@ -509,6 +916,68 @@ fn nested_verify_tcmqa(device_prefix: bool, rows: usize, bound: usize) -> Result
     Ok(true)
 }
 impl Runtime {
+    fn native_workspace(
+        spec: &crate::model_spec::ModelSpec,
+        manifest: &crate::checkpoint::TensorManifest,
+        rows: usize,
+    ) -> Result<usize> {
+        use crate::experts::catalogue::{ExpertGeometry, ExpertLayout};
+        let geometry = ExpertGeometry::from_model(spec)?;
+        let layout = ExpertLayout::new(
+            spec.expert_format.context("native expert format missing")?,
+            &geometry,
+        )?;
+        let (h, i, e, k, layers) = (
+            geometry.hidden as u64,
+            geometry.intermediate as u64,
+            geometry.experts as u64,
+            geometry.top_k as u64,
+            geometry.layers as u64,
+        );
+        let rows = u64::try_from(rows)?;
+        let live = (rows * k).min(e);
+        let slots = layers * live * layout.slot_bytes();
+        let quant = |width: u64| width + width.div_ceil(128) * 4;
+        let row_buffers = e * 4
+            + k * 16
+            + quant(h)
+            + k * (i * 6 + quant(i) + h * 4)
+            + i * 6
+            + h * 2
+            + 2 * quant(h)
+            + quant(i)
+            + 4;
+        let plans = layers * (rows * (4 * 1024 * 1024 + 64) + rows * (rows + 1) / 2 * row_buffers);
+        let tables = layers * (e * 6 * 8 + e * 4 + rows * e * 4);
+        let native_inputs = manifest
+            .entries
+            .values()
+            .filter(|entry| {
+                entry.load
+                    && entry.is_linear_projection()
+                    && !entry.is_routed_expert()
+                    && entry.dtype == safetensors::Dtype::F8_E4M3
+            })
+            .try_fold(0u64, |sum, entry| {
+                let &width = entry
+                    .shape
+                    .get(1)
+                    .context("native projection is not a matrix")?;
+                sum.checked_add(quant(width as u64))
+                    .context("native projection scratch overflow")
+            })?
+            * rows;
+        let mult = u64::from(
+            spec.glm5_next
+                .as_ref()
+                .context("GLM configuration missing")?
+                .hc_mult,
+        );
+        let hc = rows * (4 * mult * h + (4 * mult + mult * mult) * 4);
+        let dsa = rows * ((512 * 2 + 1 + 2051) * 4 + 257 * 2);
+        usize::try_from(slots + plans + tables + native_inputs + hc + dsa)
+            .context("native workspace exceeds address space")
+    }
     #[cfg(all(test, feature = "cuda"))]
     pub(super) fn allocated_workspace_bytes(&self) -> u64 {
         self.scratch.len() as u64
@@ -607,24 +1076,50 @@ impl Runtime {
                 )?;
             return Ok(usize::try_from(decode.max(prefill).div_ceil(256) * 256)?);
         }
-        let attention = FullAttentionSpec::from_model(model)?;
+        let attention = if model.architecture == crate::model_spec::Architecture::Glm5Next {
+            None
+        } else {
+            Some(FullAttentionSpec::from_model(model)?)
+        };
         let gdn = GdnSpec::from_model(model)?;
-        let attention_prefill = if cfg!(feature = "rocm") {
-            FullAttentionOps::workspace(&attention, limits(rows, capacity)?)?
-        } else {
-            FullAttentionOps::preprocess_workspace(&attention, limits(rows, capacity)?)?
-        };
-        let attention_decode =
-            FullAttentionOps::decode_workspace(&attention, 1, u32::try_from(capacity)?)?;
-        let attention_nested_verify = if cfg!(feature = "rocm") {
-            FullAttentionOps::decode_workspace(
-                &attention,
-                u32::try_from(rows.min(verify_rows))?,
-                u32::try_from(capacity)?,
-            )?
-        } else {
-            FullAttentionOps::workspace(&attention, limits(rows.min(verify_rows), capacity)?)?
-        };
+        let (attention_prefill, attention_decode, attention_nested_verify) =
+            if let Some(attention) = attention.as_ref() {
+                (
+                    if cfg!(feature = "rocm") {
+                        FullAttentionOps::workspace(attention, limits(rows, capacity)?)?
+                    } else {
+                        FullAttentionOps::preprocess_workspace(attention, limits(rows, capacity)?)?
+                    },
+                    FullAttentionOps::decode_workspace(attention, 1, u32::try_from(capacity)?)?,
+                    if cfg!(feature = "rocm") {
+                        FullAttentionOps::decode_workspace(
+                            attention,
+                            u32::try_from(rows.min(verify_rows))?,
+                            u32::try_from(capacity)?,
+                        )?
+                    } else {
+                        FullAttentionOps::workspace(
+                            attention,
+                            limits(rows.min(verify_rows), capacity)?,
+                        )?
+                    },
+                )
+            } else {
+                (
+                    crate::op_contract::WorkspaceReq {
+                        bytes: 0,
+                        alignment: 256,
+                    },
+                    crate::op_contract::WorkspaceReq {
+                        bytes: 0,
+                        alignment: 256,
+                    },
+                    crate::op_contract::WorkspaceReq {
+                        bytes: 0,
+                        alignment: 256,
+                    },
+                )
+            };
         let spec = gdn;
         let prefill = GdnOps::workspace(&spec, u32::try_from(rows)?, policy)?;
         let decode = GdnOps::workspace(&spec, 1, GdnPolicy::P2)?;
@@ -662,7 +1157,9 @@ impl Runtime {
         let s = &engine.device.stream;
         let rows = engine.workspace_rows;
         let flint = engine.model_spec.architecture == crate::model_spec::Architecture::Flint;
-        let attention = if flint {
+        let attention = if flint
+            || engine.model_spec.architecture == crate::model_spec::Architecture::Glm5Next
+        {
             None
         } else {
             Some(FullAttentionSpec::from_model(&engine.model_spec)?)
@@ -731,17 +1228,64 @@ impl Runtime {
                 format!("model.language_model.layers.{i}.")
             };
             let weight = |name: &str| vector(catalog.bf16(&format!("{prefix}{name}"))?, s);
-            let plan = LayerDequantPlan::from_manifest(
-                &catalog.manifest,
-                i as u32,
-                engine.model_spec.linear_format,
-            )?;
+            let plan =
+                LayerDequantPlan::from_model(&catalog.manifest, i as u32, &engine.model_spec)?;
             let arena_view = arena.as_ref().map(|b| scratch(b, s));
             let mut linear = LayerLinearPlan::bind(&plan, &catalog, arena_view.as_ref(), s)?;
             let ffn = BoundFfn::bind(&engine.model_spec, &mut linear)?;
+            #[cfg(feature = "cuda")]
+            if engine.model_spec.architecture == crate::model_spec::Architecture::Glm5Next {
+                linear.prepare_native(engine.blas.fp8_ops()?, s, rows as u32)?;
+            }
+            #[cfg(feature = "cuda")]
+            let native = NativeFfn::new(engine, &catalog, i, &ffn, rows)?;
             let mixer = match layout.mixer {
                 Mixer::FullAttention => {
-                    if flint {
+                    if engine.model_spec.architecture == crate::model_spec::Architecture::Glm5Next {
+                        let spec = crate::op_contract::DsaSpec::from_model(&engine.model_spec)?;
+                        let full = DsaPlan::new(
+                            &engine.device.ctx,
+                            &engine.device.info,
+                            spec,
+                            u32::try_from(engine.capacity)?,
+                            u32::try_from(rows)?,
+                        )?;
+                        let decode = Box::new(full.for_rows(1)?);
+                        let prefill = PrefillPlans::bind(
+                            full,
+                            (rows, crate::linear_plan::MAX_SKINNY_ROWS.min(rows)),
+                            DsaPlan::for_rows,
+                        )?;
+                        let aux = |name: &str| {
+                            vector(catalog.bf16(&format!("{prefix}self_attn.{name}"))?, s)
+                        };
+                        let kv_b = matrix(
+                            catalog.bf16(&format!("{prefix}self_attn.kv_b_proj.weight"))?,
+                            s,
+                            0,
+                            32_768,
+                            512,
+                        )?;
+                        let ape = matrix(
+                            catalog.bf16(&format!(
+                                "{prefix}self_attn.indexer.index_kpool_compress_ape"
+                            ))?,
+                            s,
+                            0,
+                            4,
+                            128,
+                        )?;
+                        BoundMixer::Dsa {
+                            q_norm: aux("q_a_layernorm.weight")?,
+                            kv_norm: aux("kv_a_layernorm.weight")?,
+                            k_norm: aux("indexer.k_norm.weight")?,
+                            k_bias: aux("indexer.k_norm.bias")?,
+                            ape,
+                            kv_b,
+                            prefill,
+                            decode,
+                        }
+                    } else if flint {
                         {
                             let module =
                                 rope_module.as_ref().context("Flint rope module missing")?;
@@ -957,9 +1501,18 @@ impl Runtime {
                 }
                 Mixer::Gdn => {
                     let spec = gdn.context("GDN layer has no GDN specification")?;
+                    let native_kda = matches!(
+                        spec.gate_mode,
+                        crate::op_contract::GdnGateMode::PerChannel { .. }
+                    );
+                    let mixer_prefix = if native_kda {
+                        "self_attn."
+                    } else {
+                        "linear_attn."
+                    };
                     let cd = spec.conv_dim()?;
+                    let a_width = spec.ab_width()? as usize - spec.hv as usize;
                     let state = &engine.state.gdn[layout.state_index as usize];
-                    let conv = catalog.bf16(&format!("{prefix}linear_attn.conv1d.weight"))?;
                     let bind = |active_rows| {
                         GdnOps::prepare(
                             &engine.device.ctx,
@@ -967,23 +1520,46 @@ impl Runtime {
                             active_rows as u32,
                             GdnBindings {
                                 qkv: matrix(&w.qkv, s, 0, active_rows, cd as usize)?,
-                                a: matrix(&mw.ab, s, 0, active_rows, spec.hv as usize)?,
+                                a: if matches!(
+                                    spec.gate_mode,
+                                    crate::op_contract::GdnGateMode::PerChannel { .. }
+                                ) {
+                                    GdnGateInput::PerChannel(heads(
+                                        &mw.ab,
+                                        s,
+                                        0,
+                                        active_rows,
+                                        spec.hv,
+                                        128,
+                                    )?)
+                                } else {
+                                    GdnGateInput::PerHead(matrix(
+                                        &mw.ab,
+                                        s,
+                                        0,
+                                        active_rows,
+                                        spec.hv as usize,
+                                    )?)
+                                },
                                 b: matrix(
                                     &mw.ab,
                                     s,
-                                    rows * spec.hv as usize,
+                                    rows * a_width,
                                     active_rows,
                                     spec.hv as usize,
                                 )?,
-                                conv_weight: matrix(
-                                    conv,
+                                conv_weight: GdnConvWeights::bind(
+                                    &catalog,
                                     s,
-                                    0,
-                                    cd as usize,
-                                    spec.conv_width as usize,
+                                    &format!("{prefix}{mixer_prefix}"),
+                                    spec,
                                 )?,
-                                a_log: weight("linear_attn.A_log")?,
-                                dt_bias: weight("linear_attn.dt_bias")?,
+                                decay: GdnDecayWeights::bind(
+                                    &catalog,
+                                    s,
+                                    &format!("{prefix}{mixer_prefix}"),
+                                    spec,
+                                )?,
                                 core_out: TensorMut(heads(
                                     &w.attn,
                                     s,
@@ -1017,7 +1593,11 @@ impl Runtime {
                         )
                     };
                     BoundMixer::Gdn {
-                        norm: weight("linear_attn.norm.weight")?,
+                        norm: weight(if native_kda {
+                            "self_attn.o_norm.weight"
+                        } else {
+                            "linear_attn.norm.weight"
+                        })?,
                         prefill: PrefillPlans::bind(
                             bind(rows)?,
                             (rows, verify_rows),
@@ -1032,6 +1612,8 @@ impl Runtime {
             layers.push(Layer {
                 linear,
                 ffn,
+                #[cfg(feature = "cuda")]
+                native,
                 input_norm: weight("input_layernorm.weight")?,
                 post_norm: weight("post_attention_layernorm.weight")?,
                 mixer,
@@ -1048,6 +1630,10 @@ impl Runtime {
             vision_bytes: 0,
             #[cfg(test)]
             vision_encode_calls: 0,
+            #[cfg(test)]
+            glm_calls: (engine.model_spec.architecture
+                == crate::model_spec::Architecture::Glm5Next)
+                .then(|| std::cell::RefCell::new(vec![[0; 10]; engine.model_spec.layers.len()])),
             positions,
             active_positions,
             gather_positions: crate::backend::cuda::cubin::module(
@@ -1095,6 +1681,7 @@ impl Runtime {
             for layer in &self.layers {
                 let input = matrix(&work.n, stream, 0, rows, hidden)?;
                 let (role, width) = match &layer.mixer {
+                    BoundMixer::Dsa { .. } => anyhow::bail!("HIP DSA projections are not bound"),
                     BoundMixer::Flint { .. } => {
                         anyhow::bail!("Flint FP8 mixer binding is unsupported")
                     }
@@ -1360,6 +1947,7 @@ impl Engine {
         let g = q.gdn.as_ref().context("GDN verify runtime missing")?;
         let cd = g.conv_dim()? as usize;
         let hv = g.hv as usize;
+        let a_width = g.ab_width()? as usize - hv;
         ensure!(
             (2..=g.snapshot_limit()? as usize).contains(&verify_rows),
             "GDN hv={} verify_rows={verify_rows} exceeds snapshot bound={}",
@@ -1380,15 +1968,22 @@ impl Engine {
                     .next()
                     .context("missing GDN verify input allocation")?;
                 ensure!(
-                    input.qkv.len() == slots * cd && input.ab.len() == slots * 2 * hv,
+                    input.qkv.len() == slots * cd && input.ab.len() == slots * (a_width + hv),
                     "GDN verify input storage hv={} rows={verify_rows} slots={slots} qkv={} ab={}",
                     g.hv,
                     input.qkv.len(),
                     input.ab.len()
                 );
                 let qkv = matrix(&input.qkv, stream, 0, slots, cd)?;
-                let a = matrix(&input.ab, stream, 0, slots, hv)?;
-                let b = matrix(&input.ab, stream, slots * hv, slots, hv)?;
+                let a = match g.gate_mode {
+                    crate::op_contract::GdnGateMode::PerHead => {
+                        GdnGateInput::PerHead(matrix(&input.ab, stream, 0, slots, hv)?)
+                    }
+                    crate::op_contract::GdnGateMode::PerChannel { .. } => {
+                        GdnGateInput::PerChannel(heads(&input.ab, stream, 0, slots, g.hv, g.dv)?)
+                    }
+                };
+                let b = matrix(&input.ab, stream, slots * a_width, slots, hv)?;
                 *verify = (1..=verify_rows)
                     .map(|rows| prefill.full.for_verify(rows as u32, None))
                     .collect::<Result<_>>()?;
@@ -1633,6 +2228,7 @@ impl Engine {
     ) -> Result<Self> {
         match model_spec.architecture {
             crate::model_spec::Architecture::Flint => require_flint_geometry(&model_spec)?,
+            crate::model_spec::Architecture::Glm5Next => require_glm_geometry(&model_spec)?,
             _ => require_qwen35_geometry(&model_spec)?,
         }
         let write = mode.writes();
@@ -1662,7 +2258,8 @@ impl Engine {
         );
         let started = Instant::now();
         let flint = model_spec.architecture == crate::model_spec::Architecture::Flint;
-        let attention = if flint {
+        let glm = model_spec.architecture == crate::model_spec::Architecture::Glm5Next;
+        let attention = if flint || glm {
             None
         } else {
             Some(FullAttentionSpec::from_model(&model_spec)?)
@@ -1697,7 +2294,7 @@ impl Engine {
                 .as_ref()
                 .map(|draft| draft.target_rows(&model_spec))
                 .transpose()?
-                .unwrap_or(crate::mtp::MAX_VERIFY_ROWS),
+                .unwrap_or(if glm { 1 } else { crate::mtp::MAX_VERIFY_ROWS }),
         };
         let capture_layers = if let Some(draft) = &draft_config {
             Some(draft.target_layer_ids.clone())
@@ -1774,6 +2371,11 @@ impl Engine {
         };
         #[cfg(feature = "rocm")]
         let mut catalog = WeightCatalog::load(dir, &model_spec, &device)?;
+        let glm_hc_weights = if glm {
+            take_glm_hc_weights(&mut catalog, &model_spec)?
+        } else {
+            Vec::new()
+        };
         let prefix_identity_load_ms = catalog.load_wall_ms;
         #[cfg(feature = "cuda")]
         let mut prefix_identity = if prefix_cache {
@@ -1818,21 +2420,21 @@ impl Engine {
                 s.alloc_zeros::<bf16>(capacity * kv_width as usize)?,
             ))
         };
-        let capture_checkpoint = Some(super::super::state::StateCheckpoint::new(
-            &state,
-            &model_spec,
-            1,
-            s,
-        )?);
+        let capture_checkpoint = if glm {
+            None
+        } else {
+            Some(super::super::state::StateCheckpoint::new(
+                &state,
+                &model_spec,
+                1,
+                s,
+            )?)
+        };
         #[cfg(feature = "cuda")]
         let arena_bytes = (0..model_spec.layers.len())
             .map(|i| {
-                LayerDequantPlan::from_manifest(
-                    &catalog.manifest,
-                    i as u32,
-                    model_spec.linear_format,
-                )
-                .map(|p| p.bytes)
+                LayerDequantPlan::from_model(&catalog.manifest, i as u32, &model_spec)
+                    .map(|p| p.bytes)
             })
             .collect::<Result<Vec<_>>>()?
             .into_iter()
@@ -1894,7 +2496,7 @@ impl Engine {
                 .and_then(|bytes| bytes.checked_add(target_head_bytes))
                 .context("combined fixed bytes overflow")?,
         };
-        let expert_setup = if model_spec.moe.is_some() {
+        let expert_setup = if model_spec.moe.is_some() && !glm {
             Some(super::moe::Setup::new(
                 &device,
                 &model_spec,
@@ -1915,9 +2517,32 @@ impl Engine {
         } else {
             None
         };
+        let native_budget = if glm {
+            Some(crate::prefill::WorkspaceBudget::new(
+                crate::prefill::WorkspaceRequest {
+                    capacity: capacity.min(crate::linear_plan::MAX_SKINNY_ROWS),
+                    alignment: 1,
+                    ..request
+                },
+                |rows| {
+                    Runtime::workspace(&model_spec, rows, capacity, gdn_policy, verify_rows)?
+                        .checked_add(Runtime::native_workspace(
+                            &model_spec,
+                            &catalog.manifest,
+                            rows,
+                        )?)
+                        .context("native GLM workspace overflow")
+                },
+                |rows| Ok(1usize << (usize::BITS - 1 - rows.leading_zeros())),
+            )?)
+        } else {
+            None
+        };
         let dense_budget;
         let mut dense_prompt_bytes = 0;
-        let budget = if let Some(setup) = &expert_setup {
+        let budget = if let Some(native) = &native_budget {
+            native
+        } else if let Some(setup) = &expert_setup {
             &setup.workspace.mixer
         } else {
             let workspace = |rows| {
@@ -2013,7 +2638,9 @@ impl Engine {
                     .bytes as usize
                 },
             );
-        let (attention_prefill_bytes, attention_decode_bytes, attention_verify_bytes) = if flint {
+        let (attention_prefill_bytes, attention_decode_bytes, attention_verify_bytes) = if flint
+            || glm
+        {
             (0, 0, 0)
         } else {
             let attention = attention
@@ -2054,6 +2681,8 @@ impl Engine {
         };
         let (prefill_backend, decode_backend) = if flint {
             ("native d128 sliding/full", "flash decode d128")
+        } else if glm {
+            ("native DSA + KDA", "native DSA + KDA")
         } else if cfg!(feature = "rocm") {
             ("native HIP d256", "TCMQA d256")
         } else {
@@ -2112,13 +2741,37 @@ impl Engine {
             .transpose()?
             .unwrap_or(0);
         let work = Work::new_with_peer_tail(s, &model_spec, rows, peer_tail_elems)?;
-        let flash = Flash::new(
-            s.clone(),
-            rows,
-            model_spec.q_heads as usize,
-            model_spec.kv_heads as usize,
-            model_spec.head_dim as usize,
-        )?;
+        let glm_dsa = if glm {
+            Some(GlmDsaOutputs::new(rows, s)?)
+        } else {
+            None
+        };
+        let glm_hc = if glm {
+            let mut runtime = HcRuntime::new(
+                &device.ctx,
+                s,
+                crate::backend::cuda::hc::glm_binding(&model_spec)?,
+                model_spec.layers.len(),
+                rows,
+            )?;
+            for (layer, weights) in glm_hc_weights.into_iter().enumerate() {
+                runtime.bind_layer(layer, weights.attn, weights.ffn)?;
+            }
+            Some(runtime)
+        } else {
+            None
+        };
+        let flash = if glm {
+            None
+        } else {
+            Some(Flash::new(
+                s.clone(),
+                rows,
+                model_spec.q_heads as usize,
+                model_spec.kv_heads as usize,
+                model_spec.head_dim as usize,
+            )?)
+        };
         let logits_f32 = if flint {
             Some(s.alloc_zeros(model_spec.vocab as usize)?)
         } else {
@@ -2137,7 +2790,7 @@ impl Engine {
             flint_window_capture: None,
             qwen_device_prefix: false,
             forward_rows: (1..=rows.min(16)).collect(),
-            graphs: if expert_setup.is_some() {
+            graphs: if expert_setup.is_some() || glm {
                 Vec::new()
             } else {
                 vec![Graph::Decode]
@@ -2159,7 +2812,7 @@ impl Engine {
             work,
             ops,
             blas,
-            flash: Some(flash),
+            flash,
             decode: None,
             logits_f32,
             device,
@@ -2181,14 +2834,14 @@ impl Engine {
             last_input_kind: None,
             qwen: None,
             #[cfg(feature = "cuda")]
-            deepseek: None,
-            #[cfg(feature = "cuda")]
             deepseek_mixer: None,
             #[cfg(feature = "cuda")]
             deepseek_ffn: None,
             #[cfg(feature = "cuda")]
             deepseek_engram: None,
             recurrent: None,
+            hc: glm_hc,
+            glm_dsa,
             moe: None,
             moe_slots: None,
             moe_prefill: None,
@@ -2241,7 +2894,24 @@ impl Engine {
         if engine.spec.is_some() {
             engine.bind_invariant_arithmetic()?;
         }
-        if engine.model_spec.moe.is_some() {
+        #[cfg(feature = "cuda")]
+        if glm {
+            let manifest = &engine
+                .qwen
+                .as_ref()
+                .context("GLM runtime missing")?
+                .catalog
+                .manifest;
+            engine.moe_slots = Some(super::moe::Slots::load_staging(
+                &engine.device,
+                &engine.model_spec,
+                manifest,
+                dir,
+                rows as u32,
+            )?);
+            engine.device.finish_upload()?;
+        }
+        if engine.model_spec.moe.is_some() && !glm {
             engine.declare_graphs()?;
         }
         #[cfg(feature = "rocm")]
@@ -2486,14 +3156,8 @@ impl Engine {
     }
     pub(super) fn qwen_advance(&mut self) -> Result<()> {
         let q = self.qwen.as_ref().context("Q38 runtime missing")?;
-        let meta = self.state.seq_ref(&self.device.stream)?;
-        unsafe {
-            self.device
-                .stream
-                .launch_builder(&q.advance)
-                .arg(&meta.ptr)
-                .launch(grid(1, 1))?;
-        }
+        self.state
+            .advance_sequence(&self.device.stream, &q.advance)?;
         self.work.advance(&self.ops, &self.device.stream)?;
         self.state.compact_commit(&self.device.stream, false)
     }
@@ -2816,6 +3480,247 @@ impl Engine {
         }
         Ok(())
     }
+    pub(super) fn glm_dsa_mixer(&mut self, i: usize, step: crate::backend::Step<'_>) -> Result<()> {
+        use crate::op_contract::ExecutionPhase;
+        let rows = step.rows;
+        let phase = if step.input == crate::backend::Input::Token {
+            ExecutionPhase::Decode
+        } else {
+            ExecutionPhase::Prefill
+        };
+        let layout = DsaRowLayout::new(&self.model_spec, self.workspace_rows)?;
+        let hidden = self.model_spec.hidden as usize;
+        let s = &self.device.stream;
+        let q = self.qwen.as_mut().context("GLM runtime missing")?;
+        let linear_rows = q.linear_rows(rows as u32, phase)? as usize;
+        let layer = &q.layers[i];
+        let w = &mut self.work;
+        let input = matrix(&w.n, s, 0, linear_rows, hidden)?;
+        layer.linear.run(
+            &self.blas,
+            "self_attn.q_a_proj.weight",
+            phase,
+            input,
+            &mut TensorMut(matrix(
+                &w.qkv,
+                s,
+                layout.query_residual.start,
+                linear_rows,
+                1536,
+            )?),
+        )?;
+        layer.linear.run(
+            &self.blas,
+            "self_attn.kv_a_proj_with_mqa.weight",
+            phase,
+            input,
+            &mut TensorMut(matrix(&w.qkv, s, layout.latent.start, linear_rows, 512)?),
+        )?;
+        let domain = RowDomain {
+            meta: self.state.seq_ref(s)?,
+            row_base: 0,
+            row_capacity: rows as u32,
+        };
+        let residual = heads(&w.qkv, s, layout.query_residual.start, rows, 1, 1536)?;
+        let mut residual_mut = TensorMut(heads(
+            &w.qkv,
+            s,
+            layout.query_residual.start,
+            rows,
+            1,
+            1536,
+        )?);
+        q.common.norm.rms_with(
+            s,
+            domain,
+            residual,
+            match &layer.mixer {
+                BoundMixer::Dsa { q_norm, .. } => *q_norm,
+                _ => anyhow::bail!("GLM DSA layer has no q_a_layernorm"),
+            },
+            &mut residual_mut,
+            RmsOptions {
+                mode: RmsMode::Standard,
+                eps: self.model_spec.rms_eps,
+            },
+        )?;
+        let latent = heads(&w.qkv, s, layout.latent.start, rows, 1, 512)?;
+        let mut latent_mut = TensorMut(heads(&w.qkv, s, layout.latent.start, rows, 1, 512)?);
+        q.common.norm.rms_with(
+            s,
+            domain,
+            latent,
+            match &layer.mixer {
+                BoundMixer::Dsa { kv_norm, .. } => *kv_norm,
+                _ => anyhow::bail!("GLM DSA layer has no kv_a_layernorm"),
+            },
+            &mut latent_mut,
+            RmsOptions {
+                mode: RmsMode::Standard,
+                eps: self.model_spec.rms_eps,
+            },
+        )?;
+        layer.linear.run(
+            &self.blas,
+            "self_attn.q_b_proj.weight",
+            phase,
+            matrix(&w.qkv, s, layout.query_residual.start, linear_rows, 1536)?,
+            &mut TensorMut(matrix(&w.qkv, s, layout.query.start, linear_rows, 16_384)?),
+        )?;
+        layer.linear.run(
+            &self.blas,
+            "self_attn.indexer.wq_b.weight",
+            phase,
+            matrix(&w.qkv, s, layout.query_residual.start, linear_rows, 1536)?,
+            &mut TensorMut(matrix(
+                &w.qkv,
+                s,
+                layout.index_query.start,
+                linear_rows,
+                4096,
+            )?),
+        )?;
+        layer.linear.run(
+            &self.blas,
+            "self_attn.indexer.wk.weight",
+            phase,
+            input,
+            &mut TensorMut(matrix(&w.qkv, s, layout.packed.start, linear_rows, 128)?),
+        )?;
+        layer.linear.run(
+            &self.blas,
+            "self_attn.indexer.index_kpool_compress_gate",
+            phase,
+            input,
+            &mut TensorMut(matrix(
+                &w.qkv,
+                s,
+                layout.packed.start + self.workspace_rows * 128,
+                linear_rows,
+                128,
+            )?),
+        )?;
+        layer.linear.run(
+            &self.blas,
+            "self_attn.indexer.weights_proj.weight",
+            phase,
+            input,
+            &mut TensorMut(matrix(
+                &w.qkv,
+                s,
+                layout.index_weights.start,
+                linear_rows,
+                32,
+            )?),
+        )?;
+        let packed = heads(&w.qkv, s, layout.packed.start, rows, 1, 128)?;
+        let mut packed_mut = TensorMut(heads(&w.qkv, s, layout.packed.start, rows, 1, 128)?);
+        q.common.norm.layer_norm(
+            s,
+            packed,
+            match &layer.mixer {
+                BoundMixer::Dsa { k_norm, .. } => *k_norm,
+                _ => anyhow::bail!("GLM DSA layer has no indexer k_norm weight"),
+            },
+            match &layer.mixer {
+                BoundMixer::Dsa { k_bias, .. } => *k_bias,
+                _ => anyhow::bail!("GLM DSA layer has no indexer k_norm bias"),
+            },
+            &mut packed_mut,
+            1e-6,
+        )?;
+        let narrowed = if step.input == crate::backend::Input::Token {
+            None
+        } else {
+            Some(match &layer.mixer {
+                BoundMixer::Dsa { prefill, .. } => prefill.select(rows, &DsaPlan::for_rows)?,
+                _ => anyhow::bail!("GLM DSA layer has no prefill plan"),
+            })
+        };
+        let (plan, state_index, kv_b, ape) = match (&narrowed, &layer.mixer) {
+            (
+                None,
+                BoundMixer::Dsa {
+                    decode, kv_b, ape, ..
+                },
+            ) => (
+                decode.as_ref(),
+                self.model_spec.layers[i].state_index as usize,
+                *kv_b,
+                *ape,
+            ),
+            (Some(narrowed), BoundMixer::Dsa { kv_b, ape, .. }) => (
+                &**narrowed,
+                self.model_spec.layers[i].state_index as usize,
+                *kv_b,
+                *ape,
+            ),
+            _ => anyhow::bail!("GLM DSA layer has no bound DSA plan"),
+        };
+        let state = self.state.dsa_state_mut(state_index)?;
+        let outputs = self
+            .glm_dsa
+            .as_mut()
+            .context("GLM DSA output buffers are not bound")?;
+        outputs.pack_index(
+            s,
+            &w.qkv,
+            [
+                layout.packed.start,
+                layout.packed.start + self.workspace_rows * 128,
+            ],
+            rows,
+        )?;
+        let append = DsaAppendInput {
+            latent: matrix(&w.qkv, s, layout.latent.start, rows, 512)?,
+            packed: matrix(&outputs.packed, s, 0, rows, 257)?,
+        };
+        plan.append(state, &append, s)?;
+        let index = DsaIndexInput {
+            q: heads(&w.qkv, s, layout.index_query.start, rows, 32, 128)?,
+            weights: matrix(&w.qkv, s, layout.index_weights.start, rows, 32)?,
+            ape,
+        };
+        plan.pool(state, &index, s)?;
+        plan.index(
+            state,
+            &index,
+            &DsaIndexOutput {
+                selected: TensorMut(view(&outputs.selected, s, 0, [rows as u32, 512], [512, 1])?),
+                scores: TensorMut(view(&outputs.scores, s, 0, [rows as u32, 512], [512, 1])?),
+                margins: TensorMut(view(&outputs.margins, s, 0, [rows as u32], [1])?),
+                indices: TensorMut(view(
+                    &outputs.indices,
+                    s,
+                    0,
+                    [rows as u32, 2051],
+                    [2051, 1],
+                )?),
+            },
+            s,
+        )?;
+        let indices_view = view(&outputs.indices, s, 0, [rows as u32, 2051], [2051, 1])?;
+        let mut attention_output = TensorMut(heads(&w.attn, s, 0, rows, 64, 256)?);
+        plan.attention(
+            state,
+            &DsaAttentionInput {
+                q: heads(&w.qkv, s, layout.query.start, rows, 64, 256)?,
+                kv_b: Some(kv_b),
+                indices: indices_view,
+                sinks: None,
+                out: &mut attention_output,
+            },
+            s,
+        )?;
+        layer.linear.run(
+            &self.blas,
+            "self_attn.o_proj.weight",
+            phase,
+            matrix(&w.attn, s, 0, linear_rows, 16_384)?,
+            &mut TensorMut(matrix(&w.out, s, 0, linear_rows, hidden)?),
+        )
+    }
+
     pub(super) fn qwen_mixer(
         &mut self,
         i: usize,
@@ -2825,11 +3730,7 @@ impl Engine {
         let q = self.qwen.as_mut().context("Q38 runtime missing")?;
         let layer = &q.layers[i];
         let flint_layer = matches!(layer.mixer, BoundMixer::Flint { .. });
-        let attention = if flint_layer {
-            None
-        } else {
-            Some(q.attention.context("Q38 attention specification missing")?)
-        };
+        let attention = q.attention;
         let gdn = if flint_layer {
             None
         } else {
@@ -2848,6 +3749,11 @@ impl Engine {
             ExecutionPhase::Prefill
         };
         let linear_rows = q.linear_rows(rows as u32, phase)? as usize;
+        if self.model_spec.architecture == crate::model_spec::Architecture::Glm5Next
+            && self.model_spec.layers[i].mixer == Mixer::FullAttention
+        {
+            return self.glm_dsa_mixer(i, step);
+        }
         let w = &mut self.work;
         let mw = w.mixer.as_ref().context("Q38 mixer work missing")?;
         let meta = self.state.seq_ref(s)?;
@@ -2857,6 +3763,9 @@ impl Engine {
             row_capacity: rows as u32,
         };
         match &layer.mixer {
+            BoundMixer::Dsa { .. } => {
+                anyhow::bail!("GLM DSA mixer escaped its production dispatch")
+            }
             BoundMixer::Flint {
                 q_norm,
                 k_norm,
@@ -3398,25 +4307,42 @@ impl Engine {
                 let conv = conv_width as usize;
                 let value = value_width as usize;
                 let hv = spec.hv as usize;
-                for (role, output, offset, width) in [
-                    ("linear_attn.in_proj_qkv.weight", &w.qkv, 0, conv),
-                    ("linear_attn.in_proj_z.weight", &mw.gate, 0, value),
-                    ("linear_attn.in_proj_a.weight", &mw.ab, 0, hv),
-                    (
-                        "linear_attn.in_proj_b.weight",
-                        &mw.ab,
-                        self.workspace_rows * hv,
-                        hv,
-                    ),
-                ] {
-                    layer.linear.run(
+                let a_width = spec.ab_width()? as usize - hv;
+                if matches!(
+                    spec.gate_mode,
+                    crate::op_contract::GdnGateMode::PerChannel { .. }
+                ) {
+                    project_kda(
+                        &layer.linear,
                         &self.blas,
-                        role,
+                        s,
                         phase,
-                        matrix(&w.n, s, 0, linear_rows, hidden)?,
-                        &mut TensorMut(matrix(output, s, offset, linear_rows, width)?),
+                        w,
+                        spec,
+                        [linear_rows, self.workspace_rows, hidden],
                     )?;
+                } else {
+                    for (role, output, offset, width) in [
+                        ("linear_attn.in_proj_qkv.weight", &w.qkv, 0, conv),
+                        ("linear_attn.in_proj_z.weight", &mw.gate, 0, value),
+                        ("linear_attn.in_proj_a.weight", &mw.ab, 0, a_width),
+                        (
+                            "linear_attn.in_proj_b.weight",
+                            &mw.ab,
+                            self.workspace_rows * a_width,
+                            hv,
+                        ),
+                    ] {
+                        layer.linear.run(
+                            &self.blas,
+                            role,
+                            phase,
+                            matrix(&w.n, s, 0, linear_rows, hidden)?,
+                            &mut TensorMut(matrix(output, s, offset, linear_rows, width)?),
+                        )?;
+                    }
                 }
+                let mw = w.mixer.as_ref().context("KDA mixer workspace missing")?;
                 if self.qwen_device_prefix
                     && let Some(spec_state) = self.spec.as_mut()
                 {
@@ -3433,14 +4359,17 @@ impl Engine {
                             &mut input.qkv.slice_mut(..capture_rows * conv),
                         )?;
                         s.memcpy_dtod(
-                            &mw.ab.slice(..capture_rows * hv),
-                            &mut input.ab.slice_mut(..capture_rows * hv),
+                            &mw.ab.slice(..capture_rows * a_width),
+                            &mut input.ab.slice_mut(..capture_rows * a_width),
                         )?;
                         s.memcpy_dtod(
                             &mw.ab.slice(
-                                self.workspace_rows * hv..(self.workspace_rows + capture_rows) * hv,
+                                self.workspace_rows * a_width
+                                    ..(self.workspace_rows + capture_rows) * a_width,
                             ),
-                            &mut input.ab.slice_mut(slots * hv..(slots + capture_rows) * hv),
+                            &mut input
+                                .ab
+                                .slice_mut(slots * a_width..(slots + capture_rows) * a_width),
                         )?;
                     }
                 }
@@ -3464,6 +4393,11 @@ impl Engine {
                     }
                 };
                 let gated = GatedRmsInput {
+                    mode: if matches!(spec.gate_mode, crate::op_contract::GdnGateMode::PerHead) {
+                        super::super::ops::GatedRmsMode::SiluBf16
+                    } else {
+                        super::super::ops::GatedRmsMode::SigmoidF32
+                    },
                     x: heads(&w.attn, s, 0, rows, spec.hv, spec.dv)?,
                     weight: *norm,
                     gate: heads(&mw.gate, s, 0, rows, spec.hv, spec.dv)?,
@@ -3487,7 +4421,14 @@ impl Engine {
                 }
                 layer.linear.run(
                     &self.blas,
-                    "linear_attn.out_proj.weight",
+                    if matches!(
+                        spec.gate_mode,
+                        crate::op_contract::GdnGateMode::PerChannel { .. }
+                    ) {
+                        "self_attn.o_proj.weight"
+                    } else {
+                        "linear_attn.out_proj.weight"
+                    },
                     phase,
                     matrix(&w.attn, s, 0, linear_rows, value)?,
                     &mut TensorMut(matrix(&w.out, s, 0, linear_rows, hidden)?),
@@ -3501,6 +4442,7 @@ impl Engine {
                 BoundMixer::Flint { .. } => q_width,
                 BoundMixer::Attention { .. } => q_width,
                 BoundMixer::Gdn { .. } => value_width,
+                BoundMixer::Dsa { .. } => q_width,
             };
             trace_value(trace, s, &name, &w.attn, rows, mixer_width as usize)?;
             let name = debug_name(trace, i, "o_proj");
@@ -3540,6 +4482,65 @@ impl Engine {
         #[cfg(feature = "cuda")]
         if self.model_spec.architecture == crate::model_spec::Architecture::DeepseekV41 {
             self.deepseek_ffn_stage(layer, step)?;
+            return Ok(true);
+        }
+        #[cfg(feature = "cuda")]
+        if self
+            .qwen
+            .as_ref()
+            .is_some_and(|runtime| runtime.layers[layer].native.is_some())
+        {
+            let s = &self.device.stream;
+            let runtime = self.qwen.as_mut().context("native MoE runtime missing")?;
+            let native = runtime.layers[layer]
+                .native
+                .as_mut()
+                .context("native MoE binding missing")?;
+            let plan = native
+                .plans
+                .get(step.rows.checked_sub(1).context("empty native MoE step")?)
+                .context("native MoE rows outside setup closure")?;
+            let h = self.model_spec.hidden as usize;
+            let x = matrix(&self.work.n, s, 0, step.rows, h)?;
+            let y = TensorMut(matrix(&self.work.out, s, 0, step.rows, h)?);
+            let (ids, weights) = plan.route(s, x)?;
+            let slots = self
+                .moe_slots
+                .as_mut()
+                .context("native expert tier service missing")?;
+            let slot_layer = native.slot_layer;
+            slots.resolve_native(slot_layer, &ids, &weights)?;
+            slots.wait_refill(s)?;
+            let (pointers, valid) = slots.native_dispatch(slot_layer)?;
+            #[cfg(test)]
+            let pointers = {
+                let mut pointers = pointers;
+                if native.wrong_route {
+                    let destination = ids[0] as usize * 6;
+                    let source = ids[1] as usize * 6;
+                    ensure!(
+                        destination != source,
+                        "native wrong-route control needs distinct experts"
+                    );
+                    let replacement: Vec<_> = pointers[source..source + 6].to_vec();
+                    pointers[destination..destination + 6].copy_from_slice(&replacement);
+                }
+                pointers
+            };
+            s.memcpy_htod(&pointers, &mut native.pointers)?;
+            s.memcpy_htod(&valid, &mut native.valid)?;
+            plan.run(s, x, &y)?;
+            slots.record_all_readers(&self.device)?;
+            if all_layers(trace) || layer == self.trace_layer {
+                trace_value(
+                    trace,
+                    s,
+                    &format!("{layer}.ffn"),
+                    &self.work.out,
+                    step.rows,
+                    h,
+                )?;
+            }
             return Ok(true);
         }
         let ffn = self
@@ -3637,6 +4638,24 @@ impl Engine {
                 trace_value(trace, s, "embed", &w.x, rows, h)?;
             }
             O::Norm => {
+                if self.model_spec.architecture == crate::model_spec::Architecture::Glm5Next {
+                    q.common.norm.rms_with(
+                        s,
+                        domain,
+                        heads(&w.x, s, 0, rows, 1, h as u32)?,
+                        layer.input_norm,
+                        &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
+                        RmsOptions {
+                            mode: RmsMode::Standard,
+                            eps: self.model_spec.rms_eps,
+                        },
+                    )?;
+                    if all_layers(trace) || i == self.trace_layer {
+                        let name = debug_name(trace, i, "norm1");
+                        trace_value(trace, s, &name, &w.n, rows, h)?;
+                    }
+                    return Ok(());
+                }
                 if i == 0
                     || (!flint
                         && ((self.model_spec.moe.is_some()
@@ -3665,6 +4684,26 @@ impl Engine {
                 }
             }
             O::PostNorm | O::NextNorm => {
+                if self.model_spec.architecture == crate::model_spec::Architecture::Glm5Next {
+                    if matches!(op, O::PostNorm) {
+                        q.common.norm.rms_with(
+                            s,
+                            domain,
+                            heads(&w.x, s, 0, rows, 1, h as u32)?,
+                            layer.post_norm,
+                            &mut TensorMut(heads(&w.n, s, 0, rows, 1, h as u32)?),
+                            RmsOptions {
+                                mode: RmsMode::Standard,
+                                eps: self.model_spec.rms_eps,
+                            },
+                        )?;
+                        if all_layers(trace) || i == self.trace_layer {
+                            let name = debug_name(trace, i, "norm2");
+                            trace_value(trace, s, &name, &w.n, rows, h)?;
+                        }
+                    }
+                    return Ok(());
+                }
                 if matches!(op, O::PostNorm) {
                     let mode = norm_mode(&self.model_spec);
                     if matches!(mode, RmsMode::Standard) {
@@ -3855,6 +4894,12 @@ impl Engine {
                 if step.head == Head::None {
                     return Ok(());
                 }
+                if self.model_spec.architecture == crate::model_spec::Architecture::Glm5Next {
+                    self.hc
+                        .as_mut()
+                        .context("GLM-5.3 mHC runtime is not bound")?
+                        .collapse_final(s, rows, &mut w.x)?;
+                }
                 if !flint
                     && ((self.model_spec.moe.is_some()
                         && !self.qwen_device_prefix
@@ -3951,6 +4996,10 @@ impl Engine {
                     matrix(&w.n, s, (rows - 1) * h, 1, h)?,
                     &mut TensorMut(matrix(&w.logits, s, 0, 1, self.model_spec.vocab as usize)?),
                 )?;
+                #[cfg(test)]
+                if let Some(calls) = &q.glm_calls {
+                    calls.borrow_mut()[0][9] += 1;
+                }
                 unsafe {
                     s.launch_builder(&self.ops.argmax)
                         .arg(&w.logits)
@@ -3973,9 +5022,201 @@ impl Engine {
     }
 }
 
+#[cfg(all(test, feature = "cuda"))]
+#[path = "engine_glm_tests.rs"]
+mod composition_tests;
+
 #[cfg(test)]
 mod tests {
     use super::default_chunk;
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "exclusive CUDA; native KDA projection binding"]
+    fn kda_native_projections_gpu() -> anyhow::Result<()> {
+        use super::*;
+        use crate::backend::cuda::{blas::Blas, closure::Closure, ops::Ops, weights::StoredTensor};
+        use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope};
+        use std::collections::BTreeMap;
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let root = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/glm53-flash-config.json"
+        )))?;
+        let model = crate::model_spec::ModelSpec::glm5_next(&root, &serde_json::Value::Null)?;
+        let spec = GdnSpec::from_model(&model)?;
+        let device = crate::backend::cuda::Device::new(0)?;
+        let s = &device.stream;
+        let width = (spec.hv * spec.dv) as usize;
+        let hidden = model.hidden as usize;
+        let definitions = [
+            ("q_proj", width, hidden),
+            ("k_proj", width, hidden),
+            ("v_proj", width, hidden),
+            ("f_a_proj", 128, hidden),
+            ("f_b_proj", width, 128),
+            ("g_a_proj", 128, hidden),
+            ("g_b_proj", width, 128),
+            ("b_proj", 64, hidden),
+        ];
+        let mut entries = BTreeMap::new();
+        let mut tensors = BTreeMap::new();
+        let mut bytes = 0;
+        for (seed, (role, n, k)) in definitions.iter().copied().enumerate() {
+            let mut weight = vec![bf16::ZERO; n * k];
+            for row in 0..n {
+                weight[row * k + (row * 17 + seed * 29) % k] =
+                    bf16::from_f32((row % 7 + 1) as f32 / 8.0);
+            }
+            let role = format!("self_attn.{role}.weight");
+            let name = format!("model.language_model.layers.2.{role}");
+            let size = weight.len() * 2;
+            entries.insert(
+                name.clone(),
+                TensorEntry {
+                    dtype: safetensors::Dtype::BF16,
+                    shape: vec![n, k],
+                    shard: "native-kda.safetensors".into(),
+                    bytes: size,
+                    load: true,
+                    data_start: 0,
+                    data_offsets: [0, size as u64],
+                    scope: TensorScope::Text,
+                    layer: Some(2),
+                    role,
+                    scale_name: None,
+                },
+            );
+            tensors.insert(name, StoredTensor::Bf16(s.clone_htod(&weight)?));
+            bytes += size;
+        }
+        let catalog = WeightCatalog {
+            linear_format: crate::model_spec::LinearFormat::Bf16,
+            tensors,
+            manifest: TensorManifest {
+                entries,
+                resident_bytes: bytes,
+            },
+            bytes,
+            upload_content_sha256: None,
+            upload_hashed_bytes: None,
+            load_wall_ms: 0.0,
+        };
+        let dequant = LayerDequantPlan::from_manifest(&catalog.manifest, 2, catalog.linear_format)?;
+        let linear = LayerLinearPlan::bind(&dequant, &catalog, None, s)?;
+        let runtime = PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?);
+        let blas = Blas::new(
+            &device,
+            &Ops::new(&device.ctx)?,
+            &runtime,
+            std::rc::Rc::new(Closure::new(false, "native KDA binding".into())),
+        )?;
+        let capacity = 65;
+        let mut work = Work::new(s, &model, capacity)?;
+        let input: Vec<_> = (0..capacity * hidden)
+            .map(|i| bf16::from_f32(((i * 11 + 3) % 251) as f32 / 128.0 - 1.0))
+            .collect();
+        s.memcpy_htod(&input, &mut work.n)?;
+        let project = |seed: usize, values: &[bf16]| -> Vec<bf16> {
+            let (_, n, k) = definitions[seed];
+            (0..values.len() / k * n)
+                .map(|i| {
+                    let row = i / n;
+                    let output = i % n;
+                    bf16::from_f32(
+                        values[row * k + (output * 17 + seed * 29) % k].to_f32()
+                            * (output % 7 + 1) as f32
+                            / 8.0,
+                    )
+                })
+                .collect()
+        };
+        let expected: Vec<_> = (0..3).map(|seed| project(seed, &input)).collect();
+        let a = project(4, &project(3, &input));
+        let z = project(6, &project(5, &input));
+        let b = project(7, &input);
+        let mut defects = 0;
+        let mut cells = 0;
+        for rows in [1, 2, 5, 31, 33, 65] {
+            linear.prepare(&blas, rows as u32)?;
+            for phase in [ExecutionPhase::Prefill, ExecutionPhase::Decode] {
+                if phase == ExecutionPhase::Decode && rows != 1 {
+                    continue;
+                }
+                for graph in [false, true] {
+                    device.finish_upload()?;
+                    if graph {
+                        s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                    }
+                    let launched = project_kda(
+                        &linear,
+                        &blas,
+                        s,
+                        phase,
+                        &mut work,
+                        spec,
+                        [rows, capacity, hidden],
+                    );
+                    if graph {
+                        let captured =
+                            s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                        launched?;
+                        captured?
+                            .context("empty native projection graph")?
+                            .launch()?;
+                    } else {
+                        launched?;
+                    }
+                    let qkv = s.clone_dtoh(&work.qkv)?;
+                    let mixer = work.mixer.as_ref().context("native mixer workspace")?;
+                    let ab = s.clone_dtoh(&mixer.ab)?;
+                    let gate = s.clone_dtoh(&mixer.gate)?;
+                    let mut mismatches = 0;
+                    let mut wrong_segment = 0;
+                    for row in 0..rows {
+                        for part in 0..3 {
+                            for d in 0..width {
+                                let actual = qkv[(row * 3 + part) * width + d].to_bits();
+                                mismatches += usize::from(
+                                    actual != expected[part][row * width + d].to_bits(),
+                                );
+                                wrong_segment += usize::from(
+                                    actual != expected[(part + 1) % 3][row * width + d].to_bits(),
+                                );
+                            }
+                        }
+                    }
+                    for (actual, expected) in [
+                        (&ab[..rows * width], &a[..rows * width]),
+                        (&gate[..rows * width], &z[..rows * width]),
+                        (
+                            &ab[capacity * width..capacity * width + rows * 64],
+                            &b[..rows * 64],
+                        ),
+                    ] {
+                        mismatches += actual
+                            .iter()
+                            .zip(expected)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                    }
+                    let passed = mismatches == 0 && wrong_segment > 0;
+                    defects += usize::from(!passed);
+                    cells += 1;
+                    println!(
+                        "{} KDA_NATIVE_PROJECTIONS layer=2 rows={rows} graph={graph} phase={phase:?} qkv=[{rows},24576] mismatches={mismatches} wrong_segment={wrong_segment} native_bf16=true copies=3",
+                        if passed { "PASS" } else { "DEFECT" }
+                    );
+                }
+            }
+        }
+        println!("KDA_NATIVE_PROJECTIONS_SUMMARY cells={cells} defects={defects}");
+        ensure!(defects == 0, "native projection binding defects={defects}");
+        Ok(())
+    }
 
     fn geometry() -> crate::model_spec::ModelSpec {
         crate::model_spec::ModelSpec::qwen(

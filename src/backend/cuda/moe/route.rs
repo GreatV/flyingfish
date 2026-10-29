@@ -26,6 +26,8 @@ pub(crate) struct RouteOps {
     #[cfg(feature = "cuda")]
     noaux_topk_f32: CudaFunction,
     blas: CudaBlas,
+    #[cfg(feature = "cuda")]
+    logits_gemm: Option<super::super::blas::RouteLogits>,
     stream: Arc<CudaStream>,
 }
 
@@ -127,6 +129,8 @@ impl RouteOps {
             #[cfg(feature = "cuda")]
             noaux_topk_f32: module.load_function("moe_route_topk_noaux_f32")?,
             blas,
+            #[cfg(feature = "cuda")]
+            logits_gemm: None,
             stream: stream.clone(),
         })
     }
@@ -200,41 +204,7 @@ impl RouteOps {
         router: Tensor<bf16, 2>,
         logits: &mut TensorMut<f32, 2>,
     ) -> Result<()> {
-        ensure!(
-            Arc::ptr_eq(stream, &self.stream),
-            "moe route FP32 logits stream is not the RouteOps construction stream (cuBLAS handle bound at construction)"
-        );
-        x.validate()?;
-        router.validate()?;
-        logits.0.validate()?;
-        let (rows, hidden) = (x.shape[0], x.shape[1]);
-        let experts = router.shape[0];
-        ensure!(
-            x.stride == [u64::from(hidden), 1] && router.stride == [u64::from(hidden), 1],
-            "FP32 route logits require contiguous x and router rows: x {:?}/{:?}, router {:?}/{:?}",
-            x.shape,
-            x.stride,
-            router.shape,
-            router.stride
-        );
-        ensure!(
-            router.shape[1] == hidden,
-            "FP32 route logits hidden width mismatch: x {:?}, router {:?}",
-            x.shape,
-            router.shape
-        );
-        ensure!(
-            logits.0.shape == [rows, experts] && logits.0.stride == [u64::from(experts), 1],
-            "FP32 route logits must be a dense [rows, experts] view: shape {:?}, stride {:?}, expected [{rows}, {experts}]",
-            logits.0.shape,
-            logits.0.stride
-        );
-        no_overlap(&x, &logits.0, "x", "logits")?;
-        no_overlap(&router, &logits.0, "router", "logits")?;
-        ensure!(
-            rows <= i32::MAX as u32 && experts <= i32::MAX as u32 && hidden <= i32::MAX as u32,
-            "FP32 route logits GEMM dimensions must fit i32: rows {rows}, experts {experts}, hidden {hidden}"
-        );
+        let (rows, experts, hidden) = self.validate_logits_f32(stream, x, router, logits)?;
         let alpha = 1f32;
         let beta = 0f32;
         unsafe {
@@ -338,6 +308,78 @@ impl RouteOps {
             )?;
         }
         self.topk(stream, &plan, logits, ids, weights, score)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn validate_logits_f32(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: Tensor<bf16, 2>,
+        router: Tensor<bf16, 2>,
+        logits: &TensorMut<f32, 2>,
+    ) -> Result<(u32, u32, u32)> {
+        ensure!(
+            Arc::ptr_eq(stream, &self.stream),
+            "moe route FP32 logits stream is not the RouteOps construction stream (cuBLAS handle bound at construction)"
+        );
+        x.validate()?;
+        router.validate()?;
+        logits.0.validate()?;
+        let (rows, hidden) = (x.shape[0], x.shape[1]);
+        let experts = router.shape[0];
+        ensure!(
+            x.stride == [u64::from(hidden), 1] && router.stride == [u64::from(hidden), 1],
+            "FP32 route logits require contiguous x and router rows: x {:?}/{:?}, router {:?}/{:?}",
+            x.shape,
+            x.stride,
+            router.shape,
+            router.stride
+        );
+        ensure!(
+            router.shape[1] == hidden,
+            "FP32 route logits hidden width mismatch: x {:?}, router {:?}",
+            x.shape,
+            router.shape
+        );
+        ensure!(
+            logits.0.shape == [rows, experts] && logits.0.stride == [u64::from(experts), 1],
+            "FP32 route logits must be a dense [rows, experts] view: shape {:?}, stride {:?}, expected [{rows}, {experts}]",
+            logits.0.shape,
+            logits.0.stride
+        );
+        no_overlap(&x, &logits.0, "x", "logits")?;
+        no_overlap(&router, &logits.0, "router", "logits")?;
+        ensure!(
+            rows <= i32::MAX as u32 && experts <= i32::MAX as u32 && hidden <= i32::MAX as u32,
+            "FP32 route logits GEMM dimensions must fit i32: rows {rows}, experts {experts}, hidden {hidden}"
+        );
+        Ok((rows, experts, hidden))
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn prepare_logits_f32(&mut self, rows: u32, hidden: u32) -> Result<()> {
+        if self.logits_gemm.is_none() {
+            self.logits_gemm = Some(super::super::blas::RouteLogits::new(&self.stream)?);
+        }
+        self.logits_gemm
+            .as_ref()
+            .context("Lt route handle missing")?
+            .plan_for(rows as usize, self.experts as usize, hidden as usize)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn logits_f32_lt(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: Tensor<bf16, 2>,
+        router: Tensor<bf16, 2>,
+        logits: &mut TensorMut<f32, 2>,
+    ) -> Result<()> {
+        self.validate_logits_f32(stream, x, router, logits)?;
+        self.logits_gemm
+            .as_ref()
+            .context("Lt route logits were not prepared")?
+            .matmul_f32(&router, &x, &logits.0)
     }
 
     pub fn topk_noaux<T: DeviceRepr + Copy + 'static>(

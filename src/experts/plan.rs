@@ -437,7 +437,11 @@ pub fn staging_capacity(
         .context("native copy stage bytes overflow")?;
     let host_expert_bytes = host_bytes
         .checked_sub(host_io)
-        .context("native host budget cannot hold copy stages")?;
+        .with_context(|| {
+            format!(
+                "native host budget cannot hold copy stages: host_bytes={host_bytes} slot={slot} copies={copies} required={host_io}"
+            )
+        })?;
     let non_gpu = total - slots;
     let (host_blocks, spare_blocks) = if non_gpu == 0 {
         (0, 0)
@@ -1639,6 +1643,38 @@ impl PeerSendLayout {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_staging_bounds_glm_block_experts() -> Result<()> {
+        let geometry = ExpertGeometry {
+            first_layer: 3,
+            layers: 42,
+            experts: 288,
+            hidden: 4096,
+            intermediate: 2048,
+            top_k: 8,
+        };
+        let layout = crate::experts::catalogue::ExpertLayout::new(
+            crate::model_spec::ExpertFormat::Fp8W8a16Block {
+                block: [128, 128],
+                scale_dtype: safetensors::Dtype::F32,
+            },
+            &geometry,
+        )?;
+        let slot = layout.slot_bytes();
+        let (capacity, admission) =
+            staging_capacity(geometry, layout.clone(), 4, 80 << 30, 24 << 30, 2)?;
+        assert_eq!(capacity.spare_blocks, 32);
+        assert_eq!(admission.hard_cap(slot)?, 32);
+        assert!(capacity.slots_per_layer.iter().all(|&n| n >= 32));
+        assert!(u64::from(capacity.slots_total()) * slot <= 80 << 30);
+        assert!(u64::from(capacity.host_blocks + capacity.spare_blocks + 6) * slot <= 24 << 30);
+        assert!(
+            staging_capacity(geometry, layout.clone(), 4, 42 * 32 * slot - 1, 24 << 30, 2).is_err()
+        );
+        assert!(staging_capacity(geometry, layout, 4, 80 << 30, 38 * slot, 2).is_err());
+        Ok(())
+    }
+
     #[test]
     fn native_staging_capacity_bounds_real_expert_geometry() -> Result<()> {
         let geometry = ExpertGeometry {

@@ -2006,7 +2006,7 @@ impl DeepseekFfn {
         slots: &super::moe::Slots,
     ) -> Result<()> {
         let layer_u32 = u32::try_from(layer).context("DeepSeek-V4.1 tier layer overflow")?;
-        let (table, valid) = slots.deepseek_dispatch(layer_u32)?;
+        let (table, valid) = slots.native_dispatch(layer_u32)?;
         let bound = self
             .layers
             .get_mut(layer)
@@ -2352,7 +2352,7 @@ impl DeepseekFfn {
             }
             let ids = s.clone_dtoh(&self.ids.slice(..rows * top_k))?;
             let weights = s.clone_dtoh(&self.route_weights.slice(..rows * top_k))?;
-            slots.resolve_deepseek(
+            slots.resolve_native(
                 u32::try_from(layer).context("DeepSeek-V4.1 tier layer overflow")?,
                 &ids,
                 &weights,
@@ -2602,7 +2602,7 @@ impl Engine {
                 );
             }
             let runtime = self
-                .deepseek
+                .hc
                 .as_mut()
                 .context("DeepSeek-V4.1 mHC runtime is not bound")?;
             let ids = if matches!(step.input, crate::backend::Input::Token) {
@@ -2657,7 +2657,7 @@ impl Engine {
                 return Ok(());
             }
             let Engine {
-                deepseek,
+                hc,
                 deepseek_ffn,
                 work,
                 device,
@@ -2665,7 +2665,7 @@ impl Engine {
                 weights,
                 ..
             } = self;
-            let hc = deepseek
+            let hc = hc
                 .as_mut()
                 .context("DeepSeek-V4.1 mHC runtime is not bound")?;
             hc.collapse_final(&device.stream, step.rows, &mut work.x)?;
@@ -3334,7 +3334,8 @@ impl Engine {
             runtime,
             spec: None,
             hidden_capture: None,
-            deepseek: Some(hc),
+            hc: Some(hc),
+            glm_dsa: None,
             deepseek_mixer: Some(mixer),
             deepseek_ffn: Some(ffn),
             deepseek_engram: Some(engram),
@@ -5353,7 +5354,7 @@ mod tests {
         ffn: bool,
     ) -> Result<()> {
         let s = &engine.device.stream;
-        let hc = engine.deepseek.as_mut().context("mHC runtime missing")?;
+        let hc = engine.hc.as_mut().context("mHC runtime missing")?;
         ensure!(
             residual.len() == 20480 && pre.len() == 4,
             "mHC operand geometry"
@@ -5392,7 +5393,7 @@ mod tests {
             .context("recorded comb missing")?;
         ensure!(post.len() == 4 && comb.len() == 16, "recorded mix geometry");
         let s = &engine.device.stream;
-        let hc = engine.deepseek.as_mut().context("mHC runtime missing")?;
+        let hc = engine.hc.as_mut().context("mHC runtime missing")?;
         s.memcpy_htod(&residual, &mut hc.stream.slice_mut(..20480))?;
         s.memcpy_htod(post, &mut hc.mix_post.slice_mut(..4))?;
         s.memcpy_htod(comb, &mut hc.mix_comb.slice_mut(..16))?;
@@ -5479,7 +5480,7 @@ mod tests {
         values: [f32; 2],
     ) -> Result<bool> {
         let s = &engine.device.stream;
-        let hc = engine.deepseek.as_ref().context("mHC missing")?;
+        let hc = engine.hc.as_ref().context("mHC missing")?;
         let (pre, expected_pre, expected_stream) = if name == "collapse_attn" {
             (
                 hc.carry.as_ref().context("mHC carry missing")?,
@@ -6521,7 +6522,7 @@ mod tests {
                     "expand_attn",
                     &s.clone_dtoh(
                         &engine
-                            .deepseek
+                            .hc
                             .as_ref()
                             .context("mHC missing")?
                             .stream
@@ -6598,7 +6599,7 @@ mod tests {
                     "expand_ffn",
                     &s.clone_dtoh(
                         &engine
-                            .deepseek
+                            .hc
                             .as_ref()
                             .context("mHC missing")?
                             .stream
@@ -6616,7 +6617,7 @@ mod tests {
                     "carried_pre",
                     &s.clone_dtoh(
                         &engine
-                            .deepseek
+                            .hc
                             .as_ref()
                             .context("mHC missing")?
                             .carry
@@ -6646,7 +6647,7 @@ mod tests {
 
     fn layer_mix_rows(engine: &Engine, prefix: &str) -> Result<Vec<(String, Vec<f32>)>> {
         let s = &engine.device.stream;
-        let hc = engine.deepseek.as_ref().context("mHC missing")?;
+        let hc = engine.hc.as_ref().context("mHC missing")?;
         Ok(vec![
             (
                 format!("{prefix}_pre"),
@@ -7137,7 +7138,8 @@ mod tests {
             capture_fail_after_layer: None,
             capture_fail_stage: None,
             flint_window_capture: None,
-            deepseek: Some(runtime),
+            hc: Some(runtime),
+            glm_dsa: None,
             deepseek_mixer: None,
             deepseek_ffn: None,
             deepseek_engram: None,
@@ -7208,9 +7210,8 @@ mod tests {
         let ids = [0u32, 3, 5];
         s.memcpy_htod(&ids, &mut engine.work.ids.slice_mut(..ROWS))?;
         engine.run_operator(Operator::Embed, 0, step, &mut None)?;
-        let stream0: Vec<bf16> = s.clone_dtoh(&engine.deepseek.as_ref().unwrap().stream)?;
-        let carry0: Vec<f32> =
-            s.clone_dtoh(engine.deepseek.as_ref().unwrap().carry.as_ref().unwrap())?;
+        let stream0: Vec<bf16> = s.clone_dtoh(&engine.hc.as_ref().unwrap().stream)?;
+        let carry0: Vec<f32> = s.clone_dtoh(engine.hc.as_ref().unwrap().carry.as_ref().unwrap())?;
         for row in 0..ROWS {
             for (j, got) in stream0[row * mix_width..(row + 1) * mix_width]
                 .chunks(HIDDEN)
@@ -7231,11 +7232,11 @@ mod tests {
         }
 
         engine.run_hc_stage(0, HcStage::Pre, 0, step)?;
-        let pre0: Vec<f32> = s.clone_dtoh(&engine.deepseek.as_ref().unwrap().mix_pre)?;
-        let post0: Vec<f32> = s.clone_dtoh(&engine.deepseek.as_ref().unwrap().mix_post)?;
-        let comb0: Vec<f32> = s.clone_dtoh(&engine.deepseek.as_ref().unwrap().mix_comb)?;
+        let pre0: Vec<f32> = s.clone_dtoh(&engine.hc.as_ref().unwrap().mix_pre)?;
+        let post0: Vec<f32> = s.clone_dtoh(&engine.hc.as_ref().unwrap().mix_post)?;
+        let comb0: Vec<f32> = s.clone_dtoh(&engine.hc.as_ref().unwrap().mix_comb)?;
         let attn_pre0: Vec<f32> =
-            s.clone_dtoh(engine.deepseek.as_ref().unwrap().attn_pre.as_ref().unwrap())?;
+            s.clone_dtoh(engine.hc.as_ref().unwrap().attn_pre.as_ref().unwrap())?;
         let x0: Vec<bf16> = s.clone_dtoh(&engine.work.x.slice(..ROWS * HIDDEN))?;
         for row in 0..ROWS {
             let stream = &stream0[row * mix_width..(row + 1) * mix_width];
@@ -7286,7 +7287,7 @@ mod tests {
 
         s.memcpy_htod(&attn.out, &mut engine.work.out.slice_mut(..ROWS * HIDDEN))?;
         engine.run_hc_stage(3, HcStage::Post, 0, step)?;
-        let stream1: Vec<bf16> = s.clone_dtoh(&engine.deepseek.as_ref().unwrap().stream)?;
+        let stream1: Vec<bf16> = s.clone_dtoh(&engine.hc.as_ref().unwrap().stream)?;
         for row in 0..ROWS {
             let residual = &stream0[row * mix_width..(row + 1) * mix_width];
             let sublayer = &attn.out[row * HIDDEN..(row + 1) * HIDDEN];
@@ -7311,11 +7312,10 @@ mod tests {
         }
 
         engine.run_hc_stage(4, HcStage::Pre, 0, step)?;
-        let pre4: Vec<f32> = s.clone_dtoh(&engine.deepseek.as_ref().unwrap().mix_pre)?;
-        let post4: Vec<f32> = s.clone_dtoh(&engine.deepseek.as_ref().unwrap().mix_post)?;
-        let comb4: Vec<f32> = s.clone_dtoh(&engine.deepseek.as_ref().unwrap().mix_comb)?;
-        let carry4: Vec<f32> =
-            s.clone_dtoh(engine.deepseek.as_ref().unwrap().carry.as_ref().unwrap())?;
+        let pre4: Vec<f32> = s.clone_dtoh(&engine.hc.as_ref().unwrap().mix_pre)?;
+        let post4: Vec<f32> = s.clone_dtoh(&engine.hc.as_ref().unwrap().mix_post)?;
+        let comb4: Vec<f32> = s.clone_dtoh(&engine.hc.as_ref().unwrap().mix_comb)?;
+        let carry4: Vec<f32> = s.clone_dtoh(engine.hc.as_ref().unwrap().carry.as_ref().unwrap())?;
         let x4: Vec<bf16> = s.clone_dtoh(&engine.work.x.slice(..ROWS * HIDDEN))?;
         for row in 0..ROWS {
             let stream = &stream1[row * mix_width..(row + 1) * mix_width];
@@ -7365,7 +7365,7 @@ mod tests {
 
         s.memcpy_htod(&ffn.out, &mut engine.work.out.slice_mut(..ROWS * HIDDEN))?;
         engine.run_hc_stage(7, HcStage::Post, 0, step)?;
-        let stream2: Vec<bf16> = s.clone_dtoh(&engine.deepseek.as_ref().unwrap().stream)?;
+        let stream2: Vec<bf16> = s.clone_dtoh(&engine.hc.as_ref().unwrap().stream)?;
         for row in 0..ROWS {
             let residual = &stream1[row * mix_width..(row + 1) * mix_width];
             let sublayer = &ffn.out[row * HIDDEN..(row + 1) * HIDDEN];
@@ -7391,7 +7391,7 @@ mod tests {
 
         // Planted control (model.py:978-980): the FFN HcPre collapses with the
         // carried (layer-entry, one-hot) pre-mix instead of the attention's own.
-        let runtime = engine.deepseek.as_mut().context("runtime missing")?;
+        let runtime = engine.hc.as_mut().context("runtime missing")?;
         s.memcpy_htod(&stream1, &mut runtime.stream.slice_mut(..ROWS * mix_width))?;
         let mut one_hot = vec![0.0f32; ROWS * MULT];
         for row in one_hot.chunks_mut(MULT) {
@@ -7426,7 +7426,7 @@ mod tests {
 
         // Policy control (GLM semantics, modeling_glm5_next.py:1334-1336): the
         // FFN HcPre collapsed with the sublayer's own just-computed pre.
-        let runtime = engine.deepseek.as_mut().context("runtime missing")?;
+        let runtime = engine.hc.as_mut().context("runtime missing")?;
         runtime.hc_pre(
             s,
             0,
@@ -7488,14 +7488,14 @@ mod tests {
                 .map(|i| (pattern(53 + i, 1.1) * 0.5 + 0.5) as f32)
                 .collect();
             {
-                let runtime = engine.deepseek.as_mut().unwrap();
+                let runtime = engine.hc.as_mut().unwrap();
                 s.memcpy_htod(
                     &stream_vals,
                     &mut runtime.stream.slice_mut(..ROWS * MIX_WIDTH),
                 )?;
                 s.memcpy_htod(&pre_vals, &mut runtime.mix_pre.slice_mut(..ROWS * MULT))?;
             }
-            let runtime = engine.deepseek.as_ref().unwrap();
+            let runtime = engine.hc.as_ref().unwrap();
             let mut collapsed = engine.work.x.clone();
             runtime.collapse_final(s, ROWS, &mut collapsed)?;
             let got: Vec<bf16> = s.clone_dtoh(&collapsed.slice(..ROWS * HIDDEN))?;
@@ -7968,7 +7968,8 @@ mod tests {
             capture_fail_after_layer: None,
             capture_fail_stage: None,
             flint_window_capture: None,
-            deepseek: None,
+            hc: None,
+            glm_dsa: None,
             deepseek_mixer: Some(mixer),
             deepseek_ffn: None,
             deepseek_engram: None,
@@ -9074,7 +9075,8 @@ mod tests {
             capture_fail_after_layer: None,
             capture_fail_stage: None,
             flint_window_capture: None,
-            deepseek: None,
+            hc: None,
+            glm_dsa: None,
             deepseek_mixer: None,
             deepseek_ffn: Some(ffn),
             deepseek_engram: None,
@@ -10514,12 +10516,7 @@ mod tests {
         )?;
         let device = engine.device.clone();
         let s = &device.stream;
-        let params = engine
-            .deepseek
-            .as_ref()
-            .context(runtime_missing)?
-            .binding
-            .params;
+        let params = engine.hc.as_ref().context(runtime_missing)?.binding.params;
         ensure!(
             params.mult as usize == STREAM_COPIES,
             "engine hc_mult {} is not {STREAM_COPIES}",
@@ -10542,12 +10539,12 @@ mod tests {
         // Layer-0 hc weights as uploaded: the FP64 mixes reference reads these,
         // not the checkpoint, so the reference shares the engine's operands.
         let hc_attn_bytes = engine
-            .deepseek
+            .hc
             .as_ref()
             .context(runtime_missing)?
             .sublayer_weight_host(s, 0, HcSublayer::Attention)?;
         let hc_ffn_bytes = engine
-            .deepseek
+            .hc
             .as_ref()
             .context(runtime_missing)?
             .sublayer_weight_host(s, 0, HcSublayer::Ffn)?;
@@ -10713,7 +10710,7 @@ mod tests {
             s.memcpy_htod(
                 &input_row,
                 &mut engine
-                    .deepseek
+                    .hc
                     .as_mut()
                     .context(runtime_missing)?
                     .stream
@@ -10728,7 +10725,7 @@ mod tests {
                 s.memcpy_htod(
                     &carried,
                     &mut engine
-                        .deepseek
+                        .hc
                         .as_mut()
                         .context(runtime_missing)?
                         .carry
@@ -10742,7 +10739,7 @@ mod tests {
                 // Planted wiring control (model.py:978-980): the attention
                 // sublayer collapsing with its own pre instead of the carried
                 // one must move the collapse beyond the same thresholds.
-                engine.deepseek.as_mut().context(runtime_missing)?.hc_pre(
+                engine.hc.as_mut().context(runtime_missing)?.hc_pre(
                     &engine.device.stream,
                     0,
                     HcSublayer::Attention,
@@ -10796,8 +10793,7 @@ mod tests {
                 f64::INFINITY,
             );
             engine.run_hc_stage(7, HcStage::Post, 0, step)?;
-            let final_row =
-                s.clone_dtoh(&engine.deepseek.as_ref().context(runtime_missing)?.stream)?;
+            let final_row = s.clone_dtoh(&engine.hc.as_ref().context(runtime_missing)?.stream)?;
             let final_row = final_row[..STREAM_WIDTH].to_vec();
             let want = &records.expand[1][index * STREAM_WIDTH..(index + 1) * STREAM_WIDTH];
             info_final.bf16s(position, &final_row, want, f64::INFINITY);
@@ -10853,7 +10849,7 @@ mod tests {
             s.memcpy_htod(
                 &input_row,
                 &mut engine
-                    .deepseek
+                    .hc
                     .as_mut()
                     .context(runtime_missing)?
                     .stream
@@ -10876,7 +10872,7 @@ mod tests {
             s.memcpy_htod(
                 &carried,
                 &mut engine
-                    .deepseek
+                    .hc
                     .as_mut()
                     .context(runtime_missing)?
                     .carry
@@ -10889,7 +10885,7 @@ mod tests {
             // Program stage 0 (HcPre): the attention mixes and the collapse
             // with the carried pre-mix.
             engine.run_hc_stage(0, HcStage::Pre, 0, step)?;
-            let runtime = engine.deepseek.as_ref().context(runtime_missing)?;
+            let runtime = engine.hc.as_ref().context(runtime_missing)?;
             let mix_pre: Vec<f32> = s.clone_dtoh(&runtime.mix_pre.slice(..STREAM_COPIES))?;
             let mix_post: Vec<f32> = s.clone_dtoh(&runtime.mix_post.slice(..STREAM_COPIES))?;
             let mix_comb: Vec<f32> =
@@ -10930,7 +10926,7 @@ mod tests {
             if position == 0 {
                 let carry: Vec<f32> = s.clone_dtoh(
                     &engine
-                        .deepseek
+                        .hc
                         .as_ref()
                         .context(runtime_missing)?
                         .carry
@@ -11215,8 +11211,7 @@ mod tests {
                 s.memcpy_htod(want_attn, &mut engine.work.out.slice_mut(..HIDDEN))?;
             }
             engine.run_hc_stage(3, HcStage::Post, 0, step)?;
-            let stream =
-                s.clone_dtoh(&engine.deepseek.as_ref().context(runtime_missing)?.stream)?;
+            let stream = s.clone_dtoh(&engine.hc.as_ref().context(runtime_missing)?.stream)?;
             let stream = stream[..STREAM_WIDTH].to_vec();
             let want_expand = &records.expand[0][index * STREAM_WIDTH..(index + 1) * STREAM_WIDTH];
             expand_margin.bf16s(position, &stream, want_expand, band("expand_attn", tf));
@@ -11257,7 +11252,7 @@ mod tests {
             // Program stage 4 (HcPre): the FFN mixes and the collapse with the
             // attention's own pre-mix.
             engine.run_hc_stage(4, HcStage::Pre, 0, step)?;
-            let runtime = engine.deepseek.as_ref().context(runtime_missing)?;
+            let runtime = engine.hc.as_ref().context(runtime_missing)?;
             let mix_pre: Vec<f32> = s.clone_dtoh(&runtime.mix_pre.slice(..STREAM_COPIES))?;
             let mix_post: Vec<f32> = s.clone_dtoh(&runtime.mix_post.slice(..STREAM_COPIES))?;
             let mix_comb: Vec<f32> =
@@ -11367,7 +11362,7 @@ mod tests {
                     .iter()
                     .map(|&v| v as f32)
                     .collect();
-                let runtime = engine.deepseek.as_mut().context(runtime_missing)?;
+                let runtime = engine.hc.as_mut().context(runtime_missing)?;
                 // The residual copies are the record's expanded attention stream.
                 s.memcpy_htod(
                     &records.expand[0][index * STREAM_WIDTH..(index + 1) * STREAM_WIDTH],
@@ -11382,7 +11377,7 @@ mod tests {
             // Isolated-operand check (4d ruling 2026-10-28T21:24:59Z): the stage-7 launch must
             // see the record's coefficients and residual, or the injection point is wrong.
             if isolated_ffn {
-                let runtime = engine.deepseek.as_ref().context(runtime_missing)?;
+                let runtime = engine.hc.as_ref().context(runtime_missing)?;
                 let post_dev: Vec<f32> = s.clone_dtoh(&runtime.mix_post.slice(..STREAM_COPIES))?;
                 let comb_dev: Vec<f32> =
                     s.clone_dtoh(&runtime.mix_comb.slice(..STREAM_COPIES * STREAM_COPIES))?;
@@ -11412,8 +11407,7 @@ mod tests {
                 );
             }
             engine.run_hc_stage(7, HcStage::Post, 0, step)?;
-            let final_row =
-                s.clone_dtoh(&engine.deepseek.as_ref().context(runtime_missing)?.stream)?;
+            let final_row = s.clone_dtoh(&engine.hc.as_ref().context(runtime_missing)?.stream)?;
             let final_row = final_row[..STREAM_WIDTH].to_vec();
             let want_final = &records.expand[1][index * STREAM_WIDTH..(index + 1) * STREAM_WIDTH];
             final_stream.bf16s(position, &final_row, want_final, band("expand_ffn", tf));
@@ -11424,7 +11418,7 @@ mod tests {
             );
             let carried: Vec<f32> = s.clone_dtoh(
                 &engine
-                    .deepseek
+                    .hc
                     .as_ref()
                     .context(runtime_missing)?
                     .carry
@@ -11522,7 +11516,7 @@ mod tests {
                     s.memcpy_htod(
                         &decode_stream,
                         &mut engine
-                            .deepseek
+                            .hc
                             .as_mut()
                             .context(runtime_missing)?
                             .stream
@@ -11531,7 +11525,7 @@ mod tests {
                     s.memcpy_htod(
                         carry,
                         &mut engine
-                            .deepseek
+                            .hc
                             .as_mut()
                             .context(runtime_missing)?
                             .carry
@@ -11569,7 +11563,7 @@ mod tests {
             s.memcpy_htod(
                 &decode_stream,
                 &mut engine
-                    .deepseek
+                    .hc
                     .as_mut()
                     .context(runtime_missing)?
                     .stream
@@ -11578,7 +11572,7 @@ mod tests {
             s.memcpy_htod(
                 &negated,
                 &mut engine
-                    .deepseek
+                    .hc
                     .as_mut()
                     .context(runtime_missing)?
                     .carry

@@ -138,6 +138,8 @@ __device__ __forceinline__ void fp4_act_quant(
 }
 #endif
 
+#if !defined(__HIP__)
+#include <cuda_fp16.h>
 // Two E4M3 codes per call. E4M3 is a subset of FP16, so the hardware form is
 // exact for all 256 codes; the fix-up forces the canonical NaN for both NaN codes.
 __device__ __forceinline__ float2 e4m3_decode_pair(uint16_t packed) {
@@ -156,3 +158,44 @@ __device__ __forceinline__ float2 e4m3_decode_pair(uint16_t packed) {
     return make_float2(e4m3_decode(uint8_t(packed)), e4m3_decode(uint8_t(packed >> 8)));
 #endif
 }
+
+__device__ __forceinline__ float fp8_block_scale(float value) { return value; }
+__device__ __forceinline__ float fp8_block_scale(uint8_t value) { return e8m0_decode(value); }
+
+template <typename Scale, int BLOCK>
+__device__ __forceinline__ void fp8_block_decode(
+        const uint8_t* w, const Scale* sw, const uint8_t* x, const Scale* sx,
+        __nv_bfloat16* y, int m, int n, int k, uint64_t tile) {
+    const uint64_t tiles = (uint64_t(n) + 7) / 8;
+    const uint64_t row = tile / tiles;
+    const uint64_t col = (tile % tiles) * 8 + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (row >= uint64_t(m) || col >= uint64_t(n)) return;
+    const uint64_t groups = (uint64_t(k) + BLOCK - 1) / BLOCK;
+    float total = 0.0f;
+    for (uint64_t group = 0; group < groups; ++group) {
+        float sum = 0.0f;
+        #pragma unroll
+        for (int offset = lane; offset < BLOCK; offset += 32) {
+            const uint64_t inner = group * BLOCK + offset;
+            if (inner < uint64_t(k)) {
+                const uint16_t pair = uint16_t(w[col * k + inner]) |
+                                      (uint16_t(x[row * k + inner]) << 8);
+                const float2 values = e4m3_decode_pair(pair);
+                sum = fmaf(values.x, values.y, sum);
+            }
+        }
+        #pragma unroll
+        for (int shift = 16; shift > 0; shift >>= 1)
+            sum += __shfl_down_sync(0xffffffffu, sum, shift);
+        if (lane == 0) {
+            const float scale = fp8_block_scale(sw[(col / BLOCK) * groups + group]) *
+                                fp8_block_scale(sx[row * groups + group]);
+            total = fmaf(sum, scale, total);
+        }
+    }
+    if (lane == 0) y[row * n + col] = __float2bfloat16_rn(total);
+}
+
+
+#endif
