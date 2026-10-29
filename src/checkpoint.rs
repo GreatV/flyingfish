@@ -2092,6 +2092,37 @@ mod component_tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires the published GLM checkpoint"]
+    fn glm_published_native_storage() -> Result<()> {
+        let root = std::env::var_os("FF_GLM_MODEL").context("FF_GLM_MODEL is required")?;
+        let root = std::path::Path::new(&root);
+        let spec = crate::model_spec::ModelSpec::read(root)?;
+        let mapped = MappedCheckpoint::open(root)?;
+        let manifest = mapped.manifest(&spec, LoadPolicy::TextOnly)?;
+        let mut counts = [0usize; 2];
+        for (name, entry) in &manifest.entries {
+            if !entry.load || !entry.role.starts_with("hc_") {
+                continue;
+            }
+            ensure!(
+                entry.native_byte_storage(),
+                "mHC native storage missing: {name}"
+            );
+            match entry.dtype {
+                Dtype::BF16 => counts[0] += 1,
+                Dtype::F32 => counts[1] += 1,
+                dtype => anyhow::bail!("unexpected published mHC dtype {dtype:?}: {name}"),
+            }
+        }
+        ensure!(
+            counts == [90, 180],
+            "published mHC census mismatch: {counts:?}"
+        );
+        println!("PASS glm_published_native_storage bf16_fn=90 f32=180 conversion=0");
+        Ok(())
+    }
+
+    #[test]
     fn glm_native_manifest_preserves_roles_and_projection_extents() -> Result<()> {
         let root = serde_json::from_str(include_str!("../tests/data/glm53-flash-config.json"))?;
         let mut spec = crate::model_spec::ModelSpec::glm5_next(&root, &serde_json::Value::Null)?;

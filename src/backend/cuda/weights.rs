@@ -916,11 +916,14 @@ impl Loader<'_> {
             let valid = match dtype {
                 Dtype::F8_E4M3 => staging.as_slice()?[..len].iter().all(|c| c & 0x7f != 0x7f),
                 Dtype::F8_E8M0 => staging.as_slice()?[..len].iter().all(|c| *c != 0xff),
-                Dtype::BF16 => staging.as_slice()?[..len]
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .all(|c| u16::from_le_bytes(*c) & 0x7f80 != 0x7f80),
+                Dtype::BF16 => {
+                    ensure!(len % 2 == 0, "unaligned BF16 chunk in {name}");
+                    staging.as_slice()?[..len]
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .all(|c| bf16::from_bits(u16::from_le_bytes(*c)).is_finite())
+                }
                 Dtype::F32 => {
                     ensure!(len % 4 == 0, "unaligned F32 chunk in {name}");
                     staging.as_slice()?[..len]
