@@ -918,7 +918,7 @@ impl Blas {
         }
     }
 
-    pub(crate) fn cublas(
+    fn cublas(
         &self,
         w: &impl DevicePtr<bf16>,
         x: &CudaView<'_, bf16>,

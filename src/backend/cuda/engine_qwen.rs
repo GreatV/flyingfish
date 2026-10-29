@@ -5727,16 +5727,11 @@ impl Engine {
                         {
                             let ops = q.gemma.as_mut().context("Gemma 4 operations missing")?;
                             let vocab = self.model_spec.vocab as usize;
-                            self.blas.cublas(
-                                &self.weights.head,
-                                &w.n.slice(..linear_rows * h),
-                                &mut ops.logits.slice_mut(..linear_rows * vocab),
-                                crate::backend::setup::LinearShape {
-                                    rows: linear_rows,
-                                    output: vocab,
-                                    input: h,
-                                },
-                                0,
+                            self.blas.linear_typed(
+                                phase,
+                                LinearWeightRef::Bf16(matrix(&self.weights.head, s, 0, vocab, h)?),
+                                matrix(&w.n, s, 0, linear_rows, h)?,
+                                &mut TensorMut(matrix(&ops.logits, s, 0, linear_rows, vocab)?),
                             )?;
                             trace_value(trace, s, "head_raw", &ops.logits, linear_rows, vocab)?;
                             unsafe {
