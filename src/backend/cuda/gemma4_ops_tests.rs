@@ -1015,6 +1015,17 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         v_shape.clone(),
         native_v.iter().map(|v| v.to_f32()).collect(),
     )?;
+    let (native_k4, native_v4) = engine.gemma_kv_rows(4, first_ids.len())?;
+    trace.add(
+        "debug.native_k4".into(),
+        vec![first_ids.len(), 1, 512],
+        native_k4.iter().map(|v| v.to_f32()).collect(),
+    )?;
+    trace.add(
+        "debug.native_v4".into(),
+        vec![first_ids.len(), 1, 512],
+        native_v4.iter().map(|v| v.to_f32()).collect(),
+    )?;
     trace.set_device(&engine.device_info().name)?;
     trace.save(&runtime.join("native-trace.safetensors"))?;
     let mut raw_v = Vec::with_capacity(reference_v.len());
