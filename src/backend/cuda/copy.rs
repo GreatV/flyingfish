@@ -260,7 +260,7 @@ pub struct RingCopy<'a> {
     pub head_dim: usize,
 }
 
-struct RingCopyCall {
+pub(crate) struct RingCopyCall {
     src: u64,
     dst: u64,
     source_start: usize,
@@ -299,6 +299,16 @@ impl RingCopy<'_> {
             [self.heads, self.head_dim],
         )
     }
+    pub(crate) fn run_raw(self, call: RingCopyCall) -> Result<()> {
+        let lengths = [self.source.len(), self.target.len()];
+        call.run(
+            self.stream,
+            [self.source_capacity, self.target_capacity],
+            lengths,
+            [self.heads, self.head_dim],
+        )
+    }
+
     pub(crate) fn run_dynamic(
         self,
         function: &CudaFunction,
