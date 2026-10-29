@@ -576,6 +576,10 @@ struct GemmaOps {
     per_layer_inputs: CudaSlice<bf16>,
     #[cfg(test)]
     logits: CudaSlice<bf16>,
+    #[cfg(test)]
+    mlp_ones: CudaSlice<bf16>,
+    #[cfg(test)]
+    mlp_activation: CudaSlice<bf16>,
 }
 
 pub(super) struct Runtime {
@@ -1310,6 +1314,19 @@ impl Runtime {
                 .map_err(|_| anyhow::anyhow!("two per-layer RoPE tables required"))?;
             let act = cubin::module(&engine.device.ctx, "act")?;
             let embed = cubin::module(&engine.device.ctx, "embed")?;
+            #[cfg(test)]
+            let mlp_elements = rows
+                * engine
+                    .model_spec
+                    .layers
+                    .iter()
+                    .filter_map(|layer| {
+                        layer
+                            .geometry
+                            .map(|geometry| geometry.intermediate as usize)
+                    })
+                    .max()
+                    .context("Gemma MLP diagnostic geometry missing")?;
             Some(GemmaOps {
                 scaled_embed: embed.load_function("embed_scale_broadcast")?,
                 softcap: act.load_function("softcap")?,
@@ -1348,6 +1365,10 @@ impl Runtime {
                 per_layer_inputs: s.alloc_zeros(rows * depth * width)?,
                 #[cfg(test)]
                 logits: s.alloc_zeros(rows * engine.model_spec.vocab as usize)?,
+                #[cfg(test)]
+                mlp_ones: s.clone_htod(&vec![bf16::ONE; mlp_elements])?,
+                #[cfg(test)]
+                mlp_activation: s.alloc_zeros(mlp_elements)?,
             })
         } else {
             None
@@ -5748,14 +5769,17 @@ impl Engine {
                 }
                 #[cfg(test)]
                 if gemma && (all_layers(trace) || i == self.trace_layer) {
-                    let ops = q.gemma.as_ref().context("Gemma 4 operations missing")?;
-                    let ones = s.clone_htod(&vec![bf16::ONE; rows * f])?;
-                    let mut activation = s.alloc_zeros::<bf16>(rows * f)?;
+                    let ops = q.gemma.as_mut().context("Gemma 4 operations missing")?;
+                    ensure!(
+                        ops.mlp_ones.len() >= rows * f && ops.mlp_activation.len() >= rows * f,
+                        "Gemma MLP diagnostic workspace exceeds setup extent"
+                    );
+                    let activation = &mut ops.mlp_activation;
                     unsafe {
                         s.launch_builder(&ops.gated_activation)
                             .arg(&w.gu)
-                            .arg(&ones)
-                            .arg(&mut activation)
+                            .arg(&ops.mlp_ones)
+                            .arg(&mut *activation)
                             .arg(&((rows * f) as i32))
                             .arg(&2i32)
                             .launch(flat(rows * f))?;
@@ -5764,7 +5788,7 @@ impl Engine {
                         trace,
                         s,
                         &debug_name(trace, i, "mlp_activation"),
-                        &activation,
+                        activation,
                         rows,
                         f,
                     )?;
