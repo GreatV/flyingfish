@@ -940,26 +940,30 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
     let spec = crate::model_spec::ModelSpec::read(&dir)?;
     let device = Device::new(0)?;
     let catalog = super::weights::WeightCatalog::load(&dir, &spec, &device)?;
-    for name in [
-        "self_attn.q_proj.weight",
-        "self_attn.k_proj.weight",
-        "self_attn.v_proj.weight",
-        "self_attn.q_norm.weight",
-        "self_attn.k_norm.weight",
+    for full in [
+        "model.language_model.layers.0.self_attn.q_proj.weight",
+        "model.language_model.layers.0.self_attn.k_proj.weight",
+        "model.language_model.layers.0.self_attn.v_proj.weight",
+        "model.language_model.layers.0.self_attn.q_norm.weight",
+        "model.language_model.layers.0.self_attn.k_norm.weight",
+        "model.language_model.layers.4.self_attn.k_norm.weight",
     ] {
-        let full = format!("model.language_model.layers.0.{name}");
-        let actual = catalog.bf16(&full)?;
+        let actual = catalog.bf16(full)?;
         let actual = device.stream.clone_dtoh(actual)?;
         let expected = checkpoint_tensor(&dir, &full)?;
         ensure!(actual == expected, "published tensor mismatch: {full}");
     }
     drop(catalog);
     let mut engine = super::engine::Engine::load(&dir, 0, 640, Some(640), settings)?;
-    let expected_table = spec.layers[4]
+    let full_table = spec.layers[4]
         .geometry
         .context("D512 layer geometry missing")?
         .rope
         .table(512, 14)?;
+    let expected_table: Vec<bf16> = [0usize, 1, 13]
+        .into_iter()
+        .flat_map(|position| full_table[position * 512..(position + 1) * 512].to_vec())
+        .collect();
     let actual_table = engine.gemma_rope_table(true, &[0, 1, 13])?;
     let mismatches = actual_table
         .iter()
