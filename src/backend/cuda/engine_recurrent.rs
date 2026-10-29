@@ -1014,15 +1014,17 @@ impl Engine {
         };
         unsafe {
             let (visual, visual_begin, visual_rows) = if !token {
-                r.media.as_ref().map_or((&self.weights.embed, 0, 0), |m| {
-                    (
-                        &m.work.projected_bf16,
-                        m.slot.tokens.start as i32,
-                        m.slot.tokens.len() as i32,
-                    )
-                })
+                r.media
+                    .as_ref()
+                    .map_or((self.weights.embedding(), 0, 0), |m| {
+                        (
+                            &m.work.projected_bf16,
+                            m.slot.tokens.start as i32,
+                            m.slot.tokens.len() as i32,
+                        )
+                    })
             } else {
-                (&self.weights.embed, 0, 0)
+                (self.weights.embedding(), 0, 0)
             };
             s.launch_builder(&r.embed)
                 .arg(self.weights.embedding())
