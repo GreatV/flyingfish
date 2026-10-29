@@ -13,6 +13,8 @@ pub struct Ops {
     norm_capture: CudaFunction,
     pub kv_write: CudaFunction,
     pub rope_kv: CudaFunction,
+    pub rope_pair_rows: CudaFunction,
+    pub rope_pair_tail: CudaFunction,
     pub act: CudaFunction,
     pub argmax: CudaFunction,
     pub argmax_rows: CudaFunction,
@@ -58,6 +60,126 @@ impl Ops {
         self.swiglu_rounding
     }
 
+    /// Interleaved (cos, sin) rows of one position range under the
+    /// adjacent-pair layout, from per-layer inverse frequencies; `inverse`
+    /// holds the conjugate the attention output needs.
+    pub fn rope_pair_rows(
+        &self,
+        stream: &Arc<CudaStream>,
+        inv_freq: Tensor<f32, 1>,
+        start: i32,
+        rows: usize,
+        forward: &mut TensorMut<f32, 2>,
+        inverse: &mut TensorMut<f32, 2>,
+    ) -> Result<()> {
+        let (stride, _) = dense_layout(inv_freq.shape)?;
+        ensure!(
+            inv_freq.stride == stride,
+            "rope pair inv_freq must be dense: stride {:?} != {:?}",
+            inv_freq.stride,
+            stride
+        );
+        let (stride, _) = dense_layout(forward.0.shape)?;
+        ensure!(
+            forward.0.stride == stride,
+            "rope pair forward must be dense: stride {:?} != {:?}",
+            forward.0.stride,
+            stride
+        );
+        let (stride, _) = dense_layout(inverse.0.shape)?;
+        ensure!(
+            inverse.0.stride == stride,
+            "rope pair inverse must be dense: stride {:?} != {:?}",
+            inverse.0.stride,
+            stride
+        );
+        let half = inv_freq.shape[0] as usize;
+        let tail = forward.0.shape[1] as usize;
+        ensure!(
+            half >= 1 && tail == 2 * half,
+            "rope pair rows tail {tail} is not twice the inverse-frequency count {half}"
+        );
+        ensure!(rows >= 1, "rope pair rows {rows} is below 1");
+        ensure!(start >= 0, "rope pair rows start {start} is negative");
+        ensure!(
+            forward.0.shape == [u32::try_from(rows)?, u32::try_from(tail)?],
+            "rope pair forward shape {:?} != expected [{rows}, {tail}]",
+            forward.0.shape
+        );
+        ensure!(
+            inverse.0.shape == forward.0.shape,
+            "rope pair inverse shape {:?} != forward {:?}",
+            inverse.0.shape,
+            forward.0.shape
+        );
+        unsafe {
+            stream
+                .launch_builder(&self.rope_pair_rows)
+                .arg(&inv_freq.ptr)
+                .arg(&start)
+                .arg(&i32::try_from(rows)?)
+                .arg(&i32::try_from(tail)?)
+                .arg(&forward.0.ptr)
+                .arg(&inverse.0.ptr)
+                .launch(flat(rows * half))?;
+        }
+        Ok(())
+    }
+
+    /// Rotate the last `tail` elements of every vector of `x` in place by the
+    /// row's interleaved (cos, sin) pair, adjacent pairs as complex numbers.
+    pub fn rope_pair_tail(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: &mut TensorMut<bf16, 3>,
+        rotary: Tensor<f32, 2>,
+    ) -> Result<()> {
+        let (stride, _) = dense_layout(x.0.shape)?;
+        ensure!(
+            x.0.stride == stride,
+            "rope pair input must be dense: stride {:?} != {:?}",
+            x.0.stride,
+            stride
+        );
+        let (stride, _) = dense_layout(rotary.shape)?;
+        ensure!(
+            rotary.stride == stride,
+            "rope pair rotary must be dense: stride {:?} != {:?}",
+            rotary.stride,
+            stride
+        );
+        let rows = x.0.shape[0] as usize;
+        let vectors = x.0.shape[1] as usize;
+        let width = x.0.shape[2] as usize;
+        let tail = rotary.shape[1] as usize;
+        ensure!(
+            rows >= 1 && vectors >= 1,
+            "rope pair tail rows {rows} or vectors {vectors} are below 1"
+        );
+        ensure!(
+            tail >= 2 && tail.is_multiple_of(2) && tail <= width,
+            "rope pair tail {tail} is odd, below 2, or exceeds the vector width {width}"
+        );
+        ensure!(
+            rotary.shape == [x.0.shape[0], u32::try_from(tail)?],
+            "rope pair rotary shape {:?} != expected [{}, {tail}]",
+            rotary.shape,
+            x.0.shape[0]
+        );
+        unsafe {
+            stream
+                .launch_builder(&self.rope_pair_tail)
+                .arg(&x.0.ptr)
+                .arg(&rotary.ptr)
+                .arg(&i32::try_from(rows)?)
+                .arg(&i32::try_from(vectors)?)
+                .arg(&i32::try_from(width)?)
+                .arg(&i32::try_from(tail)?)
+                .launch(flat(rows * vectors * tail / 2))?;
+        }
+        Ok(())
+    }
+
     pub fn new_with_swiglu_rounding(
         ctx: &Arc<CudaContext>,
         swiglu_rounding: crate::model_spec::SwigluRounding,
@@ -80,6 +202,8 @@ impl Ops {
             norm_capture: cubin::module(ctx, "q38_common")?.load_function("q38_norm_capture")?,
             kv_write: rope.load_function("kv_write")?,
             rope_kv: rope_kv.load_function("rope_kv")?,
+            rope_pair_rows: rope.load_function("rope_pair_rows")?,
+            rope_pair_tail: rope.load_function("rope_pair_tail")?,
             act: act.load_function("silu_mul")?,
             argmax: sample.load_function("argmax")?,
             argmax_rows: sample.load_function("argmax_rows_bf16")?,
@@ -175,7 +299,7 @@ pub fn flat(n: usize) -> LaunchConfig {
     grid(n.div_ceil(256), 256)
 }
 
-use super::contracts::{RowDomain, Tensor, TensorMut};
+use super::contracts::{RowDomain, Tensor, TensorMut, dense_layout};
 use crate::backend::gpu::{CudaStream, PushKernelArg};
 use anyhow::ensure;
 use half::bf16;

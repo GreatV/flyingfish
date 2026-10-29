@@ -13,6 +13,20 @@ pub mod decode;
 pub mod draft;
 pub mod engine;
 pub mod flash;
+<<<<<<< HEAD
+=======
+#[cfg(feature = "cuda")]
+pub mod gated_residual;
+#[cfg(feature = "cuda")]
+pub mod index_score;
+#[cfg(feature = "cuda")]
+pub mod latent_compress;
+#[cfg(feature = "cuda")]
+pub mod latent_window_attention;
+#[cfg(feature = "cuda")]
+pub mod quantize;
+#[cfg(feature = "cuda")]
+pub mod selection;
 pub(crate) mod gdn;
 #[cfg(test)]
 #[cfg(feature = "cuda")]
