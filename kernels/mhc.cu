@@ -246,15 +246,13 @@ extern "C" __global__ __launch_bounds__(MHC_THREADS) void mhc_update(
   for (int h = tid; h < hidden; h += nthr) {
     const float sub = __bfloat162float(sub_row[h]);
     for (int j = 0; j < mult; ++j) {
-      float p = post[(size_t)row * mult + j];
-      if (rounding == 1) p = __bfloat162float(__float2bfloat16_rn(p));
+      const float p = post[(size_t)row * mult + j];
       // model.py hc_post and modeling_glm5_next.py:1346-1348 form `post*x`
       // and each `comb*residual` before the additions.
       float acc = __fmul_rn(p, sub);
       for (int k = 0; k < mult; ++k) {
         const int coeff = orientation == 0 ? j * mult + k : k * mult + j;
-        float c = comb[(size_t)row * mult * mult + coeff];
-        if (rounding == 1) c = __bfloat162float(__float2bfloat16_rn(c));
+        const float c = comb[(size_t)row * mult * mult + coeff];
         acc = __fadd_rn(
             acc,
             __fmul_rn(c, __bfloat162float(res_row[(size_t)k * hidden + h])));
