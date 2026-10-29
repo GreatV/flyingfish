@@ -1936,6 +1936,12 @@ pub struct TensorEntry {
     pub scale_name: Option<String>,
 }
 impl TensorEntry {
+    pub(crate) fn native_byte_storage(&self) -> bool {
+        matches!(self.dtype, Dtype::F8_E4M3 | Dtype::F32)
+            || (self.dtype == Dtype::BF16
+                && matches!(self.role.as_str(), "hc_attn_fn" | "hc_ffn_fn"))
+    }
+
     pub(crate) fn is_linear_projection(&self) -> bool {
         self.is_non_expert_loaded()
             && self.shape.len() == 2
@@ -2220,6 +2226,45 @@ mod component_tests {
             assert_eq!(tensors[&name], (dtype, shape, TensorScope::Text), "{name}");
             assert_eq!(split_layer_role(&name)?, (Some(layer), role.to_owned()));
         }
+        let mut hc_native = 0;
+        let mut old_dtype_control = 0;
+        for (name, (dtype, shape, scope)) in &tensors {
+            let (layer, role) = split_layer_role(name)?;
+            if !role.starts_with("hc_") {
+                continue;
+            }
+            let bytes = tensor_bytes(*dtype, shape)?;
+            let entry = TensorEntry {
+                dtype: *dtype,
+                shape: shape.clone(),
+                shard: "native.safetensors".into(),
+                bytes,
+                load: *scope == TensorScope::Text,
+                data_start: 0,
+                data_offsets: [0, bytes as u64],
+                scope: *scope,
+                layer,
+                role,
+                scale_name: None,
+            };
+            assert!(
+                entry.native_byte_storage(),
+                "mHC native storage missing: {name}"
+            );
+            hc_native += 1;
+            old_dtype_control += usize::from(*dtype == Dtype::BF16);
+            if *dtype == Dtype::BF16 {
+                let mut ordinary = entry;
+                ordinary.role = "self_attn.q_proj.weight".into();
+                assert!(
+                    !ordinary.native_byte_storage(),
+                    "ordinary BF16 changed storage"
+                );
+            }
+        }
+        assert_eq!(hc_native, 270);
+        assert_eq!(old_dtype_control, 90);
+        println!("PASS glm_hc_native_storage entries=270 bf16_fn=90 f32=180 old_dtype_control=90");
         spec.glm5_next.as_mut().unwrap().v_head_dim = 128;
         tensors.clear();
         MappedCheckpoint::glm5_next_dsa(&spec, "layer", &mut tensors, TensorScope::Text)?;
