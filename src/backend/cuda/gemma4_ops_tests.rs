@@ -833,8 +833,23 @@ fn d512_table_kv_preparation_matches_definition_gpu() -> Result<()> {
     let q = tensor(&data, "stage.a.q_proj")?;
     let k = tensor(&data, "stage.a.k_proj")?;
     let v = tensor(&data, "stage.a.v_proj")?;
+    let q_rope = tensor(&data, "stage.a.q_rope")?;
+    let q_width = spec.q_heads as usize * d;
+    ensure!(
+        q.len() == rows * q_width
+            && q_rope.len() == rows * q_width
+            && k.len() == rows * d
+            && v.len() == rows * d,
+        "D512 preparation fixture extents differ"
+    );
+    let first_head = |values: &[bf16]| -> Vec<bf16> {
+        values
+            .chunks_exact(q_width)
+            .flat_map(|row| row[..d].iter().copied())
+            .collect()
+    };
     let mut qkv = Vec::with_capacity(rows * 3 * d);
-    qkv.extend_from_slice(&q[..rows * d]);
+    qkv.extend_from_slice(&first_head(q));
     qkv.extend_from_slice(k);
     qkv.extend_from_slice(v);
     let mut qkv = s.clone_htod(&qkv)?;
@@ -882,7 +897,7 @@ fn d512_table_kv_preparation_matches_definition_gpu() -> Result<()> {
     let got_q = s.clone_dtoh(&qkv.slice(..rows * d))?;
     let got_k = s.clone_dtoh(&cache_k.slice(..rows * d))?;
     let got_v = s.clone_dtoh(&cache_v.slice(..rows * d))?;
-    let q_rope = tensor(&data, "stage.a.q_rope")?;
+    let q_rope = first_head(q_rope);
     let expected = [
         ("q", got_q, &q_rope[..rows * d]),
         ("k", got_k, tensor(&data, "stage.a.k_rope")?),
