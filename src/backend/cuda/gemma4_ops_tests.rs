@@ -1019,14 +1019,19 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         raw_stats.is_detected_mutant(),
         "GEMMA4_KV_SCATTER raw-V control is not discriminating"
     );
+    let mut scatter_defects = 0usize;
     for (name, actual, expected) in [
-        ("k", &native_k, tensor(&data, "stage.a.k_rope")?),
         ("v", &native_v, reference_v),
+        ("k", &native_k, tensor(&data, "stage.a.k_rope")?),
     ] {
         let stats = Stats::new(actual, expected)?;
         println!("GEMMA4_KV_SCATTER {}", stats.line(name));
-        ensure!(stats.passes(), "GEMMA4_KV_SCATTER {name} DEFECT");
+        scatter_defects += usize::from(!stats.passes());
     }
+    ensure!(
+        scatter_defects == 0,
+        "GEMMA4_KV_SCATTER defects={scatter_defects}"
+    );
     let mut defects = 0usize;
     let mut graph_defects = 0usize;
     let mut first = false;
