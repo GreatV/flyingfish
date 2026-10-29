@@ -3249,7 +3249,11 @@ impl Engine {
     pub fn decode_logits(&self) -> Result<Vec<f32>> {
         self.logits_cache.read()?;
         if let Some(logits) = &self.flint_logits {
-            return Ok(self.device.stream.clone_dtoh(logits)?);
+            return self
+                .device
+                .stream
+                .clone_dtoh(logits)
+                .context("read Flint FP32 logits");
         }
         let values = self
             .device
