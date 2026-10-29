@@ -1994,24 +1994,6 @@ impl Engine {
     }
 
     #[cfg(test)]
-    pub(crate) fn gemma_decode_all(&mut self, token: u32) -> Result<()> {
-        self.device
-            .stream
-            .memcpy_htod(&[token], &mut self.work.token)?;
-        self.run_step(
-            crate::backend::Step {
-                rows: 1,
-                input: crate::backend::Input::Token,
-                head: Head::All,
-                mask: crate::backend::Mask::Causal,
-            },
-            None,
-        )?;
-        self.position += 1;
-        Ok(())
-    }
-
-    #[cfg(test)]
     pub(crate) fn gemma_hidden_state(&self) -> Result<(Vec<bf16>, Vec<bf16>)> {
         let h = self.model_spec.hidden as usize;
         Ok((

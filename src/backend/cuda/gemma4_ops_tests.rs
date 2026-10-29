@@ -882,8 +882,9 @@ fn native_path(
         }
     }
     for token in &ids[prefill..] {
-        engine.gemma_decode_all(*token)?;
-        out.extend(engine.gemma_all_logits(0)?);
+        engine.set_token(*token)?;
+        engine.decode(false, None)?;
+        out.extend(engine.decode_logits()?.into_iter().map(bf16::from_f32));
     }
     Ok(out)
 }
@@ -1092,8 +1093,9 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
             let mut eager_decode0_kv = None;
             let mut eager_decode0_hidden = None;
             for (row, &token) in sequence[512..].iter().enumerate() {
-                engine.gemma_decode_all(token)?;
-                eager.extend(engine.gemma_all_logits(0)?);
+                engine.set_token(token)?;
+                engine.decode(false, None)?;
+                eager.extend(engine.decode_logits()?.into_iter().map(bf16::from_f32));
                 if row == 0 {
                     eager_decode0_kv = Some(engine.gemma_kv_rows(0, 512)?);
                     eager_decode0_hidden = Some(engine.gemma_hidden_state()?);
