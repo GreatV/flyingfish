@@ -2106,6 +2106,59 @@ impl Engine {
         Ok(output)
     }
 
+    #[cfg(test)]
+    pub(crate) fn gemma_first_layer_probe(
+        &mut self,
+        ids: &[u32],
+        input: &[bf16],
+        trace: &mut crate::trace::Trace,
+    ) -> Result<Vec<bf16>> {
+        let width = self.model_spec.hidden as usize;
+        ensure!(
+            !ids.is_empty() && input.len() == ids.len() * width,
+            "Gemma first-layer probe extent"
+        );
+        self.reset()?;
+        self.device
+            .stream
+            .memcpy_htod(ids, &mut self.work.ids.slice_mut(..ids.len()))?;
+        self.device
+            .stream
+            .memcpy_htod(&[0i32], &mut self.work.position)?;
+        self.device
+            .stream
+            .memcpy_htod(&[1i32], &mut self.work.length)?;
+        self.state.set_sequence(
+            &self.device.stream,
+            0,
+            u32::try_from(ids.len())?,
+            self.workspace_rows as u32,
+        )?;
+        let step = crate::backend::Step {
+            rows: ids.len(),
+            input: crate::backend::Input::Ids,
+            head: Head::None,
+            mask: crate::backend::Mask::Causal,
+        };
+        self.run_operator(crate::backend::Operator::Embed, 0, step, &mut None)?;
+        self.device
+            .stream
+            .memcpy_htod(input, &mut self.work.x.slice_mut(..input.len()))?;
+        self.run_layer(
+            0,
+            step,
+            &mut Some(Target {
+                trace,
+                prefix: "layer_rule_a",
+                skip: 0,
+            }),
+        )?;
+        self.device
+            .stream
+            .clone_dtoh(&self.work.x.slice(..input.len()))
+            .map_err(Into::into)
+    }
+
     pub fn verification_logits(&self, row: usize) -> Result<Vec<f32>> {
         let spec = self.spec.as_ref().context("draft state is not enabled")?;
         ensure!(

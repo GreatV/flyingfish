@@ -995,10 +995,15 @@ fn oracle_layer_distance(
     oracle: &ReferenceFixture,
     reference_layers: &ReferenceFixture,
     family: &str,
+    mode: &str,
     row: Option<usize>,
     layer: usize,
 ) -> Result<bool> {
-    let name = format!("layers.{family}");
+    let name = if mode == "decode" {
+        format!("decode_layers.{family}")
+    } else {
+        format!("layers.{family}")
+    };
     let oracle_values = reference(oracle, &name)?.as_f32();
     let reference_values = reference(reference_layers, &name)?.as_f32();
     let candidate_values = trace.values(&format!(".{layer}"))?;
@@ -1051,6 +1056,54 @@ fn oracle_layer_distance(
     println!(
         "GEMMA4_ORACLE_LAYER row={row} rows={} layer={layer} candidate_max={candidate_max} candidate_rmse={candidate_rmse} reference_max={reference_max} reference_rmse={reference_rmse} beyond_2x={beyond}",
         candidate_values.len() / hidden
+    );
+    Ok(beyond)
+}
+
+fn oracle_store_distance(
+    channel: &str,
+    candidate_values: &[f32],
+    reference_values: &[f32],
+    oracle_values: &[f32],
+    row: usize,
+    rows: usize,
+    store: &str,
+) -> Result<bool> {
+    ensure!(
+        candidate_values.len() == reference_values.len()
+            && candidate_values.len() == oracle_values.len()
+            && candidate_values.len().is_multiple_of(rows)
+            && row < rows,
+        "oracle store extent mismatch at {store}"
+    );
+    let width = candidate_values.len() / rows;
+    let candidate_values = &candidate_values[row * width..(row + 1) * width];
+    let reference_values = &reference_values[row * width..(row + 1) * width];
+    let oracle_values = &oracle_values[row * width..(row + 1) * width];
+    let (mut candidate_max, mut reference_max) = (0.0f64, 0.0f64);
+    let (mut candidate_sq, mut reference_sq) = (0.0f64, 0.0f64);
+    let mut reference_bit_equal = 0usize;
+    let mut oracle_rounded_bit_equal = 0usize;
+    for ((candidate, reference), oracle) in candidate_values
+        .iter()
+        .zip(reference_values)
+        .zip(oracle_values)
+    {
+        let candidate_delta = f64::from(*candidate - *oracle);
+        let reference_delta = f64::from(*reference - *oracle);
+        candidate_max = candidate_max.max(candidate_delta.abs());
+        reference_max = reference_max.max(reference_delta.abs());
+        candidate_sq += candidate_delta * candidate_delta;
+        reference_sq += reference_delta * reference_delta;
+        reference_bit_equal += usize::from(candidate.to_bits() == reference.to_bits());
+        oracle_rounded_bit_equal +=
+            usize::from(candidate.to_bits() == bf16::from_f32(*oracle).to_f32().to_bits());
+    }
+    let candidate_rmse = (candidate_sq / width as f64).sqrt();
+    let reference_rmse = (reference_sq / width as f64).sqrt();
+    let beyond = candidate_max > 2.0 * reference_max || candidate_rmse > 2.0 * reference_rmse;
+    println!(
+        "GEMMA4_ORACLE_STORE channel={channel} row={row} store={store} width={width} candidate_max={candidate_max} candidate_rmse={candidate_rmse} reference_max={reference_max} reference_rmse={reference_rmse} reference_bit_equal={reference_bit_equal} oracle_rounded_bit_equal={oracle_rounded_bit_equal} beyond_2x={beyond}"
     );
     Ok(beyond)
 }
@@ -1167,6 +1220,111 @@ fn oracle_nll_summary(
     Ok(())
 }
 
+fn oracle_first_layer_rule_a(
+    engine: &mut super::engine::Engine,
+    oracle: &ReferenceFixture,
+    reference_layers: &ReferenceFixture,
+    family: &str,
+    sequence: &[u32],
+    selected_rows: &[usize],
+) -> Result<()> {
+    let rows = sequence.len();
+    let prefix = format!("stage.{family}");
+    let input = reference_bf16(reference_layers, &format!("{prefix}.embed"))?;
+    let mut trace = crate::trace::Trace::default();
+    engine.gemma_first_layer_probe(sequence, input, &mut trace)?;
+    let (cache_k, cache_v) = engine.gemma_kv_rows(0, rows)?;
+    let cache_k: Vec<f32> = cache_k.into_iter().map(|value| value.to_f32()).collect();
+    let cache_v: Vec<f32> = cache_v.into_iter().map(|value| value.to_f32()).collect();
+    let raw = trace.values("layer_rule_a.debug.qkv_projected")?;
+    let q_width = reference(oracle, &format!("{prefix}.q_proj"))?
+        .as_f32()
+        .len()
+        / rows;
+    let kv_width = reference(oracle, &format!("{prefix}.k_proj"))?
+        .as_f32()
+        .len()
+        / rows;
+    ensure!(
+        raw.len() == rows * (q_width + 2 * kv_width),
+        "first-layer raw QKV extent mismatch"
+    );
+    let input: Vec<f32> = input.iter().map(|value| value.to_f32()).collect();
+    let mut stores = vec![
+        ("embed", input),
+        ("input_layernorm", trace.values("layer_rule_a.debug.norm1")?),
+        ("q_proj", raw[..rows * q_width].to_vec()),
+        (
+            "k_proj",
+            raw[rows * q_width..rows * (q_width + kv_width)].to_vec(),
+        ),
+        ("v_proj", raw[rows * (q_width + kv_width)..].to_vec()),
+        ("q_rope", trace.values("layer_rule_a.debug.qkv_prepared")?),
+        ("k_rope", cache_k),
+        ("v_norm", cache_v),
+        (
+            "attention_out",
+            trace.values("layer_rule_a.debug.mixer_out")?,
+        ),
+        ("self_attn", trace.values("layer_rule_a.debug.o_proj")?),
+        (
+            "pre_feedforward_layernorm",
+            trace.values("layer_rule_a.debug.norm2")?,
+        ),
+        ("mlp", trace.values("layer_rule_a.ffn")?),
+        (
+            "per_layer_input_gate",
+            trace.values("layer_rule_a.debug.ple_gate")?,
+        ),
+        ("act_fn", trace.values("layer_rule_a.debug.ple_act")?),
+        (
+            "per_layer_projection",
+            trace.values("layer_rule_a.debug.per_layer_input")?,
+        ),
+    ];
+    let layer_name = format!("layers.{family}");
+    let layer_values = trace.values("layer_rule_a.layer.0")?;
+    let mut first_beyond = None;
+    for (store, candidate) in stores.drain(..) {
+        let stage_name = format!("{prefix}.{store}");
+        let reference_values = reference(reference_layers, &stage_name)?.as_f32();
+        let oracle_values = reference(oracle, &stage_name)?.as_f32();
+        for row in selected_rows {
+            if oracle_store_distance(
+                "first_layer_rule_a",
+                &candidate,
+                &reference_values,
+                &oracle_values,
+                *row,
+                rows,
+                store,
+            )? && first_beyond.is_none()
+            {
+                first_beyond = Some(store);
+            }
+        }
+    }
+    let reference_values = reference(reference_layers, &layer_name)?.as_f32();
+    let oracle_values = reference(oracle, &layer_name)?.as_f32();
+    let hidden = layer_values.len() / rows;
+    for row in selected_rows {
+        if oracle_store_distance(
+            "first_layer_rule_a",
+            &layer_values,
+            &reference_values[..rows * hidden],
+            &oracle_values[..rows * hidden],
+            *row,
+            rows,
+            "layer_output",
+        )? && first_beyond.is_none()
+        {
+            first_beyond = Some("layer_output");
+        }
+    }
+    println!("GEMMA4_ORACLE_FIRST_LAYER first_beyond={first_beyond:?}");
+    Ok(())
+}
+
 fn localize_oracle_cell(
     engine: &mut super::engine::Engine,
     oracle: &ReferenceFixture,
@@ -1216,6 +1374,7 @@ fn localize_oracle_cell(
                             oracle,
                             reference_layers,
                             family,
+                            "prefill",
                             Some(*row),
                             layer,
                         )?;
@@ -1228,6 +1387,7 @@ fn localize_oracle_cell(
                         oracle,
                         reference_layers,
                         family,
+                        "prefill",
                         None,
                         layer,
                     )?;
@@ -1265,30 +1425,45 @@ fn localize_oracle_cell(
                 )?;
             }
             if let Some(rows) = &selected_rows {
-                let layer_name = format!("layers.{family}");
-                let layer_values = reference(oracle, &layer_name)?.as_f32();
-                let hidden = oracle[layer_name.as_str()].0[2];
-                let final_base = (layers - 1) * sequence.len() * hidden;
-                let mut final_input = Vec::with_capacity(rows.len() * hidden);
-                for row in rows {
-                    let base = final_base + row * hidden;
-                    final_input.extend(
-                        layer_values[base..base + hidden]
-                            .iter()
-                            .map(|value| bf16::from_f32(*value)),
+                oracle_first_layer_rule_a(
+                    engine,
+                    oracle,
+                    reference_layers,
+                    family,
+                    &sequence,
+                    rows,
+                )?;
+                for (channel, hidden_fixture) in [
+                    ("head_oracle", oracle),
+                    ("head_bf16_reference", reference_layers),
+                ] {
+                    let layer_name = format!("layers.{family}");
+                    let layer_values = reference(hidden_fixture, &layer_name)?.as_f32();
+                    let hidden = hidden_fixture[layer_name.as_str()].0[2];
+                    let final_base = (layers - 1) * sequence.len() * hidden;
+                    let mut final_input = Vec::with_capacity(rows.len() * hidden);
+                    for row in rows {
+                        let base = final_base + row * hidden;
+                        final_input.extend(
+                            layer_values[base..base + hidden]
+                                .iter()
+                                .map(|value| bf16::from_f32(*value)),
+                        );
+                    }
+                    println!(
+                        "GEMMA4_ORACLE_HEAD_INPUT channel={channel} rows={rows:?} storage=bf16"
                     );
-                }
-                println!("GEMMA4_ORACLE_HEAD_INPUT rows={rows:?} source=fp32_oracle storage=bf16");
-                let head_values = engine.gemma_final_probe(&final_input)?;
-                for (probe_row, row) in rows.iter().enumerate() {
-                    oracle_token_metrics(
-                        "head_rule_a",
-                        &head_values[probe_row * vocab..(probe_row + 1) * vocab],
-                        &reference_values[*row * vocab..(*row + 1) * vocab],
-                        &oracle_values[*row * vocab..(*row + 1) * vocab],
-                        sequence.get(*row + 1).map(|target| *target as usize),
-                        *row,
-                    )?;
+                    let head_values = engine.gemma_final_probe(&final_input)?;
+                    for (probe_row, row) in rows.iter().enumerate() {
+                        oracle_token_metrics(
+                            channel,
+                            &head_values[probe_row * vocab..(probe_row + 1) * vocab],
+                            &reference_values[*row * vocab..(*row + 1) * vocab],
+                            &oracle_values[*row * vocab..(*row + 1) * vocab],
+                            sequence.get(*row + 1).map(|target| *target as usize),
+                            *row,
+                        )?;
+                    }
                 }
             }
         }
@@ -1309,6 +1484,7 @@ fn localize_oracle_cell(
                         oracle,
                         reference_layers,
                         family,
+                        "decode",
                         Some(row),
                         layer,
                     )?;
