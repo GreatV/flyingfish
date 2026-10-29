@@ -343,7 +343,7 @@ impl Residency {
         for (index, &(layer, expert)) in order.iter().enumerate() {
             let block = u32::try_from(index).context("host block id exceeds u32")?;
             let arena = host.context("host arena missing for the host fill")?;
-            let slot = reader.read_expert(layer, expert, catalogue)?;
+            let slot = reader.read_expert(layer, expert, catalogue, catalogue.slot_bytes())?;
             let values = reader.values(slot)?;
             let mut claim = arena.claim(block)?;
             claim.slice()?.copy_from_slice(&values);
@@ -738,6 +738,152 @@ impl Residency {
         self.missed[l].sort_unstable();
         self.dispatched[l] = true;
         Ok(dispatch)
+    }
+
+    /// Resolves every non-GPU expert selected by the current dispatch before
+    /// the layer's device launch. Victims are chosen only from experts not
+    /// routed by this token.
+    pub fn resolve(&mut self, layer: u32, experts: &[u32]) -> Result<Vec<Published>> {
+        ensure!(self.token_open, "resolve outside a token");
+        ensure!(
+            layer < self.geometry.layers,
+            "expert layer {layer} outside {}",
+            self.geometry.layers
+        );
+        let l = layer as usize;
+        ensure!(self.dispatched[l], "layer {layer} resolved before dispatch");
+        let mut unique = experts.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        for &expert in &unique {
+            ensure!(
+                expert < self.geometry.experts,
+                "resolve expert {expert} of layer {layer} outside {}",
+                self.geometry.experts
+            );
+        }
+        self.drain_released()?;
+        self.victims.clear();
+        for expert in 0..self.geometry.experts {
+            if !self.routed[l][expert as usize] && self.ledger.tier(layer, expert)? == Tier::Gpu {
+                self.victims.push(expert);
+            }
+        }
+        self.victims.sort_by(|&a, &b| {
+            self.scores[l][a as usize]
+                .total_cmp(&self.scores[l][b as usize])
+                .then(a.cmp(&b))
+        });
+        let backed = self.ledger.has_full_host_backing();
+        let mut pool =
+            u32::try_from(self.free_blocks.len()).context("free host blocks exceed u32")?;
+        self.published.clear();
+        for expert in unique {
+            if self.ledger.tier(layer, expert)? == Tier::Gpu {
+                continue;
+            }
+            let empty = self.ledger.empty_slot(layer)?;
+            let victim = if empty.is_some() {
+                anyhow::bail!(
+                    "layer {layer} has an empty slot; synchronous tier resolution requires a victim"
+                )
+            } else {
+                let victim = *self
+                    .victims
+                    .first()
+                    .context("no unrouted GPU victim for a synchronous expert miss")?;
+                self.victims.remove(0);
+                Some(victim)
+            };
+            let source_block = match self.ledger.tier(layer, expert)? {
+                Tier::Host => {
+                    let block = self.host_block[l][expert as usize];
+                    ensure!(
+                        block != NO_BLOCK,
+                        "host expert {expert} of layer {layer} has no block"
+                    );
+                    Some(block)
+                }
+                Tier::Disk | Tier::Gpu => None,
+            };
+            let (slot, dest_block, dest_wait) = match victim {
+                Some(victim) => {
+                    let slot = self.ledger.slot(layer, victim)?;
+                    let (dest_block, dest_wait) = match self.ledger.tier(layer, expert)? {
+                        Tier::Host if backed => (None, None),
+                        Tier::Host => {
+                            ensure!(pool >= 1, "synchronous host swap needs a free block");
+                            pool -= 1;
+                            let free = self.pool_block()?;
+                            (Some(free.id), free.wait)
+                        }
+                        Tier::Disk => {
+                            if pool > self.reserve {
+                                pool -= 1;
+                                let free = self.pool_block()?;
+                                (Some(free.id), free.wait)
+                            } else {
+                                (None, None)
+                            }
+                        }
+                        Tier::Gpu => unreachable!("resolved expert is not GPU resident"),
+                    };
+                    match self.ledger.tier(layer, expert)? {
+                        Tier::Host => {
+                            self.ledger.admit_host(layer, expert, victim)?;
+                            if !backed {
+                                self.host_block[l][expert as usize] = NO_BLOCK;
+                                self.host_block[l][victim as usize] =
+                                    dest_block.context("host swap has no destination block")?;
+                                self.released.push(ReleasedBlock {
+                                    block: source_block.context("host swap source missing")?,
+                                    slot,
+                                    event: None,
+                                });
+                            }
+                        }
+                        Tier::Disk => {
+                            self.ledger
+                                .admit_disk(layer, expert, victim, dest_block.is_some())?;
+                            if let Some(block) = dest_block {
+                                self.host_block[l][victim as usize] = block;
+                            }
+                        }
+                        Tier::Gpu => unreachable!("resolved expert is not GPU resident"),
+                    }
+                    (slot, dest_block, dest_wait)
+                }
+                None => {
+                    let slot = self.ledger.install(layer, expert)?;
+                    if self.ledger.tier(layer, expert)? == Tier::Host && !backed {
+                        let block = source_block.context("host miss without a source block")?;
+                        self.host_block[l][expert as usize] = NO_BLOCK;
+                        self.released.push(ReleasedBlock {
+                            block,
+                            slot,
+                            event: None,
+                        });
+                    }
+                    (slot, None, None)
+                }
+            };
+            self.next_generation += 1;
+            self.generation[l][expert as usize] = self.next_generation;
+            self.published.push(Published {
+                layer,
+                expert,
+                victim: victim.expect("synchronous tier victim is present"),
+                from_host: source_block.is_some(),
+                source_block,
+                dest_block,
+                dest_wait,
+                slot,
+                generation: self.next_generation,
+            });
+        }
+        self.missed[l].retain(|expert| !self.published.iter().any(|p| p.expert == *expert));
+        self.ledger.check()?;
+        Ok(std::mem::take(&mut self.published))
     }
 
     /// Publishes at most the hard per-token cap after validating block requirements.
@@ -1248,6 +1394,25 @@ mod tests {
             expert,
             weight: bf16::from_f32(1.0),
         }
+    }
+
+    #[test]
+    fn synchronous_host_swap_recycles_source_after_copy() -> Result<()> {
+        let mut state = build(4, 1)?;
+        for iteration in 0..8u64 {
+            let expert = (0..8)
+                .find(|&id| state.ledger().tier(0, id).is_ok_and(|t| t == Tier::Host))
+                .context("host expert missing")?;
+            state.begin_token()?;
+            state.dispatch(0, &[route(0, 0, expert)])?;
+            let moves = state.resolve(0, &[expert])?;
+            assert_eq!(moves.len(), 1);
+            assert_eq!(state.released.len(), 1);
+            assert!(state.validate_released().is_err());
+            state.record_copy(&[moves[0].slot], iteration + 1)?;
+            state.finish_token()?;
+        }
+        Ok(())
     }
 
     fn set_scores(residency: &mut Residency, layer: usize, scores: [f64; 8]) {

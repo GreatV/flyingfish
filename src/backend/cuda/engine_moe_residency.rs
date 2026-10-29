@@ -120,7 +120,9 @@ impl Reader {
             0
         };
         for _ in 0..slots {
-            let slot = reader.disk.read_expert(0, 0, catalogue)?;
+            let slot = reader
+                .disk
+                .read_expert(0, 0, catalogue, catalogue.slot_bytes())?;
             let values = reader.disk.values(slot)?;
             let address = values.as_ptr() as u64;
             let bytes = std::mem::size_of_val(values.values());
@@ -172,7 +174,8 @@ impl Reader {
             event.event.synchronize()?;
             self.disk.reclaim(slot as u32, event.id)?;
         }
-        self.disk.read_expert(layer, expert, catalogue)
+        self.disk
+            .read_expert(layer, expert, catalogue, catalogue.slot_bytes())
     }
 }
 
@@ -1095,7 +1098,10 @@ impl Slots {
         )
     }
 
-    pub(super) fn begin_request(&mut self, frequency: &[Vec<f64>]) -> Result<()> {
+    pub(in crate::backend::cuda::engine) fn begin_request(
+        &mut self,
+        frequency: &[Vec<f64>],
+    ) -> Result<()> {
         self.moves.clear();
         self.moves
             .extend_from_slice(self.policy.begin_request(frequency)?);

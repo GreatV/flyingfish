@@ -26,6 +26,7 @@ mod graphs;
 
 pub(super) struct Setup {
     pub workspace: crate::prefill::ExpertWorkspaceBudget,
+    directory: PathBuf,
     capacity: crate::experts::plan::Capacity,
     admission: crate::experts::plan::Admission,
     measured: super::super::calibrate::ExpertCalibration,
@@ -619,6 +620,7 @@ impl Setup {
         );
         Ok(Self {
             workspace,
+            directory: directory.to_owned(),
             capacity,
             admission,
             measured,
@@ -673,11 +675,7 @@ impl Setup {
                 capacity: &self.capacity,
                 admission: self.admission,
                 initial: &initial,
-                directory: engine
-                    .qwen
-                    .as_ref()
-                    .context("expert hybrid runtime missing")?
-                    .checkpoint_path(),
+                directory: &self.directory,
                 catalogue: self.catalogue,
                 engines: self.measured.copy_engines,
                 max_rows: u32::try_from(cpu.0.max(self.decode_rows))?,

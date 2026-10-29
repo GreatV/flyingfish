@@ -5,17 +5,60 @@ use half::bf16;
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
-use std::os::unix::fs::FileExt;
+use std::fs::{File, OpenOptions};
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::ptr::NonNull;
 
 /// Alignment of a ring slot; one slot holds one expert's gate-up then down bytes.
 const RING_ALIGN: usize = 4096;
 
-struct AlignedSlot {
+/// An aligned, zeroed, caller-sized buffer. The one aligned allocation both the expert ring and
+/// the Engram row reader use.
+pub(crate) struct AlignedBytes {
     ptr: NonNull<u8>,
     layout: Layout,
+}
+
+impl AlignedBytes {
+    pub(crate) fn new(bytes: usize, alignment: usize) -> Result<Self> {
+        ensure!(bytes > 0, "zero aligned buffer bytes");
+        ensure!(
+            alignment.is_power_of_two() && alignment >= 4096,
+            "aligned buffer alignment {alignment} is not a power of two of at least 4096"
+        );
+        let layout = Layout::from_size_align(bytes, alignment)
+            .with_context(|| format!("invalid aligned buffer layout: {bytes} B / {alignment}"))?;
+        // SAFETY: the layout has a nonzero size and a power-of-two alignment.
+        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })
+            .with_context(|| format!("allocate {bytes} B aligned buffer"))?;
+        Ok(Self { ptr, layout })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.layout.size()
+    }
+
+    pub(crate) fn as_mut(&mut self) -> &mut [u8] {
+        // SAFETY: the buffer owns `layout.size()` initialized bytes.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.layout.size()) }
+    }
+
+    pub(crate) fn as_ptr(&self) -> *const u8 {
+        self.ptr.as_ptr()
+    }
+}
+
+impl Drop for AlignedBytes {
+    fn drop(&mut self) {
+        // SAFETY: the pointer and layout came from alloc_zeroed.
+        unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}
+
+struct AlignedSlot {
+    bytes: AlignedBytes,
     state: Cell<RingState>,
 }
 
@@ -40,7 +83,7 @@ impl SlotLease<'_> {
         let ring = &self.reader.ring[self.slot];
         // SAFETY: the slot holds `per_expert` initialized bf16 values for the guard's lifetime.
         unsafe {
-            std::slice::from_raw_parts(ring.ptr.as_ptr() as *const bf16, self.reader.per_expert)
+            std::slice::from_raw_parts(ring.bytes.as_ptr() as *const bf16, self.reader.per_expert)
         }
     }
 
@@ -78,30 +121,225 @@ impl Drop for SlotLease<'_> {
 
 impl AlignedSlot {
     fn new(bytes: usize) -> Result<Self> {
-        ensure!(bytes > 0, "zero disk ring slot bytes");
-        let layout = Layout::from_size_align(bytes, RING_ALIGN)
-            .with_context(|| format!("invalid ring slot layout: {bytes} B"))?;
-        // SAFETY: the layout has a nonzero size and a power-of-two alignment.
-        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })
-            .with_context(|| format!("allocate {bytes} B ring slot"))?;
         Ok(Self {
-            ptr,
-            layout,
+            bytes: AlignedBytes::new(bytes, RING_ALIGN)?,
             state: Cell::new(RingState::Free),
         })
     }
 }
 
-impl Drop for AlignedSlot {
-    fn drop(&mut self) {
-        // SAFETY: the pointer came from alloc_zeroed with this layout.
-        unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
+/// One planned aligned read: a file span and the request range that lands inside it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReadSpan {
+    pub(crate) begin: u64,
+    pub(crate) end: u64,
+    pub(crate) first: usize,
+    pub(crate) last: usize,
+}
+
+/// Merges `(offset, len)` requests into aligned reads: sorted, merged while the next request falls
+/// inside the span already planned, capped at `cap`, tail clamped to `file_len`. Shared by the
+/// expert ring and the Engram row reader.
+pub(crate) fn plan_spans(
+    requests: &[(u64, u64)],
+    alignment: u64,
+    file_len: u64,
+    cap: u64,
+) -> Result<Vec<ReadSpan>> {
+    ensure!(
+        alignment.is_power_of_two() && alignment > 0,
+        "span alignment {alignment} is not a power of two"
+    );
+    let mut ordered: Vec<(u64, u64)> = requests.to_vec();
+    ordered.sort_unstable();
+    let mut spans = Vec::new();
+    let mut index = 0;
+    while index < ordered.len() {
+        let (offset, len) = ordered[index];
+        ensure!(len > 0, "zero-length span request at {offset}");
+        let finish = offset
+            .checked_add(len)
+            .context("span request end overflow")?;
+        ensure!(
+            finish <= file_len,
+            "span request {offset}+{len} exceeds file length {file_len}"
+        );
+        let begin = offset & !(alignment - 1);
+        let mut end = finish.div_ceil(alignment) * alignment;
+        let mut last = index + 1;
+        while last < ordered.len() {
+            let (next_offset, next_len) = ordered[last];
+            let next_end = next_offset
+                .checked_add(next_len)
+                .context("span request end overflow")?;
+            let next_aligned = next_end.div_ceil(alignment) * alignment;
+            if next_aligned > end || next_aligned - begin > cap {
+                break;
+            }
+            end = end.max(next_aligned);
+            last += 1;
+        }
+        spans.push(ReadSpan {
+            begin,
+            end: end.min(file_len),
+            first: index,
+            last,
+        });
+        index = last;
+    }
+    Ok(spans)
+}
+
+/// Shared shard reader; direct mode uses filesystem-derived aligned IO.
+pub(crate) struct SpanReader {
+    file: File,
+    pub(crate) alignment: u64,
+    len: u64,
+    direct: bool,
+}
+
+impl SpanReader {
+    pub(crate) fn open(path: &Path, direct: bool) -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(if direct {
+                libc::O_DIRECT | libc::O_CLOEXEC
+            } else {
+                libc::O_CLOEXEC
+            })
+            .open(path)
+            .with_context(|| format!("open native shard {} direct={direct}", path.display()))?;
+        let len = file.metadata().context("stat native shard")?.len();
+        let alignment = if direct {
+            let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+            // SAFETY: the file descriptor is open and stat is writable.
+            let rc = unsafe { libc::fstatvfs(file.as_raw_fd(), &mut stat) };
+            ensure!(
+                rc == 0,
+                "native shard fstatvfs: {}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: sysconf takes no pointer arguments.
+            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            ensure!(
+                page > 0 && stat.f_frsize > 0,
+                "invalid direct IO page/filesystem block size"
+            );
+            let page = u64::try_from(page)?;
+            let block = stat.f_frsize;
+            let (mut a, mut b) = (page, block);
+            while b != 0 {
+                (a, b) = (b, a % b);
+            }
+            let alignment = (page / a)
+                .checked_mul(block)
+                .context("direct IO alignment overflow")?;
+            ensure!(
+                alignment.is_power_of_two() && alignment >= RING_ALIGN as u64,
+                "invalid direct IO alignment {alignment}"
+            );
+            alignment
+        } else {
+            RING_ALIGN as u64
+        };
+        Ok(Self {
+            file,
+            alignment,
+            len,
+            direct,
+        })
+    }
+
+    /// The callback receives the original request index and its complete native bytes.
+    pub(crate) fn read_spans(
+        &self,
+        requests: &[(u64, u64)],
+        chunk_bytes: u64,
+        staging: &mut AlignedBytes,
+        mut consume: impl FnMut(usize, &[u8]) -> Result<()>,
+    ) -> Result<usize> {
+        ensure!(chunk_bytes > 0, "native read chunk is zero");
+        let chunk = if self.direct {
+            chunk_bytes
+                .checked_add(self.alignment - 1)
+                .context("direct chunk overflow")?
+                & !(self.alignment - 1)
+        } else {
+            chunk_bytes
+        };
+        for &(offset, len) in requests {
+            ensure!(
+                len > 0 && offset.checked_add(len).is_some_and(|end| end <= self.len),
+                "invalid native range {offset}+{len} for {} bytes",
+                self.len
+            );
+        }
+        let mut order: Vec<usize> = (0..requests.len()).collect();
+        order.sort_unstable_by_key(|&i| requests[i]);
+        let sorted: Vec<_> = order.iter().map(|&i| requests[i]).collect();
+        let spans = plan_spans(&sorted, self.alignment, self.len, chunk.max(self.alignment))?;
+        for span in &spans {
+            let width = usize::try_from(span.end - span.begin)?;
+            let allocated = if self.direct {
+                u64::try_from(width)?
+                    .checked_add(self.alignment - 1)
+                    .context("direct span overflow")?
+                    & !(self.alignment - 1)
+            } else {
+                u64::try_from(width)?
+            };
+            ensure!(
+                allocated <= staging.len() as u64,
+                "native span {allocated} exceeds staging {}",
+                staging.len()
+            );
+            ensure!(
+                !self.direct || (staging.as_ptr() as usize as u64).is_multiple_of(self.alignment),
+                "native direct buffer is misaligned"
+            );
+            let mut written = 0usize;
+            while written < width {
+                let logical = usize::try_from(chunk)?.min(width - written);
+                let requested = if self.direct {
+                    logical.div_ceil(self.alignment as usize) * self.alignment as usize
+                } else {
+                    logical
+                };
+                let at = span.begin + written as u64;
+                let buffer = &mut staging.as_mut()[written..written + requested];
+                if self.direct {
+                    let got = self
+                        .file
+                        .read_at(buffer, at)
+                        .with_context(|| format!("direct read {at}+{requested}"))?;
+                    ensure!(
+                        got == logical,
+                        "short native direct read at {at}: got {got}, expected {logical}"
+                    );
+                } else {
+                    self.file
+                        .read_exact_at(buffer, at)
+                        .with_context(|| format!("native read {at}+{requested}"))?;
+                }
+                written += logical;
+            }
+            for index in span.first..span.last {
+                let (offset, len) = sorted[index];
+                let from = usize::try_from(offset - span.begin)?;
+                let end = from
+                    .checked_add(usize::try_from(len)?)
+                    .context("native slice overflow")?;
+                ensure!(end <= width, "native request exceeds its span");
+                consume(order[index], &staging.as_mut()[from..end])?;
+            }
+        }
+        Ok(spans.len())
     }
 }
 
 /// Read-only disk tier over the native checkpoint shards with a bounded aligned ring.
 pub struct DiskReader {
-    shards: BTreeMap<String, File>,
+    shards: BTreeMap<String, SpanReader>,
     per_expert: usize,
     ring: Vec<AlignedSlot>,
     next: Cell<usize>,
@@ -138,6 +376,18 @@ fn visit_slices(
                 visit(native)?;
             }
         }
+        ExpertRange::E2m1 {
+            gate,
+            up,
+            down,
+            gate_scale,
+            up_scale,
+            down_scale,
+        } => {
+            for native in [gate, up, down, gate_scale, up_scale, down_scale] {
+                visit(native)?;
+            }
+        }
     }
     Ok(())
 }
@@ -160,12 +410,11 @@ impl DiskReader {
         let mut shards = BTreeMap::new();
         let mut lengths = BTreeMap::new();
         for name in names {
-            let file = File::open(model_dir.join(name.as_ref()))
-                .with_context(|| format!("open disk shard {name}"))?;
-            let length = file
-                .metadata()
-                .with_context(|| format!("stat disk shard {name}"))?
-                .len();
+            let file = SpanReader::open(
+                &model_dir.join(name.as_ref()),
+                matches!(catalogue.layout(), ExpertLayout::Fp4E2m1Block(..)),
+            )?;
+            let length = file.len;
             shards.insert(name.to_string(), file);
             lengths.insert(name.to_string(), length);
         }
@@ -202,7 +451,14 @@ impl DiskReader {
     }
 
     /// Reads one expert's native ranges into a free ring slot in the layout's slot order.
-    pub fn read_expert(&self, layer: u32, expert: u32, catalogue: &ExpertCatalogue) -> Result<u32> {
+    pub fn read_expert(
+        &self,
+        layer: u32,
+        expert: u32,
+        catalogue: &ExpertCatalogue,
+        chunk_bytes: u64,
+    ) -> Result<u32> {
+        ensure!(chunk_bytes > 0, "disk read chunk is not positive");
         let range: &ExpertRange = catalogue.range(layer, expert)?;
         let layout = catalogue.layout();
         let slots = self.ring.len();
@@ -216,51 +472,26 @@ impl DiskReader {
         }
         let slot = chosen.with_context(|| format!("all {slots} disk ring slots are in use"))?;
         self.next.set((slot + 1) % slots);
-        let bytes = self.ring[slot].layout.size();
-        let ptr = self.ring[slot].ptr.as_ptr();
+        let bytes = self.ring[slot].bytes.len();
+        let ptr = self.ring[slot].bytes.as_ptr() as *mut u8;
         // SAFETY: the slot owns `bytes` writable bytes with the ring alignment.
         let buffer: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(ptr, bytes) };
-        let mut read = |offset: u64, native: &NativeRange| -> Result<()> {
-            let start = usize::try_from(offset).context("expert slice offset exceeds usize")?;
-            let len = usize::try_from(native.len).context("expert slice length exceeds usize")?;
-            let end = start
-                .checked_add(len)
-                .context("expert slice end overflow")?;
-            ensure!(
-                end <= buffer.len(),
-                "expert slice {start}..{end} exceeds the {}-byte slot",
-                buffer.len()
-            );
-            let shard = self
-                .shards
-                .get(native.shard.as_ref())
-                .with_context(|| format!("disk shard {} not open", native.shard))?;
-            shard
-                .read_exact_at(&mut buffer[start..end], native.offset)
-                .with_context(|| {
-                    format!(
-                        "read {}..{} of shard {}",
-                        native.offset,
-                        native.offset + native.len,
-                        native.shard
-                    )
-                })
-        };
+        let mut parts: Vec<(u64, &NativeRange)> = Vec::new();
         match (layout, range) {
             (
                 ExpertLayout::Bf16Fused { gate_up_bytes, .. },
                 ExpertRange::Bf16 { gate_up, down },
             ) => {
-                read(0, gate_up)?;
-                read(*gate_up_bytes, down)?;
+                parts.push((0, gate_up));
+                parts.push((*gate_up_bytes, down));
             }
             (
                 ExpertLayout::Bf16Separate { matrix_bytes, .. },
                 ExpertRange::Bf16Separate { gate, up, down },
             ) => {
-                read(0, gate)?;
-                read(*matrix_bytes, up)?;
-                read(*matrix_bytes * 2, down)?;
+                parts.push((0, gate));
+                parts.push((*matrix_bytes, up));
+                parts.push((*matrix_bytes * 2, down));
             }
             (
                 ExpertLayout::Fp8W8a16(slot) | ExpertLayout::Fp8W8a16Block(slot, _),
@@ -273,17 +504,93 @@ impl DiskReader {
                     down_scale,
                 },
             ) => {
-                read(slot.gate.start, gate)?;
-                read(slot.up.start, up)?;
-                read(slot.down.start, down)?;
-                read(slot.gate_scale.start, gate_scale)?;
-                read(slot.up_scale.start, up_scale)?;
-                read(slot.down_scale.start, down_scale)?;
+                parts.push((slot.gate.start, gate));
+                parts.push((slot.up.start, up));
+                parts.push((slot.down.start, down));
+                parts.push((slot.gate_scale.start, gate_scale));
+                parts.push((slot.up_scale.start, up_scale));
+                parts.push((slot.down_scale.start, down_scale));
+            }
+            (
+                ExpertLayout::Fp4E2m1Block(slot, _),
+                ExpertRange::E2m1 {
+                    gate,
+                    up,
+                    down,
+                    gate_scale,
+                    up_scale,
+                    down_scale,
+                },
+            ) => {
+                parts.push((slot.gate.start, gate));
+                parts.push((slot.up.start, up));
+                parts.push((slot.down.start, down));
+                parts.push((slot.gate_scale.start, gate_scale));
+                parts.push((slot.up_scale.start, up_scale));
+                parts.push((slot.down_scale.start, down_scale));
             }
             _ => bail!("expert range does not match the catalogue layout"),
         }
+        self.read_parts(&parts, buffer, chunk_bytes)?;
         self.ring[slot].state.set(RingState::Filled);
         u32::try_from(slot).context("disk ring slot exceeds u32")
+    }
+
+    /// Reads one expert's ranges through the shared span planner: the requests are merged into
+    /// aligned spans per shard, each span is fetched once in `chunk_bytes` steps, and every request
+    /// is copied into its slot offset.
+    fn read_parts(
+        &self,
+        parts: &[(u64, &NativeRange)],
+        slot: &mut [u8],
+        chunk_bytes: u64,
+    ) -> Result<()> {
+        ensure!(!parts.is_empty(), "expert read has no native ranges");
+        for (offset, native) in parts {
+            let end = offset
+                .checked_add(native.len)
+                .context("expert slice end overflow")?;
+            ensure!(end <= slot.len() as u64, "expert range exceeds slot");
+        }
+        let mut by_shard: std::collections::BTreeMap<&str, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (index, (_, native)) in parts.iter().enumerate() {
+            by_shard
+                .entry(native.shard.as_ref())
+                .or_default()
+                .push(index);
+        }
+        for (shard_name, indexes) in by_shard {
+            let shard = self
+                .shards
+                .get(shard_name)
+                .with_context(|| format!("disk shard {shard_name} not open"))?;
+            let requests: Vec<(u64, u64)> = indexes
+                .iter()
+                .map(|&index| (parts[index].1.offset, parts[index].1.len))
+                .collect();
+            let largest = requests
+                .iter()
+                .map(|&(offset, len)| {
+                    (offset % shard.alignment)
+                        .checked_add(len)
+                        .and_then(|n| n.checked_add(shard.alignment - 1))
+                        .map(|n| n & !(shard.alignment - 1))
+                        .context("expert staging extent overflow")
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .max()
+                .context("empty native requests")?;
+            let mut staging =
+                AlignedBytes::new(usize::try_from(largest)?, usize::try_from(shard.alignment)?)?;
+            shard.read_spans(&requests, chunk_bytes, &mut staging, |index, bytes| {
+                let start = usize::try_from(parts[indexes[index]].0)?;
+                slot[start..start + bytes.len()].copy_from_slice(bytes);
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     /// Lease over a filled ring slot; the guard holds the values until it drops or records the
@@ -676,7 +983,7 @@ fn disk_contributions<const FP8: bool>(
         if !work.routes.iter().any(|route| route.expert == expert) {
             continue;
         }
-        let slot = reader.read_expert(work.layer, expert, catalogue)?;
+        let slot = reader.read_expert(work.layer, expert, catalogue, catalogue.slot_bytes())?;
         let values = reader.values(slot)?;
         for route in work.routes.iter().filter(|route| route.expert == expert) {
             let first = route.row as usize * shape.hidden;
@@ -940,7 +1247,7 @@ mod tests {
         let pattern = pattern(1536, 0);
         let reader = DiskReader::open(&catalogue, dir.path(), 2)?;
         for (layer, expert) in [(0u32, 0u32), (0, 3), (1, 0), (1, 3)] {
-            let slot = reader.read_expert(layer, expert, &catalogue)?;
+            let slot = reader.read_expert(layer, expert, &catalogue, catalogue.slot_bytes())?;
             {
                 let values = reader.values(slot)?;
                 assert_eq!(values.len(), 96);
@@ -970,7 +1277,7 @@ mod tests {
         let gate_pattern = pattern(1536, 0);
         let down_pattern = pattern(1536, 91);
         let reader = DiskReader::open(&catalogue, dir.path(), 1)?;
-        let slot = reader.read_expert(0, 2, &catalogue)?;
+        let slot = reader.read_expert(0, 2, &catalogue, catalogue.slot_bytes())?;
         let values = reader.values(slot)?;
         for (index, value) in values.iter().enumerate() {
             let (pattern, byte) = if index < 64 {
@@ -1008,11 +1315,11 @@ mod tests {
     fn ring_slots_are_guarded_until_their_lease_drops() -> Result<()> {
         let (dir, catalogue) = staged("shard-0.safetensors", "shard-0.safetensors")?;
         let reader = DiskReader::open(&catalogue, dir.path(), 2)?;
-        let first = reader.read_expert(0, 0, &catalogue)?;
-        let second = reader.read_expert(0, 1, &catalogue)?;
+        let first = reader.read_expert(0, 0, &catalogue, catalogue.slot_bytes())?;
+        let second = reader.read_expert(0, 1, &catalogue, catalogue.slot_bytes())?;
         assert_ne!(first, second);
         let error = reader
-            .read_expert(0, 2, &catalogue)
+            .read_expert(0, 2, &catalogue, catalogue.slot_bytes())
             .unwrap_err()
             .to_string();
         assert!(
@@ -1021,7 +1328,7 @@ mod tests {
         );
         drop(reader.values(first)?);
         assert!(reader.values(first).is_err());
-        let third = reader.read_expert(0, 2, &catalogue)?;
+        let third = reader.read_expert(0, 2, &catalogue, catalogue.slot_bytes())?;
         assert_eq!(third, first);
         Ok(())
     }
@@ -1030,9 +1337,9 @@ mod tests {
     fn a_slot_can_be_filled_while_another_is_read() -> Result<()> {
         let (dir, catalogue) = staged("shard-0.safetensors", "shard-0.safetensors")?;
         let reader = DiskReader::open(&catalogue, dir.path(), 2)?;
-        let first = reader.read_expert(0, 0, &catalogue)?;
+        let first = reader.read_expert(0, 0, &catalogue, catalogue.slot_bytes())?;
         let values = reader.values(first)?;
-        let second = reader.read_expert(0, 1, &catalogue)?;
+        let second = reader.read_expert(0, 1, &catalogue, catalogue.slot_bytes())?;
         assert_ne!(first, second);
         let second_values = reader.values(second)?;
         assert_eq!(values.len(), 96);
@@ -1042,9 +1349,9 @@ mod tests {
         drop(second_values);
         assert!(reader.values(first).is_err());
         let single = DiskReader::open(&catalogue, dir.path(), 1)?;
-        let held = single.read_expert(0, 0, &catalogue)?;
+        let held = single.read_expert(0, 0, &catalogue, catalogue.slot_bytes())?;
         let error = single
-            .read_expert(0, 1, &catalogue)
+            .read_expert(0, 1, &catalogue, catalogue.slot_bytes())
             .unwrap_err()
             .to_string();
         assert!(
@@ -1059,10 +1366,10 @@ mod tests {
     fn a_copied_slot_returns_only_through_its_copy_event() -> Result<()> {
         let (dir, catalogue) = staged("shard-0.safetensors", "shard-0.safetensors")?;
         let reader = DiskReader::open(&catalogue, dir.path(), 1)?;
-        let slot = reader.read_expert(0, 0, &catalogue)?;
+        let slot = reader.read_expert(0, 0, &catalogue, catalogue.slot_bytes())?;
         reader.values(slot)?.copied(5)?;
         let error = reader
-            .read_expert(0, 1, &catalogue)
+            .read_expert(0, 1, &catalogue, catalogue.slot_bytes())
             .unwrap_err()
             .to_string();
         assert!(
@@ -1072,7 +1379,7 @@ mod tests {
         let error = reader.reclaim(slot, 4).unwrap_err().to_string();
         assert!(error.contains("has no copy with event 4"), "{error}");
         reader.reclaim(slot, 5)?;
-        let again = reader.read_expert(0, 1, &catalogue)?;
+        let again = reader.read_expert(0, 1, &catalogue, catalogue.slot_bytes())?;
         assert_eq!(again, slot);
         Ok(())
     }
@@ -1156,7 +1463,8 @@ mod tests {
             let mut output = vec![bf16::from_f32(-99.0); 6 * 8];
             let mut expected = output.clone();
             for route in routes {
-                let slot = oracle.read_expert(layer, route.expert, &catalogue)?;
+                let slot =
+                    oracle.read_expert(layer, route.expert, &catalogue, catalogue.slot_bytes())?;
                 let values = oracle.values(slot)?;
                 let first = route.row as usize * 8;
                 contribution(
@@ -1485,7 +1793,8 @@ mod tests {
             let mut actual = vec![bf16::from_f32(-99.0); 6 * shape.hidden];
             let mut expected = actual.clone();
             for route in routes {
-                let slot = reader.read_expert(layer, route.expert, &catalogue)?;
+                let slot =
+                    reader.read_expert(layer, route.expert, &catalogue, catalogue.slot_bytes())?;
                 let values = reader.values(slot)?;
                 fp8_contribution(
                     Isa::Scalar,
@@ -1543,7 +1852,7 @@ mod tests {
         )?;
         assert_eq!(catalogue.slot_bytes(), 128);
         let reader = DiskReader::open(&catalogue, dir.path(), 1)?;
-        let slot = reader.read_expert(1, 2, &catalogue)?;
+        let slot = reader.read_expert(1, 2, &catalogue, catalogue.slot_bytes())?;
         let ExpertRange::Fp8 {
             gate,
             up,
@@ -1591,7 +1900,7 @@ mod tests {
         let gate_up_elements = 2 * geometry.intermediate as usize * geometry.hidden as usize;
         let down_elements = geometry.hidden as usize * geometry.intermediate as usize;
         for (layer, expert) in [(0u32, 0u32), (39, 255)] {
-            let slot = reader.read_expert(layer, expert, &catalogue)?;
+            let slot = reader.read_expert(layer, expert, &catalogue, catalogue.slot_bytes())?;
             let values = reader.values(slot)?.to_vec();
             let ExpertRange::Bf16 { gate_up, down } = catalogue.range(layer, expert)? else {
                 bail!("BF16 range expected");
@@ -1623,6 +1932,263 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod e2m1_tests {
+    use super::*;
+    use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope};
+    use crate::experts::catalogue::{ExpertCatalogue, ExpertGeometry};
+    use crate::model_spec::ExpertFormat;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    /// The audited DeepSeek E2M1 names: packed `[rows, cols/2]` I8 codes and
+    /// `[rows, cols/32]` E8M0 scales, in emit order.
+    fn e2m1_manifest(layers: u32, experts: u32, rows: usize, cols: usize) -> TensorManifest {
+        let mut entries = BTreeMap::new();
+        let mut next = 0u64;
+        for layer in 0..layers {
+            for expert in 0..experts {
+                let name = |role: &str| format!("layers.{layer}.ffn.experts.{expert}.{role}");
+                for (role, r, c, dtype) in [
+                    ("w1.weight", rows, cols / 2, safetensors::Dtype::I8),
+                    ("w3.weight", rows, cols / 2, safetensors::Dtype::I8),
+                    ("w2.weight", cols, rows / 2, safetensors::Dtype::I8),
+                    ("w1.scale", rows, cols / 32, safetensors::Dtype::F8_E8M0),
+                    ("w3.scale", rows, cols / 32, safetensors::Dtype::F8_E8M0),
+                    ("w2.scale", cols, rows / 32, safetensors::Dtype::F8_E8M0),
+                ] {
+                    let len = (r * c) as u64;
+                    entries.insert(
+                        name(role),
+                        TensorEntry {
+                            dtype,
+                            shape: vec![r, c],
+                            shard: "e2m1.bin".into(),
+                            bytes: len as usize,
+                            load: true,
+                            data_start: 0,
+                            data_offsets: [next, next + len],
+                            scope: TensorScope::Text,
+                            layer: None,
+                            role: role.into(),
+                            scale_name: None,
+                        },
+                    );
+                    next += len;
+                }
+            }
+        }
+        TensorManifest {
+            entries,
+            resident_bytes: 0,
+        }
+    }
+
+    fn e2m1_geometry() -> ExpertGeometry {
+        ExpertGeometry {
+            first_layer: 0,
+            layers: 1,
+            experts: 2,
+            hidden: 32,
+            intermediate: 32,
+            top_k: 2,
+        }
+    }
+
+    fn e2m1_format() -> ExpertFormat {
+        ExpertFormat::Fp4E2m1Block {
+            block: [1, 32],
+            scale_dtype: safetensors::Dtype::F8_E8M0,
+        }
+    }
+
+    fn temp_dir(tag: &str) -> Result<TempDir> {
+        let dir =
+            std::env::temp_dir().join(format!("flyingfish-e2m1-{}-{}", std::process::id(), tag));
+        std::fs::create_dir_all(&dir)?;
+        Ok(TempDir {
+            path: dir,
+            _0: std::marker::PhantomData,
+        })
+    }
+
+    struct TempDir {
+        path: std::path::PathBuf,
+        _0: std::marker::PhantomData<u8>,
+    }
+    impl TempDir {
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn pattern(len: usize, seed: u64) -> Vec<u8> {
+        (0..len)
+            .map(|index| ((index * 37 + seed as usize * 11) % 251) as u8)
+            .collect()
+    }
+
+    #[test]
+    fn e2m1_slot_layout_is_the_published_geometry() -> Result<()> {
+        let geometry = e2m1_geometry();
+        let catalogue = ExpertCatalogue::from_manifest(
+            &e2m1_manifest(geometry.layers, geometry.experts, 32, 32),
+            geometry,
+            e2m1_format(),
+        )?;
+        let layout = match catalogue.layout() {
+            ExpertLayout::Fp4E2m1Block(slot, _) => slot,
+            _ => bail!("E2M1 layout expected"),
+        };
+        let ranges = [
+            ("gate", &layout.gate),
+            ("up", &layout.up),
+            ("down", &layout.down),
+            ("gate_scale", &layout.gate_scale),
+            ("up_scale", &layout.up_scale),
+            ("down_scale", &layout.down_scale),
+        ];
+        let mut ends = Vec::new();
+        for (name, range) in ranges {
+            ensure!(
+                range.start < range.end && range.start.is_multiple_of(16),
+                "E2M1 {name} alignment: range={range:?}"
+            );
+            ends.push(range.end);
+        }
+        ensure!(
+            ranges.iter().zip(ends).all(|((_, a), end)| a.end <= end),
+            "E2M1 ranges must be ordered"
+        );
+        assert_eq!(catalogue.slot_bytes(), layout.down_scale.end);
+        Ok(())
+    }
+
+    #[test]
+    fn e2m1_disk_read_lands_the_published_layout_byte_for_byte() -> Result<()> {
+        let geometry = e2m1_geometry();
+        let rows = 32usize;
+        let cols = 32usize;
+        let dir = temp_dir("disk-read")?;
+        let manifest = e2m1_manifest(geometry.layers, geometry.experts, rows, cols);
+        let mut native = Vec::new();
+        let mut ordered: Vec<(&String, &TensorEntry)> = manifest.entries.iter().collect();
+        ordered.sort_by_key(|(_, entry)| entry.data_offsets[0]);
+        for (name, entry) in ordered {
+            let len = (entry.data_offsets[1] - entry.data_offsets[0]) as usize;
+            let _ = name;
+            native.extend(pattern(len, 7));
+        }
+        let _ = &native;
+        std::fs::write(dir.path().join("e2m1.bin"), &native)?;
+        let catalogue = Arc::new(ExpertCatalogue::from_manifest(
+            &e2m1_manifest(geometry.layers, geometry.experts, rows, cols),
+            geometry,
+            e2m1_format(),
+        )?);
+        let reader = DiskReader::open(&catalogue, dir.path(), 2)?;
+        for shard in reader.shards.values() {
+            // SAFETY: F_GETFL reads flags from an open file descriptor.
+            let flags = unsafe { libc::fcntl(shard.file.as_raw_fd(), libc::F_GETFL) };
+            ensure!(
+                flags >= 0 && flags & libc::O_DIRECT != 0,
+                "E2M1 shard must use direct IO"
+            );
+        }
+        let shard = &reader.shards["e2m1.bin"];
+        let requests = [(native.len() as u64 - 11, 11), (13, 19), (7, 23), (13, 19)];
+        let mut staging =
+            AlignedBytes::new(2 * shard.alignment as usize, shard.alignment as usize)?;
+        let mut completed = [false; 4];
+        shard.read_spans(&requests, shard.alignment, &mut staging, |index, bytes| {
+            let (offset, len) = requests[index];
+            ensure!(
+                bytes == &native[offset as usize..(offset + len) as usize],
+                "native request ordering or tail differs"
+            );
+            completed[index] = true;
+            Ok(())
+        })?;
+        ensure!(
+            completed.iter().all(|&done| done),
+            "native read omitted a request"
+        );
+        ensure!(
+            shard
+                .read_spans(
+                    &[(native.len() as u64 - 1, 2)],
+                    shard.alignment,
+                    &mut staging,
+                    |_, _| Ok(())
+                )
+                .is_err(),
+            "out-of-file request escaped validation"
+        );
+        let slot = reader.read_expert(0, 1, &catalogue, catalogue.slot_bytes())?;
+        let values = reader.values(slot)?;
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.to_bits().to_le_bytes())
+            .collect();
+        let want_len = usize::try_from(catalogue.slot_bytes())?;
+        ensure!(
+            bytes.len() >= want_len && native.len() >= want_len,
+            "slot byte extent: have {} want {want_len}",
+            bytes.len().min(native.len())
+        );
+        assert_eq!(&bytes[..want_len], &native[..want_len]);
+        // Planted control: a slot served from the wrong byte range must not match.
+        let mut shifted = bytes[..want_len].to_vec();
+        shifted.rotate_left(1);
+        ensure!(
+            shifted != bytes[..want_len],
+            "wrong-slot control: a rotated slot compared equal"
+        );
+        let _ = (rows, cols);
+        Ok(())
+    }
+
+    #[test]
+    fn e2m1_disk_read_rejects_a_wrong_range() -> Result<()> {
+        let geometry = e2m1_geometry();
+        let dir = temp_dir("wrong-range")?;
+        let manifest = e2m1_manifest(geometry.layers, geometry.experts, 32, 32);
+        let mut native = Vec::new();
+        let mut ordered: Vec<&TensorEntry> = manifest.entries.values().collect();
+        ordered.sort_by_key(|entry| entry.data_offsets[0]);
+        for entry in ordered {
+            let len = (entry.data_offsets[1] - entry.data_offsets[0]) as usize;
+            native.extend(pattern(len, 3));
+        }
+        std::fs::write(dir.path().join("e2m1.bin"), native)?;
+        let catalogue = Arc::new(ExpertCatalogue::from_manifest(
+            &e2m1_manifest(geometry.layers, geometry.experts, 32, 32),
+            geometry,
+            e2m1_format(),
+        )?);
+        // A geometry whose code extent differs must not be readable as this layout.
+        let wrong = ExpertGeometry {
+            intermediate: 64,
+            ..geometry
+        };
+        let error = ExpertCatalogue::from_manifest(
+            &e2m1_manifest(wrong.layers, wrong.experts, 32, 64),
+            wrong,
+            e2m1_format(),
+        )
+        .map(|_| ())
+        .unwrap_err();
+        assert!(!error.to_string().is_empty());
+        let _ = (catalogue, dir, error);
         Ok(())
     }
 }

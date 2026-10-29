@@ -197,6 +197,9 @@ impl ExpertWeights {
             ExpertLayout::Fp8W8a16Block(..) => {
                 anyhow::bail!("block-scale CPU expert arithmetic is not bound yet")
             }
+            ExpertLayout::Fp4E2m1Block(..) => {
+                anyhow::bail!("E2M1 CPU expert arithmetic is not bound yet")
+            }
         };
         Ok(Self {
             gate_up,
@@ -2947,6 +2950,9 @@ pub fn measure_service_table(
         }
         ExpertLayout::Fp8W8a16Block(..) => {
             unreachable!("block-scale fixtures are covered by the real checkpoint gate")
+        }
+        ExpertLayout::Fp4E2m1Block(..) => {
+            anyhow::bail!("E2M1 CPU expert fixtures are not bound yet")
         }
     }
     for expert in 0..ring_experts {

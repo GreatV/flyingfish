@@ -20,6 +20,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "signal
 futures-util = "0.3"
 cudarc = { optional = true, version = "=0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "cublas", "cublaslt", "dynamic-loading", "cuda-version-from-build-system", "f16"] }
 half = { version = "2", features = ["bytemuck"] }
+libc = "0.2"
 memmap2 = "0.9"
 safetensors = "0.6"
 serde = { version = "1", features = ["derive"] }

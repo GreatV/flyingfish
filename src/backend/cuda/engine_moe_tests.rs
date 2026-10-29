@@ -984,6 +984,9 @@ impl Engine {
                     scale_dtype: block_scale.dtype(),
                 }
             }
+            crate::experts::catalogue::ExpertLayout::Fp4E2m1Block(..) => {
+                anyhow::bail!("E2M1 hybrid fixtures are not bound yet")
+            }
         });
         let config = model_spec.config();
         let manifest = hybrid_manifest(&model_spec)?;
@@ -1786,6 +1789,9 @@ impl TierOracle {
                     scale_dtype: block_scale.dtype(),
                 }
             }
+            crate::experts::catalogue::ExpertLayout::Fp4E2m1Block(..) => {
+                anyhow::bail!("E2M1 hybrid fixtures are not bound yet")
+            }
         };
         let catalogue = native_fixture(fixture, directory, format)?;
         let geometry = catalogue.geometry();
@@ -1865,9 +1871,12 @@ impl TierOracle {
             if active == 1 {
                 continue;
             }
-            let slot = self
-                .reader
-                .read_expert(layer, ids[choice] as u32, &self.catalogue)?;
+            let slot = self.reader.read_expert(
+                layer,
+                ids[choice] as u32,
+                &self.catalogue,
+                self.catalogue.slot_bytes(),
+            )?;
             let values = self.reader.values(slot)?;
             let row = choice / 4;
             if let Some(slot_layout) = self.catalogue.layout().fp8_slot() {
@@ -1956,9 +1965,12 @@ fn decode_residency_fixture_covers_tiers_requests_and_cap() -> Result<()> {
     )?;
     for layer in 0..2 {
         for expert in 0..16 {
-            let slot = oracle
-                .reader
-                .read_expert(layer, expert, &oracle.catalogue)?;
+            let slot = oracle.reader.read_expert(
+                layer,
+                expert,
+                &oracle.catalogue,
+                oracle.catalogue.slot_bytes(),
+            )?;
             let values = oracle.reader.values(slot)?;
             let expert = expert as usize;
             let expected = fixture.gate_up[expert * 16384..(expert + 1) * 16384]
@@ -3673,7 +3685,7 @@ pub(super) fn placement_components(engine: &Engine, model: &Path) -> Result<usiz
     let host = HostBlocks::new(1, elements)?;
     let mut gpu_weights = Vec::new();
     for expert in 0..8 {
-        let index = reader.read_expert(0, expert, &catalogue)?;
+        let index = reader.read_expert(0, expert, &catalogue, catalogue.slot_bytes())?;
         let lease = reader.values(index)?;
         if expert == 0 {
             host.claim(0)?.slice()?.copy_from_slice(&lease);

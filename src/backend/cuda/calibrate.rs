@@ -1096,7 +1096,7 @@ fn expert_key(device: &Device) -> Result<CacheKey> {
     }
 }
 
-fn copy_engines(device: &Device) -> Result<u32> {
+pub(super) fn copy_engines(device: &Device) -> Result<u32> {
     #[cfg(feature = "cuda")]
     let count = device
         .ctx

@@ -273,6 +273,21 @@ impl SlotLayout {
                     );
                 }
             }
+            crate::experts::catalogue::ExpertLayout::Fp4E2m1Block(layout, _) => {
+                for (name, range) in [
+                    ("gate", &layout.gate),
+                    ("up", &layout.up),
+                    ("down", &layout.down),
+                    ("gate_scale", &layout.gate_scale),
+                    ("up_scale", &layout.up_scale),
+                    ("down_scale", &layout.down_scale),
+                ] {
+                    ensure!(
+                        range.start < range.end && range.start.is_multiple_of(16),
+                        "E2M1 native {name} alignment: range={range:?}"
+                    );
+                }
+            }
         }
         ensure!(
             capacity.slots_per_layer.len() == geometry.layers as usize,
@@ -539,6 +554,34 @@ impl SlotEvents {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn e2m1_capacity(geometry: ExpertGeometry, slots_per_layer: Vec<u32>) -> Result<Capacity> {
+        let layout = crate::experts::catalogue::ExpertLayout::new(
+            crate::model_spec::ExpertFormat::Fp4E2m1Block {
+                block: [1, 32],
+                scale_dtype: safetensors::Dtype::F8_E8M0,
+            },
+            &geometry,
+        )?;
+        let bytes = layout.slot_bytes();
+        Ok(Capacity {
+            layout,
+            span_rows: 8,
+            wave_rows: 2,
+            device_expert_bytes: slots_per_layer.iter().map(|&n| u64::from(n)).sum::<u64>() * bytes,
+            peer_expert_bytes: 0,
+            gpu0_layers: geometry.layers,
+            host_expert_bytes: 3 * bytes,
+            slots_per_layer,
+            host_blocks: 2,
+            spare_blocks: 1,
+            disk_bytes: 0,
+            worker_count: 1,
+            disk_workers: 0,
+            prefill_staging_slots: 2,
+            pinned: false,
+        })
+    }
+
     fn slot_capacity(geometry: ExpertGeometry, slots_per_layer: Vec<u32>) -> Result<Capacity> {
         let layout = crate::experts::catalogue::ExpertLayout::new(
             crate::model_spec::ExpertFormat::Bf16,
@@ -626,6 +669,23 @@ mod tests {
         assert_eq!(borrowed.experts, vec![(0, 7), (2, 0)]);
         assert_eq!(borrowed.disk_bytes, 2 * bytes as u64);
         ledger.check()?;
+        Ok(())
+    }
+
+    #[test]
+    fn e2m1_slot_layout_validates_the_published_ranges() -> Result<()> {
+        let geometry = ExpertGeometry {
+            first_layer: 0,
+            layers: 40,
+            experts: 384,
+            hidden: 5120,
+            intermediate: 2304,
+            top_k: 6,
+        };
+        let capacity = e2m1_capacity(geometry, crate::experts::plan::equal_slots(384, 40)?)?;
+        assert_eq!(capacity.slot_bytes(), 18_800_640);
+        let layout = SlotLayout::new(geometry, &capacity)?;
+        assert_eq!(layout.slot_bytes(), 18_800_640);
         Ok(())
     }
 

@@ -79,6 +79,11 @@ pub enum ExpertFormat {
         block: [u32; 2],
         scale_dtype: safetensors::Dtype,
     },
+    /// Per-expert E2M1 weights packed two values per byte, with block scales beside them.
+    Fp4E2m1Block {
+        block: [u32; 2],
+        scale_dtype: safetensors::Dtype,
+    },
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1248,6 +1253,9 @@ impl ModelSpec {
             ExpertFormat::Fp8W8a16 => LinearFormat::Fp8E4m3Channel,
             ExpertFormat::Fp8W8a16Block { .. } => {
                 bail!("MiniCPM does not use F32 block-scale experts")
+            }
+            ExpertFormat::Fp4E2m1Block { .. } => {
+                bail!("MiniCPM does not use E2M1 experts")
             }
         };
         let spec = Self::from_text(
