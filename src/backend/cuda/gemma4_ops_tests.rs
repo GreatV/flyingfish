@@ -292,6 +292,9 @@ fn softcap_tied_head_and_embedding_scale_match_the_definition_gpu() -> Result<()
                 .arg(&(ids.len() as i32))
                 .arg(&(hidden as i32))
                 .arg(&scale)
+                .arg(&0u64)
+                .arg(&0i32)
+                .arg(&0i32)
                 .launch(flat(ids.len() * hidden))?;
         }
         s.clone_dtoh(&embedded)
