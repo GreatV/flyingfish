@@ -625,7 +625,7 @@ fn proportional_and_default_rope_tables_match_the_definition_gpu() -> Result<()>
     };
     let full = RopeSpec {
         theta: 1000000.0,
-        pairs: 256,
+        pairs: 64,
         pair_stride: 256,
         denominator: 512,
     };
@@ -694,7 +694,7 @@ fn proportional_and_default_rope_tables_match_the_definition_gpu() -> Result<()>
         };
         let mutants: Vec<(&str, cudarc::driver::CudaSlice<bf16>)> = if tag == "full" {
             [
-                ("partial_64", RopeSpec { pairs: 64, ..spec }),
+                ("rotate_all_256", RopeSpec { pairs: 256, ..spec }),
                 (
                     "denominator_256",
                     RopeSpec {
@@ -955,6 +955,16 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
     }
     drop(catalog);
     let mut engine = super::engine::Engine::load(&dir, 0, 640, Some(640), settings)?;
+    let expected_table = spec.layers[4]
+        .geometry
+        .context("D512 layer geometry missing")?
+        .rope
+        .table(512, 14)?;
+    let actual_table = engine.gemma_rope_table(true, &[0, 1, 13])?;
+    ensure!(
+        actual_table == expected_table,
+        "D512 RoPE table content mismatch"
+    );
     let probe_input = tensor(&data, "stage.a.input_layernorm")?;
     let projected = engine.gemma_linear_probe("self_attn.q_proj.weight", probe_input)?;
     let expected = tensor(&data, "stage.a.q_proj")?;

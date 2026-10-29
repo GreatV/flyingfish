@@ -552,7 +552,7 @@ fn require_gemma_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
                 && g.intermediate > 0
                 && g.rope.pair_stride == g.head_dim / 2
                 && g.rope.denominator == g.head_dim
-                && g.rope.pairs == if full { 256 } else { 128 },
+                && g.rope.pairs == if full { 64 } else { 128 },
             "unsupported Gemma 4 layer geometry: {g:?}"
         );
     }

@@ -62,7 +62,7 @@ fn check(spec: &ModelSpec, e: &Expect) -> Result<()> {
     };
     let global = RopeSpec {
         theta: 1000000.0,
-        pairs: 256,
+        pairs: 64,
         pair_stride: 256,
         denominator: 512,
     };

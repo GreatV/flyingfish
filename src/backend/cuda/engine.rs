@@ -2022,6 +2022,30 @@ impl Engine {
     }
 
     #[cfg(test)]
+    pub(crate) fn gemma_rope_table(&self, full: bool, positions: &[usize]) -> Result<Vec<bf16>> {
+        let ops = self
+            .qwen
+            .as_ref()
+            .and_then(|q| q.gemma.as_ref())
+            .context("Gemma 4 operations missing")?;
+        let d = if full { 512 } else { 256 };
+        let table = &ops.rope_tables[usize::from(full)];
+        let mut out = Vec::with_capacity(positions.len() * d);
+        for &position in positions {
+            ensure!(
+                position < self.capacity,
+                "RoPE table position outside capacity"
+            );
+            out.extend(
+                self.device
+                    .stream
+                    .clone_dtoh(&table.slice(position * d..(position + 1) * d))?,
+            );
+        }
+        Ok(out)
+    }
+
+    #[cfg(test)]
     pub(crate) fn gemma_position(&self) -> Result<(usize, i32)> {
         Ok((
             self.position,

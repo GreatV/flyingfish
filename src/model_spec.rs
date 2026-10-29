@@ -1794,7 +1794,7 @@ impl ModelSpec {
         };
         let global = RopeSpec {
             theta: 1000000.0,
-            pairs: GLOBAL_HEAD_DIM / 2,
+            pairs: GLOBAL_HEAD_DIM / 8,
             pair_stride: GLOBAL_HEAD_DIM / 2,
             denominator: GLOBAL_HEAD_DIM,
         };
