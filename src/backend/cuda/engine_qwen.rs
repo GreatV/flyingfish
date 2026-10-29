@@ -5148,9 +5148,8 @@ impl Engine {
                 trace,
                 s,
                 &debug_name(trace, i, "ple_identity"),
-                &ops.per_layer_inputs
-                    .slice(i * linear_rows * width..(i + 1) * linear_rows * width),
-                rows,
+                &ops.per_layer_inputs,
+                ops.per_layer_inputs.len() / width,
                 width,
             )?;
         }
