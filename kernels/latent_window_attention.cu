@@ -32,6 +32,10 @@
 #include <math.h>
 #include <stdint.h>
 
+#if defined(__HIP__)
+#pragma clang fp contract(off)
+#endif
+
 #define LWA_THREADS 256
 // E4M3 codes per E8M0 scale along the head vector.
 #define LWA_SCALE_BLOCK 32

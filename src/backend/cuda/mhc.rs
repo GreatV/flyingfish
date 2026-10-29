@@ -1577,14 +1577,27 @@ mod tests {
             eps: 0.0,
             norm_eps: 1e-5,
         };
-        let expected = oracle.update(
-            &sublayer,
-            &residual,
-            &post.iter().map(|v| f64::from(*v)).collect::<Vec<_>>(),
-            &comb.iter().map(|v| f64::from(*v)).collect::<Vec<_>>(),
-            true,
-            true,
-        );
+        let expected: Vec<_> = (0..ROWS as usize)
+            .flat_map(|row| {
+                let hidden = HIDDEN as usize;
+                let mult = MULT as usize;
+                oracle.update(
+                    &sublayer[row * hidden..(row + 1) * hidden],
+                    &residual[row * mult * hidden..(row + 1) * mult * hidden],
+                    &post[row * mult..(row + 1) * mult]
+                        .iter()
+                        .map(|v| f64::from(*v))
+                        .collect::<Vec<_>>(),
+                    &comb[row * mult * mult..(row + 1) * mult * mult]
+                        .iter()
+                        .map(|v| f64::from(*v))
+                        .collect::<Vec<_>>(),
+                    true,
+                    true,
+                )
+            })
+            .collect();
+        ensure!(actual.len() == expected.len(), "mHC oracle output extent");
         let mismatches = actual
             .iter()
             .zip(&expected)

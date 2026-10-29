@@ -1,5 +1,9 @@
 #include "q38_contract.cuh"
 
+#if defined(__HIP__)
+#pragma clang fp contract(off)
+#endif
+
 // Cursor is the next absolute input position; tails retain the latest row of each parity.
 __device__ __forceinline__ void compress_guard(
     const Q38SequenceMeta* sequence, const uint32_t* cursor, int rows) {
