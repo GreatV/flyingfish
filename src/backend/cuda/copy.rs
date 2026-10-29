@@ -279,6 +279,7 @@ impl RingCopy<'_> {
         wrap_source: bool,
         wrap_target: bool,
     ) -> Result<()> {
+        self.stream.context().bind_to_thread()?;
         let lengths = [self.source.len(), self.target.len()];
         let (src, _src) = self.source.device_ptr(self.stream);
         let (dst, _dst) = self.target.device_ptr_mut(self.stream);
