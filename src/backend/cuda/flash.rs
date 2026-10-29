@@ -851,6 +851,92 @@ mod tests {
         assert_eq!(std::mem::offset_of!(Attention, q_stride), 48);
         assert_eq!(std::mem::offset_of!(Attention, start), 60);
     }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "GPU lease; shared window and explicit score dispatch"]
+    fn score_window_binding_gpu() -> Result<()> {
+        let ctx = crate::backend::gpu::CudaContext::new(0)?;
+        let stream = ctx.new_stream()?;
+        for (d, hq, hkv, window) in [
+            (128, 32, 4, Some(31)),
+            (256, 8, 2, Some(31)),
+            (512, 8, 2, None),
+        ] {
+            let case = Case {
+                name: "score-binding".into(),
+                d,
+                hq,
+                hkv,
+                mode: if window.is_some() { "window" } else { "causal" }.into(),
+                seed: 47,
+                rows: 3,
+                start: 77,
+                keys: 80,
+                extent: window.unwrap_or(0),
+                capacity: 128,
+                pitch: hq * d + 128,
+            };
+            let values: Vec<_> = (0..hkv * case.capacity * d)
+                .map(|i| {
+                    let head = i / (case.capacity * d);
+                    let key = i / d % case.capacity;
+                    bf16::from_f32(
+                        ((key * 29 + head * 7 + i % d * 3) % 127) as f32 / 64.0 - 63.0 / 64.0,
+                    )
+                })
+                .collect();
+            let mut b = Buffers {
+                q: stream.alloc_zeros(case.rows * case.pitch)?,
+                k: stream.alloc_zeros(values.len())?,
+                v: stream.clone_htod(&values)?,
+                out: stream.alloc_zeros(case.rows * hq * d)?,
+            };
+            let mut op = if d == 128 {
+                Flash::new(stream.clone(), case.rows, hq, hkv, d)?
+            } else {
+                Flash::new_with_score(
+                    stream.clone(),
+                    case.rows,
+                    hq,
+                    hkv,
+                    d,
+                    Score {
+                        scale: 1.0,
+                        window_left: window,
+                    },
+                    case.capacity,
+                )?
+            };
+            case.run(&mut op, &mut b)?;
+            let actual = stream.clone_dtoh(&b.out)?;
+            let expected = uniform_reference(&case, &values);
+            ensure!(
+                actual
+                    .iter()
+                    .zip(&expected)
+                    .all(|(a, b)| (a.to_f64() - b).abs() <= 0.0078125),
+                "shared score/window output differs D={d}"
+            );
+            let lse = stream.clone_dtoh(&op.lse)?;
+            for head in 0..hq {
+                for row in 0..case.rows {
+                    let count = (0..case.keys)
+                        .filter(|&key| visible(&case, row, key))
+                        .count();
+                    ensure!(
+                        (f64::from(lse[head * case.rows + row]) - (count as f64).ln()).abs()
+                            <= 0.0000051421306608290256,
+                        "shared score/window LSE differs D={d}"
+                    );
+                }
+            }
+            println!(
+                "PASS score_window_binding D={d} heads={hq} kv_heads={hkv} window={window:?} rows=3"
+            );
+        }
+        Ok(())
+    }
     #[derive(Clone, serde::Deserialize)]
     struct Case {
         name: String,
