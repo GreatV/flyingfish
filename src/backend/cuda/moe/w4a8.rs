@@ -64,33 +64,10 @@ pub struct W4A8Inputs<'a> {
     pub swiglu_limit: f32,
 }
 
-/// Weight addresses of one expert inside a dispatch slot table, in the order
-/// gate_codes, gate_scales, up_codes, up_scales, down_codes, down_scales.
-pub const W4A8_SLOT_POINTERS: usize = 6;
-
 /// Device-side routed dispatch of one decode batch: the ids and route weights
 /// stay in device memory and the per-expert launches are sequenced from the
 /// host-known `rows`/`top_k` bounds only. `slots` is `[experts, 6]` addresses;
 /// a zero `slot_valid` entry marks an unresident expert and traps the launch.
-pub struct W4A8Dispatch<'a> {
-    /// `[rows, hidden]` BF16 activations, row-contiguous.
-    pub x: Tensor<bf16, 2>,
-    /// `[rows, top_k]` routed expert ids on device.
-    pub ids: Tensor<i32, 2>,
-    /// `[rows, top_k]` routed weights on device.
-    pub route_weights: Tensor<f32, 2>,
-    /// `[experts, 6]` weight addresses.
-    pub slots: Tensor<u64, 2>,
-    /// `[experts]` residency mask.
-    pub slot_valid: Tensor<u32, 1>,
-    /// The expert intermediate width of the slot table's weights.
-    pub intermediate: u32,
-    /// The SwiGLU clamp limit.
-    pub swiglu_limit: f32,
-    /// `[rows, top_k, hidden]` BF16 contributions out.
-    pub contributions: &'a mut TensorMut<bf16, 3>,
-}
-
 /// Derived extents of one call.
 #[derive(Clone, Copy, Debug)]
 #[cfg(test)]
@@ -238,8 +215,6 @@ pub struct MoeExpertW4A8 {
     gate_up: CudaFunction,
     #[cfg(test)]
     down: CudaFunction,
-    dispatch_gate_up: CudaFunction,
-    dispatch_down: CudaFunction,
 }
 
 impl MoeExpertW4A8 {
@@ -251,8 +226,6 @@ impl MoeExpertW4A8 {
             gate_up: module.load_function("moe_ffn_gate_up_e2m1_e8m0")?,
             #[cfg(test)]
             down: module.load_function("moe_ffn_down_e2m1_e8m0")?,
-            dispatch_gate_up: module.load_function("moe_ffn_dispatch_gate_up_e2m1_e8m0")?,
-            dispatch_down: module.load_function("moe_ffn_dispatch_down_e2m1_e8m0")?,
         })
     }
 
@@ -339,203 +312,6 @@ impl MoeExpertW4A8 {
         }
         Ok(())
     }
-
-    /// The routed contributions of one decode batch, dispatched on device:
-    /// one activation quantization per row, then per (row, choice) the
-    /// gate_up, the down-input quantization and the down launch, each reading
-    /// its expert id, routed weight and weight addresses from device memory.
-    /// Stream order serializes the shared scratch reuse.
-    pub fn run_dispatch(
-        &self,
-        stream: &Arc<CudaStream>,
-        input: W4A8Dispatch<'_>,
-        scratch: &Tensor<u8, 1>,
-    ) -> Result<()> {
-        let dims = validate_dispatch(&input, scratch)?;
-        let (rows, top_k, experts) = (dims.rows, dims.top_k, dims.experts);
-        let (hidden, intermediate) = (dims.hidden, dims.intermediate);
-        let (offsets, _) = scratch_layout(hidden, intermediate);
-        let codes = scratch.ptr + offsets[0];
-        let scales = scratch.ptr + offsets[1];
-        let state = scratch.ptr + offsets[2];
-        let down_codes = scratch.ptr + offsets[3];
-        let down_scales = scratch.ptr + offsets[4];
-        let groups = hidden / W4A8_SCALE_BLOCK;
-        let down_groups = intermediate / W4A8_SCALE_BLOCK;
-        let shared_gate_up = u64::from(hidden) + u64::from(groups);
-        let shared_down = u64::from(intermediate) + u64::from(down_groups);
-        let contributions = input.contributions.read();
-        for row in 0..rows {
-            let x_row = input.x.ptr + u64::from(row) * u64::from(hidden) * 2;
-            unsafe {
-                stream
-                    .launch_builder(&self.act_quant)
-                    .arg(&x_row)
-                    .arg(&codes)
-                    .arg(&scales)
-                    .arg(&(hidden as i32))
-                    .launch(LaunchConfig {
-                        grid_dim: (groups.div_ceil(W4A8_ROWS), 1, 1),
-                        block_dim: (W4A8_THREADS, 1, 1),
-                        shared_mem_bytes: 0,
-                    })?;
-            }
-            for k in 0..top_k {
-                let index = u64::from(row) * u64::from(top_k) + u64::from(k);
-                unsafe {
-                    stream
-                        .launch_builder(&self.dispatch_gate_up)
-                        .arg(&codes)
-                        .arg(&scales)
-                        .arg(&input.slots.ptr)
-                        .arg(&input.slot_valid.ptr)
-                        .arg(&input.ids.ptr)
-                        .arg(&input.route_weights.ptr)
-                        .arg(&index)
-                        .arg(&(experts as i32))
-                        .arg(&state)
-                        .arg(&(hidden as i32))
-                        .arg(&(intermediate as i32))
-                        .arg(&input.swiglu_limit)
-                        .launch(LaunchConfig {
-                            grid_dim: (intermediate.div_ceil(W4A8_ROWS), 1, 1),
-                            block_dim: (W4A8_THREADS, 1, 1),
-                            shared_mem_bytes: shared_gate_up as u32,
-                        })?;
-                    stream
-                        .launch_builder(&self.act_quant)
-                        .arg(&state)
-                        .arg(&down_codes)
-                        .arg(&down_scales)
-                        .arg(&(intermediate as i32))
-                        .launch(LaunchConfig {
-                            grid_dim: (down_groups.div_ceil(W4A8_ROWS), 1, 1),
-                            block_dim: (W4A8_THREADS, 1, 1),
-                            shared_mem_bytes: 0,
-                        })?;
-                    let out = contributions.ptr + index * u64::from(hidden) * 2;
-                    stream
-                        .launch_builder(&self.dispatch_down)
-                        .arg(&down_codes)
-                        .arg(&down_scales)
-                        .arg(&input.slots.ptr)
-                        .arg(&input.slot_valid.ptr)
-                        .arg(&input.ids.ptr)
-                        .arg(&index)
-                        .arg(&(experts as i32))
-                        .arg(&out)
-                        .arg(&(hidden as i32))
-                        .arg(&(intermediate as i32))
-                        .launch(LaunchConfig {
-                            grid_dim: (hidden.div_ceil(W4A8_ROWS), 1, 1),
-                            block_dim: (W4A8_THREADS, 1, 1),
-                            shared_mem_bytes: shared_down as u32,
-                        })?;
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Derived extents of one dispatch call.
-#[derive(Clone, Copy, Debug)]
-struct W4A8DispatchDims {
-    rows: u32,
-    top_k: u32,
-    experts: u32,
-    hidden: u32,
-    intermediate: u32,
-}
-
-fn validate_dispatch(
-    input: &W4A8Dispatch<'_>,
-    scratch: &Tensor<u8, 1>,
-) -> Result<W4A8DispatchDims> {
-    input.x.validate()?;
-    let (rows, hidden) = (input.x.shape[0], input.x.shape[1]);
-    ensure!(
-        input.x.stride == [u64::from(hidden), 1],
-        "w4a8 dispatch x must be row-contiguous [rows, hidden] (shape {:?}, stride {:?})",
-        input.x.shape,
-        input.x.stride
-    );
-    input.ids.validate()?;
-    let top_k = input.ids.shape[1];
-    ensure!(
-        input.ids.shape == [rows, top_k] && input.ids.stride == [u64::from(top_k), 1],
-        "w4a8 dispatch ids must be row-contiguous [rows, top_k] (shape {:?}, stride {:?})",
-        input.ids.shape,
-        input.ids.stride
-    );
-    input.route_weights.validate()?;
-    ensure!(
-        input.route_weights.shape == input.ids.shape
-            && input.route_weights.stride == input.ids.stride,
-        "w4a8 dispatch route_weights must match the ids view (shape {:?}, stride {:?})",
-        input.route_weights.shape,
-        input.route_weights.stride
-    );
-    input.slots.validate()?;
-    let experts = input.slots.shape[0];
-    ensure!(
-        input.slots.shape == [experts, W4A8_SLOT_POINTERS as u32]
-            && input.slots.stride == [W4A8_SLOT_POINTERS as u64, 1],
-        "w4a8 dispatch slots must be dense [experts, 6] (shape {:?}, stride {:?})",
-        input.slots.shape,
-        input.slots.stride
-    );
-    input.slot_valid.validate()?;
-    ensure!(
-        input.slot_valid.shape == [experts] && input.slot_valid.stride == [1],
-        "w4a8 dispatch slot_valid must be contiguous [experts] (shape {:?}, stride {:?})",
-        input.slot_valid.shape,
-        input.slot_valid.stride
-    );
-    let contributions = input.contributions.read();
-    contributions.validate()?;
-    ensure!(
-        contributions.shape == [rows, top_k, hidden]
-            && contributions.stride == [u64::from(top_k) * u64::from(hidden), u64::from(hidden), 1],
-        "w4a8 dispatch contributions must be dense [rows, top_k, hidden] (shape {:?}, stride {:?})",
-        contributions.shape,
-        contributions.stride
-    );
-    no_overlap(&input.x, &contributions, "x", "contributions")?;
-    ensure!(
-        input.swiglu_limit.is_finite() && input.swiglu_limit > 0.0,
-        "w4a8 dispatch swiglu limit {} must be positive and finite",
-        input.swiglu_limit
-    );
-    scratch.validate()?;
-    let intermediate = input.intermediate;
-    ensure!(
-        hidden >= W4A8_SCALE_BLOCK && hidden.is_multiple_of(W4A8_SCALE_BLOCK),
-        "w4a8 dispatch hidden {hidden} must be a positive multiple of {W4A8_SCALE_BLOCK}"
-    );
-    ensure!(
-        intermediate >= W4A8_SCALE_BLOCK && intermediate.is_multiple_of(W4A8_SCALE_BLOCK),
-        "w4a8 dispatch intermediate {intermediate} must be a positive multiple of {W4A8_SCALE_BLOCK}"
-    );
-    ensure!(
-        scratch.span_bytes >= scratch_bytes(hidden, intermediate),
-        "w4a8 dispatch scratch holds {} bytes, the call needs {}",
-        scratch.span_bytes,
-        scratch_bytes(hidden, intermediate)
-    );
-    let shared_gate_up = u64::from(hidden) + u64::from(hidden / W4A8_SCALE_BLOCK);
-    let shared_down = u64::from(intermediate) + u64::from(intermediate / W4A8_SCALE_BLOCK);
-    ensure!(
-        shared_gate_up <= W4A8_SHARED_LIMIT && shared_down <= W4A8_SHARED_LIMIT,
-        "w4a8 dispatch shared staging {shared_gate_up}/{shared_down} B exceeds the {W4A8_SHARED_LIMIT} B limit (hidden {hidden}, intermediate {intermediate})"
-    );
-    Ok(W4A8DispatchDims {
-        rows,
-        top_k,
-        experts,
-        hidden,
-        intermediate,
-    })
 }
 
 #[cfg(test)]

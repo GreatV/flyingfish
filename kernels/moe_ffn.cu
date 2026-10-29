@@ -2,8 +2,10 @@
 // gate_up: grid(ceil(I/32),rows,K+1), block256, smem=H*2; down: grid(ceil(H/16),rows,K+1), block128.
 // Active assignments require valid slots, matching generations and distinct expert ids.
 // Expert row pointers and shared weights are 16-byte aligned.
+#if !defined(__HIP__)
 #include <cuda_runtime.h>
 #include <cuda_fp8.h>
+#endif
 #include "q38_contract.cuh"
 
 using bf16 = __nv_bfloat16;
@@ -392,6 +394,7 @@ MOE_INVARIANT_DOWN(moe_ffn_down_w8a16_lane16, unsigned char, true)
 
 #undef FD_GUARD_MOE_GATE_UP
 #undef FD_GUARD_MOE_DOWN
+#if !defined(__HIP__)
 
 // ---------------------------------------------------------------------------
 // W4A8 routed experts: E2M1 weights with one E8M0 scale per 32 elements of
@@ -762,3 +765,4 @@ extern "C" __global__ __launch_bounds__(W4A8_THREADS) void moe_ffn_down_e4m3_blo
       s_codes, s_scales, groups));
   if (int(threadIdx.x % 32) == 0) out[row] = __float2bfloat16_rn(acc);
 }
+#endif

@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include "q38_contract.cuh"
 
+#if !defined(__HIP__)
 __device__ __forceinline__ float fp8_block_scale(float value) { return value; }
 __device__ __forceinline__ float fp8_block_scale(uint8_t value) { return e8m0_decode(value); }
 
@@ -149,6 +150,7 @@ FP8_BLOCK_ENTRY(fp8_block_f32_128_mma, float, 128, true)
 FP8_BLOCK_ENTRY(fp8_block_e8m0_32_decode, uint8_t, 32, false)
 FP8_BLOCK_ENTRY(fp8_block_e8m0_32_mma, uint8_t, 32, true)
 #undef FP8_BLOCK_ENTRY
+#endif
 
 template <bool PER_CHANNEL>
 __device__ __forceinline__ __nv_bfloat16 weight_at(

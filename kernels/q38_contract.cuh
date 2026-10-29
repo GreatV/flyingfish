@@ -1,6 +1,8 @@
 #pragma once
 #include "gpu_compat.cuh"
+#if !defined(__HIP__)
 #include <cuda_fp8.h>
+#endif
 #include <math.h>
 #include <stdint.h>
 struct Q38SequenceFields {
@@ -72,6 +74,7 @@ __device__ __forceinline__ float act_quant_pow2(int exponent) {
 // publisher kernel.py act_quant, block 32, scale_fmt "ue8m0"). Shared by the
 // W4A8/W8A8 expert paths and the DeepSeek-V4.1 latent ring and attention-output
 // quantization.
+#if !defined(__HIP__)
 __device__ __forceinline__ void act_quant32(float value, unsigned char* code,
                                             unsigned char* scale_code) {
     float amax = fabsf(value);
@@ -133,6 +136,7 @@ __device__ __forceinline__ void fp4_act_quant(
     }
     *code = e2m1_encode(__fdiv_rn(value, scale));
 }
+#endif
 
 // Two E4M3 codes per call. E4M3 is a subset of FP16, so the hardware form is
 // exact for all 256 codes; the fix-up forces the canonical NaN for both NaN codes.

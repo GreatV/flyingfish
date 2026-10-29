@@ -10,6 +10,7 @@ use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::sync::Arc;
 /// Native BF16 operands with an unrounded FP32 output on the shared skinny tile.
+#[cfg(test)]
 #[cfg(feature = "cuda")]
 pub struct Bf16F32Plan {
     kernel: CudaFunction,
@@ -19,6 +20,7 @@ pub struct Bf16F32Plan {
     shape: [i32; 3],
 }
 
+#[cfg(test)]
 #[cfg(feature = "cuda")]
 fn bf16_f32_shape(
     input: Tensor<bf16, 2>,
@@ -66,6 +68,7 @@ fn bf16_f32_shape(
     Ok([rows as i32, columns as i32, width as i32])
 }
 
+#[cfg(test)]
 #[cfg(feature = "cuda")]
 impl Bf16F32Plan {
     pub fn new(
@@ -122,6 +125,8 @@ pub(crate) enum Fp8ScaleRef {
 }
 
 impl Fp8ScaleRef {
+    #[cfg(test)]
+    #[cfg(feature = "cuda")]
     fn ptr(self) -> u64 {
         match self {
             Self::Bf16(t) => t.ptr,
@@ -130,6 +135,8 @@ impl Fp8ScaleRef {
         }
     }
 
+    #[cfg(test)]
+    #[cfg(feature = "cuda")]
     fn disjoint<T: Copy>(self, other: &Tensor<T, 2>) -> Result<()> {
         match self {
             Self::Bf16(t) => disjoint(&t, other),
@@ -230,10 +237,14 @@ pub(crate) struct Fp8Ops {
     #[cfg(feature = "rocm")]
     context: Arc<CudaContext>,
     fake_quant: CudaFunction,
-    block: [[CudaFunction; 2]; 2],
+    #[cfg(test)]
+    #[cfg(feature = "cuda")]
+    native_block: [[CudaFunction; 2]; 2],
 }
 
 /// Bound native codes/scales and prepared activations; storage remains caller-owned.
+#[cfg(test)]
+#[cfg(feature = "cuda")]
 pub(crate) struct Fp8BlockPlan {
     kernel: CudaFunction,
     grid: cudarc::driver::LaunchConfig,
@@ -241,6 +252,8 @@ pub(crate) struct Fp8BlockPlan {
     shape: [i32; 3],
 }
 
+#[cfg(test)]
+#[cfg(feature = "cuda")]
 impl Fp8BlockPlan {
     pub(crate) fn run(&self, stream: &Arc<CudaStream>) -> Result<()> {
         unsafe {
@@ -261,6 +274,7 @@ impl Fp8BlockPlan {
 }
 
 impl Fp8Ops {
+    #[cfg(test)]
     #[cfg(feature = "cuda")]
     pub(crate) fn bind_block(
         &self,
@@ -313,7 +327,7 @@ impl Fp8Ops {
         };
         ensure!(blocks <= i32::MAX as u64, "native FP8 grid extent overflow");
         Ok(Fp8BlockPlan {
-            kernel: self.block[family][usize::from(tiled)].clone(),
+            kernel: self.native_block[family][usize::from(tiled)].clone(),
             grid: super::ops::grid(blocks as usize, if tiled { 128 } else { 256 }),
             pointers: [
                 weight.ptr,
@@ -325,6 +339,7 @@ impl Fp8Ops {
             shape: [m as i32, n as i32, k as i32],
         })
     }
+    #[cfg(feature = "cuda")]
     pub(super) fn require_rows(&self, rows: usize) -> Result<()> {
         ensure!(
             rows > 0 && self.small.iter().all(|table| table.len() >= rows),
@@ -363,7 +378,8 @@ impl Fp8Ops {
                 module.load_function("fp8_dequant_bf16_per_channel")?,
             ],
             small: [load("")?, load("_per_channel")?],
-            block: [
+            #[cfg(test)]
+            native_block: [
                 [
                     module.load_function("fp8_block_f32_128_decode")?,
                     module.load_function("fp8_block_f32_128_mma")?,
@@ -418,7 +434,7 @@ impl Fp8Ops {
         else {
             anyhow::bail!("HIP native projection requires FP8 weight");
         };
-        Self::check(&codes, &scale, layout)?;
+        let scale = Self::check(&codes, scale, layout)?;
         validate_call(codes.shape, x, &y.0)?;
         disjoint(&codes, &y.0)?;
         disjoint(&scale, &y.0)?;
@@ -762,7 +778,7 @@ struct BoundProjection {
     #[cfg(feature = "cuda")]
     prefill: Tensor<bf16, 2>,
     #[cfg(feature = "rocm")]
-    calls: std::cell::RefCell<std::collections::BTreeMap<(u32, u64, u64), ChannelProjection>>,
+    calls: std::cell::RefCell<std::collections::BTreeMap<(u32, u64, u64), Fp8Projection>>,
     invariant_rows: usize,
 }
 /// Setup-bound views for a layer. Engine retains catalog/arena storage; run does
@@ -1083,7 +1099,9 @@ fn hip_projection_closure_excludes_native_and_invariant_calls() -> Result<()> {
         (
             LinearWeightRef::Fp8 {
                 codes: unsafe { Tensor::new(0x1000, [512, 2048], [2048, 1], 512 * 2048)? },
-                scale: unsafe { Tensor::new(0x2000, [512, 1], [1, 1], 512 * 2)? },
+                scale: Fp8ScaleRef::Bf16(unsafe {
+                    Tensor::new(0x2000, [512, 1], [1, 1], 512 * 2)?
+                }),
                 layout: Fp8ScaleLayout::PerChannel,
             },
             0,
@@ -1314,6 +1332,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "GPU native FP8 block-scale linear correctness"]
     fn fp8_native_block_linear_matches_fp64() -> Result<()> {
