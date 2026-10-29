@@ -10,7 +10,6 @@ use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::sync::Arc;
 /// Native BF16 operands with an unrounded FP32 output on the shared skinny tile.
-#[cfg(test)]
 #[cfg(feature = "cuda")]
 pub struct Bf16F32Plan {
     kernel: CudaFunction,
@@ -20,7 +19,6 @@ pub struct Bf16F32Plan {
     shape: [i32; 3],
 }
 
-#[cfg(test)]
 #[cfg(feature = "cuda")]
 fn bf16_f32_shape(
     input: Tensor<bf16, 2>,
@@ -68,7 +66,6 @@ fn bf16_f32_shape(
     Ok([rows as i32, columns as i32, width as i32])
 }
 
-#[cfg(test)]
 #[cfg(feature = "cuda")]
 impl Bf16F32Plan {
     pub fn new(
@@ -125,7 +122,6 @@ pub(crate) enum Fp8ScaleRef {
 }
 
 impl Fp8ScaleRef {
-    #[cfg(test)]
     #[cfg(feature = "cuda")]
     fn ptr(self) -> u64 {
         match self {
@@ -135,7 +131,6 @@ impl Fp8ScaleRef {
         }
     }
 
-    #[cfg(test)]
     #[cfg(feature = "cuda")]
     fn disjoint<T: Copy>(self, other: &Tensor<T, 2>) -> Result<()> {
         match self {
@@ -237,13 +232,11 @@ pub(crate) struct Fp8Ops {
     #[cfg(feature = "rocm")]
     context: Arc<CudaContext>,
     fake_quant: CudaFunction,
-    #[cfg(test)]
     #[cfg(feature = "cuda")]
     native_block: [[CudaFunction; 2]; 2],
 }
 
 /// Bound native codes/scales and prepared activations; storage remains caller-owned.
-#[cfg(test)]
 #[cfg(feature = "cuda")]
 pub(crate) struct Fp8BlockPlan {
     kernel: CudaFunction,
@@ -252,7 +245,6 @@ pub(crate) struct Fp8BlockPlan {
     shape: [i32; 3],
 }
 
-#[cfg(test)]
 #[cfg(feature = "cuda")]
 impl Fp8BlockPlan {
     pub(crate) fn run(&self, stream: &Arc<CudaStream>) -> Result<()> {
@@ -274,7 +266,6 @@ impl Fp8BlockPlan {
 }
 
 impl Fp8Ops {
-    #[cfg(test)]
     #[cfg(feature = "cuda")]
     pub(crate) fn bind_block(
         &self,
@@ -378,7 +369,6 @@ impl Fp8Ops {
                 module.load_function("fp8_dequant_bf16_per_channel")?,
             ],
             small: [load("")?, load("_per_channel")?],
-            #[cfg(test)]
             native_block: [
                 [
                     module.load_function("fp8_block_f32_128_decode")?,
