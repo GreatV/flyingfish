@@ -285,8 +285,44 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
     } else {
         const int kv_head = head - q_heads - kv_heads;
         const size_t dst = ((size_t)kv_head * capacity + cache_pos) * dim;
+        if constexpr (TABLE) {
+        float r[8];
+        float ssq = 0.0f;
+        if (gid < dim / 8) {
+            const __nv_bfloat16* p = qkv + base + (size_t)gid * 8;
+            union U { float4 x; __nv_bfloat162 h[4]; } u;
+            u.x = *reinterpret_cast<const float4*>(p);
 #pragma unroll
-        for (int d = gid; d < dim; d += nthr) v[dst + d] = qkv[base + d];
+            for (int j = 0; j < 8; ++j) {
+                float2 t = __bfloat1622float2(u.h[j >> 1]);
+                r[j] = (j & 1) ? t.y : t.x;
+                ssq += r[j] * r[j];
+            }
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) ssq += __shfl_xor_sync(FF_WARP_MASK, ssq, o);
+        if ((gid & 31) == 0) smem[gid >> 5] = ssq;
+        __syncthreads();
+        if (gid < 32) {
+            int nw = nthr >> 5;
+            float t = (gid < nw) ? smem[gid] : 0.0f;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) t += __shfl_xor_sync(FF_WARP_MASK, t, o);
+            if (gid == 0) smem[0] = t;
+        }
+        __syncthreads();
+        const float rstd = rsqrtf(smem[0] / (float)dim + eps);
+        if (gid < dim / 8) {
+            union O { float4 x; __nv_bfloat162 h[4]; } o;
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                o.h[j] = __floats2bfloat162_rn(r[2 * j] * rstd, r[2 * j + 1] * rstd);
+            *reinterpret_cast<float4*>(v + dst + (size_t)gid * 8) = o.x;
+        }
+        } else {
+#pragma unroll
+            for (int d = gid; d < dim; d += nthr) v[dst + d] = qkv[base + d];
+        }
     }
 }
 
