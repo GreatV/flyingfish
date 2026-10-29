@@ -268,6 +268,28 @@ impl RouteOps {
         score: crate::model_spec::RouterScore,
         routed_scaling: f32,
     ) -> Result<()> {
+        self.noaux(
+            logits,
+            bias,
+            ids,
+            weights,
+            (&self.noaux_topk, score, routed_scaling),
+        )
+    }
+
+    fn noaux<T, W>(
+        &self,
+        logits: Tensor<T, 2>,
+        bias: Option<Tensor<f32, 2>>,
+        ids: &mut TensorMut<i32, 2>,
+        weights: &mut TensorMut<W, 2>,
+        launch: (&CudaFunction, crate::model_spec::RouterScore, f32),
+    ) -> Result<()>
+    where
+        T: DeviceRepr + Copy + 'static,
+        W: DeviceRepr + Copy + 'static,
+    {
+        let (kernel, score, routed_scaling) = launch;
         let (rows, experts) = (logits.shape[0], logits.shape[1]);
         let top_k = ids.0.shape[1];
         if TypeId::of::<T>() == TypeId::of::<bf16>() {
@@ -346,7 +368,7 @@ impl RouteOps {
         };
         unsafe {
             self.stream
-                .launch_builder(&self.noaux_topk)
+                .launch_builder(kernel)
                 .arg(&logits.ptr)
                 .arg(&bias.ptr)
                 .arg(&ids.0.ptr)

@@ -80,8 +80,9 @@ pub struct MoeCombineResidual {
     pub y_out: Option<TensorMut<bf16, 2>>,
 }
 
-/// The fused peer join: the routed sum comes from the peer GPU; the
-/// shared-expert sigmoid gate and one output boundary are local.
+/// The fused peer join: the routed sum comes from the peer GPU, the
+/// shared-expert sigmoid gate and the residual add are local. The residual is
+/// read and written in place.
 pub struct MoeJoinRoutedResidual {
     /// `[rows, hidden]` routed sum produced by the peer (dense).
     pub routed_in: Tensor<bf16, 2>,

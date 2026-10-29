@@ -1283,7 +1283,7 @@ impl Engine {
             blas,
             flash,
             decode: None,
-            flint_logits: None,
+            logits_f32: None,
             device,
             config,
             model_spec,

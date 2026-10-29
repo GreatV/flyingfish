@@ -81,6 +81,45 @@ pub fn decode_e4m3(code: u8) -> f32 {
     f32::from_bits(sign | ((u32::from(exponent) + 120) << 23) | (u32::from(mantissa) << 20))
 }
 
+/// E4M3 code of a value in [-448, 448], round-to-nearest-even.
+pub fn encode_e4m3(value: f32) -> u8 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 31) & 1) as u8;
+    let magnitude = bits & 0x7FFF_FFFF;
+    if magnitude == 0 {
+        return sign << 7;
+    }
+    let exponent = ((magnitude >> 23) & 0xFF) as i32 - 127;
+    let mantissa = magnitude & 0x7F_FFFF;
+    if exponent < -6 {
+        // The E4M3 subnormal grid is m/512.
+        let scaled = f64::from(value.abs()) * 512.0;
+        let mut m = scaled.floor() as u64;
+        let fraction = scaled - m as f64;
+        if fraction > 0.5 || (fraction == 0.5 && (m & 1) == 1) {
+            m += 1;
+        }
+        if m >= 8 {
+            return (sign << 7) | 0x08;
+        }
+        return (sign << 7) | m as u8;
+    }
+    let mut e = exponent + 7;
+    let mut m = mantissa >> 20;
+    let rest = mantissa & 0xF_FFFF;
+    if rest > 0x8_0000 || (rest == 0x8_0000 && (m & 1) == 1) {
+        m += 1;
+        if m == 8 {
+            m = 0;
+            e += 1;
+        }
+    }
+    if e > 15 {
+        return (sign << 7) | 0x7E;
+    }
+    (sign << 7) | ((e as u8) << 3) | m as u8
+}
+
 pub fn effective_weight(code: u8, scale: bf16) -> bf16 {
     bf16::from_f32(decode_e4m3(code) * scale.to_f32())
 }

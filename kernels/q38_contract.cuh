@@ -1,5 +1,8 @@
 #pragma once
 #include "gpu_compat.cuh"
+#if !defined(__HIP__)
+#include <cuda_fp8.h>
+#endif
 #include <math.h>
 #include <stdint.h>
 struct Q38SequenceFields {
@@ -25,6 +28,12 @@ __device__ __forceinline__ void q38_meta_guard(const Q38SequenceMeta* s, bool ca
         s->reserved[0] || s->reserved[1] || s->reserved[2]) __trap();
 }
 
+// E8M0FN scale: the value is 2^(code - 127); 0xff is NaN.
+__device__ __forceinline__ float e8m0_decode(uint8_t code) {
+    if (code == 0xffu) return __uint_as_float(0x7fc00000u);
+    return ldexpf(1.0f, int(code) - 127);
+}
+
 __device__ __forceinline__ float e4m3_decode(uint8_t code) {
     const uint32_t sign = uint32_t(code & 0x80) << 24;
     const uint32_t mag = code & 0x7f;
@@ -46,3 +55,104 @@ __device__ __forceinline__ float fp8_channel_tile_unscale(__nv_bfloat16 channel_
     return __bfloat162float(channel_scale) < 0x1p-64f ? 0x1p-64f : 1.0f;
 }
 #endif
+
+// ceil(log2(v)) of a positive normal float, from its bit pattern.
+__device__ __forceinline__ int act_quant_log2_ceil(float v) {
+    const unsigned bits = __float_as_uint(v);
+    const int exponent = int((bits >> 23) & 0xFFu) - 127;
+    return exponent + ((bits & 0x7FFFFFu) != 0u ? 1 : 0);
+}
+
+// 2^exponent.
+__device__ __forceinline__ float act_quant_pow2(int exponent) {
+    return __uint_as_float((unsigned)(exponent + 127) << 23);
+}
+
+// One 32-element activation-quant group, each lane owning one element: the amax
+// is floored at 1e-4, the E8M0 scale is 2^ceil(log2(amax/448)) and the code is
+// E4M3 round-to-nearest-even of value/scale clamped to +-448 (model definition,
+// publisher kernel.py act_quant, block 32, scale_fmt "ue8m0"). Shared by the
+// W4A8/W8A8 expert paths and the DeepSeek-V4.1 latent ring and attention-output
+// quantization.
+#if !defined(__HIP__)
+__device__ __forceinline__ void act_quant32(float value, unsigned char* code,
+                                            unsigned char* scale_code) {
+    float amax = fabsf(value);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+    amax = fmaxf(amax, 1e-4f);
+    const int exponent = act_quant_log2_ceil(amax * (1.0f / 448.0f));
+    if (exponent < -127 || exponent > 127) {
+        printf("act_quant32 trap value=%f amax=%f exponent=%d block=%u thread=%u\n",
+               value, amax, exponent, blockIdx.x, threadIdx.x);
+        __trap();
+    }
+    const float scale = act_quant_pow2(exponent);
+    *code = __nv_cvt_float_to_fp8(
+        fminf(448.0f, fmaxf(-448.0f, value / scale)), __NV_SATFINITE, __NV_E4M3);
+    *scale_code = (unsigned char)(exponent + 127);
+}
+
+// E2M1 nibble magnitude and sign; both signed zeros are preserved.
+__device__ __forceinline__ float e2m1_decode(uint8_t code) {
+    const int magnitude = code & 7;
+    const float value = magnitude < 4 ? float(magnitude) * 0.5f
+        : magnitude == 4 ? 2.0f : magnitude == 5 ? 3.0f
+        : magnitude == 6 ? 4.0f : 6.0f;
+    return __uint_as_float(__float_as_uint(value) | (uint32_t(code & 8) << 28));
+}
+
+__device__ __forceinline__ uint8_t e2m1_encode(float value) {
+    const float magnitude = fabsf(value);
+    const uint8_t code = magnitude <= 0.25f ? 0 : magnitude < 0.75f ? 1
+        : magnitude <= 1.25f ? 2 : magnitude < 1.75f ? 3
+        : magnitude <= 2.5f ? 4 : magnitude < 3.5f ? 5
+        : magnitude <= 5.0f ? 6 : 7;
+    return code | uint8_t((__float_as_uint(value) >> 28) & 8);
+}
+
+// All 32 lanes participate; a 16-wide specialization reduces each half-warp separately.
+template<int Block, bool PowerOfTwoScale>
+__device__ __forceinline__ void fp4_act_quant(
+    float value, uint8_t* code, uint8_t* scale_code) {
+    static_assert((Block == 16 && !PowerOfTwoScale) || (Block == 32 && PowerOfTwoScale));
+    if (!isfinite(value)) __trap();
+    float amax = fabsf(value);
+#pragma unroll
+    for (int offset = Block / 2; offset > 0; offset >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offset));
+    const float unrounded = __fdiv_rn(amax, 6.0f);
+    float scale;
+    if constexpr (PowerOfTwoScale) {
+        const int exponent = act_quant_log2_ceil(fmaxf(unrounded, 0x1p-126f));
+        if (exponent > 127) __trap();
+        *scale_code = uint8_t(exponent + 127);
+        scale = act_quant_pow2(exponent);
+    } else {
+        uint8_t rounded = __nv_cvt_float_to_fp8(unrounded, __NV_SATFINITE, __NV_E4M3);
+        *scale_code = rounded == 0 ? 1 : rounded;
+        scale = e4m3_decode(*scale_code);
+    }
+    *code = e2m1_encode(__fdiv_rn(value, scale));
+}
+#endif
+
+// Two E4M3 codes per call. E4M3 is a subset of FP16, so the hardware form is
+// exact for all 256 codes; the fix-up forces the canonical NaN for both NaN codes.
+__device__ __forceinline__ float2 e4m3_decode_pair(uint16_t packed) {
+#if __CUDA_ARCH__ >= 890
+    uint32_t halfs;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(halfs) : "h"(packed));
+    float2 values = make_float2(__half2float(__ushort_as_half(uint16_t(halfs))),
+                               __half2float(__ushort_as_half(uint16_t(halfs >> 16))));
+    const uint32_t low = packed & 255u, high = packed >> 8;
+    if ((low & 127u) == 127u)
+        values.x = __uint_as_float(((low & 128u) << 24) | 0x7fc00000u);
+    if ((high & 127u) == 127u)
+        values.y = __uint_as_float(((high & 128u) << 24) | 0x7fc00000u);
+    return values;
+#else
+    return make_float2(e4m3_decode(uint8_t(packed)), e4m3_decode(uint8_t(packed >> 8)));
+#endif
+}

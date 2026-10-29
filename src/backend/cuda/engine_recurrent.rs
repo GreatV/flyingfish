@@ -792,7 +792,7 @@ impl Engine {
             blas,
             flash: Some(flash),
             decode: Some(decode),
-            flint_logits: None,
+            logits_f32: None,
             device,
             config,
             model_spec,

@@ -6,7 +6,7 @@ use super::{
     closure::Closure,
     contracts::{RowDomain, Scratch, SeqRef, Tensor, TensorMut},
     cubin,
-    linear::{Fp8Ops, LinearWeightRef},
+    linear::{Fp8Ops, Fp8ScaleRef, LinearWeightRef},
     moe::testing::view,
     ops::{
         CommonOpsRef, GatedRmsInput, GdnGateBindings, Ops, ResidualRmsInput, RmsMode, RmsOptions,
@@ -138,7 +138,7 @@ fn q38_primitives_gpu() -> Result<()> {
             let w = view(&wb, s, [n, k], [u64::from(k), 1])?;
             let sc = view(&sb, s, shape, [u64::from(shape[1]), 1])?;
             let mut out = TensorMut(view(&y, s, [n, k], [u64::from(k), 1])?);
-            fp8.materialize(s, w, sc, layout, &mut out)?;
+            fp8.materialize(s, w, Fp8ScaleRef::Bf16(sc), layout, &mut out)?;
             let got = s.clone_dtoh(&y)?;
             for row in 0..n {
                 for col in 0..k {
@@ -166,7 +166,7 @@ fn q38_primitives_gpu() -> Result<()> {
                 let mut permuted = scales.clone();
                 permuted.rotate_left(1);
                 s.memcpy_htod(&permuted, &mut sb)?;
-                fp8.materialize(s, w, sc, layout, &mut out)?;
+                fp8.materialize(s, w, Fp8ScaleRef::Bf16(sc), layout, &mut out)?;
                 let wrong = s.clone_dtoh(&y)?;
                 let differences = got
                     .iter()
@@ -216,7 +216,7 @@ fn q38_primitives_gpu() -> Result<()> {
         fp8.materialize(
             s,
             w,
-            sc,
+            Fp8ScaleRef::Bf16(sc),
             Fp8ScaleLayout::Block(
                 crate::fp8::Fp8BlockScale::new([128, 128], safetensors::Dtype::BF16)
                     .expect("valid BF16 block scale"),
@@ -268,7 +268,7 @@ fn q38_primitives_gpu() -> Result<()> {
                                 .expect("valid BF16 block scale"),
                         ),
                         codes: w,
-                        scale: sc,
+                        scale: Fp8ScaleRef::Bf16(sc),
                     },
                     x,
                     &mut y,
@@ -338,7 +338,7 @@ fn q38_primitives_gpu() -> Result<()> {
                     LinearWeightRef::Fp8 {
                         layout,
                         codes: codes_view,
-                        scale: scales_view,
+                        scale: Fp8ScaleRef::Bf16(scales_view),
                     },
                     x,
                     &mut y,
@@ -390,7 +390,7 @@ fn q38_primitives_gpu() -> Result<()> {
                         LinearWeightRef::Fp8 {
                             layout,
                             codes: codes_view,
-                            scale: scales_view,
+                            scale: Fp8ScaleRef::Bf16(scales_view),
                         },
                         x,
                         &mut y,
@@ -486,7 +486,7 @@ fn q38_primitives_gpu() -> Result<()> {
             fp8.materialize(
                 s,
                 w,
-                sc,
+                Fp8ScaleRef::Bf16(sc),
                 Fp8ScaleLayout::Block(
                     crate::fp8::Fp8BlockScale::new([128, 128], safetensors::Dtype::BF16)
                         .expect("valid BF16 block scale"),
@@ -525,7 +525,7 @@ fn q38_primitives_gpu() -> Result<()> {
                                 .expect("valid BF16 block scale"),
                             ),
                             codes: w,
-                            scale: sc,
+                            scale: Fp8ScaleRef::Bf16(sc),
                         },
                     ),
                 ] {
@@ -928,7 +928,7 @@ fn verify_projection_m4(
                 .expect("valid BF16 block scale"),
         ),
         codes: codes_view,
-        scale: scales_view,
+        scale: Fp8ScaleRef::Bf16(scales_view),
     };
     let batch_x = view(
         &row_buffer,
@@ -3845,7 +3845,7 @@ fn residual_rms_capture_gpu() -> Result<()> {
                             )?;
                         }
                     }
-                    RmsMode::Standard => {
+                    RmsMode::Standard | RmsMode::Unrounded => {
                         for row in 1..=active {
                             let offset = (row * hidden * size_of::<bf16>()) as u64;
                             let rp = baseline_view.0.ptr + offset;

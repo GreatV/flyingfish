@@ -183,8 +183,21 @@ __device__ void moe_route_select_sigmoid(
   }
 }
 
+// The routed weight's storage type: FP32 where the definition multiplies by an
+// FP32 weight (model.py Expert.forward), BF16 for the paths that round it.
+template <class Weight>
+__device__ __forceinline__ void moe_route_weight_store(
+    Weight* __restrict__ weights, size_t index, float value) {
+  if constexpr (sizeof(Weight) == sizeof(float)) {
+    weights[index] = value;
+  } else {
+    weights[index] = __float2bfloat16(value);
+  }
+}
+
+template <class Weight>
 __device__ __forceinline__ void moe_route_select_noaux(
-    float logit, float bias, int* __restrict__ ids, bf16* __restrict__ weights,
+    float logit, float bias, int* __restrict__ ids, Weight* __restrict__ weights,
     int experts, int top_k, int score_mode, float routed_scaling) {
   const int tid = threadIdx.x;
   const int nthr = (int)blockDim.x;
@@ -246,8 +259,9 @@ __device__ __forceinline__ void moe_route_select_noaux(
 
   if (tid < top_k) {
     ids[(size_t)row * top_k + tid] = s_sel_id[tid];
-    weights[(size_t)row * top_k + tid] =
-        __float2bfloat16((s_sel_p[tid] / (s_tsum + 1.0e-20f)) * routed_scaling);
+    moe_route_weight_store(
+        weights, (size_t)row * top_k + tid,
+        (s_sel_p[tid] / (s_tsum + 1.0e-20f)) * routed_scaling);
   }
 }
 
@@ -448,6 +462,33 @@ extern "C" __global__ void moe_route_topk_noaux(
       !isfinite(routed_scaling) || routed_scaling <= 0.0f ||
       (reinterpret_cast<uintptr_t>(logits) & 3) != 0 ||
       (reinterpret_cast<uintptr_t>(bias) & 3) != 0)
+    __trap();
+
+  const int tid = threadIdx.x;
+  const int row = blockIdx.x;
+  float logit = -INFINITY;
+  float correction = 0.0f;
+  if (tid < experts) {
+    logit = logits[(size_t)row * experts + tid];
+    correction = bias[(size_t)row * experts + tid];
+  }
+  moe_route_select_noaux(logit, correction, ids, weights, experts, top_k,
+                         score_mode, routed_scaling);
+}
+
+// The same selection with FP32 routed weights (model.py Gate.forward returns
+// FP32 scores; Expert.forward multiplies by them in FP32).
+extern "C" __global__ void moe_route_topk_noaux_f32(
+    const float* __restrict__ logits, const float* __restrict__ bias,
+    int* __restrict__ ids, float* __restrict__ weights, int rows, int experts,
+    int top_k, int score_mode, float routed_scaling) {
+  if ((int)blockIdx.x >= rows || experts < 1 || experts > 1024 || top_k < 1 ||
+      top_k > 32 || top_k > experts || (blockDim.x & 31) != 0 ||
+      (int)blockDim.x < experts || score_mode < 0 || score_mode > 1 ||
+      !isfinite(routed_scaling) || routed_scaling <= 0.0f ||
+      (reinterpret_cast<uintptr_t>(logits) & 3) != 0 ||
+      (reinterpret_cast<uintptr_t>(bias) & 3) != 0 ||
+      (reinterpret_cast<uintptr_t>(weights) & 3) != 0)
     __trap();
 
   const int tid = threadIdx.x;
