@@ -1438,19 +1438,22 @@ impl Runtime {
                             .geometry
                             .context("Gemma 4 attention geometry missing")?;
                         let full = geometry.head_dim == 512;
-                        BoundMixer::Gemma {
-                            flash: Flash::new_with_score(
-                                s.clone(),
-                                rows,
-                                engine.model_spec.q_heads as usize,
-                                engine.model_spec.kv_heads as usize,
-                                geometry.head_dim as usize,
-                                Score::from_tokens(
-                                    1.0,
-                                    layout.sliding_window.map(|window| window as usize),
-                                )?,
-                                engine.capacity,
+                        let mut flash = Flash::new_with_score(
+                            s.clone(),
+                            rows,
+                            engine.model_spec.q_heads as usize,
+                            engine.model_spec.kv_heads as usize,
+                            geometry.head_dim as usize,
+                            Score::from_tokens(
+                                1.0,
+                                layout.sliding_window.map(|window| window as usize),
                             )?,
+                            engine.capacity,
+                        )?;
+                        #[cfg(feature = "cuda")]
+                        flash.bind_position(&work.position)?;
+                        BoundMixer::Gemma {
+                            flash,
                             q_norm: weight("self_attn.q_norm.weight")?,
                             k_norm: if geometry.kv_reader {
                                 None

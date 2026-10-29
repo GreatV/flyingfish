@@ -26,6 +26,15 @@ pub struct Attention {
     q_heads: u32,
     group: u32,
     start: u32,
+    position: *const u32,
+}
+
+#[inline(always)]
+unsafe fn resolve_position(mut p: Attention) -> Attention {
+    if !p.position.is_null() {
+        unsafe { p.start = *p.position };
+    }
+    p
 }
 
 #[inline(always)]
@@ -266,6 +275,7 @@ unsafe fn copy_kv<const D: usize, const MASK: bool>(
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
     unsafe {
+        let p = resolve_position(p);
         attention::<256, 32, 0>(p, p.start + p.rows, 0, 0.0625);
     }
 }
@@ -275,6 +285,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128(p: Attention) {
     unsafe {
+        let p = resolve_position(p);
         attention::<128, 16, 0>(
             p,
             p.start + p.rows,
@@ -289,6 +300,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d128(p: Attention) {
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128_bidirectional(p: Attention, keys: u32) {
     unsafe {
+        let p = resolve_position(p);
         attention::<128, 16, 1>(p, keys, 0, core::f32::consts::FRAC_1_SQRT_2 / 8.0);
     }
 }
@@ -298,6 +310,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d128_bidirectional(p: Attent
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128_prefix(p: Attention, prefix: u32) {
     unsafe {
+        let p = resolve_position(p);
         attention::<128, 16, 2>(
             p,
             prefix.max(p.start + p.rows),
@@ -316,6 +329,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_window(
     scale: f32,
 ) {
     unsafe {
+        let p = resolve_position(p);
         attention::<256, 32, 3>(p, p.start + p.rows, window, scale);
     }
 }
@@ -325,6 +339,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_window(
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128_window(p: Attention, window: u32) {
     unsafe {
+        let p = resolve_position(p);
         attention::<128, 16, 3>(
             p,
             p.start + p.rows,
@@ -775,7 +790,10 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
 /// Launch uses 128 threads, 90112 shared bytes and buffers covering the declared extents.
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d512(p: Attention, scale: f32) {
-    unsafe { attention_d512::<false>(p, scale, core::ptr::null_mut(), 1, 0) }
+    unsafe {
+        let p = resolve_position(p);
+        attention_d512::<false>(p, scale, core::ptr::null_mut(), 1, 0)
+    }
 }
 
 /// # Safety
@@ -788,7 +806,10 @@ pub unsafe extern "ptx-kernel" fn attention_partial_d512(
     parts: u32,
     chunk: u32,
 ) {
-    unsafe { attention_d512::<true>(p, scale, partials, parts, chunk) }
+    unsafe {
+        let p = resolve_position(p);
+        attention_d512::<true>(p, scale, partials, parts, chunk)
+    }
 }
 
 #[inline(always)]

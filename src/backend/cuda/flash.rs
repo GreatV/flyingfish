@@ -91,6 +91,7 @@ pub struct Flash {
     tile: usize,
     shared: u32,
     split: Option<Split>,
+    position: u64,
 }
 
 struct Split {
@@ -195,6 +196,8 @@ struct Attention {
     q_heads: u32,
     group: u32,
     start: u32,
+    #[cfg(feature = "cuda")]
+    position: u64,
 }
 unsafe impl DeviceRepr for Attention {}
 
@@ -456,7 +459,16 @@ impl Flash {
             tile,
             shared: dynamic_shared,
             split,
+            position: 0,
         })
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn bind_position(&mut self, position: &CudaSlice<i32>) -> Result<()> {
+        ensure!(position.len() == 1, "attention position must be scalar");
+        let (ptr, _position) = position.device_ptr(&self.stream);
+        self.position = ptr;
+        Ok(())
     }
 
     /// Runs prefill attention on one chunk. `q` is the normed, RoPE'd `[rows, q_heads,
@@ -637,6 +649,8 @@ impl Flash {
                 q_heads: shape.q_heads as u32,
                 group: (shape.q_heads / shape.kv_heads) as u32,
                 start: shape.start as u32,
+                #[cfg(feature = "cuda")]
+                position: self.position,
             };
             if let Some(split) = &mut self.split {
                 ensure!(
@@ -852,6 +866,12 @@ mod tests {
 
     #[test]
     fn native_prefill_parameter_layout() {
+        #[cfg(feature = "cuda")]
+        {
+            assert_eq!(std::mem::size_of::<Attention>(), 72);
+            assert_eq!(std::mem::offset_of!(Attention, position), 64);
+        }
+        #[cfg(not(feature = "cuda"))]
         assert_eq!(std::mem::size_of::<Attention>(), 64);
         assert_eq!(std::mem::align_of::<Attention>(), 8);
         assert_eq!(std::mem::offset_of!(Attention, rows), 40);
