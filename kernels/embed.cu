@@ -39,15 +39,16 @@ extern "C" __global__ void per_layer_input(const uint32_t* ids,
     const int row = blockIdx.x / layers;
     const int layer = blockIdx.x % layers;
     if (row >= rows) return;
-    const size_t base = ((size_t)row * layers + layer) * width;
+    const size_t context_base = ((size_t)row * layers + layer) * width;
+    const size_t out_base = ((size_t)layer * rows + row) * width;
     const size_t token = (size_t)ids[row] * layers * width + (size_t)layer * width;
     const __nv_bfloat16 is = __float2bfloat16_rn(identity_scale);
     const __nv_bfloat16 cs = __float2bfloat16_rn(context_scale);
     __shared__ float partial[4];
     float sum = 0.0f;
     for (int d = threadIdx.x; d < width; d += blockDim.x) {
-        out[base + d] = __hmul(table[token + d], is);
-        const float x = __bfloat162float(__hmul(context[base + d], cs));
+        out[out_base + d] = __hmul(table[token + d], is);
+        const float x = __bfloat162float(__hmul(context[context_base + d], cs));
         sum += x * x;
     }
     for (int offset = 16; offset > 0; offset >>= 1)
@@ -63,8 +64,8 @@ extern "C" __global__ void per_layer_input(const uint32_t* ids,
     const float rstd = rsqrtf(partial[0] / width + eps);
     const __nv_bfloat16 combine = __float2bfloat16_rn(combine_scale);
     for (int d = threadIdx.x; d < width; d += blockDim.x) {
-        const float x = __bfloat162float(__hmul(context[base + d], cs));
+        const float x = __bfloat162float(__hmul(context[context_base + d], cs));
         const __nv_bfloat16 n = __float2bfloat16_rn(x * rstd * __bfloat162float(wn[d]));
-        out[base + d] = __hmul(__hadd(n, out[base + d]), combine);
+        out[out_base + d] = __hmul(__hadd(n, out[out_base + d]), combine);
     }
 }
