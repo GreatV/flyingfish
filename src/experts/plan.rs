@@ -437,7 +437,11 @@ pub fn staging_capacity(
         .context("native copy stage bytes overflow")?;
     let host_expert_bytes = host_bytes
         .checked_sub(host_io)
-        .context("native host budget cannot hold copy stages")?;
+        .with_context(|| {
+            format!(
+                "native host budget cannot hold copy stages: host_bytes={host_bytes} slot={slot} copies={copies} required={host_io}"
+            )
+        })?;
     let non_gpu = total - slots;
     let (host_blocks, spare_blocks) = if non_gpu == 0 {
         (0, 0)

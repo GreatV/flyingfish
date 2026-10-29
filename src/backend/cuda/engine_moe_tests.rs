@@ -627,6 +627,66 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
         );
         write("proc/self/status", "VmRSS: invalid kB\n")?;
         ensure!(super::host_memory(&root).is_err(), "invalid RSS admitted");
+        write("proc/meminfo", "MemAvailable: 886853164 kB\n")?;
+        write("sys/fs/cgroup/job/memory.max", "128849018880\n")?;
+        write("sys/fs/cgroup/job/memory.current", "107595685888\n")?;
+        write(
+            "sys/fs/cgroup/job/memory.stat",
+            "file 106297856000\nshmem 8192\n",
+        )?;
+        write("proc/self/status", "VmRSS: 1973172 kB\n")?;
+        let model = crate::model_spec::ModelSpec::glm5_next(
+            &serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/data/glm53-flash-config.json"
+            )))?,
+            &serde_json::Value::Null,
+        )?;
+        let geometry = ExpertGeometry::from_model(&model)?;
+        let layout = ExpertLayout::new(
+            model.expert_format.context("GLM format missing")?,
+            &geometry,
+        )?;
+        let slot = layout.slot_bytes();
+        ensure!(slot == 25_171_968, "GLM native slot extent changed");
+        for limit in [42_949_672_960u64, 40] {
+            write(
+                "proc/self/limits",
+                &format!("Max resident set {limit} {limit} bytes\n"),
+            )?;
+            let host = super::host_memory(&root)?;
+            let host_bytes = host - host / 16;
+            let capacity = crate::experts::plan::staging_capacity(
+                geometry,
+                layout.clone(),
+                8,
+                79_600_893_952,
+                host_bytes,
+                2,
+            );
+            if limit == 40 {
+                ensure!(host == 0, "exhausted 40-byte RSS limit admitted");
+                let error = capacity.expect_err("40-byte RSS limit admitted staging");
+                ensure!(
+                    error
+                        .to_string()
+                        .ends_with("host_bytes=0 slot=25171968 copies=2 required=151031808"),
+                    "native staging failure omits budget operands: {error}"
+                );
+            } else {
+                ensure!(host == 40_929_144_832, "GLM process headroom changed");
+                ensure!(host_bytes == 38_371_073_280, "GLM host reserve changed");
+                let (capacity, _) = capacity?;
+                ensure!(
+                    u64::from(capacity.host_blocks + capacity.spare_blocks + 6) * slot
+                        <= host_bytes,
+                    "GLM host allocation exceeds retained headroom"
+                );
+            }
+        }
+        println!(
+            "PASS glm_host_staging rss_bytes=42949672960 sampled_rss_bytes=2020528128 host_bytes=38371073280 slot=25171968 copies=2 required=151031808 malformed_rss_bytes=40 rejected=true"
+        );
         write(
             "proc/self/limits",
             "Max resident set unlimited unlimited bytes\n",
