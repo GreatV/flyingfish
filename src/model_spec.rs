@@ -115,6 +115,21 @@ pub struct Glm5NextConfig {
     pub swiglu_limit: f32,
     pub routed_scaling_factor: f32,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DeepseekSelectionShape {
+    pub index_topk: u32,
+    pub candidate_topk_blocks: u32,
+    pub candidate_block_size: u32,
+}
+
+impl DeepseekSelectionShape {
+    pub(crate) const IMPLEMENTED: Self = Self {
+        index_topk: 512,
+        candidate_topk_blocks: 2048,
+        candidate_block_size: 8,
+    };
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeepseekV41Config {
@@ -139,6 +154,7 @@ pub struct DeepseekV41Config {
     pub routed_scaling_factor: f32,
     pub index_heads: u32,
     pub index_head_dim: u32,
+    pub selection: DeepseekSelectionShape,
     pub kv_source_layer_ids: Vec<u32>,
     pub index_source_layer_ids: Vec<u32>,
     pub candidate_source_layer_id: u32,
@@ -2144,9 +2160,33 @@ impl ModelSpec {
             .context("shared expert width overflow")?;
         let index_heads = positive(t, "index_n_heads")?;
         let index_head_dim = positive(t, "index_head_dim")?;
-        positive(t, "index_topk")?;
-        positive(t, "candidate_topk_blocks")?;
-        positive(t, "candidate_block_size")?;
+        let index_topk = positive(t, "index_topk")?;
+        let candidate_topk_blocks = positive(t, "candidate_topk_blocks")?;
+        let candidate_block_size = positive(t, "candidate_block_size")?;
+        let implemented = DeepseekSelectionShape::IMPLEMENTED;
+        ensure!(
+            index_topk == implemented.index_topk,
+            "index_topk {} differs from implemented {}",
+            index_topk,
+            implemented.index_topk
+        );
+        ensure!(
+            candidate_topk_blocks == implemented.candidate_topk_blocks,
+            "candidate_topk_blocks {} differs from implemented {}",
+            candidate_topk_blocks,
+            implemented.candidate_topk_blocks
+        );
+        ensure!(
+            candidate_block_size == implemented.candidate_block_size,
+            "candidate_block_size {} differs from implemented {}",
+            candidate_block_size,
+            implemented.candidate_block_size
+        );
+        let selection = DeepseekSelectionShape {
+            index_topk,
+            candidate_topk_blocks,
+            candidate_block_size,
+        };
         let kv_source_layer_ids = integer_array(t, "kv_source_layer_ids", depth)?;
         let index_source_layer_ids = integer_array(t, "index_source_layer_ids", depth)?;
         let candidate_source_layer_id = integer(t, "candidate_source_layer_id")?;
@@ -2313,6 +2353,7 @@ impl ModelSpec {
                 routed_scaling_factor,
                 index_heads,
                 index_head_dim,
+                selection,
                 kv_source_layer_ids,
                 index_source_layer_ids,
                 candidate_source_layer_id,

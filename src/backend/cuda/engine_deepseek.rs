@@ -2914,10 +2914,15 @@ impl Engine {
             s,
         )?);
         let row_bytes = crate::work_layout::RowWorkSpec::new(&model_spec)?.row_bytes()?;
+        let dsa_shape = model_spec
+            .deepseek_v41
+            .as_ref()
+            .context("DSA geometry missing")?
+            .selection;
         let fixed = dense_bytes
             .checked_add(state.bytes())
             .and_then(|n| n.checked_add(workspace_rows * row_bytes))
-            .and_then(|n| n.checked_add(dsa::scratch_bytes(workspace_rows, capacity)))
+            .and_then(|n| n.checked_add(dsa::scratch_bytes(workspace_rows, capacity, &dsa_shape)))
             .and_then(|n| n.checked_add(512 * 1024 * 1024))
             .context("DeepSeek-V4.1 fixed residency overflow")?;
         let (free, total) = device.ctx.mem_get_info()?;
@@ -3621,7 +3626,8 @@ mod tests {
                 kv.owner
             );
         }
-        let selection_rows = model_spec
+        let selection_rows = engine
+            .model_spec
             .deepseek_v41
             .as_ref()
             .context("DSA geometry missing")?

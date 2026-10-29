@@ -68,6 +68,14 @@ fn deepseek41_normalizes_geometry_and_quant_formats() {
     assert_eq!(ds.swiglu_limit, 10.0);
     assert_eq!(ds.routed_scaling_factor, 1.5);
     assert_eq!((ds.index_heads, ds.index_head_dim), (32, 128));
+    assert_eq!(
+        (
+            ds.selection.index_topk,
+            ds.selection.candidate_topk_blocks,
+            ds.selection.candidate_block_size
+        ),
+        (512, 2048, 8)
+    );
     assert_eq!(ds.kv_source_layer_ids, vec![2u32, 8, 14, 20]);
     assert_eq!(
         ds.index_source_layer_ids,
@@ -113,6 +121,9 @@ fn deepseek41_rejects_unsupported_semantics() {
         ("/text_config/sliding_window", json!(0)),
         ("/text_config/rope_scaling/factor", json!(8)),
         ("/text_config/n_routed_experts", json!(0)),
+        ("/text_config/index_topk", json!(256)),
+        ("/text_config/candidate_topk_blocks", json!(1024)),
+        ("/text_config/candidate_block_size", json!(4)),
     ] {
         let mut bad = root();
         *bad.pointer_mut(pointer).unwrap() = value;
@@ -121,6 +132,14 @@ fn deepseek41_rejects_unsupported_semantics() {
             "{pointer}"
         );
     }
+    let mut bad = root();
+    bad["text_config"]["index_topk"] = json!(256);
+    let error = ModelSpec::deepseek_v41(&bad, &json!({}))
+        .expect_err("an unsupported index_topk was accepted");
+    assert!(
+        error.to_string() == "index_topk 256 differs from implemented 512",
+        "{error}"
+    );
     let mut bad = root();
     bad["text_config"]["unknown"] = Value::Null;
     assert!(ModelSpec::deepseek_v41(&bad, &json!({})).is_err());

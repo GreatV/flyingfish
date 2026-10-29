@@ -470,6 +470,8 @@ impl LatentCompressedState {
             spec.head_dim == 512 && ds.index_head_dim == 128 && ds.index_heads == 32,
             "latent compressed geometry requires D512 and index32x128"
         );
+        let index_topk = ds.selection.index_topk as usize;
+        let candidate_blocks = ds.selection.candidate_topk_blocks as usize;
         let mut kv = Vec::new();
         let mut index = Vec::new();
         for (layer, mapping) in owners.iter().enumerate() {
@@ -493,7 +495,7 @@ impl LatentCompressedState {
             if mapping.index == layer {
                 index.push(LatentSelection {
                     owner: layer,
-                    positions: s.clone_htod(&vec![-1; rows * 512])?,
+                    positions: s.clone_htod(&vec![-1; rows * index_topk])?,
                     ticket: s.alloc_zeros(5)?,
                 });
             }
@@ -502,7 +504,7 @@ impl LatentCompressedState {
             owners,
             kv,
             index,
-            candidates: s.clone_htod(&vec![-1; rows * 2048])?,
+            candidates: s.clone_htod(&vec![-1; rows * candidate_blocks])?,
             candidate_ticket: s.alloc_zeros(5)?,
             generation: s.clone_htod(&[1u32])?,
             generation_value: 1,

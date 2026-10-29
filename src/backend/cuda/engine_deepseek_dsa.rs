@@ -16,7 +16,14 @@ use std::collections::BTreeMap;
 
 pub(super) type Weights = BTreeMap<String, CudaSlice<u8>>;
 
-pub(super) fn scratch_bytes(rows: usize, capacity: usize) -> usize {
+pub(super) fn scratch_bytes(
+    rows: usize,
+    capacity: usize,
+    shape: &crate::model_spec::DeepseekSelectionShape,
+) -> usize {
+    let index_topk = shape.index_topk as usize;
+    let candidate_blocks = shape.candidate_topk_blocks as usize;
+    let candidate_block_size = shape.candidate_block_size as usize;
     32 + rows
         * (64 * 4
             + 2 * 512 * 4
@@ -28,13 +35,13 @@ pub(super) fn scratch_bytes(rows: usize, capacity: usize) -> usize {
             + 32
             + 64
             + 4
-            + 2048
+            + candidate_blocks
             + 128
             + capacity * 8
             + 16384 * 8
-            + capacity.div_ceil(8) * 8
-            + 2047 * 8
-            + 512 * 8
+            + capacity.div_ceil(candidate_block_size) * 8
+            + (candidate_blocks - 1) * 8
+            + index_topk * 8
             + 4)
 }
 
@@ -216,7 +223,15 @@ struct Scratch {
     margins: CudaSlice<f32>,
 }
 impl Scratch {
-    fn new(s: &Arc<CudaStream>, rows: usize, capacity: usize) -> Result<Self> {
+    fn new(
+        s: &Arc<CudaStream>,
+        rows: usize,
+        capacity: usize,
+        shape: &crate::model_spec::DeepseekSelectionShape,
+    ) -> Result<Self> {
+        let index_topk = shape.index_topk as usize;
+        let candidate_blocks = shape.candidate_topk_blocks as usize;
+        let candidate_block_size = shape.candidate_block_size as usize;
         Ok(Self {
             group_meta: s.alloc_zeros(8)?,
             group_angles: s.alloc_zeros(rows * 64)?,
@@ -236,12 +251,12 @@ impl Scratch {
             full_ids: s.alloc_zeros(rows * capacity)?,
             restricted_scores: s.alloc_zeros(rows * 16384)?,
             restricted_ids: s.alloc_zeros(rows * 16384)?,
-            block_scores: s.alloc_zeros(rows * capacity.div_ceil(8))?,
-            block_ids: s.alloc_zeros(rows * capacity.div_ceil(8))?,
-            block_selected_scores: s.alloc_zeros(rows * 2047)?,
-            block_selected_ids: s.alloc_zeros(rows * 2047)?,
-            selected_scores: s.alloc_zeros(rows * 512)?,
-            selected_ids: s.alloc_zeros(rows * 512)?,
+            block_scores: s.alloc_zeros(rows * capacity.div_ceil(candidate_block_size))?,
+            block_ids: s.alloc_zeros(rows * capacity.div_ceil(candidate_block_size))?,
+            block_selected_scores: s.alloc_zeros(rows * (candidate_blocks - 1))?,
+            block_selected_ids: s.alloc_zeros(rows * (candidate_blocks - 1))?,
+            selected_scores: s.alloc_zeros(rows * index_topk)?,
+            selected_ids: s.alloc_zeros(rows * index_topk)?,
             margins: s.alloc_zeros(rows)?,
         })
     }
@@ -477,7 +492,16 @@ impl Runtime {
             .map(|v| v.codes.len() / 256)
             .max()
             .context("DSA KV owners absent")?;
-        let scratch = Scratch::new(&device.stream, compressed.rows, capacity)?;
+        let scratch = Scratch::new(
+            &device.stream,
+            compressed.rows,
+            capacity,
+            &spec
+                .deepseek_v41
+                .as_ref()
+                .context("DSA geometry missing")?
+                .selection,
+        )?;
         let bind = Binding {
             device,
             blas,
@@ -830,6 +854,7 @@ impl Binding<'_> {
             .context("DSA index owner missing")?;
         let capacity = (kv.codes.len() / 256) as u32;
         let rows = rows as u32;
+        let ds = spec.deepseek_v41.as_ref().context("DSA geometry missing")?;
         let seq = self.state.seq_ref(s)?;
         let qrank = self.mixer.geometry.q_lora as u32;
         let query = dense(&a.query, s, [rows, 4096])?;
@@ -891,11 +916,7 @@ impl Binding<'_> {
                 },
             })
         };
-        let candidate_owner = spec
-            .deepseek_v41
-            .as_ref()
-            .context("DSA geometry missing")?
-            .candidate_source_layer_id as usize;
+        let candidate_owner = ds.candidate_source_layer_id as usize;
         let full = if layer <= candidate_owner {
             Some(IndexScorePlan::new(
                 ctx,
@@ -910,12 +931,32 @@ impl Binding<'_> {
                 ctx,
                 IndexCandidatesViews {
                     scores: dense(&a.full_scores, s, [rows, capacity])?,
-                    block_scores: dense(&a.block_scores, s, [rows, capacity.div_ceil(8)])?,
-                    block_ids: dense(&a.block_ids, s, [rows, capacity.div_ceil(8)])?,
-                    selected_scores: dense(&a.block_selected_scores, s, [rows, 2047])?,
-                    selected_ids: dense(&a.block_selected_ids, s, [rows, 2047])?,
+                    block_scores: dense(
+                        &a.block_scores,
+                        s,
+                        [rows, capacity.div_ceil(ds.selection.candidate_block_size)],
+                    )?,
+                    block_ids: dense(
+                        &a.block_ids,
+                        s,
+                        [rows, capacity.div_ceil(ds.selection.candidate_block_size)],
+                    )?,
+                    selected_scores: dense(
+                        &a.block_selected_scores,
+                        s,
+                        [rows, ds.selection.candidate_topk_blocks - 1],
+                    )?,
+                    selected_ids: dense(
+                        &a.block_selected_ids,
+                        s,
+                        [rows, ds.selection.candidate_topk_blocks - 1],
+                    )?,
                     margins: dense(&a.margins, s, [rows])?,
-                    candidates: dense(&state.candidates, s, [rows, 2048])?,
+                    candidates: dense(
+                        &state.candidates,
+                        s,
+                        [rows, ds.selection.candidate_topk_blocks],
+                    )?,
                     sequence: seq,
                 },
                 owners.ratio as u32,
@@ -944,18 +985,26 @@ impl Binding<'_> {
             None
         };
         let values = score(restricted.is_some())?;
-        let selector = DsaSelectionPlan::new(ctx, rows, values.scores.shape[1], 512)?;
+        let selector =
+            DsaSelectionPlan::new(ctx, rows, values.scores.shape[1], ds.selection.index_topk)?;
         let input = DsaTopKInput {
             scores: values.scores,
             ids: values.positions,
         };
         let output = DsaTopKOutput {
-            scores: TensorMut(dense(&a.selected_scores, s, [rows, 512])?),
-            ids: TensorMut(dense(&a.selected_ids, s, [rows, 512])?),
+            scores: TensorMut(dense(
+                &a.selected_scores,
+                s,
+                [rows, ds.selection.index_topk],
+            )?),
+            ids: TensorMut(dense(&a.selected_ids, s, [rows, ds.selection.index_topk])?),
             margins: TensorMut(dense(&a.margins, s, [rows])?),
         };
-        let order =
-            IndexPositionOrder::new(ctx, output.ids.0, dense(&index.positions, s, [rows, 512])?)?;
+        let order = IndexPositionOrder::new(
+            ctx,
+            output.ids.0,
+            dense(&index.positions, s, [rows, ds.selection.index_topk])?,
+        )?;
         Ok(Indexer {
             query_projection,
             weight_projection,
@@ -1056,7 +1105,12 @@ mod tests {
         let seq = SeqRef {
             ptr: metadata.device_ptr(&s).0,
         };
-        let mut scratch = Scratch::new(&s, width, 136)?;
+        let mut scratch = Scratch::new(
+            &s,
+            width,
+            136,
+            &crate::model_spec::DeepseekSelectionShape::IMPLEMENTED,
+        )?;
         let frequency = s.clone_htod(&rotary_inv_freq(
             &spec,
             spec.deepseek_v41.as_ref().unwrap(),
@@ -1292,7 +1346,12 @@ mod tests {
         if kind == "stale-cursor" {
             s.memcpy_htod(&[2, 1, 2, 1], &mut kv.ticket)?;
             s.memcpy_htod(&[2, 1, 3, 136, 1, 0, 0, 0], &mut meta)?;
-            let scratch = Scratch::new(s, 1, 136)?;
+            let scratch = Scratch::new(
+                s,
+                1,
+                136,
+                &crate::model_spec::DeepseekSelectionShape::IMPLEMENTED,
+            )?;
             let frequencies = s.clone_htod(&[1.0f32; 32])?;
             let p = Publication {
                 sequence: seq,
