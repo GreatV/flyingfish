@@ -278,6 +278,11 @@ fn validate_ring_write(
     let head_dim = kv.shape[1];
     let window = codes.shape[0];
     ensure!(rows >= 1, "latent ring write rows {rows} is below 1");
+    // Rows `window` apart share a slot; one launch writes each slot at most once.
+    ensure!(
+        rows <= window,
+        "latent ring write rows {rows} exceed the {window}-slot window"
+    );
     ensure!(
         head_dim.is_multiple_of(SCALE_BLOCK),
         "latent ring write head_dim {head_dim} must be a multiple of {SCALE_BLOCK} for one E8M0 scale per {SCALE_BLOCK} codes"
@@ -783,6 +788,22 @@ mod tests {
             "scales shape",
         );
         check(validate_ring_write(&kv, -1, &codes, &scales), "position");
+        validate_ring_write(
+            &fake::<bf16, 2>([WINDOW as u32, HEAD_DIM as u32], 0x100000),
+            131,
+            &codes,
+            &scales,
+        )
+        .expect("a full-window latent ring write is valid");
+        check(
+            validate_ring_write(
+                &fake::<bf16, 2>([WINDOW as u32 + 1, HEAD_DIM as u32], 0x100000),
+                131,
+                &codes,
+                &scales,
+            ),
+            "exceed the 128-slot window",
+        );
     }
 
     #[test]
