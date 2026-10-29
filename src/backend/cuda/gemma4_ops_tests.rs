@@ -15,9 +15,8 @@ const MUTANT_FRACTION: f64 = 0.01;
 
 type Fixture = BTreeMap<String, (Vec<usize>, Vec<bf16>)>;
 
-fn fixture(file: &str) -> Result<Fixture> {
-    let dir = std::env::var_os("FF_GEMMA4_FIXTURES").context("FF_GEMMA4_FIXTURES missing")?;
-    let bytes = std::fs::read(std::path::Path::new(&dir).join(file))?;
+fn load_fixture(path: &std::path::Path) -> Result<Fixture> {
+    let bytes = std::fs::read(path)?;
     let tensors = SafeTensors::deserialize(&bytes)?;
     tensors
         .iter()
@@ -36,6 +35,11 @@ fn fixture(file: &str) -> Result<Fixture> {
             Ok((name.to_owned(), (view.shape().to_vec(), values)))
         })
         .collect()
+}
+
+fn fixture(file: &str) -> Result<Fixture> {
+    let dir = std::env::var_os("FF_GEMMA4_FIXTURES").context("FF_GEMMA4_FIXTURES missing")?;
+    load_fixture(&std::path::Path::new(&dir).join(file))
 }
 
 fn bf16_ulp(v: f32) -> f32 {
@@ -139,6 +143,79 @@ fn tensor<'a>(fixture: &'a Fixture, name: &str) -> Result<&'a [bf16]> {
         .get(name)
         .with_context(|| format!("fixture tensor {name} missing"))?
         .1)
+}
+
+/// Reference values keep their stored dtype. F32 tensors are the FP32 oracle and are
+/// never rounded; BF16 tensors widen to F32 exactly.
+enum ReferenceValues {
+    Bf16(Vec<bf16>),
+    F32(Vec<f32>),
+}
+
+impl ReferenceValues {
+    fn as_bf16(&self) -> Option<&[bf16]> {
+        match self {
+            Self::Bf16(values) => Some(values),
+            Self::F32(_) => None,
+        }
+    }
+
+    fn as_f32(&self) -> Vec<f32> {
+        match self {
+            Self::Bf16(values) => values.iter().map(|value| value.to_f32()).collect(),
+            Self::F32(values) => values.clone(),
+        }
+    }
+}
+
+type ReferenceFixture = BTreeMap<String, (Vec<usize>, ReferenceValues)>;
+
+fn load_reference(path: &std::path::Path) -> Result<ReferenceFixture> {
+    let bytes = std::fs::read(path)?;
+    let tensors = SafeTensors::deserialize(&bytes)?;
+    tensors
+        .iter()
+        .map(|(name, view)| {
+            let values = match view.dtype() {
+                safetensors::Dtype::BF16 => ReferenceValues::Bf16(
+                    view.data()
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|b| bf16::from_le_bytes(*b))
+                        .collect(),
+                ),
+                safetensors::Dtype::F32 => ReferenceValues::F32(
+                    view.data()
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|b| f32::from_le_bytes(*b))
+                        .collect(),
+                ),
+                dtype => anyhow::bail!("reference tensor {name} has unsupported dtype {dtype:?}"),
+            };
+            Ok((name.to_owned(), (view.shape().to_vec(), values)))
+        })
+        .collect()
+}
+
+fn reference_fixture(file: &str) -> Result<ReferenceFixture> {
+    let dir = std::env::var_os("FF_GEMMA4_FIXTURES").context("FF_GEMMA4_FIXTURES missing")?;
+    load_reference(&std::path::Path::new(&dir).join(file))
+}
+
+fn reference<'a>(fixture: &'a ReferenceFixture, name: &str) -> Result<&'a ReferenceValues> {
+    Ok(&fixture
+        .get(name)
+        .with_context(|| format!("reference tensor {name} missing"))?
+        .1)
+}
+
+fn reference_bf16<'a>(fixture: &'a ReferenceFixture, name: &str) -> Result<&'a [bf16]> {
+    reference(fixture, name)?
+        .as_bf16()
+        .with_context(|| format!("reference tensor {name} is not BF16"))
 }
 
 #[test]
@@ -915,7 +992,7 @@ fn d512_table_kv_preparation_matches_definition_gpu() -> Result<()> {
 
 fn model_metrics(
     actual: &[bf16],
-    expected: &[bf16],
+    expected: &[f32],
     ids: &[u32],
     bounds: &serde_json::Value,
 ) -> Result<(bool, String)> {
@@ -925,10 +1002,7 @@ fn model_metrics(
     );
     ensure!(!ids.is_empty(), "model metric requires rows");
     ensure!(
-        actual
-            .iter()
-            .chain(expected)
-            .all(|v| v.to_f32().is_finite()),
+        actual.iter().all(|v| v.to_f32().is_finite()) && expected.iter().all(|v| v.is_finite()),
         "Runner FAIL non-finite model logits"
     );
     let vocab = expected.len() / ids.len();
@@ -947,7 +1021,7 @@ fn model_metrics(
         let b = &expected[row * vocab..(row + 1) * vocab];
         let mut reference_best = 0usize;
         for (a, b) in a.iter().zip(b) {
-            let delta = f64::from(a.to_f32() - b.to_f32());
+            let delta = f64::from(a.to_f32() - *b);
             maximum = maximum.max(delta.abs());
             squared += delta * delta;
         }
@@ -955,7 +1029,7 @@ fn model_metrics(
         let mut candidate = 0usize;
         let mut candidate_best = f32::NEG_INFINITY;
         for (i, (av, bv)) in a.iter().zip(b).enumerate() {
-            let score = bv.to_f32();
+            let score = *bv;
             if score > best[0] {
                 best[1] = best[0];
                 best[0] = score;
@@ -974,17 +1048,21 @@ fn model_metrics(
         }
         if row + 1 < ids.len() {
             let target = ids[row + 1] as usize;
-            for (side, values) in [0, 1].map(|side| (side, if side == 0 { a } else { b })) {
-                let peak = values
-                    .iter()
-                    .map(|v| v.to_f32())
-                    .fold(f32::NEG_INFINITY, f32::max);
-                let sum = values
-                    .iter()
-                    .map(|v| (v.to_f32() - peak).exp() as f64)
-                    .sum::<f64>();
-                losses[side] += -(values[target].to_f32() - peak) as f64 + sum.ln();
-            }
+            let candidate_peak = a
+                .iter()
+                .map(|v| v.to_f32())
+                .fold(f32::NEG_INFINITY, f32::max);
+            let candidate_sum = a
+                .iter()
+                .map(|v| (v.to_f32() - candidate_peak).exp() as f64)
+                .sum::<f64>();
+            losses[0] += -(a[target].to_f32() - candidate_peak) as f64 + candidate_sum.ln();
+            let reference_peak = b.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let reference_sum = b
+                .iter()
+                .map(|v| (v - reference_peak).exp() as f64)
+                .sum::<f64>();
+            losses[1] += -(b[target] - reference_peak) as f64 + reference_sum.ln();
         }
     }
     let count = ids.len().saturating_sub(1).max(1) as f64;
@@ -1000,6 +1078,74 @@ fn model_metrics(
             "output_max={maximum} output_rmse={rmse} nll_delta={nll_delta} qualified_ids={qualified} id_defects={id_defects}"
         ),
     ))
+}
+
+fn write_f32_fixture(path: &std::path::Path, values: &[f32]) -> Result<()> {
+    let mut body = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        body.extend_from_slice(&value.to_le_bytes());
+    }
+    let header = format!(
+        "{{\"a.prefill\":{{\"dtype\":\"F32\",\"shape\":[2,2],\"data_offsets\":[0,{}]}}}}",
+        body.len()
+    );
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(header.as_bytes());
+    bytes.extend_from_slice(&body);
+    std::fs::write(path, bytes)?;
+    Ok(())
+}
+
+#[test]
+fn f32_reference_distances_differ_from_bf16_rounding() -> Result<()> {
+    let path = std::env::temp_dir().join(format!(
+        "gemma4-f32-reference-{}.safetensors",
+        std::process::id()
+    ));
+    // 1 + 2^-10 sits between the BF16 neighbours 1.0 and 1.0078125.
+    let values = [1.0f32 + 2f32.powi(-10), 2.0, 3.0, 4.0];
+    write_f32_fixture(&path, &values)?;
+    let bf16_loader = load_fixture(&path);
+    let reference = load_reference(&path)?;
+    std::fs::remove_file(&path)?;
+    ensure!(
+        bf16_loader.is_err(),
+        "BF16 loader must reject an F32 reference tensor"
+    );
+    let oracle = reference["a.prefill"].1.as_f32();
+    ensure!(
+        oracle == values,
+        "F32 reference values changed in the loader"
+    );
+    let actual = [
+        bf16::from_f32(1.0),
+        bf16::from_f32(2.0),
+        bf16::from_f32(3.0),
+        bf16::from_f32(4.0),
+    ];
+    let ids = [0u32, 1];
+    let bounds = serde_json::json!({
+        "output_max": 0.0,
+        "output_rmse": 0.0,
+        "nll_max": 1e9,
+        "margin_cut": 0.0
+    });
+    let (pass, line) = model_metrics(&actual, &oracle, &ids, &bounds)?;
+    ensure!(
+        !pass && line.starts_with("output_max=0.0009765625"),
+        "F32 oracle distance was not scored: {line}"
+    );
+    let rounded: Vec<f32> = oracle
+        .iter()
+        .map(|value| bf16::from_f32(*value).to_f32())
+        .collect();
+    let (pass, line) = model_metrics(&actual, &rounded, &ids, &bounds)?;
+    ensure!(
+        pass && line.starts_with("output_max=0 "),
+        "BF16 rounding did not hide the sub-ulp distance: {line}"
+    );
+    Ok(())
 }
 
 fn native_path(
@@ -1054,7 +1200,7 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
     );
     let ids: serde_json::Value =
         serde_json::from_slice(&std::fs::read(fixtures.join("ids.json"))?)?;
-    let data = fixture("reference.safetensors")?;
+    let data = reference_fixture("reference.safetensors")?;
     let settings = crate::backend::Settings {
         tree_builder: crate::backend::TreeBuilder::Waves,
         spec_budget: crate::backend::SpecBudget::Chain,
@@ -1122,111 +1268,119 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
             .collect::<Vec<_>>()
     );
     ensure!(mismatches == 0, "D512 RoPE table content mismatch");
-    let probe_input = tensor(&data, "stage.a.input_layernorm")?;
-    let projected = engine.gemma_linear_probe("self_attn.q_proj.weight", probe_input)?;
-    let expected = tensor(&data, "stage.a.q_proj")?;
-    let delta: Vec<f32> = projected
-        .iter()
-        .zip(expected)
-        .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
-        .collect();
-    let maximum = delta.iter().copied().fold(0.0f32, f32::max);
-    let rmse = (delta.iter().map(|v| v * v).sum::<f32>() / delta.len() as f32).sqrt();
-    println!("GEMMA4_LINEAR_PROBE output_max={maximum} output_rmse={rmse}");
-    let first_ids: Vec<u32> = serde_json::from_value(ids["short"][0].clone())?;
-    let mut trace = crate::trace::Trace::all_layers();
-    engine.gemma_prefill_trace(&first_ids, &mut trace)?;
-    let native_input: Vec<bf16> = trace
-        .values(".0.debug.norm1")?
-        .into_iter()
-        .map(bf16::from_f32)
-        .collect();
-    let native_projected = engine.gemma_linear_probe("self_attn.q_proj.weight", &native_input)?;
-    let raw = trace.values(".0.debug.qkv_projected")?;
-    let rows = first_ids.len();
-    let q_width = native_projected.len() / rows;
-    let v_shape = &data["stage.a.v_norm"].0;
-    let (hkv, d) = (v_shape[1], v_shape[2]);
-    let kv_width = hkv * d;
-    let delta: Vec<f32> = native_projected
-        .iter()
-        .zip(&raw)
-        .map(|(a, b)| (a.to_f32() - b).abs())
-        .collect();
-    let maximum = delta.iter().copied().fold(0.0f32, f32::max);
-    let rmse = (delta.iter().map(|v| v * v).sum::<f32>() / delta.len() as f32).sqrt();
-    println!("GEMMA4_LINEAR_NATIVE_PROBE output_max={maximum} output_rmse={rmse}");
-    for (role, offset) in [
-        ("self_attn.k_proj.weight", rows * q_width),
-        ("self_attn.v_proj.weight", rows * (q_width + kv_width)),
-    ] {
-        let projected = engine.gemma_linear_probe(role, &native_input)?;
+    if reference(&data, "stage.a.input_layernorm")?
+        .as_bf16()
+        .is_none()
+    {
+        println!("GEMMA4_PROBES skipped=f32_reference");
+    } else {
+        let probe_input = reference_bf16(&data, "stage.a.input_layernorm")?;
+        let projected = engine.gemma_linear_probe("self_attn.q_proj.weight", probe_input)?;
+        let expected = reference_bf16(&data, "stage.a.q_proj")?;
         let delta: Vec<f32> = projected
             .iter()
-            .zip(&raw[offset..offset + rows * kv_width])
+            .zip(expected)
+            .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+            .collect();
+        let maximum = delta.iter().copied().fold(0.0f32, f32::max);
+        let rmse = (delta.iter().map(|v| v * v).sum::<f32>() / delta.len() as f32).sqrt();
+        println!("GEMMA4_LINEAR_PROBE output_max={maximum} output_rmse={rmse}");
+        let first_ids: Vec<u32> = serde_json::from_value(ids["short"][0].clone())?;
+        let mut trace = crate::trace::Trace::all_layers();
+        engine.gemma_prefill_trace(&first_ids, &mut trace)?;
+        let native_input: Vec<bf16> = trace
+            .values(".0.debug.norm1")?
+            .into_iter()
+            .map(bf16::from_f32)
+            .collect();
+        let native_projected =
+            engine.gemma_linear_probe("self_attn.q_proj.weight", &native_input)?;
+        let raw = trace.values(".0.debug.qkv_projected")?;
+        let rows = first_ids.len();
+        let q_width = native_projected.len() / rows;
+        let v_shape = &data["stage.a.v_norm"].0;
+        let (hkv, d) = (v_shape[1], v_shape[2]);
+        let kv_width = hkv * d;
+        let delta: Vec<f32> = native_projected
+            .iter()
+            .zip(&raw)
             .map(|(a, b)| (a.to_f32() - b).abs())
             .collect();
         let maximum = delta.iter().copied().fold(0.0f32, f32::max);
         let rmse = (delta.iter().map(|v| v * v).sum::<f32>() / delta.len() as f32).sqrt();
-        println!("GEMMA4_LINEAR_NATIVE_PROBE {role} output_max={maximum} output_rmse={rmse}");
-    }
-    let (native_k, native_v) = engine.gemma_kv_rows(0, first_ids.len())?;
-    let reference_v = tensor(&data, "stage.a.v_norm")?;
-    trace.add(
-        "debug.native_k".into(),
-        v_shape.clone(),
-        native_k.iter().map(|v| v.to_f32()).collect(),
-    )?;
-    trace.add(
-        "debug.native_v".into(),
-        v_shape.clone(),
-        native_v.iter().map(|v| v.to_f32()).collect(),
-    )?;
-    let (native_k4, native_v4) = engine.gemma_kv_rows(global_layer, first_ids.len())?;
-    trace.add(
-        "debug.native_k4".into(),
-        vec![first_ids.len(), spec.kv_heads as usize, 512],
-        native_k4.iter().map(|v| v.to_f32()).collect(),
-    )?;
-    trace.add(
-        "debug.native_v4".into(),
-        vec![first_ids.len(), spec.kv_heads as usize, 512],
-        native_v4.iter().map(|v| v.to_f32()).collect(),
-    )?;
-    trace.set_device(&engine.device_info().name)?;
-    trace.save(&runtime.join("native-trace.safetensors"))?;
-    let mut raw_v = Vec::with_capacity(reference_v.len());
-    for row in 0..rows {
-        for head in 0..hkv {
-            let base = rows * (q_width + kv_width) + row * kv_width + head * d;
-            raw_v.extend(raw[base..base + d].iter().map(|v| bf16::from_f32(*v)));
+        println!("GEMMA4_LINEAR_NATIVE_PROBE output_max={maximum} output_rmse={rmse}");
+        for (role, offset) in [
+            ("self_attn.k_proj.weight", rows * q_width),
+            ("self_attn.v_proj.weight", rows * (q_width + kv_width)),
+        ] {
+            let projected = engine.gemma_linear_probe(role, &native_input)?;
+            let delta: Vec<f32> = projected
+                .iter()
+                .zip(&raw[offset..offset + rows * kv_width])
+                .map(|(a, b)| (a.to_f32() - b).abs())
+                .collect();
+            let maximum = delta.iter().copied().fold(0.0f32, f32::max);
+            let rmse = (delta.iter().map(|v| v * v).sum::<f32>() / delta.len() as f32).sqrt();
+            println!("GEMMA4_LINEAR_NATIVE_PROBE {role} output_max={maximum} output_rmse={rmse}");
         }
-    }
-    let unit_weight = vec![bf16::ONE; d];
-    let expected_v: Vec<bf16> = raw_v
-        .chunks(d)
-        .flat_map(|row| {
-            rms_f32(
-                &row.iter().map(|v| v.to_f32()).collect::<Vec<_>>(),
-                &unit_weight,
-            )
-        })
-        .collect();
-    let raw_stats = Stats::new(&raw_v, &expected_v)?;
-    println!("GEMMA4_KV_SCATTER_CONTROL raw_v {}", raw_stats.line("v"));
-    ensure!(
-        raw_stats.is_detected_mutant(),
-        "GEMMA4_KV_SCATTER raw-V control is not discriminating"
-    );
-    let stats = Stats::new(&native_v, &expected_v)?;
-    println!("GEMMA4_KV_SCATTER {}", stats.line("v"));
-    ensure!(stats.passes(), "GEMMA4_KV_SCATTER v DEFECT");
-    for (name, actual, expected) in [
-        ("v", &native_v, reference_v),
-        ("k", &native_k, tensor(&data, "stage.a.k_rope")?),
-    ] {
-        let stats = Stats::new(actual, expected)?;
-        println!("GEMMA4_KV_REFERENCE {}", stats.line(name));
+        let (native_k, native_v) = engine.gemma_kv_rows(0, first_ids.len())?;
+        let reference_v = reference_bf16(&data, "stage.a.v_norm")?;
+        trace.add(
+            "debug.native_k".into(),
+            v_shape.clone(),
+            native_k.iter().map(|v| v.to_f32()).collect(),
+        )?;
+        trace.add(
+            "debug.native_v".into(),
+            v_shape.clone(),
+            native_v.iter().map(|v| v.to_f32()).collect(),
+        )?;
+        let (native_k4, native_v4) = engine.gemma_kv_rows(global_layer, first_ids.len())?;
+        trace.add(
+            "debug.native_k4".into(),
+            vec![first_ids.len(), spec.kv_heads as usize, 512],
+            native_k4.iter().map(|v| v.to_f32()).collect(),
+        )?;
+        trace.add(
+            "debug.native_v4".into(),
+            vec![first_ids.len(), spec.kv_heads as usize, 512],
+            native_v4.iter().map(|v| v.to_f32()).collect(),
+        )?;
+        trace.set_device(&engine.device_info().name)?;
+        trace.save(&runtime.join("native-trace.safetensors"))?;
+        let mut raw_v = Vec::with_capacity(reference_v.len());
+        for row in 0..rows {
+            for head in 0..hkv {
+                let base = rows * (q_width + kv_width) + row * kv_width + head * d;
+                raw_v.extend(raw[base..base + d].iter().map(|v| bf16::from_f32(*v)));
+            }
+        }
+        let unit_weight = vec![bf16::ONE; d];
+        let expected_v: Vec<bf16> = raw_v
+            .chunks(d)
+            .flat_map(|row| {
+                rms_f32(
+                    &row.iter().map(|v| v.to_f32()).collect::<Vec<_>>(),
+                    &unit_weight,
+                )
+            })
+            .collect();
+        let raw_stats = Stats::new(&raw_v, &expected_v)?;
+        println!("GEMMA4_KV_SCATTER_CONTROL raw_v {}", raw_stats.line("v"));
+        ensure!(
+            raw_stats.is_detected_mutant(),
+            "GEMMA4_KV_SCATTER raw-V control is not discriminating"
+        );
+        let stats = Stats::new(&native_v, &expected_v)?;
+        println!("GEMMA4_KV_SCATTER {}", stats.line("v"));
+        ensure!(stats.passes(), "GEMMA4_KV_SCATTER v DEFECT");
+        for (name, actual, expected) in [
+            ("v", &native_v, reference_v),
+            ("k", &native_k, reference_bf16(&data, "stage.a.k_rope")?),
+        ] {
+            let stats = Stats::new(actual, expected)?;
+            println!("GEMMA4_KV_REFERENCE {}", stats.line(name));
+        }
     }
     let mut defects = 0usize;
     let mut graph_defects = 0usize;
@@ -1249,7 +1403,7 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
             } else {
                 native_path(&mut engine, &sequence, sequence.len())?
             };
-            let expected = tensor(&data, &format!("{tag}.{mode}"))?;
+            let expected = reference(&data, &format!("{tag}.{mode}"))?.as_f32();
             let expected_rows = if cached {
                 sequence.len() - prefill
             } else if tag == "wrap" {
@@ -1259,7 +1413,7 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
             };
             let target_ids = &sequence[sequence.len() - expected_rows..];
             let actual = actual[actual.len() - expected.len()..].to_vec();
-            let (pass, line) = model_metrics(&actual, expected, target_ids, bounds)?;
+            let (pass, line) = model_metrics(&actual, &expected, target_ids, bounds)?;
             println!("GEMMA4_MODEL {tag} {mode} {line}");
             defects += usize::from(!pass);
         }
@@ -1329,7 +1483,7 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
             }
             let (pass, line) = model_metrics(
                 &graph_logits,
-                tensor(&data, "wrap.decode")?,
+                &reference(&data, "wrap.decode")?.as_f32(),
                 &sequence[512..],
                 bounds,
             )?;
