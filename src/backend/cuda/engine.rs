@@ -638,7 +638,7 @@ pub struct Engine {
     blas: Blas,
     flash: Option<Flash>,
     decode: Option<Attention>,
-    flint_logits: Option<CudaSlice<f32>>,
+    logits_f32: Option<CudaSlice<f32>>,
     device: Device,
     config: Config,
     model_spec: crate::model_spec::ModelSpec,
@@ -1132,7 +1132,7 @@ impl Engine {
             #[cfg(feature = "cuda")]
             flash: Some(flash),
             decode: None,
-            flint_logits: None,
+            logits_f32: None,
             device,
             config,
             model_spec,
@@ -3248,7 +3248,7 @@ impl Engine {
 
     pub fn decode_logits(&self) -> Result<Vec<f32>> {
         self.logits_cache.read()?;
-        if let Some(logits) = &self.flint_logits {
+        if let Some(logits) = &self.logits_f32 {
             return self
                 .device
                 .stream
@@ -5675,7 +5675,7 @@ impl Engine {
             #[cfg(test)]
             flint_legacy_overflow_prefill: false,
             flint_frozen_decode_length: false,
-            flint_logits: None,
+            logits_f32: None,
             #[cfg(test)]
             moe_test_ffn: None,
             graphs: Vec::new(),

@@ -101,6 +101,7 @@ __device__ __forceinline__ float norm_inv(float sum,uint32_t width,int mode,floa
 __device__ __forceinline__ __nv_bfloat16 norm_scale(float a,float inv,__nv_bfloat16 wd,__nv_bfloat16 zd,int mode) {
     float result=__fmul_rn(a,inv);
     if(mode==1 || mode==4) result=__fmul_rn(result,__fadd_rn(1.0f,__bfloat162float(wd)));
+    else if(mode==5) result=__fmul_rn(result,__bfloat162float(wd));
     else if(mode!=2) {
         result=bround(__fmul_rn(bround(result),__bfloat162float(wd)));
         if(mode==3) result=__fmul_rn(result,silu(__bfloat162float(zd)));
@@ -120,12 +121,12 @@ __device__ __forceinline__ uint32_t norm_slices_per_block(
     uint32_t row_capacity,uint32_t heads,uint32_t width,
     uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,
     uint64_t zs0,uint64_t zs1,uint64_t zs2,int mode) {
-    if(xs2!=1u || ys2!=1u || (mode>=3 && zs2!=1u)) return 1u;
-    uintptr_t ptrs=uintptr_t(x)|uintptr_t(y)|uintptr_t(w)|(mode>=3?uintptr_t(z):0u);
-    uint64_t strides=xs0|xs1|ys0|ys1|(mode>=3?(zs0|zs1):0u);
+    if(xs2!=1u || ys2!=1u || ((mode==3||mode==4) && zs2!=1u)) return 1u;
+    uintptr_t ptrs=uintptr_t(x)|uintptr_t(y)|uintptr_t(w)|((mode==3||mode==4)?uintptr_t(z):0u);
+    uint64_t strides=xs0|xs1|ys0|ys1|((mode==3||mode==4)?(zs0|zs1):0u);
     if(width==128u && ((ptrs&7u)==0u) && ((strides&3u)==0u)) return 8u;
     if(width==256u && ((ptrs&15u)==0u) && ((strides&7u)==0u)) return 8u;
-    if(width==5120u && heads==1u && row_capacity>16u && ((ptrs&7u)==0u) && (((xs0|ys0|(mode>=3?zs0:0u))&3u)==0u)) return 4u;
+    if(width==5120u && heads==1u && row_capacity>16u && ((ptrs&7u)==0u) && (((xs0|ys0|((mode==3||mode==4)?zs0:0u))&3u)==0u)) return 4u;
     return 1u;
 }
 __device__ __forceinline__ float block_inv(float v,float* scratch,uint32_t width,int mode,float eps) {
@@ -160,7 +161,7 @@ __device__ __forceinline__ void norm_body(
     uint64_t expected_blocks=(total_slices+spb-1u)/spb;
     if(blockDim.x!=256 || blockDim.y!=1 || blockDim.z!=1 || gridDim.y!=1 || gridDim.z!=1 ||
        !heads || !width || !row_capacity || uint64_t(gridDim.x)!=expected_blocks ||
-       mode<0 || mode>4 || !x || !y || (mode!=2 && !w) || (mode>=3 && !z) || !(eps>0)) {__trap();return;}
+       mode<0 || mode>5 || !x || !y || (mode!=2 && !w) || ((mode==3||mode==4) && !z) || !(eps>0)) {__trap();return;}
     if(spb==8u && width==128u) {
         uint32_t warp=threadIdx.x>>5,lane=threadIdx.x&31u;
         uint64_t slice=uint64_t(blockIdx.x)*8u+warp;
@@ -171,7 +172,7 @@ __device__ __forceinline__ void norm_body(
         if(row>=valid_rows) return;
         __nv_bfloat16* xs=x+row*xs0+head*xs1;
         __nv_bfloat16* ys=y+row*ys0+head*ys1;
-        const __nv_bfloat16* zs=(mode>=3)?(z+row*zs0+head*zs1):nullptr;
+        const __nv_bfloat16* zs=((mode==3||mode==4))?(z+row*zs0+head*zs1):nullptr;
         Bf16Vec4 vx; vx.u=reinterpret_cast<const uint2*>(xs)[lane];
         if(mode==4) {
             Bf16Vec4 vz; vz.u=reinterpret_cast<const uint2*>(zs)[lane];
@@ -212,7 +213,7 @@ __device__ __forceinline__ void norm_body(
         if(row>=valid_rows) return;
         __nv_bfloat16* xs=x+row*xs0+head*xs1;
         __nv_bfloat16* ys=y+row*ys0+head*ys1;
-        const __nv_bfloat16* zs=(mode>=3)?(z+row*zs0+head*zs1):nullptr;
+        const __nv_bfloat16* zs=((mode==3||mode==4))?(z+row*zs0+head*zs1):nullptr;
         Bf16Vec8 vx; vx.u=reinterpret_cast<const uint4*>(xs)[lane];
         if(mode==4) {
             Bf16Vec8 vz; vz.u=reinterpret_cast<const uint4*>(zs)[lane];
@@ -257,7 +258,7 @@ __device__ __forceinline__ void norm_body(
         bool active=launched && row<valid_rows;
         __nv_bfloat16* xs=active?(x+row*xs0):nullptr;
         __nv_bfloat16* ys=active?(y+row*ys0):nullptr;
-        const __nv_bfloat16* zs=(active && mode>=3)?(z+row*zs0):nullptr;
+        const __nv_bfloat16* zs=(active && (mode==3||mode==4))?(z+row*zs0):nullptr;
         uint2 xv[20];
         float acc[4]={0.0f,0.0f,0.0f,0.0f};
         if constexpr(Capture) {
@@ -344,7 +345,7 @@ __device__ __forceinline__ void norm_body(
     }
     if constexpr(Capture) capture+=row*capture_pitch+capture_column;
     x+=row*xs0+head*xs1; y+=row*ys0+head*ys1;
-    if(mode>=3) z+=row*zs0+head*zs1;
+    if(mode==3||mode==4) z+=row*zs0+head*zs1;
     __shared__ float tmp[8];
     if(width==5120u && xs2==1u && ys2==1u && (mode<3 || zs2==1u)) {
         float xv[20],sum=0.0f;

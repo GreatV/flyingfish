@@ -20,7 +20,7 @@ pub struct Ops {
     pub finite_bf16: CudaFunction,
     pub advance: CudaFunction,
     pub flint_decode_length: CudaFunction,
-    pub flint_lm_head_f32: CudaFunction,
+    pub lm_head_f32: CudaFunction,
     pub residual: CudaFunction,
     swiglu_rounding: crate::model_spec::SwigluRounding,
 }
@@ -87,7 +87,7 @@ impl Ops {
             finite_bf16: sample.load_function("finite_bf16")?,
             advance: sample.load_function("advance")?,
             flint_decode_length: sample.load_function("flint_decode_length")?,
-            flint_lm_head_f32: sample.load_function("lm_head_f32")?,
+            lm_head_f32: sample.load_function("lm_head_f32")?,
             residual: norm.load_function("residual")?,
             swiglu_rounding,
         })
@@ -115,7 +115,7 @@ impl Ops {
         Ok(())
     }
 
-    pub fn flint_lm_head_f32(
+    pub fn lm_head_f32(
         &self,
         stream: &Arc<CudaStream>,
         input: &CudaView<'_, bf16>,
@@ -133,7 +133,7 @@ impl Ops {
         );
         unsafe {
             stream
-                .launch_builder(&self.flint_lm_head_f32)
+                .launch_builder(&self.lm_head_f32)
                 .arg(input)
                 .arg(weight)
                 .arg(&mut logits.slice_mut(..))
@@ -185,6 +185,10 @@ use half::bf16;
 pub enum RmsMode {
     Standard = 0,
     ZeroCentered = 1,
+    /// F32 `x * rsqrt(mean(x^2) + eps) * w` with one BF16 rounding at the store: neither the
+    /// normalized value nor the weight product is rounded before it (model definition
+    /// `RMSNorm.forward`).
+    Unrounded = 5,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct RmsOptions {
@@ -206,7 +210,9 @@ pub struct NormOps {
 pub struct GateOps {
     gate: CudaFunction,
     gelu: CudaFunction,
+    swiglu_clamped: CudaFunction,
     swiglu_rounding: crate::model_spec::SwigluRounding,
+    swiglu_limit: f32,
 }
 #[derive(Clone)]
 pub struct CommonOpsRef {
@@ -215,14 +221,16 @@ pub struct CommonOpsRef {
 }
 impl CommonOpsRef {
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
-        Self::new_with_swiglu_rounding(ctx, crate::model_spec::SwigluRounding::Twice)
+        Self::new_with_swiglu_rounding(ctx, crate::model_spec::SwigluRounding::Twice, 0.0)
     }
 
     pub fn new_with_swiglu_rounding(
         ctx: &Arc<CudaContext>,
         swiglu_rounding: crate::model_spec::SwigluRounding,
+        swiglu_limit: f32,
     ) -> Result<Self> {
         let module = cubin::module(ctx, "q38_common")?;
+        let act = cubin::module(ctx, "act")?;
         Ok(Self {
             norm: Arc::new(NormOps {
                 norm: module.load_function("q38_norm")?,
@@ -231,7 +239,9 @@ impl CommonOpsRef {
             gate: Arc::new(GateOps {
                 gate: module.load_function("q38_gate")?,
                 gelu: module.load_function("q38_gelu")?,
+                swiglu_clamped: act.load_function("silu_mul_split_clamped")?,
                 swiglu_rounding,
+                swiglu_limit,
             }),
         })
     }
@@ -553,15 +563,19 @@ fn norm_slices_per_block(
 ) -> u32 {
     let heads = x.shape[1];
     let width = x.shape[2];
-    if x.stride[2] != 1 || y.stride[2] != 1 || (mode >= 3 && zs[2] != 1) {
+    if x.stride[2] != 1 || y.stride[2] != 1 || ((mode == 3 || mode == 4) && zs[2] != 1) {
         return 1;
     }
-    let ptrs = x.ptr | y.ptr | wp | if mode >= 3 { zp } else { 0 };
+    let ptrs = x.ptr | y.ptr | wp | if mode == 3 || mode == 4 { zp } else { 0 };
     let strides = x.stride[0]
         | x.stride[1]
         | y.stride[0]
         | y.stride[1]
-        | if mode >= 3 { zs[0] | zs[1] } else { 0 };
+        | if mode == 3 || mode == 4 {
+            zs[0] | zs[1]
+        } else {
+            0
+        };
     if width == 128 && (ptrs & 7) == 0 && (strides & 3) == 0 {
         return 8;
     }
@@ -812,12 +826,39 @@ impl GateOps {
             blocks <= i32::MAX as u32 && rows.row_capacity <= u16::MAX as u32,
             "SwiGLU grid outside CUDA limits"
         );
+        if self.swiglu_rounding == crate::model_spec::SwigluRounding::ClampedTwice {
+            ensure!(
+                self.swiglu_limit.is_finite() && self.swiglu_limit > 0.0,
+                "clamped SwiGLU limit {} must be positive and finite",
+                self.swiglu_limit
+            );
+            unsafe {
+                stream
+                    .launch_builder(&self.swiglu_clamped)
+                    .arg(&x.ptr)
+                    .arg(&up.ptr)
+                    .arg(&y.0.ptr)
+                    .arg(&rows.meta.ptr)
+                    .arg(&rows.row_base)
+                    .arg(&rows.row_capacity)
+                    .arg(&width)
+                    .arg(&self.swiglu_limit)
+                    .launch(LaunchConfig {
+                        grid_dim: (blocks, rows.row_capacity, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+            return Ok(());
+        }
         let mode = match self.swiglu_rounding {
             crate::model_spec::SwigluRounding::Twice => 2,
             crate::model_spec::SwigluRounding::Once => 3,
-            crate::model_spec::SwigluRounding::ClampedTwice
-            | crate::model_spec::SwigluRounding::ClampedOnce => {
-                anyhow::bail!("clamped SwiGLU execution is not bound")
+            crate::model_spec::SwigluRounding::ClampedOnce => {
+                anyhow::bail!("clamped-once SwiGLU execution is not bound")
+            }
+            crate::model_spec::SwigluRounding::ClampedTwice => {
+                unreachable!("ClampedTwice launches the clamped entry above")
             }
         };
         unsafe {
@@ -967,6 +1008,85 @@ impl GateOps {
 mod tests {
     use super::*;
     use anyhow::ensure;
+
+    #[test]
+    #[ignore = "GPU window; FF_Q38_GPU_WINDOW=granted required"]
+    fn lm_head_f32_matches_fp64_gpu() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let device = super::super::Device::new(0)?;
+        let s = &device.stream;
+        let ops = Ops::new(&device.ctx)?;
+        for (vocab, hidden) in [(129_280usize, 5120usize), (150_144, 2048)] {
+            let input: Vec<_> = (0..hidden)
+                .map(|k| bf16::from_f32(((k * 11) % 127 + 1) as f32 / 128.0))
+                .collect();
+            let weights: Vec<_> = (0..vocab * hidden)
+                .map(|i| {
+                    let (row, k) = (i / hidden, i % hidden);
+                    bf16::from_f32(((row * 17 + k * 29) % 127 + 1) as f32 / 128.0)
+                })
+                .collect();
+            let exact: Vec<f64> = (0..127)
+                .map(|row| {
+                    input
+                        .iter()
+                        .enumerate()
+                        .map(|(k, x)| {
+                            f64::from(x.to_f32()) * f64::from(weights[row * hidden + k].to_f32())
+                        })
+                        .sum()
+                })
+                .collect();
+            let unit = f64::from(f32::EPSILON) / 2.0;
+            let gamma = hidden as f64 * unit / (1.0 - hidden as f64 * unit);
+            let x = s.clone_htod(&input)?;
+            let w = s.clone_htod(&weights)?;
+            drop(weights);
+            let mut logits = s.alloc_zeros::<f32>(vocab)?;
+            device.finish_upload()?;
+            ops.lm_head_f32(s, &x.as_view(), &w, &mut logits)?;
+            let eager = s.clone_dtoh(&logits)?;
+            let mut outside = 0;
+            let mut rounded_control = 0;
+            let mut max_error = 0.0f64;
+            for (row, &got) in eager.iter().enumerate() {
+                let want = exact[row % 127];
+                let bound = gamma * want.abs();
+                let error = (f64::from(got) - want).abs();
+                outside += usize::from(!got.is_finite() || error > bound);
+                max_error = max_error.max(error);
+                rounded_control +=
+                    usize::from((f64::from(bf16::from_f32(got).to_f32()) - want).abs() > bound);
+            }
+            ensure!(
+                outside == 0,
+                "FP32 head {outside}/{vocab} outside gamma_{hidden}"
+            );
+            ensure!(rounded_control > 0, "BF16 logit store control escaped");
+            s.begin_capture(
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )?;
+            ops.lm_head_f32(s, &x.as_view(), &w, &mut logits)?;
+            let graph = s
+                .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
+                .context("empty FP32 head graph")?;
+            graph.launch()?;
+            let replay = s.clone_dtoh(&logits)?;
+            let bits = eager
+                .iter()
+                .zip(&replay)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            ensure!(bits == 0, "FP32 head graph differs at {bits}/{vocab}");
+            println!(
+                "PASS LM_HEAD_F32 shape=[{vocab},{hidden}] fp64_outside={outside} max_error={max_error:.12e} gamma={gamma:.12e} graph_bits={bits} bf16_store_control={rounded_control}"
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     #[ignore = "GPU window; FF_Q38_GPU_WINDOW=granted required"]

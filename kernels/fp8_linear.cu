@@ -9,6 +9,147 @@
 #include <stdint.h>
 #include "q38_contract.cuh"
 
+__device__ __forceinline__ float fp8_block_scale(float value) { return value; }
+__device__ __forceinline__ float fp8_block_scale(uint8_t value) { return e8m0_decode(value); }
+
+template <typename Scale, int BLOCK>
+__device__ __forceinline__ void fp8_block_decode(
+        const uint8_t* w, const Scale* sw, const uint8_t* x, const Scale* sx,
+        __nv_bfloat16* y, int m, int n, int k) {
+    const uint64_t tiles = (uint64_t(n) + 7) / 8;
+    const uint64_t row = blockIdx.x / tiles;
+    const uint64_t col = (blockIdx.x % tiles) * 8 + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (row >= uint64_t(m) || col >= uint64_t(n)) return;
+    const uint64_t groups = (uint64_t(k) + BLOCK - 1) / BLOCK;
+    float total = 0.0f;
+    for (uint64_t group = 0; group < groups; ++group) {
+        float sum = 0.0f;
+        #pragma unroll
+        for (int offset = lane; offset < BLOCK; offset += 32) {
+            const uint64_t inner = group * BLOCK + offset;
+            if (inner < uint64_t(k)) {
+                const uint16_t pair = uint16_t(w[col * k + inner]) |
+                                      (uint16_t(x[row * k + inner]) << 8);
+                const float2 values = e4m3_decode_pair(pair);
+                sum = fmaf(values.x, values.y, sum);
+            }
+        }
+        #pragma unroll
+        for (int shift = 16; shift > 0; shift >>= 1)
+            sum += __shfl_down_sync(0xffffffffu, sum, shift);
+        if (lane == 0) {
+            const float scale = fp8_block_scale(sw[(col / BLOCK) * groups + group]) *
+                                fp8_block_scale(sx[row * groups + group]);
+            total = fmaf(sum, scale, total);
+        }
+    }
+    if (lane == 0) y[row * n + col] = __float2bfloat16_rn(total);
+}
+
+template <int COUNT>
+__device__ __forceinline__ uint32_t fp8_block_codes(
+        const uint8_t* data, uint64_t row, uint64_t col, int rows, int k) {
+    if (row >= uint64_t(rows)) return 0;
+    const uint8_t* ptr = data + row * k + col;
+    if (col + COUNT <= uint64_t(k) && (reinterpret_cast<uintptr_t>(ptr) & (COUNT - 1)) == 0) {
+        if constexpr (COUNT == 4) return *reinterpret_cast<const uint32_t*>(ptr);
+        else return *reinterpret_cast<const uint16_t*>(ptr);
+    }
+    uint32_t packed = 0;
+    #pragma unroll
+    for (int i = 0; i < COUNT; ++i)
+        if (col + i < uint64_t(k)) packed |= uint32_t(data[row * k + col + i]) << (8 * i);
+    return packed;
+}
+
+__device__ __forceinline__ uint32_t fp8_block_bf16(uint32_t packed) {
+    const float2 value = e4m3_decode_pair(uint16_t(packed));
+    return uint32_t(__bfloat16_as_ushort(__float2bfloat16_rn(value.x))) |
+           (uint32_t(__bfloat16_as_ushort(__float2bfloat16_rn(value.y))) << 16);
+}
+
+template <typename Scale, int BLOCK>
+__device__ __forceinline__ void fp8_block_mma(
+        const uint8_t* w, const Scale* sw, const uint8_t* x, const Scale* sx,
+        __nv_bfloat16* y, int m, int n, int k) {
+    const uint64_t tiles = (uint64_t(n) + 31) / 32;
+    const uint64_t row_base = (blockIdx.x / tiles) * 16;
+    const uint64_t col_base = (blockIdx.x % tiles) * 32 + (threadIdx.x / 32) * 8;
+    const int lane = threadIdx.x & 31, group = lane >> 2, thread = lane & 3;
+    const uint64_t groups = (uint64_t(k) + BLOCK - 1) / BLOCK;
+    float result[4] = {};
+    for (uint64_t scale_col = 0; scale_col < groups; ++scale_col) {
+        float c[4] = {};
+        // sm_89 CUDA 13.0 native FP8 MMA exceeds FP64 bounds in 14/1024 outputs at [M,N,K]=[16,64,32].
+#if __CUDA_ARCH__ >= 900
+        #pragma unroll
+        for (int offset = 0; offset < BLOCK; offset += 32) {
+            const uint64_t inner = scale_col * BLOCK + offset + 4 * thread;
+            const uint32_t a0 = fp8_block_codes<4>(x, row_base + group, inner, m, k);
+            const uint32_t a1 = fp8_block_codes<4>(x, row_base + group + 8, inner, m, k);
+            const uint32_t a2 = fp8_block_codes<4>(x, row_base + group, inner + 16, m, k);
+            const uint32_t a3 = fp8_block_codes<4>(x, row_base + group + 8, inner + 16, m, k);
+            const uint32_t b0 = fp8_block_codes<4>(w, col_base + group, inner, n, k);
+            const uint32_t b1 = fp8_block_codes<4>(w, col_base + group, inner + 16, n, k);
+            asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+        }
+#else
+        #pragma unroll
+        for (int offset = 0; offset < BLOCK; offset += 16) {
+            const uint64_t inner = scale_col * BLOCK + offset + 2 * thread;
+            const uint32_t a0 = fp8_block_bf16(fp8_block_codes<2>(x, row_base + group, inner, m, k));
+            const uint32_t a1 = fp8_block_bf16(fp8_block_codes<2>(x, row_base + group + 8, inner, m, k));
+            const uint32_t a2 = fp8_block_bf16(fp8_block_codes<2>(x, row_base + group, inner + 8, m, k));
+            const uint32_t a3 = fp8_block_bf16(fp8_block_codes<2>(x, row_base + group + 8, inner + 8, m, k));
+            const uint32_t b0 = fp8_block_bf16(fp8_block_codes<2>(w, col_base + group, inner, n, k));
+            const uint32_t b1 = fp8_block_bf16(fp8_block_codes<2>(w, col_base + group, inner + 8, n, k));
+            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+        }
+#endif
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint64_t row = row_base + group + (i / 2) * 8;
+            const uint64_t col = col_base + 2 * thread + (i & 1);
+            if (row < uint64_t(m) && col < uint64_t(n)) {
+                const float scale = fp8_block_scale(sw[(col / BLOCK) * groups + scale_col]) *
+                                    fp8_block_scale(sx[row * groups + scale_col]);
+                result[i] = fmaf(c[i], scale, result[i]);
+            }
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint64_t row = row_base + group + (i / 2) * 8;
+        const uint64_t col = col_base + 2 * thread + (i & 1);
+        if (row < uint64_t(m) && col < uint64_t(n))
+            y[row * n + col] = __float2bfloat16_rn(result[i]);
+    }
+}
+
+#define FP8_BLOCK_ENTRY(NAME, SCALE, BLOCK, TILED) \
+extern "C" __global__ void NAME( \
+        const uint8_t* w, const SCALE* sw, const uint8_t* x, const SCALE* sx, \
+        __nv_bfloat16* y, int m, int n, int k) { \
+    if (m <= 0 || n <= 0 || k <= 0 || blockDim.x != (TILED ? 128 : 256) || \
+        blockDim.y != 1 || blockDim.z != 1 || gridDim.y != 1 || gridDim.z != 1) { \
+        __trap(); return; \
+    } \
+    if constexpr (TILED) fp8_block_mma<SCALE, BLOCK>(w, sw, x, sx, y, m, n, k); \
+    else fp8_block_decode<SCALE, BLOCK>(w, sw, x, sx, y, m, n, k); \
+}
+FP8_BLOCK_ENTRY(fp8_block_f32_128_decode, float, 128, false)
+FP8_BLOCK_ENTRY(fp8_block_f32_128_mma, float, 128, true)
+FP8_BLOCK_ENTRY(fp8_block_e8m0_32_decode, uint8_t, 32, false)
+FP8_BLOCK_ENTRY(fp8_block_e8m0_32_mma, uint8_t, 32, true)
+#undef FP8_BLOCK_ENTRY
+
 template <bool PER_CHANNEL>
 __device__ __forceinline__ __nv_bfloat16 weight_at(
         const uint8_t* w, const __nv_bfloat16* scales, uint64_t n,

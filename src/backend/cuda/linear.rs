@@ -1,24 +1,220 @@
 //! Typed Linear views; all BF16 plans execute through the shared Blas handle.
-use super::contracts::Scratch;
-use super::contracts::{RowDomain, Tensor, TensorMut};
-use super::weights::WeightCatalog;
+//! Typed linear views with explicit native input and output formats.
+use super::{
+    contracts::{RowDomain, Scratch, Tensor, TensorMut},
+    weights::WeightCatalog,
+};
 use crate::backend::gpu::{CudaContext, CudaFunction, CudaStream, DevicePtr, PushKernelArg};
 use crate::fp8::Fp8ScaleLayout;
 use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::sync::Arc;
+/// Native BF16 operands with an unrounded FP32 output on the shared skinny tile.
+#[cfg(feature = "cuda")]
+pub struct Bf16F32Plan {
+    kernel: CudaFunction,
+    input: Tensor<bf16, 2>,
+    weight: Tensor<bf16, 2>,
+    output: Tensor<f32, 2>,
+    shape: [i32; 3],
+}
+
+#[cfg(feature = "cuda")]
+fn bf16_f32_shape(
+    input: Tensor<bf16, 2>,
+    weight: Tensor<bf16, 2>,
+    output: Tensor<f32, 2>,
+) -> Result<[i32; 3]> {
+    use super::contracts::{dense_layout, spans_disjoint};
+    input.validate()?;
+    weight.validate()?;
+    output.validate()?;
+    let [rows, width] = input.shape;
+    let columns = weight.shape[0];
+    ensure!(
+        (1..=16).contains(&rows)
+            && width.is_multiple_of(256)
+            && width <= i32::MAX as u32
+            && columns <= i32::MAX as u32,
+        "BF16 to F32 skinny projection requires M1..16 and K divisible by256"
+    );
+    ensure!(
+        input.stride == dense_layout(input.shape)?.0
+            && weight.stride == dense_layout(weight.shape)?.0
+            && output.stride == dense_layout(output.shape)?.0
+            && weight.shape[1] == width
+            && output.shape == [rows, columns],
+        "BF16 to F32 projection shape/stride mismatch"
+    );
+    let spans = [
+        (input.ptr, input.span_bytes),
+        (weight.ptr, weight.span_bytes),
+        (output.ptr, output.span_bytes),
+    ];
+    ensure!(
+        input.ptr.is_multiple_of(16) && weight.ptr.is_multiple_of(16),
+        "BF16 to F32 projection requires16byte input/weight alignment"
+    );
+    for (i, &(ptr, bytes)) in spans.iter().enumerate() {
+        for &(other, count) in &spans[i + 1..] {
+            ensure!(
+                spans_disjoint(ptr, bytes, other, count)?,
+                "BF16 to F32 projection overlap"
+            );
+        }
+    }
+    Ok([rows as i32, columns as i32, width as i32])
+}
+
+#[cfg(feature = "cuda")]
+impl Bf16F32Plan {
+    pub fn new(
+        ctx: &Arc<CudaContext>,
+        input: Tensor<bf16, 2>,
+        weight: Tensor<bf16, 2>,
+        output: Tensor<f32, 2>,
+    ) -> Result<Self> {
+        let shape = bf16_f32_shape(input, weight, output)?;
+        Ok(Self {
+            kernel: super::cubin::module(ctx, "gemm_skinny")?
+                .load_function("gemm_skinny_bf16_f32")?,
+            input,
+            weight,
+            output,
+            shape,
+        })
+    }
+
+    pub fn run(&self, stream: &Arc<CudaStream>) -> Result<()> {
+        let [rows, columns, width] = self.shape;
+        let leading = i64::from(width);
+        unsafe {
+            stream
+                .launch_builder(&self.kernel)
+                .arg(&self.weight.ptr)
+                .arg(&self.input.ptr)
+                .arg(&self.output.ptr)
+                .arg(&columns)
+                .arg(&width)
+                .arg(&leading)
+                .arg(&rows)
+                .launch(cudarc::driver::LaunchConfig {
+                    grid_dim: ((columns as u32).div_ceil(16), 1, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 40960,
+                })?;
+        }
+        Ok(())
+    }
+}
+
 /// Explicit visible bias boundary; the caller's numerical contract selects it.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum LinearBiasMode {
     BeforeOutputRound,
     AfterOutputRound,
 }
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Fp8ScaleRef {
+    Bf16(Tensor<bf16, 2>),
+    F32(Tensor<f32, 2>),
+    E8m0(Tensor<u8, 2>),
+}
+
+impl Fp8ScaleRef {
+    fn ptr(self) -> u64 {
+        match self {
+            Self::Bf16(t) => t.ptr,
+            Self::F32(t) => t.ptr,
+            Self::E8m0(t) => t.ptr,
+        }
+    }
+
+    fn disjoint<T: Copy>(self, other: &Tensor<T, 2>) -> Result<()> {
+        match self {
+            Self::Bf16(t) => disjoint(&t, other),
+            Self::F32(t) => disjoint(&t, other),
+            Self::E8m0(t) => disjoint(&t, other),
+        }
+    }
+    /// # Safety
+    /// The native allocation matches dtype and remains live through every use of this view.
+    unsafe fn new(
+        ptr: u64,
+        shape: [u32; 2],
+        bytes: u64,
+        dtype: safetensors::Dtype,
+    ) -> Result<Self> {
+        let stride = [u64::from(shape[1]), 1];
+        Ok(match dtype {
+            safetensors::Dtype::BF16 => {
+                Self::Bf16(unsafe { Tensor::new(ptr, shape, stride, bytes)? })
+            }
+            safetensors::Dtype::F32 => {
+                Self::F32(unsafe { Tensor::new(ptr, shape, stride, bytes)? })
+            }
+            safetensors::Dtype::F8_E8M0 => {
+                Self::E8m0(unsafe { Tensor::new(ptr, shape, stride, bytes)? })
+            }
+            _ => anyhow::bail!("unsupported native FP8 scale dtype {dtype:?}"),
+        })
+    }
+
+    pub(crate) fn validate(self, codes: &Tensor<u8, 2>, layout: Fp8ScaleLayout) -> Result<()> {
+        match self {
+            Self::Bf16(scale) => {
+                Self::validate_tensor(codes, scale, layout, safetensors::Dtype::BF16)
+            }
+            Self::F32(scale) => {
+                Self::validate_tensor(codes, scale, layout, safetensors::Dtype::F32)
+            }
+            Self::E8m0(scale) => {
+                Self::validate_tensor(codes, scale, layout, safetensors::Dtype::F8_E8M0)
+            }
+        }
+    }
+
+    fn validate_tensor<T: Copy>(
+        codes: &Tensor<u8, 2>,
+        scale: Tensor<T, 2>,
+        layout: Fp8ScaleLayout,
+        dtype: safetensors::Dtype,
+    ) -> Result<()> {
+        codes.validate()?;
+        scale.validate()?;
+        ensure!(
+            codes.shape.iter().all(|&n| n <= i32::MAX as u32)
+                && codes.stride == [u64::from(codes.shape[1]), 1]
+                && codes.span_bytes == u64::from(codes.shape[0]) * u64::from(codes.shape[1]),
+            "invalid native FP8 code extent"
+        );
+        let shape = layout.scale_shape(codes.shape[0], codes.shape[1]);
+        ensure!(
+            dtype == layout.scale_dtype()
+                && scale.shape.map(|n| n as usize) == shape
+                && scale.stride == [shape[1] as u64, 1],
+            "native FP8 scale dtype/grid mismatch: view={dtype:?} layout={layout:?} shape={:?} stride={:?}",
+            scale.shape,
+            scale.stride
+        );
+        let bytes = u64::from(scale.shape[0])
+            .checked_mul(u64::from(scale.shape[1]))
+            .and_then(|n| n.checked_mul(size_of::<T>() as u64))
+            .context("native FP8 scale byte extent overflow")?;
+        ensure!(
+            scale.span_bytes == bytes,
+            "native FP8 scale allocation extent mismatch"
+        );
+        super::contracts::no_overlap(codes, &scale, "FP8 codes", "FP8 scales")
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum LinearWeightRef {
     Bf16(Tensor<bf16, 2>),
     Fp8 {
         codes: Tensor<u8, 2>,
-        scale: Tensor<bf16, 2>,
+        scale: Fp8ScaleRef,
         layout: Fp8ScaleLayout,
     },
 }
@@ -34,9 +230,101 @@ pub(crate) struct Fp8Ops {
     #[cfg(feature = "rocm")]
     context: Arc<CudaContext>,
     fake_quant: CudaFunction,
+    block: [[CudaFunction; 2]; 2],
 }
+
+/// Bound native codes/scales and prepared activations; storage remains caller-owned.
+pub(crate) struct Fp8BlockPlan {
+    kernel: CudaFunction,
+    grid: cudarc::driver::LaunchConfig,
+    pointers: [u64; 5],
+    shape: [i32; 3],
+}
+
+impl Fp8BlockPlan {
+    pub(crate) fn run(&self, stream: &Arc<CudaStream>) -> Result<()> {
+        unsafe {
+            stream
+                .launch_builder(&self.kernel)
+                .arg(&self.pointers[0])
+                .arg(&self.pointers[1])
+                .arg(&self.pointers[2])
+                .arg(&self.pointers[3])
+                .arg(&self.pointers[4])
+                .arg(&self.shape[0])
+                .arg(&self.shape[1])
+                .arg(&self.shape[2])
+                .launch(self.grid)?;
+        }
+        Ok(())
+    }
+}
+
 impl Fp8Ops {
     #[cfg(feature = "cuda")]
+    pub(crate) fn bind_block(
+        &self,
+        weight: LinearWeightRef,
+        codes: Tensor<u8, 2>,
+        scale: Fp8ScaleRef,
+        output: &TensorMut<bf16, 2>,
+    ) -> Result<Fp8BlockPlan> {
+        use crate::fp8::Fp8BlockScale;
+        use safetensors::Dtype;
+        let LinearWeightRef::Fp8 {
+            codes: weight,
+            scale: weight_scale,
+            layout,
+        } = weight
+        else {
+            anyhow::bail!("prepared FP8 linear requires native FP8 weights");
+        };
+        weight_scale.validate(&weight, layout)?;
+        let block = layout
+            .block_scale()
+            .context("native FP8 block layout missing")?;
+        let family = match (block.dtype(), block.block()) {
+            (Dtype::F32, [128, 128]) => 0,
+            (Dtype::F8_E8M0, [32, 32]) => 1,
+            _ => anyhow::bail!("unsupported prepared FP8 block layout {layout:?}"),
+        };
+        scale.validate(
+            &codes,
+            Fp8ScaleLayout::Block(Fp8BlockScale::new([1, block.block()[1]], block.dtype())?),
+        )?;
+        output.0.validate()?;
+        let [m, k] = codes.shape;
+        let n = weight.shape[0];
+        ensure!(
+            k == weight.shape[1]
+                && output.0.shape == [m, n]
+                && output.0.stride == [u64::from(n), 1],
+            "native FP8 linear activation/output shape mismatch"
+        );
+        disjoint(&weight, &output.0)?;
+        disjoint(&codes, &output.0)?;
+        weight_scale.disjoint(&output.0)?;
+        scale.disjoint(&output.0)?;
+        let tiled = m > 8;
+        let blocks = if tiled {
+            u64::from(m.div_ceil(16)) * u64::from(n.div_ceil(32))
+        } else {
+            u64::from(m) * u64::from(n.div_ceil(8))
+        };
+        ensure!(blocks <= i32::MAX as u64, "native FP8 grid extent overflow");
+        Ok(Fp8BlockPlan {
+            kernel: self.block[family][usize::from(tiled)].clone(),
+            grid: super::ops::grid(blocks as usize, if tiled { 128 } else { 256 }),
+            pointers: [
+                weight.ptr,
+                weight_scale.ptr(),
+                codes.ptr,
+                scale.ptr(),
+                output.0.ptr,
+            ],
+            shape: [m as i32, n as i32, k as i32],
+        })
+    }
     pub(super) fn require_rows(&self, rows: usize) -> Result<()> {
         ensure!(
             rows > 0 && self.small.iter().all(|table| table.len() >= rows),
@@ -75,6 +363,16 @@ impl Fp8Ops {
                 module.load_function("fp8_dequant_bf16_per_channel")?,
             ],
             small: [load("")?, load("_per_channel")?],
+            block: [
+                [
+                    module.load_function("fp8_block_f32_128_decode")?,
+                    module.load_function("fp8_block_f32_128_mma")?,
+                ],
+                [
+                    module.load_function("fp8_block_e8m0_32_decode")?,
+                    module.load_function("fp8_block_e8m0_32_mma")?,
+                ],
+            ],
         })
     }
     #[cfg(feature = "rocm")]
@@ -188,9 +486,17 @@ impl Fp8Ops {
         }
         Ok(())
     }
-    fn check(codes: &Tensor<u8, 2>, scale: &Tensor<bf16, 2>, layout: Fp8ScaleLayout) -> Result<()> {
-        codes.validate()?;
-        scale.validate()?;
+    fn check(
+        codes: &Tensor<u8, 2>,
+        scale: Fp8ScaleRef,
+        layout: Fp8ScaleLayout,
+    ) -> Result<Tensor<bf16, 2>> {
+        scale.validate(codes, layout)?;
+        let Fp8ScaleRef::Bf16(scale) = scale else {
+            anyhow::bail!(
+                "native FP8 scale storage is valid but its execution kernel is not bound: {layout:?}"
+            );
+        };
         if let Some(descriptor) = layout.block_scale() {
             ensure!(
                 descriptor.block() == [128, 128] && descriptor.dtype() == safetensors::Dtype::BF16,
@@ -199,30 +505,18 @@ impl Fp8Ops {
                 descriptor.dtype()
             );
         }
-        ensure!(
-            codes.shape.iter().all(|&v| v <= i32::MAX as u32)
-                && codes.stride == [u64::from(codes.shape[1]), 1],
-            "invalid FP8 matrix"
-        );
-        let shape = layout
-            .scale_shape(codes.shape[0], codes.shape[1])
-            .map(|v| v as u32);
-        ensure!(
-            scale.shape == shape && scale.stride == [u64::from(shape[1]), 1],
-            "invalid FP8 scale"
-        );
-        Ok(())
+        Ok(scale)
     }
     #[cfg(feature = "cuda")]
     pub fn materialize(
         &self,
         stream: &Arc<CudaStream>,
         codes: Tensor<u8, 2>,
-        scale: Tensor<bf16, 2>,
+        scale: Fp8ScaleRef,
         layout: Fp8ScaleLayout,
         dst: &mut TensorMut<bf16, 2>,
     ) -> Result<()> {
-        Self::check(&codes, &scale, layout)?;
+        let scale = Self::check(&codes, scale, layout)?;
         dst.0.validate()?;
         ensure!(
             dst.0.shape == codes.shape && dst.0.stride == codes.stride,
@@ -254,12 +548,12 @@ impl Fp8Ops {
         &self,
         stream: &Arc<CudaStream>,
         codes: Tensor<u8, 2>,
-        scale: Tensor<bf16, 2>,
+        scale: Fp8ScaleRef,
         layout: Fp8ScaleLayout,
         x: Tensor<bf16, 2>,
         y: &mut TensorMut<bf16, 2>,
     ) -> Result<()> {
-        Self::check(&codes, &scale, layout)?;
+        let scale = Self::check(&codes, scale, layout)?;
         validate_call(codes.shape, x, &y.0)?;
         self.require_rows(x.shape[0] as usize)?;
         disjoint(&codes, &y.0)?;
@@ -343,6 +637,54 @@ pub(crate) fn validate_call(
     disjoint(&x, y)
 }
 impl WeightCatalog {
+    fn fp8_scale_ref(&self, name: &str, stream: &Arc<CudaStream>) -> Result<Fp8ScaleRef> {
+        use super::weights::StoredTensor;
+        use safetensors::Dtype;
+        let entry = self
+            .manifest
+            .entries
+            .get(name)
+            .context("FP8 scale absent from manifest")?;
+        ensure!(
+            entry.load && entry.shape.len() == 2,
+            "FP8 scale must be a loaded matrix: {name}"
+        );
+        let (ptr, bytes) = match self.tensors.get(name).context("FP8 scale not uploaded")? {
+            StoredTensor::Bf16(buffer) => {
+                ensure!(
+                    entry.dtype == Dtype::BF16,
+                    "FP8 scale native storage mismatch: {name}"
+                );
+                (
+                    buffer.device_ptr(stream).0,
+                    buffer.len().checked_mul(2).context("scale byte overflow")?,
+                )
+            }
+            StoredTensor::Bytes(buffer) => {
+                ensure!(
+                    matches!(entry.dtype, Dtype::F32 | Dtype::F8_E8M0),
+                    "FP8 scale native storage mismatch: {name}"
+                );
+                (buffer.device_ptr(stream).0, buffer.len())
+            }
+        };
+        ensure!(
+            bytes == entry.bytes,
+            "FP8 scale upload extent mismatch: {name}"
+        );
+        unsafe {
+            Fp8ScaleRef::new(
+                ptr,
+                [
+                    u32::try_from(entry.shape[0])?,
+                    u32::try_from(entry.shape[1])?,
+                ],
+                bytes as u64,
+                entry.dtype,
+            )
+        }
+    }
+
     pub fn linear_ref(&self, name: &str, stream: &Arc<CudaStream>) -> Result<LinearWeightRef> {
         let entry = self
             .manifest
@@ -379,16 +721,18 @@ impl WeightCatalog {
                     .linear_format
                     .fp8_layout()
                     .context("FP8 tensor declared as BF16")?;
-                let scale = self.bf16(scale_name)?;
-                let sh = layout.scale_shape(shape[0], shape[1]).map(|v| v as u32);
+                let scale = self.fp8_scale_ref(scale_name, stream)?;
                 let (wp, _rw) = w.device_ptr(stream);
-                let (sp, _rs) = scale.device_ptr(stream);
+                ensure!(
+                    w.len() == entry.bytes,
+                    "FP8 code upload extent mismatch: {name}"
+                );
+                let codes = unsafe { Tensor::new(wp, shape, stride, entry.bytes as u64)? };
+                scale.validate(&codes, layout)?;
                 Ok(LinearWeightRef::Fp8 {
                     layout,
-                    codes: unsafe { Tensor::new(wp, shape, stride, entry.bytes as u64)? },
-                    scale: unsafe {
-                        Tensor::new(sp, sh, [u64::from(sh[1]), 1], (scale.len() * 2) as u64)?
-                    },
+                    codes,
+                    scale,
                 })
             }
         }
@@ -418,7 +762,7 @@ struct BoundProjection {
     #[cfg(feature = "cuda")]
     prefill: Tensor<bf16, 2>,
     #[cfg(feature = "rocm")]
-    calls: std::cell::RefCell<std::collections::BTreeMap<(u32, u64, u64), Fp8Projection>>,
+    calls: std::cell::RefCell<std::collections::BTreeMap<(u32, u64, u64), ChannelProjection>>,
     invariant_rows: usize,
 }
 /// Setup-bound views for a layer. Engine retains catalog/arena storage; run does
@@ -789,6 +1133,475 @@ mod tests {
     use crate::op_contract::ExecutionPhase;
     use std::{path::PathBuf, rc::Rc};
 
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn bf16_f32_projection_bounds() -> Result<()> {
+        use super::super::contracts::dense_layout;
+        fn view<T: Copy>(ptr: u64, shape: [u32; 2]) -> Result<Tensor<T, 2>> {
+            let (stride, n) = dense_layout(shape)?;
+            unsafe { Tensor::new(ptr, shape, stride, n * size_of::<T>() as u64) }
+        }
+        let x = view(0x100000, [16, 5120])?;
+        let w = view(0x1000000, [512, 5120])?;
+        let y = view(0x2000000, [16, 512])?;
+        assert_eq!(bf16_f32_shape(x, w, y)?, [16, 512, 5120]);
+        assert!(
+            bf16_f32_shape(view(0x100000, [17, 5120])?, w, view(0x2000000, [17, 512])?).is_err()
+        );
+        assert!(bf16_f32_shape(view(0x100000, [16, 5118])?, w, y).is_err());
+        assert!(bf16_f32_shape(x, w, view(0x100000, [16, 512])?).is_err());
+        assert!(
+            view(0x100002, [16, 5120])
+                .and_then(|v| bf16_f32_shape(v, w, y))
+                .is_err()
+        );
+        assert!(bf16_f32_shape(x, w, view(0x2000000, [16, 511])?).is_err());
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires GPU lease; native BF16 weights with FP32 projection output"]
+    fn bf16_f32_projection_gpu() -> Result<()> {
+        use super::super::contracts::view;
+        const K: usize = 5120;
+        const N: usize = 512;
+        let ctx = CudaContext::new(0)?;
+        let stream = ctx.new_stream()?;
+        let inputs: Vec<i32> = (0..16 * K)
+            .map(|i| ((i % K * 37 + i / K * 17) % 251 % 15) as i32 - 7)
+            .collect();
+        let weights: Vec<i32> = (0..N * K)
+            .map(|i| ((i % K * 29 + i / K * 13) % 241 % 15) as i32 - 7)
+            .collect();
+        let mut oracle = Vec::with_capacity(16 * N);
+        for row in 0..16 {
+            for col in 0..N {
+                let sum: i64 = inputs[row * K..(row + 1) * K]
+                    .iter()
+                    .zip(&weights[col * K..(col + 1) * K])
+                    .map(|(&a, &b)| i64::from(a) * i64::from(b))
+                    .sum();
+                // Every product is an integer multiple of 1/256; absolute partial sum <=5120*49<2^24.
+                ensure!(sum.abs() < (1 << 24), "projection exact oracle range");
+                oracle.push(sum as f32 / 256.0);
+            }
+        }
+        let x = stream.clone_htod(
+            &inputs
+                .iter()
+                .map(|&n| bf16::from_f32(n as f32 / 16.0))
+                .collect::<Vec<_>>(),
+        )?;
+        let w = stream.clone_htod(
+            &weights
+                .iter()
+                .map(|&n| bf16::from_f32(n as f32 / 16.0))
+                .collect::<Vec<_>>(),
+        )?;
+        let legacy =
+            super::super::cubin::module(&ctx, "gemm_skinny")?.load_function("gemm_skinny_bf16")?;
+        let mut cells = 0;
+        for rows in [1u32, 2, 5, 8, 16] {
+            let output = stream.clone_htod(&vec![127.0f32; rows as usize * N + 16])?;
+            let old = stream.alloc_zeros::<bf16>(rows as usize * N)?;
+            let xv = view(&x, &stream, 0, [rows, K as u32], [K as u64, 1])?;
+            let wv = view(&w, &stream, 0, [N as u32, K as u32], [K as u64, 1])?;
+            let yv = view(&output, &stream, 0, [rows, N as u32], [N as u64, 1])?;
+            let plan = Bf16F32Plan::new(&ctx, xv, wv, yv)?;
+            plan.run(&stream)?;
+            let eager = stream.clone_dtoh(&output)?;
+            ensure!(
+                eager[..rows as usize * N] == oracle[..rows as usize * N]
+                    && eager[rows as usize * N..].iter().all(|&v| v == 127.0),
+                "BF16 F32 projection exact/guard DEFECT rows={rows}"
+            );
+            stream.begin_capture(
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )?;
+            plan.run(&stream)?;
+            stream
+                .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
+                .context("F32 projection graph empty")?
+                .launch()?;
+            ensure!(
+                stream.clone_dtoh(&output)? == eager,
+                "F32 projection graph bits DEFECT rows={rows}"
+            );
+            let (old_ptr, record) = old.device_ptr(&stream);
+            drop(record);
+            unsafe {
+                stream
+                    .launch_builder(&legacy)
+                    .arg(&wv.ptr)
+                    .arg(&xv.ptr)
+                    .arg(&old_ptr)
+                    .arg(&(N as i32))
+                    .arg(&(K as i32))
+                    .arg(&(K as i64))
+                    .arg(&(rows as i32))
+                    .arg(&0i32)
+                    .launch(cudarc::driver::LaunchConfig {
+                        grid_dim: ((N as u32).div_ceil(16), 1, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 40960,
+                    })?;
+            }
+            let rounded = stream.clone_dtoh(&old)?;
+            ensure!(
+                rounded
+                    .iter()
+                    .zip(&oracle)
+                    .all(|(&a, &b)| a == bf16::from_f32(b)),
+                "legacy BF16 projection DEFECT rows={rows}"
+            );
+            let premature = rounded
+                .iter()
+                .zip(&oracle)
+                .filter(|(a, b)| a.to_f32() != **b)
+                .count();
+            ensure!(
+                premature > 0,
+                "premature BF16 store control escaped rows={rows}"
+            );
+            println!(
+                "BF16_F32_PROJECTION rows={rows} weights_bf16=[512,5120] input=[{rows},5120] output=[{rows},512] fp64_bits=0 graph_bits=0 premature_round_mismatches={premature}"
+            );
+            cells += 1;
+        }
+        println!(
+            "PASS BF16_F32_PROJECTION cases={cells} exact_dyadic_fp64=true shape_bits=0 graph_bits=0 guards=true premature_round_controls={cells}"
+        );
+        Ok(())
+    }
+
+    fn native_block_oracle(
+        codes: [&[u8]; 2],
+        scales: [&[f32]; 2],
+        shape: [usize; 3],
+        block: usize,
+        wrong_scale_cell: bool,
+    ) -> Vec<(f64, f64)> {
+        let [m, n, k] = shape;
+        let groups = k.div_ceil(block);
+        (0..m * n)
+            .map(|index| {
+                let row = index / n;
+                let col = index % n;
+                let scale_row = if wrong_scale_cell {
+                    (col / block + 1) % n.div_ceil(block)
+                } else {
+                    col / block
+                };
+                let mut sum = 0.0;
+                let mut absolute = 0.0;
+                for inner in 0..k {
+                    let weight = f64::from(crate::fp8::decode_e4m3(codes[0][col * k + inner]))
+                        * f64::from(scales[0][scale_row * groups + inner / block]);
+                    let input = f64::from(crate::fp8::decode_e4m3(codes[1][row * k + inner]))
+                        * f64::from(scales[1][row * groups + inner / block]);
+                    let product = weight * input;
+                    sum += product;
+                    absolute += product.abs();
+                }
+                // FP32 reduction bound plus one BF16 rounding unit and FP64 reference roundoff.
+                let epsilon = f64::from(f32::EPSILON);
+                let gamma =
+                    (k + 2 * groups) as f64 * epsilon / (1.0 - (k + 2 * groups) as f64 * epsilon);
+                let bound = gamma * absolute + sum.abs() / 256.0 + 1.0e-30;
+                (sum, bound)
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "GPU native FP8 block-scale linear correctness"]
+    fn fp8_native_block_linear_matches_fp64() -> Result<()> {
+        use crate::fp8::Fp8BlockScale;
+        use cudarc::driver::sys;
+        use safetensors::Dtype;
+        let device = Device::new(0)?;
+        let stream = &device.stream;
+        let ops = Fp8Ops::new(&device.ctx)?;
+        let mut defects = 0;
+        let mut cases = 0;
+        for (dtype, block, production) in [
+            (Dtype::F32, 128usize, [1536usize, 4096usize]),
+            (Dtype::F8_E8M0, 32usize, [1280usize, 5120usize]),
+        ] {
+            let layout = Fp8ScaleLayout::Block(Fp8BlockScale::new([block as u32; 2], dtype)?);
+            for [n, k] in [[block * 2 + 3, block * 2 + 5], [block * 2, 32], production] {
+                let groups = k.div_ceil(block);
+                let weight: Vec<_> = (0..n * k)
+                    .map(|i| ((i * 37 + 11) % 67) as u8 | (((i * 13 + 7) % 5 < 2) as u8 * 128))
+                    .collect();
+                let weight_scales: Vec<_> = (0..n.div_ceil(block) * groups)
+                    .map(|i| {
+                        let value = 2.0f32.powi(((i * 17 + 3) % 7) as i32 - 4);
+                        if dtype == Dtype::F32 {
+                            value * (1.0 + (i * 23 % 11) as f32 / 31.0)
+                        } else {
+                            value
+                        }
+                    })
+                    .collect();
+                let weight_scale_bytes: Vec<u8> = if dtype == Dtype::F32 {
+                    weight_scales.iter().flat_map(|v| v.to_le_bytes()).collect()
+                } else {
+                    weight_scales
+                        .iter()
+                        .map(|v| (v.log2() as i32 + 127) as u8)
+                        .collect()
+                };
+                let wc = stream.clone_htod(&weight)?;
+                let ws = stream.clone_htod(&weight_scale_bytes)?;
+                let wc_view = unsafe {
+                    Tensor::new(
+                        wc.device_ptr(stream).0,
+                        [n as u32, k as u32],
+                        [k as u64, 1],
+                        (n * k) as u64,
+                    )?
+                };
+                let ws_view = unsafe {
+                    Fp8ScaleRef::new(
+                        ws.device_ptr(stream).0,
+                        [n.div_ceil(block) as u32, groups as u32],
+                        weight_scale_bytes.len() as u64,
+                        dtype,
+                    )?
+                };
+                let rows: &[usize] = if [n, k] == production {
+                    &[1, 17]
+                } else if [n, k] == [block * 2, 32] {
+                    &[16]
+                } else {
+                    &[1, 3, 8, 9, 17, 33]
+                };
+                for &m in rows {
+                    let input: Vec<_> = (0..m * k)
+                        .map(|i| ((i * 43 + 19) % 71) as u8 | (((i * 11 + 5) % 7 < 3) as u8 * 128))
+                        .collect();
+                    let input_scales: Vec<_> = (0..m * groups)
+                        .map(|i| {
+                            let value = 2.0f32.powi(((i * 19 + 2) % 5) as i32 - 5);
+                            if dtype == Dtype::F32 {
+                                value * (1.0 + (i * 29 % 13) as f32 / 37.0)
+                            } else {
+                                value
+                            }
+                        })
+                        .collect();
+                    let input_scale_bytes: Vec<u8> = if dtype == Dtype::F32 {
+                        input_scales.iter().flat_map(|v| v.to_le_bytes()).collect()
+                    } else {
+                        input_scales
+                            .iter()
+                            .map(|v| (v.log2() as i32 + 127) as u8)
+                            .collect()
+                    };
+                    let oracle = native_block_oracle(
+                        [&weight, &input],
+                        [&weight_scales, &input_scales],
+                        [m, n, k],
+                        block,
+                        false,
+                    );
+                    let mutant = native_block_oracle(
+                        [&weight, &input],
+                        [&weight_scales, &input_scales],
+                        [m, n, k],
+                        block,
+                        true,
+                    );
+                    let control = oracle
+                        .iter()
+                        .zip(&mutant)
+                        .filter(|((reference, bound), (wrong, _))| {
+                            (reference - wrong).abs() > *bound
+                        })
+                        .count();
+                    ensure!(control > 0, "wrong scale-cell control not discriminating");
+                    let xc = stream.clone_htod(&input)?;
+                    let xs = stream.clone_htod(&input_scale_bytes)?;
+                    let canary = bf16::from_bits(0x7fc1);
+                    let output = stream.clone_htod(&vec![canary; m * n + 16])?;
+                    let xc_view = unsafe {
+                        Tensor::new(
+                            xc.device_ptr(stream).0,
+                            [m as u32, k as u32],
+                            [k as u64, 1],
+                            (m * k) as u64,
+                        )?
+                    };
+                    let xs_view = unsafe {
+                        Fp8ScaleRef::new(
+                            xs.device_ptr(stream).0,
+                            [m as u32, groups as u32],
+                            input_scale_bytes.len() as u64,
+                            dtype,
+                        )?
+                    };
+                    let output_view = unsafe {
+                        TensorMut::new(
+                            output.device_ptr(stream).0,
+                            [m as u32, n as u32],
+                            [n as u64, 1],
+                            (m * n * 2) as u64,
+                        )?
+                    };
+                    let plan = ops.bind_block(
+                        LinearWeightRef::Fp8 {
+                            codes: wc_view,
+                            scale: ws_view,
+                            layout,
+                        },
+                        xc_view,
+                        xs_view,
+                        &output_view,
+                    )?;
+                    device.finish_upload()?;
+                    for graph in [false, true] {
+                        if graph {
+                            stream.begin_capture(
+                                sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                            )?;
+                            let result = plan.run(stream);
+                            let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
+                            result?;
+                            captured?.context("empty native FP8 graph")?.launch()?;
+                        } else {
+                            plan.run(stream)?;
+                        }
+                        stream.synchronize()?;
+                        let got = stream.clone_dtoh(&output)?;
+                        ensure!(
+                            got[..m * n].iter().all(|v| v.is_finite()),
+                            "non-finite native FP8 output"
+                        );
+                        ensure!(
+                            got[m * n..].iter().all(|v| v.to_bits() == canary.to_bits()),
+                            "native FP8 output guard overwritten"
+                        );
+                        let bad = got
+                            .iter()
+                            .zip(&oracle)
+                            .filter(|(value, (reference, bound))| {
+                                (f64::from(value.to_f32()) - reference).abs() > *bound
+                            })
+                            .count();
+                        defects += bad;
+                        cases += 1;
+                        println!(
+                            "FP8_NATIVE_BLOCK_CELL dtype={dtype:?} block={block} weight=[{n},{k}] input=[{m},{k}] graph={graph} defects={bad} scale_cell_control={control}"
+                        );
+                    }
+                }
+            }
+        }
+        println!(
+            "{} FP8_NATIVE_BLOCK cases={cases} defects={defects} fp64=true scale_cell_control=true graph_eager=true no_materialization=true",
+            if defects == 0 { "PASS" } else { "DEFECT" }
+        );
+        ensure!(defects == 0, "native FP8 block linear defects={defects}");
+        Ok(())
+    }
+
+    #[test]
+    fn fp8_native_scale_views_check_storage_and_block_geometry() -> Result<()> {
+        use crate::fp8::Fp8BlockScale;
+        use safetensors::Dtype;
+        let mut cases = 0;
+        let mut wrong_dtype = 0;
+        for (dtype, block) in [
+            (Dtype::BF16, [128, 128]),
+            (Dtype::F32, [128, 128]),
+            (Dtype::F8_E8M0, [32, 32]),
+        ] {
+            let layout = Fp8ScaleLayout::Block(Fp8BlockScale::new(block, dtype)?);
+            for [n, k] in [[1u32, 1u32], [129, 257], [1536, 4096], [32768, 1280]] {
+                // Metadata-only views; no address is dereferenced.
+                let codes = unsafe {
+                    Tensor::new(
+                        0x1000,
+                        [n, k],
+                        [u64::from(k), 1],
+                        u64::from(n) * u64::from(k),
+                    )?
+                };
+                let shape = layout.scale_shape(n, k).map(|n| n as u32);
+                let bytes =
+                    u64::from(shape[0]) * u64::from(shape[1]) * (dtype.bitsize() / 8) as u64;
+                let ptr = 0x1_0000_0000;
+                let scale = unsafe { Fp8ScaleRef::new(ptr, shape, bytes, dtype)? };
+                scale.validate(&codes, layout)?;
+                match (scale, dtype) {
+                    (Fp8ScaleRef::Bf16(t), Dtype::BF16) => assert_eq!(t.ptr, ptr),
+                    (Fp8ScaleRef::F32(t), Dtype::F32) => assert_eq!(t.ptr, ptr),
+                    (Fp8ScaleRef::E8m0(t), Dtype::F8_E8M0) => assert_eq!(t.ptr, ptr),
+                    _ => panic!("native scale storage type changed"),
+                }
+                assert_eq!(
+                    Fp8Ops::check(&codes, scale, layout).is_ok(),
+                    dtype == Dtype::BF16
+                );
+                for wrong in [Dtype::BF16, Dtype::F32, Dtype::F8_E8M0]
+                    .into_iter()
+                    .filter(|d| *d != dtype)
+                {
+                    let wrong_bytes =
+                        u64::from(shape[0]) * u64::from(shape[1]) * (wrong.bitsize() / 8) as u64;
+                    let view = unsafe { Fp8ScaleRef::new(ptr, shape, wrong_bytes, wrong)? };
+                    assert!(view.validate(&codes, layout).is_err());
+                    wrong_dtype += 1;
+                }
+                assert!(unsafe { Fp8ScaleRef::new(ptr, shape, bytes - 1, dtype) }.is_err());
+                let oversized = unsafe { Fp8ScaleRef::new(ptr, shape, bytes + 16, dtype)? };
+                assert!(oversized.validate(&codes, layout).is_err());
+                let overlap = unsafe { Fp8ScaleRef::new(codes.ptr, shape, bytes, dtype)? };
+                assert!(overlap.validate(&codes, layout).is_err());
+                let mut padded = codes;
+                padded.span_bytes += 16;
+                assert!(scale.validate(&padded, layout).is_err());
+                let mut strided = codes;
+                strided.stride[1] = 2;
+                assert!(scale.validate(&strided, layout).is_err());
+                let mut too_wide = codes;
+                too_wide.shape = [1, i32::MAX as u32 + 1];
+                too_wide.stride = [u64::from(too_wide.shape[1]), 1];
+                too_wide.span_bytes = u64::from(too_wide.shape[1]);
+                assert!(scale.validate(&too_wide, layout).is_err());
+                let wrong_grid = [shape[0] + 1, shape[1]];
+                let wrong_bytes = u64::from(wrong_grid[0])
+                    * u64::from(wrong_grid[1])
+                    * (dtype.bitsize() / 8) as u64;
+                let wrong = unsafe { Fp8ScaleRef::new(ptr, wrong_grid, wrong_bytes, dtype)? };
+                assert!(wrong.validate(&codes, layout).is_err());
+                cases += 1;
+            }
+        }
+        let codes = unsafe { Tensor::new(0x1000, [129, 257], [257, 1], 129 * 257)? };
+        let per_channel = unsafe { Fp8ScaleRef::new(0x1_0000_0000, [129, 1], 258, Dtype::BF16)? };
+        per_channel.validate(&codes, Fp8ScaleLayout::PerChannel)?;
+        assert!(Fp8Ops::check(&codes, per_channel, Fp8ScaleLayout::PerChannel).is_ok());
+        let Fp8ScaleRef::Bf16(mut wrong_stride) = per_channel else {
+            unreachable!()
+        };
+        wrong_stride.stride[1] = 2;
+        assert!(
+            Fp8ScaleRef::Bf16(wrong_stride)
+                .validate(&codes, Fp8ScaleLayout::PerChannel)
+                .is_err()
+        );
+        assert!(unsafe { Fp8ScaleRef::new(0x1001, [1, 1], 4, Dtype::F32) }.is_err());
+        assert!(unsafe { Fp8ScaleRef::new(0x1000, [1, 1], 1, Dtype::F8_E4M3) }.is_err());
+        assert!(unsafe { Fp8ScaleRef::new(0x1000, [0, 1], 1, Dtype::F8_E8M0) }.is_err());
+        println!(
+            "PASS FP8_NATIVE_SCALE_VIEWS block_cells={cases} per_channel=1 wrong_dtype_controls={wrong_dtype} bounds_controls=true execution_unbound_f32_e8m0=true no_gpu=true"
+        );
+        Ok(())
+    }
+
     fn invariant_rows(
         device: &Device,
         blas: &Blas,
@@ -1112,13 +1925,13 @@ mod tests {
                     let scale = stream.clone_htod(&scales)?;
                     let weight = LinearWeightRef::Fp8 {
                         codes: view(&codes, stream, 0, [n as u32, k as u32], [k as u64, 1])?,
-                        scale: view(
+                        scale: Fp8ScaleRef::Bf16(view(
                             &scale,
                             stream,
                             0,
                             [scale_rows as u32, scale_cols as u32],
                             [scale_cols as u64, 1],
-                        )?,
+                        )?),
                         layout,
                     };
                     let bound = match layout {

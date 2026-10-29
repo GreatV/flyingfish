@@ -6,7 +6,7 @@ use super::{
     closure::Closure,
     contracts::{RowDomain, Scratch, SeqRef, Tensor, TensorMut},
     cubin,
-    linear::{Fp8Ops, LinearWeightRef},
+    linear::{Fp8Ops, Fp8ScaleRef, LinearWeightRef},
     moe::testing::view,
     ops::{
         CommonOpsRef, GatedRmsInput, GdnGateBindings, Ops, ResidualRmsInput, RmsMode, RmsOptions,
@@ -138,7 +138,7 @@ fn q38_primitives_gpu() -> Result<()> {
             let w = view(&wb, s, [n, k], [u64::from(k), 1])?;
             let sc = view(&sb, s, shape, [u64::from(shape[1]), 1])?;
             let mut out = TensorMut(view(&y, s, [n, k], [u64::from(k), 1])?);
-            fp8.materialize(s, w, sc, layout, &mut out)?;
+            fp8.materialize(s, w, Fp8ScaleRef::Bf16(sc), layout, &mut out)?;
             let got = s.clone_dtoh(&y)?;
             for row in 0..n {
                 for col in 0..k {
@@ -166,7 +166,7 @@ fn q38_primitives_gpu() -> Result<()> {
                 let mut permuted = scales.clone();
                 permuted.rotate_left(1);
                 s.memcpy_htod(&permuted, &mut sb)?;
-                fp8.materialize(s, w, sc, layout, &mut out)?;
+                fp8.materialize(s, w, Fp8ScaleRef::Bf16(sc), layout, &mut out)?;
                 let wrong = s.clone_dtoh(&y)?;
                 let differences = got
                     .iter()
@@ -216,7 +216,7 @@ fn q38_primitives_gpu() -> Result<()> {
         fp8.materialize(
             s,
             w,
-            sc,
+            Fp8ScaleRef::Bf16(sc),
             Fp8ScaleLayout::Block(
                 crate::fp8::Fp8BlockScale::new([128, 128], safetensors::Dtype::BF16)
                     .expect("valid BF16 block scale"),
@@ -268,7 +268,7 @@ fn q38_primitives_gpu() -> Result<()> {
                                 .expect("valid BF16 block scale"),
                         ),
                         codes: w,
-                        scale: sc,
+                        scale: Fp8ScaleRef::Bf16(sc),
                     },
                     x,
                     &mut y,
@@ -338,7 +338,7 @@ fn q38_primitives_gpu() -> Result<()> {
                     LinearWeightRef::Fp8 {
                         layout,
                         codes: codes_view,
-                        scale: scales_view,
+                        scale: Fp8ScaleRef::Bf16(scales_view),
                     },
                     x,
                     &mut y,
@@ -390,7 +390,7 @@ fn q38_primitives_gpu() -> Result<()> {
                         LinearWeightRef::Fp8 {
                             layout,
                             codes: codes_view,
-                            scale: scales_view,
+                            scale: Fp8ScaleRef::Bf16(scales_view),
                         },
                         x,
                         &mut y,
@@ -486,7 +486,7 @@ fn q38_primitives_gpu() -> Result<()> {
             fp8.materialize(
                 s,
                 w,
-                sc,
+                Fp8ScaleRef::Bf16(sc),
                 Fp8ScaleLayout::Block(
                     crate::fp8::Fp8BlockScale::new([128, 128], safetensors::Dtype::BF16)
                         .expect("valid BF16 block scale"),
@@ -525,7 +525,7 @@ fn q38_primitives_gpu() -> Result<()> {
                                 .expect("valid BF16 block scale"),
                             ),
                             codes: w,
-                            scale: sc,
+                            scale: Fp8ScaleRef::Bf16(sc),
                         },
                     ),
                 ] {
@@ -928,7 +928,7 @@ fn verify_projection_m4(
                 .expect("valid BF16 block scale"),
         ),
         codes: codes_view,
-        scale: scales_view,
+        scale: Fp8ScaleRef::Bf16(scales_view),
     };
     let batch_x = view(
         &row_buffer,
@@ -3845,7 +3845,7 @@ fn residual_rms_capture_gpu() -> Result<()> {
                             )?;
                         }
                     }
-                    RmsMode::Standard => {
+                    RmsMode::Standard | RmsMode::Unrounded => {
                         for row in 1..=active {
                             let offset = (row * hidden * size_of::<bf16>()) as u64;
                             let rp = baseline_view.0.ptr + offset;
@@ -4024,5 +4024,142 @@ fn residual_rms_capture_gpu() -> Result<()> {
         if defects == 0 { "PASS" } else { "DEFECT" }
     );
     ensure!(defects == 0, "capture candidate has {defects} defects");
+    Ok(())
+}
+
+#[test]
+#[ignore = "exclusive CUDA; FF_Q38_GPU_WINDOW=granted"]
+fn dsa_bounded_topk_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    let device = Device::new(0)?;
+    let s = &device.stream;
+    use super::{
+        moe::testing,
+        selection::{DsaSelectionPlan, DsaTopKInput, DsaTopKOutput},
+    };
+    for shape in [[0, 7, 7], [4, 0, 7], [4, 7, 0], [4, 7, 2049]] {
+        ensure!(
+            DsaSelectionPlan::new(&device.ctx, shape[0], shape[1], shape[2]).is_err(),
+            "selection setup capacity control"
+        );
+    }
+    let mut defects = 0;
+    for (candidates, keep) in [
+        (7, 7),
+        (512, 512),
+        (2048, 512),
+        (2048, 2047),
+        (2048, 2048),
+        (65536, 512),
+        (65536, 2048),
+    ] {
+        let plan = DsaSelectionPlan::new(&device.ctx, 4, candidates as u32, keep as u32)?;
+        let mut scores = vec![0.0f32; 4 * candidates];
+        let mut ids = vec![0i32; 4 * candidates];
+        let mut expected_ids = vec![-1; 4 * keep];
+        let mut expected_scores = vec![f32::NEG_INFINITY; 4 * keep];
+        let mut expected_margin = [f32::INFINITY; 4];
+        for row in 0..4 {
+            let mut sorted = Vec::new();
+            for candidate in 0..candidates {
+                let score = if row == 3 {
+                    f32::NEG_INFINITY
+                } else if row == 1 {
+                    if candidate % 2 == 0 { 0.0 } else { -0.0 }
+                } else if row == 2 && candidate % 11 == 0 {
+                    f32::NEG_INFINITY
+                } else {
+                    ((candidate * 29 + 13) % 1031) as f32 / 128.0
+                };
+                let id = if row == 3 || (row == 2 && candidate % 13 == 0) {
+                    -1
+                } else {
+                    ((candidate * 37) % candidates) as i32
+                };
+                scores[row * candidates + candidate] = score;
+                ids[row * candidates + candidate] = id;
+                if id >= 0 && score.is_finite() {
+                    sorted.push((id, score));
+                }
+            }
+            sorted.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1)
+                    .expect("finite score")
+                    .then(a.0.cmp(&b.0))
+            });
+            for (slot, &(id, score)) in sorted.iter().take(keep).enumerate() {
+                expected_ids[row * keep + slot] = id;
+                expected_scores[row * keep + slot] = score;
+            }
+            if sorted.len() > keep {
+                expected_margin[row] = sorted[keep - 1].1 - sorted[keep].1;
+            }
+        }
+        let scores = s.clone_htod(&scores)?;
+        let ids = s.clone_htod(&ids)?;
+        let selected = s.clone_htod(&vec![i32::MIN; 4 * keep + 8])?;
+        let values = s.clone_htod(&vec![-12345.0f32; 4 * keep + 8])?;
+        let margins = s.clone_htod(&[-12345.0f32; 12])?;
+        let input = DsaTopKInput {
+            scores: testing::dense(&scores, s, 4, candidates as u32)?,
+            ids: testing::dense(&ids, s, 4, candidates as u32)?,
+        };
+        let output = DsaTopKOutput {
+            scores: testing::dense_mut(&values, s, 4, keep as u32)?,
+            ids: testing::dense_mut(&selected, s, 4, keep as u32)?,
+            margins: testing::mut_view(&margins, s, [4], [1])?,
+        };
+        let wrong_extent =
+            DsaSelectionPlan::new(&device.ctx, 4, candidates as u32 + 1, keep as u32)?;
+        ensure!(
+            wrong_extent.select_scores(&input, &output, s).is_err(),
+            "selection extent control"
+        );
+        let alias = DsaTopKOutput {
+            scores: testing::dense_mut(&values, s, 4, keep as u32)?,
+            ids: testing::dense_mut(&selected, s, 4, keep as u32)?,
+            margins: testing::mut_view(&scores, s, [4], [1])?,
+        };
+        ensure!(
+            plan.select_scores(&input, &alias, s).is_err(),
+            "selection alias control"
+        );
+        device.finish_upload()?;
+        for graph in [false, true] {
+            if graph {
+                s.begin_capture(
+                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )?;
+            }
+            plan.select_scores(&input, &output, s)?;
+            if graph {
+                s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
+                    .context("Runner FAIL empty selection graph")?
+                    .launch()?;
+            }
+            let selected = s.clone_dtoh(&selected)?;
+            let values = s.clone_dtoh(&values)?;
+            let margins = s.clone_dtoh(&margins)?;
+            ensure!(
+                selected[4 * keep..].iter().all(|&v| v == i32::MIN)
+                    && values[4 * keep..].iter().all(|&v| v == -12345.0)
+                    && margins[4..].iter().all(|&v| v == -12345.0),
+                "selection output guard"
+            );
+            let pass = selected[..4 * keep] == expected_ids
+                && values[..4 * keep] == expected_scores
+                && margins[..4] == expected_margin;
+            defects += usize::from(!pass);
+            println!(
+                "{} DSA_BOUNDED_TOPK candidates={candidates} keep={keep} rows=4 graph={graph} exact_ids_scores_margin={pass}",
+                if pass { "PASS" } else { "DEFECT" }
+            );
+        }
+    }
+    println!("DSA_BOUNDED_TOPK_SUMMARY cases=7 modes=2 defects={defects}");
+    ensure!(defects == 0, "DEFECT bounded topk count={defects}");
     Ok(())
 }

@@ -694,6 +694,7 @@ impl Runtime {
         let common = CommonOpsRef::new_with_swiglu_rounding(
             &engine.device.ctx,
             engine.model_spec.swiglu_rounding(),
+            engine.model_spec.swiglu_limit(),
         )?;
         let positions = s.clone_htod(
             &crate::vision_input::PositionPlan::text(1, engine.capacity)?.packed_axes()?,
@@ -2113,7 +2114,7 @@ impl Engine {
             model_spec.kv_heads as usize,
             model_spec.head_dim as usize,
         )?;
-        let flint_logits = if flint {
+        let logits_f32 = if flint {
             Some(s.alloc_zeros(model_spec.vocab as usize)?)
         } else {
             None
@@ -2155,7 +2156,7 @@ impl Engine {
             blas,
             flash: Some(flash),
             decode: None,
-            flint_logits,
+            logits_f32,
             device,
             config,
             model_spec,
@@ -3904,12 +3905,11 @@ impl Engine {
                 }
                 if flint {
                     let logits = self
-                        .flint_logits
+                        .logits_f32
                         .as_mut()
                         .context("Flint FP32 logits are not bound")?;
                     let input = &w.n.slice((rows - 1) * h..rows * h);
-                    self.ops
-                        .flint_lm_head_f32(s, input, &self.weights.head, logits)?;
+                    self.ops.lm_head_f32(s, input, &self.weights.head, logits)?;
                     self.ops.argmax_f32(s, logits, &mut w.token)?;
                     if let Some(t) = trace.as_mut() {
                         let values = s.clone_dtoh(logits)?;

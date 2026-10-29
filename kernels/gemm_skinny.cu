@@ -86,6 +86,7 @@ extern "C" __global__ __launch_bounds__(128) void gemm_skinny_bf16(
 // tiny requires positive even in, even ldw >= in, and 4B-aligned W/X bases.
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <type_traits>
 
 using bf16 = __nv_bfloat16;
 
@@ -124,9 +125,10 @@ constexpr int WT_BYTES = NW * RT * LDS * 2;        // 9216 per buffer
 constexpr int XT_BYTES = NW * MA * LDS * 2;        // 9216 per buffer
 constexpr int MG_OFF = 2 * (WT_BYTES + XT_BYTES);  // 36864; + merge 4096 = 40960 total
 
-extern "C" __global__ void __launch_bounds__(NT_) gemm_skinny_bf16(
+template<typename Output>
+__device__ __forceinline__ void skinny_project(
     const bf16* __restrict__ W, const bf16* __restrict__ X,
-    bf16* __restrict__ Y, int out_features, int in_features,
+    Output* __restrict__ Y, int out_features, int in_features,
     long ldw, int m, int tiny) {
   if (blockDim.x != NT_ || m < 1 || m > MA || out_features < 1 ||
       in_features < 1 || ldw < in_features) __trap();
@@ -160,7 +162,9 @@ extern "C" __global__ void __launch_bounds__(NT_) gemm_skinny_bf16(
       float total = 0.0f;
 #pragma unroll
       for (int w = 0; w < NW; ++w) total += partials[w];
-      Y[(size_t)row * out_features + output] = __float2bfloat16(total);
+      if constexpr (std::is_same_v<Output, bf16>)
+        Y[(size_t)row * out_features + output] = __float2bfloat16(total);
+      else Y[(size_t)row * out_features + output] = total;
     }
     return;
   }
@@ -269,8 +273,24 @@ extern "C" __global__ void __launch_bounds__(NT_) gemm_skinny_bf16(
     float s = 0.0f;
 #pragma unroll
     for (int w = 0; w < NW; ++w) s += mg[(w * RT + r) * MA + a];
-    Y[(size_t)a * out_features + row] = __float2bfloat16(s);
+    if constexpr (std::is_same_v<Output, bf16>)
+      Y[(size_t)a * out_features + row] = __float2bfloat16(s);
+    else Y[(size_t)a * out_features + row] = s;
   }
+}
+
+extern "C" __global__ __launch_bounds__(NT_) void gemm_skinny_bf16(
+    const bf16* __restrict__ W, const bf16* __restrict__ X,
+    bf16* __restrict__ Y, int out_features, int in_features,
+    long ldw, int m, int tiny) {
+    skinny_project(W, X, Y, out_features, in_features, ldw, m, tiny);
+}
+
+extern "C" __global__ __launch_bounds__(NT_) void gemm_skinny_bf16_f32(
+    const bf16* __restrict__ W, const bf16* __restrict__ X,
+    float* __restrict__ Y, int out_features, int in_features,
+    long ldw, int m) {
+    skinny_project(W, X, Y, out_features, in_features, ldw, m, 0);
 }
 
 #undef FD_GUARD_SKINNY

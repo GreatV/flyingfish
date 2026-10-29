@@ -533,7 +533,7 @@ impl Engine {
                         .into_iter()
                         .map(bf16::to_f32)
                         .collect::<Vec<_>>()
-                } else if let Some(logits) = &self.flint_logits {
+                } else if let Some(logits) = &self.logits_f32 {
                     stream.clone_dtoh(logits)?
                 } else {
                     stream

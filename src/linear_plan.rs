@@ -68,6 +68,7 @@ impl LayerDequantPlan {
     ) -> Result<Self> {
         let mut bytes = 0u64;
         let mut slots = BTreeMap::new();
+        let mut native = 0usize;
         for (name, e) in &manifest.entries {
             if !e.load
                 || e.is_routed_expert()
@@ -102,6 +103,10 @@ impl LayerDequantPlan {
                 e.scale_name.as_ref() == Some(&scale_name),
                 "FP8 scale name mismatch"
             );
+            if scale_dtype != Dtype::BF16 {
+                native += 1;
+                continue;
+            }
             let size = u64::from(n)
                 .checked_mul(u64::from(k))
                 .and_then(|v| v.checked_mul(2))
@@ -135,7 +140,7 @@ impl LayerDequantPlan {
             "missing linear layer {layer}"
         );
         let plan_shape = match format {
-            LinearFormat::Fp8E4m3Block { .. } => !slots.is_empty(),
+            LinearFormat::Fp8E4m3Block { .. } => native > 0 || !slots.is_empty(),
             LinearFormat::Bf16 => slots.is_empty(),
             LinearFormat::Fp8E4m3Channel => true,
         };
@@ -208,6 +213,8 @@ mod tests {
         for format in [
             LinearFormat::fp8_block([128, 128], Dtype::BF16)?,
             LinearFormat::Fp8E4m3Channel,
+            LinearFormat::fp8_block([128, 128], Dtype::F32)?,
+            LinearFormat::fp8_block([32, 32], Dtype::F8_E8M0)?,
         ] {
             let layout = format.fp8_layout().unwrap();
             let scale_name = format!(
@@ -221,11 +228,11 @@ mod tests {
             weight.data_offsets = [0, weight.bytes as u64];
             weight.scale_name = Some(scale_name.clone());
             let shape = layout.scale_shape(8192, 2048);
-            let bytes = shape.iter().product::<usize>() * 2;
+            let bytes = shape.iter().product::<usize>() * (layout.scale_dtype().bitsize() / 8);
             manifest.entries.insert(
                 scale_name.clone(),
                 TensorEntry {
-                    dtype: Dtype::BF16,
+                    dtype: layout.scale_dtype(),
                     shape: shape.to_vec(),
                     shard: "native.safetensors".into(),
                     bytes,
@@ -239,8 +246,13 @@ mod tests {
                 },
             );
             let plan = LayerDequantPlan::from_manifest(&manifest, 0, format)?;
-            assert_eq!(plan.bytes, 8192 * 2048 * 2);
-            assert_eq!(plan.slots[&name].offset_bytes, 0);
+            if layout.scale_dtype() == Dtype::BF16 {
+                assert_eq!(plan.bytes, 8192 * 2048 * 2);
+                assert_eq!(plan.slots[&name].offset_bytes, 0);
+            } else {
+                assert_eq!(plan.bytes, 0);
+                assert!(plan.slots.is_empty());
+            }
             let scale = manifest.entries.get_mut(&scale_name).unwrap();
             scale.shape.swap(0, 1);
             assert!(LayerDequantPlan::from_manifest(&manifest, 0, format).is_err());
