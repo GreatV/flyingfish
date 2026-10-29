@@ -1051,6 +1051,7 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
     }
     let mut defects = 0usize;
     let mut graph_defects = 0usize;
+    let mut graph_state_defects = 0usize;
     let mut first = false;
     for (tag, prefill) in [("a", 0usize), ("b", 0), ("wrap", 512)] {
         let sequence: Vec<u32> = if tag == "wrap" {
@@ -1085,14 +1086,36 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         }
         if tag == "wrap" {
             engine.reset()?;
-            let eager = native_path(&mut engine, &sequence, 512)?;
+            engine.gemma_prefill_all(&sequence[..512])?;
+            let eager_prefill_kv = engine.gemma_kv_rows(0, 512)?;
+            let mut eager = Vec::new();
+            let mut eager_decode0_kv = None;
+            for (row, &token) in sequence[512..].iter().enumerate() {
+                engine.gemma_decode_all(token)?;
+                eager.extend(engine.gemma_all_logits(0)?);
+                if row == 0 {
+                    eager_decode0_kv = Some(engine.gemma_kv_rows(0, 512)?);
+                }
+            }
             engine.reset()?;
             engine.gemma_prefill_all(&sequence[..512])?;
+            let prefill_equal = engine.gemma_kv_rows(0, 512)? == eager_prefill_kv;
+            graph_state_defects += usize::from(!prefill_equal);
+            println!("GEMMA4_GRAPH_KV prefill equal={prefill_equal}");
             engine.capture()?;
+            let restore_equal = engine.gemma_kv_rows(0, 512)? == eager_prefill_kv;
+            graph_state_defects += usize::from(!restore_equal);
+            println!("GEMMA4_GRAPH_KV capture_restore equal={restore_equal}");
             let mut graph_logits = Vec::new();
             for (row, &token) in sequence[512..].iter().enumerate() {
                 engine.set_token(token)?;
                 engine.decode(true, None)?;
+                if row == 0 {
+                    let decode_equal = engine.gemma_kv_rows(0, 512)?
+                        == eager_decode0_kv.as_ref().context("eager KV row missing")?;
+                    graph_state_defects += usize::from(!decode_equal);
+                    println!("GEMMA4_GRAPH_KV decode0 equal={decode_equal}");
+                }
                 let actual = engine.decode_logits()?;
                 let eager = &eager[row * actual.len()..(row + 1) * actual.len()];
                 let graph_equal = actual
@@ -1119,8 +1142,8 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
     }
     ensure!(defects == 0, "GEMMA4_MODEL defects={defects}");
     ensure!(
-        graph_defects == 0,
-        "GEMMA4_GRAPH_EAGER defects={graph_defects}"
+        graph_defects == 0 && graph_state_defects == 0,
+        "GEMMA4_GRAPH_EAGER defects={graph_defects} state_defects={graph_state_defects}"
     );
     println!("GEMMA4_MODEL PASS prefill decode wrap graph");
     Ok(())
