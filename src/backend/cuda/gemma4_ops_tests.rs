@@ -1089,11 +1089,11 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
             engine.reset()?;
             engine.gemma_prefill_all(&sequence[..512])?;
             engine.capture()?;
-            for (row, _) in sequence[512..].iter().enumerate() {
+            let mut graph_logits = Vec::new();
+            for (row, &token) in sequence[512..].iter().enumerate() {
+                engine.set_token(token)?;
                 engine.decode(true, None)?;
                 let actual = engine.decode_logits()?;
-                let expected =
-                    &tensor(&data, "wrap.decode")?[row * actual.len()..(row + 1) * actual.len()];
                 let eager = &eager[row * actual.len()..(row + 1) * actual.len()];
                 let graph_equal = actual
                     .iter()
@@ -1105,12 +1105,16 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
                     "GEMMA4_GRAPH_EAGER wrap row={row} {}",
                     if graph_equal { "PASS" } else { "DEFECT" }
                 );
-                let actual: Vec<bf16> = actual.iter().map(|v| bf16::from_f32(*v)).collect();
-                let (pass, line) =
-                    model_metrics(&actual, expected, &sequence[512..=512 + row], bounds)?;
-                println!("GEMMA4_MODEL wrap graph row={row} {line}");
-                defects += usize::from(!pass);
+                graph_logits.extend(actual.iter().map(|v| bf16::from_f32(*v)));
             }
+            let (pass, line) = model_metrics(
+                &graph_logits,
+                tensor(&data, "wrap.decode")?,
+                &sequence[512..],
+                bounds,
+            )?;
+            println!("GEMMA4_MODEL wrap graph {line}");
+            defects += usize::from(!pass);
         }
     }
     ensure!(defects == 0, "GEMMA4_MODEL defects={defects}");
