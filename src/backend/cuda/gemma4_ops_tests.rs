@@ -1111,8 +1111,9 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
                 engine.set_token(token)?;
                 engine.decode(true, None)?;
                 if row == 0 {
-                    let decode_equal = engine.gemma_kv_rows(0, 512)?
-                        == eager_decode0_kv.as_ref().context("eager KV row missing")?;
+                    let actual_kv = engine.gemma_kv_rows(0, 512)?;
+                    let decode_equal =
+                        &actual_kv == eager_decode0_kv.as_ref().context("eager KV row missing")?;
                     graph_state_defects += usize::from(!decode_equal);
                     println!("GEMMA4_GRAPH_KV decode0 equal={decode_equal}");
                 }
