@@ -23,6 +23,8 @@ mod linear_calibrate;
 mod markov;
 #[cfg(feature = "cuda")]
 mod markov_calibrate;
+#[cfg(feature = "cuda")]
+pub mod mhc;
 pub(crate) mod moe;
 #[cfg(feature = "cuda")]
 pub mod multi_calibrate;

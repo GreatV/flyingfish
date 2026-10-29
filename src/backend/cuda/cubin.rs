@@ -73,7 +73,7 @@ mod tests {
     fn exact_architecture_and_elf_only() {
         for &sm in binaries::ARCHES {
             check(sm).unwrap();
-            for name in ["embed", "norm", "rope", "act", "sample", "attention"] {
+            for name in ["embed", "norm", "rope", "act", "sample", "attention", "mhc"] {
                 let bytes = binaries::cubin(name, sm).unwrap();
                 assert_eq!(&bytes[..4], b"\x7fELF");
             }

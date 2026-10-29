@@ -19,6 +19,11 @@ pub use cuda::engine::Engine as Backend;
 pub use cuda::engine::TextPrefixSaveOutput;
 #[cfg(feature = "cuda")]
 pub use cuda::engine::{TextPrefixRestoreIntent, TextPrefixSaveRequest};
+#[cfg(feature = "cuda")]
+pub use cuda::mhc::{
+    HcCombOrientation, HcFnDtype, HcFnW, HcMixes, HcParams, HcRounding, HcUpdate, HcWeights,
+    MhcOps, mix_rows, validate_params,
+};
 #[cfg(not(any(feature = "cuda", feature = "rocm")))]
 mod missing;
 #[cfg(not(any(feature = "cuda", feature = "rocm")))]
