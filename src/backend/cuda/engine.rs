@@ -2071,6 +2071,41 @@ impl Engine {
             .gemma_logits(&self.device.stream, row, self.model_spec.vocab as usize)
     }
 
+    #[cfg(test)]
+    pub(crate) fn gemma_final_probe(&mut self, input: &[bf16]) -> Result<Vec<bf16>> {
+        let width = self.model_spec.hidden as usize;
+        ensure!(
+            !input.is_empty() && input.len().is_multiple_of(width),
+            "Gemma final probe input extent"
+        );
+        let rows = input.len() / width;
+        self.device
+            .stream
+            .memcpy_htod(input, &mut self.work.x.slice_mut(..input.len()))?;
+        self.state.set_sequence(
+            &self.device.stream,
+            0,
+            u32::try_from(rows)?,
+            self.workspace_rows as u32,
+        )?;
+        self.run_operator(
+            crate::backend::Operator::Head,
+            0,
+            crate::backend::Step {
+                rows,
+                input: crate::backend::Input::Ids,
+                head: Head::All,
+                mask: crate::backend::Mask::Causal,
+            },
+            &mut None,
+        )?;
+        let mut output = Vec::with_capacity(rows * self.model_spec.vocab as usize);
+        for row in 0..rows {
+            output.extend(self.gemma_all_logits(row)?);
+        }
+        Ok(output)
+    }
+
     pub fn verification_logits(&self, row: usize) -> Result<Vec<f32>> {
         let spec = self.spec.as_ref().context("draft state is not enabled")?;
         ensure!(
