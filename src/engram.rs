@@ -4,6 +4,7 @@ use crate::experts::disk::{AlignedBytes, SpanReader};
 use anyhow::{Context, Result, ensure};
 use safetensors::Dtype;
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -47,6 +48,24 @@ impl EngramHashSetup {
             .with_context(|| format!("decode engram hash setup {}", path.display()))?;
         setup.validate(config_sha256, tokenizer_sha256)?;
         Ok(setup)
+    }
+
+    /// SHA-256 fingerprints of the loaded checkpoint's config and tokenizer files.
+    pub fn model_fingerprints(model: &Path) -> Result<(String, String)> {
+        let digest = |name: &str| -> Result<String> {
+            let bytes = std::fs::read(model.join(name))
+                .with_context(|| format!("read model {name} for Engram fingerprints"))?;
+            let mut hash = sha2::Sha256::new();
+            hash.update(bytes);
+            Ok(format!("{:x}", hash.finalize()))
+        };
+        Ok((digest("config.json")?, digest("tokenizer.json")?))
+    }
+
+    /// Validates the record schema and its fingerprints against the loaded model files.
+    pub fn validate_model(&self, model: &Path) -> Result<()> {
+        let (config_sha256, tokenizer_sha256) = Self::model_fingerprints(model)?;
+        self.validate(&config_sha256, &tokenizer_sha256)
     }
 
     pub fn validate(&self, config_sha256: &str, tokenizer_sha256: &str) -> Result<()> {
@@ -197,14 +216,14 @@ impl EngramHashSetup {
             .collect()
     }
 
-    pub fn validate_samples(&self) -> Result<()> {
+    pub fn validate_samples(&self, model: &Path) -> Result<()> {
         let capacity = self
             .samples
             .iter()
             .map(|sample| sample.start_position as usize + sample.input_ids.len())
             .max()
             .unwrap_or(0);
-        let mut hasher = NgramHistory::new(self.clone(), capacity)?;
+        let mut hasher = NgramHistory::new_for_model(self.clone(), capacity, model)?;
         for (index, sample) in self.samples.iter().enumerate() {
             let observed = hasher.prepare(
                 &sample.input_ids,
@@ -250,7 +269,6 @@ pub struct NgramHistory {
 
 impl NgramHistory {
     pub fn new(setup: EngramHashSetup, capacity: usize) -> Result<Self> {
-        setup.validate(&setup.config_sha256, &setup.tokenizer_sha256)?;
         ensure!(capacity > 0, "engram history capacity is zero");
         let offsets = setup.offsets();
         Ok(Self {
@@ -259,6 +277,10 @@ impl NgramHistory {
             setup,
             offsets,
         })
+    }
+    pub fn new_for_model(setup: EngramHashSetup, capacity: usize, model: &Path) -> Result<Self> {
+        setup.validate_model(model)?;
+        Self::new(setup, capacity)
     }
 
     pub fn reset(&mut self) {
@@ -757,7 +779,7 @@ impl EngramService {
         capacity_rows: usize,
         history_capacity: usize,
     ) -> Result<Self> {
-        setup.validate(&setup.config_sha256, &setup.tokenizer_sha256)?;
+        setup.validate_model(model_dir)?;
         ensure!(capacity_rows > 0, "engram LFU capacity is zero");
         let layer_ids = setup.layer_ids.clone();
         let layer_rows = setup.layer_rows()?;
@@ -1232,6 +1254,22 @@ mod tests {
             .collect()
     }
 
+    fn fingerprint_model_dir(setup: &mut EngramHashSetup) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "flyingfish-engram-model-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fingerprint model");
+        std::fs::write(dir.join("config.json"), b"engram config").expect("write config");
+        std::fs::write(dir.join("tokenizer.json"), b"engram tokenizer").expect("write tokenizer");
+        let (config_sha256, tokenizer_sha256) =
+            EngramHashSetup::model_fingerprints(&dir).expect("fingerprints");
+        setup.config_sha256 = config_sha256;
+        setup.tokenizer_sha256 = tokenizer_sha256;
+        dir
+    }
+
     fn sampled_setup() -> EngramHashSetup {
         let mut setup = hash_setup();
         let mask = [true, false, true, true];
@@ -1250,35 +1288,36 @@ mod tests {
 
     #[test]
     fn hash_samples_catch_setup_mutants() -> Result<()> {
-        let setup = sampled_setup();
-        setup.validate(&setup.config_sha256, &setup.tokenizer_sha256)?;
-        setup.validate_samples()?;
+        let mut setup = sampled_setup();
+        let model = fingerprint_model_dir(&mut setup);
+        setup.validate_model(&model)?;
+        setup.validate_samples(&model)?;
         let mut mapping = setup.clone();
         mapping.token_map[3] = 9;
         mapping.validate(&mapping.config_sha256, &mapping.tokenizer_sha256)?;
         assert!(
-            mapping.validate_samples().is_err(),
+            mapping.validate_samples(&model).is_err(),
             "an altered compressed-token map escaped the recorded samples"
         );
         let mut multiplier = setup.clone();
         multiplier.multipliers[1][2] = 15;
         multiplier.validate(&multiplier.config_sha256, &multiplier.tokenizer_sha256)?;
         assert!(
-            multiplier.validate_samples().is_err(),
+            multiplier.validate_samples(&model).is_err(),
             "an altered layer multiplier escaped the recorded samples"
         );
         let mut primes = setup.clone();
         primes.primes[0][1][0] = 59;
         primes.validate(&primes.config_sha256, &primes.tokenizer_sha256)?;
         assert!(
-            primes.validate_samples().is_err(),
+            primes.validate_samples(&model).is_err(),
             "an altered prime escaped the recorded samples"
         );
         let mut offset = setup.clone();
         offset.primes[0][1][0] = 61;
         offset.validate(&offset.config_sha256, &offset.tokenizer_sha256)?;
         assert!(
-            offset.validate_samples().is_err(),
+            offset.validate_samples(&model).is_err(),
             "an altered bucket extent escaped the recorded samples"
         );
         Ok(())
@@ -1328,6 +1367,7 @@ mod tests {
     #[ignore = "reads the generated engram-hash-v1 record; set F3_HASH"]
     fn hash_record_reproduces_the_publisher_samples() -> Result<()> {
         let path = PathBuf::from(std::env::var("F3_HASH").context("F3_HASH is not set")?);
+        let model = PathBuf::from(std::env::var("F3_MODEL").context("F3_MODEL is not set")?);
         let document: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
         let setup = EngramHashSetup::read(
             &path,
@@ -1336,7 +1376,8 @@ mod tests {
                 .as_str()
                 .context("tokenizer sha")?,
         )?;
-        setup.validate_samples()?;
+        setup.validate_model(&model)?;
+        setup.validate_samples(&model)?;
         let rows = setup.layer_rows()?;
         for sample in &setup.samples {
             for (layer, hashes) in sample.hashes.iter().enumerate() {
@@ -1350,9 +1391,29 @@ mod tests {
         let mut mutant = setup.clone();
         mutant.samples[0].hashes[0][0] ^= 1;
         ensure!(
-            mutant.validate_samples().is_err(),
+            mutant.validate_samples(&model).is_err(),
             "a mutated sample escaped validate_samples"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn model_fingerprints_reject_a_wrong_tokenizer() -> Result<()> {
+        let mut setup = sampled_setup();
+        let model = fingerprint_model_dir(&mut setup);
+        setup.validate_model(&model)?;
+        let path = model.join("tokenizer.json");
+        let mut bytes = std::fs::read(&path)?;
+        bytes.push(b' ');
+        std::fs::write(&path, bytes)?;
+        let error = setup
+            .validate_model(&model)
+            .expect_err("a changed tokenizer matched the Engram record");
+        assert!(
+            error.to_string().contains("config/tokenizer fingerprint"),
+            "wrong tokenizer error was {error}"
+        );
+        let _ = std::fs::remove_dir_all(&model);
         Ok(())
     }
 

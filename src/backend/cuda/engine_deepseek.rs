@@ -108,8 +108,8 @@ impl DeepseekEngram {
                 .with_context(|| format!("read Engram hash record {}", path.display()))?,
         )
         .context("decode Engram hash record")?;
-        setup.validate(&setup.config_sha256, &setup.tokenizer_sha256)?;
-        setup.validate_samples()?;
+        setup.validate_model(model)?;
+        setup.validate_samples(model)?;
         ensure!(
             setup.layer_ids == ds.engram_layer_ids
                 && setup.layer_rows()? == ds.engram_num_embeddings
@@ -3621,6 +3621,12 @@ mod tests {
                 kv.owner
             );
         }
+        let selection_rows = model_spec
+            .deepseek_v41
+            .as_ref()
+            .context("DSA geometry missing")?
+            .selection
+            .index_topk as usize;
         for selection in &state.index {
             let mapping =
                 state.owners[selection.owner].context("composition owner mapping absent")?;
@@ -3637,7 +3643,11 @@ mod tests {
                 "composition selection owner {} did not advance",
                 selection.owner
             );
-            let ids = s.clone_dtoh(&selection.positions.slice((rows - 1) * 512..rows * 512))?;
+            let ids = s.clone_dtoh(
+                &selection
+                    .positions
+                    .slice((rows - 1) * selection_rows..rows * selection_rows),
+            )?;
             let count = end / mapping.ratio;
             ensure!(
                 ids.iter()
