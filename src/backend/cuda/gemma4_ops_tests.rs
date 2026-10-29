@@ -1185,12 +1185,12 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
     let (native_k4, native_v4) = engine.gemma_kv_rows(global_layer, first_ids.len())?;
     trace.add(
         "debug.native_k4".into(),
-        vec![first_ids.len(), 1, 512],
+        vec![first_ids.len(), spec.kv_heads as usize, 512],
         native_k4.iter().map(|v| v.to_f32()).collect(),
     )?;
     trace.add(
         "debug.native_v4".into(),
-        vec![first_ids.len(), 1, 512],
+        vec![first_ids.len(), spec.kv_heads as usize, 512],
         native_v4.iter().map(|v| v.to_f32()).collect(),
     )?;
     trace.set_device(&engine.device_info().name)?;
