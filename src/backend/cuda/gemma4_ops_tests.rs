@@ -625,7 +625,7 @@ fn proportional_and_default_rope_tables_match_the_definition_gpu() -> Result<()>
     };
     let full = RopeSpec {
         theta: 1000000.0,
-        pairs: 64,
+        pairs: 256,
         pair_stride: 256,
         denominator: 512,
     };
@@ -694,7 +694,7 @@ fn proportional_and_default_rope_tables_match_the_definition_gpu() -> Result<()>
         };
         let mutants: Vec<(&str, cudarc::driver::CudaSlice<bf16>)> = if tag == "full" {
             [
-                ("rotate_all_512", RopeSpec { pairs: 256, ..spec }),
+                ("partial_64", RopeSpec { pairs: 64, ..spec }),
                 (
                     "denominator_256",
                     RopeSpec {
