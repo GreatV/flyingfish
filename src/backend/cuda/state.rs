@@ -588,6 +588,7 @@ pub struct StateStore {
     pub(crate) latent: Vec<LatentRing>,
     #[cfg(feature = "cuda")]
     pub(crate) compressed: Option<LatentCompressedState>,
+    pub(crate) dsa: Vec<super::dsa::DsaState>,
     pub sequence: Option<CudaSlice<i32>>,
     capacity: u32,
     kv_rings: Vec<usize>,
@@ -619,6 +620,7 @@ impl StateStore {
         let mut kv_rings = Vec::new();
         let mut gdn = Vec::new();
         let mut latent = Vec::new();
+        let mut dsa = Vec::new();
         for layer in &spec.layers {
             if spec.architecture == crate::model_spec::Architecture::DeepseekV41 {
                 let (codes, scales) = latent_ring_extents(spec)?;
@@ -626,6 +628,20 @@ impl StateStore {
                     codes: stream.alloc_zeros(codes)?,
                     scales: stream.alloc_zeros(scales)?,
                 });
+                continue;
+            }
+            if spec.architecture == crate::model_spec::Architecture::Glm5Next
+                && layer.mixer == Mixer::FullAttention
+            {
+                ensure!(
+                    layer.state_index as usize == dsa.len(),
+                    "invalid GLM DSA state mapping"
+                );
+                dsa.push(super::dsa::DsaState::new(
+                    crate::op_contract::DsaSpec::glm53(),
+                    u32::try_from(capacity)?,
+                    stream,
+                )?);
                 continue;
             }
             match layer.mixer {
@@ -685,11 +701,21 @@ impl StateStore {
             latent,
             #[cfg(feature = "cuda")]
             compressed: None,
+            dsa,
             sequence,
             capacity: capacity as u32,
             kv_rings,
         })
     }
+    pub(crate) fn dsa_state_mut(
+        &mut self,
+        state_index: usize,
+    ) -> Result<&mut super::dsa::DsaState> {
+        self.dsa
+            .get_mut(state_index)
+            .with_context(|| format!("DSA state index {state_index} is outside the layer plan"))
+    }
+
     pub fn kv_ring(&self, state_index: usize) -> Result<usize> {
         self.kv_rings
             .get(state_index)
@@ -754,6 +780,41 @@ impl StateStore {
                 .as_mut()
                 .context("missing sequence metadata")?,
         )?;
+        for state in &mut self.dsa {
+            state.set_meta(
+                stream,
+                crate::op_contract::DsaMeta {
+                    prefix: meta.prefix,
+                    valid_rows: meta.valid_rows,
+                    key_count: meta.key_count,
+                    capacity: self.capacity as i32,
+                    first_key: 0,
+                    reserved: [0; 3],
+                },
+            )?;
+        }
+        Ok(())
+    }
+    pub fn advance_sequence(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        advance: &CudaFunction,
+    ) -> Result<()> {
+        let meta = self.seq_ref(stream)?;
+        unsafe {
+            stream
+                .launch_builder(advance)
+                .arg(&meta.ptr)
+                .launch(super::ops::grid(1, 1))?;
+        }
+        let sequence = self
+            .sequence
+            .as_ref()
+            .context("missing sequence metadata")?;
+        for state in &mut self.dsa {
+            // Prefix, valid rows, key count and capacity share the same layout.
+            stream.memcpy_dtod(&sequence.slice(..4), &mut state.meta.slice_mut(..4))?;
+        }
         Ok(())
     }
     pub fn reset(&mut self, stream: &Arc<CudaStream>) -> Result<()> {
@@ -774,6 +835,9 @@ impl StateStore {
             stream.memset_zeros(&mut ring.codes)?;
             stream.memset_zeros(&mut ring.scales)?;
         }
+        for state in &mut self.dsa {
+            state.reset(stream)?;
+        }
         if self.sequence.is_some() {
             self.set_sequence(stream, 0, 1, 1)?;
         }
@@ -792,6 +856,7 @@ impl StateStore {
                 .iter()
                 .map(|v| v.codes.len() + v.scales.len())
                 .sum::<usize>()
+            + self.dsa.iter().map(|state| state.bytes()).sum::<usize>()
             + self.sequence.as_ref().map_or(0, |m| m.len() * 4)
             + {
                 #[cfg(feature = "cuda")]
@@ -840,9 +905,7 @@ pub struct GdnVerifyInput {
 impl GdnVerifyInput {
     pub fn new(spec: &GdnSpec, slots: usize, stream: &Arc<CudaStream>) -> Result<Self> {
         let conv_dim = usize::try_from(spec.conv_dim()?)?;
-        let ab_width = usize::try_from(spec.hv)?
-            .checked_mul(2)
-            .context("GDN verify input ab width overflow")?;
+        let ab_width = usize::try_from(spec.ab_width()?)?;
         let qkv_elems = slots
             .checked_mul(conv_dim)
             .context("GDN verify input qkv extent overflow")?;
@@ -882,6 +945,10 @@ impl StateCheckpoint {
         rows: usize,
         stream: &Arc<CudaStream>,
     ) -> Result<Self> {
+        ensure!(
+            store.dsa.is_empty(),
+            "DSA checkpoint persistence is not bound"
+        );
         ensure!(
             rows > 0 && rows <= store.capacity as usize,
             "invalid checkpoint window"
@@ -926,6 +993,10 @@ impl StateCheckpoint {
         })
     }
     fn check(&self, store: &StateStore) -> Result<()> {
+        ensure!(
+            store.dsa.is_empty(),
+            "DSA checkpoint persistence is not bound"
+        );
         ensure!(
             self.kv.len() == store.kv.len()
                 && self.gdn.len() == store.gdn.len()

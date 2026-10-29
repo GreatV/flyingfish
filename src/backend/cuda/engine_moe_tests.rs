@@ -1251,14 +1251,14 @@ impl Engine {
             flint_window_capture: None,
             qwen: None,
             #[cfg(feature = "cuda")]
-            deepseek: None,
-            #[cfg(feature = "cuda")]
             deepseek_mixer: None,
             #[cfg(feature = "cuda")]
             deepseek_ffn: None,
             #[cfg(feature = "cuda")]
             deepseek_engram: None,
             recurrent: None,
+            hc: None,
+            glm_dsa: None,
             moe,
             moe_slots: Some(slots),
             moe_prefill,

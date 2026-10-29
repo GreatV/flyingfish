@@ -8,7 +8,10 @@
 #define GDN_HEADS 48
 #endif
 #define GDN_PREP_HEADS GDN_HEADS
-#define GDN_PREP_KHEADS 16
+#ifndef GDN_KHEADS
+#define GDN_KHEADS 16
+#endif
+#define GDN_PREP_KHEADS GDN_KHEADS
 #define GDN_PREP_DK 128
 #define GDN_PREP_DV 128
 

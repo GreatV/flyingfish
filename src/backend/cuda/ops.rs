@@ -327,8 +327,18 @@ pub struct GdnGateBindings<'a> {
     pub beta: &'a mut TensorMut<bf16, 2>,
     pub g: &'a mut TensorMut<f32, 2>,
 }
+pub struct GdnChannelGateBindings<'a> {
+    pub a: Tensor<bf16, 3>,
+    pub b: Tensor<bf16, 2>,
+    pub a_log: Tensor<f32, 1>,
+    pub dt_bias: Tensor<f32, 1>,
+    pub beta: &'a mut TensorMut<bf16, 2>,
+    pub g: &'a mut TensorMut<f32, 3>,
+    pub lower_bound: Option<f32>,
+}
 pub struct NormOps {
     norm: CudaFunction,
+    norm_sigmoid: CudaFunction,
     layer_norm: CudaFunction,
 }
 pub struct GateOps {
@@ -358,6 +368,7 @@ impl CommonOpsRef {
         Ok(Self {
             norm: Arc::new(NormOps {
                 norm: module.load_function("q38_norm")?,
+                norm_sigmoid: module.load_function("q38_norm_sigmoid")?,
                 layer_norm: module.load_function("q38_layer_norm")?,
             }),
             gate: Arc::new(GateOps {
@@ -401,13 +412,21 @@ struct NormLaunch<'a> {
     z: Option<Tensor<bf16, 3>>,
     y: &'a mut TensorMut<bf16, 3>,
     mode: Option<RmsMode>,
+    gate_mode: Option<GatedRmsMode>,
     eps: f32,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum GatedRmsMode {
+    SiluBf16,
+    SigmoidF32,
 }
 
 pub struct GatedRmsInput {
     pub x: Tensor<bf16, 3>,
     pub weight: Tensor<bf16, 1>,
     pub gate: Tensor<bf16, 3>,
+    pub mode: GatedRmsMode,
 }
 
 pub struct ResidualRmsInput<'a> {
@@ -737,6 +756,7 @@ impl NormOps {
                 z: None,
                 y,
                 mode: Some(mode),
+                gate_mode: None,
                 eps,
             },
         )
@@ -771,6 +791,7 @@ impl NormOps {
                 z: Some(z),
                 y,
                 mode: Some(mode),
+                gate_mode: None,
                 eps,
             },
         )
@@ -793,6 +814,7 @@ impl NormOps {
                 z: None,
                 y,
                 mode: None,
+                gate_mode: None,
                 eps,
             },
         )
@@ -805,7 +827,12 @@ impl NormOps {
         y: &mut TensorMut<bf16, 3>,
         eps: f32,
     ) -> Result<()> {
-        let GatedRmsInput { x, weight, gate: z } = input;
+        let GatedRmsInput {
+            x,
+            weight,
+            gate: z,
+            mode: gate_mode,
+        } = input;
         self.launch(
             stream,
             NormLaunch {
@@ -815,6 +842,7 @@ impl NormOps {
                 z: Some(z),
                 y,
                 mode: Some(RmsMode::Standard),
+                gate_mode: Some(gate_mode),
                 eps,
             },
         )
@@ -827,13 +855,15 @@ impl NormOps {
             z,
             y,
             mode,
+            gate_mode,
             eps,
         } = call;
-        let mode = match (mode, z.is_some()) {
-            (Some(RmsMode::Standard), true) => 3,
-            (Some(RmsMode::ZeroCentered), true) => 4,
-            (Some(mode), false) => mode as i32,
-            (None, false) => 2,
+        let mode = match (mode, z.is_some(), gate_mode) {
+            (Some(RmsMode::Standard), true, Some(GatedRmsMode::SiluBf16)) => 3,
+            (Some(RmsMode::Standard), true, Some(GatedRmsMode::SigmoidF32)) => 5,
+            (Some(RmsMode::ZeroCentered), true, None) => 4,
+            (Some(mode), false, None) => mode as i32,
+            (None, false, None) => 2,
             _ => anyhow::bail!("gated norm requires standard RMS semantics"),
         };
         validate_io(&x, &y.0, rows)?;
@@ -867,11 +897,16 @@ impl NormOps {
             .checked_mul(x.shape[1])
             .filter(|&n| n <= i32::MAX as u32)
             .ok_or_else(|| anyhow::anyhow!("norm grid overflow"))?;
+        let (kernel, mode) = if mode == 5 {
+            (&self.norm_sigmoid, 3)
+        } else {
+            (&self.norm, mode)
+        };
         let spb = norm_slices_per_block(rows.row_capacity, &x, wp, zp, zs, &y.0, mode);
         let blocks = slices.div_ceil(spb);
         unsafe {
             stream
-                .launch_builder(&self.norm)
+                .launch_builder(kernel)
                 .arg(&x.ptr)
                 .arg(&wp)
                 .arg(&zp)
@@ -1058,6 +1093,85 @@ impl GateOps {
         }
         Ok(())
     }
+    pub fn gdn_channel_gates_with(
+        function: &CudaFunction,
+        stream: &Arc<CudaStream>,
+        rows: RowDomain,
+        bindings: GdnChannelGateBindings<'_>,
+    ) -> Result<()> {
+        let GdnChannelGateBindings {
+            a,
+            b,
+            a_log,
+            dt_bias,
+            beta,
+            g,
+            lower_bound,
+        } = bindings;
+        rows.validate(a.shape[0])?;
+        a.validate()?;
+        ensure!(
+            a.shape[1] == 64 && a.shape[2] == 128 && a.stride == [64 * 128, 128, 1],
+            "GDN per-channel a must be [rows, 64, 128] with strides [8192, 128, 1]"
+        );
+        for t in [&b, &beta.0] {
+            t.validate()?;
+            ensure!(
+                t.shape == a.shape[..2] && t.stride[1] == 1 && t.stride[0] >= 64,
+                "GDN per-channel beta layout mismatch"
+            );
+        }
+        a_log.validate()?;
+        ensure!(
+            a_log.shape == [64] && a_log.stride == [1],
+            "GDN A_log layout mismatch"
+        );
+        dt_bias.validate()?;
+        ensure!(
+            dt_bias.shape == [64 * 128] && dt_bias.stride == [1],
+            "GDN per-channel dt_bias layout mismatch"
+        );
+        g.0.validate()?;
+        ensure!(
+            g.0.shape == a.shape && g.0.stride == a.stride,
+            "GDN per-channel g layout mismatch"
+        );
+        no_overlap(&a, &beta.0, "operator input", "operator output")?;
+        no_overlap(&a, &g.0, "operator input", "operator output")?;
+        no_overlap(&b, &beta.0, "operator input", "operator output")?;
+        no_overlap(&b, &g.0, "operator input", "operator output")?;
+        for t in [&a_log, &dt_bias] {
+            no_overlap(t, &beta.0, "operator input", "operator output")?;
+            no_overlap(t, &g.0, "operator input", "operator output")?;
+        }
+        no_overlap(&beta.0, &g.0, "operator input", "operator output")?;
+        unsafe {
+            stream
+                .launch_builder(function)
+                .arg(&a.ptr)
+                .arg(&b.ptr)
+                .arg(&a_log.ptr)
+                .arg(&dt_bias.ptr)
+                .arg(&beta.0.ptr)
+                .arg(&g.0.ptr)
+                .arg(&rows.meta.ptr)
+                .arg(&rows.row_base)
+                .arg(&rows.row_capacity)
+                .arg(&a.stride[0])
+                .arg(&b.stride[0])
+                .arg(&beta.0.stride[0])
+                .arg(&g.0.stride[0])
+                .arg(&(i32::from(lower_bound.is_some())))
+                .arg(&lower_bound.unwrap_or(0.0))
+                .launch(LaunchConfig {
+                    grid_dim: (rows.row_capacity.div_ceil(64), 64, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
     pub fn gdn_gates_with(
         function: &CudaFunction,
         stream: &Arc<CudaStream>,

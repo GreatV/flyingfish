@@ -464,7 +464,7 @@ fn main() {
     println!("cargo:rerun-if-changed={p2_header}");
     let text = fs::read_to_string(p2_header).expect("read chunkwise P2 layout header");
     let mut cw = String::new();
-    for (name, optin) in [("SMEM", true), ("SLOT", false)] {
+    for (name, optin) in [("SMEM", true), ("SLOT", false), ("KEY_SLOT", false)] {
         let prefix = format!("#define GDN_CW_P2_{name}_BYTES ");
         let value = text
             .lines()
@@ -552,10 +552,15 @@ fn main() {
             &[
                 ("", &[]),
                 ("_h32", &["-DGDN_HEADS=32"]),
+                ("_per_channel", &["-DGDN_HEADS=64", "-DGDN_KHEADS=64"]),
                 ("_compact", &["-DGDN_COMPACT_QK=1"]),
             ]
         } else if name.starts_with("gdn/") {
-            &[("", &[]), ("_h32", &["-DGDN_HEADS=32"])]
+            &[
+                ("", &[]),
+                ("_h32", &["-DGDN_HEADS=32"]),
+                ("_per_channel", &["-DGDN_HEADS=64", "-DGDN_KHEADS=64"]),
+            ]
         } else if name == "tcmqa_d256" {
             &[
                 ("", &[]),

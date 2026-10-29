@@ -610,6 +610,7 @@ fn q38_primitives_gpu() -> Result<()> {
             s,
             rows,
             GatedRmsInput {
+                mode: super::ops::GatedRmsMode::SiluBf16,
                 x: xv,
                 weight: wv,
                 gate: xv,
@@ -3376,6 +3377,7 @@ fn q38_norm_stage_ab_gpu() -> Result<()> {
                             s,
                             rows,
                             GatedRmsInput {
+                                mode: super::ops::GatedRmsMode::SiluBf16,
                                 x: xv_cand,
                                 weight: wv,
                                 gate: zv,
@@ -3541,6 +3543,7 @@ fn q38_norm_stage_ab_gpu() -> Result<()> {
                 s,
                 rows,
                 GatedRmsInput {
+                    mode: super::ops::GatedRmsMode::SiluBf16,
                     x: xv,
                     weight: wv,
                     gate: zv,
@@ -3642,6 +3645,7 @@ fn invariant_gated_norm(device: &Device) -> Result<()> {
             s,
             one,
             GatedRmsInput {
+                mode: super::ops::GatedRmsMode::SiluBf16,
                 x: tensor(&xb, r * row_words, 1)?,
                 weight,
                 gate: tensor(&zb, r * row_words, 1)?,
@@ -3663,9 +3667,18 @@ fn invariant_gated_norm(device: &Device) -> Result<()> {
         let gate = tensor(&zb, 0, m)?;
         let mut y = TensorMut(tensor(&output, 0, m)?);
         let mut execute = || {
-            common
-                .norm
-                .rms_gated(s, domain, GatedRmsInput { x, weight, gate }, &mut y, 1e-6)
+            common.norm.rms_gated(
+                s,
+                domain,
+                GatedRmsInput {
+                    mode: super::ops::GatedRmsMode::SiluBf16,
+                    x,
+                    weight,
+                    gate,
+                },
+                &mut y,
+                1e-6,
+            )
         };
         for graph in [false, true] {
             if graph {
@@ -3715,6 +3728,7 @@ fn invariant_gated_norm(device: &Device) -> Result<()> {
             row_capacity: rows as u32,
         },
         GatedRmsInput {
+            mode: super::ops::GatedRmsMode::SiluBf16,
             x: tensor(&xb, 0, rows as u32)?,
             weight,
             gate: tensor(&wrong, 0, rows as u32)?,

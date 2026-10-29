@@ -11,12 +11,12 @@ pub mod copy;
 pub mod cubin;
 pub mod decode;
 pub mod draft;
+pub mod dsa;
 pub mod engine;
 pub mod flash;
 #[cfg(feature = "cuda")]
 pub mod gated_residual;
 pub(crate) mod gdn;
-#[cfg(feature = "cuda")]
 pub mod hc;
 #[cfg(feature = "cuda")]
 pub mod index_score;
@@ -33,7 +33,6 @@ mod linear_calibrate;
 mod markov;
 #[cfg(feature = "cuda")]
 mod markov_calibrate;
-#[cfg(feature = "cuda")]
 pub mod mhc;
 pub mod moe;
 #[cfg(feature = "cuda")]
@@ -821,3 +820,6 @@ impl Device {
         Ok(None)
     }
 }
+
+#[cfg(all(test, feature = "cuda"))]
+mod engine_glm_gate;

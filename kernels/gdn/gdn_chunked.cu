@@ -18,6 +18,7 @@
 #include "../gpu_compat.cuh"
 #include <stdint.h>
 #include "../q38_contract.cuh"
+#include "gdn_gate.cuh"
 
 #ifndef GDN_CHUNK
 #define GDN_CHUNK 32
@@ -30,14 +31,14 @@
 #define GDN_DK    128
 #define GDN_DV    128
 
-template <int VSPLIT, bool SNAPSHOT = false>
+template <int VSPLIT, bool SNAPSHOT = false, bool CHANNEL_G = false>
 __device__
 void gdn_chunked_core_t(
         const float* __restrict__ q,      // FP32 [M, HEADS, DK], pre-scaled by 1/sqrt(DK)
         const float* __restrict__ k,      // FP32 [M, HEADS, DK]
         const float* __restrict__ v,      // FP32 [M, HEADS, DV]
         const float* __restrict__ beta,   // FP32 [M, HEADS]
-        const float* __restrict__ g,      // FP32 [M, HEADS]
+        const float* __restrict__ g,      // FP32 [M, HEADS], or cumulative [M, HEADS, DV]
         float* __restrict__ S,            // FP32 [HEADS, DK, DV]
         __nv_bfloat16* __restrict__ out,  // BF16 [M, HEADS, DV]
         const Q38SequenceFields* __restrict__ meta,
@@ -47,7 +48,9 @@ void gdn_chunked_core_t(
     const int j0 = blockIdx.x * VW;
     const int tid = threadIdx.x;
 
-    if (VSPLIT < 1 || VSPLIT > 4 || blockDim.x != GDN_THREADS || blockDim.y != 1 || blockDim.z != 1 ||
+    if (VSPLIT < 1 || VSPLIT > 4 ||
+        (CHANNEL_G && VSPLIT != 1) ||
+        blockDim.x != GDN_THREADS || blockDim.y != 1 || blockDim.z != 1 ||
         gridDim.z != 1 || gridDim.y != GDN_HEADS || gridDim.x != VSPLIT ||
         !aligned16(q) || !aligned16(k) || !aligned16(v) ||
         !aligned16(S) || !aligned16(out)) {
@@ -76,15 +79,18 @@ void gdn_chunked_core_t(
 
     // S[:, j0:j0+VW] stays in registers: 512 threads tile [DK][VW] as 16 row groups x 32
     // column groups, RT x TC each. Loops indexing Sr are fully unrolled.
-    constexpr int RT = 8, TC = GDN_DV / 32, TG = GDN_DK / RT;
+    constexpr int RT = 8, TC = VW < 32 ? 1 : VW / 32, TG = GDN_DK / RT;
     const int ti = tid / 32, tj = tid % 32;
     const int i0 = ti * RT, jb = tj * TC;
+    const bool value_lane = true;
     float Sr[RT][TC];
     #pragma unroll
     for (int a = 0; a < RT; ++a)
         #pragma unroll
         for (int b = 0; b < TC; ++b)
-            Sr[a][b] = S[(size_t)head * GDN_DK * GDN_DV + (i0 + a) * GDN_DV + j0 + jb + b];
+            Sr[a][b] = value_lane
+                ? S[(size_t)head * GDN_DK * GDN_DV + (i0 + a) * GDN_DV + j0 + jb + b]
+                : 0.0f;
 
     const int nchunk = (valid_rows + GDN_CHUNK - 1) / GDN_CHUNK;
 
@@ -95,14 +101,20 @@ void gdn_chunked_core_t(
             const int gr = row0 + r;
             const bool live = gr < valid_rows;
             sBeta[r] = live ? beta[(size_t)gr * GDN_HEADS + head] : 0.0f;
-            sG[r]   = live ? g[(size_t)gr * GDN_HEADS + head] : 0.0f;
+            if constexpr (!CHANNEL_G) {
+                sG[r] = live ? g[(size_t)gr * GDN_HEADS + head] : 0.0f;
+            } else {
+                sG[r] = 0.0f;
+            }
         }
         __syncthreads();
-        // Single-thread in-place prefix sum over sG.
-        if (tid == 0) {
-            for (int r = 1; r < GDN_CHUNK; ++r) sG[r] += sG[r - 1];
+        if constexpr (!CHANNEL_G) {
+            // Single-thread in-place prefix sum over sG.
+            if (tid == 0) {
+                for (int r = 1; r < GDN_CHUNK; ++r) sG[r] += sG[r - 1];
+            }
+            __syncthreads();
         }
-        __syncthreads();
 
         // sKb holds unscaled k; beta*e^G is applied in kbS and in the state update.
         for (int idx = tid; idx < GDN_CHUNK * GDN_DK; idx += GDN_THREADS) {
@@ -126,9 +138,25 @@ void gdn_chunked_core_t(
                     const int jl = idx / GDN_SUB, il = idx - jl * GDN_SUB;
                     const int j = sj * GDN_SUB + jl, i = si * GDN_SUB + il;
                     if (j <= i || sBeta[j] == 0.0f) { sT[j * GDN_CHUNK + i] = 0.0f; continue; }
-                    float dot = 0.0f;
-                    for (int t = 0; t < GDN_DK; ++t) dot = fmaf(sKb[j * GDN_DK + t], sKb[i * GDN_DK + t], dot);
-                    sT[j * GDN_CHUNK + i] = -sBeta[j] * dot * __expf(sG[j] - sG[i]);
+                    if constexpr (CHANNEL_G) {
+                        float dot = 0.0f;
+                        for (int t = 0; t < GDN_DK; ++t) {
+                            float key = sKb[j * GDN_DK + t];
+                            if constexpr (CHANNEL_G)
+                                key *= __expf(gdn_gate_at<true, GDN_HEADS, GDN_DK, 32>(g, sG, row0, j, valid_rows, head, t)
+                                              - gdn_gate_at<true, GDN_HEADS, GDN_DK, 32>(g, sG, row0, i, valid_rows, head, t));
+                            dot = fmaf(key, sKb[i * GDN_DK + t], dot);
+                        }
+                        if constexpr (CHANNEL_G) {
+                            sT[j * GDN_CHUNK + i] = -sBeta[j] * dot;
+                        } else {
+                            sT[j * GDN_CHUNK + i] = -sBeta[j] * dot * __expf(sG[j] - sG[i]);
+                        }
+                    } else {
+                        float dot = 0.0f;
+                        for (int t = 0; t < GDN_DK; ++t) dot = fmaf(sKb[j * GDN_DK + t], sKb[i * GDN_DK + t], dot);
+                        sT[j * GDN_CHUNK + i] = -sBeta[j] * dot * __expf(sG[j] - sG[i]);
+                    }
                 }
         __syncthreads();
 
@@ -161,14 +189,32 @@ void gdn_chunked_core_t(
         // kbS = kb @ S (kb = beta.K.e^G) into sVb, one row at a time: per-row-group partials
         // stage through sRed [TG][VW] and reduce between barriers.
         for (int r = 0; r < GDN_CHUNK; ++r) {
-            const float sc = sBeta[r] * __expf(sG[r]);
-            #pragma unroll
-            for (int b = 0; b < TC; ++b) {
-                float acc = 0.0f;
+            if constexpr (CHANNEL_G) {
+                float sc[CHANNEL_G ? RT : TC];
                 #pragma unroll
-                for (int a = 0; a < RT; ++a)
-                    acc = fmaf(sKb[r * GDN_DK + i0 + a] * sc, Sr[a][b], acc);
-                sRed[ti * VW + jb + b] = acc;
+                for (int b = 0; b < (CHANNEL_G ? RT : TC); ++b)
+                    sc[b] = sBeta[r] * __expf(gdn_gate_at<CHANNEL_G, GDN_HEADS, GDN_DK, 32>(g, sG, row0, r, valid_rows, head,
+                        CHANNEL_G ? i0 + b : j0 + jb + b));
+                if (value_lane) {
+                    #pragma unroll
+                    for (int b = 0; b < TC; ++b) {
+                        float acc = 0.0f;
+                        #pragma unroll
+                        for (int a = 0; a < RT; ++a)
+                            acc = fmaf(sKb[r * GDN_DK + i0 + a] * sc[CHANNEL_G ? a : b], Sr[a][b], acc);
+                        sRed[ti * VW + jb + b] = acc;
+                    }
+                }
+            } else {
+                const float sc = sBeta[r] * __expf(sG[r]);
+                #pragma unroll
+                for (int b = 0; b < TC; ++b) {
+                    float acc = 0.0f;
+                    #pragma unroll
+                    for (int a = 0; a < RT; ++a)
+                        acc = fmaf(sKb[r * GDN_DK + i0 + a] * sc, Sr[a][b], acc);
+                    sRed[ti * VW + jb + b] = acc;
+                }
             }
             __syncthreads();
             for (int j = tid; j < VW; j += GDN_THREADS) {
@@ -190,7 +236,8 @@ void gdn_chunked_core_t(
         __syncthreads();
 
         // o = (q.e^G) @ S + [tril(q k^T .* L)] @ v_new
-        for (int r = 0; r < GDN_CHUNK; ++r) {
+        const int output_rows = CHANNEL_G ? min(GDN_CHUNK, valid_rows - row0) : GDN_CHUNK;
+        for (int r = 0; r < output_rows; ++r) {
             const int gr = row0 + r;
             // sQr holds raw q; inter is scaled by e^{G_r} once and the attention term uses e^{G_r-G_i}.
             if (gr < valid_rows) {
@@ -200,81 +247,175 @@ void gdn_chunked_core_t(
                 for (int t = tid; t < GDN_DK; t += GDN_THREADS) sQr[t] = 0.0f;
             }
             __syncthreads();
-            // inter partials: each thread contributes its RT rows for its own columns
-            #pragma unroll
-            for (int b = 0; b < TC; ++b) {
-                float p = 0.0f;
+            if constexpr (CHANNEL_G) {
+                // inter partials: each thread contributes its RT rows for its own columns
+                if (value_lane) {
+                    #pragma unroll
+                    for (int b = 0; b < TC; ++b) {
+                        float p = 0.0f;
+                        #pragma unroll
+                        for (int a = 0; a < RT; ++a) {
+                            float query = sQr[i0 + a];
+                            if constexpr (CHANNEL_G)
+                                query *= __expf(gdn_gate_at<true, GDN_HEADS, GDN_DK, 32>(g, sG, row0, r, valid_rows, head, i0 + a));
+                            p = fmaf(query, Sr[a][b], p);
+                        }
+                        sRed[ti * VW + jb + b] = p;
+                    }
+                }
+                // q.k row products, shared across columns
+                for (int i = tid; i <= r; i += GDN_THREADS) {
+                    float qk = 0.0f;
+                    for (int t = 0; t < GDN_DK; ++t) {
+                        float query = sQr[t];
+                        if constexpr (CHANNEL_G)
+                            query *= __expf(gdn_gate_at<true, GDN_HEADS, GDN_DK, 32>(g, sG, row0, r, valid_rows, head, t)
+                                            - gdn_gate_at<true, GDN_HEADS, GDN_DK, 32>(g, sG, row0, i, valid_rows, head, t));
+                        qk = fmaf(query, sKb[i * GDN_DK + t], qk);
+                    }
+                    sQk[i] = qk;
+                }
+                __syncthreads();
+                for (int j = tid; j < VW; j += GDN_THREADS) {
+                    float inter = 0.0f;
+                    for (int u = 0; u < GDN_DK / RT; ++u) inter += sRed[u * VW + j];
+                    if constexpr (!CHANNEL_G) inter *= __expf(sG[r]);
+                    float attn = 0.0f;
+                    for (int i = 0; i <= r; ++i) {
+                        float weight = sQk[i];
+                        if constexpr (!CHANNEL_G) weight *= __expf(sG[r] - sG[i]);
+                        attn = fmaf(weight, sKbS[i * VW + j], attn);
+                    }
+                    if (gr < valid_rows)
+                        out[((size_t)gr * GDN_HEADS + head) * GDN_DV + j0 + j] =
+                            __float2bfloat16_rn(inter + attn);
+                }
+            } else {
+                // inter partials: each thread contributes its RT rows for its own columns
                 #pragma unroll
-                for (int a = 0; a < RT; ++a) p = fmaf(sQr[i0 + a], Sr[a][b], p);
-                sRed[ti * VW + jb + b] = p;
-            }
-            // q.k row products, shared across columns
-            for (int i = tid; i <= r; i += GDN_THREADS) {
-                float qk = 0.0f;
-                for (int t = 0; t < GDN_DK; ++t) qk = fmaf(sQr[t], sKb[i * GDN_DK + t], qk);
-                sQk[i] = qk;
-            }
-            __syncthreads();
-            for (int j = tid; j < VW; j += GDN_THREADS) {
-                const float eG = __expf(sG[r]);
-                float inter = 0.0f;
-                for (int u = 0; u < GDN_DK / RT; ++u) inter += sRed[u * VW + j];
-                inter *= eG;
-                float attn = 0.0f;
-                for (int i = 0; i <= r; ++i)
-                    attn = fmaf(sQk[i] * __expf(sG[r] - sG[i]), sKbS[i * VW + j], attn);
-                if (gr < valid_rows)
-                    out[((size_t)gr * GDN_HEADS + head) * GDN_DV + j0 + j] =
-                        __float2bfloat16_rn(inter + attn);
+                for (int b = 0; b < TC; ++b) {
+                    float p = 0.0f;
+                    #pragma unroll
+                    for (int a = 0; a < RT; ++a) p = fmaf(sQr[i0 + a], Sr[a][b], p);
+                    sRed[ti * VW + jb + b] = p;
+                }
+                // q.k row products, shared across columns
+                for (int i = tid; i <= r; i += GDN_THREADS) {
+                    float qk = 0.0f;
+                    for (int t = 0; t < GDN_DK; ++t) qk = fmaf(sQr[t], sKb[i * GDN_DK + t], qk);
+                    sQk[i] = qk;
+                }
+                __syncthreads();
+                for (int j = tid; j < VW; j += GDN_THREADS) {
+                    const float eG = __expf(sG[r]);
+                    float inter = 0.0f;
+                    for (int u = 0; u < GDN_DK / RT; ++u) inter += sRed[u * VW + j];
+                    inter *= eG;
+                    float attn = 0.0f;
+                    for (int i = 0; i <= r; ++i)
+                        attn = fmaf(sQk[i] * __expf(sG[r] - sG[i]), sKbS[i * VW + j], attn);
+                    if (gr < valid_rows)
+                        out[((size_t)gr * GDN_HEADS + head) * GDN_DV + j0 + j] =
+                            __float2bfloat16_rn(inter + attn);
+                }
             }
             __syncthreads();
         }
 
-        // The last row is not snapshotted; snapshot_row reads rows < live only.
-        if (SNAPSHOT) {
-            for (int r = 0; r + 1 < valid_rows; ++r) {
+        if constexpr (CHANNEL_G) {
+            // The last row is not snapshotted; snapshot_row reads rows < live only.
+            if (SNAPSHOT && value_lane) {
+                for (int r = 0; r + 1 < valid_rows; ++r) {
+                    #pragma unroll
+                    for (int a = 0; a < RT; ++a)
+                        #pragma unroll
+                        for (int b = 0; b < TC; ++b) {
+                            float acc = Sr[a][b] *
+                                __expf(gdn_gate_at<CHANNEL_G, GDN_HEADS, GDN_DK, 32>(g, sG, row0, r, valid_rows, head, CHANNEL_G ? i0 + a : j0 + jb + b));
+                            for (int t = 0; t <= r; ++t)
+                                acc = fmaf(sKb[t * GDN_DK + i0 + a] *
+                                               __expf(gdn_gate_at<CHANNEL_G, GDN_HEADS, GDN_DK, 32>(g, sG, row0, r, valid_rows, head, CHANNEL_G ? i0 + a : j0 + jb + b)
+                                                      - gdn_gate_at<CHANNEL_G, GDN_HEADS, GDN_DK, 32>(g, sG, row0, t, valid_rows, head, CHANNEL_G ? i0 + a : j0 + jb + b)),
+                                           sKbS[t * VW + jb + b], acc);
+                            snapshots[((size_t)r * GDN_HEADS + head) * GDN_DK * GDN_DV +
+                                      (i0 + a) * GDN_DV + j0 + jb + b] = acc;
+                        }
+                }
+            }
+
+            // S = S * e^{G_{C-1}} + (k .* e^{G_{C-1}-G})^T @ v_new
+            if (value_lane) {
+                const int last = min(valid_rows - row0, GDN_CHUNK) - 1;
+                float decay[CHANNEL_G ? RT : TC];
+                #pragma unroll
+                for (int b = 0; b < (CHANNEL_G ? RT : TC); ++b)
+                    decay[b] = __expf(gdn_gate_at<CHANNEL_G, GDN_HEADS, GDN_DK, 32>(g, sG, row0, last, valid_rows, head, CHANNEL_G ? i0 + b : j0 + jb + b));
                 #pragma unroll
                 for (int a = 0; a < RT; ++a)
                     #pragma unroll
                     for (int b = 0; b < TC; ++b) {
-                        float acc = Sr[a][b] * __expf(sG[r]);
-                        for (int t = 0; t <= r; ++t)
-                            acc = fmaf(sKb[t * GDN_DK + i0 + a] * __expf(sG[r] - sG[t]),
-                                       sKbS[t * VW + jb + b], acc);
-                        snapshots[((size_t)r * GDN_HEADS + head) * GDN_DK * GDN_DV +
-                                  (i0 + a) * GDN_DV + j0 + jb + b] = acc;
+                        float acc = Sr[a][b] * decay[CHANNEL_G ? a : b];
+                        const int i = i0 + a;
+                        #pragma unroll 4
+                        for (int r = 0; r < GDN_CHUNK; ++r) {
+                            // want k_r[i] * e^{Glast - G_r}; sKb holds raw k
+                            const float f = __expf(
+                                gdn_gate_at<CHANNEL_G, GDN_HEADS, GDN_DK, 32>(g, sG, row0, last, valid_rows, head, CHANNEL_G ? i0 + a : j0 + jb + b)
+                                - gdn_gate_at<CHANNEL_G, GDN_HEADS, GDN_DK, 32>(g, sG, row0, r, valid_rows, head, CHANNEL_G ? i0 + a : j0 + jb + b));
+                            acc = fmaf(sKb[r * GDN_DK + i] * f, sKbS[r * VW + jb + b], acc);
+                        }
+                        Sr[a][b] = acc;
                     }
             }
-        }
-
-        // S = S * e^{G_{C-1}} + (k .* e^{G_{C-1}-G})^T @ v_new
-        {
-            const float decay = __expf(sG[GDN_CHUNK - 1]);
-            const float invc = 1.0f / fmaxf(decay, 1e-38f);
-            #pragma unroll
-            for (int a = 0; a < RT; ++a)
-                #pragma unroll
-                for (int b = 0; b < TC; ++b) {
-                    float acc = Sr[a][b] * decay;
-                    const int i = i0 + a;
-                    #pragma unroll 4
-                    for (int r = 0; r < GDN_CHUNK; ++r) {
-                        // want k_r[i] * e^{Glast - G_r}; sKb holds raw k
-                        const float f = __expf(sG[GDN_CHUNK - 1] - sG[r]);
-                        acc = fmaf(sKb[r * GDN_DK + i] * f, sKbS[r * VW + jb + b], acc);
-                    }
-                    Sr[a][b] = acc;
+        } else {
+            // The last row is not snapshotted; snapshot_row reads rows < live only.
+            if (SNAPSHOT) {
+                for (int r = 0; r + 1 < valid_rows; ++r) {
+                    #pragma unroll
+                    for (int a = 0; a < RT; ++a)
+                        #pragma unroll
+                        for (int b = 0; b < TC; ++b) {
+                            float acc = Sr[a][b] * __expf(sG[r]);
+                            for (int t = 0; t <= r; ++t)
+                                acc = fmaf(sKb[t * GDN_DK + i0 + a] * __expf(sG[r] - sG[t]),
+                                           sKbS[t * VW + jb + b], acc);
+                            snapshots[((size_t)r * GDN_HEADS + head) * GDN_DK * GDN_DV +
+                                      (i0 + a) * GDN_DV + j0 + jb + b] = acc;
+                        }
                 }
+            }
+
+            // S = S * e^{G_{C-1}} + (k .* e^{G_{C-1}-G})^T @ v_new
+            {
+                const float decay = __expf(sG[GDN_CHUNK - 1]);
+                const float invc = 1.0f / fmaxf(decay, 1e-38f);
+                #pragma unroll
+                for (int a = 0; a < RT; ++a)
+                    #pragma unroll
+                    for (int b = 0; b < TC; ++b) {
+                        float acc = Sr[a][b] * decay;
+                        const int i = i0 + a;
+                        #pragma unroll 4
+                        for (int r = 0; r < GDN_CHUNK; ++r) {
+                            // want k_r[i] * e^{Glast - G_r}; sKb holds raw k
+                            const float f = __expf(sG[GDN_CHUNK - 1] - sG[r]);
+                            acc = fmaf(sKb[r * GDN_DK + i] * f, sKbS[r * VW + jb + b], acc);
+                        }
+                        Sr[a][b] = acc;
+                    }
+            }
         }
         // End-of-chunk barrier: the next iteration overwrites sBeta/sG/sKb.
         __syncthreads();
     }
 
-    #pragma unroll
-    for (int a = 0; a < RT; ++a)
+    if (value_lane) {
         #pragma unroll
-        for (int b = 0; b < TC; ++b)
-            S[(size_t)head * GDN_DK * GDN_DV + (i0 + a) * GDN_DV + j0 + jb + b] = Sr[a][b];
+        for (int a = 0; a < RT; ++a)
+            #pragma unroll
+            for (int b = 0; b < TC; ++b)
+                S[(size_t)head * GDN_DK * GDN_DV + (i0 + a) * GDN_DV + j0 + jb + b] = Sr[a][b];
+    }
 }
 
 // VSPLIT is fixed at setup by the prepared plan.
@@ -291,4 +432,19 @@ void gdn_chunked_core_snapshot(const float* q, const float* k, const float* v,
                               __nv_bfloat16* out, const Q38SequenceFields* meta, int valid_rows,
                               float* snapshots) {
     gdn_chunked_core_t<1, true>(q, k, v, beta, g, S, out, meta, valid_rows, snapshots);
+}
+
+extern "C" __global__ __launch_bounds__(GDN_THREADS, 1)
+void gdn_chunked_core_per_channel_v1(const float* q, const float* k, const float* v,
+                                     const float* beta, const float* g, float* S,
+                                     __nv_bfloat16* out, const Q38SequenceFields* meta, int valid_rows) {
+    gdn_chunked_core_t<1, false, true>(q, k, v, beta, g, S, out, meta, valid_rows, nullptr);
+}
+
+extern "C" __global__ __launch_bounds__(GDN_THREADS, 1)
+void gdn_chunked_core_per_channel_snapshot(const float* q, const float* k, const float* v,
+                                           const float* beta, const float* g, float* S,
+                                           __nv_bfloat16* out, const Q38SequenceFields* meta, int valid_rows,
+                                           float* snapshots) {
+    gdn_chunked_core_t<1, true, true>(q, k, v, beta, g, S, out, meta, valid_rows, snapshots);
 }

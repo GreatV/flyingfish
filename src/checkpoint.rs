@@ -1171,6 +1171,14 @@ impl MappedCheckpoint {
             .context("GLM-5.3 geometry missing")?;
         let hidden = spec.hidden as usize;
         let depth = spec.layers.len();
+        let hc_width = (glm.hc_mult as usize)
+            .checked_mul(hidden)
+            .context("GLM HC input width overflow")?;
+        let hc_coefficients = glm
+            .hc_mult
+            .checked_add(2)
+            .and_then(|n| n.checked_mul(glm.hc_mult))
+            .context("GLM HC coefficient width overflow")? as usize;
         for name in ["model.language_model.embed_tokens.weight", "lm_head.weight"] {
             put(
                 expected,
@@ -1205,7 +1213,13 @@ impl MappedCheckpoint {
             }
             if i < depth {
                 for name in ["hc_attn_base", "hc_ffn_base"] {
-                    put(expected, format!("{p}.{name}"), Dtype::F32, vec![24], scope);
+                    put(
+                        expected,
+                        format!("{p}.{name}"),
+                        Dtype::F32,
+                        vec![hc_coefficients],
+                        scope,
+                    );
                 }
                 for name in ["hc_attn_scale", "hc_ffn_scale"] {
                     put(expected, format!("{p}.{name}"), Dtype::F32, vec![3], scope);
@@ -1215,7 +1229,7 @@ impl MappedCheckpoint {
                         expected,
                         format!("{p}.{name}"),
                         Dtype::BF16,
-                        vec![24, 4 * hidden],
+                        vec![hc_coefficients, hc_width],
                         scope,
                     );
                 }
@@ -1266,7 +1280,10 @@ impl MappedCheckpoint {
     ) -> Result<()> {
         let g = spec.gdn.as_ref().context("GLM-5.3 KDA geometry missing")?;
         let hidden = spec.hidden as usize;
-        let width = (g.value_heads * g.value_head_dim) as usize;
+        let width = g
+            .value_heads
+            .checked_mul(g.value_head_dim)
+            .context("GLM KDA projection width overflow")? as usize;
         let heads = g.value_heads as usize;
         let low_rank = g.key_head_dim as usize;
         for (role, n, k) in [
@@ -1335,6 +1352,15 @@ impl MappedCheckpoint {
         let q_lora = glm.q_lora_rank as usize;
         let kv_lora = glm.kv_lora_rank as usize;
         let index_dim = glm.index_head_dim as usize;
+        let kv_width = glm
+            .qk_nope_head_dim
+            .checked_add(glm.v_head_dim)
+            .and_then(|n| n.checked_mul(spec.q_heads))
+            .context("GLM DSA expanded KV width overflow")? as usize;
+        let output_width = spec
+            .q_heads
+            .checked_mul(glm.v_head_dim)
+            .context("GLM DSA output width overflow")? as usize;
         for (suffix, shape) in [
             (
                 "index_kpool_compress_ape",
@@ -1374,17 +1400,14 @@ impl MappedCheckpoint {
             expected,
             format!("{prefix}.self_attn.kv_b_proj.weight"),
             Dtype::BF16,
-            vec![
-                (glm.qk_nope_head_dim + glm.v_head_dim) as usize * spec.q_heads as usize,
-                kv_lora,
-            ],
+            vec![kv_width, kv_lora],
             scope,
         );
         for (role, n, k) in [
             ("q_a_proj", q_lora, hidden),
             ("q_b_proj", spec.q_width as usize, q_lora),
             ("kv_a_proj_with_mqa", kv_lora, hidden),
-            ("o_proj", hidden, spec.q_width as usize),
+            ("o_proj", hidden, output_width),
         ] {
             projection_scoped(
                 expected,
@@ -1913,6 +1936,13 @@ pub struct TensorEntry {
     pub scale_name: Option<String>,
 }
 impl TensorEntry {
+    pub(crate) fn is_linear_projection(&self) -> bool {
+        self.is_non_expert_loaded()
+            && self.shape.len() == 2
+            && (self.role.ends_with(".weight")
+                || self.role == "self_attn.indexer.index_kpool_compress_gate")
+    }
+
     pub(crate) fn is_routed_expert(&self) -> bool {
         self.role.starts_with("mlp.experts.")
     }
@@ -1953,6 +1983,40 @@ pub struct TensorManifest {
 }
 
 impl TensorManifest {
+    pub(crate) fn validate_dsa_layer(
+        &self,
+        spec: &crate::model_spec::ModelSpec,
+        layer: u32,
+        prefix: &str,
+    ) -> Result<()> {
+        let mut expected = BTreeMap::new();
+        MappedCheckpoint::glm5_next_dsa(
+            spec,
+            prefix.trim_end_matches('.'),
+            &mut expected,
+            TensorScope::Text,
+        )?;
+        for (name, (dtype, shape, scope)) in expected {
+            let entry = self
+                .entries
+                .get(&name)
+                .with_context(|| format!("DSA layer {layer} missing binding {name}"))?;
+            ensure!(
+                entry.load
+                    && entry.scope == scope
+                    && entry.layer == Some(layer)
+                    && entry.role == name[prefix.len()..]
+                    && entry.dtype == dtype
+                    && entry.shape == shape
+                    && entry.bytes == tensor_bytes(dtype, &shape)?
+                    && entry.data_offsets[1].checked_sub(entry.data_offsets[0])
+                        == Some(u64::try_from(entry.bytes)?),
+                "DSA layer {layer} native binding mismatch: {name}"
+            );
+        }
+        Ok(())
+    }
+
     /// Loaded text-tower non-expert tensor bytes scanned during decode (excludes token embedding lookup).
     pub fn non_expert_decode_bytes(&self) -> Result<u64> {
         self.entries
@@ -2019,6 +2083,160 @@ impl MappedCheckpoint {
 #[cfg(test)]
 mod component_tests {
     use super::*;
+
+    #[test]
+    fn glm_native_manifest_preserves_roles_and_projection_extents() -> Result<()> {
+        let root = serde_json::from_str(include_str!("../tests/data/glm53-flash-config.json"))?;
+        let mut spec = crate::model_spec::ModelSpec::glm5_next(&root, &serde_json::Value::Null)?;
+        let mut tensors = BTreeMap::new();
+        MappedCheckpoint::glm5_next_entries(&spec, &mut tensors)?;
+        assert_eq!(tensors.len(), 75_761);
+        for (scope, count, bytes) in [
+            (TensorScope::Text, 74_001, 319_706_118_392usize),
+            (TensorScope::Mtp, 1_760, 7_493_399_168),
+        ] {
+            let entries: Vec<_> = tensors.values().filter(|entry| entry.2 == scope).collect();
+            assert_eq!(entries.len(), count);
+            let total = entries.iter().try_fold(0usize, |sum, (dtype, shape, _)| {
+                sum.checked_add(tensor_bytes(*dtype, shape)?)
+                    .context("manifest byte overflow")
+            })?;
+            assert_eq!(total, bytes);
+        }
+        let mut manifest = TensorManifest {
+            entries: BTreeMap::new(),
+            resident_bytes: 0,
+        };
+        for (name, (dtype, shape, scope)) in &tensors {
+            let (layer, role) = split_layer_role(name)?;
+            if !layer.is_some_and(|i| (i + 1).is_multiple_of(4)) || !role.starts_with("self_attn.")
+            {
+                continue;
+            }
+            let bytes = tensor_bytes(*dtype, shape)?;
+            manifest.entries.insert(
+                name.clone(),
+                TensorEntry {
+                    dtype: *dtype,
+                    shape: shape.clone(),
+                    shard: "native.safetensors".into(),
+                    bytes,
+                    load: true,
+                    data_start: 0,
+                    data_offsets: [0, bytes as u64],
+                    scope: *scope,
+                    layer,
+                    role,
+                    scale_name: (*dtype == Dtype::F8_E4M3).then(|| format!("{}_scale_inv", name)),
+                },
+            );
+            manifest.resident_bytes += bytes;
+        }
+        for layer in (3..45).step_by(4) {
+            let plan = crate::linear_plan::LayerDequantPlan::from_model(&manifest, layer, &spec)?;
+            assert!(plan.slots.is_empty());
+            assert_eq!(plan.bytes, 0);
+            assert_eq!(
+                manifest
+                    .entries
+                    .iter()
+                    .filter(|(name, entry)| name.starts_with(&plan.prefix)
+                        && entry.dtype == Dtype::F8_E4M3)
+                    .count(),
+                4
+            );
+            let admitted: Vec<_> = manifest
+                .entries
+                .iter()
+                .filter(|(name, e)| name.starts_with(&plan.prefix) && e.is_linear_projection())
+                .collect();
+            assert_eq!(admitted.len(), 9);
+            let old_suffix_count = admitted
+                .iter()
+                .filter(|(name, _)| name.ends_with(".weight"))
+                .count();
+            assert_eq!(old_suffix_count, 8);
+            let gate = format!("{}self_attn.indexer.index_kpool_compress_gate", plan.prefix);
+            assert!(manifest.entries[&gate].is_linear_projection());
+            let entry = manifest.entries.remove(&gate).unwrap();
+            assert!(
+                crate::linear_plan::LayerDequantPlan::from_model(&manifest, layer, &spec).is_err()
+            );
+            manifest.entries.insert(gate.clone(), entry);
+            manifest.entries.get_mut(&gate).unwrap().shape.swap(0, 1);
+            assert!(
+                crate::linear_plan::LayerDequantPlan::from_model(&manifest, layer, &spec).is_err()
+            );
+            manifest.entries.get_mut(&gate).unwrap().shape.swap(0, 1);
+            manifest.entries.get_mut(&gate).unwrap().load = false;
+            assert!(
+                crate::linear_plan::LayerDequantPlan::from_model(&manifest, layer, &spec).is_err()
+            );
+            manifest.entries.get_mut(&gate).unwrap().load = true;
+        }
+        println!(
+            "PASS glm_dsa_native_binding layers=11 projections_per_layer=9 fp8_slots=4 old_suffix_control=8 missing_shape_unloaded_controls=33"
+        );
+        for (layer, role, dtype, shape) in [
+            (2, "hc_attn_fn", Dtype::BF16, vec![24, 16384]),
+            (2, "hc_attn_base", Dtype::F32, vec![24]),
+            (2, "self_attn.q_proj.weight", Dtype::BF16, vec![8192, 4096]),
+            (
+                2,
+                "self_attn.q_conv1d.weight",
+                Dtype::BF16,
+                vec![8192, 1, 4],
+            ),
+            (2, "self_attn.A_log", Dtype::F32, vec![64]),
+            (2, "self_attn.dt_bias", Dtype::F32, vec![8192]),
+            (
+                3,
+                "self_attn.q_a_proj.weight",
+                Dtype::F8_E4M3,
+                vec![1536, 4096],
+            ),
+            (
+                3,
+                "self_attn.q_a_proj.weight_scale_inv",
+                Dtype::F32,
+                vec![12, 32],
+            ),
+            (
+                3,
+                "self_attn.kv_b_proj.weight",
+                Dtype::BF16,
+                vec![32768, 512],
+            ),
+            (
+                3,
+                "self_attn.o_proj.weight",
+                Dtype::F8_E4M3,
+                vec![4096, 16384],
+            ),
+            (3, "mlp.gate.weight", Dtype::BF16, vec![288, 4096]),
+            (3, "mlp.gate.e_score_correction_bias", Dtype::F32, vec![288]),
+        ] {
+            let name = format!("model.language_model.layers.{layer}.{role}");
+            assert_eq!(tensors[&name], (dtype, shape, TensorScope::Text), "{name}");
+            assert_eq!(split_layer_role(&name)?, (Some(layer), role.to_owned()));
+        }
+        spec.glm5_next.as_mut().unwrap().v_head_dim = 128;
+        tensors.clear();
+        MappedCheckpoint::glm5_next_dsa(&spec, "layer", &mut tensors, TensorScope::Text)?;
+        assert_eq!(tensors["layer.self_attn.kv_b_proj.weight"].1, [24576, 512]);
+        assert_eq!(tensors["layer.self_attn.o_proj.weight"].1, [4096, 8192]);
+        spec.glm5_next.as_mut().unwrap().v_head_dim = u32::MAX;
+        assert!(
+            MappedCheckpoint::glm5_next_dsa(&spec, "layer", &mut tensors, TensorScope::Text)
+                .is_err()
+        );
+        spec.glm5_next.as_mut().unwrap().hc_mult = u32::MAX;
+        assert!(MappedCheckpoint::glm5_next_entries(&spec, &mut tensors).is_err());
+        println!(
+            "PASS glm_native_manifest text=74001 mtp=1760 native_roles=12 asymmetric_value_control=true overflow_controls=2"
+        );
+        Ok(())
+    }
 
     #[test]
     fn mtp_presence_comes_from_checkpoint_tensor_names() -> Result<()> {

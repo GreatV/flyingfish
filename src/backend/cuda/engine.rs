@@ -591,9 +591,7 @@ fn load_dispatch(architecture: crate::model_spec::Architecture) -> Result<LoadDi
         Architecture::Flint => LoadDispatch::Qwen,
         Architecture::LoopVl => LoadDispatch::Recurrent,
         Architecture::DeepseekV41 => LoadDispatch::Deepseek,
-        Architecture::Glm5Next => {
-            anyhow::bail!("GLM-5.3 execution is not bound yet")
-        }
+        Architecture::Glm5Next => LoadDispatch::Qwen,
     })
 }
 
@@ -621,13 +619,13 @@ pub struct Engine {
     qwen: Option<qwen::Runtime>,
     recurrent: Option<recurrent::Runtime>,
     #[cfg(feature = "cuda")]
-    deepseek: Option<crate::backend::cuda::hc::HcRuntime>,
-    #[cfg(feature = "cuda")]
     deepseek_mixer: Option<deepseek::DeepseekMixer>,
     #[cfg(feature = "cuda")]
     deepseek_ffn: Option<deepseek::DeepseekFfn>,
     #[cfg(feature = "cuda")]
     deepseek_engram: Option<deepseek::DeepseekEngram>,
+    hc: Option<super::hc::HcRuntime>,
+    glm_dsa: Option<qwen::GlmDsaOutputs>,
     moe: Option<moe::Decode>,
     moe_slots: Option<moe::Slots>,
     moe_prefill: Option<moe::Prefill>,
@@ -1111,14 +1109,14 @@ impl Engine {
             flint_window_capture: None,
             qwen: None,
             #[cfg(feature = "cuda")]
-            deepseek: None,
-            #[cfg(feature = "cuda")]
             deepseek_mixer: None,
             #[cfg(feature = "cuda")]
             deepseek_ffn: None,
             #[cfg(feature = "cuda")]
             deepseek_engram: None,
             recurrent: None,
+            hc: None,
+            glm_dsa: None,
             moe: None,
             moe_slots: None,
             moe_prefill: None,
@@ -1261,9 +1259,8 @@ impl Engine {
         if rows != old_rows {
             self.work
                 .grow(&self.device.stream, &self.model_spec, rows)?;
-            #[cfg(feature = "cuda")]
-            if let Some(deepseek) = &mut self.deepseek {
-                deepseek.grow(&self.device.stream, rows)?;
+            if let Some(hc) = &mut self.hc {
+                hc.grow(&self.device.stream, rows)?;
             }
             #[cfg(feature = "cuda")]
             if let Some(mixer) = &mut self.deepseek_mixer {
@@ -1777,10 +1774,22 @@ impl Engine {
             }
         }
         if let Some(slots) = self.moe_slots.as_mut() {
+            #[cfg(feature = "cuda")]
+            if self.model_spec.architecture == crate::model_spec::Architecture::Glm5Next
+                && !slots.request_open
+            {
+                slots.begin_staging_request()?;
+            }
             slots.begin_token()?;
         }
         let executed = (|| {
             self.run_operator(crate::backend::Operator::Embed, 0, step, &mut trace)?;
+            if self.model_spec.architecture == crate::model_spec::Architecture::Glm5Next {
+                self.hc
+                    .as_mut()
+                    .context("GLM-5.3 mHC runtime is not bound")?
+                    .begin_embedded(&self.device.stream, step.rows, &self.work.x)?;
+            }
             for i in 0..self.config.num_hidden_layers {
                 self.run_layer(i, step, &mut trace)?;
             }
@@ -1975,9 +1984,7 @@ impl Engine {
                 &self.device.stream,
                 layer,
                 step.rows,
-                self.deepseek
-                    .as_mut()
-                    .context("Engram mHC stream missing")?,
+                self.hc.as_mut().context("Engram mHC stream missing")?,
             )?;
         }
         let program = crate::model::layer_program(&self.model_spec, layer)?;
@@ -1995,11 +2002,12 @@ impl Engine {
                 }
                 crate::model::LayerStage::Ffn => self.run_ffn(layer, step, trace)?,
                 crate::model::LayerStage::Hc(kind) => {
-                    #[cfg(feature = "cuda")]
-                    self.run_hc_stage(position, kind, layer, step)?;
-                    #[cfg(not(feature = "cuda"))]
-                    anyhow::bail!("mHC stage {position}/{kind:?} requires CUDA");
+                    self.run_hc_stage(position, kind, layer, step)?
                 }
+            }
+            #[cfg(test)]
+            if let Some(calls) = self.qwen.as_ref().and_then(|q| q.glm_calls.as_ref()) {
+                calls.borrow_mut()[layer][position] += step.rows;
             }
         }
         #[cfg(test)]
@@ -2007,7 +2015,6 @@ impl Engine {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     fn run_hc_stage(
         &mut self,
         stage: usize,
@@ -2020,10 +2027,7 @@ impl Engine {
         } else {
             step.rows
         };
-        let runtime = self
-            .deepseek
-            .as_mut()
-            .context("DeepSeek-V4.1 mHC runtime is not bound")?;
+        let runtime = self.hc.as_mut().context("mHC runtime is not bound")?;
         let plan = crate::model::hc_stage_plan(stage, kind, runtime.binding.policy)?;
         match plan {
             crate::model::HcStagePlan::Pre { sublayer, source } => runtime.hc_pre(
@@ -2065,9 +2069,13 @@ impl Engine {
     ) -> Result<()> {
         use crate::model_spec::{Architecture, Mixer};
         match (self.model_spec.architecture, mixer) {
-            (Architecture::Qwen35Text | Architecture::MiniCpmV47 | Architecture::Flint, _) => {
-                self.qwen_mixer(layer, step, trace)
-            }
+            (
+                Architecture::Qwen35Text
+                | Architecture::MiniCpmV47
+                | Architecture::Flint
+                | Architecture::Glm5Next,
+                _,
+            ) => self.qwen_mixer(layer, step, trace),
             (Architecture::Llama, Mixer::FullAttention) => {
                 for op in crate::model::LLAMA_MIXER {
                     self.run_operator(op, layer, step, trace)?;
@@ -2520,6 +2528,10 @@ impl Engine {
             engram.service.reset();
             engram.prepared = None;
         }
+        #[cfg(test)]
+        if let Some(calls) = self.qwen.as_ref().and_then(|q| q.glm_calls.as_ref()) {
+            calls.borrow_mut().fill([0; 10]);
+        }
         if let Some(spec) = self.spec.as_mut() {
             spec.active_rows = 0;
             spec.verify_schedule = spec.cold_verify_schedule;
@@ -2545,6 +2557,10 @@ impl Engine {
         &mut self,
         request: TextPrefixSaveRequest<'_>,
     ) -> Result<TextPrefixSaveOutput> {
+        ensure!(
+            self.model_spec.architecture != crate::model_spec::Architecture::Glm5Next,
+            "GLM DSA prefix persistence is not bound"
+        );
         let started = Instant::now();
         self.closure.assert_ready()?;
         ensure!(!self.poisoned, "cannot save a poisoned engine prefix");
@@ -2792,6 +2808,10 @@ impl Engine {
         snapshot: &PrefixSnapshot,
         intent: TextPrefixRestoreIntent<'_>,
     ) -> Result<PrefixRestoreReceipt> {
+        ensure!(
+            self.model_spec.architecture != crate::model_spec::Architecture::Glm5Next,
+            "GLM DSA prefix persistence is not bound"
+        );
         let started = Instant::now();
         validate_transfer_bytes(intent.transfer_bytes)?;
         snapshot.verify_prefix_and_pending_within_vocab(
@@ -3054,7 +3074,11 @@ impl Engine {
             "input token id outside vocabulary"
         );
         if self.model_spec.moe.is_some()
-            && self.model_spec.architecture != crate::model_spec::Architecture::DeepseekV41
+            && !matches!(
+                self.model_spec.architecture,
+                crate::model_spec::Architecture::DeepseekV41
+                    | crate::model_spec::Architecture::Glm5Next
+            )
         {
             return self.prefill_moe_chunks(ids, trace, keep, &mut after_chunk);
         }
@@ -3276,8 +3300,11 @@ impl Engine {
             .sum()
     }
 
-    /// Whether decode has a bound graph path; DeepSeek-V4.1 decodes eagerly.
+    /// DeepSeek-V4.1 and GLM-5.3 decode eagerly.
     pub fn graph_decode(&self) -> bool {
+        if self.model_spec.architecture == crate::model_spec::Architecture::Glm5Next {
+            return false;
+        }
         #[cfg(feature = "cuda")]
         if self.deepseek_mixer.is_some() {
             return false;
@@ -3286,6 +3313,10 @@ impl Engine {
     }
 
     pub fn capture(&mut self) -> Result<()> {
+        ensure!(
+            self.model_spec.architecture != crate::model_spec::Architecture::Glm5Next,
+            "GLM storage-only expert graph segments are not bound"
+        );
         ensure!(
             self.graph_decode(),
             "DeepSeek-V4.1 decode has no bound graph path"
@@ -5510,6 +5541,16 @@ impl Engine {
 }
 
 #[cfg(all(test, feature = "cuda"))]
+#[test]
+fn glm_dispatch_selects_the_hybrid_runtime() -> Result<()> {
+    assert!(matches!(
+        load_dispatch(crate::model_spec::Architecture::Glm5Next)?,
+        LoadDispatch::Qwen
+    ));
+    Ok(())
+}
+
+#[cfg(all(test, feature = "cuda"))]
 #[path = "engine_tests.rs"]
 mod tests;
 
@@ -5820,6 +5861,8 @@ impl Engine {
             qwen_device_prefix: false,
             qwen: None,
             recurrent: None,
+            hc: None,
+            glm_dsa: None,
             moe: None,
             moe_slots: None,
             moe_prefill: None,

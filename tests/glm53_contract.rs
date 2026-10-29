@@ -4,9 +4,10 @@ use flyingfish::{
     experts::catalogue::{ExpertCatalogue, ExpertGeometry, ExpertLayout, ExpertRange},
     model::{HcPreSource, HcStage, HcStagePlan, HcSublayer, hc_pre_policy, hc_stage_plan},
     model_spec::{
-        Architecture, ExpertFormat, LinearFormat, Mixer, ModelSpec, RoutedWeightBoundary,
+        Architecture, ExpertFormat, FfnKind, LinearFormat, Mixer, ModelSpec, RoutedWeightBoundary,
         RouterScore, SwigluRounding,
     },
+    work_layout::{DsaRowLayout, RowWorkSpec},
 };
 use safetensors::SafeTensors;
 use serde_json::{Value, json};
@@ -85,6 +86,115 @@ fn glm53_normalizes_every_layer_and_fp8_format() {
     assert_eq!(slot.up_scale.start, 25_167_872);
     assert_eq!(slot.down_scale.start, 25_169_920);
     assert_eq!(slot.down_scale.end, 25_171_968);
+}
+
+#[test]
+fn glm53_uses_the_nine_stage_own_pre_hc_program() -> Result<()> {
+    use flyingfish::model::{
+        HcPreSource, HcStage, LayerProgram, LayerStage, hc_pre_policy, layer_program,
+    };
+    let model = spec();
+    let policy = hc_pre_policy(model.architecture)?;
+    assert_eq!(
+        (policy.attention, policy.ffn),
+        (HcPreSource::Own, HcPreSource::Own)
+    );
+    for layer in 0..model.layers.len() {
+        let LayerProgram::Hc(stages) = layer_program(&model, layer)? else {
+            anyhow::bail!("GLM layer {layer} does not use the mHC program");
+        };
+        assert_eq!(stages.len(), 9);
+        assert!(matches!(stages[0], LayerStage::Hc(HcStage::Pre)));
+        assert!(matches!(stages[3], LayerStage::Hc(HcStage::Post)));
+        assert!(matches!(stages[4], LayerStage::Hc(HcStage::Pre)));
+        assert!(matches!(stages[7], LayerStage::Hc(HcStage::Post)));
+    }
+    Ok(())
+}
+
+#[test]
+fn glm53_native_rows_cover_both_mixers_and_reject_extent_overflow() -> Result<()> {
+    let model = spec();
+    let gdn = flyingfish::op_contract::GdnSpec::from_model(&model)?;
+    assert_eq!((gdn.hk, gdn.hv, gdn.dk, gdn.dv), (64, 64, 128, 128));
+    assert_eq!(gdn.rms_eps, 1e-5);
+    assert_eq!(gdn.l2_eps, 1e-6);
+    assert_eq!(gdn.conv_dim()?, 24576);
+    assert_eq!(gdn.state_bytes()?, 4_194_304);
+    assert_eq!(gdn.history_bytes()?, 294_912);
+    assert!(
+        flyingfish::op_contract::GdnSpec { hk: 16, ..gdn }
+            .validate()
+            .is_err()
+    );
+    let mut slots = [0, 0];
+    for (layer, plan) in model.layers.iter().enumerate() {
+        let dsa = (layer + 1).is_multiple_of(4);
+        let slot = usize::from(!dsa);
+        assert_eq!(
+            plan.mixer,
+            if dsa {
+                Mixer::FullAttention
+            } else {
+                Mixer::Gdn
+            }
+        );
+        assert_eq!(plan.state_index, slots[slot]);
+        assert_eq!(
+            plan.ffn,
+            if layer < 3 {
+                FfnKind::Dense
+            } else {
+                FfnKind::Moe
+            }
+        );
+        assert!(!plan.rope);
+        slots[slot] += 1;
+    }
+    assert_eq!(slots, [11, 34]);
+    let work = RowWorkSpec::new(&model)?;
+    assert_eq!((work.hidden, work.intermediate), (4096, 12288));
+    assert_eq!((work.projection, work.mixer, work.ab), (24576, 16384, 8256));
+    assert!(work.extra_mixer);
+    assert_eq!(work.row_bytes()?, 262276);
+    for rows in [1, 2, 5, 31, 33, 65] {
+        assert_eq!(
+            RowWorkSpec::elements(rows, work.projection)?,
+            rows * 3 * 64 * 128
+        );
+        let dsa = DsaRowLayout::new(&model, rows)?;
+        let mut end = 0;
+        for (range, width) in [
+            (&dsa.query, 16384),
+            (&dsa.query_residual, 1536),
+            (&dsa.latent, 512),
+            (&dsa.index_query, 4096),
+            (&dsa.index_weights, 32),
+            (&dsa.packed, 257),
+        ] {
+            assert_eq!(range.start, end);
+            assert_eq!(range.len(), rows * width);
+            assert_eq!(range.start * 2 % 16, 0);
+            end = range.end;
+        }
+        assert_eq!(end, rows * 22817);
+        assert!(end <= RowWorkSpec::elements(rows, work.projection)?);
+    }
+    assert!(DsaRowLayout::new(&model, 0).is_err());
+    assert!(DsaRowLayout::new(&model, usize::MAX).is_err());
+    let mut wider = model.clone();
+    wider.glm5_next.as_mut().unwrap().q_lora_rank = 8192;
+    assert_eq!(RowWorkSpec::new(&wider)?.projection, 29473);
+    wider.glm5_next.as_mut().unwrap().q_lora_rank = u32::MAX;
+    assert!(RowWorkSpec::new(&wider).is_err());
+    let mut bad = model;
+    bad.gdn.as_mut().unwrap().key_heads = u32::MAX;
+    assert!(RowWorkSpec::new(&bad).is_err());
+    assert!(RowWorkSpec::elements(usize::MAX, work.projection).is_err());
+    println!(
+        "PASS glm53_native_row_geometry layers=45 kda=34 dsa=11 row_bytes=262276 overflow_controls=3"
+    );
+    Ok(())
 }
 
 #[test]

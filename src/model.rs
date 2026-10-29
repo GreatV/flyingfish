@@ -458,7 +458,8 @@ pub fn layer_program(
         .context("layer outside model plan")?
         .mixer;
     match spec.architecture {
-        crate::model_spec::Architecture::DeepseekV41 => Ok(LayerProgram::Hc([
+        crate::model_spec::Architecture::DeepseekV41
+        | crate::model_spec::Architecture::Glm5Next => Ok(LayerProgram::Hc([
             LayerStage::Hc(HcStage::Pre),
             LayerStage::Common(O::Norm),
             LayerStage::Mixer(mixer),
@@ -473,7 +474,6 @@ pub fn layer_program(
         | crate::model_spec::Architecture::Qwen35Text
         | crate::model_spec::Architecture::MiniCpmV47
         | crate::model_spec::Architecture::Flint
-        | crate::model_spec::Architecture::Glm5Next
         | crate::model_spec::Architecture::LoopVl => Ok(LayerProgram::Standard([
             LayerStage::Common(O::Norm),
             LayerStage::Mixer(mixer),

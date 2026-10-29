@@ -1274,10 +1274,10 @@ impl Slots {
     }
 
     #[cfg(feature = "cuda")]
-    pub fn resolve_deepseek(&mut self, layer: u32, ids: &[i32], weights: &[f32]) -> Result<usize> {
+    pub fn resolve_native(&mut self, layer: u32, ids: &[i32], weights: &[f32]) -> Result<usize> {
         ensure!(
             ids.len() == weights.len(),
-            "DeepSeek tier route ids {} and weights {} differ",
+            "native tier route ids {} and weights {} differ",
             ids.len(),
             weights.len()
         );
@@ -1285,10 +1285,10 @@ impl Slots {
         for (choice, (&expert, &weight)) in ids.iter().zip(weights).enumerate() {
             self.routes.push(crate::experts::runtime::Route {
                 row: u32::try_from(choice / self.catalogue.geometry().top_k as usize)
-                    .context("DeepSeek tier route row overflow")?,
-                choice: u32::try_from(choice).context("DeepSeek tier choice overflow")?,
+                    .context("native tier route row overflow")?,
+                choice: u32::try_from(choice).context("native tier choice overflow")?,
                 expert: u32::try_from(expert)
-                    .context("DeepSeek tier expert id is negative or too large")?,
+                    .context("native tier expert id is negative or too large")?,
                 weight: bf16::from_f32(weight),
             });
         }
@@ -1308,7 +1308,7 @@ impl Slots {
             let source = match (published.from_host, published.source_block) {
                 (true, Some(block)) => MoveSource::Host(block),
                 (false, None) => MoveSource::Disk,
-                other => anyhow::bail!("DeepSeek tier source contract differs: {other:?}"),
+                other => anyhow::bail!("native tier source contract differs: {other:?}"),
             };
             self.moves.push(PromptMove {
                 layer: published.layer,
@@ -1331,48 +1331,56 @@ impl Slots {
     }
 
     #[cfg(feature = "cuda")]
-    pub fn deepseek_dispatch(&self, layer: u32) -> Result<(Vec<u64>, Vec<u32>)> {
+    pub fn native_dispatch(&self, layer: u32) -> Result<(Vec<u64>, Vec<u32>)> {
         let geometry = self.catalogue.geometry();
         ensure!(
             layer < geometry.layers,
-            "DeepSeek tier layer {layer} outside {}",
-            geometry.layers
+            "native tier layer outside geometry"
         );
-        let mut slots = Vec::with_capacity(
-            geometry.experts as usize * crate::backend::cuda::moe::w4a8::W4A8_SLOT_POINTERS,
-        );
+        let offsets = match self.catalogue.layout() {
+            crate::experts::catalogue::ExpertLayout::Fp8W8a16(layout)
+            | crate::experts::catalogue::ExpertLayout::Fp8W8a16Block(layout, _) => [
+                layout.gate.start,
+                layout.gate_scale.start,
+                layout.up.start,
+                layout.up_scale.start,
+                layout.down.start,
+                layout.down_scale.start,
+            ],
+            crate::experts::catalogue::ExpertLayout::Fp4E2m1Block(layout, _) => [
+                layout.gate.start,
+                layout.gate_scale.start,
+                layout.up.start,
+                layout.up_scale.start,
+                layout.down.start,
+                layout.down_scale.start,
+            ],
+            _ => anyhow::bail!("native dispatch requires six-slice quantized expert storage"),
+        };
+        let mut pointers = Vec::with_capacity(geometry.experts as usize * offsets.len());
         let mut valid = Vec::with_capacity(geometry.experts as usize);
         for expert in 0..geometry.experts {
             if self.policy.ledger().tier(layer, expert)? != Tier::Gpu {
-                slots.extend(std::iter::repeat_n(
-                    0,
-                    crate::backend::cuda::moe::w4a8::W4A8_SLOT_POINTERS,
-                ));
+                pointers.extend(std::iter::repeat_n(0, offsets.len()));
                 valid.push(0);
                 continue;
             }
-            let physical = self.policy.ledger().slot(layer, expert).and_then(|slot| {
-                self.physical
-                    .get(slot as usize)
-                    .map(|slot| slot.pointer)
-                    .context("DeepSeek tier physical slot outside allocation")
-            })?;
-            let crate::experts::catalogue::ExpertLayout::Fp4E2m1Block(layout, _) =
-                self.catalogue.layout()
-            else {
-                anyhow::bail!("DeepSeek tier catalogue is not the published E2M1 layout")
-            };
-            slots.extend([
-                physical + layout.gate.start,
-                physical + layout.gate_scale.start,
-                physical + layout.up.start,
-                physical + layout.up_scale.start,
-                physical + layout.down.start,
-                physical + layout.down_scale.start,
-            ]);
+            let slot = self.policy.ledger().slot(layer, expert)?;
+            let physical = self
+                .physical
+                .get(slot as usize)
+                .context("native physical slot missing")?;
+            for offset in offsets {
+                pointers.push(
+                    physical
+                        .pointer
+                        .checked_add(offset)
+                        .context("native slot pointer overflow")?,
+                );
+            }
             valid.push(1);
         }
-        Ok((slots, valid))
+        Ok((pointers, valid))
     }
 
     #[cfg(test)]
@@ -1398,7 +1406,7 @@ impl Slots {
     ) -> Result<usize> {
         self.begin_token()?;
         let weights = vec![1.0 / self.catalogue.geometry().top_k as f32; ids.len()];
-        let misses = self.resolve_deepseek(layer, ids, &weights)?;
+        let misses = self.resolve_native(layer, ids, &weights)?;
         self.finish_token()?;
         Ok(misses)
     }
@@ -1506,7 +1514,10 @@ impl Slots {
         self.physical.len() == geometry.layers as usize * geometry.experts as usize
     }
 
-    pub(super) fn record_all_readers(&mut self, device: &Device) -> Result<()> {
+    pub(in crate::backend::cuda::engine) fn record_all_readers(
+        &mut self,
+        device: &Device,
+    ) -> Result<()> {
         self.readers.clear();
         self.readers.extend(0..u32::try_from(self.physical.len())?);
         let event = self.events.record(&device.stream)?;
