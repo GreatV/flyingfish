@@ -1070,7 +1070,8 @@ fn localize_oracle_cell(
             engine.gemma_prefill_trace(&sequence, &mut trace)?;
             let mut beyond = false;
             for layer in 0..layers {
-                beyond |= oracle_layer_distance(&trace, oracle, reference, family, 0, layer)?;
+                beyond |=
+                    oracle_layer_distance(&trace, oracle, reference_layers, family, 0, layer)?;
             }
             if !beyond {
                 let expected = reference(oracle, &format!("{family}.prefill"))?.as_f32();
@@ -1092,7 +1093,14 @@ fn localize_oracle_cell(
                 engine.gemma_decode_trace(id, &mut trace)?;
                 let mut beyond = false;
                 for layer in 0..layers {
-                    beyond |= oracle_layer_distance(&trace, oracle, reference, family, row, layer)?;
+                    beyond |= oracle_layer_distance(
+                        &trace,
+                        oracle,
+                        reference_layers,
+                        family,
+                        row,
+                        layer,
+                    )?;
                 }
                 if !beyond {
                     let expected = reference(oracle, &format!("{family}.decode"))?.as_f32();
