@@ -1088,7 +1088,12 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
     }
     drop(catalog);
     let mut engine = super::engine::Engine::load(&dir, 0, 640, Some(640), settings)?;
-    let full_table = spec.layers[4]
+    let global_layer = spec
+        .layers
+        .iter()
+        .position(|layer| layer.geometry.is_some_and(|g| g.head_dim == 512))
+        .context("no D512 layer in Gemma model")?;
+    let full_table = spec.layers[global_layer]
         .geometry
         .context("D512 layer geometry missing")?
         .rope
@@ -1177,7 +1182,7 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         v_shape.clone(),
         native_v.iter().map(|v| v.to_f32()).collect(),
     )?;
-    let (native_k4, native_v4) = engine.gemma_kv_rows(4, first_ids.len())?;
+    let (native_k4, native_v4) = engine.gemma_kv_rows(global_layer, first_ids.len())?;
     trace.add(
         "debug.native_k4".into(),
         vec![first_ids.len(), 1, 512],
