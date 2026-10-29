@@ -1120,7 +1120,11 @@ mod tests {
         ));
         std::fs::create_dir_all(&root)?;
         let result = (|| {
-            let setup = wide_hash_setup();
+            let mut setup = wide_hash_setup();
+            std::fs::write(root.join("config.json"), b"engram config")?;
+            std::fs::write(root.join("tokenizer.json"), b"engram tokenizer")?;
+            (setup.config_sha256, setup.tokenizer_sha256) =
+                EngramHashSetup::model_fingerprints(&root)?;
             let layer_rows = setup.layer_rows()?;
             let ids = [1u32, 2, 3, 4];
             let mut hasher = NgramHistory::new(setup.clone(), ids.len())?;
