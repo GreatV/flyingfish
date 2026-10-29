@@ -993,14 +993,14 @@ fn d512_table_kv_preparation_matches_definition_gpu() -> Result<()> {
 fn oracle_layer_distance(
     trace: &crate::trace::Trace,
     oracle: &ReferenceFixture,
-    reference: &ReferenceFixture,
+    reference_layers: &ReferenceFixture,
     family: &str,
     token: usize,
     layer: usize,
 ) -> Result<bool> {
     let name = format!("layers.{family}");
     let oracle_values = reference(oracle, &name)?.as_f32();
-    let reference_values = reference(reference, &name)?.as_f32();
+    let reference_values = reference(reference_layers, &name)?.as_f32();
     let candidate_values = trace.values(&format!(".{layer}"))?;
     ensure!(
         candidate_values.len() == oracle_values.len()
@@ -1045,7 +1045,7 @@ fn oracle_token_nll(
 fn localize_oracle_cell(
     engine: &mut super::engine::Engine,
     oracle: &ReferenceFixture,
-    reference: &ReferenceFixture,
+    reference_layers: &ReferenceFixture,
     ids: &serde_json::Value,
     cell: &str,
     bounds: &serde_json::Value,
