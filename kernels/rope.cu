@@ -335,3 +335,47 @@ extern "C" __global__ void flint_qknorm_kv_nope(__nv_bfloat16* qkv,
                                       q_heads, kv_heads, dim, capacity, ring_tokens, 1.0f, eps,
                                       q_row_stride, k_offset, k_row_stride, v_offset, v_row_stride);
 }
+
+// Adjacent-pair layout mode of the rope op (the model definition's complex
+// convention: pairs (x[2i], x[2i+1]), in-place, FP32 math, one BF16 round).
+// rope_pair_rows emits the interleaved (cos, sin) rows of one position range
+// from per-layer inverse frequencies; the second buffer holds the conjugate
+// the attention output needs.
+// rows*tail/2 threads: fwd[r][2i]=cos(a), fwd[r][2i+1]=sin(a),
+// inv[r][2i+1]=-sin(a), a = (start + r) * inv_freq[i].
+extern "C" __global__ void rope_pair_rows(
+    const float* __restrict__ inv_freq, int start, int rows, int tail,
+    float* __restrict__ fwd, float* __restrict__ inv) {
+  if (start < 0 || rows < 1 || tail < 2 || (tail % 2) != 0) __trap();
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int half = tail / 2;
+  if (i >= rows * half) return;
+  const int r = i / half, d = i % half;
+  const float angle = float(start + r) * inv_freq[d];
+  const float c = cosf(angle), s = sinf(angle);
+  fwd[(size_t)r * tail + 2 * d] = c;
+  fwd[(size_t)r * tail + 2 * d + 1] = s;
+  inv[(size_t)r * tail + 2 * d] = c;
+  inv[(size_t)r * tail + 2 * d + 1] = -s;
+}
+
+// rows*n*(tail/2) threads: rotate the last `tail` elements of every n-vector
+// of x[r] in place by the row's (cos, sin) pair.
+extern "C" __global__ void rope_pair_tail(
+    __nv_bfloat16* x, const float* __restrict__ rotary, int rows, int n,
+    int width, int tail) {
+  if (rows < 1 || n < 1 || tail < 2 || (tail % 2) != 0 || tail > width) __trap();
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int half = tail / 2;
+  if (i >= rows * n * half) return;
+  const int pair = i % half;
+  const int v = (i / half) % n;
+  const int r = i / (half * n);
+  const int d = r * n * width + v * width + (width - tail) + 2 * pair;
+  const float c = rotary[(size_t)r * tail + 2 * pair];
+  const float s = rotary[(size_t)r * tail + 2 * pair + 1];
+  const float a = __bfloat162float(x[d]);
+  const float b = __bfloat162float(x[d + 1]);
+  x[d] = __float2bfloat16_rn(a * c - b * s);
+  x[d + 1] = __float2bfloat16_rn(a * s + b * c);
+}
