@@ -221,7 +221,7 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
             if (gid == 0) smem[0] = t;
         }
         __syncthreads();
-        const float rstd = rsqrtf(smem[0] / (float)dim + eps);
+        const float rstd = powf(smem[0] / (float)dim + eps, -0.5f);
 
         if (gid < dim / 8) {
             float ww[8], out[8];
@@ -313,7 +313,7 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
             if (gid == 0) smem[0] = t;
         }
         __syncthreads();
-        const float rstd = rsqrtf(smem[0] / (float)dim + eps);
+        const float rstd = powf(smem[0] / (float)dim + eps, -0.5f);
         if (gid < dim / 8) {
             union O { float4 x; __nv_bfloat162 h[4]; } o;
 #pragma unroll
