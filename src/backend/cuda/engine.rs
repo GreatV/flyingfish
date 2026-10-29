@@ -2112,6 +2112,10 @@ impl Engine {
         }
         #[cfg(feature = "cuda")]
         if self.model_spec.architecture == crate::model_spec::Architecture::DeepseekV41 {
+            ensure!(
+                trace.is_none(),
+                "DeepSeek-V4.1 operators record no trace tensors; --dump and --trace-layer are unsupported"
+            );
             return self.deepseek_operator(op, i, step);
         }
         let is_tree = matches!(step.mask, crate::backend::Mask::Tree { .. });

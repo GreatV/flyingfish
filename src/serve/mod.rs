@@ -607,7 +607,23 @@ mod tests {
                 output.ids.len()
             );
         }
-        println!("PASS deepseek_plain_serving requests=2 tokens=4 graph_decode=false");
+        let mut trace = crate::trace::Trace::default();
+        let traced = crate::model::generate_plain(
+            &mut model,
+            &[785, 10567, 1087],
+            2,
+            true,
+            false,
+            Some(&mut trace),
+            &mut |_| true,
+        );
+        ensure!(
+            traced.is_err_and(|error| error.to_string().contains("record no trace tensors")),
+            "DeepSeek-V4.1 accepted a trace target it does not record"
+        );
+        println!(
+            "PASS deepseek_plain_serving requests=2 tokens=4 graph_decode=false trace_rejected=true"
+        );
         Ok(())
     }
 }
