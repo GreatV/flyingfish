@@ -1965,6 +1965,20 @@ impl Engine {
             None,
         )?;
         self.position += ids.len();
+        self.device
+            .stream
+            .memcpy_htod(&[self.position as i32], &mut self.work.position)?;
+        self.device
+            .stream
+            .memcpy_htod(&[(self.position + 1) as i32], &mut self.work.length)?;
+        if self.qwen.is_some() && self.position < self.capacity {
+            self.state.set_sequence(
+                &self.device.stream,
+                self.position as u32,
+                1,
+                self.workspace_rows as u32,
+            )?;
+        }
         Ok(())
     }
 
@@ -1990,6 +2004,20 @@ impl Engine {
             }),
         )?;
         self.position += ids.len();
+        self.device
+            .stream
+            .memcpy_htod(&[self.position as i32], &mut self.work.position)?;
+        self.device
+            .stream
+            .memcpy_htod(&[(self.position + 1) as i32], &mut self.work.length)?;
+        if self.qwen.is_some() && self.position < self.capacity {
+            self.state.set_sequence(
+                &self.device.stream,
+                self.position as u32,
+                1,
+                self.workspace_rows as u32,
+            )?;
+        }
         Ok(())
     }
 
@@ -3271,14 +3299,6 @@ impl Engine {
         #[cfg(feature = "cuda")]
         self.prepare_deepseek_engram(&[committed_token], None)?;
         if graph {
-            if self.model_spec.architecture == crate::model_spec::Architecture::Gemma4 {
-                self.device
-                    .stream
-                    .memcpy_htod(&[self.position as i32], &mut self.work.position)?;
-                self.device
-                    .stream
-                    .memcpy_htod(&[(self.position + 1) as i32], &mut self.work.length)?;
-            }
             {
                 let result = if self.moe.is_some() {
                     self.run_moe_graph(1)
