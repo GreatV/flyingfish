@@ -39,10 +39,6 @@
 #include <math.h>
 #include <stdint.h>
 
-#if defined(__HIP__)
-#pragma clang fp contract(off)
-#endif
-
 #define MHC_THREADS 256
 
 // Exact FP32 register upcast of one fn weight element.
