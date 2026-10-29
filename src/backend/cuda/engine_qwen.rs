@@ -5733,6 +5733,7 @@ impl Engine {
                                 matrix(&w.n, s, 0, linear_rows, h)?,
                                 &mut TensorMut(matrix(&ops.logits, s, 0, linear_rows, vocab)?),
                             )?;
+                            trace_value(trace, s, "head_raw", &ops.logits, linear_rows, vocab)?;
                             unsafe {
                                 s.launch_builder(&ops.softcap)
                                     .arg(&mut ops.logits)
