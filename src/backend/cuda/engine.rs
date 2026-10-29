@@ -1994,6 +1994,14 @@ impl Engine {
     }
 
     #[cfg(test)]
+    pub(crate) fn gemma_position(&self) -> Result<(usize, i32)> {
+        Ok((
+            self.position,
+            self.device.stream.clone_dtoh(&self.work.position)?[0],
+        ))
+    }
+
+    #[cfg(test)]
     pub(crate) fn gemma_hidden_state(&self) -> Result<(Vec<bf16>, Vec<bf16>)> {
         let h = self.model_spec.hidden as usize;
         Ok((

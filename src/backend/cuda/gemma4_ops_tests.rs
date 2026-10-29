@@ -1093,6 +1093,9 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
             let mut eager_decode0_kv = None;
             let mut eager_decode0_hidden = None;
             for (row, &token) in sequence[512..].iter().enumerate() {
+                if row == 0 {
+                    println!("GEMMA4_POSITION eager {:?}", engine.gemma_position()?);
+                }
                 engine.set_token(token)?;
                 engine.decode(false, None)?;
                 eager.extend(engine.decode_logits()?.into_iter().map(bf16::from_f32));
@@ -1112,6 +1115,9 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
             println!("GEMMA4_GRAPH_KV capture_restore equal={restore_equal}");
             let mut graph_logits = Vec::new();
             for (row, &token) in sequence[512..].iter().enumerate() {
+                if row == 0 {
+                    println!("GEMMA4_POSITION graph {:?}", engine.gemma_position()?);
+                }
                 engine.set_token(token)?;
                 engine.decode(true, None)?;
                 if row == 0 {
