@@ -990,6 +990,132 @@ fn d512_table_kv_preparation_matches_definition_gpu() -> Result<()> {
     Ok(())
 }
 
+fn oracle_layer_distance(
+    trace: &crate::trace::Trace,
+    oracle: &ReferenceFixture,
+    reference: &ReferenceFixture,
+    family: &str,
+    token: usize,
+    layer: usize,
+) -> Result<bool> {
+    let name = format!("layers.{family}");
+    let oracle_values = reference(oracle, &name)?.as_f32();
+    let reference_values = reference(reference, &name)?.as_f32();
+    let candidate_values = trace.values(&format!(".{layer}"))?;
+    ensure!(
+        candidate_values.len() == oracle_values.len()
+            && candidate_values.len() == reference_values.len(),
+        "oracle layer extent mismatch at layer {layer}"
+    );
+    let (mut candidate_max, mut reference_max) = (0.0f64, 0.0f64);
+    let (mut candidate_sq, mut reference_sq) = (0.0f64, 0.0f64);
+    for ((candidate, oracle), reference) in candidate_values
+        .iter()
+        .zip(&oracle_values)
+        .zip(&reference_values)
+    {
+        let candidate_delta = f64::from(*candidate - *oracle);
+        let reference_delta = f64::from(*reference - *oracle);
+        candidate_max = candidate_max.max(candidate_delta.abs());
+        reference_max = reference_max.max(reference_delta.abs());
+        candidate_sq += candidate_delta * candidate_delta;
+        reference_sq += reference_delta * reference_delta;
+    }
+    let candidate_rmse = (candidate_sq / candidate_values.len() as f64).sqrt();
+    let reference_rmse = (reference_sq / reference_values.len() as f64).sqrt();
+    let beyond = candidate_max > 2.0 * reference_max || candidate_rmse > 2.0 * reference_rmse;
+    println!(
+        "GEMMA4_ORACLE_LAYER token={token} layer={layer} candidate_max={candidate_max} candidate_rmse={candidate_rmse} reference_max={reference_max} reference_rmse={reference_rmse} beyond_2x={beyond}"
+    );
+    Ok(beyond)
+}
+
+fn oracle_token_nll(
+    actual: &[bf16],
+    expected: &[f32],
+    ids: &[u32],
+    bounds: &serde_json::Value,
+    token: usize,
+) -> Result<()> {
+    let (_, line) = model_metrics(actual, expected, ids, bounds)?;
+    println!("GEMMA4_ORACLE_TOKEN token={token} {line}");
+    Ok(())
+}
+
+fn localize_oracle_cell(
+    engine: &mut super::engine::Engine,
+    oracle: &ReferenceFixture,
+    reference: &ReferenceFixture,
+    ids: &serde_json::Value,
+    cell: &str,
+    bounds: &serde_json::Value,
+) -> Result<()> {
+    let (family, mode) = cell
+        .split_once('.')
+        .context("oracle cell must be family.mode")?;
+    ensure!(
+        matches!(family, "a" | "b" | "wrap"),
+        "unknown oracle family {family}"
+    );
+    let sequence: Vec<u32> = if family == "wrap" {
+        serde_json::from_value(ids["wrap"].clone())?
+    } else {
+        let index = usize::from(family == "b");
+        serde_json::from_value(ids["short"][index].clone())?
+    };
+    let layers = oracle["layers.a"].0[0];
+    match mode {
+        "prefill" => {
+            let mut trace = crate::trace::Trace::all_layers();
+            engine.gemma_prefill_trace(&sequence, &mut trace)?;
+            let mut beyond = false;
+            for layer in 0..layers {
+                beyond |= oracle_layer_distance(&trace, oracle, reference, family, 0, layer)?;
+            }
+            if !beyond {
+                let expected = reference(oracle, &format!("{family}.prefill"))?.as_f32();
+                for (row, &id) in sequence.iter().enumerate() {
+                    let actual = engine.gemma_all_logits(row)?;
+                    oracle_token_nll(
+                        &actual,
+                        &expected[row * actual.len()..(row + 1) * actual.len()],
+                        &[id],
+                        bounds,
+                        row,
+                    )?;
+                }
+            }
+        }
+        "decode" => {
+            for (row, &id) in sequence.iter().enumerate() {
+                let mut trace = crate::trace::Trace::all_layers();
+                engine.gemma_decode_trace(id, &mut trace)?;
+                let mut beyond = false;
+                for layer in 0..layers {
+                    beyond |= oracle_layer_distance(&trace, oracle, reference, family, row, layer)?;
+                }
+                if !beyond {
+                    let expected = reference(oracle, &format!("{family}.decode"))?.as_f32();
+                    let actual: Vec<bf16> = engine
+                        .decode_logits()?
+                        .into_iter()
+                        .map(bf16::from_f32)
+                        .collect();
+                    oracle_token_nll(
+                        &actual,
+                        &expected[row * actual.len()..(row + 1) * actual.len()],
+                        &[id],
+                        bounds,
+                        row,
+                    )?;
+                }
+            }
+        }
+        _ => anyhow::bail!("unknown oracle cell mode {mode}"),
+    }
+    Ok(())
+}
+
 fn model_metrics(
     actual: &[bf16],
     expected: &[f32],
@@ -1490,6 +1616,23 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
             println!("GEMMA4_MODEL wrap graph {line}");
             defects += usize::from(!pass);
         }
+    }
+    if let Some(cell) = std::env::var_os("FF_ORACLE_CELL") {
+        let cell = cell.to_string_lossy().into_owned();
+        let family = cell.split_once('.').map(|(family, _)| family).unwrap_or("");
+        let reference_dir = std::env::var_os("FF_GEMMA4_REFERENCE_FIXTURES")
+            .context("FF_GEMMA4_REFERENCE_FIXTURES missing for oracle localization")?;
+        let reference =
+            load_reference(&std::path::Path::new(&reference_dir).join("reference.safetensors"))?;
+        engine.reset()?;
+        localize_oracle_cell(
+            &mut engine,
+            &data,
+            &reference,
+            &ids,
+            &cell,
+            &frozen["families"][family],
+        )?;
     }
     ensure!(defects == 0, "GEMMA4_MODEL defects={defects}");
     ensure!(

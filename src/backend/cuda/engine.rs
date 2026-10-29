@@ -2022,6 +2022,23 @@ impl Engine {
     }
 
     #[cfg(test)]
+    pub(crate) fn gemma_decode_trace(
+        &mut self,
+        token: u32,
+        trace: &mut crate::trace::Trace,
+    ) -> Result<()> {
+        self.set_token(token)?;
+        self.run_decode_step(Some(Target {
+            trace,
+            prefix: "",
+            skip: 0,
+        }))?;
+        self.position += 1;
+        self.pending_token = Some(self.token()?);
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn gemma_rope_table(&self, full: bool, positions: &[usize]) -> Result<Vec<bf16>> {
         self.qwen
             .as_ref()
