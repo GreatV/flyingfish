@@ -163,6 +163,9 @@ impl Backend {
         let _ = tokens;
         match *self {}
     }
+    pub fn graph_decode(&self) -> bool {
+        match *self {}
+    }
     pub fn capture(&mut self) -> Result<()> {
         match *self {}
     }

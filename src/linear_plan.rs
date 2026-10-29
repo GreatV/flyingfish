@@ -22,6 +22,24 @@ pub struct LayerDequantPlan {
     pub slots: BTreeMap<String, DequantSlot>,
 }
 impl LayerDequantPlan {
+    pub fn from_model(
+        manifest: &TensorManifest,
+        layer: u32,
+        spec: &crate::model_spec::ModelSpec,
+    ) -> Result<Self> {
+        let plan = Self::from_manifest(manifest, layer, spec.linear_format)?;
+        let layout = spec
+            .layers
+            .get(layer as usize)
+            .context("linear layer outside model specification")?;
+        if spec.architecture == crate::model_spec::Architecture::Glm5Next
+            && layout.mixer == crate::model_spec::Mixer::FullAttention
+        {
+            manifest.validate_dsa_layer(spec, layer, &plan.prefix)?;
+        }
+        Ok(plan)
+    }
+
     pub fn from_manifest(
         manifest: &TensorManifest,
         layer: u32,
@@ -130,11 +148,8 @@ impl LayerDequantPlan {
         }
         ensure!(
             manifest.entries.iter().any(|(name, entry)| {
-                entry.load
-                    && !entry.is_routed_expert()
+                entry.is_linear_projection()
                     && name.starts_with(&prefix)
-                    && name.ends_with(".weight")
-                    && entry.shape.len() == 2
                     && matches!(entry.dtype, Dtype::BF16 | Dtype::F8_E4M3)
             }),
             "missing linear layer {layer}"

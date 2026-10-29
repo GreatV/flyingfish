@@ -98,7 +98,7 @@ enum Command {
         max_new_tokens: usize,
         #[arg(long)]
         graph: bool,
-        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=4), help = "MTP depth; defaults to 4 when the checkpoint contains MTP weights; 0 selects plain generation")]
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=4), help = "MTP depth; defaults to 4 when the checkpoint contains MTP weights for an architecture with MTP decode; 0 selects plain generation")]
         mtp: Option<u8>,
         #[arg(long)]
         dump: Option<PathBuf>,
@@ -117,7 +117,7 @@ enum Command {
     Serve {
         #[arg(long, default_value_t = 8080)]
         port: u16,
-        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=4), help = "MTP depth; defaults to 4 when the checkpoint contains MTP weights; 0 selects plain serving")]
+        #[arg(long, value_parser = clap::value_parser!(u8).range(0..=4), help = "MTP depth; defaults to 4 when the checkpoint contains MTP weights for an architecture with MTP decode; 0 selects plain serving")]
         mtp: Option<u8>,
     },
     Bench {
@@ -513,7 +513,10 @@ fn resolve_mtp(requested: Option<u8>, component: bool, plain_selected: bool) -> 
                 !plain_selected,
                 "MTP cannot combine --draft-model, --dump, --trace-layer or --image-tensors"
             );
-            ensure!(component, "checkpoint has no MTP component");
+            ensure!(
+                component,
+                "checkpoint has no MTP component with a bound decode path"
+            );
             Ok(Some(depth))
         }
         None => Ok((component && !plain_selected).then_some(4)),

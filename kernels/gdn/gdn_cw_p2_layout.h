@@ -6,3 +6,5 @@
 // Workspace bytes of one (chunk, head) slot: W bf16[64,128] 16384 + U fp32[64,128] 32768
 // + qk bf16[64,72] 9216 + the FP32[64] vectors Gc, Be, Sc 768.
 #define GDN_CW_P2_SLOT_BYTES 59136
+// Key-axis slot: W/U FP32[64,128], QK FP32[64,64], final log-decay FP32[128].
+#define GDN_CW_P2_KEY_SLOT_BYTES 82432

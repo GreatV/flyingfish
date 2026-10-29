@@ -23,7 +23,11 @@ pub(crate) struct RouteOps {
     topk: CudaFunction,
     sigmoid_topk: CudaFunction,
     noaux_topk: CudaFunction,
+    #[cfg(feature = "cuda")]
+    noaux_topk_f32: CudaFunction,
     blas: CudaBlas,
+    #[cfg(feature = "cuda")]
+    logits_gemm: Option<super::super::blas::RouteLogits>,
     stream: Arc<CudaStream>,
 }
 
@@ -122,7 +126,11 @@ impl RouteOps {
             topk: module.load_function("moe_route_topk")?,
             sigmoid_topk: module.load_function("moe_route_topk_sigmoid")?,
             noaux_topk: module.load_function("moe_route_topk_noaux")?,
+            #[cfg(feature = "cuda")]
+            noaux_topk_f32: module.load_function("moe_route_topk_noaux_f32")?,
             blas,
+            #[cfg(feature = "cuda")]
+            logits_gemm: None,
             stream: stream.clone(),
         })
     }
@@ -181,6 +189,49 @@ impl RouteOps {
 
     pub fn workspace_bytes(&self) -> usize {
         self.completed.len() * size_of::<u32>()
+    }
+
+    /// Router logits with an FP32 output on the RouteOps cuBLAS handle:
+    /// one cublasGemmEx with opA=T/opB=N, `router[H,E] * x[H,rows] ->
+    /// logits[E,rows]` column-major (row-major `[rows, experts]`),
+    /// CUBLAS_COMPUTE_32F with FP32 C (model definition Gate.forward
+    /// linear(x.float(), weight.float())).
+    #[cfg(feature = "cuda")]
+    pub fn logits_f32(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: Tensor<bf16, 2>,
+        router: Tensor<bf16, 2>,
+        logits: &mut TensorMut<f32, 2>,
+    ) -> Result<()> {
+        let (rows, experts, hidden) = self.validate_logits_f32(stream, x, router, logits)?;
+        let alpha = 1f32;
+        let beta = 0f32;
+        unsafe {
+            bs::cublasGemmEx(
+                *self.blas.handle(),
+                bs::cublasOperation_t::CUBLAS_OP_T,
+                bs::cublasOperation_t::CUBLAS_OP_N,
+                experts as i32,
+                rows as i32,
+                hidden as i32,
+                (&alpha as *const f32).cast(),
+                router.ptr as *const core::ffi::c_void,
+                bs::cudaDataType_t::CUDA_R_16BF,
+                hidden as i32,
+                x.ptr as *const core::ffi::c_void,
+                bs::cudaDataType_t::CUDA_R_16BF,
+                hidden as i32,
+                (&beta as *const f32).cast(),
+                logits.0.ptr as *mut core::ffi::c_void,
+                bs::cudaDataType_t::CUDA_R_32F,
+                experts as i32,
+                bs::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                bs::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+            .result()?;
+        }
+        Ok(())
     }
 
     /// Prefill routing: logits = x·routerᵀ via one cuBLAS GEMM, then
@@ -259,6 +310,78 @@ impl RouteOps {
         self.topk(stream, &plan, logits, ids, weights, score)
     }
 
+    #[cfg(feature = "cuda")]
+    fn validate_logits_f32(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: Tensor<bf16, 2>,
+        router: Tensor<bf16, 2>,
+        logits: &TensorMut<f32, 2>,
+    ) -> Result<(u32, u32, u32)> {
+        ensure!(
+            Arc::ptr_eq(stream, &self.stream),
+            "moe route FP32 logits stream is not the RouteOps construction stream (cuBLAS handle bound at construction)"
+        );
+        x.validate()?;
+        router.validate()?;
+        logits.0.validate()?;
+        let (rows, hidden) = (x.shape[0], x.shape[1]);
+        let experts = router.shape[0];
+        ensure!(
+            x.stride == [u64::from(hidden), 1] && router.stride == [u64::from(hidden), 1],
+            "FP32 route logits require contiguous x and router rows: x {:?}/{:?}, router {:?}/{:?}",
+            x.shape,
+            x.stride,
+            router.shape,
+            router.stride
+        );
+        ensure!(
+            router.shape[1] == hidden,
+            "FP32 route logits hidden width mismatch: x {:?}, router {:?}",
+            x.shape,
+            router.shape
+        );
+        ensure!(
+            logits.0.shape == [rows, experts] && logits.0.stride == [u64::from(experts), 1],
+            "FP32 route logits must be a dense [rows, experts] view: shape {:?}, stride {:?}, expected [{rows}, {experts}]",
+            logits.0.shape,
+            logits.0.stride
+        );
+        no_overlap(&x, &logits.0, "x", "logits")?;
+        no_overlap(&router, &logits.0, "router", "logits")?;
+        ensure!(
+            rows <= i32::MAX as u32 && experts <= i32::MAX as u32 && hidden <= i32::MAX as u32,
+            "FP32 route logits GEMM dimensions must fit i32: rows {rows}, experts {experts}, hidden {hidden}"
+        );
+        Ok((rows, experts, hidden))
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn prepare_logits_f32(&mut self, rows: u32, hidden: u32) -> Result<()> {
+        if self.logits_gemm.is_none() {
+            self.logits_gemm = Some(super::super::blas::RouteLogits::new(&self.stream)?);
+        }
+        self.logits_gemm
+            .as_ref()
+            .context("Lt route handle missing")?
+            .plan_for(rows as usize, self.experts as usize, hidden as usize)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn logits_f32_lt(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: Tensor<bf16, 2>,
+        router: Tensor<bf16, 2>,
+        logits: &mut TensorMut<f32, 2>,
+    ) -> Result<()> {
+        self.validate_logits_f32(stream, x, router, logits)?;
+        self.logits_gemm
+            .as_ref()
+            .context("Lt route logits were not prepared")?
+            .matmul_f32(&router, &x, &logits.0)
+    }
+
     pub fn topk_noaux<T: DeviceRepr + Copy + 'static>(
         &self,
         logits: Tensor<T, 2>,
@@ -274,6 +397,27 @@ impl RouteOps {
             ids,
             weights,
             (&self.noaux_topk, score, routed_scaling),
+        )
+    }
+
+    /// The same noaux selection writing FP32 routed weights (model definition
+    /// Gate.forward FP32 scores applied by Expert.forward in FP32).
+    #[cfg(feature = "cuda")]
+    pub fn topk_noaux_f32<T: DeviceRepr + Copy + 'static>(
+        &self,
+        logits: Tensor<T, 2>,
+        bias: Option<Tensor<f32, 2>>,
+        ids: &mut TensorMut<i32, 2>,
+        weights: &mut TensorMut<f32, 2>,
+        score: crate::model_spec::RouterScore,
+        routed_scaling: f32,
+    ) -> Result<()> {
+        self.noaux(
+            logits,
+            bias,
+            ids,
+            weights,
+            (&self.noaux_topk_f32, score, routed_scaling),
         )
     }
 

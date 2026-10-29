@@ -10,42 +10,36 @@
 #include "q38_contract.cuh"
 
 #if !defined(__HIP__)
-__device__ __forceinline__ float fp8_block_scale(float value) { return value; }
-__device__ __forceinline__ float fp8_block_scale(uint8_t value) { return e8m0_decode(value); }
-
-template <typename Scale, int BLOCK>
-__device__ __forceinline__ void fp8_block_decode(
-        const uint8_t* w, const Scale* sw, const uint8_t* x, const Scale* sx,
-        __nv_bfloat16* y, int m, int n, int k) {
-    const uint64_t tiles = (uint64_t(n) + 7) / 8;
-    const uint64_t row = blockIdx.x / tiles;
-    const uint64_t col = (blockIdx.x % tiles) * 8 + threadIdx.x / 32;
+extern "C" __global__ void fp8_quant_f32_128(
+        const __nv_bfloat16* x, uint8_t* codes, float* scales, int m, int k) {
+    if (m <= 0 || k <= 0 || blockDim.x != 128 || blockDim.y != 1 ||
+        blockDim.z != 1 || gridDim.y != 1 || gridDim.z != 1) { __trap(); return; }
+    const uint64_t groups = (uint64_t(k) + 127) / 128;
+    const uint64_t cell = uint64_t(blockIdx.x) * 4 + threadIdx.x / 32;
+    if (cell >= uint64_t(m) * groups) return;
+    const uint64_t row = cell / groups, first = (cell % groups) * 128;
     const int lane = threadIdx.x & 31;
-    if (row >= uint64_t(m) || col >= uint64_t(n)) return;
-    const uint64_t groups = (uint64_t(k) + BLOCK - 1) / BLOCK;
-    float total = 0.0f;
-    for (uint64_t group = 0; group < groups; ++group) {
-        float sum = 0.0f;
-        #pragma unroll
-        for (int offset = lane; offset < BLOCK; offset += 32) {
-            const uint64_t inner = group * BLOCK + offset;
-            if (inner < uint64_t(k)) {
-                const uint16_t pair = uint16_t(w[col * k + inner]) |
-                                      (uint16_t(x[row * k + inner]) << 8);
-                const float2 values = e4m3_decode_pair(pair);
-                sum = fmaf(values.x, values.y, sum);
-            }
-        }
-        #pragma unroll
-        for (int shift = 16; shift > 0; shift >>= 1)
-            sum += __shfl_down_sync(0xffffffffu, sum, shift);
-        if (lane == 0) {
-            const float scale = fp8_block_scale(sw[(col / BLOCK) * groups + group]) *
-                                fp8_block_scale(sx[row * groups + group]);
-            total = fmaf(sum, scale, total);
-        }
+    float values[4], maximum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint64_t col = first + lane + 32 * i;
+        values[i] = col < uint64_t(k) ? __bfloat162float(x[row * k + col]) : 0.0f;
+        if (!isfinite(values[i])) { __trap(); return; }
+        maximum = fmaxf(maximum, fabsf(values[i]));
     }
-    if (lane == 0) y[row * n + col] = __float2bfloat16_rn(total);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, offset));
+    const float scale = __fmul_rn(maximum, 1.0f / 448.0f);
+    if (lane == 0) scales[cell] = scale;
+    const float divisor = fmaxf(scale, 1.0e-12f);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint64_t col = first + lane + 32 * i;
+        if (col < uint64_t(k))
+            codes[row * k + col] = __nv_cvt_float_to_fp8(
+                fminf(448.0f, fmaxf(-448.0f, values[i] / divisor)), __NV_SATFINITE, __NV_E4M3);
+    }
 }
 
 template <int COUNT>
@@ -143,7 +137,7 @@ extern "C" __global__ void NAME( \
         __trap(); return; \
     } \
     if constexpr (TILED) fp8_block_mma<SCALE, BLOCK>(w, sw, x, sx, y, m, n, k); \
-    else fp8_block_decode<SCALE, BLOCK>(w, sw, x, sx, y, m, n, k); \
+    else fp8_block_decode<SCALE, BLOCK>(w, sw, x, sx, y, m, n, k, blockIdx.x); \
 }
 FP8_BLOCK_ENTRY(fp8_block_f32_128_decode, float, 128, false)
 FP8_BLOCK_ENTRY(fp8_block_f32_128_mma, float, 128, true)

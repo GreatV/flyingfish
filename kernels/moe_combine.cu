@@ -589,3 +589,27 @@ extern "C" __global__ void moe_combine_accum(
     *reinterpret_cast<float4*>(yr + d0) = out.v;
   }
 }
+#if !defined(__HIP__)
+extern "C" __global__ void moe_combine_bf16(
+    const bf16* __restrict__ contributions, const bf16* __restrict__ shared_out,
+    const int* __restrict__ ids, const unsigned* __restrict__ done,
+    const unsigned* __restrict__ final_active,
+    bf16* __restrict__ y, int rows, int top_k, long long hidden) {
+  if (blockDim.x != 256 || top_k < 1 || top_k > 32) __trap();
+  const int row = blockIdx.x;
+  if (row < 0 || row >= rows) __trap();
+  const int tid = threadIdx.x;
+  const int a0 = row * top_k;
+  int order[32];
+  const int live =
+      moe_order_routed_row(ids, done, final_active, a0, top_k, order);
+  const bf16* __restrict__ sh = shared_out + (long long)row * hidden;
+  bf16* __restrict__ yr = y + (long long)row * hidden;
+  for (long long d = tid; d < hidden; d += blockDim.x) {
+    bf16 acc = __float2bfloat16(0.0f);
+    for (int k = 0; k < live; ++k)
+      acc = __hadd(acc, contributions[(long long)(a0 + order[k]) * hidden + d]);
+    yr[d] = __hadd(acc, sh[d]);
+  }
+}
+#endif

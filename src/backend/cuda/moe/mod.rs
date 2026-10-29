@@ -2,10 +2,8 @@ pub mod combine;
 pub(crate) mod decode;
 pub(crate) mod prefill;
 pub(crate) mod route;
-#[cfg(test)]
 #[cfg(feature = "cuda")]
 pub mod w4a8;
-#[cfg(test)]
 #[cfg(feature = "cuda")]
 pub mod w8a8;
 

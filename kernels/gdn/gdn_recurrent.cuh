@@ -17,6 +17,7 @@
 #include "../gpu_compat.cuh"
 #include <stdint.h>
 #include "../q38_contract.cuh"
+#include "gdn_gate.cuh"
 
 #define GDN_THREADS 512
 #ifndef GDN_HEADS
@@ -25,7 +26,7 @@
 #define GDN_DK      128
 #define GDN_DV      128
 
-template <int VSPLIT, bool SINGLE, bool SNAPSHOT = false>
+template <int VSPLIT, bool SINGLE, bool SNAPSHOT = false, bool CHANNEL_G = false>
 __device__
 void gdn_recurrent_t(
         const float* __restrict__ q,      // FP32 [bound, HEADS, DK]
@@ -82,17 +83,27 @@ void gdn_recurrent_t(
 
     const int rows = SINGLE ? 1 : valid_rows;
     for (int row = 0; row < rows; ++row) {
-    const float gv = g[row * GDN_HEADS + head];
+    const float gv = CHANNEL_G ? 0.0f : g[row * GDN_HEADS + head];
     const float bv = beta[row * GDN_HEADS + head];
-    const size_t kv0 = ((size_t)row * GDN_HEADS + head) * GDN_DK;    // local row; prefix never indexes input
+    const size_t kv0 = ((size_t)row * GDN_HEADS + head) * GDN_DK;
 
     float dl[TC];
-    // 1. Decay before kv.
-    const float alpha = __expf(gv);
-    #pragma unroll
-    for (int a = 0; a < RT; ++a)
+    if constexpr (CHANNEL_G) {
+        float alpha[RT];
         #pragma unroll
-        for (int b = 0; b < TC; ++b) Sr[a][b] *= alpha;
+        for (int a = 0; a < RT; ++a)
+            alpha[a] = __expf(gdn_gate_global<true, GDN_HEADS, GDN_DK>(g, row, head, i0 + a));
+        #pragma unroll
+        for (int a = 0; a < RT; ++a)
+            #pragma unroll
+            for (int b = 0; b < TC; ++b) Sr[a][b] *= alpha[a];
+    } else {
+        const float alpha = __expf(gv);
+        #pragma unroll
+        for (int a = 0; a < RT; ++a)
+            #pragma unroll
+            for (int b = 0; b < TC; ++b) Sr[a][b] *= alpha;
+    }
     __syncthreads();
 
     // 2. kv = k^T S from the decayed S; one staged partial per row group.

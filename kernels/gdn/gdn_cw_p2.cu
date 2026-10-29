@@ -772,3 +772,180 @@ void gdn_cw_p2_stage_h(const float* __restrict__ q,
     }
 }
 
+
+extern "C" __global__ __launch_bounds__(P2_THREADS, 1)
+void gdn_cw_p2_stage_a_per_channel(const AQuery* __restrict__ q,
+                                   const float* __restrict__ k,
+                                   const __nv_bfloat16* __restrict__ v,
+                                   const float* __restrict__ beta,
+                                   const float* __restrict__ g,
+                                   char* __restrict__ ws,
+                                   const Q38SequenceFields* __restrict__ meta,
+                                   int max_rows, int row_base, int group_rows,
+                                   uint32_t v_row_stride
+#ifdef GDN_COMPACT_QK
+                                   , const __nv_bfloat16* __restrict__ k_bf16
+#endif
+                                   ) {
+    const int head = blockIdx.y, chunk = blockIdx.x, tid = threadIdx.x;
+    const uintptr_t pointers = reinterpret_cast<uintptr_t>(q) | reinterpret_cast<uintptr_t>(k)
+        | reinterpret_cast<uintptr_t>(v) | reinterpret_cast<uintptr_t>(beta)
+        | reinterpret_cast<uintptr_t>(g) | reinterpret_cast<uintptr_t>(ws);
+    if (blockDim.x != P2_THREADS || blockDim.y != 1 || blockDim.z != 1 || gridDim.z != 1
+        || gridDim.y != P2_HEADS || pointers % 256 != 0 || v_row_stride < P2_HEADS * P2_DV) {
+        __trap(); return;
+    }
+    const int valid = p2_valid_rows(meta, max_rows, row_base, group_rows);
+    if (chunk >= (valid + P2_C - 1) / P2_C) return;
+    const int first = row_base + chunk * P2_C;
+    const int live = min(valid - chunk * P2_C, P2_C);
+    const size_t stride = P2_HEADS * P2_DK;
+    extern __shared__ float key_smem[];
+    float* const a = key_smem;
+    float* const t = a + P2_C * P2_C;
+    for (int index = tid; index < P2_C * P2_C; index += P2_THREADS) {
+        const int r = index / P2_C, c = index % P2_C;
+        float dot = 0.0f;
+        if (r < live && c < r) {
+            const size_t ri = (size_t)(first + r) * stride + head * P2_DK;
+            const size_t ci = (size_t)(first + c) * stride + head * P2_DK;
+            for (int d = 0; d < P2_DK; ++d)
+                dot = fmaf(k[ri + d] * __expf(g[ri + d] - g[ci + d]), k[ci + d], dot);
+            dot *= -beta[(size_t)(first + r) * P2_HEADS + head];
+        }
+        a[index] = dot;
+        t[index] = r == c ? 1.0f : 0.0f;
+    }
+    __syncthreads();
+    for (int r = 1; r < live; ++r) {
+        if (tid < r) {
+            float sum = a[r * P2_C + tid];
+            for (int j = tid + 1; j < r; ++j)
+                sum = fmaf(a[r * P2_C + j], t[j * P2_C + tid], sum);
+            t[r * P2_C + tid] = sum;
+        }
+        __syncthreads();
+    }
+    float* const slot = reinterpret_cast<float*>(ws +
+        ((size_t)chunk * P2_HEADS + head) * GDN_CW_P2_KEY_SLOT_BYTES);
+    float* const w = slot;
+    float* const u = w + P2_C * P2_DK;
+    float* const qk = u + P2_C * P2_DV;
+    float* const last_g = qk + P2_C * P2_C;
+    for (int index = tid; index < P2_C * P2_DK; index += P2_THREADS) {
+        const int r = index / P2_DK, d = index % P2_DK;
+        float weight = 0.0f, value = 0.0f;
+        if (r < live) {
+            for (int j = 0; j <= r; ++j) {
+                const size_t ji = (size_t)(first + j) * stride + head * P2_DK + d;
+                const float coefficient = t[r * P2_C + j] * beta[(size_t)(first + j) * P2_HEADS + head];
+                weight = fmaf(coefficient, k[ji] * __expf(g[ji]), weight);
+                value = fmaf(coefficient,
+                    __bfloat162float(v[(size_t)(first + j) * v_row_stride + head * P2_DV + d]), value);
+            }
+        }
+        w[index] = weight;
+        u[index] = value;
+    }
+    for (int index = tid; index < P2_C * P2_C; index += P2_THREADS) {
+        const int r = index / P2_C, c = index % P2_C;
+        float dot = 0.0f;
+        if (r < live && c <= r) {
+            const size_t ri = (size_t)(first + r) * stride + head * P2_DK;
+            const size_t ci = (size_t)(first + c) * stride + head * P2_DK;
+            for (int d = 0; d < P2_DK; ++d)
+                dot = fmaf((float)q[ri + d] * __expf(g[ri + d] - g[ci + d]), k[ci + d], dot);
+        }
+        qk[index] = dot;
+    }
+    for (int d = tid; d < P2_DK; d += P2_THREADS)
+        last_g[d] = g[(size_t)(first + live - 1) * stride + head * P2_DK + d];
+}
+
+extern "C" __global__ __launch_bounds__(P2_THREADS, 1)
+void gdn_cw_p2_stage_h_per_channel(const float* __restrict__ q,
+                                   const float* __restrict__ k,
+                                   const __nv_bfloat16* __restrict__ v,
+                                   const float* __restrict__ beta,
+                                   const float* __restrict__ g,
+                                   float* __restrict__ S,
+                                   __nv_bfloat16* __restrict__ out,
+                                   char* __restrict__ ws,
+                                   const Q38SequenceFields* __restrict__ meta,
+                                   int max_rows, int row_base, int group_rows) {
+    const int head = blockIdx.y, tid = threadIdx.x;
+    const int column = blockIdx.x * P2_VW + (tid % P2_VW);
+    const int key_base = (tid / P2_VW) * 16;
+    const uintptr_t pointers = reinterpret_cast<uintptr_t>(q) | reinterpret_cast<uintptr_t>(k)
+        | reinterpret_cast<uintptr_t>(g) | reinterpret_cast<uintptr_t>(S)
+        | reinterpret_cast<uintptr_t>(out) | reinterpret_cast<uintptr_t>(ws);
+    if (blockDim.x != P2_THREADS || blockDim.y != 1 || blockDim.z != 1 || gridDim.z != 1
+        || gridDim.y != P2_HEADS || gridDim.x != P2_DV / P2_VW || pointers % 256 != 0) {
+        __trap(); return;
+    }
+    const int valid = p2_valid_rows(meta, max_rows, row_base, group_rows);
+    if (valid == 0) return;
+    const size_t stride = P2_HEADS * P2_DK;
+    extern __shared__ float key_smem[];
+    float* const values = key_smem;
+    float* const reduction = values + P2_C * P2_VW;
+    float state[16];
+    #pragma unroll
+    for (int d = 0; d < 16; ++d)
+        state[d] = S[((size_t)head * P2_DK + key_base + d) * P2_DV + column];
+    for (int chunk = 0; chunk < (valid + P2_C - 1) / P2_C; ++chunk) {
+        const int first = row_base + chunk * P2_C;
+        const int live = min(valid - chunk * P2_C, P2_C);
+        const float* const slot = reinterpret_cast<const float*>(ws +
+            ((size_t)chunk * P2_HEADS + head) * GDN_CW_P2_KEY_SLOT_BYTES);
+        const float* const w = slot;
+        const float* const u = w + P2_C * P2_DK;
+        const float* const qk = u + P2_C * P2_DV;
+        const float* const last_g = qk + P2_C * P2_C;
+        for (int r = 0; r < live; ++r) {
+            float partial = 0.0f;
+            #pragma unroll
+            for (int d = 0; d < 16; ++d)
+                partial = fmaf(w[r * P2_DK + key_base + d], state[d], partial);
+            reduction[tid] = partial;
+            __syncthreads();
+            if (tid < P2_VW) {
+                float memory = 0.0f;
+                for (int group = 0; group < 8; ++group) memory += reduction[group * P2_VW + tid];
+                values[r * P2_VW + tid] = u[r * P2_DV + column] - memory;
+            }
+            __syncthreads();
+        }
+        for (int r = 0; r < live; ++r) {
+            const size_t ri = (size_t)(first + r) * stride + head * P2_DK + key_base;
+            float partial = 0.0f;
+            #pragma unroll
+            for (int d = 0; d < 16; ++d)
+                partial = fmaf(q[ri + d] * __expf(g[ri + d]), state[d], partial);
+            reduction[tid] = partial;
+            __syncthreads();
+            if (tid < P2_VW) {
+                float result = 0.0f;
+                for (int group = 0; group < 8; ++group) result += reduction[group * P2_VW + tid];
+                for (int j = 0; j <= r; ++j)
+                    result = fmaf(qk[r * P2_C + j], values[j * P2_VW + tid], result);
+                out[((size_t)(first + r) * P2_HEADS + head) * P2_DV + column] = __float2bfloat16_rn(result);
+            }
+            __syncthreads();
+        }
+        #pragma unroll
+        for (int d = 0; d < 16; ++d) {
+            float updated = state[d] * __expf(last_g[key_base + d]);
+            for (int r = 0; r < live; ++r) {
+                const size_t ri = (size_t)(first + r) * stride + head * P2_DK + key_base + d;
+                updated = fmaf(k[ri] * __expf(last_g[key_base + d] - g[ri]),
+                    values[r * P2_VW + tid % P2_VW], updated);
+            }
+            state[d] = updated;
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int d = 0; d < 16; ++d)
+        S[((size_t)head * P2_DK + key_base + d) * P2_DV + column] = state[d];
+}

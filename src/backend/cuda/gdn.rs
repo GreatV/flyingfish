@@ -1,6 +1,6 @@
-//! Gated delta network with 16 key heads and 32 or 48 value heads.
+//! Gated delta network with per-head or key-channel decay.
 //!
-//! Geometry is bound from [`GdnSpec`] before launch: GQA 2 or 3,
+//! Geometry is bound from [`GdnSpec`] before launch: 16/32, 16/48 or 64/64 key/value heads,
 //! dk = dv = 128, conv width 4, history width 3, chunk 32, FP32 tiles. Kernels are in `kernels/gdn/`.
 //!
 //! `run` issues the whole mixer between the `qkv`/`a`/`b` projections and the ungated
@@ -35,10 +35,9 @@ use super::cubin;
 use super::ops::{GatedRmsInput, GdnGateBindings};
 use crate::backend::gpu::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use crate::gdn_plan::{
-    CW_P2_CHUNK, CW_P2_MAX_GROUPS, CW_P2_VALUE_BLOCK, GdnPolicy, GdnWorkspace, Region, add, cw_p2,
-    mul,
+    CW_P2_CHUNK, CW_P2_VALUE_BLOCK, GdnPolicy, GdnWorkspace, Region, add, cw_p2, mul,
 };
-use crate::op_contract::{ExecutionPhase, GdnSpec, WorkspaceReq};
+use crate::op_contract::{ExecutionPhase, GdnGateMode, GdnSpec, WorkspaceReq};
 use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::mem::size_of;
@@ -62,20 +61,149 @@ const P2_THREADS: u32 = 256;
 
 /// The ABI §6 views; `prepare` validates every stride and span against the registered layout.
 /// `conv_dim` comes from [`GdnSpec::conv_dim`], not from these bindings.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum GdnGateInput {
+    PerHead(Tensor<bf16, 2>),
+    PerChannel(Tensor<bf16, 3>),
+}
+
+impl GdnGateInput {
+    fn prefix_rows(&self, rows: u32) -> Result<Self> {
+        match self {
+            Self::PerHead(value) => Ok(Self::PerHead(value.prefix_rows(rows)?)),
+            Self::PerChannel(value) => Ok(Self::PerChannel(value.prefix_rows(rows)?)),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum GdnGateOutput {
+    PerHead(TensorMut<f32, 2>),
+    PerChannel(TensorMut<f32, 3>),
+}
+
+impl GdnGateOutput {
+    fn ptr(&self) -> u64 {
+        match self {
+            Self::PerHead(value) => value.0.ptr,
+            Self::PerChannel(value) => value.0.ptr,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum GdnDecayWeights {
+    Bf16 {
+        a_log: Tensor<bf16, 1>,
+        dt_bias: Tensor<bf16, 1>,
+    },
+    F32 {
+        a_log: Tensor<f32, 1>,
+        dt_bias: Tensor<f32, 1>,
+    },
+}
+
+impl GdnDecayWeights {
+    pub fn bind(
+        catalog: &super::weights::WeightCatalog,
+        stream: &Arc<CudaStream>,
+        prefix: &str,
+        spec: GdnSpec,
+    ) -> Result<Self> {
+        use crate::backend::gpu::DevicePtr;
+        use safetensors::Dtype;
+        spec.validate()?;
+        let name_a = format!("{prefix}A_log");
+        let name_dt = format!("{prefix}dt_bias");
+        match spec.gate_mode {
+            GdnGateMode::PerHead => Ok(Self::Bf16 {
+                a_log: super::contracts::view(catalog.bf16(&name_a)?, stream, 0, [spec.hv], [1])?,
+                dt_bias: super::contracts::view(
+                    catalog.bf16(&name_dt)?,
+                    stream,
+                    0,
+                    [spec.hv],
+                    [1],
+                )?,
+            }),
+            GdnGateMode::PerChannel { .. } => {
+                let bind = |name: &str, count: u32| -> Result<Tensor<f32, 1>> {
+                    let entry = catalog
+                        .manifest
+                        .entries
+                        .get(name)
+                        .with_context(|| format!("missing decay manifest entry {name}"))?;
+                    ensure!(
+                        entry.dtype == Dtype::F32 && entry.shape == [count as usize],
+                        "native decay dtype/shape mismatch: {name}"
+                    );
+                    let Some(super::weights::StoredTensor::Bytes(bytes)) =
+                        catalog.tensors.get(name)
+                    else {
+                        anyhow::bail!("missing native F32 decay tensor {name}");
+                    };
+                    ensure!(
+                        bytes.len() == count as usize * size_of::<f32>(),
+                        "native decay byte extent mismatch: {name}"
+                    );
+                    let (ptr, _read) = bytes.device_ptr(stream);
+                    unsafe { Tensor::new(ptr, [count], [1], bytes.len() as u64) }
+                };
+                Ok(Self::F32 {
+                    a_log: bind(&name_a, spec.hv)?,
+                    dt_bias: bind(&name_dt, spec.hv * spec.dk)?,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum GdnConvWeights {
+    Fused(Tensor<bf16, 2>),
+    Separate([Tensor<bf16, 2>; 3]),
+}
+
+impl GdnConvWeights {
+    pub fn bind(
+        catalog: &super::weights::WeightCatalog,
+        stream: &Arc<CudaStream>,
+        prefix: &str,
+        spec: GdnSpec,
+    ) -> Result<Self> {
+        let bind = |role: &str, channels| {
+            super::contracts::view(
+                catalog.bf16(&format!("{prefix}{role}.weight"))?,
+                stream,
+                0,
+                [channels, 4],
+                [4, 1],
+            )
+        };
+        match spec.gate_mode {
+            GdnGateMode::PerHead => Ok(Self::Fused(bind("conv1d", spec.conv_dim()?)?)),
+            GdnGateMode::PerChannel { .. } => Ok(Self::Separate([
+                bind("q_conv1d", spec.hk * DK)?,
+                bind("k_conv1d", spec.hk * DK)?,
+                bind("v_conv1d", spec.hv * DV)?,
+            ])),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct GdnBindings {
     /// Pre-conv projection `[M, conv_dim]`: Q at offset 0 width `HK*DK`, K next
     /// width `HK*DK`, V next width `HV*DV`.
     pub qkv: Tensor<bf16, 2>,
-    /// Gate inputs `[M, hv]`.
-    pub a: Tensor<bf16, 2>,
+    /// Gate inputs `[M, hv]` or `[M, hv, 128]`.
+    pub a: GdnGateInput,
     pub b: Tensor<bf16, 2>,
     /// Depthwise conv weights `[conv_dim, 4]`, a zero-copy reshape of the
     /// manifest's `[conv_dim, 1, 4]`.
-    pub conv_weight: Tensor<bf16, 2>,
-    /// `[hv]` each.
-    pub a_log: Tensor<bf16, 1>,
-    pub dt_bias: Tensor<bf16, 1>,
+    pub conv_weight: GdnConvWeights,
+    /// A_log is `[hv]`; dt_bias is `[hv]` for per-head gates and `[hv*128]` for per-channel gates.
+    pub decay: GdnDecayWeights,
     /// Ungated core output `[M, hv, 128]`. The caller applies `rms_gated`.
     pub core_out: TensorMut<bf16, 3>,
     /// Recurrent state `[hv, 128, 128]`, axes (value_head, key_dim, value_dim).
@@ -104,7 +232,8 @@ struct Kernels {
 }
 
 fn fused_step_geometry(spec: &GdnSpec) -> bool {
-    (spec.hk, spec.dk, spec.dv, spec.hv) == (16, 128, 128, 32)
+    matches!(spec.gate_mode, GdnGateMode::PerHead)
+        && (spec.hk, spec.dk, spec.dv, spec.hv) == (16, 128, 128, 32)
 }
 
 /// The two chunkwise-P2 stages, launched A then H on one stream with nothing between:
@@ -136,8 +265,7 @@ fn bind_conv(
     Ok((function.clone(), if narrow { 8 } else { CONV_ROWS }))
 }
 
-/// Chunkwise-P2 launch configs for a plan bound at `rows`: stage A one CTA per (chunk, head)
-/// with grid.x = ceil(rows/64), stage H one CTA per 32-wide value block with grid.x = DV/32.
+/// Stage A uses (chunk, head) CTAs; stage H uses 32-wide value strips in both gate modes.
 fn cw_p2_grids(rows: u32, hv: u32) -> (LaunchConfig, LaunchConfig) {
     let per_chunk = LaunchConfig {
         grid_dim: (rows.div_ceil(CW_P2_CHUNK), hv, 1),
@@ -152,22 +280,14 @@ fn cw_p2_grids(rows: u32, hv: u32) -> (LaunchConfig, LaunchConfig) {
     (per_chunk, per_value_block)
 }
 
-fn cw_p2_groups(
-    ws: &GdnWorkspace,
-    rows: u32,
-    hv: u32,
-) -> Result<[Option<(i32, i32, LaunchConfig)>; CW_P2_MAX_GROUPS]> {
-    let mut groups = [None; CW_P2_MAX_GROUPS];
+fn cw_p2_groups(ws: &GdnWorkspace, rows: u32, hv: u32) -> Result<Vec<(i32, i32, LaunchConfig)>> {
+    let mut groups = Vec::new();
     if ws.p2_group_rows == 0 {
         return Ok(groups);
     }
-    ensure!(
-        rows.div_ceil(ws.p2_group_rows) as usize <= groups.len(),
-        "GDN P2 group count exceeds its slot-geometry bound"
-    );
-    for (index, base) in (0..rows).step_by(ws.p2_group_rows as usize).enumerate() {
+    for base in (0..rows).step_by(ws.p2_group_rows as usize) {
         let count = ws.p2_group_rows.min(rows - base);
-        groups[index] = Some((base as i32, count as i32, cw_p2_grids(count, hv).0));
+        groups.push((base as i32, count as i32, cw_p2_grids(count, hv).0));
     }
     Ok(groups)
 }
@@ -218,7 +338,7 @@ pub(crate) struct GdnPlan {
     /// Whether this plan carries the chunkwise-P2 split.
     cw_p2: bool,
     /// Prebound row base, group extent and stage-A grid, in chunk order.
-    p2_groups: [Option<(i32, i32, LaunchConfig)>; CW_P2_MAX_GROUPS],
+    p2_groups: Vec<(i32, i32, LaunchConfig)>,
     p2_h_cfg: LaunchConfig,
 }
 
@@ -244,7 +364,7 @@ impl GdnPlan {
     pub(crate) fn for_verify(
         &self,
         rows: u32,
-        inputs: Option<(Tensor<bf16, 2>, Tensor<bf16, 2>, Tensor<bf16, 2>)>,
+        inputs: Option<(Tensor<bf16, 2>, GdnGateInput, Tensor<bf16, 2>)>,
     ) -> Result<Self> {
         self.bind_rows(rows, inputs, None, false)
     }
@@ -252,7 +372,7 @@ impl GdnPlan {
     fn bind_rows(
         &self,
         rows: u32,
-        inputs: Option<(Tensor<bf16, 2>, Tensor<bf16, 2>, Tensor<bf16, 2>)>,
+        inputs: Option<(Tensor<bf16, 2>, GdnGateInput, Tensor<bf16, 2>)>,
         snapshots: Option<(Tensor<f32, 4>, Tensor<f32, 3>)>,
         allow_cw_p2: bool,
     ) -> Result<Self> {
@@ -310,8 +430,7 @@ impl GdnPlan {
             a,
             b: b_in,
             conv_weight: b.conv_weight,
-            a_log: b.a_log,
-            dt_bias: b.dt_bias,
+            decay: b.decay,
             core_out: TensorMut(b.core_out.read().prefix_rows(rows)?),
             s: TensorMut(b.s.read()),
             history: TensorMut(b.history.read()),
@@ -363,7 +482,7 @@ impl GdnPlan {
         meta.validate()?;
         scratch.validate(self.ws.bytes)?;
         ensure!(
-            self.cw_p2 && self.p2_groups[0].is_some(),
+            self.cw_p2 && !self.p2_groups.is_empty(),
             "chunkwise P2 slot groups were not bound"
         );
         let p2 = self
@@ -375,7 +494,14 @@ impl GdnPlan {
         let ws = scratch.ptr;
         let (q, k, v) = (src.q, src.k, src.v);
         let beta = ws_f32(self.ws.beta_fp32, ws, rows, self.spec.hv)?.0.ptr;
-        let g = ws_f32(self.ws.g, ws, rows, self.spec.hv)?.0.ptr;
+        let g = match self.spec.gate_mode {
+            crate::op_contract::GdnGateMode::PerHead => {
+                ws_f32(self.ws.g, ws, rows, self.spec.hv)?.0.ptr
+            }
+            crate::op_contract::GdnGateMode::PerChannel { .. } => {
+                ws_f32_3(self.ws.g, ws, rows, self.spec.hv, DV)?.0.ptr
+            }
+        };
         let slot = add(ws, self.ws.p2.offset)?;
         let compact = self.ws.q_bf16.bytes > 0;
         let a_query = if compact {
@@ -384,7 +510,7 @@ impl GdnPlan {
             q
         };
         let a_key = ws + self.ws.k_bf16.offset;
-        for &(row_base, group_rows, a_cfg) in self.p2_groups.iter().flatten() {
+        for &(row_base, group_rows, a_cfg) in &self.p2_groups {
             let stage = crate::gdn_plan::P2StageArgs {
                 q,
                 k,
@@ -465,6 +591,7 @@ impl GdnOps {
         let compiled_width = match suffix {
             "" => 10240,
             "_h32" => 8192,
+            "_per_channel" => 24576,
             _ => anyhow::bail!("unsupported GDN kernel suffix={suffix}"),
         };
         ensure!(
@@ -508,12 +635,28 @@ impl GdnOps {
         let chunked_mod = module("gdn_chunked")?;
         let prep_mod = module("gdn_prep")?;
         let recurrent_mod = module("gdn_recurrent")?;
-        let f_conv = conv.load_function("gdn_conv")?;
+        let f_conv = conv.load_function(if matches!(spec.gate_mode, GdnGateMode::PerHead) {
+            "gdn_conv"
+        } else {
+            "gdn_conv_separate"
+        })?;
         let f_hist = conv.load_function("gdn_conv_hist_update")?;
         let f_prep = prep_mod.load_function("gdn_prep_l2_fp32")?;
         let f_beta = prep_mod.load_function("gdn_beta_widen")?;
-        let f_chunked = chunked_mod.load_function("gdn_chunked_core_v1")?;
-        let f_recurrent = recurrent_mod.load_function("gdn_recurrent_core_v2")?;
+        let per_channel = matches!(
+            spec.gate_mode,
+            crate::op_contract::GdnGateMode::PerChannel { .. }
+        );
+        let f_chunked = chunked_mod.load_function(if per_channel {
+            "gdn_chunked_core_per_channel_v1"
+        } else {
+            "gdn_chunked_core_v1"
+        })?;
+        let f_recurrent = recurrent_mod.load_function(if per_channel {
+            "gdn_recurrent_core_per_channel_v2"
+        } else {
+            "gdn_recurrent_core_v2"
+        })?;
 
         // The dynamic shared memory opt-in is applied to every core at setup; a launch without it
         // fails with `invalid argument`.
@@ -527,9 +670,17 @@ impl GdnOps {
             }
         }
 
-        let rstep = Some(module("gdn_rstep")?.load_function("gdn_rstep_core_v1")?);
+        let rstep = Some(module("gdn_rstep")?.load_function(if per_channel {
+            "gdn_rstep_core_per_channel_v1"
+        } else {
+            "gdn_rstep_core_v1"
+        })?);
         let hist_snapshot = module("gdn_conv")?.load_function("gdn_conv_hist_snapshot")?;
-        let core_snapshot = module("gdn_rstep")?.load_function("gdn_rstep_core_snapshot")?;
+        let core_snapshot = module("gdn_rstep")?.load_function(if per_channel {
+            "gdn_rstep_core_per_channel_snapshot"
+        } else {
+            "gdn_rstep_core_snapshot"
+        })?;
         // All three arenas are under the 48 KiB no-opt-in cap.
         let p2 = if !cw_p2 {
             None
@@ -540,8 +691,16 @@ impl GdnOps {
                 "gdn_cw_p2"
             })?;
             Some(ChunkwiseP2 {
-                a: p2_mod.load_function("gdn_cw_p2_stage_a")?,
-                h: p2_mod.load_function("gdn_cw_p2_stage_h")?,
+                a: p2_mod.load_function(if per_channel {
+                    "gdn_cw_p2_stage_a_per_channel"
+                } else {
+                    "gdn_cw_p2_stage_a"
+                })?,
+                h: p2_mod.load_function(if per_channel {
+                    "gdn_cw_p2_stage_h_per_channel"
+                } else {
+                    "gdn_cw_p2_stage_h"
+                })?,
             })
         };
         let kernels = Kernels {
@@ -717,12 +876,19 @@ impl GdnOps {
             "fused GDN decode requires one row"
         );
         let b = &plan.bindings;
+        let GdnGateInput::PerHead(a) = &b.a else {
+            anyhow::bail!("fused GDN step requires per-head gate input");
+        };
+        let GdnDecayWeights::Bf16 { a_log, dt_bias } = b.decay else {
+            anyhow::bail!("fused GDN step requires BF16 decay parameters");
+        };
         let (norm, gate) = if let Some(input) = gated {
             input.x.validate()?;
             input.weight.validate()?;
             input.gate.validate()?;
             ensure!(
-                input.x.ptr == b.core_out.0.ptr
+                input.mode == super::ops::GatedRmsMode::SiluBf16
+                    && input.x.ptr == b.core_out.0.ptr
                     && input.x.shape == b.core_out.0.shape
                     && input.x.stride == b.core_out.0.stride
                     && input.gate.shape == input.x.shape
@@ -741,11 +907,14 @@ impl GdnOps {
             .step
             .as_ref()
             .context("fused GDN step not bound")?;
+        let GdnConvWeights::Fused(conv_weight) = b.conv_weight else {
+            anyhow::bail!("fused GDN requires fused convolution weights");
+        };
         unsafe {
             stream
                 .launch_builder(&plan.conv)
                 .arg(&b.qkv.ptr)
-                .arg(&b.conv_weight.ptr)
+                .arg(&conv_weight.ptr)
                 .arg(&b.history.0.ptr)
                 .arg(&conv)
                 .arg(&meta.ptr)
@@ -761,17 +930,17 @@ impl GdnOps {
             stream
                 .launch_builder(kernel)
                 .arg(&conv)
-                .arg(&b.a.ptr)
+                .arg(&a.ptr)
                 .arg(&b.b.ptr)
-                .arg(&b.a_log.ptr)
-                .arg(&b.dt_bias.ptr)
+                .arg(&a_log.ptr)
+                .arg(&dt_bias.ptr)
                 .arg(&b.s.0.ptr)
                 .arg(&b.core_out.0.ptr)
                 .arg(&norm)
                 .arg(&gate)
                 .arg(&meta.ptr)
                 .arg(&(plan.max_rows as i32))
-                .arg(&b.a.stride[0])
+                .arg(&a.stride[0])
                 .arg(&b.b.stride[0])
                 .arg(&plan.spec.l2_eps)
                 .arg(&plan.spec.rms_eps)
@@ -865,7 +1034,21 @@ impl GdnOps {
         let conv_out = ws_bf16(plan.ws.conv_out, ws_ptr, rows, cd)?;
         let mut beta = ws_bf16(plan.ws.beta, ws_ptr, rows, plan.spec.hv)?;
         let beta_fp32 = ws_f32(plan.ws.beta_fp32, ws_ptr, rows, plan.spec.hv)?;
-        let mut g = ws_f32(plan.ws.g, ws_ptr, rows, plan.spec.hv)?;
+        let per_channel = matches!(
+            plan.spec.gate_mode,
+            crate::op_contract::GdnGateMode::PerChannel { .. }
+        );
+        let mut g = if per_channel {
+            GdnGateOutput::PerChannel(ws_f32_3(
+                plan.ws.g,
+                ws_ptr,
+                rows,
+                plan.spec.hv,
+                plan.spec.dv,
+            )?)
+        } else {
+            GdnGateOutput::PerHead(ws_f32(plan.ws.g, ws_ptr, rows, plan.spec.hv)?)
+        };
         let q_fp32 = ws_f32_3(plan.ws.q_fp32, ws_ptr, rows, plan.ws.qk_heads, plan.spec.dk)?;
         let k_fp32 = ws_f32_3(plan.ws.k_fp32, ws_ptr, rows, plan.ws.qk_heads, plan.spec.dk)?;
         let v_fp32 = ws_f32_3(plan.ws.v_fp32, ws_ptr, rows, plan.spec.hv, plan.spec.dv)?;
@@ -890,9 +1073,18 @@ impl GdnOps {
             }
             let cd_i32 = cd as i32;
             let mut conv = stream.launch_builder(&plan.conv);
-            conv.arg(&b.qkv.ptr)
-                .arg(&b.conv_weight.ptr)
-                .arg(&b.history.0.ptr)
+            conv.arg(&b.qkv.ptr);
+            match &b.conv_weight {
+                GdnConvWeights::Fused(weight) => {
+                    conv.arg(&weight.ptr);
+                }
+                GdnConvWeights::Separate(weights) => {
+                    for weight in weights {
+                        conv.arg(&weight.ptr);
+                    }
+                }
+            }
+            conv.arg(&b.history.0.ptr)
                 .arg(&conv_ptr)
                 .arg(&meta.ptr)
                 .arg(&cd_i32);
@@ -925,19 +1117,52 @@ impl GdnOps {
             }
         }
         // common gdn_gates: beta BF16, g FP32.
-        super::ops::GateOps::gdn_gates_with(
-            &plan.kernels.gate,
-            stream,
-            dom,
-            GdnGateBindings {
-                a: b.a,
-                b: b.b,
-                a_log: b.a_log,
-                dt_bias: b.dt_bias,
-                beta: &mut beta,
-                g: &mut g,
-            },
-        )?;
+        match (&b.a, b.decay, &mut g) {
+            (
+                GdnGateInput::PerHead(a),
+                GdnDecayWeights::Bf16 { a_log, dt_bias },
+                GdnGateOutput::PerHead(g_out),
+            ) => {
+                crate::backend::cuda::ops::GateOps::gdn_gates_with(
+                    &plan.kernels.gate,
+                    stream,
+                    dom,
+                    GdnGateBindings {
+                        a: *a,
+                        b: b.b,
+                        a_log,
+                        dt_bias,
+                        beta: &mut beta,
+                        g: g_out,
+                    },
+                )?;
+            }
+            (
+                GdnGateInput::PerChannel(a),
+                GdnDecayWeights::F32 { a_log, dt_bias },
+                GdnGateOutput::PerChannel(g_out),
+            ) => {
+                let lower_bound = match plan.spec.gate_mode {
+                    crate::op_contract::GdnGateMode::PerChannel { lower_bound } => lower_bound,
+                    crate::op_contract::GdnGateMode::PerHead => unreachable!(),
+                };
+                crate::backend::cuda::ops::GateOps::gdn_channel_gates_with(
+                    &plan.kernels.gate,
+                    stream,
+                    dom,
+                    crate::backend::cuda::ops::GdnChannelGateBindings {
+                        a: *a,
+                        b: b.b,
+                        a_log,
+                        dt_bias,
+                        beta: &mut beta,
+                        g: g_out,
+                        lower_bound,
+                    },
+                )?;
+            }
+            _ => anyhow::bail!("GDN gate mode and binding layout differ"),
+        }
         // V is read in place from its conv_out columns through the validated window helper.
         let v_bf16 = as3(conv_ptr, rows, plan.spec.hv, cd, span, v_off)?;
         let q = conv_ptr + q_off;
@@ -1005,7 +1230,7 @@ impl GdnOps {
                         .arg(&k_fp32.0.ptr)
                         .arg(&v_fp32.0.ptr)
                         .arg(&beta_fp32.0.ptr)
-                        .arg(&g.0.ptr)
+                        .arg(&g.ptr())
                         .arg(&b.s.0.ptr)
                         .arg(&b.core_out.0.ptr)
                         .arg(&meta.ptr)
@@ -1021,7 +1246,7 @@ impl GdnOps {
                         .arg(&k_fp32.0.ptr)
                         .arg(&v_fp32.0.ptr)
                         .arg(&beta_fp32.0.ptr)
-                        .arg(&g.0.ptr)
+                        .arg(&g.ptr())
                         .arg(&b.s.0.ptr)
                         .arg(&b.core_out.0.ptr)
                         .arg(&meta.ptr)
@@ -1035,7 +1260,7 @@ impl GdnOps {
                         .arg(&k_fp32.0.ptr)
                         .arg(&v_fp32.0.ptr)
                         .arg(&beta_fp32.0.ptr)
-                        .arg(&g.0.ptr)
+                        .arg(&g.ptr())
                         .arg(&b.s.0.ptr)
                         .arg(&b.core_out.0.ptr)
                         .arg(&meta.ptr)
@@ -1050,7 +1275,7 @@ impl GdnOps {
                     .arg(&k_fp32.0.ptr)
                     .arg(&v_fp32.0.ptr)
                     .arg(&beta_fp32.0.ptr)
-                    .arg(&g.0.ptr)
+                    .arg(&g.ptr())
                     .arg(&b.s.0.ptr)
                     .arg(&b.core_out.0.ptr)
                     .arg(&meta.ptr)
@@ -1134,27 +1359,75 @@ fn check_bindings(b: &GdnBindings, rows: u32, conv_dim: u32, hv: u32) -> Result<
         "GDN qkv rows ({}) must equal the plan's max_rows ({rows})",
         b.qkv.shape[0]
     );
-    for (t, what) in [(&b.a, "a"), (&b.b, "b")] {
-        t.validate()?;
-        ensure!(
-            t.shape[0] == rows
-                && t.shape[1] == hv
-                && t.stride[1] == 1
-                && t.stride[0] >= u64::from(hv),
-            "GDN {what} must be [max_rows, {hv}] with stride [{hv}, 1]"
-        );
-    }
-    b.conv_weight.validate()?;
+    b.b.validate()?;
     ensure!(
-        b.conv_weight.shape == [conv_dim, 4] && b.conv_weight.stride == [4, 1],
-        "GDN conv_weight must be [conv_dim, 4] with stride [4, 1] (a zero-copy reshape of the manifest's [conv_dim, 1, 4])"
+        b.b.shape[0] == rows
+            && b.b.shape[1] == hv
+            && b.b.stride[1] == 1
+            && b.b.stride[0] >= u64::from(hv),
+        "GDN b must be [max_rows, {hv}] with stride [{hv}, 1]"
     );
-    for (t, what) in [(&b.a_log, "A_log"), (&b.dt_bias, "dt_bias")] {
-        t.validate()?;
+    let dt_bias_width = match &b.a {
+        GdnGateInput::PerHead(a) => {
+            a.validate()?;
+            ensure!(
+                a.shape[0] == rows
+                    && a.shape[1] == hv
+                    && a.stride[1] == 1
+                    && a.stride[0] >= u64::from(hv),
+                "GDN a must be [max_rows, {hv}] with stride [{hv}, 1]"
+            );
+            hv
+        }
+        GdnGateInput::PerChannel(a) => {
+            a.validate()?;
+            ensure!(
+                a.shape == [rows, hv, 128] && a.stride == [u64::from(hv * 128), 128, 1],
+                "GDN a must be [max_rows, {hv}, 128] with strides [hv*128, 128, 1]"
+            );
+            hv * 128
+        }
+    };
+    let (a_shape, a_stride, dt_shape, dt_stride) = match (&b.a, b.decay) {
+        (GdnGateInput::PerHead(_), GdnDecayWeights::Bf16 { a_log, dt_bias }) => {
+            a_log.validate()?;
+            dt_bias.validate()?;
+            (a_log.shape, a_log.stride, dt_bias.shape, dt_bias.stride)
+        }
+        (GdnGateInput::PerChannel(_), GdnDecayWeights::F32 { a_log, dt_bias }) => {
+            a_log.validate()?;
+            dt_bias.validate()?;
+            (a_log.shape, a_log.stride, dt_bias.shape, dt_bias.stride)
+        }
+        _ => anyhow::bail!("GDN gate mode and native decay dtype differ"),
+    };
+    ensure!(
+        a_shape == [hv] && a_stride == [1],
+        "GDN A_log must be [{hv}] with stride [1]"
+    );
+    ensure!(
+        dt_shape == [dt_bias_width] && dt_stride == [1],
+        "GDN dt_bias must be [{dt_bias_width}] with stride [1]"
+    );
+    let validate_conv = |weight: Tensor<bf16, 2>, channels| -> Result<()> {
+        weight.validate()?;
         ensure!(
-            t.shape == [hv] && t.stride == [1],
-            "GDN {what} must be [{hv}] with stride [1]"
+            weight.shape == [channels, 4] && weight.stride == [4, 1],
+            "GDN conv weight must be [channels,4] with stride [4,1]"
         );
+        Ok(())
+    };
+    match (&b.a, b.conv_weight) {
+        (GdnGateInput::PerHead(_), GdnConvWeights::Fused(weight)) => {
+            validate_conv(weight, conv_dim)?
+        }
+        (GdnGateInput::PerChannel(_), GdnConvWeights::Separate(weights)) => {
+            let channels = [(conv_dim - hv * DV) / 2, (conv_dim - hv * DV) / 2, hv * DV];
+            for (weight, channels) in weights.into_iter().zip(channels) {
+                validate_conv(weight, channels)?;
+            }
+        }
+        _ => anyhow::bail!("GDN gate mode and native convolution binding differ"),
     }
     b.core_out.0.validate()?;
     ensure!(
@@ -1194,6 +1467,12 @@ mod tests {
             GdnSpec { dk: 64, ..spec },
             GdnSpec { dv: 64, ..spec },
             GdnSpec { hv: 48, ..spec },
+            GdnSpec {
+                gate_mode: GdnGateMode::PerChannel {
+                    lower_bound: Some(-5.0),
+                },
+                ..spec
+            },
         ] {
             assert!(!fused_step_geometry(&incompatible));
         }
@@ -1252,13 +1531,23 @@ mod tests {
     use super::*;
     use crate::gdn_plan::cw_p2_bytes;
 
+    enum GeometryDecay {
+        Bf16(
+            cudarc::driver::CudaSlice<bf16>,
+            cudarc::driver::CudaSlice<bf16>,
+        ),
+        F32(
+            cudarc::driver::CudaSlice<f32>,
+            cudarc::driver::CudaSlice<f32>,
+        ),
+    }
+
     struct GeometryBuffers {
         qkv: cudarc::driver::CudaSlice<bf16>,
         a: cudarc::driver::CudaSlice<bf16>,
         b: cudarc::driver::CudaSlice<bf16>,
         conv: cudarc::driver::CudaSlice<bf16>,
-        a_log: cudarc::driver::CudaSlice<bf16>,
-        dt: cudarc::driver::CudaSlice<bf16>,
+        decay: GeometryDecay,
         out: cudarc::driver::CudaSlice<bf16>,
         state: cudarc::driver::CudaSlice<f32>,
         history: cudarc::driver::CudaSlice<f32>,
@@ -1281,7 +1570,7 @@ mod tests {
         stride: [u64; R],
         offset: usize,
     ) -> Result<Tensor<T, R>> {
-        use cudarc::driver::DevicePtr;
+        use crate::backend::gpu::DevicePtr;
         let bytes = size_of::<T>();
         let remaining = buffer
             .len()
@@ -1305,8 +1594,9 @@ mod tests {
             let pattern = |i: usize, period: usize| {
                 bf16::from_f32(((i % period) as f32 - (period / 2) as f32) / 512.0)
             };
-            let period = |c: usize| if c < 2048 { 251 } else { 257 };
-            let zero_head = |c: usize| c < 4096 && c % 2048 < 128;
+            let key_width = spec.hk as usize * spec.dk as usize;
+            let period = |c: usize| if c < key_width { 251 } else { 257 };
+            let zero_head = |c: usize| c < 2 * key_width && c % key_width < 128;
             let qkv: Vec<_> = (0..rows as usize * cd)
                 .map(|i| {
                     if i / cd < valid as usize {
@@ -1316,6 +1606,24 @@ mod tests {
                         } else {
                             pattern((i / cd) * 17 + c * 11, period(c))
                         }
+                    } else {
+                        bf16::NAN
+                    }
+                })
+                .collect();
+            let per_channel = matches!(
+                spec.gate_mode,
+                crate::op_contract::GdnGateMode::PerChannel { .. }
+            );
+            let a_width = if per_channel { hv * 128 } else { hv };
+            let a: Vec<_> = (0..rows as usize * a_width)
+                .map(|i| {
+                    if i / a_width < valid as usize {
+                        let c = i % a_width;
+                        pattern(
+                            (i / a_width) * 17 + c * 13,
+                            if c % 2 == 0 { 251 } else { 257 },
+                        )
                     } else {
                         bf16::NAN
                     }
@@ -1338,7 +1646,9 @@ mod tests {
             let a_log: Vec<_> = (0..hv)
                 .map(|h| bf16::from_f32(-3.0 + h as f32 / 128.0))
                 .collect();
-            let dt: Vec<_> = (0..hv).map(|h| pattern(h * 3, 251)).collect();
+            let dt: Vec<_> = (0..a_width)
+                .map(|c| pattern(c * 3, if c % 2 == 0 { 251 } else { 257 }))
+                .collect();
             let history: Vec<_> = (0..cd * 3)
                 .map(|i| {
                     if zero_head(i / 3) {
@@ -1350,11 +1660,25 @@ mod tests {
                 .collect();
             Ok(Self {
                 qkv: stream.clone_htod(&qkv)?,
-                a: stream.clone_htod(&gates(0, 251))?,
+                a: stream.clone_htod(&a)?,
                 b: stream.clone_htod(&gates(19, 257))?,
                 conv: stream.clone_htod(&conv)?,
-                a_log: stream.clone_htod(&a_log)?,
-                dt: stream.clone_htod(&dt)?,
+                decay: if per_channel {
+                    GeometryDecay::F32(
+                        stream.clone_htod(
+                            &(0..hv)
+                                .map(|h| -3.0 + h as f32 / 128.0 + 0.00013 * (h % 7 + 1) as f32)
+                                .collect::<Vec<_>>(),
+                        )?,
+                        stream.clone_htod(
+                            &(0..a_width)
+                                .map(|c| dt[c].to_f32() + 0.00017 * (c % 5 + 1) as f32)
+                                .collect::<Vec<_>>(),
+                        )?,
+                    )
+                } else {
+                    GeometryDecay::Bf16(stream.clone_htod(&a_log)?, stream.clone_htod(&dt)?)
+                },
                 out: stream.clone_htod(&vec![bf16::from_bits(0x7fc5); rows as usize * hv * 128])?,
                 state: stream.clone_htod(&geometry_state(hv))?,
                 history: stream.clone_htod(&history)?,
@@ -1412,13 +1736,26 @@ mod tests {
                     [u64::from(cd), 1],
                     row * cd as usize,
                 )?,
-                a: geometry_view(
-                    &self.a,
-                    stream,
-                    [rows, hv],
-                    [u64::from(hv), 1],
-                    row * hv as usize,
-                )?,
+                a: match spec.gate_mode {
+                    crate::op_contract::GdnGateMode::PerHead => {
+                        GdnGateInput::PerHead(geometry_view(
+                            &self.a,
+                            stream,
+                            [rows, hv],
+                            [u64::from(hv), 1],
+                            row * hv as usize,
+                        )?)
+                    }
+                    crate::op_contract::GdnGateMode::PerChannel { .. } => {
+                        GdnGateInput::PerChannel(geometry_view(
+                            &self.a,
+                            stream,
+                            [rows, hv, 128],
+                            [u64::from(hv) * 128, 128, 1],
+                            row * hv as usize * 128,
+                        )?)
+                    }
+                },
                 b: geometry_view(
                     &self.b,
                     stream,
@@ -1426,9 +1763,32 @@ mod tests {
                     [u64::from(hv), 1],
                     row * hv as usize,
                 )?,
-                conv_weight: geometry_view(&self.conv, stream, [cd, 4], [4, 1], 0)?,
-                a_log: geometry_view(&self.a_log, stream, [hv], [1], 0)?,
-                dt_bias: geometry_view(&self.dt, stream, [hv], [1], 0)?,
+                conv_weight: if matches!(spec.gate_mode, GdnGateMode::PerHead) {
+                    GdnConvWeights::Fused(geometry_view(&self.conv, stream, [cd, 4], [4, 1], 0)?)
+                } else {
+                    let width = spec.hk * DK;
+                    GdnConvWeights::Separate([
+                        geometry_view(&self.conv, stream, [width, 4], [4, 1], 0)?,
+                        geometry_view(&self.conv, stream, [width, 4], [4, 1], width as usize * 4)?,
+                        geometry_view(
+                            &self.conv,
+                            stream,
+                            [spec.hv * DV, 4],
+                            [4, 1],
+                            width as usize * 8,
+                        )?,
+                    ])
+                },
+                decay: match &self.decay {
+                    GeometryDecay::Bf16(a, dt) => GdnDecayWeights::Bf16 {
+                        a_log: geometry_view(a, stream, [hv], [1], 0)?,
+                        dt_bias: geometry_view(dt, stream, [hv], [1], 0)?,
+                    },
+                    GeometryDecay::F32(a, dt) => GdnDecayWeights::F32 {
+                        a_log: geometry_view(a, stream, [hv], [1], 0)?,
+                        dt_bias: geometry_view(dt, stream, [hv * 128], [1], 0)?,
+                    },
+                },
                 core_out: TensorMut(geometry_view(
                     &self.out,
                     stream,
@@ -1448,6 +1808,8 @@ mod tests {
         }
     }
 
+    const PER_CHANNEL_ORACLE_LIMIT: f64 = 0.05;
+
     struct GeometryOutput {
         out: Vec<bf16>,
         state: Vec<f32>,
@@ -1455,6 +1817,9 @@ mod tests {
         prefix_states: Vec<f32>,
         prefix_histories: Vec<f32>,
         norm_ratio: f64,
+        oracle_out: f64,
+        oracle_state: f64,
+        oracle_history: usize,
         snapshot_mismatches: usize,
         p2_prepared: Vec<u8>,
         p2_slots: Vec<u8>,
@@ -1479,11 +1844,134 @@ mod tests {
             .map_err(Into::into)
     }
 
+    fn per_channel_gate_run(
+        device: &crate::backend::cuda::Device,
+        spec: GdnSpec,
+        rows: u32,
+        valid: u32,
+        buffers: &GeometryBuffers,
+        lower_bound: Option<f32>,
+    ) -> Result<(Vec<f32>, Vec<bf16>)> {
+        let stream = &device.stream;
+        let bindings = buffers.bindings(stream, spec, rows, 0)?;
+        let GdnDecayWeights::F32 { a_log, dt_bias } = bindings.decay else {
+            anyhow::bail!("per-channel fixture requires native F32 parameters");
+        };
+        let beta = stream.alloc_zeros::<bf16>(rows as usize * spec.hv as usize)?;
+        let g = stream.alloc_zeros::<f32>(rows as usize * spec.hv as usize * 128)?;
+        let mut beta_view = TensorMut(geometry_view(
+            &beta,
+            stream,
+            [rows, spec.hv],
+            [u64::from(spec.hv), 1],
+            0,
+        )?);
+        let mut g_view = TensorMut(geometry_view(
+            &g,
+            stream,
+            [rows, spec.hv, 128],
+            [u64::from(spec.hv) * 128, 128, 1],
+            0,
+        )?);
+        let meta = geometry_meta(stream, 23, valid)?;
+        let function =
+            cubin::module(&device.ctx, "q38_common")?.load_function("gdn_gates_per_channel")?;
+        crate::backend::cuda::ops::GateOps::gdn_channel_gates_with(
+            &function,
+            stream,
+            RowDomain {
+                meta: SeqRef {
+                    ptr: meta.device_ptr(stream).0,
+                },
+                row_base: 0,
+                row_capacity: rows,
+            },
+            crate::backend::cuda::ops::GdnChannelGateBindings {
+                a: match bindings.a {
+                    GdnGateInput::PerChannel(a) => a,
+                    GdnGateInput::PerHead(_) => {
+                        anyhow::bail!("per-channel gate fixture is per-head")
+                    }
+                },
+                b: bindings.b,
+                a_log,
+                dt_bias,
+                beta: &mut beta_view,
+                g: &mut g_view,
+                lower_bound,
+            },
+        )?;
+        stream.synchronize()?;
+        Ok((stream.clone_dtoh(&g)?, stream.clone_dtoh(&beta)?))
+    }
+
+    struct PerChannelGateFixture<'a> {
+        a: &'a [bf16],
+        b: &'a [bf16],
+        a_log: &'a [f32],
+        dt: &'a [f32],
+    }
+
+    fn per_channel_gate_reference(
+        fixture: PerChannelGateFixture<'_>,
+        hv: usize,
+        rows: usize,
+        valid: usize,
+        lower_bound: Option<f32>,
+    ) -> (Vec<f32>, Vec<bf16>) {
+        let PerChannelGateFixture { a, b, a_log, dt } = fixture;
+        let sigmoid = |x: f32| {
+            if x >= 0.0 {
+                1.0 / (1.0 + (-x).exp())
+            } else {
+                let e = x.exp();
+                e / (1.0 + e)
+            }
+        };
+        let mut g = vec![0.0f32; rows * hv * 128];
+        let mut beta = vec![bf16::ZERO; rows * hv];
+        for first in (0..rows).step_by(64) {
+            let mut decay = vec![0.0f32; hv * 128];
+            for row in first..(first + 64).min(rows) {
+                for head in 0..hv {
+                    let rate = a_log[head].exp();
+                    beta[row * hv + head] = if row < valid {
+                        bf16::from_f32(sigmoid(b[row * hv + head].to_f32()))
+                    } else {
+                        bf16::ZERO
+                    };
+                    for channel in 0..128 {
+                        let index = (row * hv + head) * 128 + channel;
+                        let local = head * 128 + channel;
+                        let value = if row < valid {
+                            let t = a[index].to_f32() + dt[local];
+                            if let Some(bound) = lower_bound {
+                                bound * sigmoid(rate * t)
+                            } else {
+                                -rate * if t > 20.0 { t } else { t.exp().ln_1p() }
+                            }
+                        } else {
+                            0.0
+                        };
+                        decay[local] = if row < valid {
+                            decay[local] + value
+                        } else {
+                            0.0
+                        };
+                        g[index] = decay[local];
+                    }
+                }
+            }
+        }
+        (g, beta)
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum GeometryCore {
         Recurrent,
         Selected,
         Verify,
+        Replay,
         ChunkedSnapshot,
         RstepSnapshot,
         Chunked,
@@ -1492,6 +1980,14 @@ mod tests {
         P2Whole,
         P2Expanded,
         WrongHeadStride,
+    }
+
+    #[derive(Clone, Copy)]
+    enum GeometryControl {
+        None,
+        ValueInput,
+        KeyDecay,
+        StrongDecay,
     }
 
     fn geometry_plan(
@@ -1518,11 +2014,23 @@ mod tests {
                 &device.ctx,
                 &format!("gdn/gdn_cw_p2{}", spec.kernel_suffix()?),
             )?;
+            let per_channel = matches!(
+                spec.gate_mode,
+                crate::op_contract::GdnGateMode::PerChannel { .. }
+            );
             Arc::get_mut(&mut plan.kernels)
                 .context("expanded P2 kernels are shared")?
                 .p2 = Some(ChunkwiseP2 {
-                a: module.load_function("gdn_cw_p2_stage_a")?,
-                h: module.load_function("gdn_cw_p2_stage_h")?,
+                a: module.load_function(if per_channel {
+                    "gdn_cw_p2_stage_a_per_channel"
+                } else {
+                    "gdn_cw_p2_stage_a"
+                })?,
+                h: module.load_function(if per_channel {
+                    "gdn_cw_p2_stage_h_per_channel"
+                } else {
+                    "gdn_cw_p2_stage_h"
+                })?,
             });
             plan.cw_p2 = true;
             let bounded = GdnWorkspace::new(&spec, rows, true)?;
@@ -1542,7 +2050,7 @@ mod tests {
             let base = add(plan.ws.k_bf16.offset, plan.ws.k_bf16.bytes)?;
             plan.ws.p2 = Region {
                 offset: base,
-                bytes: cw_p2_bytes(spec.hv, rows),
+                bytes: cw_p2_bytes(&spec, rows),
             };
             plan.ws.p2_group_rows = rows.div_ceil(CW_P2_CHUNK) * CW_P2_CHUNK;
             plan.ws.bytes = add(base, plan.ws.p2.bytes)?;
@@ -1554,10 +2062,22 @@ mod tests {
         ) {
             let suffix = spec.kernel_suffix()?;
             let kernels = Arc::get_mut(&mut plan.kernels).context("snapshot kernels are shared")?;
+            let per_channel = matches!(
+                spec.gate_mode,
+                crate::op_contract::GdnGateMode::PerChannel { .. }
+            );
             if matches!(core, GeometryCore::RstepSnapshot) {
                 let module = cubin::module(&device.ctx, &format!("gdn/gdn_rstep{suffix}"))?;
-                kernels.rstep = Some(module.load_function("gdn_rstep_core_v1")?);
-                kernels.core_snapshot = module.load_function("gdn_rstep_core_snapshot")?;
+                kernels.rstep = Some(module.load_function(if per_channel {
+                    "gdn_rstep_core_per_channel_v1"
+                } else {
+                    "gdn_rstep_core_v1"
+                })?);
+                kernels.core_snapshot = module.load_function(if per_channel {
+                    "gdn_rstep_core_per_channel_snapshot"
+                } else {
+                    "gdn_rstep_core_snapshot"
+                })?;
             } else {
                 ensure!(
                     rows <= 5,
@@ -1566,7 +2086,11 @@ mod tests {
                 kernels.rstep = None;
                 kernels.core_snapshot =
                     cubin::module(&device.ctx, &format!("gdn/gdn_chunked{suffix}"))?
-                        .load_function("gdn_chunked_core_snapshot")?;
+                        .load_function(if per_channel {
+                            "gdn_chunked_core_per_channel_snapshot"
+                        } else {
+                            "gdn_chunked_core_snapshot"
+                        })?;
                 kernels.core_snapshot.set_attribute(
                     cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                     CHUNKED_SMEM as i32,
@@ -1604,6 +2128,26 @@ mod tests {
         core: GeometryCore,
         graph: bool,
     ) -> Result<GeometryOutput> {
+        geometry_run_control(
+            device,
+            spec,
+            rows,
+            valid,
+            core,
+            graph,
+            GeometryControl::None,
+        )
+    }
+
+    fn geometry_run_control(
+        device: &crate::backend::cuda::Device,
+        spec: GdnSpec,
+        rows: u32,
+        valid: u32,
+        core: GeometryCore,
+        graph: bool,
+        control: GeometryControl,
+    ) -> Result<GeometryOutput> {
         use cudarc::driver::{DevicePtr, sys};
         let label = std::ffi::CString::new(format!(
             "gdn hv={} rows={rows} valid={valid} core={core:?} graph={graph}",
@@ -1612,6 +2156,64 @@ mod tests {
         let _range = super::super::profile::Range::new(true, &label);
         let stream = &device.stream;
         let mut buffers = GeometryBuffers::new(stream, spec, rows, valid)?;
+        let per_channel = matches!(
+            spec.gate_mode,
+            crate::op_contract::GdnGateMode::PerChannel { .. }
+        );
+        if matches!(control, GeometryControl::ValueInput) {
+            ensure!(per_channel, "channel control requires per-channel gates");
+            let mut qkv = stream.clone_dtoh(&buffers.qkv)?;
+            let conv_dim = spec.conv_dim()? as usize;
+            let index = 59 * conv_dim + 2 * spec.hk as usize * 128 + 4 * 128 + 91;
+            qkv[index] = bf16::from_f32(qkv[index].to_f32() + 8.0);
+            buffers.qkv = stream.clone_htod(&qkv)?;
+        }
+        if matches!(control, GeometryControl::KeyDecay) {
+            ensure!(
+                per_channel && valid == 1,
+                "key-axis control requires one native per-channel row"
+            );
+            let cd = spec.conv_dim()? as usize;
+            let mut qkv = vec![bf16::ZERO; rows as usize * cd];
+            qkv[3 * 128 + 17] = bf16::ONE;
+            buffers.qkv = stream.clone_htod(&qkv)?;
+            let mut conv = vec![bf16::ZERO; cd * 4];
+            for channel in 0..cd {
+                conv[channel * 4 + 3] = bf16::ONE;
+            }
+            buffers.conv = stream.clone_htod(&conv)?;
+            buffers.history = stream.alloc_zeros(cd * 3)?;
+            let mut state = vec![0.0f32; 64 * 128 * 128];
+            state[(3 * 128 + 17) * 128 + 91] = 1.0;
+            buffers.state = stream.clone_htod(&state)?;
+            let mut a = vec![bf16::ZERO; rows as usize * 64 * 128];
+            a[3 * 128 + 17] = bf16::from_f32(-1.828125);
+            a[3 * 128 + 91] = bf16::from_f32(-0.95703125);
+            buffers.a = stream.clone_htod(&a)?;
+            buffers.b = stream.clone_htod(&vec![bf16::from_f32(-100.0); rows as usize * 64])?;
+            buffers.decay = GeometryDecay::F32(stream.alloc_zeros(64)?, stream.alloc_zeros(8192)?);
+        }
+        if matches!(control, GeometryControl::StrongDecay) {
+            ensure!(per_channel, "strong decay requires per-channel gates");
+            let a: Vec<_> = (0..rows as usize * 8192)
+                .map(|index| bf16::from_f32(if index % 7 < 4 { 128.0 } else { -128.0 }))
+                .collect();
+            buffers.a = stream.clone_htod(&a)?;
+            buffers.decay = GeometryDecay::F32(stream.alloc_zeros(64)?, stream.alloc_zeros(8192)?);
+        }
+        let initial_state = if per_channel {
+            stream.clone_dtoh(&buffers.state)?
+        } else {
+            Vec::new()
+        };
+        let raw_history = if per_channel {
+            Some((
+                stream.clone_dtoh(&buffers.qkv)?,
+                stream.clone_dtoh(&buffers.history)?,
+            ))
+        } else {
+            None
+        };
         let sequential = matches!(core, GeometryCore::Recurrent);
         let mut plans = Vec::new();
         for row in 0..if sequential { valid } else { 1 } {
@@ -1708,7 +2310,10 @@ mod tests {
                         Scratch { ptr, bytes },
                         true,
                     )?;
-                } else if matches!(core, GeometryCore::Verify | GeometryCore::RstepSnapshot) {
+                } else if matches!(
+                    core,
+                    GeometryCore::Verify | GeometryCore::Replay | GeometryCore::RstepSnapshot
+                ) {
                     GdnOps::run_verify(plan, stream, meta, Scratch { ptr, bytes })?;
                 } else {
                     GdnOps::run(
@@ -1737,7 +2342,12 @@ mod tests {
         }
         stream.synchronize()?;
         let plan = &plans.last().context("empty geometry plans")?.0;
-        let data = stream.clone_dtoh(&workspace.slice(..plan.ws.bytes as usize))?;
+        let data_bytes = if per_channel {
+            (plan.ws.k_fp32.offset + plan.ws.k_fp32.bytes) as usize
+        } else {
+            plan.ws.bytes as usize
+        };
+        let data = stream.clone_dtoh(&workspace.slice(..data_bytes))?;
         let checked_rows = if sequential { 1 } else { valid };
         let norm_ratio = geometry_qk_norm(&data, plan, checked_rows)?;
         if !sequential && valid < rows {
@@ -1768,6 +2378,38 @@ mod tests {
             } else {
                 (Vec::new(), Vec::new())
             };
+        if matches!(control, GeometryControl::ValueInput) {
+            let conv_dim = spec.conv_dim()? as usize;
+            let channel = 2 * spec.hk as usize * 128 + 4 * 128 + 91;
+            let prepared_offset = plan.ws.conv_out.offset as usize + (59 * conv_dim + channel) * 2;
+            let prepared = bf16::from_bits(u16::from_ne_bytes([
+                data[prepared_offset],
+                data[prepared_offset + 1],
+            ]));
+            let raw = raw_history
+                .as_ref()
+                .map(|(qkv, _)| qkv[59 * conv_dim + channel]);
+            println!(
+                "GDN_PER_CHANNEL_CONTROL_PROBE raw={raw:?} prepared={} out={}",
+                prepared.to_f32(),
+                out[(59 * 64 + 4) * 128 + 91].to_f32()
+            );
+        }
+        if let Some((index, value)) = out[..valid as usize * spec.hv as usize * 128]
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            eprintln!("Runner FAIL nonfinite output index={index} value={value:?}");
+        }
+        if let Some((index, value)) = state
+            .iter()
+            .chain(&history)
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            eprintln!("Runner FAIL nonfinite state/history index={index} value={value:?}");
+        }
         ensure!(
             out[..valid as usize * spec.hv as usize * 128]
                 .iter()
@@ -1817,9 +2459,13 @@ mod tests {
                     }
                 }
             }
-            let slots = stream.clone_dtoh(&workspace.slice(
-                plan.ws.p2.offset as usize..(plan.ws.p2.offset + plan.ws.p2.bytes) as usize,
-            ))?;
+            let slots = if per_channel {
+                Vec::new()
+            } else {
+                stream.clone_dtoh(&workspace.slice(
+                    plan.ws.p2.offset as usize..(plan.ws.p2.offset + plan.ws.p2.bytes) as usize,
+                ))?
+            };
             (prepared, slots)
         } else {
             (Vec::new(), Vec::new())
@@ -1849,12 +2495,29 @@ mod tests {
                         state.iter().chain(history).all(|value| value.is_finite()),
                         "nonfinite geometry snapshot"
                     );
-                    snapshot_mismatches += state
-                        .iter()
-                        .zip(&reference.state)
-                        .chain(history.iter().zip(&reference.history))
-                        .filter(|(actual, reference)| actual.to_bits() != reference.to_bits())
-                        .count();
+                    if per_channel {
+                        snapshot_mismatches += state
+                            .iter()
+                            .zip(&reference.state)
+                            .filter(|(actual, reference)| {
+                                (f64::from(**actual) - f64::from(**reference)).abs()
+                                    > PER_CHANNEL_ORACLE_LIMIT
+                                        * (1e-4 + f64::from(**reference).abs())
+                            })
+                            .count();
+                        snapshot_mismatches += history
+                            .iter()
+                            .zip(&reference.history)
+                            .filter(|(actual, reference)| actual.to_bits() != reference.to_bits())
+                            .count();
+                    } else {
+                        snapshot_mismatches += state
+                            .iter()
+                            .zip(&reference.state)
+                            .chain(history.iter().zip(&reference.history))
+                            .filter(|(actual, reference)| actual.to_bits() != reference.to_bits())
+                            .count();
+                    }
                 } else {
                     snapshot_mismatches += state
                         .iter()
@@ -1864,6 +2527,27 @@ mod tests {
                 }
             }
         }
+        let mut oracle_history = 0;
+        if let Some((qkv, initial)) = &raw_history {
+            let conv_dim = spec.conv_dim()? as usize;
+            for channel in 0..conv_dim {
+                for tap in 0..3 {
+                    let source = valid as usize + tap;
+                    let expected = if source < 3 {
+                        initial[channel * 3 + source]
+                    } else {
+                        qkv[(source - 3) * conv_dim + channel].to_f32()
+                    };
+                    oracle_history +=
+                        usize::from(history[channel * 3 + tap].to_bits() != expected.to_bits());
+                }
+            }
+        }
+        let (oracle_out, oracle_state) = if per_channel && !sequential {
+            per_channel_oracle(&data, plan, valid, &out, &state, &initial_state)?
+        } else {
+            (0.0, 0.0)
+        };
         Ok(GeometryOutput {
             out,
             state,
@@ -1871,6 +2555,9 @@ mod tests {
             prefix_states,
             prefix_histories,
             norm_ratio,
+            oracle_out,
+            oracle_state,
+            oracle_history,
             snapshot_mismatches,
             p2_prepared,
             p2_slots,
@@ -1886,6 +2573,10 @@ mod tests {
         let history_words = (spec.conv_dim()? * spec.history_width) as usize;
         let mut defects = 0;
         let mut controls = 0;
+        let per_channel = matches!(
+            spec.gate_mode,
+            crate::op_contract::GdnGateMode::PerChannel { .. }
+        );
         for valid in 1..=rows {
             for graph in [false, true] {
                 take_phase_log();
@@ -1895,15 +2586,29 @@ mod tests {
                 let ordered = phases.first().copied() == Some("rstep");
                 let expected = &reference[valid as usize - 1];
                 let mismatches = geometry_mismatches(&candidate, expected);
-                defects += usize::from(mismatches != 0 || !ordered);
-                println!(
-                    "{} INVARIANT_GDN hv={} bound={rows} valid={valid} graph={graph} output_state_history_bit_mismatches={mismatches} ordered_rstep={ordered}",
-                    if mismatches == 0 && ordered {
-                        "PASS"
+                let history_mismatches = candidate
+                    .history
+                    .iter()
+                    .zip(&expected.history)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                let passed = ordered
+                    && candidate.snapshot_mismatches == 0
+                    && if per_channel {
+                        history_mismatches == 0
+                            && candidate.oracle_history == 0
+                            && candidate.oracle_out <= PER_CHANNEL_ORACLE_LIMIT
+                            && candidate.oracle_state <= PER_CHANNEL_ORACLE_LIMIT
                     } else {
-                        "DEFECT"
-                    },
-                    spec.hv
+                        mismatches == 0
+                    };
+                defects += usize::from(!passed);
+                println!(
+                    "{} INVARIANT_GDN hv={} bound={rows} valid={valid} graph={graph} output_state_history_bit_mismatches={mismatches} history_mismatches={history_mismatches} out_scaled={} state_scaled={} ordered_rstep={ordered}",
+                    if passed { "PASS" } else { "DEFECT" },
+                    spec.hv,
+                    candidate.oracle_out,
+                    candidate.oracle_state
                 );
                 for (stage, slots, width) in [
                     ("state", &candidate.prefix_states, state_words),
@@ -1928,7 +2633,14 @@ mod tests {
                         let mismatches = got
                             .iter()
                             .zip(expected)
-                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .filter(|(a, b)| {
+                                if per_channel && stage == "state" {
+                                    (f64::from(**a) - f64::from(**b)).abs()
+                                        > PER_CHANNEL_ORACLE_LIMIT * (1e-4 + f64::from(**b).abs())
+                                } else {
+                                    a.to_bits() != b.to_bits()
+                                }
+                            })
                             .count();
                         defects += usize::from(mismatches != 0);
                         println!(
@@ -2027,6 +2739,130 @@ mod tests {
         Ok(worst_ratio)
     }
 
+    fn key_axis_column_step(
+        state: &mut [f64; 128],
+        q: &[f64; 128],
+        k: &[f64; 128],
+        gate: &[f64; 128],
+        value: f64,
+        beta: f64,
+    ) -> f64 {
+        for (entry, decay) in state.iter_mut().zip(gate) {
+            *entry *= decay.exp();
+        }
+        let memory: f64 = state.iter().zip(k).map(|(s, k)| s * k).sum();
+        let delta = beta * (value - memory);
+        for (entry, key) in state.iter_mut().zip(k) {
+            *entry += key * delta;
+        }
+        state.iter().zip(q).map(|(s, q)| s * q).sum()
+    }
+
+    #[test]
+    fn kda_decay_follows_key_axis_on_off_diagonal_state() {
+        let mut state = [0.0; 128];
+        state[17] = 1.0;
+        let mut query = [0.0; 128];
+        query[17] = 1.0 / 128.0f64.sqrt();
+        let mut gate = [0.0; 128];
+        gate[17] = 0.5f64.ln();
+        gate[91] = 0.25f64.ln();
+        let output = key_axis_column_step(&mut state, &query, &[0.0; 128], &gate, 0.0, 0.0);
+        assert_eq!(state[17], 0.5);
+        assert_eq!(output, 0.5 / 128.0f64.sqrt());
+        let wrong_state = gate[91].exp();
+        let wrong_output = wrong_state / 128.0f64.sqrt();
+        assert!((state[17] - wrong_state).abs() > 0.05 * state[17]);
+        assert!((output - wrong_output).abs() > 0.05 * output);
+        println!(
+            "PASS kda_key_axis_control key=17 value=91 correct_state=0.5 value_axis_state=0.25"
+        );
+    }
+
+    fn per_channel_oracle(
+        data: &[u8],
+        plan: &GdnPlan,
+        valid: u32,
+        out: &[bf16],
+        state: &[f32],
+        initial_state: &[f32],
+    ) -> Result<(f64, f64)> {
+        let spec = plan.spec;
+        ensure!(
+            matches!(
+                spec.gate_mode,
+                crate::op_contract::GdnGateMode::PerChannel { .. }
+            ),
+            "per-channel oracle bound to a per-head plan"
+        );
+        let hv = spec.hv as usize;
+        let read_bf16 = |offset: usize| {
+            f64::from(
+                bf16::from_bits(u16::from_ne_bytes([data[offset], data[offset + 1]])).to_f32(),
+            )
+        };
+        let read_f32 = |offset: usize| {
+            f64::from(f32::from_ne_bytes(
+                data[offset..offset + 4].try_into().unwrap(),
+            ))
+        };
+        let qk = |region: Region, row: usize, head: usize, d: usize| {
+            read_f32(region.offset as usize + ((row * hv + head) * 128 + d) * 4)
+        };
+        let v_offset = 2 * spec.hk as usize * 128;
+        let conv_dim = plan.conv_dim as usize;
+        let mut worst_out = 0f64;
+        let mut worst_out_detail = (0usize, 0usize, 0usize, 0f64, 0f64);
+        let mut worst_state = 0f64;
+        for head in [0, 1, 3, 4, 17, hv - 1] {
+            for channel in [0, 1, 31, 32, 91, 127] {
+                let mut expected = [0f64; 128];
+                for (d, value) in expected.iter_mut().enumerate() {
+                    let index = (head * 128 + d) * 128 + channel;
+                    *value = f64::from(initial_state[index]);
+                }
+                for row in 0..valid as usize {
+                    let gate = std::array::from_fn(|d| {
+                        let index = (row * hv + head) * 128 + d;
+                        let current = read_f32(plan.ws.g.offset as usize + index * 4);
+                        let previous = if row % 64 == 0 {
+                            0.0
+                        } else {
+                            read_f32(plan.ws.g.offset as usize + (index - hv * 128) * 4)
+                        };
+                        current - previous
+                    });
+                    let q = std::array::from_fn(|d| qk(plan.ws.q_fp32, row, head, d));
+                    let k = std::array::from_fn(|d| qk(plan.ws.k_fp32, row, head, d));
+                    let beta = read_f32(plan.ws.beta_fp32.offset as usize + (row * hv + head) * 4);
+                    let v = read_bf16(
+                        plan.ws.conv_out.offset as usize
+                            + (row * conv_dim + v_offset + head * 128 + channel) * 2,
+                    );
+                    let expected_out = key_axis_column_step(&mut expected, &q, &k, &gate, v, beta);
+                    let actual = out[(row * hv + head) * 128 + channel].to_f32() as f64;
+                    let ratio = (actual - expected_out).abs() / (1e-4 + expected_out.abs());
+                    if ratio > worst_out {
+                        worst_out = ratio;
+                        worst_out_detail = (row, head, channel, expected_out, actual);
+                    }
+                }
+                for (d, expected) in expected.iter().enumerate() {
+                    let actual = state[(head * 128 + d) * 128 + channel] as f64;
+                    worst_state =
+                        worst_state.max((actual - expected).abs() / (1e-4 + expected.abs()));
+                }
+            }
+        }
+        if worst_out > 1.0 {
+            let (row, head, channel, expected, actual) = worst_out_detail;
+            println!(
+                "GDN_PER_CHANNEL_ORACLE_WORST row={row} head={head} channel={channel} expected={expected} actual={actual} scaled={worst_out}"
+            );
+        }
+        Ok((worst_out, worst_state))
+    }
+
     fn geometry_mismatches(a: &GeometryOutput, b: &GeometryOutput) -> usize {
         a.out
             .iter()
@@ -2053,7 +2889,7 @@ mod tests {
         prefix: u32,
         prior: &GeometryOutput,
     ) -> Result<Vec<u32>> {
-        use cudarc::driver::DevicePtr;
+        use crate::backend::gpu::DevicePtr;
         let stream = &device.stream;
         let mut buffers = GeometryBuffers::new(stream, spec, 1, 1)?;
         stream.memcpy_htod(&prior.state, &mut buffers.state)?;
@@ -2236,6 +3072,7 @@ mod tests {
                     };
                     let input = || -> Result<GatedRmsInput> {
                         Ok(GatedRmsInput {
+                            mode: super::super::ops::GatedRmsMode::SiluBf16,
                             x: plan.bindings.core_out.read(),
                             weight: geometry_view(&norm, stream, [128], [1], 0)?,
                             gate: geometry_view(
@@ -2436,6 +3273,547 @@ mod tests {
             "MIXER_SMOKE geometries=2 prefix=23 selected_rows=1,4,5,64 graph_modes=2 defects={defects}"
         );
         ensure!(defects == 0, "mixer SMOKE DEFECT cases={defects}");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "exclusive CUDA; native KDA key-axis model-definition control"]
+    fn gdn_per_channel_key_axis_gpu() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let root = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/glm53-flash-config.json"
+        )))?;
+        let model = crate::model_spec::ModelSpec::glm5_next(&root, &serde_json::Value::Null)?;
+        let spec = GdnSpec::from_model(&model)?;
+        let device = crate::backend::cuda::Device::new(0)?;
+        let expected_state = (-5.0 / (1.0 + 1.828125f64.exp())).exp();
+        let value_axis_state = (-5.0 / (1.0 + 0.95703125f64.exp())).exp();
+        let q = f64::from(bf16::from_f32(1.0 / (1.0 + (-1.0f32).exp())).to_f32());
+        let scaled_q = q / (q * q + 1e-6).sqrt() / 128.0f64.sqrt();
+        let expected_out = expected_state * scaled_q;
+        let mut defects = 0;
+        for (core, rows) in [
+            (GeometryCore::Recurrent, 1),
+            (GeometryCore::Replay, 1),
+            (GeometryCore::Chunked, 1),
+            (GeometryCore::P2, 5),
+        ] {
+            for graph in [false, true] {
+                let actual = geometry_run_control(
+                    &device,
+                    spec,
+                    rows,
+                    1,
+                    core,
+                    graph,
+                    GeometryControl::KeyDecay,
+                )?;
+                let state = f64::from(actual.state[(3 * 128 + 17) * 128 + 91]);
+                let out = f64::from(actual.out[3 * 128 + 91].to_f32());
+                ensure!(
+                    state.is_finite() && out.is_finite(),
+                    "Runner FAIL nonfinite key-axis control"
+                );
+                let state_error = (state - expected_state).abs() / (1e-4 + expected_state.abs());
+                let out_error = (out - expected_out).abs() / (1e-4 + expected_out.abs());
+                let wrong_state_error =
+                    (state - value_axis_state).abs() / (1e-4 + expected_state.abs());
+                let wrong_out_error =
+                    (out - value_axis_state * scaled_q).abs() / (1e-4 + expected_out.abs());
+                let passed = state_error <= PER_CHANNEL_ORACLE_LIMIT
+                    && out_error <= PER_CHANNEL_ORACLE_LIMIT
+                    && wrong_state_error > PER_CHANNEL_ORACLE_LIMIT
+                    && wrong_out_error > PER_CHANNEL_ORACLE_LIMIT;
+                defects += usize::from(!passed);
+                println!(
+                    "{} KDA_KEY_AXIS core={core:?} graph={graph} key=17 value=91 state_scaled={state_error} out_scaled={out_error} value_axis_state_scaled={wrong_state_error} value_axis_out_scaled={wrong_out_error} limit={PER_CHANNEL_ORACLE_LIMIT}",
+                    if passed { "PASS" } else { "DEFECT" }
+                );
+            }
+        }
+        println!("KDA_KEY_AXIS_SUMMARY cells=8 defects={defects} model_definition=key_axis");
+        ensure!(defects == 0, "key-axis defects={defects}");
+        Ok(())
+    }
+
+    fn per_channel_norm_gate(device: &crate::backend::cuda::Device) -> Result<usize> {
+        use super::super::ops::{CommonOpsRef, GatedRmsMode};
+        let stream = &device.stream;
+        let common = CommonOpsRef::new(&device.ctx)?;
+        let mut defects = 0;
+        for (rows, valid) in [(1u32, 1u32), (5, 2), (65, 63)] {
+            let values: Vec<_> = (0..rows as usize * 8192)
+                .map(|i| bf16::from_f32(((i * 19 + 3) % 251) as f32 / 128.0 - 1.0))
+                .collect();
+            let gates: Vec<_> = (0..values.len())
+                .map(|i| bf16::from_f32(((i * 13 + 5) % 257) as f32 / 64.0 - 2.0))
+                .collect();
+            let weights: Vec<_> = (0..128)
+                .map(|i| bf16::from_f32(((i * 7 + 11) % 131) as f32 / 128.0 + 0.5))
+                .collect();
+            let x = stream.clone_htod(&values)?;
+            let z = stream.clone_htod(&gates)?;
+            let w = stream.clone_htod(&weights)?;
+            let y = stream.clone_htod(&vec![bf16::from_bits(0x7fc1); values.len()])?;
+            let metadata = geometry_meta(stream, 0, valid)?;
+            let shape = [rows, 64, 128];
+            let stride = [8192, 128, 1];
+            let mut output = TensorMut(geometry_view(&y, stream, shape, stride, 0)?);
+            let mut execute = || {
+                common.norm.rms_gated(
+                    stream,
+                    RowDomain {
+                        meta: SeqRef {
+                            ptr: metadata.device_ptr(stream).0,
+                        },
+                        row_base: 0,
+                        row_capacity: rows,
+                    },
+                    GatedRmsInput {
+                        x: geometry_view(&x, stream, shape, stride, 0)?,
+                        gate: geometry_view(&z, stream, shape, stride, 0)?,
+                        weight: geometry_view(&w, stream, [128], [1], 0)?,
+                        mode: GatedRmsMode::SigmoidF32,
+                    },
+                    &mut output,
+                    1e-5,
+                )
+            };
+            device.finish_upload()?;
+            for graph in [false, true] {
+                if graph {
+                    stream.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                    let launched = execute();
+                    let captured =
+                        stream.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+                    launched?;
+                    captured?.context("empty KDA norm graph")?.launch()?;
+                } else {
+                    execute()?;
+                }
+                let actual = stream.clone_dtoh(&y)?;
+                let mut worst = 0f64;
+                let mut wrong = 0f64;
+                for slice in 0..valid as usize * 64 {
+                    let start = slice * 128;
+                    let square_sum: f64 = values[start..start + 128]
+                        .iter()
+                        .map(|v| f64::from(v.to_f32()).powi(2))
+                        .sum();
+                    let inverse = (square_sum / 128.0 + 1e-5).sqrt().recip();
+                    for (d, weight) in weights.iter().enumerate() {
+                        let index = start + d;
+                        let gate = f64::from(gates[index].to_f32());
+                        let expected = f64::from(values[index].to_f32())
+                            * inverse
+                            * f64::from(weight.to_f32())
+                            / (1.0 + (-gate).exp());
+                        let value = f64::from(actual[index].to_f32());
+                        ensure!(value.is_finite(), "Runner FAIL nonfinite native gated norm");
+                        worst = worst.max((value - expected).abs() / (1e-4 + expected.abs()));
+                        wrong =
+                            wrong.max((value - expected * gate).abs() / (1e-4 + expected.abs()));
+                    }
+                }
+                let padding = actual[valid as usize * 8192..]
+                    .iter()
+                    .all(|v| v.to_bits() == 0x7fc1);
+                let passed = worst <= PER_CHANNEL_ORACLE_LIMIT
+                    && wrong > PER_CHANNEL_ORACLE_LIMIT
+                    && padding;
+                defects += usize::from(!passed);
+                println!(
+                    "{} KDA_SIGMOID_NORM shape=[{rows},64,128] valid={valid} graph={graph} scaled={worst} wrong_silu_scaled={wrong} padding={padding} limit={PER_CHANNEL_ORACLE_LIMIT}",
+                    if passed { "PASS" } else { "DEFECT" }
+                );
+            }
+        }
+        Ok(defects)
+    }
+
+    #[test]
+    #[ignore = "exclusive CUDA; per-channel gate oracle and negative control"]
+    fn gdn_per_channel_gates_gpu() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let device = crate::backend::cuda::Device::new(0)?;
+        let spec = GdnSpec {
+            hk: 64,
+            hv: 64,
+            rms_eps: 1e-5,
+            gate_mode: crate::op_contract::GdnGateMode::PerChannel {
+                lower_bound: Some(-5.0),
+            },
+            ..GdnSpec::q38()
+        };
+        let rows = 65;
+        let valid = 63;
+        let hv = spec.hv as usize;
+        let stream = &device.stream;
+        let mut buffers = GeometryBuffers::new(stream, spec, rows, valid)?;
+        let a = stream.clone_dtoh(&buffers.a)?;
+        let b = stream.clone_dtoh(&buffers.b)?;
+        let GeometryDecay::F32(a_log, dt) = &buffers.decay else {
+            anyhow::bail!("per-channel fixture requires native F32 parameters");
+        };
+        let a_log = stream.clone_dtoh(a_log)?;
+        let dt = stream.clone_dtoh(dt)?;
+        let baseline = per_channel_gate_run(&device, spec, rows, valid, &buffers, Some(-5.0))?;
+        let mut defects = per_channel_norm_gate(&device)?;
+        for lower_bound in [Some(-5.0), None] {
+            let actual = if lower_bound.is_some() {
+                baseline.clone()
+            } else {
+                per_channel_gate_run(&device, spec, rows, valid, &buffers, lower_bound)?
+            };
+            let expected = per_channel_gate_reference(
+                PerChannelGateFixture {
+                    a: &a,
+                    b: &b,
+                    a_log: &a_log,
+                    dt: &dt,
+                },
+                hv,
+                rows as usize,
+                valid as usize,
+                lower_bound,
+            );
+            let mut worst = 0f64;
+            let mut nonfinite = 0;
+            for (actual, expected) in actual.0.iter().zip(&expected.0) {
+                nonfinite += usize::from(!actual.is_finite());
+                let expected = f64::from(*expected);
+                worst = worst
+                    .max((f64::from(*actual) - expected).abs() / (2e-5 * (1.0 + expected.abs())));
+            }
+            let beta_mismatches = actual
+                .1
+                .iter()
+                .zip(&expected.1)
+                .filter(|(actual, expected)| actual.to_bits() != expected.to_bits())
+                .count();
+            ensure!(
+                nonfinite == 0,
+                "Runner FAIL nonfinite per-channel gate output"
+            );
+            let passed = worst <= 1.0 && beta_mismatches == 0;
+            println!(
+                "{} GDN_PER_CHANNEL_GATE lower_bound={lower_bound:?} input=[{rows},{hv},128] valid={valid} cumulative_block=64 scaled_error={worst} tolerance=2e-5 beta_bits={beta_mismatches} nonfinite={nonfinite}",
+                if passed { "PASS" } else { "DEFECT" }
+            );
+            defects += usize::from(!passed);
+        }
+        let mut perturbed = a.clone();
+        let index = (17 * hv + 3) * 128 + 91;
+        perturbed[index] = bf16::from_f32(perturbed[index].to_f32() + 0.25);
+        buffers.a = stream.clone_htod(&perturbed)?;
+        let control = per_channel_gate_run(&device, spec, rows, valid, &buffers, Some(-5.0))?;
+        let mut changed = 0;
+        let mut wrong = 0;
+        for (index, (before, after)) in baseline.0.iter().zip(&control.0).enumerate() {
+            let row = index / (hv * 128);
+            let head = index / 128 % hv;
+            let channel = index % 128;
+            let expected = (17..valid as usize).contains(&row) && head == 3 && channel == 91;
+            let differs = before.to_bits() != after.to_bits();
+            changed += usize::from(differs);
+            wrong += usize::from(differs != expected);
+        }
+        let beta_mismatches = baseline
+            .1
+            .iter()
+            .zip(&control.1)
+            .filter(|(before, after)| before.to_bits() != after.to_bits())
+            .count();
+        let passed = changed == valid as usize - 17 && wrong == 0 && beta_mismatches == 0;
+        println!(
+            "{} GDN_PER_CHANNEL_GATE_CONTROL perturb=[17,3,91] changed={changed} expected={} wrong={wrong} beta_bits={beta_mismatches}",
+            if passed { "PASS" } else { "DEFECT" },
+            valid - 17
+        );
+        defects += usize::from(!passed);
+        println!(
+            "{} GDN_PER_CHANNEL_GATES cells=9 defects={defects} lower_bound_and_softplus=true negative_control=true sigmoid_norm=true",
+            if defects == 0 { "PASS" } else { "DEFECT" }
+        );
+        ensure!(defects == 0, "per-channel gate defects={defects}");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "exclusive CUDA; production-shape per-channel GDN oracle"]
+    fn gdn_per_channel_geometry_gpu() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let device = crate::backend::cuda::Device::new(0)?;
+        let spec = GdnSpec {
+            hk: 64,
+            hv: 64,
+            rms_eps: 1e-5,
+            gate_mode: crate::op_contract::GdnGateMode::PerChannel {
+                lower_bound: Some(-5.0),
+            },
+            ..GdnSpec::q38()
+        };
+        let mut defects = invariant_gdn(&device, spec)?;
+        let mut cells = 0;
+        let sequential = geometry_run(&device, spec, 65, 63, GeometryCore::Recurrent, false)?;
+        let chunked = geometry_run(&device, spec, 65, 63, GeometryCore::Chunked, false)?;
+        let diagnostic = (7 * 64 + 63) * 128 + 127;
+        println!(
+            "GDN_PER_CHANNEL_CROSS_CORE row=7 head=63 channel=127 recurrent={} chunked={} oracle_scaled={}",
+            sequential.out[diagnostic].to_f32(),
+            chunked.out[diagnostic].to_f32(),
+            chunked.oracle_out
+        );
+        for (core, row_cases) in [
+            (GeometryCore::Replay, &[(1, 1), (2, 2), (5, 5)][..]),
+            (GeometryCore::ChunkedSnapshot, &[(1, 1), (5, 2), (5, 5)][..]),
+            (GeometryCore::RstepSnapshot, &[(1, 1), (5, 2), (5, 5)][..]),
+            (
+                GeometryCore::Chunked,
+                &[
+                    (1, 1),
+                    (2, 2),
+                    (5, 5),
+                    (31, 31),
+                    (32, 32),
+                    (33, 33),
+                    (63, 63),
+                    (65, 63),
+                ][..],
+            ),
+            (
+                GeometryCore::P2,
+                &[
+                    (5, 5),
+                    (6, 6),
+                    (7, 7),
+                    (8, 8),
+                    (16, 16),
+                    (31, 31),
+                    (32, 32),
+                    (33, 33),
+                    (63, 63),
+                    (64, 37),
+                    (65, 63),
+                    (127, 127),
+                    (129, 129),
+                    (512, 509),
+                ][..],
+            ),
+            (GeometryCore::Selected, &[(5, 5), (65, 63), (512, 509)][..]),
+        ] {
+            for &(rows, valid) in row_cases {
+                for graph in [false, true] {
+                    take_phase_log();
+                    let candidate = geometry_run(&device, spec, rows, valid, core, graph)?;
+                    let phases = take_phase_log();
+                    let phase_ok =
+                        !matches!(core, GeometryCore::Selected) || phases == ["chunkwise_p2"];
+                    let passed = candidate.norm_ratio <= 1.0
+                        && candidate.oracle_out <= PER_CHANNEL_ORACLE_LIMIT
+                        && candidate.oracle_state <= PER_CHANNEL_ORACLE_LIMIT
+                        && candidate.snapshot_mismatches == 0
+                        && candidate.oracle_history == 0
+                        && phase_ok;
+                    defects += usize::from(!passed);
+                    cells += 1;
+                    println!(
+                        "{} GDN_PER_CHANNEL_CELL core={core:?} input=[{rows},24576] state=[64,128,128] valid={valid} graph={graph} phase={phases:?} out_scaled={} state_scaled={} history_bits={} limit={PER_CHANNEL_ORACLE_LIMIT} qk_ratio={}",
+                        if passed { "PASS" } else { "DEFECT" },
+                        candidate.oracle_out,
+                        candidate.oracle_state,
+                        candidate.oracle_history,
+                        candidate.norm_ratio
+                    );
+                }
+            }
+        }
+        for core in [
+            GeometryCore::Recurrent,
+            GeometryCore::Chunked,
+            GeometryCore::P2,
+        ] {
+            for (rows, valid) in [(65, 63), (129, 129)] {
+                for graph in [false, true] {
+                    let mut candidate = geometry_run_control(
+                        &device,
+                        spec,
+                        rows,
+                        valid,
+                        core,
+                        graph,
+                        GeometryControl::StrongDecay,
+                    )?;
+                    if matches!(core, GeometryCore::Recurrent) {
+                        let reference = geometry_run_control(
+                            &device,
+                            spec,
+                            rows,
+                            valid,
+                            GeometryCore::Chunked,
+                            false,
+                            GeometryControl::StrongDecay,
+                        )?;
+                        candidate.oracle_out = reference.oracle_out.max(
+                            candidate.out[..valid as usize * 8192]
+                                .iter()
+                                .zip(&reference.out)
+                                .map(|(a, b)| {
+                                    let (a, b) = (f64::from(a.to_f32()), f64::from(b.to_f32()));
+                                    (a - b).abs() / (1e-4 + b.abs())
+                                })
+                                .fold(0.0, f64::max),
+                        );
+                        candidate.oracle_state = reference.oracle_state.max(
+                            candidate
+                                .state
+                                .iter()
+                                .zip(&reference.state)
+                                .map(|(a, b)| {
+                                    let (a, b) = (f64::from(*a), f64::from(*b));
+                                    (a - b).abs() / (1e-4 + b.abs())
+                                })
+                                .fold(0.0, f64::max),
+                        );
+                    }
+                    let passed = candidate.oracle_out <= PER_CHANNEL_ORACLE_LIMIT
+                        && candidate.oracle_state <= PER_CHANNEL_ORACLE_LIMIT
+                        && candidate.oracle_history == 0
+                        && candidate.snapshot_mismatches == 0;
+                    defects += usize::from(!passed);
+                    cells += 1;
+                    println!(
+                        "{} GDN_KEY_STRONG_DECAY core={core:?} rows={rows} valid={valid} graph={graph} out_scaled={} state_scaled={} limit={PER_CHANNEL_ORACLE_LIMIT}",
+                        if passed { "PASS" } else { "DEFECT" },
+                        candidate.oracle_out,
+                        candidate.oracle_state
+                    );
+                }
+            }
+        }
+        let baseline = geometry_run(&device, spec, 65, 63, GeometryCore::P2, false)?;
+        let control = geometry_run_control(
+            &device,
+            spec,
+            65,
+            63,
+            GeometryCore::P2,
+            false,
+            GeometryControl::ValueInput,
+        )?;
+        let mut out_changed = 0;
+        let mut out_wrong = 0;
+        for row in 0..65usize {
+            for head in 0..64usize {
+                for channel in 0..128usize {
+                    let affected = (59..63).contains(&row) && head == 4 && channel == 91;
+                    let index = (row * 64 + head) * 128 + channel;
+                    let differs = baseline.out[index].to_bits() != control.out[index].to_bits();
+                    out_changed += usize::from(affected && differs);
+                    out_wrong += usize::from(!affected && differs);
+                }
+            }
+        }
+        let mut state_changed = 0;
+        let mut state_wrong = 0;
+        for head in 0..64usize {
+            for d in 0..128usize {
+                for channel in 0..128usize {
+                    let affected = head == 4 && channel == 91;
+                    let index = (head * 128 + d) * 128 + channel;
+                    let differs = baseline.state[index].to_bits() != control.state[index].to_bits();
+                    state_changed += usize::from(affected && differs);
+                    state_wrong += usize::from(affected != differs);
+                }
+            }
+        }
+        let history_mismatches = baseline
+            .history
+            .iter()
+            .zip(&control.history)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        // 2026-10-27: BF16 rounding may preserve bits inside the causal region.
+        let passed = out_changed > 0
+            && state_changed == 128
+            && out_wrong == 0
+            && state_wrong == 0
+            && history_mismatches == 0
+            && control.oracle_out <= PER_CHANNEL_ORACLE_LIMIT
+            && control.oracle_state <= PER_CHANNEL_ORACLE_LIMIT
+            && control.oracle_history == 0;
+        defects += usize::from(!passed);
+        cells += 1;
+        println!(
+            "{} GDN_PER_CHANNEL_RECURRENCE_CONTROL perturb=[59,4,91] out_changed={out_changed} out_wrong={out_wrong} state_changed={state_changed} state_wrong={state_wrong} history_bits={history_mismatches}",
+            if passed { "PASS" } else { "DEFECT" }
+        );
+        println!(
+            "{} GDN_PER_CHANNEL_GEOMETRY cells={cells} defects={defects} oracle=f64-recurrence limit={PER_CHANNEL_ORACLE_LIMIT} snapshot_replay=true graph_eager=true",
+            if defects == 0 { "PASS" } else { "DEFECT" }
+        );
+        ensure!(defects == 0, "per-channel GDN defects={defects}");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "exclusive CUDA; small per-channel memcheck coverage"]
+    fn gdn_per_channel_memcheck_gpu() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window required"
+        );
+        let device = crate::backend::cuda::Device::new(0)?;
+        let spec = GdnSpec {
+            hk: 64,
+            hv: 64,
+            rms_eps: 1e-5,
+            gate_mode: crate::op_contract::GdnGateMode::PerChannel {
+                lower_bound: Some(-5.0),
+            },
+            ..GdnSpec::q38()
+        };
+        let mut cells = 0;
+        let mut defects = 0;
+        for (core, rows, valid) in [
+            (GeometryCore::Recurrent, 5, 5),
+            (GeometryCore::Replay, 5, 5),
+            (GeometryCore::Verify, 5, 5),
+            (GeometryCore::ChunkedSnapshot, 5, 2),
+            (GeometryCore::Chunked, 65, 63),
+            (GeometryCore::P2, 65, 63),
+        ] {
+            let candidate = geometry_run(&device, spec, rows, valid, core, false)?;
+            let passed = candidate.norm_ratio <= 1.0
+                && candidate.oracle_out <= PER_CHANNEL_ORACLE_LIMIT
+                && candidate.oracle_state <= PER_CHANNEL_ORACLE_LIMIT
+                && candidate.oracle_history == 0
+                && candidate.snapshot_mismatches == 0;
+            defects += usize::from(!passed);
+            cells += 1;
+            println!(
+                "{} GDN_PER_CHANNEL_MEMCHECK_CELL core={core:?} rows={rows} valid={valid} out_scaled={} state_scaled={} history_bits={}",
+                if passed { "PASS" } else { "DEFECT" },
+                candidate.oracle_out,
+                candidate.oracle_state,
+                candidate.oracle_history
+            );
+        }
+        println!(
+            "{} GDN_PER_CHANNEL_MEMCHECK cells={cells} defects={defects} all_core_types=true",
+            if defects == 0 { "PASS" } else { "DEFECT" }
+        );
+        ensure!(defects == 0, "per-channel memcheck defects={defects}");
         Ok(())
     }
 
@@ -2885,7 +4263,7 @@ mod tests {
                 }
             }
             let reference_meta = geometry_meta(stream, 67, rows as u32)?;
-            super::super::ops::GateOps::gdn_gates_with(
+            crate::backend::cuda::ops::GateOps::gdn_gates_with(
                 &gate,
                 stream,
                 RowDomain {
@@ -2968,7 +4346,7 @@ mod tests {
                                 )?),
                             )?;
                         }
-                        super::super::ops::GateOps::gdn_gates_with(
+                        crate::backend::cuda::ops::GateOps::gdn_gates_with(
                             &gate,
                             stream,
                             RowDomain {
@@ -3423,21 +4801,23 @@ mod tests {
         let bindings = unsafe {
             GdnBindings {
                 qkv: matrix(&qkv, qwen_conv_dim)?,
-                a: matrix(&a, qwen.hv)?,
+                a: GdnGateInput::PerHead(matrix(&a, qwen.hv)?),
                 b: matrix(&b, qwen.hv)?,
-                conv_weight: matrix(&conv_weight, 4)?,
-                a_log: Tensor::new(
-                    a_log.device_ptr(stream).0,
-                    [qwen.hv],
-                    [1],
-                    u64::from(qwen.hv) * 2,
-                )?,
-                dt_bias: Tensor::new(
-                    dt_bias.device_ptr(stream).0,
-                    [qwen.hv],
-                    [1],
-                    u64::from(qwen.hv) * 2,
-                )?,
+                conv_weight: GdnConvWeights::Fused(matrix(&conv_weight, 4)?),
+                decay: GdnDecayWeights::Bf16 {
+                    a_log: Tensor::new(
+                        a_log.device_ptr(stream).0,
+                        [qwen.hv],
+                        [1],
+                        u64::from(qwen.hv) * 2,
+                    )?,
+                    dt_bias: Tensor::new(
+                        dt_bias.device_ptr(stream).0,
+                        [qwen.hv],
+                        [1],
+                        u64::from(qwen.hv) * 2,
+                    )?,
+                },
                 core_out: TensorMut(Tensor::new(
                     core_out.device_ptr(stream).0,
                     [5, qwen.hv, DV],
@@ -3546,27 +4926,34 @@ mod tests {
         let reference_out = stream.alloc_zeros::<bf16>(5 * row_elements)?;
         let final_state = stream.clone_dtoh(&state)?;
         let final_history = stream.clone_dtoh(&history)?;
-        let input_row = |source: Tensor<bf16, 2>, row: usize| {
+        fn input_row<const N: usize>(
+            source: Tensor<bf16, N>,
+            row: usize,
+        ) -> Result<Tensor<bf16, N>> {
             let offset = row as u64 * source.stride[0] * 2;
+            let mut shape = source.shape;
+            shape[0] = 1;
             unsafe {
                 Tensor::new(
                     source.ptr + offset,
-                    [1, source.shape[1]],
+                    shape,
                     source.stride,
                     source.span_bytes - offset,
                 )
             }
-        };
+        }
         for row in 0..5 {
             let b = &full.bindings;
             let bindings = unsafe {
                 GdnBindings {
                     qkv: input_row(b.qkv, row)?,
-                    a: input_row(b.a, row)?,
+                    a: match b.a {
+                        GdnGateInput::PerHead(a) => GdnGateInput::PerHead(input_row(a, row)?),
+                        GdnGateInput::PerChannel(a) => GdnGateInput::PerChannel(input_row(a, row)?),
+                    },
                     b: input_row(b.b, row)?,
                     conv_weight: b.conv_weight,
-                    a_log: b.a_log,
-                    dt_bias: b.dt_bias,
+                    decay: b.decay,
                     core_out: TensorMut(Tensor::new(
                         reference_out.device_ptr(stream).0 + (row * row_elements * 2) as u64,
                         [1, qwen.hv, DV],
@@ -3891,7 +5278,7 @@ mod tests {
         for rows in [1u32, 64, 2048, 16384] {
             let slots = u64::from(rows.div_ceil(CW_P2_CHUNK)) * u64::from(qwen.hv);
             assert_eq!(
-                cw_p2_bytes(qwen.hv, rows),
+                cw_p2_bytes(&qwen, rows),
                 slots * cw_p2::SLOT_BYTES,
                 "rows={rows}"
             );
@@ -3907,10 +5294,7 @@ mod tests {
                 "the split must not tax a plan that does not carry it, rows={rows}"
             );
             // Every slot sits inside the region the plan accounts for.
-            assert!(
-                cw_p2_bytes(qwen.hv, rows).is_multiple_of(256),
-                "rows={rows}"
-            );
+            assert!(cw_p2_bytes(&qwen, rows).is_multiple_of(256), "rows={rows}");
         }
         Ok(())
     }
@@ -4029,14 +5413,21 @@ mod tests {
                     padded(r * u64::from(cd) * bf),
                 )
                 .expect("qkv"),
-                a: Tensor::new(0x1000, [rows, qwen.hv], [head, 1], padded(r * head * bf))
-                    .expect("a"),
+                a: GdnGateInput::PerHead(
+                    Tensor::new(0x1000, [rows, qwen.hv], [head, 1], padded(r * head * bf))
+                        .expect("a"),
+                ),
                 b: Tensor::new(0x1000, [rows, qwen.hv], [head, 1], padded(r * head * bf))
                     .expect("b"),
-                conv_weight: Tensor::new(0x1000, [cd, 4], [4, 1], padded(u64::from(cd) * 4 * bf))
-                    .expect("conv_weight"),
-                a_log: Tensor::new(0x1000, [qwen.hv], [1], padded(head * bf)).expect("a_log"),
-                dt_bias: Tensor::new(0x1000, [qwen.hv], [1], padded(head * bf)).expect("dt_bias"),
+                conv_weight: GdnConvWeights::Fused(
+                    Tensor::new(0x1000, [cd, 4], [4, 1], padded(u64::from(cd) * 4 * bf))
+                        .expect("conv_weight"),
+                ),
+                decay: GdnDecayWeights::Bf16 {
+                    a_log: Tensor::new(0x1000, [qwen.hv], [1], padded(head * bf)).expect("a_log"),
+                    dt_bias: Tensor::new(0x1000, [qwen.hv], [1], padded(head * bf))
+                        .expect("dt_bias"),
+                },
                 core_out: TensorMut::new(
                     0x1000,
                     [rows, qwen.hv, DV],

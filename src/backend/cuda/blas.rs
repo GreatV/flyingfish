@@ -164,6 +164,46 @@ impl Plan {
         algo_index: u32,
         bias: Option<u64>,
     ) -> Result<Self> {
+        Self::build(
+            handle,
+            (rows, output, input),
+            workspace,
+            algo_index,
+            bias,
+            sys::cudaDataType_t::CUDA_R_16BF,
+        )
+    }
+
+    /// F32-output variant of the plain plan: same geometry and heuristic
+    /// contract, C/D stored as CUDA_R_32F.
+    fn new_f32_out(
+        handle: sys::cublasLtHandle_t,
+        rows: usize,
+        output: usize,
+        input: usize,
+        workspace: usize,
+        algo_index: u32,
+    ) -> Result<Self> {
+        Self::build(
+            handle,
+            (rows, output, input),
+            workspace,
+            algo_index,
+            None,
+            sys::cudaDataType_t::CUDA_R_32F,
+        )
+    }
+
+    /// Geometry tuple is (rows, output, input).
+    fn build(
+        handle: sys::cublasLtHandle_t,
+        geometry: (usize, usize, usize),
+        workspace: usize,
+        algo_index: u32,
+        bias: Option<u64>,
+        c_dtype: sys::cudaDataType_t,
+    ) -> Result<Self> {
+        let (rows, output, input) = geometry;
         let mut p = Self {
             desc: std::ptr::null_mut(),
             a: std::ptr::null_mut(),
@@ -215,7 +255,7 @@ impl Plan {
         }
         p.a = lt::create_matrix_layout(dtype, input as u64, output as u64, input as i64)?;
         p.b = lt::create_matrix_layout(dtype, input as u64, rows as u64, input as i64)?;
-        p.c = lt::create_matrix_layout(dtype, output as u64, rows as u64, output as i64)?;
+        p.c = lt::create_matrix_layout(c_dtype, output as u64, rows as u64, output as i64)?;
         p.pref = lt::create_matmul_pref()?;
         unsafe {
             // Biased plans are single-pass; split-K bias epilogues round before bias.
@@ -288,6 +328,102 @@ impl Drop for Plan {
             if !self.pref.is_null() {
                 drop_result("destroy Lt preference", lt::destroy_matmul_pref(self.pref));
             }
+        }
+    }
+}
+
+/// Lt GEMM plans for the MoE route logits: BF16 operands, CUBLAS_COMPUTE_32F,
+/// BF16 or F32 output. Plans are bound on first use per geometry; the
+/// workspace is preallocated so captured launches perform no allocation.
+pub(crate) struct RouteLogits {
+    handle: sys::cublasLtHandle_t,
+    stream: Arc<CudaStream>,
+    workspace: CudaSlice<u8>,
+    workspace_ptr: u64,
+    plans: RouteLogitsPlans,
+}
+
+/// Keyed by (rows, experts, hidden): (BF16-out prefill plan, F32-out plan).
+/// Keyed by (rows, experts, hidden).
+type RouteLogitsPlans = RefCell<BTreeMap<(usize, usize, usize), Plan>>;
+
+impl RouteLogits {
+    pub(crate) fn new(stream: &Arc<CudaStream>) -> Result<Self> {
+        let handle = lt::create_handle()?;
+        let workspace = stream.alloc_zeros::<u8>(4 * 1024 * 1024)?;
+        let workspace_ptr = {
+            use cudarc::driver::DevicePtr;
+            let (ptr, _guard) = workspace.device_ptr(stream);
+            ptr
+        };
+        Ok(Self {
+            handle,
+            stream: stream.clone(),
+            workspace,
+            workspace_ptr,
+            plans: RefCell::new(BTreeMap::new()),
+        })
+    }
+
+    pub(crate) fn plan_for(&self, rows: usize, experts: usize, hidden: usize) -> Result<()> {
+        if self.plans.borrow().contains_key(&(rows, experts, hidden)) {
+            return Ok(());
+        }
+        let workspace = self.workspace.len();
+        let plan = Plan::new_f32_out(self.handle, rows, experts, hidden, workspace, 0)?;
+        self.plans
+            .borrow_mut()
+            .insert((rows, experts, hidden), plan);
+        Ok(())
+    }
+
+    pub(crate) fn matmul_f32(
+        &self,
+        weight: &crate::backend::cuda::contracts::Tensor<bf16, 2>,
+        x: &crate::backend::cuda::contracts::Tensor<bf16, 2>,
+        y: &crate::backend::cuda::contracts::Tensor<f32, 2>,
+    ) -> Result<()> {
+        let plans = self.plans.borrow();
+        let p = plans
+            .get(&(
+                x.shape[0] as usize,
+                weight.shape[0] as usize,
+                weight.shape[1] as usize,
+            ))
+            .expect("route logits F32 plan bound before run");
+        let alpha = 1f32;
+        let beta = 0f32;
+        unsafe {
+            lt::matmul(
+                self.handle,
+                p.desc,
+                (&alpha as *const f32).cast(),
+                (&beta as *const f32).cast(),
+                weight.ptr as _,
+                p.a,
+                x.ptr as _,
+                p.b,
+                y.ptr as _,
+                p.c,
+                y.ptr as _,
+                p.c,
+                p.algo.as_ref().context("route logits F32 algo missing")?,
+                self.workspace_ptr as _,
+                self.workspace.len(),
+                self.stream.cu_stream() as _,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RouteLogits {
+    fn drop(&mut self) {
+        unsafe {
+            drop_result(
+                "destroy route logits Lt handle",
+                lt::destroy_handle(self.handle),
+            );
         }
     }
 }
@@ -515,6 +651,10 @@ impl Blas {
             stream,
             closure,
         })
+    }
+
+    pub(crate) fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
     }
 
     pub fn declare(&mut self, rows: usize, pairs: &std::collections::BTreeSet<(usize, usize)>) {
@@ -1089,9 +1229,10 @@ impl Blas {
                         0,
                     ))
                     .context("fixed Lt plan missing; bind before run/capture")?;
-                let (workspace, _r) = self.workspace.device_ptr(&self.stream);
+
                 let alpha = 1f32;
                 let beta = 0f32;
+                let (workspace, _guard) = self.workspace.device_ptr(&self.stream);
                 unsafe {
                     lt::matmul(
                         self.handle,

@@ -765,4 +765,46 @@ extern "C" __global__ __launch_bounds__(W4A8_THREADS) void moe_ffn_down_e4m3_blo
       s_codes, s_scales, groups));
   if (int(threadIdx.x % 32) == 0) out[row] = __float2bfloat16_rn(acc);
 }
+
+// slots[expert,6] = gate codes/scales, up codes/scales, down codes/scales.
+extern "C" __global__ void moe_ffn_dispatch_e4m3_f32_128(
+    const uint8_t* x, const float* sx, const uint64_t* slots,
+    const unsigned* valid, const int* ids, bf16* y,
+    int rows, int top_k, int experts, int n, int k, int projection) {
+  if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
+      gridDim.y != rows || gridDim.z != top_k || rows < 1 || top_k < 1 ||
+      top_k > 32 || experts < top_k || n < 1 || k < 1 ||
+      projection < 0 || projection > 2) { __trap(); return; }
+  const uint64_t assignment = uint64_t(blockIdx.y) * top_k + blockIdx.z;
+  const int expert = ids[assignment];
+  for (int choice = 0; choice < int(blockIdx.z); ++choice)
+    if (ids[uint64_t(blockIdx.y) * top_k + choice] == expert) { __trap(); return; }
+  if (unsigned(expert) >= unsigned(experts) || valid[expert] != 1) { __trap(); return; }
+  const uint64_t wc = slots[uint64_t(expert) * 6 + projection * 2];
+  const uint64_t ws = slots[uint64_t(expert) * 6 + projection * 2 + 1];
+  if (!wc || !ws || (wc & 15) || (ws & 3)) { __trap(); return; }
+  const uint64_t row = projection == 2 ? assignment : blockIdx.y;
+  fp8_block_decode<float, 128>(reinterpret_cast<const uint8_t*>(wc),
+      reinterpret_cast<const float*>(ws), x + row * k,
+      sx + row * ((uint64_t(k) + 127) / 128), y + assignment * n,
+      1, n, k, blockIdx.x);
+}
+
+// BF16(down_output) precedes FP32 route multiplication and BF16 contribution.
+extern "C" __global__ void moe_ffn_weight_f32(
+    const bf16* down, const float* weights, bf16* contributions,
+    unsigned* done, int assignments, int hidden) {
+  const uint64_t assignment = blockIdx.y;
+  const uint64_t col = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (blockDim.x != 256 || assignments < 1 || hidden < 1 ||
+      gridDim.y != assignments || gridDim.z != 1) { __trap(); return; }
+  if (col < uint64_t(hidden)) {
+    const float weight = weights[assignment];
+    if (!isfinite(weight)) { __trap(); return; }
+    contributions[assignment * hidden + col] = __float2bfloat16_rn(
+        __bfloat162float(down[assignment * hidden + col]) * weight);
+  }
+  if (col == 0) done[assignment] = 1;
+}
+
 #endif

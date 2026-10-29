@@ -4,13 +4,14 @@ use super::{
     contracts::{RowDomain, Scratch, Tensor, TensorMut},
     weights::WeightCatalog,
 };
+#[cfg(feature = "cuda")]
+use crate::backend::gpu::CudaSlice;
 use crate::backend::gpu::{CudaContext, CudaFunction, CudaStream, DevicePtr, PushKernelArg};
 use crate::fp8::Fp8ScaleLayout;
 use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::sync::Arc;
 /// Native BF16 operands with an unrounded FP32 output on the shared skinny tile.
-#[cfg(test)]
 #[cfg(feature = "cuda")]
 pub struct Bf16F32Plan {
     kernel: CudaFunction,
@@ -20,7 +21,6 @@ pub struct Bf16F32Plan {
     shape: [i32; 3],
 }
 
-#[cfg(test)]
 #[cfg(feature = "cuda")]
 fn bf16_f32_shape(
     input: Tensor<bf16, 2>,
@@ -68,7 +68,6 @@ fn bf16_f32_shape(
     Ok([rows as i32, columns as i32, width as i32])
 }
 
-#[cfg(test)]
 #[cfg(feature = "cuda")]
 impl Bf16F32Plan {
     pub fn new(
@@ -125,7 +124,6 @@ pub(crate) enum Fp8ScaleRef {
 }
 
 impl Fp8ScaleRef {
-    #[cfg(test)]
     #[cfg(feature = "cuda")]
     fn ptr(self) -> u64 {
         match self {
@@ -135,7 +133,6 @@ impl Fp8ScaleRef {
         }
     }
 
-    #[cfg(test)]
     #[cfg(feature = "cuda")]
     fn disjoint<T: Copy>(self, other: &Tensor<T, 2>) -> Result<()> {
         match self {
@@ -216,7 +213,7 @@ impl Fp8ScaleRef {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum LinearWeightRef {
     Bf16(Tensor<bf16, 2>),
     Fp8 {
@@ -226,6 +223,8 @@ pub(crate) enum LinearWeightRef {
     },
 }
 pub(crate) struct Fp8Ops {
+    #[cfg(feature = "cuda")]
+    quant_block_f32: CudaFunction,
     #[cfg(feature = "cuda")]
     dequant: [CudaFunction; 2],
     #[cfg(feature = "cuda")]
@@ -237,22 +236,19 @@ pub(crate) struct Fp8Ops {
     #[cfg(feature = "rocm")]
     context: Arc<CudaContext>,
     fake_quant: CudaFunction,
-    #[cfg(test)]
     #[cfg(feature = "cuda")]
     native_block: [[CudaFunction; 2]; 2],
 }
 
 /// Bound native codes/scales and prepared activations; storage remains caller-owned.
-#[cfg(test)]
 #[cfg(feature = "cuda")]
 pub(crate) struct Fp8BlockPlan {
     kernel: CudaFunction,
-    grid: cudarc::driver::LaunchConfig,
+    grid: crate::backend::gpu::LaunchConfig,
     pointers: [u64; 5],
     shape: [i32; 3],
 }
 
-#[cfg(test)]
 #[cfg(feature = "cuda")]
 impl Fp8BlockPlan {
     pub(crate) fn run(&self, stream: &Arc<CudaStream>) -> Result<()> {
@@ -274,7 +270,6 @@ impl Fp8BlockPlan {
 }
 
 impl Fp8Ops {
-    #[cfg(test)]
     #[cfg(feature = "cuda")]
     pub(crate) fn bind_block(
         &self,
@@ -373,12 +368,12 @@ impl Fp8Ops {
         };
         Ok(Self {
             fake_quant: module.load_function("e4m3_fake_quant_bf16")?,
+            quant_block_f32: module.load_function("fp8_quant_f32_128")?,
             dequant: [
                 module.load_function("fp8_dequant_bf16")?,
                 module.load_function("fp8_dequant_bf16_per_channel")?,
             ],
             small: [load("")?, load("_per_channel")?],
-            #[cfg(test)]
             native_block: [
                 [
                     module.load_function("fp8_block_f32_128_decode")?,
@@ -776,10 +771,131 @@ impl crate::linear_plan::LayerDequantPlan {
 struct BoundProjection {
     resident: LinearWeightRef,
     #[cfg(feature = "cuda")]
-    prefill: Tensor<bf16, 2>,
+    prefill: Option<Tensor<bf16, 2>>,
+    #[cfg(feature = "cuda")]
+    native: std::cell::RefCell<Option<NativeProjection>>,
     #[cfg(feature = "rocm")]
     calls: std::cell::RefCell<std::collections::BTreeMap<(u32, u64, u64), Fp8Projection>>,
     invariant_rows: usize,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct NativeProjection {
+    weight: LinearWeightRef,
+    shape: [u32; 2],
+    quant: CudaFunction,
+    _keepalive: (CudaSlice<u8>, CudaSlice<f32>),
+    codes_view: crate::backend::cuda::contracts::Tensor<u8, 2>,
+    scales_view: crate::backend::cuda::contracts::Tensor<f32, 2>,
+}
+
+#[cfg(feature = "cuda")]
+impl NativeProjection {
+    pub(crate) fn new(
+        ops: &Fp8Ops,
+        stream: &Arc<CudaStream>,
+        weight: LinearWeightRef,
+        rows: u32,
+    ) -> Result<Self> {
+        let LinearWeightRef::Fp8 {
+            codes,
+            scale,
+            layout,
+        } = weight
+        else {
+            anyhow::bail!("native projection requires FP8 weights");
+        };
+        scale.validate(&codes, layout)?;
+        ensure!(
+            layout.block_scale().is_some_and(
+                |block| block.dtype() == safetensors::Dtype::F32 && block.block() == [128, 128]
+            ),
+            "layer FP8 activation preparation requires F32 block128 scales"
+        );
+        ensure!(
+            rows > 0 && rows <= i32::MAX as u32,
+            "invalid native projection rows"
+        );
+        let k = codes.shape[1];
+        let elements = u64::from(rows) * u64::from(k);
+        let cells = u64::from(rows) * u64::from(k.div_ceil(128));
+        ensure!(
+            cells.div_ceil(4) <= i32::MAX as u64,
+            "FP8 quantization grid overflow"
+        );
+        let codes = stream.alloc_zeros(usize::try_from(elements)?)?;
+        let scales = stream.alloc_zeros(usize::try_from(cells)?)?;
+        let codes_view = super::contracts::view(&codes, stream, 0, [rows, k], [u64::from(k), 1])?;
+        let scales_view = super::contracts::view(
+            &scales,
+            stream,
+            0,
+            [rows, k.div_ceil(128)],
+            [u64::from(k.div_ceil(128)), 1],
+        )?;
+        Ok(Self {
+            weight,
+            shape: [rows, k],
+            quant: ops.quant_block_f32.clone(),
+            _keepalive: (codes, scales),
+            codes_view,
+            scales_view,
+        })
+    }
+
+    pub(crate) fn run(
+        &self,
+        ops: &Fp8Ops,
+        stream: &Arc<CudaStream>,
+        x: Tensor<bf16, 2>,
+        y: &TensorMut<bf16, 2>,
+    ) -> Result<()> {
+        let shape = match self.weight {
+            LinearWeightRef::Fp8 { codes, .. } => codes.shape,
+            LinearWeightRef::Bf16(weight) => weight.shape,
+        };
+        validate_call(shape, x, &y.0)?;
+        let [capacity, k] = self.shape;
+        let m = x.shape[0];
+        ensure!(
+            m > 0 && m <= capacity && x.shape[1] == k,
+            "native FP8 projection row plan mismatch"
+        );
+        let codes = unsafe {
+            Tensor::new(
+                self.codes_view.ptr,
+                [m, k],
+                [u64::from(k), 1],
+                u64::from(m) * u64::from(k),
+            )?
+        };
+        let groups = k.div_ceil(128);
+        let scales = unsafe {
+            Tensor::new(
+                self.scales_view.ptr,
+                [m, groups],
+                [u64::from(groups), 1],
+                u64::from(m) * u64::from(groups) * 4,
+            )?
+        };
+        disjoint(&x, &codes)?;
+        disjoint(&x, &scales)?;
+        unsafe {
+            stream
+                .launch_builder(&self.quant)
+                .arg(&x.ptr)
+                .arg(&codes.ptr)
+                .arg(&scales.ptr)
+                .arg(&(m as i32))
+                .arg(&(k as i32))
+                .launch(super::ops::grid(
+                    (u64::from(m) * u64::from(groups)).div_ceil(4) as usize,
+                    128,
+                ))?;
+        }
+        ops.bind_block(self.weight, codes, Fp8ScaleRef::F32(scales), y)?
+            .run(stream)
+    }
 }
 /// Setup-bound views for a layer. Engine retains catalog/arena storage; run does
 /// not construct tensor names, allocate scratch or invoke a Lt heuristic.
@@ -792,6 +908,11 @@ pub(crate) struct LayerLinearPlan {
 #[derive(Clone, Debug)]
 pub(crate) enum BoundFfn {
     Dense,
+    #[cfg(feature = "cuda")]
+    Native {
+        router: Tensor<bf16, 2>,
+        shared: Box<[LinearWeightRef; 3]>,
+    },
     Moe {
         router: Tensor<bf16, 2>,
         score: crate::model_spec::RouterScore,
@@ -811,6 +932,34 @@ impl BoundFfn {
         let h = spec.hidden;
         let i = moe.shared_intermediate;
         let router = linear.take_bf16("mlp.gate.weight", [moe.experts, h])?;
+        #[cfg(feature = "cuda")]
+        if spec.architecture == crate::model_spec::Architecture::Glm5Next {
+            let mut take = |role: &str| -> Result<LinearWeightRef> {
+                let projection = linear
+                    .projections
+                    .remove(role)
+                    .with_context(|| format!("native FFN projection not bound: {role}"))?;
+                ensure!(
+                    matches!(
+                        projection.resident,
+                        LinearWeightRef::Fp8 {
+                            scale: Fp8ScaleRef::F32(_),
+                            ..
+                        }
+                    ),
+                    "native FFN requires FP32-scale FP8 weights: {role}"
+                );
+                Ok(projection.resident)
+            };
+            return Ok(Self::Native {
+                router,
+                shared: Box::new([
+                    take("mlp.shared_experts.gate_proj.weight")?,
+                    take("mlp.shared_experts.up_proj.weight")?,
+                    take("mlp.shared_experts.down_proj.weight")?,
+                ]),
+            });
+        }
         let shared = Box::new([
             linear.take_bf16("mlp.shared_expert.gate_proj.weight", [i, h])?,
             linear.take_bf16("mlp.shared_expert.up_proj.weight", [i, h])?,
@@ -833,6 +982,8 @@ impl BoundFfn {
     pub fn prepare(&self, blas: &super::blas::Blas, rows: u32) -> Result<()> {
         match self {
             Self::Dense => Ok(()),
+            #[cfg(feature = "cuda")]
+            Self::Native { .. } => Ok(()),
             Self::Moe {
                 shared,
                 shared_gate,
@@ -911,18 +1062,17 @@ impl LayerLinearPlan {
         #[cfg(feature = "cuda")]
         let mut materialize = Vec::new();
         for (name, entry) in &catalog.manifest.entries {
-            if !entry.load
-                || entry.is_routed_expert()
-                || !name.starts_with(prefix)
-                || !name.ends_with(".weight")
-                || entry.shape.len() != 2
-            {
+            if !entry.is_linear_projection() || !name.starts_with(prefix) {
                 continue;
             }
             let resident = catalog.linear_ref(name, stream)?;
             #[cfg(feature = "cuda")]
             let prefill = match &resident {
-                LinearWeightRef::Bf16(w) => *w,
+                LinearWeightRef::Bf16(w) => Some(*w),
+                LinearWeightRef::Fp8 {
+                    scale: Fp8ScaleRef::F32(_),
+                    ..
+                } => None,
                 LinearWeightRef::Fp8 { .. } => {
                     let LinearWeightRef::Bf16(w) = plan.weight(
                         name,
@@ -932,7 +1082,7 @@ impl LayerLinearPlan {
                         unreachable!()
                     };
                     materialize.push((resident, TensorMut(w)));
-                    w
+                    Some(w)
                 }
             };
             let role = &name[prefix.len()..];
@@ -954,6 +1104,8 @@ impl LayerLinearPlan {
                     resident,
                     #[cfg(feature = "cuda")]
                     prefill,
+                    #[cfg(feature = "cuda")]
+                    native: Default::default(),
                     #[cfg(feature = "rocm")]
                     calls: std::cell::RefCell::new(std::collections::BTreeMap::new()),
                     invariant_rows,
@@ -971,10 +1123,28 @@ impl LayerLinearPlan {
             materialize,
         })
     }
+    #[cfg(feature = "cuda")]
+    pub fn prepare_native(&self, ops: &Fp8Ops, stream: &Arc<CudaStream>, rows: u32) -> Result<()> {
+        for projection in self.projections.values() {
+            if projection.prefill.is_none() {
+                let mut native = projection.native.borrow_mut();
+                ensure!(native.is_none(), "native projection already bound");
+                *native = Some(NativeProjection::new(
+                    ops,
+                    stream,
+                    projection.resident,
+                    rows,
+                )?);
+            }
+        }
+        Ok(())
+    }
     pub fn prepare(&self, blas: &super::blas::Blas, rows: u32) -> Result<()> {
         for p in self.projections.values() {
             #[cfg(feature = "cuda")]
-            let weight = p.prefill;
+            let Some(weight) = p.prefill else {
+                continue;
+            };
             #[cfg(feature = "rocm")]
             let LinearWeightRef::Bf16(weight) = p.resident else {
                 continue;
@@ -1052,6 +1222,14 @@ impl LayerLinearPlan {
             .projections
             .get(role)
             .with_context(|| format!("layer projection not bound: {role}"))?;
+        #[cfg(feature = "cuda")]
+        if p.prefill.is_none() {
+            let native = p.native.borrow();
+            return native
+                .as_ref()
+                .context("native projection setup missing")?
+                .run(blas.fp8_ops()?, blas.stream(), x, y);
+        }
         #[cfg(feature = "rocm")]
         if let LinearWeightRef::Fp8 { codes, .. } = p.resident {
             validate_call(codes.shape, x, &y.0)?;
@@ -1071,7 +1249,7 @@ impl LayerLinearPlan {
         let weight = if phase == crate::op_contract::ExecutionPhase::Prefill
             && !blas.direct_fp8_rows().contains(&(x.shape[0] as usize))
         {
-            LinearWeightRef::Bf16(p.prefill)
+            LinearWeightRef::Bf16(p.prefill.context("native projection was not bound")?)
         } else {
             p.resident
         };
@@ -1668,7 +1846,8 @@ mod tests {
                 "projection.weight".into(),
                 BoundProjection {
                     resident: weight,
-                    prefill,
+                    prefill: Some(prefill),
+                    native: Default::default(),
                     invariant_rows: 0,
                 },
             )]
@@ -2561,7 +2740,8 @@ mod tests {
                     role.into(),
                     BoundProjection {
                         resident: LinearWeightRef::Bf16(weight),
-                        prefill: weight,
+                        prefill: Some(weight),
+                        native: Default::default(),
                         invariant_rows: 0,
                     },
                 );

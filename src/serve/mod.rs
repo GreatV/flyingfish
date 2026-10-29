@@ -490,13 +490,14 @@ fn produce_plain_events(
     on_token: &mut dyn FnMut(u32) -> bool,
 ) -> Result<spec::Output> {
     model.reset()?;
+    let graph = model.graph_decode();
     let output = match images {
         Some(images) => crate::model::generate_multimodal(
             model,
             &images.input(ids),
             options.count,
             options.ignore_eos,
-            true,
+            graph,
             None,
             on_token,
         )?,
@@ -505,7 +506,7 @@ fn produce_plain_events(
             ids,
             options.count,
             options.ignore_eos,
-            true,
+            graph,
             None,
             on_token,
         )?,
@@ -561,5 +562,68 @@ mod tests {
             "disconnected client"
         )));
         assert_eq!(*slot.lock().unwrap(), Slot::Unavailable);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "loads the official DeepSeek-V4.1-Flash; set F3_MODEL and FLYINGFISH_RUNTIME_DIR"]
+    fn deepseek_plain_serving_decodes_past_the_first_token() -> Result<()> {
+        let model_dir = PathBuf::from(std::env::var_os("F3_MODEL").context("F3_MODEL missing")?);
+        let runtime = PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR missing")?,
+        );
+        let settings = crate::backend::Settings {
+            tree_builder: crate::backend::TreeBuilder::Waves,
+            spec_budget: crate::backend::SpecBudget::Chain,
+            spec_graph: false,
+            draft_model: None,
+            prefix_cache: false,
+            kv_format: crate::kv::KvFormat::Bf16,
+            runtime_dir: Some(runtime),
+        };
+        let options = SpecOptions {
+            device: 0,
+            capacity: 64,
+            chunk: None,
+            backend: settings.clone(),
+            count: 4,
+            ignore_eos: true,
+        };
+        let mut model = Model::load(&model_dir, 0, 64, None, settings)?;
+        ensure!(
+            !model.graph_decode(),
+            "DeepSeek-V4.1 declared an unbound graph decode"
+        );
+        for request in 0..2 {
+            let mut seen = 0;
+            let output =
+                produce_plain_events(&mut model, &[785, 10567, 1087], None, &options, &mut |_| {
+                    seen += 1;
+                    true
+                })?;
+            ensure!(
+                seen == 4 && output.ids.len() == 4,
+                "request {request} produced {seen} events and {} ids",
+                output.ids.len()
+            );
+        }
+        let mut trace = crate::trace::Trace::default();
+        let traced = crate::model::generate_plain(
+            &mut model,
+            &[785, 10567, 1087],
+            2,
+            true,
+            false,
+            Some(&mut trace),
+            &mut |_| true,
+        );
+        ensure!(
+            traced.is_err_and(|error| error.to_string().contains("record no trace tensors")),
+            "DeepSeek-V4.1 accepted a trace target it does not record"
+        );
+        println!(
+            "PASS deepseek_plain_serving requests=2 tokens=4 graph_decode=false trace_rejected=true"
+        );
+        Ok(())
     }
 }

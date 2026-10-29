@@ -12,6 +12,10 @@ pub struct CombineOps {
     shared_scale: CudaFunction,
     combine: CudaFunction,
     combine_ungated: CudaFunction,
+    #[cfg(feature = "cuda")]
+    combine_accum: CudaFunction,
+    #[cfg(feature = "cuda")]
+    combine_bf16: CudaFunction,
     combine_routed: CudaFunction,
     combine_routed_vector: CudaFunction,
     join_routed: CudaFunction,
@@ -78,6 +82,65 @@ pub struct MoeCombineResidual {
     pub residual: Option<TensorMut<bf16, 2>>,
     /// `[rows, hidden]` FFN delta output.
     pub y_out: Option<TensorMut<bf16, 2>>,
+}
+
+/// The FP32-accumulated combine of the DeepSeek-V4.1 MoE: per-choice BF16
+/// contributions plus one weight-1 shared row, one BF16 round at the output.
+#[cfg(feature = "cuda")]
+pub enum Accumulator {
+    /// The routed sum rounds to BF16 before the shared join (the family
+    /// gated/ungated boundary).
+    #[cfg(test)]
+    Bf16,
+    /// FP32 accumulation of the contributions and the weight-1 shared row,
+    // one BF16 round at the output (model.py MoE.forward).
+    Fp32,
+}
+
+#[cfg(feature = "cuda")]
+pub struct MoeCombineAccum {
+    /// `[rows, top_k, hidden]` weighted BF16 contributions (dense).
+    pub contributions: Tensor<bf16, 3>,
+    /// `[rows, hidden]` shared-expert output (dense).
+    pub shared_out: Tensor<bf16, 2>,
+    /// `[rows, hidden]` output.
+    pub y: TensorMut<bf16, 2>,
+    // Selected once at the binding; both boundaries are the same launch.
+    pub accumulator: Accumulator,
+}
+
+#[cfg(feature = "cuda")]
+impl MoeCombineAccum {
+    fn validate(&self) -> Result<(u32, u32, u32)> {
+        let (rows, top_k) = (self.contributions.shape[0], self.contributions.shape[1]);
+        let hidden = self.contributions.shape[2];
+        self.contributions.validate()?;
+        ensure!(
+            self.contributions.shape == [rows, top_k, hidden]
+                && self.contributions.stride[2] == 1
+                && self.contributions.stride[1] == u64::from(hidden)
+                && self.contributions.stride[0] == u64::from(top_k) * u64::from(hidden),
+            "moe combine f32 contributions must be dense [rows, top_k, hidden]"
+        );
+        self.shared_out.validate()?;
+        ensure!(
+            self.shared_out.shape == [rows, hidden]
+                && self.shared_out.stride == [u64::from(hidden), 1],
+            "moe combine f32 shared_out must be dense [rows, hidden]"
+        );
+        self.y.read().validate()?;
+        ensure!(
+            self.y.read().shape == [rows, hidden] && self.y.read().stride == [u64::from(hidden), 1],
+            "moe combine f32 y must be dense [rows, hidden]"
+        );
+        ensure!(
+            rows >= 1 && (1..=32).contains(&top_k) && hidden >= 1 && hidden.is_multiple_of(8),
+            "moe combine f32 extents rows={rows} top_k={top_k} hidden={hidden} (hidden must be a multiple of 8)"
+        );
+        no_overlap(&self.contributions, &self.y.0, "contributions", "y")?;
+        no_overlap(&self.shared_out, &self.y.0, "shared_out", "y")?;
+        Ok((rows, top_k, hidden))
+    }
 }
 
 /// The fused peer join: the routed sum comes from the peer GPU, the
@@ -367,6 +430,10 @@ impl CombineOps {
             shared_scale: module.load_function("moe_shared_scale")?,
             combine: module.load_function("moe_combine")?,
             combine_ungated: module.load_function("moe_combine_ungated")?,
+            #[cfg(feature = "cuda")]
+            combine_accum: module.load_function("moe_combine_accum")?,
+            #[cfg(feature = "cuda")]
+            combine_bf16: module.load_function("moe_combine_bf16")?,
             combine_routed: module.load_function("moe_combine_routed")?,
             combine_routed_vector: module.load_function("moe_combine_routed_vector")?,
             join_routed: module.load_function("moe_join_routed")?,
@@ -412,6 +479,30 @@ impl CombineOps {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
+    pub fn combine_bf16(&self, stream: &Arc<CudaStream>, input: &MoeCombine) -> Result<()> {
+        let (rows, top_k, hidden) = input.validate()?;
+        ensure!(
+            input.shared_expert_gate.is_none() && input.scale.is_none(),
+            "BF16 combine requires an ungated shared expert"
+        );
+        unsafe {
+            stream
+                .launch_builder(&self.combine_bf16)
+                .arg(&input.contributions.ptr)
+                .arg(&input.shared_out.ptr)
+                .arg(&input.ids.ptr)
+                .arg(&input.done.ptr)
+                .arg(&input.final_active.ptr)
+                .arg(&input.y.0.ptr)
+                .arg(&(rows as i32))
+                .arg(&(top_k as i32))
+                .arg(&(hidden as i64))
+                .launch(grid(rows as usize, 256))?;
+        }
+        Ok(())
+    }
+
     pub fn combine(&self, stream: &Arc<CudaStream>, input: &MoeCombine) -> Result<()> {
         let (rows, top_k, hidden) = input.validate()?;
         // SAFETY: all validated views cover rows*top_k choices and rows*hidden output values.
@@ -450,6 +541,33 @@ impl CombineOps {
                     .arg(&(hidden as i64))
                     .launch(grid(rows as usize, 256))?;
             }
+        }
+        Ok(())
+    }
+
+    /// The FP32-accumulated combine: per-choice BF16 contributions plus one
+    /// weight-1 shared row, one BF16 round at the output (the DeepSeek-V4.1
+    /// model definition MoE.forward accumulator).
+    #[cfg(feature = "cuda")]
+    pub fn combine_accum(&self, stream: &Arc<CudaStream>, input: &MoeCombineAccum) -> Result<()> {
+        let (rows, top_k, hidden) = input.validate()?;
+        let fp32 = match input.accumulator {
+            Accumulator::Fp32 => 1i32,
+            #[cfg(test)]
+            Accumulator::Bf16 => 0i32,
+        };
+        // SAFETY: validated views cover rows*top_k contributions and rows*hidden outputs.
+        unsafe {
+            stream
+                .launch_builder(&self.combine_accum)
+                .arg(&input.contributions.ptr)
+                .arg(&input.shared_out.ptr)
+                .arg(&input.y.0.ptr)
+                .arg(&(rows as i32))
+                .arg(&(top_k as i32))
+                .arg(&(hidden as i64))
+                .arg(&fp32)
+                .launch(grid(rows as usize, 256))?;
         }
         Ok(())
     }

@@ -50,22 +50,23 @@ pub const fn cw_p2_slot_layout() -> [(u64, u64, char); 6] {
 
 /// Bytes of one slot: the six fields above.
 pub const CW_P2_SLOT_BYTES: u64 = 64 * 128 * 2 + 64 * 128 * 4 + 64 * 72 * 2 + 3 * 64 * 4;
-/// Group-count bound for 128-wide FP32 V and 64-row slot chunks.
-pub const CW_P2_MAX_GROUPS: usize =
-    (2 * CW_P2_SLOT_BYTES).div_ceil(CW_P2_CHUNK as u64 * 128 * 4) as usize;
 const _: () = assert!(
     CW_P2_SLOT_BYTES == cw_p2::SLOT_BYTES,
     "the chunkwise-P2 slot fields and gdn_cw_p2_layout.h disagree"
 );
 
-/// The chunkwise-P2 workspace for `max_rows`: one slot per (chunk, value head), ceil(rows/64) * value_heads slots.
-pub const fn cw_p2_bytes(value_heads: u32, max_rows: u32) -> u64 {
+/// The chunkwise-P2 workspace for `max_rows`, one slot per (chunk, head).
+pub const fn cw_p2_bytes(spec: &GdnSpec, max_rows: u32) -> u64 {
     let chunks = if max_rows == 0 {
         0
     } else {
         (max_rows - 1) / CW_P2_CHUNK + 1
     };
-    chunks as u64 * value_heads as u64 * CW_P2_SLOT_BYTES
+    let slot_bytes = match spec.gate_mode {
+        crate::op_contract::GdnGateMode::PerHead => CW_P2_SLOT_BYTES,
+        crate::op_contract::GdnGateMode::PerChannel { .. } => cw_p2::KEY_SLOT_BYTES,
+    };
+    chunks as u64 * spec.hv as u64 * slot_bytes
 }
 
 /// The chunkwise-P2 stage ABI: field order is the argument order in `kernels/gdn/gdn_cw_p2.cu`.
@@ -79,7 +80,7 @@ pub struct P2StageArgs {
     pub v: u64,
     /// FP32 [M, hv]: gdn_beta_widen's output.
     pub beta: u64,
-    /// FP32 [M, hv]: gdn_gates' output.
+    /// FP32 [M, hv] per-head, or cumulative FP32 [M, hv, 128] per-channel.
     pub g: u64,
     /// The workspace slot base, or the state for stage H.
     pub ws: u64,
@@ -148,7 +149,7 @@ pub struct GdnWorkspace {
     pub beta: Region,
     /// `[R, hv]` FP32 — the exact widen of `beta`; both cores read `const float* beta`.
     pub beta_fp32: Region,
-    /// `[R, hv]` FP32 — `g = -exp(A_log) * softplus(a + dt_bias)`.
+    /// `[R, hv]` FP32 per-head decay, or `[R, hv, dv]` cumulative per-channel log-decay.
     pub g: Region,
     /// `[R, qk_heads, 128]` FP32 — Q normalized and scaled by `1/sqrt(DK)`.
     pub q_fp32: Region,
@@ -191,6 +192,14 @@ impl GdnWorkspace {
         let dv = u64::from(spec.dv);
 
         let hd_dv = mul(hd, dv)?;
+        let gate_elements = if matches!(
+            spec.gate_mode,
+            crate::op_contract::GdnGateMode::PerChannel { .. }
+        ) {
+            hd_dv
+        } else {
+            hd
+        };
         let compact = p2 && spec.hv == 48 && max_rows > MIN_VERIFY_ROWS;
         let qk_heads = if compact { spec.hk } else { spec.hv };
         let qk_width = mul(u64::from(qk_heads), u64::from(spec.dk))?;
@@ -200,13 +209,13 @@ impl GdnWorkspace {
             0
         };
         let sizes = [
-            mul(rows, mul(conv_dim, 2)?)?, // conv_out  BF16 [R, conv_dim]
-            mul(rows, mul(hd, 2)?)?,       // beta       BF16 [R, hv]
-            mul(rows, mul(hd, 4)?)?,       // beta_fp32  FP32 [R, hv]
-            mul(rows, mul(hd, 4)?)?,       // g          FP32 [R, hv]
-            mul(rows, mul(qk_width, 4)?)?, // q_fp32
-            mul(rows, mul(qk_width, 4)?)?, // k_fp32
-            mul(rows, mul(hd_dv, 4)?)?,    // v_fp32     FP32 [R, hv, 128]
+            mul(rows, mul(conv_dim, 2)?)?,      // conv_out  BF16 [R, conv_dim]
+            mul(rows, mul(hd, 2)?)?,            // beta       BF16 [R, hv]
+            mul(rows, mul(hd, 4)?)?,            // beta_fp32  FP32 [R, hv]
+            mul(rows, mul(gate_elements, 4)?)?, // g FP32 [R, hv] or [R, hv, dv]
+            mul(rows, mul(qk_width, 4)?)?,      // q_fp32
+            mul(rows, mul(qk_width, 4)?)?,      // k_fp32
+            mul(rows, mul(hd_dv, 4)?)?,         // v_fp32     FP32 [R, hv, 128]
             rounded,
             rounded,
         ];
@@ -224,7 +233,7 @@ impl GdnWorkspace {
             off = align(add(off, padded)?)?;
         }
         let (p2_region, p2_group_rows) = if p2 {
-            let chunk_bytes = cw_p2_bytes(spec.hv, CW_P2_CHUNK);
+            let chunk_bytes = cw_p2_bytes(spec, CW_P2_CHUNK);
             let alias_chunks =
                 (r[6].bytes / chunk_bytes).min(u64::from(max_rows.div_ceil(CW_P2_CHUNK)));
             let chunks = alias_chunks.max(1);
@@ -246,7 +255,7 @@ impl GdnWorkspace {
         };
         let mut bytes = off.max(add(p2_region.offset, p2_region.bytes)?);
         if p2 && p2_region.offset < off {
-            let first_alias_rows = cw_p2_bytes(spec.hv, CW_P2_CHUNK).div_ceil(mul(hd_dv, 4)?);
+            let first_alias_rows = cw_p2_bytes(spec, CW_P2_CHUNK).div_ceil(mul(hd_dv, 4)?);
             let short_rows = u32::try_from(first_alias_rows - 1)?;
             bytes = bytes.max(Self::new(spec, short_rows, true)?.bytes);
         }
@@ -326,7 +335,7 @@ mod tests {
                 assert!(bytes >= last, "non-monotone at hv={hv} rows={rows}");
                 last = bytes;
                 let base = ws.k_bf16.offset + ws.k_bf16.bytes;
-                let original = base + if p2 { cw_p2_bytes(hv, rows) } else { 0 };
+                let original = base + if p2 { cw_p2_bytes(&spec, rows) } else { 0 };
                 assert!(bytes <= original, "grew at hv={hv} rows={rows}");
                 assert!(ws.p2.offset.is_multiple_of(256));
                 assert!(ws.p2.offset + ws.p2.bytes <= bytes);
@@ -337,8 +346,7 @@ mod tests {
                 }
                 assert!(ws.p2_group_rows.is_multiple_of(CW_P2_CHUNK));
                 assert!(ws.p2_group_rows > 0);
-                assert!(rows.div_ceil(ws.p2_group_rows) as usize <= CW_P2_MAX_GROUPS);
-                assert_eq!(ws.p2.bytes, cw_p2_bytes(hv, ws.p2_group_rows));
+                assert_eq!(ws.p2.bytes, cw_p2_bytes(&spec, ws.p2_group_rows));
                 for live in [
                     ws.conv_out,
                     ws.beta,
@@ -422,6 +430,49 @@ mod tests {
                     end = region.offset + region.bytes;
                 }
                 assert!(end <= compact.bytes);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn per_channel_workspace_covers_gate_and_reused_slots() -> Result<()> {
+        let spec = GdnSpec {
+            hk: 64,
+            hv: 64,
+            rms_eps: 1e-5,
+            gate_mode: crate::op_contract::GdnGateMode::PerChannel {
+                lower_bound: Some(-5.0),
+            },
+            ..GdnSpec::q38()
+        };
+        assert_eq!(spec.ab_width()?, 64 * 129);
+        let slot_group = cw_p2_bytes(&spec, CW_P2_CHUNK);
+        assert_eq!(slot_group, 5_275_648);
+        for rows in [1, 5, 64, 65, 512, 4096] {
+            let p2 = GdnPolicy::P2.cw_p2_for_step(rows);
+            let ws = GdnWorkspace::new(&spec, rows, p2)?;
+            assert_eq!(ws.g.bytes, (u64::from(rows) * 64 * 128 * 4 + 255) & !255);
+            assert_eq!(ws.qk_heads, 64);
+            assert_eq!(ws.q_bf16.bytes, 0);
+            assert!(ws.p2.offset.is_multiple_of(256));
+            assert!(ws.p2.offset + ws.p2.bytes <= ws.bytes);
+            if p2 {
+                let groups = match rows {
+                    512 => 3,
+                    4096 => 25,
+                    _ => 1,
+                };
+                assert_eq!(ws.p2_group_rows, groups * CW_P2_CHUNK);
+                assert_eq!(ws.p2.bytes, u64::from(groups) * slot_group);
+                if groups == 1 {
+                    assert!(ws.v_fp32.offset + ws.v_fp32.bytes <= ws.p2.offset);
+                } else {
+                    assert_eq!(ws.p2.offset, ws.v_fp32.offset);
+                    assert!(ws.p2.bytes <= ws.v_fp32.bytes);
+                }
+            } else {
+                assert_eq!(ws.p2.bytes, 0);
             }
         }
         Ok(())

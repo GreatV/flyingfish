@@ -77,7 +77,7 @@ flyingfish --model <model-dir> --runtime-dir <dir> serve --port 8080
 Common options:
 - `--runtime-dir` (or `FLYINGFISH_RUNTIME_DIR`) holds per-machine calibration. MoE models require it. It must be outside any model directory.
 - `--draft-model <dir>` enables a DSpark draft model.
-- `--mtp <0-4>` sets the MTP depth. It defaults to 4 when the checkpoint has MTP weights; 0 selects plain decoding.
+- `--mtp <0-4>` sets the MTP depth. It defaults to 4 when the checkpoint has MTP weights for an architecture with MTP decode (Qwen3.8); 0 selects plain decoding.
 - `--kv-format affine8` stores an 8-bit KV cache for long contexts. The default is `bf16`.
 - `--device <n>` selects the GPU.
 

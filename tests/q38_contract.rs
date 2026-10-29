@@ -269,13 +269,15 @@ fn g6_workspace_budget_counts_resident_once_and_checks_tail() {
 #[test]
 fn g9_shared_layer_program_preserves_llama_order_and_types_qwen() {
     use flyingfish::{
-        model::{LAYER, LLAMA_MIXER, LayerStage, layer_program},
+        model::{LAYER, LLAMA_MIXER, LayerProgram, LayerStage, layer_program},
         model_spec::ModelSpec,
     };
     let root: serde_json::Value =
         serde_json::from_str(include_str!("data/q38-config.json")).unwrap();
     let spec = ModelSpec::qwen(&root, &serde_json::Value::Null).unwrap();
-    let full = layer_program(&spec, 3).unwrap();
+    let LayerProgram::Standard(full) = layer_program(&spec, 3).unwrap() else {
+        panic!("Qwen3.5 layers use the standard program");
+    };
     let mut flattened = Vec::new();
     for stage in full {
         match stage {
@@ -299,10 +301,10 @@ fn g9_shared_layer_program_preserves_llama_order_and_types_qwen() {
         flattened,
         LAYER.iter().map(std::mem::discriminant).collect::<Vec<_>>()
     );
-    assert!(matches!(
-        layer_program(&spec, 0).unwrap()[1],
-        LayerStage::Mixer(Mixer::Gdn)
-    ));
+    let LayerProgram::Standard(first) = layer_program(&spec, 0).unwrap() else {
+        panic!("Qwen3.5 layers use the standard program");
+    };
+    assert!(matches!(first[1], LayerStage::Mixer(Mixer::Gdn)));
     assert!(layer_program(&spec, 64).is_err());
 }
 

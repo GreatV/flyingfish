@@ -350,9 +350,245 @@ pub struct GdnState {
     pub s: CudaSlice<f32>,
     pub history: CudaSlice<f32>,
 }
+
+/// Per-layer latent K ring of the sliding-window mixer: `[window, head_dim]`
+/// E4M3 codes and `[window, head_dim/32]` E8M0 scales, written at slot
+/// `position % window`.
+pub struct LatentRing {
+    pub codes: CudaSlice<u8>,
+    pub scales: CudaSlice<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "cuda", test))]
+pub(crate) struct LatentOwners {
+    pub kv: usize,
+    pub index: usize,
+    pub ratio: usize,
+}
+
+#[cfg(any(feature = "cuda", test))]
+pub(crate) fn latent_owners(spec: &ModelSpec) -> Result<Vec<Option<LatentOwners>>> {
+    let ds = spec
+        .deepseek_v41
+        .as_ref()
+        .context("latent owner geometry missing")?;
+    let mut result = Vec::with_capacity(spec.layers.len());
+    for layer in 0..spec.layers.len() {
+        let ratio = usize::from(ds.compress_ratios[layer]);
+        if ratio == 0 {
+            result.push(None);
+            continue;
+        }
+        ensure!(
+            matches!(ratio, 1 | 2),
+            "latent compression ratio {ratio} at layer {layer}"
+        );
+        let preceding = |owners: &[u32]| -> Result<usize> {
+            ensure!(
+                owners.windows(2).all(|w| w[0] < w[1]),
+                "latent owners are not strictly ordered"
+            );
+            let owner = owners
+                .iter()
+                .copied()
+                .take_while(|&id| id as usize <= layer)
+                .last()
+                .context("compressed layer has no preceding owner")?
+                as usize;
+            ensure!(
+                usize::from(ds.compress_ratios[owner]) == ratio,
+                "layer {layer} and latent owner {owner} have different compression ratios"
+            );
+            Ok(owner)
+        };
+        let kv = preceding(&ds.kv_source_layer_ids)?;
+        let index = preceding(&ds.index_source_layer_ids)?;
+        ensure!(
+            index >= kv,
+            "layer {layer} index owner precedes its KV owner"
+        );
+        result.push(Some(LatentOwners { kv, index, ratio }));
+    }
+    Ok(result)
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct LatentCompressedKv {
+    pub owner: usize,
+    pub ratio: usize,
+    pub codes: CudaSlice<u8>,
+    pub scales: CudaSlice<u8>,
+    pub index_codes: CudaSlice<u8>,
+    pub index_scales: CudaSlice<u8>,
+    pub count: CudaSlice<u32>,
+    /// `[owner, generation, next input position, committed rows]`.
+    pub ticket: CudaSlice<u32>,
+    pub cursor: CudaSlice<u32>,
+    pub tail_values: CudaSlice<f32>,
+    pub tail_scores: CudaSlice<f32>,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct LatentSelection {
+    pub owner: usize,
+    pub positions: CudaSlice<i32>,
+    /// `[owner, KV owner, generation, prefix, end]`.
+    pub ticket: CudaSlice<u32>,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct LatentCompressedState {
+    pub owners: Vec<Option<LatentOwners>>,
+    pub kv: Vec<LatentCompressedKv>,
+    pub index: Vec<LatentSelection>,
+    pub candidates: CudaSlice<i32>,
+    pub candidate_ticket: CudaSlice<u32>,
+    pub generation: CudaSlice<u32>,
+    generation_value: u32,
+    pub rows: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl LatentCompressedState {
+    pub(crate) fn new(
+        spec: &ModelSpec,
+        capacity: usize,
+        rows: usize,
+        s: &Arc<CudaStream>,
+    ) -> Result<Self> {
+        ensure!(
+            (1..=16).contains(&rows),
+            "latent compressed workspace requires 1..=16 rows"
+        );
+        let owners = latent_owners(spec)?;
+        let ds = spec
+            .deepseek_v41
+            .as_ref()
+            .context("latent geometry missing")?;
+        ensure!(
+            spec.head_dim == 512 && ds.index_head_dim == 128 && ds.index_heads == 32,
+            "latent compressed geometry requires D512 and index32x128"
+        );
+        let index_topk = ds.selection.index_topk as usize;
+        let candidate_blocks = ds.selection.candidate_topk_blocks as usize;
+        let mut kv = Vec::new();
+        let mut index = Vec::new();
+        for (layer, mapping) in owners.iter().enumerate() {
+            let Some(mapping) = mapping else { continue };
+            if mapping.kv == layer {
+                let entries = capacity.div_ceil(mapping.ratio);
+                kv.push(LatentCompressedKv {
+                    owner: layer,
+                    ratio: mapping.ratio,
+                    codes: s.alloc_zeros(entries * 256)?,
+                    scales: s.alloc_zeros(entries * 32)?,
+                    index_codes: s.alloc_zeros(entries * 64)?,
+                    index_scales: s.alloc_zeros(entries * 4)?,
+                    count: s.alloc_zeros(1)?,
+                    ticket: s.alloc_zeros(4)?,
+                    cursor: s.alloc_zeros(1)?,
+                    tail_values: s.alloc_zeros(2 * 512)?,
+                    tail_scores: s.clone_htod(&vec![f32::NEG_INFINITY; 2 * 512])?,
+                });
+            }
+            if mapping.index == layer {
+                index.push(LatentSelection {
+                    owner: layer,
+                    positions: s.clone_htod(&vec![-1; rows * index_topk])?,
+                    ticket: s.alloc_zeros(5)?,
+                });
+            }
+        }
+        Ok(Self {
+            owners,
+            kv,
+            index,
+            candidates: s.clone_htod(&vec![-1; rows * candidate_blocks])?,
+            candidate_ticket: s.alloc_zeros(5)?,
+            generation: s.clone_htod(&[1u32])?,
+            generation_value: 1,
+            rows,
+        })
+    }
+
+    pub(crate) fn reset(&mut self, s: &Arc<CudaStream>) -> Result<()> {
+        self.generation_value = self
+            .generation_value
+            .checked_add(1)
+            .context("latent request generation exhausted")?;
+        s.memcpy_htod(&[self.generation_value], &mut self.generation)?;
+        for state in &mut self.kv {
+            s.memset_zeros(&mut state.count)?;
+            s.memset_zeros(&mut state.ticket)?;
+            s.memset_zeros(&mut state.cursor)?;
+            s.memset_zeros(&mut state.tail_values)?;
+            s.memcpy_htod(
+                &vec![f32::NEG_INFINITY; state.tail_scores.len()],
+                &mut state.tail_scores,
+            )?;
+        }
+        for state in &mut self.index {
+            s.memset_zeros(&mut state.ticket)?;
+            s.memcpy_htod(&vec![-1; state.positions.len()], &mut state.positions)?;
+        }
+        s.memset_zeros(&mut self.candidate_ticket)?;
+        s.memcpy_htod(&vec![-1; self.candidates.len()], &mut self.candidates)?;
+        Ok(())
+    }
+
+    fn bytes(&self) -> usize {
+        self.kv
+            .iter()
+            .map(|v| {
+                v.codes.len()
+                    + v.scales.len()
+                    + v.index_codes.len()
+                    + v.index_scales.len()
+                    + 4 * (v.count.len()
+                        + v.ticket.len()
+                        + v.cursor.len()
+                        + v.tail_values.len()
+                        + v.tail_scores.len())
+            })
+            .sum::<usize>()
+            + 4 * (self
+                .index
+                .iter()
+                .map(|v| v.positions.len() + v.ticket.len())
+                .sum::<usize>()
+                + self.candidates.len()
+                + self.candidate_ticket.len()
+                + self.generation.len())
+    }
+}
+
+/// Ring extents `[window, head_dim]` codes and `[window, head_dim/32]` scales.
+pub(crate) fn latent_ring_extents(spec: &ModelSpec) -> Result<(usize, usize)> {
+    let window = spec
+        .layers
+        .first()
+        .and_then(|layer| layer.sliding_window)
+        .context("model has no latent ring window")?;
+    ensure!(window > 0, "latent ring window {window} is zero");
+    ensure!(
+        (spec.head_dim as usize).is_multiple_of(32),
+        "latent ring head_dim {} must be a multiple of 32 for the ring scales",
+        spec.head_dim
+    );
+    Ok((
+        window as usize * spec.head_dim as usize,
+        window as usize * (spec.head_dim as usize / 32),
+    ))
+}
+
 pub struct StateStore {
     pub kv: Vec<Kv>,
     pub gdn: Vec<GdnState>,
+    pub(crate) latent: Vec<LatentRing>,
+    #[cfg(feature = "cuda")]
+    pub(crate) compressed: Option<LatentCompressedState>,
+    pub(crate) dsa: Vec<super::dsa::DsaState>,
     pub sequence: Option<CudaSlice<i32>>,
     capacity: u32,
     kv_rings: Vec<usize>,
@@ -383,7 +619,31 @@ impl StateStore {
         let mut kv = Vec::new();
         let mut kv_rings = Vec::new();
         let mut gdn = Vec::new();
+        let mut latent = Vec::new();
+        let mut dsa = Vec::new();
         for layer in &spec.layers {
+            if spec.architecture == crate::model_spec::Architecture::DeepseekV41 {
+                let (codes, scales) = latent_ring_extents(spec)?;
+                latent.push(LatentRing {
+                    codes: stream.alloc_zeros(codes)?,
+                    scales: stream.alloc_zeros(scales)?,
+                });
+                continue;
+            }
+            if spec.architecture == crate::model_spec::Architecture::Glm5Next
+                && layer.mixer == Mixer::FullAttention
+            {
+                ensure!(
+                    layer.state_index as usize == dsa.len(),
+                    "invalid GLM DSA state mapping"
+                );
+                dsa.push(super::dsa::DsaState::new(
+                    crate::op_contract::DsaSpec::glm53(),
+                    u32::try_from(capacity)?,
+                    stream,
+                )?);
+                continue;
+            }
             match layer.mixer {
                 Mixer::FullAttention => {
                     ensure!(
@@ -427,25 +687,55 @@ impl StateStore {
                 }
             }
         }
-        let sequence =
-            if spec.gdn.is_some() || spec.architecture == crate::model_spec::Architecture::Flint {
-                Some(stream.clone_htod(&[0i32, 1, 1, capacity as i32, 1, 0, 0, 0])?)
-            } else {
-                None
-            };
+        let sequence = if spec.gdn.is_some()
+            || spec.architecture == crate::model_spec::Architecture::Flint
+            || spec.architecture == crate::model_spec::Architecture::DeepseekV41
+        {
+            Some(stream.clone_htod(&[0i32, 1, 1, capacity as i32, 1, 0, 0, 0])?)
+        } else {
+            None
+        };
         Ok(Self {
             kv,
             gdn,
+            latent,
+            #[cfg(feature = "cuda")]
+            compressed: None,
+            dsa,
             sequence,
             capacity: capacity as u32,
             kv_rings,
         })
     }
+    pub(crate) fn dsa_state_mut(
+        &mut self,
+        state_index: usize,
+    ) -> Result<&mut super::dsa::DsaState> {
+        self.dsa
+            .get_mut(state_index)
+            .with_context(|| format!("DSA state index {state_index} is outside the layer plan"))
+    }
+
     pub fn kv_ring(&self, state_index: usize) -> Result<usize> {
         self.kv_rings
             .get(state_index)
             .copied()
             .context("KV ring state index is outside the layer plan")
+    }
+    /// Latent ring of one DeepSeek-V4.1 layer.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn latent_ring(&self, layer: usize) -> Result<&LatentRing> {
+        self.latent
+            .get(layer)
+            .with_context(|| format!("latent ring of layer {layer} is outside the layer plan"))
+    }
+    /// Mutable latent ring of one layer; the gates' planted ring controls.
+    #[cfg(test)]
+    #[cfg(feature = "cuda")]
+    pub(crate) fn latent_ring_mut(&mut self, layer: usize) -> Result<&mut LatentRing> {
+        self.latent
+            .get_mut(layer)
+            .with_context(|| format!("latent ring of layer {layer} is outside the layer plan"))
     }
     pub fn seq_ref(&self, stream: &Arc<CudaStream>) -> Result<SeqRef> {
         let meta = self
@@ -490,9 +780,48 @@ impl StateStore {
                 .as_mut()
                 .context("missing sequence metadata")?,
         )?;
+        for state in &mut self.dsa {
+            state.set_meta(
+                stream,
+                crate::op_contract::DsaMeta {
+                    prefix: meta.prefix,
+                    valid_rows: meta.valid_rows,
+                    key_count: meta.key_count,
+                    capacity: self.capacity as i32,
+                    first_key: 0,
+                    reserved: [0; 3],
+                },
+            )?;
+        }
+        Ok(())
+    }
+    pub fn advance_sequence(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        advance: &CudaFunction,
+    ) -> Result<()> {
+        let meta = self.seq_ref(stream)?;
+        unsafe {
+            stream
+                .launch_builder(advance)
+                .arg(&meta.ptr)
+                .launch(super::ops::grid(1, 1))?;
+        }
+        let sequence = self
+            .sequence
+            .as_ref()
+            .context("missing sequence metadata")?;
+        for state in &mut self.dsa {
+            // Prefix, valid rows, key count and capacity share the same layout.
+            stream.memcpy_dtod(&sequence.slice(..4), &mut state.meta.slice_mut(..4))?;
+        }
         Ok(())
     }
     pub fn reset(&mut self, stream: &Arc<CudaStream>) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        if let Some(state) = &mut self.compressed {
+            state.reset(stream)?;
+        }
         for kv in &mut self.kv {
             if let Some(c) = &mut kv.compact {
                 stream.memset_zeros(&mut c.cursor)?;
@@ -501,6 +830,13 @@ impl StateStore {
         for state in &mut self.gdn {
             stream.memset_zeros(&mut state.s)?;
             stream.memset_zeros(&mut state.history)?;
+        }
+        for ring in &mut self.latent {
+            stream.memset_zeros(&mut ring.codes)?;
+            stream.memset_zeros(&mut ring.scales)?;
+        }
+        for state in &mut self.dsa {
+            state.reset(stream)?;
         }
         if self.sequence.is_some() {
             self.set_sequence(stream, 0, 1, 1)?;
@@ -515,7 +851,25 @@ impl StateStore {
                 .iter()
                 .map(|v| (v.s.len() + v.history.len()) * 4)
                 .sum::<usize>()
+            + self
+                .latent
+                .iter()
+                .map(|v| v.codes.len() + v.scales.len())
+                .sum::<usize>()
+            + self.dsa.iter().map(|state| state.bytes()).sum::<usize>()
             + self.sequence.as_ref().map_or(0, |m| m.len() * 4)
+            + {
+                #[cfg(feature = "cuda")]
+                {
+                    self.compressed
+                        .as_ref()
+                        .map_or(0, LatentCompressedState::bytes)
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    0
+                }
+            }
     }
     pub fn compact_commit(&self, stream: &Arc<CudaStream>, force: bool) -> Result<()> {
         if self.kv.first().is_none_or(|kv| kv.compact.is_none()) {
@@ -551,9 +905,7 @@ pub struct GdnVerifyInput {
 impl GdnVerifyInput {
     pub fn new(spec: &GdnSpec, slots: usize, stream: &Arc<CudaStream>) -> Result<Self> {
         let conv_dim = usize::try_from(spec.conv_dim()?)?;
-        let ab_width = usize::try_from(spec.hv)?
-            .checked_mul(2)
-            .context("GDN verify input ab width overflow")?;
+        let ab_width = usize::try_from(spec.ab_width()?)?;
         let qkv_elems = slots
             .checked_mul(conv_dim)
             .context("GDN verify input qkv extent overflow")?;
@@ -593,6 +945,10 @@ impl StateCheckpoint {
         rows: usize,
         stream: &Arc<CudaStream>,
     ) -> Result<Self> {
+        ensure!(
+            store.dsa.is_empty(),
+            "DSA checkpoint persistence is not bound"
+        );
         ensure!(
             rows > 0 && rows <= store.capacity as usize,
             "invalid checkpoint window"
@@ -637,6 +993,10 @@ impl StateCheckpoint {
         })
     }
     fn check(&self, store: &StateStore) -> Result<()> {
+        ensure!(
+            store.dsa.is_empty(),
+            "DSA checkpoint persistence is not bound"
+        );
         ensure!(
             self.kv.len() == store.kv.len()
                 && self.gdn.len() == store.gdn.len()
@@ -964,5 +1324,80 @@ impl StateCheckpoint {
                 .sum::<usize>()
             + 4
             + self.sequence.as_ref().map_or(0, |s| s.len() * 4)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn deepseek_spec() -> crate::model_spec::ModelSpec {
+        let root: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/data/deepseek41-flash-config.json"
+        ))
+        .unwrap();
+        crate::model_spec::ModelSpec::deepseek_v41(&root, &serde_json::Value::Null).unwrap()
+    }
+
+    #[test]
+    fn compressed_ownership_keeps_kv_and_selection_sources_separate() -> Result<()> {
+        let spec = deepseek_spec();
+        let owners = latent_owners(&spec)?;
+        assert_eq!(&owners[..2], &[None, None]);
+        for (layer, mapping) in owners.iter().enumerate().take(40).skip(2) {
+            let kv = [2, 8, 14, 20].into_iter().rfind(|&v| v <= layer).unwrap();
+            let index = [2, 8, 14, 20, 24, 28, 32, 36]
+                .into_iter()
+                .rfind(|&v| v <= layer)
+                .unwrap();
+            assert_eq!(
+                *mapping,
+                Some(LatentOwners {
+                    kv,
+                    index,
+                    ratio: if layer < 20 { 2 } else { 1 }
+                })
+            );
+        }
+        let mut wrong = spec.clone();
+        wrong
+            .deepseek_v41
+            .as_mut()
+            .unwrap()
+            .kv_source_layer_ids
+            .retain(|&v| v != 20);
+        assert!(latent_owners(&wrong).is_err());
+        let mut wrong = spec;
+        wrong
+            .deepseek_v41
+            .as_mut()
+            .unwrap()
+            .index_source_layer_ids
+            .swap(0, 1);
+        assert!(latent_owners(&wrong).is_err());
+        Ok(())
+    }
+
+    /// Per-layer ring extents [window, head_dim] codes and [window, head_dim/32]
+    /// scales (window 128, head_dim 512) and the 40-layer state total.
+    #[test]
+    fn latent_ring_extents_match_the_window_geometry() {
+        let spec = deepseek_spec();
+        assert_eq!(
+            latent_ring_extents(&spec).unwrap(),
+            (128 * 512, 128 * (512 / 32))
+        );
+        let per_layer = 128 * 512 + 128 * 16;
+        assert_eq!(per_layer, 67_584);
+        assert_eq!(spec.layers.len(), 40);
+        assert_eq!(spec.layers.len() * per_layer, 2_703_360);
+        let mut bad = spec.clone();
+        bad.head_dim = 513;
+        let error = latent_ring_extents(&bad).unwrap_err().to_string();
+        assert!(error.contains("multiple of 32"), "{error}");
+        let mut bad = spec;
+        bad.layers[0].sliding_window = None;
+        let error = latent_ring_extents(&bad).unwrap_err().to_string();
+        assert!(error.contains("window"), "{error}");
     }
 }

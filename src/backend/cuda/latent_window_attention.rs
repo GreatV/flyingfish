@@ -380,6 +380,10 @@ fn validate_group_project(
 /// Latent window attention over a ring of FP8 latent K rows.
 pub struct LatentWindowAttention {
     kernel: CudaFunction,
+    ring_write: CudaFunction,
+    act_quant: CudaFunction,
+    window_slots: CudaFunction,
+    group_project: CudaFunction,
 }
 
 impl LatentWindowAttention {
@@ -387,6 +391,10 @@ impl LatentWindowAttention {
         let module = cubin::module(ctx, "latent_window_attention")?;
         Ok(Self {
             kernel: module.load_function("latent_window_attention")?,
+            ring_write: module.load_function("latent_ring_write")?,
+            act_quant: module.load_function("latent_act_quant")?,
+            window_slots: module.load_function("latent_window_slots")?,
+            group_project: module.load_function("latent_group_project")?,
         })
     }
 
@@ -445,6 +453,166 @@ impl LatentWindowAttention {
                     grid_dim: (dims.heads, 1, 1),
                     block_dim: (LWA_THREADS, 1, 1),
                     shared_mem_bytes: shared as u32,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Ring write: quantize the post-RoPE K rows per 32 (E4M3 codes, one E8M0
+    /// scale per block) and place row `r` at ring slot `(position + r) % window`.
+    pub fn ring_write(
+        &self,
+        stream: &Arc<CudaStream>,
+        kv: Tensor<bf16, 2>,
+        position: i32,
+        codes: &mut TensorMut<u8, 2>,
+        scales: &mut TensorMut<u8, 2>,
+    ) -> Result<()> {
+        validate_ring_write(&kv, position, &codes.0, &scales.0)?;
+        let rows = kv.shape[0];
+        let head_dim = kv.shape[1];
+        let window = codes.0.shape[0];
+        let groups = (head_dim / SCALE_BLOCK) as usize;
+        let warps = rows as usize * groups;
+        unsafe {
+            stream
+                .launch_builder(&self.ring_write)
+                .arg(&kv.ptr)
+                .arg(&codes.0.ptr)
+                .arg(&scales.0.ptr)
+                .arg(&position)
+                .arg(&i32::try_from(rows)?)
+                .arg(&i32::try_from(head_dim)?)
+                .arg(&i32::try_from(window)?)
+                .launch(LaunchConfig {
+                    grid_dim: (u32::try_from(warps.div_ceil(8))?, 1, 1),
+                    block_dim: (LWA_THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Per-32 E4M3/E8M0 quantization of `x` rows into linear codes and scales.
+    pub fn act_quant(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: Tensor<bf16, 2>,
+        codes: &mut TensorMut<u8, 2>,
+        scales: &mut TensorMut<u8, 2>,
+    ) -> Result<()> {
+        require_dense(&x, "quant input")?;
+        require_dense(&codes.0, "quant codes")?;
+        require_dense(&scales.0, "quant scales")?;
+        let rows = x.shape[0];
+        let width = x.shape[1];
+        ensure!(rows >= 1, "latent act quant rows {rows} is below 1");
+        ensure!(
+            width.is_multiple_of(SCALE_BLOCK),
+            "latent act quant width {width} must be a multiple of {SCALE_BLOCK} for one E8M0 scale per {SCALE_BLOCK} codes"
+        );
+        let nblocks = width / SCALE_BLOCK;
+        ensure!(
+            codes.0.shape == [rows, width],
+            "latent act quant codes shape {:?} != expected [{}, {}]",
+            codes.0.shape,
+            rows,
+            width
+        );
+        ensure!(
+            scales.0.shape == [rows, nblocks],
+            "latent act quant scales shape {:?} != expected [{}, {}]",
+            scales.0.shape,
+            rows,
+            nblocks
+        );
+        no_overlap(&x, &codes.0, "quant input", "quant codes")?;
+        no_overlap(&x, &scales.0, "quant input", "quant scales")?;
+        let warps = rows as usize * nblocks as usize;
+        unsafe {
+            stream
+                .launch_builder(&self.act_quant)
+                .arg(&x.ptr)
+                .arg(&codes.0.ptr)
+                .arg(&scales.0.ptr)
+                .arg(&(rows as i64))
+                .arg(&i32::try_from(width)?)
+                .launch(LaunchConfig {
+                    grid_dim: (u32::try_from(warps.div_ceil(8))?, 1, 1),
+                    block_dim: (LWA_THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
+    /// The visible ring slots of the query at `position`, oldest first; the
+    /// caller exposes `min(position + 1, window)` of the buffer.
+    pub fn window_slots(
+        &self,
+        stream: &Arc<CudaStream>,
+        slots: &mut TensorMut<i32, 1>,
+        position: i32,
+    ) -> Result<()> {
+        require_dense(&slots.0, "window slots")?;
+        let window = slots.0.shape[0];
+        ensure!(
+            window >= 1,
+            "latent window slots window {window} is below 1"
+        );
+        ensure!(
+            position >= 0,
+            "latent window slots position {position} is negative"
+        );
+        unsafe {
+            stream
+                .launch_builder(&self.window_slots)
+                .arg(&slots.0.ptr)
+                .arg(&position)
+                .arg(&i32::try_from(window)?)
+                .launch(crate::backend::cuda::ops::flat(window as usize))?;
+        }
+        Ok(())
+    }
+
+    /// Block-diagonal group projection of the quantized attention output:
+    /// group `g` of each row is projected by weight rows `[g*rank, (g+1)*rank)`
+    /// with one E8M0 scale per 32x32 weight block (model definition einsum
+    /// `bsgd,grd->bsgr` over the per-32 quantized o). The dot accumulates exact
+    /// 16-element sums into eight contiguous FP32 partials, the definition's
+    /// mma k-step, then reduces the partials in a five-level tree.
+    pub fn group_project(
+        &self,
+        stream: &Arc<CudaStream>,
+        act_codes: Tensor<u8, 3>,
+        act_scales: Tensor<u8, 3>,
+        w_codes: Tensor<u8, 2>,
+        w_scales: Tensor<u8, 2>,
+        out: &mut TensorMut<bf16, 2>,
+    ) -> Result<()> {
+        validate_group_project(&act_codes, &act_scales, &w_codes, &w_scales, &out.0)?;
+        let rows = act_codes.shape[0];
+        let groups = act_codes.shape[1];
+        let rank_rows = w_codes.shape[0];
+        let rank = (rank_rows / groups) as usize;
+        let width = act_codes.shape[2];
+        let warps = rows as usize * rank_rows as usize;
+        unsafe {
+            stream
+                .launch_builder(&self.group_project)
+                .arg(&act_codes.ptr)
+                .arg(&act_scales.ptr)
+                .arg(&w_codes.ptr)
+                .arg(&w_scales.ptr)
+                .arg(&out.0.ptr)
+                .arg(&i32::try_from(rows)?)
+                .arg(&i32::try_from(groups)?)
+                .arg(&i32::try_from(rank)?)
+                .arg(&i32::try_from(width)?)
+                .launch(LaunchConfig {
+                    grid_dim: (u32::try_from(warps.div_ceil(8))?, 1, 1),
+                    block_dim: (LWA_THREADS, 1, 1),
+                    shared_mem_bytes: 0,
                 })?;
         }
         Ok(())
