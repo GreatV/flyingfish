@@ -3471,7 +3471,8 @@ fn flint_sliding_ring_prefill_interleaved_gpu() -> Result<()> {
             )?;
         }
         s.synchronize()?;
-        Ok(s.clone_dtoh(&output)?)
+        let values = s.clone_dtoh(&output)?;
+        Ok(values)
     };
     let interleaved = run_case(true)?;
     let metrics = attention_metrics(

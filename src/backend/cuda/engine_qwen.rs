@@ -505,7 +505,7 @@ fn nested_verify_tcmqa(device_prefix: bool, rows: usize, bound: usize) -> Result
     Ok(true)
 }
 impl Runtime {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(super) fn allocated_workspace_bytes(&self) -> u64 {
         self.scratch.len() as u64
     }
