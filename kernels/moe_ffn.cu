@@ -805,4 +805,3 @@ extern "C" __global__ void moe_ffn_weight_f32(
   }
   if (col == 0) done[assignment] = 1;
 }
-

@@ -156,6 +156,7 @@ __device__ __forceinline__ void fp4_act_quant(
 
 #if !defined(__HIP__)
 #include <cuda_fp16.h>
+#endif
 // Two E4M3 codes per call. E4M3 is a subset of FP16, so the hardware form is
 // exact for all 256 codes; the fix-up forces the canonical NaN for both NaN codes.
 __device__ __forceinline__ float2 e4m3_decode_pair(uint16_t packed) {
@@ -212,6 +213,3 @@ __device__ __forceinline__ void fp8_block_decode(
     }
     if (lane == 0) y[row * n + col] = __float2bfloat16_rn(total);
 }
-
-
-#endif

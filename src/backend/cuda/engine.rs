@@ -6085,7 +6085,6 @@ impl Engine {
         let mut engine = Self {
             images: None,
             qwen_device_prefix: false,
-            deepseek: None,
             deepseek_mixer: None,
             deepseek_ffn: None,
             deepseek_engram: None,
