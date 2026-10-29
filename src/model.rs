@@ -449,6 +449,17 @@ pub enum LayerProgram {
     PerLayerInput([LayerStage; 6]),
 }
 
+impl std::ops::Deref for LayerProgram {
+    type Target = [LayerStage];
+    fn deref(&self) -> &[LayerStage] {
+        match self {
+            Self::Standard(stages) => &stages[..],
+            Self::Hc(stages) => &stages[..],
+            Self::PerLayerInput(stages) => &stages[..],
+        }
+    }
+}
+
 pub fn layer_program(
     spec: &crate::model_spec::ModelSpec,
     layer: usize,
