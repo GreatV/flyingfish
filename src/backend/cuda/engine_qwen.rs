@@ -2000,6 +2000,25 @@ impl Runtime {
         Ok(stream.clone_dtoh(&ops.logits.slice(row * vocab..(row + 1) * vocab))?)
     }
 
+    #[cfg(test)]
+    pub(super) fn gemma_rope_table(
+        &self,
+        stream: &Arc<CudaStream>,
+        full: bool,
+        positions: &[usize],
+        capacity: usize,
+    ) -> Result<Vec<bf16>> {
+        let ops = self.gemma.as_ref().context("Gemma 4 operations missing")?;
+        let d = if full { 512 } else { 256 };
+        let table = &ops.rope_tables[usize::from(full)];
+        let mut out = Vec::with_capacity(positions.len() * d);
+        for &position in positions {
+            ensure!(position < capacity, "RoPE table position outside capacity");
+            out.extend(stream.clone_dtoh(&table.slice(position * d..(position + 1) * d))?);
+        }
+        Ok(out)
+    }
+
     fn linear_rows(&self, rows: u32, phase: ExecutionPhase) -> Result<u32> {
         if phase == ExecutionPhase::Decode {
             return Ok(rows);
