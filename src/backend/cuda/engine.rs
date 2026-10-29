@@ -36,6 +36,8 @@ use std::{
     time::Instant,
 };
 
+#[path = "engine_deepseek.rs"]
+pub(crate) mod deepseek;
 #[path = "engine_moe.rs"]
 mod moe;
 #[path = "engine_mtp.rs"]
@@ -575,6 +577,7 @@ enum LoadDispatch {
     Qwen,
     Llama,
     Recurrent,
+    Deepseek,
 }
 
 #[cfg(feature = "cuda")]
@@ -586,6 +589,7 @@ fn load_dispatch(architecture: crate::model_spec::Architecture) -> Result<LoadDi
         Architecture::MiniCpmV47 => LoadDispatch::Qwen,
         Architecture::Flint => LoadDispatch::Qwen,
         Architecture::LoopVl => LoadDispatch::Recurrent,
+        Architecture::DeepseekV41 => LoadDispatch::Deepseek,
         Architecture::Glm5Next => {
             anyhow::bail!("GLM-5.3 execution is not bound yet")
         }
@@ -615,6 +619,11 @@ pub struct Engine {
     hidden_capture: Option<HiddenCapture>,
     qwen: Option<qwen::Runtime>,
     recurrent: Option<recurrent::Runtime>,
+    #[cfg(feature = "cuda")]
+    deepseek: Option<crate::backend::cuda::hc::HcRuntime>,
+    deepseek_mixer: Option<deepseek::DeepseekMixer>,
+    deepseek_ffn: Option<deepseek::DeepseekFfn>,
+    deepseek_engram: Option<deepseek::DeepseekEngram>,
     moe: Option<moe::Decode>,
     moe_slots: Option<moe::Slots>,
     moe_prefill: Option<moe::Prefill>,
@@ -945,6 +954,16 @@ impl Engine {
                     model_spec,
                 );
             }
+            LoadDispatch::Deepseek => {
+                return Self::load_deepseek(
+                    dir,
+                    ordinal,
+                    capacity,
+                    requested_chunk,
+                    settings,
+                    model_spec,
+                );
+            }
             LoadDispatch::Qwen => {
                 return Self::load_qwen(
                     dir,
@@ -1084,6 +1103,11 @@ impl Engine {
             #[cfg(test)]
             flint_window_capture: None,
             qwen: None,
+            #[cfg(feature = "cuda")]
+            deepseek: None,
+            deepseek_mixer: None,
+            deepseek_ffn: None,
+            deepseek_engram: None,
             recurrent: None,
             moe: None,
             moe_slots: None,
@@ -1219,9 +1243,22 @@ impl Engine {
         let old_rows = self.workspace_rows;
         let old_chunk = self.chunk;
         ensure!(rows >= old_rows, "workspace cannot shrink during load");
+        ensure!(
+            self.deepseek_engram.is_none() || rows == old_rows,
+            "Engram workspace is fixed at setup"
+        );
         if rows != old_rows {
             self.work
                 .grow(&self.device.stream, &self.model_spec, rows)?;
+            if let Some(deepseek) = &mut self.deepseek {
+                deepseek.grow(&self.device.stream, rows)?;
+            }
+            if let Some(mixer) = &mut self.deepseek_mixer {
+                mixer.grow(&self.device.stream, rows)?;
+            }
+            if let Some(ffn) = &mut self.deepseek_ffn {
+                ffn.grow(&self.device.stream, rows)?;
+            }
             if let Some(spec) = &mut self.spec {
                 spec.draft.grow(rows)?;
             }
@@ -1322,6 +1359,13 @@ impl Engine {
 
     #[cfg(feature = "cuda")]
     fn ensure_decode(&mut self) -> Result<()> {
+        if self.model_spec.architecture == crate::model_spec::Architecture::DeepseekV41 {
+            return self
+                .deepseek_mixer
+                .as_ref()
+                .context("DeepSeek-V4.1 decode native mixer is not bound")?
+                .check_decode_ready();
+        }
         if self.qwen.is_some()
             && self.model_spec.architecture != crate::model_spec::Architecture::Flint
         {
@@ -1911,7 +1955,22 @@ impl Engine {
         step: crate::backend::Step<'_>,
         trace: &mut Option<Target<'_>>,
     ) -> Result<()> {
-        for stage in crate::model::layer_program(&self.model_spec, layer)? {
+        if let Some(engram) = &self.deepseek_engram {
+            engram.run(
+                &self.device.stream,
+                layer,
+                step.rows,
+                self.deepseek
+                    .as_mut()
+                    .context("Engram mHC stream missing")?,
+            )?;
+        }
+        let program = crate::model::layer_program(&self.model_spec, layer)?;
+        let stages: &[crate::model::LayerStage] = match &program {
+            crate::model::LayerProgram::Standard(stages) => &stages[..],
+            crate::model::LayerProgram::Hc(stages) => &stages[..],
+        };
+        for (position, &stage) in stages.iter().enumerate() {
             match stage {
                 crate::model::LayerStage::Common(op) => {
                     self.run_operator(op, layer, step, trace)?
@@ -1920,11 +1979,49 @@ impl Engine {
                     self.run_mixer(mixer, layer, step, trace)?
                 }
                 crate::model::LayerStage::Ffn => self.run_ffn(layer, step, trace)?,
+                crate::model::LayerStage::Hc(kind) => {
+                    self.run_hc_stage(position, kind, layer, step)?
+                }
             }
         }
         #[cfg(test)]
         self.check_capture_layer(layer)?;
         Ok(())
+    }
+
+    /// Hc stage dispatch of the frozen nine-stage program: the stage index and
+    /// the bound pre-source policy resolve the sublayer weights and the
+    /// collapse pre-mix source.
+    fn run_hc_stage(
+        &mut self,
+        stage: usize,
+        kind: crate::model::HcStage,
+        layer: usize,
+        step: crate::backend::Step<'_>,
+    ) -> Result<()> {
+        let rows = if matches!(step.mask, crate::backend::Mask::Tree { .. }) {
+            self.spec_budget.rows()
+        } else {
+            step.rows
+        };
+        let runtime = self
+            .deepseek
+            .as_mut()
+            .context("DeepSeek-V4.1 mHC runtime is not bound")?;
+        let plan = crate::model::hc_stage_plan(stage, kind, runtime.binding.policy)?;
+        match plan {
+            crate::model::HcStagePlan::Pre { sublayer, source } => runtime.hc_pre(
+                &self.device.stream,
+                layer,
+                sublayer,
+                source,
+                rows,
+                &mut self.work.x,
+            ),
+            crate::model::HcStagePlan::Post { sublayer } => {
+                runtime.hc_post(&self.device.stream, layer, sublayer, rows, &self.work.out)
+            }
+        }
     }
 
     #[cfg(test)]
@@ -1961,6 +2058,7 @@ impl Engine {
                 }
                 Ok(())
             }
+            (Architecture::DeepseekV41, _) => self.deepseek_mixer_stage(layer, step),
             _ => anyhow::bail!(
                 "mixer {mixer:?} has no bound layer runtime; Q38 setup is not complete"
             ),
@@ -1994,6 +2092,9 @@ impl Engine {
         );
         if self.qwen.is_some() {
             return self.qwen_operator(op, i, step, trace);
+        }
+        if self.model_spec.architecture == crate::model_spec::Architecture::DeepseekV41 {
+            return self.deepseek_operator(op, i, step);
         }
         let is_tree = matches!(step.mask, crate::backend::Mask::Tree { .. });
         if is_tree && matches!(op, crate::backend::Operator::RopeKv) {
@@ -2386,6 +2487,15 @@ impl Engine {
             self.reset_qwen_positions()?;
         }
         self.state.reset(&self.device.stream)?;
+        if self.deepseek_ffn.is_some()
+            && let Some(slots) = self.moe_slots.as_mut()
+        {
+            slots.begin_staging_request()?;
+        }
+        if let Some(engram) = &mut self.deepseek_engram {
+            engram.service.reset();
+            engram.prepared = None;
+        }
         if let Some(spec) = self.spec.as_mut() {
             spec.active_rows = 0;
             spec.verify_schedule = spec.cold_verify_schedule;
@@ -2919,7 +3029,7 @@ impl Engine {
             ids.iter().all(|&x| (x as usize) < self.config.vocab_size),
             "input token id outside vocabulary"
         );
-        if self.model_spec.moe.is_some() {
+        if self.model_spec.moe.is_some() && self.deepseek.is_none() {
             return self.prefill_moe_chunks(ids, trace, keep, &mut after_chunk);
         }
         #[cfg(feature = "cuda")]
@@ -2933,6 +3043,7 @@ impl Engine {
         let end = self.position + ids.len();
         let mut part = 0usize;
         for chunk in ids.chunks(self.chunk) {
+            self.prepare_deepseek_engram(chunk, None)?;
             let skip = trace_start.saturating_sub(self.position).min(chunk.len());
             let selected = trace.is_some() && skip < chunk.len();
             self.prepare_prefill_rows(chunk.len())?;
@@ -3021,6 +3132,7 @@ impl Engine {
             Some(token) => token,
             None => self.token()?,
         };
+        self.prepare_deepseek_engram(&[committed_token], None)?;
         if graph {
             {
                 let result = if self.moe.is_some() {
@@ -3253,7 +3365,7 @@ impl Engine {
                 .device
                 .stream
                 .clone_dtoh(logits)
-                .context("read Flint FP32 logits");
+                .context("read FP32 logits");
         }
         let values = self
             .device

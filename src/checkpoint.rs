@@ -227,23 +227,22 @@ impl MappedCheckpoint {
                 vision_count == 347 && vision_bytes == 1_127_254_016,
                 "GLM-5.3 vision scope mismatch: tensors={vision_count} bytes={vision_bytes}"
             );
-            let planned =
-                expected
-                    .iter()
-                    .try_fold(0usize, |sum, (name, (dtype, shape, scope))| {
-                        if !policy.selects_tensor(*scope, name) {
-                            return Ok(sum);
-                        }
-                        sum.checked_add(tensor_bytes(*dtype, shape)?)
-                            .context("resident size overflow")
-                    })?;
+            let planned = planned_bytes(&expected, policy)?;
             return self.assemble_manifest(
                 "GLM53",
                 expected,
                 policy,
                 planned,
-                spec.linear_format.fp8_layout(),
+                spec.linear_format
+                    .fp8_layout()
+                    .map(|layout| layout.scale_suffix()),
             );
+        }
+        if spec.architecture == Architecture::DeepseekV41 {
+            let mut expected = BTreeMap::new();
+            Self::deepseek_v41_entries(spec, &mut expected)?;
+            let planned = planned_bytes(&expected, policy)?;
+            return self.assemble_manifest("DeepSeek41", expected, policy, planned, Some("scale"));
         }
         let label = match spec.architecture {
             Architecture::Qwen35Text => "Q38",
@@ -251,6 +250,9 @@ impl MappedCheckpoint {
             Architecture::Flint => "Flint",
             Architecture::Llama | Architecture::Glm5Next | Architecture::LoopVl => {
                 bail!("checkpoint manifest requires a Qwen3.5-family spec")
+            }
+            Architecture::DeepseekV41 => {
+                unreachable!("DeepSeek-V4.1 has a dedicated manifest path")
             }
         };
         let mut expected = BTreeMap::new();
@@ -288,6 +290,9 @@ impl MappedCheckpoint {
             Architecture::MiniCpmV47 => Self::minicpm_vision_entries(spec, &mut expected)?,
             Architecture::Flint => {}
             Architecture::Llama | Architecture::Glm5Next | Architecture::LoopVl => unreachable!(),
+            Architecture::DeepseekV41 => {
+                unreachable!("DeepSeek-V4.1 has a dedicated manifest path")
+            }
         }
         if policy.selects(TensorScope::Mtp)
             && !expected
@@ -296,21 +301,15 @@ impl MappedCheckpoint {
         {
             bail!("{label} checkpoint has no MTP component");
         }
-        let planned = expected
-            .iter()
-            .try_fold(0usize, |sum, (name, (dtype, shape, scope))| {
-                if !policy.selects_tensor(*scope, name) {
-                    return Ok(sum);
-                }
-                sum.checked_add(tensor_bytes(*dtype, shape)?)
-                    .context("resident size overflow")
-            })?;
+        let planned = planned_bytes(&expected, policy)?;
         self.assemble_manifest(
             label,
             expected,
             policy,
             planned,
-            spec.linear_format.fp8_layout(),
+            spec.linear_format
+                .fp8_layout()
+                .map(|layout| layout.scale_suffix()),
         )
     }
 
@@ -429,7 +428,7 @@ impl MappedCheckpoint {
             Architecture::Qwen35Text | Architecture::MiniCpmV47 | Architecture::Llama => {
                 "model.language_model"
             }
-            Architecture::Glm5Next | Architecture::LoopVl => {
+            Architecture::Glm5Next | Architecture::LoopVl | Architecture::DeepseekV41 => {
                 unreachable!("architecture has a dedicated manifest path")
             }
         };
@@ -595,6 +594,9 @@ impl MappedCheckpoint {
                         Architecture::Glm5Next | Architecture::LoopVl => {
                             unreachable!("GLM has a dedicated manifest path")
                         }
+                        Architecture::DeepseekV41 => {
+                            unreachable!("DeepSeek-V4.1 has a dedicated manifest path")
+                        }
                     };
                     projection(
                         expected,
@@ -705,6 +707,450 @@ impl MappedCheckpoint {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Closed-world expectation of the DeepSeek-V4.1 checkpoint.
+    pub fn deepseek_v41_entries(
+        spec: &crate::model_spec::ModelSpec,
+        expected: &mut BTreeMap<String, ExpectedTensor>,
+    ) -> Result<()> {
+        let ds = spec
+            .deepseek_v41
+            .as_ref()
+            .context("DeepSeek-V4.1 geometry missing")?;
+        let moe = spec
+            .moe
+            .as_ref()
+            .context("DeepSeek-V4.1 MoE geometry missing")?;
+        let layout = spec
+            .linear_format
+            .fp8_layout()
+            .context("DeepSeek-V4.1 linear format has no scale layout")?;
+        let expert_layout = match spec.expert_format {
+            Some(crate::model_spec::ExpertFormat::Fp4E2m1Block { block, scale_dtype }) => {
+                crate::fp8::Fp8BlockScale::new(block, scale_dtype)?
+            }
+            other => bail!("unsupported DeepSeek-V4.1 expert format {other:?}"),
+        };
+        let hidden = spec.hidden as usize;
+        let vocab = spec.vocab as usize;
+        let head_dim = spec.head_dim as usize;
+        let q_width = spec.q_width as usize;
+        let expert_i = moe.expert_intermediate as usize;
+        let shared_i = moe.shared_intermediate as usize;
+        let q_lora = ds.q_lora_rank as usize;
+        let hc_width = (ds.hc_mult as usize) * hidden;
+        let o_width = (ds.o_lora_rank as usize) * (ds.o_groups as usize);
+        let o_input = (ds.o_groups as usize) * head_dim;
+
+        for name in ["embed.weight", "head.weight"] {
+            put(
+                expected,
+                name.into(),
+                Dtype::BF16,
+                vec![vocab, hidden],
+                TensorScope::Text,
+            );
+        }
+        put(
+            expected,
+            "norm.weight".into(),
+            Dtype::BF16,
+            vec![hidden],
+            TensorScope::Text,
+        );
+        for name in ["image_start", "image_end", "image_newline"] {
+            put(
+                expected,
+                name.into(),
+                Dtype::BF16,
+                vec![hidden],
+                TensorScope::Text,
+            );
+        }
+
+        let mut layers =
+            Vec::with_capacity(ds.num_hidden_layers as usize + ds.nextn_layers as usize);
+        for index in 0..ds.num_hidden_layers {
+            layers.push((
+                format!("layers.{index}"),
+                TensorScope::Text,
+                moe.experts as usize,
+            ));
+        }
+        for index in 0..ds.nextn_layers {
+            layers.push((
+                format!("mtp.{index}"),
+                TensorScope::Mtp,
+                ds.dspark_experts as usize,
+            ));
+        }
+        for (prefix, scope, expert_count) in layers {
+            put(
+                expected,
+                format!("{prefix}.attn.attn_sink"),
+                Dtype::F32,
+                vec![spec.q_heads as usize],
+                scope,
+            );
+            put(
+                expected,
+                format!("{prefix}.attn.kv_norm.weight"),
+                Dtype::BF16,
+                vec![head_dim],
+                scope,
+            );
+            put(
+                expected,
+                format!("{prefix}.attn.q_norm.weight"),
+                Dtype::BF16,
+                vec![q_lora],
+                scope,
+            );
+            for name in ["attn_norm", "ffn_norm"] {
+                put(
+                    expected,
+                    format!("{prefix}.{name}.weight"),
+                    Dtype::BF16,
+                    vec![hidden],
+                    scope,
+                );
+            }
+            for name in ["hc_attn_base", "hc_ffn_base"] {
+                put(
+                    expected,
+                    format!("{prefix}.{name}"),
+                    Dtype::F32,
+                    vec![HC_BASIS],
+                    scope,
+                );
+            }
+            for name in ["hc_attn_scale", "hc_ffn_scale"] {
+                put(
+                    expected,
+                    format!("{prefix}.{name}"),
+                    Dtype::F32,
+                    vec![HC_SCALE],
+                    scope,
+                );
+            }
+            for name in ["hc_attn_fn", "hc_ffn_fn"] {
+                put(
+                    expected,
+                    format!("{prefix}.{name}"),
+                    Dtype::F32,
+                    vec![HC_BASIS, hc_width],
+                    scope,
+                );
+            }
+            for (name, n, k) in [
+                ("wkv", head_dim, hidden),
+                ("wq_a", q_lora, hidden),
+                ("wq_b", q_width, q_lora),
+                ("wo_a", o_width, o_input),
+                ("wo_b", hidden, o_width),
+            ] {
+                deepseek_projection(
+                    expected,
+                    &format!("{prefix}.attn.{name}"),
+                    n,
+                    k,
+                    layout,
+                    scope,
+                );
+            }
+            put(
+                expected,
+                format!("{prefix}.ffn.gate.weight"),
+                Dtype::BF16,
+                vec![expert_count, hidden],
+                scope,
+            );
+            for name in ["ffn.gate.bias", "ffn.gate.bias_vl"] {
+                put(
+                    expected,
+                    format!("{prefix}.{name}"),
+                    Dtype::F32,
+                    vec![expert_count],
+                    scope,
+                );
+            }
+            for (name, n, k) in [
+                ("w1", shared_i, hidden),
+                ("w2", hidden, shared_i),
+                ("w3", shared_i, hidden),
+            ] {
+                deepseek_projection(
+                    expected,
+                    &format!("{prefix}.ffn.shared_experts.{name}"),
+                    n,
+                    k,
+                    layout,
+                    scope,
+                );
+            }
+            for expert in 0..expert_count {
+                for (name, n, k) in [
+                    ("w1", expert_i, hidden),
+                    ("w2", hidden, expert_i),
+                    ("w3", expert_i, hidden),
+                ] {
+                    deepseek_fp4_expert(
+                        expected,
+                        &format!("{prefix}.ffn.experts.{expert}.{name}"),
+                        n,
+                        k,
+                        expert_layout,
+                        scope,
+                    );
+                }
+            }
+        }
+
+        for layer in 0..ds.num_hidden_layers {
+            let prefix = format!("layers.{layer}");
+            if ds.kv_source_layer_ids.contains(&layer) {
+                put(
+                    expected,
+                    format!("{prefix}.attn.compressor.norm.weight"),
+                    Dtype::BF16,
+                    vec![head_dim],
+                    TensorScope::Text,
+                );
+                put(
+                    expected,
+                    format!("{prefix}.attn.compressor.wkv.weight"),
+                    Dtype::BF16,
+                    vec![head_dim, hidden],
+                    TensorScope::Text,
+                );
+                if layer != ds.candidate_source_layer_id {
+                    put(
+                        expected,
+                        format!("{prefix}.attn.compressor.wgate.weight"),
+                        Dtype::BF16,
+                        vec![head_dim, hidden],
+                        TensorScope::Text,
+                    );
+                }
+                put(
+                    expected,
+                    format!("{prefix}.attn.indexer.k_norm.weight"),
+                    Dtype::BF16,
+                    vec![ds.index_head_dim as usize],
+                    TensorScope::Text,
+                );
+                put(
+                    expected,
+                    format!("{prefix}.attn.indexer.wk.weight"),
+                    Dtype::BF16,
+                    vec![ds.index_head_dim as usize, head_dim],
+                    TensorScope::Text,
+                );
+            }
+            if ds.index_source_layer_ids.contains(&layer) {
+                put(
+                    expected,
+                    format!("{prefix}.attn.indexer.weights_proj.weight"),
+                    Dtype::BF16,
+                    vec![ds.index_heads as usize, hidden],
+                    TensorScope::Text,
+                );
+                deepseek_projection(
+                    expected,
+                    &format!("{prefix}.attn.indexer.wq_b"),
+                    (ds.index_heads as usize) * (ds.index_head_dim as usize),
+                    q_lora,
+                    layout,
+                    TensorScope::Text,
+                );
+            }
+            if let Some(position) = ds.engram_layer_ids.iter().position(|id| *id == layer) {
+                let rows = ds.engram_num_embeddings[position] as usize;
+                put(
+                    expected,
+                    format!("{prefix}.engram.embed.weight"),
+                    Dtype::F8_E4M3,
+                    vec![rows, ds.engram_head_dim as usize],
+                    TensorScope::Text,
+                );
+                put(
+                    expected,
+                    format!("{prefix}.engram.embed.scale"),
+                    Dtype::F8_E8M0,
+                    vec![rows, ds.engram_n_heads as usize],
+                    TensorScope::Text,
+                );
+                for name in ["engram.q_weight", "engram.k_weight"] {
+                    put(
+                        expected,
+                        format!("{prefix}.{name}"),
+                        Dtype::BF16,
+                        vec![ds.engram_max_ngram_size as usize, hidden],
+                        TensorScope::Text,
+                    );
+                }
+                deepseek_projection(
+                    expected,
+                    &format!("{prefix}.engram.wkv"),
+                    ENGRAM_WKV_ROWS,
+                    hidden + (ds.engram_max_ngram_size as usize) * (ds.engram_head_dim as usize),
+                    layout,
+                    TensorScope::Text,
+                );
+            }
+        }
+
+        deepseek_projection(
+            expected,
+            "mtp.0.main_proj",
+            hidden,
+            MAIN_PROJECTION_WIDTH,
+            layout,
+            TensorScope::Mtp,
+        );
+        put(
+            expected,
+            "mtp.0.main_norm.weight".into(),
+            Dtype::BF16,
+            vec![hidden],
+            TensorScope::Mtp,
+        );
+        put(
+            expected,
+            "mtp.2.norm.weight".into(),
+            Dtype::BF16,
+            vec![hidden],
+            TensorScope::Mtp,
+        );
+        put(
+            expected,
+            "mtp.2.confidence_head.proj.weight".into(),
+            Dtype::BF16,
+            vec![1, hidden + ds.dspark_markov_rank as usize],
+            TensorScope::Mtp,
+        );
+        for name in [
+            "mtp.2.markov_head.embed.weight",
+            "mtp.2.markov_head.head.weight",
+        ] {
+            put(
+                expected,
+                name.into(),
+                Dtype::BF16,
+                vec![vocab, ds.dspark_markov_rank as usize],
+                TensorScope::Mtp,
+            );
+        }
+
+        let vision_hidden = ds.vision_hidden as usize;
+        let vision_i = ds.vision_intermediate as usize;
+        let patch = ds.vision_patch as usize;
+        let merged = (ds.vision_downsample_ratio as usize) * (ds.vision_downsample_ratio as usize);
+        put(
+            expected,
+            "vision.patch_embed.proj.weight".into(),
+            Dtype::BF16,
+            vec![vision_hidden, VISION_CHANNELS * patch * patch],
+            TensorScope::Vision,
+        );
+        put(
+            expected,
+            "vision.patch_embed.proj.bias".into(),
+            Dtype::BF16,
+            vec![vision_hidden],
+            TensorScope::Vision,
+        );
+        put(
+            expected,
+            "vision.norm.weight".into(),
+            Dtype::BF16,
+            vec![vision_hidden],
+            TensorScope::Vision,
+        );
+        for block in 0..ds.vision_layers {
+            let prefix = format!("vision.blocks.{block}");
+            for name in ["norm1", "norm2"] {
+                put(
+                    expected,
+                    format!("{prefix}.{name}.weight"),
+                    Dtype::BF16,
+                    vec![vision_hidden],
+                    TensorScope::Vision,
+                );
+            }
+            put(
+                expected,
+                format!("{prefix}.attn.wqkv.weight"),
+                Dtype::BF16,
+                vec![3 * vision_hidden, vision_hidden],
+                TensorScope::Vision,
+            );
+            put(
+                expected,
+                format!("{prefix}.attn.wqkv.bias"),
+                Dtype::BF16,
+                vec![3 * vision_hidden],
+                TensorScope::Vision,
+            );
+            put(
+                expected,
+                format!("{prefix}.attn.wo.weight"),
+                Dtype::BF16,
+                vec![vision_hidden, vision_hidden],
+                TensorScope::Vision,
+            );
+            put(
+                expected,
+                format!("{prefix}.attn.wo.bias"),
+                Dtype::BF16,
+                vec![vision_hidden],
+                TensorScope::Vision,
+            );
+            put(
+                expected,
+                format!("{prefix}.mlp.w1.weight"),
+                Dtype::BF16,
+                vec![2 * vision_i, vision_hidden],
+                TensorScope::Vision,
+            );
+            put(
+                expected,
+                format!("{prefix}.mlp.w2.weight"),
+                Dtype::BF16,
+                vec![vision_hidden, vision_i],
+                TensorScope::Vision,
+            );
+        }
+        put(
+            expected,
+            "aligner.w1.weight".into(),
+            Dtype::BF16,
+            vec![hidden, vision_hidden * merged],
+            TensorScope::Vision,
+        );
+        put(
+            expected,
+            "aligner.w1.bias".into(),
+            Dtype::BF16,
+            vec![hidden],
+            TensorScope::Vision,
+        );
+        put(
+            expected,
+            "aligner.w2.weight".into(),
+            Dtype::BF16,
+            vec![hidden, hidden],
+            TensorScope::Vision,
+        );
+        put(
+            expected,
+            "aligner.w2.bias".into(),
+            Dtype::BF16,
+            vec![hidden],
+            TensorScope::Vision,
+        );
         Ok(())
     }
 
@@ -1174,7 +1620,7 @@ impl MappedCheckpoint {
         mut expected: BTreeMap<String, ExpectedTensor>,
         policy: LoadPolicy,
         expected_bytes: usize,
-        fp8_layout: Option<crate::fp8::Fp8ScaleLayout>,
+        scale_suffix: Option<&str>,
     ) -> Result<TensorManifest> {
         if expected.len() != self.index.weight_map.len() {
             let missing: Vec<_> = expected
@@ -1232,9 +1678,7 @@ impl MappedCheckpoint {
                     "{}.{}",
                     name.strip_suffix(".weight")
                         .context("invalid FP8 tensor suffix")?,
-                    fp8_layout
-                        .context("FP8 tensor without scale layout")?
-                        .scale_suffix()
+                    scale_suffix.context("FP8 tensor without scale layout")?
                 ))
             } else {
                 None
@@ -1267,7 +1711,22 @@ impl MappedCheckpoint {
     }
 }
 
-type ExpectedTensor = (Dtype, Vec<usize>, TensorScope);
+/// Layer name prefixes of the published checkpoints.
+const LAYER_PREFIXES: [&str; 3] = ["model.layers.", "model.language_model.layers.", "layers."];
+
+pub type ExpectedTensor = (Dtype, Vec<usize>, TensorScope);
+
+fn planned_bytes(expected: &BTreeMap<String, ExpectedTensor>, policy: LoadPolicy) -> Result<usize> {
+    expected
+        .iter()
+        .try_fold(0usize, |sum, (name, (dtype, shape, scope))| {
+            if !policy.selects_tensor(*scope, name) {
+                return Ok(sum);
+            }
+            sum.checked_add(tensor_bytes(*dtype, shape)?)
+                .context("resident size overflow")
+        })
+}
 
 fn put(
     expected: &mut BTreeMap<String, ExpectedTensor>,
@@ -1312,6 +1771,65 @@ fn projection_scoped(
             scope,
         );
     }
+}
+
+/// Hyper-connection basis width of the published DeepSeek-V4.1 checkpoint.
+const HC_BASIS: usize = 24;
+/// Hyper-connection group count of the published DeepSeek-V4.1 checkpoint.
+const HC_SCALE: usize = 3;
+/// Rows of the published engram WKV matrix `[rows, hidden + ngram_size * head_dim]`.
+const ENGRAM_WKV_ROWS: usize = 25_600;
+/// Columns of the published MTP main projection `[hidden, columns]`.
+const MAIN_PROJECTION_WIDTH: usize = 15_360;
+/// Colour channels of the published DeepSeek-V4.1 patch embedding.
+const VISION_CHANNELS: usize = 3;
+
+fn deepseek_projection(
+    expected: &mut BTreeMap<String, ExpectedTensor>,
+    base: &str,
+    n: usize,
+    k: usize,
+    layout: crate::fp8::Fp8ScaleLayout,
+    scope: TensorScope,
+) {
+    put(
+        expected,
+        format!("{base}.weight"),
+        Dtype::F8_E4M3,
+        vec![n, k],
+        scope,
+    );
+    put(
+        expected,
+        format!("{base}.scale"),
+        layout.scale_dtype(),
+        layout.scale_shape(n as u32, k as u32).to_vec(),
+        scope,
+    );
+}
+
+fn deepseek_fp4_expert(
+    expected: &mut BTreeMap<String, ExpectedTensor>,
+    base: &str,
+    n: usize,
+    k: usize,
+    layout: crate::fp8::Fp8BlockScale,
+    scope: TensorScope,
+) {
+    put(
+        expected,
+        format!("{base}.weight"),
+        Dtype::I8,
+        vec![n, k / 2],
+        scope,
+    );
+    put(
+        expected,
+        format!("{base}.scale"),
+        layout.dtype(),
+        layout.scale_shape(n as u32, k as u32).to_vec(),
+        scope,
+    );
 }
 
 fn tensor_bytes(dtype: Dtype, shape: &[usize]) -> Result<usize> {
@@ -1399,14 +1917,16 @@ impl TensorEntry {
 }
 
 fn split_layer_role(name: &str) -> Result<(Option<u32>, String)> {
-    let layer = name
-        .strip_prefix("model.layers.")
-        .or_else(|| name.strip_prefix("model.language_model.layers."))
+    let layer = LAYER_PREFIXES
+        .iter()
+        .find_map(|prefix| name.strip_prefix(prefix))
         .and_then(|s| s.split('.').next())
         .map(str::parse::<u32>)
         .transpose()?;
     let role = if let Some(layer) = layer {
-        name.strip_prefix(&format!("model.layers.{layer}."))
+        LAYER_PREFIXES
+            .iter()
+            .find_map(|prefix| name.strip_prefix(&format!("{prefix}{layer}.")))
             .or_else(|| name.strip_prefix(&format!("model.language_model.layers.{layer}.")))
             .unwrap_or(name)
             .to_owned()

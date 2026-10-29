@@ -13,20 +13,18 @@ pub mod decode;
 pub mod draft;
 pub mod engine;
 pub mod flash;
-#[cfg(test)]
 #[cfg(feature = "cuda")]
 pub mod gated_residual;
 pub(crate) mod gdn;
-#[cfg(test)]
+#[cfg(feature = "cuda")]
+pub mod hc;
 #[cfg(feature = "cuda")]
 pub mod index_score;
 #[cfg(test)]
 #[cfg(feature = "cuda")]
 mod kv_cache_tests;
-#[cfg(test)]
 #[cfg(feature = "cuda")]
 pub mod latent_compress;
-#[cfg(test)]
 #[cfg(feature = "cuda")]
 pub mod latent_window_attention;
 pub(crate) mod linear;
@@ -37,15 +35,13 @@ mod markov;
 mod markov_calibrate;
 #[cfg(feature = "cuda")]
 pub mod mhc;
-pub(crate) mod moe;
+pub mod moe;
 #[cfg(feature = "cuda")]
 pub mod multi_calibrate;
 pub mod ops;
 pub mod profile;
-#[cfg(test)]
 #[cfg(feature = "cuda")]
 pub mod quantize;
-#[cfg(test)]
 #[cfg(feature = "cuda")]
 pub mod selection;
 pub mod state;

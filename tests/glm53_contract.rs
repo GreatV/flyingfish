@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use flyingfish::{
     checkpoint::{LoadPolicy, MappedCheckpoint, TensorScope},
     experts::catalogue::{ExpertCatalogue, ExpertGeometry, ExpertLayout, ExpertRange},
+    model::{HcPreSource, HcStage, HcStagePlan, HcSublayer, hc_pre_policy, hc_stage_plan},
     model_spec::{
         Architecture, ExpertFormat, LinearFormat, Mixer, ModelSpec, RoutedWeightBoundary,
         RouterScore, SwigluRounding,
@@ -278,4 +279,40 @@ fn glm53_checkpoint_manifest_and_mutants() -> Result<()> {
         "{error}"
     );
     Ok(())
+}
+
+#[test]
+fn glm53_hc_pre_policy_is_own_for_both_sublayers() {
+    let spec = spec();
+    let policy = hc_pre_policy(spec.architecture).unwrap();
+    assert_eq!(policy.attention, HcPreSource::Own);
+    assert_eq!(policy.ffn, HcPreSource::Own);
+    assert_eq!(
+        hc_stage_plan(0, HcStage::Pre, policy).unwrap(),
+        HcStagePlan::Pre {
+            sublayer: HcSublayer::Attention,
+            source: HcPreSource::Own,
+        }
+    );
+    assert_eq!(
+        hc_stage_plan(4, HcStage::Pre, policy).unwrap(),
+        HcStagePlan::Pre {
+            sublayer: HcSublayer::Ffn,
+            source: HcPreSource::Own,
+        }
+    );
+    // The DeepSeek policy's carried attention source is the discriminating
+    // cross-model control.
+    assert_ne!(
+        hc_stage_plan(0, HcStage::Pre, policy).unwrap(),
+        hc_stage_plan(
+            0,
+            HcStage::Pre,
+            hc_pre_policy(Architecture::DeepseekV41).unwrap()
+        )
+        .unwrap()
+    );
+    // Architectures without mHC name themselves.
+    let error = hc_pre_policy(Architecture::Llama).unwrap_err().to_string();
+    assert!(error.contains("Llama"), "{error}");
 }

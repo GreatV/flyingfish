@@ -16,7 +16,7 @@ pub struct RowWorkSpec {
 impl RowWorkSpec {
     pub fn new(spec: &ModelSpec) -> Result<Self> {
         let hidden = spec.hidden as usize;
-        let intermediate = spec.intermediate as usize;
+        let mut intermediate = spec.intermediate as usize;
         let q = spec.q_width as usize;
         let kv = (spec.kv_heads as usize)
             .checked_mul(spec.head_dim as usize)
@@ -39,6 +39,26 @@ impl RowWorkSpec {
             ),
             Architecture::Glm5Next => {
                 anyhow::bail!("GLM-5.3 row work is not bound yet")
+            }
+            Architecture::DeepseekV41 => {
+                let moe = spec
+                    .moe
+                    .as_ref()
+                    .context("DeepSeek-V4.1 MoE geometry missing")?;
+                // The projection buffer holds the wq_b output (q_width) and the
+                // wkv output (head_dim) side by side: [rows, q_width + head_dim].
+                // The FFN row takes the wider of the routed and shared expert
+                // intermediates; the mixer buffer holds the post-wo_b attention
+                // output: [rows, hidden].
+                intermediate =
+                    (moe.expert_intermediate as usize).max(moe.shared_intermediate as usize);
+                (
+                    q.checked_add(spec.head_dim as usize)
+                        .context("projection width overflow")?,
+                    hidden,
+                    false,
+                    0,
+                )
             }
             Architecture::Qwen35Text | Architecture::MiniCpmV47 => {
                 FullAttentionSpec::from_model(spec)?;

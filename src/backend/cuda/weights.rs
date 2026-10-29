@@ -435,6 +435,14 @@ impl UploadHashWorker {
 }
 
 impl Loader<'_> {
+    /// Marks one manifest tensor consumed without uploading it.
+    pub(super) fn defer(&mut self, name: &str) -> Result<()> {
+        ensure!(
+            self.seen.insert(name.to_owned()),
+            "tensor {name} deferred twice"
+        );
+        Ok(())
+    }
     pub(crate) fn load(&mut self, specs: &[(String, Vec<usize>)]) -> Result<CudaSlice<bf16>> {
         let count = specs.iter().try_fold(0usize, |total, (_, shape)| {
             let n = shape.iter().try_fold(1usize, |n, &d| {
@@ -906,6 +914,12 @@ impl Loader<'_> {
             }
             let valid = match dtype {
                 Dtype::F8_E4M3 => staging.as_slice()?[..len].iter().all(|c| c & 0x7f != 0x7f),
+                Dtype::F8_E8M0 => staging.as_slice()?[..len].iter().all(|c| *c != 0xff),
+                Dtype::BF16 => staging.as_slice()?[..len]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .all(|c| u16::from_le_bytes(*c) & 0x7f80 != 0x7f80),
                 Dtype::F32 => {
                     ensure!(len % 4 == 0, "unaligned F32 chunk in {name}");
                     staging.as_slice()?[..len]
@@ -914,6 +928,8 @@ impl Loader<'_> {
                         .iter()
                         .all(|c| f32::from_le_bytes(*c).is_finite())
                 }
+                // Packed E2M1 nibble pairs; every byte is a valid code pair.
+                Dtype::I8 => true,
                 _ => anyhow::bail!("unsupported native byte dtype {dtype:?} for {name}"),
             };
             ensure!(valid, "nonfinite native value in {name}");

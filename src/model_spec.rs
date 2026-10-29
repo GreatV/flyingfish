@@ -12,6 +12,7 @@ pub enum Architecture {
     Flint,
     Glm5Next,
     LoopVl,
+    DeepseekV41,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Mixer {
@@ -69,7 +70,7 @@ pub enum LinearFormat {
     Fp8E4m3Channel,
 }
 /// Routed-expert checkpoint layout: fused or separate BF16 tensors, per-channel BF16 scales,
-/// or block scales beside per-expert E4M3 weights.
+/// block scales beside per-expert E4M3 weights, or block scales beside per-expert E2M1 weights.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ExpertFormat {
     Bf16,
@@ -115,6 +116,47 @@ pub struct Glm5NextConfig {
     pub routed_scaling_factor: f32,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeepseekV41Config {
+    pub num_hidden_layers: u32,
+    pub hc_mult: u32,
+    pub hc_sinkhorn_iters: u32,
+    pub hc_eps: f32,
+    pub window_size: u32,
+    pub qk_rope_head_dim: u32,
+    pub q_lora_rank: u32,
+    pub o_lora_rank: u32,
+    pub o_groups: u32,
+    /// Per-layer compress ratio; the nonzero kinds rotate with the YaRN table
+    /// built from compress_rope_theta, the zero kinds with plain rope_theta.
+    pub compress_ratios: Vec<u8>,
+    pub compress_rope_theta: f32,
+    pub rope_factor: f32,
+    pub original_max_position: u32,
+    pub beta_fast: u32,
+    pub beta_slow: u32,
+    pub swiglu_limit: f32,
+    pub routed_scaling_factor: f32,
+    pub index_heads: u32,
+    pub index_head_dim: u32,
+    pub kv_source_layer_ids: Vec<u32>,
+    pub index_source_layer_ids: Vec<u32>,
+    pub candidate_source_layer_id: u32,
+    pub engram_layer_ids: Vec<u32>,
+    pub engram_num_embeddings: Vec<u32>,
+    pub engram_max_ngram_size: u32,
+    pub engram_n_heads: u32,
+    pub engram_head_dim: u32,
+    pub nextn_layers: u32,
+    pub dspark_experts: u32,
+    pub dspark_markov_rank: u32,
+    pub vision_layers: u32,
+    pub vision_hidden: u32,
+    pub vision_intermediate: u32,
+    pub vision_patch: u32,
+    pub vision_downsample_ratio: u32,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LayerPlan {
     pub mixer: Mixer,
     pub state_index: u32,
@@ -154,6 +196,8 @@ pub struct ModelSpec {
     pub gdn: Option<GdnConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub glm5_next: Option<Glm5NextConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deepseek_v41: Option<DeepseekV41Config>,
     #[serde(default)]
     pub vision: Option<VisionConfig>,
 }
@@ -276,6 +320,9 @@ impl VisionConfig {
             | Architecture::Flint
             | Architecture::Glm5Next
             | Architecture::LoopVl => {
+                bail!("vision configuration requires a supported multimodal architecture")
+            }
+            Architecture::DeepseekV41 => {
                 bail!("vision configuration requires a supported multimodal architecture")
             }
         }
@@ -401,6 +448,39 @@ fn positive(v: &Value, key: &str) -> Result<u32> {
     let n = integer(v, key)?;
     ensure!(n > 0, "unsupported {key}: 0");
     Ok(n)
+}
+fn u32_list(v: &Value, key: &str) -> Result<Vec<u32>> {
+    let values = v
+        .get(key)
+        .and_then(Value::as_array)
+        .with_context(|| format!("missing/invalid {key}"))?;
+    let mut out = Vec::with_capacity(values.len());
+    for value in values {
+        let n = value
+            .as_u64()
+            .with_context(|| format!("{key} contains a non-unsigned integer"))?;
+        out.push(u32::try_from(n).with_context(|| format!("{key} overflows u32"))?);
+    }
+    Ok(out)
+}
+fn block_size(v: &Value, key: &str) -> Result<[u32; 2]> {
+    let values = v
+        .get(key)
+        .and_then(Value::as_array)
+        .with_context(|| format!("missing/invalid {key}"))?;
+    ensure!(values.len() == 2, "{key} is not a two-element block size");
+    let mut block = [0u32; 2];
+    for (index, value) in values.iter().enumerate() {
+        let n = value
+            .as_u64()
+            .with_context(|| format!("{key} contains a non-unsigned integer"))?;
+        block[index] = u32::try_from(n).with_context(|| format!("{key} overflows u32"))?;
+    }
+    ensure!(
+        block.iter().all(|&n| n > 0),
+        "{key} contains a zero block extent"
+    );
+    Ok(block)
 }
 fn integer_array(v: &Value, key: &str, limit: u32) -> Result<Vec<u32>> {
     let values = v
@@ -966,7 +1046,7 @@ impl ModelSpec {
     pub fn swiglu_rounding(&self) -> SwigluRounding {
         match self.architecture {
             Architecture::Flint => SwigluRounding::Once,
-            Architecture::Glm5Next => SwigluRounding::ClampedTwice,
+            Architecture::Glm5Next | Architecture::DeepseekV41 => SwigluRounding::ClampedTwice,
             Architecture::Llama
             | Architecture::Qwen35Text
             | Architecture::MiniCpmV47
@@ -975,9 +1055,21 @@ impl ModelSpec {
     }
 
     pub fn swiglu_limit(&self) -> f32 {
-        self.glm5_next
-            .as_ref()
-            .map_or(0.0, |config| config.swiglu_limit)
+        match self.architecture {
+            Architecture::Glm5Next => self
+                .glm5_next
+                .as_ref()
+                .map_or(0.0, |config| config.swiglu_limit),
+            Architecture::DeepseekV41 => self
+                .deepseek_v41
+                .as_ref()
+                .map_or(0.0, |config| config.swiglu_limit),
+            Architecture::Llama
+            | Architecture::Qwen35Text
+            | Architecture::MiniCpmV47
+            | Architecture::Flint
+            | Architecture::LoopVl => 0.0,
+        }
     }
 
     pub fn routed_weight_boundary(&self) -> RoutedWeightBoundary {
@@ -985,6 +1077,7 @@ impl ModelSpec {
             Architecture::Flint | Architecture::Glm5Next => {
                 RoutedWeightBoundary::BeforeContributionBf16
             }
+            Architecture::DeepseekV41 => RoutedWeightBoundary::BeforeDownQuantization,
             Architecture::Llama
             | Architecture::Qwen35Text
             | Architecture::MiniCpmV47
@@ -1002,6 +1095,7 @@ impl ModelSpec {
                 Architecture::Flint => "flint",
                 Architecture::Glm5Next => "glm5_next_text",
                 Architecture::LoopVl => "hrm_text",
+                Architecture::DeepseekV41 => "deepseek_v41_text",
             }
             .into(),
             hidden_size: self.hidden as usize,
@@ -1043,6 +1137,8 @@ impl ModelSpec {
             Self::glm5_next(&root, &generation)
         } else if root.get("model_type").and_then(Value::as_str) == Some("loopvl") {
             Self::loopvl(&root, &generation)
+        } else if root.get("model_type").and_then(Value::as_str) == Some("deepseek_v41") {
+            Self::deepseek_v41(&root, &generation)
         } else {
             Self::qwen(&root, &generation)
         }
@@ -1070,6 +1166,7 @@ impl ModelSpec {
             moe: None,
             gdn: None,
             glm5_next: None,
+            deepseek_v41: None,
             layers: (0..u(c.num_hidden_layers)?)
                 .map(|state_index| LayerPlan {
                     mixer: Mixer::FullAttention,
@@ -1209,6 +1306,7 @@ impl ModelSpec {
             moe: None,
             gdn: None,
             glm5_next: None,
+            deepseek_v41: None,
             vision: None,
         })
     }
@@ -1454,6 +1552,7 @@ impl ModelSpec {
             moe: Some(moe),
             gdn: None,
             glm5_next: None,
+            deepseek_v41: None,
             vision: None,
         })
     }
@@ -1835,6 +1934,402 @@ impl ModelSpec {
                 swiglu_limit,
                 routed_scaling_factor,
             }),
+            deepseek_v41: None,
+            vision: None,
+        })
+    }
+    pub fn deepseek_v41(root: &Value, generation: &Value) -> Result<Self> {
+        equal(root, "model_type", "deepseek_v41".into())?;
+        equal(
+            root,
+            "architectures",
+            serde_json::json!(["DeepseekV41ForCausalLM"]),
+        )?;
+        equal(root, "dtype", "bfloat16".into())?;
+        let quant = root
+            .get("quantization_config")
+            .context("DeepSeek-V4.1 quantization_config missing")?;
+        exact_keys(
+            quant,
+            &[
+                "activation_scheme",
+                "expert_dtype",
+                "quant_method",
+                "scale_fmt",
+                "weight_block_size",
+            ],
+            "quantization_config",
+        )?;
+        for (key, value) in [
+            ("activation_scheme", "dynamic"),
+            ("expert_dtype", "fp4"),
+            ("quant_method", "fp8"),
+            ("scale_fmt", "ue8m0"),
+        ] {
+            equal(quant, key, value.into())?;
+        }
+        let block = block_size(quant, "weight_block_size")?;
+        ensure!(
+            block == [32, 32],
+            "unsupported DeepSeek-V4.1 weight block size: {block:?}"
+        );
+
+        let t = root.get("text_config").context("missing text_config")?;
+        exact_keys(
+            t,
+            &[
+                "attention_bias",
+                "attention_dropout",
+                "candidate_block_size",
+                "candidate_source_layer_id",
+                "candidate_topk_blocks",
+                "compress_ratios",
+                "compress_rope_theta",
+                "dspark_block_size",
+                "dspark_markov_rank",
+                "dspark_n_routed_experts",
+                "dspark_noise_token_id",
+                "dspark_num_experts_per_tok",
+                "dspark_target_layer_ids",
+                "engram_compressed_vocab_size",
+                "engram_head_dim",
+                "engram_layer_ids",
+                "engram_max_ngram_size",
+                "engram_n_heads",
+                "engram_num_embeddings",
+                "engram_pad_token_id",
+                "engram_vocab_size",
+                "hc_eps",
+                "hc_mult",
+                "hc_sinkhorn_iters",
+                "head_dim",
+                "hidden_act",
+                "hidden_size",
+                "index_head_dim",
+                "index_n_heads",
+                "index_source_layer_ids",
+                "index_topk",
+                "initializer_range",
+                "kv_source_layer_ids",
+                "max_position_embeddings",
+                "model_type",
+                "moe_intermediate_size",
+                "n_routed_experts",
+                "n_shared_experts",
+                "norm_topk_prob",
+                "num_attention_heads",
+                "num_experts_per_tok",
+                "num_hidden_layers",
+                "num_key_value_heads",
+                "num_nextn_predict_layers",
+                "o_groups",
+                "o_lora_rank",
+                "q_lora_rank",
+                "qk_rope_head_dim",
+                "rms_norm_eps",
+                "rope_scaling",
+                "rope_theta",
+                "routed_scaling_factor",
+                "scoring_func",
+                "sliding_window",
+                "swiglu_limit",
+                "tie_word_embeddings",
+                "topk_method",
+                "use_cache",
+                "vocab_size",
+            ],
+            "text_config",
+        )?;
+        equal(t, "model_type", "deepseek_v41_text".into())?;
+        for (key, value) in [
+            ("attention_bias", false.into()),
+            ("attention_dropout", 0.0.into()),
+            ("hidden_act", "silu".into()),
+            ("norm_topk_prob", true.into()),
+            ("scoring_func", "sqrtsoftplus".into()),
+            ("tie_word_embeddings", false.into()),
+            ("topk_method", "noaux_tc".into()),
+            ("use_cache", true.into()),
+        ] {
+            equal(t, key, value)?;
+        }
+        let rope = t.get("rope_scaling").context("missing rope_scaling")?;
+        exact_keys(
+            rope,
+            &[
+                "beta_fast",
+                "beta_slow",
+                "factor",
+                "original_max_position_embeddings",
+                "rope_type",
+            ],
+            "rope_scaling",
+        )?;
+        equal(rope, "rope_type", "yarn".into())?;
+        equal(rope, "factor", 16.into())?;
+        equal(rope, "beta_fast", 32.into())?;
+        equal(rope, "beta_slow", 1.into())?;
+        equal(rope, "original_max_position_embeddings", 65536.into())?;
+        let rope_factor = rope
+            .get("factor")
+            .and_then(Value::as_f64)
+            .context("missing/invalid rope factor")? as f32;
+        let original_max_position = positive(rope, "original_max_position_embeddings")?;
+        let beta_fast = positive(rope, "beta_fast")?;
+        let beta_slow = positive(rope, "beta_slow")?;
+
+        let hidden = positive(t, "hidden_size")?;
+        let vocab = positive(t, "vocab_size")?;
+        let depth = positive(t, "num_hidden_layers")?;
+        let q_heads = positive(t, "num_attention_heads")?;
+        let kv_heads = positive(t, "num_key_value_heads")?;
+        let head_dim = positive(t, "head_dim")?;
+        let qk_rope_head_dim = positive(t, "qk_rope_head_dim")?;
+        let q_lora_rank = positive(t, "q_lora_rank")?;
+        let o_lora_rank = positive(t, "o_lora_rank")?;
+        let o_groups = positive(t, "o_groups")?;
+        let window_size = positive(t, "sliding_window")?;
+        let max_position = positive(t, "max_position_embeddings")?;
+        ensure!(
+            q_heads.is_multiple_of(kv_heads),
+            "num_attention_heads is not a multiple of num_key_value_heads"
+        );
+        ensure!(
+            qk_rope_head_dim <= head_dim,
+            "qk_rope_head_dim exceeds head_dim"
+        );
+        ensure!(
+            q_heads.is_multiple_of(o_groups),
+            "num_attention_heads is not a multiple of o_groups"
+        );
+        let float = |key: &str| -> Result<f64> {
+            t.get(key)
+                .and_then(Value::as_f64)
+                .with_context(|| format!("missing/invalid {key}"))
+        };
+        let positive_f32 = |key: &str| -> Result<f32> {
+            let value = float(key)? as f32;
+            ensure!(value.is_finite() && value > 0.0, "invalid {key}");
+            Ok(value)
+        };
+        for key in [
+            "hc_eps",
+            "initializer_range",
+            "rms_norm_eps",
+            "routed_scaling_factor",
+            "swiglu_limit",
+            "compress_rope_theta",
+            "rope_theta",
+        ] {
+            positive_f32(key)?;
+        }
+        let rms_eps = positive_f32("rms_norm_eps")?;
+        let hc_eps = positive_f32("hc_eps")?;
+        let swiglu_limit = positive_f32("swiglu_limit")?;
+        let routed_scaling_factor = positive_f32("routed_scaling_factor")?;
+        let rope_theta = positive_f32("rope_theta")?;
+        let compress_rope_theta = positive_f32("compress_rope_theta")?;
+        let hc_mult = positive(t, "hc_mult")?;
+        let hc_sinkhorn_iters = positive(t, "hc_sinkhorn_iters")?;
+        let experts = positive(t, "n_routed_experts")?;
+        let shared_experts = positive(t, "n_shared_experts")?;
+        let experts_per_tok = positive(t, "num_experts_per_tok")?;
+        ensure!(
+            experts_per_tok <= experts,
+            "num_experts_per_tok exceeds n_routed_experts"
+        );
+        let expert_intermediate = positive(t, "moe_intermediate_size")?;
+        let shared_intermediate = expert_intermediate
+            .checked_mul(shared_experts)
+            .context("shared expert width overflow")?;
+        let index_heads = positive(t, "index_n_heads")?;
+        let index_head_dim = positive(t, "index_head_dim")?;
+        positive(t, "index_topk")?;
+        positive(t, "candidate_topk_blocks")?;
+        positive(t, "candidate_block_size")?;
+        let kv_source_layer_ids = integer_array(t, "kv_source_layer_ids", depth)?;
+        let index_source_layer_ids = integer_array(t, "index_source_layer_ids", depth)?;
+        let candidate_source_layer_id = integer(t, "candidate_source_layer_id")?;
+        ensure!(
+            candidate_source_layer_id < depth,
+            "candidate_source_layer_id outside the layer extent"
+        );
+        let engram_layer_ids = integer_array(t, "engram_layer_ids", depth)?;
+        let engram_num_embeddings = u32_list(t, "engram_num_embeddings")?;
+        ensure!(
+            engram_layer_ids.len() == engram_num_embeddings.len(),
+            "engram_num_embeddings length differs from engram_layer_ids"
+        );
+        let engram_max_ngram_size = positive(t, "engram_max_ngram_size")?;
+        let engram_n_heads = positive(t, "engram_n_heads")?;
+        let engram_head_dim = positive(t, "engram_head_dim")?;
+        positive(t, "engram_vocab_size")?;
+        positive(t, "engram_compressed_vocab_size")?;
+        let engram_pad_token_id = integer(t, "engram_pad_token_id")?;
+        ensure!(
+            engram_pad_token_id < vocab,
+            "engram_pad_token_id outside vocabulary"
+        );
+        let nextn_layers = positive(t, "num_nextn_predict_layers")?;
+        let dspark_experts = positive(t, "dspark_n_routed_experts")?;
+        let dspark_experts_per_tok = positive(t, "dspark_num_experts_per_tok")?;
+        ensure!(
+            dspark_experts_per_tok <= dspark_experts,
+            "dspark_num_experts_per_tok exceeds dspark_n_routed_experts"
+        );
+        let dspark_markov_rank = positive(t, "dspark_markov_rank")?;
+        positive(t, "dspark_block_size")?;
+        let dspark_noise_token_id = integer(t, "dspark_noise_token_id")?;
+        ensure!(
+            dspark_noise_token_id < vocab,
+            "dspark_noise_token_id outside vocabulary"
+        );
+        integer_array(t, "dspark_target_layer_ids", depth)?;
+        let ratios = t
+            .get("compress_ratios")
+            .and_then(Value::as_array)
+            .context("missing/invalid compress_ratios")?;
+        ensure!(
+            ratios.len() == depth as usize + nextn_layers as usize,
+            "compress_ratios length differs from the layer extent"
+        );
+        let compress_ratios: Vec<u8> = ratios
+            .iter()
+            .map(|ratio| {
+                let value = ratio
+                    .as_u64()
+                    .with_context(|| format!("unsupported compress ratio {ratio:?}"))?;
+                ensure!(value <= 2, "unsupported compress ratio {ratio:?}");
+                u8::try_from(value).context("compress ratio outside u8")
+            })
+            .collect::<Result<_>>()?;
+
+        let v = root.get("vision_config").context("missing vision_config")?;
+        exact_keys(
+            v,
+            &[
+                "downsample_ratio",
+                "hidden_size",
+                "intermediate_size",
+                "max_image_tokens",
+                "max_wh_ratio",
+                "min_pixels",
+                "model_type",
+                "num_attention_heads",
+                "num_hidden_layers",
+                "patch_size",
+                "rope_theta",
+            ],
+            "vision_config",
+        )?;
+        equal(v, "model_type", "deepseek_v41_vision".into())?;
+        let vision_layers = positive(v, "num_hidden_layers")?;
+        let vision_hidden = positive(v, "hidden_size")?;
+        positive(v, "num_attention_heads")?;
+        let vision_intermediate = positive(v, "intermediate_size")?;
+        let vision_patch = positive(v, "patch_size")?;
+        let vision_downsample_ratio = positive(v, "downsample_ratio")?;
+        positive(v, "max_image_tokens")?;
+        positive(v, "min_pixels")?;
+        ensure!(
+            v.get("max_wh_ratio").is_none_or(Value::is_null),
+            "unsupported vision max_wh_ratio"
+        );
+        let vision_rope = v
+            .get("rope_theta")
+            .and_then(Value::as_f64)
+            .context("missing/invalid vision rope_theta")?;
+        ensure!(
+            vision_rope.is_finite() && vision_rope > 0.0,
+            "unsupported vision rope_theta"
+        );
+
+        let mut layers = Vec::with_capacity(depth as usize);
+        for index in 0..depth {
+            layers.push(LayerPlan {
+                mixer: Mixer::FullAttention,
+                state_index: index,
+                rope: true,
+                sliding_window: Some(window_size),
+                ffn: FfnKind::Moe,
+            });
+        }
+        let eos_value = generation
+            .get("eos_token_id")
+            .filter(|value| !value.is_null())
+            .or_else(|| root.get("eos_token_id"))
+            .context("missing EOS")?;
+        Ok(Self {
+            abi_version: 1,
+            architecture: Architecture::DeepseekV41,
+            hidden,
+            intermediate: expert_intermediate,
+            vocab,
+            q_heads,
+            kv_heads,
+            head_dim,
+            q_width: q_heads
+                .checked_mul(head_dim)
+                .context("DeepSeek-V4.1 Q width overflows u32")?,
+            max_position,
+            rms_eps,
+            rope_theta,
+            rotary_dim: qk_rope_head_dim,
+            linear_format: LinearFormat::fp8_block(block, safetensors::Dtype::F8_E8M0)?,
+            // Audited FP4 expert scales: one E8M0 scale per 32-element column block of each row.
+            expert_format: Some(ExpertFormat::Fp4E2m1Block {
+                block: [1, block[1]],
+                scale_dtype: safetensors::Dtype::F8_E8M0,
+            }),
+            eos: eos(eos_value, vocab)?,
+            layers,
+            moe: Some(MoeConfig {
+                experts,
+                experts_per_tok,
+                expert_intermediate,
+                shared_intermediate,
+                score: RouterScore::SqrtSoftplus,
+                shared_gate: false,
+            }),
+            gdn: None,
+            glm5_next: None,
+            deepseek_v41: Some(DeepseekV41Config {
+                num_hidden_layers: depth,
+                hc_mult,
+                hc_sinkhorn_iters,
+                hc_eps,
+                window_size,
+                qk_rope_head_dim,
+                q_lora_rank,
+                o_lora_rank,
+                o_groups,
+                compress_ratios,
+                compress_rope_theta,
+                rope_factor,
+                original_max_position,
+                beta_fast,
+                beta_slow,
+                swiglu_limit,
+                routed_scaling_factor,
+                index_heads,
+                index_head_dim,
+                kv_source_layer_ids,
+                index_source_layer_ids,
+                candidate_source_layer_id,
+                engram_layer_ids,
+                engram_num_embeddings,
+                engram_max_ngram_size,
+                engram_n_heads,
+                engram_head_dim,
+                nextn_layers,
+                dspark_experts,
+                dspark_markov_rank,
+                vision_layers,
+                vision_hidden,
+                vision_intermediate,
+                vision_patch,
+                vision_downsample_ratio,
+            }),
             vision: None,
         })
     }
@@ -1873,6 +2368,7 @@ impl ModelSpec {
             moe: text.moe,
             gdn: Some(text.gdn),
             glm5_next: None,
+            deepseek_v41: None,
             vision,
         })
     }

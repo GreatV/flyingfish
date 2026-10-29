@@ -1250,6 +1250,11 @@ impl Engine {
             #[cfg(test)]
             flint_window_capture: None,
             qwen: None,
+            #[cfg(feature = "cuda")]
+            deepseek: None,
+            deepseek_mixer: None,
+            deepseek_ffn: None,
+            deepseek_engram: None,
             recurrent: None,
             moe,
             moe_slots: Some(slots),
@@ -3043,8 +3048,13 @@ fn injected_layers_bind_hybrid_mixer_geometry() -> Result<()> {
         (16, 32, 128, 128, 4)
     );
     for (layer, mixer) in [Mixer::Gdn, Mixer::FullAttention].into_iter().enumerate() {
+        let crate::model::LayerProgram::Standard(stages) =
+            crate::model::layer_program(&spec, layer)?
+        else {
+            anyhow::bail!("hybrid spec must use the standard layer program");
+        };
         assert!(matches!(
-            crate::model::layer_program(&spec, layer)?[1],
+            stages[1],
             crate::model::LayerStage::Mixer(bound) if bound == mixer
         ));
         let plan = crate::linear_plan::LayerDequantPlan::from_manifest(

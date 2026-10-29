@@ -217,6 +217,10 @@ fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
             "hybrid engine does not implement architecture={:?}",
             spec.architecture
         ),
+        Architecture::DeepseekV41 => anyhow::bail!(
+            "hybrid engine does not implement architecture={:?}",
+            spec.architecture
+        ),
     };
     for (name, value, expected) in [
         ("hidden_size", spec.hidden, hidden),
@@ -2176,6 +2180,11 @@ impl Engine {
             resident_ids_len: 0,
             last_input_kind: None,
             qwen: None,
+            #[cfg(feature = "cuda")]
+            deepseek: None,
+            deepseek_mixer: None,
+            deepseek_ffn: None,
+            deepseek_engram: None,
             recurrent: None,
             moe: None,
             moe_slots: None,
@@ -3525,6 +3534,10 @@ impl Engine {
         step: crate::backend::Step<'_>,
         trace: &mut Option<Target<'_>>,
     ) -> Result<bool> {
+        if self.model_spec.architecture == crate::model_spec::Architecture::DeepseekV41 {
+            self.deepseek_ffn_stage(layer, step)?;
+            return Ok(true);
+        }
         let ffn = self
             .qwen
             .as_ref()

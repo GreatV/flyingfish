@@ -343,12 +343,110 @@ pub enum LayerStage {
     Common(crate::backend::Operator),
     Mixer(crate::model_spec::Mixer),
     Ffn,
+    Hc(HcStage),
+}
+
+/// Manifold-constrained hyper-connection stage around a residual branch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HcStage {
+    Pre,
+    Post,
+}
+
+/// mHC sublayer instance owning one fn/base/scale weight triple.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HcSublayer {
+    Attention,
+    Ffn,
+}
+
+/// Pre-mix an HcPre stage collapses the stream with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HcPreSource {
+    /// Pre-mix carried across layers: the previous layer's FFN pre; one-hot on
+    /// copy 0 at the first layer of a forward.
+    Carried,
+    /// This layer's attention pre.
+    AttentionOwn,
+    /// The sublayer's own just-computed pre.
+    Own,
+}
+
+/// Per-model pre-mix source policy of the two HcPre stages: (attention, ffn).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HcPrePolicy {
+    pub attention: HcPreSource,
+    pub ffn: HcPreSource,
+}
+
+/// Pre-mix source policy of an mHC architecture: DeepSeek collapses the
+/// attention stage with the carried pre-mix and the FFN stage with the
+/// attention's own (model.py:978-980); GLM collapses both stages with the
+/// sublayer's own pre (modeling_glm5_next.py:1314-1349), no carried state.
+pub fn hc_pre_policy(architecture: crate::model_spec::Architecture) -> anyhow::Result<HcPrePolicy> {
+    let policy = match architecture {
+        crate::model_spec::Architecture::DeepseekV41 => HcPrePolicy {
+            attention: HcPreSource::Carried,
+            ffn: HcPreSource::AttentionOwn,
+        },
+        crate::model_spec::Architecture::Glm5Next => HcPrePolicy {
+            attention: HcPreSource::Own,
+            ffn: HcPreSource::Own,
+        },
+        other => anyhow::bail!("architecture {other:?} has no mHC pre-source policy"),
+    };
+    Ok(policy)
+}
+
+/// Resolved execution step of one Hc stage of `LayerProgram::Hc`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HcStagePlan {
+    Pre {
+        sublayer: HcSublayer,
+        source: HcPreSource,
+    },
+    Post {
+        sublayer: HcSublayer,
+    },
+}
+
+/// Stage-index plan of the frozen nine-stage program
+/// `[HcPre, Norm, Mixer, HcPost, HcPre, PostNorm, Ffn, HcPost, NextNorm]`
+/// under one architecture's pre-source policy.
+pub fn hc_stage_plan(stage: usize, kind: HcStage, policy: HcPrePolicy) -> Result<HcStagePlan> {
+    let plan = match (stage, kind) {
+        (0, HcStage::Pre) => HcStagePlan::Pre {
+            sublayer: HcSublayer::Attention,
+            source: policy.attention,
+        },
+        (3, HcStage::Post) => HcStagePlan::Post {
+            sublayer: HcSublayer::Attention,
+        },
+        (4, HcStage::Pre) => HcStagePlan::Pre {
+            sublayer: HcSublayer::Ffn,
+            source: policy.ffn,
+        },
+        (7, HcStage::Post) => HcStagePlan::Post {
+            sublayer: HcSublayer::Ffn,
+        },
+        _ => anyhow::bail!(
+            "layer program position {stage} ({kind:?}) is not an mHC stage of the frozen nine-stage program"
+        ),
+    };
+    Ok(plan)
+}
+
+/// Stage order of one transformer layer.
+#[derive(Clone, Copy, Debug)]
+pub enum LayerProgram {
+    Standard([LayerStage; 5]),
+    Hc([LayerStage; 9]),
 }
 
 pub fn layer_program(
     spec: &crate::model_spec::ModelSpec,
     layer: usize,
-) -> anyhow::Result<[LayerStage; 5]> {
+) -> anyhow::Result<LayerProgram> {
     use crate::backend::Operator as O;
     use anyhow::Context;
     let mixer = spec
@@ -356,13 +454,31 @@ pub fn layer_program(
         .get(layer)
         .context("layer outside model plan")?
         .mixer;
-    Ok([
-        LayerStage::Common(O::Norm),
-        LayerStage::Mixer(mixer),
-        LayerStage::Common(O::PostNorm),
-        LayerStage::Ffn,
-        LayerStage::Common(O::NextNorm),
-    ])
+    match spec.architecture {
+        crate::model_spec::Architecture::DeepseekV41 => Ok(LayerProgram::Hc([
+            LayerStage::Hc(HcStage::Pre),
+            LayerStage::Common(O::Norm),
+            LayerStage::Mixer(mixer),
+            LayerStage::Hc(HcStage::Post),
+            LayerStage::Hc(HcStage::Pre),
+            LayerStage::Common(O::PostNorm),
+            LayerStage::Ffn,
+            LayerStage::Hc(HcStage::Post),
+            LayerStage::Common(O::NextNorm),
+        ])),
+        crate::model_spec::Architecture::Llama
+        | crate::model_spec::Architecture::Qwen35Text
+        | crate::model_spec::Architecture::MiniCpmV47
+        | crate::model_spec::Architecture::Flint
+        | crate::model_spec::Architecture::Glm5Next
+        | crate::model_spec::Architecture::LoopVl => Ok(LayerProgram::Standard([
+            LayerStage::Common(O::Norm),
+            LayerStage::Mixer(mixer),
+            LayerStage::Common(O::PostNorm),
+            LayerStage::Ffn,
+            LayerStage::Common(O::NextNorm),
+        ])),
+    }
 }
 
 pub const LLAMA_MIXER: [crate::backend::Operator; 4] = [

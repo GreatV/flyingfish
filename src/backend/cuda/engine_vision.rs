@@ -79,7 +79,8 @@ impl VisionGeometry {
             crate::model_spec::Architecture::Llama
             | crate::model_spec::Architecture::Flint
             | crate::model_spec::Architecture::Glm5Next
-            | crate::model_spec::Architecture::LoopVl => {
+            | crate::model_spec::Architecture::LoopVl
+            | crate::model_spec::Architecture::DeepseekV41 => {
                 bail!("vision configuration requires a multimodal architecture")
             }
         };
@@ -1060,6 +1061,9 @@ impl VisionWeights {
             | Architecture::Glm5Next
             | Architecture::LoopVl => {
                 bail!("vision configuration requires a multimodal architecture")
+            }
+            Architecture::DeepseekV41 => {
+                bail!("DeepSeek-V4.1 vision execution is not bound yet")
             }
         };
         ensure!(
@@ -2169,6 +2173,9 @@ impl VisionRuntime {
             | Architecture::LoopVl => {
                 bail!("vision configuration requires a multimodal architecture")
             }
+            Architecture::DeepseekV41 => {
+                bail!("DeepSeek-V4.1 vision execution is not bound yet")
+            }
         };
         let hidden = geometry.hidden() as usize;
         if cfg!(feature = "cuda") && bilinear.is_some() {
@@ -2230,6 +2237,9 @@ impl VisionRuntime {
                 | Architecture::Glm5Next
                 | Architecture::LoopVl => {
                     bail!("vision configuration requires a multimodal architecture")
+                }
+                Architecture::DeepseekV41 => {
+                    bail!("DeepSeek-V4.1 vision execution is not bound yet")
                 }
             }
             self.io.project_position(

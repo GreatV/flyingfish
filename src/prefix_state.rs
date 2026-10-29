@@ -1107,6 +1107,7 @@ mod tests {
                 conv_kernel: 4,
             }),
             glm5_next: None,
+            deepseek_v41: None,
             vision: None,
         }
     }

@@ -20,3 +20,12 @@ extern "C" __global__ void embed_scale_broadcast(const __nv_bfloat16* w,
     embedded[i] = __float2bfloat16(__bfloat162float(value) * scale);
     broadcast[i] = initial[i % dim];
 }
+
+// One mHC stream row batch: out holds rows*mult embedded rows, row r the
+// mult-fold repeat of token ids[r/mult].
+extern "C" __global__ void embed_streams(const __nv_bfloat16* w, const uint32_t* ids,
+                                         __nv_bfloat16* y, int rows, int mult, int dim) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows * mult * dim)
+        y[i] = w[(uint64_t)ids[i / (mult * dim)] * dim + i % dim];
+}
