@@ -1451,7 +1451,7 @@ impl Runtime {
                             engine.capacity,
                         )?;
                         #[cfg(feature = "cuda")]
-                        flash.bind_position(&work.position)?;
+                        flash.bind_position(&engine.work.position)?;
                         BoundMixer::Gemma {
                             flash,
                             q_norm: weight("self_attn.q_norm.weight")?,
