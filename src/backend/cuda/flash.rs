@@ -317,7 +317,10 @@ impl Flash {
         #[cfg(feature = "rocm")]
         ensure!(score.is_none(), "HIP explicit attention score is not bound");
         #[cfg(feature = "rocm")]
-        ensure!(capacity >= rows, "HIP attention capacity is below query workspace");
+        ensure!(
+            capacity >= rows,
+            "HIP attention capacity is below query workspace"
+        );
         let elements = rows
             .checked_mul(heads)
             .context("prefill LSE extent overflow")?;
