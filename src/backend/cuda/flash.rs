@@ -92,6 +92,7 @@ pub struct Flash {
     shared: u32,
     split: Option<Split>,
     position: u64,
+    position_limit: u32,
 }
 
 struct Split {
@@ -512,13 +513,19 @@ impl Flash {
             shared: dynamic_shared,
             split,
             position: 0,
+            position_limit: 0,
         })
     }
 
-    pub fn bind_position(&mut self, position: &CudaSlice<i32>) -> Result<()> {
+    pub fn bind_position(&mut self, position: &CudaSlice<i32>, limit: usize) -> Result<()> {
         ensure!(position.len() == 1, "attention position must be scalar");
+        ensure!(
+            limit <= i32::MAX as usize,
+            "attention position limit exceeds i32"
+        );
         let (ptr, _position) = position.device_ptr(&self.stream);
         self.position = ptr;
+        self.position_limit = limit as u32;
         Ok(())
     }
 
@@ -699,7 +706,12 @@ impl Flash {
                 q_stride: q_row_stride as u32,
                 q_heads: shape.q_heads as u32,
                 group: (shape.q_heads / shape.kv_heads) as u32,
-                start: shape.start as u32,
+                start: if self.position == 0 {
+                    shape.start as u32
+                } else {
+                    self.position_limit
+                        .min((shape.capacity - shape.rows) as u32)
+                },
                 position: self.position,
             };
             if let Some(split) = &mut self.split {
@@ -932,6 +944,10 @@ mod tests {
     #[ignore = "GPU lease; shared window and explicit score dispatch"]
     fn score_window_binding_gpu() -> Result<()> {
         let ctx = crate::backend::gpu::CudaContext::new(0)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            ctx.disable_event_tracking();
+        }
         let stream = ctx.new_stream()?;
         for (d, hq, hkv, window) in [
             (128, 32, 4, Some(31)),
@@ -949,7 +965,7 @@ mod tests {
                 start: 77,
                 keys: 80,
                 extent: window.unwrap_or(0),
-                capacity: 128,
+                capacity: 640,
                 pitch: hq * d + 128,
                 scale: None,
             };
@@ -1008,47 +1024,49 @@ mod tests {
                 }
             }
             let mut position = stream.clone_htod(&[3i32])?;
-            op.bind_position(&position)?;
-            case.run(&mut op, &mut b)?;
-            stream.synchronize()?;
-            #[cfg(feature = "cuda")]
-            stream.begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )?;
-            #[cfg(feature = "rocm")]
-            let capture = stream.begin_capture()?;
-            case.run(&mut op, &mut b)?;
-            #[cfg(feature = "cuda")]
-            let graph = stream
-                .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                .context("position graph missing")?;
-            #[cfg(feature = "rocm")]
-            let graph = capture.finish()?;
-            for start in [3usize, 109] {
-                stream.memcpy_htod(&[start as i32], &mut position)?;
-                graph.launch()?;
-                let actual = stream.clone_dtoh(&b.out)?;
-                let mut dynamic = case.clone();
-                dynamic.start = start;
-                dynamic.keys = start + case.rows;
-                let expected = uniform_reference(&dynamic, &values);
-                ensure!(
-                    actual
-                        .iter()
-                        .zip(&expected)
-                        .all(|(a, b)| (a.to_f64() - b).abs() <= 0.0078125),
-                    "captured device position differs D={d} start={start}"
-                );
+            for limit in [case.capacity - case.rows, 512] {
+                op.bind_position(&position, limit)?;
                 case.run(&mut op, &mut b)?;
-                let eager = stream.clone_dtoh(&b.out)?;
-                ensure!(actual == eager, "device-position graph/eager differs D={d}");
+                stream.synchronize()?;
+                #[cfg(feature = "cuda")]
+                stream.begin_capture(
+                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )?;
+                #[cfg(feature = "rocm")]
+                let capture = stream.begin_capture()?;
+                case.run(&mut op, &mut b)?;
+                #[cfg(feature = "cuda")]
+                let graph = stream
+                    .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
+                    .context("position graph missing")?;
+                #[cfg(feature = "rocm")]
+                let graph = capture.finish()?;
+                for start in [3usize, 109, 511, 512, 513, 519, 701] {
+                    stream.memcpy_htod(&[start as i32], &mut position)?;
+                    graph.launch()?;
+                    let actual = stream.clone_dtoh(&b.out)?;
+                    let mut dynamic = case.clone();
+                    dynamic.start = start.min(limit);
+                    dynamic.keys = dynamic.start + case.rows;
+                    let expected = uniform_reference(&dynamic, &values);
+                    ensure!(
+                        actual
+                            .iter()
+                            .zip(&expected)
+                            .all(|(a, b)| (a.to_f64() - b).abs() <= 0.0078125),
+                        "captured device position differs D={d} start={start} limit={limit}"
+                    );
+                    case.run(&mut op, &mut b)?;
+                    let eager = stream.clone_dtoh(&b.out)?;
+                    ensure!(actual == eager, "device-position graph/eager differs D={d}");
+                }
             }
             op.position = 0;
             case.run(&mut op, &mut b)?;
             let stale = stream.clone_dtoh(&b.out)?;
             let mut dynamic = case.clone();
-            dynamic.start = 109;
-            dynamic.keys = 112;
+            dynamic.start = 512;
+            dynamic.keys = 515;
             let expected = uniform_reference(&dynamic, &values);
             ensure!(
                 stale
@@ -1058,7 +1076,7 @@ mod tests {
                 "omitted device-position control was not detected D={d}"
             );
             println!(
-                "PASS score_window_binding D={d} heads={hq} kv_heads={hkv} window={window:?} rows=3 device_positions=3,109 graph_eager=true stale_position_rejected=true"
+                "PASS score_window_binding D={d} heads={hq} kv_heads={hkv} window={window:?} rows=3 device_positions=3,109,511,512,513,519,701 limits=637,512 graph_eager=true stale_position_rejected=true"
             );
         }
         Ok(())

@@ -790,7 +790,7 @@ __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
   if (p.position) {
     const int start = *p.position;
     if (start < 0) __trap();
-    p.start = static_cast<uint32_t>(start);
+    p.start = min(static_cast<uint32_t>(start), p.start);
   }
   constexpr int BQ = D == 128 ? 32 : 16;
   constexpr int BK = D == 128 ? 64 : (D == 256 ? 32 : 16);

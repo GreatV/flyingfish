@@ -1455,7 +1455,12 @@ impl Runtime {
                             )?,
                             engine.capacity,
                         )?;
-                        flash.bind_position(&engine.work.position)?;
+                        let position_limit = if layout.sliding_window.is_some() {
+                            engine.state.kv_ring(layout.state_index as usize)?
+                        } else {
+                            engine.capacity - 1
+                        };
+                        flash.bind_position(&engine.work.position, position_limit)?;
                         BoundMixer::Gemma {
                             flash: Box::new(flash),
                             q_norm: weight("self_attn.q_norm.weight")?,
