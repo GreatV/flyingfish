@@ -5232,6 +5232,9 @@ impl Engine {
                         .arg(&(rows as i32))
                         .arg(&(h as i32))
                         .arg(&scale)
+                        .arg(self.weights.embedding())
+                        .arg(&0i32)
+                        .arg(&0i32)
                         .launch(flat(rows * h))?;
                     } else {
                         s.launch_builder(&self.ops.embed)
