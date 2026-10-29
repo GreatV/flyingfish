@@ -926,7 +926,7 @@ mod tests {
                         .count();
                     ensure!(
                         (f64::from(lse[head * case.rows + row]) - (count as f64).ln()).abs()
-                            <= 0.0000051421306608290256,
+                            <= 5.142_130_660_829_025e-6,
                         "shared score/window LSE differs D={d}"
                     );
                 }
