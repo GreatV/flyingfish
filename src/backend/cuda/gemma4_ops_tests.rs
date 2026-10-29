@@ -983,6 +983,20 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
     let maximum = delta.iter().copied().fold(0.0f32, f32::max);
     let rmse = (delta.iter().map(|v| v * v).sum::<f32>() / delta.len() as f32).sqrt();
     println!("GEMMA4_LINEAR_NATIVE_PROBE output_max={maximum} output_rmse={rmse}");
+    for (role, offset) in [
+        ("self_attn.k_proj.weight", 2048usize),
+        ("self_attn.v_proj.weight", 2304),
+    ] {
+        let projected = engine.gemma_linear_probe(role, &native_input)?;
+        let delta: Vec<f32> = projected
+            .iter()
+            .zip(&raw[offset..offset + 256])
+            .map(|(a, b)| (a.to_f32() - b).abs())
+            .collect();
+        let maximum = delta.iter().copied().fold(0.0f32, f32::max);
+        let rmse = (delta.iter().map(|v| v * v).sum::<f32>() / delta.len() as f32).sqrt();
+        println!("GEMMA4_LINEAR_NATIVE_PROBE {role} output_max={maximum} output_rmse={rmse}");
+    }
     trace.set_device(&engine.device_info().name)?;
     trace.save(&runtime.join("native-trace.safetensors"))?;
     let mut defects = 0usize;
