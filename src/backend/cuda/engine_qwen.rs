@@ -20,11 +20,11 @@ pub(super) fn default_chunk(admitted: usize) -> usize {
     admitted.min(CUDA_GRID_YZ_MAX as usize / CHUNK_ALIGNMENT * CHUNK_ALIGNMENT)
 }
 
+use crate::backend::cuda::cubin;
+use crate::backend::cuda::decode::{GqaDecodeInput, SlidingWindow};
 #[cfg(feature = "cuda")]
-use crate::backend::cuda::{
-    cubin,
-    decode::{GqaDecodeInput, SlidingWindow},
-    dsa::{DsaAppendInput, DsaAttentionInput, DsaIndexInput, DsaIndexOutput, DsaPlan},
+use crate::backend::cuda::dsa::{
+    DsaAppendInput, DsaAttentionInput, DsaIndexInput, DsaIndexOutput, DsaPlan,
 };
 use crate::backend::gpu::LaunchConfig;
 use crate::backend::gpu::{CudaFunction, DevicePtr};
