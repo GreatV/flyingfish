@@ -3589,7 +3589,7 @@ impl Engine {
         )?;
         layer.linear.run(
             &self.blas,
-            "self_attn.indexer.index_kpool_compress_gate.weight",
+            "self_attn.indexer.index_kpool_compress_gate",
             phase,
             input,
             &mut TensorMut(matrix(

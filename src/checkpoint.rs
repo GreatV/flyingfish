@@ -2091,6 +2091,175 @@ impl MappedCheckpoint {
 mod component_tests {
     use super::*;
 
+    fn binding_literals<'a>(source: &'a str, begin: &str, end: &str) -> Result<Vec<&'a str>> {
+        let body = source
+            .split_once(begin)
+            .with_context(|| format!("binding census scope missing: {begin}"))?
+            .1
+            .split_once(end)
+            .with_context(|| format!("binding census scope end missing: {end}"))?
+            .0;
+        Ok(body.split('"').skip(1).step_by(2).collect())
+    }
+
+    fn glm_consumer_roles(
+        mixer: crate::model_spec::Mixer,
+        dense: bool,
+    ) -> Result<BTreeSet<String>> {
+        let engine = include_str!("backend/cuda/engine_qwen.rs");
+        let linear = include_str!("backend/cuda/linear.rs");
+        let gdn = include_str!("backend/cuda/gdn.rs");
+        let mut roles = BTreeSet::new();
+        for role in binding_literals(engine, "layers.push(Layer {", "let module =")? {
+            if role.ends_with(".weight") {
+                roles.insert(role.to_owned());
+            }
+        }
+        let hc = binding_literals(
+            engine,
+            "fn take_glm_hc_weights(",
+            "pub(super) struct GlmDsaOutputs",
+        )?;
+        for base in hc.iter().filter(|name| name.starts_with("hc_")) {
+            for suffix in hc.iter().filter_map(|name| name.strip_prefix("{base}")) {
+                roles.insert(format!("{base}{suffix}"));
+            }
+        }
+        let (begin, end) = if mixer == crate::model_spec::Mixer::FullAttention {
+            ("fn glm_dsa_mixer(", "pub(super) fn qwen_mixer(")
+        } else {
+            ("fn project_kda(", "pub(super) fn matrix(")
+        };
+        for role in binding_literals(engine, begin, end)? {
+            if role.starts_with("self_attn.") {
+                roles.insert(role.to_owned());
+            }
+        }
+        if mixer == crate::model_spec::Mixer::FullAttention {
+            let aux = binding_literals(engine, "let aux = |name: &str|", "} else if flint {")?;
+            for role in aux {
+                if let Some(role) = role.strip_prefix("{prefix}") {
+                    if role != "self_attn.{name}" {
+                        roles.insert(role.to_owned());
+                    }
+                } else if role.ends_with(".weight") || role.ends_with(".bias") {
+                    roles.insert(format!("self_attn.{role}"));
+                }
+            }
+        } else {
+            for role in binding_literals(
+                engine,
+                "pub(super) fn qwen_mixer(",
+                "pub(super) fn run_moe_if_bound(",
+            )? {
+                if role.starts_with("self_attn.") {
+                    roles.insert(role.to_owned());
+                }
+            }
+            for role in binding_literals(engine, "Mixer::Gdn => {", "layers.push(Layer {")? {
+                if role.starts_with("self_attn.") && role.ends_with(".weight") {
+                    roles.insert(role.to_owned());
+                }
+            }
+            for role in binding_literals(
+                gdn,
+                "impl GdnDecayWeights {",
+                "pub(crate) enum GdnConvWeights",
+            )? {
+                if let Some(role) = role.strip_prefix("{prefix}") {
+                    roles.insert(format!("self_attn.{role}"));
+                }
+            }
+            for role in binding_literals(
+                gdn,
+                "impl GdnConvWeights {",
+                "pub(crate) struct GdnBindings",
+            )? {
+                if role.ends_with("_conv1d") {
+                    roles.insert(format!("self_attn.{role}.weight"));
+                }
+            }
+        }
+        let ffn = if dense {
+            binding_literals(engine, "O::GateUp => {", "O::Head => {")?
+        } else {
+            binding_literals(linear, "pub fn bind(spec:", "let shared =")?
+        };
+        for role in ffn {
+            if role.starts_with("mlp.") {
+                roles.insert(role.to_owned());
+            }
+        }
+        if !dense {
+            for role in binding_literals(engine, "impl NativeFfn {", "enum BoundMixer")? {
+                if let Some(role) = role.strip_prefix("model.language_model.layers.{layer}.") {
+                    roles.insert(role.to_owned());
+                }
+            }
+        }
+        ensure!(!roles.is_empty(), "empty GLM consumer role census");
+        Ok(roles)
+    }
+
+    #[test]
+    #[ignore = "requires the published GLM safetensors index"]
+    fn glm_production_binding_index() -> Result<()> {
+        let directory = std::env::var_os("FF_GLM_MODEL").context("FF_GLM_MODEL is required")?;
+        let directory = Path::new(&directory);
+        let spec = crate::model_spec::ModelSpec::read(directory)?;
+        ensure!(
+            spec.architecture == crate::model_spec::Architecture::Glm5Next,
+            "GLM census architecture mismatch"
+        );
+        let index: Index = serde_json::from_slice(&std::fs::read(
+            directory.join("model.safetensors.index.json"),
+        )?)?;
+        let mut inventory = BTreeMap::new();
+        MappedCheckpoint::glm5_next_entries(&spec, &mut inventory)?;
+        let mut requested = BTreeSet::new();
+        let mut missing = Vec::new();
+        let mut resolve = |name: String| {
+            if requested.insert(name.clone()) && !index.weight_map.contains_key(&name) {
+                missing.push(name);
+            }
+        };
+        for role in binding_literals(
+            include_str!("backend/cuda/weights.rs"),
+            "pub fn take_globals(",
+            "pub fn load(",
+        )? {
+            if role.starts_with("model.language_model.") || role == "lm_head.weight" {
+                resolve(role.to_owned());
+            }
+        }
+        for (layer, plan) in spec.layers.iter().enumerate() {
+            let prefix = format!("model.language_model.layers.{layer}.");
+            for role in
+                glm_consumer_roles(plan.mixer, plan.ffn == crate::model_spec::FfnKind::Dense)?
+            {
+                resolve(format!("{prefix}{role}"));
+            }
+            for (name, (_, _, scope)) in &inventory {
+                if *scope == TensorScope::Text && name.starts_with(&prefix) {
+                    resolve(name.clone());
+                }
+            }
+        }
+        let first = missing.first().map_or("none", String::as_str);
+        println!(
+            "GLM_BINDING_CENSUS requested={} resolved={} missing={} first_missing={first} layers={} upload_bytes=0",
+            requested.len(),
+            requested.len() - missing.len(),
+            missing.len(),
+            spec.layers.len()
+        );
+        ensure!(
+            missing.is_empty(),
+            "GLM binding requests are missing from the official index: {first}"
+        );
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires the published GLM checkpoint"]
     fn glm_published_native_storage() -> Result<()> {
