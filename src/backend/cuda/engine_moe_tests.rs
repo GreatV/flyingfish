@@ -475,6 +475,10 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
         };
         let expected_placement = placement(5 << 30)?;
         write("proc/meminfo", "MemAvailable: 16777216 kB\n")?;
+        write(
+            "proc/self/limits",
+            "Max resident set unlimited unlimited bytes\n",
+        )?;
         let mounts = "1 0 0:1 / /other rw - cgroup none rw,cpuset\n2 0 0:2 /pod /controllers/memory\\040bank rw - cgroup none rw,cpu,memory\n3 0 0:3 / /sys/fs/cgroup rw - cgroup2 none rw\n";
         write("proc/self/mountinfo", mounts)?;
         write(
@@ -603,13 +607,37 @@ fn expert_host_profile_obeys_the_current_cgroup_limit() -> Result<()> {
             super::host_memory(&root)? == 16 << 30,
             "v2 unlimited bound MemAvailable"
         );
+        write(
+            "proc/self/limits",
+            "Max resident set 6442450944 unlimited bytes\n",
+        )?;
+        write("proc/self/status", "VmRSS: 1048576 kB\n")?;
+        ensure!(
+            super::host_memory(&root)? == 5 << 30,
+            "process resident limit did not bind"
+        );
+        ensure!(
+            placement(super::host_memory(&root)?)? == expected_placement,
+            "process resident limit changed placement for equal headroom"
+        );
+        write("proc/self/status", "VmRSS: 7340032 kB\n")?;
+        ensure!(
+            super::host_memory(&root)? == 0,
+            "exhausted RSS limit admitted"
+        );
+        write("proc/self/status", "VmRSS: invalid kB\n")?;
+        ensure!(super::host_memory(&root).is_err(), "invalid RSS admitted");
+        write(
+            "proc/self/limits",
+            "Max resident set unlimited unlimited bytes\n",
+        )?;
         write("proc/self/cgroup", "2:cpuset:/other\n")?;
         ensure!(
             super::host_memory(&root).is_err(),
             "missing memory hierarchy admitted"
         );
         println!(
-            "PASS host_memory_fixtures v1_finite=true v1_unlimited=true hybrid=true v2_finite=true v2_unlimited=true cache_independent_placement=true shmem_retained=true malformed_stats_rejected=true missing_controller_rejected=true"
+            "PASS host_memory_fixtures v1_finite=true v1_unlimited=true hybrid=true v2_finite=true v2_unlimited=true rss_finite=true rss_exhausted=true cache_independent_placement=true shmem_retained=true malformed_stats_rejected=true missing_controller_rejected=true"
         );
         Ok(())
     })();
