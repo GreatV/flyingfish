@@ -1252,8 +1252,11 @@ impl Engine {
             qwen: None,
             #[cfg(feature = "cuda")]
             deepseek: None,
+            #[cfg(feature = "cuda")]
             deepseek_mixer: None,
+            #[cfg(feature = "cuda")]
             deepseek_ffn: None,
+            #[cfg(feature = "cuda")]
             deepseek_engram: None,
             recurrent: None,
             moe,

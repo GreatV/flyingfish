@@ -607,6 +607,79 @@ pub(super) fn delay_stream(stream: &Arc<CudaStream>) -> Result<()> {
 }
 
 impl Slots {
+    #[cfg(feature = "cuda")]
+    pub(in crate::backend::cuda::engine) fn begin_staging_request(&mut self) -> Result<()> {
+        let geometry = self.catalogue.geometry();
+        self.begin_request(&vec![
+            vec![1.0; geometry.experts as usize];
+            geometry.layers as usize
+        ])
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(in crate::backend::cuda::engine) fn load_staging(
+        device: &Device,
+        model: &crate::model_spec::ModelSpec,
+        manifest: &crate::checkpoint::TensorManifest,
+        directory: &Path,
+        rows: u32,
+    ) -> Result<Self> {
+        let geometry = ExpertGeometry::from_model(model)?;
+        let catalogue = Arc::new(ExpertCatalogue::from_manifest(
+            manifest,
+            geometry,
+            model
+                .expert_format
+                .context("native expert format missing")?,
+        )?);
+        let (free, total) = device.ctx.mem_get_info()?;
+        let device_bytes = free
+            .checked_sub(total / 16)
+            .context("native staging device reserve exceeds free memory")?;
+        let host = host_memory(Path::new("/"))?;
+        let copies = super::super::super::calibrate::copy_engines(device)?;
+        let (capacity, admission) = crate::experts::plan::staging_capacity(
+            geometry,
+            catalogue.layout().clone(),
+            rows,
+            device_bytes as u64,
+            host - host / 16,
+            copies,
+        )?;
+        let frequency = vec![vec![0.0; geometry.experts as usize]; geometry.layers as usize];
+        let initial = crate::experts::plan::initial_residency(
+            &frequency,
+            &capacity.slots_per_layer,
+            &geometry,
+        )?;
+        eprintln!(
+            "{}",
+            serde_json::json!({"native_staging_capacity": {
+                "slot_bytes": capacity.slot_bytes(), "gpu_slots": capacity.slots_total(),
+                "host_blocks": capacity.host_blocks, "spare_blocks": capacity.spare_blocks,
+                "disk_bytes": capacity.disk_bytes, "live_rows": rows, "copy_engines": copies,
+                "host_available_bytes": host, "source": "capacity; GPU compute; native host staging"
+            }})
+        );
+        Self::load(
+            device,
+            None,
+            geometry,
+            Load {
+                capacity: &capacity,
+                admission,
+                initial: &initial,
+                directory,
+                catalogue,
+                engines: copies,
+                max_rows: rows,
+                swiglu_rounding: model.swiglu_rounding(),
+                swiglu_limit: model.swiglu_limit(),
+                routed_weight: model.routed_weight_boundary(),
+            },
+        )
+    }
+
     pub(super) fn load(
         device: &Device,
         peer_device: Option<&Device>,
@@ -1198,6 +1271,136 @@ impl Slots {
             self.apply_move(self.moves[index])?;
         }
         Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn resolve_deepseek(&mut self, layer: u32, ids: &[i32], weights: &[f32]) -> Result<usize> {
+        ensure!(
+            ids.len() == weights.len(),
+            "DeepSeek tier route ids {} and weights {} differ",
+            ids.len(),
+            weights.len()
+        );
+        self.routes.clear();
+        for (choice, (&expert, &weight)) in ids.iter().zip(weights).enumerate() {
+            self.routes.push(crate::experts::runtime::Route {
+                row: u32::try_from(choice / self.catalogue.geometry().top_k as usize)
+                    .context("DeepSeek tier route row overflow")?,
+                choice: u32::try_from(choice).context("DeepSeek tier choice overflow")?,
+                expert: u32::try_from(expert)
+                    .context("DeepSeek tier expert id is negative or too large")?,
+                weight: bf16::from_f32(weight),
+            });
+        }
+        let dispatch = self.policy.dispatch(layer, &self.routes)?;
+        let mut unique: Vec<u32> = dispatch
+            .host_experts
+            .iter()
+            .copied()
+            .chain(dispatch.disk.iter().map(|route| route.expert))
+            .collect();
+        unique.sort_unstable();
+        unique.dedup();
+        let published = self.policy.resolve(layer, &unique)?;
+        let count = published.len();
+        self.moves.clear();
+        for published in published {
+            let source = match (published.from_host, published.source_block) {
+                (true, Some(block)) => MoveSource::Host(block),
+                (false, None) => MoveSource::Disk,
+                other => anyhow::bail!("DeepSeek tier source contract differs: {other:?}"),
+            };
+            self.moves.push(PromptMove {
+                layer: published.layer,
+                expert: published.expert,
+                victim: Some(published.victim),
+                source,
+                dest_block: published.dest_block,
+                dest_wait: published.dest_wait,
+                chain_slot: None,
+                slot: published.slot,
+                generation: published.generation,
+            });
+        }
+        for index in 0..self.moves.len() {
+            self.apply_move(self.moves[index])?;
+        }
+        self.moves.clear();
+        self.refill.record(&self.transfers.h2d)?;
+        Ok(count)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn deepseek_dispatch(&self, layer: u32) -> Result<(Vec<u64>, Vec<u32>)> {
+        let geometry = self.catalogue.geometry();
+        ensure!(
+            layer < geometry.layers,
+            "DeepSeek tier layer {layer} outside {}",
+            geometry.layers
+        );
+        let mut slots = Vec::with_capacity(
+            geometry.experts as usize * crate::backend::cuda::moe::w4a8::W4A8_SLOT_POINTERS,
+        );
+        let mut valid = Vec::with_capacity(geometry.experts as usize);
+        for expert in 0..geometry.experts {
+            if self.policy.ledger().tier(layer, expert)? != Tier::Gpu {
+                slots.extend(std::iter::repeat_n(
+                    0,
+                    crate::backend::cuda::moe::w4a8::W4A8_SLOT_POINTERS,
+                ));
+                valid.push(0);
+                continue;
+            }
+            let physical = self.policy.ledger().slot(layer, expert).and_then(|slot| {
+                self.physical
+                    .get(slot as usize)
+                    .map(|slot| slot.pointer)
+                    .context("DeepSeek tier physical slot outside allocation")
+            })?;
+            let crate::experts::catalogue::ExpertLayout::Fp4E2m1Block(layout, _) =
+                self.catalogue.layout()
+            else {
+                anyhow::bail!("DeepSeek tier catalogue is not the published E2M1 layout")
+            };
+            slots.extend([
+                physical + layout.gate.start,
+                physical + layout.gate_scale.start,
+                physical + layout.up.start,
+                physical + layout.up_scale.start,
+                physical + layout.down.start,
+                physical + layout.down_scale.start,
+            ]);
+            valid.push(1);
+        }
+        Ok((slots, valid))
+    }
+
+    #[cfg(test)]
+    #[cfg(feature = "cuda")]
+    pub(in crate::backend::cuda::engine) fn tier(&self, layer: u32, expert: u32) -> Result<Tier> {
+        self.policy.ledger().tier(layer, expert)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(in crate::backend::cuda::engine) fn wait_refill(
+        &self,
+        stream: &Arc<CudaStream>,
+    ) -> Result<()> {
+        Ok(stream.wait(&self.refill)?)
+    }
+
+    #[cfg(test)]
+    #[cfg(feature = "cuda")]
+    pub(in crate::backend::cuda::engine) fn force_routes(
+        &mut self,
+        layer: u32,
+        ids: &[i32],
+    ) -> Result<usize> {
+        self.begin_token()?;
+        let weights = vec![1.0 / self.catalogue.geometry().top_k as f32; ids.len()];
+        let misses = self.resolve_deepseek(layer, ids, &weights)?;
+        self.finish_token()?;
+        Ok(misses)
     }
 
     fn prepare_routes(&mut self, device: &Device, layer: u32, decode: &Decode) -> Result<()> {
