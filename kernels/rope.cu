@@ -250,8 +250,8 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
               const __nv_bfloat16 s = table[(size_t)position * dim + dim / 2 + d];
               const __nv_bfloat16 a = qkv[base + d];
               const __nv_bfloat16 b = qkv[base + d + dim / 2];
-              const __nv_bfloat16 lo = __hsub(__hmul(a, c), __hmul(b, s));
-              const __nv_bfloat16 hi = __hadd(__hmul(b, c), __hmul(a, s));
+              const __nv_bfloat16 lo = __hsub_rn(__hmul_rn(a, c), __hmul_rn(b, s));
+              const __nv_bfloat16 hi = __hadd_rn(__hmul_rn(b, c), __hmul_rn(a, s));
               qkv[base + d] = lo;
               qkv[base + d + dim / 2] = hi;
               if (head >= q_heads) {
