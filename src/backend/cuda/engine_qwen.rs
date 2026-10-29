@@ -4385,7 +4385,7 @@ impl Engine {
                     };
                     let prep_heads = if reader { 0 } else { hkv };
                     let cache_start = if overflow { history as i32 } else { -1 };
-                    if all_layers(trace) || i == self.trace_layer {
+                    if trace.is_some() && (all_layers(trace) || i == self.trace_layer) {
                         if self.graph.is_none() {
                             s.synchronize()?;
                         }
@@ -4426,7 +4426,7 @@ impl Engine {
                                 shared_mem_bytes: 0,
                             })?;
                     }
-                    if all_layers(trace) || i == self.trace_layer {
+                    if trace.is_some() && (all_layers(trace) || i == self.trace_layer) {
                         if self.graph.is_none() {
                             s.synchronize()?;
                         }
@@ -5370,7 +5370,7 @@ impl Engine {
                             )?;
                         }
                     }
-                    if all_layers(trace) || i == self.trace_layer {
+                    if trace.is_some() && (all_layers(trace) || i == self.trace_layer) {
                         let name = debug_name(trace, i, "post_attention");
                         trace_value(trace, s, &name, &w.x, rows, h)?;
                         let name = debug_name(trace, i, "norm2");
