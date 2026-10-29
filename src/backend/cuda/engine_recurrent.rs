@@ -1280,6 +1280,145 @@ mod tests {
     use safetensors::{Dtype, SafeTensors};
 
     #[test]
+    #[ignore = "authorized GPU window; rotary rounding and KV indexing"]
+    fn recurrent_rotary_rounding_gpu() -> Result<()> {
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        let module = cubin::module(&device.ctx, "rope")?;
+        let rows = 37usize;
+        let dim = 128usize;
+        let capacity = 64usize;
+        let start = 3usize;
+        let pattern = |n: usize, seed: usize| -> Vec<bf16> {
+            (0..n)
+                .map(|i| bf16::from_f32(((i * seed % 4099) as f32 - 2049.0) / 509.0))
+                .collect()
+        };
+        let round = |x: f32| bf16::from_f32(x).to_f32();
+        let mut defects = 0usize;
+        for table_mode in [true, false] {
+            let (qh, kh, stride) = if table_mode {
+                (12, 12, 6144)
+            } else {
+                (16, 8, 4096)
+            };
+            let input = pattern(rows * stride, 37);
+            let mut expected = input.clone();
+            let mut data = s.clone_htod(&input)?;
+            let sentinel = bf16::from_f32(-17.0);
+            let mut expected_k = vec![sentinel; kh * capacity * dim];
+            let mut expected_v = expected_k.clone();
+            let mut k = s.clone_htod(&expected_k)?;
+            let mut v = s.clone_htod(&expected_v)?;
+            let table = pattern(capacity * 2 * dim, 53);
+            let positions: Vec<i32> = (0..2 * rows)
+                .map(|i| {
+                    if i < rows {
+                        (i * 3 % 17) as i32
+                    } else {
+                        (i * 5 % 19) as i32
+                    }
+                })
+                .collect();
+            for row in 0..rows {
+                for head in 0..qh + kh {
+                    for d in 0..dim / 2 {
+                        let off = row * stride + head * dim + d;
+                        let a = input[off].to_f32();
+                        let b = input[off + dim / 2].to_f32();
+                        let (c0, s0, c1, s1) = if table_mode {
+                            let p = (start + row) * 2 * dim + d;
+                            (
+                                table[p].to_f32(),
+                                table[p + dim / 2].to_f32(),
+                                table[p + dim].to_f32(),
+                                table[p + dim + dim / 2].to_f32(),
+                            )
+                        } else {
+                            let x = positions[row] as f32;
+                            let y = positions[rows + row] as f32;
+                            (
+                                round(x.cos()),
+                                round(x.sin()),
+                                round(y.cos()),
+                                round(y.sin()),
+                            )
+                        };
+                        let lo = bf16::from_f32(round(a * c0) - round(b * s0));
+                        let hi = bf16::from_f32(round(b * c1) + round(a * s1));
+                        if !table_mode || head < qh {
+                            expected[off] = lo;
+                            expected[off + dim / 2] = hi;
+                        } else {
+                            let dst = ((head - qh) * capacity + start + row) * dim + d;
+                            expected_k[dst] = lo;
+                            expected_k[dst + dim / 2] = hi;
+                            expected_v[dst] = input[off + kh * dim];
+                            expected_v[dst + dim / 2] = input[off + kh * dim + dim / 2];
+                        }
+                    }
+                }
+            }
+            if table_mode {
+                let function = module.load_function("rope_table_kv")?;
+                let table = s.clone_htod(&table)?;
+                let start = s.clone_htod(&[start as i32])?;
+                unsafe {
+                    s.launch_builder(&function)
+                        .arg(&mut data)
+                        .arg(&mut k)
+                        .arg(&mut v)
+                        .arg(&table)
+                        .arg(&start)
+                        .arg(&(rows as i32))
+                        .arg(&(qh as i32))
+                        .arg(&(kh as i32))
+                        .arg(&(dim as i32))
+                        .arg(&(capacity as i32))
+                        .arg(&(stride as i32))
+                        .launch(flat(rows * (qh + kh) * (dim / 2)))?;
+                }
+            } else {
+                let function = module.load_function("rope_2d_qk")?;
+                let positions = s.clone_htod(&positions)?;
+                unsafe {
+                    s.launch_builder(&function)
+                        .arg(&mut data)
+                        .arg(&positions)
+                        .arg(&(rows as i32))
+                        .arg(&(qh as i32))
+                        .arg(&(kh as i32))
+                        .arg(&(dim as i32))
+                        .arg(&(stride as i32))
+                        .arg(&1.0f32)
+                        .launch(flat(rows * (qh + kh) * (dim / 2)))?;
+                }
+            }
+            for (name, actual, expected) in [
+                ("qkv", s.clone_dtoh(&data)?, expected),
+                ("k", s.clone_dtoh(&k)?, expected_k),
+                ("v", s.clone_dtoh(&v)?, expected_v),
+            ] {
+                let mismatches = actual
+                    .iter()
+                    .zip(&expected)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                println!(
+                    "ROTARY_ROUNDING table={table_mode} buffer={name} rows={rows} stride={stride} bit_mismatches={mismatches} limit=0"
+                );
+                defects += mismatches;
+            }
+        }
+        ensure!(
+            defects == 0,
+            "DEFECT rotary BF16 rounding mismatches={defects}"
+        );
+        println!("PASS recurrent_rotary_rounding_gpu cells=6 bit_mismatches=0");
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "authorized GPU window; shared decode head geometry"]
     fn recurrent_decode_shapes_gpu() -> Result<()> {
         let d = Device::new(0)?;
