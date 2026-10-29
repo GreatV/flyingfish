@@ -52,12 +52,12 @@ extern "C" __global__ void per_layer_input(const uint32_t* ids,
         sum += x * x;
     }
     for (int offset = 16; offset > 0; offset >>= 1)
-        sum += __shfl_xor_sync(0xffffffff, sum, offset);
+        sum += __shfl_xor_sync(FF_WARP_MASK, sum, offset);
     if ((threadIdx.x & 31) == 0) partial[threadIdx.x >> 5] = sum;
     __syncthreads();
     if (threadIdx.x < 4) {
         float x = partial[threadIdx.x];
-        for (int offset = 2; offset > 0; offset >>= 1) x += __shfl_xor_sync(0xf, x, offset);
+        for (int offset = 2; offset > 0; offset >>= 1) x += __shfl_xor_sync(FF_WARP_MASK & 0xf, x, offset);
         if (threadIdx.x == 0) partial[0] = x;
     }
     __syncthreads();
