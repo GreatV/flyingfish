@@ -17,9 +17,9 @@ use crate::backend::cuda::moe::w4a8;
 use crate::backend::cuda::moe::w8a8;
 use crate::backend::cuda::ops::{CommonOpsRef, RmsMode, RmsOptions};
 use crate::backend::cuda::state::LatentRing;
+use crate::backend::gpu::DevicePtr;
 use crate::model::hc_pre_policy;
 use crate::model_spec::{DeepseekV41Config, ModelSpec, RouterScore};
-use cudarc::driver::DevicePtr;
 
 #[path = "engine_deepseek_dsa.rs"]
 mod dsa;
@@ -523,7 +523,7 @@ impl DeepseekMixer {
     /// post-wo_a groups, both for the first `rows` rows.
     pub(crate) fn attn_output_host(
         &self,
-        s: &std::sync::Arc<cudarc::driver::CudaStream>,
+        s: &std::sync::Arc<crate::backend::gpu::CudaStream>,
         rows: usize,
     ) -> Result<(Vec<bf16>, Vec<bf16>)> {
         let q_width = self.geometry.heads * self.geometry.head_dim;
@@ -540,7 +540,7 @@ impl DeepseekMixer {
     /// Host copy of the hidden activation codes and E8M0 scales the projections consume.
     pub(crate) fn activation_codes_host(
         &self,
-        s: &std::sync::Arc<cudarc::driver::CudaStream>,
+        s: &std::sync::Arc<crate::backend::gpu::CudaStream>,
         rows: usize,
         width: usize,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -554,7 +554,7 @@ impl DeepseekMixer {
     /// of `wo_b` weight row `dim` with its per-32 block scales.
     pub(crate) fn wo_b_row_host(
         &self,
-        s: &std::sync::Arc<cudarc::driver::CudaStream>,
+        s: &std::sync::Arc<crate::backend::gpu::CudaStream>,
         layer: usize,
         dim: usize,
     ) -> Result<WoBRow> {
@@ -589,10 +589,11 @@ impl DeepseekMixer {
     /// Host copy of the visible ring slot ids the attention consumed.
     pub(crate) fn visible_slots_host(
         &self,
-        s: &std::sync::Arc<cudarc::driver::CudaStream>,
+        s: &std::sync::Arc<crate::backend::gpu::CudaStream>,
         count: usize,
     ) -> Result<Vec<i32>> {
-        Ok(s.clone_dtoh(&self.slots.slice(..count))?)
+        s.clone_dtoh(&self.slots.slice(..count))
+            .context("DeepSeek device readback")
     }
 
     pub(crate) fn replay_recorded_window(&self, input: RecordedWindowReplay<'_>) -> Result<()> {
@@ -819,16 +820,17 @@ impl DeepseekMixer {
     /// Host copy of the query latent after its norm, before the wq_b quantization.
     pub(crate) fn query_latent_host(
         &self,
-        s: &std::sync::Arc<cudarc::driver::CudaStream>,
+        s: &std::sync::Arc<crate::backend::gpu::CudaStream>,
         rows: usize,
     ) -> Result<Vec<bf16>> {
-        Ok(s.clone_dtoh(&self.q_lora.slice(..rows * self.geometry.q_lora))?)
+        s.clone_dtoh(&self.q_lora.slice(..rows * self.geometry.q_lora))
+            .context("DeepSeek device readback")
     }
 
     /// Host copy of the post-RoPE query rows and the post-RoPE K row of one step.
     pub(crate) fn query_key_host(
         &self,
-        s: &std::sync::Arc<cudarc::driver::CudaStream>,
+        s: &std::sync::Arc<crate::backend::gpu::CudaStream>,
         qkv: &CudaSlice<bf16>,
         rows: usize,
     ) -> Result<(Vec<bf16>, Vec<bf16>)> {
@@ -2866,6 +2868,7 @@ impl Engine {
             .context("DeepSeek-V4.1 geometry missing")?;
         let layers = ds.num_hidden_layers as usize;
         let workspace_rows = settings.spec_budget.rows().min(capacity);
+        #[cfg(feature = "cuda")]
         ensure!(
             requested_chunk.is_none_or(|n| n == workspace_rows),
             "DeepSeek-V4.1 decode rows are {workspace_rows}; chunking is not bound"
@@ -3314,7 +3317,10 @@ impl Engine {
             "DeepSeek-V4.1 fixed setup".into(),
         ));
         let runtime = settings.runtime_dir.clone().unwrap_or_default();
+        #[cfg(feature = "cuda")]
         let mut blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
+        #[cfg(feature = "rocm")]
+        let mut blas = Blas::new(device.stream.clone())?;
         blas.enable_fp8(&device.ctx)?;
         let mut work = Work::new(s, &model_spec, workspace_rows)?;
         mixer.dsa = Some(dsa::Runtime::new(
@@ -3357,8 +3363,11 @@ impl Engine {
             #[cfg(test)]
             flint_legacy_overflow_prefill: false,
             flint_frozen_decode_length: false,
+            #[cfg(feature = "cuda")]
             mtp: None,
+            #[cfg(feature = "cuda")]
             mtp_state: None,
+            #[cfg(feature = "cuda")]
             mtp_epoch: 0,
             images: None,
             weights: Weights {
@@ -3385,7 +3394,9 @@ impl Engine {
             workspace_rows,
             trace_layer: 0,
             position: 0,
+            #[cfg(feature = "cuda")]
             prefix_identity: None,
+            #[cfg(feature = "cuda")]
             prefix_identity_load_ms: 0.0,
             logits_cache: PrefixLogitsCache::default(),
             committed_prefix_ids: Vec::new(),
@@ -3394,15 +3405,33 @@ impl Engine {
             last_input_kind: None,
         };
         if tiered {
-            engine.moe_slots = Some(super::moe::Slots::load_staging(
+            let (slots, admitted_rows) = super::moe::Slots::load_staging(
                 &engine.device,
                 &engine.model_spec,
                 &manifest,
                 dir,
                 u32::try_from(workspace_rows)?,
-            )?);
+            )?;
+            engine.moe_slots = Some(slots);
+            engine.chunk = admitted_rows as usize;
+            engine.workspace_rows = admitted_rows as usize;
+            engine.forward_rows = (1..=admitted_rows as usize).collect();
             engine.device.finish_upload()?;
         }
+        ensure!(
+            requested_chunk.is_none_or(|n| n == engine.chunk),
+            "DeepSeek-V4.1 setup-derived row tile is {}; requested chunk differs",
+            engine.chunk
+        );
+        eprintln!(
+            "{}",
+            serde_json::json!({"deepseek_row_capacity": {
+                "allocated_rows": workspace_rows, "admitted_rows": engine.chunk,
+                "work_bytes_per_row": row_bytes, "dense_bytes": dense_bytes,
+                "state_bytes": engine.state.bytes(), "slot_bytes": slot_bytes,
+                "top_k": geometry.top_k, "layers": geometry.layers
+            }})
+        );
         engine.closure.freeze_fixed()?;
         engine.reset()?;
         engine.closure.ready(started)?;
@@ -4058,13 +4087,11 @@ mod tests {
             }
             if graph {
                 self.device.ctx.synchronize()?;
-                s.begin_capture(
-                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-                )?;
-                launch()?;
-                s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                    .context("source operator graph empty")?
-                    .launch()?;
+                crate::backend::cuda::moe::testing::capture(s, || {
+                    launch()?;
+                    Ok(())
+                })?
+                .launch()?;
             }
             let out = if float_plan.is_some() {
                 s.clone_dtoh(&yf)?
@@ -4149,16 +4176,20 @@ mod tests {
         let device = Device::new(0)?;
         let ops =
             Ops::new_with_swiglu_rounding(&device.ctx, crate::model_spec::SwigluRounding::Twice)?;
+        #[cfg(feature = "cuda")]
         let closure = Rc::new(crate::backend::cuda::closure::Closure::new(
             false,
             "source operator gate".into(),
         ));
+        #[cfg(feature = "cuda")]
         let mut blas = Blas::new(
             &device,
             &ops,
             &PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?),
             closure,
         )?;
+        #[cfg(feature = "rocm")]
+        let mut blas = Blas::new(device.stream.clone())?;
         blas.enable_fp8(&device.ctx)?;
         let runtime = SourceOps {
             common: CommonOpsRef::new(&device.ctx)?,
@@ -4269,13 +4300,10 @@ mod tests {
                 ops.rope_pair_tail(s, &mut xv, tv)?;
                 let eager = s.clone_dtoh(&x)?;
                 s.memcpy_htod(&original, &mut x)?;
-                s.begin_capture(
-                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-                )?;
-                ops.rope_pair_tail(s, &mut xv, tv)?;
-                let graph = s
-                    .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                    .context("source rotary graph empty")?;
+                let graph = crate::backend::cuda::moe::testing::capture(s, || {
+                    ops.rope_pair_tail(s, &mut xv, tv)?;
+                    Ok(())
+                })?;
                 graph.launch()?;
                 let got = s.clone_dtoh(&x)?;
                 let repeat = eager
@@ -4653,11 +4681,10 @@ mod tests {
                 )?;
                 if graph {
                     s.synchronize()?;
-                    s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-                    let launched = runtime.run(s, cell.layer, rows, hc);
-                    let captured = s.end_capture(sys::CUgraphInstantiate_flags(0));
-                    launched?;
-                    captured?.context("empty Engram graph")?.launch()?;
+                    crate::backend::cuda::moe::testing::capture(s, || {
+                        runtime.run(s, cell.layer, rows, hc)
+                    })?
+                    .launch()?;
                 } else {
                     runtime.run(s, cell.layer, rows, hc)?;
                 }
@@ -4693,11 +4720,7 @@ mod tests {
                 };
                 if graph {
                     s.synchronize()?;
-                    s.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-                    let launched = execute();
-                    let captured = s.end_capture(sys::CUgraphInstantiate_flags(0));
-                    launched?;
-                    captured?.context("empty isolated Engram graph")?.launch()?;
+                    crate::backend::cuda::moe::testing::capture(s, &mut execute)?.launch()?;
                 } else {
                     execute()?;
                 }
@@ -5084,7 +5107,7 @@ mod tests {
 
     fn uploaded_sublayer(
         fx: &HcFixture,
-        upload: &Arc<cudarc::driver::CudaStream>,
+        upload: &Arc<crate::backend::gpu::CudaStream>,
     ) -> Result<HcSublayerWeights> {
         Ok(HcSublayerWeights {
             fn_w: testing::upload(upload, upload_f32(&fx.fn_w))?,
@@ -6781,7 +6804,8 @@ mod tests {
                 fixed_routes: Some((ids.to_vec(), weights)),
             })?;
             slots.finish_token()?;
-            Ok(s.clone_dtoh(&work.out.slice(..5120))?)
+            s.clone_dtoh(&work.out.slice(..5120))
+                .context("DeepSeek device readback")
         }
 
         fn evict(engine: &mut Engine, target: u32) -> Result<u32> {
@@ -6927,12 +6951,10 @@ mod tests {
             } = &mut engine;
             let ffn = deepseek_ffn.as_mut().context("DeepSeek-V4.1 FFN missing")?;
             let s = &device.stream;
-            s.begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )?;
-            ffn.route_only(s, 1, &work.n, 0)?;
-            s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                .context("empty DeepSeek route graph")?
+            crate::backend::cuda::moe::testing::capture(s, || {
+                ffn.route_only(s, 1, &work.n, 0)?;
+                Ok(())
+            })?
         };
         route_graph
             .launch()
@@ -6988,12 +7010,10 @@ mod tests {
             } = &mut engine;
             let ffn = deepseek_ffn.as_mut().context("DeepSeek-V4.1 FFN missing")?;
             let s = &device.stream;
-            s.begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )?;
-            ffn.run(s, 1, &work.n, &mut work.out, 0, Accumulator::Fp32)?;
-            s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                .context("empty DeepSeek tier decode graph")?
+            crate::backend::cuda::moe::testing::capture(s, || {
+                ffn.run(s, 1, &work.n, &mut work.out, 0, Accumulator::Fp32)?;
+                Ok(())
+            })?
         };
         decode_graph
             .launch()
@@ -7133,7 +7153,10 @@ mod tests {
         let runtime_dir =
             std::env::temp_dir().join(format!("flyingfish-deepseek-hc-{}", std::process::id()));
         std::fs::create_dir_all(&runtime_dir)?;
+        #[cfg(feature = "cuda")]
         let blas = Blas::new(&device, &ops, &runtime_dir, closure.clone())?;
+        #[cfg(feature = "rocm")]
+        let blas = Blas::new(device.stream.clone())?;
         let state = crate::backend::cuda::state::StateStore::new(&spec, 8, s)?;
         let work = Work::new(s, &spec, ROWS)?;
         let mut runtime = HcRuntime::new(&device.ctx, s, deepseek_hc_binding(&spec)?, 1, ROWS)?;
@@ -7159,8 +7182,11 @@ mod tests {
             moe_test_ffn: None,
             flint_legacy_overflow_prefill: false,
             flint_frozen_decode_length: false,
+            #[cfg(feature = "cuda")]
             mtp: None,
+            #[cfg(feature = "cuda")]
             mtp_state: None,
+            #[cfg(feature = "cuda")]
             mtp_epoch: 0,
             images: None,
             weights: Weights {
@@ -7200,7 +7226,9 @@ mod tests {
             workspace_rows: ROWS,
             trace_layer: 0,
             position: 0,
+            #[cfg(feature = "cuda")]
             prefix_identity: None,
+            #[cfg(feature = "cuda")]
             prefix_identity_load_ms: 0.0,
             logits_cache: PrefixLogitsCache::default(),
             committed_prefix_ids: Vec::new(),
@@ -7504,7 +7532,7 @@ mod tests {
                 s.memcpy_htod(&pre_vals, &mut runtime.mix_pre.slice_mut(..ROWS * MULT))?;
             }
             let runtime = engine.hc.as_ref().unwrap();
-            let mut collapsed = engine.work.x.clone();
+            let mut collapsed = s.alloc_zeros::<bf16>(engine.work.x.len())?;
             runtime.collapse_final(s, ROWS, &mut collapsed)?;
             let got: Vec<bf16> = s.clone_dtoh(&collapsed.slice(..ROWS * HIDDEN))?;
             let mut mean_diffs = 0usize;
@@ -7931,7 +7959,10 @@ mod tests {
         let runtime_dir =
             std::env::temp_dir().join(format!("flyingfish-deepseek-mixer-{}", std::process::id()));
         std::fs::create_dir_all(&runtime_dir)?;
+        #[cfg(feature = "cuda")]
         let mut blas = Blas::new(&device, &ops, &runtime_dir, closure.clone())?;
+        #[cfg(feature = "rocm")]
+        let mut blas = Blas::new(device.stream.clone())?;
         blas.bind_invariant(&device.ctx, MIX_ROWS)?;
         blas.enable_fp8(&device.ctx)?;
         let mut state =
@@ -7989,8 +8020,11 @@ mod tests {
             moe_test_ffn: None,
             flint_legacy_overflow_prefill: false,
             flint_frozen_decode_length: false,
+            #[cfg(feature = "cuda")]
             mtp: None,
+            #[cfg(feature = "cuda")]
             mtp_state: None,
+            #[cfg(feature = "cuda")]
             mtp_epoch: 0,
             images: None,
             weights: Weights {
@@ -8033,7 +8067,9 @@ mod tests {
             workspace_rows: MIX_ROWS,
             trace_layer: 0,
             position: 0,
+            #[cfg(feature = "cuda")]
             prefix_identity: None,
+            #[cfg(feature = "cuda")]
             prefix_identity_load_ms: 0.0,
             logits_cache: PrefixLogitsCache::default(),
             committed_prefix_ids: Vec::new(),
@@ -8775,7 +8811,7 @@ mod tests {
             let ub = testing::upload(&device.upload, mix_bytes(&up))?;
             let mut yb = testing::zeros::<u8>(s, ROWS * WIDTH * 2)?;
             device.finish_upload()?;
-            let dense3 = |slice: &cudarc::driver::CudaSlice<u8>| -> Result<Tensor<bf16, 3>> {
+            let dense3 = |slice: &crate::backend::gpu::CudaSlice<u8>| -> Result<Tensor<bf16, 3>> {
                 weight_view::<bf16, 3>(slice, s, [ROWS as u32, 1, WIDTH as u32], "swiglu input")
             };
             common.gate.swiglu(
@@ -9038,7 +9074,10 @@ mod tests {
         let runtime_dir =
             std::env::temp_dir().join(format!("flyingfish-deepseek-ffn-{}", std::process::id()));
         std::fs::create_dir_all(&runtime_dir)?;
+        #[cfg(feature = "cuda")]
         let blas = Blas::new(&device, &ops, &runtime_dir, closure.clone())?;
+        #[cfg(feature = "rocm")]
+        let blas = Blas::new(device.stream.clone())?;
         let state = crate::backend::cuda::state::StateStore::new(&spec, FF_ROWS + 8, s)?;
         let work = Work::new(s, &spec, FF_ROWS)?;
         let mut ffn = DeepseekFfn::new(&device.ctx, s, &spec, 1, FF_ROWS)?;
@@ -9099,8 +9138,11 @@ mod tests {
             moe_test_ffn: None,
             flint_legacy_overflow_prefill: false,
             flint_frozen_decode_length: false,
+            #[cfg(feature = "cuda")]
             mtp: None,
+            #[cfg(feature = "cuda")]
             mtp_state: None,
+            #[cfg(feature = "cuda")]
             mtp_epoch: 0,
             images: None,
             weights: Weights {
@@ -9143,7 +9185,9 @@ mod tests {
             workspace_rows: FF_ROWS,
             trace_layer: 0,
             position: 0,
+            #[cfg(feature = "cuda")]
             prefix_identity: None,
+            #[cfg(feature = "cuda")]
             prefix_identity_load_ms: 0.0,
             logits_cache: PrefixLogitsCache::default(),
             committed_prefix_ids: Vec::new(),
@@ -11594,7 +11638,8 @@ mod tests {
                     engine.run_hc_stage(0, HcStage::Pre, 0, step)?;
                     engine.run_operator(Operator::Norm, 0, step, &mut None)?;
                     engine.run_mixer(mixer_kind, 0, step, &mut None)?;
-                    Ok(s.clone_dtoh(&engine.work.out.slice(..HIDDEN))?)
+                    s.clone_dtoh(&engine.work.out.slice(..HIDDEN))
+                        .context("DeepSeek device readback")
                 };
             let clean_attn = replay_decode(None, &decode_carried)?;
             let planted_attn = replay_decode(Some((5, 0x7Eu8, 0x89u8)), &decode_carried)?;

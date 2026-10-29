@@ -3086,11 +3086,8 @@ impl Engine {
             resident_ids_len: 0,
             last_input_kind: None,
             qwen: None,
-            #[cfg(feature = "cuda")]
             deepseek_mixer: None,
-            #[cfg(feature = "cuda")]
             deepseek_ffn: None,
-            #[cfg(feature = "cuda")]
             deepseek_engram: None,
             recurrent: None,
             hc: glm_hc,
@@ -4999,7 +4996,6 @@ impl Engine {
         step: crate::backend::Step<'_>,
         trace: &mut Option<Target<'_>>,
     ) -> Result<bool> {
-        #[cfg(feature = "cuda")]
         if self.model_spec.architecture == crate::model_spec::Architecture::DeepseekV41 {
             self.deepseek_ffn_stage(layer, step)?;
             return Ok(true);

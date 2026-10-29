@@ -11,7 +11,7 @@ use crate::backend::cuda::{
     selection::{DsaSelectionPlan, DsaTopKInput, DsaTopKOutput},
     state::{LatentCompressedState, LatentOwners, StateStore},
 };
-use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
+use crate::backend::gpu::{CudaFunction, LaunchConfig, PushKernelArg};
 use std::collections::BTreeMap;
 
 pub(super) type Weights = BTreeMap<String, CudaSlice<u8>>;
@@ -109,7 +109,7 @@ pub(super) fn load_weights(
     Ok(weights)
 }
 
-fn dense<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
+fn dense<T: crate::backend::gpu::DeviceRepr + Copy, const R: usize>(
     data: &CudaSlice<T>,
     s: &Arc<CudaStream>,
     shape: [u32; R],
@@ -1198,14 +1198,10 @@ mod tests {
             Ok(())
         };
         let captured = if graph {
-            s.begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )?;
-            launch()?;
-            Some(
-                s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                    .context("publication graph absent")?,
-            )
+            Some(crate::backend::cuda::moe::testing::capture(&s, || {
+                launch()?;
+                Ok(())
+            })?)
         } else {
             None
         };
@@ -1621,9 +1617,11 @@ mod live_tests {
         let device = Device::new(0)?;
         let s = &device.stream;
         let ops = Ops::new_with_swiglu_rounding(&device.ctx, spec.swiglu_rounding())?;
+        #[cfg(feature = "cuda")]
         let runtime = PathBuf::from(
             std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime directory required")?,
         );
+        #[cfg(feature = "cuda")]
         let mut blas = Blas::new(
             &device,
             &ops,
@@ -1633,6 +1631,8 @@ mod live_tests {
                 "DSA live gate".into(),
             )),
         )?;
+        #[cfg(feature = "rocm")]
+        let mut blas = Blas::new(device.stream.clone())?;
         blas.enable_fp8(&device.ctx)?;
         let mut state = StateStore::new(&spec, 136, s)?;
         state.compressed = Some(LatentCompressedState::new(&spec, 136, 8, s)?);

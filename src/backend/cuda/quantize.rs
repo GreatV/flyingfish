@@ -3,8 +3,8 @@ use super::{
     cubin,
     linear::{Fp8BlockPlan, Fp8Ops, Fp8ScaleRef, LinearWeightRef},
 };
+use crate::backend::gpu::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use anyhow::{Result, ensure};
-use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use half::bf16;
 use std::sync::Arc;
 
@@ -275,8 +275,8 @@ impl Fp4PackPlan {
 mod tests {
     use super::super::contracts::view;
     use super::*;
+    use crate::backend::gpu::DevicePtr;
     use anyhow::Context;
-    use cudarc::driver::DevicePtr;
 
     fn tensor<T: Copy>(ptr: u64, shape: [u32; 2]) -> Result<Tensor<T, 2>> {
         let (stride, count) = dense_layout(shape)?;
@@ -377,8 +377,7 @@ mod tests {
             0,
             0,
         ])?;
-        let (pointer, record) = metadata.device_ptr(&stream);
-        drop(record);
+        let pointer = metadata.device_ptr(&stream).0;
         let views = Fp4PackViews {
             input: view(
                 &input,
@@ -405,15 +404,13 @@ mod tests {
         };
         let plan = Fp4PackPlan::new(ctx, views, cell.block, group)?;
         let captured = if graph {
-            stream.begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )?;
-            plan.run(&stream)?;
-            Some(
-                stream
-                    .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                    .context("FP4 graph empty")?,
-            )
+            Some(crate::backend::cuda::moe::testing::capture(
+                &stream,
+                || {
+                    plan.run(&stream)?;
+                    Ok(())
+                },
+            )?)
         } else {
             None
         };
@@ -578,8 +575,7 @@ mod tests {
         let decoded = stream.clone_htod(&vec![bf16::from_bits(0x42f6); capacity * 6144 + 8])?;
         let mut metadata =
             stream.clone_htod(&[0, c.rows as i32, c.rows as i32, capacity as i32, 1, 0, 0, 0])?;
-        let (sequence, record) = metadata.device_ptr(&stream);
-        drop(record);
+        let sequence = metadata.device_ptr(&stream).0;
         let views = Fp8LookupViews {
             records: view(
                 &records,
@@ -594,8 +590,7 @@ mod tests {
         };
         let plan = Fp8LookupPlan::new(ctx, views)?;
         let decode = cubin::module(ctx, "quantize")?.load_function("fp8_lookup_decode")?;
-        let (decode_ptr, record) = decoded.device_ptr(&stream);
-        drop(record);
+        let decode_ptr = decoded.device_ptr(&stream).0;
         unsafe {
             stream
                 .launch_builder(&decode)
@@ -619,15 +614,13 @@ mod tests {
             "lookup decode guard DEFECT"
         );
         let captured = if graph {
-            stream.begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )?;
-            plan.run(&stream)?;
-            Some(
-                stream
-                    .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                    .context("lookup graph empty")?,
-            )
+            Some(crate::backend::cuda::moe::testing::capture(
+                &stream,
+                || {
+                    plan.run(&stream)?;
+                    Ok(())
+                },
+            )?)
         } else {
             None
         };
@@ -709,8 +702,8 @@ mod tests {
         stream: &Arc<CudaStream>,
         cell: &LookupCell,
         projection: &Fp8LookupProjection,
-        projected: &cudarc::driver::CudaSlice<bf16>,
-        records: &mut cudarc::driver::CudaSlice<u8>,
+        projected: &crate::backend::gpu::CudaSlice<bf16>,
+        records: &mut crate::backend::gpu::CudaSlice<u8>,
         sequence: SeqRef,
     ) -> Result<()> {
         use super::super::gated_residual::{GatedResidualPlan, GatedResidualViews};
@@ -757,15 +750,12 @@ mod tests {
         let normal = stream.clone_dtoh(&out)?;
         let normal_gates = stream.clone_dtoh(&gates)?;
         let kv = stream.clone_dtoh(projected)?;
-        stream.begin_capture(
-            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-        )?;
-        projection.run(stream)?;
-        residual.run(stream)?;
-        stream
-            .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-            .context("lookup residual graph empty")?
-            .launch()?;
+        crate::backend::cuda::moe::testing::capture(stream, || {
+            projection.run(stream)?;
+            residual.run(stream)?;
+            Ok(())
+        })?
+        .launch()?;
         ensure!(
             stream.clone_dtoh(&out)? == normal && stream.clone_dtoh(&gates)? == normal_gates,
             "lookup residual composed graph/eager bits DEFECT"
@@ -888,8 +878,7 @@ mod tests {
             0,
             0,
         ])?;
-        let (ptr, record) = sequence.device_ptr(&stream);
-        drop(record);
+        let ptr = sequence.device_ptr(&stream).0;
         let lookup = Fp8LookupViews {
             records: view(
                 &records,
@@ -940,14 +929,11 @@ mod tests {
                 && stream.clone_dtoh(&prepared_scales)? == cell.scales,
             "lookup projection preparation DEFECT"
         );
-        stream.begin_capture(
-            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-        )?;
-        plan.run(&stream)?;
-        stream
-            .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-            .context("lookup projection graph empty")?
-            .launch()?;
+        crate::backend::cuda::moe::testing::capture(&stream, || {
+            plan.run(&stream)?;
+            Ok(())
+        })?
+        .launch()?;
         ensure!(
             stream.clone_dtoh(&output)? == eager,
             "lookup projection graph/eager bits DEFECT"

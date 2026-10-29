@@ -404,6 +404,27 @@ pub struct PlanInputs<'a> {
     pub wave_rows: u32,
 }
 
+/// Maximum live rows whose distinct routes fit the least-populated layer.
+pub fn staging_rows(
+    geometry: ExpertGeometry,
+    max_rows: u32,
+    slot_bytes: u64,
+    device_bytes: u64,
+) -> Result<u32> {
+    ensure!(
+        max_rows > 0 && geometry.layers > 0 && geometry.top_k > 0 && slot_bytes > 0,
+        "zero native staging row extent"
+    );
+    let per_layer =
+        (device_bytes / slot_bytes / u64::from(geometry.layers)).min(u64::from(geometry.experts));
+    let rows = u64::from(max_rows).min(per_layer / u64::from(geometry.top_k));
+    ensure!(
+        rows > 0,
+        "native GPU capacity cannot hold one complete routed row per layer"
+    );
+    Ok(rows as u32)
+}
+
 /// Native storage capacity with GPU-only arithmetic and one layer of live swaps.
 pub fn staging_capacity(
     geometry: ExpertGeometry,
@@ -1693,6 +1714,21 @@ mod tests {
             &geometry,
         )?;
         let slot = layout.slot_bytes();
+        for (bytes, expected) in [(32u64 << 30, 7u32), (34u64 << 30, 8u32)] {
+            let rows = staging_rows(geometry, 8, slot, bytes)?;
+            assert_eq!(rows, expected);
+            let (capacity, _) =
+                staging_capacity(geometry, layout.clone(), rows, bytes, 24 << 30, 2)?;
+            assert!(capacity.slots_per_layer.iter().all(|&n| n >= 6 * rows));
+            if rows < 8 {
+                assert!(
+                    staging_capacity(geometry, layout.clone(), rows + 1, bytes, 24 << 30, 2)
+                        .is_err()
+                );
+            }
+        }
+        assert_eq!(staging_rows(geometry, 8, slot, 40 * 6 * slot)?, 1);
+        assert!(staging_rows(geometry, 8, slot, 40 * 6 * slot - 1).is_err());
         let (capacity, admission) =
             staging_capacity(geometry, layout.clone(), 16, 80 << 30, 24 << 30, 2)?;
         assert_eq!(capacity.spare_blocks, 96);

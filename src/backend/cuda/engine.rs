@@ -36,7 +36,6 @@ use std::{
     time::Instant,
 };
 
-#[cfg(feature = "cuda")]
 #[path = "engine_deepseek.rs"]
 pub(crate) mod deepseek;
 #[path = "engine_moe.rs"]
@@ -619,11 +618,8 @@ pub struct Engine {
     hidden_capture: Option<HiddenCapture>,
     qwen: Option<qwen::Runtime>,
     recurrent: Option<recurrent::Runtime>,
-    #[cfg(feature = "cuda")]
     deepseek_mixer: Option<deepseek::DeepseekMixer>,
-    #[cfg(feature = "cuda")]
     deepseek_ffn: Option<deepseek::DeepseekFfn>,
-    #[cfg(feature = "cuda")]
     deepseek_engram: Option<deepseek::DeepseekEngram>,
     hc: Option<super::hc::HcRuntime>,
     glm_dsa: Option<qwen::GlmDsaOutputs>,
@@ -1113,11 +1109,8 @@ impl Engine {
             #[cfg(test)]
             flint_window_capture: None,
             qwen: None,
-            #[cfg(feature = "cuda")]
             deepseek_mixer: None,
-            #[cfg(feature = "cuda")]
             deepseek_ffn: None,
-            #[cfg(feature = "cuda")]
             deepseek_engram: None,
             recurrent: None,
             hc: None,
@@ -1256,7 +1249,6 @@ impl Engine {
         let old_rows = self.workspace_rows;
         let old_chunk = self.chunk;
         ensure!(rows >= old_rows, "workspace cannot shrink during load");
-        #[cfg(feature = "cuda")]
         ensure!(
             self.deepseek_engram.is_none() || rows == old_rows,
             "Engram workspace is fixed at setup"
@@ -1267,11 +1259,9 @@ impl Engine {
             if let Some(hc) = &mut self.hc {
                 hc.grow(&self.device.stream, rows)?;
             }
-            #[cfg(feature = "cuda")]
             if let Some(mixer) = &mut self.deepseek_mixer {
                 mixer.grow(&self.device.stream, rows)?;
             }
-            #[cfg(feature = "cuda")]
             if let Some(ffn) = &mut self.deepseek_ffn {
                 ffn.grow(&self.device.stream, rows)?;
             }
@@ -2205,7 +2195,6 @@ impl Engine {
         step: crate::backend::Step<'_>,
         trace: &mut Option<Target<'_>>,
     ) -> Result<()> {
-        #[cfg(feature = "cuda")]
         if let Some(engram) = &self.deepseek_engram {
             engram.run(
                 &self.device.stream,
@@ -2314,7 +2303,6 @@ impl Engine {
                 }
                 Ok(())
             }
-            #[cfg(feature = "cuda")]
             (Architecture::DeepseekV41, _) => self.deepseek_mixer_stage(layer, step),
             _ => anyhow::bail!(
                 "mixer {mixer:?} has no bound layer runtime; Q38 setup is not complete"
@@ -2350,7 +2338,6 @@ impl Engine {
         if self.qwen.is_some() {
             return self.qwen_operator(op, i, step, trace);
         }
-        #[cfg(feature = "cuda")]
         if self.model_spec.architecture == crate::model_spec::Architecture::DeepseekV41 {
             ensure!(
                 trace.is_none(),
@@ -2749,13 +2736,11 @@ impl Engine {
             self.reset_qwen_positions()?;
         }
         self.state.reset(&self.device.stream)?;
-        #[cfg(feature = "cuda")]
         if self.deepseek_ffn.is_some()
             && let Some(slots) = self.moe_slots.as_mut()
         {
             slots.begin_staging_request()?;
         }
-        #[cfg(feature = "cuda")]
         if let Some(engram) = &mut self.deepseek_engram {
             engram.service.reset();
             engram.prepared = None;
@@ -3325,7 +3310,6 @@ impl Engine {
         let end = self.position + ids.len();
         let mut part = 0usize;
         for chunk in ids.chunks(self.chunk) {
-            #[cfg(feature = "cuda")]
             self.prepare_deepseek_engram(chunk, None)?;
             let skip = trace_start.saturating_sub(self.position).min(chunk.len());
             let selected = trace.is_some() && skip < chunk.len();
@@ -3415,7 +3399,6 @@ impl Engine {
             Some(token) => token,
             None => self.token()?,
         };
-        #[cfg(feature = "cuda")]
         self.prepare_deepseek_engram(&[committed_token], None)?;
         if graph {
             {
@@ -5990,6 +5973,16 @@ impl Engine {
         let started = Instant::now();
         let write = mode.writes();
         let model_spec = crate::model_spec::ModelSpec::read(dir)?;
+        if model_spec.architecture == crate::model_spec::Architecture::DeepseekV41 {
+            return Self::load_deepseek(
+                dir,
+                ordinal,
+                capacity,
+                requested_chunk,
+                settings,
+                model_spec,
+            );
+        }
         if model_spec.architecture == crate::model_spec::Architecture::LoopVl {
             return Self::load_recurrent(
                 dir,
@@ -6092,6 +6085,10 @@ impl Engine {
         let mut engine = Self {
             images: None,
             qwen_device_prefix: false,
+            deepseek: None,
+            deepseek_mixer: None,
+            deepseek_ffn: None,
+            deepseek_engram: None,
             qwen: None,
             recurrent: None,
             hc: None,
@@ -6339,6 +6336,13 @@ impl Engine {
         Ok(())
     }
     fn ensure_decode(&self) -> Result<()> {
+        if self.model_spec.architecture == crate::model_spec::Architecture::DeepseekV41 {
+            return self
+                .deepseek_mixer
+                .as_ref()
+                .context("DeepSeek-V4.1 decode native mixer is not bound")?
+                .check_decode_ready();
+        }
         if self.qwen.is_some() {
             return Ok(());
         }

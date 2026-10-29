@@ -35,8 +35,8 @@
 // __trap() guards: grid beyond rows, mult below 2, hidden or iters below 1,
 // non-positive eps or norm_eps. mhc_update additionally traps on a rounding
 // or orientation mode above 1.
-#include <cuda_bf16.h>
-#include <math_constants.h>
+#include "gpu_compat.cuh"
+#include <math.h>
 #include <stdint.h>
 
 #define MHC_THREADS 256
@@ -53,12 +53,12 @@ __device__ __forceinline__ float mhc_block_sum(float value, float* s_red) {
   const int warp = threadIdx.x >> 5;
   const int nwarp = (int)blockDim.x >> 5;
   float v = value;
-  for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffffu, v, off);
+  for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(FF_WARP_MASK, v, off);
   if (lane == 0) s_red[warp] = v;
   __syncthreads();
   if (warp == 0) {
     float w = lane < nwarp ? s_red[lane] : 0.0f;
-    for (int off = 16; off > 0; off >>= 1) w += __shfl_down_sync(0xffffffffu, w, off);
+    for (int off = 16; off > 0; off >>= 1) w += __shfl_down_sync(FF_WARP_MASK, w, off);
     if (lane == 0) s_red[0] = w;
   }
   __syncthreads();
@@ -121,7 +121,7 @@ __device__ __forceinline__ void mhc_mixes_body(
                                base[2 * mult + j * mult + k];
 
     for (int j = 0; j < mult; ++j) {
-      float mx = -CUDART_INF_F;
+      float mx = -INFINITY;
       for (int k = 0; k < mult; ++k) mx = fmaxf(mx, s_comb[j * mult + k]);
       float rowsum = 0.0f;
       for (int k = 0; k < mult; ++k) {

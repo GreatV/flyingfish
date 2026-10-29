@@ -6,9 +6,10 @@ using Bf16Fragment = short __attribute__((ext_vector_type(16)));
 using AccFragment = float __attribute__((ext_vector_type(8)));
 
 // Four wave32 groups reduce disjoint K intervals; W[out,ldw], X[m,in], Y[m,out].
-extern "C" __global__ __launch_bounds__(128) void gemm_skinny_bf16(
+template<typename Output>
+__device__ __forceinline__ void gemm_skinny_hip(
     const bf16* __restrict__ W, const bf16* __restrict__ X,
-    bf16* __restrict__ Y, const bf16* __restrict__ bias,
+    Output* __restrict__ Y, const bf16* __restrict__ bias,
     int out_features, int in_features, unsigned long ldw, int m) {
     if (blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 ||
         gridDim.x != (out_features + 15) / 16 || gridDim.y != 1 || gridDim.z != 1 ||
@@ -61,10 +62,22 @@ extern "C" __global__ __launch_bounds__(128) void gemm_skinny_bf16(
 #pragma unroll
             for (int w = 0; w < 4; ++w) sum += partials[w * 256 + cell];
             if (bias) sum += __bfloat162float(bias[output]);
-            Y[(size_t)row * out_features + output] = __float2bfloat16(sum);
+            if constexpr (__is_same(Output, float)) Y[(size_t)row * out_features + output] = sum;
+            else Y[(size_t)row * out_features + output] = __float2bfloat16(sum);
         }
     }
 }
+extern "C" __global__ __launch_bounds__(128) void gemm_skinny_bf16(
+    const bf16* W, const bf16* X, bf16* Y, const bf16* bias,
+    int out_features, int in_features, unsigned long ldw, int m) {
+    gemm_skinny_hip(W, X, Y, bias, out_features, in_features, ldw, m);
+}
+extern "C" __global__ __launch_bounds__(128) void gemm_skinny_bf16_f32(
+    const bf16* W, const bf16* X, float* Y,
+    int out_features, int in_features, unsigned long ldw, int m) {
+    gemm_skinny_hip(W, X, Y, nullptr, out_features, in_features, ldw, m);
+}
+
 #else
 // Skinny GEMM on bf16 tensor cores: M activation rows share one streaming weight read.
 //   Y[m, out] = X[m, in] @ W[out, in]^T

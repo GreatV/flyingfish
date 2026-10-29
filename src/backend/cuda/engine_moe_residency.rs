@@ -607,7 +607,6 @@ pub(super) fn delay_stream(stream: &Arc<CudaStream>) -> Result<()> {
 }
 
 impl Slots {
-    #[cfg(feature = "cuda")]
     pub(in crate::backend::cuda::engine) fn begin_staging_request(&mut self) -> Result<()> {
         let geometry = self.catalogue.geometry();
         self.begin_request(&vec![
@@ -616,14 +615,13 @@ impl Slots {
         ])
     }
 
-    #[cfg(feature = "cuda")]
     pub(in crate::backend::cuda::engine) fn load_staging(
         device: &Device,
         model: &crate::model_spec::ModelSpec,
         manifest: &crate::checkpoint::TensorManifest,
         directory: &Path,
         rows: u32,
-    ) -> Result<Self> {
+    ) -> Result<(Self, u32)> {
         let geometry = ExpertGeometry::from_model(model)?;
         let catalogue = Arc::new(ExpertCatalogue::from_manifest(
             manifest,
@@ -633,9 +631,20 @@ impl Slots {
                 .context("native expert format missing")?,
         )?);
         let (free, total) = device.ctx.mem_get_info()?;
+        #[cfg(feature = "cuda")]
+        let reserve = total / 16;
+        #[cfg(feature = "rocm")]
+        let reserve = total.div_ceil(12);
         let device_bytes = free
-            .checked_sub(total / 16)
+            .checked_sub(reserve)
             .context("native staging device reserve exceeds free memory")?;
+        #[cfg(feature = "rocm")]
+        let rows = crate::experts::plan::staging_rows(
+            geometry,
+            rows,
+            catalogue.slot_bytes(),
+            device_bytes as u64,
+        )?;
         let host = host_memory(Path::new("/"))?;
         let copies = super::super::super::calibrate::copy_engines(device)?;
         let (capacity, admission) = crate::experts::plan::staging_capacity(
@@ -655,13 +664,15 @@ impl Slots {
         eprintln!(
             "{}",
             serde_json::json!({"native_staging_capacity": {
-                "slot_bytes": capacity.slot_bytes(), "gpu_slots": capacity.slots_total(),
+                "slot_bytes": capacity.slot_bytes(), "device_free_bytes": free,
+                "device_total_bytes": total, "device_reserve_bytes": reserve,
+                "device_fixed_or_external_bytes": total - free, "gpu_slots": capacity.slots_total(),
                 "host_blocks": capacity.host_blocks, "spare_blocks": capacity.spare_blocks,
                 "disk_bytes": capacity.disk_bytes, "live_rows": rows, "copy_engines": copies,
                 "host_available_bytes": host, "source": "capacity; GPU compute; native host staging"
             }})
         );
-        Self::load(
+        let slots = Self::load(
             device,
             None,
             geometry,
@@ -677,7 +688,8 @@ impl Slots {
                 swiglu_limit: model.swiglu_limit(),
                 routed_weight: model.routed_weight_boundary(),
             },
-        )
+        )?;
+        Ok((slots, rows))
     }
 
     pub(super) fn load(
@@ -1273,7 +1285,6 @@ impl Slots {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     pub fn resolve_native(&mut self, layer: u32, ids: &[i32], weights: &[f32]) -> Result<usize> {
         ensure!(
             ids.len() == weights.len(),
@@ -1330,7 +1341,6 @@ impl Slots {
         Ok(count)
     }
 
-    #[cfg(feature = "cuda")]
     pub fn native_dispatch(&self, layer: u32) -> Result<(Vec<u64>, Vec<u32>)> {
         let geometry = self.catalogue.geometry();
         ensure!(
@@ -1384,21 +1394,20 @@ impl Slots {
     }
 
     #[cfg(test)]
-    #[cfg(feature = "cuda")]
     pub(in crate::backend::cuda::engine) fn tier(&self, layer: u32, expert: u32) -> Result<Tier> {
         self.policy.ledger().tier(layer, expert)
     }
 
-    #[cfg(feature = "cuda")]
     pub(in crate::backend::cuda::engine) fn wait_refill(
         &self,
         stream: &Arc<CudaStream>,
     ) -> Result<()> {
-        Ok(stream.wait(&self.refill)?)
+        stream
+            .wait(&self.refill)
+            .context("native expert refill event")
     }
 
     #[cfg(test)]
-    #[cfg(feature = "cuda")]
     pub(in crate::backend::cuda::engine) fn force_routes(
         &mut self,
         layer: u32,

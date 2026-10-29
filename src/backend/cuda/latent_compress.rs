@@ -1,7 +1,7 @@
 use crate::backend::cuda::contracts::{SeqRef, Tensor, dense_layout, spans_disjoint};
 use crate::backend::cuda::cubin;
+use crate::backend::gpu::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use half::bf16;
 use std::sync::Arc;
 
@@ -163,7 +163,7 @@ impl LatentCompressPlan {
 mod tests {
     use super::*;
     use crate::backend::cuda::contracts::view;
-    use cudarc::driver::DevicePtr;
+    use crate::backend::gpu::DevicePtr;
 
     fn tensor<T: Copy, const R: usize>(ptr: u64, shape: [u32; R]) -> Result<Tensor<T, R>> {
         let (stride, count) = dense_layout(shape)?;
@@ -314,8 +314,7 @@ mod tests {
                 0,
                 0,
             ])?;
-            let (pointer, record) = metadata.device_ptr(&stream);
-            drop(record);
+            let pointer = metadata.device_ptr(&stream).0;
             let count = rows.div_ceil(2) * 512;
             let sentinel = bf16::from_f32(31.0);
             let output = stream.clone_htod(&vec![sentinel; count + 8])?;
@@ -341,13 +340,10 @@ mod tests {
                 stream.memcpy_htod(&vec![19.0; 1024], &mut tail_values)?;
             }
             if graph {
-                stream.begin_capture(
-                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-                )?;
-                plan.run(&stream)?;
-                let captured = stream
-                    .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                    .context("compression graph capture was empty")?;
+                let captured = crate::backend::cuda::moe::testing::capture(&stream, || {
+                    plan.run(&stream)?;
+                    Ok(())
+                })?;
                 captured.launch()?;
             } else {
                 plan.run(&stream)?;

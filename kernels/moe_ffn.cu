@@ -394,7 +394,6 @@ MOE_INVARIANT_DOWN(moe_ffn_down_w8a16_lane16, unsigned char, true)
 
 #undef FD_GUARD_MOE_GATE_UP
 #undef FD_GUARD_MOE_DOWN
-#if !defined(__HIP__)
 
 // ---------------------------------------------------------------------------
 // W4A8 routed experts: E2M1 weights with one E8M0 scale per 32 elements of
@@ -438,7 +437,7 @@ __device__ __forceinline__ float moe_e2m1(unsigned nibble) {
 __device__ __forceinline__ float moe_warp_sum(float v) {
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1)
-    v += __shfl_xor_sync(0xffffffffu, v, off);
+    v += __shfl_xor_sync(FF_WARP_MASK, v, off);
   return v;
 }
 
@@ -685,8 +684,8 @@ __device__ __forceinline__ float moe_w8a8_dot(
       for (int i = 0; i < W8A8_LANE_ELEMS; ++i)
         sum = fmaf(e4m3_decode(w[i]), e4m3_decode(a[i]), sum);
     }
-    sum += __shfl_xor_sync(0xffffffffu, sum, 1, 4);
-    sum += __shfl_xor_sync(0xffffffffu, sum, 2, 4);
+    sum += __shfl_xor_sync(FF_WARP_MASK, sum, 1, 4);
+    sum += __shfl_xor_sync(FF_WARP_MASK, sum, 2, 4);
     if (sub == 0 && block < groups) {
       const float scale =
           e8m0_decode(act_scales[block]) * e8m0_decode(weight_scales[block]);
@@ -807,4 +806,3 @@ extern "C" __global__ void moe_ffn_weight_f32(
   if (col == 0) done[assignment] = 1;
 }
 
-#endif

@@ -12,7 +12,6 @@ use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::sync::Arc;
 /// Native BF16 operands with an unrounded FP32 output on the shared skinny tile.
-#[cfg(feature = "cuda")]
 pub struct Bf16F32Plan {
     kernel: CudaFunction,
     input: Tensor<bf16, 2>,
@@ -21,7 +20,6 @@ pub struct Bf16F32Plan {
     shape: [i32; 3],
 }
 
-#[cfg(feature = "cuda")]
 fn bf16_f32_shape(
     input: Tensor<bf16, 2>,
     weight: Tensor<bf16, 2>,
@@ -68,7 +66,6 @@ fn bf16_f32_shape(
     Ok([rows as i32, columns as i32, width as i32])
 }
 
-#[cfg(feature = "cuda")]
 impl Bf16F32Plan {
     pub fn new(
         ctx: &Arc<CudaContext>,
@@ -100,10 +97,10 @@ impl Bf16F32Plan {
                 .arg(&width)
                 .arg(&leading)
                 .arg(&rows)
-                .launch(cudarc::driver::LaunchConfig {
+                .launch(crate::backend::gpu::LaunchConfig {
                     grid_dim: ((columns as u32).div_ceil(16), 1, 1),
                     block_dim: (128, 1, 1),
-                    shared_mem_bytes: 40960,
+                    shared_mem_bytes: if cfg!(feature = "cuda") { 40960 } else { 0 },
                 })?;
         }
         Ok(())
@@ -124,7 +121,6 @@ pub(crate) enum Fp8ScaleRef {
 }
 
 impl Fp8ScaleRef {
-    #[cfg(feature = "cuda")]
     fn ptr(self) -> u64 {
         match self {
             Self::Bf16(t) => t.ptr,
@@ -133,7 +129,6 @@ impl Fp8ScaleRef {
         }
     }
 
-    #[cfg(feature = "cuda")]
     fn disjoint<T: Copy>(self, other: &Tensor<T, 2>) -> Result<()> {
         match self {
             Self::Bf16(t) => disjoint(&t, other),
@@ -236,12 +231,10 @@ pub(crate) struct Fp8Ops {
     #[cfg(feature = "rocm")]
     context: Arc<CudaContext>,
     fake_quant: CudaFunction,
-    #[cfg(feature = "cuda")]
     native_block: [[CudaFunction; 2]; 2],
 }
 
 /// Bound native codes/scales and prepared activations; storage remains caller-owned.
-#[cfg(feature = "cuda")]
 pub(crate) struct Fp8BlockPlan {
     kernel: CudaFunction,
     grid: crate::backend::gpu::LaunchConfig,
@@ -249,7 +242,6 @@ pub(crate) struct Fp8BlockPlan {
     shape: [i32; 3],
 }
 
-#[cfg(feature = "cuda")]
 impl Fp8BlockPlan {
     pub(crate) fn run(&self, stream: &Arc<CudaStream>) -> Result<()> {
         unsafe {
@@ -270,7 +262,6 @@ impl Fp8BlockPlan {
 }
 
 impl Fp8Ops {
-    #[cfg(feature = "cuda")]
     pub(crate) fn bind_block(
         &self,
         weight: LinearWeightRef,
@@ -410,6 +401,16 @@ impl Fp8Ops {
             block,
             context: ctx.clone(),
             fake_quant: module.load_function("e4m3_fake_quant_bf16")?,
+            native_block: [
+                [
+                    module.load_function("fp8_block_f32_128_decode")?,
+                    module.load_function("fp8_block_f32_128_mma")?,
+                ],
+                [
+                    module.load_function("fp8_block_e8m0_32_decode")?,
+                    module.load_function("fp8_block_e8m0_32_mma")?,
+                ],
+            ],
         })
     }
 
@@ -1329,7 +1330,6 @@ mod tests {
     use crate::op_contract::ExecutionPhase;
     use std::{path::PathBuf, rc::Rc};
 
-    #[cfg(feature = "cuda")]
     #[test]
     fn bf16_f32_projection_bounds() -> Result<()> {
         use super::super::contracts::dense_layout;
@@ -1355,7 +1355,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "requires GPU lease; native BF16 weights with FP32 projection output"]
     fn bf16_f32_projection_gpu() -> Result<()> {
@@ -1409,14 +1408,7 @@ mod tests {
                     && eager[rows as usize * N..].iter().all(|&v| v == 127.0),
                 "BF16 F32 projection exact/guard DEFECT rows={rows}"
             );
-            stream.begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )?;
-            plan.run(&stream)?;
-            stream
-                .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                .context("F32 projection graph empty")?
-                .launch()?;
+            super::super::moe::testing::capture(&stream, || plan.run(&stream))?.launch()?;
             ensure!(
                 stream.clone_dtoh(&output)? == eager,
                 "F32 projection graph bits DEFECT rows={rows}"
@@ -1485,12 +1477,10 @@ mod tests {
             .collect()
     }
 
-    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "GPU native FP8 block-scale linear correctness"]
     fn fp8_native_block_linear_matches_fp64() -> Result<()> {
         use crate::fp8::Fp8BlockScale;
-        use cudarc::driver::sys;
         use safetensors::Dtype;
         let device = Device::new(0)?;
         let stream = &device.stream;
@@ -1635,13 +1625,8 @@ mod tests {
                     device.finish_upload()?;
                     for graph in [false, true] {
                         if graph {
-                            stream.begin_capture(
-                                sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-                            )?;
-                            let result = plan.run(stream);
-                            let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
-                            result?;
-                            captured?.context("empty native FP8 graph")?.launch()?;
+                            super::super::moe::testing::capture(stream, || plan.run(stream))?
+                                .launch()?;
                         } else {
                             plan.run(stream)?;
                         }

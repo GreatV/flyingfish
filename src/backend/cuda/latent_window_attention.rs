@@ -11,8 +11,8 @@
 //! wo_a group projection of the quantized attention output.
 use crate::backend::cuda::contracts::{Tensor, TensorMut, dense_layout, no_overlap};
 use crate::backend::cuda::cubin;
+use crate::backend::gpu::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use anyhow::{Result, ensure};
-use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use half::bf16;
 use std::sync::Arc;
 
@@ -1318,8 +1318,8 @@ pub(super) mod certificate;
 mod indexed_tests {
     use super::*;
     use crate::backend::cuda::contracts::{SeqRef, view};
+    use crate::backend::gpu::DevicePtr;
     use anyhow::Context;
-    use cudarc::driver::DevicePtr;
 
     #[derive(serde::Deserialize)]
     struct Cell {
@@ -1419,13 +1419,10 @@ mod indexed_tests {
             0,
         )?;
         if graph {
-            s.begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )?;
-            plan.run(&s)?;
-            let captured = s
-                .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                .context("indexed graph missing")?;
+            let captured = crate::backend::cuda::moe::testing::capture(&s, || {
+                plan.run(&s)?;
+                Ok(())
+            })?;
             captured.launch()?;
         } else {
             plan.run(&s)?;
