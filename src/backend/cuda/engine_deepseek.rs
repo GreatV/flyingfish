@@ -314,19 +314,6 @@ impl DeepseekEngram {
         Ok(())
     }
 }
-/// DeepSeek-V4.1 binding of the shared mHC runtime: the fn projection stays
-/// in its published F32 storage, the update rounds once at the output, the
-/// comb applies plain, the stream RMS epsilon is rms_eps, and the pre-source
-/// policy is the architecture's (carried attention, attention-own FFN).
-/// The DeepSeek RMS-norm contract: F32 arithmetic with one BF16 rounding at the store.
-/// `FF_DS41_NORM_LEGACY` selects the pre-fix contract for the mode-0 control run.
-fn deepseek_rms_mode() -> RmsMode {
-    if std::env::var_os("FF_DS41_NORM_LEGACY").is_some() {
-        return RmsMode::Standard;
-    }
-    RmsMode::Unrounded
-}
-
 pub fn deepseek_hc_binding(spec: &crate::model_spec::ModelSpec) -> Result<HcBinding> {
     let ds = spec
         .deepseek_v41
@@ -1238,7 +1225,7 @@ impl DeepseekMixer {
         #[cfg(test)]
         capture_query("q_a", &self.q_lora, g.q_lora)?;
         let options = RmsOptions {
-            mode: deepseek_rms_mode(),
+            mode: RmsMode::Unrounded,
             eps: self.eps,
         };
         let lora3 = view(
@@ -1377,13 +1364,7 @@ impl DeepseekMixer {
             [(g.head_dim / 32) as u64, 1],
         )?);
         let sink = weight_view::<f32, 1>(&weights.attn_sink, s, [g.heads as u32], "attn_sink")?;
-        // 0 is the definition's attention boundaries; 1 is the pre-fix arithmetic, for the
-        // gate's control.
-        let p_mode: i32 = if std::env::var_os("FF_DS41_LWA_FP32_P").is_some() {
-            1
-        } else {
-            0
-        };
+        let p_mode: i32 = 0;
         for row in 0..rows {
             let position = position + row;
             self.ops.ring_write(
@@ -2184,7 +2165,7 @@ impl DeepseekFfn {
             weight,
             &mut n3,
             RmsOptions {
-                mode: deepseek_rms_mode(),
+                mode: RmsMode::Unrounded,
                 eps: self.eps,
             },
         )
@@ -2238,7 +2219,7 @@ impl DeepseekFfn {
             weight,
             &mut n3,
             RmsOptions {
-                mode: deepseek_rms_mode(),
+                mode: RmsMode::Unrounded,
                 eps: self.eps,
             },
         )
@@ -2944,22 +2925,17 @@ impl Engine {
             "DeepSeek-V4.1 dense resident weights/workspace exceed the device memory budget",
         )?;
         let admitted_total = available / slot_bytes;
-        let uniform = (admitted_total / layers.max(1)).min(geometry.experts as usize);
-        let tiered = std::env::var("FF_DS41_EXPERT_TIERS").as_deref() == Ok("1");
-        // Gate-load scope (not a production placement knob): one selected
-        // layer's complete expert set is admitted first; the remaining layers
-        // share the leftover admission as a uniform prefix. Requires the total
-        // budget to hold one full layer plus at least one expert per
-        // remaining layer.
-        let legacy_layer0_full =
-            std::env::var("FF_DS41_LAYER0_FULL_RESIDENCY").as_deref() == Ok("1");
+        #[cfg(test)]
         let full_residency_layer = match std::env::var("FF_DS41_FULL_RESIDENCY_LAYER") {
             Ok(value) => value
                 .parse::<usize>()
                 .context("FF_DS41_FULL_RESIDENCY_LAYER must be a layer index")?,
-            Err(_) if legacy_layer0_full => 0,
-            Err(_) => usize::MAX,
+            Err(std::env::VarError::NotPresent) => usize::MAX,
+            Err(error) => return Err(error.into()),
         };
+        #[cfg(not(test))]
+        let full_residency_layer = usize::MAX;
+        let tiered = full_residency_layer == usize::MAX;
         if full_residency_layer != usize::MAX {
             ensure!(
                 full_residency_layer < layers,
@@ -2978,7 +2954,7 @@ impl Engine {
                 }})
             );
             (0, 0)
-        } else if full_residency {
+        } else {
             let leftover = admitted_total.saturating_sub(geometry.experts as usize);
             let rest_prefix = if std::env::var_os("FF_DS41_LAYERS_LAYER").is_some() {
                 1
@@ -3005,26 +2981,12 @@ impl Engine {
                 }})
             );
             (geometry.experts as usize, rest_prefix)
-        } else {
-            (uniform, uniform)
         };
         if !tiered {
             ensure!(
                 resident_experts > 0,
                 "DeepSeek-V4.1 routed-expert residency admits zero of the {} bytes/expert; the tiered expert service is not bound (dense fixed bytes {fixed})",
                 slot_bytes
-            );
-        }
-        if !full_residency && !tiered {
-            eprintln!(
-                "{}",
-                serde_json::json!({"deepseek_routed_residency": {
-                    "experts_per_layer": resident_experts,
-                    "of": geometry.experts,
-                    "slot_bytes": slot_bytes,
-                    "dense_bytes": dense_bytes,
-                    "tiered_service": "not bound; decode traps when routed outside the resident prefix"
-                }})
             );
         }
         let mix = MixerGeometry::new(&model_spec)?;
@@ -3695,8 +3657,7 @@ mod tests {
     #[ignore = "full-model composition; clean isolated-layer gates and live compressed-state binding required"]
     fn deepseek_composition_gpu() -> Result<()> {
         ensure!(
-            std::env::var("FF_DS41_GPU_WINDOW").as_deref() == Ok("granted")
-                && std::env::var("FF_DS41_EXPERT_TIERS").as_deref() == Ok("1"),
+            std::env::var("FF_DS41_GPU_WINDOW").as_deref() == Ok("granted"),
             "granted GPU window and live expert tiers required"
         );
         let root = PathBuf::from(
@@ -4060,7 +4021,7 @@ mod tests {
                         )?
                     }),
                     RmsOptions {
-                        mode: deepseek_rms_mode(),
+                        mode: RmsMode::Unrounded,
                         eps: cell.epsilon,
                     },
                 )
@@ -6765,7 +6726,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "GPU lease; FF_DS41_GPU_WINDOW=granted, FF_DS41_MODEL, FF_DS41_ENGRAM_HASH and FF_DS41_EXPERT_TIERS=1"]
+    #[ignore = "GPU lease; FF_DS41_GPU_WINDOW=granted, FF_DS41_MODEL, FF_DS41_ENGRAM_HASH"]
     fn deepseek_expert_tier_miss_eviction_refill_gpu() -> Result<()> {
         use crate::experts::plan::Tier;
 
@@ -6861,9 +6822,8 @@ mod tests {
         }
 
         ensure!(
-            std::env::var("FF_DS41_GPU_WINDOW").as_deref() == Ok("granted")
-                && std::env::var("FF_DS41_EXPERT_TIERS").as_deref() == Ok("1"),
-            "granted GPU window and FF_DS41_EXPERT_TIERS=1 required"
+            std::env::var("FF_DS41_GPU_WINDOW").as_deref() == Ok("granted"),
+            "granted GPU window required"
         );
         let model_dir = PathBuf::from(std::env::var("FF_DS41_MODEL")?);
         let runtime_dir = std::env::temp_dir().join(format!(
