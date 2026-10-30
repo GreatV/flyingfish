@@ -8028,7 +8028,10 @@ mod tests {
             mtp_epoch: 0,
             images: None,
             weights: Weights {
-                embed: Some(testing::upload_device(&device, vec![bf16::ZERO; 8 * MIX_HIDDEN])?),
+                embed: Some(testing::upload_device(
+                    &device,
+                    vec![bf16::ZERO; 8 * MIX_HIDDEN],
+                )?),
                 layers: Vec::new(),
                 norm: None,
                 head: s.alloc_zeros(1)?,
@@ -9143,7 +9146,10 @@ mod tests {
             mtp_epoch: 0,
             images: None,
             weights: Weights {
-                embed: Some(testing::upload_device(&device, vec![bf16::ZERO; 8 * FF_HIDDEN])?),
+                embed: Some(testing::upload_device(
+                    &device,
+                    vec![bf16::ZERO; 8 * FF_HIDDEN],
+                )?),
                 layers: Vec::new(),
                 norm: None,
                 head: s.alloc_zeros(1)?,
