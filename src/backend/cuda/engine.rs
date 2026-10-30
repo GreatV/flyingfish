@@ -2076,6 +2076,13 @@ impl Engine {
     }
 
     #[cfg(test)]
+    pub(crate) fn gemma_scratch_len(&self) -> usize {
+        self.qwen
+            .as_ref()
+            .map_or(0, |runtime| runtime.scratch.len())
+    }
+
+    #[cfg(test)]
     pub(crate) fn gemma_final_probe(&mut self, input: &[bf16]) -> Result<Vec<bf16>> {
         let width = self.model_spec.hidden as usize;
         ensure!(

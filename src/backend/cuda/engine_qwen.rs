@@ -2928,29 +2928,33 @@ impl Engine {
         if let Some(draft) = &mut draft {
             draft.grow(context_rows)?;
         }
-        let target_workspace = Runtime::workspace(
-            &model_spec,
-            rows,
-            capacity,
-            gdn_policy,
-            verify_rows,
-            Some(s),
-        )?
-        .max(
-            if flint || settings.kv_format == crate::kv::KvFormat::Bf16 {
-                0
-            } else {
-                crate::op_contract::AttentionWorkspace::new(
-                    attention
-                        .as_ref()
-                        .context("Q38 attention specification missing")?,
-                    verify_rows as u32,
-                    capacity as u32,
-                    limits(verify_rows, capacity)?.key_chunk,
-                )?
-                .bytes as usize
-            },
-        );
+        let target_workspace = if gemma {
+            0
+        } else {
+            Runtime::workspace(
+                &model_spec,
+                rows,
+                capacity,
+                gdn_policy,
+                verify_rows,
+                Some(s),
+            )?
+            .max(
+                if flint || settings.kv_format == crate::kv::KvFormat::Bf16 {
+                    0
+                } else {
+                    crate::op_contract::AttentionWorkspace::new(
+                        attention
+                            .as_ref()
+                            .context("Q38 attention specification missing")?,
+                        verify_rows as u32,
+                        capacity as u32,
+                        limits(verify_rows, capacity)?.key_chunk,
+                    )?
+                    .bytes as usize
+                },
+            )
+        };
         let (attention_prefill_bytes, attention_decode_bytes, attention_verify_bytes) =
             if flint || glm || gemma {
                 (0, 0, 0)
