@@ -2622,6 +2622,12 @@ impl Engine {
             "invalid Q38 capacity"
         );
         // Reject an incomplete operator plan before allocating model weights.
+        let runtime = settings
+            .runtime_dir
+            .as_deref()
+            .context("Q38 setup requires runtime directory")?
+            .to_owned();
+        std::fs::create_dir_all(&runtime)?;
         let device = Device::new(ordinal)?;
         #[cfg(feature = "cuda")]
         Runtime::workspace(
@@ -2632,12 +2638,6 @@ impl Engine {
             verify_rows,
             Some(&device.stream),
         )?;
-        let runtime = settings
-            .runtime_dir
-            .as_deref()
-            .context("Q38 setup requires runtime directory")?
-            .to_owned();
-        std::fs::create_dir_all(&runtime)?;
         let closure = Rc::new(super::super::closure::Closure::new(
             write,
             format!(
