@@ -3334,19 +3334,17 @@ impl Engine {
             output: self.config.vocab_size,
             input: self.config.hidden_size,
         }]);
-        if runtime.gemma.is_some() {
-            linear.extend((1..=runtime.workspace_rows).map(|rows| LinearShape {
-                rows: rows as usize,
-                output: self.config.vocab_size,
-                input: self.config.hidden_size,
-            }));
-        }
         for rows in buckets {
             if let Some(ops) = &runtime.gemma {
                 linear.insert(LinearShape {
                     rows: rows as usize,
                     output: ops.per_layer_projection.shape[0] as usize,
                     input: ops.per_layer_projection.shape[1] as usize,
+                });
+                linear.insert(LinearShape {
+                    rows: rows as usize,
+                    output: self.config.vocab_size,
+                    input: self.config.hidden_size,
                 });
             }
             for layer in &runtime.layers {
