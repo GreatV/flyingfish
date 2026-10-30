@@ -271,6 +271,7 @@ pub struct ModelSpec {
     pub glm5_next: Option<Glm5NextConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deepseek_v41: Option<DeepseekV41Config>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logit_softcap: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_layer_input: Option<u32>,
