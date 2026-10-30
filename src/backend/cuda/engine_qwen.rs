@@ -3152,13 +3152,16 @@ impl Engine {
                 .context("GLM runtime missing")?
                 .catalog
                 .manifest;
-            engine.moe_slots = Some(super::moe::Slots::load_staging(
-                &engine.device,
-                &engine.model_spec,
-                manifest,
-                dir,
-                rows as u32,
-            )?);
+            engine.moe_slots = Some(
+                super::moe::Slots::load_staging(
+                    &engine.device,
+                    &engine.model_spec,
+                    manifest,
+                    dir,
+                    rows as u32,
+                )?
+                .0,
+            );
             engine.device.finish_upload()?;
         }
         if engine.model_spec.moe.is_some() && !glm {
