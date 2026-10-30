@@ -6494,6 +6494,78 @@ mod tests {
     }
 
     #[test]
+    fn non_gemma_workspace_admission_is_unchanged() -> Result<()> {
+        fn expected(
+            spec: &crate::model_spec::ModelSpec,
+            rows: usize,
+            capacity: usize,
+            verify_rows: usize,
+        ) -> Result<usize> {
+            let attention = if spec.architecture == crate::model_spec::Architecture::Glm5Next {
+                None
+            } else {
+                Some(FullAttentionSpec::from_model(spec)?)
+            };
+            let (prefill, decode, verify) = if let Some(attention) = attention.as_ref() {
+                (
+                    FullAttentionOps::preprocess_workspace(attention, limits(rows, capacity)?)?
+                        .bytes,
+                    FullAttentionOps::decode_workspace(attention, 1, capacity as u32)?.bytes,
+                    FullAttentionOps::workspace(attention, limits(verify_rows, capacity)?)?.bytes,
+                )
+            } else {
+                (0, 0, 0)
+            };
+            let gdn = GdnSpec::from_model(spec)?;
+            let prefill_gdn = GdnOps::workspace(&gdn, rows as u32, GdnPolicy::P2)?.bytes;
+            let decode_gdn = GdnOps::workspace(&gdn, 1, GdnPolicy::P2)?.bytes;
+            Ok(usize::try_from(
+                prefill
+                    .max(decode)
+                    .max(verify)
+                    .max(prefill_gdn)
+                    .max(decode_gdn),
+            )?)
+        }
+        let minicpm = crate::model_spec::ModelSpec::minicpm(
+            &serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/data/minicpm-config.json"
+            )))?,
+            &serde_json::json!({"eos_token_id": [248044, 248046]}),
+        )?;
+        let loopvl = crate::model_spec::ModelSpec::loopvl(
+            &serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/data/loopvl-config.json"
+            )))?,
+            &serde_json::json!({}),
+        )?;
+        let glm = crate::model_spec::ModelSpec::glm5_next(
+            &serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/data/glm53-flash-config.json"
+            )))?,
+            &serde_json::json!({}),
+        )?;
+        for (spec, rows, capacity) in [(geometry(), 17, 4096), (minicpm, 33, 2048), (glm, 17, 4096)]
+        {
+            let actual = Runtime::workspace(&spec, rows, capacity, GdnPolicy::P2, 5, None)?;
+            let expected = expected(&spec, rows, capacity, 5)?;
+            ensure!(
+                actual == expected,
+                "non-Gemma admission changed for {:?}: actual={actual} expected={expected}",
+                spec.architecture
+            );
+        }
+        ensure!(
+            Runtime::workspace(&loopvl, 65, 4096, GdnPolicy::P2, 5, None).is_err(),
+            "LoopVL full-attention admission was accepted"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn small_prefill_plans_select_structural_rows_without_rebinding() -> Result<()> {
         for capacity in [1, 2, 3, 4, 5, 16, 2048, 4096] {
             let narrow = |&full: &usize, rows: u32| {
