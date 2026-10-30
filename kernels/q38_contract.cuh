@@ -204,7 +204,7 @@ __device__ __forceinline__ void fp8_block_decode(
         }
         #pragma unroll
         for (int shift = 16; shift > 0; shift >>= 1)
-            sum += __shfl_down_sync(0xffffffffu, sum, shift);
+            sum += __shfl_down_sync(FF_WARP_MASK, sum, shift);
         if (lane == 0) {
             const float scale = fp8_block_scale(sw[(col / BLOCK) * groups + group]) *
                                 fp8_block_scale(sx[row * groups + group]);
