@@ -2005,7 +2005,10 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
     ensure!(admitted == expected, "Gemma workspace admission mismatch");
     let scratch = engine.gemma_scratch_len();
     println!("GEMMA4_SCRATCH bytes={scratch}");
-    ensure!(scratch == 0, "Gemma scratch allocation duplicates admission");
+    ensure!(
+        scratch == 0,
+        "Gemma scratch allocation duplicates admission"
+    );
     let global_layer = spec
         .layers
         .iter()
