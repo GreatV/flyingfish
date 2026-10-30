@@ -2264,7 +2264,7 @@ mod component_tests {
         let linear = include_str!("backend/cuda/linear.rs");
         let gdn = include_str!("backend/cuda/gdn.rs");
         let mut roles = BTreeSet::new();
-        for role in binding_literals(engine, "layers.push(Layer {", "let module =")? {
+        for role in binding_literals(engine, "layers.push(Layer {", "pre_ffn_norm: gemma")? {
             if role.ends_with(".weight") {
                 roles.insert(role.to_owned());
             }
@@ -2353,6 +2353,30 @@ mod component_tests {
         }
         ensure!(!roles.is_empty(), "empty GLM consumer role census");
         Ok(roles)
+    }
+
+    #[test]
+    fn glm_consumer_roles_exclude_conditional_gemma_norms() -> Result<()> {
+        use crate::model_spec::Mixer;
+        for mixer in [Mixer::FullAttention, Mixer::Gdn] {
+            for dense in [false, true] {
+                let roles = glm_consumer_roles(mixer, dense)?;
+                for role in ["input_layernorm.weight", "post_attention_layernorm.weight"] {
+                    ensure!(roles.contains(role), "GLM norm role missing: {role}");
+                }
+                for role in [
+                    "pre_feedforward_layernorm.weight",
+                    "post_feedforward_layernorm.weight",
+                    "post_per_layer_input_norm.weight",
+                ] {
+                    ensure!(
+                        !roles.contains(role),
+                        "Gemma-only norm in GLM census: {role}"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
