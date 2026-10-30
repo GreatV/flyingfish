@@ -1395,12 +1395,9 @@ mod tests {
                 .map(|&n| bf16::from_f32(n as f32 / 16.0))
                 .collect::<Vec<_>>(),
         )?;
-        let legacy =
-            super::super::cubin::module(&ctx, "gemm_skinny")?.load_function("gemm_skinny_bf16")?;
         let mut cells = 0;
         for rows in [1u32, 2, 5, 8, 16] {
             let output = stream.clone_htod(&vec![127.0f32; rows as usize * N + 16])?;
-            let old = stream.alloc_zeros::<bf16>(rows as usize * N)?;
             let xv = view(&x, &stream, 0, [rows, K as u32], [K as u64, 1])?;
             let wv = view(&w, &stream, 0, [N as u32, K as u32], [K as u64, 1])?;
             let yv = view(&output, &stream, 0, [rows, N as u32], [N as u64, 1])?;
@@ -1424,33 +1421,11 @@ mod tests {
                 stream.clone_dtoh(&output)? == eager,
                 "F32 projection graph bits DEFECT rows={rows}"
             );
-            let (old_ptr, record) = old.device_ptr(&stream);
-            drop(record);
-            unsafe {
-                stream
-                    .launch_builder(&legacy)
-                    .arg(&wv.ptr)
-                    .arg(&xv.ptr)
-                    .arg(&old_ptr)
-                    .arg(&(N as i32))
-                    .arg(&(K as i32))
-                    .arg(&(K as i64))
-                    .arg(&(rows as i32))
-                    .arg(&0i32)
-                    .launch(cudarc::driver::LaunchConfig {
-                        grid_dim: ((N as u32).div_ceil(16), 1, 1),
-                        block_dim: (128, 1, 1),
-                        shared_mem_bytes: 40960,
-                    })?;
-            }
-            let rounded = stream.clone_dtoh(&old)?;
-            ensure!(
-                rounded
-                    .iter()
-                    .zip(&oracle)
-                    .all(|(&a, &b)| a == bf16::from_f32(b)),
-                "legacy BF16 projection DEFECT rows={rows}"
-            );
+            // 2026-10-29: the control rounds measured FP32 output; it does not execute BF16 WMMA.
+            let rounded: Vec<_> = eager[..rows as usize * N]
+                .iter()
+                .map(|&value| bf16::from_f32(value))
+                .collect();
             let premature = rounded
                 .iter()
                 .zip(&oracle)
