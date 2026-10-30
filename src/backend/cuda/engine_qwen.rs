@@ -3998,7 +3998,8 @@ impl Engine {
         let layer = &q.layers[i];
         let flint_layer = matches!(layer.mixer, BoundMixer::Flint { .. });
         let gemma_layer = matches!(layer.mixer, BoundMixer::Gemma { .. });
-        let attention = if flint_layer || gemma_layer {
+        let glm = self.model_spec.architecture == crate::model_spec::Architecture::Glm5Next;
+        let attention = if flint_layer || gemma_layer || glm {
             None
         } else {
             Some(q.attention.context("Q38 attention specification missing")?)
