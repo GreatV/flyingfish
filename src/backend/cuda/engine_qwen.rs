@@ -22,7 +22,6 @@ pub(super) fn default_chunk(admitted: usize) -> usize {
 
 use crate::backend::cuda::cubin;
 use crate::backend::cuda::decode::{GqaDecodeInput, SlidingWindow};
-#[cfg(feature = "cuda")]
 use crate::backend::cuda::dsa::{
     DsaAppendInput, DsaAttentionInput, DsaIndexInput, DsaIndexOutput, DsaPlan,
 };
