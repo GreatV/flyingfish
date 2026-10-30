@@ -599,7 +599,7 @@ pub(super) struct Runtime {
     gather_positions: CudaFunction,
     catalog: WeightCatalog,
     arena: Option<CudaSlice<u8>>,
-    scratch: CudaSlice<u8>,
+    pub(super) scratch: CudaSlice<u8>,
     kv_scratch: Option<(CudaSlice<bf16>, CudaSlice<bf16>)>,
     pub(super) prompt: Option<CudaSlice<bf16>>,
     mask: CudaSlice<u64>,
