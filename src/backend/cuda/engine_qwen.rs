@@ -6508,10 +6508,24 @@ mod tests {
             };
             let (prefill, decode, verify) = if let Some(attention) = attention.as_ref() {
                 (
-                    FullAttentionOps::preprocess_workspace(attention, limits(rows, capacity)?)?
-                        .bytes,
+                    if cfg!(feature = "rocm") {
+                        FullAttentionOps::workspace(attention, limits(rows, capacity)?)?.bytes
+                    } else {
+                        FullAttentionOps::preprocess_workspace(attention, limits(rows, capacity)?)?
+                            .bytes
+                    },
                     FullAttentionOps::decode_workspace(attention, 1, capacity as u32)?.bytes,
-                    FullAttentionOps::workspace(attention, limits(verify_rows, capacity)?)?.bytes,
+                    if cfg!(feature = "rocm") {
+                        FullAttentionOps::decode_workspace(
+                            attention,
+                            rows.min(verify_rows) as u32,
+                            capacity as u32,
+                        )?
+                        .bytes
+                    } else {
+                        FullAttentionOps::workspace(attention, limits(verify_rows, capacity)?)?
+                            .bytes
+                    },
                 )
             } else {
                 (0, 0, 0)
