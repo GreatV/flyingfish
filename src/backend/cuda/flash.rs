@@ -270,10 +270,14 @@ impl Flash {
         if head_dim == 512 {
             #[cfg(feature = "cuda")]
             let (resident, units) = {
-                use cudarc::driver::sys::CUdevice_attribute as A;
+                use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
                 let ctx = stream.context();
                 let module = super::cubin::module(ctx, "attention_native")?;
                 let partial = module.load_function("attention_partial_d512")?;
+                partial.set_attribute(
+                    F::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    90112,
+                )?;
                 let resident = partial
                     .occupancy_max_active_blocks_per_multiprocessor(128, 90112, None)?
                     as usize;
