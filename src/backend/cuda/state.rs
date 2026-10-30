@@ -360,14 +360,12 @@ pub struct LatentRing {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg(any(feature = "cuda", test))]
 pub(crate) struct LatentOwners {
     pub kv: usize,
     pub index: usize,
     pub ratio: usize,
 }
 
-#[cfg(any(feature = "cuda", test))]
 pub(crate) fn latent_owners(spec: &ModelSpec) -> Result<Vec<Option<LatentOwners>>> {
     let ds = spec
         .deepseek_v41
@@ -413,7 +411,6 @@ pub(crate) fn latent_owners(spec: &ModelSpec) -> Result<Vec<Option<LatentOwners>
     Ok(result)
 }
 
-#[cfg(feature = "cuda")]
 pub(crate) struct LatentCompressedKv {
     pub owner: usize,
     pub ratio: usize,
@@ -429,7 +426,6 @@ pub(crate) struct LatentCompressedKv {
     pub tail_scores: CudaSlice<f32>,
 }
 
-#[cfg(feature = "cuda")]
 pub(crate) struct LatentSelection {
     pub owner: usize,
     pub positions: CudaSlice<i32>,
@@ -437,7 +433,6 @@ pub(crate) struct LatentSelection {
     pub ticket: CudaSlice<u32>,
 }
 
-#[cfg(feature = "cuda")]
 pub(crate) struct LatentCompressedState {
     pub owners: Vec<Option<LatentOwners>>,
     pub kv: Vec<LatentCompressedKv>,
@@ -449,7 +444,6 @@ pub(crate) struct LatentCompressedState {
     pub rows: usize,
 }
 
-#[cfg(feature = "cuda")]
 impl LatentCompressedState {
     pub(crate) fn new(
         spec: &ModelSpec,
@@ -586,7 +580,7 @@ pub struct StateStore {
     pub kv: Vec<Kv>,
     pub gdn: Vec<GdnState>,
     pub(crate) latent: Vec<LatentRing>,
-    #[cfg(feature = "cuda")]
+
     pub(crate) compressed: Option<LatentCompressedState>,
     pub(crate) dsa: Vec<super::dsa::DsaState>,
     pub sequence: Option<CudaSlice<i32>>,
@@ -711,7 +705,7 @@ impl StateStore {
             kv,
             gdn,
             latent,
-            #[cfg(feature = "cuda")]
+
             compressed: None,
             dsa,
             sequence,
@@ -735,7 +729,6 @@ impl StateStore {
             .context("KV ring state index is outside the layer plan")
     }
     /// Latent ring of one DeepSeek-V4.1 layer.
-    #[cfg(feature = "cuda")]
     pub(crate) fn latent_ring(&self, layer: usize) -> Result<&LatentRing> {
         self.latent
             .get(layer)
@@ -743,7 +736,6 @@ impl StateStore {
     }
     /// Mutable latent ring of one layer; the gates' planted ring controls.
     #[cfg(test)]
-    #[cfg(feature = "cuda")]
     pub(crate) fn latent_ring_mut(&mut self, layer: usize) -> Result<&mut LatentRing> {
         self.latent
             .get_mut(layer)
@@ -830,7 +822,6 @@ impl StateStore {
         Ok(())
     }
     pub fn reset(&mut self, stream: &Arc<CudaStream>) -> Result<()> {
-        #[cfg(feature = "cuda")]
         if let Some(state) = &mut self.compressed {
             state.reset(stream)?;
         }
@@ -871,15 +862,10 @@ impl StateStore {
             + self.dsa.iter().map(|state| state.bytes()).sum::<usize>()
             + self.sequence.as_ref().map_or(0, |m| m.len() * 4)
             + {
-                #[cfg(feature = "cuda")]
                 {
                     self.compressed
                         .as_ref()
                         .map_or(0, LatentCompressedState::bytes)
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    0
                 }
             }
     }

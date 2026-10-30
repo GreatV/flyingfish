@@ -11,8 +11,8 @@
 //! wo_a group projection of the quantized attention output.
 use crate::backend::cuda::contracts::{Tensor, TensorMut, dense_layout, no_overlap};
 use crate::backend::cuda::cubin;
+use crate::backend::gpu::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use anyhow::{Result, ensure};
-use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use half::bf16;
 use std::sync::Arc;
 
@@ -1191,18 +1191,18 @@ mod tests {
                 .into_iter()
                 .map(|value| bf16::from_f32(value as f32))
                 .collect();
-            let qb = testing::upload(&device.upload, fx.q.clone())?;
-            let cb = testing::upload(&device.upload, fx.codes.clone())?;
-            let sb = testing::upload(&device.upload, fx.scales.clone())?;
-            let idb = testing::upload(&device.upload, fx.slot_ids.clone())?;
-            let skb = testing::upload(&device.upload, fx.sink.clone())?;
-            let rb = testing::upload(&device.upload, fx.inv_rotary.clone())?;
+            let qb = testing::upload_device(&device, fx.q.clone())?;
+            let cb = testing::upload_device(&device, fx.codes.clone())?;
+            let sb = testing::upload_device(&device, fx.scales.clone())?;
+            let idb = testing::upload_device(&device, fx.slot_ids.clone())?;
+            let skb = testing::upload_device(&device, fx.sink.clone())?;
+            let rb = testing::upload_device(&device, fx.inv_rotary.clone())?;
             // Discriminating control: one visible slot replaced by the next ring
             // slot must change the output.
             let mut wrong_ids = fx.slot_ids.clone();
             let last = wrong_ids.len() - 1;
             wrong_ids[last] = (wrong_ids[last] + 1) % WINDOW as i32;
-            let widb = testing::upload(&device.upload, wrong_ids)?;
+            let widb = testing::upload_device(&device, wrong_ids)?;
             device.finish_upload()?;
             let out = testing::zeros::<bf16>(s, HEADS * HEAD_DIM)?;
             let wrong_out = testing::zeros::<bf16>(s, HEADS * HEAD_DIM)?;
@@ -1318,8 +1318,8 @@ pub(super) mod certificate;
 mod indexed_tests {
     use super::*;
     use crate::backend::cuda::contracts::{SeqRef, view};
+    use crate::backend::gpu::DevicePtr;
     use anyhow::Context;
-    use cudarc::driver::DevicePtr;
 
     #[derive(serde::Deserialize)]
     struct Cell {
@@ -1419,13 +1419,10 @@ mod indexed_tests {
             0,
         )?;
         if graph {
-            s.begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )?;
-            plan.run(&s)?;
-            let captured = s
-                .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                .context("indexed graph missing")?;
+            let captured = crate::backend::cuda::moe::testing::capture(&s, || {
+                plan.run(&s)?;
+                Ok(())
+            })?;
             captured.launch()?;
         } else {
             plan.run(&s)?;

@@ -11,7 +11,7 @@ __device__ __forceinline__ void pack_rows(
     if (index >= int64_t(valid) * width) return;
     uint8_t code, scale;
     fp4_act_quant<Block, PowerOfTwo>(__bfloat162float(input[index]), &code, &scale);
-    const int adjacent = __shfl_down_sync(0xffffffffu, int(code), 1);
+    const int adjacent = __shfl_down_sync(FF_WARP_MASK, int(code), 1);
     if ((index & 1) == 0) output[index / 2] = code | (adjacent << 4);
     if (index % Block == 0) scales[index / Block] = scale;
 }

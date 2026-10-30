@@ -1241,13 +1241,14 @@ pub struct Module {
 impl Module {
     pub fn load_function(self: &Arc<Self>, name: &str) -> Result<Function> {
         self.context.bind_to_thread()?;
-        let name = CString::new(name)?;
+        let symbol = CString::new(name)?;
         let mut handle = std::ptr::null_mut();
         unsafe {
             check(
-                hipModuleGetFunction(&mut handle, self.handle as Handle, name.as_ptr()),
+                hipModuleGetFunction(&mut handle, self.handle as Handle, symbol.as_ptr()),
                 "hipModuleGetFunction",
-            )?;
+            )
+            .with_context(|| format!("HIP kernel symbol {name}"))?;
         }
         Ok(Function {
             handle: handle as usize,

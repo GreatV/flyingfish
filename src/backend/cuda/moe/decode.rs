@@ -686,7 +686,6 @@ impl DecodeOps {
     }
 }
 
-#[cfg(feature = "cuda")]
 mod native {
     use super::super::{combine, route};
     use super::*;
@@ -999,8 +998,13 @@ mod native {
                     shared_meta_ptr: shared_meta_buf.device_ptr(stream).0,
                 }
             };
-            let mut route = route::RouteOps::new(ctx, stream, g.experts, m)?;
-            route.prepare_logits_f32(rows, g.hidden)?;
+            let route = route::RouteOps::new(ctx, stream, g.experts, m)?;
+            #[cfg(feature = "cuda")]
+            let route = {
+                let mut route = route;
+                route.prepare_logits_f32(rows, g.hidden)?;
+                route
+            };
             Ok(Self {
                 rows,
                 route,
@@ -1125,8 +1129,12 @@ mod native {
             let logits = self.views.logits;
             let ids = self.views.ids;
             let weights = self.views.route_weights;
+            #[cfg(feature = "cuda")]
             self.route
                 .logits_f32_lt(stream, x, self.weights.router, &mut TensorMut(logits))?;
+            #[cfg(feature = "rocm")]
+            self.route
+                .logits_f32(stream, x, self.weights.router, &mut TensorMut(logits))?;
             self.route.topk_noaux_f32(
                 logits,
                 Some(self.weights.bias),
@@ -1255,5 +1263,4 @@ mod native {
         }
     }
 }
-#[cfg(feature = "cuda")]
 pub(crate) use native::{NativeMoe, NativeMoeGeometry, NativeMoeWeights};

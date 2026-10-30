@@ -200,7 +200,7 @@ void dsa_index_score_topk(const __nv_bfloat16* q, const __nv_bfloat16* weights,
                 dot = fmaf(sq[head * DSA_INDEX_DIM + d], sk[d], dot);
             }
             for (int delta = 16; delta > 0; delta >>= 1) {
-                dot += __shfl_down_sync(0xffffffff, dot, delta);
+                dot += __shfl_down_sync(FF_WARP_MASK, dot, delta);
             }
             if (lane == 0) {
                 sh[head] = fmaxf(dot * 0.0883883461356163f, 0.0f) * sw[head];
@@ -331,7 +331,7 @@ void dsa_sparse_attention(const __nv_bfloat16* q, const __nv_bfloat16* latent,
         key = bround(key);
         float dot = sq[tid] * key;
         for (int delta = 16; delta > 0; delta >>= 1) {
-            dot += __shfl_down_sync(0xffffffff, dot, delta);
+            dot += __shfl_down_sync(FF_WARP_MASK, dot, delta);
         }
         if (lane == 0) sr[warp] = dot;
         __syncthreads();
@@ -389,7 +389,7 @@ void dsa_sparse_attention_direct(const __nv_bfloat16* q, const __nv_bfloat16* la
         for (int slot = 0; slot < 64; ++slot) {
             int at = physical[slot];
             float dot = at >= 0 ? query[tid] * __bfloat162float(latent[(size_t)at * 512 + tid]) : 0.0f;
-            for (int delta = 16; delta > 0; delta >>= 1) dot += __shfl_down_sync(0xffffffff, dot, delta);
+            for (int delta = 16; delta > 0; delta >>= 1) dot += __shfl_down_sync(FF_WARP_MASK, dot, delta);
             if (lane == 0) reduction[warp] = dot;
             __syncthreads();
             if (tid == 0) {

@@ -436,7 +436,6 @@ impl UploadHashWorker {
 
 impl Loader<'_> {
     /// Marks one manifest tensor consumed without uploading it.
-    #[cfg(feature = "cuda")]
     pub(super) fn defer(&mut self, name: &str) -> Result<()> {
         ensure!(
             self.seen.insert(name.to_owned()),

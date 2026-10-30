@@ -58,7 +58,7 @@ __device__ __forceinline__ void score_positions(
         }
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            dot = __fadd_rn(dot, __shfl_down_sync(0xffffffffu, dot, offset));
+            dot = __fadd_rn(dot, __shfl_down_sync(FF_WARP_MASK, dot, offset));
         if (lane == 0) {
             const float weight = bround(__fmul_rn(__bfloat162float(weights[qrow]), weight_scale));
             const float product = bround(__fmul_rn(fmaxf(bround(dot), 0.0f), weight));

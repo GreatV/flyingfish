@@ -2,8 +2,8 @@ use super::{
     contracts::{Tensor, TensorMut, no_overlap},
     cubin,
 };
+use crate::backend::gpu::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use anyhow::{Result, ensure};
-use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug)]

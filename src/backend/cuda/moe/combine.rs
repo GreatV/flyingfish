@@ -12,9 +12,7 @@ pub struct CombineOps {
     shared_scale: CudaFunction,
     combine: CudaFunction,
     combine_ungated: CudaFunction,
-    #[cfg(feature = "cuda")]
     combine_accum: CudaFunction,
-    #[cfg(feature = "cuda")]
     combine_bf16: CudaFunction,
     combine_routed: CudaFunction,
     combine_routed_vector: CudaFunction,
@@ -86,7 +84,6 @@ pub struct MoeCombineResidual {
 
 /// The FP32-accumulated combine of the DeepSeek-V4.1 MoE: per-choice BF16
 /// contributions plus one weight-1 shared row, one BF16 round at the output.
-#[cfg(feature = "cuda")]
 pub enum Accumulator {
     /// The routed sum rounds to BF16 before the shared join (the family
     /// gated/ungated boundary).
@@ -97,7 +94,6 @@ pub enum Accumulator {
     Fp32,
 }
 
-#[cfg(feature = "cuda")]
 pub struct MoeCombineAccum {
     /// `[rows, top_k, hidden]` weighted BF16 contributions (dense).
     pub contributions: Tensor<bf16, 3>,
@@ -109,7 +105,6 @@ pub struct MoeCombineAccum {
     pub accumulator: Accumulator,
 }
 
-#[cfg(feature = "cuda")]
 impl MoeCombineAccum {
     fn validate(&self) -> Result<(u32, u32, u32)> {
         let (rows, top_k) = (self.contributions.shape[0], self.contributions.shape[1]);
@@ -430,9 +425,7 @@ impl CombineOps {
             shared_scale: module.load_function("moe_shared_scale")?,
             combine: module.load_function("moe_combine")?,
             combine_ungated: module.load_function("moe_combine_ungated")?,
-            #[cfg(feature = "cuda")]
             combine_accum: module.load_function("moe_combine_accum")?,
-            #[cfg(feature = "cuda")]
             combine_bf16: module.load_function("moe_combine_bf16")?,
             combine_routed: module.load_function("moe_combine_routed")?,
             combine_routed_vector: module.load_function("moe_combine_routed_vector")?,
@@ -479,7 +472,6 @@ impl CombineOps {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     pub fn combine_bf16(&self, stream: &Arc<CudaStream>, input: &MoeCombine) -> Result<()> {
         let (rows, top_k, hidden) = input.validate()?;
         ensure!(
@@ -548,7 +540,6 @@ impl CombineOps {
     /// The FP32-accumulated combine: per-choice BF16 contributions plus one
     /// weight-1 shared row, one BF16 round at the output (the DeepSeek-V4.1
     /// model definition MoE.forward accumulator).
-    #[cfg(feature = "cuda")]
     pub fn combine_accum(&self, stream: &Arc<CudaStream>, input: &MoeCombineAccum) -> Result<()> {
         let (rows, top_k, hidden) = input.validate()?;
         let fp32 = match input.accumulator {

@@ -3,8 +3,8 @@ use super::{
     cubin,
     selection::{DsaSelectionPlan, DsaTopKInput, DsaTopKOutput},
 };
+use crate::backend::gpu::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use anyhow::{Result, ensure};
-use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use half::bf16;
 use std::sync::Arc;
 
@@ -343,8 +343,8 @@ impl IndexPositionOrder {
 mod tests {
     use super::super::contracts::view;
     use super::*;
+    use crate::backend::gpu::DevicePtr;
     use anyhow::Context;
-    use cudarc::driver::DevicePtr;
 
     // 2026-10-28: 3 * 0.0078125 reference shape spread; sm86/sm89 repeat/cross spread is zero.
     const SCORE_LIMIT: f64 = 0.0234375;
@@ -417,8 +417,7 @@ mod tests {
             0,
             0,
         ])?;
-        let (ptr, record) = metadata.device_ptr(&stream);
-        drop(record);
+        let ptr = metadata.device_ptr(&stream).0;
         let block_count = capacity.div_ceil(8);
         let candidate_ids: Vec<_> = (0..rows * 2048)
             .map(|i| {
@@ -469,14 +468,11 @@ mod tests {
         plan.run(&stream)?;
         let eager = stream.clone_dtoh(&scores)?;
         if graph {
-            stream.begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )?;
-            plan.run(&stream)?;
-            stream
-                .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                .context("score graph empty")?
-                .launch()?;
+            crate::backend::cuda::moe::testing::capture(&stream, || {
+                plan.run(&stream)?;
+                Ok(())
+            })?
+            .launch()?;
         } else {
             plan.run(&stream)?;
         }
@@ -743,8 +739,7 @@ mod tests {
             0,
             0,
         ])?;
-        let (ptr, record) = metadata.device_ptr(&stream);
-        drop(record);
+        let ptr = metadata.device_ptr(&stream).0;
         let v = IndexCandidatesViews {
             scores: view(
                 &scores,
@@ -775,15 +770,13 @@ mod tests {
         };
         let plan = IndexCandidatesPlan::new(ctx, v, ratio as u32)?;
         let captured = if graph {
-            stream.begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )?;
-            plan.run(&stream)?;
-            Some(
-                stream
-                    .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                    .context("index graph empty")?,
-            )
+            Some(crate::backend::cuda::moe::testing::capture(
+                &stream,
+                || {
+                    plan.run(&stream)?;
+                    Ok(())
+                },
+            )?)
         } else {
             None
         };
@@ -880,14 +873,11 @@ mod tests {
             view(&output, &stream, 0, [rows as u32, 512], [512, 1])?,
         )?;
         if graph {
-            stream.begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )?;
-            plan.run(&stream)?;
-            stream
-                .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                .context("order graph empty")?
-                .launch()?;
+            crate::backend::cuda::moe::testing::capture(&stream, || {
+                plan.run(&stream)?;
+                Ok(())
+            })?
+            .launch()?;
         } else {
             plan.run(&stream)?;
         }
@@ -1046,8 +1036,8 @@ mod tests {
     fn select_recorded_scores(
         ctx: &Arc<CudaContext>,
         stream: &Arc<CudaStream>,
-        scores: &cudarc::driver::CudaSlice<f32>,
-        ids: &cudarc::driver::CudaSlice<i32>,
+        scores: &crate::backend::gpu::CudaSlice<f32>,
+        ids: &crate::backend::gpu::CudaSlice<i32>,
         columns: usize,
         graph: bool,
     ) -> Result<Vec<i32>> {
@@ -1070,18 +1060,15 @@ mod tests {
             output.ids.read(),
             view(&ordered, stream, 0, [1, 512], [512, 1])?,
         )?;
+        let execute = || -> Result<()> {
+            plan.select_scores(&input, &output, stream)?;
+            order.run(stream)?;
+            Ok(())
+        };
         if graph {
-            stream.begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )?;
-        }
-        plan.select_scores(&input, &output, stream)?;
-        order.run(stream)?;
-        if graph {
-            stream
-                .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                .context("index selection graph")?
-                .launch()?;
+            crate::backend::cuda::moe::testing::capture(stream, execute)?.launch()?;
+        } else {
+            execute()?;
         }
         let host = stream.clone_dtoh(&ordered)?;
         let valid: Vec<_> = host.iter().copied().filter(|&i| i >= 0).collect();
@@ -1124,8 +1111,7 @@ mod tests {
             0,
             0,
         ])?;
-        let (ptr, guard) = meta.device_ptr(&s);
-        drop(guard);
+        let ptr = meta.device_ptr(&s).0;
         let plan = IndexCandidatesPlan::new(
             ctx,
             IndexCandidatesViews {
@@ -1140,16 +1126,14 @@ mod tests {
             },
             cell.ratio as u32,
         )?;
+        let execute = || -> Result<()> {
+            plan.run(&s)?;
+            Ok(())
+        };
         if graph {
-            s.begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )?;
-        }
-        plan.run(&s)?;
-        if graph {
-            s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                .context("recorded candidate graph")?
-                .launch()?;
+            crate::backend::cuda::moe::testing::capture(&s, execute)?.launch()?;
+        } else {
+            execute()?;
         }
         let actual = s.clone_dtoh(&candidates)?;
         let want: BTreeSet<i32> = if let Some(mask) = &cell.candidate_mask {
@@ -1242,16 +1226,14 @@ mod tests {
             },
             cell.ratio as u32,
         )?;
+        let execute = || -> Result<()> {
+            plan.run(&s)?;
+            Ok(())
+        };
         if graph {
-            s.begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )?;
-        }
-        plan.run(&s)?;
-        if graph {
-            s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                .context("restricted index graph")?
-                .launch()?;
+            crate::backend::cuda::moe::testing::capture(&s, execute)?.launch()?;
+        } else {
+            execute()?;
         }
         let got = s.clone_dtoh(&scores)?;
         let positions = s.clone_dtoh(&ids)?;
@@ -1338,8 +1320,7 @@ mod tests {
             0,
             0,
         ])?;
-        let (ptr, guard) = meta.device_ptr(&stream);
-        drop(guard);
+        let ptr = meta.device_ptr(&stream).0;
         let views = IndexScoreViews {
             query: view(&query, &stream, 0, [1, 32, 64], [2048, 64, 1])?,
             query_scales: view(&scales, &stream, 0, [1, 32, 4], [128, 4, 1])?,
@@ -1355,17 +1336,14 @@ mod tests {
         let plan = IndexScorePlan::new(ctx, views, cell.ratio as u32)?;
         plan.run(&stream)?;
         let baseline = stream.clone_dtoh(&scores)?;
+        let execute = || -> Result<()> {
+            plan.run(&stream)?;
+            Ok(())
+        };
         if graph {
-            stream.begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )?;
-        }
-        plan.run(&stream)?;
-        if graph {
-            stream
-                .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                .context("recorded score graph")?
-                .launch()?;
+            crate::backend::cuda::moe::testing::capture(&stream, execute)?.launch()?;
+        } else {
+            execute()?;
         }
         let actual = stream.clone_dtoh(&scores)?;
         let ids = stream.clone_dtoh(&positions)?;

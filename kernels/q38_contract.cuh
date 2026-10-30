@@ -56,6 +56,25 @@ __device__ __forceinline__ float fp8_channel_tile_unscale(__nv_bfloat16 channel_
 }
 #endif
 
+#if defined(__HIP__)
+__device__ __forceinline__ uint8_t e4m3_encode_finite(float value) {
+    const uint32_t bits = __float_as_uint(value);
+    const uint32_t sign = (bits >> 24) & 128;
+    const float magnitude = fabsf(value);
+    if (magnitude < 0.015625f)
+        return uint8_t(sign | uint32_t(nearbyintf(magnitude * 512.0f)));
+    const uint32_t absolute = bits & 0x7fffffffu;
+    uint32_t rounded = absolute >> 20;
+    const uint32_t remainder = absolute & 0xfffffu;
+    rounded += remainder > 0x80000u || (remainder == 0x80000u && (rounded & 1));
+    return uint8_t(sign | min(126u, rounded - 960u));
+}
+#else
+__device__ __forceinline__ uint8_t e4m3_encode_finite(float value) {
+    return __nv_cvt_float_to_fp8(value, __NV_SATFINITE, __NV_E4M3);
+}
+#endif
+
 // ceil(log2(v)) of a positive normal float, from its bit pattern.
 __device__ __forceinline__ int act_quant_log2_ceil(float v) {
     const unsigned bits = __float_as_uint(v);
@@ -74,13 +93,12 @@ __device__ __forceinline__ float act_quant_pow2(int exponent) {
 // publisher kernel.py act_quant, block 32, scale_fmt "ue8m0"). Shared by the
 // W4A8/W8A8 expert paths and the DeepSeek-V4.1 latent ring and attention-output
 // quantization.
-#if !defined(__HIP__)
 __device__ __forceinline__ void act_quant32(float value, unsigned char* code,
                                             unsigned char* scale_code) {
     float amax = fabsf(value);
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
-        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+        amax = fmaxf(amax, __shfl_xor_sync(FF_WARP_MASK, amax, off));
     amax = fmaxf(amax, 1e-4f);
     const int exponent = act_quant_log2_ceil(amax * (1.0f / 448.0f));
     if (exponent < -127 || exponent > 127) {
@@ -89,8 +107,7 @@ __device__ __forceinline__ void act_quant32(float value, unsigned char* code,
         __trap();
     }
     const float scale = act_quant_pow2(exponent);
-    *code = __nv_cvt_float_to_fp8(
-        fminf(448.0f, fmaxf(-448.0f, value / scale)), __NV_SATFINITE, __NV_E4M3);
+    *code = e4m3_encode_finite(fminf(448.0f, fmaxf(-448.0f, value / scale)));
     *scale_code = (unsigned char)(exponent + 127);
 }
 
@@ -121,7 +138,7 @@ __device__ __forceinline__ void fp4_act_quant(
     float amax = fabsf(value);
 #pragma unroll
     for (int offset = Block / 2; offset > 0; offset >>= 1)
-        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offset));
+        amax = fmaxf(amax, __shfl_xor_sync(FF_WARP_MASK, amax, offset));
     const float unrounded = __fdiv_rn(amax, 6.0f);
     float scale;
     if constexpr (PowerOfTwoScale) {
@@ -130,16 +147,16 @@ __device__ __forceinline__ void fp4_act_quant(
         *scale_code = uint8_t(exponent + 127);
         scale = act_quant_pow2(exponent);
     } else {
-        uint8_t rounded = __nv_cvt_float_to_fp8(unrounded, __NV_SATFINITE, __NV_E4M3);
+        uint8_t rounded = e4m3_encode_finite(unrounded);
         *scale_code = rounded == 0 ? 1 : rounded;
         scale = e4m3_decode(*scale_code);
     }
     *code = e2m1_encode(__fdiv_rn(value, scale));
 }
-#endif
 
 #if !defined(__HIP__)
 #include <cuda_fp16.h>
+#endif
 // Two E4M3 codes per call. E4M3 is a subset of FP16, so the hardware form is
 // exact for all 256 codes; the fix-up forces the canonical NaN for both NaN codes.
 __device__ __forceinline__ float2 e4m3_decode_pair(uint16_t packed) {
@@ -187,7 +204,7 @@ __device__ __forceinline__ void fp8_block_decode(
         }
         #pragma unroll
         for (int shift = 16; shift > 0; shift >>= 1)
-            sum += __shfl_down_sync(0xffffffffu, sum, shift);
+            sum += __shfl_down_sync(FF_WARP_MASK, sum, shift);
         if (lane == 0) {
             const float scale = fp8_block_scale(sw[(col / BLOCK) * groups + group]) *
                                 fp8_block_scale(sx[row * groups + group]);
@@ -196,6 +213,3 @@ __device__ __forceinline__ void fp8_block_decode(
     }
     if (lane == 0) y[row * n + col] = __float2bfloat16_rn(total);
 }
-
-
-#endif

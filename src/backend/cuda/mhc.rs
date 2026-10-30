@@ -1185,13 +1185,13 @@ mod tests {
             } else {
                 fx.fn_w.clone()
             };
-            let xb = testing::upload(&device.upload, fx.stream.clone())?;
-            let fnb_f32 = testing::upload(&device.upload, fx.fn_w.clone())?;
-            let fnb_bf16 = testing::upload(&device.upload, fn_bf16_stored)?;
-            let baseb = testing::upload(&device.upload, fx.base.clone())?;
-            let scaleb = testing::upload(&device.upload, fx.scale.clone())?;
-            let subb = testing::upload(&device.upload, fx.sublayer.clone())?;
-            let resb = testing::upload(&device.upload, fx.residual.clone())?;
+            let xb = testing::upload_device(&device, fx.stream.clone())?;
+            let fnb_f32 = testing::upload_device(&device, fx.fn_w.clone())?;
+            let fnb_bf16 = testing::upload_device(&device, fn_bf16_stored)?;
+            let baseb = testing::upload_device(&device, fx.base.clone())?;
+            let scaleb = testing::upload_device(&device, fx.scale.clone())?;
+            let subb = testing::upload_device(&device, fx.sublayer.clone())?;
+            let resb = testing::upload_device(&device, fx.residual.clone())?;
             device.finish_upload()?;
             let pre = testing::zeros::<f32>(s, (ROWS * MULT) as usize)?;
             let post = testing::zeros::<f32>(s, (ROWS * MULT) as usize)?;
@@ -1502,6 +1502,205 @@ mod tests {
         Ok(())
     }
 
+    fn glm_runtime_policy(device: &Device) -> Result<()> {
+        use crate::backend::cuda::hc::{HcRuntime, HcSublayerWeights, glm_binding};
+        use crate::model::{HcPreSource, HcSublayer};
+        let config = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/glm53-flash-config.json"
+        )))?;
+        let spec = crate::model_spec::ModelSpec::glm5_next(&config, &serde_json::Value::Null)?;
+        let binding = glm_binding(&spec)?;
+        let p = binding.params;
+        let (rows, mult, hidden) = (3usize, p.mult as usize, p.hidden as usize);
+        ensure!(
+            mult == 4 && hidden == 4096 && p.iters == 20,
+            "GLM mHC production geometry"
+        );
+        ensure!(
+            binding.policy.attention == HcPreSource::Own && binding.policy.ffn == HcPreSource::Own,
+            "GLM mHC requires own pre-mixes"
+        );
+        let s = &device.stream;
+        let oracle = Oracle {
+            mult,
+            hidden,
+            iters: p.iters as usize,
+            eps: f64::from(p.eps),
+            norm_eps: f64::from(p.norm_eps),
+        };
+        let attn = fixture(p.mult, p.hidden, rows as u32, 7);
+        let ffn = fixture(p.mult, p.hidden, rows as u32, 11);
+        let upload = |fx: &Fixture| -> Result<HcSublayerWeights> {
+            let fn_bytes: Vec<_> = fx
+                .fn_w
+                .iter()
+                .flat_map(|&v| bf16::from_f32(v).to_bits().to_ne_bytes())
+                .collect();
+            let base: Vec<_> = fx.base.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let scale: Vec<_> = fx.scale.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            Ok(HcSublayerWeights {
+                fn_w: s.clone_htod(&fn_bytes)?,
+                base: s.clone_htod(&base)?,
+                scale: s.clone_htod(&scale)?,
+            })
+        };
+        let mut controls = 0usize;
+        for graph in [false, true] {
+            let mut runtime = HcRuntime::new(&device.ctx, s, binding, 1, rows)?;
+            runtime.bind_layer(0, upload(&attn)?, upload(&ffn)?)?;
+            let embedded = s.clone_htod(&attn.sublayer)?;
+            runtime.begin_embedded(s, rows, &embedded)?;
+            let broadcast = s.clone_dtoh(&runtime.stream)?;
+            for row in 0..rows {
+                for copy in 0..mult {
+                    ensure!(
+                        broadcast[(row * mult + copy) * hidden..(row * mult + copy + 1) * hidden]
+                            == attn.sublayer[row * hidden..(row + 1) * hidden],
+                        "mHC embedded broadcast mismatch"
+                    );
+                }
+            }
+            s.memcpy_htod(&attn.stream, &mut runtime.stream)?;
+            let mut host_stream = attn.stream.clone();
+            let mut branch = s.alloc_zeros(rows * hidden)?;
+            let mut prior_pre = vec![0f32; rows * mult];
+            for (stage, fx) in [(HcSublayer::Attention, &attn), (HcSublayer::Ffn, &ffn)] {
+                let weights: Vec<_> = fx
+                    .fn_w
+                    .iter()
+                    .map(|&v| bf16::from_f32(v).to_f32())
+                    .collect();
+                let pre_run = || runtime.hc_pre(s, 0, stage, HcPreSource::Own, rows, &mut branch);
+                if graph {
+                    testing::capture(s, pre_run)?.launch()?;
+                } else {
+                    let mut run = pre_run;
+                    run()?;
+                }
+                let pre = s.clone_dtoh(&runtime.mix_pre)?;
+                let post = s.clone_dtoh(&runtime.mix_post)?;
+                let comb = s.clone_dtoh(&runtime.mix_comb)?;
+                let collapsed = s.clone_dtoh(&branch)?;
+                for row in 0..rows {
+                    let stream = &host_stream[row * mult * hidden..(row + 1) * mult * hidden];
+                    let mixes = oracle.mixes(stream, &weights, &fx.base, &fx.scale);
+                    for j in 0..mult {
+                        ensure!(
+                            (f64::from(pre[row * mult + j]) - mixes.pre[j]).abs() <= 1e-5,
+                            "GLM runtime pre coefficient mismatch"
+                        );
+                        ensure!(
+                            (f64::from(post[row * mult + j]) - mixes.post[j]).abs() <= 1e-5,
+                            "GLM runtime post coefficient mismatch"
+                        );
+                    }
+                    for j in 0..mult * mult {
+                        ensure!(
+                            (f64::from(comb[row * mult * mult + j]) - mixes.comb[j]).abs() <= 1e-4,
+                            "GLM runtime comb coefficient mismatch"
+                        );
+                    }
+                    let own: Vec<_> = pre[row * mult..(row + 1) * mult]
+                        .iter()
+                        .map(|&v| f64::from(v))
+                        .collect();
+                    let expected = oracle.collapse(stream, &own);
+                    for (&got, &want) in collapsed[row * hidden..(row + 1) * hidden]
+                        .iter()
+                        .zip(&expected)
+                    {
+                        ensure!(
+                            bf16_ulp_distance(got, want) <= 1
+                                || (f64::from(got.to_f32()) - f64::from(want.to_f32())).abs()
+                                    <= OUTPUT_ABS_TOL,
+                            "GLM own-policy collapse mismatch"
+                        );
+                    }
+                    if matches!(stage, HcSublayer::Ffn) {
+                        let stale: Vec<_> = prior_pre[row * mult..(row + 1) * mult]
+                            .iter()
+                            .map(|&v| f64::from(v))
+                            .collect();
+                        let wrong = oracle.collapse(stream, &stale);
+                        controls += expected
+                            .iter()
+                            .zip(wrong)
+                            .filter(|(a, b)| {
+                                bf16_ulp_distance(**a, *b) > 1
+                                    && (a.to_f32() - b.to_f32()).abs() > OUTPUT_ABS_TOL as f32
+                            })
+                            .count();
+                    }
+                }
+                prior_pre = pre;
+                s.memcpy_htod(&fx.sublayer, &mut branch)?;
+                let post_run = || runtime.hc_post(s, 0, stage, rows, &branch);
+                if graph {
+                    testing::capture(s, post_run)?.launch()?;
+                } else {
+                    let mut run = post_run;
+                    run()?;
+                }
+                let updated = s.clone_dtoh(&runtime.stream)?;
+                for row in 0..rows {
+                    let ps: Vec<_> = post[row * mult..(row + 1) * mult]
+                        .iter()
+                        .map(|&v| f64::from(v))
+                        .collect();
+                    let cs: Vec<_> = comb[row * mult * mult..(row + 1) * mult * mult]
+                        .iter()
+                        .map(|&v| f64::from(v))
+                        .collect();
+                    let expected = oracle.update(
+                        &fx.sublayer[row * hidden..(row + 1) * hidden],
+                        &host_stream[row * mult * hidden..(row + 1) * mult * hidden],
+                        &ps,
+                        &cs,
+                        true,
+                        true,
+                    );
+                    ensure!(
+                        updated[row * mult * hidden..(row + 1) * mult * hidden] == expected,
+                        "GLM runtime post rounding/orientation mismatch"
+                    );
+                }
+                host_stream = updated;
+            }
+            let final_run = || runtime.collapse_final(s, rows, &mut branch);
+            if graph {
+                testing::capture(s, final_run)?.launch()?;
+            } else {
+                let mut run = final_run;
+                run()?;
+            }
+            let actual = s.clone_dtoh(&branch)?;
+            for row in 0..rows {
+                let stream = &host_stream[row * mult * hidden..(row + 1) * mult * hidden];
+                let expected = oracle.collapse(stream, &vec![1.0 / mult as f64; mult]);
+                ensure!(
+                    actual[row * hidden..(row + 1) * hidden] == expected,
+                    "GLM uniform head collapse mismatch"
+                );
+                let stale: Vec<_> = prior_pre[row * mult..(row + 1) * mult]
+                    .iter()
+                    .map(|&v| f64::from(v))
+                    .collect();
+                controls += expected
+                    .iter()
+                    .zip(oracle.collapse(stream, &stale))
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+            }
+            println!(
+                "PASS GLM_MHC_RUNTIME rows={rows} mult={mult} hidden={hidden} graph={graph} own_own=true post_bits=0 uniform_head_bits=0"
+            );
+        }
+        ensure!(controls > 0, "GLM stale-pre policy control escaped");
+        println!("PASS GLM_MHC_POLICY_CONTROL differing_elements={controls}");
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires coordinator-granted GPU window; FF_Q38_GPU_WINDOW=granted"]
     fn mhc_post_comb_matches_definition_reference() -> Result<()> {
@@ -1536,10 +1735,10 @@ mod tests {
         let comb: Vec<f32> = (0..ROWS as usize)
             .flat_map(|_| comb_row.iter().flat_map(|r| r.iter().copied()))
             .collect();
-        let subb = testing::upload(&device.upload, sublayer.clone())?;
-        let resb = testing::upload(&device.upload, residual.clone())?;
-        let postb = testing::upload(&device.upload, post.clone())?;
-        let combb = testing::upload(&device.upload, comb.clone())?;
+        let subb = testing::upload_device(&device, sublayer.clone())?;
+        let resb = testing::upload_device(&device, residual.clone())?;
+        let postb = testing::upload_device(&device, post.clone())?;
+        let combb = testing::upload_device(&device, comb.clone())?;
         device.finish_upload()?;
         let updated = testing::zeros::<bf16>(s, n_stream)?;
         ops.update(
@@ -1577,14 +1776,27 @@ mod tests {
             eps: 0.0,
             norm_eps: 1e-5,
         };
-        let expected = oracle.update(
-            &sublayer,
-            &residual,
-            &post.iter().map(|v| f64::from(*v)).collect::<Vec<_>>(),
-            &comb.iter().map(|v| f64::from(*v)).collect::<Vec<_>>(),
-            true,
-            true,
-        );
+        let expected: Vec<_> = (0..ROWS as usize)
+            .flat_map(|row| {
+                let hidden = HIDDEN as usize;
+                let mult = MULT as usize;
+                oracle.update(
+                    &sublayer[row * hidden..(row + 1) * hidden],
+                    &residual[row * mult * hidden..(row + 1) * mult * hidden],
+                    &post[row * mult..(row + 1) * mult]
+                        .iter()
+                        .map(|v| f64::from(*v))
+                        .collect::<Vec<_>>(),
+                    &comb[row * mult * mult..(row + 1) * mult * mult]
+                        .iter()
+                        .map(|v| f64::from(*v))
+                        .collect::<Vec<_>>(),
+                    true,
+                    true,
+                )
+            })
+            .collect();
+        ensure!(actual.len() == expected.len(), "mHC oracle output extent");
         let mismatches = actual
             .iter()
             .zip(&expected)
@@ -1598,6 +1810,6 @@ mod tests {
         eprintln!(
             "PASS MHC_POST_COMB_DEFINITION rows={ROWS} mult={MULT} hidden={HIDDEN} bit_mismatches=0 threshold=0"
         );
-        Ok(())
+        glm_runtime_policy(&device)
     }
 }

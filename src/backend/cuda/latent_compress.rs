@@ -1,7 +1,7 @@
 use crate::backend::cuda::contracts::{SeqRef, Tensor, dense_layout, spans_disjoint};
 use crate::backend::cuda::cubin;
+use crate::backend::gpu::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use half::bf16;
 use std::sync::Arc;
 
@@ -163,7 +163,7 @@ impl LatentCompressPlan {
 mod tests {
     use super::*;
     use crate::backend::cuda::contracts::view;
-    use cudarc::driver::DevicePtr;
+    use crate::backend::gpu::DevicePtr;
 
     fn tensor<T: Copy, const R: usize>(ptr: u64, shape: [u32; R]) -> Result<Tensor<T, R>> {
         let (stride, count) = dense_layout(shape)?;
@@ -314,8 +314,7 @@ mod tests {
                 0,
                 0,
             ])?;
-            let (pointer, record) = metadata.device_ptr(&stream);
-            drop(record);
+            let pointer = metadata.device_ptr(&stream).0;
             let count = rows.div_ceil(2) * 512;
             let sentinel = bf16::from_f32(31.0);
             let output = stream.clone_htod(&vec![sentinel; count + 8])?;
@@ -341,13 +340,10 @@ mod tests {
                 stream.memcpy_htod(&vec![19.0; 1024], &mut tail_values)?;
             }
             if graph {
-                stream.begin_capture(
-                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-                )?;
-                plan.run(&stream)?;
-                let captured = stream
-                    .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                    .context("compression graph capture was empty")?;
+                let captured = crate::backend::cuda::moe::testing::capture(&stream, || {
+                    plan.run(&stream)?;
+                    Ok(())
+                })?;
                 captured.launch()?;
             } else {
                 plan.run(&stream)?;
@@ -519,12 +515,25 @@ mod tests {
                         trace_operands(&ctx, &cell.values, &cell.scores, initial, [graph, false])?;
                     let mut bad = 0;
                     let mut maximum = 0.0f64;
-                    for (&got, &want) in result.pooled.iter().zip(&cell.pooled) {
+                    for (index, (&got, &want)) in result.pooled.iter().zip(&cell.pooled).enumerate()
+                    {
                         let distance = (f64::from(bf16::from_bits(got).to_f32())
                             - f64::from(bf16::from_bits(want).to_f32()))
                         .abs();
                         maximum = maximum.max(distance);
-                        bad += usize::from(distance > cell.bound);
+                        if distance > cell.bound {
+                            let row = index / 512 * 2;
+                            let column = index % 512;
+                            println!(
+                                "COMPRESSOR_STORE owner={} initial={initial} graph={graph} row={row} column={column} candidate={got} publisher={want} v0={:?} v1={:?} s0={:?} s1={:?}",
+                                cell.owner,
+                                cell.values[row * 512 + column],
+                                cell.values[(row + 1) * 512 + column],
+                                cell.scores[row * 512 + column],
+                                cell.scores[(row + 1) * 512 + column]
+                            );
+                            bad += 1;
+                        }
                     }
                     let repeat = result
                         .pooled
