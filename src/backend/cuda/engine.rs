@@ -2077,6 +2077,18 @@ impl Engine {
     }
 
     #[cfg(test)]
+    pub(crate) fn gemma_workspace(&self, rows: usize, capacity: usize) -> Result<usize> {
+        qwen::Runtime::workspace(
+            &self.model_spec,
+            rows,
+            capacity,
+            crate::gdn_plan::GdnPolicy::P2,
+            1,
+            Some(&self.device.stream),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn gemma_final_probe(&mut self, input: &[bf16]) -> Result<Vec<bf16>> {
         let width = self.model_spec.hidden as usize;
         ensure!(

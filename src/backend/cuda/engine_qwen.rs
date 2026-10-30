@@ -4,7 +4,7 @@ use crate::backend::cuda::contracts::view;
 use crate::backend::cuda::{
     attention_d256::{AttentionBindings, FullAttentionOps, FullAttentionPlan, PositionBindings},
     contracts::{RowDomain, Scratch, Tensor, TensorMut},
-    flash::Score,
+    flash::{Flash, Score},
     gdn::{
         CUDA_GRID_YZ_MAX, GdnBindings, GdnConvWeights, GdnDecayWeights, GdnGateInput, GdnOps,
         GdnPlan,
@@ -1112,6 +1112,7 @@ impl Runtime {
         capacity: usize,
         policy: GdnPolicy,
         verify_rows: usize,
+        stream: Option<&Arc<CudaStream>>,
     ) -> Result<usize> {
         if model.architecture == crate::model_spec::Architecture::Flint {
             let moe = model.moe.context("Flint MoE geometry missing")?;
@@ -1140,7 +1141,40 @@ impl Runtime {
             return Ok(usize::try_from(decode.max(prefill).div_ceil(256) * 256)?);
         }
         if model.architecture == crate::model_spec::Architecture::Gemma4 {
-            return Ok(0);
+            let stream = stream.context("Gemma workspace admission requires a device stream")?;
+            let layers = model.layers.len();
+            let per_layer_input = model.per_layer_input.context("PLE width missing")? as usize;
+            let per_layer_inputs = rows
+                .checked_mul(layers)
+                .and_then(|n| n.checked_mul(per_layer_input))
+                .and_then(|n| n.checked_mul(2))
+                .context("PLE admission bytes overflow")?;
+            let rope_tables = capacity
+                .checked_mul(256 + 512)
+                .and_then(|n| n.checked_mul(2))
+                .context("RoPE admission bytes overflow")?;
+            let flash = model.layers.iter().try_fold(0usize, |total, layer| {
+                let geometry = layer.geometry.context("Gemma attention geometry missing")?;
+                Flash::workspace(
+                    stream,
+                    rows,
+                    model.q_heads as usize,
+                    geometry.head_dim as usize,
+                    capacity,
+                )?
+                .checked_add(total)
+                .context("Flash admission bytes overflow")
+            })?;
+            let kv_width = (model.kv_heads * model.head_dim) as usize;
+            let staging = (512 + rows)
+                .checked_mul(kv_width)
+                .and_then(|n| n.checked_mul(4))
+                .context("KV staging admission bytes overflow")?;
+            return per_layer_inputs
+                .checked_add(rope_tables)
+                .and_then(|n| n.checked_add(flash))
+                .and_then(|n| n.checked_add(staging))
+                .context("Gemma admission bytes overflow");
         }
         let attention = if model.architecture == crate::model_spec::Architecture::Glm5Next {
             None
@@ -2591,8 +2625,16 @@ impl Engine {
             "invalid Q38 capacity"
         );
         // Reject an incomplete operator plan before allocating model weights.
+        let device = Device::new(ordinal)?;
         #[cfg(feature = "cuda")]
-        Runtime::workspace(&model_spec, 1, capacity, GdnPolicy::P2, verify_rows)?;
+        Runtime::workspace(
+            &model_spec,
+            1,
+            capacity,
+            GdnPolicy::P2,
+            verify_rows,
+            Some(&device.stream),
+        )?;
         let runtime = settings
             .runtime_dir
             .as_deref()
@@ -2606,10 +2648,16 @@ impl Engine {
                 settings.draft_model
             ),
         ));
-        let device = Device::new(ordinal)?;
         let gdn_policy = GdnPolicy::for_device(&device.info);
         #[cfg(feature = "rocm")]
-        Runtime::workspace(&model_spec, 1, capacity, gdn_policy, verify_rows)?;
+        Runtime::workspace(
+            &model_spec,
+            1,
+            capacity,
+            gdn_policy,
+            verify_rows,
+            Some(&device.stream),
+        )?;
         let prefix_cache = settings.prefix_cache;
         #[cfg(feature = "cuda")]
         let mut catalog = if prefix_cache {
@@ -2773,13 +2821,20 @@ impl Engine {
                     ..request
                 },
                 |rows| {
-                    Runtime::workspace(&model_spec, rows, capacity, gdn_policy, verify_rows)?
-                        .checked_add(Runtime::native_workspace(
-                            &model_spec,
-                            &catalog.manifest,
-                            rows,
-                        )?)
-                        .context("native GLM workspace overflow")
+                    Runtime::workspace(
+                        &model_spec,
+                        rows,
+                        capacity,
+                        gdn_policy,
+                        verify_rows,
+                        Some(s),
+                    )?
+                    .checked_add(Runtime::native_workspace(
+                        &model_spec,
+                        &catalog.manifest,
+                        rows,
+                    )?)
+                    .context("native GLM workspace overflow")
                 },
                 |rows| Ok(1usize << (usize::BITS - 1 - rows.leading_zeros())),
             )?)
@@ -2794,8 +2849,14 @@ impl Engine {
             &setup.workspace.mixer
         } else {
             let workspace = |rows| {
-                let mut target =
-                    Runtime::workspace(&model_spec, rows, capacity, gdn_policy, verify_rows)?;
+                let mut target = Runtime::workspace(
+                    &model_spec,
+                    rows,
+                    capacity,
+                    gdn_policy,
+                    verify_rows,
+                    Some(s),
+                )?;
                 if !flint && settings.kv_format != crate::kv::KvFormat::Bf16 {
                     target = target.max(
                         crate::op_contract::AttentionWorkspace::new(
@@ -2870,22 +2931,29 @@ impl Engine {
         if let Some(draft) = &mut draft {
             draft.grow(context_rows)?;
         }
-        let target_workspace =
-            Runtime::workspace(&model_spec, rows, capacity, gdn_policy, verify_rows)?.max(
-                if flint || settings.kv_format == crate::kv::KvFormat::Bf16 {
-                    0
-                } else {
-                    crate::op_contract::AttentionWorkspace::new(
-                        attention
-                            .as_ref()
-                            .context("Q38 attention specification missing")?,
-                        verify_rows as u32,
-                        capacity as u32,
-                        limits(verify_rows, capacity)?.key_chunk,
-                    )?
-                    .bytes as usize
-                },
-            );
+        let target_workspace = Runtime::workspace(
+            &model_spec,
+            rows,
+            capacity,
+            gdn_policy,
+            verify_rows,
+            Some(s),
+        )?
+        .max(
+            if flint || settings.kv_format == crate::kv::KvFormat::Bf16 {
+                0
+            } else {
+                crate::op_contract::AttentionWorkspace::new(
+                    attention
+                        .as_ref()
+                        .context("Q38 attention specification missing")?,
+                    verify_rows as u32,
+                    capacity as u32,
+                    limits(verify_rows, capacity)?.key_chunk,
+                )?
+                .bytes as usize
+            },
+        );
         let (attention_prefill_bytes, attention_decode_bytes, attention_verify_bytes) =
             if flint || glm || gemma {
                 (0, 0, 0)
@@ -6446,7 +6514,8 @@ mod tests {
             assert!(plans.select(0, &narrow).is_err());
             assert!(plans.select(capacity + 1, &narrow).is_err());
             assert!(plans.select(usize::MAX, &narrow).is_err());
-            let budget = Runtime::workspace(&geometry(), capacity, 4096, GdnPolicy::P2, 5)? as u64;
+            let budget =
+                Runtime::workspace(&geometry(), capacity, 4096, GdnPolicy::P2, 5, None)? as u64;
             for rows in 1..=5.min(capacity) {
                 assert!(
                     GdnOps::workspace(
@@ -6509,7 +6578,7 @@ mod tests {
         for capacity in [256, 16_832] {
             let required =
                 FullAttentionOps::workspace(&FullAttentionSpec::q38(), limits(5, capacity)?)?;
-            let allocated = Runtime::workspace(&geometry(), 5, capacity, GdnPolicy::P2, 5)?;
+            let allocated = Runtime::workspace(&geometry(), 5, capacity, GdnPolicy::P2, 5, None)?;
             ensure!(
                 required.bytes <= allocated as u64,
                 "nested verify workspace {required:?} exceeds allocation {allocated}"
@@ -6519,7 +6588,7 @@ mod tests {
             let fixed = Runtime::fixed_bytes(&spec, capacity)? + mtp.fixed_bytes;
             let workspace = |rows| {
                 Ok(
-                    Runtime::workspace(&geometry(), rows, capacity, GdnPolicy::P2, 5)?
+                    Runtime::workspace(&geometry(), rows, capacity, GdnPolicy::P2, 5, None)?
                         + mtp.workspace(rows)?,
                 )
             };
@@ -6587,7 +6656,7 @@ mod tests {
         let total = 1 << 30;
         let fixed = spec.vocab as usize * 2 + 12 + 64 * size_of::<u64>() + capacity * 12;
         for rows in [1, 65, 128] {
-            let scratch = Runtime::workspace(&geometry(), rows, capacity, GdnPolicy::P2, 5)?;
+            let scratch = Runtime::workspace(&geometry(), rows, capacity, GdnPolicy::P2, 5, None)?;
             for required in [
                 FullAttentionOps::preprocess_workspace(
                     &FullAttentionSpec::q38(),
@@ -6619,7 +6688,7 @@ mod tests {
             };
             let budget = WorkspaceBudget::new(
                 request,
-                |r| Runtime::workspace(&geometry(), r, capacity, GdnPolicy::P2, 5),
+                |r| Runtime::workspace(&geometry(), r, capacity, GdnPolicy::P2, 5, None),
                 Ok,
             )?;
             assert_eq!(budget.planned_transient_bytes, allocated);
@@ -6631,7 +6700,7 @@ mod tests {
                         free_after_resident: request.free_after_resident - 1,
                         ..request
                     },
-                    |r| Runtime::workspace(&geometry(), r, capacity, GdnPolicy::P2, 5),
+                    |r| Runtime::workspace(&geometry(), r, capacity, GdnPolicy::P2, 5, None),
                     Ok,
                 )
                 .is_err()
@@ -6654,7 +6723,7 @@ mod tests {
         let row_bytes = Runtime::row_bytes(&spec)?;
         let fixed = Runtime::fixed_bytes(&spec, capacity)?;
         for rows in [512, 513, 1021, 1024, 2048, 4096, 8192] {
-            let scratch = Runtime::workspace(&geometry(), rows, capacity, policy, 5)?;
+            let scratch = Runtime::workspace(&geometry(), rows, capacity, policy, 5, None)?;
             let gdn = policy.workspace(&crate::op_contract::GdnSpec::q38(), rows as u32)?;
             assert!(scratch as u64 >= gdn.bytes);
             let required = rows * row_bytes + fixed + scratch;
@@ -6669,7 +6738,7 @@ mod tests {
             };
             let budget = WorkspaceBudget::new(
                 request,
-                |r| Runtime::workspace(&geometry(), r, capacity, policy, 5),
+                |r| Runtime::workspace(&geometry(), r, capacity, policy, 5, None),
                 Ok,
             )?;
             assert_eq!(budget.plan.chunk, rows);
@@ -6681,7 +6750,7 @@ mod tests {
                         free_after_resident: request.free_after_resident - 1,
                         ..request
                     },
-                    |r| Runtime::workspace(&geometry(), r, capacity, policy, 5),
+                    |r| Runtime::workspace(&geometry(), r, capacity, policy, 5, None),
                     Ok,
                 )
                 .is_err()

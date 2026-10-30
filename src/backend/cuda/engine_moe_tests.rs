@@ -1388,6 +1388,7 @@ impl Engine {
             #[cfg(feature = "rocm")]
             crate::gdn_plan::GdnPolicy::P2,
             8,
+            Some(&engine.device.stream),
         )?)?;
         engine.qwen = Some(qwen::Runtime::new(
             &engine,
@@ -3146,7 +3147,7 @@ fn injected_layers_bind_hybrid_mixer_geometry() -> Result<()> {
             shape
         );
     }
-    assert!(qwen::Runtime::workspace(&spec, 8, 32, crate::gdn_plan::GdnPolicy::P2, 8)? > 0);
+    assert!(qwen::Runtime::workspace(&spec, 8, 32, crate::gdn_plan::GdnPolicy::P2, 8, None)? > 0);
     let mut old = spec.clone();
     old.architecture = Architecture::Llama;
     assert!(hybrid_manifest(&old).is_err());

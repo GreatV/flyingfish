@@ -256,6 +256,62 @@ struct Attention {
 unsafe impl DeviceRepr for Attention {}
 
 impl Flash {
+    pub fn workspace(
+        stream: &Arc<CudaStream>,
+        rows: usize,
+        heads: usize,
+        head_dim: usize,
+        capacity: usize,
+    ) -> Result<usize> {
+        let elements = rows
+            .checked_mul(heads)
+            .context("prefill LSE extent overflow")?;
+        let mut bytes = elements.checked_mul(4).context("LSE bytes overflow")?;
+        if head_dim == 512 {
+            #[cfg(feature = "cuda")]
+            let (resident, units) = {
+                use cudarc::driver::sys::CUdevice_attribute as A;
+                let ctx = stream.context();
+                let module = super::cubin::module(ctx, "attention_native")?;
+                let partial = module.load_function("attention_partial_d512")?;
+                let resident = partial
+                    .occupancy_max_active_blocks_per_multiprocessor(128, 90112, None)?
+                    as usize;
+                (
+                    resident,
+                    usize::try_from(ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?)?,
+                )
+            };
+            #[cfg(feature = "rocm")]
+            let (resident, units) = {
+                let ctx = stream.context();
+                let module = super::cubin::module(ctx, "attention")?;
+                let partial = module.load_function("attention_partial_d512")?;
+                let resident =
+                    partial.occupancy_max_active_blocks_per_multiprocessor(128, 0, None)? as usize;
+                (resident, usize::try_from(ctx.properties.compute_units)?)
+            };
+            let (parts, _) = split_extent(
+                capacity,
+                heads,
+                units
+                    .checked_mul(resident)
+                    .context("D512 resident grid overflow")?,
+            )?;
+            let partial = rows
+                .min(16)
+                .checked_mul(heads)
+                .and_then(|n| n.checked_mul(parts))
+                .and_then(|n| n.checked_mul(514))
+                .and_then(|n| n.checked_mul(4))
+                .context("D512 partial workspace overflow")?;
+            bytes = bytes
+                .checked_add(partial)
+                .context("attention workspace bytes overflow")?;
+        }
+        Ok(bytes)
+    }
+
     /// Query tile rows for the bound prefill family.
     pub fn tile(head_dim: usize) -> Result<usize> {
         ensure!(

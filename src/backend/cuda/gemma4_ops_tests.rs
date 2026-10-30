@@ -1980,7 +1980,29 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         ensure!(actual == expected, "published tensor mismatch: {full}");
     }
     drop(catalog);
+    let admission_stream = device.stream.clone();
     let mut engine = super::engine::Engine::load(&dir, 0, 640, Some(640), settings.clone())?;
+    let (admission_rows, admission_capacity) = (65_504usize, 131_072usize);
+    let per_layer_inputs = admission_rows * spec.layers.len() * 256 * 2;
+    let rope_tables = admission_capacity * (256 + 512) * 2;
+    let flash = spec.layers.iter().try_fold(0usize, |total, layer| {
+        let geometry = layer.geometry.context("Gemma geometry missing")?;
+        super::flash::Flash::workspace(
+            &admission_stream,
+            admission_rows,
+            spec.q_heads as usize,
+            geometry.head_dim as usize,
+            admission_capacity,
+        )
+        .map(|bytes| total + bytes)
+    })?;
+    let staging = (512 + admission_rows) * spec.kv_heads as usize * spec.head_dim as usize * 4;
+    let expected = per_layer_inputs + rope_tables + flash + staging;
+    let admitted = engine.gemma_workspace(admission_rows, admission_capacity)?;
+    println!(
+        "GEMMA4_WORKSPACE admitted={admitted} expected={expected} per_layer_inputs={per_layer_inputs} rope_tables={rope_tables} flash={flash} staging={staging}"
+    );
+    ensure!(admitted == expected, "Gemma workspace admission mismatch");
     let global_layer = spec
         .layers
         .iter()
