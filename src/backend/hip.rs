@@ -729,7 +729,7 @@ impl Stream {
         Launch {
             stream: self,
             function,
-            arguments: [[0; 8]; 32],
+            arguments: [[0; 9]; 32],
             allocations: std::array::from_fn(|_| None),
             count: 0,
         }
@@ -1241,13 +1241,14 @@ pub struct Module {
 impl Module {
     pub fn load_function(self: &Arc<Self>, name: &str) -> Result<Function> {
         self.context.bind_to_thread()?;
-        let name = CString::new(name)?;
+        let symbol = CString::new(name)?;
         let mut handle = std::ptr::null_mut();
         unsafe {
             check(
-                hipModuleGetFunction(&mut handle, self.handle as Handle, name.as_ptr()),
+                hipModuleGetFunction(&mut handle, self.handle as Handle, symbol.as_ptr()),
                 "hipModuleGetFunction",
-            )?;
+            )
+            .with_context(|| format!("HIP kernel symbol {name}"))?;
         }
         Ok(Function {
             handle: handle as usize,
@@ -1268,6 +1269,18 @@ pub struct Function {
     module: Arc<Module>,
 }
 impl Function {
+    pub fn local_size_bytes(&self) -> Result<i32> {
+        self.module.context.bind_to_thread()?;
+        let mut value = 0;
+        unsafe {
+            check(
+                hipFuncGetAttribute(&mut value, 3, self.handle as Handle),
+                "hipFuncGetAttribute(localSizeBytes)",
+            )?;
+        }
+        Ok(value)
+    }
+
     pub fn shared_size_bytes(&self) -> Result<i32> {
         self.module.context.bind_to_thread()?;
         let mut value = 0;
@@ -1326,7 +1339,7 @@ pub struct LaunchConfig {
 pub struct Launch<'a> {
     stream: &'a Arc<Stream>,
     function: &'a Function,
-    arguments: [[u64; 8]; 32],
+    arguments: [[u64; 9]; 32],
     allocations: [Option<Arc<Allocation>>; 32],
     count: usize,
 }
@@ -1340,8 +1353,8 @@ impl Launch<'_> {
             "HIP_KERNEL_ARGUMENT_LIMIT=32"
         );
         assert!(
-            size_of::<T>() <= 64 && align_of::<T>() <= 8,
-            "HIP_ARGUMENT_BYTES_LIMIT=64 alignment_limit=8"
+            size_of::<T>() <= 72 && align_of::<T>() <= 8,
+            "HIP_ARGUMENT_BYTES_LIMIT=72 alignment_limit=8"
         );
         let bytes = &mut self.arguments[self.count];
         unsafe {

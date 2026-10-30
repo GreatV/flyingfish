@@ -1,6 +1,7 @@
 {
   "rule": "Twice the maximum A-only FP32/BF16 reference deviation from independent FP64 across HIP/CUDA and full/17-query shapes; three exact FP32 repeats. Frozen before candidate execution.",
   "reference_cells": 280,
+  "extended_rule": "The 764-case E grid uses accepted sm86/sm89 FP32/BF16 and shape-variation floors, frozen before HIP candidates; absolute output max, output RMS and LSE max. Candidate seeds are 47 and 71.",
   "floors": {
     "256-causal": {
       "output_max": 0.0025993622507483162,
@@ -29,6 +30,21 @@
     }
   },
   "limits": {
+    "e256-legacy": {
+      "output_max": 0.006304088076299452,
+      "output_rms": 0.00196498347710934,
+      "lse_max": 3.5915567053734776e-6
+    },
+    "e256-unit": {
+      "output_max": 0.0078125,
+      "output_rms": 0.0017012367252344392,
+      "lse_max": 4.475625530631078e-6
+    },
+    "e512-unit": {
+      "output_max": 0.0078125,
+      "output_rms": 0.0016487033621029159,
+      "lse_max": 5.142130660829025e-6
+    },
     "256-causal": {
       "output_max": 0.0051987245014966325,
       "output_rms": 0.0019007991915960015,

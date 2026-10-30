@@ -849,6 +849,7 @@ pub(super) fn hybrid_spec() -> Result<crate::model_spec::ModelSpec> {
     });
     spec.layers = vec![
         LayerPlan {
+            geometry: None,
             mixer: Mixer::Gdn,
             state_index: 0,
             rope: false,
@@ -856,6 +857,7 @@ pub(super) fn hybrid_spec() -> Result<crate::model_spec::ModelSpec> {
             ffn: crate::model_spec::FfnKind::Moe,
         },
         LayerPlan {
+            geometry: None,
             mixer: Mixer::FullAttention,
             state_index: 0,
             rope: true,
@@ -1162,22 +1164,26 @@ impl Engine {
         let mut linear = LayerLinearPlan::bind(&plan, &catalog, None, stream)?;
         let ffn = BoundFfn::bind(&model_spec, &mut linear)?;
         let weights = Weights {
-            embed: stream.clone_htod(
-                &(0..32 * d.hidden)
-                    .map(|index| {
-                        let (token, column) = (index / d.hidden, index % d.hidden);
-                        if column < 8 {
-                            if token % 8 == column {
-                                bf16::ONE
+            embed: Some(
+                stream.clone_htod(
+                    &(0..32 * d.hidden)
+                        .map(|index| {
+                            let (token, column) = (index / d.hidden, index % d.hidden);
+                            if column < 8 {
+                                if token % 8 == column {
+                                    bf16::ONE
+                                } else {
+                                    bf16::ZERO
+                                }
                             } else {
-                                bf16::ZERO
+                                bf16::from_f32(
+                                    (((token * 37 + column * 11) % 53) as f32 - 26.0) / 64.0,
+                                )
                             }
-                        } else {
-                            bf16::from_f32((((token * 37 + column * 11) % 53) as f32 - 26.0) / 64.0)
-                        }
-                    })
-                    .collect::<Vec<_>>(),
-            )?,
+                        })
+                        .collect::<Vec<_>>(),
+                )?,
+            ),
             norm: Some(stream.clone_htod(&vec![bf16::ONE; d.hidden])?),
             head: stream.clone_htod(
                 &(0..32 * d.hidden)
@@ -1310,11 +1316,8 @@ impl Engine {
             #[cfg(test)]
             flint_window_capture: None,
             qwen: None,
-            #[cfg(feature = "cuda")]
             deepseek_mixer: None,
-            #[cfg(feature = "cuda")]
             deepseek_ffn: None,
-            #[cfg(feature = "cuda")]
             deepseek_engram: None,
             recurrent: None,
             hc: None,
@@ -1382,6 +1385,7 @@ impl Engine {
             #[cfg(feature = "rocm")]
             crate::gdn_plan::GdnPolicy::P2,
             8,
+            Some(&engine.device.stream),
         )?)?;
         engine.qwen = Some(qwen::Runtime::new(
             &engine,
@@ -3140,7 +3144,7 @@ fn injected_layers_bind_hybrid_mixer_geometry() -> Result<()> {
             shape
         );
     }
-    assert!(qwen::Runtime::workspace(&spec, 8, 32, crate::gdn_plan::GdnPolicy::P2, 8)? > 0);
+    assert!(qwen::Runtime::workspace(&spec, 8, 32, crate::gdn_plan::GdnPolicy::P2, 8, None)? > 0);
     let mut old = spec.clone();
     old.architecture = Architecture::Llama;
     assert!(hybrid_manifest(&old).is_err());

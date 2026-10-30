@@ -1,16 +1,25 @@
 #include "gpu_compat.cuh"
 #include "q38_contract.cuh"
 
+// mode: 0 = SiLU, product rounded twice; 1 = SiLU, rounded once; 2 = GELU (tanh form), product rounded twice.
+__device__ __forceinline__ float gelu_tanh(float x) {
+    const float cube = x * x * x;
+    const float inner = 0.7978845608028654f * (x + 0.044715f * cube);
+    return 0.5f * x * (1.0f + tanhf(inner));
+}
+
 extern "C" __global__ void silu_mul(const __nv_bfloat16* gu, __nv_bfloat16* y,
-                                   int rows, int dim, int rounding_once) {
-    if ((unsigned)rounding_once > 1u) __trap();
+                                   int rows, int dim, int mode) {
+    if ((unsigned)mode > 2u) __trap();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows * dim) return;
     int row = i / dim;
     int d = i % dim;
     float g = __bfloat162float(gu[row * 2 * dim + d]);
     const float u = __bfloat162float(gu[row * 2 * dim + dim + d]);
-    if (rounding_once) {
+    if (mode == 2) {
+      y[i] = __hmul(__float2bfloat16(gelu_tanh(g)), gu[row * 2 * dim + dim + d]);
+    } else if (mode == 1) {
       y[i] = __float2bfloat16(g / (1.0f + expf(-g)) * u);
     } else {
       const __nv_bfloat16 s = __float2bfloat16(g / (1.0f + expf(-g)));
@@ -22,13 +31,15 @@ extern "C" __global__ void silu_mul(const __nv_bfloat16* gu, __nv_bfloat16* y,
 extern "C" __global__ void silu_mul_split(const __nv_bfloat16* gate,
                                          const __nv_bfloat16* up,
                                          __nv_bfloat16* y, int count,
-                                         int rounding_once) {
-    if ((unsigned)rounding_once > 1u) __trap();
+                                         int mode) {
+    if ((unsigned)mode > 2u) __trap();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     const float g = __bfloat162float(gate[i]);
     const float u = __bfloat162float(up[i]);
-    if (rounding_once) {
+    if (mode == 2) {
+      y[i] = __hmul(__float2bfloat16_rn(gelu_tanh(g)), up[i]);
+    } else if (mode == 1) {
       y[i] = __float2bfloat16_rn(g / (1.0f + expf(-g)) * u);
     } else {
       const __nv_bfloat16 s = __float2bfloat16_rn(g / (1.0f + expf(-g)));
@@ -74,4 +85,20 @@ extern "C" __global__ void silu_mul_split_clamped(
         rv[i] = __float2bfloat16_rn(s * u);
     }
     reinterpret_cast<uint4*>(y + row * width)[vector] = result;
+}
+
+// y = bf16(a * b), elementwise.
+extern "C" __global__ void multiply(const __nv_bfloat16* a, const __nv_bfloat16* b,
+                                    __nv_bfloat16* y, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) y[i] = __hmul(a[i], b[i]);
+}
+
+// x = bf16(bf16(tanh(bf16(x / cap))) * cap), in place.
+extern "C" __global__ void softcap(__nv_bfloat16* x, long long count, float cap) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float z = __bfloat162float(__float2bfloat16_rn(__bfloat162float(x[i]) / cap));
+    const float t = __bfloat162float(__float2bfloat16_rn(tanhf(z)));
+    x[i] = __float2bfloat16_rn(t * cap);
 }

@@ -589,7 +589,6 @@ extern "C" __global__ void moe_combine_accum(
     *reinterpret_cast<float4*>(yr + d0) = out.v;
   }
 }
-#if !defined(__HIP__)
 extern "C" __global__ void moe_combine_bf16(
     const bf16* __restrict__ contributions, const bf16* __restrict__ shared_out,
     const int* __restrict__ ids, const unsigned* __restrict__ done,
@@ -612,4 +611,3 @@ extern "C" __global__ void moe_combine_bf16(
     yr[d] = __hadd(acc, sh[d]);
   }
 }
-#endif

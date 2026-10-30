@@ -312,7 +312,10 @@ impl MultimodalInput<'_> {
             Architecture::LoopVl => {
                 self.validate_loopvl(spec.vocab, spec.max_position as usize, capacity)
             }
-            Architecture::Llama | Architecture::Flint | Architecture::Glm5Next => {
+            Architecture::Llama
+            | Architecture::Flint
+            | Architecture::Glm5Next
+            | Architecture::Gemma4 => {
                 bail!("packed images require a supported multimodal architecture")
             }
             Architecture::DeepseekV41 => {

@@ -1,5 +1,5 @@
 #pragma once
-#include <cuda_runtime.h>
+#include "gpu_compat.cuh"
 
 template<int Capacity>
 struct DsaTopK {

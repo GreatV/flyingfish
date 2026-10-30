@@ -36,7 +36,6 @@ use std::{
     time::Instant,
 };
 
-#[cfg(feature = "cuda")]
 #[path = "engine_deepseek.rs"]
 pub(crate) mod deepseek;
 #[path = "engine_moe.rs"]
@@ -573,7 +572,6 @@ impl SetupMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg(feature = "cuda")]
 enum LoadDispatch {
     Qwen,
     Llama,
@@ -581,7 +579,6 @@ enum LoadDispatch {
     Deepseek,
 }
 
-#[cfg(feature = "cuda")]
 fn load_dispatch(architecture: crate::model_spec::Architecture) -> Result<LoadDispatch> {
     use crate::model_spec::Architecture;
     Ok(match architecture {
@@ -592,6 +589,7 @@ fn load_dispatch(architecture: crate::model_spec::Architecture) -> Result<LoadDi
         Architecture::LoopVl => LoadDispatch::Recurrent,
         Architecture::DeepseekV41 => LoadDispatch::Deepseek,
         Architecture::Glm5Next => LoadDispatch::Qwen,
+        Architecture::Gemma4 => LoadDispatch::Qwen,
     })
 }
 
@@ -618,11 +616,8 @@ pub struct Engine {
     hidden_capture: Option<HiddenCapture>,
     qwen: Option<qwen::Runtime>,
     recurrent: Option<recurrent::Runtime>,
-    #[cfg(feature = "cuda")]
     deepseek_mixer: Option<deepseek::DeepseekMixer>,
-    #[cfg(feature = "cuda")]
     deepseek_ffn: Option<deepseek::DeepseekFfn>,
-    #[cfg(feature = "cuda")]
     deepseek_engram: Option<deepseek::DeepseekEngram>,
     hc: Option<super::hc::HcRuntime>,
     glm_dsa: Option<qwen::GlmDsaOutputs>,
@@ -1090,13 +1085,17 @@ impl Engine {
         let chunk = workspace_rows;
         let mut work = Work::new(s, &model_spec, workspace_rows)?;
         s.memcpy_htod(&[1i32], &mut work.length)?;
-        let flash = Flash::new(
-            s.clone(),
-            workspace_rows,
-            config.num_attention_heads,
-            config.num_key_value_heads,
-            config.head_dim,
-        )?;
+        let flash = if model_spec.architecture == crate::model_spec::Architecture::Gemma4 {
+            None
+        } else {
+            Some(Flash::new(
+                s.clone(),
+                workspace_rows,
+                config.num_attention_heads,
+                config.num_key_value_heads,
+                config.head_dim,
+            )?)
+        };
         s.synchronize()?;
         let mut engine = Self {
             #[cfg(test)]
@@ -1108,11 +1107,8 @@ impl Engine {
             #[cfg(test)]
             flint_window_capture: None,
             qwen: None,
-            #[cfg(feature = "cuda")]
             deepseek_mixer: None,
-            #[cfg(feature = "cuda")]
             deepseek_ffn: None,
-            #[cfg(feature = "cuda")]
             deepseek_engram: None,
             recurrent: None,
             hc: None,
@@ -1162,7 +1158,7 @@ impl Engine {
             ops,
             blas,
             #[cfg(feature = "cuda")]
-            flash: Some(flash),
+            flash,
             decode: None,
             logits_f32: None,
             device,
@@ -1251,7 +1247,6 @@ impl Engine {
         let old_rows = self.workspace_rows;
         let old_chunk = self.chunk;
         ensure!(rows >= old_rows, "workspace cannot shrink during load");
-        #[cfg(feature = "cuda")]
         ensure!(
             self.deepseek_engram.is_none() || rows == old_rows,
             "Engram workspace is fixed at setup"
@@ -1262,11 +1257,9 @@ impl Engine {
             if let Some(hc) = &mut self.hc {
                 hc.grow(&self.device.stream, rows)?;
             }
-            #[cfg(feature = "cuda")]
             if let Some(mixer) = &mut self.deepseek_mixer {
                 mixer.grow(&self.device.stream, rows)?;
             }
-            #[cfg(feature = "cuda")]
             if let Some(ffn) = &mut self.deepseek_ffn {
                 ffn.grow(&self.device.stream, rows)?;
             }
@@ -1661,7 +1654,9 @@ impl Engine {
         if self.qwen.is_some() {
             ensure!(
                 matches!(step.mask, crate::backend::Mask::Causal)
-                    && (step.head != Head::All || self.model_spec.moe.is_some()),
+                    && (step.head != Head::All
+                        || self.model_spec.moe.is_some()
+                        || self.model_spec.architecture == crate::model_spec::Architecture::Gemma4),
                 "hybrid forward requires causal mask and a bound MoE chain for head={:?}",
                 step.head
             );
@@ -1688,6 +1683,7 @@ impl Engine {
         if step.input == crate::backend::Input::Ids
             && step.head == Head::All
             && matches!(step.mask, crate::backend::Mask::Causal)
+            && self.model_spec.architecture != crate::model_spec::Architecture::Gemma4
         {
             let spec = self
                 .spec
@@ -1719,7 +1715,12 @@ impl Engine {
         } else {
             self.prepare(rows)?;
         }
-        if step.head == Head::All {
+        // HIP Gemma prefill heads execute at the bucket bound by prepare_prefill_rows.
+        if step.head == Head::All
+            && !(cfg!(feature = "rocm")
+                && step.input == crate::backend::Input::Ids
+                && self.model_spec.architecture == crate::model_spec::Architecture::Gemma4)
+        {
             self.blas
                 .prepare(rows, self.config.vocab_size, self.config.hidden_size)?;
         }
@@ -1732,7 +1733,10 @@ impl Engine {
         trace: Option<Target<'_>>,
     ) -> Result<()> {
         let previous = self.qwen_device_prefix;
-        if self.qwen.is_some() && step.head == Head::All {
+        if self.qwen.is_some()
+            && step.head == Head::All
+            && self.model_spec.architecture != crate::model_spec::Architecture::Gemma4
+        {
             self.qwen_device_prefix = true;
         }
         let result = self.run_step_inner(step, trace);
@@ -1756,13 +1760,15 @@ impl Engine {
             self.ensure_decode()?;
         } else if step.head == Head::All && matches!(step.mask, crate::backend::Mask::Causal) {
             {
-                ensure!(
-                    step.rows <= crate::linear_plan::MAX_SKINNY_ROWS,
-                    "chain verification rows={} exceeds skinny bound={}",
-                    step.rows,
-                    crate::linear_plan::MAX_SKINNY_ROWS
-                );
-                self.ensure_verification()?;
+                if self.model_spec.architecture != crate::model_spec::Architecture::Gemma4 {
+                    ensure!(
+                        step.rows <= crate::linear_plan::MAX_SKINNY_ROWS,
+                        "chain verification rows={} exceeds skinny bound={}",
+                        step.rows,
+                        crate::linear_plan::MAX_SKINNY_ROWS
+                    );
+                    self.ensure_verification()?;
+                }
                 if self.qwen.is_some() {
                     self.state.set_sequence(
                         &self.device.stream,
@@ -1774,7 +1780,6 @@ impl Engine {
             }
         }
         if let Some(slots) = self.moe_slots.as_mut() {
-            #[cfg(feature = "cuda")]
             if self.model_spec.architecture == crate::model_spec::Architecture::Glm5Next
                 && !slots.request_open
             {
@@ -1938,6 +1943,239 @@ impl Engine {
         self.profile_rounds = enabled;
     }
 
+    #[cfg(test)]
+    pub(crate) fn gemma_prefill_all(&mut self, ids: &[u32]) -> Result<()> {
+        ensure!(!ids.is_empty(), "Gemma 4 prefill requires token IDs");
+        self.device.stream.memcpy_htod(ids, &mut self.work.ids)?;
+        self.run_step(
+            crate::backend::Step {
+                rows: ids.len(),
+                input: crate::backend::Input::Ids,
+                head: Head::All,
+                mask: crate::backend::Mask::Causal,
+            },
+            None,
+        )?;
+        self.position += ids.len();
+        self.device
+            .stream
+            .memcpy_htod(&[self.position as i32], &mut self.work.position)?;
+        self.device
+            .stream
+            .memcpy_htod(&[(self.position + 1) as i32], &mut self.work.length)?;
+        if self.qwen.is_some() && self.position < self.capacity {
+            self.state.set_sequence(
+                &self.device.stream,
+                self.position as u32,
+                1,
+                self.workspace_rows as u32,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gemma_prefill_trace(
+        &mut self,
+        ids: &[u32],
+        trace: &mut crate::trace::Trace,
+    ) -> Result<()> {
+        ensure!(!ids.is_empty(), "Gemma 4 prefill requires token IDs");
+        self.device.stream.memcpy_htod(ids, &mut self.work.ids)?;
+        self.run_step(
+            crate::backend::Step {
+                rows: ids.len(),
+                input: crate::backend::Input::Ids,
+                head: Head::All,
+                mask: crate::backend::Mask::Causal,
+            },
+            Some(Target {
+                trace,
+                prefix: "",
+                skip: 0,
+            }),
+        )?;
+        self.position += ids.len();
+        self.device
+            .stream
+            .memcpy_htod(&[self.position as i32], &mut self.work.position)?;
+        self.device
+            .stream
+            .memcpy_htod(&[(self.position + 1) as i32], &mut self.work.length)?;
+        if self.qwen.is_some() && self.position < self.capacity {
+            self.state.set_sequence(
+                &self.device.stream,
+                self.position as u32,
+                1,
+                self.workspace_rows as u32,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gemma_decode_trace(
+        &mut self,
+        token: u32,
+        trace: &mut crate::trace::Trace,
+    ) -> Result<()> {
+        self.set_token(token)?;
+        self.run_decode_step(Some(Target {
+            trace,
+            prefix: "",
+            skip: 0,
+        }))?;
+        self.position += 1;
+        self.pending_token = Some(self.token()?);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gemma_rope_table(&self, full: bool, positions: &[usize]) -> Result<Vec<bf16>> {
+        self.qwen
+            .as_ref()
+            .context("Gemma 4 runtime missing")?
+            .gemma_rope_table(&self.device.stream, full, positions, self.capacity)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gemma_position(&self) -> Result<(usize, i32)> {
+        Ok((
+            self.position,
+            self.device.stream.clone_dtoh(&self.work.position)?[0],
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gemma_hidden_state(&self) -> Result<(Vec<bf16>, Vec<bf16>)> {
+        let h = self.model_spec.hidden as usize;
+        Ok((
+            self.device.stream.clone_dtoh(&self.work.x.slice(..h))?,
+            self.device.stream.clone_dtoh(&self.work.n.slice(..h))?,
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gemma_all_logits(&self, row: usize) -> Result<Vec<bf16>> {
+        self.qwen
+            .as_ref()
+            .context("Gemma 4 runtime missing")?
+            .gemma_logits(&self.device.stream, row, self.model_spec.vocab as usize)
+    }
+
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn gemma_linear_plan_receipt(&self) -> Result<serde_json::Value> {
+        self.blas.bound_plan_receipt()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gemma_workspace(&self, rows: usize, capacity: usize) -> Result<usize> {
+        qwen::Runtime::workspace(
+            &self.model_spec,
+            rows,
+            capacity,
+            crate::gdn_plan::GdnPolicy::P2,
+            1,
+            Some(&self.device.stream),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gemma_scratch_len(&self) -> usize {
+        self.qwen
+            .as_ref()
+            .map_or(0, |runtime| runtime.scratch.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gemma_final_probe(&mut self, input: &[bf16]) -> Result<Vec<bf16>> {
+        let width = self.model_spec.hidden as usize;
+        ensure!(
+            !input.is_empty() && input.len().is_multiple_of(width),
+            "Gemma final probe input extent"
+        );
+        let rows = input.len() / width;
+        self.device
+            .stream
+            .memcpy_htod(input, &mut self.work.x.slice_mut(..input.len()))?;
+        self.state.set_sequence(
+            &self.device.stream,
+            0,
+            u32::try_from(rows)?,
+            self.workspace_rows as u32,
+        )?;
+        self.run_operator(
+            crate::backend::Operator::Head,
+            0,
+            crate::backend::Step {
+                rows,
+                input: crate::backend::Input::Ids,
+                head: Head::All,
+                mask: crate::backend::Mask::Causal,
+            },
+            &mut None,
+        )?;
+        let mut output = Vec::with_capacity(rows * self.model_spec.vocab as usize);
+        for row in 0..rows {
+            output.extend(self.gemma_all_logits(row)?);
+        }
+        Ok(output)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gemma_first_layer_probe(
+        &mut self,
+        ids: &[u32],
+        input: &[bf16],
+        trace: &mut crate::trace::Trace,
+    ) -> Result<Vec<bf16>> {
+        let width = self.model_spec.hidden as usize;
+        ensure!(
+            !ids.is_empty() && input.len() == ids.len() * width,
+            "Gemma first-layer probe extent"
+        );
+        self.reset()?;
+        self.device
+            .stream
+            .memcpy_htod(ids, &mut self.work.ids.slice_mut(..ids.len()))?;
+        self.device
+            .stream
+            .memcpy_htod(&[0i32], &mut self.work.position)?;
+        self.device
+            .stream
+            .memcpy_htod(&[1i32], &mut self.work.length)?;
+        self.state.set_sequence(
+            &self.device.stream,
+            0,
+            u32::try_from(ids.len())?,
+            self.workspace_rows as u32,
+        )?;
+        let step = crate::backend::Step {
+            rows: ids.len(),
+            input: crate::backend::Input::Ids,
+            head: Head::None,
+            mask: crate::backend::Mask::Causal,
+        };
+        self.run_operator(crate::backend::Operator::Embed, 0, step, &mut None)?;
+        self.device
+            .stream
+            .memcpy_htod(input, &mut self.work.x.slice_mut(..input.len()))?;
+        self.run_layer(
+            0,
+            step,
+            &mut Some(Target {
+                trace,
+                prefix: "layer_rule_a",
+                skip: 0,
+            }),
+        )?;
+        let values = self
+            .device
+            .stream
+            .clone_dtoh(&self.work.x.slice(..input.len()))?;
+        Ok(values)
+    }
+
     pub fn verification_logits(&self, row: usize) -> Result<Vec<f32>> {
         let spec = self.spec.as_ref().context("draft state is not enabled")?;
         ensure!(
@@ -1978,7 +2216,6 @@ impl Engine {
         step: crate::backend::Step<'_>,
         trace: &mut Option<Target<'_>>,
     ) -> Result<()> {
-        #[cfg(feature = "cuda")]
         if let Some(engram) = &self.deepseek_engram {
             engram.run(
                 &self.device.stream,
@@ -1991,6 +2228,7 @@ impl Engine {
         let stages: &[crate::model::LayerStage] = match &program {
             crate::model::LayerProgram::Standard(stages) => &stages[..],
             crate::model::LayerProgram::Hc(stages) => &stages[..],
+            crate::model::LayerProgram::PerLayerInput(stages) => &stages[..],
         };
         for (position, &stage) in stages.iter().enumerate() {
             match stage {
@@ -2003,6 +2241,9 @@ impl Engine {
                 crate::model::LayerStage::Ffn => self.run_ffn(layer, step, trace)?,
                 crate::model::LayerStage::Hc(kind) => {
                     self.run_hc_stage(position, kind, layer, step)?
+                }
+                crate::model::LayerStage::PerLayerInput => {
+                    self.qwen_per_layer_input(layer, step, trace)?
                 }
             }
             #[cfg(test)]
@@ -2073,7 +2314,8 @@ impl Engine {
                 Architecture::Qwen35Text
                 | Architecture::MiniCpmV47
                 | Architecture::Flint
-                | Architecture::Glm5Next,
+                | Architecture::Glm5Next
+                | Architecture::Gemma4,
                 _,
             ) => self.qwen_mixer(layer, step, trace),
             (Architecture::Llama, Mixer::FullAttention) => {
@@ -2082,7 +2324,6 @@ impl Engine {
                 }
                 Ok(())
             }
-            #[cfg(feature = "cuda")]
             (Architecture::DeepseekV41, _) => self.deepseek_mixer_stage(layer, step),
             _ => anyhow::bail!(
                 "mixer {mixer:?} has no bound layer runtime; Q38 setup is not complete"
@@ -2118,7 +2359,6 @@ impl Engine {
         if self.qwen.is_some() {
             return self.qwen_operator(op, i, step, trace);
         }
-        #[cfg(feature = "cuda")]
         if self.model_spec.architecture == crate::model_spec::Architecture::DeepseekV41 {
             ensure!(
                 trace.is_none(),
@@ -2177,7 +2417,7 @@ impl Engine {
                             .context("tree State is not enabled")?;
                         tree.prepare_embed_norm(
                             &w.position,
-                            &self.weights.embed,
+                            self.weights.embedding(),
                             layer
                                 .input_norm
                                 .as_ref()
@@ -2194,7 +2434,7 @@ impl Engine {
                     let ids = if use_token { &w.token } else { &w.ids };
                     unsafe {
                         s.launch_builder(&self.ops.embed_rmsnorm)
-                            .arg(&self.weights.embed)
+                            .arg(self.weights.embedding())
                             .arg(ids)
                             .arg(&mut w.x)
                             .arg(
@@ -2517,13 +2757,11 @@ impl Engine {
             self.reset_qwen_positions()?;
         }
         self.state.reset(&self.device.stream)?;
-        #[cfg(feature = "cuda")]
         if self.deepseek_ffn.is_some()
             && let Some(slots) = self.moe_slots.as_mut()
         {
             slots.begin_staging_request()?;
         }
-        #[cfg(feature = "cuda")]
         if let Some(engram) = &mut self.deepseek_engram {
             engram.service.reset();
             engram.prepared = None;
@@ -3093,7 +3331,6 @@ impl Engine {
         let end = self.position + ids.len();
         let mut part = 0usize;
         for chunk in ids.chunks(self.chunk) {
-            #[cfg(feature = "cuda")]
             self.prepare_deepseek_engram(chunk, None)?;
             let skip = trace_start.saturating_sub(self.position).min(chunk.len());
             let selected = trace.is_some() && skip < chunk.len();
@@ -3183,7 +3420,6 @@ impl Engine {
             Some(token) => token,
             None => self.token()?,
         };
-        #[cfg(feature = "cuda")]
         self.prepare_deepseek_engram(&[committed_token], None)?;
         if graph {
             {
@@ -3279,7 +3515,7 @@ impl Engine {
                 * 4
                 + (self.weights.head.len() + 2 * self.config.hidden_size) * 2;
         }
-        self.weights.bytes - self.weights.embed.len() * size_of::<bf16>()
+        self.weights.bytes - self.weights.embedding().len() * size_of::<bf16>()
             + self.config.hidden_size * size_of::<bf16>()
     }
 
@@ -4146,7 +4382,7 @@ impl Engine {
                         &self.work.token,
                         &self.work.position,
                         start,
-                        (&self.weights.embed, &self.weights.head),
+                        (self.weights.embedding(), &self.weights.head),
                         super::draft::Compute {
                             ops: &self.ops,
                             blas: &mut self.blas,
@@ -4307,7 +4543,7 @@ impl Engine {
                 &self.work.token,
                 &self.work.position,
                 start,
-                (&self.weights.embed, &self.weights.head),
+                (self.weights.embedding(), &self.weights.head),
                 super::draft::Compute {
                     ops: &self.ops,
                     blas: &mut self.blas,
@@ -4482,7 +4718,7 @@ impl Engine {
                 spec.draft.propose(
                     anchor,
                     start,
-                    (&self.weights.embed, &self.weights.head),
+                    (self.weights.embedding(), &self.weights.head),
                     super::draft::Compute {
                         ops: &self.ops,
                         blas: &mut self.blas,
@@ -4804,7 +5040,7 @@ impl Engine {
             spec.draft.forward_base(
                 anchor,
                 start,
-                (&self.weights.embed, &self.weights.head),
+                (self.weights.embedding(), &self.weights.head),
                 super::draft::Compute {
                     ops: &self.ops,
                     blas: &mut self.blas,
@@ -5055,7 +5291,7 @@ impl Engine {
         spec.draft.propose(
             anchor,
             position,
-            (&self.weights.embed, &self.weights.head),
+            (self.weights.embedding(), &self.weights.head),
             super::draft::Compute {
                 ops: &self.ops,
                 blas: &mut self.blas,
@@ -5540,7 +5776,7 @@ impl Engine {
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 #[test]
 fn glm_dispatch_selects_the_hybrid_runtime() -> Result<()> {
     assert!(matches!(
@@ -5758,37 +5994,40 @@ impl Engine {
         let started = Instant::now();
         let write = mode.writes();
         let model_spec = crate::model_spec::ModelSpec::read(dir)?;
-        if model_spec.architecture == crate::model_spec::Architecture::LoopVl {
-            return Self::load_recurrent(
-                dir,
-                ordinal,
-                capacity,
-                requested_chunk,
-                settings,
-                model_spec,
-            );
+        match load_dispatch(model_spec.architecture)? {
+            LoadDispatch::Deepseek => {
+                return Self::load_deepseek(
+                    dir,
+                    ordinal,
+                    capacity,
+                    requested_chunk,
+                    settings,
+                    model_spec,
+                );
+            }
+            LoadDispatch::Recurrent => {
+                return Self::load_recurrent(
+                    dir,
+                    ordinal,
+                    capacity,
+                    requested_chunk,
+                    settings,
+                    model_spec,
+                );
+            }
+            LoadDispatch::Qwen => {
+                return Self::load_qwen(
+                    dir,
+                    ordinal,
+                    capacity,
+                    requested_chunk,
+                    settings,
+                    mode,
+                    model_spec,
+                );
+            }
+            LoadDispatch::Llama => {}
         }
-        if matches!(
-            model_spec.architecture,
-            crate::model_spec::Architecture::MiniCpmV47
-                | crate::model_spec::Architecture::Qwen35Text
-                | crate::model_spec::Architecture::Flint
-        ) {
-            return Self::load_qwen(
-                dir,
-                ordinal,
-                capacity,
-                requested_chunk,
-                settings,
-                mode,
-                model_spec,
-            );
-        }
-        ensure!(
-            model_spec.architecture == crate::model_spec::Architecture::Llama,
-            "HIP dense setup requires Llama; architecture {:?} is unsupported",
-            model_spec.architecture
-        );
         ensure!(
             !settings.prefix_cache && settings.kv_format == crate::kv::KvFormat::Bf16,
             "HIP dense setup requires BF16 KV without persistent prefix cache"
@@ -5859,6 +6098,9 @@ impl Engine {
         let mut engine = Self {
             images: None,
             qwen_device_prefix: false,
+            deepseek_mixer: None,
+            deepseek_ffn: None,
+            deepseek_engram: None,
             qwen: None,
             recurrent: None,
             hc: None,
@@ -6090,6 +6332,14 @@ impl Engine {
     }
 
     fn prepare(&mut self, rows: usize) -> Result<()> {
+        if self.model_spec.architecture == crate::model_spec::Architecture::DeepseekV41 {
+            ensure!(
+                (1..=self.workspace_rows).contains(&rows),
+                "DeepSeek-V4.1 prepare rows {rows} exceed the native workspace {}",
+                self.workspace_rows
+            );
+            return self.ensure_decode();
+        }
         if self.qwen.is_some() {
             return self.prepare_qwen(rows);
         }
@@ -6106,6 +6356,13 @@ impl Engine {
         Ok(())
     }
     fn ensure_decode(&self) -> Result<()> {
+        if self.model_spec.architecture == crate::model_spec::Architecture::DeepseekV41 {
+            return self
+                .deepseek_mixer
+                .as_ref()
+                .context("DeepSeek-V4.1 decode native mixer is not bound")?
+                .check_decode_ready();
+        }
         if self.qwen.is_some() {
             return Ok(());
         }

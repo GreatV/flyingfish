@@ -360,14 +360,12 @@ pub struct LatentRing {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg(any(feature = "cuda", test))]
 pub(crate) struct LatentOwners {
     pub kv: usize,
     pub index: usize,
     pub ratio: usize,
 }
 
-#[cfg(any(feature = "cuda", test))]
 pub(crate) fn latent_owners(spec: &ModelSpec) -> Result<Vec<Option<LatentOwners>>> {
     let ds = spec
         .deepseek_v41
@@ -413,7 +411,6 @@ pub(crate) fn latent_owners(spec: &ModelSpec) -> Result<Vec<Option<LatentOwners>
     Ok(result)
 }
 
-#[cfg(feature = "cuda")]
 pub(crate) struct LatentCompressedKv {
     pub owner: usize,
     pub ratio: usize,
@@ -429,7 +426,6 @@ pub(crate) struct LatentCompressedKv {
     pub tail_scores: CudaSlice<f32>,
 }
 
-#[cfg(feature = "cuda")]
 pub(crate) struct LatentSelection {
     pub owner: usize,
     pub positions: CudaSlice<i32>,
@@ -437,7 +433,6 @@ pub(crate) struct LatentSelection {
     pub ticket: CudaSlice<u32>,
 }
 
-#[cfg(feature = "cuda")]
 pub(crate) struct LatentCompressedState {
     pub owners: Vec<Option<LatentOwners>>,
     pub kv: Vec<LatentCompressedKv>,
@@ -449,7 +444,6 @@ pub(crate) struct LatentCompressedState {
     pub rows: usize,
 }
 
-#[cfg(feature = "cuda")]
 impl LatentCompressedState {
     pub(crate) fn new(
         spec: &ModelSpec,
@@ -586,7 +580,7 @@ pub struct StateStore {
     pub kv: Vec<Kv>,
     pub gdn: Vec<GdnState>,
     pub(crate) latent: Vec<LatentRing>,
-    #[cfg(feature = "cuda")]
+
     pub(crate) compressed: Option<LatentCompressedState>,
     pub(crate) dsa: Vec<super::dsa::DsaState>,
     pub sequence: Option<CudaSlice<i32>>,
@@ -646,6 +640,19 @@ impl StateStore {
             }
             match layer.mixer {
                 Mixer::FullAttention => {
+                    let geometry = layer.geometry.as_ref();
+                    if geometry.is_some_and(|g| g.kv_reader) {
+                        let publisher = layer.state_index as usize;
+                        ensure!(publisher < kv.len(), "invalid shared KV publisher");
+                        let ring = kv_rings[publisher];
+                        kv.push(Kv {
+                            k: stream.alloc_zeros::<bf16>(0)?,
+                            v: stream.alloc_zeros::<bf16>(0)?,
+                            compact: None,
+                        });
+                        kv_rings.push(ring);
+                        continue;
+                    }
                     ensure!(
                         layer.state_index as usize == kv.len(),
                         "invalid full-state mapping"
@@ -657,11 +664,9 @@ impl StateStore {
                     let layer_capacity = layer
                         .sliding_window
                         .map_or(capacity, |window| window as usize);
-                    let layout = format.layout(
-                        layer_capacity,
-                        spec.kv_heads as usize,
-                        spec.head_dim as usize,
-                    )?;
+                    let head_dim = geometry.map_or(spec.head_dim, |g| g.head_dim);
+                    let layout =
+                        format.layout(layer_capacity, spec.kv_heads as usize, head_dim as usize)?;
                     kv.push(Kv {
                         k: stream.alloc_zeros::<bf16>(layout.ring_elements)?,
                         v: stream.alloc_zeros::<bf16>(layout.ring_elements)?,
@@ -690,6 +695,7 @@ impl StateStore {
         let sequence = if spec.gdn.is_some()
             || spec.architecture == crate::model_spec::Architecture::Flint
             || spec.architecture == crate::model_spec::Architecture::DeepseekV41
+            || spec.architecture == crate::model_spec::Architecture::Gemma4
         {
             Some(stream.clone_htod(&[0i32, 1, 1, capacity as i32, 1, 0, 0, 0])?)
         } else {
@@ -699,7 +705,7 @@ impl StateStore {
             kv,
             gdn,
             latent,
-            #[cfg(feature = "cuda")]
+
             compressed: None,
             dsa,
             sequence,
@@ -723,7 +729,6 @@ impl StateStore {
             .context("KV ring state index is outside the layer plan")
     }
     /// Latent ring of one DeepSeek-V4.1 layer.
-    #[cfg(feature = "cuda")]
     pub(crate) fn latent_ring(&self, layer: usize) -> Result<&LatentRing> {
         self.latent
             .get(layer)
@@ -731,7 +736,6 @@ impl StateStore {
     }
     /// Mutable latent ring of one layer; the gates' planted ring controls.
     #[cfg(test)]
-    #[cfg(feature = "cuda")]
     pub(crate) fn latent_ring_mut(&mut self, layer: usize) -> Result<&mut LatentRing> {
         self.latent
             .get_mut(layer)
@@ -818,7 +822,6 @@ impl StateStore {
         Ok(())
     }
     pub fn reset(&mut self, stream: &Arc<CudaStream>) -> Result<()> {
-        #[cfg(feature = "cuda")]
         if let Some(state) = &mut self.compressed {
             state.reset(stream)?;
         }
@@ -859,15 +862,10 @@ impl StateStore {
             + self.dsa.iter().map(|state| state.bytes()).sum::<usize>()
             + self.sequence.as_ref().map_or(0, |m| m.len() * 4)
             + {
-                #[cfg(feature = "cuda")]
                 {
                     self.compressed
                         .as_ref()
                         .map_or(0, LatentCompressedState::bytes)
-                }
-                #[cfg(not(feature = "cuda"))]
-                {
-                    0
                 }
             }
     }
@@ -933,7 +931,7 @@ pub struct StateCheckpoint {
     rows: usize,
     active_rows: usize,
     heads: usize,
-    dim: usize,
+    kv_dims: Vec<usize>,
     capacity: usize,
     kv_rings: Vec<usize>,
     valid: bool,
@@ -953,19 +951,29 @@ impl StateCheckpoint {
             rows > 0 && rows <= store.capacity as usize,
             "invalid checkpoint window"
         );
-        let (heads, dim) = (spec.kv_heads as usize, spec.head_dim as usize);
-        let slots = heads
-            .checked_mul(rows)
-            .and_then(|n| n.checked_mul(dim))
-            .context("checkpoint KV size overflow")?;
+        let heads = spec.kv_heads as usize;
         let mut kv = Vec::new();
+        let mut kv_dims = Vec::new();
         let mut gdn = Vec::new();
-        for _ in &store.kv {
+        for layer in &spec.layers {
+            if layer.mixer != Mixer::FullAttention {
+                continue;
+            }
+            let dim = layer.geometry.map_or(spec.head_dim, |g| g.head_dim) as usize;
+            let slots = if layer.geometry.is_some_and(|g| g.kv_reader) {
+                0
+            } else {
+                heads
+                    .checked_mul(rows)
+                    .and_then(|n| n.checked_mul(dim))
+                    .context("checkpoint KV size overflow")?
+            };
             kv.push(Kv {
                 compact: None,
                 k: stream.alloc_zeros(slots)?,
                 v: stream.alloc_zeros(slots)?,
             });
+            kv_dims.push(dim);
         }
         for state in &store.gdn {
             gdn.push(GdnState {
@@ -986,7 +994,7 @@ impl StateCheckpoint {
             rows,
             active_rows: 0,
             heads,
-            dim,
+            kv_dims,
             capacity: store.capacity as usize,
             kv_rings: store.kv_rings.clone(),
             valid: false,
@@ -1011,22 +1019,39 @@ impl StateCheckpoint {
                 "checkpoint GDN extent mismatch"
             );
         }
-        for (kv, ring) in store.kv.iter().zip(&self.kv_rings) {
+        for ((kv, saved), cap, dim) in store
+            .kv
+            .iter()
+            .zip(&self.kv)
+            .zip(&self.kv_rings)
+            .zip(&self.kv_dims)
+            .map(|(((kv, saved), cap), dim)| ((kv, saved), cap, dim))
+        {
+            if kv.k.is_empty() && kv.v.is_empty() {
+                ensure!(
+                    saved.k.is_empty() && saved.v.is_empty(),
+                    "shared reader checkpoint extent"
+                );
+                continue;
+            }
             let n = kv
                 .compact
                 .as_ref()
                 .map_or_else(
                     || {
                         self.heads
-                            .checked_mul(*ring)
-                            .and_then(|n| n.checked_mul(self.dim))
+                            .checked_mul(*cap)
+                            .and_then(|n| n.checked_mul(*dim))
                     },
                     |c| Some(c.layout.ring_elements),
                 )
                 .context("checkpoint KV extent overflow")?;
             ensure!(
-                kv.k.len() == n && kv.v.len() == n,
-                "checkpoint KV extent mismatch ring={ring}"
+                kv.k.len() == n
+                    && kv.v.len() == n
+                    && saved.k.len() == self.heads * self.rows * *dim
+                    && saved.v.len() == saved.k.len(),
+                "checkpoint KV extent mismatch ring={cap}"
             );
         }
         Ok(())
@@ -1095,7 +1120,16 @@ impl StateCheckpoint {
             stream.memcpy_dtod(&src.s, &mut dst.s)?;
             stream.memcpy_dtod(&src.history, &mut dst.history)?;
         }
-        for ((src, dst), cap) in store.kv.iter().zip(&mut self.kv).zip(&self.kv_rings) {
+        for (((src, dst), cap), dim) in store
+            .kv
+            .iter()
+            .zip(&mut self.kv)
+            .zip(&self.kv_rings)
+            .zip(&self.kv_dims)
+        {
+            if src.k.is_empty() && src.v.is_empty() {
+                continue;
+            }
             for (a, b) in [(&src.k, &mut dst.k), (&src.v, &mut dst.v)] {
                 if src.compact.is_none() && *cap == self.capacity {
                     super::copy::columns(
@@ -1104,10 +1138,10 @@ impl StateCheckpoint {
                         b,
                         super::copy::Rect {
                             rows: self.heads,
-                            width: active_rows * self.dim,
-                            src_pitch: self.capacity * self.dim,
-                            src_col: prefix * self.dim,
-                            dst_pitch: self.rows * self.dim,
+                            width: active_rows * (*dim),
+                            src_pitch: self.capacity * (*dim),
+                            src_col: prefix * (*dim),
+                            dst_pitch: self.rows * (*dim),
                             dst_col: 0,
                         },
                     )?;
@@ -1125,11 +1159,11 @@ impl StateCheckpoint {
                         b,
                         super::copy::Rect {
                             rows: self.heads,
-                            width: self.dim,
-                            src_pitch: cap * self.dim,
-                            src_col: pos * self.dim,
-                            dst_pitch: self.rows * self.dim,
-                            dst_col: row * self.dim,
+                            width: (*dim),
+                            src_pitch: cap * (*dim),
+                            src_col: pos * (*dim),
+                            dst_pitch: self.rows * (*dim),
+                            dst_col: row * (*dim),
                         },
                     )?;
                 }
@@ -1269,7 +1303,16 @@ impl StateCheckpoint {
         if first == end {
             return Ok(());
         }
-        for ((src, dst), cap) in self.kv.iter().zip(&mut store.kv).zip(&self.kv_rings) {
+        for (((src, dst), cap), dim) in self
+            .kv
+            .iter()
+            .zip(&mut store.kv)
+            .zip(&self.kv_rings)
+            .zip(&self.kv_dims)
+        {
+            if src.k.is_empty() && src.v.is_empty() {
+                continue;
+            }
             let compact = dst.compact.is_some();
             for (a, b) in [(&src.k, &mut dst.k), (&src.v, &mut dst.v)] {
                 if !compact && *cap == self.capacity {
@@ -1279,11 +1322,11 @@ impl StateCheckpoint {
                         b,
                         super::copy::Rect {
                             rows: self.heads,
-                            width: (end - first) * self.dim,
-                            src_pitch: self.rows * self.dim,
-                            src_col: first * self.dim,
-                            dst_pitch: self.capacity * self.dim,
-                            dst_col: (self.prefix + first) * self.dim,
+                            width: (end - first) * (*dim),
+                            src_pitch: self.rows * (*dim),
+                            src_col: first * (*dim),
+                            dst_pitch: self.capacity * (*dim),
+                            dst_col: (self.prefix + first) * (*dim),
                         },
                     )?;
                     continue;
@@ -1300,11 +1343,11 @@ impl StateCheckpoint {
                         b,
                         super::copy::Rect {
                             rows: self.heads,
-                            width: self.dim,
-                            src_pitch: self.rows * self.dim,
-                            src_col: row * self.dim,
-                            dst_pitch: cap * self.dim,
-                            dst_col: pos * self.dim,
+                            width: (*dim),
+                            src_pitch: self.rows * (*dim),
+                            src_col: row * (*dim),
+                            dst_pitch: cap * (*dim),
+                            dst_col: pos * (*dim),
                         },
                     )?;
                 }

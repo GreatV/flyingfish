@@ -4,7 +4,6 @@ use super::{
     contracts::{RowDomain, Scratch, Tensor, TensorMut},
     weights::WeightCatalog,
 };
-#[cfg(feature = "cuda")]
 use crate::backend::gpu::CudaSlice;
 use crate::backend::gpu::{CudaContext, CudaFunction, CudaStream, DevicePtr, PushKernelArg};
 use crate::fp8::Fp8ScaleLayout;
@@ -12,7 +11,6 @@ use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::sync::Arc;
 /// Native BF16 operands with an unrounded FP32 output on the shared skinny tile.
-#[cfg(feature = "cuda")]
 pub struct Bf16F32Plan {
     kernel: CudaFunction,
     input: Tensor<bf16, 2>,
@@ -21,7 +19,6 @@ pub struct Bf16F32Plan {
     shape: [i32; 3],
 }
 
-#[cfg(feature = "cuda")]
 fn bf16_f32_shape(
     input: Tensor<bf16, 2>,
     weight: Tensor<bf16, 2>,
@@ -68,7 +65,6 @@ fn bf16_f32_shape(
     Ok([rows as i32, columns as i32, width as i32])
 }
 
-#[cfg(feature = "cuda")]
 impl Bf16F32Plan {
     pub fn new(
         ctx: &Arc<CudaContext>,
@@ -100,10 +96,10 @@ impl Bf16F32Plan {
                 .arg(&width)
                 .arg(&leading)
                 .arg(&rows)
-                .launch(cudarc::driver::LaunchConfig {
+                .launch(crate::backend::gpu::LaunchConfig {
                     grid_dim: ((columns as u32).div_ceil(16), 1, 1),
                     block_dim: (128, 1, 1),
-                    shared_mem_bytes: 40960,
+                    shared_mem_bytes: if cfg!(feature = "cuda") { 40960 } else { 0 },
                 })?;
         }
         Ok(())
@@ -124,7 +120,6 @@ pub(crate) enum Fp8ScaleRef {
 }
 
 impl Fp8ScaleRef {
-    #[cfg(feature = "cuda")]
     fn ptr(self) -> u64 {
         match self {
             Self::Bf16(t) => t.ptr,
@@ -133,7 +128,6 @@ impl Fp8ScaleRef {
         }
     }
 
-    #[cfg(feature = "cuda")]
     fn disjoint<T: Copy>(self, other: &Tensor<T, 2>) -> Result<()> {
         match self {
             Self::Bf16(t) => disjoint(&t, other),
@@ -223,7 +217,6 @@ pub(crate) enum LinearWeightRef {
     },
 }
 pub(crate) struct Fp8Ops {
-    #[cfg(feature = "cuda")]
     quant_block_f32: CudaFunction,
     #[cfg(feature = "cuda")]
     dequant: [CudaFunction; 2],
@@ -236,12 +229,10 @@ pub(crate) struct Fp8Ops {
     #[cfg(feature = "rocm")]
     context: Arc<CudaContext>,
     fake_quant: CudaFunction,
-    #[cfg(feature = "cuda")]
     native_block: [[CudaFunction; 2]; 2],
 }
 
 /// Bound native codes/scales and prepared activations; storage remains caller-owned.
-#[cfg(feature = "cuda")]
 pub(crate) struct Fp8BlockPlan {
     kernel: CudaFunction,
     grid: crate::backend::gpu::LaunchConfig,
@@ -249,7 +240,6 @@ pub(crate) struct Fp8BlockPlan {
     shape: [i32; 3],
 }
 
-#[cfg(feature = "cuda")]
 impl Fp8BlockPlan {
     pub(crate) fn run(&self, stream: &Arc<CudaStream>) -> Result<()> {
         unsafe {
@@ -270,7 +260,6 @@ impl Fp8BlockPlan {
 }
 
 impl Fp8Ops {
-    #[cfg(feature = "cuda")]
     pub(crate) fn bind_block(
         &self,
         weight: LinearWeightRef,
@@ -406,10 +395,21 @@ impl Fp8Ops {
             );
         }
         Ok(Self {
+            quant_block_f32: module.load_function("fp8_quant_f32_128")?,
             channel,
             block,
             context: ctx.clone(),
             fake_quant: module.load_function("e4m3_fake_quant_bf16")?,
+            native_block: [
+                [
+                    module.load_function("fp8_block_f32_128_decode")?,
+                    module.load_function("fp8_block_f32_128_mma")?,
+                ],
+                [
+                    module.load_function("fp8_block_e8m0_32_decode")?,
+                    module.load_function("fp8_block_e8m0_32_mma")?,
+                ],
+            ],
         })
     }
 
@@ -772,14 +772,12 @@ struct BoundProjection {
     resident: LinearWeightRef,
     #[cfg(feature = "cuda")]
     prefill: Option<Tensor<bf16, 2>>,
-    #[cfg(feature = "cuda")]
     native: std::cell::RefCell<Option<NativeProjection>>,
     #[cfg(feature = "rocm")]
     calls: std::cell::RefCell<std::collections::BTreeMap<(u32, u64, u64), Fp8Projection>>,
     invariant_rows: usize,
 }
 
-#[cfg(feature = "cuda")]
 pub(crate) struct NativeProjection {
     weight: LinearWeightRef,
     shape: [u32; 2],
@@ -789,7 +787,6 @@ pub(crate) struct NativeProjection {
     scales_view: crate::backend::cuda::contracts::Tensor<f32, 2>,
 }
 
-#[cfg(feature = "cuda")]
 impl NativeProjection {
     pub(crate) fn new(
         ops: &Fp8Ops,
@@ -908,7 +905,6 @@ pub(crate) struct LayerLinearPlan {
 #[derive(Clone, Debug)]
 pub(crate) enum BoundFfn {
     Dense,
-    #[cfg(feature = "cuda")]
     Native {
         router: Tensor<bf16, 2>,
         shared: Box<[LinearWeightRef; 3]>,
@@ -932,7 +928,6 @@ impl BoundFfn {
         let h = spec.hidden;
         let i = moe.shared_intermediate;
         let router = linear.take_bf16("mlp.gate.weight", [moe.experts, h])?;
-        #[cfg(feature = "cuda")]
         if spec.architecture == crate::model_spec::Architecture::Glm5Next {
             let mut take = |role: &str| -> Result<LinearWeightRef> {
                 let projection = linear
@@ -982,7 +977,6 @@ impl BoundFfn {
     pub fn prepare(&self, blas: &super::blas::Blas, rows: u32) -> Result<()> {
         match self {
             Self::Dense => Ok(()),
-            #[cfg(feature = "cuda")]
             Self::Native { .. } => Ok(()),
             Self::Moe {
                 shared,
@@ -1104,7 +1098,6 @@ impl LayerLinearPlan {
                     resident,
                     #[cfg(feature = "cuda")]
                     prefill,
-                    #[cfg(feature = "cuda")]
                     native: Default::default(),
                     #[cfg(feature = "rocm")]
                     calls: std::cell::RefCell::new(std::collections::BTreeMap::new()),
@@ -1123,10 +1116,19 @@ impl LayerLinearPlan {
             materialize,
         })
     }
-    #[cfg(feature = "cuda")]
     pub fn prepare_native(&self, ops: &Fp8Ops, stream: &Arc<CudaStream>, rows: u32) -> Result<()> {
         for projection in self.projections.values() {
-            if projection.prefill.is_none() {
+            #[cfg(feature = "cuda")]
+            let native = projection.prefill.is_none();
+            #[cfg(feature = "rocm")]
+            let native = matches!(
+                projection.resident,
+                LinearWeightRef::Fp8 {
+                    scale: Fp8ScaleRef::F32(_),
+                    ..
+                }
+            );
+            if native {
                 let mut native = projection.native.borrow_mut();
                 ensure!(native.is_none(), "native projection already bound");
                 *native = Some(NativeProjection::new(
@@ -1231,6 +1233,10 @@ impl LayerLinearPlan {
                 .run(blas.fp8_ops()?, blas.stream(), x, y);
         }
         #[cfg(feature = "rocm")]
+        if let Some(native) = p.native.borrow().as_ref() {
+            return native.run(blas.fp8_ops()?, blas.stream(), x, y);
+        }
+        #[cfg(feature = "rocm")]
         if let LinearWeightRef::Fp8 { codes, .. } = p.resident {
             validate_call(codes.shape, x, &y.0)?;
             ensure!(
@@ -1295,6 +1301,7 @@ fn hip_projection_closure_excludes_native_and_invariant_calls() -> Result<()> {
                     BoundProjection {
                         resident,
                         invariant_rows,
+                        native: Default::default(),
                         calls: Default::default(),
                     },
                 )
@@ -1319,17 +1326,19 @@ fn hip_projection_closure_excludes_native_and_invariant_calls() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::cuda::{
-        Device, blas::Blas, closure::Closure, ops::Ops, weights::StoredTensor,
-    };
+    use crate::backend::cuda::Device;
+    #[cfg(feature = "cuda")]
+    use crate::backend::cuda::{blas::Blas, closure::Closure, ops::Ops, weights::StoredTensor};
+    #[cfg(feature = "cuda")]
     use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope};
+    #[cfg(feature = "cuda")]
     use crate::op_contract::ExecutionPhase;
+    #[cfg(feature = "cuda")]
     use std::{path::PathBuf, rc::Rc};
 
-    #[cfg(feature = "cuda")]
     #[test]
     fn bf16_f32_projection_bounds() -> Result<()> {
         use super::super::contracts::dense_layout;
@@ -1355,7 +1364,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "requires GPU lease; native BF16 weights with FP32 projection output"]
     fn bf16_f32_projection_gpu() -> Result<()> {
@@ -1409,14 +1417,7 @@ mod tests {
                     && eager[rows as usize * N..].iter().all(|&v| v == 127.0),
                 "BF16 F32 projection exact/guard DEFECT rows={rows}"
             );
-            stream.begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )?;
-            plan.run(&stream)?;
-            stream
-                .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                .context("F32 projection graph empty")?
-                .launch()?;
+            super::super::moe::testing::capture(&stream, || plan.run(&stream))?.launch()?;
             ensure!(
                 stream.clone_dtoh(&output)? == eager,
                 "F32 projection graph bits DEFECT rows={rows}"
@@ -1485,12 +1486,10 @@ mod tests {
             .collect()
     }
 
-    #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "GPU native FP8 block-scale linear correctness"]
     fn fp8_native_block_linear_matches_fp64() -> Result<()> {
         use crate::fp8::Fp8BlockScale;
-        use cudarc::driver::sys;
         use safetensors::Dtype;
         let device = Device::new(0)?;
         let stream = &device.stream;
@@ -1635,13 +1634,8 @@ mod tests {
                     device.finish_upload()?;
                     for graph in [false, true] {
                         if graph {
-                            stream.begin_capture(
-                                sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-                            )?;
-                            let result = plan.run(stream);
-                            let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
-                            result?;
-                            captured?.context("empty native FP8 graph")?.launch()?;
+                            super::super::moe::testing::capture(stream, || plan.run(stream))?
+                                .launch()?;
                         } else {
                             plan.run(stream)?;
                         }
@@ -1667,6 +1661,88 @@ mod tests {
                         println!(
                             "FP8_NATIVE_BLOCK_CELL dtype={dtype:?} block={block} weight=[{n},{k}] input=[{m},{k}] graph={graph} defects={bad} scale_cell_control={control}"
                         );
+                    }
+                    if dtype == Dtype::F32 {
+                        let values: Vec<_> = (0..m * k)
+                            .map(|i| bf16::from_f32(((i * 19 + 3) % 251) as f32 / 32.0 - 4.0))
+                            .collect();
+                        let mut codes = Vec::with_capacity(m * k);
+                        let mut scales = Vec::with_capacity(m * groups);
+                        for row in values.chunks_exact(k) {
+                            for cell in row.chunks(128) {
+                                let maximum =
+                                    cell.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max);
+                                let scale = maximum * (1.0f32 / 448.0);
+                                scales.push(scale);
+                                codes.extend(cell.iter().map(|v| {
+                                    crate::fp8::encode_e4m3(
+                                        (v.to_f32() / scale.max(1e-12)).clamp(-448.0, 448.0),
+                                    )
+                                }));
+                            }
+                        }
+                        let oracle = native_block_oracle(
+                            [&weight, &codes],
+                            [&weight_scales, &scales],
+                            [m, n, k],
+                            block,
+                            false,
+                        );
+                        let x = stream.clone_htod(&values)?;
+                        let x_view = super::super::contracts::view(
+                            &x,
+                            stream,
+                            0,
+                            [m as u32, k as u32],
+                            [k as u64, 1],
+                        )?;
+                        let native = NativeProjection::new(
+                            &ops,
+                            stream,
+                            LinearWeightRef::Fp8 {
+                                codes: wc_view,
+                                scale: ws_view,
+                                layout,
+                            },
+                            m as u32,
+                        )?;
+                        device.finish_upload()?;
+                        for graph in [false, true] {
+                            let run = || native.run(&ops, stream, x_view, &output_view);
+                            if graph {
+                                super::super::moe::testing::capture(stream, run)?.launch()?;
+                            } else {
+                                run()?;
+                            }
+                            let actual_codes = stream.clone_dtoh(&native._keepalive.0)?;
+                            let actual_scales = stream.clone_dtoh(&native._keepalive.1)?;
+                            ensure!(
+                                actual_codes == codes
+                                    && actual_scales
+                                        .iter()
+                                        .zip(&scales)
+                                        .all(|(a, b)| { a.to_bits() == b.to_bits() }),
+                                "native BF16-input FP8 quantization codes/scale bits DEFECT"
+                            );
+                            let got = stream.clone_dtoh(&output)?;
+                            ensure!(
+                                got[..m * n].iter().all(|v| v.is_finite())
+                                    && got[m * n..].iter().all(|v| v.to_bits() == canary.to_bits()),
+                                "native BF16-input FP8 output finite/guard DEFECT"
+                            );
+                            let bad = got
+                                .iter()
+                                .zip(&oracle)
+                                .filter(|(value, (reference, bound))| {
+                                    (f64::from(value.to_f32()) - reference).abs() > *bound
+                                })
+                                .count();
+                            defects += bad;
+                            cases += 1;
+                            println!(
+                                "FP8_NATIVE_QUANTIZED_CELL weight=[{n},{k}] input=[{m},{k}] graph={graph} codes_equal=true scale_bits_equal=true defects={bad} oracle=f64"
+                            );
+                        }
                     }
                 }
             }
@@ -1774,6 +1850,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     fn invariant_rows(
         device: &Device,
         blas: &Blas,
@@ -2022,6 +2099,7 @@ mod tests {
         Ok(defects)
     }
 
+    #[cfg(feature = "cuda")]
     fn invariant_linears(device: &Device, root: &std::path::Path) -> Result<()> {
         use crate::backend::cuda::contracts::view;
         let stream = &device.stream;
@@ -2148,6 +2226,7 @@ mod tests {
 
     #[test]
     #[ignore = "GPU window, official FP8 model, T13 and projection reference required"]
+    #[cfg(feature = "cuda")]
     fn channel_projection_gpu() -> Result<()> {
         use super::super::moe::testing::view;
         use crate::fp8::{effective_weight, linear_reference};
@@ -2431,6 +2510,7 @@ mod tests {
 
     #[test]
     #[ignore = "GPU window and FF_MINICPM_REFERENCE_DIR required"]
+    #[cfg(feature = "cuda")]
     fn token_quantization_gpu() -> Result<()> {
         use super::super::moe::testing::view;
         use crate::fp8::fake_quant_reference;
@@ -2583,7 +2663,6 @@ mod tests {
     fn token_quantization_live_rows_gpu() -> Result<()> {
         use super::super::{contracts::SeqRef, moe::testing::view};
         use crate::fp8::fake_quant_reference;
-        use cudarc::driver::{DevicePtr, sys};
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
             "GPU window required"
@@ -2624,13 +2703,7 @@ mod tests {
                 device.finish_upload()?;
                 let execute = || op.fake_quant(stream, &mut TensorMut(x_view), Some(domain));
                 let captured = if graph {
-                    stream.begin_capture(
-                        sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-                    )?;
-                    let run = execute();
-                    let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
-                    run?;
-                    Some(captured?.context("empty live-row quantization graph")?)
+                    Some(super::super::moe::testing::capture(stream, execute)?)
                 } else {
                     None
                 };
@@ -2684,6 +2757,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cuda")]
     fn moe_ffn_binding_uses_native_router_and_shared_layouts() -> Result<()> {
         let spec = crate::model_spec::ModelSpec::minicpm(
             &serde_json::from_str(include_str!(concat!(
@@ -2758,6 +2832,7 @@ mod tests {
 
     #[test]
     #[ignore = "coordinator-granted GPU window and FF_Q38_PROBE_DIR required"]
+    #[cfg(feature = "cuda")]
     fn mixer_geometry_linear_gpu() -> Result<()> {
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),

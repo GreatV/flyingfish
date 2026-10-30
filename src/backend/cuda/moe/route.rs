@@ -23,7 +23,6 @@ pub(crate) struct RouteOps {
     topk: CudaFunction,
     sigmoid_topk: CudaFunction,
     noaux_topk: CudaFunction,
-    #[cfg(feature = "cuda")]
     noaux_topk_f32: CudaFunction,
     blas: CudaBlas,
     #[cfg(feature = "cuda")]
@@ -126,7 +125,6 @@ impl RouteOps {
             topk: module.load_function("moe_route_topk")?,
             sigmoid_topk: module.load_function("moe_route_topk_sigmoid")?,
             noaux_topk: module.load_function("moe_route_topk_noaux")?,
-            #[cfg(feature = "cuda")]
             noaux_topk_f32: module.load_function("moe_route_topk_noaux_f32")?,
             blas,
             #[cfg(feature = "cuda")]
@@ -196,7 +194,6 @@ impl RouteOps {
     /// logits[E,rows]` column-major (row-major `[rows, experts]`),
     /// CUBLAS_COMPUTE_32F with FP32 C (model definition Gate.forward
     /// linear(x.float(), weight.float())).
-    #[cfg(feature = "cuda")]
     pub fn logits_f32(
         &self,
         stream: &Arc<CudaStream>,
@@ -205,31 +202,48 @@ impl RouteOps {
         logits: &mut TensorMut<f32, 2>,
     ) -> Result<()> {
         let (rows, experts, hidden) = self.validate_logits_f32(stream, x, router, logits)?;
-        let alpha = 1f32;
-        let beta = 0f32;
+        #[cfg(feature = "rocm")]
         unsafe {
-            bs::cublasGemmEx(
-                *self.blas.handle(),
-                bs::cublasOperation_t::CUBLAS_OP_T,
-                bs::cublasOperation_t::CUBLAS_OP_N,
-                experts as i32,
-                rows as i32,
-                hidden as i32,
-                (&alpha as *const f32).cast(),
-                router.ptr as *const core::ffi::c_void,
-                bs::cudaDataType_t::CUDA_R_16BF,
-                hidden as i32,
-                x.ptr as *const core::ffi::c_void,
-                bs::cudaDataType_t::CUDA_R_16BF,
-                hidden as i32,
-                (&beta as *const f32).cast(),
-                logits.0.ptr as *mut core::ffi::c_void,
-                bs::cudaDataType_t::CUDA_R_32F,
-                experts as i32,
-                bs::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                bs::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-            )
-            .result()?;
+            self.blas.bf16_gemm(
+                crate::backend::setup::LinearShape {
+                    rows: rows as usize,
+                    output: experts as usize,
+                    input: hidden as usize,
+                },
+                [router.ptr, x.ptr, logits.0.ptr],
+                [hidden as usize, hidden as usize, experts as usize],
+                None,
+                true,
+            )?;
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let alpha = 1f32;
+            let beta = 0f32;
+            unsafe {
+                bs::cublasGemmEx(
+                    *self.blas.handle(),
+                    bs::cublasOperation_t::CUBLAS_OP_T,
+                    bs::cublasOperation_t::CUBLAS_OP_N,
+                    experts as i32,
+                    rows as i32,
+                    hidden as i32,
+                    (&alpha as *const f32).cast(),
+                    router.ptr as *const core::ffi::c_void,
+                    bs::cudaDataType_t::CUDA_R_16BF,
+                    hidden as i32,
+                    x.ptr as *const core::ffi::c_void,
+                    bs::cudaDataType_t::CUDA_R_16BF,
+                    hidden as i32,
+                    (&beta as *const f32).cast(),
+                    logits.0.ptr as *mut core::ffi::c_void,
+                    bs::cudaDataType_t::CUDA_R_32F,
+                    experts as i32,
+                    bs::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    bs::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                )
+                .result()?;
+            }
         }
         Ok(())
     }
@@ -310,7 +324,6 @@ impl RouteOps {
         self.topk(stream, &plan, logits, ids, weights, score)
     }
 
-    #[cfg(feature = "cuda")]
     fn validate_logits_f32(
         &self,
         stream: &Arc<CudaStream>,
@@ -402,7 +415,6 @@ impl RouteOps {
 
     /// The same noaux selection writing FP32 routed weights (model definition
     /// Gate.forward FP32 scores applied by Expert.forward in FP32).
-    #[cfg(feature = "cuda")]
     pub fn topk_noaux_f32<T: DeviceRepr + Copy + 'static>(
         &self,
         logits: Tensor<T, 2>,

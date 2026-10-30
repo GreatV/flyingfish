@@ -211,6 +211,7 @@ impl Probe {
     fn state(&self, capacity: usize) -> Result<StateStore> {
         let mut spec = self.spec.clone();
         spec.layers = vec![LayerPlan {
+            geometry: None,
             mixer: Mixer::FullAttention,
             state_index: 0,
             rope: true,

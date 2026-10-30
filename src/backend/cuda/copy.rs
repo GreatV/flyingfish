@@ -1,7 +1,7 @@
-use crate::backend::gpu::CudaSlice;
 use crate::backend::gpu::{
     CudaContext, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, PinnedHostSlice, ValidAsZeroBits,
 };
+use crate::backend::gpu::{CudaFunction, CudaSlice, PushKernelArg};
 use anyhow::{Result, ensure};
 #[cfg(feature = "cuda")]
 use cudarc::driver::sys;
@@ -260,14 +260,14 @@ pub struct RingCopy<'a> {
     pub head_dim: usize,
 }
 
-struct RingCopyCall {
-    src: u64,
-    dst: u64,
-    source_start: usize,
-    target_start: usize,
-    rows: usize,
-    wrap_source: bool,
-    wrap_target: bool,
+pub(crate) struct RingCopyCall {
+    pub(crate) src: u64,
+    pub(crate) dst: u64,
+    pub(crate) source_start: usize,
+    pub(crate) target_start: usize,
+    pub(crate) rows: usize,
+    pub(crate) wrap_source: bool,
+    pub(crate) wrap_target: bool,
 }
 
 impl RingCopy<'_> {
@@ -298,6 +298,65 @@ impl RingCopy<'_> {
             lengths,
             [self.heads, self.head_dim],
         )
+    }
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn run_raw(self, call: RingCopyCall) -> Result<()> {
+        let lengths = [self.source.len(), self.target.len()];
+        call.run(
+            self.stream,
+            [self.source_capacity, self.target_capacity],
+            lengths,
+            [self.heads, self.head_dim],
+        )
+    }
+
+    pub(crate) fn run_dynamic(
+        self,
+        function: &CudaFunction,
+        position: &CudaSlice<i32>,
+        rows: usize,
+        to_ring: bool,
+    ) -> Result<()> {
+        ensure!(position.len() == 1, "dynamic ring position must be scalar");
+        ensure!(rows > 0, "dynamic ring copy requires query rows");
+        ensure!(
+            self.heads > 0 && self.head_dim > 0,
+            "dynamic ring copy requires nonzero head geometry"
+        );
+        for (capacity, len) in [
+            (self.source_capacity, self.source.len()),
+            (self.target_capacity, self.target.len()),
+        ] {
+            ensure!(
+                capacity
+                    .checked_mul(self.head_dim)
+                    .and_then(|n| n.checked_mul(self.heads))
+                    .is_some_and(|n| n <= len && n <= i32::MAX as usize),
+                "dynamic ring copy geometry exceeds buffer"
+            );
+        }
+        let ring = if to_ring {
+            self.target_capacity
+        } else {
+            self.source_capacity
+        };
+        let (src, _src) = self.source.device_ptr(self.stream);
+        let (dst, _dst) = self.target.device_ptr_mut(self.stream);
+        unsafe {
+            self.stream
+                .launch_builder(function)
+                .arg(&src)
+                .arg(&dst)
+                .arg(position)
+                .arg(&i32::try_from(rows)?)
+                .arg(&i32::try_from(self.source_capacity)?)
+                .arg(&i32::try_from(self.target_capacity)?)
+                .arg(&i32::try_from(self.heads)?)
+                .arg(&i32::try_from(self.head_dim)?)
+                .arg(&i32::from(to_ring))
+                .launch(super::ops::flat(self.heads * ring * self.head_dim))?;
+        }
+        Ok(())
     }
 }
 

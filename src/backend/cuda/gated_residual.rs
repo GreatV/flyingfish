@@ -2,8 +2,8 @@ use super::{
     contracts::{SeqRef, Tensor, dense_layout, spans_disjoint},
     cubin,
 };
+use crate::backend::gpu::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use anyhow::{Result, ensure};
-use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use half::bf16;
 use std::sync::Arc;
 
@@ -135,8 +135,8 @@ impl GatedResidualPlan {
 mod tests {
     use super::super::contracts::view;
     use super::*;
+    use crate::backend::gpu::DevicePtr;
     use anyhow::Context;
-    use cudarc::driver::DevicePtr;
 
     // 2026-10-28: three times max(FP64, repeat, shape, sm86/sm89 reference spread).
     const GATE_LIMIT: f64 = 5.408762987491045e-7;
@@ -240,8 +240,7 @@ mod tests {
         let mut gates = stream.clone_htod(&vec![12345.0f32; rows * 4 + 16])?;
         let mut metadata =
             stream.clone_htod(&[0, rows as i32, rows as i32, rows as i32, 1, 0, 0, 0])?;
-        let (ptr, record) = metadata.device_ptr(&stream);
-        drop(record);
+        let ptr = metadata.device_ptr(&stream).0;
         let views = GatedResidualViews {
             input: view(&input, &stream, 0, [rows as u32, 4, 5120], [20480, 5120, 1])?,
             projection: view(&projected, &stream, 0, [rows as u32, 25600], [25600, 1])?,
@@ -262,15 +261,13 @@ mod tests {
         plan.run(&stream)?;
         let eager = (stream.clone_dtoh(&output)?, stream.clone_dtoh(&gates)?);
         let captured = if graph {
-            stream.begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )?;
-            plan.run(&stream)?;
-            Some(
-                stream
-                    .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                    .context("gated residual graph empty")?,
-            )
+            Some(crate::backend::cuda::moe::testing::capture(
+                &stream,
+                || {
+                    plan.run(&stream)?;
+                    Ok(())
+                },
+            )?)
         } else {
             None
         };

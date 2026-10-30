@@ -19,8 +19,8 @@
 use crate::backend::cuda::contracts::dense_layout;
 use crate::backend::cuda::contracts::{Tensor, TensorMut, no_overlap};
 use crate::backend::cuda::cubin;
+use crate::backend::gpu::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use anyhow::{Result, ensure};
-use cudarc::driver::{CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use half::bf16;
 use std::sync::Arc;
 
@@ -1072,15 +1072,15 @@ mod tests {
         for expert in 0..TOP_K {
             let fx = fixture(expert);
             let expected = oracle.forward(&fx);
-            let xb = testing::upload(&device.upload, fx.x.clone())?;
-            let gb = testing::upload(&device.upload, fx.gate_codes.clone())?;
-            let gs = testing::upload(&device.upload, fx.gate_scales.clone())?;
-            let ub = testing::upload(&device.upload, fx.up_codes.clone())?;
-            let us = testing::upload(&device.upload, fx.up_scales.clone())?;
-            let db = testing::upload(&device.upload, fx.down_codes.clone())?;
-            let ds = testing::upload(&device.upload, fx.down_scales.clone())?;
+            let xb = testing::upload_device(&device, fx.x.clone())?;
+            let gb = testing::upload_device(&device, fx.gate_codes.clone())?;
+            let gs = testing::upload_device(&device, fx.gate_scales.clone())?;
+            let ub = testing::upload_device(&device, fx.up_codes.clone())?;
+            let us = testing::upload_device(&device, fx.up_scales.clone())?;
+            let db = testing::upload_device(&device, fx.down_codes.clone())?;
+            let ds = testing::upload_device(&device, fx.down_scales.clone())?;
             let wrong = swapped_nibbles(&fx);
-            let wb = testing::upload(&device.upload, wrong.gate_codes)?;
+            let wb = testing::upload_device(&device, wrong.gate_codes)?;
             device.finish_upload()?;
             let out = testing::zeros::<bf16>(s, HIDDEN)?;
             let wrong_out = testing::zeros::<bf16>(s, HIDDEN)?;

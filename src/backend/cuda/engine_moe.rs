@@ -434,6 +434,7 @@ impl Setup {
                         request.capacity,
                         policy,
                         verify_rows,
+                        Some(&device.stream),
                     )
                 },
                 |rows| Ok(qwen::default_chunk(rows)),

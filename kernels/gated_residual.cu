@@ -30,9 +30,9 @@ extern "C" __global__ void normalized_gate_residual(
         dot = __fadd_rn(dot, __fmul_rn(__fmul_rn(h, weight), k));
     }
     for (int offset = 16; offset; offset >>= 1) {
-        h2 = __fadd_rn(h2, __shfl_down_sync(0xffffffffu, h2, offset));
-        k2 = __fadd_rn(k2, __shfl_down_sync(0xffffffffu, k2, offset));
-        dot = __fadd_rn(dot, __shfl_down_sync(0xffffffffu, dot, offset));
+        h2 = __fadd_rn(h2, __shfl_down_sync(FF_WARP_MASK, h2, offset));
+        k2 = __fadd_rn(k2, __shfl_down_sync(FF_WARP_MASK, k2, offset));
+        dot = __fadd_rn(dot, __shfl_down_sync(FF_WARP_MASK, dot, offset));
     }
     __shared__ float sums[3][8];
     __shared__ float gate;
@@ -44,9 +44,9 @@ extern "C" __global__ void normalized_gate_residual(
         k2 = lane < 8 ? sums[1][lane] : 0.0f;
         dot = lane < 8 ? sums[2][lane] : 0.0f;
         for (int offset = 16; offset; offset >>= 1) {
-            h2 = __fadd_rn(h2, __shfl_down_sync(0xffffffffu, h2, offset));
-            k2 = __fadd_rn(k2, __shfl_down_sync(0xffffffffu, k2, offset));
-            dot = __fadd_rn(dot, __shfl_down_sync(0xffffffffu, dot, offset));
+            h2 = __fadd_rn(h2, __shfl_down_sync(FF_WARP_MASK, h2, offset));
+            k2 = __fadd_rn(k2, __shfl_down_sync(FF_WARP_MASK, k2, offset));
+            dot = __fadd_rn(dot, __shfl_down_sync(FF_WARP_MASK, dot, offset));
         }
         if (lane == 0) {
             const float h_inv = rsqrtf(__fadd_rn(__fdiv_rn(h2, float(width)), epsilon));

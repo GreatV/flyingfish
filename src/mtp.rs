@@ -300,6 +300,7 @@ pub(crate) fn component_spec(spec: &ModelSpec) -> Result<ModelSpec> {
         crate::model_spec::FfnKind::Dense
     };
     component.layers = vec![crate::model_spec::LayerPlan {
+        geometry: None,
         mixer: crate::model_spec::Mixer::FullAttention,
         state_index: 0,
         rope: true,

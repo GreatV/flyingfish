@@ -772,11 +772,8 @@ impl Engine {
             spec: None,
             hidden_capture: None,
             qwen: None,
-            #[cfg(feature = "cuda")]
             deepseek_mixer: None,
-            #[cfg(feature = "cuda")]
             deepseek_ffn: None,
-            #[cfg(feature = "cuda")]
             deepseek_engram: None,
             recurrent: Some(recurrent),
             hc: None,
@@ -1014,18 +1011,20 @@ impl Engine {
         };
         unsafe {
             let (visual, visual_begin, visual_rows) = if !token {
-                r.media.as_ref().map_or((&self.weights.embed, 0, 0), |m| {
-                    (
-                        &m.work.projected_bf16,
-                        m.slot.tokens.start as i32,
-                        m.slot.tokens.len() as i32,
-                    )
-                })
+                r.media
+                    .as_ref()
+                    .map_or((self.weights.embedding(), 0, 0), |m| {
+                        (
+                            &m.work.projected_bf16,
+                            m.slot.tokens.start as i32,
+                            m.slot.tokens.len() as i32,
+                        )
+                    })
             } else {
-                (&self.weights.embed, 0, 0)
+                (self.weights.embedding(), 0, 0)
             };
             s.launch_builder(&r.embed)
-                .arg(&self.weights.embed)
+                .arg(self.weights.embedding())
                 .arg(if token { &w.token } else { &w.ids })
                 .arg(&r.initial)
                 .arg(&mut r.high)

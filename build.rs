@@ -150,6 +150,14 @@ const ROCM_KERNELS: &[&str] = &[
     "vision_ops",
     "gemm_skinny",
     "fp8_linear",
+    "mhc",
+    "quantize",
+    "latent_compress",
+    "latent_window_attention",
+    "index_score",
+    "dsa",
+    "topk",
+    "gated_residual",
     "moe_route",
     "moe_ffn",
     "moe_combine",
@@ -287,7 +295,11 @@ fn build_rocm(out: &std::path::Path) {
     );
     for name in ROCM_KERNELS {
         let variants: &[(&str, &[&str])] = if name.starts_with("gdn/") {
-            &[("", &[]), ("_h32", &["-DGDN_HEADS=32"])]
+            &[
+                ("", &[]),
+                ("_h32", &["-DGDN_HEADS=32"]),
+                ("_per_channel", &["-DGDN_HEADS=64", "-DGDN_KHEADS=64"]),
+            ]
         } else if *name == "tcmqa_d256" {
             &[
                 ("", &[]),
@@ -334,6 +346,10 @@ fn build_rocm(out: &std::path::Path) {
                 let result = Command::new(&hipcc)
                     .env("TMPDIR", &temp)
                     .args(["--genco", "-O3", "--std=c++17", "-mno-wavefrontsize64"])
+                    .args(
+                        matches!(*name, "mhc" | "latent_compress" | "latent_window_attention")
+                            .then_some("-ffp-contract=off"),
+                    )
                     .args(*defines)
                     .arg(format!("--offload-arch={arch}"))
                     .arg(&file)

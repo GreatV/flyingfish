@@ -14,18 +14,14 @@ pub mod draft;
 pub mod dsa;
 pub mod engine;
 pub mod flash;
-#[cfg(feature = "cuda")]
 pub mod gated_residual;
 pub(crate) mod gdn;
 pub mod hc;
-#[cfg(feature = "cuda")]
 pub mod index_score;
 #[cfg(test)]
 #[cfg(feature = "cuda")]
 mod kv_cache_tests;
-#[cfg(feature = "cuda")]
 pub mod latent_compress;
-#[cfg(feature = "cuda")]
 pub mod latent_window_attention;
 pub(crate) mod linear;
 #[cfg(feature = "cuda")]
@@ -39,9 +35,7 @@ pub mod moe;
 pub mod multi_calibrate;
 pub mod ops;
 pub mod profile;
-#[cfg(feature = "cuda")]
 pub mod quantize;
-#[cfg(feature = "cuda")]
 pub mod selection;
 pub mod state;
 pub(crate) mod tree;
@@ -603,6 +597,9 @@ pub(crate) static DISABLE_PEER: std::sync::atomic::AtomicBool =
 #[cfg(test)]
 #[cfg(feature = "cuda")]
 mod q38_tests;
+
+#[cfg(test)]
+mod gemma4_ops_tests;
 
 #[cfg(test)]
 #[cfg(feature = "cuda")]

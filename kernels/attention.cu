@@ -775,47 +775,63 @@ struct Problem {
   bf16* out;
   float* lse;
   uint32_t rows, capacity, q_stride, q_heads, group, start;
+  const int* position;
 };
-static_assert(sizeof(Problem) == 64);
+static_assert(sizeof(Problem) == 72);
+static_assert(__builtin_offsetof(Problem, position) == 64);
 using B = short __attribute__((ext_vector_type(16)));
 using A = float __attribute__((ext_vector_type(8)));
 
 // D256 uses eight-lane FP32 QK dots and BF16 WMMA PV.
 // D128 reuses K storage for scores and keeps two BF16 probability planes.
-template<int D, int MODE>
-__device__ void run(Problem p, uint32_t extent) {
-  constexpr int BQ = D == 256 ? 16 : 32;
-  constexpr int BK = D == 256 ? 32 : 64;
-  constexpr int KS = D == 256 ? D+8 : D;
-  constexpr int PLANES = D == 256 ? 1 : 2;
+template<int D, int MODE, bool EXPLICIT = false, bool PARTIAL = false>
+__device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
+    float* partials = nullptr, uint32_t parts = 1, uint32_t chunk = 0) {
+  if (p.position) {
+    const int start = *p.position;
+    if (start < 0) __trap();
+    p.start = min(static_cast<uint32_t>(start), p.start);
+  }
+  constexpr int BQ = D == 128 ? 32 : 16;
+  constexpr int BK = D == 128 ? 64 : (D == 256 ? 32 : 16);
+  constexpr int KS = D == 128 ? D : D+8;
+  constexpr int PLANES = D == 256 && !EXPLICIT ? 1 : 2;
+  constexpr int PANELS = D == 512 ? 8 : 4;
   __shared__ __align__(16) unsigned short memory[BQ*D + BK*KS + BK*D +
-      PLANES*BQ*BK + 2*BQ + (D == 256 ? 2*BQ*BK : 0)];
+      PLANES*BQ*BK + 2*BQ + (D != 128 ? 2*BQ*BK : 0)];
   auto* qs = memory;
   auto* ks = qs + BQ*D;
   auto* vs = ks + BK*KS;
   auto* high = vs + BK*D;
   auto* low = high + BQ*BK;
   auto* alpha = reinterpret_cast<float*>(high + PLANES*BQ*BK);
-  auto* score_memory = D == 256 ? alpha+BQ : reinterpret_cast<float*>(ks);
+  auto* score_memory = D != 128 ? alpha+BQ : reinterpret_cast<float*>(ks);
   const int tid = threadIdx.x, wave = tid/32, lane = tid%32;
-  const uint32_t head = blockIdx.y, kv = head/p.group, query_base = blockIdx.x*BQ;
+  const uint32_t head = blockIdx.y, kv = head/p.group;
+  const uint32_t query_base = PARTIAL ? 0 : blockIdx.x*BQ;
+  const uint32_t partition = PARTIAL ? blockIdx.x : 0;
   if (blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 ||
-      gridDim.x != (p.rows+BQ-1)/BQ || gridDim.y != p.q_heads || gridDim.z != 1 ||
-      p.group == 0 || p.rows == 0 || p.start > p.capacity || p.rows > p.capacity-p.start) __trap();
+      gridDim.x != (PARTIAL ? parts : (p.rows+BQ-1)/BQ) || gridDim.y != p.q_heads || gridDim.z != 1 ||
+      p.group == 0 || p.rows == 0 || p.start > p.capacity || p.rows > p.capacity-p.start ||
+      (PARTIAL && (p.rows > BQ || parts == 0 || chunk == 0 || chunk % BK != 0))) __trap();
   const uint32_t end = MODE == 1 ? extent : (MODE == 2 ? max(extent,p.start+p.rows) : p.start+p.rows);
-  const uint32_t first = MODE == 3 && p.start+query_base > extent
+  uint32_t first = MODE == 3 && p.start+query_base > extent
       ? (p.start+query_base-extent)/BK*BK : 0;
-  const uint32_t limit = MODE == 1 ? end : min(end, MODE == 2
+  uint32_t limit = MODE == 1 ? end : min(end, MODE == 2
       ? max(extent,p.start+query_base+BQ) : p.start+query_base+BQ);
+  if constexpr (PARTIAL) {
+    first = max(first,partition*chunk);
+    limit = min(limit,(partition+1)*chunk);
+  }
   for (int cell = tid; cell < BQ*D; cell += 128) {
     const uint32_t row = query_base + cell/D;
     qs[cell] = row < p.rows ? reinterpret_cast<const unsigned short*>(p.q)[
         (size_t)row*p.q_stride + head*D + cell%D] : 0;
   }
   float peak = -INFINITY, denominator = 0.0f, correction = 0.0f;
-  A output[4] = {};
-  const int q_slab = D == 256 ? 0 : wave/2;
-  const int channel = D == 256 ? wave*64 : (wave%2)*64;
+  A output[PANELS] = {};
+  const int q_slab = D == 128 ? wave/2 : 0;
+  const int channel = D == 128 ? (wave%2)*64 : wave*(D/4);
   __syncthreads();
   for (uint32_t base = first; base < limit; base += BK) {
     for (int cell = tid; cell < BK*D; cell += 128) {
@@ -830,9 +846,9 @@ __device__ void run(Problem p, uint32_t extent) {
       const bool visible = query_base+row < p.rows && key < end &&
           (MODE == 1 || (MODE == 2 ? key < max(extent,query+1) : key <= query)) &&
           (MODE != 3 || query-key <= extent);
-      score_memory[row*BK+column] = visible ? value*(D == 256 ? 0.0625f : SCALE) : -INFINITY;
+      score_memory[row*BK+column] = visible ? value*(EXPLICIT ? scale : (D == 256 ? 0.0625f : SCALE)) : -INFINITY;
     };
-    if constexpr (D == 256) {
+    if constexpr (D != 128) {
       for (int cell = tid/8; cell < BQ*BK; cell += 16) {
         float dot = 0.0f;
 #pragma unroll
@@ -883,7 +899,7 @@ __device__ void run(Problem p, uint32_t extent) {
         denominator = sum;
         const bf16 hi = __float2bfloat16(value);
         high[tid*BK+key] = reinterpret_cast<const unsigned short&>(hi);
-        if constexpr (D == 128) {
+        if constexpr (PLANES == 2) {
           const bf16 lo = __float2bfloat16(value-__bfloat162float(hi));
           low[tid*BK+key] = reinterpret_cast<const unsigned short&>(lo);
         }
@@ -893,7 +909,7 @@ __device__ void run(Problem p, uint32_t extent) {
     }
     __syncthreads();
 #pragma unroll
-    for (int panel = 0; panel < 4; ++panel) {
+    for (int panel = 0; panel < PANELS; ++panel) {
 #pragma unroll
       for (int j = 0; j < 8; ++j) output[panel][j] *= alpha[q_slab*16+2*j+lane/16];
     }
@@ -903,15 +919,15 @@ __device__ void run(Problem p, uint32_t extent) {
 #pragma unroll
       for (int j = 0; j < 16; ++j) {
         ph[j] = high[(q_slab*16+lane%16)*BK+tile*16+j];
-        if constexpr (D == 128) pl[j] = low[(q_slab*16+lane%16)*BK+tile*16+j];
+        if constexpr (PLANES == 2) pl[j] = low[(q_slab*16+lane%16)*BK+tile*16+j];
       }
 #pragma unroll
-      for (int panel = 0; panel < 4; ++panel) {
+      for (int panel = 0; panel < PANELS; ++panel) {
         B value;
 #pragma unroll
         for (int j = 0; j < 16; ++j) value[j] = vs[(tile*16+j)*D+channel+panel*16+lane%16];
         output[panel] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(ph,value,output[panel]);
-        if constexpr (D == 128)
+        if constexpr (PLANES == 2)
           output[panel] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(pl,value,output[panel]);
       }
     }
@@ -919,21 +935,63 @@ __device__ void run(Problem p, uint32_t extent) {
   }
   if (tid < BQ) {
     alpha[tid] = denominator > 0 ? 1.0f/denominator : 0.0f;
-    if (query_base+tid < p.rows) p.lse[(size_t)head*p.rows+query_base+tid] = peak+logf(denominator);
+    if (query_base+tid < p.rows) {
+      if constexpr (PARTIAL) {
+        const size_t offset = (((size_t)(query_base+tid)*p.q_heads+head)*parts+partition)*514;
+        partials[offset+512] = peak;
+        partials[offset+513] = denominator;
+      } else {
+        p.lse[(size_t)head*p.rows+query_base+tid] = peak+logf(denominator);
+      }
+    }
   }
   __syncthreads();
 #pragma unroll
-  for (int panel = 0; panel < 4; ++panel) {
+  for (int panel = 0; panel < PANELS; ++panel) {
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
       const uint32_t row = query_base+q_slab*16+2*j+lane/16;
-      if (row < p.rows) p.out[((size_t)row*p.q_heads+head)*D+channel+panel*16+lane%16] =
-          __float2bfloat16(output[panel][j]*alpha[q_slab*16+2*j+lane/16]);
+      if (row < p.rows) {
+        const size_t dimension = channel+panel*16+lane%16;
+        if constexpr (PARTIAL) {
+          partials[(((size_t)row*p.q_heads+head)*parts+partition)*514+dimension] = output[panel][j];
+        } else {
+          p.out[((size_t)row*p.q_heads+head)*D+dimension] =
+              __float2bfloat16(output[panel][j]*alpha[q_slab*16+2*j+lane/16]);
+        }
+      }
     }
   }
 }
 }
 extern "C" __global__ void attention_prefill_d256(prefill::Problem p) { prefill::run<256,0>(p,0); }
+extern "C" __global__ void attention_prefill_d256_window(prefill::Problem p, uint32_t window, float scale) { prefill::run<256,3,true>(p,window,scale); }
+extern "C" __global__ void attention_prefill_d512(prefill::Problem p, float scale) { prefill::run<512,0,true>(p,0,scale); }
+extern "C" __global__ void attention_partial_d512(prefill::Problem p, float scale, float* partials, uint32_t parts, uint32_t chunk) { prefill::run<512,0,true,true>(p,0,scale,partials,parts,chunk); }
+extern "C" __global__ void attention_merge_d512(prefill::Problem p, const float* partials, uint32_t parts) {
+  const uint32_t row = blockIdx.x, head = blockIdx.y, tid = threadIdx.x;
+  if (blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 || gridDim.z != 1 ||
+      gridDim.x != p.rows || gridDim.y != p.q_heads || parts == 0) __trap();
+  const size_t base = ((size_t)row*p.q_heads+head)*parts*514;
+  float peak = -INFINITY;
+  for (uint32_t part = 0; part < parts; ++part) peak = fmaxf(peak,partials[base+part*514+512]);
+  float sum = 0.0f, correction = 0.0f;
+  float output[4] = {};
+  for (uint32_t part = 0; part < parts; ++part) {
+    const float* source = partials+base+part*514;
+    if (source[513] > 0.0f) {
+      const float weight = __expf(source[512]-peak);
+      const float value = weight*source[513]-correction, next = sum+value;
+      correction = (next-sum)-value;
+      sum = next;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) output[j] = fmaf(weight,source[tid*4+j],output[j]);
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < 4; ++j) p.out[((size_t)row*p.q_heads+head)*512+tid*4+j] = __float2bfloat16(output[j]/sum);
+  if (tid == 0) p.lse[(size_t)head*p.rows+row] = peak+logf(sum);
+}
 extern "C" __global__ void attention_prefill_d128(prefill::Problem p) { prefill::run<128,0>(p,0); }
 extern "C" __global__ void attention_prefill_d128_bidirectional(prefill::Problem p, uint32_t keys) { prefill::run<128,1>(p,keys); }
 extern "C" __global__ void attention_prefill_d128_prefix(prefill::Problem p, uint32_t prefix) { prefill::run<128,2>(p,prefix); }

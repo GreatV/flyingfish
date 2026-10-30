@@ -49,7 +49,7 @@ pub struct Layer {
 }
 
 pub struct Weights {
-    pub embed: CudaSlice<bf16>,
+    pub embed: Option<CudaSlice<bf16>>,
     pub layers: Vec<Layer>,
     pub norm: Option<CudaSlice<bf16>>,
     pub head: CudaSlice<bf16>,
@@ -436,7 +436,6 @@ impl UploadHashWorker {
 
 impl Loader<'_> {
     /// Marks one manifest tensor consumed without uploading it.
-    #[cfg(feature = "cuda")]
     pub(super) fn defer(&mut self, name: &str) -> Result<()> {
         ensure!(
             self.seen.insert(name.to_owned()),
@@ -673,6 +672,10 @@ fn decode_bf16(bytes: &[u8], values: &mut [bf16]) {
 }
 
 impl Weights {
+    pub fn embedding(&self) -> &CudaSlice<bf16> {
+        self.embed.as_ref().unwrap_or(&self.head)
+    }
+
     pub fn load_loopvl(
         dir: &Path,
         spec: &crate::model_spec::ModelSpec,
@@ -720,7 +723,7 @@ impl Weights {
             );
             Ok((
                 Self {
-                    embed,
+                    embed: Some(embed),
                     head,
                     norm: None,
                     layers,
@@ -775,7 +778,7 @@ impl Weights {
             let head = l.load(&[("lm_head.weight".into(), vec![c.vocab_size, h])])?;
             let bytes = l.bytes;
             Ok(Self {
-                embed,
+                embed: Some(embed),
                 layers,
                 norm: Some(norm),
                 head,
@@ -1011,14 +1014,20 @@ impl WeightCatalog {
         } else {
             "model.norm.weight"
         };
+        let has_head = self.tensors.contains_key("lm_head.weight");
         let mut take = |name: &str| match self.tensors.remove(name) {
             Some(StoredTensor::Bf16(v)) => Ok(v),
             _ => anyhow::bail!("missing/non-BF16 global tensor {name}"),
         };
+        let (embed, head) = if has_head {
+            (Some(take(embed_name)?), take("lm_head.weight")?)
+        } else {
+            (None, take(embed_name)?)
+        };
         Ok(Weights {
-            embed: take(embed_name)?,
+            embed,
             norm: Some(take(norm_name)?),
-            head: take("lm_head.weight")?,
+            head,
             layers: Vec::new(),
             bytes: self.bytes,
         })

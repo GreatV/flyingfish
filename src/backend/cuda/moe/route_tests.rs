@@ -1011,6 +1011,116 @@ fn noaux_route(device: &Device, ops: &RouteOps) -> Result<()> {
     Ok(())
 }
 
+fn noaux_fp32_route(device: &Device, ops: &RouteOps) -> Result<()> {
+    let s = &device.stream;
+    let experts = 288usize;
+    let top_k = 8usize;
+    let score = crate::model_spec::RouterScore::Sigmoid;
+    let scaling = 2.5f32;
+    let limit = 16.0 * f64::from(f32::EPSILON);
+    let mut cells = 0;
+    let mut bias_controls = 0;
+    let mut rounding_controls = 0;
+    for rows in [1usize, 5, 37, 512] {
+        let logits: Vec<f32> = (0..rows * experts)
+            .map(|i| ((i * 37 + 11) % 293) as f32 / 64.0 - 2.0)
+            .collect();
+        let bias: Vec<f32> = (0..rows * experts)
+            .map(|i| ((i * 19 + 7) % 283) as f32 / 128.0 - 1.0)
+            .collect();
+        let lb = testing::upload_device(device, logits.clone())?;
+        let bb = testing::upload_device(device, bias.clone())?;
+        device.finish_upload()?;
+        let ib = testing::zeros::<i32>(s, rows * top_k)?;
+        let wb = testing::zeros::<f32>(s, rows * top_k)?;
+        let run = || {
+            ops.topk_noaux_f32(
+                testing::dense(&lb, s, rows as u32, experts as u32)?,
+                Some(testing::dense(&bb, s, rows as u32, experts as u32)?),
+                &mut testing::dense_mut(&ib, s, rows as u32, top_k as u32)?,
+                &mut testing::dense_mut(&wb, s, rows as u32, top_k as u32)?,
+                score,
+                scaling,
+            )
+        };
+        let mut eager = None;
+        for graph in [false, true] {
+            if graph {
+                testing::capture(s, run)?.launch()?;
+            } else {
+                run()?;
+            }
+            let ids = s.clone_dtoh(&ib)?;
+            let weights = s.clone_dtoh(&wb)?;
+            let mut worst = 0f64;
+            let mut minimum_margin = f64::INFINITY;
+            for row in 0..rows {
+                let x = &logits[row * experts..(row + 1) * experts];
+                let b = &bias[row * experts..(row + 1) * experts];
+                let raw: Vec<f64> = x
+                    .iter()
+                    .map(|&v| 1.0 / (1.0 + (-f64::from(v)).exp()))
+                    .collect();
+                let mut order: Vec<usize> = (0..experts).collect();
+                order.sort_by(|&a, &c| {
+                    (raw[c] + f64::from(b[c]))
+                        .total_cmp(&(raw[a] + f64::from(b[a])))
+                        .then(a.cmp(&c))
+                });
+                let margin =
+                    raw[order[7]] + f64::from(b[order[7]]) - raw[order[8]] - f64::from(b[order[8]]);
+                minimum_margin = minimum_margin.min(margin);
+                ensure!(
+                    margin > 4.0 * f64::from(f32::EPSILON),
+                    "FP32 route fixture cut margin {margin}"
+                );
+                let denominator = order[..top_k].iter().map(|&i| raw[i]).sum::<f64>() + 1e-20;
+                for choice in 0..top_k {
+                    let i = row * top_k + choice;
+                    ensure!(
+                        ids[i] == order[choice] as i32,
+                        "FP32 route row={row} choice={choice} ID mismatch"
+                    );
+                    let expected = raw[order[choice]] / denominator * f64::from(scaling);
+                    let error = (f64::from(weights[i]) - expected).abs();
+                    ensure!(
+                        error.is_finite() && error <= limit,
+                        "FP32 route weight error={error} limit={limit}"
+                    );
+                    worst = worst.max(error);
+                    rounding_controls += usize::from(
+                        (f64::from(bf16::from_f32(weights[i]).to_f32()) - expected).abs() > limit,
+                    );
+                }
+                let (without_bias, _) =
+                    reference::noaux_tc_route(x, &vec![0.0; experts], top_k, score, scaling)?;
+                bias_controls += usize::from(without_bias != ids[row * top_k..(row + 1) * top_k]);
+            }
+            let bits: Vec<_> = weights.iter().map(|v| v.to_bits()).collect();
+            if let Some((old_ids, old_bits)) = &eager {
+                ensure!(
+                    ids == *old_ids && bits == *old_bits,
+                    "FP32 route graph/eager mismatch"
+                );
+            } else {
+                eager = Some((ids, bits));
+            }
+            cells += 1;
+            println!(
+                "PASS ROUTE_NOAUX_F32 logits=[{rows},{experts}] weights=[{rows},{top_k}] graph={graph} max_abs={worst} limit={limit} cut_margin={minimum_margin}"
+            );
+        }
+    }
+    ensure!(
+        bias_controls > 0 && rounding_controls > 0,
+        "FP32 route bias/rounding control escaped"
+    );
+    println!(
+        "PASS ROUTE_NOAUX_F32_SUMMARY cells={cells} bias_controls={bias_controls} bf16_weight_controls={rounding_controls} fp64=true graph_bits=0"
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires coordinator-granted GPU window; FF_Q38_GPU_WINDOW=granted"]
 fn moe_route_noaux_gpu() -> Result<()> {
@@ -1019,8 +1129,9 @@ fn moe_route_noaux_gpu() -> Result<()> {
         "GPU window not acknowledged"
     );
     let device = Device::new(0)?;
-    let ops = RouteOps::new(&device.ctx, &device.stream, 288, 2)?;
-    noaux_route(&device, &ops)
+    let ops = RouteOps::new(&device.ctx, &device.stream, 288, 512)?;
+    noaux_route(&device, &ops)?;
+    noaux_fp32_route(&device, &ops)
 }
 
 #[test]

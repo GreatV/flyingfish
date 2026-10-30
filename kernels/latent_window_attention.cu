@@ -29,9 +29,7 @@
 // adjacent-pair rotary lives in kernels/rope.cu (rope_pair_rows /
 // rope_pair_tail).
 #include "q38_contract.cuh"
-#include <cuda_bf16.h>
 #include <math.h>
-#include <math_constants.h>
 #include <stdint.h>
 
 #define LWA_THREADS 256
@@ -95,7 +93,7 @@ extern "C" __global__ __launch_bounds__(LWA_THREADS) void latent_window_attentio
       acc = fmaf(s_q[d], lwa_value(k_row[d], sc_row[i]), acc);
     }
     for (int off = 16; off > 0; off >>= 1)
-      acc += __shfl_down_sync(0xffffffffu, acc, off);
+      acc += __shfl_down_sync(FF_WARP_MASK, acc, off);
     if (lane == 0) s_scores[s] = acc * scale;
   }
   __syncthreads();
@@ -107,7 +105,7 @@ extern "C" __global__ __launch_bounds__(LWA_THREADS) void latent_window_attentio
   // its unrounded sum; the sink enters the sum after the last block, then one divide.
   // p_mode 1 keeps the structure and drops only the BF16 P rounding (the gate's control).
   for (int d = tid; d < head_dim; d += nthr) s_acc[d] = 0.0f;
-  float m_run = -CUDART_INF_F;
+  float m_run = -INFINITY;
   float sum_exp = 0.0f;
   for (int t = 0; t < slots; t += LWA_PUB_BLOCK) {
     const int hi = t + LWA_PUB_BLOCK < slots ? t + LWA_PUB_BLOCK : slots;
@@ -263,8 +261,8 @@ extern "C" __global__ __launch_bounds__(LWA_THREADS) void latent_group_project(
       sum = fmaf(e4m3_decode(w[i]), e4m3_decode(a[i]), sum);
     // Lanes with sub in {0, 1} hold the block's low 16-element sum, {2, 3} its
     // high one; sub 0 adds both to its partial in ascending order.
-    sum += __shfl_xor_sync(0xffffffffu, sum, 1, 4);
-    const float upper = __shfl_xor_sync(0xffffffffu, sum, 2, 4);
+    sum += __shfl_xor_sync(FF_WARP_MASK, sum, 1, 4);
+    const float upper = __shfl_xor_sync(FF_WARP_MASK, sum, 2, 4);
     if (sub == 0) {
       const float scale =
           e8m0_decode(act_sc[block]) * e8m0_decode(w_sc[block]);
@@ -276,7 +274,7 @@ extern "C" __global__ __launch_bounds__(LWA_THREADS) void latent_group_project(
   // stride lanes' partial dots.
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1)
-    acc += __shfl_xor_sync(0xffffffffu, acc, off);
+    acc += __shfl_xor_sync(FF_WARP_MASK, acc, off);
   if (lane == 0) out[(size_t)row * groups * rank + col] = __float2bfloat16_rn(acc);
 }
 
@@ -337,7 +335,7 @@ __device__ __forceinline__ void indexed_attention_core(
         if constexpr (Trace) { if (!head) trace[163840+i*512+d] = value; }
         dot = fmaf(qv[d], value, dot);
       }
-      for (int off = 16; off; off >>= 1) dot += __shfl_down_sync(0xffffffffu, dot, off);
+      for (int off = 16; off; off >>= 1) dot += __shfl_down_sync(FF_WARP_MASK, dot, off);
     }
     if constexpr (Trace) {
       if (id < 0 && !head) for (int d = lane; d < width; d += 32)

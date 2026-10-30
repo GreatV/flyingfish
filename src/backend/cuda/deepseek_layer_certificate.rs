@@ -1,7 +1,7 @@
 use super::*;
 use crate::backend::cuda::cubin;
 use crate::backend::cuda::latent_window_attention::certificate;
-use cudarc::driver::{LaunchConfig, PushKernelArg};
+use crate::backend::gpu::{LaunchConfig, PushKernelArg};
 
 pub(super) struct Certificate {
     values: [Vec<bf16>; 2],

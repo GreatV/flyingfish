@@ -142,7 +142,7 @@ extern "C" __global__ void rope_float(__nv_bfloat16* qkv, const int* start,
     qkv[off + dim / 2] = __float2bfloat16(b * c + a * s);
 }
 
-template <bool ROTARY, bool PLANAR>
+template <bool ROTARY, bool PLANAR, bool TABLE = false>
 __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
                                                     __nv_bfloat16* k, __nv_bfloat16* v,
                                                     const __nv_bfloat16* q_norm_w,
@@ -154,14 +154,17 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
                                                     int ring_tokens, float theta, float eps,
                                                     size_t q_row_stride, size_t k_offset,
                                                     size_t k_row_stride, size_t v_offset,
-                                                    size_t v_row_stride) {
-    const bool shape = (q_heads == 16 && kv_heads == 2) ||
-                       (q_heads == 32 && kv_heads == 4);
-    if (!shape || dim != 128 || rows < 1 || rows > 65535 ||
-        *start < 0 || cache_start < -1 ||
+                                                    size_t v_row_stride,
+                                                    const __nv_bfloat16* table) {
+    const bool shape = TABLE ? (q_heads > 0 && kv_heads >= 0 &&
+                                (dim == 256 || dim == 512))
+                             : ((q_heads == 16 && kv_heads == 2) ||
+                                (q_heads == 32 && kv_heads == 4));
+    if (!shape || (!TABLE && dim != 128) || (TABLE && !table) || rows < 1 || rows > 65535 ||
+        *start < 0 || cache_start < -2 ||
         (ring_tokens == 0 && cache_start < 0 && *start + rows > capacity) ||
         (ring_tokens == 0 && cache_start >= 0 && cache_start + rows > capacity) ||
-        (ring_tokens > 0 && cache_start >= 0))
+        (ring_tokens > 0 && cache_start >= 0) || (!TABLE && cache_start == -2))
         __trap();
     __shared__ float smem[32];
     const int heads = q_heads + 2 * kv_heads;
@@ -185,9 +188,11 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
         base = (size_t)row * heads * dim + (size_t)head * dim;
     }
     const int position = *start + row;
-    const int cache_pos = ring_tokens > 0
-                              ? position % ring_tokens
-                              : (cache_start < 0 ? position : cache_start + row);
+    const int cache_pos = ring_tokens > 0 && cache_start == -2
+                              ? min(position, ring_tokens) + row
+                              : ring_tokens > 0
+                                  ? position % ring_tokens
+                                  : (cache_start < 0 ? position : cache_start + row);
 
     if (head < q_heads + kv_heads) {
         const __nv_bfloat16* w = (head < q_heads) ? q_norm_w : k_norm_w;
@@ -216,7 +221,7 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
             if (gid == 0) smem[0] = t;
         }
         __syncthreads();
-        const float rstd = rsqrtf(smem[0] / (float)dim + eps);
+        const float rstd = powf(smem[0] / (float)dim + eps, -0.5f);
 
         if (gid < dim / 8) {
             float ww[8], out[8];
@@ -239,7 +244,23 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
         __syncthreads();
 
         if constexpr (ROTARY) {
-          if (gid < dim / 2) {
+          for (int d = gid; d < dim / 2; d += nthr) {
+            if constexpr (TABLE) {
+              const __nv_bfloat16 c = table[(size_t)position * dim + d];
+              const __nv_bfloat16 s = table[(size_t)position * dim + dim / 2 + d];
+              const __nv_bfloat16 a = qkv[base + d];
+              const __nv_bfloat16 b = qkv[base + d + dim / 2];
+              const __nv_bfloat16 lo = __hsub_rn(__hmul_rn(a, c), __hmul_rn(b, s));
+              const __nv_bfloat16 hi = __hadd_rn(__hmul_rn(b, c), __hmul_rn(a, s));
+              qkv[base + d] = lo;
+              qkv[base + d + dim / 2] = hi;
+              if (head >= q_heads) {
+                const int kv_head = head - q_heads;
+                const size_t dst = ((size_t)kv_head * capacity + cache_pos) * dim;
+                k[dst + d] = lo;
+                k[dst + d + dim / 2] = hi;
+              }
+            } else {
             const float inv = 1.0f / powf(theta, float(2 * gid) / dim);
             const float angle = float(position) * inv;
             const float c = __bfloat162float(__float2bfloat16(cosf(angle)));
@@ -255,6 +276,7 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
                 const size_t dst = ((size_t)kv_head * capacity + cache_pos) * dim;
                 k[dst + gid] = lo;
                 k[dst + gid + dim / 2] = hi;
+              }
             }
           }
         } else if (head >= q_heads) {
@@ -265,8 +287,44 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
     } else {
         const int kv_head = head - q_heads - kv_heads;
         const size_t dst = ((size_t)kv_head * capacity + cache_pos) * dim;
+        if constexpr (TABLE) {
+        float r[8];
+        float ssq = 0.0f;
+        if (gid < dim / 8) {
+            const __nv_bfloat16* p = qkv + base + (size_t)gid * 8;
+            union U { float4 x; __nv_bfloat162 h[4]; } u;
+            u.x = *reinterpret_cast<const float4*>(p);
 #pragma unroll
-        for (int d = gid; d < dim; d += nthr) v[dst + d] = qkv[base + d];
+            for (int j = 0; j < 8; ++j) {
+                float2 t = __bfloat1622float2(u.h[j >> 1]);
+                r[j] = (j & 1) ? t.y : t.x;
+                ssq += r[j] * r[j];
+            }
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) ssq += __shfl_xor_sync(FF_WARP_MASK, ssq, o);
+        if ((gid & 31) == 0) smem[gid >> 5] = ssq;
+        __syncthreads();
+        if (gid < 32) {
+            int nw = nthr >> 5;
+            float t = (gid < nw) ? smem[gid] : 0.0f;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) t += __shfl_xor_sync(FF_WARP_MASK, t, o);
+            if (gid == 0) smem[0] = t;
+        }
+        __syncthreads();
+        const float rstd = powf(smem[0] / (float)dim + eps, -0.5f);
+        if (gid < dim / 8) {
+            union O { float4 x; __nv_bfloat162 h[4]; } o;
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                o.h[j] = __floats2bfloat162_rn(r[2 * j] * rstd, r[2 * j + 1] * rstd);
+            *reinterpret_cast<float4*>(v + dst + (size_t)gid * 8) = o.x;
+        }
+        } else {
+#pragma unroll
+            for (int d = gid; d < dim; d += nthr) v[dst + d] = qkv[base + d];
+        }
     }
 }
 
@@ -282,7 +340,7 @@ extern "C" __global__ void draft_qknorm_rope_kv(__nv_bfloat16* qkv,
                                                 int ring_tokens, float theta, float eps) {
     qknorm_rope_kv_impl<true, false>(qkv, k, v, q_norm_w, k_norm_w, start, -1, rows,
                                      q_heads, kv_heads, dim, capacity, ring_tokens, theta, eps,
-                                     0, 0, 0, 0, 0);
+                                     0, 0, 0, 0, 0, nullptr);
 }
 
 extern "C" __global__ void qknorm_kv_nope(__nv_bfloat16* qkv,
@@ -295,7 +353,7 @@ extern "C" __global__ void qknorm_kv_nope(__nv_bfloat16* qkv,
                                           int ring_tokens, float, float eps) {
     qknorm_rope_kv_impl<false, false>(qkv, k, v, q_norm_w, k_norm_w, start, -1, rows,
                                       q_heads, kv_heads, dim, capacity, ring_tokens, 1.0f, eps,
-                                      0, 0, 0, 0, 0);
+                                      0, 0, 0, 0, 0, nullptr);
 }
 
 extern "C" __global__ void flint_qknorm_rope_kv(__nv_bfloat16* qkv,
@@ -314,7 +372,7 @@ extern "C" __global__ void flint_qknorm_rope_kv(__nv_bfloat16* qkv,
                                                  unsigned long long v_row_stride) {
     qknorm_rope_kv_impl<true, true>(qkv, k, v, q_norm_w, k_norm_w, start, cache_start, rows,
                                      q_heads, kv_heads, dim, capacity, ring_tokens, theta, eps,
-                                     q_row_stride, k_offset, k_row_stride, v_offset, v_row_stride);
+                                     q_row_stride, k_offset, k_row_stride, v_offset, v_row_stride, nullptr);
 }
 
 extern "C" __global__ void flint_qknorm_kv_nope(__nv_bfloat16* qkv,
@@ -333,7 +391,28 @@ extern "C" __global__ void flint_qknorm_kv_nope(__nv_bfloat16* qkv,
                                                  unsigned long long v_row_stride) {
     qknorm_rope_kv_impl<false, true>(qkv, k, v, q_norm_w, k_norm_w, start, cache_start, rows,
                                       q_heads, kv_heads, dim, capacity, ring_tokens, 1.0f, eps,
-                                      q_row_stride, k_offset, k_row_stride, v_offset, v_row_stride);
+                                      q_row_stride, k_offset, k_row_stride, v_offset, v_row_stride, nullptr);
+}
+
+extern "C" __global__ void qknorm_rope_table_kv(__nv_bfloat16* qkv,
+                                                 __nv_bfloat16* k, __nv_bfloat16* v,
+                                                 const __nv_bfloat16* q_norm_w,
+                                                 const __nv_bfloat16* k_norm_w,
+                                                 const __nv_bfloat16* table,
+                                                 const int* start,
+                                                 int cache_start,
+                                                 int rows, int q_heads, int kv_heads,
+                                                 int dim, int capacity,
+                                                 int ring_tokens, float eps,
+                                                 unsigned long long q_row_stride,
+                                                 unsigned long long k_offset,
+                                                 unsigned long long k_row_stride,
+                                                 unsigned long long v_offset,
+                                                 unsigned long long v_row_stride) {
+    qknorm_rope_kv_impl<true, true, true>(qkv, k, v, q_norm_w, k_norm_w, start, cache_start,
+                                          rows, q_heads, kv_heads, dim, capacity, ring_tokens,
+                                          1.0f, eps, q_row_stride, k_offset, k_row_stride,
+                                          v_offset, v_row_stride, table);
 }
 
 // Adjacent-pair layout mode of the rope op (the model definition's complex
@@ -378,4 +457,35 @@ extern "C" __global__ void rope_pair_tail(
   const float b = __bfloat162float(x[d + 1]);
   x[d] = __float2bfloat16_rn(a * c - b * s);
   x[d + 1] = __float2bfloat16_rn(a * s + b * c);
+}
+
+extern "C" __global__ void dynamic_ring_copy(const __nv_bfloat16* source,
+                                              __nv_bfloat16* target,
+                                              const int* position, int rows,
+                                              int source_capacity, int target_capacity,
+                                              int heads, int dim, int to_ring) {
+    const int ring = to_ring ? target_capacity : source_capacity;
+    const int absolute = *position;
+    const int history = min(absolute, ring);
+    int count, source_start, target_start;
+    if (to_ring) {
+        const int end = history + rows;
+        count = min(end, ring);
+        source_start = end - count;
+        target_start = absolute + rows - count;
+    } else {
+        count = history;
+        source_start = absolute - history;
+        target_start = 0;
+    }
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= heads * ring * dim) return;
+    const int head = i / (ring * dim);
+    const int row = (i / dim) % ring;
+    const int d = i % dim;
+    if (row >= count) return;
+    const int source_row = to_ring ? source_start + row : (source_start + row) % source_capacity;
+    const int target_row = to_ring ? (target_start + row) % target_capacity : target_start + row;
+    target[((size_t)head * target_capacity + target_row) * dim + d] =
+        source[((size_t)head * source_capacity + source_row) * dim + d];
 }
