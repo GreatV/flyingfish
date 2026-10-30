@@ -1980,7 +1980,7 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         ensure!(actual == expected, "published tensor mismatch: {full}");
     }
     drop(catalog);
-    let mut engine = super::engine::Engine::load(&dir, 0, 640, Some(640), settings)?;
+    let mut engine = super::engine::Engine::load(&dir, 0, 640, Some(640), settings.clone())?;
     let global_layer = spec
         .layers
         .iter()
@@ -2250,6 +2250,26 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
             &frozen["families"][family],
         )?;
     }
+    let wrap: Vec<u32> = serde_json::from_value(ids["wrap"].clone())?;
+    drop(engine);
+    let mut chunked = super::engine::Engine::load(&dir, 0, 640, Some(8), settings)?;
+    let mut actual = Vec::new();
+    for chunk in wrap.chunks(8) {
+        chunked.gemma_prefill_all(chunk)?;
+        for row in 0..chunk.len() {
+            actual.extend(chunked.gemma_all_logits(row)?);
+        }
+    }
+    let expected = reference(&data, "wrap.prefill")?.as_f32();
+    let actual = actual[actual.len() - expected.len()..].to_vec();
+    let (pass, line, _) = model_metrics(
+        &actual,
+        &expected,
+        &wrap[wrap.len() - 8..],
+        &frozen["families"]["wrap"],
+    )?;
+    println!("GEMMA4_CHUNKED_WRAP chunk=8 {line}");
+    defects += usize::from(!pass);
     ensure!(defects == 0, "GEMMA4_MODEL defects={defects}");
     ensure!(
         graph_defects == 0 && graph_state_defects == 0,

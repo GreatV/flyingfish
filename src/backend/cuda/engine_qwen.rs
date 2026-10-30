@@ -4423,7 +4423,7 @@ impl Engine {
                             .kv_scratch
                             .as_mut()
                             .context("sliding KV staging is not bound")?;
-                        if history > 0 || decode {
+                        if !reader && (history > 0 || decode) {
                             for (source, target) in [(&kv.k, &mut *stage_k), (&kv.v, &mut *stage_v)]
                             {
                                 let copy = super::super::copy::RingCopy {
