@@ -1715,7 +1715,12 @@ impl Engine {
         } else {
             self.prepare(rows)?;
         }
-        if step.head == Head::All {
+        // HIP Gemma prefill heads execute at the bucket bound by prepare_prefill_rows.
+        if step.head == Head::All
+            && !(cfg!(feature = "rocm")
+                && step.input == crate::backend::Input::Ids
+                && self.model_spec.architecture == crate::model_spec::Architecture::Gemma4)
+        {
             self.blas
                 .prepare(rows, self.config.vocab_size, self.config.hidden_size)?;
         }
