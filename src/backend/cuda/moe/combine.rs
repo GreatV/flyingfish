@@ -13,7 +13,6 @@ pub struct CombineOps {
     combine: CudaFunction,
     combine_ungated: CudaFunction,
     combine_accum: CudaFunction,
-    #[cfg(feature = "cuda")]
     combine_bf16: CudaFunction,
     combine_routed: CudaFunction,
     combine_routed_vector: CudaFunction,
@@ -427,7 +426,6 @@ impl CombineOps {
             combine: module.load_function("moe_combine")?,
             combine_ungated: module.load_function("moe_combine_ungated")?,
             combine_accum: module.load_function("moe_combine_accum")?,
-            #[cfg(feature = "cuda")]
             combine_bf16: module.load_function("moe_combine_bf16")?,
             combine_routed: module.load_function("moe_combine_routed")?,
             combine_routed_vector: module.load_function("moe_combine_routed_vector")?,
@@ -474,7 +472,6 @@ impl CombineOps {
         Ok(())
     }
 
-    #[cfg(feature = "cuda")]
     pub fn combine_bf16(&self, stream: &Arc<CudaStream>, input: &MoeCombine) -> Result<()> {
         let (rows, top_k, hidden) = input.validate()?;
         ensure!(

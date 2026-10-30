@@ -9,7 +9,6 @@
 #include <stdint.h>
 #include "q38_contract.cuh"
 
-#if !defined(__HIP__)
 extern "C" __global__ void fp8_quant_f32_128(
         const __nv_bfloat16* x, uint8_t* codes, float* scales, int m, int k) {
     if (m <= 0 || k <= 0 || blockDim.x != 128 || blockDim.y != 1 ||
@@ -29,19 +28,24 @@ extern "C" __global__ void fp8_quant_f32_128(
     }
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
-        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, offset));
+        maximum = fmaxf(maximum, __shfl_xor_sync(FF_WARP_MASK, maximum, offset));
     const float scale = __fmul_rn(maximum, 1.0f / 448.0f);
     if (lane == 0) scales[cell] = scale;
     const float divisor = fmaxf(scale, 1.0e-12f);
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const uint64_t col = first + lane + 32 * i;
-        if (col < uint64_t(k))
+        if (col < uint64_t(k)) {
+#if defined(__HIP__)
+            codes[row * k + col] = e4m3_encode_finite(
+                fminf(448.0f, fmaxf(-448.0f, values[i] / divisor)));
+#else
             codes[row * k + col] = __nv_cvt_float_to_fp8(
                 fminf(448.0f, fmaxf(-448.0f, values[i] / divisor)), __NV_SATFINITE, __NV_E4M3);
+#endif
+        }
     }
 }
-#endif
 
 #if !defined(__HIP__)
 template <int COUNT>

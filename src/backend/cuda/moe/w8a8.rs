@@ -199,7 +199,6 @@ pub struct MoeSharedW8A8 {
     down: CudaFunction,
 }
 
-#[cfg(feature = "cuda")]
 pub(crate) struct W8A8BlockCall<'a> {
     pub projections: &'a [super::super::linear::NativeProjection; 3],
     pub fp8: &'a super::super::linear::Fp8Ops,
@@ -213,7 +212,6 @@ pub(crate) struct W8A8BlockCall<'a> {
 }
 
 impl MoeSharedW8A8 {
-    #[cfg(feature = "cuda")]
     pub(crate) fn run_block(stream: &Arc<CudaStream>, call: W8A8BlockCall<'_>) -> Result<()> {
         let W8A8BlockCall {
             projections,

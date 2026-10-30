@@ -155,6 +155,7 @@ const ROCM_KERNELS: &[&str] = &[
     "latent_compress",
     "latent_window_attention",
     "index_score",
+    "dsa",
     "topk",
     "gated_residual",
     "moe_route",
@@ -294,7 +295,11 @@ fn build_rocm(out: &std::path::Path) {
     );
     for name in ROCM_KERNELS {
         let variants: &[(&str, &[&str])] = if name.starts_with("gdn/") {
-            &[("", &[]), ("_h32", &["-DGDN_HEADS=32"])]
+            &[
+                ("", &[]),
+                ("_h32", &["-DGDN_HEADS=32"]),
+                ("_per_channel", &["-DGDN_HEADS=64", "-DGDN_KHEADS=64"]),
+            ]
         } else if *name == "tcmqa_d256" {
             &[
                 ("", &[]),

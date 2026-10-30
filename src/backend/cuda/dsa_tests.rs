@@ -398,7 +398,7 @@ fn dsa_attention_reference_cpu() -> Result<()> {
 }
 
 #[test]
-#[ignore = "exclusive CUDA; FF_Q38_GPU_WINDOW=granted; FF_DSA_REFERENCE_DIR"]
+#[ignore = "exclusive GPU; FF_Q38_GPU_WINDOW=granted; FF_DSA_REFERENCE_DIR"]
 fn dsa_attention_gpu() -> Result<()> {
     ensure!(
         std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -469,15 +469,7 @@ fn dsa_attention_gpu() -> Result<()> {
         for graph in [false, true] {
             if graph {
                 s.synchronize()?;
-                s.begin_capture(
-                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-                )?;
-                let launched = bound.attention(&state, &input, s);
-                let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
-                launched?;
-                captured?
-                    .context("Runner FAIL empty attention graph")?
-                    .launch()?;
+                testing::capture(s, || bound.attention(&state, &input, s))?.launch()?;
             } else {
                 bound.attention(&state, &input, s)?;
             }
@@ -565,13 +557,7 @@ fn index_gpu_case(device: &Device, f: &Fixture) -> Result<usize> {
     for graph in [false, true] {
         if graph {
             s.synchronize()?;
-            s.begin_capture(
-                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )?;
-            let launched = bound.index(&state, &input, &output, s);
-            let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
-            launched?;
-            captured?.context("Runner FAIL DSA empty graph")?.launch()?;
+            testing::capture(s, || bound.index(&state, &input, &output, s))?.launch()?;
         } else {
             bound.index(&state, &input, &output, s)?;
         }
@@ -638,7 +624,7 @@ fn index_gpu_case(device: &Device, f: &Fixture) -> Result<usize> {
 }
 
 #[test]
-#[ignore = "exclusive CUDA; FF_Q38_GPU_WINDOW=granted"]
+#[ignore = "exclusive GPU; FF_Q38_GPU_WINDOW=granted"]
 fn dsa_index_gpu() -> Result<()> {
     ensure!(
         std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -734,7 +720,7 @@ impl Chunk {
 }
 
 #[test]
-#[ignore = "exclusive CUDA; FF_Q38_GPU_WINDOW=granted"]
+#[ignore = "exclusive GPU; FF_Q38_GPU_WINDOW=granted"]
 fn dsa_state_gpu() -> Result<()> {
     ensure!(
         std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -776,31 +762,29 @@ fn dsa_state_gpu() -> Result<()> {
             let mut outer = DsaCheckpoint::new(spec, 11, 5, s)?;
             let mut inner = DsaCheckpoint::new(spec, 11, 2, s)?;
             device.finish_upload()?;
-            if graph {
-                s.begin_capture(
-                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-                )?;
-            }
-            outer.save(&plan, &state, s)?;
-            first.run(&plan, &mut state, &input, s)?;
-            let nested = if graph {
-                None
-            } else {
-                Some(snapshot(&state, s)?)
+            let mut run = || -> Result<()> {
+                outer.save(&plan, &state, s)?;
+                first.run(&plan, &mut state, &input, s)?;
+                let nested = if graph {
+                    None
+                } else {
+                    Some(snapshot(&state, s)?)
+                };
+                inner.save(&plan, &state, s)?;
+                second.run(&plan, &mut state, &input, s)?;
+                inner.restore(&plan, &state, s)?;
+                if let Some(nested) = nested {
+                    let pass = snapshot(&state, s)? == nested;
+                    println!("DSA_CHECKPOINT inner base={base} equal={pass}");
+                    defects += usize::from(!pass);
+                }
+                outer.restore(&plan, &state, s)?;
+                Ok(())
             };
-            inner.save(&plan, &state, s)?;
-            second.run(&plan, &mut state, &input, s)?;
-            inner.restore(&plan, &state, s)?;
-            if let Some(nested) = nested {
-                let pass = snapshot(&state, s)? == nested;
-                println!("DSA_CHECKPOINT inner base={base} equal={pass}");
-                defects += usize::from(!pass);
-            }
-            outer.restore(&plan, &state, s)?;
             if graph {
-                s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                    .context("Runner FAIL empty state graph")?
-                    .launch()?;
+                testing::capture(s, run)?.launch()?;
+            } else {
+                run()?;
             }
             let pass = snapshot(&state, s)? == initial;
             println!("DSA_CHECKPOINT outer base={base} graph={graph} equal={pass}");
@@ -935,7 +919,7 @@ fn dsa_direct_reference_cpu() -> Result<()> {
 }
 
 #[test]
-#[ignore = "exclusive CUDA; FF_Q38_GPU_WINDOW=granted; FF_DSA_REFERENCE_DIR"]
+#[ignore = "exclusive GPU; FF_Q38_GPU_WINDOW=granted; FF_DSA_REFERENCE_DIR"]
 fn dsa_direct_gpu() -> Result<()> {
     ensure!(
         std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -1016,15 +1000,9 @@ fn dsa_direct_gpu() -> Result<()> {
         device.finish_upload()?;
         for graph in [false, true] {
             if graph {
-                s.begin_capture(
-                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-                )?;
-            }
-            bound.attention(&state, &input, s)?;
-            if graph {
-                s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                    .context("Runner FAIL empty direct graph")?
-                    .launch()?;
+                testing::capture(s, || bound.attention(&state, &input, s))?.launch()?;
+            } else {
+                bound.attention(&state, &input, s)?;
             }
             let (maximum, rms) = attention_error(&s.clone_dtoh(&output)?, &expected)?;
             let pass = maximum <= 9.765625e-4 && rms <= 8.0e-6;
@@ -1041,7 +1019,7 @@ fn dsa_direct_gpu() -> Result<()> {
 }
 
 #[test]
-#[ignore = "exclusive CUDA; FF_Q38_GPU_WINDOW=granted"]
+#[ignore = "exclusive GPU; FF_Q38_GPU_WINDOW=granted"]
 fn dsa_bounded_topk_gpu() -> Result<()> {
     ensure!(
         std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -1115,15 +1093,9 @@ fn dsa_bounded_topk_gpu() -> Result<()> {
         device.finish_upload()?;
         for graph in [false, true] {
             if graph {
-                s.begin_capture(
-                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-                )?;
-            }
-            plan.select_scores(&input, &output, s)?;
-            if graph {
-                s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
-                    .context("Runner FAIL empty selection graph")?
-                    .launch()?;
+                testing::capture(s, || plan.select_scores(&input, &output, s))?.launch()?;
+            } else {
+                plan.select_scores(&input, &output, s)?;
             }
             let pass = s.clone_dtoh(&selected)? == expected_ids
                 && s.clone_dtoh(&values)? == expected_scores
@@ -1140,8 +1112,9 @@ fn dsa_bounded_topk_gpu() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
 #[test]
-#[ignore = "exclusive CUDA; metadata traps execute in isolated child processes"]
+#[ignore = "exclusive GPU; metadata traps execute in isolated child processes"]
 fn dsa_metadata_bounds_gpu() -> Result<()> {
     use std::io::Write;
     ensure!(

@@ -4,7 +4,6 @@ use super::{
     contracts::{RowDomain, Scratch, Tensor, TensorMut},
     weights::WeightCatalog,
 };
-#[cfg(feature = "cuda")]
 use crate::backend::gpu::CudaSlice;
 use crate::backend::gpu::{CudaContext, CudaFunction, CudaStream, DevicePtr, PushKernelArg};
 use crate::fp8::Fp8ScaleLayout;
@@ -218,7 +217,6 @@ pub(crate) enum LinearWeightRef {
     },
 }
 pub(crate) struct Fp8Ops {
-    #[cfg(feature = "cuda")]
     quant_block_f32: CudaFunction,
     #[cfg(feature = "cuda")]
     dequant: [CudaFunction; 2],
@@ -397,6 +395,7 @@ impl Fp8Ops {
             );
         }
         Ok(Self {
+            quant_block_f32: module.load_function("fp8_quant_f32_128")?,
             channel,
             block,
             context: ctx.clone(),
@@ -773,14 +772,12 @@ struct BoundProjection {
     resident: LinearWeightRef,
     #[cfg(feature = "cuda")]
     prefill: Option<Tensor<bf16, 2>>,
-    #[cfg(feature = "cuda")]
     native: std::cell::RefCell<Option<NativeProjection>>,
     #[cfg(feature = "rocm")]
     calls: std::cell::RefCell<std::collections::BTreeMap<(u32, u64, u64), Fp8Projection>>,
     invariant_rows: usize,
 }
 
-#[cfg(feature = "cuda")]
 pub(crate) struct NativeProjection {
     weight: LinearWeightRef,
     shape: [u32; 2],
@@ -790,7 +787,6 @@ pub(crate) struct NativeProjection {
     scales_view: crate::backend::cuda::contracts::Tensor<f32, 2>,
 }
 
-#[cfg(feature = "cuda")]
 impl NativeProjection {
     pub(crate) fn new(
         ops: &Fp8Ops,
@@ -909,7 +905,6 @@ pub(crate) struct LayerLinearPlan {
 #[derive(Clone, Debug)]
 pub(crate) enum BoundFfn {
     Dense,
-    #[cfg(feature = "cuda")]
     Native {
         router: Tensor<bf16, 2>,
         shared: Box<[LinearWeightRef; 3]>,
@@ -933,7 +928,6 @@ impl BoundFfn {
         let h = spec.hidden;
         let i = moe.shared_intermediate;
         let router = linear.take_bf16("mlp.gate.weight", [moe.experts, h])?;
-        #[cfg(feature = "cuda")]
         if spec.architecture == crate::model_spec::Architecture::Glm5Next {
             let mut take = |role: &str| -> Result<LinearWeightRef> {
                 let projection = linear
@@ -983,7 +977,6 @@ impl BoundFfn {
     pub fn prepare(&self, blas: &super::blas::Blas, rows: u32) -> Result<()> {
         match self {
             Self::Dense => Ok(()),
-            #[cfg(feature = "cuda")]
             Self::Native { .. } => Ok(()),
             Self::Moe {
                 shared,
@@ -1105,7 +1098,6 @@ impl LayerLinearPlan {
                     resident,
                     #[cfg(feature = "cuda")]
                     prefill,
-                    #[cfg(feature = "cuda")]
                     native: Default::default(),
                     #[cfg(feature = "rocm")]
                     calls: std::cell::RefCell::new(std::collections::BTreeMap::new()),
@@ -1124,10 +1116,19 @@ impl LayerLinearPlan {
             materialize,
         })
     }
-    #[cfg(feature = "cuda")]
     pub fn prepare_native(&self, ops: &Fp8Ops, stream: &Arc<CudaStream>, rows: u32) -> Result<()> {
         for projection in self.projections.values() {
-            if projection.prefill.is_none() {
+            #[cfg(feature = "cuda")]
+            let native = projection.prefill.is_none();
+            #[cfg(feature = "rocm")]
+            let native = matches!(
+                projection.resident,
+                LinearWeightRef::Fp8 {
+                    scale: Fp8ScaleRef::F32(_),
+                    ..
+                }
+            );
+            if native {
                 let mut native = projection.native.borrow_mut();
                 ensure!(native.is_none(), "native projection already bound");
                 *native = Some(NativeProjection::new(
@@ -1232,6 +1233,10 @@ impl LayerLinearPlan {
                 .run(blas.fp8_ops()?, blas.stream(), x, y);
         }
         #[cfg(feature = "rocm")]
+        if let Some(native) = p.native.borrow().as_ref() {
+            return native.run(blas.fp8_ops()?, blas.stream(), x, y);
+        }
+        #[cfg(feature = "rocm")]
         if let LinearWeightRef::Fp8 { codes, .. } = p.resident {
             validate_call(codes.shape, x, &y.0)?;
             ensure!(
@@ -1296,6 +1301,7 @@ fn hip_projection_closure_excludes_native_and_invariant_calls() -> Result<()> {
                     BoundProjection {
                         resident,
                         invariant_rows,
+                        native: Default::default(),
                         calls: Default::default(),
                     },
                 )
@@ -1655,6 +1661,88 @@ mod tests {
                         println!(
                             "FP8_NATIVE_BLOCK_CELL dtype={dtype:?} block={block} weight=[{n},{k}] input=[{m},{k}] graph={graph} defects={bad} scale_cell_control={control}"
                         );
+                    }
+                    if dtype == Dtype::F32 {
+                        let values: Vec<_> = (0..m * k)
+                            .map(|i| bf16::from_f32(((i * 19 + 3) % 251) as f32 / 32.0 - 4.0))
+                            .collect();
+                        let mut codes = Vec::with_capacity(m * k);
+                        let mut scales = Vec::with_capacity(m * groups);
+                        for row in values.chunks_exact(k) {
+                            for cell in row.chunks(128) {
+                                let maximum =
+                                    cell.iter().map(|v| v.to_f32().abs()).fold(0.0f32, f32::max);
+                                let scale = maximum * (1.0f32 / 448.0);
+                                scales.push(scale);
+                                codes.extend(cell.iter().map(|v| {
+                                    crate::fp8::encode_e4m3(
+                                        (v.to_f32() / scale.max(1e-12)).clamp(-448.0, 448.0),
+                                    )
+                                }));
+                            }
+                        }
+                        let oracle = native_block_oracle(
+                            [&weight, &codes],
+                            [&weight_scales, &scales],
+                            [m, n, k],
+                            block,
+                            false,
+                        );
+                        let x = stream.clone_htod(&values)?;
+                        let x_view = super::super::contracts::view(
+                            &x,
+                            stream,
+                            0,
+                            [m as u32, k as u32],
+                            [k as u64, 1],
+                        )?;
+                        let native = NativeProjection::new(
+                            &ops,
+                            stream,
+                            LinearWeightRef::Fp8 {
+                                codes: wc_view,
+                                scale: ws_view,
+                                layout,
+                            },
+                            m as u32,
+                        )?;
+                        device.finish_upload()?;
+                        for graph in [false, true] {
+                            let run = || native.run(&ops, stream, x_view, &output_view);
+                            if graph {
+                                super::super::moe::testing::capture(stream, run)?.launch()?;
+                            } else {
+                                run()?;
+                            }
+                            let actual_codes = stream.clone_dtoh(&native._keepalive.0)?;
+                            let actual_scales = stream.clone_dtoh(&native._keepalive.1)?;
+                            ensure!(
+                                actual_codes == codes
+                                    && actual_scales
+                                        .iter()
+                                        .zip(&scales)
+                                        .all(|(a, b)| { a.to_bits() == b.to_bits() }),
+                                "native BF16-input FP8 quantization codes/scale bits DEFECT"
+                            );
+                            let got = stream.clone_dtoh(&output)?;
+                            ensure!(
+                                got[..m * n].iter().all(|v| v.is_finite())
+                                    && got[m * n..].iter().all(|v| v.to_bits() == canary.to_bits()),
+                                "native BF16-input FP8 output finite/guard DEFECT"
+                            );
+                            let bad = got
+                                .iter()
+                                .zip(&oracle)
+                                .filter(|(value, (reference, bound))| {
+                                    (f64::from(value.to_f32()) - reference).abs() > *bound
+                                })
+                                .count();
+                            defects += bad;
+                            cases += 1;
+                            println!(
+                                "FP8_NATIVE_QUANTIZED_CELL weight=[{n},{k}] input=[{m},{k}] graph={graph} codes_equal=true scale_bits_equal=true defects={bad} oracle=f64"
+                            );
+                        }
                     }
                 }
             }

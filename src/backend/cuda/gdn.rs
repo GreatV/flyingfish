@@ -25,7 +25,7 @@ pub(crate) fn record_phase(which: &'static str) {
     PHASE_LOG.lock().unwrap().push(which);
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 pub(crate) fn take_phase_log() -> Vec<&'static str> {
     std::mem::take(&mut *PHASE_LOG.lock().unwrap())
 }
@@ -602,8 +602,8 @@ impl GdnOps {
         check_bindings(&bindings, max_rows, conv_dim, spec.hv)?;
         #[cfg(feature = "rocm")]
         ensure!(
-            matches!(spec.hv, 32 | 48) && !cw_p2,
-            "HIP GDN requires hv32/hv48 and the FP32 chunked/recurrent policy"
+            matches!(spec.hv, 32 | 48 | 64) && !cw_p2,
+            "HIP GDN requires hv32/hv48/hv64 and the FP32 chunked/recurrent policy"
         );
 
         #[cfg(feature = "cuda")]
@@ -1450,10 +1450,10 @@ fn check_bindings(b: &GdnBindings, rows: u32, conv_dim: u32, hv: u32) -> Result<
     Ok(())
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 mod tests {
     use super::prep_grids;
-    use cudarc::driver::{DevicePtr, LaunchConfig};
+    use crate::backend::gpu::{DevicePtr, LaunchConfig};
 
     #[test]
     fn fused_step_requires_compiled_geometry() {
@@ -1522,8 +1522,10 @@ mod tests {
     fn rows_beyond_the_cuda_grid_yz_limit_are_rejected() -> Result<()> {
         let full = (cfg((2, 48, 2048)), cfg((1, 2048, 1)), cfg((1280, 16, 1)));
         prep_grids(full.0, full.1, full.2, CUDA_GRID_YZ_MAX, CONV_ROWS)?;
-        let rejected = prep_grids(full.0, full.1, full.2, CUDA_GRID_YZ_MAX + 1, CONV_ROWS)
-            .expect_err("rows above the CUDA gridDim.y/z limit must not form a launch");
+        let Err(rejected) = prep_grids(full.0, full.1, full.2, CUDA_GRID_YZ_MAX + 1, CONV_ROWS)
+        else {
+            panic!("rows above the CUDA gridDim.y/z limit must not form a launch");
+        };
         assert!(rejected.to_string().contains("gridDim"), "{rejected}");
         Ok(())
     }
@@ -1533,27 +1535,27 @@ mod tests {
 
     enum GeometryDecay {
         Bf16(
-            cudarc::driver::CudaSlice<bf16>,
-            cudarc::driver::CudaSlice<bf16>,
+            crate::backend::gpu::CudaSlice<bf16>,
+            crate::backend::gpu::CudaSlice<bf16>,
         ),
         F32(
-            cudarc::driver::CudaSlice<f32>,
-            cudarc::driver::CudaSlice<f32>,
+            crate::backend::gpu::CudaSlice<f32>,
+            crate::backend::gpu::CudaSlice<f32>,
         ),
     }
 
     struct GeometryBuffers {
-        qkv: cudarc::driver::CudaSlice<bf16>,
-        a: cudarc::driver::CudaSlice<bf16>,
-        b: cudarc::driver::CudaSlice<bf16>,
-        conv: cudarc::driver::CudaSlice<bf16>,
+        qkv: crate::backend::gpu::CudaSlice<bf16>,
+        a: crate::backend::gpu::CudaSlice<bf16>,
+        b: crate::backend::gpu::CudaSlice<bf16>,
+        conv: crate::backend::gpu::CudaSlice<bf16>,
         decay: GeometryDecay,
-        out: cudarc::driver::CudaSlice<bf16>,
-        state: cudarc::driver::CudaSlice<f32>,
-        history: cudarc::driver::CudaSlice<f32>,
+        out: crate::backend::gpu::CudaSlice<bf16>,
+        state: crate::backend::gpu::CudaSlice<f32>,
+        history: crate::backend::gpu::CudaSlice<f32>,
         snapshots: Option<(
-            cudarc::driver::CudaSlice<f32>,
-            cudarc::driver::CudaSlice<f32>,
+            crate::backend::gpu::CudaSlice<f32>,
+            crate::backend::gpu::CudaSlice<f32>,
         )>,
     }
 
@@ -1563,8 +1565,8 @@ mod tests {
             .collect()
     }
 
-    fn geometry_view<T: cudarc::driver::DeviceRepr + Copy, const R: usize>(
-        buffer: &cudarc::driver::CudaSlice<T>,
+    fn geometry_view<T: crate::backend::gpu::DeviceRepr + Copy, const R: usize>(
+        buffer: &crate::backend::gpu::CudaSlice<T>,
         stream: &Arc<CudaStream>,
         shape: [u32; R],
         stride: [u64; R],
@@ -1821,7 +1823,9 @@ mod tests {
         oracle_state: f64,
         oracle_history: usize,
         snapshot_mismatches: usize,
+        #[cfg(feature = "cuda")]
         p2_prepared: Vec<u8>,
+        #[cfg(feature = "cuda")]
         p2_slots: Vec<u8>,
     }
 
@@ -1829,19 +1833,18 @@ mod tests {
         stream: &Arc<CudaStream>,
         prefix: u32,
         valid: u32,
-    ) -> Result<cudarc::driver::CudaSlice<i32>> {
-        stream
-            .clone_htod(&[
-                prefix as i32,
-                valid as i32,
-                (prefix + valid) as i32,
-                8192,
-                1,
-                0,
-                0,
-                0,
-            ])
-            .map_err(Into::into)
+    ) -> Result<crate::backend::gpu::CudaSlice<i32>> {
+        let metadata = stream.clone_htod(&[
+            prefix as i32,
+            valid as i32,
+            (prefix + valid) as i32,
+            8192,
+            1,
+            0,
+            0,
+            0,
+        ])?;
+        Ok(metadata)
     }
 
     fn per_channel_gate_run(
@@ -1975,11 +1978,28 @@ mod tests {
         ChunkedSnapshot,
         RstepSnapshot,
         Chunked,
+        #[cfg(feature = "cuda")]
         P1(u32),
         P2,
+        #[cfg(feature = "cuda")]
         P2Whole,
+        #[cfg(feature = "cuda")]
         P2Expanded,
+        #[cfg(feature = "cuda")]
         WrongHeadStride,
+    }
+
+    impl GeometryCore {
+        fn covered(self, device: &crate::backend::cuda::Device) -> bool {
+            let needs_p2 = matches!(self, Self::P2);
+            #[cfg(feature = "cuda")]
+            let needs_p2 = needs_p2 || matches!(self, Self::P2Whole | Self::P2Expanded);
+            let covered = !needs_p2 || GdnPolicy::for_device(&device.info).cw_p2_for_step(5);
+            if !covered {
+                println!("GDN NOT_COVERED core={self:?} arch={}", device.info.arch);
+            }
+            covered
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -1999,9 +2019,11 @@ mod tests {
         core: GeometryCore,
     ) -> Result<GdnPlan> {
         let stream = &device.stream;
-        let compact = matches!(core, GeometryCore::P2 | GeometryCore::P2Whole)
+        let compact = matches!(core, GeometryCore::P2)
             || matches!(core, GeometryCore::Selected)
                 && GdnPolicy::for_device(&device.info).cw_p2_for_step(rows);
+        #[cfg(feature = "cuda")]
+        let compact = compact || matches!(core, GeometryCore::P2Whole);
         let mut plan = GdnOps::prepare(
             &device.ctx,
             &spec,
@@ -2009,6 +2031,7 @@ mod tests {
             buffers.bindings(stream, spec, rows, offset)?,
             compact,
         )?;
+        #[cfg(feature = "cuda")]
         if matches!(core, GeometryCore::P2Expanded) {
             let module = cubin::module(
                 &device.ctx,
@@ -2046,6 +2069,7 @@ mod tests {
             plan.ws.bytes = plan.ws.bytes.max(add(plan.ws.p2.offset, plan.ws.p2.bytes)?);
             plan.p2_groups = cw_p2_groups(&plan.ws, rows, spec.hv)?;
         }
+        #[cfg(feature = "cuda")]
         if matches!(core, GeometryCore::P2Whole) {
             let base = add(plan.ws.k_bf16.offset, plan.ws.k_bf16.bytes)?;
             plan.ws.p2 = Region {
@@ -2091,6 +2115,7 @@ mod tests {
                         } else {
                             "gdn_chunked_core_snapshot"
                         })?;
+                #[cfg(feature = "cuda")]
                 kernels.core_snapshot.set_attribute(
                     cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                     CHUNKED_SMEM as i32,
@@ -2103,6 +2128,7 @@ mod tests {
         ) {
             plan = plan.for_rows(rows, Some(buffers.bind_snapshots(stream, spec)?))?;
         }
+        #[cfg(feature = "cuda")]
         if matches!(core, GeometryCore::WrongHeadStride) {
             let directory = std::path::PathBuf::from(
                 std::env::var_os("FF_Q38_PROBE_DIR").context("GDN control directory missing")?,
@@ -2148,12 +2174,12 @@ mod tests {
         graph: bool,
         control: GeometryControl,
     ) -> Result<GeometryOutput> {
-        use cudarc::driver::{DevicePtr, sys};
+        use crate::backend::gpu::DevicePtr;
         let label = std::ffi::CString::new(format!(
             "gdn hv={} rows={rows} valid={valid} core={core:?} graph={graph}",
             spec.hv
         ))?;
-        let _range = super::super::profile::Range::new(true, &label);
+        let _range = super::super::profile::Range::new(cfg!(feature = "cuda"), &label);
         let stream = &device.stream;
         let mut buffers = GeometryBuffers::new(stream, spec, rows, valid)?;
         let per_channel = matches!(
@@ -2245,6 +2271,7 @@ mod tests {
                 )?;
             }
         }
+        #[cfg(feature = "cuda")]
         let p1 = if let GeometryCore::P1(split) = core {
             let (plan, metadata) = &plans[0];
             let meta = SeqRef {
@@ -2286,6 +2313,7 @@ mod tests {
                 let meta = SeqRef {
                     ptr: metadata.device_ptr(stream).0,
                 };
+                #[cfg(feature = "cuda")]
                 if let Some((function, config)) = &p1 {
                     unsafe {
                         stream
@@ -2301,7 +2329,9 @@ mod tests {
                             .arg(&0i32)
                             .launch(*config)?;
                     }
-                } else if matches!(core, GeometryCore::ChunkedSnapshot) {
+                    continue;
+                }
+                if matches!(core, GeometryCore::ChunkedSnapshot) {
                     GdnOps::run_core(
                         plan,
                         stream,
@@ -2332,11 +2362,7 @@ mod tests {
             Ok(())
         };
         if graph {
-            stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-            let run = execute();
-            let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
-            run?;
-            captured?.context("empty geometry graph")?.launch()?;
+            super::super::moe::testing::capture(stream, execute)?.launch()?;
         } else {
             execute()?;
         }
@@ -2424,6 +2450,7 @@ mod tests {
             "geometry fixture wrote an inactive row"
         );
         let mut snapshot_mismatches = 0;
+        #[cfg(feature = "cuda")]
         let (p2_prepared, p2_slots) = if matches!(core, GeometryCore::P2 | GeometryCore::P2Expanded)
         {
             let mut prepared = data[plan.ws.conv_out.offset as usize
@@ -2559,7 +2586,9 @@ mod tests {
             oracle_state,
             oracle_history,
             snapshot_mismatches,
+            #[cfg(feature = "cuda")]
             p2_prepared,
+            #[cfg(feature = "cuda")]
             p2_slots,
         })
     }
@@ -2883,6 +2912,7 @@ mod tests {
             + b.snapshot_mismatches
     }
 
+    #[cfg(feature = "cuda")]
     fn geometry_follow(
         device: &crate::backend::cuda::Device,
         spec: GdnSpec,
@@ -2932,6 +2962,7 @@ mod tests {
 
     #[test]
     #[ignore = "exclusive CUDA; bounded P2 against the original whole-span core"]
+    #[cfg(feature = "cuda")]
     fn gdn_p2_groups_gpu() -> Result<()> {
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -3031,6 +3062,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     fn fused_step_identity(device: &crate::backend::cuda::Device, spec: GdnSpec) -> Result<()> {
         use super::super::ops::CommonOpsRef;
         use cudarc::driver::sys;
@@ -3195,6 +3227,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires an exclusive CUDA window"]
+    #[cfg(feature = "cuda")]
     fn mixer_smoke_gpu() -> Result<()> {
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -3277,7 +3310,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "exclusive CUDA; native KDA key-axis model-definition control"]
+    #[ignore = "exclusive GPU; native KDA key-axis model-definition control"]
     fn gdn_per_channel_key_axis_gpu() -> Result<()> {
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -3296,13 +3329,18 @@ mod tests {
         let scaled_q = q / (q * q + 1e-6).sqrt() / 128.0f64.sqrt();
         let expected_out = expected_state * scaled_q;
         let mut defects = 0;
+        let mut cells = 0;
         for (core, rows) in [
             (GeometryCore::Recurrent, 1),
             (GeometryCore::Replay, 1),
             (GeometryCore::Chunked, 1),
             (GeometryCore::P2, 5),
         ] {
+            if !core.covered(&device) {
+                continue;
+            }
             for graph in [false, true] {
+                cells += 1;
                 let actual = geometry_run_control(
                     &device,
                     spec,
@@ -3335,7 +3373,7 @@ mod tests {
                 );
             }
         }
-        println!("KDA_KEY_AXIS_SUMMARY cells=8 defects={defects} model_definition=key_axis");
+        println!("KDA_KEY_AXIS_SUMMARY cells={cells} defects={defects} model_definition=key_axis");
         ensure!(defects == 0, "key-axis defects={defects}");
         Ok(())
     }
@@ -3386,12 +3424,7 @@ mod tests {
             device.finish_upload()?;
             for graph in [false, true] {
                 if graph {
-                    stream.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-                    let launched = execute();
-                    let captured =
-                        stream.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
-                    launched?;
-                    captured?.context("empty KDA norm graph")?.launch()?;
+                    super::super::moe::testing::capture(stream, &mut execute)?.launch()?;
                 } else {
                     execute()?;
                 }
@@ -3436,7 +3469,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "exclusive CUDA; per-channel gate oracle and negative control"]
+    #[ignore = "exclusive GPU; per-channel gate oracle and negative control"]
     fn gdn_per_channel_gates_gpu() -> Result<()> {
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -3547,7 +3580,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "exclusive CUDA; production-shape per-channel GDN oracle"]
+    #[ignore = "exclusive GPU; production-shape per-channel GDN oracle"]
     fn gdn_per_channel_geometry_gpu() -> Result<()> {
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -3612,13 +3645,20 @@ mod tests {
             ),
             (GeometryCore::Selected, &[(5, 5), (65, 63), (512, 509)][..]),
         ] {
+            if !core.covered(&device) {
+                continue;
+            }
             for &(rows, valid) in row_cases {
                 for graph in [false, true] {
                     take_phase_log();
                     let candidate = geometry_run(&device, spec, rows, valid, core, graph)?;
                     let phases = take_phase_log();
-                    let phase_ok =
-                        !matches!(core, GeometryCore::Selected) || phases == ["chunkwise_p2"];
+                    let expected = if GdnPolicy::for_device(&device.info).cw_p2_for_step(rows) {
+                        "chunkwise_p2"
+                    } else {
+                        "chunked"
+                    };
+                    let phase_ok = !matches!(core, GeometryCore::Selected) || phases == [expected];
                     let passed = candidate.norm_ratio <= 1.0
                         && candidate.oracle_out <= PER_CHANNEL_ORACLE_LIMIT
                         && candidate.oracle_state <= PER_CHANNEL_ORACLE_LIMIT
@@ -3643,6 +3683,9 @@ mod tests {
             GeometryCore::Chunked,
             GeometryCore::P2,
         ] {
+            if !core.covered(&device) {
+                continue;
+            }
             for (rows, valid) in [(65, 63), (129, 129)] {
                 for graph in [false, true] {
                     let mut candidate = geometry_run_control(
@@ -3701,13 +3744,18 @@ mod tests {
                 }
             }
         }
-        let baseline = geometry_run(&device, spec, 65, 63, GeometryCore::P2, false)?;
+        let selected = if GdnPolicy::for_device(&device.info).cw_p2_for_step(65) {
+            GeometryCore::P2
+        } else {
+            GeometryCore::Chunked
+        };
+        let baseline = geometry_run(&device, spec, 65, 63, selected, false)?;
         let control = geometry_run_control(
             &device,
             spec,
             65,
             63,
-            GeometryCore::P2,
+            selected,
             false,
             GeometryControl::ValueInput,
         )?;
@@ -3767,7 +3815,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "exclusive CUDA; small per-channel memcheck coverage"]
+    #[ignore = "exclusive GPU; small per-channel memcheck coverage"]
     fn gdn_per_channel_memcheck_gpu() -> Result<()> {
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -3793,6 +3841,9 @@ mod tests {
             (GeometryCore::Chunked, 65, 63),
             (GeometryCore::P2, 65, 63),
         ] {
+            if !core.covered(&device) {
+                continue;
+            }
             let candidate = geometry_run(&device, spec, rows, valid, core, false)?;
             let passed = candidate.norm_ratio <= 1.0
                 && candidate.oracle_out <= PER_CHANNEL_ORACLE_LIMIT
@@ -3810,7 +3861,7 @@ mod tests {
             );
         }
         println!(
-            "{} GDN_PER_CHANNEL_MEMCHECK cells={cells} defects={defects} all_core_types=true",
+            "{} GDN_PER_CHANNEL_MEMCHECK cells={cells} defects={defects} available_core_types=true",
             if defects == 0 { "PASS" } else { "DEFECT" }
         );
         ensure!(defects == 0, "per-channel memcheck defects={defects}");
@@ -3819,6 +3870,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires CUDA and FF_Q38_PROBE_DIR/gdn_prep_h32_wrong_stride_sm<arch>.cubin"]
+    #[cfg(feature = "cuda")]
     fn mixer_geometry_gdn_gpu() -> Result<()> {
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -3972,6 +4024,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires an exclusive CUDA window"]
+    #[cfg(feature = "cuda")]
     fn gdn_operation_timing_gpu() -> Result<()> {
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -4123,6 +4176,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     fn gate_projection_rows(
         device: &crate::backend::cuda::Device,
         shape: [u32; 2],
@@ -4459,6 +4513,7 @@ mod tests {
         Ok(defects)
     }
 
+    #[cfg(feature = "cuda")]
     fn gate_projection_isolation(device: &crate::backend::cuda::Device) -> Result<usize> {
         use safetensors::{Dtype, SafeTensors};
         let model = std::path::PathBuf::from(std::env::var("FF_Q38_MODEL")?);
@@ -4568,6 +4623,7 @@ mod tests {
 
     #[test]
     #[ignore = "exclusive CUDA, published Qwen gate weights and saved layer0 normalized row"]
+    #[cfg(feature = "cuda")]
     fn gdn_verify_snapshot_rows_gpu() -> Result<()> {
         let qwen = GdnSpec::q38();
         let qwen_conv_dim = qwen.conv_dim().expect("Qwen GDN geometry");

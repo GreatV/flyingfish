@@ -14,7 +14,7 @@ use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::sync::Arc;
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 #[path = "dsa_tests.rs"]
 mod tests;
 

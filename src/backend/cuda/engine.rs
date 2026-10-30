@@ -572,7 +572,6 @@ impl SetupMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg(feature = "cuda")]
 enum LoadDispatch {
     Qwen,
     Llama,
@@ -580,7 +579,6 @@ enum LoadDispatch {
     Deepseek,
 }
 
-#[cfg(feature = "cuda")]
 fn load_dispatch(architecture: crate::model_spec::Architecture) -> Result<LoadDispatch> {
     use crate::model_spec::Architecture;
     Ok(match architecture {
@@ -1777,7 +1775,6 @@ impl Engine {
             }
         }
         if let Some(slots) = self.moe_slots.as_mut() {
-            #[cfg(feature = "cuda")]
             if self.model_spec.architecture == crate::model_spec::Architecture::Glm5Next
                 && !slots.request_open
             {
@@ -5755,7 +5752,7 @@ impl Engine {
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 #[test]
 fn glm_dispatch_selects_the_hybrid_runtime() -> Result<()> {
     assert!(matches!(
@@ -5973,48 +5970,40 @@ impl Engine {
         let started = Instant::now();
         let write = mode.writes();
         let model_spec = crate::model_spec::ModelSpec::read(dir)?;
-        if model_spec.architecture == crate::model_spec::Architecture::DeepseekV41 {
-            return Self::load_deepseek(
-                dir,
-                ordinal,
-                capacity,
-                requested_chunk,
-                settings,
-                model_spec,
-            );
+        match load_dispatch(model_spec.architecture)? {
+            LoadDispatch::Deepseek => {
+                return Self::load_deepseek(
+                    dir,
+                    ordinal,
+                    capacity,
+                    requested_chunk,
+                    settings,
+                    model_spec,
+                );
+            }
+            LoadDispatch::Recurrent => {
+                return Self::load_recurrent(
+                    dir,
+                    ordinal,
+                    capacity,
+                    requested_chunk,
+                    settings,
+                    model_spec,
+                );
+            }
+            LoadDispatch::Qwen => {
+                return Self::load_qwen(
+                    dir,
+                    ordinal,
+                    capacity,
+                    requested_chunk,
+                    settings,
+                    mode,
+                    model_spec,
+                );
+            }
+            LoadDispatch::Llama => {}
         }
-        if model_spec.architecture == crate::model_spec::Architecture::LoopVl {
-            return Self::load_recurrent(
-                dir,
-                ordinal,
-                capacity,
-                requested_chunk,
-                settings,
-                model_spec,
-            );
-        }
-        if matches!(
-            model_spec.architecture,
-            crate::model_spec::Architecture::MiniCpmV47
-                | crate::model_spec::Architecture::Qwen35Text
-                | crate::model_spec::Architecture::Flint
-                | crate::model_spec::Architecture::Gemma4
-        ) {
-            return Self::load_qwen(
-                dir,
-                ordinal,
-                capacity,
-                requested_chunk,
-                settings,
-                mode,
-                model_spec,
-            );
-        }
-        ensure!(
-            model_spec.architecture == crate::model_spec::Architecture::Llama,
-            "HIP dense setup requires Llama; architecture {:?} is unsupported",
-            model_spec.architecture
-        );
         ensure!(
             !settings.prefix_cache && settings.kv_format == crate::kv::KvFormat::Bf16,
             "HIP dense setup requires BF16 KV without persistent prefix cache"

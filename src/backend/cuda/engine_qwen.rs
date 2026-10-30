@@ -614,7 +614,6 @@ pub(super) struct Runtime {
 struct Layer {
     linear: LayerLinearPlan,
     ffn: BoundFfn,
-    #[cfg(feature = "cuda")]
     native: Option<NativeFfn>,
     input_norm: Tensor<bf16, 1>,
     post_norm: Tensor<bf16, 1>,
@@ -625,7 +624,6 @@ struct Layer {
     mixer: BoundMixer,
 }
 
-#[cfg(feature = "cuda")]
 struct NativeFfn {
     #[cfg(test)]
     wrong_route: bool,
@@ -636,7 +634,6 @@ struct NativeFfn {
     _bias: CudaSlice<u8>,
 }
 
-#[cfg(feature = "cuda")]
 impl NativeFfn {
     fn new(
         engine: &Engine,
@@ -1386,11 +1383,9 @@ impl Runtime {
             let arena_view = arena.as_ref().map(|b| scratch(b, s));
             let mut linear = LayerLinearPlan::bind(&plan, &catalog, arena_view.as_ref(), s)?;
             let ffn = BoundFfn::bind(&engine.model_spec, &mut linear)?;
-            #[cfg(feature = "cuda")]
             if engine.model_spec.architecture == crate::model_spec::Architecture::Glm5Next {
                 linear.prepare_native(engine.blas.fp8_ops()?, s, rows as u32)?;
             }
-            #[cfg(feature = "cuda")]
             let native = NativeFfn::new(engine, &catalog, i, &ffn, rows)?;
             let mixer = match layout.mixer {
                 Mixer::FullAttention => {
@@ -1800,7 +1795,6 @@ impl Runtime {
             layers.push(Layer {
                 linear,
                 ffn,
-                #[cfg(feature = "cuda")]
                 native,
                 input_norm: weight("input_layernorm.weight")?,
                 post_norm: weight("post_attention_layernorm.weight")?,
@@ -1860,7 +1854,9 @@ impl Runtime {
     }
     #[cfg(feature = "rocm")]
     fn bind_linear_calls(&self, engine: &Engine, invariant: bool) -> Result<()> {
-        if engine.model_spec.linear_format.fp8_layout().is_none() {
+        if engine.model_spec.architecture == crate::model_spec::Architecture::Glm5Next
+            || engine.model_spec.linear_format.fp8_layout().is_none()
+        {
             return Ok(());
         }
         let ops = engine.blas.fp8_ops()?;
@@ -2490,9 +2486,10 @@ impl Engine {
                     | crate::model_spec::Architecture::Qwen35Text
                     | crate::model_spec::Architecture::Flint
                     | crate::model_spec::Architecture::Gemma4
+                    | crate::model_spec::Architecture::Glm5Next
             ) && !settings.prefix_cache
                 && settings.kv_format == crate::kv::KvFormat::Bf16,
-            "HIP hybrid setup requires MiniCPM-V-4.7, Qwen3.8, Flint or Gemma 4 with BF16 KV and no persistent prefix cache"
+            "HIP hybrid setup requires MiniCPM-V-4.7, Qwen3.8, Flint, Gemma 4 or GLM-5.3 with BF16 KV and no persistent prefix cache"
         );
         ensure!(
             model_spec.moe.is_none() || !reserve_mtp,
@@ -3144,7 +3141,6 @@ impl Engine {
         if engine.spec.is_some() {
             engine.bind_invariant_arithmetic()?;
         }
-        #[cfg(feature = "cuda")]
         if glm {
             let manifest = &engine
                 .qwen
@@ -3152,16 +3148,22 @@ impl Engine {
                 .context("GLM runtime missing")?
                 .catalog
                 .manifest;
-            engine.moe_slots = Some(
-                super::moe::Slots::load_staging(
-                    &engine.device,
-                    &engine.model_spec,
-                    manifest,
-                    dir,
-                    rows as u32,
-                )?
-                .0,
-            );
+            let (slots, admitted_rows) = super::moe::Slots::load_staging(
+                &engine.device,
+                &engine.model_spec,
+                manifest,
+                dir,
+                rows as u32,
+            )?;
+            engine.moe_slots = Some(slots);
+            engine.chunk = engine.chunk.min(admitted_rows as usize);
+            #[cfg(feature = "cuda")]
+            {
+                engine.workspace_rows = admitted_rows as usize;
+            }
+            engine
+                .forward_rows
+                .retain(|row| *row <= admitted_rows as usize);
             engine.device.finish_upload()?;
         }
         if engine.model_spec.moe.is_some() && !glm {
@@ -5003,7 +5005,6 @@ impl Engine {
             self.deepseek_ffn_stage(layer, step)?;
             return Ok(true);
         }
-        #[cfg(feature = "cuda")]
         if self
             .qwen
             .as_ref()
@@ -5995,7 +5996,7 @@ impl Engine {
     }
 }
 
-#[cfg(all(test, feature = "cuda"))]
+#[cfg(test)]
 #[path = "engine_glm_tests.rs"]
 mod composition_tests;
 

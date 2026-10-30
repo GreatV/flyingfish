@@ -488,7 +488,18 @@ fn glm_composition_gpu() -> Result<()> {
             std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime missing")?,
         )),
     };
+    #[cfg(feature = "rocm")]
+    Engine::calibrate(&model, 0, 640, None, settings.clone())?;
     let mut engine = Engine::load(&model, 0, 640, None, settings)?;
+    ensure!(
+        engine.workspace_rows
+            == engine
+                .qwen
+                .as_ref()
+                .context("GLM runtime missing")?
+                .workspace_rows as usize,
+        "Runner FAIL allocated GLM projection row pitch changed during slot admission"
+    );
     ensure!(
         engine.model_spec.architecture == crate::model_spec::Architecture::Glm5Next
             && engine.config.vocab_size == 154880
