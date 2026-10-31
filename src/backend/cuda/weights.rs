@@ -1550,7 +1550,7 @@ mod tests {
         std::fs::create_dir(&root)?;
         let result = (|| -> Result<()> {
             let device = Device::new(0)?;
-            let shapes = [vec![257, 263], vec![15360, 3840]];
+            let shapes = [vec![257, 264], vec![15360, 3840]];
             let per_layer = shapes
                 .iter()
                 .map(|s| s.iter().product::<usize>() * 2)
