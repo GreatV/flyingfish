@@ -304,6 +304,8 @@ def main():
         tensors[f"{tag}.decode"] = varied
         noise[tag] = {"repeat": distances(again, direct, targets),
                       "shape": distances(varied, direct, targets), "chunk": chunk, "prefix": prefix}
+        save_file({f"{tag}.prefill": direct, f"{tag}.decode": varied}, str(args.out / f"{tag}.safetensors"))
+        (args.out / f"{tag}.json").write_text(json.dumps(noise[tag], indent=2) + "\n")
         print(f"REFERENCE_CELL {tag} rows={keep} repeat_bits=0 chunk={chunk}", flush=True)
     expected = {name for name in weights.entries if name.startswith("model.language_model.")}
     require(weights.consumed == expected, "streamed text tensor key-consumption mismatch")
@@ -316,6 +318,9 @@ def main():
     save_file(tensors, str(args.out / "reference.safetensors"))
     (args.out / "NOISE.json").write_text(json.dumps(noise, indent=2) + "\n")
     (args.out / "LOAD.json").write_text(json.dumps(report, indent=2) + "\n")
+    for tag, *_ in cases:
+        (args.out / f"{tag}.safetensors").unlink()
+        (args.out / f"{tag}.json").unlink()
     for hook in hooks:
         hook.remove()
     print(f"PASS streamed_reference cells={len(cases)} text_keys={len(expected)}", flush=True)
