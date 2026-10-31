@@ -225,6 +225,7 @@ def capture_model(args, config):
             cell["encoder_calls"][variant] = counted[0] - before
             assert cell["encoder_calls"][variant] == 1
             captured = dict(logits=logits, features=features[0].float(), ple=ple[0][0].float())
+            del output
             if variant == "packed":
                 features.clear()
                 ple.clear()
@@ -238,7 +239,7 @@ def capture_model(args, config):
             (args.output / f"{name}-{variant}.safetensors").write_bytes(save(captured))
             if name in ("street", "winter") and variant == "packed":
                 media_logits.append(logits[0].clone())
-            del output, logits, captured
+            del logits, captured, arguments
         if args.stage == "media":
             before = counted[0]
             image_end = (ids[0] == config.eoi_token_id).nonzero().item() + 1

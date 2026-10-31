@@ -2551,6 +2551,7 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
     let mut engine = super::engine::Engine::load(&dir, 0, 896, Some(896), settings)?;
     let mut defects = 0usize;
     let mut street_features = None;
+    let mut street_input = None;
     for name in ["street", "winter", "wide", "long"] {
         let cell = &metadata[name];
         let bounds = &frozen["cells"][name];
@@ -2628,7 +2629,13 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
             if pass { "PASS" } else { "DEFECT" }
         );
         if name == "street" {
-            street_features = Some(features);
+            street_features = Some(features.clone());
+            street_input = Some((
+                ids.clone(),
+                modality_view.data().to_vec(),
+                pixels.clone(),
+                grids[0],
+            ));
             engine.reset()?;
             let mut wrong = crate::trace::Trace::default();
             engine.gemma_vision_trace(&input, &ids, &mut wrong)?;
@@ -2659,6 +2666,48 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
             )?;
             defects += usize::from(!detected);
             println!("two_media_control detected={detected}");
+        }
+        if name == "wide" {
+            let previous = street_input.as_ref().context("street input missing")?;
+            let mut mixed_ids = previous.0.clone();
+            mixed_ids.extend_from_slice(&ids);
+            let mut mixed_modalities = previous.1.clone();
+            mixed_modalities.extend_from_slice(modality_view.data());
+            let mut mixed_pixels = previous.2.clone();
+            mixed_pixels.extend_from_slice(&pixels);
+            let mixed_grids = [previous.3, grids[0]];
+            let mixed_input = MultimodalInput {
+                input_ids: &mixed_ids,
+                modality_ids: &mixed_modalities,
+                pixel_values: &mixed_pixels,
+                grids: &mixed_grids,
+            };
+            let mixed_identities: Vec<_> = mixed_ids
+                .iter()
+                .map(|&id| if id == image_token { 0 } else { id })
+                .collect();
+            engine.reset()?;
+            let mut mixed_trace = crate::trace::Trace::default();
+            engine.gemma_vision_trace(&mixed_input, &mixed_identities, &mut mixed_trace)?;
+            let actual = mixed_trace.values("image_features")?;
+            let mut expected = street_features
+                .as_ref()
+                .context("street features missing")?
+                .clone();
+            expected.extend_from_slice(&features);
+            ensure!(
+                actual.len() == expected.len() && actual.iter().all(|v| v.is_finite()),
+                "Runner FAIL mixed-image feature extent or finiteness"
+            );
+            let differences = actual
+                .iter()
+                .zip(&expected)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            defects += usize::from(differences != 0);
+            println!(
+                "mixed_image_batch_invariance images=2 grids=48x48,42x60 bit_mismatches={differences}"
+            );
         }
         if name == "long" {
             continue;
