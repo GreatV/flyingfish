@@ -2024,15 +2024,18 @@ impl Engine {
     ) -> Result<()> {
         self.prepare_multimodal(input, Some(trace))?;
         self.gemma_prefill_trace(identities, trace)?;
+        let (images, clips) = self.gemma_encoder_calls()?;
         ensure!(
-            self.qwen
-                .as_ref()
-                .context("Gemma runtime missing")?
-                .vision_encode_calls
-                == 1,
-            "image encoder call count differs from one"
+            images == usize::from(!input.grids.is_empty()) && clips == input.audio.len(),
+            "media encoder call count differs: images={images} clips={clips}"
         );
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gemma_encoder_calls(&self) -> Result<(usize, usize)> {
+        let q = self.qwen.as_ref().context("Gemma runtime missing")?;
+        Ok((q.vision_encode_calls, q.audio_encode_calls))
     }
 
     #[cfg(test)]

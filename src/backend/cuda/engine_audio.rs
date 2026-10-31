@@ -195,13 +195,14 @@ impl AudioRuntime {
                 TensorMut(stage_view(&scratch, s, [relative_rows, h])?),
                 &mut TensorMut(stage_view(&relative, s, [relative_rows, h])?),
             )?;
-            let scale = catalog.take_bf16(
+            let scale_parameter = catalog.take_bf16(
                 &format!("{prefix}.self_attn.per_dim_scale"),
                 &[(h / a.heads) as usize],
             )?;
+            let scale = s.alloc_zeros((h / a.heads) as usize)?;
             unsafe {
                 s.launch_builder(&ops.activation)
-                    .arg(&scale)
+                    .arg(&scale_parameter)
                     .arg(&scale)
                     .arg(&1u32)
                     .arg(&(h / a.heads))
@@ -531,9 +532,16 @@ impl AudioRuntime {
         let h = self.config.hidden;
         self.clamp(s, &work.hidden, &work.delta, rows)?;
         self.norm(s, domain, &work.delta, &work.norm, &ff.pre, h)?;
-        self.linear(s, blas, work, &ff.up, &work.norm, &work.expanded, rows)?;
+        self.linear(s, blas, work, &ff.up, (&work.norm, &work.expanded), rows)?;
         self.activate(s, &work.expanded, &work.activation, rows, h * 4, 1)?;
-        self.linear(s, blas, work, &ff.down, &work.activation, &work.delta, rows)?;
+        self.linear(
+            s,
+            blas,
+            work,
+            &ff.down,
+            (&work.activation, &work.delta),
+            rows,
+        )?;
         self.branch(s, work, &ff.post, rows, self.config.residual_weight)
     }
 
@@ -543,10 +551,10 @@ impl AudioRuntime {
         blas: &Blas,
         work: &AudioRequest,
         weight: &ClippedLinear,
-        input: &CudaSlice<bf16>,
-        output: &CudaSlice<bf16>,
+        buffers: (&CudaSlice<bf16>, &CudaSlice<bf16>),
         rows: u32,
     ) -> Result<()> {
+        let (input, output) = buffers;
         weight.run(
             s,
             blas,
@@ -578,7 +586,7 @@ impl AudioRuntime {
             };
             for i in 0..2 {
                 let (time, frequency, channels, input) = if i == 0 {
-                    (clip.frames, 128, 1, &clip.input)
+                    (clip.frames, 128u32, 1, &clip.input)
                 } else {
                     (
                         clip.frames.div_ceil(2),
@@ -647,8 +655,7 @@ impl AudioRuntime {
                 blas,
                 &work,
                 &self.input,
-                &work.subsample[1],
-                &work.hidden,
+                (&work.subsample[1], &work.hidden),
                 rows,
             )?;
             for (index, block) in self.blocks.iter().enumerate() {
@@ -656,7 +663,7 @@ impl AudioRuntime {
                 self.clamp(s, &work.hidden, &work.delta, rows)?;
                 self.norm(s, domain, &work.delta, &work.norm, &block.pre_attention, h)?;
                 for (projection, output) in block.projections[..3].iter().zip(&work.qkv) {
-                    self.linear(s, blas, &work, projection, &work.norm, output, rows)?;
+                    self.linear(s, blas, &work, projection, (&work.norm, output), rows)?;
                 }
                 let q_scale = (128_f64.powf(-0.5) / std::f64::consts::LN_2) as f32;
                 let k_scale = (1_f64.exp().ln_1p() / std::f64::consts::LN_2) as f32;
@@ -688,8 +695,7 @@ impl AudioRuntime {
                     blas,
                     &work,
                     &block.projections[3],
-                    &work.core,
-                    &work.delta,
+                    (&work.core, &work.delta),
                     rows,
                 )?;
                 self.branch(s, &work, &block.post_attention, rows, 1.0)?;
@@ -699,8 +705,7 @@ impl AudioRuntime {
                     blas,
                     &work,
                     &block.conv_start,
-                    &work.norm,
-                    &work.expanded,
+                    (&work.norm, &work.expanded),
                     rows,
                 )?;
                 self.activate(s, &work.expanded, &work.activation, rows, h, 2)?;
@@ -722,8 +727,7 @@ impl AudioRuntime {
                     blas,
                     &work,
                     &block.conv_end,
-                    &work.activation,
-                    &work.delta,
+                    (&work.activation, &work.delta),
                     rows,
                 )?;
                 unsafe {
@@ -775,8 +779,7 @@ impl AudioRuntime {
                 blas,
                 &work,
                 &self.projection,
-                &work.embed_norm,
-                &work.features,
+                (&work.embed_norm, &work.features),
                 rows,
             )?;
             Self::trace(

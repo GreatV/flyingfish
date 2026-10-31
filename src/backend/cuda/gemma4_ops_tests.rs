@@ -3239,6 +3239,386 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[ignore = "requires accepted audio media review, frozen model references, published weights and a GPU window"]
+fn audio_model_definition_and_graph_gpu() -> Result<()> {
+    use crate::vision_input::{AudioClip, MultimodalInput};
+    let dir = std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("model missing")?);
+    let fixtures = std::path::PathBuf::from(
+        std::env::var_os("FF_GEMMA4_FIXTURES").context("fixtures missing")?,
+    );
+    let frozen: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixtures.join("FROZEN.json"))?)?;
+    let review: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixtures.join("MEDIA_REVIEW.json"))?)?;
+    ensure!(
+        frozen["status"] == "FROZEN"
+            && frozen["candidate_observations"] == 0
+            && review["accepted"] == true,
+        "audio freeze or human review missing"
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixtures.join("inputs/INPUT.json"))?)?;
+    let settings = crate::backend::Settings {
+        tree_builder: crate::backend::TreeBuilder::Waves,
+        spec_budget: crate::backend::SpecBudget::Chain,
+        spec_graph: true,
+        draft_model: None,
+        prefix_cache: false,
+        kv_format: crate::kv::KvFormat::Bf16,
+        runtime_dir: Some(std::path::PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime missing")?,
+        )),
+    };
+    let spec = crate::model_spec::ModelSpec::read(&dir)?;
+    let audio_token = spec.audio.as_ref().context("audio config missing")?.token;
+    let mut engine = super::engine::Engine::load(&dir, 0, 1536, Some(1536), settings.clone())?;
+    let mut defects = 0;
+    let mut singles = Vec::new();
+    let mut stew = None;
+    for name in ["stew", "wizard", "pair", "long"] {
+        let cell = &metadata[name];
+        let bounds = &frozen["cells"][name];
+        let bytes = std::fs::read(fixtures.join(format!("inputs/{name}-input.safetensors")))?;
+        let data = SafeTensors::deserialize(&bytes)?;
+        let ids_view = data.tensor("ids")?;
+        let modalities = data.tensor("modalities")?;
+        let features = data.tensor("audio_features")?;
+        let mask = data.tensor("audio_mask")?;
+        ensure!(
+            ids_view.dtype() == safetensors::Dtype::I32
+                && modalities.dtype() == safetensors::Dtype::U8
+                && features.dtype() == safetensors::Dtype::F32
+                && mask.dtype() == safetensors::Dtype::BOOL,
+            "audio fixture dtype mismatch"
+        );
+        let ids = ids_view
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| u32::from_le_bytes(*v))
+            .collect::<Vec<_>>();
+        let values = features
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| f32::from_le_bytes(*v))
+            .collect::<Vec<_>>();
+        let valid = mask.data().iter().map(|v| *v != 0).collect::<Vec<_>>();
+        let frames = features.shape()[1];
+        let clips = values
+            .chunks_exact(frames * 128)
+            .zip(valid.chunks_exact(frames))
+            .map(|(features, mask)| AudioClip { features, mask })
+            .collect::<Vec<_>>();
+        let input = MultimodalInput {
+            input_ids: &ids,
+            modality_ids: modalities.data(),
+            pixel_values: &[],
+            grids: &[],
+            audio: &clips,
+        };
+        let identities = ids
+            .iter()
+            .map(|&id| if id == audio_token { 0 } else { id })
+            .collect::<Vec<_>>();
+        let oracle = load_reference(&fixtures.join(format!("oracle/{name}-packed.safetensors")))?;
+        let first = cell["score_first"].as_u64().context("score first")? as usize;
+        engine.reset()?;
+        let mut trace = crate::trace::Trace::default();
+        engine.gemma_vision_trace(&input, &identities, &mut trace)?;
+        for (stage, width, frequency, stride) in [
+            ("subsample0", 128usize, 64, 2),
+            ("subsample1", 32, 32, 4),
+            ("layer0", 1024, 1, 4),
+            ("tower", 1536, 1, 4),
+            ("features", spec.hidden as usize, 1, 4),
+        ] {
+            let mut actual = Vec::new();
+            for (index, clip) in clips.iter().enumerate() {
+                let raw = trace.values(&format!("audio.{index}.{stage}"))?;
+                let row_width = width * frequency;
+                ensure!(
+                    raw.len() == clip.mask.len().div_ceil(stride) * row_width,
+                    "audio stage extent mismatch"
+                );
+                for (row, &keep) in clip.mask.iter().step_by(stride).enumerate() {
+                    if keep {
+                        actual.extend_from_slice(&raw[row * row_width..(row + 1) * row_width]);
+                    }
+                }
+            }
+            let pass = vision_distance(&actual, &oracle[stage].1.as_f32(), &bounds[stage])?;
+            defects += usize::from(!pass);
+            println!(
+                "{} audio_stage {name} {stage}",
+                if pass { "PASS" } else { "DEFECT" }
+            );
+            if stage == "features" {
+                if name == "stew" || name == "wizard" {
+                    singles.push(actual.clone());
+                }
+                if name == "pair" {
+                    let expected = singles.iter().flatten().copied().collect::<Vec<_>>();
+                    let mismatch = actual
+                        .iter()
+                        .zip(&expected)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    defects += usize::from(actual.len() != expected.len() || mismatch != 0);
+                    println!("audio_clip_isolation bit_mismatches={mismatch}");
+                }
+            }
+        }
+        let combined = trace.values(".debug.ple_identity")?;
+        let ple = combined.get(..ids.len() * 256).context("PLE extent")?;
+        let ple_pass = vision_distance(ple, &oracle["ple"].1.as_f32(), &bounds["ple"])?;
+        defects += usize::from(!ple_pass);
+        let mut actual = Vec::new();
+        for row in first..ids.len() {
+            actual.extend(engine.gemma_all_logits(row)?);
+        }
+        let (pass, metrics, _) = model_metrics(
+            &actual,
+            &oracle["logits"].1.as_f32(),
+            &ids[first..],
+            &bounds["logits"],
+        )?;
+        defects += usize::from(!pass);
+        println!(
+            "{} audio_model {name} ple={ple_pass} {metrics}",
+            if pass && ple_pass { "PASS" } else { "DEFECT" }
+        );
+        if name == "stew" {
+            engine.reset()?;
+            let mut wrong = crate::trace::Trace::default();
+            engine.gemma_vision_trace(&input, &ids, &mut wrong)?;
+            let wrong = wrong.values(".debug.ple_identity")?;
+            let wrong = &wrong[..ids.len() * 256];
+            let detected = !vision_distance(wrong, &oracle["ple"].1.as_f32(), &bounds["ple"])?;
+            let text_changed = ids
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| **id != audio_token)
+                .filter(|(row, _)| ple[row * 256..][..256] != wrong[row * 256..][..256])
+                .count();
+            defects += usize::from(!detected || text_changed != 0);
+            println!("audio_identity_control detected={detected} text_rows_changed={text_changed}");
+            stew = Some((
+                ids.clone(),
+                modalities.data().to_vec(),
+                values.clone(),
+                valid.clone(),
+            ));
+            let image_bytes = std::fs::read(fixtures.join("inputs/image-input.safetensors"))?;
+            let image = SafeTensors::deserialize(&image_bytes)?;
+            let vision = spec.vision.as_ref().context("vision config")?;
+            let image_ids = image
+                .tensor("ids")?
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| u32::from_le_bytes(*v))
+                .collect::<Vec<_>>();
+            let image_end = image_ids
+                .iter()
+                .position(|&id| id == vision.end_token)
+                .context("image marker")?
+                + 1;
+            let image_modalities = image.tensor("modalities")?;
+            let pixels = image
+                .tensor("pixels")?
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_le_bytes(*v))
+                .collect::<Vec<_>>();
+            let positions = image.tensor("positions")?;
+            let xy = positions
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| i32::from_le_bytes(*v))
+                .collect::<Vec<_>>();
+            let grids = [crate::vision_input::ImageGrid {
+                t: 1,
+                h: (xy.iter().skip(1).step_by(2).max().context("image height")? + 1) as u32,
+                w: (xy.iter().step_by(2).max().context("image width")? + 1) as u32,
+            }];
+            let image_input = MultimodalInput {
+                input_ids: &image_ids[..image_end],
+                modality_ids: &image_modalities.data()[..image_end],
+                pixel_values: &pixels,
+                grids: &grids,
+                audio: &[],
+            };
+            let image_identities = image_input
+                .input_ids
+                .iter()
+                .map(|&id| if id == vision.image_token { 0 } else { id })
+                .collect::<Vec<_>>();
+            engine.reset()?;
+            let mut image_trace = crate::trace::Trace::default();
+            engine.gemma_vision_trace(&image_input, &image_identities, &mut image_trace)?;
+            let mut mixed_ids = ids[..first + 1].to_vec();
+            mixed_ids.extend_from_slice(image_input.input_ids);
+            let mut mixed_modalities = modalities.data()[..first + 1].to_vec();
+            mixed_modalities.extend_from_slice(image_input.modality_ids);
+            let mixed = MultimodalInput {
+                input_ids: &mixed_ids,
+                modality_ids: &mixed_modalities,
+                pixel_values: &pixels,
+                grids: &grids,
+                audio: &clips,
+            };
+            let mixed_identities = mixed_ids
+                .iter()
+                .map(|&id| {
+                    if id == vision.image_token || id == audio_token {
+                        0
+                    } else {
+                        id
+                    }
+                })
+                .collect::<Vec<_>>();
+            engine.reset()?;
+            let mut mixed_trace = crate::trace::Trace::default();
+            engine.gemma_vision_trace(&mixed, &mixed_identities, &mut mixed_trace)?;
+            let mut expected = singles[0].clone();
+            expected.extend(image_trace.values("media_features")?);
+            let actual = mixed_trace.values("media_features")?;
+            let mismatches = actual
+                .iter()
+                .zip(&expected)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            defects += usize::from(actual.len() != expected.len() || mismatches != 0);
+            println!(
+                "mixed_image_audio_splice bit_mismatches={mismatches} encoder_calls={:?}",
+                engine.gemma_encoder_calls()?
+            );
+        }
+        if name == "long" {
+            continue;
+        }
+        let prompt = first + 1;
+        let prompt_input = MultimodalInput {
+            input_ids: &ids[..prompt],
+            modality_ids: &modalities.data()[..prompt],
+            pixel_values: &[],
+            grids: &[],
+            audio: &clips,
+        };
+        let mut eager = Vec::new();
+        let mut eager_kv = None;
+        for graph in [false, true] {
+            engine.reset()?;
+            engine.prefill_multimodal(&prompt_input, None)?;
+            let mut output = engine
+                .decode_logits()?
+                .into_iter()
+                .map(bf16::from_f32)
+                .collect::<Vec<_>>();
+            if graph {
+                engine.capture()?;
+            }
+            for &token in &ids[prompt..] {
+                engine.set_token(token)?;
+                engine.decode(graph, None)?;
+                output.extend(engine.decode_logits()?.into_iter().map(bf16::from_f32));
+            }
+            let calls = engine.gemma_encoder_calls()?;
+            let kv = (
+                engine.gemma_kv_rows(0, ids.len())?,
+                engine.gemma_kv_rows(4, ids.len())?,
+            );
+            defects += usize::from(calls != (0, clips.len()));
+            let (pass, metrics, _) = model_metrics(
+                &output,
+                &oracle["logits"].1.as_f32(),
+                &ids[first..],
+                &bounds["logits"],
+            )?;
+            defects += usize::from(!pass);
+            println!(
+                "{} audio_decode {name} graph={graph} encoder_calls={calls:?} {metrics}",
+                if pass { "PASS" } else { "DEFECT" }
+            );
+            if graph {
+                let differences = output.iter().zip(&eager).filter(|(a, b)| a != b).count();
+                defects += usize::from(differences != 0);
+                println!("audio_graph {name} bit_mismatches={differences}");
+                let state_equal = eager_kv.as_ref() == Some(&kv);
+                defects += usize::from(!state_equal);
+                println!("audio_graph_state {name} kv_equal={state_equal}");
+            } else {
+                eager = output;
+                eager_kv = Some(kv);
+            }
+        }
+    }
+    ensure!(singles.len() == 2, "two audio controls missing");
+    let changed = singles[0]
+        .iter()
+        .zip(&singles[1])
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    defects += usize::from(changed == 0);
+    println!("audio_two_media changed_prefix_elements={changed}");
+    drop(engine);
+    let (ids, modalities, values, valid) = stew.context("stew chunk fixture")?;
+    let clips = [AudioClip {
+        features: &values,
+        mask: &valid,
+    }];
+    let first = metadata["stew"]["score_first"]
+        .as_u64()
+        .context("score first")? as usize;
+    let input = MultimodalInput {
+        input_ids: &ids[..first + 1],
+        modality_ids: &modalities[..first + 1],
+        pixel_values: &[],
+        grids: &[],
+        audio: &clips,
+    };
+    let mut engine = super::engine::Engine::load(&dir, 0, 1536, Some(128), settings)?;
+    engine.prefill_multimodal(&input, None)?;
+    let mut output = engine
+        .decode_logits()?
+        .into_iter()
+        .map(bf16::from_f32)
+        .collect::<Vec<_>>();
+    for &token in &ids[first + 1..] {
+        engine.set_token(token)?;
+        engine.decode(false, None)?;
+        output.extend(engine.decode_logits()?.into_iter().map(bf16::from_f32));
+    }
+    let oracle = load_reference(&fixtures.join("oracle/stew-packed.safetensors"))?;
+    let (pass, metrics, _) = model_metrics(
+        &output,
+        &oracle["logits"].1.as_f32(),
+        &ids[first..],
+        &frozen["cells"]["stew"]["logits"],
+    )?;
+    let calls = engine.gemma_encoder_calls()?;
+    defects += usize::from(!pass || calls != (0, 1));
+    println!(
+        "{} audio_chunk_splice chunk=128 encoder_calls={calls:?} {metrics}",
+        if pass { "PASS" } else { "DEFECT" }
+    );
+    println!(
+        "{} audio_model_definition_and_graph_gpu cells=4 defects={defects}",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(defects == 0, "audio candidate defects={defects}");
+    Ok(())
+}
+
 fn checkpoint_tensor(dir: &std::path::Path, name: &str) -> Result<Vec<bf16>> {
     let mapped = crate::checkpoint::MappedCheckpoint::open(dir)?;
     let shard = mapped

@@ -2383,6 +2383,7 @@ impl Engine {
             #[cfg(test)]
             {
                 q.vision_encode_calls = 0;
+                q.audio_encode_calls = 0;
             }
             let positions =
                 crate::vision_input::PositionPlan::text(1, self.capacity)?.packed_axes()?;
@@ -2484,7 +2485,7 @@ impl Engine {
             .context("media feature bytes overflow")?;
         let request_bytes = audio_bytes
             .checked_add(vision_bytes)
-            .and_then(|n| n.checked_add(feature_bytes))
+            .and_then(|n| n.checked_add(if vision_bytes == 0 { feature_bytes } else { 0 }))
             .context("media request bytes overflow")?;
         if audio_bytes != 0 {
             self.prepare_audio_weights(request_bytes)?;
@@ -2528,12 +2529,20 @@ impl Engine {
                 &self.blas,
                 request,
                 &images.features,
-                trace,
+                trace.as_deref_mut(),
             )?;
             #[cfg(test)]
             {
                 q.audio_encode_calls += input.audio.len();
             }
+        }
+        if let Some(trace) = trace.as_mut() {
+            let values = self.device.stream.clone_dtoh(&images.features)?;
+            trace.add(
+                "media_features".into(),
+                vec![plan.feature_rows(), self.model_spec.hidden as usize],
+                values.into_iter().map(bf16::to_f32).collect(),
+            )?;
         }
         self.device
             .stream

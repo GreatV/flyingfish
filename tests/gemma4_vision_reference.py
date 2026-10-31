@@ -250,19 +250,46 @@ def capture_model(args, config):
     if not audio:
         for module in (tower.patch_embedder, *tower.encoder.layers, embedder):
             stream(module)
-    for module in (lm.embed_tokens_per_layer, lm.per_layer_model_projection,
-                   lm.per_layer_projection_norm, *lm.layers, lm.norm):
-        stream(module)
+    text_modules = (lm.embed_tokens_per_layer, lm.per_layer_model_projection,
+                    lm.per_layer_projection_norm, *lm.layers, lm.norm)
+    text_bytes = sum(p.numel() * torch.empty((), dtype=dtype).element_size()
+                     for module in text_modules for p in module.parameters())
+    rows = max(cell["total_tokens"] for cell in metadata.values())
+    score_rows = max(cell["score_rows"] for cell in metadata.values())
+    text_config = config.text_config
+    workspace_bytes = (2 * 1024**3 + 12 * rows * rows * text_config.num_attention_heads
+                       + 12 * rows * text_config.intermediate_size
+                       + 12 * score_rows * text_config.vocab_size)
+    free_bytes, _ = torch.cuda.mem_get_info(args.device)
+    resident = text_bytes + workspace_bytes <= free_bytes
+    for module in text_modules:
+        move(module) if resident else stream(module)
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, local_files_only=True)
     report = dict(definition="transformers Gemma4 model definition", transformers=transformers.__version__,
                   torch=torch.__version__, dtype=args.dtype, device=args.device,
                   clean_load={key: list(load[key]) for key in
                               ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")},
                   cpu_resident_weights="published BF16", cells={})
+    report["text_placement"] = dict(resident=resident, additional_weight_bytes=text_bytes,
+                                  workspace_bytes=workspace_bytes, free_bytes=free_bytes)
+    if audio:
+        report["relative_timescales_dtype"] = str(relative_timescales.dtype)
     (args.output / "LOAD.json").write_text(json.dumps(report, indent=2) + "\n")
     counted = [0]
     features = []
     ple = []
+    stages = {}
+    if audio:
+        for index, module in enumerate((tower.subsample_conv_projection.layer0,
+                                        tower.subsample_conv_projection.layer1)):
+            def subsample_hook(module, inputs, output, index=index):
+                hidden, mask = output
+                stages[f"subsample{index}"] = hidden.permute(0, 2, 3, 1)[mask].flatten(0, 1).float().cpu().contiguous()
+            hooks.append(module.register_forward_hook(subsample_hook))
+        hooks.append(tower.layers[0].register_forward_hook(
+            lambda module, inputs, output: stages.update(layer0=output.detach().cpu())))
+        hooks.append(tower.register_forward_hook(
+            lambda module, inputs, output: stages.update(tower=output.last_hidden_state.detach().cpu())))
     def encoder_called(module, inputs, output):
         counted[0] += 1
     hooks.append(tower.register_forward_hook(encoder_called))
@@ -295,12 +322,18 @@ def capture_model(args, config):
             def valid_features():
                 return (features[0][media["input_features_mask"].cpu()[:, ::4]] if audio else features[0]).float()
             captured = dict(logits=logits, features=valid_features(), ple=ple[0][0].float())
+            if audio:
+                for key, value in stages.items():
+                    captured[key] = (value[media["input_features_mask"].cpu()[:, ::4]] if key in ("layer0", "tower") else value).float().contiguous()
             del output
             if variant == "packed":
                 features.clear()
                 ple.clear()
                 repeated = model(**arguments)
                 repeat = dict(logits=repeated.logits[0].float().cpu(), features=valid_features(), ple=ple[0][0].float())
+                if audio:
+                    for key, value in stages.items():
+                        repeat[key] = (value[media["input_features_mask"].cpu()[:, ::4]] if key in ("layer0", "tower") else value).float().contiguous()
                 cell["repeat_mismatches"] = {key: int((captured[key] != repeat[key]).sum()) for key in captured}
                 assert not any(cell["repeat_mismatches"].values()), cell["repeat_mismatches"]
                 assert counted[0] - before == 2
@@ -495,11 +528,11 @@ def freeze_model(args):
     versions = [json.loads((arm / "LOAD.json").read_text()) for arm in [args.oracle, *args.arms]]
     assert len({(v["torch"], v["transformers"]) for v in versions}) == 1, "mixed reference software versions"
     metadata = json.loads((args.inputs / "INPUT.json").read_text())
-    frozen = dict(status="FROZEN", rule="2 * maximum reference-only distance to FP32 oracle", cells={})
+    frozen = dict(status="FROZEN", candidate_observations=0, rule="2 * maximum reference-only distance to FP32 oracle", cells={})
     for name, cell in metadata.items():
         expected = load_file(args.oracle / f"{name}-packed.safetensors")
         ids = load_file(args.inputs / f"{name}-input.safetensors")["ids"].long()[cell["score_first"]:]
-        bounds = {key: dict(output_max=0.0, output_rmse=0.0) for key in ("logits", "features", "ple")}
+        bounds = {key: dict(output_max=0.0, output_rmse=0.0) for key in expected}
         bounds["logits"]["nll_max"] = 0.0
         for arm in args.arms:
             for variant in ("packed", "padded"):
