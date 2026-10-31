@@ -240,12 +240,12 @@ def main():
     if args.validate_full:
         require(args.dtype == "bf16" and args.ids is not None, "full validation requires BF16 and shared IDs")
         model, loading = model_class.from_pretrained(
-            args.model, local_files_only=True, dtype=torch.bfloat16, device_map={"": 0},
+            args.model, local_files_only=True, dtype=torch.bfloat16,
             attn_implementation="eager", output_loading_info=True)
         require(all(not loading[key] for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")),
                 "unclean full GPU reference load")
         require(all(not value.is_meta for value in model.state_dict().values()), "unbound full GPU reference")
-        model.eval()
+        model.to(torch.device("cuda", 0)).eval()
         inputs = json.loads(args.ids.read_text())
         expected = load_file(str(args.validate_full / "reference.safetensors"))
         for tag, ids in zip(("a", "b"), inputs["short"]):
