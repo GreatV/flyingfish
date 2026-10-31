@@ -4069,10 +4069,17 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         .max()
         .context("Gemma sliding window missing")? as usize;
     let decode = spec.q_heads as usize * ring.div_ceil(32) * (spec.head_dim as usize + 2) * 4;
-    let expected = per_layer_inputs + rope_tables + flash + staging + decode;
+    let intermediate = spec
+        .layers
+        .iter()
+        .filter_map(|layer| layer.geometry.map(|g| g.intermediate as usize))
+        .max()
+        .context("Gemma diagnostic intermediate missing")?;
+    let diagnostics = admission_rows * (spec.vocab as usize + 2 * intermediate) * 2;
+    let expected = per_layer_inputs + rope_tables + flash + staging + decode + diagnostics;
     let admitted = engine.gemma_workspace(admission_rows, admission_capacity)?;
     println!(
-        "GEMMA4_WORKSPACE admitted={admitted} expected={expected} per_layer_inputs={per_layer_inputs} rope_tables={rope_tables} flash={flash} staging={staging} decode={decode}"
+        "GEMMA4_WORKSPACE admitted={admitted} expected={expected} per_layer_inputs={per_layer_inputs} rope_tables={rope_tables} flash={flash} staging={staging} decode={decode} diagnostics={diagnostics}"
     );
     ensure!(admitted == expected, "Gemma workspace admission mismatch");
     let scratch = engine.gemma_scratch_len();
