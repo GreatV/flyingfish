@@ -2493,6 +2493,228 @@ fn native_path(
     Ok(out)
 }
 
+fn vision_distance(actual: &[f32], expected: &[f32], bounds: &serde_json::Value) -> Result<bool> {
+    ensure!(
+        actual.len() == expected.len()
+            && !actual.is_empty()
+            && actual.iter().chain(expected).all(|v| v.is_finite()),
+        "Runner FAIL vision comparison extent or finiteness"
+    );
+    let mut maximum = 0.0f64;
+    let mut squared = 0.0f64;
+    for (a, b) in actual.iter().zip(expected) {
+        let delta = f64::from(*a) - f64::from(*b);
+        maximum = maximum.max(delta.abs());
+        squared += delta * delta;
+    }
+    let rmse = (squared / actual.len() as f64).sqrt();
+    let pass = maximum <= bounds["output_max"].as_f64().context("vision max")?
+        && rmse <= bounds["output_rmse"].as_f64().context("vision RMSE")?;
+    println!("vision_distance max={maximum} rmse={rmse} pass={pass}");
+    Ok(pass)
+}
+
+#[test]
+#[ignore = "requires Gemma image references, frozen limits, published weights and a GPU window"]
+fn image_model_definition_and_graph_gpu() -> Result<()> {
+    use crate::vision_input::{ImageGrid, MultimodalInput};
+    let dir = std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+    let fixtures = std::path::PathBuf::from(
+        std::env::var_os("FF_GEMMA4_FIXTURES").context("FF_GEMMA4_FIXTURES missing")?,
+    );
+    let frozen: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixtures.join("FROZEN.json"))?)?;
+    ensure!(frozen["status"] == "FROZEN", "vision limits are not frozen");
+    let review: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixtures.join("MEDIA_REVIEW.json"))?)?;
+    ensure!(review["accepted"] == true, "media review missing");
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixtures.join("inputs/INPUT.json"))?)?;
+    let settings = crate::backend::Settings {
+        tree_builder: crate::backend::TreeBuilder::Waves,
+        spec_budget: crate::backend::SpecBudget::Chain,
+        spec_graph: true,
+        draft_model: None,
+        prefix_cache: false,
+        kv_format: crate::kv::KvFormat::Bf16,
+        runtime_dir: Some(std::path::PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime directory missing")?,
+        )),
+    };
+    let spec = crate::model_spec::ModelSpec::read(&dir)?;
+    let image_token = spec
+        .vision
+        .as_ref()
+        .context("vision config missing")?
+        .image_token;
+    let depth = spec.layers.len();
+    let mut engine = super::engine::Engine::load(&dir, 0, 896, Some(896), settings)?;
+    let mut defects = 0usize;
+    let mut street_features = None;
+    for name in ["street", "winter", "wide", "long"] {
+        let cell = &metadata[name];
+        let bounds = &frozen["cells"][name];
+        let bytes = std::fs::read(fixtures.join(format!("inputs/{name}-input.safetensors")))?;
+        let data = SafeTensors::deserialize(&bytes)?;
+        let ids_view = data.tensor("ids")?;
+        let ids: Vec<_> = ids_view
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| u32::from_le_bytes(*v))
+            .collect();
+        let modality_view = data.tensor("modalities")?;
+        let pixels_view = data.tensor("pixels")?;
+        ensure!(
+            ids_view.dtype() == safetensors::Dtype::I32
+                && modality_view.dtype() == safetensors::Dtype::U8
+                && pixels_view.dtype() == safetensors::Dtype::F32,
+            "image input dtype mismatch"
+        );
+        let pixels: Vec<_> = pixels_view
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| f32::from_le_bytes(*v))
+            .collect();
+        let grids = [ImageGrid {
+            t: 1,
+            h: u32::try_from(cell["grid_xy"][1].as_u64().context("grid h")?)?,
+            w: u32::try_from(cell["grid_xy"][0].as_u64().context("grid w")?)?,
+        }];
+        let input = MultimodalInput {
+            input_ids: &ids,
+            modality_ids: modality_view.data(),
+            pixel_values: &pixels,
+            grids: &grids,
+        };
+        let identities: Vec<_> = ids
+            .iter()
+            .map(|&id| if id == image_token { 0 } else { id })
+            .collect();
+        let oracle = load_reference(&fixtures.join(format!("oracle/{name}-packed.safetensors")))?;
+        let first = usize::try_from(cell["score_first"].as_u64().context("score first")?)?;
+        engine.reset()?;
+        let mut trace = crate::trace::Trace::default();
+        engine.gemma_vision_trace(&input, &identities, &mut trace)?;
+        let features = trace.values("image_features")?;
+        let feature_pass = vision_distance(
+            &features,
+            &oracle["features"].1.as_f32(),
+            &bounds["features"],
+        )?;
+        defects += usize::from(!feature_pass);
+        let combined = trace.values("debug.ple_identity")?;
+        let ple: Vec<_> = (0..ids.len())
+            .flat_map(|row| combined[row * depth * 256..][..256].iter().copied())
+            .collect();
+        let ple_pass = vision_distance(&ple, &oracle["ple"].1.as_f32(), &bounds["ple"])?;
+        defects += usize::from(!ple_pass);
+        let mut actual = Vec::new();
+        for row in first..ids.len() {
+            actual.extend(engine.gemma_all_logits(row)?);
+        }
+        let (pass, metrics, _) = model_metrics(
+            &actual,
+            &oracle["logits"].1.as_f32(),
+            &ids[first..],
+            &bounds["logits"],
+        )?;
+        defects += usize::from(!pass);
+        println!(
+            "{} image_model {name} features={feature_pass} ple={ple_pass} {metrics}",
+            if pass { "PASS" } else { "DEFECT" }
+        );
+        if name == "street" {
+            street_features = Some(features);
+            engine.reset()?;
+            let mut wrong = crate::trace::Trace::default();
+            engine.gemma_vision_trace(&input, &ids, &mut wrong)?;
+            let wrong_combined = wrong.values("debug.ple_identity")?;
+            let wrong_ple: Vec<_> = (0..ids.len())
+                .flat_map(|row| wrong_combined[row * depth * 256..][..256].iter().copied())
+                .collect();
+            let detected = !vision_distance(&wrong_ple, &oracle["ple"].1.as_f32(), &bounds["ple"])?;
+            defects += usize::from(!detected);
+            let text_differences = ids
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| **id != image_token)
+                .filter(|(row, _)| ple[row * 256..][..256] != wrong_ple[row * 256..][..256])
+                .count();
+            defects += usize::from(text_differences != 0);
+            println!(
+                "image_identity_control detected={detected} text_row_differences={text_differences}"
+            );
+        }
+        if name == "winter" {
+            let detected = !vision_distance(
+                street_features
+                    .as_ref()
+                    .context("street features missing")?,
+                &oracle["features"].1.as_f32(),
+                &bounds["features"],
+            )?;
+            defects += usize::from(!detected);
+            println!("two_media_control detected={detected}");
+        }
+        if name == "long" {
+            continue;
+        }
+        let prompt = first + 1;
+        let prompt_input = MultimodalInput {
+            input_ids: &ids[..prompt],
+            modality_ids: &modality_view.data()[..prompt],
+            pixel_values: &pixels,
+            grids: &grids,
+        };
+        let mut eager = Vec::new();
+        for graph in [false, true] {
+            engine.reset()?;
+            engine.prefill_multimodal(&prompt_input, None)?;
+            let mut output: Vec<_> = engine
+                .decode_logits()?
+                .into_iter()
+                .map(bf16::from_f32)
+                .collect();
+            if graph {
+                engine.capture()?;
+            }
+            for &token in &ids[prompt..] {
+                engine.set_token(token)?;
+                engine.decode(graph, None)?;
+                output.extend(engine.decode_logits()?.into_iter().map(bf16::from_f32));
+            }
+            let (pass, metrics, _) = model_metrics(
+                &output,
+                &oracle["logits"].1.as_f32(),
+                &ids[first..],
+                &bounds["logits"],
+            )?;
+            defects += usize::from(!pass);
+            println!(
+                "{} image_decode {name} graph={graph} {metrics}",
+                if pass { "PASS" } else { "DEFECT" }
+            );
+            if graph {
+                let differences = output.iter().zip(&eager).filter(|(a, b)| a != b).count();
+                defects += usize::from(differences != 0);
+                println!("image_graph {name} bit_mismatches={differences}");
+            } else {
+                eager = output;
+            }
+        }
+    }
+    println!(
+        "{} image_model_definition_and_graph_gpu cells=4 defects={defects}",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(defects == 0, "Gemma image candidate defects={defects}");
+    Ok(())
+}
+
 fn checkpoint_tensor(dir: &std::path::Path, name: &str) -> Result<Vec<bf16>> {
     let bytes = std::fs::read(dir.join("model.safetensors"))?;
     let tensors = SafeTensors::deserialize(&bytes)?;
