@@ -298,6 +298,16 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d128(p: Attention) {
 }
 
 /// # Safety
+/// All keys below `keys` are populated in this sequence; launch uses 128 threads and 98304 shared bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_prefill_d256_bidirectional(p: Attention, keys: u32) {
+    unsafe {
+        let p = resolve_position(p);
+        attention::<256, 32, 1>(p, keys, 0, 0.0625);
+    }
+}
+
+/// # Safety
 /// All keys below `keys` are populated in this sequence; launch uses 128 threads and 49152 shared bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128_bidirectional(p: Attention, keys: u32) {
@@ -825,7 +835,21 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
 pub unsafe extern "ptx-kernel" fn attention_prefill_d512(p: Attention, scale: f32) {
     unsafe {
         let p = resolve_position(p);
-        attention_d512::<false>(p, scale, core::ptr::null_mut(), 1, 0)
+        attention_d512::<false, false>(p, 0, scale, core::ptr::null_mut(), 1, 0)
+    }
+}
+
+/// # Safety
+/// All keys below `keys` are populated in this sequence; launch uses 128 threads and 90112 shared bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_prefill_d512_bidirectional(
+    p: Attention,
+    keys: u32,
+    scale: f32,
+) {
+    unsafe {
+        let p = resolve_position(p);
+        attention_d512::<false, true>(p, keys, scale, core::ptr::null_mut(), 1, 0)
     }
 }
 
@@ -841,13 +865,14 @@ pub unsafe extern "ptx-kernel" fn attention_partial_d512(
 ) {
     unsafe {
         let p = resolve_position(p);
-        attention_d512::<true>(p, scale, partials, parts, chunk)
+        attention_d512::<true, false>(p, 0, scale, partials, parts, chunk)
     }
 }
 
 #[inline(always)]
-unsafe fn attention_d512<const SPLIT: bool>(
+unsafe fn attention_d512<const SPLIT: bool, const BIDI: bool>(
     p: Attention,
+    keys: u32,
     scale: f32,
     partials: *mut f32,
     parts: u32,
@@ -860,12 +885,12 @@ unsafe fn attention_d512<const SPLIT: bool>(
         let lane = tid & 31;
         let warp = tid >> 5;
         let qstart = tile * 16;
-        let end = p.start + p.rows;
+        // BIDI: every query row sees all keys below the explicit extent.
+        let end = if BIDI { keys } else { p.start + p.rows };
         let part: u32;
         asm!("mov.u32 {p}, %ctaid.z;", p=out(reg32) part);
         let begin = if SPLIT { part * chunk } else { 0 };
-        let stop = end
-            .min(p.start + qstart + 16)
+        let stop = (if BIDI { end } else { end.min(p.start + qstart + 16) })
             .min(if SPLIT { begin + chunk } else { end });
         let sk = sm + 16384;
         let sv = sm + 49152;
@@ -971,7 +996,12 @@ unsafe fn attention_d512<const SPLIT: bool>(
                         let c = f32::from_bits(load_shared(addr + 4096));
                         let d = f32::from_bits(load_shared(addr + 6144));
                         scores[$i][j] = ((a + b) + c) + d;
-                        if key + col + (j as u32 & 1) >= (p.start + qstart + row + 1).min(end) {
+                        let bound = if BIDI {
+                            end
+                        } else {
+                            (p.start + qstart + row + 1).min(end)
+                        };
+                        if key + col + (j as u32 & 1) >= bound {
                             scores[$i][j] = f32::NEG_INFINITY;
                         }
                     }

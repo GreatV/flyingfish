@@ -1082,6 +1082,7 @@ __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
 extern "C" __global__ void attention_prefill_d256(prefill::Problem p) { prefill::run<256,0>(p,0); }
 extern "C" __global__ void attention_prefill_d256_window(prefill::Problem p, uint32_t window, float scale) { prefill::run<256,3,true>(p,window,scale); }
 extern "C" __global__ void attention_prefill_d512(prefill::Problem p, float scale) { prefill::run<512,0,true>(p,0,scale); }
+extern "C" __global__ void attention_prefill_d512_bidirectional(prefill::Problem p, uint32_t keys, float scale) { prefill::run<512,1,true>(p,keys,scale); }
 extern "C" __global__ void attention_partial_d512(prefill::Problem p, float scale, float* partials, uint32_t parts, uint32_t chunk) { prefill::run<512,0,true,true>(p,0,scale,partials,parts,chunk); }
 extern "C" __global__ void attention_merge_d512(prefill::Problem p, const float* partials, uint32_t parts) {
   const uint32_t row = blockIdx.x, head = blockIdx.y, tid = threadIdx.x;
@@ -1109,6 +1110,7 @@ extern "C" __global__ void attention_merge_d512(prefill::Problem p, const float*
 }
 extern "C" __global__ void attention_prefill_d128(prefill::Problem p) { prefill::run<128,0>(p,0); }
 extern "C" __global__ void attention_prefill_d128_bidirectional(prefill::Problem p, uint32_t keys) { prefill::run<128,1>(p,keys); }
+extern "C" __global__ void attention_prefill_d256_bidirectional(prefill::Problem p, uint32_t keys) { prefill::run<256,1>(p,keys); }
 extern "C" __global__ void attention_prefill_d128_prefix(prefill::Problem p, uint32_t prefix) { prefill::run<128,2>(p,prefix); }
 extern "C" __global__ void attention_prefill_d128_window(prefill::Problem p, uint32_t window) { prefill::run<128,3>(p,window); }
 #endif

@@ -463,11 +463,17 @@ impl Flash {
             let names: &[&str] = if head_dim == 64 {
                 &["attention_prefill_d64_bidirectional"]
             } else if head_dim == 512 {
-                &["attention_prefill_d512"]
+                &[
+                    "attention_prefill_d512",
+                    "attention_prefill_d512_bidirectional",
+                ]
             } else if score.is_some() {
                 &["attention_prefill_d256_window"]
             } else if head_dim == 256 {
-                &["attention_prefill_d256"]
+                &[
+                    "attention_prefill_d256",
+                    "attention_prefill_d256_bidirectional",
+                ]
             } else if (heads, kv_heads) == (32, 4) {
                 &["attention_prefill_d128", "attention_prefill_d128_window"]
             } else {
@@ -525,11 +531,17 @@ impl Flash {
                 "prefill query tiles exceed grid limit"
             );
             let names: &[&str] = if head_dim == 512 {
-                &["attention_prefill_d512"]
+                &[
+                    "attention_prefill_d512",
+                    "attention_prefill_d512_bidirectional",
+                ]
             } else if head_dim == 256 && score.is_some() {
                 &["attention_prefill_d256_window"]
             } else if head_dim == 256 {
-                &["attention_prefill_d256"]
+                &[
+                    "attention_prefill_d256",
+                    "attention_prefill_d256_bidirectional",
+                ]
             } else if (heads, kv_heads) == (32, 4) {
                 &["attention_prefill_d128", "attention_prefill_d128_window"]
             } else {
@@ -674,7 +686,7 @@ impl Flash {
         );
         ensure!(
             mode == 0
-                || (shape.window_left.is_none() && (self.native.len() == 3 || bidirectional_only)),
+                || (shape.window_left.is_none() && (self.native.len() > mode || bidirectional_only)),
             "prefill mask is not bound for this geometry/window"
         );
         ensure!(
@@ -839,6 +851,9 @@ impl Flash {
                         launch.arg(&extent);
                     } else if shape.head_dim == 256 {
                         launch.arg(&window);
+                    }
+                    if mode != 0 && shape.head_dim == 512 {
+                        launch.arg(&extent);
                     }
                     launch.arg(&score.scale);
                     launch.launch(LaunchConfig {
@@ -2063,11 +2078,28 @@ mod tests {
             v: stream.clone_htod(&values)?,
             out: stream.alloc_zeros(case.rows * case.hq * case.d)?,
         };
-        let mut op = Flash::new(stream.clone(), case.rows, case.hq, case.hkv, case.d)?;
+        let mut op = if case.d == 512 {
+            Flash::new_with_score(
+                stream.clone(),
+                case.rows,
+                case.hq,
+                case.hkv,
+                case.d,
+                Score::from_tokens(0.044_194_174_f32, None)?,
+                case.capacity,
+            )?
+        } else {
+            Flash::new(stream.clone(), case.rows, case.hq, case.hkv, case.d)?
+        };
         let expected = uniform_reference(case, &values);
         let limit = limits["limits"][format!("{}-{}", case.d, case.mode)]["output_max"]
             .as_f64()
-            .context("mask control limit")?;
+            .with_context(|| {
+                format!(
+                    "mask control limit for {}-{}: derive and freeze it before the run",
+                    case.d, case.mode
+                )
+            })?;
         case.run(&mut op, &mut b)?;
         let actual: Vec<_> = stream
             .clone_dtoh(&b.out)?
@@ -2147,6 +2179,10 @@ mod tests {
             (256, 24, 4, "causal", 33, 17, 50, 0),
             (128, 16, 2, "causal", 33, 17, 50, 0),
             (128, 16, 8, "bidirectional", 17, 0, 33, 0),
+            (256, 16, 8, "bidirectional", 17, 0, 33, 0),
+            (512, 16, 2, "bidirectional", 17, 0, 33, 0),
+            (256, 16, 8, "bidirectional", 17, 33, 50, 0),
+            (512, 16, 2, "bidirectional", 17, 33, 50, 0),
             (128, 12, 12, "prefix", 65, 0, 65, 33),
             (128, 32, 4, "window", 17, 127, 144, 31),
         ] {
