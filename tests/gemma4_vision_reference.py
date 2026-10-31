@@ -235,7 +235,9 @@ def capture_model(args, config):
     model.lm_head.weight = lm.embed_tokens.weight
     lm.rotary_emb.to(args.device)
     if audio:
+        relative_timescales = tower.rel_pos_enc.inv_timescales.detach().clone()
         move(tower)
+        tower.rel_pos_enc.inv_timescales = relative_timescales.to(args.device)
         move(embedder)
     else:
         tower.encoder.rotary_emb.to(args.device)
@@ -388,7 +390,7 @@ def capture_audio_operators(args, config):
             mask[:, -2:] = False
             mask[:, 3] = False
         if rows >= 25:
-            mask[:, :13] = False
+            mask[:, :12] = False
         tensors["mask"] = mask.bfloat16()
         tensors["branch"][rows // 2, 3] = 2e10
         x, branch, weight = [tensors[k].to(dtype) for k in ("x", "branch", "weight")]
