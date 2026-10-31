@@ -280,6 +280,123 @@ pub struct ModelSpec {
     pub per_layer_input: Option<u32>,
     #[serde(default)]
     pub vision: Option<VisionConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<AudioConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AudioConfig {
+    pub hidden: u32,
+    pub layers: u32,
+    pub heads: u32,
+    pub output: u32,
+    pub chunk: u32,
+    pub context_left: u32,
+    pub context_right: u32,
+    pub conv_kernel: u32,
+    pub subsample_channels: [u32; 2],
+    pub rms_eps: f32,
+    pub logit_cap: f32,
+    pub invalid_logit: f32,
+    pub gradient_clip: f32,
+    pub residual_weight: f32,
+    pub token: u32,
+    pub start_token: u32,
+    pub end_token: u32,
+}
+
+impl AudioConfig {
+    fn from_root(root: &Value) -> Result<Option<Self>> {
+        let Some(a) = root.get("audio_config").filter(|a| !a.is_null()) else {
+            return Ok(None);
+        };
+        exact_keys(
+            a,
+            &[
+                "_name_or_path",
+                "architectures",
+                "attention_chunk_size",
+                "attention_context_left",
+                "attention_context_right",
+                "attention_invalid_logits_value",
+                "attention_logit_cap",
+                "chunk_size_feed_forward",
+                "conv_kernel_size",
+                "dtype",
+                "gradient_clipping",
+                "hidden_act",
+                "hidden_size",
+                "id2label",
+                "initializer_range",
+                "is_encoder_decoder",
+                "label2id",
+                "model_type",
+                "num_attention_heads",
+                "num_hidden_layers",
+                "output_attentions",
+                "output_hidden_states",
+                "output_proj_dims",
+                "problem_type",
+                "residual_weight",
+                "return_dict",
+                "rms_norm_eps",
+                "subsampling_conv_channels",
+                "use_clipped_linears",
+            ],
+            "audio config",
+        )?;
+        for (key, value) in [
+            ("model_type", "gemma4_audio".into()),
+            ("hidden_size", 1024.into()),
+            ("num_hidden_layers", 12.into()),
+            ("num_attention_heads", 8.into()),
+            ("output_proj_dims", 1536.into()),
+            ("attention_chunk_size", 12.into()),
+            ("attention_context_left", 13.into()),
+            ("attention_context_right", 0.into()),
+            ("conv_kernel_size", 5.into()),
+            ("subsampling_conv_channels", serde_json::json!([128, 32])),
+            ("rms_norm_eps", 1e-6.into()),
+            ("attention_logit_cap", 50.0.into()),
+            ("attention_invalid_logits_value", (-1e9).into()),
+            ("gradient_clipping", 1e10.into()),
+            ("residual_weight", 0.5.into()),
+            ("hidden_act", "silu".into()),
+            ("use_clipped_linears", true.into()),
+            ("dtype", "bfloat16".into()),
+            ("chunk_size_feed_forward", 0.into()),
+        ] {
+            equal(a, key, value)?;
+        }
+        ensure!(
+            root["eoa_token_id"] == root["eoa_token_index"],
+            "audio end token mismatch"
+        );
+        let spec = Self {
+            hidden: 1024,
+            layers: 12,
+            heads: 8,
+            output: 1536,
+            chunk: 12,
+            context_left: 13,
+            context_right: 0,
+            conv_kernel: 5,
+            subsample_channels: [128, 32],
+            rms_eps: 1e-6,
+            logit_cap: 50.0,
+            invalid_logit: -1e9,
+            gradient_clip: 1e10,
+            residual_weight: 0.5,
+            token: positive(root, "audio_token_id")?,
+            start_token: positive(root, "boa_token_id")?,
+            end_token: positive(root, "eoa_token_id")?,
+        };
+        ensure!(
+            spec.token == 258881 && spec.start_token == 256000 && spec.end_token == 258883,
+            "unsupported audio token identities"
+        );
+        Ok(Some(spec))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1386,6 +1503,7 @@ impl ModelSpec {
             deepseek_v41: None,
             logit_softcap: None,
             per_layer_input: None,
+            audio: None,
             layers: (0..u(c.num_hidden_layers)?)
                 .map(|state_index| LayerPlan {
                     geometry: None,
@@ -1530,6 +1648,7 @@ impl ModelSpec {
             deepseek_v41: None,
             logit_softcap: None,
             per_layer_input: None,
+            audio: None,
             vision: None,
         })
     }
@@ -1779,6 +1898,7 @@ impl ModelSpec {
             deepseek_v41: None,
             logit_softcap: None,
             per_layer_input: None,
+            audio: None,
             vision: None,
         })
     }
@@ -2095,6 +2215,11 @@ impl ModelSpec {
             per_layer_input: (ple != 0).then_some(ple),
             vision: if ple != 0 {
                 VisionConfig::from_root(root)?
+            } else {
+                None
+            },
+            audio: if ple != 0 {
+                AudioConfig::from_root(root)?
             } else {
                 None
             },
@@ -2482,6 +2607,7 @@ impl ModelSpec {
             deepseek_v41: None,
             logit_softcap: None,
             per_layer_input: None,
+            audio: None,
             vision: None,
         })
     }
@@ -2905,6 +3031,7 @@ impl ModelSpec {
             }),
             logit_softcap: None,
             per_layer_input: None,
+            audio: None,
             vision: None,
         })
     }
@@ -2946,6 +3073,7 @@ impl ModelSpec {
             deepseek_v41: None,
             logit_softcap: None,
             per_layer_input: None,
+            audio: None,
             vision,
         })
     }

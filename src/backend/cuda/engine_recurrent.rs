@@ -2363,6 +2363,7 @@ mod tests {
             let mut modality = vec![0; rows];
             modality[begin..begin + count].fill(1);
             let input = crate::vision_input::MultimodalInput {
+                audio: &[],
                 input_ids: &prompt,
                 modality_ids: &modality,
                 pixel_values: &pixels,

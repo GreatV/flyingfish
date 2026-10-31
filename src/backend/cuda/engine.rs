@@ -36,6 +36,8 @@ use std::{
     time::Instant,
 };
 
+#[path = "engine_audio.rs"]
+pub(super) mod audio_runtime;
 #[path = "engine_deepseek.rs"]
 pub(crate) mod deepseek;
 #[path = "engine_moe.rs"]
@@ -553,6 +555,9 @@ enum CaptureFault {
 #[derive(Clone, Copy)]
 enum SetupMode {
     Ready,
+    Media {
+        reserved_bytes: usize,
+    },
     Prepare,
     #[cfg(feature = "cuda")]
     Mtp {
@@ -563,7 +568,7 @@ enum SetupMode {
 impl SetupMode {
     fn writes(self) -> bool {
         match self {
-            Self::Ready => false,
+            Self::Ready | Self::Media { .. } => false,
             Self::Prepare => true,
             #[cfg(feature = "cuda")]
             Self::Mtp { .. } => true,
@@ -809,6 +814,45 @@ fn prefix_attention_host_tensors(
 }
 
 impl Engine {
+    pub fn load_multimodal(
+        dir: &Path,
+        ordinal: usize,
+        capacity: usize,
+        requested_chunk: Option<usize>,
+        settings: Settings,
+        input: &crate::vision_input::MultimodalInput<'_>,
+    ) -> Result<Self> {
+        let spec = crate::model_spec::ModelSpec::read(dir)?;
+        ensure!(
+            matches!(load_dispatch(spec.architecture)?, LoadDispatch::Qwen)
+                && spec.moe.is_none()
+                && spec.linear_format.fp8_layout().is_none(),
+            "media-aware dense placement requires a BF16 dense Qwen-family runtime"
+        );
+        let (audio, vision, request) = Self::multimodal_request_bytes(&spec, input, capacity)?;
+        let checkpoint = crate::checkpoint::MappedCheckpoint::open(dir)?;
+        let mut reserved_bytes = request;
+        for (present, policy) in [
+            (audio != 0, crate::checkpoint::LoadPolicy::AudioOnly),
+            (vision != 0, crate::checkpoint::LoadPolicy::VisionOnly),
+        ] {
+            if present {
+                reserved_bytes = reserved_bytes
+                    .checked_add(checkpoint.manifest(&spec, policy)?.resident_bytes)
+                    .and_then(|n| n.checked_add(1024 * 1024))
+                    .context("media setup reservation overflow")?;
+            }
+        }
+        Self::load_kind_for(
+            dir,
+            ordinal,
+            capacity,
+            requested_chunk,
+            settings,
+            SetupMode::Media { reserved_bytes },
+        )
+    }
+
     pub fn load(
         dir: &Path,
         ordinal: usize,
@@ -2020,17 +2064,21 @@ impl Engine {
         identities: &[u32],
         trace: &mut crate::trace::Trace,
     ) -> Result<()> {
+        trace.set_device(&self.device.info.name)?;
         self.prepare_multimodal(input, Some(trace))?;
         self.gemma_prefill_trace(identities, trace)?;
+        let (images, clips) = self.gemma_encoder_calls()?;
         ensure!(
-            self.qwen
-                .as_ref()
-                .context("Gemma runtime missing")?
-                .vision_encode_calls
-                == 1,
-            "image encoder call count differs from one"
+            images == usize::from(!input.grids.is_empty()) && clips == input.audio.len(),
+            "media encoder call count differs: images={images} clips={clips}"
         );
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gemma_encoder_calls(&self) -> Result<(usize, usize)> {
+        let q = self.qwen.as_ref().context("Gemma runtime missing")?;
+        Ok((q.vision_encode_calls, q.audio_encode_calls))
     }
 
     #[cfg(test)]
@@ -6521,6 +6569,7 @@ fn q38_engine_capture_gpu() -> Result<()> {
             .map(|v| f32::from_le_bytes(*v))
             .collect();
         let input = crate::vision_input::MultimodalInput {
+            audio: &[],
             input_ids: &ids,
             modality_ids: &modalities,
             grids: &grids,

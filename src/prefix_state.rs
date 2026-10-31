@@ -1111,6 +1111,7 @@ mod tests {
             deepseek_v41: None,
             logit_softcap: None,
             per_layer_input: None,
+            audio: None,
             vision: None,
         }
     }

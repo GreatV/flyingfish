@@ -62,6 +62,7 @@ fn rectangular_image_positions_and_chunk_splices() -> Result<()> {
     let pixels = vec![0.0; 24 * 1536];
     let grid = [ImageGrid { t: 1, h: 4, w: 6 }];
     let plan = MultimodalInput {
+        audio: &[],
         input_ids: &ids,
         modality_ids: &modality,
         pixel_values: &pixels,
@@ -127,6 +128,7 @@ fn multiple_images_keep_distinct_feature_and_token_ranges() -> Result<()> {
     ];
     let pixels = vec![0.0; 12 * 1536];
     let plan = MultimodalInput {
+        audio: &[],
         input_ids: &ids,
         modality_ids: &modality,
         pixel_values: &pixels,
@@ -160,6 +162,7 @@ fn packed_input_rejects_ambiguous_slots_and_invalid_pixels() {
     let grid = [ImageGrid { t: 1, h: 2, w: 2 }];
     let valid = |ids: &[u32], m: &[u8], p: &[f32], g: &[ImageGrid], capacity| {
         MultimodalInput {
+            audio: &[],
             input_ids: ids,
             modality_ids: m,
             pixel_values: p,
@@ -232,6 +235,7 @@ fn text_axes_and_all_rotary_frequencies_are_exactly_linear() -> Result<()> {
     assert!(PositionPlan::text(0, 65).is_err());
     let ids = [1, 2, 3];
     let plan = MultimodalInput {
+        audio: &[],
         input_ids: &ids,
         modality_ids: &[0; 3],
         pixel_values: &[],
@@ -326,6 +330,7 @@ fn image_fixture_positions_and_bilinear_tables_match_bitwise() -> Result<()> {
             .map(|v| f32::from_le_bytes(*v))
             .collect();
         let plan = MultimodalInput {
+            audio: &[],
             input_ids: &ids,
             modality_ids: &modalities,
             pixel_values: &pixels,

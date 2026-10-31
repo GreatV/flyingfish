@@ -10,6 +10,100 @@ use crate::fp8::Fp8ScaleLayout;
 use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::sync::Arc;
+pub(crate) struct ClippedLinear {
+    pub(crate) weight: CudaSlice<bf16>,
+    pub(crate) shape: [u32; 2],
+    pub(crate) bounds: Option<[CudaSlice<bf16>; 4]>,
+}
+
+impl ClippedLinear {
+    pub(crate) fn take(
+        catalog: &mut WeightCatalog,
+        name: &str,
+        shape: [u32; 2],
+        bounds: Option<&str>,
+    ) -> Result<Self> {
+        let weight = catalog.take_bf16(name, &[shape[0] as usize, shape[1] as usize])?;
+        let bounds = bounds
+            .map(|prefix| -> Result<_> {
+                Ok([
+                    catalog.take_bf16(&format!("{prefix}.input_min"), &[])?,
+                    catalog.take_bf16(&format!("{prefix}.input_max"), &[])?,
+                    catalog.take_bf16(&format!("{prefix}.output_min"), &[])?,
+                    catalog.take_bf16(&format!("{prefix}.output_max"), &[])?,
+                ])
+            })
+            .transpose()?;
+        Ok(Self {
+            weight,
+            shape,
+            bounds,
+        })
+    }
+
+    pub(crate) fn prepare(&self, blas: &super::blas::Blas, rows: u32) -> Result<()> {
+        blas.prepare_request_fixed(rows, self.shape[0], self.shape[1])
+    }
+
+    pub(crate) fn run(
+        &self,
+        stream: &Arc<CudaStream>,
+        blas: &super::blas::Blas,
+        clamp: &CudaFunction,
+        input: Tensor<bf16, 2>,
+        scratch: TensorMut<bf16, 2>,
+        output: &mut TensorMut<bf16, 2>,
+    ) -> Result<()> {
+        let x = if let Some(bounds) = &self.bounds {
+            ensure!(
+                input.shape == scratch.0.shape,
+                "clamp scratch extent differs"
+            );
+            disjoint(&input, &scratch.0)?;
+            let count = u64::from(input.shape[0]) * u64::from(input.shape[1]);
+            unsafe {
+                stream
+                    .launch_builder(clamp)
+                    .arg(&input.ptr)
+                    .arg(&scratch.0.ptr)
+                    .arg(&count)
+                    .arg(&bounds[0])
+                    .arg(&bounds[1])
+                    .launch(super::ops::flat(count as usize))?;
+            }
+            scratch.0
+        } else {
+            input
+        };
+        blas.linear_typed(
+            crate::op_contract::ExecutionPhase::Prefill,
+            LinearWeightRef::Bf16(super::contracts::view(
+                &self.weight,
+                stream,
+                0,
+                self.shape,
+                [u64::from(self.shape[1]), 1],
+            )?),
+            x,
+            output,
+        )?;
+        if let Some(bounds) = &self.bounds {
+            let count = u64::from(output.0.shape[0]) * u64::from(output.0.shape[1]);
+            unsafe {
+                stream
+                    .launch_builder(clamp)
+                    .arg(&output.0.ptr)
+                    .arg(&output.0.ptr)
+                    .arg(&count)
+                    .arg(&bounds[2])
+                    .arg(&bounds[3])
+                    .launch(super::ops::flat(count as usize))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Native BF16 operands with an unrounded FP32 output on the shared skinny tile.
 pub struct Bf16F32Plan {
     kernel: CudaFunction,

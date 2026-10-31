@@ -301,6 +301,7 @@ impl PreparedInput {
 
     pub fn input<'a>(&'a self, ids: &'a [u32]) -> MultimodalInput<'a> {
         MultimodalInput {
+            audio: &[],
             input_ids: ids,
             modality_ids: &self.modality_ids,
             pixel_values: &self.pixel_values,

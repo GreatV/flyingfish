@@ -53,6 +53,20 @@ pub(crate) struct DensePlacement {
 
 #[cfg(any(feature = "cuda", test))]
 impl DensePlacement {
+    pub(crate) fn device_budget(
+        free: usize,
+        total: usize,
+        fixed: usize,
+        transient: usize,
+        media: usize,
+    ) -> Result<usize> {
+        free.checked_sub(total / 16)
+            .and_then(|n| n.checked_sub(fixed))
+            .and_then(|n| n.checked_sub(transient))
+            .and_then(|n| n.checked_sub(media))
+            .context("dense fixed weights, media and workspace exceed VRAM")
+    }
+
     pub(crate) fn new(layers: &[usize], device_bytes: usize, host_bytes: usize) -> Result<Self> {
         ensure!(
             !layers.is_empty() && layers.iter().all(|&n| n > 0),
@@ -222,6 +236,37 @@ impl Plan {
 #[cfg(test)]
 mod tests {
     use super::{Plan, WorkspaceBudget, WorkspaceRequest, chunk_end, dense_prompt_bytes};
+
+    #[test]
+    fn dense_media_reservation_preserves_device_capacity() -> anyhow::Result<()> {
+        use super::DensePlacement;
+        let total = 16usize << 30;
+        let fixed = 2usize << 30;
+        let transient = 1usize << 30;
+        let media_weights = 512usize << 20;
+        let media_workspace = 256usize << 20;
+        let request_buffers = 128usize << 20;
+        let media = media_weights + media_workspace + request_buffers;
+        let layers = [256usize << 20; 48];
+        let budget = DensePlacement::device_budget(total, total, fixed, transient, media)?;
+        let plan = DensePlacement::new(&layers, budget, 4 << 30)?;
+        assert!(plan.slot_bytes > 0);
+        assert!(
+            plan.resident_bytes + 2 * plan.slot_bytes + fixed + transient + media
+                <= total - total / 16
+        );
+        let old_budget = DensePlacement::device_budget(total, total, fixed, transient, 0)?;
+        let old = DensePlacement::new(&layers, old_budget, 4 << 30)?;
+        assert_eq!(old.slot_bytes, 0);
+        assert!(old.resident_bytes + fixed + transient + media > total - total / 16);
+        assert!(DensePlacement::device_budget(total, total, fixed, transient, total).is_err());
+        eprintln!(
+            "PASS dense_media_capacity total={total} media_weights={media_weights} media_workspace={media_workspace} request_buffers={request_buffers} resident={} slots={} old_omitted_media_control=detected",
+            plan.resident_bytes,
+            2 * plan.slot_bytes
+        );
+        Ok(())
+    }
 
     #[test]
     fn dense_tiers_preserve_capacity_and_slot_bounds() -> anyhow::Result<()> {

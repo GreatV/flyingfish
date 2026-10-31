@@ -2,6 +2,64 @@
 #include <stdint.h>
 #include <math.h>
 
+// [time,frequency,channel] -> [ceil(time/2)*ceil(frequency/2),channel*3*3].
+extern "C" __global__ void masked_strided_patch_bf16(
+    const __nv_bfloat16* input, const uint8_t* mask, __nv_bfloat16* output,
+    uint32_t time, uint32_t frequency, uint32_t channels) {
+    if (blockDim.x != 256 || !input || !mask || !output || !time || !frequency || !channels) {
+        __trap(); return;
+    }
+    const uint32_t ot = (time + 1) / 2, of = (frequency + 1) / 2, width = channels * 9;
+    const uint64_t count = uint64_t(ot) * of * width;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint64_t row = i / width;
+        const uint32_t k = i % width, c = k / 9;
+        const int t = int(row / of * 2 + (k % 9) / 3) - 1;
+        const int f = int(row % of * 2 + k % 3) - 1;
+        output[i] = (t >= 0 && t < int(time) && f >= 0 && f < int(frequency) && mask[t])
+            ? input[(uint64_t(t) * frequency + f) * channels + c] : __float2bfloat16_rn(0.0f);
+    }
+}
+
+// mode 0: ReLU; mode 1: SiLU; mode 2: GLU; mode 3: softplus.
+extern "C" __global__ void activation_bf16(
+    const __nv_bfloat16* input, __nv_bfloat16* output, uint32_t rows, uint32_t width, int mode) {
+    if (blockDim.x != 256 || !input || !output || !rows || !width || mode < 0 || mode > 3) {
+        __trap(); return;
+    }
+    const uint64_t count = uint64_t(rows) * width;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint64_t offset = mode == 2 ? i / width * (2 * width) + i % width : i;
+        const float x = __bfloat162float(input[offset]);
+        const float gate = mode == 2 ? __bfloat162float(input[offset + width]) : x;
+        const float y = mode == 0 ? fmaxf(x, 0.0f) : mode == 3 ?
+            (x > 20.0f ? x : log1pf(expf(x))) : x / (1.0f + expf(-gate));
+        output[i] = __float2bfloat16_rn(y);
+    }
+}
+
+// Native weights[channel,1,kernel]; BF16 input/output[time,channel], zero left padding.
+extern "C" __global__ void causal_depthwise_conv_bf16(
+    const __nv_bfloat16* input, const __nv_bfloat16* weight, __nv_bfloat16* output,
+    uint32_t rows, uint32_t channels, uint32_t kernel) {
+    if (blockDim.x != 256 || !input || !weight || !output || input == output ||
+        !rows || !channels || !kernel) { __trap(); return; }
+    const uint64_t count = uint64_t(rows) * channels;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint32_t row = i / channels, c = i % channels;
+        float sum = 0.0f;
+        for (uint32_t k = 0; k < kernel; ++k) {
+            const int t = int(row) + int(k) - int(kernel) + 1;
+            if (t >= 0) sum = __fmaf_rn(__bfloat162float(input[uint64_t(t) * channels + c]),
+                __bfloat162float(weight[uint64_t(c) * kernel + k]), sum);
+        }
+        output[i] = __float2bfloat16_rn(sum);
+    }
+}
+
 __device__ __forceinline__ bool vision_flat_launch() {
     return blockDim.x == 256 && blockDim.y == 1 && blockDim.z == 1 &&
            gridDim.y == 1 && gridDim.z == 1;
