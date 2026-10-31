@@ -700,6 +700,70 @@ fn unrounded_norm_and_branch_boundary_match_the_definition_gpu() -> Result<()> {
             cases += 1;
         }
     }
+    for hidden in [1536usize, 2560] {
+        for rows in [1usize, 17, 64, 1024] {
+            let values = |period: usize, count: usize| {
+                (0..count)
+                    .map(|i| bf16::from_f32(((i * 37 + 11) % period) as f32 / 256.0 - 1.0))
+                    .collect::<Vec<_>>()
+            };
+            let mut x = s.clone_htod(&values(1009, rows * hidden))?;
+            let b = s.clone_htod(&values(1013, rows * hidden))?;
+            let wb = s.clone_htod(&values(509, hidden))?;
+            let wn = s.clone_htod(&values(503, hidden))?;
+            let scalar = s.clone_htod(&[bf16::from_f32(0.875)])?;
+            let mut reused = s.alloc_zeros::<bf16>(rows * hidden)?;
+            unsafe {
+                s.launch_builder(&branch)
+                    .arg(&mut x)
+                    .arg(&b)
+                    .arg(&wb)
+                    .arg(&scalar)
+                    .arg(&wn)
+                    .arg(&mut reused)
+                    .arg(&(hidden as u32))
+                    .arg(&1e-6f32)
+                    .launch(super::ops::grid(rows, 256))?;
+            }
+            let meta = s.clone_htod(&[0i32, rows as i32, rows as i32, rows as i32, 1, 0, 0, 0])?;
+            let domain = RowDomain {
+                meta: SeqRef {
+                    ptr: meta.device_ptr(s).0,
+                },
+                row_base: 0,
+                row_capacity: rows as u32,
+            };
+            let normalize = |weight: &CudaSlice<bf16>| -> Result<Vec<bf16>> {
+                let output = s.alloc_zeros::<bf16>(rows * hidden)?;
+                common.norm.rms_with(
+                    s,
+                    domain,
+                    heads(&x, s, rows, 1, hidden as u32)?,
+                    vector(weight, s)?,
+                    &mut TensorMut(heads(&output, s, rows, 1, hidden as u32)?),
+                    options,
+                )?;
+                s.clone_dtoh(&output).context("norm reuse readback failed")
+            };
+            let actual = s.clone_dtoh(&reused)?;
+            let expected = normalize(&wn)?;
+            let wrong = normalize(&wb)?;
+            let mismatches = actual
+                .iter()
+                .zip(&expected)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let control = actual
+                .iter()
+                .zip(&wrong)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            ensure!(mismatches == 0 && control > 0, "norm reuse/control differs");
+            println!(
+                "NORM_REUSE PASS rows={rows} hidden={hidden} bit_mismatches={mismatches} wrong_weight_mismatches={control}"
+            );
+        }
+    }
     println!("GEMMA4_NORM cases={cases} defects={defects} undetected_mutants={undetected}");
     ensure!(defects == 0 && undetected == 0, "GEMMA4_NORM FAIL");
     Ok(())

@@ -621,6 +621,7 @@ struct Layer {
     post_ffn_norm: Option<Tensor<bf16, 1>>,
     post_ple_norm: Option<Tensor<bf16, 1>>,
     layer_scalar: Option<Tensor<bf16, 1>>,
+    produces_next_norm: bool,
     mixer: BoundMixer,
 }
 
@@ -1826,6 +1827,20 @@ impl Runtime {
                     }
                 }
             };
+            let produces_next_norm = matches!(
+                &*crate::model::layer_program(&engine.model_spec, i)?,
+                [
+                    ..,
+                    crate::model::LayerStage::PerLayerInput,
+                    crate::model::LayerStage::Common(crate::backend::Operator::NextNorm)
+                ]
+            );
+            ensure!(
+                !produces_next_norm
+                    || (gemma_ops.is_some()
+                        && matches!(norm_mode(&engine.model_spec), RmsMode::Unrounded)),
+                "layer-end norm producer requires the bound unrounded branch operation"
+            );
             layers.push(Layer {
                 linear,
                 ffn,
@@ -1842,6 +1857,7 @@ impl Runtime {
                     .then(|| weight("post_per_layer_input_norm.weight"))
                     .transpose()?,
                 layer_scalar: gemma.then(|| weight("layer_scalar")).transpose()?,
+                produces_next_norm,
                 mixer,
             });
         }
@@ -5570,7 +5586,8 @@ impl Engine {
                     return Ok(());
                 }
                 if i == 0
-                    || (!flint
+                    || (!q.layers[i - 1].produces_next_norm
+                        && !flint
                         && ((self.model_spec.moe.is_some()
                             && !self.qwen_device_prefix
                             && step.input == crate::backend::Input::Ids)
@@ -5905,7 +5922,8 @@ impl Engine {
                         .context("GLM-5.3 mHC runtime is not bound")?
                         .collapse_final(s, rows, &mut w.x)?;
                 }
-                if !flint
+                if !q.layers[self.model_spec.layers.len() - 1].produces_next_norm
+                    && !flint
                     && ((self.model_spec.moe.is_some()
                         && !self.qwen_device_prefix
                         && step.input == crate::backend::Input::Ids)
