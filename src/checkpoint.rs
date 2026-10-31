@@ -206,8 +206,11 @@ impl MappedCheckpoint {
         }
         if spec.architecture == Architecture::Gemma4 {
             ensure!(
-                policy == LoadPolicy::TextOnly,
-                "Gemma 4 supports text-only loading"
+                matches!(
+                    policy,
+                    LoadPolicy::TextOnly | LoadPolicy::TextWithVision | LoadPolicy::VisionOnly
+                ),
+                "Gemma 4 load policy requires text and/or vision"
             );
             let expected = self.gemma4_expected(spec)?;
             let planned = Self::planned_bytes(&expected, policy)?;
@@ -437,13 +440,15 @@ impl MappedCheckpoint {
     ) -> Result<BTreeMap<String, ExpectedTensor>> {
         let mut expected = BTreeMap::new();
         Self::gemma4_entries(spec, &mut expected)?;
+        Self::axial_vision_entries(
+            spec.vision
+                .as_ref()
+                .context("vision configuration missing")?,
+            &mut expected,
+        )?;
         let views = self.views()?;
         for (name, shard) in &self.index.weight_map {
-            let scope = if name.starts_with("model.vision_tower.")
-                || name.starts_with("model.embed_vision.")
-            {
-                TensorScope::Vision
-            } else if name.starts_with("model.audio_tower.")
+            let scope = if name.starts_with("model.audio_tower.")
                 || name.starts_with("model.embed_audio.")
             {
                 TensorScope::Audio
@@ -460,6 +465,78 @@ impl MappedCheckpoint {
             );
         }
         Ok(expected)
+    }
+
+    fn axial_vision_entries(
+        vision: &crate::model_spec::VisionConfig,
+        expected: &mut BTreeMap<String, ExpectedTensor>,
+    ) -> Result<()> {
+        vision.validate(crate::model_spec::Architecture::Gemma4)?;
+        let axial = vision
+            .axial
+            .as_ref()
+            .context("axial vision configuration missing")?;
+        let h = vision.hidden as usize;
+        let d = axial.head_dim as usize;
+        let i = vision.intermediate as usize;
+        let mut add = |name: String, shape: Vec<usize>| {
+            put(expected, name, Dtype::BF16, shape, TensorScope::Vision);
+        };
+        for (name, shape) in [
+            (
+                "model.vision_tower.patch_embedder.input_proj.weight",
+                vec![
+                    h,
+                    vision.patch_elements(crate::model_spec::Architecture::Gemma4)?,
+                ],
+            ),
+            (
+                "model.vision_tower.patch_embedder.position_embedding_table",
+                vec![2, vision.position_side as usize, h],
+            ),
+            (
+                "model.embed_vision.embedding_projection.weight",
+                vec![vision.output as usize, h],
+            ),
+        ] {
+            add(name.into(), shape);
+        }
+        if axial.standardize {
+            for name in ["std_bias", "std_scale"] {
+                add(format!("model.vision_tower.{name}"), vec![h]);
+            }
+        }
+        for layer in 0..vision.depth {
+            let prefix = format!("model.vision_tower.encoder.layers.{layer}");
+            for name in [
+                "input_layernorm",
+                "post_attention_layernorm",
+                "pre_feedforward_layernorm",
+                "post_feedforward_layernorm",
+            ] {
+                add(format!("{prefix}.{name}.weight"), vec![h]);
+            }
+            for name in ["q_norm", "k_norm"] {
+                add(format!("{prefix}.self_attn.{name}.weight"), vec![d]);
+            }
+            for (name, shape) in [
+                ("self_attn.q_proj", vec![h, h]),
+                ("self_attn.k_proj", vec![h, h]),
+                ("self_attn.v_proj", vec![h, h]),
+                ("self_attn.o_proj", vec![h, h]),
+                ("mlp.gate_proj", vec![i, h]),
+                ("mlp.up_proj", vec![i, h]),
+                ("mlp.down_proj", vec![h, i]),
+            ] {
+                add(format!("{prefix}.{name}.linear.weight"), shape);
+                if axial.clipped_linears {
+                    for bound in ["input_min", "input_max", "output_min", "output_max"] {
+                        add(format!("{prefix}.{name}.{bound}"), vec![]);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn planned_bytes(
@@ -2740,6 +2817,27 @@ mod component_tests {
                 !expected.contains_key("lm_head.weight"),
                 "tied head must not expect lm_head"
             );
+            MappedCheckpoint::axial_vision_entries(
+                spec.vision.as_ref().context("vision spec")?,
+                &mut expected,
+            )?;
+            let vision_bytes = if spec.hidden == 1536 {
+                337_089_408
+            } else {
+                338_662_272
+            };
+            ensure!(
+                expected
+                    .values()
+                    .filter(|e| e.2 == TensorScope::Vision)
+                    .count()
+                    == 659
+                    && MappedCheckpoint::planned_bytes(&expected, LoadPolicy::VisionOnly)?
+                        == vision_bytes
+                    && MappedCheckpoint::planned_bytes(&expected, LoadPolicy::TextWithVision)?
+                        == resident + vision_bytes,
+                "vision manifest count or allocation size changed"
+            );
             let mut shifted = BTreeMap::new();
             let moved = gemma4_spec(text, Some(3))?;
             MappedCheckpoint::gemma4_entries(&moved, &mut shifted)?;
@@ -2763,6 +2861,32 @@ mod component_tests {
         let spec = crate::model_spec::ModelSpec::read(&dir)?;
         let checkpoint = MappedCheckpoint::open(&dir)?;
         let manifest = checkpoint.manifest(&spec, LoadPolicy::TextOnly)?;
+        let vision_manifest = checkpoint.manifest(&spec, LoadPolicy::VisionOnly)?;
+        let expected_vision_bytes = if spec.hidden == 1536 {
+            337_089_408
+        } else {
+            338_662_272
+        };
+        ensure!(
+            vision_manifest.resident_bytes == expected_vision_bytes
+                && vision_manifest
+                    .entries
+                    .values()
+                    .all(|e| e.load == (e.scope == TensorScope::Vision)),
+            "vision allocation plan differs from published tensors"
+        );
+        let mut wrong_geometry = spec.clone();
+        wrong_geometry
+            .vision
+            .as_mut()
+            .context("vision spec")?
+            .intermediate += 16;
+        ensure!(
+            checkpoint
+                .manifest(&wrong_geometry, LoadPolicy::VisionOnly)
+                .is_err(),
+            "checkpoint-derived vision shapes hid a config/weight mismatch"
+        );
         let (total, vision, audio, dormant, resident) = match spec.hidden {
             1536 => (2011, 659, 752, 60, 9_257_138_758),
             2560 => (2130, 659, 752, 54, 14_926_026_836),

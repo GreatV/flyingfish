@@ -176,7 +176,7 @@ pub struct MultimodalInput<'a> {
     pub input_ids: &'a [u32],
     /// 0 = text, 1 = image, 2 = video.
     pub modality_ids: &'a [u8],
-    /// Merge-grouped rows, each [channel, temporal, patch_y, patch_x] flattened.
+    /// Processor-packed rows: axial vision uses [patch_y, patch_x, channel]; other towers use their declared patch layout.
     pub pixel_values: &'a [f32],
     pub grids: &'a [ImageGrid],
 }
@@ -309,19 +309,127 @@ impl MultimodalInput<'_> {
         match spec.architecture {
             Architecture::Qwen35Text => self.validate_qwen(spec, capacity),
             Architecture::MiniCpmV47 => self.validate_minicpm(spec, capacity),
+            Architecture::Gemma4 => self.validate_axial(spec, capacity),
             Architecture::LoopVl => {
                 self.validate_loopvl(spec.vocab, spec.max_position as usize, capacity)
             }
-            Architecture::Llama
-            | Architecture::Flint
-            | Architecture::Glm5Next
-            | Architecture::Gemma4 => {
+            Architecture::Llama | Architecture::Flint | Architecture::Glm5Next => {
                 bail!("packed images require a supported multimodal architecture")
             }
             Architecture::DeepseekV41 => {
                 bail!("packed images require a supported multimodal architecture")
             }
         }
+    }
+
+    fn validate_axial(&self, spec: &ModelSpec, capacity: usize) -> Result<PositionPlan> {
+        let vision = spec
+            .vision
+            .as_ref()
+            .context("vision configuration missing")?;
+        vision.validate(spec.architecture)?;
+        let axial = vision
+            .axial
+            .as_ref()
+            .context("axial vision configuration missing")?;
+        ensure!(
+            capacity <= spec.max_position as usize,
+            "image capacity exceeds model positions"
+        );
+        let mut plan = PositionPlan::text(self.input_ids.len(), capacity)?;
+        ensure!(
+            self.modality_ids.len() == self.input_ids.len()
+                && self.modality_ids.iter().all(|&m| m <= 1)
+                && self
+                    .input_ids
+                    .iter()
+                    .all(|&id| id < spec.vocab && id != vision.video_token),
+            "invalid image token or modality extent"
+        );
+        let mut cursor = 0;
+        while cursor < self.input_ids.len() {
+            let id = self.input_ids[cursor];
+            if id != vision.start_token {
+                ensure!(
+                    self.modality_ids[cursor] == 0
+                        && id != vision.image_token
+                        && id != vision.end_token,
+                    "image token outside its delimited span"
+                );
+                cursor += 1;
+                continue;
+            }
+            ensure!(
+                self.modality_ids[cursor] == 0,
+                "image start is not a text token"
+            );
+            let grid = *self
+                .grids
+                .get(plan.slots.len())
+                .context("image span has no grid")?;
+            ensure!(
+                grid.t == 1
+                    && grid.h > 0
+                    && grid.w > 0
+                    && grid.h.is_multiple_of(vision.merge)
+                    && grid.w.is_multiple_of(vision.merge)
+                    && grid.h <= vision.position_side
+                    && grid.w <= vision.position_side,
+                "image grid is outside pooling or position bounds"
+            );
+            let patches = usize::try_from(u64::from(grid.h) * u64::from(grid.w))?;
+            let group = (vision.merge * vision.merge) as usize;
+            let features = patches / group;
+            ensure!(
+                features <= axial.soft_tokens as usize,
+                "image exceeds soft-token budget"
+            );
+            let start = cursor + 1;
+            let end = start.checked_add(features).context("image span overflow")?;
+            ensure!(
+                self.input_ids.get(end) == Some(&vision.end_token)
+                    && self.modality_ids.get(end) == Some(&0)
+                    && self.input_ids[start..end]
+                        .iter()
+                        .all(|&token| token == vision.image_token)
+                    && self.modality_ids[start..end].iter().all(|&m| m == 1),
+                "image placeholder count or delimiter mismatch"
+            );
+            let patch_end = plan
+                .patch_rows
+                .checked_add(patches)
+                .context("image patch count overflow")?;
+            let feature_end = plan
+                .feature_rows
+                .checked_add(features)
+                .context("image feature count overflow")?;
+            plan.slots.push(ImageSlot {
+                tokens: start..end,
+                patches: plan.patch_rows..patch_end,
+                features: plan.feature_rows..feature_end,
+                grid,
+            });
+            plan.patch_rows = patch_end;
+            plan.feature_rows = feature_end;
+            cursor = end + 1;
+        }
+        ensure!(
+            plan.slots.len() == self.grids.len() && !plan.slots.is_empty(),
+            "image grid/span count mismatch"
+        );
+        let elements = plan
+            .patch_rows
+            .checked_mul(vision.patch_elements(spec.architecture)?)
+            .context("image pixel extent overflow")?;
+        ensure!(
+            self.pixel_values.len() == elements
+                && self
+                    .pixel_values
+                    .iter()
+                    .all(|&v| v.is_finite() && half::bf16::from_f32(2.0 * (v - 0.5)).is_finite()),
+            "image pixels require finite rescaled [patch,patch_y,patch_x,channel] values"
+        );
+        Ok(plan)
     }
 
     fn validate_loopvl(
