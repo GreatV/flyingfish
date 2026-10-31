@@ -1211,7 +1211,7 @@ fn softcap_tied_head_and_embedding_scale_match_the_definition_gpu() -> Result<()
 }
 
 fn rms_f32(x: &[f32], weight: &[bf16]) -> Vec<bf16> {
-    let mean = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+    let mean = x.iter().map(|v| f64::from(v * v)).sum::<f64>() as f32 / x.len() as f32;
     let inv = 1.0 / (mean + 1e-6).sqrt();
     x.iter()
         .zip(weight)
