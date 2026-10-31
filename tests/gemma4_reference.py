@@ -16,10 +16,32 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+def host_cache_budget():
+    available = next(int(line.split()[1]) * 1024 for line in Path("/proc/meminfo").read_text().splitlines()
+                     if line.startswith("MemAvailable:"))
+    group = next(line[3:] for line in Path("/proc/self/cgroup").read_text().splitlines() if line.startswith("0::"))
+    mount = Path("/sys/fs/cgroup")
+    directory = mount / group.lstrip("/")
+    while True:
+        maximum = (directory / "memory.max").read_text().strip()
+        if maximum != "max":
+            current = int((directory / "memory.current").read_text())
+            stats = dict(line.split() for line in (directory / "memory.stat").read_text().splitlines())
+            non_file = current - int(stats["file"]) + int(stats["shmem"])
+            available = min(available, max(0, int(maximum) - non_file))
+        if directory == mount:
+            break
+        directory = directory.parent
+    return max(0, available - 8 * 1024 ** 3)
+
+
 class PublishedWeights:
-    def __init__(self, directory, model_type):
+    def __init__(self, directory, model_type, cache_budget=0):
         self.entries = {}
         self.consumed = set()
+        self.cache = {}
+        self.cache_budget = cache_budget
+        self.cached_bytes = 0
         renamings = get_checkpoint_conversion_mapping(model_type) or []
         for path in sorted(directory.glob("*.safetensors")):
             with path.open("rb") as source:
@@ -49,15 +71,20 @@ class PublishedWeights:
 
     def read(self, name, dtype, device):
         path, offset, length, shape = self.entries[name]
-        with path.open("rb", buffering=0) as source:
-            source.seek(offset)
-            data = bytearray(length)
-            view = memoryview(data)
-            read = 0
-            while read < length:
-                count = source.readinto(view[read:])
-                require(count, f"short published tensor read {name}")
-                read += count
+        data = self.cache.get(name)
+        if data is None:
+            with path.open("rb", buffering=0) as source:
+                source.seek(offset)
+                data = bytearray(length)
+                view = memoryview(data)
+                read = 0
+                while read < length:
+                    count = source.readinto(view[read:])
+                    require(count, f"short published tensor read {name}")
+                    read += count
+            if ".layers." in name and self.cached_bytes + length <= self.cache_budget:
+                self.cache[name] = data
+                self.cached_bytes += length
         value = torch.frombuffer(data, dtype=torch.bfloat16).reshape(shape).to(device=device, dtype=dtype)
         require(bool(torch.isfinite(value).all()), f"nonfinite published tensor {name}")
         self.consumed.add(name)
@@ -247,7 +274,7 @@ def main():
     config.text_config._attn_implementation = "eager"
     dtype = torch.float32 if args.dtype == "fp32" else torch.bfloat16
     device = torch.device("cuda", 0)
-    weights = PublishedWeights(args.model, raw["model_type"])
+    weights = PublishedWeights(args.model, raw["model_type"], host_cache_budget())
     model, hooks = stream_model(model_class, config, weights, dtype, device)
     window = config.text_config.sliding_window
     if args.ids:
@@ -286,7 +313,8 @@ def main():
               "torch": torch.__version__, "device": torch.cuda.get_device_name(0), "dtype": args.dtype,
               "full_class_load": False, "checkpoint_tensors": len(weights.entries),
               "consumed_text_tensors": len(weights.consumed), "unbound_executed": 0,
-              "unexpected": 0, "newly_initialized_executed": 0, "tied_head": True}
+              "unexpected": 0, "newly_initialized_executed": 0, "tied_head": True,
+              "published_host_cache_bytes": weights.cached_bytes}
     save_file(tensors, str(args.out / "reference.safetensors"))
     (args.out / "NOISE.json").write_text(json.dumps(noise, indent=2) + "\n")
     (args.out / "LOAD.json").write_text(json.dumps(report, indent=2) + "\n")
