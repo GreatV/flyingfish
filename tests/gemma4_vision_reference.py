@@ -348,6 +348,27 @@ def capture_model(args, config):
             if name in semantic_cells and variant == "packed":
                 media_logits.append(logits[0].clone())
             del logits, captured, arguments
+        if audio and args.stage == "model":
+            before = counted[0]
+            media = reference_media(data, "packed", args.device, audio)
+            output = model(input_ids=ids[:, :prompt_length].to(args.device),
+                           mm_token_type_ids=modalities[:, :prompt_length].to(args.device),
+                           **media, use_cache=True, logits_to_keep=1)
+            cache = output.past_key_values
+            decoded_logits = [output.logits[0].float().cpu()]
+            del output
+            for position in range(prompt_length, ids.shape[1]):
+                output = model(input_ids=ids[:, position:position + 1].to(args.device),
+                               past_key_values=cache, use_cache=True, logits_to_keep=1)
+                cache = output.past_key_values
+                decoded_logits.append(output.logits[0].float().cpu())
+                del output
+            logits = torch.cat(decoded_logits)
+            assert logits.shape[0] == rows and torch.isfinite(logits).all()
+            assert counted[0] - before == 1
+            (args.output / f"{name}-decode.safetensors").write_bytes(save(dict(logits=logits.contiguous())))
+            cell["encoder_calls"]["decode"] = 1
+            del logits, decoded_logits, cache, media
         if args.stage == "media":
             before = counted[0]
             image_end = (ids[0] == (config.eoa_token_id if audio else config.eoi_token_id)).nonzero().item() + 1
