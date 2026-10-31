@@ -6,8 +6,9 @@ use crate::{
         blas::Blas,
         contracts::{Scratch, Tensor, TensorMut, dense_layout},
         cubin,
+        flash::{Flash, Query, Score, Shape},
         linear::{LinearBiasMode, LinearWeightRef, disjoint},
-        ops::{CommonOpsRef, GeluMode, grid},
+        ops::{CommonOpsRef, GeluMode, RmsMode, RmsOptions, flat, grid},
         vision::{
             PatchGrid, PatchPacking, VisionAttnBindings, VisionAttnOps, VisionAttnPlan,
             VisionMergerBindings, VisionMergerOps, VisionMergerPlan, VisionSpec,
@@ -275,8 +276,9 @@ impl VisionIo {
         let splice = match width {
             2048 => "vision_splice_2048",
             5120 => "q38_vision_splice",
-            _ => bail!("vision splice has no compiled output width={width}"),
+            _ => "vision_splice_rows",
         };
+        ensure!(width > 0, "vision splice output width is zero");
         let module = cubin::module(&device.ctx, "q38_vision_io")?;
         let wide = cubin::module(&device.ctx, "vision_ops")?;
         Ok(Self {
@@ -480,16 +482,19 @@ impl VisionIo {
         let destination = u32::try_from(range.chunk_rows.start)?;
         let count = u64::from(rows) * u64::from(width);
         unsafe {
-            stream
-                .launch_builder(&self.splice)
+            let mut launch = stream.launch_builder(&self.splice);
+            launch
                 .arg(&features.ptr)
                 .arg(&output.0.ptr)
                 .arg(&features.shape[0])
                 .arg(&output.0.shape[0])
                 .arg(&source)
                 .arg(&destination)
-                .arg(&rows)
-                .launch(grid(count.div_ceil(256).min(65535) as usize, 256))?;
+                .arg(&rows);
+            if !matches!(width, 2048 | 5120) {
+                launch.arg(&width);
+            }
+            launch.launch(grid(count.div_ceil(256).min(65535) as usize, 256))?;
         }
         Ok(())
     }
@@ -1083,7 +1088,83 @@ impl VisionWeights {
     }
 }
 
-pub(super) struct VisionRuntime {
+pub(super) enum VisionRuntime {
+    LayerNorm(Box<LayerNormTower>),
+    Axial(Box<AxialTower>),
+}
+
+pub(super) enum VisionRequest {
+    LayerNorm(Box<LayerNormRequest>),
+    Axial(Box<AxialRequest>),
+}
+
+impl VisionRuntime {
+    pub(super) fn request_bytes(
+        model: &ModelSpec,
+        input: &MultimodalInput<'_>,
+        capacity: usize,
+    ) -> Result<usize> {
+        if model.vision.as_ref().is_some_and(|v| v.axial.is_some()) {
+            AxialTower::request_bytes(model, input, capacity)
+        } else {
+            LayerNormTower::request_bytes(model, input, capacity)
+        }
+    }
+
+    pub(super) fn from_catalog(
+        model: &ModelSpec,
+        catalog: &mut WeightCatalog,
+        device: &Device,
+        common: CommonOpsRef,
+    ) -> Result<Self> {
+        if model.vision.as_ref().is_some_and(|v| v.axial.is_some()) {
+            Ok(Self::Axial(Box::new(AxialTower::from_catalog(
+                model, catalog, device, common,
+            )?)))
+        } else {
+            Ok(Self::LayerNorm(Box::new(LayerNormTower::from_catalog(
+                model, catalog, device, common,
+            )?)))
+        }
+    }
+
+    pub(super) fn prepare(
+        &self,
+        device: &Device,
+        blas: &mut Blas,
+        input: &MultimodalInput<'_>,
+        capacity: usize,
+    ) -> Result<VisionRequest> {
+        match self {
+            Self::LayerNorm(tower) => Ok(VisionRequest::LayerNorm(Box::new(
+                tower.prepare(device, blas, input, capacity)?,
+            ))),
+            Self::Axial(tower) => Ok(VisionRequest::Axial(Box::new(
+                tower.prepare(device, blas, input, capacity)?,
+            ))),
+        }
+    }
+
+    pub(super) fn encode(
+        &self,
+        stream: &Arc<CudaStream>,
+        blas: &Blas,
+        request: VisionRequest,
+        trace: Option<&mut crate::trace::Trace>,
+    ) -> Result<EncodedImages> {
+        match (self, request) {
+            (Self::LayerNorm(tower), VisionRequest::LayerNorm(request)) => {
+                tower.encode(stream, blas, *request, trace)
+            }
+            (Self::Axial(tower), VisionRequest::Axial(request)) => {
+                tower.encode(stream, blas, *request, trace)
+            }
+            _ => bail!("vision request belongs to a different tower"),
+        }
+    }
+}
+
+pub(super) struct LayerNormTower {
     model: ModelSpec,
     geometry: VisionGeometry,
     weights: VisionWeights,
@@ -1108,7 +1189,7 @@ struct BilinearTables {
     values: CudaSlice<f32>,
 }
 
-pub(super) struct VisionRequest {
+pub(super) struct LayerNormRequest {
     prefix: VisionPrefix,
     packing: PatchPacking,
     norm: CudaSlice<bf16>,
@@ -1363,7 +1444,7 @@ struct BlockRun<'a> {
     index: usize,
 }
 
-impl VisionRuntime {
+impl LayerNormTower {
     pub(super) fn request_bytes(
         model: &ModelSpec,
         input: &MultimodalInput<'_>,
@@ -1380,7 +1461,7 @@ impl VisionRuntime {
         blas: &mut Blas,
         input: &MultimodalInput<'_>,
         capacity: usize,
-    ) -> Result<VisionRequest> {
+    ) -> Result<LayerNormRequest> {
         let positions = input.validate(&self.model, capacity)?;
         let packings = VisionPackings::new(&self.geometry, input.grids)?;
         let packing = packings.tower.clone();
@@ -1562,7 +1643,7 @@ impl VisionRuntime {
                 "payload_bytes":bytes,"operator_scratch_bytes":scratch_bytes,"free_bytes":free,"reserve_bytes":total/16
             }})
         );
-        Ok(VisionRequest {
+        Ok(LayerNormRequest {
             prefix,
             packing,
             norm,
@@ -1585,7 +1666,7 @@ impl VisionRuntime {
         &self,
         stream: &Arc<CudaStream>,
         blas: &Blas,
-        mut request: VisionRequest,
+        mut request: LayerNormRequest,
         mut trace: Option<&mut crate::trace::Trace>,
     ) -> Result<EncodedImages> {
         let launched = (|| -> Result<()> {
@@ -1948,7 +2029,7 @@ impl VisionRuntime {
         &self,
         stream: &Arc<CudaStream>,
         blas: &Blas,
-        request: &VisionRequest,
+        request: &LayerNormRequest,
         scratch: Scratch,
     ) -> Result<()> {
         let tower = request.down.as_ref().context("insert stage missing")?;
@@ -2269,6 +2350,746 @@ impl VisionRuntime {
     }
 }
 
+struct ClippedLinear {
+    weight: CudaSlice<bf16>,
+    shape: [u32; 2],
+    bounds: Option<[CudaSlice<bf16>; 4]>,
+}
+
+impl ClippedLinear {
+    fn take(
+        catalog: &mut WeightCatalog,
+        name: &str,
+        shape: [u32; 2],
+        bounds: Option<&str>,
+    ) -> Result<Self> {
+        let weight = take(catalog, name, &[shape[0] as usize, shape[1] as usize])?;
+        let bounds = bounds
+            .map(|prefix| -> Result<_> {
+                Ok([
+                    take(catalog, &format!("{prefix}.input_min"), &[])?,
+                    take(catalog, &format!("{prefix}.input_max"), &[])?,
+                    take(catalog, &format!("{prefix}.output_min"), &[])?,
+                    take(catalog, &format!("{prefix}.output_max"), &[])?,
+                ])
+            })
+            .transpose()?;
+        Ok(Self {
+            weight,
+            shape,
+            bounds,
+        })
+    }
+
+    fn prepare(&self, blas: &Blas, rows: u32) -> Result<()> {
+        blas.prepare_request_fixed(rows, self.shape[0], self.shape[1])
+    }
+
+    fn run(
+        &self,
+        stream: &Arc<CudaStream>,
+        blas: &Blas,
+        clamp: &CudaFunction,
+        input: Tensor<bf16, 2>,
+        scratch: TensorMut<bf16, 2>,
+        output: &mut TensorMut<bf16, 2>,
+    ) -> Result<()> {
+        let x = if let Some(bounds) = &self.bounds {
+            ensure!(
+                input.shape == scratch.0.shape,
+                "clamp scratch extent differs"
+            );
+            disjoint(&input, &scratch.0)?;
+            let count = u64::from(input.shape[0]) * u64::from(input.shape[1]);
+            unsafe {
+                stream
+                    .launch_builder(clamp)
+                    .arg(&input.ptr)
+                    .arg(&scratch.0.ptr)
+                    .arg(&count)
+                    .arg(&bounds[0])
+                    .arg(&bounds[1])
+                    .launch(flat(count as usize))?;
+            }
+            scratch.0
+        } else {
+            input
+        };
+        blas.linear_typed(
+            crate::op_contract::ExecutionPhase::Prefill,
+            LinearWeightRef::Bf16(dense(&self.weight, stream, self.shape)?),
+            x,
+            output,
+        )?;
+        if let Some(bounds) = &self.bounds {
+            let count = u64::from(output.0.shape[0]) * u64::from(output.0.shape[1]);
+            unsafe {
+                stream
+                    .launch_builder(clamp)
+                    .arg(&output.0.ptr)
+                    .arg(&output.0.ptr)
+                    .arg(&count)
+                    .arg(&bounds[2])
+                    .arg(&bounds[3])
+                    .launch(flat(count as usize))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+struct AxialBlock {
+    input_norm: CudaSlice<bf16>,
+    post_attention_norm: CudaSlice<bf16>,
+    pre_ffn_norm: CudaSlice<bf16>,
+    post_ffn_norm: CudaSlice<bf16>,
+    q_norm: CudaSlice<bf16>,
+    k_norm: CudaSlice<bf16>,
+    q: ClippedLinear,
+    k: ClippedLinear,
+    v: ClippedLinear,
+    output: ClippedLinear,
+    gate: ClippedLinear,
+    up: ClippedLinear,
+    down: ClippedLinear,
+}
+
+struct AxialOps {
+    affine: CudaFunction,
+    position: CudaFunction,
+    clamp: CudaFunction,
+    pool: CudaFunction,
+    rope: CudaFunction,
+    branch: CudaFunction,
+    activation: CudaFunction,
+}
+
+pub(super) struct AxialTower {
+    model: ModelSpec,
+    patch: ClippedLinear,
+    position: CudaSlice<bf16>,
+    projection: ClippedLinear,
+    standardization: Option<[CudaSlice<bf16>; 2]>,
+    blocks: Vec<AxialBlock>,
+    ones: CudaSlice<bf16>,
+    common: CommonOpsRef,
+    ops: AxialOps,
+    io: Arc<VisionIo>,
+}
+
+struct AxialImage {
+    grid: ImageGrid,
+    pixels: CudaSlice<f32>,
+    angles: CudaSlice<bf16>,
+    meta: CudaSlice<i32>,
+    pool_meta: CudaSlice<i32>,
+    feature_first: usize,
+}
+
+pub(super) struct AxialRequest {
+    positions: PositionPlan,
+    images: Vec<AxialImage>,
+    patches: CudaSlice<bf16>,
+    hidden: CudaSlice<bf16>,
+    norm: CudaSlice<bf16>,
+    q: CudaSlice<bf16>,
+    k: CudaSlice<bf16>,
+    v: CudaSlice<bf16>,
+    q_norm: CudaSlice<bf16>,
+    k_norm: CudaSlice<bf16>,
+    v_norm: CudaSlice<bf16>,
+    core: CudaSlice<bf16>,
+    delta: CudaSlice<bf16>,
+    gate: CudaSlice<bf16>,
+    up: CudaSlice<bf16>,
+    activation: CudaSlice<bf16>,
+    clipped: CudaSlice<bf16>,
+    pooled: CudaSlice<bf16>,
+    pool_norm: CudaSlice<bf16>,
+    features: CudaSlice<bf16>,
+    attention: Flash,
+}
+
+impl AxialTower {
+    fn from_catalog(
+        model: &ModelSpec,
+        catalog: &mut WeightCatalog,
+        device: &Device,
+        common: CommonOpsRef,
+    ) -> Result<Self> {
+        let vision = model
+            .vision
+            .as_ref()
+            .context("vision configuration missing")?;
+        vision.validate(model.architecture)?;
+        let axial = vision
+            .axial
+            .as_ref()
+            .context("axial configuration missing")?;
+        let h = vision.hidden;
+        let i = vision.intermediate;
+        let d = axial.head_dim;
+        let patch = ClippedLinear::take(
+            catalog,
+            "model.vision_tower.patch_embedder.input_proj.weight",
+            [
+                h,
+                u32::try_from(vision.patch_elements(model.architecture)?)?,
+            ],
+            None,
+        )?;
+        let position = take(
+            catalog,
+            "model.vision_tower.patch_embedder.position_embedding_table",
+            &[2, vision.position_side as usize, h as usize],
+        )?;
+        let projection = ClippedLinear::take(
+            catalog,
+            "model.embed_vision.embedding_projection.weight",
+            [vision.output, h],
+            None,
+        )?;
+        let standardization = if axial.standardize {
+            Some([
+                take(catalog, "model.vision_tower.std_bias", &[h as usize])?,
+                take(catalog, "model.vision_tower.std_scale", &[h as usize])?,
+            ])
+        } else {
+            None
+        };
+        let mut blocks = Vec::with_capacity(vision.depth as usize);
+        for layer in 0..vision.depth {
+            let prefix = format!("model.vision_tower.encoder.layers.{layer}");
+            let mut norm = |name: &str, width: u32| {
+                take(
+                    catalog,
+                    &format!("{prefix}.{name}.weight"),
+                    &[width as usize],
+                )
+            };
+            let input_norm = norm("input_layernorm", h)?;
+            let post_attention_norm = norm("post_attention_layernorm", h)?;
+            let pre_ffn_norm = norm("pre_feedforward_layernorm", h)?;
+            let post_ffn_norm = norm("post_feedforward_layernorm", h)?;
+            let q_norm = norm("self_attn.q_norm", d)?;
+            let k_norm = norm("self_attn.k_norm", d)?;
+            let mut linear = |name: &str, shape: [u32; 2]| {
+                let name = format!("{prefix}.{name}");
+                ClippedLinear::take(
+                    catalog,
+                    &format!("{name}.linear.weight"),
+                    shape,
+                    axial.clipped_linears.then_some(name.as_str()),
+                )
+            };
+            blocks.push(AxialBlock {
+                input_norm,
+                post_attention_norm,
+                pre_ffn_norm,
+                post_ffn_norm,
+                q_norm,
+                k_norm,
+                q: linear("self_attn.q_proj", [h, h])?,
+                k: linear("self_attn.k_proj", [h, h])?,
+                v: linear("self_attn.v_proj", [h, h])?,
+                output: linear("self_attn.o_proj", [h, h])?,
+                gate: linear("mlp.gate_proj", [i, h])?,
+                up: linear("mlp.up_proj", [i, h])?,
+                down: linear("mlp.down_proj", [h, i])?,
+            });
+        }
+        let module = cubin::module(&device.ctx, "vision_ops")?;
+        let ops = AxialOps {
+            affine: module.load_function("vision_affine_cast_bf16")?,
+            position: module.load_function("vision_axis_position_add_bf16")?,
+            clamp: module.load_function("vision_clamp_bf16")?,
+            pool: module.load_function("vision_spatial_mean_scale_bf16")?,
+            rope: cubin::module(&device.ctx, "vision_rope")?
+                .load_function("vision_axial_rope_prepare_bf16")?,
+            branch: cubin::module(&device.ctx, "q38_common")?.load_function("rms_branch_add")?,
+            activation: cubin::module(&device.ctx, "act")?.load_function("silu_mul_split")?,
+        };
+        Ok(Self {
+            model: model.clone(),
+            patch,
+            position,
+            projection,
+            standardization,
+            blocks,
+            ones: device.stream.clone_htod(&vec![bf16::ONE; h as usize])?,
+            common,
+            ops,
+            io: Arc::new(VisionIo::new(device, vision.output)?),
+        })
+    }
+
+    fn request_bytes(
+        model: &ModelSpec,
+        input: &MultimodalInput<'_>,
+        capacity: usize,
+    ) -> Result<usize> {
+        let plan = input.validate(model, capacity)?;
+        let vision = model
+            .vision
+            .as_ref()
+            .context("vision configuration missing")?;
+        let axial = vision
+            .axial
+            .as_ref()
+            .context("axial configuration missing")?;
+        let max_rows = input
+            .grids
+            .iter()
+            .map(|g| u128::from(g.h) * u128::from(g.w))
+            .max()
+            .context("empty image request")?;
+        let patch = vision.patch_elements(model.architecture)? as u128;
+        let h = u128::from(vision.hidden);
+        let i = u128::from(vision.intermediate);
+        let soft = max_rows / u128::from(vision.merge).pow(2);
+        let workspace = 2 * max_rows * (patch + 10 * h + 3 * i + i.max(h).max(patch))
+            + 4 * soft * h
+            + 4 * max_rows * u128::from(vision.heads);
+        let inputs = plan.patch_rows() as u128 * (4 * patch + 2 * u128::from(axial.head_dim))
+            + plan.slots().len() as u128 * 64;
+        let features = 2 * plan.feature_rows() as u128 * u128::from(vision.output);
+        usize::try_from(
+            workspace
+                .checked_add(inputs)
+                .and_then(|n| n.checked_add(features))
+                .context("axial workspace overflow")?,
+        )
+        .context("axial workspace exceeds host indexing")
+    }
+
+    fn prepare(
+        &self,
+        device: &Device,
+        blas: &mut Blas,
+        input: &MultimodalInput<'_>,
+        capacity: usize,
+    ) -> Result<AxialRequest> {
+        let positions = input.validate(&self.model, capacity)?;
+        let vision = self
+            .model
+            .vision
+            .as_ref()
+            .context("vision configuration missing")?;
+        let axial = vision
+            .axial
+            .as_ref()
+            .context("axial configuration missing")?;
+        let bytes = Self::request_bytes(&self.model, input, capacity)?;
+        let (free, total) = device.ctx.mem_get_info()?;
+        ensure!(
+            free.checked_sub(total / 16).is_some_and(|n| bytes <= n),
+            "axial vision workspace exceeds memory budget: required={bytes} free={free}"
+        );
+        let rows = positions
+            .slots()
+            .iter()
+            .map(|s| s.patches.len())
+            .max()
+            .context("empty image request")?;
+        let h = vision.hidden as usize;
+        let i = vision.intermediate as usize;
+        let patch = self.patch.shape[1] as usize;
+        let soft = rows / (vision.merge * vision.merge) as usize;
+        let s = &device.stream;
+        let attention = Flash::new_with_score(
+            s.clone(),
+            rows,
+            vision.heads as usize,
+            vision.heads as usize,
+            axial.head_dim as usize,
+            Score {
+                scale: 1.0,
+                window_left: None,
+            },
+            rows,
+        )?;
+        let frequencies = (0..axial.head_dim / 4)
+            .map(|j| {
+                1.0 / axial
+                    .rope_theta
+                    .powf(j as f32 / (axial.head_dim / 4) as f32)
+            })
+            .collect::<Vec<_>>();
+        let mut images = Vec::with_capacity(input.grids.len());
+        for slot in positions.slots() {
+            let n = u32::try_from(slot.patches.len())?;
+            let pooled = u32::try_from(slot.features.len())?;
+            self.patch.prepare(blas, n)?;
+            self.projection.prepare(blas, pooled)?;
+            for block in &self.blocks {
+                for projection in [
+                    &block.q,
+                    &block.k,
+                    &block.v,
+                    &block.output,
+                    &block.gate,
+                    &block.up,
+                    &block.down,
+                ] {
+                    projection.prepare(blas, n)?;
+                }
+            }
+            let mut angles = Vec::with_capacity(n as usize * axial.head_dim as usize);
+            for y in 0..slot.grid.h {
+                for x in 0..slot.grid.w {
+                    for position in [x, y] {
+                        for frequency in &frequencies {
+                            let angle = position as f32 * frequency;
+                            angles.push(bf16::from_f32(angle.cos()));
+                            angles.push(bf16::from_f32(angle.sin()));
+                        }
+                    }
+                }
+            }
+            images.push(AxialImage {
+                grid: slot.grid,
+                pixels: s.clone_htod(
+                    &input.pixel_values[slot.patches.start * patch..slot.patches.end * patch],
+                )?,
+                angles: s.clone_htod(&angles)?,
+                meta: s.clone_htod(&[0, n as i32, n as i32, n as i32, 0, 0, 0, 0])?,
+                pool_meta: s.clone_htod(&[
+                    0,
+                    pooled as i32,
+                    pooled as i32,
+                    pooled as i32,
+                    0,
+                    0,
+                    0,
+                    0,
+                ])?,
+                feature_first: slot.features.start,
+            });
+        }
+        let features = s.alloc_zeros(positions.feature_rows() * vision.output as usize)?;
+        Ok(AxialRequest {
+            positions,
+            images,
+            patches: s.alloc_zeros(rows * patch)?,
+            hidden: s.alloc_zeros(rows * h)?,
+            norm: s.alloc_zeros(rows * h)?,
+            q: s.alloc_zeros(rows * h)?,
+            k: s.alloc_zeros(rows * h)?,
+            v: s.alloc_zeros(rows * h)?,
+            q_norm: s.alloc_zeros(rows * h)?,
+            k_norm: s.alloc_zeros(rows * h)?,
+            v_norm: s.alloc_zeros(rows * h)?,
+            core: s.alloc_zeros(rows * h)?,
+            delta: s.alloc_zeros(rows * h)?,
+            gate: s.alloc_zeros(rows * i)?,
+            up: s.alloc_zeros(rows * i)?,
+            activation: s.alloc_zeros(rows * i)?,
+            clipped: s.alloc_zeros(rows * i.max(h).max(patch))?,
+            pooled: s.alloc_zeros(soft * h)?,
+            pool_norm: s.alloc_zeros(soft * h)?,
+            features,
+            attention,
+        })
+    }
+
+    fn norm(
+        &self,
+        stream: &Arc<CudaStream>,
+        domain: crate::backend::cuda::contracts::RowDomain,
+        input: Tensor<bf16, 3>,
+        weight: &CudaSlice<bf16>,
+        output: Tensor<bf16, 3>,
+        eps: f32,
+    ) -> Result<()> {
+        self.common.norm.rms_with(
+            stream,
+            domain,
+            input,
+            dense_at(weight, stream, [input.shape[2]], 0)?,
+            &mut TensorMut(output),
+            RmsOptions {
+                mode: RmsMode::Unrounded,
+                eps,
+            },
+        )
+    }
+
+    fn encode(
+        &self,
+        stream: &Arc<CudaStream>,
+        blas: &Blas,
+        mut request: AxialRequest,
+        mut trace: Option<&mut crate::trace::Trace>,
+    ) -> Result<EncodedImages> {
+        use crate::backend::cuda::contracts::{RowDomain, SeqRef};
+        let vision = self
+            .model
+            .vision
+            .as_ref()
+            .context("vision configuration missing")?;
+        let axial = vision
+            .axial
+            .as_ref()
+            .context("axial configuration missing")?;
+        let h = vision.hidden;
+        let d = axial.head_dim;
+        let heads = vision.heads;
+        let run = (|| -> Result<()> {
+            for (image_index, image) in request.images.iter().enumerate() {
+                let rows = image.grid.h * image.grid.w;
+                let soft = rows / (vision.merge * vision.merge);
+                let domain = RowDomain {
+                    meta: SeqRef {
+                        ptr: image.meta.device_ptr(stream).0,
+                    },
+                    row_base: 0,
+                    row_capacity: rows,
+                };
+                let linear =
+                    |weight: &ClippedLinear, input: &CudaSlice<bf16>, output: &CudaSlice<bf16>| {
+                        weight.run(
+                            stream,
+                            blas,
+                            &self.ops.clamp,
+                            stage_view(input, stream, [rows, weight.shape[1]])?,
+                            TensorMut(stage_view(
+                                &request.clipped,
+                                stream,
+                                [rows, weight.shape[1]],
+                            )?),
+                            &mut TensorMut(stage_view(output, stream, [rows, weight.shape[0]])?),
+                        )
+                    };
+                let count = u64::from(rows) * u64::from(self.patch.shape[1]);
+                unsafe {
+                    stream
+                        .launch_builder(&self.ops.affine)
+                        .arg(&image.pixels)
+                        .arg(&request.patches)
+                        .arg(&count)
+                        .arg(&-0.5f32)
+                        .arg(&2.0f32)
+                        .launch(flat(count as usize))?;
+                }
+                linear(&self.patch, &request.patches, &request.delta)?;
+                record(
+                    &mut trace,
+                    stream,
+                    &format!("image.{image_index}.patch"),
+                    &request.delta,
+                    h,
+                    rows,
+                )?;
+                unsafe {
+                    stream
+                        .launch_builder(&self.ops.position)
+                        .arg(&request.delta)
+                        .arg(&self.position)
+                        .arg(&request.hidden)
+                        .arg(&image.grid.h)
+                        .arg(&image.grid.w)
+                        .arg(&h)
+                        .arg(&vision.position_side)
+                        .launch(flat(rows as usize * h as usize))?;
+                }
+                record(
+                    &mut trace,
+                    stream,
+                    &format!("image.{image_index}.position"),
+                    &request.hidden,
+                    h,
+                    rows,
+                )?;
+                self.norm(
+                    stream,
+                    domain,
+                    stage_view(&request.hidden, stream, [rows, 1, h])?,
+                    &self.blocks[0].input_norm,
+                    stage_view(&request.norm, stream, [rows, 1, h])?,
+                    axial.rms_eps,
+                )?;
+                for (layer, block) in self.blocks.iter().enumerate() {
+                    linear(&block.q, &request.norm, &request.q)?;
+                    linear(&block.k, &request.norm, &request.k)?;
+                    linear(&block.v, &request.norm, &request.v)?;
+                    for (input, weight, output) in [
+                        (&request.q, &block.q_norm, &request.q_norm),
+                        (&request.k, &block.k_norm, &request.k_norm),
+                        (&request.v, &self.ones, &request.v_norm),
+                    ] {
+                        self.norm(
+                            stream,
+                            domain,
+                            stage_view(input, stream, [rows, heads, d])?,
+                            weight,
+                            stage_view(output, stream, [rows, heads, d])?,
+                            axial.rms_eps,
+                        )?;
+                    }
+                    unsafe {
+                        stream
+                            .launch_builder(&self.ops.rope)
+                            .arg(&request.q_norm)
+                            .arg(&request.k_norm)
+                            .arg(&request.v_norm)
+                            .arg(&image.angles)
+                            .arg(&request.q)
+                            .arg(&request.k)
+                            .arg(&request.v)
+                            .arg(&rows)
+                            .arg(&heads)
+                            .arg(&d)
+                            .launch(flat(rows as usize * h as usize))?;
+                    }
+                    request.attention.run_masked(Query {
+                        q: &request.q,
+                        q_row_stride: h as usize,
+                        k: &request.k,
+                        v: &request.v,
+                        out: &mut request.core,
+                        shape: Shape {
+                            rows: rows as usize,
+                            start: 0,
+                            capacity: rows as usize,
+                            q_heads: heads as usize,
+                            kv_heads: heads as usize,
+                            head_dim: d as usize,
+                            causal: false,
+                            window_left: None,
+                        },
+                        keys: rows as usize,
+                        prefix: None,
+                    })?;
+                    linear(&block.output, &request.core, &request.delta)?;
+                    unsafe {
+                        stream
+                            .launch_builder(&self.ops.branch)
+                            .arg(&request.hidden)
+                            .arg(&request.delta)
+                            .arg(&block.post_attention_norm)
+                            .arg(&0u64)
+                            .arg(&block.pre_ffn_norm)
+                            .arg(&request.norm)
+                            .arg(&h)
+                            .arg(&axial.rms_eps)
+                            .launch(grid(rows as usize, 256))?;
+                    }
+                    linear(&block.gate, &request.norm, &request.gate)?;
+                    linear(&block.up, &request.norm, &request.up)?;
+                    unsafe {
+                        let count =
+                            i32::try_from(u64::from(rows) * u64::from(vision.intermediate))?;
+                        stream
+                            .launch_builder(&self.ops.activation)
+                            .arg(&request.gate)
+                            .arg(&request.up)
+                            .arg(&request.activation)
+                            .arg(&count)
+                            .arg(&2i32)
+                            .launch(flat(count as usize))?;
+                    }
+                    linear(&block.down, &request.activation, &request.delta)?;
+                    let next = self
+                        .blocks
+                        .get(layer + 1)
+                        .map_or(0, |b| b.input_norm.device_ptr(stream).0);
+                    unsafe {
+                        stream
+                            .launch_builder(&self.ops.branch)
+                            .arg(&request.hidden)
+                            .arg(&request.delta)
+                            .arg(&block.post_ffn_norm)
+                            .arg(&0u64)
+                            .arg(&next)
+                            .arg(&request.norm)
+                            .arg(&h)
+                            .arg(&axial.rms_eps)
+                            .launch(grid(rows as usize, 256))?;
+                    }
+                    record(
+                        &mut trace,
+                        stream,
+                        &format!("image.{image_index}.layer.{layer}"),
+                        &request.hidden,
+                        h,
+                        rows,
+                    )?;
+                }
+                let (bias, scale) = self.standardization.as_ref().map_or((0, 0), |values| {
+                    (
+                        values[0].device_ptr(stream).0,
+                        values[1].device_ptr(stream).0,
+                    )
+                });
+                let multiplier = f64::from(h).sqrt() as f32;
+                unsafe {
+                    stream
+                        .launch_builder(&self.ops.pool)
+                        .arg(&request.hidden)
+                        .arg(&request.pooled)
+                        .arg(&bias)
+                        .arg(&scale)
+                        .arg(&image.grid.h)
+                        .arg(&image.grid.w)
+                        .arg(&h)
+                        .arg(&vision.merge)
+                        .arg(&multiplier)
+                        .launch(flat(soft as usize * h as usize))?;
+                }
+                record(
+                    &mut trace,
+                    stream,
+                    &format!("image.{image_index}.pool"),
+                    &request.pooled,
+                    h,
+                    soft,
+                )?;
+                let domain = RowDomain {
+                    meta: SeqRef {
+                        ptr: image.pool_meta.device_ptr(stream).0,
+                    },
+                    row_base: 0,
+                    row_capacity: soft,
+                };
+                self.norm(
+                    stream,
+                    domain,
+                    stage_view(&request.pooled, stream, [soft, 1, h])?,
+                    &self.ones,
+                    stage_view(&request.pool_norm, stream, [soft, 1, h])?,
+                    axial.rms_eps,
+                )?;
+                self.projection.run(
+                    stream,
+                    blas,
+                    &self.ops.clamp,
+                    stage_view(&request.pool_norm, stream, [soft, h])?,
+                    TensorMut(stage_view(&request.clipped, stream, [soft, h])?),
+                    &mut TensorMut(dense_at(
+                        &request.features,
+                        stream,
+                        [soft, vision.output],
+                        image.feature_first * vision.output as usize,
+                    )?),
+                )?;
+            }
+            record(
+                &mut trace,
+                stream,
+                "image_features",
+                &request.features,
+                vision.output,
+                u32::try_from(request.positions.feature_rows())?,
+            )?;
+            Ok(())
+        })();
+        let synchronized = stream.synchronize();
+        run?;
+        synchronized?;
+        EncodedImages::new(request.positions, request.features, self.io.clone())
+    }
+}
+
 /// Owns merger output until all prompt chunks have consumed their image rows.
 pub(super) struct EncodedImages {
     positions: PositionPlan,
@@ -2384,6 +3205,43 @@ mod tests {
             + scratch;
         assert_eq!(bytes, expected);
         assert!(scratch >= VisionMergerOps::workspace(&VisionSpec::q38(), 12)?.bytes as usize);
+        let root =
+            serde_json::from_str(include_str!("../../../tests/data/gemma4-e2b-config.json"))?;
+        let model = ModelSpec::gemma4(&root, &serde_json::json!({"eos_token_id":1}))?;
+        let vision = model
+            .vision
+            .as_ref()
+            .context("vision configuration missing")?;
+        let ids = [
+            vec![vision.start_token],
+            vec![vision.image_token; 280],
+            vec![vision.end_token],
+        ]
+        .concat()
+        .repeat(2);
+        let modalities = [vec![0], vec![1; 280], vec![0]].concat().repeat(2);
+        let pixels = vec![0.25; 2 * 2520 * 768];
+        let grids = [ImageGrid { t: 1, h: 42, w: 60 }; 2];
+        let input = MultimodalInput {
+            input_ids: &ids,
+            modality_ids: &modalities,
+            pixel_values: &pixels,
+            grids: &grids,
+        };
+        let single = MultimodalInput {
+            input_ids: &ids[..282],
+            modality_ids: &modalities[..282],
+            pixel_values: &pixels[..2520 * 768],
+            grids: &grids[..1],
+        };
+        let single_bytes = VisionRuntime::request_bytes(&model, &single, 1024)?;
+        let pair_bytes = VisionRuntime::request_bytes(&model, &input, 1024)?;
+        assert_eq!(
+            pair_bytes - single_bytes,
+            2520 * (4 * 768 + 2 * 64) + 280 * 1536 * 2 + 64
+        );
+        assert!(single_bytes >= 2520 * 768 * 4 + 280 * 1536 * 2 + 2520 * 768 * 2);
+        assert!(VisionRuntime::request_bytes(&model, &input, 512).is_err());
         Ok(())
     }
 
@@ -2671,7 +3529,7 @@ mod tests {
         ids.extend([248054, 200]);
         let mut modalities = vec![0; 10];
         modalities[2..8].fill(1);
-        for width in [2048, OUTPUT] {
+        for width in [1536, 2048, 2560, OUTPUT] {
             let io = Arc::new(VisionIo::new(&device, width)?);
             let plan = MultimodalInput {
                 input_ids: &ids,
@@ -2872,7 +3730,7 @@ mod tests {
             catalog.bytes == 1_105_972_064,
             "vision-only weight ledger mismatch"
         );
-        let runtime = VisionRuntime::from_catalog(&model, &mut catalog, &device, common)?;
+        let runtime = LayerNormTower::from_catalog(&model, &mut catalog, &device, common)?;
         ensure!(
             catalog.tensors.is_empty(),
             "vision binding left unloaded owners"
@@ -4080,7 +4938,7 @@ mod tests {
             catalog.bytes == 921_460_192,
             "vision-only weight ledger mismatch"
         );
-        let runtime = VisionRuntime::from_catalog(&model, &mut catalog, &device, common)?;
+        let runtime = LayerNormTower::from_catalog(&model, &mut catalog, &device, common)?;
         ensure!(
             catalog.tensors.is_empty(),
             "vision binding left unloaded owners"

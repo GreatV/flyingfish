@@ -2014,6 +2014,26 @@ impl Engine {
     }
 
     #[cfg(test)]
+    pub(crate) fn gemma_vision_trace(
+        &mut self,
+        input: &crate::vision_input::MultimodalInput<'_>,
+        identities: &[u32],
+        trace: &mut crate::trace::Trace,
+    ) -> Result<()> {
+        self.prepare_multimodal(input, Some(trace))?;
+        self.gemma_prefill_trace(identities, trace)?;
+        ensure!(
+            self.qwen
+                .as_ref()
+                .context("Gemma runtime missing")?
+                .vision_encode_calls
+                == 1,
+            "image encoder call count differs from one"
+        );
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn gemma_decode_trace(
         &mut self,
         token: u32,

@@ -218,6 +218,429 @@ fn reference_bf16<'a>(fixture: &'a ReferenceFixture, name: &str) -> Result<&'a [
         .with_context(|| format!("reference tensor {name} is not BF16"))
 }
 
+struct VisionFixture<'a> {
+    device: &'a Device,
+    values: ReferenceFixture,
+    height: u32,
+    width: u32,
+    defects: usize,
+}
+
+impl VisionFixture<'_> {
+    fn upload(&self, name: &str) -> Result<crate::backend::gpu::CudaSlice<bf16>> {
+        Ok(self
+            .device
+            .stream
+            .clone_htod(reference_bf16(&self.values, name)?)?)
+    }
+
+    fn compare(
+        &mut self,
+        name: &str,
+        output: &crate::backend::gpu::CudaSlice<bf16>,
+        control: bool,
+    ) -> Result<()> {
+        let actual = self.device.stream.clone_dtoh(output)?;
+        let expected = reference_bf16(&self.values, name)?;
+        ensure!(
+            actual.len() == expected.len() && actual.iter().all(|v| v.is_finite()),
+            "RUNNER_FAIL vision output shape or finiteness: {name}"
+        );
+        let differences = actual
+            .iter()
+            .zip(expected)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let pass = if control {
+            differences > 0
+        } else {
+            differences == 0
+        };
+        self.defects += usize::from(!pass);
+        println!(
+            "{} vision_op {name} grid={}x{} control={control} bit_mismatches={differences}",
+            if pass { "PASS" } else { "DEFECT" },
+            self.height,
+            self.width
+        );
+        Ok(())
+    }
+
+    fn pointwise(&mut self) -> Result<()> {
+        let s = &self.device.stream;
+        let module = cubin::module(&self.device.ctx, "vision_ops")?;
+        let cast = module.load_function("vision_affine_cast_bf16")?;
+        let clamp = module.load_function("vision_clamp_bf16")?;
+        let position = module.load_function("vision_axis_position_add_bf16")?;
+        let pixels = s.clone_htod(&reference(&self.values, "pixels")?.as_f32())?;
+        let scaled = self.upload("scaled")?;
+        let table = self.upload("table")?;
+        let mut wrong_table = reference_bf16(&self.values, "table")?.to_vec();
+        let half = wrong_table.len() / 2;
+        wrong_table.rotate_left(half);
+        let wrong_table = s.clone_htod(&wrong_table)?;
+        let hidden = u32::try_from(self.values["scaled"].0[1])?;
+        let positions = u32::try_from(self.values["table"].0[1])?;
+        let count = u64::from(self.height) * u64::from(self.width) * u64::from(hidden);
+        ensure!(
+            pixels.len() == count as usize
+                && scaled.len() == pixels.len()
+                && table.len() == 2 * positions as usize * hidden as usize,
+            "RUNNER_FAIL pointwise fixture extents"
+        );
+        let mut output = s.alloc_zeros::<bf16>(count as usize)?;
+        for control in [false, true] {
+            let (shift, scale) = if control {
+                (0.0f32, 1.0f32)
+            } else {
+                (-0.5, 2.0)
+            };
+            unsafe {
+                s.launch_builder(&cast)
+                    .arg(&pixels)
+                    .arg(&mut output)
+                    .arg(&count)
+                    .arg(&shift)
+                    .arg(&scale)
+                    .launch(flat(count as usize))?;
+            }
+            self.compare("scaled", &output, control)?;
+            let lower = if control {
+                s.clone_htod(&[bf16::from_f32(-2.0)])?
+            } else {
+                self.upload("lower")?
+            };
+            let upper = if control {
+                s.clone_htod(&[bf16::from_f32(2.0)])?
+            } else {
+                self.upload("upper")?
+            };
+            unsafe {
+                s.launch_builder(&clamp)
+                    .arg(&scaled)
+                    .arg(&mut output)
+                    .arg(&count)
+                    .arg(&lower)
+                    .arg(&upper)
+                    .launch(flat(count as usize))?;
+            }
+            self.compare("clamped", &output, control)?;
+            unsafe {
+                s.launch_builder(&position)
+                    .arg(&scaled)
+                    .arg(if control { &wrong_table } else { &table })
+                    .arg(&mut output)
+                    .arg(&self.height)
+                    .arg(&self.width)
+                    .arg(&hidden)
+                    .arg(&positions)
+                    .launch(flat(count as usize))?;
+            }
+            self.compare("positioned", &output, control)?;
+        }
+        Ok(())
+    }
+
+    fn pool(&mut self) -> Result<()> {
+        let s = &self.device.stream;
+        let module = cubin::module(&self.device.ctx, "vision_ops")?;
+        let pool = module.load_function("vision_spatial_mean_scale_bf16")?;
+        let input = self.upload("pool_input")?;
+        let bias = self.upload("bias")?;
+        let multiplier = self.upload("multiplier")?;
+        let hidden = u32::try_from(self.values["pool_input"].0[1])?;
+        let count = u64::from(self.height) * u64::from(self.width) * u64::from(hidden) / 9;
+        let mut output = s.alloc_zeros::<bf16>(count as usize)?;
+        ensure!(
+            input.len() == 9 * count as usize
+                && bias.len() == hidden as usize
+                && multiplier.len() == bias.len(),
+            "RUNNER_FAIL pooling fixture extents"
+        );
+        let scale = f64::from(hidden).sqrt() as f32;
+        let original = reference_bf16(&self.values, "pool_input")?;
+        let mut transposed = vec![bf16::ZERO; original.len()];
+        for y in 0..self.height as usize {
+            for x in 0..self.width as usize {
+                let source = (y * self.width as usize + x) * hidden as usize;
+                let target = (x * self.height as usize + y) * hidden as usize;
+                transposed[target..target + hidden as usize]
+                    .copy_from_slice(&original[source..source + hidden as usize]);
+            }
+        }
+        let transposed = s.clone_htod(&transposed)?;
+        for control in [false, true] {
+            let (h, w) = if control {
+                (self.width, self.height)
+            } else {
+                (self.height, self.width)
+            };
+            let input = if control { &transposed } else { &input };
+            unsafe {
+                s.launch_builder(&pool)
+                    .arg(input)
+                    .arg(&mut output)
+                    .arg(&0u64)
+                    .arg(&0u64)
+                    .arg(&h)
+                    .arg(&w)
+                    .arg(&hidden)
+                    .arg(&3u32)
+                    .arg(&scale)
+                    .launch(flat(count as usize))?;
+            }
+            self.compare("pooled", &output, control)?;
+            unsafe {
+                s.launch_builder(&pool)
+                    .arg(input)
+                    .arg(&mut output)
+                    .arg(&bias)
+                    .arg(&multiplier)
+                    .arg(&h)
+                    .arg(&w)
+                    .arg(&hidden)
+                    .arg(&3u32)
+                    .arg(&scale)
+                    .launch(flat(count as usize))?;
+            }
+            self.compare("standardized", &output, control)?;
+        }
+        Ok(())
+    }
+
+    fn rope(&mut self) -> Result<()> {
+        let s = &self.device.stream;
+        let module = cubin::module(&self.device.ctx, "vision_rope")?;
+        let rope = module.load_function("vision_axial_rope_prepare_bf16")?;
+        let q = self.upload("q")?;
+        let k = self.upload("k")?;
+        let v = self.upload("v")?;
+        let rows = self.height * self.width;
+        let heads = u32::try_from(self.values["q"].0[1])?;
+        let dim = u32::try_from(self.values["q"].0[2])?;
+        let mut q_out = s.alloc_zeros::<bf16>(q.len())?;
+        let mut k_out = s.alloc_zeros::<bf16>(k.len())?;
+        let mut v_out = s.alloc_zeros::<bf16>(v.len())?;
+        ensure!(
+            q.len() == rows as usize * heads as usize * dim as usize
+                && q.len() == k.len()
+                && q.len() == v.len(),
+            "RUNNER_FAIL rotary fixture extents"
+        );
+        for control in [false, true] {
+            let mut table = reference_bf16(&self.values, "angles")?.to_vec();
+            ensure!(
+                table.len() == rows as usize * dim as usize,
+                "RUNNER_FAIL rotary table extent"
+            );
+            if control {
+                for row in table.chunks_exact_mut(dim as usize) {
+                    row.rotate_left(dim as usize / 2);
+                }
+            }
+            let table = s.clone_htod(&table)?;
+            unsafe {
+                s.launch_builder(&rope)
+                    .arg(&q)
+                    .arg(&k)
+                    .arg(&v)
+                    .arg(&table)
+                    .arg(&mut q_out)
+                    .arg(&mut k_out)
+                    .arg(&mut v_out)
+                    .arg(&rows)
+                    .arg(&heads)
+                    .arg(&dim)
+                    .launch(flat(q.len()))?;
+            }
+            self.compare("rotated_q", &q_out, control)?;
+            self.compare("rotated_k", &k_out, control)?;
+            self.compare("transposed_v", &v_out, false)?;
+        }
+        Ok(())
+    }
+}
+
+#[test]
+#[ignore = "requires a GPU and frozen FF_GEMMA4_FIXTURES vision operator references"]
+fn axial_vision_pointwise_pool_rope_gpu() -> Result<()> {
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("FF_GEMMA4_FIXTURES").context("FF_GEMMA4_FIXTURES missing")?,
+    );
+    let frozen: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("VISION_FROZEN.json"))?)?;
+    ensure!(
+        frozen["status"] == "FROZEN"
+            && frozen["max_bit_mismatches"] == 0
+            && frozen["reference_devices"] == serde_json::json!(["cpu", "sm89", "sm86"]),
+        "RUNNER_FAIL vision operator reference freeze missing"
+    );
+    let device = Device::new(0)?;
+    let mut defects = 0;
+    for (height, width) in [(9, 15), (48, 48), (42, 60)] {
+        let name = format!("vision-ops-{height}x{width}");
+        ensure!(
+            frozen["cells"][&name]["cross_device_mismatches"] == 0,
+            "RUNNER_FAIL vision reference cross-device noise differs"
+        );
+        let mut cell = VisionFixture {
+            device: &device,
+            values: load_reference(&directory.join(format!("{name}.safetensors")))?,
+            height,
+            width,
+            defects: 0,
+        };
+        cell.pointwise()?;
+        cell.pool()?;
+        cell.rope()?;
+        defects += cell.defects;
+    }
+    println!(
+        "{} axial_vision_pointwise_pool_rope_gpu cells=3 defects={defects}",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(defects == 0, "DEFECT axial vision operations");
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires a GPU and frozen FF_GEMMA4_FIXTURES attention references"]
+fn vision_bidirectional_attention_gpu() -> Result<()> {
+    use super::flash::{Flash, Query, Score, Shape};
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("FF_GEMMA4_FIXTURES").context("FF_GEMMA4_FIXTURES missing")?,
+    );
+    let limits: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("D64_FROZEN.json"))?)?;
+    ensure!(
+        limits["status"] == "FROZEN"
+            && limits["reference_devices"] == serde_json::json!(["sm89", "sm86"]),
+        "RUNNER_FAIL attention reference freeze missing"
+    );
+    let device = Device::new(0)?;
+    // SAFETY: all allocations, copies and launches use this test's single stream.
+    unsafe {
+        device.ctx.disable_event_tracking();
+    }
+    let stream = &device.stream;
+    let mut defects = 0;
+    for rows in [1usize, 63, 64, 65, 135, 2304, 2520] {
+        let name = format!("vision-attention-{rows}");
+        let fixture = load_reference(&directory.join(format!("{name}.safetensors")))?;
+        let bound = &limits["cells"][&name];
+        let max_limit = bound["output_max"].as_f64().context("max limit")?;
+        let rmse_limit = bound["output_rmse"].as_f64().context("RMSE limit")?;
+        ensure!(
+            max_limit.is_finite() && max_limit > 0.0 && rmse_limit.is_finite() && rmse_limit > 0.0,
+            "RUNNER_FAIL attention limits"
+        );
+        let q = stream.clone_htod(reference_bf16(&fixture, "q")?)?;
+        let k = stream.clone_htod(reference_bf16(&fixture, "k")?)?;
+        let v = stream.clone_htod(reference_bf16(&fixture, "v")?)?;
+        let heads = fixture["k"].0[0];
+        let capacity = fixture["k"].0[1];
+        let pitch = fixture["q"].0[1];
+        let keys = usize::try_from(bound["keys"].as_u64().context("key extent")?)?;
+        let expected = reference(&fixture, "oracle")?.as_f32();
+        let count = rows * heads * 64;
+        ensure!(
+            fixture["q"].0 == [rows, pitch]
+                && fixture["k"].0 == [heads, capacity, 64]
+                && fixture["v"].0 == fixture["k"].0
+                && fixture["oracle"].0 == [rows, heads, 64]
+                && expected.len() == count
+                && expected.iter().all(|v| v.is_finite()),
+            "RUNNER_FAIL attention fixture extents/finiteness"
+        );
+        let mut out = stream.clone_htod(&vec![bf16::from_bits(0x7fc1); count + 32])?;
+        let run = |op: &mut Flash, out: &mut crate::backend::gpu::CudaSlice<bf16>| {
+            op.run_masked(Query {
+                q: &q,
+                q_row_stride: pitch,
+                k: &k,
+                v: &v,
+                out,
+                shape: Shape {
+                    rows,
+                    start: 0,
+                    capacity,
+                    q_heads: heads,
+                    kv_heads: heads,
+                    head_dim: 64,
+                    causal: false,
+                    window_left: None,
+                },
+                keys,
+                prefix: None,
+            })
+        };
+        for control in [false, true] {
+            let mut op = Flash::new_with_score(
+                stream.clone(),
+                rows,
+                heads,
+                heads,
+                64,
+                Score {
+                    scale: if control { 0.125 } else { 1.0 },
+                    window_left: None,
+                },
+                capacity,
+            )?;
+            run(&mut op, &mut out)?;
+            let actual = stream.clone_dtoh(&out)?;
+            ensure!(
+                actual[..count].iter().all(|v| v.is_finite()),
+                "RUNNER_FAIL attention nonfinite"
+            );
+            let mut maximum = 0.0f64;
+            let mut squared = 0.0;
+            for (actual, expected) in actual[..count].iter().zip(&expected) {
+                let error = actual.to_f64() - f64::from(*expected);
+                maximum = maximum.max(error.abs());
+                squared += error * error;
+            }
+            let rmse = (squared / count as f64).sqrt();
+            let within = maximum <= max_limit && rmse <= rmse_limit;
+            let guard = actual[count..].iter().all(|v| v.to_bits() == 0x7fc1);
+            let pass = within != control && guard;
+            defects += usize::from(!pass);
+            println!(
+                "{} vision_attention rows={rows} control={control} max={maximum:e} rmse={rmse:e} limits={max_limit:e}/{rmse_limit:e} guard={guard}",
+                if pass { "PASS" } else { "DEFECT" }
+            );
+            if !control {
+                stream.begin_capture(
+                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                )?;
+                run(&mut op, &mut out)?;
+                let graph = stream
+                    .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
+                    .context("attention graph missing")?;
+                graph.launch()?;
+                let captured = stream.clone_dtoh(&out)?;
+                let bits = captured
+                    .iter()
+                    .zip(&actual)
+                    .filter(|(a, b)| a.to_bits() != b.to_bits())
+                    .count();
+                defects += usize::from(bits != 0);
+                println!(
+                    "{} vision_attention rows={rows} graph_eager_bits={bits}",
+                    if bits == 0 { "PASS" } else { "DEFECT" }
+                );
+            }
+        }
+    }
+    println!(
+        "{} vision_bidirectional_attention_gpu cells=7 defects={defects}",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(defects == 0, "DEFECT vision bidirectional attention");
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires a GPU and FF_GEMMA4_FIXTURES"]
 fn gelu_tanh_gated_activation_matches_the_definition_gpu() -> Result<()> {
@@ -2068,6 +2491,280 @@ fn native_path(
         out.extend(engine.decode_logits()?.into_iter().map(bf16::from_f32));
     }
     Ok(out)
+}
+
+fn vision_distance(actual: &[f32], expected: &[f32], bounds: &serde_json::Value) -> Result<bool> {
+    ensure!(
+        actual.len() == expected.len()
+            && !actual.is_empty()
+            && actual.iter().chain(expected).all(|v| v.is_finite()),
+        "Runner FAIL vision comparison extent or finiteness"
+    );
+    let mut maximum = 0.0f64;
+    let mut squared = 0.0f64;
+    for (a, b) in actual.iter().zip(expected) {
+        let delta = f64::from(*a) - f64::from(*b);
+        maximum = maximum.max(delta.abs());
+        squared += delta * delta;
+    }
+    let rmse = (squared / actual.len() as f64).sqrt();
+    let pass = maximum <= bounds["output_max"].as_f64().context("vision max")?
+        && rmse <= bounds["output_rmse"].as_f64().context("vision RMSE")?;
+    println!("vision_distance max={maximum} rmse={rmse} pass={pass}");
+    Ok(pass)
+}
+
+#[test]
+#[ignore = "requires Gemma image references, frozen limits, published weights and a GPU window"]
+fn image_model_definition_and_graph_gpu() -> Result<()> {
+    use crate::vision_input::{ImageGrid, MultimodalInput};
+    let dir = std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+    let fixtures = std::path::PathBuf::from(
+        std::env::var_os("FF_GEMMA4_FIXTURES").context("FF_GEMMA4_FIXTURES missing")?,
+    );
+    let frozen: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixtures.join("FROZEN.json"))?)?;
+    ensure!(frozen["status"] == "FROZEN", "vision limits are not frozen");
+    let review: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixtures.join("MEDIA_REVIEW.json"))?)?;
+    ensure!(review["accepted"] == true, "media review missing");
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixtures.join("inputs/INPUT.json"))?)?;
+    let settings = crate::backend::Settings {
+        tree_builder: crate::backend::TreeBuilder::Waves,
+        spec_budget: crate::backend::SpecBudget::Chain,
+        spec_graph: true,
+        draft_model: None,
+        prefix_cache: false,
+        kv_format: crate::kv::KvFormat::Bf16,
+        runtime_dir: Some(std::path::PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime directory missing")?,
+        )),
+    };
+    let spec = crate::model_spec::ModelSpec::read(&dir)?;
+    let image_token = spec
+        .vision
+        .as_ref()
+        .context("vision config missing")?
+        .image_token;
+    let mut engine = super::engine::Engine::load(&dir, 0, 896, Some(896), settings)?;
+    let mut defects = 0usize;
+    let mut street_features = None;
+    let mut street_input = None;
+    for name in ["street", "winter", "wide", "long"] {
+        let cell = &metadata[name];
+        let bounds = &frozen["cells"][name];
+        let bytes = std::fs::read(fixtures.join(format!("inputs/{name}-input.safetensors")))?;
+        let data = SafeTensors::deserialize(&bytes)?;
+        let ids_view = data.tensor("ids")?;
+        let ids: Vec<_> = ids_view
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| u32::from_le_bytes(*v))
+            .collect();
+        let modality_view = data.tensor("modalities")?;
+        let pixels_view = data.tensor("pixels")?;
+        ensure!(
+            ids_view.dtype() == safetensors::Dtype::I32
+                && modality_view.dtype() == safetensors::Dtype::U8
+                && pixels_view.dtype() == safetensors::Dtype::F32,
+            "image input dtype mismatch"
+        );
+        let pixels: Vec<_> = pixels_view
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| f32::from_le_bytes(*v))
+            .collect();
+        let grids = [ImageGrid {
+            t: 1,
+            h: u32::try_from(cell["grid_xy"][1].as_u64().context("grid h")?)?,
+            w: u32::try_from(cell["grid_xy"][0].as_u64().context("grid w")?)?,
+        }];
+        let input = MultimodalInput {
+            input_ids: &ids,
+            modality_ids: modality_view.data(),
+            pixel_values: &pixels,
+            grids: &grids,
+        };
+        let identities: Vec<_> = ids
+            .iter()
+            .map(|&id| if id == image_token { 0 } else { id })
+            .collect();
+        let oracle = load_reference(&fixtures.join(format!("oracle/{name}-packed.safetensors")))?;
+        let first = usize::try_from(cell["score_first"].as_u64().context("score first")?)?;
+        engine.reset()?;
+        let mut trace = crate::trace::Trace::default();
+        engine.gemma_vision_trace(&input, &identities, &mut trace)?;
+        let features = trace.values("image_features")?;
+        let feature_pass = vision_distance(
+            &features,
+            &oracle["features"].1.as_f32(),
+            &bounds["features"],
+        )?;
+        defects += usize::from(!feature_pass);
+        let combined = trace.values(".debug.ple_identity")?;
+        let ple = combined
+            .get(..ids.len() * 256)
+            .context("layer-major PLE trace is shorter than layer zero")?;
+        let ple_pass = vision_distance(ple, &oracle["ple"].1.as_f32(), &bounds["ple"])?;
+        defects += usize::from(!ple_pass);
+        let mut actual = Vec::new();
+        for row in first..ids.len() {
+            actual.extend(engine.gemma_all_logits(row)?);
+        }
+        let (pass, metrics, _) = model_metrics(
+            &actual,
+            &oracle["logits"].1.as_f32(),
+            &ids[first..],
+            &bounds["logits"],
+        )?;
+        defects += usize::from(!pass);
+        println!(
+            "{} image_model {name} features={feature_pass} ple={ple_pass} {metrics}",
+            if pass && feature_pass && ple_pass {
+                "PASS"
+            } else {
+                "DEFECT"
+            }
+        );
+        if name == "street" {
+            street_features = Some(features.clone());
+            street_input = Some((
+                ids.clone(),
+                modality_view.data().to_vec(),
+                pixels.clone(),
+                grids[0],
+            ));
+            engine.reset()?;
+            let mut wrong = crate::trace::Trace::default();
+            engine.gemma_vision_trace(&input, &ids, &mut wrong)?;
+            let wrong_combined = wrong.values(".debug.ple_identity")?;
+            let wrong_ple = wrong_combined
+                .get(..ids.len() * 256)
+                .context("control PLE trace is shorter than layer zero")?;
+            let detected = !vision_distance(wrong_ple, &oracle["ple"].1.as_f32(), &bounds["ple"])?;
+            defects += usize::from(!detected);
+            let text_differences = ids
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| **id != image_token)
+                .filter(|(row, _)| ple[row * 256..][..256] != wrong_ple[row * 256..][..256])
+                .count();
+            defects += usize::from(text_differences != 0);
+            println!(
+                "image_identity_control detected={detected} text_row_differences={text_differences}"
+            );
+        }
+        if name == "winter" {
+            let detected = !vision_distance(
+                street_features
+                    .as_ref()
+                    .context("street features missing")?,
+                &oracle["features"].1.as_f32(),
+                &bounds["features"],
+            )?;
+            defects += usize::from(!detected);
+            println!("two_media_control detected={detected}");
+        }
+        if name == "wide" {
+            let previous = street_input.as_ref().context("street input missing")?;
+            let mut mixed_ids = previous.0.clone();
+            mixed_ids.extend_from_slice(&ids);
+            let mut mixed_modalities = previous.1.clone();
+            mixed_modalities.extend_from_slice(modality_view.data());
+            let mut mixed_pixels = previous.2.clone();
+            mixed_pixels.extend_from_slice(&pixels);
+            let mixed_grids = [previous.3, grids[0]];
+            let mixed_input = MultimodalInput {
+                input_ids: &mixed_ids,
+                modality_ids: &mixed_modalities,
+                pixel_values: &mixed_pixels,
+                grids: &mixed_grids,
+            };
+            let mixed_identities: Vec<_> = mixed_ids
+                .iter()
+                .map(|&id| if id == image_token { 0 } else { id })
+                .collect();
+            engine.reset()?;
+            let mut mixed_trace = crate::trace::Trace::default();
+            engine.gemma_vision_trace(&mixed_input, &mixed_identities, &mut mixed_trace)?;
+            let actual = mixed_trace.values("image_features")?;
+            let mut expected = street_features
+                .as_ref()
+                .context("street features missing")?
+                .clone();
+            expected.extend_from_slice(&features);
+            ensure!(
+                actual.len() == expected.len() && actual.iter().all(|v| v.is_finite()),
+                "Runner FAIL mixed-image feature extent or finiteness"
+            );
+            let differences = actual
+                .iter()
+                .zip(&expected)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            defects += usize::from(differences != 0);
+            println!(
+                "mixed_image_batch_invariance images=2 grids=48x48,42x60 bit_mismatches={differences}"
+            );
+        }
+        if name == "long" {
+            continue;
+        }
+        let prompt = first + 1;
+        let prompt_input = MultimodalInput {
+            input_ids: &ids[..prompt],
+            modality_ids: &modality_view.data()[..prompt],
+            pixel_values: &pixels,
+            grids: &grids,
+        };
+        let mut eager = Vec::new();
+        for graph in [false, true] {
+            engine.reset()?;
+            engine.prefill_multimodal(&prompt_input, None)?;
+            let mut output: Vec<_> = engine
+                .decode_logits()?
+                .into_iter()
+                .map(bf16::from_f32)
+                .collect();
+            if graph {
+                engine.capture()?;
+            }
+            for &token in &ids[prompt..] {
+                engine.set_token(token)?;
+                engine.decode(graph, None)?;
+                output.extend(engine.decode_logits()?.into_iter().map(bf16::from_f32));
+            }
+            let (pass, metrics, _) = model_metrics(
+                &output,
+                &oracle["logits"].1.as_f32(),
+                &ids[first..],
+                &bounds["logits"],
+            )?;
+            defects += usize::from(!pass);
+            println!(
+                "{} image_decode {name} graph={graph} {metrics}",
+                if pass { "PASS" } else { "DEFECT" }
+            );
+            if graph {
+                let differences = output.iter().zip(&eager).filter(|(a, b)| a != b).count();
+                defects += usize::from(differences != 0);
+                println!("image_graph {name} bit_mismatches={differences}");
+            } else {
+                eager = output;
+            }
+        }
+    }
+    println!(
+        "{} image_model_definition_and_graph_gpu cells=4 defects={defects}",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(defects == 0, "Gemma image candidate defects={defects}");
+    Ok(())
 }
 
 fn checkpoint_tensor(dir: &std::path::Path, name: &str) -> Result<Vec<bf16>> {

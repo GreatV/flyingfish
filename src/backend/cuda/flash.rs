@@ -316,8 +316,8 @@ impl Flash {
     /// Query tile rows for the bound prefill family.
     pub fn tile(head_dim: usize) -> Result<usize> {
         ensure!(
-            matches!(head_dim, 128 | 256 | 512),
-            "prefill binds head dims 128, 256 and 512 (asked for {head_dim})"
+            matches!(head_dim, 64 | 128 | 256 | 512),
+            "prefill binds head dims 64, 128, 256 and 512 (asked for {head_dim})"
         );
         #[cfg(feature = "cuda")]
         {
@@ -325,6 +325,7 @@ impl Flash {
         }
         #[cfg(feature = "rocm")]
         {
+            ensure!(head_dim != 64, "HIP D64 prefill is not bound");
             Ok(if head_dim == 128 { 32 } else { 16 })
         }
     }
@@ -337,7 +338,10 @@ impl Flash {
         kv_heads: usize,
         head_dim: usize,
     ) -> Result<Self> {
-        ensure!(head_dim != 512, "D512 requires an explicit score binding");
+        ensure!(
+            !matches!(head_dim, 64 | 512),
+            "D64 and D512 require an explicit score binding"
+        );
         let scale = if head_dim == 256 {
             0.0625
         } else {
@@ -364,8 +368,8 @@ impl Flash {
         capacity: usize,
     ) -> Result<Self> {
         ensure!(
-            matches!(head_dim, 128 | 256 | 512),
-            "score binding requires D128, D256 or D512"
+            matches!(head_dim, 64 | 128 | 256 | 512),
+            "score binding requires D64, D128, D256 or D512"
         );
         ensure!(
             score.scale.is_finite() && score.scale > 0.0,
@@ -379,13 +383,18 @@ impl Flash {
             head_dim != 512 || score.window_left.is_none(),
             "D512 binds full causal attention"
         );
+        ensure!(
+            head_dim != 64 || (score.window_left.is_none() && heads == kv_heads),
+            "D64 binds full bidirectional multi-head attention"
+        );
         let legacy_scale = if head_dim == 256 {
             0.0625
         } else {
             std::f32::consts::FRAC_1_SQRT_2 / 8.0
         };
-        let explicit =
-            head_dim == 512 || score.scale != legacy_scale || score.window_left.is_some();
+        let explicit = matches!(head_dim, 64 | 512)
+            || score.scale != legacy_scale
+            || score.window_left.is_some();
         ensure!(
             head_dim != 128 || !explicit,
             "D128 explicit score is not bound"
@@ -422,7 +431,7 @@ impl Flash {
             "invalid prefill attention geometry"
         );
         ensure!(
-            matches!(head_dim, 128 | 256 | 512),
+            matches!(head_dim, 64 | 128 | 256 | 512),
             "unsupported prefill attention head dimension {head_dim}"
         );
         #[cfg(feature = "rocm")]
@@ -440,7 +449,7 @@ impl Flash {
             "prefill LSE indexing exceeds u32"
         );
         #[cfg(feature = "cuda")]
-        let native = if matches!(head_dim, 256 | 512)
+        let native = if matches!(head_dim, 64 | 256 | 512)
             || matches!(
                 (heads, kv_heads, head_dim),
                 (16, 2, 128) | (16, 8, 128) | (12, 12, 128) | (32, 4, 128)
@@ -451,7 +460,9 @@ impl Flash {
                 heads <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y)? as usize,
                 "prefill heads exceed grid limit"
             );
-            let names: &[&str] = if head_dim == 512 {
+            let names: &[&str] = if head_dim == 64 {
+                &["attention_prefill_d64_bidirectional"]
+            } else if head_dim == 512 {
                 &["attention_prefill_d512"]
             } else if score.is_some() {
                 &["attention_prefill_d256_window"]
@@ -656,8 +667,14 @@ impl Flash {
         } else {
             1
         };
+        let bidirectional_only = self.geometry[2] == 64;
         ensure!(
-            mode == 0 || (shape.window_left.is_none() && self.native.len() == 3),
+            !bidirectional_only || mode == 1,
+            "D64 requires bidirectional attention"
+        );
+        ensure!(
+            mode == 0
+                || (shape.window_left.is_none() && (self.native.len() == 3 || bidirectional_only)),
             "prefill mask is not bound for this geometry/window"
         );
         ensure!(
@@ -679,8 +696,8 @@ impl Flash {
             "prefill window exceeds i32"
         );
         ensure!(
-            matches!(shape.head_dim, 128 | 256 | 512),
-            "prefill binds head dims 128, 256 and 512 (got {})",
+            matches!(shape.head_dim, 64 | 128 | 256 | 512),
+            "prefill binds head dims 64, 128, 256 and 512 (got {})",
             shape.head_dim
         );
         ensure!(shape.rows > 0, "prefill needs at least one query row");
@@ -741,7 +758,9 @@ impl Flash {
             let window = shape.window_left.is_some();
             let native = self
                 .native
-                .get(if window && self.score.is_none() {
+                .get(if bidirectional_only {
+                    0
+                } else if window && self.score.is_none() {
                     1
                 } else {
                     mode
@@ -816,7 +835,9 @@ impl Flash {
                 launch.arg(&args);
                 if let Some(score) = &self.score {
                     let window = score.window_left.map_or(u32::MAX, |w| w as u32);
-                    if shape.head_dim == 256 {
+                    if bidirectional_only {
+                        launch.arg(&extent);
+                    } else if shape.head_dim == 256 {
                         launch.arg(&window);
                     }
                     launch.arg(&score.scale);

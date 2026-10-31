@@ -289,6 +289,16 @@ pub struct MiniCpmVision {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AxialVision {
+    pub head_dim: u32,
+    pub soft_tokens: u32,
+    pub rms_eps: f32,
+    pub rope_theta: f32,
+    pub standardize: bool,
+    pub clipped_linears: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VisionConfig {
     pub depth: u32,
     pub hidden: u32,
@@ -306,6 +316,8 @@ pub struct VisionConfig {
     pub end_token: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minicpm: Option<MiniCpmVision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub axial: Option<AxialVision>,
 }
 
 impl VisionConfig {
@@ -337,8 +349,10 @@ impl VisionConfig {
                     "unsupported Q38 image token IDs"
                 );
                 ensure!(self.minicpm.is_none(), "unexpected MiniCPM vision fields");
+                ensure!(self.axial.is_none(), "unexpected axial vision fields");
             }
             Architecture::MiniCpmV47 => {
+                ensure!(self.axial.is_none(), "unexpected axial vision fields");
                 ensure!(
                     [
                         self.depth,
@@ -393,11 +407,44 @@ impl VisionConfig {
                     v.newline_token
                 );
             }
+            Architecture::Gemma4 => {
+                let axial = self
+                    .axial
+                    .as_ref()
+                    .context("axial vision configuration missing")?;
+                ensure!(
+                    self.depth > 0
+                        && self.hidden > 0
+                        && self.heads > 0
+                        && self.intermediate > 0
+                        && self.output > 0
+                        && axial.head_dim > 0
+                        && axial.head_dim.is_multiple_of(4)
+                        && self.heads.checked_mul(axial.head_dim) == Some(self.hidden)
+                        && self.channels == 3
+                        && self.patch == 16
+                        && self.temporal_patch == 1
+                        && self.merge == 3
+                        && self.position_side > 0
+                        && axial.soft_tokens > 0
+                        && axial.soft_tokens.checked_mul(9).is_some()
+                        && axial.rms_eps.is_finite()
+                        && axial.rms_eps > 0.0
+                        && axial.rope_theta.is_finite()
+                        && axial.rope_theta > 0.0
+                        && self.minicpm.is_none(),
+                    "unsupported axial vision geometry"
+                );
+                ensure!(
+                    [self.image_token, self.start_token, self.end_token]
+                        == [258880, 255999, 258882],
+                    "unsupported image token IDs"
+                );
+            }
             Architecture::Llama
             | Architecture::Flint
             | Architecture::Glm5Next
-            | Architecture::LoopVl
-            | Architecture::Gemma4 => {
+            | Architecture::LoopVl => {
                 bail!("vision configuration requires a supported multimodal architecture")
             }
             Architecture::DeepseekV41 => {
@@ -412,15 +459,87 @@ impl VisionConfig {
         Ok((self.channels * self.temporal_patch * self.patch * self.patch) as usize)
     }
 
-    fn from_root(root: &Value) -> Result<Option<Self>> {
+    pub fn from_root(root: &Value) -> Result<Option<Self>> {
         let Some(v) = root.get("vision_config") else {
             return Ok(None);
         };
         match v.get("model_type").and_then(Value::as_str) {
             Some("qwen3_5") => Self::qwen_from_root(root, v).map(Some),
             Some("minicpmv4_7_vision") => Self::minicpm_from_root(root, v).map(Some),
+            Some("gemma4_vision") => Self::axial_from_root(root, v).map(Some),
             other => bail!("unsupported vision_config model_type: {other:?}"),
         }
+    }
+
+    fn axial_from_root(root: &Value, v: &Value) -> Result<Self> {
+        if root.get("video_token_id").is_some() {
+            equal(root, "video_token_id", 258884.into())?;
+        }
+        for (key, value) in [
+            ("attention_bias", false.into()),
+            ("attention_dropout", 0.0.into()),
+            ("hidden_activation", "gelu_pytorch_tanh".into()),
+            ("dtype", "bfloat16".into()),
+        ] {
+            equal(v, key, value)?;
+        }
+        let head_dim = positive(v, "head_dim")?;
+        let heads = positive(v, "num_attention_heads")?;
+        ensure!(
+            integer(v, "global_head_dim")? == head_dim
+                && integer(v, "num_key_value_heads")? == heads,
+            "axial vision requires equal query/key/value head geometry"
+        );
+        let rope = v
+            .get("rope_parameters")
+            .context("vision rope_parameters missing")?;
+        equal(rope, "rope_type", "default".into())?;
+        let number = |object: &Value, key: &str| -> Result<f32> {
+            Ok(object
+                .get(key)
+                .and_then(Value::as_f64)
+                .with_context(|| format!("missing/invalid vision {key}"))? as f32)
+        };
+        let flag = |key: &str| -> Result<bool> {
+            v.get(key)
+                .and_then(Value::as_bool)
+                .with_context(|| format!("missing/invalid vision {key}"))
+        };
+        let soft_tokens = positive(root, "vision_soft_tokens_per_image")?;
+        ensure!(
+            integer(v, "default_output_length")? == soft_tokens,
+            "vision output token budgets differ"
+        );
+        let spec = Self {
+            depth: positive(v, "num_hidden_layers")?,
+            hidden: positive(v, "hidden_size")?,
+            heads,
+            intermediate: positive(v, "intermediate_size")?,
+            channels: 3,
+            patch: positive(v, "patch_size")?,
+            temporal_patch: 1,
+            merge: positive(v, "pooling_kernel_size")?,
+            output: positive(
+                root.get("text_config").context("text_config missing")?,
+                "hidden_size",
+            )?,
+            position_side: positive(v, "position_embedding_size")?,
+            image_token: integer(root, "image_token_id")?,
+            video_token: 258884,
+            start_token: integer(root, "boi_token_id")?,
+            end_token: integer(root, "eoi_token_id")?,
+            minicpm: None,
+            axial: Some(AxialVision {
+                head_dim,
+                soft_tokens,
+                rms_eps: number(v, "rms_norm_eps")?,
+                rope_theta: number(rope, "rope_theta")?,
+                standardize: flag("standardize")?,
+                clipped_linears: flag("use_clipped_linears")?,
+            }),
+        };
+        spec.validate(Architecture::Gemma4)?;
+        Ok(spec)
     }
 
     fn qwen_from_root(root: &Value, v: &Value) -> Result<Self> {
@@ -446,6 +565,7 @@ impl VisionConfig {
             start_token: integer(root, "vision_start_token_id")?,
             end_token: integer(root, "vision_end_token_id")?,
             minicpm: None,
+            axial: None,
         };
         spec.validate(Architecture::Qwen35Text)?;
         Ok(spec)
@@ -510,6 +630,7 @@ impl VisionConfig {
                 slice_end_token: integer(root, "slice_end_id")?,
                 newline_token: integer(root, "newline_id")?,
             }),
+            axial: None,
         };
         spec.validate(Architecture::MiniCpmV47)?;
         Ok(spec)
@@ -1903,7 +2024,7 @@ impl ModelSpec {
             deepseek_v41: None,
             logit_softcap: Some(30.0),
             per_layer_input: Some(256),
-            vision: None,
+            vision: VisionConfig::from_root(root)?,
         })
     }
     pub fn glm5_next(root: &Value, generation: &Value) -> Result<Self> {

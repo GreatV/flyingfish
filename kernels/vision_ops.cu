@@ -7,6 +7,73 @@ __device__ __forceinline__ bool vision_flat_launch() {
            gridDim.y == 1 && gridDim.z == 1;
 }
 
+extern "C" __global__ void vision_affine_cast_bf16(
+    const float* input, __nv_bfloat16* output, uint64_t count, float shift, float scale) {
+    if (!vision_flat_launch() || !input || !output || !count ||
+        !isfinite(shift) || !isfinite(scale)) { __trap(); return; }
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256) {
+        const float value = __fmul_rn(__fadd_rn(input[i], shift), scale);
+        const __nv_bfloat16 rounded = __float2bfloat16_rn(value);
+        if (!isfinite(value) || !isfinite(__bfloat162float(rounded))) { __trap(); return; }
+        output[i] = rounded;
+    }
+}
+
+extern "C" __global__ void vision_clamp_bf16(
+    const __nv_bfloat16* input, __nv_bfloat16* output, uint64_t count,
+    const __nv_bfloat16* lower, const __nv_bfloat16* upper) {
+    if (!vision_flat_launch() || !input || !output || !count || !lower || !upper) { __trap(); return; }
+    const float lo = __bfloat162float(*lower), hi = __bfloat162float(*upper);
+    if (!isfinite(lo) || !isfinite(hi) || lo > hi) { __trap(); return; }
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256) {
+        const float value = __bfloat162float(input[i]);
+        if (!isfinite(value)) { __trap(); return; }
+        output[i] = __float2bfloat16_rn(fminf(hi, fmaxf(lo, value)));
+    }
+}
+
+// The two axis embeddings add in BF16 before the patch residual addition.
+extern "C" __global__ void vision_axis_position_add_bf16(
+    const __nv_bfloat16* patches, const __nv_bfloat16* table, __nv_bfloat16* output,
+    uint32_t grid_h, uint32_t grid_w, uint32_t width, uint32_t positions) {
+    if (!vision_flat_launch() || !patches || !table || !output || !grid_h || !grid_w ||
+        !width || grid_h > positions || grid_w > positions) { __trap(); return; }
+    const uint64_t count = uint64_t(grid_h) * grid_w * width;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint64_t row = i / width, column = i % width;
+        const __nv_bfloat16 position = __hadd(table[(row % grid_w) * width + column],
+            table[(uint64_t(positions) + row / grid_w) * width + column]);
+        output[i] = __hadd(patches[i], position);
+    }
+}
+
+// Spatial mean rounds to BF16 before F32 scale and optional F32 standardization.
+extern "C" __global__ void vision_spatial_mean_scale_bf16(
+    const __nv_bfloat16* input, __nv_bfloat16* output,
+    const __nv_bfloat16* bias, const __nv_bfloat16* multiplier,
+    uint32_t grid_h, uint32_t grid_w, uint32_t width, uint32_t merge, float scale) {
+    if (!vision_flat_launch() || !input || !output || !grid_h || !grid_w || !width || !merge ||
+        grid_h % merge || grid_w % merge || bool(bias) != bool(multiplier) || !isfinite(scale)) { __trap(); return; }
+    const uint64_t columns = grid_w / merge, rows = grid_h / merge;
+    const float weight = 1.0f / (float(merge) * float(merge));
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < rows * columns * width;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint64_t group = i / width, channel = i % width;
+        const uint64_t first = (group / columns * merge * grid_w + group % columns * merge) * width + channel;
+        float sum = 0.0f;
+        for (uint32_t y = 0; y < merge; ++y)
+            for (uint32_t x = 0; x < merge; ++x)
+                sum = __fmaf_rn(weight, __bfloat162float(input[first + (uint64_t(y) * grid_w + x) * width]), sum);
+        float value = __fmul_rn(__bfloat162float(__float2bfloat16_rn(sum)), scale);
+        if (bias) value = __fmul_rn(__fsub_rn(value, __bfloat162float(bias[channel])),
+            __bfloat162float(multiplier[channel]));
+        output[i] = __float2bfloat16_rn(value);
+    }
+}
+
 // NaViT pack `[channels, side, rows*side]` (order c, ky, patch, kx) -> per-patch rows
 // `[rows, channels*side*side]` in (c, ky, kx) order, rounding each value to BF16.
 extern "C" __global__ void vision_patch_rows(

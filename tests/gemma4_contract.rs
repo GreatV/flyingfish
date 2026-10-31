@@ -3,7 +3,8 @@ use anyhow::{Context, Result, ensure};
 use flyingfish::{
     backend::Operator,
     model::{LayerStage, layer_program},
-    model_spec::{Architecture, FfnKind, LayerGeometry, Mixer, ModelSpec, RopeSpec},
+    model_spec::{Architecture, FfnKind, LayerGeometry, Mixer, ModelSpec, RopeSpec, VisionConfig},
+    vision_input::{ImageGrid, MultimodalInput},
 };
 use serde_json::{Value, json};
 
@@ -133,6 +134,158 @@ fn gemma4_e4b_config_normalizes_the_published_layer_plan() -> Result<()> {
             publishers: [22, 23],
         },
     )
+}
+
+#[test]
+fn axial_vision_preserves_geometry_and_image_slot_bounds() -> Result<()> {
+    for text in [E2B, E4B] {
+        let (_, spec) = read(text)?;
+        let vision = spec.vision.as_ref().context("missing vision spec")?;
+        let axial = vision.axial.as_ref().context("missing axial spec")?;
+        ensure!(
+            [
+                vision.hidden,
+                vision.depth,
+                vision.heads,
+                axial.head_dim,
+                vision.intermediate
+            ] == [768, 16, 12, 64, 3072]
+                && vision.output == spec.hidden
+                && vision.position_side == 10240
+                && axial.soft_tokens == 280
+                && axial.clipped_linears
+                && !axial.standardize,
+            "published vision geometry changed"
+        );
+        for (h, w) in [(3u32, 9u32), (48, 48), (42, 60)] {
+            let features = (h * w / 9) as usize;
+            let mut ids = vec![2, vision.start_token];
+            ids.extend(std::iter::repeat_n(vision.image_token, features));
+            ids.extend([vision.end_token, 17, 19]);
+            let mut modalities = vec![0; ids.len()];
+            modalities[2..features + 2].fill(1);
+            let pixels = vec![0.5; (h * w * 768) as usize];
+            let grids = [ImageGrid { t: 1, h, w }];
+            let input = MultimodalInput {
+                input_ids: &ids,
+                modality_ids: &modalities,
+                pixel_values: &pixels,
+                grids: &grids,
+            };
+            let capacity = ids.len() + 11;
+            let plan = input.validate(&spec, capacity)?;
+            ensure!(
+                plan.feature_rows() == features
+                    && plan.patch_rows() == (h * w) as usize
+                    && plan.slots()[0].tokens == (2..features + 2)
+                    && plan.rope_delta() == 0
+                    && plan
+                        .axes()
+                        .iter()
+                        .all(|axis| axis.iter().enumerate().all(|(i, &p)| p == i as i32))
+                    && plan.decode_position(ids.len())? == ids.len() as i32,
+                "image placement or scalar text positions changed"
+            );
+            let splice = plan.splices(3..features + 3)?;
+            ensure!(
+                splice.len() == 1
+                    && splice[0].chunk_rows == (0..features - 1)
+                    && splice[0].feature_rows == (1..features),
+                "chunk splice bounds changed"
+            );
+            let mut wrong_ids = ids.clone();
+            wrong_ids[features + 1] = 17;
+            ensure!(
+                MultimodalInput {
+                    input_ids: &wrong_ids,
+                    ..input
+                }
+                .validate(&spec, capacity)
+                .is_err(),
+                "wrong image placeholder was accepted"
+            );
+            ensure!(
+                MultimodalInput {
+                    pixel_values: &pixels[..pixels.len() - 1],
+                    ..input
+                }
+                .validate(&spec, capacity)
+                .is_err(),
+                "short pixel buffer was accepted"
+            );
+            let wrong_grid = [ImageGrid {
+                h: h + 1,
+                ..grids[0]
+            }];
+            ensure!(
+                MultimodalInput {
+                    grids: &wrong_grid,
+                    ..input
+                }
+                .validate(&spec, capacity)
+                .is_err(),
+                "misaligned pooling grid was accepted"
+            );
+            ensure!(
+                input.validate(&spec, ids.len() - 1).is_err(),
+                "short KV capacity was accepted"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn axial_vision_parser_accepts_diffusion_geometry_without_text_support() -> Result<()> {
+    let (mut root, _) = read(E2B)?;
+    let vision = root.get_mut("vision_config").context("vision_config")?;
+    for (key, value) in [
+        ("hidden_size", 1152),
+        ("intermediate_size", 4304),
+        ("num_hidden_layers", 27),
+        ("num_attention_heads", 16),
+        ("num_key_value_heads", 16),
+        ("head_dim", 72),
+        ("global_head_dim", 72),
+    ] {
+        vision[key] = json!(value);
+    }
+    vision["standardize"] = json!(true);
+    vision["use_clipped_linears"] = json!(false);
+    root["text_config"]["hidden_size"] = json!(2816);
+    root.as_object_mut()
+        .context("config object")?
+        .remove("video_token_id");
+    let parsed = VisionConfig::from_root(&root)?.context("vision spec")?;
+    let axial = parsed.axial.as_ref().context("axial spec")?;
+    ensure!(
+        [
+            parsed.hidden,
+            parsed.intermediate,
+            parsed.depth,
+            parsed.heads,
+            axial.head_dim,
+            parsed.output
+        ] == [1152, 4304, 27, 16, 72, 2816]
+            && axial.standardize
+            && !axial.clipped_linears,
+        "DiffusionGemma vision parameters were specialized away"
+    );
+    for (key, value) in [
+        ("num_key_value_heads", json!(8)),
+        ("head_dim", json!(64)),
+        ("pooling_kernel_size", json!(0)),
+        ("rms_norm_eps", json!(0.0)),
+        ("standardize", json!(null)),
+    ] {
+        let mut mutant = root.clone();
+        mutant["vision_config"][key] = value;
+        ensure!(
+            VisionConfig::from_root(&mutant).is_err(),
+            "invalid vision geometry was accepted: {key}"
+        );
+    }
+    Ok(())
 }
 
 #[test]

@@ -264,6 +264,8 @@ unsafe fn copy_kv<const D: usize, const MASK: bool>(
         }
         if D == 256 {
             sixteen!(transfer);
+        } else if D == 64 {
+            four!(transfer);
         } else {
             eight!(transfer);
         }
@@ -302,6 +304,20 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d128_bidirectional(p: Attent
     unsafe {
         let p = resolve_position(p);
         attention::<128, 16, 1>(p, keys, 0, core::f32::consts::FRAC_1_SQRT_2 / 8.0);
+    }
+}
+
+/// # Safety
+/// All keys below `keys` are populated; launch uses 128 threads and 24576 shared bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_prefill_d64_bidirectional(
+    p: Attention,
+    keys: u32,
+    scale: f32,
+) {
+    unsafe {
+        let p = resolve_position(p);
+        attention::<64, 8, 1>(p, keys, 0, scale);
     }
 }
 
@@ -413,6 +429,8 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
         }
         if D == 256 {
             sixteen!(copy_q);
+        } else if D == 64 {
+            four!(copy_q);
         } else {
             eight!(copy_q);
         }
@@ -471,6 +489,8 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                             ($pair:expr) => {{
                                 let b = if D == 256 {
                                     ld4::<{ ($inner / 4) * 128 + $pair * 8192 }>(kb[$inner % 4])
+                                } else if D == 64 {
+                                    ld4::<{ $pair * 2048 }>(kb[$inner % 4])
                                 } else {
                                     ld4::<{ ($inner / 4) * 128 + $pair * 4096 }>(kb[$inner % 4])
                                 };
@@ -483,6 +503,8 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                 }
                 if D == 256 {
                     sixteen!(qk_step);
+                } else if D == 64 {
+                    four!(qk_step);
                 } else {
                     eight!(qk_step);
                 }
@@ -603,7 +625,7 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                         sum[1] += c + d;
                         packed[$n / 2][($n % 2) * 2] = pack(a, b);
                         packed[$n / 2][($n % 2) * 2 + 1] = pack(c, d);
-                        if D == 128 {
+                        if D <= 128 {
                             residual[$n / 2][($n % 2) * 2] =
                                 pack_residual(a, b, packed[$n / 2][($n % 2) * 2]);
                             residual[$n / 2][($n % 2) * 2 + 1] =
@@ -625,6 +647,8 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                 }
                 if D == 256 {
                     thirty_two!(rescale);
+                } else if D == 64 {
+                    eight!(rescale);
                 } else {
                     sixteen!(rescale);
                 }
@@ -637,6 +661,8 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                                     ld4_trans::<{ ($pair / 4) * 128 + $inner * 8192 }>(
                                         vb[$pair % 4],
                                     )
+                                } else if D == 64 {
+                                    ld4_trans::<{ $inner * 2048 }>(vb[$pair % 4])
                                 } else {
                                     ld4_trans::<{ ($pair / 4) * 128 + $inner * 4096 }>(
                                         vb[$pair % 4],
@@ -644,7 +670,7 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                                 };
                                 output[$pair * 2] = mma(a, [b[0], b[1]], output[$pair * 2]);
                                 output[$pair * 2 + 1] = mma(a, [b[2], b[3]], output[$pair * 2 + 1]);
-                                if D == 128 {
+                                if D <= 128 {
                                     output[$pair * 2] =
                                         mma(residual[$inner], [b[0], b[1]], output[$pair * 2]);
                                     output[$pair * 2 + 1] =
@@ -654,6 +680,8 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                         }
                         if D == 256 {
                             sixteen!(pv_pair);
+                        } else if D == 64 {
+                            four!(pv_pair);
                         } else {
                             eight!(pv_pair);
                         }
@@ -750,6 +778,9 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
         }
         if D == 256 {
             eight!(stage_output);
+        } else if D == 64 {
+            stage_output!(0);
+            stage_output!(1);
         } else {
             four!(stage_output);
         }
@@ -780,6 +811,8 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
         }
         if D == 256 {
             sixteen!(write_output);
+        } else if D == 64 {
+            four!(write_output);
         } else {
             eight!(write_output);
         }
