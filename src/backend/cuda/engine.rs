@@ -36,6 +36,8 @@ use std::{
     time::Instant,
 };
 
+#[path = "engine_audio.rs"]
+mod audio_runtime;
 #[path = "engine_deepseek.rs"]
 pub(crate) mod deepseek;
 #[path = "engine_moe.rs"]

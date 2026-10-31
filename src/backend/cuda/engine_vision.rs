@@ -165,7 +165,7 @@ fn dense_at<T: crate::backend::gpu::DeviceRepr + Copy, const R: usize>(
 
 /// Stage view: exact-length `dense` when the extent covers the whole allocation, otherwise the
 /// offset-0 prefix `dense_at`.
-fn stage_view<T: crate::backend::gpu::DeviceRepr + Copy, const R: usize>(
+pub(super) fn stage_view<T: crate::backend::gpu::DeviceRepr + Copy, const R: usize>(
     buffer: &CudaSlice<T>,
     stream: &Arc<CudaStream>,
     shape: [u32; R],
@@ -272,7 +272,7 @@ struct PatchPositionBindings<'a> {
 }
 
 impl VisionIo {
-    fn new(device: &Device, width: u32) -> Result<Self> {
+    pub(super) fn new(device: &Device, width: u32) -> Result<Self> {
         let splice = match width {
             2048 => "vision_splice_2048",
             5120 => "q38_vision_splice",
@@ -3005,7 +3005,7 @@ impl AxialTower {
 /// Owns merger output until all prompt chunks have consumed their image rows.
 pub(super) struct EncodedImages {
     positions: PositionPlan,
-    features: CudaSlice<bf16>,
+    pub(super) features: CudaSlice<bf16>,
     io: Arc<VisionIo>,
 }
 impl EncodedImages {

@@ -11,9 +11,9 @@ use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::sync::Arc;
 pub(crate) struct ClippedLinear {
-    weight: CudaSlice<bf16>,
+    pub(crate) weight: CudaSlice<bf16>,
     pub(crate) shape: [u32; 2],
-    bounds: Option<[CudaSlice<bf16>; 4]>,
+    pub(crate) bounds: Option<[CudaSlice<bf16>; 4]>,
 }
 
 impl ClippedLinear {
