@@ -6,7 +6,7 @@ import struct
 
 import torch
 import transformers
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 from transformers.conversion_mapping import get_checkpoint_conversion_mapping
 from transformers.core_model_loading import apply_renamings
 
@@ -142,6 +142,52 @@ def distances(actual, expected, targets):
             "nll_max": abs(losses[0] - losses[1])}
 
 
+def freeze(arms, output):
+    inputs = json.loads((arms[0] / "ids.json").read_text())
+    oracle_meta = json.loads((arms[0] / "LOAD.json").read_text())
+    require(oracle_meta["dtype"] == "fp32", "first freeze arm must be the FP32 oracle")
+    oracle = load_file(str(arms[0] / "reference.safetensors"))
+    families = {tag: {key: 0.0 for key in ("output_max", "output_rmse", "nll_max")}
+                for tag in ("a", "b", "wrap", "long")}
+    references, coverage = [], set()
+    for arm in arms:
+        require(json.loads((arm / "ids.json").read_text()) == inputs, "reference token IDs differ")
+        meta = json.loads((arm / "LOAD.json").read_text())
+        require(meta["unbound_executed"] == meta["unexpected"] == meta["newly_initialized_executed"] == 0,
+                "unclean streamed reference arm")
+        require(meta["class"] == oracle_meta["class"], "reference model classes differ")
+        coverage.add((meta["device"], meta["dtype"]))
+        noise = json.loads((arm / "NOISE.json").read_text())
+        values = load_file(str(arm / "reference.safetensors"))
+        measured = {}
+        for tag, limits in families.items():
+            require(all(value == 0 for value in noise[tag]["repeat"].values()), "reference repeat is not exact")
+            ids = inputs["short"][0 if tag == "a" else 1] if tag in ("a", "b") else inputs[tag]
+            for mode in ("prefill", "decode"):
+                name = f"{tag}.{mode}"
+                target = oracle[f"{tag}.prefill"]
+                delta = distances(values[name], target, ids[len(ids) - len(target) + 1:])
+                measured[name] = delta
+                for key in limits:
+                    limits[key] = max(limits[key], 2 * delta[key])
+        references.append({"device": meta["device"], "dtype": meta["dtype"], "distances": measured})
+        del values
+    devices = {device for device, _ in coverage}
+    require(len(devices) == 2 and coverage == {(device, dtype) for device in devices for dtype in ("bf16", "fp32")},
+            "freeze requires BF16 and FP32 on both GPUs")
+    for limits in families.values():
+        limits["margin_cut"] = 2 * limits["output_max"]
+    for tag in families:
+        oracle[f"{tag}.decode"] = oracle[f"{tag}.prefill"].clone()
+    save_file(oracle, str(output / "reference.safetensors"))
+    (output / "ids.json").write_text(json.dumps(inputs, indent=2) + "\n")
+    frozen = {"status": "FROZEN", "policy": "2*max reference-only distance to FP32 prefill oracle",
+              "families": families, "arms": references}
+    with (output / "FROZEN.json").open("x") as destination:
+        destination.write(json.dumps(frozen, indent=2) + "\n")
+    print("PASS frozen_reference_limits arms=4 candidate_observations=0", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
@@ -149,15 +195,38 @@ def main():
     parser.add_argument("--dtype", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument("--full-load-only", action="store_true")
     parser.add_argument("--ids", type=Path)
+    parser.add_argument("--validate-full", type=Path)
+    parser.add_argument("--freeze-from", type=Path, nargs=4)
     args = parser.parse_args()
     require(not args.out.resolve().is_relative_to(args.model.resolve()), "output inside read-only weights")
     require(transformers.__version__ == "5.21.0", "reference definition version mismatch")
     args.out.mkdir(parents=True, exist_ok=False)
     torch.set_num_threads(4)
+    if args.freeze_from:
+        freeze(args.freeze_from, args.out)
+        return
     raw = json.loads((args.model / "config.json").read_text())
     require(raw["architectures"] in (["Gemma4ForConditionalGeneration"],
                                     ["Gemma4UnifiedForConditionalGeneration"]), "reference class mismatch")
     model_class = getattr(transformers, raw["architectures"][0])
+    if args.validate_full:
+        require(args.dtype == "bf16" and args.ids is not None, "full validation requires BF16 and shared IDs")
+        model, loading = model_class.from_pretrained(
+            args.model, local_files_only=True, dtype=torch.bfloat16, device_map={"": 0},
+            attn_implementation="eager", output_loading_info=True)
+        require(all(not loading[key] for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")),
+                "unclean full GPU reference load")
+        require(all(not value.is_meta for value in model.state_dict().values()), "unbound full GPU reference")
+        model.eval()
+        inputs = json.loads(args.ids.read_text())
+        expected = load_file(str(args.validate_full / "reference.safetensors"))
+        for tag, ids in zip(("a", "b"), inputs["short"]):
+            actual = capture(model, ids, len(ids), len(ids), torch.device("cuda", 0))
+            require(torch.equal(actual, expected[f"{tag}.prefill"]), f"full/streamed model-definition mismatch {tag}")
+        (args.out / "LOAD.json").write_text(json.dumps({"class": model_class.__name__, "full_class_load": True,
+            "missing": 0, "unexpected": 0, "newly_initialized": 0, "full_streamed_bits": 0, "cells": 2}, indent=2) + "\n")
+        print("PASS full_streamed_definition cells=2 bits=0 missing=0 unexpected=0 newly_initialized=0", flush=True)
+        return
     if args.full_load_only:
         model, loading = model_class.from_pretrained(
             args.model, local_files_only=True, dtype=torch.bfloat16,
