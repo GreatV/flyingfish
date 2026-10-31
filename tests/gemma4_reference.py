@@ -225,6 +225,7 @@ def main():
     args = parser.parse_args()
     require(not args.out.resolve().is_relative_to(args.model.resolve()), "output inside read-only weights")
     require(transformers.__version__ == "5.21.0", "reference definition version mismatch")
+    require(torch.__version__ == "2.14.1+cu130", "reference torch version mismatch")
     args.out.mkdir(parents=True, exist_ok=False)
     torch.set_num_threads(4)
     torch.backends.cuda.matmul.allow_tf32 = False
