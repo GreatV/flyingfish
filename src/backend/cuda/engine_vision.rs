@@ -2640,19 +2640,19 @@ impl AxialTower {
         let max_rows = input
             .grids
             .iter()
-            .map(|g| u64::from(g.h) * u64::from(g.w))
+            .map(|g| u128::from(g.h) * u128::from(g.w))
             .max()
             .context("empty image request")?;
-        let patch = vision.patch_elements(model.architecture)? as u64;
-        let h = u64::from(vision.hidden);
-        let i = u64::from(vision.intermediate);
-        let soft = max_rows / u64::from(vision.merge).pow(2);
+        let patch = vision.patch_elements(model.architecture)? as u128;
+        let h = u128::from(vision.hidden);
+        let i = u128::from(vision.intermediate);
+        let soft = max_rows / u128::from(vision.merge).pow(2);
         let workspace = 2 * max_rows * (patch + 10 * h + 3 * i + i.max(h).max(patch))
             + 4 * soft * h
-            + 4 * max_rows * u64::from(vision.heads);
-        let inputs = plan.patch_rows() as u64 * (4 * patch + 2 * u64::from(axial.head_dim))
-            + plan.slots().len() as u64 * 64;
-        let features = 2 * plan.feature_rows() as u64 * u64::from(vision.output);
+            + 4 * max_rows * u128::from(vision.heads);
+        let inputs = plan.patch_rows() as u128 * (4 * patch + 2 * u128::from(axial.head_dim))
+            + plan.slots().len() as u128 * 64;
+        let features = 2 * plan.feature_rows() as u128 * u128::from(vision.output);
         usize::try_from(
             workspace
                 .checked_add(inputs)
