@@ -10,7 +10,9 @@ from transformers.models.gemma4.modeling_gemma4 import (
     Gemma4VisionPatchEmbedder,
     Gemma4VisionPooler,
     Gemma4VisionRotaryEmbedding,
+    Gemma4VisionAttention,
     apply_multidimensional_rope,
+    eager_attention_forward,
 )
 
 
@@ -78,11 +80,46 @@ def capture(config, height, width, device):
     return {name: value.cpu().contiguous() for name, value in tensors.items()}, controls
 
 
+@torch.inference_mode()
+def capture_attention(config, rows, device):
+    heads, dim = config.num_attention_heads, config.head_dim
+    assert dim == 64 and config.num_key_value_heads == heads
+    keys = rows + 17 if rows < 2304 else rows
+    capacity, pitch = keys + 23, heads * dim + 64
+    q = pattern((1, rows, heads, dim), 257, 29, 128, 64, device).bfloat16().transpose(1, 2)
+    k = pattern((1, heads, keys, dim), 263, 31, 131, 64, device).bfloat16()
+    v = pattern((1, heads, keys, dim), 269, 37, 134, 64, device).bfloat16()
+    module = Gemma4VisionAttention(config, 0).eval()
+    assert module.scaling == 1.0 and not module.is_causal
+    def run(query, key, value, scale=1.0):
+        return eager_attention_forward(module, query, key, value, None, scaling=scale)[0][0]
+    expected = run(q.float(), k.float(), v.float())
+    baseline = run(q, k, v)
+    repeat = run(q, k, v)
+    assert torch.equal(baseline, repeat)
+    varied = torch.cat([run(q[:, :, start:start + 17], k, v)
+                       for start in range(0, rows, 17)])
+    wrong = run(q, k, v, scale=0.125)
+    packed_q = torch.full((rows, pitch), 37.0, dtype=torch.bfloat16, device=device)
+    packed_q[:, :heads * dim] = q[0].transpose(0, 1).reshape(rows, heads * dim)
+    packed_k = torch.full((heads, capacity, dim), 17.0, dtype=torch.bfloat16, device=device)
+    packed_v = torch.full_like(packed_k, 31.0)
+    packed_k[:, :keys], packed_v[:, :keys] = k[0], v[0]
+    tensors = dict(q=packed_q, k=packed_k, v=packed_v, oracle=expected,
+                   baseline=baseline, varied=varied, wrong_scale=wrong)
+    controls = {"wrong_scale": int((wrong != baseline).sum())}
+    assert controls["wrong_scale"] > 0
+    return {name: value.cpu().contiguous() for name, value in tensors.items()}, dict(
+        rows=rows, heads=heads, dim=dim, keys=keys, capacity=capacity, pitch=pitch,
+        repeat_mismatches=0, controls=controls)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", required=True)
+    parser.add_argument("--stage", choices=("operators", "attention"), default="operators")
     args = parser.parse_args()
     assert transformers.__version__ == "5.21.0"
     assert not args.output.resolve().is_relative_to(args.model.resolve())
@@ -96,6 +133,18 @@ def main():
     report = {"definition": "transformers Gemma4 vision model definition", "weights_loaded": False,
               "transformers": transformers.__version__, "torch": torch.__version__, "device": args.device,
               "cells": {}}
+    if args.stage == "attention":
+        for rows in [1, 63, 64, 65, 135, 2304, 2520]:
+            tensors, cell = capture_attention(config.vision_config, rows, args.device)
+            name = f"vision-attention-{rows}"
+            with (args.output / f"{name}.safetensors").open("xb") as output:
+                output.write(save(tensors, metadata={"definition": report["definition"]}))
+            report["cells"][name] = cell
+            print(f"PASS {name} reference_repeat_bits=0 wrong_scale={cell['controls']['wrong_scale']}", flush=True)
+        with (args.output / "REFERENCE.json").open("x") as output:
+            json.dump(report, output, indent=2)
+            output.write("\n")
+        return
     for height, width in [(9, 15), (48, 48), (42, 60)]:
         tensors, controls = capture(config.vision_config, height, width, args.device)
         repeat, repeat_controls = capture(config.vision_config, height, width, args.device)
