@@ -340,6 +340,16 @@ impl RingCopy<'_> {
         } else {
             self.source_capacity
         };
+        let staging = if to_ring {
+            self.source_capacity
+        } else {
+            self.target_capacity
+        };
+        ensure!(
+            ring > 0 && ring.checked_add(rows).is_some_and(|n| n <= staging),
+            "dynamic ring staging must cover history and appended rows"
+        );
+        let extent = if to_ring { rows.min(ring) } else { ring };
         let (src, _src) = self.source.device_ptr(self.stream);
         let (dst, _dst) = self.target.device_ptr_mut(self.stream);
         unsafe {
@@ -354,7 +364,7 @@ impl RingCopy<'_> {
                 .arg(&i32::try_from(self.heads)?)
                 .arg(&i32::try_from(self.head_dim)?)
                 .arg(&i32::from(to_ring))
-                .launch(super::ops::flat(self.heads * ring * self.head_dim))?;
+                .launch(super::ops::flat(self.heads * extent * self.head_dim))?;
         }
         Ok(())
     }
@@ -541,7 +551,6 @@ pub fn htod_bytes<T: crate::backend::gpu::DeviceRepr>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "cuda")]
     use anyhow::Context;
 
     #[cfg(feature = "cuda")]
@@ -805,6 +814,146 @@ mod tests {
                 "PASS ring_copy_geometry heads={heads} dim={head_dim} rows={rows} source_capacity={source_capacity} target_capacity={target_capacity} graph_eager_exact=true shifted_source_rejected=true"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "GPU window required; dynamic KV append and ring bounds"]
+    fn dynamic_ring_appended_rows_gpu() -> Result<()> {
+        let device = crate::backend::cuda::Device::new(0)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let module = crate::backend::cuda::cubin::module(&device.ctx, "rope")?;
+        let function = module.load_function("dynamic_ring_copy")?;
+        let (ring, dim) = (512usize, 256usize);
+        let sentinel = bf16::from_f32(-32.0);
+        let (mut cases, mut defects, mut controls) = (0, 0, 0);
+        for heads in [1usize, 2] {
+            for rows in [1usize, 7, 513] {
+                let staging = ring + rows;
+                for absolute in [0usize, 1, 511, 512, 513, 1024, 8192] {
+                    let position = s.clone_htod(&[absolute as i32])?;
+                    for to_ring in [false, true] {
+                        let (source_capacity, target_capacity) = if to_ring {
+                            (staging, ring)
+                        } else {
+                            (ring, staging)
+                        };
+                        let host: Vec<_> = (0..heads * source_capacity * dim)
+                            .map(|i| bf16::from_f32(((i * 37 + 11) % 1009) as f32 / 256.0 - 2.0))
+                            .collect();
+                        let source = s.clone_htod(&host)?;
+                        let empty = vec![sentinel; heads * target_capacity * dim + 32];
+                        let count = if to_ring {
+                            rows.min(ring)
+                        } else {
+                            absolute.min(ring)
+                        };
+                        let source_start = if to_ring {
+                            absolute.min(ring) + rows - count
+                        } else {
+                            absolute - count
+                        };
+                        let target_start = if to_ring { absolute + rows - count } else { 0 };
+                        let mut expected = empty.clone();
+                        for head in 0..heads {
+                            for row in 0..count {
+                                let src = (head * source_capacity
+                                    + (source_start + row) % source_capacity)
+                                    * dim;
+                                let dst = (head * target_capacity
+                                    + (target_start + row) % target_capacity)
+                                    * dim;
+                                expected[dst..dst + dim].copy_from_slice(&host[src..src + dim]);
+                            }
+                        }
+                        for graph in [false, true] {
+                            let mut target = s.clone_htod(&empty)?;
+                            s.synchronize()?;
+                            if graph {
+                                #[cfg(feature = "cuda")]
+                                s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                            }
+                            #[cfg(feature = "rocm")]
+                            let capture = if graph {
+                                Some(s.begin_capture()?)
+                            } else {
+                                None
+                            };
+                            let run = RingCopy {
+                                stream: s,
+                                source: &source,
+                                target: &mut target,
+                                source_capacity,
+                                target_capacity,
+                                heads,
+                                head_dim: dim,
+                            }
+                            .run_dynamic(&function, &position, rows, to_ring);
+                            if graph {
+                                #[cfg(feature = "cuda")]
+                                let captured = s
+                                    .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
+                                    .context("dynamic ring graph missing")?;
+                                #[cfg(feature = "rocm")]
+                                let captured =
+                                    capture.context("dynamic ring capture missing")?.finish()?;
+                                run?;
+                                captured.launch()?;
+                                captured.launch()?;
+                            } else {
+                                run?;
+                            }
+                            let actual = s.clone_dtoh(&target)?;
+                            let mismatches = actual
+                                .iter()
+                                .zip(&expected)
+                                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                                .count();
+                            defects += usize::from(mismatches != 0);
+                            cases += 1;
+                            println!(
+                                "DYNAMIC_RING {} heads={heads} rows={rows} position={absolute} to_ring={to_ring} graph={graph} bit_mismatches={mismatches}",
+                                if mismatches == 0 { "PASS" } else { "DEFECT" }
+                            );
+                        }
+                        if to_ring {
+                            let mut wrong = s.clone_htod(&empty)?;
+                            RingCopy {
+                                stream: s,
+                                source: &source,
+                                target: &mut wrong,
+                                source_capacity,
+                                target_capacity,
+                                heads,
+                                head_dim: dim,
+                            }
+                            .run(
+                                source_start,
+                                (target_start + 1) % ring,
+                                count,
+                                false,
+                                true,
+                            )?;
+                            let wrong = s.clone_dtoh(&wrong)?;
+                            let detected = wrong
+                                .iter()
+                                .zip(&expected)
+                                .any(|(a, b)| a.to_bits() != b.to_bits());
+                            controls += usize::from(detected);
+                            defects += usize::from(!detected);
+                        }
+                    }
+                }
+            }
+        }
+        println!(
+            "DYNAMIC_RING_RESULT cases={cases} defects={defects} wrong_slot_controls={controls}"
+        );
+        ensure!(
+            cases == 168 && defects == 0 && controls == 42,
+            "dynamic ring append/control failed"
+        );
         Ok(())
     }
 }

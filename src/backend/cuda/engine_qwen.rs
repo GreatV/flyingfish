@@ -568,7 +568,6 @@ struct GemmaOps {
     rope: CudaFunction,
     ring_copy: CudaFunction,
     branch_add: CudaFunction,
-    multiply: CudaFunction,
     per_layer: CudaFunction,
     rope_tables: [CudaSlice<bf16>; 2],
     per_layer_table: Tensor<bf16, 2>,
@@ -621,6 +620,7 @@ struct Layer {
     post_ffn_norm: Option<Tensor<bf16, 1>>,
     post_ple_norm: Option<Tensor<bf16, 1>>,
     layer_scalar: Option<Tensor<bf16, 1>>,
+    produces_next_norm: bool,
     mixer: BoundMixer,
 }
 
@@ -1373,7 +1373,6 @@ impl Runtime {
                     .load_function("dynamic_ring_copy")?,
                 branch_add: cubin::module(&engine.device.ctx, "q38_common")?
                     .load_function("rms_branch_add")?,
-                multiply: act.load_function("multiply")?,
                 per_layer: embed.load_function("per_layer_input")?,
                 rope_tables,
                 per_layer_table: matrix(
@@ -1826,6 +1825,20 @@ impl Runtime {
                     }
                 }
             };
+            let produces_next_norm = matches!(
+                &*crate::model::layer_program(&engine.model_spec, i)?,
+                [
+                    ..,
+                    crate::model::LayerStage::PerLayerInput,
+                    crate::model::LayerStage::Common(crate::backend::Operator::NextNorm)
+                ]
+            );
+            ensure!(
+                !produces_next_norm
+                    || (gemma_ops.is_some()
+                        && matches!(norm_mode(&engine.model_spec), RmsMode::Unrounded)),
+                "layer-end norm producer requires the bound unrounded branch operation"
+            );
             layers.push(Layer {
                 linear,
                 ffn,
@@ -1842,6 +1855,7 @@ impl Runtime {
                     .then(|| weight("post_per_layer_input_norm.weight"))
                     .transpose()?,
                 layer_scalar: gemma.then(|| weight("layer_scalar")).transpose()?,
+                produces_next_norm,
                 mixer,
             });
         }
@@ -5350,18 +5364,31 @@ impl Engine {
                 width,
             )?;
         }
-        q.common.gate.gelu(
+        q.common.gate.gelu_tanh_mul(
             s,
             heads(&w.gu, s, 0, rows, 1, width as u32)?,
+            heads(
+                &ops.per_layer_inputs,
+                s,
+                i * linear_rows * width,
+                rows,
+                1,
+                width as u32,
+            )?,
             &mut TensorMut(heads(&w.act, s, 0, rows, 1, width as u32)?),
-            crate::backend::cuda::ops::GeluMode::Tanh,
         )?;
-        if all_layers(trace) || i == self.trace_layer {
+        if trace.is_some() && (all_layers(trace) || i == self.trace_layer) {
+            q.common.gate.gelu(
+                s,
+                heads(&w.gu, s, 0, rows, 1, width as u32)?,
+                &mut TensorMut(heads(&w.gu, s, 0, rows, 1, width as u32)?),
+                crate::backend::cuda::ops::GeluMode::Tanh,
+            )?;
             trace_value(
                 trace,
                 s,
                 &debug_name(trace, i, "ple_act"),
-                &w.act,
+                &w.gu,
                 rows,
                 width,
             )?;
@@ -5374,23 +5401,12 @@ impl Engine {
                 width,
             )?;
         }
-        unsafe {
-            s.launch_builder(&ops.multiply)
-                .arg(&w.act)
-                .arg(
-                    &ops.per_layer_inputs
-                        .slice(i * linear_rows * width..(i + 1) * linear_rows * width),
-                )
-                .arg(&mut w.gu)
-                .arg(&((rows * width) as i32))
-                .launch(flat(rows * width))?;
-        }
         if all_layers(trace) || i == self.trace_layer {
             trace_value(
                 trace,
                 s,
                 &debug_name(trace, i, "ple_product"),
-                &w.gu,
+                &w.act,
                 rows,
                 width,
             )?;
@@ -5399,7 +5415,7 @@ impl Engine {
             &self.blas,
             "per_layer_projection.weight",
             phase,
-            matrix(&w.gu, s, 0, linear_rows, width)?,
+            matrix(&w.act, s, 0, linear_rows, width)?,
             &mut TensorMut(matrix(&w.out, s, 0, linear_rows, h)?),
         )?;
         unsafe {
@@ -5570,7 +5586,8 @@ impl Engine {
                     return Ok(());
                 }
                 if i == 0
-                    || (!flint
+                    || (!q.layers[i - 1].produces_next_norm
+                        && !flint
                         && ((self.model_spec.moe.is_some()
                             && !self.qwen_device_prefix
                             && step.input == crate::backend::Input::Ids)
@@ -5905,7 +5922,8 @@ impl Engine {
                         .context("GLM-5.3 mHC runtime is not bound")?
                         .collapse_final(s, rows, &mut w.x)?;
                 }
-                if !flint
+                if !q.layers[self.model_spec.layers.len() - 1].produces_next_norm
+                    && !flint
                     && ((self.model_spec.moe.is_some()
                         && !self.qwen_device_prefix
                         && step.input == crate::backend::Input::Ids)

@@ -470,7 +470,7 @@ extern "C" __global__ void dynamic_ring_copy(const __nv_bfloat16* source,
     int count, source_start, target_start;
     if (to_ring) {
         const int end = history + rows;
-        count = min(end, ring);
+        count = min(rows, ring);
         source_start = end - count;
         target_start = absolute + rows - count;
     } else {
@@ -478,10 +478,11 @@ extern "C" __global__ void dynamic_ring_copy(const __nv_bfloat16* source,
         source_start = absolute - history;
         target_start = 0;
     }
+    const int extent = to_ring ? min(rows, ring) : ring;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= heads * ring * dim) return;
-    const int head = i / (ring * dim);
-    const int row = (i / dim) % ring;
+    if (i >= heads * extent * dim) return;
+    const int head = i / (extent * dim);
+    const int row = (i / dim) % extent;
     const int d = i % dim;
     if (row >= count) return;
     const int source_row = to_ring ? source_start + row : (source_start + row) % source_capacity;
