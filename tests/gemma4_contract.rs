@@ -40,6 +40,12 @@ fn large_gemma_geometry_preserves_global_kv_and_absent_per_layer_inputs() -> Res
                 && spec.per_layer_input.is_none(),
             "large Gemma geometry"
         );
+        let work = flyingfish::work_layout::RowWorkSpec::new(&spec)?;
+        let expected_projection = if hidden == 3840 { 8704 } else { 18432 };
+        ensure!(
+            work.projection == expected_projection && work.mixer == heads as usize * 512,
+            "large Gemma projection/work bounds: {work:?}"
+        );
         for (index, layer) in spec.layers.iter().enumerate() {
             let geometry = geometry(&spec, index)?;
             let full = root["text_config"]["layer_types"][index] == "full_attention";
