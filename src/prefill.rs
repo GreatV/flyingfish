@@ -248,7 +248,7 @@ mod tests {
             assert!(plan.host_bytes <= host);
             assert_eq!(
                 plan.resident_bytes + plan.host_bytes + plan.disk_bytes,
-                layers.iter().sum()
+                layers.iter().sum::<usize>()
             );
             let mut sequence = 0;
             for (i, slot) in plan.slots.iter().enumerate() {
