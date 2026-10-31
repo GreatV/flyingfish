@@ -365,7 +365,7 @@ def capture_model(args, config):
             if name in semantic_cells and variant == "packed":
                 media_logits.append(logits[0].clone())
             del logits, captured, arguments
-        if audio and args.stage == "model" and name != "long":
+        if audio and args.stage == "model" and args.dtype == "bf16" and name != "long":
             before = counted[0]
             media = reference_media(data, "packed", args.device, audio)
             output = model(input_ids=ids[:, :prompt_length].to(args.device),
