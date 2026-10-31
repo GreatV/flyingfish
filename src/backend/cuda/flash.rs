@@ -478,12 +478,14 @@ impl Flash {
                     "attention_prefill_d256_window",
                     "attention_prefill_d256_bidirectional",
                     "attention_prefill_d256_blocks",
+                    "attention_prefill_d256_symmetric",
                 ]
             } else if head_dim == 256 {
                 &[
                     "attention_prefill_d256",
                     "attention_prefill_d256_bidirectional",
                     "attention_prefill_d256_blocks",
+                    "attention_prefill_d256_symmetric",
                 ]
             } else if (heads, kv_heads) == (32, 4) {
                 &["attention_prefill_d128", "attention_prefill_d128_window"]
@@ -714,6 +716,8 @@ impl Flash {
             if shape.window_left.is_some() { 5 } else { 4 }
         } else if prefix.is_some() {
             2
+        } else if shape.window_left.is_some() && !shape.causal {
+            6
         } else if shape.causal {
             0
         } else {
@@ -816,7 +820,9 @@ impl Flash {
                     self.native.len() - 1
                 } else if bidirectional_only {
                     0
-                } else if window && self.score.is_none() {
+                } else if mode == 6 {
+                    3
+                } else if window && self.score.is_none() && mode != 6 {
                     1
                 } else {
                     mode
@@ -938,11 +944,15 @@ impl Flash {
                     })?;
                     return Ok(());
                 }
-                if mode != 0 || window {
-                    launch.arg(&extent);
-                }
-                if mode == 1 && shape.head_dim == 256 {
-                    launch.arg(&0.0625f32);
+                if mode == 6 {
+                    launch.arg(&(keys as u32)).arg(&extent).arg(&0.0625f32);
+                } else {
+                    if mode != 0 || window {
+                        launch.arg(&extent);
+                    }
+                    if mode == 1 && shape.head_dim == 256 {
+                        launch.arg(&0.0625f32);
+                    }
                 }
                 launch.launch(LaunchConfig {
                     grid_dim: (
@@ -1509,7 +1519,8 @@ mod tests {
                     self.d,
                     Score {
                         scale,
-                        window_left: (self.mode == "window").then_some(self.extent),
+                        window_left: matches!(self.mode.as_str(), "window" | "symmetric")
+                            .then_some(self.extent),
                     },
                     self.capacity,
                 )
@@ -1584,7 +1595,8 @@ mod tests {
                     capacity: self.capacity,
                     head_dim: self.d,
                     causal: matches!(self.mode.as_str(), "causal" | "window"),
-                    window_left: (self.mode == "window").then_some(self.extent),
+                    window_left: matches!(self.mode.as_str(), "window" | "symmetric")
+                        .then_some(self.extent),
                 },
                 keys: self.keys,
                 prefix: (self.mode == "prefix").then_some(self.extent),
@@ -2101,6 +2113,9 @@ mod tests {
             "bidirectional" => key < case.keys,
             "prefix" => key < case.keys && key < case.extent.max(query + 1),
             "window" => key <= query && query - key <= case.extent,
+            "symmetric" => {
+                key + case.extent >= query && key <= query + case.extent && key < case.keys
+            }
             _ => key <= query,
         }
     }
@@ -2186,7 +2201,7 @@ mod tests {
         let mut mutant = case.clone();
         match case.mode.as_str() {
             "prefix" | "bidirectional" => mutant.mode = "causal".into(),
-            "window" => mutant.extent -= 1,
+            "window" | "symmetric" => mutant.extent -= 1,
             _ => {
                 mutant.start += 1;
                 mutant.keys += 1;
@@ -2259,6 +2274,8 @@ mod tests {
             (512, 16, 2, "bidirectional", 1, 0, 33, 0),
             (256, 16, 8, "bidirectional", 1, 0, 33, 0),
             (256, 16, 8, "bidirectional", 17, 33, 50, 0),
+            (256, 16, 8, "symmetric", 17, 0, 600, 512),
+            (256, 16, 8, "symmetric", 17, 513, 1100, 512),
             (512, 16, 2, "bidirectional", 17, 33, 50, 0),
             (128, 12, 12, "prefix", 65, 0, 65, 33),
             (128, 32, 4, "window", 17, 127, 144, 31),

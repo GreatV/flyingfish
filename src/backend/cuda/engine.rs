@@ -595,6 +595,7 @@ fn load_dispatch(architecture: crate::model_spec::Architecture) -> Result<LoadDi
         Architecture::DeepseekV41 => LoadDispatch::Deepseek,
         Architecture::Glm5Next => LoadDispatch::Qwen,
         Architecture::Gemma4 => LoadDispatch::Qwen,
+        Architecture::EmbeddingGemma2 => LoadDispatch::Qwen,
     })
 }
 

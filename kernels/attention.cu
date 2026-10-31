@@ -936,10 +936,10 @@ __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
         max(q+1, blocks[2*(origin+q)+1] > origin ? blocks[2*(origin+q)+1]-origin : 0));
   };
   const uint32_t end = MODE >= 4 ? keys : MODE == 1 ? extent : (MODE == 2 ? max(extent,p.start+p.rows) : p.start+p.rows);
-  uint32_t first = MODE == 3 && p.start+query_base > extent
+  uint32_t first = (MODE == 3 || MODE == 6) && p.start+query_base > extent
       ? (p.start+query_base-extent)/BK*BK : 0;
   if constexpr (MODE == 5) first = bounds(query_base).x/BK*BK;
-  uint32_t limit = MODE >= 4 ? min(end,bounds(min(query_base+BQ-1,p.rows-1)).y) : MODE == 1 ? end : min(end, MODE == 2
+  uint32_t limit = MODE == 6 ? end : MODE >= 4 ? min(end,bounds(min(query_base+BQ-1,p.rows-1)).y) : MODE == 1 ? end : min(end, MODE == 2
       ? max(extent,p.start+query_base+BQ) : p.start+query_base+BQ);
   if constexpr (PARTIAL) {
     first = max(first,partition*chunk);
@@ -966,7 +966,8 @@ __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
     const auto store_score = [&](int row, int column, float value) {
       const uint32_t key = base+column, query = p.start+query_base+row;
       const bool visible = query_base+row < p.rows && key < end &&
-          (MODE >= 4 ? key < bounds(query_base+row).y && (MODE != 5 || key >= bounds(query_base+row).x) :
+          (MODE == 6 ? key+extent >= query && key <= query+extent :
+              MODE >= 4 ? key < bounds(query_base+row).y && (MODE != 5 || key >= bounds(query_base+row).x) :
               (MODE == 1 || (MODE == 2 ? key < max(extent,query+1) : key <= query)) &&
               (MODE != 3 || query-key <= extent));
       score_memory[row*BK+column] = visible ? value*(EXPLICIT ? scale : (D == 256 ? 0.0625f : SCALE)) : -INFINITY;
@@ -1094,6 +1095,7 @@ extern "C" __global__ void attention_prefill_d256_blocks(prefill::Problem p, uin
   else prefill::run<256,5,true>(p,window,scale,nullptr,1,0,blocks,origin,keys);
 }
 extern "C" __global__ void attention_prefill_d512_blocks(prefill::Problem p, uint32_t keys, float scale, const uint32_t* blocks, uint32_t origin) { prefill::run<512,4,true>(p,UINT32_MAX,scale,nullptr,1,0,blocks,origin,keys); }
+extern "C" __global__ void attention_prefill_d256_symmetric(prefill::Problem p, uint32_t keys, uint32_t radius, float scale) { prefill::run<256,6,true>(p,radius,scale,nullptr,1,0,nullptr,0,keys); }
 extern "C" __global__ void attention_prefill_d256_window(prefill::Problem p, uint32_t window, float scale) { prefill::run<256,3,true>(p,window,scale); }
 extern "C" __global__ void attention_prefill_d512(prefill::Problem p, float scale) { prefill::run<512,0,true>(p,0,scale); }
 extern "C" __global__ void attention_prefill_d512_bidirectional(prefill::Problem p, uint32_t keys, float scale) { prefill::run<512,1,true>(p,keys,scale); }

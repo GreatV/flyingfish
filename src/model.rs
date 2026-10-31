@@ -499,7 +499,8 @@ pub fn layer_program(
         | crate::model_spec::Architecture::MiniCpmV47
         | crate::model_spec::Architecture::Flint
         | crate::model_spec::Architecture::LoopVl
-        | crate::model_spec::Architecture::Gemma4 => Ok(LayerProgram::Standard([
+        | crate::model_spec::Architecture::Gemma4
+        | crate::model_spec::Architecture::EmbeddingGemma2 => Ok(LayerProgram::Standard([
             LayerStage::Common(O::Norm),
             LayerStage::Mixer(mixer),
             LayerStage::Common(O::PostNorm),

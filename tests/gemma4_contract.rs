@@ -2,6 +2,7 @@
 use anyhow::{Context, Result, ensure};
 use flyingfish::{
     backend::Operator,
+    checkpoint::{LoadPolicy, MappedCheckpoint},
     model::{LayerStage, layer_program},
     model_spec::{Architecture, FfnKind, LayerGeometry, Mixer, ModelSpec, RopeSpec, VisionConfig},
     vision_input::{AudioClip, ImageGrid, MultimodalInput},
@@ -334,6 +335,41 @@ fn raw_audio_masks_and_mixed_splices_preserve_row_identity() -> Result<()> {
         input.validate(&large, 32).is_err(),
         "31B accepted absent audio weights"
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires FF_MODEL published EmbeddingGemma-2"]
+fn embedding_gemma2_spec_and_manifest_match_published_shapes() -> Result<()> {
+    let root: Value = serde_json::from_str(include_str!("data/embeddinggemma-2-config.json"))?;
+    let spec = ModelSpec::embedding_gemma2(&root, &Value::Null)?;
+    ensure!(spec.architecture == Architecture::EmbeddingGemma2);
+    ensure!(spec.hidden == 512 && spec.intermediate == 2048 && spec.q_width == 1024);
+    ensure!(spec.per_layer_input == Some(512) && spec.logit_softcap.is_none());
+    ensure!(spec.layers.len() == 24 && spec.vision.is_some());
+    for (index, full) in [(0, false), (5, true), (11, true), (17, true), (23, true)] {
+        let geometry = spec.layers[index].geometry.context("layer geometry")?;
+        ensure!(geometry.head_dim == if full { 512 } else { 256 });
+        ensure!(geometry.kv_heads == if full { Some(1) } else { None });
+        ensure!(geometry.rope.theta == if full { 1000000.0 } else { 10000.0 });
+    }
+    let model = std::env::var_os("FF_MODEL").context("FF_MODEL required")?;
+    let checkpoint = MappedCheckpoint::open(std::path::Path::new(&model))?;
+    let expected = checkpoint
+        .manifest(&spec, LoadPolicy::TextWithVision)?
+        .entries;
+    ensure!(expected.len() == 1376, "checkpoint tensor count differs");
+    ensure!(!expected.contains_key("lm_head.weight"));
+    ensure!(!expected.contains_key("language_model.embed_tokens_per_layer.weight"));
+    ensure!(expected["language_model.embedding_projection.weight"].shape == vec![768, 512]);
+    ensure!(
+        expected["language_model.ple.per_layer_model_projection.weight"].shape == vec![12288, 512]
+    );
+    for index in 0..24 {
+        ensure!(expected.contains_key(&format!(
+            "language_model.layers.{index}.self_attn.v_proj.weight"
+        )));
+    }
     Ok(())
 }
 

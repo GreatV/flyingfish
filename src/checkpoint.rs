@@ -204,6 +204,11 @@ impl MappedCheckpoint {
                 })?;
             return self.assemble_manifest("LoopVL", expected, policy, planned, None);
         }
+        if spec.architecture == Architecture::EmbeddingGemma2 {
+            let expected = self.gemma4_expected(spec)?;
+            let planned = planned_bytes(&expected, policy)?;
+            return self.assemble_manifest("EmbeddingGemma2", expected, policy, planned, None);
+        }
         if spec.architecture == Architecture::Gemma4 {
             ensure!(
                 matches!(
@@ -272,7 +277,8 @@ impl MappedCheckpoint {
             Architecture::Llama
             | Architecture::Glm5Next
             | Architecture::LoopVl
-            | Architecture::Gemma4 => {
+            | Architecture::Gemma4
+            | Architecture::EmbeddingGemma2 => {
                 bail!("checkpoint manifest requires a Qwen3.5-family spec")
             }
             Architecture::DeepseekV41 => {
@@ -316,7 +322,8 @@ impl MappedCheckpoint {
             Architecture::Llama
             | Architecture::Glm5Next
             | Architecture::LoopVl
-            | Architecture::Gemma4 => unreachable!(),
+            | Architecture::Gemma4
+            | Architecture::EmbeddingGemma2 => unreachable!(),
             Architecture::DeepseekV41 => {
                 unreachable!("DeepSeek-V4.1 has a dedicated manifest path")
             }
@@ -447,12 +454,16 @@ impl MappedCheckpoint {
             if vision.unified.is_some() {
                 Self::unified_vision_entries(vision, &mut expected)?;
             } else {
-                Self::axial_vision_entries(
-                    vision,
-                    "model.vision_tower",
-                    "model.embed_vision.embedding_projection.weight",
-                    &mut expected,
-                )?;
+                let (tower, projection) =
+                    if spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
+                        ("vision_tower", "embed_vision.embedding_projection.weight")
+                    } else {
+                        (
+                            "model.vision_tower",
+                            "model.embed_vision.embedding_projection.weight",
+                        )
+                    };
+                Self::axial_vision_entries(vision, tower, projection, &mut expected)?;
             }
         }
         if let Some(audio) = &spec.audio {
@@ -470,12 +481,16 @@ impl MappedCheckpoint {
             let scope = if spec.vision.is_none()
                 && (name.starts_with("model.vision_tower.")
                     || name.starts_with("model.embed_vision.")
-                    || name.starts_with("model.vision_embedder."))
+                    || name.starts_with("model.vision_embedder.")
+                    || name.starts_with("vision_tower.")
+                    || name.starts_with("embed_vision."))
             {
                 TensorScope::Vision
             } else if spec.audio.is_none()
                 && (name.starts_with("model.audio_tower.")
-                    || name.starts_with("model.embed_audio."))
+                    || name.starts_with("model.embed_audio.")
+                    || name.starts_with("audio_tower.")
+                    || name.starts_with("embed_audio."))
             {
                 TensorScope::Audio
             } else {
@@ -707,7 +722,11 @@ impl MappedCheckpoint {
         let depth = spec.layers.len();
         let ple = spec.per_layer_input.map(|width| width as usize);
         let q_heads = spec.q_heads as usize;
-        let text = "model.language_model";
+        let text = if spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
+            "language_model"
+        } else {
+            "model.language_model"
+        };
         let mut add = |name: String, shape: Vec<usize>, scope| {
             put(expected, name, Dtype::BF16, shape, scope);
         };
@@ -717,15 +736,27 @@ impl MappedCheckpoint {
             TensorScope::Text,
         );
         if let Some(ple) = ple {
-            for (name, shape) in [
-                (
-                    "embed_tokens_per_layer",
+            let module = if spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
+                "ple."
+            } else {
+                ""
+            };
+            if spec.architecture != crate::model_spec::Architecture::EmbeddingGemma2 {
+                add(
+                    format!("{text}.embed_tokens_per_layer.weight"),
                     vec![spec.vocab as usize, depth * ple],
-                ),
+                    TensorScope::Text,
+                );
+            }
+            for (name, shape) in [
                 ("per_layer_model_projection", vec![depth * ple, hidden]),
                 ("per_layer_projection_norm", vec![ple]),
             ] {
-                add(format!("{text}.{name}.weight"), shape, TensorScope::Text);
+                add(
+                    format!("{text}.{module}{name}.weight"),
+                    shape,
+                    TensorScope::Text,
+                );
             }
         }
         add(
@@ -733,6 +764,13 @@ impl MappedCheckpoint {
             vec![hidden],
             TensorScope::Text,
         );
+        if spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
+            add(
+                format!("{text}.embedding_projection.weight"),
+                vec![768, hidden],
+                TensorScope::Text,
+            );
+        }
         for (i, layer) in spec.layers.iter().enumerate() {
             let g = layer
                 .geometry
@@ -758,12 +796,22 @@ impl MappedCheckpoint {
                 );
             }
             if let Some(ple) = ple {
+                let block = if spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2
+                {
+                    ".ple_block"
+                } else {
+                    ""
+                };
                 for (name, shape) in [
                     ("post_per_layer_input_norm", vec![hidden]),
                     ("per_layer_input_gate", vec![ple, hidden]),
                     ("per_layer_projection", vec![hidden, ple]),
                 ] {
-                    add(format!("{p}.{name}.weight"), shape, TensorScope::Text);
+                    add(
+                        format!("{p}{block}.{name}.weight"),
+                        shape,
+                        TensorScope::Text,
+                    );
                 }
             }
             add(format!("{p}.layer_scalar"), vec![1], TensorScope::Text);
@@ -819,7 +867,8 @@ impl MappedCheckpoint {
             Architecture::Glm5Next
             | Architecture::LoopVl
             | Architecture::DeepseekV41
-            | Architecture::Gemma4 => {
+            | Architecture::Gemma4
+            | Architecture::EmbeddingGemma2 => {
                 unreachable!("architecture has a dedicated manifest path")
             }
         };
@@ -982,7 +1031,10 @@ impl MappedCheckpoint {
                         Architecture::Qwen35Text
                         | Architecture::MiniCpmV47
                         | Architecture::Llama => 2 * q_width,
-                        Architecture::Glm5Next | Architecture::LoopVl | Architecture::Gemma4 => {
+                        Architecture::Glm5Next
+                        | Architecture::LoopVl
+                        | Architecture::Gemma4
+                        | Architecture::EmbeddingGemma2 => {
                             unreachable!("architecture has a dedicated manifest path")
                         }
                         Architecture::DeepseekV41 => {

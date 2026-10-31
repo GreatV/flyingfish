@@ -398,7 +398,9 @@ impl MultimodalInput<'_> {
         match spec.architecture {
             Architecture::Qwen35Text => self.validate_qwen(spec, capacity),
             Architecture::MiniCpmV47 => self.validate_minicpm(spec, capacity),
-            Architecture::Gemma4 => self.validate_axial(spec, capacity),
+            Architecture::Gemma4 | Architecture::EmbeddingGemma2 => {
+                self.validate_axial(spec, capacity)
+            }
             Architecture::LoopVl => {
                 self.validate_loopvl(spec.vocab, spec.max_position as usize, capacity)
             }

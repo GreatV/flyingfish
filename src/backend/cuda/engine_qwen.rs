@@ -223,7 +223,8 @@ fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
         | Architecture::Flint
         | Architecture::Glm5Next
         | Architecture::LoopVl
-        | Architecture::Gemma4 => anyhow::bail!(
+        | Architecture::Gemma4
+        | Architecture::EmbeddingGemma2 => anyhow::bail!(
             "hybrid engine does not implement architecture={:?}",
             spec.architecture
         ),

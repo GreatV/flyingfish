@@ -315,6 +315,21 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_bidirectional(
 }
 
 /// # Safety
+/// Keys within `radius` of each query are visible; launch uses 128 threads and 98304 shared bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_prefill_d256_symmetric(
+    p: Attention,
+    keys: u32,
+    radius: u32,
+    scale: f32,
+) {
+    unsafe {
+        let p = resolve_position(p);
+        attention::<256, 32, 6, 256>(p, keys, radius, scale, core::ptr::null(), 0);
+    }
+}
+
+/// # Safety
 /// All keys below `keys` are populated in this sequence; launch uses 128 threads and 49152 shared bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128_bidirectional(p: Attention, keys: u32) {
@@ -467,7 +482,7 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
         let diagonal = p.start + qstart;
         let sk = sm + (128 * D) as u32;
         let sv = sm + (256 * D) as u32;
-        let stop = if MODE >= 4 {
+        let stop = if MODE == 4 || MODE == 5 {
             block_bounds(p, (qstart + 63).min(p.rows - 1), prefix, blocks, origin)[1].min(end)
         } else if MODE == 1 {
             end
@@ -476,7 +491,7 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
         } else {
             end.min(diagonal + 64)
         };
-        let interior = if MODE >= 4 {
+        let interior = if MODE == 4 || MODE == 5 {
             block_bounds(p, qstart, prefix, blocks, origin)[1].min(end)
         } else if MODE == 1 {
             end
@@ -495,7 +510,7 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
         let kv = (head / p.group) as usize * p.capacity as usize * L;
         let first = if MODE == 5 {
             block_bounds(p, qstart, prefix, blocks, origin)[0] / 64 * 64
-        } else if MODE == 3 {
+        } else if MODE == 3 || MODE == 6 {
             diagonal.saturating_sub(prefix) / 64 * 64
         } else {
             0
@@ -625,7 +640,7 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
                         if $masked || MODE >= 3 {
                             let col = key + $n * 8 + (lane & 3) * 2;
                             if col
-                                >= if MODE >= 4 {
+                                >= if MODE == 4 || MODE == 5 {
                                     block_bounds(p, qstart + r0, prefix, blocks, origin)[1].min(end)
                                 } else if MODE == 1 {
                                     end
@@ -638,7 +653,7 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
                                 scores[$n][0] = f32::NEG_INFINITY;
                             }
                             if col + 1
-                                >= if MODE >= 4 {
+                                >= if MODE == 4 || MODE == 5 {
                                     block_bounds(p, qstart + r0, prefix, blocks, origin)[1].min(end)
                                 } else if MODE == 1 {
                                     end
@@ -651,7 +666,7 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
                                 scores[$n][1] = f32::NEG_INFINITY;
                             }
                             if col
-                                >= if MODE >= 4 {
+                                >= if MODE == 4 || MODE == 5 {
                                     block_bounds(p, qstart + r1, prefix, blocks, origin)[1].min(end)
                                 } else if MODE == 1 {
                                     end
@@ -664,7 +679,7 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
                                 scores[$n][2] = f32::NEG_INFINITY;
                             }
                             if col + 1
-                                >= if MODE >= 4 {
+                                >= if MODE == 4 || MODE == 5 {
                                     block_bounds(p, qstart + r1, prefix, blocks, origin)[1].min(end)
                                 } else if MODE == 1 {
                                     end
@@ -677,7 +692,7 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
                                 scores[$n][3] = f32::NEG_INFINITY;
                             }
                         }
-                        if MODE == 3 || MODE == 5 {
+                        if MODE == 3 || MODE == 5 || MODE == 6 {
                             let col = key + $n * 8 + (lane & 3) * 2;
                             let lo0 = if MODE == 5 {
                                 block_bounds(p, qstart + r0, prefix, blocks, origin)[0]
