@@ -15,6 +15,218 @@ const MUTANT_FRACTION: f64 = 0.01;
 
 type Fixture = BTreeMap<String, (Vec<usize>, Vec<bf16>)>;
 
+#[test]
+#[ignore = "requires a GPU"]
+fn shared_kv_preparation_matches_independent_raw_projection_gpu() -> Result<()> {
+    let device = Device::new(0)?;
+    let s = &device.stream;
+    let module = cubin::module(&device.ctx, "rope")?;
+    let independent = module.load_function("qknorm_rope_table_kv")?;
+    let shared = module.load_function("qknorm_rope_table_shared_kv")?;
+    let mut cases = 0;
+    for (hq, hkv) in [(16usize, 1usize), (16, 2), (32, 4)] {
+        for d in [256usize, 512] {
+            for rows in [1usize, 17, 1032] {
+                let capacity = rows + 35;
+                let q_width = hq * d;
+                let kv_width = hkv * d;
+                let raw: Vec<_> = (0..rows * (q_width + kv_width))
+                    .map(|i| bf16::from_f32(((i * 37 % 1009) as f32 - 504.0) / 128.0))
+                    .collect();
+                let mut copied = raw.clone();
+                copied.extend_from_slice(&raw[rows * q_width..]);
+                let norms: Vec<_> = (0..d)
+                    .map(|i| bf16::from_f32(0.25 + (i * 17 % 101) as f32 / 32.0))
+                    .collect();
+                let norms = s.clone_htod(&norms)?;
+                let rope = crate::model_spec::RopeSpec {
+                    theta: if d == 512 { 1_000_000.0 } else { 10_000.0 },
+                    pairs: if d == 512 { 64 } else { 128 },
+                    pair_stride: d as u32 / 2,
+                    denominator: d as u32,
+                };
+                let table = s.clone_htod(&rope.table(d as u32, capacity)?)?;
+                let start = s.clone_htod(&[13i32])?;
+                let run = |shared_input: bool| -> Result<_> {
+                    let mut qkv = s.clone_htod(if shared_input { &raw } else { &copied })?;
+                    let poison = vec![bf16::from_f32(-71.0); hkv * capacity * d];
+                    let mut k = s.clone_htod(&poison)?;
+                    let mut v = s.clone_htod(&poison)?;
+                    unsafe {
+                        s.launch_builder(if shared_input { &shared } else { &independent })
+                            .arg(&mut qkv)
+                            .arg(&mut k)
+                            .arg(&mut v)
+                            .arg(&norms)
+                            .arg(&norms)
+                            .arg(&table)
+                            .arg(&start)
+                            .arg(&-1i32)
+                            .arg(&(rows as i32))
+                            .arg(&(hq as i32))
+                            .arg(&(hkv as i32))
+                            .arg(&(d as i32))
+                            .arg(&(capacity as i32))
+                            .arg(&0i32)
+                            .arg(&1e-6f32)
+                            .arg(&(q_width as u64))
+                            .arg(&((rows * q_width) as u64))
+                            .arg(&(kv_width as u64))
+                            .arg(&((rows * (q_width + kv_width)) as u64))
+                            .arg(&(kv_width as u64))
+                            .launch(LaunchConfig {
+                                grid_dim: (
+                                    (rows * (hq + if shared_input { hkv } else { 2 * hkv })) as u32,
+                                    1,
+                                    1,
+                                ),
+                                block_dim: (128, 1, 1),
+                                shared_mem_bytes: 0,
+                            })?;
+                    }
+                    Ok((
+                        s.clone_dtoh(&qkv.slice(..raw.len()))?,
+                        s.clone_dtoh(&k)?,
+                        s.clone_dtoh(&v)?,
+                    ))
+                };
+                let expected = run(false)?;
+                let actual = run(true)?;
+                let repeat = run(true)?;
+                ensure!(
+                    actual == expected && repeat == actual,
+                    "shared KV differs rows={rows} hq={hq} hkv={hkv} d={d}"
+                );
+                ensure!(
+                    actual.1 != actual.2,
+                    "normalized/rotated K-as-V control undetected"
+                );
+                for head in 0..hkv {
+                    for position in (0..13).chain(13 + rows..capacity) {
+                        let begin = (head * capacity + position) * d;
+                        ensure!(
+                            actual.1[begin..begin + d]
+                                .iter()
+                                .chain(&actual.2[begin..begin + d])
+                                .all(|x| *x == bf16::from_f32(-71.0)),
+                            "cache guard overwritten"
+                        );
+                    }
+                }
+                println!(
+                    "SHARED_KV_PREP rows={rows} hq={hq} hkv={hkv} d={d} bit_mismatches=0 repeat_mismatches=0 wrong_value_control=detected guards=PASS"
+                );
+                cases += 1;
+            }
+        }
+    }
+    println!("PASS shared_kv_preparation cells={cases} defects=0");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a GPU"]
+fn per_layer_kv_state_and_checkpoint_preserve_heads_gpu() -> Result<()> {
+    let device = Device::new(0)?;
+    let s = &device.stream;
+    for (text, bytes) in [
+        (
+            include_str!("../../../tests/data/gemma4-12b-config.json"),
+            369_098_752usize,
+        ),
+        (
+            include_str!("../../../tests/data/gemma4-31b-config.json"),
+            1_006_632_960,
+        ),
+    ] {
+        let spec = crate::model_spec::ModelSpec::gemma4(
+            &serde_json::from_str(text)?,
+            &serde_json::Value::Null,
+        )?;
+        let mut state = super::state::StateStore::new(&spec, 2048, s)?;
+        ensure!(
+            state.bytes() == bytes + 32,
+            "per-layer state byte accounting"
+        );
+        state.set_sequence(s, 1022, 8, 8)?;
+        let mut token = s.clone_htod(&[17u32])?;
+        for (index, kv) in state.kv.iter_mut().enumerate() {
+            let g = spec.layers[index].geometry.context("layer geometry")?;
+            let heads = g.kv_heads.unwrap_or(spec.kv_heads) as usize;
+            let dim = g.head_dim as usize;
+            let capacity = spec.layers[index]
+                .sliding_window
+                .map_or(2048, |w| w as usize);
+            ensure!(
+                kv.k.len() == heads * capacity * dim && kv.v.len() == kv.k.len(),
+                "layer {index} allocation"
+            );
+            for head in 0..heads {
+                for row in 0..8 {
+                    let offset = (head * capacity + (1022 + row) % capacity) * dim;
+                    let values: Vec<_> = (0..dim)
+                        .map(|d| {
+                            bf16::from_f32(
+                                ((index * 17 + head * 41 + row * 29 + d * 7) % 1013) as f32 / 64.0,
+                            )
+                        })
+                        .collect();
+                    s.memcpy_htod(&values, &mut kv.k.slice_mut(offset..offset + dim))?;
+                    s.memcpy_htod(&values, &mut kv.v.slice_mut(offset..offset + dim))?;
+                }
+            }
+        }
+        let mut checkpoint = super::state::StateCheckpoint::new(&state, &spec, 8, s)?;
+        checkpoint.save(&state, &token, 1022, s, None)?;
+        let mut wrong = spec.clone();
+        for layer in &mut wrong.layers {
+            layer.geometry.as_mut().context("layer geometry")?.kv_heads = None;
+        }
+        let mut wrong_checkpoint = super::state::StateCheckpoint::new(&state, &wrong, 8, s)?;
+        ensure!(
+            wrong_checkpoint
+                .save(&state, &token, 1022, s, None)
+                .is_err(),
+            "model-wide KV-head control undetected"
+        );
+        for kv in &mut state.kv {
+            s.memset_zeros(&mut kv.k)?;
+            s.memset_zeros(&mut kv.v)?;
+        }
+        checkpoint.restore(&mut state, &mut token, s)?;
+        for (index, kv) in state.kv.iter().enumerate() {
+            let g = spec.layers[index].geometry.context("layer geometry")?;
+            let heads = g.kv_heads.unwrap_or(spec.kv_heads) as usize;
+            let dim = g.head_dim as usize;
+            let capacity = spec.layers[index]
+                .sliding_window
+                .map_or(2048, |w| w as usize);
+            for head in 0..heads {
+                for row in 0..8 {
+                    let offset = (head * capacity + (1022 + row) % capacity) * dim;
+                    let expected: Vec<_> = (0..dim)
+                        .map(|d| {
+                            bf16::from_f32(
+                                ((index * 17 + head * 41 + row * 29 + d * 7) % 1013) as f32 / 64.0,
+                            )
+                        })
+                        .collect();
+                    ensure!(
+                        s.clone_dtoh(&kv.k.slice(offset..offset + dim))? == expected
+                            && s.clone_dtoh(&kv.v.slice(offset..offset + dim))? == expected,
+                        "snapshot head/row mismatch"
+                    );
+                }
+            }
+        }
+        println!(
+            "PASS per_layer_kv_state hidden={} cache_bytes={bytes} checkpoint_bits=0 wrong_heads_control=detected",
+            spec.hidden
+        );
+    }
+    Ok(())
+}
+
 fn load_fixture(path: &std::path::Path) -> Result<Fixture> {
     let bytes = std::fs::read(path)?;
     let tensors = SafeTensors::deserialize(&bytes)?;

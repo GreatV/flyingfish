@@ -142,7 +142,7 @@ extern "C" __global__ void rope_float(__nv_bfloat16* qkv, const int* start,
     qkv[off + dim / 2] = __float2bfloat16(b * c + a * s);
 }
 
-template <bool ROTARY, bool PLANAR, bool TABLE = false>
+template <bool ROTARY, bool PLANAR, bool TABLE = false, bool SHARED_KV = false>
 __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
                                                     __nv_bfloat16* k, __nv_bfloat16* v,
                                                     const __nv_bfloat16* q_norm_w,
@@ -167,7 +167,7 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
         (ring_tokens > 0 && cache_start >= 0))
         __trap();
     __shared__ float smem[32];
-    const int heads = q_heads + 2 * kv_heads;
+    const int heads = q_heads + (SHARED_KV ? 1 : 2) * kv_heads;
     const int row = blockIdx.x / heads;
     const int head = blockIdx.x % heads;
     if (row >= rows) return;
@@ -221,6 +221,14 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
         const float rstd = powf(smem[0] / (float)dim + eps, -0.5f);
 
         if (gid < dim / 8) {
+            if constexpr (SHARED_KV) {
+                if (head >= q_heads) {
+                    const size_t dst = ((size_t)(head - q_heads) * capacity + cache_pos) * dim;
+#pragma unroll
+                    for (int j = 0; j < 8; ++j)
+                        v[dst + gid * 8 + j] = __float2bfloat16_rn(r[j] * rstd);
+                }
+            }
             float ww[8], out[8];
             const __nv_bfloat16* wp = w + (size_t)gid * 8;
             union U { float4 x; __nv_bfloat162 h[4]; } u;
@@ -410,6 +418,27 @@ extern "C" __global__ void qknorm_rope_table_kv(__nv_bfloat16* qkv,
                                           rows, q_heads, kv_heads, dim, capacity, ring_tokens,
                                           1.0f, eps, q_row_stride, k_offset, k_row_stride,
                                           v_offset, v_row_stride, table);
+}
+
+extern "C" __global__ void qknorm_rope_table_shared_kv(__nv_bfloat16* qkv,
+                                                 __nv_bfloat16* k, __nv_bfloat16* v,
+                                                 const __nv_bfloat16* q_norm_w,
+                                                 const __nv_bfloat16* k_norm_w,
+                                                 const __nv_bfloat16* table,
+                                                 const int* start,
+                                                 int cache_start,
+                                                 int rows, int q_heads, int kv_heads,
+                                                 int dim, int capacity,
+                                                 int ring_tokens, float eps,
+                                                 unsigned long long q_row_stride,
+                                                 unsigned long long k_offset,
+                                                 unsigned long long k_row_stride,
+                                                 unsigned long long v_offset,
+                                                 unsigned long long v_row_stride) {
+    qknorm_rope_kv_impl<true, true, true, true>(qkv, k, v, q_norm_w, k_norm_w, start,
+                                             cache_start, rows, q_heads, kv_heads, dim,
+                                             capacity, ring_tokens, 1.0f, eps, q_row_stride,
+                                             k_offset, k_row_stride, v_offset, v_row_stride, table);
 }
 
 // Adjacent-pair layout mode of the rope op (the model definition's complex
