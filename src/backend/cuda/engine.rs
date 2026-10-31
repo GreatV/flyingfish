@@ -3488,23 +3488,16 @@ impl Engine {
             {
                 let result = if self.moe.is_some() {
                     self.run_moe_graph(1)
+                } else if let Some(graph) = &self.graph {
+                    #[cfg(feature = "cuda")]
+                    let launched = graph.launch().map_err(Into::into);
+                    #[cfg(feature = "rocm")]
+                    let launched = graph.launch();
+                    launched
                 } else if self.dense_streaming() {
                     self.run_dense_graph()
                 } else {
-                    #[cfg(feature = "cuda")]
-                    let launched = self
-                        .graph
-                        .as_ref()
-                        .context("decode graph is not captured")?
-                        .launch()
-                        .map_err(Into::into);
-                    #[cfg(feature = "rocm")]
-                    let launched = self
-                        .graph
-                        .as_ref()
-                        .context("decode graph is not captured")?
-                        .launch();
-                    launched
+                    anyhow::bail!("decode graph is not captured");
                 };
                 if let Err(error) = result {
                     self.poisoned = true;
@@ -5677,13 +5670,10 @@ impl Engine {
         }
         if self.spec.is_none() {
             self.capture()?;
-            if self.dense_streaming() {
-                self.run_dense_graph()?;
+            if let Some(graph) = &self.graph {
+                graph.launch()?;
             } else {
-                self.graph
-                    .as_ref()
-                    .context("decode Graph missing")?
-                    .launch()?;
+                self.run_dense_graph()?;
             }
             self.device.stream.synchronize()?;
             self.check_logits()?;
