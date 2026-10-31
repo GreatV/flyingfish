@@ -4,7 +4,7 @@ use flyingfish::{
     backend::Operator,
     model::{LayerStage, layer_program},
     model_spec::{Architecture, FfnKind, LayerGeometry, Mixer, ModelSpec, RopeSpec, VisionConfig},
-    vision_input::{ImageGrid, MultimodalInput},
+    vision_input::{AudioClip, ImageGrid, MultimodalInput},
 };
 use serde_json::{Value, json};
 
@@ -70,6 +70,129 @@ fn large_gemma_geometry_preserves_global_kv_and_absent_per_layer_inputs() -> Res
             ensure!(
                 ModelSpec::gemma4(&mutant, &Value::Null).is_err(),
                 "accepted {key} mutant"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn audio_masks_and_mixed_splices_preserve_token_identity() -> Result<()> {
+    for text in [E2B, E4B] {
+        let (root, spec) = read(text)?;
+        let a = spec.audio.as_ref().context("audio config")?;
+        for frames in [1usize, 3, 4, 5, 47, 48, 49, 3000] {
+            let features = vec![0.25; frames * 128];
+            let mut mask = vec![true; frames];
+            if frames > 1 {
+                mask[frames - 1] = false;
+            }
+            let count = mask.iter().step_by(4).filter(|&&v| v).count();
+            let audio = [AudioClip {
+                features: &features,
+                mask: &mask,
+            }];
+            let mut ids = vec![a.start_token];
+            ids.extend(std::iter::repeat_n(a.token, count));
+            ids.push(a.end_token);
+            let mut modalities = vec![3; ids.len()];
+            modalities[0] = 0;
+            modalities[count + 1] = 0;
+            let input = MultimodalInput {
+                input_ids: &ids,
+                modality_ids: &modalities,
+                pixel_values: &[],
+                grids: &[],
+                audio: &audio,
+            };
+            let plan = input.validate(&spec, 1024)?;
+            ensure!(
+                plan.feature_rows() == count && plan.audio_slots()[0].tokens == (1..count + 1),
+                "audio mask stride changed"
+            );
+            let ranges = plan.splices(1..count + 1)?;
+            ensure!(
+                ranges.len() == 1 && ranges[0].feature_rows == (0..count),
+                "audio splice changed"
+            );
+            let mut wrong = modalities.clone();
+            wrong[1] = 0;
+            ensure!(
+                MultimodalInput {
+                    modality_ids: &wrong,
+                    ..input
+                }
+                .validate(&spec, 1024)
+                .is_err(),
+                "audio placeholder marked text was accepted"
+            );
+        }
+        let v = spec.vision.as_ref().context("vision config")?;
+        let features = vec![0.5; 9 * 128];
+        let mask = [true; 9];
+        let audio = [AudioClip {
+            features: &features,
+            mask: &mask,
+        }];
+        let grid = [ImageGrid { t: 1, h: 3, w: 3 }];
+        let pixels = vec![0.5; 9 * 768];
+        let ids = [
+            a.start_token,
+            a.token,
+            a.token,
+            a.token,
+            a.end_token,
+            v.start_token,
+            v.image_token,
+            v.end_token,
+            10,
+        ];
+        let modalities = [0, 3, 3, 3, 0, 0, 1, 0, 0];
+        let input = MultimodalInput {
+            input_ids: &ids,
+            modality_ids: &modalities,
+            pixel_values: &pixels,
+            grids: &grid,
+            audio: &audio,
+        };
+        let plan = input.validate(&spec, 32)?;
+        ensure!(
+            plan.audio_slots()[0].features == (0..3)
+                && plan.slots()[0].features == (3..4)
+                && plan.feature_rows() == 4
+                && plan.axes()[0] == [0, 1, 2, 3, 4, 5, 6, 7, 8],
+            "mixed media order changed"
+        );
+        let splices = plan.splices(2..8)?;
+        ensure!(
+            splices.contains(&flyingfish::vision_input::SpliceRange {
+                chunk_rows: 0..2,
+                feature_rows: 1..3
+            }) && splices.contains(&flyingfish::vision_input::SpliceRange {
+                chunk_rows: 4..5,
+                feature_rows: 3..4
+            }),
+            "mixed chunk splice misaligned"
+        );
+        ensure!(
+            MultimodalInput {
+                audio: &[],
+                ..input
+            }
+            .validate(&spec, 32)
+            .is_err(),
+            "missing audio accepted"
+        );
+        for key in [
+            "conv_kernel_size",
+            "attention_context_left",
+            "output_proj_dims",
+        ] {
+            let mut wrong = root.clone();
+            wrong["audio_config"][key] = json!(7);
+            ensure!(
+                ModelSpec::gemma4(&wrong, &Value::Null).is_err(),
+                "unsupported audio geometry accepted"
             );
         }
     }
@@ -232,6 +355,7 @@ fn axial_vision_preserves_geometry_and_image_slot_bounds() -> Result<()> {
             let pixels = vec![0.5; (h * w * 768) as usize];
             let grids = [ImageGrid { t: 1, h, w }];
             let input = MultimodalInput {
+                audio: &[],
                 input_ids: &ids,
                 modality_ids: &modalities,
                 pixel_values: &pixels,
@@ -262,6 +386,7 @@ fn axial_vision_preserves_geometry_and_image_slot_bounds() -> Result<()> {
             wrong_ids[features + 1] = 17;
             ensure!(
                 MultimodalInput {
+                    audio: &[],
                     input_ids: &wrong_ids,
                     ..input
                 }
@@ -271,6 +396,7 @@ fn axial_vision_preserves_geometry_and_image_slot_bounds() -> Result<()> {
             );
             ensure!(
                 MultimodalInput {
+                    audio: &[],
                     pixel_values: &pixels[..pixels.len() - 1],
                     ..input
                 }
@@ -284,6 +410,7 @@ fn axial_vision_preserves_geometry_and_image_slot_bounds() -> Result<()> {
             }];
             ensure!(
                 MultimodalInput {
+                    audio: &[],
                     grids: &wrong_grid,
                     ..input
                 }

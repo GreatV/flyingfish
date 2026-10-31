@@ -3223,12 +3223,14 @@ mod tests {
         let pixels = vec![0.25; 2 * 2520 * 768];
         let grids = [ImageGrid { t: 1, h: 42, w: 60 }; 2];
         let input = MultimodalInput {
+            audio: &[],
             input_ids: &ids,
             modality_ids: &modalities,
             pixel_values: &pixels,
             grids: &grids,
         };
         let single = MultimodalInput {
+            audio: &[],
             input_ids: &ids[..282],
             modality_ids: &modalities[..282],
             pixel_values: &pixels[..2520 * 768],
@@ -3532,6 +3534,7 @@ mod tests {
         for width in [1536, 2048, 2560, OUTPUT] {
             let io = Arc::new(VisionIo::new(&device, width)?);
             let plan = MultimodalInput {
+                audio: &[],
                 input_ids: &ids,
                 modality_ids: &modalities,
                 pixel_values: &pixels,
@@ -3818,6 +3821,7 @@ mod tests {
                 .map(|v| f32::from_le_bytes(*v))
                 .collect();
             let input = MultimodalInput {
+                audio: &[],
                 input_ids: &ids,
                 modality_ids: &modalities,
                 pixel_values: &pixels,
@@ -3947,6 +3951,7 @@ mod tests {
                 vision_config.patch as usize,
             );
             let input = MultimodalInput {
+                audio: &[],
                 input_ids: &merged.ids,
                 modality_ids: &merged.modalities,
                 pixel_values: &merged_pixels,
@@ -4986,6 +4991,7 @@ mod tests {
                 .map(|v| f32::from_le_bytes(*v))
                 .collect();
             let input = MultimodalInput {
+                audio: &[],
                 input_ids: &ids,
                 modality_ids: &modalities,
                 pixel_values: &pixels,

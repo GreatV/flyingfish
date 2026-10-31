@@ -6521,6 +6521,7 @@ fn q38_engine_capture_gpu() -> Result<()> {
             .map(|v| f32::from_le_bytes(*v))
             .collect();
         let input = crate::vision_input::MultimodalInput {
+            audio: &[],
             input_ids: &ids,
             modality_ids: &modalities,
             grids: &grids,

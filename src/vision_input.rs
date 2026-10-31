@@ -172,19 +172,53 @@ pub struct SpliceRange {
     pub feature_rows: Range<usize>,
 }
 
+pub struct AudioClip<'a> {
+    pub features: &'a [f32],
+    pub mask: &'a [bool],
+}
+
+impl AudioClip<'_> {
+    fn output_rows(&self) -> Result<usize> {
+        ensure!(
+            !self.mask.is_empty()
+                && self.mask.len() <= 3000
+                && self.mask.len().checked_mul(128) == Some(self.features.len())
+                && self
+                    .features
+                    .iter()
+                    .all(|&v| v.is_finite() && half::bf16::from_f32(v).is_finite()),
+            "audio requires finite [frames,128] features and 1..3000 frame masks"
+        );
+        let rows = self.mask.iter().step_by(4).filter(|&&valid| valid).count();
+        ensure!(
+            rows > 0 && rows <= 750,
+            "audio soft-token count outside 1..750"
+        );
+        Ok(rows)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AudioSlot {
+    pub tokens: Range<usize>,
+    pub features: Range<usize>,
+}
+
 pub struct MultimodalInput<'a> {
     pub input_ids: &'a [u32],
-    /// 0 = text, 1 = image, 2 = video.
+    /// 0 = text, 1 = image, 2 = video, 3 = audio.
     pub modality_ids: &'a [u8],
     /// Processor-packed rows: axial vision uses [patch_y, patch_x, channel]; other towers use their declared patch layout.
     pub pixel_values: &'a [f32],
     pub grids: &'a [ImageGrid],
+    pub audio: &'a [AudioClip<'a>],
 }
 
 #[derive(Clone, Debug)]
 pub struct PositionPlan {
     axes: [Vec<i32>; 3],
     slots: Vec<ImageSlot>,
+    audio_slots: Vec<AudioSlot>,
     capacity: usize,
     rope_delta: i64,
     patch_rows: usize,
@@ -201,6 +235,7 @@ impl PositionPlan {
         Ok(Self {
             axes: [positions.clone(), positions.clone(), positions],
             slots: Vec::new(),
+            audio_slots: Vec::new(),
             capacity,
             rope_delta: 0,
             patch_rows: 0,
@@ -213,6 +248,9 @@ impl PositionPlan {
     }
     pub fn slots(&self) -> &[ImageSlot] {
         &self.slots
+    }
+    pub fn audio_slots(&self) -> &[AudioSlot] {
+        &self.audio_slots
     }
     pub fn rope_delta(&self) -> i64 {
         self.rope_delta
@@ -257,11 +295,17 @@ impl PositionPlan {
         Ok(self
             .slots
             .iter()
-            .filter_map(|slot| {
-                let start = rows.start.max(slot.tokens.start);
-                let end = rows.end.min(slot.tokens.end);
+            .map(|slot| (&slot.tokens, &slot.features))
+            .chain(
+                self.audio_slots
+                    .iter()
+                    .map(|slot| (&slot.tokens, &slot.features)),
+            )
+            .filter_map(|(tokens, features)| {
+                let start = rows.start.max(tokens.start);
+                let end = rows.end.min(tokens.end);
                 (start < end).then(|| {
-                    let feature_start = slot.features.start + start - slot.tokens.start;
+                    let feature_start = features.start + start - tokens.start;
                     SpliceRange {
                         chunk_rows: start - rows.start..end - rows.start,
                         feature_rows: feature_start..feature_start + end - start,
@@ -306,6 +350,10 @@ impl PositionPlan {
 
 impl MultimodalInput<'_> {
     pub fn validate(&self, spec: &ModelSpec, capacity: usize) -> Result<PositionPlan> {
+        ensure!(
+            self.audio.is_empty() || spec.audio.is_some(),
+            "audio input requires a supported audio tower"
+        );
         match spec.architecture {
             Architecture::Qwen35Text => self.validate_qwen(spec, capacity),
             Architecture::MiniCpmV47 => self.validate_minicpm(spec, capacity),
@@ -339,7 +387,7 @@ impl MultimodalInput<'_> {
         let mut plan = PositionPlan::text(self.input_ids.len(), capacity)?;
         ensure!(
             self.modality_ids.len() == self.input_ids.len()
-                && self.modality_ids.iter().all(|&m| m <= 1)
+                && self.modality_ids.iter().all(|&m| matches!(m, 0 | 1 | 3))
                 && self
                     .input_ids
                     .iter()
@@ -349,6 +397,16 @@ impl MultimodalInput<'_> {
         let mut cursor = 0;
         while cursor < self.input_ids.len() {
             let id = self.input_ids[cursor];
+            if let Some(audio) = &spec.audio {
+                if id == audio.start_token {
+                    cursor = self.validate_audio_span(audio, cursor, &mut plan)?;
+                    continue;
+                }
+                ensure!(
+                    id != audio.token && id != audio.end_token,
+                    "audio token outside its delimited span"
+                );
+            }
             if id != vision.start_token {
                 ensure!(
                     self.modality_ids[cursor] == 0
@@ -414,8 +472,10 @@ impl MultimodalInput<'_> {
             cursor = end + 1;
         }
         ensure!(
-            plan.slots.len() == self.grids.len() && !plan.slots.is_empty(),
-            "image grid/span count mismatch"
+            plan.slots.len() == self.grids.len()
+                && plan.audio_slots.len() == self.audio.len()
+                && (!plan.slots.is_empty() || !plan.audio_slots.is_empty()),
+            "media payload/span count mismatch"
         );
         let elements = plan
             .patch_rows
@@ -430,6 +490,41 @@ impl MultimodalInput<'_> {
             "image pixels require finite rescaled [patch,patch_y,patch_x,channel] values"
         );
         Ok(plan)
+    }
+
+    fn validate_audio_span(
+        &self,
+        audio: &crate::model_spec::AudioConfig,
+        cursor: usize,
+        plan: &mut PositionPlan,
+    ) -> Result<usize> {
+        let clip = self
+            .audio
+            .get(plan.audio_slots.len())
+            .context("audio span has no clip")?;
+        let count = clip.output_rows()?;
+        let start = cursor + 1;
+        let end = start.checked_add(count).context("audio span overflow")?;
+        ensure!(
+            self.modality_ids[cursor] == 0
+                && self.input_ids.get(end) == Some(&audio.end_token)
+                && self.modality_ids.get(end) == Some(&0)
+                && self.input_ids[start..end]
+                    .iter()
+                    .all(|&id| id == audio.token)
+                && self.modality_ids[start..end].iter().all(|&m| m == 3),
+            "audio placeholder count or delimiter mismatch"
+        );
+        let feature_end = plan
+            .feature_rows
+            .checked_add(count)
+            .context("audio feature count overflow")?;
+        plan.audio_slots.push(AudioSlot {
+            tokens: start..end,
+            features: plan.feature_rows..feature_end,
+        });
+        plan.feature_rows = feature_end;
+        Ok(end + 1)
     }
 
     fn validate_loopvl(
@@ -550,6 +645,7 @@ impl MultimodalInput<'_> {
         let mut plan = PositionPlan {
             axes: std::array::from_fn(|_| Vec::with_capacity(len)),
             slots: Vec::new(),
+            audio_slots: Vec::new(),
             capacity,
             rope_delta: 0,
             patch_rows,
@@ -780,6 +876,7 @@ impl MultimodalInput<'_> {
         Ok(PositionPlan {
             axes,
             slots,
+            audio_slots: Vec::new(),
             capacity,
             rope_delta,
             patch_rows,
@@ -1188,6 +1285,7 @@ mod loopvl_tests {
                 w: w as u32,
             }];
             let input = MultimodalInput {
+                audio: &[],
                 input_ids: &tokens,
                 modality_ids: &modality,
                 pixel_values: &pixels,
@@ -1204,6 +1302,7 @@ mod loopvl_tests {
             assert!(input.validate_loopvl(65536, 8192, rows).is_err());
             assert!(
                 MultimodalInput {
+                    audio: &[],
                     pixel_values: &pixels[..pixels.len() - 1],
                     ..input
                 }
@@ -1214,6 +1313,7 @@ mod loopvl_tests {
             invalid_modality[begin + count] = 1;
             assert!(
                 MultimodalInput {
+                    audio: &[],
                     modality_ids: &invalid_modality,
                     ..input
                 }

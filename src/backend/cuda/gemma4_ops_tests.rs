@@ -2797,6 +2797,7 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
             w: u32::try_from(cell["grid_xy"][0].as_u64().context("grid w")?)?,
         }];
         let input = MultimodalInput {
+            audio: &[],
             input_ids: &ids,
             modality_ids: modality_view.data(),
             pixel_values: &pixels,
@@ -2892,6 +2893,7 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
             mixed_pixels.extend_from_slice(&pixels);
             let mixed_grids = [previous.3, grids[0]];
             let mixed_input = MultimodalInput {
+                audio: &[],
                 input_ids: &mixed_ids,
                 modality_ids: &mixed_modalities,
                 pixel_values: &mixed_pixels,
@@ -2929,6 +2931,7 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
         }
         let prompt = first + 1;
         let prompt_input = MultimodalInput {
+            audio: &[],
             input_ids: &ids[..prompt],
             modality_ids: &modality_view.data()[..prompt],
             pixel_values: &pixels,

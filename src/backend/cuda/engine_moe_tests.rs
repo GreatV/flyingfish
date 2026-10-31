@@ -5671,6 +5671,7 @@ impl Input {
 
     pub(super) fn packed(&self) -> MultimodalInput<'_> {
         MultimodalInput {
+            audio: &[],
             input_ids: &self.ids,
             modality_ids: &self.modalities,
             pixel_values: &self.pixels,
