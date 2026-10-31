@@ -22,15 +22,13 @@ def host_cache_budget():
     group = next(line[3:] for line in Path("/proc/self/cgroup").read_text().splitlines() if line.startswith("0::"))
     mount = Path("/sys/fs/cgroup")
     directory = mount / group.lstrip("/")
-    while True:
+    while directory != mount:
         maximum = (directory / "memory.max").read_text().strip()
         if maximum != "max":
             current = int((directory / "memory.current").read_text())
             stats = dict(line.split() for line in (directory / "memory.stat").read_text().splitlines())
             non_file = current - int(stats["file"]) + int(stats["shmem"])
             available = min(available, max(0, int(maximum) - non_file))
-        if directory == mount:
-            break
         directory = directory.parent
     return max(0, available - 8 * 1024 ** 3)
 
