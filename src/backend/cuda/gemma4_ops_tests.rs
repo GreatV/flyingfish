@@ -3416,25 +3416,48 @@ fn audio_model_definition_and_graph_gpu() -> Result<()> {
         )?;
         if name == "stew" {
             let h = spec.hidden as usize;
+            let full_rows =
+                super::engine::bucketed_prefill_rows(u32::try_from(ids.len())?, 1536)? as usize;
             let normalized = trace.values(".debug.norm1")?;
-            let x = normalized[..ids.len() * h]
+            let mut x = normalized[..ids.len() * h]
                 .iter()
                 .copied()
                 .map(bf16::from_f32)
                 .collect::<Vec<_>>();
+            x.resize(full_rows * h, bf16::ZERO);
             let full = engine.gemma_linear_probe("self_attn.q_proj.weight", &x)?;
-            let skinny = engine.gemma_linear_probe("self_attn.q_proj.weight", &x[..10 * h])?;
-            let mismatch = full.iter().zip(&skinny).filter(|(a, b)| a != b).count();
-            println!(
-                "audio_text_linear_shapes full_rows={} skinny_rows=10 bit_mismatches={mismatch}",
-                ids.len()
-            );
-            for (key, rows, values) in [("q_full", ids.len(), full), ("q_skinny", 10, skinny)] {
+            for (key, rows) in [("q_chunk128", 128), ("q_chunk10", 10)] {
+                let chunk = engine.gemma_linear_probe("self_attn.q_proj.weight", &x[..rows * h])?;
+                let mismatch = full.iter().zip(&chunk).filter(|(a, b)| a != b).count();
+                println!(
+                    "audio_text_linear_shapes full_rows={full_rows} chunk_rows={rows} bit_mismatches={mismatch}"
+                );
                 trace.add(
                     key.into(),
-                    vec![rows, values.len() / rows],
-                    values.into_iter().map(bf16::to_f32).collect(),
+                    vec![rows, chunk.len() / rows],
+                    chunk.into_iter().map(bf16::to_f32).collect(),
                 )?;
+            }
+            trace.add(
+                "q_full".into(),
+                vec![full_rows, full.len() / full_rows],
+                full.into_iter().map(bf16::to_f32).collect(),
+            )?;
+            #[cfg(feature = "cuda")]
+            {
+                let receipt = engine.gemma_linear_plan_receipt()?;
+                let plans = receipt["lt"]
+                    .as_array()
+                    .context("linear plans missing")?
+                    .iter()
+                    .filter(|plan| {
+                        plan["input"].as_u64() == Some(h as u64)
+                            && plan["output"].as_u64() == Some(u64::from(spec.q_width))
+                            && [full_rows as u64, 128, 10]
+                                .contains(&plan["rows"].as_u64().unwrap_or(0))
+                    })
+                    .collect::<Vec<_>>();
+                println!("audio_text_linear_plans {}", serde_json::to_string(&plans)?);
             }
         }
         let diagnostics = settings.runtime_dir.as_ref().context("runtime missing")?;

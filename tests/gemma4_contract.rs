@@ -37,7 +37,8 @@ fn large_gemma_geometry_preserves_global_kv_and_absent_per_layer_inputs() -> Res
                 && spec.layers.len() == depth
                 && spec.q_heads == heads
                 && spec.kv_heads == kv
-                && spec.per_layer_input.is_none(),
+                && spec.per_layer_input.is_none()
+                && spec.audio.is_none(),
             "large Gemma geometry"
         );
         let work = flyingfish::work_layout::RowWorkSpec::new(&spec)?;
