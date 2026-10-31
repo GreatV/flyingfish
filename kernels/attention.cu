@@ -28,6 +28,59 @@
 
 using bf16 = __nv_bfloat16;
 
+// One CTA/query/head; BF16 projections and relative table, FP32 logits and weighted values.
+extern "C" __global__ void relative_window_attention_d128(
+    const bf16* q, const bf16* k, const bf16* v, const bf16* relative, const bf16* dim_scale,
+    const uint8_t* mask, bf16* output, uint32_t rows, uint32_t heads,
+    uint32_t chunk, uint32_t left, float q_scale, float k_scale, float cap, float invalid) {
+    const uint32_t context = chunk + left - 1, relative_rows = context / 2 + 1;
+    if (blockDim.x != 128 || blockDim.y != 1 || blockDim.z != 1 ||
+        !q || !k || !v || !relative || !dim_scale || !mask || !output || !rows || !heads ||
+        !chunk || left < 2 || context > 32 || left - 1 > relative_rows || !(cap > 0.0f) ||
+        gridDim.x != rows || gridDim.y != heads || gridDim.z != 1) { __trap(); return; }
+    const uint32_t row = blockIdx.x, head = blockIdx.y, d = threadIdx.x, hidden = heads * 128;
+    const int first = int(row / chunk * chunk) - int(left) + 1;
+    __shared__ float reduction[8], probabilities[32];
+    const float query = __fmul_rn(__fmul_rn(__bfloat162float(q[uint64_t(row)*hidden+head*128+d]), q_scale),
+        __bfloat162float(dim_scale[d]));
+    for (uint32_t c = 0; c < context; ++c) {
+        const int key = first + int(c), lag = int(row) - key;
+        const bool valid = key >= 0 && key < int(rows) && mask[key] && lag >= 0 && lag < int(left)-1;
+        float ac = 0.0f, bd = 0.0f;
+        if (valid) {
+            ac = __fmul_rn(query, __fmul_rn(__bfloat162float(k[uint64_t(key)*hidden+head*128+d]), k_scale));
+            bd = __fmul_rn(query, __bfloat162float(relative[uint64_t(int(relative_rows)-1-lag)*hidden+head*128+d]));
+        }
+        for (int offset = 16; offset > 0; offset /= 2) {
+            ac += __shfl_down_sync(0xffffffffu, ac, offset);
+            bd += __shfl_down_sync(0xffffffffu, bd, offset);
+        }
+        if ((d & 31) == 0) { reduction[d/32] = ac; reduction[4+d/32] = bd; }
+        __syncthreads();
+        if (d == 0) {
+            const float content = (reduction[0]+reduction[1])+(reduction[2]+reduction[3]);
+            const float position = (reduction[4]+reduction[5])+(reduction[6]+reduction[7]);
+            probabilities[c] = valid ? cap*tanhf((content+position)/cap) : invalid;
+        }
+        __syncthreads();
+    }
+    if (d == 0) {
+        float peak = -INFINITY;
+        for (uint32_t c = 0; c < context; ++c) peak = fmaxf(peak, probabilities[c]);
+        float sum = 0.0f;
+        for (uint32_t c = 0; c < context; ++c) { probabilities[c] = expf(probabilities[c]-peak); sum += probabilities[c]; }
+        for (uint32_t c = 0; c < context; ++c) probabilities[c] /= sum;
+    }
+    __syncthreads();
+    float result = 0.0f;
+    for (uint32_t c = 0; c < context; ++c) {
+        const int key = first + int(c);
+        if (key >= 0 && key < int(rows)) result = __fmaf_rn(probabilities[c],
+            __bfloat162float(v[uint64_t(key)*hidden+head*128+d]), result);
+    }
+    output[uint64_t(row)*hidden+head*128+d] = __float2bfloat16_rn(result);
+}
+
 constexpr int DH  = 128;                // head_dim
 constexpr int TP  = 16;                 // lanes cooperating on one key position
 constexpr float SCALE = 0.08838834764831845f;   // 1/sqrt(128)

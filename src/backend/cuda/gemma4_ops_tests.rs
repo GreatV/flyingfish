@@ -382,6 +382,263 @@ impl ReferenceValues {
 
 type ReferenceFixture = BTreeMap<String, (Vec<usize>, ReferenceValues)>;
 
+fn audio_output_matches(
+    device: &Device,
+    output: &crate::backend::gpu::CudaSlice<bf16>,
+    expected: &[f32],
+    bound: &serde_json::Value,
+) -> Result<bool> {
+    let host = device.stream.clone_dtoh(output)?;
+    ensure!(
+        host.len() == expected.len() + 32
+            && host[expected.len()..].iter().all(|v| v.to_bits() == 0x7fc1),
+        "RUNNER_FAIL audio output guard overwritten"
+    );
+    vision_distance(
+        &host[..expected.len()]
+            .iter()
+            .map(|v| v.to_f32())
+            .collect::<Vec<_>>(),
+        expected,
+        bound,
+    )
+}
+
+#[test]
+#[ignore = "requires frozen cross-device audio operator fixtures and a GPU window"]
+fn audio_operators_match_definition_gpu() -> Result<()> {
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("FF_GEMMA4_FIXTURES").context("fixtures missing")?,
+    );
+    let frozen: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("AUDIO_FROZEN.json"))?)?;
+    ensure!(
+        frozen["status"] == "FROZEN" && frozen["candidate_observations"] == 0,
+        "RUNNER_FAIL audio reference freeze missing"
+    );
+    let device = Device::new(0)?;
+    let stream = &device.stream;
+    let pointwise = cubin::module(&device.ctx, "vision_ops")?;
+    let patch = pointwise.load_function("masked_strided_patch_bf16")?;
+    let activation = pointwise.load_function("activation_bf16")?;
+    let conv = pointwise.load_function("causal_depthwise_conv_bf16")?;
+    let branch =
+        cubin::module(&device.ctx, "q38_common")?.load_function("rms_scaled_branch_add")?;
+    let attention =
+        cubin::module(&device.ctx, "attention")?.load_function("relative_window_attention_d128")?;
+    let mut cells = 0;
+    let mut defects = 0;
+    for (name, cell) in frozen["cells"].as_object().context("audio cells")? {
+        let fixture = load_reference(&directory.join(format!("{name}.safetensors")))?;
+        let upload =
+            |name: &str| -> Result<_> { Ok(stream.clone_htod(reference_bf16(&fixture, name)?)?) };
+        let output = |count: usize| -> Result<_> {
+            Ok(stream.clone_htod(&vec![bf16::from_bits(0x7fc1); count + 32])?)
+        };
+        let compare =
+            |key: &str, out: &crate::backend::gpu::CudaSlice<bf16>, mutant: bool| -> Result<bool> {
+                let pass = audio_output_matches(
+                    &device,
+                    out,
+                    &reference(&fixture, key)?.as_f32(),
+                    &cell["bounds"][key],
+                )?;
+                println!(
+                    "AUDIO_OP {name} {key} mutant={mutant} {}",
+                    if pass != mutant { "PASS" } else { "DEFECT" }
+                );
+                Ok(pass != mutant)
+            };
+        let mask_host = reference_bf16(&fixture, "mask")?
+            .iter()
+            .map(|v| u8::from(v.to_f32() != 0.0))
+            .collect::<Vec<_>>();
+        let mask = stream.clone_htod(&mask_host)?;
+        let x = upload("x")?;
+        if name.starts_with("audio-patch-") {
+            let [time, frequency, channels] = <[usize; 3]>::try_from(fixture["x"].0.clone())
+                .map_err(|_| anyhow::anyhow!("patch shape"))?;
+            let count = time.div_ceil(2) * frequency.div_ceil(2) * channels * 9;
+            let out = output(count)?;
+            let run = |mask: &crate::backend::gpu::CudaSlice<u8>| -> Result<()> {
+                unsafe {
+                    stream
+                        .launch_builder(&patch)
+                        .arg(&x)
+                        .arg(mask)
+                        .arg(&out)
+                        .arg(&(time as u32))
+                        .arg(&(frequency as u32))
+                        .arg(&(channels as u32))
+                        .launch(flat(count))?;
+                }
+                Ok(())
+            };
+            run(&mask)?;
+            defects += usize::from(!compare("patches", &out, false)?);
+            cells += 1;
+            run(&stream.clone_htod(&vec![1u8; time])?)?;
+            defects += usize::from(!compare("patches", &out, true)?);
+            cells += 1;
+            continue;
+        }
+        let rows = u32::try_from(cell["rows"].as_u64().context("audio rows")?)?;
+        let count = rows as usize * 1024;
+        for (key, input_key, width, n, mode) in [
+            ("relu", "x", 1024u32, rows, 0i32),
+            ("silu", "x", 1024, rows, 1),
+            ("glu", "gate", 1024, rows, 2),
+            ("softplus", "scale", 128, 1, 3),
+        ] {
+            let input = upload(input_key)?;
+            let out = output(n as usize * width as usize)?;
+            unsafe {
+                stream
+                    .launch_builder(&activation)
+                    .arg(&input)
+                    .arg(&out)
+                    .arg(&n)
+                    .arg(&width)
+                    .arg(&mode)
+                    .launch(flat(n as usize * width as usize))?;
+            }
+            defects += usize::from(!compare(key, &out, false)?);
+            cells += 1;
+            if key == "glu" {
+                let mut swapped = reference_bf16(&fixture, "gate")?.to_vec();
+                for row in swapped.chunks_exact_mut(2048) {
+                    row.rotate_left(1024);
+                }
+                let input = stream.clone_htod(&swapped)?;
+                unsafe {
+                    stream
+                        .launch_builder(&activation)
+                        .arg(&input)
+                        .arg(&out)
+                        .arg(&n)
+                        .arg(&width)
+                        .arg(&mode)
+                        .launch(flat(n as usize * width as usize))?;
+                }
+                defects += usize::from(!compare(key, &out, true)?);
+                cells += 1;
+            }
+        }
+        let weight = upload("conv_weight")?;
+        let out = output(count)?;
+        let run_conv = |input: &crate::backend::gpu::CudaSlice<bf16>| -> Result<()> {
+            unsafe {
+                stream
+                    .launch_builder(&conv)
+                    .arg(input)
+                    .arg(&weight)
+                    .arg(&out)
+                    .arg(&rows)
+                    .arg(&1024u32)
+                    .arg(&5u32)
+                    .launch(flat(count))?;
+            }
+            Ok(())
+        };
+        run_conv(&x)?;
+        defects += usize::from(!compare("conv", &out, false)?);
+        cells += 1;
+        if rows > 1 {
+            let mut wrong = reference_bf16(&fixture, "x")?.to_vec();
+            wrong.rotate_right(1024);
+            run_conv(&stream.clone_htod(&wrong)?)?;
+            defects += usize::from(!compare("conv", &out, true)?);
+            cells += 1;
+        }
+        let b = upload("branch")?;
+        let w = upload("weight")?;
+        for mutant in [false, true] {
+            let mut host = reference_bf16(&fixture, "x")?
+                .iter()
+                .map(|v| {
+                    if mutant {
+                        bf16::from_f32(v.to_f32() * 0.5)
+                    } else {
+                        *v
+                    }
+                })
+                .collect::<Vec<_>>();
+            host.extend([bf16::from_bits(0x7fc1); 32]);
+            let out = stream.clone_htod(&host)?;
+            unsafe {
+                stream
+                    .launch_builder(&branch)
+                    .arg(&out)
+                    .arg(&b)
+                    .arg(&w)
+                    .arg(&1024u32)
+                    .arg(&1e-6f32)
+                    .arg(&1e10f32)
+                    .arg(&0.5f32)
+                    .launch(super::ops::grid(rows as usize, 256))?;
+            }
+            defects += usize::from(!compare("branch_out", &out, mutant)?);
+            cells += 1;
+        }
+        let q = upload("q")?;
+        let k = upload("k")?;
+        let v = upload("v")?;
+        let relative = upload("relative")?;
+        let scale = upload("scale")?;
+        let softplus = stream.alloc_zeros::<bf16>(128)?;
+        unsafe {
+            stream
+                .launch_builder(&activation)
+                .arg(&scale)
+                .arg(&softplus)
+                .arg(&1u32)
+                .arg(&128u32)
+                .arg(&3i32)
+                .launch(flat(128))?;
+        }
+        let out = output(count)?;
+        let q_scale = (128f64.powf(-0.5) / 2f64.ln()) as f32;
+        let k_scale = ((1.0 + std::f64::consts::E).ln() / 2f64.ln()) as f32;
+        for left in [13u32, 14] {
+            if left == 14 && rows < 13 {
+                continue;
+            }
+            unsafe {
+                stream
+                    .launch_builder(&attention)
+                    .arg(&q)
+                    .arg(&k)
+                    .arg(&v)
+                    .arg(&relative)
+                    .arg(&softplus)
+                    .arg(&mask)
+                    .arg(&out)
+                    .arg(&rows)
+                    .arg(&8u32)
+                    .arg(&12u32)
+                    .arg(&left)
+                    .arg(&q_scale)
+                    .arg(&k_scale)
+                    .arg(&50.0f32)
+                    .arg(&-1e9f32)
+                    .launch(LaunchConfig {
+                        grid_dim: (rows, 8, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+            defects += usize::from(!compare("attention", &out, left == 14)?);
+            cells += 1;
+        }
+    }
+    println!(
+        "AUDIO_OPS {} cells={cells} defects={defects}",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(defects == 0, "audio operator defects={defects}");
+    Ok(())
+}
+
 fn load_reference(path: &std::path::Path) -> Result<ReferenceFixture> {
     let bytes = std::fs::read(path)?;
     let tensors = SafeTensors::deserialize(&bytes)?;

@@ -7,7 +7,7 @@ use crate::{
         contracts::{Scratch, Tensor, TensorMut, dense_layout},
         cubin,
         flash::{Flash, Query, Score, Shape},
-        linear::{LinearBiasMode, LinearWeightRef, disjoint},
+        linear::{ClippedLinear, LinearBiasMode, LinearWeightRef, disjoint},
         ops::{CommonOpsRef, GeluMode, RmsMode, RmsOptions, flat, grid},
         vision::{
             PatchGrid, PatchPacking, VisionAttnBindings, VisionAttnOps, VisionAttnPlan,
@@ -2346,94 +2346,6 @@ impl LayerNormTower {
         let synchronized = stream.synchronize();
         launched?;
         synchronized?;
-        Ok(())
-    }
-}
-
-struct ClippedLinear {
-    weight: CudaSlice<bf16>,
-    shape: [u32; 2],
-    bounds: Option<[CudaSlice<bf16>; 4]>,
-}
-
-impl ClippedLinear {
-    fn take(
-        catalog: &mut WeightCatalog,
-        name: &str,
-        shape: [u32; 2],
-        bounds: Option<&str>,
-    ) -> Result<Self> {
-        let weight = take(catalog, name, &[shape[0] as usize, shape[1] as usize])?;
-        let bounds = bounds
-            .map(|prefix| -> Result<_> {
-                Ok([
-                    take(catalog, &format!("{prefix}.input_min"), &[])?,
-                    take(catalog, &format!("{prefix}.input_max"), &[])?,
-                    take(catalog, &format!("{prefix}.output_min"), &[])?,
-                    take(catalog, &format!("{prefix}.output_max"), &[])?,
-                ])
-            })
-            .transpose()?;
-        Ok(Self {
-            weight,
-            shape,
-            bounds,
-        })
-    }
-
-    fn prepare(&self, blas: &Blas, rows: u32) -> Result<()> {
-        blas.prepare_request_fixed(rows, self.shape[0], self.shape[1])
-    }
-
-    fn run(
-        &self,
-        stream: &Arc<CudaStream>,
-        blas: &Blas,
-        clamp: &CudaFunction,
-        input: Tensor<bf16, 2>,
-        scratch: TensorMut<bf16, 2>,
-        output: &mut TensorMut<bf16, 2>,
-    ) -> Result<()> {
-        let x = if let Some(bounds) = &self.bounds {
-            ensure!(
-                input.shape == scratch.0.shape,
-                "clamp scratch extent differs"
-            );
-            disjoint(&input, &scratch.0)?;
-            let count = u64::from(input.shape[0]) * u64::from(input.shape[1]);
-            unsafe {
-                stream
-                    .launch_builder(clamp)
-                    .arg(&input.ptr)
-                    .arg(&scratch.0.ptr)
-                    .arg(&count)
-                    .arg(&bounds[0])
-                    .arg(&bounds[1])
-                    .launch(flat(count as usize))?;
-            }
-            scratch.0
-        } else {
-            input
-        };
-        blas.linear_typed(
-            crate::op_contract::ExecutionPhase::Prefill,
-            LinearWeightRef::Bf16(dense(&self.weight, stream, self.shape)?),
-            x,
-            output,
-        )?;
-        if let Some(bounds) = &self.bounds {
-            let count = u64::from(output.0.shape[0]) * u64::from(output.0.shape[1]);
-            unsafe {
-                stream
-                    .launch_builder(clamp)
-                    .arg(&output.0.ptr)
-                    .arg(&output.0.ptr)
-                    .arg(&count)
-                    .arg(&bounds[2])
-                    .arg(&bounds[3])
-                    .launch(flat(count as usize))?;
-            }
-        }
         Ok(())
     }
 }

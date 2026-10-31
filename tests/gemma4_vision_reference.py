@@ -355,6 +355,126 @@ def reference_media(data, variant, device, audio):
                 image_position_ids=data[prefix + "positions"][None].long().to(device))
 
 
+@torch.inference_mode()
+def capture_audio_operators(args, config):
+    from types import SimpleNamespace
+    from transformers.models.gemma4 import modeling_gemma4 as definition
+    import torch.nn.functional as F
+    dtype = torch.float32 if args.dtype == "fp32" else torch.bfloat16
+    config.audio_config._attn_implementation = "eager"
+    report = dict(torch=torch.__version__, transformers=transformers.__version__, device=args.device,
+                  capability=list(torch.cuda.get_device_capability(args.device)) if str(args.device).startswith("cuda") else None,
+                  dtype=args.dtype, definition="transformers Gemma4 audio model definition", cells={})
+    class Projection(torch.nn.Module):
+        def __init__(self, value):
+            super().__init__()
+            self.value = value
+        def forward(self, unused):
+            return self.value
+    for rows in [1, 11, 12, 13, 25, 750]:
+        def values(shape, period=1009, multiplier=37, shift=504, divisor=128):
+            return pattern(shape, period, multiplier, shift, divisor, args.device).bfloat16()
+        tensors = dict(x=values((rows, 1024)), weight=values((1024,), 1013, 31, -1000, 2048),
+                       branch=values((rows, 1024), 1019, 41, 509, 256),
+                       gate=values((rows, 2048), 1021, 43, 510, 128),
+                       conv_weight=values((1024, 1, 5), 1031, 47, 515, 1024),
+                       q=values((1, rows, 1024), 1033, 53, 516, 512),
+                       k=values((1, rows, 1024), 1039, 59, 519, 512),
+                       v=values((1, rows, 1024), 1049, 61, 524, 256),
+                       relative=values((1, 13, 1024), 1051, 67, 525, 512),
+                       scale=values((128,), 1061, 71, 530, 512))
+        mask = torch.ones((1, rows), dtype=torch.bool, device=args.device)
+        if rows > 12:
+            mask[:, -2:] = False
+            mask[:, 3] = False
+        if rows >= 25:
+            mask[:, :13] = False
+        tensors["mask"] = mask.bfloat16()
+        tensors["branch"][rows // 2, 3] = 2e10
+        x, branch, weight = [tensors[k].to(dtype) for k in ("x", "branch", "weight")]
+        norm = definition.Gemma4RMSNorm(1024).to(device=args.device, dtype=dtype)
+        norm.weight.copy_(weight)
+        expected = dict(relu=F.relu(x), silu=F.silu(x), glu=F.glu(tensors["gate"].to(dtype)),
+                        softplus=F.softplus(tensors["scale"].to(dtype)),
+                        branch_out=(norm(branch.clamp(-1e10, 1e10)) * 0.5 + x))
+        expected["branch_wrong"] = (norm(branch.clamp(-1e10, 1e10)) + x) * 0.5
+        halves = tensors["gate"].to(dtype).chunk(2, -1)
+        expected["glu_wrong"] = F.glu(torch.cat(halves[::-1], -1))
+        conv = definition.Gemma4AudioCausalConv1d(1024, 1024, 5, groups=1024, bias=False).to(
+            device=args.device, dtype=dtype)
+        conv.weight.copy_(tensors["conv_weight"].to(dtype))
+        expected["conv"] = conv(x.T[None])[0].T.contiguous()
+        expected["conv_wrong"] = conv(x.roll(1, 0).T[None])[0].T.contiguous()
+        attention = definition.Gemma4AudioAttention(config.audio_config, 0).to(device=args.device, dtype=dtype)
+        attention.q_proj = Projection(tensors["q"].to(dtype))
+        attention.k_proj = Projection(tensors["k"].to(dtype))
+        attention.v_proj = Projection(tensors["v"].to(dtype))
+        attention.post = torch.nn.Identity()
+        attention.relative_k_proj = torch.nn.Identity()
+        attention.per_dim_scale.copy_(tensors["scale"].to(dtype))
+        hidden = x[None]
+        def run_attention(left):
+            dense_mask = definition.create_bidirectional_mask(config=config.audio_config, inputs_embeds=hidden,
+                attention_mask=mask, and_mask_function=definition.sliding_window_mask_function((left, 0)))
+            blocked = definition.Gemma4AudioModel._convert_4d_mask_to_blocked_5d(
+                SimpleNamespace(config=config.audio_config), dense_mask)
+            return attention(hidden, tensors["relative"].to(dtype), blocked)[0][0]
+        expected["attention"] = run_attention(12)
+        expected["attention_wrong"] = run_attention(13)
+        expected["attention_repeat"] = run_attention(12)
+        assert torch.equal(expected["attention"], expected["attention_repeat"])
+        outputs = ["relu", "silu", "glu", "softplus", "conv", "branch_out", "attention"]
+        for key, value in expected.items():
+            assert torch.isfinite(value).all(), key
+            tensors[key] = value.float()
+        name = f"audio-ops-{rows}"
+        (args.output / f"{name}.safetensors").write_bytes(save({k: v.cpu().contiguous() for k,v in tensors.items()}))
+        report["cells"][name] = dict(rows=rows, outputs=outputs,
+            controls={"branch_out": "branch_wrong", "glu": "glu_wrong", **({"conv": "conv_wrong"} if rows > 1 else {}),
+                      **({"attention": "attention_wrong"} if rows >= 13 else {})})
+        print(f"PASS {name} reference_repeat_bits=0", flush=True)
+    for time, frequency, channels in [(7, 5, 3), (2999, 128, 1), (1500, 64, 128)]:
+        x = pattern((time, frequency, channels), 1063, 73, 531, 256, args.device).bfloat16()
+        mask = torch.ones(time, device=args.device, dtype=torch.bool)
+        mask[-1] = False
+        masked = x * mask[:, None, None]
+        patches = F.unfold(masked.permute(2, 0, 1)[None].to(dtype), (3, 3), padding=1, stride=2)[0].T
+        wrong = F.unfold(x.permute(2, 0, 1)[None].to(dtype), (3, 3), padding=1, stride=2)[0].T
+        name = f"audio-patch-{time}-{channels}"
+        (args.output / f"{name}.safetensors").write_bytes(save(dict(x=x.cpu(), mask=mask.bfloat16().cpu(),
+            patches=patches.float().cpu().contiguous(), wrong=wrong.float().cpu().contiguous())))
+        report["cells"][name] = dict(shape=[time, frequency, channels], outputs=["patches"], controls={"patches":"wrong"})
+        print(f"PASS {name} masked_rows=true", flush=True)
+    (args.output / "AUDIO_OPS.json").write_text(json.dumps(report, indent=2) + "\n")
+
+
+def freeze_audio_operators(args):
+    from safetensors.torch import load_file
+    import shutil
+    reports = [json.loads((p / "AUDIO_OPS.json").read_text()) for p in [args.oracle, *args.arms]]
+    assert len({(r["torch"], r["transformers"]) for r in reports}) == 1
+    assert {tuple(r["capability"]) for r in reports} == {(8, 9), (8, 6)}
+    assert {r["dtype"] for r in reports} == {"bf16", "fp32"}
+    frozen = dict(status="FROZEN", candidate_observations=0,
+                  rule="2 * maximum reference-only distance to FP32 oracle", reference_reports=reports, cells={})
+    for name, cell in reports[0]["cells"].items():
+        oracle = load_file(args.oracle / f"{name}.safetensors")
+        bounds = {key: dict(output_max=0.0, output_rmse=0.0) for key in cell["outputs"]}
+        for path in args.arms:
+            arm = load_file(path / f"{name}.safetensors")
+            for key, bound in bounds.items():
+                delta = arm[key].double() - oracle[key].double()
+                bound["output_max"] = max(bound["output_max"], 2*delta.abs().max().item())
+                bound["output_rmse"] = max(bound["output_rmse"], 2*delta.square().mean().sqrt().item())
+        for key, control in cell["controls"].items():
+            delta = oracle[control].double() - oracle[key].double()
+            assert delta.abs().max().item() > bounds[key]["output_max"] or delta.square().mean().sqrt().item() > bounds[key]["output_rmse"], (name,key)
+        frozen["cells"][name] = dict(**cell, bounds=bounds)
+        shutil.copyfile(args.oracle / f"{name}.safetensors", args.output / f"{name}.safetensors")
+    (args.output / "AUDIO_FROZEN.json").write_text(json.dumps(frozen, indent=2) + "\n")
+    print(f"PASS audio_operator_freeze cells={len(frozen['cells'])} candidate_observations=0", flush=True)
+
+
 def freeze_model(args):
     from safetensors.torch import load_file
     import shutil
@@ -400,7 +520,7 @@ def main():
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", required=True)
-    parser.add_argument("--stage", choices=("operators", "attention", "inputs", "model", "media", "freeze"), default="operators")
+    parser.add_argument("--stage", choices=("operators", "attention", "inputs", "model", "media", "freeze", "audio-operators", "audio-freeze"), default="operators")
     parser.add_argument("--images", type=Path, nargs=2)
     parser.add_argument("--audio", type=Path, nargs=2)
     parser.add_argument("--inputs", type=Path)
@@ -417,6 +537,12 @@ def main():
     torch.backends.cudnn.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
     args.output.mkdir(parents=True, exist_ok=False)
+    if args.stage == "audio-operators":
+        capture_audio_operators(args, config)
+        return
+    if args.stage == "audio-freeze":
+        freeze_audio_operators(args)
+        return
     if args.stage == "freeze":
         freeze_model(args)
         return

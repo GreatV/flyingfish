@@ -617,6 +617,29 @@ extern "C" __global__ void gelu_tanh_mul(
         y[row*ys0+head*ys1+uint64_t(d)*ys2]=__hmul(gate,up[row*us0+head*us1+uint64_t(d)*us2]);
     }
 }
+// x = bf16(x + bf16(scale * bf16(rms(clamp(b))*weight))).
+extern "C" __global__ __launch_bounds__(256) void rms_scaled_branch_add(
+    __nv_bfloat16* x, const __nv_bfloat16* branch, const __nv_bfloat16* weight,
+    uint32_t width, float eps, float limit, float scale) {
+    if (blockDim.x != 256 || !x || !branch || !weight || !width || !(eps > 0.0f) ||
+        !(limit > 0.0f) || !isfinite(scale)) { __trap(); return; }
+    __shared__ float scratch[8];
+    const uint64_t base = uint64_t(blockIdx.x) * width;
+    const float bound = __bfloat162float(__float2bfloat16_rn(limit));
+    float sum = 0.0f;
+    for (uint32_t d = threadIdx.x; d < width; d += 256) {
+        const float v = fminf(bound, fmaxf(-bound, __bfloat162float(branch[base + d])));
+        sum = __fadd_rn(sum, __fmul_rn(v, v));
+    }
+    const float inv = block_inv(sum, scratch, width, 5, eps);
+    const __nv_bfloat16 zero = __float2bfloat16_rn(0.0f), multiplier = __float2bfloat16_rn(scale);
+    for (uint32_t d = threadIdx.x; d < width; d += 256) {
+        const float v = fminf(bound, fmaxf(-bound, __bfloat162float(branch[base + d])));
+        const __nv_bfloat16 normalized = norm_scale<false>(v, inv, weight[d], zero, 5);
+        x[base + d] = __hadd(x[base + d], __hmul(normalized, multiplier));
+    }
+}
+
 // x = bf16(bf16(x + bf16(rms(b)*wb)) * scalar) in place, then n = rms(x)*wn; scalar and wn may be null.
 // rms(v)*w: F32 v*rsqrt(mean(v^2)+eps)*w with one BF16 rounding. One block of 256 threads per row.
 extern "C" __global__ __launch_bounds__(256) void rms_branch_add(
