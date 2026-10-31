@@ -148,6 +148,7 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--dtype", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument("--full-load-only", action="store_true")
+    parser.add_argument("--ids", type=Path)
     args = parser.parse_args()
     require(not args.out.resolve().is_relative_to(args.model.resolve()), "output inside read-only weights")
     require(transformers.__version__ == "5.21.0", "reference definition version mismatch")
@@ -179,15 +180,23 @@ def main():
     device = torch.device("cuda", 0)
     weights = PublishedWeights(args.model, raw["model_type"])
     model, hooks = stream_model(model_class, config, weights, dtype, device)
-    tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, local_files_only=True)
-    texts = ["The small brown bird rested on a smooth stone beside the river.",
-             "During the winter workshop, students designed a careful map of the old railway."]
-    short = [tokenizer(text).input_ids for text in texts]
-    require(all(8 <= len(ids) <= 32 for ids in short), "short reference input extent")
-    seed = short[0] + short[1]
     window = config.text_config.sliding_window
-    wrap = (seed * ((window + 8) // len(seed) + 1))[:window + 8]
-    (args.out / "ids.json").write_text(json.dumps({"texts": texts, "short": short, "wrap": wrap, "long": wrap}, indent=2) + "\n")
+    if args.ids:
+        inputs = json.loads(args.ids.read_text())
+    else:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, local_files_only=True)
+        texts = ["The small brown bird rested on a smooth stone beside the river.",
+                 "During the winter workshop, students designed a careful map of the old railway."]
+        short = [tokenizer(text).input_ids for text in texts]
+        seed = short[0] + short[1]
+        wrap = (seed * ((window + 8) // len(seed) + 1))[:window + 8]
+        inputs = {"texts": texts, "short": short, "wrap": wrap, "long": wrap}
+    short, wrap = inputs["short"], inputs["wrap"]
+    require(len(short) == 2 and all(8 <= len(ids) <= 32 for ids in short), "short reference input extent")
+    require(len(wrap) == window + 8 and inputs["long"] == wrap, "window reference input extent")
+    require(all(type(token) is int and 0 <= token < config.text_config.vocab_size
+                for ids in short + [wrap] for token in ids), "invalid reference token ID")
+    (args.out / "ids.json").write_text(json.dumps(inputs, indent=2) + "\n")
     tensors, noise = {}, {}
     cases = [("a", short[0], len(short[0]), 1, 0), ("b", short[1], len(short[1]), 1, 0),
              ("wrap", wrap, 8, 1, window), ("long", wrap, 513, window // 2, 0)]
