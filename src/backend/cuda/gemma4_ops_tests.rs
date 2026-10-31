@@ -3476,6 +3476,10 @@ fn gemma4_catalog_uploads_exactly_the_text_set_gpu() -> Result<()> {
                 |(bf16_bytes, native_bytes), tensor| match tensor {
                     StoredTensor::Bf16(values) => (bf16_bytes + values.len() * 2, native_bytes),
                     StoredTensor::Bytes(values) => (bf16_bytes, native_bytes + values.len()),
+                    #[cfg(feature = "cuda")]
+                    StoredTensor::Slot { .. } => {
+                        panic!("resident upload gate contains streamed weights")
+                    }
                 },
             );
     ensure!(

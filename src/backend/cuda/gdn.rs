@@ -4233,6 +4233,8 @@ mod tests {
             bytes += size;
         }
         let catalog = WeightCatalog {
+            #[cfg(feature = "cuda")]
+            dense: None,
             linear_format: crate::model_spec::LinearFormat::Bf16,
             tensors,
             manifest: TensorManifest {

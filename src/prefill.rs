@@ -40,6 +40,106 @@ pub(crate) fn chunk_end(start: usize, expected: usize, rows: usize, total: usize
     Ok(end)
 }
 
+#[cfg(any(feature = "cuda", test))]
+#[derive(Debug, Serialize)]
+pub(crate) struct DensePlacement {
+    pub slots: Vec<Option<usize>>,
+    pub host: Vec<bool>,
+    pub slot_bytes: usize,
+    pub resident_bytes: usize,
+    pub host_bytes: usize,
+    pub disk_bytes: usize,
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl DensePlacement {
+    pub(crate) fn new(layers: &[usize], device_bytes: usize, host_bytes: usize) -> Result<Self> {
+        ensure!(
+            !layers.is_empty() && layers.iter().all(|&n| n > 0),
+            "empty dense layer extent"
+        );
+        let total = layers.iter().try_fold(0usize, |sum, &n| {
+            sum.checked_add(n).context("dense weight extent overflow")
+        })?;
+        let mut plan = Self {
+            slots: vec![None; layers.len()],
+            host: vec![false; layers.len()],
+            slot_bytes: 0,
+            resident_bytes: total,
+            host_bytes: 0,
+            disk_bytes: 0,
+        };
+        if total <= device_bytes {
+            return Ok(plan);
+        }
+        let mut sizes = layers.to_vec();
+        sizes.sort_unstable();
+        sizes.dedup();
+        let mut order: Vec<_> = (0..layers.len()).collect();
+        order.sort_by_key(|&i| std::cmp::Reverse(layers[i]));
+        let mut best = None;
+        for slot in sizes {
+            let slots = slot.checked_mul(2).context("dense slots overflow")?;
+            let Some(mut remaining) = device_bytes.checked_sub(slots) else {
+                continue;
+            };
+            let mut resident = vec![false; layers.len()];
+            let mut required = 0usize;
+            for &i in &order {
+                if layers[i] > slot {
+                    required += layers[i];
+                    resident[i] = true;
+                }
+            }
+            let Some(available) = remaining.checked_sub(required) else {
+                continue;
+            };
+            remaining = available;
+            for &i in &order {
+                if !resident[i] && layers[i] <= remaining {
+                    resident[i] = true;
+                    remaining -= layers[i];
+                }
+            }
+            let kept = device_bytes - slots - remaining;
+            if best
+                .as_ref()
+                .is_none_or(|(_, _, previous)| kept > *previous)
+            {
+                best = Some((slot, resident, kept));
+            }
+        }
+        let (slot, resident, kept) =
+            best.context("dense fixed tensors and two layer slots exceed VRAM")?;
+        plan.slot_bytes = slot;
+        plan.resident_bytes = kept;
+        let mut index = 0;
+        for (i, &resident) in resident.iter().enumerate() {
+            if !resident {
+                plan.slots[i] = Some(index % 2);
+                index += 1;
+            }
+        }
+        let mut remaining = host_bytes;
+        for &i in &order {
+            if plan.slots[i].is_some() {
+                if layers[i] <= remaining {
+                    plan.host[i] = true;
+                    remaining -= layers[i];
+                    plan.host_bytes += layers[i];
+                } else {
+                    plan.disk_bytes += layers[i];
+                }
+            }
+        }
+        ensure!(
+            plan.resident_bytes + plan.host_bytes + plan.disk_bytes == total,
+            "dense tier byte conservation"
+        );
+        Ok(plan)
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct Plan {
     pub chunk: usize,
@@ -122,6 +222,53 @@ impl Plan {
 #[cfg(test)]
 mod tests {
     use super::{Plan, WorkspaceBudget, WorkspaceRequest, chunk_end, dense_prompt_bytes};
+
+    #[test]
+    fn dense_tiers_preserve_capacity_and_slot_bounds() -> anyhow::Result<()> {
+        use super::DensePlacement;
+        for (layers, device, host) in [
+            (vec![448_266_240; 48], 19 << 30, 4 << 30),
+            (
+                (0..60)
+                    .map(|i| {
+                        if i % 6 == 5 {
+                            1_067_974_656
+                        } else {
+                            957_874_176
+                        }
+                    })
+                    .collect(),
+                18 << 30,
+                32 << 30,
+            ),
+            (vec![13, 29, 17, 29, 13], 78, 17),
+        ] {
+            let plan = DensePlacement::new(&layers, device, host)?;
+            assert!(plan.resident_bytes + 2 * plan.slot_bytes <= device);
+            assert!(plan.host_bytes <= host);
+            assert_eq!(
+                plan.resident_bytes + plan.host_bytes + plan.disk_bytes,
+                layers.iter().sum()
+            );
+            let mut sequence = 0;
+            for (i, slot) in plan.slots.iter().enumerate() {
+                if let Some(slot) = slot {
+                    assert_eq!(*slot, sequence % 2);
+                    assert!(layers[i] <= plan.slot_bytes);
+                    sequence += 1;
+                } else {
+                    assert!(!plan.host[i]);
+                }
+            }
+            assert!(sequence > 0);
+        }
+        let resident = DensePlacement::new(&[13, 29, 17], 59, 0)?;
+        assert_eq!(resident.slot_bytes, 0);
+        assert!(DensePlacement::new(&[13, 29, 17], 25, 100).is_err());
+        assert!(DensePlacement::new(&[usize::MAX, 1], usize::MAX, 0).is_err());
+        assert!(DensePlacement::new(&[0], 1, 0).is_err());
+        Ok(())
+    }
 
     #[test]
     fn dense_prefill_chunk_order_rejects_a_swapped_predecessor() -> anyhow::Result<()> {

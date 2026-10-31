@@ -1520,7 +1520,7 @@ impl Engine {
 
     fn has_graph(&self, graph: Graph) -> bool {
         if matches!(graph, Graph::Decode) {
-            return self.graph.is_some();
+            return self.graph.is_some() || self.dense_graph_ready();
         }
         if let Graph::MoeRoute(layer) | Graph::MoeContribute(layer) | Graph::MoeJoin(layer) = graph
         {
@@ -2227,7 +2227,8 @@ impl Engine {
         if self.qwen.is_some() {
             self.qwen_layer_begin(layer, step)?;
         }
-        self.run_layer_program(layer, step, trace)
+        self.run_layer_program(layer, step, trace)?;
+        self.dense_layer_end(layer)
     }
 
     fn run_layer_program(
@@ -3445,6 +3446,8 @@ impl Engine {
             {
                 let result = if self.moe.is_some() {
                     self.run_moe_graph(1)
+                } else if self.dense_streaming() {
+                    self.run_dense_graph()
                 } else {
                     #[cfg(feature = "cuda")]
                     let launched = self
@@ -3579,6 +3582,9 @@ impl Engine {
         );
         if self.moe.is_some() {
             return self.capture_moe();
+        }
+        if self.dense_streaming() {
+            return self.capture_dense_graph();
         }
         ensure!(
             self.spec.is_none(),
@@ -5616,10 +5622,14 @@ impl Engine {
         }
         if self.spec.is_none() {
             self.capture()?;
-            self.graph
-                .as_ref()
-                .context("decode Graph missing")?
-                .launch()?;
+            if self.dense_streaming() {
+                self.run_dense_graph()?;
+            } else {
+                self.graph
+                    .as_ref()
+                    .context("decode Graph missing")?
+                    .launch()?;
+            }
             self.device.stream.synchronize()?;
             self.check_logits()?;
             return Ok(());

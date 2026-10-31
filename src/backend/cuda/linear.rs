@@ -661,6 +661,8 @@ impl WeightCatalog {
             "FP8 scale must be a loaded matrix: {name}"
         );
         let (ptr, bytes) = match self.tensors.get(name).context("FP8 scale not uploaded")? {
+            #[cfg(feature = "cuda")]
+            StoredTensor::Slot { .. } => anyhow::bail!("FP8 scale cannot use a dense BF16 slot"),
             StoredTensor::Bf16(buffer) => {
                 ensure!(
                     entry.dtype == Dtype::BF16,
@@ -713,6 +715,16 @@ impl WeightCatalog {
             .get(name)
             .context("linear tensor not uploaded")?
         {
+            #[cfg(feature = "cuda")]
+            super::weights::StoredTensor::Slot { pointer, bytes } => {
+                ensure!(
+                    entry.dtype == safetensors::Dtype::BF16 && *bytes == entry.bytes,
+                    "dense BF16 slot extent mismatch"
+                );
+                Ok(LinearWeightRef::Bf16(unsafe {
+                    Tensor::new(*pointer, shape, stride, *bytes as u64)?
+                }))
+            }
             super::weights::StoredTensor::Bf16(w) => {
                 let (p, _r) = w.device_ptr(stream);
                 Ok(LinearWeightRef::Bf16(unsafe {
@@ -2365,6 +2377,8 @@ mod tests {
                 spec.linear_format,
             )?;
             let catalog = WeightCatalog {
+                #[cfg(feature = "cuda")]
+                dense: None,
                 linear_format: spec.linear_format,
                 tensors: [
                     (name.clone(), StoredTensor::Bytes(codes)),
@@ -2887,6 +2901,8 @@ mod tests {
                 resident_bytes: bytes,
             };
             let catalog = WeightCatalog {
+                #[cfg(feature = "cuda")]
+                dense: None,
                 linear_format: crate::model_spec::LinearFormat::Bf16,
                 tensors: [(name.clone(), StoredTensor::Bf16(weight))].into(),
                 manifest,

@@ -622,6 +622,8 @@ pub(super) struct Runtime {
     active_positions: CudaSlice<i32>,
     gather_positions: CudaFunction,
     catalog: WeightCatalog,
+    #[cfg(feature = "cuda")]
+    dense_graphs: Vec<CudaGraph>,
     arena: Option<CudaSlice<u8>>,
     pub(super) scratch: CudaSlice<u8>,
     kv_scratch: Option<(CudaSlice<bf16>, CudaSlice<bf16>)>,
@@ -1940,6 +1942,8 @@ impl Runtime {
             )?
             .load_function("q38_text_positions")?,
             catalog,
+            #[cfg(feature = "cuda")]
+            dense_graphs: Vec::new(),
             arena,
             scratch: scratch_buffer,
             kv_scratch,
@@ -2739,13 +2743,40 @@ impl Engine {
             verify_rows,
             Some(&device.stream),
         )?;
+        let s = &device.stream;
+        let state = super::super::state::StateStore::new_with_format(
+            &model_spec,
+            capacity,
+            settings.kv_format,
+            s,
+        )?;
         let prefix_cache = settings.prefix_cache;
         #[cfg(feature = "cuda")]
-        let mut catalog = if prefix_cache {
-            WeightCatalog::load_for_prefix_cache(dir, &model_spec, &device)?
-        } else {
-            WeightCatalog::load(dir, &model_spec, &device)?
-        };
+        let mut catalog =
+            if model_spec.moe.is_none() && model_spec.linear_format.fp8_layout().is_none() {
+                let rows = requested_chunk.unwrap_or(capacity.min(1024));
+                let fixed = Runtime::fixed_bytes(&model_spec, capacity)?;
+                let transient = Runtime::workspace(
+                    &model_spec,
+                    rows,
+                    capacity,
+                    gdn_policy,
+                    verify_rows,
+                    Some(s),
+                )?
+                .checked_add(
+                    Runtime::row_bytes(&model_spec)?
+                        .checked_mul(rows)
+                        .context("dense row reservation overflow")?,
+                )
+                .and_then(|n| n.checked_add(fixed))
+                .context("dense workspace reservation overflow")?;
+                WeightCatalog::load_dense(dir, &model_spec, &device, transient, prefix_cache)?
+            } else if prefix_cache {
+                WeightCatalog::load_for_prefix_cache(dir, &model_spec, &device)?
+            } else {
+                WeightCatalog::load(dir, &model_spec, &device)?
+            };
         #[cfg(feature = "rocm")]
         let mut catalog = WeightCatalog::load(dir, &model_spec, &device)?;
         let glm_hc_weights = if glm {
@@ -2782,13 +2813,6 @@ impl Engine {
             identity.attention_kv_dtype = settings.kv_format.tag().into();
         }
         let weights = catalog.take_globals()?;
-        let s = &device.stream;
-        let state = super::super::state::StateStore::new_with_format(
-            &model_spec,
-            capacity,
-            settings.kv_format,
-            s,
-        )?;
         let mut kv_scratch = if settings.kv_format == crate::kv::KvFormat::Bf16 {
             None
         } else {
@@ -3904,6 +3928,10 @@ impl Engine {
         i: usize,
         step: crate::backend::Step<'_>,
     ) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        if let Some(dense) = self.qwen.as_mut().and_then(|q| q.catalog.dense.as_mut()) {
+            dense.begin(i, &self.device.stream)?;
+        }
         #[cfg(feature = "rocm")]
         ensure!(
             i < self.model_spec.layers.len() && step.rows > 0,
@@ -3918,6 +3946,164 @@ impl Engine {
                 .materialize(&self.blas, &self.device.stream)?;
         }
         Ok(())
+    }
+
+    pub(super) fn dense_streaming(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        return self
+            .qwen
+            .as_ref()
+            .is_some_and(|q| q.catalog.dense.is_some());
+        #[cfg(feature = "rocm")]
+        false
+    }
+
+    pub(super) fn dense_graph_ready(&self) -> bool {
+        #[cfg(feature = "cuda")]
+        return self.qwen.as_ref().is_some_and(|q| {
+            q.catalog.dense.is_some() && q.dense_graphs.len() == self.model_spec.layers.len() + 2
+        });
+        #[cfg(feature = "rocm")]
+        false
+    }
+
+    pub(super) fn dense_layer_end(&mut self, layer: usize) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        if let Some(dense) = self.qwen.as_mut().and_then(|q| q.catalog.dense.as_mut()) {
+            dense.end(layer, &self.device.stream)?;
+        }
+        #[cfg(feature = "rocm")]
+        let _ = layer;
+        Ok(())
+    }
+
+    pub(super) fn run_dense_graph(&mut self) -> Result<()> {
+        #[cfg(feature = "rocm")]
+        anyhow::bail!("dense streamed graphs are not bound for HIP");
+        #[cfg(feature = "cuda")]
+        {
+            ensure!(
+                self.dense_graph_ready(),
+                "dense decode segments are not captured"
+            );
+            let step = crate::backend::Step {
+                rows: 1,
+                input: crate::backend::Input::Token,
+                head: Head::Last,
+                mask: crate::backend::Mask::Causal,
+            };
+            self.qwen
+                .as_ref()
+                .context("dense runtime missing")?
+                .dense_graphs[0]
+                .launch()?;
+            for layer in 0..self.model_spec.layers.len() {
+                self.qwen_layer_begin(layer, step)?;
+                self.qwen
+                    .as_ref()
+                    .context("dense runtime missing")?
+                    .dense_graphs[layer + 1]
+                    .launch()?;
+                self.dense_layer_end(layer)?;
+            }
+            self.qwen
+                .as_ref()
+                .context("dense runtime missing")?
+                .dense_graphs
+                .last()
+                .context("dense head graph missing")?
+                .launch()?;
+            Ok(())
+        }
+    }
+
+    pub(super) fn capture_dense_graph(&mut self) -> Result<()> {
+        #[cfg(feature = "rocm")]
+        anyhow::bail!("dense streamed graph capture is not bound for HIP");
+        #[cfg(feature = "cuda")]
+        {
+            if self.dense_graph_ready() {
+                return Ok(());
+            }
+            ensure!(
+                self.spec.is_none() && !self.poisoned && self.position < self.capacity,
+                "invalid dense capture state"
+            );
+            self.closure.capture()?;
+            self.ensure_decode()?;
+            let stream = self.device.stream.clone();
+            let position = stream.clone_dtoh(&self.work.position)?;
+            let length = stream.clone_dtoh(&self.work.length)?;
+            let mut checkpoint = self
+                .capture_checkpoint
+                .take()
+                .context("dense capture checkpoint missing")?;
+            let result = (|| -> Result<Vec<CudaGraph>> {
+                checkpoint.save(&self.state, &self.work.token, self.position, &stream, None)?;
+                self.run_decode_step(None)?;
+                stream.synchronize()?;
+                checkpoint.restore(&mut self.state, &mut self.work.token, &stream)?;
+                stream.memcpy_htod(&position, &mut self.work.position)?;
+                stream.memcpy_htod(&length, &mut self.work.length)?;
+                let count = self.model_spec.layers.len();
+                let mut graphs = Vec::with_capacity(count + 2);
+                let step = crate::backend::Step {
+                    rows: 1,
+                    input: crate::backend::Input::Token,
+                    head: Head::Last,
+                    mask: crate::backend::Mask::Causal,
+                };
+                for segment in 0..count + 2 {
+                    if (1..=count).contains(&segment) {
+                        self.qwen_layer_begin(segment - 1, step)?;
+                    }
+                    stream.synchronize()?;
+                    stream.begin_capture(
+                        sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+                    )?;
+                    let launched = if segment == 0 {
+                        self.run_operator(crate::backend::Operator::Embed, 0, step, &mut None)
+                    } else if segment == count + 1 {
+                        self.run_operator(crate::backend::Operator::Head, 0, step, &mut None)
+                            .and_then(|()| self.qwen_advance())
+                    } else {
+                        self.run_layer_program(segment - 1, step, &mut None)
+                    };
+                    let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
+                    launched?;
+                    let graph = captured?.context("empty dense graph segment")?;
+                    graph.upload()?;
+                    graphs.push(graph);
+                }
+                stream.synchronize()?;
+                Ok(graphs)
+            })();
+            let restored = (|| -> Result<()> {
+                checkpoint.restore(&mut self.state, &mut self.work.token, &stream)?;
+                stream.memcpy_htod(&position, &mut self.work.position)?;
+                stream.memcpy_htod(&length, &mut self.work.length)?;
+                stream.synchronize()?;
+                Ok(())
+            })();
+            self.capture_checkpoint = Some(checkpoint);
+            if let Err(error) = restored {
+                self.poisoned = true;
+                return Err(error.context("dense capture restore failed"));
+            }
+            match result {
+                Ok(graphs) => {
+                    self.qwen
+                        .as_mut()
+                        .context("dense runtime missing")?
+                        .dense_graphs = graphs
+                }
+                Err(error) => {
+                    self.poisoned = true;
+                    return Err(error.context("dense graph capture failed"));
+                }
+            }
+            Ok(())
+        }
     }
     pub(super) fn glm_dsa_mixer(&mut self, i: usize, step: crate::backend::Step<'_>) -> Result<()> {
         use crate::op_contract::ExecutionPhase;
@@ -6287,6 +6473,8 @@ mod tests {
             bytes += size;
         }
         let catalog = WeightCatalog {
+            #[cfg(feature = "cuda")]
+            dense: None,
             linear_format: crate::model_spec::LinearFormat::Bf16,
             tensors,
             manifest: TensorManifest {
