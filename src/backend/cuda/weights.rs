@@ -971,6 +971,7 @@ struct DenseRange {
 #[cfg(feature = "cuda")]
 struct DenseLayer {
     slot: Option<usize>,
+    next: Option<usize>,
     bytes: usize,
     ranges: BTreeMap<String, Vec<DenseRange>>,
     host: Option<PinnedHostSlice<u8>>,
@@ -1018,11 +1019,19 @@ impl DenseStreaming {
             .iter()
             .map(|&slot| DenseLayer {
                 slot,
+                next: None,
                 bytes: 0,
                 ranges: BTreeMap::new(),
                 host: None,
             })
             .collect();
+        let mut next = None;
+        for (index, layer) in layers.iter_mut().enumerate().rev() {
+            layer.next = next;
+            if layer.slot.is_some() {
+                next = Some(index);
+            }
+        }
         let mut readers = BTreeMap::new();
         let mut largest = 0usize;
         let mut alignment = 4096usize;
@@ -1187,9 +1196,7 @@ impl DenseStreaming {
         if let Some(slot) = self.layers[layer].slot {
             self.slots[slot].retired.record(stream)?;
             self.slots[slot].retired_valid = true;
-            if let Some(next) =
-                (layer + 1..self.layers.len()).find(|&i| self.layers[i].slot.is_some())
-            {
+            if let Some(next) = self.layers[layer].next {
                 self.prefetch(next)?;
             }
         }
