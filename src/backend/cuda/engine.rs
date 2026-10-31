@@ -2075,6 +2075,48 @@ impl Engine {
         ))
     }
 
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn gemma_exit_probe(
+        &mut self,
+        x: &[bf16],
+        branch: &[bf16],
+    ) -> Result<(Vec<bf16>, Vec<bf16>)> {
+        let hidden = self.model_spec.hidden as usize;
+        ensure!(
+            self.model_spec.per_layer_input.is_none()
+                && !x.is_empty()
+                && x.len() == branch.len()
+                && x.len().is_multiple_of(hidden),
+            "invalid no-PLE layer-exit probe"
+        );
+        let rows = x.len() / hidden;
+        self.device
+            .stream
+            .memcpy_htod(x, &mut self.work.x.slice_mut(..x.len()))?;
+        self.device
+            .stream
+            .memcpy_htod(branch, &mut self.work.out.slice_mut(..branch.len()))?;
+        self.run_operator(
+            crate::backend::Operator::NextNorm,
+            0,
+            crate::backend::Step {
+                rows,
+                input: crate::backend::Input::Ids,
+                head: Head::None,
+                mask: crate::backend::Mask::Causal,
+            },
+            &mut None,
+        )?;
+        Ok((
+            self.device
+                .stream
+                .clone_dtoh(&self.work.x.slice(..x.len()))?,
+            self.device
+                .stream
+                .clone_dtoh(&self.work.n.slice(..x.len()))?,
+        ))
+    }
+
     #[cfg(test)]
     pub(crate) fn gemma_all_logits(&self, row: usize) -> Result<Vec<bf16>> {
         self.qwen
@@ -3524,10 +3566,23 @@ impl Engine {
 
     pub fn weight_bytes(&self) -> usize {
         let extra = self.qwen.as_ref().map_or(0, qwen::Runtime::vision_bytes);
+        #[cfg(feature = "cuda")]
+        if let Some(bytes) = self.dense_checkpoint_bytes() {
+            return bytes + extra;
+        }
         self.weights.bytes + extra
     }
 
     pub fn decode_weight_bytes(&self) -> usize {
+        #[cfg(feature = "cuda")]
+        if let Some(bytes) = self.dense_checkpoint_bytes() {
+            return bytes
+                - self
+                    .weights
+                    .embed
+                    .as_ref()
+                    .map_or(0, |embed| embed.len() * size_of::<bf16>());
+        }
         if self.recurrent.is_some() {
             return self
                 .weights

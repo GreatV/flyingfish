@@ -2980,20 +2980,254 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
 }
 
 fn checkpoint_tensor(dir: &std::path::Path, name: &str) -> Result<Vec<bf16>> {
-    let bytes = std::fs::read(dir.join("model.safetensors"))?;
-    let tensors = SafeTensors::deserialize(&bytes)?;
-    let view = tensors.tensor(name)?;
+    let mapped = crate::checkpoint::MappedCheckpoint::open(dir)?;
+    let shard = mapped
+        .index
+        .weight_map
+        .get(name)
+        .context("checkpoint tensor is absent")?;
+    let tensors = mapped.views()?;
+    let view = tensors[shard].tensor(name)?;
+    let mut bytes = vec![0u8; view.data().len()];
+    mapped.read_mapped_range(shard, view.data(), &mut bytes)?;
     ensure!(
         view.dtype() == safetensors::Dtype::BF16,
         "{name} is not BF16"
     );
-    Ok(view
-        .data()
+    Ok(bytes
         .as_chunks::<2>()
         .0
         .iter()
         .map(|b| bf16::from_le_bytes(*b))
         .collect())
+}
+
+#[cfg(feature = "cuda")]
+fn no_ple_exit_control(
+    engine: &mut super::engine::Engine,
+    dir: &std::path::Path,
+    hidden: usize,
+) -> Result<usize> {
+    let mut defects = 0;
+    let post = checkpoint_tensor(
+        dir,
+        "model.language_model.layers.0.post_feedforward_layernorm.weight",
+    )?;
+    let next = checkpoint_tensor(dir, "model.language_model.layers.1.input_layernorm.weight")?;
+    let scale = checkpoint_tensor(dir, "model.language_model.layers.0.layer_scalar")?[0].to_f32();
+    ensure!(
+        scale != 1.0,
+        "layer-exit scalar control is not discriminating"
+    );
+    for rows in [1, 17] {
+        engine.reset()?;
+        let x: Vec<_> = (0..rows * hidden)
+            .map(|i| bf16::from_f32(((i * 37 % 1009) as f32 - 504.0) / 256.0))
+            .collect();
+        let branch: Vec<_> = (0..rows * hidden)
+            .map(|i| bf16::from_f32(((i * 71 % 997) as f32 - 498.0) / 128.0))
+            .collect();
+        let normalized: Vec<_> = branch
+            .chunks(hidden)
+            .flat_map(|row| rms_f32(&row.iter().map(|v| v.to_f32()).collect::<Vec<_>>(), &post))
+            .collect();
+        let unscaled: Vec<_> = x
+            .iter()
+            .zip(&normalized)
+            .map(|(x, b)| bf16::from_f32(x.to_f32() + b.to_f32()))
+            .collect();
+        let expected_x: Vec<_> = unscaled
+            .iter()
+            .map(|v| bf16::from_f32(v.to_f32() * scale))
+            .collect();
+        let expected_n: Vec<_> = expected_x
+            .chunks(hidden)
+            .flat_map(|row| rms_f32(&row.iter().map(|v| v.to_f32()).collect::<Vec<_>>(), &next))
+            .collect();
+        let floor_x: Vec<_> = x
+            .iter()
+            .map(|v| 2.0 * scale.abs() * bf16_ulp(v.to_f32()))
+            .collect();
+        let floor_n: Vec<_> = expected_x
+            .chunks(hidden)
+            .zip(floor_x.chunks(hidden))
+            .zip(expected_n.chunks(hidden))
+            .flat_map(|((row, floor), norm)| {
+                let mean = row.iter().map(|v| v.to_f32() * v.to_f32()).sum::<f32>() / hidden as f32;
+                let inv = 1.0 / (mean + 1e-6).sqrt();
+                floor
+                    .iter()
+                    .zip(&next)
+                    .zip(norm)
+                    .map(|((error, weight), value)| {
+                        inv * weight.to_f32().abs() * error + bf16_ulp(value.to_f32())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let (actual_x, actual_n) = engine.gemma_exit_probe(&x, &branch)?;
+        for (tag, actual, expected, floor) in [
+            ("x", &actual_x, &expected_x, &floor_x),
+            ("n", &actual_n, &expected_n, &floor_n),
+        ] {
+            let stats = Stats::with_floor(actual, expected, Some(floor))?;
+            println!(
+                "GEMMA4_NO_PLE_EXIT rows={rows} hidden={hidden} scalar={scale} {}",
+                stats.line(tag)
+            );
+            defects += usize::from(!stats.passes());
+        }
+        let control = Stats::new(&expected_x, &unscaled)?;
+        ensure!(
+            control.is_detected_mutant(),
+            "omitted scalar control is not discriminating"
+        );
+        println!("PASS no_ple_scalar_control rows={rows} hidden={hidden} omitted_scalar=detected");
+    }
+    engine.reset()?;
+    Ok(defects)
+}
+
+#[cfg(feature = "cuda")]
+fn large_model_definition(
+    dir: &std::path::Path,
+    settings: crate::backend::Settings,
+    spec: &crate::model_spec::ModelSpec,
+    data: &ReferenceFixture,
+    ids: &serde_json::Value,
+    frozen: &serde_json::Value,
+) -> Result<()> {
+    let window = spec
+        .layers
+        .iter()
+        .find_map(|layer| layer.geometry.and_then(|g| g.window))
+        .context("large Gemma window missing")? as usize;
+    let capacity = window + 128;
+    let mut engine = super::engine::Engine::load(dir, 0, capacity, Some(window + 8), settings)?;
+    let plan = engine
+        .dense_placement()
+        .context("large-model gate did not execute dense streaming")?;
+    println!("GEMMA4_DENSE_PLACEMENT {}", serde_json::to_string(plan)?);
+    ensure!(
+        plan.host_bytes > 0,
+        "large-model host tier was not executed"
+    );
+    if spec.hidden == 5376 {
+        ensure!(plan.disk_bytes > 0, "31B gate must force the disk tier");
+    }
+    let mut defects = no_ple_exit_control(&mut engine, dir, spec.hidden as usize)?;
+    let mut wrap_eager = Vec::new();
+    let mut wrap_state = None;
+    let global = spec
+        .layers
+        .iter()
+        .position(|layer| layer.geometry.is_some_and(|g| g.window.is_none()))
+        .context("global layer missing")?;
+    for tag in ["a", "b", "wrap", "long"] {
+        let sequence: Vec<u32> = serde_json::from_value(if matches!(tag, "a" | "b") {
+            ids["short"][usize::from(tag == "b")].clone()
+        } else {
+            ids[tag].clone()
+        })?;
+        for mode in ["prefill", "decode"] {
+            engine.reset()?;
+            let name = format!("{tag}.{mode}");
+            let rows = data[&name].0[0];
+            let actual = if tag == "long" && mode == "decode" {
+                let mut values = Vec::new();
+                for (piece, chunk) in sequence.chunks(window / 2).enumerate() {
+                    engine.gemma_prefill_all(chunk)?;
+                    let start = piece * (window / 2);
+                    for row in 0..chunk.len() {
+                        if start + row >= sequence.len() - rows {
+                            values.extend(engine.gemma_all_logits(row)?);
+                        }
+                    }
+                }
+                values
+            } else {
+                let prefill = if mode == "prefill" {
+                    sequence.len()
+                } else if tag == "wrap" {
+                    window
+                } else {
+                    0
+                };
+                let mut values = native_path(&mut engine, &sequence, prefill)?;
+                drop(values.drain(..values.len() - rows * spec.vocab as usize));
+                values
+            };
+            let (pass, line, _) = model_metrics(
+                &actual,
+                &reference(data, &name)?.as_f32(),
+                &sequence[sequence.len() - rows..],
+                &frozen["families"][tag],
+            )?;
+            println!(
+                "GEMMA4_MODEL {tag} {mode} {} {line}",
+                if pass { "PASS" } else { "DEFECT" }
+            );
+            defects += usize::from(!pass);
+            if tag == "wrap" && mode == "decode" {
+                wrap_eager = actual;
+                wrap_state = Some((
+                    engine.gemma_kv_rows(0, window)?,
+                    engine.gemma_kv_rows(global, sequence.len())?,
+                    engine.gemma_hidden_state()?,
+                ));
+            }
+        }
+    }
+    let sequence: Vec<u32> = serde_json::from_value(ids["wrap"].clone())?;
+    engine.reset()?;
+    engine.gemma_prefill_all(&sequence[..window])?;
+    let before = (
+        engine.gemma_kv_rows(0, window)?,
+        engine.gemma_kv_rows(global, window)?,
+    );
+    engine.capture()?;
+    let restored = before
+        == (
+            engine.gemma_kv_rows(0, window)?,
+            engine.gemma_kv_rows(global, window)?,
+        );
+    defects += usize::from(!restored);
+    let mut graph = Vec::new();
+    for &token in &sequence[window..] {
+        engine.set_token(token)?;
+        engine.decode(true, None)?;
+        graph.extend(engine.decode_logits()?.into_iter().map(bf16::from_f32));
+    }
+    let differing = graph
+        .iter()
+        .zip(&wrap_eager)
+        .filter(|(a, b)| a != b)
+        .count();
+    let final_state = (
+        engine.gemma_kv_rows(0, window)?,
+        engine.gemma_kv_rows(global, sequence.len())?,
+        engine.gemma_hidden_state()?,
+    );
+    let state_equal = wrap_state.as_ref() == Some(&final_state);
+    defects += usize::from(differing != 0 || !state_equal);
+    let (pass, line, _) = model_metrics(
+        &graph,
+        &reference(data, "wrap.decode")?.as_f32(),
+        &sequence[window..],
+        &frozen["families"]["wrap"],
+    )?;
+    defects += usize::from(!pass);
+    println!(
+        "GEMMA4_MODEL wrap graph {} {line}",
+        if pass { "PASS" } else { "DEFECT" }
+    );
+    println!("GEMMA4_GRAPH_EAGER bits={differing} restored={restored} state_equal={state_equal}");
+    println!(
+        "GEMMA4_MODEL {} cells=9 defects={defects} window={window} long_targets=512 streamed_graph=true",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(defects == 0, "large Gemma candidate defects={defects}");
+    Ok(())
 }
 
 #[test]
@@ -3028,6 +3262,12 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         .clone()
         .context("runtime directory missing")?;
     let spec = crate::model_spec::ModelSpec::read(&dir)?;
+    if spec.per_layer_input.is_none() {
+        #[cfg(feature = "cuda")]
+        return large_model_definition(&dir, settings, &spec, &data, &ids, &frozen);
+        #[cfg(feature = "rocm")]
+        anyhow::bail!("large Gemma streamed text gate requires CUDA");
+    }
     let device = Device::new(0)?;
     let catalog = super::weights::WeightCatalog::load(&dir, &spec, &device)?;
     for full in [

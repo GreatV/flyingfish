@@ -3958,6 +3958,23 @@ impl Engine {
         false
     }
 
+    #[cfg(feature = "cuda")]
+    pub(super) fn dense_checkpoint_bytes(&self) -> Option<usize> {
+        self.qwen.as_ref().and_then(|q| {
+            q.catalog
+                .dense
+                .as_ref()
+                .map(|_| q.catalog.manifest.resident_bytes)
+        })
+    }
+
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn dense_placement(&self) -> Option<&crate::prefill::DensePlacement> {
+        self.qwen
+            .as_ref()
+            .and_then(|q| q.catalog.dense.as_ref().map(|dense| &dense.plan))
+    }
+
     pub(super) fn dense_graph_ready(&self) -> bool {
         #[cfg(feature = "cuda")]
         return self.qwen.as_ref().is_some_and(|q| {
