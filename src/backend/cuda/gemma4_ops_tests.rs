@@ -506,7 +506,7 @@ fn audio_operators_match_definition_gpu() -> Result<()> {
             cells += 1;
             if key == "glu" {
                 let mut swapped = reference_bf16(&fixture, "gate")?.to_vec();
-                for row in swapped.chunks_exact_mut(2048) {
+                for row in swapped.as_chunks_mut::<2048>().0 {
                     row.rotate_left(1024);
                 }
                 let input = stream.clone_htod(&swapped)?;
