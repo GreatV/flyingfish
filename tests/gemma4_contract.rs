@@ -227,6 +227,7 @@ fn unified_media_shapes_and_packed_patch_bounds_are_strict() -> Result<()> {
     let pixels = vec![0.5; 2 * 6912];
     let grid = [ImageGrid { t: 1, h: 1, w: 2 }];
     let input = MultimodalInput {
+        audio: &[],
         input_ids: &ids,
         modality_ids: &modality,
         pixel_values: &pixels,
@@ -250,6 +251,7 @@ fn unified_media_shapes_and_packed_patch_bounds_are_strict() -> Result<()> {
         "image blocks split across chunks"
     );
     let short = MultimodalInput {
+        audio: &[],
         pixel_values: &pixels[..pixels.len() - 1],
         ..input
     };
@@ -271,6 +273,67 @@ fn unified_media_shapes_and_packed_patch_bounds_are_strict() -> Result<()> {
             "accepted {scope}.{key} mutation"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn raw_audio_masks_and_mixed_splices_preserve_row_identity() -> Result<()> {
+    use flyingfish::vision_input::AudioClip;
+    let (_, spec) = read(include_str!("data/gemma4-12b-config.json"))?;
+    let ids = [2, 256000, 258881, 258881, 258883, 255999, 258880, 258882, 5];
+    let modalities = [0, 0, 3, 3, 0, 0, 1, 0, 0];
+    let samples = vec![0.25; 3 * 640];
+    let mask = [true, false, true];
+    let clips = [AudioClip {
+        features: &samples,
+        mask: &mask,
+    }];
+    let pixels = vec![0.5; 6912];
+    let grids = [ImageGrid { t: 1, h: 1, w: 1 }];
+    let input = MultimodalInput {
+        input_ids: &ids,
+        modality_ids: &modalities,
+        pixel_values: &pixels,
+        grids: &grids,
+        audio: &clips,
+    };
+    let plan = input.validate(&spec, 32)?;
+    ensure!(
+        plan.feature_rows() == 3
+            && plan.audio_slots()[0].features == (0..2)
+            && plan.slots()[0].features == (2..3),
+        "media feature order"
+    );
+    let splices = plan.splices(3..8)?;
+    ensure!(
+        splices
+            .iter()
+            .any(|s| s.chunk_rows == (0..1) && s.feature_rows == (1..2))
+            && splices
+                .iter()
+                .any(|s| s.chunk_rows == (3..4) && s.feature_rows == (2..3)),
+        "mixed chunk splice offset"
+    );
+    let mut short = samples.clone();
+    short.pop();
+    let bad_clips = [AudioClip {
+        features: &short,
+        mask: &mask,
+    }];
+    ensure!(
+        MultimodalInput {
+            audio: &bad_clips,
+            ..input
+        }
+        .validate(&spec, 32)
+        .is_err(),
+        "short raw frame accepted"
+    );
+    let (_, large) = read(include_str!("data/gemma4-31b-config.json"))?;
+    ensure!(
+        input.validate(&large, 32).is_err(),
+        "31B accepted absent audio weights"
+    );
     Ok(())
 }
 

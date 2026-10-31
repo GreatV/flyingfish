@@ -447,7 +447,12 @@ impl MappedCheckpoint {
             if vision.unified.is_some() {
                 Self::unified_vision_entries(vision, &mut expected)?;
             } else {
-                Self::axial_vision_entries(vision, &mut expected)?;
+                Self::axial_vision_entries(
+                    vision,
+                    "model.vision_tower",
+                    "model.embed_vision.embedding_projection.weight",
+                    &mut expected,
+                )?;
             }
         }
         if let Some(audio) = &spec.audio {
@@ -608,8 +613,10 @@ impl MappedCheckpoint {
         Ok(())
     }
 
-    fn axial_vision_entries(
+    pub(crate) fn axial_vision_entries(
         vision: &crate::model_spec::VisionConfig,
+        tower_prefix: &str,
+        projection_name: &str,
         expected: &mut BTreeMap<String, ExpectedTensor>,
     ) -> Result<()> {
         vision.validate(crate::model_spec::Architecture::Gemma4)?;
@@ -625,30 +632,27 @@ impl MappedCheckpoint {
         };
         for (name, shape) in [
             (
-                "model.vision_tower.patch_embedder.input_proj.weight",
+                format!("{tower_prefix}.patch_embedder.input_proj.weight"),
                 vec![
                     h,
                     vision.patch_elements(crate::model_spec::Architecture::Gemma4)?,
                 ],
             ),
             (
-                "model.vision_tower.patch_embedder.position_embedding_table",
+                format!("{tower_prefix}.patch_embedder.position_embedding_table"),
                 vec![2, vision.position_side as usize, h],
             ),
-            (
-                "model.embed_vision.embedding_projection.weight",
-                vec![vision.output as usize, h],
-            ),
+            (projection_name.to_owned(), vec![vision.output as usize, h]),
         ] {
-            add(name.into(), shape);
+            add(name, shape);
         }
         if axial.standardize {
             for name in ["std_bias", "std_scale"] {
-                add(format!("model.vision_tower.{name}"), vec![h]);
+                add(format!("{tower_prefix}.{name}"), vec![h]);
             }
         }
         for layer in 0..vision.depth {
-            let prefix = format!("model.vision_tower.encoder.layers.{layer}");
+            let prefix = format!("{tower_prefix}.encoder.layers.{layer}");
             for name in [
                 "input_layernorm",
                 "post_attention_layernorm",
@@ -3002,7 +3006,12 @@ mod component_tests {
                     MappedCheckpoint::unified_vision_entries(vision, &mut expected)?;
                     (10, 99_844_608)
                 } else {
-                    MappedCheckpoint::axial_vision_entries(vision, &mut expected)?;
+                    MappedCheckpoint::axial_vision_entries(
+                        vision,
+                        "model.vision_tower",
+                        "model.embed_vision.embedding_projection.weight",
+                        &mut expected,
+                    )?;
                     (356, 1_151_487_072)
                 };
                 ensure!(
@@ -3015,10 +3024,28 @@ mod component_tests {
                             == vision_bytes,
                     "large vision manifest count or allocation size changed"
                 );
+                if spec.hidden == 5376 {
+                    let mut encoder_vision = vision.clone();
+                    encoder_vision.output = 2816;
+                    let mut encoder = BTreeMap::new();
+                    MappedCheckpoint::axial_vision_entries(
+                        &encoder_vision,
+                        "model.encoder.vision_tower",
+                        "model.encoder.embed_vision.embedding_projection.weight",
+                        &mut encoder,
+                    )?;
+                    ensure!(encoder.len() == 356
+                        && encoder.contains_key("model.encoder.vision_tower.encoder.layers.26.self_attn.q_proj.linear.weight")
+                        && encoder["model.encoder.embed_vision.embedding_projection.weight"].1 == [2816, 1152]
+                        && MappedCheckpoint::planned_bytes(&encoder, LoadPolicy::VisionOnly)? == 1_145_588_832,
+                        "shared axial manifest lost its binding prefix or output width");
+                }
                 continue;
             }
             MappedCheckpoint::axial_vision_entries(
                 spec.vision.as_ref().context("vision spec")?,
+                "model.vision_tower",
+                "model.embed_vision.embedding_projection.weight",
                 &mut expected,
             )?;
             let vision_bytes = if spec.hidden == 1536 {

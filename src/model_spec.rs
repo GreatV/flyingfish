@@ -305,7 +305,6 @@ pub struct AudioConfig {
     pub end_token: u32,
 }
 
-<<<<<<< HEAD
 impl AudioConfig {
     fn from_root(root: &Value) -> Result<Option<Self>> {
         let Some(a) = root.get("audio_config").filter(|a| !a.is_null()) else {
@@ -2288,17 +2287,6 @@ impl ModelSpec {
             deepseek_v41: None,
             logit_softcap: Some(30.0),
             per_layer_input: (ple != 0).then_some(ple),
-<<<<<<< HEAD
-            vision: if ple != 0 {
-                VisionConfig::from_root(root)?
-            } else {
-                None
-            },
-            audio: if ple != 0 {
-                AudioConfig::from_root(root)?
-            } else {
-                None
-            },
             audio: if ple != 0 {
                 AudioConfig::from_root(root)?
             } else {

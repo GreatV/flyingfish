@@ -1541,6 +1541,22 @@ impl WeightCatalog {
             load_wall_ms,
         })
     }
+    pub fn take_bf16(&mut self, name: &str, shape: &[usize]) -> Result<CudaSlice<bf16>> {
+        let entry = self
+            .manifest
+            .entries
+            .get(name)
+            .context("BF16 manifest entry missing")?;
+        anyhow::ensure!(
+            entry.load && entry.dtype == safetensors::Dtype::BF16 && entry.shape == shape,
+            "invalid BF16 tensor {name}"
+        );
+        match self.tensors.remove(name) {
+            Some(StoredTensor::Bf16(buffer)) => Ok(buffer),
+            _ => anyhow::bail!("tensor not uploaded as BF16: {name}"),
+        }
+    }
+
     pub fn bf16(&self, name: &str) -> Result<&CudaSlice<bf16>> {
         match self.tensors.get(name) {
             Some(StoredTensor::Bf16(v)) => Ok(v),

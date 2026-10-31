@@ -4,7 +4,7 @@ use crate::backend::cuda::contracts::view;
 use crate::backend::cuda::{
     attention_d256::{AttentionBindings, FullAttentionOps, FullAttentionPlan, PositionBindings},
     contracts::{RowDomain, Scratch, Tensor, TensorMut},
-    flash::{Flash, Score},
+    flash::{Flash, Query, Score},
     gdn::{
         CUDA_GRID_YZ_MAX, GdnBindings, GdnConvWeights, GdnDecayWeights, GdnGateInput, GdnOps,
         GdnPlan,
@@ -617,6 +617,7 @@ pub(super) struct Runtime {
     vision_bytes: usize,
     media_reserved_bytes: usize,
     audio: Option<super::audio_runtime::AudioRuntime>,
+    image_blocks: Option<CudaSlice<u32>>,
     #[cfg(test)]
     pub(super) audio_encode_calls: usize,
     #[cfg(test)]
@@ -1981,6 +1982,7 @@ impl Runtime {
             vision_bytes: 0,
             media_reserved_bytes: 0,
             audio: None,
+            image_blocks: None,
             #[cfg(test)]
             audio_encode_calls: 0,
             #[cfg(test)]
@@ -2429,6 +2431,7 @@ impl Engine {
 
     pub(super) fn reset_qwen_positions(&mut self) -> Result<()> {
         if let Some(q) = self.qwen.as_mut() {
+            q.image_blocks = None;
             #[cfg(test)]
             {
                 q.vision_encode_calls = 0;
@@ -2517,6 +2520,16 @@ impl Engine {
         let request_bytes = audio_bytes
             .checked_add(vision_bytes)
             .and_then(|n| n.checked_add(if vision_bytes == 0 { feature_bytes } else { 0 }))
+            .and_then(|n| {
+                if model.per_layer_input.is_none()
+                    && model.architecture == crate::model_spec::Architecture::Gemma4
+                    && !plan.slots().is_empty()
+                {
+                    n.checked_add(capacity.checked_mul(8).context("image block bytes overflow")?)
+                } else {
+                    Some(n)
+                }
+            })
             .context("media request bytes overflow")?;
         Ok((audio_bytes, vision_bytes, request_bytes))
     }
@@ -2597,6 +2610,18 @@ impl Engine {
             {
                 q.audio_encode_calls += input.audio.len();
             }
+        }
+        if self.model_spec.architecture == crate::model_spec::Architecture::Gemma4
+            && self.model_spec.per_layer_input.is_none()
+            && !plan.slots().is_empty()
+        {
+            ensure!(
+                plan.slots()
+                    .iter()
+                    .all(|slot| slot.tokens.len() <= self.chunk),
+                "prefill workspace cannot fit a complete image block"
+            );
+            q.image_blocks = Some(self.device.stream.clone_htod(&plan.image_blocks()?)?);
         }
         if let Some(trace) = trace.as_mut() {
             let values = self.device.stream.clone_dtoh(&images.features)?;

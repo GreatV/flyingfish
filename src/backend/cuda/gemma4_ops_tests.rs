@@ -782,6 +782,17 @@ impl VisionFixture<'_> {
                 && table.len() == 2 * positions as usize * hidden as usize,
             "RUNNER_FAIL pointwise fixture extents"
         );
+        let source_table = reference_bf16(&self.values, "table")?;
+        let mut interleaved = vec![bf16::ZERO; source_table.len()];
+        for axis in 0..2 {
+            for position in 0..positions as usize {
+                for channel in 0..hidden as usize {
+                    interleaved[(position * 2 + axis) * hidden as usize + channel] = source_table
+                        [(axis * positions as usize + position) * hidden as usize + channel];
+                }
+            }
+        }
+        let interleaved = s.clone_htod(&interleaved)?;
         let mut output = s.alloc_zeros::<bf16>(count as usize)?;
         for control in [false, true] {
             let (shift, scale) = if control {
@@ -828,9 +839,27 @@ impl VisionFixture<'_> {
                     .arg(&self.width)
                     .arg(&hidden)
                     .arg(&positions)
+                    .arg(&(u64::from(positions) * u64::from(hidden)))
+                    .arg(&u64::from(hidden))
                     .launch(flat(count as usize))?;
             }
             self.compare("positioned", &output, control)?;
+            if !control {
+                unsafe {
+                    s.launch_builder(&position)
+                        .arg(&scaled)
+                        .arg(&interleaved)
+                        .arg(&mut output)
+                        .arg(&self.height)
+                        .arg(&self.width)
+                        .arg(&hidden)
+                        .arg(&positions)
+                        .arg(&u64::from(hidden))
+                        .arg(&(2 * u64::from(hidden)))
+                        .launch(flat(count as usize))?;
+                }
+                self.compare("positioned", &output, false)?;
+            }
         }
         Ok(())
     }
