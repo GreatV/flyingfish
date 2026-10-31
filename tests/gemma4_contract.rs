@@ -41,6 +41,29 @@ fn large_gemma_geometry_preserves_global_kv_and_absent_per_layer_inputs() -> Res
                 && spec.audio.is_none(),
             "large Gemma geometry"
         );
+        let vision = spec.vision.as_ref().context("large Gemma vision missing")?;
+        if hidden == 3840 {
+            ensure!(
+                vision.unified.is_some()
+                    && vision.axial.is_none()
+                    && vision.patch_elements(spec.architecture)? == 6912,
+                "unified raw patch geometry"
+            );
+            let audio = spec.audio.as_ref().context("raw audio missing")?;
+            ensure!(
+                [audio.frame, audio.output] == [640, 3840],
+                "raw frame projection geometry"
+            );
+        } else {
+            let axial = vision.axial.as_ref().context("31B axial config missing")?;
+            ensure!(
+                [vision.hidden, vision.depth, vision.heads, axial.head_dim] == [1152, 27, 16, 72]
+                    && axial.standardize
+                    && !axial.clipped_linears
+                    && spec.audio.is_none(),
+                "31B media geometry"
+            );
+        }
         let work = flyingfish::work_layout::RowWorkSpec::new(&spec)?;
         let expected_projection = if hidden == 3840 { 8704 } else { 18432 };
         ensure!(

@@ -417,10 +417,15 @@ impl MultimodalInput<'_> {
             .as_ref()
             .context("vision configuration missing")?;
         vision.validate(spec.architecture)?;
-        let axial = vision
-            .axial
-            .as_ref()
-            .context("axial vision configuration missing")?;
+        let soft_tokens = if let Some(axial) = &vision.axial {
+            axial.soft_tokens
+        } else {
+            vision
+                .unified
+                .as_ref()
+                .context("image embedding configuration missing")?
+                .soft_tokens
+        };
         ensure!(
             capacity <= spec.max_position as usize,
             "image capacity exceeds model positions"
@@ -480,7 +485,7 @@ impl MultimodalInput<'_> {
             let group = (vision.merge * vision.merge) as usize;
             let features = patches / group;
             ensure!(
-                features <= axial.soft_tokens as usize,
+                features <= soft_tokens as usize,
                 "image exceeds soft-token budget"
             );
             let start = cursor + 1;

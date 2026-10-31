@@ -1104,6 +1104,21 @@ impl VisionRuntime {
         input: &MultimodalInput<'_>,
         capacity: usize,
     ) -> Result<usize> {
+        if model.vision.as_ref().is_some_and(|v| v.unified.is_some()) {
+            let plan = input.validate(model, capacity)?;
+            let v = model
+                .vision
+                .as_ref()
+                .context("vision configuration missing")?;
+            let rows = plan.patch_rows() as u128;
+            let patch = v.patch_elements(model.architecture)? as u128;
+            let h = u128::from(v.hidden);
+            let bytes = rows * (4 * patch + 8 + 2 * patch + 10 * h)
+                + 2 * plan.feature_rows() as u128 * u128::from(v.output)
+                + plan.slots().len() as u128 * 64;
+            return usize::try_from(bytes)
+                .context("unified vision workspace exceeds host indexing");
+        }
         if model.vision.as_ref().is_some_and(|v| v.axial.is_some()) {
             AxialTower::request_bytes(model, input, capacity)
         } else {

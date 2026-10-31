@@ -444,7 +444,20 @@ impl MappedCheckpoint {
         let mut expected = BTreeMap::new();
         Self::gemma4_entries(spec, &mut expected)?;
         if let Some(vision) = &spec.vision {
-            Self::axial_vision_entries(vision, &mut expected)?;
+            if vision.unified.is_some() {
+                Self::unified_vision_entries(vision, &mut expected)?;
+            } else {
+                Self::axial_vision_entries(vision, &mut expected)?;
+            }
+        }
+        if let Some(audio) = &spec.audio {
+            put(
+                &mut expected,
+                "model.embed_audio.embedding_projection.weight".into(),
+                Dtype::BF16,
+                vec![audio.output as usize, audio.frame as usize],
+                TensorScope::Audio,
+            );
         }
         Self::audio_entries(spec, &mut expected)?;
         let views = self.views()?;
@@ -550,6 +563,47 @@ impl MappedCheckpoint {
                 format!("{p}.lconv1d.depthwise_conv1d.weight"),
                 vec![h, 1, a.conv_kernel as usize],
             );
+    fn unified_vision_entries(
+        vision: &crate::model_spec::VisionConfig,
+        expected: &mut BTreeMap<String, ExpectedTensor>,
+    ) -> Result<()> {
+        vision.validate(crate::model_spec::Architecture::Gemma4)?;
+        ensure!(
+            vision.unified.is_some(),
+            "unified vision configuration missing"
+        );
+        let h = vision.hidden as usize;
+        let patch = vision.patch_elements(crate::model_spec::Architecture::Gemma4)?;
+        let mut add = |name: &str, shape: Vec<usize>| {
+            put(
+                expected,
+                name.into(),
+                Dtype::BF16,
+                shape,
+                TensorScope::Vision,
+            );
+        };
+        for (name, shape) in [
+            ("model.vision_embedder.patch_dense.weight", vec![h, patch]),
+            ("model.vision_embedder.patch_dense.bias", vec![h]),
+            (
+                "model.vision_embedder.pos_embedding",
+                vec![vision.position_side as usize, 2, h],
+            ),
+            (
+                "model.embed_vision.embedding_projection.weight",
+                vec![vision.output as usize, h],
+            ),
+        ] {
+            add(name, shape);
+        }
+        for (name, width) in [("patch_ln1", patch), ("patch_ln2", h), ("pos_norm", h)] {
+            for suffix in ["weight", "bias"] {
+                add(
+                    &format!("model.vision_embedder.{name}.{suffix}"),
+                    vec![width],
+                );
+            }
         }
         Ok(())
     }
@@ -2943,6 +2997,24 @@ mod component_tests {
                         "shared projection binding: {name}"
                     );
                 }
+                let vision = spec.vision.as_ref().context("large vision spec")?;
+                let (vision_count, vision_bytes) = if vision.unified.is_some() {
+                    MappedCheckpoint::unified_vision_entries(vision, &mut expected)?;
+                    (10, 99_844_608)
+                } else {
+                    MappedCheckpoint::axial_vision_entries(vision, &mut expected)?;
+                    (356, 1_151_487_072)
+                };
+                ensure!(
+                    expected
+                        .values()
+                        .filter(|e| e.2 == TensorScope::Vision)
+                        .count()
+                        == vision_count
+                        && MappedCheckpoint::planned_bytes(&expected, LoadPolicy::VisionOnly)?
+                            == vision_bytes,
+                    "large vision manifest count or allocation size changed"
+                );
                 continue;
             }
             MappedCheckpoint::axial_vision_entries(
@@ -2991,10 +3063,12 @@ mod component_tests {
         let manifest = checkpoint.manifest(&spec, LoadPolicy::TextOnly)?;
         if spec.vision.is_some() {
             let vision_manifest = checkpoint.manifest(&spec, LoadPolicy::VisionOnly)?;
-            let expected_vision_bytes = if spec.hidden == 1536 {
-                337_089_408
-            } else {
-                338_662_272
+            let expected_vision_bytes = match spec.hidden {
+                1536 => 337_089_408,
+                2560 => 338_662_272,
+                3840 => 99_844_608,
+                5376 => 1_151_487_072,
+                hidden => bail!("unexpected vision hidden size {hidden}"),
             };
             ensure!(
                 vision_manifest.resident_bytes == expected_vision_bytes
