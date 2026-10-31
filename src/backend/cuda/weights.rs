@@ -1252,6 +1252,7 @@ impl WeightCatalog {
         spec: &crate::model_spec::ModelSpec,
         d: &Device,
         transient_bytes: usize,
+        media_bytes: usize,
         prefix_cache: bool,
     ) -> Result<Self> {
         use crate::prefill::DensePlacement;
@@ -1280,11 +1281,8 @@ impl WeightCatalog {
             }
         }
         let (free, total) = d.ctx.mem_get_info()?;
-        let budget = free
-            .checked_sub(total / 16)
-            .and_then(|n| n.checked_sub(transient_bytes))
-            .and_then(|n| n.checked_sub(fixed))
-            .context("dense fixed weights and workspace exceed VRAM")?;
+        let budget =
+            DensePlacement::device_budget(free, total, fixed, transient_bytes, media_bytes)?;
         let preliminary = DensePlacement::new(&layers, budget, 0)?;
         if preliminary.slot_bytes == 0 {
             return Self::load_inner(

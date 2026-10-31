@@ -1204,8 +1204,23 @@ impl Runtime {
                     .max()
                     .context("sliding window missing")? as usize,
             )?;
+            #[cfg(test)]
+            let diagnostics = {
+                let intermediate = model
+                    .layers
+                    .iter()
+                    .filter_map(|layer| layer.geometry.map(|g| g.intermediate as usize))
+                    .max()
+                    .context("Gemma diagnostic intermediate missing")?;
+                rows.checked_mul(model.vocab as usize + 2 * intermediate)
+                    .and_then(|n| n.checked_mul(size_of::<bf16>()))
+                    .context("Gemma diagnostic bytes overflow")?
+            };
+            #[cfg(not(test))]
+            let diagnostics = 0;
             return per_layer_inputs
-                .checked_add(rope_tables)
+                .checked_add(diagnostics)
+                .and_then(|n| n.checked_add(rope_tables))
                 .and_then(|n| n.checked_add(flash))
                 .and_then(|n| n.checked_add(staging))
                 .and_then(|n| n.checked_add(decode))
@@ -2444,6 +2459,34 @@ impl Engine {
         result
     }
 
+    pub(super) fn multimodal_request_bytes(
+        model: &crate::model_spec::ModelSpec,
+        input: &crate::vision_input::MultimodalInput<'_>,
+        capacity: usize,
+    ) -> Result<(usize, usize, usize)> {
+        let plan = input.validate(model, capacity)?;
+        let audio_bytes = if input.audio.is_empty() {
+            0
+        } else {
+            super::audio_runtime::AudioRuntime::request_bytes(model, input, capacity)?
+        };
+        let vision_bytes = if plan.slots().is_empty() {
+            0
+        } else {
+            super::vision_runtime::VisionRuntime::request_bytes(model, input, capacity)?
+        };
+        let feature_bytes = plan
+            .feature_rows()
+            .checked_mul(model.hidden as usize)
+            .and_then(|n| n.checked_mul(2))
+            .context("media feature bytes overflow")?;
+        let request_bytes = audio_bytes
+            .checked_add(vision_bytes)
+            .and_then(|n| n.checked_add(if vision_bytes == 0 { feature_bytes } else { 0 }))
+            .context("media request bytes overflow")?;
+        Ok((audio_bytes, vision_bytes, request_bytes))
+    }
+
     pub(super) fn prepare_multimodal(
         &mut self,
         input: &crate::vision_input::MultimodalInput<'_>,
@@ -2460,33 +2503,8 @@ impl Engine {
         );
         let plan = input.validate(&self.model_spec, self.capacity)?;
         let positions = plan.packed_axes()?;
-        let audio_bytes = if input.audio.is_empty() {
-            0
-        } else {
-            super::audio_runtime::AudioRuntime::request_bytes(
-                &self.model_spec,
-                input,
-                self.capacity,
-            )?
-        };
-        let vision_bytes = if plan.slots().is_empty() {
-            0
-        } else {
-            super::vision_runtime::VisionRuntime::request_bytes(
-                &self.model_spec,
-                input,
-                self.capacity,
-            )?
-        };
-        let feature_bytes = plan
-            .feature_rows()
-            .checked_mul(self.model_spec.hidden as usize)
-            .and_then(|n| n.checked_mul(2))
-            .context("media feature bytes overflow")?;
-        let request_bytes = audio_bytes
-            .checked_add(vision_bytes)
-            .and_then(|n| n.checked_add(if vision_bytes == 0 { feature_bytes } else { 0 }))
-            .context("media request bytes overflow")?;
+        let (audio_bytes, vision_bytes, request_bytes) =
+            Self::multimodal_request_bytes(&self.model_spec, input, self.capacity)?;
         if audio_bytes != 0 {
             self.prepare_audio_weights(request_bytes)?;
         }
@@ -2715,6 +2733,10 @@ impl Engine {
             _ => require_qwen35_geometry(&model_spec)?,
         }
         let write = mode.writes();
+        let media_bytes = match mode {
+            super::SetupMode::Media { reserved_bytes } => reserved_bytes,
+            _ => 0,
+        };
         #[cfg(feature = "cuda")]
         let reserve_mtp = matches!(mode, super::SetupMode::Mtp { .. });
         #[cfg(feature = "rocm")]
@@ -2890,7 +2912,14 @@ impl Engine {
                 )
                 .and_then(|n| n.checked_add(fixed))
                 .context("dense workspace reservation overflow")?;
-                WeightCatalog::load_dense(dir, &model_spec, &device, transient, prefix_cache)?
+                WeightCatalog::load_dense(
+                    dir,
+                    &model_spec,
+                    &device,
+                    transient,
+                    media_bytes,
+                    prefix_cache,
+                )?
             } else if prefix_cache {
                 WeightCatalog::load_for_prefix_cache(dir, &model_spec, &device)?
             } else {
@@ -3014,6 +3043,7 @@ impl Engine {
                 .checked_add(mtp_budget.as_ref().map_or(0, |b| b.fixed_bytes))
                 .and_then(|bytes| bytes.checked_add(target_transaction_bytes))
                 .and_then(|bytes| bytes.checked_add(target_head_bytes))
+                .and_then(|bytes| bytes.checked_add(media_bytes))
                 .context("combined fixed bytes overflow")?,
         };
         let expert_setup = if model_spec.moe.is_some() && !glm {

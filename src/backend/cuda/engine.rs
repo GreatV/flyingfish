@@ -555,6 +555,9 @@ enum CaptureFault {
 #[derive(Clone, Copy)]
 enum SetupMode {
     Ready,
+    Media {
+        reserved_bytes: usize,
+    },
     Prepare,
     #[cfg(feature = "cuda")]
     Mtp {
@@ -565,7 +568,7 @@ enum SetupMode {
 impl SetupMode {
     fn writes(self) -> bool {
         match self {
-            Self::Ready => false,
+            Self::Ready | Self::Media { .. } => false,
             Self::Prepare => true,
             #[cfg(feature = "cuda")]
             Self::Mtp { .. } => true,
@@ -811,6 +814,45 @@ fn prefix_attention_host_tensors(
 }
 
 impl Engine {
+    pub fn load_multimodal(
+        dir: &Path,
+        ordinal: usize,
+        capacity: usize,
+        requested_chunk: Option<usize>,
+        settings: Settings,
+        input: &crate::vision_input::MultimodalInput<'_>,
+    ) -> Result<Self> {
+        let spec = crate::model_spec::ModelSpec::read(dir)?;
+        ensure!(
+            matches!(load_dispatch(spec.architecture)?, LoadDispatch::Qwen)
+                && spec.moe.is_none()
+                && spec.linear_format.fp8_layout().is_none(),
+            "media-aware dense placement requires a BF16 dense Qwen-family runtime"
+        );
+        let (audio, vision, request) = Self::multimodal_request_bytes(&spec, input, capacity)?;
+        let checkpoint = crate::checkpoint::MappedCheckpoint::open(dir)?;
+        let mut reserved_bytes = request;
+        for (present, policy) in [
+            (audio != 0, crate::checkpoint::LoadPolicy::AudioOnly),
+            (vision != 0, crate::checkpoint::LoadPolicy::VisionOnly),
+        ] {
+            if present {
+                reserved_bytes = reserved_bytes
+                    .checked_add(checkpoint.manifest(&spec, policy)?.resident_bytes)
+                    .and_then(|n| n.checked_add(1024 * 1024))
+                    .context("media setup reservation overflow")?;
+            }
+        }
+        Self::load_kind_for(
+            dir,
+            ordinal,
+            capacity,
+            requested_chunk,
+            settings,
+            SetupMode::Media { reserved_bytes },
+        )
+    }
+
     pub fn load(
         dir: &Path,
         ordinal: usize,

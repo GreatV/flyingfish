@@ -3041,7 +3041,6 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
         .as_ref()
         .context("vision config missing")?
         .image_token;
-    let mut engine = super::engine::Engine::load(&dir, 0, 896, Some(896), settings)?;
     let mut defects = 0usize;
     let mut street_features = None;
     let mut street_input = None;
@@ -3085,6 +3084,14 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
             pixel_values: &pixels,
             grids: &grids,
         };
+        let mut engine = super::engine::Engine::load_multimodal(
+            &dir,
+            0,
+            896,
+            Some(896),
+            settings.clone(),
+            &input,
+        )?;
         let identities: Vec<_> = ids
             .iter()
             .map(|&id| if id == image_token { 0 } else { id })
@@ -3185,7 +3192,15 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
                 .iter()
                 .map(|&id| if id == image_token { 0 } else { id })
                 .collect();
-            engine.reset()?;
+            drop(engine);
+            engine = super::engine::Engine::load_multimodal(
+                &dir,
+                0,
+                896,
+                Some(896),
+                settings.clone(),
+                &mixed_input,
+            )?;
             let mut mixed_trace = crate::trace::Trace::default();
             engine.gemma_vision_trace(&mixed_input, &mixed_identities, &mut mixed_trace)?;
             let actual = mixed_trace.values("image_features")?;
@@ -3297,7 +3312,6 @@ fn audio_model_definition_and_graph_gpu() -> Result<()> {
     };
     let spec = crate::model_spec::ModelSpec::read(&dir)?;
     let audio_token = spec.audio.as_ref().context("audio config missing")?.token;
-    let mut engine = super::engine::Engine::load(&dir, 0, 1536, Some(1536), settings.clone())?;
     let mut defects = 0;
     let mut singles = Vec::new();
     let mut stew = None;
@@ -3345,6 +3359,14 @@ fn audio_model_definition_and_graph_gpu() -> Result<()> {
             grids: &[],
             audio: &clips,
         };
+        let mut engine = super::engine::Engine::load_multimodal(
+            &dir,
+            0,
+            1536,
+            Some(1536),
+            settings.clone(),
+            &input,
+        )?;
         let identities = ids
             .iter()
             .map(|&id| if id == audio_token { 0 } else { id })
@@ -3545,7 +3567,15 @@ fn audio_model_definition_and_graph_gpu() -> Result<()> {
                 .iter()
                 .map(|&id| if id == vision.image_token { 0 } else { id })
                 .collect::<Vec<_>>();
-            engine.reset()?;
+            drop(engine);
+            engine = super::engine::Engine::load_multimodal(
+                &dir,
+                0,
+                1536,
+                Some(1536),
+                settings.clone(),
+                &image_input,
+            )?;
             let mut image_trace = crate::trace::Trace::default();
             engine.gemma_vision_trace(&image_input, &image_identities, &mut image_trace)?;
             let mut mixed_ids = ids[..first + 1].to_vec();
@@ -3569,7 +3599,15 @@ fn audio_model_definition_and_graph_gpu() -> Result<()> {
                     }
                 })
                 .collect::<Vec<_>>();
-            engine.reset()?;
+            drop(engine);
+            engine = super::engine::Engine::load_multimodal(
+                &dir,
+                0,
+                1536,
+                Some(1536),
+                settings.clone(),
+                &mixed,
+            )?;
             let mut mixed_trace = crate::trace::Trace::default();
             engine.gemma_vision_trace(&mixed, &mixed_identities, &mut mixed_trace)?;
             let mut expected = singles[0].clone();
@@ -3653,7 +3691,6 @@ fn audio_model_definition_and_graph_gpu() -> Result<()> {
         .count();
     defects += usize::from(changed == 0);
     println!("audio_two_media changed_prefix_elements={changed}");
-    drop(engine);
     let (ids, modalities, values, valid) = stew.context("stew chunk fixture")?;
     let clips = [AudioClip {
         features: &values,
@@ -3669,7 +3706,8 @@ fn audio_model_definition_and_graph_gpu() -> Result<()> {
         grids: &[],
         audio: &clips,
     };
-    let mut engine = super::engine::Engine::load(&dir, 0, 1536, Some(128), settings)?;
+    let mut engine =
+        super::engine::Engine::load_multimodal(&dir, 0, 1536, Some(128), settings, &input)?;
     engine.prefill_multimodal(&input, None)?;
     let mut output = engine
         .decode_logits()?
