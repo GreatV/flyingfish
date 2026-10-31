@@ -3412,7 +3412,7 @@ fn audio_model_definition_and_graph_gpu() -> Result<()> {
         trace.add(
             "scored_logits".into(),
             vec![ids.len() - first, actual.len() / (ids.len() - first)],
-            actual.clone(),
+            actual.iter().map(|value| value.to_f32()).collect(),
         )?;
         let diagnostics = settings.runtime_dir.as_ref().context("runtime missing")?;
         std::fs::create_dir_all(diagnostics)?;
