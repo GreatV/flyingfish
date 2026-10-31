@@ -2152,17 +2152,24 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         .map(|bytes| total + bytes)
     })?;
     let staging = (512 + admission_rows) * spec.kv_heads as usize * spec.head_dim as usize * 4;
-    let expected = per_layer_inputs + rope_tables + flash + staging;
+    let ring = spec
+        .layers
+        .iter()
+        .filter_map(|l| l.sliding_window)
+        .max()
+        .context("Gemma sliding window missing")? as usize;
+    let decode = spec.q_heads as usize * ring.div_ceil(32) * (spec.head_dim as usize + 2) * 4;
+    let expected = per_layer_inputs + rope_tables + flash + staging + decode;
     let admitted = engine.gemma_workspace(admission_rows, admission_capacity)?;
     println!(
-        "GEMMA4_WORKSPACE admitted={admitted} expected={expected} per_layer_inputs={per_layer_inputs} rope_tables={rope_tables} flash={flash} staging={staging}"
+        "GEMMA4_WORKSPACE admitted={admitted} expected={expected} per_layer_inputs={per_layer_inputs} rope_tables={rope_tables} flash={flash} staging={staging} decode={decode}"
     );
     ensure!(admitted == expected, "Gemma workspace admission mismatch");
     let scratch = engine.gemma_scratch_len();
     println!("GEMMA4_SCRATCH bytes={scratch}");
     ensure!(
-        scratch == 0,
-        "Gemma scratch allocation duplicates admission"
+        scratch == decode,
+        "Gemma shared decode scratch extent differs"
     );
     let global_layer = spec
         .layers
