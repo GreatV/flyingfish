@@ -100,7 +100,7 @@ __device__ __forceinline__ void fd_phase1_body(
   const int lane = tid % TP;
   const int grp  = tid / TP;
   const int dim0 = lane * VPR;
-  const int ngrp = blockDim.x / TP;
+  const int ngrp = DH == 256 ? 4 : blockDim.x / TP;
   extern __shared__ float fd_sm[];
   if constexpr (DH == 256) {
     bf16* shared_q = reinterpret_cast<bf16*>(fd_sm);
@@ -232,7 +232,7 @@ __device__ __forceinline__ void fd_phase1_body(
   // Level 2: cross-warp merge through dynamic shared memory.
   const int warp   = tid / 32;
   const int lane32 = tid % 32;
-  const int nw     = blockDim.x / 32;
+  const int nw     = DH == 256 ? 4 : blockDim.x / 32;
   float* sa  = fd_sm + (DH == 256 ? QP * DH / 2 : 0); // [QP][nw][DH]
   float* smm = sa + QP * nw * DH;                  // [QP][nw]
   float* sll = smm + QP * nw;                      // [QP][nw]
@@ -282,7 +282,7 @@ __device__ __forceinline__ void fd_phase2_body(const float* __restrict__ p_m,
   extern __shared__ float sm[];
   const int qh  = blockIdx.x;
   const int tid = threadIdx.x;
-  const int nt  = blockDim.x;
+  const int nt  = DH == 256 ? 256 : blockDim.x;
   const int G2  = nt / DH;
   const int g   = tid / DH;
   const int d   = tid % DH;
