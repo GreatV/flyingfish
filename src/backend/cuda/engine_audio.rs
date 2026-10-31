@@ -554,13 +554,44 @@ impl AudioRuntime {
         work: &AudioRequest,
         ff: &FeedForward,
         domain: RowDomain,
+        mut trace: Option<(&mut crate::trace::Trace, &str)>,
     ) -> Result<()> {
         let rows = domain.row_capacity;
         let h = self.config.hidden;
         self.clamp(s, &work.hidden, &work.delta, rows)?;
         self.norm(s, domain, &work.delta, &work.norm, &ff.pre, h)?;
+        if let Some((trace, prefix)) = trace.as_mut() {
+            Self::trace(
+                s,
+                &mut Some(trace),
+                &format!("{prefix}.pre"),
+                &work.norm,
+                rows,
+                h,
+            )?;
+        }
         self.linear(s, blas, work, &ff.up, (&work.norm, &work.expanded), rows)?;
+        if let Some((trace, prefix)) = trace.as_mut() {
+            Self::trace(
+                s,
+                &mut Some(trace),
+                &format!("{prefix}.up"),
+                &work.expanded,
+                rows,
+                h * 4,
+            )?;
+        }
         self.activate(s, &work.expanded, &work.activation, rows, h * 4, 1)?;
+        if let Some((trace, prefix)) = trace.as_mut() {
+            Self::trace(
+                s,
+                &mut Some(trace),
+                &format!("{prefix}.act"),
+                &work.activation,
+                rows,
+                h * 4,
+            )?;
+        }
         self.linear(
             s,
             blas,
@@ -569,6 +600,16 @@ impl AudioRuntime {
             (&work.activation, &work.delta),
             rows,
         )?;
+        if let Some((trace, prefix)) = trace.as_mut() {
+            Self::trace(
+                s,
+                &mut Some(trace),
+                &format!("{prefix}.down"),
+                &work.delta,
+                rows,
+                h,
+            )?;
+        }
         self.branch(s, work, &ff.post, rows, self.config.residual_weight)
     }
 
@@ -685,8 +726,28 @@ impl AudioRuntime {
                 (&work.subsample[1], &work.hidden),
                 rows,
             )?;
+            Self::trace(
+                s,
+                &mut trace,
+                &format!("audio.{clip_index}.input"),
+                &work.hidden,
+                rows,
+                h,
+            )?;
             for (index, block) in self.blocks.iter().enumerate() {
-                self.feed_forward(s, blas, &work, &block.ff[0], domain)?;
+                let prefix = format!("audio.{clip_index}.ff1");
+                self.feed_forward(
+                    s,
+                    blas,
+                    &work,
+                    &block.ff[0],
+                    domain,
+                    if index == 0 {
+                        trace.as_deref_mut().map(|trace| (trace, prefix.as_str()))
+                    } else {
+                        None
+                    },
+                )?;
                 if index == 0 {
                     Self::trace(
                         s,
@@ -784,7 +845,7 @@ impl AudioRuntime {
                         .arg(&(u64::from(rows) * u64::from(h)))
                         .launch(flat(rows as usize * h as usize))?;
                 }
-                self.feed_forward(s, blas, &work, &block.ff[1], domain)?;
+                self.feed_forward(s, blas, &work, &block.ff[1], domain, None)?;
                 if index == 0 {
                     Self::trace(
                         s,

@@ -279,6 +279,13 @@ def capture_model(args, config):
     ple = []
     stages = {}
     if audio:
+        hooks.append(tower.subsample_conv_projection.register_forward_hook(
+            lambda module, inputs, output: stages.update(input=output[0].detach().cpu())))
+        ff = tower.layers[0].feed_forward1
+        for key, module in (("pre", ff.pre_layer_norm), ("up", ff.ffw_layer_1),
+                            ("act", ff.act_fn), ("down", ff.ffw_layer_2)):
+            hooks.append(module.register_forward_hook(
+                lambda module, inputs, output, key=key: stages.update({f"ff1.{key}": output.detach().cpu()})))
         for index, module in enumerate((tower.subsample_conv_projection.layer0,
                                         tower.subsample_conv_projection.layer1)):
             def subsample_hook(module, inputs, output, index=index):
