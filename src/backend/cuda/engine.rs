@@ -2022,6 +2022,7 @@ impl Engine {
         identities: &[u32],
         trace: &mut crate::trace::Trace,
     ) -> Result<()> {
+        trace.set_device(&self.device.info.name)?;
         self.prepare_multimodal(input, Some(trace))?;
         self.gemma_prefill_trace(identities, trace)?;
         let (images, clips) = self.gemma_encoder_calls()?;
