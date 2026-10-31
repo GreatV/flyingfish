@@ -218,6 +218,291 @@ fn reference_bf16<'a>(fixture: &'a ReferenceFixture, name: &str) -> Result<&'a [
         .with_context(|| format!("reference tensor {name} is not BF16"))
 }
 
+struct VisionFixture<'a> {
+    device: &'a Device,
+    values: ReferenceFixture,
+    height: u32,
+    width: u32,
+    defects: usize,
+}
+
+impl VisionFixture<'_> {
+    fn upload(&self, name: &str) -> Result<crate::backend::gpu::CudaSlice<bf16>> {
+        Ok(self
+            .device
+            .stream
+            .clone_htod(reference_bf16(&self.values, name)?)?)
+    }
+
+    fn compare(
+        &mut self,
+        name: &str,
+        output: &crate::backend::gpu::CudaSlice<bf16>,
+        control: bool,
+    ) -> Result<()> {
+        let actual = self.device.stream.clone_dtoh(output)?;
+        let expected = reference_bf16(&self.values, name)?;
+        ensure!(
+            actual.len() == expected.len() && actual.iter().all(|v| v.is_finite()),
+            "RUNNER_FAIL vision output shape or finiteness: {name}"
+        );
+        let differences = actual
+            .iter()
+            .zip(expected)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let pass = if control {
+            differences > 0
+        } else {
+            differences == 0
+        };
+        self.defects += usize::from(!pass);
+        println!(
+            "{} vision_op {name} grid={}x{} control={control} bit_mismatches={differences}",
+            if pass { "PASS" } else { "DEFECT" },
+            self.height,
+            self.width
+        );
+        Ok(())
+    }
+
+    fn pointwise(&mut self) -> Result<()> {
+        let s = &self.device.stream;
+        let module = cubin::module(&self.device.ctx, "vision_ops")?;
+        let cast = module.load_function("vision_affine_cast_bf16")?;
+        let clamp = module.load_function("vision_clamp_bf16")?;
+        let position = module.load_function("vision_axis_position_add_bf16")?;
+        let pixels = s.clone_htod(&reference(&self.values, "pixels")?.as_f32())?;
+        let scaled = self.upload("scaled")?;
+        let table = self.upload("table")?;
+        let mut wrong_table = reference_bf16(&self.values, "table")?.to_vec();
+        let half = wrong_table.len() / 2;
+        wrong_table.rotate_left(half);
+        let wrong_table = s.clone_htod(&wrong_table)?;
+        let hidden = u32::try_from(self.values["scaled"].0[1])?;
+        let positions = u32::try_from(self.values["table"].0[1])?;
+        let count = u64::from(self.height) * u64::from(self.width) * u64::from(hidden);
+        ensure!(
+            pixels.len() == count as usize
+                && scaled.len() == pixels.len()
+                && table.len() == 2 * positions as usize * hidden as usize,
+            "RUNNER_FAIL pointwise fixture extents"
+        );
+        let mut output = s.alloc_zeros::<bf16>(count as usize)?;
+        for control in [false, true] {
+            let (shift, scale) = if control {
+                (0.0f32, 1.0f32)
+            } else {
+                (-0.5, 2.0)
+            };
+            unsafe {
+                s.launch_builder(&cast)
+                    .arg(&pixels)
+                    .arg(&mut output)
+                    .arg(&count)
+                    .arg(&shift)
+                    .arg(&scale)
+                    .launch(flat(count as usize))?;
+            }
+            self.compare("scaled", &output, control)?;
+            let lower = if control {
+                s.clone_htod(&[bf16::from_f32(-2.0)])?
+            } else {
+                self.upload("lower")?
+            };
+            let upper = if control {
+                s.clone_htod(&[bf16::from_f32(2.0)])?
+            } else {
+                self.upload("upper")?
+            };
+            unsafe {
+                s.launch_builder(&clamp)
+                    .arg(&scaled)
+                    .arg(&mut output)
+                    .arg(&count)
+                    .arg(&lower)
+                    .arg(&upper)
+                    .launch(flat(count as usize))?;
+            }
+            self.compare("clamped", &output, control)?;
+            unsafe {
+                s.launch_builder(&position)
+                    .arg(&scaled)
+                    .arg(if control { &wrong_table } else { &table })
+                    .arg(&mut output)
+                    .arg(&self.height)
+                    .arg(&self.width)
+                    .arg(&hidden)
+                    .arg(&positions)
+                    .launch(flat(count as usize))?;
+            }
+            self.compare("positioned", &output, control)?;
+        }
+        Ok(())
+    }
+
+    fn pool(&mut self) -> Result<()> {
+        let s = &self.device.stream;
+        let module = cubin::module(&self.device.ctx, "vision_ops")?;
+        let pool = module.load_function("vision_spatial_mean_scale_bf16")?;
+        let input = self.upload("pool_input")?;
+        let bias = self.upload("bias")?;
+        let multiplier = self.upload("multiplier")?;
+        let hidden = u32::try_from(self.values["pool_input"].0[1])?;
+        let count = u64::from(self.height) * u64::from(self.width) * u64::from(hidden) / 9;
+        let mut output = s.alloc_zeros::<bf16>(count as usize)?;
+        ensure!(
+            input.len() == 9 * count as usize
+                && bias.len() == hidden as usize
+                && multiplier.len() == bias.len(),
+            "RUNNER_FAIL pooling fixture extents"
+        );
+        let scale = f64::from(hidden).sqrt() as f32;
+        let original = reference_bf16(&self.values, "pool_input")?;
+        let mut transposed = vec![bf16::ZERO; original.len()];
+        for y in 0..self.height as usize {
+            for x in 0..self.width as usize {
+                let source = (y * self.width as usize + x) * hidden as usize;
+                let target = (x * self.height as usize + y) * hidden as usize;
+                transposed[target..target + hidden as usize]
+                    .copy_from_slice(&original[source..source + hidden as usize]);
+            }
+        }
+        let transposed = s.clone_htod(&transposed)?;
+        for control in [false, true] {
+            let (h, w) = if control {
+                (self.width, self.height)
+            } else {
+                (self.height, self.width)
+            };
+            let input = if control { &transposed } else { &input };
+            unsafe {
+                s.launch_builder(&pool)
+                    .arg(input)
+                    .arg(&mut output)
+                    .arg(&0u64)
+                    .arg(&0u64)
+                    .arg(&h)
+                    .arg(&w)
+                    .arg(&hidden)
+                    .arg(&3u32)
+                    .arg(&scale)
+                    .launch(flat(count as usize))?;
+            }
+            self.compare("pooled", &output, control)?;
+            unsafe {
+                s.launch_builder(&pool)
+                    .arg(input)
+                    .arg(&mut output)
+                    .arg(&bias)
+                    .arg(&multiplier)
+                    .arg(&h)
+                    .arg(&w)
+                    .arg(&hidden)
+                    .arg(&3u32)
+                    .arg(&scale)
+                    .launch(flat(count as usize))?;
+            }
+            self.compare("standardized", &output, control)?;
+        }
+        Ok(())
+    }
+
+    fn rope(&mut self) -> Result<()> {
+        let s = &self.device.stream;
+        let module = cubin::module(&self.device.ctx, "vision_rope")?;
+        let rope = module.load_function("vision_axial_rope_prepare_bf16")?;
+        let q = self.upload("q")?;
+        let k = self.upload("k")?;
+        let v = self.upload("v")?;
+        let rows = self.height * self.width;
+        let heads = u32::try_from(self.values["q"].0[1])?;
+        let dim = u32::try_from(self.values["q"].0[2])?;
+        let mut q_out = s.alloc_zeros::<bf16>(q.len())?;
+        let mut k_out = s.alloc_zeros::<bf16>(k.len())?;
+        let mut v_out = s.alloc_zeros::<bf16>(v.len())?;
+        ensure!(
+            q.len() == rows as usize * heads as usize * dim as usize
+                && q.len() == k.len()
+                && q.len() == v.len(),
+            "RUNNER_FAIL rotary fixture extents"
+        );
+        for control in [false, true] {
+            let mut table = reference_bf16(&self.values, "angles")?.to_vec();
+            ensure!(
+                table.len() == rows as usize * dim as usize,
+                "RUNNER_FAIL rotary table extent"
+            );
+            if control {
+                for row in table.chunks_exact_mut(dim as usize) {
+                    row.rotate_left(dim as usize / 2);
+                }
+            }
+            let table = s.clone_htod(&table)?;
+            unsafe {
+                s.launch_builder(&rope)
+                    .arg(&q)
+                    .arg(&k)
+                    .arg(&v)
+                    .arg(&table)
+                    .arg(&mut q_out)
+                    .arg(&mut k_out)
+                    .arg(&mut v_out)
+                    .arg(&rows)
+                    .arg(&heads)
+                    .arg(&dim)
+                    .launch(flat(q.len()))?;
+            }
+            self.compare("rotated_q", &q_out, control)?;
+            self.compare("rotated_k", &k_out, control)?;
+            self.compare("transposed_v", &v_out, false)?;
+        }
+        Ok(())
+    }
+}
+
+#[test]
+#[ignore = "requires a GPU and frozen FF_GEMMA4_FIXTURES vision operator references"]
+fn axial_vision_pointwise_pool_rope_gpu() -> Result<()> {
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("FF_GEMMA4_FIXTURES").context("FF_GEMMA4_FIXTURES missing")?,
+    );
+    let frozen: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("VISION_FROZEN.json"))?)?;
+    ensure!(
+        frozen["status"] == "FROZEN"
+            && frozen["max_bit_mismatches"] == 0
+            && frozen["reference_devices"] == serde_json::json!(["cpu", "sm89", "sm86"]),
+        "RUNNER_FAIL vision operator reference freeze missing"
+    );
+    let device = Device::new(0)?;
+    let mut defects = 0;
+    for (height, width) in [(9, 15), (48, 48), (42, 60)] {
+        let name = format!("vision-ops-{height}x{width}");
+        ensure!(
+            frozen["cells"][&name]["cross_device_mismatches"] == 0,
+            "RUNNER_FAIL vision reference cross-device noise differs"
+        );
+        let mut cell = VisionFixture {
+            device: &device,
+            values: load_reference(&directory.join(format!("{name}.safetensors")))?,
+            height,
+            width,
+            defects: 0,
+        };
+        cell.pointwise()?;
+        cell.pool()?;
+        cell.rope()?;
+        defects += cell.defects;
+    }
+    println!(
+        "{} axial_vision_pointwise_pool_rope_gpu cells=3 defects={defects}",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(defects == 0, "DEFECT axial vision operations");
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires a GPU and FF_GEMMA4_FIXTURES"]
 fn gelu_tanh_gated_activation_matches_the_definition_gpu() -> Result<()> {

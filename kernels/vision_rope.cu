@@ -21,6 +21,32 @@
 #endif
 #include <stdint.h>
 
+// Q remains token-major; K/V become head-major. Tables hold BF16 [row, axis, pair, cos/sin].
+extern "C" __global__ void vision_axial_rope_prepare_bf16(
+    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
+    const __nv_bfloat16* table, __nv_bfloat16* q_out, __nv_bfloat16* k_out, __nv_bfloat16* v_out,
+    uint32_t rows, uint32_t heads, uint32_t dim) {
+    if (!q || !k || !v || !table || !q_out || !k_out || !v_out || !rows || !heads ||
+        !dim || dim % 4 || blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
+        gridDim.y != 1 || gridDim.z != 1) { __trap(); return; }
+    const uint32_t quarter = dim / 4;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < uint64_t(rows) * heads * dim;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint64_t row = i / (uint64_t(heads) * dim), head = i / dim % heads;
+        const uint32_t channel = i % dim, axis = channel / (2 * quarter), part = channel % (2 * quarter);
+        const uint64_t other = i - channel + axis * 2 * quarter + (part + quarter) % (2 * quarter);
+        const uint64_t angle = row * dim + (axis * quarter + part % quarter) * 2;
+        const __nv_bfloat16 cosine = table[angle], sine = table[angle + 1];
+        const float sign = part < quarter ? -1.0f : 1.0f;
+        q_out[i] = __hadd(__hmul(q[i], cosine),
+            __hmul(__float2bfloat16_rn(sign * __bfloat162float(q[other])), sine));
+        const uint64_t target = (head * rows + row) * dim + channel;
+        k_out[target] = __hadd(__hmul(k[i], cosine),
+            __hmul(__float2bfloat16_rn(sign * __bfloat162float(k[other])), sine));
+        v_out[target] = v[i];
+    }
+}
+
 namespace vision_rope {
 
 using bf16 = __nv_bfloat16;
