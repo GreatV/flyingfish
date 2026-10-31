@@ -858,16 +858,14 @@ impl AudioRuntime {
                 }
                 self.clamp(s, &work.hidden, &work.delta, rows)?;
                 self.norm(s, domain, &work.delta, &work.hidden, &block.final_norm, h)?;
-                if index == 0 {
-                    Self::trace(
-                        s,
-                        &mut trace,
-                        &format!("audio.{clip_index}.layer0"),
-                        &work.hidden,
-                        rows,
-                        h,
-                    )?;
-                }
+                Self::trace(
+                    s,
+                    &mut trace,
+                    &format!("audio.{clip_index}.layer{index}"),
+                    &work.hidden,
+                    rows,
+                    h,
+                )?;
             }
             blas.linear_biased(
                 stage_view(&self.output.weight, s, self.output.shape)?,

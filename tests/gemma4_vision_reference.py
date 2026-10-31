@@ -273,12 +273,18 @@ def capture_model(args, config):
                                   workspace_bytes=workspace_bytes, free_bytes=free_bytes)
     if audio:
         report["relative_timescales_dtype"] = relative_timescales_dtype
+        report["bf16_reduced_precision_reduction"] = torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
     (args.output / "LOAD.json").write_text(json.dumps(report, indent=2) + "\n")
     counted = [0]
     features = []
     ple = []
     stages = {}
+    text_stages = {}
     if audio:
+        for index in (0, len(lm.layers) // 2, len(lm.layers) - 1):
+            hooks.append(lm.layers[index].register_forward_hook(
+                lambda module, inputs, output, index=index:
+                    text_stages.update({f"text.layer.{index}": output[0].detach().float().cpu().contiguous()})))
         hooks.append(tower.subsample_conv_projection.register_forward_hook(
             lambda module, inputs, output: stages.update(input=output[0].detach().cpu())))
         ff = tower.layers[0].feed_forward1
@@ -292,8 +298,10 @@ def capture_model(args, config):
                 hidden, mask = output
                 stages[f"subsample{index}"] = hidden.permute(0, 2, 3, 1)[mask].flatten(0, 1).float().cpu().contiguous()
             hooks.append(module.register_forward_hook(subsample_hook))
-        hooks.append(tower.layers[0].register_forward_hook(
-            lambda module, inputs, output: stages.update(layer0=output.detach().cpu())))
+        for index, module in enumerate(tower.layers):
+            hooks.append(module.register_forward_hook(
+                lambda module, inputs, output, index=index:
+                    stages.update({f"layer{index}": output.detach().cpu()})))
         for key, module in (("ff1", tower.layers[0].feed_forward1),
                             ("ff2", tower.layers[0].feed_forward2)):
             hooks.append(module.register_forward_hook(
@@ -334,6 +342,7 @@ def capture_model(args, config):
             def valid_features():
                 return (features[0][media["input_features_mask"].cpu()[:, ::4]] if audio else features[0]).float()
             captured = dict(logits=logits, features=valid_features(), ple=ple[0][0].float())
+            captured.update(text_stages)
             if audio:
                 for key, value in stages.items():
                     captured[key] = (value[media["input_features_mask"].cpu()[:, ::4]] if key not in ("subsample0", "subsample1") else value).float().contiguous()
@@ -343,6 +352,7 @@ def capture_model(args, config):
                 ple.clear()
                 repeated = model(**arguments)
                 repeat = dict(logits=repeated.logits[0].float().cpu(), features=valid_features(), ple=ple[0][0].float())
+                repeat.update(text_stages)
                 if audio:
                     for key, value in stages.items():
                         repeat[key] = (value[media["input_features_mask"].cpu()[:, ::4]] if key not in ("subsample0", "subsample1") else value).float().contiguous()
@@ -355,7 +365,7 @@ def capture_model(args, config):
             if name in semantic_cells and variant == "packed":
                 media_logits.append(logits[0].clone())
             del logits, captured, arguments
-        if audio and args.stage == "model":
+        if audio and args.stage == "model" and name != "long":
             before = counted[0]
             media = reference_media(data, "packed", args.device, audio)
             output = model(input_ids=ids[:, :prompt_length].to(args.device),

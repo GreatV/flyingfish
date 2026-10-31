@@ -3414,6 +3414,29 @@ fn audio_model_definition_and_graph_gpu() -> Result<()> {
             vec![ids.len() - first, actual.len() / (ids.len() - first)],
             actual.iter().map(|value| value.to_f32()).collect(),
         )?;
+        if name == "stew" {
+            let h = spec.hidden as usize;
+            let normalized = trace.values(".debug.norm1")?;
+            let x = normalized[..ids.len() * h]
+                .iter()
+                .copied()
+                .map(bf16::from_f32)
+                .collect::<Vec<_>>();
+            let full = engine.gemma_linear_probe("self_attn.q_proj.weight", &x)?;
+            let skinny = engine.gemma_linear_probe("self_attn.q_proj.weight", &x[..10 * h])?;
+            let mismatch = full.iter().zip(&skinny).filter(|(a, b)| a != b).count();
+            println!(
+                "audio_text_linear_shapes full_rows={} skinny_rows=10 bit_mismatches={mismatch}",
+                ids.len()
+            );
+            for (key, rows, values) in [("q_full", ids.len(), full), ("q_skinny", 10, skinny)] {
+                trace.add(
+                    key.into(),
+                    vec![rows, values.len() / rows],
+                    values.into_iter().map(bf16::to_f32).collect(),
+                )?;
+            }
+        }
         let diagnostics = settings.runtime_dir.as_ref().context("runtime missing")?;
         std::fs::create_dir_all(diagnostics)?;
         trace.save(&diagnostics.join(format!("{name}-native.safetensors")))?;
