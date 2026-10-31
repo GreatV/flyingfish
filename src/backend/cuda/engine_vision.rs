@@ -1642,7 +1642,7 @@ impl LayerNormTower {
             "{}",
             serde_json::json!({"vision_memory_plan": {
                 "rows":rows,"padded_rows":padded,"images":packing.images(),
-                "payload_bytes":bytes,"operator_scratch_bytes":scratch_bytes,"free_bytes":free,"reserve_bytes":total/16
+                "payload_bytes":bytes,"operator_scratch_bytes":scratch_bytes,"free_bytes":free,"reserve_bytes":reserve
             }})
         );
         Ok(LayerNormRequest {
