@@ -2547,7 +2547,6 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
         .as_ref()
         .context("vision config missing")?
         .image_token;
-    let depth = spec.layers.len();
     let mut engine = super::engine::Engine::load(&dir, 0, 896, Some(896), settings)?;
     let mut defects = 0usize;
     let mut street_features = None;
@@ -2608,10 +2607,10 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
         )?;
         defects += usize::from(!feature_pass);
         let combined = trace.values(".debug.ple_identity")?;
-        let ple: Vec<_> = (0..ids.len())
-            .flat_map(|row| combined[row * depth * 256..][..256].iter().copied())
-            .collect();
-        let ple_pass = vision_distance(&ple, &oracle["ple"].1.as_f32(), &bounds["ple"])?;
+        let ple = combined
+            .get(..ids.len() * 256)
+            .context("layer-major PLE trace is shorter than layer zero")?;
+        let ple_pass = vision_distance(ple, &oracle["ple"].1.as_f32(), &bounds["ple"])?;
         defects += usize::from(!ple_pass);
         let mut actual = Vec::new();
         for row in first..ids.len() {
@@ -2626,7 +2625,11 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
         defects += usize::from(!pass);
         println!(
             "{} image_model {name} features={feature_pass} ple={ple_pass} {metrics}",
-            if pass { "PASS" } else { "DEFECT" }
+            if pass && feature_pass && ple_pass {
+                "PASS"
+            } else {
+                "DEFECT"
+            }
         );
         if name == "street" {
             street_features = Some(features.clone());
@@ -2640,10 +2643,10 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
             let mut wrong = crate::trace::Trace::default();
             engine.gemma_vision_trace(&input, &ids, &mut wrong)?;
             let wrong_combined = wrong.values(".debug.ple_identity")?;
-            let wrong_ple: Vec<_> = (0..ids.len())
-                .flat_map(|row| wrong_combined[row * depth * 256..][..256].iter().copied())
-                .collect();
-            let detected = !vision_distance(&wrong_ple, &oracle["ple"].1.as_f32(), &bounds["ple"])?;
+            let wrong_ple = wrong_combined
+                .get(..ids.len() * 256)
+                .context("control PLE trace is shorter than layer zero")?;
+            let detected = !vision_distance(wrong_ple, &oracle["ple"].1.as_f32(), &bounds["ple"])?;
             defects += usize::from(!detected);
             let text_differences = ids
                 .iter()
