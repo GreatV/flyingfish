@@ -1544,6 +1544,7 @@ mod tests {
     #[test]
     #[ignore = "requires CUDA and a dense streaming window"]
     fn dense_slots_preserve_native_bytes_across_host_disk_reuse_gpu() -> Result<()> {
+        use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, sys as bs};
         use std::io::Write;
         let root = std::env::temp_dir().join(format!("ff-dense-slots-{}", std::process::id()));
         std::fs::create_dir(&root)?;
@@ -1613,13 +1614,59 @@ mod tests {
             let mut outputs = (0..4)
                 .map(|_| stream.alloc_zeros::<u8>(per_layer))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            for (values, output) in expected.iter().zip(&mut outputs) {
+            let blas = CudaBlas::new(stream.clone())?;
+            let (n, k) = (shapes[1][0], shapes[1][1]);
+            let input = stream.clone_htod(
+                &(0..18 * k)
+                    .map(|i| bf16::from_f32(((i * 37 % 997) as f32 - 498.0) / 512.0))
+                    .collect::<Vec<_>>(),
+            )?;
+            let mut products = (0..4)
+                .map(|_| stream.alloc_zeros::<bf16>(18 * n))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let product = |weights: &CudaSlice<u8>, output: &mut CudaSlice<bf16>| -> Result<()> {
+                let weight = unsafe { weights.transmute::<bf16>(per_layer / 2) }
+                    .context("dense test matrix extent")?;
+                let weight = weight.slice(shapes[0].iter().product::<usize>()..);
+                for (start, rows) in [(0, 1), (1, 17)] {
+                    let config = GemmConfig {
+                        transa: bs::cublasOperation_t::CUBLAS_OP_T,
+                        transb: bs::cublasOperation_t::CUBLAS_OP_N,
+                        m: n as i32,
+                        n: rows as i32,
+                        k: k as i32,
+                        alpha: bf16::ONE,
+                        lda: k as i32,
+                        ldb: k as i32,
+                        beta: bf16::ZERO,
+                        ldc: n as i32,
+                    };
+                    unsafe {
+                        blas.gemm(
+                            config,
+                            &weight,
+                            &input.slice(start * k..(start + rows) * k),
+                            &mut output.slice_mut(start * n..(start + rows) * n),
+                        )?;
+                    }
+                }
+                Ok(())
+            };
+            let mut resident_products = Vec::new();
+            for (layer, (values, output)) in expected.iter().zip(&mut outputs).enumerate() {
                 let resident = stream.clone_htod(values)?;
                 stream.memcpy_dtod(&resident, output)?;
                 ensure!(
                     stream.clone_dtoh(output)? == *values,
                     "resident native byte baseline differs"
                 );
+                product(&resident, &mut products[layer])?;
+                let values = stream.clone_dtoh(&products[layer])?;
+                ensure!(
+                    values.iter().all(|v| v.is_finite()),
+                    "nonfinite resident product"
+                );
+                resident_products.push(values);
             }
             println!("PASS dense_resident layers=4 layer_bytes={per_layer} byte_mismatches=0");
             for host_layers in [0, 2, 4] {
@@ -1653,6 +1700,8 @@ mod tests {
                                 stream.cu_stream(),
                             )?;
                         }
+                        let slot = dense.plan.slots[layer].context("streamed test slot missing")?;
+                        product(&dense.slots[slot].device, &mut products[layer])?;
                         dense.end(layer, stream)?;
                     }
                     for (layer, output) in outputs.iter().enumerate() {
@@ -1665,6 +1714,15 @@ mod tests {
                             actual != expected[(layer + 2) % 4],
                             "wrong-slot-generation control is not discriminating"
                         );
+                        let actual = stream.clone_dtoh(&products[layer])?;
+                        ensure!(
+                            actual == resident_products[layer],
+                            "dense resident/streamed products differ: host_layers={host_layers} repeat={repeat} layer={layer}"
+                        );
+                        ensure!(
+                            actual != resident_products[(layer + 2) % 4],
+                            "wrong-generation product control is not discriminating"
+                        );
                     }
                     device.upload.synchronize()?;
                     for slot in &dense.slots {
@@ -1676,7 +1734,7 @@ mod tests {
                     }
                 }
                 println!(
-                    "PASS dense_slots host_layers={host_layers} disk_layers={} layers=4 repeats=3 slot_bytes={per_layer} byte_mismatches=0 wrong_generation=detected bounds=detected tail_guards=preserved",
+                    "PASS dense_slots host_layers={host_layers} disk_layers={} layers=4 repeats=3 slot_bytes={per_layer} byte_mismatches=0 product_rows=1,17 product_bits=0 wrong_generation=detected bounds=detected tail_guards=preserved",
                     4 - host_layers
                 );
             }
