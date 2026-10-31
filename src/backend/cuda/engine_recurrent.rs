@@ -1144,6 +1144,7 @@ impl Engine {
                             out: &mut w.attn,
                             keys: rows,
                             prefix: Some(r.prefix),
+                            image_blocks: None,
                             shape: super::super::flash::Shape {
                                 rows,
                                 start: 0,

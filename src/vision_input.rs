@@ -252,6 +252,47 @@ impl PositionPlan {
     pub fn audio_slots(&self) -> &[AudioSlot] {
         &self.audio_slots
     }
+    pub fn image_blocks(&self) -> Result<Vec<u32>> {
+        let mut bounds = Vec::with_capacity(
+            self.capacity
+                .checked_mul(2)
+                .context("image-block extent overflow")?,
+        );
+        for position in 0..self.capacity {
+            let end = u32::try_from(position + 1)?;
+            bounds.extend([end, end]);
+        }
+        for slot in &self.slots {
+            let start = u32::try_from(slot.tokens.start)?;
+            let end = u32::try_from(slot.tokens.end)?;
+            for row in slot.tokens.clone() {
+                bounds[2 * row..2 * row + 2].copy_from_slice(&[start, end]);
+            }
+        }
+        Ok(bounds)
+    }
+
+    pub fn chunk_end(&self, start: usize, rows: usize, total: usize) -> Result<usize> {
+        ensure!(rows > 0 && start < total, "invalid media prefill chunk");
+        let mut end = start
+            .checked_add(rows)
+            .context("media prefill chunk overflow")?
+            .min(total);
+        for slot in &self.slots {
+            ensure!(
+                start <= slot.tokens.start || start >= slot.tokens.end,
+                "media prefill starts inside an image block"
+            );
+            if slot.tokens.start < end && end < slot.tokens.end {
+                end = slot.tokens.start;
+            }
+        }
+        ensure!(
+            end > start,
+            "prefill workspace cannot fit a complete image block"
+        );
+        Ok(end)
+    }
     pub fn rope_delta(&self) -> i64 {
         self.rope_delta
     }

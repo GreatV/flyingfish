@@ -1000,13 +1000,13 @@ fn axial_vision_pointwise_pool_rope_gpu() -> Result<()> {
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "requires a GPU and frozen FF_GEMMA4_FIXTURES attention references"]
-fn vision_bidirectional_attention_gpu() -> Result<()> {
+fn media_prefill_attention_gpu() -> Result<()> {
     use super::flash::{Flash, Query, Score, Shape};
     let directory = std::path::PathBuf::from(
         std::env::var_os("FF_GEMMA4_FIXTURES").context("FF_GEMMA4_FIXTURES missing")?,
     );
     let limits: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(directory.join("D64_FROZEN.json"))?)?;
+        serde_json::from_slice(&std::fs::read(directory.join("ATTENTION_FROZEN.json"))?)?;
     ensure!(
         limits["status"] == "FROZEN"
             && limits["reference_devices"] == serde_json::json!(["sm89", "sm86"]),
@@ -1018,11 +1018,40 @@ fn vision_bidirectional_attention_gpu() -> Result<()> {
         device.ctx.disable_event_tracking();
     }
     let stream = &device.stream;
+    let cells = limits["cells"]
+        .as_object()
+        .context("attention cells missing")?;
+    ensure!(!cells.is_empty(), "RUNNER_FAIL empty attention cells");
     let mut defects = 0;
-    for rows in [1usize, 63, 64, 65, 135, 2304, 2520] {
-        let name = format!("vision-attention-{rows}");
+    for (name, bound) in cells {
         let fixture = load_reference(&directory.join(format!("{name}.safetensors")))?;
-        let bound = &limits["cells"][&name];
+        let integer = |key: &str| -> Result<usize> {
+            usize::try_from(
+                bound[key]
+                    .as_u64()
+                    .with_context(|| format!("attention {key} missing"))?,
+            )
+            .context("attention dimension exceeds host index")
+        };
+        let rows = integer("rows")?;
+        let heads = integer("heads")?;
+        let kv_heads = integer("kv_heads")?;
+        let dim = integer("dim")?;
+        let start = integer("start")?;
+        let origin = integer("origin")?;
+        let capacity = integer("capacity")?;
+        let pitch = integer("pitch")?;
+        let keys = integer("keys")?;
+        let block_mode = match bound["mode"].as_str() {
+            Some("blocks") => true,
+            Some("bidirectional") => false,
+            _ => anyhow::bail!("RUNNER_FAIL unknown media attention mask"),
+        };
+        let window_left = if bound["window_left"].is_null() {
+            None
+        } else {
+            Some(integer("window_left")?)
+        };
         let max_limit = bound["output_max"].as_f64().context("max limit")?;
         let rmse_limit = bound["output_rmse"].as_f64().context("RMSE limit")?;
         ensure!(
@@ -1032,57 +1061,84 @@ fn vision_bidirectional_attention_gpu() -> Result<()> {
         let q = stream.clone_htod(reference_bf16(&fixture, "q")?)?;
         let k = stream.clone_htod(reference_bf16(&fixture, "k")?)?;
         let v = stream.clone_htod(reference_bf16(&fixture, "v")?)?;
-        let heads = fixture["k"].0[0];
-        let capacity = fixture["k"].0[1];
-        let pitch = fixture["q"].0[1];
-        let keys = usize::try_from(bound["keys"].as_u64().context("key extent")?)?;
+        let blocks = if block_mode {
+            let length = origin
+                .checked_add(capacity)
+                .context("block metadata overflow")?;
+            let mut values = Vec::with_capacity(2 * length);
+            for index in 0..length {
+                let end = u32::try_from(index + 1)?;
+                values.extend([end, end]);
+            }
+            let spans: Vec<[usize; 2]> = serde_json::from_value(bound["block_spans"].clone())?;
+            ensure!(!spans.is_empty(), "RUNNER_FAIL empty block spans");
+            for [start, end] in spans {
+                ensure!(
+                    start < end && end <= length,
+                    "RUNNER_FAIL block span outside metadata"
+                );
+                for row in start..end {
+                    values[2 * row..2 * row + 2]
+                        .copy_from_slice(&[u32::try_from(start)?, u32::try_from(end)?]);
+                }
+            }
+            Some(stream.clone_htod(&values)?)
+        } else {
+            None
+        };
         let expected = reference(&fixture, "oracle")?.as_f32();
-        let count = rows * heads * 64;
+        let count = rows * heads * dim;
         ensure!(
             fixture["q"].0 == [rows, pitch]
-                && fixture["k"].0 == [heads, capacity, 64]
+                && fixture["k"].0 == [kv_heads, capacity, dim]
                 && fixture["v"].0 == fixture["k"].0
-                && fixture["oracle"].0 == [rows, heads, 64]
+                && fixture["oracle"].0 == [rows, heads, dim]
                 && expected.len() == count
                 && expected.iter().all(|v| v.is_finite()),
             "RUNNER_FAIL attention fixture extents/finiteness"
         );
         let mut out = stream.clone_htod(&vec![bf16::from_bits(0x7fc1); count + 32])?;
-        let run = |op: &mut Flash, out: &mut crate::backend::gpu::CudaSlice<bf16>| {
-            op.run_masked(Query {
-                q: &q,
-                q_row_stride: pitch,
-                k: &k,
-                v: &v,
-                out,
-                shape: Shape {
-                    rows,
-                    start: 0,
-                    capacity,
-                    q_heads: heads,
-                    kv_heads: heads,
-                    head_dim: 64,
-                    causal: false,
-                    window_left: None,
-                },
-                keys,
-                prefix: None,
-            })
-        };
+        let run =
+            |op: &mut Flash, out: &mut crate::backend::gpu::CudaSlice<bf16>, control: bool| {
+                op.run_masked(Query {
+                    q: &q,
+                    q_row_stride: pitch,
+                    k: &k,
+                    v: &v,
+                    out,
+                    shape: Shape {
+                        rows,
+                        start,
+                        capacity,
+                        q_heads: heads,
+                        kv_heads,
+                        head_dim: dim,
+                        causal: block_mode,
+                        window_left,
+                    },
+                    keys,
+                    prefix: None,
+                    image_blocks: if control {
+                        None
+                    } else {
+                        blocks.as_ref().map(|b| (b, origin))
+                    },
+                })
+            };
         for control in [false, true] {
             let mut op = Flash::new_with_score(
                 stream.clone(),
                 rows,
                 heads,
-                heads,
-                64,
+                kv_heads,
+                dim,
                 Score {
-                    scale: if control { 0.125 } else { 1.0 },
-                    window_left: None,
+                    scale: if control && !block_mode { 0.125 } else { 1.0 },
+                    window_left,
                 },
                 capacity,
             )?;
-            run(&mut op, &mut out)?;
+            run(&mut op, &mut out, control)?;
             let actual = stream.clone_dtoh(&out)?;
             ensure!(
                 actual[..count].iter().all(|v| v.is_finite()),
@@ -1101,14 +1157,14 @@ fn vision_bidirectional_attention_gpu() -> Result<()> {
             let pass = within != control && guard;
             defects += usize::from(!pass);
             println!(
-                "{} vision_attention rows={rows} control={control} max={maximum:e} rmse={rmse:e} limits={max_limit:e}/{rmse_limit:e} guard={guard}",
+                "{} media_attention name={name} control={control} max={maximum:e} rmse={rmse:e} limits={max_limit:e}/{rmse_limit:e} guard={guard}",
                 if pass { "PASS" } else { "DEFECT" }
             );
             if !control {
                 stream.begin_capture(
                     cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
                 )?;
-                run(&mut op, &mut out)?;
+                run(&mut op, &mut out, control)?;
                 let graph = stream
                     .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
                     .context("attention graph missing")?;
@@ -1121,17 +1177,18 @@ fn vision_bidirectional_attention_gpu() -> Result<()> {
                     .count();
                 defects += usize::from(bits != 0);
                 println!(
-                    "{} vision_attention rows={rows} graph_eager_bits={bits}",
+                    "{} media_attention name={name} graph_eager_bits={bits}",
                     if bits == 0 { "PASS" } else { "DEFECT" }
                 );
             }
         }
     }
     println!(
-        "{} vision_bidirectional_attention_gpu cells=7 defects={defects}",
-        if defects == 0 { "PASS" } else { "DEFECT" }
+        "{} media_prefill_attention_gpu cells={} defects={defects}",
+        if defects == 0 { "PASS" } else { "DEFECT" },
+        cells.len()
     );
-    ensure!(defects == 0, "DEFECT vision bidirectional attention");
+    ensure!(defects == 0, "DEFECT media prefill attention");
     Ok(())
 }
 

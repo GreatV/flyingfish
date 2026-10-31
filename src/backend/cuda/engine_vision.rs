@@ -2874,6 +2874,7 @@ impl AxialTower {
                         },
                         keys: rows as usize,
                         prefix: None,
+                        image_blocks: None,
                     })?;
                     linear(&block.output, &request.core, &request.delta)?;
                     unsafe {

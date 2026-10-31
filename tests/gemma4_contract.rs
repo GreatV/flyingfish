@@ -196,6 +196,57 @@ fn audio_masks_and_mixed_splices_preserve_token_identity() -> Result<()> {
                 "unsupported audio geometry accepted"
             );
         }
+#[test]
+fn unified_media_shapes_and_packed_patch_bounds_are_strict() -> Result<()> {
+    let (root, spec) = read(include_str!("data/gemma4-12b-config.json"))?;
+    let ids = [2, 255999, 258880, 258880, 258882, 4];
+    let modality = [0, 0, 1, 1, 0, 0];
+    let pixels = vec![0.5; 2 * 6912];
+    let grid = [ImageGrid { t: 1, h: 1, w: 2 }];
+    let input = MultimodalInput {
+        input_ids: &ids,
+        modality_ids: &modality,
+        pixel_values: &pixels,
+        grids: &grid,
+    };
+    let plan = input.validate(&spec, 32)?;
+    ensure!(
+        plan.patch_rows() == 2 && plan.feature_rows() == 2,
+        "unified patch rows were pooled twice"
+    );
+    let blocks = plan.image_blocks()?;
+    ensure!(
+        &blocks[..12] == [1, 1, 2, 2, 2, 4, 2, 4, 5, 5, 6, 6],
+        "image-block query bounds"
+    );
+    ensure!(
+        plan.chunk_end(0, 3, 6)? == 2
+            && plan.chunk_end(2, 3, 6)? == 5
+            && plan.chunk_end(2, 1, 6).is_err()
+            && plan.chunk_end(3, 3, 6).is_err(),
+        "image blocks split across chunks"
+    );
+    let short = MultimodalInput {
+        pixel_values: &pixels[..pixels.len() - 1],
+        ..input
+    };
+    ensure!(
+        short.validate(&spec, 32).is_err(),
+        "short raw patch accepted"
+    );
+    for (scope, key, value) in [
+        ("vision_config", "mm_embed_dim", 1152),
+        ("vision_config", "model_patch_size", 16),
+        ("vision_config", "mm_posemb_size", 280),
+        ("audio_config", "audio_samples_per_token", 320),
+        ("audio_config", "output_proj_dims", 3840),
+    ] {
+        let mut mutant = root.clone();
+        mutant[scope][key] = json!(value);
+        ensure!(
+            ModelSpec::gemma4(&mutant, &Value::Null).is_err(),
+            "accepted {scope}.{key} mutation"
+        );
     }
     Ok(())
 }
