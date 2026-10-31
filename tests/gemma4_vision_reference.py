@@ -404,6 +404,8 @@ def capture_audio_operators(args, config):
             device=args.device, dtype=dtype)
         conv.weight.copy_(tensors["conv_weight"].to(dtype))
         expected["conv"] = conv(x.T[None])[0].T.contiguous()
+        batched = F.pad(x.T, (0, 13))[None].repeat(2, 1, 1)
+        expected["conv_shape"] = conv(batched)[0, :, :rows].T.contiguous()
         expected["conv_wrong"] = conv(x.roll(1, 0).T[None])[0].T.contiguous()
         attention = definition.Gemma4AudioAttention(config.audio_config, 0).to(device=args.device, dtype=dtype)
         attention.q_proj = Projection(tensors["q"].to(dtype))
@@ -413,16 +415,23 @@ def capture_audio_operators(args, config):
         attention.relative_k_proj = torch.nn.Identity()
         attention.per_dim_scale.copy_(tensors["scale"].to(dtype))
         hidden = x[None]
-        def run_attention(left):
-            dense_mask = definition.create_bidirectional_mask(config=config.audio_config, inputs_embeds=hidden,
-                attention_mask=mask, and_mask_function=definition.sliding_window_mask_function((left, 0)))
+        def run_attention(left, padded=False):
+            inputs = F.pad(hidden, (0, 0, 0, 12)) if padded else hidden
+            valid = F.pad(mask, (0, 12), value=False) if padded else mask
+            for key in ("q", "k", "v"):
+                value = tensors[key].to(dtype)
+                getattr(attention, key + "_proj").value = F.pad(value, (0, 0, 0, 12)) if padded else value
+            dense_mask = definition.create_bidirectional_mask(config=config.audio_config, inputs_embeds=inputs,
+                attention_mask=valid, and_mask_function=definition.sliding_window_mask_function((left, 0)))
             blocked = definition.Gemma4AudioModel._convert_4d_mask_to_blocked_5d(
                 SimpleNamespace(config=config.audio_config), dense_mask)
-            return attention(hidden, tensors["relative"].to(dtype), blocked)[0][0]
+            return attention(inputs, tensors["relative"].to(dtype), blocked)[0][0, :rows]
         expected["attention"] = run_attention(12)
         expected["attention_wrong"] = run_attention(13)
         expected["attention_repeat"] = run_attention(12)
         assert torch.equal(expected["attention"], expected["attention_repeat"])
+        expected["attention_shape"] = run_attention(12, padded=True)
+        expected["branch_out_shape"] = (norm(F.pad(branch, (0, 0, 0, 13)).clamp(-1e10, 1e10))[:rows] * 0.5 + x)
         outputs = ["relu", "silu", "glu", "softplus", "conv", "branch_out", "attention"]
         for key, value in expected.items():
             assert torch.isfinite(value).all(), key
@@ -430,6 +439,7 @@ def capture_audio_operators(args, config):
         name = f"audio-ops-{rows}"
         (args.output / f"{name}.safetensors").write_bytes(save({k: v.cpu().contiguous() for k,v in tensors.items()}))
         report["cells"][name] = dict(rows=rows, outputs=outputs,
+            variations={"conv": "conv_shape", "attention": "attention_shape", "branch_out": "branch_out_shape"},
             controls={"branch_out": "branch_wrong", "glu": "glu_wrong", **({"conv": "conv_wrong"} if rows > 1 else {}),
                       **({"attention": "attention_wrong"} if rows >= 13 else {})})
         print(f"PASS {name} reference_repeat_bits=0", flush=True)
@@ -463,9 +473,10 @@ def freeze_audio_operators(args):
         for path in args.arms:
             arm = load_file(path / f"{name}.safetensors")
             for key, bound in bounds.items():
-                delta = arm[key].double() - oracle[key].double()
-                bound["output_max"] = max(bound["output_max"], 2*delta.abs().max().item())
-                bound["output_rmse"] = max(bound["output_rmse"], 2*delta.square().mean().sqrt().item())
+                for variant in (key, cell.get("variations", {}).get(key, key)):
+                    delta = arm[variant].double() - oracle[key].double()
+                    bound["output_max"] = max(bound["output_max"], 2*delta.abs().max().item())
+                    bound["output_rmse"] = max(bound["output_rmse"], 2*delta.square().mean().sqrt().item())
         for key, control in cell["controls"].items():
             delta = oracle[control].double() - oracle[key].double()
             assert delta.abs().max().item() > bounds[key]["output_max"] or delta.square().mean().sqrt().item() > bounds[key]["output_rmse"], (name,key)
