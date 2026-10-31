@@ -1269,6 +1269,18 @@ pub struct Function {
     module: Arc<Module>,
 }
 impl Function {
+    pub fn registers_per_thread(&self) -> Result<i32> {
+        self.module.context.bind_to_thread()?;
+        let mut value = 0;
+        unsafe {
+            check(
+                hipFuncGetAttribute(&mut value, 4, self.handle as Handle),
+                "hipFuncGetAttribute(numRegs)",
+            )?;
+        }
+        Ok(value)
+    }
+
     pub fn local_size_bytes(&self) -> Result<i32> {
         self.module.context.bind_to_thread()?;
         let mut value = 0;

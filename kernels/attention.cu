@@ -87,7 +87,8 @@ __device__ __forceinline__ void fd_phase1_body(
     float* __restrict__ p_m, float* __restrict__ p_l, float* __restrict__ p_o,
     int L, int chunk, int nchunks, int gqa,
     int k_head_stride, int k_pos_stride, int v_head_stride, int v_pos_stride,
-    int first_pos, int ring_tokens) {
+    int first_pos, int ring_tokens, float scale = SCALE) {
+  constexpr int TP = DH == 256 ? 32 : 16;
   constexpr int VPR = DH / TP;
   const int ch      = blockIdx.x;
   const int qh0     = blockIdx.y * QP;
@@ -100,6 +101,17 @@ __device__ __forceinline__ void fd_phase1_body(
   const int grp  = tid / TP;
   const int dim0 = lane * VPR;
   const int ngrp = blockDim.x / TP;
+  extern __shared__ float fd_sm[];
+  if constexpr (DH == 256) {
+    bf16* shared_q = reinterpret_cast<bf16*>(fd_sm);
+    if (tid < 32) {
+#pragma unroll
+      for (int h = 0; h < QP; ++h)
+        reinterpret_cast<uint4*>(shared_q + h * DH)[tid] =
+            reinterpret_cast<const uint4*>(q + (qh0 + h) * DH)[tid];
+    }
+    __syncthreads();
+  }
 
   const bf16* __restrict__ Krow = Kc + kv * k_head_stride + dim0;
   const bf16* __restrict__ Vrow = Vc + kv * v_head_stride + dim0;
@@ -109,7 +121,10 @@ __device__ __forceinline__ void fd_phase1_body(
   float mx[QP], ls[QP];
 #pragma unroll
   for (int h = 0; h < QP; ++h) {
-    ld_vec<VPR>(q + (qh0 + h) * DH + dim0, qr[h]);
+    if constexpr (DH == 256)
+      ld_vec<VPR>(reinterpret_cast<bf16*>(fd_sm) + h * DH + dim0, qr[h]);
+    else
+      ld_vec<VPR>(q + (qh0 + h) * DH + dim0, qr[h]);
     mx[h] = -3.0e38f;                              // finite sentinel: never NaN in m - m'
     ls[h] = 0.0f;
 #pragma unroll
@@ -158,12 +173,19 @@ __device__ __forceinline__ void fd_phase1_body(
       float cf[QP], pf[QP];
 #pragma unroll
       for (int h = 0; h < QP; ++h) {
-        const float sp = ok[u] ? s[h] * SCALE : -INFINITY;   // dead slot -> no-op softmax step
-        const float mn = fmaxf(mx[h], sp);
-        cf[h] = __expf(mx[h] - mn);
-        pf[h] = __expf(sp - mn);
-        mx[h] = mn;
-        ls[h] = ls[h] * cf[h] + pf[h];
+        if constexpr (DH == 256) { cf[h] = 0.0f; pf[h] = 0.0f; }
+        if (DH != 256 || lane == 0) {
+          const float sp = ok[u] ? s[h] * scale : -INFINITY;
+          const float mn = fmaxf(mx[h], sp);
+          cf[h] = __expf(mx[h] - mn);
+          pf[h] = __expf(sp - mn);
+          mx[h] = mn;
+          ls[h] = ls[h] * cf[h] + pf[h];
+        }
+        if constexpr (DH == 256) {
+          cf[h] = __shfl_sync(FF_WARP_MASK, cf[h], 0);
+          pf[h] = __shfl_sync(FF_WARP_MASK, pf[h], 0);
+        }
       }
 
       const int pos = base + u * ngrp;
@@ -184,6 +206,7 @@ __device__ __forceinline__ void fd_phase1_body(
 
   // Online-softmax merge of the per-group partials (disjoint position sets).
   // Level 1: the two TP-lane groups of a warp exchange via shuffles; both halves hold the result.
+  if constexpr (TP == 16) {
 #pragma unroll
   for (int h = 0; h < QP; ++h) {
     const float pm = __shfl_xor_sync(FF_WARP_MASK, mx[h], TP);
@@ -199,12 +222,18 @@ __device__ __forceinline__ void fd_phase1_body(
     for (int j = 0; j < VPR; ++j) acc[h][j] = acc[h][j] * c + pa[j] * pc;
     mx[h] = M;
   }
+  } else {
+#pragma unroll
+    for (int h = 0; h < QP; ++h) {
+      mx[h] = __shfl_sync(FF_WARP_MASK, mx[h], 0);
+      ls[h] = __shfl_sync(FF_WARP_MASK, ls[h], 0);
+    }
+  }
   // Level 2: cross-warp merge through dynamic shared memory.
   const int warp   = tid / 32;
   const int lane32 = tid % 32;
   const int nw     = blockDim.x / 32;
-  extern __shared__ float fd_sm[];
-  float* sa  = fd_sm;                              // [QP][nw][DH]
+  float* sa  = fd_sm + (DH == 256 ? QP * DH / 2 : 0); // [QP][nw][DH]
   float* smm = sa + QP * nw * DH;                  // [QP][nw]
   float* sll = smm + QP * nw;                      // [QP][nw]
   if (lane32 < TP) {   // one group per warp writes; both halves hold the same merged shard
@@ -248,7 +277,8 @@ __device__ __forceinline__ void fd_phase2_body(const float* __restrict__ p_m,
                                                const float* __restrict__ p_l,
                                                const float* __restrict__ p_o,
                                                const bf16* __restrict__ sinks,
-                                               bf16* __restrict__ o, int nchunks) {
+                                               bf16* __restrict__ o, int nchunks,
+                                               float* __restrict__ output_lse = nullptr) {
   extern __shared__ float sm[];
   const int qh  = blockIdx.x;
   const int tid = threadIdx.x;
@@ -309,6 +339,37 @@ __device__ __forceinline__ void fd_phase2_body(const float* __restrict__ p_m,
 
   const float inv = (lse > 0.0f) ? (1.0f / lse) : 0.0f;
   if (g == 0) o[qh * DH + d] = __float2bfloat16(acc * inv);   // only group 0 holds the reduced acc
+  if (output_lse && tid == 0) output_lse[qh] = M + logf(lse);
+}
+
+#define FD_RING_256(QP) \
+extern "C" __global__ void flash_decode_ring_d256_q##QP( \
+    const bf16* q,const bf16* k,const bf16* v,float* scratch, \
+    const int* position,int heads,int kv_heads,int ring,int chunk,float scale) { \
+  const int p = *position; \
+  if (blockDim.x != 128 || p < 0 || p == 2147483647 || ring <= 0 || chunk <= 0 || \
+      heads <= 0 || kv_heads <= 0 || heads % kv_heads || \
+      (heads / kv_heads) % QP || !(scale > 0.0f)) {__trap();return;} \
+  const int length = min(p + 1,ring); \
+  const int parts = (length + chunk - 1) / chunk; \
+  if (blockIdx.x >= parts) return; \
+  fd_phase1_body<256,QP,(QP == 1 ? 2 : 1),true>( \
+      q,k,v,scratch,scratch + heads * parts,scratch + 2 * heads * parts, \
+      length,chunk,parts,heads / kv_heads,ring * 256,256,ring * 256,256, \
+      (p + 1 - length) % ring,ring,scale); \
+}
+FD_RING_256(1)
+FD_RING_256(2)
+FD_RING_256(4)
+FD_RING_256(8)
+
+extern "C" __global__ void flash_decode_ring_d256_merge(
+    const float* scratch,bf16* out,float* lse,const int* position,int heads,int ring,int chunk) {
+  const int p = *position;
+  if (blockDim.x != 256 || p < 0 || p == 2147483647 || ring <= 0 || chunk <= 0 || heads <= 0) {__trap();return;}
+  const int parts = (min(p + 1,ring) + chunk - 1) / chunk;
+  fd_phase2_body<256,false>(scratch,scratch + heads * parts,
+      scratch + 2 * heads * parts,nullptr,out,parts,lse);
 }
 
 // QP is baked into the symbol name; every other dimension and stride is an argument.
