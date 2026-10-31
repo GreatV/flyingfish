@@ -2344,7 +2344,24 @@ impl Engine {
             "all-layer multimodal trace requires one complete prompt chunk"
         );
         self.prepare_multimodal(input, trace.as_deref_mut())?;
-        let result = self.prefill(input.input_ids, trace);
+        let identities;
+        let ids = if self.model_spec.architecture == crate::model_spec::Architecture::Gemma4 {
+            let image = self
+                .model_spec
+                .vision
+                .as_ref()
+                .context("vision configuration missing")?
+                .image_token;
+            identities = input
+                .input_ids
+                .iter()
+                .map(|&id| if id == image { 0 } else { id })
+                .collect::<Vec<_>>();
+            &identities
+        } else {
+            input.input_ids
+        };
+        let result = self.prefill(ids, trace);
         if result.is_err() {
             self.poisoned = true;
         }
