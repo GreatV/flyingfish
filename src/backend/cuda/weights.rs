@@ -1613,6 +1613,15 @@ mod tests {
             let mut outputs = (0..4)
                 .map(|_| stream.alloc_zeros::<u8>(per_layer))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
+            for (values, output) in expected.iter().zip(&mut outputs) {
+                let resident = stream.clone_htod(values)?;
+                stream.memcpy_dtod(&resident, output)?;
+                ensure!(
+                    stream.clone_dtoh(output)? == *values,
+                    "resident native byte baseline differs"
+                );
+            }
+            println!("PASS dense_resident layers=4 layer_bytes={per_layer} byte_mismatches=0");
             for host_layers in [0, 2, 4] {
                 let plan = crate::prefill::DensePlacement::new(
                     &[per_layer; 4],
@@ -1624,6 +1633,9 @@ mod tests {
                     "streaming gate has a resident layer"
                 );
                 let mut dense = DenseStreaming::new(&root, &manifest, plan, &device)?;
+                for slot in &mut dense.slots {
+                    slot.device = device.upload.clone_htod(&vec![0xcdu8; per_layer + 64])?;
+                }
                 ensure!(
                     dense.pointer(0, per_layer, 2).is_err(),
                     "slot overflow control was admitted"
@@ -1654,9 +1666,17 @@ mod tests {
                             "wrong-slot-generation control is not discriminating"
                         );
                     }
+                    device.upload.synchronize()?;
+                    for slot in &dense.slots {
+                        let guard = stream.clone_dtoh(&slot.device.slice(per_layer..))?;
+                        ensure!(
+                            guard == [0xcd; 64],
+                            "dense upload overwrote unused slot capacity"
+                        );
+                    }
                 }
                 println!(
-                    "PASS dense_slots host_layers={host_layers} disk_layers={} layers=4 repeats=3 slot_bytes={per_layer} byte_mismatches=0 wrong_generation=detected bounds=detected",
+                    "PASS dense_slots host_layers={host_layers} disk_layers={} layers=4 repeats=3 slot_bytes={per_layer} byte_mismatches=0 wrong_generation=detected bounds=detected tail_guards=preserved",
                     4 - host_layers
                 );
             }
