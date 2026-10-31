@@ -568,7 +568,6 @@ struct GemmaOps {
     rope: CudaFunction,
     ring_copy: CudaFunction,
     branch_add: CudaFunction,
-    multiply: CudaFunction,
     per_layer: CudaFunction,
     rope_tables: [CudaSlice<bf16>; 2],
     per_layer_table: Tensor<bf16, 2>,
@@ -1374,7 +1373,6 @@ impl Runtime {
                     .load_function("dynamic_ring_copy")?,
                 branch_add: cubin::module(&engine.device.ctx, "q38_common")?
                     .load_function("rms_branch_add")?,
-                multiply: act.load_function("multiply")?,
                 per_layer: embed.load_function("per_layer_input")?,
                 rope_tables,
                 per_layer_table: matrix(
@@ -5366,18 +5364,31 @@ impl Engine {
                 width,
             )?;
         }
-        q.common.gate.gelu(
+        q.common.gate.gelu_tanh_mul(
             s,
             heads(&w.gu, s, 0, rows, 1, width as u32)?,
+            heads(
+                &ops.per_layer_inputs,
+                s,
+                i * linear_rows * width,
+                rows,
+                1,
+                width as u32,
+            )?,
             &mut TensorMut(heads(&w.act, s, 0, rows, 1, width as u32)?),
-            crate::backend::cuda::ops::GeluMode::Tanh,
         )?;
-        if all_layers(trace) || i == self.trace_layer {
+        if trace.is_some() && (all_layers(trace) || i == self.trace_layer) {
+            q.common.gate.gelu(
+                s,
+                heads(&w.gu, s, 0, rows, 1, width as u32)?,
+                &mut TensorMut(heads(&w.gu, s, 0, rows, 1, width as u32)?),
+                crate::backend::cuda::ops::GeluMode::Tanh,
+            )?;
             trace_value(
                 trace,
                 s,
                 &debug_name(trace, i, "ple_act"),
-                &w.act,
+                &w.gu,
                 rows,
                 width,
             )?;
@@ -5390,23 +5401,12 @@ impl Engine {
                 width,
             )?;
         }
-        unsafe {
-            s.launch_builder(&ops.multiply)
-                .arg(&w.act)
-                .arg(
-                    &ops.per_layer_inputs
-                        .slice(i * linear_rows * width..(i + 1) * linear_rows * width),
-                )
-                .arg(&mut w.gu)
-                .arg(&((rows * width) as i32))
-                .launch(flat(rows * width))?;
-        }
         if all_layers(trace) || i == self.trace_layer {
             trace_value(
                 trace,
                 s,
                 &debug_name(trace, i, "ple_product"),
-                &w.gu,
+                &w.act,
                 rows,
                 width,
             )?;
@@ -5415,7 +5415,7 @@ impl Engine {
             &self.blas,
             "per_layer_projection.weight",
             phase,
-            matrix(&w.gu, s, 0, linear_rows, width)?,
+            matrix(&w.act, s, 0, linear_rows, width)?,
             &mut TensorMut(matrix(&w.out, s, 0, linear_rows, h)?),
         )?;
         unsafe {

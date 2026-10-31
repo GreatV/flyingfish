@@ -344,6 +344,7 @@ pub struct NormOps {
 pub struct GateOps {
     gate: CudaFunction,
     gelu: CudaFunction,
+    gelu_tanh_mul: CudaFunction,
     swiglu_clamped: CudaFunction,
     swiglu_rounding: crate::model_spec::SwigluRounding,
     swiglu_limit: f32,
@@ -374,6 +375,7 @@ impl CommonOpsRef {
             gate: Arc::new(GateOps {
                 gate: module.load_function("q38_gate")?,
                 gelu: module.load_function("q38_gelu")?,
+                gelu_tanh_mul: module.load_function("gelu_tanh_mul")?,
                 swiglu_clamped: act.load_function("silu_mul_split_clamped")?,
                 swiglu_rounding,
                 swiglu_limit,
@@ -1583,6 +1585,43 @@ impl GateOps {
                 .arg(&y.0.stride[1])
                 .arg(&y.0.stride[2])
                 .arg(&(mode as i32))
+                .launch(grid(count.div_ceil(256).min(65535) as usize, 256))?;
+        }
+        Ok(())
+    }
+
+    /// y = bf16(bf16(tanh-GELU(x)) * up); all declared rows are valid.
+    pub fn gelu_tanh_mul(
+        &self,
+        stream: &Arc<CudaStream>,
+        x: Tensor<bf16, 3>,
+        up: Tensor<bf16, 3>,
+        y: &mut TensorMut<bf16, 3>,
+    ) -> Result<()> {
+        validate_dense_io(&x, &y.0)?;
+        validate_dense_io(&up, &y.0)?;
+        let count = u64::from(x.shape[0])
+            .checked_mul(u64::from(x.shape[1]))
+            .and_then(|n| n.checked_mul(u64::from(x.shape[2])))
+            .ok_or_else(|| anyhow::anyhow!("gated GELU element count overflow"))?;
+        unsafe {
+            stream
+                .launch_builder(&self.gelu_tanh_mul)
+                .arg(&x.ptr)
+                .arg(&up.ptr)
+                .arg(&y.0.ptr)
+                .arg(&x.shape[0])
+                .arg(&x.shape[1])
+                .arg(&x.shape[2])
+                .arg(&x.stride[0])
+                .arg(&x.stride[1])
+                .arg(&x.stride[2])
+                .arg(&up.stride[0])
+                .arg(&up.stride[1])
+                .arg(&up.stride[2])
+                .arg(&y.0.stride[0])
+                .arg(&y.0.stride[1])
+                .arg(&y.0.stride[2])
                 .launch(grid(count.div_ceil(256).min(65535) as usize, 256))?;
         }
         Ok(())

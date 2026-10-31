@@ -581,6 +581,11 @@ extern "C" __global__ void q38_layer_norm(
         y[uint64_t(d)*ys2]=__float2bfloat16_rn(affine);
     }
 }
+__device__ __forceinline__ float gelu_tanh_rn(float value) {
+    float cubic=__fmul_rn(__fmul_rn(value,value),value);
+    float inner=__fmul_rn(0.7978845608028653559f,__fadd_rn(value,__fmul_rn(0.044715f,cubic)));
+    return __fmul_rn(__fmul_rn(0.5f,value),__fadd_rn(1.0f,tanhf(inner)));
+}
 // mode 0: erf GELU. mode 1: tanh approximation. All declared rows are valid.
 extern "C" __global__ void q38_gelu(
     const __nv_bfloat16* x,__nv_bfloat16* y,uint32_t rows,uint32_t heads,uint32_t width,
@@ -591,14 +596,25 @@ extern "C" __global__ void q38_gelu(
     for(uint64_t i=uint64_t(blockIdx.x)*256+threadIdx.x;i<count;i+=uint64_t(gridDim.x)*256) {
         uint64_t row=i/(uint64_t(heads)*width);uint32_t head=(i/width)%heads,d=i%width;
         float value=__bfloat162float(x[row*xs0+head*xs1+uint64_t(d)*xs2]);
-        float cdf;
-        if(mode==0) cdf=__fadd_rn(1.0f,erff(__fmul_rn(value,0.7071067811865475244f)));
-        else {
-            float cubic=__fmul_rn(__fmul_rn(value,value),value);
-            float inner=__fmul_rn(0.7978845608028653559f,__fadd_rn(value,__fmul_rn(0.044715f,cubic)));
-            cdf=__fadd_rn(1.0f,tanhf(inner));
-        }
-        y[row*ys0+head*ys1+uint64_t(d)*ys2]=__float2bfloat16_rn(__fmul_rn(__fmul_rn(0.5f,value),cdf));
+        float result=mode==1 ? gelu_tanh_rn(value) : __fmul_rn(__fmul_rn(0.5f,value),
+            __fadd_rn(1.0f,erff(__fmul_rn(value,0.7071067811865475244f))));
+        y[row*ys0+head*ys1+uint64_t(d)*ys2]=__float2bfloat16_rn(result);
+    }
+}
+// y = bf16(bf16(tanh-GELU(x)) * up). All declared rows are valid.
+extern "C" __global__ void gelu_tanh_mul(
+    const __nv_bfloat16* x,const __nv_bfloat16* up,__nv_bfloat16* y,
+    uint32_t rows,uint32_t heads,uint32_t width,
+    uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t us0,uint64_t us1,uint64_t us2,
+    uint64_t ys0,uint64_t ys1,uint64_t ys2) {
+    if(blockDim.x!=256 || blockDim.y!=1 || blockDim.z!=1 || gridDim.y!=1 || gridDim.z!=1 ||
+       !rows || !heads || !width || !x || !up || !y) {__trap();return;}
+    uint64_t count=uint64_t(rows)*heads*width;
+    for(uint64_t i=uint64_t(blockIdx.x)*256+threadIdx.x;i<count;i+=uint64_t(gridDim.x)*256) {
+        uint64_t row=i/(uint64_t(heads)*width);uint32_t head=(i/width)%heads,d=i%width;
+        float value=__bfloat162float(x[row*xs0+head*xs1+uint64_t(d)*xs2]);
+        __nv_bfloat16 gate=__float2bfloat16_rn(gelu_tanh_rn(value));
+        y[row*ys0+head*ys1+uint64_t(d)*ys2]=__hmul(gate,up[row*us0+head*us1+uint64_t(d)*us2]);
     }
 }
 // x = bf16(bf16(x + bf16(rms(b)*wb)) * scalar) in place, then n = rms(x)*wn; scalar and wn may be null.
