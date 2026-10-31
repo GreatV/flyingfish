@@ -2606,7 +2606,7 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
             &bounds["features"],
         )?;
         defects += usize::from(!feature_pass);
-        let combined = trace.values("debug.ple_identity")?;
+        let combined = trace.values(".debug.ple_identity")?;
         let ple: Vec<_> = (0..ids.len())
             .flat_map(|row| combined[row * depth * 256..][..256].iter().copied())
             .collect();
@@ -2632,7 +2632,7 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
             engine.reset()?;
             let mut wrong = crate::trace::Trace::default();
             engine.gemma_vision_trace(&input, &ids, &mut wrong)?;
-            let wrong_combined = wrong.values("debug.ple_identity")?;
+            let wrong_combined = wrong.values(".debug.ple_identity")?;
             let wrong_ple: Vec<_> = (0..ids.len())
                 .flat_map(|row| wrong_combined[row * depth * 256..][..256].iter().copied())
                 .collect();

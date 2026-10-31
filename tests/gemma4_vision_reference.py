@@ -216,18 +216,29 @@ def capture_model(args, config):
             ple.clear()
             pixels = data["pixels" if variant == "packed" else "padded_pixels"][None]
             coordinates = data["positions" if variant == "packed" else "padded_positions"][None].long()
-            output = model(input_ids=ids.to(args.device), mm_token_type_ids=modalities.to(args.device),
-                           pixel_values=pixels.to(args.device), image_position_ids=coordinates.to(args.device),
-                           use_cache=False, logits_to_keep=rows)
+            arguments = dict(input_ids=ids.to(args.device), mm_token_type_ids=modalities.to(args.device),
+                             pixel_values=pixels.to(args.device), image_position_ids=coordinates.to(args.device),
+                             use_cache=False, logits_to_keep=rows)
+            output = model(**arguments)
             logits = output.logits[0].float().cpu().contiguous()
             assert torch.isfinite(logits).all() and len(features) == 1
             cell["encoder_calls"][variant] = counted[0] - before
             assert cell["encoder_calls"][variant] == 1
-            (args.output / f"{name}-{variant}.safetensors").write_bytes(
-                save(dict(logits=logits, features=features[0].float(), ple=ple[0][0].float())))
+            captured = dict(logits=logits, features=features[0].float(), ple=ple[0][0].float())
+            if variant == "packed":
+                features.clear()
+                ple.clear()
+                repeated = model(**arguments)
+                repeat = dict(logits=repeated.logits[0].float().cpu(), features=features[0].float(), ple=ple[0][0].float())
+                cell["repeat_mismatches"] = {key: int((captured[key] != repeat[key]).sum()) for key in captured}
+                assert not any(cell["repeat_mismatches"].values()), cell["repeat_mismatches"]
+                assert counted[0] - before == 2
+                cell["repeat_encoder_calls"] = 1
+                del repeated, repeat
+            (args.output / f"{name}-{variant}.safetensors").write_bytes(save(captured))
             if name in ("street", "winter") and variant == "packed":
                 media_logits.append(logits[0].clone())
-            del output, logits
+            del output, logits, captured
         if args.stage == "media":
             before = counted[0]
             image_end = (ids[0] == config.eoi_token_id).nonzero().item() + 1
