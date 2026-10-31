@@ -21,7 +21,7 @@ pub(super) fn default_chunk(admitted: usize) -> usize {
 }
 
 use crate::backend::cuda::cubin;
-use crate::backend::cuda::decode::{GqaDecodeInput, SlidingWindow};
+use crate::backend::cuda::decode::{GqaDecodeInput, RingDecode, RingDecodeInput, SlidingWindow};
 use crate::backend::cuda::dsa::{
     DsaAppendInput, DsaAttentionInput, DsaIndexInput, DsaIndexOutput, DsaPlan,
 };
@@ -566,7 +566,7 @@ struct GemmaOps {
     softcap: CudaFunction,
     gated_activation: CudaFunction,
     rope: CudaFunction,
-    ring_copy: CudaFunction,
+    ring_decode: RingDecode,
     branch_add: CudaFunction,
     per_layer: CudaFunction,
     rope_tables: [CudaSlice<bf16>; 2],
@@ -1167,10 +1167,20 @@ impl Runtime {
                 .checked_mul(kv_width)
                 .and_then(|n| n.checked_mul(4))
                 .context("KV staging admission bytes overflow")?;
+            let decode = RingDecode::workspace(
+                model.q_heads as usize,
+                model
+                    .layers
+                    .iter()
+                    .filter_map(|l| l.sliding_window)
+                    .max()
+                    .context("sliding window missing")? as usize,
+            )?;
             return per_layer_inputs
                 .checked_add(rope_tables)
                 .and_then(|n| n.checked_add(flash))
                 .and_then(|n| n.checked_add(staging))
+                .and_then(|n| n.checked_add(decode))
                 .context("Gemma admission bytes overflow");
         }
         let attention = if model.architecture == crate::model_spec::Architecture::Glm5Next {
@@ -1367,10 +1377,19 @@ impl Runtime {
                     .as_ref()
                     .context("table RoPE module missing")?
                     .load_function("qknorm_rope_table_kv")?,
-                ring_copy: rope_module
-                    .as_ref()
-                    .context("table RoPE module missing")?
-                    .load_function("dynamic_ring_copy")?,
+                ring_decode: RingDecode::new(
+                    &engine.device.ctx,
+                    engine.model_spec.q_heads,
+                    engine.model_spec.kv_heads,
+                    engine
+                        .model_spec
+                        .layers
+                        .iter()
+                        .filter_map(|l| l.sliding_window)
+                        .max()
+                        .context("sliding window missing")?,
+                    1.0,
+                )?,
                 branch_add: cubin::module(&engine.device.ctx, "q38_common")?
                     .load_function("rms_branch_add")?,
                 per_layer: embed.load_function("per_layer_input")?,
@@ -2943,7 +2962,15 @@ impl Engine {
             draft.grow(context_rows)?;
         }
         let target_workspace = if gemma {
-            0
+            RingDecode::workspace(
+                model_spec.q_heads as usize,
+                model_spec
+                    .layers
+                    .iter()
+                    .filter_map(|l| l.sliding_window)
+                    .max()
+                    .context("sliding window missing")? as usize,
+            )?
         } else {
             Runtime::workspace(
                 &model_spec,
@@ -2969,38 +2996,38 @@ impl Engine {
                 },
             )
         };
-        let (attention_prefill_bytes, attention_decode_bytes, attention_verify_bytes) =
-            if flint || glm || gemma {
-                (0, 0, 0)
-            } else {
-                let attention = attention
-                    .as_ref()
-                    .context("Q38 attention specification missing")?;
-                (
-                    if cfg!(feature = "rocm") {
-                        FullAttentionOps::workspace(attention, limits(rows, capacity)?)?.bytes
-                    } else {
-                        FullAttentionOps::preprocess_workspace(attention, limits(rows, capacity)?)?
-                            .bytes
-                    },
-                    FullAttentionOps::decode_workspace(attention, 1, u32::try_from(capacity)?)?
-                        .bytes,
-                    if cfg!(feature = "rocm") {
-                        FullAttentionOps::decode_workspace(
-                            attention,
-                            u32::try_from(rows.min(verify_rows))?,
-                            u32::try_from(capacity)?,
-                        )?
+        let (attention_prefill_bytes, attention_decode_bytes, attention_verify_bytes) = if gemma {
+            (0, target_workspace as u64, 0)
+        } else if flint || glm {
+            (0, 0, 0)
+        } else {
+            let attention = attention
+                .as_ref()
+                .context("Q38 attention specification missing")?;
+            (
+                if cfg!(feature = "rocm") {
+                    FullAttentionOps::workspace(attention, limits(rows, capacity)?)?.bytes
+                } else {
+                    FullAttentionOps::preprocess_workspace(attention, limits(rows, capacity)?)?
                         .bytes
-                    } else {
-                        FullAttentionOps::workspace(
-                            attention,
-                            limits(rows.min(verify_rows), capacity)?,
-                        )?
-                        .bytes
-                    },
-                )
-            };
+                },
+                FullAttentionOps::decode_workspace(attention, 1, u32::try_from(capacity)?)?.bytes,
+                if cfg!(feature = "rocm") {
+                    FullAttentionOps::decode_workspace(
+                        attention,
+                        u32::try_from(rows.min(verify_rows))?,
+                        u32::try_from(capacity)?,
+                    )?
+                    .bytes
+                } else {
+                    FullAttentionOps::workspace(
+                        attention,
+                        limits(rows.min(verify_rows), capacity)?,
+                    )?
+                    .bytes
+                },
+            )
+        };
         let (gdn_prefill_bytes, gdn_decode_bytes) = if flint || gemma {
             (0, 0)
         } else {
@@ -3012,8 +3039,12 @@ impl Engine {
         };
         let (prefill_backend, decode_backend) = if gemma {
             (
-                "native Rust D256-window/D512",
-                "native Rust D256-window/D512",
+                if cfg!(feature = "cuda") {
+                    "native Rust D256-window/D512"
+                } else {
+                    "native HIP D256-window/D512"
+                },
+                "GQA D256 ring split + native D512 split",
             )
         } else if flint {
             ("native d128 sliding/full", "flash decode d128")
@@ -4495,7 +4526,7 @@ impl Engine {
                 let ring = self.state.kv_ring(state_index)?;
                 let sliding = layout.sliding_window.is_some();
                 let decode = phase == ExecutionPhase::Decode;
-                let overflow = sliding && (decode || self.position + rows > ring);
+                let overflow = sliding && !decode && self.position + rows > ring;
                 let history = if overflow { self.position.min(ring) } else { 0 };
                 let cache_capacity = if overflow {
                     ring + self.workspace_rows
@@ -4509,7 +4540,7 @@ impl Engine {
                             .kv_scratch
                             .as_mut()
                             .context("sliding KV staging is not bound")?;
-                        if !reader && (history > 0 || decode) {
+                        if !reader && history > 0 {
                             for (source, target) in [(&kv.k, &mut *stage_k), (&kv.v, &mut *stage_v)]
                             {
                                 let copy = super::super::copy::RingCopy {
@@ -4521,17 +4552,13 @@ impl Engine {
                                     heads: hkv,
                                     head_dim: d,
                                 };
-                                if decode {
-                                    copy.run_dynamic(&ops.ring_copy, &w.position, rows, false)?;
-                                } else {
-                                    copy.run(
-                                        (self.position - history) % ring,
-                                        0,
-                                        history,
-                                        true,
-                                        false,
-                                    )?;
-                                }
+                                copy.run(
+                                    (self.position - history) % ring,
+                                    0,
+                                    history,
+                                    true,
+                                    false,
+                                )?;
                             }
                         }
                         (stage_k, stage_v)
@@ -4540,14 +4567,8 @@ impl Engine {
                     };
                     let q_stride = q_width;
                     let prep_heads = if reader { 0 } else { hkv };
-                    let cache_start = if overflow && decode {
-                        -2
-                    } else if overflow {
-                        history as i32
-                    } else {
-                        -1
-                    };
-                    let ring_tokens = if overflow && decode { ring as i32 } else { 0 };
+                    let cache_start = if overflow { history as i32 } else { -1 };
+                    let ring_tokens = if sliding && decode { ring as i32 } else { 0 };
                     if trace.is_some() && (all_layers(trace) || i == self.trace_layer) {
                         if self.graph.is_none() {
                             s.synchronize()?;
@@ -4625,29 +4646,42 @@ impl Engine {
                             )?;
                         }
                     }
-                    flash.run(
-                        &w.qkv,
-                        q_stride,
-                        stage_k,
-                        stage_v,
-                        &mut w.attn,
-                        Shape {
-                            rows,
-                            start: if overflow && decode {
-                                ring
-                            } else if overflow {
-                                history
-                            } else {
-                                self.position
+                    if sliding && decode {
+                        ops.ring_decode.run(
+                            s,
+                            RingDecodeInput {
+                                q: heads(&w.qkv, s, 0, rows, hq as u32, d as u32)?,
+                                k: heads(stage_k, s, 0, hkv, ring as u32, d as u32)?,
+                                v: heads(stage_v, s, 0, hkv, ring as u32, d as u32)?,
+                                position: view(&w.position, s, 0, [1], [1])?,
+                                out: &mut TensorMut(heads(
+                                    &w.attn, s, 0, rows, hq as u32, d as u32,
+                                )?),
+                                lse: &mut TensorMut(view(&flash.lse, s, 0, [hq as u32], [1])?),
+                                scratch: scratch(&q.scratch, s),
                             },
-                            q_heads: hq,
-                            kv_heads: hkv,
-                            capacity: cache_capacity,
-                            head_dim: d,
-                            causal: true,
-                            window_left: layout.sliding_window.map(|window| window as usize - 1),
-                        },
-                    )?;
+                        )?;
+                    } else {
+                        flash.run(
+                            &w.qkv,
+                            q_stride,
+                            stage_k,
+                            stage_v,
+                            &mut w.attn,
+                            Shape {
+                                rows,
+                                start: if overflow { history } else { self.position },
+                                q_heads: hq,
+                                kv_heads: hkv,
+                                capacity: cache_capacity,
+                                head_dim: d,
+                                causal: true,
+                                window_left: layout
+                                    .sliding_window
+                                    .map(|window| window as usize - 1),
+                            },
+                        )?;
+                    }
                 }
                 if overflow && !reader {
                     let kv = &mut self.state.kv[state_index];
@@ -4669,11 +4703,7 @@ impl Engine {
                             heads: hkv,
                             head_dim: d,
                         };
-                        if decode {
-                            copy.run_dynamic(&ops.ring_copy, &w.position, rows, true)?;
-                        } else {
-                            copy.run(source_start, absolute_start % ring, keep, false, true)?;
-                        }
+                        copy.run(source_start, absolute_start % ring, keep, false, true)?;
                     }
                 }
                 layer.linear.run(

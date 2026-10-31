@@ -83,7 +83,7 @@ impl Score {
 
 pub struct Flash {
     stream: Arc<CudaStream>,
-    lse: CudaSlice<f32>,
+    pub(super) lse: CudaSlice<f32>,
     sink_rescale: CudaFunction,
     native: Vec<CudaFunction>,
     geometry: [usize; 3],
@@ -1136,6 +1136,223 @@ mod tests {
                 "PASS score_window_binding D={d} heads={hq} kv_heads={hkv} window={window:?} rows=3 device_positions=3,109,511,512,513,519,701 limits=637,512 graph_eager=true stale_position_rejected=true"
             );
         }
+        ring_decode_cases(&ctx, &stream)?;
+        Ok(())
+    }
+
+    fn ring_decode_cases(
+        ctx: &Arc<crate::backend::gpu::CudaContext>,
+        s: &Arc<CudaStream>,
+    ) -> Result<()> {
+        use super::super::contracts::{Scratch, TensorMut, view};
+        use super::super::decode::{RingDecode, RingDecodeInput};
+        use crate::backend::gpu::DevicePtr;
+        for (heads, kv) in [(1, 1), (16384, 16384)] {
+            ensure!(
+                RingDecode::new(ctx, heads, kv, 512, 1.0).is_err(),
+                "ring decode accepted invalid partial/KV offsets heads={heads} kv={kv}"
+            );
+        }
+        let limits: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/attention_reference.json"
+        ))?;
+        let bound = &limits["limits"]["e256-unit"];
+        let maximum = bound["output_max"]
+            .as_f64()
+            .context("output bound missing")?;
+        let rms = bound["output_rms"].as_f64().context("RMS bound missing")?;
+        let lse_max = bound["lse_max"].as_f64().context("LSE bound missing")?;
+        let (mut cases, mut defects, mut controls) = (0, 0, 0);
+        for kv in [1usize, 2] {
+            let op = RingDecode::new(ctx, 8, kv as u32, 512, 1.0)?;
+            let bytes = RingDecode::workspace(8, 512)?;
+            let mut scratch = s.clone_htod(&vec![0xa5u8; bytes + 256])?;
+            let mut position = s.clone_htod(&[0i32])?;
+            let qh: Vec<_> = (0..8 * 256)
+                .map(|i| {
+                    bf16::from_f32(if i % 256 == 0 {
+                        1.0 + (i / 256) as f32 / 16.0
+                    } else {
+                        ((i * 31 % 1009) as f32 - 504.0) / 32768.0
+                    })
+                })
+                .collect();
+            let q = s.clone_htod(&qh)?;
+            let mut k = s.clone_htod(&vec![bf16::from_f32(-32.0); kv * 512 * 256 + 32])?;
+            let mut v = s.clone_htod(&vec![bf16::from_f32(-32.0); kv * 512 * 256 + 32])?;
+            let out = s.clone_htod(&vec![bf16::from_f32(-32.0); 8 * 256 + 32])?;
+            let lse = s.clone_htod(&[f32::from_bits(0x7fc00001); 16])?;
+            let qv = view(&q, s, 0, [1, 8, 256], [2048, 256, 1])?;
+            let kv_shape = [kv as u32, 512, 256];
+            let kv_stride = [512 * 256, 256, 1];
+            let run = || {
+                op.run(
+                    s,
+                    RingDecodeInput {
+                        q: qv,
+                        k: view(&k, s, 0, kv_shape, kv_stride)?,
+                        v: view(&v, s, 0, kv_shape, kv_stride)?,
+                        position: view(&position, s, 0, [1], [1])?,
+                        out: &mut TensorMut(view(&out, s, 0, [1, 8, 256], [2048, 256, 1])?),
+                        lse: &mut TensorMut(view(&lse, s, 0, [8], [1])?),
+                        scratch: Scratch {
+                            ptr: scratch.device_ptr(s).0,
+                            bytes: bytes as u64,
+                        },
+                    },
+                )
+            };
+            s.synchronize()?;
+            #[cfg(feature = "cuda")]
+            s.begin_capture(
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )?;
+            #[cfg(feature = "rocm")]
+            let capture = s.begin_capture()?;
+            let scheduled = run();
+            #[cfg(feature = "cuda")]
+            let captured = s
+                .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
+                .context("ring decode graph empty")?;
+            #[cfg(feature = "rocm")]
+            let captured = capture.finish()?;
+            scheduled?;
+            for seed in [47usize, 71] {
+                for p in [0usize, 1, 511, 512, 513, 1024, 8192] {
+                    let length = (p + 1).min(512);
+                    let first = p + 1 - length;
+                    let mut kh = vec![bf16::from_f32(-32.0); k.len()];
+                    let mut vh = vec![bf16::from_f32(-32.0); v.len()];
+                    for head in 0..kv {
+                        for key in first..=p {
+                            let base = ((key * 37 + head * 13 + seed) % 1009) as f32 / 128.0
+                                - 504.0 / 128.0;
+                            for d in 0..256 {
+                                let offset = (head * 512 + key % 512) * 256 + d;
+                                kh[offset] = bf16::from_f32(if d == 0 {
+                                    base
+                                } else {
+                                    ((key * 256 + d * 41 + head * 7) % 1013) as f32 / 32768.0
+                                        - 506.0 / 32768.0
+                                });
+                                vh[offset] = bf16::from_f32(
+                                    base / 8.0
+                                        + ((key * 256 + d * 43 + head * 11) % 1019) as f32 / 8192.0
+                                        - 509.0 / 8192.0,
+                                );
+                            }
+                        }
+                    }
+                    let mut expected = vec![0f64; 8 * 256];
+                    let mut expected_lse = Vec::new();
+                    for head in 0..8 {
+                        let kv_head = head / (8 / kv);
+                        let scores: Vec<_> = (first..=p)
+                            .map(|key| {
+                                (0..256)
+                                    .map(|d| {
+                                        qh[head * 256 + d].to_f64()
+                                            * kh[(kv_head * 512 + key % 512) * 256 + d].to_f64()
+                                    })
+                                    .sum::<f64>()
+                            })
+                            .collect();
+                        let peak = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                        let weights: Vec<_> = scores.iter().map(|x| (x - peak).exp()).collect();
+                        let denominator: f64 = weights.iter().sum();
+                        expected_lse.push(peak + denominator.ln());
+                        for (key, weight) in (first..=p).zip(weights) {
+                            for d in 0..256 {
+                                expected[head * 256 + d] += weight / denominator
+                                    * vh[(kv_head * 512 + key % 512) * 256 + d].to_f64();
+                            }
+                        }
+                    }
+                    s.memcpy_htod(&kh, &mut k)?;
+                    s.memcpy_htod(&vh, &mut v)?;
+                    s.memcpy_htod(&[p as i32], &mut position)?;
+                    s.memcpy_htod(&vec![0xa5u8; bytes + 256], &mut scratch)?;
+                    captured.launch()?;
+                    captured.launch()?;
+                    let graph = s.clone_dtoh(&out)?;
+                    let graph_lse = s.clone_dtoh(&lse)?;
+                    let call = RingDecodeInput {
+                        q: qv,
+                        k: view(&k, s, 0, kv_shape, kv_stride)?,
+                        v: view(&v, s, 0, kv_shape, kv_stride)?,
+                        position: view(&position, s, 0, [1], [1])?,
+                        out: &mut TensorMut(view(&out, s, 0, [1, 8, 256], [2048, 256, 1])?),
+                        lse: &mut TensorMut(view(&lse, s, 0, [8], [1])?),
+                        scratch: Scratch {
+                            ptr: scratch.device_ptr(s).0,
+                            bytes: bytes as u64,
+                        },
+                    };
+                    op.run(s, call)?;
+                    let eager = s.clone_dtoh(&out)?;
+                    let eager_lse = s.clone_dtoh(&lse)?;
+                    ensure!(
+                        graph == eager && graph_lse[..8] == eager_lse[..8],
+                        "ring decode graph/eager differs"
+                    );
+                    ensure!(
+                        graph[2048..].iter().all(|x| *x == bf16::from_f32(-32.0))
+                            && graph_lse[8..].iter().all(|x| x.to_bits() == 0x7fc00001)
+                            && s.clone_dtoh(&scratch)?[bytes..].iter().all(|&x| x == 0xa5),
+                        "ring decode output/scratch guard changed"
+                    );
+                    let (max_error, rms_error) = errors(
+                        &graph[..2048].iter().map(|x| x.to_f64()).collect::<Vec<_>>(),
+                        &expected,
+                        false,
+                    )?;
+                    let (lse_error, _) = errors(
+                        &graph_lse[..8]
+                            .iter()
+                            .map(|&x| f64::from(x))
+                            .collect::<Vec<_>>(),
+                        &expected_lse,
+                        false,
+                    )?;
+                    let passed = max_error <= maximum && rms_error <= rms && lse_error <= lse_max;
+                    defects += usize::from(!passed);
+                    println!(
+                        "RING_DECODE {} kv={kv} position={p} seed={seed} output_max={max_error:e} output_rms={rms_error:e} lse_max={lse_error:e}",
+                        if passed { "PASS" } else { "DEFECT" }
+                    );
+                    let mut wrong = vh.clone();
+                    for head in 0..kv {
+                        for slot in 0..512 {
+                            for d in 0..256 {
+                                wrong[(head * 512 + slot) * 256 + d] =
+                                    vh[(head * 512 + (slot + 1) % 512) * 256 + d];
+                            }
+                        }
+                    }
+                    s.memcpy_htod(&wrong, &mut v)?;
+                    captured.launch()?;
+                    let wrong = s.clone_dtoh(&out)?;
+                    let (control, _) = errors(
+                        &wrong[..2048].iter().map(|x| x.to_f64()).collect::<Vec<_>>(),
+                        &expected,
+                        false,
+                    )?;
+                    controls += usize::from(control > maximum);
+                    println!(
+                        "RING_DECODE_CONTROL kv={kv} position={p} seed={seed} wrong_v_slot_margin={:e}",
+                        control / maximum
+                    );
+                    cases += 1;
+                }
+            }
+        }
+        println!(
+            "RING_DECODE_RESULT cases={cases} defects={defects} detected_controls={controls} frozen_limits=true"
+        );
+        ensure!(
+            cases == 28 && defects == 0 && controls == 28,
+            "ring decode numerics/indexing DEFECT"
+        );
         Ok(())
     }
     #[derive(Clone, serde::Deserialize)]
@@ -1305,6 +1522,120 @@ mod tests {
                 },
         ))
     }
+    fn ring_reference_cell(
+        s: &Arc<CudaStream>,
+        case: &Case,
+        reference: (&[f64], &[f64]),
+        bound: &serde_json::Value,
+    ) -> Result<usize> {
+        use super::super::contracts::{Scratch, TensorMut, view};
+        use super::super::decode::{RingDecode, RingDecodeInput};
+        let op = RingDecode::new(s.context(), case.hq as u32, case.hkv as u32, 512, 1.0)?;
+        let b = case.buffers(s)?;
+        let ring = |kind| {
+            let mut data = vec![bf16::from_bits(0x7fc1); case.hkv * 512 * 256];
+            for head in 0..case.hkv {
+                for key in case.start.saturating_sub(511)..=case.start {
+                    for d in 0..256 {
+                        data[(head * 512 + key % 512) * 256 + d] =
+                            case.extended_value(key, head, d, kind);
+                    }
+                }
+            }
+            data
+        };
+        let k = s.clone_htod(&ring(b'k'))?;
+        let v = s.clone_htod(&ring(b'v'))?;
+        let position = s.clone_htod(&[i32::try_from(case.start)?])?;
+        let lse = s.clone_htod(&vec![f32::from_bits(0x7fc00001); case.hq + 32])?;
+        let bytes = RingDecode::workspace(case.hq, 512)?;
+        let scratch = s.clone_htod(&vec![0xa5u8; bytes + 256])?;
+        let qshape = [1, case.hq as u32, 256];
+        let run = || {
+            op.run(
+                s,
+                RingDecodeInput {
+                    q: view(&b.q, s, 0, qshape, [case.pitch as u64, 256, 1])?,
+                    k: view(&k, s, 0, [case.hkv as u32, 512, 256], [512 * 256, 256, 1])?,
+                    v: view(&v, s, 0, [case.hkv as u32, 512, 256], [512 * 256, 256, 1])?,
+                    position: view(&position, s, 0, [1], [1])?,
+                    out: &mut TensorMut(view(
+                        &b.out,
+                        s,
+                        0,
+                        qshape,
+                        [(case.hq * 256) as u64, 256, 1],
+                    )?),
+                    lse: &mut TensorMut(view(&lse, s, 0, [case.hq as u32], [1])?),
+                    scratch: Scratch {
+                        ptr: scratch.device_ptr(s).0,
+                        bytes: bytes as u64,
+                    },
+                },
+            )
+        };
+        run()?;
+        let first = s.clone_dtoh(&b.out)?;
+        let first_lse = s.clone_dtoh(&lse)?;
+        #[cfg(feature = "cuda")]
+        s.begin_capture(
+            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        )?;
+        #[cfg(feature = "rocm")]
+        let capture = s.begin_capture()?;
+        run()?;
+        #[cfg(feature = "cuda")]
+        let graph = s
+            .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
+            .context("ring reference graph empty")?;
+        #[cfg(feature = "rocm")]
+        let graph = capture.finish()?;
+        let mut defects = 0;
+        for _ in 0..2 {
+            graph.launch()?;
+            defects += usize::from(
+                !s.clone_dtoh(&b.out)?
+                    .iter()
+                    .zip(&first)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+            );
+            defects += usize::from(
+                !s.clone_dtoh(&lse)?
+                    .iter()
+                    .zip(&first_lse)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+            );
+        }
+        defects += usize::from(!first[case.hq * 256..].iter().all(|v| v.to_bits() == 0x7fc1));
+        defects += usize::from(
+            !first_lse[case.hq..]
+                .iter()
+                .all(|v| v.to_bits() == 0x7fc00001),
+        );
+        defects += usize::from(!s.clone_dtoh(&scratch)?[bytes..].iter().all(|&v| v == 0xa5));
+        let actual: Vec<_> = first[..case.hq * 256].iter().map(|v| v.to_f64()).collect();
+        let actual_lse: Vec<_> = first_lse[..case.hq].iter().map(|&v| f64::from(v)).collect();
+        let (maximum, rms) = errors(&actual, reference.0, false)?;
+        let (lse_error, _) = errors(&actual_lse, reference.1, false)?;
+        for (name, value) in [
+            ("output_max", maximum),
+            ("output_rms", rms),
+            ("lse_max", lse_error),
+        ] {
+            defects += usize::from(
+                value
+                    > bound[name]
+                        .as_f64()
+                        .context("ring reference bound missing")?,
+            );
+        }
+        println!(
+            "FFA_RING_CELL name={} max={maximum:e} rms={rms:e} lse={lse_error:e} defects={defects}",
+            case.name
+        );
+        Ok(defects)
+    }
+
     fn cell(
         stream: &Arc<CudaStream>,
         case: &Case,
@@ -1489,6 +1820,15 @@ mod tests {
             "FFA_HIP_CELL name={} d={} hq={} hkv={} mode={} rows={} start={} max={maximum:e} rms={rms:e} lse={lse_error:e} defects={defects}",
             case.name, case.d, case.hq, case.hkv, case.mode, case.rows, case.start
         );
+        if case.d == 256
+            && case.rows == 1
+            && case.scale == Some(1.0)
+            && case.mode == "window"
+            && case.extent == 511
+        {
+            ensure!(selected == [0], "single-query ring reference selection");
+            defects += ring_reference_cell(stream, case, (&reference, &reference_lse), bound)?;
+        }
         Ok(defects)
     }
 
