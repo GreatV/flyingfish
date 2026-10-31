@@ -216,7 +216,7 @@ fn unified_media_shapes_and_packed_patch_bounds_are_strict() -> Result<()> {
     );
     let blocks = plan.image_blocks()?;
     ensure!(
-        &blocks[..12] == [1, 1, 2, 2, 2, 4, 2, 4, 5, 5, 6, 6],
+        blocks[..12] == [1, 1, 2, 2, 2, 4, 2, 4, 5, 5, 6, 6],
         "image-block query bounds"
     );
     ensure!(

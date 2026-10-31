@@ -914,11 +914,12 @@ impl Flash {
                 }
                 if let Some(score) = &self.score {
                     let window = score.window_left.map_or(u32::MAX, |w| w as u32);
+                    let key_extent = keys as u32;
                     if bidirectional_only {
                         launch.arg(&extent);
                     } else if shape.head_dim == 256 {
                         if mode == 1 {
-                            launch.arg(&(keys as u32));
+                            launch.arg(&key_extent);
                         } else {
                             launch.arg(&window);
                         }
