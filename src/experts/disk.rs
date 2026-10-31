@@ -250,6 +250,78 @@ impl SpanReader {
         })
     }
 
+    pub(crate) fn plan(&self, requests: &[(u64, u64)], chunk: u64) -> Result<Vec<ReadSpan>> {
+        plan_spans(
+            requests,
+            self.alignment,
+            self.len,
+            chunk.max(self.alignment),
+        )
+    }
+
+    pub(crate) fn read_span<'a>(
+        &self,
+        span: &ReadSpan,
+        chunk: u64,
+        staging: &'a mut AlignedBytes,
+    ) -> Result<&'a [u8]> {
+        ensure!(
+            chunk > 0 && span.begin < span.end && span.end <= self.len,
+            "invalid prepared native span"
+        );
+        ensure!(
+            !self.direct
+                || (chunk.is_multiple_of(self.alignment)
+                    && span.begin.is_multiple_of(self.alignment)),
+            "misaligned prepared native span"
+        );
+        let width = usize::try_from(span.end - span.begin)?;
+        let allocated = if self.direct {
+            u64::try_from(width)?
+                .checked_add(self.alignment - 1)
+                .context("direct span overflow")?
+                & !(self.alignment - 1)
+        } else {
+            u64::try_from(width)?
+        };
+        ensure!(
+            allocated <= staging.len() as u64,
+            "native span {allocated} exceeds staging {}",
+            staging.len()
+        );
+        ensure!(
+            !self.direct || (staging.as_ptr() as usize as u64).is_multiple_of(self.alignment),
+            "native direct buffer is misaligned"
+        );
+        let mut written = 0usize;
+        while written < width {
+            let logical = usize::try_from(chunk)?.min(width - written);
+            let requested = if self.direct {
+                logical.div_ceil(self.alignment as usize) * self.alignment as usize
+            } else {
+                logical
+            };
+            let at = span.begin + written as u64;
+            let buffer = &mut staging.as_mut()[written..written + requested];
+            if self.direct {
+                let got = self
+                    .file
+                    .read_at(buffer, at)
+                    .with_context(|| format!("direct read {at}+{requested}"))?;
+                ensure!(
+                    got == logical,
+                    "short native direct read at {at}: got {got}, expected {logical}"
+                );
+            } else {
+                self.file
+                    .read_exact_at(buffer, at)
+                    .with_context(|| format!("native read {at}+{requested}"))?;
+            }
+            written += logical;
+        }
+        Ok(&staging.as_mut()[..width])
+    }
+
     /// The callback receives the original request index and its complete native bytes.
     pub(crate) fn read_spans(
         &self,
@@ -277,52 +349,10 @@ impl SpanReader {
         let mut order: Vec<usize> = (0..requests.len()).collect();
         order.sort_unstable_by_key(|&i| requests[i]);
         let sorted: Vec<_> = order.iter().map(|&i| requests[i]).collect();
-        let spans = plan_spans(&sorted, self.alignment, self.len, chunk.max(self.alignment))?;
+        let spans = self.plan(&sorted, chunk)?;
         for span in &spans {
-            let width = usize::try_from(span.end - span.begin)?;
-            let allocated = if self.direct {
-                u64::try_from(width)?
-                    .checked_add(self.alignment - 1)
-                    .context("direct span overflow")?
-                    & !(self.alignment - 1)
-            } else {
-                u64::try_from(width)?
-            };
-            ensure!(
-                allocated <= staging.len() as u64,
-                "native span {allocated} exceeds staging {}",
-                staging.len()
-            );
-            ensure!(
-                !self.direct || (staging.as_ptr() as usize as u64).is_multiple_of(self.alignment),
-                "native direct buffer is misaligned"
-            );
-            let mut written = 0usize;
-            while written < width {
-                let logical = usize::try_from(chunk)?.min(width - written);
-                let requested = if self.direct {
-                    logical.div_ceil(self.alignment as usize) * self.alignment as usize
-                } else {
-                    logical
-                };
-                let at = span.begin + written as u64;
-                let buffer = &mut staging.as_mut()[written..written + requested];
-                if self.direct {
-                    let got = self
-                        .file
-                        .read_at(buffer, at)
-                        .with_context(|| format!("direct read {at}+{requested}"))?;
-                    ensure!(
-                        got == logical,
-                        "short native direct read at {at}: got {got}, expected {logical}"
-                    );
-                } else {
-                    self.file
-                        .read_exact_at(buffer, at)
-                        .with_context(|| format!("native read {at}+{requested}"))?;
-                }
-                written += logical;
-            }
+            let bytes = self.read_span(span, chunk, staging)?;
+            let width = bytes.len();
             for index in span.first..span.last {
                 let (offset, len) = sorted[index];
                 let from = usize::try_from(offset - span.begin)?;
@@ -330,7 +360,7 @@ impl SpanReader {
                     .checked_add(usize::try_from(len)?)
                     .context("native slice overflow")?;
                 ensure!(end <= width, "native request exceeds its span");
-                consume(order[index], &staging.as_mut()[from..end])?;
+                consume(order[index], &bytes[from..end])?;
             }
         }
         Ok(spans.len())

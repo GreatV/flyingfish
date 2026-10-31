@@ -1147,6 +1147,8 @@ impl Engine {
         }
         let bytes = manifest.resident_bytes;
         let catalog = WeightCatalog {
+            #[cfg(feature = "cuda")]
+            dense: None,
             linear_format: model_spec.linear_format,
             tensors,
             manifest,

@@ -665,8 +665,9 @@ impl StateStore {
                         .sliding_window
                         .map_or(capacity, |window| window as usize);
                     let head_dim = geometry.map_or(spec.head_dim, |g| g.head_dim);
+                    let heads = geometry.and_then(|g| g.kv_heads).unwrap_or(spec.kv_heads);
                     let layout =
-                        format.layout(layer_capacity, spec.kv_heads as usize, head_dim as usize)?;
+                        format.layout(layer_capacity, heads as usize, head_dim as usize)?;
                     kv.push(Kv {
                         k: stream.alloc_zeros::<bf16>(layout.ring_elements)?,
                         v: stream.alloc_zeros::<bf16>(layout.ring_elements)?,
@@ -930,8 +931,7 @@ pub struct StateCheckpoint {
     prefix: usize,
     rows: usize,
     active_rows: usize,
-    heads: usize,
-    kv_dims: Vec<usize>,
+    kv_dims: Vec<(usize, usize)>,
     capacity: usize,
     kv_rings: Vec<usize>,
     valid: bool,
@@ -951,7 +951,6 @@ impl StateCheckpoint {
             rows > 0 && rows <= store.capacity as usize,
             "invalid checkpoint window"
         );
-        let heads = spec.kv_heads as usize;
         let mut kv = Vec::new();
         let mut kv_dims = Vec::new();
         let mut gdn = Vec::new();
@@ -960,6 +959,10 @@ impl StateCheckpoint {
                 continue;
             }
             let dim = layer.geometry.map_or(spec.head_dim, |g| g.head_dim) as usize;
+            let heads = layer
+                .geometry
+                .and_then(|g| g.kv_heads)
+                .unwrap_or(spec.kv_heads) as usize;
             let slots = if layer.geometry.is_some_and(|g| g.kv_reader) {
                 0
             } else {
@@ -973,7 +976,7 @@ impl StateCheckpoint {
                 k: stream.alloc_zeros(slots)?,
                 v: stream.alloc_zeros(slots)?,
             });
-            kv_dims.push(dim);
+            kv_dims.push((heads, dim));
         }
         for state in &store.gdn {
             gdn.push(GdnState {
@@ -993,7 +996,6 @@ impl StateCheckpoint {
             prefix: 0,
             rows,
             active_rows: 0,
-            heads,
             kv_dims,
             capacity: store.capacity as usize,
             kv_rings: store.kv_rings.clone(),
@@ -1019,7 +1021,7 @@ impl StateCheckpoint {
                 "checkpoint GDN extent mismatch"
             );
         }
-        for ((kv, saved), cap, dim) in store
+        for ((kv, saved), cap, (heads, dim)) in store
             .kv
             .iter()
             .zip(&self.kv)
@@ -1038,18 +1040,14 @@ impl StateCheckpoint {
                 .compact
                 .as_ref()
                 .map_or_else(
-                    || {
-                        self.heads
-                            .checked_mul(*cap)
-                            .and_then(|n| n.checked_mul(*dim))
-                    },
+                    || heads.checked_mul(*cap).and_then(|n| n.checked_mul(*dim)),
                     |c| Some(c.layout.ring_elements),
                 )
                 .context("checkpoint KV extent overflow")?;
             ensure!(
                 kv.k.len() == n
                     && kv.v.len() == n
-                    && saved.k.len() == self.heads * self.rows * *dim
+                    && saved.k.len() == heads * self.rows * *dim
                     && saved.v.len() == saved.k.len(),
                 "checkpoint KV extent mismatch ring={cap}"
             );
@@ -1120,7 +1118,7 @@ impl StateCheckpoint {
             stream.memcpy_dtod(&src.s, &mut dst.s)?;
             stream.memcpy_dtod(&src.history, &mut dst.history)?;
         }
-        for (((src, dst), cap), dim) in store
+        for (((src, dst), cap), (heads, dim)) in store
             .kv
             .iter()
             .zip(&mut self.kv)
@@ -1137,7 +1135,7 @@ impl StateCheckpoint {
                         a,
                         b,
                         super::copy::Rect {
-                            rows: self.heads,
+                            rows: *heads,
                             width: active_rows * (*dim),
                             src_pitch: self.capacity * (*dim),
                             src_col: prefix * (*dim),
@@ -1158,7 +1156,7 @@ impl StateCheckpoint {
                         a,
                         b,
                         super::copy::Rect {
-                            rows: self.heads,
+                            rows: *heads,
                             width: (*dim),
                             src_pitch: cap * (*dim),
                             src_col: pos * (*dim),
@@ -1303,7 +1301,7 @@ impl StateCheckpoint {
         if first == end {
             return Ok(());
         }
-        for (((src, dst), cap), dim) in self
+        for (((src, dst), cap), (heads, dim)) in self
             .kv
             .iter()
             .zip(&mut store.kv)
@@ -1321,7 +1319,7 @@ impl StateCheckpoint {
                         a,
                         b,
                         super::copy::Rect {
-                            rows: self.heads,
+                            rows: *heads,
                             width: (end - first) * (*dim),
                             src_pitch: self.rows * (*dim),
                             src_col: first * (*dim),
@@ -1342,7 +1340,7 @@ impl StateCheckpoint {
                         a,
                         b,
                         super::copy::Rect {
-                            rows: self.heads,
+                            rows: *heads,
                             width: (*dim),
                             src_pitch: self.rows * (*dim),
                             src_col: row * (*dim),

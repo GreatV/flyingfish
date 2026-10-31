@@ -15,6 +15,218 @@ const MUTANT_FRACTION: f64 = 0.01;
 
 type Fixture = BTreeMap<String, (Vec<usize>, Vec<bf16>)>;
 
+#[test]
+#[ignore = "requires a GPU"]
+fn shared_kv_preparation_matches_independent_raw_projection_gpu() -> Result<()> {
+    let device = Device::new(0)?;
+    let s = &device.stream;
+    let module = cubin::module(&device.ctx, "rope")?;
+    let independent = module.load_function("qknorm_rope_table_kv")?;
+    let shared = module.load_function("qknorm_rope_table_shared_kv")?;
+    let mut cases = 0;
+    for (hq, hkv) in [(16usize, 1usize), (16, 2), (32, 4)] {
+        for d in [256usize, 512] {
+            for rows in [1usize, 17, 1032] {
+                let capacity = rows + 35;
+                let q_width = hq * d;
+                let kv_width = hkv * d;
+                let raw: Vec<_> = (0..rows * (q_width + kv_width))
+                    .map(|i| bf16::from_f32(((i * 37 % 1009) as f32 - 504.0) / 128.0))
+                    .collect();
+                let mut copied = raw.clone();
+                copied.extend_from_slice(&raw[rows * q_width..]);
+                let norms: Vec<_> = (0..d)
+                    .map(|i| bf16::from_f32(0.25 + (i * 17 % 101) as f32 / 32.0))
+                    .collect();
+                let norms = s.clone_htod(&norms)?;
+                let rope = crate::model_spec::RopeSpec {
+                    theta: if d == 512 { 1_000_000.0 } else { 10_000.0 },
+                    pairs: if d == 512 { 64 } else { 128 },
+                    pair_stride: d as u32 / 2,
+                    denominator: d as u32,
+                };
+                let table = s.clone_htod(&rope.table(d as u32, capacity)?)?;
+                let start = s.clone_htod(&[13i32])?;
+                let run = |shared_input: bool| -> Result<_> {
+                    let mut qkv = s.clone_htod(if shared_input { &raw } else { &copied })?;
+                    let poison = vec![bf16::from_f32(-71.0); hkv * capacity * d];
+                    let mut k = s.clone_htod(&poison)?;
+                    let mut v = s.clone_htod(&poison)?;
+                    unsafe {
+                        s.launch_builder(if shared_input { &shared } else { &independent })
+                            .arg(&mut qkv)
+                            .arg(&mut k)
+                            .arg(&mut v)
+                            .arg(&norms)
+                            .arg(&norms)
+                            .arg(&table)
+                            .arg(&start)
+                            .arg(&-1i32)
+                            .arg(&(rows as i32))
+                            .arg(&(hq as i32))
+                            .arg(&(hkv as i32))
+                            .arg(&(d as i32))
+                            .arg(&(capacity as i32))
+                            .arg(&0i32)
+                            .arg(&1e-6f32)
+                            .arg(&(q_width as u64))
+                            .arg(&((rows * q_width) as u64))
+                            .arg(&(kv_width as u64))
+                            .arg(&((rows * (q_width + kv_width)) as u64))
+                            .arg(&(kv_width as u64))
+                            .launch(LaunchConfig {
+                                grid_dim: (
+                                    (rows * (hq + if shared_input { hkv } else { 2 * hkv })) as u32,
+                                    1,
+                                    1,
+                                ),
+                                block_dim: (128, 1, 1),
+                                shared_mem_bytes: 0,
+                            })?;
+                    }
+                    Ok((
+                        s.clone_dtoh(&qkv.slice(..raw.len()))?,
+                        s.clone_dtoh(&k)?,
+                        s.clone_dtoh(&v)?,
+                    ))
+                };
+                let expected = run(false)?;
+                let actual = run(true)?;
+                let repeat = run(true)?;
+                ensure!(
+                    actual == expected && repeat == actual,
+                    "shared KV differs rows={rows} hq={hq} hkv={hkv} d={d}"
+                );
+                ensure!(
+                    actual.1 != actual.2,
+                    "normalized/rotated K-as-V control undetected"
+                );
+                for head in 0..hkv {
+                    for position in (0..13).chain(13 + rows..capacity) {
+                        let begin = (head * capacity + position) * d;
+                        ensure!(
+                            actual.1[begin..begin + d]
+                                .iter()
+                                .chain(&actual.2[begin..begin + d])
+                                .all(|x| *x == bf16::from_f32(-71.0)),
+                            "cache guard overwritten"
+                        );
+                    }
+                }
+                println!(
+                    "SHARED_KV_PREP rows={rows} hq={hq} hkv={hkv} d={d} bit_mismatches=0 repeat_mismatches=0 wrong_value_control=detected guards=PASS"
+                );
+                cases += 1;
+            }
+        }
+    }
+    println!("PASS shared_kv_preparation cells={cases} defects=0");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a GPU"]
+fn per_layer_kv_state_and_checkpoint_preserve_heads_gpu() -> Result<()> {
+    let device = Device::new(0)?;
+    let s = &device.stream;
+    for (text, bytes) in [
+        (
+            include_str!("../../../tests/data/gemma4-12b-config.json"),
+            369_098_752usize,
+        ),
+        (
+            include_str!("../../../tests/data/gemma4-31b-config.json"),
+            1_006_632_960,
+        ),
+    ] {
+        let spec = crate::model_spec::ModelSpec::gemma4(
+            &serde_json::from_str(text)?,
+            &serde_json::Value::Null,
+        )?;
+        let mut state = super::state::StateStore::new(&spec, 2048, s)?;
+        ensure!(
+            state.bytes() == bytes + 32,
+            "per-layer state byte accounting"
+        );
+        state.set_sequence(s, 1022, 8, 8)?;
+        let mut token = s.clone_htod(&[17u32])?;
+        for (index, kv) in state.kv.iter_mut().enumerate() {
+            let g = spec.layers[index].geometry.context("layer geometry")?;
+            let heads = g.kv_heads.unwrap_or(spec.kv_heads) as usize;
+            let dim = g.head_dim as usize;
+            let capacity = spec.layers[index]
+                .sliding_window
+                .map_or(2048, |w| w as usize);
+            ensure!(
+                kv.k.len() == heads * capacity * dim && kv.v.len() == kv.k.len(),
+                "layer {index} allocation"
+            );
+            for head in 0..heads {
+                for row in 0..8 {
+                    let offset = (head * capacity + (1022 + row) % capacity) * dim;
+                    let values: Vec<_> = (0..dim)
+                        .map(|d| {
+                            bf16::from_f32(
+                                ((index * 17 + head * 41 + row * 29 + d * 7) % 1013) as f32 / 64.0,
+                            )
+                        })
+                        .collect();
+                    s.memcpy_htod(&values, &mut kv.k.slice_mut(offset..offset + dim))?;
+                    s.memcpy_htod(&values, &mut kv.v.slice_mut(offset..offset + dim))?;
+                }
+            }
+        }
+        let mut checkpoint = super::state::StateCheckpoint::new(&state, &spec, 8, s)?;
+        checkpoint.save(&state, &token, 1022, s, None)?;
+        let mut wrong = spec.clone();
+        for layer in &mut wrong.layers {
+            layer.geometry.as_mut().context("layer geometry")?.kv_heads = None;
+        }
+        let mut wrong_checkpoint = super::state::StateCheckpoint::new(&state, &wrong, 8, s)?;
+        ensure!(
+            wrong_checkpoint
+                .save(&state, &token, 1022, s, None)
+                .is_err(),
+            "model-wide KV-head control undetected"
+        );
+        for kv in &mut state.kv {
+            s.memset_zeros(&mut kv.k)?;
+            s.memset_zeros(&mut kv.v)?;
+        }
+        checkpoint.restore(&mut state, &mut token, s)?;
+        for (index, kv) in state.kv.iter().enumerate() {
+            let g = spec.layers[index].geometry.context("layer geometry")?;
+            let heads = g.kv_heads.unwrap_or(spec.kv_heads) as usize;
+            let dim = g.head_dim as usize;
+            let capacity = spec.layers[index]
+                .sliding_window
+                .map_or(2048, |w| w as usize);
+            for head in 0..heads {
+                for row in 0..8 {
+                    let offset = (head * capacity + (1022 + row) % capacity) * dim;
+                    let expected: Vec<_> = (0..dim)
+                        .map(|d| {
+                            bf16::from_f32(
+                                ((index * 17 + head * 41 + row * 29 + d * 7) % 1013) as f32 / 64.0,
+                            )
+                        })
+                        .collect();
+                    ensure!(
+                        s.clone_dtoh(&kv.k.slice(offset..offset + dim))? == expected
+                            && s.clone_dtoh(&kv.v.slice(offset..offset + dim))? == expected,
+                        "snapshot head/row mismatch"
+                    );
+                }
+            }
+        }
+        println!(
+            "PASS per_layer_kv_state hidden={} cache_bytes={bytes} checkpoint_bits=0 wrong_heads_control=detected",
+            spec.hidden
+        );
+    }
+    Ok(())
+}
+
 fn load_fixture(path: &std::path::Path) -> Result<Fixture> {
     let bytes = std::fs::read(path)?;
     let tensors = SafeTensors::deserialize(&bytes)?;
@@ -999,7 +1211,7 @@ fn softcap_tied_head_and_embedding_scale_match_the_definition_gpu() -> Result<()
 }
 
 fn rms_f32(x: &[f32], weight: &[bf16]) -> Vec<bf16> {
-    let mean = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
+    let mean = x.iter().map(|v| f64::from(v * v)).sum::<f64>() as f32 / x.len() as f32;
     let inv = 1.0 / (mean + 1e-6).sqrt();
     x.iter()
         .zip(weight)
@@ -2768,20 +2980,254 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
 }
 
 fn checkpoint_tensor(dir: &std::path::Path, name: &str) -> Result<Vec<bf16>> {
-    let bytes = std::fs::read(dir.join("model.safetensors"))?;
-    let tensors = SafeTensors::deserialize(&bytes)?;
-    let view = tensors.tensor(name)?;
+    let mapped = crate::checkpoint::MappedCheckpoint::open(dir)?;
+    let shard = mapped
+        .index
+        .weight_map
+        .get(name)
+        .context("checkpoint tensor is absent")?;
+    let tensors = mapped.views()?;
+    let view = tensors[shard].tensor(name)?;
+    let mut bytes = vec![0u8; view.data().len()];
+    mapped.read_mapped_range(shard, view.data(), &mut bytes)?;
     ensure!(
         view.dtype() == safetensors::Dtype::BF16,
         "{name} is not BF16"
     );
-    Ok(view
-        .data()
+    Ok(bytes
         .as_chunks::<2>()
         .0
         .iter()
         .map(|b| bf16::from_le_bytes(*b))
         .collect())
+}
+
+#[cfg(feature = "cuda")]
+fn no_ple_exit_control(
+    engine: &mut super::engine::Engine,
+    dir: &std::path::Path,
+    hidden: usize,
+) -> Result<usize> {
+    let mut defects = 0;
+    let post = checkpoint_tensor(
+        dir,
+        "model.language_model.layers.0.post_feedforward_layernorm.weight",
+    )?;
+    let next = checkpoint_tensor(dir, "model.language_model.layers.1.input_layernorm.weight")?;
+    let scale = checkpoint_tensor(dir, "model.language_model.layers.0.layer_scalar")?[0].to_f32();
+    ensure!(
+        scale != 1.0,
+        "layer-exit scalar control is not discriminating"
+    );
+    for rows in [1, 17] {
+        engine.reset()?;
+        let x: Vec<_> = (0..rows * hidden)
+            .map(|i| bf16::from_f32(((i * 37 % 1009) as f32 - 504.0) / 256.0))
+            .collect();
+        let branch: Vec<_> = (0..rows * hidden)
+            .map(|i| bf16::from_f32(((i * 71 % 997) as f32 - 498.0) / 128.0))
+            .collect();
+        let normalized: Vec<_> = branch
+            .chunks(hidden)
+            .flat_map(|row| rms_f32(&row.iter().map(|v| v.to_f32()).collect::<Vec<_>>(), &post))
+            .collect();
+        let unscaled: Vec<_> = x
+            .iter()
+            .zip(&normalized)
+            .map(|(x, b)| bf16::from_f32(x.to_f32() + b.to_f32()))
+            .collect();
+        let expected_x: Vec<_> = unscaled
+            .iter()
+            .map(|v| bf16::from_f32(v.to_f32() * scale))
+            .collect();
+        let expected_n: Vec<_> = expected_x
+            .chunks(hidden)
+            .flat_map(|row| rms_f32(&row.iter().map(|v| v.to_f32()).collect::<Vec<_>>(), &next))
+            .collect();
+        let floor_x: Vec<_> = x
+            .iter()
+            .map(|v| 2.0 * scale.abs() * bf16_ulp(v.to_f32()))
+            .collect();
+        let floor_n: Vec<_> = expected_x
+            .chunks(hidden)
+            .zip(floor_x.chunks(hidden))
+            .zip(expected_n.chunks(hidden))
+            .flat_map(|((row, floor), norm)| {
+                let mean = row.iter().map(|v| v.to_f32() * v.to_f32()).sum::<f32>() / hidden as f32;
+                let inv = 1.0 / (mean + 1e-6).sqrt();
+                floor
+                    .iter()
+                    .zip(&next)
+                    .zip(norm)
+                    .map(|((error, weight), value)| {
+                        inv * weight.to_f32().abs() * error + bf16_ulp(value.to_f32())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let (actual_x, actual_n) = engine.gemma_exit_probe(&x, &branch)?;
+        for (tag, actual, expected, floor) in [
+            ("x", &actual_x, &expected_x, &floor_x),
+            ("n", &actual_n, &expected_n, &floor_n),
+        ] {
+            let stats = Stats::with_floor(actual, expected, Some(floor))?;
+            println!(
+                "GEMMA4_NO_PLE_EXIT rows={rows} hidden={hidden} scalar={scale} {}",
+                stats.line(tag)
+            );
+            defects += usize::from(!stats.passes());
+        }
+        let control = Stats::new(&expected_x, &unscaled)?;
+        ensure!(
+            control.is_detected_mutant(),
+            "omitted scalar control is not discriminating"
+        );
+        println!("PASS no_ple_scalar_control rows={rows} hidden={hidden} omitted_scalar=detected");
+    }
+    engine.reset()?;
+    Ok(defects)
+}
+
+#[cfg(feature = "cuda")]
+fn large_model_definition(
+    dir: &std::path::Path,
+    settings: crate::backend::Settings,
+    spec: &crate::model_spec::ModelSpec,
+    data: &ReferenceFixture,
+    ids: &serde_json::Value,
+    frozen: &serde_json::Value,
+) -> Result<()> {
+    let window = spec
+        .layers
+        .iter()
+        .find_map(|layer| layer.sliding_window)
+        .context("large Gemma window missing")? as usize;
+    let capacity = window + 128;
+    let mut engine = super::engine::Engine::load(dir, 0, capacity, Some(window + 8), settings)?;
+    let plan = engine
+        .dense_placement()
+        .context("large-model gate did not execute dense streaming")?;
+    println!("GEMMA4_DENSE_PLACEMENT {}", serde_json::to_string(plan)?);
+    ensure!(
+        plan.host_bytes > 0,
+        "large-model host tier was not executed"
+    );
+    if spec.hidden == 5376 {
+        ensure!(plan.disk_bytes > 0, "31B gate must force the disk tier");
+    }
+    let mut defects = no_ple_exit_control(&mut engine, dir, spec.hidden as usize)?;
+    let mut wrap_eager = Vec::new();
+    let mut wrap_state = None;
+    let global = spec
+        .layers
+        .iter()
+        .position(|layer| layer.sliding_window.is_none())
+        .context("global layer missing")?;
+    for tag in ["a", "b", "wrap", "long"] {
+        let sequence: Vec<u32> = serde_json::from_value(if matches!(tag, "a" | "b") {
+            ids["short"][usize::from(tag == "b")].clone()
+        } else {
+            ids[tag].clone()
+        })?;
+        for mode in ["prefill", "decode"] {
+            engine.reset()?;
+            let name = format!("{tag}.{mode}");
+            let rows = data[&name].0[0];
+            let actual = if tag == "long" && mode == "decode" {
+                let mut values = Vec::new();
+                for (piece, chunk) in sequence.chunks(window / 2).enumerate() {
+                    engine.gemma_prefill_all(chunk)?;
+                    let start = piece * (window / 2);
+                    for row in 0..chunk.len() {
+                        if start + row >= sequence.len() - rows {
+                            values.extend(engine.gemma_all_logits(row)?);
+                        }
+                    }
+                }
+                values
+            } else {
+                let prefill = if mode == "prefill" {
+                    sequence.len()
+                } else if tag == "wrap" {
+                    window
+                } else {
+                    0
+                };
+                let mut values = native_path(&mut engine, &sequence, prefill)?;
+                drop(values.drain(..values.len() - rows * spec.vocab as usize));
+                values
+            };
+            let (pass, line, _) = model_metrics(
+                &actual,
+                &reference(data, &name)?.as_f32(),
+                &sequence[sequence.len() - rows..],
+                &frozen["families"][tag],
+            )?;
+            println!(
+                "GEMMA4_MODEL {tag} {mode} {} {line}",
+                if pass { "PASS" } else { "DEFECT" }
+            );
+            defects += usize::from(!pass);
+            if tag == "wrap" && mode == "decode" {
+                wrap_eager = actual;
+                wrap_state = Some((
+                    engine.gemma_kv_rows(0, window)?,
+                    engine.gemma_kv_rows(global, sequence.len())?,
+                    engine.gemma_hidden_state()?,
+                ));
+            }
+        }
+    }
+    let sequence: Vec<u32> = serde_json::from_value(ids["wrap"].clone())?;
+    engine.reset()?;
+    engine.gemma_prefill_all(&sequence[..window])?;
+    let before = (
+        engine.gemma_kv_rows(0, window)?,
+        engine.gemma_kv_rows(global, window)?,
+    );
+    engine.capture()?;
+    let restored = before
+        == (
+            engine.gemma_kv_rows(0, window)?,
+            engine.gemma_kv_rows(global, window)?,
+        );
+    defects += usize::from(!restored);
+    let mut graph = Vec::new();
+    for &token in &sequence[window..] {
+        engine.set_token(token)?;
+        engine.decode(true, None)?;
+        graph.extend(engine.decode_logits()?.into_iter().map(bf16::from_f32));
+    }
+    let differing = graph
+        .iter()
+        .zip(&wrap_eager)
+        .filter(|(a, b)| a != b)
+        .count();
+    let final_state = (
+        engine.gemma_kv_rows(0, window)?,
+        engine.gemma_kv_rows(global, sequence.len())?,
+        engine.gemma_hidden_state()?,
+    );
+    let state_equal = wrap_state.as_ref() == Some(&final_state);
+    defects += usize::from(differing != 0 || !state_equal);
+    let (pass, line, _) = model_metrics(
+        &graph,
+        &reference(data, "wrap.decode")?.as_f32(),
+        &sequence[window..],
+        &frozen["families"]["wrap"],
+    )?;
+    defects += usize::from(!pass);
+    println!(
+        "GEMMA4_MODEL wrap graph {} {line}",
+        if pass { "PASS" } else { "DEFECT" }
+    );
+    println!("GEMMA4_GRAPH_EAGER bits={differing} restored={restored} state_equal={state_equal}");
+    println!(
+        "GEMMA4_MODEL {} cells=9 defects={defects} window={window} long_targets=512 streamed_graph=true",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(defects == 0, "large Gemma candidate defects={defects}");
+    Ok(())
 }
 
 #[test]
@@ -2816,6 +3262,12 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         .clone()
         .context("runtime directory missing")?;
     let spec = crate::model_spec::ModelSpec::read(&dir)?;
+    if spec.per_layer_input.is_none() {
+        #[cfg(feature = "cuda")]
+        return large_model_definition(&dir, settings, &spec, &data, &ids, &frozen);
+        #[cfg(feature = "rocm")]
+        anyhow::bail!("large Gemma streamed text gate requires CUDA");
+    }
     let device = Device::new(0)?;
     let catalog = super::weights::WeightCatalog::load(&dir, &spec, &device)?;
     for full in [
@@ -3264,6 +3716,10 @@ fn gemma4_catalog_uploads_exactly_the_text_set_gpu() -> Result<()> {
                 |(bf16_bytes, native_bytes), tensor| match tensor {
                     StoredTensor::Bf16(values) => (bf16_bytes + values.len() * 2, native_bytes),
                     StoredTensor::Bytes(values) => (bf16_bytes, native_bytes + values.len()),
+                    #[cfg(feature = "cuda")]
+                    StoredTensor::Slot { .. } => {
+                        panic!("resident upload gate contains streamed weights")
+                    }
                 },
             );
     ensure!(

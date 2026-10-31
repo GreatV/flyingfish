@@ -440,15 +440,18 @@ impl MappedCheckpoint {
     ) -> Result<BTreeMap<String, ExpectedTensor>> {
         let mut expected = BTreeMap::new();
         Self::gemma4_entries(spec, &mut expected)?;
-        Self::axial_vision_entries(
-            spec.vision
-                .as_ref()
-                .context("vision configuration missing")?,
-            &mut expected,
-        )?;
+        if let Some(vision) = &spec.vision {
+            Self::axial_vision_entries(vision, &mut expected)?;
+        }
         let views = self.views()?;
         for (name, shard) in &self.index.weight_map {
-            let scope = if name.starts_with("model.audio_tower.")
+            let scope = if spec.vision.is_none()
+                && (name.starts_with("model.vision_tower.")
+                    || name.starts_with("model.embed_vision.")
+                    || name.starts_with("model.vision_embedder."))
+            {
+                TensorScope::Vision
+            } else if name.starts_with("model.audio_tower.")
                 || name.starts_with("model.embed_audio.")
             {
                 TensorScope::Audio
@@ -560,34 +563,32 @@ impl MappedCheckpoint {
     ) -> Result<()> {
         let hidden = spec.hidden as usize;
         let depth = spec.layers.len();
-        let ple = spec
-            .per_layer_input
-            .context("Gemma 4 per-layer input width missing from the spec")?
-            as usize;
+        let ple = spec.per_layer_input.map(|width| width as usize);
         let q_heads = spec.q_heads as usize;
-        let kv_heads = spec.kv_heads as usize;
         let text = "model.language_model";
         let mut add = |name: String, shape: Vec<usize>, scope| {
             put(expected, name, Dtype::BF16, shape, scope);
         };
-        for (name, shape) in [
-            ("embed_tokens", vec![spec.vocab as usize, hidden]),
-            (
-                "embed_tokens_per_layer",
-                vec![spec.vocab as usize, depth * ple],
-            ),
-            ("per_layer_model_projection", vec![depth * ple, hidden]),
-        ] {
-            add(format!("{text}.{name}.weight"), shape, TensorScope::Text);
+        add(
+            format!("{text}.embed_tokens.weight"),
+            vec![spec.vocab as usize, hidden],
+            TensorScope::Text,
+        );
+        if let Some(ple) = ple {
+            for (name, shape) in [
+                (
+                    "embed_tokens_per_layer",
+                    vec![spec.vocab as usize, depth * ple],
+                ),
+                ("per_layer_model_projection", vec![depth * ple, hidden]),
+                ("per_layer_projection_norm", vec![ple]),
+            ] {
+                add(format!("{text}.{name}.weight"), shape, TensorScope::Text);
+            }
         }
         add(
             format!("{text}.norm.weight"),
             vec![hidden],
-            TensorScope::Text,
-        );
-        add(
-            format!("{text}.per_layer_projection_norm.weight"),
-            vec![ple],
             TensorScope::Text,
         );
         for (i, layer) in spec.layers.iter().enumerate() {
@@ -595,6 +596,7 @@ impl MappedCheckpoint {
                 .geometry
                 .with_context(|| format!("Gemma 4 layer {i} has no geometry"))?;
             let (head_dim, inter) = (g.head_dim as usize, g.intermediate as usize);
+            let kv_heads = g.kv_heads.unwrap_or(spec.kv_heads) as usize;
             let p = format!("{text}.layers.{i}");
             let own = if g.kv_reader {
                 TensorScope::Dormant
@@ -606,7 +608,6 @@ impl MappedCheckpoint {
                 "post_attention_layernorm",
                 "pre_feedforward_layernorm",
                 "post_feedforward_layernorm",
-                "post_per_layer_input_norm",
             ] {
                 add(
                     format!("{p}.{name}.weight"),
@@ -614,13 +615,20 @@ impl MappedCheckpoint {
                     TensorScope::Text,
                 );
             }
+            if let Some(ple) = ple {
+                for (name, shape) in [
+                    ("post_per_layer_input_norm", vec![hidden]),
+                    ("per_layer_input_gate", vec![ple, hidden]),
+                    ("per_layer_projection", vec![hidden, ple]),
+                ] {
+                    add(format!("{p}.{name}.weight"), shape, TensorScope::Text);
+                }
+            }
             add(format!("{p}.layer_scalar"), vec![1], TensorScope::Text);
             for (name, shape) in [
                 ("mlp.gate_proj", vec![inter, hidden]),
                 ("mlp.up_proj", vec![inter, hidden]),
                 ("mlp.down_proj", vec![hidden, inter]),
-                ("per_layer_input_gate", vec![ple, hidden]),
-                ("per_layer_projection", vec![hidden, ple]),
                 ("self_attn.q_proj", vec![q_heads * head_dim, hidden]),
                 ("self_attn.o_proj", vec![hidden, q_heads * head_dim]),
             ] {
@@ -633,10 +641,16 @@ impl MappedCheckpoint {
             );
             for (name, shape) in [
                 ("self_attn.k_proj", vec![kv_heads * head_dim, hidden]),
-                ("self_attn.v_proj", vec![kv_heads * head_dim, hidden]),
                 ("self_attn.k_norm", vec![head_dim]),
             ] {
                 add(format!("{p}.{name}.weight"), shape, own);
+            }
+            if ple.is_some() || layer.sliding_window.is_some() {
+                add(
+                    format!("{p}.self_attn.v_proj.weight"),
+                    vec![kv_heads * head_dim, hidden],
+                    own,
+                );
             }
         }
         Ok(())
@@ -2799,6 +2813,18 @@ mod component_tests {
                 54,
                 14_926_026_836,
             ),
+            (
+                include_str!("../tests/data/gemma4-12b-config.json"),
+                666,
+                0,
+                23_814_700_640,
+            ),
+            (
+                include_str!("../tests/data/gemma4-31b-config.json"),
+                832,
+                0,
+                61_394_690_680,
+            ),
         ] {
             let spec = gemma4_spec(text, None)?;
             let mut expected = BTreeMap::new();
@@ -2817,6 +2843,21 @@ mod component_tests {
                 !expected.contains_key("lm_head.weight"),
                 "tied head must not expect lm_head"
             );
+            if spec.per_layer_input.is_none() {
+                ensure!(
+                    !expected.keys().any(|key| key.contains("per_layer")),
+                    "large Gemma manifest contains per-layer input weights"
+                );
+                for (index, layer) in spec.layers.iter().enumerate() {
+                    let name =
+                        format!("model.language_model.layers.{index}.self_attn.v_proj.weight");
+                    ensure!(
+                        expected.contains_key(&name) == layer.sliding_window.is_some(),
+                        "shared projection binding: {name}"
+                    );
+                }
+                continue;
+            }
             MappedCheckpoint::axial_vision_entries(
                 spec.vision.as_ref().context("vision spec")?,
                 &mut expected,
@@ -2854,42 +2895,46 @@ mod component_tests {
     }
 
     #[test]
-    #[ignore = "CPU-only real checkpoint; set FF_MODEL to a Gemma 4 E2B/E4B directory"]
+    #[ignore = "CPU-only real checkpoint; set FF_MODEL to a Gemma 4 directory"]
     fn gemma4_manifest_matches_the_checkpoint_and_rejects_mutants() -> Result<()> {
         let dir =
             std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
         let spec = crate::model_spec::ModelSpec::read(&dir)?;
         let checkpoint = MappedCheckpoint::open(&dir)?;
         let manifest = checkpoint.manifest(&spec, LoadPolicy::TextOnly)?;
-        let vision_manifest = checkpoint.manifest(&spec, LoadPolicy::VisionOnly)?;
-        let expected_vision_bytes = if spec.hidden == 1536 {
-            337_089_408
-        } else {
-            338_662_272
-        };
-        ensure!(
-            vision_manifest.resident_bytes == expected_vision_bytes
-                && vision_manifest
-                    .entries
-                    .values()
-                    .all(|e| e.load == (e.scope == TensorScope::Vision)),
-            "vision allocation plan differs from published tensors"
-        );
-        let mut wrong_geometry = spec.clone();
-        wrong_geometry
-            .vision
-            .as_mut()
-            .context("vision spec")?
-            .intermediate += 16;
-        ensure!(
-            checkpoint
-                .manifest(&wrong_geometry, LoadPolicy::VisionOnly)
-                .is_err(),
-            "checkpoint-derived vision shapes hid a config/weight mismatch"
-        );
+        if spec.vision.is_some() {
+            let vision_manifest = checkpoint.manifest(&spec, LoadPolicy::VisionOnly)?;
+            let expected_vision_bytes = if spec.hidden == 1536 {
+                337_089_408
+            } else {
+                338_662_272
+            };
+            ensure!(
+                vision_manifest.resident_bytes == expected_vision_bytes
+                    && vision_manifest
+                        .entries
+                        .values()
+                        .all(|e| e.load == (e.scope == TensorScope::Vision)),
+                "vision allocation plan differs from published tensors"
+            );
+            let mut wrong_geometry = spec.clone();
+            wrong_geometry
+                .vision
+                .as_mut()
+                .context("vision spec")?
+                .intermediate += 16;
+            ensure!(
+                checkpoint
+                    .manifest(&wrong_geometry, LoadPolicy::VisionOnly)
+                    .is_err(),
+                "checkpoint-derived vision shapes hid a config/weight mismatch"
+            );
+        }
         let (total, vision, audio, dormant, resident) = match spec.hidden {
             1536 => (2011, 659, 752, 60, 9_257_138_758),
             2560 => (2130, 659, 752, 54, 14_926_026_836),
+            3840 => (677, 10, 1, 0, 23_814_700_640),
+            5376 => (1188, 356, 0, 0, 61_394_690_680),
             hidden => bail!("unexpected Gemma 4 hidden size {hidden}"),
         };
         let count = |scope| {

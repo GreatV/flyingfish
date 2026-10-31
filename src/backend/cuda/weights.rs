@@ -961,9 +961,257 @@ impl Loader<'_> {
     }
 }
 
+#[cfg(feature = "cuda")]
+struct DenseRange {
+    span: crate::experts::disk::ReadSpan,
+    source: std::ops::Range<usize>,
+    target: usize,
+}
+
+#[cfg(feature = "cuda")]
+struct DenseLayer {
+    slot: Option<usize>,
+    next: Option<usize>,
+    bytes: usize,
+    ranges: BTreeMap<String, Vec<DenseRange>>,
+    host: Option<PinnedHostSlice<u8>>,
+}
+
+#[cfg(feature = "cuda")]
+struct DenseSlot {
+    device: CudaSlice<u8>,
+    staging: PinnedHostSlice<u8>,
+    ready: cudarc::driver::CudaEvent,
+    retired: cudarc::driver::CudaEvent,
+    retired_valid: bool,
+    layer: Option<usize>,
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) struct DenseStreaming {
+    layers: Vec<DenseLayer>,
+    slots: Vec<DenseSlot>,
+    readers: BTreeMap<String, crate::experts::disk::SpanReader>,
+    read_buffer: crate::experts::disk::AlignedBytes,
+    upload: Arc<CudaStream>,
+    pub plan: crate::prefill::DensePlacement,
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for DenseStreaming {
+    fn drop(&mut self) {
+        let context = self.upload.context();
+        context.record_err(context.synchronize());
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl DenseStreaming {
+    fn new(
+        dir: &Path,
+        manifest: &TensorManifest,
+        plan: crate::prefill::DensePlacement,
+        d: &Device,
+    ) -> Result<Self> {
+        use crate::experts::disk::{AlignedBytes, SpanReader};
+        let mut layers: Vec<_> = plan
+            .slots
+            .iter()
+            .map(|&slot| DenseLayer {
+                slot,
+                next: None,
+                bytes: 0,
+                ranges: BTreeMap::new(),
+                host: None,
+            })
+            .collect();
+        let mut next = None;
+        for (index, layer) in layers.iter_mut().enumerate().rev() {
+            layer.next = next;
+            if layer.slot.is_some() {
+                next = Some(index);
+            }
+        }
+        let mut readers = BTreeMap::new();
+        let mut largest = 0usize;
+        let mut alignment = 4096usize;
+        for entry in manifest
+            .entries
+            .values()
+            .filter(|entry| entry.is_linear_projection() && entry.layer.is_some())
+        {
+            let layer = &mut layers[entry.layer.context("dense layer missing")? as usize];
+            if layer.slot.is_none() {
+                continue;
+            }
+            if !readers.contains_key(&entry.shard) {
+                let reader = SpanReader::open(&dir.join(&entry.shard), true)?;
+                alignment = alignment.max(reader.alignment as usize);
+                readers.insert(entry.shard.clone(), reader);
+            }
+            let offset = entry
+                .data_start
+                .checked_add(entry.data_offsets[0])
+                .context("dense source offset overflow")?;
+            let span = readers[&entry.shard]
+                .plan(&[(offset, entry.bytes as u64)], UPLOAD_CHUNK_BYTES as u64)?
+                .pop()
+                .context("dense disk span missing")?;
+            let begin = usize::try_from(offset - span.begin)?;
+            layer
+                .ranges
+                .entry(entry.shard.clone())
+                .or_default()
+                .push(DenseRange {
+                    span,
+                    source: begin..begin + entry.bytes,
+                    target: layer.bytes,
+                });
+            layer.bytes = layer
+                .bytes
+                .checked_add(entry.bytes)
+                .context("dense layer bytes overflow")?;
+            largest = largest.max(entry.bytes);
+        }
+        let mut read_buffer = AlignedBytes::new(
+            largest
+                .checked_add(2 * alignment)
+                .context("dense disk span overflow")?,
+            alignment,
+        )?;
+        for (index, layer) in layers.iter_mut().enumerate() {
+            if plan.host[index] {
+                let mut host = unsafe { d.ctx.alloc_pinned_with_flags::<u8>(layer.bytes, 0)? };
+                Self::read_layer(&readers, &mut read_buffer, layer, host.as_mut_slice()?)?;
+                layer.host = Some(host);
+            }
+        }
+        let slots = (0..2)
+            .map(|_| {
+                Ok(DenseSlot {
+                    device: d.upload.alloc_zeros::<u8>(plan.slot_bytes)?,
+                    staging: unsafe { d.ctx.alloc_pinned_with_flags::<u8>(plan.slot_bytes, 0)? },
+                    ready: d
+                        .ctx
+                        .new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?,
+                    retired: d
+                        .ctx
+                        .new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?,
+                    retired_valid: false,
+                    layer: None,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            layers,
+            slots,
+            readers,
+            read_buffer,
+            upload: d.upload.clone(),
+            plan,
+        })
+    }
+
+    fn read_layer(
+        readers: &BTreeMap<String, crate::experts::disk::SpanReader>,
+        buffer: &mut crate::experts::disk::AlignedBytes,
+        layer: &DenseLayer,
+        destination: &mut [u8],
+    ) -> Result<()> {
+        ensure!(
+            destination.len() >= layer.bytes,
+            "dense host destination is too small"
+        );
+        for (shard, ranges) in &layer.ranges {
+            let reader = readers.get(shard).context("dense shard reader missing")?;
+            for range in ranges {
+                let source = &reader.read_span(&range.span, UPLOAD_CHUNK_BYTES as u64, buffer)?
+                    [range.source.clone()];
+                ensure!(
+                    source
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .all(|v| u16::from_le_bytes([v[0], v[1]]) & 0x7f80 != 0x7f80),
+                    "nonfinite dense BF16 range"
+                );
+                destination[range.target..range.target + source.len()].copy_from_slice(source);
+            }
+        }
+        Ok(())
+    }
+
+    fn pointer(&self, layer: usize, offset: usize, bytes: usize) -> Result<u64> {
+        let binding = self.layers.get(layer).context("dense layer outside plan")?;
+        ensure!(
+            offset
+                .checked_add(bytes)
+                .is_some_and(|end| end <= binding.bytes),
+            "dense tensor exceeds layer slot"
+        );
+        let slot = &self.slots[binding.slot.context("dense layer is resident")?];
+        Ok(slot.device.device_ptr(&self.upload).0 + offset as u64)
+    }
+
+    fn prefetch(&mut self, index: usize) -> Result<()> {
+        let layer = &self.layers[index];
+        let Some(slot_index) = layer.slot else {
+            return Ok(());
+        };
+        let slot = &mut self.slots[slot_index];
+        if slot.layer == Some(index) {
+            return Ok(());
+        }
+        if slot.retired_valid {
+            self.upload.wait(&slot.retired)?;
+        }
+        let source = if let Some(host) = &layer.host {
+            host.as_slice()?
+        } else {
+            if slot.layer.is_some() {
+                slot.ready.synchronize()?;
+            }
+            let destination = slot.staging.as_mut_slice()?;
+            Self::read_layer(&self.readers, &mut self.read_buffer, layer, destination)?;
+            &destination[..layer.bytes]
+        };
+        let pointer = slot.device.device_ptr(&self.upload).0;
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async(pointer, source, self.upload.cu_stream())?;
+        }
+        slot.ready.record(&self.upload)?;
+        slot.layer = Some(index);
+        Ok(())
+    }
+
+    pub(crate) fn begin(&mut self, layer: usize, stream: &Arc<CudaStream>) -> Result<()> {
+        self.prefetch(layer)?;
+        if let Some(slot) = self.layers[layer].slot {
+            stream.wait(&self.slots[slot].ready)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn end(&mut self, layer: usize, stream: &Arc<CudaStream>) -> Result<()> {
+        if let Some(slot) = self.layers[layer].slot {
+            self.slots[slot].retired.record(stream)?;
+            self.slots[slot].retired_valid = true;
+            if let Some(next) = self.layers[layer].next {
+                self.prefetch(next)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 pub(crate) enum StoredTensor {
     Bf16(CudaSlice<bf16>),
     Bytes(CudaSlice<u8>),
+    #[cfg(feature = "cuda")]
+    Slot {
+        pointer: u64,
+        bytes: usize,
+    },
 }
 impl StoredTensor {
     fn load(loader: &mut Loader<'_>, name: &str, entry: &TensorEntry) -> Result<Self> {
@@ -986,6 +1234,8 @@ impl StoredTensor {
 }
 
 pub(crate) struct WeightCatalog {
+    #[cfg(feature = "cuda")]
+    pub dense: Option<DenseStreaming>,
     pub linear_format: crate::model_spec::LinearFormat,
     pub tensors: BTreeMap<String, StoredTensor>,
     pub manifest: TensorManifest,
@@ -996,6 +1246,150 @@ pub(crate) struct WeightCatalog {
     pub load_wall_ms: f64,
 }
 impl WeightCatalog {
+    #[cfg(feature = "cuda")]
+    pub(crate) fn load_dense(
+        dir: &Path,
+        spec: &crate::model_spec::ModelSpec,
+        d: &Device,
+        transient_bytes: usize,
+        prefix_cache: bool,
+    ) -> Result<Self> {
+        use crate::prefill::DensePlacement;
+        ensure!(
+            spec.moe.is_none() && spec.linear_format.fp8_layout().is_none(),
+            "dense layer streaming requires BF16 dense weights"
+        );
+        let mapped = MappedCheckpoint::open(dir)?;
+        let manifest = mapped.manifest(spec, crate::checkpoint::LoadPolicy::TextOnly)?;
+        let mut layers = vec![0usize; spec.layers.len()];
+        let mut fixed = 0usize;
+        let mut largest_matrix = 0usize;
+        for entry in manifest.entries.values().filter(|e| e.load) {
+            if entry.is_linear_projection()
+                && let Some(layer) = entry.layer
+            {
+                ensure!(entry.dtype == Dtype::BF16, "dense layer matrix is not BF16");
+                layers[layer as usize] = layers[layer as usize]
+                    .checked_add(entry.bytes)
+                    .context("dense layer size overflow")?;
+                largest_matrix = largest_matrix.max(entry.bytes);
+            } else {
+                fixed = fixed
+                    .checked_add(entry.bytes)
+                    .context("dense fixed weights overflow")?;
+            }
+        }
+        let (free, total) = d.ctx.mem_get_info()?;
+        let budget = free
+            .checked_sub(total / 16)
+            .and_then(|n| n.checked_sub(transient_bytes))
+            .and_then(|n| n.checked_sub(fixed))
+            .context("dense fixed weights and workspace exceed VRAM")?;
+        let preliminary = DensePlacement::new(&layers, budget, 0)?;
+        if preliminary.slot_bytes == 0 {
+            return Self::load_inner(
+                dir,
+                spec,
+                d,
+                crate::checkpoint::LoadPolicy::TextOnly,
+                prefix_cache,
+            );
+        }
+        ensure!(
+            !prefix_cache,
+            "prefix-cache identity for streamed dense weights is not bound"
+        );
+        let available_host = usize::try_from(super::calibrate::host_memory(Path::new("/"))?)?;
+        let host_fixed = preliminary
+            .slot_bytes
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(largest_matrix))
+            .and_then(|n| n.checked_add(4 << 30))
+            .context("dense host staging overflow")?;
+        ensure!(
+            available_host >= host_fixed,
+            "dense pinned staging and host reserve exceed available RAM: need={host_fixed} available={available_host}"
+        );
+        let plan = DensePlacement::new(&layers, budget, available_host - host_fixed)?;
+        let memory_bus_bits = d
+            .ctx
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH)?;
+        let copy_engines = d
+            .ctx
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT)?;
+        let mut pci_name = [0i8; 32];
+        unsafe {
+            sys::cuDeviceGetPCIBusId(
+                pci_name.as_mut_ptr(),
+                pci_name.len() as i32,
+                d.ctx.cu_device(),
+            )
+            .result()?;
+        }
+        let pci_name = unsafe { std::ffi::CStr::from_ptr(pci_name.as_ptr()) }.to_str()?;
+        let pci = Path::new("/sys/bus/pci/devices").join(pci_name);
+        let link_speed = std::fs::read_to_string(pci.join("max_link_speed"))
+            .context("probe dense PCIe link speed")?;
+        let link_width: usize = std::fs::read_to_string(pci.join("current_link_width"))
+            .context("probe dense PCIe link width")?
+            .trim()
+            .parse()?;
+        ensure!(
+            link_width > 0 && !link_speed.trim().is_empty(),
+            "invalid dense PCIe capability"
+        );
+        eprintln!(
+            "{}",
+            serde_json::json!({"dense_placement": &plan, "fixed_bytes": fixed, "transient_bytes": transient_bytes, "host_available_bytes": available_host, "copy_engines": copy_engines, "memory_bus_bits": memory_bus_bits, "sms": d.info.sms, "pcie_link_width": link_width, "pcie_max_link_speed": link_speed.trim()})
+        );
+        let started = Instant::now();
+        let dense = DenseStreaming::new(dir, &manifest, plan, d)?;
+        let mut offsets = vec![0; layers.len()];
+        let ((tensors, uploaded), _) =
+            checkpoint_mapped(&mapped, d, Some(&manifest), false, |loader| {
+                let mut tensors = BTreeMap::new();
+                for (name, entry) in &manifest.entries {
+                    if !entry.load {
+                        continue;
+                    }
+                    let value = if entry.is_linear_projection()
+                        && let Some(layer) = entry.layer
+                        && dense.plan.slots[layer as usize].is_some()
+                    {
+                        let layer = layer as usize;
+                        let pointer = dense.pointer(layer, offsets[layer], entry.bytes)?;
+                        offsets[layer] += entry.bytes;
+                        loader.defer(name)?;
+                        StoredTensor::Slot {
+                            pointer,
+                            bytes: entry.bytes,
+                        }
+                    } else {
+                        StoredTensor::load(loader, name, entry)?
+                    };
+                    tensors.insert(name.clone(), value);
+                }
+                Ok((tensors, loader.bytes))
+            })?;
+        ensure!(
+            uploaded == fixed + dense.plan.resident_bytes,
+            "dense resident byte count mismatch"
+        );
+        let bytes = uploaded
+            .checked_add(2 * dense.plan.slot_bytes)
+            .context("dense device extent overflow")?;
+        Ok(Self {
+            dense: Some(dense),
+            linear_format: spec.linear_format,
+            tensors,
+            manifest,
+            bytes,
+            upload_content_sha256: None,
+            upload_hashed_bytes: None,
+            load_wall_ms: elapsed_ms(started),
+        })
+    }
+
     /// Move shared global tensors into the existing Engine weight owner.
     pub fn take_globals(&mut self) -> Result<Weights> {
         let embed_name = if self
@@ -1121,6 +1515,8 @@ impl WeightCatalog {
             }})
         );
         Ok(Self {
+            #[cfg(feature = "cuda")]
+            dense: None,
             linear_format: spec.linear_format,
             tensors,
             manifest,
@@ -1144,6 +1540,209 @@ mod tests {
     use super::*;
     use half::bf16;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    #[ignore = "requires CUDA and a dense streaming window"]
+    fn dense_slots_preserve_native_bytes_across_host_disk_reuse_gpu() -> Result<()> {
+        use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, sys as bs};
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!("ff-dense-slots-{}", std::process::id()));
+        std::fs::create_dir(&root)?;
+        let result = (|| -> Result<()> {
+            let device = Device::new(0)?;
+            let shapes = [vec![257, 264], vec![15360, 3840]];
+            let per_layer = shapes
+                .iter()
+                .map(|s| s.iter().product::<usize>() * 2)
+                .sum::<usize>();
+            let mut header = serde_json::Map::new();
+            let mut offset = 0usize;
+            let mut entries = BTreeMap::new();
+            for layer in 0..4u32 {
+                for (tensor, shape) in shapes.iter().enumerate() {
+                    let name = format!("model.layers.{layer}.matrix{tensor}.weight");
+                    let bytes = shape.iter().product::<usize>() * 2;
+                    header.insert(name.clone(), serde_json::json!({"dtype":"BF16", "shape":shape, "data_offsets":[offset, offset + bytes]}));
+                    entries.insert(
+                        name,
+                        TensorEntry {
+                            dtype: Dtype::BF16,
+                            shape: shape.clone(),
+                            shard: "model.safetensors".into(),
+                            bytes,
+                            load: true,
+                            data_start: 0,
+                            data_offsets: [offset as u64, (offset + bytes) as u64],
+                            scope: crate::checkpoint::TensorScope::Text,
+                            layer: Some(layer),
+                            role: format!("matrix{tensor}.weight"),
+                            scale_name: None,
+                        },
+                    );
+                    offset += bytes;
+                }
+            }
+            let mut header = serde_json::to_vec(&header)?;
+            while !header.len().is_multiple_of(8) {
+                header.push(b' ');
+            }
+            for entry in entries.values_mut() {
+                entry.data_start = 8 + header.len() as u64;
+            }
+            let expected: Vec<Vec<u8>> = (0..4)
+                .map(|layer| {
+                    (0..per_layer / 2)
+                        .flat_map(|i| {
+                            (0x3c00u16 + ((i * 19 + layer * 173) % 1009) as u16).to_le_bytes()
+                        })
+                        .collect()
+                })
+                .collect();
+            let mut file = std::fs::File::create(root.join("model.safetensors"))?;
+            file.write_all(&(header.len() as u64).to_le_bytes())?;
+            file.write_all(&header)?;
+            for bytes in &expected {
+                file.write_all(bytes)?;
+            }
+            file.sync_all()?;
+            drop(file);
+            let manifest = TensorManifest {
+                entries,
+                resident_bytes: per_layer * 4,
+            };
+            let stream = &device.stream;
+            let mut outputs = (0..4)
+                .map(|_| stream.alloc_zeros::<u8>(per_layer))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let blas = CudaBlas::new(stream.clone())?;
+            let (n, k) = (shapes[1][0], shapes[1][1]);
+            let input = stream.clone_htod(
+                &(0..18 * k)
+                    .map(|i| bf16::from_f32(((i * 37 % 997) as f32 - 498.0) / 512.0))
+                    .collect::<Vec<_>>(),
+            )?;
+            let mut products = (0..4)
+                .map(|_| stream.alloc_zeros::<bf16>(18 * n))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let product = |weights: &CudaSlice<u8>, output: &mut CudaSlice<bf16>| -> Result<()> {
+                let weight = unsafe { weights.transmute::<bf16>(per_layer / 2) }
+                    .context("dense test matrix extent")?;
+                let weight = weight.slice(shapes[0].iter().product::<usize>()..);
+                for (start, rows) in [(0, 1), (1, 17)] {
+                    let config = GemmConfig {
+                        transa: bs::cublasOperation_t::CUBLAS_OP_T,
+                        transb: bs::cublasOperation_t::CUBLAS_OP_N,
+                        m: n as i32,
+                        n: rows as i32,
+                        k: k as i32,
+                        alpha: bf16::ONE,
+                        lda: k as i32,
+                        ldb: k as i32,
+                        beta: bf16::ZERO,
+                        ldc: n as i32,
+                    };
+                    unsafe {
+                        blas.gemm(
+                            config,
+                            &weight,
+                            &input.slice(start * k..(start + rows) * k),
+                            &mut output.slice_mut(start * n..(start + rows) * n),
+                        )?;
+                    }
+                }
+                Ok(())
+            };
+            let mut resident_products = Vec::new();
+            for (layer, (values, output)) in expected.iter().zip(&mut outputs).enumerate() {
+                let resident = stream.clone_htod(values)?;
+                stream.memcpy_dtod(&resident, output)?;
+                ensure!(
+                    stream.clone_dtoh(output)? == *values,
+                    "resident native byte baseline differs"
+                );
+                product(&resident, &mut products[layer])?;
+                let values = stream.clone_dtoh(&products[layer])?;
+                ensure!(
+                    values.iter().all(|v| v.is_finite()),
+                    "nonfinite resident product"
+                );
+                resident_products.push(values);
+            }
+            println!("PASS dense_resident layers=4 layer_bytes={per_layer} byte_mismatches=0");
+            for host_layers in [0, 2, 4] {
+                let plan = crate::prefill::DensePlacement::new(
+                    &[per_layer; 4],
+                    2 * per_layer,
+                    host_layers * per_layer,
+                )?;
+                ensure!(
+                    plan.slots.iter().all(Option::is_some),
+                    "streaming gate has a resident layer"
+                );
+                let mut dense = DenseStreaming::new(&root, &manifest, plan, &device)?;
+                for slot in &mut dense.slots {
+                    slot.device = device.upload.clone_htod(&vec![0xcdu8; per_layer + 64])?;
+                }
+                ensure!(
+                    dense.pointer(0, per_layer, 2).is_err(),
+                    "slot overflow control was admitted"
+                );
+                for repeat in 0..3 {
+                    for (layer, output) in outputs.iter_mut().enumerate() {
+                        dense.begin(layer, stream)?;
+                        let source = dense.pointer(layer, 0, per_layer)?;
+                        let target = output.device_ptr(stream).0;
+                        unsafe {
+                            cudarc::driver::result::memcpy_dtod_async(
+                                target,
+                                source,
+                                per_layer,
+                                stream.cu_stream(),
+                            )?;
+                        }
+                        let slot = dense.plan.slots[layer].context("streamed test slot missing")?;
+                        product(&dense.slots[slot].device, &mut products[layer])?;
+                        dense.end(layer, stream)?;
+                    }
+                    for (layer, output) in outputs.iter().enumerate() {
+                        let actual = stream.clone_dtoh(output)?;
+                        ensure!(
+                            actual == expected[layer],
+                            "dense slot bytes differ: host_layers={host_layers} repeat={repeat} layer={layer}"
+                        );
+                        ensure!(
+                            actual != expected[(layer + 2) % 4],
+                            "wrong-slot-generation control is not discriminating"
+                        );
+                        let actual = stream.clone_dtoh(&products[layer])?;
+                        ensure!(
+                            actual == resident_products[layer],
+                            "dense resident/streamed products differ: host_layers={host_layers} repeat={repeat} layer={layer}"
+                        );
+                        ensure!(
+                            actual != resident_products[(layer + 2) % 4],
+                            "wrong-generation product control is not discriminating"
+                        );
+                    }
+                    device.upload.synchronize()?;
+                    for slot in &dense.slots {
+                        let guard = stream.clone_dtoh(&slot.device.slice(per_layer..))?;
+                        ensure!(
+                            guard == [0xcd; 64],
+                            "dense upload overwrote unused slot capacity"
+                        );
+                    }
+                }
+                println!(
+                    "PASS dense_slots host_layers={host_layers} disk_layers={} layers=4 repeats=3 slot_bytes={per_layer} byte_mismatches=0 product_rows=1,17 product_bits=0 wrong_generation=detected bounds=detected tail_guards=preserved",
+                    4 - host_layers
+                );
+            }
+            Ok(())
+        })();
+        std::fs::remove_dir_all(&root)?;
+        result
+    }
 
     fn expert_storage_case(geometry: crate::experts::catalogue::ExpertGeometry) -> Result<()> {
         use crate::experts::plan::Capacity;

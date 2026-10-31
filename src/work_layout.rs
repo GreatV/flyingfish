@@ -133,7 +133,8 @@ impl RowWorkSpec {
                 )
             }
             Architecture::Gemma4 => {
-                let mut head_dim = 0usize;
+                let mut q = 0usize;
+                let mut qkv = 0usize;
                 for layer in &spec.layers {
                     let geometry = layer.geometry.as_ref().with_context(|| {
                         format!(
@@ -141,28 +142,30 @@ impl RowWorkSpec {
                             layer.state_index
                         )
                     })?;
-                    head_dim = head_dim.max(geometry.head_dim as usize);
+                    let q_width = (spec.q_heads as usize)
+                        .checked_mul(geometry.head_dim as usize)
+                        .context("per-layer Q width overflow")?;
+                    let kv_width = (geometry.kv_heads.unwrap_or(spec.kv_heads) as usize)
+                        .checked_mul(geometry.head_dim as usize)
+                        .context("per-layer KV width overflow")?;
+                    let planes = if spec.per_layer_input.is_none() && layer.sliding_window.is_none()
+                    {
+                        1
+                    } else {
+                        2
+                    };
+                    let width = kv_width
+                        .checked_mul(planes)
+                        .and_then(|n| n.checked_add(q_width))
+                        .context("per-layer projection width overflow")?;
+                    q = q.max(q_width);
+                    qkv = qkv.max(width);
                     intermediate = intermediate.max(geometry.intermediate as usize);
                 }
                 if let Some(width) = spec.per_layer_input {
                     intermediate = intermediate.max(spec.layers.len() * width as usize);
                 }
-                let q = (spec.q_heads as usize)
-                    .checked_mul(head_dim)
-                    .context("per-layer Q width overflow")?;
-                let kv = (spec.kv_heads as usize)
-                    .checked_mul(head_dim)
-                    .context("per-layer KV width overflow")?;
-                (
-                    q.checked_add(
-                        kv.checked_mul(2)
-                            .context("per-layer KV projection overflow")?,
-                    )
-                    .context("per-layer projection width overflow")?,
-                    q,
-                    false,
-                    0,
-                )
+                (qkv, q, false, 0)
             }
             Architecture::Qwen35Text | Architecture::MiniCpmV47 => {
                 FullAttentionSpec::from_model(spec)?;
