@@ -1147,10 +1147,12 @@ mod tests {
         use super::super::contracts::{Scratch, TensorMut, view};
         use super::super::decode::{RingDecode, RingDecodeInput};
         use crate::backend::gpu::DevicePtr;
-        ensure!(
-            RingDecode::new(ctx, 16384, 16384, 512, 1.0).is_err(),
-            "ring decode accepted overflowing KV head offsets"
-        );
+        for (heads, kv) in [(1, 1), (16384, 16384)] {
+            ensure!(
+                RingDecode::new(ctx, heads, kv, 512, 1.0).is_err(),
+                "ring decode accepted invalid partial/KV offsets heads={heads} kv={kv}"
+            );
+        }
         let limits: serde_json::Value = serde_json::from_str(include_str!(
             "../../../tests/fixtures/attention_reference.json"
         ))?;

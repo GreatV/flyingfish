@@ -68,7 +68,7 @@ pub(super) struct RingDecodeInput<'a> {
 impl RingDecode {
     pub fn workspace(heads: usize, ring: usize) -> Result<usize> {
         ensure!(
-            heads > 0 && ring >= 32 && ring.is_multiple_of(32),
+            heads > 0 && heads.is_multiple_of(2) && ring >= 32 && ring.is_multiple_of(32),
             "invalid ring decode geometry"
         );
         heads
