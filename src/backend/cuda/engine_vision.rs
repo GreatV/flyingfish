@@ -1134,13 +1134,14 @@ impl VisionRuntime {
         blas: &mut Blas,
         input: &MultimodalInput<'_>,
         capacity: usize,
+        reserve: usize,
     ) -> Result<VisionRequest> {
         match self {
             Self::LayerNorm(tower) => Ok(VisionRequest::LayerNorm(Box::new(
-                tower.prepare(device, blas, input, capacity)?,
+                tower.prepare(device, blas, input, capacity, reserve)?,
             ))),
             Self::Axial(tower) => Ok(VisionRequest::Axial(Box::new(
-                tower.prepare(device, blas, input, capacity)?,
+                tower.prepare(device, blas, input, capacity, reserve)?,
             ))),
         }
     }
@@ -1461,6 +1462,7 @@ impl LayerNormTower {
         blas: &mut Blas,
         input: &MultimodalInput<'_>,
         capacity: usize,
+        reserve: usize,
     ) -> Result<LayerNormRequest> {
         let positions = input.validate(&self.model, capacity)?;
         let packings = VisionPackings::new(&self.geometry, input.grids)?;
@@ -1470,9 +1472,9 @@ impl LayerNormTower {
             "patch packing/input mismatch"
         );
         let (bytes, scratch_bytes) = tower_bytes(&self.geometry, &packings)?;
-        let (free, total) = device.ctx.mem_get_info()?;
+        let (free, _) = device.ctx.mem_get_info()?;
         ensure!(
-            free.checked_sub(total / 16).is_some_and(|n| bytes <= n),
+            free.checked_sub(reserve).is_some_and(|n| bytes <= n),
             "vision tower budget exceeded: required={bytes} free={free}"
         );
         let rows = packing.real_rows();
@@ -2580,6 +2582,7 @@ impl AxialTower {
         blas: &mut Blas,
         input: &MultimodalInput<'_>,
         capacity: usize,
+        reserve: usize,
     ) -> Result<AxialRequest> {
         let positions = input.validate(&self.model, capacity)?;
         let vision = self
@@ -2592,9 +2595,9 @@ impl AxialTower {
             .as_ref()
             .context("axial configuration missing")?;
         let bytes = Self::request_bytes(&self.model, input, capacity)?;
-        let (free, total) = device.ctx.mem_get_info()?;
+        let (free, _) = device.ctx.mem_get_info()?;
         ensure!(
-            free.checked_sub(total / 16).is_some_and(|n| bytes <= n),
+            free.checked_sub(reserve).is_some_and(|n| bytes <= n),
             "axial vision workspace exceeds memory budget: required={bytes} free={free}"
         );
         let rows = positions
@@ -3739,7 +3742,13 @@ mod tests {
                 pixel_values: &pixels,
                 grids: &grids,
             };
-            let request = runtime.prepare(&device, &mut blas, &input, ids.len())?;
+            let request = runtime.prepare(
+                &device,
+                &mut blas,
+                &input,
+                ids.len(),
+                device.ctx.mem_get_info()?.1 / 16,
+            )?;
             let feature_rows = request.prefix.positions.feature_rows();
             let mut trace = crate::trace::Trace::default();
             trace.set_device(&device.info.name)?;
@@ -3869,7 +3878,13 @@ mod tests {
                 pixel_values: &merged_pixels,
                 grids: &merged.grids,
             };
-            let request = runtime.prepare(&device, &mut blas, &input, merged.ids.len())?;
+            let request = runtime.prepare(
+                &device,
+                &mut blas,
+                &input,
+                merged.ids.len(),
+                device.ctx.mem_get_info()?.1 / 16,
+            )?;
             let mut trace = crate::trace::Trace::default();
             trace.set_device(&device.info.name)?;
             let _images = runtime.encode(s, &blas, request, Some(&mut trace))?;
@@ -4909,7 +4924,13 @@ mod tests {
                 pixel_values: &pixels,
                 grids: &grids,
             };
-            let request = runtime.prepare(&device, &mut blas, &input, ids.len())?;
+            let request = runtime.prepare(
+                &device,
+                &mut blas,
+                &input,
+                ids.len(),
+                device.ctx.mem_get_info()?.1 / 16,
+            )?;
             let rows = request.prefix.positions.patch_rows();
             let mut trace = crate::trace::Trace::default();
             trace.set_device(&device.info.name)?;

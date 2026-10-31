@@ -3192,6 +3192,16 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
                 .iter()
                 .map(|&id| if id == image_token { 0 } else { id })
                 .collect();
+            engine.reset()?;
+            let calls = engine.gemma_encoder_calls()?;
+            let rejected = engine.prefill_multimodal(&mixed_input, None).is_err();
+            ensure!(
+                rejected && engine.gemma_encoder_calls()? == calls,
+                "larger media request was not rejected before encoding"
+            );
+            println!(
+                "media_reservation_control larger_request_rejected=true encoder_calls_unchanged=true"
+            );
             drop(engine);
             engine = super::engine::Engine::load_multimodal(
                 &dir,
