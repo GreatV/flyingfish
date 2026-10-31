@@ -237,6 +237,9 @@ pub struct LayerGeometry {
     pub intermediate: u32,
     pub rope: RopeSpec,
     pub kv_reader: bool,
+    /// Per-layer KV head count; absent means the model-wide `kv_heads`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_heads: Option<u32>,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FfnKind {
@@ -1348,7 +1351,10 @@ impl ModelSpec {
             Self::loopvl(&root, &generation)
         } else if root.get("model_type").and_then(Value::as_str) == Some("deepseek_v41") {
             Self::deepseek_v41(&root, &generation)
-        } else if root.get("model_type").and_then(Value::as_str) == Some("gemma4") {
+        } else if matches!(
+            root.get("model_type").and_then(Value::as_str),
+            Some("gemma4" | "gemma4_unified")
+        ) {
             Self::gemma4(&root, &generation)
         } else {
             Self::qwen(&root, &generation)
@@ -1777,11 +1783,19 @@ impl ModelSpec {
         })
     }
     pub fn gemma4(root: &Value, generation: &Value) -> Result<Self> {
+        let unified = root.get("model_type").and_then(Value::as_str) == Some("gemma4_unified");
         for (key, value) in [
-            ("model_type", "gemma4".into()),
+            (
+                "model_type",
+                if unified { "gemma4_unified" } else { "gemma4" }.into(),
+            ),
             (
                 "architectures",
-                serde_json::json!(["Gemma4ForConditionalGeneration"]),
+                serde_json::json!([if unified {
+                    "Gemma4UnifiedForConditionalGeneration"
+                } else {
+                    "Gemma4ForConditionalGeneration"
+                }]),
             ),
             ("tie_word_embeddings", true.into()),
             ("dtype", "bfloat16".into()),
@@ -1809,10 +1823,25 @@ impl ModelSpec {
                 "video_token_id",
                 "vision_config",
                 "vision_soft_tokens_per_image",
-            ],
+            ]
+            .into_iter()
+            .filter(|key| {
+                !unified || !matches!(*key, "eoa_token_id" | "vision_soft_tokens_per_image")
+            })
+            .collect::<Vec<_>>(),
             "gemma4 config",
         )?;
         let t = root.get("text_config").context("missing text_config")?;
+        let ple = integer(t, "hidden_size_per_layer_input")?;
+        ensure!(
+            matches!(ple, 0 | 256),
+            "unsupported Gemma per-layer input width {ple}"
+        );
+        let shared_projection = ple == 0;
+        ensure!(
+            !unified || shared_projection,
+            "unified text does not use per-layer inputs"
+        );
         exact_keys(
             t,
             &[
@@ -1823,7 +1852,11 @@ impl ModelSpec {
                 "dtype",
                 "enable_moe_block",
                 "eos_token_id",
-                "expert_intermediate_size",
+                if unified {
+                    "moe_intermediate_size"
+                } else {
+                    "expert_intermediate_size"
+                },
                 "final_logit_softcapping",
                 "global_head_dim",
                 "head_dim",
@@ -1852,27 +1885,49 @@ impl ModelSpec {
                 "use_double_wide_mlp",
                 "vocab_size",
                 "vocab_size_per_layer_input",
-            ],
+            ]
+            .into_iter()
+            .filter(|key| !unified || *key != "dtype")
+            .collect::<Vec<_>>(),
             "gemma4 text_config",
         )?;
         for (key, value) in [
-            ("model_type", "gemma4_text".into()),
-            ("dtype", "bfloat16".into()),
+            (
+                "model_type",
+                if unified {
+                    "gemma4_unified_text"
+                } else {
+                    "gemma4_text"
+                }
+                .into(),
+            ),
             ("attention_bias", false.into()),
             ("attention_dropout", 0.0.into()),
-            ("attention_k_eq_v", false.into()),
+            ("attention_k_eq_v", shared_projection.into()),
             ("enable_moe_block", false.into()),
-            ("expert_intermediate_size", Value::Null),
+            (
+                if unified {
+                    "moe_intermediate_size"
+                } else {
+                    "expert_intermediate_size"
+                },
+                Value::Null,
+            ),
             ("num_experts", Value::Null),
             ("top_k_experts", Value::Null),
-            ("num_global_key_value_heads", Value::Null),
-            ("use_bidirectional_attention", Value::Null),
+            (
+                "use_bidirectional_attention",
+                if shared_projection {
+                    "vision".into()
+                } else {
+                    Value::Null
+                },
+            ),
             ("hidden_activation", "gelu_pytorch_tanh".into()),
             ("tie_word_embeddings", true.into()),
             ("final_logit_softcapping", 30.0.into()),
             ("head_dim", 256.into()),
             ("global_head_dim", 512.into()),
-            ("hidden_size_per_layer_input", 256.into()),
             ("vocab_size", 262144.into()),
             ("vocab_size_per_layer_input", 262144.into()),
             ("rms_norm_eps", 1e-6.into()),
@@ -1881,6 +1936,15 @@ impl ModelSpec {
             ("use_cache", true.into()),
         ] {
             equal(t, key, value)?;
+        }
+        if !unified {
+            equal(t, "dtype", "bfloat16".into())?;
+        }
+        if shared_projection {
+            equal(t, "num_kv_shared_layers", 0.into())?;
+            equal(t, "use_double_wide_mlp", false.into())?;
+        } else {
+            equal(t, "num_global_key_value_heads", Value::Null)?;
         }
         let rope = t
             .get("rope_parameters")
@@ -1933,8 +1997,12 @@ impl ModelSpec {
         let window = positive(t, "sliding_window")?;
         let q_heads = positive(t, "num_attention_heads")?;
         let kv_heads = positive(t, "num_key_value_heads")?;
+        let global_kv_heads = shared_projection
+            .then(|| positive(t, "num_global_key_value_heads"))
+            .transpose()?;
         ensure!(
-            q_heads.is_multiple_of(kv_heads),
+            q_heads.is_multiple_of(kv_heads)
+                && global_kv_heads.is_none_or(|heads| q_heads.is_multiple_of(heads)),
             "num_attention_heads is not a multiple of num_key_value_heads"
         );
         let double_wide = t
@@ -1989,6 +2057,7 @@ impl ModelSpec {
                     },
                     rope: if full { global } else { sliding },
                     kv_reader: reader,
+                    kv_heads: if full { global_kv_heads } else { None },
                 }),
             });
         }
@@ -2023,8 +2092,12 @@ impl ModelSpec {
             glm5_next: None,
             deepseek_v41: None,
             logit_softcap: Some(30.0),
-            per_layer_input: Some(256),
-            vision: VisionConfig::from_root(root)?,
+            per_layer_input: (ple != 0).then_some(ple),
+            vision: if ple != 0 {
+                VisionConfig::from_root(root)?
+            } else {
+                None
+            },
         })
     }
     pub fn glm5_next(root: &Value, generation: &Value) -> Result<Self> {

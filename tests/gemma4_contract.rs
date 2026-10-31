@@ -11,6 +11,65 @@ use serde_json::{Value, json};
 const E2B: &str = include_str!("data/gemma4-e2b-config.json");
 const E4B: &str = include_str!("data/gemma4-e4b-config.json");
 
+#[test]
+fn large_gemma_geometry_preserves_global_kv_and_absent_per_layer_inputs() -> Result<()> {
+    for (text, hidden, depth, heads, kv, global_kv) in [
+        (
+            include_str!("data/gemma4-12b-config.json"),
+            3840,
+            48,
+            16,
+            8,
+            1,
+        ),
+        (
+            include_str!("data/gemma4-31b-config.json"),
+            5376,
+            60,
+            32,
+            16,
+            4,
+        ),
+    ] {
+        let (root, spec) = read(text)?;
+        ensure!(
+            spec.hidden == hidden
+                && spec.layers.len() == depth
+                && spec.q_heads == heads
+                && spec.kv_heads == kv
+                && spec.per_layer_input.is_none(),
+            "large Gemma geometry"
+        );
+        for (index, layer) in spec.layers.iter().enumerate() {
+            let geometry = geometry(&spec, index)?;
+            let full = root["text_config"]["layer_types"][index] == "full_attention";
+            ensure!(
+                geometry.kv_heads == full.then_some(global_kv)
+                    && geometry.head_dim == if full { 512 } else { 256 }
+                    && !geometry.kv_reader
+                    && layer.state_index as usize == index
+                    && layer.sliding_window == (!full).then_some(1024)
+                    && layer_program(&spec, index)?.len() == 5,
+                "layer {index}: {layer:?}"
+            );
+        }
+        for (key, value) in [
+            ("num_global_key_value_heads", json!(3)),
+            ("num_kv_shared_layers", json!(1)),
+            ("attention_k_eq_v", json!(false)),
+            ("hidden_size_per_layer_input", json!(256)),
+        ] {
+            let mut mutant = root.clone();
+            mutant["text_config"][key] = value;
+            ensure!(
+                ModelSpec::gemma4(&mutant, &Value::Null).is_err(),
+                "accepted {key} mutant"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn read(text: &str) -> Result<(Value, ModelSpec)> {
     let root: Value = serde_json::from_str(text)?;
     let spec = ModelSpec::gemma4(&root, &json!({"eos_token_id": 1}))?;
