@@ -726,7 +726,6 @@ impl Flash {
         );
         ensure!(
             mode == 0
-            mode == 0
                 || image_blocks.is_some()
                 || (shape.window_left.is_none()
                     && (self.native.len() > mode || bidirectional_only)),
