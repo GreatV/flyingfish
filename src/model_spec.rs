@@ -397,6 +397,8 @@ impl AudioConfig {
             "unsupported audio token identities"
         );
         Ok(Some(spec))
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MiniCpmVision {
@@ -1529,7 +1531,7 @@ impl ModelSpec {
                 "silu"
             }
             .into(),
-            tie_word_embeddings: false,
+            tie_word_embeddings: self.architecture == Architecture::Gemma4,
             torch_dtype: "bfloat16".into(),
             eos_token_id: self.eos.clone(),
             attention_bias: false,

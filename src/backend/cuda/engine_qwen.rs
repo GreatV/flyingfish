@@ -535,11 +535,14 @@ impl GlmDsaOutputs {
 
 fn require_gemma_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
     ensure!(
-        spec.architecture == crate::model_spec::Architecture::Gemma4
-            && spec.linear_format == crate::model_spec::LinearFormat::Bf16
+        matches!(
+            spec.architecture,
+            crate::model_spec::Architecture::Gemma4
+                | crate::model_spec::Architecture::EmbeddingGemma2
+        ) && spec.linear_format == crate::model_spec::LinearFormat::Bf16
             && spec.moe.is_none()
             && spec.gdn.is_none()
-            && matches!(spec.per_layer_input, None | Some(256)),
+            && matches!(spec.per_layer_input, None | Some(256) | Some(512)),
         "unsupported Gemma 4 execution geometry"
     );
     for layer in &spec.layers {
@@ -549,6 +552,14 @@ fn require_gemma_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
             .context("Gemma 4 layer geometry missing")?;
         let full = g.head_dim == 512;
         let kv_heads = g.kv_heads.unwrap_or(spec.kv_heads);
+        let pairs = if full && spec.architecture != crate::model_spec::Architecture::EmbeddingGemma2
+        {
+            64
+        } else if full {
+            256
+        } else {
+            128
+        };
         ensure!(
             (full || g.head_dim == 256)
                 && kv_heads > 0
@@ -558,7 +569,7 @@ fn require_gemma_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
                 && g.intermediate > 0
                 && g.rope.pair_stride == g.head_dim / 2
                 && g.rope.denominator == g.head_dim
-                && g.rope.pairs == if full { 64 } else { 128 },
+                && g.rope.pairs == pairs,
             "unsupported Gemma 4 layer geometry: {g:?}"
         );
     }
@@ -575,6 +586,8 @@ struct GemmaOps {
     shared_rope: CudaFunction,
     branch_add: CudaFunction,
     rope_tables: [CudaSlice<bf16>; 2],
+    embedding_projection: Option<(Tensor<bf16, 2>, CudaFunction)>,
+    embedding_normalize: Option<CudaFunction>,
     ple: Option<PerLayerInputs>,
     #[cfg(test)]
     logits: CudaSlice<bf16>,
@@ -586,13 +599,29 @@ struct GemmaOps {
 
 struct PerLayerInputs {
     combine: CudaFunction,
-    table: Tensor<bf16, 2>,
+    table: Option<Tensor<bf16, 2>>,
     projection: Tensor<bf16, 2>,
     norm: Tensor<bf16, 1>,
     inputs: CudaSlice<bf16>,
 }
 
-fn sliding_kv_stage_elements(model: &crate::model_spec::ModelSpec, rows: usize) -> Result<usize> {
+fn attention_kv_stage_elements(
+    model: &crate::model_spec::ModelSpec,
+    rows: usize,
+    capacity: usize,
+) -> Result<usize> {
+    if model.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
+        return model.layers.iter().try_fold(0usize, |largest, layer| {
+            let geometry = layer.geometry.context("attention KV geometry missing")?;
+            let width = (geometry.kv_heads.unwrap_or(model.kv_heads) as usize)
+                .checked_mul(geometry.head_dim as usize)
+                .context("KV staging width overflow")?;
+            capacity
+                .checked_mul(width)
+                .map(|n| largest.max(n))
+                .context("KV staging extent overflow")
+        });
+    }
     model.layers.iter().try_fold(0usize, |largest, layer| {
         let Some(window) = layer.sliding_window else {
             return Ok(largest);
@@ -1200,7 +1229,11 @@ impl Runtime {
                 )?;
             return Ok(usize::try_from(decode.max(prefill).div_ceil(256) * 256)?);
         }
-        if model.architecture == crate::model_spec::Architecture::Gemma4 {
+        if matches!(
+            model.architecture,
+            crate::model_spec::Architecture::Gemma4
+                | crate::model_spec::Architecture::EmbeddingGemma2
+        ) {
             let stream = stream.context("Gemma workspace admission requires a device stream")?;
             let layers = model.layers.len();
             let per_layer_input = model.per_layer_input.unwrap_or(0) as usize;
@@ -1225,7 +1258,7 @@ impl Runtime {
                 .checked_add(total)
                 .context("Flash admission bytes overflow")
             })?;
-            let staging = sliding_kv_stage_elements(model, rows)?
+            let staging = attention_kv_stage_elements(model, rows, capacity)?
                 .checked_mul(4)
                 .context("KV staging admission bytes overflow")?;
             let decode = RingDecode::workspace(
@@ -1245,7 +1278,13 @@ impl Runtime {
                     .filter_map(|layer| layer.geometry.map(|g| g.intermediate as usize))
                     .max()
                     .context("Gemma diagnostic intermediate missing")?;
-                rows.checked_mul(model.vocab as usize + 2 * intermediate)
+                let vocabulary =
+                    if model.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
+                        0
+                    } else {
+                        model.vocab as usize
+                    };
+                rows.checked_mul(vocabulary + 2 * intermediate)
                     .and_then(|n| n.checked_mul(size_of::<bf16>()))
                     .context("Gemma diagnostic bytes overflow")?
             };
@@ -1340,7 +1379,11 @@ impl Runtime {
         let s = &engine.device.stream;
         let rows = engine.workspace_rows;
         let flint = engine.model_spec.architecture == crate::model_spec::Architecture::Flint;
-        let gemma = engine.model_spec.architecture == crate::model_spec::Architecture::Gemma4;
+        let gemma = matches!(
+            engine.model_spec.architecture,
+            crate::model_spec::Architecture::Gemma4
+                | crate::model_spec::Architecture::EmbeddingGemma2
+        );
         let attention = if flint
             || gemma
             || engine.model_spec.architecture == crate::model_spec::Architecture::Glm5Next
@@ -1471,34 +1514,72 @@ impl Runtime {
                 branch_add: cubin::module(&engine.device.ctx, "q38_common")?
                     .load_function("rms_branch_add")?,
                 rope_tables,
+                embedding_projection: if engine.model_spec.architecture
+                    == crate::model_spec::Architecture::EmbeddingGemma2
+                {
+                    Some((
+                        matrix(
+                            catalog.bf16("language_model.embedding_projection.weight")?,
+                            s,
+                            0,
+                            768,
+                            engine.model_spec.hidden as usize,
+                        )?,
+                        embed.load_function("mean_pool_l2")?,
+                    ))
+                } else {
+                    None
+                },
+                embedding_normalize: if engine.model_spec.architecture
+                    == crate::model_spec::Architecture::EmbeddingGemma2
+                {
+                    Some(embed.load_function("l2_normalize")?)
+                } else {
+                    None
+                },
                 ple: engine
                     .model_spec
                     .per_layer_input
                     .map(|width| -> Result<_> {
                         let width = width as usize;
+                        let embedding = engine.model_spec.architecture
+                            == crate::model_spec::Architecture::EmbeddingGemma2;
                         Ok(PerLayerInputs {
-                            combine: embed.load_function("per_layer_input")?,
-                            table: matrix(
-                                catalog
-                                    .bf16("model.language_model.embed_tokens_per_layer.weight")?,
-                                s,
-                                0,
-                                engine.model_spec.vocab as usize,
-                                depth * width,
-                            )?,
+                            combine: if embedding {
+                                embed.load_function("per_layer_projection")?
+                            } else {
+                                embed.load_function("per_layer_input")?
+                            },
+                            table: if embedding {
+                                None
+                            } else {
+                                Some(matrix(
+                                    catalog.bf16(
+                                        "model.language_model.embed_tokens_per_layer.weight",
+                                    )?,
+                                    s,
+                                    0,
+                                    engine.model_spec.vocab as usize,
+                                    depth * width,
+                                )?)
+                            },
                             projection: matrix(
-                                catalog.bf16(
-                                    "model.language_model.per_layer_model_projection.weight",
-                                )?,
+                                catalog.bf16(if embedding {
+                                    "language_model.ple.per_layer_model_projection.weight"
+                                } else {
+                                    "model.language_model.per_layer_model_projection.weight"
+                                })?,
                                 s,
                                 0,
                                 depth * width,
                                 engine.model_spec.hidden as usize,
                             )?,
                             norm: vector(
-                                catalog.bf16(
-                                    "model.language_model.per_layer_projection_norm.weight",
-                                )?,
+                                catalog.bf16(if embedding {
+                                    "language_model.ple.per_layer_projection_norm.weight"
+                                } else {
+                                    "model.language_model.per_layer_projection_norm.weight"
+                                })?,
                                 s,
                             )?,
                             inputs: s.alloc_zeros(rows * depth * width)?,
@@ -1506,7 +1587,15 @@ impl Runtime {
                     })
                     .transpose()?,
                 #[cfg(test)]
-                logits: s.alloc_zeros(rows * engine.model_spec.vocab as usize)?,
+                logits: s.alloc_zeros(
+                    if engine.model_spec.architecture
+                        == crate::model_spec::Architecture::EmbeddingGemma2
+                    {
+                        0
+                    } else {
+                        rows * engine.model_spec.vocab as usize
+                    },
+                )?,
                 #[cfg(test)]
                 mlp_ones: s.clone_htod(&vec![bf16::ONE; mlp_elements])?,
                 #[cfg(test)]
@@ -1516,14 +1605,10 @@ impl Runtime {
             None
         };
         for (i, layout) in engine.model_spec.layers.iter().enumerate() {
-            let prefix = if flint {
-                format!("model.layers.{i}.")
-            } else {
-                format!("model.language_model.layers.{i}.")
-            };
-            let weight = |name: &str| vector(catalog.bf16(&format!("{prefix}{name}"))?, s);
             let plan =
                 LayerDequantPlan::from_model(&catalog.manifest, i as u32, &engine.model_spec)?;
+            let prefix = plan.prefix.clone();
+            let weight = |name: &str| vector(catalog.bf16(&format!("{prefix}{name}"))?, s);
             let arena_view = arena.as_ref().map(|b| scratch(b, s));
             let mut linear = LayerLinearPlan::bind(&plan, &catalog, arena_view.as_ref(), s)?;
             let ffn = BoundFfn::bind(&engine.model_spec, &mut linear)?;
@@ -1616,7 +1701,10 @@ impl Runtime {
                             )?,
                             engine.capacity,
                         )?;
-                        let position_limit = if layout.sliding_window.is_some() {
+                        let position_limit = if layout.sliding_window.is_some()
+                            && engine.model_spec.architecture
+                                != crate::model_spec::Architecture::EmbeddingGemma2
+                        {
                             engine.state.kv_ring(layout.state_index as usize)?
                         } else {
                             engine.capacity - 1
@@ -1964,7 +2052,17 @@ impl Runtime {
                     .then(|| weight("post_feedforward_layernorm.weight"))
                     .transpose()?,
                 post_ple_norm: (gemma && engine.model_spec.per_layer_input.is_some())
-                    .then(|| weight("post_per_layer_input_norm.weight"))
+                    .then(|| {
+                        weight(
+                            if engine.model_spec.architecture
+                                == crate::model_spec::Architecture::EmbeddingGemma2
+                            {
+                                "ple_block.post_per_layer_input_norm.weight"
+                            } else {
+                                "post_per_layer_input_norm.weight"
+                            },
+                        )
+                    })
                     .transpose()?,
                 layer_scalar: gemma.then(|| weight("layer_scalar")).transpose()?,
                 produces_next_norm,
@@ -2462,7 +2560,11 @@ impl Engine {
         );
         self.prepare_multimodal(input, trace.as_deref_mut())?;
         let identities;
-        let ids = if self.model_spec.architecture == crate::model_spec::Architecture::Gemma4 {
+        let ids = if matches!(
+            self.model_spec.architecture,
+            crate::model_spec::Architecture::Gemma4
+                | crate::model_spec::Architecture::EmbeddingGemma2
+        ) {
             let image = self
                 .model_spec
                 .vision
@@ -2497,6 +2599,32 @@ impl Engine {
         result
     }
 
+    pub(super) fn embedding_projection(
+        &self,
+    ) -> Result<(Tensor<bf16, 2>, CudaFunction, CudaFunction)> {
+        let (weight, pool) = self
+            .qwen
+            .as_ref()
+            .context("Gemma runtime missing")?
+            .gemma
+            .as_ref()
+            .context("Gemma operations missing")?
+            .embedding_projection
+            .as_ref()
+            .context("embedding projection missing")?;
+        let normalize = self
+            .qwen
+            .as_ref()
+            .context("Gemma runtime missing")?
+            .gemma
+            .as_ref()
+            .context("Gemma operations missing")?
+            .embedding_normalize
+            .as_ref()
+            .context("embedding normalize missing")?;
+        Ok((*weight, pool.clone(), normalize.clone()))
+    }
+
     pub(super) fn multimodal_request_bytes(
         model: &crate::model_spec::ModelSpec,
         input: &crate::vision_input::MultimodalInput<'_>,
@@ -2518,19 +2646,30 @@ impl Engine {
             .checked_mul(model.hidden as usize)
             .and_then(|n| n.checked_mul(2))
             .context("media feature bytes overflow")?;
-        let request_bytes = audio_bytes
-            .checked_add(vision_bytes)
-            .and_then(|n| n.checked_add(if vision_bytes == 0 { feature_bytes } else { 0 }))
-            .and_then(|n| {
-                if model.per_layer_input.is_none()
-                    && model.architecture == crate::model_spec::Architecture::Gemma4
-                    && !plan.slots().is_empty()
-                {
-                    n.checked_add(capacity.checked_mul(8).context("image block bytes overflow")?)
-                } else {
-                    Some(n)
-                }
-            })
+        let audio_peak = if audio_bytes == 0 {
+            0
+        } else {
+            audio_bytes
+                .checked_add(feature_bytes)
+                .context("audio request bytes overflow")?
+        };
+        let block_bytes = if model.per_layer_input.is_none()
+            && matches!(
+                model.architecture,
+                crate::model_spec::Architecture::Gemma4
+                    | crate::model_spec::Architecture::EmbeddingGemma2
+            )
+            && !plan.slots().is_empty()
+        {
+            capacity
+                .checked_mul(8)
+                .context("image block bytes overflow")?
+        } else {
+            0
+        };
+        let request_bytes = vision_bytes
+            .max(audio_peak)
+            .checked_add(block_bytes)
             .context("media request bytes overflow")?;
         Ok((audio_bytes, vision_bytes, request_bytes))
     }
@@ -2612,8 +2751,11 @@ impl Engine {
                 q.audio_encode_calls += input.audio.len();
             }
         }
-        if self.model_spec.architecture == crate::model_spec::Architecture::Gemma4
-            && self.model_spec.per_layer_input.is_none()
+        if matches!(
+            self.model_spec.architecture,
+            crate::model_spec::Architecture::Gemma4
+                | crate::model_spec::Architecture::EmbeddingGemma2
+        ) && self.model_spec.per_layer_input.is_none()
             && !plan.slots().is_empty()
         {
             ensure!(
@@ -2811,7 +2953,10 @@ impl Engine {
         match model_spec.architecture {
             crate::model_spec::Architecture::Flint => require_flint_geometry(&model_spec)?,
             crate::model_spec::Architecture::Glm5Next => require_glm_geometry(&model_spec)?,
-            crate::model_spec::Architecture::Gemma4 => require_gemma_geometry(&model_spec)?,
+            crate::model_spec::Architecture::Gemma4
+            | crate::model_spec::Architecture::EmbeddingGemma2 => {
+                require_gemma_geometry(&model_spec)?
+            }
             _ => require_qwen35_geometry(&model_spec)?,
         }
         let write = mode.writes();
@@ -2848,7 +2993,20 @@ impl Engine {
         let started = Instant::now();
         let flint = model_spec.architecture == crate::model_spec::Architecture::Flint;
         let glm = model_spec.architecture == crate::model_spec::Architecture::Glm5Next;
-        let gemma = model_spec.architecture == crate::model_spec::Architecture::Gemma4;
+        let gemma = matches!(
+            model_spec.architecture,
+            crate::model_spec::Architecture::Gemma4
+                | crate::model_spec::Architecture::EmbeddingGemma2
+        );
+        if model_spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
+            ensure!(
+                !settings.prefix_cache
+                    && settings.draft_model.is_none()
+                    && !reserve_mtp
+                    && settings.kv_format == crate::kv::KvFormat::Bf16,
+                "EmbeddingGemma-2 supports only resident BF16 whole-input embedding"
+            );
+        }
         let attention = if flint || glm || gemma {
             None
         } else {
@@ -3051,16 +3209,17 @@ impl Engine {
                 s.alloc_zeros::<bf16>(capacity * kv_width as usize)?,
             ))
         };
-        let capture_checkpoint = if glm {
-            None
-        } else {
-            Some(super::super::state::StateCheckpoint::new(
-                &state,
-                &model_spec,
-                1,
-                s,
-            )?)
-        };
+        let capture_checkpoint =
+            if glm || model_spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
+                None
+            } else {
+                Some(super::super::state::StateCheckpoint::new(
+                    &state,
+                    &model_spec,
+                    1,
+                    s,
+                )?)
+            };
         #[cfg(feature = "cuda")]
         let arena_bytes = (0..model_spec.layers.len())
             .map(|i| {
@@ -3363,7 +3522,7 @@ impl Engine {
         };
         if flint || gemma {
             let elements = if gemma {
-                sliding_kv_stage_elements(&model_spec, rows)?
+                attention_kv_stage_elements(&model_spec, rows, capacity)?
             } else {
                 (512 + rows)
                     .checked_mul(kv_width as usize)
@@ -5027,20 +5186,31 @@ impl Engine {
                 let ring = self.state.kv_ring(state_index)?;
                 let sliding = layout.sliding_window.is_some();
                 let decode = phase == ExecutionPhase::Decode;
-                let overflow = sliding && !decode && self.position + rows > ring;
+                let embedding = self.model_spec.architecture
+                    == crate::model_spec::Architecture::EmbeddingGemma2;
+                let overflow = !embedding && sliding && !decode && self.position + rows > ring;
                 let history = if overflow { self.position.min(ring) } else { 0 };
-                let cache_capacity = if overflow {
+                let cache_capacity = if embedding {
+                    self.capacity
+                } else if overflow {
                     ring + self.workspace_rows
                 } else {
                     ring
                 };
                 {
                     let kv = &mut self.state.kv[state_index];
-                    let (stage_k, stage_v) = if overflow {
+                    let (stage_k, stage_v) = if overflow || embedding {
                         let (stage_k, stage_v) = q
                             .kv_scratch
                             .as_mut()
-                            .context("sliding KV staging is not bound")?;
+                            .context("attention KV staging is not bound")?;
+                        if embedding {
+                            ensure!(
+                                stage_k.len() >= self.capacity * kv_width
+                                    && stage_v.len() == stage_k.len(),
+                                "bidirectional KV staging extent differs from the setup plan"
+                            );
+                        }
                         if !reader && history > 0 {
                             for (source, target) in [(&kv.k, &mut *stage_k), (&kv.v, &mut *stage_v)]
                             {
@@ -5186,8 +5356,15 @@ impl Engine {
                             kv_heads: hkv,
                             capacity: cache_capacity,
                             head_dim: d,
-                            causal: true,
-                            window_left: layout.sliding_window.map(|window| window as usize - 1),
+                            causal: self.model_spec.architecture
+                                != crate::model_spec::Architecture::EmbeddingGemma2,
+                            window_left: if self.model_spec.architecture
+                                == crate::model_spec::Architecture::EmbeddingGemma2
+                            {
+                                layout.sliding_window.map(|window| window as usize)
+                            } else {
+                                layout.sliding_window.map(|window| window as usize - 1)
+                            },
                         };
                         if !decode
                             && layout.sliding_window.is_some()
@@ -5912,9 +6089,15 @@ impl Engine {
                 .arg(&self.model_spec.rms_eps)
                 .launch(grid(rows, 256))?;
         }
+        let ple_module =
+            if self.model_spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
+                "ple_block."
+            } else {
+                ""
+            };
         layer.linear.run(
             &self.blas,
-            "per_layer_input_gate.weight",
+            &format!("{ple_module}per_layer_input_gate.weight"),
             phase,
             matrix(&w.x, s, 0, linear_rows, h)?,
             &mut TensorMut(matrix(&w.gu, s, 0, linear_rows, width)?),
@@ -5962,7 +6145,7 @@ impl Engine {
                 s,
                 &debug_name(trace, i, "ple_identity"),
                 &ple.inputs,
-                ple.inputs.len() / width,
+                linear_rows * self.model_spec.layers.len(),
                 width,
             )?;
         }
@@ -5978,7 +6161,7 @@ impl Engine {
         }
         layer.linear.run(
             &self.blas,
-            "per_layer_projection.weight",
+            &format!("{ple_module}per_layer_projection.weight"),
             phase,
             matrix(&w.act, s, 0, linear_rows, width)?,
             &mut TensorMut(matrix(&w.out, s, 0, linear_rows, h)?),
@@ -6019,7 +6202,11 @@ impl Engine {
         use crate::backend::Operator as O;
         let q = self.qwen.as_mut().context("Q38 runtime missing")?;
         let flint = self.model_spec.architecture == crate::model_spec::Architecture::Flint;
-        let gemma = self.model_spec.architecture == crate::model_spec::Architecture::Gemma4;
+        let gemma = matches!(
+            self.model_spec.architecture,
+            crate::model_spec::Architecture::Gemma4
+                | crate::model_spec::Architecture::EmbeddingGemma2
+        );
         let layer = &q.layers[i];
         let s = &self.device.stream;
         let w = &mut self.work;
@@ -6111,25 +6298,45 @@ impl Engine {
                     let identity_scale = bf16::from_f32((width as f32).sqrt()).to_f32();
                     let context_scale = bf16::from_f32(1.0 / (h as f32).sqrt()).to_f32();
                     let combine_scale = bf16::from_f32(std::f32::consts::FRAC_1_SQRT_2).to_f32();
+                    let table_ptr = ple.table.as_ref().map_or(0, |table| table.ptr);
                     unsafe {
-                        s.launch_builder(&ple.combine)
-                            .arg(ids)
-                            .arg(&ple.table.ptr)
-                            .arg(&w.gu)
-                            .arg(&ple.norm.ptr)
-                            .arg(&mut ple.inputs)
-                            .arg(&(linear_rows as i32))
-                            .arg(&(depth as i32))
-                            .arg(&(width as i32))
-                            .arg(&identity_scale)
-                            .arg(&context_scale)
-                            .arg(&combine_scale)
-                            .arg(&self.model_spec.rms_eps)
-                            .launch(LaunchConfig {
-                                grid_dim: ((linear_rows * depth) as u32, 1, 1),
-                                block_dim: (128, 1, 1),
-                                shared_mem_bytes: 0,
-                            })?;
+                        if self.model_spec.architecture
+                            == crate::model_spec::Architecture::EmbeddingGemma2
+                        {
+                            s.launch_builder(&ple.combine)
+                                .arg(&w.gu)
+                                .arg(&ple.norm.ptr)
+                                .arg(&mut ple.inputs)
+                                .arg(&(linear_rows as i32))
+                                .arg(&(depth as i32))
+                                .arg(&(width as i32))
+                                .arg(&context_scale)
+                                .arg(&self.model_spec.rms_eps)
+                                .launch(LaunchConfig {
+                                    grid_dim: ((linear_rows * depth) as u32, 1, 1),
+                                    block_dim: (128, 1, 1),
+                                    shared_mem_bytes: 0,
+                                })?;
+                        } else {
+                            s.launch_builder(&ple.combine)
+                                .arg(ids)
+                                .arg(&table_ptr)
+                                .arg(&w.gu)
+                                .arg(&ple.norm.ptr)
+                                .arg(&mut ple.inputs)
+                                .arg(&(linear_rows as i32))
+                                .arg(&(depth as i32))
+                                .arg(&(width as i32))
+                                .arg(&identity_scale)
+                                .arg(&context_scale)
+                                .arg(&combine_scale)
+                                .arg(&self.model_spec.rms_eps)
+                                .launch(LaunchConfig {
+                                    grid_dim: ((linear_rows * depth) as u32, 1, 1),
+                                    block_dim: (128, 1, 1),
+                                    shared_mem_bytes: 0,
+                                })?;
+                        }
                     }
                 }
             }

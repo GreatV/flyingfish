@@ -610,6 +610,12 @@ impl StateStore {
             format == crate::kv::KvFormat::Bf16 || (spec.kv_heads == 4 && spec.head_dim == 256),
             "compact cache requires four256-wide KV heads"
         );
+        ensure!(
+            spec.architecture != crate::model_spec::Architecture::EmbeddingGemma2
+                || format == crate::kv::KvFormat::Bf16,
+            "EmbeddingGemma-2 uses BF16 attention scratch"
+        );
+        let embedding = spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2;
         let mut kv = Vec::new();
         let mut kv_rings = Vec::new();
         let mut gdn = Vec::new();
@@ -669,8 +675,16 @@ impl StateStore {
                     let layout =
                         format.layout(layer_capacity, heads as usize, head_dim as usize)?;
                     kv.push(Kv {
-                        k: stream.alloc_zeros::<bf16>(layout.ring_elements)?,
-                        v: stream.alloc_zeros::<bf16>(layout.ring_elements)?,
+                        k: stream.alloc_zeros::<bf16>(if embedding {
+                            0
+                        } else {
+                            layout.ring_elements
+                        })?,
+                        v: stream.alloc_zeros::<bf16>(if embedding {
+                            0
+                        } else {
+                            layout.ring_elements
+                        })?,
                         compact: if format == crate::kv::KvFormat::Bf16 {
                             None
                         } else {
@@ -697,6 +711,7 @@ impl StateStore {
             || spec.architecture == crate::model_spec::Architecture::Flint
             || spec.architecture == crate::model_spec::Architecture::DeepseekV41
             || spec.architecture == crate::model_spec::Architecture::Gemma4
+            || spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2
         {
             Some(stream.clone_htod(&[0i32, 1, 1, capacity as i32, 1, 0, 0, 0])?)
         } else {

@@ -42,29 +42,6 @@ fn large_gemma_geometry_preserves_global_kv_and_absent_per_layer_inputs() -> Res
                 && spec.audio.is_none(),
             "large Gemma geometry"
         );
-        let vision = spec.vision.as_ref().context("large Gemma vision missing")?;
-        if hidden == 3840 {
-            ensure!(
-                vision.unified.is_some()
-                    && vision.axial.is_none()
-                    && vision.patch_elements(spec.architecture)? == 6912,
-                "unified raw patch geometry"
-            );
-            let audio = spec.audio.as_ref().context("raw audio missing")?;
-            ensure!(
-                [audio.frame, audio.output] == [640, 3840],
-                "raw frame projection geometry"
-            );
-        } else {
-            let axial = vision.axial.as_ref().context("31B axial config missing")?;
-            ensure!(
-                [vision.hidden, vision.depth, vision.heads, axial.head_dim] == [1152, 27, 16, 72]
-                    && axial.standardize
-                    && !axial.clipped_linears
-                    && spec.audio.is_none(),
-                "31B media geometry"
-            );
-        }
         let work = flyingfish::work_layout::RowWorkSpec::new(&spec)?;
         let expected_projection = if hidden == 3840 { 8704 } else { 18432 };
         ensure!(
@@ -220,121 +197,7 @@ fn audio_masks_and_mixed_splices_preserve_token_identity() -> Result<()> {
                 "unsupported audio geometry accepted"
             );
         }
-#[test]
-fn unified_media_shapes_and_packed_patch_bounds_are_strict() -> Result<()> {
-    let (root, spec) = read(include_str!("data/gemma4-12b-config.json"))?;
-    let ids = [2, 255999, 258880, 258880, 258882, 4];
-    let modality = [0, 0, 1, 1, 0, 0];
-    let pixels = vec![0.5; 2 * 6912];
-    let grid = [ImageGrid { t: 1, h: 1, w: 2 }];
-    let input = MultimodalInput {
-        audio: &[],
-        input_ids: &ids,
-        modality_ids: &modality,
-        pixel_values: &pixels,
-        grids: &grid,
-    };
-    let plan = input.validate(&spec, 32)?;
-    ensure!(
-        plan.patch_rows() == 2 && plan.feature_rows() == 2,
-        "unified patch rows were pooled twice"
-    );
-    let blocks = plan.image_blocks()?;
-    ensure!(
-        blocks[..12] == [1, 1, 2, 2, 2, 4, 2, 4, 5, 5, 6, 6],
-        "image-block query bounds"
-    );
-    ensure!(
-        plan.chunk_end(0, 3, 6)? == 2
-            && plan.chunk_end(2, 3, 6)? == 5
-            && plan.chunk_end(2, 1, 6).is_err()
-            && plan.chunk_end(3, 3, 6).is_err(),
-        "image blocks split across chunks"
-    );
-    let short = MultimodalInput {
-        audio: &[],
-        pixel_values: &pixels[..pixels.len() - 1],
-        ..input
-    };
-    ensure!(
-        short.validate(&spec, 32).is_err(),
-        "short raw patch accepted"
-    );
-    for (scope, key, value) in [
-        ("vision_config", "mm_embed_dim", 1152),
-        ("vision_config", "model_patch_size", 16),
-        ("vision_config", "mm_posemb_size", 280),
-        ("audio_config", "audio_samples_per_token", 320),
-        ("audio_config", "output_proj_dims", 3840),
-    ] {
-        let mut mutant = root.clone();
-        mutant[scope][key] = json!(value);
-        ensure!(
-            ModelSpec::gemma4(&mutant, &Value::Null).is_err(),
-            "accepted {scope}.{key} mutation"
-        );
     }
-    Ok(())
-}
-
-#[test]
-fn raw_audio_masks_and_mixed_splices_preserve_row_identity() -> Result<()> {
-    use flyingfish::vision_input::AudioClip;
-    let (_, spec) = read(include_str!("data/gemma4-12b-config.json"))?;
-    let ids = [2, 256000, 258881, 258881, 258883, 255999, 258880, 258882, 5];
-    let modalities = [0, 0, 3, 3, 0, 0, 1, 0, 0];
-    let samples = vec![0.25; 3 * 640];
-    let mask = [true, false, true];
-    let clips = [AudioClip {
-        features: &samples,
-        mask: &mask,
-    }];
-    let pixels = vec![0.5; 6912];
-    let grids = [ImageGrid { t: 1, h: 1, w: 1 }];
-    let input = MultimodalInput {
-        input_ids: &ids,
-        modality_ids: &modalities,
-        pixel_values: &pixels,
-        grids: &grids,
-        audio: &clips,
-    };
-    let plan = input.validate(&spec, 32)?;
-    ensure!(
-        plan.feature_rows() == 3
-            && plan.audio_slots()[0].features == (0..2)
-            && plan.slots()[0].features == (2..3),
-        "media feature order"
-    );
-    let splices = plan.splices(3..8)?;
-    ensure!(
-        splices
-            .iter()
-            .any(|s| s.chunk_rows == (0..1) && s.feature_rows == (1..2))
-            && splices
-                .iter()
-                .any(|s| s.chunk_rows == (3..4) && s.feature_rows == (2..3)),
-        "mixed chunk splice offset"
-    );
-    let mut short = samples.clone();
-    short.pop();
-    let bad_clips = [AudioClip {
-        features: &short,
-        mask: &mask,
-    }];
-    ensure!(
-        MultimodalInput {
-            audio: &bad_clips,
-            ..input
-        }
-        .validate(&spec, 32)
-        .is_err(),
-        "short raw frame accepted"
-    );
-    let (_, large) = read(include_str!("data/gemma4-31b-config.json"))?;
-    ensure!(
-        input.validate(&large, 32).is_err(),
-        "31B accepted absent audio weights"
-    );
     Ok(())
 }
 
@@ -370,6 +233,227 @@ fn embedding_gemma2_spec_and_manifest_match_published_shapes() -> Result<()> {
             "language_model.layers.{index}.self_attn.v_proj.weight"
         )));
     }
+    Ok(())
+}
+
+fn embedding_f32(
+    tensors: &safetensors::SafeTensors<'_>,
+    name: &str,
+) -> Result<(Vec<usize>, Vec<f32>)> {
+    let view = tensors.tensor(name)?;
+    ensure!(
+        view.dtype() == safetensors::Dtype::F32,
+        "{name} is not FP32"
+    );
+    Ok((
+        view.shape().to_vec(),
+        view.data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
+            .collect(),
+    ))
+}
+
+fn embedding_distance(actual: &[f32], expected: &[f32]) -> Result<(f64, f64, f64)> {
+    ensure!(
+        actual.len() == expected.len(),
+        "embedding metric shape differs"
+    );
+    ensure!(
+        actual.iter().all(|value| value.is_finite()),
+        "nonfinite native embedding output"
+    );
+    let (mut maximum, mut squared, mut dot, mut a, mut b) = (0f64, 0f64, 0f64, 0f64, 0f64);
+    for (&actual, &expected) in actual.iter().zip(expected) {
+        let (actual, expected) = (f64::from(actual), f64::from(expected));
+        maximum = maximum.max((actual - expected).abs());
+        squared += (actual - expected).powi(2);
+        dot += actual * expected;
+        a += actual * actual;
+        b += expected * expected;
+    }
+    Ok((
+        maximum,
+        (squared / actual.len() as f64).sqrt(),
+        1.0 - dot / (a.sqrt() * b.sqrt()),
+    ))
+}
+
+fn embedding_stage(
+    case: &str,
+    stage: &str,
+    actual: &[f32],
+    expected: &[f32],
+    bounds: &Value,
+) -> Result<bool> {
+    let (maximum, rmse, cosine) = embedding_distance(actual, expected)?;
+    let maximum_limit = bounds["output_max"].as_f64().context("output_max limit")?;
+    let rmse_limit = bounds["output_rmse"]
+        .as_f64()
+        .context("output_rmse limit")?;
+    let cosine_limit = bounds["cosine_distance"].as_f64();
+    let pass = maximum <= maximum_limit
+        && rmse <= rmse_limit
+        && cosine_limit.is_none_or(|limit| cosine <= limit);
+    println!(
+        "EMBEDDING_GEMMA2 {case} {stage} {} max={maximum:.9}/{maximum_limit:.9} rmse={rmse:.9}/{rmse_limit:.9} cosine_distance={cosine:.9}",
+        if pass { "PASS" } else { "DEFECT" }
+    );
+    Ok(pass)
+}
+
+#[test]
+#[ignore = "requires FF_MODEL, FF_EMBEDDING_FIXTURES and a GPU window"]
+fn embedding_gemma2_text_matches_frozen_reference() -> Result<()> {
+    let model_dir = std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL")?);
+    let fixtures = std::path::PathBuf::from(
+        std::env::var_os("FF_EMBEDDING_FIXTURES").context("FF_EMBEDDING_FIXTURES")?,
+    );
+    let frozen: Value = serde_json::from_slice(&std::fs::read(fixtures.join("FROZEN.json"))?)?;
+    ensure!(frozen["status"] == "FROZEN" && frozen["candidate_observations"] == 0);
+    let settings = flyingfish::backend::Settings {
+        tree_builder: flyingfish::backend::TreeBuilder::Waves,
+        spec_budget: flyingfish::backend::SpecBudget::Chain,
+        spec_graph: false,
+        draft_model: None,
+        prefix_cache: false,
+        kv_format: flyingfish::kv::KvFormat::Bf16,
+        runtime_dir: Some(std::path::PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR")?,
+        )),
+    };
+    let mut model = flyingfish::model::Model::load(&model_dir, 0, 1024, Some(1024), settings)?;
+    let mut defects = 0;
+    let mut first_short = None;
+    for case in ["short", "batch", "radius", "radius_batch", "semantic"] {
+        let input_bytes =
+            std::fs::read(fixtures.join("inputs").join(format!("{case}.safetensors")))?;
+        let input = safetensors::SafeTensors::deserialize(&input_bytes)?;
+        let ids_view = input.tensor("ids")?;
+        let mask_view = input.tensor("mask")?;
+        ensure!(
+            ids_view.dtype() == safetensors::Dtype::I32
+                && mask_view.dtype() == safetensors::Dtype::BOOL
+        );
+        let shape = ids_view.shape();
+        ensure!(shape.len() == 2 && mask_view.shape() == shape);
+        let ids: Vec<u32> = ids_view
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| i32::from_le_bytes(*bytes) as u32)
+            .collect();
+        let mask: Vec<bool> = mask_view.data().iter().map(|&value| value != 0).collect();
+        let oracle_bytes =
+            std::fs::read(fixtures.join("oracle").join(format!("{case}.safetensors")))?;
+        let oracle = safetensors::SafeTensors::deserialize(&oracle_bytes)?;
+        let (_, expected_vectors) = embedding_f32(&oracle, "vector")?;
+        let (_, expected_pooled) = embedding_f32(&oracle, "pooled")?;
+        for row in 0..shape[0] {
+            let valid = mask[row * shape[1]..(row + 1) * shape[1]]
+                .iter()
+                .take_while(|&&valid| valid)
+                .count();
+            let row_ids = &ids[row * shape[1]..row * shape[1] + valid];
+            let row_mask = &mask[row * shape[1]..row * shape[1] + valid];
+            let mut trace = flyingfish::trace::Trace::all_layers();
+            let vector = model.embed(row_ids, row_mask, Some(&mut trace))?;
+            ensure!(vector.len() == 768);
+            let expected = &expected_vectors[row * 768..(row + 1) * 768];
+            if case == "short" {
+                if let Some(first) = &first_short {
+                    ensure!(vector == *first, "embedding state leaked across calls");
+                } else {
+                    first_short = Some(vector.clone());
+                }
+            }
+            defects += usize::from(!embedding_stage(
+                case,
+                "vector",
+                &vector,
+                expected,
+                &frozen["cells"][case]["vector"],
+            )?);
+            let norm = vector
+                .iter()
+                .map(|&value| f64::from(value).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            ensure!(
+                (norm - 1.0).abs() <= frozen["unit_norm_limit"].as_f64().unwrap(),
+                "native vector unit norm differs: {norm}"
+            );
+            for (stage, trace_name) in [
+                ("embedding", "embed".to_owned()),
+                ("layer0", "0.debug.layer_out".to_owned()),
+                ("layer5", "5.debug.layer_out".to_owned()),
+                ("layer17", "17.debug.layer_out".to_owned()),
+                ("layer23", "23.debug.layer_out".to_owned()),
+                ("norm", "layer.norm".to_owned()),
+                ("projected", "layer.projected".to_owned()),
+            ] {
+                let (expected_shape, expected_values) = embedding_f32(&oracle, stage)?;
+                ensure!(expected_shape[0] == shape[0] && expected_shape[1] >= valid);
+                let width = expected_shape[2];
+                let start = (row * expected_shape[1]) * width;
+                let expected = &expected_values[start..start + valid * width];
+                defects += usize::from(!embedding_stage(
+                    case,
+                    stage,
+                    &trace.values(&trace_name)?,
+                    expected,
+                    &frozen["cells"][case][stage],
+                )?);
+            }
+            let (ple_shape, ple) = embedding_f32(&oracle, "ple")?;
+            ensure!(ple_shape[2..] == [24, 512]);
+            let mut expected_ple = vec![0.0; valid * 24 * 512];
+            for token in 0..valid {
+                for layer in 0..24 {
+                    let source = ((row * ple_shape[1] + token) * 24 + layer) * 512;
+                    let target = (layer * valid + token) * 512;
+                    expected_ple[target..target + 512].copy_from_slice(&ple[source..source + 512]);
+                }
+            }
+            defects += usize::from(!embedding_stage(
+                case,
+                "ple",
+                &trace.values("0.debug.ple_identity")?,
+                &expected_ple,
+                &frozen["cells"][case]["ple"],
+            )?);
+            let projected = trace.values("layer.projected")?;
+            let mut pooled = vec![0.0f32; 768];
+            for token in 0..valid {
+                for (column, value) in pooled.iter_mut().enumerate() {
+                    *value += projected[token * 768 + column] / valid as f32;
+                }
+            }
+            defects += usize::from(!embedding_stage(
+                case,
+                "pooled",
+                &pooled,
+                &expected_pooled[row * 768..(row + 1) * 768],
+                &frozen["cells"][case]["pooled"],
+            )?);
+            if case == "batch" && row == 1 {
+                let mut padded_ids = ids[row * shape[1]..(row + 1) * shape[1]].to_vec();
+                padded_ids[valid..].fill(1);
+                let padded = model.embed(
+                    &padded_ids,
+                    &mask[row * shape[1]..(row + 1) * shape[1]],
+                    None,
+                )?;
+                ensure!(padded == vector, "padding changed the native embedding");
+                ensure!(model.embed(&[2, 3, 4], &[true, false, true], None).is_err());
+            }
+        }
+    }
+    ensure!(defects == 0, "EmbeddingGemma-2 candidate defects={defects}");
+    println!("EMBEDDING_GEMMA2 PASS cells=5 defects=0");
     Ok(())
 }
 

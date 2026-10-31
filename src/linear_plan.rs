@@ -47,25 +47,36 @@ impl LayerDequantPlan {
     ) -> Result<Self> {
         let language = format!("model.language_model.layers.{layer}.");
         let model = format!("model.layers.{layer}.");
-        let language_count = manifest
-            .entries
-            .keys()
-            .filter(|name| name.starts_with(&language))
-            .count();
-        let model_count = manifest
-            .entries
-            .keys()
-            .filter(|name| name.starts_with(&model))
-            .count();
+        let direct = format!("language_model.layers.{layer}.");
+        let count = |prefix: &str| {
+            manifest
+                .entries
+                .keys()
+                .filter(|name| name.starts_with(prefix))
+                .count()
+        };
+        let language_count = count(&language);
+        let model_count = count(&model);
+        let direct_count = count(&direct);
         ensure!(
-            language_count > 0 || model_count > 0,
+            language_count > 0 || model_count > 0 || direct_count > 0,
             "missing linear layer {layer}"
         );
         ensure!(
-            language_count == 0 || model_count == 0,
-            "layer {layer} has both model and language_model tensors"
+            [language_count, model_count, direct_count]
+                .into_iter()
+                .filter(|&count| count > 0)
+                .count()
+                == 1,
+            "layer {layer} has ambiguous tensor namespaces"
         );
-        let prefix = if language_count > 0 { language } else { model };
+        let prefix = if language_count > 0 {
+            language
+        } else if model_count > 0 {
+            model
+        } else {
+            direct
+        };
         Self::build(manifest, layer, prefix, format)
     }
 

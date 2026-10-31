@@ -225,6 +225,15 @@ impl Model {
         self.backend.prefill(ids, trace)
     }
     /// Prefill one complete processor-packed image/text prompt after reset.
+    pub fn embed(
+        &mut self,
+        ids: &[u32],
+        mask: &[bool],
+        trace: Option<&mut Trace>,
+    ) -> Result<Vec<f32>> {
+        self.backend.embed(ids, mask, trace)
+    }
+
     pub fn prefill_multimodal(
         &mut self,
         input: &crate::vision_input::MultimodalInput<'_>,

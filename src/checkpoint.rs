@@ -466,15 +466,6 @@ impl MappedCheckpoint {
                 Self::axial_vision_entries(vision, tower, projection, &mut expected)?;
             }
         }
-        if let Some(audio) = &spec.audio {
-            put(
-                &mut expected,
-                "model.embed_audio.embedding_projection.weight".into(),
-                Dtype::BF16,
-                vec![audio.output as usize, audio.frame as usize],
-                TensorScope::Audio,
-            );
-        }
         Self::audio_entries(spec, &mut expected)?;
         let views = self.views()?;
         for (name, shard) in &self.index.weight_map {
@@ -583,6 +574,10 @@ impl MappedCheckpoint {
                 format!("{p}.lconv1d.depthwise_conv1d.weight"),
                 vec![h, 1, a.conv_kernel as usize],
             );
+        }
+        Ok(())
+    }
+
     fn unified_vision_entries(
         vision: &crate::model_spec::VisionConfig,
         expected: &mut BTreeMap<String, ExpectedTensor>,

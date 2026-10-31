@@ -944,8 +944,9 @@ impl Flash {
                     })?;
                     return Ok(());
                 }
+                let key_extent = keys as u32;
                 if mode == 6 {
-                    launch.arg(&(keys as u32)).arg(&extent).arg(&0.0625f32);
+                    launch.arg(&key_extent).arg(&extent).arg(&0.0625f32);
                 } else {
                     if mode != 0 || window {
                         launch.arg(&extent);

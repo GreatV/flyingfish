@@ -109,3 +109,75 @@ extern "C" __global__ void per_layer_input(const uint32_t* ids,
         out[out_base + d] = __hmul(__hadd(n, out[out_base + d]), combine);
     }
 }
+
+// out = bf16(rms(bf16(context*context_scale))*wn).
+extern "C" __global__ void per_layer_projection(const __nv_bfloat16* context,
+    const __nv_bfloat16* wn, __nv_bfloat16* out, int rows, int layers, int width,
+    float context_scale, float eps) {
+    if (width <= 0 || layers <= 0 || rows <= 0 || blockDim.x != 128) { __trap(); return; }
+    const int row = blockIdx.x / layers;
+    const int layer = blockIdx.x % layers;
+    if (row >= rows) return;
+    const size_t context_base = ((size_t)row * layers + layer) * width;
+    const size_t out_base = ((size_t)layer * rows + row) * width;
+    const __nv_bfloat16 cs = __float2bfloat16_rn(context_scale);
+    __shared__ float partial[4];
+    float sum = 0.0f;
+    for (int d = threadIdx.x; d < width; d += blockDim.x) {
+        const float x = __bfloat162float(__hmul(context[context_base + d], cs));
+        sum += x * x;
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_xor_sync(FF_WARP_MASK, sum, offset);
+    if ((threadIdx.x & 31) == 0) partial[threadIdx.x >> 5] = sum;
+    __syncthreads();
+    if (threadIdx.x < 4) {
+        float x = partial[threadIdx.x];
+        for (int offset = 2; offset > 0; offset >>= 1) x += __shfl_xor_sync(FF_WARP_MASK & 0xf, x, offset);
+        if (threadIdx.x == 0) partial[0] = x;
+    }
+    __syncthreads();
+    const float rstd = rsqrtf(partial[0] / width + eps);
+    for (int d = threadIdx.x; d < width; d += blockDim.x) {
+        const float x = __bfloat162float(__hmul(context[context_base + d], cs));
+        out[out_base + d] = __float2bfloat16_rn(x * rstd * __bfloat162float(wn[d]));
+    }
+}
+
+// out accumulates valid_count * mean when accumulate is true, otherwise it stores mean.
+extern "C" __global__ void mean_pool_l2(const __nv_bfloat16* input, const bool* mask,
+    float* out, int rows, int width, bool accumulate) {
+    if (rows <= 0 || width <= 0 || blockDim.x != 128) { __trap(); return; }
+    unsigned valid = 0;
+    for (int row = 0; row < rows; ++row) valid += mask[row] ? 1u : 0u;
+    if (valid == 0) { __trap(); return; }
+    for (int d = threadIdx.x; d < width; d += blockDim.x) {
+        float value = 0.0f;
+        for (int row = 0; row < rows; ++row) {
+            if (mask[row]) value += __bfloat162float(input[row * width + d]);
+        }
+        value /= (float)valid;
+        if (accumulate) out[d] += value * (float)valid;
+        else out[d] = value;
+    }
+}
+
+// out = out / sqrt(sum(out^2) + 1e-12).
+extern "C" __global__ void l2_normalize(float* out, int width) {
+    if (width <= 0 || blockDim.x != 128) { __trap(); return; }
+    __shared__ float partial[4];
+    float sum = 0.0f;
+    for (int d = threadIdx.x; d < width; d += blockDim.x) sum += out[d] * out[d];
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_xor_sync(FF_WARP_MASK, sum, offset);
+    if ((threadIdx.x & 31) == 0) partial[threadIdx.x >> 5] = sum;
+    __syncthreads();
+    if (threadIdx.x < 4) {
+        float x = partial[threadIdx.x];
+        for (int offset = 2; offset > 0; offset >>= 1) x += __shfl_xor_sync(FF_WARP_MASK & 0xf, x, offset);
+        if (threadIdx.x == 0) partial[0] = x;
+    }
+    __syncthreads();
+    const float scale = rsqrtf(partial[0] + 1e-12f);
+    for (int d = threadIdx.x; d < width; d += blockDim.x) out[d] *= scale;
+}
