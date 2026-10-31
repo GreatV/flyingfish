@@ -13,11 +13,19 @@ use crate::backend::gpu::{
 };
 use crate::{
     model_spec::{AudioConfig, ModelSpec},
-    vision_input::{MultimodalInput, PositionPlan},
+    vision_input::{AudioClip, MultimodalInput, PositionPlan},
 };
 use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::sync::Arc;
+
+fn active_frames(clip: &AudioClip<'_>) -> Result<usize> {
+    clip.mask
+        .iter()
+        .rposition(|&valid| valid)
+        .map(|last| last + 1)
+        .context("audio clip has no valid frames")
+}
 
 pub(crate) fn relative_positions(rows: u32, width: u32) -> Result<Vec<bf16>> {
     ensure!(
@@ -302,7 +310,9 @@ impl AudioRuntime {
         let frames = input
             .audio
             .iter()
-            .map(|clip| clip.mask.len())
+            .map(active_frames)
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
             .max()
             .context("audio request has no clips")?;
         let t1 = frames.div_ceil(2);
@@ -320,9 +330,9 @@ impl AudioRuntime {
                     + model.hidden as usize);
         let mut bytes = working.checked_mul(2).context("audio workspace overflow")?;
         for clip in input.audio {
-            let frames = clip.mask.len();
+            let frames = active_frames(clip)?;
             let resident =
-                clip.features.len() * 2 + frames + frames.div_ceil(2) + frames.div_ceil(4) * 5 + 32;
+                frames * 128 * 2 + frames + frames.div_ceil(2) + frames.div_ceil(4) * 5 + 32;
             bytes = bytes
                 .checked_add(resident)
                 .context("audio request overflow")?;
@@ -354,11 +364,12 @@ impl AudioRuntime {
         let s = &device.stream;
         let mut clips = Vec::new();
         for (clip, slot) in input.audio.iter().zip(positions.audio_slots()) {
-            let frames = u32::try_from(clip.mask.len())?;
+            let frames = u32::try_from(active_frames(clip)?)?;
             let rows = frames.div_ceil(4);
             let masks = [1, 2, 4].map(|stride| {
                 clip.mask
                     .iter()
+                    .take(frames as usize)
                     .step_by(stride)
                     .map(|&v| u8::from(v))
                     .collect::<Vec<_>>()
@@ -378,6 +389,7 @@ impl AudioRuntime {
                     &clip
                         .features
                         .iter()
+                        .take(frames as usize * 128)
                         .copied()
                         .map(bf16::from_f32)
                         .collect::<Vec<_>>(),
@@ -675,6 +687,16 @@ impl AudioRuntime {
             )?;
             for (index, block) in self.blocks.iter().enumerate() {
                 self.feed_forward(s, blas, &work, &block.ff[0], domain)?;
+                if index == 0 {
+                    Self::trace(
+                        s,
+                        &mut trace,
+                        &format!("audio.{clip_index}.ff1"),
+                        &work.hidden,
+                        rows,
+                        h,
+                    )?;
+                }
                 self.clamp(s, &work.hidden, &work.delta, rows)?;
                 self.norm(s, domain, &work.delta, &work.norm, &block.pre_attention, h)?;
                 for (projection, output) in block.projections[..3].iter().zip(&work.qkv) {
@@ -714,6 +736,16 @@ impl AudioRuntime {
                     rows,
                 )?;
                 self.branch(s, &work, &block.post_attention, rows, 1.0)?;
+                if index == 0 {
+                    Self::trace(
+                        s,
+                        &mut trace,
+                        &format!("audio.{clip_index}.attention"),
+                        &work.hidden,
+                        rows,
+                        h,
+                    )?;
+                }
                 self.norm(s, domain, &work.hidden, &work.norm, &block.conv_pre, h)?;
                 self.linear(
                     s,
@@ -753,6 +785,16 @@ impl AudioRuntime {
                         .launch(flat(rows as usize * h as usize))?;
                 }
                 self.feed_forward(s, blas, &work, &block.ff[1], domain)?;
+                if index == 0 {
+                    Self::trace(
+                        s,
+                        &mut trace,
+                        &format!("audio.{clip_index}.ff2"),
+                        &work.hidden,
+                        rows,
+                        h,
+                    )?;
+                }
                 self.clamp(s, &work.hidden, &work.delta, rows)?;
                 self.norm(s, domain, &work.delta, &work.hidden, &block.final_norm, h)?;
                 if index == 0 {

@@ -3366,12 +3366,16 @@ fn audio_model_definition_and_graph_gpu() -> Result<()> {
                 let raw = trace.values(&format!("audio.{index}.{stage}"))?;
                 let row_width = width * frequency;
                 ensure!(
-                    raw.len() == clip.mask.len().div_ceil(stride) * row_width,
+                    raw.len().is_multiple_of(row_width)
+                        && raw.len() <= clip.mask.len().div_ceil(stride) * row_width,
                     "audio stage extent mismatch"
                 );
                 for (row, &keep) in clip.mask.iter().step_by(stride).enumerate() {
                     if keep {
-                        actual.extend_from_slice(&raw[row * row_width..(row + 1) * row_width]);
+                        actual.extend_from_slice(
+                            raw.get(row * row_width..(row + 1) * row_width)
+                                .context("audio stage omitted a valid row")?,
+                        );
                     }
                 }
             }
@@ -3405,6 +3409,14 @@ fn audio_model_definition_and_graph_gpu() -> Result<()> {
         for row in first..ids.len() {
             actual.extend(engine.gemma_all_logits(row)?);
         }
+        trace.add(
+            "scored_logits".into(),
+            vec![ids.len() - first, actual.len() / (ids.len() - first)],
+            actual.clone(),
+        )?;
+        let diagnostics = settings.runtime_dir.as_ref().context("runtime missing")?;
+        std::fs::create_dir_all(diagnostics)?;
+        trace.save(&diagnostics.join(format!("{name}-native.safetensors")))?;
         let (pass, metrics, _) = model_metrics(
             &actual,
             &oracle["logits"].1.as_f32(),

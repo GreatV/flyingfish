@@ -287,6 +287,12 @@ def capture_model(args, config):
             hooks.append(module.register_forward_hook(subsample_hook))
         hooks.append(tower.layers[0].register_forward_hook(
             lambda module, inputs, output: stages.update(layer0=output.detach().cpu())))
+        for key, module in (("ff1", tower.layers[0].feed_forward1),
+                            ("ff2", tower.layers[0].feed_forward2)):
+            hooks.append(module.register_forward_hook(
+                lambda module, inputs, output, key=key: stages.update({key: output.detach().cpu()})))
+        hooks.append(tower.layers[0].lconv1d.register_forward_pre_hook(
+            lambda module, inputs: stages.update(attention=inputs[0].detach().cpu())))
         hooks.append(tower.register_forward_hook(
             lambda module, inputs, output: stages.update(tower=output.last_hidden_state.detach().cpu())))
     def encoder_called(module, inputs, output):
@@ -323,7 +329,7 @@ def capture_model(args, config):
             captured = dict(logits=logits, features=valid_features(), ple=ple[0][0].float())
             if audio:
                 for key, value in stages.items():
-                    captured[key] = (value[media["input_features_mask"].cpu()[:, ::4]] if key in ("layer0", "tower") else value).float().contiguous()
+                    captured[key] = (value[media["input_features_mask"].cpu()[:, ::4]] if key not in ("subsample0", "subsample1") else value).float().contiguous()
             del output
             if variant == "packed":
                 features.clear()
@@ -332,7 +338,7 @@ def capture_model(args, config):
                 repeat = dict(logits=repeated.logits[0].float().cpu(), features=valid_features(), ple=ple[0][0].float())
                 if audio:
                     for key, value in stages.items():
-                        repeat[key] = (value[media["input_features_mask"].cpu()[:, ::4]] if key in ("layer0", "tower") else value).float().contiguous()
+                        repeat[key] = (value[media["input_features_mask"].cpu()[:, ::4]] if key not in ("subsample0", "subsample1") else value).float().contiguous()
                 cell["repeat_mismatches"] = {key: int((captured[key] != repeat[key]).sum()) for key in captured}
                 assert not any(cell["repeat_mismatches"].values()), cell["repeat_mismatches"]
                 assert counted[0] - before == 2
