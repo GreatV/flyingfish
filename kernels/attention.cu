@@ -25,6 +25,7 @@
 //   smem = (2*nchunks + threads2)*4 bytes <= 48 KB.
 // nchunks is identical in both phases for the same (L, chunk).
 #include "gpu_compat.cuh"
+#include <stdint.h>
 
 using bf16 = __nv_bfloat16;
 
