@@ -202,6 +202,9 @@ def main():
     require(transformers.__version__ == "5.21.0", "reference definition version mismatch")
     args.out.mkdir(parents=True, exist_ok=False)
     torch.set_num_threads(4)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
     if args.freeze_from:
         freeze(args.freeze_from, args.out)
         return
@@ -239,9 +242,6 @@ def main():
         (args.out / "LOAD.json").write_text(json.dumps(report, indent=2) + "\n")
         print("PASS full_class_load missing=0 unexpected=0 newly_initialized=0", flush=True)
         return
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    torch.set_float32_matmul_precision("highest")
     config = model_class.config_class.from_pretrained(args.model, local_files_only=True)
     config._attn_implementation = "eager"
     config.text_config._attn_implementation = "eager"
