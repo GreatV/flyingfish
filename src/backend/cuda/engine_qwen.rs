@@ -5679,6 +5679,11 @@ impl Engine {
         let rows = input.len() / input_width;
         let x = s.clone_htod(input)?;
         let y = s.alloc_zeros(rows * output_width)?;
+        self.blas.prepare_fixed(
+            u32::try_from(rows)?,
+            u32::try_from(output_width)?,
+            u32::try_from(input_width)?,
+        )?;
         layer.linear.run(
             &self.blas,
             role,
