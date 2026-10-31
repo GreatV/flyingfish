@@ -151,6 +151,7 @@ def prepare_media(args):
 def capture_model(args, config):
     from safetensors.torch import load_file
     assert args.inputs
+    assert args.stage != "media" or args.dtype == "bf16"
     dtype = torch.float32 if args.dtype == "fp32" else torch.bfloat16
     model_class = getattr(transformers, config.architectures[0])
     model, load = model_class.from_pretrained(
@@ -227,7 +228,7 @@ def capture_model(args, config):
             if name in ("street", "winter") and variant == "packed":
                 media_logits.append(logits[0].clone())
             del output, logits
-        if name in ("street", "winter") and args.dtype == "bf16":
+        if args.stage == "media":
             before = counted[0]
             image_end = (ids[0] == config.eoi_token_id).nonzero().item() + 1
             caption = tokenizer(" Caption: A photograph of", add_special_tokens=False).input_ids
