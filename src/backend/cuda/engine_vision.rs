@@ -3660,6 +3660,7 @@ impl EncodedImages {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::cuda::weights::StoredTensor;
 
     fn test_blas(
         device: &Device,

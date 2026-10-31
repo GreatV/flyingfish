@@ -829,8 +829,6 @@ impl Engine {
                 && spec.linear_format.fp8_layout().is_none(),
             "media-aware dense placement requires a BF16 dense Qwen-family runtime"
         );
-<<<<<<< HEAD
-=======
         let plan = input.validate(&spec, capacity)?;
         if let Some(chunk) = requested_chunk
             && spec.per_layer_input.is_none()
@@ -840,7 +838,6 @@ impl Engine {
                 "requested prefill chunk cannot fit a complete image block"
             );
         }
->>>>>>> 5c7fb94c (Integrate unified media embedders and shared axial tower bindings)
         let (audio, vision, request) = Self::multimodal_request_bytes(&spec, input, capacity)?;
         let checkpoint = crate::checkpoint::MappedCheckpoint::open(dir)?;
         let mut reserved_bytes = request;
