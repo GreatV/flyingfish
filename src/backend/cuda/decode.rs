@@ -87,7 +87,10 @@ impl RingDecode {
     ) -> Result<Self> {
         Self::workspace(heads as usize, ring as usize)?;
         ensure!(
-            kv_heads > 0 && heads.is_multiple_of(kv_heads) && ring <= i32::MAX as u32 / 256,
+            kv_heads > 0
+                && heads.is_multiple_of(kv_heads)
+                && ring <= i32::MAX as u32 / 256
+                && u64::from(kv_heads) * u64::from(ring) * 256 <= i32::MAX as u64,
             "invalid ring decode heads/stride"
         );
         ensure!(
