@@ -614,6 +614,10 @@ pub(super) struct Runtime {
     checkpoint_dir: PathBuf,
     vision: Option<super::vision_runtime::VisionRuntime>,
     vision_bytes: usize,
+    media_reserved_bytes: usize,
+    audio: Option<super::audio_runtime::AudioRuntime>,
+    #[cfg(test)]
+    pub(super) audio_encode_calls: usize,
     #[cfg(test)]
     pub(super) vision_encode_calls: usize,
     #[cfg(test)]
@@ -1099,6 +1103,32 @@ impl Runtime {
         let values = stream.clone_dtoh(&self.positions)?;
         Ok(values)
     }
+    fn check_media_reservation(&self, audio: bool, vision: bool, request: usize) -> Result<()> {
+        if self.media_reserved_bytes == 0 {
+            return Ok(());
+        }
+        let required = self
+            .catalog
+            .manifest
+            .entries
+            .values()
+            .filter(|entry| match entry.scope {
+                crate::checkpoint::TensorScope::Audio => audio || self.audio.is_some(),
+                crate::checkpoint::TensorScope::Vision => vision || self.vision.is_some(),
+                _ => false,
+            })
+            .try_fold(request, |sum, entry| {
+                sum.checked_add(entry.bytes)
+                    .context("media reservation extent overflow")
+            })?;
+        ensure!(
+            required <= self.media_reserved_bytes,
+            "media request exceeds setup reservation: required={required} reserved={}",
+            self.media_reserved_bytes
+        );
+        Ok(())
+    }
+
     pub(super) fn vision_bytes(&self) -> usize {
         self.vision_bytes
     }
@@ -1201,8 +1231,23 @@ impl Runtime {
                     .max()
                     .context("sliding window missing")? as usize,
             )?;
+            #[cfg(test)]
+            let diagnostics = {
+                let intermediate = model
+                    .layers
+                    .iter()
+                    .filter_map(|layer| layer.geometry.map(|g| g.intermediate as usize))
+                    .max()
+                    .context("Gemma diagnostic intermediate missing")?;
+                rows.checked_mul(model.vocab as usize + 2 * intermediate)
+                    .and_then(|n| n.checked_mul(size_of::<bf16>()))
+                    .context("Gemma diagnostic bytes overflow")?
+            };
+            #[cfg(not(test))]
+            let diagnostics = 0;
             return per_layer_inputs
-                .checked_add(rope_tables)
+                .checked_add(diagnostics)
+                .and_then(|n| n.checked_add(rope_tables))
                 .and_then(|n| n.checked_add(flash))
                 .and_then(|n| n.checked_add(staging))
                 .and_then(|n| n.checked_add(decode))
@@ -1928,6 +1973,10 @@ impl Runtime {
                 .context("resolve Q38 checkpoint directory")?,
             vision: None,
             vision_bytes: 0,
+            media_reserved_bytes: 0,
+            audio: None,
+            #[cfg(test)]
+            audio_encode_calls: 0,
             #[cfg(test)]
             vision_encode_calls: 0,
             #[cfg(test)]
@@ -2377,6 +2426,7 @@ impl Engine {
             #[cfg(test)]
             {
                 q.vision_encode_calls = 0;
+                q.audio_encode_calls = 0;
             }
             let positions =
                 crate::vision_input::PositionPlan::text(1, self.capacity)?.packed_axes()?;
@@ -2412,7 +2462,19 @@ impl Engine {
             identities = input
                 .input_ids
                 .iter()
-                .map(|&id| if id == image { 0 } else { id })
+                .map(|&id| {
+                    if id == image
+                        || self
+                            .model_spec
+                            .audio
+                            .as_ref()
+                            .is_some_and(|a| id == a.token)
+                    {
+                        0
+                    } else {
+                        id
+                    }
+                })
                 .collect::<Vec<_>>();
             &identities
         } else {
@@ -2425,10 +2487,38 @@ impl Engine {
         result
     }
 
+    pub(super) fn multimodal_request_bytes(
+        model: &crate::model_spec::ModelSpec,
+        input: &crate::vision_input::MultimodalInput<'_>,
+        capacity: usize,
+    ) -> Result<(usize, usize, usize)> {
+        let plan = input.validate(model, capacity)?;
+        let audio_bytes = if input.audio.is_empty() {
+            0
+        } else {
+            super::audio_runtime::AudioRuntime::request_bytes(model, input, capacity)?
+        };
+        let vision_bytes = if plan.slots().is_empty() {
+            0
+        } else {
+            super::vision_runtime::VisionRuntime::request_bytes(model, input, capacity)?
+        };
+        let feature_bytes = plan
+            .feature_rows()
+            .checked_mul(model.hidden as usize)
+            .and_then(|n| n.checked_mul(2))
+            .context("media feature bytes overflow")?;
+        let request_bytes = audio_bytes
+            .checked_add(vision_bytes)
+            .and_then(|n| n.checked_add(if vision_bytes == 0 { feature_bytes } else { 0 }))
+            .context("media request bytes overflow")?;
+        Ok((audio_bytes, vision_bytes, request_bytes))
+    }
+
     pub(super) fn prepare_multimodal(
         &mut self,
         input: &crate::vision_input::MultimodalInput<'_>,
-        trace: Option<&mut Trace>,
+        mut trace: Option<&mut Trace>,
     ) -> Result<()> {
         ensure!(self.qwen.is_some(), "packed images require Qwen");
         ensure!(
@@ -2439,29 +2529,76 @@ impl Engine {
             !self.poisoned && self.position == 0 && self.images.is_none(),
             "multimodal prefill requires a healthy, reset sequence"
         );
-        let positions = input
-            .validate(&self.model_spec, self.capacity)?
-            .packed_axes()?;
-        let request_bytes = super::vision_runtime::VisionRuntime::request_bytes(
-            &self.model_spec,
-            input,
-            self.capacity,
-        )?;
-        self.prepare_vision_weights(request_bytes)?;
+        let plan = input.validate(&self.model_spec, self.capacity)?;
+        let positions = plan.packed_axes()?;
+        let (audio_bytes, vision_bytes, request_bytes) =
+            Self::multimodal_request_bytes(&self.model_spec, input, self.capacity)?;
+        self.qwen
+            .as_ref()
+            .context("media runtime missing")?
+            .check_media_reservation(audio_bytes != 0, vision_bytes != 0, request_bytes)?;
+        if audio_bytes != 0 {
+            self.prepare_audio_weights(request_bytes)?;
+        }
+        if vision_bytes != 0 {
+            self.prepare_vision_weights(request_bytes)?;
+        }
         let q = self.qwen.as_mut().context("Q38 runtime missing")?;
-        let vision = q.vision.as_ref().context("vision runtime missing")?;
         let (free, total) = self.device.ctx.mem_get_info()?;
+        let reserve = if q.media_reserved_bytes == 0 {
+            total / 16
+        } else {
+            0
+        };
         ensure!(
-            free.checked_sub(total / 16)
+            free.checked_sub(reserve)
                 .is_some_and(|n| request_bytes <= n),
             "vision request exceeds memory budget: required={request_bytes} free={free}"
         );
         self.poisoned = true;
-        let request = vision.prepare(&self.device, &mut self.blas, input, self.capacity)?;
-        let images = vision.encode(&self.device.stream, &self.blas, request, trace)?;
-        #[cfg(test)]
-        {
-            q.vision_encode_calls += 1;
+        let images = if vision_bytes != 0 {
+            let vision = q.vision.as_ref().context("vision runtime missing")?;
+            let request =
+                vision.prepare(&self.device, &mut self.blas, input, self.capacity, reserve)?;
+            let images = vision.encode(
+                &self.device.stream,
+                &self.blas,
+                request,
+                trace.as_deref_mut(),
+            )?;
+            #[cfg(test)]
+            {
+                q.vision_encode_calls += 1;
+            }
+            images
+        } else {
+            q.audio
+                .as_ref()
+                .context("audio runtime missing")?
+                .empty_features(&self.device, plan.clone())?
+        };
+        if audio_bytes != 0 {
+            let audio = q.audio.as_ref().context("audio runtime missing")?;
+            let request = audio.prepare(&self.device, &mut self.blas, input, &plan)?;
+            audio.encode(
+                &self.device.stream,
+                &self.blas,
+                request,
+                &images.features,
+                trace.as_deref_mut(),
+            )?;
+            #[cfg(test)]
+            {
+                q.audio_encode_calls += input.audio.len();
+            }
+        }
+        if let Some(trace) = trace.as_mut() {
+            let values = self.device.stream.clone_dtoh(&images.features)?;
+            trace.add(
+                "media_features".into(),
+                vec![plan.feature_rows(), self.model_spec.hidden as usize],
+                values.into_iter().map(bf16::to_f32).collect(),
+            )?;
         }
         self.device
             .stream
@@ -2520,6 +2657,50 @@ impl Engine {
         Ok(())
     }
 
+    fn prepare_audio_weights(&mut self, request_bytes: usize) -> Result<()> {
+        let q = self.qwen.as_mut().context("audio text runtime missing")?;
+        q.check_media_reservation(true, false, request_bytes)?;
+        if q.audio.is_some() {
+            return Ok(());
+        }
+        let manifest = crate::checkpoint::MappedCheckpoint::open(&q.checkpoint_dir)?
+            .manifest(&self.model_spec, crate::checkpoint::LoadPolicy::AudioOnly)?;
+        let needed = manifest
+            .resident_bytes
+            .checked_add(request_bytes)
+            .and_then(|n| n.checked_add(1024 * 1024))
+            .context("audio resident budget overflow")?;
+        let (free, total) = self.device.ctx.mem_get_info()?;
+        let reserve = if q.media_reserved_bytes == 0 {
+            total / 16
+        } else {
+            0
+        };
+        ensure!(
+            free.checked_sub(reserve).is_some_and(|n| needed <= n),
+            "audio weights/workspace exceed memory budget: additional_required_bytes={needed} free_bytes={free} reserve_bytes={}",
+            reserve
+        );
+        self.poisoned = true;
+        let mut catalog = WeightCatalog::load_with_policy(
+            &q.checkpoint_dir,
+            &self.model_spec,
+            &self.device,
+            crate::checkpoint::LoadPolicy::AudioOnly,
+        )?;
+        q.audio = Some(super::audio_runtime::AudioRuntime::from_catalog(
+            &self.model_spec,
+            &mut catalog,
+            &self.device,
+            &mut self.blas,
+            q.common.clone(),
+        )?);
+        ensure!(catalog.tensors.is_empty(), "audio weights left unbound");
+        self.device.finish_upload()?;
+        self.poisoned = false;
+        Ok(())
+    }
+
     fn prepare_vision_weights(&mut self, request_bytes: usize) -> Result<()> {
         let kv_bytes = self
             .state
@@ -2536,6 +2717,7 @@ impl Engine {
         #[cfg(feature = "rocm")]
         let mtp_bytes = 0usize;
         let q = self.qwen.as_mut().context("Q38 runtime missing")?;
+        q.check_media_reservation(false, true, request_bytes)?;
         if q.vision.is_none() {
             let manifest = crate::checkpoint::MappedCheckpoint::open(&q.checkpoint_dir)?
                 .manifest(&self.model_spec, crate::checkpoint::LoadPolicy::VisionOnly)?;
@@ -2544,20 +2726,25 @@ impl Engine {
                 .checked_add(request_bytes)
                 .context("vision resident/workspace overflow")?;
             let (free, total) = self.device.ctx.mem_get_info()?;
+            let reserve = if q.media_reserved_bytes == 0 {
+                total / 16
+            } else {
+                0
+            };
             eprintln!(
                 "{}",
                 serde_json::json!({"serve_resident_budget": {
                     "main_weights_bytes": self.weights.bytes, "mtp_attachment_bytes": mtp_bytes,
                     "vision_weights_bytes": manifest.resident_bytes, "kv_bytes": kv_bytes,
-                    "request_bytes": request_bytes, "free_bytes": free, "reserve_bytes": total / 16,
+                    "request_bytes": request_bytes, "free_bytes": free, "reserve_bytes": reserve,
                     "additional_required_bytes": needed, "chunk": self.chunk,
                 }})
             );
             ensure!(
-                free.checked_sub(total / 16).is_some_and(|n| needed <= n),
+                free.checked_sub(reserve).is_some_and(|n| needed <= n),
                 "co-resident MTP/vision/KV exceeds memory budget: mtp_bytes={mtp_bytes} vision_bytes={} kv_bytes={kv_bytes} request_bytes={request_bytes} additional_required_bytes={needed} free_bytes={free} reserve_bytes={}",
                 manifest.resident_bytes,
-                total / 16
+                reserve
             );
             self.poisoned = true;
             let mut catalog = WeightCatalog::load_with_policy(
@@ -2596,6 +2783,10 @@ impl Engine {
             _ => require_qwen35_geometry(&model_spec)?,
         }
         let write = mode.writes();
+        let media_bytes = match mode {
+            super::SetupMode::Media { reserved_bytes } => reserved_bytes,
+            _ => 0,
+        };
         #[cfg(feature = "cuda")]
         let reserve_mtp = matches!(mode, super::SetupMode::Mtp { .. });
         #[cfg(feature = "rocm")]
@@ -2771,7 +2962,14 @@ impl Engine {
                 )
                 .and_then(|n| n.checked_add(fixed))
                 .context("dense workspace reservation overflow")?;
-                WeightCatalog::load_dense(dir, &model_spec, &device, transient, prefix_cache)?
+                WeightCatalog::load_dense(
+                    dir,
+                    &model_spec,
+                    &device,
+                    transient,
+                    media_bytes,
+                    prefix_cache,
+                )?
             } else if prefix_cache {
                 WeightCatalog::load_for_prefix_cache(dir, &model_spec, &device)?
             } else {
@@ -2895,6 +3093,7 @@ impl Engine {
                 .checked_add(mtp_budget.as_ref().map_or(0, |b| b.fixed_bytes))
                 .and_then(|bytes| bytes.checked_add(target_transaction_bytes))
                 .and_then(|bytes| bytes.checked_add(target_head_bytes))
+                .and_then(|bytes| bytes.checked_add(media_bytes))
                 .context("combined fixed bytes overflow")?,
         };
         let expert_setup = if model_spec.moe.is_some() && !glm {
@@ -3310,6 +3509,11 @@ impl Engine {
             kv_scratch,
             (verify_rows, draft_config.is_some()),
         )?);
+        engine
+            .qwen
+            .as_mut()
+            .context("media runtime missing")?
+            .media_reserved_bytes = media_bytes;
         #[cfg(feature = "cuda")]
         if flint {
             if write {
@@ -5560,6 +5764,11 @@ impl Engine {
         let rows = input.len() / input_width;
         let x = s.clone_htod(input)?;
         let y = s.alloc_zeros(rows * output_width)?;
+        self.blas.prepare_fixed(
+            u32::try_from(rows)?,
+            u32::try_from(output_width)?,
+            u32::try_from(input_width)?,
+        )?;
         layer.linear.run(
             &self.blas,
             role,

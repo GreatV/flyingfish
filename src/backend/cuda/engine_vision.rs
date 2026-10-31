@@ -7,7 +7,7 @@ use crate::{
         contracts::{Scratch, Tensor, TensorMut, dense_layout},
         cubin,
         flash::{Flash, Query, Score, Shape},
-        linear::{LinearBiasMode, LinearWeightRef, disjoint},
+        linear::{ClippedLinear, LinearBiasMode, LinearWeightRef, disjoint},
         ops::{CommonOpsRef, GeluMode, RmsMode, RmsOptions, flat, grid},
         vision::{
             PatchGrid, PatchPacking, VisionAttnBindings, VisionAttnOps, VisionAttnPlan,
@@ -165,7 +165,7 @@ fn dense_at<T: crate::backend::gpu::DeviceRepr + Copy, const R: usize>(
 
 /// Stage view: exact-length `dense` when the extent covers the whole allocation, otherwise the
 /// offset-0 prefix `dense_at`.
-fn stage_view<T: crate::backend::gpu::DeviceRepr + Copy, const R: usize>(
+pub(super) fn stage_view<T: crate::backend::gpu::DeviceRepr + Copy, const R: usize>(
     buffer: &CudaSlice<T>,
     stream: &Arc<CudaStream>,
     shape: [u32; R],
@@ -272,7 +272,7 @@ struct PatchPositionBindings<'a> {
 }
 
 impl VisionIo {
-    fn new(device: &Device, width: u32) -> Result<Self> {
+    pub(super) fn new(device: &Device, width: u32) -> Result<Self> {
         let splice = match width {
             2048 => "vision_splice_2048",
             5120 => "q38_vision_splice",
@@ -1134,13 +1134,14 @@ impl VisionRuntime {
         blas: &mut Blas,
         input: &MultimodalInput<'_>,
         capacity: usize,
+        reserve: usize,
     ) -> Result<VisionRequest> {
         match self {
             Self::LayerNorm(tower) => Ok(VisionRequest::LayerNorm(Box::new(
-                tower.prepare(device, blas, input, capacity)?,
+                tower.prepare(device, blas, input, capacity, reserve)?,
             ))),
             Self::Axial(tower) => Ok(VisionRequest::Axial(Box::new(
-                tower.prepare(device, blas, input, capacity)?,
+                tower.prepare(device, blas, input, capacity, reserve)?,
             ))),
         }
     }
@@ -1461,6 +1462,7 @@ impl LayerNormTower {
         blas: &mut Blas,
         input: &MultimodalInput<'_>,
         capacity: usize,
+        reserve: usize,
     ) -> Result<LayerNormRequest> {
         let positions = input.validate(&self.model, capacity)?;
         let packings = VisionPackings::new(&self.geometry, input.grids)?;
@@ -1470,9 +1472,9 @@ impl LayerNormTower {
             "patch packing/input mismatch"
         );
         let (bytes, scratch_bytes) = tower_bytes(&self.geometry, &packings)?;
-        let (free, total) = device.ctx.mem_get_info()?;
+        let (free, _) = device.ctx.mem_get_info()?;
         ensure!(
-            free.checked_sub(total / 16).is_some_and(|n| bytes <= n),
+            free.checked_sub(reserve).is_some_and(|n| bytes <= n),
             "vision tower budget exceeded: required={bytes} free={free}"
         );
         let rows = packing.real_rows();
@@ -1640,7 +1642,7 @@ impl LayerNormTower {
             "{}",
             serde_json::json!({"vision_memory_plan": {
                 "rows":rows,"padded_rows":padded,"images":packing.images(),
-                "payload_bytes":bytes,"operator_scratch_bytes":scratch_bytes,"free_bytes":free,"reserve_bytes":total/16
+                "payload_bytes":bytes,"operator_scratch_bytes":scratch_bytes,"free_bytes":free,"reserve_bytes":reserve
             }})
         );
         Ok(LayerNormRequest {
@@ -2350,94 +2352,6 @@ impl LayerNormTower {
     }
 }
 
-struct ClippedLinear {
-    weight: CudaSlice<bf16>,
-    shape: [u32; 2],
-    bounds: Option<[CudaSlice<bf16>; 4]>,
-}
-
-impl ClippedLinear {
-    fn take(
-        catalog: &mut WeightCatalog,
-        name: &str,
-        shape: [u32; 2],
-        bounds: Option<&str>,
-    ) -> Result<Self> {
-        let weight = take(catalog, name, &[shape[0] as usize, shape[1] as usize])?;
-        let bounds = bounds
-            .map(|prefix| -> Result<_> {
-                Ok([
-                    take(catalog, &format!("{prefix}.input_min"), &[])?,
-                    take(catalog, &format!("{prefix}.input_max"), &[])?,
-                    take(catalog, &format!("{prefix}.output_min"), &[])?,
-                    take(catalog, &format!("{prefix}.output_max"), &[])?,
-                ])
-            })
-            .transpose()?;
-        Ok(Self {
-            weight,
-            shape,
-            bounds,
-        })
-    }
-
-    fn prepare(&self, blas: &Blas, rows: u32) -> Result<()> {
-        blas.prepare_request_fixed(rows, self.shape[0], self.shape[1])
-    }
-
-    fn run(
-        &self,
-        stream: &Arc<CudaStream>,
-        blas: &Blas,
-        clamp: &CudaFunction,
-        input: Tensor<bf16, 2>,
-        scratch: TensorMut<bf16, 2>,
-        output: &mut TensorMut<bf16, 2>,
-    ) -> Result<()> {
-        let x = if let Some(bounds) = &self.bounds {
-            ensure!(
-                input.shape == scratch.0.shape,
-                "clamp scratch extent differs"
-            );
-            disjoint(&input, &scratch.0)?;
-            let count = u64::from(input.shape[0]) * u64::from(input.shape[1]);
-            unsafe {
-                stream
-                    .launch_builder(clamp)
-                    .arg(&input.ptr)
-                    .arg(&scratch.0.ptr)
-                    .arg(&count)
-                    .arg(&bounds[0])
-                    .arg(&bounds[1])
-                    .launch(flat(count as usize))?;
-            }
-            scratch.0
-        } else {
-            input
-        };
-        blas.linear_typed(
-            crate::op_contract::ExecutionPhase::Prefill,
-            LinearWeightRef::Bf16(dense(&self.weight, stream, self.shape)?),
-            x,
-            output,
-        )?;
-        if let Some(bounds) = &self.bounds {
-            let count = u64::from(output.0.shape[0]) * u64::from(output.0.shape[1]);
-            unsafe {
-                stream
-                    .launch_builder(clamp)
-                    .arg(&output.0.ptr)
-                    .arg(&output.0.ptr)
-                    .arg(&count)
-                    .arg(&bounds[2])
-                    .arg(&bounds[3])
-                    .launch(flat(count as usize))?;
-            }
-        }
-        Ok(())
-    }
-}
-
 struct AxialBlock {
     input_norm: CudaSlice<bf16>,
     post_attention_norm: CudaSlice<bf16>,
@@ -2668,6 +2582,7 @@ impl AxialTower {
         blas: &mut Blas,
         input: &MultimodalInput<'_>,
         capacity: usize,
+        reserve: usize,
     ) -> Result<AxialRequest> {
         let positions = input.validate(&self.model, capacity)?;
         let vision = self
@@ -2680,9 +2595,9 @@ impl AxialTower {
             .as_ref()
             .context("axial configuration missing")?;
         let bytes = Self::request_bytes(&self.model, input, capacity)?;
-        let (free, total) = device.ctx.mem_get_info()?;
+        let (free, _) = device.ctx.mem_get_info()?;
         ensure!(
-            free.checked_sub(total / 16).is_some_and(|n| bytes <= n),
+            free.checked_sub(reserve).is_some_and(|n| bytes <= n),
             "axial vision workspace exceeds memory budget: required={bytes} free={free}"
         );
         let rows = positions
@@ -3093,7 +3008,7 @@ impl AxialTower {
 /// Owns merger output until all prompt chunks have consumed their image rows.
 pub(super) struct EncodedImages {
     positions: PositionPlan,
-    features: CudaSlice<bf16>,
+    pub(super) features: CudaSlice<bf16>,
     io: Arc<VisionIo>,
 }
 impl EncodedImages {
@@ -3223,12 +3138,14 @@ mod tests {
         let pixels = vec![0.25; 2 * 2520 * 768];
         let grids = [ImageGrid { t: 1, h: 42, w: 60 }; 2];
         let input = MultimodalInput {
+            audio: &[],
             input_ids: &ids,
             modality_ids: &modalities,
             pixel_values: &pixels,
             grids: &grids,
         };
         let single = MultimodalInput {
+            audio: &[],
             input_ids: &ids[..282],
             modality_ids: &modalities[..282],
             pixel_values: &pixels[..2520 * 768],
@@ -3532,6 +3449,7 @@ mod tests {
         for width in [1536, 2048, 2560, OUTPUT] {
             let io = Arc::new(VisionIo::new(&device, width)?);
             let plan = MultimodalInput {
+                audio: &[],
                 input_ids: &ids,
                 modality_ids: &modalities,
                 pixel_values: &pixels,
@@ -3818,12 +3736,19 @@ mod tests {
                 .map(|v| f32::from_le_bytes(*v))
                 .collect();
             let input = MultimodalInput {
+                audio: &[],
                 input_ids: &ids,
                 modality_ids: &modalities,
                 pixel_values: &pixels,
                 grids: &grids,
             };
-            let request = runtime.prepare(&device, &mut blas, &input, ids.len())?;
+            let request = runtime.prepare(
+                &device,
+                &mut blas,
+                &input,
+                ids.len(),
+                device.ctx.mem_get_info()?.1 / 16,
+            )?;
             let feature_rows = request.prefix.positions.feature_rows();
             let mut trace = crate::trace::Trace::default();
             trace.set_device(&device.info.name)?;
@@ -3947,12 +3872,19 @@ mod tests {
                 vision_config.patch as usize,
             );
             let input = MultimodalInput {
+                audio: &[],
                 input_ids: &merged.ids,
                 modality_ids: &merged.modalities,
                 pixel_values: &merged_pixels,
                 grids: &merged.grids,
             };
-            let request = runtime.prepare(&device, &mut blas, &input, merged.ids.len())?;
+            let request = runtime.prepare(
+                &device,
+                &mut blas,
+                &input,
+                merged.ids.len(),
+                device.ctx.mem_get_info()?.1 / 16,
+            )?;
             let mut trace = crate::trace::Trace::default();
             trace.set_device(&device.info.name)?;
             let _images = runtime.encode(s, &blas, request, Some(&mut trace))?;
@@ -4986,12 +4918,19 @@ mod tests {
                 .map(|v| f32::from_le_bytes(*v))
                 .collect();
             let input = MultimodalInput {
+                audio: &[],
                 input_ids: &ids,
                 modality_ids: &modalities,
                 pixel_values: &pixels,
                 grids: &grids,
             };
-            let request = runtime.prepare(&device, &mut blas, &input, ids.len())?;
+            let request = runtime.prepare(
+                &device,
+                &mut blas,
+                &input,
+                ids.len(),
+                device.ctx.mem_get_info()?.1 / 16,
+            )?;
             let rows = request.prefix.positions.patch_rows();
             let mut trace = crate::trace::Trace::default();
             trace.set_device(&device.info.name)?;

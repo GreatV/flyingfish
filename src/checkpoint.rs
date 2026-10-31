@@ -208,9 +208,12 @@ impl MappedCheckpoint {
             ensure!(
                 matches!(
                     policy,
-                    LoadPolicy::TextOnly | LoadPolicy::TextWithVision | LoadPolicy::VisionOnly
+                    LoadPolicy::TextOnly
+                        | LoadPolicy::TextWithVision
+                        | LoadPolicy::VisionOnly
+                        | LoadPolicy::AudioOnly
                 ),
-                "Gemma 4 load policy requires text and/or vision"
+                "Gemma 4 load policy requires text, vision or audio"
             );
             let expected = self.gemma4_expected(spec)?;
             let planned = Self::planned_bytes(&expected, policy)?;
@@ -443,6 +446,7 @@ impl MappedCheckpoint {
         if let Some(vision) = &spec.vision {
             Self::axial_vision_entries(vision, &mut expected)?;
         }
+        Self::audio_entries(spec, &mut expected)?;
         let views = self.views()?;
         for (name, shard) in &self.index.weight_map {
             let scope = if spec.vision.is_none()
@@ -451,8 +455,9 @@ impl MappedCheckpoint {
                     || name.starts_with("model.vision_embedder."))
             {
                 TensorScope::Vision
-            } else if name.starts_with("model.audio_tower.")
-                || name.starts_with("model.embed_audio.")
+            } else if spec.audio.is_none()
+                && (name.starts_with("model.audio_tower.")
+                    || name.starts_with("model.embed_audio."))
             {
                 TensorScope::Audio
             } else {
@@ -468,6 +473,85 @@ impl MappedCheckpoint {
             );
         }
         Ok(expected)
+    }
+
+    fn audio_entries(
+        spec: &crate::model_spec::ModelSpec,
+        expected: &mut BTreeMap<String, ExpectedTensor>,
+    ) -> Result<()> {
+        let Some(a) = &spec.audio else {
+            return Ok(());
+        };
+        let h = a.hidden as usize;
+        let mut add = |name, shape| put(expected, name, Dtype::BF16, shape, TensorScope::Audio);
+        let p = "model.audio_tower";
+        let [c0, c1] = a.subsample_channels.map(|n| n as usize);
+        for (i, input, output) in [(0, 1, c0), (1, c0, c1)] {
+            add(
+                format!("{p}.subsample_conv_projection.layer{i}.conv.weight"),
+                vec![output, input, 3, 3],
+            );
+            add(
+                format!("{p}.subsample_conv_projection.layer{i}.norm.weight"),
+                vec![output],
+            );
+        }
+        add(
+            format!("{p}.subsample_conv_projection.input_proj_linear.weight"),
+            vec![h, 32 * c1],
+        );
+        add(
+            format!("{p}.output_proj.weight"),
+            vec![a.output as usize, h],
+        );
+        add(format!("{p}.output_proj.bias"), vec![a.output as usize]);
+        add(
+            "model.embed_audio.embedding_projection.weight".into(),
+            vec![spec.hidden as usize, a.output as usize],
+        );
+        for layer in 0..a.layers {
+            let p = format!("{p}.layers.{layer}");
+            for (name, shape) in [
+                ("feed_forward1.ffw_layer_1", vec![4 * h, h]),
+                ("feed_forward1.ffw_layer_2", vec![h, 4 * h]),
+                ("feed_forward2.ffw_layer_1", vec![4 * h, h]),
+                ("feed_forward2.ffw_layer_2", vec![h, 4 * h]),
+                ("self_attn.q_proj", vec![h, h]),
+                ("self_attn.k_proj", vec![h, h]),
+                ("self_attn.v_proj", vec![h, h]),
+                ("self_attn.post", vec![h, h]),
+                ("lconv1d.linear_start", vec![2 * h, h]),
+                ("lconv1d.linear_end", vec![h, h]),
+            ] {
+                add(format!("{p}.{name}.linear.weight"), shape);
+                for bound in ["input_min", "input_max", "output_min", "output_max"] {
+                    add(format!("{p}.{name}.{bound}"), vec![]);
+                }
+            }
+            for name in [
+                "feed_forward1.pre_layer_norm",
+                "feed_forward1.post_layer_norm",
+                "feed_forward2.pre_layer_norm",
+                "feed_forward2.post_layer_norm",
+                "lconv1d.pre_layer_norm",
+                "lconv1d.conv_norm",
+                "norm_pre_attn",
+                "norm_post_attn",
+                "norm_out",
+            ] {
+                add(format!("{p}.{name}.weight"), vec![h]);
+            }
+            add(format!("{p}.self_attn.relative_k_proj.weight"), vec![h, h]);
+            add(
+                format!("{p}.self_attn.per_dim_scale"),
+                vec![h / a.heads as usize],
+            );
+            add(
+                format!("{p}.lconv1d.depthwise_conv1d.weight"),
+                vec![h, 1, a.conv_kernel as usize],
+            );
+        }
+        Ok(())
     }
 
     fn axial_vision_entries(
@@ -2128,6 +2212,8 @@ pub enum LoadPolicy {
     TextWithVision,
     /// For the standalone vision component; cannot construct a text Engine.
     VisionOnly,
+    /// Audio component attached to an existing text engine.
+    AudioOnly,
     TextWithMtp,
     /// Only MTP and the shared embedding/head; no target layers or final norm.
     #[cfg(test)]
@@ -2148,6 +2234,7 @@ impl LoadPolicy {
                 Self::TextOnly | Self::TextWithVision | Self::TextWithMtp,
                 TensorScope::Text
             ) | (Self::TextWithVision | Self::VisionOnly, TensorScope::Vision)
+                | (Self::AudioOnly, TensorScope::Audio)
                 | (Self::TextWithMtp | Self::MtpOnly, TensorScope::Mtp)
         )
     }
@@ -2928,6 +3015,35 @@ mod component_tests {
                     .manifest(&wrong_geometry, LoadPolicy::VisionOnly)
                     .is_err(),
                 "checkpoint-derived vision shapes hid a config/weight mismatch"
+            );
+        }
+        if spec.audio.is_some() {
+            let audio_manifest = checkpoint.manifest(&spec, LoadPolicy::AudioOnly)?;
+            ensure!(
+                audio_manifest.resident_bytes
+                    == if spec.hidden == 1536 {
+                        614_368_768
+                    } else {
+                        617_514_496
+                    }
+                    && audio_manifest.entries.values().filter(|e| e.load).count() == 752
+                    && audio_manifest
+                        .entries
+                        .values()
+                        .all(|e| e.load == (e.scope == TensorScope::Audio)),
+                "audio manifest residency differs from published shapes"
+            );
+            let mut wrong_audio = spec.clone();
+            wrong_audio
+                .audio
+                .as_mut()
+                .context("audio spec")?
+                .conv_kernel = 3;
+            ensure!(
+                checkpoint
+                    .manifest(&wrong_audio, LoadPolicy::TextOnly)
+                    .is_err(),
+                "checkpoint-derived audio shapes hid a wrong convolution kernel"
             );
         }
         let (total, vision, audio, dormant, resident) = match spec.hidden {

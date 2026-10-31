@@ -1252,6 +1252,7 @@ impl WeightCatalog {
         spec: &crate::model_spec::ModelSpec,
         d: &Device,
         transient_bytes: usize,
+        media_bytes: usize,
         prefix_cache: bool,
     ) -> Result<Self> {
         use crate::prefill::DensePlacement;
@@ -1280,11 +1281,8 @@ impl WeightCatalog {
             }
         }
         let (free, total) = d.ctx.mem_get_info()?;
-        let budget = free
-            .checked_sub(total / 16)
-            .and_then(|n| n.checked_sub(transient_bytes))
-            .and_then(|n| n.checked_sub(fixed))
-            .context("dense fixed weights and workspace exceed VRAM")?;
+        let budget =
+            DensePlacement::device_budget(free, total, fixed, transient_bytes, media_bytes)?;
         let preliminary = DensePlacement::new(&layers, budget, 0)?;
         if preliminary.slot_bytes == 0 {
             return Self::load_inner(
@@ -1388,6 +1386,22 @@ impl WeightCatalog {
             upload_hashed_bytes: None,
             load_wall_ms: elapsed_ms(started),
         })
+    }
+
+    pub fn take_bf16(&mut self, name: &str, shape: &[usize]) -> Result<CudaSlice<bf16>> {
+        let entry = self
+            .manifest
+            .entries
+            .get(name)
+            .context("BF16 manifest entry missing")?;
+        anyhow::ensure!(
+            entry.load && entry.dtype == safetensors::Dtype::BF16 && entry.shape == shape,
+            "invalid BF16 tensor {name}"
+        );
+        match self.tensors.remove(name) {
+            Some(StoredTensor::Bf16(buffer)) => Ok(buffer),
+            _ => anyhow::bail!("tensor not uploaded as BF16: {name}"),
+        }
     }
 
     /// Move shared global tensors into the existing Engine weight owner.

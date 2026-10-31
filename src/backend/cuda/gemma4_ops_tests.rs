@@ -382,6 +382,288 @@ impl ReferenceValues {
 
 type ReferenceFixture = BTreeMap<String, (Vec<usize>, ReferenceValues)>;
 
+fn audio_output_matches(
+    device: &Device,
+    output: &crate::backend::gpu::CudaSlice<bf16>,
+    expected: &[f32],
+    bound: &serde_json::Value,
+) -> Result<bool> {
+    let host = device.stream.clone_dtoh(output)?;
+    ensure!(
+        host.len() == expected.len() + 32
+            && host[expected.len()..].iter().all(|v| v.to_bits() == 0x7fc1),
+        "RUNNER_FAIL audio output guard overwritten"
+    );
+    vision_distance(
+        &host[..expected.len()]
+            .iter()
+            .map(|v| v.to_f32())
+            .collect::<Vec<_>>(),
+        expected,
+        bound,
+    )
+}
+
+#[test]
+#[ignore = "requires frozen cross-device audio operator fixtures and a GPU window"]
+fn audio_operators_match_definition_gpu() -> Result<()> {
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("FF_GEMMA4_FIXTURES").context("fixtures missing")?,
+    );
+    let frozen: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("AUDIO_FROZEN.json"))?)?;
+    ensure!(
+        frozen["status"] == "FROZEN" && frozen["candidate_observations"] == 0,
+        "RUNNER_FAIL audio reference freeze missing"
+    );
+    let device = Device::new(0)?;
+    let stream = &device.stream;
+    let pointwise = cubin::module(&device.ctx, "vision_ops")?;
+    let patch = pointwise.load_function("masked_strided_patch_bf16")?;
+    let activation = pointwise.load_function("activation_bf16")?;
+    let conv = pointwise.load_function("causal_depthwise_conv_bf16")?;
+    let branch =
+        cubin::module(&device.ctx, "q38_common")?.load_function("rms_scaled_branch_add")?;
+    let attention =
+        cubin::module(&device.ctx, "attention")?.load_function("relative_window_attention_d128")?;
+    let mut cells = 0;
+    let mut defects = 0;
+    for (name, cell) in frozen["cells"].as_object().context("audio cells")? {
+        let fixture = load_reference(&directory.join(format!("{name}.safetensors")))?;
+        if name == "audio-relative-table" {
+            let actual = super::engine::audio_runtime::relative_positions(13, 1024)?
+                .into_iter()
+                .map(bf16::to_f32)
+                .collect::<Vec<_>>();
+            let expected = reference(&fixture, "positions")?.as_f32();
+            let pass = vision_distance(&actual, &expected, &cell["bounds"]["positions"])?;
+            let wrong = (0..13)
+                .flat_map(|row| {
+                    (0..1024).map(move |d| {
+                        let exponent = (d % 512) as f32 * -(10000_f64.ln() / 511.0) as f32;
+                        let phase = (12 - row) as f32 * exponent.exp();
+                        bf16::from_f32(if d < 512 { phase.sin() } else { phase.cos() }).to_f32()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let detected = !vision_distance(&wrong, &expected, &cell["bounds"]["positions"])?;
+            cells += 2;
+            defects += usize::from(!pass) + usize::from(!detected);
+            println!(
+                "{} audio_relative_table elements=13312 old_fp32_control={detected}",
+                if pass && detected { "PASS" } else { "DEFECT" }
+            );
+            continue;
+        }
+        let upload =
+            |name: &str| -> Result<_> { Ok(stream.clone_htod(reference_bf16(&fixture, name)?)?) };
+        let output = |count: usize| -> Result<_> {
+            Ok(stream.clone_htod(&vec![bf16::from_bits(0x7fc1); count + 32])?)
+        };
+        let compare =
+            |key: &str, out: &crate::backend::gpu::CudaSlice<bf16>, mutant: bool| -> Result<bool> {
+                let pass = audio_output_matches(
+                    &device,
+                    out,
+                    &reference(&fixture, key)?.as_f32(),
+                    &cell["bounds"][key],
+                )?;
+                println!(
+                    "AUDIO_OP {name} {key} mutant={mutant} {}",
+                    if pass != mutant { "PASS" } else { "DEFECT" }
+                );
+                Ok(pass != mutant)
+            };
+        let mask_host = reference_bf16(&fixture, "mask")?
+            .iter()
+            .map(|v| u8::from(v.to_f32() != 0.0))
+            .collect::<Vec<_>>();
+        let mask = stream.clone_htod(&mask_host)?;
+        let x = upload("x")?;
+        if name.starts_with("audio-patch-") {
+            let [time, frequency, channels] = <[usize; 3]>::try_from(fixture["x"].0.clone())
+                .map_err(|_| anyhow::anyhow!("patch shape"))?;
+            let count = time.div_ceil(2) * frequency.div_ceil(2) * channels * 9;
+            let out = output(count)?;
+            let run = |mask: &crate::backend::gpu::CudaSlice<u8>| -> Result<()> {
+                unsafe {
+                    stream
+                        .launch_builder(&patch)
+                        .arg(&x)
+                        .arg(mask)
+                        .arg(&out)
+                        .arg(&(time as u32))
+                        .arg(&(frequency as u32))
+                        .arg(&(channels as u32))
+                        .launch(flat(count))?;
+                }
+                Ok(())
+            };
+            run(&mask)?;
+            defects += usize::from(!compare("patches", &out, false)?);
+            cells += 1;
+            run(&stream.clone_htod(&vec![1u8; time])?)?;
+            defects += usize::from(!compare("patches", &out, true)?);
+            cells += 1;
+            continue;
+        }
+        let rows = u32::try_from(cell["rows"].as_u64().context("audio rows")?)?;
+        let count = rows as usize * 1024;
+        for (key, input_key, width, n, mode) in [
+            ("relu", "x", 1024u32, rows, 0i32),
+            ("silu", "x", 1024, rows, 1),
+            ("glu", "gate", 1024, rows, 2),
+            ("softplus", "scale", 128, 1, 3),
+        ] {
+            let input = upload(input_key)?;
+            let out = output(n as usize * width as usize)?;
+            unsafe {
+                stream
+                    .launch_builder(&activation)
+                    .arg(&input)
+                    .arg(&out)
+                    .arg(&n)
+                    .arg(&width)
+                    .arg(&mode)
+                    .launch(flat(n as usize * width as usize))?;
+            }
+            defects += usize::from(!compare(key, &out, false)?);
+            cells += 1;
+            if key == "glu" {
+                let mut swapped = reference_bf16(&fixture, "gate")?.to_vec();
+                for row in swapped.as_chunks_mut::<2048>().0 {
+                    row.rotate_left(1024);
+                }
+                let input = stream.clone_htod(&swapped)?;
+                unsafe {
+                    stream
+                        .launch_builder(&activation)
+                        .arg(&input)
+                        .arg(&out)
+                        .arg(&n)
+                        .arg(&width)
+                        .arg(&mode)
+                        .launch(flat(n as usize * width as usize))?;
+                }
+                defects += usize::from(!compare(key, &out, true)?);
+                cells += 1;
+            }
+        }
+        let weight = upload("conv_weight")?;
+        let out = output(count)?;
+        let run_conv = |input: &crate::backend::gpu::CudaSlice<bf16>| -> Result<()> {
+            unsafe {
+                stream
+                    .launch_builder(&conv)
+                    .arg(input)
+                    .arg(&weight)
+                    .arg(&out)
+                    .arg(&rows)
+                    .arg(&1024u32)
+                    .arg(&5u32)
+                    .launch(flat(count))?;
+            }
+            Ok(())
+        };
+        run_conv(&x)?;
+        defects += usize::from(!compare("conv", &out, false)?);
+        cells += 1;
+        if rows > 1 {
+            let mut wrong = reference_bf16(&fixture, "x")?.to_vec();
+            wrong.rotate_right(1024);
+            run_conv(&stream.clone_htod(&wrong)?)?;
+            defects += usize::from(!compare("conv", &out, true)?);
+            cells += 1;
+        }
+        let b = upload("branch")?;
+        let w = upload("weight")?;
+        for mutant in [false, true] {
+            let mut host = reference_bf16(&fixture, "x")?
+                .iter()
+                .map(|v| {
+                    if mutant {
+                        bf16::from_f32(v.to_f32() * 0.5)
+                    } else {
+                        *v
+                    }
+                })
+                .collect::<Vec<_>>();
+            host.extend([bf16::from_bits(0x7fc1); 32]);
+            let out = stream.clone_htod(&host)?;
+            unsafe {
+                stream
+                    .launch_builder(&branch)
+                    .arg(&out)
+                    .arg(&b)
+                    .arg(&w)
+                    .arg(&1024u32)
+                    .arg(&1e-6f32)
+                    .arg(&1e10f32)
+                    .arg(&0.5f32)
+                    .launch(super::ops::grid(rows as usize, 256))?;
+            }
+            defects += usize::from(!compare("branch_out", &out, mutant)?);
+            cells += 1;
+        }
+        let q = upload("q")?;
+        let k = upload("k")?;
+        let v = upload("v")?;
+        let relative = upload("relative")?;
+        let scale = upload("scale")?;
+        let softplus = stream.alloc_zeros::<bf16>(128)?;
+        unsafe {
+            stream
+                .launch_builder(&activation)
+                .arg(&scale)
+                .arg(&softplus)
+                .arg(&1u32)
+                .arg(&128u32)
+                .arg(&3i32)
+                .launch(flat(128))?;
+        }
+        let out = output(count)?;
+        let q_scale = (128f64.powf(-0.5) / 2f64.ln()) as f32;
+        let k_scale = ((1.0 + std::f64::consts::E).ln() / 2f64.ln()) as f32;
+        for left in [13u32, 14] {
+            if left == 14 && rows < 13 {
+                continue;
+            }
+            unsafe {
+                stream
+                    .launch_builder(&attention)
+                    .arg(&q)
+                    .arg(&k)
+                    .arg(&v)
+                    .arg(&relative)
+                    .arg(&softplus)
+                    .arg(&mask)
+                    .arg(&out)
+                    .arg(&rows)
+                    .arg(&8u32)
+                    .arg(&12u32)
+                    .arg(&left)
+                    .arg(&q_scale)
+                    .arg(&k_scale)
+                    .arg(&50.0f32)
+                    .arg(&-1e9f32)
+                    .launch(LaunchConfig {
+                        grid_dim: (rows, 8, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+            defects += usize::from(!compare("attention", &out, left == 14)?);
+            cells += 1;
+        }
+    }
+    println!(
+        "AUDIO_OPS {} cells={cells} defects={defects}",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(defects == 0, "audio operator defects={defects}");
+    Ok(())
+}
+
 fn load_reference(path: &std::path::Path) -> Result<ReferenceFixture> {
     let bytes = std::fs::read(path)?;
     let tensors = SafeTensors::deserialize(&bytes)?;
@@ -2759,7 +3041,6 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
         .as_ref()
         .context("vision config missing")?
         .image_token;
-    let mut engine = super::engine::Engine::load(&dir, 0, 896, Some(896), settings)?;
     let mut defects = 0usize;
     let mut street_features = None;
     let mut street_input = None;
@@ -2797,11 +3078,20 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
             w: u32::try_from(cell["grid_xy"][0].as_u64().context("grid w")?)?,
         }];
         let input = MultimodalInput {
+            audio: &[],
             input_ids: &ids,
             modality_ids: modality_view.data(),
             pixel_values: &pixels,
             grids: &grids,
         };
+        let mut engine = super::engine::Engine::load_multimodal(
+            &dir,
+            0,
+            896,
+            Some(896),
+            settings.clone(),
+            &input,
+        )?;
         let identities: Vec<_> = ids
             .iter()
             .map(|&id| if id == image_token { 0 } else { id })
@@ -2892,6 +3182,7 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
             mixed_pixels.extend_from_slice(&pixels);
             let mixed_grids = [previous.3, grids[0]];
             let mixed_input = MultimodalInput {
+                audio: &[],
                 input_ids: &mixed_ids,
                 modality_ids: &mixed_modalities,
                 pixel_values: &mixed_pixels,
@@ -2902,6 +3193,24 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
                 .map(|&id| if id == image_token { 0 } else { id })
                 .collect();
             engine.reset()?;
+            let calls = engine.gemma_encoder_calls()?;
+            let rejected = engine.prefill_multimodal(&mixed_input, None).is_err();
+            ensure!(
+                rejected && engine.gemma_encoder_calls()? == calls,
+                "larger media request was not rejected before encoding"
+            );
+            println!(
+                "media_reservation_control larger_request_rejected=true encoder_calls_unchanged=true"
+            );
+            drop(engine);
+            engine = super::engine::Engine::load_multimodal(
+                &dir,
+                0,
+                896,
+                Some(896),
+                settings.clone(),
+                &mixed_input,
+            )?;
             let mut mixed_trace = crate::trace::Trace::default();
             engine.gemma_vision_trace(&mixed_input, &mixed_identities, &mut mixed_trace)?;
             let actual = mixed_trace.values("image_features")?;
@@ -2929,6 +3238,7 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
         }
         let prompt = first + 1;
         let prompt_input = MultimodalInput {
+            audio: &[],
             input_ids: &ids[..prompt],
             modality_ids: &modality_view.data()[..prompt],
             pixel_values: &pixels,
@@ -2976,6 +3286,467 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
         if defects == 0 { "PASS" } else { "DEFECT" }
     );
     ensure!(defects == 0, "Gemma image candidate defects={defects}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires accepted audio media review, frozen model references, published weights and a GPU window"]
+fn audio_model_definition_and_graph_gpu() -> Result<()> {
+    use crate::vision_input::{AudioClip, MultimodalInput};
+    let dir = std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("model missing")?);
+    let fixtures = std::path::PathBuf::from(
+        std::env::var_os("FF_GEMMA4_FIXTURES").context("fixtures missing")?,
+    );
+    let frozen: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixtures.join("FROZEN.json"))?)?;
+    let review: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixtures.join("MEDIA_REVIEW.json"))?)?;
+    ensure!(
+        frozen["status"] == "FROZEN"
+            && frozen["candidate_observations"] == 0
+            && review["accepted"] == true,
+        "audio freeze or human review missing"
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fixtures.join("inputs/INPUT.json"))?)?;
+    let settings = crate::backend::Settings {
+        tree_builder: crate::backend::TreeBuilder::Waves,
+        spec_budget: crate::backend::SpecBudget::Chain,
+        spec_graph: true,
+        draft_model: None,
+        prefix_cache: false,
+        kv_format: crate::kv::KvFormat::Bf16,
+        runtime_dir: Some(std::path::PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime missing")?,
+        )),
+    };
+    let spec = crate::model_spec::ModelSpec::read(&dir)?;
+    let audio_token = spec.audio.as_ref().context("audio config missing")?.token;
+    let mut defects = 0;
+    let mut singles = Vec::new();
+    let mut stew = None;
+    for name in ["stew", "wizard", "pair", "long"] {
+        let cell = &metadata[name];
+        let bounds = &frozen["cells"][name];
+        let bytes = std::fs::read(fixtures.join(format!("inputs/{name}-input.safetensors")))?;
+        let data = SafeTensors::deserialize(&bytes)?;
+        let ids_view = data.tensor("ids")?;
+        let modalities = data.tensor("modalities")?;
+        let features = data.tensor("audio_features")?;
+        let mask = data.tensor("audio_mask")?;
+        ensure!(
+            ids_view.dtype() == safetensors::Dtype::I32
+                && modalities.dtype() == safetensors::Dtype::U8
+                && features.dtype() == safetensors::Dtype::F32
+                && mask.dtype() == safetensors::Dtype::BOOL,
+            "audio fixture dtype mismatch"
+        );
+        let ids = ids_view
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| u32::from_le_bytes(*v))
+            .collect::<Vec<_>>();
+        let values = features
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| f32::from_le_bytes(*v))
+            .collect::<Vec<_>>();
+        let valid = mask.data().iter().map(|v| *v != 0).collect::<Vec<_>>();
+        let frames = features.shape()[1];
+        let clips = values
+            .chunks_exact(frames * 128)
+            .zip(valid.chunks_exact(frames))
+            .map(|(features, mask)| AudioClip { features, mask })
+            .collect::<Vec<_>>();
+        let input = MultimodalInput {
+            input_ids: &ids,
+            modality_ids: modalities.data(),
+            pixel_values: &[],
+            grids: &[],
+            audio: &clips,
+        };
+        let mut engine = super::engine::Engine::load_multimodal(
+            &dir,
+            0,
+            1536,
+            Some(1536),
+            settings.clone(),
+            &input,
+        )?;
+        let identities = ids
+            .iter()
+            .map(|&id| if id == audio_token { 0 } else { id })
+            .collect::<Vec<_>>();
+        let oracle = load_reference(&fixtures.join(format!("oracle/{name}-packed.safetensors")))?;
+        let first = cell["score_first"].as_u64().context("score first")? as usize;
+        engine.reset()?;
+        let mut trace = crate::trace::Trace::default();
+        engine.gemma_vision_trace(&input, &identities, &mut trace)?;
+        for (stage, width, frequency, stride) in [
+            ("subsample0", 128usize, 64, 2),
+            ("subsample1", 32, 32, 4),
+            ("layer0", 1024, 1, 4),
+            ("tower", 1536, 1, 4),
+            ("features", spec.hidden as usize, 1, 4),
+        ] {
+            let mut actual = Vec::new();
+            for (index, clip) in clips.iter().enumerate() {
+                let raw = trace.values(&format!("audio.{index}.{stage}"))?;
+                let row_width = width * frequency;
+                ensure!(
+                    raw.len().is_multiple_of(row_width)
+                        && raw.len() <= clip.mask.len().div_ceil(stride) * row_width,
+                    "audio stage extent mismatch"
+                );
+                for (row, &keep) in clip.mask.iter().step_by(stride).enumerate() {
+                    if keep {
+                        actual.extend_from_slice(
+                            raw.get(row * row_width..(row + 1) * row_width)
+                                .context("audio stage omitted a valid row")?,
+                        );
+                    }
+                }
+            }
+            let pass = vision_distance(&actual, &oracle[stage].1.as_f32(), &bounds[stage])?;
+            defects += usize::from(!pass);
+            println!(
+                "{} audio_stage {name} {stage}",
+                if pass { "PASS" } else { "DEFECT" }
+            );
+            if stage == "features" {
+                if name == "stew" || name == "wizard" {
+                    singles.push(actual.clone());
+                }
+                if name == "pair" {
+                    let expected = singles.iter().flatten().copied().collect::<Vec<_>>();
+                    let mismatch = actual
+                        .iter()
+                        .zip(&expected)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    defects += usize::from(actual.len() != expected.len() || mismatch != 0);
+                    println!("audio_clip_isolation bit_mismatches={mismatch}");
+                }
+            }
+        }
+        let combined = trace.values(".debug.ple_identity")?;
+        let ple = combined.get(..ids.len() * 256).context("PLE extent")?;
+        let ple_pass = vision_distance(ple, &oracle["ple"].1.as_f32(), &bounds["ple"])?;
+        defects += usize::from(!ple_pass);
+        let mut actual = Vec::new();
+        for row in first..ids.len() {
+            actual.extend(engine.gemma_all_logits(row)?);
+        }
+        trace.add(
+            "scored_logits".into(),
+            vec![ids.len() - first, actual.len() / (ids.len() - first)],
+            actual.iter().map(|value| value.to_f32()).collect(),
+        )?;
+        if name == "stew" {
+            let h = spec.hidden as usize;
+            let full_rows =
+                super::engine::bucketed_prefill_rows(u32::try_from(ids.len())?, 1536)? as usize;
+            let normalized = trace.values(".debug.norm1")?;
+            let mut x = normalized[..ids.len() * h]
+                .iter()
+                .copied()
+                .map(bf16::from_f32)
+                .collect::<Vec<_>>();
+            x.resize(full_rows * h, bf16::ZERO);
+            let full = engine.gemma_linear_probe("self_attn.q_proj.weight", &x)?;
+            for (key, rows) in [("q_chunk128", 128), ("q_chunk10", 10)] {
+                let chunk = engine.gemma_linear_probe("self_attn.q_proj.weight", &x[..rows * h])?;
+                let mismatch = full.iter().zip(&chunk).filter(|(a, b)| a != b).count();
+                println!(
+                    "audio_text_linear_shapes full_rows={full_rows} chunk_rows={rows} bit_mismatches={mismatch}"
+                );
+                trace.add(
+                    key.into(),
+                    vec![rows, chunk.len() / rows],
+                    chunk.into_iter().map(bf16::to_f32).collect(),
+                )?;
+            }
+            trace.add(
+                "q_full".into(),
+                vec![full_rows, full.len() / full_rows],
+                full.into_iter().map(bf16::to_f32).collect(),
+            )?;
+            #[cfg(feature = "cuda")]
+            {
+                let receipt = engine.gemma_linear_plan_receipt()?;
+                let plans = receipt["lt"]
+                    .as_array()
+                    .context("linear plans missing")?
+                    .iter()
+                    .filter(|plan| {
+                        plan["input"].as_u64() == Some(h as u64)
+                            && plan["output"].as_u64() == Some(u64::from(spec.q_width))
+                            && [full_rows as u64, 128, 10]
+                                .contains(&plan["rows"].as_u64().unwrap_or(0))
+                    })
+                    .collect::<Vec<_>>();
+                println!("audio_text_linear_plans {}", serde_json::to_string(&plans)?);
+            }
+        }
+        let diagnostics = settings.runtime_dir.as_ref().context("runtime missing")?;
+        std::fs::create_dir_all(diagnostics)?;
+        trace.save(&diagnostics.join(format!("{name}-native.safetensors")))?;
+        let (pass, metrics, _) = model_metrics(
+            &actual,
+            &oracle["logits"].1.as_f32(),
+            &ids[first..],
+            &bounds["logits"],
+        )?;
+        defects += usize::from(!pass);
+        println!(
+            "{} audio_model {name} ple={ple_pass} {metrics}",
+            if pass && ple_pass { "PASS" } else { "DEFECT" }
+        );
+        if name == "stew" {
+            engine.reset()?;
+            let mut wrong = crate::trace::Trace::default();
+            engine.gemma_vision_trace(&input, &ids, &mut wrong)?;
+            let wrong = wrong.values(".debug.ple_identity")?;
+            let wrong = &wrong[..ids.len() * 256];
+            let detected = !vision_distance(wrong, &oracle["ple"].1.as_f32(), &bounds["ple"])?;
+            let text_changed = ids
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| **id != audio_token)
+                .filter(|(row, _)| ple[row * 256..][..256] != wrong[row * 256..][..256])
+                .count();
+            defects += usize::from(!detected || text_changed != 0);
+            println!("audio_identity_control detected={detected} text_rows_changed={text_changed}");
+            stew = Some((
+                ids.clone(),
+                modalities.data().to_vec(),
+                values.clone(),
+                valid.clone(),
+            ));
+            let image_bytes = std::fs::read(fixtures.join("inputs/image-input.safetensors"))?;
+            let image = SafeTensors::deserialize(&image_bytes)?;
+            let vision = spec.vision.as_ref().context("vision config")?;
+            let image_ids = image
+                .tensor("ids")?
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| u32::from_le_bytes(*v))
+                .collect::<Vec<_>>();
+            let image_end = image_ids
+                .iter()
+                .position(|&id| id == vision.end_token)
+                .context("image marker")?
+                + 1;
+            let image_modalities = image.tensor("modalities")?;
+            let pixels = image
+                .tensor("pixels")?
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_le_bytes(*v))
+                .collect::<Vec<_>>();
+            let positions = image.tensor("positions")?;
+            let xy = positions
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| i32::from_le_bytes(*v))
+                .collect::<Vec<_>>();
+            let grids = [crate::vision_input::ImageGrid {
+                t: 1,
+                h: (xy.iter().skip(1).step_by(2).max().context("image height")? + 1) as u32,
+                w: (xy.iter().step_by(2).max().context("image width")? + 1) as u32,
+            }];
+            let image_input = MultimodalInput {
+                input_ids: &image_ids[..image_end],
+                modality_ids: &image_modalities.data()[..image_end],
+                pixel_values: &pixels,
+                grids: &grids,
+                audio: &[],
+            };
+            let image_identities = image_input
+                .input_ids
+                .iter()
+                .map(|&id| if id == vision.image_token { 0 } else { id })
+                .collect::<Vec<_>>();
+            drop(engine);
+            engine = super::engine::Engine::load_multimodal(
+                &dir,
+                0,
+                1536,
+                Some(1536),
+                settings.clone(),
+                &image_input,
+            )?;
+            let mut image_trace = crate::trace::Trace::default();
+            engine.gemma_vision_trace(&image_input, &image_identities, &mut image_trace)?;
+            let mut mixed_ids = ids[..first + 1].to_vec();
+            mixed_ids.extend_from_slice(image_input.input_ids);
+            let mut mixed_modalities = modalities.data()[..first + 1].to_vec();
+            mixed_modalities.extend_from_slice(image_input.modality_ids);
+            let mixed = MultimodalInput {
+                input_ids: &mixed_ids,
+                modality_ids: &mixed_modalities,
+                pixel_values: &pixels,
+                grids: &grids,
+                audio: &clips,
+            };
+            let mixed_identities = mixed_ids
+                .iter()
+                .map(|&id| {
+                    if id == vision.image_token || id == audio_token {
+                        0
+                    } else {
+                        id
+                    }
+                })
+                .collect::<Vec<_>>();
+            drop(engine);
+            engine = super::engine::Engine::load_multimodal(
+                &dir,
+                0,
+                1536,
+                Some(1536),
+                settings.clone(),
+                &mixed,
+            )?;
+            let mut mixed_trace = crate::trace::Trace::default();
+            engine.gemma_vision_trace(&mixed, &mixed_identities, &mut mixed_trace)?;
+            let mut expected = singles[0].clone();
+            expected.extend(image_trace.values("media_features")?);
+            let actual = mixed_trace.values("media_features")?;
+            let mismatches = actual
+                .iter()
+                .zip(&expected)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            defects += usize::from(actual.len() != expected.len() || mismatches != 0);
+            println!(
+                "mixed_image_audio_splice bit_mismatches={mismatches} encoder_calls={:?}",
+                engine.gemma_encoder_calls()?
+            );
+        }
+        if name == "long" {
+            continue;
+        }
+        let prompt = first + 1;
+        let prompt_input = MultimodalInput {
+            input_ids: &ids[..prompt],
+            modality_ids: &modalities.data()[..prompt],
+            pixel_values: &[],
+            grids: &[],
+            audio: &clips,
+        };
+        let mut eager = Vec::new();
+        let mut eager_kv = None;
+        for graph in [false, true] {
+            engine.reset()?;
+            engine.prefill_multimodal(&prompt_input, None)?;
+            let mut output = engine
+                .decode_logits()?
+                .into_iter()
+                .map(bf16::from_f32)
+                .collect::<Vec<_>>();
+            if graph {
+                engine.capture()?;
+            }
+            for &token in &ids[prompt..] {
+                engine.set_token(token)?;
+                engine.decode(graph, None)?;
+                output.extend(engine.decode_logits()?.into_iter().map(bf16::from_f32));
+            }
+            let calls = engine.gemma_encoder_calls()?;
+            let kv = (
+                engine.gemma_kv_rows(0, ids.len())?,
+                engine.gemma_kv_rows(4, ids.len())?,
+            );
+            defects += usize::from(calls != (0, clips.len()));
+            let (pass, metrics, _) = model_metrics(
+                &output,
+                &oracle["logits"].1.as_f32(),
+                &ids[first..],
+                &bounds["logits"],
+            )?;
+            defects += usize::from(!pass);
+            println!(
+                "{} audio_decode {name} graph={graph} encoder_calls={calls:?} {metrics}",
+                if pass { "PASS" } else { "DEFECT" }
+            );
+            if graph {
+                let differences = output.iter().zip(&eager).filter(|(a, b)| a != b).count();
+                defects += usize::from(differences != 0);
+                println!("audio_graph {name} bit_mismatches={differences}");
+                let state_equal = eager_kv.as_ref() == Some(&kv);
+                defects += usize::from(!state_equal);
+                println!("audio_graph_state {name} kv_equal={state_equal}");
+            } else {
+                eager = output;
+                eager_kv = Some(kv);
+            }
+        }
+    }
+    ensure!(singles.len() == 2, "two audio controls missing");
+    let changed = singles[0]
+        .iter()
+        .zip(&singles[1])
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    defects += usize::from(changed == 0);
+    println!("audio_two_media changed_prefix_elements={changed}");
+    let (ids, modalities, values, valid) = stew.context("stew chunk fixture")?;
+    let clips = [AudioClip {
+        features: &values,
+        mask: &valid,
+    }];
+    let first = metadata["stew"]["score_first"]
+        .as_u64()
+        .context("score first")? as usize;
+    let input = MultimodalInput {
+        input_ids: &ids[..first + 1],
+        modality_ids: &modalities[..first + 1],
+        pixel_values: &[],
+        grids: &[],
+        audio: &clips,
+    };
+    let mut engine =
+        super::engine::Engine::load_multimodal(&dir, 0, 1536, Some(128), settings, &input)?;
+    engine.prefill_multimodal(&input, None)?;
+    let mut output = engine
+        .decode_logits()?
+        .into_iter()
+        .map(bf16::from_f32)
+        .collect::<Vec<_>>();
+    for &token in &ids[first + 1..] {
+        engine.set_token(token)?;
+        engine.decode(false, None)?;
+        output.extend(engine.decode_logits()?.into_iter().map(bf16::from_f32));
+    }
+    let oracle = load_reference(&fixtures.join("oracle/stew-packed.safetensors"))?;
+    let (pass, metrics, _) = model_metrics(
+        &output,
+        &oracle["logits"].1.as_f32(),
+        &ids[first..],
+        &frozen["cells"]["stew"]["logits"],
+    )?;
+    let calls = engine.gemma_encoder_calls()?;
+    defects += usize::from(!pass || calls != (0, 1));
+    println!(
+        "{} audio_chunk_splice chunk=128 encoder_calls={calls:?} {metrics}",
+        if pass { "PASS" } else { "DEFECT" }
+    );
+    println!(
+        "{} audio_model_definition_and_graph_gpu cells=4 defects={defects}",
+        if defects == 0 { "PASS" } else { "DEFECT" }
+    );
+    ensure!(defects == 0, "audio candidate defects={defects}");
     Ok(())
 }
 
@@ -3308,10 +4079,17 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         .max()
         .context("Gemma sliding window missing")? as usize;
     let decode = spec.q_heads as usize * ring.div_ceil(32) * (spec.head_dim as usize + 2) * 4;
-    let expected = per_layer_inputs + rope_tables + flash + staging + decode;
+    let intermediate = spec
+        .layers
+        .iter()
+        .filter_map(|layer| layer.geometry.map(|g| g.intermediate as usize))
+        .max()
+        .context("Gemma diagnostic intermediate missing")?;
+    let diagnostics = admission_rows * (spec.vocab as usize + 2 * intermediate) * 2;
+    let expected = per_layer_inputs + rope_tables + flash + staging + decode + diagnostics;
     let admitted = engine.gemma_workspace(admission_rows, admission_capacity)?;
     println!(
-        "GEMMA4_WORKSPACE admitted={admitted} expected={expected} per_layer_inputs={per_layer_inputs} rope_tables={rope_tables} flash={flash} staging={staging} decode={decode}"
+        "GEMMA4_WORKSPACE admitted={admitted} expected={expected} per_layer_inputs={per_layer_inputs} rope_tables={rope_tables} flash={flash} staging={staging} decode={decode} diagnostics={diagnostics}"
     );
     ensure!(admitted == expected, "Gemma workspace admission mismatch");
     let scratch = engine.gemma_scratch_len();
