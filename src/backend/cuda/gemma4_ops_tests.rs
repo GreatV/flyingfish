@@ -519,6 +519,10 @@ fn vision_bidirectional_attention_gpu() -> Result<()> {
         "RUNNER_FAIL attention reference freeze missing"
     );
     let device = Device::new(0)?;
+    // SAFETY: all allocations, copies and launches use this test's single stream.
+    unsafe {
+        device.ctx.disable_event_tracking();
+    }
     let stream = &device.stream;
     let mut defects = 0;
     for rows in [1usize, 63, 64, 65, 135, 2304, 2520] {
