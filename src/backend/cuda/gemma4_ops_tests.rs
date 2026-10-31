@@ -3100,7 +3100,7 @@ fn large_model_definition(
     let window = spec
         .layers
         .iter()
-        .find_map(|layer| layer.geometry.and_then(|g| g.window))
+        .find_map(|layer| layer.sliding_window)
         .context("large Gemma window missing")? as usize;
     let capacity = window + 128;
     let mut engine = super::engine::Engine::load(dir, 0, capacity, Some(window + 8), settings)?;
@@ -3121,7 +3121,7 @@ fn large_model_definition(
     let global = spec
         .layers
         .iter()
-        .position(|layer| layer.geometry.is_some_and(|g| g.window.is_none()))
+        .position(|layer| layer.sliding_window.is_none())
         .context("global layer missing")?;
     for tag in ["a", "b", "wrap", "long"] {
         let sequence: Vec<u32> = serde_json::from_value(if matches!(tag, "a" | "b") {
