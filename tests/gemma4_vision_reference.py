@@ -116,6 +116,9 @@ def capture_attention(config, rows, device):
 
 @torch.inference_mode()
 def prepare_media(args):
+    if args.audio:
+        prepare_audio(args)
+        return
     from PIL import Image
     from transformers import AutoProcessor
     assert args.images and len(args.images) == 2
@@ -147,20 +150,78 @@ def prepare_media(args):
     print("PASS media_inputs cells=4 same_grid_two_media=true production_patches=2304,2520", flush=True)
 
 
+def prepare_audio(args):
+    import subprocess
+    import numpy as np
+    from transformers import AutoProcessor
+    processor = AutoProcessor.from_pretrained(args.model, local_files_only=True)
+    waves = []
+    for path in args.audio:
+        probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=sample_rate,channels",
+                                "-of", "json", str(path)], check=True, capture_output=True)
+        streams = json.loads(probe.stdout)["streams"]
+        assert len(streams) == 1 and streams[0] == dict(sample_rate="16000", channels=1)
+        decoded = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-f", "f32le",
+                                  "-acodec", "pcm_f32le", "-"], check=True, capture_output=True)
+        waves.append(np.frombuffer(decoded.stdout, dtype="<f4").copy())
+    long = np.tile(waves[0], (480000 + len(waves[0]) - 1) // len(waves[0]))[:480000]
+    suffix = processor.tokenizer(" Transcription: The speaker describes a scene in a story.",
+                                 add_special_tokens=False).input_ids
+    metadata = {}
+    for name, clips, rows in [("stew", waves[:1], 17), ("wizard", waves[1:], 17),
+                              ("pair", waves, 17), ("long", [long], 513)]:
+        processed = [processor(text=processor.audio_token, audio=wave, sampling_rate=16000,
+                               return_tensors="pt") for wave in clips]
+        frames = max(batch.input_features.shape[1] for batch in processed)
+        padded_frames = min(3000, ((frames + 47) // 48) * 48)
+        def pack(extent):
+            features = torch.zeros(len(clips), extent, 128)
+            mask = torch.zeros(len(clips), extent, dtype=torch.bool)
+            for i, batch in enumerate(processed):
+                n = batch.input_features.shape[1]
+                features[i, :n] = batch.input_features[0]
+                mask[i, :n] = batch.input_features_mask[0]
+            return features, mask
+        features, mask = pack(frames)
+        padded, padded_mask = pack(padded_frames)
+        base = processed[0].input_ids[0].tolist()
+        for batch in processed[1:]:
+            assert batch.input_ids[0, 0] == base[0]
+            base.extend(batch.input_ids[0, 1:].tolist())
+        prompt = base + processor.tokenizer(" Transcription:", add_special_tokens=False).input_ids
+        continuation = (suffix * ((rows + len(suffix) - 1) // len(suffix)))[:rows - 1]
+        ids = torch.tensor(prompt + continuation, dtype=torch.int32)
+        modalities = (ids == processor.audio_token_id).to(torch.uint8) * 3
+        assert int(mask[:, ::4].sum()) == int((modalities == 3).sum())
+        assert torch.isfinite(features).all() and frames <= 3000
+        (args.output / f"{name}-input.safetensors").write_bytes(save(dict(
+            ids=ids, modalities=modalities, audio_features=features, audio_mask=mask,
+            padded_audio_features=padded, padded_audio_mask=padded_mask)))
+        metadata[name] = dict(kind="audio", prompt_length=len(prompt), score_first=len(prompt)-1,
+                              score_rows=rows, total_tokens=len(ids), clips=len(clips), frames=frames,
+                              valid_frames=mask.sum(1).tolist(), soft_tokens=mask[:, ::4].sum(1).tolist())
+    (args.output / "INPUT.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    print("PASS audio_inputs cells=4 two_clips=true production_soft_tokens=750", flush=True)
+
+
 @torch.inference_mode()
 def capture_model(args, config):
     from safetensors.torch import load_file
     assert args.inputs
     assert args.stage != "media" or args.dtype == "bf16"
     dtype = torch.float32 if args.dtype == "fp32" else torch.bfloat16
+    metadata = json.loads((args.inputs / "INPUT.json").read_text())
+    audio = all(cell.get("kind") == "audio" for cell in metadata.values())
     model_class = getattr(transformers, config.architectures[0])
     model, load = model_class.from_pretrained(
         args.model, local_files_only=True, dtype=torch.bfloat16,
-        attn_implementation="eager", output_loading_info=True, device_map="cpu")
+        attn_implementation="eager", output_loading_info=True)
     assert all(not load[key] for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")), load
     assert not any(value.is_meta for value in model.state_dict().values())
     model.eval().requires_grad_(False)
-    lm, vision = model.model.language_model, model.model.vision_tower
+    lm = model.model.language_model
+    tower = model.model.audio_tower if audio else model.model.vision_tower
+    embedder = model.model.embed_audio if audio else model.model.embed_vision
     assert config.text_config.use_bidirectional_attention is None
     assert model.lm_head.weight is lm.embed_tokens.weight
 
@@ -173,15 +234,21 @@ def capture_model(args, config):
     move(lm.embed_tokens)
     model.lm_head.weight = lm.embed_tokens.weight
     lm.rotary_emb.to(args.device)
-    vision.encoder.rotary_emb.to(args.device)
+    if audio:
+        move(tower)
+        move(embedder)
+    else:
+        tower.encoder.rotary_emb.to(args.device)
     hooks = []
     def stream(module):
         hooks.append(module.register_forward_pre_hook(lambda mod, inputs: move(mod)))
         def offload(mod, inputs, output):
             mod.to(device="cpu", dtype=torch.bfloat16)
         hooks.append(module.register_forward_hook(offload))
-    for module in (vision.patch_embedder, *vision.encoder.layers, model.model.embed_vision,
-                   lm.embed_tokens_per_layer, lm.per_layer_model_projection,
+    if not audio:
+        for module in (tower.patch_embedder, *tower.encoder.layers, embedder):
+            stream(module)
+    for module in (lm.embed_tokens_per_layer, lm.per_layer_model_projection,
                    lm.per_layer_projection_norm, *lm.layers, lm.norm):
         stream(module)
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, local_files_only=True)
@@ -196,15 +263,16 @@ def capture_model(args, config):
     ple = []
     def encoder_called(module, inputs, output):
         counted[0] += 1
-    hooks.append(vision.register_forward_hook(encoder_called))
-    hooks.append(model.model.embed_vision.register_forward_hook(
+    hooks.append(tower.register_forward_hook(encoder_called))
+    hooks.append(embedder.register_forward_hook(
         lambda module, inputs, output: features.append(output.detach().cpu().contiguous())))
     def capture_ple(module, inputs):
         ple.append(inputs[1].detach().cpu().contiguous())
     hooks.append(lm.layers[0].register_forward_pre_hook(capture_ple))
     media_logits = []
-    for name, cell in json.loads((args.inputs / "INPUT.json").read_text()).items():
-        if args.stage == "media" and name not in ("street", "winter"):
+    semantic_cells = ("stew", "wizard") if audio else ("street", "winter")
+    for name, cell in metadata.items():
+        if args.stage == "media" and name not in semantic_cells:
             continue
         data = load_file(args.inputs / f"{name}-input.safetensors")
         ids, modalities = data["ids"][None].long(), data["modalities"][None].long()
@@ -214,54 +282,55 @@ def capture_model(args, config):
             before = counted[0]
             features.clear()
             ple.clear()
-            pixels = data["pixels" if variant == "packed" else "padded_pixels"][None]
-            coordinates = data["positions" if variant == "packed" else "padded_positions"][None].long()
+            media = reference_media(data, variant, args.device, audio)
             arguments = dict(input_ids=ids.to(args.device), mm_token_type_ids=modalities.to(args.device),
-                             pixel_values=pixels.to(args.device), image_position_ids=coordinates.to(args.device),
-                             use_cache=False, logits_to_keep=rows)
+                             **media, use_cache=False, logits_to_keep=rows)
             output = model(**arguments)
             logits = output.logits[0].float().cpu().contiguous()
             assert torch.isfinite(logits).all() and len(features) == 1
             cell["encoder_calls"][variant] = counted[0] - before
             assert cell["encoder_calls"][variant] == 1
-            captured = dict(logits=logits, features=features[0].float(), ple=ple[0][0].float())
+            def valid_features():
+                return (features[0][media["input_features_mask"].cpu()[:, ::4]] if audio else features[0]).float()
+            captured = dict(logits=logits, features=valid_features(), ple=ple[0][0].float())
             del output
             if variant == "packed":
                 features.clear()
                 ple.clear()
                 repeated = model(**arguments)
-                repeat = dict(logits=repeated.logits[0].float().cpu(), features=features[0].float(), ple=ple[0][0].float())
+                repeat = dict(logits=repeated.logits[0].float().cpu(), features=valid_features(), ple=ple[0][0].float())
                 cell["repeat_mismatches"] = {key: int((captured[key] != repeat[key]).sum()) for key in captured}
                 assert not any(cell["repeat_mismatches"].values()), cell["repeat_mismatches"]
                 assert counted[0] - before == 2
                 cell["repeat_encoder_calls"] = 1
                 del repeated, repeat
             (args.output / f"{name}-{variant}.safetensors").write_bytes(save(captured))
-            if name in ("street", "winter") and variant == "packed":
+            if name in semantic_cells and variant == "packed":
                 media_logits.append(logits[0].clone())
             del logits, captured, arguments
         if args.stage == "media":
             before = counted[0]
-            image_end = (ids[0] == config.eoi_token_id).nonzero().item() + 1
-            caption = tokenizer(" Caption: A photograph of", add_special_tokens=False).input_ids
+            image_end = (ids[0] == (config.eoa_token_id if audio else config.eoi_token_id)).nonzero().item() + 1
+            review_suffix = " Transcription:" if audio else " Caption: A photograph of"
+            caption = tokenizer(review_suffix, add_special_tokens=False).input_ids
             review_ids = torch.cat((ids[:, :image_end], torch.tensor([caption])), dim=1)
             review_modalities = torch.cat((modalities[:, :image_end], torch.zeros((1, len(caption)), dtype=torch.long)), dim=1)
             output = model(input_ids=review_ids.to(args.device),
                            mm_token_type_ids=review_modalities.to(args.device),
-                           pixel_values=data["padded_pixels"][None].to(args.device),
-                           image_position_ids=data["padded_positions"][None].long().to(args.device),
+                           **reference_media(data, "padded", args.device, audio),
                            use_cache=True, logits_to_keep=1)
             generated = []
             media_logits.append(output.logits[0, -1].float().cpu())
-            for step in range(32):
+            review_tokens = 64 if audio else 32
+            for step in range(review_tokens):
                 token = output.logits[:, -1].argmax(-1, keepdim=True)
                 generated.append(token.item())
-                if step != 31:
+                if step != review_tokens - 1:
                     output = model(input_ids=token, past_key_values=output.past_key_values,
                                    use_cache=True, logits_to_keep=1)
             cell["decoded"] = tokenizer.decode(generated, skip_special_tokens=False)
             cell["generated_ids"] = generated
-            cell["review_prompt_suffix"] = " Caption: A photograph of"
+            cell["review_prompt_suffix"] = review_suffix
             del output
             cell["generation_encoder_calls"] = counted[0] - before
             assert cell["generation_encoder_calls"] == 1
@@ -277,10 +346,21 @@ def capture_model(args, config):
         hook.remove()
 
 
+def reference_media(data, variant, device, audio):
+    prefix = "" if variant == "packed" else "padded_"
+    if audio:
+        return dict(input_features=data[prefix + "audio_features"].to(device),
+                    input_features_mask=data[prefix + "audio_mask"].to(device))
+    return dict(pixel_values=data[prefix + "pixels"][None].to(device),
+                image_position_ids=data[prefix + "positions"][None].long().to(device))
+
+
 def freeze_model(args):
     from safetensors.torch import load_file
     import shutil
     assert args.oracle and args.arms and args.inputs
+    versions = [json.loads((arm / "LOAD.json").read_text()) for arm in [args.oracle, *args.arms]]
+    assert len({(v["torch"], v["transformers"]) for v in versions}) == 1, "mixed reference software versions"
     metadata = json.loads((args.inputs / "INPUT.json").read_text())
     frozen = dict(status="FROZEN", rule="2 * maximum reference-only distance to FP32 oracle", cells={})
     for name, cell in metadata.items():
@@ -322,6 +402,7 @@ def main():
     parser.add_argument("--device", required=True)
     parser.add_argument("--stage", choices=("operators", "attention", "inputs", "model", "media", "freeze"), default="operators")
     parser.add_argument("--images", type=Path, nargs=2)
+    parser.add_argument("--audio", type=Path, nargs=2)
     parser.add_argument("--inputs", type=Path)
     parser.add_argument("--oracle", type=Path)
     parser.add_argument("--arms", type=Path, nargs="+")
