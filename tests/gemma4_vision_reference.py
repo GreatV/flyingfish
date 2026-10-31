@@ -118,7 +118,7 @@ def capture_attention(config, rows, device):
 @torch.inference_mode()
 def capture_blocks(config, rows, start, window, origin, device):
     from importlib import import_module
-    from transformers.masking_utils import blockwise_overlay, causal_mask_function, sliding_window_causal_mask_function
+    from transformers.masking_utils import blockwise_overlay, causal_mask_function, sliding_window_causal_mask_function, sliding_window_overlay
     cls = getattr(transformers, config.architectures[0])
     with torch.device("meta"):
         model = cls(config)
@@ -144,6 +144,8 @@ def capture_blocks(config, rows, start, window, origin, device):
     causal = causal_mask_function if window is None else sliding_window_causal_mask_function(window + 1)
     base = causal(0, 0, query, key)
     legal = base | blockwise_overlay(groups)(0, 0, query, key)
+    if window is not None:
+        legal = legal & sliding_window_overlay(window + 1)(0, 0, query, key)
     def run(q, k, v, mask):
         additive = torch.zeros_like(mask, dtype=torch.float32).masked_fill(~mask, -torch.inf)[None, None]
         return forward(module, q, k, v, additive, scaling=1.0)[0][0]

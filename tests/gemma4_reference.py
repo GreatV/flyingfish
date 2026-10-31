@@ -128,6 +128,290 @@ def stream_model(model_class, config, weights, dtype, device):
     return model, hooks
 
 
+def bind_media(model, weights, dtype, device):
+    core = model.model
+    modules = ["embed_vision"]
+    if hasattr(core, "vision_tower"):
+        modules.append("vision_tower")
+    if getattr(core, "embed_audio", None) is not None:
+        modules.append("embed_audio")
+    for name in modules:
+        weights.bind(getattr(core, name), f"model.{name}.", dtype, device)
+    if hasattr(core, "vision_tower"):
+        tower = core.vision_tower
+        tower.encoder.rotary_emb = type(tower.encoder.rotary_emb)(model.config.vision_config).to(device)
+    return {name for name in weights.entries if any(name.startswith(f"model.{part}.") for part in modules)}
+
+
+@torch.inference_mode()
+def prepare_media(args):
+    from PIL import Image
+    processor = transformers.AutoProcessor.from_pretrained(args.model, local_files_only=True)
+    require(args.images and len(args.images) == 2, "two media-control images required")
+    images = [Image.open(path).convert("RGB") for path in args.images]
+    images = [picture.resize((768, 768), Image.Resampling.BICUBIC) for picture in images]
+    sentence = processor.tokenizer(" Objects and buildings appear in the surrounding scene.",
+                                   add_special_tokens=False).input_ids
+    cases = [("street", [images[0]], [], processor.image_token + " Caption: A photograph of", 16),
+             ("winter", [images[1]], [], processor.image_token + " Caption: A photograph of", 16),
+             ("wide", [images[0].resize((960, 672), Image.Resampling.BICUBIC)], [],
+              processor.image_token + " Describe the image.", 16),
+             ("pair", images, [], processor.image_token + " First picture. " + processor.image_token + " Compare.", 16),
+             ("long", [images[0]], [], processor.image_token + " Describe the image.", 1024)]
+    raw = json.loads((args.model / "config.json").read_text())
+    if raw.get("audio_config") is not None:
+        require(args.audio and len(args.audio) == 2, "two raw-audio controls required")
+        waves = []
+        for path in args.audio:
+            pcm = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-f", "f32le",
+                                  "-acodec", "pcm_f32le", "-ac", "1", "-ar", "16000", "-"],
+                                 check=True, capture_output=True).stdout
+            waves.append(torch.frombuffer(bytearray(pcm), dtype=torch.float32).numpy().copy())
+        token = processor.audio_token
+        cases += [("stew", [], [waves[0]], token + " Transcription:", 16),
+                  ("wizard", [], [waves[1]], token + " Transcription:", 16),
+                  ("audio_pair", [], waves, token + " First clip. " + token + " Transcribe.", 16),
+                  ("mixed", [images[0]], [waves[1]], token + " Sound. " + processor.image_token + " Describe both.", 16)]
+    metadata = {}
+    for name, pictures, waves, text, extra in cases:
+        arguments = dict(text=text, return_tensors="pt")
+        if pictures:
+            arguments["images"] = pictures
+        if waves:
+            arguments.update(audio=waves, sampling_rate=16000)
+        batch = processor(**arguments)
+        prompt = batch.input_ids.shape[1]
+        suffix = (sentence * (extra // len(sentence) + 1))[:extra]
+        ids = torch.cat((batch.input_ids[0], torch.tensor(suffix)))
+        modalities = torch.cat((batch.mm_token_type_ids[0], torch.zeros(len(suffix), dtype=torch.long)))
+        values = dict(ids=ids.int(), modalities=modalities.to(torch.uint8))
+        grids = []
+        if pictures:
+            masks = (batch.image_position_ids >= 0).all(-1)
+            values.update(padded_pixels=batch.pixel_values.float(), padded_positions=batch.image_position_ids.int())
+            values["pixels"] = batch.pixel_values[masks].float()
+            values["positions"] = batch.image_position_ids[masks].int()
+            lengths = masks.sum(-1).tolist()
+            require(len(set(lengths)) == 1, "packed reference images must have matching patch counts")
+            for coordinates, mask in zip(batch.image_position_ids, masks):
+                x, y = (coordinates[mask].amax(0) + 1).tolist()
+                grids.append([1, y, x])
+        if waves:
+            values.update(audio=batch.input_features.float(), audio_mask=batch.input_features_mask.bool())
+        save_file(values, str(args.out / f"{name}-input.safetensors"))
+        rows = 513 if name == "long" else 17
+        metadata[name] = dict(prompt_length=prompt, score_first=len(ids) - rows,
+                              score_rows=rows, total_tokens=len(ids), grids=grids,
+                              audio_clips=len(waves), image_count=len(pictures))
+    require(metadata["long"]["total_tokens"] > raw["text_config"]["sliding_window"], "long does not wrap KV")
+    (args.out / "INPUT.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    print(f"PASS large_media_inputs cells={len(cases)} GPU_calls=0", flush=True)
+
+
+def media_arguments(data, cell, variant, device):
+    arguments = dict(input_ids=data["ids"][None].long().to(device),
+                     mm_token_type_ids=data["modalities"][None].long().to(device))
+    if cell["image_count"]:
+        if variant == "packed":
+            pixels = data["pixels"].reshape(cell["image_count"], -1, data["pixels"].shape[-1])
+            positions = data["positions"].reshape(cell["image_count"], -1, 2)
+        else:
+            pixels, positions = data["padded_pixels"], data["padded_positions"]
+        arguments.update(pixel_values=pixels.to(device), image_position_ids=positions.long().to(device))
+    if cell["audio_clips"]:
+        samples, mask = data["audio"], data["audio_mask"]
+        if variant == "packed":
+            samples = samples[mask][None]
+            mask = torch.ones(samples.shape[:2], dtype=torch.bool)
+        else:
+            samples = torch.nn.functional.pad(samples, (0, 0, 0, 7))
+            mask = torch.nn.functional.pad(mask, (0, 7))
+        arguments.update(input_features=samples.to(device), input_features_mask=mask.to(device))
+    return arguments
+
+
+@torch.inference_mode()
+def capture_media(args, model, weights, hooks, expected, device):
+    metadata = json.loads((args.media_inputs / "INPUT.json").read_text())
+    tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, local_files_only=True)
+    core = model.model
+    calls = dict(image=0, audio=0)
+    recorded = {}
+    active = {}
+
+    def image_output(module, inputs, output):
+        calls["image"] += 1
+        values = output.pooler_output if hasattr(output, "pooler_output") else output
+        values = values.reshape(-1, values.shape[-1])
+        if hasattr(output, "pooler_output"):
+            valid = (active["image_position_ids"] >= 0).all(-1).reshape(-1)
+            values = values[valid]
+        recorded["image"] = values.float().cpu().contiguous()
+
+    def audio_output(module, inputs, output):
+        calls["audio"] += 1
+        recorded["audio"] = output[active["input_features_mask"]].float().cpu().contiguous()
+
+    hooks.append(core.embed_vision.register_forward_hook(image_output))
+    if hasattr(core.embed_vision, "patch_ln1"):
+        stages = [("patch_ln1", "vision.patch_ln1"), ("patch_dense", "vision.patch_dense"),
+                  ("patch_ln2", "vision.patch_ln2"), ("pos_norm", "vision.pos_norm"),
+                  ("multimodal_embedder.embedding_pre_projection_norm", "vision.rms")]
+        for path, label in stages:
+            def record_image(module, inputs, output, label=label):
+                valid = (active["image_position_ids"] >= 0).all(-1)
+                recorded[label] = output[valid].float().cpu().contiguous()
+            hooks.append(core.embed_vision.get_submodule(path).register_forward_hook(record_image))
+        def record_position(module, inputs):
+            valid = (active["image_position_ids"] >= 0).all(-1)
+            recorded["vision.position"] = inputs[0][valid].float().cpu().contiguous()
+        hooks.append(core.embed_vision.pos_norm.register_forward_pre_hook(record_position))
+    if getattr(core, "embed_audio", None) is not None:
+        hooks.append(core.embed_audio.register_forward_hook(audio_output))
+        def record_audio(module, inputs, output):
+            recorded["audio.raw_norm"] = output[active["input_features_mask"]].float().cpu().contiguous()
+        hooks.append(core.embed_audio.embedding_pre_projection_norm.register_forward_hook(record_audio))
+    report = dict(class_name=type(model).__name__, torch=torch.__version__, transformers=transformers.__version__,
+                  device=torch.cuda.get_device_name(0), dtype=args.dtype, strict=args.strict_reduction,
+                  unbound_executed=0, unexpected=0, newly_initialized_executed=0, full_class_load=False, cells={})
+    controls = {}
+    for name, cell in metadata.items():
+        if args.media_review and name not in ("street", "winter", "stew", "wizard"):
+            continue
+        data = load_file(str(args.media_inputs / f"{name}-input.safetensors"))
+        cell = dict(cell)
+        variants = ("padded",) if args.media_review else ("packed", "padded", "chunk") if name == "long" else ("packed", "padded")
+        for variant in variants:
+            arguments = media_arguments(data, cell, variant, device)
+            active = arguments
+            before = dict(calls)
+            recorded.clear()
+            if args.media_review:
+                length = cell["prompt_length"]
+                for key in ("input_ids", "mm_token_type_ids"):
+                    arguments[key] = arguments[key][:, :length]
+                output = model(**arguments, use_cache=True, logits_to_keep=1)
+                logits = output.logits[0, -1].float().cpu()
+                generated = []
+                for step in range(32):
+                    token = output.logits[:, -1].argmax(-1, keepdim=True)
+                    generated.append(token.item())
+                    if step != 31:
+                        output = model(input_ids=token, past_key_values=output.past_key_values,
+                                       use_cache=True, logits_to_keep=1)
+                cell.update(decoded=tokenizer.decode(generated, skip_special_tokens=False), generated_ids=generated)
+                controls[name] = logits
+                print(f"MEDIA {name} decoded={cell['decoded']!r}", flush=True)
+            else:
+                rows = cell["score_rows"]
+                if variant == "chunk":
+                    prompt = cell["prompt_length"]
+                    prefix = {key: value for key, value in arguments.items()}
+                    prefix["input_ids"] = arguments["input_ids"][:, :prompt]
+                    prefix["mm_token_type_ids"] = arguments["mm_token_type_ids"][:, :prompt]
+                    output = model(**prefix, use_cache=True, logits_to_keep=1)
+                    cache, outputs = output.past_key_values, []
+                    for first in range(prompt, data["ids"].numel(), 512):
+                        end = min(first + 512, data["ids"].numel())
+                        output = model(input_ids=arguments["input_ids"][:, first:end],
+                                       mm_token_type_ids=arguments["mm_token_type_ids"][:, first:end],
+                                       position_ids=torch.arange(first, end, device=device)[None],
+                                       past_key_values=cache, use_cache=True)
+                        cache = output.past_key_values
+                        selected = max(0, cell["score_first"] - first)
+                        if selected < end - first:
+                            outputs.append(output.logits[0, selected:].float().cpu())
+                    logits = torch.cat(outputs)
+                else:
+                    output = model(**arguments, use_cache=False, logits_to_keep=rows)
+                    logits = output.logits[0].float().cpu().contiguous()
+                captured = dict(logits=logits)
+                chunks = []
+                image_offset = audio_offset = 0
+                kinds, counts = torch.unique_consecutive(data["modalities"], return_counts=True)
+                for kind, count in zip(kinds.tolist(), counts.tolist()):
+                    if kind == 1:
+                        chunks.append(recorded["image"][image_offset:image_offset + count])
+                        image_offset += count
+                    elif kind == 3:
+                        chunks.append(recorded["audio"][audio_offset:audio_offset + count])
+                        audio_offset += count
+                require(chunks, "reference did not consume media")
+                captured["features"] = torch.cat(chunks)
+                captured.update({key: value for key, value in recorded.items() if "." in key})
+                require(all(bool(torch.isfinite(value).all()) for value in captured.values()), "nonfinite media reference")
+                save_file(captured, str(args.out / f"{name}-{variant}.safetensors"))
+                if variant == "packed":
+                    recorded.clear()
+                    repeated = model(**arguments, use_cache=False, logits_to_keep=rows)
+                    require(torch.equal(repeated.logits[0].float().cpu(), logits), "media explicit repeat differs")
+                    del repeated
+                    cell["repeat_bits"] = 0
+            multiplier = 2 if not args.media_review and variant == "packed" else 1
+            observed = {key: calls[key] - before[key] for key in calls}
+            require(observed == dict(image=multiplier * bool(cell["image_count"]),
+                                     audio=multiplier * bool(cell["audio_clips"])), f"encoder calls {observed}")
+            cell[variant + "_calls"] = observed
+            del output, arguments, logits
+        report["cells"][name] = cell
+        (args.out / "REFERENCE.json").write_text(json.dumps(report, indent=2) + "\n")
+        print(f"PASS media_reference {name}", flush=True)
+    require(weights.consumed == expected, "streamed media executed-key mismatch")
+    report["consumed_keys"] = len(weights.consumed)
+    if args.media_review:
+        for a, b in (("street", "winter"), ("stew", "wizard")):
+            if a in controls:
+                require(not torch.equal(controls[a], controls[b]), "two-media logits are identical")
+                require(report["cells"][a]["generated_ids"] != report["cells"][b]["generated_ids"], "two-media decoded output identical")
+    (args.out / "REFERENCE.json").write_text(json.dumps(report, indent=2) + "\n")
+    for hook in hooks:
+        hook.remove()
+    print(f"PASS large_media_reference cells={len(report['cells'])} executed_keys={len(expected)}", flush=True)
+
+
+def freeze_media(args):
+    import shutil
+    arms = args.freeze_media_from
+    metadata = json.loads((args.media_inputs / "INPUT.json").read_text())
+    reports = [json.loads((arm / "REFERENCE.json").read_text()) for arm in arms]
+    require(reports[0]["dtype"] == "fp32", "media oracle must be FP32")
+    devices = {report["device"] for report in reports}
+    coverage = {(report["device"], report["dtype"], report["strict"]) for report in reports}
+    require(len(devices) == 2 and coverage == {(device, dtype, strict) for device in devices
+            for dtype, strict in (("fp32", False), ("bf16", False), ("bf16", True))}, "incomplete media reference coverage")
+    for report in reports:
+        require(report["torch"] == torch.__version__ and report["transformers"] == transformers.__version__,
+                "media reference versions differ")
+        require(report["class_name"] == reports[0]["class_name"] and report["unbound_executed"] ==
+                report["unexpected"] == report["newly_initialized_executed"] == 0, "unclean media reference")
+    frozen = dict(status="FROZEN", policy="2*maximum reference-only distance to FP32 oracle", cells={}, arms=reports)
+    for name, cell in metadata.items():
+        expected = load_file(str(arms[0] / f"{name}-packed.safetensors"))
+        ids = load_file(str(args.media_inputs / f"{name}-input.safetensors"))["ids"].long()[cell["score_first"]:]
+        bounds = {key: dict(output_max=0.0, output_rmse=0.0) for key in expected}
+        bounds["logits"]["nll_max"] = 0.0
+        for arm, report in zip(arms, reports):
+            require(report["cells"][name]["repeat_bits"] == 0, "media repeat mismatch")
+            for variant in (("packed", "padded", "chunk") if name == "long" else ("packed", "padded")):
+                actual = load_file(str(arm / f"{name}-{variant}.safetensors"))
+                for key in expected:
+                    require(actual[key].shape == expected[key].shape and bool(torch.isfinite(actual[key]).all()),
+                            "media freeze shape or finite check")
+                    delta = actual[key].double() - expected[key].double()
+                    bounds[key]["output_max"] = max(bounds[key]["output_max"], 2 * float(delta.abs().max()))
+                    bounds[key]["output_rmse"] = max(bounds[key]["output_rmse"], 2 * float(delta.square().mean().sqrt()))
+                metric = distances(actual["logits"], expected["logits"], ids[1:].tolist())
+                bounds["logits"]["nll_max"] = max(bounds["logits"]["nll_max"], 2 * metric["nll_max"])
+        bounds["logits"]["margin_cut"] = 2 * bounds["logits"]["output_max"]
+        frozen["cells"][name] = bounds
+        print(f"FREEZE {name} {json.dumps(bounds, sort_keys=True)}", flush=True)
+    shutil.copytree(args.media_inputs, args.out / "inputs")
+    (args.out / "oracle").symlink_to(arms[0].resolve(), target_is_directory=True)
+    with (args.out / "FROZEN.json").open("x") as destination:
+        destination.write(json.dumps(frozen, indent=2) + "\n")
+    print(f"PASS frozen_media_limits cells={len(metadata)} arms=6 candidate_observations=0", flush=True)
+
+
 @torch.inference_mode()
 def capture(model, ids, chunk, keep, device, prefix=0):
     cache = None

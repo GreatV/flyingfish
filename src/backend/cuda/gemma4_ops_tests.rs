@@ -3097,6 +3097,304 @@ fn vision_distance(actual: &[f32], expected: &[f32], bounds: &serde_json::Value)
     Ok(pass)
 }
 
+#[cfg(feature = "cuda")]
+struct LargeMediaInput {
+    ids: Vec<u32>,
+    modalities: Vec<u8>,
+    pixels: Vec<f32>,
+    grids: Vec<crate::vision_input::ImageGrid>,
+    audio: Vec<(Vec<f32>, Vec<bool>)>,
+}
+
+#[cfg(feature = "cuda")]
+impl LargeMediaInput {
+    fn read(path: &std::path::Path, cell: &serde_json::Value) -> Result<Self> {
+        let bytes = std::fs::read(path)?;
+        let data = SafeTensors::deserialize(&bytes)?;
+        let floats = |name: &str| -> Result<Vec<f32>> {
+            let view = data.tensor(name)?;
+            ensure!(view.dtype() == safetensors::Dtype::F32, "media float dtype");
+            Ok(view
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_le_bytes(*v))
+                .collect())
+        };
+        let ids = data.tensor("ids")?;
+        let modalities = data.tensor("modalities")?;
+        ensure!(
+            ids.dtype() == safetensors::Dtype::I32 && modalities.dtype() == safetensors::Dtype::U8,
+            "media identity dtypes"
+        );
+        let mut grids = Vec::new();
+        for grid in cell["grids"].as_array().context("media grids")? {
+            grids.push(crate::vision_input::ImageGrid {
+                t: u32::try_from(grid[0].as_u64().context("grid t")?)?,
+                h: u32::try_from(grid[1].as_u64().context("grid h")?)?,
+                w: u32::try_from(grid[2].as_u64().context("grid w")?)?,
+            });
+        }
+        let mut audio = Vec::new();
+        let clips = usize::try_from(cell["audio_clips"].as_u64().context("audio clips")?)?;
+        if clips != 0 {
+            let values = floats("audio")?;
+            let mask = data.tensor("audio_mask")?;
+            ensure!(
+                mask.dtype() == safetensors::Dtype::BOOL && mask.shape()[0] == clips,
+                "raw audio mask extent"
+            );
+            let frames = mask.shape()[1];
+            ensure!(
+                values.len() == clips * frames * 640,
+                "raw audio samples extent"
+            );
+            for clip in 0..clips {
+                audio.push((
+                    values[clip * frames * 640..(clip + 1) * frames * 640].to_vec(),
+                    mask.data()[clip * frames..(clip + 1) * frames]
+                        .iter()
+                        .map(|v| *v != 0)
+                        .collect(),
+                ));
+            }
+        }
+        Ok(Self {
+            ids: ids
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| u32::from_le_bytes(*v))
+                .collect(),
+            modalities: modalities.data().to_vec(),
+            pixels: if grids.is_empty() {
+                Vec::new()
+            } else {
+                floats("pixels")?
+            },
+            grids,
+            audio,
+        })
+    }
+
+    fn clips(&self) -> Vec<crate::vision_input::AudioClip<'_>> {
+        self.audio
+            .iter()
+            .map(|(features, mask)| crate::vision_input::AudioClip { features, mask })
+            .collect()
+    }
+
+    fn input<'a>(
+        &'a self,
+        end: usize,
+        audio: &'a [crate::vision_input::AudioClip<'a>],
+    ) -> crate::vision_input::MultimodalInput<'a> {
+        crate::vision_input::MultimodalInput {
+            input_ids: &self.ids[..end],
+            modality_ids: &self.modalities[..end],
+            pixel_values: &self.pixels,
+            grids: &self.grids,
+            audio,
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn large_media_model_definition(
+    dir: &std::path::Path,
+    fixtures: &std::path::Path,
+    settings: crate::backend::Settings,
+    spec: &crate::model_spec::ModelSpec,
+    metadata: &serde_json::Value,
+    frozen: &serde_json::Value,
+) -> Result<()> {
+    let cells = metadata.as_object().context("large media metadata")?;
+    let capacity = 1536;
+    let mut inputs = BTreeMap::new();
+    for (name, cell) in cells {
+        inputs.insert(
+            name.clone(),
+            LargeMediaInput::read(
+                &fixtures.join(format!("inputs/{name}-input.safetensors")),
+                cell,
+            )?,
+        );
+    }
+    let mut reservation = LargeMediaInput {
+        ids: Vec::new(),
+        modalities: Vec::new(),
+        pixels: Vec::new(),
+        grids: Vec::new(),
+        audio: Vec::new(),
+    };
+    for name in ["pair", "wide", "audio_pair"] {
+        if let Some(input) = inputs.get(name) {
+            reservation.ids.extend_from_slice(&input.ids);
+            reservation.modalities.extend_from_slice(&input.modalities);
+            reservation.pixels.extend_from_slice(&input.pixels);
+            reservation.grids.extend_from_slice(&input.grids);
+            reservation.audio.extend(input.audio.iter().cloned());
+        }
+    }
+    let clips = reservation.clips();
+    let mut engine = super::engine::Engine::load_multimodal(
+        dir,
+        0,
+        capacity,
+        Some(capacity),
+        settings.clone(),
+        &reservation.input(reservation.ids.len(), &clips),
+    )?;
+    println!(
+        "GEMMA4_MEDIA_PLACEMENT {}",
+        serde_json::to_string(
+            engine
+                .dense_placement()
+                .context("media dense placement missing")?
+        )?
+    );
+    let mut defects = 0usize;
+    let mut features = BTreeMap::new();
+    for (name, input) in &inputs {
+        let audio = input.clips();
+        let cell = &metadata[name];
+        let bounds = &frozen["cells"][name];
+        let oracle = load_reference(&fixtures.join(format!("oracle/{name}-packed.safetensors")))?;
+        let first = usize::try_from(cell["score_first"].as_u64().context("media score first")?)?;
+        let identities: Vec<_> = input
+            .ids
+            .iter()
+            .zip(&input.modalities)
+            .map(|(id, modality)| if matches!(modality, 1 | 3) { 0 } else { *id })
+            .collect();
+        engine.reset()?;
+        let mut trace = crate::trace::Trace::default();
+        engine.gemma_vision_trace(
+            &input.input(input.ids.len(), &audio),
+            &identities,
+            &mut trace,
+        )?;
+        for (key, (_, expected)) in &oracle {
+            if key != "logits" {
+                let actual = trace.values(if key == "features" {
+                    "media_features"
+                } else {
+                    key
+                })?;
+                let pass = vision_distance(&actual, &expected.as_f32(), &bounds[key])?;
+                defects += usize::from(!pass);
+                println!(
+                    "{} media_stage {name} {key}",
+                    if pass { "PASS" } else { "DEFECT" }
+                );
+                if key == "features" {
+                    features.insert(name.clone(), actual);
+                }
+            }
+        }
+        let mut actual = Vec::new();
+        for row in first..input.ids.len() {
+            actual.extend(engine.gemma_all_logits(row)?);
+        }
+        let expected = oracle["logits"].1.as_f32();
+        let (pass, line, _) =
+            model_metrics(&actual, &expected, &input.ids[first..], &bounds["logits"])?;
+        defects += usize::from(!pass);
+        println!(
+            "{} media_model {name} {line}",
+            if pass { "PASS" } else { "DEFECT" }
+        );
+        let prompt = input.ids.len() - 16;
+        let score = expected.len() - 17 * spec.vocab as usize;
+        let mut eager = Vec::new();
+        let mut eager_state = None;
+        for graph in [false, true] {
+            engine.reset()?;
+            engine.prefill_multimodal(&input.input(prompt, &audio), None)?;
+            let before = engine.gemma_hidden_state()?;
+            if graph {
+                engine.capture()?;
+                let restored = engine.gemma_hidden_state()? == before;
+                defects += usize::from(!restored);
+                println!("media_capture_restored {name} equal={restored}");
+            }
+            let mut output: Vec<_> = engine
+                .decode_logits()?
+                .into_iter()
+                .map(bf16::from_f32)
+                .collect();
+            for &token in &input.ids[prompt..] {
+                engine.set_token(token)?;
+                engine.decode(graph, None)?;
+                output.extend(engine.decode_logits()?.into_iter().map(bf16::from_f32));
+            }
+            let (pass, line, _) = model_metrics(
+                &output,
+                &expected[score..],
+                &input.ids[prompt - 1..],
+                &bounds["logits"],
+            )?;
+            defects += usize::from(!pass);
+            println!(
+                "{} media_decode {name} graph={graph} {line}",
+                if pass { "PASS" } else { "DEFECT" }
+            );
+            let state = engine.gemma_hidden_state()?;
+            if graph {
+                let bits = output.iter().zip(&eager).filter(|(a, b)| a != b).count();
+                let equal = eager_state.as_ref() == Some(&state);
+                defects += usize::from(bits != 0 || !equal);
+                println!("media_graph {name} bits={bits} state_equal={equal}");
+            } else {
+                eager = output;
+                eager_state = Some(state);
+            }
+        }
+    }
+    for (a, b) in [("street", "winter"), ("stew", "wizard")] {
+        if let (Some(first), Some(second)) = (features.get(a), features.get(b)) {
+            let detected = first != second;
+            defects += usize::from(!detected);
+            println!("media_negative_control {a}/{b} detected={detected}");
+        }
+    }
+    drop(engine);
+    let input = inputs.get("long").context("long media input missing")?;
+    let mut engine = super::engine::Engine::load_multimodal(
+        dir,
+        0,
+        capacity,
+        Some(512),
+        settings,
+        &reservation.input(reservation.ids.len(), &clips),
+    )?;
+    let audio = input.clips();
+    engine.prefill_multimodal(&input.input(input.ids.len(), &audio), None)?;
+    let actual: Vec<_> = engine
+        .decode_logits()?
+        .into_iter()
+        .map(bf16::from_f32)
+        .collect();
+    let oracle = load_reference(&fixtures.join("oracle/long-packed.safetensors"))?;
+    let expected = oracle["logits"].1.as_f32();
+    let pass = vision_distance(
+        &actual.iter().map(|v| v.to_f32()).collect::<Vec<_>>(),
+        &expected[expected.len() - spec.vocab as usize..],
+        &frozen["cells"]["long"]["logits"],
+    )?;
+    defects += usize::from(!pass);
+    println!("media_chunk_control chunk=512 final_logits_pass={pass}");
+    println!(
+        "{} large_media_model_definition cells={} defects={defects}",
+        if defects == 0 { "PASS" } else { "DEFECT" },
+        cells.len()
+    );
+    ensure!(defects == 0, "large media candidate defects={defects}");
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires Gemma image references, frozen limits, published weights and a GPU window"]
 fn image_model_definition_and_graph_gpu() -> Result<()> {
@@ -3125,6 +3423,12 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
         )),
     };
     let spec = crate::model_spec::ModelSpec::read(&dir)?;
+    if spec.per_layer_input.is_none() {
+        #[cfg(feature = "cuda")]
+        return large_media_model_definition(&dir, &fixtures, settings, &spec, &metadata, &frozen);
+        #[cfg(feature = "rocm")]
+        anyhow::bail!("large Gemma media gate requires CUDA");
+    }
     let image_token = spec
         .vision
         .as_ref()

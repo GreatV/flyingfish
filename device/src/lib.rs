@@ -394,10 +394,7 @@ unsafe fn block_bounds(
     unsafe {
         let index = (origin + q) as usize * 2;
         [
-            core::cmp::min(
-                q.saturating_sub(window),
-                (*blocks.add(index)).saturating_sub(origin),
-            ),
+            q.saturating_sub(window),
             core::cmp::max(q + 1, (*blocks.add(index + 1)).saturating_sub(origin)),
         ]
     }

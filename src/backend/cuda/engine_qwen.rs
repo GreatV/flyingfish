@@ -5153,25 +5153,34 @@ impl Engine {
                             },
                         )?;
                     } else {
-                        flash.run(
-                            &w.qkv,
-                            q_stride,
-                            stage_k,
-                            stage_v,
-                            &mut w.attn,
-                            Shape {
-                                rows,
-                                start: if overflow { history } else { self.position },
-                                q_heads: hq,
-                                kv_heads: hkv,
-                                capacity: cache_capacity,
-                                head_dim: d,
-                                causal: true,
-                                window_left: layout
-                                    .sliding_window
-                                    .map(|window| window as usize - 1),
-                            },
-                        )?;
+                        let shape = Shape {
+                            rows,
+                            start: if overflow { history } else { self.position },
+                            q_heads: hq,
+                            kv_heads: hkv,
+                            capacity: cache_capacity,
+                            head_dim: d,
+                            causal: true,
+                            window_left: layout.sliding_window.map(|window| window as usize - 1),
+                        };
+                        if !decode
+                            && layout.sliding_window.is_some()
+                            && let Some(blocks) = &q.image_blocks
+                        {
+                            flash.run_masked(Query {
+                                q: &w.qkv,
+                                q_row_stride: q_stride,
+                                k: stage_k,
+                                v: stage_v,
+                                out: &mut w.attn,
+                                shape,
+                                keys: shape.start + rows,
+                                prefix: None,
+                                image_blocks: Some((blocks, self.position - shape.start)),
+                            })?;
+                        } else {
+                            flash.run(&w.qkv, q_stride, stage_k, stage_v, &mut w.attn, shape)?;
+                        }
                     }
                 }
                 if overflow && !reader {

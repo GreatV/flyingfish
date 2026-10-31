@@ -932,7 +932,7 @@ __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
       (PARTIAL && (p.rows > BQ || parts == 0 || chunk == 0 || chunk % BK != 0))) __trap();
   const auto bounds = [&](uint32_t row) {
     const uint32_t q = p.start+row;
-    return make_uint2(min(q > extent ? q-extent : 0, blocks[2*(origin+q)] > origin ? blocks[2*(origin+q)]-origin : 0),
+    return make_uint2(q > extent ? q-extent : 0,
         max(q+1, blocks[2*(origin+q)+1] > origin ? blocks[2*(origin+q)+1]-origin : 0));
   };
   const uint32_t end = MODE >= 4 ? keys : MODE == 1 ? extent : (MODE == 2 ? max(extent,p.start+p.rows) : p.start+p.rows);
