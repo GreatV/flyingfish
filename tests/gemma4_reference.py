@@ -181,6 +181,9 @@ def freeze(arms, output):
         require(meta["unbound_executed"] == meta["unexpected"] == meta["newly_initialized_executed"] == 0,
                 "unclean streamed reference arm")
         require(meta["class"] == oracle_meta["class"], "reference model classes differ")
+        require(meta["torch"] == oracle_meta["torch"] == torch.__version__
+                and meta["transformers"] == oracle_meta["transformers"] == transformers.__version__,
+                "reference software versions differ")
         coverage.add((meta["device"], meta["dtype"]))
         noise = json.loads((arm / "NOISE.json").read_text())
         values = load_file(str(arm / "reference.safetensors"))
