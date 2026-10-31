@@ -235,9 +235,8 @@ def capture_model(args, config):
     model.lm_head.weight = lm.embed_tokens.weight
     lm.rotary_emb.to(args.device)
     if audio:
-        relative_timescales = tower.rel_pos_enc.inv_timescales.detach().clone()
+        relative_timescales_dtype = str(tower.rel_pos_enc.inv_timescales.dtype)
         move(tower)
-        tower.rel_pos_enc.inv_timescales = relative_timescales.to(args.device)
         move(embedder)
     else:
         tower.encoder.rotary_emb.to(args.device)
@@ -273,7 +272,7 @@ def capture_model(args, config):
     report["text_placement"] = dict(resident=resident, additional_weight_bytes=text_bytes,
                                   workspace_bytes=workspace_bytes, free_bytes=free_bytes)
     if audio:
-        report["relative_timescales_dtype"] = str(relative_timescales.dtype)
+        report["relative_timescales_dtype"] = relative_timescales_dtype
     (args.output / "LOAD.json").write_text(json.dumps(report, indent=2) + "\n")
     counted = [0]
     features = []
@@ -346,7 +345,7 @@ def capture_model(args, config):
         if args.stage == "media":
             before = counted[0]
             image_end = (ids[0] == (config.eoa_token_id if audio else config.eoi_token_id)).nonzero().item() + 1
-            review_suffix = " Transcription:" if audio else " Caption: A photograph of"
+            review_suffix = ' Audio transcript: "' if audio else " Caption: A photograph of"
             caption = tokenizer(review_suffix, add_special_tokens=False).input_ids
             review_ids = torch.cat((ids[:, :image_end], torch.tensor([caption])), dim=1)
             review_modalities = torch.cat((modalities[:, :image_end], torch.zeros((1, len(caption)), dtype=torch.long)), dim=1)
@@ -400,6 +399,21 @@ def capture_audio_operators(args, config):
     report = dict(torch=torch.__version__, transformers=transformers.__version__, device=args.device,
                   capability=list(torch.cuda.get_device_capability(args.device)) if str(args.device).startswith("cuda") else None,
                   dtype=args.dtype, definition="transformers Gemma4 audio model definition", cells={})
+    initial_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        position = definition.Gemma4AudioRelPositionalEncoding(config.audio_config)
+    finally:
+        torch.set_default_dtype(initial_dtype)
+    position.to(device=args.device, dtype=dtype)
+    positions = position(torch.zeros(1, 1, 1024, device=args.device, dtype=dtype))[0]
+    old_position = definition.Gemma4AudioRelPositionalEncoding(config.audio_config).to(args.device)
+    wrong = old_position(torch.zeros(1, 1, 1024, device=args.device)).bfloat16()[0]
+    (args.output / "audio-relative-table.safetensors").write_bytes(save(dict(
+        positions=positions.float().cpu().contiguous(), wrong=wrong.float().cpu().contiguous())))
+    report["cells"]["audio-relative-table"] = dict(shape=[13, 1024], outputs=["positions"],
+        controls={"positions": "wrong"}, exact_bf16=True)
+    print("PASS audio_relative_table elements=13312 staged_bf16_initialization=true", flush=True)
     class Projection(torch.nn.Module):
         def __init__(self, value):
             super().__init__()
@@ -503,20 +517,25 @@ def freeze_audio_operators(args):
     frozen = dict(status="FROZEN", candidate_observations=0,
                   rule="2 * maximum reference-only distance to FP32 oracle", reference_reports=reports, cells={})
     for name, cell in reports[0]["cells"].items():
-        oracle = load_file(args.oracle / f"{name}.safetensors")
+        paths = [args.oracle, *args.arms]
+        selected = [p for p, r in zip(paths, reports) if not cell.get("exact_bf16") or r["dtype"] == "bf16"]
+        oracle_path = selected[0] if cell.get("exact_bf16") else args.oracle
+        oracle = load_file(oracle_path / f"{name}.safetensors")
         bounds = {key: dict(output_max=0.0, output_rmse=0.0) for key in cell["outputs"]}
-        for path in args.arms:
+        for path in selected:
             arm = load_file(path / f"{name}.safetensors")
             for key, bound in bounds.items():
                 for variant in (key, cell.get("variations", {}).get(key, key)):
                     delta = arm[variant].double() - oracle[key].double()
+                    if cell.get("exact_bf16"):
+                        assert torch.equal(arm[variant], oracle[key]), "BF16 relative table varies across GPUs"
                     bound["output_max"] = max(bound["output_max"], 2*delta.abs().max().item())
                     bound["output_rmse"] = max(bound["output_rmse"], 2*delta.square().mean().sqrt().item())
         for key, control in cell["controls"].items():
             delta = oracle[control].double() - oracle[key].double()
             assert delta.abs().max().item() > bounds[key]["output_max"] or delta.square().mean().sqrt().item() > bounds[key]["output_rmse"], (name,key)
         frozen["cells"][name] = dict(**cell, bounds=bounds)
-        shutil.copyfile(args.oracle / f"{name}.safetensors", args.output / f"{name}.safetensors")
+        shutil.copyfile(oracle_path / f"{name}.safetensors", args.output / f"{name}.safetensors")
     (args.output / "AUDIO_FROZEN.json").write_text(json.dumps(frozen, indent=2) + "\n")
     print(f"PASS audio_operator_freeze cells={len(frozen['cells'])} candidate_observations=0", flush=True)
 

@@ -430,6 +430,31 @@ fn audio_operators_match_definition_gpu() -> Result<()> {
     let mut defects = 0;
     for (name, cell) in frozen["cells"].as_object().context("audio cells")? {
         let fixture = load_reference(&directory.join(format!("{name}.safetensors")))?;
+        if name == "audio-relative-table" {
+            let actual = super::engine::audio_runtime::relative_positions(13, 1024)?
+                .into_iter()
+                .map(bf16::to_f32)
+                .collect::<Vec<_>>();
+            let expected = reference(&fixture, "positions")?.as_f32();
+            let pass = vision_distance(&actual, &expected, &cell["bounds"]["positions"])?;
+            let wrong = (0..13)
+                .flat_map(|row| {
+                    (0..1024).map(move |d| {
+                        let exponent = (d % 512) as f32 * -(10000_f64.ln() / 511.0) as f32;
+                        let phase = (12 - row) as f32 * exponent.exp();
+                        bf16::from_f32(if d < 512 { phase.sin() } else { phase.cos() }).to_f32()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let detected = !vision_distance(&wrong, &expected, &cell["bounds"]["positions"])?;
+            cells += 2;
+            defects += usize::from(!pass) + usize::from(!detected);
+            println!(
+                "{} audio_relative_table elements=13312 old_fp32_control={detected}",
+                if pass && detected { "PASS" } else { "DEFECT" }
+            );
+            continue;
+        }
         let upload =
             |name: &str| -> Result<_> { Ok(stream.clone_htod(reference_bf16(&fixture, name)?)?) };
         let output = |count: usize| -> Result<_> {

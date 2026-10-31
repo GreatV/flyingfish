@@ -19,6 +19,30 @@ use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::sync::Arc;
 
+pub(crate) fn relative_positions(rows: u32, width: u32) -> Result<Vec<bf16>> {
+    ensure!(
+        rows > 0 && width >= 4 && width.is_multiple_of(2),
+        "relative position shape invalid"
+    );
+    let increment = -(10000_f64.ln() / f64::from(width / 2 - 1)) as f32;
+    Ok((0..rows)
+        .flat_map(|row| {
+            (0..width).map(move |d| {
+                let index = bf16::from_f32((d % (width / 2)) as f32).to_f32();
+                let exponent = bf16::from_f32(index * increment).to_f32();
+                let inverse = bf16::from_f32(exponent.exp()).to_f32();
+                let position = bf16::from_f32((rows - 1 - row) as f32).to_f32();
+                let phase = bf16::from_f32(position * inverse).to_f32();
+                bf16::from_f32(if d < width / 2 {
+                    phase.sin()
+                } else {
+                    phase.cos()
+                })
+            })
+        })
+        .collect())
+}
+
 struct FeedForward {
     pre: CudaSlice<bf16>,
     post: CudaSlice<bf16>,
@@ -143,16 +167,7 @@ impl AudioRuntime {
             ));
         }
         let relative_rows = (a.chunk + a.context_left - 1) / 2 + 1;
-        let relative_input = (0..relative_rows)
-            .flat_map(|row| {
-                (0..h).map(move |d| {
-                    let exponent =
-                        (d % (h / 2)) as f32 * -(10000_f64.ln() / f64::from(h / 2 - 1)) as f32;
-                    let phase = (relative_rows - 1 - row) as f32 * exponent.exp();
-                    bf16::from_f32(if d < h / 2 { phase.sin() } else { phase.cos() })
-                })
-            })
-            .collect::<Vec<_>>();
+        let relative_input = relative_positions(relative_rows, h)?;
         let relative_input = s.clone_htod(&relative_input)?;
         let scratch = s.alloc_zeros(relative_rows as usize * h as usize)?;
         let mut blocks = Vec::new();
