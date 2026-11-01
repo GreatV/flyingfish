@@ -3797,10 +3797,13 @@ impl Engine {
                 .clone_dtoh(logits)
                 .context("read FP32 logits");
         }
-        let values = self
-            .device
-            .stream
-            .clone_dtoh(&self.work.logits.slice(..self.config.vocab_size))?;
+        let values = if self.qwen.is_some() {
+            self.read_decode_logits_bf16()?
+        } else {
+            self.device
+                .stream
+                .clone_dtoh(&self.work.logits.slice(..self.config.vocab_size))?
+        };
         Ok(values.into_iter().map(bf16::to_f32).collect())
     }
 

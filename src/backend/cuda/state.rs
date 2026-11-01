@@ -2,7 +2,7 @@
 use super::contracts::SeqRef;
 use super::contracts::Tensor;
 use crate::backend::gpu::{
-    CudaFunction, CudaSlice, CudaStream, DevicePtr, DeviceRepr, PushKernelArg,
+    CudaFunction, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, PushKernelArg,
 };
 use crate::{
     model_spec::{Mixer, ModelSpec},
@@ -804,12 +804,20 @@ impl StateStore {
         &mut self,
         stream: &Arc<CudaStream>,
         advance: &CudaFunction,
+        position: Option<&mut CudaSlice<i32>>,
+        length: Option<&mut CudaSlice<i32>>,
     ) -> Result<()> {
         let meta = self.seq_ref(stream)?;
+        let pos_guard = position.map(|s| s.device_ptr_mut(stream));
+        let len_guard = length.map(|s| s.device_ptr_mut(stream));
+        let pos_ptr = pos_guard.as_ref().map_or(0u64, |(ptr, _)| *ptr);
+        let len_ptr = len_guard.as_ref().map_or(0u64, |(ptr, _)| *ptr);
         unsafe {
             stream
                 .launch_builder(advance)
                 .arg(&meta.ptr)
+                .arg(&pos_ptr)
+                .arg(&len_ptr)
                 .launch(super::ops::grid(1, 1))?;
         }
         let sequence = self

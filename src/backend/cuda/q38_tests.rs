@@ -2154,11 +2154,14 @@ fn q38_state_checkpoint_gpu() -> Result<()> {
     state.set_sequence(s, 5, 1, 1)?;
     let advance = super::cubin::module(&d.ctx, "q38_common")?.load_function("q38_advance")?;
     let seq = state.seq_ref(s)?;
+    let null = 0u64;
     use cudarc::driver::PushKernelArg;
     s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
     let launched = unsafe {
         s.launch_builder(&advance)
             .arg(&seq.ptr)
+            .arg(&null)
+            .arg(&null)
             .launch(super::ops::grid(1, 1))
     };
     let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));

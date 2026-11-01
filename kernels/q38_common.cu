@@ -23,9 +23,14 @@ extern "C" __global__ void q38_bias_add(__nv_bfloat16* y,const __nv_bfloat16* bi
         y[i]=__hadd(y[i],bias[i%width]);
 }
 #endif
-extern "C" __global__ void q38_advance(Q38SequenceMeta* meta) {
+extern "C" __global__ void q38_advance(Q38SequenceMeta* meta, int32_t* position, int32_t* length) {
     q38_meta_guard(meta);
-    if(threadIdx.x==0 && blockIdx.x==0) { ++meta->prefix; ++meta->key_count; }
+    if(threadIdx.x==0 && blockIdx.x==0) {
+        ++meta->prefix;
+        ++meta->key_count;
+        if(position) ++*position;
+        if(length) ++*length;
+    }
 }
 // Reads the device position; requires p + rows < capacity, leaving the final
 // physical slot for the next-row decode metadata.

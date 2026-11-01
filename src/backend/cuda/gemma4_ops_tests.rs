@@ -1487,6 +1487,38 @@ fn softcap_tied_head_and_embedding_scale_match_the_definition_gpu() -> Result<()
     let stats = Stats::new(raw, capped)?;
     println!("GEMMA4_SOFTCAP_MUTANT tanh_absent {}", stats.line(tag));
     undetected += usize::from(!(stats.is_detected_mutant() && !stats.passes()));
+    let softcap_argmax = cubin::module(&device.ctx, "sample")?.load_function("softcap_argmax")?;
+    let argmax = cubin::module(&device.ctx, "sample")?.load_function("argmax")?;
+    let last_start = (rows - 1) * vocab;
+    let fused_logits = s.clone_htod(&raw[last_start..last_start + vocab])?;
+    let mut fused_token = s.alloc_zeros::<u32>(1)?;
+    let mut unfused_token = s.alloc_zeros::<u32>(1)?;
+    let unfused_capped = s.clone_htod(&capped[last_start..last_start + vocab])?;
+    unsafe {
+        s.launch_builder(&softcap_argmax)
+            .arg(&fused_logits)
+            .arg(&mut fused_token)
+            .arg(&(vocab as i32))
+            .arg(&cap)
+            .launch(super::ops::grid(1, 1024))?;
+        s.launch_builder(&argmax)
+            .arg(&unfused_capped)
+            .arg(&mut unfused_token)
+            .arg(&(vocab as i32))
+            .launch(super::ops::grid(1, 1024))?;
+    }
+    let fused_host = s.clone_dtoh(&fused_logits)?;
+    let input_bits: usize = fused_host
+        .iter()
+        .zip(&raw[last_start..last_start + vocab])
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    let fused_tok = s.clone_dtoh(&fused_token)?[0];
+    let unfused_tok = s.clone_dtoh(&unfused_token)?[0];
+    println!(
+        "GEMMA4_SOFTCAP_ARGMAX {tag} input_bit_diffs={input_bits} token={fused_tok} expected={unfused_tok}"
+    );
+    defects += usize::from(input_bits != 0 || fused_tok != unfused_tok);
     println!("GEMMA4_HEAD {tag} defects={defects} undetected_mutants={undetected}");
     ensure!(defects == 0 && undetected == 0, "GEMMA4_HEAD FAIL");
     Ok(())
@@ -4249,6 +4281,50 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
     let mut defects = 0usize;
     let mut graph_defects = 0usize;
     let mut graph_state_defects = 0usize;
+    {
+        engine.reset()?;
+        let mut decode_trace = crate::trace::Trace::default();
+        let probe_token = ids["short"][0][0].as_u64().context("short id")? as u32;
+        engine.gemma_decode_trace(probe_token, &mut decode_trace)?;
+        let (raw_work, expected_softcapped) = engine.gemma_raw_and_softcapped_work_logits()?;
+        let decode_read1: Vec<bf16> = engine
+            .decode_logits()?
+            .into_iter()
+            .map(bf16::from_f32)
+            .collect();
+        let decode_read2: Vec<bf16> = engine
+            .decode_logits()?
+            .into_iter()
+            .map(bf16::from_f32)
+            .collect();
+        let traced_logits: Vec<bf16> = decode_trace
+            .values(".logits")?
+            .into_iter()
+            .map(bf16::from_f32)
+            .collect();
+        let raw_diffs = raw_work
+            .iter()
+            .zip(&expected_softcapped)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        println!(
+            "GEMMA4_DECODE_LOGITS_SOFTCAP vocab={} read1_eq_main={} read2_eq_main={} trace_eq_main={} work_logits_raw_diffs={raw_diffs}",
+            expected_softcapped.len(),
+            decode_read1 == expected_softcapped,
+            decode_read2 == expected_softcapped,
+            traced_logits == expected_softcapped,
+        );
+        ensure!(
+            decode_read1 == expected_softcapped
+                && decode_read2 == expected_softcapped
+                && traced_logits == expected_softcapped
+                && raw_diffs > 0,
+            "Gemma decode_logits/trace softcap contract failed: read1_eq={} read2_eq={} trace_eq={} raw_diffs={raw_diffs}",
+            decode_read1 == expected_softcapped,
+            decode_read2 == expected_softcapped,
+            traced_logits == expected_softcapped,
+        );
+    }
     let mut first = false;
     for (tag, prefill) in [("a", 0usize), ("b", 0), ("wrap", 512), ("long", 0)] {
         let sequence: Vec<u32> = if matches!(tag, "wrap" | "long") {
@@ -4524,6 +4600,461 @@ fn gemma4_catalog_uploads_exactly_the_text_set_gpu() -> Result<()> {
         "GEMMA4_LOADER PASS tensors={} bytes={} device_delta={used}",
         loaded.len(),
         catalog.bytes
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a GPU"]
+fn gemma4_decode_launch_and_byte_reductions_gpu() -> Result<()> {
+    use super::{
+        Device, cubin,
+        ops::{flat, grid},
+        state::StateStore,
+    };
+    use crate::backend::gpu::{DevicePtr, LaunchConfig, PushKernelArg};
+
+    let device = Device::new(0)?;
+    device.finish_upload()?;
+    let s = &device.stream;
+    let act_mod = cubin::module(&device.ctx, "act")?;
+    let sample_mod = cubin::module(&device.ctx, "sample")?;
+    let embed_mod = cubin::module(&device.ctx, "embed")?;
+    let common_mod = cubin::module(&device.ctx, "q38_common")?;
+    let vision_io_mod = cubin::module(&device.ctx, "q38_vision_io")?;
+
+    let softcap = act_mod.load_function("softcap")?;
+    let argmax = sample_mod.load_function("argmax")?;
+    let softcap_argmax = sample_mod.load_function("softcap_argmax")?;
+    let embed_scale_broadcast = embed_mod.load_function("embed_scale_broadcast")?;
+    let per_layer_input = embed_mod.load_function("per_layer_input")?;
+    let q38_advance = common_mod.load_function("q38_advance")?;
+    let q38_text_positions = vision_io_mod.load_function("q38_text_positions")?;
+
+    // A-5: softcap_argmax bit-identity + tie rule (sample.cu:3-4, 29-30, 36, 43, 55, 61) + near-tie mutant.
+    let vocab = 262_144usize;
+    let cap = 30.0f32;
+    let raw_logits: Vec<bf16> = (0..vocab)
+        .map(|i| bf16::from_f32(((i * 257 + 19) % 1021) as f32 * 0.03125 - 16.0))
+        .collect();
+    let run_pair = |input: &[bf16]| -> Result<(Vec<bf16>, u32, Vec<bf16>, u32)> {
+        let mut unfused = s.clone_htod(input)?;
+        let mut unfused_tok = s.alloc_zeros::<u32>(1)?;
+        let fused = s.clone_htod(input)?;
+        let mut fused_tok = s.alloc_zeros::<u32>(1)?;
+        unsafe {
+            s.launch_builder(&softcap)
+                .arg(&mut unfused)
+                .arg(&(input.len() as i64))
+                .arg(&cap)
+                .launch(flat(input.len()))?;
+            s.launch_builder(&argmax)
+                .arg(&unfused)
+                .arg(&mut unfused_tok)
+                .arg(&(input.len() as i32))
+                .launch(grid(1, 1024))?;
+            s.launch_builder(&softcap_argmax)
+                .arg(&fused)
+                .arg(&mut fused_tok)
+                .arg(&(input.len() as i32))
+                .arg(&cap)
+                .launch(grid(1, 1024))?;
+        }
+        let read_softcapped = |raw: &crate::backend::gpu::CudaSlice<bf16>| -> Result<Vec<bf16>> {
+            let mut staged = s.clone_dtod(raw)?;
+            unsafe {
+                s.launch_builder(&softcap)
+                    .arg(&mut staged)
+                    .arg(&(input.len() as i64))
+                    .arg(&cap)
+                    .launch(flat(input.len()))?;
+            }
+            Ok(s.clone_dtoh(&staged)?)
+        };
+        let unfused_host = s.clone_dtoh(&unfused)?;
+        let fused_raw = s.clone_dtoh(&fused)?;
+        let read1 = read_softcapped(&fused)?;
+        let read2 = read_softcapped(&fused)?;
+        let raw_preserved = fused_raw
+            .iter()
+            .zip(input)
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+        let repeat_diffs = unfused_host
+            .iter()
+            .zip(&read2)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        ensure!(
+            raw_preserved && repeat_diffs == 0,
+            "A-5 staging/raw contract failed: raw_preserved={raw_preserved} repeat_diffs={repeat_diffs}"
+        );
+        Ok((
+            unfused_host,
+            s.clone_dtoh(&unfused_tok)?[0],
+            read1,
+            s.clone_dtoh(&fused_tok)?[0],
+        ))
+    };
+    let (unfused_out, unfused_id, fused_out, fused_id) = run_pair(&raw_logits)?;
+    let normal_bit_diffs = unfused_out
+        .iter()
+        .zip(&fused_out)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    let raw_read_mutant_diffs = unfused_out
+        .iter()
+        .zip(&raw_logits)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    let mut double_softcap_dev = s.clone_htod(&unfused_out)?;
+    unsafe {
+        s.launch_builder(&softcap)
+            .arg(&mut double_softcap_dev)
+            .arg(&(vocab as i64))
+            .arg(&cap)
+            .launch(flat(vocab))?;
+    }
+    let double_softcap_diffs = s
+        .clone_dtoh(&double_softcap_dev)?
+        .iter()
+        .zip(&unfused_out)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    ensure!(
+        normal_bit_diffs == 0
+            && raw_read_mutant_diffs > 0
+            && double_softcap_diffs > 0
+            && fused_id == unfused_id,
+        "A-5 normal softcap_argmax mismatch: bit_diffs={normal_bit_diffs} raw_read_mutant_diffs={raw_read_mutant_diffs} double_softcap_diffs={double_softcap_diffs} fused_id={fused_id} unfused_id={unfused_id}"
+    );
+
+    let mut tie_logits = vec![bf16::from_f32(-5.0); vocab];
+    tie_logits[19] = bf16::from_f32(12.5);
+    tie_logits[200_003] = bf16::from_f32(12.5);
+    let (tie_unfused_out, tie_unfused_id, tie_fused_out, tie_fused_id) = run_pair(&tie_logits)?;
+    let tie_bit_diffs = tie_unfused_out
+        .iter()
+        .zip(&tie_fused_out)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    ensure!(
+        tie_bit_diffs == 0 && tie_fused_id == 19 && tie_unfused_id == 19,
+        "A-5 exact tie mismatch: bit_diffs={tie_bit_diffs} fused_id={tie_fused_id} unfused_id={tie_unfused_id}"
+    );
+
+    let mut near_tie_logits = vec![bf16::from_f32(-10.0); vocab];
+    near_tie_logits[41] = bf16::from_f32(450.0);
+    near_tie_logits[199_999] = bf16::from_f32(500.0);
+    let (nt_unfused_out, nt_unfused_id, nt_fused_out, nt_fused_id) = run_pair(&near_tie_logits)?;
+    let nt_bit_diffs = nt_unfused_out
+        .iter()
+        .zip(&nt_fused_out)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    // Planted mutant: argmax over pre-softcap (or unrounded float) logits picks index 199_999 instead of 41.
+    let raw_dev = s.clone_htod(&near_tie_logits)?;
+    let mut mutant_tok = s.alloc_zeros::<u32>(1)?;
+    unsafe {
+        s.launch_builder(&argmax)
+            .arg(&raw_dev)
+            .arg(&mut mutant_tok)
+            .arg(&(vocab as i32))
+            .launch(grid(1, 1024))?;
+    }
+    let mutant_id = s.clone_dtoh(&mutant_tok)?[0];
+    ensure!(
+        nt_bit_diffs == 0
+            && nt_fused_out[41].to_bits() == nt_fused_out[199_999].to_bits()
+            && nt_fused_id == 41
+            && nt_unfused_id == 41
+            && mutant_id == 199_999,
+        "A-5 near-tie saturation control failed: bit_diffs={nt_bit_diffs} fused_id={nt_fused_id} unfused_id={nt_unfused_id} mutant_id={mutant_id}"
+    );
+    println!(
+        "PASS A5_SOFTCAP_ARGMAX vocab={vocab} raw_preserved=true normal_bit_diffs={normal_bit_diffs} repeat_bit_diffs=0 raw_read_mutant_diffs={raw_read_mutant_diffs} double_softcap_diffs={double_softcap_diffs} tie_id={tie_fused_id} near_tie_id={nt_fused_id} planted_prerounded_mutant_id={mutant_id} mutant_detected=true"
+    );
+
+    // A-4: q38_advance fused with position and length (eager + CUDA graph replay + planted length-omitted mutant).
+    let qwen_root: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/q38-config.json"
+    )))?;
+    let mut small_spec = crate::model_spec::ModelSpec::qwen(&qwen_root, &serde_json::json!({}))?;
+    small_spec.layers.truncate(1);
+    let mut state = StateStore::new(&small_spec, 32, s)?;
+    state.set_sequence(s, 5, 1, 1)?;
+    let mut pos_dev = s.clone_htod(&[5i32])?;
+    let mut len_dev = s.clone_htod(&[6i32])?;
+    state.advance_sequence(s, &q38_advance, Some(&mut pos_dev), Some(&mut len_dev))?;
+    ensure!(
+        s.clone_dtoh(state.sequence.as_ref().context("seq missing")?)? == [6, 1, 7, 32, 1, 0, 0, 0]
+            && s.clone_dtoh(&pos_dev)? == [6]
+            && s.clone_dtoh(&len_dev)? == [7],
+        "A-4 eager q38_advance mismatch"
+    );
+    s.begin_capture(cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+    let cap_res = state.advance_sequence(s, &q38_advance, Some(&mut pos_dev), Some(&mut len_dev));
+    let graph = s
+        .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
+        .context("empty A-4 advance graph")?;
+    cap_res?;
+    for expected_prefix in [7i32, 8, 9] {
+        graph.launch()?;
+        ensure!(
+            s.clone_dtoh(state.sequence.as_ref().context("seq missing")?)?
+                == [expected_prefix, 1, expected_prefix + 1, 32, 1, 0, 0, 0]
+                && s.clone_dtoh(&pos_dev)? == [expected_prefix]
+                && s.clone_dtoh(&len_dev)? == [expected_prefix + 1],
+            "A-4 graph q38_advance mismatch at prefix={expected_prefix}"
+        );
+    }
+    // Planted mutant: omitting length leaves len_dev stale relative to meta.key_count.
+    state.advance_sequence(s, &q38_advance, Some(&mut pos_dev), None)?;
+    let stale_len = s.clone_dtoh(&len_dev)?[0];
+    let key_count = s.clone_dtoh(state.sequence.as_ref().context("seq missing")?)?[2];
+    ensure!(
+        stale_len != key_count,
+        "A-4 planted length-omitted mutant was not detected"
+    );
+    println!(
+        "PASS A4_QWEN_ADVANCE eager_and_graph_steps=4 meta_prefix=10 key_count={key_count} pos=10 stale_len_mutant={stale_len} mutant_detected=true"
+    );
+
+    // A-2: structural skip of q38_text_positions when attention.is_none() vs update when attention.is_some().
+    let workspace_rows = 16usize;
+    let table = s.clone_htod(&crate::vision_input::PositionPlan::text(1, 32)?.packed_axes()?)?;
+    let mut active = s.clone_htod(&vec![i32::MIN; workspace_rows * 3])?;
+    state.set_sequence(s, 4, 3, workspace_rows as u32)?;
+    let seq_ref = state.seq_ref(s)?;
+    let run_select =
+        |has_attention: bool, active: &mut crate::backend::gpu::CudaSlice<i32>| -> Result<()> {
+            if !has_attention {
+                return Ok(());
+            }
+            let (table_ptr, _t) = table.device_ptr(s);
+            let (active_ptr, _a) = active.device_ptr(s);
+            let max_rows = workspace_rows as u32;
+            unsafe {
+                s.launch_builder(&q38_text_positions)
+                    .arg(&table_ptr)
+                    .arg(&active_ptr)
+                    .arg(&seq_ref.ptr)
+                    .arg(&max_rows)
+                    .launch(grid((workspace_rows * 3).div_ceil(256).min(65535), 256))?;
+            }
+            Ok(())
+        };
+    run_select(false, &mut active)?;
+    ensure!(
+        s.clone_dtoh(&active)?.iter().all(|&v| v == i32::MIN),
+        "A-2 structural skip modified active_positions when attention is absent"
+    );
+    run_select(true, &mut active)?;
+    let updated_active = s.clone_dtoh(&active)?;
+    ensure!(
+        updated_active[..9] == [4, 4, 4, 5, 5, 5, 6, 6, 6],
+        "A-2 attention-present control failed: {:?}",
+        &updated_active[..9]
+    );
+    println!(
+        "PASS A2_SELECT_POSITIONS no_attention_untouched=true attention_present_axes={:?}",
+        &updated_active[..9]
+    );
+
+    // A-3: embed_scale_broadcast structural null-broadcast skip + LoopVL broadcast preservation.
+    let e_rows = 17usize;
+    let e_dim = 2048usize;
+    let e_vocab = 64usize;
+    let weight_host: Vec<bf16> = (0..e_vocab * e_dim)
+        .map(|i| bf16::from_f32(((i * 73 + 11) % 251) as f32 * 0.015625 - 2.0))
+        .collect();
+    let ids_host: Vec<u32> = (0..e_rows)
+        .map(|r| ((r * 13 + 5) % e_vocab) as u32)
+        .collect();
+    let initial_host: Vec<bf16> = (0..e_dim)
+        .map(|d| bf16::from_f32(((d * 41 + 3) % 199) as f32 * 0.03125 - 3.0))
+        .collect();
+    let visual_host: Vec<bf16> = (0..4 * e_dim)
+        .map(|i| bf16::from_f32(((i * 29 + 7) % 173) as f32 * 0.03125 - 2.5))
+        .collect();
+    let w_dev = s.clone_htod(&weight_host)?;
+    let ids_dev = s.clone_htod(&ids_host)?;
+    let initial_dev = s.clone_htod(&initial_host)?;
+    let visual_dev = s.clone_htod(&visual_host)?;
+    let sentinel = bf16::from_bits(0x5678);
+    let mut embedded_null = s.alloc_zeros::<bf16>(e_rows * e_dim)?;
+    let sentinel_dev = s.clone_htod(&vec![sentinel; e_rows * e_dim])?;
+    let _nan_initial = s.clone_htod(&vec![bf16::NAN; e_dim])?;
+    let scale = bf16::from_f32((e_dim as f32).sqrt()).to_f32();
+    let null = 0u64;
+    unsafe {
+        s.launch_builder(&embed_scale_broadcast)
+            .arg(&w_dev)
+            .arg(&ids_dev)
+            .arg(&null)
+            .arg(&mut embedded_null)
+            .arg(&null)
+            .arg(&(e_rows as i32))
+            .arg(&(e_dim as i32))
+            .arg(&scale)
+            .arg(&visual_dev)
+            .arg(&3i32)
+            .arg(&4i32)
+            .launch(flat(e_rows * e_dim))?;
+    }
+    let mut embedded_full = s.alloc_zeros::<bf16>(e_rows * e_dim)?;
+    let mut broadcast_full = s.alloc_zeros::<bf16>(e_rows * e_dim)?;
+    unsafe {
+        s.launch_builder(&embed_scale_broadcast)
+            .arg(&w_dev)
+            .arg(&ids_dev)
+            .arg(&initial_dev)
+            .arg(&mut embedded_full)
+            .arg(&mut broadcast_full)
+            .arg(&(e_rows as i32))
+            .arg(&(e_dim as i32))
+            .arg(&scale)
+            .arg(&visual_dev)
+            .arg(&3i32)
+            .arg(&4i32)
+            .launch(flat(e_rows * e_dim))?;
+    }
+    let emb_null_out = s.clone_dtoh(&embedded_null)?;
+    let emb_full_out = s.clone_dtoh(&embedded_full)?;
+    let bcast_out = s.clone_dtoh(&broadcast_full)?;
+    let sentinel_out = s.clone_dtoh(&sentinel_dev)?;
+    let emb_bit_diffs = emb_null_out
+        .iter()
+        .zip(&emb_full_out)
+        .filter(|(a, b)| a.to_bits() != b.to_bits() || !a.is_finite())
+        .count();
+    let bcast_mismatches = bcast_out
+        .iter()
+        .enumerate()
+        .filter(|(i, v)| v.to_bits() != initial_host[i % e_dim].to_bits())
+        .count();
+    let sentinel_preserved = sentinel_out
+        .iter()
+        .all(|v| v.to_bits() == sentinel.to_bits());
+    ensure!(
+        emb_bit_diffs == 0 && bcast_mismatches == 0 && sentinel_preserved,
+        "A-3 embed_scale_broadcast failed: emb_bit_diffs={emb_bit_diffs} bcast_mismatches={bcast_mismatches} sentinel_preserved={sentinel_preserved}"
+    );
+    println!(
+        "PASS A3_EMBED_SCALE_BROADCAST rows={e_rows} dim={e_dim} emb_bit_diffs={emb_bit_diffs} loopvl_bcast_mismatches={bcast_mismatches} sentinel_preserved={sentinel_preserved}"
+    );
+
+    // A-1: per_layer_input register retention for width=256 across rows in [1, 17, 64] and layers in [35, 42].
+    let width = 256usize;
+    let ple_vocab = 32usize;
+    let wn_host: Vec<bf16> = (0..width)
+        .map(|d| bf16::from_f32(((d * 19 + 7) % 127) as f32 * 0.015625 + 0.5))
+        .collect();
+    let wn_dev = s.clone_htod(&wn_host)?;
+    let (wn_ptr, _wn_guard) = wn_dev.device_ptr(s);
+    let identity_scale = bf16::from_f32((width as f32).sqrt()).to_f32();
+    let context_scale = bf16::from_f32(1.0 / (1536.0f32).sqrt()).to_f32();
+    let combine_scale = bf16::from_f32(std::f32::consts::FRAC_1_SQRT_2).to_f32();
+    let eps = 1e-6f32;
+
+    for layers in [35usize, 42] {
+        let table_host: Vec<bf16> = (0..ple_vocab * layers * width)
+            .map(|i| bf16::from_f32(((i * 37 + 13) % 251) as f32 * 0.0078125 - 1.0))
+            .collect();
+        let table_dev = s.clone_htod(&table_host)?;
+        let (table_ptr, _table_guard) = table_dev.device_ptr(s);
+        for rows in [1usize, 17, 64] {
+            let ids_host: Vec<u32> = (0..rows)
+                .map(|r| ((r * 7 + 3) % ple_vocab) as u32)
+                .collect();
+            let ctx_host: Vec<bf16> = (0..rows * layers * width)
+                .map(|i| bf16::from_f32(((i * 53 + 9) % 239) as f32 * 0.015625 - 1.8))
+                .collect();
+            let ids_dev = s.clone_htod(&ids_host)?;
+            let ctx_dev = s.clone_htod(&ctx_host)?;
+            let mut out_dev = s.alloc_zeros::<bf16>(rows * layers * width)?;
+            unsafe {
+                s.launch_builder(&per_layer_input)
+                    .arg(&ids_dev)
+                    .arg(&table_ptr)
+                    .arg(&ctx_dev)
+                    .arg(&wn_ptr)
+                    .arg(&mut out_dev)
+                    .arg(&(rows as i32))
+                    .arg(&(layers as i32))
+                    .arg(&(width as i32))
+                    .arg(&identity_scale)
+                    .arg(&context_scale)
+                    .arg(&combine_scale)
+                    .arg(&eps)
+                    .launch(LaunchConfig {
+                        grid_dim: ((rows * layers) as u32, 1, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+            let actual = s.clone_dtoh(&out_dev)?;
+            let is_bf16 = bf16::from_f32(identity_scale);
+            let cs_bf16 = bf16::from_f32(context_scale);
+            let comb_bf16 = bf16::from_f32(combine_scale);
+            let mut bit_diffs = 0usize;
+            let mut mutant_diffs = 0usize;
+            for (row, &tok_id) in ids_host.iter().enumerate() {
+                let tok = tok_id as usize;
+                for layer in 0..layers {
+                    let ctx_base = (row * layers + layer) * width;
+                    let out_base = (layer * rows + row) * width;
+                    let tok_base = (tok * layers + layer) * width;
+                    let mut scaled_ctx = [0.0f32; 256];
+                    for (d, slot) in scaled_ctx.iter_mut().enumerate() {
+                        *slot = bf16::from_f32(ctx_host[ctx_base + d].to_f32() * cs_bf16.to_f32())
+                            .to_f32();
+                    }
+                    let mut t_sum = [0.0f32; 128];
+                    for (t, slot) in t_sum.iter_mut().enumerate() {
+                        let x0 = scaled_ctx[t];
+                        let x1 = scaled_ctx[t + 128];
+                        *slot = (0.0f32 + x0 * x0) + x1 * x1;
+                    }
+                    let mut warp_sum = [0.0f32; 4];
+                    for (w, w_slot) in warp_sum.iter_mut().enumerate() {
+                        let mut lane = [0.0f32; 32];
+                        lane.copy_from_slice(&t_sum[w * 32..(w + 1) * 32]);
+                        for offset in [16usize, 8, 4, 2, 1] {
+                            for i in 0..offset {
+                                lane[i] += lane[i + offset];
+                            }
+                        }
+                        *w_slot = lane[0];
+                    }
+                    let sum = ((warp_sum[0] + warp_sum[1]) + warp_sum[2]) + warp_sum[3];
+                    let rstd = 1.0f32 / (sum / (width as f32) + eps).sqrt();
+                    for d in 0..width {
+                        let id_val =
+                            bf16::from_f32(table_host[tok_base + d].to_f32() * is_bf16.to_f32());
+                        let n = bf16::from_f32(scaled_ctx[d] * rstd * wn_host[d].to_f32());
+                        let sum_bf16 = bf16::from_f32(n.to_f32() + id_val.to_f32());
+                        let expected = bf16::from_f32(sum_bf16.to_f32() * comb_bf16.to_f32());
+                        let got = actual[out_base + d];
+                        if (got.to_f32() - expected.to_f32()).abs() > 0.0 {
+                            bit_diffs += usize::from(got.to_bits() != expected.to_bits());
+                        }
+                        // Planted mutant: unscaled identity table entry.
+                        let bad_sum =
+                            bf16::from_f32(n.to_f32() + table_host[tok_base + d].to_f32());
+                        let bad_out = bf16::from_f32(bad_sum.to_f32() * comb_bf16.to_f32());
+                        mutant_diffs += usize::from(got.to_bits() != bad_out.to_bits());
+                    }
+                }
+            }
+            ensure!(
+                bit_diffs == 0 && mutant_diffs > (rows * layers * width) / 2,
+                "A-1 per_layer_input failed at layers={layers} rows={rows}: bit_diffs={bit_diffs} mutant_diffs={mutant_diffs}"
+            );
+        }
+    }
+    println!(
+        "PASS A1_PER_LAYER_INPUT layers=35,42 rows=1,17,64 width={width} bit_diffs=0 planted_scale_mutant=detected"
     );
     Ok(())
 }

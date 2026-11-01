@@ -567,6 +567,7 @@ fn require_gemma_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
 struct GemmaOps {
     scaled_embed: CudaFunction,
     softcap: CudaFunction,
+    softcap_argmax: CudaFunction,
     gated_activation: CudaFunction,
     rope: CudaFunction,
     ring_decode: RingDecode,
@@ -1080,6 +1081,9 @@ impl Runtime {
         meta: crate::backend::cuda::contracts::SeqRef,
         workspace_rows: usize,
     ) -> Result<()> {
+        if self.attention.is_none() {
+            return Ok(());
+        }
         let (table, _table) = self.positions.device_ptr(stream);
         let (active, _active) = self.active_positions.device_ptr(stream);
         let max_rows = u32::try_from(workspace_rows)?;
@@ -1422,6 +1426,7 @@ impl Runtime {
                 .map_err(|_| anyhow::anyhow!("two per-layer RoPE tables required"))?;
             let act = cubin::module(&engine.device.ctx, "act")?;
             let embed = cubin::module(&engine.device.ctx, "embed")?;
+            let sample = cubin::module(&engine.device.ctx, "sample")?;
             #[cfg(test)]
             let mlp_elements = rows
                 * engine
@@ -1438,6 +1443,7 @@ impl Runtime {
             Some(GemmaOps {
                 scaled_embed: embed.load_function("embed_scale_broadcast")?,
                 softcap: act.load_function("softcap")?,
+                softcap_argmax: sample.load_function("softcap_argmax")?,
                 gated_activation: act.load_function("silu_mul_split")?,
                 rope: rope_module
                     .as_ref()
@@ -3823,9 +3829,12 @@ impl Engine {
     }
     pub(super) fn qwen_advance(&mut self) -> Result<()> {
         let q = self.qwen.as_ref().context("Q38 runtime missing")?;
-        self.state
-            .advance_sequence(&self.device.stream, &q.advance)?;
-        self.work.advance(&self.ops, &self.device.stream)?;
+        self.state.advance_sequence(
+            &self.device.stream,
+            &q.advance,
+            Some(&mut self.work.position),
+            Some(&mut self.work.length),
+        )?;
         self.state.compact_commit(&self.device.stream, false)
     }
 
@@ -6011,6 +6020,7 @@ impl Engine {
                 unsafe {
                     if gemma {
                         let scale = bf16::from_f32((h as f32).sqrt()).to_f32();
+                        let null = 0u64;
                         s.launch_builder(
                             &q.gemma
                                 .as_ref()
@@ -6019,9 +6029,9 @@ impl Engine {
                         )
                         .arg(self.weights.embedding())
                         .arg(ids)
-                        .arg(&w.gu)
+                        .arg(&null)
                         .arg(&mut w.x)
-                        .arg(&mut w.n)
+                        .arg(&null)
                         .arg(&(rows as i32))
                         .arg(&(h as i32))
                         .arg(&scale)
@@ -6598,22 +6608,24 @@ impl Engine {
                 if gemma {
                     let ops = q.gemma.as_ref().context("Gemma 4 operations missing")?;
                     unsafe {
-                        s.launch_builder(&ops.softcap)
-                            .arg(&mut w.logits)
-                            .arg(&(self.model_spec.vocab as i64))
+                        s.launch_builder(&ops.softcap_argmax)
+                            .arg(&w.logits)
+                            .arg(&mut w.token)
+                            .arg(&(self.model_spec.vocab as i32))
                             .arg(&self.model_spec.logit_softcap.context("softcap missing")?)
-                            .launch(flat(self.model_spec.vocab as usize))?;
+                            .launch(grid(1, 1024))?;
+                    }
+                } else {
+                    unsafe {
+                        s.launch_builder(&self.ops.argmax)
+                            .arg(&w.logits)
+                            .arg(&mut w.token)
+                            .arg(&(self.model_spec.vocab as i32))
+                            .launch(grid(1, 1024))?;
                     }
                 }
-                unsafe {
-                    s.launch_builder(&self.ops.argmax)
-                        .arg(&w.logits)
-                        .arg(&mut w.token)
-                        .arg(&(self.model_spec.vocab as i32))
-                        .launch(grid(1, 1024))?;
-                }
                 if let Some(t) = trace.as_mut() {
-                    let values = s.clone_dtoh(&w.logits)?;
+                    let values = self.read_decode_logits_bf16()?;
                     t.trace.add(
                         format!("{}.logits", t.prefix),
                         vec![1, 1, self.model_spec.vocab as usize],
@@ -6624,6 +6636,47 @@ impl Engine {
             _ => anyhow::bail!("operator {op:?} is not a Q38 common stage"),
         }
         Ok(())
+    }
+
+    pub(super) fn read_decode_logits_bf16(&self) -> Result<Vec<bf16>> {
+        let s = &self.device.stream;
+        let vocab = self.model_spec.vocab as usize;
+        let slice = self.work.logits.slice(..vocab);
+        if let Some(ops) = self.qwen.as_ref().and_then(|q| q.gemma.as_ref()) {
+            let cap = self.model_spec.logit_softcap.context("softcap missing")?;
+            let mut staged = s.clone_dtod(&slice)?;
+            unsafe {
+                s.launch_builder(&ops.softcap)
+                    .arg(&mut staged)
+                    .arg(&(vocab as i64))
+                    .arg(&cap)
+                    .launch(flat(vocab))?;
+            }
+            return Ok(s.clone_dtoh(&staged)?);
+        }
+        Ok(s.clone_dtoh(&slice)?)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gemma_raw_and_softcapped_work_logits(&self) -> Result<(Vec<bf16>, Vec<bf16>)> {
+        let s = &self.device.stream;
+        let vocab = self.model_spec.vocab as usize;
+        let raw = s.clone_dtoh(&self.work.logits.slice(..vocab))?;
+        let ops = self
+            .qwen
+            .as_ref()
+            .and_then(|q| q.gemma.as_ref())
+            .context("Gemma 4 operations missing")?;
+        let cap = self.model_spec.logit_softcap.context("softcap missing")?;
+        let mut staged = s.clone_htod(&raw)?;
+        unsafe {
+            s.launch_builder(&ops.softcap)
+                .arg(&mut staged)
+                .arg(&(vocab as i64))
+                .arg(&cap)
+                .launch(flat(vocab))?;
+        }
+        Ok((raw, s.clone_dtoh(&staged)?))
     }
 }
 
