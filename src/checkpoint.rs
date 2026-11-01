@@ -3018,6 +3018,18 @@ mod component_tests {
                 54,
                 14_926_026_836,
             ),
+            (
+                include_str!("../tests/data/gemma4-12b-config.json"),
+                666,
+                0,
+                23_814_700_640,
+            ),
+            (
+                include_str!("../tests/data/gemma4-31b-config.json"),
+                832,
+                0,
+                61_394_690_680,
+            ),
         ] {
             let spec = gemma4_spec(text, None)?;
             let mut expected = BTreeMap::new();
@@ -3036,6 +3048,60 @@ mod component_tests {
                 !expected.contains_key("lm_head.weight"),
                 "tied head must not expect lm_head"
             );
+            if spec.per_layer_input.is_none() {
+                ensure!(
+                    !expected.keys().any(|key| key.contains("per_layer")),
+                    "large Gemma manifest contains per-layer input weights"
+                );
+                for (index, layer) in spec.layers.iter().enumerate() {
+                    let name =
+                        format!("model.language_model.layers.{index}.self_attn.v_proj.weight");
+                    ensure!(
+                        expected.contains_key(&name) == layer.sliding_window.is_some(),
+                        "shared projection binding: {name}"
+                    );
+                }
+                let vision = spec.vision.as_ref().context("large vision spec")?;
+                let (vision_count, vision_bytes) = if vision.unified.is_some() {
+                    MappedCheckpoint::unified_vision_entries(vision, &mut expected)?;
+                    (10, 99_844_608)
+                } else {
+                    MappedCheckpoint::axial_vision_entries(
+                        vision,
+                        "model.vision_tower",
+                        "model.embed_vision.embedding_projection.weight",
+                        &mut expected,
+                    )?;
+                    (356, 1_151_487_072)
+                };
+                ensure!(
+                    expected
+                        .values()
+                        .filter(|e| e.2 == TensorScope::Vision)
+                        .count()
+                        == vision_count
+                        && MappedCheckpoint::planned_bytes(&expected, LoadPolicy::VisionOnly)?
+                            == vision_bytes,
+                    "large vision manifest count or allocation size changed"
+                );
+                if spec.hidden == 5376 {
+                    let mut encoder_vision = vision.clone();
+                    encoder_vision.output = 2816;
+                    let mut encoder = BTreeMap::new();
+                    MappedCheckpoint::axial_vision_entries(
+                        &encoder_vision,
+                        "model.encoder.vision_tower",
+                        "model.encoder.embed_vision.embedding_projection.weight",
+                        &mut encoder,
+                    )?;
+                    ensure!(encoder.len() == 356
+                        && encoder.contains_key("model.encoder.vision_tower.encoder.layers.26.self_attn.q_proj.linear.weight")
+                        && encoder["model.encoder.embed_vision.embedding_projection.weight"].1 == [2816, 1152]
+                        && MappedCheckpoint::planned_bytes(&encoder, LoadPolicy::VisionOnly)? == 1_145_588_832,
+                        "shared axial manifest lost its binding prefix or output width");
+                }
+                continue;
+            }
             MappedCheckpoint::axial_vision_entries(
                 spec.vision.as_ref().context("vision spec")?,
                 "model.vision_tower",
