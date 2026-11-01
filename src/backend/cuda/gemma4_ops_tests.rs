@@ -1490,13 +1490,13 @@ fn softcap_tied_head_and_embedding_scale_match_the_definition_gpu() -> Result<()
     let softcap_argmax = cubin::module(&device.ctx, "sample")?.load_function("softcap_argmax")?;
     let argmax = cubin::module(&device.ctx, "sample")?.load_function("argmax")?;
     let last_start = (rows - 1) * vocab;
-    let mut fused_logits = s.clone_htod(&raw[last_start..last_start + vocab])?;
+    let fused_logits = s.clone_htod(&raw[last_start..last_start + vocab])?;
     let mut fused_token = s.alloc_zeros::<u32>(1)?;
     let mut unfused_token = s.alloc_zeros::<u32>(1)?;
     let unfused_capped = s.clone_htod(&capped[last_start..last_start + vocab])?;
     unsafe {
         s.launch_builder(&softcap_argmax)
-            .arg(&mut fused_logits)
+            .arg(&fused_logits)
             .arg(&mut fused_token)
             .arg(&(vocab as i32))
             .arg(&cap)
@@ -1508,17 +1508,17 @@ fn softcap_tied_head_and_embedding_scale_match_the_definition_gpu() -> Result<()
             .launch(super::ops::grid(1, 1024))?;
     }
     let fused_host = s.clone_dtoh(&fused_logits)?;
-    let fused_bits: usize = fused_host
+    let input_bits: usize = fused_host
         .iter()
-        .zip(&capped[last_start..last_start + vocab])
+        .zip(&raw[last_start..last_start + vocab])
         .filter(|(a, b)| a.to_bits() != b.to_bits())
         .count();
     let fused_tok = s.clone_dtoh(&fused_token)?[0];
     let unfused_tok = s.clone_dtoh(&unfused_token)?[0];
     println!(
-        "GEMMA4_SOFTCAP_ARGMAX {tag} bit_diffs={fused_bits} token={fused_tok} expected={unfused_tok}"
+        "GEMMA4_SOFTCAP_ARGMAX {tag} input_bit_diffs={input_bits} token={fused_tok} expected={unfused_tok}"
     );
-    defects += usize::from(fused_bits != 0 || fused_tok != unfused_tok);
+    defects += usize::from(input_bits != 0 || fused_tok != unfused_tok);
     println!("GEMMA4_HEAD {tag} defects={defects} undetected_mutants={undetected}");
     ensure!(defects == 0 && undetected == 0, "GEMMA4_HEAD FAIL");
     Ok(())
