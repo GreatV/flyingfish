@@ -818,7 +818,7 @@ impl Flash {
                     shape.capacity == split.capacity,
                     "D512 capacity differs from setup binding"
                 );
-                if shape.rows <= 16 && split.parts > 1 {
+                if mode == 0 && shape.rows <= 16 && split.parts > 1 {
                     let (partials, _partials) = split.workspace.device_ptr_mut(&self.stream);
                     let scale = self.score.context("D512 score is not bound")?.scale;
                     #[cfg(feature = "cuda")]
