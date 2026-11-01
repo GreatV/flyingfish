@@ -730,6 +730,7 @@ impl Flash {
         );
         ensure!(
             mode == 0
+                || mode == 6
                 || image_blocks.is_some()
                 || (shape.window_left.is_none()
                     && (self.native.len() > mode || bidirectional_only)),
@@ -817,7 +818,7 @@ impl Flash {
             let native = self
                 .native
                 .get(if image_blocks.is_some() {
-                    self.native.len() - 1
+                    2
                 } else if bidirectional_only {
                     0
                 } else if mode == 6 {
@@ -925,6 +926,8 @@ impl Flash {
                     } else if shape.head_dim == 256 {
                         if mode == 1 {
                             launch.arg(&key_extent);
+                        } else if mode == 6 {
+                            launch.arg(&key_extent).arg(&window);
                         } else {
                             launch.arg(&window);
                         }
@@ -2148,6 +2151,7 @@ mod tests {
         let spike = match case.mode.as_str() {
             "prefix" => case.extent - 1,
             "window" => case.start - case.extent,
+            "symmetric" => case.start + case.extent,
             _ => case.keys - 1,
         };
         for kv in 0..case.hkv {
@@ -2169,14 +2173,21 @@ mod tests {
             v: stream.clone_htod(&values)?,
             out: stream.alloc_zeros(case.rows * case.hq * case.d)?,
         };
-        let mut op = if case.d == 512 {
+        let mut op = if case.d == 512 || case.mode == "symmetric" {
             Flash::new_with_score(
                 stream.clone(),
                 case.rows,
                 case.hq,
                 case.hkv,
                 case.d,
-                Score::from_tokens(0.044_194_174_f32, None)?,
+                Score {
+                    scale: if case.d == 512 {
+                        0.044_194_174_f32
+                    } else {
+                        0.0625
+                    },
+                    window_left: (case.mode == "symmetric").then_some(case.extent),
+                },
                 case.capacity,
             )?
         } else {
@@ -2208,7 +2219,12 @@ mod tests {
                 mutant.keys += 1;
             }
         }
-        mutant.run(&mut op, &mut b)?;
+        if case.mode == "symmetric" {
+            let mut wrong_op = mutant.binding(stream)?;
+            mutant.run(&mut wrong_op, &mut b)?;
+        } else {
+            mutant.run(&mut op, &mut b)?;
+        }
         let wrong: Vec<_> = stream
             .clone_dtoh(&b.out)?
             .iter()
@@ -2294,7 +2310,7 @@ mod tests {
                 seed: 31,
                 capacity: keys + 23,
                 pitch: hq * d + 128,
-                scale: None,
+                scale: (mode == "symmetric").then_some(0.0625),
             };
             defects += mask_control(stream, &case, limits)?;
         }

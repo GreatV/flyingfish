@@ -2934,10 +2934,11 @@ impl Engine {
 
     pub fn embed(
         &mut self,
-        ids: &[u32],
+        input: &crate::vision_input::MultimodalInput<'_>,
         mask: &[bool],
         trace: Option<&mut Trace>,
     ) -> Result<Vec<f32>> {
+        let ids = input.input_ids;
         ensure!(
             ids.len() == mask.len(),
             "embedding mask length differs from input"
@@ -2955,8 +2956,23 @@ impl Engine {
             !self.poisoned && self.position == 0 && self.images.is_none(),
             "embedding requires a healthy, reset sequence"
         );
+        ensure!(
+            input.modality_ids.len() == ids.len(),
+            "embedding modality length differs from input"
+        );
         let ids = &ids[..valid];
         let mask = &mask[..valid];
+        let packed = crate::vision_input::MultimodalInput {
+            input_ids: ids,
+            modality_ids: &input.modality_ids[..valid],
+            pixel_values: input.pixel_values,
+            grids: input.grids,
+            audio: input.audio,
+        };
+        let media = !packed.pixel_values.is_empty()
+            || !packed.grids.is_empty()
+            || !packed.audio.is_empty()
+            || packed.modality_ids.iter().any(|&modality| modality != 0);
         ensure!(
             ids.len() <= self.chunk,
             "bidirectional embedding input exceeds the whole-input prefill workspace"
@@ -2974,7 +2990,12 @@ impl Engine {
                 .as_mut()
                 .context("embedding output missing")?,
         )?;
-        self.prefill_inner(ids, trace, ids.len())?;
+        if media {
+            self.prefill_multimodal(&packed, trace)?;
+        } else {
+            packed.validate(&self.model_spec, self.capacity)?;
+            self.prefill_inner(ids, trace, ids.len())?;
+        }
         let output = self.device.stream.clone_dtoh(
             self.work
                 .embedding

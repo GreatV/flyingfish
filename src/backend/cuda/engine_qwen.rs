@@ -1689,16 +1689,26 @@ impl Runtime {
                             .geometry
                             .context("Gemma 4 attention geometry missing")?;
                         let full = geometry.head_dim == 512;
+                        let score = if engine.model_spec.architecture
+                            == crate::model_spec::Architecture::EmbeddingGemma2
+                        {
+                            Score {
+                                scale: 1.0,
+                                window_left: layout.sliding_window.map(|window| window as usize),
+                            }
+                        } else {
+                            Score::from_tokens(
+                                1.0,
+                                layout.sliding_window.map(|window| window as usize),
+                            )?
+                        };
                         let mut flash = Flash::new_with_score(
                             s.clone(),
                             rows,
                             engine.model_spec.q_heads as usize,
                             geometry.kv_heads.unwrap_or(engine.model_spec.kv_heads) as usize,
                             geometry.head_dim as usize,
-                            Score::from_tokens(
-                                1.0,
-                                layout.sliding_window.map(|window| window as usize),
-                            )?,
+                            score,
                             engine.capacity,
                         )?;
                         let position_limit = if layout.sliding_window.is_some()
@@ -2592,7 +2602,7 @@ impl Engine {
         } else {
             input.input_ids
         };
-        let result = self.prefill(ids, trace);
+        let result = self.prefill_inner(ids, trace, ids.len());
         if result.is_err() {
             self.poisoned = true;
         }

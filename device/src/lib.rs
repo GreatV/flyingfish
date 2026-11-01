@@ -486,6 +486,8 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
             block_bounds(p, (qstart + 63).min(p.rows - 1), prefix, blocks, origin)[1].min(end)
         } else if MODE == 1 {
             end
+        } else if MODE == 6 {
+            end.min(diagonal + 64 + prefix)
         } else if MODE == 2 {
             end.min(prefix.max(diagonal + 64))
         } else {
@@ -495,6 +497,8 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
             block_bounds(p, qstart, prefix, blocks, origin)[1].min(end)
         } else if MODE == 1 {
             end
+        } else if MODE == 6 {
+            end.min(diagonal + prefix)
         } else if MODE == 2 {
             end.min(prefix.max(diagonal))
         } else {
@@ -635,60 +639,33 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
                     commit();
                 }
                 let mut next = peak;
+                let upper = |row: u32| {
+                    if MODE == 4 || MODE == 5 {
+                        block_bounds(p, qstart + row, prefix, blocks, origin)[1].min(end)
+                    } else if MODE == 1 {
+                        end
+                    } else if MODE == 2 {
+                        prefix.max(diagonal + row + 1).min(end)
+                    } else if MODE == 6 {
+                        (diagonal + row + 1 + prefix).min(end)
+                    } else {
+                        (diagonal + row + 1).min(end)
+                    }
+                };
                 macro_rules! mask_max {
                     ($n:expr) => {{
                         if $masked || MODE >= 3 {
                             let col = key + $n * 8 + (lane & 3) * 2;
-                            if col
-                                >= if MODE == 4 || MODE == 5 {
-                                    block_bounds(p, qstart + r0, prefix, blocks, origin)[1].min(end)
-                                } else if MODE == 1 {
-                                    end
-                                } else if MODE == 2 {
-                                    prefix.max(diagonal + r0 + 1).min(end)
-                                } else {
-                                    (diagonal + r0 + 1).min(end)
-                                }
-                            {
+                            if col >= upper(r0) {
                                 scores[$n][0] = f32::NEG_INFINITY;
                             }
-                            if col + 1
-                                >= if MODE == 4 || MODE == 5 {
-                                    block_bounds(p, qstart + r0, prefix, blocks, origin)[1].min(end)
-                                } else if MODE == 1 {
-                                    end
-                                } else if MODE == 2 {
-                                    prefix.max(diagonal + r0 + 1).min(end)
-                                } else {
-                                    (diagonal + r0 + 1).min(end)
-                                }
-                            {
+                            if col + 1 >= upper(r0) {
                                 scores[$n][1] = f32::NEG_INFINITY;
                             }
-                            if col
-                                >= if MODE == 4 || MODE == 5 {
-                                    block_bounds(p, qstart + r1, prefix, blocks, origin)[1].min(end)
-                                } else if MODE == 1 {
-                                    end
-                                } else if MODE == 2 {
-                                    prefix.max(diagonal + r1 + 1).min(end)
-                                } else {
-                                    (diagonal + r1 + 1).min(end)
-                                }
-                            {
+                            if col >= upper(r1) {
                                 scores[$n][2] = f32::NEG_INFINITY;
                             }
-                            if col + 1
-                                >= if MODE == 4 || MODE == 5 {
-                                    block_bounds(p, qstart + r1, prefix, blocks, origin)[1].min(end)
-                                } else if MODE == 1 {
-                                    end
-                                } else if MODE == 2 {
-                                    prefix.max(diagonal + r1 + 1).min(end)
-                                } else {
-                                    (diagonal + r1 + 1).min(end)
-                                }
-                            {
+                            if col + 1 >= upper(r1) {
                                 scores[$n][3] = f32::NEG_INFINITY;
                             }
                         }

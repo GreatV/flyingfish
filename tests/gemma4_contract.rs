@@ -359,8 +359,16 @@ fn embedding_gemma2_text_matches_frozen_reference() -> Result<()> {
                 .count();
             let row_ids = &ids[row * shape[1]..row * shape[1] + valid];
             let row_mask = &mask[row * shape[1]..row * shape[1] + valid];
+            let modalities = vec![0u8; valid];
+            let input = MultimodalInput {
+                input_ids: row_ids,
+                modality_ids: &modalities,
+                pixel_values: &[],
+                grids: &[],
+                audio: &[],
+            };
             let mut trace = flyingfish::trace::Trace::all_layers();
-            let vector = model.embed(row_ids, row_mask, Some(&mut trace))?;
+            let vector = model.embed(&input, row_mask, Some(&mut trace))?;
             ensure!(vector.len() == 768);
             let expected = &expected_vectors[row * 768..(row + 1) * 768];
             if case == "short" {
@@ -442,13 +450,32 @@ fn embedding_gemma2_text_matches_frozen_reference() -> Result<()> {
             if case == "batch" && row == 1 {
                 let mut padded_ids = ids[row * shape[1]..(row + 1) * shape[1]].to_vec();
                 padded_ids[valid..].fill(1);
+                let padded_modalities = vec![0u8; shape[1]];
+                let padded_input = MultimodalInput {
+                    input_ids: &padded_ids,
+                    modality_ids: &padded_modalities,
+                    pixel_values: &[],
+                    grids: &[],
+                    audio: &[],
+                };
                 let padded = model.embed(
-                    &padded_ids,
+                    &padded_input,
                     &mask[row * shape[1]..(row + 1) * shape[1]],
                     None,
                 )?;
                 ensure!(padded == vector, "padding changed the native embedding");
-                ensure!(model.embed(&[2, 3, 4], &[true, false, true], None).is_err());
+                let invalid_input = MultimodalInput {
+                    input_ids: &[2, 3, 4],
+                    modality_ids: &[0, 0, 0],
+                    pixel_values: &[],
+                    grids: &[],
+                    audio: &[],
+                };
+                ensure!(
+                    model
+                        .embed(&invalid_input, &[true, false, true], None)
+                        .is_err()
+                );
             }
         }
     }

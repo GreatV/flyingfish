@@ -4423,6 +4423,211 @@ fn large_model_definition(
     Ok(())
 }
 
+#[cfg(feature = "cuda")]
+fn embedding_vector_distance(
+    actual: &[f32],
+    expected: &[f32],
+    bounds: &serde_json::Value,
+) -> Result<bool> {
+    ensure!(
+        actual.len() == expected.len(),
+        "embedding vector shape differs"
+    );
+    ensure!(
+        actual.iter().all(|value| value.is_finite()),
+        "nonfinite embedding vector"
+    );
+    let (mut maximum, mut squared, mut dot, mut a, mut b) = (0f64, 0f64, 0f64, 0f64, 0f64);
+    for (&actual, &expected) in actual.iter().zip(expected) {
+        let (actual, expected) = (f64::from(actual), f64::from(expected));
+        maximum = maximum.max((actual - expected).abs());
+        squared += (actual - expected).powi(2);
+        dot += actual * expected;
+        a += actual * actual;
+        b += expected * expected;
+    }
+    let rmse = (squared / actual.len() as f64).sqrt();
+    let cosine = 1.0 - dot / (a.sqrt() * b.sqrt());
+    let pass = maximum <= bounds["output_max"].as_f64().context("vector max")?
+        && rmse <= bounds["output_rmse"].as_f64().context("vector RMSE")?
+        && cosine
+            <= bounds["cosine_distance"]
+                .as_f64()
+                .context("vector cosine")?;
+    println!("embedding_vector max={maximum} rmse={rmse} cosine_distance={cosine} pass={pass}");
+    Ok(pass)
+}
+
+#[test]
+#[ignore = "requires EmbeddingGemma-2 media fixtures, frozen thresholds and a GPU window"]
+fn embedding_gemma2_vision_matches_frozen_reference() -> Result<()> {
+    #[cfg(not(feature = "cuda"))]
+    anyhow::bail!("EmbeddingGemma-2 vision gate requires CUDA");
+    #[cfg(feature = "cuda")]
+    {
+        let dir = std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL")?);
+        let fixtures = std::path::PathBuf::from(
+            std::env::var_os("FF_EMBEDDING_FIXTURES").context("FF_EMBEDDING_FIXTURES")?,
+        );
+        let frozen: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixtures.join("FROZEN.json"))?)?;
+        ensure!(frozen["status"] == "FROZEN" && frozen["candidate_observations"] == 0);
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixtures.join("inputs/INPUT.json"))?)?;
+        let settings = crate::backend::Settings {
+            tree_builder: crate::backend::TreeBuilder::Waves,
+            spec_budget: crate::backend::SpecBudget::Chain,
+            spec_graph: false,
+            draft_model: None,
+            prefix_cache: false,
+            kv_format: crate::kv::KvFormat::Bf16,
+            runtime_dir: Some(std::path::PathBuf::from(
+                std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR")?,
+            )),
+        };
+        let pair = LargeMediaInput::read(
+            &fixtures.join("inputs/image_pair.safetensors"),
+            &metadata["image_pair"],
+        )?;
+        let clips = pair.clips();
+        let mut engine = super::engine::Engine::load_multimodal(
+            &dir,
+            0,
+            1024,
+            Some(1024),
+            settings,
+            &pair.input(pair.ids.len(), &clips),
+        )?;
+        let spec = crate::model_spec::ModelSpec::read(&dir)?;
+        let last_vision_layer = spec
+            .vision
+            .as_ref()
+            .context("EmbeddingGemma-2 vision missing")?
+            .depth
+            .checked_sub(1)
+            .context("empty vision tower")?;
+        let mut defects = 0usize;
+        let mut vectors = BTreeMap::new();
+        for name in ["street", "winter", "image_pair"] {
+            let input = LargeMediaInput::read(
+                &fixtures.join("inputs").join(format!("{name}.safetensors")),
+                &metadata[name],
+            )?;
+            let oracle =
+                load_reference(&fixtures.join("oracle").join(format!("{name}.safetensors")))?;
+            let clips = input.clips();
+            let packed = input.input(input.ids.len(), &clips);
+            let mask = vec![true; input.ids.len()];
+            let before = engine.gemma_encoder_calls()?;
+            let mut trace = crate::trace::Trace::all_layers();
+            let vector = engine.embed(&packed, &mask, Some(&mut trace))?;
+            let after = engine.gemma_encoder_calls()?;
+            ensure!(
+                after.0 == before.0 + 1 && after.1 == before.1,
+                "vision encoder call count"
+            );
+            let bounds = &frozen["cells"][name];
+            let expected_vector = oracle["vector"].1.as_f32();
+            defects += usize::from(!embedding_vector_distance(
+                &vector,
+                &expected_vector,
+                &bounds["vector"],
+            )?);
+            let norm = vector
+                .iter()
+                .map(|&value| f64::from(value).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            ensure!((norm - 1.0).abs() <= frozen["unit_norm_limit"].as_f64().unwrap());
+            for (stage, trace_name) in [
+                ("spliced", "embed".to_owned()),
+                ("layer0", "0.debug.layer_out".to_owned()),
+                ("layer5", "5.debug.layer_out".to_owned()),
+                ("layer17", "17.debug.layer_out".to_owned()),
+                ("layer23", "23.debug.layer_out".to_owned()),
+                ("norm", "layer.norm".to_owned()),
+                ("projected", "layer.projected".to_owned()),
+                ("features", "media_features".to_owned()),
+            ] {
+                let actual = trace.values(&trace_name)?;
+                let pass = vision_distance(&actual, &oracle[stage].1.as_f32(), &bounds[stage])?;
+                defects += usize::from(!pass);
+                println!(
+                    "{} embedding_vision {name} {stage}",
+                    if pass { "PASS" } else { "DEFECT" }
+                );
+            }
+            let (ple_shape, ple) = &oracle["ple"];
+            ensure!(ple_shape[2..] == [24, 512]);
+            let rows = input.ids.len();
+            let source = ple.as_f32();
+            let mut expected_ple = vec![0.0; rows * 24 * 512];
+            for token in 0..rows {
+                for layer in 0..24 {
+                    let from = (token * 24 + layer) * 512;
+                    let to = (layer * rows + token) * 512;
+                    expected_ple[to..to + 512].copy_from_slice(&source[from..from + 512]);
+                }
+            }
+            let pass = vision_distance(
+                &trace.values("0.debug.ple_identity")?,
+                &expected_ple,
+                &bounds["ple"],
+            )?;
+            defects += usize::from(!pass);
+            let projected = trace.values("layer.projected")?;
+            let mut pooled = vec![0.0f32; 768];
+            for token in 0..rows {
+                for (column, value) in pooled.iter_mut().enumerate() {
+                    *value += projected[token * 768 + column] / rows as f32;
+                }
+            }
+            defects += usize::from(!embedding_vector_distance(
+                &pooled,
+                &oracle["pooled"].1.as_f32(),
+                &bounds["pooled"],
+            )?);
+            let mut tower = Vec::new();
+            for image in 0..input.grids.len() {
+                tower.extend(trace.values(&format!("image.{image}.layer.{last_vision_layer}"))?);
+            }
+            let pass = vision_distance(&tower, &oracle["tower"].1.as_f32(), &bounds["tower"])?;
+            defects += usize::from(!pass);
+            println!(
+                "{} embedding_vision {name} tower",
+                if pass { "PASS" } else { "DEFECT" }
+            );
+            if name == "image_pair" {
+                let halfway = input.pixels.len() / 2;
+                let mut pixels = input.pixels.clone();
+                let (first, second) = pixels.split_at_mut(halfway);
+                second.copy_from_slice(first);
+                let negative = LargeMediaInput {
+                    ids: input.ids.clone(),
+                    modalities: input.modalities.clone(),
+                    pixels,
+                    grids: input.grids.clone(),
+                    audio: Vec::new(),
+                };
+                let clips = negative.clips();
+                let negative =
+                    engine.embed(&negative.input(negative.ids.len(), &clips), &mask, None)?;
+                ensure!(
+                    negative != vector,
+                    "two-media native negative control did not change output"
+                );
+            }
+            vectors.insert(name, vector);
+        }
+        ensure!(
+            vectors["street"] != vectors["winter"] && vectors["street"] != vectors["image_pair"]
+        );
+        ensure!(defects == 0, "EmbeddingGemma-2 vision defects={defects}");
+        println!("EMBEDDING_GEMMA2_VISION PASS cells=3 defects=0");
+        Ok(())
+    }
+}
+
 #[test]
 #[ignore = "requires Gemma 4 model-definition fixtures, FROZEN.json, model weights and a GPU window"]
 fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {

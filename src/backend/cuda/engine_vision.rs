@@ -2447,9 +2447,19 @@ impl AxialTower {
         let h = vision.hidden;
         let i = vision.intermediate;
         let d = axial.head_dim;
+        let tower = if model.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
+            "vision_tower"
+        } else {
+            "model.vision_tower"
+        };
+        let embedder = if model.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
+            "embed_vision.embedding_projection.weight"
+        } else {
+            "model.embed_vision.embedding_projection.weight"
+        };
         let patch = ClippedLinear::take(
             catalog,
-            "model.vision_tower.patch_embedder.input_proj.weight",
+            &format!("{tower}.patch_embedder.input_proj.weight"),
             [
                 h,
                 u32::try_from(vision.patch_elements(model.architecture)?)?,
@@ -2458,26 +2468,21 @@ impl AxialTower {
         )?;
         let position = take(
             catalog,
-            "model.vision_tower.patch_embedder.position_embedding_table",
+            &format!("{tower}.patch_embedder.position_embedding_table"),
             &[2, vision.position_side as usize, h as usize],
         )?;
-        let projection = ClippedLinear::take(
-            catalog,
-            "model.embed_vision.embedding_projection.weight",
-            [vision.output, h],
-            None,
-        )?;
+        let projection = ClippedLinear::take(catalog, embedder, [vision.output, h], None)?;
         let standardization = if axial.standardize {
             Some([
-                take(catalog, "model.vision_tower.std_bias", &[h as usize])?,
-                take(catalog, "model.vision_tower.std_scale", &[h as usize])?,
+                take(catalog, &format!("{tower}.std_bias"), &[h as usize])?,
+                take(catalog, &format!("{tower}.std_scale"), &[h as usize])?,
             ])
         } else {
             None
         };
         let mut blocks = Vec::with_capacity(vision.depth as usize);
         for layer in 0..vision.depth {
-            let prefix = format!("model.vision_tower.encoder.layers.{layer}");
+            let prefix = format!("{tower}.encoder.layers.{layer}");
             let mut norm = |name: &str, width: u32| {
                 take(
                     catalog,
