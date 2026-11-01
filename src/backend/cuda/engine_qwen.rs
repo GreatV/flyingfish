@@ -2555,6 +2555,11 @@ impl Engine {
 
     pub(super) fn reset_qwen_positions(&mut self) -> Result<()> {
         if let Some(q) = self.qwen.as_mut() {
+            #[cfg(test)]
+            {
+                q.vision_encode_calls = 0;
+                q.audio_encode_calls = 0;
+            }
             q.image_blocks = None;
             let positions =
                 crate::vision_input::PositionPlan::text(1, self.capacity)?.packed_axes()?;

@@ -3017,7 +3017,15 @@ impl Engine {
                 .as_ref()
                 .context("embedding output missing")?,
         )?;
+        #[cfg(test)]
+        let encoder_calls = self.gemma_encoder_calls()?;
         self.reset()?;
+        #[cfg(test)]
+        {
+            let q = self.qwen.as_mut().context("Gemma runtime missing")?;
+            q.vision_encode_calls = encoder_calls.0;
+            q.audio_encode_calls = encoder_calls.1;
+        }
         Ok(output)
     }
 
