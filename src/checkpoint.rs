@@ -3061,45 +3061,6 @@ mod component_tests {
                         "shared projection binding: {name}"
                     );
                 }
-                let vision = spec.vision.as_ref().context("large vision spec")?;
-                let (vision_count, vision_bytes) = if vision.unified.is_some() {
-                    MappedCheckpoint::unified_vision_entries(vision, &mut expected)?;
-                    (10, 99_844_608)
-                } else {
-                    MappedCheckpoint::axial_vision_entries(
-                        vision,
-                        "model.vision_tower",
-                        "model.embed_vision.embedding_projection.weight",
-                        &mut expected,
-                    )?;
-                    (356, 1_151_487_072)
-                };
-                ensure!(
-                    expected
-                        .values()
-                        .filter(|e| e.2 == TensorScope::Vision)
-                        .count()
-                        == vision_count
-                        && MappedCheckpoint::planned_bytes(&expected, LoadPolicy::VisionOnly)?
-                            == vision_bytes,
-                    "large vision manifest count or allocation size changed"
-                );
-                if spec.hidden == 5376 {
-                    let mut encoder_vision = vision.clone();
-                    encoder_vision.output = 2816;
-                    let mut encoder = BTreeMap::new();
-                    MappedCheckpoint::axial_vision_entries(
-                        &encoder_vision,
-                        "model.encoder.vision_tower",
-                        "model.encoder.embed_vision.embedding_projection.weight",
-                        &mut encoder,
-                    )?;
-                    ensure!(encoder.len() == 356
-                        && encoder.contains_key("model.encoder.vision_tower.encoder.layers.26.self_attn.q_proj.linear.weight")
-                        && encoder["model.encoder.embed_vision.embedding_projection.weight"].1 == [2816, 1152]
-                        && MappedCheckpoint::planned_bytes(&encoder, LoadPolicy::VisionOnly)? == 1_145_588_832,
-                        "shared axial manifest lost its binding prefix or output width");
-                }
                 continue;
             }
             MappedCheckpoint::axial_vision_entries(

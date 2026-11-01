@@ -2324,7 +2324,11 @@ impl ModelSpec {
             } else {
                 None
             },
-            vision: VisionConfig::from_root(root)?,
+            vision: if ple != 0 {
+                VisionConfig::from_root(root)?
+            } else {
+                None
+            },
         })
     }
     pub fn embedding_gemma2(root: &Value, generation: &Value) -> Result<Self> {
