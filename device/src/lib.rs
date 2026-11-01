@@ -247,20 +247,19 @@ macro_rules! thirty_two {
 }
 
 #[inline(always)]
-unsafe fn copy_kv<const D: usize, const L: usize, const MASK: bool>(
+unsafe fn copy_kv<const D: usize, const MASK: bool>(
     dst: [u32; 2],
     src: *const u16,
     row: u32,
     rows: u32,
-    col: u32,
 ) {
     unsafe {
         macro_rules! transfer {
             ($i:expr) => {
                 asm!("cp.async.cg.shared.global [{dst}+{shared_offset}], [{src}+{global_offset}], 16, {bytes};",
                     dst=in(reg32) dst[$i % 2],src=in(reg64) src,
-                    shared_offset=const ($i / 2) * 4096,global_offset=const $i * (1024 / D) * L * 2,
-                    bytes=in(reg32) if (!MASK || row + $i * (1024 / D as u32) < rows) && col < L as u32 {16u32} else {0u32});
+                    shared_offset=const ($i / 2) * 4096,global_offset=const $i * 2048,
+                    bytes=in(reg32) if !MASK || row + $i * (1024 / D as u32) < rows {16u32} else {0u32});
             };
         }
         if D == 256 {
@@ -279,7 +278,7 @@ unsafe fn copy_kv<const D: usize, const L: usize, const MASK: bool>(
 pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
     unsafe {
         let p = resolve_position(p);
-        attention::<256, 32, 0, 256>(p, p.start + p.rows, 0, 0.0625, core::ptr::null(), 0);
+        attention::<256, 32, 0>(p, p.start + p.rows, 0, 0.0625);
     }
 }
 
@@ -289,13 +288,11 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128(p: Attention) {
     unsafe {
         let p = resolve_position(p);
-        attention::<128, 16, 0, 128>(
+        attention::<128, 16, 0>(
             p,
             p.start + p.rows,
             0,
             core::f32::consts::FRAC_1_SQRT_2 / 8.0,
-            core::ptr::null(),
-            0,
         );
     }
 }
@@ -303,14 +300,10 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d128(p: Attention) {
 /// # Safety
 /// All keys below `keys` are populated in this sequence; launch uses 128 threads and 98304 shared bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "ptx-kernel" fn attention_prefill_d256_bidirectional(
-    p: Attention,
-    keys: u32,
-    scale: f32,
-) {
+pub unsafe extern "ptx-kernel" fn attention_prefill_d256_bidirectional(p: Attention, keys: u32) {
     unsafe {
         let p = resolve_position(p);
-        attention::<256, 32, 1, 256>(p, keys, 0, scale, core::ptr::null(), 0);
+        attention::<256, 32, 1>(p, keys, 0, 0.0625);
     }
 }
 
@@ -325,7 +318,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_symmetric(
 ) {
     unsafe {
         let p = resolve_position(p);
-        attention::<256, 32, 6, 256>(p, keys, radius, scale, core::ptr::null(), 0);
+        attention::<256, 32, 6>(p, keys, radius, scale);
     }
 }
 
@@ -335,14 +328,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_symmetric(
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128_bidirectional(p: Attention, keys: u32) {
     unsafe {
         let p = resolve_position(p);
-        attention::<128, 16, 1, 128>(
-            p,
-            keys,
-            0,
-            core::f32::consts::FRAC_1_SQRT_2 / 8.0,
-            core::ptr::null(),
-            0,
-        );
+        attention::<128, 16, 1>(p, keys, 0, core::f32::consts::FRAC_1_SQRT_2 / 8.0);
     }
 }
 
@@ -356,62 +342,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d64_bidirectional(
 ) {
     unsafe {
         let p = resolve_position(p);
-        attention::<64, 8, 1, 64>(p, keys, 0, scale, core::ptr::null(), 0);
-    }
-}
-
-/// # Safety
-/// Global heads have 72 BF16 columns; launch uses 128 threads and 49152 shared bytes.
-#[unsafe(no_mangle)]
-pub unsafe extern "ptx-kernel" fn attention_prefill_d72_bidirectional(
-    p: Attention,
-    keys: u32,
-    scale: f32,
-) {
-    unsafe {
-        attention::<128, 16, 1, 72>(resolve_position(p), keys, 0, scale, core::ptr::null(), 0);
-    }
-}
-
-/// # Safety
-/// Blocks cover [origin + start, origin + start + rows, 2]; launch uses 128 threads and 98304 shared bytes.
-#[unsafe(no_mangle)]
-pub unsafe extern "ptx-kernel" fn attention_prefill_d256_blocks(
-    p: Attention,
-    keys: u32,
-    window: u32,
-    scale: f32,
-    blocks: *const u32,
-    origin: u32,
-) {
-    unsafe {
-        let p = resolve_position(p);
-        if window == u32::MAX {
-            attention::<256, 32, 4, 256>(p, keys, 0, scale, blocks, origin);
-        } else {
-            attention::<256, 32, 5, 256>(p, keys, window, scale, blocks, origin);
-        }
-    }
-}
-
-#[inline(always)]
-unsafe fn block_bounds(
-    p: Attention,
-    row: u32,
-    window: u32,
-    blocks: *const u32,
-    origin: u32,
-) -> [u32; 2] {
-    if row >= p.rows {
-        return [0, 0];
-    }
-    let q = p.start + row;
-    unsafe {
-        let index = (origin + q) as usize * 2;
-        [
-            q.saturating_sub(window),
-            core::cmp::max(q + 1, (*blocks.add(index + 1)).saturating_sub(origin)),
-        ]
+        attention::<64, 8, 1>(p, keys, 0, scale);
     }
 }
 
@@ -421,13 +352,11 @@ unsafe fn block_bounds(
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128_prefix(p: Attention, prefix: u32) {
     unsafe {
         let p = resolve_position(p);
-        attention::<128, 16, 2, 128>(
+        attention::<128, 16, 2>(
             p,
             prefix.max(p.start + p.rows),
             prefix,
             core::f32::consts::FRAC_1_SQRT_2 / 8.0,
-            core::ptr::null(),
-            0,
         );
     }
 }
@@ -442,7 +371,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_window(
 ) {
     unsafe {
         let p = resolve_position(p);
-        attention::<256, 32, 3, 256>(p, p.start + p.rows, window, scale, core::ptr::null(), 0);
+        attention::<256, 32, 3>(p, p.start + p.rows, window, scale);
     }
 }
 
@@ -452,25 +381,21 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_window(
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128_window(p: Attention, window: u32) {
     unsafe {
         let p = resolve_position(p);
-        attention::<128, 16, 3, 128>(
+        attention::<128, 16, 3>(
             p,
             p.start + p.rows,
             window,
             core::f32::consts::FRAC_1_SQRT_2 / 8.0,
-            core::ptr::null(),
-            0,
         );
     }
 }
 
 #[inline(always)]
-unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const L: usize>(
+unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
     p: Attention,
     end: u32,
     prefix: u32,
     scale: f32,
-    blocks: *const u32,
-    origin: u32,
 ) {
     unsafe {
         let (tid, tile, head, sm): (u32, u32, u32, u32);
@@ -482,9 +407,7 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
         let diagonal = p.start + qstart;
         let sk = sm + (128 * D) as u32;
         let sv = sm + (256 * D) as u32;
-        let stop = if MODE == 4 || MODE == 5 {
-            block_bounds(p, (qstart + 63).min(p.rows - 1), prefix, blocks, origin)[1].min(end)
-        } else if MODE == 1 {
+        let stop = if MODE == 1 {
             end
         } else if MODE == 6 {
             end.min(diagonal + 64 + prefix)
@@ -493,9 +416,7 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
         } else {
             end.min(diagonal + 64)
         };
-        let interior = if MODE == 4 || MODE == 5 {
-            block_bounds(p, qstart, prefix, blocks, origin)[1].min(end)
-        } else if MODE == 1 {
+        let interior = if MODE == 1 {
             end
         } else if MODE == 6 {
             end.min(diagonal + prefix)
@@ -511,18 +432,16 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
             address(0, copy_row, copy_col, D as u32),
             address(0, copy_row + 1024 / D as u32, copy_col, D as u32),
         ];
-        let kv = (head / p.group) as usize * p.capacity as usize * L;
-        let first = if MODE == 5 {
-            block_bounds(p, qstart, prefix, blocks, origin)[0] / 64 * 64
-        } else if MODE == 3 || MODE == 6 {
+        let kv = (head / p.group) as usize * p.capacity as usize * D;
+        let first = if MODE == 3 || MODE == 6 {
             diagonal.saturating_sub(prefix) / 64 * 64
         } else {
             0
         };
         let mut kp =
-            p.k.wrapping_add(kv + (first + copy_row) as usize * L + copy_col as usize);
+            p.k.wrapping_add(kv + (first + copy_row) as usize * D + copy_col as usize);
         let mut vp =
-            p.v.wrapping_add(kv + (first + copy_row) as usize * L + copy_col as usize);
+            p.v.wrapping_add(kv + (first + copy_row) as usize * D + copy_col as usize);
         macro_rules! copy_q {
             ($i:expr) => {{
                 let row = copy_row + $i * (1024 / D as u32);
@@ -530,10 +449,10 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
                     sm + copy_shared[$i % 2] + ($i / 2) * 4096,
                     p.q.wrapping_add(
                         (qstart + row) as usize * p.q_stride as usize
-                            + head as usize * L
+                            + head as usize * D
                             + copy_col as usize,
                     ),
-                    qstart + row < p.rows && copy_col < L as u32,
+                    qstart + row < p.rows,
                 );
             }};
         }
@@ -544,12 +463,11 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
         } else {
             eight!(copy_q);
         }
-        copy_kv::<D, L, true>(
+        copy_kv::<D, true>(
             [sk + copy_shared[0], sk + copy_shared[1]],
             kp,
             first + copy_row,
             end,
-            copy_col,
         );
         commit();
         wait();
@@ -585,12 +503,11 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
         let mut key = first;
         macro_rules! tile_step {
             ($masked:expr) => {{
-                copy_kv::<D, L, $masked>(
+                copy_kv::<D, $masked>(
                     [sv + copy_shared[0], sv + copy_shared[1]],
                     vp,
                     key + copy_row,
                     end,
-                    copy_col,
                 );
                 commit();
                 let mut scores = [[0.0f32; 4]; 8];
@@ -622,27 +539,19 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
                 }
                 wait();
                 let next_key = key + 64;
-                kp = kp.wrapping_add(64 * L);
+                kp = kp.wrapping_add(64 * D);
                 if next_key < stop {
                     let destinations = [sk + copy_shared[0], sk + copy_shared[1]];
                     if next_key + 64 <= end {
-                        copy_kv::<D, L, false>(
-                            destinations,
-                            kp,
-                            next_key + copy_row,
-                            end,
-                            copy_col,
-                        );
+                        copy_kv::<D, false>(destinations, kp, next_key + copy_row, end);
                     } else {
-                        copy_kv::<D, L, true>(destinations, kp, next_key + copy_row, end, copy_col);
+                        copy_kv::<D, true>(destinations, kp, next_key + copy_row, end);
                     }
                     commit();
                 }
                 let mut next = peak;
                 let upper = |row: u32| {
-                    if MODE == 4 || MODE == 5 {
-                        block_bounds(p, qstart + row, prefix, blocks, origin)[1].min(end)
-                    } else if MODE == 1 {
+                    if MODE == 1 {
                         end
                     } else if MODE == 2 {
                         prefix.max(diagonal + row + 1).min(end)
@@ -654,7 +563,7 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
                 };
                 macro_rules! mask_max {
                     ($n:expr) => {{
-                        if $masked || MODE >= 3 {
+                        if $masked || MODE == 3 {
                             let col = key + $n * 8 + (lane & 3) * 2;
                             if col >= upper(r0) {
                                 scores[$n][0] = f32::NEG_INFINITY;
@@ -669,18 +578,10 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
                                 scores[$n][3] = f32::NEG_INFINITY;
                             }
                         }
-                        if MODE == 3 || MODE == 5 || MODE == 6 {
+                        if MODE == 3 || MODE == 6 {
                             let col = key + $n * 8 + (lane & 3) * 2;
-                            let lo0 = if MODE == 5 {
-                                block_bounds(p, qstart + r0, prefix, blocks, origin)[0]
-                            } else {
-                                (diagonal + r0).saturating_sub(prefix)
-                            };
-                            let lo1 = if MODE == 5 {
-                                block_bounds(p, qstart + r1, prefix, blocks, origin)[0]
-                            } else {
-                                (diagonal + r1).saturating_sub(prefix)
-                            };
+                            let lo0 = (diagonal + r0).saturating_sub(prefix);
+                            let lo1 = (diagonal + r1).saturating_sub(prefix);
                             if col < lo0 {
                                 scores[$n][0] = f32::NEG_INFINITY;
                             }
@@ -711,7 +612,7 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
                     probability::<{ D }>(peak[0] - next[0], 0.0, scale),
                     probability::<{ D }>(peak[1] - next[1], 0.0, scale),
                 ];
-                if MODE >= 3 {
+                if MODE == 3 {
                     for row in 0..2 {
                         if next[row] == f32::NEG_INFINITY {
                             negative_peak[row] = 0.0;
@@ -801,12 +702,12 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
         while key + 64 <= interior {
             tile_step!(false);
             key += 64;
-            vp = vp.wrapping_add(64 * L);
+            vp = vp.wrapping_add(64 * D);
         }
         while key < stop {
             tile_step!(true);
             key += 64;
-            vp = vp.wrapping_add(64 * L);
+            vp = vp.wrapping_add(64 * D);
         }
         let (tid, tile, head, sm): (u32, u32, u32, u32);
         asm!("mov.u32 {t}, %tid.x; mov.u32 {b}, %ctaid.x; mov.u32 {h}, %ctaid.y; mov.u32 {s}, attention_shared;",
@@ -895,7 +796,7 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
         macro_rules! write_output {
             ($step:expr) => {{
                 let row = copy_row + $step * (1024 / D as u32);
-                if qstart + row < p.rows && copy_col < L as u32 {
+                if qstart + row < p.rows {
                     let base = sm
                         + (row / 16) * (32 * D) as u32
                         + (copy_lane / 4) * 1024
@@ -909,7 +810,7 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
                         load_shared(base + (source ^ 3) * 16),
                     ];
                     let dst = p.out.wrapping_add(
-                        ((qstart + row) as usize * p.q_heads as usize + head as usize) * L
+                        ((qstart + row) as usize * p.q_heads as usize + head as usize) * D
                             + copy_col as usize,
                     );
                     store_global4(dst, values);
@@ -932,16 +833,7 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
 pub unsafe extern "ptx-kernel" fn attention_prefill_d512(p: Attention, scale: f32) {
     unsafe {
         let p = resolve_position(p);
-        attention_d512::<false, 0>(
-            p,
-            0,
-            scale,
-            core::ptr::null_mut(),
-            1,
-            0,
-            core::ptr::null(),
-            0,
-        )
+        attention_d512::<false, false>(p, 0, scale, core::ptr::null_mut(), 1, 0)
     }
 }
 
@@ -955,40 +847,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d512_bidirectional(
 ) {
     unsafe {
         let p = resolve_position(p);
-        attention_d512::<false, 1>(
-            p,
-            keys,
-            scale,
-            core::ptr::null_mut(),
-            1,
-            0,
-            core::ptr::null(),
-            0,
-        )
-    }
-}
-
-/// # Safety
-/// Blocks cover [origin + start, origin + start + rows, 2]; launch uses 128 threads and 90112 shared bytes.
-#[unsafe(no_mangle)]
-pub unsafe extern "ptx-kernel" fn attention_prefill_d512_blocks(
-    p: Attention,
-    keys: u32,
-    scale: f32,
-    blocks: *const u32,
-    origin: u32,
-) {
-    unsafe {
-        attention_d512::<false, 4>(
-            resolve_position(p),
-            keys,
-            scale,
-            core::ptr::null_mut(),
-            1,
-            0,
-            blocks,
-            origin,
-        );
+        attention_d512::<false, true>(p, keys, scale, core::ptr::null_mut(), 1, 0)
     }
 }
 
@@ -1004,20 +863,18 @@ pub unsafe extern "ptx-kernel" fn attention_partial_d512(
 ) {
     unsafe {
         let p = resolve_position(p);
-        attention_d512::<true, 0>(p, 0, scale, partials, parts, chunk, core::ptr::null(), 0)
+        attention_d512::<true, false>(p, 0, scale, partials, parts, chunk)
     }
 }
 
 #[inline(always)]
-unsafe fn attention_d512<const SPLIT: bool, const MODE: u32>(
+unsafe fn attention_d512<const SPLIT: bool, const BIDI: bool>(
     p: Attention,
     keys: u32,
     scale: f32,
     partials: *mut f32,
     parts: u32,
     chunk: u32,
-    blocks: *const u32,
-    origin: u32,
 ) {
     unsafe {
         let (tid, tile, head, sm): (u32, u32, u32, u32);
@@ -1026,18 +883,13 @@ unsafe fn attention_d512<const SPLIT: bool, const MODE: u32>(
         let lane = tid & 31;
         let warp = tid >> 5;
         let qstart = tile * 16;
-        let end = if MODE != 0 { keys } else { p.start + p.rows };
+        // BIDI: every query row sees all keys below the explicit extent.
+        let end = if BIDI { keys } else { p.start + p.rows };
         let part: u32;
         asm!("mov.u32 {p}, %ctaid.z;", p=out(reg32) part);
         let begin = if SPLIT { part * chunk } else { 0 };
-        let stop = (if MODE == 4 {
-            block_bounds(p, (qstart + 15).min(p.rows - 1), u32::MAX, blocks, origin)[1].min(end)
-        } else if MODE == 1 {
-            end
-        } else {
-            end.min(p.start + qstart + 16)
-        })
-        .min(if SPLIT { begin + chunk } else { end });
+        let stop = (if BIDI { end } else { end.min(p.start + qstart + 16) })
+            .min(if SPLIT { begin + chunk } else { end });
         let sk = sm + 16384;
         let sv = sm + 49152;
         let partial = sm + 81920;
@@ -1142,9 +994,7 @@ unsafe fn attention_d512<const SPLIT: bool, const MODE: u32>(
                         let c = f32::from_bits(load_shared(addr + 4096));
                         let d = f32::from_bits(load_shared(addr + 6144));
                         scores[$i][j] = ((a + b) + c) + d;
-                        let bound = if MODE == 4 {
-                            block_bounds(p, qstart + row, u32::MAX, blocks, origin)[1].min(end)
-                        } else if MODE == 1 {
+                        let bound = if BIDI {
                             end
                         } else {
                             (p.start + qstart + row + 1).min(end)

@@ -252,47 +252,6 @@ impl PositionPlan {
     pub fn audio_slots(&self) -> &[AudioSlot] {
         &self.audio_slots
     }
-    pub fn image_blocks(&self) -> Result<Vec<u32>> {
-        let mut bounds = Vec::with_capacity(
-            self.capacity
-                .checked_mul(2)
-                .context("image-block extent overflow")?,
-        );
-        for position in 0..self.capacity {
-            let end = u32::try_from(position + 1)?;
-            bounds.extend([end, end]);
-        }
-        for slot in &self.slots {
-            let start = u32::try_from(slot.tokens.start)?;
-            let end = u32::try_from(slot.tokens.end)?;
-            for row in slot.tokens.clone() {
-                bounds[2 * row..2 * row + 2].copy_from_slice(&[start, end]);
-            }
-        }
-        Ok(bounds)
-    }
-
-    pub fn chunk_end(&self, start: usize, rows: usize, total: usize) -> Result<usize> {
-        ensure!(rows > 0 && start < total, "invalid media prefill chunk");
-        let mut end = start
-            .checked_add(rows)
-            .context("media prefill chunk overflow")?
-            .min(total);
-        for slot in &self.slots {
-            ensure!(
-                start <= slot.tokens.start || start >= slot.tokens.end,
-                "media prefill starts inside an image block"
-            );
-            if slot.tokens.start < end && end < slot.tokens.end {
-                end = slot.tokens.start;
-            }
-        }
-        ensure!(
-            end > start,
-            "prefill workspace cannot fit a complete image block"
-        );
-        Ok(end)
-    }
     pub fn rope_delta(&self) -> i64 {
         self.rope_delta
     }
@@ -419,15 +378,10 @@ impl MultimodalInput<'_> {
             .as_ref()
             .context("vision configuration missing")?;
         vision.validate(spec.architecture)?;
-        let soft_tokens = if let Some(axial) = &vision.axial {
-            axial.soft_tokens
-        } else {
-            vision
-                .unified
-                .as_ref()
-                .context("image embedding configuration missing")?
-                .soft_tokens
-        };
+        let axial = vision
+            .axial
+            .as_ref()
+            .context("axial vision configuration missing")?;
         ensure!(
             capacity <= spec.max_position as usize,
             "image capacity exceeds model positions"
@@ -487,7 +441,7 @@ impl MultimodalInput<'_> {
             let group = (vision.merge * vision.merge) as usize;
             let features = patches / group;
             ensure!(
-                features <= soft_tokens as usize,
+                features <= axial.soft_tokens as usize,
                 "image exceeds soft-token budget"
             );
             let start = cursor + 1;

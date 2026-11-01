@@ -899,10 +899,9 @@ using A = float __attribute__((ext_vector_type(8)));
 
 // D256 uses eight-lane FP32 QK dots and BF16 WMMA PV.
 // D128 reuses K storage for scores and keeps two BF16 probability planes.
-template<int D, int MODE, bool EXPLICIT = false, bool PARTIAL = false, int L = D>
+template<int D, int MODE, bool EXPLICIT = false, bool PARTIAL = false>
 __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
-    float* partials = nullptr, uint32_t parts = 1, uint32_t chunk = 0,
-    const uint32_t* blocks = nullptr, uint32_t origin = 0, uint32_t keys = 0) {
+    float* partials = nullptr, uint32_t parts = 1, uint32_t chunk = 0, uint32_t keys = 0) {
   if (p.position) {
     const int start = *p.position;
     if (start < 0) __trap();
@@ -930,16 +929,10 @@ __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
       gridDim.x != (PARTIAL ? parts : (p.rows+BQ-1)/BQ) || gridDim.y != p.q_heads || gridDim.z != 1 ||
       p.group == 0 || p.rows == 0 || p.start > p.capacity || p.rows > p.capacity-p.start ||
       (PARTIAL && (p.rows > BQ || parts == 0 || chunk == 0 || chunk % BK != 0))) __trap();
-  const auto bounds = [&](uint32_t row) {
-    const uint32_t q = p.start+row;
-    return make_uint2(q > extent ? q-extent : 0,
-        max(q+1, blocks[2*(origin+q)+1] > origin ? blocks[2*(origin+q)+1]-origin : 0));
-  };
-  const uint32_t end = MODE >= 4 ? keys : MODE == 1 ? extent : (MODE == 2 ? max(extent,p.start+p.rows) : p.start+p.rows);
+  const uint32_t end = MODE == 6 ? keys : MODE == 1 ? extent : (MODE == 2 ? max(extent,p.start+p.rows) : p.start+p.rows);
   uint32_t first = (MODE == 3 || MODE == 6) && p.start+query_base > extent
       ? (p.start+query_base-extent)/BK*BK : 0;
-  if constexpr (MODE == 5) first = bounds(query_base).x/BK*BK;
-  uint32_t limit = MODE == 6 ? end : MODE >= 4 ? min(end,bounds(min(query_base+BQ-1,p.rows-1)).y) : MODE == 1 ? end : min(end, MODE == 2
+  uint32_t limit = MODE == 6 ? end : MODE == 1 ? end : min(end, MODE == 2
       ? max(extent,p.start+query_base+BQ) : p.start+query_base+BQ);
   if constexpr (PARTIAL) {
     first = max(first,partition*chunk);
@@ -947,8 +940,8 @@ __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
   }
   for (int cell = tid; cell < BQ*D; cell += 128) {
     const uint32_t row = query_base + cell/D;
-    qs[cell] = row < p.rows && cell%D < L ? reinterpret_cast<const unsigned short*>(p.q)[
-        (size_t)row*p.q_stride + head*L + cell%D] : 0;
+    qs[cell] = row < p.rows ? reinterpret_cast<const unsigned short*>(p.q)[
+        (size_t)row*p.q_stride + head*D + cell%D] : 0;
   }
   float peak = -INFINITY, denominator = 0.0f, correction = 0.0f;
   A output[PANELS] = {};
@@ -958,16 +951,15 @@ __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
   for (uint32_t base = first; base < limit; base += BK) {
     for (int cell = tid; cell < BK*D; cell += 128) {
       const uint32_t key = base + cell/D;
-      const size_t offset = ((size_t)kv*p.capacity + key)*L + cell%D;
-      ks[(cell/D)*KS+cell%D] = key < end && cell%D < L ? reinterpret_cast<const unsigned short*>(p.k)[offset] : 0;
-      vs[cell] = key < end && cell%D < L ? reinterpret_cast<const unsigned short*>(p.v)[offset] : 0;
+      const size_t offset = ((size_t)kv*p.capacity + key)*D + cell%D;
+      ks[(cell/D)*KS+cell%D] = key < end ? reinterpret_cast<const unsigned short*>(p.k)[offset] : 0;
+      vs[cell] = key < end ? reinterpret_cast<const unsigned short*>(p.v)[offset] : 0;
     }
     __syncthreads();
     const auto store_score = [&](int row, int column, float value) {
       const uint32_t key = base+column, query = p.start+query_base+row;
       const bool visible = query_base+row < p.rows && key < end &&
           (MODE == 6 ? key+extent >= query && key <= query+extent :
-              MODE >= 4 ? key < bounds(query_base+row).y && (MODE != 5 || key >= bounds(query_base+row).x) :
               (MODE == 1 || (MODE == 2 ? key < max(extent,query+1) : key <= query)) &&
               (MODE != 3 || query-key <= extent));
       score_memory[row*BK+column] = visible ? value*(EXPLICIT ? scale : (D == 256 ? 0.0625f : SCALE)) : -INFINITY;
@@ -1080,7 +1072,7 @@ __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
         if constexpr (PARTIAL) {
           partials[(((size_t)row*p.q_heads+head)*parts+partition)*514+dimension] = output[panel][j];
         } else {
-          if (dimension < L) p.out[((size_t)row*p.q_heads+head)*L+dimension] =
+          p.out[((size_t)row*p.q_heads+head)*D+dimension] =
               __float2bfloat16(output[panel][j]*alpha[q_slab*16+2*j+lane/16]);
         }
       }
@@ -1089,12 +1081,6 @@ __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
 }
 }
 extern "C" __global__ void attention_prefill_d256(prefill::Problem p) { prefill::run<256,0>(p,0); }
-extern "C" __global__ void attention_prefill_d72_bidirectional(prefill::Problem p, uint32_t keys, float scale) { prefill::run<128,1,true,false,72>(p,keys,scale); }
-extern "C" __global__ void attention_prefill_d256_blocks(prefill::Problem p, uint32_t keys, uint32_t window, float scale, const uint32_t* blocks, uint32_t origin) {
-  if (window == UINT32_MAX) prefill::run<256,4,true>(p,window,scale,nullptr,1,0,blocks,origin,keys);
-  else prefill::run<256,5,true>(p,window,scale,nullptr,1,0,blocks,origin,keys);
-}
-extern "C" __global__ void attention_prefill_d512_blocks(prefill::Problem p, uint32_t keys, float scale, const uint32_t* blocks, uint32_t origin) { prefill::run<512,4,true>(p,UINT32_MAX,scale,nullptr,1,0,blocks,origin,keys); }
 extern "C" __global__ void attention_prefill_d256_symmetric(prefill::Problem p, uint32_t keys, uint32_t radius, float scale) { prefill::run<256,6,true>(p,radius,scale,nullptr,1,0,nullptr,0,keys); }
 extern "C" __global__ void attention_prefill_d256_window(prefill::Problem p, uint32_t window, float scale) { prefill::run<256,3,true>(p,window,scale); }
 extern "C" __global__ void attention_prefill_d512(prefill::Problem p, float scale) { prefill::run<512,0,true>(p,0,scale); }
@@ -1126,7 +1112,7 @@ extern "C" __global__ void attention_merge_d512(prefill::Problem p, const float*
 }
 extern "C" __global__ void attention_prefill_d128(prefill::Problem p) { prefill::run<128,0>(p,0); }
 extern "C" __global__ void attention_prefill_d128_bidirectional(prefill::Problem p, uint32_t keys) { prefill::run<128,1>(p,keys); }
-extern "C" __global__ void attention_prefill_d256_bidirectional(prefill::Problem p, uint32_t keys, float scale) { prefill::run<256,1,true>(p,keys,scale); }
+extern "C" __global__ void attention_prefill_d256_bidirectional(prefill::Problem p, uint32_t keys) { prefill::run<256,1>(p,keys); }
 extern "C" __global__ void attention_prefill_d128_prefix(prefill::Problem p, uint32_t prefix) { prefill::run<128,2>(p,prefix); }
 extern "C" __global__ void attention_prefill_d128_window(prefill::Problem p, uint32_t window) { prefill::run<128,3>(p,window); }
 #endif

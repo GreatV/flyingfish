@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 import transformers
-from safetensors.torch import load_file, save
+from safetensors.torch import save
 from transformers.models.gemma4.modeling_gemma4 import (
     Gemma4VisionPatchEmbedder,
     Gemma4VisionPooler,
@@ -83,7 +83,7 @@ def capture(config, height, width, device):
 @torch.inference_mode()
 def capture_attention(config, rows, device):
     heads, dim = config.num_attention_heads, config.head_dim
-    assert dim in (64, 72) and config.num_key_value_heads == heads
+    assert dim == 64 and config.num_key_value_heads == heads
     keys = rows + 17 if rows < 2304 else rows
     capacity, pitch = keys + 23, heads * dim + 64
     q = pattern((1, rows, heads, dim), 257, 29, 128, 64, device).bfloat16().transpose(1, 2)
@@ -111,98 +111,7 @@ def capture_attention(config, rows, device):
     assert controls["wrong_scale"] > 0
     return {name: value.cpu().contiguous() for name, value in tensors.items()}, dict(
         rows=rows, heads=heads, dim=dim, keys=keys, capacity=capacity, pitch=pitch,
-        kv_heads=heads, start=0, origin=0, window_left=None, mode="bidirectional",
         repeat_mismatches=0, controls=controls)
-
-
-@torch.inference_mode()
-def capture_blocks(config, rows, start, window, origin, device):
-    from importlib import import_module
-    from transformers.masking_utils import blockwise_overlay, causal_mask_function, sliding_window_causal_mask_function, sliding_window_overlay
-    cls = getattr(transformers, config.architectures[0])
-    with torch.device("meta"):
-        model = cls(config)
-    index = 5 if window is None else 0
-    module = model.model.language_model.layers[index].self_attn.eval()
-    forward = import_module(type(module).__module__).eager_attention_forward
-    heads, dim = config.text_config.num_attention_heads, module.head_dim
-    kv_heads = heads // module.num_key_value_groups
-    keys = start + rows + 17
-    capacity, pitch = keys + 23, heads * dim + 64
-    q = pattern((1, rows, heads, dim), 257, 29, 128, 128, "cpu").bfloat16().to(device).transpose(1, 2)
-    k = pattern((1, kv_heads, keys, dim), 263, 31, 131, 128, "cpu").bfloat16().to(device)
-    v = pattern((1, kv_heads, keys, dim), 269, 37, 134, 64, "cpu").bfloat16().to(device)
-    groups = torch.full((1, origin + capacity), -1, dtype=torch.long, device=device)
-    spans = [(origin + max(0, start - 3), origin + start + rows + 17)]
-    if rows == 65:
-        spans = [(origin + start, origin + start + 17),
-                 (origin + start + 29, origin + start + rows + 17)]
-    for group, (first, end) in enumerate(spans):
-        groups[:, first:end] = group
-    query = torch.arange(origin + start, origin + start + rows, device=device)[:, None]
-    key = torch.arange(origin, origin + keys, device=device)[None, :]
-    causal = causal_mask_function if window is None else sliding_window_causal_mask_function(window + 1)
-    base = causal(0, 0, query, key)
-    legal = base | blockwise_overlay(groups)(0, 0, query, key)
-    if window is not None:
-        legal = legal & sliding_window_overlay(window + 1)(0, 0, query, key)
-    def run(q, k, v, mask):
-        additive = torch.zeros_like(mask, dtype=torch.float32).masked_fill(~mask, -torch.inf)[None, None]
-        return forward(module, q, k, v, additive, scaling=1.0)[0][0]
-    expected = run(q.float(), k.float(), v.float(), legal)
-    baseline = run(q, k, v, legal)
-    assert torch.equal(baseline, run(q, k, v, legal))
-    varied = torch.cat([run(q[:, :, first:first + 17], k, v, legal[first:first + 17])
-                       for first in range(0, rows, 17)])
-    control = run(q, k, v, base)
-    packed_q = torch.full((rows, pitch), 37., dtype=torch.bfloat16, device=device)
-    packed_q[:, :heads * dim] = q[0].transpose(0, 1).reshape(rows, heads * dim)
-    packed_k = torch.full((kv_heads, capacity, dim), 17., dtype=torch.bfloat16, device=device)
-    packed_v = torch.full_like(packed_k, 31.)
-    packed_k[:, :keys], packed_v[:, :keys] = k[0], v[0]
-    tensors = dict(q=packed_q, k=packed_k, v=packed_v, oracle=expected,
-                   baseline=baseline, varied=varied, wrong_scale=control)
-    metadata = dict(rows=rows, heads=heads, kv_heads=kv_heads, dim=dim, start=start,
-                    keys=keys, capacity=capacity, pitch=pitch, origin=origin,
-                    window_left=window, mode="blocks", block_spans=spans, repeat_mismatches=0,
-                    controls={"wrong_scale": int((control != baseline).sum())})
-    assert metadata["controls"]["wrong_scale"] > 0
-    return {name: value.cpu().contiguous() for name, value in tensors.items()}, metadata
-
-
-def freeze_attention(args):
-    assert args.arms and len(args.arms) == 2
-    reports = [json.loads((arm / "REFERENCE.json").read_text()) for arm in args.arms]
-    assert [r["architecture"] for r in reports] == ["sm89", "sm86"]
-    assert reports[0]["cells"].keys() == reports[1]["cells"].keys()
-    for name in reports[0]["cells"]:
-        assert {k: v for k, v in reports[0]["cells"][name].items() if k != "controls"} == {
-            k: v for k, v in reports[1]["cells"][name].items() if k != "controls"}
-    assert all(r["torch"] == torch.__version__ and r["transformers"] == transformers.__version__ for r in reports)
-    frozen = dict(status="FROZEN", reference_devices=["sm89", "sm86"], cells={})
-    for name, metadata in reports[0]["cells"].items():
-        oracle = load_file(str(args.arms[0] / f"{name}.safetensors"))["oracle"].double()
-        maximum, rmse = 0., 0.
-        tensors = []
-        for arm in args.arms:
-            values = load_file(str(arm / f"{name}.safetensors"))
-            tensors.append(values)
-            assert all(torch.equal(values[key], tensors[0][key]) for key in ("q", "k", "v"))
-            for key in ("oracle", "baseline", "varied"):
-                delta = values[key].double() - oracle
-                maximum = max(maximum, 2 * float(delta.abs().max()))
-                rmse = max(rmse, 2 * float(delta.square().mean().sqrt()))
-        for values in tensors:
-            delta = values["wrong_scale"].double() - oracle
-            assert float(delta.abs().max()) > maximum or float(delta.square().mean().sqrt()) > rmse
-        frozen["cells"][name] = dict(metadata, output_max=maximum, output_rmse=rmse)
-        with (args.output / f"{name}.safetensors").open("xb") as output:
-            output.write(save(tensors[0]))
-        print(f"FREEZE {name} max={maximum!r} rmse={rmse!r}", flush=True)
-    with (args.output / "ATTENTION_FROZEN.json").open("x") as output:
-        json.dump(frozen, output, indent=2)
-        output.write("\n")
-    print(f"PASS media_attention_freeze cells={len(frozen['cells'])} candidate_observations=0", flush=True)
 
 
 @torch.inference_mode()
@@ -720,7 +629,7 @@ def main():
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", required=True)
-    parser.add_argument("--stage", choices=("operators", "attention", "attention-freeze", "inputs", "model", "media", "freeze", "audio-operators", "audio-freeze"), default="operators")
+    parser.add_argument("--stage", choices=("operators", "attention", "inputs", "model", "media", "freeze", "audio-operators", "audio-freeze"), default="operators")
     parser.add_argument("--images", type=Path, nargs=2)
     parser.add_argument("--audio", type=Path, nargs=2)
     parser.add_argument("--inputs", type=Path)
@@ -731,7 +640,7 @@ def main():
     assert transformers.__version__ == "5.21.0"
     assert not args.output.resolve().is_relative_to(args.model.resolve())
     config = transformers.AutoConfig.from_pretrained(args.model, local_files_only=True)
-    assert config.architectures[0] in ("Gemma4ForConditionalGeneration", "Gemma4UnifiedForConditionalGeneration")
+    assert config.architectures == ["Gemma4ForConditionalGeneration"]
     torch.set_num_threads(4)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
@@ -743,9 +652,6 @@ def main():
         return
     if args.stage == "audio-freeze":
         freeze_audio_operators(args)
-        return
-    if args.stage == "attention-freeze":
-        freeze_attention(args)
         return
     if args.stage == "freeze":
         freeze_model(args)
@@ -760,19 +666,9 @@ def main():
               "transformers": transformers.__version__, "torch": torch.__version__, "device": args.device,
               "cells": {}}
     if args.stage == "attention":
-        capability = torch.cuda.get_device_capability()
-        report["architecture"] = f"sm{capability[0]}{capability[1]}"
-        cases = []
-        if config.vision_config.model_type == "gemma4_vision":
-            cases += [(f"vision-attention-{rows}", capture_attention, (config.vision_config, rows, args.device))
-                      for rows in [1, 17, 63, 64, 65, 135, 2304, 2520]]
-        if config.text_config.hidden_size_per_layer_input == 0:
-            for window in (None, 1023, 31):
-                for rows, start, origin in [(1, 0, 0), (17, 31, 0), (65, 1020, 37), (280, 0, 0)]:
-                    name = f"block-attention-{window}-{rows}-{start}-{origin}"
-                    cases.append((name, capture_blocks, (config, rows, start, window, origin, args.device)))
-        for name, capture_fn, arguments in cases:
-            tensors, cell = capture_fn(*arguments)
+        for rows in [1, 63, 64, 65, 135, 2304, 2520]:
+            tensors, cell = capture_attention(config.vision_config, rows, args.device)
+            name = f"vision-attention-{rows}"
             with (args.output / f"{name}.safetensors").open("xb") as output:
                 output.write(save(tensors, metadata={"definition": report["definition"]}))
             report["cells"][name] = cell

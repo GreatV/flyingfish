@@ -197,7 +197,6 @@ fn prefill_sequence_masks_gpu() -> Result<()> {
                 shape: Shape { causal, ..shape },
                 keys: rows,
                 prefix: if causal { None } else { prefix },
-                image_blocks: None,
             })?;
             let values = s.clone_dtoh(&output)?;
             ensure!(

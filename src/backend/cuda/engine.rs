@@ -848,15 +848,6 @@ impl Engine {
                 && spec.linear_format.fp8_layout().is_none(),
             "media-aware dense placement requires a BF16 dense Qwen-family runtime"
         );
-        let plan = input.validate(&spec, capacity)?;
-        if let Some(chunk) = requested_chunk
-            && spec.per_layer_input.is_none()
-        {
-            ensure!(
-                plan.slots().iter().all(|s| s.tokens.len() <= chunk),
-                "requested prefill chunk cannot fit a complete image block"
-            );
-        }
         let (audio, vision, request) = Self::multimodal_request_bytes(&spec, input, capacity)?;
         let checkpoint = crate::checkpoint::MappedCheckpoint::open(dir)?;
         let mut reserved_bytes = request;
@@ -3637,18 +3628,7 @@ impl Engine {
         let trace_start = self.position + ids.len() - keep;
         let end = self.position + ids.len();
         let mut part = 0usize;
-        let mut consumed = 0;
-        while consumed < ids.len() {
-            let rows = self.chunk.min(ids.len() - consumed);
-            let count = if self.model_spec.architecture == crate::model_spec::Architecture::Gemma4
-                && self.model_spec.per_layer_input.is_none()
-                && let Some(images) = &self.images
-            {
-                images.positions.chunk_end(self.position, rows, end)? - self.position
-            } else {
-                rows
-            };
-            let chunk = &ids[consumed..consumed + count];
+        for chunk in ids.chunks(self.chunk) {
             self.prepare_deepseek_engram(chunk, None)?;
             let skip = trace_start.saturating_sub(self.position).min(chunk.len());
             let selected = trace.is_some() && skip < chunk.len();
@@ -3697,7 +3677,6 @@ impl Engine {
             }
             self.committed_prefix_ids.extend_from_slice(chunk);
             self.position += chunk.len();
-            consumed += count;
         }
         self.device
             .stream

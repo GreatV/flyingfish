@@ -4,7 +4,7 @@ use crate::backend::cuda::contracts::view;
 use crate::backend::cuda::{
     attention_d256::{AttentionBindings, FullAttentionOps, FullAttentionPlan, PositionBindings},
     contracts::{RowDomain, Scratch, Tensor, TensorMut},
-    flash::{Flash, Query, Score},
+    flash::{Flash, Score},
     gdn::{
         CUDA_GRID_YZ_MAX, GdnBindings, GdnConvWeights, GdnDecayWeights, GdnGateInput, GdnOps,
         GdnPlan,
@@ -648,7 +648,6 @@ pub(super) struct Runtime {
     vision_bytes: usize,
     media_reserved_bytes: usize,
     audio: Option<super::audio_runtime::AudioRuntime>,
-    image_blocks: Option<CudaSlice<u32>>,
     #[cfg(test)]
     pub(super) audio_encode_calls: usize,
     #[cfg(test)]
@@ -2092,7 +2091,6 @@ impl Runtime {
             vision_bytes: 0,
             media_reserved_bytes: 0,
             audio: None,
-            image_blocks: None,
             #[cfg(test)]
             audio_encode_calls: 0,
             #[cfg(test)]
@@ -2560,7 +2558,6 @@ impl Engine {
                 q.vision_encode_calls = 0;
                 q.audio_encode_calls = 0;
             }
-            q.image_blocks = None;
             let positions =
                 crate::vision_input::PositionPlan::text(1, self.capacity)?.packed_axes()?;
             self.device
@@ -2678,24 +2675,7 @@ impl Engine {
                 .checked_add(feature_bytes)
                 .context("audio request bytes overflow")?
         };
-        let block_bytes = if model.per_layer_input.is_none()
-            && matches!(
-                model.architecture,
-                crate::model_spec::Architecture::Gemma4
-                    | crate::model_spec::Architecture::EmbeddingGemma2
-            )
-            && !plan.slots().is_empty()
-        {
-            capacity
-                .checked_mul(8)
-                .context("image block bytes overflow")?
-        } else {
-            0
-        };
-        let request_bytes = vision_bytes
-            .max(audio_peak)
-            .checked_add(block_bytes)
-            .context("media request bytes overflow")?;
+        let request_bytes = vision_bytes.max(audio_peak);
         Ok((audio_bytes, vision_bytes, request_bytes))
     }
 
@@ -2775,21 +2755,6 @@ impl Engine {
             {
                 q.audio_encode_calls += input.audio.len();
             }
-        }
-        if matches!(
-            self.model_spec.architecture,
-            crate::model_spec::Architecture::Gemma4
-                | crate::model_spec::Architecture::EmbeddingGemma2
-        ) && self.model_spec.per_layer_input.is_none()
-            && !plan.slots().is_empty()
-        {
-            ensure!(
-                plan.slots()
-                    .iter()
-                    .all(|slot| slot.tokens.len() <= self.chunk),
-                "prefill workspace cannot fit a complete image block"
-            );
-            q.image_blocks = Some(self.device.stream.clone_htod(&plan.image_blocks()?)?);
         }
         if let Some(trace) = trace.as_mut() {
             let values = self.device.stream.clone_dtoh(&images.features)?;
@@ -5394,24 +5359,7 @@ impl Engine {
                                 layout.sliding_window.map(|window| window as usize - 1)
                             },
                         };
-                        if !decode
-                            && layout.sliding_window.is_some()
-                            && let Some(blocks) = &q.image_blocks
-                        {
-                            flash.run_masked(Query {
-                                q: &w.qkv,
-                                q_row_stride: q_stride,
-                                k: stage_k,
-                                v: stage_v,
-                                out: &mut w.attn,
-                                shape,
-                                keys: shape.start + rows,
-                                prefix: None,
-                                image_blocks: Some((blocks, self.position - shape.start)),
-                            })?;
-                        } else {
-                            flash.run(&w.qkv, q_stride, stage_k, stage_v, &mut w.attn, shape)?;
-                        }
+                        flash.run(&w.qkv, q_stride, stage_k, stage_v, &mut w.attn, shape)?;
                     }
                 }
                 if overflow && !reader {

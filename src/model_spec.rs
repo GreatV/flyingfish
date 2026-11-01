@@ -432,12 +432,6 @@ pub struct AxialVision {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct UnifiedVision {
-    pub soft_tokens: u32,
-    pub rms_eps: f32,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VisionConfig {
     pub depth: u32,
     pub hidden: u32,
@@ -457,8 +451,6 @@ pub struct VisionConfig {
     pub minicpm: Option<MiniCpmVision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub axial: Option<AxialVision>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unified: Option<UnifiedVision>,
 }
 
 impl VisionConfig {
@@ -549,28 +541,6 @@ impl VisionConfig {
                 );
             }
             Architecture::Gemma4 | Architecture::EmbeddingGemma2 => {
-                if let Some(unified) = &self.unified {
-                    ensure!(
-                        self.depth == 0
-                            && self.heads == 0
-                            && self.intermediate == 0
-                            && self.hidden == 3840
-                            && self.output == self.hidden
-                            && self.channels == 3
-                            && self.patch == 48
-                            && self.merge == 1
-                            && self.temporal_patch == 1
-                            && self.position_side == 1120
-                            && unified.soft_tokens == 280
-                            && unified.rms_eps == 1e-6
-                            && self.axial.is_none()
-                            && self.minicpm.is_none()
-                            && [self.image_token, self.start_token, self.end_token]
-                                == [258880, 255999, 258882],
-                        "unsupported unified vision geometry"
-                    );
-                    return Ok(());
-                }
                 let axial = self
                     .axial
                     .as_ref()
@@ -630,51 +600,8 @@ impl VisionConfig {
             Some("qwen3_5") => Self::qwen_from_root(root, v).map(Some),
             Some("minicpmv4_7_vision") => Self::minicpm_from_root(root, v).map(Some),
             Some("gemma4_vision") => Self::axial_from_root(root, v).map(Some),
-            Some("gemma4_unified_vision") => Self::unified_from_root(root, v).map(Some),
             other => bail!("unsupported vision_config model_type: {other:?}"),
         }
-    }
-
-    fn unified_from_root(root: &Value, v: &Value) -> Result<Self> {
-        for (key, value) in [
-            ("mm_embed_dim", 3840.into()),
-            ("mm_posemb_size", 1120.into()),
-            ("model_patch_size", 48.into()),
-            ("num_soft_tokens", 280.into()),
-            ("output_proj_dims", 3840.into()),
-            ("patch_size", 16.into()),
-            ("pooling_kernel_size", 3.into()),
-            ("rms_norm_eps", 1e-6.into()),
-        ] {
-            equal(v, key, value)?;
-        }
-        let spec = Self {
-            depth: 0,
-            hidden: positive(v, "mm_embed_dim")?,
-            heads: 0,
-            intermediate: 0,
-            channels: 3,
-            patch: positive(v, "model_patch_size")?,
-            temporal_patch: 1,
-            merge: 1,
-            output: positive(
-                root.get("text_config").context("text_config missing")?,
-                "hidden_size",
-            )?,
-            position_side: positive(v, "mm_posemb_size")?,
-            image_token: integer(root, "image_token_id")?,
-            video_token: integer(root, "video_token_id")?,
-            start_token: integer(root, "boi_token_id")?,
-            end_token: integer(root, "eoi_token_id")?,
-            minicpm: None,
-            axial: None,
-            unified: Some(UnifiedVision {
-                soft_tokens: positive(v, "num_soft_tokens")?,
-                rms_eps: 1e-6,
-            }),
-        };
-        spec.validate(Architecture::Gemma4)?;
-        Ok(spec)
     }
 
     fn axial_from_root(root: &Value, v: &Value) -> Result<Self> {
@@ -751,7 +678,6 @@ impl VisionConfig {
                 standardize: flag("standardize")?,
                 clipped_linears: flag("use_clipped_linears")?,
             }),
-            unified: None,
         };
         spec.validate(Architecture::Gemma4)?;
         Ok(spec)
@@ -781,7 +707,6 @@ impl VisionConfig {
             end_token: integer(root, "vision_end_token_id")?,
             minicpm: None,
             axial: None,
-            unified: None,
         };
         spec.validate(Architecture::Qwen35Text)?;
         Ok(spec)
@@ -847,7 +772,6 @@ impl VisionConfig {
                 newline_token: integer(root, "newline_id")?,
             }),
             axial: None,
-            unified: None,
         };
         spec.validate(Architecture::MiniCpmV47)?;
         Ok(spec)
