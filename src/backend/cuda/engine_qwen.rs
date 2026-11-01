@@ -21,7 +21,10 @@ pub(super) fn default_chunk(admitted: usize) -> usize {
 }
 
 use crate::backend::cuda::cubin;
-use crate::backend::cuda::decode::{GqaDecodeInput, RingDecode, RingDecodeInput, SlidingWindow};
+use crate::backend::cuda::decode::{
+    CausalDecodeD512, CausalDecodeD512Input, GqaDecodeInput, RingDecode, RingDecodeInput,
+    SlidingWindow,
+};
 use crate::backend::cuda::dsa::{
     DsaAppendInput, DsaAttentionInput, DsaIndexInput, DsaIndexOutput, DsaPlan,
 };
@@ -546,6 +549,7 @@ fn require_gemma_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
             && matches!(spec.per_layer_input, None | Some(256) | Some(512)),
         "unsupported Gemma 4 execution geometry"
     );
+    let mut full_kv_heads = None;
     for layer in &spec.layers {
         let g = layer
             .geometry
@@ -561,6 +565,16 @@ fn require_gemma_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
         } else {
             128
         };
+        if full {
+            if let Some(expected) = full_kv_heads {
+                ensure!(
+                    kv_heads == expected,
+                    "unsupported Gemma 4 layer geometry: {g:?}"
+                );
+            } else {
+                full_kv_heads = Some(kv_heads);
+            }
+        }
         ensure!(
             (full || g.head_dim == 256)
                 && kv_heads > 0
@@ -584,6 +598,7 @@ struct GemmaOps {
     gated_activation: CudaFunction,
     rope: CudaFunction,
     ring_decode: RingDecode,
+    causal_decode_d512: CausalDecodeD512,
     shared_rope: CudaFunction,
     branch_add: CudaFunction,
     rope_tables: [CudaSlice<bf16>; 2],
@@ -1269,7 +1284,11 @@ impl Runtime {
                     .filter_map(|l| l.sliding_window)
                     .max()
                     .context("sliding window missing")? as usize,
-            )?;
+            )?
+            .max(CausalDecodeD512::workspace(
+                model.q_heads as usize,
+                capacity,
+            )?);
             #[cfg(test)]
             let diagnostics = {
                 let intermediate = model
@@ -1505,6 +1524,21 @@ impl Runtime {
                         .filter_map(|l| l.sliding_window)
                         .max()
                         .context("sliding window missing")?,
+                    1.0,
+                )?,
+                causal_decode_d512: CausalDecodeD512::new(
+                    &engine.device.ctx,
+                    engine.model_spec.q_heads,
+                    engine
+                        .model_spec
+                        .layers
+                        .iter()
+                        .find(|l| l.sliding_window.is_none())
+                        .and_then(|l| l.geometry)
+                        .context("Gemma 4 full-attention layer geometry missing")?
+                        .kv_heads
+                        .unwrap_or(engine.model_spec.kv_heads),
+                    engine.capacity as u32,
                     1.0,
                 )?,
                 shared_rope: rope_module
@@ -3426,6 +3460,10 @@ impl Engine {
                     .max()
                     .context("sliding window missing")? as usize,
             )?
+            .max(CausalDecodeD512::workspace(
+                model_spec.q_heads as usize,
+                capacity,
+            )?)
         } else {
             Runtime::workspace(
                 &model_spec,
@@ -5333,6 +5371,21 @@ impl Engine {
                                 q: heads(&w.qkv, s, 0, rows, hq as u32, d as u32)?,
                                 k: heads(stage_k, s, 0, hkv, ring as u32, d as u32)?,
                                 v: heads(stage_v, s, 0, hkv, ring as u32, d as u32)?,
+                                position: view(&w.position, s, 0, [1], [1])?,
+                                out: &mut TensorMut(heads(
+                                    &w.attn, s, 0, rows, hq as u32, d as u32,
+                                )?),
+                                lse: &mut TensorMut(view(&flash.lse, s, 0, [hq as u32], [1])?),
+                                scratch: scratch(&q.scratch, s),
+                            },
+                        )?;
+                    } else if decode {
+                        ops.causal_decode_d512.run(
+                            s,
+                            CausalDecodeD512Input {
+                                q: heads(&w.qkv, s, 0, rows, hq as u32, d as u32)?,
+                                k: heads(stage_k, s, 0, hkv, cache_capacity as u32, d as u32)?,
+                                v: heads(stage_v, s, 0, hkv, cache_capacity as u32, d as u32)?,
                                 position: view(&w.position, s, 0, [1], [1])?,
                                 out: &mut TensorMut(heads(
                                     &w.attn, s, 0, rows, hq as u32, d as u32,

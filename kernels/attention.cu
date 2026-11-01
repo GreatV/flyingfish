@@ -142,7 +142,7 @@ __device__ __forceinline__ void fd_phase1_body(
     int L, int chunk, int nchunks, int gqa,
     int k_head_stride, int k_pos_stride, int v_head_stride, int v_pos_stride,
     int first_pos, int ring_tokens, float scale = SCALE) {
-  constexpr int TP = DH == 256 ? 32 : 16;
+  constexpr int TP = DH >= 256 ? 32 : 16;
   constexpr int VPR = DH / TP;
   const int ch      = blockIdx.x;
   const int qh0     = blockIdx.y * QP;
@@ -154,11 +154,11 @@ __device__ __forceinline__ void fd_phase1_body(
   const int lane = tid % TP;
   const int grp  = tid / TP;
   const int dim0 = lane * VPR;
-  const int ngrp = DH == 256 ? 4 : blockDim.x / TP;
+  const int ngrp = DH >= 256 ? 4 : blockDim.x / TP;
   extern __shared__ float fd_sm[];
-  if constexpr (DH == 256) {
+  if constexpr (DH >= 256) {
     bf16* shared_q = reinterpret_cast<bf16*>(fd_sm);
-    if (tid < 32) {
+    if (tid < DH / 8) {
 #pragma unroll
       for (int h = 0; h < QP; ++h)
         reinterpret_cast<uint4*>(shared_q + h * DH)[tid] =
@@ -175,7 +175,7 @@ __device__ __forceinline__ void fd_phase1_body(
   float mx[QP], ls[QP];
 #pragma unroll
   for (int h = 0; h < QP; ++h) {
-    if constexpr (DH == 256)
+    if constexpr (DH >= 256)
       ld_vec<VPR>(reinterpret_cast<bf16*>(fd_sm) + h * DH + dim0, qr[h]);
     else
       ld_vec<VPR>(q + (qh0 + h) * DH + dim0, qr[h]);
@@ -227,8 +227,8 @@ __device__ __forceinline__ void fd_phase1_body(
       float cf[QP], pf[QP];
 #pragma unroll
       for (int h = 0; h < QP; ++h) {
-        if constexpr (DH == 256) { cf[h] = 0.0f; pf[h] = 0.0f; }
-        if (DH != 256 || lane == 0) {
+        if constexpr (DH >= 256) { cf[h] = 0.0f; pf[h] = 0.0f; }
+        if (DH < 256 || lane == 0) {
           const float sp = ok[u] ? s[h] * scale : -INFINITY;
           const float mn = fmaxf(mx[h], sp);
           cf[h] = __expf(mx[h] - mn);
@@ -236,7 +236,7 @@ __device__ __forceinline__ void fd_phase1_body(
           mx[h] = mn;
           ls[h] = ls[h] * cf[h] + pf[h];
         }
-        if constexpr (DH == 256) {
+        if constexpr (DH >= 256) {
           cf[h] = __shfl_sync(FF_WARP_MASK, cf[h], 0);
           pf[h] = __shfl_sync(FF_WARP_MASK, pf[h], 0);
         }
@@ -286,8 +286,8 @@ __device__ __forceinline__ void fd_phase1_body(
   // Level 2: cross-warp merge through dynamic shared memory.
   const int warp   = tid / 32;
   const int lane32 = tid % 32;
-  const int nw     = DH == 256 ? 4 : blockDim.x / 32;
-  float* sa  = fd_sm + (DH == 256 ? QP * DH / 2 : 0); // [QP][nw][DH]
+  const int nw     = DH >= 256 ? 4 : blockDim.x / 32;
+  float* sa  = fd_sm + (DH >= 256 ? QP * DH / 2 : 0); // [QP][nw][DH]
   float* smm = sa + QP * nw * DH;                  // [QP][nw]
   float* sll = smm + QP * nw;                      // [QP][nw]
   if (lane32 < TP) {   // one group per warp writes; both halves hold the same merged shard
@@ -336,7 +336,7 @@ __device__ __forceinline__ void fd_phase2_body(const float* __restrict__ p_m,
   extern __shared__ float sm[];
   const int qh  = blockIdx.x;
   const int tid = threadIdx.x;
-  const int nt  = DH == 256 ? 256 : blockDim.x;
+  const int nt  = DH >= 256 ? DH : blockDim.x;
   const int G2  = nt / DH;
   const int g   = tid / DH;
   const int d   = tid % DH;
@@ -423,6 +423,36 @@ extern "C" __global__ void flash_decode_ring_d256_merge(
   if (blockDim.x != 256 || p < 0 || p == 2147483647 || ring <= 0 || chunk <= 0 || heads <= 0) {__trap();return;}
   const int parts = (min(p + 1,ring) + chunk - 1) / chunk;
   fd_phase2_body<256,false>(scratch,scratch + heads * parts,
+      scratch + 2 * heads * parts,nullptr,out,parts,lse);
+}
+
+#define FD_CAUSAL_512(QP) \
+extern "C" __global__ void flash_decode_d512_q##QP( \
+    const bf16* q,const bf16* k,const bf16* v,float* scratch, \
+    const int* position,int heads,int kv_heads,int capacity,int chunk,float scale) { \
+  const int p = *position; \
+  if (blockDim.x != 128 || p < 0 || p == 2147483647 || capacity <= 0 || chunk <= 0 || \
+      p >= capacity || heads <= 0 || kv_heads <= 0 || heads % kv_heads || \
+      (heads / kv_heads) % QP || !(scale > 0.0f)) {__trap();return;} \
+  const int length = p + 1; \
+  const int parts = (length + chunk - 1) / chunk; \
+  if (blockIdx.x >= parts) return; \
+  fd_phase1_body<512,QP,(QP == 1 ? 2 : 1),false>( \
+      q,k,v,scratch,scratch + heads * parts,scratch + 2 * heads * parts, \
+      length,chunk,parts,heads / kv_heads,capacity * 512,512,capacity * 512,512, \
+      0,1,scale); \
+}
+FD_CAUSAL_512(1)
+FD_CAUSAL_512(2)
+FD_CAUSAL_512(4)
+
+extern "C" __global__ void flash_decode_d512_merge(
+    const float* scratch,bf16* out,float* lse,const int* position,int heads,int capacity,int chunk) {
+  const int p = *position;
+  if (blockDim.x != 512 || p < 0 || p == 2147483647 || capacity <= 0 || chunk <= 0 ||
+      p >= capacity || heads <= 0) {__trap();return;}
+  const int parts = (p + 1 + chunk - 1) / chunk;
+  fd_phase2_body<512,false>(scratch,scratch + heads * parts,
       scratch + 2 * heads * parts,nullptr,out,parts,lse);
 }
 
