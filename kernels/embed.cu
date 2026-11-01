@@ -11,6 +11,7 @@ extern "C" __global__ void embed_scale_broadcast(const __nv_bfloat16* w,
     const uint32_t* ids, const __nv_bfloat16* initial,
     __nv_bfloat16* embedded, __nv_bfloat16* broadcast, int rows, int dim, float scale,
     const __nv_bfloat16* visual, int visual_begin, int visual_rows) {
+    if (broadcast && !initial) { __trap(); return; }
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows * dim) return;
     const int row = i / dim;
@@ -18,7 +19,7 @@ extern "C" __global__ void embed_scale_broadcast(const __nv_bfloat16* w,
         ? visual[(row - visual_begin) * dim + i % dim]
         : w[(uint64_t)ids[row] * dim + i % dim];
     embedded[i] = __float2bfloat16(__bfloat162float(value) * scale);
-    broadcast[i] = initial[i % dim];
+    if (broadcast) broadcast[i] = initial[i % dim];
 }
 
 // One mHC stream row batch: out holds rows*mult embedded rows, row r the
@@ -46,6 +47,45 @@ extern "C" __global__ void per_layer_input(const uint32_t* ids,
     const __nv_bfloat16 cs = __float2bfloat16_rn(context_scale);
     __shared__ float partial[4];
     float sum = 0.0f;
+    if (width <= 256) {
+        const int d0 = threadIdx.x;
+        const int d1 = threadIdx.x + 128;
+        __nv_bfloat16 id0 = __float2bfloat16_rn(0.0f);
+        __nv_bfloat16 id1 = __float2bfloat16_rn(0.0f);
+        float x0 = 0.0f;
+        float x1 = 0.0f;
+        if (d0 < width) {
+            id0 = __hmul(table[token + d0], is);
+            x0 = __bfloat162float(__hmul(context[context_base + d0], cs));
+            sum += x0 * x0;
+        }
+        if (d1 < width) {
+            id1 = __hmul(table[token + d1], is);
+            x1 = __bfloat162float(__hmul(context[context_base + d1], cs));
+            sum += x1 * x1;
+        }
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_xor_sync(FF_WARP_MASK, sum, offset);
+        if ((threadIdx.x & 31) == 0) partial[threadIdx.x >> 5] = sum;
+        __syncthreads();
+        if (threadIdx.x < 4) {
+            float x = partial[threadIdx.x];
+            for (int offset = 2; offset > 0; offset >>= 1) x += __shfl_xor_sync(FF_WARP_MASK & 0xf, x, offset);
+            if (threadIdx.x == 0) partial[0] = x;
+        }
+        __syncthreads();
+        const float rstd = rsqrtf(partial[0] / width + eps);
+        const __nv_bfloat16 combine = __float2bfloat16_rn(combine_scale);
+        if (d0 < width) {
+            const __nv_bfloat16 n = __float2bfloat16_rn(x0 * rstd * __bfloat162float(wn[d0]));
+            out[out_base + d0] = __hmul(__hadd(n, id0), combine);
+        }
+        if (d1 < width) {
+            const __nv_bfloat16 n = __float2bfloat16_rn(x1 * rstd * __bfloat162float(wn[d1]));
+            out[out_base + d1] = __hmul(__hadd(n, id1), combine);
+        }
+        return;
+    }
     for (int d = threadIdx.x; d < width; d += blockDim.x) {
         out[out_base + d] = __hmul(table[token + d], is);
         const float x = __bfloat162float(__hmul(context[context_base + d], cs));

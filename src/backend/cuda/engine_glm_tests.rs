@@ -606,9 +606,12 @@ fn glm_dsa_publication_gpu() -> Result<()> {
     let advance = cubin::module(&device.ctx, "q38_common")?.load_function("q38_advance")?;
     state.set_sequence(s, 7, 1, 16)?;
     let meta = state.seq_ref(s)?;
+    let null = 0u64;
     unsafe {
         s.launch_builder(&advance)
             .arg(&meta.ptr)
+            .arg(&null)
+            .arg(&null)
             .launch(grid(1, 1))?;
     }
     let mut mutant = 0;
@@ -657,7 +660,7 @@ fn glm_dsa_publication_gpu() -> Result<()> {
         for dsa in &state.dsa {
             plan.append(dsa, &input, s)?;
         }
-        state.advance_sequence(s, &advance)?;
+        state.advance_sequence(s, &advance, None, None)?;
         for dsa in &state.dsa {
             let meta = s.clone_dtoh(&dsa.meta)?;
             ensure!(

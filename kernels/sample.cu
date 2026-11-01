@@ -197,6 +197,75 @@ extern "C" __global__ void __launch_bounds__(1024) argmax_rows_bf16(
     }
 }
 
+__device__ __forceinline__ __nv_bfloat16 softcap_logit(__nv_bfloat16 x, float cap) {
+    const float z = __bfloat162float(__float2bfloat16_rn(__bfloat162float(x) / cap));
+    const float t = __bfloat162float(__float2bfloat16_rn(tanhf(z)));
+    return __float2bfloat16_rn(t * cap);
+}
+
+// Softcap over [vocab] BF16 logits fused with single-row argmax<<<1, T>>>, T <= 1024.
+// Same rounding as act.cu:softcap (90-97) and same tie comparator as sample.cu:argmax (12-65):
+// strictly greater post-softcap BF16 value wins; ties resolve to the lower index.
+extern "C" __global__ void softcap_argmax(const __nv_bfloat16* logits, uint32_t* token,
+                                          int vocab, float cap) {
+    if (blockDim.x > 1024 || gridDim.x != 1 || vocab < 1 || !(cap > 0.0f) || !isfinite(cap)) {
+        __trap();
+        return;
+    }
+    const int tid  = threadIdx.x;
+    const int nthr = blockDim.x;
+    float best = -INFINITY;
+    uint32_t id = 0xFFFFFFFFu;
+    const bool vec_ok = (vocab % 8 == 0) &&
+                        ((reinterpret_cast<uintptr_t>(logits) & 15) == 0);
+    if (vec_ok) {
+        const int nv = vocab >> 3;
+        const uint4* p = reinterpret_cast<const uint4*>(logits);
+        for (int i = tid; i < nv; i += nthr) {
+            const uint4 r = p[i];
+            const __nv_bfloat16* e = reinterpret_cast<const __nv_bfloat16*>(&r);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const __nv_bfloat16 s = softcap_logit(e[j], cap);
+                const float v = __bfloat162float(s);
+                const uint32_t idx = (uint32_t)i * 8 + (uint32_t)j;
+                if (v > best || (v == best && idx < id)) { best = v; id = idx; }
+            }
+        }
+    } else {
+        for (int i = tid; i < vocab; i += nthr) {
+            const __nv_bfloat16 s = softcap_logit(logits[i], cap);
+            const float v = __bfloat162float(s);
+            if (v > best || (v == best && (uint32_t)i < id)) { best = v; id = (uint32_t)i; }
+        }
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ob    = __shfl_down_sync(FF_WARP_MASK, best, off);
+        const uint32_t oi = __shfl_down_sync(FF_WARP_MASK, id, off);
+        if (ob > best || (ob == best && oi < id)) { best = ob; id = oi; }
+    }
+    __shared__ float wv[32];
+    __shared__ uint32_t wi[32];
+    const int lane = tid & 31, warp = tid >> 5;
+    if (lane == 0) { wv[warp] = best; wi[warp] = id; }
+    __syncthreads();
+    if (warp == 0) {
+        const int nw = (nthr + 31) >> 5;
+        best = -INFINITY; id = 0xFFFFFFFFu;
+        for (int w = lane; w < nw; w += 32) {
+            const float v = wv[w];
+            const uint32_t j = wi[w];
+            if (v > best || (v == best && j < id)) { best = v; id = j; }
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ob    = __shfl_down_sync(FF_WARP_MASK, best, off);
+            const uint32_t oi = __shfl_down_sync(FF_WARP_MASK, id, off);
+            if (ob > best || (ob == best && oi < id)) { best = ob; id = oi; }
+        }
+        if (lane == 0) *token = id;
+    }
+}
+
 extern "C" __global__ void advance(int* position) {
     if (threadIdx.x == 0) ++*position;
 }
