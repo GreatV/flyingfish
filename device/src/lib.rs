@@ -888,8 +888,12 @@ unsafe fn attention_d512<const SPLIT: bool, const BIDI: bool>(
         let part: u32;
         asm!("mov.u32 {p}, %ctaid.z;", p=out(reg32) part);
         let begin = if SPLIT { part * chunk } else { 0 };
-        let stop = (if BIDI { end } else { end.min(p.start + qstart + 16) })
-            .min(if SPLIT { begin + chunk } else { end });
+        let stop = (if BIDI {
+            end
+        } else {
+            end.min(p.start + qstart + 16)
+        })
+        .min(if SPLIT { begin + chunk } else { end });
         let sk = sm + 16384;
         let sv = sm + 49152;
         let partial = sm + 81920;
