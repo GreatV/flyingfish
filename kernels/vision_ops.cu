@@ -95,15 +95,18 @@ extern "C" __global__ void vision_clamp_bf16(
 // The two axis embeddings add in BF16 before the patch residual addition.
 extern "C" __global__ void vision_axis_position_add_bf16(
     const __nv_bfloat16* patches, const __nv_bfloat16* table, __nv_bfloat16* output,
-    uint32_t grid_h, uint32_t grid_w, uint32_t width, uint32_t positions) {
+    uint32_t grid_h, uint32_t grid_w, uint32_t width, uint32_t positions,
+    uint64_t axis_stride, uint64_t position_stride) {
     if (!vision_flat_launch() || !patches || !table || !output || !grid_h || !grid_w ||
-        !width || grid_h > positions || grid_w > positions) { __trap(); return; }
+        !width || grid_h > positions || grid_w > positions ||
+        !((axis_stride == uint64_t(positions) * width && position_stride == width) ||
+          (axis_stride == width && position_stride == 2 * uint64_t(width)))) { __trap(); return; }
     const uint64_t count = uint64_t(grid_h) * grid_w * width;
     for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
          i += uint64_t(gridDim.x) * 256) {
         const uint64_t row = i / width, column = i % width;
-        const __nv_bfloat16 position = __hadd(table[(row % grid_w) * width + column],
-            table[(uint64_t(positions) + row / grid_w) * width + column]);
+        const __nv_bfloat16 position = __hadd(table[(row % grid_w) * position_stride + column],
+            table[axis_stride + row / grid_w * position_stride + column]);
         output[i] = __hadd(patches[i], position);
     }
 }

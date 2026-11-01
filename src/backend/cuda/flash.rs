@@ -463,11 +463,22 @@ impl Flash {
             let names: &[&str] = if head_dim == 64 {
                 &["attention_prefill_d64_bidirectional"]
             } else if head_dim == 512 {
-                &["attention_prefill_d512"]
+                &[
+                    "attention_prefill_d512",
+                    "attention_prefill_d512_bidirectional",
+                ]
             } else if score.is_some() {
-                &["attention_prefill_d256_window"]
+                &[
+                    "attention_prefill_d256_window",
+                    "attention_prefill_d256_bidirectional",
+                    "attention_prefill_d256_symmetric",
+                ]
             } else if head_dim == 256 {
-                &["attention_prefill_d256"]
+                &[
+                    "attention_prefill_d256",
+                    "attention_prefill_d256_bidirectional",
+                    "attention_prefill_d256_symmetric",
+                ]
             } else if (heads, kv_heads) == (32, 4) {
                 &["attention_prefill_d128", "attention_prefill_d128_window"]
             } else {
@@ -525,11 +536,17 @@ impl Flash {
                 "prefill query tiles exceed grid limit"
             );
             let names: &[&str] = if head_dim == 512 {
-                &["attention_prefill_d512"]
+                &[
+                    "attention_prefill_d512",
+                    "attention_prefill_d512_bidirectional",
+                ]
             } else if head_dim == 256 && score.is_some() {
                 &["attention_prefill_d256_window"]
             } else if head_dim == 256 {
-                &["attention_prefill_d256"]
+                &[
+                    "attention_prefill_d256",
+                    "attention_prefill_d256_bidirectional",
+                ]
             } else if (heads, kv_heads) == (32, 4) {
                 &["attention_prefill_d128", "attention_prefill_d128_window"]
             } else {
@@ -662,6 +679,8 @@ impl Flash {
         );
         let mode = if prefix.is_some() {
             2
+        } else if shape.window_left.is_some() && !shape.causal {
+            6
         } else if shape.causal {
             0
         } else {
@@ -674,7 +693,9 @@ impl Flash {
         );
         ensure!(
             mode == 0
-                || (shape.window_left.is_none() && (self.native.len() == 3 || bidirectional_only)),
+                || mode == 6
+                || (shape.window_left.is_none()
+                    && (self.native.len() > mode || bidirectional_only)),
             "prefill mask is not bound for this geometry/window"
         );
         ensure!(
@@ -760,7 +781,9 @@ impl Flash {
                 .native
                 .get(if bidirectional_only {
                     0
-                } else if window && self.score.is_none() {
+                } else if mode == 6 {
+                    2
+                } else if window && self.score.is_none() && mode != 6 {
                     1
                 } else {
                     mode
@@ -795,7 +818,7 @@ impl Flash {
                     shape.capacity == split.capacity,
                     "D512 capacity differs from setup binding"
                 );
-                if shape.rows <= 16 && split.parts > 1 {
+                if mode == 0 && shape.rows <= 16 && split.parts > 1 {
                     let (partials, _partials) = split.workspace.device_ptr_mut(&self.stream);
                     let scale = self.score.context("D512 score is not bound")?.scale;
                     #[cfg(feature = "cuda")]
@@ -835,10 +858,20 @@ impl Flash {
                 launch.arg(&args);
                 if let Some(score) = &self.score {
                     let window = score.window_left.map_or(u32::MAX, |w| w as u32);
+                    let key_extent = keys as u32;
                     if bidirectional_only {
                         launch.arg(&extent);
                     } else if shape.head_dim == 256 {
-                        launch.arg(&window);
+                        if mode == 1 {
+                            launch.arg(&key_extent);
+                        } else if mode == 6 {
+                            launch.arg(&key_extent).arg(&window);
+                        } else {
+                            launch.arg(&window);
+                        }
+                    }
+                    if mode != 0 && shape.head_dim == 512 {
+                        launch.arg(&extent);
                     }
                     launch.arg(&score.scale);
                     launch.launch(LaunchConfig {
@@ -852,8 +885,16 @@ impl Flash {
                     })?;
                     return Ok(());
                 }
-                if mode != 0 || window {
-                    launch.arg(&extent);
+                let key_extent = keys as u32;
+                if mode == 6 {
+                    launch.arg(&key_extent).arg(&extent).arg(&0.0625f32);
+                } else {
+                    if mode != 0 || window {
+                        launch.arg(&extent);
+                    }
+                    if mode == 1 && shape.head_dim == 256 {
+                        launch.arg(&0.0625f32);
+                    }
                 }
                 launch.launch(LaunchConfig {
                     grid_dim: (
@@ -1420,7 +1461,8 @@ mod tests {
                     self.d,
                     Score {
                         scale,
-                        window_left: (self.mode == "window").then_some(self.extent),
+                        window_left: matches!(self.mode.as_str(), "window" | "symmetric")
+                            .then_some(self.extent),
                     },
                     self.capacity,
                 )
@@ -1495,7 +1537,8 @@ mod tests {
                     capacity: self.capacity,
                     head_dim: self.d,
                     causal: matches!(self.mode.as_str(), "causal" | "window"),
-                    window_left: (self.mode == "window").then_some(self.extent),
+                    window_left: matches!(self.mode.as_str(), "window" | "symmetric")
+                        .then_some(self.extent),
                 },
                 keys: self.keys,
                 prefix: (self.mode == "prefix").then_some(self.extent),
@@ -2011,6 +2054,9 @@ mod tests {
             "bidirectional" => key < case.keys,
             "prefix" => key < case.keys && key < case.extent.max(query + 1),
             "window" => key <= query && query - key <= case.extent,
+            "symmetric" => {
+                key + case.extent >= query && key <= query + case.extent && key < case.keys
+            }
             _ => key <= query,
         }
     }
@@ -2042,6 +2088,7 @@ mod tests {
         let spike = match case.mode.as_str() {
             "prefix" => case.extent - 1,
             "window" => case.start - case.extent,
+            "symmetric" => case.start + case.extent,
             _ => case.keys - 1,
         };
         for kv in 0..case.hkv {
@@ -2063,11 +2110,35 @@ mod tests {
             v: stream.clone_htod(&values)?,
             out: stream.alloc_zeros(case.rows * case.hq * case.d)?,
         };
-        let mut op = Flash::new(stream.clone(), case.rows, case.hq, case.hkv, case.d)?;
+        let mut op = if case.d == 512 || case.mode == "symmetric" {
+            Flash::new_with_score(
+                stream.clone(),
+                case.rows,
+                case.hq,
+                case.hkv,
+                case.d,
+                Score {
+                    scale: if case.d == 512 {
+                        0.044_194_174_f32
+                    } else {
+                        0.0625
+                    },
+                    window_left: (case.mode == "symmetric").then_some(case.extent),
+                },
+                case.capacity,
+            )?
+        } else {
+            Flash::new(stream.clone(), case.rows, case.hq, case.hkv, case.d)?
+        };
         let expected = uniform_reference(case, &values);
         let limit = limits["limits"][format!("{}-{}", case.d, case.mode)]["output_max"]
             .as_f64()
-            .context("mask control limit")?;
+            .with_context(|| {
+                format!(
+                    "mask control limit for {}-{}: derive and freeze it before the run",
+                    case.d, case.mode
+                )
+            })?;
         case.run(&mut op, &mut b)?;
         let actual: Vec<_> = stream
             .clone_dtoh(&b.out)?
@@ -2079,13 +2150,18 @@ mod tests {
         let mut mutant = case.clone();
         match case.mode.as_str() {
             "prefix" | "bidirectional" => mutant.mode = "causal".into(),
-            "window" => mutant.extent -= 1,
+            "window" | "symmetric" => mutant.extent -= 1,
             _ => {
                 mutant.start += 1;
                 mutant.keys += 1;
             }
         }
-        mutant.run(&mut op, &mut b)?;
+        if case.mode == "symmetric" {
+            let mut wrong_op = mutant.binding(stream)?;
+            mutant.run(&mut wrong_op, &mut b)?;
+        } else {
+            mutant.run(&mut op, &mut b)?;
+        }
         let wrong: Vec<_> = stream
             .clone_dtoh(&b.out)?
             .iter()
@@ -2147,6 +2223,12 @@ mod tests {
             (256, 24, 4, "causal", 33, 17, 50, 0),
             (128, 16, 2, "causal", 33, 17, 50, 0),
             (128, 16, 8, "bidirectional", 17, 0, 33, 0),
+            (256, 16, 8, "bidirectional", 17, 0, 33, 0),
+            (512, 16, 2, "bidirectional", 17, 0, 33, 0),
+            (256, 16, 8, "bidirectional", 17, 33, 50, 0),
+            (256, 16, 8, "symmetric", 17, 0, 600, 512),
+            (256, 16, 8, "symmetric", 17, 513, 1100, 512),
+            (512, 16, 2, "bidirectional", 17, 33, 50, 0),
             (128, 12, 12, "prefix", 65, 0, 65, 33),
             (128, 32, 4, "window", 17, 127, 144, 31),
         ] {
@@ -2163,7 +2245,7 @@ mod tests {
                 seed: 31,
                 capacity: keys + 23,
                 pitch: hq * d + 128,
-                scale: None,
+                scale: (mode == "symmetric").then_some(0.0625),
             };
             defects += mask_control(stream, &case, limits)?;
         }

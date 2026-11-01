@@ -225,6 +225,15 @@ impl Model {
         self.backend.prefill(ids, trace)
     }
     /// Prefill one complete processor-packed image/text prompt after reset.
+    pub fn embed(
+        &mut self,
+        input: &crate::vision_input::MultimodalInput<'_>,
+        mask: &[bool],
+        trace: Option<&mut Trace>,
+    ) -> Result<Vec<f32>> {
+        self.backend.embed(input, mask, trace)
+    }
+
     pub fn prefill_multimodal(
         &mut self,
         input: &crate::vision_input::MultimodalInput<'_>,
@@ -499,7 +508,8 @@ pub fn layer_program(
         | crate::model_spec::Architecture::MiniCpmV47
         | crate::model_spec::Architecture::Flint
         | crate::model_spec::Architecture::LoopVl
-        | crate::model_spec::Architecture::Gemma4 => Ok(LayerProgram::Standard([
+        | crate::model_spec::Architecture::Gemma4
+        | crate::model_spec::Architecture::EmbeddingGemma2 => Ok(LayerProgram::Standard([
             LayerStage::Common(O::Norm),
             LayerStage::Mixer(mixer),
             LayerStage::Common(O::PostNorm),

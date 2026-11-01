@@ -1411,16 +1411,20 @@ impl WeightCatalog {
             .contains_key("model.language_model.embed_tokens.weight")
         {
             "model.language_model.embed_tokens.weight"
-        } else {
+        } else if self.tensors.contains_key("model.embed_tokens.weight") {
             "model.embed_tokens.weight"
+        } else {
+            "language_model.embed_tokens.weight"
         };
         let norm_name = if self
             .tensors
             .contains_key("model.language_model.norm.weight")
         {
             "model.language_model.norm.weight"
-        } else {
+        } else if self.tensors.contains_key("model.norm.weight") {
             "model.norm.weight"
+        } else {
+            "language_model.norm.weight"
         };
         let has_head = self.tensors.contains_key("lm_head.weight");
         let mut take = |name: &str| match self.tensors.remove(name) {

@@ -133,6 +133,15 @@ impl Backend {
     pub fn reset(&mut self) -> Result<()> {
         match *self {}
     }
+    pub fn embed(
+        &mut self,
+        input: &crate::vision_input::MultimodalInput<'_>,
+        mask: &[bool],
+        trace: Option<&mut Trace>,
+    ) -> Result<Vec<f32>> {
+        let _ = (input, mask, trace);
+        match *self {}
+    }
     pub fn prefill(&mut self, ids: &[u32], trace: Option<&mut Trace>) -> Result<u32> {
         let _ = (ids, trace);
         match *self {}

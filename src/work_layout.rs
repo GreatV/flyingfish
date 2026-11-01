@@ -132,7 +132,7 @@ impl RowWorkSpec {
                     0,
                 )
             }
-            Architecture::Gemma4 => {
+            Architecture::Gemma4 | Architecture::EmbeddingGemma2 => {
                 let mut q = 0usize;
                 let mut qkv = 0usize;
                 for layer in &spec.layers {

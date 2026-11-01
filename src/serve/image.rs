@@ -438,7 +438,8 @@ impl Processor {
             | Architecture::Glm5Next
             | Architecture::LoopVl
             | Architecture::DeepseekV41
-            | Architecture::Gemma4 => return Ok(None),
+            | Architecture::Gemma4
+            | Architecture::EmbeddingGemma2 => return Ok(None),
         };
         let image_id = match spec.architecture {
             Architecture::MiniCpmV47 => Some(ImageId::read(

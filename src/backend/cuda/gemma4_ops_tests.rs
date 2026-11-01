@@ -782,6 +782,17 @@ impl VisionFixture<'_> {
                 && table.len() == 2 * positions as usize * hidden as usize,
             "RUNNER_FAIL pointwise fixture extents"
         );
+        let source_table = reference_bf16(&self.values, "table")?;
+        let mut interleaved = vec![bf16::ZERO; source_table.len()];
+        for axis in 0..2 {
+            for position in 0..positions as usize {
+                for channel in 0..hidden as usize {
+                    interleaved[(position * 2 + axis) * hidden as usize + channel] = source_table
+                        [(axis * positions as usize + position) * hidden as usize + channel];
+                }
+            }
+        }
+        let interleaved = s.clone_htod(&interleaved)?;
         let mut output = s.alloc_zeros::<bf16>(count as usize)?;
         for control in [false, true] {
             let (shift, scale) = if control {
@@ -828,9 +839,27 @@ impl VisionFixture<'_> {
                     .arg(&self.width)
                     .arg(&hidden)
                     .arg(&positions)
+                    .arg(&(u64::from(positions) * u64::from(hidden)))
+                    .arg(&u64::from(hidden))
                     .launch(flat(count as usize))?;
             }
             self.compare("positioned", &output, control)?;
+            if !control {
+                unsafe {
+                    s.launch_builder(&position)
+                        .arg(&scaled)
+                        .arg(&interleaved)
+                        .arg(&mut output)
+                        .arg(&self.height)
+                        .arg(&self.width)
+                        .arg(&hidden)
+                        .arg(&positions)
+                        .arg(&u64::from(hidden))
+                        .arg(&(2 * u64::from(hidden)))
+                        .launch(flat(count as usize))?;
+                }
+                self.compare("positioned", &output, false)?;
+            }
         }
         Ok(())
     }
@@ -3020,11 +3049,16 @@ fn native_path(
 }
 
 fn vision_distance(actual: &[f32], expected: &[f32], bounds: &serde_json::Value) -> Result<bool> {
+    let nonfinite = actual
+        .iter()
+        .chain(expected)
+        .filter(|value| !value.is_finite())
+        .count();
     ensure!(
-        actual.len() == expected.len()
-            && !actual.is_empty()
-            && actual.iter().chain(expected).all(|v| v.is_finite()),
-        "Runner FAIL vision comparison extent or finiteness"
+        actual.len() == expected.len() && !actual.is_empty() && nonfinite == 0,
+        "Runner FAIL vision comparison extent actual={} expected={} nonfinite={nonfinite}",
+        actual.len(),
+        expected.len()
     );
     let mut maximum = 0.0f64;
     let mut squared = 0.0f64;
@@ -3038,6 +3072,107 @@ fn vision_distance(actual: &[f32], expected: &[f32], bounds: &serde_json::Value)
         && rmse <= bounds["output_rmse"].as_f64().context("vision RMSE")?;
     println!("vision_distance max={maximum} rmse={rmse} pass={pass}");
     Ok(pass)
+}
+
+#[cfg(feature = "cuda")]
+struct LargeMediaInput {
+    ids: Vec<u32>,
+    modalities: Vec<u8>,
+    pixels: Vec<f32>,
+    grids: Vec<crate::vision_input::ImageGrid>,
+    audio: Vec<(Vec<f32>, Vec<bool>)>,
+}
+
+#[cfg(feature = "cuda")]
+impl LargeMediaInput {
+    fn read_embedding(path: &std::path::Path, cell: &serde_json::Value) -> Result<Self> {
+        let bytes = std::fs::read(path)?;
+        let data = SafeTensors::deserialize(&bytes)?;
+        let floats = |name: &str| -> Result<Vec<f32>> {
+            let view = data.tensor(name)?;
+            ensure!(view.dtype() == safetensors::Dtype::F32, "media float dtype");
+            Ok(view
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_le_bytes(*v))
+                .collect())
+        };
+        let ids = data.tensor("ids")?;
+        let modalities = data.tensor("modalities")?;
+        ensure!(
+            ids.dtype() == safetensors::Dtype::I32 && modalities.dtype() == safetensors::Dtype::U8,
+            "media identity dtypes"
+        );
+        let mut grids = Vec::new();
+        for grid in cell["grids"].as_array().context("media grids")? {
+            grids.push(crate::vision_input::ImageGrid {
+                t: u32::try_from(grid[0].as_u64().context("grid t")?)?,
+                h: u32::try_from(grid[1].as_u64().context("grid h")?)?,
+                w: u32::try_from(grid[2].as_u64().context("grid w")?)?,
+            });
+        }
+        let mut audio = Vec::new();
+        let clips = usize::try_from(cell["audio_clips"].as_u64().context("audio clips")?)?;
+        if clips != 0 {
+            let values = floats("audio")?;
+            let mask = data.tensor("audio_mask")?;
+            ensure!(
+                mask.dtype() == safetensors::Dtype::BOOL && mask.shape()[0] == clips,
+                "raw audio mask extent"
+            );
+            let frames = mask.shape()[1];
+            ensure!(values.len() == clips * frames * 128, "audio samples extent");
+            for clip in 0..clips {
+                audio.push((
+                    values[clip * frames * 128..(clip + 1) * frames * 128].to_vec(),
+                    mask.data()[clip * frames..(clip + 1) * frames]
+                        .iter()
+                        .map(|v| *v != 0)
+                        .collect(),
+                ));
+            }
+        }
+        Ok(Self {
+            ids: ids
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| u32::from_le_bytes(*v))
+                .collect(),
+            modalities: modalities.data().to_vec(),
+            pixels: if grids.is_empty() {
+                Vec::new()
+            } else {
+                floats("pixels")?
+            },
+            grids,
+            audio,
+        })
+    }
+
+    fn clips(&self) -> Vec<crate::vision_input::AudioClip<'_>> {
+        self.audio
+            .iter()
+            .map(|(features, mask)| crate::vision_input::AudioClip { features, mask })
+            .collect()
+    }
+
+    fn input<'a>(
+        &'a self,
+        end: usize,
+        audio: &'a [crate::vision_input::AudioClip<'a>],
+    ) -> crate::vision_input::MultimodalInput<'a> {
+        crate::vision_input::MultimodalInput {
+            input_ids: &self.ids[..end],
+            modality_ids: &self.modalities[..end],
+            pixel_values: &self.pixels,
+            grids: &self.grids,
+            audio,
+        }
+    }
 }
 
 #[test]
@@ -4031,6 +4166,277 @@ fn large_model_definition(
     );
     ensure!(defects == 0, "large Gemma candidate defects={defects}");
     Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn embedding_vector_distance(
+    actual: &[f32],
+    expected: &[f32],
+    bounds: &serde_json::Value,
+) -> Result<bool> {
+    ensure!(
+        actual.len() == expected.len(),
+        "embedding vector shape differs"
+    );
+    ensure!(
+        actual.iter().all(|value| value.is_finite()),
+        "nonfinite embedding vector"
+    );
+    let (mut maximum, mut squared, mut dot, mut a, mut b) = (0f64, 0f64, 0f64, 0f64, 0f64);
+    for (&actual, &expected) in actual.iter().zip(expected) {
+        let (actual, expected) = (f64::from(actual), f64::from(expected));
+        maximum = maximum.max((actual - expected).abs());
+        squared += (actual - expected).powi(2);
+        dot += actual * expected;
+        a += actual * actual;
+        b += expected * expected;
+    }
+    let rmse = (squared / actual.len() as f64).sqrt();
+    let cosine = 1.0 - dot / (a.sqrt() * b.sqrt());
+    let pass = maximum <= bounds["output_max"].as_f64().context("vector max")?
+        && rmse <= bounds["output_rmse"].as_f64().context("vector RMSE")?
+        && cosine
+            <= bounds["cosine_distance"]
+                .as_f64()
+                .context("vector cosine")?;
+    println!("embedding_vector max={maximum} rmse={rmse} cosine_distance={cosine} pass={pass}");
+    Ok(pass)
+}
+
+#[test]
+#[ignore = "requires EmbeddingGemma-2 media fixtures, frozen thresholds and a GPU window"]
+fn embedding_gemma2_media_matches_frozen_reference() -> Result<()> {
+    #[cfg(not(feature = "cuda"))]
+    anyhow::bail!("EmbeddingGemma-2 media gate requires CUDA");
+    #[cfg(feature = "cuda")]
+    {
+        let dir = std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL")?);
+        let fixtures = std::path::PathBuf::from(
+            std::env::var_os("FF_EMBEDDING_FIXTURES").context("FF_EMBEDDING_FIXTURES")?,
+        );
+        let frozen: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixtures.join("FROZEN.json"))?)?;
+        ensure!(frozen["status"] == "FROZEN" && frozen["candidate_observations"] == 0);
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(fixtures.join("inputs/INPUT.json"))?)?;
+        let settings = crate::backend::Settings {
+            tree_builder: crate::backend::TreeBuilder::Waves,
+            spec_budget: crate::backend::SpecBudget::Chain,
+            spec_graph: false,
+            draft_model: None,
+            prefix_cache: false,
+            kv_format: crate::kv::KvFormat::Bf16,
+            runtime_dir: Some(std::path::PathBuf::from(
+                std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR")?,
+            )),
+        };
+        let images = LargeMediaInput::read_embedding(
+            &fixtures.join("inputs/image_pair.safetensors"),
+            &metadata["image_pair"],
+        )?;
+        let audio = LargeMediaInput::read_embedding(
+            &fixtures.join("inputs/audio_pair.safetensors"),
+            &metadata["audio_pair"],
+        )?;
+        let reservation = LargeMediaInput {
+            ids: [images.ids.clone(), audio.ids.clone()].concat(),
+            modalities: [images.modalities.clone(), audio.modalities.clone()].concat(),
+            pixels: images.pixels.clone(),
+            grids: images.grids.clone(),
+            audio: audio.audio.clone(),
+        };
+        let clips = reservation.clips();
+        let mut engine = super::engine::Engine::load_multimodal(
+            &dir,
+            0,
+            1024,
+            Some(1024),
+            settings,
+            &reservation.input(reservation.ids.len(), &clips),
+        )?;
+        let mut defects = 0usize;
+        let mut vectors = BTreeMap::new();
+        for name in [
+            "street",
+            "winter",
+            "image_pair",
+            "stew",
+            "wizard",
+            "audio_pair",
+            "mixed",
+        ] {
+            let input = LargeMediaInput::read_embedding(
+                &fixtures.join("inputs").join(format!("{name}.safetensors")),
+                &metadata[name],
+            )?;
+            let oracle =
+                load_reference(&fixtures.join("oracle").join(format!("{name}.safetensors")))?;
+            let clips = input.clips();
+            let packed = input.input(input.ids.len(), &clips);
+            let mask = vec![true; input.ids.len()];
+            let before = engine.gemma_encoder_calls()?;
+            let mut trace = crate::trace::Trace::all_layers();
+            let vector = engine.embed(&packed, &mask, Some(&mut trace))?;
+            let after = engine.gemma_encoder_calls()?;
+            ensure!(
+                after.0 == before.0 + usize::from(!input.grids.is_empty())
+                    && after.1 == before.1 + input.audio.len(),
+                "media encoder call count"
+            );
+            let bounds = &frozen["cells"][name];
+            let expected_vector = oracle["vector"].1.as_f32();
+            defects += usize::from(!embedding_vector_distance(
+                &vector,
+                &expected_vector,
+                &bounds["vector"],
+            )?);
+            let norm = vector
+                .iter()
+                .map(|&value| f64::from(value).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            ensure!((norm - 1.0).abs() <= frozen["unit_norm_limit"].as_f64().unwrap());
+            for (stage, trace_name) in [
+                ("spliced", "layer.embed".to_owned()),
+                ("layer0", "layer.0.debug.layer_out".to_owned()),
+                ("layer5", "layer.5.debug.layer_out".to_owned()),
+                ("layer17", "layer.17.debug.layer_out".to_owned()),
+                ("layer23", "layer.23.debug.layer_out".to_owned()),
+                ("norm", "layer.norm".to_owned()),
+                ("projected", "layer.projected".to_owned()),
+            ] {
+                let actual = trace.values(&trace_name)?;
+                let pass = vision_distance(&actual, &oracle[stage].1.as_f32(), &bounds[stage])?;
+                defects += usize::from(!pass);
+                println!(
+                    "{} embedding_media {name} {stage}",
+                    if pass { "PASS" } else { "DEFECT" }
+                );
+            }
+            let (ple_shape, ple) = &oracle["ple"];
+            ensure!(ple_shape[2..] == [24, 512]);
+            let rows = input.ids.len();
+            let source = ple.as_f32();
+            let mut expected_ple = vec![0.0; rows * 24 * 512];
+            for token in 0..rows {
+                for layer in 0..24 {
+                    let from = (token * 24 + layer) * 512;
+                    let to = (layer * rows + token) * 512;
+                    expected_ple[to..to + 512].copy_from_slice(&source[from..from + 512]);
+                }
+            }
+            let bound_ple = trace.values("layer.0.debug.ple_identity")?;
+            let bound = bound_ple.len() / (24 * 512);
+            let mut actual_ple = vec![0.0; rows * 24 * 512];
+            for layer in 0..24 {
+                for token in 0..rows {
+                    let from = (layer * bound + token) * 512;
+                    let to = (layer * rows + token) * 512;
+                    actual_ple[to..to + 512].copy_from_slice(&bound_ple[from..from + 512]);
+                }
+            }
+            let pass = vision_distance(&actual_ple, &expected_ple, &bounds["ple"])?;
+            defects += usize::from(!pass);
+            let projected = trace.values("layer.projected")?;
+            let mut pooled = vec![0.0f32; 768];
+            for token in 0..rows {
+                for (column, value) in pooled.iter_mut().enumerate() {
+                    *value += projected[token * 768 + column] / rows as f32;
+                }
+            }
+            defects += usize::from(!embedding_vector_distance(
+                &pooled,
+                &oracle["pooled"].1.as_f32(),
+                &bounds["pooled"],
+            )?);
+            if !input.grids.is_empty() {
+                let mut tower = Vec::new();
+                for image in 0..input.grids.len() {
+                    tower.extend(trace.values(&format!("image.{image}.pool"))?);
+                }
+                let pass = vision_distance(&tower, &oracle["tower"].1.as_f32(), &bounds["tower"])?;
+                defects += usize::from(!pass);
+                if input.audio.is_empty() {
+                    let pass = vision_distance(
+                        &trace.values("media_features")?,
+                        &oracle["features"].1.as_f32(),
+                        &bounds["features"],
+                    )?;
+                    defects += usize::from(!pass);
+                }
+            }
+            if !input.audio.is_empty() {
+                let (mut tower, mut features) = (Vec::new(), Vec::new());
+                for clip in 0..input.audio.len() {
+                    tower.extend(trace.values(&format!("audio.{clip}.tower"))?);
+                    features.extend(trace.values(&format!("audio.{clip}.features"))?);
+                }
+                for (stage, actual) in [("audio_tower", tower), ("audio_features", features)] {
+                    let pass = vision_distance(&actual, &oracle[stage].1.as_f32(), &bounds[stage])?;
+                    defects += usize::from(!pass);
+                    println!(
+                        "{} embedding_media {name} {stage}",
+                        if pass { "PASS" } else { "DEFECT" }
+                    );
+                }
+                if input.grids.is_empty() {
+                    let pass = vision_distance(
+                        &trace.values("media_features")?,
+                        &oracle["audio_features"].1.as_f32(),
+                        &bounds["audio_features"],
+                    )?;
+                    defects += usize::from(!pass);
+                }
+            }
+            if name == "image_pair" {
+                let halfway = input.pixels.len() / 2;
+                let mut pixels = input.pixels.clone();
+                let (first, second) = pixels.split_at_mut(halfway);
+                second.copy_from_slice(first);
+                let negative = LargeMediaInput {
+                    ids: input.ids.clone(),
+                    modalities: input.modalities.clone(),
+                    pixels,
+                    grids: input.grids.clone(),
+                    audio: Vec::new(),
+                };
+                let clips = negative.clips();
+                let negative =
+                    engine.embed(&negative.input(negative.ids.len(), &clips), &mask, None)?;
+                ensure!(
+                    negative != vector,
+                    "two-image native control did not change output"
+                );
+            }
+            if name == "audio_pair" {
+                let mut negative_audio = input.audio.clone();
+                let first_clip = negative_audio[0].0.clone();
+                negative_audio[1].0 = first_clip;
+                let negative = LargeMediaInput {
+                    ids: input.ids.clone(),
+                    modalities: input.modalities.clone(),
+                    pixels: Vec::new(),
+                    grids: Vec::new(),
+                    audio: negative_audio,
+                };
+                let clips = negative.clips();
+                let negative =
+                    engine.embed(&negative.input(negative.ids.len(), &clips), &mask, None)?;
+                ensure!(
+                    negative != vector,
+                    "two-audio native control did not change output"
+                );
+            }
+            vectors.insert(name, vector);
+        }
+        ensure!(
+            vectors["street"] != vectors["winter"] && vectors["street"] != vectors["image_pair"]
+        );
+        ensure!(vectors["stew"] != vectors["wizard"] && vectors["wizard"] != vectors["audio_pair"]);
+        ensure!(defects == 0, "EmbeddingGemma-2 media defects={defects}");
+        println!("EMBEDDING_GEMMA2_MEDIA PASS cells=7 defects=0");
+        Ok(())
+    }
 }
 
 #[test]

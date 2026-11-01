@@ -155,7 +155,11 @@ impl AudioRuntime {
             layer_norm: common_module.load_function("q38_layer_norm")?,
             gather: module.load_function("vision_row_gather")?,
         };
-        let p = "model.audio_tower";
+        let p = if model.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
+            "audio_tower"
+        } else {
+            "model.audio_tower"
+        };
         let mut subsample = Vec::new();
         for (index, input, output) in [
             (0, 1, a.subsample_channels[0]),
@@ -275,7 +279,11 @@ impl AudioRuntime {
             output_bias: catalog.take_bf16(&format!("{p}.output_proj.bias"), &[output as usize])?,
             projection: ClippedLinear::take(
                 catalog,
-                "model.embed_audio.embedding_projection.weight",
+                if model.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
+                    "embed_audio.embedding_projection.weight"
+                } else {
+                    "model.embed_audio.embedding_projection.weight"
+                },
                 [model.hidden, output],
                 None,
             )?,

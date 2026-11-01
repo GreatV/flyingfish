@@ -901,7 +901,7 @@ using A = float __attribute__((ext_vector_type(8)));
 // D128 reuses K storage for scores and keeps two BF16 probability planes.
 template<int D, int MODE, bool EXPLICIT = false, bool PARTIAL = false>
 __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
-    float* partials = nullptr, uint32_t parts = 1, uint32_t chunk = 0) {
+    float* partials = nullptr, uint32_t parts = 1, uint32_t chunk = 0, uint32_t keys = 0) {
   if (p.position) {
     const int start = *p.position;
     if (start < 0) __trap();
@@ -929,10 +929,10 @@ __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
       gridDim.x != (PARTIAL ? parts : (p.rows+BQ-1)/BQ) || gridDim.y != p.q_heads || gridDim.z != 1 ||
       p.group == 0 || p.rows == 0 || p.start > p.capacity || p.rows > p.capacity-p.start ||
       (PARTIAL && (p.rows > BQ || parts == 0 || chunk == 0 || chunk % BK != 0))) __trap();
-  const uint32_t end = MODE == 1 ? extent : (MODE == 2 ? max(extent,p.start+p.rows) : p.start+p.rows);
-  uint32_t first = MODE == 3 && p.start+query_base > extent
+  const uint32_t end = MODE == 6 ? keys : MODE == 1 ? extent : (MODE == 2 ? max(extent,p.start+p.rows) : p.start+p.rows);
+  uint32_t first = (MODE == 3 || MODE == 6) && p.start+query_base > extent
       ? (p.start+query_base-extent)/BK*BK : 0;
-  uint32_t limit = MODE == 1 ? end : min(end, MODE == 2
+  uint32_t limit = MODE == 6 ? end : MODE == 1 ? end : min(end, MODE == 2
       ? max(extent,p.start+query_base+BQ) : p.start+query_base+BQ);
   if constexpr (PARTIAL) {
     first = max(first,partition*chunk);
@@ -959,8 +959,9 @@ __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
     const auto store_score = [&](int row, int column, float value) {
       const uint32_t key = base+column, query = p.start+query_base+row;
       const bool visible = query_base+row < p.rows && key < end &&
-          (MODE == 1 || (MODE == 2 ? key < max(extent,query+1) : key <= query)) &&
-          (MODE != 3 || query-key <= extent);
+          (MODE == 6 ? key+extent >= query && key <= query+extent :
+              (MODE == 1 || (MODE == 2 ? key < max(extent,query+1) : key <= query)) &&
+              (MODE != 3 || query-key <= extent));
       score_memory[row*BK+column] = visible ? value*(EXPLICIT ? scale : (D == 256 ? 0.0625f : SCALE)) : -INFINITY;
     };
     if constexpr (D != 128) {
@@ -1080,8 +1081,10 @@ __device__ void run(Problem p, uint32_t extent, float scale = 0.0f,
 }
 }
 extern "C" __global__ void attention_prefill_d256(prefill::Problem p) { prefill::run<256,0>(p,0); }
+extern "C" __global__ void attention_prefill_d256_symmetric(prefill::Problem p, uint32_t keys, uint32_t radius, float scale) { prefill::run<256,6,true>(p,radius,scale,nullptr,1,0,nullptr,0,keys); }
 extern "C" __global__ void attention_prefill_d256_window(prefill::Problem p, uint32_t window, float scale) { prefill::run<256,3,true>(p,window,scale); }
 extern "C" __global__ void attention_prefill_d512(prefill::Problem p, float scale) { prefill::run<512,0,true>(p,0,scale); }
+extern "C" __global__ void attention_prefill_d512_bidirectional(prefill::Problem p, uint32_t keys, float scale) { prefill::run<512,1,true>(p,keys,scale); }
 extern "C" __global__ void attention_partial_d512(prefill::Problem p, float scale, float* partials, uint32_t parts, uint32_t chunk) { prefill::run<512,0,true,true>(p,0,scale,partials,parts,chunk); }
 extern "C" __global__ void attention_merge_d512(prefill::Problem p, const float* partials, uint32_t parts) {
   const uint32_t row = blockIdx.x, head = blockIdx.y, tid = threadIdx.x;
@@ -1109,6 +1112,7 @@ extern "C" __global__ void attention_merge_d512(prefill::Problem p, const float*
 }
 extern "C" __global__ void attention_prefill_d128(prefill::Problem p) { prefill::run<128,0>(p,0); }
 extern "C" __global__ void attention_prefill_d128_bidirectional(prefill::Problem p, uint32_t keys) { prefill::run<128,1>(p,keys); }
+extern "C" __global__ void attention_prefill_d256_bidirectional(prefill::Problem p, uint32_t keys) { prefill::run<256,1>(p,keys); }
 extern "C" __global__ void attention_prefill_d128_prefix(prefill::Problem p, uint32_t prefix) { prefill::run<128,2>(p,prefix); }
 extern "C" __global__ void attention_prefill_d128_window(prefill::Problem p, uint32_t window) { prefill::run<128,3>(p,window); }
 #endif

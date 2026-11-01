@@ -298,6 +298,31 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d128(p: Attention) {
 }
 
 /// # Safety
+/// All keys below `keys` are populated in this sequence; launch uses 128 threads and 98304 shared bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_prefill_d256_bidirectional(p: Attention, keys: u32) {
+    unsafe {
+        let p = resolve_position(p);
+        attention::<256, 32, 1>(p, keys, 0, 0.0625);
+    }
+}
+
+/// # Safety
+/// Keys within `radius` of each query are visible; launch uses 128 threads and 98304 shared bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_prefill_d256_symmetric(
+    p: Attention,
+    keys: u32,
+    radius: u32,
+    scale: f32,
+) {
+    unsafe {
+        let p = resolve_position(p);
+        attention::<256, 32, 6>(p, keys, radius, scale);
+    }
+}
+
+/// # Safety
 /// All keys below `keys` are populated in this sequence; launch uses 128 threads and 49152 shared bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128_bidirectional(p: Attention, keys: u32) {
@@ -384,6 +409,8 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
         let sv = sm + (256 * D) as u32;
         let stop = if MODE == 1 {
             end
+        } else if MODE == 6 {
+            end.min(diagonal + 64 + prefix)
         } else if MODE == 2 {
             end.min(prefix.max(diagonal + 64))
         } else {
@@ -391,6 +418,8 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
         };
         let interior = if MODE == 1 {
             end
+        } else if MODE == 6 {
+            end.min(diagonal + prefix)
         } else if MODE == 2 {
             end.min(prefix.max(diagonal))
         } else {
@@ -404,7 +433,7 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
             address(0, copy_row + 1024 / D as u32, copy_col, D as u32),
         ];
         let kv = (head / p.group) as usize * p.capacity as usize * D;
-        let first = if MODE == 3 {
+        let first = if MODE == 3 || MODE == 6 {
             diagonal.saturating_sub(prefix) / 64 * 64
         } else {
             0
@@ -521,56 +550,35 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                     commit();
                 }
                 let mut next = peak;
+                let upper = |row: u32| {
+                    if MODE == 1 {
+                        end
+                    } else if MODE == 2 {
+                        prefix.max(diagonal + row + 1).min(end)
+                    } else if MODE == 6 {
+                        (diagonal + row + 1 + prefix).min(end)
+                    } else {
+                        (diagonal + row + 1).min(end)
+                    }
+                };
                 macro_rules! mask_max {
                     ($n:expr) => {{
                         if $masked || MODE == 3 {
                             let col = key + $n * 8 + (lane & 3) * 2;
-                            if col
-                                >= if MODE == 1 {
-                                    end
-                                } else if MODE == 2 {
-                                    prefix.max(diagonal + r0 + 1).min(end)
-                                } else {
-                                    (diagonal + r0 + 1).min(end)
-                                }
-                            {
+                            if col >= upper(r0) {
                                 scores[$n][0] = f32::NEG_INFINITY;
                             }
-                            if col + 1
-                                >= if MODE == 1 {
-                                    end
-                                } else if MODE == 2 {
-                                    prefix.max(diagonal + r0 + 1).min(end)
-                                } else {
-                                    (diagonal + r0 + 1).min(end)
-                                }
-                            {
+                            if col + 1 >= upper(r0) {
                                 scores[$n][1] = f32::NEG_INFINITY;
                             }
-                            if col
-                                >= if MODE == 1 {
-                                    end
-                                } else if MODE == 2 {
-                                    prefix.max(diagonal + r1 + 1).min(end)
-                                } else {
-                                    (diagonal + r1 + 1).min(end)
-                                }
-                            {
+                            if col >= upper(r1) {
                                 scores[$n][2] = f32::NEG_INFINITY;
                             }
-                            if col + 1
-                                >= if MODE == 1 {
-                                    end
-                                } else if MODE == 2 {
-                                    prefix.max(diagonal + r1 + 1).min(end)
-                                } else {
-                                    (diagonal + r1 + 1).min(end)
-                                }
-                            {
+                            if col + 1 >= upper(r1) {
                                 scores[$n][3] = f32::NEG_INFINITY;
                             }
                         }
-                        if MODE == 3 {
+                        if MODE == 3 || MODE == 6 {
                             let col = key + $n * 8 + (lane & 3) * 2;
                             let lo0 = (diagonal + r0).saturating_sub(prefix);
                             let lo1 = (diagonal + r1).saturating_sub(prefix);
@@ -825,7 +833,21 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
 pub unsafe extern "ptx-kernel" fn attention_prefill_d512(p: Attention, scale: f32) {
     unsafe {
         let p = resolve_position(p);
-        attention_d512::<false>(p, scale, core::ptr::null_mut(), 1, 0)
+        attention_d512::<false, false>(p, 0, scale, core::ptr::null_mut(), 1, 0)
+    }
+}
+
+/// # Safety
+/// All keys below `keys` are populated in this sequence; launch uses 128 threads and 90112 shared bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_prefill_d512_bidirectional(
+    p: Attention,
+    keys: u32,
+    scale: f32,
+) {
+    unsafe {
+        let p = resolve_position(p);
+        attention_d512::<false, true>(p, keys, scale, core::ptr::null_mut(), 1, 0)
     }
 }
 
@@ -841,13 +863,14 @@ pub unsafe extern "ptx-kernel" fn attention_partial_d512(
 ) {
     unsafe {
         let p = resolve_position(p);
-        attention_d512::<true>(p, scale, partials, parts, chunk)
+        attention_d512::<true, false>(p, 0, scale, partials, parts, chunk)
     }
 }
 
 #[inline(always)]
-unsafe fn attention_d512<const SPLIT: bool>(
+unsafe fn attention_d512<const SPLIT: bool, const BIDI: bool>(
     p: Attention,
+    keys: u32,
     scale: f32,
     partials: *mut f32,
     parts: u32,
@@ -860,13 +883,17 @@ unsafe fn attention_d512<const SPLIT: bool>(
         let lane = tid & 31;
         let warp = tid >> 5;
         let qstart = tile * 16;
-        let end = p.start + p.rows;
+        // BIDI: every query row sees all keys below the explicit extent.
+        let end = if BIDI { keys } else { p.start + p.rows };
         let part: u32;
         asm!("mov.u32 {p}, %ctaid.z;", p=out(reg32) part);
         let begin = if SPLIT { part * chunk } else { 0 };
-        let stop = end
-            .min(p.start + qstart + 16)
-            .min(if SPLIT { begin + chunk } else { end });
+        let stop = (if BIDI {
+            end
+        } else {
+            end.min(p.start + qstart + 16)
+        })
+        .min(if SPLIT { begin + chunk } else { end });
         let sk = sm + 16384;
         let sv = sm + 49152;
         let partial = sm + 81920;
@@ -971,7 +998,12 @@ unsafe fn attention_d512<const SPLIT: bool>(
                         let c = f32::from_bits(load_shared(addr + 4096));
                         let d = f32::from_bits(load_shared(addr + 6144));
                         scores[$i][j] = ((a + b) + c) + d;
-                        if key + col + (j as u32 & 1) >= (p.start + qstart + row + 1).min(end) {
+                        let bound = if BIDI {
+                            end
+                        } else {
+                            (p.start + qstart + row + 1).min(end)
+                        };
+                        if key + col + (j as u32 & 1) >= bound {
                             scores[$i][j] = f32::NEG_INFINITY;
                         }
                     }
