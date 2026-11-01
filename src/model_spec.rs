@@ -2214,6 +2214,10 @@ impl ModelSpec {
         let hidden = positive(t, "hidden_size")?;
         let base = positive(t, "intermediate_size")?;
         let depth = positive(t, "num_hidden_layers")?;
+        ensure!(
+            matches!((hidden, depth), (1536, 35) | (2560, 42)),
+            "unsupported Gemma 4 geometry hidden_size={hidden}, num_hidden_layers={depth}; enabled geometries are E2B and E4B"
+        );
         let shared = integer(t, "num_kv_shared_layers")?;
         ensure!(
             shared < depth,
