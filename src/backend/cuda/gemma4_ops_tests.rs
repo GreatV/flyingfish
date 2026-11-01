@@ -3138,6 +3138,20 @@ struct LargeMediaInput {
 #[cfg(feature = "cuda")]
 impl LargeMediaInput {
     fn read(path: &std::path::Path, cell: &serde_json::Value) -> Result<Self> {
+        Self::read_with_frame_width(path, cell, 640)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn read_embedding(path: &std::path::Path, cell: &serde_json::Value) -> Result<Self> {
+        Self::read_with_frame_width(path, cell, 128)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn read_with_frame_width(
+        path: &std::path::Path,
+        cell: &serde_json::Value,
+        frame_width: usize,
+    ) -> Result<Self> {
         let bytes = std::fs::read(path)?;
         let data = SafeTensors::deserialize(&bytes)?;
         let floats = |name: &str| -> Result<Vec<f32>> {
@@ -3176,12 +3190,12 @@ impl LargeMediaInput {
             );
             let frames = mask.shape()[1];
             ensure!(
-                values.len() == clips * frames * 640,
-                "raw audio samples extent"
+                values.len() == clips * frames * frame_width,
+                "audio samples extent"
             );
             for clip in 0..clips {
                 audio.push((
-                    values[clip * frames * 640..(clip + 1) * frames * 640].to_vec(),
+                    values[clip * frames * frame_width..(clip + 1) * frames * frame_width].to_vec(),
                     mask.data()[clip * frames..(clip + 1) * frames]
                         .iter()
                         .map(|v| *v != 0)
@@ -4460,9 +4474,9 @@ fn embedding_vector_distance(
 
 #[test]
 #[ignore = "requires EmbeddingGemma-2 media fixtures, frozen thresholds and a GPU window"]
-fn embedding_gemma2_vision_matches_frozen_reference() -> Result<()> {
+fn embedding_gemma2_media_matches_frozen_reference() -> Result<()> {
     #[cfg(not(feature = "cuda"))]
-    anyhow::bail!("EmbeddingGemma-2 vision gate requires CUDA");
+    anyhow::bail!("EmbeddingGemma-2 media gate requires CUDA");
     #[cfg(feature = "cuda")]
     {
         let dir = std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL")?);
@@ -4485,18 +4499,29 @@ fn embedding_gemma2_vision_matches_frozen_reference() -> Result<()> {
                 std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR")?,
             )),
         };
-        let pair = LargeMediaInput::read(
+        let images = LargeMediaInput::read_embedding(
             &fixtures.join("inputs/image_pair.safetensors"),
             &metadata["image_pair"],
         )?;
-        let clips = pair.clips();
+        let audio = LargeMediaInput::read_embedding(
+            &fixtures.join("inputs/audio_pair.safetensors"),
+            &metadata["audio_pair"],
+        )?;
+        let reservation = LargeMediaInput {
+            ids: [images.ids.clone(), audio.ids.clone()].concat(),
+            modalities: [images.modalities.clone(), audio.modalities.clone()].concat(),
+            pixels: images.pixels.clone(),
+            grids: images.grids.clone(),
+            audio: audio.audio.clone(),
+        };
+        let clips = reservation.clips();
         let mut engine = super::engine::Engine::load_multimodal(
             &dir,
             0,
             1024,
             Some(1024),
             settings,
-            &pair.input(pair.ids.len(), &clips),
+            &reservation.input(reservation.ids.len(), &clips),
         )?;
         let spec = crate::model_spec::ModelSpec::read(&dir)?;
         let last_vision_layer = spec
@@ -4508,8 +4533,16 @@ fn embedding_gemma2_vision_matches_frozen_reference() -> Result<()> {
             .context("empty vision tower")?;
         let mut defects = 0usize;
         let mut vectors = BTreeMap::new();
-        for name in ["street", "winter", "image_pair"] {
-            let input = LargeMediaInput::read(
+        for name in [
+            "street",
+            "winter",
+            "image_pair",
+            "stew",
+            "wizard",
+            "audio_pair",
+            "mixed",
+        ] {
+            let input = LargeMediaInput::read_embedding(
                 &fixtures.join("inputs").join(format!("{name}.safetensors")),
                 &metadata[name],
             )?;
@@ -4523,8 +4556,9 @@ fn embedding_gemma2_vision_matches_frozen_reference() -> Result<()> {
             let vector = engine.embed(&packed, &mask, Some(&mut trace))?;
             let after = engine.gemma_encoder_calls()?;
             ensure!(
-                after.0 == before.0 + 1 && after.1 == before.1,
-                "vision encoder call count"
+                after.0 == before.0 + usize::from(!input.grids.is_empty())
+                    && after.1 == before.1 + input.audio.len(),
+                "media encoder call count"
             );
             let bounds = &frozen["cells"][name];
             let expected_vector = oracle["vector"].1.as_f32();
@@ -4547,13 +4581,12 @@ fn embedding_gemma2_vision_matches_frozen_reference() -> Result<()> {
                 ("layer23", "23.debug.layer_out".to_owned()),
                 ("norm", "layer.norm".to_owned()),
                 ("projected", "layer.projected".to_owned()),
-                ("features", "media_features".to_owned()),
             ] {
                 let actual = trace.values(&trace_name)?;
                 let pass = vision_distance(&actual, &oracle[stage].1.as_f32(), &bounds[stage])?;
                 defects += usize::from(!pass);
                 println!(
-                    "{} embedding_vision {name} {stage}",
+                    "{} embedding_media {name} {stage}",
                     if pass { "PASS" } else { "DEFECT" }
                 );
             }
@@ -4587,16 +4620,46 @@ fn embedding_gemma2_vision_matches_frozen_reference() -> Result<()> {
                 &oracle["pooled"].1.as_f32(),
                 &bounds["pooled"],
             )?);
-            let mut tower = Vec::new();
-            for image in 0..input.grids.len() {
-                tower.extend(trace.values(&format!("image.{image}.layer.{last_vision_layer}"))?);
+            if !input.grids.is_empty() {
+                let mut tower = Vec::new();
+                for image in 0..input.grids.len() {
+                    tower
+                        .extend(trace.values(&format!("image.{image}.layer.{last_vision_layer}"))?);
+                }
+                let pass = vision_distance(&tower, &oracle["tower"].1.as_f32(), &bounds["tower"])?;
+                defects += usize::from(!pass);
+                if input.audio.is_empty() {
+                    let pass = vision_distance(
+                        &trace.values("media_features")?,
+                        &oracle["features"].1.as_f32(),
+                        &bounds["features"],
+                    )?;
+                    defects += usize::from(!pass);
+                }
             }
-            let pass = vision_distance(&tower, &oracle["tower"].1.as_f32(), &bounds["tower"])?;
-            defects += usize::from(!pass);
-            println!(
-                "{} embedding_vision {name} tower",
-                if pass { "PASS" } else { "DEFECT" }
-            );
+            if !input.audio.is_empty() {
+                let (mut tower, mut features) = (Vec::new(), Vec::new());
+                for clip in 0..input.audio.len() {
+                    tower.extend(trace.values(&format!("audio.{clip}.tower"))?);
+                    features.extend(trace.values(&format!("audio.{clip}.features"))?);
+                }
+                for (stage, actual) in [("audio_tower", tower), ("audio_features", features)] {
+                    let pass = vision_distance(&actual, &oracle[stage].1.as_f32(), &bounds[stage])?;
+                    defects += usize::from(!pass);
+                    println!(
+                        "{} embedding_media {name} {stage}",
+                        if pass { "PASS" } else { "DEFECT" }
+                    );
+                }
+                if input.grids.is_empty() {
+                    let pass = vision_distance(
+                        &trace.values("media_features")?,
+                        &oracle["audio_features"].1.as_f32(),
+                        &bounds["audio_features"],
+                    )?;
+                    defects += usize::from(!pass);
+                }
+            }
             if name == "image_pair" {
                 let halfway = input.pixels.len() / 2;
                 let mut pixels = input.pixels.clone();
@@ -4614,7 +4677,26 @@ fn embedding_gemma2_vision_matches_frozen_reference() -> Result<()> {
                     engine.embed(&negative.input(negative.ids.len(), &clips), &mask, None)?;
                 ensure!(
                     negative != vector,
-                    "two-media native negative control did not change output"
+                    "two-image native control did not change output"
+                );
+            }
+            if name == "audio_pair" {
+                let mut negative_audio = input.audio.clone();
+                let first_clip = negative_audio[0].0.clone();
+                negative_audio[1].0 = first_clip;
+                let negative = LargeMediaInput {
+                    ids: input.ids.clone(),
+                    modalities: input.modalities.clone(),
+                    pixels: Vec::new(),
+                    grids: Vec::new(),
+                    audio: negative_audio,
+                };
+                let clips = negative.clips();
+                let negative =
+                    engine.embed(&negative.input(negative.ids.len(), &clips), &mask, None)?;
+                ensure!(
+                    negative != vector,
+                    "two-audio native control did not change output"
                 );
             }
             vectors.insert(name, vector);
@@ -4622,8 +4704,9 @@ fn embedding_gemma2_vision_matches_frozen_reference() -> Result<()> {
         ensure!(
             vectors["street"] != vectors["winter"] && vectors["street"] != vectors["image_pair"]
         );
-        ensure!(defects == 0, "EmbeddingGemma-2 vision defects={defects}");
-        println!("EMBEDDING_GEMMA2_VISION PASS cells=3 defects=0");
+        ensure!(vectors["stew"] != vectors["wizard"] && vectors["wizard"] != vectors["audio_pair"]);
+        ensure!(defects == 0, "EmbeddingGemma-2 media defects={defects}");
+        println!("EMBEDDING_GEMMA2_MEDIA PASS cells=7 defects=0");
         Ok(())
     }
 }

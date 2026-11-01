@@ -508,7 +508,11 @@ impl MappedCheckpoint {
         };
         let h = a.hidden as usize;
         let mut add = |name, shape| put(expected, name, Dtype::BF16, shape, TensorScope::Audio);
-        let p = "model.audio_tower";
+        let p = if spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
+            "audio_tower"
+        } else {
+            "model.audio_tower"
+        };
         let [c0, c1] = a.subsample_channels.map(|n| n as usize);
         for (i, input, output) in [(0, 1, c0), (1, c0, c1)] {
             add(
@@ -530,7 +534,11 @@ impl MappedCheckpoint {
         );
         add(format!("{p}.output_proj.bias"), vec![a.output as usize]);
         add(
-            "model.embed_audio.embedding_projection.weight".into(),
+            if spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
+                "embed_audio.embedding_projection.weight".into()
+            } else {
+                "model.embed_audio.embedding_projection.weight".into()
+            },
             vec![spec.hidden as usize, a.output as usize],
         );
         for layer in 0..a.layers {

@@ -2,6 +2,7 @@
 import argparse
 import json
 from pathlib import Path
+import subprocess
 
 import torch
 import transformers
@@ -12,7 +13,8 @@ from sentence_transformers.sentence_transformer.modules.pooling import Pooling
 
 CASES = ("short", "batch", "radius", "radius_batch", "semantic")
 VISION_CASES = ("street", "winter", "image_pair")
-ALL_CASES = CASES + VISION_CASES
+AUDIO_CASES = ("stew", "wizard", "audio_pair", "mixed")
+ALL_CASES = CASES + VISION_CASES + AUDIO_CASES
 STAGES = ("embedding", "ple", "layer0", "layer5", "layer17", "layer23", "norm", "projected")
 
 
@@ -101,9 +103,10 @@ def prepare_inputs(args):
         metadata[name] = {"rows": len(rows), "tokens": width, "valid": [len(row) for row in rows]}
     if args.images:
         prepare_vision_inputs(args, metadata)
-    else:
-        write_json(args.out / "INPUT.json", metadata)
-    print(f"PASS embedding_text_inputs cells={len(raw)} vision={len(VISION_CASES) if args.images else 0}", flush=True)
+    if args.audio:
+        prepare_audio_inputs(args, metadata)
+    write_json(args.out / "INPUT.json", metadata)
+    print(f"PASS embedding_text_inputs cells={len(raw)} vision={len(VISION_CASES) if args.images else 0} audio={len(AUDIO_CASES) if args.audio else 0}", flush=True)
 
 
 def prepare_vision_inputs(args, metadata):
@@ -150,8 +153,72 @@ def prepare_vision_inputs(args, metadata):
             "grids": grids,
             "prompt": prompt,
         }
-    write_json(args.out / "INPUT.json", metadata)
     print(f"PASS embedding_vision_inputs cells={len(cases)}", flush=True)
+
+
+def prepare_audio_inputs(args, metadata):
+    from PIL import Image
+
+    processor = transformers.AutoProcessor.from_pretrained(args.model, local_files_only=True)
+    require(args.images and len(args.audio) == 2, "mixed media requires two images and two clips")
+    waves = []
+    for path in args.audio:
+        pcm = subprocess.run(
+            ["ffmpeg", "-v", "error", "-i", str(path), "-f", "f32le", "-acodec", "pcm_f32le",
+             "-ac", "1", "-ar", "16000", "-"],
+            check=True, capture_output=True,
+        ).stdout
+        waves.append(torch.frombuffer(bytearray(pcm), dtype=torch.float32).numpy().copy())
+    require(waves[0].shape != waves[1].shape or (waves[0] != waves[1]).any(), "audio controls are identical")
+    image = Image.open(args.images[0]).convert("RGB").resize((768, 768), Image.Resampling.BICUBIC)
+    audio_token = processor.audio_token
+    cases = [
+        ("stew", [], [waves[0]], audio_token + " Transcription:"),
+        ("wizard", [], [waves[1]], audio_token + " Transcription:"),
+        ("audio_pair", [], waves, audio_token + " First clip. " + audio_token + " Transcribe."),
+        ("mixed", [image], [waves[1]], audio_token + " Sound. " + processor.image_token + " Describe both."),
+    ]
+    image_id = processor.tokenizer.convert_tokens_to_ids(processor.image_token)
+    audio_id = processor.tokenizer.convert_tokens_to_ids(audio_token)
+    require(image_id == 258880 and audio_id == 258881, "published media placeholder identities changed")
+    for name, pictures, clips, prompt in cases:
+        arguments = dict(text=prompt, return_tensors="pt", audio=clips, sampling_rate=16000)
+        if pictures:
+            arguments["images"] = pictures
+        batch = processor(**arguments)
+        modalities = torch.zeros_like(batch.input_ids, dtype=torch.uint8)
+        modalities[batch.input_ids == image_id] = 1
+        modalities[batch.input_ids == audio_id] = 3
+        values = {
+            "ids": batch.input_ids.int(),
+            "mask": torch.ones(batch.input_ids.shape, dtype=torch.bool),
+            "modalities": modalities,
+            "audio": batch.input_features.float(),
+            "audio_mask": batch.input_features_mask.bool(),
+        }
+        grids = []
+        if pictures:
+            masks = (batch.image_position_ids >= 0).all(-1)
+            values.update(
+                pixels=batch.pixel_values[masks].float(),
+                positions=batch.image_position_ids[masks].int(),
+                padded_pixels=batch.pixel_values.float(),
+                padded_positions=batch.image_position_ids.int(),
+            )
+            for coordinates, mask in zip(batch.image_position_ids, masks):
+                x, y = (coordinates[mask].amax(0) + 1).tolist()
+                grids.append([1, y, x])
+        save_tensors(args.out / f"{name}.safetensors", values)
+        metadata[name] = {
+            "rows": 1,
+            "tokens": batch.input_ids.shape[1],
+            "valid": [batch.input_ids.shape[1]],
+            "image_count": len(pictures),
+            "audio_clips": len(clips),
+            "grids": grids,
+            "prompt": prompt,
+        }
+    print(f"PASS embedding_audio_inputs cells={len(cases)}", flush=True)
 
 
 def load_model(args, device):
@@ -199,7 +266,7 @@ def load_model(args, device):
 def capture_modules(model):
     language = model.language_model
     stages = {}
-    calls = {"vision": 0, "last_vision": 0}
+    calls = {"vision": 0, "last_vision": 0, "audio": 0, "last_audio": 0}
 
     def put(name, output):
         if hasattr(output, "last_hidden_state"):
@@ -215,6 +282,13 @@ def capture_modules(model):
         calls["vision"] += 1
         put("tower", output)
 
+    def audio_called(module, inputs, output):
+        calls["audio"] += 1
+        if hasattr(output, "attention_mask"):
+            put("audio_tower", output.last_hidden_state[output.attention_mask])
+        else:
+            put("audio_tower", output)
+
     hooks = [
         language.embed_tokens.register_forward_hook(lambda module, inputs, output: put("embedding", output)),
         language.ple.register_forward_hook(lambda module, inputs, output: put("ple", output)),
@@ -223,6 +297,7 @@ def capture_modules(model):
         language.register_forward_pre_hook(spliced, with_kwargs=True),
         model.vision_tower.register_forward_hook(vision_called),
         model.embed_vision.register_forward_hook(lambda module, inputs, output: put("features", output)),
+        model.audio_tower.register_forward_hook(audio_called),
     ]
     for index in (0, 5, 17, 23):
         hooks.append(language.layers[index].register_forward_hook(
@@ -234,6 +309,7 @@ def capture_modules(model):
 def run_case(model, pooling, normalize, data, stages, calls, device, variant="packed"):
     stages.clear()
     calls["vision"] = 0
+    calls["audio"] = 0
     ids = data["ids"].long().to(device)
     mask = data["mask"].to(device)
     arguments = {"input_ids": ids, "attention_mask": mask}
@@ -246,6 +322,12 @@ def run_case(model, pooling, normalize, data, stages, calls, device, variant="pa
             require(variant == "padded", "unknown vision variant")
             pixels, positions = data["padded_pixels"], data["padded_positions"]
         arguments.update(pixel_values=pixels.to(device), image_position_ids=positions.long().to(device))
+    if "audio" in data:
+        samples, audio_mask = data["audio"], data["audio_mask"]
+        if variant == "padded":
+            samples = torch.nn.functional.pad(samples, (0, 0, 0, 7))
+            audio_mask = torch.nn.functional.pad(audio_mask, (0, 7))
+        arguments.update(input_features=samples.to(device), input_features_mask=audio_mask.to(device))
     with torch.inference_mode():
         output = model(**arguments)
         projected = output.last_hidden_state
@@ -255,6 +337,12 @@ def run_case(model, pooling, normalize, data, stages, calls, device, variant="pa
     expected_calls = int("pixels" in data)
     require(calls["vision"] == expected_calls, f"vision encoder calls {calls['vision']} != {expected_calls}")
     calls["last_vision"] = calls["vision"]
+    expected_audio = int("audio" in data)
+    require(calls["audio"] == expected_audio, f"audio encoder calls {calls['audio']} != {expected_audio}")
+    calls["last_audio"] = calls["audio"]
+    if "audio" in data:
+        require(output.audio_hidden_states is not None, "audio features did not reach the model")
+        stages["audio_features"] = output.audio_hidden_states.detach().float().cpu().contiguous()
     result = dict(stages)
     result.update(pooled=pooled.float().cpu(), vector=vector.float().cpu())
     require(set(STAGES) <= set(result), "missing reference text stage")
@@ -262,6 +350,8 @@ def run_case(model, pooling, normalize, data, stages, calls, device, variant="pa
     if "pixels" in data:
         require({"tower", "features", "spliced"} <= set(result), "missing reference vision stage")
         require(output.image_hidden_states is not None, "image features did not reach the model")
+    if "audio" in data:
+        require({"audio_tower", "audio_features", "spliced"} <= set(result), "missing reference audio stage")
     for value in result.values():
         require(bool(torch.isfinite(value).all()), "nonfinite reference output")
     norms = vector.float().norm(dim=-1)
@@ -331,13 +421,14 @@ def record(args):
             "repeat": repeat_distances,
             "unit_norm_max": float((result["vector"].norm(dim=-1) - 1).abs().max()),
             "vision_encoder_calls": calls["last_vision"],
+            "audio_encoder_calls": calls["last_audio"],
         }
         if data["ids"].shape[0] > 1:
             split = split_rows(model, pooling, normalize, data, stages, calls, device)
             valid = flatten_valid(result, data["mask"].sum(1).tolist())
             saved.update(prefixed(split, "split."))
             case_report["batch_split"] = {key: distances(split[key], valid[key]) for key in result}
-        if name in VISION_CASES:
+        if name in VISION_CASES or name in AUDIO_CASES:
             padded_vision = run_case(model, pooling, normalize, data, stages, calls, device, variant="padded")
             saved.update(prefixed(padded_vision, "padded."))
             case_report["padded"] = {key: distances(padded_vision[key], result[key]) for key in result}
@@ -352,6 +443,14 @@ def record(args):
             difference = float((negative["vector"] - result["vector"]).abs().max())
             require(difference > 0, "two-media negative control did not change the embedding")
             reports["controls"]["two_media"] = {"duplicate_second_image_vector_max": difference}
+        if name == "audio_pair":
+            changed = dict(data)
+            changed["audio"] = data["audio"].clone()
+            changed["audio"][1] = changed["audio"][0]
+            negative = run_case(model, pooling, normalize, changed, stages, calls, device)
+            difference = float((negative["vector"] - result["vector"]).abs().max())
+            require(difference > 0, "two-audio negative control did not change the embedding")
+            reports["controls"]["two_audio"] = {"duplicate_second_clip_vector_max": difference}
         if name == "radius":
             changed = dict(data)
             changed["ids"] = data["ids"].clone()
@@ -399,6 +498,19 @@ def record(args):
         "street_winter": float(torch.nn.functional.cosine_similarity(street.double(), winter.double(), dim=0)),
         "street_pair": float(torch.nn.functional.cosine_similarity(street.double(), pair.double(), dim=0)),
         "winter_pair": float(torch.nn.functional.cosine_similarity(winter.double(), pair.double(), dim=0)),
+    }
+    stew = load_file(args.out / "stew.safetensors")["vector"][0]
+    wizard = load_file(args.out / "wizard.safetensors")["vector"][0]
+    audio_pair = load_file(args.out / "audio_pair.safetensors")["vector"][0]
+    mixed = load_file(args.out / "mixed.safetensors")["vector"][0]
+    require(not torch.equal(stew, wizard) and not torch.equal(stew, audio_pair)
+            and not torch.equal(wizard, audio_pair) and not torch.equal(wizard, mixed),
+            "audio outputs are byte-identical")
+    reports["controls"]["audio_similarity"] = {
+        "stew_wizard": float(torch.nn.functional.cosine_similarity(stew.double(), wizard.double(), dim=0)),
+        "stew_pair": float(torch.nn.functional.cosine_similarity(stew.double(), audio_pair.double(), dim=0)),
+        "wizard_pair": float(torch.nn.functional.cosine_similarity(wizard.double(), audio_pair.double(), dim=0)),
+        "wizard_mixed": float(torch.nn.functional.cosine_similarity(wizard.double(), mixed.double(), dim=0)),
     }
     write_json(args.out / "REPORT.json", reports)
     print(f"PASS embedding_reference cells={len(ALL_CASES)} dtype={args.dtype} reduction={args.bf16_reduction}", flush=True)
@@ -475,6 +587,7 @@ def main():
     parser.add_argument("--ordinal", type=int, default=0)
     parser.add_argument("--arms", type=Path, nargs=6)
     parser.add_argument("--images", type=Path, nargs=2)
+    parser.add_argument("--audio", type=Path, nargs=2)
     args = parser.parse_args()
     if args.mode == "inputs":
         prepare_inputs(args)

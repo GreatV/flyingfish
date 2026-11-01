@@ -2505,7 +2505,7 @@ impl ModelSpec {
             logit_softcap: None,
             per_layer_input: Some(512),
             vision: VisionConfig::from_root(root)?,
-            audio: None,
+            audio: AudioConfig::from_root(root)?,
         })
     }
     pub fn glm5_next(root: &Value, generation: &Value) -> Result<Self> {
