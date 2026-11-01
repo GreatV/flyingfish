@@ -2814,6 +2814,8 @@ impl AxialTower {
                         .arg(&image.grid.w)
                         .arg(&h)
                         .arg(&vision.position_side)
+                        .arg(&(vision.position_side as u64 * h as u64))
+                        .arg(&(h as u64))
                         .launch(flat(rows as usize * h as usize))?;
                 }
                 record(

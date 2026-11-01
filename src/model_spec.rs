@@ -369,10 +369,18 @@ impl AudioConfig {
         ] {
             equal(a, key, value)?;
         }
-        ensure!(
-            root["eoa_token_id"] == root["eoa_token_index"],
-            "audio end token mismatch"
-        );
+        let embedding = root.get("model_type").and_then(Value::as_str) == Some("embedding_gemma2");
+        if embedding {
+            ensure!(
+                root.get("eoa_token_id").is_none(),
+                "unexpected audio end token alias"
+            );
+        } else {
+            ensure!(
+                root["eoa_token_id"] == root["eoa_token_index"],
+                "audio end token mismatch"
+            );
+        }
         let spec = Self {
             hidden: 1024,
             layers: 12,
@@ -390,7 +398,11 @@ impl AudioConfig {
             residual_weight: 0.5,
             token: positive(root, "audio_token_id")?,
             start_token: positive(root, "boa_token_id")?,
-            end_token: positive(root, "eoa_token_id")?,
+            end_token: if embedding {
+                positive(root, "eoa_token_index")?
+            } else {
+                positive(root, "eoa_token_id")?
+            },
         };
         ensure!(
             spec.token == 258881 && spec.start_token == 256000 && spec.end_token == 258883,

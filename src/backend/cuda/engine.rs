@@ -1523,6 +1523,9 @@ impl Engine {
 
     fn declare_graphs(&mut self) -> Result<()> {
         self.graphs = 'plans: {
+            if self.model_spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
+                break 'plans Vec::new();
+            }
             if self.spec.as_ref().is_some_and(|spec| !spec.graph) {
                 break 'plans Vec::new();
             }
@@ -2454,7 +2457,8 @@ impl Engine {
                 | Architecture::MiniCpmV47
                 | Architecture::Flint
                 | Architecture::Glm5Next
-                | Architecture::Gemma4,
+                | Architecture::Gemma4
+                | Architecture::EmbeddingGemma2,
                 _,
             ) => self.qwen_mixer(layer, step, trace),
             (Architecture::Llama, Mixer::FullAttention) => {
@@ -2892,16 +2896,28 @@ impl Engine {
 
     fn finish_embedding(&mut self, rows: usize, finalize: bool) -> Result<()> {
         let (weight, pool, normalize) = self.embedding_projection()?;
+        let linear_rows = self
+            .qwen
+            .as_ref()
+            .context("Gemma runtime missing")?
+            .linear_rows(rows as u32, crate::op_contract::ExecutionPhase::Prefill)?
+            as usize;
         let w = &mut self.work;
         self.blas.linear_typed(
             crate::op_contract::ExecutionPhase::Prefill,
             super::linear::LinearWeightRef::Bf16(weight),
-            qwen::matrix(&w.n, &self.device.stream, 0, rows, self.config.hidden_size)?,
+            qwen::matrix(
+                &w.n,
+                &self.device.stream,
+                0,
+                linear_rows,
+                self.config.hidden_size,
+            )?,
             &mut super::contracts::TensorMut(qwen::matrix(
                 &w.gu,
                 &self.device.stream,
                 0,
-                rows,
+                linear_rows,
                 768,
             )?),
         )?;
@@ -2919,14 +2935,14 @@ impl Engine {
                 .arg(&(rows as i32))
                 .arg(&768i32)
                 .arg(&true)
-                .launch(super::ops::flat(1))?;
+                .launch(super::ops::grid(1, 128))?;
             if finalize {
                 self.device
                     .stream
                     .launch_builder(&normalize)
                     .arg(w.embedding.as_mut().context("embedding output missing")?)
                     .arg(&768i32)
-                    .launch(super::ops::flat(1))?;
+                    .launch(super::ops::grid(1, 128))?;
             }
         }
         Ok(())
@@ -2993,7 +3009,6 @@ impl Engine {
         if media {
             self.prefill_multimodal(&packed, trace)?;
         } else {
-            packed.validate(&self.model_spec, self.capacity)?;
             self.prefill_inner(ids, trace, ids.len())?;
         }
         let output = self.device.stream.clone_dtoh(
@@ -3689,6 +3704,9 @@ impl Engine {
                 1,
                 self.workspace_rows as u32,
             )?;
+        }
+        if self.model_spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
+            return Ok(0);
         }
         let pending_next_token = self.token()?;
         self.pending_token = Some(pending_next_token);

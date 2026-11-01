@@ -3106,11 +3106,16 @@ fn native_path(
 }
 
 fn vision_distance(actual: &[f32], expected: &[f32], bounds: &serde_json::Value) -> Result<bool> {
+    let nonfinite = actual
+        .iter()
+        .chain(expected)
+        .filter(|value| !value.is_finite())
+        .count();
     ensure!(
-        actual.len() == expected.len()
-            && !actual.is_empty()
-            && actual.iter().chain(expected).all(|v| v.is_finite()),
-        "Runner FAIL vision comparison extent or finiteness"
+        actual.len() == expected.len() && !actual.is_empty() && nonfinite == 0,
+        "Runner FAIL vision comparison extent actual={} expected={} nonfinite={nonfinite}",
+        actual.len(),
+        expected.len()
     );
     let mut maximum = 0.0f64;
     let mut squared = 0.0f64;
@@ -4523,14 +4528,6 @@ fn embedding_gemma2_media_matches_frozen_reference() -> Result<()> {
             settings,
             &reservation.input(reservation.ids.len(), &clips),
         )?;
-        let spec = crate::model_spec::ModelSpec::read(&dir)?;
-        let last_vision_layer = spec
-            .vision
-            .as_ref()
-            .context("EmbeddingGemma-2 vision missing")?
-            .depth
-            .checked_sub(1)
-            .context("empty vision tower")?;
         let mut defects = 0usize;
         let mut vectors = BTreeMap::new();
         for name in [
@@ -4574,11 +4571,11 @@ fn embedding_gemma2_media_matches_frozen_reference() -> Result<()> {
                 .sqrt();
             ensure!((norm - 1.0).abs() <= frozen["unit_norm_limit"].as_f64().unwrap());
             for (stage, trace_name) in [
-                ("spliced", "embed".to_owned()),
-                ("layer0", "0.debug.layer_out".to_owned()),
-                ("layer5", "5.debug.layer_out".to_owned()),
-                ("layer17", "17.debug.layer_out".to_owned()),
-                ("layer23", "23.debug.layer_out".to_owned()),
+                ("spliced", "layer.embed".to_owned()),
+                ("layer0", "layer.0.debug.layer_out".to_owned()),
+                ("layer5", "layer.5.debug.layer_out".to_owned()),
+                ("layer17", "layer.17.debug.layer_out".to_owned()),
+                ("layer23", "layer.23.debug.layer_out".to_owned()),
                 ("norm", "layer.norm".to_owned()),
                 ("projected", "layer.projected".to_owned()),
             ] {
@@ -4602,11 +4599,17 @@ fn embedding_gemma2_media_matches_frozen_reference() -> Result<()> {
                     expected_ple[to..to + 512].copy_from_slice(&source[from..from + 512]);
                 }
             }
-            let pass = vision_distance(
-                &trace.values("0.debug.ple_identity")?,
-                &expected_ple,
-                &bounds["ple"],
-            )?;
+            let bound_ple = trace.values("layer.0.debug.ple_identity")?;
+            let bound = bound_ple.len() / (24 * 512);
+            let mut actual_ple = vec![0.0; rows * 24 * 512];
+            for layer in 0..24 {
+                for token in 0..rows {
+                    let from = (layer * bound + token) * 512;
+                    let to = (layer * rows + token) * 512;
+                    actual_ple[to..to + 512].copy_from_slice(&bound_ple[from..from + 512]);
+                }
+            }
+            let pass = vision_distance(&actual_ple, &expected_ple, &bounds["ple"])?;
             defects += usize::from(!pass);
             let projected = trace.values("layer.projected")?;
             let mut pooled = vec![0.0f32; 768];
@@ -4623,8 +4626,7 @@ fn embedding_gemma2_media_matches_frozen_reference() -> Result<()> {
             if !input.grids.is_empty() {
                 let mut tower = Vec::new();
                 for image in 0..input.grids.len() {
-                    tower
-                        .extend(trace.values(&format!("image.{image}.layer.{last_vision_layer}"))?);
+                    tower.extend(trace.values(&format!("image.{image}.pool"))?);
                 }
                 let pass = vision_distance(&tower, &oracle["tower"].1.as_f32(), &bounds["tower"])?;
                 defects += usize::from(!pass);

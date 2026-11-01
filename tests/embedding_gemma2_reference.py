@@ -56,12 +56,14 @@ def distances(actual, expected):
     require(a.shape == b.shape, f"metric shape mismatch {a.shape} != {b.shape}")
     delta = a - b
     cosine = 0.0
-    if a.ndim == 1:
+    if a.shape[-1] == 768 and a.numel() % 768 == 0:
+        a = a.flatten()
+        b = b.flatten()
         cosine = 1.0 - float(torch.dot(a, b) / (a.norm() * b.norm()))
     return {
         "output_max": float(delta.abs().max()),
         "output_rmse": float(delta.square().mean().sqrt()),
-        **({"cosine_distance": cosine} if a.ndim == 1 else {}),
+        **({"cosine_distance": cosine} if a.shape[-1] == 768 and a.numel() % 768 == 0 else {}),
     }
 
 

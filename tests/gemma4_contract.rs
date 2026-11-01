@@ -210,6 +210,11 @@ fn embedding_gemma2_spec_and_manifest_match_published_shapes() -> Result<()> {
     ensure!(spec.hidden == 512 && spec.intermediate == 2048 && spec.q_width == 1024);
     ensure!(spec.per_layer_input == Some(512) && spec.logit_softcap.is_none());
     ensure!(spec.layers.len() == 24 && spec.vision.is_some());
+    let audio = spec.audio.as_ref().context("audio configuration missing")?;
+    ensure!(
+        [audio.token, audio.start_token, audio.end_token] == [258881, 256000, 258883]
+            && audio.output == 1536
+    );
     for (index, full) in [(0, false), (5, true), (11, true), (17, true), (23, true)] {
         let geometry = spec.layers[index].geometry.context("layer geometry")?;
         ensure!(geometry.head_dim == if full { 512 } else { 256 });
@@ -395,11 +400,11 @@ fn embedding_gemma2_text_matches_frozen_reference() -> Result<()> {
                 "native vector unit norm differs: {norm}"
             );
             for (stage, trace_name) in [
-                ("embedding", "embed".to_owned()),
-                ("layer0", "0.debug.layer_out".to_owned()),
-                ("layer5", "5.debug.layer_out".to_owned()),
-                ("layer17", "17.debug.layer_out".to_owned()),
-                ("layer23", "23.debug.layer_out".to_owned()),
+                ("embedding", "layer.embed".to_owned()),
+                ("layer0", "layer.0.debug.layer_out".to_owned()),
+                ("layer5", "layer.5.debug.layer_out".to_owned()),
+                ("layer17", "layer.17.debug.layer_out".to_owned()),
+                ("layer23", "layer.23.debug.layer_out".to_owned()),
                 ("norm", "layer.norm".to_owned()),
                 ("projected", "layer.projected".to_owned()),
             ] {
@@ -426,10 +431,21 @@ fn embedding_gemma2_text_matches_frozen_reference() -> Result<()> {
                     expected_ple[target..target + 512].copy_from_slice(&ple[source..source + 512]);
                 }
             }
+            let bound_ple = trace.values("layer.0.debug.ple_identity")?;
+            let bound = bound_ple.len() / (24 * 512);
+            let mut actual_ple = vec![0.0; valid * 24 * 512];
+            for layer in 0..24 {
+                for token in 0..valid {
+                    let source = (layer * bound + token) * 512;
+                    let target = (layer * valid + token) * 512;
+                    actual_ple[target..target + 512]
+                        .copy_from_slice(&bound_ple[source..source + 512]);
+                }
+            }
             defects += usize::from(!embedding_stage(
                 case,
                 "ple",
-                &trace.values("0.debug.ple_identity")?,
+                &actual_ple,
                 &expected_ple,
                 &frozen["cells"][case]["ple"],
             )?);

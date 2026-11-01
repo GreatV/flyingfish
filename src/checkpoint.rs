@@ -2181,7 +2181,12 @@ impl MappedCheckpoint {
 }
 
 /// Layer name prefixes of the published checkpoints.
-const LAYER_PREFIXES: [&str; 3] = ["model.layers.", "model.language_model.layers.", "layers."];
+const LAYER_PREFIXES: [&str; 4] = [
+    "model.layers.",
+    "model.language_model.layers.",
+    "language_model.layers.",
+    "layers.",
+];
 
 pub type ExpectedTensor = (Dtype, Vec<usize>, TensorScope);
 

@@ -51,7 +51,8 @@ fn debug_name(trace: &Option<Target<'_>>, layer: usize, point: &str) -> String {
 
 fn norm_mode(spec: &crate::model_spec::ModelSpec) -> RmsMode {
     match spec.architecture {
-        crate::model_spec::Architecture::Gemma4 => RmsMode::Unrounded,
+        crate::model_spec::Architecture::Gemma4
+        | crate::model_spec::Architecture::EmbeddingGemma2 => RmsMode::Unrounded,
         crate::model_spec::Architecture::Flint | crate::model_spec::Architecture::Glm5Next => {
             RmsMode::Standard
         }
@@ -2267,7 +2268,21 @@ impl Runtime {
         if let Some(ple) = self.gemma.as_ref().and_then(|ops| ops.ple.as_ref()) {
             blas.prepare_fixed(rows, ple.projection.shape[0], ple.projection.shape[1])?;
         }
-        blas.prepare_fixed(rows, vocab, hidden)?;
+        if let Some((weight, _)) = self
+            .gemma
+            .as_ref()
+            .and_then(|ops| ops.embedding_projection.as_ref())
+        {
+            blas.prepare_fixed(rows, weight.shape[0], weight.shape[1])?;
+        }
+        if self
+            .gemma
+            .as_ref()
+            .and_then(|ops| ops.embedding_projection.as_ref())
+            .is_none()
+        {
+            blas.prepare_fixed(rows, vocab, hidden)?;
+        }
         self.prepared.insert(rows);
         Ok(())
     }
@@ -2317,7 +2332,7 @@ impl Runtime {
         Ok(out)
     }
 
-    fn linear_rows(&self, rows: u32, phase: ExecutionPhase) -> Result<u32> {
+    pub(super) fn linear_rows(&self, rows: u32, phase: ExecutionPhase) -> Result<u32> {
         if phase == ExecutionPhase::Decode {
             return Ok(rows);
         }
@@ -2541,11 +2556,6 @@ impl Engine {
     pub(super) fn reset_qwen_positions(&mut self) -> Result<()> {
         if let Some(q) = self.qwen.as_mut() {
             q.image_blocks = None;
-            #[cfg(test)]
-            {
-                q.vision_encode_calls = 0;
-                q.audio_encode_calls = 0;
-            }
             let positions =
                 crate::vision_input::PositionPlan::text(1, self.capacity)?.packed_axes()?;
             self.device
@@ -3636,7 +3646,10 @@ impl Engine {
             flint_window_capture: None,
             qwen_device_prefix: false,
             forward_rows: (1..=rows.min(16)).collect(),
-            graphs: if expert_setup.is_some() || glm {
+            graphs: if expert_setup.is_some()
+                || glm
+                || model_spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2
+            {
                 Vec::new()
             } else {
                 vec![Graph::Decode]
@@ -6210,6 +6223,32 @@ impl Engine {
         trace: &mut Option<Target<'_>>,
     ) -> Result<()> {
         use crate::backend::Operator as O;
+        if matches!(op, O::Head)
+            && self.model_spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2
+        {
+            if let Some(t) = trace.as_mut() {
+                self.snapshot(
+                    t.trace,
+                    format!("{}.norm", t.prefix),
+                    &self.work.n,
+                    t.skip,
+                    step.rows,
+                    self.config.hidden_size,
+                )?;
+            }
+            self.finish_embedding(step.rows, step.head != crate::backend::Head::None)?;
+            if let Some(t) = trace.as_mut() {
+                self.snapshot(
+                    t.trace,
+                    format!("{}.projected", t.prefix),
+                    &self.work.gu,
+                    t.skip,
+                    step.rows,
+                    768,
+                )?;
+            }
+            return Ok(());
+        }
         let q = self.qwen.as_mut().context("Q38 runtime missing")?;
         let flint = self.model_spec.architecture == crate::model_spec::Architecture::Flint;
         let gemma = matches!(
