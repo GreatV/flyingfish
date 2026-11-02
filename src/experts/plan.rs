@@ -459,19 +459,19 @@ pub fn cohort_capacity(
     ensure!(slot > 0 && geometry.layers > 0, "empty cohort geometry");
     let available = device_bytes / slot;
     let complete = u64::from(geometry.layers) * u64::from(geometry.experts);
-    // Per-layer share first; a device too small for one slot per layer still
-    // executes with zero resident experts and only staging, so any nonzero
-    // availability admits (2026-11-02 4d ruling: a whole-tier host/disk plan
-    // is executable; only an empty device errors).
-    let staging = if available >= complete {
+    // Below one slot per layer the plan keeps zero resident experts and
+    // staging only; an empty device errors.
+    let share = if available >= complete {
         0
     } else if available / (u64::from(geometry.layers) + 1) > 0 {
-        (available / (u64::from(geometry.layers) + 1))
-            .min(u64::from(rows) * u64::from(geometry.top_k))
-            .min(u64::from(geometry.experts))
-            .min(u64::from(staging_slots_max))
+        available / (u64::from(geometry.layers) + 1)
     } else {
         available
+    };
+    let staging = if available >= complete {
+        0
+    } else {
+        share
             .min(u64::from(rows) * u64::from(geometry.top_k))
             .min(u64::from(geometry.experts))
             .min(u64::from(staging_slots_max))
@@ -527,9 +527,8 @@ fn native_staging_capacity(
             .min()
             .context("empty cohort layers")?;
         if fewest == 0 {
-            // Below one slot per layer the whole-tier host/disk plan runs
-            // with zero resident experts; leftover device slots stay unused
-            // (2026-11-02 4d ruling).
+            // Below one slot per layer the plan runs zero resident experts;
+            // leftover device slots stay unused.
             slots = 0;
             slots_per_layer = equal_slots(0, geometry.layers)?;
             live = 0;
@@ -1952,9 +1951,8 @@ mod tests {
             );
             assert_eq!(admission.hard_cap(slot)?, plan.spare_blocks);
         }
-        // 2026-11-02 4d ruling: a device below one slot per layer admits the
-        // whole-tier host/disk plan with zero resident experts; only an
-        // empty device errors.
+        // Below one slot per layer the whole-tier host/disk plan admits;
+        // an empty device errors.
         let (plan, _) = cohort_capacity(
             geometry,
             layout.clone(),

@@ -2378,7 +2378,7 @@ fn diffusion_trajectory_gpu() -> Result<()> {
 
         // Encoder pass over the prompt with the canvas init forced to the
         // recorded step-48 inputs: one teacher-forced denoise step.
-        // Localization taps (4d): encoder hidden taps at 00/05/17/29 and
+        // Encoder hidden taps at 00/05/17/29 and
         // Chunk-1 probe: 256 rows in one pass (no staging, no chunking);
         // divergence here means the plain layer program, not the chunk path.
         {
