@@ -286,6 +286,296 @@ extern "C" __global__ void finite_bf16(
     }
 }
 
+// Text-diffusion canvas sampler ops (definition: DiffusionGemma generation loop).
+// All logits are FP32 post-softcap rows of [rows, vocab].
+
+// out[i] = logits[i] / t (definition: scores / temperature, a division).
+extern "C" __global__ void temperature_scale_f32(
+    const float* __restrict__ logits, float* __restrict__ out,
+    long long count, float t) {
+  if (!(t > 0.0f) || !isfinite(t)) __trap();
+  const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < count) out[i] = logits[i] / t;
+}
+
+// Per-row categorical entropy in FP32: H = -sum(softmax(l) * log_softmax(l)),
+// two passes (row max, then exp/sum and the weighted deviation sum), matching
+// torch.distributions.Categorical.entropy over FP32 logits.
+extern "C" __global__ void row_entropy_f32(
+    const float* __restrict__ logits, float* __restrict__ entropy, int rows,
+    long long vocab, int vocab_threads) {
+  if (rows < 1 || vocab < 1 || vocab_threads < 1 || (blockDim.x & 31) != 0 ||
+      (int)blockDim.x < vocab_threads || vocab % 16 != 0)
+    __trap();
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const float* l = logits + (long long)row * vocab;
+  float mx = -INFINITY;
+  for (long long c = tid; c < vocab; c += vocab_threads)
+    mx = fmaxf(mx, l[c]);
+  __shared__ float s_red[32];
+  for (int off = 16; off > 0; off >>= 1)
+    mx = fmaxf(mx, __shfl_down_sync(FF_WARP_MASK, mx, off));
+  if (lane == 0) s_red[warp] = mx;
+  __syncthreads();
+  mx = warp == 0 && lane < ((int)blockDim.x >> 5) ? s_red[lane] : -INFINITY;
+  for (int off = 16; off > 0; off >>= 1)
+    mx = fmaxf(mx, __shfl_down_sync(FF_WARP_MASK, mx, off));
+  // Broadcast the block max to every warp (see moe_route_topk_softmax_scale_f32).
+  if (warp == 0 && lane == 0) s_red[0] = mx;
+  __syncthreads();
+  mx = s_red[0];
+  __syncthreads();  // s_red is reused for the sum stage below
+  float acc = 0.0f;
+  float dev = 0.0f;
+  for (long long c = tid; c < vocab; c += vocab_threads) {
+    const float e = expf(l[c] - mx);
+    acc += e;
+    dev += e * (l[c] - mx);
+  }
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(FF_WARP_MASK, acc, off);
+    dev += __shfl_down_sync(FF_WARP_MASK, dev, off);
+  }
+  if (lane == 0) { s_red[warp] = acc; }
+  __shared__ float s_dev[32];
+  if (lane == 0) s_dev[warp] = dev;
+  __syncthreads();
+  const int nw = (int)blockDim.x >> 5;
+  if (warp == 0) {
+    acc = lane < nw ? s_red[lane] : 0.0f;
+    dev = lane < nw ? s_dev[lane] : 0.0f;
+    for (int off = 16; off > 0; off >>= 1) {
+      acc += __shfl_down_sync(FF_WARP_MASK, acc, off);
+      dev += __shfl_down_sync(FF_WARP_MASK, dev, off);
+    }
+    if (lane == 0) {
+      const float lse = logf(acc);
+      entropy[row] = lse - dev / acc;
+    }
+  }
+}
+
+// Entropy-bound acceptance (definition EntropyBoundSampler.accept_canvas) over
+// one canvas row set: sort entropies ascending, accept the prefix while
+// cumsum(sorted) - sorted[k] <= bound, scatter back. n must be a power of two
+// (canvas 256); one block, n threads, bitonic sort of (entropy, index).
+extern "C" __global__ void entropy_bound_accept(
+    const float* __restrict__ entropy, unsigned char* __restrict__ accept,
+    int n, float bound) {
+  if (n < 2 || (n & (n - 1)) != 0 || (int)blockDim.x != n ||
+      !isfinite(bound) || bound <= 0.0f)
+    __trap();
+  __shared__ float s_e[1024];
+  __shared__ int s_i[1024];
+  __shared__ float s_cum[1024];
+  __shared__ unsigned char s_mask[1024];
+  const int i = threadIdx.x;
+  s_e[i] = entropy[i];
+  s_i[i] = i;
+  __syncthreads();
+  for (int k = 2; k <= n; k <<= 1) {
+    for (int j = k >> 1; j > 0; j >>= 1) {
+      const int a = i ^ j;
+      if (a > i) {
+        const bool up = (i & k) == 0;
+        const float ei = s_e[i], ea = s_e[a];
+        const int ii = s_i[i], ia = s_i[a];
+        const bool swap = up ? (ea < ei || (ea == ei && ia < ii))
+                             : (ea > ei || (ea == ei && ia > ii));
+        if (swap) {
+          s_e[i] = ea; s_e[a] = ei;
+          s_i[i] = ia; s_i[a] = ii;
+        }
+      }
+      __syncthreads();
+    }
+  }
+  // Sequential inclusive cumsum on thread 0 in ascending sorted order: the
+  // definition (torch.cumsum) adds in exactly this order, so the boundary
+  // decision is bit-stable.
+  if (i == 0) {
+    float run = 0.0f;
+    for (int k = 0; k < n; ++k) {
+      run += s_e[k];
+      s_cum[k] = run;
+    }
+  }
+  __syncthreads();
+  s_mask[i] = (s_cum[i] - s_e[i]) <= bound;
+  accept[s_i[i]] = s_mask[i];
+}
+
+// Philox4_32-10 counter RNG (public algorithm, independent implementation).
+// One thread produces 4 draws; out = floor(u01 * vocab) with u01 = word / 2^32.
+__device__ __forceinline__ uint4 philox4_32_10(uint4 counter, uint2 key) {
+  const unsigned mask = 0x9E3779B9u, round = 0xBB67AE85u;
+#pragma unroll
+  for (int r = 0; r < 10; ++r) {
+    if (r > 0) {
+      key.x += mask;
+      key.y += round;
+    }
+    const unsigned hi0 = __umulhi(0xD2511F53u, counter.x);
+    const unsigned lo0 = 0xD2511F53u * counter.x;
+    const unsigned hi1 = __umulhi(0xCD9E8D57u, counter.z);
+    const unsigned lo1 = 0xCD9E8D57u * counter.z;
+    counter = make_uint4(hi1 ^ counter.y ^ key.x, lo1, hi0 ^ counter.w ^ key.y,
+                         lo0);
+  }
+  return counter;
+}
+
+extern "C" __global__ void philox_uniform_ids(
+    unsigned long long seed, unsigned long long stream, int* __restrict__ out,
+    long long count, int vocab) {
+  if (vocab < 1 || count < 0) __trap();
+  const long long base = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  const uint2 key = make_uint2((unsigned)(seed & 0xffffffffu),
+                               (unsigned)(seed >> 32));
+  const uint4 counter = make_uint4((unsigned)(stream & 0xffffffffu),
+                                   (unsigned)(stream >> 32),
+                                   (unsigned)(base & 0xffffffffu),
+                                   (unsigned)(base >> 32));
+  const uint4 r = philox4_32_10(counter, key);
+  for (int j = 0; j < 4; ++j) {
+    const long long idx = base * 4 + j;
+    if (idx < count) {
+      const unsigned word = j == 0 ? r.x : j == 1 ? r.y : j == 2 ? r.z : r.w;
+      // id = floor(word * vocab / 2^32), always < vocab.
+      out[idx] = (int)(((unsigned long long)word * (unsigned long long)vocab) >> 32);
+    }
+  }
+}
+
+// Inverse-CDF categorical sample per row: one uniform draw from the same
+// Philox stream, then the first prefix that reaches it (two passes: row sum,
+// then scan). Deterministic given (seed, stream).
+extern "C" __global__ void categorical_sample_rows(
+    const float* __restrict__ probs, int* __restrict__ out, int rows,
+    long long vocab, unsigned long long seed, unsigned long long stream,
+    int vocab_threads) {
+  if (rows < 1 || vocab < 1 || vocab_threads < 1 || (blockDim.x & 31) != 0 ||
+      (int)blockDim.x != vocab_threads || vocab_threads > 1024)
+    __trap();
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const uint2 key =
+      make_uint2((unsigned)(seed & 0xffffffffu), (unsigned)(seed >> 32));
+  const uint4 counter =
+      make_uint4((unsigned)(stream & 0xffffffffu), (unsigned)(stream >> 32),
+                 (unsigned)row, 0u);
+  const float u = (float)(philox4_32_10(counter, key).x * (1.0 / 4294967296.0));
+  const float* p = probs + (long long)row * vocab;
+  const long long chunk = (vocab + vocab_threads - 1) / vocab_threads;
+  const long long lo = (long long)tid * chunk;
+  const long long hi = lo + chunk < vocab ? lo + chunk : vocab;
+
+  __shared__ float s_stage[32];
+  __shared__ float s_scan[1024];
+  float sum = 0.0f;
+  for (long long c = lo; c < hi; ++c) sum += p[c];
+
+  // Block total of the row probabilities.
+  float t = sum;
+  for (int off = 16; off > 0; off >>= 1)
+    t += __shfl_down_sync(FF_WARP_MASK, t, off);
+  if (lane == 0) s_stage[warp] = t;
+  __syncthreads();
+  if (warp == 0) {
+    const int nw = (int)blockDim.x >> 5;
+    t = lane < nw ? s_stage[lane] : 0.0f;
+    for (int off = 16; off > 0; off >>= 1)
+      t += __shfl_down_sync(FF_WARP_MASK, t, off);
+    if (lane == 0) s_stage[0] = t;
+  }
+  __syncthreads();
+  const float norm = 1.0f / s_stage[0];
+
+  // Exclusive block scan over the per-thread chunk sums (s_scan).
+  s_scan[tid] = sum;
+  __syncthreads();
+  for (int d = 1; d < vocab_threads; d <<= 1) {
+    const float add = tid >= d ? s_scan[tid - d] : 0.0f;
+    __syncthreads();
+    s_scan[tid] += add;
+    __syncthreads();
+  }
+  float base = s_scan[tid] - sum;
+
+  // First prefix reaching u inside this thread's chunk.
+  int mine = 0x7fffffff;
+  float run = base * norm;
+  for (long long c = lo; c < hi && mine == 0x7fffffff; ++c) {
+    const float next = run + p[c] * norm;
+    if (u >= run && u < next) mine = (int)c;
+    run = next;
+  }
+
+  __shared__ int s_pick[32];
+  const int nw = (int)blockDim.x >> 5;
+  for (int off = 16; off > 0; off >>= 1) {
+    const int other = __shfl_down_sync(FF_WARP_MASK, mine, off);
+    if (other < mine) mine = other;
+  }
+  if (lane == 0) s_pick[warp] = mine;
+  __syncthreads();
+  if (warp == 0) {
+    mine = lane < nw ? s_pick[lane] : 0x7fffffff;
+    for (int off = 16; off > 0; off >>= 1) {
+      const int other = __shfl_down_sync(FF_WARP_MASK, mine, off);
+      if (other < mine) mine = other;
+    }
+    if (lane == 0)
+      out[row] = mine == 0x7fffffff ? (int)(vocab - 1) : mine;
+  }
+}
+
+// Adaptive stopping (definition StableAndConfidentStoppingCriteria):
+// stable = the argmax canvas is unchanged from the previous step on every
+// position; confident = mean entropy below the threshold. One block.
+extern "C" __global__ void canvas_stability_stop(
+    const int* __restrict__ argmax_prev, const int* __restrict__ argmax_cur,
+    const float* __restrict__ entropy, unsigned char* __restrict__ stop, int n,
+    float confidence) {
+  if (n < 1 || (blockDim.x & 31) != 0 || !isfinite(confidence) ||
+      confidence <= 0.0f)
+    __trap();
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  int same = 1;
+  float h = 0.0f;
+  if (tid < n) {
+    same = argmax_prev[tid] == argmax_cur[tid];
+    h = entropy[tid];
+  } else {
+    h = 0.0f;
+  }
+  for (int off = 16; off > 0; off >>= 1) {
+    same &= __shfl_down_sync(FF_WARP_MASK, same, off);
+    h += __shfl_down_sync(FF_WARP_MASK, h, off);
+  }
+  __shared__ int s_same[32];
+  __shared__ float s_h[32];
+  if (lane == 0) { s_same[warp] = same; s_h[warp] = h; }
+  __syncthreads();
+  const int nw = (int)blockDim.x >> 5;
+  if (warp == 0) {
+    same = lane < nw ? s_same[lane] : 1;
+    h = lane < nw ? s_h[lane] : 0.0f;
+    for (int off = 16; off > 0; off >>= 1) {
+      same &= __shfl_down_sync(FF_WARP_MASK, same, off);
+      h += __shfl_down_sync(FF_WARP_MASK, h, off);
+    }
+    if (lane == 0) *stop = (unsigned char)(same && h / n < confidence);
+  }
+}
+
 // Per-row argmax over FP32 logits: strictly greater wins, ties to the lower
 // index (torch.argmax semantics). Grid = rows, block = vocab_threads. Two
 // passes: block max of the row, then the lowest index holding exactly it.
@@ -496,4 +786,15 @@ extern "C" __global__ void response_count_commit(const int* block,
     }
     state[0] += returned;
     state[1] = returned;
+}
+
+// Canvas iterate update: accepted rows take the sampled pick, the rest take a
+// fresh uniform renoise draw.
+extern "C" __global__ void canvas_accept_scatter(const unsigned char* __restrict__ accept,
+    const int* __restrict__ picks, const int* __restrict__ renoise,
+    unsigned int* __restrict__ canvas_ids, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    canvas_ids[i] =
+        (unsigned int)(accept[i] ? picks[i] : renoise[i]);
 }

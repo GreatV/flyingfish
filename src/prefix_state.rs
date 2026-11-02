@@ -1112,6 +1112,8 @@ mod tests {
             logit_softcap: None,
             per_layer_input: None,
             audio: None,
+            canvas_length: None,
+            diffusion: None,
             vision: None,
         }
     }

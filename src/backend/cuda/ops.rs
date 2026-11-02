@@ -1120,6 +1120,9 @@ impl GateOps {
             crate::model_spec::SwigluRounding::ClampedTwice => {
                 unreachable!("ClampedTwice launches the clamped entry above")
             }
+            crate::model_spec::SwigluRounding::GeluTwice => {
+                anyhow::bail!("gelu SwiGLU execution is not bound in the row-meta gate path")
+            }
         };
         unsafe {
             stream

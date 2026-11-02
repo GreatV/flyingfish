@@ -601,6 +601,8 @@ pub(crate) static DISABLE_PEER: std::sync::atomic::AtomicBool =
 mod q38_tests;
 
 #[cfg(test)]
+mod diffusion_ops_tests;
+#[cfg(test)]
 mod gemma4_ops_tests;
 
 #[cfg(test)]

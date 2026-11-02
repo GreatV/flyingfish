@@ -16,6 +16,7 @@ pub enum Architecture {
     Gemma4,
     EmbeddingGemma2,
     Clover,
+    DiffusionGemma,
 }
 impl Architecture {
     /// Architectures with a bound MTP decode path.
@@ -61,6 +62,8 @@ pub enum SwigluRounding {
     Once,
     ClampedTwice,
     ClampedOnce,
+    /// tanh-GELU gated product with two BF16 roundings (gelu_pytorch_tanh).
+    GeluTwice,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RoutedWeightBoundary {
@@ -443,6 +446,17 @@ fn block_generation_requires_publisher_penalties_and_bounded_state() -> Result<(
     Ok(())
 }
 
+/// DiffusionGemma sampler schedule from generation_config.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiffusionConfig {
+    pub denoise_steps: u32,
+    pub t_min: f32,
+    pub t_max: f32,
+    pub entropy_bound: f32,
+    pub confidence: f32,
+    pub pad: u32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelSpec {
     pub abi_version: u32,
@@ -475,6 +489,10 @@ pub struct ModelSpec {
     pub logit_softcap: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_layer_input: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canvas_length: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diffusion: Option<DiffusionConfig>,
     #[serde(default)]
     pub vision: Option<VisionConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -774,7 +792,8 @@ impl VisionConfig {
             | Architecture::Flint
             | Architecture::Glm5Next
             | Architecture::LoopVl
-            | Architecture::Clover => {
+            | Architecture::Clover
+            | Architecture::DiffusionGemma => {
                 bail!("vision configuration requires a supported multimodal architecture")
             }
             Architecture::DeepseekV41 => {
@@ -1599,6 +1618,7 @@ impl ModelSpec {
             | Architecture::LoopVl
             | Architecture::Gemma4
             | Architecture::EmbeddingGemma2 => SwigluRounding::Twice,
+            Architecture::DiffusionGemma => SwigluRounding::GeluTwice,
         }
     }
 
@@ -1619,7 +1639,8 @@ impl ModelSpec {
             | Architecture::LoopVl
             | Architecture::Gemma4
             | Architecture::EmbeddingGemma2
-            | Architecture::Clover => 0.0,
+            | Architecture::Clover
+            | Architecture::DiffusionGemma => 0.0,
         }
     }
 
@@ -1634,7 +1655,8 @@ impl ModelSpec {
             | Architecture::MiniCpmV47
             | Architecture::LoopVl
             | Architecture::Gemma4
-            | Architecture::EmbeddingGemma2 => RoutedWeightBoundary::AfterDownBf16,
+            | Architecture::EmbeddingGemma2
+            | Architecture::DiffusionGemma => RoutedWeightBoundary::AfterDownBf16,
         }
     }
 
@@ -1652,6 +1674,7 @@ impl ModelSpec {
                 Architecture::Gemma4 => "gemma4_text",
                 Architecture::EmbeddingGemma2 => "embedding_gemma2_text",
                 Architecture::Clover => "clover_moe",
+                Architecture::DiffusionGemma => "diffusion_gemma_text",
             }
             .into(),
             hidden_size: self.hidden as usize,
@@ -1687,10 +1710,6 @@ impl ModelSpec {
             let c = crate::config::Config::read(dir)?;
             return Self::from_llama(&c);
         }
-        ensure!(
-            root.get("model_type").and_then(Value::as_str) != Some("diffusion_gemma"),
-            "unsupported model architecture diffusion_gemma"
-        );
         let path = dir.join("generation_config.json");
         let generation = if path.exists() {
             serde_json::from_slice(&fs::read(path)?)?
@@ -1716,6 +1735,8 @@ impl ModelSpec {
             Self::gemma4(&root, &generation)
         } else if root.get("model_type").and_then(Value::as_str) == Some("clover_moe") {
             Self::clover(&root, &generation)
+        } else if root.get("model_type").and_then(Value::as_str) == Some("diffusion_gemma") {
+            Self::diffusion_gemma(&root, &generation)
         } else {
             Self::qwen(&root, &generation)
         }
@@ -1747,6 +1768,8 @@ impl ModelSpec {
             logit_softcap: None,
             per_layer_input: None,
             audio: None,
+            canvas_length: None,
+            diffusion: None,
             layers: (0..u(c.num_hidden_layers)?)
                 .map(|state_index| LayerPlan {
                     geometry: None,
@@ -1892,6 +1915,8 @@ impl ModelSpec {
             logit_softcap: None,
             per_layer_input: None,
             audio: None,
+            canvas_length: None,
+            diffusion: None,
             vision: None,
         })
     }
@@ -2260,6 +2285,8 @@ impl ModelSpec {
             logit_softcap: None,
             per_layer_input: None,
             audio: None,
+            canvas_length: None,
+            diffusion: None,
             vision: None,
         })
     }
@@ -2584,6 +2611,280 @@ impl ModelSpec {
             } else {
                 None
             },
+            canvas_length: None,
+            diffusion: None,
+        })
+    }
+    pub fn diffusion_gemma(root: &Value, generation: &Value) -> Result<Self> {
+        for (key, value) in [
+            ("model_type", "diffusion_gemma".into()),
+            (
+                "architectures",
+                serde_json::json!(["DiffusionGemmaForBlockDiffusion"]),
+            ),
+            ("tie_word_embeddings", true.into()),
+            ("dtype", "bfloat16".into()),
+            ("initializer_range", 0.02.into()),
+            ("boi_token_id", 255_999.into()),
+            ("eoi_token_id", 258_882.into()),
+            ("image_token_id", 258_880.into()),
+            ("eos_token_id", serde_json::json!([1, 106])),
+            ("vision_soft_tokens_per_image", 280.into()),
+        ] {
+            equal(root, key, value)?;
+        }
+        exact_keys(
+            root,
+            &[
+                "architectures",
+                "boi_token_id",
+                "canvas_length",
+                "dtype",
+                "eoi_token_id",
+                "eos_token_id",
+                "image_token_id",
+                "initializer_range",
+                "model_type",
+                "text_config",
+                "tie_word_embeddings",
+                "transformers_version",
+                "vision_config",
+                "vision_soft_tokens_per_image",
+            ],
+            "diffusion_gemma config",
+        )?;
+        let canvas = positive(root, "canvas_length")?;
+        let t = root.get("text_config").context("missing text_config")?;
+        exact_keys(
+            t,
+            &[
+                "attention_bias",
+                "attention_dropout",
+                "bos_token_id",
+                "dtype",
+                "eos_token_id",
+                "final_logit_softcapping",
+                "global_head_dim",
+                "head_dim",
+                "hidden_activation",
+                "hidden_size",
+                "initializer_range",
+                "intermediate_size",
+                "layer_types",
+                "max_position_embeddings",
+                "model_type",
+                "moe_intermediate_size",
+                "num_attention_heads",
+                "num_experts",
+                "num_global_key_value_heads",
+                "num_hidden_layers",
+                "num_key_value_heads",
+                "pad_token_id",
+                "rms_norm_eps",
+                "rope_parameters",
+                "sliding_window",
+                "tie_word_embeddings",
+                "top_k_experts",
+                "use_bidirectional_attention",
+                "vocab_size",
+            ],
+            "diffusion_gemma text_config",
+        )?;
+        for (key, value) in [
+            ("model_type", "diffusion_gemma_text".into()),
+            ("dtype", "bfloat16".into()),
+            ("attention_bias", false.into()),
+            ("attention_dropout", 0.0.into()),
+            ("hidden_activation", "gelu_pytorch_tanh".into()),
+            ("tie_word_embeddings", true.into()),
+            ("final_logit_softcapping", 30.0.into()),
+            ("use_bidirectional_attention", "vision".into()),
+            ("head_dim", 256.into()),
+            ("global_head_dim", 512.into()),
+            ("vocab_size", 262_144.into()),
+            ("rms_norm_eps", 1e-6.into()),
+            ("bos_token_id", 2.into()),
+            ("pad_token_id", 0.into()),
+            ("eos_token_id", 1.into()),
+            ("initializer_range", 0.02.into()),
+        ] {
+            equal(t, key, value)?;
+        }
+        let rope = t
+            .get("rope_parameters")
+            .context("missing rope_parameters")?;
+        exact_keys(
+            rope,
+            &["full_attention", "sliding_attention"],
+            "diffusion_gemma rope_parameters",
+        )?;
+        let full_rope = &rope["full_attention"];
+        exact_keys(
+            full_rope,
+            &["partial_rotary_factor", "rope_theta", "rope_type"],
+            "diffusion_gemma full_attention rope",
+        )?;
+        equal(full_rope, "rope_type", "proportional".into())?;
+        equal(full_rope, "partial_rotary_factor", 0.25.into())?;
+        equal(full_rope, "rope_theta", 1_000_000.0.into())?;
+        let sliding_rope = &rope["sliding_attention"];
+        exact_keys(
+            sliding_rope,
+            &["rope_theta", "rope_type"],
+            "diffusion_gemma sliding_attention rope",
+        )?;
+        equal(sliding_rope, "rope_type", "default".into())?;
+        equal(sliding_rope, "rope_theta", 10_000.0.into())?;
+        const SLIDING_HEAD_DIM: u32 = 256;
+        const GLOBAL_HEAD_DIM: u32 = 512;
+        let sliding = RopeSpec {
+            theta: 10_000.0,
+            pairs: SLIDING_HEAD_DIM / 2,
+            pair_stride: SLIDING_HEAD_DIM / 2,
+            denominator: SLIDING_HEAD_DIM,
+        };
+        // Proportional partial rope (modeling_rope_utils
+        // _compute_proportional_rope_parameters): 64 real angles with
+        // exponent over head_dim, zero frequencies for the remaining pairs.
+        let global = RopeSpec {
+            theta: 1_000_000.0,
+            pairs: GLOBAL_HEAD_DIM / 8,
+            pair_stride: GLOBAL_HEAD_DIM / 2,
+            denominator: GLOBAL_HEAD_DIM,
+        };
+        let hidden = positive(t, "hidden_size")?;
+        let base = positive(t, "intermediate_size")?;
+        let depth = positive(t, "num_hidden_layers")?;
+        let window = positive(t, "sliding_window")?;
+        let q_heads = positive(t, "num_attention_heads")?;
+        let kv_heads = positive(t, "num_key_value_heads")?;
+        ensure!(
+            q_heads.is_multiple_of(kv_heads),
+            "num_attention_heads is not a multiple of num_key_value_heads"
+        );
+        let experts = positive(t, "num_experts")?;
+        let top_k = positive(t, "top_k_experts")?;
+        let expert_intermediate = positive(t, "moe_intermediate_size")?;
+        ensure!(experts > top_k, "num_experts must exceed top_k_experts");
+        let global_kv_heads = positive(t, "num_global_key_value_heads")?;
+        ensure!(
+            global_kv_heads < kv_heads && q_heads.is_multiple_of(global_kv_heads),
+            "num_global_key_value_heads must divide num_attention_heads and be smaller than the sliding set"
+        );
+        let types = t
+            .get("layer_types")
+            .and_then(Value::as_array)
+            .context("missing layer_types")?;
+        ensure!(
+            types.len() == depth as usize,
+            "layer_types length differs from num_hidden_layers"
+        );
+        let mut layers = Vec::with_capacity(types.len());
+        for (i, kind) in types.iter().enumerate() {
+            let full = match kind.as_str() {
+                Some("sliding_attention") => false,
+                Some("full_attention") => true,
+                _ => bail!("unsupported DiffusionGemma layer type at {i}: {kind:?}"),
+            };
+            layers.push(LayerPlan {
+                mixer: Mixer::FullAttention,
+                state_index: u32::try_from(i).context("layer index overflows u32")?,
+                rope: true,
+                sliding_window: (!full).then_some(window),
+                ffn: FfnKind::Moe,
+                geometry: Some(LayerGeometry {
+                    head_dim: if full {
+                        GLOBAL_HEAD_DIM
+                    } else {
+                        SLIDING_HEAD_DIM
+                    },
+                    intermediate: base,
+                    rope: if full { global } else { sliding },
+                    // Full layers publish no v_proj: V = v_norm(k_proj(x)).
+                    kv_reader: false,
+                    kv_heads: full.then_some(global_kv_heads),
+                }),
+            });
+        }
+        ensure!(
+            layers.last().is_some_and(|l| l.sliding_window.is_none()),
+            "the last DiffusionGemma layer must be full attention"
+        );
+        let f32_field = |value: &Value, name: &str| -> Result<f32> {
+            let v = value
+                .get(name)
+                .and_then(Value::as_f64)
+                .with_context(|| format!("missing DiffusionGemma {name}"))?
+                as f32;
+            ensure!(
+                v.is_finite() && v > 0.0,
+                "DiffusionGemma {name} must be positive"
+            );
+            Ok(v)
+        };
+        let sampler = generation
+            .get("sampler_config")
+            .context("missing DiffusionGemma sampler_config")?;
+        let diffusion = DiffusionConfig {
+            denoise_steps: positive(generation, "max_denoising_steps")?,
+            t_min: f32_field(generation, "t_min")?,
+            t_max: f32_field(generation, "t_max")?,
+            entropy_bound: f32_field(sampler, "entropy_bound")?,
+            confidence: f32_field(generation, "confidence_threshold")?,
+            pad: u32::try_from(
+                generation
+                    .get("pad_token_id")
+                    .and_then(Value::as_u64)
+                    .context("missing DiffusionGemma pad_token_id")?,
+            )
+            .context("DiffusionGemma pad_token_id overflows u32")?,
+        };
+        ensure!(
+            diffusion.t_min <= diffusion.t_max,
+            "DiffusionGemma t_min exceeds t_max"
+        );
+        let eos_value = generation
+            .get("eos_token_id")
+            .filter(|x| !x.is_null())
+            .or_else(|| t.get("eos_token_id"))
+            .context("missing DiffusionGemma EOS")?;
+        Ok(Self {
+            abi_version: 1,
+            architecture: Architecture::DiffusionGemma,
+            hidden,
+            intermediate: base,
+            vocab: 262_144,
+            q_heads,
+            kv_heads,
+            head_dim: SLIDING_HEAD_DIM,
+            q_width: q_heads
+                .checked_mul(SLIDING_HEAD_DIM)
+                .context("Q width overflows u32")?,
+            max_position: positive(t, "max_position_embeddings")?,
+            rms_eps: 1e-6,
+            rope_theta: sliding.theta,
+            rotary_dim: SLIDING_HEAD_DIM,
+            linear_format: LinearFormat::Bf16,
+            expert_format: Some(crate::model_spec::ExpertFormat::Bf16),
+            eos: eos(eos_value, 262_144)?,
+            layers,
+            moe: Some(MoeConfig {
+                experts,
+                experts_per_tok: top_k,
+                expert_intermediate,
+                shared_intermediate: base,
+                score: RouterScore::Softmax,
+                shared_gate: false,
+            }),
+            gdn: None,
+            glm5_next: None,
+            deepseek_v41: None,
+            logit_softcap: Some(30.0),
+            per_layer_input: None,
+            canvas_length: Some(canvas),
+            diffusion: Some(diffusion),
+            audio: None,
+            vision: None,
         })
     }
     pub fn embedding_gemma2(root: &Value, generation: &Value) -> Result<Self> {
@@ -2777,6 +3078,8 @@ impl ModelSpec {
             per_layer_input: Some(512),
             vision: VisionConfig::from_root(root)?,
             audio: AudioConfig::from_root(root)?,
+            canvas_length: None,
+            diffusion: None,
         })
     }
 
@@ -3163,6 +3466,8 @@ impl ModelSpec {
             logit_softcap: None,
             per_layer_input: None,
             audio: None,
+            canvas_length: None,
+            diffusion: None,
             vision: None,
         })
     }
@@ -3587,6 +3892,8 @@ impl ModelSpec {
             logit_softcap: None,
             per_layer_input: None,
             audio: None,
+            canvas_length: None,
+            diffusion: None,
             vision: None,
         })
     }
@@ -3629,7 +3936,65 @@ impl ModelSpec {
             logit_softcap: None,
             per_layer_input: None,
             audio: None,
+            canvas_length: None,
+            diffusion: None,
             vision,
         })
+    }
+}
+
+#[cfg(test)]
+mod diffusion_rope_tests {
+    use super::*;
+
+    #[test]
+    fn full_layer_rope_table_rotates_at_the_rotary_dim() -> Result<()> {
+        let root: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/data/diffusiongemma-26b-a4b-config.json"
+        ))?;
+        let spec = ModelSpec::diffusion_gemma(
+            &root,
+            &serde_json::json!({
+                "max_denoising_steps": 48,
+                "t_min": 0.4,
+                "t_max": 0.8,
+                "confidence_threshold": 0.005,
+                "sampler_config": {"entropy_bound": 0.1},
+                "pad_token_id": 0,
+            }),
+        )?;
+        let full = spec
+            .layers
+            .iter()
+            .find_map(|l| l.geometry.filter(|g| g.head_dim == 512))
+            .context("full geometry missing")?;
+        let table = full.rope.table(512, 8)?;
+        // position 1, pair i: cos(inv_i) with the proportional form
+        // inv_i = 1e6^(-i/256) (exponent over head_dim 512); pairs beyond
+        // 64 hold cos(0)=1 (zero frequency).
+        let inv = |i: usize| (1_000_000.0f64).powf(-(i as f64) / 256.0);
+        for i in [0usize, 1, 17, 63] {
+            let expect = inv(i).cos();
+            let got = f64::from(table[512 + i].to_f32());
+            ensure!(
+                (got - expect).abs() < 1e-2,
+                "full rope pair {i}: table cos {got} vs proportional form {expect}"
+            );
+        }
+        // pair 0 has inv 1 under both forms and pair 63 differs by less
+        // than the bf16 grid; the control checks the mid pairs where the
+        // two forms separate by ~0.08.
+        for i in [1usize, 17] {
+            let got = f64::from(table[512 + i].to_f32());
+            ensure!(
+                (got - (1_000_000.0f64).powf(-(i as f64) / 64.0).cos()).abs() > 1e-3,
+                "full rope pair {i}: table still matches the rotary-dim-exponent form"
+            );
+        }
+        ensure!(
+            table[512 + 64].to_f32() == 1.0,
+            "pairs beyond the rotary dim must not rotate"
+        );
+        Ok(())
     }
 }

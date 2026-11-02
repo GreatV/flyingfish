@@ -256,6 +256,10 @@ struct Attention {
 unsafe impl DeviceRepr for Attention {}
 
 impl Flash {
+    pub(super) fn allocated_bytes(&self) -> usize {
+        4 * (self.lse.len() + self.split.as_ref().map_or(0, |split| split.workspace.len()))
+    }
+
     pub fn workspace(
         stream: &Arc<CudaStream>,
         rows: usize,
@@ -467,12 +471,20 @@ impl Flash {
                     "attention_prefill_d512",
                     "attention_prefill_d512_bidirectional",
                 ]
-            } else if score.is_some() {
-                &[
-                    "attention_prefill_d256_window",
-                    "attention_prefill_d256_bidirectional",
-                    "attention_prefill_d256_symmetric",
-                ]
+            } else if let Some(score) = score {
+                if score.window_left.is_some() {
+                    &[
+                        "attention_prefill_d256_window",
+                        "attention_prefill_d256_bidirectional",
+                        "attention_prefill_d256_symmetric",
+                    ]
+                } else {
+                    &[
+                        "attention_prefill_d256_scored",
+                        "attention_prefill_d256_bidirectional_scored",
+                        "attention_prefill_d256_symmetric",
+                    ]
+                }
             } else if head_dim == 256 {
                 &[
                     "attention_prefill_d256",
@@ -866,8 +878,10 @@ impl Flash {
                             launch.arg(&key_extent);
                         } else if mode == 6 {
                             launch.arg(&key_extent).arg(&window);
-                        } else {
+                        } else if score.window_left.is_some() {
                             launch.arg(&window);
+                        } else if mode != 0 {
+                            launch.arg(&extent);
                         }
                     }
                     if mode != 0 && shape.head_dim == 512 {
@@ -2251,6 +2265,151 @@ mod tests {
         }
         Ok(defects)
     }
+    #[test]
+    #[ignore = "GPU lease; DG1 encoder scored-prefill per-band FP64 reference"]
+    fn scored_prefill_dg1_shapes_gpu() -> Result<()> {
+        let ctx = crate::backend::gpu::CudaContext::new(0)?;
+        #[cfg(feature = "cuda")]
+        unsafe {
+            ctx.disable_event_tracking();
+        }
+        let stream = ctx.new_stream()?;
+        let limits: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/attention_reference.json"
+        ))?;
+        // DG1 encoder shapes: D256 sliding (window 1023, ring 1279) and D512
+        // full causal, 16 query heads over 8/2 KV heads, score scale 1.0;
+        // 256 rows at prefix 0 and the 44-row tail at prefix 256. The FP64
+        // reference runs on the same bf16 inputs. Every band is judged
+        // against the frozen operator bounds for this geometry (output_max /
+        // output_rms of the e{d}-unit family, the same bounds the other
+        // scored prefill cases use); cosine 0.99 stays only as the collapse
+        // check. Thresholds frozen before the run.
+        for (d, hkv, window, mode) in [
+            (256usize, 8usize, Some(1023usize), "window"),
+            (512, 2, None, "causal"),
+            // The canvas form: bidirectional over prefix+canvas on the ring
+            // at the DG1 P300 geometry.
+            (256, 8, None, "bidirectional"),
+        ] {
+            let canvas_form = mode == "bidirectional";
+            for (rows, start) in if canvas_form {
+                vec![(256usize, 300usize)]
+            } else {
+                vec![(256usize, 0usize), (44, 256)]
+            } {
+                let case = Case {
+                    name: "dg1-op".into(),
+                    d,
+                    hq: 16,
+                    hkv,
+                    mode: mode.into(),
+                    seed: 3,
+                    rows,
+                    start,
+                    keys: start + rows,
+                    extent: window.unwrap_or(0),
+                    capacity: if d == 256 { 1279 } else { 512 },
+                    pitch: 16 * d + 128,
+                    scale: Some(1.0),
+                };
+                let mut buffers = case.buffers(&stream)?;
+                let mut op = case.binding(&stream)?;
+                case.run(&mut op, &mut buffers)?;
+                let actual = stream.clone_dtoh(&buffers.out)?;
+                ensure!(
+                    actual[..case.rows * case.hq * case.d]
+                        .iter()
+                        .all(|x| x.to_f32().is_finite()),
+                    "nonfinite DG1 prefill output d={d} start={start}"
+                );
+                let family = format!("e{d}-unit");
+                let bound = &limits["limits"][&family];
+                let out_max = bound["output_max"]
+                    .as_f64()
+                    .with_context(|| format!("{family} output_max bound"))?;
+                let out_rms = bound["output_rms"]
+                    .as_f64()
+                    .with_context(|| format!("{family} output_rms bound"))?;
+                let mut defects = Vec::new();
+                for (lo, hi) in [
+                    (0, rows.min(64)),
+                    (64, rows.min(128)),
+                    (128, rows.min(192)),
+                    (192, rows),
+                ] {
+                    if lo >= hi {
+                        continue;
+                    }
+                    let (mut dot, mut a, mut b, mut worst, mut square, mut count) =
+                        (0f64, 0f64, 0f64, 0f64, 0f64, 0usize);
+                    for row in lo..hi {
+                        let keys: Vec<usize> = (0..case.keys)
+                            .filter(|&key| visible(&case, row, key))
+                            .collect();
+                        for h in 0..case.hq {
+                            let kvh = h * case.hkv / case.hq;
+                            let mut scores = Vec::with_capacity(keys.len());
+                            for &key in &keys {
+                                let mut s = 0f64;
+                                for dim in 0..case.d {
+                                    s += f64::from(
+                                        case.extended_value(case.start + row, h, dim, b'q')
+                                            .to_f32(),
+                                    ) * f64::from(
+                                        case.extended_value(key, kvh, dim, b'k').to_f32(),
+                                    );
+                                }
+                                scores.push(s);
+                            }
+                            let max = scores.iter().cloned().fold(-f64::INFINITY, f64::max);
+                            let exp: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+                            let sum: f64 = exp.iter().sum();
+                            for dim in 0..case.d {
+                                let mut acc = 0f64;
+                                for (w, &key) in exp.iter().zip(&keys) {
+                                    acc += w / sum
+                                        * f64::from(
+                                            case.extended_value(key, kvh, dim, b'v').to_f32(),
+                                        );
+                                }
+                                let got =
+                                    f64::from(actual[(row * case.hq + h) * case.d + dim].to_f32());
+                                dot += acc * got;
+                                a += acc * acc;
+                                b += got * got;
+                                worst = worst.max((acc - got).abs());
+                                square += (acc - got).powi(2);
+                                count += 1;
+                            }
+                        }
+                    }
+                    let cosine = dot / (a.sqrt() * b.sqrt());
+                    let rmse = (square / count as f64).sqrt();
+                    println!(
+                        "OPDG1 d={d} window={:?} rows={rows} start={start} band_rows={lo}..{hi} cosine={cosine:.6} max_abs={worst:.6} rmse={rmse:.6} bounds_max={out_max} bounds_rms={out_rms}",
+                        window
+                    );
+                    if cosine < 0.99 {
+                        defects.push(format!("band {lo}..{hi} collapsed (cosine {cosine:.6})"));
+                    }
+                    if worst > out_max {
+                        defects.push(format!("band {lo}..{hi} max_abs {worst:.6} > {out_max}"));
+                    }
+                    if rmse > out_rms {
+                        defects.push(format!("band {lo}..{hi} rmse {rmse:.6} > {out_rms}"));
+                    }
+                }
+                ensure!(
+                    defects.is_empty(),
+                    "DG1 scored prefill d={d} start={start} vs frozen {family} bounds: {}",
+                    defects.join("; ")
+                );
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "GPU lease and independent attention reference fixtures"]
     fn native_prefill_reference_gpu() -> Result<()> {

@@ -184,9 +184,30 @@ impl BlockRoutePlan {
     }
 }
 
+/// Affine-prescaled block router call: x [rows, hidden] residual rows,
+/// scale [hidden], proj [experts, hidden], per_expert [experts]; outputs
+/// ids/weights [rows, top_k] with prescaled/logits caller scratch.
+pub(crate) struct DiffusionRoute<'a> {
+    pub x: &'a CudaSlice<bf16>,
+    pub scale: &'a CudaSlice<bf16>,
+    pub proj: &'a CudaSlice<bf16>,
+    pub per_expert: &'a CudaSlice<bf16>,
+    pub prescaled: &'a mut CudaSlice<bf16>,
+    pub logits: &'a mut CudaSlice<bf16>,
+    pub ids: &'a mut CudaSlice<i32>,
+    pub weights: &'a mut CudaSlice<f32>,
+    pub rows: usize,
+    pub hidden: usize,
+    pub top_k: usize,
+    pub eps: f32,
+}
+
 pub(crate) struct RouteOps {
     decode: CudaFunction,
     launch: Vec<(u32, LaunchConfig)>,
+    prescale: CudaFunction,
+    logits_bf16: CudaFunction,
+    topk_scale: CudaFunction,
     completed: CudaSlice<u32>,
     experts: u32,
     topk: CudaFunction,
@@ -289,6 +310,9 @@ impl RouteOps {
         Ok(Self {
             decode,
             launch,
+            prescale: module.load_function("moe_route_prescale_bf16")?,
+            logits_bf16: module.load_function("moe_route_logits_bf16")?,
+            topk_scale: module.load_function("moe_route_topk_softmax_scale_f32")?,
             completed: stream.alloc_zeros(max_rows)?,
             experts,
             topk: module.load_function("moe_route_topk")?,
@@ -300,6 +324,85 @@ impl RouteOps {
             logits_gemm: None,
             stream: stream.clone(),
         })
+    }
+
+    /// Affine-prescaled block router: weightless RMS x per-dimension scale
+    /// x hidden^-0.5, BF16 logits GEMM, FP32 softmax top-k renormalised and
+    /// scaled per expert. `prescaled` and `logits` are caller scratch.
+    pub fn diffusion_topk(&self, stream: &Arc<CudaStream>, call: DiffusionRoute<'_>) -> Result<()> {
+        let DiffusionRoute {
+            x,
+            scale,
+            proj,
+            per_expert,
+            prescaled,
+            logits,
+            ids,
+            weights,
+            rows,
+            hidden,
+            top_k,
+            eps,
+        } = call;
+        let experts = self.experts as usize;
+        ensure!(
+            experts >= top_k
+                && top_k > 0
+                && rows > 0
+                && x.len() >= rows * hidden
+                && scale.len() == hidden
+                && proj.len() == experts * hidden
+                && per_expert.len() == experts
+                && prescaled.len() >= rows * hidden
+                && logits.len() >= rows * experts
+                && ids.len() >= rows * top_k
+                && weights.len() >= rows * top_k,
+            "diffusion route extents mismatch rows={rows} hidden={hidden} experts={experts} top_k={top_k}"
+        );
+        let root = (hidden as f64).powf(-0.5) as f32;
+        let (lptr, _) = logits.device_ptr(stream);
+        let (eptr, _) = per_expert.device_ptr(stream);
+        let (iptr, _) = ids.device_ptr(stream);
+        let (wptr, _) = weights.device_ptr(stream);
+        let (xptr, _) = x.device_ptr(stream);
+        let (sptr, _) = scale.device_ptr(stream);
+        let (yptr, _) = prescaled.device_ptr(stream);
+        unsafe {
+            stream
+                .launch_builder(&self.prescale)
+                .arg(&xptr)
+                .arg(&sptr)
+                .arg(&yptr)
+                .arg(&(rows as i32))
+                .arg(&(hidden as i32))
+                .arg(&eps)
+                .arg(&root)
+                .launch(grid(rows, 256))?;
+            stream
+                .launch_builder(&self.logits_bf16)
+                .arg(prescaled)
+                .arg(proj)
+                .arg(logits)
+                .arg(&(rows as i32))
+                .arg(&self.experts)
+                .arg(&(hidden as i32))
+                .launch(LaunchConfig {
+                    grid_dim: (self.experts / 32, rows as u32, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+            stream
+                .launch_builder(&self.topk_scale)
+                .arg(&lptr)
+                .arg(&eptr)
+                .arg(&iptr)
+                .arg(&wptr)
+                .arg(&(rows as i32))
+                .arg(&self.experts)
+                .arg(&(top_k as i32))
+                .launch(grid(rows, (experts.div_ceil(32) * 32) as u32))?;
+        }
+        Ok(())
     }
 
     /// One decode launch with row-local completion counters on the bound stream.

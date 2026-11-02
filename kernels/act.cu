@@ -95,3 +95,23 @@ extern "C" __global__ void softcap(__nv_bfloat16* x, long long count, float cap)
     const float t = __bfloat162float(__float2bfloat16_rn(tanhf(z)));
     x[i] = __float2bfloat16_rn(t * cap);
 }
+
+// Canvas head form: y = cap * tanh(x / cap) in FP32 from BF16 logits.
+extern "C" __global__ void softcap_cast_f32(const __nv_bfloat16* __restrict__ x,
+    float* __restrict__ y, long long count, float cap) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float v = __bfloat162float(x[i]);
+    y[i] = cap * tanhf(v / cap);
+}
+
+// y = bf16(bf16(a + b) * scale); two ordered BF16 roundings, elementwise.
+extern "C" __global__ void residual_scale(const __nv_bfloat16* __restrict__ a,
+    const __nv_bfloat16* __restrict__ b, float scale, __nv_bfloat16* __restrict__ y,
+    long long count) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const __nv_bfloat16 sum =
+        __float2bfloat16_rn(__bfloat162float(a[i]) + __bfloat162float(b[i]));
+    y[i] = __float2bfloat16_rn(__bfloat162float(sum) * scale);
+}

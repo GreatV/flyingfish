@@ -459,12 +459,17 @@ pub fn cohort_capacity(
     ensure!(slot > 0 && geometry.layers > 0, "empty cohort geometry");
     let available = device_bytes / slot;
     let complete = u64::from(geometry.layers) * u64::from(geometry.experts);
+    // Below one slot per layer the plan keeps zero resident experts and
+    // staging only; an empty device errors.
     let staging = if available >= complete {
         0
     } else {
-        available
-            .checked_div(u64::from(geometry.layers) + 1)
-            .context("cohort staging divisor")?
+        let share = if available / (u64::from(geometry.layers) + 1) > 0 {
+            available / (u64::from(geometry.layers) + 1)
+        } else {
+            available
+        };
+        share
             .min(u64::from(rows) * u64::from(geometry.top_k))
             .min(u64::from(geometry.experts))
             .min(u64::from(staging_slots_max))
@@ -512,17 +517,24 @@ fn native_staging_capacity(
     let slot = layout.slot_bytes();
     ensure!(slot > 0, "zero native slot bytes");
     let total = u64::from(geometry.layers) * u64::from(geometry.experts);
-    let slots = (device_bytes / slot).min(total);
-    let slots_per_layer = equal_slots(slots, geometry.layers)?;
+    let mut slots = (device_bytes / slot).min(total);
+    let mut slots_per_layer = equal_slots(slots, geometry.layers)?;
     if cohorts {
-        live = live.min(
-            *slots_per_layer
-                .iter()
-                .min()
-                .context("empty cohort layers")?,
-        );
+        let fewest = *slots_per_layer
+            .iter()
+            .min()
+            .context("empty cohort layers")?;
+        if fewest == 0 {
+            // Below one slot per layer the plan runs zero resident experts;
+            // leftover device slots stay unused.
+            slots = 0;
+            slots_per_layer = equal_slots(0, geometry.layers)?;
+            live = 0;
+        } else {
+            live = live.min(fewest);
+        }
         ensure!(
-            live > 0,
+            live > 0 || slots == 0,
             "native cohort capacity cannot hold one expert per layer"
         );
     }
@@ -530,6 +542,7 @@ fn native_staging_capacity(
         slots_per_layer.iter().all(|&n| n >= live),
         "native GPU slots cannot hold {live} distinct routes per layer"
     );
+
     let copies = u64::from(copy_engines.min(2));
     let host_io = (3 * copies)
         .checked_mul(slot)
@@ -718,7 +731,8 @@ impl BlockResidency {
             resources.staging_slots_max,
         )?;
         ensure!(
-            experts.slots_per_layer.iter().all(|&n| n >= minimum_cohort),
+            experts.slots_per_layer.iter().all(|&n| n >= minimum_cohort)
+                || experts.slots_per_layer.iter().all(|&n| n == 0),
             "block cohort below derived launch coverage"
         );
         let host_fixed_bytes = resources
@@ -1935,19 +1949,26 @@ mod tests {
             );
             assert_eq!(admission.hard_cap(slot)?, plan.spare_blocks);
         }
+        // Below one slot per layer the whole-tier host/disk plan admits;
+        // an empty device errors.
+        let (plan, _) = cohort_capacity(
+            geometry,
+            layout.clone(),
+            32,
+            40 * slot - 1,
+            40 << 30,
+            2,
+            256,
+        )?;
+        assert!(plan.slots_per_layer.iter().all(|&n| n == 0));
+        assert_eq!(plan.prefill_staging_slots, 39);
+        // Host too small rejects at an admitted device size: 41 device slots
+        // admit residency, but one slot of host after the 3*2*slot staging
+        // IO cannot hold a host expert plus a live swap.
         assert!(
-            cohort_capacity(
-                geometry,
-                layout.clone(),
-                32,
-                40 * slot - 1,
-                40 << 30,
-                2,
-                256
-            )
-            .is_err()
+            cohort_capacity(geometry, layout.clone(), 32, 41 * slot, 7 * slot, 2, 256).is_err()
         );
-        assert!(cohort_capacity(geometry, layout, 32, 40 * slot, 7 * slot, 2, 256).is_err());
+        assert!(cohort_capacity(geometry, layout, 32, 0, 40 << 30, 2, 256).is_err());
         let geometry = ExpertGeometry {
             first_layer: 0,
             layers: 30,

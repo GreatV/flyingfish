@@ -42,6 +42,11 @@ pub(super) mod audio_runtime;
 pub(crate) mod deepseek;
 #[path = "engine_diffusion.rs"]
 mod diffusion;
+#[cfg(test)]
+pub(crate) use self::diffusion::{
+    DISK_MARK, HOST_MARK, TieredCall, canvas_window as diffusion_canvas_window,
+    commit_window as diffusion_commit_window, contribute_tiered,
+};
 #[path = "engine_moe.rs"]
 mod moe;
 pub(in crate::backend::cuda) use moe::{Events, ReadAhead, Reader};
@@ -647,6 +652,7 @@ fn load_dispatch(architecture: crate::model_spec::Architecture) -> Result<LoadDi
         Architecture::Glm5Next => LoadDispatch::Qwen,
         Architecture::Gemma4 => LoadDispatch::Qwen,
         Architecture::EmbeddingGemma2 => LoadDispatch::Qwen,
+        Architecture::DiffusionGemma => LoadDispatch::Canvas,
     })
 }
 
@@ -720,6 +726,10 @@ pub struct Engine {
     pending_token: Option<u32>,
     resident_ids_len: usize,
     last_input_kind: Option<PrefixLastInputKind>,
+    #[cfg(test)]
+    pub(crate) diffusion_single_step: bool,
+    #[cfg(test)]
+    pub(crate) diffusion_forced_draws: Option<(&'static [i32], &'static [i32])>,
 }
 
 #[cfg(feature = "cuda")]
@@ -1039,7 +1049,7 @@ impl Engine {
         let model_spec = crate::model_spec::ModelSpec::read(dir)?;
         match load_dispatch(model_spec.architecture)? {
             LoadDispatch::Canvas => {
-                return Self::load_clover(
+                return Self::load_diffusion(
                     dir,
                     ordinal,
                     capacity,
@@ -1286,6 +1296,10 @@ impl Engine {
             pending_token: None,
             resident_ids_len: 0,
             last_input_kind: None,
+            #[cfg(test)]
+            diffusion_single_step: false,
+            #[cfg(test)]
+            diffusion_forced_draws: None,
         };
         if let Some(path) = settings.draft_model {
             let path = path.canonicalize()?;
@@ -3906,10 +3920,10 @@ impl Engine {
         if self.model_spec.architecture == crate::model_spec::Architecture::Glm5Next {
             return false;
         }
-        // Clover canvas execution is eager.
         if matches!(
             self.model_spec.architecture,
             crate::model_spec::Architecture::Clover
+                | crate::model_spec::Architecture::DiffusionGemma
         ) {
             return false;
         }
@@ -3922,8 +3936,12 @@ impl Engine {
 
     pub fn capture(&mut self) -> Result<()> {
         ensure!(
-            self.model_spec.architecture != crate::model_spec::Architecture::Clover,
-            "Clover canvas graph execution is not bound"
+            !matches!(
+                self.model_spec.architecture,
+                crate::model_spec::Architecture::Clover
+                    | crate::model_spec::Architecture::DiffusionGemma
+            ),
+            "canvas graph execution is not bound"
         );
         ensure!(
             self.model_spec.architecture != crate::model_spec::Architecture::Glm5Next,
@@ -4048,13 +4066,7 @@ impl Engine {
     pub fn decode_logits(&self) -> Result<Vec<f32>> {
         self.logits_cache.read()?;
         if self.diffusion.is_some() {
-            return Ok(self
-                .device
-                .stream
-                .clone_dtoh(&self.canvas_logits()?)?
-                .into_iter()
-                .map(bf16::to_f32)
-                .collect());
+            return self.canvas_logits_f32();
         }
         if let Some(logits) = &self.logits_f32 {
             return self
@@ -6404,7 +6416,7 @@ impl Engine {
                 );
             }
             LoadDispatch::Canvas => {
-                return Self::load_clover(
+                return Self::load_diffusion(
                     dir,
                     ordinal,
                     capacity,
@@ -6562,6 +6574,10 @@ impl Engine {
             pending_token: None,
             resident_ids_len: 0,
             last_input_kind: None,
+            #[cfg(test)]
+            diffusion_single_step: false,
+            #[cfg(test)]
+            diffusion_forced_draws: None,
             flash: None,
         };
         if let Some(path) = &settings.draft_model {

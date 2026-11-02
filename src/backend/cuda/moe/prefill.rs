@@ -897,13 +897,14 @@ impl Stage {
     }
 }
 
-/// Twice, Once and ClampedTwice prefill modes are 0, 1 and 2.
+/// Activation mode 2 selects tanh-GELU with two BF16 roundings.
 fn fused_act_mode(rounding: crate::model_spec::SwigluRounding) -> Result<i32> {
     use crate::model_spec::SwigluRounding as R;
     Ok(match rounding {
         R::Twice => 0,
         R::Once => 1,
         R::ClampedTwice => 2,
+        R::GeluTwice => 2,
         R::ClampedOnce => anyhow::bail!("ClampedOnce is not bound in the moe prefill path"),
     })
 }

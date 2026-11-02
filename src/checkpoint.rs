@@ -224,7 +224,15 @@ impl MappedCheckpoint {
             let planned = Self::planned_bytes(&expected, policy)?;
             return self.assemble_manifest("Gemma4", expected, policy, planned, None);
         }
-
+        if spec.architecture == Architecture::DiffusionGemma {
+            ensure!(
+                policy == LoadPolicy::TextOnly,
+                "DiffusionGemma text-only loading is required for DG1a"
+            );
+            let expected = self.diffusion_gemma_expected(spec)?;
+            let planned = Self::planned_bytes(&expected, policy)?;
+            return self.assemble_manifest("DiffusionGemma", expected, policy, planned, None);
+        }
         if spec.architecture == Architecture::Glm5Next {
             let mut expected = BTreeMap::new();
             Self::glm5_next_entries(spec, &mut expected)?;
@@ -283,7 +291,7 @@ impl MappedCheckpoint {
             | Architecture::EmbeddingGemma2 => {
                 bail!("checkpoint manifest requires a Qwen3.5-family spec")
             }
-            Architecture::DeepseekV41 => {
+            Architecture::DeepseekV41 | Architecture::DiffusionGemma => {
                 unreachable!("architecture has a dedicated manifest path")
             }
         };
@@ -325,7 +333,8 @@ impl MappedCheckpoint {
             | Architecture::Glm5Next
             | Architecture::LoopVl
             | Architecture::Gemma4
-            | Architecture::EmbeddingGemma2 => unreachable!(),
+            | Architecture::EmbeddingGemma2
+            | Architecture::DiffusionGemma => unreachable!(),
             Architecture::DeepseekV41 => {
                 unreachable!("DeepSeek-V4.1 has a dedicated manifest path")
             }
@@ -802,6 +811,136 @@ impl MappedCheckpoint {
         Ok(())
     }
 
+    fn diffusion_gemma_expected(
+        &self,
+        spec: &crate::model_spec::ModelSpec,
+    ) -> Result<BTreeMap<String, ExpectedTensor>> {
+        let mut expected = BTreeMap::new();
+        Self::diffusion_gemma_entries(spec, &mut expected)?;
+        let views = self.views()?;
+        for (name, shard) in &self.index.weight_map {
+            let scope = if name.starts_with("model.encoder.vision_tower.")
+                || name.starts_with("model.encoder.embed_vision.")
+            {
+                TensorScope::Vision
+            } else {
+                continue;
+            };
+            let tensor = views[shard].tensor(name)?;
+            put(
+                &mut expected,
+                name.clone(),
+                tensor.dtype(),
+                tensor.shape().to_vec(),
+                scope,
+            );
+        }
+        Ok(expected)
+    }
+
+    fn diffusion_gemma_entries(
+        spec: &crate::model_spec::ModelSpec,
+        expected: &mut BTreeMap<String, ExpectedTensor>,
+    ) -> Result<()> {
+        let moe = spec
+            .moe
+            .as_ref()
+            .context("DiffusionGemma spec is missing its MoE configuration")?;
+        let hidden = spec.hidden as usize;
+        let dense = spec.intermediate as usize;
+        let experts = moe.experts as usize;
+        let expert_i = moe.expert_intermediate as usize;
+        let canvas = spec
+            .canvas_length
+            .context("DiffusionGemma canvas length missing from the spec")?
+            as usize;
+        ensure!(
+            canvas > 0 && spec.vocab == 262_144,
+            "DiffusionGemma manifest requires a positive canvas and the published vocabulary"
+        );
+        let q_heads = spec.q_heads as usize;
+        let text = "model.decoder";
+        let mut add = |name: String, shape: Vec<usize>, scope| {
+            put(expected, name, Dtype::BF16, shape, scope);
+        };
+        add(
+            format!("{text}.embed_tokens.weight"),
+            vec![spec.vocab as usize, hidden],
+            TensorScope::Text,
+        );
+        add(
+            format!("{text}.norm.weight"),
+            vec![hidden],
+            TensorScope::Text,
+        );
+        for (name, shape) in [
+            ("self_conditioning.pre_norm", vec![hidden]),
+            ("self_conditioning.gate_proj", vec![dense, hidden]),
+            ("self_conditioning.up_proj", vec![dense, hidden]),
+            ("self_conditioning.down_proj", vec![hidden, dense]),
+        ] {
+            add(format!("{text}.{name}.weight"), shape, TensorScope::Text);
+        }
+        for (i, layer) in spec.layers.iter().enumerate() {
+            let g = layer
+                .geometry
+                .with_context(|| format!("DiffusionGemma layer {i} has no geometry"))?;
+            let head_dim = g.head_dim as usize;
+            let kv_heads = g.kv_heads.unwrap_or(spec.kv_heads) as usize;
+            let p = format!("{text}.layers.{i}");
+            for name in [
+                "input_layernorm",
+                "post_attention_layernorm",
+                "pre_feedforward_layernorm",
+                "pre_feedforward_layernorm_2",
+                "post_feedforward_layernorm",
+                "post_feedforward_layernorm_1",
+                "post_feedforward_layernorm_2",
+            ] {
+                add(
+                    format!("{p}.{name}.weight"),
+                    vec![hidden],
+                    TensorScope::Text,
+                );
+            }
+            add(format!("{p}.layer_scalar"), vec![1], TensorScope::Text);
+            add(
+                format!("model.encoder.language_model.layers.{i}.layer_scalar"),
+                vec![1],
+                TensorScope::Text,
+            );
+            for (name, shape) in [
+                ("self_attn.q_proj", vec![q_heads * head_dim, hidden]),
+                ("self_attn.o_proj", vec![hidden, q_heads * head_dim]),
+                ("self_attn.q_norm", vec![head_dim]),
+                ("self_attn.k_proj", vec![kv_heads * head_dim, hidden]),
+                ("self_attn.k_norm", vec![head_dim]),
+                ("mlp.gate_proj", vec![dense, hidden]),
+                ("mlp.up_proj", vec![dense, hidden]),
+                ("mlp.down_proj", vec![hidden, dense]),
+                ("router.proj", vec![experts, hidden]),
+            ] {
+                add(format!("{p}.{name}.weight"), shape, TensorScope::Text);
+            }
+            for (name, shape) in [
+                ("router.scale", vec![hidden]),
+                ("router.per_expert_scale", vec![experts]),
+                ("experts.gate_up_proj", vec![experts, 2 * expert_i, hidden]),
+                ("experts.down_proj", vec![experts, hidden, expert_i]),
+            ] {
+                add(format!("{p}.{name}"), shape, TensorScope::Text);
+            }
+            if layer.sliding_window.is_some() {
+                add(
+                    format!("{p}.self_attn.v_proj.weight"),
+                    vec![kv_heads * head_dim, hidden],
+                    TensorScope::Text,
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn text_entries(
         spec: &crate::model_spec::ModelSpec,
         expected: &mut BTreeMap<String, ExpectedTensor>,
@@ -824,7 +963,8 @@ impl MappedCheckpoint {
             | Architecture::LoopVl
             | Architecture::DeepseekV41
             | Architecture::Gemma4
-            | Architecture::EmbeddingGemma2 => {
+            | Architecture::EmbeddingGemma2
+            | Architecture::DiffusionGemma => {
                 unreachable!("architecture has a dedicated manifest path")
             }
         };
@@ -991,7 +1131,8 @@ impl MappedCheckpoint {
                         Architecture::Glm5Next
                         | Architecture::LoopVl
                         | Architecture::Gemma4
-                        | Architecture::EmbeddingGemma2 => {
+                        | Architecture::EmbeddingGemma2
+                        | Architecture::DiffusionGemma => {
                             unreachable!("architecture has a dedicated manifest path")
                         }
                         Architecture::DeepseekV41 => {
@@ -2157,11 +2298,13 @@ impl MappedCheckpoint {
 }
 
 /// Layer name prefixes of the published checkpoints.
-const LAYER_PREFIXES: [&str; 4] = [
+const LAYER_PREFIXES: [&str; 6] = [
     "model.layers.",
     "model.language_model.layers.",
     "language_model.layers.",
     "layers.",
+    "model.decoder.layers.",
+    "model.encoder.language_model.layers.",
 ];
 
 pub type ExpectedTensor = (Dtype, Vec<usize>, TensorScope);
@@ -2377,7 +2520,8 @@ impl TensorEntry {
     }
 
     pub(crate) fn is_routed_expert(&self) -> bool {
-        self.role.starts_with("mlp.experts.")
+        // DiffusionGemma publishes the fused experts without the mlp. segment.
+        self.role.starts_with("mlp.experts.") || self.role.starts_with("experts.")
     }
 
     pub(crate) fn is_non_expert_loaded(&self) -> bool {
@@ -2971,15 +3115,207 @@ mod component_tests {
         Ok(())
     }
 
+    fn diffusion_gemma_spec() -> Result<crate::model_spec::ModelSpec> {
+        let root: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/data/diffusiongemma-26b-a4b-config.json"
+        ))?;
+        crate::model_spec::ModelSpec::diffusion_gemma(
+            &root,
+            &serde_json::json!({
+                "eos_token_id": [1, 106, 50],
+                "max_denoising_steps": 48,
+                "t_min": 0.4,
+                "t_max": 0.8,
+                "confidence_threshold": 0.005,
+                "sampler_config": {"entropy_bound": 0.1},
+                "pad_token_id": 0,
+            }),
+        )
+    }
+
+    #[test]
+    fn diffusion_gemma_plan_matches_the_published_tensor_counts() -> Result<()> {
+        let spec = diffusion_gemma_spec()?;
+        ensure!(
+            spec.canvas_length == Some(256)
+                && spec.moe.as_ref().is_some_and(|moe| {
+                    moe.experts == 128
+                        && moe.experts_per_tok == 8
+                        && moe.expert_intermediate == 704
+                        && moe.shared_intermediate == 2112
+                        && !moe.shared_gate
+                })
+                && spec.layers.len() == 30
+                && spec
+                    .layers
+                    .iter()
+                    .filter(|l| l.sliding_window.is_some())
+                    .count()
+                    == 25
+                && spec.layers[5].geometry.as_ref().unwrap().kv_heads == Some(2)
+                && spec.layers[0].geometry.as_ref().unwrap().kv_heads.is_none()
+                && spec.layers[5].geometry.as_ref().unwrap().head_dim == 512
+                && spec.layers[0].geometry.as_ref().unwrap().head_dim == 256
+                && spec.eos == [1, 50, 106],
+            "DiffusionGemma spec drift: {spec:?}"
+        );
+        let mut expected = BTreeMap::new();
+        MappedCheckpoint::diffusion_gemma_entries(&spec, &mut expected)?;
+        let count = |scope| expected.values().filter(|e| e.2 == scope).count();
+        ensure!(
+            count(TensorScope::Text) == 691
+                && MappedCheckpoint::planned_bytes(&expected, LoadPolicy::TextOnly)?
+                    == 50_501_973_624usize,
+            "DiffusionGemma plan: text={} resident={}",
+            count(TensorScope::Text),
+            MappedCheckpoint::planned_bytes(&expected, LoadPolicy::TextOnly)?,
+        );
+        for name in [
+            "model.decoder.embed_tokens.weight",
+            "model.decoder.self_conditioning.down_proj.weight",
+            "model.decoder.layers.0.router.scale",
+            "model.decoder.layers.0.router.per_expert_scale",
+            "model.decoder.layers.0.experts.gate_up_proj",
+            "model.decoder.layers.0.experts.down_proj",
+            "model.decoder.layers.0.layer_scalar",
+            "model.encoder.language_model.layers.29.layer_scalar",
+            "model.decoder.layers.0.self_attn.v_proj.weight",
+        ] {
+            ensure!(
+                expected.contains_key(name),
+                "missing expected tensor {name}"
+            );
+        }
+        for name in [
+            "lm_head.weight",
+            "model.encoder.language_model.embed_tokens.weight",
+            "model.encoder.language_model.layers.0.mlp.up_proj.weight",
+            "model.decoder.layers.5.self_attn.v_proj.weight",
+            "model.decoder.layers.0.mlp.experts.gate_up_proj",
+        ] {
+            ensure!(
+                !expected.contains_key(name),
+                "tied or absent tensor must not be expected: {name}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "published checkpoint; set FF_MODEL; CPU only"]
+    fn published_diffusion_gemma_manifest_accounts_for_all_components() -> Result<()> {
+        let dir =
+            std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+        let spec = crate::model_spec::ModelSpec::read(&dir)?;
+        let checkpoint = MappedCheckpoint::open(&dir)?;
+        let manifest = checkpoint.manifest(&spec, LoadPolicy::TextOnly)?;
+        let count = |scope| {
+            manifest
+                .entries
+                .values()
+                .filter(|entry| entry.scope == scope)
+                .count()
+        };
+        ensure!(
+            manifest.entries.len() == 1047
+                && count(TensorScope::Text) == 691
+                && count(TensorScope::Vision) == 356
+                && manifest.resident_bytes == 50_501_973_624usize
+                && manifest
+                    .entries
+                    .values()
+                    .all(|e| e.load == (e.scope == TensorScope::Text)),
+            "DiffusionGemma manifest: entries={} vision={} resident={}",
+            manifest.entries.len(),
+            count(TensorScope::Vision),
+            manifest.resident_bytes
+        );
+        // Tier conservation (4595b03e form against the DiffusionGemma
+        // manifest): every planned byte is accounted exactly once, both
+        // capacity bounds hold, and the zero-expert-space control errors.
+        for (device_gib, host_gib, compute_units) in [(22u64, 40u64, 128), (10, 8, 48), (3, 3, 16)]
+        {
+            let resources = crate::experts::plan::BlockResources {
+                device_free_bytes: device_gib << 30,
+                host_available_bytes: host_gib << 30,
+                device_work_bytes: 512 << 20,
+                host_work_bytes: 128 << 20,
+                compute_units,
+                copy_engines: 2,
+                rows: 32,
+                staging_slots_max: 16,
+            };
+            let plan = crate::experts::plan::BlockResidency::new(&spec, &manifest, resources)?;
+            let slot = plan.experts.slot_bytes();
+            let gpu = plan.device_fixed_bytes
+                + plan.dense.resident_bytes as u64
+                + 2 * plan.dense.slot_bytes as u64
+                + u64::from(plan.experts.slots_total() + plan.experts.prefill_staging_slots) * slot;
+            let host = plan.host_fixed_bytes
+                + plan.dense.host_bytes as u64
+                + u64::from(plan.experts.host_blocks + plan.experts.spare_blocks) * slot;
+            ensure!(
+                gpu <= resources.device_free_bytes && host <= resources.host_available_bytes,
+                "DiffusionGemma model tier capacity exceeded"
+            );
+            let unique = plan.global_dense_bytes
+                + plan.dense.resident_bytes as u64
+                + plan.dense.host_bytes as u64
+                + plan.dense.disk_bytes as u64
+                + u64::from(plan.experts.slots_total() + plan.experts.host_blocks) * slot
+                + plan.experts.disk_bytes;
+            ensure!(
+                unique == manifest.resident_bytes as u64,
+                "DiffusionGemma model tier conservation"
+            );
+            let mut invalid = resources;
+            invalid.device_free_bytes = plan.global_dense_bytes + resources.device_work_bytes;
+            ensure!(
+                crate::experts::plan::BlockResidency::new(&spec, &manifest, invalid).is_err(),
+                "DiffusionGemma capacity control accepted zero expert space"
+            );
+        }
+        let layer = "model.decoder.layers.0.experts.gate_up_proj".to_owned();
+        type Mutation = fn(&mut BTreeMap<String, ExpectedTensor>, &str);
+        let mutants: [(&str, Mutation); 3] = [
+            ("missing", |e, name| {
+                e.remove(name);
+            }),
+            ("shape", |e, name| {
+                e.get_mut(name).expect("expected tensor").1[0] += 1;
+            }),
+            ("extra", |e, _| {
+                put(
+                    e,
+                    "model.decoder.layers.0.extra.weight".into(),
+                    Dtype::BF16,
+                    vec![1],
+                    TensorScope::Text,
+                );
+            }),
+        ];
+        for (label, mutate) in mutants {
+            let mut expected = checkpoint.diffusion_gemma_expected(&spec)?;
+            mutate(&mut expected, &layer);
+            let planned = MappedCheckpoint::planned_bytes(&expected, LoadPolicy::TextOnly)?;
+            ensure!(
+                checkpoint
+                    .assemble_manifest(
+                        "DiffusionGemma",
+                        expected,
+                        LoadPolicy::TextOnly,
+                        planned,
+                        None,
+                    )
+                    .is_err(),
+                "{label} mutant was accepted"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn clover_manifest_counts_all_side_weights() -> Result<()> {
-        ensure!(
-            serde_json::from_value::<crate::model_spec::Architecture>(serde_json::json!(
-                "DiffusionGemma"
-            ))
-            .is_err(),
-            "unvalidated architecture accepted in model geometry"
-        );
         let root = serde_json::from_str(include_str!("../tests/fixtures/clover_config.json"))?;
         let spec = crate::model_spec::ModelSpec::clover(
             &root,
