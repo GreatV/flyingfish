@@ -680,31 +680,6 @@ impl Loader<'_> {
         );
         Ok(())
     }
-    /// Validate and mark tensors without uploading them; the tier planner
-    /// owns their placement outside the device upload closure.
-    pub(crate) fn mark(&mut self, specs: &[(String, Vec<usize>)]) -> Result<()> {
-        for (name, shape) in specs {
-            let file = self
-                .index
-                .weight_map
-                .get(name)
-                .with_context(|| format!("missing tensor {name}"))?;
-            let tensor = self.tensors[file].tensor(name)?;
-            ensure!(
-                tensor.dtype() == Dtype::BF16,
-                "tensor {name}: expected BF16, found {:?}",
-                tensor.dtype()
-            );
-            ensure!(
-                tensor.shape() == *shape,
-                "tensor {name}: expected {shape:?}, found {:?}",
-                tensor.shape()
-            );
-            ensure!(self.seen.insert(name.clone()), "tensor {name} loaded twice");
-        }
-        Ok(())
-    }
-
     pub(crate) fn load(&mut self, specs: &[(String, Vec<usize>)]) -> Result<CudaSlice<bf16>> {
         let count = specs.iter().try_fold(0usize, |total, (_, shape)| {
             let n = shape.iter().try_fold(1usize, |n, &d| {
@@ -3033,7 +3008,6 @@ impl DiffusionWeights {
             let dense = spec.intermediate as usize;
             let moe = spec.moe.as_ref().context("DiffusionGemma MoE missing")?;
             let e = moe.experts as usize;
-            let ei = moe.expert_intermediate as usize;
             let mut layers = Vec::new();
             for (i, plan) in spec.layers.iter().enumerate() {
                 let g = plan.geometry.context("layer geometry missing")?;
@@ -3087,10 +3061,12 @@ impl DiffusionWeights {
                     vec![1],
                 )])?);
                 let p = format!("model.decoder.layers.{i}");
-                l.mark(&[
-                    (format!("{p}.experts.gate_up_proj"), vec![e, 2 * ei, h]),
-                    (format!("{p}.experts.down_proj"), vec![e, h, ei]),
-                ])?;
+                for name in [
+                    format!("{p}.experts.gate_up_proj"),
+                    format!("{p}.experts.down_proj"),
+                ] {
+                    l.defer(&name)?;
+                }
             }
             let embed = l.load(&[(
                 "model.decoder.embed_tokens.weight".to_owned(),

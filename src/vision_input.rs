@@ -366,7 +366,8 @@ impl MultimodalInput<'_> {
             Architecture::Llama
             | Architecture::Flint
             | Architecture::Glm5Next
-            | Architecture::Clover => {
+            | Architecture::Clover
+            | Architecture::DiffusionGemma => {
                 bail!("packed images require a supported multimodal architecture")
             }
             Architecture::DeepseekV41 => {

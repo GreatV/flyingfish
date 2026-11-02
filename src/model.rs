@@ -3,7 +3,7 @@ use crate::{
     config::Config,
     trace::Trace,
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use std::path::Path;
 use std::time::Instant;
 
@@ -512,7 +512,9 @@ pub fn layer_program(
             LayerStage::Hc(HcStage::Post),
             LayerStage::Common(O::NextNorm),
         ])),
-
+        crate::model_spec::Architecture::DiffusionGemma => {
+            bail!("DiffusionGemma layer program is not bound yet")
+        }
         crate::model_spec::Architecture::Llama
         | crate::model_spec::Architecture::Qwen35Text
         | crate::model_spec::Architecture::MiniCpmV47

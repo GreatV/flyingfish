@@ -3920,7 +3920,11 @@ impl Engine {
         if self.model_spec.architecture == crate::model_spec::Architecture::Glm5Next {
             return false;
         }
-        if matches!(self.model_spec.architecture, crate::model_spec::Architecture::Clover | crate::model_spec::Architecture::DiffusionGemma) {
+        if matches!(
+            self.model_spec.architecture,
+            crate::model_spec::Architecture::Clover
+                | crate::model_spec::Architecture::DiffusionGemma
+        ) {
             return false;
         }
         #[cfg(feature = "cuda")]
@@ -3931,14 +3935,13 @@ impl Engine {
     }
 
     pub fn capture(&mut self) -> Result<()> {
-        if self.diffusion.is_some() {
-            // Canvas graphs are captured per canvas inside the diffusion
-            // runtime; there is no fixed decode graph.
-            return Ok(());
-        }
         ensure!(
-            self.model_spec.architecture != crate::model_spec::Architecture::Clover,
-            "Clover canvas graph execution is not bound"
+            !matches!(
+                self.model_spec.architecture,
+                crate::model_spec::Architecture::Clover
+                    | crate::model_spec::Architecture::DiffusionGemma
+            ),
+            "canvas graph execution is not bound"
         );
         ensure!(
             self.model_spec.architecture != crate::model_spec::Architecture::Glm5Next,

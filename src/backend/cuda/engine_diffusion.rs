@@ -1,5 +1,4 @@
-//! DiffusionGemma block-diffusion execution: canvas decode over the shared
-//! decoder weights, encoder commits through the causal program.
+//! Clover and DiffusionGemma canvas execution.
 use super::*;
 use crate::backend::cuda::copy::RingCopy;
 use crate::backend::cuda::moe::combine::MoeCombineRouted;
@@ -715,6 +714,9 @@ impl Engine {
         ignore_eos: bool,
         graph: bool,
     ) -> Result<()> {
+        if self.diffusion.is_some() {
+            ensure!(!graph, "canvas graph execution is not bound");
+        }
         if let Some(runtime) = &mut self.diffusion
             && let Program::Clover(_) = &runtime.program
         {
@@ -726,7 +728,6 @@ impl Engine {
                 !ignore_eos,
                 "Clover generation requires the published EOS policy"
             );
-            ensure!(!graph, "Clover canvas graph execution is not bound");
             ensure!(
                 self.position == 0 && runtime.limit.is_none(),
                 "Clover generation requires reset"
@@ -2000,7 +2001,7 @@ impl Engine {
     /// and the engine stream (trajectory gate plumbing).
     #[cfg(test)]
     pub(crate) fn diffusion_encoder_chunk_public(&mut self, ids: &[u32]) -> Result<()> {
-        for chunk in ids.chunks(self.diffusion_canvas()) {
+        for chunk in ids.chunks(self.diffusion_canvas()?) {
             self.diffusion_encoder_chunk(chunk)?;
         }
         Ok(())
@@ -2038,7 +2039,7 @@ impl Engine {
             "prefill requires reset"
         );
         ensure!(
-            !ids.is_empty() && ids.len() + self.diffusion_canvas() <= self.capacity,
+            !ids.is_empty() && ids.len() + self.diffusion_canvas()? <= self.capacity,
             "prompt plus one canvas exceeds KV capacity {}",
             self.capacity
         );
@@ -2046,7 +2047,7 @@ impl Engine {
             ids.iter().all(|&x| x < self.model_spec.vocab),
             "input token id outside vocabulary"
         );
-        let canvas = self.diffusion_canvas();
+        let canvas = self.diffusion_canvas()?;
         if let Some(runtime) = &mut self.diffusion
             && let Program::Clover(state) = &mut runtime.program
         {
@@ -2148,8 +2149,16 @@ impl Engine {
     /// One shared-weight layer. `encoder` selects the causal windowed form
     /// (prompt and commit passes); otherwise the bidirectional canvas form.
     fn diffusion_layer(&mut self, i: usize, rows: usize, encoder: bool) -> Result<()> {
-        let prefix = self.diffusion.as_ref().context("canvas runtime missing")?.prefix;
-        let canvas = self.diffusion.as_ref().context("canvas runtime missing")?.canvas;
+        let prefix = self
+            .diffusion
+            .as_ref()
+            .context("canvas runtime missing")?
+            .prefix;
+        let canvas = self
+            .diffusion
+            .as_ref()
+            .context("canvas runtime missing")?
+            .canvas;
         let r = self
             .diffusion
             .as_mut()
@@ -2200,13 +2209,7 @@ impl Engine {
                         heads: hkv,
                         head_dim: d,
                     }
-                    .run(
-                        (prefix - history) % ring,
-                        0,
-                        history,
-                        true,
-                        false,
-                    )?;
+                    .run((prefix - history) % ring, 0, history, true, false)?;
                 }
                 (&r.stage_k, &r.stage_v, ring + canvas, history as i32, 0)
             } else {
@@ -2577,8 +2580,12 @@ impl Engine {
 }
 
 impl Engine {
-    fn diffusion_canvas(&self) -> usize {
-        self.diffusion.as_ref().map_or(0, |r| r.canvas)
+    fn diffusion_canvas(&self) -> Result<usize> {
+        Ok(self
+            .diffusion
+            .as_ref()
+            .context("diffusion runtime missing")?
+            .canvas)
     }
 
     fn diffusion_encoder_body(&mut self, rows: usize) -> Result<()> {
@@ -2595,8 +2602,7 @@ impl Engine {
         Ok(())
     }
 
-    /// Graph body: self-conditioning over the previous probabilities, the
-    /// canvas embedding, the shared layer stack, the final norm and the head.
+    /// Canvas self-conditioning, layer stack, final norm and head.
     fn canvas_forward(&mut self) -> Result<()> {
         if let Program::Clover(state) = &mut self
             .diffusion
@@ -2987,7 +2993,7 @@ impl Engine {
                 return Ok(());
             }
         }
-        let canvas = self.diffusion_canvas();
+        let canvas = self.diffusion_canvas()?;
         let padded = {
             let r = self
                 .diffusion
@@ -3150,10 +3156,7 @@ impl Engine {
         Ok(())
     }
 
-    /// Drains the committed canvas tokens; runs the next canvas when empty.
-    /// The canvas step runs eager: the cohort path host-syncs per layer for
-    /// the grouped-GEMM counts; the per-canvas graph returns with the tiered
-    /// residency work.
+    /// Canvas steps execute eagerly when the committed queue is empty.
     pub(super) fn canvas_logits(&self) -> Result<crate::backend::gpu::CudaView<'_, bf16>> {
         let runtime = self.diffusion.as_ref().context("canvas runtime missing")?;
         let width = self.model_spec.vocab as usize;
@@ -3168,16 +3171,23 @@ impl Engine {
         let runtime = self.diffusion.as_ref().context("canvas runtime missing")?;
         if let Program::Gemma(state) = &runtime.program {
             let width = self.model_spec.vocab as usize;
-            return Ok(self.device.stream.clone_dtoh(&state.logits.slice((runtime.canvas - 1) * width..runtime.canvas * width))?);
+            return Ok(self.device.stream.clone_dtoh(
+                &state
+                    .logits
+                    .slice((runtime.canvas - 1) * width..runtime.canvas * width),
+            )?);
         }
-        Ok(self.device.stream.clone_dtoh(&self.canvas_logits()?)?.into_iter().map(bf16::to_f32).collect())
+        Ok(self
+            .device
+            .stream
+            .clone_dtoh(&self.canvas_logits()?)?
+            .into_iter()
+            .map(bf16::to_f32)
+            .collect())
     }
 
     pub(super) fn decode_diffusion(&mut self, graph: bool) -> Result<u32> {
-        ensure!(
-            !graph || self.model_spec.architecture != crate::model_spec::Architecture::Clover,
-            "Clover canvas graph execution is not bound"
-        );
+        ensure!(!graph, "canvas graph execution is not bound");
         self.closure.assert_ready()?;
         ensure!(
             !self.poisoned,
@@ -3220,10 +3230,16 @@ fn clover_canvas_logits_readback_gpu() -> Result<()> {
     );
 
     fn state(runtime: &Runtime) -> &CloverState {
-        match &runtime.program { Program::Clover(state) => state, Program::Gemma(_) => panic!("expected Clover") }
+        match &runtime.program {
+            Program::Clover(state) => state,
+            Program::Gemma(_) => panic!("expected Clover"),
+        }
     }
     fn state_mut(runtime: &mut Runtime) -> &mut CloverState {
-        match &mut runtime.program { Program::Clover(state) => state, Program::Gemma(_) => panic!("expected Clover") }
+        match &mut runtime.program {
+            Program::Clover(state) => state,
+            Program::Gemma(_) => panic!("expected Clover"),
+        }
     }
     let directory =
         std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
