@@ -1560,6 +1560,11 @@ impl DenseStreaming {
 
 pub(crate) enum StoredTensor {
     Bf16(CudaSlice<bf16>),
+    Bf16Pair {
+        buffer: Arc<CudaSlice<bf16>>,
+        offset: usize,
+        len: usize,
+    },
     Bytes(CudaSlice<u8>),
     #[cfg(feature = "cuda")]
     Slot {
@@ -1568,6 +1573,55 @@ pub(crate) enum StoredTensor {
     },
 }
 impl StoredTensor {
+    fn contiguous_projection_pair(a: &TensorEntry, b: &TensorEntry) -> bool {
+        a.load
+            && b.load
+            && upload_entry(a)
+            && upload_entry(b)
+            && !a.native_byte_storage()
+            && !b.native_byte_storage()
+            && a.dtype == Dtype::BF16
+            && b.dtype == Dtype::BF16
+            && a.layer.is_some()
+            && a.layer == b.layer
+            && a.shard == b.shard
+            && a.data_start == b.data_start
+            && a.data_offsets[1] == b.data_offsets[0]
+            && a.shape.len() == 2
+            && b.shape.len() == 2
+            && a.shape[1] == b.shape[1]
+            && matches!(
+                (a.role.as_str(), b.role.as_str()),
+                ("mlp.gate_proj.weight", "mlp.up_proj.weight")
+                    | ("self_attn.q_proj.weight", "self_attn.v_proj.weight")
+            )
+    }
+
+    fn load_pair(
+        loader: &mut Loader<'_>,
+        first: (&String, &TensorEntry),
+        second: (&String, &TensorEntry),
+    ) -> Result<(Self, Self)> {
+        let len_a = first.1.shape.iter().product::<usize>();
+        let len_b = second.1.shape.iter().product::<usize>();
+        let buffer = Arc::new(loader.load(&[
+            (first.0.clone(), first.1.shape.clone()),
+            (second.0.clone(), second.1.shape.clone()),
+        ])?);
+        Ok((
+            Self::Bf16Pair {
+                buffer: Arc::clone(&buffer),
+                offset: 0,
+                len: len_a,
+            },
+            Self::Bf16Pair {
+                buffer,
+                offset: len_a,
+                len: len_b,
+            },
+        ))
+    }
+
     fn load(loader: &mut Loader<'_>, name: &str, entry: &TensorEntry) -> Result<Self> {
         if entry.native_byte_storage() {
             Ok(Self::Bytes(loader.load_bytes(
@@ -1759,14 +1813,20 @@ impl WeightCatalog {
         let started = Instant::now();
         let mut dense = DenseStreaming::new(dir, &manifest, plan, d)?;
         let mut offsets = vec![0; layers.len()];
+        let gemma = matches!(
+            spec.architecture,
+            crate::model_spec::Architecture::Gemma4
+                | crate::model_spec::Architecture::EmbeddingGemma2
+        );
         let ((tensors, uploaded), _) =
             checkpoint_mapped(&mapped, d, Some(&manifest), false, |loader| {
                 let mut tensors = BTreeMap::new();
-                for (name, entry) in &manifest.entries {
+                let mut iter = manifest.entries.iter().peekable();
+                while let Some((name, entry)) = iter.next() {
                     if !entry.load {
                         continue;
                     }
-                    let value = if entry.is_linear_projection()
+                    if entry.is_linear_projection()
                         && let Some(layer) = entry.layer
                         && dense.plan.slots[layer as usize].is_some()
                     {
@@ -1775,14 +1835,33 @@ impl WeightCatalog {
                         let pointer = dense.pointer(layer, offset, entry.bytes)?;
                         offsets[layer] += entry.bytes;
                         dense.defer(loader, name, entry, layer, offset)?;
-                        StoredTensor::Slot {
-                            pointer,
-                            bytes: entry.bytes,
-                        }
-                    } else {
-                        StoredTensor::load(loader, name, entry)?
-                    };
-                    tensors.insert(name.clone(), value);
+                        tensors.insert(
+                            name.clone(),
+                            StoredTensor::Slot {
+                                pointer,
+                                bytes: entry.bytes,
+                            },
+                        );
+                        continue;
+                    }
+                    if gemma
+                        && let Some(&(next_name, next_entry)) = iter.peek()
+                        && StoredTensor::contiguous_projection_pair(entry, next_entry)
+                        && next_entry
+                            .layer
+                            .is_none_or(|layer| dense.plan.slots[layer as usize].is_none())
+                    {
+                        iter.next();
+                        let (first, second) = StoredTensor::load_pair(
+                            loader,
+                            (name, entry),
+                            (next_name, next_entry),
+                        )?;
+                        tensors.insert(name.clone(), first);
+                        tensors.insert(next_name.clone(), second);
+                        continue;
+                    }
+                    tensors.insert(name.clone(), StoredTensor::load(loader, name, entry)?);
                 }
                 Ok((tensors, loader.bytes))
             })?;
@@ -1910,11 +1989,17 @@ impl WeightCatalog {
             "prefix-cache identity does not cover deferred expert bytes: uploaded={upload_bytes} selected={}",
             manifest.resident_bytes
         );
+        let gemma = matches!(
+            spec.architecture,
+            crate::model_spec::Architecture::Gemma4
+                | crate::model_spec::Architecture::EmbeddingGemma2
+        );
         let phase = Instant::now();
         let ((tensors, bytes, upload_timings), upload_digest) =
             checkpoint_mapped(&mapped, d, Some(&manifest), hash_uploads, |loader| {
                 let mut tensors = BTreeMap::new();
-                for (name, entry) in &manifest.entries {
+                let mut iter = manifest.entries.iter().peekable();
+                while let Some((name, entry)) = iter.next() {
                     if !entry.load {
                         continue;
                     }
@@ -1923,6 +2008,20 @@ impl WeightCatalog {
                             loader.seen.insert(name.clone()),
                             "expert tensor delegated twice: name={name}"
                         );
+                        continue;
+                    }
+                    if gemma
+                        && let Some(&(next_name, next_entry)) = iter.peek()
+                        && StoredTensor::contiguous_projection_pair(entry, next_entry)
+                    {
+                        iter.next();
+                        let (first, second) = StoredTensor::load_pair(
+                            loader,
+                            (name, entry),
+                            (next_name, next_entry),
+                        )?;
+                        tensors.insert(name.clone(), first);
+                        tensors.insert(next_name.clone(), second);
                         continue;
                     }
                     let value = StoredTensor::load(loader, name, entry)?;
@@ -1986,13 +2085,29 @@ impl WeightCatalog {
         );
         let rows = u32::try_from(entry.shape[0])?;
         let width = u32::try_from(entry.shape[1..].iter().product::<usize>())?;
-        super::contracts::view(
-            self.bf16(name)?,
-            stream,
-            0,
-            [rows, width],
-            [u64::from(width), 1],
-        )
+        match self.tensors.get(name) {
+            Some(StoredTensor::Bf16(values)) => {
+                super::contracts::view(values, stream, 0, [rows, width], [u64::from(width), 1])
+            }
+            Some(StoredTensor::Bf16Pair {
+                buffer,
+                offset,
+                len,
+            }) => {
+                ensure!(
+                    *len == (rows as usize) * (width as usize),
+                    "paired matrix slice extent differs: {name}"
+                );
+                super::contracts::view(
+                    buffer,
+                    stream,
+                    *offset,
+                    [rows, width],
+                    [u64::from(width), 1],
+                )
+            }
+            _ => anyhow::bail!("missing/non-BF16 tensor {name}"),
+        }
     }
 
     pub(crate) fn vector(

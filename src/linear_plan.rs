@@ -183,6 +183,47 @@ impl LayerDequantPlan {
             slots,
         })
     }
+
+    pub fn validate_contiguous_pair(
+        &self,
+        manifest: &TensorManifest,
+        first: &str,
+        second: &str,
+    ) -> Result<([u32; 2], u64)> {
+        let first_name = format!("{}{first}", self.prefix);
+        let second_name = format!("{}{second}", self.prefix);
+        let entry_a = manifest
+            .entries
+            .get(&first_name)
+            .with_context(|| format!("layer {} missing manifest entry {first_name}", self.layer))?;
+        let entry_b = manifest.entries.get(&second_name).with_context(|| {
+            format!("layer {} missing manifest entry {second_name}", self.layer)
+        })?;
+        ensure!(
+            entry_a.load
+                && entry_b.load
+                && entry_a.shard == entry_b.shard
+                && entry_a.data_start == entry_b.data_start
+                && entry_a.data_offsets[1] == entry_b.data_offsets[0]
+                && entry_a.dtype == Dtype::BF16
+                && entry_b.dtype == Dtype::BF16
+                && entry_a.shape.len() == 2
+                && entry_b.shape.len() == 2
+                && entry_a.shape[1] == entry_b.shape[1],
+            "layer {} projections {first_name} and {second_name} are not contiguous BF16 matrices with matching K in manifest",
+            self.layer
+        );
+        let rows_a = u32::try_from(entry_a.shape[0])?;
+        let rows_b = u32::try_from(entry_b.shape[0])?;
+        let k = u32::try_from(entry_a.shape[1])?;
+        let rows = rows_a
+            .checked_add(rows_b)
+            .context("fused projection output rows overflow")?;
+        let bytes = (entry_a.bytes as u64)
+            .checked_add(entry_b.bytes as u64)
+            .context("fused projection byte span overflow")?;
+        Ok(([rows, k], bytes))
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +325,119 @@ mod tests {
             assert!(LayerDequantPlan::from_manifest(&manifest, 0, format).is_err());
             manifest.entries.remove(&scale_name);
         }
+        let prefix = "model.language_model.layers.3.";
+        let gate_bytes = 6144 * 1536 * 2;
+        let q_bytes = 2048 * 1536 * 2;
+        let v_bytes = 256 * 1536 * 2;
+        let mut gemma_manifest = TensorManifest {
+            entries: [
+                (
+                    format!("{prefix}mlp.gate_proj.weight"),
+                    TensorEntry {
+                        dtype: Dtype::BF16,
+                        shape: vec![6144, 1536],
+                        shard: "model.safetensors".into(),
+                        bytes: gate_bytes,
+                        load: true,
+                        data_start: 1024,
+                        data_offsets: [0, gate_bytes as u64],
+                        scope: TensorScope::Text,
+                        layer: Some(3),
+                        role: "mlp.gate_proj.weight".into(),
+                        scale_name: None,
+                    },
+                ),
+                (
+                    format!("{prefix}mlp.up_proj.weight"),
+                    TensorEntry {
+                        dtype: Dtype::BF16,
+                        shape: vec![6144, 1536],
+                        shard: "model.safetensors".into(),
+                        bytes: gate_bytes,
+                        load: true,
+                        data_start: 1024,
+                        data_offsets: [gate_bytes as u64, (2 * gate_bytes) as u64],
+                        scope: TensorScope::Text,
+                        layer: Some(3),
+                        role: "mlp.up_proj.weight".into(),
+                        scale_name: None,
+                    },
+                ),
+                (
+                    format!("{prefix}self_attn.q_proj.weight"),
+                    TensorEntry {
+                        dtype: Dtype::BF16,
+                        shape: vec![2048, 1536],
+                        shard: "model.safetensors".into(),
+                        bytes: q_bytes,
+                        load: true,
+                        data_start: 1024,
+                        data_offsets: [(2 * gate_bytes) as u64, (2 * gate_bytes + q_bytes) as u64],
+                        scope: TensorScope::Text,
+                        layer: Some(3),
+                        role: "self_attn.q_proj.weight".into(),
+                        scale_name: None,
+                    },
+                ),
+                (
+                    format!("{prefix}self_attn.v_proj.weight"),
+                    TensorEntry {
+                        dtype: Dtype::BF16,
+                        shape: vec![256, 1536],
+                        shard: "model.safetensors".into(),
+                        bytes: v_bytes,
+                        load: true,
+                        data_start: 1024,
+                        data_offsets: [
+                            (2 * gate_bytes + q_bytes) as u64,
+                            (2 * gate_bytes + q_bytes + v_bytes) as u64,
+                        ],
+                        scope: TensorScope::Text,
+                        layer: Some(3),
+                        role: "self_attn.v_proj.weight".into(),
+                        scale_name: None,
+                    },
+                ),
+            ]
+            .into(),
+            resident_bytes: 2 * gate_bytes + q_bytes + v_bytes,
+        };
+        let gemma_plan = LayerDequantPlan::from_manifest(&gemma_manifest, 3, LinearFormat::Bf16)?;
+        assert_eq!(
+            gemma_plan.validate_contiguous_pair(
+                &gemma_manifest,
+                "mlp.gate_proj.weight",
+                "mlp.up_proj.weight"
+            )?,
+            ([12288, 1536], (2 * gate_bytes) as u64)
+        );
+        assert_eq!(
+            gemma_plan.validate_contiguous_pair(
+                &gemma_manifest,
+                "self_attn.q_proj.weight",
+                "self_attn.v_proj.weight"
+            )?,
+            ([2304, 1536], (q_bytes + v_bytes) as u64)
+        );
+        gemma_manifest
+            .entries
+            .get_mut(&format!("{prefix}mlp.up_proj.weight"))
+            .unwrap()
+            .data_offsets[0] += 512;
+        let gap_err = gemma_plan
+            .validate_contiguous_pair(
+                &gemma_manifest,
+                "mlp.gate_proj.weight",
+                "mlp.up_proj.weight",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            gap_err.contains("layer 3")
+                && gap_err.contains("model.language_model.layers.3.mlp.gate_proj.weight")
+                && gap_err.contains("model.language_model.layers.3.mlp.up_proj.weight"),
+            "{gap_err}"
+        );
         Ok(())
     }
 }
