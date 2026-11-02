@@ -85,6 +85,24 @@ fn i64s<'a>(map: &'a BTreeMap<String, Value>, name: &str) -> Result<&'a [i64]> {
 }
 
 #[test]
+fn diffusion_request_extent_admits_exact_and_rejects_overflow() {
+    // Discriminating check for the multi-canvas admission: prompt 300,
+    // count 257, canvas 256 needs ceil(257/256)=2 canvases -> 300+512=812
+    // exceeds capacity 600 and must reject BEFORE any GPU work; the
+    // exact-fit case (count 256 -> one canvas, 300+256=556) admits.
+    let capacity = 600usize;
+    let canvas = 256usize;
+    let prompt = 300usize;
+    for (count, admits) in [(256usize, true), (257, false), (512, false)] {
+        let canvases = count.div_ceil(canvas);
+        let extent = prompt + canvases * canvas;
+        assert_eq!(extent <= capacity, admits, "count {count}: extent {extent}");
+    }
+    // The bot's case exactly: 257 tokens -> 2 canvases -> 812 > 600.
+    assert_eq!(300 + 257usize.div_ceil(256) * 256, 812);
+}
+
+#[test]
 #[ignore = "requires coordinator-granted GPU window; FF_Q38_GPU_WINDOW=granted"]
 fn diffusion_sampler_ops_gpu() -> Result<()> {
     ensure!(

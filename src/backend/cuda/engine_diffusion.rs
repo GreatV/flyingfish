@@ -211,6 +211,9 @@ pub(crate) struct GemmaState {
     /// When false the emitted canvas pads after the first EOS; when true
     /// (generation requested ignore_eos) post-EOS tokens are kept.
     ignore_eos: bool,
+    /// Tokens requested by generation_request; prefill validates the full
+    /// multi-canvas extent against capacity.
+    requested: usize,
     #[cfg(test)]
     pub(crate) tap_capture: Option<Vec<CudaSlice<bf16>>>,
     #[cfg(test)]
@@ -740,6 +743,7 @@ impl Engine {
             runtime.terminal = false;
             if let Program::Gemma(state) = &mut runtime.program {
                 state.ignore_eos = ignore_eos;
+                state.requested = count;
             }
             #[cfg(test)]
             if let Program::Clover(state) = &mut runtime.program
@@ -1232,6 +1236,7 @@ impl Engine {
             confidence: diffusion_cfg.confidence,
             pad: diffusion_cfg.pad,
             ignore_eos: false,
+            requested: 0,
             #[cfg(test)]
             tap_capture: None,
             #[cfg(test)]
@@ -2060,6 +2065,29 @@ impl Engine {
             "prompt plus one canvas exceeds KV capacity {}",
             self.capacity
         );
+        if let Some(runtime) = &self.diffusion
+            && let Program::Gemma(state) = &runtime.program
+        {
+            let count = state.requested;
+            let canvas = self.diffusion_canvas()?;
+            let canvases = count.div_ceil(canvas);
+            let extent = ids
+                .len()
+                .checked_add(
+                    canvases
+                        .checked_mul(canvas)
+                        .context("canvas extent overflow")?,
+                )
+                .context("request extent overflow")?;
+            ensure!(
+                extent <= self.capacity,
+                "prompt plus requested canvases exceeds KV capacity {} ({} prompt + {} x {} canvas)",
+                self.capacity,
+                ids.len(),
+                canvases,
+                canvas
+            );
+        }
         ensure!(
             ids.iter().all(|&x| x < self.model_spec.vocab),
             "input token id outside vocabulary"
