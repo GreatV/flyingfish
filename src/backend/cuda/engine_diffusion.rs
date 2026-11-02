@@ -741,10 +741,6 @@ impl Engine {
             runtime.limit = Some(count);
             runtime.produced = 0;
             runtime.terminal = false;
-            if let Program::Gemma(state) = &mut runtime.program {
-                state.ignore_eos = ignore_eos;
-                state.requested = count;
-            }
             #[cfg(test)]
             if let Program::Clover(state) = &mut runtime.program
                 && let Some(capture) = &mut state.capture
@@ -758,7 +754,47 @@ impl Engine {
                 std::fs::create_dir(capture.directory())?;
             }
         }
+        if let Some(runtime) = &mut self.diffusion
+            && let Program::Gemma(state) = &mut runtime.program
+        {
+            state.ignore_eos = ignore_eos;
+            state.requested = count;
+            // Necessary condition at request time (the prompt length is only
+            // known at prefill, which carries the full extent check).
+            let canvas = self.diffusion_canvas()?;
+            let canvases = count.div_ceil(canvas);
+            let span = canvases
+                .checked_mul(canvas)
+                .context("canvas extent overflow")?;
+            ensure!(
+                span <= self.capacity,
+                "requested canvases exceed KV capacity {} ({} x {} canvas)",
+                self.capacity,
+                canvases,
+                canvas
+            );
+        }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generation_request_for_test(
+        &mut self,
+        count: usize,
+        ignore_eos: bool,
+    ) -> Result<()> {
+        self.generation_request(count, ignore_eos, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn diffusion_requested_for_test(&self) -> Option<usize> {
+        self.diffusion.as_ref().and_then(|runtime| {
+            if let Program::Gemma(state) = &runtime.program {
+                Some(state.requested)
+            } else {
+                None
+            }
+        })
     }
 
     pub(super) fn load_clover(
