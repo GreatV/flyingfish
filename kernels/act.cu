@@ -18,11 +18,11 @@ extern "C" __global__ void silu_mul(const __nv_bfloat16* gu, __nv_bfloat16* y,
     float g = __bfloat162float(gu[row * 2 * dim + d]);
     const float u = __bfloat162float(gu[row * 2 * dim + dim + d]);
     if (mode == 2) {
-      y[i] = __hmul(__float2bfloat16_rn(gelu_tanh(g)), gu[row * 2 * dim + dim + d]);
+      y[i] = __hmul(__float2bfloat16(gelu_tanh(g)), gu[row * 2 * dim + dim + d]);
     } else if (mode == 1) {
-      y[i] = __float2bfloat16_rn(g / (1.0f + expf(-g)) * u);
+      y[i] = __float2bfloat16(g / (1.0f + expf(-g)) * u);
     } else {
-      const __nv_bfloat16 s = __float2bfloat16_rn(g / (1.0f + expf(-g)));
+      const __nv_bfloat16 s = __float2bfloat16(g / (1.0f + expf(-g)));
       y[i] = __hmul(s, gu[row * 2 * dim + dim + d]);
     }
 }
