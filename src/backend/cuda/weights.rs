@@ -2328,6 +2328,7 @@ impl WeightCatalog {
             load_wall_ms,
         })
     }
+
     pub fn bf16(&self, name: &str) -> Result<&CudaSlice<bf16>> {
         match self.tensors.get(name) {
             Some(StoredTensor::Bf16(v)) => Ok(v),

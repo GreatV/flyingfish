@@ -1,10 +1,10 @@
-use super::vision_runtime::{EncodedImages, VisionIo, stage_view};
+use super::vision_runtime::{EncodedImages, VisionIo, dense, dense_at, record, stage_view};
 use crate::backend::cuda::{
     Device,
     blas::Blas,
     contracts::{RowDomain, SeqRef, TensorMut},
     cubin,
-    linear::{ClippedLinear, LinearBiasMode},
+    linear::{ClippedLinear, LinearBiasMode, LinearWeightRef},
     ops::{CommonOpsRef, RmsMode, RmsOptions, flat, grid},
     weights::WeightCatalog,
 };
@@ -13,7 +13,7 @@ use crate::backend::gpu::{
 };
 use crate::{
     model_spec::{AudioConfig, ModelSpec},
-    vision_input::{AudioClip, MultimodalInput, PositionPlan},
+    vision_input::{AudioClip, MultimodalInput, PositionPlan, SpliceRange},
 };
 use anyhow::{Context, Result, ensure};
 use half::bf16;
@@ -85,8 +85,104 @@ struct AudioOps {
     gather: CudaFunction,
 }
 
-pub(super) struct AudioRuntime {
-    config: AudioConfig,
+pub(super) enum AudioRuntime {
+    Encoder(Box<EncoderAudioRuntime>),
+    Raw(Box<RawAudioEmbedder>),
+}
+
+pub(super) enum AudioRequest {
+    Encoder(Box<EncoderAudioRequest>),
+    Raw(Box<RawAudioRequest>),
+}
+
+impl AudioRuntime {
+    pub(super) fn from_catalog(
+        model: &ModelSpec,
+        catalog: &mut WeightCatalog,
+        device: &Device,
+        blas: &mut Blas,
+        common: CommonOpsRef,
+    ) -> Result<Self> {
+        match model
+            .audio
+            .as_ref()
+            .context("audio configuration missing")?
+        {
+            AudioConfig::Encoder(_) => Ok(Self::Encoder(Box::new(
+                EncoderAudioRuntime::from_catalog(model, catalog, device, blas, common)?,
+            ))),
+            AudioConfig::Raw(_) => Ok(Self::Raw(Box::new(RawAudioEmbedder::from_catalog(
+                model, catalog, device, common,
+            )?))),
+        }
+    }
+
+    pub(super) fn request_bytes(
+        model: &ModelSpec,
+        input: &MultimodalInput<'_>,
+        positions: &PositionPlan,
+        capacity: usize,
+    ) -> Result<usize> {
+        match model
+            .audio
+            .as_ref()
+            .context("audio configuration missing")?
+        {
+            AudioConfig::Encoder(_) => EncoderAudioRuntime::request_bytes(model, input, capacity),
+            AudioConfig::Raw(_) => RawAudioEmbedder::request_bytes(model, positions),
+        }
+    }
+
+    pub(super) fn empty_features(
+        &self,
+        device: &Device,
+        positions: PositionPlan,
+    ) -> Result<EncodedImages> {
+        match self {
+            Self::Encoder(runtime) => runtime.empty_features(device, positions),
+            Self::Raw(runtime) => runtime.empty_features(device, positions),
+        }
+    }
+
+    pub(super) fn prepare(
+        &self,
+        device: &Device,
+        blas: &mut Blas,
+        input: &MultimodalInput<'_>,
+        positions: &PositionPlan,
+    ) -> Result<AudioRequest> {
+        match self {
+            Self::Encoder(runtime) => Ok(AudioRequest::Encoder(Box::new(
+                runtime.prepare(device, blas, input, positions)?,
+            ))),
+            Self::Raw(runtime) => Ok(AudioRequest::Raw(Box::new(
+                runtime.prepare(device, blas, input, positions)?,
+            ))),
+        }
+    }
+
+    pub(super) fn encode(
+        &self,
+        stream: &Arc<CudaStream>,
+        blas: &Blas,
+        request: AudioRequest,
+        features: &CudaSlice<bf16>,
+        trace: Option<&mut crate::trace::Trace>,
+    ) -> Result<()> {
+        match (self, request) {
+            (Self::Encoder(runtime), AudioRequest::Encoder(request)) => {
+                runtime.encode(stream, blas, *request, features, trace)
+            }
+            (Self::Raw(runtime), AudioRequest::Raw(request)) => {
+                runtime.encode(stream, blas, *request, features, trace)
+            }
+            _ => anyhow::bail!("audio request belongs to a different frontend"),
+        }
+    }
+}
+
+pub(super) struct EncoderAudioRuntime {
+    config: crate::model_spec::AudioEncoderConfig,
     width: u32,
     subsample: [(ClippedLinear, CudaSlice<bf16>); 2],
     input: ClippedLinear,
@@ -112,7 +208,7 @@ struct Clip {
     valid: u32,
 }
 
-pub(super) struct AudioRequest {
+pub(super) struct EncoderAudioRequest {
     clips: Vec<Clip>,
     patch: CudaSlice<bf16>,
     subsample: [CudaSlice<bf16>; 2],
@@ -129,7 +225,7 @@ pub(super) struct AudioRequest {
     features: CudaSlice<bf16>,
 }
 
-impl AudioRuntime {
+impl EncoderAudioRuntime {
     pub(super) fn from_catalog(
         model: &ModelSpec,
         catalog: &mut WeightCatalog,
@@ -137,7 +233,10 @@ impl AudioRuntime {
         blas: &mut Blas,
         common: CommonOpsRef,
     ) -> Result<Self> {
-        let a = model.audio.clone().context("audio configuration missing")?;
+        let AudioConfig::Encoder(a) = model.audio.clone().context("audio configuration missing")?
+        else {
+            anyhow::bail!("encoder audio configuration required");
+        };
         let h = a.hidden;
         let s = &device.stream;
         let module = cubin::module(&device.ctx, "vision_ops")?;
@@ -311,10 +410,13 @@ impl AudioRuntime {
         capacity: usize,
     ) -> Result<usize> {
         input.validate(model, capacity)?;
-        let a = model
+        let AudioConfig::Encoder(a) = model
             .audio
             .as_ref()
-            .context("audio configuration missing")?;
+            .context("audio configuration missing")?
+        else {
+            anyhow::bail!("encoder audio configuration required");
+        };
         let frames = input
             .audio
             .iter()
@@ -368,7 +470,7 @@ impl AudioRuntime {
         blas: &mut Blas,
         input: &MultimodalInput<'_>,
         positions: &PositionPlan,
-    ) -> Result<AudioRequest> {
+    ) -> Result<EncoderAudioRequest> {
         let s = &device.stream;
         let mut clips = Vec::new();
         for (clip, slot) in input.audio.iter().zip(positions.audio_slots()) {
@@ -447,7 +549,7 @@ impl AudioRuntime {
         let output = self.config.output as usize;
         let c0 = self.config.subsample_channels[0] as usize;
         let c1 = self.config.subsample_channels[1] as usize;
-        Ok(AudioRequest {
+        Ok(EncoderAudioRequest {
             clips,
             patch: s.alloc_zeros((t1 * 64 * 9).max(rows * 32 * c0 * 9))?,
             subsample: [s.alloc_zeros(t1 * 64 * c0)?, s.alloc_zeros(rows * 32 * c1)?],
@@ -536,7 +638,7 @@ impl AudioRuntime {
     fn branch(
         &self,
         s: &Arc<CudaStream>,
-        work: &AudioRequest,
+        work: &EncoderAudioRequest,
         weight: &CudaSlice<bf16>,
         rows: u32,
         scale: f32,
@@ -559,7 +661,7 @@ impl AudioRuntime {
         &self,
         s: &Arc<CudaStream>,
         blas: &Blas,
-        work: &AudioRequest,
+        work: &EncoderAudioRequest,
         ff: &FeedForward,
         domain: RowDomain,
         mut trace: Option<(&mut crate::trace::Trace, &str)>,
@@ -625,7 +727,7 @@ impl AudioRuntime {
         &self,
         s: &Arc<CudaStream>,
         blas: &Blas,
-        work: &AudioRequest,
+        work: &EncoderAudioRequest,
         weight: &ClippedLinear,
         buffers: (&CudaSlice<bf16>, &CudaSlice<bf16>),
         rows: u32,
@@ -645,7 +747,7 @@ impl AudioRuntime {
         &self,
         s: &Arc<CudaStream>,
         blas: &Blas,
-        work: AudioRequest,
+        work: EncoderAudioRequest,
         features: &CudaSlice<bf16>,
         mut trace: Option<&mut crate::trace::Trace>,
     ) -> Result<()> {
@@ -967,6 +1069,221 @@ impl AudioRuntime {
                 values.into_iter().map(bf16::to_f32).collect(),
             )?;
         }
+        Ok(())
+    }
+}
+
+pub(super) struct RawAudioEmbedder {
+    config: crate::model_spec::RawAudioConfig,
+    projection: CudaSlice<bf16>,
+    ones: CudaSlice<bf16>,
+    cast: CudaFunction,
+    common: CommonOpsRef,
+    io: Arc<VisionIo>,
+}
+
+pub(super) struct RawAudioRequest {
+    positions: PositionPlan,
+    samples: CudaSlice<f32>,
+    norm: CudaSlice<bf16>,
+    projected: Option<CudaSlice<bf16>>,
+    meta: CudaSlice<i32>,
+    rows: u32,
+}
+
+impl RawAudioEmbedder {
+    pub(super) fn from_catalog(
+        model: &ModelSpec,
+        catalog: &mut WeightCatalog,
+        device: &Device,
+        common: CommonOpsRef,
+    ) -> Result<Self> {
+        let AudioConfig::Raw(config) = model.audio.as_ref().context("raw audio config missing")?
+        else {
+            anyhow::bail!("raw audio configuration required");
+        };
+        Ok(Self {
+            config: config.clone(),
+            projection: catalog.take_bf16(
+                "model.embed_audio.embedding_projection.weight",
+                &[config.output as usize, config.frame as usize],
+            )?,
+            ones: device
+                .stream
+                .clone_htod(&vec![bf16::ONE; config.frame as usize])?,
+            cast: cubin::module(&device.ctx, "vision_ops")?
+                .load_function("vision_affine_cast_bf16")?,
+            common,
+            io: Arc::new(VisionIo::new(device, config.output)?),
+        })
+    }
+
+    pub(super) fn request_bytes(model: &ModelSpec, plan: &PositionPlan) -> Result<usize> {
+        let AudioConfig::Raw(config) = model.audio.as_ref().context("raw audio config missing")?
+        else {
+            anyhow::bail!("raw audio configuration required");
+        };
+        let rows = plan.audio_slots().iter().try_fold(0usize, |sum, slot| {
+            sum.checked_add(slot.features.len())
+                .context("raw audio rows overflow")
+        })?;
+        let projected = if plan.slots().is_empty() {
+            0
+        } else {
+            2 * rows as u128 * u128::from(config.output)
+        };
+        usize::try_from(6 * rows as u128 * u128::from(config.frame) + projected + 32)
+            .context("raw audio workspace exceeds host indexing")
+    }
+
+    pub(super) fn empty_features(
+        &self,
+        device: &Device,
+        positions: PositionPlan,
+    ) -> Result<EncodedImages> {
+        let features = device
+            .stream
+            .alloc_zeros(positions.feature_rows() * self.config.output as usize)?;
+        EncodedImages::new(positions, features, self.io.clone())
+    }
+
+    pub(super) fn prepare(
+        &self,
+        device: &Device,
+        blas: &mut Blas,
+        input: &MultimodalInput<'_>,
+        positions: &PositionPlan,
+    ) -> Result<RawAudioRequest> {
+        let mut samples = Vec::new();
+        for clip in input.audio {
+            for (frame, &valid) in clip
+                .features
+                .chunks_exact(self.config.frame as usize)
+                .zip(clip.mask)
+            {
+                if valid {
+                    samples.extend_from_slice(frame);
+                }
+            }
+        }
+        let rows = u32::try_from(samples.len() / self.config.frame as usize)?;
+        ensure!(
+            rows > 0
+                && rows as usize
+                    == positions
+                        .audio_slots()
+                        .iter()
+                        .map(|s| s.features.len())
+                        .sum::<usize>(),
+            "raw audio packed row mismatch"
+        );
+        blas.prepare_request_fixed(rows, self.config.output, self.config.frame)?;
+        let s = &device.stream;
+        Ok(RawAudioRequest {
+            positions: positions.clone(),
+            samples: s.clone_htod(&samples)?,
+            norm: s.alloc_zeros(samples.len())?,
+            projected: if positions.slots().is_empty() {
+                None
+            } else {
+                Some(s.alloc_zeros(rows as usize * self.config.output as usize)?)
+            },
+            meta: s.clone_htod(&[0, rows as i32, rows as i32, rows as i32, 0, 0, 0, 0])?,
+            rows,
+        })
+    }
+
+    pub(super) fn encode(
+        &self,
+        stream: &Arc<CudaStream>,
+        blas: &Blas,
+        request: RawAudioRequest,
+        features: &CudaSlice<bf16>,
+        mut trace: Option<&mut crate::trace::Trace>,
+    ) -> Result<()> {
+        use crate::backend::cuda::contracts::{RowDomain, SeqRef};
+        let rows = request.rows;
+        let width = self.config.frame;
+        let count = u64::from(rows) * u64::from(width);
+        unsafe {
+            stream
+                .launch_builder(&self.cast)
+                .arg(&request.samples)
+                .arg(&request.norm)
+                .arg(&count)
+                .arg(&0.0f32)
+                .arg(&1.0f32)
+                .launch(flat(count as usize))?;
+        }
+        let domain = RowDomain {
+            meta: SeqRef {
+                ptr: request.meta.device_ptr(stream).0,
+            },
+            row_base: 0,
+            row_capacity: rows,
+        };
+        self.common.norm.rms_with(
+            stream,
+            domain,
+            dense(&request.norm, stream, [rows, 1, width])?,
+            dense(&self.ones, stream, [width])?,
+            &mut TensorMut(dense(&request.norm, stream, [rows, 1, width])?),
+            RmsOptions {
+                mode: RmsMode::Unrounded,
+                eps: self.config.rms_eps,
+            },
+        )?;
+        record(
+            &mut trace,
+            stream,
+            "audio.raw_norm",
+            &request.norm,
+            width,
+            rows,
+        )?;
+        let output = request.projected.as_ref().unwrap_or(features);
+        blas.linear_typed(
+            crate::op_contract::ExecutionPhase::Prefill,
+            LinearWeightRef::Bf16(dense(
+                &self.projection,
+                stream,
+                [self.config.output, width],
+            )?),
+            dense(&request.norm, stream, [rows, width])?,
+            &mut TensorMut(dense_at(output, stream, [rows, self.config.output], 0)?),
+        )?;
+        record(
+            &mut trace,
+            stream,
+            "audio.features",
+            output,
+            self.config.output,
+            rows,
+        )?;
+        if request.projected.is_some() {
+            let mut first = 0;
+            for slot in request.positions.audio_slots() {
+                let end = first + slot.features.len();
+                self.io.splice(
+                    stream,
+                    dense(output, stream, [rows, self.config.output])?,
+                    &mut TensorMut(dense(
+                        features,
+                        stream,
+                        [
+                            u32::try_from(request.positions.feature_rows())?,
+                            self.config.output,
+                        ],
+                    )?),
+                    &SpliceRange {
+                        chunk_rows: slot.features.clone(),
+                        feature_rows: first..end,
+                    },
+                )?;
+                first = end;
+            }
+        }
+        stream.synchronize()?;
         Ok(())
     }
 }

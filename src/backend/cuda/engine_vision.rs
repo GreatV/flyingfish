@@ -15,7 +15,7 @@ use crate::{
             PatchGrid, PatchPacking, VisionAttnBindings, VisionAttnOps, VisionAttnPlan,
             VisionMergerBindings, VisionMergerOps, VisionMergerPlan, VisionSpec,
         },
-        weights::{StoredTensor, WeightCatalog},
+        weights::WeightCatalog,
     },
     model_spec::{Architecture, ModelSpec},
     vision_input::{ImageGrid, MultimodalInput, PositionPlan, SpliceRange, VisionPositions},
@@ -128,7 +128,7 @@ impl VisionGeometry {
     }
 }
 
-fn dense<T: crate::backend::gpu::DeviceRepr + Copy, const R: usize>(
+pub(super) fn dense<T: crate::backend::gpu::DeviceRepr + Copy, const R: usize>(
     buffer: &CudaSlice<T>,
     stream: &Arc<CudaStream>,
     shape: [u32; R],
@@ -152,7 +152,7 @@ fn dense<T: crate::backend::gpu::DeviceRepr + Copy, const R: usize>(
     }
 }
 
-fn dense_at<T: crate::backend::gpu::DeviceRepr + Copy, const R: usize>(
+pub(super) fn dense_at<T: crate::backend::gpu::DeviceRepr + Copy, const R: usize>(
     buffer: &CudaSlice<T>,
     stream: &Arc<CudaStream>,
     shape: [u32; R],
@@ -483,7 +483,7 @@ impl VisionIo {
         }
     }
 
-    fn splice(
+    pub(super) fn splice(
         &self,
         stream: &Arc<CudaStream>,
         features: Tensor<bf16, 2>,
@@ -731,8 +731,8 @@ struct AffineWeights<T = bf16> {
 impl AffineWeights {
     fn take(catalog: &mut WeightCatalog, name: &str, width: u32) -> Result<Self> {
         Ok(Self {
-            weight: take(catalog, &format!("{name}.weight"), &[width as usize])?,
-            bias: take(catalog, &format!("{name}.bias"), &[width as usize])?,
+            weight: catalog.take_bf16(&format!("{name}.weight"), &[width as usize])?,
+            bias: catalog.take_bf16(&format!("{name}.bias"), &[width as usize])?,
         })
     }
 }
@@ -753,8 +753,8 @@ impl BiasedWeight {
         bias_mode: LinearBiasMode,
     ) -> Result<Self> {
         Ok(Self {
-            weight: take(catalog, &format!("{name}.weight"), stored_shape)?,
-            bias: take(catalog, &format!("{name}.bias"), &[shape[0] as usize])?,
+            weight: catalog.take_bf16(&format!("{name}.weight"), stored_shape)?,
+            bias: catalog.take_bf16(&format!("{name}.bias"), &[shape[0] as usize])?,
             shape,
             bias_mode,
             f32_bias: None,
@@ -917,6 +917,7 @@ impl VisionWeights {
             ]
         };
         let window_width = (merge * merge) as usize * mlp_usize;
+<<<<<<< HEAD
         let (patch, position, post_norm, blocks, window, merger, deepstack, expected) =
             match architecture {
                 Architecture::Qwen35Text | Architecture::Qwen3Vl => {
@@ -970,6 +971,26 @@ impl VisionWeights {
                     let merger = MergerWeights {
                         norm: AffineWeights::take(catalog, "model.visual.merger.norm", hidden)?,
                         fc1: BiasedWeight::take(
+=======
+        let (patch, position, post_norm, blocks, window, merger, expected) = match architecture {
+            Architecture::Qwen35Text => {
+                let patch = BiasedWeight::patch(
+                    catalog,
+                    "model.visual.patch_embed.proj",
+                    [hidden, geometry.patch],
+                    &patch_shape,
+                )?;
+                let position = catalog.take_bf16(
+                    "model.visual.pos_embed.weight",
+                    &[position_rows, hidden_usize],
+                )?;
+                let mut blocks = Vec::with_capacity(depth as usize);
+                for i in 0..depth {
+                    let p = format!("model.visual.blocks.{i}");
+                    blocks.push(BlockWeights {
+                        norm1: AffineWeights::take(catalog, &format!("{p}.norm1"), hidden)?,
+                        qkv: QkvWeights::Fused(BiasedWeight::take(
+>>>>>>> f6244ff8 (Support Gemma 4 12B and 31B media input)
                             catalog,
                             "model.visual.merger.linear_fc1",
                             [geometry.spec.merger_fc1, geometry.spec.merger_fc1],
@@ -1042,6 +1063,7 @@ impl VisionWeights {
                             [hidden, hidden],
                             &[hidden_usize, hidden_usize],
                             LinearBiasMode::BeforeOutputRound,
+<<<<<<< HEAD
                         )
                     };
                     let mut blocks = Vec::with_capacity(depth as usize);
@@ -1086,6 +1108,85 @@ impl VisionWeights {
                         k: projection(catalog, p, "k")?,
                         v: projection(catalog, p, "v")?,
                         projection: projection(catalog, p, "out")?,
+=======
+                        )?,
+                        norm2: AffineWeights::take(catalog, &format!("{p}.norm2"), hidden)?,
+                        fc1: BiasedWeight::take(
+                            catalog,
+                            &format!("{p}.mlp.linear_fc1"),
+                            [mlp, hidden],
+                            &[mlp_usize, hidden_usize],
+                            LinearBiasMode::BeforeOutputRound,
+                        )?,
+                        fc2: BiasedWeight::take(
+                            catalog,
+                            &format!("{p}.mlp.linear_fc2"),
+                            [hidden, mlp],
+                            &[hidden_usize, mlp_usize],
+                            LinearBiasMode::BeforeOutputRound,
+                        )?,
+                    });
+                }
+                let merger = MergerWeights {
+                    norm: AffineWeights::take(catalog, "model.visual.merger.norm", hidden)?,
+                    fc1: BiasedWeight::take(
+                        catalog,
+                        "model.visual.merger.linear_fc1",
+                        [geometry.spec.merger_fc1, geometry.spec.merger_fc1],
+                        &[fc1_usize, fc1_usize],
+                        LinearBiasMode::BeforeOutputRound,
+                    )?,
+                    fc2: BiasedWeight::take(
+                        catalog,
+                        "model.visual.merger.linear_fc2",
+                        [geometry.output(), geometry.spec.merger_fc1],
+                        &[output_usize, fc1_usize],
+                        LinearBiasMode::BeforeOutputRound,
+                    )?,
+                };
+                (
+                    patch,
+                    position,
+                    None,
+                    blocks,
+                    None,
+                    merger,
+                    2 + 1 + 6 + depth as usize * 12,
+                )
+            }
+            Architecture::MiniCpmV47 => {
+                let patch = BiasedWeight::patch(
+                    catalog,
+                    "model.vision_tower.embeddings.patch_embedding",
+                    [hidden, geometry.patch],
+                    &patch_shape,
+                )?;
+                let position = catalog.take_bf16(
+                    "model.vision_tower.embeddings.position_embedding.weight",
+                    &[position_rows, hidden_usize],
+                )?;
+                let post_norm = Some(AffineWeights::take(
+                    catalog,
+                    "model.vision_tower.post_layernorm",
+                    hidden,
+                )?);
+                let projection = |catalog: &mut WeightCatalog,
+                                  prefix: &str,
+                                  name: &str|
+                 -> Result<BiasedWeight> {
+                    BiasedWeight::take(
+                        catalog,
+                        &format!("{prefix}.self_attn.{name}_proj"),
+                        [hidden, hidden],
+                        &[hidden_usize, hidden_usize],
+                        LinearBiasMode::BeforeOutputRound,
+                    )
+                };
+                let mut blocks = Vec::with_capacity(depth as usize);
+                for i in 0..depth {
+                    let p = format!("model.vision_tower.encoder.layers.{i}");
+                    blocks.push(BlockWeights {
+>>>>>>> f6244ff8 (Support Gemma 4 12B and 31B media input)
                         norm1: AffineWeights::take(catalog, &format!("{p}.layer_norm1"), hidden)?,
                         pre_norm: AffineWeights::take(
                             catalog,
@@ -1175,11 +1276,13 @@ impl VisionWeights {
 pub(super) enum VisionRuntime {
     LayerNorm(Box<LayerNormTower>),
     Axial(Box<AxialTower>),
+    Unified(Box<UnifiedTower>),
 }
 
 pub(super) enum VisionRequest {
     LayerNorm(Box<LayerNormRequest>),
     Axial(Box<AxialRequest>),
+    Unified(Box<UnifiedRequest>),
 }
 
 impl VisionRuntime {
@@ -1188,8 +1291,23 @@ impl VisionRuntime {
         input: &MultimodalInput<'_>,
         capacity: usize,
     ) -> Result<usize> {
+        if model.vision.as_ref().is_some_and(|v| v.unified.is_some()) {
+            let plan = input.validate(model, capacity)?;
+            let v = model
+                .vision
+                .as_ref()
+                .context("vision configuration missing")?;
+            return UnifiedTower::request_bytes(v, &plan);
+        }
         if model.vision.as_ref().is_some_and(|v| v.axial.is_some()) {
-            AxialTower::request_bytes(model, input, capacity)
+            AxialTower::request_bytes(
+                model
+                    .vision
+                    .as_ref()
+                    .context("vision configuration missing")?,
+                input,
+                &input.validate(model, capacity)?,
+            )
         } else {
             LayerNormTower::request_bytes(model, input, capacity)
         }
@@ -1201,9 +1319,37 @@ impl VisionRuntime {
         device: &Device,
         common: CommonOpsRef,
     ) -> Result<Self> {
+        if model.vision.as_ref().is_some_and(|v| v.unified.is_some()) {
+            return Ok(Self::Unified(Box::new(UnifiedTower::from_catalog(
+                model
+                    .vision
+                    .as_ref()
+                    .context("vision configuration missing")?,
+                catalog,
+                device,
+                common,
+            )?)));
+        }
         if model.vision.as_ref().is_some_and(|v| v.axial.is_some()) {
+            let (tower, projection) =
+                if model.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
+                    ("vision_tower", "embed_vision.embedding_projection.weight")
+                } else {
+                    (
+                        "model.vision_tower",
+                        "model.embed_vision.embedding_projection.weight",
+                    )
+                };
             Ok(Self::Axial(Box::new(AxialTower::from_catalog(
-                model, catalog, device, common,
+                model
+                    .vision
+                    .as_ref()
+                    .context("vision configuration missing")?,
+                catalog,
+                device,
+                common,
+                tower,
+                projection,
             )?)))
         } else {
             Ok(Self::LayerNorm(Box::new(LayerNormTower::from_catalog(
@@ -1218,6 +1364,7 @@ impl VisionRuntime {
         blas: &mut Blas,
         input: &MultimodalInput<'_>,
         capacity: usize,
+        positions: PositionPlan,
         reserve: usize,
     ) -> Result<VisionRequest> {
         match self {
@@ -1225,7 +1372,10 @@ impl VisionRuntime {
                 tower.prepare(device, blas, input, capacity, reserve)?,
             ))),
             Self::Axial(tower) => Ok(VisionRequest::Axial(Box::new(
-                tower.prepare(device, blas, input, capacity, reserve)?,
+                tower.prepare(device, blas, input, positions, reserve)?,
+            ))),
+            Self::Unified(tower) => Ok(VisionRequest::Unified(Box::new(
+                tower.prepare(device, blas, input, positions)?,
             ))),
         }
     }
@@ -1244,8 +1394,301 @@ impl VisionRuntime {
             (Self::Axial(tower), VisionRequest::Axial(request)) => {
                 tower.encode(stream, blas, *request, trace)
             }
+            (Self::Unified(tower), VisionRequest::Unified(request)) => {
+                tower.encode(stream, blas, *request, trace)
+            }
             _ => bail!("vision request belongs to a different tower"),
         }
+    }
+}
+
+pub(super) struct UnifiedTower {
+    vision: crate::model_spec::VisionConfig,
+    norms: [AffineWeights; 3],
+    patch: BiasedWeight,
+    position: CudaSlice<bf16>,
+    projection: CudaSlice<bf16>,
+    ones: CudaSlice<bf16>,
+    cast: CudaFunction,
+    axis: CudaFunction,
+    common: CommonOpsRef,
+    io: Arc<VisionIo>,
+}
+
+pub(super) struct UnifiedRequest {
+    positions: PositionPlan,
+    pixels: CudaSlice<f32>,
+    patches: CudaSlice<bf16>,
+    hidden: CudaSlice<bf16>,
+    norm: CudaSlice<bf16>,
+    projected: Option<CudaSlice<bf16>>,
+    features: CudaSlice<bf16>,
+    meta: CudaSlice<i32>,
+}
+
+impl UnifiedTower {
+    fn from_catalog(
+        vision: &crate::model_spec::VisionConfig,
+        catalog: &mut WeightCatalog,
+        device: &Device,
+        common: CommonOpsRef,
+    ) -> Result<Self> {
+        vision.validate(Architecture::Gemma4)?;
+        ensure!(
+            vision.unified.is_some(),
+            "unified vision configuration missing"
+        );
+        let h = vision.hidden;
+        let patch = u32::try_from(vision.patch_elements(Architecture::Gemma4)?)?;
+        let module = cubin::module(&device.ctx, "vision_ops")?;
+        Ok(Self {
+            vision: vision.clone(),
+            norms: [
+                AffineWeights::take(catalog, "model.vision_embedder.patch_ln1", patch)?,
+                AffineWeights::take(catalog, "model.vision_embedder.patch_ln2", h)?,
+                AffineWeights::take(catalog, "model.vision_embedder.pos_norm", h)?,
+            ],
+            patch: BiasedWeight::take(
+                catalog,
+                "model.vision_embedder.patch_dense",
+                [h, patch],
+                &[h as usize, patch as usize],
+                LinearBiasMode::BeforeOutputRound,
+            )?,
+            position: catalog.take_bf16(
+                "model.vision_embedder.pos_embedding",
+                &[vision.position_side as usize, 2, h as usize],
+            )?,
+            projection: catalog.take_bf16(
+                "model.embed_vision.embedding_projection.weight",
+                &[vision.output as usize, h as usize],
+            )?,
+            ones: device.stream.clone_htod(&vec![bf16::ONE; h as usize])?,
+            cast: module.load_function("vision_affine_cast_bf16")?,
+            axis: module.load_function("vision_axis_position_add_bf16")?,
+            common,
+            io: Arc::new(VisionIo::new(device, vision.output)?),
+        })
+    }
+
+    fn request_bytes(
+        vision: &crate::model_spec::VisionConfig,
+        plan: &PositionPlan,
+    ) -> Result<usize> {
+        let rows = plan.patch_rows() as u128;
+        let patch = vision.patch_elements(Architecture::Gemma4)? as u128;
+        let h = u128::from(vision.hidden);
+        let projected = if plan.audio_slots().is_empty() {
+            0
+        } else {
+            2 * rows * u128::from(vision.output)
+        };
+        usize::try_from(
+            rows * (6 * patch + 4 * h)
+                + projected
+                + 2 * plan.feature_rows() as u128 * u128::from(vision.output)
+                + 32,
+        )
+        .context("unified vision workspace exceeds host indexing")
+    }
+
+    fn prepare(
+        &self,
+        device: &Device,
+        blas: &mut Blas,
+        input: &MultimodalInput<'_>,
+        positions: PositionPlan,
+    ) -> Result<UnifiedRequest> {
+        let rows = u32::try_from(positions.patch_rows())?;
+        let h = self.vision.hidden;
+        let patch = self.vision.patch_elements(Architecture::Gemma4)?;
+        self.patch.prepare(&device.stream, blas, rows)?;
+        blas.prepare_request_fixed(rows, self.vision.output, h)?;
+        let s = &device.stream;
+        Ok(UnifiedRequest {
+            projected: if positions.audio_slots().is_empty() {
+                None
+            } else {
+                Some(s.alloc_zeros(rows as usize * self.vision.output as usize)?)
+            },
+            features: s.alloc_zeros(positions.feature_rows() * self.vision.output as usize)?,
+            positions,
+            pixels: s.clone_htod(input.pixel_values)?,
+            patches: s.alloc_zeros(rows as usize * patch)?,
+            hidden: s.alloc_zeros(rows as usize * h as usize)?,
+            norm: s.alloc_zeros(rows as usize * h as usize)?,
+            meta: s.clone_htod(&[0, rows as i32, rows as i32, rows as i32, 0, 0, 0, 0])?,
+        })
+    }
+
+    fn layer_norm(
+        &self,
+        stream: &Arc<CudaStream>,
+        data: &CudaSlice<bf16>,
+        rows: u32,
+        index: usize,
+    ) -> Result<()> {
+        let width = u32::try_from(self.norms[index].weight.len())?;
+        self.common.norm.layer_norm(
+            stream,
+            dense(data, stream, [rows, 1, width])?,
+            dense(&self.norms[index].weight, stream, [width])?,
+            dense(&self.norms[index].bias, stream, [width])?,
+            &mut TensorMut(dense(data, stream, [rows, 1, width])?),
+            1e-5,
+        )
+    }
+
+    fn encode(
+        &self,
+        stream: &Arc<CudaStream>,
+        blas: &Blas,
+        request: UnifiedRequest,
+        mut trace: Option<&mut crate::trace::Trace>,
+    ) -> Result<EncodedImages> {
+        use crate::backend::cuda::contracts::{RowDomain, SeqRef};
+        let rows = u32::try_from(request.positions.patch_rows())?;
+        let h = self.vision.hidden;
+        let patch = self.patch.shape[1];
+        let count = u64::from(rows) * u64::from(patch);
+        unsafe {
+            stream
+                .launch_builder(&self.cast)
+                .arg(&request.pixels)
+                .arg(&request.patches)
+                .arg(&count)
+                .arg(&0.0f32)
+                .arg(&1.0f32)
+                .launch(flat(count as usize))?;
+        }
+        self.layer_norm(stream, &request.patches, rows, 0)?;
+        record(
+            &mut trace,
+            stream,
+            "vision.patch_ln1",
+            &request.patches,
+            patch,
+            rows,
+        )?;
+        self.patch.run(
+            stream,
+            blas,
+            dense(&request.patches, stream, [rows, patch])?,
+            &mut TensorMut(dense(&request.hidden, stream, [rows, h])?),
+        )?;
+        record(
+            &mut trace,
+            stream,
+            "vision.patch_dense",
+            &request.hidden,
+            h,
+            rows,
+        )?;
+        self.layer_norm(stream, &request.hidden, rows, 1)?;
+        record(
+            &mut trace,
+            stream,
+            "vision.patch_ln2",
+            &request.hidden,
+            h,
+            rows,
+        )?;
+        for slot in request.positions.slots() {
+            let offset = slot.patches.start * h as usize;
+            let end = slot.patches.end * h as usize;
+            unsafe {
+                stream
+                    .launch_builder(&self.axis)
+                    .arg(&request.hidden.slice(offset..end))
+                    .arg(&self.position)
+                    .arg(&request.hidden.slice(offset..end))
+                    .arg(&slot.grid.h)
+                    .arg(&slot.grid.w)
+                    .arg(&h)
+                    .arg(&self.vision.position_side)
+                    .arg(&u64::from(h))
+                    .arg(&(2 * u64::from(h)))
+                    .launch(flat(slot.patches.len() * h as usize))?;
+            }
+        }
+        record(
+            &mut trace,
+            stream,
+            "vision.position",
+            &request.hidden,
+            h,
+            rows,
+        )?;
+        self.layer_norm(stream, &request.hidden, rows, 2)?;
+        record(
+            &mut trace,
+            stream,
+            "vision.pos_norm",
+            &request.hidden,
+            h,
+            rows,
+        )?;
+        let domain = RowDomain {
+            meta: SeqRef {
+                ptr: request.meta.device_ptr(stream).0,
+            },
+            row_base: 0,
+            row_capacity: rows,
+        };
+        self.common.norm.rms_with(
+            stream,
+            domain,
+            dense(&request.hidden, stream, [rows, 1, h])?,
+            dense(&self.ones, stream, [h])?,
+            &mut TensorMut(dense(&request.norm, stream, [rows, 1, h])?),
+            RmsOptions {
+                mode: RmsMode::Unrounded,
+                eps: self
+                    .vision
+                    .unified
+                    .as_ref()
+                    .context("unified config missing")?
+                    .rms_eps,
+            },
+        )?;
+        record(&mut trace, stream, "vision.rms", &request.norm, h, rows)?;
+        let output = request.projected.as_ref().unwrap_or(&request.features);
+        blas.linear_typed(
+            crate::op_contract::ExecutionPhase::Prefill,
+            LinearWeightRef::Bf16(dense(&self.projection, stream, [self.vision.output, h])?),
+            dense(&request.norm, stream, [rows, h])?,
+            &mut TensorMut(dense_at(output, stream, [rows, self.vision.output], 0)?),
+        )?;
+        record(
+            &mut trace,
+            stream,
+            "vision.features",
+            output,
+            self.vision.output,
+            rows,
+        )?;
+        if request.projected.is_some() {
+            for slot in request.positions.slots() {
+                self.io.splice(
+                    stream,
+                    dense(output, stream, [rows, self.vision.output])?,
+                    &mut TensorMut(dense(
+                        &request.features,
+                        stream,
+                        [
+                            u32::try_from(request.positions.feature_rows())?,
+                            self.vision.output,
+                        ],
+                    )?),
+                    &SpliceRange {
+                        chunk_rows: slot.features.clone(),
+                        feature_rows: slot.patches.clone(),
+                    },
+                )?;
+            }
+        }
+        stream.synchronize()?;
+        EncodedImages::new(request.positions, request.features, self.io.clone())
     }
 }
 
@@ -1457,7 +1900,7 @@ fn tower_bytes(geometry: &VisionGeometry, packings: &VisionPackings) -> Result<(
     Ok((payload, scratch))
 }
 
-fn record(
+pub(super) fn record(
     trace: &mut Option<&mut crate::trace::Trace>,
     stream: &Arc<CudaStream>,
     name: &str,
@@ -2543,7 +2986,7 @@ struct AxialOps {
 }
 
 pub(super) struct AxialTower {
-    model: ModelSpec,
+    vision: crate::model_spec::VisionConfig,
     patch: ClippedLinear,
     position: CudaSlice<bf16>,
     projection: ClippedLinear,
@@ -2589,17 +3032,15 @@ pub(super) struct AxialRequest {
 }
 
 impl AxialTower {
-    fn from_catalog(
-        model: &ModelSpec,
+    pub(super) fn from_catalog(
+        vision: &crate::model_spec::VisionConfig,
         catalog: &mut WeightCatalog,
         device: &Device,
         common: CommonOpsRef,
+        tower_prefix: &str,
+        projection_name: &str,
     ) -> Result<Self> {
-        let vision = model
-            .vision
-            .as_ref()
-            .context("vision configuration missing")?;
-        vision.validate(model.architecture)?;
+        vision.validate(crate::model_spec::Architecture::Gemma4)?;
         let axial = vision
             .axial
             .as_ref()
@@ -2607,48 +3048,33 @@ impl AxialTower {
         let h = vision.hidden;
         let i = vision.intermediate;
         let d = axial.head_dim;
-        let tower = if model.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
-            "vision_tower"
-        } else {
-            "model.vision_tower"
-        };
-        let embedder = if model.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
-            "embed_vision.embedding_projection.weight"
-        } else {
-            "model.embed_vision.embedding_projection.weight"
-        };
         let patch = ClippedLinear::take(
             catalog,
-            &format!("{tower}.patch_embedder.input_proj.weight"),
+            &format!("{tower_prefix}.patch_embedder.input_proj.weight"),
             [
                 h,
-                u32::try_from(vision.patch_elements(model.architecture)?)?,
+                u32::try_from(vision.patch_elements(crate::model_spec::Architecture::Gemma4)?)?,
             ],
             None,
         )?;
-        let position = take(
-            catalog,
-            &format!("{tower}.patch_embedder.position_embedding_table"),
+        let position = catalog.take_bf16(
+            &format!("{tower_prefix}.patch_embedder.position_embedding_table"),
             &[2, vision.position_side as usize, h as usize],
         )?;
-        let projection = ClippedLinear::take(catalog, embedder, [vision.output, h], None)?;
+        let projection = ClippedLinear::take(catalog, projection_name, [vision.output, h], None)?;
         let standardization = if axial.standardize {
             Some([
-                take(catalog, &format!("{tower}.std_bias"), &[h as usize])?,
-                take(catalog, &format!("{tower}.std_scale"), &[h as usize])?,
+                catalog.take_bf16(&format!("{tower_prefix}.std_bias"), &[h as usize])?,
+                catalog.take_bf16(&format!("{tower_prefix}.std_scale"), &[h as usize])?,
             ])
         } else {
             None
         };
         let mut blocks = Vec::with_capacity(vision.depth as usize);
         for layer in 0..vision.depth {
-            let prefix = format!("{tower}.encoder.layers.{layer}");
+            let prefix = format!("{tower_prefix}.encoder.layers.{layer}");
             let mut norm = |name: &str, width: u32| {
-                take(
-                    catalog,
-                    &format!("{prefix}.{name}.weight"),
-                    &[width as usize],
-                )
+                catalog.take_bf16(&format!("{prefix}.{name}.weight"), &[width as usize])
             };
             let input_norm = norm("input_layernorm", h)?;
             let post_attention_norm = norm("post_attention_layernorm", h)?;
@@ -2693,7 +3119,7 @@ impl AxialTower {
             activation: cubin::module(&device.ctx, "act")?.load_function("silu_mul_split")?,
         };
         Ok(Self {
-            model: model.clone(),
+            vision: vision.clone(),
             patch,
             position,
             projection,
@@ -2707,15 +3133,10 @@ impl AxialTower {
     }
 
     fn request_bytes(
-        model: &ModelSpec,
+        vision: &crate::model_spec::VisionConfig,
         input: &MultimodalInput<'_>,
-        capacity: usize,
+        plan: &PositionPlan,
     ) -> Result<usize> {
-        let plan = input.validate(model, capacity)?;
-        let vision = model
-            .vision
-            .as_ref()
-            .context("vision configuration missing")?;
         let axial = vision
             .axial
             .as_ref()
@@ -2726,7 +3147,7 @@ impl AxialTower {
             .map(|g| u128::from(g.h) * u128::from(g.w))
             .max()
             .context("empty image request")?;
-        let patch = vision.patch_elements(model.architecture)? as u128;
+        let patch = vision.patch_elements(crate::model_spec::Architecture::Gemma4)? as u128;
         let h = u128::from(vision.hidden);
         let i = u128::from(vision.intermediate);
         let soft = max_rows / u128::from(vision.merge).pow(2);
@@ -2745,25 +3166,20 @@ impl AxialTower {
         .context("axial workspace exceeds host indexing")
     }
 
-    fn prepare(
+    pub(super) fn prepare(
         &self,
         device: &Device,
         blas: &mut Blas,
         input: &MultimodalInput<'_>,
-        capacity: usize,
+        positions: PositionPlan,
         reserve: usize,
     ) -> Result<AxialRequest> {
-        let positions = input.validate(&self.model, capacity)?;
-        let vision = self
-            .model
-            .vision
-            .as_ref()
-            .context("vision configuration missing")?;
+        let vision = &self.vision;
         let axial = vision
             .axial
             .as_ref()
             .context("axial configuration missing")?;
-        let bytes = Self::request_bytes(&self.model, input, capacity)?;
+        let bytes = Self::request_bytes(vision, input, &positions)?;
         let (free, _) = device.ctx.mem_get_info()?;
         ensure!(
             free.checked_sub(reserve).is_some_and(|n| bytes <= n),
@@ -2898,7 +3314,7 @@ impl AxialTower {
         )
     }
 
-    fn encode(
+    pub(super) fn encode(
         &self,
         stream: &Arc<CudaStream>,
         blas: &Blas,
@@ -2906,11 +3322,7 @@ impl AxialTower {
         mut trace: Option<&mut crate::trace::Trace>,
     ) -> Result<EncodedImages> {
         use crate::backend::cuda::contracts::{RowDomain, SeqRef};
-        let vision = self
-            .model
-            .vision
-            .as_ref()
-            .context("vision configuration missing")?;
+        let vision = &self.vision;
         let axial = vision
             .axial
             .as_ref()
@@ -2974,8 +3386,8 @@ impl AxialTower {
                         .arg(&image.grid.w)
                         .arg(&h)
                         .arg(&vision.position_side)
-                        .arg(&(vision.position_side as u64 * h as u64))
-                        .arg(&(h as u64))
+                        .arg(&(u64::from(vision.position_side) * u64::from(h)))
+                        .arg(&u64::from(h))
                         .launch(flat(rows as usize * h as usize))?;
                 }
                 record(
@@ -3045,6 +3457,7 @@ impl AxialTower {
                         },
                         keys: rows as usize,
                         prefix: None,
+                        image_blocks: None,
                     })?;
                     linear(&block.output, &request.core, &request.delta)?;
                     unsafe {
@@ -9656,6 +10069,7 @@ impl IdolPipelineRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::cuda::weights::StoredTensor;
 
     fn test_blas(
         device: &Device,
@@ -11320,8 +11734,7 @@ mod tests {
             [vision.hidden, geometry.patch],
             &stored_shape,
         )?;
-        let position = take(
-            &mut catalog,
+        let position = catalog.take_bf16(
             "model.visual.pos_embed.weight",
             &[2304, vision.hidden as usize],
         )?;

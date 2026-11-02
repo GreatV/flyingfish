@@ -4,7 +4,7 @@ use crate::backend::cuda::contracts::view;
 use crate::backend::cuda::{
     attention_d256::{AttentionBindings, FullAttentionOps, FullAttentionPlan, PositionBindings},
     contracts::{RowDomain, Scratch, Tensor, TensorMut},
-    flash::{Flash, Score},
+    flash::{Flash, Query, Score},
     gdn::{
         CUDA_GRID_YZ_MAX, GdnBindings, GdnConvWeights, GdnDecayWeights, GdnGateInput, GdnOps,
         GdnPlan,
@@ -665,6 +665,7 @@ pub(super) struct Runtime {
     vision_bytes: usize,
     media_reserved_bytes: usize,
     audio: Option<super::audio_runtime::AudioRuntime>,
+    image_blocks: Option<CudaSlice<u32>>,
     #[cfg(test)]
     pub(super) audio_encode_calls: usize,
     #[cfg(test)]
@@ -2146,6 +2147,7 @@ impl Runtime {
             vision_bytes: 0,
             media_reserved_bytes: 0,
             audio: None,
+            image_blocks: None,
             #[cfg(test)]
             audio_encode_calls: 0,
             #[cfg(test)]
@@ -2608,6 +2610,7 @@ impl Engine {
 
     pub(super) fn reset_qwen_positions(&mut self) -> Result<()> {
         if let Some(q) = self.qwen.as_mut() {
+            q.image_blocks = None;
             #[cfg(test)]
             {
                 q.vision_encode_calls = 0;
@@ -2657,7 +2660,7 @@ impl Engine {
                             .model_spec
                             .audio
                             .as_ref()
-                            .is_some_and(|a| id == a.token)
+                            .is_some_and(|a| id == a.tokens()[0])
                     {
                         0
                     } else {
@@ -2711,7 +2714,7 @@ impl Engine {
         let audio_bytes = if input.audio.is_empty() {
             0
         } else {
-            super::audio_runtime::AudioRuntime::request_bytes(model, input, capacity)?
+            super::audio_runtime::AudioRuntime::request_bytes(model, input, &plan, capacity)?
         };
         let vision_bytes = if plan.slots().is_empty() {
             0
@@ -2730,7 +2733,20 @@ impl Engine {
                 .checked_add(feature_bytes)
                 .context("audio request bytes overflow")?
         };
-        let request_bytes = vision_bytes.max(audio_peak);
+        let block_bytes = if model.per_layer_input.is_none()
+            && model.architecture == crate::model_spec::Architecture::Gemma4
+            && !plan.slots().is_empty()
+        {
+            capacity
+                .checked_mul(8)
+                .context("image block bytes overflow")?
+        } else {
+            0
+        };
+        let request_bytes = vision_bytes
+            .max(audio_peak)
+            .checked_add(block_bytes)
+            .context("media request bytes overflow")?;
         Ok((audio_bytes, vision_bytes, request_bytes))
     }
 
@@ -2777,8 +2793,14 @@ impl Engine {
         self.poisoned = true;
         let images = if vision_bytes != 0 {
             let vision = q.vision.as_ref().context("vision runtime missing")?;
-            let request =
-                vision.prepare(&self.device, &mut self.blas, input, self.capacity, reserve)?;
+            let request = vision.prepare(
+                &self.device,
+                &mut self.blas,
+                input,
+                self.capacity,
+                plan.clone(),
+                reserve,
+            )?;
             let images = vision.encode(
                 &self.device.stream,
                 &self.blas,
@@ -2808,8 +2830,27 @@ impl Engine {
             )?;
             #[cfg(test)]
             {
-                q.audio_encode_calls += input.audio.len();
+                q.audio_encode_calls += if matches!(
+                    self.model_spec.audio,
+                    Some(crate::model_spec::AudioConfig::Raw(_))
+                ) {
+                    1
+                } else {
+                    input.audio.len()
+                };
             }
+        }
+        if self.model_spec.architecture == crate::model_spec::Architecture::Gemma4
+            && self.model_spec.per_layer_input.is_none()
+            && !plan.slots().is_empty()
+        {
+            ensure!(
+                plan.slots()
+                    .iter()
+                    .all(|slot| slot.tokens.len() <= self.chunk),
+                "prefill workspace cannot fit a complete image block"
+            );
+            q.image_blocks = Some(self.device.stream.clone_htod(&plan.image_blocks()?)?);
         }
         if let Some(trace) = trace.as_mut() {
             let values = self.device.stream.clone_dtoh(&images.features)?;
@@ -5469,7 +5510,24 @@ impl Engine {
                                 layout.sliding_window.map(|window| window as usize - 1)
                             },
                         };
-                        flash.run(&w.qkv, q_stride, stage_k, stage_v, &mut w.attn, shape)?;
+                        if !decode
+                            && layout.sliding_window.is_some()
+                            && let Some(blocks) = &q.image_blocks
+                        {
+                            flash.run_masked(Query {
+                                q: &w.qkv,
+                                q_row_stride: q_stride,
+                                k: stage_k,
+                                v: stage_v,
+                                out: &mut w.attn,
+                                shape,
+                                keys: shape.start + rows,
+                                prefix: None,
+                                image_blocks: Some((blocks, self.position - shape.start)),
+                            })?;
+                        } else {
+                            flash.run(&w.qkv, q_stride, stage_k, stage_v, &mut w.attn, shape)?;
+                        }
                     }
                 }
                 if overflow && !reader {
@@ -6006,6 +6064,7 @@ impl Engine {
     }
 
     #[cfg(test)]
+    /// Probe rows are packed as [rows, kv_heads, head_dim].
     pub(crate) fn gemma_kv_rows(
         &self,
         layer: usize,

@@ -613,16 +613,20 @@ impl MappedCheckpoint {
         let mut expected = BTreeMap::new();
         Self::gemma4_entries(spec, &mut expected)?;
         if let Some(vision) = &spec.vision {
-            let (tower, projection) =
-                if spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
-                    ("vision_tower", "embed_vision.embedding_projection.weight")
-                } else {
-                    (
-                        "model.vision_tower",
-                        "model.embed_vision.embedding_projection.weight",
-                    )
-                };
-            Self::axial_vision_entries(vision, tower, projection, &mut expected)?;
+            if vision.unified.is_some() {
+                Self::unified_vision_entries(vision, &mut expected)?;
+            } else {
+                let (tower, projection) =
+                    if spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
+                        ("vision_tower", "embed_vision.embedding_projection.weight")
+                    } else {
+                        (
+                            "model.vision_tower",
+                            "model.embed_vision.embedding_projection.weight",
+                        )
+                    };
+                Self::axial_vision_entries(vision, tower, projection, &mut expected)?;
+            }
         }
         Self::audio_entries(spec, &mut expected)?;
         let views = self.views()?;
@@ -661,8 +665,21 @@ impl MappedCheckpoint {
         spec: &crate::model_spec::ModelSpec,
         expected: &mut BTreeMap<String, ExpectedTensor>,
     ) -> Result<()> {
-        let Some(a) = &spec.audio else {
+        let Some(audio) = &spec.audio else {
             return Ok(());
+        };
+        let a = match audio {
+            crate::model_spec::AudioConfig::Raw(a) => {
+                put(
+                    expected,
+                    "model.embed_audio.embedding_projection.weight".into(),
+                    Dtype::BF16,
+                    vec![a.output as usize, a.frame as usize],
+                    TensorScope::Audio,
+                );
+                return Ok(());
+            }
+            crate::model_spec::AudioConfig::Encoder(a) => a,
         };
         let h = a.hidden as usize;
         let mut add = |name, shape| put(expected, name, Dtype::BF16, shape, TensorScope::Audio);
@@ -740,6 +757,51 @@ impl MappedCheckpoint {
                 format!("{p}.lconv1d.depthwise_conv1d.weight"),
                 vec![h, 1, a.conv_kernel as usize],
             );
+        }
+        Ok(())
+    }
+
+    fn unified_vision_entries(
+        vision: &crate::model_spec::VisionConfig,
+        expected: &mut BTreeMap<String, ExpectedTensor>,
+    ) -> Result<()> {
+        vision.validate(crate::model_spec::Architecture::Gemma4)?;
+        ensure!(
+            vision.unified.is_some(),
+            "unified vision configuration missing"
+        );
+        let h = vision.hidden as usize;
+        let patch = vision.patch_elements(crate::model_spec::Architecture::Gemma4)?;
+        let mut add = |name: &str, shape: Vec<usize>| {
+            put(
+                expected,
+                name.into(),
+                Dtype::BF16,
+                shape,
+                TensorScope::Vision,
+            );
+        };
+        for (name, shape) in [
+            ("model.vision_embedder.patch_dense.weight", vec![h, patch]),
+            ("model.vision_embedder.patch_dense.bias", vec![h]),
+            (
+                "model.vision_embedder.pos_embedding",
+                vec![vision.position_side as usize, 2, h],
+            ),
+            (
+                "model.embed_vision.embedding_projection.weight",
+                vec![vision.output as usize, h],
+            ),
+        ] {
+            add(name, shape);
+        }
+        for (name, width) in [("patch_ln1", patch), ("patch_ln2", h), ("pos_norm", h)] {
+            for suffix in ["weight", "bias"] {
+                add(
+                    &format!("model.vision_embedder.{name}.{suffix}"),
+                    vec![width],
+                );
+            }
         }
         Ok(())
     }
@@ -3154,7 +3216,6 @@ pub enum LoadPolicy {
     TextWithVision,
     /// For the standalone vision component; cannot construct a text Engine.
     VisionOnly,
-    /// Audio component attached to an existing text engine.
     AudioOnly,
     TextWithMtp,
     /// Only MTP and the shared embedding/head; no target layers or final norm.
@@ -4356,6 +4417,45 @@ mod component_tests {
                         "shared projection binding: {name}"
                     );
                 }
+                let vision = spec.vision.as_ref().context("large vision spec")?;
+                let (vision_count, vision_bytes) = if vision.unified.is_some() {
+                    MappedCheckpoint::unified_vision_entries(vision, &mut expected)?;
+                    (10, 99_844_608)
+                } else {
+                    MappedCheckpoint::axial_vision_entries(
+                        vision,
+                        "model.vision_tower",
+                        "model.embed_vision.embedding_projection.weight",
+                        &mut expected,
+                    )?;
+                    (356, 1_151_487_072)
+                };
+                ensure!(
+                    expected
+                        .values()
+                        .filter(|e| e.2 == TensorScope::Vision)
+                        .count()
+                        == vision_count
+                        && MappedCheckpoint::planned_bytes(&expected, LoadPolicy::VisionOnly)?
+                            == vision_bytes,
+                    "large vision manifest count or allocation size changed"
+                );
+                if spec.hidden == 5376 {
+                    let mut encoder_vision = vision.clone();
+                    encoder_vision.output = 2816;
+                    let mut encoder = BTreeMap::new();
+                    MappedCheckpoint::axial_vision_entries(
+                        &encoder_vision,
+                        "model.encoder.vision_tower",
+                        "model.encoder.embed_vision.embedding_projection.weight",
+                        &mut encoder,
+                    )?;
+                    ensure!(encoder.len() == 356
+                        && encoder.contains_key("model.encoder.vision_tower.encoder.layers.26.self_attn.q_proj.linear.weight")
+                        && encoder["model.encoder.embed_vision.embedding_projection.weight"].1 == [2816, 1152]
+                        && MappedCheckpoint::planned_bytes(&encoder, LoadPolicy::VisionOnly)? == 1_145_588_832,
+                        "shared axial manifest lost its binding prefix or output width");
+                }
                 continue;
             }
             MappedCheckpoint::axial_vision_entries(
@@ -4406,10 +4506,12 @@ mod component_tests {
         let manifest = checkpoint.manifest(&spec, LoadPolicy::TextOnly)?;
         if spec.vision.is_some() {
             let vision_manifest = checkpoint.manifest(&spec, LoadPolicy::VisionOnly)?;
-            let expected_vision_bytes = if spec.hidden == 1536 {
-                337_089_408
-            } else {
-                338_662_272
+            let expected_vision_bytes = match spec.hidden {
+                1536 => 337_089_408,
+                2560 => 338_662_272,
+                3840 => 99_844_608,
+                5376 => 1_151_487_072,
+                hidden => bail!("unexpected vision hidden size {hidden}"),
             };
             ensure!(
                 vision_manifest.resident_bytes == expected_vision_bytes
@@ -4436,12 +4538,14 @@ mod component_tests {
             let audio_manifest = checkpoint.manifest(&spec, LoadPolicy::AudioOnly)?;
             ensure!(
                 audio_manifest.resident_bytes
-                    == if spec.hidden == 1536 {
-                        614_368_768
-                    } else {
-                        617_514_496
+                    == match spec.hidden {
+                        1536 => 614_368_768,
+                        2560 => 617_514_496,
+                        3840 => 4_915_200,
+                        hidden => bail!("unexpected audio hidden size {hidden}"),
                     }
-                    && audio_manifest.entries.values().filter(|e| e.load).count() == 752
+                    && audio_manifest.entries.values().filter(|e| e.load).count()
+                        == if spec.hidden == 3840 { 1 } else { 752 }
                     && audio_manifest
                         .entries
                         .values()
@@ -4449,11 +4553,10 @@ mod component_tests {
                 "audio manifest residency differs from published shapes"
             );
             let mut wrong_audio = spec.clone();
-            wrong_audio
-                .audio
-                .as_mut()
-                .context("audio spec")?
-                .conv_kernel = 3;
+            match wrong_audio.audio.as_mut().context("audio spec")? {
+                crate::model_spec::AudioConfig::Encoder(a) => a.conv_kernel = 3,
+                crate::model_spec::AudioConfig::Raw(a) => a.frame += 1,
+            }
             ensure!(
                 checkpoint
                     .manifest(&wrong_audio, LoadPolicy::TextOnly)

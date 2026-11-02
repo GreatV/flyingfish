@@ -178,22 +178,33 @@ pub struct AudioClip<'a> {
 }
 
 impl AudioClip<'_> {
-    fn output_rows(&self) -> Result<usize> {
+    fn output_rows(&self, config: &crate::model_spec::AudioConfig) -> Result<usize> {
+        let (frame, stride) = match config {
+            crate::model_spec::AudioConfig::Raw(a) => (a.frame as usize, 1),
+            crate::model_spec::AudioConfig::Encoder(_) => {
+                ensure!(
+                    self.mask.len() <= 3000,
+                    "audio encoder input exceeds 3000 frames"
+                );
+                (128, 4)
+            }
+        };
         ensure!(
             !self.mask.is_empty()
-                && self.mask.len() <= 3000
-                && self.mask.len().checked_mul(128) == Some(self.features.len())
+                && self.mask.len().checked_mul(frame) == Some(self.features.len())
                 && self
                     .features
                     .iter()
                     .all(|&v| v.is_finite() && half::bf16::from_f32(v).is_finite()),
-            "audio requires finite [frames,128] features and 1..3000 frame masks"
+            "raw audio requires finite [frames, samples_per_token] features and frame masks"
         );
-        let rows = self.mask.iter().step_by(4).filter(|&&valid| valid).count();
-        ensure!(
-            rows > 0 && rows <= 750,
-            "audio soft-token count outside 1..750"
-        );
+        let rows = self
+            .mask
+            .iter()
+            .step_by(stride)
+            .filter(|&&valid| valid)
+            .count();
+        ensure!(rows > 0, "raw audio has no valid frames");
         Ok(rows)
     }
 }
@@ -251,6 +262,47 @@ impl PositionPlan {
     }
     pub fn audio_slots(&self) -> &[AudioSlot] {
         &self.audio_slots
+    }
+    pub fn image_blocks(&self) -> Result<Vec<u32>> {
+        let mut bounds = Vec::with_capacity(
+            self.capacity
+                .checked_mul(2)
+                .context("image-block extent overflow")?,
+        );
+        for position in 0..self.capacity {
+            let end = u32::try_from(position + 1)?;
+            bounds.extend([end, end]);
+        }
+        for slot in &self.slots {
+            let start = u32::try_from(slot.tokens.start)?;
+            let end = u32::try_from(slot.tokens.end)?;
+            for row in slot.tokens.clone() {
+                bounds[2 * row..2 * row + 2].copy_from_slice(&[start, end]);
+            }
+        }
+        Ok(bounds)
+    }
+
+    pub fn chunk_end(&self, start: usize, rows: usize, total: usize) -> Result<usize> {
+        ensure!(rows > 0 && start < total, "invalid media prefill chunk");
+        let mut end = start
+            .checked_add(rows)
+            .context("media prefill chunk overflow")?
+            .min(total);
+        for slot in &self.slots {
+            ensure!(
+                start <= slot.tokens.start || start >= slot.tokens.end,
+                "media prefill starts inside an image block"
+            );
+            if slot.tokens.start < end && end < slot.tokens.end {
+                end = slot.tokens.start;
+            }
+        }
+        ensure!(
+            end > start,
+            "prefill workspace cannot fit a complete image block"
+        );
+        Ok(end)
     }
     pub fn rope_delta(&self) -> i64 {
         self.rope_delta
@@ -360,7 +412,7 @@ impl MultimodalInput<'_> {
     pub fn validate(&self, spec: &ModelSpec, capacity: usize) -> Result<PositionPlan> {
         ensure!(
             self.audio.is_empty() || spec.audio.is_some(),
-            "audio input requires a supported audio tower"
+            "raw audio input requires a supported audio embedder"
         );
         match spec.architecture {
             Architecture::Qwen35Text | Architecture::Qwen3Vl => self.validate_qwen(spec, capacity),
@@ -391,10 +443,15 @@ impl MultimodalInput<'_> {
             .as_ref()
             .context("vision configuration missing")?;
         vision.validate(spec.architecture)?;
-        let axial = vision
-            .axial
-            .as_ref()
-            .context("axial vision configuration missing")?;
+        let soft_tokens = if let Some(axial) = &vision.axial {
+            axial.soft_tokens
+        } else {
+            vision
+                .unified
+                .as_ref()
+                .context("image embedding configuration missing")?
+                .soft_tokens
+        };
         ensure!(
             capacity <= spec.max_position as usize,
             "image capacity exceeds model positions"
@@ -413,12 +470,12 @@ impl MultimodalInput<'_> {
         while cursor < self.input_ids.len() {
             let id = self.input_ids[cursor];
             if let Some(audio) = &spec.audio {
-                if id == audio.start_token {
+                if id == audio.tokens()[1] {
                     cursor = self.validate_audio_span(audio, cursor, &mut plan)?;
                     continue;
                 }
                 ensure!(
-                    id != audio.token && id != audio.end_token,
+                    id != audio.tokens()[0] && id != audio.tokens()[2],
                     "audio token outside its delimited span"
                 );
             }
@@ -454,7 +511,7 @@ impl MultimodalInput<'_> {
             let group = (vision.merge * vision.merge) as usize;
             let features = patches / group;
             ensure!(
-                features <= axial.soft_tokens as usize,
+                features <= soft_tokens as usize,
                 "image exceeds soft-token budget"
             );
             let start = cursor + 1;
@@ -517,16 +574,16 @@ impl MultimodalInput<'_> {
             .audio
             .get(plan.audio_slots.len())
             .context("audio span has no clip")?;
-        let count = clip.output_rows()?;
+        let count = clip.output_rows(audio)?;
         let start = cursor + 1;
         let end = start.checked_add(count).context("audio span overflow")?;
         ensure!(
             self.modality_ids[cursor] == 0
-                && self.input_ids.get(end) == Some(&audio.end_token)
+                && self.input_ids.get(end) == Some(&audio.tokens()[2])
                 && self.modality_ids.get(end) == Some(&0)
                 && self.input_ids[start..end]
                     .iter()
-                    .all(|&id| id == audio.token)
+                    .all(|&id| id == audio.tokens()[0])
                 && self.modality_ids[start..end].iter().all(|&m| m == 3),
             "audio placeholder count or delimiter mismatch"
         );

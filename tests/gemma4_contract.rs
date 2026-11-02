@@ -38,11 +38,36 @@ fn large_gemma_geometry_preserves_global_kv_and_absent_per_layer_inputs() -> Res
                 && spec.layers.len() == depth
                 && spec.q_heads == heads
                 && spec.kv_heads == kv
-                && spec.per_layer_input.is_none()
-                && spec.vision.is_none()
-                && spec.audio.is_none(),
+                && spec.per_layer_input.is_none(),
             "large Gemma geometry"
         );
+        let vision = spec.vision.as_ref().context("large Gemma vision missing")?;
+        if hidden == 3840 {
+            ensure!(
+                vision.unified.is_some()
+                    && vision.axial.is_none()
+                    && vision.patch_elements(spec.architecture)? == 6912,
+                "unified raw patch geometry"
+            );
+            let flyingfish::model_spec::AudioConfig::Raw(audio) =
+                spec.audio.as_ref().context("raw audio missing")?
+            else {
+                anyhow::bail!("raw audio variant missing");
+            };
+            ensure!(
+                [audio.frame, audio.output] == [640, 3840],
+                "raw frame projection geometry"
+            );
+        } else {
+            let axial = vision.axial.as_ref().context("31B axial config missing")?;
+            ensure!(
+                [vision.hidden, vision.depth, vision.heads, axial.head_dim] == [1152, 27, 16, 72]
+                    && axial.standardize
+                    && !axial.clipped_linears
+                    && spec.audio.is_none(),
+                "31B media geometry"
+            );
+        }
         let work = flyingfish::work_layout::RowWorkSpec::new(&spec)?;
         let expected_projection = if hidden == 3840 { 8704 } else { 18432 };
         ensure!(
@@ -95,9 +120,9 @@ fn audio_masks_and_mixed_splices_preserve_token_identity() -> Result<()> {
                 features: &features,
                 mask: &mask,
             }];
-            let mut ids = vec![a.start_token];
-            ids.extend(std::iter::repeat_n(a.token, count));
-            ids.push(a.end_token);
+            let mut ids = vec![a.tokens()[1]];
+            ids.extend(std::iter::repeat_n(a.tokens()[0], count));
+            ids.push(a.tokens()[2]);
             let mut modalities = vec![3; ids.len()];
             modalities[0] = 0;
             modalities[count + 1] = 0;
@@ -140,11 +165,11 @@ fn audio_masks_and_mixed_splices_preserve_token_identity() -> Result<()> {
         let grid = [ImageGrid { t: 1, h: 3, w: 3 }];
         let pixels = vec![0.5; 9 * 768];
         let ids = [
-            a.start_token,
-            a.token,
-            a.token,
-            a.token,
-            a.end_token,
+            a.tokens()[1],
+            a.tokens()[0],
+            a.tokens()[0],
+            a.tokens()[0],
+            a.tokens()[2],
             v.start_token,
             v.image_token,
             v.end_token,
@@ -211,7 +236,11 @@ fn embedding_gemma2_spec_and_manifest_match_published_shapes() -> Result<()> {
     ensure!(spec.hidden == 512 && spec.intermediate == 2048 && spec.q_width == 1024);
     ensure!(spec.per_layer_input == Some(512) && spec.logit_softcap.is_none());
     ensure!(spec.layers.len() == 24 && spec.vision.is_some());
-    let audio = spec.audio.as_ref().context("audio configuration missing")?;
+    let flyingfish::model_spec::AudioConfig::Encoder(audio) =
+        spec.audio.as_ref().context("audio configuration missing")?
+    else {
+        anyhow::bail!("EmbeddingGemma-2 requires an audio encoder");
+    };
     ensure!(
         [audio.token, audio.start_token, audio.end_token] == [258881, 256000, 258883]
             && audio.output == 1536
@@ -499,6 +528,124 @@ fn embedding_gemma2_text_matches_frozen_reference() -> Result<()> {
     }
     ensure!(defects == 0, "EmbeddingGemma-2 candidate defects={defects}");
     println!("EMBEDDING_GEMMA2 PASS cells=5 defects=0");
+    Ok(())
+}
+
+#[test]
+fn unified_media_shapes_and_packed_patch_bounds_are_strict() -> Result<()> {
+    let (root, spec) = read(include_str!("data/gemma4-12b-config.json"))?;
+    let ids = [2, 255999, 258880, 258880, 258882, 4];
+    let modality = [0, 0, 1, 1, 0, 0];
+    let pixels = vec![0.5; 2 * 6912];
+    let grid = [ImageGrid { t: 1, h: 1, w: 2 }];
+    let input = MultimodalInput {
+        audio: &[],
+        input_ids: &ids,
+        modality_ids: &modality,
+        pixel_values: &pixels,
+        grids: &grid,
+    };
+    let plan = input.validate(&spec, 32)?;
+    ensure!(
+        plan.patch_rows() == 2 && plan.feature_rows() == 2,
+        "unified patch rows were pooled twice"
+    );
+    let blocks = plan.image_blocks()?;
+    ensure!(
+        blocks[..12] == [1, 1, 2, 2, 2, 4, 2, 4, 5, 5, 6, 6],
+        "image-block query bounds"
+    );
+    ensure!(
+        plan.chunk_end(0, 3, 6)? == 2
+            && plan.chunk_end(2, 3, 6)? == 5
+            && plan.chunk_end(2, 1, 6).is_err()
+            && plan.chunk_end(3, 3, 6).is_err(),
+        "image blocks split across chunks"
+    );
+    let short = MultimodalInput {
+        audio: &[],
+        pixel_values: &pixels[..pixels.len() - 1],
+        ..input
+    };
+    ensure!(
+        short.validate(&spec, 32).is_err(),
+        "short raw patch accepted"
+    );
+    for (scope, key, value) in [
+        ("vision_config", "mm_embed_dim", 1152),
+        ("vision_config", "model_patch_size", 16),
+        ("vision_config", "mm_posemb_size", 280),
+        ("audio_config", "audio_samples_per_token", 320),
+        ("audio_config", "output_proj_dims", 3840),
+    ] {
+        let mut mutant = root.clone();
+        mutant[scope][key] = json!(value);
+        ensure!(
+            ModelSpec::gemma4(&mutant, &Value::Null).is_err(),
+            "accepted {scope}.{key} mutation"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn raw_audio_masks_and_mixed_splices_preserve_row_identity() -> Result<()> {
+    use flyingfish::vision_input::AudioClip;
+    let (_, spec) = read(include_str!("data/gemma4-12b-config.json"))?;
+    let ids = [2, 256000, 258881, 258881, 258883, 255999, 258880, 258882, 5];
+    let modalities = [0, 0, 3, 3, 0, 0, 1, 0, 0];
+    let samples = vec![0.25; 3 * 640];
+    let mask = [true, false, true];
+    let clips = [AudioClip {
+        features: &samples,
+        mask: &mask,
+    }];
+    let pixels = vec![0.5; 6912];
+    let grids = [ImageGrid { t: 1, h: 1, w: 1 }];
+    let input = MultimodalInput {
+        input_ids: &ids,
+        modality_ids: &modalities,
+        pixel_values: &pixels,
+        grids: &grids,
+        audio: &clips,
+    };
+    let plan = input.validate(&spec, 32)?;
+    ensure!(
+        plan.feature_rows() == 3
+            && plan.audio_slots()[0].features == (0..2)
+            && plan.slots()[0].features == (2..3),
+        "media feature order"
+    );
+    let splices = plan.splices(3..8)?;
+    ensure!(
+        splices
+            .iter()
+            .any(|s| s.chunk_rows == (0..1) && s.feature_rows == (1..2))
+            && splices
+                .iter()
+                .any(|s| s.chunk_rows == (3..4) && s.feature_rows == (2..3)),
+        "mixed chunk splice offset"
+    );
+    let mut short = samples.clone();
+    short.pop();
+    let bad_clips = [AudioClip {
+        features: &short,
+        mask: &mask,
+    }];
+    ensure!(
+        MultimodalInput {
+            audio: &bad_clips,
+            ..input
+        }
+        .validate(&spec, 32)
+        .is_err(),
+        "short raw frame accepted"
+    );
+    let (_, large) = read(include_str!("data/gemma4-31b-config.json"))?;
+    ensure!(
+        input.validate(&large, 32).is_err(),
+        "31B accepted absent audio weights"
+    );
     Ok(())
 }
 

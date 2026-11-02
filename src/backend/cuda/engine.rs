@@ -899,6 +899,16 @@ impl Engine {
                 && spec.linear_format.fp8_layout().is_none(),
             "media-aware dense placement requires a BF16 dense Qwen-family runtime"
         );
+        let plan = input.validate(&spec, capacity)?;
+        if let Some(chunk) = requested_chunk
+            && spec.architecture == crate::model_spec::Architecture::Gemma4
+            && spec.per_layer_input.is_none()
+        {
+            ensure!(
+                plan.slots().iter().all(|s| s.tokens.len() <= chunk),
+                "requested prefill chunk cannot fit a complete image block"
+            );
+        }
         let (audio, vision, request) = Self::multimodal_request_bytes(&spec, input, capacity)?;
         let checkpoint = crate::checkpoint::MappedCheckpoint::open(dir)?;
         let mut reserved_bytes = request;
@@ -2155,10 +2165,19 @@ impl Engine {
         trace.set_device(&self.device.info.name)?;
         self.prepare_multimodal(input, Some(trace))?;
         self.gemma_prefill_trace(identities, trace)?;
-        let (images, clips) = self.gemma_encoder_calls()?;
+        let q = self.qwen.as_ref().context("Gemma runtime missing")?;
         ensure!(
-            images == usize::from(!input.grids.is_empty()) && clips == input.audio.len(),
-            "media encoder call count differs: images={images} clips={clips}"
+            q.vision_encode_calls == usize::from(!input.grids.is_empty())
+                && q.audio_encode_calls
+                    == if matches!(
+                        self.model_spec.audio,
+                        Some(crate::model_spec::AudioConfig::Raw(_))
+                    ) {
+                        usize::from(!input.audio.is_empty())
+                    } else {
+                        input.audio.len()
+                    },
+            "media encoder call counts differ from the requested modalities"
         );
         Ok(())
     }
@@ -3709,7 +3728,18 @@ impl Engine {
         let trace_start = self.position + ids.len() - keep;
         let end = self.position + ids.len();
         let mut part = 0usize;
-        for chunk in ids.chunks(self.chunk) {
+        let mut consumed = 0;
+        while consumed < ids.len() {
+            let rows = self.chunk.min(ids.len() - consumed);
+            let count = if self.model_spec.architecture == crate::model_spec::Architecture::Gemma4
+                && self.model_spec.per_layer_input.is_none()
+                && let Some(images) = &self.images
+            {
+                images.positions.chunk_end(self.position, rows, end)? - self.position
+            } else {
+                rows
+            };
+            let chunk = &ids[consumed..consumed + count];
             self.prepare_deepseek_engram(chunk, None)?;
             let skip = trace_start.saturating_sub(self.position).min(chunk.len());
             let selected = trace.is_some() && skip < chunk.len();
@@ -3758,6 +3788,7 @@ impl Engine {
             }
             self.committed_prefix_ids.extend_from_slice(chunk);
             self.position += chunk.len();
+            consumed += count;
         }
         self.device
             .stream
