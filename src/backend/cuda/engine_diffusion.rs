@@ -2377,6 +2377,7 @@ impl Engine {
                 shape,
                 keys,
                 prefix: None,
+                image_blocks: None,
             };
             if sliding {
                 let flash = if encoder {
