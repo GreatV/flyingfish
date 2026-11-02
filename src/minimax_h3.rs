@@ -498,3 +498,127 @@ pub struct LoraAdapter {
     pub rank: usize,
     pub scale: f32,
 }
+
+/// Every `(timestep, tag)` AdaLN pair addressed by any evaluation of a request, with per-evaluation row maps.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdalnPlan {
+    /// Distinct timesteps over all evaluations, ascending.
+    pub timesteps: Vec<f32>,
+    /// `(index into timesteps, tag)` in ascending order.
+    pub pairs: Vec<(u32, u8)>,
+    /// Per evaluation, the pair of every sequence row.
+    pub row_pairs: Vec<Vec<u32>>,
+    /// Per evaluation, the index into `timesteps` of every sequence row.
+    pub row_timesteps: Vec<Vec<u32>>,
+}
+
+impl AdalnPlan {
+    pub fn build(layout: &PackedLayout, plan: &[RowTimesteps]) -> Self {
+        let mut timesteps: Vec<f32> = plan
+            .iter()
+            .flat_map(|step| step.timesteps.clone())
+            .collect();
+        timesteps.sort_by(f32::total_cmp);
+        timesteps.dedup();
+        let global = |t: f32| timesteps.partition_point(|&v| v < t) as u32;
+        let row_timesteps: Vec<Vec<u32>> = plan
+            .iter()
+            .map(|step| {
+                let map: Vec<u32> = step.timesteps.iter().map(|&t| global(t)).collect();
+                step.indices.iter().map(|&i| map[i as usize]).collect()
+            })
+            .collect();
+        let mut pairs: Vec<(u32, u8)> = row_timesteps
+            .iter()
+            .flat_map(|rows| {
+                rows.iter()
+                    .zip(&layout.token_tags)
+                    .map(|(&t, &tag)| (t, tag))
+            })
+            .collect();
+        pairs.sort_unstable();
+        pairs.dedup();
+        let row_pairs = row_timesteps
+            .iter()
+            .map(|rows| {
+                rows.iter()
+                    .zip(&layout.token_tags)
+                    .map(|(&t, &tag)| pairs.partition_point(|&p| p < (t, tag)) as u32)
+                    .collect()
+            })
+            .collect();
+        Self {
+            timesteps,
+            pairs,
+            row_pairs,
+            row_timesteps,
+        }
+    }
+}
+
+/// `silu(time_embedder(sinusoid(t)))` rounded to BF16, `[timesteps, time_dim]`: the input of every AdaLN projection.
+/// Sinusoid `[cos(t f_i), sin(t f_i)]`, `f_i = exp(-ln(10000) * i / half)` in f32; the two F32 linears accumulate in
+/// f64 and round once.
+pub fn adaln_input(
+    spec: &H3Spec,
+    checkpoint: &crate::checkpoint::MappedCheckpoint,
+    timesteps: &[f32],
+) -> Result<Vec<half::bf16>> {
+    let half = spec.freq_dim / 2;
+    let log_period = -(10000.0f64.ln()) as f32;
+    let frequencies: Vec<f32> = (0..half)
+        .map(|i| (log_period * i as f32 / half as f32).exp())
+        .collect();
+    let mut x = Vec::with_capacity(timesteps.len() * spec.freq_dim);
+    for &t in timesteps {
+        x.extend(frequencies.iter().map(|&f| (t * f).cos()));
+        x.extend(frequencies.iter().map(|&f| (t * f).sin()));
+    }
+    let silu = |v: f32| v / (1.0 + (-v).exp());
+    let hidden = f32_linear(
+        checkpoint,
+        "time_embedder.linear_1",
+        &x,
+        spec.freq_dim,
+        spec.time_hidden,
+    )?;
+    let hidden: Vec<f32> = hidden.into_iter().map(silu).collect();
+    let embedding = f32_linear(
+        checkpoint,
+        "time_embedder.linear_2",
+        &hidden,
+        spec.time_hidden,
+        spec.time_dim,
+    )?;
+    Ok(embedding
+        .into_iter()
+        .map(|v| half::bf16::from_f32(silu(v)))
+        .collect())
+}
+
+/// `x [rows, input] * weight[output, input]^T + bias` from the published F32 tensors.
+fn f32_linear(
+    checkpoint: &crate::checkpoint::MappedCheckpoint,
+    base: &str,
+    x: &[f32],
+    input: usize,
+    output: usize,
+) -> Result<Vec<f32>> {
+    let weight = checkpoint.f32_tensor(&format!("{base}.weight"), &[output, input])?;
+    let bias = checkpoint.f32_tensor(&format!("{base}.bias"), &[output])?;
+    Ok(x.chunks_exact(input)
+        .flat_map(|row| {
+            weight
+                .chunks_exact(input)
+                .zip(&bias)
+                .map(|(w, &b)| {
+                    (row.iter()
+                        .zip(w)
+                        .map(|(&a, &w)| f64::from(a) * f64::from(w))
+                        .sum::<f64>()
+                        + f64::from(b)) as f32
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect())
+}

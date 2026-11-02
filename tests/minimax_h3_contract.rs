@@ -3,8 +3,8 @@ use anyhow::{Context, Result, ensure};
 use flyingfish::{
     checkpoint::MappedCheckpoint,
     minimax_h3::{
-        AUDIO_TAG, Geometry, H3Spec, KeyframeAnchor, PackedLayout, RowTimesteps, Schedule,
-        TEXT_TAG, VIDEO_TAG, row_timestep_plan,
+        AUDIO_TAG, AdalnPlan, Geometry, H3Spec, KeyframeAnchor, PackedLayout, RowTimesteps,
+        Schedule, TEXT_TAG, VIDEO_TAG, row_timestep_plan,
     },
 };
 use safetensors::{Dtype, SafeTensors};
@@ -412,5 +412,39 @@ fn minimax_h3_manifests_match_the_published_checkpoints() -> Result<()> {
         "accepted a 49-block manifest"
     );
     println!("H3_MANIFEST tensors=638 f32=12 bytes=66280430080 lora=624 rank=128 scale=0.0625");
+    Ok(())
+}
+
+#[test]
+fn minimax_h3_adaln_plan_addresses_every_row_pair() -> Result<()> {
+    let spec = spec()?;
+    let geometry = Geometry::resolve(&spec, 768, 1344, 124)?;
+    let video = Schedule::new(GRID_POINTS, VIDEO_SHIFT)?;
+    let audio = Schedule::new(GRID_POINTS, AUDIO_SHIFT)?;
+    for anchors in [
+        &[KeyframeAnchor::First][..],
+        &[KeyframeAnchor::First, KeyframeAnchor::Last],
+    ] {
+        let layout = PackedLayout::build(&spec, &geometry, &text_tags(), anchors)?;
+        let plan = row_timestep_plan(&layout, &video, &audio)?;
+        let adaln = AdalnPlan::build(&layout, &plan);
+        ensure!(
+            adaln.timesteps.len() == 16 && adaln.pairs.len() == 25,
+            "AdaLN extent: timesteps={} pairs={}",
+            adaln.timesteps.len(),
+            adaln.pairs.len()
+        );
+        for (k, step) in plan.iter().enumerate() {
+            for row in 0..layout.rows() {
+                let t = adaln.row_timesteps[k][row];
+                ensure!(
+                    adaln.timesteps[t as usize] == step.timesteps[step.indices[row] as usize]
+                        && adaln.pairs[adaln.row_pairs[k][row] as usize]
+                            == (t, layout.token_tags[row]),
+                    "step {k} row {row} AdaLN pair"
+                );
+            }
+        }
+    }
     Ok(())
 }

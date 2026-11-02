@@ -178,6 +178,29 @@ impl MappedCheckpoint {
             .read_exact_at(destination, u64::try_from(offset)?)?;
         Ok(())
     }
+    /// Host copy of one published F32 tensor with the given shape.
+    pub(crate) fn f32_tensor(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
+        let shard = self
+            .index
+            .weight_map
+            .get(name)
+            .with_context(|| format!("checkpoint lacks {name}"))?;
+        let map = self.maps.get(shard).context("unknown checkpoint shard")?;
+        let tensor = SafeTensors::deserialize(map)?.tensor(name)?;
+        ensure!(
+            tensor.dtype() == Dtype::F32 && tensor.shape() == shape,
+            "{name} is {:?} {:?}, expected F32 {shape:?}",
+            tensor.dtype(),
+            tensor.shape()
+        );
+        Ok(tensor
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect())
+    }
     pub(crate) fn views(&self) -> Result<BTreeMap<String, SafeTensors<'_>>> {
         self.maps
             .iter()

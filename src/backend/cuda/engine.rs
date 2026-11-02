@@ -47,6 +47,9 @@ pub(crate) use self::diffusion::{
     DISK_MARK, HOST_MARK, TieredCall, canvas_window as diffusion_canvas_window,
     commit_window as diffusion_commit_window, contribute_tiered,
 };
+#[path = "engine_minimax_h3.rs"]
+#[cfg(all(test, feature = "cuda"))]
+mod minimax_h3;
 #[path = "engine_moe.rs"]
 mod moe;
 pub(in crate::backend::cuda) use moe::{Events, ReadAhead, Reader};
