@@ -381,13 +381,32 @@ fn minimax_h3_manifests_match_the_published_checkpoints() -> Result<()> {
         .values()
         .filter(|entry| entry.dtype == Dtype::F32)
         .count();
+    let dormant = manifest
+        .entries
+        .values()
+        .filter(|entry| !entry.load)
+        .count();
     ensure!(
         manifest.entries.len() == 638
             && f32_tensors == 12
-            && manifest.resident_bytes == 66_280_430_080,
-        "transformer manifest: tensors={} f32={f32_tensors} bytes={}",
+            && dormant == 100
+            && manifest.resident_bytes == 66_280_430_080 - 26_020_915_200,
+        "transformer manifest: tensors={} f32={f32_tensors} dormant={dormant} loaded bytes={}",
         manifest.entries.len(),
         manifest.resident_bytes
+    );
+    let mut layer_matrices = vec![0usize; spec.layers];
+    for entry in manifest.entries.values() {
+        if let Some(layer) = entry.layer
+            && entry.load
+            && entry.shape.len() == 2
+        {
+            layer_matrices[layer as usize] += entry.bytes;
+        }
+    }
+    ensure!(
+        layer_matrices.iter().all(|&bytes| bytes == 770_703_360),
+        "streamed block matrices per layer: {layer_matrices:?}"
     );
     let lora = PathBuf::from(env::var_os("FF_H3_LORA").context("FF_H3_LORA missing")?);
     let stem = lora
@@ -411,7 +430,9 @@ fn minimax_h3_manifests_match_the_published_checkpoints() -> Result<()> {
             .is_err(),
         "accepted a 49-block manifest"
     );
-    println!("H3_MANIFEST tensors=638 f32=12 bytes=66280430080 lora=624 rank=128 scale=0.0625");
+    println!(
+        "H3_MANIFEST tensors=638 f32=12 dormant=100 loaded=40259514880 block_matrices=770703360x50 lora=624 rank=128 scale=0.0625"
+    );
     Ok(())
 }
 

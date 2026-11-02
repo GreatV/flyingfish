@@ -1241,7 +1241,7 @@ impl Drop for DenseStreaming {
 
 #[cfg(feature = "cuda")]
 impl DenseStreaming {
-    fn new(
+    pub(crate) fn new(
         dir: &Path,
         manifest: &TensorManifest,
         plan: crate::prefill::DensePlacement,
@@ -1455,7 +1455,7 @@ impl DenseStreaming {
         Ok(counts)
     }
 
-    fn pointer(&self, layer: usize, offset: usize, bytes: usize) -> Result<u64> {
+    pub(crate) fn pointer(&self, layer: usize, offset: usize, bytes: usize) -> Result<u64> {
         let binding = self.layers.get(layer).context("dense layer outside plan")?;
         ensure!(
             offset

@@ -2326,7 +2326,8 @@ impl MappedCheckpoint {
 }
 
 impl MappedCheckpoint {
-    /// MiniMax-H3 transformer: F32 patch, time-embedding and output projections, BF16 elsewhere; every tensor loads.
+    /// MiniMax-H3 transformer: F32 patch, time-embedding and output projections, BF16 elsewhere. The per-block AdaLN
+    /// projections are Dormant: read once at setup into the modulation table, never part of the per-step layer set.
     pub fn minimax_h3_manifest(&self, spec: &crate::minimax_h3::H3Spec) -> Result<TensorManifest> {
         let scope = TensorScope::Text;
         let mut expected = BTreeMap::new();
@@ -2392,14 +2393,14 @@ impl MappedCheckpoint {
                     format!("{base}.weight"),
                     Dtype::BF16,
                     vec![modulation, spec.time_dim],
-                    scope,
+                    TensorScope::Dormant,
                 );
                 put(
                     &mut expected,
                     format!("{base}.bias"),
                     Dtype::BF16,
                     vec![modulation],
-                    scope,
+                    TensorScope::Dormant,
                 );
             }
         }
@@ -2493,13 +2494,14 @@ impl MappedCheckpoint {
 }
 
 /// Layer name prefixes of the published checkpoints.
-const LAYER_PREFIXES: [&str; 6] = [
+const LAYER_PREFIXES: [&str; 7] = [
     "model.layers.",
     "model.language_model.layers.",
     "language_model.layers.",
     "layers.",
     "model.decoder.layers.",
     "model.encoder.language_model.layers.",
+    "transformer_blocks.",
 ];
 
 pub type ExpectedTensor = (Dtype, Vec<usize>, TensorScope);

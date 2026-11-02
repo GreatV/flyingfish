@@ -237,18 +237,15 @@ const HIDDEN_NORM_THREADS: u32 = 768;
 /// Threads per head-width RMSNorm row.
 const HEAD_NORM_THREADS: u32 = 32;
 
-/// One transformer block's BF16 weights and LoRA factors; the q, k, v LoRA A factors are stacked `[3 * rank, hidden]`.
+/// One block's BF16 weights: the base linears as row-major views (`LINEAR_ROLES` order) into `storage` or a dense
+/// streaming slot, norms and LoRA factors owned; the q, k, v LoRA A factors are stacked `[3 * rank, hidden]`.
 pub(crate) struct BlockWeights {
     norm1: CudaSlice<bf16>,
     norm2: CudaSlice<bf16>,
     norm_q: CudaSlice<bf16>,
     norm_k: CudaSlice<bf16>,
-    to_q: CudaSlice<bf16>,
-    to_k: CudaSlice<bf16>,
-    to_v: CudaSlice<bf16>,
-    to_out: CudaSlice<bf16>,
-    ff_in: CudaSlice<bf16>,
-    ff_out: CudaSlice<bf16>,
+    linears: [Tensor<bf16, 2>; 6],
+    storage: Option<CudaSlice<bf16>>,
     qkv_a: CudaSlice<bf16>,
     q_b: CudaSlice<bf16>,
     k_b: CudaSlice<bf16>,
@@ -302,91 +299,61 @@ impl<'a> Source<'a> {
     }
 }
 
+/// Roles of `BlockWeights::linears`, in order.
+const LINEAR_ROLES: [&str; 6] = [
+    "attn.to_q.weight",
+    "attn.to_k.weight",
+    "attn.to_v.weight",
+    "attn.to_out.0.weight",
+    "ff.net.0.proj.weight",
+    "ff.net.2.weight",
+];
+const Q: usize = 0;
+const K: usize = 1;
+const V: usize = 2;
+const OUT: usize = 3;
+const FF_IN: usize = 4;
+const FF_OUT: usize = 5;
+
+/// Element offset and shape of each loaded matrix of `block` in manifest name order, the order `DenseStreaming`
+/// fills a layer slot in, and the block's total matrix elements.
+type MatrixLayout = BTreeMap<String, (usize, [u32; 2])>;
+
+fn matrix_layout(manifest: &TensorManifest, block: &str) -> Result<(MatrixLayout, usize)> {
+    let prefix = format!("{block}.");
+    let mut layout = BTreeMap::new();
+    let mut elements = 0usize;
+    for (name, entry) in &manifest.entries {
+        let Some(role) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if !entry.load || entry.shape.len() != 2 {
+            continue;
+        }
+        ensure!(entry.dtype == Dtype::BF16, "{name} is not BF16");
+        layout.insert(
+            role.to_owned(),
+            (
+                elements,
+                [
+                    u32::try_from(entry.shape[0])?,
+                    u32::try_from(entry.shape[1])?,
+                ],
+            ),
+        );
+        elements += entry.bytes / 2;
+    }
+    ensure!(
+        layout.len() == LINEAR_ROLES.len() && LINEAR_ROLES.iter().all(|r| layout.contains_key(*r)),
+        "{block}: matrix set {:?}",
+        layout.keys().collect::<Vec<_>>()
+    );
+    Ok((layout, elements))
+}
+
 impl BlockWeights {
-    /// Device buffers for one block of `spec` with LoRA rank `rank`, unfilled.
-    pub(crate) fn alloc(s: &Arc<CudaStream>, spec: &H3Spec, rank: usize) -> Result<Self> {
-        let (h, w, f, r) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn, rank);
-        let z = |n: usize| s.alloc_zeros::<bf16>(n);
-        Ok(Self {
-            norm1: z(h)?,
-            norm2: z(h)?,
-            norm_q: z(spec.head_dim)?,
-            norm_k: z(spec.head_dim)?,
-            to_q: z(w * h)?,
-            to_k: z(w * h)?,
-            to_v: z(w * h)?,
-            to_out: z(h * w)?,
-            ff_in: z(2 * f * h)?,
-            ff_out: z(h * f)?,
-            qkv_a: z(3 * r * h)?,
-            q_b: z(w * r)?,
-            k_b: z(w * r)?,
-            v_b: z(w * r)?,
-            out_a: z(r * w)?,
-            out_b: z(h * r)?,
-            in_a: z(r * h)?,
-            in_b: z(2 * f * r)?,
-            ffo_a: z(r * f)?,
-            ffo_b: z(h * r)?,
-            rank,
-        })
-    }
-
-    /// Fills every buffer with `block`'s published weights and LoRA factors, in stream order.
-    pub(crate) fn reload(
-        &mut self,
-        s: &Arc<CudaStream>,
-        block: &str,
-        base: &mut Source<'_>,
-        lora: &mut Source<'_>,
-    ) -> Result<()> {
-        let part = self.qkv_a.len() / 3;
-        for (i, name) in ["to_q", "to_k", "to_v"].iter().enumerate() {
-            lora.into(
-                s,
-                &format!("{block}.attn.{name}.lora_A.default.weight"),
-                &mut self.qkv_a.slice_mut(i * part..(i + 1) * part),
-            )?;
-        }
-        for (name, buffer) in [
-            ("norm1", &mut self.norm1),
-            ("norm2", &mut self.norm2),
-            ("attn.norm_q", &mut self.norm_q),
-            ("attn.norm_k", &mut self.norm_k),
-            ("attn.to_q", &mut self.to_q),
-            ("attn.to_k", &mut self.to_k),
-            ("attn.to_v", &mut self.to_v),
-            ("attn.to_out.0", &mut self.to_out),
-            ("ff.net.0.proj", &mut self.ff_in),
-            ("ff.net.2", &mut self.ff_out),
-        ] {
-            base.into(
-                s,
-                &format!("{block}.{name}.weight"),
-                &mut buffer.slice_mut(..),
-            )?;
-        }
-        for (name, factor, buffer) in [
-            ("attn.to_q", "B", &mut self.q_b),
-            ("attn.to_k", "B", &mut self.k_b),
-            ("attn.to_v", "B", &mut self.v_b),
-            ("attn.to_out.0", "A", &mut self.out_a),
-            ("attn.to_out.0", "B", &mut self.out_b),
-            ("ff.net.0.proj", "A", &mut self.in_a),
-            ("ff.net.0.proj", "B", &mut self.in_b),
-            ("ff.net.2", "A", &mut self.ffo_a),
-            ("ff.net.2", "B", &mut self.ffo_b),
-        ] {
-            lora.into(
-                s,
-                &format!("{block}.{name}.lora_{factor}.default.weight"),
-                &mut buffer.slice_mut(..),
-            )?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn load(
+    /// Base linears read into one owned buffer in `matrix_layout` order.
+    pub(crate) fn resident(
         s: &Arc<CudaStream>,
         spec: &H3Spec,
         rank: usize,
@@ -394,9 +361,103 @@ impl BlockWeights {
         base: &mut Source<'_>,
         lora: &mut Source<'_>,
     ) -> Result<Self> {
-        let mut weights = Self::alloc(s, spec, rank)?;
-        weights.reload(s, block, base, lora)?;
+        let (layout, elements) = matrix_layout(base.manifest, block)?;
+        let mut storage = s.alloc_zeros::<bf16>(elements)?;
+        for (role, (offset, shape)) in &layout {
+            let count = shape[0] as usize * shape[1] as usize;
+            base.into(
+                s,
+                &format!("{block}.{role}"),
+                &mut storage.slice_mut(*offset..offset + count),
+            )?;
+        }
+        let at = pointer(&storage, s);
+        let mut weights = Self::with_linears(s, spec, rank, block, (at, &layout), base, lora)?;
+        weights.storage = Some(storage);
         Ok(weights)
+    }
+
+    /// Base linears read from the `DenseStreaming` slot at `slot`, valid between the layer's `begin` and `end`.
+    pub(crate) fn streamed(
+        s: &Arc<CudaStream>,
+        spec: &H3Spec,
+        rank: usize,
+        block: &str,
+        slot: u64,
+        base: &mut Source<'_>,
+        lora: &mut Source<'_>,
+    ) -> Result<Self> {
+        let (layout, _) = matrix_layout(base.manifest, block)?;
+        Self::with_linears(s, spec, rank, block, (slot, &layout), base, lora)
+    }
+
+    fn with_linears(
+        s: &Arc<CudaStream>,
+        spec: &H3Spec,
+        rank: usize,
+        block: &str,
+        (at, layout): (u64, &MatrixLayout),
+        base: &mut Source<'_>,
+        lora: &mut Source<'_>,
+    ) -> Result<Self> {
+        let mut linears = Vec::with_capacity(LINEAR_ROLES.len());
+        for role in LINEAR_ROLES {
+            let (offset, shape) = layout[role];
+            let bytes = 2 * u64::from(shape[0]) * u64::from(shape[1]);
+            linears.push(unsafe {
+                Tensor::new(
+                    at + 2 * offset as u64,
+                    shape,
+                    [u64::from(shape[1]), 1],
+                    bytes,
+                )?
+            });
+        }
+        let linears: [Tensor<bf16, 2>; 6] = linears
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("block linear count"))?;
+        let (h, w, f, r) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn, rank);
+        let mut qkv_a = s.alloc_zeros::<bf16>(3 * r * h)?;
+        for (i, name) in ["to_q", "to_k", "to_v"].iter().enumerate() {
+            lora.into(
+                s,
+                &format!("{block}.attn.{name}.lora_A.default.weight"),
+                &mut qkv_a.slice_mut(i * r * h..(i + 1) * r * h),
+            )?;
+        }
+        let mut n =
+            |name: &str, count: usize| base.tensor(s, &format!("{block}.{name}.weight"), count);
+        let (norm1, norm2) = (n("norm1", h)?, n("norm2", h)?);
+        let (norm_q, norm_k) = (
+            n("attn.norm_q", spec.head_dim)?,
+            n("attn.norm_k", spec.head_dim)?,
+        );
+        let mut l = |name: &str, factor: &str, count: usize| {
+            lora.tensor(
+                s,
+                &format!("{block}.{name}.lora_{factor}.default.weight"),
+                count,
+            )
+        };
+        Ok(Self {
+            q_b: l("attn.to_q", "B", w * r)?,
+            k_b: l("attn.to_k", "B", w * r)?,
+            v_b: l("attn.to_v", "B", w * r)?,
+            out_a: l("attn.to_out.0", "A", r * w)?,
+            out_b: l("attn.to_out.0", "B", h * r)?,
+            in_a: l("ff.net.0.proj", "A", r * h)?,
+            in_b: l("ff.net.0.proj", "B", 2 * f * r)?,
+            ffo_a: l("ff.net.2", "A", r * f)?,
+            ffo_b: l("ff.net.2", "B", h * r)?,
+            norm1,
+            norm2,
+            norm_q,
+            norm_k,
+            linears,
+            storage: None,
+            qkv_a,
+            rank,
+        })
     }
 }
 
@@ -439,6 +500,27 @@ pub(crate) struct BlockWork {
 }
 
 impl BlockWork {
+    /// Binds the fixed GEMM plans of every base linear shape these rows run: q/k/v and out over all rows, the two
+    /// FFN projections over full and tail chunks.
+    pub(crate) fn prepare(&self, blas: &Blas, spec: &H3Spec) -> Result<()> {
+        let (h, width, f) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn);
+        let mut shapes = vec![(self.rows, width, h), (self.rows, h, width)];
+        let chunk = self.rows.min(FFN_CHUNK_ROWS);
+        let tail = self.rows % FFN_CHUNK_ROWS;
+        for rows in [chunk, tail].into_iter().filter(|&n| n > 0) {
+            shapes.push((rows, 2 * f, h));
+            shapes.push((rows, h, f));
+        }
+        for (rows, output, input) in shapes {
+            blas.prepare_fixed(
+                u32::try_from(rows)?,
+                u32::try_from(output)?,
+                u32::try_from(input)?,
+            )?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn new(
         s: &Arc<CudaStream>,
         spec: &H3Spec,
@@ -652,6 +734,14 @@ pub(crate) fn block_forward(
         }
         Ok(())
     };
+    let base = |index: usize, x: Operand<'_>, y: Operand<'_>, count: usize| -> Result<()> {
+        blas.linear_typed(
+            crate::op_contract::ExecutionPhase::Prefill,
+            crate::backend::cuda::linear::LinearWeightRef::Bf16(w.linears[index]),
+            rows_view(x.buffer, s, x.offset, count, x.width, x.width)?,
+            &mut TensorMut(rows_view(y.buffer, s, y.offset, count, y.width, y.width)?),
+        )
+    };
     let xp = pointer(x, s);
     let normed = pointer(&work.normed, s);
 
@@ -667,18 +757,20 @@ pub(crate) fn block_forward(
     if modulation.is_some() {
         modulate(normed, 0, 1)?;
     }
-    for (weight, out) in [
-        (&w.to_q, &mut work.q_raw),
-        (&w.to_k, &mut work.k_raw),
-        (&w.to_v, &mut work.v_raw),
-    ] {
-        blas.linear(
-            weight,
-            &work.normed.slice(..),
-            &mut out.slice_mut(..),
+    for (index, out) in [(Q, &work.q_raw), (K, &work.k_raw), (V, &work.v_raw)] {
+        base(
+            index,
+            Operand {
+                buffer: &work.normed,
+                offset: 0,
+                width: h,
+            },
+            Operand {
+                buffer: out,
+                offset: 0,
+                width,
+            },
             rows,
-            width,
-            h,
         )?;
     }
     blas.linear(
@@ -759,13 +851,19 @@ pub(crate) fn block_forward(
             window_left: None,
         },
     )?;
-    blas.linear(
-        &w.to_out,
-        &work.v_raw.slice(..),
-        &mut work.normed.slice_mut(..),
+    base(
+        OUT,
+        Operand {
+            buffer: &work.v_raw,
+            offset: 0,
+            width,
+        },
+        Operand {
+            buffer: &work.normed,
+            offset: 0,
+            width: h,
+        },
         rows,
-        h,
-        width,
     )?;
     lora_pair(
         c,
@@ -804,13 +902,19 @@ pub(crate) fn block_forward(
     }
     for start in (0..rows).step_by(FFN_CHUNK_ROWS) {
         let n = FFN_CHUNK_ROWS.min(rows - start);
-        blas.linear(
-            &w.ff_in,
-            &work.normed.slice(start * h..(start + n) * h),
-            &mut work.hidden.slice_mut(..n * 2 * f),
+        base(
+            FF_IN,
+            Operand {
+                buffer: &work.normed,
+                offset: start * h,
+                width: h,
+            },
+            Operand {
+                buffer: &work.hidden,
+                offset: 0,
+                width: 2 * f,
+            },
             n,
-            2 * f,
-            h,
         )?;
         lora_pair(
             c,
@@ -838,13 +942,19 @@ pub(crate) fn block_forward(
                 .arg(&3i32)
                 .launch(flat(n * f))?;
         }
-        blas.linear(
-            &w.ff_out,
-            &work.gated.slice(..n * f),
-            &mut work.normed.slice_mut(start * h..(start + n) * h),
+        base(
+            FF_OUT,
+            Operand {
+                buffer: &work.gated,
+                offset: 0,
+                width: f,
+            },
+            Operand {
+                buffer: &work.normed,
+                offset: start * h,
+                width: h,
+            },
             n,
-            h,
-            f,
         )?;
         lora_pair(
             c,
@@ -1002,9 +1112,10 @@ pub(crate) struct StepInputs<'a> {
     pub row_timesteps: &'a CudaSlice<u32>,
 }
 
-/// The transformer over one request layout: F32 patch and output projections, BF16 text embedder, norms and refiner
-/// blocks resident; the 50 transformer blocks stream through one slot from disk each evaluation.
-pub(crate) struct Dit<'a> {
+/// The transformer over one request layout: F32 patch and output projections, BF16 text embedder, norms, refiner
+/// blocks and LoRA factors resident; the 50 transformer blocks' matrices placed by `DensePlacement` from the sensed
+/// VRAM and host budgets (resident, or two device slots fed from pinned host memory or the disk tier).
+pub(crate) struct Dit {
     ranges: Ranges,
     proj_in: [CudaSlice<f32>; 2],
     audio_proj_in: [CudaSlice<f32>; 2],
@@ -1014,9 +1125,8 @@ pub(crate) struct Dit<'a> {
     final_norm: CudaSlice<bf16>,
     norm_out: CudaSlice<bf16>,
     refiners: Vec<BlockWeights>,
-    block: BlockWeights,
-    base: Source<'a>,
-    lora: Source<'a>,
+    blocks: Vec<BlockWeights>,
+    dense: Option<crate::backend::cuda::weights::DenseStreaming>,
     rotary: CudaSlice<bf16>,
     x: CudaSlice<bf16>,
     work: BlockWork,
@@ -1035,15 +1145,17 @@ pub(crate) struct Dit<'a> {
     pub audio: CudaSlice<f32>,
 }
 
-impl<'a> Dit<'a> {
+impl Dit {
     pub(crate) fn new(
-        s: &Arc<CudaStream>,
+        d: &Device,
         blas: &mut Blas,
         spec: &H3Spec,
         (rank, layout): (usize, &crate::minimax_h3::PackedLayout),
-        mut base: Source<'a>,
-        mut lora: Source<'a>,
+        mut base: Source<'_>,
+        mut lora: Source<'_>,
     ) -> Result<Self> {
+        use crate::prefill::DensePlacement;
+        let s = &d.stream;
         let ranges = Ranges::of(layout)?;
         let (h, width, ffn, r) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn, rank);
         let patch = spec.video_row_width();
@@ -1065,7 +1177,7 @@ impl<'a> Dit<'a> {
         let norm_out = base.tensor(s, "norm_out.norm.weight", h)?;
         let refiners = (0..spec.refiner_layers)
             .map(|i| {
-                BlockWeights::load(
+                BlockWeights::resident(
                     s,
                     spec,
                     r,
@@ -1077,18 +1189,9 @@ impl<'a> Dit<'a> {
             .collect::<Result<Vec<_>>>()?;
         blas.declare(
             ranges.rows,
-            &[
-                (width, h),
-                (h, width),
-                (2 * ffn, h),
-                (h, ffn),
-                (3 * r, h),
-                (r, width),
-                (r, h),
-                (r, ffn),
-            ]
-            .into_iter()
-            .collect(),
+            &[(3 * r, h), (r, width), (r, h), (r, ffn)]
+                .into_iter()
+                .collect(),
         );
         blas.prepare_biased(
             u32::try_from(ranges.text)?,
@@ -1097,9 +1200,100 @@ impl<'a> Dit<'a> {
             vector(&context[1], s)?,
             LinearBiasMode::BeforeOutputRound,
         )?;
-        let vision = cubin::module(s.context(), "vision_ops")?;
+        let work = BlockWork::new(s, spec, r, ranges.rows)?;
+        work.prepare(blas, spec)?;
+        let text_work = BlockWork::new(s, spec, r, ranges.text)?;
+        text_work.prepare(blas, spec)?;
+        let flash = Flash::new(
+            s.clone(),
+            ranges.rows,
+            spec.heads,
+            spec.heads,
+            spec.head_dim,
+        )?;
+        let text_flash = Flash::new(
+            s.clone(),
+            ranges.text,
+            spec.heads,
+            spec.heads,
+            spec.head_dim,
+        )?;
         let generated = ranges.rows - ranges.video_start;
         let scratch_rows = (ranges.condition + generated).max(ranges.audio);
+        let x = s.alloc_zeros::<bf16>(ranges.rows * h)?;
+        let text = s.alloc_zeros::<bf16>(ranges.text * h)?;
+        let scratch = s.alloc_zeros::<f32>(scratch_rows * h)?;
+        let video = s.alloc_zeros::<f32>(generated * patch)?;
+        let audio = s.alloc_zeros::<f32>(ranges.audio * spec.audio_in_channels)?;
+        let rotary = s.clone_htod(&crate::minimax_h3::rotary_table(spec, layout))?;
+
+        let mut layers = vec![0usize; spec.layers];
+        let mut largest = 0usize;
+        for entry in base.manifest.entries.values() {
+            if let Some(layer) = entry.layer
+                && entry.load
+                && entry.shape.len() == 2
+            {
+                layers[layer as usize] += entry.bytes;
+                largest = largest.max(entry.bytes);
+            }
+        }
+        let owned = lora
+            .manifest
+            .entries
+            .iter()
+            .filter(|(name, _)| name.starts_with("transformer_blocks."))
+            .map(|(_, entry)| entry.bytes)
+            .sum::<usize>()
+            + spec.layers * 2 * (2 * h + 2 * spec.head_dim);
+        let (free, total) = d.ctx.mem_get_info()?;
+        let budget = DensePlacement::device_budget(free, total, owned, 0, 0)?;
+        let mut plan = DensePlacement::new(&layers, budget, 0)?;
+        let mut host = None;
+        if plan.slot_bytes > 0 {
+            let available = usize::try_from(crate::backend::cuda::calibrate::host_memory(
+                Path::new("/"),
+            )?)?;
+            let reserved = 2 * plan.slot_bytes + largest + (4 << 30);
+            ensure!(
+                available >= reserved,
+                "dense pinned staging and host reserve exceed available RAM: need={reserved} available={available}"
+            );
+            plan = DensePlacement::new(&layers, budget, available - reserved)?;
+            host = Some(available);
+        }
+        eprintln!(
+            "{}",
+            serde_json::json!({"h3_dense_placement": &plan, "free_bytes": free, "total_bytes": total, "owned_block_bytes": owned, "host_available_bytes": host})
+        );
+        let dense = if plan.slot_bytes > 0 {
+            let dir = base.reader.dir.clone();
+            Some(crate::backend::cuda::weights::DenseStreaming::new(
+                &dir,
+                base.manifest,
+                plan,
+                d,
+            )?)
+        } else {
+            None
+        };
+        let mut blocks = Vec::with_capacity(spec.layers);
+        for (layer, &bytes) in layers.iter().enumerate() {
+            let name = format!("transformer_blocks.{layer}");
+            let slot = match &dense {
+                Some(dense) if dense.plan.slots[layer].is_some() => {
+                    Some(dense.pointer(layer, 0, bytes)?)
+                }
+                _ => None,
+            };
+            blocks.push(match slot {
+                Some(slot) => {
+                    BlockWeights::streamed(s, spec, r, &name, slot, &mut base, &mut lora)?
+                }
+                None => BlockWeights::resident(s, spec, r, &name, &mut base, &mut lora)?,
+            });
+        }
+        let vision = cubin::module(s.context(), "vision_ops")?;
         Ok(Self {
             ranges,
             proj_in,
@@ -1110,35 +1304,22 @@ impl<'a> Dit<'a> {
             final_norm,
             norm_out,
             refiners,
-            block: BlockWeights::alloc(s, spec, r)?,
-            base,
-            lora,
-            rotary: s.clone_htod(&crate::minimax_h3::rotary_table(spec, layout))?,
-            x: s.alloc_zeros::<bf16>(ranges.rows * h)?,
-            work: BlockWork::new(s, spec, r, ranges.rows)?,
-            flash: Flash::new(
-                s.clone(),
-                ranges.rows,
-                spec.heads,
-                spec.heads,
-                spec.head_dim,
-            )?,
-            text: s.alloc_zeros::<bf16>(ranges.text * h)?,
-            text_work: BlockWork::new(s, spec, r, ranges.text)?,
-            text_flash: Flash::new(
-                s.clone(),
-                ranges.text,
-                spec.heads,
-                spec.heads,
-                spec.head_dim,
-            )?,
-            scratch: s.alloc_zeros::<f32>(scratch_rows * h)?,
+            blocks,
+            dense,
+            rotary,
+            x,
+            work,
+            flash,
+            text,
+            text_work,
+            text_flash,
+            scratch,
             upcast: vision.load_function("vision_upcast_f32")?,
             bias: vision.load_function("vision_bias_f32")?,
             round: vision.load_function("vision_affine_cast_bf16")?,
             euler: cubin::module(s.context(), "flow")?.load_function("euler_blend_f32")?,
-            video: s.alloc_zeros::<f32>(generated * patch)?,
-            audio: s.alloc_zeros::<f32>(ranges.audio * spec.audio_in_channels)?,
+            video,
+            audio,
         })
     }
 
@@ -1376,13 +1557,10 @@ impl<'a> Dit<'a> {
         self.round_into(s, scratch, r.audio_start * h, r.audio * h)?;
 
         let block_rows = 6 * h * pairs as usize;
-        for layer in 0..spec.layers {
-            self.block.reload(
-                s,
-                &format!("transformer_blocks.{layer}"),
-                &mut self.base,
-                &mut self.lora,
-            )?;
+        for (layer, block) in self.blocks.iter().enumerate() {
+            if let Some(dense) = self.dense.as_mut() {
+                dense.begin(layer, s)?;
+            }
             let modulation = Modulation {
                 table: &adaln.blocks,
                 offset: layer * block_rows,
@@ -1392,7 +1570,7 @@ impl<'a> Dit<'a> {
             block_forward(
                 c,
                 &mut self.flash,
-                &self.block,
+                block,
                 &Conditioning::Modulated {
                     rotary: &self.rotary,
                     modulation: &modulation,
@@ -1400,6 +1578,9 @@ impl<'a> Dit<'a> {
                 &mut self.x,
                 &mut self.work,
             )?;
+            if let Some(dense) = self.dense.as_mut() {
+                dense.end(layer, s)?;
+            }
         }
         let normed = pointer(&self.work.normed, s);
         c.kernels.rms_norm(
@@ -1804,7 +1985,7 @@ mod tests {
         );
         let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?;
         let kernels = BlockKernels::new(&device.ctx)?;
-        let weights = BlockWeights::load(
+        let weights = BlockWeights::resident(
             s,
             &spec,
             r,
@@ -1813,6 +1994,7 @@ mod tests {
             &mut Source::new(&lora_dir, &lora_manifest),
         )?;
         let mut work = BlockWork::new(s, &spec, r, rows)?;
+        work.prepare(&blas, &spec)?;
         let rotary = s.clone_htod(&rotary_host)?;
         let table = s.clone_htod(&table_host)?;
         let index = s.clone_htod(&index)?;
@@ -1952,7 +2134,7 @@ mod tests {
             &adaln_plan,
         )?;
         let mut dit = Dit::new(
-            s,
+            &device,
             &mut blas,
             &spec,
             (adapter.rank, &layout),
@@ -2192,7 +2374,7 @@ mod tests {
             &adaln_plan,
         )?;
         let mut dit = Dit::new(
-            s,
+            &device,
             &mut blas,
             &spec,
             (adapter.rank, &layout),
