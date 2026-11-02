@@ -4046,6 +4046,15 @@ impl Engine {
 
     pub fn decode_logits(&self) -> Result<Vec<f32>> {
         self.logits_cache.read()?;
+        if self.diffusion.is_some() {
+            return Ok(self
+                .device
+                .stream
+                .clone_dtoh(&self.canvas_logits()?)?
+                .into_iter()
+                .map(bf16::to_f32)
+                .collect());
+        }
         if let Some(logits) = &self.logits_f32 {
             return self
                 .device
@@ -4102,8 +4111,13 @@ impl Engine {
                 .is_some_and(|n| n <= dst.0.len()),
             "logit sample destination size mismatch"
         );
+        let source = if self.diffusion.is_some() {
+            self.canvas_logits()?
+        } else {
+            self.work.logits.slice(..width)
+        };
         self.device.stream.memcpy_dtod(
-            &self.work.logits.slice(..width),
+            &source,
             &mut dst.0.slice_mut(step * width..(step + 1) * width),
         )?;
         Ok(())

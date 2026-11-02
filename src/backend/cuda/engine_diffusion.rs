@@ -874,6 +874,7 @@ impl Engine {
         if state.policy.is_some() {
             return Ok(());
         }
+        self.logits_cache.invalidate();
         #[cfg(all(test, feature = "cuda"))]
         let _range = crate::backend::cuda::profile::Range::new(
             state.capture.is_some(),
@@ -890,7 +891,18 @@ impl Engine {
                 .arg(&count)
                 .launch(flat(count as usize))?;
         }
+        self.logits_cache.mark_valid();
         Ok(())
+    }
+
+    pub(super) fn canvas_logits(&self) -> Result<crate::backend::gpu::CudaView<'_, bf16>> {
+        let runtime = self.diffusion.as_ref().context("canvas runtime missing")?;
+        let width = self.model_spec.vocab as usize;
+        Ok(runtime
+            .state
+            .forward
+            .logits
+            .slice((runtime.canvas - 1) * width..runtime.canvas * width))
     }
 
     fn canvas_step(&mut self) -> Result<()> {
@@ -1072,4 +1084,116 @@ impl Runtime {
         }
         Ok(())
     }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+#[test]
+#[ignore = "GPU window and published Clover checkpoint"]
+fn clover_canvas_logits_readback_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    let directory =
+        std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+    let settings = Settings {
+        tree_builder: crate::backend::TreeBuilder::Waves,
+        spec_budget: crate::backend::SpecBudget::Chain,
+        spec_graph: false,
+        draft_model: None,
+        prefix_cache: false,
+        kv_format: crate::kv::KvFormat::Bf16,
+        device_budget_gib: Some(14),
+        runtime_dir: Some(std::path::PathBuf::from(
+            std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR missing")?,
+        )),
+    };
+    let mut engine = Engine::load(&directory, 0, 97, None, settings)?;
+    ensure!(engine.check_logits().is_err(), "reset logits accepted");
+    engine.generation_request(64, false, false)?;
+    engine.diffusion_encoder_chunk(&[17; 32])?;
+    ensure!(engine.check_logits().is_err(), "state-only logits accepted");
+    let s = engine.device.stream.clone();
+    let width = engine.model_spec.vocab as usize;
+    s.memcpy_htod(
+        &vec![bf16::from_f32(f32::NAN); width],
+        &mut engine.work.logits,
+    )?;
+    engine
+        .diffusion
+        .as_mut()
+        .unwrap()
+        .state
+        .sampler
+        .begin_block()?;
+    engine.canvas_forward()?;
+    engine.check_logits()?;
+    let raw = &mut engine.diffusion.as_mut().unwrap().state.forward.logits;
+    s.memcpy_htod(&[bf16::from_f32(-42.0)], &mut raw.slice_mut(17..18))?;
+    s.memcpy_htod(
+        &[bf16::from_f32(42.0)],
+        &mut raw.slice_mut(31 * width + 17..31 * width + 18),
+    )?;
+    let expected = s.clone_dtoh(
+        &engine
+            .diffusion
+            .as_ref()
+            .unwrap()
+            .state
+            .forward
+            .logits
+            .slice(31 * width..32 * width),
+    )?;
+    let actual = engine.decode_logits()?;
+    ensure!(
+        actual.len() == width
+            && actual
+                .iter()
+                .zip(&expected)
+                .all(|(a, b)| a.to_bits() == b.to_f32().to_bits()),
+        "canvas readback differs from raw final preview row"
+    );
+    let mut sample = engine.sample_buffer(1)?;
+    engine.copy_logits(&mut sample, 0)?;
+    ensure!(s.clone_dtoh(&sample.0)? == expected, "canvas copy differs");
+    let runtime = engine.diffusion.as_mut().unwrap();
+    runtime
+        .state
+        .sampler
+        .apply_history(&mut runtime.state.logits)?;
+    let mask = 31 * width + 151669;
+    ensure!(
+        s.clone_dtoh(&runtime.state.logits.slice(mask..mask + 1))?[0] == f32::NEG_INFINITY,
+        "mask infinity control absent"
+    );
+    engine.check_logits()?;
+    engine.diffusion_encoder_chunk(&[17; 32])?;
+    engine.check_logits()?;
+    let runtime = engine.diffusion.as_mut().unwrap();
+    runtime.pending.extend([17, 19]);
+    runtime.terminal = true;
+    ensure!(engine.decode(false, None)? == 17, "first queued token");
+    ensure!(engine.decode(false, None)? == 19, "last queued token");
+    engine.check_logits()?;
+    s.memcpy_htod(
+        &[bf16::from_f32(f32::NAN)],
+        &mut engine
+            .diffusion
+            .as_mut()
+            .unwrap()
+            .state
+            .forward
+            .logits
+            .slice_mut(31 * width + 17..31 * width + 18),
+    )?;
+    ensure!(engine.check_logits().is_err(), "raw NaN control accepted");
+    engine.reset()?;
+    ensure!(
+        engine.decode_logits().is_err() && engine.copy_logits(&mut sample, 0).is_err(),
+        "reset preserved stale canvas logits"
+    );
+    println!(
+        "CLOVER_SERVING_LOGITS PASS raw_row_bits_exact=true copy_bits_exact=true stale_work_ignored=true masked_fp32_ignored=true state_only_and_queue_preserved=true raw_nan_rejected=true reset_invalid=true"
+    );
+    Ok(())
 }

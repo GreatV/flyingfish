@@ -279,6 +279,10 @@ impl BlockGeneration {
     }
 
     pub fn clover(root: &Value, generation: &Value) -> Result<Self> {
+        ensure!(
+            generation.get("eos_token_id").is_some_and(|v| !v.is_null()),
+            "missing generation EOS"
+        );
         let spec = ModelSpec::clover(root, generation)?;
         for (key, value) in [
             ("do_sample", false.into()),
@@ -297,23 +301,12 @@ impl BlockGeneration {
             ensure!(number.is_finite(), "nonfinite {key}");
             Ok(number)
         };
-        let mut stop_ids = eos(
-            generation
-                .get("eos_token_id")
-                .context("missing generation EOS")?,
-            spec.vocab,
-        )?;
-        if generation.get("stop_token_ids").is_some() {
-            stop_ids.extend(u32_list(generation, "stop_token_ids")?);
-            stop_ids.sort_unstable();
-            stop_ids.dedup();
-        }
         let policy = Self {
             rows: positive(root, "block_size")?,
             vocab: spec.vocab,
             mask: integer(root, "mask_token_id")?,
             pad: integer(generation, "pad_token_id")?,
-            eos: stop_ids,
+            eos: spec.eos,
             presence: number(generation, "presence_penalty")?,
             frequency: number(generation, "frequency_penalty")?,
             repetition: generation
@@ -413,6 +406,29 @@ fn block_generation_requires_publisher_penalties_and_bounded_state() -> Result<(
         ensure!(
             BlockGeneration::clover(&root, &missing).is_err(),
             "accepted missing {key}"
+        );
+    }
+    let mut stopped = generation.clone();
+    stopped["stop_token_ids"] = serde_json::json!([17, 248044, 17]);
+    let spec = ModelSpec::clover(&root, &stopped)?;
+    let stopped_policy = BlockGeneration::clover(&root, &stopped)?;
+    ensure!(
+        spec.eos == [17, 248044, 248046]
+            && stopped_policy.eos == spec.eos
+            && spec.config().eos_token_id == spec.eos,
+        "Clover sampler and host generation stop sets differ"
+    );
+    stopped["stop_token_ids"] = serde_json::json!([]);
+    ensure!(
+        ModelSpec::clover(&root, &stopped)?.eos == policy.eos,
+        "empty extra stop set changes EOS"
+    );
+    for stops in [serde_json::json!([spec.vocab]), serde_json::json!([-1])] {
+        stopped["stop_token_ids"] = stops;
+        ensure!(
+            ModelSpec::clover(&root, &stopped).is_err()
+                && BlockGeneration::clover(&root, &stopped).is_err(),
+            "accepted invalid Clover stop token"
         );
     }
     let mut invalid = policy;
@@ -1975,7 +1991,7 @@ impl ModelSpec {
                 && integer(root, "mask_token_id")? < text.vocab,
             "unsupported Clover mixer geometry"
         );
-        Self::from_text(
+        let mut spec = Self::from_text(
             Architecture::Clover,
             text,
             root,
@@ -1983,7 +1999,18 @@ impl ModelSpec {
             None,
             LinearFormat::Bf16,
             Some(ExpertFormat::Bf16),
-        )
+        )?;
+        if generation.get("stop_token_ids").is_some() {
+            let stops = u32_list(generation, "stop_token_ids")?;
+            ensure!(
+                stops.iter().all(|&id| id < spec.vocab),
+                "Clover stop token outside vocabulary"
+            );
+            spec.eos.extend(stops);
+            spec.eos.sort_unstable();
+            spec.eos.dedup();
+        }
+        Ok(spec)
     }
 
     pub fn qwen(root: &Value, generation: &Value) -> Result<Self> {
