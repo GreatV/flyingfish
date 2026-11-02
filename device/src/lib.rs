@@ -323,6 +323,30 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_symmetric(
 }
 
 /// # Safety
+/// Launch uses 128 threads, 98304 shared bytes, disjoint BF16 Q/K/V/output and F32 LSE buffers covering the declared extents.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_prefill_d256_scored(p: Attention, scale: f32) {
+    unsafe {
+        let p = resolve_position(p);
+        attention::<256, 32, 0>(p, p.start + p.rows, 0, scale);
+    }
+}
+
+/// # Safety
+/// All keys below `keys` are populated in this sequence; launch uses 128 threads and 98304 shared bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_prefill_d256_bidirectional_scored(
+    p: Attention,
+    keys: u32,
+    scale: f32,
+) {
+    unsafe {
+        let p = resolve_position(p);
+        attention::<256, 32, 1>(p, keys, 0, scale);
+    }
+}
+
+/// # Safety
 /// All keys below `keys` are populated in this sequence; launch uses 128 threads and 49152 shared bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128_bidirectional(p: Attention, keys: u32) {

@@ -655,3 +655,152 @@ extern "C" __global__ void moe_route_mask(
   assignment_gen[a] = valid[expert] ? generation[expert] : 0;
 }
 
+// DiffusionGemma router input pre-form (model definition Router.forward):
+// y = bf16(bf16(bf16(x * pow(mean(x^2) + eps, -0.5)) * scale) * root), all
+// norm internals in FP32, eps added to the mean. One block per row; the sum
+// of squares accumulates per thread in element order then reduces by shuffles.
+//   x [rows, hidden] bf16 row-major, scale [hidden] bf16, y same shape as x,
+//   eps FP32, root FP32 (hidden_size ** -0.5 rounded from the host f64 value).
+extern "C" __global__ void moe_route_prescale_bf16(
+    const bf16* __restrict__ x, const bf16* __restrict__ scale,
+    bf16* __restrict__ y, int rows, int hidden, float eps, float root) {
+  if ((int)blockIdx.x >= rows || hidden < 1 || (blockDim.x & 31) != 0 ||
+      (reinterpret_cast<uintptr_t>(x) & 15) != 0 ||
+      (reinterpret_cast<uintptr_t>(y) & 15) != 0 ||
+      (reinterpret_cast<uintptr_t>(scale) & 15) != 0 || !(eps >= 0.0f) ||
+      !isfinite(root) || root <= 0.0f)
+    __trap();
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int nthr = blockDim.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  float ss = 0.0f;
+  for (int c = tid; c < hidden; c += nthr) {
+    const float v = __bfloat162float(x[(size_t)row * hidden + c]);
+    ss += v * v;
+  }
+  for (int off = 16; off > 0; off >>= 1)
+    ss += __shfl_down_sync(FF_WARP_MASK, ss, off);
+  __shared__ float s_w[32];
+  __shared__ float s_ms;
+  if (lane == 0) s_w[warp] = ss;
+  __syncthreads();
+  if (warp == 0) {
+    ss = lane < (nthr >> 5) ? s_w[lane] : 0.0f;
+    for (int off = 16; off > 0; off >>= 1)
+      ss += __shfl_down_sync(FF_WARP_MASK, ss, off);
+    if (lane == 0) s_ms = ss / (float)hidden + eps;
+  }
+  __syncthreads();
+  const float inv = powf(s_ms, -0.5f);
+  for (int c = tid; c < hidden; c += nthr) {
+    const float v = __bfloat162float(x[(size_t)row * hidden + c]);
+    const bf16 normed = __float2bfloat16(v * inv);
+    const bf16 scaled =
+        __hmul(normed, scale[c]);
+    y[(size_t)row * hidden + c] = __hmul(scaled, __float2bfloat16(root));
+  }
+}
+
+// DiffusionGemma router selection: FP32 softmax over BF16 logits, top-k with
+// the (probability desc, expert id asc) tie rule, weights renormalised to sum
+// 1 in descending order, then multiplied by per_expert_scale[selected] and
+// stored as FP32 (model definition Router.forward; torch.topk tie semantics).
+//   logits [rows, experts] bf16, per_expert_scale [experts] bf16,
+//   ids [rows, top_k] i32, weights [rows, top_k] f32.
+extern "C" __global__ void moe_route_topk_softmax_scale_f32(
+    const bf16* __restrict__ logits, const bf16* __restrict__ per_expert_scale,
+    int* __restrict__ ids, float* __restrict__ weights, int rows, int experts,
+    int top_k) {
+  if ((int)blockIdx.x >= rows || experts < 1 || experts > 1024 || top_k < 1 ||
+      top_k > 32 || top_k >= experts || (blockDim.x & 31) != 0 ||
+      (int)blockDim.x < experts ||
+      (reinterpret_cast<uintptr_t>(logits) & 15) != 0 ||
+      (reinterpret_cast<uintptr_t>(weights) & 3) != 0)
+    __trap();
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int nthr = blockDim.x;
+  const int nw = nthr >> 5;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const bool live = tid < experts;
+  float logit = -INFINITY;
+  if (live) logit = __bfloat162float(logits[(size_t)row * experts + tid]);
+
+  __shared__ float s_red[32];
+  __shared__ int s_rid[32];
+  __shared__ float s_sel[32];
+  __shared__ int s_sel_id[32];
+  __shared__ float s_tsum;
+  __shared__ float s_bcast[1];
+  float mx = logit;
+  for (int off = 16; off > 0; off >>= 1)
+    mx = fmaxf(mx, __shfl_down_sync(FF_WARP_MASK, mx, off));
+  if (lane == 0) s_red[warp] = mx;
+  __syncthreads();
+  mx = warp == 0 && lane < nw ? s_red[lane] : -INFINITY;
+  for (int off = 16; off > 0; off >>= 1)
+    mx = fmaxf(mx, __shfl_down_sync(FF_WARP_MASK, mx, off));
+  // The block max and block sum must reach every warp: broadcast both through
+  // shared memory (a warp-0-only result leaves later warps at -INF/0).
+  if (warp == 0 && lane == 0) s_bcast[0] = mx;
+  __syncthreads();
+  mx = s_bcast[0];
+
+  float p = 0.0f;
+  if (live) p = expf(logit - mx);
+  float sum = live ? p : 0.0f;
+  for (int off = 16; off > 0; off >>= 1)
+    sum += __shfl_down_sync(FF_WARP_MASK, sum, off);
+  if (lane == 0) s_red[warp] = sum;
+  __syncthreads();
+  sum = warp == 0 && lane < nw ? s_red[lane] : 0.0f;
+  for (int off = 16; off > 0; off >>= 1)
+    sum += __shfl_down_sync(FF_WARP_MASK, sum, off);
+  if (warp == 0 && lane == 0) s_bcast[0] = sum;
+  __syncthreads();
+  sum = s_bcast[0];
+
+  if (tid == 0) s_tsum = 0.0f;
+  __syncthreads();
+  bool taken = false;
+  const float prob = live ? p / sum : -1.0f;
+  for (int r = 0; r < top_k; ++r) {
+    float v = !taken && live ? prob : -INFINITY;
+    int id = live ? tid : 0x7fffffff;
+    for (int off = 16; off > 0; off >>= 1) {
+      const float ov = __shfl_down_sync(FF_WARP_MASK, v, off);
+      const int oi = __shfl_down_sync(FF_WARP_MASK, id, off);
+      if (ov > v || (ov == v && oi < id)) { v = ov; id = oi; }
+    }
+    if (lane == 0) { s_red[warp] = v; s_rid[warp] = id; }
+    __syncthreads();
+    if (warp == 0) {
+      v = lane < nw ? s_red[lane] : -INFINITY;
+      id = lane < nw ? s_rid[lane] : 0x7fffffff;
+      for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_down_sync(FF_WARP_MASK, v, off);
+        const int oi = __shfl_down_sync(FF_WARP_MASK, id, off);
+        if (ov > v || (ov == v && oi < id)) { v = ov; id = oi; }
+      }
+      if (lane == 0) { s_red[0] = v; s_rid[0] = id; }
+    }
+    __syncthreads();
+    if (live && !taken && prob == s_red[0] && tid == s_rid[0]) {
+      s_sel_id[r] = tid;
+      s_sel[r] = prob;
+      s_tsum += prob;
+      taken = true;
+    }
+    __syncthreads();
+  }
+  if (tid < top_k) {
+    const int expert = s_sel_id[tid];
+    ids[(size_t)row * top_k + tid] = expert;
+    const float scale = __bfloat162float(per_expert_scale[expert]);
+    weights[(size_t)row * top_k + tid] = (s_sel[tid] / s_tsum) * scale;
+  }
+}
+
