@@ -1674,10 +1674,17 @@ pub(crate) fn contribute_tiered(call: TieredCall<'_>) -> Result<()> {
     let (stg_dn, _) = staging_dn.device_ptr(stream);
     let mut resident: Vec<usize> = Vec::new();
     let mut staged: Vec<usize> = Vec::new();
+    let mut routed = vec![false; tiers.len()];
+    for &id in ids_host {
+        let id = usize::try_from(id).context("tiered route id negative")?;
+        if id < routed.len() {
+            routed[id] = true;
+        }
+    }
     for (expert, tier) in tiers.iter().enumerate() {
         if *tier < HOST_MARK {
             resident.push(expert);
-        } else {
+        } else if routed[expert] {
             staged.push(expert);
         }
     }

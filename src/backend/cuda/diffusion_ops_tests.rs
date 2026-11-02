@@ -336,6 +336,14 @@ fn diffusion_sampler_ops_gpu() -> Result<()> {
         "philox uniformity: worst bucket deviation {worst_bucket} exceeds 4 sigma ({})",
         4.0 * sigma
     );
+    // Boundary control: a word within 2^7 of 2^32 maps below vocab under the
+    // integer multiply-high form (the float form rounds to 1.0 -> id vocab).
+    let boundary_word = 4294967210u64;
+    let mapped = ((boundary_word * 1024) >> 32) as i32;
+    ensure!(
+        (0..buckets).contains(&mapped),
+        "philox boundary word maps outside the vocab: {mapped}"
+    );
 
     // Categorical: peaked rows (0.999 mass on one id) must sample the argmax
     // for at least 99.5% of rows, and repeat identically.

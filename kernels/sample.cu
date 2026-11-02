@@ -444,8 +444,8 @@ extern "C" __global__ void philox_uniform_ids(
     const long long idx = base * 4 + j;
     if (idx < count) {
       const unsigned word = j == 0 ? r.x : j == 1 ? r.y : j == 2 ? r.z : r.w;
-      const float u01 = (float)(word * (1.0 / 4294967296.0));
-      out[idx] = (int)(u01 * vocab);
+      // id = floor(word * vocab / 2^32), always < vocab.
+      out[idx] = (int)(((unsigned long long)word * (unsigned long long)vocab) >> 32);
     }
   }
 }
