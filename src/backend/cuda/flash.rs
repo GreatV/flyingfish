@@ -456,7 +456,7 @@ impl Flash {
         let native = if matches!(head_dim, 64 | 256 | 512)
             || matches!(
                 (heads, kv_heads, head_dim),
-                (16, 2, 128) | (16, 8, 128) | (12, 12, 128) | (32, 4, 128)
+                (16, 2, 128) | (16, 8, 128) | (12, 12, 128) | (32, 4, 128) | (56, 56, 128)
             ) {
             use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
             let ctx = stream.context();

@@ -622,3 +622,24 @@ fn f32_linear(
         })
         .collect())
 }
+
+/// `[rows, 6 * rope_freq_dim]` BF16 rotary table: the cosines of each row's `3 * rope_freq_dim` angles, then their
+/// sines. Angle `(axis, i)` is `f32(position[axis]) * inv_freq[i]` with `inv_freq[i] = 1 / theta^(2i / (2 *
+/// rope_freq_dim))` in f32; axes in `(t, h, w)` order.
+pub fn rotary_table(spec: &H3Spec, layout: &PackedLayout) -> Vec<half::bf16> {
+    let width = 2 * spec.rope_freq_dim;
+    let inv_freq: Vec<f32> = (0..spec.rope_freq_dim)
+        .map(|i| 1.0f32 / spec.rope_theta.powf((2 * i) as f32 / width as f32))
+        .collect();
+    let mut table = Vec::with_capacity(layout.rows() * 3 * width);
+    let mut angles = Vec::with_capacity(3 * spec.rope_freq_dim);
+    for position in &layout.position_ids {
+        angles.clear();
+        for &coordinate in position {
+            angles.extend(inv_freq.iter().map(|&f| coordinate as f32 * f));
+        }
+        table.extend(angles.iter().map(|a| half::bf16::from_f32(a.cos())));
+        table.extend(angles.iter().map(|a| half::bf16::from_f32(a.sin())));
+    }
+    table
+}
