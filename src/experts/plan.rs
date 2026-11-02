@@ -461,16 +461,14 @@ pub fn cohort_capacity(
     let complete = u64::from(geometry.layers) * u64::from(geometry.experts);
     // Below one slot per layer the plan keeps zero resident experts and
     // staging only; an empty device errors.
-    let share = if available >= complete {
-        0
-    } else if available / (u64::from(geometry.layers) + 1) > 0 {
-        available / (u64::from(geometry.layers) + 1)
-    } else {
-        available
-    };
     let staging = if available >= complete {
         0
     } else {
+        let share = if available / (u64::from(geometry.layers) + 1) > 0 {
+            available / (u64::from(geometry.layers) + 1)
+        } else {
+            available
+        };
         share
             .min(u64::from(rows) * u64::from(geometry.top_k))
             .min(u64::from(geometry.experts))
@@ -1963,7 +1961,13 @@ mod tests {
             256,
         )?;
         assert!(plan.slots_per_layer.iter().all(|&n| n == 0));
-        assert!(plan.prefill_staging_slots == 39);
+        assert_eq!(plan.prefill_staging_slots, 39);
+        // Host too small rejects at an admitted device size: 41 device slots
+        // admit residency, but one slot of host after the 3*2*slot staging
+        // IO cannot hold a host expert plus a live swap.
+        assert!(
+            cohort_capacity(geometry, layout.clone(), 32, 41 * slot, 7 * slot, 2, 256).is_err()
+        );
         assert!(cohort_capacity(geometry, layout, 32, 0, 40 << 30, 2, 256).is_err());
         let geometry = ExpertGeometry {
             first_layer: 0,
