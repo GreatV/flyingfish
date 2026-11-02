@@ -27,6 +27,34 @@ use std::{
 /// Direct-IO read granularity.
 const READ_CHUNK_BYTES: u64 = 32 << 20;
 
+/// Published element types a tensor upload accepts.
+trait Element: crate::backend::gpu::DeviceRepr {
+    const DTYPE: Dtype;
+    fn finite(bytes: &[u8]) -> bool;
+}
+
+impl Element for bf16 {
+    const DTYPE: Dtype = Dtype::BF16;
+    fn finite(bytes: &[u8]) -> bool {
+        bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|v| u16::from_le_bytes(*v) & 0x7f80 != 0x7f80)
+    }
+}
+
+impl Element for f32 {
+    const DTYPE: Dtype = Dtype::F32;
+    fn finite(bytes: &[u8]) -> bool {
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|v| f32::from_le_bytes(*v).is_finite())
+    }
+}
+
 /// O_DIRECT reads of single manifest tensors through one aligned pageable staging buffer.
 struct EntryReader {
     dir: PathBuf,
@@ -43,20 +71,22 @@ impl EntryReader {
         }
     }
 
-    /// Copies a finite BF16 tensor into `destination`; the pageable source is consumed when the copy call returns.
-    fn upload(
+    /// Copies a finite BF16 or F32 tensor into a buffer of its element type; the pageable source is consumed when the
+    /// copy call returns.
+    fn upload<T: Element>(
         &mut self,
         stream: &Arc<CudaStream>,
         name: &str,
         entry: &TensorEntry,
-        destination: &mut CudaViewMut<'_, bf16>,
+        destination: &mut CudaViewMut<'_, T>,
     ) -> Result<()> {
         ensure!(
-            entry.dtype == Dtype::BF16 && entry.bytes == 2 * destination.len(),
-            "{name}: {:?} {} B does not fill a {}-element BF16 buffer",
+            entry.dtype == T::DTYPE && entry.bytes == std::mem::size_of::<T>() * destination.len(),
+            "{name}: {:?} {} B does not fill a {}-element {:?} buffer",
             entry.dtype,
             entry.bytes,
-            destination.len()
+            destination.len(),
+            T::DTYPE
         );
         if !self.readers.contains_key(&entry.shard) {
             let reader = SpanReader::open(&self.dir.join(&entry.shard), true)?;
@@ -80,14 +110,7 @@ impl EntryReader {
         let begin = usize::try_from(offset - span.begin)?;
         let bytes =
             &reader.read_span(&span, READ_CHUNK_BYTES, staging)?[begin..begin + entry.bytes];
-        ensure!(
-            bytes
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .all(|v| u16::from_le_bytes(*v) & 0x7f80 != 0x7f80),
-            "{name}: nonfinite BF16 value"
-        );
+        ensure!(T::finite(bytes), "{name}: nonfinite value");
         let (pointer, _record) = destination.device_ptr_mut(stream);
         unsafe {
             cudarc::driver::result::memcpy_htod_async(pointer, bytes, stream.cu_stream())?;
@@ -253,11 +276,11 @@ impl<'a> Source<'a> {
         }
     }
 
-    fn into(
+    fn into<T: Element>(
         &mut self,
         s: &Arc<CudaStream>,
         name: &str,
-        destination: &mut CudaViewMut<'_, bf16>,
+        destination: &mut CudaViewMut<'_, T>,
     ) -> Result<()> {
         let entry = self
             .manifest
@@ -267,19 +290,102 @@ impl<'a> Source<'a> {
         self.reader.upload(s, name, entry, destination)
     }
 
-    fn tensor(
+    fn tensor<T: Element + crate::backend::gpu::ValidAsZeroBits>(
         &mut self,
         s: &Arc<CudaStream>,
         name: &str,
         elements: usize,
-    ) -> Result<CudaSlice<bf16>> {
-        let mut buffer = s.alloc_zeros::<bf16>(elements)?;
+    ) -> Result<CudaSlice<T>> {
+        let mut buffer = s.alloc_zeros::<T>(elements)?;
         self.into(s, name, &mut buffer.slice_mut(..))?;
         Ok(buffer)
     }
 }
 
 impl BlockWeights {
+    /// Device buffers for one block of `spec` with LoRA rank `rank`, unfilled.
+    pub(crate) fn alloc(s: &Arc<CudaStream>, spec: &H3Spec, rank: usize) -> Result<Self> {
+        let (h, w, f, r) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn, rank);
+        let z = |n: usize| s.alloc_zeros::<bf16>(n);
+        Ok(Self {
+            norm1: z(h)?,
+            norm2: z(h)?,
+            norm_q: z(spec.head_dim)?,
+            norm_k: z(spec.head_dim)?,
+            to_q: z(w * h)?,
+            to_k: z(w * h)?,
+            to_v: z(w * h)?,
+            to_out: z(h * w)?,
+            ff_in: z(2 * f * h)?,
+            ff_out: z(h * f)?,
+            qkv_a: z(3 * r * h)?,
+            q_b: z(w * r)?,
+            k_b: z(w * r)?,
+            v_b: z(w * r)?,
+            out_a: z(r * w)?,
+            out_b: z(h * r)?,
+            in_a: z(r * h)?,
+            in_b: z(2 * f * r)?,
+            ffo_a: z(r * f)?,
+            ffo_b: z(h * r)?,
+            rank,
+        })
+    }
+
+    /// Fills every buffer with `block`'s published weights and LoRA factors, in stream order.
+    pub(crate) fn reload(
+        &mut self,
+        s: &Arc<CudaStream>,
+        block: &str,
+        base: &mut Source<'_>,
+        lora: &mut Source<'_>,
+    ) -> Result<()> {
+        let part = self.qkv_a.len() / 3;
+        for (i, name) in ["to_q", "to_k", "to_v"].iter().enumerate() {
+            lora.into(
+                s,
+                &format!("{block}.attn.{name}.lora_A.default.weight"),
+                &mut self.qkv_a.slice_mut(i * part..(i + 1) * part),
+            )?;
+        }
+        for (name, buffer) in [
+            ("norm1", &mut self.norm1),
+            ("norm2", &mut self.norm2),
+            ("attn.norm_q", &mut self.norm_q),
+            ("attn.norm_k", &mut self.norm_k),
+            ("attn.to_q", &mut self.to_q),
+            ("attn.to_k", &mut self.to_k),
+            ("attn.to_v", &mut self.to_v),
+            ("attn.to_out.0", &mut self.to_out),
+            ("ff.net.0.proj", &mut self.ff_in),
+            ("ff.net.2", &mut self.ff_out),
+        ] {
+            base.into(
+                s,
+                &format!("{block}.{name}.weight"),
+                &mut buffer.slice_mut(..),
+            )?;
+        }
+        for (name, factor, buffer) in [
+            ("attn.to_q", "B", &mut self.q_b),
+            ("attn.to_k", "B", &mut self.k_b),
+            ("attn.to_v", "B", &mut self.v_b),
+            ("attn.to_out.0", "A", &mut self.out_a),
+            ("attn.to_out.0", "B", &mut self.out_b),
+            ("ff.net.0.proj", "A", &mut self.in_a),
+            ("ff.net.0.proj", "B", &mut self.in_b),
+            ("ff.net.2", "A", &mut self.ffo_a),
+            ("ff.net.2", "B", &mut self.ffo_b),
+        ] {
+            lora.into(
+                s,
+                &format!("{block}.{name}.lora_{factor}.default.weight"),
+                &mut buffer.slice_mut(..),
+            )?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn load(
         s: &Arc<CudaStream>,
         spec: &H3Spec,
@@ -288,61 +394,9 @@ impl BlockWeights {
         base: &mut Source<'_>,
         lora: &mut Source<'_>,
     ) -> Result<Self> {
-        let (h, w, f, r) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn, rank);
-        let mut qkv_a = s.alloc_zeros::<bf16>(3 * r * h)?;
-        for (i, name) in ["to_q", "to_k", "to_v"].iter().enumerate() {
-            lora.into(
-                s,
-                &format!("{block}.attn.{name}.lora_A.default.weight"),
-                &mut qkv_a.slice_mut(i * r * h..(i + 1) * r * h),
-            )?;
-        }
-        let mut b = |name: &str, n| base.tensor(s, &format!("{block}.{name}.weight"), n);
-        let (norm1, norm2) = (b("norm1", h)?, b("norm2", h)?);
-        let (norm_q, norm_k) = (
-            b("attn.norm_q", spec.head_dim)?,
-            b("attn.norm_k", spec.head_dim)?,
-        );
-        let (to_q, to_k, to_v) = (
-            b("attn.to_q", w * h)?,
-            b("attn.to_k", w * h)?,
-            b("attn.to_v", w * h)?,
-        );
-        let (to_out, ff_in, ff_out) = (
-            b("attn.to_out.0", h * w)?,
-            b("ff.net.0.proj", 2 * f * h)?,
-            b("ff.net.2", h * f)?,
-        );
-        let mut l = |name: &str, factor: &str, n| {
-            lora.tensor(
-                s,
-                &format!("{block}.{name}.lora_{factor}.default.weight"),
-                n,
-            )
-        };
-        Ok(Self {
-            q_b: l("attn.to_q", "B", w * r)?,
-            k_b: l("attn.to_k", "B", w * r)?,
-            v_b: l("attn.to_v", "B", w * r)?,
-            out_a: l("attn.to_out.0", "A", r * w)?,
-            out_b: l("attn.to_out.0", "B", h * r)?,
-            in_a: l("ff.net.0.proj", "A", r * h)?,
-            in_b: l("ff.net.0.proj", "B", 2 * f * r)?,
-            ffo_a: l("ff.net.2", "A", r * f)?,
-            ffo_b: l("ff.net.2", "B", h * r)?,
-            norm1,
-            norm2,
-            norm_q,
-            norm_k,
-            to_q,
-            to_k,
-            to_v,
-            to_out,
-            ff_in,
-            ff_out,
-            qkv_a,
-            rank,
-        })
+        let mut weights = Self::alloc(s, spec, rank)?;
+        weights.reload(s, block, base, lora)?;
+        Ok(weights)
     }
 }
 
@@ -352,13 +406,16 @@ pub(crate) struct BlockKernels {
     swiglu: crate::backend::gpu::CudaFunction,
     modulate: crate::backend::gpu::CudaFunction,
     gated_add: crate::backend::gpu::CudaFunction,
+    residual: crate::backend::gpu::CudaFunction,
 }
 
 impl BlockKernels {
     pub(crate) fn new(ctx: &Arc<crate::backend::gpu::CudaContext>) -> Result<Self> {
         let modulate = cubin::module(ctx, "modulate")?;
+        let norm = cubin::module(ctx, "norm")?;
         Ok(Self {
-            norm: cubin::module(ctx, "norm")?.load_function("rms_norm_bf16")?,
+            norm: norm.load_function("rms_norm_bf16")?,
+            residual: norm.load_function("residual")?,
             rotary: cubin::module(ctx, "rope")?.load_function("rotary_prefix_kv")?,
             swiglu: cubin::module(ctx, "act")?.load_function("silu_mul")?,
             modulate: modulate.load_function("row_modulate")?,
@@ -404,6 +461,16 @@ impl BlockWork {
             gated: s.alloc_zeros::<bf16>(chunk * spec.ffn)?,
         })
     }
+}
+
+/// Transformer blocks read AdaLN rows and rotate the first `6 * rope_freq_dim` channels of q and k; token refiner
+/// blocks do neither and add both residuals unmodulated.
+pub(crate) enum Conditioning<'a> {
+    Modulated {
+        rotary: &'a CudaSlice<bf16>,
+        modulation: &'a Modulation<'a>,
+    },
+    Plain,
 }
 
 /// Block modulation: `entries` rows of `6 * hidden` (shift, scale, gate of attention, then of the FFN) starting
@@ -479,35 +546,44 @@ fn lora_pair(
     )
 }
 
-/// One MiniMax-H3 transformer block over `x [rows, hidden]` in place, BF16, LoRA applied online at
-/// `c.lora_scale`. `rotary` is `[rows, 6 * rope_freq_dim]` from `rotary_table`.
+/// One MiniMax-H3 transformer or token refiner block over `x [rows, hidden]` in place, BF16, LoRA applied online
+/// at `c.lora_scale`. A modulated block's `rotary` is `[rows, 6 * rope_freq_dim]` from `rotary_table`.
 pub(crate) fn block_forward(
     c: &BlockContext<'_>,
     flash: &mut Flash,
     w: &BlockWeights,
-    rotary: &CudaSlice<bf16>,
-    modulation: &Modulation<'_>,
+    conditioning: &Conditioning<'_>,
     x: &mut CudaSlice<bf16>,
     work: &mut BlockWork,
 ) -> Result<()> {
     let (s, blas, kernels, spec, lora_scale) = (c.s, c.blas, c.kernels, c.spec, c.lora_scale);
     let rows = work.rows;
     let (h, width, f, r) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn, w.rank);
-    let rotary_width = 6 * spec.rope_freq_dim;
-    ensure!(
-        x.len() == rows * h
-            && rotary.len() == rows * rotary_width
-            && modulation.index.len() == rows,
-        "block extents differ from the work rows"
-    );
+    let (rotary_width, rotary_table, modulation) = match conditioning {
+        Conditioning::Modulated { rotary, modulation } => {
+            ensure!(
+                rotary.len() == rows * 6 * spec.rope_freq_dim && modulation.index.len() == rows,
+                "conditioning extents differ from the work rows"
+            );
+            ensure!(
+                modulation.offset + modulation.entries as usize * 6 * h <= modulation.table.len(),
+                "modulation table extent"
+            );
+            (6 * spec.rope_freq_dim, pointer(rotary, s), Some(modulation))
+        }
+        Conditioning::Plain => (0, pointer(&work.q, s), None),
+    };
+    ensure!(x.len() == rows * h, "block rows differ from the work rows");
     let stride = 6 * h;
-    ensure!(
-        modulation.offset + modulation.entries as usize * stride <= modulation.table.len(),
-        "modulation table extent"
-    );
-    let table = pointer(modulation.table, s) + 2 * modulation.offset as u64;
+    let (table, index, entries) = match modulation {
+        Some(m) => (
+            pointer(m.table, s) + 2 * m.offset as u64,
+            pointer(m.index, s),
+            m.entries,
+        ),
+        None => (0, 0, 0),
+    };
     let chunk = |c: usize| table + (2 * c * h) as u64;
-    let index = pointer(modulation.index, s);
     let rows_i = i32::try_from(rows)?;
     let row_grid = LaunchConfig {
         grid_dim: (u32::try_from(rows)?, u32::try_from(h.div_ceil(256))?, 1),
@@ -517,26 +593,23 @@ pub(crate) fn block_forward(
     let norm = |input: u64,
                 weight: u64,
                 output: u64,
-                count: usize,
+                rows: usize,
                 dim: usize,
                 threads: u32,
                 eps: f32|
      -> Result<()> {
-        unsafe {
-            s.launch_builder(&kernels.norm)
-                .arg(&input)
-                .arg(&weight)
-                .arg(&output)
-                .arg(&i32::try_from(count)?)
-                .arg(&i32::try_from(dim)?)
-                .arg(&eps)
-                .launch(LaunchConfig {
-                    grid_dim: (u32::try_from(count)?, 1, 1),
-                    block_dim: (threads, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
-        }
-        Ok(())
+        kernels.rms_norm(
+            s,
+            NormRows {
+                input,
+                weight,
+                output,
+                rows,
+                dim,
+                threads,
+                eps,
+            },
+        )
     };
     let modulate = |data: u64, shift: usize, scale: usize| -> Result<()> {
         unsafe {
@@ -549,7 +622,7 @@ pub(crate) fn block_forward(
                 .arg(&rows_i)
                 .arg(&i32::try_from(h)?)
                 .arg(&(stride as u64))
-                .arg(&modulation.entries)
+                .arg(&entries)
                 .launch(row_grid)?;
         }
         Ok(())
@@ -564,8 +637,18 @@ pub(crate) fn block_forward(
                 .arg(&rows_i)
                 .arg(&i32::try_from(h)?)
                 .arg(&(stride as u64))
-                .arg(&modulation.entries)
+                .arg(&entries)
                 .launch(row_grid)?;
+        }
+        Ok(())
+    };
+    let residual = |residual: u64, update: u64| -> Result<()> {
+        unsafe {
+            s.launch_builder(&kernels.residual)
+                .arg(&residual)
+                .arg(&update)
+                .arg(&i32::try_from(rows * h)?)
+                .launch(flat(rows * h / 8))?;
         }
         Ok(())
     };
@@ -581,7 +664,9 @@ pub(crate) fn block_forward(
         HIDDEN_NORM_THREADS,
         spec.norm_eps,
     )?;
-    modulate(normed, 0, 1)?;
+    if modulation.is_some() {
+        modulate(normed, 0, 1)?;
+    }
     for (weight, out) in [
         (&w.to_q, &mut work.q_raw),
         (&w.to_k, &mut work.k_raw),
@@ -647,7 +732,7 @@ pub(crate) fn block_forward(
             .arg(&pointer(&work.v_raw, s))
             .arg(&pointer(&work.q_raw, s))
             .arg(&pointer(&work.k_raw, s))
-            .arg(&pointer(rotary, s))
+            .arg(&rotary_table)
             .arg(&0i32)
             .arg(&rows_i)
             .arg(&i32::try_from(spec.heads)?)
@@ -699,7 +784,11 @@ pub(crate) fn block_forward(
         },
         rows,
     )?;
-    gated_add(xp, normed, 2)?;
+    if modulation.is_some() {
+        gated_add(xp, normed, 2)?;
+    } else {
+        residual(xp, normed)?;
+    }
 
     norm(
         xp,
@@ -710,7 +799,9 @@ pub(crate) fn block_forward(
         HIDDEN_NORM_THREADS,
         spec.norm_eps,
     )?;
-    modulate(normed, 3, 4)?;
+    if modulation.is_some() {
+        modulate(normed, 3, 4)?;
+    }
     for start in (0..rows).step_by(FFN_CHUNK_ROWS) {
         let n = FFN_CHUNK_ROWS.min(rows - start);
         blas.linear(
@@ -773,8 +864,510 @@ pub(crate) fn block_forward(
             n,
         )?;
     }
-    gated_add(xp, normed, 5)?;
+    if modulation.is_some() {
+        gated_add(xp, normed, 5)?;
+    } else {
+        residual(xp, normed)?;
+    }
     Ok(())
+}
+
+/// One RMSNorm launch: `rows` rows of `dim` elements, one block of `threads` per row.
+struct NormRows {
+    input: u64,
+    weight: u64,
+    output: u64,
+    rows: usize,
+    dim: usize,
+    threads: u32,
+    eps: f32,
+}
+
+/// One `row_modulate` launch over dense `[rows, dim]` data with table rows of `stride` elements.
+struct ModulateRows {
+    data: u64,
+    shift: u64,
+    scale: u64,
+    index: u64,
+    rows: usize,
+    dim: usize,
+    stride: usize,
+    entries: u32,
+}
+
+impl BlockKernels {
+    fn rms_norm(&self, s: &Arc<CudaStream>, n: NormRows) -> Result<()> {
+        unsafe {
+            s.launch_builder(&self.norm)
+                .arg(&n.input)
+                .arg(&n.weight)
+                .arg(&n.output)
+                .arg(&i32::try_from(n.rows)?)
+                .arg(&i32::try_from(n.dim)?)
+                .arg(&n.eps)
+                .launch(LaunchConfig {
+                    grid_dim: (u32::try_from(n.rows)?, 1, 1),
+                    block_dim: (n.threads, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
+    fn row_modulate(&self, s: &Arc<CudaStream>, m: ModulateRows) -> Result<()> {
+        unsafe {
+            s.launch_builder(&self.modulate)
+                .arg(&m.data)
+                .arg(&m.shift)
+                .arg(&m.scale)
+                .arg(&m.index)
+                .arg(&m.data)
+                .arg(&i32::try_from(m.rows)?)
+                .arg(&i32::try_from(m.dim)?)
+                .arg(&(m.stride as u64))
+                .arg(&m.entries)
+                .launch(LaunchConfig {
+                    grid_dim: (
+                        u32::try_from(m.rows)?,
+                        u32::try_from(m.dim.div_ceil(256))?,
+                        1,
+                    ),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+}
+
+/// `[text | conditioning video | audio | generated video]` row ranges of a packed layout.
+#[derive(Clone, Copy)]
+struct Ranges {
+    text: usize,
+    condition: usize,
+    audio_start: usize,
+    audio: usize,
+    video_start: usize,
+    rows: usize,
+}
+
+impl Ranges {
+    fn of(layout: &crate::minimax_h3::PackedLayout) -> Result<Self> {
+        let text = layout.text_indices.len();
+        let condition = layout.condition_video_rows;
+        let audio = layout.audio_indices.len();
+        let audio_start = text + condition;
+        let video_start = audio_start + audio;
+        let rows = layout.rows();
+        ensure!(
+            layout
+                .text_indices
+                .iter()
+                .enumerate()
+                .all(|(i, &r)| r as usize == i)
+                && layout
+                    .audio_indices
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &r)| r as usize == audio_start + i)
+                && layout.video_indices.iter().enumerate().all(|(i, &r)| {
+                    r as usize
+                        == if i < condition {
+                            text + i
+                        } else {
+                            video_start + i - condition
+                        }
+                }),
+            "packed layout is not [text | conditions | audio | video]"
+        );
+        Ok(Self {
+            text,
+            condition,
+            audio_start,
+            audio,
+            video_start,
+            rows,
+        })
+    }
+}
+
+/// Teacher-forced inputs of one evaluation: patchified video rows `[video rows, 96]` (conditioning first) and audio
+/// rows `[audio rows, 32]` in F32, text states `[text rows, text_dim]` in BF16, and each sequence row's AdaLN pair and
+/// timestep from `AdalnPlan`.
+pub(crate) struct StepInputs<'a> {
+    pub video: &'a CudaSlice<f32>,
+    pub audio: &'a CudaSlice<f32>,
+    pub text: &'a CudaSlice<bf16>,
+    pub row_pairs: &'a CudaSlice<u32>,
+    pub row_timesteps: &'a CudaSlice<u32>,
+}
+
+/// The transformer over one request layout: F32 patch and output projections, BF16 text embedder, norms and refiner
+/// blocks resident; the 50 transformer blocks stream through one slot from disk each evaluation.
+pub(crate) struct Dit<'a> {
+    ranges: Ranges,
+    proj_in: [CudaSlice<f32>; 2],
+    audio_proj_in: [CudaSlice<f32>; 2],
+    proj_out: [CudaSlice<f32>; 2],
+    audio_proj_out: [CudaSlice<f32>; 2],
+    context: [CudaSlice<bf16>; 2],
+    final_norm: CudaSlice<bf16>,
+    norm_out: CudaSlice<bf16>,
+    refiners: Vec<BlockWeights>,
+    block: BlockWeights,
+    base: Source<'a>,
+    lora: Source<'a>,
+    rotary: CudaSlice<bf16>,
+    x: CudaSlice<bf16>,
+    work: BlockWork,
+    flash: Flash,
+    text: CudaSlice<bf16>,
+    text_work: BlockWork,
+    text_flash: Flash,
+    scratch: CudaSlice<f32>,
+    upcast: crate::backend::gpu::CudaFunction,
+    bias: crate::backend::gpu::CudaFunction,
+    round: crate::backend::gpu::CudaFunction,
+    /// Velocity of the generated video rows, `[generated rows, 96]`.
+    pub video: CudaSlice<f32>,
+    /// Velocity of the audio rows, `[audio rows, 32]`.
+    pub audio: CudaSlice<f32>,
+}
+
+impl<'a> Dit<'a> {
+    pub(crate) fn new(
+        s: &Arc<CudaStream>,
+        blas: &mut Blas,
+        spec: &H3Spec,
+        (rank, layout): (usize, &crate::minimax_h3::PackedLayout),
+        mut base: Source<'a>,
+        mut lora: Source<'a>,
+    ) -> Result<Self> {
+        let ranges = Ranges::of(layout)?;
+        let (h, width, ffn, r) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn, rank);
+        let patch = spec.video_row_width();
+        let mut pair = |name: &str, n: usize, k: usize| -> Result<[CudaSlice<f32>; 2]> {
+            Ok([
+                base.tensor(s, &format!("{name}.weight"), n * k)?,
+                base.tensor(s, &format!("{name}.bias"), n)?,
+            ])
+        };
+        let proj_in = pair("proj_in", h, patch)?;
+        let audio_proj_in = pair("audio_proj_in", h, spec.audio_in_channels)?;
+        let proj_out = pair("proj_out", patch, h)?;
+        let audio_proj_out = pair("audio_proj_out", spec.audio_in_channels, h)?;
+        let context = [
+            base.tensor(s, "context_embedder.weight", h * spec.text_dim)?,
+            base.tensor(s, "context_embedder.bias", h)?,
+        ];
+        let final_norm = base.tensor(s, "token_refiner.final_norm.weight", h)?;
+        let norm_out = base.tensor(s, "norm_out.norm.weight", h)?;
+        let refiners = (0..spec.refiner_layers)
+            .map(|i| {
+                BlockWeights::load(
+                    s,
+                    spec,
+                    r,
+                    &format!("token_refiner.refiner_blocks.{i}"),
+                    &mut base,
+                    &mut lora,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        blas.declare(
+            ranges.rows,
+            &[
+                (width, h),
+                (h, width),
+                (2 * ffn, h),
+                (h, ffn),
+                (3 * r, h),
+                (r, width),
+                (r, h),
+                (r, ffn),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        blas.prepare_biased(
+            u32::try_from(ranges.text)?,
+            u32::try_from(h)?,
+            u32::try_from(spec.text_dim)?,
+            vector(&context[1], s)?,
+            LinearBiasMode::BeforeOutputRound,
+        )?;
+        let vision = cubin::module(s.context(), "vision_ops")?;
+        let generated = ranges.rows - ranges.video_start;
+        let scratch_rows = (ranges.condition + generated).max(ranges.audio);
+        Ok(Self {
+            ranges,
+            proj_in,
+            audio_proj_in,
+            proj_out,
+            audio_proj_out,
+            context,
+            final_norm,
+            norm_out,
+            refiners,
+            block: BlockWeights::alloc(s, spec, r)?,
+            base,
+            lora,
+            rotary: s.clone_htod(&crate::minimax_h3::rotary_table(spec, layout))?,
+            x: s.alloc_zeros::<bf16>(ranges.rows * h)?,
+            work: BlockWork::new(s, spec, r, ranges.rows)?,
+            flash: Flash::new(
+                s.clone(),
+                ranges.rows,
+                spec.heads,
+                spec.heads,
+                spec.head_dim,
+            )?,
+            text: s.alloc_zeros::<bf16>(ranges.text * h)?,
+            text_work: BlockWork::new(s, spec, r, ranges.text)?,
+            text_flash: Flash::new(
+                s.clone(),
+                ranges.text,
+                spec.heads,
+                spec.heads,
+                spec.head_dim,
+            )?,
+            scratch: s.alloc_zeros::<f32>(scratch_rows * h)?,
+            upcast: vision.load_function("vision_upcast_f32")?,
+            bias: vision.load_function("vision_bias_f32")?,
+            round: vision.load_function("vision_affine_cast_bf16")?,
+            video: s.alloc_zeros::<f32>(generated * patch)?,
+            audio: s.alloc_zeros::<f32>(ranges.audio * spec.audio_in_channels)?,
+        })
+    }
+
+    /// `y [rows, n] = x [rows, k] * w^T + b` in F32 on rows starting at element `x_offset` of `x`.
+    fn projection(
+        &self,
+        c: &BlockContext<'_>,
+        [w, b]: &[CudaSlice<f32>; 2],
+        (x, x_offset): (&CudaSlice<f32>, usize),
+        y: &CudaSlice<f32>,
+        rows: usize,
+    ) -> Result<()> {
+        let s = c.s;
+        let (n, k) = (b.len(), w.len() / b.len());
+        c.blas.linear_f32(
+            view(
+                w,
+                s,
+                0,
+                [u32::try_from(n)?, u32::try_from(k)?],
+                [k as u64, 1],
+            )?,
+            view(
+                x,
+                s,
+                x_offset,
+                [u32::try_from(rows)?, u32::try_from(k)?],
+                [k as u64, 1],
+            )?,
+            &mut TensorMut(view(
+                y,
+                s,
+                0,
+                [u32::try_from(rows)?, u32::try_from(n)?],
+                [n as u64, 1],
+            )?),
+        )?;
+        let out = pointer(y, s);
+        unsafe {
+            s.launch_builder(&self.bias)
+                .arg(&out)
+                .arg(&pointer(b, s))
+                .arg(&out)
+                .arg(&u32::try_from(rows)?)
+                .arg(&u32::try_from(n)?)
+                .launch(flat(rows * n))?;
+        }
+        Ok(())
+    }
+
+    /// Rounds `count` F32 values to BF16 sequence rows starting at element `target` of the hidden state.
+    fn round_into(
+        &self,
+        s: &Arc<CudaStream>,
+        source: u64,
+        target: usize,
+        count: usize,
+    ) -> Result<()> {
+        unsafe {
+            s.launch_builder(&self.round)
+                .arg(&source)
+                .arg(&(pointer(&self.x, s) + 2 * target as u64))
+                .arg(&(count as u64))
+                .arg(&0f32)
+                .arg(&1f32)
+                .launch(flat(count))?;
+        }
+        Ok(())
+    }
+
+    /// Widens `count` BF16 values starting at element `source` of `normed` into the F32 scratch.
+    fn upcast_from(&self, s: &Arc<CudaStream>, source: usize, count: usize) -> Result<()> {
+        unsafe {
+            s.launch_builder(&self.upcast)
+                .arg(&(pointer(&self.work.normed, s) + 2 * source as u64))
+                .arg(&pointer(&self.scratch, s))
+                .arg(&u32::try_from(count)?)
+                .launch(flat(count))?;
+        }
+        Ok(())
+    }
+
+    /// One teacher-forced evaluation; the velocities land in `self.video` and `self.audio`.
+    pub(crate) fn step(
+        &mut self,
+        c: &BlockContext<'_>,
+        adaln: &AdalnTable,
+        (pairs, timesteps): (u32, u32),
+        inputs: &StepInputs<'_>,
+    ) -> Result<()> {
+        let (s, spec, r) = (c.s, c.spec, self.ranges);
+        let h = spec.hidden;
+        let video_rows = r.condition + (r.rows - r.video_start);
+        let patch = spec.video_row_width();
+        ensure!(
+            inputs.video.len() == video_rows * patch
+                && inputs.audio.len() == r.audio * spec.audio_in_channels
+                && inputs.text.len() == r.text * spec.text_dim
+                && inputs.row_pairs.len() == r.rows
+                && inputs.row_timesteps.len() == r.rows,
+            "evaluation inputs differ from the layout"
+        );
+        c.blas.linear_biased(
+            matrix(&self.context[0], s, h, spec.text_dim)?,
+            vector(&self.context[1], s)?,
+            matrix(inputs.text, s, r.text, spec.text_dim)?,
+            &mut TensorMut(matrix(&self.text, s, r.text, h)?),
+            LinearBiasMode::BeforeOutputRound,
+        )?;
+        for refiner in &self.refiners {
+            block_forward(
+                c,
+                &mut self.text_flash,
+                refiner,
+                &Conditioning::Plain,
+                &mut self.text,
+                &mut self.text_work,
+            )?;
+        }
+        c.kernels.rms_norm(
+            s,
+            NormRows {
+                input: pointer(&self.text, s),
+                weight: pointer(&self.final_norm, s),
+                output: pointer(&self.x, s),
+                rows: r.text,
+                dim: h,
+                threads: HIDDEN_NORM_THREADS,
+                eps: spec.final_norm_eps,
+            },
+        )?;
+        self.projection(
+            c,
+            &self.proj_in,
+            (inputs.video, 0),
+            &self.scratch,
+            video_rows,
+        )?;
+        let scratch = pointer(&self.scratch, s);
+        self.round_into(s, scratch, r.text * h, r.condition * h)?;
+        self.round_into(
+            s,
+            scratch + 4 * (r.condition * h) as u64,
+            r.video_start * h,
+            (video_rows - r.condition) * h,
+        )?;
+        self.projection(
+            c,
+            &self.audio_proj_in,
+            (inputs.audio, 0),
+            &self.scratch,
+            r.audio,
+        )?;
+        self.round_into(s, scratch, r.audio_start * h, r.audio * h)?;
+
+        let block_rows = 6 * h * pairs as usize;
+        for layer in 0..spec.layers {
+            self.block.reload(
+                s,
+                &format!("transformer_blocks.{layer}"),
+                &mut self.base,
+                &mut self.lora,
+            )?;
+            let modulation = Modulation {
+                table: &adaln.blocks,
+                offset: layer * block_rows,
+                entries: pairs,
+                index: inputs.row_pairs,
+            };
+            block_forward(
+                c,
+                &mut self.flash,
+                &self.block,
+                &Conditioning::Modulated {
+                    rotary: &self.rotary,
+                    modulation: &modulation,
+                },
+                &mut self.x,
+                &mut self.work,
+            )?;
+        }
+        let normed = pointer(&self.work.normed, s);
+        c.kernels.rms_norm(
+            s,
+            NormRows {
+                input: pointer(&self.x, s),
+                weight: pointer(&self.norm_out, s),
+                output: normed,
+                rows: r.rows,
+                dim: h,
+                threads: HIDDEN_NORM_THREADS,
+                eps: spec.final_norm_eps,
+            },
+        )?;
+        ensure!(
+            adaln.norm_out.len() == timesteps as usize * 2 * h,
+            "output-norm table extent"
+        );
+        let table = pointer(&adaln.norm_out, s);
+        c.kernels.row_modulate(
+            s,
+            ModulateRows {
+                data: normed,
+                shift: table,
+                scale: table + 2 * h as u64,
+                index: pointer(inputs.row_timesteps, s),
+                rows: r.rows,
+                dim: h,
+                stride: 2 * h,
+                entries: timesteps,
+            },
+        )?;
+        let generated = r.rows - r.video_start;
+        self.upcast_from(s, r.video_start * h, generated * h)?;
+        self.projection(
+            c,
+            &self.proj_out,
+            (&self.scratch, 0),
+            &self.video,
+            generated,
+        )?;
+        self.upcast_from(s, r.audio_start * h, r.audio * h)?;
+        self.projection(
+            c,
+            &self.audio_proj_out,
+            (&self.scratch, 0),
+            &self.audio,
+            r.audio,
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1159,8 +1752,10 @@ mod tests {
                 &context,
                 &mut flash,
                 &weights,
-                &rotary,
-                &modulation,
+                &Conditioning::Modulated {
+                    rotary: &rotary,
+                    modulation: &modulation,
+                },
                 &mut x,
                 &mut work,
             )?;
@@ -1194,6 +1789,189 @@ mod tests {
             "LoRA-scale-0 control stayed within {threshold}"
         );
         println!("H3_BLOCK0_GATE PASS control=FAIL_AS_REQUIRED");
+        Ok(())
+    }
+
+    /// Streamed blocks (disk tier, one slot), eager, native AdaLN table. Every step the FP32 replay holds: the
+    /// native velocity of the generated video rows and of the audio rows on the run's teacher-forced inputs, within
+    /// the frozen `{FF_H3_CELL}.step{k}.*` thresholds; control: text rows rotated by one must leave a threshold.
+    #[test]
+    #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_MODEL, FF_H3_LORA, FF_H3_CAPTURE (BF16 run), FF_H3_REPLAY (its FP32 replay with steps), FF_H3_THRESHOLDS, FF_H3_CELL"]
+    fn dit_steps_match_the_fp32_replay() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let path = |key: &str| {
+            std::env::var_os(key)
+                .map(PathBuf::from)
+                .with_context(|| format!("{key} missing"))
+        };
+        let cell = std::env::var("FF_H3_CELL").context("FF_H3_CELL missing")?;
+        let model = path("FF_MODEL")?;
+        let capture = path("FF_H3_CAPTURE")?;
+        let lora_path = path("FF_H3_LORA")?;
+        let thresholds: serde_json::Value =
+            serde_json::from_slice(&fs::read(path("FF_H3_THRESHOLDS")?)?)?;
+        let thresholds = &thresholds["thresholds"];
+        let spec = H3Spec::read(&model)?;
+        let transformer = model.join("transformer");
+        let checkpoint = MappedCheckpoint::open_component(&transformer, "diffusion_pytorch_model")?;
+        let manifest = checkpoint.minimax_h3_manifest(&spec)?;
+        let lora_dir = lora_path.parent().context("LoRA directory")?.to_owned();
+        let stem = lora_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".safetensors"))
+            .context("LoRA file stem")?;
+        let (lora_manifest, adapter) =
+            MappedCheckpoint::open_component(&lora_dir, stem)?.minimax_h3_lora_manifest(&spec)?;
+        let layout = capture_layout(&spec, &capture)?;
+        let plan = row_timestep_plan(&layout, &Schedule::new(9, 6.0)?, &Schedule::new(9, 3.0)?)?;
+        let adaln_plan = AdalnPlan::build(&layout, &plan);
+        let replay_map = mapped(&path("FF_H3_REPLAY")?.join("replay.safetensors"))?;
+        let replay = SafeTensors::deserialize(&replay_map)?;
+        let steps: Vec<usize> = (0..plan.len())
+            .filter(|k| replay.tensor(&format!("step{k}.noise_pred")).is_ok())
+            .collect();
+        ensure!(!steps.is_empty(), "replay holds no step velocities");
+        let text_map = mapped(&capture.join("dit_text_input.safetensors"))?;
+        let text_file = SafeTensors::deserialize(&text_map)?;
+        let text_view = text_file.tensor("encoder_hidden_states")?;
+        ensure!(text_view.dtype() == Dtype::BF16, "text input dtype");
+        let text_host: Vec<bf16> = text_view
+            .data()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| bf16::from_le_bytes(*b))
+            .collect();
+
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let runtime = std::env::temp_dir().join(format!("ff-h3-dit-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(true, "MiniMax-H3 DiT gate".into())),
+        )?;
+        let table = AdalnTable::build(
+            &device,
+            &mut blas,
+            &transformer,
+            &checkpoint,
+            &manifest,
+            &spec,
+            &adaln_plan,
+        )?;
+        let mut dit = Dit::new(
+            s,
+            &mut blas,
+            &spec,
+            (adapter.rank, &layout),
+            Source::new(&transformer, &manifest),
+            Source::new(&lora_dir, &lora_manifest),
+        )?;
+        let kernels = BlockKernels::new(&device.ctx)?;
+        let context = BlockContext {
+            s,
+            blas: &blas,
+            kernels: &kernels,
+            spec: &spec,
+            lora_scale: adapter.scale,
+        };
+        let counts = (
+            u32::try_from(adaln_plan.pairs.len())?,
+            u32::try_from(adaln_plan.timesteps.len())?,
+        );
+        let text = s.clone_htod(&text_host)?;
+        let rotated: Vec<bf16> = text_host[spec.text_dim..]
+            .iter()
+            .chain(&text_host[..spec.text_dim])
+            .copied()
+            .collect();
+        let rotated = s.clone_htod(&rotated)?;
+        let condition = layout.condition_video_rows;
+        let patch = spec.video_row_width();
+        let mut control_failed = false;
+        for &k in &steps {
+            let step_map = mapped(&capture.join(format!("step{k}.safetensors")))?;
+            let step_file = SafeTensors::deserialize(&step_map)?;
+            let to_f32 = |name: &str| -> Result<Vec<f32>> {
+                Ok(decoded(&step_file, name)?
+                    .0
+                    .into_iter()
+                    .map(|v| v as f32)
+                    .collect())
+            };
+            let video = s.clone_htod(&to_f32("hidden_states")?)?;
+            let audio = s.clone_htod(&to_f32("audio_hidden_states")?)?;
+            let row_pairs = s.clone_htod(&adaln_plan.row_pairs[k])?;
+            let row_timesteps = s.clone_htod(&adaln_plan.row_timesteps[k])?;
+            let mut evaluate = |text: &CudaSlice<bf16>| -> Result<[[f64; 3]; 2]> {
+                dit.step(
+                    &context,
+                    &table,
+                    counts,
+                    &StepInputs {
+                        video: &video,
+                        audio: &audio,
+                        text,
+                        row_pairs: &row_pairs,
+                        row_timesteps: &row_timesteps,
+                    },
+                )?;
+                let candidate: Vec<f64> = s
+                    .clone_dtoh(&dit.video)?
+                    .into_iter()
+                    .map(f64::from)
+                    .collect();
+                let audio_candidate: Vec<f64> = s
+                    .clone_dtoh(&dit.audio)?
+                    .into_iter()
+                    .map(f64::from)
+                    .collect();
+                ensure!(
+                    candidate
+                        .iter()
+                        .chain(&audio_candidate)
+                        .all(|v| v.is_finite()),
+                    "step {k}: non-finite velocity"
+                );
+                let (reference, _) = decoded(&replay, &format!("step{k}.noise_pred"))?;
+                let (audio_reference, _) = decoded(&replay, &format!("step{k}.audio_noise_pred"))?;
+                Ok([
+                    distance(&candidate, &reference[condition * patch..]),
+                    distance(&audio_candidate, &audio_reference),
+                ])
+            };
+            let [d_video, d_audio] = evaluate(&text)?;
+            let video_threshold = &thresholds[format!("{cell}.step{k}.noise_pred")];
+            let audio_threshold = &thresholds[format!("{cell}.step{k}.audio_noise_pred")];
+            println!(
+                "H3_DIT step{k} video={d_video:?} audio={d_audio:?} thresholds={video_threshold} {audio_threshold}"
+            );
+            ensure!(
+                within(d_video, video_threshold)? && within(d_audio, audio_threshold)?,
+                "step {k} outside the frozen thresholds"
+            );
+            if k == steps[0] {
+                let [c_video, c_audio] = evaluate(&rotated)?;
+                println!("H3_DIT step{k} rotated-text control video={c_video:?} audio={c_audio:?}");
+                control_failed =
+                    !within(c_video, video_threshold)? || !within(c_audio, audio_threshold)?;
+            }
+        }
+        fs::remove_dir(&runtime)?;
+        ensure!(
+            control_failed,
+            "rotated-text control stayed within the thresholds"
+        );
+        println!("H3_DIT_GATE PASS cell={cell} steps={steps:?} control=FAIL_AS_REQUIRED");
         Ok(())
     }
 }
