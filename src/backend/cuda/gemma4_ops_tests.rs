@@ -4516,7 +4516,11 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         .filter_map(|l| l.sliding_window)
         .max()
         .context("Gemma sliding window missing")? as usize;
-    let decode = spec.q_heads as usize * ring.div_ceil(32) * (spec.head_dim as usize + 2) * 4;
+    let ring_decode = spec.q_heads as usize * ring.div_ceil(32) * (spec.head_dim as usize + 2) * 4;
+    let decode = ring_decode.max(super::decode::CausalDecodeD512::workspace(
+        spec.q_heads as usize,
+        admission_capacity,
+    )?);
     let intermediate = spec
         .layers
         .iter()
@@ -4531,9 +4535,13 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
     );
     ensure!(admitted == expected, "Gemma workspace admission mismatch");
     let scratch = engine.gemma_scratch_len();
+    let expected_scratch = ring_decode.max(super::decode::CausalDecodeD512::workspace(
+        spec.q_heads as usize,
+        640,
+    )?);
     println!("GEMMA4_SCRATCH bytes={scratch}");
     ensure!(
-        scratch == decode,
+        scratch == expected_scratch,
         "Gemma shared decode scratch extent differs"
     );
     let global_layer = spec
@@ -5461,6 +5469,789 @@ fn gemma4_decode_launch_and_byte_reductions_gpu() -> Result<()> {
     }
     println!(
         "PASS A1_PER_LAYER_INPUT layers=35,42 rows=1,17,64 width={width} bit_diffs=0 planted_scale_mutant=detected"
+    );
+    Ok(())
+}
+
+#[test]
+fn gemma4_causal_decode_d512_setup_and_workspace_cpu() -> Result<()> {
+    use super::decode::CausalDecodeD512;
+
+    let merge_room = 49_152usize;
+    let max_grid = (2_147_483_647u32, 65_535u32);
+    let sm89_res = [(1u32, 5usize), (2, 2), (4, 1)];
+    let sm86_res = [(1u32, 5usize), (2, 2), (4, 1)];
+    for (name, heads, kv, cap, sms, res, exp_pack, exp_chunk, exp_ws) in [
+        (
+            "E2B_1k_sm89",
+            8u32,
+            1u32,
+            1040u32,
+            128usize,
+            &sm89_res[..],
+            2u32,
+            32u32,
+            542_784usize,
+        ),
+        (
+            "E4B_1k_sm89",
+            8,
+            2,
+            1040,
+            128,
+            &sm89_res[..],
+            2,
+            32,
+            542_784,
+        ),
+        (
+            "12B_1k_sm89",
+            16,
+            1,
+            1040,
+            128,
+            &sm89_res[..],
+            4,
+            32,
+            1_085_568,
+        ),
+        (
+            "31B_1k_sm89",
+            32,
+            4,
+            1040,
+            128,
+            &sm89_res[..],
+            4,
+            64,
+            2_171_136,
+        ),
+        (
+            "E2B_8k_sm89",
+            8,
+            1,
+            8208,
+            128,
+            &sm89_res[..],
+            2,
+            32,
+            4_227_136,
+        ),
+        (
+            "E4B_8k_sm89",
+            8,
+            2,
+            8208,
+            128,
+            &sm89_res[..],
+            2,
+            32,
+            4_227_136,
+        ),
+        (
+            "12B_8k_sm89",
+            16,
+            1,
+            8208,
+            128,
+            &sm89_res[..],
+            4,
+            32,
+            8_454_272,
+        ),
+        (
+            "31B_8k_sm89",
+            32,
+            4,
+            8208,
+            128,
+            &sm89_res[..],
+            4,
+            64,
+            16_908_544,
+        ),
+        (
+            "E2B_8k_sm86",
+            8,
+            1,
+            8208,
+            48,
+            &sm86_res[..],
+            4,
+            32,
+            4_227_136,
+        ),
+        (
+            "31B_8k_sm86",
+            32,
+            4,
+            8208,
+            48,
+            &sm86_res[..],
+            4,
+            192,
+            16_908_544,
+        ),
+        (
+            "pack1_mha",
+            4,
+            4,
+            8208,
+            128,
+            &sm89_res[..],
+            1,
+            32,
+            2_113_568,
+        ),
+    ] {
+        let (pack, chunk, max_parts, _) = CausalDecodeD512::select_partition_chunk(
+            heads, kv, cap, sms, merge_room, max_grid, res,
+        )?;
+        let ws = CausalDecodeD512::workspace(heads as usize, cap as usize)?;
+        ensure!(
+            pack == exp_pack
+                && chunk == exp_chunk
+                && max_parts == cap.div_ceil(exp_chunk)
+                && ws == exp_ws,
+            "{name}: got (pack={pack}, chunk={chunk}, max_parts={max_parts}, ws={ws}), expected (pack={exp_pack}, chunk={exp_chunk}, ws={exp_ws})"
+        );
+    }
+    for (heads, kv, cap, sms, room) in [
+        (0u32, 1u32, 1024u32, 128usize, merge_room),
+        (8, 0, 1024, 128, merge_room),
+        (8, 3, 1024, 128, merge_room),
+        (8, 1, 0, 128, merge_room),
+        (8, 1, 1024, 0, merge_room),
+        (8, 1, 8208, 128, 2048),
+    ] {
+        ensure!(
+            CausalDecodeD512::select_partition_chunk(
+                heads, kv, cap, sms, room, max_grid, &sm89_res
+            )
+            .is_err(),
+            "accepted invalid CausalDecodeD512 setup ({heads}, {kv}, {cap}, {sms}, {room})"
+        );
+    }
+    ensure!(
+        CausalDecodeD512::workspace(0, 1024).is_err(),
+        "accepted zero heads"
+    );
+    ensure!(
+        CausalDecodeD512::workspace(8, 0).is_err(),
+        "accepted zero capacity"
+    );
+    println!("PASS gemma4_causal_decode_d512_setup_and_workspace_cpu cases=11 invalid_rejected=8");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a GPU"]
+fn gemma4_causal_decode_d512_gpu() -> Result<()> {
+    use super::contracts::{Scratch, TensorMut, view};
+    use super::decode::{CausalDecodeD512, CausalDecodeD512Input};
+    use crate::backend::gpu::DevicePtr;
+
+    let device = Device::new(0)?;
+    let ctx = &device.ctx;
+    let s = &device.stream;
+    for (heads, kv, cap) in [(0, 1, 1024), (8, 3, 1024), (8, 1, 0), (16384, 16384, 8208)] {
+        ensure!(
+            CausalDecodeD512::new(ctx, heads, kv, cap, 1.0).is_err(),
+            "CausalDecodeD512 accepted invalid shape heads={heads} kv={kv} cap={cap}"
+        );
+    }
+    let limits: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/attention_reference.json"
+    ))?;
+    let bound = &limits["limits"]["e512-unit"];
+    let maximum = bound["output_max"]
+        .as_f64()
+        .context("e512-unit output_max missing")?;
+    let rms = bound["output_rms"]
+        .as_f64()
+        .context("e512-unit output_rms missing")?;
+    let lse_max = bound["lse_max"]
+        .as_f64()
+        .context("e512-unit lse_max missing")?;
+
+    let error_pair = |actual: &[f64], expected: &[f64]| -> Result<(f64, f64)> {
+        ensure!(
+            !actual.is_empty() && actual.len() == expected.len(),
+            "error slice length mismatch {} vs {}",
+            actual.len(),
+            expected.len()
+        );
+        let mut peak = 0.0f64;
+        let mut sum_sq = 0.0f64;
+        for (&a, &e) in actual.iter().zip(expected) {
+            ensure!(a.is_finite() && e.is_finite(), "non-finite attention value");
+            let diff = (a - e).abs();
+            peak = peak.max(diff);
+            sum_sq += diff * diff;
+        }
+        Ok((peak, (sum_sq / actual.len() as f64).sqrt()))
+    };
+
+    let capacity = 8208usize;
+    let positions = [0usize, 1, 31, 32, 33, 63, 64, 65, 511, 512, 1024, 8192];
+    let max_pos = 8192usize;
+    let (mut cases, mut defects, mut controls) = (0usize, 0usize, 0usize);
+
+    for (heads, kv) in [(8usize, 1usize), (8, 2), (16, 1), (32, 4), (4, 4)] {
+        let op = CausalDecodeD512::new(ctx, heads as u32, kv as u32, capacity as u32, 1.0)?;
+        let bytes = CausalDecodeD512::workspace(heads, capacity)?;
+        let mut scratch = s.clone_htod(&vec![0xa5u8; bytes + 256])?;
+        let mut position = s.clone_htod(&[0i32])?;
+        let q_len = heads * 512;
+        let qh: Vec<_> = (0..q_len)
+            .map(|i| {
+                bf16::from_f32(if i % 512 == 0 {
+                    1.0 + (i / 512) as f32 / 16.0
+                } else {
+                    ((i * 31 % 1009) as f32 - 504.0) / 32768.0
+                })
+            })
+            .collect();
+        let q = s.clone_htod(&qh)?;
+        let kv_total = kv * capacity * 512;
+        let mut kh = vec![bf16::from_f32(-32.0); kv_total + 32];
+        let mut vh = vec![bf16::from_f32(-32.0); kv_total + 32];
+        let mut k = s.clone_htod(&kh)?;
+        let mut v = s.clone_htod(&vh)?;
+        let out = s.clone_htod(&vec![bf16::from_f32(-32.0); q_len + 32])?;
+        let lse = s.clone_htod(&vec![f32::from_bits(0x7fc00001); heads + 8])?;
+
+        let mut kh_valid = vec![bf16::ZERO; kv * (max_pos + 1) * 512];
+        let mut vh_valid = vec![bf16::ZERO; kv * (max_pos + 1) * 512];
+        for head in 0..kv {
+            for key in 0..=max_pos {
+                let base = ((key * 37 + head * 13 + 47) % 1009) as f32 / 128.0 - 504.0 / 128.0;
+                for d in 0..512 {
+                    let idx = (head * (max_pos + 1) + key) * 512 + d;
+                    kh_valid[idx] = bf16::from_f32(if d == 0 {
+                        base
+                    } else {
+                        ((key * 512 + d * 41 + head * 7) % 1013) as f32 / 32768.0 - 506.0 / 32768.0
+                    });
+                    vh_valid[idx] = bf16::from_f32(
+                        base / 8.0 + ((key * 512 + d * 43 + head * 11) % 1019) as f32 / 8192.0
+                            - 509.0 / 8192.0,
+                    );
+                }
+            }
+        }
+        let mut scores_by_head = vec![vec![0.0f64; max_pos + 1]; heads];
+        for head in 0..heads {
+            let kv_head = head / (heads / kv);
+            let q_row = &qh[head * 512..(head + 1) * 512];
+            for key in 0..=max_pos {
+                let k_row = &kh_valid[(kv_head * (max_pos + 1) + key) * 512
+                    ..(kv_head * (max_pos + 1) + key + 1) * 512];
+                let mut dot = 0.0f64;
+                for d in 0..512 {
+                    dot += q_row[d].to_f64() * k_row[d].to_f64();
+                }
+                scores_by_head[head][key] = dot;
+            }
+        }
+
+        let qv = view(&q, s, 0, [1, heads as u32, 512], [q_len as u64, 512, 1])?;
+        let kv_shape = [kv as u32, capacity as u32, 512];
+        let kv_stride = [(capacity * 512) as u64, 512, 1];
+        let kv_view = view(&k, s, 0, kv_shape, kv_stride)?;
+        let vv_view = view(&v, s, 0, kv_shape, kv_stride)?;
+        let pos_view = view(&position, s, 0, [1], [1])?;
+        let out_view = view(&out, s, 0, [1, heads as u32, 512], [q_len as u64, 512, 1])?;
+        let lse_view = view(&lse, s, 0, [heads as u32], [1])?;
+        let scratch_ptr = scratch.device_ptr(s).0;
+        let run = || {
+            op.run(
+                s,
+                CausalDecodeD512Input {
+                    q: qv,
+                    k: kv_view,
+                    v: vv_view,
+                    position: pos_view,
+                    out: &mut TensorMut(out_view),
+                    lse: &mut TensorMut(lse_view),
+                    scratch: Scratch {
+                        ptr: scratch_ptr,
+                        bytes: bytes as u64,
+                    },
+                },
+            )
+        };
+        s.synchronize()?;
+        #[cfg(feature = "cuda")]
+        s.begin_capture(
+            cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+        )?;
+        #[cfg(feature = "rocm")]
+        let capture = s.begin_capture()?;
+        let scheduled = run();
+        #[cfg(feature = "cuda")]
+        let captured = s
+            .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
+            .context("causal decode D512 graph empty")?;
+        #[cfg(feature = "rocm")]
+        let captured = capture.finish()?;
+        scheduled?;
+
+        let mut filled = 0usize;
+        for &p in &positions {
+            for head in 0..kv {
+                for key in filled..=p {
+                    let dst = (head * capacity + key) * 512;
+                    let src = (head * (max_pos + 1) + key) * 512;
+                    kh[dst..dst + 512].copy_from_slice(&kh_valid[src..src + 512]);
+                    vh[dst..dst + 512].copy_from_slice(&vh_valid[src..src + 512]);
+                }
+            }
+            filled = p + 1;
+            let mut expected = vec![0.0f64; q_len];
+            let mut expected_lse = Vec::with_capacity(heads);
+            for head in 0..heads {
+                let kv_head = head / (heads / kv);
+                let scores = &scores_by_head[head][..=p];
+                let peak = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let weights: Vec<_> = scores.iter().map(|&x| (x - peak).exp()).collect();
+                let denominator: f64 = weights.iter().sum();
+                expected_lse.push(peak + denominator.ln());
+                let out_row = &mut expected[head * 512..(head + 1) * 512];
+                for (key, weight) in weights.into_iter().enumerate() {
+                    let scale = weight / denominator;
+                    let v_row = &vh_valid[(kv_head * (max_pos + 1) + key) * 512
+                        ..(kv_head * (max_pos + 1) + key + 1) * 512];
+                    for d in 0..512 {
+                        out_row[d] += scale * v_row[d].to_f64();
+                    }
+                }
+            }
+            s.memcpy_htod(&kh, &mut k)?;
+            s.memcpy_htod(&vh, &mut v)?;
+            s.memcpy_htod(&[p as i32], &mut position)?;
+            s.memcpy_htod(&vec![0xa5u8; bytes + 256], &mut scratch)?;
+            captured.launch()?;
+            captured.launch()?;
+            let graph = s.clone_dtoh(&out)?;
+            let graph_lse = s.clone_dtoh(&lse)?;
+            run()?;
+            let eager = s.clone_dtoh(&out)?;
+            let eager_lse = s.clone_dtoh(&lse)?;
+            ensure!(
+                graph == eager && graph_lse[..heads] == eager_lse[..heads],
+                "causal decode D512 graph/eager differs heads={heads} kv={kv} p={p}"
+            );
+            ensure!(
+                graph[q_len..].iter().all(|&x| x == bf16::from_f32(-32.0))
+                    && graph_lse[heads..].iter().all(|x| x.to_bits() == 0x7fc00001)
+                    && s.clone_dtoh(&scratch)?[bytes..].iter().all(|&x| x == 0xa5),
+                "causal decode D512 output/scratch guard changed heads={heads} kv={kv} p={p}"
+            );
+            let (max_error, rms_error) = error_pair(
+                &graph[..q_len]
+                    .iter()
+                    .map(|x| x.to_f64())
+                    .collect::<Vec<_>>(),
+                &expected,
+            )?;
+            let (lse_error, _) = error_pair(
+                &graph_lse[..heads]
+                    .iter()
+                    .map(|&x| f64::from(x))
+                    .collect::<Vec<_>>(),
+                &expected_lse,
+            )?;
+            let passed = max_error <= maximum && rms_error <= rms && lse_error <= lse_max;
+            defects += usize::from(!passed);
+            println!(
+                "CAUSAL_DECODE_D512 {} heads={heads} kv={kv} position={p} output_max={max_error:e} output_rms={rms_error:e} lse_max={lse_error:e}",
+                if passed { "PASS" } else { "DEFECT" }
+            );
+            if p >= 31 {
+                let mut wrong = vh.clone();
+                for head in 0..kv {
+                    for slot in 0..=p {
+                        let next = (slot + 1) % (p + 1);
+                        let dst = (head * capacity + slot) * 512;
+                        let src = (head * capacity + next) * 512;
+                        wrong[dst..dst + 512].copy_from_slice(&vh[src..src + 512]);
+                    }
+                }
+                s.memcpy_htod(&wrong, &mut v)?;
+                captured.launch()?;
+                let wrong_out = s.clone_dtoh(&out)?;
+                let (control, _) = error_pair(
+                    &wrong_out[..q_len]
+                        .iter()
+                        .map(|x| x.to_f64())
+                        .collect::<Vec<_>>(),
+                    &expected,
+                )?;
+                ensure!(
+                    control > maximum,
+                    "wrong-slot V control not detected heads={heads} kv={kv} p={p} err={control:e}"
+                );
+                controls += 1;
+                s.memcpy_htod(&vh, &mut v)?;
+            }
+            if p == 1024 {
+                s.memcpy_htod(&[0i32], &mut position)?;
+                captured.launch()?;
+                let stale_out = s.clone_dtoh(&out)?;
+                let (stale_err, _) = error_pair(
+                    &stale_out[..q_len]
+                        .iter()
+                        .map(|x| x.to_f64())
+                        .collect::<Vec<_>>(),
+                    &expected,
+                )?;
+                ensure!(
+                    stale_err > maximum,
+                    "stale host-baked position=0 control not detected heads={heads} kv={kv}"
+                );
+                controls += 1;
+                s.memcpy_htod(&[p as i32], &mut position)?;
+            }
+            cases += 1;
+        }
+
+        if matches!((heads, kv), (8, 1) | (8, 2)) {
+            let qh_reader: Vec<_> = (0..q_len)
+                .map(|i| {
+                    bf16::from_f32(if i % 512 == 0 {
+                        1.25 + (i / 512) as f32 / 16.0
+                    } else {
+                        ((i * 53 % 1009) as f32 - 504.0) / 32768.0
+                    })
+                })
+                .collect();
+            let q_reader = s.clone_htod(&qh_reader)?;
+            let qv_reader = view(
+                &q_reader,
+                s,
+                0,
+                [1, heads as u32, 512],
+                [q_len as u64, 512, 1],
+            )?;
+            let p_shared = 1024usize;
+            s.memcpy_htod(&[p_shared as i32], &mut position)?;
+            let run_reader = || {
+                op.run(
+                    s,
+                    CausalDecodeD512Input {
+                        q: qv_reader,
+                        k: kv_view,
+                        v: vv_view,
+                        position: pos_view,
+                        out: &mut TensorMut(out_view),
+                        lse: &mut TensorMut(lse_view),
+                        scratch: Scratch {
+                            ptr: scratch_ptr,
+                            bytes: bytes as u64,
+                        },
+                    },
+                )
+            };
+            s.synchronize()?;
+            #[cfg(feature = "cuda")]
+            s.begin_capture(
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )?;
+            #[cfg(feature = "rocm")]
+            let reader_cap = s.begin_capture()?;
+            let reader_sched = run_reader();
+            #[cfg(feature = "cuda")]
+            let reader_graph = s
+                .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
+                .context("shared KV reader graph empty")?;
+            #[cfg(feature = "rocm")]
+            let reader_graph = reader_cap.finish()?;
+            reader_sched?;
+            reader_graph.launch()?;
+            let graph_shared = s.clone_dtoh(&out)?;
+            let graph_shared_lse = s.clone_dtoh(&lse)?;
+            run_reader()?;
+            let eager_shared = s.clone_dtoh(&out)?;
+            let eager_shared_lse = s.clone_dtoh(&lse)?;
+            ensure!(
+                graph_shared == eager_shared
+                    && graph_shared_lse[..heads] == eager_shared_lse[..heads],
+                "shared-KV reader graph/eager mismatch heads={heads} kv={kv}"
+            );
+            let mut expected_shared = vec![0.0f64; q_len];
+            let mut expected_shared_lse = Vec::with_capacity(heads);
+            for head in 0..heads {
+                let kv_head = head / (heads / kv);
+                let q_row = &qh_reader[head * 512..(head + 1) * 512];
+                let scores: Vec<_> = (0..=p_shared)
+                    .map(|key| {
+                        let k_row = &kh_valid[(kv_head * (max_pos + 1) + key) * 512
+                            ..(kv_head * (max_pos + 1) + key + 1) * 512];
+                        (0..512)
+                            .map(|d| q_row[d].to_f64() * k_row[d].to_f64())
+                            .sum::<f64>()
+                    })
+                    .collect();
+                let peak = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let weights: Vec<_> = scores.iter().map(|&x| (x - peak).exp()).collect();
+                let denominator: f64 = weights.iter().sum();
+                expected_shared_lse.push(peak + denominator.ln());
+                let out_row = &mut expected_shared[head * 512..(head + 1) * 512];
+                for (key, weight) in weights.into_iter().enumerate() {
+                    let scale = weight / denominator;
+                    let v_row = &vh_valid[(kv_head * (max_pos + 1) + key) * 512
+                        ..(kv_head * (max_pos + 1) + key + 1) * 512];
+                    for d in 0..512 {
+                        out_row[d] += scale * v_row[d].to_f64();
+                    }
+                }
+            }
+            let (max_err, rms_err) = error_pair(
+                &graph_shared[..q_len]
+                    .iter()
+                    .map(|x| x.to_f64())
+                    .collect::<Vec<_>>(),
+                &expected_shared,
+            )?;
+            let (lse_err, _) = error_pair(
+                &graph_shared_lse[..heads]
+                    .iter()
+                    .map(|&x| f64::from(x))
+                    .collect::<Vec<_>>(),
+                &expected_shared_lse,
+            )?;
+            let passed = max_err <= maximum && rms_err <= rms && lse_err <= lse_max;
+            defects += usize::from(!passed);
+            println!(
+                "CAUSAL_DECODE_D512_SHARED_KV {} heads={heads} kv={kv} position={p_shared} output_max={max_err:e} output_rms={rms_err:e} lse_max={lse_err:e}",
+                if passed { "PASS" } else { "DEFECT" }
+            );
+            cases += 1;
+        }
+
+        if matches!((heads, kv), (16, 1) | (32, 4)) {
+            ensure!(
+                op.run(
+                    s,
+                    CausalDecodeD512Input {
+                        q: qv,
+                        k: kv_view,
+                        v: kv_view,
+                        position: pos_view,
+                        out: &mut TensorMut(out_view),
+                        lse: &mut TensorMut(lse_view),
+                        scratch: Scratch {
+                            ptr: scratch_ptr,
+                            bytes: bytes as u64,
+                        },
+                    },
+                )
+                .is_err(),
+                "CausalDecodeD512 accepted aliased K/V pointer heads={heads} kv={kv}"
+            );
+            let rope_mod = cubin::module(ctx, "rope")?;
+            let shared_rope = rope_mod.load_function("qknorm_rope_table_shared_kv")?;
+            let prep_rows = 1025usize;
+            let q_width = heads * 512;
+            let kv_width = kv * 512;
+            let raw: Vec<_> = (0..prep_rows * (q_width + kv_width))
+                .map(|i| bf16::from_f32(((i * 37 % 1009) as f32 - 504.0) / 128.0))
+                .collect();
+            let mut qkv_dev = s.clone_htod(&raw)?;
+            let q_norms_host: Vec<_> = (0..512)
+                .map(|i| bf16::from_f32((0.5 + (i * 19 % 97) as f32 / 97.0) / 512.0f32.sqrt()))
+                .collect();
+            let k_norms_host: Vec<_> = (0..512)
+                .map(|i| bf16::from_f32(0.25 + (i * 17 % 101) as f32 / 32.0))
+                .collect();
+            let q_norms_dev = s.clone_htod(&q_norms_host)?;
+            let k_norms_dev = s.clone_htod(&k_norms_host)?;
+            let rope_spec = crate::model_spec::RopeSpec {
+                theta: 1_000_000.0,
+                pairs: 64,
+                pair_stride: 256,
+                denominator: 512,
+            };
+            let table_dev = s.clone_htod(&rope_spec.table(512, capacity)?)?;
+            let start_zero = s.clone_htod(&[0i32])?;
+            let mut stage_k = s.clone_htod(&vec![bf16::from_f32(-32.0); kv_total + 32])?;
+            let mut stage_v = s.clone_htod(&vec![bf16::from_f32(-32.0); kv_total + 32])?;
+            unsafe {
+                s.launch_builder(&shared_rope)
+                    .arg(&mut qkv_dev)
+                    .arg(&mut stage_k)
+                    .arg(&mut stage_v)
+                    .arg(&q_norms_dev)
+                    .arg(&k_norms_dev)
+                    .arg(&table_dev)
+                    .arg(&start_zero)
+                    .arg(&-1i32)
+                    .arg(&(prep_rows as i32))
+                    .arg(&(heads as i32))
+                    .arg(&(kv as i32))
+                    .arg(&512i32)
+                    .arg(&(capacity as i32))
+                    .arg(&0i32)
+                    .arg(&1e-6f32)
+                    .arg(&(q_width as u64))
+                    .arg(&((prep_rows * q_width) as u64))
+                    .arg(&(kv_width as u64))
+                    .arg(&((prep_rows * (q_width + kv_width)) as u64))
+                    .arg(&(kv_width as u64))
+                    .launch(LaunchConfig {
+                        grid_dim: ((prep_rows * (heads + kv)) as u32, 1, 1),
+                        block_dim: (128, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+            let qkv_host = s.clone_dtoh(&qkv_dev)?;
+            let stage_k_host = s.clone_dtoh(&stage_k)?;
+            let stage_v_host = s.clone_dtoh(&stage_v)?;
+            let q_keqv_host = &qkv_host[(prep_rows - 1) * q_width..prep_rows * q_width];
+            let q_keqv_dev = s.clone_htod(q_keqv_host)?;
+            let q_keqv_view = view(
+                &q_keqv_dev,
+                s,
+                0,
+                [1, heads as u32, 512],
+                [q_len as u64, 512, 1],
+            )?;
+            let stage_k_view = view(&stage_k, s, 0, kv_shape, kv_stride)?;
+            let stage_v_view = view(&stage_v, s, 0, kv_shape, kv_stride)?;
+            let stage_k_as_v = s.clone_htod(&stage_k_host)?;
+            let stage_k_as_v_view = view(&stage_k_as_v, s, 0, kv_shape, kv_stride)?;
+            let run_keqv = || {
+                op.run(
+                    s,
+                    CausalDecodeD512Input {
+                        q: q_keqv_view,
+                        k: stage_k_view,
+                        v: stage_v_view,
+                        position: pos_view,
+                        out: &mut TensorMut(out_view),
+                        lse: &mut TensorMut(lse_view),
+                        scratch: Scratch {
+                            ptr: scratch_ptr,
+                            bytes: bytes as u64,
+                        },
+                    },
+                )
+            };
+            s.synchronize()?;
+            #[cfg(feature = "cuda")]
+            s.begin_capture(
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )?;
+            #[cfg(feature = "rocm")]
+            let keqv_cap = s.begin_capture()?;
+            let keqv_sched = run_keqv();
+            #[cfg(feature = "cuda")]
+            let keqv_graph = s
+                .end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0))?
+                .context("k_eq_v decode graph empty")?;
+            #[cfg(feature = "rocm")]
+            let keqv_graph = keqv_cap.finish()?;
+            keqv_sched?;
+            for p_keqv in [0usize, 32, 1024] {
+                let mut exp_keqv = vec![0.0f64; q_len];
+                let mut exp_keqv_lse = Vec::with_capacity(heads);
+                for head in 0..heads {
+                    let kv_head = head / (heads / kv);
+                    let q_row = &q_keqv_host[head * 512..(head + 1) * 512];
+                    let scores: Vec<_> = (0..=p_keqv)
+                        .map(|key| {
+                            let k_row = &stage_k_host[(kv_head * capacity + key) * 512
+                                ..(kv_head * capacity + key + 1) * 512];
+                            (0..512)
+                                .map(|d| q_row[d].to_f64() * k_row[d].to_f64())
+                                .sum::<f64>()
+                        })
+                        .collect();
+                    let peak = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let weights: Vec<_> = scores.iter().map(|&x| (x - peak).exp()).collect();
+                    let denominator: f64 = weights.iter().sum();
+                    exp_keqv_lse.push(peak + denominator.ln());
+                    let out_row = &mut exp_keqv[head * 512..(head + 1) * 512];
+                    for (key, weight) in weights.into_iter().enumerate() {
+                        let scale = weight / denominator;
+                        let v_row = &stage_v_host[(kv_head * capacity + key) * 512
+                            ..(kv_head * capacity + key + 1) * 512];
+                        for d in 0..512 {
+                            out_row[d] += scale * v_row[d].to_f64();
+                        }
+                    }
+                }
+                s.memcpy_htod(&[p_keqv as i32], &mut position)?;
+                keqv_graph.launch()?;
+                let keqv_graph_out = s.clone_dtoh(&out)?;
+                let keqv_graph_lse = s.clone_dtoh(&lse)?;
+                run_keqv()?;
+                let keqv_eager_out = s.clone_dtoh(&out)?;
+                let keqv_eager_lse = s.clone_dtoh(&lse)?;
+                ensure!(
+                    keqv_graph_out == keqv_eager_out
+                        && keqv_graph_lse[..heads] == keqv_eager_lse[..heads],
+                    "k_eq_v graph/eager mismatch heads={heads} kv={kv} p={p_keqv}"
+                );
+                let (max_err, rms_err) = error_pair(
+                    &keqv_graph_out[..q_len]
+                        .iter()
+                        .map(|x| x.to_f64())
+                        .collect::<Vec<_>>(),
+                    &exp_keqv,
+                )?;
+                let (lse_err, _) = error_pair(
+                    &keqv_graph_lse[..heads]
+                        .iter()
+                        .map(|&x| f64::from(x))
+                        .collect::<Vec<_>>(),
+                    &exp_keqv_lse,
+                )?;
+                let passed = max_err <= maximum && rms_err <= rms && lse_err <= lse_max;
+                defects += usize::from(!passed);
+                op.run(
+                    s,
+                    CausalDecodeD512Input {
+                        q: q_keqv_view,
+                        k: stage_k_view,
+                        v: stage_k_as_v_view,
+                        position: pos_view,
+                        out: &mut TensorMut(out_view),
+                        lse: &mut TensorMut(lse_view),
+                        scratch: Scratch {
+                            ptr: scratch_ptr,
+                            bytes: bytes as u64,
+                        },
+                    },
+                )?;
+                let wrong_v_out = s.clone_dtoh(&out)?;
+                let (v_eq_k_err, _) = error_pair(
+                    &wrong_v_out[..q_len]
+                        .iter()
+                        .map(|x| x.to_f64())
+                        .collect::<Vec<_>>(),
+                    &exp_keqv,
+                )?;
+                ensure!(
+                    v_eq_k_err > maximum,
+                    "k_eq_v wrong-V (V := K) control not detected heads={heads} kv={kv} p={p_keqv} err={v_eq_k_err:e}"
+                );
+                controls += 1;
+                println!(
+                    "CAUSAL_DECODE_D512_K_EQ_V {} heads={heads} kv={kv} position={p_keqv} output_max={max_err:e} output_rms={rms_err:e} lse_max={lse_err:e} v_eq_k_control={v_eq_k_err:e}",
+                    if passed { "PASS" } else { "DEFECT" }
+                );
+                cases += 1;
+            }
+        }
+    }
+    println!(
+        "PASS gemma4_causal_decode_d512_gpu cases={cases} defects={defects} controls={controls} frozen_e512_unit=true"
+    );
+    ensure!(
+        cases == 68 && defects == 0 && controls == 61,
+        "gemma4_causal_decode_d512_gpu cases={cases} defects={defects} controls={controls}"
     );
     Ok(())
 }
