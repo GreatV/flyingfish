@@ -1821,9 +1821,7 @@ fn diffusion_tiered_gpu() -> Result<()> {
     #[cfg(feature = "cuda")]
     {
         use crate::backend::cuda::contracts::{Scratch, Tensor, TensorMut, view};
-        use crate::backend::cuda::engine::{
-            DISK_MARK, HOST_MARK, STAGING_SLOTS, TieredCall, contribute_tiered,
-        };
+        use crate::backend::cuda::engine::{DISK_MARK, HOST_MARK, TieredCall, contribute_tiered};
         use crate::backend::cuda::moe::PrefillOps;
         use crate::backend::cuda::moe::combine::MoeCombineRouted;
         use crate::backend::cuda::moe::prefill::MoePrefillContribute;
@@ -1918,8 +1916,11 @@ fn diffusion_tiered_gpu() -> Result<()> {
         let mut done = s.alloc_zeros(rows * top_k)?;
         let shared_gate = s.clone_htod(&vec![bf16::ZERO; expert_inter * hidden])?;
         let shared_down = s.clone_htod(&vec![bf16::ZERO; hidden * expert_inter])?;
-        let mut staging_gu = s.alloc_zeros(STAGING_SLOTS * gu_stride)?;
-        let mut staging_dn = s.alloc_zeros(STAGING_SLOTS * dn_stride)?;
+        // Planned staging below the 16-slot constant reproduces the
+        // low-memory plan shape; waves must size by this count.
+        let planned_staging_slots = 4usize;
+        let mut staging_gu = s.alloc_zeros(planned_staging_slots * gu_stride)?;
+        let mut staging_dn = s.alloc_zeros(planned_staging_slots * dn_stride)?;
         let mut wave_slots_gu = s.clone_htod(&vec![0u64; experts])?;
         let mut wave_slots_dn = s.clone_htod(&vec![0u64; experts])?;
         let mut wave_valid = s.clone_htod(&vec![0u32; experts])?;
@@ -2103,6 +2104,7 @@ fn diffusion_tiered_gpu() -> Result<()> {
                 disk_sources: disk,
                 staging_gu: &mut staging_gu,
                 staging_dn: &mut staging_dn,
+                staging_slots: planned_staging_slots,
                 wave_slots_gu: &mut wave_slots_gu,
                 wave_slots_dn: &mut wave_slots_dn,
                 wave_valid: &mut wave_valid,

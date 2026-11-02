@@ -208,6 +208,9 @@ pub(crate) struct GemmaState {
     entropy_bound: f32,
     confidence: f32,
     pad: u32,
+    /// When false the emitted canvas pads after the first EOS; when true
+    /// (generation requested ignore_eos) post-EOS tokens are kept.
+    ignore_eos: bool,
     #[cfg(test)]
     pub(crate) tap_capture: Option<Vec<CudaSlice<bf16>>>,
     #[cfg(test)]
@@ -735,6 +738,9 @@ impl Engine {
             runtime.limit = Some(count);
             runtime.produced = 0;
             runtime.terminal = false;
+            if let Program::Gemma(state) = &mut runtime.program {
+                state.ignore_eos = ignore_eos;
+            }
             #[cfg(test)]
             if let Program::Clover(state) = &mut runtime.program
                 && let Some(capture) = &mut state.capture
@@ -1225,6 +1231,7 @@ impl Engine {
             entropy_bound: diffusion_cfg.entropy_bound,
             confidence: diffusion_cfg.confidence,
             pad: diffusion_cfg.pad,
+            ignore_eos: false,
             #[cfg(test)]
             tap_capture: None,
             #[cfg(test)]
@@ -1596,6 +1603,8 @@ pub(crate) struct TieredCall<'a> {
     pub disk_sources: &'a [(*const u8, usize, *const u8, usize)],
     pub staging_gu: &'a mut CudaSlice<bf16>,
     pub staging_dn: &'a mut CudaSlice<bf16>,
+    /// Planned staging slot count; waves are sized by it, not by a constant.
+    pub staging_slots: usize,
     pub wave_slots_gu: &'a mut CudaSlice<u64>,
     pub wave_slots_dn: &'a mut CudaSlice<u64>,
     pub wave_valid: &'a mut CudaSlice<u32>,
@@ -1628,6 +1637,7 @@ pub(crate) fn contribute_tiered(call: TieredCall<'_>) -> Result<()> {
         disk_sources,
         staging_gu,
         staging_dn,
+        staging_slots,
         wave_slots_gu,
         wave_slots_dn,
         wave_valid,
@@ -1792,7 +1802,7 @@ pub(crate) fn contribute_tiered(call: TieredCall<'_>) -> Result<()> {
         }
         run_cohort(&gu_table, &dn_table, &valid_table, &active_table)?;
     }
-    for wave in staged.chunks(STAGING_SLOTS) {
+    for wave in staged.chunks(staging_slots.max(1)) {
         gu_table.iter_mut().for_each(|value| *value = 0);
         dn_table.iter_mut().for_each(|value| *value = 0);
         valid_table.iter_mut().for_each(|value| *value = 0);
@@ -2454,6 +2464,7 @@ impl Engine {
                 ptr: r.cohort_scratch.device_ptr(s).0,
                 bytes: r.cohort_scratch.len() as u64,
             };
+            let staging_slots = r.staging_gu.len() / (2 * expert_inter * hidden);
             contribute_tiered(TieredCall {
                 ops: &r.moe,
                 stream: s,
@@ -2464,6 +2475,7 @@ impl Engine {
                 disk_sources: &r.expert_disk,
                 staging_gu: &mut r.staging_gu,
                 staging_dn: &mut r.staging_dn,
+                staging_slots,
                 wave_slots_gu: &mut r.wave_slots_gu,
                 wave_slots_dn: &mut r.wave_slots_dn,
                 wave_valid: &mut r.wave_valid,
@@ -3002,7 +3014,9 @@ impl Engine {
                 .gemma()?;
             let committed = self.device.stream.clone_dtoh(&r.argmax_cur)?;
             let mut padded: Vec<u32> = committed.iter().map(|&v| v as u32).collect();
-            if let Some(position) = padded.iter().position(|v| self.model_spec.eos.contains(v)) {
+            if !r.ignore_eos
+                && let Some(position) = padded.iter().position(|v| self.model_spec.eos.contains(v))
+            {
                 padded[position + 1..].fill(r.pad);
             }
             padded
