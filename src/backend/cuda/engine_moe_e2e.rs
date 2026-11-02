@@ -39,6 +39,7 @@ fn minicpm_placement_invariance_gpu() -> Result<()> {
     let settings = Settings {
         runtime_dir: Some(runtime),
         prefix_cache: false,
+        device_budget_gib: None,
         draft_model: None,
         tree_builder: TreeBuilder::Waves,
         spec_budget: SpecBudget::Chain,
@@ -970,6 +971,7 @@ fn minicpm_native_prefill_profile_gpu() -> Result<()> {
     let settings = Settings {
         runtime_dir: Some(runtime),
         prefix_cache: false,
+        device_budget_gib: None,
         draft_model: None,
         tree_builder: TreeBuilder::Waves,
         spec_budget: SpecBudget::Chain,
@@ -1051,6 +1053,7 @@ fn minicpm_bf16_timing_arm_gpu() -> Result<()> {
     let settings = Settings {
         runtime_dir: Some(runtime),
         prefix_cache: false,
+        device_budget_gib: None,
         draft_model: None,
         tree_builder: TreeBuilder::Waves,
         spec_budget: SpecBudget::Chain,
@@ -1280,6 +1283,7 @@ fn minicpm_chain_decode_gpu() -> Result<()> {
         draft_model: None,
         runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
         prefix_cache: false,
+        device_budget_gib: None,
         kv_format: crate::kv::KvFormat::Bf16,
     };
     Engine::calibrate(&target, 0, capacity, None, settings.clone())?;
@@ -1551,6 +1555,7 @@ fn flint_ttft_timing_gpu() -> Result<()> {
     let settings = Settings {
         runtime_dir: Some(runtime),
         prefix_cache: false,
+        device_budget_gib: None,
         draft_model: None,
         tree_builder: TreeBuilder::Serial,
         spec_budget: SpecBudget::Chain,
@@ -1605,6 +1610,7 @@ fn minicpm_gdn_workspace_timing_gpu() -> Result<()> {
     let settings = Settings {
         runtime_dir: Some(runtime),
         prefix_cache: false,
+        device_budget_gib: None,
         draft_model: None,
         tree_builder: TreeBuilder::Waves,
         spec_budget: SpecBudget::Chain,
@@ -1748,6 +1754,7 @@ fn chain_decode_timing(cases: &[&str], runs: usize, margins: bool) -> Result<()>
         draft_model: std::env::var_os("FF_ARGMAX_DRAFT").map(PathBuf::from),
         runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
         prefix_cache: false,
+        device_budget_gib: None,
         kv_format: crate::kv::KvFormat::Bf16,
     };
     let mut inputs = Vec::new();
@@ -2483,6 +2490,7 @@ fn minicpm_native_checkpoint_e2e_gpu() -> Result<()> {
     let settings = Settings {
         runtime_dir: Some(runtime),
         prefix_cache: false,
+        device_budget_gib: None,
         draft_model: None,
         tree_builder: TreeBuilder::Waves,
         spec_budget: SpecBudget::Chain,
@@ -2692,6 +2700,7 @@ fn minicpm_two_gpu_split_combine_invariance_gpu() -> Result<()> {
     let settings = Settings {
         runtime_dir: Some(runtime),
         prefix_cache: false,
+        device_budget_gib: None,
         draft_model: None,
         tree_builder: TreeBuilder::Waves,
         spec_budget: SpecBudget::Chain,
@@ -3371,6 +3380,7 @@ fn minicpm_decode_key_split_gpu() -> Result<()> {
     let settings = Settings {
         runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
         prefix_cache: false,
+        device_budget_gib: None,
         draft_model: None,
         tree_builder: TreeBuilder::Waves,
         spec_budget: SpecBudget::Chain,
@@ -3544,6 +3554,7 @@ fn minicpm_prefill_combine_bit_identity_gpu() -> Result<()> {
     let settings = Settings {
         runtime_dir: Some(runtime),
         prefix_cache: false,
+        device_budget_gib: None,
         draft_model,
         tree_builder: TreeBuilder::Waves,
         spec_budget: SpecBudget::Chain,
@@ -3600,6 +3611,7 @@ fn minicpm_decode_reset_sequence_identity_gpu() -> Result<()> {
     let settings = Settings {
         runtime_dir: Some(runtime),
         prefix_cache: false,
+        device_budget_gib: None,
         draft_model: None,
         tree_builder: TreeBuilder::Waves,
         spec_budget: SpecBudget::Chain,
@@ -3710,6 +3722,7 @@ fn minicpm_decode_combine_identity_gpu() -> Result<()> {
     let settings = Settings {
         runtime_dir: Some(runtime),
         prefix_cache: false,
+        device_budget_gib: None,
         draft_model: None,
         tree_builder: TreeBuilder::Waves,
         spec_budget: SpecBudget::Chain,
@@ -3866,6 +3879,7 @@ fn flint_decode_combine_identity_gpu() -> Result<()> {
     let settings = Settings {
         runtime_dir: Some(runtime),
         prefix_cache: false,
+        device_budget_gib: None,
         draft_model: None,
         tree_builder: TreeBuilder::Serial,
         spec_budget: SpecBudget::Chain,

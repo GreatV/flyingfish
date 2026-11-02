@@ -97,6 +97,243 @@ pub struct ExpertStorage {
     registered: bool,
 }
 
+pub(crate) struct CohortStorage {
+    storage: ExpertStorage,
+    policy: crate::experts::runtime::Residency,
+    catalogue: crate::experts::catalogue::ExpertCatalogue,
+    disk: crate::experts::disk::DiskReader,
+    backing: Option<crate::experts::arena::BlockLease>,
+    claims: Vec<crate::experts::arena::WriteClaim>,
+    ready: crate::backend::gpu::CudaEvent,
+    readers: crate::backend::gpu::CudaEvent,
+    upload: Arc<CudaStream>,
+    host_blocks: u32,
+    staging: u32,
+}
+
+impl CohortStorage {
+    pub(crate) fn load(
+        device: &Device,
+        directory: &Path,
+        catalogue: crate::experts::catalogue::ExpertCatalogue,
+        capacity: &Capacity,
+        admission: crate::experts::plan::Admission,
+    ) -> Result<Self> {
+        use crate::experts::{
+            disk::DiskReader,
+            runtime::{LoadInputs, Residency},
+        };
+        let geometry = catalogue.geometry();
+        let initial: Vec<Vec<u32>> = capacity
+            .slots_per_layer
+            .iter()
+            .map(|&count| (0..count).collect())
+            .collect();
+        let mut storage =
+            ExpertStorage::new(&device.stream, &device.upload, None, geometry, capacity)?;
+        if storage.host().is_some() {
+            storage.register_host()?;
+        }
+        let disk = DiskReader::open(&catalogue, directory, 2)?;
+        let (policy, loaded) = Residency::load(LoadInputs {
+            geometry,
+            capacity: capacity.clone(),
+            admission,
+            max_rows: capacity.wave_rows,
+            initial: &initial,
+            host: storage.host(),
+            catalogue: &catalogue,
+            reader: &disk,
+        })?;
+        let mut staging =
+            super::copy::pinned_zeros::<bf16>(&device.ctx, catalogue.slot_bytes() as usize / 2)?;
+        for (layer, experts) in initial.iter().enumerate() {
+            for &expert in experts {
+                let slot =
+                    disk.read_expert(layer as u32, expert, &catalogue, catalogue.slot_bytes())?;
+                staging.as_mut_slice()?.copy_from_slice(&disk.values(slot)?);
+                // The pinned slot and destination remain live until upload synchronization.
+                unsafe {
+                    super::copy::htod_async(
+                        storage.slot(layer as u32, expert)?.0,
+                        staging.as_slice()?,
+                        &device.upload,
+                    )?;
+                }
+                device.upload.synchronize()?;
+            }
+        }
+        let backing = storage
+            .host()
+            .map(|arena| arena.lease(&(0..capacity.host_blocks).collect::<Vec<_>>()))
+            .transpose()?;
+        let ready = device.ctx.new_event(None)?;
+        ready.record(&device.upload)?;
+        device.stream.wait(&ready)?;
+        println!(
+            "COHORT_STORAGE gpu_slots={} host_blocks={} staging_slots={} slot_bytes={} host_bytes={} disk_bytes={}",
+            capacity.slots_total(),
+            capacity.host_blocks,
+            capacity.prefill_staging_slots,
+            catalogue.slot_bytes(),
+            loaded.host_bytes,
+            capacity.disk_bytes
+        );
+        Ok(Self {
+            storage,
+            policy,
+            catalogue,
+            disk,
+            backing,
+            claims: Vec::with_capacity(capacity.prefill_staging_slots as usize),
+            ready,
+            readers: device.ctx.new_event(None)?,
+            upload: device.upload.clone(),
+            host_blocks: capacity.host_blocks,
+            staging: capacity.prefill_staging_slots,
+        })
+    }
+
+    pub(crate) fn tier(&self, layer: u32, expert: u32) -> Result<crate::experts::plan::Tier> {
+        self.policy.ledger().tier(layer, expert)
+    }
+
+    pub(crate) fn resident(&self, layer: u32, expert: u32) -> Result<(u64, u64)> {
+        ensure!(
+            self.tier(layer, expert)? == crate::experts::plan::Tier::Gpu,
+            "cohort expert is not resident"
+        );
+        self.storage.slot(layer, expert)
+    }
+
+    pub(crate) fn wave_capacity(&self) -> u32 {
+        self.staging
+    }
+
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn verify_tiers(&mut self, stream: &Arc<CudaStream>) -> Result<()> {
+        use crate::experts::plan::Tier;
+        let geometry = self.catalogue.geometry();
+        let mut observed = vec![bf16::ZERO; self.catalogue.slot_bytes() as usize / 2];
+        let mut controls = 0;
+        for tier in [Tier::Gpu, Tier::Host, Tier::Disk] {
+            let mut selected = None;
+            for layer in 0..geometry.layers {
+                for expert in 0..geometry.experts {
+                    if self.tier(layer, expert)? == tier {
+                        selected = Some((layer, expert));
+                        break;
+                    }
+                }
+                if selected.is_some() {
+                    break;
+                }
+            }
+            let (layer, expert) = selected.context("Runner FAIL forced tier unavailable")?;
+            let address = if tier == Tier::Gpu {
+                self.resident(layer, expert)?.0
+            } else {
+                self.stage(stream, layer, &[expert])?;
+                self.staged(0)?.0
+            };
+            // The allocation and output span remain live through synchronization.
+            unsafe { super::copy::dtoh_async(&mut observed, address, stream)? };
+            stream.synchronize()?;
+            let slot = self.disk.read_expert(
+                layer,
+                expert,
+                &self.catalogue,
+                self.catalogue.slot_bytes(),
+            )?;
+            let expected = self.disk.values(slot)?;
+            let exact = observed.as_slice() == expected.values();
+            let slot = self.disk.read_expert(
+                layer,
+                (expert + 1) % geometry.experts,
+                &self.catalogue,
+                self.catalogue.slot_bytes(),
+            )?;
+            let wrong = self.disk.values(slot)?;
+            let detected = observed.as_slice() != wrong.values();
+            controls += usize::from(detected);
+            println!(
+                "CLOVER_TIER {} tier={tier:?} layer={layer} expert={expert} exact={exact} wrong_expert_control={detected} bytes={}",
+                if exact && detected { "PASS" } else { "DEFECT" },
+                self.catalogue.slot_bytes()
+            );
+            ensure!(exact && detected, "Clover tier copy/index defect");
+        }
+        ensure!(controls == 3, "Clover tier controls incomplete");
+        Ok(())
+    }
+
+    pub(crate) fn staged(&self, slot: u32) -> Result<(u64, u64)> {
+        self.storage.staging(slot)
+    }
+
+    pub(crate) fn stage(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        layer: u32,
+        experts: &[u32],
+    ) -> Result<[u64; 2]> {
+        use crate::experts::plan::Tier;
+        ensure!(
+            !experts.is_empty() && experts.len() <= self.staging as usize,
+            "cohort wave outside staging capacity"
+        );
+        self.ready.synchronize()?;
+        self.claims.clear();
+        self.readers.record(stream)?;
+        self.upload.wait(&self.readers)?;
+        let mut bytes = [0u64; 2];
+        for (slot, &expert) in experts.iter().enumerate() {
+            let destination = self.storage.staging(slot as u32)?.0;
+            match self.tier(layer, expert)? {
+                Tier::Gpu => anyhow::bail!("resident expert requested as a staging miss"),
+                Tier::Host => {
+                    let block = self.policy.host_block(layer, expert)?;
+                    let values = self
+                        .backing
+                        .as_ref()
+                        .context("cohort host backing missing")?
+                        .read(block)?;
+                    // The immutable host lease spans every upload and GPU reader.
+                    unsafe {
+                        super::copy::htod_async(destination, values, &self.upload)?;
+                    }
+                    bytes[0] += self.catalogue.slot_bytes();
+                }
+                Tier::Disk => {
+                    let arena = self
+                        .storage
+                        .host()
+                        .context("cohort disk staging has no host arena")?;
+                    let mut claim = arena.claim(self.host_blocks + slot as u32)?;
+                    let disk_slot = self.disk.read_expert(
+                        layer,
+                        expert,
+                        &self.catalogue,
+                        self.catalogue.slot_bytes(),
+                    )?;
+                    claim
+                        .slice()?
+                        .copy_from_slice(&self.disk.values(disk_slot)?);
+                    // The writer claim remains owned until ready synchronizes the upload.
+                    unsafe {
+                        super::copy::htod_async(destination, claim.slice()?, &self.upload)?;
+                    }
+                    self.claims.push(claim);
+                    bytes[1] += self.catalogue.slot_bytes();
+                }
+            }
+        }
+        self.ready.record(&self.upload)?;
+        stream.wait(&self.ready)?;
+        Ok(bytes)
+    }
+}
+
 impl ExpertStorage {
     pub fn new(
         stream: &Arc<CudaStream>,
@@ -443,6 +680,7 @@ impl Loader<'_> {
         );
         Ok(())
     }
+
     pub(crate) fn load(&mut self, specs: &[(String, Vec<usize>)]) -> Result<CudaSlice<bf16>> {
         let count = specs.iter().try_fold(0usize, |total, (_, shape)| {
             let n = shape.iter().try_fold(1usize, |n, &d| {
@@ -1550,6 +1788,40 @@ impl WeightCatalog {
             Some(StoredTensor::Bf16(v)) => Ok(v),
             _ => anyhow::bail!("missing/non-BF16 tensor {name}"),
         }
+    }
+
+    pub(crate) fn matrix(
+        &self,
+        stream: &Arc<CudaStream>,
+        name: &str,
+    ) -> Result<super::contracts::Tensor<bf16, 2>> {
+        let entry = self
+            .manifest
+            .entries
+            .get(name)
+            .context("matrix manifest entry missing")?;
+        ensure!(
+            entry.shape.len() >= 2,
+            "matrix manifest rank differs: {name}"
+        );
+        let rows = u32::try_from(entry.shape[0])?;
+        let width = u32::try_from(entry.shape[1..].iter().product::<usize>())?;
+        super::contracts::view(
+            self.bf16(name)?,
+            stream,
+            0,
+            [rows, width],
+            [u64::from(width), 1],
+        )
+    }
+
+    pub(crate) fn vector(
+        &self,
+        stream: &Arc<CudaStream>,
+        name: &str,
+    ) -> Result<super::contracts::Tensor<bf16, 1>> {
+        let values = self.bf16(name)?;
+        super::contracts::view(values, stream, 0, [u32::try_from(values.len())?], [1])
     }
 }
 

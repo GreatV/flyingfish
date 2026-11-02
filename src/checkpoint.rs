@@ -224,6 +224,7 @@ impl MappedCheckpoint {
             let planned = Self::planned_bytes(&expected, policy)?;
             return self.assemble_manifest("Gemma4", expected, policy, planned, None);
         }
+
         if spec.architecture == Architecture::Glm5Next {
             let mut expected = BTreeMap::new();
             Self::glm5_next_entries(spec, &mut expected)?;
@@ -274,6 +275,7 @@ impl MappedCheckpoint {
             Architecture::Qwen35Text => "Q38",
             Architecture::MiniCpmV47 => "MiniCPM",
             Architecture::Flint => "Flint",
+            Architecture::Clover => "Clover",
             Architecture::Llama
             | Architecture::Glm5Next
             | Architecture::LoopVl
@@ -282,7 +284,7 @@ impl MappedCheckpoint {
                 bail!("checkpoint manifest requires a Qwen3.5-family spec")
             }
             Architecture::DeepseekV41 => {
-                unreachable!("DeepSeek-V4.1 has a dedicated manifest path")
+                unreachable!("architecture has a dedicated manifest path")
             }
         };
         let mut expected = BTreeMap::new();
@@ -318,7 +320,7 @@ impl MappedCheckpoint {
                 }
             }
             Architecture::MiniCpmV47 => Self::minicpm_vision_entries(spec, &mut expected)?,
-            Architecture::Flint => {}
+            Architecture::Flint | Architecture::Clover => {}
             Architecture::Llama
             | Architecture::Glm5Next
             | Architecture::LoopVl
@@ -814,7 +816,7 @@ impl MappedCheckpoint {
         let fp8 = spec.linear_format.fp8_layout();
         let dense_fp8 = fp8.filter(|layout| layout.block_scale().is_some());
         let global_prefix = match spec.architecture {
-            Architecture::Flint => "model",
+            Architecture::Flint | Architecture::Clover => "model",
             Architecture::Qwen35Text | Architecture::MiniCpmV47 | Architecture::Llama => {
                 "model.language_model"
             }
@@ -983,6 +985,7 @@ impl MappedCheckpoint {
                     let q_out = match spec.architecture {
                         Architecture::Flint => q_width,
                         Architecture::Qwen35Text
+                        | Architecture::Clover
                         | Architecture::MiniCpmV47
                         | Architecture::Llama => 2 * q_width,
                         Architecture::Glm5Next
@@ -1085,6 +1088,28 @@ impl MappedCheckpoint {
                         vec![conv_dim, 1, g.conv_kernel as usize],
                         TensorScope::Text,
                     );
+                    if spec.architecture == Architecture::Clover {
+                        put(
+                            expected,
+                            format!("{p}.linear_attn.conv_right_weight"),
+                            Dtype::BF16,
+                            vec![conv_dim, 1, g.conv_kernel as usize - 1],
+                            TensorScope::Text,
+                        );
+                        for name in [
+                            "bd_softmax_logit_scale",
+                            "bd_softmax_history_bias",
+                            "bd_softmax_history_c",
+                        ] {
+                            put(
+                                expected,
+                                format!("{p}.linear_attn.{name}"),
+                                Dtype::BF16,
+                                vec![value_heads],
+                                TensorScope::Text,
+                            );
+                        }
+                    }
                     put(
                         expected,
                         format!("{p}.linear_attn.norm.weight"),
@@ -2943,6 +2968,178 @@ mod component_tests {
         )?;
         assert!(has_mtp_component(&root).is_err());
         std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn clover_manifest_counts_all_side_weights() -> Result<()> {
+        ensure!(
+            serde_json::from_value::<crate::model_spec::Architecture>(serde_json::json!(
+                "DiffusionGemma"
+            ))
+            .is_err(),
+            "unvalidated architecture accepted in model geometry"
+        );
+        let root = serde_json::from_str(include_str!("../tests/fixtures/clover_config.json"))?;
+        let spec = crate::model_spec::ModelSpec::clover(
+            &root,
+            &serde_json::json!({"eos_token_id": [248046, 248044]}),
+        )?;
+        let mut expected = BTreeMap::new();
+        MappedCheckpoint::text_entries(&spec, &mut expected)?;
+        ensure!(expected.len() == 813, "Clover tensor count");
+        ensure!(
+            MappedCheckpoint::planned_bytes(&expected, LoadPolicy::TextOnly)? == 69_322_701_696,
+            "Clover published BF16 payload"
+        );
+        for (suffix, shape, count) in [
+            ("conv_right_weight", vec![8192, 1, 3], 30),
+            ("bd_softmax_logit_scale", vec![32], 30),
+            ("bd_softmax_history_bias", vec![32], 30),
+            ("bd_softmax_history_c", vec![32], 30),
+        ] {
+            let entries: Vec<_> = expected
+                .iter()
+                .filter(|(name, _)| name.ends_with(suffix))
+                .collect();
+            ensure!(entries.len() == count, "Clover side tensor count: {suffix}");
+            ensure!(
+                entries
+                    .iter()
+                    .all(|(_, entry)| entry.0 == Dtype::BF16 && entry.1 == shape),
+                "Clover side tensor layout: {suffix}"
+            );
+        }
+        ensure!(
+            spec.rotary_dim == 64 && spec.head_dim == 256 && spec.q_width == 4096,
+            "Clover attention geometry"
+        );
+        let work = crate::work_layout::RowWorkSpec::new(&spec)?;
+        ensure!(
+            work.row_bytes()? == 6 * spec.hidden as usize + 4,
+            "Clover common workspace contains only base rows"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "CPU-only real checkpoint; set FF_MODEL to the pinned Clover directory"]
+    fn clover_manifest_matches_checkpoint_and_rejects_side_weight_mutants() -> Result<()> {
+        let dir =
+            std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+        let spec = crate::model_spec::ModelSpec::read(&dir)?;
+        ensure!(
+            spec.architecture == crate::model_spec::Architecture::Clover,
+            "expected Clover"
+        );
+        let checkpoint = MappedCheckpoint::open(&dir)?;
+        let manifest = checkpoint.manifest(&spec, LoadPolicy::TextOnly)?;
+        ensure!(
+            manifest.entries.len() == 813 && manifest.resident_bytes == 69_322_701_696,
+            "Clover manifest extent"
+        );
+        let catalogue = crate::experts::catalogue::ExpertCatalogue::from_manifest(
+            &manifest,
+            crate::experts::catalogue::ExpertGeometry::from_model(&spec)?,
+            spec.expert_format.context("Clover expert format missing")?,
+        )?;
+        ensure!(
+            catalogue.slot_bytes() == 6_291_456
+                && catalogue.geometry().layers == 40
+                && catalogue.geometry().experts == 256,
+            "Clover native expert catalogue extent"
+        );
+        for (device_gib, host_gib, compute_units) in [(22u64, 40u64, 128), (10, 8, 48), (3, 3, 16)]
+        {
+            let resources = crate::experts::plan::BlockResources {
+                device_free_bytes: device_gib << 30,
+                host_available_bytes: host_gib << 30,
+                device_work_bytes: 512 << 20,
+                host_work_bytes: 128 << 20,
+                compute_units,
+                copy_engines: 2,
+                rows: 32,
+                staging_slots_max: spec.moe.as_ref().context("block MoE missing")?.experts,
+            };
+            let plan = crate::experts::plan::BlockResidency::new(&spec, &manifest, resources)?;
+            let slot = plan.experts.slot_bytes();
+            let gpu = plan.device_fixed_bytes
+                + plan.dense.resident_bytes as u64
+                + 2 * plan.dense.slot_bytes as u64
+                + u64::from(plan.experts.slots_total() + plan.experts.prefill_staging_slots) * slot;
+            let host = plan.host_fixed_bytes
+                + plan.dense.host_bytes as u64
+                + u64::from(plan.experts.host_blocks + plan.experts.spare_blocks) * slot;
+            ensure!(
+                gpu <= resources.device_free_bytes && host <= resources.host_available_bytes,
+                "Clover model tier capacity exceeded"
+            );
+            let unique = plan.global_dense_bytes
+                + plan.dense.resident_bytes as u64
+                + plan.dense.host_bytes as u64
+                + plan.dense.disk_bytes as u64
+                + u64::from(plan.experts.slots_total() + plan.experts.host_blocks) * slot
+                + plan.experts.disk_bytes;
+            ensure!(
+                unique == manifest.resident_bytes as u64,
+                "Clover model tier conservation"
+            );
+            ensure!(
+                plan.experts.span_rows == 32 && plan.experts.disk_bytes > 0,
+                "Clover bounded tiers changed block extent or lost disk tier"
+            );
+            ensure!(
+                (device_gib == 3) == (plan.dense.slot_bytes > 0),
+                "Clover dense slot derivation"
+            );
+            let mut invalid = resources;
+            invalid.device_free_bytes = plan.global_dense_bytes + resources.device_work_bytes;
+            ensure!(
+                crate::experts::plan::BlockResidency::new(&spec, &manifest, invalid).is_err(),
+                "Clover capacity control accepted zero expert space"
+            );
+            println!(
+                "PASS clover_model_capacity_fixture device_gib={device_gib} host_gib={host_gib} gpu_bytes={gpu} host_bytes={host} dense_slot_bytes={} unique_bytes={unique}",
+                plan.dense.slot_bytes
+            );
+        }
+        for mutation in 0..3 {
+            let mut expected = BTreeMap::new();
+            MappedCheckpoint::text_entries(&spec, &mut expected)?;
+            let name = "model.layers.0.linear_attn.conv_right_weight";
+            match mutation {
+                0 => {
+                    expected
+                        .remove(name)
+                        .context("side weight missing from plan")?;
+                }
+                1 => {
+                    expected
+                        .get_mut(name)
+                        .context("side weight missing from plan")?
+                        .1[2] += 1
+                }
+                _ => {
+                    put(
+                        &mut expected,
+                        "model.extra.weight".into(),
+                        Dtype::BF16,
+                        vec![1],
+                        TensorScope::Text,
+                    );
+                }
+            }
+            let planned = MappedCheckpoint::planned_bytes(&expected, LoadPolicy::TextOnly)?;
+            ensure!(
+                checkpoint
+                    .assemble_manifest("Clover", expected, LoadPolicy::TextOnly, planned, None)
+                    .is_err(),
+                "Clover accepted side-weight mutant {mutation}"
+            );
+        }
+        println!(
+            "PASS clover_manifest tensors=813 bytes=69322701696 side_tensors=120 catalogue_slots=10240 controls=3"
+        );
         Ok(())
     }
 

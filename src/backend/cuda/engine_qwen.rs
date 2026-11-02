@@ -201,6 +201,7 @@ fn capture_flint_window(
 fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
     use crate::model_spec::{Architecture, LinearFormat};
     let (hidden, intermediate, vocab, hq, hkv, layers, hv, format) = match spec.architecture {
+        Architecture::Clover => anyhow::bail!("Clover canvas execution is not bound"),
         Architecture::Qwen35Text => (
             5120,
             17408,
@@ -3704,6 +3705,7 @@ impl Engine {
             deepseek_ffn: None,
             deepseek_engram: None,
             recurrent: None,
+            diffusion: None,
             hc: glm_hc,
             glm_dsa,
             moe: None,
@@ -7282,6 +7284,7 @@ mod tests {
                 spec_graph: false,
                 draft_model: None,
                 prefix_cache: false,
+                device_budget_gib: None,
                 kv_format: crate::kv::KvFormat::Bf16,
                 runtime_dir: None,
             },
@@ -8027,6 +8030,7 @@ mod tests {
         let settings = Settings {
             runtime_dir: Some(runtime),
             prefix_cache: false,
+            device_budget_gib: None,
             draft_model: None,
             tree_builder: crate::backend::TreeBuilder::Serial,
             spec_budget: crate::backend::SpecBudget::Chain,
@@ -8206,6 +8210,7 @@ mod tests {
         let settings = Settings {
             runtime_dir: Some(runtime),
             prefix_cache: false,
+            device_budget_gib: None,
             draft_model: None,
             tree_builder: crate::backend::TreeBuilder::Serial,
             spec_budget: crate::backend::SpecBudget::Chain,
@@ -8281,6 +8286,7 @@ mod tests {
         let settings = Settings {
             runtime_dir: Some(runtime),
             prefix_cache: false,
+            device_budget_gib: None,
             draft_model: None,
             tree_builder: crate::backend::TreeBuilder::Serial,
             spec_budget: crate::backend::SpecBudget::Chain,

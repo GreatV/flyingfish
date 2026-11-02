@@ -2316,7 +2316,7 @@ fn validate_dispatch(
             assignment.row
         );
         ensure!(
-            assignment.weight == weights[choice],
+            assignment.weight == weights[choice].to_f32(),
             "MoE CPU choice={choice} routing weight mismatch"
         );
         ensure!(
@@ -2336,7 +2336,7 @@ fn validate_dispatch(
         );
         ensure!(
             dispatch.miss_rows[route.row as usize] as usize == choice / top_k
-                && route.weight == weights[choice]
+                && route.weight == weights[choice].to_f32()
                 && coverage[choice] == 0,
             "disk route choice={choice} compact row/weight/coverage differs"
         );

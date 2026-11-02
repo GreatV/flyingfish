@@ -82,6 +82,7 @@ fn generate_input(
     on_token: &mut dyn FnMut(u32) -> bool,
 ) -> Result<GenerationOutput> {
     ensure!(count > 0, "max-new-tokens must be positive");
+    model.backend.generation_request(count, ignore_eos, graph)?;
     let start = Instant::now();
     let first = match input {
         GenerationInput::Text(ids) => model.prefill(ids, trace.as_deref_mut())?,
@@ -128,6 +129,11 @@ pub struct Model {
 }
 
 impl Model {
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn validate_canvas_reference(&mut self, reference: &Path) -> Result<usize> {
+        self.backend.validate_canvas_reference(reference)
+    }
+
     /// Generate one Q38 text request using its checkpoint's MTP component.
     pub fn generate_mtp(
         dir: &Path,
@@ -491,6 +497,9 @@ pub fn layer_program(
         ]));
     }
     match spec.architecture {
+        crate::model_spec::Architecture::Clover => {
+            anyhow::bail!("Clover canvas execution is not bound")
+        }
         crate::model_spec::Architecture::DeepseekV41
         | crate::model_spec::Architecture::Glm5Next => Ok(LayerProgram::Hc([
             LayerStage::Hc(HcStage::Pre),
@@ -503,6 +512,7 @@ pub fn layer_program(
             LayerStage::Hc(HcStage::Post),
             LayerStage::Common(O::NextNorm),
         ])),
+
         crate::model_spec::Architecture::Llama
         | crate::model_spec::Architecture::Qwen35Text
         | crate::model_spec::Architecture::MiniCpmV47

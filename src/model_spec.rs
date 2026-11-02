@@ -15,6 +15,7 @@ pub enum Architecture {
     DeepseekV41,
     Gemma4,
     EmbeddingGemma2,
+    Clover,
 }
 impl Architecture {
     /// Architectures with a bound MTP decode path.
@@ -247,6 +248,185 @@ pub enum FfnKind {
     Dense,
     Moe,
 }
+#[derive(Clone, Debug)]
+pub struct BlockGeneration {
+    pub rows: u32,
+    pub vocab: u32,
+    pub mask: u32,
+    pub pad: u32,
+    pub eos: Vec<u32>,
+    pub presence: f32,
+    pub frequency: f32,
+    pub repetition: f64,
+    pub length_bias: f32,
+    pub length_start: u32,
+    pub length_window: u32,
+    pub close_bias: f32,
+    pub close_start: u32,
+    pub close_window: u32,
+    pub close_token: u32,
+    pub threshold: f32,
+    pub max_new_tokens: u32,
+    pub capacity: u32,
+}
+
+impl BlockGeneration {
+    pub fn read(directory: &Path) -> Result<Self> {
+        let root = serde_json::from_slice(&fs::read(directory.join("config.json"))?)?;
+        let generation =
+            serde_json::from_slice(&fs::read(directory.join("generation_config.json"))?)?;
+        Self::clover(&root, &generation)
+    }
+
+    pub fn clover(root: &Value, generation: &Value) -> Result<Self> {
+        let spec = ModelSpec::clover(root, generation)?;
+        for (key, value) in [
+            ("do_sample", false.into()),
+            ("use_cache", true.into()),
+            ("temperature", 1.0.into()),
+            ("top_k", Value::Null),
+            ("top_p", 1.0.into()),
+        ] {
+            equal(generation, key, value)?;
+        }
+        let number = |value: &Value, key: &str| -> Result<f32> {
+            let number = value
+                .get(key)
+                .and_then(Value::as_f64)
+                .with_context(|| format!("missing/invalid {key}"))? as f32;
+            ensure!(number.is_finite(), "nonfinite {key}");
+            Ok(number)
+        };
+        let mut stop_ids = eos(
+            generation
+                .get("eos_token_id")
+                .context("missing generation EOS")?,
+            spec.vocab,
+        )?;
+        if generation.get("stop_token_ids").is_some() {
+            stop_ids.extend(u32_list(generation, "stop_token_ids")?);
+            stop_ids.sort_unstable();
+            stop_ids.dedup();
+        }
+        let policy = Self {
+            rows: positive(root, "block_size")?,
+            vocab: spec.vocab,
+            mask: integer(root, "mask_token_id")?,
+            pad: integer(generation, "pad_token_id")?,
+            eos: stop_ids,
+            presence: number(generation, "presence_penalty")?,
+            frequency: number(generation, "frequency_penalty")?,
+            repetition: generation
+                .get("repetition_penalty")
+                .and_then(Value::as_f64)
+                .context("missing/invalid repetition_penalty")?,
+            length_bias: number(generation, "dllm_length_penalty")?,
+            length_start: integer(generation, "dllm_length_penalty_start")?,
+            length_window: positive(generation, "dllm_length_penalty_window")?,
+            close_bias: number(generation, "dllm_think_end_bias")?,
+            close_start: integer(generation, "dllm_think_end_start")?,
+            close_window: positive(generation, "dllm_think_end_window")?,
+            close_token: integer(generation, "dllm_think_end_token_id")?,
+            threshold: number(&root["denoising_config"], "threshold")?,
+            max_new_tokens: positive(generation, "max_new_tokens")?,
+            capacity: spec.max_position,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.rows > 0
+                && self.rows <= 32
+                && self.vocab > 1
+                && self
+                    .rows
+                    .checked_mul(self.vocab)
+                    .is_some_and(|n| n <= i32::MAX as u32)
+                && self.vocab <= i32::MAX as u32
+                && self.capacity <= (1 << 24)
+                && self.max_new_tokens > 0
+                && self.max_new_tokens <= self.capacity,
+            "block generation geometry/capacity mismatch"
+        );
+        ensure!(
+            [self.mask, self.pad, self.close_token]
+                .iter()
+                .all(|&id| id < self.vocab)
+                && !self.eos.is_empty()
+                && self.eos.iter().all(|&id| id < self.vocab),
+            "block generation token outside vocabulary"
+        );
+        ensure!(
+            [self.presence, self.frequency]
+                .iter()
+                .all(|x| x.is_finite() && (-2.0..=2.0).contains(x))
+                && self.repetition.is_finite()
+                && self.repetition > 0.0
+                && self.repetition <= 2.0
+                && [self.length_bias, self.close_bias]
+                    .iter()
+                    .all(|x| x.is_finite() && *x >= 0.0)
+                && self.length_window > 0
+                && self.close_window > 0
+                && self.threshold.is_finite()
+                && (0.0..=1.0).contains(&self.threshold),
+            "block generation penalty/ramp range mismatch"
+        );
+        Ok(())
+    }
+}
+
+#[test]
+fn block_generation_requires_publisher_penalties_and_bounded_state() -> Result<()> {
+    let root = serde_json::from_str(include_str!("../tests/fixtures/clover_config.json"))?;
+    let generation: Value = serde_json::from_str(include_str!(
+        "../tests/fixtures/clover_generation_config.json"
+    ))?;
+    let policy = BlockGeneration::clover(&root, &generation)?;
+    ensure!(
+        policy.presence == 0.9
+            && policy.frequency == 0.0
+            && policy.repetition == 1.05
+            && policy.length_start == 8192
+            && policy.length_window == 8192
+            && policy.close_start == 4096
+            && policy.close_window == 4096
+            && policy.close_token == 248069
+            && policy.mask == 151669
+            && policy.eos == [248044, 248046]
+            && policy.threshold == 0.95,
+        "publisher generation definition differs"
+    );
+    for key in [
+        "presence_penalty",
+        "frequency_penalty",
+        "repetition_penalty",
+        "pad_token_id",
+        "eos_token_id",
+        "dllm_length_penalty_window",
+        "dllm_think_end_token_id",
+    ] {
+        let mut missing = generation.clone();
+        missing.as_object_mut().unwrap().remove(key);
+        ensure!(
+            BlockGeneration::clover(&root, &missing).is_err(),
+            "accepted missing {key}"
+        );
+    }
+    let mut invalid = policy;
+    invalid.rows = 33;
+    ensure!(
+        invalid.validate().is_err(),
+        "accepted block beyond warp extent"
+    );
+    invalid.rows = 32;
+    invalid.close_token = invalid.vocab;
+    ensure!(invalid.validate().is_err(), "accepted count-table overflow");
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelSpec {
     pub abi_version: u32,
@@ -577,7 +757,8 @@ impl VisionConfig {
             Architecture::Llama
             | Architecture::Flint
             | Architecture::Glm5Next
-            | Architecture::LoopVl => {
+            | Architecture::LoopVl
+            | Architecture::Clover => {
                 bail!("vision configuration requires a supported multimodal architecture")
             }
             Architecture::DeepseekV41 => {
@@ -1252,8 +1433,16 @@ impl TextGeometry {
             .get("rope_parameters")
             .context("missing rope_parameters")?;
         equal(rope, "rope_type", "default".into())?;
-        equal(rope, "mrope_interleaved", true.into())?;
-        equal(rope, "mrope_section", serde_json::json!([11, 11, 10]))?;
+        if model_type == "clover_moe" {
+            exact_keys(
+                rope,
+                &["rope_type", "rope_theta", "partial_rotary_factor"],
+                "Clover RoPE",
+            )?;
+        } else {
+            equal(rope, "mrope_interleaved", true.into())?;
+            equal(rope, "mrope_section", serde_json::json!([11, 11, 10]))?;
+        }
         let theta = positive(rope, "rope_theta")?;
         let top_partial = t.get("partial_rotary_factor");
         let rope_partial = rope.get("partial_rotary_factor");
@@ -1303,7 +1492,7 @@ impl TextGeometry {
                 state_index: counts[slot],
                 rope: full,
                 sliding_window: None,
-                ffn: if model_type == "qwen3_5_moe_text" {
+                ffn: if matches!(model_type, "qwen3_5_moe_text" | "clover_moe") {
                     FfnKind::Moe
                 } else {
                     FfnKind::Dense
@@ -1322,7 +1511,7 @@ impl TextGeometry {
             gdn.value_heads.is_multiple_of(gdn.key_heads),
             "linear_num_value_heads is not a multiple of linear_num_key_heads"
         );
-        let moe = if model_type == "qwen3_5_moe_text" {
+        let moe = if matches!(model_type, "qwen3_5_moe_text" | "clover_moe") {
             equal(t, "output_router_logits", false.into())?;
             ensure!(
                 t.get("intermediate_size").is_none(),
@@ -1386,7 +1575,7 @@ impl TextGeometry {
 impl ModelSpec {
     pub fn swiglu_rounding(&self) -> SwigluRounding {
         match self.architecture {
-            Architecture::Flint => SwigluRounding::Once,
+            Architecture::Flint | Architecture::Clover => SwigluRounding::Once,
             Architecture::Glm5Next | Architecture::DeepseekV41 => SwigluRounding::ClampedTwice,
             Architecture::Llama
             | Architecture::Qwen35Text
@@ -1413,13 +1602,14 @@ impl ModelSpec {
             | Architecture::Flint
             | Architecture::LoopVl
             | Architecture::Gemma4
-            | Architecture::EmbeddingGemma2 => 0.0,
+            | Architecture::EmbeddingGemma2
+            | Architecture::Clover => 0.0,
         }
     }
 
     pub fn routed_weight_boundary(&self) -> RoutedWeightBoundary {
         match self.architecture {
-            Architecture::Flint | Architecture::Glm5Next => {
+            Architecture::Flint | Architecture::Glm5Next | Architecture::Clover => {
                 RoutedWeightBoundary::BeforeContributionBf16
             }
             Architecture::DeepseekV41 => RoutedWeightBoundary::BeforeDownQuantization,
@@ -1445,6 +1635,7 @@ impl ModelSpec {
                 Architecture::DeepseekV41 => "deepseek_v41_text",
                 Architecture::Gemma4 => "gemma4_text",
                 Architecture::EmbeddingGemma2 => "embedding_gemma2_text",
+                Architecture::Clover => "clover_moe",
             }
             .into(),
             hidden_size: self.hidden as usize,
@@ -1480,6 +1671,10 @@ impl ModelSpec {
             let c = crate::config::Config::read(dir)?;
             return Self::from_llama(&c);
         }
+        ensure!(
+            root.get("model_type").and_then(Value::as_str) != Some("diffusion_gemma"),
+            "unsupported model architecture diffusion_gemma"
+        );
         let path = dir.join("generation_config.json");
         let generation = if path.exists() {
             serde_json::from_slice(&fs::read(path)?)?
@@ -1503,6 +1698,8 @@ impl ModelSpec {
             Some("gemma4" | "gemma4_unified")
         ) {
             Self::gemma4(&root, &generation)
+        } else if root.get("model_type").and_then(Value::as_str) == Some("clover_moe") {
+            Self::clover(&root, &generation)
         } else {
             Self::qwen(&root, &generation)
         }
@@ -1682,6 +1879,113 @@ impl ModelSpec {
             vision: None,
         })
     }
+    pub fn clover(root: &Value, generation: &Value) -> Result<Self> {
+        exact_keys(
+            root,
+            &[
+                "architectures",
+                "auto_map",
+                "attention_bias",
+                "attention_dropout",
+                "attn_output_gate",
+                "block_size",
+                "bos_token_id",
+                "dtype",
+                "eos_token_id",
+                "full_attention_interval",
+                "head_dim",
+                "hidden_act",
+                "hidden_size",
+                "initializer_range",
+                "layer_types",
+                "linear_conv_kernel_dim",
+                "linear_key_head_dim",
+                "linear_num_key_heads",
+                "linear_num_value_heads",
+                "linear_value_head_dim",
+                "mamba_ssm_dtype",
+                "mask_token_id",
+                "max_position_embeddings",
+                "model_type",
+                "moe_block_coreset_enabled",
+                "moe_block_coreset_top_p",
+                "moe_intermediate_size",
+                "num_attention_heads",
+                "num_experts",
+                "num_experts_per_tok",
+                "num_hidden_layers",
+                "num_key_value_heads",
+                "output_router_logits",
+                "pad_token_id",
+                "partial_rotary_factor",
+                "rms_norm_eps",
+                "rope_parameters",
+                "shared_expert_intermediate_size",
+                "tie_word_embeddings",
+                "use_cache",
+                "vocab_size",
+                "transformers_version",
+                "num_shared_experts",
+                "attention_backend",
+                "denoising_config",
+            ],
+            "Clover config",
+        )?;
+        equal(
+            root,
+            "architectures",
+            serde_json::json!(["CloverMoeModelLM"]),
+        )?;
+        equal(
+            root,
+            "auto_map",
+            serde_json::json!({
+                "AutoConfig": "configuration_clover_moe.CloverMoeConfig",
+                "AutoModel": "modeling_clover_moe.CloverMoeModel",
+                "AutoModelForCausalLM": "modeling_clover_moe.CloverMoeModelLM"
+            }),
+        )?;
+        for (key, value) in [
+            ("block_size", 32.into()),
+            ("mask_token_id", 151669.into()),
+            ("num_shared_experts", 1.into()),
+            ("moe_block_coreset_enabled", true.into()),
+            ("moe_block_coreset_top_p", 0.9.into()),
+            ("use_cache", true.into()),
+            ("dtype", "bfloat16".into()),
+            ("attention_backend", "sdpa".into()),
+            (
+                "denoising_config",
+                serde_json::json!({"algorithm":"low_confidence", "threshold":0.95}),
+            ),
+        ] {
+            equal(root, key, value)?;
+        }
+        let text = TextGeometry::read(root, "clover_moe")?;
+        ensure!(
+            [
+                text.gdn.key_heads,
+                text.gdn.value_heads,
+                text.gdn.key_head_dim,
+                text.gdn.value_head_dim,
+                text.gdn.conv_kernel
+            ] == [16, 32, 128, 128, 4]
+                && text.head_dim == 256
+                && text.rotary_dim == 64
+                && integer(root, "mask_token_id")? < text.vocab,
+            "unsupported Clover mixer geometry"
+        );
+        Self::from_text(
+            Architecture::Clover,
+            text,
+            root,
+            generation,
+            None,
+            LinearFormat::Bf16,
+            Some(ExpertFormat::Bf16),
+        )
+    }
+
     pub fn qwen(root: &Value, generation: &Value) -> Result<Self> {
         equal(root, "model_type", "qwen3_5".into())?;
         equal(
@@ -2448,6 +2752,7 @@ impl ModelSpec {
             audio: AudioConfig::from_root(root)?,
         })
     }
+
     pub fn glm5_next(root: &Value, generation: &Value) -> Result<Self> {
         equal(root, "model_type", "glm5_next".into())?;
         equal(

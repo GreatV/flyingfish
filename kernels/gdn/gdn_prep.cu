@@ -29,7 +29,8 @@ extern "C" __global__ void gdn_beta_widen(
         __bfloat162float(beta_bf16[(size_t)m * GDN_PREP_HEADS + h]);
 }
 
-extern "C" __global__ void gdn_prep_l2_fp32(
+template<bool ScaleQuery>
+__device__ void gdn_prep_l2(
         const __nv_bfloat16* __restrict__ q_bf16,
         const __nv_bfloat16* __restrict__ k_bf16,
         const __nv_bfloat16* __restrict__ v_bf16,
@@ -37,7 +38,7 @@ extern "C" __global__ void gdn_prep_l2_fp32(
         float* __restrict__ k_fp32,
         float* __restrict__ v_fp32,
         uint32_t row_stride,
-        const Q38SequenceFields* __restrict__ meta,
+        int rows,
         float l2_eps) {
     if (blockDim.x != GDN_PREP_DK || blockDim.y != 1 || blockDim.z != 1
         || gridDim.x != 1 || gridDim.y != GDN_PREP_KHEADS) {
@@ -45,7 +46,7 @@ extern "C" __global__ void gdn_prep_l2_fp32(
         return;
     }
     const int row = blockIdx.z;
-    if (row >= meta->valid_rows) return;
+    if (row >= rows) return;
     const int head = blockIdx.y;
     const int d = threadIdx.x;
     const int lane = d & 31;
@@ -82,7 +83,7 @@ extern "C" __global__ void gdn_prep_l2_fp32(
     __syncthreads();
     const float qn = q * sums[0][0];
     const float kn = k * sums[1][0];
-    const float scaled_q = qn * (1.0f / sqrtf((float)GDN_PREP_DK));
+    const float scaled_q = ScaleQuery ? qn * (1.0f / sqrtf((float)GDN_PREP_DK)) : qn;
     #pragma unroll
     for (int child = 0; child < GDN_PREP_HEADS / GDN_PREP_KHEADS; ++child) {
         const int value_head = head * (GDN_PREP_HEADS / GDN_PREP_KHEADS) + child;
@@ -93,5 +94,38 @@ extern "C" __global__ void gdn_prep_l2_fp32(
             v_fp32[out] = __bfloat162float(
                 v_bf16[(size_t)row * row_stride + value_head * GDN_PREP_DV + d]);
         }
+    }
+}
+
+extern "C" __global__ void gdn_prep_l2_fp32(
+        const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
+        float* q_out, float* k_out, float* v_out, uint32_t stride,
+        const Q38SequenceFields* meta, float eps) {
+    gdn_prep_l2<true>(q, k, v, q_out, k_out, v_out, stride, meta->valid_rows, eps);
+}
+
+extern "C" __global__ void gdn_block_l2_gates(
+        const __nv_bfloat16* mixed, const __nv_bfloat16* a, const __nv_bfloat16* b,
+        const __nv_bfloat16* a_log, const __nv_bfloat16* dt,
+        float* q, float* k, float* v, float* g, float* beta, int rows, int preview) {
+    constexpr int stride = (2 * GDN_KHEADS + GDN_HEADS) * 128;
+    if (rows < 1 || rows > 32 || gridDim.z != rows || (preview != 0 && preview != 1) ||
+        !aligned16(mixed) || !aligned16(a) || !aligned16(a_log) || !aligned16(dt) ||
+        !aligned16(q) || !aligned16(k) || !aligned16(v) || !aligned16(g) ||
+        (!preview && (!aligned16(b) || !aligned16(beta)))) { __trap(); return; }
+    if (preview)
+        gdn_prep_l2<false>(mixed, mixed + GDN_KHEADS * 128, mixed + 2 * GDN_KHEADS * 128,
+                          q, k, v, stride, rows, 1e-6f);
+    else
+        gdn_prep_l2<true>(mixed, mixed + GDN_KHEADS * 128, mixed + 2 * GDN_KHEADS * 128,
+                         q, k, v, stride, rows, 1e-6f);
+    if (threadIdx.x < GDN_HEADS / GDN_KHEADS) {
+        const int head = blockIdx.y * (GDN_HEADS / GDN_KHEADS) + threadIdx.x;
+        const int index = blockIdx.z * GDN_HEADS + head;
+        const float x = __bfloat162float(a[index]) + __bfloat162float(dt[head]);
+        const float softplus = x > 20.0f ? x : log1pf(expf(x));
+        g[index] = -expf(__bfloat162float(a_log[head])) * softplus;
+        if (!preview)
+            beta[index] = __bfloat162float(__float2bfloat16_rn(sigmoid(__bfloat162float(b[index]))));
     }
 }

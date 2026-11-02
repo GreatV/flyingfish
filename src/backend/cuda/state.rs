@@ -588,6 +588,20 @@ pub struct StateStore {
     kv_rings: Vec<usize>,
 }
 impl StateStore {
+    pub(crate) fn empty(capacity: usize) -> Result<Self> {
+        ensure!(capacity > 0, "empty state requires a positive capacity");
+        Ok(Self {
+            kv: Vec::new(),
+            gdn: Vec::new(),
+            latent: Vec::new(),
+            compressed: None,
+            dsa: Vec::new(),
+            sequence: None,
+            capacity: u32::try_from(capacity)?,
+            kv_rings: Vec::new(),
+        })
+    }
+
     pub fn new(spec: &ModelSpec, capacity: usize, stream: &Arc<CudaStream>) -> Result<Self> {
         Self::new_with_format(spec, capacity, crate::kv::KvFormat::Bf16, stream)
     }

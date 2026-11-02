@@ -19,6 +19,77 @@
 #define GDN_CONV_CHAN 256
 #define GDN_CONV_ROWS 32
 
+template<bool Commit>
+__device__ void gdn_block_conv(
+        const __nv_bfloat16* raw, const __nv_bfloat16* weight,
+        const __nv_bfloat16* right, const float* history, float* next_history,
+        const int* valid, __nv_bfloat16* output, int rows) {
+    const int channel = blockIdx.x * 256 + threadIdx.x;
+    if (rows < 1 || rows > 32 || blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
+        gridDim.x != GDN_CONV_DIM / 256 || gridDim.y != (Commit ? 1 : rows) || gridDim.z != 1 ||
+        !aligned16(raw) || !aligned16(weight) || !aligned16(history) || !aligned16(output) || !valid) {
+        __trap(); return;
+    }
+    float taps[4];
+    #pragma unroll
+    for (int tap = 0; tap < 4; ++tap) taps[tap] = __bfloat162float(weight[channel * 4 + tap]);
+    if constexpr (Commit) {
+        if (!aligned16(next_history)) { __trap(); return; }
+        float h0 = history[channel * 3], h1 = history[channel * 3 + 1], h2 = history[channel * 3 + 2];
+        for (int row = 0; row < rows; ++row) {
+            float result = 0.0f;
+            if (valid[row]) {
+                const float current = __bfloat162float(raw[(size_t)row * GDN_CONV_DIM + channel]);
+                const float values[4] = {h0, h1, h2, current};
+                #pragma unroll
+                for (int tap = 0; tap < 4; ++tap)
+                    result = __fadd_rn(result, __bfloat162float(__float2bfloat16_rn(__fmul_rn(values[tap], taps[tap]))));
+                result = silu(result);
+                h0 = h1; h1 = h2; h2 = current;
+            }
+            output[(size_t)row * GDN_CONV_DIM + channel] = __float2bfloat16_rn(result);
+        }
+        next_history[channel * 3] = h0;
+        next_history[channel * 3 + 1] = h1;
+        next_history[channel * 3 + 2] = h2;
+    } else {
+        if (!aligned16(right)) { __trap(); return; }
+        const int row = blockIdx.y;
+        float result = 0.0f;
+        if (valid[row]) {
+            #pragma unroll
+            for (int tap = 0; tap < 4; ++tap) {
+                const int source = row - 3 + tap;
+                const float value = source < 0 ? history[channel * 3 + source + 3] :
+                    (valid[source] ? __bfloat162float(raw[(size_t)source * GDN_CONV_DIM + channel]) : 0.0f);
+                result = fmaf(value, taps[tap], result);
+            }
+            #pragma unroll
+            for (int distance = 1; distance <= 3; ++distance) {
+                const int source = row + distance;
+                if (source < rows && valid[source])
+                    result = __fadd_rn(result, __fmul_rn(
+                        __bfloat162float(raw[(size_t)source * GDN_CONV_DIM + channel]),
+                        __bfloat162float(right[channel * 3 + distance - 1])));
+            }
+            result = silu(result);
+        }
+        output[(size_t)row * GDN_CONV_DIM + channel] = __float2bfloat16_rn(result);
+    }
+}
+
+extern "C" __global__ void gdn_conv_right_preview(
+        const __nv_bfloat16* raw, const __nv_bfloat16* weight, const __nv_bfloat16* right,
+        const float* history, const int* valid, __nv_bfloat16* output, int rows) {
+    gdn_block_conv<false>(raw, weight, right, history, nullptr, valid, output, rows);
+}
+
+extern "C" __global__ void gdn_conv_bf16_products_commit(
+        const __nv_bfloat16* raw, const __nv_bfloat16* weight, float* history,
+        const int* valid, __nv_bfloat16* output, int rows) {
+    gdn_block_conv<true>(raw, weight, nullptr, history, history, valid, output, rows);
+}
+
 // One thread per channel; the block's 256 threads cover 256 contiguous channels. Each
 // thread walks a strip of rows.
 //

@@ -34,6 +34,123 @@
 
 using bf16 = __nv_bfloat16;
 
+template<bool MASS>
+__device__ void moe_route_block_select(
+    const bf16* logits, const int* valid, const unsigned* allowed,
+    int* ids, float* output, int rows, int experts, int top_k) {
+  const int e = threadIdx.x, row = blockIdx.x;
+  if (row >= rows || experts > 1024 || experts != blockDim.x ||
+      top_k < 1 || top_k > 32 || top_k >= experts) __trap();
+  __shared__ float values[1024], chosen[32], sum;
+  __shared__ int indices[1024];
+  float logit = __bfloat162float(logits[(size_t)row * experts + e]);
+  if (!isfinite(logit)) __trap();
+  if constexpr (!MASS) {
+    if (allowed && valid[row] && !allowed[e]) logit = -INFINITY;
+  }
+  values[e] = logit;
+  __syncthreads();
+  for (int stride = experts / 2; stride; stride >>= 1) {
+    if (e < stride) values[e] = fmaxf(values[e], values[e + stride]);
+    __syncthreads();
+  }
+  const float maximum = values[0];
+  __syncthreads();
+  const float exponential = expf(logit - maximum);
+  values[e] = exponential;
+  __syncthreads();
+  for (int stride = experts / 2; stride; stride >>= 1) {
+    if (e < stride) values[e] += values[e + stride];
+    __syncthreads();
+  }
+  const float probability = exponential / values[0];
+  if constexpr (MASS) output[(size_t)row * experts + e] = 0.0f;
+  bool taken = false;
+  for (int rank = 0; rank < top_k; ++rank) {
+    __syncthreads();
+    values[e] = logit;
+    indices[e] = taken ? 0x7fffffff : e;
+    if (taken) values[e] = -INFINITY;
+    __syncthreads();
+    for (int stride = experts / 2; stride; stride >>= 1) {
+      if (e < stride) {
+        const float other = values[e + stride];
+        const int id = indices[e + stride];
+        if (other > values[e] || (other == values[e] && id < indices[e])) {
+          values[e] = other;
+          indices[e] = id;
+        }
+      }
+      __syncthreads();
+    }
+    if (e == indices[0]) {
+      taken = true;
+      if constexpr (MASS) output[(size_t)row * experts + e] = valid[row] ? probability : 0.0f;
+      else {
+        ids[(size_t)row * top_k + rank] = e;
+        chosen[rank] = probability;
+      }
+    }
+  }
+  if constexpr (!MASS) {
+    __syncthreads();
+    if (e == 0) {
+      float total = 0.0f;
+      for (int rank = 0; rank < top_k; ++rank) total += chosen[rank];
+      sum = fmaxf(total, 1e-12f);
+    }
+    __syncthreads();
+    if (e < top_k) output[(size_t)row * top_k + e] = chosen[e] / sum;
+  }
+}
+
+extern "C" __global__ void moe_route_topk_mass(
+    const bf16* logits, const int* valid, float* mass, int rows, int experts, int top_k) {
+  moe_route_block_select<true>(logits, valid, nullptr, nullptr, mass, rows, experts, top_k);
+}
+
+extern "C" __global__ void moe_route_topk_masked_f32(
+    const bf16* logits, const int* valid, unsigned* allowed, int* ids,
+    float* weights, int rows, int experts, int top_k, int masked) {
+  if (!masked && blockIdx.x == 0) allowed[threadIdx.x] = 1;
+  moe_route_block_select<false>(logits, valid, masked ? allowed : nullptr, ids, weights, rows, experts, top_k);
+}
+
+extern "C" __global__ void moe_route_mass_coreset(
+    const float* mass, unsigned* allowed, int rows, int experts, float top_p) {
+  const int e = threadIdx.x;
+  if (blockIdx.x || blockDim.x != experts || experts > 1024 ||
+      experts < 32 || (experts & (experts - 1)) || !(top_p > 0 && top_p <= 1)) __trap();
+  __shared__ float probability[1024], reduction[1024];
+  __shared__ int order[1024];
+  float total = 0.0f;
+  for (int row = 0; row < rows; ++row) total += mass[(size_t)row * experts + e];
+  reduction[e] = total;
+  __syncthreads();
+  for (int stride = experts / 2; stride; stride >>= 1) {
+    if (e < stride) reduction[e] += reduction[e + stride];
+    __syncthreads();
+  }
+  probability[e] = total / fmaxf(reduction[0], 1e-9f);
+  order[e] = e;
+  __syncthreads();
+  for (int width = 2; width <= experts; width <<= 1) {
+    for (int distance = width >> 1; distance; distance >>= 1) {
+      const int other = e ^ distance;
+      const float a = probability[e], b = probability[other];
+      const int ai = order[e], bi = order[other];
+      const bool first = a > b || (a == b && ai < bi);
+      const bool want_first = ((e & width) == 0) == ((e & distance) == 0);
+      __syncthreads();
+      if (first != want_first) { probability[e] = b; order[e] = bi; }
+      __syncthreads();
+    }
+  }
+  float cumulative = 0.0f;
+  for (int i = 0; i <= e; ++i) cumulative += probability[i];
+  allowed[order[e]] = e == 0 || __fsub_rn(cumulative, probability[e]) < top_p;
+}
+
 template<bool reverse_ties = false>
 __device__ void moe_route_select(
     float logit, int* __restrict__ ids, bf16* __restrict__ weights,
@@ -537,3 +654,4 @@ extern "C" __global__ void moe_route_mask(
   active[a] = valid[expert];
   assignment_gen[a] = valid[expert] ? generation[expert] : 0;
 }
+

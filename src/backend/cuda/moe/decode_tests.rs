@@ -393,7 +393,7 @@ fn invariant_decode(device: &Device) -> Result<()> {
                                     slot: &world.slots[start..start + world.slot_bytes as usize],
                                     slot_layout,
                                     hidden: &fx.x[r * h..(r + 1) * h],
-                                    routing: weights[a],
+                                    routing: weights[a].to_f32(),
 
                                     rounding: crate::model_spec::SwigluRounding::Twice,
                                     limit: 0.0,
@@ -418,7 +418,7 @@ fn invariant_decode(device: &Device) -> Result<()> {
                                         down_stride: i,
                                     },
                                     hidden: &fx.x[r * h..(r + 1) * h],
-                                    routing: weights[a],
+                                    routing: weights[a].to_f32(),
 
                                     rounding: crate::model_spec::SwigluRounding::Twice,
                                     limit: 0.0,

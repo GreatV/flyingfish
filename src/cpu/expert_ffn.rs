@@ -255,7 +255,7 @@ pub struct Assignment {
     pub row: u32,
     pub choice: u32,
     pub expert: u32,
-    pub weight: bf16,
+    pub weight: f32,
 }
 
 pub struct Scratch {
@@ -386,7 +386,7 @@ pub struct Contribution<'a> {
     pub arena: &'a [bf16],
     pub weights: &'a ExpertWeights,
     pub hidden: &'a [bf16],
-    pub routing: bf16,
+    pub routing: f32,
     pub rounding: crate::model_spec::SwigluRounding,
     pub limit: f32,
     pub routed_weight: crate::model_spec::RoutedWeightBoundary,
@@ -460,7 +460,7 @@ fn compute(arm: &Arm, input: Contribution<'_>, out: &mut [bf16], scratch: &mut S
         // SAFETY: as above.
         scratch.down[k] = unsafe { (arm.dot)(&scratch.activated_f, row, form) };
     }
-    let weight = f32::from(routing);
+    let weight = routing;
     match routed_weight {
         crate::model_spec::RoutedWeightBoundary::AfterDownBf16 => {
             // SAFETY: as above.
@@ -489,7 +489,7 @@ pub struct Fp8Contribution<'a> {
     pub slot: &'a [u8],
     pub slot_layout: &'a crate::experts::catalogue::Fp8Slot,
     pub hidden: &'a [bf16],
-    pub routing: bf16,
+    pub routing: f32,
     pub rounding: crate::model_spec::SwigluRounding,
     pub limit: f32,
     pub routed_weight: crate::model_spec::RoutedWeightBoundary,
@@ -580,7 +580,7 @@ fn compute_fp8(
     shape: &Shape,
     rows: Fp8Rows<'_>,
     hidden: &[bf16],
-    routing: bf16,
+    routing: f32,
     out: &mut [bf16],
     scratch: &mut Scratch,
 ) {
@@ -642,7 +642,7 @@ fn compute_fp8(
             )
         };
     }
-    let weight = f32::from(routing);
+    let weight = routing;
     match rows.routed_weight {
         crate::model_spec::RoutedWeightBoundary::AfterDownBf16 => {
             // SAFETY: as above.
@@ -1874,7 +1874,7 @@ struct GroupedItem {
     item: u16,
     row: u16,
     choice: u32,
-    weight: bf16,
+    weight: f32,
 }
 
 struct JobSlot {
@@ -2273,7 +2273,7 @@ impl ExpertPool {
                     item: 0,
                     row: 0,
                     choice: 0,
-                    weight: bf16::ZERO,
+                    weight: 0.0,
                 },
             );
             for (item_idx, item) in assignments.iter().enumerate() {
@@ -2825,7 +2825,7 @@ fn phases<const FP8: bool>(
                 }
                 for (r, item) in group_items.iter().enumerate() {
                     let value = local.down_out[r];
-                    let weight = f32::from(item.weight);
+                    let weight = item.weight;
                     let scaled = match boundaries.routed_weight {
                         RoutedWeightBoundary::AfterDownBf16 => {
                             f32::from(bf16::from_f32(value)) * weight
@@ -2856,7 +2856,7 @@ fn phases<const FP8: bool>(
                 }
                 for (r, item) in group_items.iter().enumerate() {
                     let value = local.down_out[r];
-                    let weight = f32::from(item.weight);
+                    let weight = item.weight;
                     let scaled = match boundaries.routed_weight {
                         RoutedWeightBoundary::AfterDownBf16 => {
                             f32::from(bf16::from_f32(value)) * weight
@@ -2979,7 +2979,7 @@ pub fn measure_service_table(
                         row: slot / missed,
                         choice: slot,
                         expert: slot % missed,
-                        weight: bf16::from_f32(0.125 * ((slot % missed) as f32 + 1.0)),
+                        weight: bf16::from_f32(0.125 * ((slot % missed) as f32 + 1.0)).to_f32(),
                     })
                     .collect();
                 let mut out = vec![bf16::ZERO; assignments.len() * shape.hidden];
@@ -3269,7 +3269,7 @@ mod tests {
         arena: &[bf16],
         weights: &ExpertWeights,
         hidden: &[bf16],
-        routing: bf16,
+        routing: f32,
     ) -> Vec<bf16> {
         let (h, i) = (shape.hidden, shape.intermediate);
         let gate_up = &arena[weights.gate_up.clone()];
@@ -3300,7 +3300,7 @@ mod tests {
                 acc += activated[j] * f64::from(down[k * weights.down_stride + j]);
             }
             let linear = bf16::from_f32(acc as f32);
-            out.push(bf16::from_f32(f32::from(linear) * f32::from(routing)));
+            out.push(bf16::from_f32(f32::from(linear) * routing));
         }
         out
     }
@@ -3349,7 +3349,7 @@ mod tests {
                     arena: &flat,
                     weights: &expert,
                     hidden: &hidden,
-                    routing: bf16::ONE,
+                    routing: 1.0,
 
                     rounding: crate::model_spec::SwigluRounding::Twice,
                     limit: 0.0,
@@ -3375,7 +3375,7 @@ mod tests {
             row: 0,
             choice: 0,
             expert: 0,
-            weight: bf16::ONE,
+            weight: 1.0,
         }];
         let experts = [expert.clone()];
         let pending = pool.submit(Job {
@@ -3419,7 +3419,7 @@ mod tests {
                     slot: &native,
                     slot_layout: &slot,
                     hidden: &hidden,
-                    routing: bf16::ONE,
+                    routing: 1.0,
 
                     rounding: crate::model_spec::SwigluRounding::Twice,
                     limit: 0.0,
@@ -3472,7 +3472,7 @@ mod tests {
                     arena: &flat,
                     weights: &expert,
                     hidden: &hidden,
-                    routing: bf16::ONE,
+                    routing: 1.0,
                     rounding: crate::model_spec::SwigluRounding::Once,
                     limit: 0.0,
                     routed_weight: crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16,
@@ -3520,7 +3520,7 @@ mod tests {
                     slot: &native,
                     slot_layout: &slot,
                     hidden: &hidden,
-                    routing: bf16::ONE,
+                    routing: 1.0,
                     rounding: crate::model_spec::SwigluRounding::Once,
                     limit: 0.0,
                     routed_weight: crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16,
@@ -3539,7 +3539,7 @@ mod tests {
         for row in 0..h {
             flat[2 * i * h + row * i + 1] = bf16::ONE;
         }
-        let routing = bf16::from_f32(0.1);
+        let routing = bf16::from_f32(0.1).to_f32();
         let mut after = vec![bf16::ZERO; h];
         let mut before = vec![bf16::ZERO; h];
         contribution(
@@ -3589,7 +3589,7 @@ mod tests {
         let mut worst = 0u32;
         for (expert, routing) in [(0usize, 0.3125f32), (1, -0.5), (2, 0.0625), (3, 1.0)] {
             let hidden = hidden_row(&shape, expert);
-            let routing = bf16::from_f32(routing);
+            let routing = bf16::from_f32(routing).to_f32();
             let mut out = vec![bf16::ZERO; shape.hidden];
             contribution(
                 Isa::Scalar,
@@ -3699,7 +3699,7 @@ mod tests {
         slot: &[u8],
         layout: &crate::experts::catalogue::Fp8Slot,
         hidden: &[bf16],
-        routing: bf16,
+        routing: f32,
     ) -> Vec<bf16> {
         let (h, i) = (shape.hidden, shape.intermediate);
         let scale = |range: &std::ops::Range<u64>, row: usize| -> bf16 {
@@ -3756,7 +3756,7 @@ mod tests {
                 acc += activated[j] * f64::from(down_w[k * i + j]);
             }
             let linear = bf16::from_f32(acc as f32);
-            out.push(bf16::from_f32(f32::from(linear) * f32::from(routing)));
+            out.push(bf16::from_f32(f32::from(linear) * routing));
         }
         out
     }
@@ -3771,7 +3771,7 @@ mod tests {
         let mut worst = 0u32;
         for (row, routing) in [(0usize, 0.3125f32), (1, -0.5), (2, 0.0625), (3, 1.0)] {
             let hidden = hidden_row(&shape, row);
-            let routing = bf16::from_f32(routing);
+            let routing = bf16::from_f32(routing).to_f32();
             let mut out = vec![bf16::ZERO; shape.hidden];
             fp8_contribution(
                 Isa::Scalar,
@@ -3834,7 +3834,7 @@ mod tests {
                 row,
                 choice,
                 expert,
-                weight: bf16::from_f32(weight),
+                weight: bf16::from_f32(weight).to_f32(),
             },
         );
         let mut expected = vec![bf16::ZERO; 6 * shape.hidden];
@@ -3930,7 +3930,7 @@ mod tests {
         let mut scratch = Scratch::new(&shape);
         for (row, routing) in [(0usize, 0.3125f32), (1, -0.5)] {
             let hidden = hidden_row(&shape, row);
-            let routing = bf16::from_f32(routing);
+            let routing = bf16::from_f32(routing).to_f32();
             let mut scalar = vec![bf16::ZERO; shape.hidden];
             fp8_contribution(
                 Isa::Scalar,
@@ -4009,7 +4009,7 @@ mod tests {
         for (expert, routing) in [(0usize, 0.3125f32), (1, -0.5), (2, 0.0625), (3, 1.0)] {
             let hidden = hidden_row(&shape, expert);
             let weights0 = weights(&shape, expert);
-            let routing = bf16::from_f32(routing);
+            let routing = bf16::from_f32(routing).to_f32();
             let mut scalar = vec![bf16::ZERO; shape.hidden];
             contribution(
                 Isa::Scalar,
@@ -4066,7 +4066,7 @@ mod tests {
         let shape = production_shape();
         let arena = build_arena(&shape, 2);
         let hidden = hidden_row(&shape, 0);
-        let routing = bf16::from_f32(0.25);
+        let routing = bf16::from_f32(0.25).to_f32();
         let mut scratch = Scratch::new(&shape);
         let mut correct = vec![bf16::ZERO; shape.hidden];
         contribution(
@@ -4159,7 +4159,7 @@ mod tests {
                             row: row as u32,
                             choice: (row * 8 + choice) as u32,
                             expert: ((row * 3 + choice) % experts_used) as u32,
-                            weight: bf16::from_f32(0.125 * (choice as f32 + 1.0)),
+                            weight: bf16::from_f32(0.125 * (choice as f32 + 1.0)).to_f32(),
                         });
                     }
                 }
@@ -4242,7 +4242,7 @@ mod tests {
                     row: row as u32,
                     choice: (row * 2 + choice) as u32,
                     expert: ((row + choice) % 3) as u32,
-                    weight: bf16::from_f32(0.5 + choice as f32 * 0.25),
+                    weight: bf16::from_f32(0.5 + choice as f32 * 0.25).to_f32(),
                 })
             })
             .collect();
@@ -4571,7 +4571,7 @@ mod tests {
                 row: 0,
                 choice,
                 expert: choice % 4,
-                weight: bf16::from_f32(0.125),
+                weight: bf16::from_f32(0.125).to_f32(),
             })
             .collect();
         let pool = ExpertPool::new(4, shape, 1, assignments.len(), None)?;
@@ -4625,7 +4625,7 @@ mod tests {
             row: 0,
             choice: 0,
             expert: 0,
-            weight: bf16::from_f32(0.5),
+            weight: bf16::from_f32(0.5).to_f32(),
         };
         let mut out = vec![bf16::ZERO; shape.hidden];
         pool.run(Job {
@@ -4764,7 +4764,7 @@ mod tests {
             down: 2 * shape.intermediate * shape.hidden..per_expert(&shape),
             down_stride: shape.intermediate,
         };
-        let reference64 = reference(&shape, &arena, &weights, &hidden, weight[0]);
+        let reference64 = reference(&shape, &arena, &weights, &hidden, weight[0].to_f32());
         let reference_noise = expected
             .iter()
             .zip(&reference64)
@@ -4785,7 +4785,7 @@ mod tests {
                     arena: &arena,
                     weights: &weights,
                     hidden: &hidden,
-                    routing: weight[0],
+                    routing: weight[0].to_f32(),
 
                     rounding: crate::model_spec::SwigluRounding::Twice,
                     limit: 0.0,
@@ -4958,7 +4958,7 @@ mod tests {
                         row: r as u32,
                         choice,
                         expert: 0,
-                        weight: bf16::from_f32(0.125 + 0.0625 * (r as f32)),
+                        weight: bf16::from_f32(0.125 + 0.0625 * (r as f32)).to_f32(),
                     });
                     choice += 1;
                 }
@@ -4967,7 +4967,7 @@ mod tests {
                         row: r as u32,
                         choice,
                         expert: 1,
-                        weight: bf16::from_f32(-0.25 + 0.0625 * (r as f32)),
+                        weight: bf16::from_f32(-0.25 + 0.0625 * (r as f32)).to_f32(),
                     });
                     choice += 1;
                 }
@@ -4976,7 +4976,7 @@ mod tests {
                         row: (rows - 1 - r) as u32,
                         choice,
                         expert: 2,
-                        weight: bf16::from_f32(0.5 - 0.125 * (r as f32)),
+                        weight: bf16::from_f32(0.5 - 0.125 * (r as f32)).to_f32(),
                     });
                     choice += 1;
                 }
@@ -4984,7 +4984,7 @@ mod tests {
                     row: (rows / 2) as u32,
                     choice,
                     expert: 3,
-                    weight: bf16::from_f32(0.375),
+                    weight: bf16::from_f32(0.375).to_f32(),
                 });
 
                 let mut expected_bf16 = vec![bf16::ZERO; assignments.len() * shape.hidden];

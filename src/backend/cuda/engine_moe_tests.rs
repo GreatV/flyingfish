@@ -1322,6 +1322,7 @@ impl Engine {
             deepseek_ffn: None,
             deepseek_engram: None,
             recurrent: None,
+            diffusion: None,
             hc: None,
             glm_dsa: None,
             moe,
@@ -1909,7 +1910,7 @@ impl TierOracle {
                         row: row as u32,
                         choice: (row * 4 + rank) as u32,
                         expert,
-                        weight: bf16::from_f32(0.25),
+                        weight: bf16::from_f32(0.25).to_f32(),
                     })
             })
             .collect()
@@ -1962,7 +1963,7 @@ impl TierOracle {
                         slot: native_bytes(&values),
                         slot_layout,
                         hidden: &input[row * 128..(row + 1) * 128],
-                        routing: bf16::from_f32(weights[choice]),
+                        routing: bf16::from_f32(weights[choice]).to_f32(),
 
                         rounding: crate::model_spec::SwigluRounding::Twice,
                         limit: 0.0,
@@ -1980,7 +1981,7 @@ impl TierOracle {
                         arena: &values,
                         weights: &native,
                         hidden: &input[row * 128..(row + 1) * 128],
-                        routing: bf16::from_f32(weights[choice]),
+                        routing: bf16::from_f32(weights[choice]).to_f32(),
 
                         rounding: crate::model_spec::SwigluRounding::Twice,
                         limit: 0.0,
@@ -2381,7 +2382,7 @@ fn tier_cell(
                 row: choice as u32 / 4,
                 choice: choice as u32,
                 expert: expert as u32,
-                weight: bf16::from_f32(weight),
+                weight: bf16::from_f32(weight).to_f32(),
             },
         )
         .collect::<Vec<_>>();
@@ -2747,7 +2748,7 @@ fn cpu_control(
                 arena: lease.read(expert)?,
                 weights: &local,
                 hidden: &input[row * 128..(row + 1) * 128],
-                routing: bf16::from_f32(weights[choice]),
+                routing: bf16::from_f32(weights[choice]).to_f32(),
 
                 rounding: crate::model_spec::SwigluRounding::Twice,
                 limit: 0.0,
@@ -2761,7 +2762,7 @@ fn cpu_control(
             row: miss_rows.len() as u32,
             choice: choice as u32,
             expert,
-            weight: bf16::from_f32(weights[choice]),
+            weight: bf16::from_f32(weights[choice]).to_f32(),
         });
         miss_rows.push(row as u32);
     }
@@ -3021,7 +3022,7 @@ fn dispatch_covers_original_choices_once_after_row_compaction() -> Result<()> {
                 row: 0,
                 choice: (choices - 1) as u32,
                 expert: 0,
-                weight: bf16::ONE,
+                weight: 1.0,
             }],
             miss_rows: &[(rows - 1) as u32],
             host_dma: None,
@@ -3051,13 +3052,13 @@ fn dispatch_covers_original_choices_once_after_row_compaction() -> Result<()> {
             row: 0,
             choice: 1,
             expert: 0,
-            weight: weights[1],
+            weight: weights[1].to_f32(),
         },
         Assignment {
             row: 1,
             choice: 9,
             expert: 0,
-            weight: weights[9],
+            weight: weights[9].to_f32(),
         },
     ];
     let check = |active: &[u32], assignments: &[Assignment], rows: &[u32]| {
@@ -3830,13 +3831,13 @@ pub(super) fn placement_components(engine: &Engine, model: &Path) -> Result<usiz
         row: 0,
         choice: 0,
         expert: 0,
-        weight: weights[0],
+        weight: weights[0].to_f32(),
     }];
     let disk_route = [crate::experts::runtime::Route {
         row: 0,
         choice: 0,
         expert: 0,
-        weight: weights[0],
+        weight: weights[0].to_f32(),
     }];
     let mut defects = 0;
     let mut eager = Vec::new();
@@ -4186,6 +4187,7 @@ fn published_residency_gpu() -> Result<()> {
     let settings = Settings {
         runtime_dir: Some(runtime),
         prefix_cache: false,
+        device_budget_gib: None,
         draft_model: None,
         tree_builder: TreeBuilder::Waves,
         spec_budget: SpecBudget::Chain,
@@ -4224,6 +4226,7 @@ fn published_streamed_model_gpu() -> Result<()> {
     let settings = Settings {
         runtime_dir: Some(runtime),
         prefix_cache: false,
+        device_budget_gib: None,
         draft_model: None,
         tree_builder: TreeBuilder::Waves,
         spec_budget: SpecBudget::Chain,
@@ -4472,6 +4475,7 @@ fn minicpm_chain_verify(chunk: usize) -> Result<()> {
         draft_model: Some(draft),
         runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
         prefix_cache: false,
+        device_budget_gib: None,
         kv_format: crate::kv::KvFormat::Bf16,
     };
     Engine::calibrate(&target, 0, 256, Some(chunk), settings.clone())?;
@@ -5291,6 +5295,7 @@ fn hybrid_media_identity_gpu() -> Result<()> {
             std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("media runtime missing")?,
         )),
         prefix_cache: false,
+        device_budget_gib: None,
         draft_model: None,
         tree_builder: TreeBuilder::Waves,
         spec_budget: SpecBudget::Chain,

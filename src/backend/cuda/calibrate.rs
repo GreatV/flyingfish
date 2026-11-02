@@ -556,7 +556,7 @@ fn measure(
     })
 }
 
-pub(super) fn host_memory(root: &Path) -> Result<u64> {
+pub(crate) fn host_memory(root: &Path) -> Result<u64> {
     let meminfo = std::fs::read_to_string(root.join("proc/meminfo"))?;
     let mut available = meminfo
         .lines()
@@ -2070,6 +2070,7 @@ mod long_tests {
                 spec_graph: false,
                 draft_model: None,
                 prefix_cache: false,
+                device_budget_gib: None,
                 kv_format: crate::kv::KvFormat::Bf16,
                 runtime_dir: Some(runtime.clone()),
             },

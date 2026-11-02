@@ -8,6 +8,9 @@ use std::path::Path;
 
 pub enum Backend {}
 impl Backend {
+    pub(crate) fn generation_request(&mut self, _: usize, _: bool, _: bool) -> Result<()> {
+        match *self {}
+    }
     pub(crate) fn check_resident_vision_budget(_: &Path, _: &crate::spec::Options) -> Result<()> {
         bail!("CUDA backend is disabled")
     }

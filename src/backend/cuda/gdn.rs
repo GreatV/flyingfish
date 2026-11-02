@@ -59,6 +59,287 @@ const CHUNKED_SMEM: u32 = 62_336;
 /// Chunkwise-P2 thread block; both stages use one arena sized by `gdn_cw_p2_layout.h`.
 const P2_THREADS: u32 = 256;
 
+pub struct GdnBlockBindings {
+    pub qkv: Tensor<bf16, 2>,
+    pub a: Tensor<bf16, 2>,
+    pub conv_weight: Tensor<bf16, 2>,
+    /// A_log, dt_bias, both published BF16 [hv].
+    pub decay: [Tensor<bf16, 1>; 2],
+    pub valid: Tensor<i32, 1>,
+    pub output: TensorMut<bf16, 3>,
+}
+
+pub enum GdnBlockMode {
+    Preview {
+        state: Tensor<f32, 3>,
+        history: Tensor<f32, 2>,
+        right: Tensor<bf16, 2>,
+        /// Logit scale, history bias, history log-count coefficient.
+        softmax: [Tensor<bf16, 1>; 3],
+    },
+    Commit {
+        state: TensorMut<f32, 3>,
+        history: TensorMut<f32, 2>,
+        b: Tensor<bf16, 2>,
+    },
+}
+
+pub struct GdnBlockPlan {
+    spec: GdnSpec,
+    bindings: GdnBlockBindings,
+    mode: GdnBlockMode,
+    workspace: GdnWorkspace,
+    scratch: Scratch,
+    kernels: [CudaFunction; 3],
+    configs: [LaunchConfig; 3],
+    rows: i32,
+}
+
+fn block_tensor<T: Copy, const R: usize>(
+    tensor: &Tensor<T, R>,
+    shape: [u32; R],
+) -> Result<(u64, u64)> {
+    tensor.validate()?;
+    let (stride, _) = super::contracts::dense_layout(shape)?;
+    ensure!(
+        tensor.shape == shape && tensor.stride == stride,
+        "GDN block tensor layout mismatch"
+    );
+    Ok((tensor.ptr, tensor.span_bytes))
+}
+
+impl GdnBlockPlan {
+    pub fn prepare(
+        ctx: &Arc<CudaContext>,
+        spec: GdnSpec,
+        bindings: GdnBlockBindings,
+        mode: GdnBlockMode,
+        scratch: Scratch,
+    ) -> Result<Self> {
+        spec.validate()?;
+        ensure!(
+            spec.gate_mode == GdnGateMode::PerHead,
+            "GDN block requires per-head decay"
+        );
+        let rows = bindings.qkv.shape[0];
+        ensure!((1..=32).contains(&rows), "GDN block rows must be 1..32");
+        let channels = spec.conv_dim()?;
+        let heads = spec.hv;
+        let workspace = GdnWorkspace::new(&spec, rows, false)?;
+        scratch.validate(workspace.bytes)?;
+        let mut read = vec![
+            block_tensor(&bindings.qkv, [rows, channels])?,
+            block_tensor(&bindings.a, [rows, heads])?,
+            block_tensor(&bindings.conv_weight, [channels, 4])?,
+            block_tensor(&bindings.decay[0], [heads])?,
+            block_tensor(&bindings.decay[1], [heads])?,
+            block_tensor(&bindings.valid, [rows])?,
+        ];
+        let mut write = vec![
+            block_tensor(&bindings.output.0, [rows, heads, 128])?,
+            (scratch.ptr, scratch.bytes),
+        ];
+        let preview = match &mode {
+            GdnBlockMode::Preview {
+                state,
+                history,
+                right,
+                softmax,
+            } => {
+                read.push(block_tensor(state, [heads, 128, 128])?);
+                read.push(block_tensor(history, [channels, 3])?);
+                read.push(block_tensor(right, [channels, 3])?);
+                for scalar in softmax {
+                    read.push(block_tensor(scalar, [heads])?);
+                }
+                true
+            }
+            GdnBlockMode::Commit { state, history, b } => {
+                write.push(block_tensor(&state.0, [heads, 128, 128])?);
+                write.push(block_tensor(&history.0, [channels, 3])?);
+                read.push(block_tensor(b, [rows, heads])?);
+                false
+            }
+        };
+        for (i, &(ptr, bytes)) in write.iter().enumerate() {
+            for &(other, extent) in read.iter().chain(&write[..i]) {
+                ensure!(
+                    super::contracts::spans_disjoint(ptr, bytes, other, extent)?,
+                    "overlapping GDN block bindings"
+                );
+            }
+        }
+        let suffix = spec.kernel_suffix()?;
+        let conv =
+            cubin::module(ctx, &format!("gdn/gdn_conv{suffix}"))?.load_function(if preview {
+                "gdn_conv_right_preview"
+            } else {
+                "gdn_conv_bf16_products_commit"
+            })?;
+        let prep = cubin::module(ctx, &format!("gdn/gdn_prep{suffix}"))?
+            .load_function("gdn_block_l2_gates")?;
+        let core = cubin::module(ctx, &format!("gdn/gdn_recurrent{suffix}"))?.load_function(
+            if preview {
+                "gdn_block_softmax_history_preview"
+            } else {
+                "gdn_recurrent_masked_commit"
+            },
+        )?;
+        let configs = [
+            LaunchConfig {
+                grid_dim: (channels / 256, if preview { rows } else { 1 }, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            LaunchConfig {
+                grid_dim: (1, spec.hk, rows),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            LaunchConfig {
+                grid_dim: (if preview { rows.div_ceil(4) } else { 2 }, heads, 1),
+                block_dim: (if preview { 128 } else { 512 }, 1, 1),
+                shared_mem_bytes: if preview { 0 } else { RECURRENT_SMEM },
+            },
+        ];
+        let kernels = [conv, prep, core];
+        for (kernel, config) in kernels.iter().zip(&configs) {
+            ensure!(
+                kernel.occupancy_max_active_blocks_per_multiprocessor(
+                    config.block_dim.0,
+                    config.shared_mem_bytes as usize,
+                    None
+                )? > 0,
+                "GDN block kernel has zero occupancy"
+            );
+        }
+        Ok(Self {
+            spec,
+            bindings,
+            mode,
+            workspace,
+            scratch,
+            kernels,
+            configs,
+            rows: rows as i32,
+        })
+    }
+
+    pub(crate) fn causal_rows(&self, ctx: &Arc<CudaContext>, rows: u32) -> Result<Self> {
+        ensure!(
+            rows > 0 && rows <= self.bindings.qkv.shape[0],
+            "GDN causal row extent"
+        );
+        let GdnBlockMode::Commit { state, history, b } = &self.mode else {
+            anyhow::bail!("GDN row binding requires a causal plan");
+        };
+        let mut qkv = self.bindings.qkv;
+        let mut a = self.bindings.a;
+        let mut valid = self.bindings.valid;
+        let mut output = self.bindings.output.0;
+        let mut b = *b;
+        qkv.shape[0] = rows;
+        a.shape[0] = rows;
+        valid.shape[0] = rows;
+        output.shape[0] = rows;
+        b.shape[0] = rows;
+        Self::prepare(
+            ctx,
+            self.spec,
+            GdnBlockBindings {
+                qkv,
+                a,
+                valid,
+                conv_weight: self.bindings.conv_weight,
+                decay: self.bindings.decay,
+                output: TensorMut(output),
+            },
+            GdnBlockMode::Commit {
+                state: TensorMut(state.0),
+                history: TensorMut(history.0),
+                b,
+            },
+            Scratch {
+                ptr: self.scratch.ptr,
+                bytes: self.scratch.bytes,
+            },
+        )
+    }
+
+    pub fn run(&self, stream: &Arc<CudaStream>) -> Result<()> {
+        let b = &self.bindings;
+        let base = self.scratch.ptr;
+        let conv = base + self.workspace.conv_out.offset;
+        let q = base + self.workspace.q_fp32.offset;
+        let k = base + self.workspace.k_fp32.offset;
+        let v = base + self.workspace.v_fp32.offset;
+        let g = base + self.workspace.g.offset;
+        let beta = base + self.workspace.beta_fp32.offset;
+        let (preview, b_ptr) = match &self.mode {
+            GdnBlockMode::Preview { .. } => (1i32, 0u64),
+            GdnBlockMode::Commit { b, .. } => (0, b.ptr),
+        };
+        unsafe {
+            let mut launch = stream.launch_builder(&self.kernels[0]);
+            launch.arg(&b.qkv.ptr).arg(&b.conv_weight.ptr);
+            match &self.mode {
+                GdnBlockMode::Preview { history, right, .. } => {
+                    launch.arg(&right.ptr).arg(&history.ptr);
+                }
+                GdnBlockMode::Commit { history, .. } => {
+                    launch.arg(&history.0.ptr);
+                }
+            }
+            launch
+                .arg(&b.valid.ptr)
+                .arg(&conv)
+                .arg(&self.rows)
+                .launch(self.configs[0])?;
+            stream
+                .launch_builder(&self.kernels[1])
+                .arg(&conv)
+                .arg(&b.a.ptr)
+                .arg(&b_ptr)
+                .arg(&b.decay[0].ptr)
+                .arg(&b.decay[1].ptr)
+                .arg(&q)
+                .arg(&k)
+                .arg(&v)
+                .arg(&g)
+                .arg(&beta)
+                .arg(&self.rows)
+                .arg(&preview)
+                .launch(self.configs[1])?;
+            let mut launch = stream.launch_builder(&self.kernels[2]);
+            launch.arg(&q).arg(&k).arg(&v);
+            match &self.mode {
+                GdnBlockMode::Preview { state, softmax, .. } => {
+                    launch
+                        .arg(&g)
+                        .arg(&state.ptr)
+                        .arg(&softmax[0].ptr)
+                        .arg(&softmax[1].ptr)
+                        .arg(&softmax[2].ptr)
+                        .arg(&b.valid.ptr)
+                        .arg(&b.output.0.ptr)
+                        .arg(&self.rows);
+                }
+                GdnBlockMode::Commit { state, .. } => {
+                    launch
+                        .arg(&beta)
+                        .arg(&g)
+                        .arg(&state.0.ptr)
+                        .arg(&b.output.0.ptr)
+                        .arg(&b.valid.ptr)
+                        .arg(&self.rows);
+                }
+            }
+            launch.launch(self.configs[2])?;
+        }
+        Ok(())
+    }
+}
+
 /// The ABI §6 views; `prepare` validates every stride and span against the registered layout.
 /// `conv_dim` comes from [`GdnSpec::conv_dim`], not from these bindings.
 #[derive(Clone, Copy, Debug)]
@@ -1532,6 +1813,569 @@ mod tests {
 
     use super::*;
     use crate::gdn_plan::cw_p2_bytes;
+
+    #[cfg(feature = "cuda")]
+    fn clover_fixture_f32(archive: &safetensors::SafeTensors<'_>, name: &str) -> Result<Vec<f32>> {
+        let tensor = archive.tensor(name)?;
+        ensure!(
+            tensor.dtype() == safetensors::Dtype::F32,
+            "Runner FAIL fixture dtype: {name}"
+        );
+        Ok(tensor
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| f32::from_le_bytes(*v))
+            .collect())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn clover_fixture_bf16(
+        archive: &safetensors::SafeTensors<'_>,
+        name: &str,
+    ) -> Result<Vec<bf16>> {
+        let tensor = archive.tensor(name)?;
+        ensure!(
+            tensor.dtype() == safetensors::Dtype::BF16,
+            "Runner FAIL fixture dtype: {name}"
+        );
+        Ok(tensor
+            .data()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|v| bf16::from_bits(u16::from_le_bytes(*v)))
+            .collect())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn clover_state_transpose(source: &[f32]) -> Vec<f32> {
+        (0..32 * 128 * 128)
+            .map(|i| source[i / 16384 * 16384 + i % 128 * 128 + i % 16384 / 128])
+            .collect()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn clover_block_fixture(
+        device: &crate::backend::cuda::Device,
+        archive: &safetensors::SafeTensors<'_>,
+        case: &serde_json::Value,
+        control: u32,
+        carry: Option<&std::collections::BTreeMap<String, Vec<f32>>>,
+    ) -> Result<(std::collections::BTreeMap<String, Vec<f32>>, usize)> {
+        use super::super::contracts::view;
+        use super::super::ops::{CommonOpsRef, GatedRmsMode};
+        use crate::backend::gpu::DevicePtr;
+        use cudarc::driver::sys;
+        let stream = &device.stream;
+        let tag = case["tag"].as_str().context("Runner FAIL fixture tag")?;
+        let rows = u32::try_from(case["rows"].as_u64().context("Runner FAIL fixture rows")?)?;
+        let preview = case["preview"]
+            .as_bool()
+            .context("Runner FAIL fixture mode")?;
+        let f32s = |name: &str| clover_fixture_f32(archive, &format!("{tag}.{name}"));
+        let bf16s = |name: &str| clover_fixture_bf16(archive, &format!("{tag}.{name}"));
+        let upload = |name: &str| -> Result<_> { Ok(stream.clone_htod(&bf16s(name)?)?) };
+        let qkv = upload("in_proj_qkv")?;
+        let a = upload("in_proj_a")?;
+        let b = if preview {
+            None
+        } else {
+            Some(upload("in_proj_b")?)
+        };
+        let z = upload("in_proj_z")?;
+        let w = upload("weight.conv1d.weight")?;
+        let mut right_values = bf16s("weight.conv_right_weight")?;
+        if control == 1 {
+            right_values.fill(bf16::ZERO);
+        }
+        let right = stream.clone_htod(&right_values)?;
+        let scale = upload("weight.bd_softmax_logit_scale")?;
+        let bias = upload("weight.bd_softmax_history_bias")?;
+        let mut history_c = bf16s("weight.bd_softmax_history_c")?;
+        if control == 2 {
+            history_c.fill(bf16::ZERO);
+        }
+        let history_c = stream.clone_htod(&history_c)?;
+        let a_log = upload("weight.A_log")?;
+        let dt = upload("weight.dt_bias")?;
+        let norm_weight = upload("weight.norm.weight")?;
+        let valid = archive.tensor(&format!("{tag}.valid"))?;
+        ensure!(
+            valid.dtype() == safetensors::Dtype::I32 && valid.shape() == [1, rows as usize],
+            "Runner FAIL valid mask layout"
+        );
+        let valid_values: Vec<_> = valid
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| i32::from_le_bytes(*v))
+            .collect();
+        let valid = stream.clone_htod(&valid_values)?;
+        let guard = f32::from_bits(0x7fc1_0001);
+        let state_values = match carry {
+            Some(previous) => previous
+                .get("state")
+                .context("missing committed state")?
+                .clone(),
+            None => f32s("state")?,
+        };
+        let mut initial_state = if control == 3 {
+            state_values
+        } else {
+            clover_state_transpose(&state_values)
+        };
+        initial_state.extend([guard; 64]);
+        let mut initial_history = match carry {
+            Some(previous) => previous
+                .get("history")
+                .context("missing committed history")?
+                .clone(),
+            None => f32s("history")?,
+        };
+        initial_history.extend([guard; 64]);
+        let mut state = stream.clone_htod(&initial_state)?;
+        let mut history = stream.clone_htod(&initial_history)?;
+        let words = rows as usize * 4096;
+        let canary = bf16::from_bits(0x7fc1);
+        let output = stream.clone_htod(&vec![canary; words + 64])?;
+        let normalized = stream.clone_htod(&vec![canary; words + 64])?;
+        let norm_input = stream.clone_htod(
+            &f32s("bf.core")?
+                .into_iter()
+                .map(bf16::from_f32)
+                .collect::<Vec<_>>(),
+        )?;
+        let norm_isolated = stream.clone_htod(&vec![canary; words + 64])?;
+        let root =
+            serde_json::from_str(include_str!("../../../tests/fixtures/clover_config.json"))?;
+        let model = crate::model_spec::ModelSpec::clover(
+            &root,
+            &serde_json::json!({"eos_token_id": 248044}),
+        )?;
+        let spec = GdnSpec::from_model(&model)?;
+        let workspace = GdnWorkspace::new(&spec, rows, false)?;
+        let scratch = stream.clone_htod(&vec![0xa5u8; workspace.bytes as usize + 256])?;
+        let scalar = |value| view(value, stream, 0, [32], [1]);
+        let mode = if preview {
+            GdnBlockMode::Preview {
+                state: view(&state, stream, 0, [32, 128, 128], [16384, 128, 1])?,
+                history: view(&history, stream, 0, [8192, 3], [3, 1])?,
+                right: view(&right, stream, 0, [8192, 3], [3, 1])?,
+                softmax: [scalar(&scale)?, scalar(&bias)?, scalar(&history_c)?],
+            }
+        } else {
+            GdnBlockMode::Commit {
+                state: TensorMut(view(&state, stream, 0, [32, 128, 128], [16384, 128, 1])?),
+                history: TensorMut(view(&history, stream, 0, [8192, 3], [3, 1])?),
+                b: view(
+                    b.as_ref().context("missing commit beta")?,
+                    stream,
+                    0,
+                    [rows, 32],
+                    [32, 1],
+                )?,
+            }
+        };
+        let plan = GdnBlockPlan::prepare(
+            &device.ctx,
+            spec,
+            GdnBlockBindings {
+                qkv: view(&qkv, stream, 0, [rows, 8192], [8192, 1])?,
+                a: view(&a, stream, 0, [rows, 32], [32, 1])?,
+                conv_weight: view(&w, stream, 0, [8192, 4], [4, 1])?,
+                decay: [scalar(&a_log)?, scalar(&dt)?],
+                valid: view(&valid, stream, 0, [rows], [1])?,
+                output: TensorMut(view(&output, stream, 0, [rows, 32, 128], [4096, 128, 1])?),
+            },
+            mode,
+            Scratch {
+                ptr: scratch.device_ptr(stream).0,
+                bytes: workspace.bytes,
+            },
+        )?;
+        if control == 0 && rows == 32 {
+            use sys::CUfunction_attribute as F;
+            for (index, (kernel, config)) in plan.kernels.iter().zip(&plan.configs).enumerate() {
+                println!(
+                    "GDN_BLOCK_RESOURCE tag={tag} stage={index} registers={} local_bytes={} static_shared={} dynamic_shared={} resident_blocks={}",
+                    kernel.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?,
+                    kernel.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?,
+                    kernel.get_attribute(F::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?,
+                    config.shared_mem_bytes,
+                    kernel.occupancy_max_active_blocks_per_multiprocessor(
+                        config.block_dim.0,
+                        config.shared_mem_bytes as usize,
+                        None
+                    )?
+                );
+            }
+        }
+        let metadata = stream.clone_htod(&[0i32, rows as i32, rows as i32, 128, 1, 0, 0, 0])?;
+        let domain = RowDomain {
+            meta: SeqRef {
+                ptr: metadata.device_ptr(stream).0,
+            },
+            row_base: 0,
+            row_capacity: rows,
+        };
+        let common = CommonOpsRef::new(&device.ctx)?;
+        let norm_pairs = [(&output, &normalized), (&norm_input, &norm_isolated)]
+            .into_iter()
+            .map(|(input, destination)| -> Result<_> {
+                Ok((
+                    view(input, stream, 0, [rows, 32, 128], [4096, 128, 1])?,
+                    view(destination, stream, 0, [rows, 32, 128], [4096, 128, 1])?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let norm_weight = view(&norm_weight, stream, 0, [128], [1])?;
+        let norm_gate = view(&z, stream, 0, [rows, 32, 128], [4096, 128, 1])?;
+        let execute = || -> Result<()> {
+            plan.run(stream)?;
+            for &(input, destination) in &norm_pairs {
+                common.norm.rms_gated(
+                    stream,
+                    domain,
+                    GatedRmsInput {
+                        x: input,
+                        weight: norm_weight,
+                        gate: norm_gate,
+                        mode: if control == 4 {
+                            GatedRmsMode::SiluBf16
+                        } else {
+                            GatedRmsMode::SiluF32
+                        },
+                    },
+                    &mut TensorMut(destination),
+                    1e-6,
+                )?;
+            }
+            Ok(())
+        };
+        let mut result = std::collections::BTreeMap::new();
+        let mut structural_defects = 0;
+        for graph in [false, true] {
+            stream.memcpy_htod(&initial_state, &mut state)?;
+            stream.memcpy_htod(&initial_history, &mut history)?;
+            if graph {
+                stream
+                    .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+                let launched = execute();
+                let captured = stream.end_capture(sys::CUgraphInstantiate_flags(0));
+                launched?;
+                captured?
+                    .context("Runner FAIL empty block graph")?
+                    .launch()?;
+            } else {
+                execute()?;
+            }
+            stream
+                .synchronize()
+                .context("Runner FAIL GDN block launch")?;
+            let got_output = stream.clone_dtoh(&output)?;
+            let got_norm = stream.clone_dtoh(&normalized)?;
+            let got_isolated = stream.clone_dtoh(&norm_isolated)?;
+            let isolated_guard = got_isolated[words..]
+                .iter()
+                .all(|v| v.to_bits() == canary.to_bits());
+            let got_state = stream.clone_dtoh(&state)?;
+            let got_history = stream.clone_dtoh(&history)?;
+            let got_scratch = stream.clone_dtoh(&scratch)?;
+            let guards = isolated_guard
+                && got_output[words..]
+                    .iter()
+                    .chain(&got_norm[words..])
+                    .all(|v| v.to_bits() == canary.to_bits())
+                && got_state[32 * 16384..]
+                    .iter()
+                    .chain(&got_history[8192 * 3..])
+                    .all(|v| v.to_bits() == guard.to_bits())
+                && got_scratch[workspace.bytes as usize..]
+                    .iter()
+                    .all(|v| *v == 0xa5);
+            structural_defects += usize::from(!guards);
+            if preview {
+                let immutable = got_state
+                    .iter()
+                    .zip(&initial_state)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+                    && got_history
+                        .iter()
+                        .zip(&initial_history)
+                        .all(|(a, b)| a.to_bits() == b.to_bits());
+                structural_defects += usize::from(!immutable);
+                println!("CLOVER_GDN_CACHE tag={tag} graph={graph} immutable={immutable}");
+            }
+            let conv_start = workspace.conv_out.offset as usize;
+            let conv_bytes = &got_scratch[conv_start..conv_start + rows as usize * 8192 * 2];
+            for (name, values) in [
+                (
+                    "conv",
+                    conv_bytes
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|v| bf16::from_bits(u16::from_le_bytes(*v)).to_f32())
+                        .collect(),
+                ),
+                (
+                    "core",
+                    got_output[..words].iter().map(|v| v.to_f32()).collect(),
+                ),
+                (
+                    "norm",
+                    got_norm[..words].iter().map(|v| v.to_f32()).collect(),
+                ),
+                ("state", clover_state_transpose(&got_state[..32 * 16384])),
+                (
+                    "norm_isolated",
+                    got_isolated[..words].iter().map(|v| v.to_f32()).collect(),
+                ),
+                ("history", got_history[..8192 * 3].to_vec()),
+            ] {
+                let values: Vec<f32> = values;
+                ensure!(
+                    values.iter().all(|v| v.is_finite()),
+                    "Runner FAIL nonfinite {tag} {name}"
+                );
+                if graph {
+                    let eager: &Vec<f32> = result.get(name).context("missing eager result")?;
+                    let identical = values
+                        .iter()
+                        .zip(eager)
+                        .all(|(a, b)| a.to_bits() == b.to_bits());
+                    structural_defects += usize::from(!identical);
+                    println!("CLOVER_GDN_GRAPH tag={tag} metric={name} identical={identical}");
+                } else {
+                    result.insert(name.to_owned(), values);
+                }
+            }
+        }
+        if control == 5 {
+            ensure!(
+                !preview && valid_values.iter().all(|v| *v == 1),
+                "rounding control requires all-valid commit"
+            );
+            stream.memcpy_htod(&initial_history, &mut history)?;
+            let old = cubin::module(&device.ctx, "gdn/gdn_conv_h32")?.load_function("gdn_conv")?;
+            unsafe {
+                stream
+                    .launch_builder(&old)
+                    .arg(&qkv.device_ptr(stream).0)
+                    .arg(&w.device_ptr(stream).0)
+                    .arg(&history.device_ptr(stream).0)
+                    .arg(&(scratch.device_ptr(stream).0 + workspace.conv_out.offset))
+                    .arg(&metadata.device_ptr(stream).0)
+                    .arg(&8192i32)
+                    .launch(LaunchConfig {
+                        grid_dim: (32, 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+            let bytes = stream.clone_dtoh(&scratch)?;
+            let start = workspace.conv_out.offset as usize;
+            result.insert(
+                "conv".into(),
+                bytes[start..start + rows as usize * 8192 * 2]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|v| bf16::from_bits(u16::from_le_bytes(*v)).to_f32())
+                    .collect(),
+            );
+        }
+        println!("CLOVER_GDN_STRUCTURE tag={tag} control={control} defects={structural_defects}");
+        Ok((result, structural_defects))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn clover_rounding_outside(values: &[f32], reference: &[f32]) -> Result<usize> {
+        ensure!(
+            values.len() == reference.len(),
+            "Runner FAIL rounding extent"
+        );
+        let rank = |value: f32| {
+            let bits = bf16::from_f32(value).to_bits();
+            if bits & 0x8000 != 0 {
+                0x8000i32 - i32::from(bits & 0x7fff)
+            } else {
+                0x8000i32 + i32::from(bits)
+            }
+        };
+        let mut outside = 0;
+        for (&a, &b) in values.iter().zip(reference) {
+            ensure!(
+                a.is_finite() && b.is_finite(),
+                "Runner FAIL rounding nonfinite"
+            );
+            outside += usize::from((rank(a) - rank(b)).abs() > 1);
+        }
+        Ok(outside)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn clover_score(
+        values: &[f32],
+        reference: &[f32],
+        bound: &serde_json::Value,
+    ) -> Result<(bool, f64, f64)> {
+        ensure!(
+            values.len() == reference.len(),
+            "Runner FAIL comparison extent"
+        );
+        let mut max_abs = 0.0f64;
+        let mut squared = 0.0;
+        let mut norm = 0.0;
+        for (&value, &reference) in values.iter().zip(reference) {
+            ensure!(
+                value.is_finite() && reference.is_finite(),
+                "Runner FAIL comparison nonfinite"
+            );
+            let delta = f64::from(value) - f64::from(reference);
+            max_abs = max_abs.max(delta.abs());
+            squared += delta * delta;
+            norm += f64::from(reference).powi(2);
+        }
+        let relative_l2 = squared.sqrt() / norm.sqrt().max(1e-30);
+        let passed = max_abs
+            <= bound["max_abs"]
+                .as_f64()
+                .context("missing frozen max_abs")?
+            && relative_l2
+                <= bound["relative_l2"]
+                    .as_f64()
+                    .context("missing frozen relative_l2")?;
+        Ok((passed, max_abs, relative_l2))
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
+    #[ignore = "GPU window; FF_CLOVER_REFERENCE must name a create-exclusive frozen reference"]
+    fn clover_gdn_real_weight_preview_commit_gpu() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let root = std::path::PathBuf::from(
+            std::env::var_os("FF_CLOVER_REFERENCE").context("FF_CLOVER_REFERENCE missing")?,
+        );
+        let table: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("thresholds.json"))?)?;
+        ensure!(
+            table["revision"] == "4b0402b65e523d0183a14c431955438714cb16ff"
+                && table["schema_keys"] == 813,
+            "Runner FAIL reference revision/schema"
+        );
+        let bytes = std::fs::read(root.join("gdn.safetensors"))?;
+        let archive = safetensors::SafeTensors::deserialize(&bytes)?;
+        let cases = table["cases"]
+            .as_array()
+            .context("Runner FAIL reference cases")?;
+        ensure!(cases.len() == 16, "Runner FAIL reference case count");
+        let device = crate::backend::cuda::Device::new(0)?;
+        let mut defects = 0;
+        let mut continuation = None;
+        for case in cases {
+            let tag = case["tag"].as_str().context("missing case tag")?;
+            let carry = if tag == "case7.commit" {
+                Some(
+                    continuation
+                        .as_ref()
+                        .context("missing first committed block")?,
+                )
+            } else {
+                None
+            };
+            let (result, structural) = clover_block_fixture(&device, &archive, case, 0, carry)?;
+            defects += structural;
+            if tag == "case5.commit" {
+                continuation = Some(result.clone());
+            }
+            for (name, values) in result {
+                if name == "conv" || name == "norm_isolated" {
+                    let reference_name = if name == "norm_isolated" {
+                        "norm"
+                    } else {
+                        "conv"
+                    };
+                    let reference =
+                        clover_fixture_f32(&archive, &format!("{tag}.bf.{reference_name}"))?;
+                    let outside = clover_rounding_outside(&values, &reference)?;
+                    defects += usize::from(outside != 0);
+                    println!(
+                        "CLOVER_GDN_ROUNDING {} tag={tag} metric={name} outside_one_bf16_ulp={outside}",
+                        if outside == 0 { "PASS" } else { "DEFECT" }
+                    );
+                    if name == "norm_isolated" {
+                        continue;
+                    }
+                }
+                let reference = clover_fixture_f32(&archive, &format!("{tag}.fp.{name}"))?;
+                let (passed, max_abs, relative_l2) =
+                    clover_score(&values, &reference, &case["bounds"][&name])?;
+                defects += usize::from(!passed);
+                println!(
+                    "CLOVER_GDN {} tag={tag} metric={name} max_abs={max_abs:.9e} relative_l2={relative_l2:.9e} bound={}",
+                    if passed { "PASS" } else { "DEFECT" },
+                    case["bounds"][&name]
+                );
+            }
+        }
+        let mut detected = 0;
+        for (tag, control, metric) in [
+            ("case0.preview", 1, "core"),
+            ("case4.preview", 2, "core"),
+            ("case4.preview", 3, "core"),
+            ("case5.commit", 4, "norm_isolated"),
+            ("case5.commit", 5, "conv"),
+        ] {
+            let case = cases
+                .iter()
+                .find(|case| case["tag"] == tag)
+                .context("missing control case")?;
+            let (result, structural) =
+                clover_block_fixture(&device, &archive, case, control, None)?;
+            defects += structural;
+            if control >= 4 {
+                let reference_name = if control == 4 { "norm" } else { "conv" };
+                let reference =
+                    clover_fixture_f32(&archive, &format!("{tag}.bf.{reference_name}"))?;
+                let outside = clover_rounding_outside(&result[metric], &reference)?;
+                detected += usize::from(outside > 0);
+                println!(
+                    "CLOVER_GDN_CONTROL tag={tag} control={control} metric={metric} detected={} outside_one_bf16_ulp={outside}",
+                    outside > 0
+                );
+                continue;
+            }
+            let reference = clover_fixture_f32(&archive, &format!("{tag}.fp.{metric}"))?;
+            let (passed, max_abs, relative_l2) =
+                clover_score(&result[metric], &reference, &case["bounds"][metric])?;
+            detected += usize::from(!passed);
+            println!(
+                "CLOVER_GDN_CONTROL tag={tag} control={control} metric={metric} detected={} max_abs={max_abs:.9e} relative_l2={relative_l2:.9e}",
+                !passed
+            );
+        }
+        println!(
+            "CLOVER_GDN {} cases={} graph_eager=true guards=true controls={detected}/5 defects={defects}",
+            if defects == 0 && detected == 5 {
+                "PASS"
+            } else {
+                "DEFECT"
+            },
+            cases.len()
+        );
+        ensure!(
+            defects == 0 && detected == 5,
+            "Clover GDN defects={defects} controls={detected}/5"
+        );
+        Ok(())
+    }
 
     enum GeometryDecay {
         Bf16(

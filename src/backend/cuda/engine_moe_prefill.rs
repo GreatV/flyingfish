@@ -2472,14 +2472,14 @@ impl Cpu {
                         row: self.row_map[row],
                         choice: index as u32,
                         expert: compact,
-                        weight: weights[choice],
+                        weight: weights[choice].to_f32(),
                     });
                 } else {
                     self.disk.push(crate::experts::runtime::Route {
                         row: self.row_map[row],
                         choice: index as u32,
                         expert,
-                        weight: weights[choice],
+                        weight: weights[choice].to_f32(),
                     });
                 }
             }
@@ -2795,7 +2795,7 @@ impl Gpu {
                     reader_event: Some(&ticket.event),
                     x: span.hidden(&span.layout.normalized, base, rows)?,
                     ids: span.choices(&span.layout.ids, base, rows)?,
-                    weights: span.choices(&span.layout.weights, base, rows)?,
+                    weights: span.choices::<bf16>(&span.layout.weights, base, rows)?,
                     active: span.choices(&span.layout.active, base, rows)?,
                     assignment_gen: None,
                     slots_gate_up: tables.gate_up,
@@ -3193,7 +3193,7 @@ mod tests {
                     row: row as u32,
                     choice: row as u32,
                     expert: 0,
-                    weight,
+                    weight: weight.to_f32(),
                 })
                 .collect();
             let routes: Vec<_> = assignments
@@ -3433,7 +3433,7 @@ mod tests {
                             arena: &native,
                             weights: &weights[0],
                             hidden: &x[row * hidden..(row + 1) * hidden],
-                            routing: bf16::ONE,
+                            routing: 1.0,
 
                             rounding: crate::model_spec::SwigluRounding::Twice,
                             limit: 0.0,
@@ -4229,7 +4229,7 @@ mod tests {
                             slot: &native_slot,
                             slot_layout,
                             hidden,
-                            routing: weight,
+                            routing: weight.to_f32(),
 
                             rounding: crate::model_spec::SwigluRounding::Twice,
                             limit: 0.0,
@@ -4247,7 +4247,7 @@ mod tests {
                             arena: &arena,
                             weights: &native,
                             hidden,
-                            routing: weight,
+                            routing: weight.to_f32(),
 
                             rounding: crate::model_spec::SwigluRounding::Twice,
                             limit: 0.0,

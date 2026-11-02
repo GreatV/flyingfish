@@ -1499,3 +1499,174 @@ fn moe_route_prefill_gpu() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+#[ignore = "GPU window; frozen Clover MoE reference required"]
+fn clover_block_coreset_f32_gpu() -> anyhow::Result<()> {
+    use super::reference::CloverMoeFixture;
+    use super::route::{BlockRouteBindings, BlockRoutePlan};
+    use crate::backend::cuda::contracts::Scratch;
+    use crate::backend::gpu::DevicePtr;
+    use anyhow::{Context, ensure};
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    let fixture = CloverMoeFixture::open()?;
+    let device = crate::backend::cuda::Device::new(0)?;
+    let stream = &device.stream;
+    #[cfg(feature = "cuda")]
+    {
+        use cudarc::driver::sys::CUfunction_attribute as F;
+        for (module, name) in [
+            ("moe_route", "moe_route_topk_mass"),
+            ("moe_route", "moe_route_mass_coreset"),
+            ("moe_route", "moe_route_topk_masked_f32"),
+            ("moe_prefill", "moe_scatter_route_f32"),
+        ] {
+            let kernel =
+                crate::backend::cuda::cubin::module(&device.ctx, module)?.load_function(name)?;
+            println!(
+                "CLOVER_ROUTE_RESOURCE name={name} registers={} local_bytes={} static_shared={} resident_blocks={}",
+                kernel.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?,
+                kernel.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?,
+                kernel.shared_size_bytes()?,
+                kernel.occupancy_max_active_blocks_per_multiprocessor(256, 0, None)?
+            );
+        }
+    }
+    let mut defects = 0;
+    let mut controls = 0;
+    for case in fixture.table["route_cases"]
+        .as_array()
+        .context("route cases missing")?
+    {
+        let tag = case["tag"].as_str().context("route tag missing")?;
+        let rows = case["rows"].as_u64().context("rows missing")? as u32;
+        let top_p = case["top_p"].as_f64().map(|v| v as f32);
+        let logits = stream.clone_htod(&fixture.bf16(&format!("{tag}.logits"))?)?;
+        let expected_ids = fixture.values(&format!("{tag}.ids"))?;
+        let expected_weights = fixture.values(&format!("{tag}.weights"))?;
+        let expected_allowed = fixture.values(&format!("{tag}.allowed"))?;
+        let validity: Vec<i32> = fixture
+            .values(&format!("{tag}.valid"))?
+            .into_iter()
+            .map(|v| v as i32)
+            .collect();
+        let mut valid = stream.clone_htod(&validity)?;
+        let ids = stream.clone_htod(&vec![-991i32; rows as usize * 8 + 64])?;
+        let weights = stream.clone_htod(&vec![-991f32; rows as usize * 8 + 64])?;
+        let allowed = stream.clone_htod(&vec![991u32; 256 + 64])?;
+        let workspace = stream.clone_htod(&vec![0xa5u8; rows as usize * 256 * 4 + 256])?;
+        let plan = BlockRoutePlan::prepare(
+            &device.ctx,
+            BlockRouteBindings {
+                logits: super::testing::dense(&logits, stream, rows, 256)?,
+                valid: super::testing::view(&valid, stream, [rows], [1])?,
+                ids: super::testing::dense_mut(&ids, stream, rows, 8)?,
+                weights: super::testing::dense_mut(&weights, stream, rows, 8)?,
+                allowed: super::testing::mut_view(&allowed, stream, [256], [1])?,
+            },
+            Scratch {
+                ptr: workspace.device_ptr(stream).0,
+                bytes: (rows as u64) * 256 * 4,
+            },
+            top_p,
+        )?;
+        plan.run(stream)?;
+        let eager = (
+            stream.clone_dtoh(&ids)?,
+            stream.clone_dtoh(&weights)?,
+            stream.clone_dtoh(&allowed)?,
+        );
+        let graph = super::testing::capture(stream, || plan.run(stream))?;
+        graph.launch()?;
+        let got = (
+            stream.clone_dtoh(&ids)?,
+            stream.clone_dtoh(&weights)?,
+            stream.clone_dtoh(&allowed)?,
+        );
+        let count = rows as usize * 8;
+        ensure!(
+            got.1[..count].iter().all(|v| v.is_finite()),
+            "Runner FAIL nonfinite route {tag}"
+        );
+        let exact = got.0 == eager.0
+            && got.2 == eager.2
+            && got
+                .1
+                .iter()
+                .zip(&eager.1)
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+        let guards = got.0[count..].iter().all(|v| *v == -991)
+            && got.1[count..].iter().all(|v| *v == -991.0)
+            && got.2[256..].iter().all(|v| *v == 991)
+            && stream.clone_dtoh(&workspace)?[rows as usize * 1024..]
+                .iter()
+                .all(|v| *v == 0xa5);
+        let id_bad = got.0[..count]
+            .iter()
+            .zip(&expected_ids)
+            .filter(|(a, b)| **a != **b as i32)
+            .count();
+        let allowed_bad = got.2[..256]
+            .iter()
+            .zip(&expected_allowed)
+            .filter(|(a, b)| **a != **b as u32)
+            .count();
+        let atol = fixture.table["route_atol"].as_f64().context("route atol")?;
+        let rtol = fixture.table["route_rtol"].as_f64().context("route rtol")?;
+        let weight_bad = got.1[..count]
+            .iter()
+            .zip(&expected_weights)
+            .filter(|(a, b)| f64::from((**a - **b).abs()) > atol + rtol * f64::from(b.abs()))
+            .count();
+        let zero_bad = got.1[..count]
+            .iter()
+            .zip(&expected_weights)
+            .filter(|(a, b)| **b == 0.0 && **a != 0.0)
+            .count();
+        let pass =
+            exact && guards && id_bad == 0 && allowed_bad == 0 && weight_bad == 0 && zero_bad == 0;
+        defects += usize::from(!pass);
+        println!(
+            "CLOVER_CORESET {} tag={tag} ids_bad={id_bad} allowed_bad={allowed_bad} weights_bad={weight_bad} zero_bad={zero_bad} graph={exact} guards={guards}",
+            if pass { "PASS" } else { "DEFECT" }
+        );
+        if tag == "resolved" {
+            let mut unresolved_only = validity.clone();
+            unresolved_only[..16].fill(0);
+            stream.memcpy_htod(&unresolved_only, &mut valid)?;
+            plan.run(stream)?;
+            let mutant = stream.clone_dtoh(&allowed)?;
+            let detected = mutant[..256] != got.2[..256];
+            controls += usize::from(detected);
+            println!("CLOVER_CORESET_CONTROL unresolved_only detected={detected}");
+        }
+        if tag == "crossing" {
+            let bad = expected_weights
+                .iter()
+                .filter(|w| {
+                    f64::from((bf16::from_f32(**w).to_f32() - **w).abs())
+                        > atol + rtol * f64::from(w.abs())
+                })
+                .count();
+            controls += usize::from(bad > 0);
+            println!("CLOVER_CORESET_CONTROL bf16_route_cast outside={bad}");
+        }
+    }
+    println!(
+        "CLOVER_CORESET {} cases={} controls={controls}/2 defects={defects}",
+        if defects == 0 && controls == 2 {
+            "PASS"
+        } else {
+            "DEFECT"
+        },
+        fixture.table["route_cases"].as_array().unwrap().len()
+    );
+    ensure!(
+        defects == 0 && controls == 2,
+        "Clover coreset defects={defects} controls={controls}"
+    );
+    Ok(())
+}

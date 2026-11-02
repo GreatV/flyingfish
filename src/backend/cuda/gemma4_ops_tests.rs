@@ -3197,6 +3197,7 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
         spec_graph: true,
         draft_model: None,
         prefix_cache: false,
+        device_budget_gib: None,
         kv_format: crate::kv::KvFormat::Bf16,
         runtime_dir: Some(std::path::PathBuf::from(
             std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime directory missing")?,
@@ -3483,6 +3484,7 @@ fn audio_model_definition_and_graph_gpu() -> Result<()> {
         draft_model: None,
         prefix_cache: false,
         kv_format: crate::kv::KvFormat::Bf16,
+        device_budget_gib: None,
         runtime_dir: Some(std::path::PathBuf::from(
             std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime missing")?,
         )),
@@ -4226,6 +4228,7 @@ fn embedding_gemma2_media_matches_frozen_reference() -> Result<()> {
             draft_model: None,
             prefix_cache: false,
             kv_format: crate::kv::KvFormat::Bf16,
+            device_budget_gib: None,
             runtime_dir: Some(std::path::PathBuf::from(
                 std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR")?,
             )),
@@ -4462,6 +4465,7 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         draft_model: None,
         prefix_cache: false,
         kv_format: crate::kv::KvFormat::Bf16,
+        device_budget_gib: None,
         runtime_dir: Some(std::path::PathBuf::from(
             std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR missing")?,
         )),

@@ -981,6 +981,7 @@ fn q38_mtp_snapshot_teacher_forcing_gpu() -> Result<()> {
         backend: crate::backend::Settings {
             runtime_dir: Some(runtime),
             prefix_cache: false,
+            device_budget_gib: None,
             kv_format: crate::kv::KvFormat::Bf16,
             tree_builder: crate::backend::TreeBuilder::Waves,
             spec_budget: crate::backend::SpecBudget::Chain,
@@ -1121,6 +1122,7 @@ fn q38_mtp_snapshot_measure_gpu() -> Result<()> {
         backend: crate::backend::Settings {
             runtime_dir: Some(runtime),
             prefix_cache: false,
+            device_budget_gib: None,
             kv_format: crate::kv::KvFormat::Bf16,
             tree_builder: crate::backend::TreeBuilder::Waves,
             spec_budget: crate::backend::SpecBudget::Chain,

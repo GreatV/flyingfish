@@ -1,5 +1,46 @@
 #include "gpu_compat.cuh"
 
+extern "C" __global__ void rotary_prefix_kv(__nv_bfloat16* q,
+    const __nv_bfloat16* key, const __nv_bfloat16* value,
+    __nv_bfloat16* k, __nv_bfloat16* v, const __nv_bfloat16* table,
+    int start, int rows, int q_heads, int kv_heads, int dim, int rotary,
+    int capacity) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int heads = q_heads + kv_heads;
+    if (i >= rows * heads * dim) return;
+    const int d = i % dim;
+    const int head = (i / dim) % heads;
+    const int row = i / (heads * dim);
+    const int position = start + row;
+    if (position < 0 || position >= capacity) { __trap(); return; }
+    const bool query = head < q_heads;
+    const int h = query ? head : head - q_heads;
+    const size_t src = ((size_t)row * (query ? q_heads : kv_heads) + h) * dim;
+    const size_t dst = ((size_t)h * capacity + position) * dim;
+    if (!query) v[dst + d] = value[src + d];
+    if (d >= rotary) {
+        if (!query) k[dst + d] = key[src + d];
+        return;
+    }
+    const int half = rotary / 2;
+    if (d >= half) return;
+    const __nv_bfloat16* input = query ? q : key;
+    const __nv_bfloat16 a = input[src + d];
+    const __nv_bfloat16 b = input[src + d + half];
+    const __nv_bfloat16 c = table[(size_t)position * rotary + d];
+    const __nv_bfloat16 s = table[(size_t)position * rotary + d + half];
+#if defined(__HIP__)
+    const __nv_bfloat16 lo = __hsub_rn(__hmul_rn(a, c), __hmul_rn(b, s));
+    const __nv_bfloat16 hi = __hadd_rn(__hmul_rn(b, c), __hmul_rn(a, s));
+#else
+    const __nv_bfloat16 lo = __hsub(__hmul(a, c), __hmul(b, s));
+    const __nv_bfloat16 hi = __hadd(__hmul(b, c), __hmul(a, s));
+#endif
+    __nv_bfloat16* output = query ? q + src : k + dst;
+    output[d] = lo;
+    output[d + half] = hi;
+}
+
 extern "C" __global__ void rope_table_kv(__nv_bfloat16* qkvg,
     __nv_bfloat16* k, __nv_bfloat16* v, const __nv_bfloat16* table,
     const int* start, int rows, int q_heads, int kv_heads, int dim,

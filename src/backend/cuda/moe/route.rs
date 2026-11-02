@@ -15,6 +15,175 @@ use cudarc::cublas::{CudaBlas, sys as bs};
 use half::bf16;
 use std::{any::TypeId, sync::Arc};
 
+pub struct BlockRouteBindings {
+    pub logits: Tensor<bf16, 2>,
+    pub valid: Tensor<i32, 1>,
+    pub ids: TensorMut<i32, 2>,
+    pub weights: TensorMut<f32, 2>,
+    pub allowed: TensorMut<u32, 1>,
+}
+
+pub struct BlockRoutePlan {
+    bindings: BlockRouteBindings,
+    scratch: crate::backend::cuda::contracts::Scratch,
+    kernels: [CudaFunction; 3],
+    rows: i32,
+    experts: i32,
+    top_k: i32,
+    top_p: Option<f32>,
+}
+
+impl BlockRoutePlan {
+    pub(crate) fn causal_rows(&self, ctx: &Arc<CudaContext>, rows: u32) -> Result<Self> {
+        ensure!(
+            self.top_p.is_none() && rows > 0 && rows <= self.rows as u32,
+            "causal route row extent"
+        );
+        let mut logits = self.bindings.logits;
+        let mut valid = self.bindings.valid;
+        let mut ids = self.bindings.ids.0;
+        let mut weights = self.bindings.weights.0;
+        logits.shape[0] = rows;
+        valid.shape[0] = rows;
+        ids.shape[0] = rows;
+        weights.shape[0] = rows;
+        Self::prepare(
+            ctx,
+            BlockRouteBindings {
+                logits,
+                valid,
+                ids: TensorMut(ids),
+                weights: TensorMut(weights),
+                allowed: TensorMut(self.bindings.allowed.0),
+            },
+            crate::backend::cuda::contracts::Scratch {
+                ptr: self.scratch.ptr,
+                bytes: self.scratch.bytes,
+            },
+            None,
+        )
+    }
+
+    pub fn prepare(
+        ctx: &Arc<CudaContext>,
+        bindings: BlockRouteBindings,
+        scratch: crate::backend::cuda::contracts::Scratch,
+        top_p: Option<f32>,
+    ) -> Result<Self> {
+        let b = &bindings;
+        b.logits.validate()?;
+        b.valid.validate()?;
+        b.ids.0.validate()?;
+        b.weights.0.validate()?;
+        b.allowed.0.validate()?;
+        let [rows, experts] = b.logits.shape;
+        let top_k = b.ids.0.shape[1];
+        ensure!(
+            rows > 0 && rows <= 32 && (32..=1024).contains(&experts) && experts.is_power_of_two(),
+            "block router requires 1..32 rows and a power-of-two expert count in 32..1024"
+        );
+        ensure!(
+            (1..=32).contains(&top_k) && top_k < experts,
+            "invalid block router top-k"
+        );
+        ensure!(
+            b.logits.stride == [u64::from(experts), 1]
+                && b.valid.shape == [rows]
+                && b.valid.stride == [1]
+                && b.ids.0.shape == [rows, top_k]
+                && b.ids.0.stride == [u64::from(top_k), 1]
+                && b.weights.0.shape == [rows, top_k]
+                && b.weights.0.stride == [u64::from(top_k), 1]
+                && b.allowed.0.shape == [experts]
+                && b.allowed.0.stride == [1],
+            "block router layout mismatch"
+        );
+        ensure!(
+            top_p.is_none_or(|p| p.is_finite() && p > 0.0 && p <= 1.0),
+            "invalid coreset probability"
+        );
+        scratch.validate(u64::from(rows) * u64::from(experts) * 4)?;
+        let reads = [
+            (b.logits.ptr, b.logits.span_bytes),
+            (b.valid.ptr, b.valid.span_bytes),
+        ];
+        let writes = [
+            (b.ids.0.ptr, b.ids.0.span_bytes),
+            (b.weights.0.ptr, b.weights.0.span_bytes),
+            (b.allowed.0.ptr, b.allowed.0.span_bytes),
+            (scratch.ptr, scratch.bytes),
+        ];
+        for (index, &(ptr, bytes)) in writes.iter().enumerate() {
+            for &(other, extent) in reads.iter().chain(&writes[..index]) {
+                ensure!(
+                    crate::backend::cuda::contracts::spans_disjoint(ptr, bytes, other, extent)?,
+                    "overlapping block route bindings"
+                );
+            }
+        }
+        let module = cubin::module(ctx, "moe_route")?;
+        let kernels = [
+            module.load_function("moe_route_topk_mass")?,
+            module.load_function("moe_route_mass_coreset")?,
+            module.load_function("moe_route_topk_masked_f32")?,
+        ];
+        for kernel in &kernels {
+            ensure!(
+                kernel.occupancy_max_active_blocks_per_multiprocessor(experts, 0, None)? > 0,
+                "block router has zero occupancy"
+            );
+        }
+        Ok(Self {
+            bindings,
+            scratch,
+            kernels,
+            rows: rows as i32,
+            experts: experts as i32,
+            top_k: top_k as i32,
+            top_p,
+        })
+    }
+
+    pub fn run(&self, stream: &Arc<CudaStream>) -> Result<()> {
+        let b = &self.bindings;
+        let row_grid = grid(self.rows as usize, self.experts as u32);
+        unsafe {
+            if let Some(top_p) = self.top_p {
+                stream
+                    .launch_builder(&self.kernels[0])
+                    .arg(&b.logits.ptr)
+                    .arg(&b.valid.ptr)
+                    .arg(&self.scratch.ptr)
+                    .arg(&self.rows)
+                    .arg(&self.experts)
+                    .arg(&self.top_k)
+                    .launch(row_grid)?;
+                stream
+                    .launch_builder(&self.kernels[1])
+                    .arg(&self.scratch.ptr)
+                    .arg(&b.allowed.0.ptr)
+                    .arg(&self.rows)
+                    .arg(&self.experts)
+                    .arg(&top_p)
+                    .launch(grid(1, self.experts as u32))?;
+            }
+            stream
+                .launch_builder(&self.kernels[2])
+                .arg(&b.logits.ptr)
+                .arg(&b.valid.ptr)
+                .arg(&b.allowed.0.ptr)
+                .arg(&b.ids.0.ptr)
+                .arg(&b.weights.0.ptr)
+                .arg(&self.rows)
+                .arg(&self.experts)
+                .arg(&self.top_k)
+                .arg(&i32::from(self.top_p.is_some()))
+                .launch(row_grid)?;
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct RouteOps {
     decode: CudaFunction,
     launch: Vec<(u32, LaunchConfig)>,
@@ -201,7 +370,7 @@ impl RouteOps {
         router: Tensor<bf16, 2>,
         logits: &mut TensorMut<f32, 2>,
     ) -> Result<()> {
-        let (rows, experts, hidden) = self.validate_logits_f32(stream, x, router, logits)?;
+        let (rows, experts, hidden) = self.validate_logits(stream, x, router, logits)?;
         #[cfg(feature = "rocm")]
         unsafe {
             self.blas.bf16_gemm(
@@ -267,15 +436,25 @@ impl RouteOps {
         );
         let plan = validate(&x, &router, &ids.0, &weights.0)?;
         check_logits(&plan, &x, &router, &ids.0, &weights.0, &logits.0)?;
-        let (rows, experts) = (plan.rows, plan.experts);
+        self.logits_bf16(x, router, logits)?;
+        self.topk(stream, &plan, logits, ids, weights, score)
+    }
+
+    pub fn logits_bf16(
+        &self,
+        x: Tensor<bf16, 2>,
+        router: Tensor<bf16, 2>,
+        logits: &mut TensorMut<bf16, 2>,
+    ) -> Result<()> {
+        let (rows, experts, hidden) = self.validate_logits(&self.stream, x, router, logits)?;
         ensure!(
             experts.is_multiple_of(2),
             "route prefill expert count {experts} must be even (cuBLAS BF16 ldc*2 must be a multiple of 4 bytes)"
         );
         ensure!(
-            rows <= i32::MAX as u32 && experts <= i32::MAX as u32 && plan.hidden <= i32::MAX as u32,
+            rows <= i32::MAX as u32 && experts <= i32::MAX as u32 && hidden <= i32::MAX as u32,
             "route prefill GEMM dimensions must fit i32: rows {rows}, experts {experts}, hidden {}",
-            plan.hidden
+            hidden
         );
 
         // opA=T/opB=N: router[H,E] * x[H,rows] -> logits[E,rows], column-major.
@@ -290,14 +469,14 @@ impl RouteOps {
                 bs::cublasOperation_t::CUBLAS_OP_N,
                 experts as i32,
                 rows as i32,
-                plan.hidden as i32,
+                hidden as i32,
                 (&alpha as *const f32).cast(),
                 router.ptr as *const core::ffi::c_void,
                 bs::cudaDataType_t::CUDA_R_16BF,
-                plan.hidden as i32,
+                hidden as i32,
                 x.ptr as *const core::ffi::c_void,
                 bs::cudaDataType_t::CUDA_R_16BF,
-                plan.hidden as i32,
+                hidden as i32,
                 (&beta as *const f32).cast(),
                 logits.0.ptr as *mut core::ffi::c_void,
                 bs::cudaDataType_t::CUDA_R_16BF,
@@ -313,27 +492,27 @@ impl RouteOps {
                 crate::backend::setup::LinearShape {
                     rows: rows as usize,
                     output: experts as usize,
-                    input: plan.hidden as usize,
+                    input: hidden as usize,
                 },
                 [router.ptr, x.ptr, logits.0.ptr],
-                [plan.hidden as usize, plan.hidden as usize, experts as usize],
+                [hidden as usize, hidden as usize, experts as usize],
                 None,
                 false,
             )?;
         }
-        self.topk(stream, &plan, logits, ids, weights, score)
+        Ok(())
     }
 
-    fn validate_logits_f32(
+    fn validate_logits<T: Copy>(
         &self,
         stream: &Arc<CudaStream>,
         x: Tensor<bf16, 2>,
         router: Tensor<bf16, 2>,
-        logits: &TensorMut<f32, 2>,
+        logits: &TensorMut<T, 2>,
     ) -> Result<(u32, u32, u32)> {
         ensure!(
             Arc::ptr_eq(stream, &self.stream),
-            "moe route FP32 logits stream is not the RouteOps construction stream (cuBLAS handle bound at construction)"
+            "moe route logits stream is not the RouteOps construction stream (cuBLAS handle bound at construction)"
         );
         x.validate()?;
         router.validate()?;
@@ -342,7 +521,7 @@ impl RouteOps {
         let experts = router.shape[0];
         ensure!(
             x.stride == [u64::from(hidden), 1] && router.stride == [u64::from(hidden), 1],
-            "FP32 route logits require contiguous x and router rows: x {:?}/{:?}, router {:?}/{:?}",
+            "route logits require contiguous x and router rows: x {:?}/{:?}, router {:?}/{:?}",
             x.shape,
             x.stride,
             router.shape,
@@ -350,13 +529,13 @@ impl RouteOps {
         );
         ensure!(
             router.shape[1] == hidden,
-            "FP32 route logits hidden width mismatch: x {:?}, router {:?}",
+            "route logits hidden width mismatch: x {:?}, router {:?}",
             x.shape,
             router.shape
         );
         ensure!(
             logits.0.shape == [rows, experts] && logits.0.stride == [u64::from(experts), 1],
-            "FP32 route logits must be a dense [rows, experts] view: shape {:?}, stride {:?}, expected [{rows}, {experts}]",
+            "route logits must be a dense [rows, experts] view: shape {:?}, stride {:?}, expected [{rows}, {experts}]",
             logits.0.shape,
             logits.0.stride
         );
@@ -364,7 +543,7 @@ impl RouteOps {
         no_overlap(&router, &logits.0, "router", "logits")?;
         ensure!(
             rows <= i32::MAX as u32 && experts <= i32::MAX as u32 && hidden <= i32::MAX as u32,
-            "FP32 route logits GEMM dimensions must fit i32: rows {rows}, experts {experts}, hidden {hidden}"
+            "route logits GEMM dimensions must fit i32: rows {rows}, experts {experts}, hidden {hidden}"
         );
         Ok((rows, experts, hidden))
     }
@@ -388,7 +567,7 @@ impl RouteOps {
         router: Tensor<bf16, 2>,
         logits: &mut TensorMut<f32, 2>,
     ) -> Result<()> {
-        self.validate_logits_f32(stream, x, router, logits)?;
+        self.validate_logits(stream, x, router, logits)?;
         self.logits_gemm
             .as_ref()
             .context("Lt route logits were not prepared")?

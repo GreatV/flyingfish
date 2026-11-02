@@ -40,6 +40,8 @@ use std::{
 pub(super) mod audio_runtime;
 #[path = "engine_deepseek.rs"]
 pub(crate) mod deepseek;
+#[path = "engine_diffusion.rs"]
+mod diffusion;
 #[path = "engine_moe.rs"]
 mod moe;
 #[path = "engine_mtp.rs"]
@@ -146,6 +148,34 @@ impl MixerWork {
 }
 
 impl Work {
+    fn bytes(&self) -> usize {
+        2 * [
+            &self.x,
+            &self.n,
+            &self.qkv,
+            &self.attn,
+            &self.out,
+            &self.gu,
+            &self.act,
+            &self.logits,
+        ]
+        .into_iter()
+        .map(|v| v.len())
+        .sum::<usize>()
+            + 4 * [
+                self.ids.len(),
+                self.position.len(),
+                self.length.len(),
+                self.token.len(),
+            ]
+            .into_iter()
+            .sum::<usize>()
+            + self
+                .mixer
+                .as_ref()
+                .map_or(0, |m| 2 * (m.q.len() + m.gate.len() + m.ab.len()))
+    }
+
     fn new(
         stream: &Arc<CudaStream>,
         spec: &crate::model_spec::ModelSpec,
@@ -600,11 +630,13 @@ enum LoadDispatch {
     Llama,
     Recurrent,
     Deepseek,
+    Canvas,
 }
 
 fn load_dispatch(architecture: crate::model_spec::Architecture) -> Result<LoadDispatch> {
     use crate::model_spec::Architecture;
     Ok(match architecture {
+        Architecture::Clover => LoadDispatch::Canvas,
         Architecture::Qwen35Text => LoadDispatch::Qwen,
         Architecture::Llama => LoadDispatch::Llama,
         Architecture::MiniCpmV47 => LoadDispatch::Qwen,
@@ -640,6 +672,7 @@ pub struct Engine {
     hidden_capture: Option<HiddenCapture>,
     qwen: Option<qwen::Runtime>,
     recurrent: Option<recurrent::Runtime>,
+    diffusion: Option<diffusion::Runtime>,
     deepseek_mixer: Option<deepseek::DeepseekMixer>,
     deepseek_ffn: Option<deepseek::DeepseekFfn>,
     deepseek_engram: Option<deepseek::DeepseekEngram>,
@@ -1004,6 +1037,16 @@ impl Engine {
         let started = Instant::now();
         let model_spec = crate::model_spec::ModelSpec::read(dir)?;
         match load_dispatch(model_spec.architecture)? {
+            LoadDispatch::Canvas => {
+                return Self::load_clover(
+                    dir,
+                    ordinal,
+                    capacity,
+                    requested_chunk,
+                    settings,
+                    model_spec,
+                );
+            }
             LoadDispatch::Recurrent => {
                 return Self::load_recurrent(
                     dir,
@@ -1174,6 +1217,7 @@ impl Engine {
             deepseek_ffn: None,
             deepseek_engram: None,
             recurrent: None,
+            diffusion: None,
             hc: None,
             glm_dsa: None,
             moe: None,
@@ -3048,6 +3092,9 @@ impl Engine {
             if let Some(recurrent) = self.recurrent.as_mut() {
                 recurrent.reset(&self.device.stream, self.capacity)?;
             }
+            if let Some(diffusion) = self.diffusion.as_mut() {
+                diffusion.reset(&self.device)?;
+            }
             self.reset_qwen_positions()?;
         }
         self.state.reset(&self.device.stream)?;
@@ -3576,6 +3623,10 @@ impl Engine {
         if self.recurrent.is_some() {
             return self.prefill_recurrent(ids, ids.len(), trace, keep);
         }
+        if self.diffusion.is_some() {
+            ensure!(keep == ids.len(), "Clover trace tail is not bound");
+            return self.prefill_diffusion(ids, trace);
+        }
         self.prefill_chunks(ids, trace, keep, |_, _| Ok(()))
     }
 
@@ -3758,6 +3809,10 @@ impl Engine {
     }
 
     pub fn decode(&mut self, graph: bool, trace: Option<(&mut Trace, &str)>) -> Result<u32> {
+        if self.diffusion.is_some() {
+            ensure!(trace.is_none(), "Clover decode trace is not bound");
+            return self.decode_diffusion(graph);
+        }
         self.advance(graph, trace)?;
         let pending_next_token = self.token()?;
         self.pending_token = Some(pending_next_token);
@@ -3850,6 +3905,13 @@ impl Engine {
         if self.model_spec.architecture == crate::model_spec::Architecture::Glm5Next {
             return false;
         }
+        // Clover canvas execution is eager.
+        if matches!(
+            self.model_spec.architecture,
+            crate::model_spec::Architecture::Clover
+        ) {
+            return false;
+        }
         #[cfg(feature = "cuda")]
         if self.deepseek_mixer.is_some() {
             return false;
@@ -3858,6 +3920,10 @@ impl Engine {
     }
 
     pub fn capture(&mut self) -> Result<()> {
+        ensure!(
+            self.model_spec.architecture != crate::model_spec::Architecture::Clover,
+            "Clover canvas graph execution is not bound"
+        );
         ensure!(
             self.model_spec.architecture != crate::model_spec::Architecture::Glm5Next,
             "GLM storage-only expert graph segments are not bound"
@@ -6202,6 +6268,7 @@ fn hip_engine_capture_gpu() -> Result<()> {
         draft_model: None,
         runtime_dir: Some(std::env::var("FLYINGFISH_RUNTIME_DIR")?.into()),
         prefix_cache: false,
+        device_budget_gib: None,
         kv_format: crate::kv::KvFormat::Bf16,
     };
     drop(Engine::calibrate(
@@ -6321,6 +6388,16 @@ impl Engine {
                     model_spec,
                 );
             }
+            LoadDispatch::Canvas => {
+                return Self::load_clover(
+                    dir,
+                    ordinal,
+                    capacity,
+                    requested_chunk,
+                    settings,
+                    model_spec,
+                );
+            }
             LoadDispatch::Recurrent => {
                 return Self::load_recurrent(
                     dir,
@@ -6419,6 +6496,7 @@ impl Engine {
             deepseek_engram: None,
             qwen: None,
             recurrent: None,
+            diffusion: None,
             hc: None,
             glm_dsa: None,
             moe: None,
@@ -6710,6 +6788,7 @@ fn q38_engine_capture_gpu() -> Result<()> {
         draft_model: None,
         runtime_dir: Some(runtime),
         prefix_cache: false,
+        device_budget_gib: None,
         kv_format: crate::kv::KvFormat::Bf16,
     };
     // Calibration/setup returns Frozen before production graph capture for a fixed plan.
