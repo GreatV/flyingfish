@@ -435,6 +435,7 @@ impl AttentionBlockMixer {
             },
             keys: (prefix + rows) as usize,
             prefix: None,
+            image_blocks: None,
         })?;
         let gate = view(
             &self.q_gate.output,

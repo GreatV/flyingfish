@@ -1617,6 +1617,7 @@ fn clover_attention_operands_gpu() -> Result<()> {
                 },
                 keys: 32,
                 prefix: None,
+                image_blocks: None,
             })?;
             let values: Vec<_> = s.clone_dtoh(&output)?.iter().map(|v| v.to_f32()).collect();
             let within = boundary_distance(
