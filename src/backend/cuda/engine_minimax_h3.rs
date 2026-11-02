@@ -2104,12 +2104,61 @@ mod tests {
         let (video0, _) = read("step0.safetensors", "hidden_states")?;
         let (audio0, _) = read("step0.safetensors", "audio_hidden_states")?;
         let (final_video, video_shape) = read("final.safetensors", "latents")?;
-        let (final_audio, _) = read("final.safetensors", "audio_latents")?;
+        let (final_audio, audio_shape) = read("final.safetensors", "audio_latents")?;
         let patch = spec.video_row_width();
+        let geometry = (layout.rows()
+            - layout.condition_video_rows
+            - layout.audio_indices.len()
+            - layout.text_indices.len())
+            * patch;
         ensure!(
-            final_video.len() == video0.len() && final_audio.len() == audio0.len(),
-            "final latents {video_shape:?} are not the packed step-0 rows"
+            video_shape.len() == 5
+                && video_shape[0] == 1
+                && video_shape[1] * spec.patch.iter().product::<usize>() == patch
+                && final_video.len() == geometry
+                && audio_shape.len() == 3
+                && audio_shape[1] == spec.audio_in_channels
+                && final_audio.len() == audio0.len(),
+            "final latents {video_shape:?} {audio_shape:?} do not match the layout"
         );
+        // The reference stores `[1, channels, frames, height, width]` video and `[audio_channels, channels, latents]`
+        // audio; packed rows are frame-major then row-major with columns (channel, patch_h, patch_w), audio rows
+        // channel-major.
+        let (channels, frames, height, width) = (
+            video_shape[1],
+            video_shape[2],
+            video_shape[3],
+            video_shape[4],
+        );
+        let (ph, pw) = (spec.patch[1], spec.patch[2]);
+        let mut final_video_rows = Vec::with_capacity(final_video.len());
+        for frame in 0..frames {
+            for i in 0..height / ph {
+                for j in 0..width / pw {
+                    for c in 0..channels {
+                        for y in 0..ph {
+                            for x in 0..pw {
+                                final_video_rows.push(
+                                    final_video[((c * frames + frame) * height + i * ph + y)
+                                        * width
+                                        + j * pw
+                                        + x],
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let (stereo, latents) = (audio_shape[0], audio_shape[2]);
+        let mut final_audio_rows = Vec::with_capacity(final_audio.len());
+        for ch in 0..stereo {
+            for t in 0..latents {
+                for c in 0..audio_shape[1] {
+                    final_audio_rows.push(final_audio[(ch * audio_shape[1] + c) * latents + t]);
+                }
+            }
+        }
         let text_map = mapped(&capture.join("dit_text_input.safetensors"))?;
         let text_file = SafeTensors::deserialize(&text_map)?;
         let text_host: Vec<bf16> = text_file
@@ -2177,12 +2226,12 @@ mod tests {
                 "non-finite latents"
             );
             ensure!(
-                video[..condition] == final_video[..condition],
+                video[..condition] == video0[..condition],
                 "conditioning rows moved"
             );
             Ok([
-                distance(&video[condition..], &final_video[condition..]),
-                distance(&audio, &final_audio),
+                distance(&video[condition..], &final_video_rows),
+                distance(&audio, &final_audio_rows),
             ])
         };
         let [d_video, d_audio] = chain((&video_grid, &audio_grid))?;
