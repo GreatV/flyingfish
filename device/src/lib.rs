@@ -1028,8 +1028,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d512(p: Attention, scale: f3
             core::ptr::null_mut(),
             1,
             0,
-            core::ptr::null(),
-            0,
+            (core::ptr::null(), 0),
         )
     }
 }
@@ -1051,8 +1050,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d512_bidirectional(
             core::ptr::null_mut(),
             1,
             0,
-            core::ptr::null(),
-            0,
+            (core::ptr::null(), 0),
         )
     }
 }
@@ -1075,8 +1073,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d512_blocks(
             core::ptr::null_mut(),
             1,
             0,
-            blocks,
-            origin,
+            (blocks, origin),
         );
     }
 }
@@ -1093,7 +1090,7 @@ pub unsafe extern "ptx-kernel" fn attention_partial_d512(
 ) {
     unsafe {
         let p = resolve_position(p);
-        attention_d512::<true, 0>(p, 0, scale, partials, parts, chunk, core::ptr::null(), 0)
+        attention_d512::<true, 0>(p, 0, scale, partials, parts, chunk, (core::ptr::null(), 0))
     }
 }
 
@@ -1105,9 +1102,9 @@ unsafe fn attention_d512<const SPLIT: bool, const MODE: u32>(
     partials: *mut f32,
     parts: u32,
     chunk: u32,
-    blocks: *const u32,
-    origin: u32,
+    bounds: (*const u32, u32),
 ) {
+    let (blocks, origin) = bounds;
     unsafe {
         let (tid, tile, head, sm): (u32, u32, u32, u32);
         asm!("mov.u32 {t}, %tid.x; mov.u32 {b}, %ctaid.x; mov.u32 {h}, %ctaid.y; mov.u32 {s}, attention_shared;",
