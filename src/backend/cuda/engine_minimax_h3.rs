@@ -15,7 +15,7 @@ use crate::backend::gpu::{
 use crate::checkpoint::{MappedCheckpoint, TensorEntry, TensorManifest};
 use crate::experts::disk::{AlignedBytes, SpanReader};
 use crate::minimax_h3::{AdalnPlan, H3Spec, MODALITIES, adaln_input};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use half::bf16;
 use safetensors::Dtype;
 use std::{
@@ -1112,6 +1112,27 @@ pub(crate) struct StepInputs<'a> {
     pub row_timesteps: &'a CudaSlice<u32>,
 }
 
+/// Transformer-block placement: `Derived` from the sensed VRAM and host budgets; `Streamed` keeps no block resident
+/// (two device slots, host tier from the sensed host budget, rest disk); `StreamedDisk` streams every block from disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Placement {
+    Derived,
+    Streamed,
+    StreamedDisk,
+}
+
+impl Placement {
+    /// `FF_H3_PLACEMENT` = `derived`, `streamed` or `streamed-disk`.
+    pub(crate) fn from_env() -> Result<Self> {
+        match std::env::var("FF_H3_PLACEMENT").as_deref() {
+            Ok("derived") => Ok(Self::Derived),
+            Ok("streamed") => Ok(Self::Streamed),
+            Ok("streamed-disk") => Ok(Self::StreamedDisk),
+            other => bail!("FF_H3_PLACEMENT must be derived, streamed or streamed-disk: {other:?}"),
+        }
+    }
+}
+
 /// The transformer over one request layout: F32 patch and output projections, BF16 text embedder, norms, refiner
 /// blocks and LoRA factors resident; the 50 transformer blocks' matrices placed by `DensePlacement` from the sensed
 /// VRAM and host budgets (resident, or two device slots fed from pinned host memory or the disk tier).
@@ -1153,6 +1174,7 @@ impl Dit {
         (rank, layout): (usize, &crate::minimax_h3::PackedLayout),
         mut base: Source<'_>,
         mut lora: Source<'_>,
+        placement: Placement,
     ) -> Result<Self> {
         use crate::prefill::DensePlacement;
         let s = &d.stream;
@@ -1247,7 +1269,16 @@ impl Dit {
             .sum::<usize>()
             + spec.layers * 2 * (2 * h + 2 * spec.head_dim);
         let (free, total) = d.ctx.mem_get_info()?;
-        let budget = DensePlacement::device_budget(free, total, owned, 0, 0)?;
+        let mut budget = DensePlacement::device_budget(free, total, owned, 0, 0)?;
+        if placement != Placement::Derived {
+            let slots = 2 * layers
+                .iter()
+                .copied()
+                .max()
+                .context("no transformer blocks")?;
+            ensure!(slots <= budget, "two block slots exceed the device budget");
+            budget = slots;
+        }
         let mut plan = DensePlacement::new(&layers, budget, 0)?;
         let mut host = None;
         if plan.slot_bytes > 0 {
@@ -1259,12 +1290,20 @@ impl Dit {
                 available >= reserved,
                 "dense pinned staging and host reserve exceed available RAM: need={reserved} available={available}"
             );
-            plan = DensePlacement::new(&layers, budget, available - reserved)?;
+            let host_bytes = match placement {
+                Placement::StreamedDisk => 0,
+                Placement::Derived | Placement::Streamed => available - reserved,
+            };
+            plan = DensePlacement::new(&layers, budget, host_bytes)?;
             host = Some(available);
         }
+        ensure!(
+            placement == Placement::Derived || plan.resident_bytes == 0,
+            "{placement:?} placement kept a resident block"
+        );
         eprintln!(
             "{}",
-            serde_json::json!({"h3_dense_placement": &plan, "free_bytes": free, "total_bytes": total, "owned_block_bytes": owned, "host_available_bytes": host})
+            serde_json::json!({"h3_dense_placement": &plan, "mode": format!("{placement:?}"), "free_bytes": free, "total_bytes": total, "owned_block_bytes": owned, "host_available_bytes": host})
         );
         let dense = if plan.slot_bytes > 0 {
             let dir = base.reader.dir.clone();
@@ -1724,9 +1763,9 @@ mod tests {
         PackedLayout::build(spec, &geometry, &text_tags, anchors)
     }
 
-    /// Streamed (disk tier), eager. Candidate rows of every block and step against the FP32 replay on the
-    /// addressed rows, within the frozen `A.adaln.*` thresholds; control: the same rows scored against the replay's
-    /// video/audio-swapped rows must leave a threshold.
+    /// AdaLN projections read once from disk, eager. Candidate rows of every block and step against the FP32 replay
+    /// on the addressed rows, within the frozen `A.adaln.*` thresholds; control: the same rows scored against the
+    /// replay's video/audio-swapped rows must leave a threshold.
     #[test]
     #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_MODEL, FF_H3_CAPTURE (BF16 run, --capture-adaln), FF_H3_REPLAY (its FP32 replay with the adaln stage), FF_H3_THRESHOLDS (frozen JSON)"]
     fn adaln_table_matches_the_fp32_replay() -> Result<()> {
@@ -2057,11 +2096,13 @@ mod tests {
         Ok(())
     }
 
-    /// Streamed blocks (disk tier, one slot), eager, native AdaLN table. Every step the FP32 replay holds: the
-    /// native velocity of the generated video rows and of the audio rows on the run's teacher-forced inputs, within
-    /// the frozen `{FF_H3_CELL}.step{k}.*` thresholds; control: text rows rotated by one must leave a threshold.
+    /// Blocks placed per `FF_H3_PLACEMENT`, eager (the H3 path captures no graph), native AdaLN table. Keyframe
+    /// conditioning rows are the captured FP32 VAE-encoder latents, the form under which the frozen keyframe cells
+    /// are 0. Every step in `FF_H3_STEPS` (each held by `FF_H3_REPLAY`): the native velocity of the generated video
+    /// rows and of the audio rows on the run's teacher-forced inputs, within the frozen `{FF_H3_CELL}.step{k}.*`
+    /// thresholds; control: text rows rotated by one must leave a threshold.
     #[test]
-    #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_MODEL, FF_H3_LORA, FF_H3_CAPTURE (BF16 run), FF_H3_REPLAY (its FP32 replay with steps), FF_H3_THRESHOLDS, FF_H3_CELL"]
+    #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_MODEL, FF_H3_LORA, FF_H3_CAPTURE (BF16 run), FF_H3_REPLAY (the replay the frozen step thresholds were measured against), FF_H3_THRESHOLDS, FF_H3_CELL, FF_H3_PLACEMENT, FF_H3_STEPS"]
     fn dit_steps_match_the_fp32_replay() -> Result<()> {
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -2096,10 +2137,17 @@ mod tests {
         let adaln_plan = AdalnPlan::build(&layout, &plan);
         let replay_map = mapped(&path("FF_H3_REPLAY")?.join("replay.safetensors"))?;
         let replay = SafeTensors::deserialize(&replay_map)?;
-        let steps: Vec<usize> = (0..plan.len())
-            .filter(|k| replay.tensor(&format!("step{k}.noise_pred")).is_ok())
-            .collect();
-        ensure!(!steps.is_empty(), "replay holds no step velocities");
+        let steps = std::env::var("FF_H3_STEPS")
+            .context("FF_H3_STEPS missing")?
+            .split(',')
+            .map(|k| Ok(k.parse::<usize>()?))
+            .collect::<Result<Vec<usize>>>()?;
+        for &k in &steps {
+            ensure!(
+                k < plan.len() && replay.tensor(&format!("step{k}.noise_pred")).is_ok(),
+                "replay holds no step {k} velocity"
+            );
+        }
         let text_map = mapped(&capture.join("dit_text_input.safetensors"))?;
         let text_file = SafeTensors::deserialize(&text_map)?;
         let text_view = text_file.tensor("encoder_hidden_states")?;
@@ -2140,6 +2188,7 @@ mod tests {
             (adapter.rank, &layout),
             Source::new(&transformer, &manifest),
             Source::new(&lora_dir, &lora_manifest),
+            Placement::from_env()?,
         )?;
         let kernels = BlockKernels::new(&device.ctx)?;
         let context = BlockContext {
@@ -2240,11 +2289,13 @@ mod tests {
         Ok(())
     }
 
-    /// Streamed blocks, eager, native AdaLN table and grids. The full chain from the run's step-0 latents against
-    /// the run's final latents (generated video rows, audio rows) within the frozen `{FF_H3_CELL}.final.*`
-    /// thresholds; control: the video and audio grids swapped must leave a threshold.
+    /// Blocks placed per `FF_H3_PLACEMENT`, eager (the H3 path captures no graph), native AdaLN table and grids.
+    /// Keyframe conditioning rows are the captured FP32 VAE-encoder latents, the form under which the frozen keyframe
+    /// cells are 0. The full chain from the run's step-0 latents against the run's final latents (generated video
+    /// rows, audio rows) within the frozen `{FF_H3_CELL}.final.*` thresholds; control: the video and audio grids
+    /// swapped must leave a threshold.
     #[test]
-    #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_MODEL, FF_H3_LORA, FF_H3_CAPTURE (BF16 run), FF_H3_THRESHOLDS, FF_H3_CELL"]
+    #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_MODEL, FF_H3_LORA, FF_H3_CAPTURE (BF16 run), FF_H3_THRESHOLDS, FF_H3_CELL, FF_H3_PLACEMENT"]
     fn dit_chain_matches_the_reference_final_latents() -> Result<()> {
         ensure!(
             std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
@@ -2380,6 +2431,7 @@ mod tests {
             (adapter.rank, &layout),
             Source::new(&transformer, &manifest),
             Source::new(&lora_dir, &lora_manifest),
+            Placement::from_env()?,
         )?;
         let kernels = BlockKernels::new(&device.ctx)?;
         let context = BlockContext {
