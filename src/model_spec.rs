@@ -1000,12 +1000,12 @@ fn integer(v: &Value, key: &str) -> Result<u32> {
         .with_context(|| format!("missing/invalid {key}"))?;
     u32::try_from(n).with_context(|| format!("{key} overflows u32"))
 }
-fn positive(v: &Value, key: &str) -> Result<u32> {
+pub(crate) fn positive(v: &Value, key: &str) -> Result<u32> {
     let n = integer(v, key)?;
     ensure!(n > 0, "unsupported {key}: 0");
     Ok(n)
 }
-fn u32_list(v: &Value, key: &str) -> Result<Vec<u32>> {
+pub(crate) fn u32_list(v: &Value, key: &str) -> Result<Vec<u32>> {
     let values = v
         .get(key)
         .and_then(Value::as_array)
@@ -1054,7 +1054,7 @@ fn integer_array(v: &Value, key: &str, limit: u32) -> Result<Vec<u32>> {
     }
     Ok(out)
 }
-fn equal(v: &Value, key: &str, expected: Value) -> Result<()> {
+pub(crate) fn equal(v: &Value, key: &str, expected: Value) -> Result<()> {
     ensure!(
         v.get(key) == Some(&expected),
         "unsupported {key}: {:?}",
@@ -1062,7 +1062,7 @@ fn equal(v: &Value, key: &str, expected: Value) -> Result<()> {
     );
     Ok(())
 }
-fn exact_keys(v: &Value, keys: &[&str], label: &str) -> Result<()> {
+pub(crate) fn exact_keys(v: &Value, keys: &[&str], label: &str) -> Result<()> {
     let object = v
         .as_object()
         .with_context(|| format!("{label} is not an object"))?;
