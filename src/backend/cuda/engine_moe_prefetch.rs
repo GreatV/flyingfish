@@ -7,7 +7,6 @@ use std::thread::JoinHandle;
 
 struct Read {
     reader: Reader,
-    catalogue: Arc<ExpertCatalogue>,
     layer: u32,
     expert: u32,
     reclaimed: Vec<u32>,
@@ -21,7 +20,7 @@ struct Completed {
     reclaimed: Vec<u32>,
 }
 
-pub(super) struct ReadAhead {
+pub(in crate::backend::cuda) struct ReadAhead {
     queue: Option<Prefetch>,
     depth: u32,
     input: Option<SyncSender<Read>>,
@@ -35,10 +34,14 @@ pub(super) struct ReadAhead {
     taken: Vec<bool>,
     recycled: Vec<u32>,
     pub stats: [u64; 6],
+    #[cfg(test)]
+    pub(in crate::backend::cuda) claims: u64,
+    #[cfg(test)]
+    pub(in crate::backend::cuda) reclaims: u64,
 }
 
 impl ReadAhead {
-    pub fn new(staging: u32, rings: u32, experts: u32) -> Result<Self> {
+    pub(in crate::backend::cuda) fn new(staging: u32, rings: u32, experts: u32) -> Result<Self> {
         ensure!(
             staging > 0 && experts > 0,
             "prefetch staging={staging} experts={experts}"
@@ -59,6 +62,10 @@ impl ReadAhead {
                 taken: Vec::new(),
                 recycled: Vec::new(),
                 stats: [0; 6],
+                #[cfg(test)]
+                claims: 0,
+                #[cfg(test)]
+                reclaims: 0,
             });
         }
         let queue = Some(Prefetch::new(depth, rings)?);
@@ -74,9 +81,7 @@ impl ReadAhead {
                     }
                     let result = (|| {
                         request.reader.context.bind_to_thread()?;
-                        request
-                            .reader
-                            .read(request.layer, request.expert, &request.catalogue)
+                        request.reader.read(request.layer, request.expert)
                     })();
                     request.reclaimed.clear();
                     for (slot, &was_copied) in copied.iter().enumerate() {
@@ -113,10 +118,14 @@ impl ReadAhead {
             taken: vec![false; rings as usize],
             recycled: Vec::with_capacity(rings as usize),
             stats: [0; 6],
+            #[cfg(test)]
+            claims: 0,
+            #[cfg(test)]
+            reclaims: 0,
         })
     }
 
-    fn release(&mut self, ring: u32) -> Result<()> {
+    pub(in crate::backend::cuda) fn release(&mut self, ring: u32) -> Result<()> {
         let taken = self
             .taken
             .get_mut(ring as usize)
@@ -130,11 +139,19 @@ impl ReadAhead {
                 "prefetch taken ring={ring} has no queue owner"
             );
             *taken = false;
+            #[cfg(test)]
+            {
+                self.reclaims += 1;
+            }
         }
         Ok(())
     }
 
-    fn receive(&mut self, slots: &mut Slots, wait: bool) -> Result<bool> {
+    pub(in crate::backend::cuda) fn receive_reader(
+        &mut self,
+        disk: &mut Option<Reader>,
+        wait: bool,
+    ) -> Result<bool> {
         if !self.pending {
             return Ok(false);
         }
@@ -164,10 +181,10 @@ impl ReadAhead {
             return Ok(false);
         };
         ensure!(
-            slots.disk.is_none(),
+            disk.is_none(),
             "prefetch completion has a second disk reader owner"
         );
-        slots.disk = Some(completed.reader);
+        *disk = Some(completed.reader);
         self.pending = false;
         let mut reclaimed = completed.reclaimed;
         for ring in reclaimed.drain(..) {
@@ -189,8 +206,16 @@ impl ReadAhead {
         Ok(true)
     }
 
-    fn reclaim(&mut self, slots: &mut Slots, wait: bool) -> Result<bool> {
-        let Some(reader) = slots.disk.as_mut() else {
+    fn receive(&mut self, slots: &mut Slots, wait: bool) -> Result<bool> {
+        self.receive_reader(&mut slots.disk, wait)
+    }
+
+    pub(in crate::backend::cuda) fn reclaim_reader(
+        &mut self,
+        disk: &mut Option<Reader>,
+        wait: bool,
+    ) -> Result<bool> {
+        let Some(reader) = disk.as_mut() else {
             return Ok(false);
         };
         let mut reclaimed = false;
@@ -227,22 +252,27 @@ impl ReadAhead {
         Ok(reclaimed)
     }
 
-    pub fn drive(&mut self, slots: &mut Slots) -> Result<()> {
+    fn reclaim(&mut self, slots: &mut Slots, wait: bool) -> Result<bool> {
+        self.reclaim_reader(&mut slots.disk, wait)
+    }
+
+    pub(in crate::backend::cuda) fn drive_reader(
+        &mut self,
+        disk: &mut Option<Reader>,
+        h2d_context: &Arc<CudaContext>,
+    ) -> Result<()> {
         ensure!(
             !self.failed,
             "native read-ahead is invalid after an earlier failure"
         );
-        self.receive(slots, false)?;
+        self.receive_reader(disk, false)?;
         if self.pending {
             return Ok(());
         }
-        self.reclaim(slots, false)?;
+        self.reclaim_reader(disk, false)?;
         let next = self.queue.as_mut().and_then(Prefetch::begin_read);
         if let Some((layer, expert)) = next {
-            let reader = slots
-                .disk
-                .take()
-                .context("prefetch disk reader has no owner")?;
+            let reader = disk.take().context("prefetch disk reader has no owner")?;
             ensure!(
                 reader.copied.len() == self.taken.len(),
                 "prefetch reader rings={} differ from setup rings={}",
@@ -251,7 +281,6 @@ impl ReadAhead {
             );
             let request = Read {
                 reader,
-                catalogue: slots.catalogue.clone(),
                 layer,
                 expert,
                 reclaimed: std::mem::take(&mut self.recycled),
@@ -264,12 +293,12 @@ impl ReadAhead {
                 self.taken.len()
             );
             ensure!(
-                Arc::ptr_eq(&request.reader.context, slots.transfers.h2d.context()),
+                Arc::ptr_eq(&request.reader.context, h2d_context),
                 "prefetch reader and H2D stream contexts differ: layer={} expert={}",
                 request.layer,
                 request.expert
             );
-            request.catalogue.range(request.layer, request.expert)?;
+            request.reader.validate(request.layer, request.expert)?;
             self.input
                 .as_ref()
                 .context("prefetch input is closed")?
@@ -278,6 +307,87 @@ impl ReadAhead {
             self.pending = true;
         }
         Ok(())
+    }
+
+    pub(in crate::backend::cuda::engine) fn drive(&mut self, slots: &mut Slots) -> Result<()> {
+        self.drive_reader(&mut slots.disk, slots.transfers.h2d.context())
+    }
+
+    pub(in crate::backend::cuda) fn is_pending(&self) -> bool {
+        self.pending
+    }
+
+    pub(in crate::backend::cuda) fn try_enqueue(&mut self, layer: u32, item: u32) -> Result<bool> {
+        let queue = self
+            .queue
+            .as_mut()
+            .context("disk prefetch has no setup ring")?;
+        if queue.entries() >= self.depth {
+            return Ok(false);
+        }
+        let (requested, retired) = queue.request(layer, item, false, false)?;
+        ensure!(
+            matches!(requested, Requested::Queued | Requested::Present) && retired.is_none(),
+            "prefetch non-demand request={requested:?} retired={retired:?}"
+        );
+        Ok(requested == Requested::Queued)
+    }
+
+    pub(in crate::backend::cuda) fn demand_item(
+        &mut self,
+        disk: &mut Option<Reader>,
+        h2d_context: &Arc<CudaContext>,
+        layer: u32,
+        item: u32,
+    ) -> Result<u32> {
+        ensure!(
+            self.queue.is_some(),
+            "disk demand layer={layer} expert={item} has no setup ring"
+        );
+        self.receive_reader(disk, true)?;
+        let (_, retired) = self
+            .queue
+            .as_mut()
+            .context("prefetch demand has no queue")?
+            .request(layer, item, true, false)?;
+        if let Some(ring) = retired {
+            disk.as_ref()
+                .context("prefetch discard has no reader owner")?
+                .disk
+                .discard(ring)?;
+        }
+        loop {
+            if let Some(ring) = self
+                .queue
+                .as_mut()
+                .context("prefetch demand has no queue")?
+                .take(layer, item)
+            {
+                ensure!(
+                    !self.taken[ring as usize],
+                    "prefetch ring={ring} was already taken"
+                );
+                self.taken[ring as usize] = true;
+                #[cfg(test)]
+                {
+                    self.claims += 1;
+                }
+                return Ok(ring);
+            }
+            self.drive_reader(disk, h2d_context)?;
+            if !self.pending {
+                ensure!(
+                    self.reclaim_reader(disk, true)?,
+                    "prefetch demand layer={layer} expert={item} cannot make ring progress"
+                );
+                self.drive_reader(disk, h2d_context)?;
+            }
+            ensure!(
+                self.pending,
+                "prefetch demand layer={layer} expert={item} has no queued read"
+            );
+            self.receive_reader(disk, true)?;
+        }
     }
 
     fn discard(&mut self, slots: &mut Slots, ring: u32) -> Result<()> {
@@ -291,7 +401,12 @@ impl ReadAhead {
         Ok(())
     }
 
-    pub fn begin_layer(&mut self, slots: &mut Slots, layer: u32, plan: &SpanPlan) -> Result<()> {
+    pub(in crate::backend::cuda::engine) fn begin_layer(
+        &mut self,
+        slots: &mut Slots,
+        layer: u32,
+        plan: &SpanPlan,
+    ) -> Result<()> {
         self.receive(slots, true)?;
         self.retire_forecast(layer, plan)?;
         self.consumed
@@ -318,7 +433,12 @@ impl ReadAhead {
         self.prime(slots, layer, plan)
     }
 
-    pub fn prime(&mut self, slots: &mut Slots, layer: u32, plan: &SpanPlan) -> Result<()> {
+    pub(in crate::backend::cuda::engine) fn prime(
+        &mut self,
+        slots: &mut Slots,
+        layer: u32,
+        plan: &SpanPlan,
+    ) -> Result<()> {
         self.receive(slots, false)?;
         if !self.pending {
             self.reclaim(slots, false)?;
@@ -348,7 +468,12 @@ impl ReadAhead {
         self.drive(slots)
     }
 
-    pub fn predict(&mut self, slots: &mut Slots, layer: u32, plan: &SpanPlan) -> Result<()> {
+    pub(in crate::backend::cuda::engine) fn predict(
+        &mut self,
+        slots: &mut Slots,
+        layer: u32,
+        plan: &SpanPlan,
+    ) -> Result<()> {
         ensure!(
             self.forecast.is_empty(),
             "prefetch forecast for layer={layer} overlaps an earlier layer"
@@ -382,7 +507,12 @@ impl ReadAhead {
         Ok(())
     }
 
-    pub fn demand(&mut self, slots: &mut Slots, layer: u32, expert: u32) -> Result<u32> {
+    pub(in crate::backend::cuda::engine) fn demand(
+        &mut self,
+        slots: &mut Slots,
+        layer: u32,
+        expert: u32,
+    ) -> Result<u32> {
         ensure!(
             self.queue.is_some(),
             "disk demand layer={layer} expert={expert} has no setup ring"
@@ -435,6 +565,10 @@ impl ReadAhead {
                     "prefetch ring={ring} was already taken"
                 );
                 self.taken[ring as usize] = true;
+                #[cfg(test)]
+                {
+                    self.claims += 1;
+                }
                 ensure!(
                     self.consumed.len() < self.consumed.capacity(),
                     "prefetch consumed experts exceed capacity={}",
@@ -460,7 +594,7 @@ impl ReadAhead {
         }
     }
 
-    pub fn finish(&mut self, slots: &mut Slots) -> Result<()> {
+    pub(in crate::backend::cuda::engine) fn finish(&mut self, slots: &mut Slots) -> Result<()> {
         self.receive(slots, true)?;
         while let Some((layer, expert)) = self.predictions.pop() {
             if let Retired::Loaded(ring) = self

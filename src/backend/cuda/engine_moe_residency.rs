@@ -13,15 +13,16 @@ use std::cell::RefCell;
 #[path = "engine_moe_prefill.rs"]
 mod prefill;
 pub(in crate::backend::cuda::engine) use prefill::Prefill;
+pub(in crate::backend::cuda) use prefill::ReadAhead;
 pub(super) use prefill::{cpu_bound, peer_prefill_bytes};
 
 #[derive(Clone)]
-struct Ticket {
-    id: u64,
-    event: Arc<CudaEvent>,
+pub(in crate::backend::cuda) struct Ticket {
+    pub(in crate::backend::cuda) id: u64,
+    pub(in crate::backend::cuda) event: Arc<CudaEvent>,
 }
 
-struct Events {
+pub(in crate::backend::cuda) struct Events {
     pool: Vec<Arc<CudaEvent>>,
     ids: Vec<u64>,
     epoch: u64,
@@ -40,7 +41,7 @@ fn event_index(id: u64, ids: &[u64]) -> Result<usize> {
 }
 
 impl Events {
-    fn new(context: &Arc<CudaContext>, count: usize) -> Result<Self> {
+    pub(in crate::backend::cuda) fn new(context: &Arc<CudaContext>, count: usize) -> Result<Self> {
         ensure!(count > 0, "empty expert event pool");
         Ok(Self {
             pool: (0..count)
@@ -74,13 +75,13 @@ impl Events {
         })
     }
 
-    fn record(&mut self, stream: &Arc<CudaStream>) -> Result<Ticket> {
+    pub(in crate::backend::cuda) fn record(&mut self, stream: &Arc<CudaStream>) -> Result<Ticket> {
         let ticket = self.claim()?;
         ticket.event.record(stream)?;
         Ok(ticket)
     }
 
-    fn wait(&self, stream: &Arc<CudaStream>, id: u64) -> Result<()> {
+    pub(in crate::backend::cuda) fn wait(&self, stream: &Arc<CudaStream>, id: u64) -> Result<()> {
         let index = event_index(id, &self.ids)?;
         ensure!(
             Arc::strong_count(&self.pool[index]) > 1,
@@ -91,11 +92,14 @@ impl Events {
     }
 }
 
-struct Reader {
-    disk: DiskReader,
-    context: Arc<CudaContext>,
+pub(in crate::backend::cuda) struct Reader {
+    pub(in crate::backend::cuda) disk: DiskReader,
+    pub(in crate::backend::cuda) context: Arc<CudaContext>,
     registrations: Vec<u64>,
-    copied: Vec<Option<Ticket>>,
+    pub(in crate::backend::cuda) copied: Vec<Option<Ticket>>,
+    catalogue: Option<Arc<ExpertCatalogue>>,
+    ranges: Vec<Vec<(u64, crate::experts::catalogue::NativeRange)>>,
+    chunk_bytes: u64,
 }
 
 impl Reader {
@@ -103,7 +107,7 @@ impl Reader {
         device: &Device,
         portable: bool,
         disk: DiskReader,
-        catalogue: &ExpertCatalogue,
+        catalogue: &Arc<ExpertCatalogue>,
     ) -> Result<Self> {
         let slots = disk.ring_slots() as usize;
         let mut reader = Self {
@@ -111,6 +115,9 @@ impl Reader {
             context: device.ctx.clone(),
             registrations: Vec::with_capacity(slots),
             copied: vec![None; slots],
+            catalogue: Some(catalogue.clone()),
+            ranges: Vec::new(),
+            chunk_bytes: catalogue.slot_bytes(),
         };
         device.ctx.bind_to_thread()?;
         #[cfg(feature = "cuda")]
@@ -149,7 +156,65 @@ impl Reader {
         Ok(reader)
     }
 
-    fn read(&mut self, layer: u32, expert: u32, catalogue: &ExpertCatalogue) -> Result<u32> {
+    pub(in crate::backend::cuda) fn new_ranges(
+        device: &Device,
+        disk: DiskReader,
+        ranges: Vec<Vec<(u64, crate::experts::catalogue::NativeRange)>>,
+        chunk_bytes: u64,
+    ) -> Result<Self> {
+        let slots = disk.ring_slots() as usize;
+        let spans = disk.ring_spans();
+        let mut reader = Self {
+            disk,
+            context: device.ctx.clone(),
+            registrations: Vec::with_capacity(slots),
+            copied: vec![None; slots],
+            catalogue: None,
+            ranges,
+            chunk_bytes,
+        };
+        device.ctx.bind_to_thread()?;
+        for (slot, (address, bytes)) in spans.into_iter().enumerate() {
+            ensure!(
+                !reader.registrations.contains(&address),
+                "disk ring registration repeated address={address:#x}"
+            );
+            // SAFETY: the reader owns every stable ring allocation through unregister.
+            #[cfg(feature = "cuda")]
+            let result = unsafe {
+                cudarc::driver::sys::cuMemHostRegister_v2(
+                    address as *mut std::ffi::c_void,
+                    bytes,
+                    0,
+                )
+                .result()
+            };
+            #[cfg(feature = "rocm")]
+            let result = unsafe { device.ctx.register_host(address, bytes, false) };
+            result
+                .with_context(|| format!("register dense disk ring: slot={slot} bytes={bytes}"))?;
+            reader.registrations.push(address);
+        }
+        Ok(reader)
+    }
+
+    pub(in crate::backend::cuda) fn validate(&self, layer: u32, item: u32) -> Result<()> {
+        if let Some(catalogue) = &self.catalogue {
+            catalogue.range(layer, item)?;
+            return Ok(());
+        }
+        let ranges = self
+            .ranges
+            .get(layer as usize)
+            .context("disk layer outside range table")?;
+        ensure!(
+            item == 0 && !ranges.is_empty(),
+            "disk layer={layer} item={item} has no native ranges"
+        );
+        Ok(())
+    }
+
+    pub(in crate::backend::cuda) fn read(&mut self, layer: u32, item: u32) -> Result<u32> {
         for (slot, event) in self.copied.iter_mut().enumerate() {
             let complete = if let Some(ticket) = event.as_ref() {
                 ticket.event.try_is_complete()?
@@ -174,8 +239,17 @@ impl Reader {
             event.event.synchronize()?;
             self.disk.reclaim(slot as u32, event.id)?;
         }
-        self.disk
-            .read_expert(layer, expert, catalogue, catalogue.slot_bytes())
+        if let Some(catalogue) = &self.catalogue {
+            return self
+                .disk
+                .read_expert(layer, item, catalogue, self.chunk_bytes);
+        }
+        ensure!(item == 0, "dense disk read item={item} must be 0");
+        let ranges = self
+            .ranges
+            .get(layer as usize)
+            .context("dense disk layer outside range table")?;
+        self.disk.read_ranges(ranges, self.chunk_bytes)
     }
 }
 
@@ -1051,7 +1125,7 @@ impl Slots {
                     .disk
                     .as_mut()
                     .context("decode disk reader is owned by prefill IO")?;
-                let ring = disk.read(layer, expert, &self.catalogue)?;
+                let ring = disk.read(layer, expert)?;
                 let values = disk.disk.values(ring)?;
                 let pointer = values.as_ptr() as u64;
                 if on_peer {

@@ -44,6 +44,7 @@ pub(crate) mod deepseek;
 mod diffusion;
 #[path = "engine_moe.rs"]
 mod moe;
+pub(in crate::backend::cuda) use moe::{Events, ReadAhead, Reader};
 #[path = "engine_mtp.rs"]
 #[cfg(feature = "cuda")]
 mod mtp;

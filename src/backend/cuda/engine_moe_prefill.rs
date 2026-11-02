@@ -17,7 +17,7 @@ use std::ops::Range;
 
 #[path = "engine_moe_prefetch.rs"]
 mod prefetch;
-use prefetch::ReadAhead;
+pub(in crate::backend::cuda) use prefetch::ReadAhead;
 
 fn resident_group_size(geometry: ExpertGeometry, capacity: &Capacity, wave_rows: u32) -> u32 {
     use crate::backend::cuda::moe::prefill::W8A16_TILE_ROWS;
