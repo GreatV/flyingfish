@@ -1028,6 +1028,7 @@ pub(crate) struct Dit<'a> {
     upcast: crate::backend::gpu::CudaFunction,
     bias: crate::backend::gpu::CudaFunction,
     round: crate::backend::gpu::CudaFunction,
+    euler: crate::backend::gpu::CudaFunction,
     /// Velocity of the generated video rows, `[generated rows, 96]`.
     pub video: CudaSlice<f32>,
     /// Velocity of the audio rows, `[audio rows, 32]`.
@@ -1135,6 +1136,7 @@ impl<'a> Dit<'a> {
             upcast: vision.load_function("vision_upcast_f32")?,
             bias: vision.load_function("vision_bias_f32")?,
             round: vision.load_function("vision_affine_cast_bf16")?,
+            euler: cubin::module(s.context(), "flow")?.load_function("euler_blend_f32")?,
             video: s.alloc_zeros::<f32>(generated * patch)?,
             audio: s.alloc_zeros::<f32>(ranges.audio * spec.audio_in_channels)?,
         })
@@ -1219,6 +1221,87 @@ impl<'a> Dit<'a> {
         Ok(())
     }
 
+    /// `x = r * x + (1 - r) * (x + (1 - t) * v)` over `count` F32 latents at element `offset` of `x`, from grid
+    /// points `k` and `k + 1`.
+    fn euler(
+        &self,
+        s: &Arc<CudaStream>,
+        (x, offset, count): (&CudaSlice<f32>, usize, usize),
+        v: &CudaSlice<f32>,
+        grid: &crate::minimax_h3::Schedule,
+        k: usize,
+    ) -> Result<()> {
+        ensure!(
+            v.len() == count && offset + count <= x.len(),
+            "Euler extent"
+        );
+        let step = 1.0f32 - grid.timesteps[k];
+        let ratio = grid.sigmas[k + 1] / grid.sigmas[k];
+        unsafe {
+            s.launch_builder(&self.euler)
+                .arg(&(pointer(x, s) + 4 * offset as u64))
+                .arg(&pointer(v, s))
+                .arg(&(count as u64))
+                .arg(&step)
+                .arg(&ratio)
+                .arg(&(1.0f32 - ratio))
+                .launch(flat(count))?;
+        }
+        Ok(())
+    }
+
+    /// The sampling chain in place on `[video rows, 96]` and `[audio rows, 32]` F32 latents: per evaluation of
+    /// `plan`, the forward, then the Euler step of the generated video rows on the video grid and of every audio row
+    /// on the audio grid; conditioning video rows stay fixed.
+    pub(crate) fn sample(
+        &mut self,
+        c: &BlockContext<'_>,
+        adaln: (&AdalnTable, &AdalnPlan),
+        (video_grid, audio_grid): (&crate::minimax_h3::Schedule, &crate::minimax_h3::Schedule),
+        (video, audio): (&CudaSlice<f32>, &CudaSlice<f32>),
+        text: &CudaSlice<bf16>,
+    ) -> Result<()> {
+        let (table, plan) = adaln;
+        let s = c.s;
+        let patch = c.spec.video_row_width();
+        let counts = (
+            u32::try_from(plan.pairs.len())?,
+            u32::try_from(plan.timesteps.len())?,
+        );
+        ensure!(
+            plan.row_pairs.len() == video_grid.timesteps.len()
+                && plan.row_pairs.len() == audio_grid.timesteps.len(),
+            "plan and grids differ in evaluations"
+        );
+        let condition = self.ranges.condition;
+        let generated = self.ranges.rows - self.ranges.video_start;
+        for k in 0..plan.row_pairs.len() {
+            let row_pairs = s.clone_htod(&plan.row_pairs[k])?;
+            let row_timesteps = s.clone_htod(&plan.row_timesteps[k])?;
+            self.step(
+                c,
+                table,
+                counts,
+                &StepInputs {
+                    video,
+                    audio,
+                    text,
+                    row_pairs: &row_pairs,
+                    row_timesteps: &row_timesteps,
+                },
+            )?;
+            self.euler(
+                s,
+                (video, condition * patch, generated * patch),
+                &self.video,
+                video_grid,
+                k,
+            )?;
+            self.euler(s, (audio, 0, audio.len()), &self.audio, audio_grid, k)?;
+        }
+        s.synchronize()?;
+        Ok(())
+    }
     /// One teacher-forced evaluation; the velocities land in `self.video` and `self.audio`.
     pub(crate) fn step(
         &mut self,
@@ -1972,6 +2055,154 @@ mod tests {
             "rotated-text control stayed within the thresholds"
         );
         println!("H3_DIT_GATE PASS cell={cell} steps={steps:?} control=FAIL_AS_REQUIRED");
+        Ok(())
+    }
+
+    /// Streamed blocks, eager, native AdaLN table and grids. The full chain from the run's step-0 latents against
+    /// the run's final latents (generated video rows, audio rows) within the frozen `{FF_H3_CELL}.final.*`
+    /// thresholds; control: the video and audio grids swapped must leave a threshold.
+    #[test]
+    #[ignore = "GPU; FF_Q38_GPU_WINDOW=granted, FF_MODEL, FF_H3_LORA, FF_H3_CAPTURE (BF16 run), FF_H3_THRESHOLDS, FF_H3_CELL"]
+    fn dit_chain_matches_the_reference_final_latents() -> Result<()> {
+        ensure!(
+            std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+            "GPU window not acknowledged"
+        );
+        let path = |key: &str| {
+            std::env::var_os(key)
+                .map(PathBuf::from)
+                .with_context(|| format!("{key} missing"))
+        };
+        let cell = std::env::var("FF_H3_CELL").context("FF_H3_CELL missing")?;
+        let model = path("FF_MODEL")?;
+        let capture = path("FF_H3_CAPTURE")?;
+        let lora_path = path("FF_H3_LORA")?;
+        let thresholds: serde_json::Value =
+            serde_json::from_slice(&fs::read(path("FF_H3_THRESHOLDS")?)?)?;
+        let thresholds = &thresholds["thresholds"];
+        let spec = H3Spec::read(&model)?;
+        let transformer = model.join("transformer");
+        let checkpoint = MappedCheckpoint::open_component(&transformer, "diffusion_pytorch_model")?;
+        let manifest = checkpoint.minimax_h3_manifest(&spec)?;
+        let lora_dir = lora_path.parent().context("LoRA directory")?.to_owned();
+        let stem = lora_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".safetensors"))
+            .context("LoRA file stem")?;
+        let (lora_manifest, adapter) =
+            MappedCheckpoint::open_component(&lora_dir, stem)?.minimax_h3_lora_manifest(&spec)?;
+        let layout = capture_layout(&spec, &capture)?;
+        let video_grid = Schedule::new(9, 6.0)?;
+        let audio_grid = Schedule::new(9, 3.0)?;
+        let plan = row_timestep_plan(&layout, &video_grid, &audio_grid)?;
+        let adaln_plan = AdalnPlan::build(&layout, &plan);
+        let read = |file: &str, name: &str| -> Result<(Vec<f64>, Vec<usize>)> {
+            let map = mapped(&capture.join(file))?;
+            decoded(&SafeTensors::deserialize(&map)?, name)
+        };
+        let (video0, _) = read("step0.safetensors", "hidden_states")?;
+        let (audio0, _) = read("step0.safetensors", "audio_hidden_states")?;
+        let (final_video, video_shape) = read("final.safetensors", "latents")?;
+        let (final_audio, _) = read("final.safetensors", "audio_latents")?;
+        let patch = spec.video_row_width();
+        ensure!(
+            final_video.len() == video0.len() && final_audio.len() == audio0.len(),
+            "final latents {video_shape:?} are not the packed step-0 rows"
+        );
+        let text_map = mapped(&capture.join("dit_text_input.safetensors"))?;
+        let text_file = SafeTensors::deserialize(&text_map)?;
+        let text_host: Vec<bf16> = text_file
+            .tensor("encoder_hidden_states")?
+            .data()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| bf16::from_le_bytes(*b))
+            .collect();
+
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let runtime = std::env::temp_dir().join(format!("ff-h3-chain-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(true, "MiniMax-H3 chain gate".into())),
+        )?;
+        let table = AdalnTable::build(
+            &device,
+            &mut blas,
+            &transformer,
+            &checkpoint,
+            &manifest,
+            &spec,
+            &adaln_plan,
+        )?;
+        let mut dit = Dit::new(
+            s,
+            &mut blas,
+            &spec,
+            (adapter.rank, &layout),
+            Source::new(&transformer, &manifest),
+            Source::new(&lora_dir, &lora_manifest),
+        )?;
+        let kernels = BlockKernels::new(&device.ctx)?;
+        let context = BlockContext {
+            s,
+            blas: &blas,
+            kernels: &kernels,
+            spec: &spec,
+            lora_scale: adapter.scale,
+        };
+        let text = s.clone_htod(&text_host)?;
+        let condition = layout.condition_video_rows * patch;
+        let mut chain = |grids: (&Schedule, &Schedule)| -> Result<[[f64; 3]; 2]> {
+            let video = s.clone_htod(&video0.iter().map(|&v| v as f32).collect::<Vec<_>>())?;
+            let audio = s.clone_htod(&audio0.iter().map(|&v| v as f32).collect::<Vec<_>>())?;
+            dit.sample(
+                &context,
+                (&table, &adaln_plan),
+                grids,
+                (&video, &audio),
+                &text,
+            )?;
+            let video: Vec<f64> = s.clone_dtoh(&video)?.into_iter().map(f64::from).collect();
+            let audio: Vec<f64> = s.clone_dtoh(&audio)?.into_iter().map(f64::from).collect();
+            ensure!(
+                video.iter().chain(&audio).all(|v| v.is_finite()),
+                "non-finite latents"
+            );
+            ensure!(
+                video[..condition] == final_video[..condition],
+                "conditioning rows moved"
+            );
+            Ok([
+                distance(&video[condition..], &final_video[condition..]),
+                distance(&audio, &final_audio),
+            ])
+        };
+        let [d_video, d_audio] = chain((&video_grid, &audio_grid))?;
+        let video_threshold = &thresholds[format!("{cell}.final.latents")];
+        let audio_threshold = &thresholds[format!("{cell}.final.audio_latents")];
+        println!(
+            "H3_CHAIN video={d_video:?} audio={d_audio:?} thresholds={video_threshold} {audio_threshold}"
+        );
+        ensure!(
+            within(d_video, video_threshold)? && within(d_audio, audio_threshold)?,
+            "final latents outside the frozen thresholds"
+        );
+        let [c_video, c_audio] = chain((&audio_grid, &video_grid))?;
+        println!("H3_CHAIN swapped-grid control video={c_video:?} audio={c_audio:?}");
+        fs::remove_dir(&runtime)?;
+        ensure!(
+            !within(c_video, video_threshold)? || !within(c_audio, audio_threshold)?,
+            "swapped-grid control stayed within the thresholds"
+        );
+        println!("H3_CHAIN_GATE PASS cell={cell} control=FAIL_AS_REQUIRED");
         Ok(())
     }
 }
