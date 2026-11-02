@@ -40,6 +40,10 @@ impl AlignedBytes {
         self.layout.size()
     }
 
+    pub(crate) fn alignment(&self) -> usize {
+        self.layout.align()
+    }
+
     pub(crate) fn as_mut(&mut self) -> &mut [u8] {
         // SAFETY: the buffer owns `layout.size()` initialized bytes.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.layout.size()) }
@@ -373,6 +377,7 @@ pub struct DiskReader {
     per_expert: usize,
     ring: Vec<AlignedSlot>,
     next: Cell<usize>,
+    staging: Cell<Option<AlignedBytes>>,
 }
 
 // SAFETY: the ring holds a private allocation owned by this reader; moving the reader to one
@@ -477,7 +482,111 @@ impl DiskReader {
             per_expert,
             ring,
             next: Cell::new(0),
+            staging: Cell::new(None),
         })
+    }
+
+    pub fn open_ranges(
+        layers: &[Vec<(u64, NativeRange)>],
+        slot_bytes: usize,
+        model_dir: &Path,
+        ring_slots: u32,
+    ) -> Result<Self> {
+        ensure!(ring_slots > 0, "zero disk ring slots");
+        ensure!(
+            slot_bytes > 0 && slot_bytes.is_multiple_of(std::mem::size_of::<bf16>()),
+            "invalid disk slot byte count {slot_bytes}"
+        );
+        let per_expert = slot_bytes / std::mem::size_of::<bf16>();
+        let mut names = BTreeSet::new();
+        for ranges in layers {
+            for (_, native) in ranges {
+                names.insert(native.shard.clone());
+            }
+        }
+        let mut shards = BTreeMap::new();
+        let mut lengths = BTreeMap::new();
+        for name in names {
+            let file = SpanReader::open(&model_dir.join(name.as_ref()), false)?;
+            let length = file.len;
+            shards.insert(name.to_string(), file);
+            lengths.insert(name.to_string(), length);
+        }
+        for ranges in layers {
+            for (offset, native) in ranges {
+                let slot_end = offset
+                    .checked_add(native.len)
+                    .context("disk slot range end overflow")?;
+                ensure!(
+                    slot_end <= slot_bytes as u64,
+                    "disk slot range {offset}..{slot_end} exceeds {slot_bytes} bytes"
+                );
+                let name = native.shard.as_ref();
+                let length = lengths
+                    .get(name)
+                    .copied()
+                    .with_context(|| format!("disk shard {name} not open"))?;
+                let end = native
+                    .offset
+                    .checked_add(native.len)
+                    .context("disk range end overflow")?;
+                ensure!(
+                    end <= length,
+                    "disk range {}..{end} of shard {name} exceeds {length} bytes",
+                    native.offset
+                );
+            }
+        }
+        let ring = (0..ring_slots)
+            .map(|_| AlignedSlot::new(slot_bytes))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            shards,
+            per_expert,
+            ring,
+            next: Cell::new(0),
+            staging: Cell::new(None),
+        })
+    }
+
+    #[cfg(any(feature = "cuda", feature = "rocm"))]
+    pub(crate) fn ring_spans(&self) -> Vec<(u64, usize)> {
+        self.ring
+            .iter()
+            .map(|slot| (slot.bytes.as_ptr() as u64, slot.bytes.len()))
+            .collect()
+    }
+
+    fn claim_free_slot(&self) -> Result<usize> {
+        let slots = self.ring.len();
+        let mut chosen = None;
+        for step in 0..slots {
+            let index = (self.next.get() + step) % slots;
+            if self.ring[index].state.get() == RingState::Free {
+                chosen = Some(index);
+                break;
+            }
+        }
+        let slot = chosen.with_context(|| format!("all {slots} disk ring slots are in use"))?;
+        self.next.set((slot + 1) % slots);
+        Ok(slot)
+    }
+
+    /// Reads one layer's native ranges into a free ring slot at their configured slot offsets.
+    pub fn read_ranges(&self, ranges: &[(u64, NativeRange)], chunk_bytes: u64) -> Result<u32> {
+        ensure!(chunk_bytes > 0, "disk read chunk is not positive");
+        let slot = self.claim_free_slot()?;
+        let bytes = self.ring[slot].bytes.len();
+        let ptr = self.ring[slot].bytes.as_ptr() as *mut u8;
+        // SAFETY: the slot owns `bytes` writable bytes with the ring alignment.
+        let buffer: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(ptr, bytes) };
+        let parts: Vec<(u64, &NativeRange)> = ranges
+            .iter()
+            .map(|(offset, native)| (*offset, native))
+            .collect();
+        self.read_parts(&parts, buffer, chunk_bytes)?;
+        self.ring[slot].state.set(RingState::Filled);
+        u32::try_from(slot).context("disk ring slot exceeds u32")
     }
 
     /// Reads one expert's native ranges into a free ring slot in the layout's slot order.
@@ -491,17 +600,7 @@ impl DiskReader {
         ensure!(chunk_bytes > 0, "disk read chunk is not positive");
         let range: &ExpertRange = catalogue.range(layer, expert)?;
         let layout = catalogue.layout();
-        let slots = self.ring.len();
-        let mut chosen = None;
-        for step in 0..slots {
-            let index = (self.next.get() + step) % slots;
-            if self.ring[index].state.get() == RingState::Free {
-                chosen = Some(index);
-                break;
-            }
-        }
-        let slot = chosen.with_context(|| format!("all {slots} disk ring slots are in use"))?;
-        self.next.set((slot + 1) % slots);
+        let slot = self.claim_free_slot()?;
         let bytes = self.ring[slot].bytes.len();
         let ptr = self.ring[slot].bytes.as_ptr() as *mut u8;
         // SAFETY: the slot owns `bytes` writable bytes with the ring alignment.
@@ -612,13 +711,19 @@ impl DiskReader {
                 .into_iter()
                 .max()
                 .context("empty native requests")?;
-            let mut staging =
-                AlignedBytes::new(usize::try_from(largest)?, usize::try_from(shard.alignment)?)?;
-            shard.read_spans(&requests, chunk_bytes, &mut staging, |index, bytes| {
+            let needed = usize::try_from(largest)?;
+            let align = usize::try_from(shard.alignment)?;
+            let mut staging = match self.staging.take() {
+                Some(buffer) if buffer.len() >= needed && buffer.alignment() >= align => buffer,
+                _ => AlignedBytes::new(needed, align)?,
+            };
+            let outcome = shard.read_spans(&requests, chunk_bytes, &mut staging, |index, bytes| {
                 let start = usize::try_from(parts[indexes[index]].0)?;
                 slot[start..start + bytes.len()].copy_from_slice(bytes);
                 Ok(())
-            })?;
+            });
+            self.staging.set(Some(staging));
+            outcome?;
         }
         Ok(())
     }

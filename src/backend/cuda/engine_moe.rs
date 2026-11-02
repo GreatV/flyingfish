@@ -20,6 +20,7 @@ use cudarc::driver::HostSlice;
 
 #[path = "engine_moe_residency.rs"]
 mod residency;
+pub(in crate::backend::cuda) use residency::{Events, ReadAhead, Reader};
 pub(super) use residency::{Prefill, Slots};
 #[path = "engine_moe_graph.rs"]
 mod graphs;

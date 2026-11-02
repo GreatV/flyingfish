@@ -1200,45 +1200,42 @@ impl Loader<'_> {
 }
 
 #[cfg(feature = "cuda")]
-struct DenseRange {
-    span: crate::experts::disk::ReadSpan,
-    source: std::ops::Range<usize>,
-    target: usize,
-}
-
-#[cfg(feature = "cuda")]
 struct DenseLayer {
     slot: Option<usize>,
     next: Option<usize>,
+    next_disk: Option<usize>,
     bytes: usize,
-    ranges: BTreeMap<String, Vec<DenseRange>>,
     host: Option<PinnedHostSlice<u8>>,
 }
 
 #[cfg(feature = "cuda")]
 struct DenseSlot {
     device: CudaSlice<u8>,
-    staging: PinnedHostSlice<u8>,
     ready: cudarc::driver::CudaEvent,
     retired: cudarc::driver::CudaEvent,
     retired_valid: bool,
-    layer: Option<usize>,
+    loaded: Option<usize>,
 }
 
 #[cfg(feature = "cuda")]
 pub(crate) struct DenseStreaming {
     layers: Vec<DenseLayer>,
     slots: Vec<DenseSlot>,
-    readers: BTreeMap<String, crate::experts::disk::SpanReader>,
-    read_buffer: crate::experts::disk::AlignedBytes,
+    disk: Option<super::engine::Reader>,
+    events: Option<super::engine::Events>,
+    read_ahead: super::engine::ReadAhead,
+    next_disk_read: Option<usize>,
     upload: Arc<CudaStream>,
     pub plan: crate::prefill::DensePlacement,
+    #[cfg(test)]
+    skip_reclaim: bool,
 }
 
 #[cfg(feature = "cuda")]
 impl Drop for DenseStreaming {
     fn drop(&mut self) {
         let context = self.upload.context();
+        let _ = self.read_ahead.receive_reader(&mut self.disk, true);
         context.record_err(context.synchronize());
     }
 }
@@ -1251,84 +1248,81 @@ impl DenseStreaming {
         plan: crate::prefill::DensePlacement,
         d: &Device,
     ) -> Result<Self> {
-        use crate::experts::disk::{AlignedBytes, SpanReader};
+        use crate::experts::{catalogue::NativeRange, disk::DiskReader};
         let mut layers: Vec<_> = plan
             .slots
             .iter()
             .map(|&slot| DenseLayer {
                 slot,
                 next: None,
+                next_disk: None,
                 bytes: 0,
-                ranges: BTreeMap::new(),
                 host: None,
             })
             .collect();
-        let mut next = None;
-        for (index, layer) in layers.iter_mut().enumerate().rev() {
-            layer.next = next;
-            if layer.slot.is_some() {
-                next = Some(index);
-            }
-        }
-        let mut readers = BTreeMap::new();
-        let mut largest = 0usize;
-        let mut alignment = 4096usize;
+        let mut ranges = vec![Vec::new(); layers.len()];
         for entry in manifest
             .entries
             .values()
             .filter(|entry| entry.is_linear_projection() && entry.layer.is_some())
         {
-            let layer = &mut layers[entry.layer.context("dense layer missing")? as usize];
+            let layer_index = entry.layer.context("dense layer missing")? as usize;
+            let layer = &mut layers[layer_index];
             if layer.slot.is_none() {
                 continue;
             }
-            if !readers.contains_key(&entry.shard) {
-                let reader = SpanReader::open(&dir.join(&entry.shard), true)?;
-                alignment = alignment.max(reader.alignment as usize);
-                readers.insert(entry.shard.clone(), reader);
-            }
-            let offset = entry
-                .data_start
-                .checked_add(entry.data_offsets[0])
-                .context("dense source offset overflow")?;
-            let span = readers[&entry.shard]
-                .plan(&[(offset, entry.bytes as u64)], UPLOAD_CHUNK_BYTES as u64)?
-                .pop()
-                .context("dense disk span missing")?;
-            let begin = usize::try_from(offset - span.begin)?;
-            layer
-                .ranges
-                .entry(entry.shard.clone())
-                .or_default()
-                .push(DenseRange {
-                    span,
-                    source: begin..begin + entry.bytes,
-                    target: layer.bytes,
-                });
+            let target = u64::try_from(layer.bytes)?;
             layer.bytes = layer
                 .bytes
                 .checked_add(entry.bytes)
                 .context("dense layer bytes overflow")?;
-            largest = largest.max(entry.bytes);
-        }
-        let mut read_buffer = AlignedBytes::new(
-            largest
-                .checked_add(2 * alignment)
-                .context("dense disk span overflow")?,
-            alignment,
-        )?;
-        for (index, layer) in layers.iter_mut().enumerate() {
-            if plan.host[index] {
-                let mut host = unsafe { d.ctx.alloc_pinned_with_flags::<u8>(layer.bytes, 0)? };
-                Self::read_layer(&readers, &mut read_buffer, layer, host.as_mut_slice()?)?;
-                layer.host = Some(host);
+            if !plan.host[layer_index] {
+                let offset = entry
+                    .data_start
+                    .checked_add(entry.data_offsets[0])
+                    .context("dense source offset overflow")?;
+                ranges[layer_index].push((
+                    target,
+                    NativeRange {
+                        shard: Arc::from(entry.shard.as_str()),
+                        offset,
+                        len: entry.bytes as u64,
+                    },
+                ));
             }
         }
+        let first_disk = (0..layers.len()).find(|&i| layers[i].slot.is_some() && !plan.host[i]);
+        let mut next = None;
+        let mut next_disk = first_disk;
+        for (index, layer) in layers.iter_mut().enumerate().rev() {
+            layer.next = next;
+            layer.next_disk = next_disk;
+            if layer.slot.is_some() {
+                next = Some(index);
+                if !plan.host[index] {
+                    next_disk = Some(index);
+                }
+            }
+        }
+        for (index, layer) in layers.iter_mut().enumerate() {
+            if plan.host[index] {
+                layer.host = Some(unsafe { d.ctx.alloc_pinned_with_flags::<u8>(layer.bytes, 0)? });
+            }
+        }
+        let (disk, events, read_ahead) = if plan.disk_bytes > 0 {
+            let disk = DiskReader::open_ranges(&ranges, plan.slot_bytes, dir, 2)?;
+            let reader =
+                super::engine::Reader::new_ranges(d, disk, ranges, UPLOAD_CHUNK_BYTES as u64)?;
+            let events = super::engine::Events::new(&d.ctx, 8)?;
+            let read_ahead = super::engine::ReadAhead::new(2, 2, 1)?;
+            (Some(reader), Some(events), read_ahead)
+        } else {
+            (None, None, super::engine::ReadAhead::new(2, 0, 1)?)
+        };
         let slots = (0..2)
             .map(|_| {
                 Ok(DenseSlot {
                     device: d.upload.alloc_zeros::<u8>(plan.slot_bytes)?,
-                    staging: unsafe { d.ctx.alloc_pinned_with_flags::<u8>(plan.slot_bytes, 0)? },
                     ready: d
                         .ctx
                         .new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?,
@@ -1336,47 +1330,130 @@ impl DenseStreaming {
                         .ctx
                         .new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))?,
                     retired_valid: false,
-                    layer: None,
+                    loaded: None,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             layers,
             slots,
-            readers,
-            read_buffer,
+            disk,
+            events,
+            read_ahead,
+            next_disk_read: first_disk,
             upload: d.upload.clone(),
             plan,
+            #[cfg(test)]
+            skip_reclaim: false,
         })
     }
 
-    fn read_layer(
-        readers: &BTreeMap<String, crate::experts::disk::SpanReader>,
-        buffer: &mut crate::experts::disk::AlignedBytes,
-        layer: &DenseLayer,
-        destination: &mut [u8],
+    fn defer(
+        &mut self,
+        loader: &mut Loader<'_>,
+        name: &str,
+        entry: &TensorEntry,
+        layer: usize,
+        offset: usize,
     ) -> Result<()> {
+        loader.defer(name)?;
+        let binding = self
+            .layers
+            .get_mut(layer)
+            .context("dense layer outside plan")?;
+        let end = offset
+            .checked_add(entry.bytes)
+            .context("dense tensor offset overflow")?;
+        ensure!(end <= binding.bytes, "dense tensor exceeds layer slot");
+        let file = loader
+            .index
+            .weight_map
+            .get(name)
+            .with_context(|| format!("missing tensor {name}"))?;
+        let t = loader.tensors[file].tensor(name)?;
         ensure!(
-            destination.len() >= layer.bytes,
-            "dense host destination is too small"
+            t.dtype() == Dtype::BF16,
+            "tensor {name}: expected BF16, found {:?}",
+            t.dtype()
         );
-        for (shard, ranges) in &layer.ranges {
-            let reader = readers.get(shard).context("dense shard reader missing")?;
-            for range in ranges {
-                let source = &reader.read_span(&range.span, UPLOAD_CHUNK_BYTES as u64, buffer)?
-                    [range.source.clone()];
-                ensure!(
-                    source
-                        .as_chunks::<2>()
-                        .0
-                        .iter()
-                        .all(|v| u16::from_le_bytes([v[0], v[1]]) & 0x7f80 != 0x7f80),
-                    "nonfinite dense BF16 range"
-                );
-                destination[range.target..range.target + source.len()].copy_from_slice(source);
+        ensure!(
+            t.shape() == entry.shape,
+            "tensor {name}: expected {:?}, found {:?}",
+            entry.shape,
+            t.shape()
+        );
+        ensure!(
+            t.data().len() == entry.bytes,
+            "deferred tensor {name} length {} differs from {}",
+            t.data().len(),
+            entry.bytes
+        );
+        let mut cursor = offset;
+        for mapped_chunk in t.data().chunks(UPLOAD_CHUNK_BYTES) {
+            let len = mapped_chunk.len();
+            let chunk = if loader.verify_upload {
+                loader.source.read_mapped_range(
+                    file,
+                    mapped_chunk,
+                    &mut loader.read_buffer[..len],
+                )?;
+                &loader.read_buffer[..len]
+            } else {
+                mapped_chunk
+            };
+            ensure!(len % 2 == 0, "unaligned BF16 chunk in {name}");
+            ensure!(
+                chunk
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .all(|c| bf16::from_bits(u16::from_le_bytes(*c)).is_finite()),
+                "nonfinite BF16 tensor {name}"
+            );
+            if let Some(host) = binding.host.as_mut() {
+                host.as_mut_slice()?[cursor..cursor + len].copy_from_slice(chunk);
             }
+            cursor += len;
         }
         Ok(())
+    }
+
+    fn prime(&mut self) -> Result<()> {
+        if let Some(first) = self.layers.iter().position(|layer| layer.slot == Some(0)) {
+            self.prefetch(first)?;
+        }
+        if let Some(second) = self.layers.iter().position(|layer| layer.slot == Some(1)) {
+            self.prefetch(second)?;
+        }
+        self.pump_disk()
+    }
+
+    fn pump_disk(&mut self) -> Result<()> {
+        if self.plan.disk_bytes == 0 {
+            return Ok(());
+        }
+        self.read_ahead.receive_reader(&mut self.disk, false)?;
+        if !self.read_ahead.is_pending() {
+            self.read_ahead.reclaim_reader(&mut self.disk, false)?;
+        }
+        while let Some(next_disk) = self.next_disk_read {
+            if !self.read_ahead.try_enqueue(next_disk as u32, 0)? {
+                break;
+            }
+            self.next_disk_read = self.layers[next_disk].next_disk;
+        }
+        self.read_ahead
+            .drive_reader(&mut self.disk, self.upload.context())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn flush_ring_counts(&mut self) -> Result<(u64, u64)> {
+        self.upload.synchronize()?;
+        self.read_ahead.receive_reader(&mut self.disk, true)?;
+        while self.read_ahead.reclaim_reader(&mut self.disk, true)? {}
+        let counts = (self.read_ahead.claims, self.read_ahead.reclaims);
+        self.pump_disk()?;
+        Ok(counts)
     }
 
     fn pointer(&self, layer: usize, offset: usize, bytes: usize) -> Result<u64> {
@@ -1392,34 +1469,74 @@ impl DenseStreaming {
     }
 
     fn prefetch(&mut self, index: usize) -> Result<()> {
-        let layer = &self.layers[index];
-        let Some(slot_index) = layer.slot else {
+        let Some(slot_index) = self.layers[index].slot else {
             return Ok(());
         };
-        let slot = &mut self.slots[slot_index];
-        if slot.layer == Some(index) {
-            return Ok(());
+        if self.slots[slot_index].loaded == Some(index) {
+            return self.pump_disk();
         }
-        if slot.retired_valid {
-            self.upload.wait(&slot.retired)?;
+        if self.slots[slot_index].retired_valid {
+            self.upload.wait(&self.slots[slot_index].retired)?;
         }
-        let source = if let Some(host) = &layer.host {
-            host.as_slice()?
-        } else {
-            if slot.layer.is_some() {
-                slot.ready.synchronize()?;
+        let layer_bytes = self.layers[index].bytes;
+        let pointer = self.slots[slot_index].device.device_ptr(&self.upload).0;
+        if let Some(host) = &self.layers[index].host {
+            let source = &host.as_slice()?[..layer_bytes];
+            unsafe {
+                cudarc::driver::result::memcpy_htod_async(
+                    pointer,
+                    source,
+                    self.upload.cu_stream(),
+                )?;
             }
-            let destination = slot.staging.as_mut_slice()?;
-            Self::read_layer(&self.readers, &mut self.read_buffer, layer, destination)?;
-            &destination[..layer.bytes]
-        };
-        let pointer = slot.device.device_ptr(&self.upload).0;
-        unsafe {
-            cudarc::driver::result::memcpy_htod_async(pointer, source, self.upload.cu_stream())?;
+        } else {
+            if self.next_disk_read == Some(index) {
+                self.next_disk_read = self.layers[index].next_disk;
+            }
+            let ring = self.read_ahead.demand_item(
+                &mut self.disk,
+                self.upload.context(),
+                index as u32,
+                0,
+            )?;
+            let reader = self
+                .disk
+                .as_mut()
+                .context("dense disk reader missing after demand")?;
+            let values = reader.disk.values(ring)?;
+            // SAFETY: the ring slot holds at least `layer_bytes` initialized bytes for the lease's lifetime.
+            let raw =
+                unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, layer_bytes) };
+            unsafe {
+                cudarc::driver::result::memcpy_htod_async(pointer, raw, self.upload.cu_stream())?;
+            }
+            #[cfg(test)]
+            if self.skip_reclaim {
+                drop(values);
+                self.read_ahead.release(ring)?;
+            } else {
+                let copied = self
+                    .events
+                    .as_mut()
+                    .context("dense disk events missing")?
+                    .record(&self.upload)?;
+                values.copied(copied.id)?;
+                reader.copied[ring as usize] = Some(copied);
+            }
+            #[cfg(not(test))]
+            {
+                let copied = self
+                    .events
+                    .as_mut()
+                    .context("dense disk events missing")?
+                    .record(&self.upload)?;
+                values.copied(copied.id)?;
+                reader.copied[ring as usize] = Some(copied);
+            }
         }
-        slot.ready.record(&self.upload)?;
-        slot.layer = Some(index);
-        Ok(())
+        self.slots[slot_index].ready.record(&self.upload)?;
+        self.slots[slot_index].loaded = Some(index);
+        self.pump_disk()
     }
 
     pub(crate) fn begin(&mut self, layer: usize, stream: &Arc<CudaStream>) -> Result<()> {
@@ -1485,6 +1602,35 @@ pub(crate) struct WeightCatalog {
 }
 impl WeightCatalog {
     #[cfg(feature = "cuda")]
+    fn dense_host_fixed(
+        layers: &[usize],
+        budget: usize,
+        available_host: usize,
+    ) -> Result<(usize, crate::prefill::DensePlacement)> {
+        use crate::prefill::DensePlacement;
+        let preliminary = DensePlacement::new(layers, budget, 0)?;
+        let base_reserve = 4usize << 30;
+        if available_host >= base_reserve {
+            let host_only = DensePlacement::new(layers, budget, available_host - base_reserve)?;
+            if host_only.disk_bytes == 0 {
+                return Ok((base_reserve, host_only));
+            }
+        }
+        let host_fixed = preliminary
+            .slot_bytes
+            .checked_mul(2)
+            .and_then(|n| n.checked_add(UPLOAD_CHUNK_BYTES))
+            .and_then(|n| n.checked_add(base_reserve))
+            .context("dense host staging overflow")?;
+        ensure!(
+            available_host >= host_fixed,
+            "dense pinned staging and host reserve exceed available RAM: need={host_fixed} available={available_host}"
+        );
+        let plan = DensePlacement::new(layers, budget, available_host - host_fixed)?;
+        Ok((host_fixed, plan))
+    }
+
+    #[cfg(feature = "cuda")]
     pub(crate) fn load_dense(
         dir: &Path,
         spec: &crate::model_spec::ModelSpec,
@@ -1502,7 +1648,6 @@ impl WeightCatalog {
         let manifest = mapped.manifest(spec, crate::checkpoint::LoadPolicy::TextOnly)?;
         let mut layers = vec![0usize; spec.layers.len()];
         let mut fixed = 0usize;
-        let mut largest_matrix = 0usize;
         for entry in manifest.entries.values().filter(|e| e.load) {
             if entry.is_linear_projection()
                 && let Some(layer) = entry.layer
@@ -1511,7 +1656,6 @@ impl WeightCatalog {
                 layers[layer as usize] = layers[layer as usize]
                     .checked_add(entry.bytes)
                     .context("dense layer size overflow")?;
-                largest_matrix = largest_matrix.max(entry.bytes);
             } else {
                 fixed = fixed
                     .checked_add(entry.bytes)
@@ -1536,17 +1680,7 @@ impl WeightCatalog {
             "prefix-cache identity for streamed dense weights is not bound"
         );
         let available_host = usize::try_from(super::calibrate::host_memory(Path::new("/"))?)?;
-        let host_fixed = preliminary
-            .slot_bytes
-            .checked_mul(2)
-            .and_then(|n| n.checked_add(largest_matrix))
-            .and_then(|n| n.checked_add(4 << 30))
-            .context("dense host staging overflow")?;
-        ensure!(
-            available_host >= host_fixed,
-            "dense pinned staging and host reserve exceed available RAM: need={host_fixed} available={available_host}"
-        );
-        let plan = DensePlacement::new(&layers, budget, available_host - host_fixed)?;
+        let (_, plan) = Self::dense_host_fixed(&layers, budget, available_host)?;
         let memory_bus_bits = d
             .ctx
             .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH)?;
@@ -1579,7 +1713,7 @@ impl WeightCatalog {
             serde_json::json!({"dense_placement": &plan, "fixed_bytes": fixed, "transient_bytes": transient_bytes, "host_available_bytes": available_host, "copy_engines": copy_engines, "memory_bus_bits": memory_bus_bits, "sms": d.info.sms, "pcie_link_width": link_width, "pcie_max_link_speed": link_speed.trim()})
         );
         let started = Instant::now();
-        let dense = DenseStreaming::new(dir, &manifest, plan, d)?;
+        let mut dense = DenseStreaming::new(dir, &manifest, plan, d)?;
         let mut offsets = vec![0; layers.len()];
         let ((tensors, uploaded), _) =
             checkpoint_mapped(&mapped, d, Some(&manifest), false, |loader| {
@@ -1593,9 +1727,10 @@ impl WeightCatalog {
                         && dense.plan.slots[layer as usize].is_some()
                     {
                         let layer = layer as usize;
-                        let pointer = dense.pointer(layer, offsets[layer], entry.bytes)?;
+                        let offset = offsets[layer];
+                        let pointer = dense.pointer(layer, offset, entry.bytes)?;
                         offsets[layer] += entry.bytes;
-                        loader.defer(name)?;
+                        dense.defer(loader, name, entry, layer, offset)?;
                         StoredTensor::Slot {
                             pointer,
                             bytes: entry.bytes,
@@ -1607,6 +1742,7 @@ impl WeightCatalog {
                 }
                 Ok((tensors, loader.bytes))
             })?;
+        dense.prime()?;
         ensure!(
             uploaded == fixed + dense.plan.resident_bytes,
             "dense resident byte count mismatch"
@@ -1896,10 +2032,57 @@ mod tests {
             }
             file.sync_all()?;
             drop(file);
+            let weight_map: BTreeMap<String, String> = entries
+                .keys()
+                .map(|name| (name.clone(), "model.safetensors".to_owned()))
+                .collect();
+            std::fs::write(
+                root.join("model.safetensors.index.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "metadata": {"total_size": per_layer * 4},
+                    "weight_map": weight_map
+                }))?,
+            )?;
             let manifest = TensorManifest {
                 entries,
                 resident_bytes: per_layer * 4,
             };
+            let mapped = MappedCheckpoint::open(&root)?;
+            let populate = |dense: &mut DenseStreaming| -> Result<()> {
+                let mut offsets = [0usize; 4];
+                checkpoint_mapped(&mapped, &device, Some(&manifest), false, |loader| {
+                    for (name, entry) in &manifest.entries {
+                        let layer = entry.layer.context("test layer missing")? as usize;
+                        let offset = offsets[layer];
+                        offsets[layer] += entry.bytes;
+                        dense.defer(loader, name, entry, layer, offset)?;
+                    }
+                    Ok(())
+                })?;
+                Ok(())
+            };
+            let (host_fixed, host_only_plan) = WeightCatalog::dense_host_fixed(
+                &[per_layer; 4],
+                2 * per_layer,
+                (4 << 30) + 4 * per_layer,
+            )?;
+            ensure!(
+                host_fixed == (4 << 30)
+                    && host_only_plan.host_bytes == 4 * per_layer
+                    && host_only_plan.disk_bytes == 0,
+                "host-only placement reserved disk staging bytes: host_fixed={host_fixed} plan={host_only_plan:?}"
+            );
+            let (disk_fixed, disk_plan) = WeightCatalog::dense_host_fixed(
+                &[per_layer; 4],
+                2 * per_layer,
+                (4 << 30) + 2 * per_layer + UPLOAD_CHUNK_BYTES,
+            )?;
+            ensure!(
+                disk_fixed == (4 << 30) + 2 * per_layer + UPLOAD_CHUNK_BYTES
+                    && disk_plan.host_bytes == 0
+                    && disk_plan.disk_bytes == 4 * per_layer,
+                "disk-spill placement did not reserve disk staging bytes: disk_fixed={disk_fixed} plan={disk_plan:?}"
+            );
             let stream = &device.stream;
             let mut outputs = (0..4)
                 .map(|_| stream.alloc_zeros::<u8>(per_layer))
@@ -1970,9 +2153,17 @@ mod tests {
                     "streaming gate has a resident layer"
                 );
                 let mut dense = DenseStreaming::new(&root, &manifest, plan, &device)?;
+                if host_layers == 4 {
+                    ensure!(
+                        dense.disk.is_none() && dense.events.is_none(),
+                        "host-only placement allocated disk ring resources"
+                    );
+                }
+                populate(&mut dense)?;
                 for slot in &mut dense.slots {
                     slot.device = device.upload.clone_htod(&vec![0xcdu8; per_layer + 64])?;
                 }
+                dense.prime()?;
                 ensure!(
                     dense.pointer(0, per_layer, 2).is_err(),
                     "slot overflow control was admitted"
@@ -2023,11 +2214,67 @@ mod tests {
                         );
                     }
                 }
+                let (claims, reclaims) = dense.flush_ring_counts()?;
+                if host_layers == 4 {
+                    ensure!(
+                        claims == 0 && reclaims == 0,
+                        "host-only placement claimed disk ring slots: claims={claims} reclaims={reclaims}"
+                    );
+                } else {
+                    ensure!(
+                        claims == reclaims && claims >= (3 * (4 - host_layers)) as u64,
+                        "disk ring claim/reclaim mismatch: host_layers={host_layers} claims={claims} reclaims={reclaims}"
+                    );
+                }
                 println!(
-                    "PASS dense_slots host_layers={host_layers} disk_layers={} layers=4 repeats=3 slot_bytes={per_layer} byte_mismatches=0 product_rows=1,17 product_bits=0 wrong_generation=detected bounds=detected tail_guards=preserved",
+                    "PASS dense_slots host_layers={host_layers} disk_layers={} layers=4 repeats=3 slot_bytes={per_layer} claims={claims} reclaims={reclaims} byte_mismatches=0 product_rows=1,17 product_bits=0 wrong_generation=detected bounds=detected tail_guards=preserved",
                     4 - host_layers
                 );
             }
+            unsafe extern "C" fn wait_for_gate(user_data: *mut std::ffi::c_void) {
+                let gate = unsafe { &*(user_data as *const std::sync::atomic::AtomicU32) };
+                while gate.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                    std::hint::spin_loop();
+                }
+            }
+            for skip_reclaim in [false, true] {
+                let plan = crate::prefill::DensePlacement::new(&[per_layer; 4], 2 * per_layer, 0)?;
+                let mut dense = DenseStreaming::new(&root, &manifest, plan, &device)?;
+                populate(&mut dense)?;
+                dense.skip_reclaim = skip_reclaim;
+                let gate = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+                unsafe {
+                    sys::cuLaunchHostFunc(
+                        dense.upload.cu_stream(),
+                        Some(wait_for_gate),
+                        std::sync::Arc::as_ptr(&gate) as *mut std::ffi::c_void,
+                    )
+                    .result()
+                    .context("hold dense upload stream")?;
+                }
+                dense.prefetch(0)?;
+                dense.prefetch(1)?;
+                if skip_reclaim {
+                    dense.read_ahead.receive_reader(&mut dense.disk, true)?;
+                }
+                gate.store(1, std::sync::atomic::Ordering::Release);
+                dense.upload.synchronize()?;
+                let actual = stream.clone_dtoh(&dense.slots[0].device)?;
+                if skip_reclaim {
+                    ensure!(
+                        actual == expected[2] && actual != expected[0],
+                        "reclaim mutant did not overwrite slot 0 with layer 2 while upload was held"
+                    );
+                } else {
+                    ensure!(
+                        actual == expected[0],
+                        "guarded ring slot 0 did not preserve layer 0 bytes"
+                    );
+                }
+            }
+            println!(
+                "PASS dense_reclaim_control host_only_no_staging=true guarded_exact=true skip_reclaim_overwritten_with_layer2=true"
+            );
             Ok(())
         })();
         std::fs::remove_dir_all(&root)?;

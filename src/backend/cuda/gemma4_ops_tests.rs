@@ -4047,6 +4047,12 @@ fn large_model_definition(
     let plan = engine
         .dense_placement()
         .context("large-model gate did not execute dense streaming")?;
+    let disk_layers = plan
+        .slots
+        .iter()
+        .zip(&plan.host)
+        .filter(|(slot, host)| slot.is_some() && !**host)
+        .count() as u64;
     println!("GEMMA4_DENSE_PLACEMENT {}", serde_json::to_string(plan)?);
     ensure!(
         plan.host_bytes > 0,
@@ -4132,12 +4138,24 @@ fn large_model_definition(
             engine.gemma_kv_rows(global, window)?,
         );
     defects += usize::from(!restored);
+    let before_ring = engine.dense_ring_counts()?;
     let mut graph = Vec::new();
     for &token in &sequence[window..] {
         engine.set_token(token)?;
         engine.decode(true, None)?;
         graph.extend(engine.decode_logits()?.into_iter().map(bf16::from_f32));
     }
+    let after_ring = engine.dense_ring_counts()?;
+    let decode_tokens = (sequence.len() - window) as u64;
+    let claims = after_ring.0 - before_ring.0;
+    let reclaims = after_ring.1 - before_ring.1;
+    let ring_ok = claims == decode_tokens * disk_layers && reclaims == decode_tokens * disk_layers;
+    defects += usize::from(!ring_ok);
+    println!(
+        "GEMMA4_DENSE_RING tokens={decode_tokens} disk_layers={disk_layers} claims={claims} reclaims={reclaims} claims_per_token={} reclaims_per_token={} exact={ring_ok}",
+        claims / decode_tokens,
+        reclaims / decode_tokens
+    );
     let differing = graph
         .iter()
         .zip(&wrap_eager)

@@ -4406,6 +4406,15 @@ impl Engine {
             .and_then(|q| q.catalog.dense.as_ref().map(|dense| &dense.plan))
     }
 
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn dense_ring_counts(&mut self) -> Result<(u64, u64)> {
+        self.qwen
+            .as_mut()
+            .and_then(|q| q.catalog.dense.as_mut())
+            .context("dense streaming runtime missing")?
+            .flush_ring_counts()
+    }
+
     pub(super) fn dense_graph_ready(&self) -> bool {
         #[cfg(feature = "cuda")]
         return self.qwen.as_ref().is_some_and(|q| {
