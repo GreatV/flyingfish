@@ -1604,13 +1604,22 @@ impl WeightCatalog {
     #[cfg(feature = "cuda")]
     fn dense_host_fixed(
         layers: &[usize],
-        layer_staging: &[usize],
+        ranges: &[(usize, u64, u64, u64)],
         budget: usize,
         available_host: usize,
     ) -> Result<(usize, crate::prefill::DensePlacement)> {
         use crate::prefill::DensePlacement;
+        let mut layer_staging = vec![0usize; layers.len()];
+        for &(layer, offset, len, alignment) in ranges {
+            let staging =
+                crate::experts::disk::DiskReader::aligned_staging_bytes(offset, len, alignment)?;
+            let slot = layer_staging
+                .get_mut(layer)
+                .context("dense staging layer out of bounds")?;
+            *slot = (*slot).max(staging);
+        }
         ensure!(
-            layers.len() == layer_staging.len() && layer_staging.iter().all(|&n| n > 0),
+            !layers.is_empty() && layer_staging.iter().all(|&n| n > 0),
             "invalid dense layer staging extent"
         );
         let preliminary = DensePlacement::new(layers, budget, 0)?;
@@ -1666,7 +1675,8 @@ impl WeightCatalog {
         let mapped = MappedCheckpoint::open(dir)?;
         let manifest = mapped.manifest(spec, crate::checkpoint::LoadPolicy::TextOnly)?;
         let mut layers = vec![0usize; spec.layers.len()];
-        let mut layer_staging = vec![0usize; spec.layers.len()];
+        let mut shard_alignments = BTreeMap::new();
+        let mut ranges = Vec::new();
         let mut fixed = 0usize;
         for entry in manifest.entries.values().filter(|e| e.load) {
             if entry.is_linear_projection()
@@ -1677,15 +1687,20 @@ impl WeightCatalog {
                 layers[layer] = layers[layer]
                     .checked_add(entry.bytes)
                     .context("dense layer size overflow")?;
+                let alignment = if let Some(&align) = shard_alignments.get(&entry.shard) {
+                    align
+                } else {
+                    let align =
+                        crate::experts::disk::SpanReader::open(&dir.join(&entry.shard), true)?
+                            .alignment;
+                    shard_alignments.insert(entry.shard.clone(), align);
+                    align
+                };
                 let offset = entry
                     .data_start
                     .checked_add(entry.data_offsets[0])
                     .context("dense source offset overflow")?;
-                let staging = crate::experts::disk::DiskReader::range_staging_bytes(
-                    offset,
-                    entry.bytes as u64,
-                )?;
-                layer_staging[layer] = layer_staging[layer].max(staging);
+                ranges.push((layer, offset, entry.bytes as u64, alignment));
             } else {
                 fixed = fixed
                     .checked_add(entry.bytes)
@@ -1710,7 +1725,7 @@ impl WeightCatalog {
             "prefix-cache identity for streamed dense weights is not bound"
         );
         let available_host = usize::try_from(super::calibrate::host_memory(Path::new("/"))?)?;
-        let (_, plan) = Self::dense_host_fixed(&layers, &layer_staging, budget, available_host)?;
+        let (_, plan) = Self::dense_host_fixed(&layers, &ranges, budget, available_host)?;
         let memory_bus_bits = d
             .ctx
             .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH)?;
@@ -2091,27 +2106,32 @@ mod tests {
                 })?;
                 Ok(())
             };
-            let mut layer_staging = [0usize; 4];
+            let shard_alignment =
+                crate::experts::disk::SpanReader::open(&root.join("model.safetensors"), true)?
+                    .alignment;
+            let mut ranges = Vec::new();
+            let mut max_staging = 0usize;
             for entry in manifest.entries.values() {
                 let layer = entry.layer.context("test layer missing")? as usize;
                 let offset = entry
                     .data_start
                     .checked_add(entry.data_offsets[0])
                     .context("test source offset overflow")?;
-                let staging = crate::experts::disk::DiskReader::range_staging_bytes(
+                let staging = crate::experts::disk::DiskReader::aligned_staging_bytes(
                     offset,
                     entry.bytes as u64,
+                    shard_alignment,
                 )?;
-                layer_staging[layer] = layer_staging[layer].max(staging);
+                max_staging = max_staging.max(staging);
+                ranges.push((layer, offset, entry.bytes as u64, shard_alignment));
             }
-            let max_staging = *layer_staging.iter().max().context("test staging empty")?;
             ensure!(
                 max_staging > UPLOAD_CHUNK_BYTES,
                 "test largest tensor staging {max_staging} does not exceed UPLOAD_CHUNK_BYTES"
             );
             let (host_fixed, host_only_plan) = WeightCatalog::dense_host_fixed(
                 &[per_layer; 4],
-                &layer_staging,
+                &ranges,
                 2 * per_layer,
                 (4 << 30) + 4 * per_layer,
             )?;
@@ -2123,7 +2143,7 @@ mod tests {
             );
             let (disk_fixed, disk_plan) = WeightCatalog::dense_host_fixed(
                 &[per_layer; 4],
-                &layer_staging,
+                &ranges,
                 2 * per_layer,
                 (4 << 30) + 3 * per_layer + UPLOAD_CHUNK_BYTES,
             )?;
@@ -2775,6 +2795,40 @@ mod tests {
         expected.update([0]);
         assert_eq!(count, 5);
         assert_eq!(digest, format!("{:x}", expected.finalize()));
+    }
+
+    #[test]
+    fn dense_host_fixed_reserves_shard_aligned_staging_extent() -> Result<()> {
+        let per_layer = 200_000_000usize;
+        let offset = 4096u64;
+        let len = 100_000_000u64;
+        let staging_4096 =
+            crate::experts::disk::DiskReader::aligned_staging_bytes(offset, len, 4096)?;
+        let staging_8192 =
+            crate::experts::disk::DiskReader::aligned_staging_bytes(offset, len, 8192)?;
+        assert_eq!(staging_4096, 100_003_840);
+        assert_eq!(staging_8192, staging_4096 + 4096);
+        let available_host = (4 << 30) + 3 * per_layer + staging_4096;
+        let ranges_8192 = [0, 1, 2, 3].map(|layer| (layer, offset, len, 8192));
+        let (disk_fixed, disk_plan) = WeightCatalog::dense_host_fixed(
+            &[per_layer; 4],
+            &ranges_8192,
+            2 * per_layer,
+            available_host,
+        )?;
+        assert_eq!(disk_fixed, (4 << 30) + 2 * per_layer + staging_8192);
+        assert_eq!(disk_plan.host_bytes, 0);
+        assert_eq!(disk_plan.disk_bytes, 4 * per_layer);
+        let ranges_4096 = [0, 1, 2, 3].map(|layer| (layer, offset, len, 4096));
+        let (under_fixed, under_plan) = WeightCatalog::dense_host_fixed(
+            &[per_layer; 4],
+            &ranges_4096,
+            2 * per_layer,
+            available_host,
+        )?;
+        assert_eq!(under_fixed, (4 << 30) + 2 * per_layer + staging_4096);
+        assert_eq!(under_plan.host_bytes, per_layer);
+        Ok(())
     }
 
     #[test]

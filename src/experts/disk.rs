@@ -557,12 +557,11 @@ impl DiskReader {
             .collect()
     }
 
-    #[cfg(feature = "cuda")]
-    pub(crate) fn range_staging_bytes(offset: u64, len: u64) -> Result<usize> {
-        Self::aligned_staging_bytes(offset, len, RING_ALIGN as u64)
-    }
-
-    fn aligned_staging_bytes(offset: u64, len: u64, alignment: u64) -> Result<usize> {
+    pub(crate) fn aligned_staging_bytes(offset: u64, len: u64, alignment: u64) -> Result<usize> {
+        ensure!(
+            alignment.is_power_of_two() && alignment >= RING_ALIGN as u64,
+            "invalid expert staging alignment {alignment}"
+        );
         let bytes = (offset % alignment)
             .checked_add(len)
             .and_then(|n| n.checked_add(alignment - 1))
