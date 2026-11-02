@@ -253,6 +253,7 @@ fn flint_engine_short_prefill_gpu() -> Result<()> {
     let settings = Settings {
         runtime_dir: Some(runtime),
         prefix_cache: false,
+        device_budget_gib: None,
         draft_model: None,
         tree_builder: flyingfish::backend::TreeBuilder::Serial,
         spec_budget: flyingfish::backend::SpecBudget::Chain,
@@ -318,6 +319,7 @@ fn flint_engine_prefix_nll_gpu() -> Result<()> {
     let settings = Settings {
         runtime_dir: Some(runtime),
         prefix_cache: false,
+        device_budget_gib: None,
         draft_model: None,
         tree_builder: flyingfish::backend::TreeBuilder::Serial,
         spec_budget: flyingfish::backend::SpecBudget::Chain,

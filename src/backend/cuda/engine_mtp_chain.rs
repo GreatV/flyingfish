@@ -664,6 +664,7 @@ pub(super) mod tests {
                 draft_model: None,
                 runtime_dir: Some(runtime),
                 prefix_cache: false,
+                device_budget_gib: None,
                 kv_format: format,
             },
             write,
@@ -724,6 +725,7 @@ pub(super) mod tests {
             draft_model: None,
             runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
             prefix_cache: false,
+            device_budget_gib: None,
             kv_format: crate::kv::KvFormat::Bf16,
         };
         let signature = |e: &Engine, mtp: bool| -> Result<Vec<u8>> {

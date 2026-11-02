@@ -103,11 +103,12 @@ __device__ __forceinline__ float norm_inv(float sum,uint32_t width,int mode,floa
     float scaled=(width==128u)?__fmul_rn(sum,1.0f/128.0f):(width==256u)?__fmul_rn(sum,1.0f/256.0f):(sum/float(width));
     return rsqrtf(__fadd_rn(scaled,eps));
 }
-template<bool Sigmoid>
+template<int Gate>
 __device__ __forceinline__ __nv_bfloat16 norm_scale(float a,float inv,__nv_bfloat16 wd,__nv_bfloat16 zd,int mode) {
-    if constexpr (Sigmoid) {
+    if constexpr (Gate != 0) {
         float result=__fmul_rn(__fmul_rn(a,inv),__bfloat162float(wd));
-        return __float2bfloat16_rn(__fmul_rn(result,sigmoid(__bfloat162float(zd))));
+        const float gate = Gate == 1 ? sigmoid(__bfloat162float(zd)) : silu(__bfloat162float(zd));
+        return __float2bfloat16_rn(__fmul_rn(result,gate));
     } else {
         float result=__fmul_rn(a,inv);
         if(mode==1 || mode==4) result=__fmul_rn(result,__fadd_rn(1.0f,__bfloat162float(wd)));
@@ -152,7 +153,7 @@ __device__ __forceinline__ float block_inv(float v,float* scratch,uint32_t width
     __syncthreads(); return scratch[0];
 }
 // mode: 0 Standard, 1 ZeroCentered, 2 BF16 L2 chain, 3 StandardGated, 4 ZeroCentered with in-place x += z.
-template <bool Capture, bool Sigmoid = false>
+template <bool Capture, int Gate = 0>
 __device__ __forceinline__ void norm_body(
     __nv_bfloat16* x,const __nv_bfloat16* w,const __nv_bfloat16* z,__nv_bfloat16* y,
     const Q38SequenceMeta* meta,uint32_t row_base,uint32_t row_capacity,
@@ -207,10 +208,10 @@ __device__ __forceinline__ void norm_body(
         Bf16Vec4 vw,vz,vy;
         vw.u=(mode!=2)?reinterpret_cast<const uint2*>(w)[lane]:make_uint2(0u,0u);
         vz.u=(mode==3)?reinterpret_cast<const uint2*>(zs)[lane]:make_uint2(0u,0u);
-        vy.e[0]=norm_scale<Sigmoid>(f0.x,inv,vw.e[0],vz.e[0],mode);
-        vy.e[1]=norm_scale<Sigmoid>(f0.y,inv,vw.e[1],vz.e[1],mode);
-        vy.e[2]=norm_scale<Sigmoid>(f1.x,inv,vw.e[2],vz.e[2],mode);
-        vy.e[3]=norm_scale<Sigmoid>(f1.y,inv,vw.e[3],vz.e[3],mode);
+        vy.e[0]=norm_scale<Gate>(f0.x,inv,vw.e[0],vz.e[0],mode);
+        vy.e[1]=norm_scale<Gate>(f0.y,inv,vw.e[1],vz.e[1],mode);
+        vy.e[2]=norm_scale<Gate>(f1.x,inv,vw.e[2],vz.e[2],mode);
+        vy.e[3]=norm_scale<Gate>(f1.y,inv,vw.e[3],vz.e[3],mode);
         reinterpret_cast<uint2*>(ys)[lane]=vy.u;
         return;
     }
@@ -255,7 +256,7 @@ __device__ __forceinline__ void norm_body(
         vw.u=(mode!=2)?reinterpret_cast<const uint4*>(w)[lane]:make_uint4(0u,0u,0u,0u);
         vz.u=(mode==3)?reinterpret_cast<const uint4*>(zs)[lane]:make_uint4(0u,0u,0u,0u);
         #pragma unroll
-        for(int k=0;k<8;++k) vy.e[k]=norm_scale<Sigmoid>(a[k],inv,vw.e[k],vz.e[k],mode);
+        for(int k=0;k<8;++k) vy.e[k]=norm_scale<Gate>(a[k],inv,vw.e[k],vz.e[k],mode);
         reinterpret_cast<uint4*>(ys)[lane]=vy.u;
         return;
     }
@@ -335,10 +336,10 @@ __device__ __forceinline__ void norm_body(
                 vw.u=(mode!=2)?reinterpret_cast<const uint2*>(w)[d4]:make_uint2(0u,0u);
                 vz.u=(mode==3)?reinterpret_cast<const uint2*>(zs)[d4]:make_uint2(0u,0u);
                 float2 x0=__bfloat1622float2(vx.h[0]),x1=__bfloat1622float2(vx.h[1]);
-                vy.e[0]=norm_scale<Sigmoid>(x0.x,inv,vw.e[0],vz.e[0],mode);
-                vy.e[1]=norm_scale<Sigmoid>(x0.y,inv,vw.e[1],vz.e[1],mode);
-                vy.e[2]=norm_scale<Sigmoid>(x1.x,inv,vw.e[2],vz.e[2],mode);
-                vy.e[3]=norm_scale<Sigmoid>(x1.y,inv,vw.e[3],vz.e[3],mode);
+                vy.e[0]=norm_scale<Gate>(x0.x,inv,vw.e[0],vz.e[0],mode);
+                vy.e[1]=norm_scale<Gate>(x0.y,inv,vw.e[1],vz.e[1],mode);
+                vy.e[2]=norm_scale<Gate>(x1.x,inv,vw.e[2],vz.e[2],mode);
+                vy.e[3]=norm_scale<Gate>(x1.y,inv,vw.e[3],vz.e[3],mode);
                 reinterpret_cast<uint2*>(ys)[d4]=vy.u;
             }
         }
@@ -383,7 +384,7 @@ __device__ __forceinline__ void norm_body(
                 for(int j=0;j<4;++j) {
                     int c=4*group+j;
                     uint32_t d=uint32_t(c)*256u+threadIdx.x;
-                    y[d]=norm_scale<Sigmoid>(xv[c],inv,weights[j],__float2bfloat16_rn(0.0f),1);
+                    y[d]=norm_scale<Gate>(xv[c],inv,weights[j],__float2bfloat16_rn(0.0f),1);
                 }
             }
             return;
@@ -393,7 +394,7 @@ __device__ __forceinline__ void norm_body(
             uint32_t d=uint32_t(c)*256u+threadIdx.x;
             __nv_bfloat16 wd=(mode!=2)?w[d]:__float2bfloat16_rn(0.0f);
             __nv_bfloat16 zd=(mode==3)?z[d]:__float2bfloat16_rn(0.0f);
-            y[d]=norm_scale<Sigmoid>(xv[c],inv,wd,zd,mode);
+            y[d]=norm_scale<Gate>(xv[c],inv,wd,zd,mode);
         }
         return;
     }
@@ -409,7 +410,7 @@ __device__ __forceinline__ void norm_body(
         float a=__bfloat162float(x[uint64_t(d)*xs2]);
         __nv_bfloat16 wd=(mode!=2)?w[d]:__float2bfloat16_rn(0.0f);
         __nv_bfloat16 zd=(mode==3)?z[uint64_t(d)*zs2]:__float2bfloat16_rn(0.0f);
-        y[uint64_t(d)*ys2]=norm_scale<Sigmoid>(a,inv,wd,zd,mode);
+        y[uint64_t(d)*ys2]=norm_scale<Gate>(a,inv,wd,zd,mode);
     }
 }
 extern "C" __global__ __launch_bounds__(256, 4) void q38_norm(
@@ -428,6 +429,15 @@ extern "C" __global__ __launch_bounds__(256, 4) void q38_norm_sigmoid(
     uint64_t zs0,uint64_t zs1,uint64_t zs2,int mode,float eps) {
     if(mode!=3) { __trap(); return; }
     norm_body<false,true>(x,w,z,y,meta,row_base,row_capacity,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,zs0,zs1,zs2,3,eps,nullptr,0,0);
+}
+extern "C" __global__ __launch_bounds__(256, 4) void rms_silu_f32(
+    __nv_bfloat16* x,const __nv_bfloat16* w,const __nv_bfloat16* z,__nv_bfloat16* y,
+    const Q38SequenceMeta* meta,uint32_t row_base,uint32_t row_capacity,
+    uint32_t heads,uint32_t width,
+    uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,
+    uint64_t zs0,uint64_t zs1,uint64_t zs2,int mode,float eps) {
+    if(mode!=3) { __trap(); return; }
+    norm_body<false,2>(x,w,z,y,meta,row_base,row_capacity,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,zs0,zs1,zs2,3,eps,nullptr,0,0);
 }
 extern "C" __global__ __launch_bounds__(256, 4) void q38_norm_capture(
     __nv_bfloat16* x,const __nv_bfloat16* w,const __nv_bfloat16* z,__nv_bfloat16* y,

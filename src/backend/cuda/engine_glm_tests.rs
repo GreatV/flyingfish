@@ -483,6 +483,7 @@ fn glm_composition_gpu() -> Result<()> {
         spec_graph: false,
         draft_model: None,
         prefix_cache: false,
+        device_budget_gib: None,
         kv_format: crate::kv::KvFormat::Bf16,
         runtime_dir: Some(PathBuf::from(
             std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("runtime missing")?,

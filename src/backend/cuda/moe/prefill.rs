@@ -20,7 +20,10 @@ use cudarc::{
     driver::sys as ds,
 };
 use half::bf16;
-use std::sync::{Arc, Mutex};
+use std::{
+    any::TypeId,
+    sync::{Arc, Mutex},
+};
 
 use super::combine::{
     CombineOps, MoeCombine, MoeCombineResidual, MoeCombineRouted, MoeJoinRouted,
@@ -51,7 +54,7 @@ const MAX_GROUPS: usize = MAX_EXPERTS + 2;
 
 /// Caller-owned contribution/done buffers survive cohorts; inputs stay immutable until stream completion.
 #[derive(Debug)]
-pub(crate) struct MoePrefillContribute<'a> {
+pub(crate) struct MoePrefillContribute<'a, W = bf16> {
     pub mask_from_slots: bool,
     pub expert_inter: u32,
     /// Host-packed `(cohort, base, active)` wave expectation checked at the count sync.
@@ -64,7 +67,7 @@ pub(crate) struct MoePrefillContribute<'a> {
     pub fp8_slot: Option<&'a Fp8Slot>,
     pub x: Tensor<bf16, 2>,
     pub ids: Tensor<i32, 2>,
-    pub weights: Tensor<bf16, 2>,
+    pub weights: Tensor<W, 2>,
     /// `[rows, top_k]` THIS cohort's assignment mask.
     pub active: Tensor<u32, 2>,
     pub assignment_gen: Option<Tensor<u64, 2>>,
@@ -257,11 +260,22 @@ impl MoePrefillFinish {
     }
 }
 
-impl MoePrefillContribute<'_> {
+impl<W: Copy + 'static> MoePrefillContribute<'_, W> {
     pub(crate) fn validate(
         &self,
         routed_weight: crate::model_spec::RoutedWeightBoundary,
     ) -> Result<PrefillPlan> {
+        ensure!(
+            TypeId::of::<W>() == TypeId::of::<bf16>() || TypeId::of::<W>() == TypeId::of::<f32>(),
+            "unsupported route weight type"
+        );
+        ensure!(
+            TypeId::of::<W>() != TypeId::of::<f32>()
+                || (self.fp8_slot.is_none()
+                    && routed_weight
+                        == crate::model_spec::RoutedWeightBoundary::BeforeContributionBf16),
+            "FP32 route weights require FP32 down output before contribution rounding"
+        );
         self.x.validate()?;
         let (rows, hidden) = (self.x.shape[0], self.x.shape[1]);
         ensure!(
@@ -883,6 +897,17 @@ impl Stage {
     }
 }
 
+/// Twice, Once and ClampedTwice prefill modes are 0, 1 and 2.
+fn fused_act_mode(rounding: crate::model_spec::SwigluRounding) -> Result<i32> {
+    use crate::model_spec::SwigluRounding as R;
+    Ok(match rounding {
+        R::Twice => 0,
+        R::Once => 1,
+        R::ClampedTwice => 2,
+        R::ClampedOnce => anyhow::bail!("ClampedOnce is not bound in the moe prefill path"),
+    })
+}
+
 pub(crate) struct PrefillOps {
     fp8: Option<(CudaFunction, CudaFunction)>,
     count_scan: CudaFunction,
@@ -891,6 +916,7 @@ pub(crate) struct PrefillOps {
     permute: CudaFunction,
     scatter: CudaFunction,
     scatter_f32: CudaFunction,
+    scatter_route_f32: CudaFunction,
     lane16: CudaFunction,
     lane16_f32: CudaFunction,
     silu: CudaFunction,
@@ -985,6 +1011,7 @@ impl PrefillOps {
             permute: module.load_function("moe_permute")?,
             scatter: module.load_function("moe_scatter")?,
             scatter_f32: module.load_function("moe_scatter_f32")?,
+            scatter_route_f32: module.load_function("moe_scatter_route_f32")?,
             lane16: module.load_function("moe_gemm_lane16")?,
             lane16_f32: module.load_function("moe_gemm_lane16_f32")?,
             silu: act.load_function("silu_mul")?,
@@ -998,10 +1025,10 @@ impl PrefillOps {
     }
 
     /// Count→scan→permute→GEMM1→silu→GEMM2→scatter into caller-owned contribution/done buffers.
-    pub fn prefill_contribute(
+    pub fn prefill_contribute<W: Copy + 'static>(
         &self,
         stream: &Arc<CudaStream>,
-        input: MoePrefillContribute<'_>,
+        input: MoePrefillContribute<'_, W>,
         scratch: &Scratch,
     ) -> Result<()> {
         ensure!(
@@ -1018,10 +1045,10 @@ impl PrefillOps {
         Ok(())
     }
 
-    fn contribute(
+    fn contribute<W: Copy + 'static>(
         &self,
         stream: &Arc<CudaStream>,
-        input: &MoePrefillContribute<'_>,
+        input: &MoePrefillContribute<'_, W>,
         plan: &PrefillPlan,
         scratch: &Scratch,
     ) -> Result<()> {
@@ -1263,7 +1290,7 @@ impl PrefillOps {
                 .arg(&act_at)
                 .arg(&(active_total as i32))
                 .arg(&(inter as i32))
-                .arg(&(self.swiglu_rounding as i32))
+                .arg(&fused_act_mode(self.swiglu_rounding)?)
                 .launch(silu_grid(active_total as usize * inter as usize))?;
         }
 
@@ -1338,7 +1365,11 @@ impl PrefillOps {
         unsafe {
             if output_fp32 {
                 stream
-                    .launch_builder(&self.scatter_f32)
+                    .launch_builder(if TypeId::of::<W>() == TypeId::of::<f32>() {
+                        &self.scatter_route_f32
+                    } else {
+                        &self.scatter_f32
+                    })
                     .arg(&y_perm_at)
                     .arg(&input.weights.ptr)
                     .arg(&pos_of_at)
@@ -1642,7 +1673,7 @@ impl PrefillOps {
                     .arg(&act_s_at)
                     .arg(&(rows as i32))
                     .arg(&(inter as i32))
-                    .arg(&(self.swiglu_rounding as i32))
+                    .arg(&fused_act_mode(self.swiglu_rounding)?)
                     .launch(grid(
                         (rows as usize * inter as usize).div_ceil(BLOCK_THREADS as usize),
                         BLOCK_THREADS,

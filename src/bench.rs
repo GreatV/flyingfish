@@ -257,6 +257,7 @@ mod tests {
                 draft_model: None,
                 runtime_dir: None,
                 prefix_cache: false,
+                device_budget_gib: None,
                 kv_format: crate::kv::KvFormat::Bf16,
             },
             steps: 200,

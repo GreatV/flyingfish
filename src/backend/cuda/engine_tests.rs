@@ -59,6 +59,7 @@ fn llama_rejects_unsupported_draft_blocks_before_device_setup() -> Result<()> {
                             draft_model: Some(draft.clone()),
                             runtime_dir: Some(runtime.clone()),
                             prefix_cache: false,
+                            device_budget_gib: None,
                             kv_format: crate::kv::KvFormat::Bf16,
                         };
                         let error = if write {
@@ -116,6 +117,7 @@ fn closure_graphs_restore_state_and_match_eager() -> Result<()> {
         draft_model: None,
         runtime_dir: Some(runtime),
         prefix_cache: false,
+        device_budget_gib: None,
         kv_format: crate::kv::KvFormat::Bf16,
     };
     Engine::calibrate(&target, 0, 33824, Some(16), settings.clone())?;
@@ -205,6 +207,7 @@ fn closure_graphs_restore_state_and_match_eager() -> Result<()> {
         draft_model: Some(draft),
         runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
         prefix_cache: false,
+        device_budget_gib: None,
         kv_format: crate::kv::KvFormat::Bf16,
     };
     Engine::calibrate(&target, 0, 33824, Some(1024), settings.clone())?;
@@ -327,6 +330,7 @@ fn closure_graphs_restore_state_and_match_eager() -> Result<()> {
         draft_model: Some(PathBuf::from(std::env::var("FF_ARGMAX_DRAFT")?)),
         runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
         prefix_cache: false,
+        device_budget_gib: None,
         kv_format: crate::kv::KvFormat::Bf16,
     };
     Engine::calibrate(&target, 0, 33824, Some(8), settings.clone())?;
@@ -419,6 +423,7 @@ fn chain_argmax_matches_single_on_real_logits() -> Result<()> {
             draft_model: None,
             runtime_dir: Some(runtime.clone()),
             prefix_cache: false,
+            device_budget_gib: None,
             kv_format: crate::kv::KvFormat::Bf16,
         };
         let mut model = Engine::load(
@@ -846,6 +851,7 @@ fn qwen_target_hidden_capture_gpu() -> Result<()> {
         draft_model: Some(draft.clone()),
         runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
         prefix_cache: false,
+        device_budget_gib: None,
         kv_format: crate::kv::KvFormat::Bf16,
     };
     let started = Instant::now();
@@ -1547,6 +1553,7 @@ fn target_hidden_capture_gpu() -> Result<()> {
         draft_model: None,
         runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
         prefix_cache: false,
+        device_budget_gib: None,
         kv_format: crate::kv::KvFormat::Bf16,
     };
     let mut model = Engine::load_kind(&target, 0, 128, Some(17), settings, true)?;
@@ -1774,6 +1781,7 @@ fn q38_tail_prefill_after_ready_uses_bound_linear_bucket() -> Result<()> {
         draft_model: None,
         runtime_dir: Some(runtime),
         prefix_cache: false,
+        device_budget_gib: None,
         kv_format: crate::kv::KvFormat::Bf16,
     };
     let mut engine = Engine::load_kind(&dir, 0, 128, Some(64), settings, false)?;

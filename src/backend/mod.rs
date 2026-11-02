@@ -151,6 +151,10 @@ pub struct Settings {
     pub kv_format: crate::kv::KvFormat,
     #[arg(long, global = true, env = "FLYINGFISH_RUNTIME_DIR")]
     pub runtime_dir: Option<std::path::PathBuf>,
+    /// Declared device budget (GiB) for the expert-tier derivation; unset
+    /// senses the free device memory at setup.
+    #[arg(long, global = true)]
+    pub device_budget_gib: Option<u64>,
 }
 
 impl Settings {

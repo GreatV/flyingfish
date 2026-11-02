@@ -856,7 +856,7 @@ impl DiskExperts {
                 (route.row as usize) < rows
                     && route.expert < self.geometry.experts
                     && (route.choice as usize) < self.max_routes
-                    && route.weight.to_f32().is_finite(),
+                    && route.weight.is_finite(),
                 "disk route outside job bounds: {route:?}"
             );
             ensure!(
@@ -1475,19 +1475,19 @@ mod tests {
                     row: 1,
                     choice: 5,
                     expert: 3,
-                    weight: bf16::from_f32(0.25),
+                    weight: bf16::from_f32(0.25).to_f32(),
                 },
                 Route {
                     row: 0,
                     choice: 1,
                     expert: 0,
-                    weight: bf16::from_f32(0.5),
+                    weight: bf16::from_f32(0.5).to_f32(),
                 },
                 Route {
                     row: 2,
                     choice: 4,
                     expert: 3,
-                    weight: bf16::from_f32(0.75),
+                    weight: bf16::from_f32(0.75).to_f32(),
                 },
             ];
             let mut output = vec![bf16::from_f32(-99.0); 6 * 8];
@@ -1562,7 +1562,7 @@ mod tests {
             row: 0,
             choice: expert,
             expert,
-            weight: bf16::from_f32(0.5),
+            weight: bf16::from_f32(0.5).to_f32(),
         });
         let mut expected = vec![bf16::ZERO; 16];
         pool.run(
@@ -1730,7 +1730,7 @@ mod tests {
             row: 0,
             choice: expert,
             expert,
-            weight: bf16::from_f32(0.5),
+            weight: bf16::from_f32(0.5).to_f32(),
         });
         pool.start(Job {
             layer: 0,
@@ -1817,7 +1817,7 @@ mod tests {
                     row,
                     choice,
                     expert,
-                    weight: bf16::from_f32(weight),
+                    weight: bf16::from_f32(weight).to_f32(),
                 },
             );
             let mut actual = vec![bf16::from_f32(-99.0); 6 * shape.hidden];

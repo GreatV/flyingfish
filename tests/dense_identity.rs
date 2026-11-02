@@ -24,6 +24,7 @@ fn dense_model_identity_gpu() -> Result<()> {
         draft_model: None,
         runtime_dir: Some(PathBuf::from(std::env::var("FLYINGFISH_RUNTIME_DIR")?)),
         prefix_cache: false,
+        device_budget_gib: None,
         kv_format: KvFormat::Bf16,
     };
     #[cfg(feature = "cuda")]
@@ -413,6 +414,7 @@ fn dense_dspark_identity_gpu() -> Result<()> {
             draft_model: Some(draft.clone()),
             runtime_dir: Some(runtime.clone()),
             prefix_cache: false,
+            device_budget_gib: None,
             kv_format: KvFormat::Bf16,
         };
         drop(Model::calibrate(
@@ -597,6 +599,7 @@ fn reference_settings(runtime: &std::path::Path) -> Settings {
         draft_model: None,
         runtime_dir: Some(runtime.to_owned()),
         prefix_cache: false,
+        device_budget_gib: None,
         kv_format: KvFormat::Bf16,
     }
 }

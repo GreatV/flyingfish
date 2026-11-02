@@ -4,6 +4,7 @@ pub mod blas;
 #[cfg(feature = "rocm")]
 #[path = "../hip_blas.rs"]
 pub mod blas;
+pub mod block;
 pub mod calibrate;
 mod closure;
 pub mod contracts;
@@ -36,6 +37,7 @@ pub mod multi_calibrate;
 pub mod ops;
 pub mod profile;
 pub mod quantize;
+pub mod sample;
 pub mod selection;
 pub mod state;
 pub(crate) mod tree;

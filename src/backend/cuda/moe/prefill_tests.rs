@@ -4649,3 +4649,464 @@ fn prefill_combine_residual_and_routed_gpu() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+#[ignore = "GPU window; frozen Clover MoE reference required"]
+fn clover_moe_fp32_residency_cohorts_gpu() -> Result<()> {
+    anyhow::ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window required"
+    );
+    let fixture = reference::CloverMoeFixture::open()?;
+    let device = crate::backend::cuda::Device::new(0)?;
+    let mut defects = 0;
+    for case in fixture.table["moe_cases"]
+        .as_array()
+        .context("MoE cases missing")?
+    {
+        defects += clover_layer_cohorts(&device, &fixture, case)?;
+    }
+    println!(
+        "CLOVER_COHORTS {} cases={} defects={defects}",
+        if defects == 0 { "PASS" } else { "DEFECT" },
+        fixture.table["moe_cases"].as_array().unwrap().len()
+    );
+    anyhow::ensure!(defects == 0, "Clover cohort defects={defects}");
+    Ok(())
+}
+
+fn clover_layer_cohorts(
+    device: &crate::backend::cuda::Device,
+    fixture: &reference::CloverMoeFixture,
+    case: &serde_json::Value,
+) -> Result<usize> {
+    use super::route::{BlockRouteBindings, BlockRoutePlan, RouteOps};
+    use crate::cpu::expert_ffn::{
+        Assignment, ExpertBoundaries, ExpertPool, ExpertWeights, Form, Job, Shape,
+    };
+    use crate::experts::{
+        arena::HostBlocks,
+        catalogue::{ExpertGeometry, ExpertLayout},
+        plan::ParticipantTable,
+    };
+    use crate::model_spec::{ExpertFormat, RoutedWeightBoundary, SwigluRounding};
+    use anyhow::ensure;
+    let s = &device.stream;
+    let tag = case["tag"].as_str().context("MoE tag missing")?;
+    let weight_tag = case["weights_tag"]
+        .as_str()
+        .context("weights tag missing")?;
+    let selected: Vec<usize> = case["experts"]
+        .as_array()
+        .context("experts missing")?
+        .iter()
+        .map(|v| v.as_u64().unwrap() as usize)
+        .collect();
+    let geometry = ExpertGeometry {
+        first_layer: 0,
+        layers: 1,
+        experts: 256,
+        hidden: 2048,
+        intermediate: 512,
+        top_k: 8,
+    };
+    let layout = ExpertLayout::new(ExpertFormat::Bf16, &geometry)?;
+    let slot_words = layout.slot_bytes() as usize / 2;
+    let shape = Shape::new(2048, 512)?;
+    let host = HostBlocks::new(selected.len() as u32, slot_words)?;
+    let mut experts = Vec::new();
+    for (compact, &expert) in selected.iter().enumerate() {
+        let gu = fixture.bf16(&format!("{weight_tag}.expert{expert}.gate_up_proj"))?;
+        let down = fixture.bf16(&format!("{weight_tag}.expert{expert}.down_proj"))?;
+        ensure!(
+            gu.len() == 2 * 512 * 2048 && down.len() == 2048 * 512,
+            "Runner FAIL expert layout"
+        );
+        let mut claim = host.claim(compact as u32)?;
+        let target = claim.slice()?;
+        target[..gu.len()].copy_from_slice(&gu);
+        target[gu.len()..].copy_from_slice(&down);
+        experts.push(ExpertWeights::from_slot(
+            shape,
+            host.block_range(compact as u32)?,
+            &layout,
+        )?);
+    }
+    let x_host = fixture.bf16(&format!("{tag}.x"))?;
+    ensure!(x_host.len() == 32 * 2048, "Runner FAIL production rows");
+    let x = s.clone_htod(&x_host)?;
+    let x_cpu = s.clone_dtoh(&x)?;
+    ensure!(x_cpu == x_host, "Runner FAIL CPU cohort input transfer");
+    let router = s.clone_htod(&fixture.bf16(&format!("{weight_tag}.gate.weight"))?)?;
+    let logits = s.alloc_zeros::<bf16>(32 * 256)?;
+    let valid = s.clone_htod(&vec![1i32; 32])?;
+    let ids = s.alloc_zeros::<i32>(32 * 8)?;
+    let weights = s.alloc_zeros::<f32>(32 * 8)?;
+    let allowed = s.alloc_zeros::<u32>(256)?;
+    let route_scratch = s.alloc_zeros::<u8>(32 * 256 * 4)?;
+    let route = RouteOps::new(&device.ctx, s, 256, 32)?;
+    route.logits_bf16(
+        testing::dense(&x, s, 32, 2048)?,
+        testing::dense(&router, s, 256, 2048)?,
+        &mut testing::dense_mut(&logits, s, 32, 256)?,
+    )?;
+    let plan = BlockRoutePlan::prepare(
+        &device.ctx,
+        BlockRouteBindings {
+            logits: testing::dense(&logits, s, 32, 256)?,
+            valid: testing::view(&valid, s, [32], [1])?,
+            ids: testing::dense_mut(&ids, s, 32, 8)?,
+            weights: testing::dense_mut(&weights, s, 32, 8)?,
+            allowed: testing::mut_view(&allowed, s, [256], [1])?,
+        },
+        Scratch {
+            ptr: route_scratch.device_ptr(s).0,
+            bytes: route_scratch.len() as u64,
+        },
+        case["top_p"].as_f64().map(|p| p as f32),
+    )?;
+    plan.run(s)?;
+    let reference_logits = fixture.values(&format!("{tag}.logits"))?;
+    let native_logits = s.clone_dtoh(&logits)?;
+    let logit_bits_bad = native_logits
+        .iter()
+        .zip(&reference_logits)
+        .filter(|(a, b)| a.to_bits() != bf16::from_f32(**b).to_bits())
+        .count();
+    let logit_delta = native_logits
+        .iter()
+        .zip(&reference_logits)
+        .map(|(a, b)| (a.to_f32() - b).abs())
+        .fold(0.0f32, f32::max);
+    let mut margin = f32::INFINITY;
+    let mut ties = 0;
+    for row in reference_logits.as_chunks::<256>().0 {
+        let mut ranked = row.to_vec();
+        ranked.sort_by(|a, b| b.total_cmp(a));
+        let gap = ranked[7] - ranked[8];
+        margin = margin.min(gap);
+        ties += usize::from(gap == 0.0);
+    }
+    println!(
+        "CLOVER_LAYER_ROUTE_MARGIN tag={tag} logit_max_abs={logit_delta} logit_bits_bad={logit_bits_bad} top8_logit_gap_min={margin} boundary_ties={ties}"
+    );
+    let route_ids = s.clone_dtoh(&ids)?;
+    let route_weights = s.clone_dtoh(&weights)?;
+    ensure!(
+        route_weights.iter().all(|w| w.is_finite()),
+        "Runner FAIL nonfinite route"
+    );
+    let expected_ids = fixture.values(&format!("{tag}.ids"))?;
+    let id_bad = route_ids
+        .iter()
+        .zip(&expected_ids)
+        .filter(|(a, b)| **a != **b as i32)
+        .count();
+    println!(
+        "CLOVER_LAYER_ROUTE {} tag={tag} ids_bad={id_bad}",
+        if id_bad == 0 && logit_bits_bad == 0 {
+            "PASS"
+        } else {
+            "DEFECT"
+        }
+    );
+    if id_bad > 0 {
+        return Ok(1);
+    }
+    let expected_weights = fixture.values(&format!("{tag}.weights"))?;
+    let mut defects = usize::from(logit_bits_bad > 0)
+        + usize::from(route_weights.iter().zip(&expected_weights).any(|(a, b)| {
+            f64::from((a - b).abs())
+                > fixture.table["route_atol"].as_f64().unwrap()
+                    + fixture.table["route_rtol"].as_f64().unwrap() * f64::from(b.abs())
+        }));
+    let shared = SharedBufs {
+        sg: s
+            .clone_htod(&fixture.bf16(&format!("{weight_tag}.shared_expert.gate_proj.weight"))?)?,
+        su: s.clone_htod(&fixture.bf16(&format!("{weight_tag}.shared_expert.up_proj.weight"))?)?,
+        sd: s
+            .clone_htod(&fixture.bf16(&format!("{weight_tag}.shared_expert.down_proj.weight"))?)?,
+        seg: s.clone_htod(&fixture.bf16(&format!("{weight_tag}.shared_expert_gate.weight"))?)?,
+    };
+    let ops = PrefillOps::new_with_boundaries(
+        &device.ctx,
+        s,
+        ExpertFormat::Bf16,
+        SwigluRounding::Once,
+        RoutedWeightBoundary::BeforeContributionBf16,
+    )?;
+    let combine = CombineOps::new(&device.ctx)?;
+    let scratch_bytes = prefill_scratch_bytes_mixed_with_boundary(
+        32,
+        32,
+        8,
+        256,
+        2048,
+        (512, 512),
+        (None, RoutedWeightBoundary::BeforeContributionBf16),
+    )?;
+    let scratch_buf = s.clone_htod(&vec![0xa5u8; scratch_bytes as usize + 256])?;
+    let scratch = Scratch {
+        ptr: scratch_buf.device_ptr(s).0,
+        bytes: scratch_bytes,
+    };
+    let pool = ExpertPool::new_with_boundaries(
+        2,
+        shape,
+        32,
+        256,
+        None,
+        ExpertBoundaries {
+            swiglu_rounding: SwigluRounding::Once,
+            swiglu_limit: 0.0,
+            routed_weight: RoutedWeightBoundary::BeforeContributionBf16,
+        },
+        ParticipantTable::uniform(32, 256, 2)?,
+    )?;
+    let final_active = s.clone_htod(&vec![1u32; 256])?;
+    let mut baseline: Vec<bf16> = Vec::new();
+    let mut cpu_baseline: Vec<bf16> = Vec::new();
+    for mode in [
+        "resident",
+        "stream2",
+        "stream3",
+        "cpu",
+        "mixed",
+        "resident_cast",
+        "cpu_cast",
+    ] {
+        let cast = mode.ends_with("cast");
+        if cast && case["top_p"].as_f64().unwrap() < 0.1 {
+            continue;
+        }
+        let use_cpu = mode == "cpu" || mode == "cpu_cast" || mode == "mixed";
+        let host_route: Vec<f32> = route_weights
+            .iter()
+            .map(|w| {
+                if cast {
+                    bf16::from_f32(*w).to_f32()
+                } else {
+                    *w
+                }
+            })
+            .collect();
+        let mut cpu_mask = vec![0u32; 256];
+        let mut assignments = Vec::new();
+        for (choice, &expert) in route_ids.iter().enumerate() {
+            let compact = selected
+                .iter()
+                .position(|e| *e == expert as usize)
+                .context("Runner FAIL selected expert missing")?;
+            if use_cpu && (mode != "mixed" || compact % 2 == 0) {
+                assignments.push(Assignment {
+                    row: (choice / 8) as u32,
+                    choice: choice as u32,
+                    expert: compact as u32,
+                    weight: host_route[choice],
+                });
+                cpu_mask[choice] = 1;
+            }
+        }
+        let mut cpu_output = vec![bf16::ZERO; 256 * 2048];
+        if !assignments.is_empty() {
+            pool.run(Job {
+                form: Form::Lane16,
+                arena: host.clone(),
+                hidden: &x_cpu,
+                rows: 32,
+                experts: &experts,
+                assignments: &assignments,
+                out: &mut cpu_output,
+            })?;
+        }
+        let mut initial = cpu_output;
+        initial.extend_from_slice(&[bf16::from_f32(-991.0); 64]);
+        let contributions = s.clone_htod(&initial)?;
+        let mut initial_done = cpu_mask.clone();
+        initial_done.extend_from_slice(&[991u32; 64]);
+        let done = s.clone_htod(&initial_done)?;
+        let active_weights = s.clone_htod(&host_route)?;
+        let gpu_experts: Vec<usize> = selected
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !use_cpu || (mode == "mixed" && i % 2 != 0))
+            .map(|(_, e)| *e)
+            .collect();
+        let capacity = match mode {
+            "stream2" | "mixed" => 2,
+            "stream3" => 3,
+            _ => gpu_experts.len().max(1),
+        };
+        let mut slots = s.alloc_zeros::<bf16>(capacity * slot_words)?;
+        for (cohort, chunk) in gpu_experts.chunks(capacity).enumerate() {
+            let generation = (cohort + 1) as u64;
+            let mut gu = vec![0u64; 256];
+            let mut dn = vec![0u64; 256];
+            let mut live = vec![0u32; 256];
+            let native_base = slots.device_ptr(s).0;
+            for (slot, &expert) in chunk.iter().enumerate() {
+                let compact = selected.iter().position(|e| *e == expert).unwrap();
+                let lease = host.lease(&[compact as u32])?;
+                s.memcpy_htod(
+                    lease.read(compact as u32)?,
+                    &mut slots.slice_mut(slot * slot_words..(slot + 1) * slot_words),
+                )?;
+                gu[expert] = native_base + (slot * slot_words * 2) as u64;
+                dn[expert] = gu[expert] + layout.down_offset();
+                live[expert] = 1;
+            }
+            let tables = device_slots(s, gu.clone(), dn.clone(), live, vec![generation; 256])?;
+            let mask: Vec<u32> = route_ids
+                .iter()
+                .map(|e| u32::from(chunk.contains(&(*e as usize))))
+                .collect();
+            let active = s.clone_htod(&mask)?;
+            let generations = s.clone_htod(&vec![generation; 256])?;
+            ops.prefill_contribute(
+                s,
+                MoePrefillContribute {
+                    mask_from_slots: false,
+                    expert_inter: 512,
+                    wave: Some((cohort, 0, mask.iter().sum())),
+                    wait_copy: None,
+                    reader_event: None,
+                    cpu_arithmetic: &[true; 256],
+                    fp8_slot: None,
+                    x: testing::dense(&x, s, 32, 2048)?,
+                    ids: testing::dense(&ids, s, 32, 8)?,
+                    weights: testing::dense(&active_weights, s, 32, 8)?,
+                    active: testing::dense(&active, s, 32, 8)?,
+                    assignment_gen: Some(testing::dense(&generations, s, 32, 8)?),
+                    slots_gate_up: testing::view(&tables.gu_dev, s, [256], [1])?,
+                    slots_down: testing::view(&tables.dn_dev, s, [256], [1])?,
+                    slot_valid: testing::view(&tables.valid, s, [256], [1])?,
+                    slot_generation: testing::view(&tables.generation, s, [256], [1])?,
+                    slots_gate_up_host: &gu,
+                    slots_down_host: &dn,
+                    shared_gate: testing::dense(&shared.sg, s, 512, 2048)?,
+                    shared_up: testing::dense(&shared.su, s, 512, 2048)?,
+                    shared_down: testing::dense(&shared.sd, s, 2048, 512)?,
+                    shared_expert_gate: Some(testing::view(&shared.seg, s, [2048], [1])?),
+                    contributions: testing::view(
+                        &contributions,
+                        s,
+                        [32, 8, 2048],
+                        [8 * 2048, 2048, 1],
+                    )?,
+                    done: testing::dense_mut(&done, s, 32, 8)?,
+                },
+                &scratch,
+            )?;
+            s.synchronize()?;
+        }
+        let routed = s.alloc_zeros::<bf16>(32 * 2048)?;
+        combine.combine_routed_prefill(
+            s,
+            &MoeCombineRouted {
+                ids: testing::dense(&ids, s, 32, 8)?,
+                final_active: testing::dense(&final_active, s, 32, 8)?,
+                done: testing::dense(&done, s, 32, 8)?,
+                contributions: testing::view(
+                    &contributions,
+                    s,
+                    [32, 8, 2048],
+                    [8 * 2048, 2048, 1],
+                )?,
+                routed_out: testing::dense_mut(&routed, s, 32, 2048)?,
+            },
+        )?;
+        let y = s.alloc_zeros::<bf16>(32 * 2048)?;
+        ops.prefill_finish(
+            s,
+            MoePrefillFinish {
+                expert_inter: 512,
+                x: testing::dense(&x, s, 32, 2048)?,
+                ids: testing::dense(&ids, s, 32, 8)?,
+                final_active: testing::dense(&final_active, s, 32, 8)?,
+                contributions: testing::view(
+                    &contributions,
+                    s,
+                    [32, 8, 2048],
+                    [8 * 2048, 2048, 1],
+                )?,
+                done: testing::dense(&done, s, 32, 8)?,
+                experts: 256,
+                shared_gate: testing::dense(&shared.sg, s, 512, 2048)?,
+                shared_up: testing::dense(&shared.su, s, 512, 2048)?,
+                shared_down: testing::dense(&shared.sd, s, 2048, 512)?,
+                shared_expert_gate: Some(testing::view(&shared.seg, s, [2048], [1])?),
+                y: testing::dense_mut(&y, s, 32, 2048)?,
+            },
+            &scratch,
+        )?;
+        let got = s.clone_dtoh(&contributions)?;
+        let done_values = s.clone_dtoh(&done)?;
+        let values = &got[..256 * 2048];
+        ensure!(
+            values.iter().all(|v| v.is_finite()),
+            "Runner FAIL nonfinite contribution {tag} {mode}"
+        );
+        let guards = got[256 * 2048..]
+            .iter()
+            .all(|v| *v == bf16::from_f32(-991.0))
+            && done_values[256..].iter().all(|v| *v == 991)
+            && s.clone_dtoh(&scratch_buf)?[scratch_bytes as usize..]
+                .iter()
+                .all(|v| *v == 0xa5);
+        let complete = done_values[..256].iter().all(|v| *v == 1);
+        let zero_bad = host_route
+            .iter()
+            .enumerate()
+            .filter(|(a, w)| {
+                **w == 0.0
+                    && values[a * 2048..(a + 1) * 2048]
+                        .iter()
+                        .any(|v| *v != bf16::ZERO)
+            })
+            .count();
+        if cast {
+            let original = if mode == "cpu_cast" {
+                &cpu_baseline
+            } else {
+                &baseline
+            };
+            let changed = values
+                .iter()
+                .zip(original)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            defects += usize::from(changed == 0);
+            println!("CLOVER_COHORT_CONTROL tag={tag} mode={mode} changed={changed}");
+        } else {
+            defects += usize::from(!guards || !complete || zero_bad != 0);
+            println!(
+                "CLOVER_COHORT_STRUCTURE tag={tag} mode={mode} capacity={capacity} cohorts={} cpu_assignments={} complete={complete} guards={guards} zero_bad={zero_bad}",
+                gpu_experts.len().div_ceil(capacity),
+                assignments.len()
+            );
+            for (metric, value) in [
+                ("contributions", values.to_vec()),
+                ("routed", s.clone_dtoh(&routed)?),
+                ("output", s.clone_dtoh(&y)?),
+            ] {
+                let pass = fixture.score(tag, metric, &value, &case["bounds"][metric])?;
+                defects += usize::from(!pass);
+            }
+            if mode == "resident" {
+                baseline = values.to_vec();
+            }
+            if mode == "cpu" {
+                cpu_baseline = values.to_vec();
+            }
+            if mode == "stream2" || mode == "stream3" {
+                let equal = values
+                    .iter()
+                    .zip(&baseline)
+                    .all(|(a, b)| a.to_bits() == b.to_bits());
+                defects += usize::from(!equal);
+                println!("CLOVER_COHORT_EQUAL tag={tag} mode={mode} resident_bit_equal={equal}");
+            }
+        }
+    }
+    Ok(defects)
+}

@@ -326,6 +326,7 @@ fn embedding_gemma2_text_matches_frozen_reference() -> Result<()> {
         draft_model: None,
         prefix_cache: false,
         kv_format: flyingfish::kv::KvFormat::Bf16,
+        device_budget_gib: None,
         runtime_dir: Some(std::path::PathBuf::from(
             std::env::var_os("FLYINGFISH_RUNTIME_DIR").context("FLYINGFISH_RUNTIME_DIR")?,
         )),

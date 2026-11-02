@@ -528,26 +528,37 @@ impl ExpertCatalogue {
         format: ExpertFormat,
     ) -> Result<Self> {
         let layout = ExpertLayout::new(format, &geometry)?;
-        let prefix = match format {
-            ExpertFormat::Bf16Separate => "model",
-            ExpertFormat::Bf16 | ExpertFormat::Fp8W8a16 | ExpertFormat::Fp8W8a16Block { .. } => {
-                "model.language_model"
-            }
-            // Audited DeepSeek-V4.1 names: layers.{l}.ffn.experts.{e}.w{1,3}.
-            ExpertFormat::Fp4E2m1Block { .. } => "",
-        };
-        let layer_prefix = if prefix.is_empty() {
-            "layers.".to_owned()
-        } else {
-            format!("{prefix}.layers.")
-        };
-        let layer_ids: BTreeSet<u32> = manifest
+        let mut routed = manifest
             .entries
             .iter()
             .filter(|(name, entry)| {
                 entry.scope == crate::checkpoint::TensorScope::Text
                     && (name.contains(".mlp.experts.") || name.contains(".ffn.experts."))
             })
+            .peekable();
+        let first = routed
+            .peek()
+            .context("manifest has no routed expert tensors")?
+            .0;
+        let prefix = if let Some((prefix, _)) = first.split_once(".layers.") {
+            ensure!(
+                ["model", "model.language_model"].contains(&prefix),
+                "unsupported expert namespace {prefix}"
+            );
+            prefix
+        } else {
+            ensure!(
+                first.starts_with("layers."),
+                "invalid routed-expert layer name {first}"
+            );
+            ""
+        };
+        let layer_prefix = if prefix.is_empty() {
+            "layers.".to_owned()
+        } else {
+            format!("{prefix}.layers.")
+        };
+        let layer_ids: BTreeSet<u32> = routed
             .map(|(name, _)| {
                 let layer = name
                     .strip_prefix(&layer_prefix)
@@ -973,6 +984,22 @@ mod tests {
         assert_eq!(catalogue.slot_bytes(), 192);
         assert!(catalogue.range(2, 0).is_err());
         assert!(catalogue.range(0, 4).is_err());
+        let mut text = manifest();
+        text.entries = text
+            .entries
+            .into_iter()
+            .map(|(name, entry)| (name.replace("model.language_model.", "model."), entry))
+            .collect();
+        let plain = ExpertCatalogue::from_manifest(&text, geometry(), ExpertFormat::Bf16)?;
+        for layer in 0..2 {
+            for expert in 0..4 {
+                assert_eq!(plain.range(layer, expert)?, catalogue.range(layer, expert)?);
+            }
+        }
+        let (name, entry) = text.entries.pop_first().unwrap();
+        text.entries
+            .insert(name.replace("model.", "model.language_model."), entry);
+        assert!(ExpertCatalogue::from_manifest(&text, geometry(), ExpertFormat::Bf16).is_err());
         Ok(())
     }
 

@@ -677,6 +677,107 @@ pub(crate) fn tolerance(fx: &MoeFixture, rows: &[usize]) -> f32 {
     combine_noise(fx, rows).tolerance()
 }
 
+pub(crate) struct CloverMoeFixture {
+    pub table: serde_json::Value,
+    bytes: Vec<u8>,
+}
+
+impl CloverMoeFixture {
+    pub fn open() -> Result<Self> {
+        Self::open_named("moe.safetensors")
+    }
+
+    pub fn open_named(filename: &str) -> Result<Self> {
+        use anyhow::Context;
+        let root = std::path::PathBuf::from(
+            std::env::var_os("FF_CLOVER_REFERENCE").context("FF_CLOVER_REFERENCE missing")?,
+        );
+        let table: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("thresholds.json"))?)?;
+        ensure!(
+            table["revision"] == "4b0402b65e523d0183a14c431955438714cb16ff"
+                && table["schema_keys"] == 813,
+            "Runner FAIL Clover reference identity"
+        );
+        Ok(Self {
+            table,
+            bytes: std::fs::read(root.join(filename))?,
+        })
+    }
+
+    pub fn archive(&self) -> Result<safetensors::SafeTensors<'_>> {
+        Ok(safetensors::SafeTensors::deserialize(&self.bytes)?)
+    }
+
+    pub fn values(&self, name: &str) -> Result<Vec<f32>> {
+        use safetensors::Dtype;
+        let archive = safetensors::SafeTensors::deserialize(&self.bytes)?;
+        let tensor = archive.tensor(name)?;
+        let values = match tensor.dtype() {
+            Dtype::BF16 => tensor
+                .data()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|v| bf16::from_le_bytes(*v).to_f32())
+                .collect(),
+            Dtype::F32 => tensor
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_le_bytes(*v))
+                .collect(),
+            Dtype::I32 => tensor
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| i32::from_le_bytes(*v) as f32)
+                .collect(),
+            dtype => anyhow::bail!("Runner FAIL fixture dtype {name}: {dtype:?}"),
+        };
+        Ok(values)
+    }
+
+    pub fn bf16(&self, name: &str) -> Result<Vec<bf16>> {
+        Ok(self.values(name)?.into_iter().map(bf16::from_f32).collect())
+    }
+
+    pub fn score(
+        &self,
+        tag: &str,
+        metric: &str,
+        values: &[bf16],
+        bound: &serde_json::Value,
+    ) -> Result<bool> {
+        let reference = self.values(&format!("{tag}.fp.{metric}"))?;
+        ensure!(
+            values.len() == reference.len()
+                && values.iter().all(|v| v.is_finite())
+                && reference.iter().all(|v| v.is_finite()),
+            "Runner FAIL MoE shape/nonfinite {tag} {metric}"
+        );
+        let mut maximum = 0.0f64;
+        let mut squared = 0.0f64;
+        let mut norm = 0.0f64;
+        for (value, expected) in values.iter().zip(reference) {
+            let delta = value.to_f64() - f64::from(expected);
+            maximum = maximum.max(delta.abs());
+            squared += delta * delta;
+            norm += f64::from(expected).powi(2);
+        }
+        let relative = (squared / norm.max(1e-60)).sqrt();
+        let pass = maximum <= bound["max_abs"].as_f64().unwrap()
+            && relative <= bound["relative_l2"].as_f64().unwrap();
+        println!(
+            "CLOVER_MOE {} tag={tag} metric={metric} max_abs={maximum:.9e} relative_l2={relative:.9e} bound={bound}",
+            if pass { "PASS" } else { "DEFECT" }
+        );
+        Ok(pass)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

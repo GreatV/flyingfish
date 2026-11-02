@@ -13,6 +13,7 @@ pub struct Ops {
     norm_capture: CudaFunction,
     pub kv_write: CudaFunction,
     pub rope_kv: CudaFunction,
+    rotary_prefix_kv: CudaFunction,
     pub rope_pair_rows: CudaFunction,
     pub rope_pair_tail: CudaFunction,
     pub act: CudaFunction,
@@ -27,7 +28,94 @@ pub struct Ops {
     swiglu_rounding: crate::model_spec::SwigluRounding,
 }
 
+pub struct RotaryPrefixKv {
+    pub q: TensorMut<bf16, 3>,
+    pub key: Tensor<bf16, 3>,
+    pub value: Tensor<bf16, 3>,
+    pub k: TensorMut<bf16, 3>,
+    pub v: TensorMut<bf16, 3>,
+    pub table: Tensor<bf16, 2>,
+    pub start: u32,
+}
+
 impl Ops {
+    pub fn rotary_prefix_kv(&self, stream: &Arc<CudaStream>, b: RotaryPrefixKv) -> Result<()> {
+        let [rows, q_heads, dim] = b.q.0.shape;
+        let kv_heads = b.key.shape[1];
+        let [capacity, rotary] = b.table.shape;
+        ensure!(
+            rows > 0
+                && q_heads > 0
+                && kv_heads > 0
+                && q_heads.is_multiple_of(kv_heads)
+                && rotary > 0
+                && rotary.is_multiple_of(2)
+                && rotary <= dim
+                && b.start.checked_add(rows).is_some_and(|end| end <= capacity)
+                && [rows, q_heads, kv_heads, dim, rotary, capacity]
+                    .iter()
+                    .all(|&n| n <= i32::MAX as u32)
+                && b.key.shape == [rows, kv_heads, dim]
+                && b.value.shape == b.key.shape
+                && b.k.0.shape == [kv_heads, capacity, dim]
+                && b.v.0.shape == b.k.0.shape,
+            "rotary prefix KV geometry/extent mismatch"
+        );
+        for tensor in [&b.q.0, &b.key, &b.value, &b.k.0, &b.v.0] {
+            tensor.validate()?;
+            ensure!(
+                tensor.stride == dense_layout(tensor.shape)?.0,
+                "rotary prefix requires dense tensors"
+            );
+        }
+        b.table.validate()?;
+        ensure!(
+            b.table.stride == dense_layout(b.table.shape)?.0,
+            "rotary prefix table must be dense"
+        );
+        let spans = [
+            (b.q.0.ptr, b.q.0.span_bytes),
+            (b.k.0.ptr, b.k.0.span_bytes),
+            (b.v.0.ptr, b.v.0.span_bytes),
+            (b.key.ptr, b.key.span_bytes),
+            (b.value.ptr, b.value.span_bytes),
+            (b.table.ptr, b.table.span_bytes),
+        ];
+        for i in 0..3 {
+            for &(ptr, bytes) in &spans[i + 1..] {
+                ensure!(
+                    super::contracts::spans_disjoint(spans[i].0, spans[i].1, ptr, bytes)?,
+                    "rotary prefix KV bindings overlap"
+                );
+            }
+        }
+        let count =
+            usize::try_from(u64::from(rows) * u64::from(q_heads + kv_heads) * u64::from(dim))?;
+        ensure!(
+            count <= i32::MAX as usize,
+            "rotary prefix grid exceeds indexing range"
+        );
+        unsafe {
+            stream
+                .launch_builder(&self.rotary_prefix_kv)
+                .arg(&b.q.0.ptr)
+                .arg(&b.key.ptr)
+                .arg(&b.value.ptr)
+                .arg(&b.k.0.ptr)
+                .arg(&b.v.0.ptr)
+                .arg(&b.table.ptr)
+                .arg(&(b.start as i32))
+                .arg(&(rows as i32))
+                .arg(&(q_heads as i32))
+                .arg(&(kv_heads as i32))
+                .arg(&(dim as i32))
+                .arg(&(rotary as i32))
+                .arg(&(capacity as i32))
+                .launch(flat(count))?;
+        }
+        Ok(())
+    }
+
     pub fn finite(
         &self,
         stream: &Arc<CudaStream>,
@@ -202,6 +290,7 @@ impl Ops {
             norm_capture: cubin::module(ctx, "q38_common")?.load_function("q38_norm_capture")?,
             kv_write: rope.load_function("kv_write")?,
             rope_kv: rope_kv.load_function("rope_kv")?,
+            rotary_prefix_kv: rope.load_function("rotary_prefix_kv")?,
             rope_pair_rows: rope.load_function("rope_pair_rows")?,
             rope_pair_tail: rope.load_function("rope_pair_tail")?,
             act: act.load_function("silu_mul")?,
@@ -336,9 +425,13 @@ pub struct GdnChannelGateBindings<'a> {
     pub g: &'a mut TensorMut<f32, 3>,
     pub lower_bound: Option<f32>,
 }
+pub use super::gdn::{GdnBlockBindings, GdnBlockMode, GdnBlockPlan};
+pub use super::moe::route::{BlockRouteBindings, BlockRoutePlan};
+
 pub struct NormOps {
     norm: CudaFunction,
     norm_sigmoid: CudaFunction,
+    norm_silu_f32: CudaFunction,
     layer_norm: CudaFunction,
 }
 pub struct GateOps {
@@ -370,6 +463,7 @@ impl CommonOpsRef {
             norm: Arc::new(NormOps {
                 norm: module.load_function("q38_norm")?,
                 norm_sigmoid: module.load_function("q38_norm_sigmoid")?,
+                norm_silu_f32: module.load_function("rms_silu_f32")?,
                 layer_norm: module.load_function("q38_layer_norm")?,
             }),
             gate: Arc::new(GateOps {
@@ -421,6 +515,7 @@ struct NormLaunch<'a> {
 #[derive(Clone, Copy, PartialEq)]
 pub enum GatedRmsMode {
     SiluBf16,
+    SiluF32,
     SigmoidF32,
 }
 
@@ -861,7 +956,11 @@ impl NormOps {
             eps,
         } = call;
         let mode = match (mode, z.is_some(), gate_mode) {
-            (Some(RmsMode::Standard), true, Some(GatedRmsMode::SiluBf16)) => 3,
+            (
+                Some(RmsMode::Standard),
+                true,
+                Some(GatedRmsMode::SiluBf16 | GatedRmsMode::SiluF32),
+            ) => 3,
             (Some(RmsMode::Standard), true, Some(GatedRmsMode::SigmoidF32)) => 3,
             (Some(RmsMode::ZeroCentered), true, None) => 4,
             (Some(mode), false, None) => mode as i32,
@@ -899,10 +998,10 @@ impl NormOps {
             .checked_mul(x.shape[1])
             .filter(|&n| n <= i32::MAX as u32)
             .ok_or_else(|| anyhow::anyhow!("norm grid overflow"))?;
-        let kernel = if gate_mode == Some(GatedRmsMode::SigmoidF32) {
-            &self.norm_sigmoid
-        } else {
-            &self.norm
+        let kernel = match gate_mode {
+            Some(GatedRmsMode::SigmoidF32) => &self.norm_sigmoid,
+            Some(GatedRmsMode::SiluF32) => &self.norm_silu_f32,
+            _ => &self.norm,
         };
         let spb = norm_slices_per_block(rows.row_capacity, &x, wp, zp, zs, &y.0, mode);
         let blocks = slices.div_ceil(spb);

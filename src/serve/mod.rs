@@ -578,6 +578,7 @@ mod tests {
             spec_graph: false,
             draft_model: None,
             prefix_cache: false,
+            device_budget_gib: None,
             kv_format: crate::kv::KvFormat::Bf16,
             runtime_dir: Some(runtime),
         };

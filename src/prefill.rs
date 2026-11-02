@@ -27,7 +27,7 @@ pub(crate) fn dense_prompt_bytes(
         .context("dense prefill prompt buffer extent overflow")
 }
 
-#[cfg(any(feature = "cuda", test))]
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
 pub(crate) fn chunk_end(start: usize, expected: usize, rows: usize, total: usize) -> Result<usize> {
     ensure!(
         start == expected && rows > 0,
@@ -39,10 +39,8 @@ pub(crate) fn chunk_end(start: usize, expected: usize, rows: usize, total: usize
     ensure!(end <= total, "prefill chunk exceeds the request");
     Ok(end)
 }
-
-#[cfg(any(feature = "cuda", test))]
 #[derive(Debug, Serialize)]
-pub(crate) struct DensePlacement {
+pub struct DensePlacement {
     pub slots: Vec<Option<usize>>,
     pub host: Vec<bool>,
     pub slot_bytes: usize,
@@ -51,9 +49,8 @@ pub(crate) struct DensePlacement {
     pub disk_bytes: usize,
 }
 
-#[cfg(any(feature = "cuda", test))]
 impl DensePlacement {
-    pub(crate) fn device_budget(
+    pub fn device_budget(
         free: usize,
         total: usize,
         fixed: usize,
@@ -67,7 +64,7 @@ impl DensePlacement {
             .context("dense fixed weights, media and workspace exceed VRAM")
     }
 
-    pub(crate) fn new(layers: &[usize], device_bytes: usize, host_bytes: usize) -> Result<Self> {
+    pub fn new(layers: &[usize], device_bytes: usize, host_bytes: usize) -> Result<Self> {
         ensure!(
             !layers.is_empty() && layers.iter().all(|&n| n > 0),
             "empty dense layer extent"

@@ -9,7 +9,6 @@ use crate::experts::plan::{
     seed_scores,
 };
 use anyhow::{Context, Result, ensure};
-use half::bf16;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Instant;
@@ -44,7 +43,7 @@ pub struct Route {
     pub row: u32,
     pub choice: u32,
     pub expert: u32,
-    pub weight: bf16,
+    pub weight: f32,
 }
 
 /// Per-layer dispatch: resident hits with their generation snapshots, host and disk misses.
@@ -1392,7 +1391,7 @@ mod tests {
             row,
             choice,
             expert,
-            weight: bf16::from_f32(1.0),
+            weight: 1.0,
         }
     }
 

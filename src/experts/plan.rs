@@ -434,12 +434,78 @@ pub fn staging_capacity(
     host_bytes: u64,
     copy_engines: u32,
 ) -> Result<(Capacity, Admission)> {
+    native_staging_capacity(
+        geometry,
+        layout,
+        rows,
+        device_bytes,
+        host_bytes,
+        copy_engines,
+        false,
+    )
+}
+
+/// Expert cohorts retain the whole block's FP32 routes and bounded native slots.
+pub fn cohort_capacity(
+    geometry: ExpertGeometry,
+    layout: crate::experts::catalogue::ExpertLayout,
+    rows: u32,
+    device_bytes: u64,
+    host_bytes: u64,
+    copy_engines: u32,
+    staging_slots_max: u32,
+) -> Result<(Capacity, Admission)> {
+    let slot = layout.slot_bytes();
+    ensure!(slot > 0 && geometry.layers > 0, "empty cohort geometry");
+    let available = device_bytes / slot;
+    let complete = u64::from(geometry.layers) * u64::from(geometry.experts);
+    let staging = if available >= complete {
+        0
+    } else {
+        available
+            .checked_div(u64::from(geometry.layers) + 1)
+            .context("cohort staging divisor")?
+            .min(u64::from(rows) * u64::from(geometry.top_k))
+            .min(u64::from(geometry.experts))
+            .min(u64::from(staging_slots_max))
+    };
+    ensure!(
+        available >= complete || staging > 0,
+        "cohort staging cannot fit"
+    );
+    let (mut capacity, admission) = native_staging_capacity(
+        geometry,
+        layout,
+        rows,
+        device_bytes - staging * slot,
+        host_bytes,
+        copy_engines,
+        true,
+    )?;
+    capacity.prefill_staging_slots = u32::try_from(staging)?;
+    capacity.device_expert_bytes = device_bytes;
+    ensure!(
+        u64::from(capacity.slots_total() + capacity.prefill_staging_slots) * slot <= device_bytes,
+        "cohort resident and staging slots exceed VRAM"
+    );
+    Ok((capacity, admission))
+}
+
+fn native_staging_capacity(
+    geometry: ExpertGeometry,
+    layout: crate::experts::catalogue::ExpertLayout,
+    rows: u32,
+    device_bytes: u64,
+    host_bytes: u64,
+    copy_engines: u32,
+    cohorts: bool,
+) -> Result<(Capacity, Admission)> {
     ensure!(
         rows > 0 && geometry.layers > 0 && geometry.top_k > 0,
         "zero native staging extent"
     );
     ensure!(copy_engines > 0, "native staging has no copy engine");
-    let live = rows
+    let mut live = rows
         .checked_mul(geometry.top_k)
         .context("native live route count overflow")?
         .min(geometry.experts);
@@ -448,6 +514,18 @@ pub fn staging_capacity(
     let total = u64::from(geometry.layers) * u64::from(geometry.experts);
     let slots = (device_bytes / slot).min(total);
     let slots_per_layer = equal_slots(slots, geometry.layers)?;
+    if cohorts {
+        live = live.min(
+            *slots_per_layer
+                .iter()
+                .min()
+                .context("empty cohort layers")?,
+        );
+        ensure!(
+            live > 0,
+            "native cohort capacity cannot hold one expert per layer"
+        );
+    }
     ensure!(
         slots_per_layer.iter().all(|&n| n >= live),
         "native GPU slots cannot hold {live} distinct routes per layer"
@@ -503,6 +581,160 @@ pub fn staging_capacity(
         },
         admission,
     ))
+}
+
+/// Setup topology and exact workspace reservations for one layer-major block.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockResources {
+    pub device_free_bytes: u64,
+    pub host_available_bytes: u64,
+    pub device_work_bytes: u64,
+    pub host_work_bytes: u64,
+    pub compute_units: u32,
+    pub copy_engines: u32,
+    pub rows: u32,
+    pub staging_slots_max: u32,
+}
+
+#[derive(Debug)]
+pub struct BlockResidency {
+    pub dense: crate::prefill::DensePlacement,
+    pub experts: Capacity,
+    pub admission: Admission,
+    pub global_dense_bytes: u64,
+    pub device_fixed_bytes: u64,
+    pub host_fixed_bytes: u64,
+    pub minimum_cohort: u32,
+}
+
+impl BlockResidency {
+    pub fn new(
+        spec: &crate::model_spec::ModelSpec,
+        manifest: &crate::checkpoint::TensorManifest,
+        resources: BlockResources,
+    ) -> Result<Self> {
+        use crate::experts::catalogue::ExpertLayout;
+        let geometry = ExpertGeometry::from_model(spec)?;
+        let layout = ExpertLayout::new(
+            spec.expert_format.context("block expert format missing")?,
+            &geometry,
+        )?;
+        let mut layers = vec![0usize; geometry.layers as usize];
+        let (mut global_dense_bytes, mut experts) = (0u64, 0u64);
+        for entry in manifest.entries.values().filter(|entry| entry.load) {
+            if entry.is_routed_expert() {
+                experts = experts
+                    .checked_add(entry.bytes as u64)
+                    .context("block expert bytes overflow")?;
+            } else if let Some(layer) = entry.layer {
+                let index = layer
+                    .checked_sub(geometry.first_layer)
+                    .context("block dense layer before expert layers")?
+                    as usize;
+                let total = layers
+                    .get_mut(index)
+                    .context("block dense layer outside geometry")?;
+                *total = total
+                    .checked_add(entry.bytes)
+                    .context("block dense layer bytes overflow")?;
+            } else {
+                global_dense_bytes = global_dense_bytes
+                    .checked_add(entry.bytes as u64)
+                    .context("block global dense bytes overflow")?;
+            }
+        }
+        let slot = layout.slot_bytes();
+        let expected_expert_bytes = u64::from(geometry.layers) * u64::from(geometry.experts) * slot;
+        ensure!(
+            experts == expected_expert_bytes,
+            "block manifest expert bytes differ from native geometry: {experts} vs {expected_expert_bytes} (layers {}, experts {}, slot {slot}, routed entries {})",
+            geometry.layers,
+            geometry.experts,
+            manifest
+                .entries
+                .values()
+                .filter(|entry| entry.load && entry.is_routed_expert())
+                .count()
+        );
+        ensure!(
+            resources.compute_units > 0 && resources.copy_engines > 0 && resources.rows > 0,
+            "block setup topology/rows missing"
+        );
+        let blocks_per_expert = geometry
+            .intermediate
+            .checked_mul(2)
+            .context("block expert output overflow")?
+            .div_ceil(16);
+        let minimum_cohort = resources
+            .compute_units
+            .div_ceil(blocks_per_expert)
+            .max(1)
+            .min(geometry.experts);
+        let device_fixed_bytes = resources
+            .device_work_bytes
+            .checked_add(global_dense_bytes)
+            .context("block device fixed overflow")?;
+        let device = resources
+            .device_free_bytes
+            .checked_sub(device_fixed_bytes)
+            .context("block global tensors and work exceed VRAM")?;
+        let host = resources
+            .host_available_bytes
+            .checked_sub(resources.host_work_bytes)
+            .context("block host work exceeds available RAM")?;
+        let minimum_slots = u64::from(minimum_cohort) * u64::from(geometry.layers) * slot;
+        let dense_budget = device
+            .checked_sub(minimum_slots)
+            .context("block minimum expert cohort exceeds VRAM")?;
+        let max_cohort = (device / slot / u64::from(geometry.layers))
+            .min(u64::from(resources.rows) * u64::from(geometry.top_k))
+            .min(u64::from(geometry.experts));
+        let host_io = 3 * u64::from(resources.copy_engines.min(2)) * slot;
+        let host_stage = (max_cohort + 1)
+            .checked_mul(slot)
+            .and_then(|n| n.checked_add(host_io))
+            .context("block host staging overflow")?;
+        let host_dense_budget = host
+            .checked_sub(host_stage)
+            .context("block host staging exceeds available RAM")?;
+        let dense = crate::prefill::DensePlacement::new(
+            &layers,
+            usize::try_from(dense_budget)?,
+            usize::try_from(host_dense_budget)?,
+        )?;
+        let dense_device = (dense.resident_bytes as u64)
+            .checked_add(2 * dense.slot_bytes as u64)
+            .context("block dense device bytes overflow")?;
+        let (experts, admission) = cohort_capacity(
+            geometry,
+            layout,
+            resources.rows,
+            device
+                .checked_sub(dense_device)
+                .context("block dense placement exceeds VRAM")?,
+            host.checked_sub(dense.host_bytes as u64)
+                .context("block dense placement exceeds RAM")?,
+            resources.copy_engines,
+            resources.staging_slots_max,
+        )?;
+        ensure!(
+            experts.slots_per_layer.iter().all(|&n| n >= minimum_cohort),
+            "block cohort below derived launch coverage"
+        );
+        let host_fixed_bytes = resources
+            .host_work_bytes
+            .checked_add(host_io)
+            .context("block host fixed bytes overflow")?;
+        Ok(Self {
+            dense,
+            experts,
+            admission,
+            global_dense_bytes,
+            device_fixed_bytes,
+            host_fixed_bytes,
+            minimum_cohort,
+        })
+    }
 }
 
 /// Measured peer capacity, captured 4 KiB decode bounce rate, and eager 8/68 MiB prefill rates.
@@ -1664,6 +1896,90 @@ impl PeerSendLayout {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn block_cohorts_preserve_all_routes_with_bounded_tiers() -> Result<()> {
+        let geometry = ExpertGeometry {
+            first_layer: 0,
+            layers: 40,
+            experts: 256,
+            hidden: 2048,
+            intermediate: 512,
+            top_k: 8,
+        };
+        let layout = crate::experts::catalogue::ExpertLayout::new(
+            crate::model_spec::ExpertFormat::Bf16,
+            &geometry,
+        )?;
+        let slot = layout.slot_bytes();
+        assert_eq!(slot, 6_291_456);
+        for (device, host, copies) in [
+            (18u64 << 30, 40u64 << 30, 2),
+            (5 << 30, 8 << 30, 1),
+            (41 * slot, 16 * slot, 2),
+        ] {
+            assert!(staging_capacity(geometry, layout.clone(), 32, device, host, copies).is_err());
+            let (plan, admission) =
+                cohort_capacity(geometry, layout.clone(), 32, device, host, copies, 256)?;
+            assert_eq!(plan.span_rows, 32);
+            assert_eq!(plan.wave_rows, 32);
+            assert!(plan.slots_per_layer.iter().all(|&n| n > 0 && n < 256));
+            assert!(plan.prefill_staging_slots > 0);
+            assert!(u64::from(plan.slots_total() + plan.prefill_staging_slots) * slot <= device);
+            assert!(plan.spare_blocks >= plan.prefill_staging_slots);
+            assert!(
+                u64::from(plan.host_blocks + plan.spare_blocks + 3 * copies.min(2)) * slot <= host
+            );
+            assert_eq!(
+                u64::from(plan.slots_total() + plan.host_blocks) * slot + plan.disk_bytes,
+                40 * 256 * slot
+            );
+            assert_eq!(admission.hard_cap(slot)?, plan.spare_blocks);
+        }
+        assert!(
+            cohort_capacity(
+                geometry,
+                layout.clone(),
+                32,
+                40 * slot - 1,
+                40 << 30,
+                2,
+                256
+            )
+            .is_err()
+        );
+        assert!(cohort_capacity(geometry, layout, 32, 40 * slot, 7 * slot, 2, 256).is_err());
+        let geometry = ExpertGeometry {
+            first_layer: 0,
+            layers: 30,
+            experts: 128,
+            hidden: 2816,
+            intermediate: 704,
+            top_k: 8,
+        };
+        let layout = crate::experts::catalogue::ExpertLayout::new(
+            crate::model_spec::ExpertFormat::Bf16,
+            &geometry,
+        )?;
+        let slot = layout.slot_bytes();
+        for (available, staging, resident) in [(834u64, 16, 818), (32, 1, 31)] {
+            let (plan, _) = cohort_capacity(
+                geometry,
+                layout.clone(),
+                256,
+                available * slot,
+                40 << 30,
+                2,
+                16,
+            )?;
+            assert_eq!(plan.prefill_staging_slots, staging);
+            assert_eq!(plan.slots_total(), resident);
+            assert_eq!(u64::from(resident + staging) * slot, available * slot);
+            assert_eq!(plan.span_rows, 256);
+        }
+        assert!(cohort_capacity(geometry, layout, 256, 834 * slot, 40 << 30, 2, 0).is_err());
+        Ok(())
+    }
+
     #[test]
     fn native_staging_bounds_glm_block_experts() -> Result<()> {
         let geometry = ExpertGeometry {

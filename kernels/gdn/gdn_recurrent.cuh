@@ -26,7 +26,7 @@
 #define GDN_DK      128
 #define GDN_DV      128
 
-template <int VSPLIT, bool SINGLE, bool SNAPSHOT = false, bool CHANNEL_G = false>
+template <int VSPLIT, bool SINGLE, bool SNAPSHOT = false, bool CHANNEL_G = false, bool MASKED = false>
 __device__
 void gdn_recurrent_t(
         const float* __restrict__ q,      // FP32 [bound, HEADS, DK]
@@ -36,7 +36,8 @@ void gdn_recurrent_t(
         const float* __restrict__ g,
         float* __restrict__ S,            // FP32 [HEADS, DK, DV]
         __nv_bfloat16* __restrict__ out,  // BF16 [bound, HEADS, DV]
-        const Q38SequenceFields* __restrict__ meta, int bound, float* snapshots) {
+        const Q38SequenceFields* __restrict__ meta, int bound, float* snapshots,
+        const int* valid = nullptr) {
     constexpr int VW = GDN_DV / VSPLIT;
     const int head = blockIdx.y;
     const int j0 = blockIdx.x * VW;
@@ -50,9 +51,13 @@ void gdn_recurrent_t(
         __trap(); return;
     }
     if (SNAPSHOT && !aligned16(snapshots)) { __trap(); return; }
-    const int prefix = meta->prefix;
-    const int valid_rows = meta->valid_rows;
-    if (SINGLE) {
+    const int prefix = MASKED ? 0 : meta->prefix;
+    const int valid_rows = MASKED ? bound : meta->valid_rows;
+    if constexpr (MASKED) {
+        if (bound < 1 || bound > 32 || !valid || !aligned16(beta) || !aligned16(g)) {
+            __trap(); return;
+        }
+    } else if (SINGLE) {
         if (valid_rows != 1 || prefix < 0 || meta->causal != 1 ||
             meta->key_count != prefix + valid_rows || meta->capacity < meta->key_count) {
             __trap(); return;
@@ -83,6 +88,16 @@ void gdn_recurrent_t(
 
     const int rows = SINGLE ? 1 : valid_rows;
     for (int row = 0; row < rows; ++row) {
+    if constexpr (MASKED) {
+        if (!valid[row]) {
+            if (ti == 0) {
+                #pragma unroll
+                for (int b = 0; b < TC; ++b)
+                    out[((size_t)row * GDN_HEADS + head) * GDN_DV + j0 + jb + b] = __float2bfloat16_rn(0.0f);
+            }
+            continue;
+        }
+    }
     const float gv = CHANNEL_G ? 0.0f : g[row * GDN_HEADS + head];
     const float bv = beta[row * GDN_HEADS + head];
     const size_t kv0 = ((size_t)row * GDN_HEADS + head) * GDN_DK;

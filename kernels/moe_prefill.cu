@@ -441,9 +441,9 @@ extern "C" __global__ void moe_permute(
   }
 }
 
-template <class T>
+template <class T, class W>
 __device__ __forceinline__ void moe_scatter_rows(
-    const T* __restrict__ y_perm, const bf16* __restrict__ weights,
+    const T* __restrict__ y_perm, const W* __restrict__ weights,
     const int* __restrict__ pos_of, const int* __restrict__ compact,
     bf16* __restrict__ contributions, long long assignments,
     long long hidden, int active_total, int routed_weight_fp32) {
@@ -453,7 +453,9 @@ __device__ __forceinline__ void moe_scatter_rows(
   if (a < 0 || a >= assignments) __trap();
   const int pos = pos_of[a];
   if (pos < 0 || pos >= active_total) __trap();
-  const float w = __bfloat162float(weights[a]);
+  float w;
+  if constexpr (std::is_same_v<W, bf16>) w = __bfloat162float(weights[a]);
+  else w = weights[a];
   const T* __restrict__ src = y_perm + (long long)pos * hidden;
   bf16* __restrict__ dst = contributions + (long long)a * hidden;
   if (hidden % 8 == 0) {
@@ -493,6 +495,15 @@ extern "C" __global__ void moe_scatter(
 
 extern "C" __global__ void moe_scatter_f32(
     const float* __restrict__ y_perm, const bf16* __restrict__ weights,
+    const int* __restrict__ pos_of, const int* __restrict__ compact,
+    bf16* __restrict__ contributions, long long assignments,
+    long long hidden, int active_total, int routed_weight_fp32) {
+  moe_scatter_rows(y_perm, weights, pos_of, compact, contributions,
+                   assignments, hidden, active_total, routed_weight_fp32);
+}
+
+extern "C" __global__ void moe_scatter_route_f32(
+    const float* __restrict__ y_perm, const float* __restrict__ weights,
     const int* __restrict__ pos_of, const int* __restrict__ compact,
     bf16* __restrict__ contributions, long long assignments,
     long long hidden, int active_total, int routed_weight_fp32) {

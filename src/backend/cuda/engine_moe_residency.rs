@@ -1300,7 +1300,7 @@ impl Slots {
                 choice: u32::try_from(choice).context("native tier choice overflow")?,
                 expert: u32::try_from(expert)
                     .context("native tier expert id is negative or too large")?,
-                weight: bf16::from_f32(weight),
+                weight,
             });
         }
         let dispatch = self.policy.dispatch(layer, &self.routes)?;
@@ -1438,7 +1438,7 @@ impl Slots {
                 row: choice as u32 / geometry.top_k,
                 choice: choice as u32,
                 expert,
-                weight,
+                weight: weight.to_f32(),
             });
             if self.policy.ledger().tier(layer, expert)? == Tier::Gpu {
                 let slot = self.policy.ledger().slot(layer, expert)?;
