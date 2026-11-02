@@ -557,6 +557,20 @@ impl DiskReader {
             .collect()
     }
 
+    #[cfg(feature = "cuda")]
+    pub(crate) fn range_staging_bytes(offset: u64, len: u64) -> Result<usize> {
+        Self::aligned_staging_bytes(offset, len, RING_ALIGN as u64)
+    }
+
+    fn aligned_staging_bytes(offset: u64, len: u64, alignment: u64) -> Result<usize> {
+        let bytes = (offset % alignment)
+            .checked_add(len)
+            .and_then(|n| n.checked_add(alignment - 1))
+            .map(|n| n & !(alignment - 1))
+            .context("expert staging extent overflow")?;
+        usize::try_from(bytes).context("expert staging extent exceeds usize")
+    }
+
     fn claim_free_slot(&self) -> Result<usize> {
         let slots = self.ring.len();
         let mut chosen = None;
@@ -698,20 +712,13 @@ impl DiskReader {
                 .iter()
                 .map(|&index| (parts[index].1.offset, parts[index].1.len))
                 .collect();
-            let largest = requests
+            let needed = requests
                 .iter()
-                .map(|&(offset, len)| {
-                    (offset % shard.alignment)
-                        .checked_add(len)
-                        .and_then(|n| n.checked_add(shard.alignment - 1))
-                        .map(|n| n & !(shard.alignment - 1))
-                        .context("expert staging extent overflow")
-                })
+                .map(|&(offset, len)| Self::aligned_staging_bytes(offset, len, shard.alignment))
                 .collect::<Result<Vec<_>>>()?
                 .into_iter()
                 .max()
                 .context("empty native requests")?;
-            let needed = usize::try_from(largest)?;
             let align = usize::try_from(shard.alignment)?;
             let mut staging = match self.staging.take() {
                 Some(buffer) if buffer.len() >= needed && buffer.alignment() >= align => buffer,

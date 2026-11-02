@@ -1604,10 +1604,15 @@ impl WeightCatalog {
     #[cfg(feature = "cuda")]
     fn dense_host_fixed(
         layers: &[usize],
+        layer_staging: &[usize],
         budget: usize,
         available_host: usize,
     ) -> Result<(usize, crate::prefill::DensePlacement)> {
         use crate::prefill::DensePlacement;
+        ensure!(
+            layers.len() == layer_staging.len() && layer_staging.iter().all(|&n| n > 0),
+            "invalid dense layer staging extent"
+        );
         let preliminary = DensePlacement::new(layers, budget, 0)?;
         let base_reserve = 4usize << 30;
         if available_host >= base_reserve {
@@ -1616,18 +1621,32 @@ impl WeightCatalog {
                 return Ok((base_reserve, host_only));
             }
         }
-        let host_fixed = preliminary
-            .slot_bytes
-            .checked_mul(2)
-            .and_then(|n| n.checked_add(UPLOAD_CHUNK_BYTES))
-            .and_then(|n| n.checked_add(base_reserve))
-            .context("dense host staging overflow")?;
-        ensure!(
-            available_host >= host_fixed,
-            "dense pinned staging and host reserve exceed available RAM: need={host_fixed} available={available_host}"
-        );
-        let plan = DensePlacement::new(layers, budget, available_host - host_fixed)?;
-        Ok((host_fixed, plan))
+        let mut disk_staging = 0usize;
+        for _ in 0..=layers.len() {
+            let host_fixed = preliminary
+                .slot_bytes
+                .checked_mul(2)
+                .and_then(|n| n.checked_add(disk_staging))
+                .and_then(|n| n.checked_add(base_reserve))
+                .context("dense host staging overflow")?;
+            ensure!(
+                available_host >= host_fixed,
+                "dense pinned staging and host reserve exceed available RAM: need={host_fixed} available={available_host}"
+            );
+            let plan = DensePlacement::new(layers, budget, available_host - host_fixed)?;
+            let required_staging = layer_staging
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| plan.slots[i].is_some() && !plan.host[i])
+                .map(|(_, &bytes)| bytes)
+                .max()
+                .unwrap_or(0);
+            if required_staging <= disk_staging {
+                return Ok((host_fixed, plan));
+            }
+            disk_staging = required_staging;
+        }
+        anyhow::bail!("dense disk staging extent did not converge")
     }
 
     #[cfg(feature = "cuda")]
@@ -1647,15 +1666,26 @@ impl WeightCatalog {
         let mapped = MappedCheckpoint::open(dir)?;
         let manifest = mapped.manifest(spec, crate::checkpoint::LoadPolicy::TextOnly)?;
         let mut layers = vec![0usize; spec.layers.len()];
+        let mut layer_staging = vec![0usize; spec.layers.len()];
         let mut fixed = 0usize;
         for entry in manifest.entries.values().filter(|e| e.load) {
             if entry.is_linear_projection()
                 && let Some(layer) = entry.layer
             {
                 ensure!(entry.dtype == Dtype::BF16, "dense layer matrix is not BF16");
-                layers[layer as usize] = layers[layer as usize]
+                let layer = layer as usize;
+                layers[layer] = layers[layer]
                     .checked_add(entry.bytes)
                     .context("dense layer size overflow")?;
+                let offset = entry
+                    .data_start
+                    .checked_add(entry.data_offsets[0])
+                    .context("dense source offset overflow")?;
+                let staging = crate::experts::disk::DiskReader::range_staging_bytes(
+                    offset,
+                    entry.bytes as u64,
+                )?;
+                layer_staging[layer] = layer_staging[layer].max(staging);
             } else {
                 fixed = fixed
                     .checked_add(entry.bytes)
@@ -1680,7 +1710,7 @@ impl WeightCatalog {
             "prefix-cache identity for streamed dense weights is not bound"
         );
         let available_host = usize::try_from(super::calibrate::host_memory(Path::new("/"))?)?;
-        let (_, plan) = Self::dense_host_fixed(&layers, budget, available_host)?;
+        let (_, plan) = Self::dense_host_fixed(&layers, &layer_staging, budget, available_host)?;
         let memory_bus_bits = d
             .ctx
             .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH)?;
@@ -2061,8 +2091,27 @@ mod tests {
                 })?;
                 Ok(())
             };
+            let mut layer_staging = [0usize; 4];
+            for entry in manifest.entries.values() {
+                let layer = entry.layer.context("test layer missing")? as usize;
+                let offset = entry
+                    .data_start
+                    .checked_add(entry.data_offsets[0])
+                    .context("test source offset overflow")?;
+                let staging = crate::experts::disk::DiskReader::range_staging_bytes(
+                    offset,
+                    entry.bytes as u64,
+                )?;
+                layer_staging[layer] = layer_staging[layer].max(staging);
+            }
+            let max_staging = *layer_staging.iter().max().context("test staging empty")?;
+            ensure!(
+                max_staging > UPLOAD_CHUNK_BYTES,
+                "test largest tensor staging {max_staging} does not exceed UPLOAD_CHUNK_BYTES"
+            );
             let (host_fixed, host_only_plan) = WeightCatalog::dense_host_fixed(
                 &[per_layer; 4],
+                &layer_staging,
                 2 * per_layer,
                 (4 << 30) + 4 * per_layer,
             )?;
@@ -2074,14 +2123,15 @@ mod tests {
             );
             let (disk_fixed, disk_plan) = WeightCatalog::dense_host_fixed(
                 &[per_layer; 4],
+                &layer_staging,
                 2 * per_layer,
-                (4 << 30) + 2 * per_layer + UPLOAD_CHUNK_BYTES,
+                (4 << 30) + 3 * per_layer + UPLOAD_CHUNK_BYTES,
             )?;
             ensure!(
-                disk_fixed == (4 << 30) + 2 * per_layer + UPLOAD_CHUNK_BYTES
+                disk_fixed == (4 << 30) + 2 * per_layer + max_staging
                     && disk_plan.host_bytes == 0
                     && disk_plan.disk_bytes == 4 * per_layer,
-                "disk-spill placement did not reserve disk staging bytes: disk_fixed={disk_fixed} plan={disk_plan:?}"
+                "disk-spill placement did not reserve derived disk staging bytes: disk_fixed={disk_fixed} max_staging={max_staging} plan={disk_plan:?}"
             );
             let stream = &device.stream;
             let mut outputs = (0..4)
