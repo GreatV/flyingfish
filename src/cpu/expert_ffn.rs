@@ -62,26 +62,39 @@ fn silu_mul_value(
     limit: f32,
     form: Form,
 ) -> f32 {
+    let gelu = matches!(rounding, crate::model_spec::SwigluRounding::GeluTwice);
     let (gate, up) = match rounding {
         crate::model_spec::SwigluRounding::ClampedTwice
         | crate::model_spec::SwigluRounding::ClampedOnce => {
             (gate.to_f32().min(limit), up.to_f32().clamp(-limit, limit))
         }
-        crate::model_spec::SwigluRounding::Twice | crate::model_spec::SwigluRounding::Once => {
-            (gate.to_f32(), up.to_f32())
-        }
+        crate::model_spec::SwigluRounding::Twice
+        | crate::model_spec::SwigluRounding::Once
+        | crate::model_spec::SwigluRounding::GeluTwice => (gate.to_f32(), up.to_f32()),
     };
     // The lane16 kernel computes `g * (1/(1+exp(-g)))`; the production kernel computes
     // `g / (1+exp(-g))`. The two round differently, so the form selects the expression.
-    let silu = match form {
-        Form::Lane16 => gate * (1.0 / (1.0 + (-gate).exp())),
-        Form::Lane8 => gate / (1.0 + (-gate).exp()),
+    let activated = if gelu {
+        let cube = gate * gate * gate;
+        let inner = 0.797_884_6f32 * (gate + 0.044_715f32 * cube);
+        0.5f32 * gate * (1.0f32 + inner.tanh())
+    } else {
+        match form {
+            Form::Lane16 => gate * (1.0 / (1.0 + (-gate).exp())),
+            Form::Lane8 => gate / (1.0 + (-gate).exp()),
+        }
     };
     match rounding {
         crate::model_spec::SwigluRounding::Twice
-        | crate::model_spec::SwigluRounding::ClampedTwice => bf16::from_f32(silu).to_f32() * up,
+        | crate::model_spec::SwigluRounding::ClampedTwice => {
+            bf16::from_f32(activated).to_f32() * up
+        }
         crate::model_spec::SwigluRounding::Once
-        | crate::model_spec::SwigluRounding::ClampedOnce => silu * up,
+        | crate::model_spec::SwigluRounding::ClampedOnce => activated * up,
+        crate::model_spec::SwigluRounding::GeluTwice => {
+            let g = bf16::from_f32(activated);
+            bf16::from_f32(g.to_f32() * up).to_f32()
+        }
     }
 }
 
