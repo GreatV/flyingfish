@@ -84,7 +84,8 @@ impl VisionGeometry {
             | crate::model_spec::Architecture::DeepseekV41
             | crate::model_spec::Architecture::Gemma4
             | crate::model_spec::Architecture::EmbeddingGemma2
-            | crate::model_spec::Architecture::Clover => {
+            | crate::model_spec::Architecture::Clover
+            | crate::model_spec::Architecture::DiffusionGemma => {
                 bail!("vision configuration requires a multimodal architecture")
             }
         };
@@ -1070,7 +1071,8 @@ impl VisionWeights {
             | Architecture::LoopVl
             | Architecture::Gemma4
             | Architecture::EmbeddingGemma2
-            | Architecture::Clover => {
+            | Architecture::Clover
+            | Architecture::DiffusionGemma => {
                 bail!("vision configuration requires a multimodal architecture")
             }
             Architecture::DeepseekV41 => {
@@ -2262,7 +2264,8 @@ impl LayerNormTower {
             | Architecture::LoopVl
             | Architecture::Gemma4
             | Architecture::EmbeddingGemma2
-            | Architecture::Clover => {
+            | Architecture::Clover
+            | Architecture::DiffusionGemma => {
                 bail!("vision configuration requires a multimodal architecture")
             }
             Architecture::DeepseekV41 => {
@@ -2330,7 +2333,8 @@ impl LayerNormTower {
                 | Architecture::LoopVl
                 | Architecture::Gemma4
                 | Architecture::EmbeddingGemma2
-                | Architecture::Clover => {
+                | Architecture::Clover
+                | Architecture::DiffusionGemma => {
                     bail!("vision configuration requires a multimodal architecture")
                 }
                 Architecture::DeepseekV41 => {

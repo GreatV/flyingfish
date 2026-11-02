@@ -680,6 +680,30 @@ impl Loader<'_> {
         );
         Ok(())
     }
+    /// Validate and mark tensors without uploading them; the tier planner
+    /// owns their placement outside the device upload closure.
+    pub(crate) fn mark(&mut self, specs: &[(String, Vec<usize>)]) -> Result<()> {
+        for (name, shape) in specs {
+            let file = self
+                .index
+                .weight_map
+                .get(name)
+                .with_context(|| format!("missing tensor {name}"))?;
+            let tensor = self.tensors[file].tensor(name)?;
+            ensure!(
+                tensor.dtype() == Dtype::BF16,
+                "tensor {name}: expected BF16, found {:?}",
+                tensor.dtype()
+            );
+            ensure!(
+                tensor.shape() == *shape,
+                "tensor {name}: expected {shape:?}, found {:?}",
+                tensor.shape()
+            );
+            ensure!(self.seen.insert(name.clone()), "tensor {name} loaded twice");
+        }
+        Ok(())
+    }
 
     pub(crate) fn load(&mut self, specs: &[(String, Vec<usize>)]) -> Result<CudaSlice<bf16>> {
         let count = specs.iter().try_fold(0usize, |total, (_, shape)| {
@@ -2958,5 +2982,146 @@ LOOP:
             expected_b.len()
         );
         Ok(())
+    }
+}
+
+/// DiffusionGemma decoder layer. The published BF16 tensors are placed
+/// adjacent at upload; values are unchanged. Sliding layers pack q|k|v; full
+/// layers pack q|k and derive V from the shared projection (k_eq_v). Experts
+/// hold the fused [experts, 2*inter, hidden] / [experts, hidden, inter] form
+/// of the checkpoint, device-resident.
+pub(crate) struct DiffusionLayer {
+    pub qkv: CudaSlice<bf16>,
+    pub q_norm: CudaSlice<bf16>,
+    pub k_norm: CudaSlice<bf16>,
+    pub o: CudaSlice<bf16>,
+    pub input_norm: CudaSlice<bf16>,
+    pub post_attn: CudaSlice<bf16>,
+    pub pre_ffn: CudaSlice<bf16>,
+    pub pre_ffn2: CudaSlice<bf16>,
+    pub post1: CudaSlice<bf16>,
+    pub post2: CudaSlice<bf16>,
+    pub post: CudaSlice<bf16>,
+    pub dense_gu: CudaSlice<bf16>,
+    pub dense_down: CudaSlice<bf16>,
+    pub router_proj: CudaSlice<bf16>,
+    pub router_scale: CudaSlice<bf16>,
+    pub per_expert_scale: CudaSlice<bf16>,
+    pub layer_scalar: CudaSlice<bf16>,
+}
+
+pub(crate) struct DiffusionWeights {
+    pub embed: CudaSlice<bf16>,
+    pub final_norm: CudaSlice<bf16>,
+    pub layers: Vec<DiffusionLayer>,
+    pub encoder_scalars: Vec<CudaSlice<bf16>>,
+    pub sc_pre_norm: CudaSlice<bf16>,
+    pub sc_gu: CudaSlice<bf16>,
+    pub sc_down: CudaSlice<bf16>,
+}
+
+impl DiffusionWeights {
+    pub(crate) fn load(
+        dir: &Path,
+        spec: &crate::model_spec::ModelSpec,
+        d: &Device,
+    ) -> Result<Self> {
+        let mapped = MappedCheckpoint::open(dir)?;
+        let manifest = mapped.manifest(spec, crate::checkpoint::LoadPolicy::TextOnly)?;
+        let (weights, _) = checkpoint_mapped(&mapped, d, Some(&manifest), false, |l| {
+            let h = spec.hidden as usize;
+            let dense = spec.intermediate as usize;
+            let moe = spec.moe.as_ref().context("DiffusionGemma MoE missing")?;
+            let e = moe.experts as usize;
+            let ei = moe.expert_intermediate as usize;
+            let mut layers = Vec::new();
+            for (i, plan) in spec.layers.iter().enumerate() {
+                let g = plan.geometry.context("layer geometry missing")?;
+                let dim = g.head_dim as usize;
+                let kvh = g.kv_heads.unwrap_or(spec.kv_heads) as usize;
+                let qh = spec.q_heads as usize;
+                let p = format!("model.decoder.layers.{i}");
+                let mut qkv_specs = vec![
+                    (format!("{p}.self_attn.q_proj.weight"), vec![qh * dim, h]),
+                    (format!("{p}.self_attn.k_proj.weight"), vec![kvh * dim, h]),
+                ];
+                if plan.sliding_window.is_some() {
+                    qkv_specs.push((format!("{p}.self_attn.v_proj.weight"), vec![kvh * dim, h]));
+                }
+                let qkv = l.load(&qkv_specs)?;
+
+                let layer = DiffusionLayer {
+                    qkv,
+                    q_norm: l.load(&[(format!("{p}.self_attn.q_norm.weight"), vec![dim])])?,
+                    k_norm: l.load(&[(format!("{p}.self_attn.k_norm.weight"), vec![dim])])?,
+                    o: l.load(&[(format!("{p}.self_attn.o_proj.weight"), vec![h, qh * dim])])?,
+                    input_norm: l.load(&[(format!("{p}.input_layernorm.weight"), vec![h])])?,
+                    post_attn: l
+                        .load(&[(format!("{p}.post_attention_layernorm.weight"), vec![h])])?,
+                    pre_ffn: l
+                        .load(&[(format!("{p}.pre_feedforward_layernorm.weight"), vec![h])])?,
+                    pre_ffn2: l
+                        .load(&[(format!("{p}.pre_feedforward_layernorm_2.weight"), vec![h])])?,
+                    post1: l
+                        .load(&[(format!("{p}.post_feedforward_layernorm_1.weight"), vec![h])])?,
+                    post2: l
+                        .load(&[(format!("{p}.post_feedforward_layernorm_2.weight"), vec![h])])?,
+                    post: l.load(&[(format!("{p}.post_feedforward_layernorm.weight"), vec![h])])?,
+                    dense_gu: l.load(&[
+                        (format!("{p}.mlp.gate_proj.weight"), vec![dense, h]),
+                        (format!("{p}.mlp.up_proj.weight"), vec![dense, h]),
+                    ])?,
+                    dense_down: l.load(&[(format!("{p}.mlp.down_proj.weight"), vec![h, dense])])?,
+                    router_proj: l.load(&[(format!("{p}.router.proj.weight"), vec![e, h])])?,
+                    router_scale: l.load(&[(format!("{p}.router.scale"), vec![h])])?,
+                    per_expert_scale: l
+                        .load(&[(format!("{p}.router.per_expert_scale"), vec![e])])?,
+                    layer_scalar: l.load(&[(format!("{p}.layer_scalar"), vec![1])])?,
+                };
+                layers.push(layer);
+            }
+            let mut encoder_scalars = Vec::new();
+            for i in 0..spec.layers.len() {
+                encoder_scalars.push(l.load(&[(
+                    format!("model.encoder.language_model.layers.{i}.layer_scalar"),
+                    vec![1],
+                )])?);
+                let p = format!("model.decoder.layers.{i}");
+                l.mark(&[
+                    (format!("{p}.experts.gate_up_proj"), vec![e, 2 * ei, h]),
+                    (format!("{p}.experts.down_proj"), vec![e, h, ei]),
+                ])?;
+            }
+            let embed = l.load(&[(
+                "model.decoder.embed_tokens.weight".to_owned(),
+                vec![spec.vocab as usize, h],
+            )])?;
+            let final_norm = l.load(&[("model.decoder.norm.weight".to_owned(), vec![h])])?;
+            Ok(Self {
+                embed,
+                final_norm,
+                layers,
+                encoder_scalars,
+                sc_pre_norm: l.load(&[(
+                    "model.decoder.self_conditioning.pre_norm.weight".to_owned(),
+                    vec![h],
+                )])?,
+                sc_gu: l.load(&[
+                    (
+                        "model.decoder.self_conditioning.gate_proj.weight".to_owned(),
+                        vec![dense, h],
+                    ),
+                    (
+                        "model.decoder.self_conditioning.up_proj.weight".to_owned(),
+                        vec![dense, h],
+                    ),
+                ])?,
+                sc_down: l.load(&[(
+                    "model.decoder.self_conditioning.down_proj.weight".to_owned(),
+                    vec![h, dense],
+                )])?,
+            })
+        })?;
+        Ok(weights)
     }
 }

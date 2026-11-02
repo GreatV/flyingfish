@@ -1500,6 +1500,262 @@ fn moe_route_prefill_gpu() -> Result<()> {
     Ok(())
 }
 
+/// CPU mirror of the DiffusionGemma router pre-form (definition Router.forward):
+/// FP32 sum of squares in element order, mean + eps, powf(-0.5), BF16 rounding
+/// after the norm, after the scale product and after the root product.
+fn diffusion_prescale_reference(x: &[bf16], scale: &[bf16], hidden: usize, eps: f32) -> Vec<bf16> {
+    let root = (hidden as f64).powf(-0.5) as f32;
+    x.chunks(hidden)
+        .flat_map(|row| {
+            let ss: f32 = row
+                .iter()
+                .map(|v| {
+                    let f = bf16::to_f32(*v);
+                    f * f
+                })
+                .sum();
+            let inv = ((ss / hidden as f32 + eps) as f64).powf(-0.5) as f32;
+            row.iter()
+                .zip(scale)
+                .map(|(v, s)| {
+                    let normed = bf16::from_f32(bf16::to_f32(*v) * inv);
+                    let scaled = bf16::from_f32(bf16::to_f32(normed) * bf16::to_f32(*s));
+                    bf16::from_f32(bf16::to_f32(scaled) * root)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// CPU mirror of the DiffusionGemma router selection: FP32 max-subtracted
+/// softmax, top-k by (probability desc, id asc), renormalised in descending
+/// order, multiplied by per_expert_scale.
+fn diffusion_topk_reference(
+    logits: &[bf16],
+    per_expert_scale: &[bf16],
+    experts: usize,
+    top_k: usize,
+) -> Result<(Vec<i32>, Vec<f32>)> {
+    let mut ids = Vec::with_capacity(top_k);
+    let mut weights = Vec::with_capacity(top_k);
+    for row in logits.chunks(experts) {
+        let l: Vec<f32> = row.iter().map(|v| bf16::to_f32(*v)).collect();
+        let mx = l.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let p: Vec<f32> = l.iter().map(|v| (v - mx).exp()).collect();
+        let sum: f32 = p.iter().sum();
+        let probs: Vec<f32> = p.iter().map(|v| v / sum).collect();
+        let mut order: Vec<usize> = (0..experts).collect();
+        order.sort_by(|a, b| probs[*b].partial_cmp(&probs[*a]).unwrap().then(a.cmp(b)));
+        let chosen: Vec<usize> = order[..top_k].to_vec();
+        let tsum: f32 = chosen.iter().map(|e| probs[*e]).sum();
+        for e in chosen {
+            ids.push(e as i32);
+            weights.push((probs[e] / tsum) * bf16::to_f32(per_expert_scale[e]));
+        }
+    }
+    Ok((ids, weights))
+}
+
+#[test]
+#[ignore = "requires coordinator-granted GPU window; FF_Q38_GPU_WINDOW=granted"]
+fn diffusion_router_prescale_and_scaled_topk_gpu() -> Result<()> {
+    ensure!(
+        std::env::var("FF_Q38_GPU_WINDOW").as_deref() == Ok("granted"),
+        "GPU window not acknowledged"
+    );
+    let (rows, h, e, k) = (256usize, 2816usize, 128usize, 8usize);
+    let eps = 1e-6f32;
+    let d = Device::new(0)?;
+    let s = &d.stream;
+    use crate::backend::gpu::DevicePtr;
+    let route_mod = cubin::module(&d.ctx, "moe_route")?;
+    let prescale_fn = route_mod.load_function("moe_route_prescale_bf16")?;
+    let topk_fn = route_mod.load_function("moe_route_topk_softmax_scale_f32")?;
+    let x: Vec<_> = (0..rows * h)
+        .map(|i| {
+            let (r, c) = (i / h, i % h);
+            bf16::from_f32((((r * 71 + c * 13) % 509) as f32 / 97.0) * (((r % 5) as f32) - 2.0))
+        })
+        .collect();
+    let scale: Vec<_> = (0..h)
+        .map(|c| bf16::from_f32(0.75 + 0.5 * ((c % 17) as f32 / 17.0)))
+        .collect();
+    let per_expert_scale: Vec<_> = (0..e)
+        .map(|e| bf16::from_f32(0.5 + ((e * 29 % 97) as f32) / 48.0))
+        .collect();
+    let mut logits: Vec<_> = (0..rows * e)
+        .map(|i| bf16::from_f32((((i / e) * 31 + (i % e) * 7) % 89) as f32 / 11.0 - 4.0))
+        .collect();
+    // Row 3: exact bf16 tie between experts 40 and 41 straddling nothing (both
+    // inside the top 8); row 5: an exact tie between experts 17 (in) and 90
+    // (out) exactly at the top-8 boundary.
+    logits[3 * e + 41] = logits[3 * e + 40];
+    let above = bf16::from_f32(9.5);
+    let boundary = bf16::from_f32(9.0);
+    for row in [5usize] {
+        for slot in 0..7 {
+            logits[row * e + slot] = above;
+        }
+        logits[row * e + 17] = boundary;
+        logits[row * e + 90] = boundary;
+    }
+
+    let want_prescale = diffusion_prescale_reference(&x, &scale, h, eps);
+    let (want_ids, want_weights) = diffusion_topk_reference(&logits, &per_expert_scale, e, k)?;
+
+    let dx = s.clone_htod(&x)?;
+    let dscale = s.clone_htod(&scale)?;
+    let dexpert = s.clone_htod(&per_expert_scale)?;
+    let dlogits = s.clone_htod(&logits)?;
+    let dy = s.clone_htod(&vec![bf16::ZERO; rows * h])?;
+    let dids = s.clone_htod(&vec![-1i32; rows * k])?;
+    let dweights = s.clone_htod(&vec![f32::NAN; rows * k])?;
+    d.finish_upload()?;
+
+    let root = (h as f64).powf(-0.5) as f32;
+    let prescale_launch = |scale: &crate::backend::gpu::CudaSlice<bf16>| -> Result<()> {
+        let (xptr, _) = dx.device_ptr(s);
+        let (sptr, _) = scale.device_ptr(s);
+        let (yptr, _) = dy.device_ptr(s);
+        unsafe {
+            s.launch_builder(&prescale_fn)
+                .arg(&xptr)
+                .arg(&sptr)
+                .arg(&yptr)
+                .arg(&(rows as i32))
+                .arg(&(h as i32))
+                .arg(&eps)
+                .arg(&root)
+                .launch(crate::backend::cuda::ops::grid(rows, 256))?;
+        }
+        Ok(())
+    };
+    let topk_launch = |logits: &crate::backend::gpu::CudaSlice<bf16>| -> Result<()> {
+        let (lptr, _) = logits.device_ptr(s);
+        let (eptr, _) = dexpert.device_ptr(s);
+        let (iptr, _) = dids.device_ptr(s);
+        let (wptr, _) = dweights.device_ptr(s);
+        unsafe {
+            s.launch_builder(&topk_fn)
+                .arg(&lptr)
+                .arg(&eptr)
+                .arg(&iptr)
+                .arg(&wptr)
+                .arg(&(rows as i32))
+                .arg(&(e as i32))
+                .arg(&(k as i32))
+                .launch(crate::backend::cuda::ops::grid(
+                    rows,
+                    (e.div_ceil(32) * 32) as u32,
+                ))?;
+        }
+        Ok(())
+    };
+    let run = || {
+        prescale_launch(&dscale)?;
+        topk_launch(&dlogits)
+    };
+    run()?;
+    s.synchronize()?;
+    let got_y = s.clone_dtoh(&dy)?;
+    let got_ids = s.clone_dtoh(&dids)?;
+    let got_weights = s.clone_dtoh(&dweights)?;
+
+    let ulp = |a: bf16, b: bf16| -> u32 {
+        ((a.to_bits() as i16)
+            .wrapping_sub(b.to_bits() as i16)
+            .unsigned_abs()) as u32
+    };
+    let mut worst = 0u32;
+    let mut equal = 0usize;
+    for (g, w) in got_y.iter().zip(&want_prescale) {
+        worst = worst.max(ulp(*g, *w));
+        equal += usize::from(g.to_bits() == w.to_bits());
+    }
+    ensure!(
+        // 2026-10-31 gate corrections, before any candidate PASS was
+        // recorded: first frozen as 1-ULP/99.9%, then 2-ULP, then 3 ULP.
+        // Measured spread: the pre-form chains THREE BF16 roundings (norm
+        // store, scale product, root product) after a 1-f32-ULP norm-value
+        // perturbation from the reference's own reduction order. Frozen:
+        // worst_ulp <= 3, bit fraction >= 0.5, plus the unit-scale control.
+        worst <= 3 && equal * 2 >= want_prescale.len(),
+        "prescale drift: worst_ulp={worst} bit_equal={}/{}",
+        equal,
+        want_prescale.len()
+    );
+    let ones = s.clone_htod(&vec![bf16::ONE; h])?;
+    prescale_launch(&ones)?;
+    let control = s.clone_dtoh(&dy)?;
+    let scale_control_differs = control
+        .iter()
+        .zip(&want_prescale)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    ensure!(
+        scale_control_differs * 100 > want_prescale.len(),
+        "unit-scale control escaped: only {scale_control_differs} differing elements"
+    );
+
+    if let Some((row, (a, b))) = got_ids
+        .chunks(k)
+        .zip(want_ids.chunks(k))
+        .enumerate()
+        .find(|(_, (a, b))| a != b)
+    {
+        anyhow::bail!(
+            "top-k ids differ at row {row}: got {a:?} want {b:?} (tie rule: probability desc, id asc)"
+        );
+    }
+    ensure!(
+        got_weights.iter().all(|v| v.is_finite()),
+        "router weights produced non-finite values"
+    );
+    let mut worst_rel = 0f32;
+    for (g, w) in got_weights.iter().zip(&want_weights) {
+        let rel = if w.abs() > f32::EPSILON {
+            (g - w).abs() / w.abs()
+        } else {
+            g.abs()
+        };
+        worst_rel = worst_rel.max(rel);
+    }
+    ensure!(
+        worst_rel <= 1e-5,
+        "top-k weights drift: worst relative {worst_rel} above the frozen 1e-5"
+    );
+    for row in 0..rows {
+        let unscaled: f32 = got_weights[row * k..(row + 1) * k]
+            .iter()
+            .zip(&got_ids[row * k..(row + 1) * k])
+            .map(|(w, e)| w / bf16::to_f32(per_expert_scale[*e as usize]))
+            .sum();
+        ensure!(
+            (unscaled - 1.0).abs() <= 1e-5,
+            "renormalised weights must sum to 1 after dividing out the expert scales at row {row}"
+        );
+    }
+    let boundary_in = &got_ids[5 * k..5 * k + k];
+    ensure!(
+        boundary_in.contains(&17) && !boundary_in.contains(&90),
+        "boundary tie must keep the lower expert id 17 over 90: {boundary_in:?}"
+    );
+    let mut perturbed = logits.clone();
+    perturbed[5 * e + 90] = bf16::from_f32(bf16::to_f32(boundary) * 1.03125);
+    let dperturbed = s.clone_htod(&perturbed)?;
+    topk_launch(&dperturbed)?;
+    let flipped = s.clone_dtoh(&dids)?;
+    ensure!(
+        flipped[5 * k..5 * k + k].contains(&90) && !flipped[5 * k..5 * k + k].contains(&17),
+        "perturbed tie control escaped: raising expert 90 above 17 must swap them in"
+    );
+    println!(
+        "DIFFUSION_ROUTER prescale worst_ulp={worst} bit_equal={equal}/{} weights_worst_rel={worst_rel} boundary_tie_row5=kept17",
+        want_prescale.len()
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "GPU window; frozen Clover MoE reference required"]
 fn clover_block_coreset_f32_gpu() -> anyhow::Result<()> {

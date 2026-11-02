@@ -229,7 +229,8 @@ fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
         | Architecture::Glm5Next
         | Architecture::LoopVl
         | Architecture::Gemma4
-        | Architecture::EmbeddingGemma2 => anyhow::bail!(
+        | Architecture::EmbeddingGemma2
+        | Architecture::DiffusionGemma => anyhow::bail!(
             "hybrid engine does not implement architecture={:?}",
             spec.architecture
         ),
@@ -3700,6 +3701,10 @@ impl Engine {
             pending_token: None,
             resident_ids_len: 0,
             last_input_kind: None,
+            #[cfg(test)]
+            diffusion_single_step: false,
+            #[cfg(test)]
+            diffusion_forced_draws: None,
             qwen: None,
             deepseek_mixer: None,
             deepseek_ffn: None,

@@ -816,6 +816,10 @@ impl Engine {
             pending_token: None,
             resident_ids_len: 0,
             last_input_kind: None,
+            #[cfg(test)]
+            diffusion_single_step: false,
+            #[cfg(test)]
+            diffusion_forced_draws: None,
         };
         engine.closure.freeze_fixed()?;
         engine.reset()?;

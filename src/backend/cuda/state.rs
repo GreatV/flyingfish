@@ -681,9 +681,25 @@ impl StateStore {
                         format == crate::kv::KvFormat::Bf16 || layer.sliding_window.is_none(),
                         "compact KV does not support sliding layer state"
                     );
-                    let layer_capacity = layer
-                        .sliding_window
-                        .map_or(capacity, |window| window as usize);
+                    // DiffusionGemma sliding rings hold window-1 prefix keys
+                    // plus the canvas block, so canvas writes never clobber
+                    // keys the canvas still reads.
+                    let layer_capacity = match layer.sliding_window {
+                        None => capacity,
+                        Some(window) => {
+                            if spec.architecture == crate::model_spec::Architecture::DiffusionGemma
+                            {
+                                let canvas = spec.canvas_length.unwrap_or_default() as usize;
+                                ensure!(
+                                    canvas > 0,
+                                    "DiffusionGemma sliding ring requires the canvas length"
+                                );
+                                window as usize + canvas - 1
+                            } else {
+                                window as usize
+                            }
+                        }
+                    };
                     let head_dim = geometry.map_or(spec.head_dim, |g| g.head_dim);
                     let heads = geometry.and_then(|g| g.kv_heads).unwrap_or(spec.kv_heads);
                     let layout =

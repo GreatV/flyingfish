@@ -3,6 +3,8 @@ pub(crate) mod decode;
 pub(crate) mod prefill;
 pub(crate) mod route;
 
+pub(crate) use prefill::PrefillOps;
+pub(crate) use route::{DiffusionRoute, RouteOps};
 pub mod w4a8;
 pub mod w8a8;
 

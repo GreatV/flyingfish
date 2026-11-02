@@ -3404,6 +3404,10 @@ impl Engine {
             pending_token: None,
             resident_ids_len: 0,
             last_input_kind: None,
+            #[cfg(test)]
+            diffusion_single_step: false,
+            #[cfg(test)]
+            diffusion_forced_draws: None,
         };
         if tiered {
             let (slots, admitted_rows) = super::moe::Slots::load_staging(
@@ -7241,6 +7245,10 @@ mod tests {
             pending_token: None,
             resident_ids_len: 0,
             last_input_kind: None,
+            #[cfg(test)]
+            diffusion_single_step: false,
+            #[cfg(test)]
+            diffusion_forced_draws: None,
         };
         device.finish_upload()?;
         let step = Step {
@@ -8083,6 +8091,10 @@ mod tests {
             pending_token: None,
             resident_ids_len: 0,
             last_input_kind: None,
+            #[cfg(test)]
+            diffusion_single_step: false,
+            #[cfg(test)]
+            diffusion_forced_draws: None,
         };
         device.finish_upload()?;
         // Seed the ring past the wrap: positions 0..130 written one row per
@@ -9202,6 +9214,10 @@ mod tests {
             pending_token: None,
             resident_ids_len: 0,
             last_input_kind: None,
+            #[cfg(test)]
+            diffusion_single_step: false,
+            #[cfg(test)]
+            diffusion_forced_draws: None,
         };
         device.finish_upload()?;
         // The production run dispatches on device (no routing data crosses to
