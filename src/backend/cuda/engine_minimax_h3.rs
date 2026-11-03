@@ -230,8 +230,14 @@ impl AdalnTable {
     }
 }
 
-/// Rows per FFN chunk.
+/// Upper bound on rows per FFN chunk.
 const FFN_CHUNK_ROWS: usize = 1024;
+
+/// Rows per FFN chunk: `rows` split evenly over `ceil(rows / FFN_CHUNK_ROWS)` chunks, so the tail chunk holds at
+/// least `chunk - (chunks - 1)` rows.
+fn ffn_chunk(rows: usize) -> usize {
+    rows.div_ceil(rows.div_ceil(FFN_CHUNK_ROWS))
+}
 /// Threads per hidden-width RMSNorm row: 672 eight-element vectors of a 5376 row fit one register pass.
 const HIDDEN_NORM_THREADS: u32 = 768;
 /// Threads per head-width RMSNorm row.
@@ -505,8 +511,8 @@ impl BlockWork {
     pub(crate) fn prepare(&self, blas: &Blas, spec: &H3Spec) -> Result<()> {
         let (h, width, f) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn);
         let mut shapes = vec![(self.rows, width, h), (self.rows, h, width)];
-        let chunk = self.rows.min(FFN_CHUNK_ROWS);
-        let tail = self.rows % FFN_CHUNK_ROWS;
+        let chunk = ffn_chunk(self.rows);
+        let tail = self.rows % chunk;
         for rows in [chunk, tail].into_iter().filter(|&n| n > 0) {
             shapes.push((rows, 2 * f, h));
             shapes.push((rows, h, f));
@@ -528,7 +534,7 @@ impl BlockWork {
         rows: usize,
     ) -> Result<Self> {
         let width = spec.heads * spec.head_dim;
-        let chunk = rows.min(FFN_CHUNK_ROWS);
+        let chunk = ffn_chunk(rows);
         let attention = || s.alloc_zeros::<bf16>(rows * width);
         Ok(Self {
             rows,
@@ -900,8 +906,9 @@ pub(crate) fn block_forward(
     if modulation.is_some() {
         modulate(normed, 3, 4)?;
     }
-    for start in (0..rows).step_by(FFN_CHUNK_ROWS) {
-        let n = FFN_CHUNK_ROWS.min(rows - start);
+    let chunk = ffn_chunk(rows);
+    for start in (0..rows).step_by(chunk) {
+        let n = chunk.min(rows - start);
         base(
             FF_IN,
             Operand {
@@ -1682,6 +1689,21 @@ mod tests {
     };
     use safetensors::SafeTensors;
     use std::{fs, rc::Rc};
+
+    /// The production (60,431) and small (40,045) cell rows and short multiples: every FFN chunk is within
+    /// `FFN_CHUNK_ROWS` and no tail falls in the skinny-row class, which has no frozen LoRA GEMM choice.
+    #[test]
+    fn ffn_chunks_leave_no_skinny_tail() {
+        for rows in [60_431, 40_045, 1_025, 2_049, 3_073, 1_024, 300] {
+            let chunk = ffn_chunk(rows);
+            let tail = rows % chunk;
+            assert!(chunk <= FFN_CHUNK_ROWS, "rows={rows} chunk={chunk}");
+            assert!(
+                tail == 0 || tail > crate::linear_plan::MAX_SKINNY_ROWS,
+                "rows={rows} chunk={chunk} tail={tail}"
+            );
+        }
+    }
 
     fn decoded(file: &SafeTensors<'_>, name: &str) -> Result<(Vec<f64>, Vec<usize>)> {
         let view = file.tensor(name).with_context(|| format!("lacks {name}"))?;
