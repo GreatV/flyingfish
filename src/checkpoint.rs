@@ -70,18 +70,23 @@ pub fn has_mtp_component(dir: &Path) -> Result<bool> {
 
 impl MappedCheckpoint {
     pub fn open(dir: &Path) -> Result<Self> {
-        let indexed = dir.join("model.safetensors.index.json");
+        Self::open_component(dir, "model")
+    }
+    /// Opens `{stem}.safetensors.index.json` with its shards, or the single `{stem}.safetensors`.
+    pub fn open_component(dir: &Path, stem: &str) -> Result<Self> {
+        let indexed = dir.join(format!("{stem}.safetensors.index.json"));
         let index = if indexed.is_file() {
             serde_json::from_slice::<Index>(&std::fs::read(indexed)?)?
         } else {
-            let map =
-                unsafe { MmapOptions::new().map(&File::open(dir.join("model.safetensors"))?)? };
+            let map = unsafe {
+                MmapOptions::new().map(&File::open(dir.join(format!("{stem}.safetensors")))?)?
+            };
             let tensors = SafeTensors::deserialize(&map)?;
             Index {
                 weight_map: tensors
                     .names()
                     .into_iter()
-                    .map(|s| (s.to_owned(), "model.safetensors".to_owned()))
+                    .map(|s| (s.to_owned(), format!("{stem}.safetensors")))
                     .collect(),
             }
         };
@@ -172,6 +177,29 @@ impl MappedCheckpoint {
             .context("checkpoint file handle missing")?
             .read_exact_at(destination, u64::try_from(offset)?)?;
         Ok(())
+    }
+    /// Host copy of one published F32 tensor with the given shape.
+    pub(crate) fn f32_tensor(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
+        let shard = self
+            .index
+            .weight_map
+            .get(name)
+            .with_context(|| format!("checkpoint lacks {name}"))?;
+        let map = self.maps.get(shard).context("unknown checkpoint shard")?;
+        let tensor = SafeTensors::deserialize(map)?.tensor(name)?;
+        ensure!(
+            tensor.dtype() == Dtype::F32 && tensor.shape() == shape,
+            "{name} is {:?} {:?}, expected F32 {shape:?}",
+            tensor.dtype(),
+            tensor.shape()
+        );
+        Ok(tensor
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect())
     }
     pub(crate) fn views(&self) -> Result<BTreeMap<String, SafeTensors<'_>>> {
         self.maps
@@ -2297,14 +2325,183 @@ impl MappedCheckpoint {
     }
 }
 
+impl MappedCheckpoint {
+    /// MiniMax-H3 transformer: F32 patch, time-embedding and output projections, BF16 elsewhere. The per-block AdaLN
+    /// projections are Dormant: read once at setup into the modulation table, never part of the per-step layer set.
+    pub fn minimax_h3_manifest(&self, spec: &crate::minimax_h3::H3Spec) -> Result<TensorManifest> {
+        let scope = TensorScope::Text;
+        let mut expected = BTreeMap::new();
+        for (base, n, k) in [
+            ("proj_in", spec.hidden, spec.video_row_width()),
+            ("audio_proj_in", spec.hidden, spec.audio_in_channels),
+            ("time_embedder.linear_1", spec.time_hidden, spec.freq_dim),
+            ("time_embedder.linear_2", spec.time_dim, spec.time_hidden),
+            ("proj_out", spec.video_row_width(), spec.hidden),
+            ("audio_proj_out", spec.audio_in_channels, spec.hidden),
+        ] {
+            put(
+                &mut expected,
+                format!("{base}.weight"),
+                Dtype::F32,
+                vec![n, k],
+                scope,
+            );
+            put(
+                &mut expected,
+                format!("{base}.bias"),
+                Dtype::F32,
+                vec![n],
+                scope,
+            );
+        }
+        let modulation = 6 * spec.hidden * crate::minimax_h3::MODALITIES as usize;
+        for (name, shape) in [
+            ("context_embedder.weight", vec![spec.hidden, spec.text_dim]),
+            ("context_embedder.bias", vec![spec.hidden]),
+            ("token_refiner.final_norm.weight", vec![spec.hidden]),
+            ("norm_out.norm.weight", vec![spec.hidden]),
+            (
+                "norm_out.linear.weight",
+                vec![2 * spec.hidden, spec.time_dim],
+            ),
+            ("norm_out.linear.bias", vec![2 * spec.hidden]),
+        ] {
+            put(&mut expected, name.to_owned(), Dtype::BF16, shape, scope);
+        }
+        let blocks = (0..spec.refiner_layers)
+            .map(|i| (format!("token_refiner.refiner_blocks.{i}"), false))
+            .chain((0..spec.layers).map(|i| (format!("transformer_blocks.{i}"), true)));
+        for (block, adaln) in blocks {
+            for (name, shape) in [
+                ("norm1.weight", vec![spec.hidden]),
+                ("norm2.weight", vec![spec.hidden]),
+                ("attn.norm_q.weight", vec![spec.head_dim]),
+                ("attn.norm_k.weight", vec![spec.head_dim]),
+            ] {
+                put(
+                    &mut expected,
+                    format!("{block}.{name}"),
+                    Dtype::BF16,
+                    shape,
+                    scope,
+                );
+            }
+            if adaln {
+                let base = format!("{block}.adaln_proj.linear");
+                put(
+                    &mut expected,
+                    format!("{base}.weight"),
+                    Dtype::BF16,
+                    vec![modulation, spec.time_dim],
+                    TensorScope::Dormant,
+                );
+                put(
+                    &mut expected,
+                    format!("{base}.bias"),
+                    Dtype::BF16,
+                    vec![modulation],
+                    TensorScope::Dormant,
+                );
+            }
+        }
+        for (base, n, k) in spec.block_linears() {
+            put(
+                &mut expected,
+                format!("{base}.weight"),
+                Dtype::BF16,
+                vec![n, k],
+                scope,
+            );
+        }
+        let planned = planned_bytes(&expected, LoadPolicy::TextOnly)?;
+        self.assemble_manifest("MiniMax-H3", expected, LoadPolicy::TextOnly, planned, None)
+    }
+
+    /// MiniMax-H3 LoRA file: `{linear}.lora_A.default.weight [rank, in]` and `{linear}.lora_B.default.weight
+    /// [out, rank]` in BF16 for every block linear; scale is the metadata `alpha` over the rank.
+    pub fn minimax_h3_lora_manifest(
+        &self,
+        spec: &crate::minimax_h3::H3Spec,
+    ) -> Result<(TensorManifest, crate::minimax_h3::LoraAdapter)> {
+        ensure!(
+            self.maps.len() == 1,
+            "MiniMax-H3 LoRA spans {} files",
+            self.maps.len()
+        );
+        let (shard, map) = self.maps.iter().next().context("empty LoRA checkpoint")?;
+        let (_, metadata) = SafeTensors::read_metadata(map)?;
+        let metadata = metadata
+            .metadata()
+            .as_ref()
+            .context("MiniMax-H3 LoRA metadata missing")?;
+        let field = |key: &str| metadata.get(key).map(String::as_str);
+        ensure!(
+            field("key_format") == Some("minimax-h3-diffusers")
+                && field("floating_dtype") == Some("bfloat16"),
+            "unsupported MiniMax-H3 LoRA metadata {metadata:?}"
+        );
+        let alpha: f32 = field("alpha")
+            .context("MiniMax-H3 LoRA alpha missing")?
+            .parse()
+            .context("MiniMax-H3 LoRA alpha")?;
+        let linears = spec.block_linears();
+        let probe = format!("{}.lora_A.default.weight", linears[0].0);
+        let rank = *SafeTensors::deserialize(map)?
+            .tensor(&probe)
+            .with_context(|| format!("{shard} lacks {probe}"))?
+            .shape()
+            .first()
+            .context("LoRA rank")?;
+        ensure!(
+            rank > 0 && alpha.is_finite() && alpha > 0.0,
+            "invalid MiniMax-H3 LoRA rank {rank} alpha {alpha}"
+        );
+        let mut expected = BTreeMap::new();
+        for (base, n, k) in linears {
+            let a = format!("{base}.lora_A.default.weight");
+            let b = format!("{base}.lora_B.default.weight");
+            put(
+                &mut expected,
+                a,
+                Dtype::BF16,
+                vec![rank, k],
+                TensorScope::Text,
+            );
+            put(
+                &mut expected,
+                b,
+                Dtype::BF16,
+                vec![n, rank],
+                TensorScope::Text,
+            );
+        }
+        let planned = planned_bytes(&expected, LoadPolicy::TextOnly)?;
+        let manifest = self.assemble_manifest(
+            "MiniMax-H3 LoRA",
+            expected,
+            LoadPolicy::TextOnly,
+            planned,
+            None,
+        )?;
+        Ok((
+            manifest,
+            crate::minimax_h3::LoraAdapter {
+                rank,
+                scale: alpha / rank as f32,
+            },
+        ))
+    }
+}
+
 /// Layer name prefixes of the published checkpoints.
-const LAYER_PREFIXES: [&str; 6] = [
+const LAYER_PREFIXES: [&str; 7] = [
     "model.layers.",
     "model.language_model.layers.",
     "language_model.layers.",
     "layers.",
     "model.decoder.layers.",
     "model.encoder.language_model.layers.",
+    "transformer_blocks.",
 ];
 
 pub type ExpectedTensor = (Dtype, Vec<usize>, TensorScope);

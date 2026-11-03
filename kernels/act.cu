@@ -1,7 +1,8 @@
 #include "gpu_compat.cuh"
 #include "q38_contract.cuh"
 
-// mode: 0 = SiLU, product rounded twice; 1 = SiLU, rounded once; 2 = GELU (tanh form), product rounded twice.
+// mode: 0 = SiLU, product rounded twice; 1 = SiLU, rounded once; 2 = GELU (tanh form), product rounded twice;
+// 3 = SiLU of the upper half times the lower half, product rounded twice.
 __device__ __forceinline__ float gelu_tanh(float x) {
     const float cube = x * x * x;
     const float inner = 0.7978845608028654f * (x + 0.044715f * cube);
@@ -10,11 +11,16 @@ __device__ __forceinline__ float gelu_tanh(float x) {
 
 extern "C" __global__ void silu_mul(const __nv_bfloat16* gu, __nv_bfloat16* y,
                                    int rows, int dim, int mode) {
-    if ((unsigned)mode > 2u) __trap();
+    if ((unsigned)mode > 3u) __trap();
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows * dim) return;
     int row = i / dim;
     int d = i % dim;
+    if (mode == 3) {
+      const float gate = __bfloat162float(gu[row * 2 * dim + dim + d]);
+      y[i] = __hmul(__float2bfloat16(gate / (1.0f + expf(-gate))), gu[row * 2 * dim + d]);
+      return;
+    }
     float g = __bfloat162float(gu[row * 2 * dim + d]);
     const float u = __bfloat162float(gu[row * 2 * dim + dim + d]);
     if (mode == 2) {
