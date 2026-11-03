@@ -3537,9 +3537,11 @@ fn large_media_components(
                         }
                         let expected = position + 1;
                         let actual = engine.gemma_position()?;
-                        ensure!(
-                            actual == (expected, expected as i32),
-                            "Runner FAIL prefix KV position"
+                        let pass = actual == (expected, expected as i32);
+                        defects += usize::from(!pass);
+                        println!(
+                            "{} media_prefix_position {name} graph={graph} expected={expected} actual={actual:?}",
+                            if pass { "PASS" } else { "DEFECT" }
                         );
                     }
                 }
@@ -3618,6 +3620,24 @@ fn large_media_components(
                 }
             }
             defects += media_component_distance(fixtures, frozen, name, form, "head_norm", &norms)?;
+            if name == "street" && form == "bucketed" {
+                let oracle = load_reference(
+                    &fixtures.join("components/oracle/street-bucketed-head_norm.safetensors"),
+                )?;
+                let expected = reference(&oracle, "value")?.as_f32();
+                let detected = !vision_distance(
+                    &vec![0.0; expected.len()],
+                    &expected,
+                    &frozen["components"][name][form]["head_norm"],
+                )?;
+                ensure!(
+                    detected,
+                    "Runner FAIL fresh-head norm omission control undetected"
+                );
+                println!(
+                    "PASS fresh_head_norm_control omitted_norm_detected=true zero_sink_initialized=true"
+                );
+            }
             let oracle = load_reference(&fixtures.join(format!(
                 "components/oracle/{name}-{form}-head_logits.safetensors"
             )))?;

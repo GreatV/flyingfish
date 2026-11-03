@@ -6161,6 +6161,7 @@ impl Engine {
         let rows = input.len() / width;
         let stream = &self.device.stream;
         stream.memcpy_htod(input, &mut self.work.x.slice_mut(..input.len()))?;
+        stream.memset_zeros(&mut self.work.n.slice_mut(..input.len()))?;
         self.state
             .set_sequence(stream, 0, u32::try_from(rows)?, self.workspace_rows as u32)?;
         self.qwen
