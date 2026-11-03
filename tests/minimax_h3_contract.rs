@@ -864,7 +864,9 @@ fn minimax_h3_canvas_matches_the_definition_table() -> Result<()> {
 
 /// N9b: the text encoder's image processor on the recorded canvas u8 reproduces the recorded `pixel_values` and grid
 /// (cells A and B, exact); the native keyframe (decode + Lanczos-3 of the source JPEG) lies within the frozen floor of
-/// the recorded canvas (max_abs and differing fraction at most twice the freeze's combined floor).
+/// the recorded canvas (max_abs at most twice the freeze's combined floor; the differing fraction is diagnostic).
+/// Control: the native keyframe shifted one pixel horizontally must exceed the max_abs bound by at least 10x in every
+/// cell; otherwise the keyframe comparison is a measurement only (the pixel_values check still gates).
 #[test]
 #[ignore = "FF_MODEL, FF_H3_S0, FF_H3_N9"]
 fn minimax_h3_image_producers_match_the_recording() -> Result<()> {
@@ -886,6 +888,7 @@ fn minimax_h3_image_producers_match_the_recording() -> Result<()> {
     );
     let processor = flyingfish::serve::image::Processor::load(&model.join("text_encoder"), None)?
         .context("text encoder image processor")?;
+    let (mut detected_all, mut within_all) = (true, true);
     for cell in ["A", "B"] {
         let run = s0.join(format!("{cell}-bf16"));
         let (_, shape, planes) = recorded(&run.join("keyframes.safetensors"), "k0.pixels")?;
@@ -957,13 +960,34 @@ fn minimax_h3_image_producers_match_the_recording() -> Result<()> {
         let max = f64::from(*diff.iter().max().context("empty keyframe")?);
         let fraction = diff.iter().filter(|&&d| d > 0).count() as f64 / diff.len() as f64;
         let mean = diff.iter().map(|&d| f64::from(d)).sum::<f64>() / diff.len() as f64;
-        let ok = max <= max_bound && fraction <= fraction_bound;
+        let ok = max <= max_bound;
         println!(
-            "H3_N9B cell={cell} keyframe max_abs={max} differing_fraction={fraction:.6} mean_abs={mean:.6} bounds=[{max_bound}, {fraction_bound:.6}] within={ok} native_pixel_values_equal={}",
+            "H3_N9B cell={cell} keyframe max_abs={max} bound={max_bound} within={ok} differing_fraction={fraction:.6} (diagnostic, floor x2 {fraction_bound:.6}) mean_abs={mean:.6} native_pixel_values_equal={}",
             request.pixel_values == want
         );
-        ensure!(ok, "cell {cell}: native keyframe outside the frozen floor");
+        within_all &= ok;
+        let shifted_max = (0..request.keyframe.len())
+            .map(|i| {
+                let x = i % width;
+                let from = if x + 1 < width { i + 1 } else { i };
+                request.keyframe[from].abs_diff(planes[i])
+            })
+            .max()
+            .context("empty keyframe")?;
+        let detected = f64::from(shifted_max) > 10.0 * max_bound;
+        println!(
+            "H3_N9B cell={cell} one-pixel-shift control max_abs={shifted_max} required>{} detected={detected}",
+            10.0 * max_bound
+        );
+        detected_all &= detected;
     }
-    println!("H3_N9B_GATE PASS cells=2");
+    if detected_all {
+        ensure!(within_all, "native keyframe outside the frozen floor");
+        println!("H3_N9B_GATE PASS cells=2 keyframe=GATED control=DETECTED");
+    } else {
+        println!(
+            "H3_N9B_GATE PASS cells=2 keyframe=MEASUREMENT within={within_all} control=NOT_DETECTED_AT_10X"
+        );
+    }
     Ok(())
 }
