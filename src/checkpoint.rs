@@ -325,7 +325,8 @@ impl MappedCheckpoint {
             | Architecture::Glm5Next
             | Architecture::LoopVl
             | Architecture::Gemma4
-            | Architecture::EmbeddingGemma2 => {
+            | Architecture::EmbeddingGemma2
+            | Architecture::Qwen3Vl => {
                 bail!("checkpoint manifest requires a Qwen3.5-family spec")
             }
             Architecture::DeepseekV41 | Architecture::DiffusionGemma => {
@@ -371,7 +372,8 @@ impl MappedCheckpoint {
             | Architecture::LoopVl
             | Architecture::Gemma4
             | Architecture::EmbeddingGemma2
-            | Architecture::DiffusionGemma => unreachable!(),
+            | Architecture::DiffusionGemma
+            | Architecture::Qwen3Vl => unreachable!(),
             Architecture::DeepseekV41 => {
                 unreachable!("DeepSeek-V4.1 has a dedicated manifest path")
             }
@@ -1001,7 +1003,8 @@ impl MappedCheckpoint {
             | Architecture::DeepseekV41
             | Architecture::Gemma4
             | Architecture::EmbeddingGemma2
-            | Architecture::DiffusionGemma => {
+            | Architecture::DiffusionGemma
+            | Architecture::Qwen3Vl => {
                 unreachable!("architecture has a dedicated manifest path")
             }
         };
@@ -1169,7 +1172,8 @@ impl MappedCheckpoint {
                         | Architecture::LoopVl
                         | Architecture::Gemma4
                         | Architecture::EmbeddingGemma2
-                        | Architecture::DiffusionGemma => {
+                        | Architecture::DiffusionGemma
+                        | Architecture::Qwen3Vl => {
                             unreachable!("architecture has a dedicated manifest path")
                         }
                         Architecture::DeepseekV41 => {

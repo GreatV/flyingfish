@@ -327,8 +327,13 @@ impl PositionPlan {
         i32::try_from(position).context("mRoPE coordinate exceeds device range")
     }
 
-    pub fn rotary_position(&self, frequency: usize, physical_position: usize) -> Result<i32> {
-        let axis = Self::rotary_axis(frequency)?;
+    pub fn rotary_position(
+        &self,
+        section: [u32; 3],
+        frequency: usize,
+        physical_position: usize,
+    ) -> Result<i32> {
+        let axis = Self::rotary_axis(section, frequency)?;
         if physical_position < self.prompt_rows() {
             Ok(self.axes[axis][physical_position])
         } else {
@@ -336,11 +341,14 @@ impl PositionPlan {
         }
     }
 
-    pub fn rotary_axis(frequency: usize) -> Result<usize> {
-        ensure!(frequency < 32, "frequency outside Q38 partial RoPE");
-        Ok(if frequency % 3 == 1 {
+    /// Interleaved mRoPE axis of a rotary frequency: `h` at `f % 3 == 1` below `3 * section[1]`, `w` at
+    /// `f % 3 == 2` below `3 * section[2]`, `t` otherwise, over `section.sum()` frequencies.
+    pub fn rotary_axis(section: [u32; 3], frequency: usize) -> Result<usize> {
+        let [t, h, w] = section.map(|n| n as usize);
+        ensure!(frequency < t + h + w, "frequency outside the mRoPE section");
+        Ok(if frequency % 3 == 1 && frequency < 3 * h {
             1
-        } else if frequency % 3 == 2 && frequency < 30 {
+        } else if frequency % 3 == 2 && frequency < 3 * w {
             2
         } else {
             0
@@ -355,7 +363,7 @@ impl MultimodalInput<'_> {
             "audio input requires a supported audio tower"
         );
         match spec.architecture {
-            Architecture::Qwen35Text => self.validate_qwen(spec, capacity),
+            Architecture::Qwen35Text | Architecture::Qwen3Vl => self.validate_qwen(spec, capacity),
             Architecture::MiniCpmV47 => self.validate_minicpm(spec, capacity),
             Architecture::Gemma4 | Architecture::EmbeddingGemma2 => {
                 self.validate_axial(spec, capacity)
@@ -1202,7 +1210,10 @@ impl VisionPositions {
         row_limit: usize,
     ) -> Result<Self> {
         ensure!(
-            architecture == Architecture::Qwen35Text,
+            matches!(
+                architecture,
+                Architecture::Qwen35Text | Architecture::Qwen3Vl
+            ),
             "vision positions require the Qwen tower"
         );
         spec.validate(architecture)?;

@@ -49,7 +49,8 @@ impl VisionGeometry {
             .context("vision configuration missing")?;
         vision.validate(model.architecture)?;
         let spec = match model.architecture {
-            crate::model_spec::Architecture::Qwen35Text => VisionSpec::q38(),
+            crate::model_spec::Architecture::Qwen35Text
+            | crate::model_spec::Architecture::Qwen3Vl => VisionSpec::q38(),
             crate::model_spec::Architecture::MiniCpmV47 => {
                 ensure!(
                     vision.heads > 0 && vision.hidden.is_multiple_of(vision.heads),
@@ -874,6 +875,7 @@ impl VisionWeights {
         };
         let window_width = (merge * merge) as usize * mlp_usize;
         let (patch, position, post_norm, blocks, window, merger, expected) = match architecture {
+            Architecture::Qwen3Vl => bail!("Qwen3-VL deepstack mergers are not bound"),
             Architecture::Qwen35Text => {
                 let patch = BiasedWeight::patch(
                     catalog,
@@ -2242,7 +2244,7 @@ impl LayerNormTower {
             .context("vision configuration missing")?;
         let s = &device.stream;
         let (indices, bilinear) = match self.model.architecture {
-            Architecture::Qwen35Text => {
+            Architecture::Qwen35Text | Architecture::Qwen3Vl => {
                 let tables =
                     VisionPositions::new(vision, self.model.architecture, input.grids, rows)?;
                 let indices: Vec<_> = tables.bilinear_indices.into_iter().flatten().collect();
@@ -2307,7 +2309,7 @@ impl LayerNormTower {
         let packed = dense(&request.packed, stream, [rows, geometry.patch])?;
         let launched = (|| -> Result<()> {
             match self.model.architecture {
-                Architecture::Qwen35Text => {
+                Architecture::Qwen35Text | Architecture::Qwen3Vl => {
                     self.io.cast_patches(
                         stream,
                         dense(&request.pixels, stream, [rows, geometry.patch])?,

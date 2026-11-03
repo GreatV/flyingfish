@@ -643,3 +643,33 @@ pub fn rotary_table(spec: &H3Spec, layout: &PackedLayout) -> Vec<half::bf16> {
     }
     table
 }
+
+/// `[rows, head_dim]` f32 interleaved-mRoPE table of the Qwen3-VL conditioner: the cosines of each prompt row's
+/// `head_dim / 2` angles, then their sines. Angle `j` is `f32(position[axis(j)]) * inv_freq[j]` with `inv_freq[j] =
+/// 1 / f32(theta^(2j / head_dim))`, the power in f64.
+pub fn mrope_table(
+    plan: &crate::vision_input::PositionPlan,
+    section: [u32; 3],
+    theta: f32,
+    head_dim: u32,
+) -> Result<Vec<f32>> {
+    let half = head_dim as usize / 2;
+    ensure!(
+        section.iter().sum::<u32>() as usize == half,
+        "mRoPE section {section:?} does not cover head_dim {head_dim}"
+    );
+    let inv_freq: Vec<f32> = (0..half)
+        .map(|j| 1.0f32 / f64::from(theta).powf(f64::from((2 * j) as f32 / head_dim as f32)) as f32)
+        .collect();
+    let rows = plan.prompt_rows();
+    let mut table = Vec::with_capacity(rows * 2 * half);
+    let mut angles = vec![0f32; half];
+    for row in 0..rows {
+        for (j, angle) in angles.iter_mut().enumerate() {
+            *angle = plan.rotary_position(section, j, row)? as f32 * inv_freq[j];
+        }
+        table.extend(angles.iter().map(|a| a.cos()));
+        table.extend(angles.iter().map(|a| a.sin()));
+    }
+    Ok(table)
+}
