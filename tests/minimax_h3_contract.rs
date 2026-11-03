@@ -3,8 +3,8 @@ use anyhow::{Context, Result, ensure};
 use flyingfish::{
     checkpoint::MappedCheckpoint,
     minimax_h3::{
-        AUDIO_TAG, AdalnPlan, Geometry, H3Spec, KeyframeAnchor, PackedLayout, RowTimesteps,
-        Schedule, TEXT_TAG, VIDEO_TAG, row_timestep_plan,
+        AUDIO_TAG, AdalnPlan, DecodePlan, Geometry, H3Spec, KeyframeAnchor, PackedLayout,
+        RowTimesteps, Schedule, TEXT_TAG, VIDEO_TAG, VaeSpec, VaeTiles, row_timestep_plan,
     },
 };
 use safetensors::{Dtype, SafeTensors};
@@ -55,6 +55,69 @@ fn minimax_h3_config_normalizes_the_published_transformer() -> Result<()> {
         serde_json::from_str(include_str!("data/minimax-h3-transformer-config.json"))?;
     unknown["sliding_window"] = 1.into();
     ensure!(H3Spec::parse(&unknown).is_err(), "accepted an unknown key");
+    Ok(())
+}
+
+/// Video VAE decode geometry equals the model definition's `_split_tiles` / `_decode` (tile starts and overlaps at
+/// 768 x 1344; output frames per latent length, read from `_decode` on shape-only clips, including padded lengths).
+#[test]
+fn minimax_h3_vae_decode_geometry_equals_the_model_definition() -> Result<()> {
+    let vae = VaeSpec::parse(&serde_json::from_str(include_str!(
+        "data/minimax-h3-vae-config.json"
+    ))?)?;
+    assert_eq!(
+        (
+            vae.dim,
+            vae.layers,
+            vae.heads,
+            vae.head_dim,
+            vae.registers,
+            vae.ffn,
+            vae.rope_dims
+        ),
+        (2048, 36, 32, 64, 4, 8192, 48)
+    );
+    assert_eq!(vae.patch_width(), 3072);
+    assert_eq!(
+        (
+            vae.chunk_latents(),
+            vae.overlap_latents(),
+            vae.frame_pre_padding(),
+            vae.frame_overlap()
+        ),
+        (5, 2, 3, 5)
+    );
+    let tiles = VaeTiles::released(&vae, 768, 1344)?;
+    assert_eq!((tiles.height, tiles.width, tiles.count()), (256, 256, 28));
+    assert_eq!(tiles.rows, (vec![0, 160, 336, 512], vec![96, 80, 80]));
+    assert_eq!(
+        tiles.cols,
+        (
+            vec![0, 176, 352, 528, 704, 896, 1088],
+            vec![80, 80, 80, 80, 64, 64]
+        )
+    );
+    for (latents, frames) in [
+        (3, 9),
+        (7, 22),
+        (12, 39),
+        (36, 120),
+        (37, 124),
+        (38, 128),
+        (39, 132),
+        (40, 136),
+        (41, 137),
+        (57, 192),
+    ] {
+        assert_eq!(
+            DecodePlan::new(&vae, latents)?.frames,
+            frames,
+            "{latents} latents"
+        );
+    }
+    assert_eq!(DecodePlan::new(&vae, 37)?.chunks, 7);
+    assert_eq!(DecodePlan::new(&vae, 57)?.chunks, 11);
+    assert!(DecodePlan::new(&vae, 2).is_err());
     Ok(())
 }
 
