@@ -2455,6 +2455,284 @@ impl MappedCheckpoint {
 impl MappedCheckpoint {
     /// MiniMax-H3 transformer: F32 patch, time-embedding and output projections, BF16 elsewhere. The per-block AdaLN
     /// projections are Dormant: read once at setup into the modulation table, never part of the per-step layer set.
+    pub fn music3_syn_manifest(
+        &self,
+        spec: &crate::model_spec::Music3SynSpec,
+    ) -> Result<TensorManifest> {
+        let mut expected = BTreeMap::new();
+        let dim = spec.flow_dim() as usize;
+        let concat = spec.concat_channels() as usize;
+        let ff = spec.flow_ff_inner as usize;
+        let channels = spec.in_channels as usize;
+        let fourier = spec.fourier_dim as usize;
+        if self.index.weight_map.contains_key("proj_in.weight") {
+            for i in 0..spec.flow_layers as usize {
+                let p = format!("transformer_blocks.{i}");
+                for role in ["to_q", "to_k", "to_v"] {
+                    put(
+                        &mut expected,
+                        format!("{p}.attn.{role}.weight"),
+                        Dtype::F32,
+                        vec![dim, dim],
+                        TensorScope::Text,
+                    );
+                }
+                put(
+                    &mut expected,
+                    format!("{p}.attn.to_out.0.weight"),
+                    Dtype::F32,
+                    vec![dim, dim],
+                    TensorScope::Text,
+                );
+                for norm in ["norm1", "norm2"] {
+                    for suffix in ["weight", "bias"] {
+                        put(
+                            &mut expected,
+                            format!("{p}.{norm}.{suffix}"),
+                            Dtype::F32,
+                            vec![dim],
+                            TensorScope::Text,
+                        );
+                    }
+                }
+                put(
+                    &mut expected,
+                    format!("{p}.ff_in.weight"),
+                    Dtype::F32,
+                    vec![2 * ff, dim],
+                    TensorScope::Text,
+                );
+                put(
+                    &mut expected,
+                    format!("{p}.ff_in.bias"),
+                    Dtype::F32,
+                    vec![2 * ff],
+                    TensorScope::Text,
+                );
+                put(
+                    &mut expected,
+                    format!("{p}.ff_out.weight"),
+                    Dtype::F32,
+                    vec![dim, ff],
+                    TensorScope::Text,
+                );
+                put(
+                    &mut expected,
+                    format!("{p}.ff_out.bias"),
+                    Dtype::F32,
+                    vec![dim],
+                    TensorScope::Text,
+                );
+            }
+            for (name, shape) in [
+                ("preprocess_conv.weight", vec![concat, concat, 1]),
+                ("postprocess_conv.weight", vec![channels, channels, 1]),
+                ("proj_in.weight", vec![dim, concat]),
+                ("proj_out.weight", vec![channels, dim]),
+                ("time_proj.weight", vec![fourier / 2, 1]),
+                ("time_embed.linear_1.weight", vec![dim, fourier]),
+                ("time_embed.linear_1.bias", vec![dim]),
+                ("time_embed.linear_2.weight", vec![dim, dim]),
+                ("time_embed.linear_2.bias", vec![dim]),
+            ] {
+                put(
+                    &mut expected,
+                    name.into(),
+                    Dtype::F32,
+                    shape,
+                    TensorScope::Text,
+                );
+            }
+        } else if self.index.weight_map.contains_key("proj.weight") {
+            put(
+                &mut expected,
+                "proj.weight".into(),
+                Dtype::F32,
+                vec![spec.cond_out as usize, spec.cond_hidden as usize, 3],
+                TensorScope::Text,
+            );
+            put(
+                &mut expected,
+                "proj.bias".into(),
+                Dtype::F32,
+                vec![spec.cond_out as usize],
+                TensorScope::Text,
+            );
+            put(
+                &mut expected,
+                "layer_weight_logits".into(),
+                Dtype::F32,
+                vec![spec.cond_layers as usize],
+                TensorScope::Text,
+            );
+            put(
+                &mut expected,
+                "layer_scale".into(),
+                Dtype::F32,
+                vec![1],
+                TensorScope::Text,
+            );
+        } else {
+            let hidden = spec.decoder_hidden as usize;
+            let input_dim = spec.decoder_input as usize;
+            let streams = spec.vocoder_stream_channels() as usize;
+            put(
+                &mut expected,
+                "dec_in_proj.weight".into(),
+                Dtype::F32,
+                vec![input_dim, streams, 1],
+                TensorScope::Text,
+            );
+            put(
+                &mut expected,
+                "dec_in_proj.bias".into(),
+                Dtype::F32,
+                vec![input_dim],
+                TensorScope::Text,
+            );
+            put(
+                &mut expected,
+                "conv_in.weight_g".into(),
+                Dtype::F32,
+                vec![hidden, 1, 1],
+                TensorScope::Text,
+            );
+            put(
+                &mut expected,
+                "conv_in.weight_v".into(),
+                Dtype::F32,
+                vec![hidden, input_dim, 7],
+                TensorScope::Text,
+            );
+            put(
+                &mut expected,
+                "conv_in.bias".into(),
+                Dtype::F32,
+                vec![hidden],
+                TensorScope::Text,
+            );
+            let mut stage_input = hidden;
+            for (i, ratio) in spec.upsampling.iter().enumerate() {
+                let (in_dim, out_dim, stride) = (stage_input, stage_input / 2, *ratio as usize);
+                stage_input = out_dim;
+                let b = format!("blocks.{i}");
+                put(
+                    &mut expected,
+                    format!("{b}.snake1.alpha"),
+                    Dtype::F32,
+                    vec![1, in_dim, 1],
+                    TensorScope::Text,
+                );
+                put(
+                    &mut expected,
+                    format!("{b}.conv_t1.weight_g"),
+                    Dtype::F32,
+                    vec![in_dim, 1, 1],
+                    TensorScope::Text,
+                );
+                put(
+                    &mut expected,
+                    format!("{b}.conv_t1.weight_v"),
+                    Dtype::F32,
+                    vec![in_dim, out_dim, 2 * stride],
+                    TensorScope::Text,
+                );
+                put(
+                    &mut expected,
+                    format!("{b}.conv_t1.bias"),
+                    Dtype::F32,
+                    vec![out_dim],
+                    TensorScope::Text,
+                );
+                for u in 1..=3 {
+                    let ru = format!("{b}.res_unit{u}");
+                    for snake in ["snake1", "snake2"] {
+                        put(
+                            &mut expected,
+                            format!("{ru}.{snake}.alpha"),
+                            Dtype::F32,
+                            vec![1, out_dim, 1],
+                            TensorScope::Text,
+                        );
+                    }
+                    put(
+                        &mut expected,
+                        format!("{ru}.conv1.weight_g"),
+                        Dtype::F32,
+                        vec![out_dim, 1, 1],
+                        TensorScope::Text,
+                    );
+                    put(
+                        &mut expected,
+                        format!("{ru}.conv1.weight_v"),
+                        Dtype::F32,
+                        vec![out_dim, out_dim, 7],
+                        TensorScope::Text,
+                    );
+                    put(
+                        &mut expected,
+                        format!("{ru}.conv1.bias"),
+                        Dtype::F32,
+                        vec![out_dim],
+                        TensorScope::Text,
+                    );
+                    put(
+                        &mut expected,
+                        format!("{ru}.conv2.weight_g"),
+                        Dtype::F32,
+                        vec![out_dim, 1, 1],
+                        TensorScope::Text,
+                    );
+                    put(
+                        &mut expected,
+                        format!("{ru}.conv2.weight_v"),
+                        Dtype::F32,
+                        vec![out_dim, out_dim, 1],
+                        TensorScope::Text,
+                    );
+                    put(
+                        &mut expected,
+                        format!("{ru}.conv2.bias"),
+                        Dtype::F32,
+                        vec![out_dim],
+                        TensorScope::Text,
+                    );
+                }
+            }
+            let tail = stage_input;
+            put(
+                &mut expected,
+                "snake_out.alpha".into(),
+                Dtype::F32,
+                vec![1, tail, 1],
+                TensorScope::Text,
+            );
+            put(
+                &mut expected,
+                "conv_out.weight_g".into(),
+                Dtype::F32,
+                vec![1, 1, 1],
+                TensorScope::Text,
+            );
+            put(
+                &mut expected,
+                "conv_out.weight_v".into(),
+                Dtype::F32,
+                vec![1, tail, 7],
+                TensorScope::Text,
+            );
+            put(
+                &mut expected,
+                "conv_out.bias".into(),
+                Dtype::F32,
+                vec![1],
+                TensorScope::Text,
+            );
+        }
+        let planned = Self::planned_bytes(&expected, LoadPolicy::TextOnly)?;
+        self.assemble_manifest("Music3Syn", expected, LoadPolicy::TextOnly, planned, None)
+    }
+
     pub fn minimax_h3_manifest(&self, spec: &crate::minimax_h3::H3Spec) -> Result<TensorManifest> {
         let scope = TensorScope::Text;
         let mut expected = BTreeMap::new();

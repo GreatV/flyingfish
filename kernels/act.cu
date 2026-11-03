@@ -154,3 +154,37 @@ extern "C" __global__ void residual_scale(const __nv_bfloat16* __restrict__ a,
         __float2bfloat16_rn(__bfloat162float(a[i]) + __bfloat162float(b[i]));
     y[i] = __float2bfloat16_rn(__bfloat162float(sum) * scale);
 }
+
+// Music3 snake activation in F32: y = x + (alpha + 1e-9)^-1 * sin(alpha * x)^2
+// with one alpha per channel; x/y are [channels, length] rows.
+extern "C" __global__ void snake_f32(const float* __restrict__ x,
+    const float* __restrict__ alpha, float* __restrict__ y,
+    long long count, long long length) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float a = alpha[i / length];
+    const float v = x[i];
+    const float s = sinf(a * v);
+    y[i] = v + __frcp_rn(a + 1e-9f) * s * s;
+}
+
+// Music3 FF gate in F32: pairs [rows, 2*dim] split half/half,
+// y = first * silu(second).
+extern "C" __global__ void silu_mul_f32(const float* __restrict__ gu,
+    float* __restrict__ y, long long rows, int dim) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * (long long)dim) return;
+    const long long row = i / dim;
+    const int d = (int)(i - row * dim);
+    const float value = gu[row * 2 * dim + d];
+    const float gate = gu[row * 2 * dim + dim + d];
+    y[i] = value * (gate / (1.0f + expf(-gate)));
+}
+
+// In-place silu in F32.
+extern "C" __global__ void silu_f32(float* __restrict__ x, long long count) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float v = x[i];
+    x[i] = v / (1.0f + expf(-v));
+}

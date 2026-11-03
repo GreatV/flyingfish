@@ -73,6 +73,17 @@ extern "C" __global__ void q38_stage_inputs(const uint32_t* source, uint32_t* id
     ids[row] = token;
     positions[3 * row] = positions[3 * row + 1] = positions[3 * row + 2] = prefix + int32_t(row) + 1;
 }
+__device__ __forceinline__ float block_max(float v,float* scratch) {
+    for(int delta=16;delta;delta/=2) v=fmaxf(v,__shfl_down_sync(FF_WARP_MASK,v,delta));
+    if(threadIdx.x%32==0) scratch[threadIdx.x/32]=v;
+    __syncthreads();
+    v=threadIdx.x<8?scratch[threadIdx.x]:-3.402823466e38f;
+    if(threadIdx.x<32) {
+        for(int delta=16;delta;delta/=2) v=fmaxf(v,__shfl_down_sync(FF_WARP_MASK,v,delta));
+        if(threadIdx.x==0) scratch[0]=v;
+    }
+    __syncthreads(); return scratch[0];
+}
 __device__ __forceinline__ float block_sum(float v,float* scratch) {
     for(int delta=16;delta;delta/=2) v+=__shfl_down_sync(FF_WARP_MASK,v,delta);
     if(threadIdx.x%32==0) scratch[threadIdx.x/32]=v;
@@ -964,6 +975,95 @@ extern "C" __global__ void clamp_f32(float* __restrict__ x, long long count, flo
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     x[i] = fminf(fmaxf(x[i], lo), hi);
+
+// Fourier time features: angle = (2*pi*t) * w[i]; out = [cos(angle) ..., sin(angle) ...].
+extern "C" __global__ void fourier_time_f32(const float* __restrict__ timestep,
+    const float* __restrict__ weight, float* __restrict__ out, uint32_t n) {
+    if(!timestep || !weight || !out || !n) {__trap();return;}
+    const float t = 6.283185307179586f * timestep[0];
+    for(uint32_t i=blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        const float angle = __fmul_rn(t, weight[i]);
+        out[i] = cosf(angle);
+        out[n + i] = sinf(angle);
+    }
+}
+
+// In-place F32 row softmax with max subtraction; one CTA per row.
+extern "C" __global__ void softmax_rows_f32(float* __restrict__ scores,
+    uint32_t rows, uint32_t width, uint64_t stride) {
+    if(blockDim.x!=256 || blockDim.y!=1 || blockDim.z!=1 || gridDim.y!=1 || gridDim.z!=1 ||
+       uint64_t(gridDim.x)!=rows || !rows || !width || !scores) {__trap();return;}
+    float* row = scores + uint64_t(blockIdx.x) * stride;
+    __shared__ float tmp[8];
+    float m = -3.402823466e38f;
+    for(uint32_t k=threadIdx.x;k<width;k+=256) m=fmaxf(m,row[k]);
+    m = block_max(m, tmp);
+    __syncthreads();
+    float sum=0;
+    for(uint32_t k=threadIdx.x;k<width;k+=256) {
+        float e=__expf(row[k]-m);
+        row[k]=e;
+        sum=__fadd_rn(sum,e);
+    }
+    float total=block_sum(sum,tmp);
+    float inv=__fdiv_rn(1.0f,total);
+    for(uint32_t k=threadIdx.x;k<width;k+=256) row[k]=__fmul_rn(row[k],inv);
+}
+
+// Flow input concat in F32: out[t, 0:in] = x[c, t] (channel-major latent),
+// out[t, in:2*in] = 0, out[t, 2*in:2*in+cond] = cond[t, c].
+extern "C" __global__ void flow_concat_f32(const float* __restrict__ x,
+    const float* __restrict__ cond, float* __restrict__ out,
+    long long length, int channels, int cond_dim) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const int width = 2 * channels + cond_dim;
+    const long long total = length * width;
+    if (i >= total) return;
+    const long long t = i / width;
+    const int c = (int)(i - t * width);
+    float v = 0.0f;
+    if (c < channels) v = x[(long long)c * length + t];
+    else if (c >= 2 * channels) v = cond[t * cond_dim + (c - 2 * channels)];
+    out[i] = v;
+}
+
+// y[i] += bias[i % dim], elementwise F32.
+extern "C" __global__ void bias_add_f32(float* __restrict__ y,
+    const float* __restrict__ bias, long long count, int dim) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    y[i] += bias[i % dim];
+}
+
+// a[i] += b[i], elementwise F32.
+extern "C" __global__ void add_inplace_f32(float* __restrict__ a,
+    const float* __restrict__ b, long long count) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    a[i] += b[i];
+}
+
+// In-place silu, elementwise F32.
+extern "C" __global__ void silu_f32(float* __restrict__ x, long long count) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float v = x[i];
+    x[i] = v / (1.0f + expf(-v));
+}
+
+// Flow tail: velocity[c, t] = post[t, c] + proj[t, c]; post and proj are
+// row-major [length, channels], velocity channel-major [channels, length].
+// The definition's residual at the postprocess conv is the transposed
+// proj_out output, not the transformer input.
+extern "C" __global__ void flow_tail_f32(const float* __restrict__ post,
+    const float* __restrict__ proj, float* __restrict__ velocity,
+    long long length, int channels) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)channels * length) return;
+    const long long c = i / length;
+    const long long t = i - c * length;
+    const long long rm = t * channels + c;
+    velocity[i] = post[rm] + proj[rm];
 }
 
 // NHWC GroupNorm over [batch, spatial, channels] with `groups` channel groups.

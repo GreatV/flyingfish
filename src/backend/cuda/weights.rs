@@ -85,6 +85,86 @@ pub(crate) struct LoopvlVisionWeights {
     pub bytes: usize,
 }
 
+/// MiniMax-Music3 synthesis weights, all F32 as published (raw byte slices;
+/// the engine reinterprets them as f32 at setup).
+pub struct Music3SynWeights {
+    pub flow: Music3FlowWeights,
+    pub cond: Music3CondWeights,
+    pub vocoder: Music3VocoderWeights,
+}
+
+pub struct Music3FlowWeights {
+    pub blocks: Vec<Music3FlowBlock>,
+    /// k=1 conv over the concat channels, stored [out, in].
+    pub preprocess: CudaSlice<u8>,
+    pub postprocess: CudaSlice<u8>,
+    pub proj_in: CudaSlice<u8>,
+    pub proj_out: CudaSlice<u8>,
+    /// Fourier projection weight [fourier_dim / 2, 1].
+    pub time_proj: CudaSlice<u8>,
+    pub time_l1_w: CudaSlice<u8>,
+    pub time_l1_b: CudaSlice<u8>,
+    pub time_l2_w: CudaSlice<u8>,
+    pub time_l2_b: CudaSlice<u8>,
+}
+
+pub struct Music3FlowBlock {
+    pub to_q: CudaSlice<u8>,
+    pub to_k: CudaSlice<u8>,
+    pub to_v: CudaSlice<u8>,
+    pub to_out: CudaSlice<u8>,
+    pub norm1_w: CudaSlice<u8>,
+    pub norm1_b: CudaSlice<u8>,
+    pub norm2_w: CudaSlice<u8>,
+    pub norm2_b: CudaSlice<u8>,
+    pub ff_in_w: CudaSlice<u8>,
+    pub ff_in_b: CudaSlice<u8>,
+    pub ff_out_w: CudaSlice<u8>,
+    pub ff_out_b: CudaSlice<u8>,
+}
+
+pub struct Music3CondWeights {
+    /// Conv1d k=3 over the fused condition layers, stored [out, in, 3].
+    pub proj_w: CudaSlice<u8>,
+    pub proj_b: CudaSlice<u8>,
+    pub layer_weight_logits: CudaSlice<u8>,
+    pub layer_scale: CudaSlice<u8>,
+}
+
+pub struct Music3VocoderWeights {
+    pub dec_in_proj_w: CudaSlice<u8>,
+    pub dec_in_proj_b: CudaSlice<u8>,
+    pub conv_in_g: CudaSlice<u8>,
+    pub conv_in_v: CudaSlice<u8>,
+    pub conv_in_b: CudaSlice<u8>,
+    pub blocks: Vec<Music3VocoderBlock>,
+    pub snake_out_alpha: CudaSlice<u8>,
+    pub conv_out_g: CudaSlice<u8>,
+    pub conv_out_v: CudaSlice<u8>,
+    pub conv_out_b: CudaSlice<u8>,
+}
+
+pub struct Music3VocoderBlock {
+    pub snake1_alpha: CudaSlice<u8>,
+    /// Weight-norm transposed conv: g [out, 1, 1], v [in, out, kernel].
+    pub conv_t_g: CudaSlice<u8>,
+    pub conv_t_v: CudaSlice<u8>,
+    pub conv_t_b: CudaSlice<u8>,
+    /// Dilations 1, 3, 9 in unit order.
+    pub units: Vec<Music3VocoderResUnit>,
+}
+
+pub struct Music3VocoderResUnit {
+    pub snake1_alpha: CudaSlice<u8>,
+    pub snake2_alpha: CudaSlice<u8>,
+    pub c1_g: CudaSlice<u8>,
+    pub c1_v: CudaSlice<u8>,
+    pub c1_b: CudaSlice<u8>,
+    pub c2_g: CudaSlice<u8>,
+    pub c2_v: CudaSlice<u8>,
+    pub c2_b: CudaSlice<u8>,
+}
+
 /// Stable native expert slots, persistent staging and host data plus spare blocks.
 pub struct ExpertStorage {
     layout: SlotLayout,
@@ -1111,6 +1191,172 @@ impl LoopvlVisionWeights {
             Ok(weights)
         })?;
         Ok(weights)
+    }
+}
+
+impl Music3SynWeights {
+    pub(crate) fn load(
+        dir: &Path,
+        spec: &crate::model_spec::Music3SynSpec,
+        d: &Device,
+    ) -> Result<Self> {
+        let dim = spec.flow_dim() as usize;
+        let concat = spec.concat_channels() as usize;
+        let ff = spec.flow_ff_inner as usize;
+        let mapped_transformer =
+            crate::checkpoint::MappedCheckpoint::open(&dir.join("transformer"))?;
+        let manifest_transformer = mapped_transformer.music3_syn_manifest(spec)?;
+        let (flow, _) = checkpoint_mapped(
+            &mapped_transformer,
+            d,
+            Some(&manifest_transformer),
+            false,
+            |l| {
+                let f32 = |l: &mut Loader<'_>, name: &str, shape: &[usize]| {
+                    l.load_bytes(name, shape, Dtype::F32)
+                };
+                let mut blocks = Vec::with_capacity(spec.flow_layers as usize);
+                for i in 0..spec.flow_layers as usize {
+                    let p = format!("transformer_blocks.{i}");
+                    blocks.push(Music3FlowBlock {
+                        to_q: f32(l, &format!("{p}.attn.to_q.weight"), &[dim, dim])?,
+                        to_k: f32(l, &format!("{p}.attn.to_k.weight"), &[dim, dim])?,
+                        to_v: f32(l, &format!("{p}.attn.to_v.weight"), &[dim, dim])?,
+                        to_out: f32(l, &format!("{p}.attn.to_out.0.weight"), &[dim, dim])?,
+                        norm1_w: f32(l, &format!("{p}.norm1.weight"), &[dim])?,
+                        norm1_b: f32(l, &format!("{p}.norm1.bias"), &[dim])?,
+                        norm2_w: f32(l, &format!("{p}.norm2.weight"), &[dim])?,
+                        norm2_b: f32(l, &format!("{p}.norm2.bias"), &[dim])?,
+                        ff_in_w: f32(l, &format!("{p}.ff_in.weight"), &[2 * ff, dim])?,
+                        ff_in_b: f32(l, &format!("{p}.ff_in.bias"), &[2 * ff])?,
+                        ff_out_w: f32(l, &format!("{p}.ff_out.weight"), &[dim, ff])?,
+                        ff_out_b: f32(l, &format!("{p}.ff_out.bias"), &[dim])?,
+                    });
+                }
+                Ok(Music3FlowWeights {
+                    blocks,
+                    preprocess: f32(l, "preprocess_conv.weight", &[concat, concat, 1])?,
+                    postprocess: f32(
+                        l,
+                        "postprocess_conv.weight",
+                        &[spec.in_channels as usize, spec.in_channels as usize, 1],
+                    )?,
+                    proj_in: f32(l, "proj_in.weight", &[dim, concat])?,
+                    proj_out: f32(l, "proj_out.weight", &[spec.in_channels as usize, dim])?,
+                    time_proj: f32(l, "time_proj.weight", &[spec.fourier_dim as usize / 2, 1])?,
+                    time_l1_w: f32(
+                        l,
+                        "time_embed.linear_1.weight",
+                        &[dim, spec.fourier_dim as usize],
+                    )?,
+                    time_l1_b: f32(l, "time_embed.linear_1.bias", &[dim])?,
+                    time_l2_w: f32(l, "time_embed.linear_2.weight", &[dim, dim])?,
+                    time_l2_b: f32(l, "time_embed.linear_2.bias", &[dim])?,
+                })
+            },
+        )?;
+
+        let cond_hidden = spec.cond_hidden as usize;
+        let layers = spec.cond_layers as usize;
+        let mapped_condition_encoder =
+            crate::checkpoint::MappedCheckpoint::open(&dir.join("condition_encoder"))?;
+        let manifest_condition_encoder = mapped_condition_encoder.music3_syn_manifest(spec)?;
+        let (cond, _) = checkpoint_mapped(
+            &mapped_condition_encoder,
+            d,
+            Some(&manifest_condition_encoder),
+            false,
+            |l| {
+                let f32 = |l: &mut Loader<'_>, name: &str, shape: &[usize]| {
+                    l.load_bytes(name, shape, Dtype::F32)
+                };
+                Ok(Music3CondWeights {
+                    proj_w: f32(l, "proj.weight", &[spec.cond_out as usize, cond_hidden, 3])?,
+                    proj_b: f32(l, "proj.bias", &[spec.cond_out as usize])?,
+                    layer_weight_logits: f32(l, "layer_weight_logits", &[layers])?,
+                    layer_scale: f32(l, "layer_scale", &[1])?,
+                })
+            },
+        )?;
+
+        // DAC-style decoder: each stage halves the channels while upsampling
+        // by its ratio; conv_t kernel = 2 * stride, res units at stage output.
+        let hidden = spec.decoder_hidden as usize;
+        let mut block_dims = Vec::with_capacity(spec.upsampling.len());
+        let mut stage_input = hidden;
+        for ratio in &spec.upsampling {
+            let output = stage_input / 2;
+            block_dims.push((stage_input, output, *ratio as usize));
+            stage_input = output;
+        }
+        let tail = stage_input;
+        let mapped_vocoder = crate::checkpoint::MappedCheckpoint::open(&dir.join("vocoder"))?;
+        let manifest_vocoder = mapped_vocoder.music3_syn_manifest(spec)?;
+        let (vocoder, _) =
+            checkpoint_mapped(&mapped_vocoder, d, Some(&manifest_vocoder), false, |l| {
+                let f32 = |l: &mut Loader<'_>, name: &str, shape: &[usize]| {
+                    l.load_bytes(name, shape, Dtype::F32)
+                };
+                let mut blocks = Vec::with_capacity(block_dims.len());
+                for (i, &(in_dim, out_dim, stride)) in block_dims.iter().enumerate() {
+                    let kernel = 2 * stride;
+                    let b = format!("blocks.{i}");
+                    let mut units = Vec::with_capacity(3);
+                    for u in 1..=3 {
+                        let ru = format!("{b}.res_unit{u}");
+                        units.push(Music3VocoderResUnit {
+                            snake1_alpha: f32(l, &format!("{ru}.snake1.alpha"), &[1, out_dim, 1])?,
+                            snake2_alpha: f32(l, &format!("{ru}.snake2.alpha"), &[1, out_dim, 1])?,
+                            c1_g: f32(l, &format!("{ru}.conv1.weight_g"), &[out_dim, 1, 1])?,
+                            c1_v: f32(l, &format!("{ru}.conv1.weight_v"), &[out_dim, out_dim, 7])?,
+                            c1_b: f32(l, &format!("{ru}.conv1.bias"), &[out_dim])?,
+                            c2_g: f32(l, &format!("{ru}.conv2.weight_g"), &[out_dim, 1, 1])?,
+                            c2_v: f32(l, &format!("{ru}.conv2.weight_v"), &[out_dim, out_dim, 1])?,
+                            c2_b: f32(l, &format!("{ru}.conv2.bias"), &[out_dim])?,
+                        });
+                    }
+                    blocks.push(Music3VocoderBlock {
+                        snake1_alpha: f32(l, &format!("{b}.snake1.alpha"), &[1, in_dim, 1])?,
+                        conv_t_g: f32(l, &format!("{b}.conv_t1.weight_g"), &[in_dim, 1, 1])?,
+                        conv_t_v: f32(
+                            l,
+                            &format!("{b}.conv_t1.weight_v"),
+                            &[in_dim, out_dim, kernel],
+                        )?,
+                        conv_t_b: f32(l, &format!("{b}.conv_t1.bias"), &[out_dim])?,
+                        units,
+                    });
+                }
+                Ok(Music3VocoderWeights {
+                    dec_in_proj_w: f32(
+                        l,
+                        "dec_in_proj.weight",
+                        &[
+                            spec.decoder_input as usize,
+                            spec.vocoder_stream_channels() as usize,
+                            1,
+                        ],
+                    )?,
+                    dec_in_proj_b: f32(l, "dec_in_proj.bias", &[spec.decoder_input as usize])?,
+                    conv_in_g: f32(l, "conv_in.weight_g", &[hidden, 1, 1])?,
+                    conv_in_v: f32(
+                        l,
+                        "conv_in.weight_v",
+                        &[hidden, spec.decoder_input as usize, 7],
+                    )?,
+                    conv_in_b: f32(l, "conv_in.bias", &[hidden])?,
+                    blocks,
+                    snake_out_alpha: f32(l, "snake_out.alpha", &[1, tail, 1])?,
+                    conv_out_g: f32(l, "conv_out.weight_g", &[1, 1, 1])?,
+                    conv_out_v: f32(l, "conv_out.weight_v", &[1, tail, 7])?,
+                    conv_out_b: f32(l, "conv_out.bias", &[1])?,
+                })
+            })?;
+        Ok(Self {
+            flow,
+            cond,
+            vocoder,
+        })
     }
 }
 

@@ -459,6 +459,177 @@ pub struct DiffusionConfig {
     pub pad: u32,
 }
 
+/// MiniMax-Music3 synthesis geometry from the per-component configs. The
+/// text stage (Qwen3 LM + RVQ depth decoder) is M3-AR and not part of this
+/// spec.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Music3SynSpec {
+    pub flow_layers: u32,
+    pub flow_heads: u32,
+    pub flow_head_dim: u32,
+    pub flow_ff_inner: u32,
+    pub fourier_dim: u32,
+    pub in_channels: u32,
+    pub condition_dim: u32,
+    pub rotary_dim: u32,
+    pub cond_hidden: u32,
+    pub cond_layers: u32,
+    pub cond_out: u32,
+    pub latent_channels: u32,
+    pub decoder_input: u32,
+    pub decoder_hidden: u32,
+    pub upsampling: Vec<u32>,
+    pub input_hop: u32,
+    pub input_rate: u32,
+    pub output_hop: u32,
+    pub output_rate: u32,
+}
+
+impl Music3SynSpec {
+    /// Flow model width; the conv/proj shapes below derive from it.
+    pub fn flow_dim(&self) -> u32 {
+        self.flow_heads * self.flow_head_dim
+    }
+
+    /// Channel width of the pre/post k=1 convs and the proj_in input:
+    /// latent + zero latent + condition channels.
+    pub fn concat_channels(&self) -> u32 {
+        2 * self.in_channels + self.condition_dim
+    }
+
+    /// Vocoder channel width of one folded stereo stream.
+    pub fn vocoder_stream_channels(&self) -> u32 {
+        self.latent_channels / 2
+    }
+
+    pub fn read(dir: &std::path::Path) -> Result<Self> {
+        let component = |name: &str| -> Result<Value> {
+            let path = dir.join(name).join("config.json");
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("missing component config {}", path.display()))?;
+            serde_json::from_str(&text).with_context(|| format!("invalid {name} config"))
+        };
+        let root_path = dir.join("config.json");
+        let root: Value = serde_json::from_str(
+            &std::fs::read_to_string(&root_path)
+                .with_context(|| format!("missing config {}", root_path.display()))?,
+        )?;
+        exact_keys(&root, &["architectures", "model_type"], "music3 config")?;
+        equal(
+            &root,
+            "architectures",
+            serde_json::json!(["MiniMaxMusic3ForConditionalGeneration"]),
+        )?;
+        equal(&root, "model_type", "minimax_music3".into())?;
+
+        let flow = component("transformer")?;
+        exact_keys(
+            &flow,
+            &[
+                "_class_name",
+                "_diffusers_version",
+                "attention_head_dim",
+                "condition_dim",
+                "ff_inner_dim",
+                "fourier_embedding_dim",
+                "in_channels",
+                "num_attention_heads",
+                "num_layers",
+                "rotary_dim",
+            ],
+            "transformer config",
+        )?;
+        equal(
+            &flow,
+            "_class_name",
+            "MiniMaxMusic3Transformer1DModel".into(),
+        )?;
+        let heads = positive(&flow, "num_attention_heads")?;
+        let head_dim = positive(&flow, "attention_head_dim")?;
+        let rotary = positive(&flow, "rotary_dim")?;
+        ensure!(rotary <= head_dim && rotary % 2 == 0, "invalid rotary_dim");
+
+        let cond = component("condition_encoder")?;
+        exact_keys(
+            &cond,
+            &[
+                "_class_name",
+                "_diffusers_version",
+                "condition_hidden_dim",
+                "input_hop_length",
+                "input_sampling_rate",
+                "num_condition_layers",
+                "out_dim",
+                "output_hop_length",
+                "output_sampling_rate",
+            ],
+            "condition_encoder config",
+        )?;
+        equal(&cond, "_class_name", "MiniMaxMusic3ConditionEncoder".into())?;
+
+        let vocoder = component("vocoder")?;
+        exact_keys(
+            &vocoder,
+            &[
+                "_class_name",
+                "_diffusers_version",
+                "decoder_hidden_dim",
+                "decoder_input_dim",
+                "latent_channels",
+                "sampling_rate",
+                "upsampling_ratios",
+            ],
+            "vocoder config",
+        )?;
+        equal(&vocoder, "_class_name", "MiniMaxMusic3Vocoder".into())?;
+        let upsampling_values = vocoder
+            .get("upsampling_ratios")
+            .and_then(Value::as_array)
+            .context("missing/invalid upsampling_ratios")?;
+        let upsampling = upsampling_values
+            .iter()
+            .map(|v| {
+                u32::try_from(v.as_u64().context("upsampling ratio not an integer")?)
+                    .context("upsampling ratio overflows u32")
+            })
+            .collect::<Result<Vec<u32>>>()?;
+        ensure!(upsampling.len() == 4, "vocoder needs 4 upsampling stages");
+
+        let spec = Self {
+            flow_layers: positive(&flow, "num_layers")?,
+            flow_heads: heads,
+            flow_head_dim: head_dim,
+            flow_ff_inner: positive(&flow, "ff_inner_dim")?,
+            fourier_dim: positive(&flow, "fourier_embedding_dim")?,
+            in_channels: positive(&flow, "in_channels")?,
+            condition_dim: positive(&flow, "condition_dim")?,
+            rotary_dim: rotary,
+            cond_hidden: positive(&cond, "condition_hidden_dim")?,
+            cond_layers: positive(&cond, "num_condition_layers")?,
+            cond_out: positive(&cond, "out_dim")?,
+            latent_channels: positive(&vocoder, "latent_channels")?,
+            decoder_input: positive(&vocoder, "decoder_input_dim")?,
+            decoder_hidden: positive(&vocoder, "decoder_hidden_dim")?,
+            upsampling,
+            input_hop: positive(&cond, "input_hop_length")?,
+            input_rate: positive(&cond, "input_sampling_rate")?,
+            output_hop: positive(&cond, "output_hop_length")?,
+            output_rate: positive(&cond, "output_sampling_rate")?,
+        };
+        equal(&vocoder, "sampling_rate", spec.output_rate.into())?;
+        ensure!(
+            spec.latent_channels.is_multiple_of(2)
+                && spec.flow_dim() > 0
+                && spec.flow_ff_inner.is_multiple_of(2)
+                && spec.fourier_dim.is_multiple_of(2)
+                && spec.condition_dim == spec.cond_out
+                && spec.condition_dim == spec.flow_dim(),
+            "inconsistent synthesis geometry"
+        );
+        Ok(spec)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelSpec {
     pub abi_version: u32,
@@ -1826,8 +1997,15 @@ impl ModelSpec {
             Self::clover(&root, &generation)
         } else if root.get("model_type").and_then(Value::as_str) == Some("diffusion_gemma") {
             Self::diffusion_gemma(&root, &generation)
+<<<<<<< HEAD
         } else if root.get("model_type").and_then(Value::as_str) == Some("qwen3_vl") {
             Self::qwen3_vl(&root)
+=======
+        } else if root.get("model_type").and_then(Value::as_str) == Some("minimax_music3") {
+            bail!(
+                "MiniMax-Music3 has no text ModelSpec; the synthesis stage loads via Music3Syn::load"
+            )
+>>>>>>> 42d6a153 (Add the native MiniMax-Music3 F32 flow-transformer forward with frozen-r3-syn gates)
         } else {
             Self::qwen(&root, &generation)
         }
