@@ -41,17 +41,19 @@ pub struct Music3Syn {
     guidance_scale: f32,
     vocoder_folds: VocoderFolds,
     max_length: usize,
+    #[cfg(test)]
+    pub vocoder_taps: std::cell::RefCell<Vec<(&'static str, Vec<f32>)>>,
 }
 
 /// One conv1d call site on the published folded [out, in*k] layout.
-struct Conv1dSite<'a> {
-    w: &'a CudaSlice<f32>,
-    x: &'a CudaSlice<f32>,
-    rows: usize,
-    in_dim: usize,
-    out: &'a mut CudaSlice<f32>,
-    bias: &'a CudaSlice<u8>,
-    dilation: usize,
+pub struct Conv1dSite<'a> {
+    pub w: &'a CudaSlice<f32>,
+    pub x: &'a CudaSlice<f32>,
+    pub rows: usize,
+    pub in_dim: usize,
+    pub out: &'a mut CudaSlice<f32>,
+    pub bias: &'a CudaSlice<u8>,
+    pub dilation: usize,
 }
 
 /// One batched CFG flow call site.
@@ -63,6 +65,43 @@ pub struct PairFlowCall<'a> {
     pub length: usize,
     pub v_cond: &'a mut CudaSlice<f32>,
     pub v_unc: &'a mut CudaSlice<f32>,
+}
+
+/// One linear+bias call for the vocoder discriminator.
+#[cfg(test)]
+pub struct LinearDisc<'a> {
+    pub weight: &'a CudaSlice<u8>,
+    pub out_rows: usize,
+    pub in_cols: usize,
+    pub x: &'a CudaSlice<f32>,
+    pub rows: usize,
+    pub out: &'a mut CudaSlice<f32>,
+    pub bias: &'a CudaSlice<u8>,
+}
+
+/// One conv-transpose call for the discriminator.
+#[cfg(test)]
+pub struct ConvTransposeDisc<'a> {
+    pub x: &'a CudaSlice<f32>,
+    pub w: &'a CudaSlice<f32>,
+    pub bias: &'a CudaSlice<u8>,
+    pub out: &'a mut CudaSlice<f32>,
+    pub rows: usize,
+    pub in_dim: usize,
+    pub out_dim: usize,
+    pub stride: usize,
+}
+
+/// One linear+bias call on an F32 weight for the discriminator.
+#[cfg(test)]
+pub struct LinearDiscBytes<'a> {
+    pub weight: &'a CudaSlice<f32>,
+    pub out_rows: usize,
+    pub in_cols: usize,
+    pub x: &'a CudaSlice<f32>,
+    pub rows: usize,
+    pub out: &'a mut CudaSlice<f32>,
+    pub bias: &'a CudaSlice<u8>,
 }
 
 /// Preallocated activation buffers for the synthesis path, sized at load
@@ -217,6 +256,8 @@ impl Music3Syn {
             guidance_scale: 1.7,
             vocoder_folds,
             max_length,
+            #[cfg(test)]
+            vocoder_taps: std::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -1062,6 +1103,201 @@ impl Music3Syn {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub fn transpose_for_disc(
+        &self,
+        input: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        channels: usize,
+        length: usize,
+    ) -> Result<()> {
+        let s = &self.stream;
+        unsafe {
+            s.launch_builder(&self.transpose)
+                .arg(input)
+                .arg(out)
+                .arg(&(channels as i64))
+                .arg(&(length as i64))
+                .launch(super::ops::flat(channels * length))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn linear_for_disc(&self, site: LinearDisc<'_>) -> Result<()> {
+        let LinearDisc {
+            weight,
+            out_rows,
+            in_cols,
+            x,
+            rows,
+            out,
+            bias,
+        } = site;
+        self.linear(
+            weight,
+            out_rows,
+            in_cols,
+            &x.slice(0..x.len()),
+            rows,
+            &mut out.slice_mut(0..out.len()),
+        )?;
+        let out_ptr = out.device_ptr(&self.stream).0;
+        let bias_ptr = bias.device_ptr(&self.stream).0;
+        let count = out.len();
+        unsafe {
+            self.stream
+                .launch_builder(&self.bias)
+                .arg(&out_ptr)
+                .arg(&bias_ptr)
+                .arg(&out_ptr)
+                .arg(&(rows as u32))
+                .arg(&(out_rows as u32))
+                .launch(super::ops::flat(count))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn snake_rows_for_disc(
+        &self,
+        x: &CudaSlice<f32>,
+        alpha: &CudaSlice<u8>,
+        out: &mut CudaSlice<f32>,
+        count: usize,
+        channels: usize,
+    ) -> Result<()> {
+        let s = &self.stream;
+        unsafe {
+            s.launch_builder(&self.snake_rows)
+                .arg(x)
+                .arg(alpha)
+                .arg(out)
+                .arg(&(count as i64))
+                .arg(&(channels as i32))
+                .launch(super::ops::flat(count))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn conv1d_dilated_for_disc(&self, site: Conv1dSite<'_>) -> Result<()> {
+        self.conv1d(site)
+    }
+
+    #[cfg(test)]
+    pub fn linear_bytes_bias_for_disc(&self, site: LinearDiscBytes<'_>) -> Result<()> {
+        let LinearDiscBytes {
+            weight,
+            out_rows,
+            in_cols,
+            x,
+            rows,
+            out,
+            bias,
+        } = site;
+        let x_t = unsafe {
+            Tensor::new(
+                x.device_ptr(&self.stream).0,
+                [rows as u32, in_cols as u32],
+                [in_cols as u64, 1],
+                (rows * in_cols * 4) as u64,
+            )?
+        };
+        let mut out_view = TensorMut(unsafe {
+            Tensor::new(
+                out.device_ptr_mut(&self.stream).0,
+                [rows as u32, out_rows as u32],
+                [out_rows as u64, 1],
+                (rows * out_rows * 4) as u64,
+            )?
+        });
+        let w_t = unsafe {
+            Tensor::new(
+                weight.device_ptr(&self.stream).0,
+                [out_rows as u32, in_cols as u32],
+                [in_cols as u64, 1],
+                (out_rows * in_cols * 4) as u64,
+            )?
+        };
+        self.blas.linear_f32(w_t, x_t, &mut out_view)?;
+        let out_ptr = out.device_ptr(&self.stream).0;
+        let bias_ptr = bias.device_ptr(&self.stream).0;
+        let count = out.len();
+        unsafe {
+            self.stream
+                .launch_builder(&self.bias)
+                .arg(&out_ptr)
+                .arg(&bias_ptr)
+                .arg(&out_ptr)
+                .arg(&(rows as u32))
+                .arg(&(out_rows as u32))
+                .launch(super::ops::flat(count))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn add_inplace_for_disc(&self) -> &cudarc::driver::CudaFunction {
+        &self.add_inplace
+    }
+
+    #[cfg(test)]
+    pub fn conv_transpose_for_disc(&self, site: ConvTransposeDisc<'_>) -> Result<()> {
+        let ConvTransposeDisc {
+            x,
+            w,
+            bias,
+            out,
+            rows,
+            in_dim,
+            out_dim,
+            stride,
+        } = site;
+        let s = &self.stream;
+        unsafe {
+            s.launch_builder(&self.conv_transpose)
+                .arg(x)
+                .arg(w)
+                .arg(bias)
+                .arg(out)
+                .arg(&(rows as i32))
+                .arg(&(in_dim as i32))
+                .arg(&(out_dim as i32))
+                .arg(&(stride as i32))
+                .arg(&(stride.div_ceil(2) as i32))
+                .launch(super::ops::grid(rows * stride, 256))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn conv1d_for_disc(
+        &self,
+        w: &CudaSlice<f32>,
+        x: &cudarc::driver::CudaView<f32>,
+        rows: usize,
+        in_dim: usize,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<()> {
+        let mut owned: CudaSlice<f32> = unsafe { self.stream.alloc(x.len())? };
+        self.stream.memcpy_dtod(x, &mut owned)?;
+        self.conv1d(Conv1dSite {
+            w,
+            x: &owned,
+            rows,
+            in_dim,
+            out,
+            bias: &self.weights.vocoder.conv_in_b,
+            dilation: 1,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn vocoder_folds_for_disc(&self) -> &VocoderFolds {
+        &self.vocoder_folds
+    }
+
     /// Latent length for a frame count: int(frames * out_rate * in_hop /
     /// (in_rate * out_hop)), at least 1.
     pub fn latent_length(&self, frames: usize) -> usize {
@@ -1344,16 +1580,15 @@ impl Music3Syn {
             for (unit_index, unit) in vb.units.iter().enumerate() {
                 let dilation = [1usize, 3, 9][unit_index];
                 let count = rows * dim;
-                let ptr = wide.device_ptr_mut(s).0;
-
+                let unit_weights = &self.weights.vocoder.blocks[block_index].units[unit_index];
+                let mut sn1: CudaSlice<f32> = unsafe { s.alloc(count)? };
+                let sn1_ptr = wide.device_ptr(s).0;
+                let sn1_out = sn1.device_ptr_mut(s).0;
                 unsafe {
                     s.launch_builder(&self.snake_rows)
-                        .arg(&ptr)
-                        .arg(
-                            &self.weights.vocoder.blocks[block_index].units[unit_index]
-                                .snake1_alpha,
-                        )
-                        .arg(&ptr)
+                        .arg(&sn1_ptr)
+                        .arg(&unit_weights.snake1_alpha)
+                        .arg(&sn1_out)
                         .arg(&(count as i64))
                         .arg(&(dim as i32))
                         .launch(super::ops::flat(count))?;
@@ -1361,39 +1596,34 @@ impl Music3Syn {
                 let mut conv: CudaSlice<f32> = unsafe { s.alloc(rows * dim)? };
                 self.conv1d(Conv1dSite {
                     w: &unit.c1_w,
-                    x: &wide,
+                    x: &sn1,
                     rows,
                     in_dim: dim,
                     out: &mut conv,
-                    bias: &self.weights.vocoder.blocks[block_index].units[unit_index].c1_b,
+                    bias: &unit_weights.c1_b,
                     dilation,
                 })?;
+                let mut sn2: CudaSlice<f32> = unsafe { s.alloc(count)? };
+                let conv_ptr = conv.device_ptr(s).0;
+                let sn2_out = sn2.device_ptr_mut(s).0;
                 unsafe {
                     s.launch_builder(&self.snake_rows)
-                        .arg(&conv)
-                        .arg(
-                            &self.weights.vocoder.blocks[block_index].units[unit_index]
-                                .snake2_alpha,
-                        )
-                        .arg(&conv)
+                        .arg(&conv_ptr)
+                        .arg(&unit_weights.snake2_alpha)
+                        .arg(&sn2_out)
                         .arg(&(count as i64))
                         .arg(&(dim as i32))
                         .launch(super::ops::flat(count))?;
                 }
                 let mut gated: CudaSlice<f32> = unsafe { s.alloc(rows * dim)? };
-                self.linear_bytes(
-                    &unit.c2_w,
-                    dim,
-                    dim,
-                    &conv.slice(0..count),
-                    rows,
-                    &mut gated,
-                )?;
+                self.linear_bytes(&unit.c2_w, dim, dim, &sn2.slice(0..count), rows, &mut gated)?;
+                let gated_ptr = gated.device_ptr(s).0;
+                let gated_bias = unit_weights.c2_b.device_ptr(s).0;
                 unsafe {
                     s.launch_builder(&self.bias)
-                        .arg(&gated)
-                        .arg(&self.weights.vocoder.blocks[block_index].units[unit_index].c2_b)
-                        .arg(&gated)
+                        .arg(&gated_ptr)
+                        .arg(&gated_bias)
+                        .arg(&gated_ptr)
                         .arg(&(rows as u32))
                         .arg(&(dim as u32))
                         .launch(super::ops::flat(count))?;
@@ -1404,6 +1634,10 @@ impl Music3Syn {
                         .launch(super::ops::flat(count))?;
                 }
             }
+            #[cfg(test)]
+            self.vocoder_taps
+                .borrow_mut()
+                .push(("block", s.clone_dtoh(&wide)?));
         }
         let total = rows;
         let tail = dim;
@@ -1541,19 +1775,19 @@ impl Music3Syn {
 /// Folded vocoder weights on the published layouts: conv weights
 /// [out, in*k], transposed conv weights [in, out*k].
 pub struct VocoderFolds {
-    conv_in_w: CudaSlice<f32>,
-    blocks: Vec<VocoderBlockFold>,
-    conv_out_w: CudaSlice<f32>,
+    pub conv_in_w: CudaSlice<f32>,
+    pub blocks: Vec<VocoderBlockFold>,
+    pub conv_out_w: CudaSlice<f32>,
 }
 
 pub struct VocoderBlockFold {
-    conv_t_w: CudaSlice<f32>,
-    units: Vec<VocoderUnitFold>,
+    pub conv_t_w: CudaSlice<f32>,
+    pub units: Vec<VocoderUnitFold>,
 }
 
 pub struct VocoderUnitFold {
-    c1_w: CudaSlice<f32>,
-    c2_w: CudaSlice<f32>,
+    pub c1_w: CudaSlice<f32>,
+    pub c2_w: CudaSlice<f32>,
 }
 
 impl Music3Syn {
