@@ -2233,7 +2233,7 @@ mod tests {
         let rotated = s.clone_htod(&rotated)?;
         let condition = layout.condition_video_rows;
         let patch = spec.video_row_width();
-        let mut control_failed = false;
+        let (mut control_failed, mut defects) = (false, vec![]);
         for &k in &steps {
             let step_map = mapped(&capture.join(format!("step{k}.safetensors")))?;
             let step_file = SafeTensors::deserialize(&step_map)?;
@@ -2288,13 +2288,16 @@ mod tests {
             let [d_video, d_audio] = evaluate(&text)?;
             let video_threshold = &thresholds[format!("{cell}.step{k}.noise_pred")];
             let audio_threshold = &thresholds[format!("{cell}.step{k}.audio_noise_pred")];
+            let verdict = [
+                within(d_video, video_threshold)?,
+                within(d_audio, audio_threshold)?,
+            ];
             println!(
-                "H3_DIT step{k} video={d_video:?} audio={d_audio:?} thresholds={video_threshold} {audio_threshold}"
+                "H3_DIT step{k} video={d_video:?} audio={d_audio:?} thresholds={video_threshold} {audio_threshold} within={verdict:?}"
             );
-            ensure!(
-                within(d_video, video_threshold)? && within(d_audio, audio_threshold)?,
-                "step {k} outside the frozen thresholds"
-            );
+            if verdict != [true, true] {
+                defects.push(k);
+            }
             if k == steps[0] {
                 let [c_video, c_audio] = evaluate(&rotated)?;
                 println!("H3_DIT step{k} rotated-text control video={c_video:?} audio={c_audio:?}");
@@ -2306,6 +2309,10 @@ mod tests {
         ensure!(
             control_failed,
             "rotated-text control stayed within the thresholds"
+        );
+        ensure!(
+            defects.is_empty(),
+            "H3_DIT_GATE DEFECT cell={cell} steps outside the frozen thresholds: {defects:?} of {steps:?}"
         );
         println!("H3_DIT_GATE PASS cell={cell} steps={steps:?} control=FAIL_AS_REQUIRED");
         Ok(())
