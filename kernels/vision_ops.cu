@@ -344,3 +344,154 @@ extern "C" __global__ void vision_anchor_reinject_bf16(
 #endif
     }
 }
+
+// One CTA of 256 threads per row: bf16(x * rsqrt(mean(x^2) + eps) * weight[i]) of an F32 row.
+extern "C" __global__ void rms_norm_weight_f32(
+    const float* input, const float* weight, __nv_bfloat16* output, uint32_t width, float eps) {
+    if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 || gridDim.y != 1 ||
+        gridDim.z != 1 || !input || !weight || !output || !width || !(eps > 0.0f)) {
+        __trap(); return;
+    }
+    const uint64_t row = uint64_t(blockIdx.x) * width;
+    __shared__ float partial[8];
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < width; i += 256) {
+        const float x = input[row + i];
+        sum = __fadd_rn(sum, __fmul_rn(x, x));
+    }
+    for (int delta = 16; delta; delta >>= 1)
+        sum = __fadd_rn(sum, __shfl_down_sync(FF_WARP_MASK, sum, delta));
+    if ((threadIdx.x & 31) == 0) partial[threadIdx.x >> 5] = sum;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        sum = threadIdx.x < 8 ? partial[threadIdx.x] : 0.0f;
+        for (int delta = 16; delta; delta >>= 1)
+            sum = __fadd_rn(sum, __shfl_down_sync(FF_WARP_MASK, sum, delta));
+        if (threadIdx.x == 0) partial[0] = rsqrtf(__fadd_rn(sum / float(width), eps));
+    }
+    __syncthreads();
+    const float rstd = partial[0];
+    for (uint32_t i = threadIdx.x; i < width; i += 256)
+        output[row + i] = __float2bfloat16_rn(__fmul_rn(__fmul_rn(input[row + i], rstd), weight[i]));
+}
+
+// residual[i] = residual[i] + f32(delta[i]) * scale[i % width], rounded after the product and after the sum.
+extern "C" __global__ void scaled_residual_f32(
+    float* residual, const __nv_bfloat16* delta, const float* scale, uint64_t count, uint32_t width) {
+    if (!vision_flat_launch() || !residual || !delta || !scale || !count || !width ||
+        count % width) { __trap(); return; }
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256)
+        residual[i] = __fadd_rn(residual[i], __fmul_rn(__bfloat162float(delta[i]), scale[i % width]));
+}
+
+// Token rows [frames * height * width, channels * pt * p * p] -> pixels [channels, frames * pt, height * p, width * p].
+extern "C" __global__ void unpatchify_bf16(
+    const __nv_bfloat16* rows, __nv_bfloat16* pixels, uint32_t frames, uint32_t height,
+    uint32_t width, uint32_t channels, uint32_t pt, uint32_t p) {
+    if (!vision_flat_launch() || !rows || !pixels || !frames || !height || !width || !channels ||
+        !pt || !p) { __trap(); return; }
+    const uint64_t out_t = uint64_t(frames) * pt, out_h = uint64_t(height) * p,
+                   out_w = uint64_t(width) * p;
+    const uint64_t count = uint64_t(channels) * out_t * out_h * out_w;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint64_t x = i % out_w, y = (i / out_w) % out_h, t = (i / (out_w * out_h)) % out_t,
+                       c = i / (out_w * out_h * out_t);
+        const uint64_t token = ((t / pt) * height + y / p) * width + x / p;
+        const uint64_t column = ((c * pt + t % pt) * p + y % p) * p + x % p;
+        pixels[i] = rows[token * (uint64_t(channels) * pt * p * p) + column];
+    }
+}
+
+// bf16(bf16(a * bf16(1 - w)) + bf16(b * w)) with w = bf16(position / extent): one element of a linear tile blend.
+__device__ __forceinline__ __nv_bfloat16 linear_blend_bf16(
+    __nv_bfloat16 a, __nv_bfloat16 b, uint32_t position, uint32_t extent) {
+    const float w = __bfloat162float(__float2bfloat16_rn(__fdiv_rn(float(position), float(extent))));
+    const float wa = __bfloat162float(__float2bfloat16_rn(__fsub_rn(1.0f, w)));
+    const float pa = __bfloat162float(__float2bfloat16_rn(__fmul_rn(__bfloat162float(a), wa)));
+    const float pb = __bfloat162float(__float2bfloat16_rn(__fmul_rn(__bfloat162float(b), w)));
+    return __float2bfloat16_rn(__fadd_rn(pa, pb));
+}
+
+// Raw tiles [rows * cols, planes, tile_h, tile_w] -> canvas [planes, canvas_h, canvas_w]. grid holds the row starts,
+// row overlaps, column starts and column overlaps (rows, rows - 1, cols, cols - 1 values). A tile blends its first
+// overlap rows with the raw tile above, then its first overlap columns with the raw tile to its left.
+extern "C" __global__ void tile_stitch_bf16(
+    const __nv_bfloat16* tiles, __nv_bfloat16* canvas, const uint32_t* grid, uint32_t rows,
+    uint32_t cols, uint32_t planes, uint32_t tile_h, uint32_t tile_w, uint32_t canvas_h,
+    uint32_t canvas_w) {
+    if (!vision_flat_launch() || !tiles || !canvas || !grid || !rows || !cols || !planes ||
+        !tile_h || !tile_w || !canvas_h || !canvas_w) { __trap(); return; }
+    const uint32_t* row_start = grid;
+    const uint32_t* row_overlap = grid + rows;
+    const uint32_t* col_start = row_overlap + rows - 1;
+    const uint32_t* col_overlap = col_start + cols;
+    const uint64_t tile_plane = uint64_t(tile_h) * tile_w, tile_size = uint64_t(planes) * tile_plane;
+    const uint64_t count = uint64_t(planes) * canvas_h * canvas_w;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint32_t X = uint32_t(i % canvas_w), Y = uint32_t((i / canvas_w) % canvas_h);
+        const uint64_t plane = i / (uint64_t(canvas_w) * canvas_h);
+        uint32_t r = 0, c = 0;
+        while (r + 1 < rows && row_start[r + 1] <= Y) ++r;
+        while (c + 1 < cols && col_start[c + 1] <= X) ++c;
+        const uint32_t y = Y - row_start[r], x = X - col_start[c];
+        if (y >= tile_h || x >= tile_w) { __trap(); return; }
+        const uint64_t base = plane * tile_plane;
+        __nv_bfloat16 v = tiles[uint64_t(r * cols + c) * tile_size + base + uint64_t(y) * tile_w + x];
+        if (r > 0 && y < row_overlap[r - 1]) {
+            const uint32_t above_y = y + tile_h - row_overlap[r - 1];
+            const __nv_bfloat16 a =
+                tiles[uint64_t((r - 1) * cols + c) * tile_size + base + uint64_t(above_y) * tile_w + x];
+            v = linear_blend_bf16(a, v, y, row_overlap[r - 1]);
+        }
+        if (c > 0 && x < col_overlap[c - 1]) {
+            const uint32_t left_x = x + tile_w - col_overlap[c - 1];
+            const __nv_bfloat16 a =
+                tiles[uint64_t(r * cols + c - 1) * tile_size + base + uint64_t(y) * tile_w + left_x];
+            v = linear_blend_bf16(a, v, x, col_overlap[c - 1]);
+        }
+        canvas[i] = v;
+    }
+}
+
+// out[c, out_first + k, :] = linear blend of a[c, a_first + k, :] and b[c, b_first + k, :] at position k of extent
+// frames; a, b and out are [channels, frames, plane] with their own frame counts.
+extern "C" __global__ void frame_blend_bf16(
+    const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* out, uint32_t channels,
+    uint32_t extent, uint64_t plane, uint32_t a_frames, uint32_t a_first, uint32_t b_frames,
+    uint32_t b_first, uint32_t out_frames, uint32_t out_first) {
+    if (!vision_flat_launch() || !a || !b || !out || !channels || !extent || !plane ||
+        a_first + extent > a_frames || b_first + extent > b_frames ||
+        out_first + extent > out_frames) { __trap(); return; }
+    const uint64_t count = uint64_t(channels) * extent * plane;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint64_t px = i % plane, k = (i / plane) % extent, c = i / (plane * extent);
+        const __nv_bfloat16 va = a[(c * a_frames + a_first + k) * plane + px];
+        const __nv_bfloat16 vb = b[(c * b_frames + b_first + k) * plane + px];
+        out[(c * out_frames + out_first + k) * plane + px] = linear_blend_bf16(va, vb, uint32_t(k), extent);
+    }
+}
+
+// F32 latents [channels, frames, height, width] -> BF16 rows [n_frames * n_height * n_width, channels] of the window
+// starting at (first_frame, first_row, first_col).
+extern "C" __global__ void latent_rows_bf16(
+    const float* latents, __nv_bfloat16* rows, uint32_t channels, uint32_t frames, uint32_t height,
+    uint32_t width, uint32_t first_frame, uint32_t first_row, uint32_t first_col, uint32_t n_frames,
+    uint32_t n_height, uint32_t n_width) {
+    if (!vision_flat_launch() || !latents || !rows || !channels || !n_frames || !n_height ||
+        !n_width || first_frame + n_frames > frames || first_row + n_height > height ||
+        first_col + n_width > width) { __trap(); return; }
+    const uint64_t count = uint64_t(n_frames) * n_height * n_width * channels;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint64_t c = i % channels, token = i / channels;
+        const uint64_t x = token % n_width, y = (token / n_width) % n_height,
+                       t = token / (uint64_t(n_width) * n_height);
+        const uint64_t source =
+            ((c * frames + first_frame + t) * height + first_row + y) * uint64_t(width) + first_col + x;
+        rows[i] = __float2bfloat16_rn(latents[source]);
+    }
+}

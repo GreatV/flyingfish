@@ -2500,6 +2500,124 @@ impl MappedCheckpoint {
         self.assemble_manifest("MiniMax-H3", expected, LoadPolicy::TextOnly, planned, None)
     }
 
+    /// MiniMax-H3 video VAE (published F32): every tensor's name and shape from `vae/config.json`. The decoder side
+    /// (post_quant_conv and the ViT decoder) loads; the encoder and quant_conv are Dormant.
+    pub fn minimax_h3_vae_manifest(
+        &self,
+        vae: &crate::minimax_h3::VaeSpec,
+    ) -> Result<TensorManifest> {
+        let mut expected = BTreeMap::new();
+        let mut entry = |name: String, shape: Vec<usize>, scope: TensorScope| {
+            put(&mut expected, name, Dtype::F32, shape, scope)
+        };
+        let (latent, dim) = (vae.latent_channels, vae.dim);
+        let decoder = TensorScope::Text;
+        for (name, shape) in [
+            ("post_quant_conv.weight", vec![latent, latent, 1, 1, 1]),
+            ("post_quant_conv.bias", vec![latent]),
+            ("decoder.proj_in.weight", vec![dim, latent]),
+            ("decoder.proj_in.bias", vec![dim]),
+            ("decoder.register_tokens", vec![1, vae.registers, dim]),
+            ("decoder.norm_out.weight", vec![dim]),
+            ("decoder.norm_out.bias", vec![dim]),
+            ("decoder.proj_out.weight", vec![vae.patch_width(), dim]),
+            ("decoder.proj_out.bias", vec![vae.patch_width()]),
+        ] {
+            entry(name.to_owned(), shape, decoder);
+        }
+        for layer in 0..vae.layers {
+            let block = format!("decoder.transformer_blocks.{layer}");
+            for (name, shape) in [
+                ("attn.to_q.weight", vec![dim, dim]),
+                ("attn.to_k.weight", vec![dim, dim]),
+                ("attn.to_v.weight", vec![dim, dim]),
+                ("attn.to_out.0.weight", vec![dim, dim]),
+                ("ff.net.0.proj.weight", vec![2 * vae.ffn, dim]),
+                ("ff.net.2.weight", vec![dim, vae.ffn]),
+                ("attn.to_q.bias", vec![dim]),
+                ("attn.to_k.bias", vec![dim]),
+                ("attn.to_v.bias", vec![dim]),
+                ("attn.to_out.0.bias", vec![dim]),
+                ("ff.net.0.proj.bias", vec![2 * vae.ffn]),
+                ("ff.net.2.bias", vec![dim]),
+                ("norm1.weight", vec![dim]),
+                ("norm2.weight", vec![dim]),
+                ("scale1", vec![dim]),
+                ("scale2", vec![dim]),
+            ] {
+                entry(format!("{block}.{name}"), shape, decoder);
+            }
+        }
+        let encoder = TensorScope::Dormant;
+        let conv = |out: usize, input: usize, k: usize| vec![out, input, k, k, k];
+        let first = *vae
+            .block_out_channels
+            .first()
+            .context("empty VAE encoder")?;
+        let last = *vae.block_out_channels.last().context("empty VAE encoder")?;
+        entry(
+            "encoder.conv_in.weight".into(),
+            conv(first, vae.in_channels, 3),
+            encoder,
+        );
+        entry("encoder.conv_in.bias".into(), vec![first], encoder);
+        let mut input = first;
+        for (i, &out) in vae.block_out_channels.iter().enumerate() {
+            for j in 0..vae.layers_per_block {
+                let resnet = format!("encoder.down_blocks.{i}.resnets.{j}");
+                let channels = if j == 0 { input } else { out };
+                for (name, shape) in [
+                    ("norm1.weight", vec![channels]),
+                    ("norm1.bias", vec![channels]),
+                    ("conv1.weight", conv(out, channels, 3)),
+                    ("conv1.bias", vec![out]),
+                    ("norm2.weight", vec![out]),
+                    ("norm2.bias", vec![out]),
+                    ("conv2.weight", conv(out, out, 3)),
+                    ("conv2.bias", vec![out]),
+                ] {
+                    entry(format!("{resnet}.{name}"), shape, encoder);
+                }
+                if channels != out {
+                    entry(
+                        format!("{resnet}.conv_shortcut.weight"),
+                        conv(out, channels, 1),
+                        encoder,
+                    );
+                    entry(format!("{resnet}.conv_shortcut.bias"), vec![out], encoder);
+                }
+            }
+            if vae.spatial_factors[i] * vae.temporal_factors[i] > 1 {
+                let down = format!("encoder.down_blocks.{i}.downsamplers.0.conv");
+                entry(format!("{down}.weight"), conv(out, out, 3), encoder);
+                entry(format!("{down}.bias"), vec![out], encoder);
+            }
+            input = out;
+        }
+        entry("encoder.norm_out.weight".into(), vec![last], encoder);
+        entry("encoder.norm_out.bias".into(), vec![last], encoder);
+        entry(
+            "encoder.conv_out.weight".into(),
+            conv(2 * latent, last, 3),
+            encoder,
+        );
+        entry("encoder.conv_out.bias".into(), vec![2 * latent], encoder);
+        entry(
+            "quant_conv.weight".into(),
+            conv(2 * latent, 2 * latent, 1),
+            encoder,
+        );
+        entry("quant_conv.bias".into(), vec![2 * latent], encoder);
+        let planned = planned_bytes(&expected, LoadPolicy::TextOnly)?;
+        self.assemble_manifest(
+            "MiniMax-H3 video VAE",
+            expected,
+            LoadPolicy::TextOnly,
+            planned,
+            None,
+        )
+    }
+
     /// MiniMax-H3 Qwen3-VL conditioner: decoder layers `0..layers` load; the embedding table (read by row), the later
     /// layers, the final norm and the LM head are Dormant; the vision tower is Vision scope.
     pub fn minimax_h3_conditioner_manifest(
