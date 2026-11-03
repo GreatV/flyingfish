@@ -441,6 +441,12 @@ impl VisionRuntime {
                 matrix(&work.n, s, rows, 1024)?,
                 matrix(&work.gu, s, rows, 6144)?,
             )?;
+            let cfg = crate::backend::cuda::ops::silu_mul_grid(
+                rows,
+                3072,
+                work.gu.device_ptr(s).0,
+                work.act.device_ptr(s).0,
+            )?;
             unsafe {
                 s.launch_builder(&self.ops.act)
                     .arg(&work.gu)
@@ -448,7 +454,7 @@ impl VisionRuntime {
                     .arg(&(rows as i32))
                     .arg(&3072i32)
                     .arg(&0i32)
-                    .launch(flat(rows * 3072))?;
+                    .launch(cfg)?;
             }
             linear(
                 blas,
@@ -1218,6 +1224,12 @@ impl Engine {
                     matrix(&w.n, s, rows, h)?,
                     matrix(&w.gu, s, rows, 2 * f)?,
                 )?;
+                let cfg = crate::backend::cuda::ops::silu_mul_grid(
+                    rows,
+                    f,
+                    w.gu.device_ptr(s).0,
+                    w.act.device_ptr(s).0,
+                )?;
                 unsafe {
                     s.launch_builder(&self.ops.act)
                         .arg(&w.gu)
@@ -1225,7 +1237,7 @@ impl Engine {
                         .arg(&(rows as i32))
                         .arg(&(f as i32))
                         .arg(&0i32)
-                        .launch(flat(rows * f))?;
+                        .launch(cfg)?;
                 }
                 linear(
                     &self.blas,
