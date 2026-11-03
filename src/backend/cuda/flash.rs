@@ -1654,17 +1654,21 @@ mod tests {
                 "PASS score_window_binding D={d} heads={hq} kv_heads={hkv} window={window:?} rows=3 device_positions=3,109,511,512,513,519,701 limits=637,512 graph_eager=true stale_position_rejected=true"
             );
         }
-        for (rows, keys) in [(1usize, 2usize), (1536, 1536)] {
+        for (mode, rows, keys) in [
+            ("bidirectional", 1usize, 2usize),
+            ("bidirectional", 1536, 1536),
+            ("causal", 1, 2),
+        ] {
             for scale in [0.0625f32, 1.0] {
                 let case = Case {
-                    name: "bidirectional-score-binding".into(),
+                    name: format!("{mode}-score-binding"),
                     d: 256,
                     hq: 24,
                     hkv: 4,
-                    mode: "bidirectional".into(),
+                    mode: mode.into(),
                     seed: 47,
                     rows,
-                    start: 0,
+                    start: if mode == "causal" { keys - rows } else { 0 },
                     keys,
                     extent: keys,
                     capacity: keys + 23,
@@ -1703,10 +1707,10 @@ mod tests {
                 let actual = stream.clone_dtoh(&buffers.out)?;
                 ensure!(
                     actual.iter().all(|&value| value == expected),
-                    "bidirectional score binding differs rows={rows} keys={keys} scale={scale}"
+                    "{mode} score binding differs rows={rows} keys={keys} scale={scale}"
                 );
                 println!(
-                    "PASS bidirectional_score_binding D=256 heads=24 kv_heads=4 rows={rows} keys={keys} scale={scale} output_bits={} expected_bits={} relative_rounding_margin=0.0001",
+                    "PASS {mode}_score_binding D=256 heads=24 kv_heads=4 rows={rows} keys={keys} scale={scale} output_bits={} expected_bits={} relative_rounding_margin=0.0001",
                     actual[0].to_bits(),
                     expected.to_bits()
                 );
