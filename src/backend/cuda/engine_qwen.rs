@@ -610,8 +610,6 @@ struct GemmaOps {
     #[cfg(test)]
     logits: CudaSlice<bf16>,
     #[cfg(test)]
-    mlp_ones: CudaSlice<bf16>,
-    #[cfg(test)]
     mlp_activation: CudaSlice<bf16>,
 }
 
@@ -1510,7 +1508,7 @@ impl Runtime {
                 scaled_embed: embed.load_function("embed_scale_broadcast")?,
                 softcap: act.load_function("softcap")?,
                 softcap_argmax: sample.load_function("softcap_argmax")?,
-                gated_activation: act.load_function("silu_mul_split")?,
+                gated_activation: act.load_function("silu_mul")?,
                 rope: rope_module
                     .as_ref()
                     .context("table RoPE module missing")?
@@ -1633,8 +1631,6 @@ impl Runtime {
                     },
                 )?,
                 #[cfg(test)]
-                mlp_ones: s.clone_htod(&vec![bf16::ONE; mlp_elements])?,
-                #[cfg(test)]
                 mlp_activation: s.alloc_zeros(mlp_elements)?,
             })
         } else {
@@ -1647,6 +1643,27 @@ impl Runtime {
             let weight = |name: &str| vector(catalog.bf16(&format!("{prefix}{name}"))?, s);
             let arena_view = arena.as_ref().map(|b| scratch(b, s));
             let mut linear = LayerLinearPlan::bind(&plan, &catalog, arena_view.as_ref(), s)?;
+            if gemma {
+                let geometry = layout.geometry.context("Gemma 4 layer geometry missing")?;
+                let shared_projection =
+                    geometry.head_dim == 512 && engine.model_spec.per_layer_input.is_none();
+                linear.fuse_pair(
+                    &plan,
+                    &catalog.manifest,
+                    "mlp.gate_proj.weight",
+                    "mlp.up_proj.weight",
+                    "mlp.gate_up_proj.weight",
+                )?;
+                if !geometry.kv_reader && !shared_projection {
+                    linear.fuse_pair(
+                        &plan,
+                        &catalog.manifest,
+                        "self_attn.q_proj.weight",
+                        "self_attn.v_proj.weight",
+                        "self_attn.qv_proj.weight",
+                    )?;
+                }
+            }
             let ffn = BoundFfn::bind(&engine.model_spec, &mut linear)?;
             if engine.model_spec.architecture == crate::model_spec::Architecture::Glm5Next {
                 linear.prepare_native(engine.blas.fp8_ops()?, s, rows as u32)?;
@@ -5199,6 +5216,11 @@ impl Engine {
                 let kv_width = hkv * d;
                 let reader = geometry.kv_reader;
                 let shared_projection = *full && self.model_spec.per_layer_input.is_none();
+                let q_stride = if reader || shared_projection {
+                    q_width
+                } else {
+                    q_width + kv_width
+                };
                 if reader {
                     layer.linear.run(
                         &self.blas,
@@ -5207,19 +5229,28 @@ impl Engine {
                         matrix(&w.n, s, 0, linear_rows, hidden)?,
                         &mut TensorMut(matrix(&w.qkv, s, 0, linear_rows, q_width)?),
                     )?;
-                } else {
+                } else if shared_projection {
                     for (role, width, offset) in [
                         ("self_attn.q_proj.weight", q_width, 0),
                         ("self_attn.k_proj.weight", kv_width, linear_rows * q_width),
+                    ] {
+                        layer.linear.run(
+                            &self.blas,
+                            role,
+                            phase,
+                            matrix(&w.n, s, 0, linear_rows, hidden)?,
+                            &mut TensorMut(matrix(&w.qkv, s, offset, linear_rows, width)?),
+                        )?;
+                    }
+                } else {
+                    for (role, width, offset) in [
+                        ("self_attn.qv_proj.weight", q_width + kv_width, 0),
                         (
-                            "self_attn.v_proj.weight",
+                            "self_attn.k_proj.weight",
                             kv_width,
                             linear_rows * (q_width + kv_width),
                         ),
                     ] {
-                        if shared_projection && role == "self_attn.v_proj.weight" {
-                            continue;
-                        }
                         layer.linear.run(
                             &self.blas,
                             role,
@@ -5283,7 +5314,6 @@ impl Engine {
                     } else {
                         (&mut kv.k, &mut kv.v)
                     };
-                    let q_stride = q_width;
                     let prep_heads = if reader { 0 } else { hkv };
                     let cache_start = if overflow { history as i32 } else { -1 };
                     let ring_tokens = if sliding && decode { ring as i32 } else { 0 };
@@ -5329,10 +5359,10 @@ impl Engine {
                         .arg(&ring_tokens)
                         .arg(&self.model_spec.rms_eps)
                         .arg(&(q_stride as u64))
-                        .arg(&((linear_rows * q_width) as u64))
+                        .arg(&((linear_rows * q_stride) as u64))
                         .arg(&(kv_width as u64))
-                        .arg(&((linear_rows * (q_width + kv_width)) as u64))
-                        .arg(&(kv_width as u64))
+                        .arg(&(q_width as u64))
+                        .arg(&(q_stride as u64))
                         .launch(LaunchConfig {
                             grid_dim: (
                                 (rows
@@ -5353,14 +5383,22 @@ impl Engine {
                         if self.graph.is_none() {
                             s.synchronize()?;
                         }
-                        trace_value(
-                            trace,
-                            s,
-                            &debug_name(trace, i, "qkv_prepared"),
-                            &w.qkv,
-                            linear_rows,
-                            q_stride,
-                        )?;
+                        let prepared_name = debug_name(trace, i, "qkv_prepared");
+                        if let Some(target) = trace.as_mut() {
+                            ensure!(target.skip < rows, "trace selection is empty");
+                            let data = s.clone_dtoh(
+                                &w.qkv.slice(target.skip * q_stride..rows * q_stride),
+                            )?;
+                            let mut q_prepared = Vec::with_capacity((rows - target.skip) * q_width);
+                            for row in data.chunks_exact(q_stride) {
+                                q_prepared.extend(row[..q_width].iter().copied().map(bf16::to_f32));
+                            }
+                            target.trace.add(
+                                format!("{}.{prepared_name}", target.prefix),
+                                vec![1, rows - target.skip, q_width],
+                                q_prepared,
+                            )?;
+                        }
                         if hkv == 1 && d == 512 {
                             trace_value(
                                 trace,
@@ -6002,7 +6040,6 @@ impl Engine {
     #[cfg(test)]
     pub(crate) fn gemma_linear_probe(&mut self, role: &str, input: &[bf16]) -> Result<Vec<bf16>> {
         let q = self.qwen.as_ref().context("Q38 runtime missing")?;
-        let layer = &q.layers[0];
         let s = &self.device.stream;
         let hidden = self.model_spec.hidden as usize;
         let intermediate = self.model_spec.layers[0]
@@ -6035,12 +6072,15 @@ impl Engine {
             u32::try_from(output_width)?,
             u32::try_from(input_width)?,
         )?;
-        layer.linear.run(
-            &self.blas,
-            role,
+        let weight = q
+            .catalog
+            .linear_ref(&format!("model.language_model.layers.0.{role}"), s)?;
+        self.blas.linear_typed_bound(
             ExecutionPhase::Prefill,
+            weight,
             matrix(&x, s, 0, rows, input_width)?,
             &mut TensorMut(matrix(&y, s, 0, rows, output_width)?),
+            0,
         )?;
         s.clone_dtoh(&y).context("Gemma device readback failed")
     }
@@ -6058,25 +6098,26 @@ impl Engine {
         let q = self.qwen.as_ref().context("Q38 runtime missing")?;
         let ops = q.gemma.as_ref().context("Gemma 4 operations missing")?;
         let s = &self.device.stream;
-        let gate = s.clone_htod(gate)?;
-        let up = s.clone_htod(up)?;
-        let ones = s.clone_htod(&vec![bf16::ONE; gate.len()])?;
+        let gate_ones: Vec<bf16> = gate.iter().flat_map(|&g| [g, bf16::ONE]).collect();
+        let gate_up: Vec<bf16> = gate.iter().zip(up).flat_map(|(&g, &u)| [g, u]).collect();
+        let gate_ones = s.clone_htod(&gate_ones)?;
+        let gate_up = s.clone_htod(&gate_up)?;
         let mut activation = s.alloc_zeros::<bf16>(gate.len())?;
         let mut product = s.alloc_zeros::<bf16>(gate.len())?;
         let count = i32::try_from(gate.len())?;
         unsafe {
             s.launch_builder(&ops.gated_activation)
-                .arg(&gate)
-                .arg(&ones)
+                .arg(&gate_ones)
                 .arg(&mut activation)
                 .arg(&count)
+                .arg(&1i32)
                 .arg(&2i32)
                 .launch(flat(gate.len()))?;
             s.launch_builder(&ops.gated_activation)
-                .arg(&gate)
-                .arg(&up)
+                .arg(&gate_up)
                 .arg(&mut product)
                 .arg(&count)
+                .arg(&1i32)
                 .arg(&2i32)
                 .launch(flat(gate.len()))?;
         }
@@ -6675,66 +6716,91 @@ impl Engine {
                 }
             }
             O::GateUp => {
-                for (role, offset) in [
-                    ("mlp.gate_proj.weight", 0),
-                    ("mlp.up_proj.weight", self.workspace_rows * f),
-                ] {
+                if gemma {
                     layer.linear.run(
                         &self.blas,
-                        role,
+                        "mlp.gate_up_proj.weight",
                         phase,
                         matrix(&w.n, s, 0, linear_rows, h)?,
-                        &mut TensorMut(matrix(&w.gu, s, offset, linear_rows, f)?),
+                        &mut TensorMut(matrix(&w.gu, s, 0, linear_rows, 2 * f)?),
                     )?;
+                } else {
+                    for (role, offset) in [
+                        ("mlp.gate_proj.weight", 0),
+                        ("mlp.up_proj.weight", self.workspace_rows * f),
+                    ] {
+                        layer.linear.run(
+                            &self.blas,
+                            role,
+                            phase,
+                            matrix(&w.n, s, 0, linear_rows, h)?,
+                            &mut TensorMut(matrix(&w.gu, s, offset, linear_rows, f)?),
+                        )?;
+                    }
                 }
                 if gemma && (all_layers(trace) || i == self.trace_layer) {
-                    trace_value(trace, s, &debug_name(trace, i, "mlp_gate"), &w.gu, rows, f)?;
-                    let name = debug_name(trace, i, "mlp_up");
+                    let gate_name = debug_name(trace, i, "mlp_gate");
+                    let up_name = debug_name(trace, i, "mlp_up");
                     if let Some(target) = trace.as_mut() {
                         ensure!(target.skip < rows, "trace selection is empty");
-                        let start = self.workspace_rows * f + target.skip * f;
                         let values =
-                            s.clone_dtoh(&w.gu.slice(start..start + (rows - target.skip) * f))?;
+                            s.clone_dtoh(&w.gu.slice(target.skip * 2 * f..rows * 2 * f))?;
+                        let mut gate = Vec::with_capacity((rows - target.skip) * f);
+                        let mut up = Vec::with_capacity((rows - target.skip) * f);
+                        for row in values.chunks_exact(2 * f) {
+                            gate.extend(row[..f].iter().copied().map(bf16::to_f32));
+                            up.extend(row[f..].iter().copied().map(bf16::to_f32));
+                        }
                         target.trace.add(
-                            format!("{}.{name}", target.prefix),
+                            format!("{}.{gate_name}", target.prefix),
                             vec![1, rows - target.skip, f],
-                            values.into_iter().map(|value| value.to_f32()).collect(),
+                            gate,
+                        )?;
+                        target.trace.add(
+                            format!("{}.{up_name}", target.prefix),
+                            vec![1, rows - target.skip, f],
+                            up,
                         )?;
                     }
                 }
             }
             O::Activate => {
-                let gate = heads(&w.gu, s, 0, rows, 1, f as u32)?;
-                let up = heads(&w.gu, s, self.workspace_rows * f, rows, 1, f as u32)?;
-                let mut activated = TensorMut(heads(&w.act, s, 0, rows, 1, f as u32)?);
                 if gemma {
                     let ops = q.gemma.as_ref().context("Gemma 4 operations missing")?;
                     unsafe {
                         s.launch_builder(&ops.gated_activation)
                             .arg(&w.gu)
-                            .arg(&w.gu.slice(self.workspace_rows * f..))
                             .arg(&mut w.act)
-                            .arg(&((rows * f) as i32))
+                            .arg(&(rows as i32))
+                            .arg(&(f as i32))
                             .arg(&2i32)
                             .launch(flat(rows * f))?;
                     }
                 } else {
+                    let gate = heads(&w.gu, s, 0, rows, 1, f as u32)?;
+                    let up = heads(&w.gu, s, self.workspace_rows * f, rows, 1, f as u32)?;
+                    let mut activated = TensorMut(heads(&w.act, s, 0, rows, 1, f as u32)?);
                     q.common.gate.swiglu(s, domain, gate, up, &mut activated)?;
                 }
                 #[cfg(test)]
-                if gemma && (all_layers(trace) || i == self.trace_layer) {
+                if trace.is_some() && gemma && (all_layers(trace) || i == self.trace_layer) {
                     let ops = q.gemma.as_mut().context("Gemma 4 operations missing")?;
                     ensure!(
-                        ops.mlp_ones.len() >= rows * f && ops.mlp_activation.len() >= rows * f,
+                        ops.mlp_activation.len() >= rows * f,
                         "Gemma MLP diagnostic workspace exceeds setup extent"
                     );
+                    let mut gate_ones = s.clone_dtoh(&w.gu.slice(..rows * 2 * f))?;
+                    for row in gate_ones.chunks_exact_mut(2 * f) {
+                        row[f..].fill(bf16::ONE);
+                    }
+                    let gate_ones = s.clone_htod(&gate_ones)?;
                     let activation = &mut ops.mlp_activation;
                     unsafe {
                         s.launch_builder(&ops.gated_activation)
-                            .arg(&w.gu)
-                            .arg(&ops.mlp_ones)
+                            .arg(&gate_ones)
                             .arg(&mut *activation)
-                            .arg(&((rows * f) as i32))
+                            .arg(&(rows as i32))
+                            .arg(&(f as i32))
                             .arg(&2i32)
                             .launch(flat(rows * f))?;
                     }

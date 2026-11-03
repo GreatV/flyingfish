@@ -2499,15 +2499,24 @@ fn oracle_first_layer_rule_a(
         "first-layer raw QKV extent mismatch"
     );
     let input: Vec<f32> = input.iter().map(|value| value.to_f32()).collect();
+    let qv_stride = q_width + kv_width;
+    let q_raw: Vec<f32> = raw[..rows * qv_stride]
+        .chunks_exact(qv_stride)
+        .flat_map(|row| &row[..q_width])
+        .copied()
+        .collect();
+    let v_raw: Vec<f32> = raw[..rows * qv_stride]
+        .chunks_exact(qv_stride)
+        .flat_map(|row| &row[q_width..])
+        .copied()
+        .collect();
+    let k_raw = raw[rows * qv_stride..rows * (qv_stride + kv_width)].to_vec();
     let stores = vec![
         ("embed", input),
         ("input_layernorm", trace.values("layer_rule_a.debug.norm1")?),
-        ("q_proj", raw[..rows * q_width].to_vec()),
-        (
-            "k_proj",
-            raw[rows * q_width..rows * (q_width + kv_width)].to_vec(),
-        ),
-        ("v_proj", raw[rows * (q_width + kv_width)..].to_vec()),
+        ("q_proj", q_raw),
+        ("k_proj", k_raw),
+        ("v_proj", v_raw),
         ("q_rope", trace.values("layer_rule_a.debug.qkv_prepared")?),
         ("k_rope", cache_k),
         ("v_norm", cache_v),
@@ -4509,8 +4518,17 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         "model.language_model.layers.0.self_attn.k_norm.weight",
         "model.language_model.layers.4.self_attn.k_norm.weight",
     ] {
-        let actual = catalog.bf16(full)?;
-        let actual = device.stream.clone_dtoh(actual)?;
+        let actual = match catalog.tensors.get(full) {
+            Some(super::weights::StoredTensor::Bf16(values)) => device.stream.clone_dtoh(values)?,
+            Some(super::weights::StoredTensor::Bf16Pair {
+                buffer,
+                offset,
+                len,
+            }) => device
+                .stream
+                .clone_dtoh(&buffer.slice(*offset..*offset + *len))?,
+            _ => anyhow::bail!("missing/non-BF16 tensor {full}"),
+        };
         let expected = checkpoint_tensor(&dir, full)?;
         ensure!(actual == expected, "published tensor mismatch: {full}");
     }
@@ -4633,22 +4651,34 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         let v_shape = &data["stage.a.v_norm"].0;
         let (hkv, d) = (v_shape[1], v_shape[2]);
         let kv_width = hkv * d;
+        let qv_stride = q_width + kv_width;
+        let q_raw: Vec<f32> = raw[..rows * qv_stride]
+            .chunks_exact(qv_stride)
+            .flat_map(|row| &row[..q_width])
+            .copied()
+            .collect();
+        let v_raw: Vec<f32> = raw[..rows * qv_stride]
+            .chunks_exact(qv_stride)
+            .flat_map(|row| &row[q_width..])
+            .copied()
+            .collect();
+        let k_raw = &raw[rows * qv_stride..rows * (qv_stride + kv_width)];
         let delta: Vec<f32> = native_projected
             .iter()
-            .zip(&raw)
+            .zip(&q_raw)
             .map(|(a, b)| (a.to_f32() - b).abs())
             .collect();
         let maximum = delta.iter().copied().fold(0.0f32, f32::max);
         let rmse = (delta.iter().map(|v| v * v).sum::<f32>() / delta.len() as f32).sqrt();
         println!("GEMMA4_LINEAR_NATIVE_PROBE output_max={maximum} output_rmse={rmse}");
-        for (role, offset) in [
-            ("self_attn.k_proj.weight", rows * q_width),
-            ("self_attn.v_proj.weight", rows * (q_width + kv_width)),
+        for (role, slice) in [
+            ("self_attn.k_proj.weight", k_raw),
+            ("self_attn.v_proj.weight", v_raw.as_slice()),
         ] {
             let projected = engine.gemma_linear_probe(role, &native_input)?;
             let delta: Vec<f32> = projected
                 .iter()
-                .zip(&raw[offset..offset + rows * kv_width])
+                .zip(slice)
                 .map(|(a, b)| (a.to_f32() - b).abs())
                 .collect();
             let maximum = delta.iter().copied().fold(0.0f32, f32::max);
@@ -4683,7 +4713,7 @@ fn model_definition_prefill_decode_wrap_and_graph_gpu() -> Result<()> {
         let mut raw_v = Vec::with_capacity(reference_v.len());
         for row in 0..rows {
             for head in 0..hkv {
-                let base = rows * (q_width + kv_width) + row * kv_width + head * d;
+                let base = row * qv_stride + q_width + head * d;
                 raw_v.extend(raw[base..base + d].iter().map(|v| bf16::from_f32(*v)));
             }
         }
@@ -5005,6 +5035,7 @@ fn gemma4_catalog_uploads_exactly_the_text_set_gpu() -> Result<()> {
                 (0usize, 0usize),
                 |(bf16_bytes, native_bytes), tensor| match tensor {
                     StoredTensor::Bf16(values) => (bf16_bytes + values.len() * 2, native_bytes),
+                    StoredTensor::Bf16Pair { len, .. } => (bf16_bytes + len * 2, native_bytes),
                     StoredTensor::Bytes(values) => (bf16_bytes, native_bytes + values.len()),
                     #[cfg(feature = "cuda")]
                     StoredTensor::Slot { .. } => {

@@ -757,6 +757,9 @@ impl WeightCatalog {
         let (ptr, bytes) = match self.tensors.get(name).context("FP8 scale not uploaded")? {
             #[cfg(feature = "cuda")]
             StoredTensor::Slot { .. } => anyhow::bail!("FP8 scale cannot use a dense BF16 slot"),
+            StoredTensor::Bf16Pair { .. } => {
+                anyhow::bail!("FP8 scale cannot use a paired BF16 projection slice")
+            }
             StoredTensor::Bf16(buffer) => {
                 ensure!(
                     entry.dtype == Dtype::BF16,
@@ -824,6 +827,19 @@ impl WeightCatalog {
                 Ok(LinearWeightRef::Bf16(unsafe {
                     Tensor::new(p, shape, stride, entry.bytes as u64)?
                 }))
+            }
+            super::weights::StoredTensor::Bf16Pair {
+                buffer,
+                offset,
+                len,
+            } => {
+                ensure!(
+                    entry.dtype == safetensors::Dtype::BF16 && *len * 2 == entry.bytes,
+                    "BF16 paired slice extent mismatch: {name}"
+                );
+                Ok(LinearWeightRef::Bf16(super::contracts::view(
+                    buffer, stream, *offset, shape, stride,
+                )?))
             }
             super::weights::StoredTensor::Bytes(w) => {
                 ensure!(
@@ -1221,6 +1237,64 @@ impl LayerLinearPlan {
             #[cfg(feature = "cuda")]
             materialize,
         })
+    }
+    pub(crate) fn fuse_pair(
+        &mut self,
+        plan: &crate::linear_plan::LayerDequantPlan,
+        manifest: &crate::checkpoint::TensorManifest,
+        first: &str,
+        second: &str,
+        fused: &str,
+    ) -> Result<()> {
+        let (shape, span_bytes) = plan.validate_contiguous_pair(manifest, first, second)?;
+        let first_name = format!("{}{first}", plan.prefix);
+        let second_name = format!("{}{second}", plan.prefix);
+        let proj_a = self
+            .projections
+            .remove(first)
+            .with_context(|| format!("layer {} projection not bound: {first_name}", plan.layer))?;
+        let proj_b = self
+            .projections
+            .remove(second)
+            .with_context(|| format!("layer {} projection not bound: {second_name}", plan.layer))?;
+        ensure!(
+            proj_a.invariant_rows == 0 && proj_b.invariant_rows == 0,
+            "layer {} projections {first_name} and {second_name} cannot fuse invariant rows",
+            plan.layer
+        );
+        let (LinearWeightRef::Bf16(ta), LinearWeightRef::Bf16(tb)) =
+            (proj_a.resident, proj_b.resident)
+        else {
+            anyhow::bail!(
+                "layer {} projections {first_name} and {second_name} require BF16 weights",
+                plan.layer
+            );
+        };
+        ensure!(
+            ta.shape[1] == shape[1]
+                && tb.shape[1] == shape[1]
+                && ta.shape[0].checked_add(tb.shape[0]) == Some(shape[0])
+                && ta.stride == [u64::from(shape[1]), 1]
+                && tb.stride == [u64::from(shape[1]), 1]
+                && ta.span_bytes.checked_add(tb.span_bytes) == Some(span_bytes)
+                && ta.ptr.checked_add(ta.span_bytes) == Some(tb.ptr),
+            "layer {} projections {first_name} and {second_name} are not contiguous in device memory",
+            plan.layer
+        );
+        let weight = unsafe { Tensor::new(ta.ptr, shape, [u64::from(shape[1]), 1], span_bytes)? };
+        self.projections.insert(
+            fused.to_owned(),
+            BoundProjection {
+                resident: LinearWeightRef::Bf16(weight),
+                #[cfg(feature = "cuda")]
+                prefill: Some(weight),
+                native: Default::default(),
+                #[cfg(feature = "rocm")]
+                calls: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+                invariant_rows: 0,
+            },
+        );
+        Ok(())
     }
     pub fn prepare_native(&self, ops: &Fp8Ops, stream: &Arc<CudaStream>, rows: u32) -> Result<()> {
         for projection in self.projections.values() {
@@ -3090,6 +3164,136 @@ mod tests {
         }
         println!("BF16_LINEAR_SUMMARY cases={cases} defects={defects}");
         ensure!(defects == 0, "BF16_LINEAR DEFECT cases={defects}");
+        Ok(())
+    }
+
+    #[test]
+    fn fuse_pair_requires_manifest_and_device_contiguity() -> Result<()> {
+        use crate::checkpoint::{TensorEntry, TensorManifest, TensorScope};
+        use crate::linear_plan::LayerDequantPlan;
+        use crate::model_spec::LinearFormat;
+        use safetensors::Dtype;
+        let prefix = "model.language_model.layers.5.";
+        let q_bytes = 4096 * 2560 * 2;
+        let v_bytes = 1024 * 2560 * 2;
+        let manifest = TensorManifest {
+            entries: [
+                (
+                    format!("{prefix}self_attn.q_proj.weight"),
+                    TensorEntry {
+                        dtype: Dtype::BF16,
+                        shape: vec![4096, 2560],
+                        shard: "model.safetensors".into(),
+                        bytes: q_bytes,
+                        load: true,
+                        data_start: 512,
+                        data_offsets: [0, q_bytes as u64],
+                        scope: TensorScope::Text,
+                        layer: Some(5),
+                        role: "self_attn.q_proj.weight".into(),
+                        scale_name: None,
+                    },
+                ),
+                (
+                    format!("{prefix}self_attn.v_proj.weight"),
+                    TensorEntry {
+                        dtype: Dtype::BF16,
+                        shape: vec![1024, 2560],
+                        shard: "model.safetensors".into(),
+                        bytes: v_bytes,
+                        load: true,
+                        data_start: 512,
+                        data_offsets: [q_bytes as u64, (q_bytes + v_bytes) as u64],
+                        scope: TensorScope::Text,
+                        layer: Some(5),
+                        role: "self_attn.v_proj.weight".into(),
+                        scale_name: None,
+                    },
+                ),
+            ]
+            .into(),
+            resident_bytes: q_bytes + v_bytes,
+        };
+        let dequant = LayerDequantPlan::from_manifest(&manifest, 5, LinearFormat::Bf16)?;
+        let make_plan = |v_ptr: u64| -> Result<LayerLinearPlan> {
+            let tq = unsafe { Tensor::new(0x10_0000, [4096, 2560], [2560, 1], q_bytes as u64)? };
+            let tv = unsafe { Tensor::new(v_ptr, [1024, 2560], [2560, 1], v_bytes as u64)? };
+            Ok(LayerLinearPlan {
+                projections: [
+                    (
+                        "self_attn.q_proj.weight".to_owned(),
+                        BoundProjection {
+                            resident: LinearWeightRef::Bf16(tq),
+                            #[cfg(feature = "cuda")]
+                            prefill: Some(tq),
+                            native: Default::default(),
+                            #[cfg(feature = "rocm")]
+                            calls: Default::default(),
+                            invariant_rows: 0,
+                        },
+                    ),
+                    (
+                        "self_attn.v_proj.weight".to_owned(),
+                        BoundProjection {
+                            resident: LinearWeightRef::Bf16(tv),
+                            #[cfg(feature = "cuda")]
+                            prefill: Some(tv),
+                            native: Default::default(),
+                            #[cfg(feature = "rocm")]
+                            calls: Default::default(),
+                            invariant_rows: 0,
+                        },
+                    ),
+                ]
+                .into(),
+                #[cfg(feature = "cuda")]
+                materialize: Vec::new(),
+            })
+        };
+        let mut contiguous = make_plan(0x10_0000 + q_bytes as u64)?;
+        contiguous.fuse_pair(
+            &dequant,
+            &manifest,
+            "self_attn.q_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.qv_proj.weight",
+        )?;
+        assert!(
+            !contiguous
+                .projections
+                .contains_key("self_attn.q_proj.weight")
+        );
+        assert!(
+            !contiguous
+                .projections
+                .contains_key("self_attn.v_proj.weight")
+        );
+        let LinearWeightRef::Bf16(fused) =
+            contiguous.projections["self_attn.qv_proj.weight"].resident
+        else {
+            panic!("expected BF16 fused projection");
+        };
+        assert_eq!(fused.ptr, 0x10_0000);
+        assert_eq!(fused.shape, [5120, 2560]);
+        assert_eq!(fused.span_bytes, (q_bytes + v_bytes) as u64);
+
+        let mut disjoint = make_plan(0x10_0000 + q_bytes as u64 + 4096)?;
+        let err = disjoint
+            .fuse_pair(
+                &dequant,
+                &manifest,
+                "self_attn.q_proj.weight",
+                "self_attn.v_proj.weight",
+                "self_attn.qv_proj.weight",
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("layer 5")
+                && err.contains("model.language_model.layers.5.self_attn.q_proj.weight")
+                && err.contains("model.language_model.layers.5.self_attn.v_proj.weight"),
+            "{err}"
+        );
         Ok(())
     }
 }

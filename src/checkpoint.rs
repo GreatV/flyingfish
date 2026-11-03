@@ -3711,6 +3711,42 @@ mod component_tests {
                 "{label} mutant was accepted"
             );
         }
+        for (index, layout) in spec.layers.iter().enumerate() {
+            let geometry = layout.geometry.context("Gemma 4 layer geometry missing")?;
+            let plan = crate::linear_plan::LayerDequantPlan::from_manifest(
+                &manifest,
+                u32::try_from(index)?,
+                spec.linear_format,
+            )?;
+            plan.validate_contiguous_pair(&manifest, "mlp.gate_proj.weight", "mlp.up_proj.weight")?;
+            ensure!(
+                plan.validate_contiguous_pair(
+                    &manifest,
+                    "self_attn.k_proj.weight",
+                    "self_attn.q_proj.weight",
+                )
+                .is_err(),
+                "disjoint k_proj and q_proj accepted as contiguous on layer {index}"
+            );
+            let shared_projection = geometry.head_dim == 512 && spec.per_layer_input.is_none();
+            if !geometry.kv_reader && !shared_projection {
+                plan.validate_contiguous_pair(
+                    &manifest,
+                    "self_attn.q_proj.weight",
+                    "self_attn.v_proj.weight",
+                )?;
+            } else {
+                ensure!(
+                    plan.validate_contiguous_pair(
+                        &manifest,
+                        "self_attn.q_proj.weight",
+                        "self_attn.v_proj.weight",
+                    )
+                    .is_err(),
+                    "dormant or k_eq_v v_proj accepted on layer {index}"
+                );
+            }
+        }
         Ok(())
     }
 }
