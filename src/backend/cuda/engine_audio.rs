@@ -671,7 +671,8 @@ impl AudioRuntime {
                         &work.subsample[0],
                     )
                 };
-                let out_rows = time.div_ceil(2) * frequency.div_ceil(2);
+                let out_h = time.div_ceil(2);
+                let out_rows = out_h * frequency.div_ceil(2);
                 let width = a.subsample_channels[i];
                 unsafe {
                     s.launch_builder(&self.ops.patch)
@@ -681,6 +682,16 @@ impl AudioRuntime {
                         .arg(&time)
                         .arg(&frequency)
                         .arg(&channels)
+                        .arg(&3u32)
+                        .arg(&3u32)
+                        .arg(&2u32)
+                        .arg(&2u32)
+                        .arg(&1u32)
+                        .arg(&1u32)
+                        .arg(&1u32)
+                        .arg(&1u32)
+                        .arg(&0u32)
+                        .arg(&out_h)
                         .launch(flat(out_rows as usize * channels as usize * 9))?;
                 }
                 self.subsample[i].0.run(

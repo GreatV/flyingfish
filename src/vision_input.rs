@@ -1297,6 +1297,121 @@ impl VisionPositions {
     }
 }
 
+/// DINOv3 2D axial RoPE table `[prefix_tokens + patches_h * patches_w, head_dim]` in BF16 for
+/// `rotary_prefix_kv`: the first `prefix_tokens` rows are identity `(cos=1, sin=0)`, and each patch
+/// row holds `[cos_h(0..head_dim/4), cos_w(0..head_dim/4), sin_h(0..head_dim/4), sin_w(0..head_dim/4)]`.
+pub fn dinov3_rope_table_bf16(
+    prefix_tokens: usize,
+    patches_h: u32,
+    patches_w: u32,
+    head_dim: u32,
+    rope_theta: f32,
+) -> Result<Vec<half::bf16>> {
+    ensure!(
+        patches_h > 0
+            && patches_w > 0
+            && head_dim > 0
+            && head_dim.is_multiple_of(4)
+            && rope_theta.is_finite()
+            && rope_theta > 0.0,
+        "invalid DINOv3 RoPE geometry"
+    );
+    let quarter = (head_dim / 4) as usize;
+    let half = (head_dim / 2) as usize;
+    let dim = head_dim as usize;
+    let patches = usize::try_from(patches_h)?
+        .checked_mul(usize::try_from(patches_w)?)
+        .context("DINOv3 patch count overflow")?;
+    let total_rows = prefix_tokens
+        .checked_add(patches)
+        .context("DINOv3 RoPE row count overflow")?;
+    let mut table = Vec::with_capacity(
+        total_rows
+            .checked_mul(dim)
+            .context("DINOv3 RoPE table size overflow")?,
+    );
+    let one = half::bf16::from_f32(1.0);
+    let zero = half::bf16::from_f32(0.0);
+    for _ in 0..prefix_tokens {
+        table.extend(std::iter::repeat_n(one, half));
+        table.extend(std::iter::repeat_n(zero, half));
+    }
+    let inv_freq: Vec<f32> = (0..quarter)
+        .map(|j| 1.0f32 / rope_theta.powf((4 * j) as f32 / head_dim as f32))
+        .collect();
+    let coords_h: Vec<f32> = (0..patches_h)
+        .map(|i| 2.0f32 * ((i as f32 + 0.5f32) / patches_h as f32) - 1.0f32)
+        .collect();
+    let coords_w: Vec<f32> = (0..patches_w)
+        .map(|i| 2.0f32 * ((i as f32 + 0.5f32) / patches_w as f32) - 1.0f32)
+        .collect();
+    let two_pi = 2.0f32 * std::f32::consts::PI;
+    for &ch in &coords_h {
+        for &cw in &coords_w {
+            for &coord in &[ch, cw] {
+                for &freq in &inv_freq {
+                    let angle = two_pi * coord * freq;
+                    table.push(half::bf16::from_f32(angle.cos()));
+                }
+            }
+            for &coord in &[ch, cw] {
+                for &freq in &inv_freq {
+                    let angle = two_pi * coord * freq;
+                    table.push(half::bf16::from_f32(angle.sin()));
+                }
+            }
+        }
+    }
+    Ok(table)
+}
+
+/// Normalizes an `F32` CHW `[3, height, width]` image by `(x - mean[c]) / std[c]` and packs it into
+/// the `[3, side, rows * side]` layout consumed by `vision_patch_rows`.
+pub fn dinov3_pack_normalized_chw(
+    chw: &[f32],
+    height: usize,
+    width: usize,
+    side: usize,
+    mean: [f32; 3],
+    std: [f32; 3],
+) -> Result<Vec<f32>> {
+    ensure!(
+        height > 0
+            && width > 0
+            && side > 0
+            && height.is_multiple_of(side)
+            && width.is_multiple_of(side)
+            && std.iter().all(|&s| s.is_finite() && s > 0.0)
+            && mean.iter().all(|&m| m.is_finite()),
+        "invalid DINOv3 image packing geometry"
+    );
+    let plane = height.checked_mul(width).context("image plane overflow")?;
+    let total = plane.checked_mul(3).context("image size overflow")?;
+    ensure!(chw.len() == total, "DINOv3 CHW input length mismatch");
+    let patches_h = height / side;
+    let patches_w = width / side;
+    let rows = patches_h * patches_w;
+    let mut packed = vec![0.0f32; total];
+    for c in 0..3 {
+        let m = mean[c];
+        let s = std[c];
+        for ih in 0..patches_h {
+            for iw in 0..patches_w {
+                let patch = ih * patches_w + iw;
+                for ky in 0..side {
+                    let y = ih * side + ky;
+                    let src_row = (c * height + y) * width + iw * side;
+                    let dst_row = ((c * side + ky) * rows + patch) * side;
+                    for kx in 0..side {
+                        packed[dst_row + kx] = (chw[src_row + kx] - m) / s;
+                    }
+                }
+            }
+        }
+    }
+    Ok(packed)
+}
+
 #[cfg(test)]
 mod loopvl_tests {
     use super::*;
@@ -1457,6 +1572,49 @@ mod loopvl_tests {
             }
         }
         println!("PASS loopvl_dynamic_grid grids=19x29,34x60 patch_rows=6x588");
+        Ok(())
+    }
+
+    #[test]
+    fn dinov3_rope_table_matches_model_definition() -> Result<()> {
+        let table = super::dinov3_rope_table_bf16(5, 64, 64, 64, 100.0)?;
+        assert_eq!(table.len(), 4101 * 64);
+        for row in 0..5 {
+            for col in 0..32 {
+                assert_eq!(table[row * 64 + col].to_bits(), 0x3f80);
+            }
+            for col in 32..64 {
+                assert_eq!(table[row * 64 + col].to_bits(), 0x0000);
+            }
+        }
+        let expected_row5_cos: [u16; 8] = [
+            0x3f7f, 0xbd98, 0xbf72, 0xbf5c, 0xbec0, 0x3dd5, 0x3ee8, 0x3f2e,
+        ];
+        let expected_row5_sin: [u16; 8] = [
+            0x3dc9, 0x3f7f, 0x3ea9, 0xbf02, 0xbf6d, 0xbf7f, 0xbf64, 0xbf3c,
+        ];
+        let expected_row4100_sin: [u16; 8] = [
+            0xbdc9, 0xbf7f, 0xbea9, 0x3f02, 0x3f6d, 0x3f7f, 0x3f64, 0x3f3c,
+        ];
+        for i in 0..8 {
+            assert_eq!(table[5 * 64 + i].to_bits(), expected_row5_cos[i]);
+            assert_eq!(table[5 * 64 + 32 + i].to_bits(), expected_row5_sin[i]);
+            assert_eq!(table[4100 * 64 + i].to_bits(), expected_row5_cos[i]);
+            assert_eq!(table[4100 * 64 + 32 + i].to_bits(), expected_row4100_sin[i]);
+        }
+        let fnv1a64 = |items: &[half::bf16]| -> u64 {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            for v in items {
+                for b in v.to_bits().to_le_bytes() {
+                    h ^= u64::from(b);
+                    h = h.wrapping_mul(0x0100_0000_01b3);
+                }
+            }
+            h
+        };
+        assert_eq!(fnv1a64(&table), 0x328d_0244_c944_5525);
+        let wrong_theta = super::dinov3_rope_table_bf16(5, 64, 64, 64, 10000.0)?;
+        assert_ne!(fnv1a64(&wrong_theta), 0x328d_0244_c944_5525);
         Ok(())
     }
 }

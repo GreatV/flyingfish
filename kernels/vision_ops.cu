@@ -2,23 +2,46 @@
 #include <stdint.h>
 #include <math.h>
 
-// [time,frequency,channel] -> [ceil(time/2)*ceil(frequency/2),channel*3*3].
+// NHWC 2D im2col: [height, width, channels] -> [out_y_count * out_w, channels * kh * kw] in (c, ky, kx) order.
+// `mask` may be null; when non-null, rows with mask[in_y] == 0 read zero.
 extern "C" __global__ void masked_strided_patch_bf16(
     const __nv_bfloat16* input, const uint8_t* mask, __nv_bfloat16* output,
-    uint32_t time, uint32_t frequency, uint32_t channels) {
-    if (blockDim.x != 256 || !input || !mask || !output || !time || !frequency || !channels) {
+    uint32_t height, uint32_t width, uint32_t channels,
+    uint32_t kh, uint32_t kw, uint32_t sh, uint32_t sw,
+    uint32_t pad_top, uint32_t pad_bottom, uint32_t pad_left, uint32_t pad_right,
+    uint32_t out_y_start, uint32_t out_y_count) {
+    if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
+        gridDim.y != 1 || gridDim.z != 1 || !input || !output || input == output ||
+        !height || !width || !channels || !kh || !kw || !sh || !sw || !out_y_count) {
         __trap(); return;
     }
-    const uint32_t ot = (time + 1) / 2, of = (frequency + 1) / 2, width = channels * 9;
-    const uint64_t count = uint64_t(ot) * of * width;
+    const uint64_t padded_h = uint64_t(height) + pad_top + pad_bottom;
+    const uint64_t padded_w = uint64_t(width) + pad_left + pad_right;
+    if (padded_h < kh || padded_w < kw) { __trap(); return; }
+    const uint32_t out_h = uint32_t((padded_h - kh) / sh + 1);
+    const uint32_t out_w = uint32_t((padded_w - kw) / sw + 1);
+    if (uint64_t(out_y_start) + out_y_count > out_h) { __trap(); return; }
+    const uint32_t k_area = kh * kw;
+    const uint32_t row_width = channels * k_area;
+    const uint64_t count = uint64_t(out_y_count) * out_w * row_width;
     for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
          i += uint64_t(gridDim.x) * 256) {
-        const uint64_t row = i / width;
-        const uint32_t k = i % width, c = k / 9;
-        const int t = int(row / of * 2 + (k % 9) / 3) - 1;
-        const int f = int(row % of * 2 + k % 3) - 1;
-        output[i] = (t >= 0 && t < int(time) && f >= 0 && f < int(frequency) && mask[t])
-            ? input[(uint64_t(t) * frequency + f) * channels + c] : __float2bfloat16_rn(0.0f);
+        const uint64_t row = i / row_width;
+        const uint32_t k = uint32_t(i % row_width);
+        const uint32_t c = k / k_area;
+        const uint32_t rem = k % k_area;
+        const uint32_t ky = rem / kw;
+        const uint32_t kx = rem % kw;
+        const uint32_t oy = out_y_start + uint32_t(row / out_w);
+        const uint32_t ox = uint32_t(row % out_w);
+        const int in_y = int(oy * sh + ky) - int(pad_top);
+        const int in_x = int(ox * sw + kx) - int(pad_left);
+        const bool valid = in_y >= 0 && in_y < int(height) &&
+                           in_x >= 0 && in_x < int(width) &&
+                           (!mask || mask[in_y]);
+        output[i] = valid
+            ? input[(uint64_t(in_y) * width + uint64_t(in_x)) * channels + c]
+            : __float2bfloat16_rn(0.0f);
     }
 }
 
@@ -618,5 +641,82 @@ extern "C" __global__ void gaussian_posterior_f32(
         mean[i] = m;
         stdev[i] = s;
         latents[i] = __fdiv_rn(__fsub_rn(sample, table[c]), table[channels + c]);
+    }
+}
+
+// F32 CHW [channels, height, width] -> BF16 NHWC [height, width, channels] with
+// y = bf16(bf16(x) * bf16(scale) + bf16(shift)).
+extern "C" __global__ void chw_to_nhwc_scale_shift_bf16(
+    const float* input, __nv_bfloat16* output,
+    uint32_t channels, uint32_t height, uint32_t width,
+    float scale, float shift) {
+    if (!vision_flat_launch() || !input || !output || !channels || !height || !width ||
+        !isfinite(scale) || !isfinite(shift)) { __trap(); return; }
+    const __nv_bfloat16 sc = __float2bfloat16_rn(scale);
+    const __nv_bfloat16 sh = __float2bfloat16_rn(shift);
+    const uint64_t plane = uint64_t(height) * width;
+    const uint64_t count = plane * channels;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint64_t hw = i / channels;
+        const uint32_t c = uint32_t(i % channels);
+        const float v = input[uint64_t(c) * plane + hw];
+        const __nv_bfloat16 x = __float2bfloat16_rn(v);
+        if (!isfinite(v) || !isfinite(__bfloat162float(x))) { __trap(); return; }
+        output[i] = __hadd(__hmul(x, sc), sh);
+    }
+}
+
+// Diagonal-Gaussian sample from NHWC moments [height, width, 2*latent_channels],
+// 2x2 space-to-depth rearrange, non-affine BF16 BatchNorm2d, and upcast to F32
+// token-major [height/2 * width/2, 4*latent_channels]. Optionally writes NCHW moments.
+extern "C" __global__ void diagonal_gaussian_patch_bn_f32(
+    const __nv_bfloat16* moments_nhwc, const __nv_bfloat16* noise_nchw,
+    const __nv_bfloat16* running_mean, const __nv_bfloat16* running_var,
+    __nv_bfloat16* moments_nchw, float* output,
+    uint32_t latent_channels, uint32_t height, uint32_t width, float eps) {
+    if (!vision_flat_launch() || !moments_nhwc || !noise_nchw || !running_mean ||
+        !running_var || !output || !latent_channels || !height || !width ||
+        (height & 1u) || (width & 1u) || !(eps > 0.0f)) { __trap(); return; }
+    const uint32_t out_h = height >> 1;
+    const uint32_t out_w = width >> 1;
+    const uint32_t bn_channels = latent_channels << 2;
+    const uint32_t moment_channels = latent_channels << 1;
+    const uint64_t tokens = uint64_t(out_h) * out_w;
+    const uint64_t count = tokens * bn_channels;
+    const __nv_bfloat16 half_bf16 = __float2bfloat16_rn(0.5f);
+    const __nv_bfloat16 eps_bf16 = __float2bfloat16_rn(eps);
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint64_t token = i / bn_channels;
+        const uint32_t c_bn = uint32_t(i % bn_channels);
+        const uint32_t c = c_bn >> 2;
+        const uint32_t ph = (c_bn >> 1) & 1u;
+        const uint32_t pw = c_bn & 1u;
+        const uint32_t h_out = uint32_t(token / out_w);
+        const uint32_t w_out = uint32_t(token % out_w);
+        const uint32_t h_in = (h_out << 1) + ph;
+        const uint32_t w_in = (w_out << 1) + pw;
+        const uint64_t hw_in = uint64_t(h_in) * width + w_in;
+        const uint64_t nhwc_base = hw_in * moment_channels;
+        const __nv_bfloat16 mean = moments_nhwc[nhwc_base + c];
+        const __nv_bfloat16 logvar = moments_nhwc[nhwc_base + latent_channels + c];
+        if (moments_nchw) {
+            const uint64_t plane = uint64_t(height) * width;
+            moments_nchw[uint64_t(c) * plane + hw_in] = mean;
+            moments_nchw[uint64_t(latent_channels + c) * plane + hw_in] = logvar;
+        }
+        const float lv_f = fminf(fmaxf(__bfloat162float(logvar), -30.0f), 20.0f);
+        const __nv_bfloat16 lv_clamped = __float2bfloat16_rn(lv_f);
+        const __nv_bfloat16 half_lv = __hmul(half_bf16, lv_clamped);
+        const __nv_bfloat16 std_val = __float2bfloat16_rn(expf(__bfloat162float(half_lv)));
+        const __nv_bfloat16 u = noise_nchw[uint64_t(c) * uint64_t(height) * width + hw_in];
+        const __nv_bfloat16 z = __hadd(mean, __hmul(std_val, u));
+        const __nv_bfloat16 var_eps = __hadd(running_var[c_bn], eps_bf16);
+        const __nv_bfloat16 bn_std = __float2bfloat16_rn(sqrtf(__bfloat162float(var_eps)));
+        const __nv_bfloat16 z_centered = __hsub(z, running_mean[c_bn]);
+        const __nv_bfloat16 z_norm = __float2bfloat16_rn(
+            __fdiv_rn(__bfloat162float(z_centered), __bfloat162float(bn_std)));
+        output[i] = __bfloat162float(z_norm);
     }
 }
