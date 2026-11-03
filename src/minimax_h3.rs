@@ -28,8 +28,11 @@ const ROPE_SPATIAL_SCALE: f64 = 32.0;
 /// Grids of at most 15 points follow the scalar element form of CPU `torch.linspace` (vector chunks start at 16 f32 lanes).
 const MAX_GRID_POINTS: usize = 15;
 /// Released spatial tile geometry of the video VAE, pixels: tile side and minimum overlap between neighbours.
-const VAE_TILE: usize = 256;
+pub const VAE_TILE: usize = 256;
 const VAE_TILE_MIN_OVERLAP: usize = 64;
+/// Video VAE pixel normalisation, ImageNet's (model definition `MiniMaxH3ModularPipeline.pixel_mean` / `pixel_std`).
+pub const VAE_PIXEL_MEAN: [f64; 3] = [0.485, 0.456, 0.406];
+pub const VAE_PIXEL_STD: [f64; 3] = [0.229, 0.224, 0.225];
 const VAE_KEYS: [&str; 24] = [
     "_class_name",
     "_diffusers_version",
@@ -218,6 +221,11 @@ pub struct VaeSpec {
     pub norm_eps: f32,
     pub clip_length: usize,
     pub token_drop: usize,
+    /// Encoder GroupNorm groups and epsilon (`norm_num_groups`, `norm_eps`).
+    pub groups: usize,
+    pub encoder_eps: f32,
+    pub latents_mean: Vec<f32>,
+    pub latents_std: Vec<f32>,
 }
 
 impl VaeSpec {
@@ -248,6 +256,19 @@ impl VaeSpec {
                 .map(|v| v as usize)
                 .collect())
         };
+        let floats = |key| -> Result<Vec<f32>> {
+            root.get(key)
+                .and_then(Value::as_array)
+                .with_context(|| format!("missing/invalid {key}"))?
+                .iter()
+                .map(|v| {
+                    v.as_f64()
+                        .filter(|v| v.is_finite())
+                        .map(|v| v as f32)
+                        .with_context(|| format!("{key} contains a non-finite or non-number value"))
+                })
+                .collect()
+        };
         let (spatial_factors, temporal_factors) = (
             list("spatial_downsample_factors")?,
             list("temporal_downsample_factors")?,
@@ -275,6 +296,10 @@ impl VaeSpec {
             norm_eps: f("decoder_norm_eps")? as f32,
             clip_length: n("clip_length")?,
             token_drop: n("token_drop")?,
+            groups: n("norm_num_groups")?,
+            encoder_eps: f("norm_eps")? as f32,
+            latents_mean: floats("latents_mean")?,
+            latents_std: floats("latents_std")?,
         };
         let blocks = spec.block_out_channels.len();
         ensure!(
@@ -286,18 +311,21 @@ impl VaeSpec {
                 && rope.fract() == 0.0
                 && spec.rope_dims.is_multiple_of(6)
                 && spec.rope_dims <= head_dim
-                && spec.token_drop < VAE_CLIP_LATENTS,
+                && spec.token_drop < VAE_CLIP_LATENTS
+                && spec
+                    .block_out_channels
+                    .iter()
+                    .all(|c| c.is_multiple_of(spec.groups))
+                && spec
+                    .spatial_factors
+                    .iter()
+                    .zip(&spec.temporal_factors)
+                    .all(|(&s, &t)| s == 2 || (s == 1 && t == 1))
+                && spec.latents_mean.len() == spec.latent_channels
+                && spec.latents_std.len() == spec.latent_channels
+                && spec.latents_std.iter().all(|v| *v > 0.0),
             "unsupported MiniMax-H3 video VAE geometry: {spec:?}"
         );
-        for key in ["latents_mean", "latents_std"] {
-            ensure!(
-                root.get(key)
-                    .and_then(Value::as_array)
-                    .is_some_and(|v| v.len() == spec.latent_channels),
-                "{key} does not have {} channels",
-                spec.latent_channels
-            );
-        }
         Ok(spec)
     }
 

@@ -1,9 +1,10 @@
-//! MiniMax-H3 video VAE decoder: the non-causal ViT decoder over spatial tiles and temporal chunks of a latent video.
+//! MiniMax-H3 video VAE: the non-causal ViT decoder over spatial tiles and temporal chunks of a latent video, and the
+//! causal CNN keyframe encoder over spatial tiles of one frame.
 use super::{BlockKernels, NormRows, Source, matrix, pointer, rows_view, vector};
 use crate::backend::cuda::{
     Device,
     blas::Blas,
-    contracts::TensorMut,
+    contracts::{TensorMut, view},
     cubin,
     flash::{Flash, Score},
     linear::LinearBiasMode,
@@ -12,8 +13,8 @@ use crate::backend::cuda::{
 };
 use crate::backend::gpu::{CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use crate::checkpoint::TensorManifest;
-use crate::minimax_h3::{DecodePlan, VaeSpec, VaeTiles};
-use anyhow::{Result, ensure};
+use crate::minimax_h3::{DecodePlan, VAE_PIXEL_MEAN, VAE_PIXEL_STD, VAE_TILE, VaeSpec, VaeTiles};
+use anyhow::{Context, Result, ensure};
 use half::bf16;
 use std::{path::Path, sync::Arc};
 
@@ -797,4 +798,601 @@ pub(crate) fn rope_table(
         }
     }
     table
+}
+
+/// A causal 3D convolution `[out, input, k, k, k]` with bias, published F32, applied to one frame.
+struct Conv {
+    weight: CudaSlice<f32>,
+    bias: CudaSlice<f32>,
+    out: usize,
+    input: usize,
+    kernel: usize,
+}
+
+/// Uploads one published F32 tensor of the F32 set by name and element count.
+type LoadF32<'a> = dyn FnMut(&str, usize) -> Result<CudaSlice<f32>> + 'a;
+
+impl Conv {
+    fn load(
+        load: &mut LoadF32<'_>,
+        base: &str,
+        (out, input, kernel): (usize, usize, usize),
+    ) -> Result<Self> {
+        Ok(Self {
+            weight: load(&format!("{base}.weight"), out * input * kernel.pow(3))?,
+            bias: load(&format!("{base}.bias"), out)?,
+            out,
+            input,
+            kernel,
+        })
+    }
+
+    /// GEMM reduction width: `input x k^3` im2col columns (the input rows themselves for `k = 1`).
+    fn columns(&self) -> usize {
+        self.input * self.kernel.pow(3)
+    }
+
+    /// Output extent of `size` input pixels: `size` at stride 1 (pad `k / 2` each side); at stride 2 the input carries
+    /// one reflected row/column after it and no pad before, `(size + 1 - k) / 2 + 1`.
+    fn extent(&self, size: usize, stride: usize) -> usize {
+        if stride == 1 {
+            size
+        } else {
+            (size + 1 - self.kernel) / stride + 1
+        }
+    }
+}
+
+struct GroupNorm {
+    weight: CudaSlice<f32>,
+    bias: CudaSlice<f32>,
+}
+
+impl GroupNorm {
+    fn load(load: &mut LoadF32<'_>, base: &str, channels: usize) -> Result<Self> {
+        Ok(Self {
+            weight: load(&format!("{base}.weight"), channels)?,
+            bias: load(&format!("{base}.bias"), channels)?,
+        })
+    }
+}
+
+struct Resnet {
+    norm1: GroupNorm,
+    conv1: Conv,
+    norm2: GroupNorm,
+    conv2: Conv,
+    shortcut: Option<Conv>,
+}
+
+/// One encoder level: its resnets, then the stride-2 downsampling convolution when the level downsamples.
+struct EncoderLevel {
+    resnets: Vec<Resnet>,
+    down: Option<Conv>,
+}
+
+struct EncoderKernels {
+    im2col: CudaFunction,
+    group_norm: CudaFunction,
+    bias_residual: CudaFunction,
+    pixels: CudaFunction,
+    stitch: CudaFunction,
+    posterior: CudaFunction,
+}
+
+/// The video VAE encoder side (encoder and quant_conv), F32 and resident, for single keyframes.
+pub(crate) struct KeyframeEncoder {
+    spec: VaeSpec,
+    conv_in: Conv,
+    levels: Vec<EncoderLevel>,
+    norm_out: GroupNorm,
+    conv_out: Conv,
+    quant: Conv,
+    /// `[pixel mean | pixel std]` and `[latents_mean | latents_std]`, F32.
+    pixel_table: CudaSlice<f32>,
+    latent_table: CudaSlice<f32>,
+    kernels: EncoderKernels,
+}
+
+/// Device `[mean, std, latents]` of one encoded keyframe, each `[latent_channels, height, width]` F32.
+pub(crate) type KeyframeLatents = [CudaSlice<f32>; 3];
+
+impl KeyframeEncoder {
+    pub(crate) fn new(
+        d: &Device,
+        spec: &VaeSpec,
+        vae_dir: &Path,
+        manifest: &TensorManifest,
+    ) -> Result<Self> {
+        let s = &d.stream;
+        let (free, total) = d.ctx.mem_get_info()?;
+        ensure!(
+            spec.in_channels == VAE_PIXEL_MEAN.len(),
+            "{} input channels, pixel normalisation has {}",
+            spec.in_channels,
+            VAE_PIXEL_MEAN.len()
+        );
+        let vision = cubin::module(s.context(), "vision_ops")?;
+        let kernels = EncoderKernels {
+            im2col: vision.load_function("causal_frame_im2col_f32")?,
+            group_norm: vision.load_function("group_norm_silu_f32")?,
+            bias_residual: vision.load_function("bias_residual_f32")?,
+            pixels: vision.load_function("normalize_u8_window_f32")?,
+            stitch: vision.load_function("tile_stitch_f32")?,
+            posterior: vision.load_function("gaussian_posterior_f32")?,
+        };
+        let mut source = Source::new(vae_dir, manifest);
+        let mut bytes = 0usize;
+        let load: &mut LoadF32<'_> = &mut |name: &str, elements: usize| {
+            ensure!(!bf16_parameter(name), "{name} is in the BF16 set");
+            bytes += 4 * elements;
+            source.tensor::<f32>(s, name, elements)
+        };
+        let first = spec.block_out_channels[0];
+        let conv_in = Conv::load(load, "encoder.conv_in", (first, spec.in_channels, 3))?;
+        let mut levels = Vec::with_capacity(spec.block_out_channels.len());
+        let mut input = first;
+        for (i, &out) in spec.block_out_channels.iter().enumerate() {
+            let mut resnets = Vec::with_capacity(spec.layers_per_block);
+            for j in 0..spec.layers_per_block {
+                let base = format!("encoder.down_blocks.{i}.resnets.{j}");
+                let channels = if j == 0 { input } else { out };
+                resnets.push(Resnet {
+                    norm1: GroupNorm::load(load, &format!("{base}.norm1"), channels)?,
+                    conv1: Conv::load(load, &format!("{base}.conv1"), (out, channels, 3))?,
+                    norm2: GroupNorm::load(load, &format!("{base}.norm2"), out)?,
+                    conv2: Conv::load(load, &format!("{base}.conv2"), (out, out, 3))?,
+                    shortcut: if channels == out {
+                        None
+                    } else {
+                        Some(Conv::load(
+                            load,
+                            &format!("{base}.conv_shortcut"),
+                            (out, channels, 1),
+                        )?)
+                    },
+                });
+            }
+            let down = if spec.spatial_factors[i] * spec.temporal_factors[i] > 1 {
+                let base = format!("encoder.down_blocks.{i}.downsamplers.0.conv");
+                Some(Conv::load(load, &base, (out, out, 3))?)
+            } else {
+                None
+            };
+            levels.push(EncoderLevel { resnets, down });
+            input = out;
+        }
+        let latent2 = 2 * spec.latent_channels;
+        let norm_out = GroupNorm::load(load, "encoder.norm_out", input)?;
+        let conv_out = Conv::load(load, "encoder.conv_out", (latent2, input, 3))?;
+        let quant = Conv::load(load, "quant_conv", (latent2, latent2, 1))?;
+        let table =
+            |a: &[f64], b: &[f64]| -> Vec<f32> { a.iter().chain(b).map(|&v| v as f32).collect() };
+        let pixel_table = s.clone_htod(&table(&VAE_PIXEL_MEAN, &VAE_PIXEL_STD))?;
+        let latent_table = s.clone_htod(
+            &spec
+                .latents_mean
+                .iter()
+                .chain(&spec.latents_std)
+                .copied()
+                .collect::<Vec<f32>>(),
+        )?;
+        s.synchronize()?;
+        eprintln!(
+            "{}",
+            serde_json::json!({"h3_vae_encoder_placement": {"mode": "resident", "weight_bytes": bytes,
+                "free_before_bytes": free, "free_after_bytes": d.ctx.mem_get_info()?.0, "total_bytes": total}})
+        );
+        Ok(Self {
+            spec: spec.clone(),
+            conv_in,
+            levels,
+            norm_out,
+            conv_out,
+            quant,
+            pixel_table,
+            latent_table,
+            kernels,
+        })
+    }
+
+    /// Every convolution with its stride, in execution order, with the input extent it sees for a `height x width`
+    /// tile.
+    fn convolutions(&self, (height, width): (usize, usize)) -> Vec<(&Conv, usize, usize, usize)> {
+        let (mut h, mut w) = (height, width);
+        let mut out = vec![(&self.conv_in, 1, h, w)];
+        for level in &self.levels {
+            for r in &level.resnets {
+                out.push((&r.conv1, 1, h, w));
+                out.push((&r.conv2, 1, h, w));
+            }
+            if let Some(down) = &level.down {
+                out.push((down, 2, h, w));
+                (h, w) = (down.extent(h, 2), down.extent(w, 2));
+            }
+        }
+        out.push((&self.conv_out, 1, h, w));
+        out
+    }
+
+    fn group_norm(
+        &self,
+        s: &Arc<CudaStream>,
+        norm: &GroupNorm,
+        x: &CudaSlice<f32>,
+        y: &CudaSlice<f32>,
+        (pixels, channels): (usize, usize),
+    ) -> Result<()> {
+        let groups = u32::try_from(self.spec.groups)?;
+        unsafe {
+            s.launch_builder(&self.kernels.group_norm)
+                .arg(&pointer(x, s))
+                .arg(&pointer(&norm.weight, s))
+                .arg(&pointer(&norm.bias, s))
+                .arg(&pointer(y, s))
+                .arg(&(pixels as u64))
+                .arg(&u32::try_from(channels)?)
+                .arg(&groups)
+                .arg(&self.spec.encoder_eps)
+                .launch(LaunchConfig {
+                    grid_dim: (groups, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        Ok(())
+    }
+
+    fn bias_residual(
+        &self,
+        s: &Arc<CudaStream>,
+        (y, offset, count): (&CudaSlice<f32>, usize, usize),
+        bias: &CudaSlice<f32>,
+        residual: Option<&CudaSlice<f32>>,
+        (channels, inner): (usize, usize),
+    ) -> Result<()> {
+        let target = pointer(y, s) + (offset * std::mem::size_of::<f32>()) as u64;
+        let residual = residual.map_or(0, |r| pointer(r, s));
+        unsafe {
+            s.launch_builder(&self.kernels.bias_residual)
+                .arg(&target)
+                .arg(&pointer(bias, s))
+                .arg(&residual)
+                .arg(&(count as u64))
+                .arg(&u32::try_from(channels)?)
+                .arg(&(inner as u64))
+                .launch(flat(count))?;
+        }
+        Ok(())
+    }
+
+    /// `y [out_h * out_w, out] = conv(x [h * w, input]) + bias (+ residual)`: im2col row chunks that fit `columns`,
+    /// each one F32 GEMM against the published `[out, input * k^3]` weight. Returns the output extent.
+    fn conv(
+        &self,
+        (s, blas, columns): (&Arc<CudaStream>, &Blas, &CudaSlice<f32>),
+        c: &Conv,
+        (x, height, width, stride): (&CudaSlice<f32>, usize, usize, usize),
+        y: &CudaSlice<f32>,
+        residual: Option<&CudaSlice<f32>>,
+    ) -> Result<(usize, usize)> {
+        let (out_h, out_w) = (c.extent(height, stride), c.extent(width, stride));
+        let pixels = out_h * out_w;
+        let k = c.columns();
+        ensure!(
+            pixels * c.out <= y.len() && height * width * c.input <= x.len(),
+            "convolution {height}x{width}x{} -> {out_h}x{out_w}x{} exceeds its buffers",
+            c.input,
+            c.out
+        );
+        let weight = view(
+            &c.weight,
+            s,
+            0,
+            [u32::try_from(c.out)?, u32::try_from(k)?],
+            [k as u64, 1],
+        )?;
+        if c.kernel == 1 {
+            ensure!(stride == 1, "strided 1x1x1 convolution");
+            blas.linear_f32(
+                weight,
+                view(
+                    x,
+                    s,
+                    0,
+                    [u32::try_from(pixels)?, u32::try_from(k)?],
+                    [k as u64, 1],
+                )?,
+                &mut TensorMut(view(
+                    y,
+                    s,
+                    0,
+                    [u32::try_from(pixels)?, u32::try_from(c.out)?],
+                    [c.out as u64, 1],
+                )?),
+            )?;
+        } else {
+            let chunk = (columns.len() / k) / 4 * 4;
+            ensure!(chunk > 0, "im2col workspace holds no row of {k} columns");
+            let pad = if stride == 1 { c.kernel / 2 } else { 0 };
+            for first in (0..pixels).step_by(chunk) {
+                let rows = chunk.min(pixels - first);
+                unsafe {
+                    s.launch_builder(&self.kernels.im2col)
+                        .arg(&pointer(x, s))
+                        .arg(&pointer(columns, s))
+                        .arg(&u32::try_from(c.input)?)
+                        .arg(&u32::try_from(height)?)
+                        .arg(&u32::try_from(width)?)
+                        .arg(&u32::try_from(out_w)?)
+                        .arg(&u32::try_from(c.kernel)?)
+                        .arg(&u32::try_from(c.kernel)?)
+                        .arg(&u32::try_from(stride)?)
+                        .arg(&u32::try_from(pad)?)
+                        .arg(&(first as u64))
+                        .arg(&u32::try_from(rows)?)
+                        .launch(flat(rows * k))?;
+                }
+                blas.linear_f32(
+                    weight,
+                    view(
+                        columns,
+                        s,
+                        0,
+                        [u32::try_from(rows)?, u32::try_from(k)?],
+                        [k as u64, 1],
+                    )?,
+                    &mut TensorMut(view(
+                        y,
+                        s,
+                        first * c.out,
+                        [u32::try_from(rows)?, u32::try_from(c.out)?],
+                        [c.out as u64, 1],
+                    )?),
+                )?;
+            }
+        }
+        self.bias_residual(s, (y, 0, pixels * c.out), &c.bias, residual, (c.out, 1))?;
+        Ok((out_h, out_w))
+    }
+
+    /// Encodes the tile at pixel `origin` of `frame` (`[in_channels, height, width]` u8) into moments slot `slot` of
+    /// `moments` (`[slots, 2 * latent_channels, tile_h / r, tile_w / r]`, channel-major).
+    fn tile(
+        &self,
+        (s, blas): (&Arc<CudaStream>, &Blas),
+        w: &mut EncodeWork,
+        (frame, height, width): (&CudaSlice<u8>, usize, usize),
+        origin: (usize, usize),
+        (moments, slot): (&CudaSlice<f32>, usize),
+    ) -> Result<()> {
+        let channels = self.spec.in_channels;
+        let (mut h, mut wd) = (w.height, w.width);
+        unsafe {
+            s.launch_builder(&self.kernels.pixels)
+                .arg(&pointer(frame, s))
+                .arg(&pointer(&self.pixel_table, s))
+                .arg(&pointer(&w.x, s))
+                .arg(&u32::try_from(channels)?)
+                .arg(&u32::try_from(height)?)
+                .arg(&u32::try_from(width)?)
+                .arg(&u32::try_from(origin.0)?)
+                .arg(&u32::try_from(origin.1)?)
+                .arg(&u32::try_from(h)?)
+                .arg(&u32::try_from(wd)?)
+                .launch(flat(h * wd * channels))?;
+        }
+        let ctx = (s, blas, &w.columns);
+        self.conv(ctx, &self.conv_in, (&w.x, h, wd, 1), &w.y, None)?;
+        std::mem::swap(&mut w.x, &mut w.y);
+        for level in &self.levels {
+            for r in &level.resnets {
+                let px = h * wd;
+                self.group_norm(s, &r.norm1, &w.x, &w.normed, (px, r.conv1.input))?;
+                let ctx = (s, blas, &w.columns);
+                self.conv(ctx, &r.conv1, (&w.normed, h, wd, 1), &w.hidden, None)?;
+                self.group_norm(s, &r.norm2, &w.hidden, &w.normed, (px, r.conv1.out))?;
+                let residual = match &r.shortcut {
+                    Some(shortcut) => {
+                        self.conv(ctx, shortcut, (&w.x, h, wd, 1), &w.shortcut, None)?;
+                        &w.shortcut
+                    }
+                    None => &w.x,
+                };
+                self.conv(ctx, &r.conv2, (&w.normed, h, wd, 1), &w.y, Some(residual))?;
+                std::mem::swap(&mut w.x, &mut w.y);
+            }
+            if let Some(down) = &level.down {
+                let ctx = (s, blas, &w.columns);
+                (h, wd) = self.conv(ctx, down, (&w.x, h, wd, 2), &w.y, None)?;
+                std::mem::swap(&mut w.x, &mut w.y);
+            }
+        }
+        let px = h * wd;
+        self.group_norm(
+            s,
+            &self.norm_out,
+            &w.x,
+            &w.normed,
+            (px, self.conv_out.input),
+        )?;
+        let ctx = (s, blas, &w.columns);
+        self.conv(ctx, &self.conv_out, (&w.normed, h, wd, 1), &w.y, None)?;
+        let q = &self.quant;
+        let size = q.out * px;
+        ensure!(
+            (slot + 1) * size <= moments.len(),
+            "moments slot {slot} out of range"
+        );
+        blas.linear_f32(
+            view(
+                &w.y,
+                s,
+                0,
+                [u32::try_from(px)?, u32::try_from(q.input)?],
+                [q.input as u64, 1],
+            )?,
+            view(
+                &q.weight,
+                s,
+                0,
+                [u32::try_from(q.out)?, u32::try_from(q.input)?],
+                [q.input as u64, 1],
+            )?,
+            &mut TensorMut(view(
+                moments,
+                s,
+                slot * size,
+                [u32::try_from(q.out)?, u32::try_from(px)?],
+                [px as u64, 1],
+            )?),
+        )?;
+        self.bias_residual(s, (moments, slot * size, size), &q.bias, None, (q.out, px))
+    }
+
+    /// Encodes one u8 frame `[in_channels, height, width]` through `tiles`: posterior moments of every tile, stitched
+    /// in latent space, then mean, std and normalised latents of the sample `mean + std * eps` rounded to F16, with
+    /// `eps` `[latent_channels, height / r, width / r]` F32.
+    pub(crate) fn encode(
+        &self,
+        (s, blas): (&Arc<CudaStream>, &Blas),
+        w: &mut EncodeWork,
+        tiles: &VaeTiles,
+        (frame, height, width): (&CudaSlice<u8>, usize, usize),
+        eps: &CudaSlice<f32>,
+    ) -> Result<KeyframeLatents> {
+        let spec = &self.spec;
+        let r = spec.spatial_ratio;
+        ensure!(
+            w.height == tiles.height
+                && w.width == tiles.width
+                && height.is_multiple_of(r)
+                && width.is_multiple_of(r)
+                && frame.len() == spec.in_channels * height * width,
+            "encode work {}x{} / frame {height}x{width} do not match the tile grid {}x{}",
+            w.height,
+            w.width,
+            tiles.height,
+            tiles.width
+        );
+        let (lh, lw) = (height / r, width / r);
+        let plane = lh * lw;
+        let latent = spec.latent_channels;
+        ensure!(
+            eps.len() == latent * plane,
+            "posterior noise holds {} values, not {}",
+            eps.len(),
+            latent * plane
+        );
+        let (rows, cols) = (&tiles.rows, &tiles.cols);
+        let grid: Vec<u32> = rows
+            .0
+            .iter()
+            .chain(&rows.1)
+            .chain(&cols.0)
+            .chain(&cols.1)
+            .map(|&v| u32::try_from(v / r))
+            .collect::<Result<_, _>>()?;
+        let grid = s.clone_htod(&grid)?;
+        let (th, tw) = (tiles.height / r, tiles.width / r);
+        let moments = s.alloc_zeros::<f32>(tiles.count() * 2 * latent * th * tw)?;
+        for (ti, &row) in rows.0.iter().enumerate() {
+            for (tj, &col) in cols.0.iter().enumerate() {
+                self.tile(
+                    (s, blas),
+                    w,
+                    (frame, height, width),
+                    (row, col),
+                    (&moments, ti * cols.0.len() + tj),
+                )?;
+            }
+        }
+        let canvas = s.alloc_zeros::<f32>(2 * latent * plane)?;
+        unsafe {
+            s.launch_builder(&self.kernels.stitch)
+                .arg(&pointer(&moments, s))
+                .arg(&pointer(&canvas, s))
+                .arg(&pointer(&grid, s))
+                .arg(&(rows.0.len() as u32))
+                .arg(&(cols.0.len() as u32))
+                .arg(&u32::try_from(2 * latent)?)
+                .arg(&u32::try_from(th)?)
+                .arg(&u32::try_from(tw)?)
+                .arg(&u32::try_from(lh)?)
+                .arg(&u32::try_from(lw)?)
+                .launch(flat(2 * latent * plane))?;
+        }
+        let out = [
+            s.alloc_zeros::<f32>(latent * plane)?,
+            s.alloc_zeros::<f32>(latent * plane)?,
+            s.alloc_zeros::<f32>(latent * plane)?,
+        ];
+        unsafe {
+            s.launch_builder(&self.kernels.posterior)
+                .arg(&pointer(&canvas, s))
+                .arg(&pointer(eps, s))
+                .arg(&pointer(&self.latent_table, s))
+                .arg(&pointer(&out[0], s))
+                .arg(&pointer(&out[1], s))
+                .arg(&pointer(&out[2], s))
+                .arg(&u32::try_from(latent)?)
+                .arg(&(plane as u64))
+                .launch(flat(latent * plane))?;
+        }
+        Ok(out)
+    }
+}
+
+/// Activations of one encoder tile forward over `height x width` pixels, pixel-major `[pixels, channels]` F32, and
+/// the im2col workspace: the largest convolution of a released `VAE_TILE` tile in one chunk, larger frames in row
+/// chunks.
+pub(crate) struct EncodeWork {
+    height: usize,
+    width: usize,
+    x: CudaSlice<f32>,
+    y: CudaSlice<f32>,
+    normed: CudaSlice<f32>,
+    hidden: CudaSlice<f32>,
+    shortcut: CudaSlice<f32>,
+    columns: CudaSlice<f32>,
+}
+
+impl EncodeWork {
+    pub(crate) fn new(
+        s: &Arc<CudaStream>,
+        encoder: &KeyframeEncoder,
+        (height, width): (usize, usize),
+    ) -> Result<Self> {
+        let activations = encoder
+            .convolutions((height, width))
+            .iter()
+            .map(|(c, stride, h, w)| {
+                (h * w * c.input).max(c.extent(*h, *stride) * c.extent(*w, *stride) * c.out)
+            })
+            .max()
+            .context("encoder without convolutions")?;
+        let columns = |(h, w): (usize, usize)| {
+            encoder
+                .convolutions((h, w))
+                .iter()
+                .filter(|(c, ..)| c.kernel > 1)
+                .map(|(c, stride, h, w)| {
+                    c.extent(*h, *stride) * c.extent(*w, *stride) * c.columns()
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        let workspace = columns((height, width)).min(columns((VAE_TILE, VAE_TILE)));
+        let buffer = || s.alloc_zeros::<f32>(activations);
+        Ok(Self {
+            height,
+            width,
+            x: buffer()?,
+            y: buffer()?,
+            normed: buffer()?,
+            hidden: buffer()?,
+            shortcut: buffer()?,
+            columns: s.alloc_zeros::<f32>(workspace)?,
+        })
+    }
 }

@@ -2501,7 +2501,8 @@ impl MappedCheckpoint {
     }
 
     /// MiniMax-H3 video VAE (published F32): every tensor's name and shape from `vae/config.json`. The decoder side
-    /// (post_quant_conv and the ViT decoder) loads; the encoder and quant_conv are Dormant.
+    /// (post_quant_conv and the ViT decoder) is Text scope, the keyframe encoder side (encoder and quant_conv) Vision
+    /// scope; both load.
     pub fn minimax_h3_vae_manifest(
         &self,
         vae: &crate::minimax_h3::VaeSpec,
@@ -2548,7 +2549,7 @@ impl MappedCheckpoint {
                 entry(format!("{block}.{name}"), shape, decoder);
             }
         }
-        let encoder = TensorScope::Dormant;
+        let encoder = TensorScope::Vision;
         let conv = |out: usize, input: usize, k: usize| vec![out, input, k, k, k];
         let first = *vae
             .block_out_channels
@@ -2608,11 +2609,11 @@ impl MappedCheckpoint {
             encoder,
         );
         entry("quant_conv.bias".into(), vec![2 * latent], encoder);
-        let planned = planned_bytes(&expected, LoadPolicy::TextOnly)?;
+        let planned = planned_bytes(&expected, LoadPolicy::TextWithVision)?;
         self.assemble_manifest(
             "MiniMax-H3 video VAE",
             expected,
-            LoadPolicy::TextOnly,
+            LoadPolicy::TextWithVision,
             planned,
             None,
         )

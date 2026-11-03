@@ -4119,4 +4119,120 @@ mod tests {
         println!("H3_VAE_DECODE_GATE PASS cells=2 control=FAIL_AS_REQUIRED");
         Ok(())
     }
+
+    /// N7b gate: the native keyframe encoder on the Stage 0 captured k0 pixels and posterior noise of cells A and P
+    /// against the captured CUDA FP32 posterior mean, std and normalised latents, under the frozen thresholds-n7n8.json
+    /// bounds; encoder tiling off must fail the latents bound.
+    #[test]
+    #[ignore = "requires FF_MODEL, FF_H3_S0, FF_H3_N7_THRESHOLDS and the GPU"]
+    fn keyframe_encoder_matches_the_fp32_capture() -> Result<()> {
+        use super::vae::{EncodeWork, KeyframeEncoder};
+        let var = |key: &str| -> Result<PathBuf> {
+            Ok(PathBuf::from(
+                std::env::var_os(key).with_context(|| format!("{key} missing"))?,
+            ))
+        };
+        let (model, s0) = (var("FF_MODEL")?, var("FF_H3_S0")?);
+        let frozen: serde_json::Value =
+            serde_json::from_slice(&fs::read(var("FF_H3_N7_THRESHOLDS")?)?)?;
+        let spec = crate::minimax_h3::VaeSpec::read(&model)?;
+        let vae_dir = model.join("vae");
+        let checkpoint = MappedCheckpoint::open_component(&vae_dir, "diffusion_pytorch_model")?;
+        let manifest = checkpoint.minimax_h3_vae_manifest(&spec)?;
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        let ops = Ops::new(&device.ctx)?;
+        let runtime = std::env::temp_dir().join(format!("ff-h3-vae-enc-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(
+                true,
+                "MiniMax-H3 keyframe encoder gate".into(),
+            )),
+        )?;
+        let encoder = KeyframeEncoder::new(&device, &spec, &vae_dir, &manifest)?;
+        let f32s = |bytes: &[u8]| -> Vec<f32> {
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_le_bytes(*v))
+                .collect()
+        };
+        let keys = ["posterior_mean", "posterior_std", "latents"];
+        let mut defects = Vec::new();
+        let mut tiling_off = None;
+        for cell in ["A", "P"] {
+            let map = mapped(
+                &s0.join(format!("{cell}-bf16"))
+                    .join("keyframes.safetensors"),
+            )?;
+            let file = SafeTensors::deserialize(&map)?;
+            let pixels = file.tensor("k0.pixels")?;
+            let shape = pixels.shape().to_vec();
+            ensure!(
+                pixels.dtype() == Dtype::U8
+                    && shape.len() == 5
+                    && shape[..3] == [1, spec.in_channels, 1],
+                "keyframe pixels {:?} {shape:?}",
+                pixels.dtype()
+            );
+            let (height, width) = (shape[3], shape[4]);
+            let eps = file.tensor("k0.posterior_eps")?;
+            ensure!(
+                eps.dtype() == Dtype::F32,
+                "posterior noise dtype {:?}",
+                eps.dtype()
+            );
+            let frame = s.clone_htod(pixels.data())?;
+            let eps = s.clone_htod(&f32s(eps.data()))?;
+            let encode = |tiles: &crate::minimax_h3::VaeTiles| -> Result<Vec<Vec<f32>>> {
+                let mut work = EncodeWork::new(s, &encoder, (tiles.height, tiles.width))?;
+                let out =
+                    encoder.encode((s, &blas), &mut work, tiles, (&frame, height, width), &eps)?;
+                s.synchronize()?;
+                out.iter().map(|b| Ok(s.clone_dtoh(b)?)).collect()
+            };
+            let tiles = crate::minimax_h3::VaeTiles::released(&spec, height, width)?;
+            let native = encode(&tiles)?;
+            let as64 = |v: &[f32]| v.iter().map(|&x| f64::from(x)).collect::<Vec<_>>();
+            for (key, candidate) in keys.iter().zip(&native) {
+                let reference = file.tensor(&format!("k0.{key}"))?;
+                ensure!(
+                    reference.dtype() == Dtype::F32
+                        && reference.data().len() == 4 * candidate.len(),
+                    "reference k0.{key} {:?} {:?}",
+                    reference.dtype(),
+                    reference.shape()
+                );
+                let d = distance(&as64(candidate), &as64(&f32s(reference.data())));
+                let name = format!("{cell}.keyframe.k0.{key}");
+                let ok = within(d, &frozen["cells"][&name])?;
+                println!("H3_VAE_KEYFRAME cell={cell} {key}={d:?} within={ok}");
+                if !ok {
+                    defects.push(name);
+                }
+            }
+            if cell == "A" {
+                let untiled = encode(&crate::minimax_h3::VaeTiles::whole(height, width))?;
+                let reference = f32s(file.tensor("k0.latents")?.data());
+                let d = distance(&as64(&untiled[2]), &as64(&reference));
+                let failed = !within(d, &frozen["cells"]["A.keyframe.k0.latents"])?;
+                println!("H3_VAE_KEYFRAME tiling-off control cell=A latents={d:?} fails={failed}");
+                tiling_off = Some(failed);
+            }
+        }
+        ensure!(
+            tiling_off == Some(true),
+            "encoder tiling-off control passed the A latents bound"
+        );
+        if !defects.is_empty() {
+            bail!("H3_VAE_KEYFRAME_GATE DEFECT cells outside the frozen thresholds: {defects:?}");
+        }
+        println!("H3_VAE_KEYFRAME_GATE PASS cells=2 control=FAIL_AS_REQUIRED");
+        Ok(())
+    }
 }
