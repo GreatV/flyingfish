@@ -192,6 +192,16 @@ fn g0_checkpoint_index_and_header_rejections() {
         &[0, 0],
     );
     assert!(MappedCheckpoint::open(&dir).is_ok());
+    let component = dir.join("depth");
+    std::fs::create_dir(&component).unwrap();
+    std::fs::copy(&path, component.join("diffusion_pytorch_model.safetensors")).unwrap();
+    assert!(MappedCheckpoint::open_component(&component, "diffusion_pytorch_model").is_ok());
+    std::fs::write(
+        dir.join("outside.safetensors.index.json"),
+        r#"{"weight_map":{"a":"diffusion_pytorch_model.safetensors"}}"#,
+    )
+    .unwrap();
+    assert!(MappedCheckpoint::open_component(&component, "../outside").is_err());
     let index = dir.join("model.safetensors.index.json");
     std::fs::write(
         &index,

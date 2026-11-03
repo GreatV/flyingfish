@@ -158,7 +158,7 @@ impl ArCheckpoint {
         depth.validate()?;
         let language_weights = MappedCheckpoint::open(&language_dir)?;
         let depth_weights =
-            MappedCheckpoint::open_named(&depth_dir, "diffusion_pytorch_model.safetensors")?;
+            MappedCheckpoint::open_component(&depth_dir, "diffusion_pytorch_model")?;
         let language_manifest = language_weights.manifest(&language, LoadPolicy::TextOnly)?;
         let depth_manifest = depth.manifest(&depth_weights)?;
         Ok(Self {

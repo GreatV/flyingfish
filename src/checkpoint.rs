@@ -74,6 +74,14 @@ impl MappedCheckpoint {
     }
     /// Opens `{stem}.safetensors.index.json` with its shards, or the single `{stem}.safetensors`.
     pub fn open_component(dir: &Path, stem: &str) -> Result<Self> {
+        ensure!(
+            Path::new(stem).components().count() == 1
+                && matches!(
+                    Path::new(stem).components().next(),
+                    Some(Component::Normal(_))
+                ),
+            "checkpoint stem must be a single path component"
+        );
         let indexed = dir.join(format!("{stem}.safetensors.index.json"));
         let index = if indexed.is_file() {
             serde_json::from_slice::<Index>(&std::fs::read(indexed)?)?
