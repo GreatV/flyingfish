@@ -27,6 +27,38 @@ const ROPE_FRAMES_PER_LATENT: [f64; 5] = [1.0, 4.0, 4.0, 4.0, 4.0];
 const ROPE_SPATIAL_SCALE: f64 = 32.0;
 /// Grids of at most 15 points follow the scalar element form of CPU `torch.linspace` (vector chunks start at 16 f32 lanes).
 const MAX_GRID_POINTS: usize = 15;
+/// Released spatial tile geometry of the video VAE, pixels: tile side and minimum overlap between neighbours.
+pub const VAE_TILE: usize = 256;
+const VAE_TILE_MIN_OVERLAP: usize = 64;
+/// Video VAE pixel normalisation, ImageNet's (model definition `MiniMaxH3ModularPipeline.pixel_mean` / `pixel_std`).
+pub const VAE_PIXEL_MEAN: [f64; 3] = [0.485, 0.456, 0.406];
+pub const VAE_PIXEL_STD: [f64; 3] = [0.229, 0.224, 0.225];
+const VAE_KEYS: [&str; 24] = [
+    "_class_name",
+    "_diffusers_version",
+    "in_channels",
+    "out_channels",
+    "latent_channels",
+    "block_out_channels",
+    "layers_per_block",
+    "spatial_downsample_factors",
+    "temporal_downsample_factors",
+    "norm_num_groups",
+    "norm_eps",
+    "spatial_padding_mode",
+    "decoder_num_layers",
+    "decoder_num_attention_heads",
+    "decoder_attention_head_dim",
+    "decoder_num_register_tokens",
+    "decoder_ffn_mult",
+    "decoder_rope_theta",
+    "decoder_rope_dim_ratio",
+    "decoder_norm_eps",
+    "clip_length",
+    "token_drop",
+    "latents_mean",
+    "latents_std",
+];
 const TRANSFORMER_KEYS: [&str; 20] = [
     "_class_name",
     "_diffusers_version",
@@ -84,7 +116,7 @@ impl H3Spec {
             )
             .with_context(|| format!("parse {}", path.display()))
         };
-        Self::check_vae(&read("vae")?)?;
+        VaeSpec::parse(&read("vae")?)?;
         Self::parse(&read("transformer")?)
     }
 
@@ -138,25 +170,6 @@ impl H3Spec {
         Ok(spec)
     }
 
-    fn check_vae(root: &Value) -> Result<()> {
-        equal(root, "_class_name", "AutoencoderKLMiniMaxH3".into())?;
-        let spatial: u32 = u32_list(root, "spatial_downsample_factors")?
-            .iter()
-            .product();
-        let temporal: u32 = u32_list(root, "temporal_downsample_factors")?
-            .iter()
-            .product();
-        let clip = positive(root, "clip_length")? as usize;
-        ensure!(
-            spatial as usize == VAE_SPATIAL_RATIO
-                && clip == VAE_CLIP_FRAMES
-                && temporal > 0
-                && clip.div_ceil(temporal as usize) == VAE_CLIP_LATENTS,
-            "unsupported MiniMax-H3 video VAE geometry: spatial={spatial} temporal={temporal} clip={clip}"
-        );
-        Ok(())
-    }
-
     /// Channels of one patchified video row.
     pub fn video_row_width(&self) -> usize {
         self.in_channels * self.patch.iter().product::<usize>()
@@ -181,6 +194,283 @@ impl H3Spec {
                 .map(|(name, out, input)| (format!("{block}.{name}"), out, input))
             })
             .collect()
+    }
+}
+
+/// MiniMax-H3 video VAE configuration (`vae/config.json`): the causal 3D CNN encoder and the non-causal ViT decoder.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VaeSpec {
+    pub in_channels: usize,
+    pub out_channels: usize,
+    pub latent_channels: usize,
+    pub block_out_channels: Vec<usize>,
+    pub layers_per_block: usize,
+    pub spatial_factors: Vec<usize>,
+    pub temporal_factors: Vec<usize>,
+    pub spatial_ratio: usize,
+    pub temporal_ratio: usize,
+    pub dim: usize,
+    pub layers: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub registers: usize,
+    pub ffn: usize,
+    pub rope_theta: f32,
+    /// Rotated channels of every head: `head_dim * decoder_rope_dim_ratio`, three axes of equal width.
+    pub rope_dims: usize,
+    pub norm_eps: f32,
+    pub clip_length: usize,
+    pub token_drop: usize,
+    /// Encoder GroupNorm groups and epsilon (`norm_num_groups`, `norm_eps`).
+    pub groups: usize,
+    pub encoder_eps: f32,
+    pub latents_mean: Vec<f32>,
+    pub latents_std: Vec<f32>,
+}
+
+impl VaeSpec {
+    pub fn read(model_dir: &Path) -> Result<Self> {
+        let path = model_dir.join("vae").join("config.json");
+        Self::parse(
+            &serde_json::from_slice(
+                &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+            )
+            .with_context(|| format!("parse {}", path.display()))?,
+        )
+    }
+
+    pub fn parse(root: &Value) -> Result<Self> {
+        exact_keys(root, &VAE_KEYS, "MiniMax-H3 video VAE config")?;
+        equal(root, "_class_name", "AutoencoderKLMiniMaxH3".into())?;
+        equal(root, "spatial_padding_mode", "reflect".into())?;
+        let n = |key| positive(root, key).map(|v| v as usize);
+        let f = |key: &str| {
+            root.get(key)
+                .and_then(Value::as_f64)
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .with_context(|| format!("missing/invalid {key}"))
+        };
+        let list = |key| -> Result<Vec<usize>> {
+            Ok(u32_list(root, key)?
+                .into_iter()
+                .map(|v| v as usize)
+                .collect())
+        };
+        let floats = |key| -> Result<Vec<f32>> {
+            root.get(key)
+                .and_then(Value::as_array)
+                .with_context(|| format!("missing/invalid {key}"))?
+                .iter()
+                .map(|v| {
+                    v.as_f64()
+                        .filter(|v| v.is_finite())
+                        .map(|v| v as f32)
+                        .with_context(|| format!("{key} contains a non-finite or non-number value"))
+                })
+                .collect()
+        };
+        let (spatial_factors, temporal_factors) = (
+            list("spatial_downsample_factors")?,
+            list("temporal_downsample_factors")?,
+        );
+        let head_dim = n("decoder_attention_head_dim")?;
+        let rope = head_dim as f64 * f("decoder_rope_dim_ratio")?;
+        let spec = Self {
+            in_channels: n("in_channels")?,
+            out_channels: n("out_channels")?,
+            latent_channels: n("latent_channels")?,
+            block_out_channels: list("block_out_channels")?,
+            layers_per_block: n("layers_per_block")?,
+            spatial_ratio: spatial_factors.iter().product(),
+            temporal_ratio: temporal_factors.iter().product(),
+            spatial_factors,
+            temporal_factors,
+            dim: n("decoder_num_attention_heads")? * head_dim,
+            layers: n("decoder_num_layers")?,
+            heads: n("decoder_num_attention_heads")?,
+            head_dim,
+            registers: n("decoder_num_register_tokens")?,
+            ffn: n("decoder_ffn_mult")? * n("decoder_num_attention_heads")? * head_dim,
+            rope_theta: f("decoder_rope_theta")? as f32,
+            rope_dims: rope as usize,
+            norm_eps: f("decoder_norm_eps")? as f32,
+            clip_length: n("clip_length")?,
+            token_drop: n("token_drop")?,
+            groups: n("norm_num_groups")?,
+            encoder_eps: f("norm_eps")? as f32,
+            latents_mean: floats("latents_mean")?,
+            latents_std: floats("latents_std")?,
+        };
+        let blocks = spec.block_out_channels.len();
+        ensure!(
+            spec.spatial_factors.len() == blocks
+                && spec.temporal_factors.len() == blocks
+                && spec.spatial_ratio == VAE_SPATIAL_RATIO
+                && spec.clip_length == VAE_CLIP_FRAMES
+                && spec.clip_length.div_ceil(spec.temporal_ratio) == VAE_CLIP_LATENTS
+                && rope.fract() == 0.0
+                && spec.rope_dims.is_multiple_of(6)
+                && spec.rope_dims <= head_dim
+                && spec.token_drop < VAE_CLIP_LATENTS
+                && spec
+                    .block_out_channels
+                    .iter()
+                    .all(|c| c.is_multiple_of(spec.groups))
+                && spec
+                    .spatial_factors
+                    .iter()
+                    .zip(&spec.temporal_factors)
+                    .all(|(&s, &t)| s == 2 || (s == 1 && t == 1))
+                && spec.latents_mean.len() == spec.latent_channels
+                && spec.latents_std.len() == spec.latent_channels
+                && spec.latents_std.iter().all(|v| *v > 0.0),
+            "unsupported MiniMax-H3 video VAE geometry: {spec:?}"
+        );
+        Ok(spec)
+    }
+
+    /// Channels of one decoder output token: `out_channels x temporal_ratio x spatial_ratio^2` pixels.
+    pub fn patch_width(&self) -> usize {
+        self.out_channels * self.temporal_ratio * self.spatial_ratio * self.spatial_ratio
+    }
+
+    /// Latent frames per decoded chunk (`ceil(clip_length / temporal_ratio)`).
+    pub fn chunk_latents(&self) -> usize {
+        self.clip_length.div_ceil(self.temporal_ratio)
+    }
+
+    /// Latent frames a chunk shares with the next one: `(-token_drop) mod chunk_latents`.
+    pub fn overlap_latents(&self) -> usize {
+        (self.chunk_latents() - self.token_drop % self.chunk_latents()) % self.chunk_latents()
+    }
+
+    /// Leading pixel frames of every decoded chunk that `clip_length` leaves implicit: `(-clip_length) mod temporal_ratio`.
+    pub fn frame_pre_padding(&self) -> usize {
+        (self.temporal_ratio - self.clip_length % self.temporal_ratio) % self.temporal_ratio
+    }
+
+    /// Pixel frames that consecutive chunks cross-fade over.
+    pub fn frame_overlap(&self) -> usize {
+        (self.overlap_latents() * self.temporal_ratio).saturating_sub(self.frame_pre_padding())
+    }
+}
+
+/// Spatial tiles over `length` pixels: the fewest `tile`-wide tiles whose overlaps are all at least `min_overlap`, the
+/// remaining slack spread round-robin over the overlaps in `ratio` steps. Returns the tile side, starts and overlaps; a
+/// length of at most one tile is one tile of that length.
+pub fn vae_tiles(
+    length: usize,
+    tile: usize,
+    min_overlap: usize,
+    ratio: usize,
+) -> Result<(usize, Vec<usize>, Vec<usize>)> {
+    ensure!(
+        length > 0 && min_overlap < tile && ratio > 0 && length.is_multiple_of(ratio),
+        "invalid VAE tiling of {length} px by {tile} px tiles"
+    );
+    if tile >= length {
+        return Ok((length, vec![0], Vec::new()));
+    }
+    let mut count = length.div_ceil(tile);
+    while tile * count < min_overlap * (count - 1) + length {
+        count += 1;
+    }
+    let mut overlaps = vec![min_overlap; count - 1];
+    let slack = tile * count - min_overlap * (count - 1) - length;
+    for i in 0..slack / ratio {
+        overlaps[i % (count - 1)] += ratio;
+    }
+    let mut starts = vec![0];
+    for overlap in &overlaps {
+        starts.push(starts[starts.len() - 1] + tile - overlap);
+    }
+    Ok((tile, starts, overlaps))
+}
+
+/// Spatial tile grid of a pixel frame: tile height and width, and per axis the tile starts and neighbour overlaps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaeTiles {
+    pub height: usize,
+    pub width: usize,
+    pub rows: (Vec<usize>, Vec<usize>),
+    pub cols: (Vec<usize>, Vec<usize>),
+}
+
+impl VaeTiles {
+    /// The released tiling (`VAE_TILE` px tiles, at least `VAE_TILE_MIN_OVERLAP` px overlap).
+    pub fn released(spec: &VaeSpec, height: usize, width: usize) -> Result<Self> {
+        let (tile_height, row_starts, row_overlaps) =
+            vae_tiles(height, VAE_TILE, VAE_TILE_MIN_OVERLAP, spec.spatial_ratio)?;
+        let (tile_width, col_starts, col_overlaps) =
+            vae_tiles(width, VAE_TILE, VAE_TILE_MIN_OVERLAP, spec.spatial_ratio)?;
+        Ok(Self {
+            height: tile_height,
+            width: tile_width,
+            rows: (row_starts, row_overlaps),
+            cols: (col_starts, col_overlaps),
+        })
+    }
+
+    /// One tile over the whole frame (tiling off).
+    pub fn whole(height: usize, width: usize) -> Self {
+        Self {
+            height,
+            width,
+            rows: (vec![0], Vec::new()),
+            cols: (vec![0], Vec::new()),
+        }
+    }
+
+    pub fn count(&self) -> usize {
+        self.rows.0.len() * self.cols.0.len()
+    }
+}
+
+/// Temporal decode plan of `latent_frames` latent frames: the latent tail repeated `pad` times, `chunks` decoded
+/// chunks of `chunk_latents() + overlap_latents()` latent frames starting every `chunk_latents()`, and the output
+/// frame count after the pad frames are cut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodePlan {
+    pub latent_frames: usize,
+    pub pad: usize,
+    pub chunks: usize,
+    pub frames: usize,
+}
+
+impl DecodePlan {
+    pub fn new(spec: &VaeSpec, latent_frames: usize) -> Result<Self> {
+        let chunk = spec.chunk_latents();
+        ensure!(latent_frames > 0, "empty latent video");
+        let tokens = latent_frames + spec.token_drop;
+        let pad = (chunk - tokens % chunk) % chunk;
+        let chunks = (tokens + pad) / chunk - usize::from(spec.token_drop > 0);
+        ensure!(
+            chunks > 0,
+            "{latent_frames} latent frames give no decode chunk"
+        );
+        let kept = chunk * spec.temporal_ratio - spec.frame_pre_padding();
+        let tail = (chunk + spec.overlap_latents()) * spec.temporal_ratio
+            - chunk * spec.temporal_ratio
+            - spec.frame_pre_padding();
+        let intra_tail = spec.clip_length % spec.temporal_ratio;
+        let pad_frames: usize = (0..pad)
+            .map(|k| {
+                if intra_tail != 0 && (latent_frames + k).is_multiple_of(chunk) {
+                    intra_tail
+                } else {
+                    spec.temporal_ratio
+                }
+            })
+            .sum();
+        let frames = (chunks * kept + if spec.token_drop > 0 { tail } else { 0 })
+            .checked_sub(pad_frames)
+            .context("pad frames exceed the decoded frames")?;
+        Ok(Self {
+            latent_frames,
+            pad,
+            chunks,
+            frames,
+        })
     }
 }
 

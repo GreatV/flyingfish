@@ -596,6 +596,34 @@ extern "C" __global__ void q38_layer_norm(
         y[uint64_t(d)*ys2]=__float2bfloat16_rn(affine);
     }
 }
+// Stateless LayerNorm with F32 io: same math as q38_layer_norm.
+extern "C" __global__ void q38_layer_norm_f32(
+    const float* x,const float* weight,const float* bias,float* y,
+    uint32_t rows,uint32_t heads,uint32_t width,
+    uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,float eps) {
+    if(blockDim.x!=256 || blockDim.y!=1 || blockDim.z!=1 || gridDim.y!=1 || gridDim.z!=1 ||
+       !rows || !heads || !width || uint64_t(gridDim.x)!=uint64_t(rows)*heads ||
+       !x || !weight || !bias || !y || !(eps>0)) {__trap();return;}
+    uint32_t row=blockIdx.x/heads,head=blockIdx.x%heads;
+    x+=uint64_t(row)*xs0+uint64_t(head)*xs1;
+    y+=uint64_t(row)*ys0+uint64_t(head)*ys1;
+    __shared__ float tmp[8];
+    float sum=0;
+    for(uint32_t d=threadIdx.x;d<width;d+=256) sum=__fadd_rn(sum,x[uint64_t(d)*xs2]);
+    float mean=block_sum(sum,tmp)/float(width);
+    __syncthreads();
+    float variance=0;
+    for(uint32_t d=threadIdx.x;d<width;d+=256) {
+        float delta=__fsub_rn(x[uint64_t(d)*xs2],mean);
+        variance=__fadd_rn(variance,__fmul_rn(delta,delta));
+    }
+    float inv=__fdiv_rn(1.0f,__fsqrt_rn(__fadd_rn(block_sum(variance,tmp)/float(width),eps)));
+    for(uint32_t d=threadIdx.x;d<width;d+=256) {
+        float centered=__fsub_rn(x[uint64_t(d)*xs2],mean);
+        float affine=__fadd_rn(__fmul_rn(__fmul_rn(centered,inv),weight[d]),bias[d]);
+        y[uint64_t(d)*ys2]=affine;
+    }
+}
 __device__ __forceinline__ float gelu_tanh_rn(float value) {
     float cubic=__fmul_rn(__fmul_rn(value,value),value);
     float inner=__fmul_rn(0.7978845608028653559f,__fadd_rn(value,__fmul_rn(0.044715f,cubic)));
