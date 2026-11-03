@@ -76,7 +76,7 @@ impl RowWorkSpec {
                 (0, 0, false, 0)
             }
             Architecture::LoopVl => (2 * q + 2 * kv, q, false, 0),
-            Architecture::Llama => (
+            Architecture::Llama | Architecture::Qwen3 => (
                 q.checked_add(kv.checked_mul(2).context("KV width overflow")?)
                     .context("projection width overflow")?,
                 q,

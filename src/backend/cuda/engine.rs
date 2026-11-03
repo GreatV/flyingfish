@@ -645,6 +645,7 @@ enum LoadDispatch {
 fn load_dispatch(architecture: crate::model_spec::Architecture) -> Result<LoadDispatch> {
     use crate::model_spec::Architecture;
     Ok(match architecture {
+        Architecture::Qwen3 => anyhow::bail!("Qwen3 AR execution is not bound"),
         Architecture::Clover => LoadDispatch::Canvas,
         Architecture::Qwen35Text => LoadDispatch::Qwen,
         Architecture::Llama => LoadDispatch::Llama,

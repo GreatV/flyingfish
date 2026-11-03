@@ -364,6 +364,7 @@ impl MultimodalInput<'_> {
                 self.validate_loopvl(spec.vocab, spec.max_position as usize, capacity)
             }
             Architecture::Llama
+            | Architecture::Qwen3
             | Architecture::Flint
             | Architecture::Glm5Next
             | Architecture::Clover

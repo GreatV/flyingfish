@@ -308,6 +308,7 @@ impl MappedCheckpoint {
             return self.assemble_manifest("DeepSeek41", expected, policy, planned, Some("scale"));
         }
         let label = match spec.architecture {
+            Architecture::Qwen3 => "Qwen3",
             Architecture::Qwen35Text => "Q38",
             Architecture::MiniCpmV47 => "MiniCPM",
             Architecture::Flint => "Flint",
@@ -356,7 +357,7 @@ impl MappedCheckpoint {
                 }
             }
             Architecture::MiniCpmV47 => Self::minicpm_vision_entries(spec, &mut expected)?,
-            Architecture::Flint | Architecture::Clover => {}
+            Architecture::Flint | Architecture::Clover | Architecture::Qwen3 => {}
             Architecture::Llama
             | Architecture::Glm5Next
             | Architecture::LoopVl
@@ -983,7 +984,7 @@ impl MappedCheckpoint {
         let fp8 = spec.linear_format.fp8_layout();
         let dense_fp8 = fp8.filter(|layout| layout.block_scale().is_some());
         let global_prefix = match spec.architecture {
-            Architecture::Flint | Architecture::Clover => "model",
+            Architecture::Flint | Architecture::Clover | Architecture::Qwen3 => "model",
             Architecture::Qwen35Text | Architecture::MiniCpmV47 | Architecture::Llama => {
                 "model.language_model"
             }
@@ -1151,7 +1152,7 @@ impl MappedCheckpoint {
             match layer.mixer {
                 Mixer::FullAttention => {
                     let q_out = match spec.architecture {
-                        Architecture::Flint => q_width,
+                        Architecture::Flint | Architecture::Qwen3 => q_width,
                         Architecture::Qwen35Text
                         | Architecture::Clover
                         | Architecture::MiniCpmV47
@@ -2228,7 +2229,7 @@ impl MappedCheckpoint {
         Ok(())
     }
 
-    fn assemble_manifest(
+    pub(crate) fn assemble_manifest(
         &self,
         label: &str,
         mut expected: BTreeMap<String, ExpectedTensor>,
@@ -2857,6 +2858,56 @@ impl MappedCheckpoint {
 #[cfg(test)]
 mod component_tests {
     use super::*;
+
+    #[test]
+    fn music3_qwen3_manifest_geometry() -> Result<()> {
+        let root = serde_json::from_str(include_str!("../tests/data/music3-qwen3-config.json"))?;
+        let spec = crate::model_spec::ModelSpec::qwen3(&root)?;
+        let mut expected = BTreeMap::new();
+        MappedCheckpoint::text_entries(&spec, &mut expected)?;
+        ensure!(
+            expected.len() == 399
+                && planned_bytes(&expected, LoadPolicy::TextOnly)? == 17_168_951_296,
+            "Qwen3 manifest census"
+        );
+        ensure!(
+            expected["model.layers.0.self_attn.q_proj.weight"].1 == [4096, 4096]
+                && expected["model.layers.0.self_attn.k_norm.weight"].1 == [128],
+            "Qwen3 ungated Q/QK norm layout"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "CPU-only published checkpoint; set FF_MODEL to Music3"]
+    fn music3_qwen3_manifest_rejects_missing_norm() -> Result<()> {
+        let dir =
+            std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?)
+                .join("language_model");
+        let spec = crate::model_spec::ModelSpec::read(&dir)?;
+        let mapped = MappedCheckpoint::open(&dir)?;
+        mapped.manifest(&spec, LoadPolicy::TextOnly)?;
+        let mut expected = BTreeMap::new();
+        MappedCheckpoint::text_entries(&spec, &mut expected)?;
+        expected
+            .remove("model.layers.0.self_attn.q_norm.weight")
+            .context("missing Q norm")?;
+        let bytes = planned_bytes(&expected, LoadPolicy::TextOnly)?;
+        ensure!(
+            mapped
+                .assemble_manifest(
+                    "Qwen3 norm control",
+                    expected,
+                    LoadPolicy::TextOnly,
+                    bytes,
+                    None
+                )
+                .is_err(),
+            "Qwen3 missing Q norm was accepted"
+        );
+        println!("PASS music3_qwen3_manifest missing_norm_control=rejected");
+        Ok(())
+    }
 
     fn binding_literals<'a>(source: &'a str, begin: &str, end: &str) -> Result<Vec<&'a str>> {
         let body = source

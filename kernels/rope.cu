@@ -1,6 +1,6 @@
 #include "gpu_compat.cuh"
 
-extern "C" __global__ void rotary_prefix_kv(__nv_bfloat16* q,
+__device__ __forceinline__ void rotary_prefix(__nv_bfloat16* q,
     const __nv_bfloat16* key, const __nv_bfloat16* value,
     __nv_bfloat16* k, __nv_bfloat16* v, const __nv_bfloat16* table,
     int start, int rows, int q_heads, int kv_heads, int dim, int rotary,
@@ -39,6 +39,22 @@ extern "C" __global__ void rotary_prefix_kv(__nv_bfloat16* q,
     __nv_bfloat16* output = query ? q + src : k + dst;
     output[d] = lo;
     output[d + half] = hi;
+}
+
+extern "C" __global__ void rotary_prefix_kv(__nv_bfloat16* q,
+    const __nv_bfloat16* key, const __nv_bfloat16* value,
+    __nv_bfloat16* k, __nv_bfloat16* v, const __nv_bfloat16* table,
+    int start, int rows, int q_heads, int kv_heads, int dim, int rotary,
+    int capacity) {
+    rotary_prefix(q, key, value, k, v, table, start, rows, q_heads, kv_heads, dim, rotary, capacity);
+}
+
+extern "C" __global__ void rotary_prefix_kv_device(__nv_bfloat16* q,
+    const __nv_bfloat16* key, const __nv_bfloat16* value,
+    __nv_bfloat16* k, __nv_bfloat16* v, const __nv_bfloat16* table,
+    const int* start, int rows, int q_heads, int kv_heads, int dim, int rotary,
+    int capacity) {
+    rotary_prefix(q, key, value, k, v, table, *start, rows, q_heads, kv_heads, dim, rotary, capacity);
 }
 
 extern "C" __global__ void rope_table_kv(__nv_bfloat16* qkvg,

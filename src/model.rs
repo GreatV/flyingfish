@@ -516,6 +516,7 @@ pub fn layer_program(
             bail!("DiffusionGemma layer program is not bound yet")
         }
         crate::model_spec::Architecture::Llama
+        | crate::model_spec::Architecture::Qwen3
         | crate::model_spec::Architecture::Qwen35Text
         | crate::model_spec::Architecture::MiniCpmV47
         | crate::model_spec::Architecture::Flint

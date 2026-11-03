@@ -8,6 +8,145 @@
 // advance: thread 0 increments the device position scalar.
 #include "gpu_compat.cuh"
 #include <stdint.h>
+#include <type_traits>
+
+__device__ __forceinline__ float policy_sum(float value, float* shared) {
+    for (int delta = 16; delta; delta >>= 1) {
+        const float other = __shfl_down_sync(FF_WARP_MASK, value, delta);
+        value += other;
+    }
+    if ((threadIdx.x & 31) == 0) shared[threadIdx.x >> 5] = value;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        value = threadIdx.x < 8 ? shared[threadIdx.x] : 0.0f;
+        for (int delta = 16; delta; delta >>= 1) {
+            const float other = __shfl_down_sync(FF_WARP_MASK, value, delta);
+            value += other;
+        }
+        if (threadIdx.x == 0) shared[0] = value;
+    }
+    __syncthreads();
+    value = shared[0];
+    __syncthreads();
+    return value;
+}
+
+template<bool ACCURATE, bool BF16_COPY>
+__device__ __forceinline__ void softmax_row_f32(const float* row, float* probs,
+    __nv_bfloat16* probs_bf16, long long vocab) {
+    using Sum = std::conditional_t<ACCURATE, double, float>;
+    float m = -INFINITY;
+    for (long long c = threadIdx.x; c < vocab; c += blockDim.x)
+        m = fmaxf(m, row[c]);
+    __shared__ float s_m[32];
+    __shared__ Sum s_s[32];
+    for (int off = 16; off > 0; off >>= 1)
+        m = fmaxf(m, __shfl_xor_sync(FF_WARP_MASK, m, off));
+    if ((threadIdx.x & 31) == 0) s_m[threadIdx.x >> 5] = m;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float t = threadIdx.x < (blockDim.x >> 5) ? s_m[threadIdx.x] : -INFINITY;
+        for (int off = 16; off > 0; off >>= 1)
+            t = fmaxf(t, __shfl_xor_sync(FF_WARP_MASK, t, off));
+        if (threadIdx.x == 0) s_m[0] = t;
+    }
+    __syncthreads();
+    m = s_m[0];
+    Sum s = 0;
+    for (long long c = threadIdx.x; c < vocab; c += blockDim.x) {
+        if constexpr (ACCURATE) {
+            if (row[c] != -INFINITY) s += exp(double(row[c]) - double(m));
+        } else {
+            s += expf(row[c] - m);
+        }
+    }
+    for (int off = 16; off > 0; off >>= 1)
+        s += __shfl_xor_sync(FF_WARP_MASK, s, off);
+    if ((threadIdx.x & 31) == 0) s_s[threadIdx.x >> 5] = s;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        Sum t = threadIdx.x < (blockDim.x >> 5) ? s_s[threadIdx.x] : Sum(0);
+        for (int off = 16; off > 0; off >>= 1)
+            t += __shfl_xor_sync(FF_WARP_MASK, t, off);
+        if (threadIdx.x == 0) s_s[0] = t;
+    }
+    __syncthreads();
+    const Sum inv = Sum(1) / s_s[0];
+    for (long long c = threadIdx.x; c < vocab; c += blockDim.x) {
+        float e;
+        if constexpr (ACCURATE) {
+            e = row[c] == -INFINITY ? 0.0f : float(exp(double(row[c]) - double(m)) * inv);
+        } else {
+            e = expf(row[c] - m) * inv;
+        }
+        probs[c] = e;
+        if constexpr (BF16_COPY) probs_bf16[c] = __float2bfloat16_rn(e);
+    }
+}
+
+__device__ unsigned policy_key(float value) {
+    const unsigned bits = __float_as_uint(value);
+    return bits ^ ((bits >> 31) ? 0xffffffffu : 0x80000000u);
+}
+
+__device__ float policy_kth(const float* values, int count, int rank, float* shared) {
+    unsigned prefix = 0;
+    for (int bit = 31; bit >= 0; --bit) {
+        const unsigned candidate = prefix | (1u << bit);
+        float above = 0;
+        for (int i = threadIdx.x; i < count; i += 256)
+            above += policy_key(values[i]) >= candidate;
+        if (policy_sum(above, shared) >= rank) prefix = candidate;
+    }
+    return __uint_as_float(prefix ^ ((prefix >> 31) ? 0x80000000u : 0xffffffffu));
+}
+
+// Full-vocabulary probabilities; interval and optional extra token define the mask.
+extern "C" __global__ void guided_topk_bf16(
+    const __nv_bfloat16* logits, float* probabilities, float* scratch,
+    float* thresholds, unsigned char* keep, int vocab, int begin, int count,
+    int extra, int conditional_k, int sample_k, float scale) {
+    if (blockDim.x != 256 || gridDim.x != 1 || begin < 0 || count < sample_k ||
+        begin + count > vocab || extra >= vocab || conditional_k < 0 ||
+        conditional_k > count || sample_k < 1 || !isfinite(scale)) {
+        __trap(); return;
+    }
+    __shared__ float shared[8];
+    const int size = count + (extra >= 0);
+    float* guided = scratch + size;
+    for (int i = threadIdx.x; i < vocab; i += 256) {
+        if (!isfinite(__bfloat162float(logits[i])) || !isfinite(__bfloat162float(logits[vocab + i]))) __trap();
+        probabilities[i] = -INFINITY;
+        keep[i] = 0;
+    }
+    for (int i = threadIdx.x; i < size; i += 256) {
+        const int id = i < count ? begin + i : extra;
+        const float cond = __bfloat162float(logits[id]);
+        const float uncond = __bfloat162float(logits[vocab + id]);
+        if (!isfinite(cond) || !isfinite(uncond)) __trap();
+        scratch[i] = cond;
+        guided[i] = __fadd_rn(uncond, __fmul_rn(__fsub_rn(cond, uncond), scale));
+    }
+    __syncthreads();
+    const float conditional = conditional_k ? policy_kth(scratch, size, conditional_k, shared) : -INFINITY;
+    for (int i = threadIdx.x; i < size; i += 256)
+        if (scratch[i] < conditional) guided[i] = -1e9f;
+    __syncthreads();
+    const float threshold = policy_kth(guided, size, sample_k, shared);
+    if (!(threshold > -1e9f)) { __trap(); return; }
+    for (int i = threadIdx.x; i < size; i += 256) {
+        const bool selected = guided[i] >= threshold;
+        const int id = i < count ? begin + i : extra;
+        keep[id] = selected;
+        probabilities[id] = selected ? guided[i] : -INFINITY;
+    }
+    __syncthreads();
+    softmax_row_f32<true, false>(probabilities, probabilities, nullptr, vocab);
+    if (threadIdx.x == 0) {
+        thresholds[0] = conditional;
+        thresholds[1] = threshold;
+    }
+}
 
 extern "C" __global__ void argmax(const __nv_bfloat16* logits, uint32_t* token, int vocab) {
     const int tid  = threadIdx.x;
@@ -469,7 +608,9 @@ extern "C" __global__ void categorical_sample_rows(
   const uint4 counter =
       make_uint4((unsigned)(stream & 0xffffffffu), (unsigned)(stream >> 32),
                  (unsigned)row, 0u);
-  const float u = (float)(philox4_32_10(counter, key).x * (1.0 / 4294967296.0));
+  const float u = fminf(
+      (float)(philox4_32_10(counter, key).x * (1.0 / 4294967296.0)),
+      0x1.fffffep-1f);
   const float* p = probs + (long long)row * vocab;
   const long long chunk = (vocab + vocab_threads - 1) / vocab_threads;
   const long long lo = (long long)tid * chunk;
@@ -478,7 +619,11 @@ extern "C" __global__ void categorical_sample_rows(
   __shared__ float s_stage[32];
   __shared__ float s_scan[1024];
   float sum = 0.0f;
-  for (long long c = lo; c < hi; ++c) sum += p[c];
+  for (long long c = lo; c < hi; ++c) {
+    const float probability = p[c];
+    if (!isfinite(probability) || probability < 0.0f) { __trap(); return; }
+    sum += probability;
+  }
 
   // Block total of the row probabilities.
   float t = sum;
@@ -494,6 +639,7 @@ extern "C" __global__ void categorical_sample_rows(
     if (lane == 0) s_stage[0] = t;
   }
   __syncthreads();
+  if (!isfinite(s_stage[0]) || !(s_stage[0] > 0.0f)) { __trap(); return; }
   const float norm = 1.0f / s_stage[0];
 
   // Exclusive block scan over the per-thread chunk sums (s_scan).
@@ -530,8 +676,10 @@ extern "C" __global__ void categorical_sample_rows(
       const int other = __shfl_down_sync(FF_WARP_MASK, mine, off);
       if (other < mine) mine = other;
     }
-    if (lane == 0)
-      out[row] = mine == 0x7fffffff ? (int)(vocab - 1) : mine;
+    if (lane == 0) {
+      if (mine == 0x7fffffff) { __trap(); return; }
+      out[row] = mine;
+    }
   }
 }
 
@@ -629,8 +777,10 @@ extern "C" __global__ void argmax_rows_f32(
       const int other = __shfl_down_sync(FF_WARP_MASK, mine, off);
       if (other < mine) mine = other;
     }
-    if (lane == 0)
-      out[row] = mine == 0x7fffffff ? (int)(vocab - 1) : mine;
+    if (lane == 0) {
+      if (mine == 0x7fffffff) { __trap(); return; }
+      out[row] = mine;
+    }
   }
 }
 
@@ -640,46 +790,8 @@ extern "C" __global__ void softmax_rows_dual(const float* __restrict__ x,
     long long vocab) {
     const int r = blockIdx.x;
     if (r >= rows) return;
-    const float* row = x + (long long)r * vocab;
-    float m = -INFINITY;
-    for (long long c = threadIdx.x; c < vocab; c += blockDim.x)
-        m = fmaxf(m, row[c]);
-    __shared__ float s_m[32];
-    __shared__ float s_s[32];
-    for (int off = 16; off > 0; off >>= 1)
-        m = fmaxf(m, __shfl_xor_sync(FF_WARP_MASK, m, off));
-    if ((threadIdx.x & 31) == 0) s_m[threadIdx.x >> 5] = m;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        float t = threadIdx.x < (blockDim.x >> 5) ? s_m[threadIdx.x] : -INFINITY;
-        for (int off = 16; off > 0; off >>= 1)
-            t = fmaxf(t, __shfl_xor_sync(FF_WARP_MASK, t, off));
-        if (threadIdx.x == 0) s_m[0] = t;
-    }
-    __syncthreads();
-    m = s_m[0];
-    float s = 0.0f;
-    for (long long c = threadIdx.x; c < vocab; c += blockDim.x)
-        s += expf(row[c] - m);
-    for (int off = 16; off > 0; off >>= 1)
-        s += __shfl_xor_sync(FF_WARP_MASK, s, off);
-    if ((threadIdx.x & 31) == 0) s_s[threadIdx.x >> 5] = s;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        float t = threadIdx.x < (blockDim.x >> 5) ? s_s[threadIdx.x] : 0.0f;
-        for (int off = 16; off > 0; off >>= 1)
-            t += __shfl_xor_sync(FF_WARP_MASK, t, off);
-        if (threadIdx.x == 0) s_s[0] = t;
-    }
-    __syncthreads();
-    const float inv = 1.0f / s_s[0];
-    float* p = probs + (long long)r * vocab;
-    __nv_bfloat16* pb = probs_bf16 + (long long)r * vocab;
-    for (long long c = threadIdx.x; c < vocab; c += blockDim.x) {
-        const float e = expf(row[c] - m) * inv;
-        p[c] = e;
-        pb[c] = __float2bfloat16_rn(e);
-    }
+    const long long offset = (long long)r * vocab;
+    softmax_row_f32<false, true>(x + offset, probs + offset, probs_bf16 + offset, vocab);
 }
 
 // state = [committed response length, returned rows, stopped, pending rows].
