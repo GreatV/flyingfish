@@ -1195,11 +1195,7 @@ impl LoopvlVisionWeights {
 }
 
 impl Music3SynWeights {
-    pub(crate) fn load(
-        dir: &Path,
-        spec: &crate::model_spec::Music3SynSpec,
-        d: &Device,
-    ) -> Result<Self> {
+    pub(crate) fn load(dir: &Path, spec: &crate::music3::SynSpec, d: &Device) -> Result<Self> {
         let dim = spec.flow_dim() as usize;
         let concat = spec.concat_channels() as usize;
         let ff = spec.flow_ff_inner as usize;
@@ -1207,7 +1203,7 @@ impl Music3SynWeights {
             &dir.join("transformer"),
             "diffusion_pytorch_model",
         )?;
-        let manifest_transformer = mapped_transformer.music3_syn_manifest(spec)?;
+        let manifest_transformer = spec.manifest_transformer(&mapped_transformer)?;
         let (flow, _) = checkpoint_mapped(
             &mapped_transformer,
             d,
@@ -1264,7 +1260,7 @@ impl Music3SynWeights {
             &dir.join("condition_encoder"),
             "diffusion_pytorch_model",
         )?;
-        let manifest_condition_encoder = mapped_condition_encoder.music3_syn_manifest(spec)?;
+        let manifest_condition_encoder = spec.manifest_condition(&mapped_condition_encoder)?;
         let (cond, _) = checkpoint_mapped(
             &mapped_condition_encoder,
             d,
@@ -1298,7 +1294,7 @@ impl Music3SynWeights {
             &dir.join("vocoder"),
             "diffusion_pytorch_model",
         )?;
-        let manifest_vocoder = mapped_vocoder.music3_syn_manifest(spec)?;
+        let manifest_vocoder = spec.manifest_vocoder(&mapped_vocoder)?;
         let (vocoder, _) =
             checkpoint_mapped(&mapped_vocoder, d, Some(&manifest_vocoder), false, |l| {
                 let f32 = |l: &mut Loader<'_>, name: &str, shape: &[usize]| {

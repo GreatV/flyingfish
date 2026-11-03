@@ -12,7 +12,7 @@ use std::sync::Arc;
 /// `Blas::linear_f32` (CUBLAS_COMPUTE_32F, no TF32); attention uses a
 /// dedicated handle pinned to CUBLAS_DEFAULT_MATH.
 pub struct Music3Syn {
-    pub spec: crate::model_spec::Music3SynSpec,
+    pub spec: crate::music3::SynSpec,
     pub weights: Music3SynWeights,
     pub stream: Arc<cudarc::driver::CudaStream>,
     pub blas: super::blas::Blas,
@@ -116,7 +116,7 @@ fn f32_matrix(
 
 impl Music3Syn {
     pub fn load(dir: &std::path::Path, d: &Device, max_length: usize) -> Result<Self> {
-        let spec = crate::model_spec::Music3SynSpec::read(dir)?;
+        let spec = crate::music3::SynSpec::read(dir)?;
         let weights = Music3SynWeights::load(dir, &spec, d)?;
         let ops = super::ops::Ops::new(&d.ctx)?;
         let closure = std::rc::Rc::new(super::closure::Closure::new(
@@ -1546,7 +1546,7 @@ pub struct VocoderUnitFold {
 
 impl Music3Syn {
     pub fn workspace(
-        spec: &crate::model_spec::Music3SynSpec,
+        spec: &crate::music3::SynSpec,
         d: &Device,
         max_length: usize,
     ) -> Result<Workspace> {
@@ -1555,7 +1555,7 @@ impl Music3Syn {
 }
 
 fn build_workspace(
-    spec: &crate::model_spec::Music3SynSpec,
+    spec: &crate::music3::SynSpec,
     d: &Device,
     max_length: usize,
 ) -> Result<Workspace> {
