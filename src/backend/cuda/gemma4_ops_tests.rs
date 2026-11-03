@@ -3481,7 +3481,8 @@ fn large_media_components(
             } else {
                 input.ids.len()
             };
-            let mut eager = None;
+            let mut eager_layers = Vec::<Vec<f32>>::new();
+            let mut eager_state = None;
             for graph in [false, true] {
                 if graph && form == "bucketed" {
                     continue;
@@ -3568,21 +3569,21 @@ fn large_media_components(
                     engine.gemma_position()?,
                 );
                 if graph {
-                    let (expected_layers, expected_state) =
-                        eager.as_ref().context("prefix eager control missing")?;
+                    ensure!(eager_layers.len() == 6, "prefix eager control missing");
                     let bits = layers
                         .iter()
                         .flatten()
-                        .zip(expected_layers.iter().flatten())
+                        .zip(eager_layers.iter().flatten())
                         .filter(|(a, b)| a.to_bits() != b.to_bits())
                         .count();
-                    let equal = expected_state == &state;
+                    let equal = eager_state.as_ref() == Some(&state);
                     defects += usize::from(bits != 0 || !equal);
                     println!(
                         "media_prefix_graph {name} layers=6 bit_mismatches={bits} state_equal={equal}"
                     );
                 } else {
-                    eager = Some((layers, state));
+                    eager_layers = layers;
+                    eager_state = Some(state);
                 }
             }
             let fixed = load_reference(
