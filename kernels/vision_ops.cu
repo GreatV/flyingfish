@@ -557,52 +557,62 @@ extern "C" __global__ void causal_frame_im2col_f32(
     }
 }
 
-// GroupNorm then SiLU over x [pixels, channels]: per group of channels / groups channels over all pixels, two-pass
-// F32 mean and biased variance, rstd = 1 / sqrt(var + eps), a = rstd * gamma[c], b = beta[c] - a * mean,
-// y = silu(x * a + b) = v / (1 + exp(-v)). One 1024-thread CTA per group.
+// NHWC GroupNorm/SiLU with F32 Welford moments in channel-major order; one CTA per group.
 extern "C" __global__ __launch_bounds__(1024) void group_norm_silu_f32(
     const float* x, const float* gamma, const float* beta, float* y, uint64_t pixels,
     uint32_t channels, uint32_t groups, float eps) {
-    if (blockDim.x != 1024 || blockDim.y != 1 || gridDim.x != groups || gridDim.y != 1 || !x ||
+    if ((blockDim.x != 512 && blockDim.x != 1024) || blockDim.y != 1 || gridDim.x != groups || gridDim.y != 1 || !x ||
         !gamma || !beta || !y || !pixels || !groups || channels % groups) { __trap(); return; }
-    __shared__ float partial[32];
-    __shared__ float total;
+    __shared__ float means[32], moments[32], counts[32];
+    __shared__ float mean, rstd;
     const uint32_t width = channels / groups, first = blockIdx.x * width;
     const uint64_t count = pixels * width;
-    const auto reduce = [&](float v) {
-        for (int delta = 16; delta; delta /= 2) v = __fadd_rn(v, __shfl_down_sync(FF_WARP_MASK, v, delta));
-        if (threadIdx.x % 32 == 0) partial[threadIdx.x / 32] = v;
-        __syncthreads();
-        if (threadIdx.x < 32) {
-            v = partial[threadIdx.x];
-            for (int delta = 16; delta; delta /= 2) v = __fadd_rn(v, __shfl_down_sync(FF_WARP_MASK, v, delta));
-            if (threadIdx.x == 0) total = v;
-        }
-        __syncthreads();
-        const float out = total;
-        __syncthreads();
-        return out;
-    };
-    const auto at = [&](uint64_t e) { return (e / width) * channels + first + e % width; };
-    const auto add = [](float v, float& sum, float& correction) {
-        const float adjusted = __fsub_rn(v, correction);
-        const float next = __fadd_rn(sum, adjusted);
-        correction = __fsub_rn(__fsub_rn(next, sum), adjusted);
-        sum = next;
-    };
-    float sum = 0.0f, correction = 0.0f;
-    for (uint64_t e = threadIdx.x; e < count; e += 1024) add(x[at(e)], sum, correction);
-    const float mean = __fdiv_rn(reduce(sum), float(count));
-    float squares = 0.0f;
-    correction = 0.0f;
-    for (uint64_t e = threadIdx.x; e < count; e += 1024) {
-        const float d = __fsub_rn(x[at(e)], mean);
-        add(__fmul_rn(d, d), squares, correction);
+    const auto at = [&](uint64_t e) { return (e % pixels) * channels + first + e / pixels; };
+    float m = 0.0f, moment = 0.0f, n = 0.0f;
+    for (uint64_t e = threadIdx.x; e < count; e += blockDim.x) {
+        const float value = x[at(e)];
+        n += 1.0f;
+        const float delta = value - m;
+        m += delta / n;
+        moment += delta * (value - m);
     }
-    const float rstd = __frcp_rn(__fsqrt_rn(__fadd_rn(__fdiv_rn(reduce(squares), float(count)), eps)));
-    for (uint64_t e = threadIdx.x; e < count; e += 1024) {
+    const auto warp_reduce = [&]() {
+        for (int offset = 16; offset; offset /= 2) {
+            const float other_m = __shfl_down_sync(FF_WARP_MASK, m, offset);
+            const float other_moment = __shfl_down_sync(FF_WARP_MASK, moment, offset);
+            const float other_n = __shfl_down_sync(FF_WARP_MASK, n, offset);
+            if (threadIdx.x % 32 + offset < 32 && other_n > 0.0f) {
+                const float combined = n + other_n;
+                const float ratio = other_n / combined;
+                const float delta = other_m - m;
+                moment += other_moment + delta * delta * n * ratio;
+                m += delta * ratio;
+                n = combined;
+            }
+        }
+    };
+    warp_reduce();
+    if (threadIdx.x % 32 == 0) {
+        means[threadIdx.x / 32] = m;
+        moments[threadIdx.x / 32] = moment;
+        counts[threadIdx.x / 32] = n;
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        const bool active = threadIdx.x < blockDim.x / 32;
+        m = active ? means[threadIdx.x] : 0.0f;
+        moment = active ? moments[threadIdx.x] : 0.0f;
+        n = active ? counts[threadIdx.x] : 0.0f;
+        warp_reduce();
+        if (threadIdx.x == 0) {
+            mean = m;
+            rstd = rsqrtf(moment / n + eps);
+        }
+    }
+    __syncthreads();
+    for (uint64_t e = threadIdx.x; e < count; e += blockDim.x) {
         const uint64_t i = at(e);
-        const uint32_t c = first + uint32_t(e % width);
+        const uint32_t c = first + uint32_t(e / pixels);
         const float a = __fmul_rn(rstd, gamma[c]);
         const float v = __fmaf_rn(x[i], a, __fmaf_rn(-a, mean, beta[c]));
         y[i] = __fdiv_rn(v, __fadd_rn(1.0f, expf(-v)));

@@ -5729,7 +5729,7 @@ impl NafEncoder {
                         .arg(&128u32)
                         .arg(&8u32)
                         .arg(&1.0e-5f32)
-                        .launch(grid(8, 1024))?;
+                        .launch(grid(8, 512))?;
                 }
                 self.convolve(s, conv, &ws.b, &ws.a, ws)?;
             }
