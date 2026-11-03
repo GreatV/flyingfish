@@ -6063,6 +6063,154 @@ impl Engine {
         )
     }
 
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn gemma_media_prefix_scope(
+        &mut self,
+        input: &crate::vision_input::MultimodalInput<'_>,
+    ) -> Result<()> {
+        ensure!(
+            self.model_spec.architecture == crate::model_spec::Architecture::Gemma4
+                && self.model_spec.hidden == 5376
+                && self.model_spec.per_layer_input.is_none()
+                && self.config.num_hidden_layers == 60
+                && self.position == 0
+                && self.graph.is_none(),
+            "invalid 31B six-layer control scope"
+        );
+        let (_, vision, request) =
+            Self::multimodal_request_bytes(&self.model_spec, input, self.capacity)?;
+        ensure!(vision != 0, "prefix scope requires image input");
+        self.prepare_vision_weights(request)?;
+        let runtime = self.qwen.as_mut().context("prefix runtime missing")?;
+        ensure!(
+            runtime.dense_graphs.is_empty(),
+            "prefix graph already captured"
+        );
+        runtime.layers.truncate(6);
+        self.model_spec.layers.truncate(6);
+        self.config.num_hidden_layers = 6;
+        self.reset()
+    }
+
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn gemma_graph_layers_probe(
+        &mut self,
+        token: u32,
+        input: &[bf16],
+        trace: &mut crate::trace::Trace,
+    ) -> Result<()> {
+        let width = self.model_spec.hidden as usize;
+        ensure!(
+            self.config.num_hidden_layers == 6
+                && input.len() == width
+                && self.position < self.capacity
+                && self.dense_graph_ready(),
+            "invalid captured prefix probe"
+        );
+        self.set_token(token)?;
+        self.qwen
+            .as_ref()
+            .context("prefix graph runtime missing")?
+            .dense_graphs[0]
+            .launch()?;
+        self.device
+            .stream
+            .memcpy_htod(input, &mut self.work.x.slice_mut(..width))?;
+        let step = crate::backend::Step {
+            rows: 1,
+            input: crate::backend::Input::Token,
+            head: Head::Last,
+            mask: crate::backend::Mask::Causal,
+        };
+        for layer in 0..6 {
+            self.qwen_layer_begin(layer, step)?;
+            self.qwen
+                .as_ref()
+                .context("prefix graph runtime missing")?
+                .dense_graphs[layer + 1]
+                .launch()?;
+            let values = self.device.stream.clone_dtoh(&self.work.x.slice(..width))?;
+            trace.add(
+                format!(".{layer}"),
+                vec![1, width],
+                values.into_iter().map(bf16::to_f32).collect(),
+            )?;
+            self.dense_layer_end(layer)?;
+        }
+        self.qwen
+            .as_ref()
+            .context("prefix graph runtime missing")?
+            .dense_graphs[7]
+            .launch()?;
+        self.position += 1;
+        self.pending_token = Some(self.token()?);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gemma_final_probe(
+        &mut self,
+        input: &[bf16],
+        trace: Option<&mut crate::trace::Trace>,
+    ) -> Result<Vec<bf16>> {
+        let width = self.model_spec.hidden as usize;
+        ensure!(
+            !input.is_empty() && input.len().is_multiple_of(width),
+            "Gemma final probe input extent"
+        );
+        let rows = input.len() / width;
+        let stream = &self.device.stream;
+        stream.memcpy_htod(input, &mut self.work.x.slice_mut(..input.len()))?;
+        self.state
+            .set_sequence(stream, 0, u32::try_from(rows)?, self.workspace_rows as u32)?;
+        self.qwen
+            .as_ref()
+            .context("head probe runtime missing")?
+            .common
+            .norm
+            .rms_with(
+                stream,
+                RowDomain {
+                    meta: self.state.seq_ref(stream)?,
+                    row_base: 0,
+                    row_capacity: rows as u32,
+                },
+                heads(&self.work.x, stream, 0, rows, 1, width as u32)?,
+                vector(
+                    self.weights
+                        .norm
+                        .as_ref()
+                        .context("head probe norm missing")?,
+                    stream,
+                )?,
+                &mut TensorMut(heads(&self.work.n, stream, 0, rows, 1, width as u32)?),
+                RmsOptions {
+                    mode: norm_mode(&self.model_spec),
+                    eps: self.model_spec.rms_eps,
+                },
+            )?;
+        self.run_operator(
+            crate::backend::Operator::Head,
+            0,
+            crate::backend::Step {
+                rows,
+                input: crate::backend::Input::Ids,
+                head: Head::All,
+                mask: crate::backend::Mask::Causal,
+            },
+            &mut trace.map(|trace| Target {
+                trace,
+                prefix: "",
+                skip: 0,
+            }),
+        )?;
+        let mut output = Vec::with_capacity(rows * self.model_spec.vocab as usize);
+        for row in 0..rows {
+            output.extend(self.gemma_all_logits(row)?);
+        }
+        Ok(output)
+    }
+
     #[cfg(test)]
     /// Probe rows are packed as [rows, kv_heads, head_dim].
     pub(crate) fn gemma_kv_rows(
