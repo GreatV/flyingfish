@@ -32,19 +32,36 @@ extern "C" __global__ void silu_mul_split(const __nv_bfloat16* gate,
                                          const __nv_bfloat16* up,
                                          __nv_bfloat16* y, int count,
                                          int mode) {
-    if ((unsigned)mode > 2u) __trap();
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= count) return;
-    const float g = __bfloat162float(gate[i]);
-    const float u = __bfloat162float(up[i]);
-    if (mode == 2) {
-      y[i] = __hmul(__float2bfloat16_rn(gelu_tanh(g)), up[i]);
-    } else if (mode == 1) {
-      y[i] = __float2bfloat16_rn(g / (1.0f + expf(-g)) * u);
-    } else {
-      const __nv_bfloat16 s = __float2bfloat16_rn(g / (1.0f + expf(-g)));
-      y[i] = __hmul(s, up[i]);
+    if ((unsigned)mode > 2u || count < 0 || (count & 7) != 0 ||
+        !gate || !up || !y ||
+        ((reinterpret_cast<uintptr_t>(gate) | reinterpret_cast<uintptr_t>(up) |
+          reinterpret_cast<uintptr_t>(y)) &
+         15u) != 0u) {
+        __trap();
+        return;
     }
+    const int vec = blockIdx.x * blockDim.x + threadIdx.x;
+    if (vec >= (count >> 3)) return;
+    const uint4 gv = reinterpret_cast<const uint4*>(gate)[vec];
+    const uint4 uv = reinterpret_cast<const uint4*>(up)[vec];
+    const __nv_bfloat16* gp = reinterpret_cast<const __nv_bfloat16*>(&gv);
+    const __nv_bfloat16* up_p = reinterpret_cast<const __nv_bfloat16*>(&uv);
+    uint4 yv;
+    __nv_bfloat16* yp = reinterpret_cast<__nv_bfloat16*>(&yv);
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const float g = __bfloat162float(gp[j]);
+        const float u = __bfloat162float(up_p[j]);
+        if (mode == 2) {
+            yp[j] = __hmul(__float2bfloat16_rn(gelu_tanh(g)), up_p[j]);
+        } else if (mode == 1) {
+            yp[j] = __float2bfloat16_rn(g / (1.0f + expf(-g)) * u);
+        } else {
+            const __nv_bfloat16 s = __float2bfloat16_rn(g / (1.0f + expf(-g)));
+            yp[j] = __hmul(s, up_p[j]);
+        }
+    }
+    reinterpret_cast<uint4*>(y)[vec] = yv;
 }
 
 // Clamped SwiGLU over dense [rows, width] gate and up regions (ClampedTwice):

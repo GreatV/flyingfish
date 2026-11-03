@@ -1165,10 +1165,22 @@ fn vision_bidirectional_attention_gpu() -> Result<()> {
 }
 
 #[test]
+fn silu_mul_launch_guards_reject_unaligned_and_odd_extents() -> Result<()> {
+    let ok_split = super::ops::silu_mul_split_grid(17 * 6144, 0x1000, 0x2000, 0x3000)?;
+    ensure!(ok_split.grid_dim.0 == ((17 * 6144 / 8) as u32).div_ceil(256));
+    ensure!(super::ops::silu_mul_split_grid(17 * 6144 + 4, 0x1000, 0x2000, 0x3000).is_err());
+    ensure!(super::ops::silu_mul_split_grid(17 * 6144, 0x1002, 0x2000, 0x3000).is_err());
+    ensure!(super::ops::silu_mul_split_grid(17 * 6144, 0x1000, 0x2004, 0x3000).is_err());
+    ensure!(super::ops::silu_mul_split_grid(17 * 6144, 0x1000, 0x2000, 0x3008).is_err());
+    Ok(())
+}
+
+#[test]
 #[ignore = "requires a GPU and FF_GEMMA4_FIXTURES"]
 fn gelu_tanh_gated_activation_matches_the_definition_gpu() -> Result<()> {
     use super::contracts::{TensorMut, view};
     use super::ops::{CommonOpsRef, GeluMode};
+    use crate::backend::gpu::DevicePtr;
     let device = Device::new(0)?;
     let s = &device.stream;
     let module = cubin::module(&device.ctx, "act")?;
@@ -1196,6 +1208,12 @@ fn gelu_tanh_gated_activation_matches_the_definition_gpu() -> Result<()> {
             let run = |mode: i32| -> Result<(Vec<bf16>, Vec<bf16>)> {
                 let mut y = s.alloc_zeros::<bf16>(rows * dim)?;
                 let mut z = s.alloc_zeros::<bf16>(rows * dim)?;
+                let split_cfg = super::ops::silu_mul_split_grid(
+                    rows * dim,
+                    gate.device_ptr(s).0,
+                    up.device_ptr(s).0,
+                    z.device_ptr(s).0,
+                )?;
                 unsafe {
                     s.launch_builder(&fused)
                         .arg(&packed)
@@ -1210,7 +1228,7 @@ fn gelu_tanh_gated_activation_matches_the_definition_gpu() -> Result<()> {
                         .arg(&mut z)
                         .arg(&((rows * dim) as i32))
                         .arg(&mode)
-                        .launch(flat(rows * dim))?;
+                        .launch(split_cfg)?;
                 }
                 Ok((s.clone_dtoh(&y)?, s.clone_dtoh(&z)?))
             };
@@ -1246,6 +1264,7 @@ fn gelu_tanh_gated_activation_matches_the_definition_gpu() -> Result<()> {
             cases += 1;
         }
     }
+    silu_mul_launch_guards_reject_unaligned_and_odd_extents()?;
     println!("GEMMA4_GELU_TANH cases={cases} defects={defects} undetected_mutants={undetected}");
     ensure!(defects == 0 && undetected == 0, "GEMMA4_GELU_TANH FAIL");
     let common = CommonOpsRef::new(&device.ctx)?;
@@ -2105,6 +2124,11 @@ fn d512_table_kv_preparation_matches_definition_gpu() -> Result<()> {
             })?;
     }
     let got_q = s.clone_dtoh(&qkv.slice(..rows * d))?;
+    let got_k_staging = s.clone_dtoh(&qkv.slice(rows * d..rows * 2 * d))?;
+    ensure!(
+        got_k_staging == k,
+        "GEMMA4_D512_PREP overwrote K staging rows in qkv"
+    );
     let got_k = s.clone_dtoh(&cache_k.slice(..rows * d))?;
     let got_v = s.clone_dtoh(&cache_v.slice(..rows * d))?;
     let q_rope = first_head(q_rope);

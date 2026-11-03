@@ -208,12 +208,16 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
         (ring_tokens > 0 && cache_start >= 0))
         __trap();
     __shared__ float smem[32];
+    __shared__ __align__(16) __nv_bfloat16 s_norm[512];
     const int heads = q_heads + (SHARED_KV ? 1 : 2) * kv_heads;
     const int row = blockIdx.x / heads;
     const int head = blockIdx.x % heads;
     if (row >= rows) return;
     const int gid = threadIdx.x;
     const int nthr = blockDim.x;
+    if constexpr (TABLE) {
+        if (dim == 256 && gid >= 32) return;
+    }
     size_t base;
     if constexpr (PLANAR) {
         if (head < q_heads) {
@@ -249,25 +253,31 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
         }
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) ssq += __shfl_xor_sync(FF_WARP_MASK, ssq, o);
-        if ((gid & 31) == 0) smem[gid >> 5] = ssq;
-        __syncthreads();
-        if (gid < 32) {
-            int nw = nthr >> 5;
-            float t = (gid < nw) ? smem[gid] : 0.0f;
+        float total_ssq = ssq;
+        if (!(TABLE && dim == 256)) {
+            if ((gid & 31) == 0) smem[gid >> 5] = ssq;
+            __syncthreads();
+            if (gid < 32) {
+                int nw = nthr >> 5;
+                float t = (gid < nw) ? smem[gid] : 0.0f;
 #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) t += __shfl_xor_sync(FF_WARP_MASK, t, o);
-            if (gid == 0) smem[0] = t;
+                for (int o = 16; o > 0; o >>= 1) t += __shfl_xor_sync(FF_WARP_MASK, t, o);
+                if (gid == 0) smem[0] = t;
+            }
+            __syncthreads();
+            total_ssq = smem[0];
         }
-        __syncthreads();
-        const float rstd = powf(smem[0] / (float)dim + eps, -0.5f);
+        const float rstd = powf(total_ssq / (float)dim + eps, -0.5f);
 
         if (gid < dim / 8) {
             if constexpr (SHARED_KV) {
                 if (head >= q_heads) {
                     const size_t dst = ((size_t)(head - q_heads) * capacity + cache_pos) * dim;
+                    union V { float4 x; __nv_bfloat162 h[4]; } vo;
 #pragma unroll
-                    for (int j = 0; j < 8; ++j)
-                        v[dst + gid * 8 + j] = __float2bfloat16_rn(r[j] * rstd);
+                    for (int j = 0; j < 4; ++j)
+                        vo.h[j] = __floats2bfloat162_rn(r[2 * j] * rstd, r[2 * j + 1] * rstd);
+                    *reinterpret_cast<float4*>(v + dst + (size_t)gid * 8) = vo.x;
                 }
             }
             float ww[8], out[8];
@@ -280,33 +290,54 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
                 ww[j] = (j & 1) ? t.y : t.x;
                 out[j] = r[j] * rstd * ww[j];
             }
-            __nv_bfloat16* p = qkv + base + (size_t)gid * 8;
             union O { float4 x; __nv_bfloat162 h[4]; } o;
 #pragma unroll
             for (int j = 0; j < 4; ++j)
                 o.h[j] = __floats2bfloat162_rn(out[2 * j], out[2 * j + 1]);
-            *reinterpret_cast<float4*>(p) = o.x;
+            if constexpr (TABLE) {
+                *reinterpret_cast<float4*>(s_norm + (size_t)gid * 8) = o.x;
+            } else {
+                __nv_bfloat16* p = qkv + base + (size_t)gid * 8;
+                *reinterpret_cast<float4*>(p) = o.x;
+            }
         }
+        if constexpr (TABLE) {
+            if (dim == 256) {
+                __syncwarp();
+            } else {
+                __syncthreads();
+            }
+            if (gid < dim / 8) {
+                const int d = gid * 4;
+                union P { uint2 u; __nv_bfloat16 v[4]; } ca, sa, aa, ba, loa, hia;
+                ca.u = *reinterpret_cast<const uint2*>(table + (size_t)position * dim + d);
+                sa.u = *reinterpret_cast<const uint2*>(table + (size_t)position * dim + dim / 2 + d);
+                aa.u = *reinterpret_cast<const uint2*>(s_norm + d);
+                ba.u = *reinterpret_cast<const uint2*>(s_norm + dim / 2 + d);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const __nv_bfloat16 c = ca.v[j];
+                    const __nv_bfloat16 s = sa.v[j];
+                    const __nv_bfloat16 a = aa.v[j];
+                    const __nv_bfloat16 b = ba.v[j];
+                    loa.v[j] = __hsub_rn(__hmul_rn(a, c), __hmul_rn(b, s));
+                    hia.v[j] = __hadd_rn(__hmul_rn(b, c), __hmul_rn(a, s));
+                }
+                if (head < q_heads) {
+                    *reinterpret_cast<uint2*>(qkv + base + d) = loa.u;
+                    *reinterpret_cast<uint2*>(qkv + base + dim / 2 + d) = hia.u;
+                } else {
+                    const int kv_head = head - q_heads;
+                    const size_t dst = ((size_t)kv_head * capacity + cache_pos) * dim;
+                    *reinterpret_cast<uint2*>(k + dst + d) = loa.u;
+                    *reinterpret_cast<uint2*>(k + dst + dim / 2 + d) = hia.u;
+                }
+            }
+        } else {
         __syncthreads();
 
         if constexpr (ROTARY) {
           for (int d = gid; d < dim / 2; d += nthr) {
-            if constexpr (TABLE) {
-              const __nv_bfloat16 c = table[(size_t)position * dim + d];
-              const __nv_bfloat16 s = table[(size_t)position * dim + dim / 2 + d];
-              const __nv_bfloat16 a = qkv[base + d];
-              const __nv_bfloat16 b = qkv[base + d + dim / 2];
-              const __nv_bfloat16 lo = __hsub_rn(__hmul_rn(a, c), __hmul_rn(b, s));
-              const __nv_bfloat16 hi = __hadd_rn(__hmul_rn(b, c), __hmul_rn(a, s));
-              qkv[base + d] = lo;
-              qkv[base + d + dim / 2] = hi;
-              if (head >= q_heads) {
-                const int kv_head = head - q_heads;
-                const size_t dst = ((size_t)kv_head * capacity + cache_pos) * dim;
-                k[dst + d] = lo;
-                k[dst + d + dim / 2] = hi;
-              }
-            } else {
             const float inv = 1.0f / powf(theta, float(2 * gid) / dim);
             const float angle = float(position) * inv;
             const float c = __bfloat162float(__float2bfloat16(cosf(angle)));
@@ -323,12 +354,12 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
                 k[dst + gid] = lo;
                 k[dst + gid + dim / 2] = hi;
               }
-            }
           }
         } else if (head >= q_heads) {
             const int kv_head = head - q_heads;
             const size_t dst = ((size_t)kv_head * capacity + cache_pos) * dim;
             for (int d = gid; d < dim; d += nthr) k[dst + d] = qkv[base + d];
+        }
         }
     } else {
         const int kv_head = head - q_heads - kv_heads;
@@ -349,17 +380,21 @@ __device__ __forceinline__ void qknorm_rope_kv_impl(__nv_bfloat16* qkv,
         }
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) ssq += __shfl_xor_sync(FF_WARP_MASK, ssq, o);
-        if ((gid & 31) == 0) smem[gid >> 5] = ssq;
-        __syncthreads();
-        if (gid < 32) {
-            int nw = nthr >> 5;
-            float t = (gid < nw) ? smem[gid] : 0.0f;
+        float total_ssq = ssq;
+        if (dim != 256) {
+            if ((gid & 31) == 0) smem[gid >> 5] = ssq;
+            __syncthreads();
+            if (gid < 32) {
+                int nw = nthr >> 5;
+                float t = (gid < nw) ? smem[gid] : 0.0f;
 #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) t += __shfl_xor_sync(FF_WARP_MASK, t, o);
-            if (gid == 0) smem[0] = t;
+                for (int o = 16; o > 0; o >>= 1) t += __shfl_xor_sync(FF_WARP_MASK, t, o);
+                if (gid == 0) smem[0] = t;
+            }
+            __syncthreads();
+            total_ssq = smem[0];
         }
-        __syncthreads();
-        const float rstd = powf(smem[0] / (float)dim + eps, -0.5f);
+        const float rstd = powf(total_ssq / (float)dim + eps, -0.5f);
         if (gid < dim / 8) {
             union O { float4 x; __nv_bfloat162 h[4]; } o;
 #pragma unroll

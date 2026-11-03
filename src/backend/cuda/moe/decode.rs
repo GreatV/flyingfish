@@ -581,6 +581,8 @@ impl DecodeOps {
                 hidden,
             )?;
             gemm(input.shared_up.ptr, input.x.ptr, up, shared_inter, hidden)?;
+            let elems = (rows * shared_inter) as usize;
+            let cfg = crate::backend::cuda::ops::silu_mul_split_grid(elems, shared, up, hs_ptr)?;
             // SAFETY: shared_out holds two rows*inter regions; hs_ptr is disjoint scratch.
             unsafe {
                 stream
@@ -588,11 +590,9 @@ impl DecodeOps {
                     .arg(&shared)
                     .arg(&up)
                     .arg(&hs_ptr)
-                    .arg(&((rows * shared_inter) as i32))
+                    .arg(&(elems as i32))
                     .arg(&(self.swiglu_rounding as i32))
-                    .launch(crate::backend::cuda::ops::flat(
-                        (rows * shared_inter) as usize,
-                    ))?;
+                    .launch(cfg)?;
             }
             gemm(input.shared_down.ptr, hs_ptr, shared, hidden, shared_inter)?;
         }

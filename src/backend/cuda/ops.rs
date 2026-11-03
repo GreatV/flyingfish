@@ -388,6 +388,24 @@ pub fn flat(n: usize) -> LaunchConfig {
     grid(n.div_ceil(256), 256)
 }
 
+pub(crate) fn silu_mul_split_grid(
+    elems: usize,
+    gate_ptr: u64,
+    up_ptr: u64,
+    y_ptr: u64,
+) -> Result<LaunchConfig> {
+    ensure!(
+        elems.is_multiple_of(8)
+            && elems <= i32::MAX as usize
+            && gate_ptr != 0
+            && up_ptr != 0
+            && y_ptr != 0
+            && ((gate_ptr | up_ptr | y_ptr) & 15) == 0,
+        "silu_mul_split requires 8-element count and 16-byte alignment: elems={elems} gate={gate_ptr:#x} up={up_ptr:#x} y={y_ptr:#x}"
+    );
+    Ok(flat(elems / 8))
+}
+
 use super::contracts::{RowDomain, Tensor, TensorMut, dense_layout};
 use crate::backend::gpu::{CudaStream, PushKernelArg};
 use anyhow::ensure;
@@ -1706,6 +1724,20 @@ impl GateOps {
             .checked_mul(u64::from(x.shape[1]))
             .and_then(|n| n.checked_mul(u64::from(x.shape[2])))
             .ok_or_else(|| anyhow::anyhow!("gated GELU element count overflow"))?;
+        let vec8 = x.shape[2].is_multiple_of(8)
+            && x.stride[2] == 1
+            && up.stride[2] == 1
+            && y.0.stride[2] == 1
+            && ((x.stride[0]
+                | x.stride[1]
+                | up.stride[0]
+                | up.stride[1]
+                | y.0.stride[0]
+                | y.0.stride[1])
+                & 7)
+                == 0
+            && ((x.ptr | up.ptr | y.0.ptr) & 15) == 0;
+        let threads = if vec8 { count / 8 } else { count };
         unsafe {
             stream
                 .launch_builder(&self.gelu_tanh_mul)
@@ -1724,7 +1756,7 @@ impl GateOps {
                 .arg(&y.0.stride[0])
                 .arg(&y.0.stride[1])
                 .arg(&y.0.stride[2])
-                .launch(grid(count.div_ceil(256).min(65535) as usize, 256))?;
+                .launch(grid(threads.div_ceil(256).min(65535) as usize, 256))?;
         }
         Ok(())
     }
