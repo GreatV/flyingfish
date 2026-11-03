@@ -624,6 +624,41 @@ extern "C" __global__ void gelu_tanh_mul(
     uint64_t ys0,uint64_t ys1,uint64_t ys2) {
     if(blockDim.x!=256 || blockDim.y!=1 || blockDim.z!=1 || gridDim.y!=1 || gridDim.z!=1 ||
        !rows || !heads || !width || !x || !up || !y) {__trap();return;}
+    if((width & 7u)==0u && xs2==1 && us2==1 && ys2==1 &&
+       ((xs0 | xs1 | us0 | us1 | ys0 | ys1) & 7ull)==0ull &&
+       ((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(up) |
+         reinterpret_cast<uintptr_t>(y)) & 15u)==0u) {
+        const uint32_t vec_width=width>>3;
+        const uint64_t vec_count=uint64_t(rows)*heads*vec_width;
+        for(uint64_t v=uint64_t(blockIdx.x)*256+threadIdx.x;v<vec_count;v+=uint64_t(gridDim.x)*256) {
+            uint64_t xo,uo,yo;
+            if(heads==1 && vec_width==32) {
+                const uint64_t row=v>>5;
+                const uint32_t d=(uint32_t(v)&31u)<<3;
+                xo=row*xs0+d;uo=row*us0+d;yo=row*ys0+d;
+            } else {
+                const uint64_t hw=uint64_t(heads)*vec_width;
+                const uint64_t row=v/hw;
+                const uint32_t rem=uint32_t(v%hw);
+                const uint32_t head=rem/vec_width,d=(rem%vec_width)<<3;
+                xo=row*xs0+head*xs1+d;uo=row*us0+head*us1+d;yo=row*ys0+head*ys1+d;
+            }
+            const uint4 xv=*reinterpret_cast<const uint4*>(x+xo);
+            const uint4 uv=*reinterpret_cast<const uint4*>(up+uo);
+            const __nv_bfloat16* xp=reinterpret_cast<const __nv_bfloat16*>(&xv);
+            const __nv_bfloat16* up_p=reinterpret_cast<const __nv_bfloat16*>(&uv);
+            uint4 yv;
+            __nv_bfloat16* yp=reinterpret_cast<__nv_bfloat16*>(&yv);
+            #pragma unroll
+            for(int j=0;j<8;++j) {
+                const float value=__bfloat162float(xp[j]);
+                const __nv_bfloat16 gate=__float2bfloat16_rn(gelu_tanh_rn(value));
+                yp[j]=__hmul(gate,up_p[j]);
+            }
+            *reinterpret_cast<uint4*>(y+yo)=yv;
+        }
+        return;
+    }
     uint64_t count=uint64_t(rows)*heads*width;
     for(uint64_t i=uint64_t(blockIdx.x)*256+threadIdx.x;i<count;i+=uint64_t(gridDim.x)*256) {
         uint64_t row=i/(uint64_t(heads)*width);uint32_t head=(i/width)%heads,d=i%width;
@@ -655,6 +690,55 @@ extern "C" __global__ __launch_bounds__(256) void rms_scaled_branch_add(
     }
 }
 
+template<uint32_t K>
+__device__ __forceinline__ void rms_branch_add_fixed(
+    __nv_bfloat16* x,const __nv_bfloat16* b,const __nv_bfloat16* wb,const __nv_bfloat16* scalar,
+    const __nv_bfloat16* wn,__nv_bfloat16* n,float eps,float* scratch) {
+    const uint32_t width=K*256;
+    const uint64_t base=uint64_t(blockIdx.x)*width;
+    const __nv_bfloat16 zero=__float2bfloat16_rn(0.0f);
+    const __nv_bfloat16 sc=scalar ? *scalar : zero;
+    float bv[K];
+    float sum=0.0f;
+    #pragma unroll
+    for(uint32_t k=0;k<K;++k) {
+        const uint32_t i=threadIdx.x+k*256;
+        const float v=__bfloat162float(b[base+i]);
+        bv[k]=v;
+        sum=__fadd_rn(sum,__fmul_rn(v,v));
+    }
+    float inv=block_inv(sum,scratch,width,5,eps);
+    if(!wn) {
+        #pragma unroll
+        for(uint32_t k=0;k<K;++k) {
+            const uint32_t i=threadIdx.x+k*256;
+            __nv_bfloat16 r=__hadd(x[base+i],norm_scale<false>(bv[k],inv,wb[i],zero,5));
+            if(scalar) r=__hmul(r,sc);
+            x[base+i]=r;
+        }
+        return;
+    }
+    float xv[K];
+    sum=0.0f;
+    #pragma unroll
+    for(uint32_t k=0;k<K;++k) {
+        const uint32_t i=threadIdx.x+k*256;
+        __nv_bfloat16 r=__hadd(x[base+i],norm_scale<false>(bv[k],inv,wb[i],zero,5));
+        if(scalar) r=__hmul(r,sc);
+        x[base+i]=r;
+        const float v=__bfloat162float(r);
+        xv[k]=v;
+        sum=__fadd_rn(sum,__fmul_rn(v,v));
+    }
+    __syncthreads();
+    inv=block_inv(sum,scratch,width,5,eps);
+    #pragma unroll
+    for(uint32_t k=0;k<K;++k) {
+        const uint32_t i=threadIdx.x+k*256;
+        n[base+i]=norm_scale<false>(xv[k],inv,wn[i],zero,5);
+    }
+}
+
 // x = bf16(bf16(x + bf16(rms(b)*wb)) * scalar) in place, then n = rms(x)*wn; scalar and wn may be null.
 // rms(v)*w: F32 v*rsqrt(mean(v^2)+eps)*w with one BF16 rounding. One block of 256 threads per row.
 extern "C" __global__ __launch_bounds__(256) void rms_branch_add(
@@ -662,6 +746,11 @@ extern "C" __global__ __launch_bounds__(256) void rms_branch_add(
     const __nv_bfloat16* wn,__nv_bfloat16* n,uint32_t width,float eps) {
     if(blockDim.x!=256 || !x || !b || !wb || !width || !(eps>0.0f) || (wn && !n)) {__trap();return;}
     __shared__ float scratch[8];
+    if(width==768) {rms_branch_add_fixed<3>(x,b,wb,scalar,wn,n,eps,scratch);return;}
+    if(width==1536) {rms_branch_add_fixed<6>(x,b,wb,scalar,wn,n,eps,scratch);return;}
+    if(width==2560) {rms_branch_add_fixed<10>(x,b,wb,scalar,wn,n,eps,scratch);return;}
+    if(width==3840) {rms_branch_add_fixed<15>(x,b,wb,scalar,wn,n,eps,scratch);return;}
+    if(width==5376) {rms_branch_add_fixed<21>(x,b,wb,scalar,wn,n,eps,scratch);return;}
     const uint64_t base=uint64_t(blockIdx.x)*width;
     const __nv_bfloat16 zero=__float2bfloat16_rn(0.0f);
     float sum=0.0f;

@@ -2910,9 +2910,14 @@ impl AxialTower {
                     }
                     linear(&block.gate, &request.norm, &request.gate)?;
                     linear(&block.up, &request.norm, &request.up)?;
+                    let count = i32::try_from(u64::from(rows) * u64::from(vision.intermediate))?;
+                    let cfg = crate::backend::cuda::ops::silu_mul_split_grid(
+                        usize::try_from(count)?,
+                        request.gate.device_ptr(stream).0,
+                        request.up.device_ptr(stream).0,
+                        request.activation.device_ptr(stream).0,
+                    )?;
                     unsafe {
-                        let count =
-                            i32::try_from(u64::from(rows) * u64::from(vision.intermediate))?;
                         stream
                             .launch_builder(&self.ops.activation)
                             .arg(&request.gate)
@@ -2920,7 +2925,7 @@ impl AxialTower {
                             .arg(&request.activation)
                             .arg(&count)
                             .arg(&2i32)
-                            .launch(flat(count as usize))?;
+                            .launch(cfg)?;
                     }
                     linear(&block.down, &request.activation, &request.delta)?;
                     let next = self

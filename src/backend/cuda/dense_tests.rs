@@ -1045,6 +1045,12 @@ fn fp8_published_expert_gpu() -> Result<()> {
                         (rows, 512, 2048),
                     )
                 }?;
+                let act_cfg = ops::silu_mul_split_grid(
+                    rows * 512,
+                    g.device_ptr(&s).0,
+                    u.device_ptr(&s).0,
+                    hidden.device_ptr(&s).0,
+                )?;
                 unsafe {
                     s.launch_builder(&act)
                         .arg(&g)
@@ -1052,7 +1058,7 @@ fn fp8_published_expert_gpu() -> Result<()> {
                         .arg(&mut hidden)
                         .arg(&((rows * 512) as i32))
                         .arg(&0i32)
-                        .launch(ops::flat(rows * 512))?;
+                        .launch(act_cfg)?;
                 }
                 s.memcpy_dtod(&hidden.slice(..rows * 512), &mut hidden_before_quantize)?;
                 if bound.is_some() {
