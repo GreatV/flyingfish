@@ -1163,7 +1163,9 @@ impl MappedCheckpoint {
             match layer.mixer {
                 Mixer::FullAttention => {
                     let q_out = match spec.architecture {
-                        Architecture::Flint | Architecture::Qwen3 | Architecture::Qwen3Vl => q_width,
+                        Architecture::Flint | Architecture::Qwen3 | Architecture::Qwen3Vl => {
+                            q_width
+                        }
                         Architecture::Qwen35Text
                         | Architecture::Clover
                         | Architecture::MiniCpmV47
