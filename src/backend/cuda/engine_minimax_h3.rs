@@ -552,6 +552,7 @@ impl BlockWork {
         rank: usize,
         rows: usize,
     ) -> Result<Self> {
+        launch_extents(spec, rows)?;
         let width = spec.heads * spec.head_dim;
         let chunk = ffn_chunk(rows);
         let attention = || s.alloc_zeros::<bf16>(rows * width);
@@ -1159,6 +1160,56 @@ impl Placement {
     }
 }
 
+/// `rows` sequence rows keep every launch of the block path inside its index type: `rotary_prefix_kv` indexes
+/// `rows * 2 * heads * head_dim` elements and `residual` `rows * hidden` elements in i32, the q/k `rms_norm_bf16`
+/// runs `rows * heads` rows in i32, and `vision_upcast_f32` / `vision_bias_f32` take u32 counts of `rows * hidden`.
+fn launch_extents(spec: &H3Spec, rows: usize) -> Result<()> {
+    let limit = i32::MAX as usize;
+    for (kernel, per_row) in [
+        ("rotary_prefix_kv", 2 * spec.heads * spec.head_dim),
+        ("residual", spec.hidden),
+        ("rms_norm_bf16", spec.heads),
+    ] {
+        let extent = rows
+            .checked_mul(per_row)
+            .with_context(|| format!("{kernel} extent of {rows} rows overflows"))?;
+        ensure!(
+            extent <= limit,
+            "{rows} sequence rows give {kernel} {extent} indices, above its i32 limit {limit} (at most {} rows)",
+            limit / per_row
+        );
+    }
+    ensure!(
+        rows * spec.hidden <= u32::MAX as usize,
+        "{rows} sequence rows exceed the u32 counts of vision_upcast_f32 / vision_bias_f32"
+    );
+    Ok(())
+}
+
+/// `vision_affine_cast_bf16` of `count` F32 values at `source` to BF16 at `target`; `count == 0` (the conditioning
+/// rows of a layout with no keyframe anchors, the `t2va` workflow) launches nothing.
+fn cast_rows(
+    s: &Arc<CudaStream>,
+    kernel: &crate::backend::gpu::CudaFunction,
+    source: u64,
+    target: u64,
+    count: usize,
+) -> Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+    unsafe {
+        s.launch_builder(kernel)
+            .arg(&source)
+            .arg(&target)
+            .arg(&(count as u64))
+            .arg(&0f32)
+            .arg(&1f32)
+            .launch(flat(count))?;
+    }
+    Ok(())
+}
+
 /// The transformer over one request layout: F32 patch and output projections, BF16 text embedder, norms, refiner
 /// blocks and LoRA factors resident; the 50 transformer blocks' matrices placed by `DensePlacement` from the sensed
 /// VRAM and host budgets (resident, or two device slots fed from pinned host memory or the disk tier).
@@ -1458,16 +1509,13 @@ impl Dit {
         target: usize,
         count: usize,
     ) -> Result<()> {
-        unsafe {
-            s.launch_builder(&self.round)
-                .arg(&source)
-                .arg(&(pointer(&self.x, s) + 2 * target as u64))
-                .arg(&(count as u64))
-                .arg(&0f32)
-                .arg(&1f32)
-                .launch(flat(count))?;
-        }
-        Ok(())
+        cast_rows(
+            s,
+            &self.round,
+            source,
+            pointer(&self.x, s) + 2 * target as u64,
+            count,
+        )
     }
 
     /// Widens `count` BF16 values starting at element `source` of `normed` into the F32 scratch.
@@ -1737,6 +1785,64 @@ mod tests {
                 "rows={rows} chunk={chunk} tail={tail}"
             );
         }
+    }
+
+    /// The small (40,045) and production (60,431) cell rows fit every launch's index type; the 1024x1792 canvas at
+    /// 345 frames does not, and the rotary limit is named.
+    #[test]
+    fn launch_extents_reject_rows_beyond_the_rotary_index() -> Result<()> {
+        let spec = H3Spec::parse(&serde_json::from_str(include_str!(
+            "../../../tests/data/minimax-h3-transformer-config.json"
+        ))?)?;
+        for rows in [40_045, 60_431, 149_796] {
+            launch_extents(&spec, rows)?;
+        }
+        let tags = vec![crate::minimax_h3::TEXT_TAG; 1327];
+        let geometry = Geometry::resolve(&spec, 1024, 1792, 345)?;
+        let layout = PackedLayout::build(&spec, &geometry, &tags, &[KeyframeAnchor::First])?;
+        let error = launch_extents(&spec, layout.rows())
+            .err()
+            .context("1024x1792 at 345 frames passed the launch extents")?;
+        ensure!(
+            layout.rows() > 149_796
+                && error.to_string().contains("rotary_prefix_kv")
+                && error.to_string().contains("at most 149796 rows"),
+            "rows={} error={error}",
+            layout.rows()
+        );
+        ensure!(
+            launch_extents(&spec, 149_797).is_err(),
+            "149,797 rows passed"
+        );
+        Ok(())
+    }
+
+    /// `cast_rows` with `count == 0` launches nothing (the kernel traps on a zero count); a non-zero count rounds.
+    #[test]
+    #[ignore = "GPU test"]
+    fn cast_rows_skips_an_empty_conditioning_range_gpu() -> Result<()> {
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        let kernel =
+            cubin::module(s.context(), "vision_ops")?.load_function("vision_affine_cast_bf16")?;
+        let values: Vec<f32> = (0..16).map(|i| 1.0 + i as f32 / 3.0).collect();
+        let source = s.clone_htod(&values)?;
+        let target = s.alloc_zeros::<bf16>(16)?;
+        cast_rows(s, &kernel, pointer(&source, s), pointer(&target, s), 0)?;
+        s.synchronize()?;
+        ensure!(
+            s.clone_dtoh(&target)?.iter().all(|v| v.to_bits() == 0),
+            "empty range wrote"
+        );
+        cast_rows(s, &kernel, pointer(&source, s), pointer(&target, s), 16)?;
+        ensure!(
+            s.clone_dtoh(&target)?
+                .iter()
+                .zip(&values)
+                .all(|(got, &v)| got.to_bits() == bf16::from_f32(v).to_bits()),
+            "cast differs from BF16 rounding"
+        );
+        Ok(())
     }
 
     fn decoded(file: &SafeTensors<'_>, name: &str) -> Result<(Vec<f64>, Vec<usize>)> {
