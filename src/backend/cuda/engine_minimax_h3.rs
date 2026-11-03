@@ -2198,14 +2198,16 @@ impl Conditioner {
                 (rows, h, HIDDEN_NORM_THREADS),
             )?;
             linear(layer.gate_up, &self.normed, h, &self.gate_up, 2 * self.ffn)?;
+            let (gate_up, gated) = (pointer(&self.gate_up, s), pointer(&self.gated, s));
+            let cfg = ops::silu_mul_grid(rows, self.ffn, gate_up, gated)?;
             unsafe {
                 s.launch_builder(&kernels.swiglu)
-                    .arg(&pointer(&self.gate_up, s))
-                    .arg(&pointer(&self.gated, s))
+                    .arg(&gate_up)
+                    .arg(&gated)
                     .arg(&rows_i)
                     .arg(&i32::try_from(self.ffn)?)
                     .arg(&0i32)
-                    .launch(flat(rows * self.ffn))?;
+                    .launch(cfg)?;
             }
             linear(layer.down, &self.gated, self.ffn, &self.normed, h)?;
             residual(x, normed, rows * h)?;
