@@ -1942,7 +1942,6 @@ impl LayerNormTower {
         synchronized?;
         let encoded =
             EncodedImages::new(request.prefix.positions, request.features, self.io.clone())?;
-        #[cfg(test)]
         let encoded =
             encoded.with_deepstack(request.deepstack.into_iter().map(|(_, out)| out).collect())?;
         Ok(encoded)
@@ -3153,7 +3152,6 @@ pub(super) struct EncodedImages {
     pub(super) positions: PositionPlan,
     pub(super) features: CudaSlice<bf16>,
     /// Deepstack merger outputs in tap order, each shaped like `features`; empty without deepstack.
-    #[cfg(test)]
     pub(super) deepstack: Vec<CudaSlice<bf16>>,
     io: Arc<VisionIo>,
 }
@@ -3176,13 +3174,11 @@ impl EncodedImages {
         Ok(Self {
             positions,
             features,
-            #[cfg(test)]
             deepstack: Vec::new(),
             io,
         })
     }
     /// Attaches the completed deepstack merger outputs of this request, each shaped like `features`.
-    #[cfg(test)]
     pub(super) fn with_deepstack(mut self, deepstack: Vec<CudaSlice<bf16>>) -> Result<Self> {
         ensure!(
             deepstack.iter().all(|f| f.len() == self.features.len()),

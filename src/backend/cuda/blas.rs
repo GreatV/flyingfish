@@ -1165,7 +1165,6 @@ impl Blas {
 
     /// `y = bf16(y + alpha * x * weight^T)` with BF16 operands and FP32 compute. `weight` is dense
     /// `[output, input]`; `x [rows, input]` and `y [rows, output]` may have row pitches above their widths.
-    #[cfg(test)]
     pub(crate) fn linear_accumulate(
         &self,
         weight: super::contracts::Tensor<bf16, 2>,

@@ -4,6 +4,9 @@ use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 use std::{fs, path::Path};
 
+#[cfg(feature = "cuda")]
+pub use crate::backend::cuda::engine::minimax_h3::generate;
+
 /// Row modality tags; the AdaLN table row of a sequence row is `timestep_index * MODALITIES + tag`.
 pub const VIDEO_TAG: u8 = 0;
 pub const TEXT_TAG: u8 = 1;
@@ -19,8 +22,10 @@ const MAX_SECONDS: f64 = 15.0;
 const AUDIO_LATENTS_PER_SECOND: f64 = 40.0;
 /// Stereo audio rows are packed channel-major, one block per channel.
 const AUDIO_CHANNELS: usize = 2;
-/// Conditioning video rows are pinned at `max(t, KEYFRAME_NOISE_AUG)`.
-const KEYFRAME_NOISE_AUG: f64 = 0.999;
+/// Conditioning video rows are pinned at `max(t, KEYFRAME_NOISE_AUG)`; keyframe anchors are noised to it.
+pub const KEYFRAME_NOISE_AUG: f64 = 0.999;
+/// Qwen3-VL hidden state that conditions the transformer (model definition `text_encoder_layer`).
+pub const TEXT_ENCODER_LAYER: usize = 50;
 /// Latent frame `i` spans `ROPE_FRAME_RESCALE * ROPE_FRAMES_PER_LATENT[i % 5]` rotary time units.
 const ROPE_FRAME_RESCALE: f64 = 5.0 / 3.0;
 const ROPE_FRAMES_PER_LATENT: [f64; 5] = [1.0, 4.0, 4.0, 4.0, 4.0];
@@ -1086,4 +1091,40 @@ pub fn mrope_table(
         table.extend(angles.iter().map(|a| a.sin()));
     }
     Ok(table)
+}
+
+/// One MiniMax-H3 i2va request in the form the native path consumes. Conditioner prompt: token ids, the text tag of
+/// every text row, image grids `[t, h, w]` and Qwen3-VL `pixel_values` rows. Keyframe: u8 pixels `[3, height, width]`
+/// and the posterior noise `[latent_channels, height / 16, width / 16]` of its encode. The request generator's draws,
+/// in the pipeline's order: anchor noise (same shape), video noise `[latent_channels, latent frames, height / 16,
+/// width / 16]` and audio rows `[rows, audio channels]`. Sampling: pixel frames, evaluation count and the video /
+/// audio grid shifts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct H3Request {
+    pub token_ids: Vec<u32>,
+    pub text_tags: Vec<u8>,
+    pub grids: Vec<crate::vision_input::ImageGrid>,
+    pub pixel_values: Vec<f32>,
+    pub keyframe: Vec<u8>,
+    pub height: usize,
+    pub width: usize,
+    pub frames: usize,
+    pub posterior_eps: Vec<f32>,
+    pub anchor_noise: Vec<f32>,
+    pub video_noise: Vec<f32>,
+    pub audio_rows: Vec<f32>,
+    pub evaluations: usize,
+    pub shifts: (f64, f64),
+}
+
+/// Generated media: u8 frames `[frames, height, width, 3]` and stereo PCM `[2, samples]` F32 at `sampling_rate`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct H3Output {
+    pub frames: usize,
+    pub height: usize,
+    pub width: usize,
+    pub video: Vec<u8>,
+    pub samples: usize,
+    pub sampling_rate: usize,
+    pub audio: Vec<f32>,
 }

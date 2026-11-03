@@ -58,6 +58,17 @@ impl Tensors {
             values.iter().flat_map(|v| v.to_le_bytes()).collect(),
         )
     }
+    pub fn u8(&mut self, name: String, shape: Vec<usize>, values: &[u8]) -> Result<()> {
+        self.add(name, Dtype::U8, shape, values.to_vec())
+    }
+    pub fn bf16(&mut self, name: String, shape: Vec<usize>, values: &[half::bf16]) -> Result<()> {
+        self.add(
+            name,
+            Dtype::BF16,
+            shape,
+            values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        )
+    }
     pub fn u64(&mut self, name: String, shape: Vec<usize>, values: &[u64]) -> Result<()> {
         self.add(
             name,

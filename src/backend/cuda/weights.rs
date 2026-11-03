@@ -1457,7 +1457,6 @@ impl DenseStreaming {
 
     /// Pinned host copy of a host-tier layer, its linear projections packed in manifest-name order; `None` for
     /// resident and disk-tier layers. Callers outside the loader fill it before the first `begin`.
-    #[cfg(test)]
     pub(crate) fn host_layer(&mut self, layer: usize) -> Result<Option<&mut [u8]>> {
         let binding = self
             .layers
