@@ -5426,6 +5426,7 @@ impl DinoV3Encoder {
 
 struct NafConv {
     weight: BiasedWeight<f32>,
+    linear: CudaFunction,
     kernel: u32,
     input_channels: u32,
 }
@@ -5438,7 +5439,6 @@ struct NafGuideBranch {
 struct NafEncoder {
     branches: [NafGuideBranch; 2],
     im2col: CudaFunction,
-    ordered_linear: CudaFunction,
     group_norm: CudaFunction,
     pool: CudaFunction,
     rope: CudaFunction,
@@ -5495,6 +5495,11 @@ impl NafEncoder {
                 )?;
                 let bias = read(&format!("{prefix}.bias"), &[128])?;
                 Ok(NafConv {
+                    linear: module.load_function(if kernel == 3 && channels == 128 {
+                        "linear_compensated_f32"
+                    } else {
+                        "linear_ordered_f32"
+                    })?,
                     weight: BiasedWeight {
                         weight: s.clone_htod(&weight)?,
                         bias: s.clone_htod(&bias)?,
@@ -5540,7 +5545,6 @@ impl NafEncoder {
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("NAF guide branch count"))?,
             im2col: module.load_function("causal_frame_im2col_f32")?,
-            ordered_linear: module.load_function("linear_ordered_f32")?,
             group_norm: module.load_function("group_norm_silu_f32")?,
             pool: module.load_function("adaptive_avg_pool2d_f32")?,
             rope: module.load_function("rotary_spatial_f32")?,
@@ -5653,7 +5657,7 @@ impl NafEncoder {
             };
             let target = dense_at(output, s, [rows, 128], first as usize * 128)?;
             unsafe {
-                s.launch_builder(&self.ordered_linear)
+                s.launch_builder(&conv.linear)
                     .arg(&source.ptr)
                     .arg(&conv.weight.weight)
                     .arg(&conv.weight.bias)
