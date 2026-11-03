@@ -160,8 +160,9 @@ extern "C" __global__ void vision_spatial_mean_scale_bf16(
 
 // NaViT pack `[channels, side, rows*side]` (order c, ky, patch, kx) -> per-patch rows
 // `[rows, channels*side*side]` in (c, ky, kx) order, rounding each value to BF16.
-extern "C" __global__ void vision_patch_rows(
-    const float* input, __nv_bfloat16* output,
+template<typename T>
+__device__ __forceinline__ void patch_rows(
+    const float* input, T* output,
     uint32_t rows, uint32_t channels, uint32_t side) {
     if (!vision_flat_launch() || !input || !output || !rows || !channels || !side) { __trap(); return; }
     uint32_t width = channels * side * side;
@@ -172,10 +173,19 @@ extern "C" __global__ void vision_patch_rows(
         uint32_t c = j / (side * side), r = j % (side * side), ky = r / side, kx = r % side;
         uint64_t src = (uint64_t(c * side + ky)) * rows * side + uint64_t(patch) * side + kx;
         float x = input[src];
-        __nv_bfloat16 y = __float2bfloat16_rn(x);
-        if (!isfinite(x) || !isfinite(__bfloat162float(y))) { __trap(); return; }
+        T y = T(x);
+        if (!isfinite(x) || !isfinite(float(y))) { __trap(); return; }
         output[i] = y;
     }
+}
+
+extern "C" __global__ void vision_patch_rows(const float* input, __nv_bfloat16* output,
+    uint32_t rows, uint32_t channels, uint32_t side) {
+    patch_rows(input, output, rows, channels, side);
+}
+extern "C" __global__ void vision_patch_rows_f32(const float* input, float* output,
+    uint32_t rows, uint32_t channels, uint32_t side) {
+    patch_rows(input, output, rows, channels, side);
 }
 
 // Three token-major `[rows, hq*d]` projections -> head-major Q, padded head-major K and V.
@@ -259,11 +269,11 @@ extern "C" __global__ void vision_bias_f32(
 
 extern "C" __global__ void vision_bias_gelu_f32(
     const float* input, const float* bias, float* output, uint32_t rows, uint32_t width) {
-    if (!vision_flat_launch() || !input || !bias || !output || !rows || !width) { __trap(); return; }
+    if (!vision_flat_launch() || !input || !output || !rows || !width) { __trap(); return; }
     uint32_t count = rows * width;
     const float scale = 0.70710678118654752440f;
     for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < count; i += gridDim.x * 256) {
-        float x = __fadd_rn(input[i], bias[i % width]);
+        float x = bias ? __fadd_rn(input[i], bias[i % width]) : input[i];
         output[i] = __fmul_rn(0.5f * x, __fadd_rn(1.0f, erff(__fmul_rn(x, scale))));
     }
 }
@@ -574,13 +584,20 @@ extern "C" __global__ __launch_bounds__(1024) void group_norm_silu_f32(
         return out;
     };
     const auto at = [&](uint64_t e) { return (e / width) * channels + first + e % width; };
-    float sum = 0.0f;
-    for (uint64_t e = threadIdx.x; e < count; e += 1024) sum = __fadd_rn(sum, x[at(e)]);
+    const auto add = [](float v, float& sum, float& correction) {
+        const float adjusted = __fsub_rn(v, correction);
+        const float next = __fadd_rn(sum, adjusted);
+        correction = __fsub_rn(__fsub_rn(next, sum), adjusted);
+        sum = next;
+    };
+    float sum = 0.0f, correction = 0.0f;
+    for (uint64_t e = threadIdx.x; e < count; e += 1024) add(x[at(e)], sum, correction);
     const float mean = __fdiv_rn(reduce(sum), float(count));
     float squares = 0.0f;
+    correction = 0.0f;
     for (uint64_t e = threadIdx.x; e < count; e += 1024) {
         const float d = __fsub_rn(x[at(e)], mean);
-        squares = __fmaf_rn(d, d, squares);
+        add(__fmul_rn(d, d), squares, correction);
     }
     const float rstd = __frcp_rn(__fsqrt_rn(__fadd_rn(__fdiv_rn(reduce(squares), float(count)), eps)));
     for (uint64_t e = threadIdx.x; e < count; e += 1024) {
@@ -718,5 +735,181 @@ extern "C" __global__ void diagonal_gaussian_patch_bn_f32(
         const __nv_bfloat16 z_norm = __float2bfloat16_rn(
             __fdiv_rn(__bfloat162float(z_centered), __bfloat162float(bn_std)));
         output[i] = __bfloat162float(z_norm);
+    }
+}
+
+// NHWC adaptive average pooling into a channel span of NHWC output.
+extern "C" __global__ void adaptive_avg_pool2d_f32(
+    const float* input, float* output, uint32_t ih, uint32_t iw, uint32_t oh, uint32_t ow,
+    uint32_t channels, uint32_t output_channels, uint32_t offset) {
+    if (!vision_flat_launch() || !input || !output || !ih || !iw || !oh || !ow ||
+        !channels || channels > output_channels || offset > output_channels - channels) { __trap(); return; }
+    const uint64_t count = uint64_t(oh) * ow * channels;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count; i += uint64_t(gridDim.x) * 256) {
+        const uint32_t c = i % channels, x = (i / channels) % ow, y = i / (uint64_t(channels) * ow);
+        const uint32_t y0 = uint64_t(y) * ih / oh, y1 = (uint64_t(y + 1) * ih + oh - 1) / oh;
+        const uint32_t x0 = uint64_t(x) * iw / ow, x1 = (uint64_t(x + 1) * iw + ow - 1) / ow;
+        float sum = 0.0f;
+        for (uint32_t yy = y0; yy < y1; ++yy)
+            for (uint32_t xx = x0; xx < x1; ++xx)
+                sum = __fadd_rn(sum, input[(uint64_t(yy) * iw + xx) * channels + c]);
+        output[(uint64_t(y) * ow + x) * output_channels + offset + c] = __fdiv_rn(sum, float((y1-y0)*(x1-x0)));
+    }
+}
+
+// Axial split-half RoPE on NHWC, with a [height * width, head_dim] cos/sin table.
+extern "C" __global__ void rotary_spatial_f32(float* x, const float* table,
+    uint32_t pixels, uint32_t heads, uint32_t dim) {
+    if (!vision_flat_launch() || !x || !table || !pixels || !heads || !dim || dim % 4) { __trap(); return; }
+    const uint32_t half = dim / 2;
+    const uint64_t count = uint64_t(pixels) * heads * half;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count; i += uint64_t(gridDim.x) * 256) {
+        const uint32_t d = i % half;
+        const uint64_t row = i / half, pixel = row / heads;
+        const float c = table[pixel * dim + d], s = table[pixel * dim + half + d];
+        const float a = x[row * dim + d], b = x[row * dim + half + d];
+        x[row * dim + d] = __fsub_rn(__fmul_rn(a,c), __fmul_rn(b,s));
+        x[row * dim + half + d] = __fadd_rn(__fmul_rn(b,c), __fmul_rn(a,s));
+    }
+}
+
+// Q [H,W,heads,64], pooled K [h,w,heads,64], V [h,w,heads,256], output [H,W,heads,256].
+// Integer nearest-exact expansion and dilated shifted 9x9 windows share source indices.
+extern "C" __global__ __launch_bounds__(128) void neighborhood_attention_2d_f32(
+    const float* q, const float* k, const float* v, float* output,
+    uint32_t height, uint32_t width, uint32_t source_h, uint32_t source_w, uint32_t heads,
+    uint32_t dilation_h, uint32_t dilation_w) {
+    if (blockDim.x != 128 || blockDim.y != 1 || gridDim.y != 1 || !q || !k || !v || !output ||
+        !heads || source_h < 9 || source_w < 9 || height % source_h || width % source_w ||
+        !dilation_h || !dilation_w || height % dilation_h || width % dilation_w ||
+        height/dilation_h < 9 || width/dilation_w < 9) { __trap(); return; }
+    __shared__ float scores[4][81];
+    const uint32_t lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const uint64_t query = uint64_t(blockIdx.x) * 4 + warp;
+    if (query >= uint64_t(height) * width * heads) return;
+    const uint32_t head = query % heads, y = query / (uint64_t(heads) * width), x = (query / heads) % width;
+    const int top = max(0, min(int(y / dilation_h)-4, int(height/dilation_h)-9));
+    const int left = max(0, min(int(x / dilation_w)-4, int(width/dilation_w)-9));
+    const float qa = q[query * 64 + lane], qb = q[query * 64 + 32 + lane];
+    float maximum = -INFINITY;
+    for (uint32_t tap = 0; tap < 81; ++tap) {
+        const uint32_t sy = ((top + tap/9)*dilation_h + y%dilation_h)/(height/source_h);
+        const uint32_t sx = ((left + tap%9)*dilation_w + x%dilation_w)/(width/source_w);
+        const uint64_t source = (uint64_t(sy)*source_w + sx)*heads + head;
+        float score = __fadd_rn(__fmul_rn(qa, k[source*64+lane]), __fmul_rn(qb, k[source*64+32+lane]));
+        for (uint32_t shift = 16; shift; shift /= 2) score = __fadd_rn(score, __shfl_xor_sync(FF_WARP_MASK, score, shift));
+        score = __fmul_rn(score, 0.125f);
+        if (lane == 0) scores[warp][tap] = score;
+        maximum = fmaxf(maximum, score);
+    }
+    __syncwarp();
+    float sum = 0.0f;
+    for (uint32_t tap = lane; tap < 81; tap += 32) {
+        const float weight = expf(__fsub_rn(scores[warp][tap], maximum));
+        scores[warp][tap] = weight;
+        sum = __fadd_rn(sum, weight);
+    }
+    for (uint32_t shift = 16; shift; shift /= 2) sum = __fadd_rn(sum, __shfl_xor_sync(FF_WARP_MASK, sum, shift));
+    if (!(sum > 0.0f) || !isfinite(sum)) { __trap(); return; }
+    __syncwarp();
+    float accum[8] = {};
+    for (uint32_t tap = 0; tap < 81; ++tap) {
+        const uint32_t sy = ((top + tap/9)*dilation_h + y%dilation_h)/(height/source_h);
+        const uint32_t sx = ((left + tap%9)*dilation_w + x%dilation_w)/(width/source_w);
+        const uint64_t source = (uint64_t(sy)*source_w + sx)*heads + head;
+        const float weight = __fdiv_rn(scores[warp][tap],sum);
+        #pragma unroll
+        for (uint32_t j = 0; j < 8; ++j) accum[j] = __fmaf_rn(weight,v[source*256+j*32+lane],accum[j]);
+    }
+    #pragma unroll
+    for (uint32_t j = 0; j < 8; ++j) output[query*256+j*32+lane] = accum[j];
+}
+
+// Inclusive XYZ grid, row-major camera inverse [3,4], border bilinear align_corners=false.
+// Camera parameters [12 matrix values, tan(angle/2), mesh_scale, image_resolution].
+extern "C" __global__ void project_bilinear_f32(const float* input, float* output, const float* camera,
+    uint32_t grid_side, uint32_t height, uint32_t width, uint32_t channels,
+    uint32_t output_channels, uint32_t offset, uint64_t first, uint32_t rows,
+    uint32_t add, float divisor) {
+    if (!vision_flat_launch() || !input || !output || !camera || grid_side < 2 || !height || !width ||
+        !channels || channels > output_channels || offset > output_channels-channels || add > 1 ||
+        !(divisor > 0.0f)) { __trap(); return; }
+    const uint64_t count = uint64_t(rows)*channels;
+    for (uint64_t i = uint64_t(blockIdx.x)*256+threadIdx.x; i < count; i += uint64_t(gridDim.x)*256) {
+        const uint64_t row = first + i/channels;
+        const uint32_t c = i%channels, ix = row/(uint64_t(grid_side)*grid_side), iy = (row/grid_side)%grid_side, iz=row%grid_side;
+        const auto coord = [&](uint32_t j) {
+            const float step = __fdiv_rn(2.0f,float(grid_side-1));
+            const float v = j < grid_side/2 ? __fmaf_rn(float(j),step,-1.0f) : __fmaf_rn(-float(grid_side-1-j),step,1.0f);
+            return __fdiv_rn(__fdiv_rn(v,camera[13]),2.0f);
+        };
+        const float a=coord(ix), b=-coord(iz), d=coord(iy);
+        const auto transform = [&](uint32_t r) {
+            return __fadd_rn(__fadd_rn(__fadd_rn(__fmul_rn(a,camera[r*4]),__fmul_rn(b,camera[r*4+1])),__fmul_rn(d,camera[r*4+2])),camera[r*4+3]);
+        };
+        const float xx=transform(0), yy=transform(1), zz=transform(2);
+        const float resolution=camera[14];
+        const float focal=__fdiv_rn(__fmul_rn(__fdiv_rn(16.0f,camera[12]),resolution),32.0f);
+        const float denom=__fadd_rn(-zz,1.0e-8f);
+        const auto pixel = [&](float camera_coord, uint32_t size) {
+            const float projected=__fadd_rn(__fdiv_rn(__fmul_rn(focal,camera_coord),denom),resolution/2.0f);
+            const float normalized=__fsub_rn(__fmul_rn(__fdiv_rn(__fadd_rn(projected,0.5f),resolution),2.0f),1.0f);
+            return fminf(fmaxf(__fdiv_rn(__fsub_rn(__fmul_rn(__fadd_rn(normalized,1.0f),float(size)),1.0f),2.0f),0.0f),float(size-1));
+        };
+        const float px=pixel(xx,width), py=pixel(-yy,height);
+        const uint32_t x0=uint32_t(px), y0=uint32_t(py), x1=min(x0+1,width-1), y1=min(y0+1,height-1);
+        const float dx=px-float(x0), dy=py-float(y0);
+        float val=__fmul_rn(input[(uint64_t(y0)*width+x0)*channels+c],__fmul_rn(1.0f-dx,1.0f-dy));
+        val=__fadd_rn(val,__fmul_rn(input[(uint64_t(y0)*width+x1)*channels+c],__fmul_rn(dx,1.0f-dy)));
+        val=__fadd_rn(val,__fmul_rn(input[(uint64_t(y1)*width+x0)*channels+c],__fmul_rn(1.0f-dx,dy)));
+        val=__fadd_rn(val,__fmul_rn(input[(uint64_t(y1)*width+x1)*channels+c],__fmul_rn(dx,dy)));
+        const uint64_t out=row*output_channels+offset+c;
+        output[out]=__fdiv_rn(add ? __fadd_rn(output[out],val) : val,divisor);
+    }
+}
+
+// Ordered F32 sum with division on the last view.
+extern "C" __global__ void accumulate_mean_f32(const float* input, float* output,
+    uint64_t count, uint32_t add, float divisor) {
+    if (!vision_flat_launch() || !input || !output || add > 1 || !(divisor > 0.0f)) { __trap(); return; }
+    for (uint64_t i = uint64_t(blockIdx.x)*256+threadIdx.x; i<count; i+=uint64_t(gridDim.x)*256)
+        output[i]=__fdiv_rn(add ? __fadd_rn(output[i],input[i]) : input[i],divisor);
+}
+
+// Row-major [rows, inner] times transposed [cols, inner], ascending F32 FMA then bias.
+extern "C" __global__ __launch_bounds__(256) void linear_ordered_f32(
+    const float* x, const float* weight, const float* bias, float* y,
+    uint32_t rows, uint32_t cols, uint32_t inner) {
+    if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 || gridDim.z != 1 ||
+        !x || !weight || !y || !rows || !cols || !inner) { __trap(); return; }
+    __shared__ float a[16][33];
+    __shared__ float b[32][65];
+    const uint32_t row0 = blockIdx.y * 16, col0 = blockIdx.x * 64;
+    const uint32_t lane = threadIdx.x % 64, group = threadIdx.x / 64;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint32_t first = 0; first < inner; first += 32) {
+        for (uint32_t j = threadIdx.x; j < 16 * 32; j += 256) {
+            const uint32_t r = j / 32, k = j % 32;
+            a[r][k] = row0 + r < rows && first + k < inner ? x[uint64_t(row0 + r) * inner + first + k] : 0.0f;
+        }
+        for (uint32_t j = threadIdx.x; j < 64 * 32; j += 256) {
+            const uint32_t c = j / 32, k = j % 32;
+            b[k][c] = col0 + c < cols && first + k < inner ? weight[uint64_t(col0 + c) * inner + first + k] : 0.0f;
+        }
+        __syncthreads();
+        const uint32_t count = min(32u, inner - first);
+        for (uint32_t k = 0; k < count; ++k) {
+            const float w = b[k][lane];
+            #pragma unroll
+            for (uint32_t r = 0; r < 4; ++r) acc[r] = __fmaf_rn(a[group + r * 4][k], w, acc[r]);
+        }
+        __syncthreads();
+    }
+    if (col0 + lane < cols) {
+        #pragma unroll
+        for (uint32_t r = 0; r < 4; ++r) {
+            const uint32_t row = row0 + group + r * 4;
+            if (row < rows) y[uint64_t(row) * cols + col0 + lane] = bias ? __fadd_rn(acc[r], bias[col0 + lane]) : acc[r];
+        }
     }
 }

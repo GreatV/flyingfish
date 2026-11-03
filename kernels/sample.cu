@@ -771,14 +771,17 @@ extern "C" __global__ void argmax_rows_f32(
   }
 }
 
-// Row softmax in FP32 with a parallel BF16 copy: probs = exp(x-max)/sum.
+// Row softmax in FP32 with an optional BF16 copy: probs = exp(x-max)/sum.
 extern "C" __global__ void softmax_rows_dual(const float* __restrict__ x,
     float* __restrict__ probs, __nv_bfloat16* __restrict__ probs_bf16, int rows,
     long long vocab) {
     const int r = blockIdx.x;
     if (r >= rows) return;
     const long long offset = (long long)r * vocab;
-    softmax_row_f32<false, true>(x + offset, probs + offset, probs_bf16 + offset, vocab);
+    if (probs_bf16)
+        softmax_row_f32<false, true>(x + offset, probs + offset, probs_bf16 + offset, vocab);
+    else
+        softmax_row_f32<false, false>(x + offset, probs + offset, nullptr, vocab);
 }
 
 // state = [committed response length, returned rows, stopped, pending rows].

@@ -722,9 +722,9 @@ fn take(catalog: &mut WeightCatalog, name: &str, shape: &[usize]) -> Result<Cuda
     }
 }
 
-struct AffineWeights {
-    weight: CudaSlice<bf16>,
-    bias: CudaSlice<bf16>,
+struct AffineWeights<T = bf16> {
+    weight: CudaSlice<T>,
+    bias: CudaSlice<T>,
 }
 impl AffineWeights {
     fn take(catalog: &mut WeightCatalog, name: &str, width: u32) -> Result<Self> {
@@ -735,9 +735,10 @@ impl AffineWeights {
     }
 }
 
-struct BiasedWeight {
-    weight: CudaSlice<bf16>,
-    bias: CudaSlice<bf16>,
+struct BiasedWeight<T = bf16> {
+    weight: CudaSlice<T>,
+    bias: CudaSlice<T>,
+    f32_bias: Option<CudaFunction>,
     shape: [u32; 2],
     bias_mode: LinearBiasMode,
 }
@@ -754,6 +755,7 @@ impl BiasedWeight {
             bias: take(catalog, &format!("{name}.bias"), &[shape[0] as usize])?,
             shape,
             bias_mode,
+            f32_bias: None,
         })
     }
     fn patch(
@@ -770,12 +772,17 @@ impl BiasedWeight {
             LinearBiasMode::AfterOutputRound,
         )
     }
+}
+impl<T: DinoScalar> BiasedWeight<T> {
     fn prepare(&self, stream: &Arc<CudaStream>, blas: &mut Blas, rows: u32) -> Result<()> {
+        if T::F32 {
+            return Ok(());
+        }
         blas.prepare_biased(
             rows,
             self.shape[0],
             self.shape[1],
-            dense(&self.bias, stream, [self.shape[0]])?,
+            dino_tensor_cast(dense(&self.bias, stream, [self.shape[0]])?)?,
             self.bias_mode,
         )
     }
@@ -783,14 +790,39 @@ impl BiasedWeight {
         &self,
         stream: &Arc<CudaStream>,
         blas: &Blas,
-        input: Tensor<bf16, 2>,
-        output: &mut TensorMut<bf16, 2>,
+        input: Tensor<T, 2>,
+        output: &mut TensorMut<T, 2>,
     ) -> Result<()> {
+        if T::F32 {
+            blas.linear_f32(
+                dino_tensor_cast(dense(&self.weight, stream, self.shape)?)?,
+                dino_tensor_cast(input)?,
+                &mut TensorMut(dino_tensor_cast(output.0)?),
+            )?;
+            let rows = input.shape[0];
+            let width = self.shape[0];
+            unsafe {
+                stream
+                    .launch_builder(self.f32_bias.as_ref().context("F32 bias binding missing")?)
+                    .arg(&output.0.ptr)
+                    .arg(&self.bias)
+                    .arg(&output.0.ptr)
+                    .arg(&rows)
+                    .arg(&width)
+                    .launch(grid(
+                        (u64::from(rows) * u64::from(width))
+                            .div_ceil(256)
+                            .min(65535) as usize,
+                        256,
+                    ))?;
+            }
+            return Ok(());
+        }
         blas.linear_biased(
-            dense(&self.weight, stream, self.shape)?,
-            dense(&self.bias, stream, [self.shape[0]])?,
-            input,
-            output,
+            dino_tensor_cast(dense(&self.weight, stream, self.shape)?)?,
+            dino_tensor_cast(dense(&self.bias, stream, [self.shape[0]])?)?,
+            dino_tensor_cast(input)?,
+            &mut TensorMut(dino_tensor_cast(output.0)?),
             self.bias_mode,
         )
     }
@@ -3251,8 +3283,8 @@ impl DinoV3Config {
         let cfg: Self = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
         ensure!(
             cfg.model_type == "dinov3_vit"
-                && cfg.hidden_act == "silu"
-                && cfg.use_gated_mlp
+                && ((cfg.hidden_act == "silu" && cfg.use_gated_mlp)
+                    || (cfg.hidden_act == "gelu" && !cfg.use_gated_mlp))
                 && cfg.query_bias
                 && !cfg.key_bias
                 && cfg.value_bias
@@ -3305,7 +3337,14 @@ impl DinoV3Config {
         let patch_dim = self.patch_dim() as usize;
         let prefix = self.prefix_rows() * h;
         let patch_embed = h * patch_dim + h;
-        let per_layer = 2 * (2 * h) + 4 * (h * h) + 3 * h + 2 * h + 3 * (inter * h) + 2 * inter + h;
+        let mlp_projections = if self.use_gated_mlp { 3 } else { 2 };
+        let per_layer = 2 * (2 * h)
+            + 4 * (h * h)
+            + 3 * h
+            + 2 * h
+            + mlp_projections * (inter * h)
+            + (mlp_projections - 1) * inter
+            + h;
         let final_norm = 2 * h;
         prefix + patch_embed + self.num_hidden_layers * per_layer + final_norm
     }
@@ -3474,6 +3513,14 @@ impl<'a> SafetensorsLoader<'a> {
         name: &str,
         expected_shape: &[usize],
     ) -> Result<CudaSlice<bf16>> {
+        self.take_scalar(s, name, expected_shape)
+    }
+    fn take_scalar<T: DinoScalar>(
+        &mut self,
+        s: &Arc<CudaStream>,
+        name: &str,
+        expected_shape: &[usize],
+    ) -> Result<CudaSlice<T>> {
         ensure!(
             self.remaining.remove(name),
             "tensor {name} missing or loaded twice"
@@ -3484,20 +3531,20 @@ impl<'a> SafetensorsLoader<'a> {
             "tensor {name} shape {:?} != expected {expected_shape:?}",
             view.shape()
         );
-        let host: Vec<bf16> = match view.dtype() {
+        let host: Vec<T> = match view.dtype() {
             safetensors::Dtype::BF16 => view
                 .data()
                 .as_chunks::<2>()
                 .0
                 .iter()
-                .map(|b| bf16::from_le_bytes(*b))
+                .map(|b| T::from_float(bf16::from_le_bytes(*b).to_f32()))
                 .collect(),
             safetensors::Dtype::F32 => view
                 .data()
                 .as_chunks::<4>()
                 .0
                 .iter()
-                .map(|b| bf16::from_f32(f32::from_le_bytes(*b)))
+                .map(|b| T::from_float(f32::from_le_bytes(*b)))
                 .collect(),
             dt => bail!("unsupported dtype {dt:?} for {name}"),
         };
@@ -3520,12 +3567,12 @@ impl<'a> SafetensorsLoader<'a> {
     }
 }
 
-struct UnbiasedWeight {
-    weight: CudaSlice<bf16>,
+struct UnbiasedWeight<T = bf16> {
+    weight: CudaSlice<T>,
     shape: [u32; 2],
 }
 
-impl UnbiasedWeight {
+impl<T: DinoScalar> UnbiasedWeight<T> {
     fn load(
         loader: &mut SafetensorsLoader<'_>,
         s: &Arc<CudaStream>,
@@ -3533,7 +3580,7 @@ impl UnbiasedWeight {
         shape: [u32; 2],
     ) -> Result<Self> {
         Ok(Self {
-            weight: loader.take_bf16(
+            weight: loader.take_scalar(
                 s,
                 &format!("{name}.weight"),
                 &[shape[0] as usize, shape[1] as usize],
@@ -3543,6 +3590,9 @@ impl UnbiasedWeight {
     }
 
     fn prepare(&self, blas: &Blas, rows: u32) -> Result<()> {
+        if T::F32 {
+            return Ok(());
+        }
         blas.prepare_request_fixed(rows, self.shape[0], self.shape[1])
     }
 
@@ -3550,86 +3600,101 @@ impl UnbiasedWeight {
         &self,
         s: &Arc<CudaStream>,
         blas: &Blas,
-        input: Tensor<bf16, 2>,
-        output: &mut TensorMut<bf16, 2>,
+        input: Tensor<T, 2>,
+        output: &mut TensorMut<T, 2>,
     ) -> Result<()> {
+        if T::F32 {
+            return blas.linear_f32(
+                dino_tensor_cast(dense(&self.weight, s, self.shape)?)?,
+                dino_tensor_cast(input)?,
+                &mut TensorMut(dino_tensor_cast(output.0)?),
+            );
+        }
         blas.linear_typed(
             crate::op_contract::ExecutionPhase::Prefill,
-            LinearWeightRef::Bf16(dense(&self.weight, s, self.shape)?),
-            input,
-            output,
+            LinearWeightRef::Bf16(dino_tensor_cast(dense(&self.weight, s, self.shape)?)?),
+            dino_tensor_cast(input)?,
+            &mut TensorMut(dino_tensor_cast(output.0)?),
         )
     }
 }
 
-fn load_biased_weight(
+fn load_biased_weight<T: DinoScalar>(
     loader: &mut SafetensorsLoader<'_>,
     s: &Arc<CudaStream>,
     name: &str,
     shape: [u32; 2],
     stored_shape: &[usize],
     bias_mode: LinearBiasMode,
-) -> Result<BiasedWeight> {
+) -> Result<BiasedWeight<T>> {
     Ok(BiasedWeight {
-        weight: loader.take_bf16(s, &format!("{name}.weight"), stored_shape)?,
-        bias: loader.take_bf16(s, &format!("{name}.bias"), &[shape[0] as usize])?,
+        weight: loader.take_scalar(s, &format!("{name}.weight"), stored_shape)?,
+        bias: loader.take_scalar(s, &format!("{name}.bias"), &[shape[0] as usize])?,
         shape,
         bias_mode,
+        f32_bias: if T::F32 {
+            Some(cubin::module(s.context(), "vision_ops")?.load_function("vision_bias_f32")?)
+        } else {
+            None
+        },
     })
 }
 
-fn load_affine_weights(
+fn load_affine_weights<T: DinoScalar>(
     loader: &mut SafetensorsLoader<'_>,
     s: &Arc<CudaStream>,
     name: &str,
     width: u32,
-) -> Result<AffineWeights> {
+) -> Result<AffineWeights<T>> {
     Ok(AffineWeights {
-        weight: loader.take_bf16(s, &format!("{name}.weight"), &[width as usize])?,
-        bias: loader.take_bf16(s, &format!("{name}.bias"), &[width as usize])?,
+        weight: loader.take_scalar(s, &format!("{name}.weight"), &[width as usize])?,
+        bias: loader.take_scalar(s, &format!("{name}.bias"), &[width as usize])?,
     })
 }
 
-struct DinoV3Layer {
-    norm1: AffineWeights,
-    q: BiasedWeight,
-    k: UnbiasedWeight,
-    v: BiasedWeight,
-    o: BiasedWeight,
-    scale1: CudaSlice<bf16>,
-    norm2: AffineWeights,
-    gate: BiasedWeight,
-    up: BiasedWeight,
-    down: BiasedWeight,
-    scale2: CudaSlice<bf16>,
+struct DinoV3Layer<T: DinoScalar> {
+    norm1: AffineWeights<T>,
+    q: BiasedWeight<T>,
+    k: UnbiasedWeight<T>,
+    v: BiasedWeight<T>,
+    o: BiasedWeight<T>,
+    scale1: CudaSlice<T>,
+    norm2: AffineWeights<T>,
+    gate: Option<BiasedWeight<T>>,
+    up: BiasedWeight<T>,
+    down: BiasedWeight<T>,
+    scale2: CudaSlice<T>,
 }
 
-pub struct DinoV3Workspace {
+struct DinoWorkspace<T: DinoScalar> {
     pixel_packed: CudaSlice<f32>,
-    patches: CudaSlice<bf16>,
-    x_a: CudaSlice<bf16>,
-    x_b: CudaSlice<bf16>,
-    x_c: CudaSlice<bf16>,
-    k_cache: CudaSlice<bf16>,
-    v_cache: CudaSlice<bf16>,
-    mlp_a: CudaSlice<bf16>,
-    mlp_b: CudaSlice<bf16>,
-    mlp_c: CudaSlice<bf16>,
-    rope_table: CudaSlice<bf16>,
+    patches: CudaSlice<T>,
+    x_a: CudaSlice<T>,
+    x_b: CudaSlice<T>,
+    x_c: CudaSlice<T>,
+    k_cache: CudaSlice<T>,
+    v_cache: CudaSlice<T>,
+    mlp_a: CudaSlice<T>,
+    mlp_b: CudaSlice<T>,
+    mlp_c: CudaSlice<T>,
+    rope_table: CudaSlice<T>,
     feature1: CudaSlice<f32>,
-    flash_d64: Flash,
+    flash_d64: T::Attention,
 }
 
-pub struct DinoV3Encoder {
+struct DinoEncoder<T: DinoScalar> {
     cfg: DinoV3Config,
     image_side: u32,
-    prefix_tokens: CudaSlice<bf16>,
-    patch_embed: BiasedWeight,
-    layers: Vec<DinoV3Layer>,
-    final_norm: AffineWeights,
+    prefix_tokens: CudaSlice<T>,
+    patch_embed: BiasedWeight<T>,
+    ordered_linear: CudaFunction,
+    layers: Vec<DinoV3Layer<T>>,
+    final_norm: AffineWeights<T>,
     common: CommonOpsRef,
-    ops: crate::backend::cuda::ops::Ops,
-    io: VisionIo,
+    rotary_prefix: CudaFunction,
+    patch_rows: CudaFunction,
+    gelu: CudaFunction,
+    final_affine: bool,
     channel_scale_residual: CudaFunction,
     layer_norm_f32: CudaFunction,
     upcast_f32: CudaFunction,
@@ -3642,7 +3707,7 @@ pub struct DinoV3Output {
     pub feature1: Vec<f32>,
 }
 
-impl DinoV3Encoder {
+impl<T: DinoScalar> DinoEncoder<T> {
     pub fn load(
         device: &Device,
         blas: &mut Blas,
@@ -3650,7 +3715,12 @@ impl DinoV3Encoder {
         cfg: DinoV3Config,
         image_side: u32,
         safetensors_bytes: &[u8],
-    ) -> Result<(Self, DinoV3Workspace)> {
+        final_affine: bool,
+    ) -> Result<(Self, DinoWorkspace<T>)> {
+        ensure!(
+            T::F32 != cfg.use_gated_mlp,
+            "DINO scalar/MLP contract requires F32 GELU or BF16 gated SiLU"
+        );
         let s = &device.stream;
         let h = cfg.hidden_size;
         let hu = h as usize;
@@ -3667,8 +3737,8 @@ impl DinoV3Encoder {
         let patches_side = image_side / patch;
 
         let mut loader = SafetensorsLoader::new(safetensors_bytes)?;
-        let cls = loader.take_bf16(s, "embeddings.cls_token", &[1, 1, hu])?;
-        let reg = loader.take_bf16(
+        let cls = loader.take_scalar::<T>(s, "embeddings.cls_token", &[1, 1, hu])?;
+        let reg = loader.take_scalar::<T>(
             s,
             "embeddings.register_tokens",
             &[1, cfg.num_register_tokens, hu],
@@ -3715,16 +3785,20 @@ impl DinoV3Encoder {
                 &[hu, hu],
                 LinearBiasMode::BeforeOutputRound,
             )?;
-            let scale1 = loader.take_bf16(s, &format!("{p}.layer_scale1.lambda1"), &[hu])?;
+            let scale1 = loader.take_scalar::<T>(s, &format!("{p}.layer_scale1.lambda1"), &[hu])?;
             let norm2 = load_affine_weights(&mut loader, s, &format!("{p}.norm2"), h)?;
-            let gate = load_biased_weight(
-                &mut loader,
-                s,
-                &format!("{p}.mlp.gate_proj"),
-                [inter, h],
-                &[inter_u, hu],
-                LinearBiasMode::BeforeOutputRound,
-            )?;
+            let gate = if cfg.use_gated_mlp {
+                Some(load_biased_weight(
+                    &mut loader,
+                    s,
+                    &format!("{p}.mlp.gate_proj"),
+                    [inter, h],
+                    &[inter_u, hu],
+                    LinearBiasMode::BeforeOutputRound,
+                )?)
+            } else {
+                None
+            };
             let up = load_biased_weight(
                 &mut loader,
                 s,
@@ -3741,9 +3815,12 @@ impl DinoV3Encoder {
                 &[hu, inter_u],
                 LinearBiasMode::BeforeOutputRound,
             )?;
-            let scale2 = loader.take_bf16(s, &format!("{p}.layer_scale2.lambda1"), &[hu])?;
-            for w in [&q, &v, &o, &gate, &up, &down] {
+            let scale2 = loader.take_scalar::<T>(s, &format!("{p}.layer_scale2.lambda1"), &[hu])?;
+            for w in [&q, &v, &o, &up, &down] {
                 w.prepare(s, blas, rows)?;
+            }
+            if let Some(gate) = &gate {
+                gate.prepare(s, blas, rows)?;
             }
             k.prepare(blas, rows)?;
             layers.push(DinoV3Layer {
@@ -3772,15 +3849,18 @@ impl DinoV3Encoder {
             "DINOv3 loaded element count {} != {expected_elems}",
             loader.loaded_elements
         );
-        let rope_host = crate::vision_input::dinov3_rope_table_bf16(
+        let rope_host = crate::vision_input::dinov3_rope_table_f32(
             cfg.prefix_rows(),
             patches_side,
             patches_side,
             head_dim,
             cfg.rope_theta,
-        )?;
+        )?
+        .into_iter()
+        .map(T::from_float)
+        .collect::<Vec<_>>();
         let patch_elems = (patch_rows as usize) * (patch_dim as usize);
-        let ws = DinoV3Workspace {
+        let ws = DinoWorkspace {
             pixel_packed: s.alloc_zeros(patch_elems)?,
             patches: s.alloc_zeros(patch_elems)?,
             x_a: s.alloc_zeros(rows_u * hu)?,
@@ -3793,15 +3873,11 @@ impl DinoV3Encoder {
             mlp_c: s.alloc_zeros(rows_u * inter_u)?,
             rope_table: s.clone_htod(&rope_host)?,
             feature1: s.alloc_zeros(rows_u * hu)?,
-            flash_d64: Flash::new_with_score(
-                s.clone(),
-                rows_u,
-                heads as usize,
-                heads as usize,
-                head_dim as usize,
-                Score::from_tokens((head_dim as f32).sqrt().recip(), None)?,
-                rows_u,
-            )?,
+            flash_d64: {
+                let (free, total) = device.ctx.mem_get_info()?;
+                let budget = free.min(22_000_000_000).saturating_sub(total / 16);
+                T::attention_setup(s, [rows, heads, head_dim], budget)?
+            },
         };
         let q38_mod = cubin::module(&device.ctx, "q38_common")?;
         let vis_mod = cubin::module(&device.ctx, "vision_ops")?;
@@ -3812,12 +3888,27 @@ impl DinoV3Encoder {
                 image_side,
                 prefix_tokens,
                 patch_embed,
+                ordered_linear: vis_mod.load_function("linear_ordered_f32")?,
                 layers,
                 final_norm,
                 common,
-                ops: crate::backend::cuda::ops::Ops::new(&device.ctx)?,
-                io: VisionIo::new(device, h)?,
-                channel_scale_residual: q38_mod.load_function("channel_scale_residual_bf16")?,
+                rotary_prefix: cubin::module(&device.ctx, "rope")?.load_function(if T::F32 {
+                    "rotary_prefix_kv_f32"
+                } else {
+                    "rotary_prefix_kv"
+                })?,
+                patch_rows: vis_mod.load_function(if T::F32 {
+                    "vision_patch_rows_f32"
+                } else {
+                    "vision_patch_rows"
+                })?,
+                gelu: vis_mod.load_function("vision_bias_gelu_f32")?,
+                final_affine,
+                channel_scale_residual: q38_mod.load_function(if T::F32 {
+                    "channel_scale_residual_f32"
+                } else {
+                    "channel_scale_residual_bf16"
+                })?,
                 layer_norm_f32: q38_mod.load_function("q38_layer_norm_f32")?,
                 upcast_f32: vis_mod.load_function("vision_upcast_f32")?,
                 silu_mul_split: act_mod.load_function("silu_mul_split")?,
@@ -3829,18 +3920,39 @@ impl DinoV3Encoder {
     fn layer_norm(
         &self,
         s: &Arc<CudaStream>,
-        norm: &AffineWeights,
-        input: &CudaSlice<bf16>,
-        output: &CudaSlice<bf16>,
+        norm: &AffineWeights<T>,
+        input: &CudaSlice<T>,
+        output: &CudaSlice<T>,
         rows: u32,
     ) -> Result<()> {
         let h = self.cfg.hidden_size;
+        if T::F32 {
+            unsafe {
+                s.launch_builder(&self.layer_norm_f32)
+                    .arg(input)
+                    .arg(&norm.weight)
+                    .arg(&norm.bias)
+                    .arg(output)
+                    .arg(&rows)
+                    .arg(&1u32)
+                    .arg(&h)
+                    .arg(&u64::from(h))
+                    .arg(&u64::from(h))
+                    .arg(&1u64)
+                    .arg(&u64::from(h))
+                    .arg(&u64::from(h))
+                    .arg(&1u64)
+                    .arg(&self.cfg.layer_norm_eps)
+                    .launch(grid(rows as usize, 256))?;
+            }
+            return Ok(());
+        }
         self.common.norm.layer_norm(
             s,
-            dense(input, s, [rows, 1, h])?,
-            dense(&norm.weight, s, [h])?,
-            dense(&norm.bias, s, [h])?,
-            &mut TensorMut(dense(output, s, [rows, 1, h])?),
+            dino_tensor_cast(dense(input, s, [rows, 1, h])?)?,
+            dino_tensor_cast(dense(&norm.weight, s, [h])?)?,
+            dino_tensor_cast(dense(&norm.bias, s, [h])?)?,
+            &mut TensorMut(dino_tensor_cast(dense(output, s, [rows, 1, h])?)?),
             self.cfg.layer_norm_eps,
         )
     }
@@ -3848,9 +3960,9 @@ impl DinoV3Encoder {
     fn scale_residual(
         &self,
         s: &Arc<CudaStream>,
-        residual: &CudaSlice<bf16>,
-        branch: &CudaSlice<bf16>,
-        scale: &CudaSlice<bf16>,
+        residual: &CudaSlice<T>,
+        branch: &CudaSlice<T>,
+        scale: &CudaSlice<T>,
         rows: u32,
     ) -> Result<()> {
         let h = self.cfg.hidden_size;
@@ -3868,25 +3980,14 @@ impl DinoV3Encoder {
         Ok(())
     }
 
-    pub fn encode(
+    fn stage_input(
         &self,
         s: &Arc<CudaStream>,
-        blas: &Blas,
-        ws: &mut DinoV3Workspace,
+        ws: &mut DinoWorkspace<T>,
         chw_f32: &[f32],
-        rope_override: Option<&CudaSlice<bf16>>,
-        capture_layers: bool,
-    ) -> Result<DinoV3Output> {
+    ) -> Result<()> {
         let side = self.image_side as usize;
         let patch = self.cfg.patch_size;
-        let patch_dim = self.cfg.patch_dim();
-        let patch_rows = self.cfg.patch_rows(self.image_side)?;
-        let prefix_rows = self.cfg.prefix_rows();
-        let rows = self.cfg.total_rows(self.image_side)?;
-        let h = self.cfg.hidden_size;
-        let heads = self.cfg.num_attention_heads;
-        let head_dim = self.cfg.head_dim();
-        let inter = self.cfg.intermediate_size;
         let packed_host = crate::vision_input::dinov3_pack_normalized_chw(
             chw_f32,
             side,
@@ -3896,18 +3997,52 @@ impl DinoV3Encoder {
             [0.229, 0.224, 0.225],
         )?;
         s.memcpy_htod(&packed_host, &mut ws.pixel_packed)?;
-        self.io.patch_rows(
-            s,
-            dense(&ws.pixel_packed, s, [patch_rows, patch_dim])?,
-            &mut TensorMut(dense(&ws.patches, s, [patch_rows, patch_dim])?),
-            patch_rows,
-            self.cfg.num_channels,
-            patch,
-        )?;
+        Ok(())
+    }
+
+    fn embed(&self, s: &Arc<CudaStream>, blas: &Blas, ws: &mut DinoWorkspace<T>) -> Result<()> {
+        let patch = self.cfg.patch_size;
+        let patch_dim = self.cfg.patch_dim();
+        let patch_rows = self.cfg.patch_rows(self.image_side)?;
+        let prefix_rows = self.cfg.prefix_rows();
+        let h = self.cfg.hidden_size;
+        unsafe {
+            s.launch_builder(&self.patch_rows)
+                .arg(&ws.pixel_packed)
+                .arg(&ws.patches)
+                .arg(&patch_rows)
+                .arg(&self.cfg.num_channels)
+                .arg(&patch)
+                .launch(grid(
+                    (u64::from(patch_rows) * u64::from(patch_dim))
+                        .div_ceil(256)
+                        .min(65535) as usize,
+                    256,
+                ))?;
+        }
         s.memcpy_dtod(
             &self.prefix_tokens,
             &mut ws.x_a.slice_mut(0..prefix_rows * h as usize),
         )?;
+        if T::F32 {
+            let output = dense_at(&ws.x_a, s, [patch_rows, h], prefix_rows * h as usize)?;
+            unsafe {
+                s.launch_builder(&self.ordered_linear)
+                    .arg(&ws.patches)
+                    .arg(&self.patch_embed.weight)
+                    .arg(&self.patch_embed.bias)
+                    .arg(&output.ptr)
+                    .arg(&patch_rows)
+                    .arg(&h)
+                    .arg(&patch_dim)
+                    .launch(crate::backend::gpu::LaunchConfig {
+                        grid_dim: (h.div_ceil(64), patch_rows.div_ceil(16), 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+            return Ok(());
+        }
         self.patch_embed.run(
             s,
             blas,
@@ -3919,6 +4054,22 @@ impl DinoV3Encoder {
                 prefix_rows * h as usize,
             )?),
         )?;
+        Ok(())
+    }
+
+    fn transform(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        ws: &mut DinoWorkspace<T>,
+        rope_override: Option<&CudaSlice<T>>,
+        capture_layers: bool,
+    ) -> Result<[Option<Vec<f32>>; 2]> {
+        let rows = self.cfg.total_rows(self.image_side)?;
+        let h = self.cfg.hidden_size;
+        let heads = self.cfg.num_attention_heads;
+        let head_dim = self.cfg.head_dim();
+        let inter = self.cfg.intermediate_size;
         let rope_slice = rope_override.unwrap_or(&ws.rope_table);
         let mut layer0 = None;
         let mut layer15 = None;
@@ -3942,34 +4093,38 @@ impl DinoV3Encoder {
                 dense(&ws.x_b, s, [rows, h])?,
                 &mut TensorMut(stage_view(&ws.mlp_b, s, [rows, h])?),
             )?;
-            self.ops.rotary_prefix_kv(
+            unsafe {
+                s.launch_builder(&self.rotary_prefix)
+                    .arg(&ws.x_c)
+                    .arg(&ws.mlp_a)
+                    .arg(&ws.mlp_b)
+                    .arg(&ws.k_cache)
+                    .arg(&ws.v_cache)
+                    .arg(rope_slice)
+                    .arg(&0i32)
+                    .arg(&i32::try_from(rows)?)
+                    .arg(&i32::try_from(heads)?)
+                    .arg(&i32::try_from(heads)?)
+                    .arg(&i32::try_from(head_dim)?)
+                    .arg(&i32::try_from(head_dim)?)
+                    .arg(&i32::try_from(rows)?)
+                    .launch(grid(
+                        (u64::from(rows) * u64::from(2 * heads) * u64::from(head_dim)).div_ceil(256)
+                            as usize,
+                        256,
+                    ))?;
+            }
+            T::attention_run(
+                &mut ws.flash_d64,
                 s,
-                crate::backend::cuda::ops::RotaryPrefixKv {
-                    q: TensorMut(dense(&ws.x_c, s, [rows, heads, head_dim])?),
-                    key: stage_view(&ws.mlp_a, s, [rows, heads, head_dim])?,
-                    value: stage_view(&ws.mlp_b, s, [rows, heads, head_dim])?,
-                    k: TensorMut(dense(&ws.k_cache, s, [heads, rows, head_dim])?),
-                    v: TensorMut(dense(&ws.v_cache, s, [heads, rows, head_dim])?),
-                    table: dense(rope_slice, s, [rows, head_dim])?,
-                    start: 0,
+                blas,
+                DinoAttentionBuffers {
+                    q: &ws.x_c,
+                    k: &ws.k_cache,
+                    v: &ws.v_cache,
+                    output: &mut ws.x_b,
                 },
-            )?;
-            ws.flash_d64.run(
-                &ws.x_c,
-                h as usize,
-                &ws.k_cache,
-                &ws.v_cache,
-                &mut ws.x_b,
-                Shape {
-                    rows: rows as usize,
-                    start: 0,
-                    capacity: rows as usize,
-                    q_heads: heads as usize,
-                    kv_heads: heads as usize,
-                    head_dim: head_dim as usize,
-                    causal: false,
-                    window_left: None,
-                },
+                [rows, heads, head_dim],
             )?;
             layer.o.run(
                 s,
@@ -3979,34 +4134,57 @@ impl DinoV3Encoder {
             )?;
             self.scale_residual(s, &ws.x_a, &ws.x_c, &layer.scale1, rows)?;
             self.layer_norm(s, &layer.norm2, &ws.x_a, &ws.x_b, rows)?;
-            layer.gate.run(
-                s,
-                blas,
-                dense(&ws.x_b, s, [rows, h])?,
-                &mut TensorMut(dense(&ws.mlp_a, s, [rows, inter])?),
-            )?;
-            layer.up.run(
-                s,
-                blas,
-                dense(&ws.x_b, s, [rows, h])?,
-                &mut TensorMut(dense(&ws.mlp_b, s, [rows, inter])?),
-            )?;
-            let mlp_elems = (rows * inter) as usize;
-            let cfg = crate::backend::cuda::ops::silu_mul_split_grid(
-                mlp_elems,
-                ws.mlp_a.device_ptr(s).0,
-                ws.mlp_b.device_ptr(s).0,
-                ws.mlp_c.device_ptr(s).0,
-            )?;
-            let mlp_count = i32::try_from(mlp_elems)?;
-            unsafe {
-                s.launch_builder(&self.silu_mul_split)
-                    .arg(&ws.mlp_a)
-                    .arg(&ws.mlp_b)
-                    .arg(&ws.mlp_c)
-                    .arg(&mlp_count)
-                    .arg(&0i32)
-                    .launch(cfg)?;
+            if let Some(gate) = &layer.gate {
+                gate.run(
+                    s,
+                    blas,
+                    dense(&ws.x_b, s, [rows, h])?,
+                    &mut TensorMut(dense(&ws.mlp_a, s, [rows, inter])?),
+                )?;
+                layer.up.run(
+                    s,
+                    blas,
+                    dense(&ws.x_b, s, [rows, h])?,
+                    &mut TensorMut(dense(&ws.mlp_b, s, [rows, inter])?),
+                )?;
+                let mlp_elems = (rows * inter) as usize;
+                let cfg = crate::backend::cuda::ops::silu_mul_split_grid(
+                    mlp_elems,
+                    ws.mlp_a.device_ptr(s).0,
+                    ws.mlp_b.device_ptr(s).0,
+                    ws.mlp_c.device_ptr(s).0,
+                )?;
+                let mlp_count = i32::try_from(mlp_elems)?;
+                unsafe {
+                    s.launch_builder(&self.silu_mul_split)
+                        .arg(&ws.mlp_a)
+                        .arg(&ws.mlp_b)
+                        .arg(&ws.mlp_c)
+                        .arg(&mlp_count)
+                        .arg(&0i32)
+                        .launch(cfg)?;
+                }
+            } else {
+                layer.up.run(
+                    s,
+                    blas,
+                    dense(&ws.x_b, s, [rows, h])?,
+                    &mut TensorMut(dense(&ws.mlp_b, s, [rows, inter])?),
+                )?;
+                unsafe {
+                    s.launch_builder(&self.gelu)
+                        .arg(&ws.mlp_b)
+                        .arg(&0u64)
+                        .arg(&ws.mlp_c)
+                        .arg(&rows)
+                        .arg(&inter)
+                        .launch(grid(
+                            (u64::from(rows) * u64::from(inter))
+                                .div_ceil(256)
+                                .min(65535) as usize,
+                            256,
+                        ))?;
+                }
             }
             layer.down.run(
                 s,
@@ -4019,28 +4197,38 @@ impl DinoV3Encoder {
                 layer0 = Some(
                     s.clone_dtoh(&ws.x_a)?
                         .into_iter()
-                        .map(bf16::to_f32)
+                        .map(T::into_float)
                         .collect(),
                 );
             } else if capture_layers && idx == 15 {
                 layer15 = Some(
                     s.clone_dtoh(&ws.x_a)?
                         .into_iter()
-                        .map(bf16::to_f32)
+                        .map(T::into_float)
                         .collect(),
                 );
             }
         }
-        self.layer_norm(s, &self.final_norm, &ws.x_a, &ws.x_b, rows)?;
+        if self.final_affine {
+            self.layer_norm(s, &self.final_norm, &ws.x_a, &ws.x_b, rows)?;
+        }
         let total_elems = rows * h;
+        let last = if self.final_affine { &ws.x_b } else { &ws.x_a };
+        let source_ptr = if T::F32 {
+            last.device_ptr(s).0
+        } else {
+            unsafe {
+                s.launch_builder(&self.upcast_f32)
+                    .arg(last)
+                    .arg(&ws.feature1)
+                    .arg(&total_elems)
+                    .launch(grid((total_elems as usize).div_ceil(256).min(65535), 256))?;
+            }
+            ws.feature1.device_ptr(s).0
+        };
         unsafe {
-            s.launch_builder(&self.upcast_f32)
-                .arg(&ws.x_b)
-                .arg(&ws.feature1)
-                .arg(&total_elems)
-                .launch(grid((total_elems as usize).div_ceil(256).min(65535), 256))?;
             s.launch_builder(&self.layer_norm_f32)
-                .arg(&ws.feature1)
+                .arg(&source_ptr)
                 .arg(&0u64)
                 .arg(&0u64)
                 .arg(&ws.feature1)
@@ -4056,6 +4244,21 @@ impl DinoV3Encoder {
                 .arg(&self.cfg.layer_norm_eps)
                 .launch(grid(rows as usize, 256))?;
         }
+        Ok([layer0, layer15])
+    }
+
+    pub fn encode(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        ws: &mut DinoWorkspace<T>,
+        chw_f32: &[f32],
+        rope_override: Option<&CudaSlice<T>>,
+        capture_layers: bool,
+    ) -> Result<DinoV3Output> {
+        self.stage_input(s, ws, chw_f32)?;
+        self.embed(s, blas, ws)?;
+        let [layer0, layer15] = self.transform(s, blas, ws, rope_override, capture_layers)?;
         Ok(DinoV3Output {
             layer0,
             layer15,
@@ -4986,6 +5189,954 @@ impl IdolVisionEncoderRuntime {
             [0, 1, 0, 1],
         )?;
         Ok((d_out, v_out))
+    }
+}
+
+trait DinoScalar:
+    crate::backend::gpu::DeviceRepr + crate::backend::gpu::ValidAsZeroBits + Copy
+{
+    const F32: bool;
+    type Attention;
+    fn from_float(value: f32) -> Self;
+    fn into_float(self) -> f32;
+    fn attention_setup(
+        stream: &Arc<CudaStream>,
+        shape: [u32; 3],
+        workspace_bytes: usize,
+    ) -> Result<Self::Attention>;
+    fn attention_run(
+        attention: &mut Self::Attention,
+        stream: &Arc<CudaStream>,
+        blas: &Blas,
+        buffers: DinoAttentionBuffers<'_, Self>,
+        shape: [u32; 3],
+    ) -> Result<()>;
+}
+
+struct DinoAttentionBuffers<'a, T> {
+    q: &'a CudaSlice<T>,
+    k: &'a CudaSlice<T>,
+    v: &'a CudaSlice<T>,
+    output: &'a mut CudaSlice<T>,
+}
+
+impl DinoScalar for bf16 {
+    const F32: bool = false;
+    type Attention = Flash;
+    fn from_float(value: f32) -> Self {
+        Self::from_f32(value)
+    }
+    fn into_float(self) -> f32 {
+        self.to_f32()
+    }
+    fn attention_setup(
+        stream: &Arc<CudaStream>,
+        [rows, heads, dim]: [u32; 3],
+        _: usize,
+    ) -> Result<Flash> {
+        Flash::new_with_score(
+            stream.clone(),
+            rows as usize,
+            heads as usize,
+            heads as usize,
+            dim as usize,
+            Score::from_tokens((dim as f32).sqrt().recip(), None)?,
+            rows as usize,
+        )
+    }
+    fn attention_run(
+        attention: &mut Flash,
+        _: &Arc<CudaStream>,
+        _: &Blas,
+        b: DinoAttentionBuffers<'_, Self>,
+        [rows, heads, dim]: [u32; 3],
+    ) -> Result<()> {
+        attention.run(
+            b.q,
+            (heads * dim) as usize,
+            b.k,
+            b.v,
+            b.output,
+            Shape {
+                rows: rows as usize,
+                start: 0,
+                capacity: rows as usize,
+                q_heads: heads as usize,
+                kv_heads: heads as usize,
+                head_dim: dim as usize,
+                causal: false,
+                window_left: None,
+            },
+        )
+    }
+}
+
+impl DinoScalar for f32 {
+    const F32: bool = true;
+    type Attention = crate::backend::cuda::flash::F32Attention;
+    fn from_float(value: f32) -> Self {
+        value
+    }
+    fn into_float(self) -> f32 {
+        self
+    }
+    fn attention_setup(
+        stream: &Arc<CudaStream>,
+        [rows, heads, dim]: [u32; 3],
+        workspace_bytes: usize,
+    ) -> Result<Self::Attention> {
+        crate::backend::cuda::flash::F32Attention::new(
+            stream.clone(),
+            [heads, rows, rows, dim, dim],
+            workspace_bytes,
+        )
+    }
+    fn attention_run(
+        attention: &mut Self::Attention,
+        stream: &Arc<CudaStream>,
+        blas: &Blas,
+        b: DinoAttentionBuffers<'_, Self>,
+        [rows, heads, dim]: [u32; 3],
+    ) -> Result<()> {
+        let token_major = |buffer: &CudaSlice<f32>| -> Result<Tensor<f32, 3>> {
+            unsafe {
+                Tensor::new(
+                    buffer.device_ptr(stream).0,
+                    [heads, rows, dim],
+                    [u64::from(dim), u64::from(heads) * u64::from(dim), 1],
+                    buffer.len() as u64 * 4,
+                )
+            }
+        };
+        attention.run(
+            blas,
+            token_major(b.q)?,
+            dense(b.k, stream, [heads, rows, dim])?,
+            dense(b.v, stream, [heads, rows, dim])?,
+            &mut TensorMut(token_major(b.output)?),
+        )
+    }
+}
+
+fn dino_tensor_cast<T: Copy, U: Copy, const R: usize>(
+    tensor: Tensor<T, R>,
+) -> Result<Tensor<U, R>> {
+    ensure!(
+        size_of::<T>() == size_of::<U>(),
+        "DINO scalar binding mismatch"
+    );
+    unsafe { Tensor::new(tensor.ptr, tensor.shape, tensor.stride, tensor.span_bytes) }
+}
+
+pub struct DinoV3Encoder {
+    inner: DinoEncoderStorage,
+}
+
+enum DinoEncoderStorage {
+    Bf16(Box<DinoEncoder<bf16>>),
+    F32(Box<DinoEncoder<f32>>),
+}
+
+pub struct DinoV3Workspace {
+    inner: DinoWorkspaceStorage,
+}
+
+enum DinoWorkspaceStorage {
+    Bf16(Box<DinoWorkspace<bf16>>),
+    F32(Box<DinoWorkspace<f32>>),
+}
+
+#[derive(Clone, Copy)]
+pub enum DinoV3OutputNormalization {
+    LearnedThenUnit,
+    UnitHidden,
+}
+
+impl DinoV3Encoder {
+    pub fn load(
+        device: &Device,
+        blas: &mut Blas,
+        common: CommonOpsRef,
+        cfg: DinoV3Config,
+        image_side: u32,
+        bytes: &[u8],
+    ) -> Result<(Self, DinoV3Workspace)> {
+        let (encoder, workspace) =
+            DinoEncoder::<bf16>::load(device, blas, common, cfg, image_side, bytes, true)?;
+        Ok((
+            Self {
+                inner: DinoEncoderStorage::Bf16(Box::new(encoder)),
+            },
+            DinoV3Workspace {
+                inner: DinoWorkspaceStorage::Bf16(Box::new(workspace)),
+            },
+        ))
+    }
+    pub fn load_f32(
+        device: &Device,
+        blas: &mut Blas,
+        common: CommonOpsRef,
+        cfg: DinoV3Config,
+        image_side: u32,
+        bytes: &[u8],
+        output: DinoV3OutputNormalization,
+    ) -> Result<(Self, DinoV3Workspace)> {
+        let (encoder, workspace) = DinoEncoder::<f32>::load(
+            device,
+            blas,
+            common,
+            cfg,
+            image_side,
+            bytes,
+            matches!(output, DinoV3OutputNormalization::LearnedThenUnit),
+        )?;
+        Ok((
+            Self {
+                inner: DinoEncoderStorage::F32(Box::new(encoder)),
+            },
+            DinoV3Workspace {
+                inner: DinoWorkspaceStorage::F32(Box::new(workspace)),
+            },
+        ))
+    }
+    pub fn encode(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        ws: &mut DinoV3Workspace,
+        chw_f32: &[f32],
+        rope_override: Option<&CudaSlice<bf16>>,
+        capture_layers: bool,
+    ) -> Result<DinoV3Output> {
+        match (&self.inner, &mut ws.inner) {
+            (DinoEncoderStorage::Bf16(encoder), DinoWorkspaceStorage::Bf16(workspace)) => {
+                encoder.encode(s, blas, workspace, chw_f32, rope_override, capture_layers)
+            }
+            (DinoEncoderStorage::F32(encoder), DinoWorkspaceStorage::F32(workspace)) => {
+                ensure!(
+                    rope_override.is_none(),
+                    "BF16 RoPE override for F32 encoder"
+                );
+                encoder.encode(s, blas, workspace, chw_f32, None, capture_layers)
+            }
+            _ => bail!("DINO encoder/workspace precision mismatch"),
+        }
+    }
+}
+
+struct NafConv {
+    weight: BiasedWeight<f32>,
+    kernel: u32,
+    input_channels: u32,
+}
+
+struct NafGuideBranch {
+    initial: NafConv,
+    blocks: Vec<(AffineWeights<f32>, NafConv)>,
+}
+
+struct NafEncoder {
+    branches: [NafGuideBranch; 2],
+    im2col: CudaFunction,
+    ordered_linear: CudaFunction,
+    group_norm: CudaFunction,
+    pool: CudaFunction,
+    rope: CudaFunction,
+    attention: CudaFunction,
+    periods: Vec<f32>,
+}
+
+struct NafWorkspace {
+    image_side: u32,
+    output_side: u32,
+    source_side: u32,
+    dilation: u32,
+    conv_rows: u32,
+    a: CudaSlice<f32>,
+    b: CudaSlice<f32>,
+    columns: CudaSlice<f32>,
+    guide: CudaSlice<f32>,
+    keys: CudaSlice<f32>,
+    output: CudaSlice<f32>,
+    rope_table: CudaSlice<f32>,
+}
+
+impl NafEncoder {
+    fn load(device: &Device, dir: &std::path::Path) -> Result<Self> {
+        let checkpoint =
+            crate::checkpoint::MappedCheckpoint::open_component(dir, "naf_release.pth")?;
+        let mut remaining = checkpoint
+            .index
+            .weight_map
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let s = &device.stream;
+        let mut read = |name: &str, shape: &[usize]| -> Result<Vec<f32>> {
+            ensure!(
+                remaining.remove(name),
+                "NAF tensor {name} missing or loaded twice"
+            );
+            let data = checkpoint.f32_tensor(name, shape)?;
+            ensure!(
+                data.iter().all(|x| x.is_finite()),
+                "NAF nonfinite tensor {name}"
+            );
+            Ok(data)
+        };
+        let module = cubin::module(&device.ctx, "vision_ops")?;
+        let mut branches = Vec::with_capacity(2);
+        for (name, kernel) in [("encoder", 1u32), ("sem_encoder", 3u32)] {
+            let mut conv = |suffix: &str, channels: u32| -> Result<NafConv> {
+                let prefix = format!("image_encoder.{name}.{suffix}");
+                let weight = read(
+                    &format!("{prefix}.weight"),
+                    &[128, channels as usize, kernel as usize, kernel as usize],
+                )?;
+                let bias = read(&format!("{prefix}.bias"), &[128])?;
+                Ok(NafConv {
+                    weight: BiasedWeight {
+                        weight: s.clone_htod(&weight)?,
+                        bias: s.clone_htod(&bias)?,
+                        shape: [128, channels * kernel * kernel],
+                        bias_mode: LinearBiasMode::AfterOutputRound,
+                        f32_bias: Some(module.load_function("vision_bias_f32")?),
+                    },
+                    kernel,
+                    input_channels: channels,
+                })
+            };
+            let initial = conv("0", 3)?;
+            let mut convolutions = Vec::with_capacity(4);
+            for block in 1..=2 {
+                for layer in 1..=2 {
+                    convolutions.push(conv(&format!("{block}.conv{layer}"), 128)?);
+                }
+            }
+            let mut blocks = Vec::with_capacity(4);
+            for (i, conv) in convolutions.into_iter().enumerate() {
+                let prefix = format!("image_encoder.{name}.{}.norm{}", i / 2 + 1, i % 2 + 1);
+                blocks.push((
+                    AffineWeights {
+                        weight: s.clone_htod(&read(&format!("{prefix}.weight"), &[128])?)?,
+                        bias: s.clone_htod(&read(&format!("{prefix}.bias"), &[128])?)?,
+                    },
+                    conv,
+                ));
+            }
+            branches.push(NafGuideBranch { initial, blocks });
+        }
+        let periods = read("image_encoder.rope.periods", &[16])?;
+        ensure!(
+            periods.iter().all(|x| *x > 0.0),
+            "NAF nonpositive RoPE periods"
+        );
+        ensure!(
+            remaining.is_empty(),
+            "unconsumed NAF tensors: {remaining:?}"
+        );
+        Ok(Self {
+            branches: branches
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("NAF guide branch count"))?,
+            im2col: module.load_function("causal_frame_im2col_f32")?,
+            ordered_linear: module.load_function("linear_ordered_f32")?,
+            group_norm: module.load_function("group_norm_silu_f32")?,
+            pool: module.load_function("adaptive_avg_pool2d_f32")?,
+            rope: module.load_function("rotary_spatial_f32")?,
+            attention: module.load_function("neighborhood_attention_2d_f32")?,
+            periods,
+        })
+    }
+
+    fn workspace(
+        &self,
+        device: &Device,
+        dimensions: [u32; 3],
+        free_budget: usize,
+    ) -> Result<NafWorkspace> {
+        let [image_side, output_side, source_side] = dimensions;
+        ensure!(
+            image_side >= 2
+                && output_side > 0
+                && source_side >= 9
+                && output_side.is_multiple_of(source_side)
+                && image_side <= 4 * output_side,
+            "NAF unsupported image/output/source geometry"
+        );
+        let pixels = image_side as usize * image_side as usize;
+        let target = output_side as usize * output_side as usize;
+        let source = source_side as usize * source_side as usize;
+        let fixed = 4 * (pixels * 256 + target * (256 + 1024 + 64) + source * 256);
+        let available = free_budget
+            .checked_sub(fixed)
+            .context("NAF fixed workspace exceeds remaining device budget")?;
+        let conv_rows = (available / (128 * 9 * 4)).min(pixels).min(32768) as u32;
+        ensure!(
+            conv_rows > 0,
+            "NAF convolution workspace has no row capacity"
+        );
+        let mut table = Vec::with_capacity(target * 64);
+        for y in 0..output_side {
+            for x in 0..output_side {
+                let coords = [
+                    2.0 * ((y as f32 + 0.5) / output_side as f32) - 1.0,
+                    2.0 * ((x as f32 + 0.5) / output_side as f32) - 1.0,
+                ];
+                for sine in [false, true] {
+                    for coord in coords {
+                        for period in &self.periods {
+                            let angle = (2.0 * std::f32::consts::PI * coord) / period;
+                            table.push(if sine { angle.sin() } else { angle.cos() });
+                        }
+                    }
+                }
+            }
+        }
+        let s = &device.stream;
+        Ok(NafWorkspace {
+            image_side,
+            output_side,
+            source_side,
+            dilation: output_side / source_side,
+            conv_rows,
+            a: s.alloc_zeros(pixels * 128)?,
+            b: s.alloc_zeros(pixels * 128)?,
+            columns: s.alloc_zeros(conv_rows as usize * 128 * 9)?,
+            guide: s.alloc_zeros(target * 256)?,
+            keys: s.alloc_zeros(source * 256)?,
+            output: s.alloc_zeros(target * 1024)?,
+            rope_table: s.clone_htod(&table)?,
+        })
+    }
+
+    fn convolve(
+        &self,
+        s: &Arc<CudaStream>,
+        conv: &NafConv,
+        input: &CudaSlice<f32>,
+        output: &CudaSlice<f32>,
+        ws: &NafWorkspace,
+    ) -> Result<()> {
+        let pixels = ws.image_side * ws.image_side;
+        let cols = conv.input_channels * conv.kernel * conv.kernel;
+        for first in (0..pixels).step_by(ws.conv_rows as usize) {
+            let rows = ws.conv_rows.min(pixels - first);
+            let source = if conv.kernel == 1 {
+                dense_at(
+                    input,
+                    s,
+                    [rows, conv.input_channels],
+                    first as usize * conv.input_channels as usize,
+                )?
+            } else {
+                unsafe {
+                    s.launch_builder(&self.im2col)
+                        .arg(input)
+                        .arg(&ws.columns)
+                        .arg(&conv.input_channels)
+                        .arg(&ws.image_side)
+                        .arg(&ws.image_side)
+                        .arg(&ws.image_side)
+                        .arg(&1u32)
+                        .arg(&conv.kernel)
+                        .arg(&1u32)
+                        .arg(&(conv.kernel / 2))
+                        .arg(&u64::from(first))
+                        .arg(&rows)
+                        .launch(grid(
+                            (u64::from(rows) * u64::from(cols)).div_ceil(256).min(65535) as usize,
+                            256,
+                        ))?;
+                }
+                stage_view(&ws.columns, s, [rows, cols])?
+            };
+            let target = dense_at(output, s, [rows, 128], first as usize * 128)?;
+            unsafe {
+                s.launch_builder(&self.ordered_linear)
+                    .arg(&source.ptr)
+                    .arg(&conv.weight.weight)
+                    .arg(&conv.weight.bias)
+                    .arg(&target.ptr)
+                    .arg(&rows)
+                    .arg(&128u32)
+                    .arg(&cols)
+                    .launch(crate::backend::gpu::LaunchConfig {
+                        grid_dim: (2, rows.div_ceil(16), 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn pool(
+        &self,
+        s: &Arc<CudaStream>,
+        input: &CudaSlice<f32>,
+        output: &CudaSlice<f32>,
+        sides: [u32; 2],
+        channels: [u32; 3],
+    ) -> Result<()> {
+        let [ih, oh] = sides;
+        let [count, stride, offset] = channels;
+        unsafe {
+            s.launch_builder(&self.pool)
+                .arg(input)
+                .arg(output)
+                .arg(&ih)
+                .arg(&ih)
+                .arg(&oh)
+                .arg(&oh)
+                .arg(&count)
+                .arg(&stride)
+                .arg(&offset)
+                .launch(grid(
+                    (u64::from(oh) * u64::from(oh) * u64::from(count))
+                        .div_ceil(256)
+                        .min(65535) as usize,
+                    256,
+                ))?;
+        }
+        Ok(())
+    }
+
+    fn run(
+        &self,
+        s: &Arc<CudaStream>,
+        image: &CudaSlice<f32>,
+        features: Tensor<f32, 2>,
+        ws: &NafWorkspace,
+    ) -> Result<()> {
+        ensure!(
+            features.shape == [ws.source_side * ws.source_side, 1024]
+                && features.stride == [1024, 1],
+            "NAF feature layout"
+        );
+        features.validate()?;
+        let pixels = u64::from(ws.image_side) * u64::from(ws.image_side);
+        for (branch_index, branch) in self.branches.iter().enumerate() {
+            self.convolve(s, &branch.initial, image, &ws.a, ws)?;
+            for (norm, conv) in &branch.blocks {
+                unsafe {
+                    s.launch_builder(&self.group_norm)
+                        .arg(&ws.a)
+                        .arg(&norm.weight)
+                        .arg(&norm.bias)
+                        .arg(&ws.b)
+                        .arg(&pixels)
+                        .arg(&128u32)
+                        .arg(&8u32)
+                        .arg(&1.0e-5f32)
+                        .launch(grid(8, 1024))?;
+                }
+                self.convolve(s, conv, &ws.b, &ws.a, ws)?;
+            }
+            self.pool(
+                s,
+                &ws.a,
+                &ws.guide,
+                [ws.image_side, ws.output_side],
+                [128, 256, branch_index as u32 * 128],
+            )?;
+        }
+        unsafe {
+            s.launch_builder(&self.rope)
+                .arg(&ws.guide)
+                .arg(&ws.rope_table)
+                .arg(&(ws.output_side * ws.output_side))
+                .arg(&4u32)
+                .arg(&64u32)
+                .launch(grid(
+                    (u64::from(ws.output_side) * u64::from(ws.output_side) * 128)
+                        .div_ceil(256)
+                        .min(65535) as usize,
+                    256,
+                ))?;
+        }
+        self.pool(
+            s,
+            &ws.guide,
+            &ws.keys,
+            [ws.output_side, ws.source_side],
+            [256, 256, 0],
+        )?;
+        unsafe {
+            s.launch_builder(&self.attention)
+                .arg(&ws.guide)
+                .arg(&ws.keys)
+                .arg(&features.ptr)
+                .arg(&ws.output)
+                .arg(&ws.output_side)
+                .arg(&ws.output_side)
+                .arg(&ws.source_side)
+                .arg(&ws.source_side)
+                .arg(&4u32)
+                .arg(&ws.dilation)
+                .arg(&ws.dilation)
+                .launch(grid(ws.output_side as usize * ws.output_side as usize, 128))?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct PixalConditioningShape {
+    pub image_side: u32,
+    pub grid_side: u32,
+    pub naf_side: Option<u32>,
+}
+
+/// World-to-camera matrix on the rotated XYZ grid, horizontal FOV in radians, and mesh scale.
+#[derive(Clone, Copy)]
+pub struct ProjectionCamera {
+    pub world_to_camera: [f32; 12],
+    pub horizontal_fov: f32,
+    pub mesh_scale: f32,
+}
+
+pub struct PixalConditioningRuntime {
+    dino: DinoEncoder<f32>,
+    dino_ws: DinoWorkspace<f32>,
+    naf: Option<(NafEncoder, NafWorkspace)>,
+    shape: PixalConditioningShape,
+    image: CudaSlice<f32>,
+    camera: CudaSlice<f32>,
+    global: CudaSlice<f32>,
+    projection: CudaSlice<f32>,
+    project: CudaFunction,
+    accumulate: CudaFunction,
+    projection_rows: u32,
+    channels: u32,
+    staged: bool,
+    views_accumulated: u32,
+    pub allocated_bytes: usize,
+}
+
+impl PixalConditioningRuntime {
+    pub fn load(
+        device: &Device,
+        blas: &mut Blas,
+        dino_dir: &std::path::Path,
+        naf_dir: Option<&std::path::Path>,
+        shape: PixalConditioningShape,
+    ) -> Result<Self> {
+        ensure!(
+            matches!(shape.image_side, 512 | 1024) && matches!(shape.grid_side, 16 | 32 | 64 | 96),
+            "unsupported Pixal conditioning shape"
+        );
+        ensure!(
+            shape.naf_side.is_some() == naf_dir.is_some(),
+            "NAF geometry/checkpoint mismatch"
+        );
+        ensure!(
+            shape.naf_side.is_none_or(|n| matches!(n, 512 | 1024)),
+            "unsupported NAF output size"
+        );
+        device.finish_upload()?;
+        let cfg = DinoV3Config::from_dir(dino_dir)?;
+        ensure!(
+            cfg.hidden_size == 1024
+                && cfg.prefix_rows() == 5
+                && cfg.patch_size == 16
+                && !cfg.use_gated_mlp,
+            "Pixal conditioning requires ViT-L/16 with four registers and GELU"
+        );
+        let (free_before, total) = device.ctx.mem_get_info()?;
+        let resident = total - free_before;
+        let capacity = 22_000_000_000usize.min(total.saturating_sub(total / 16));
+        ensure!(
+            resident < capacity,
+            "Pixal setup device budget exhausted before load"
+        );
+        let file = std::fs::File::open(dino_dir.join("model.safetensors"))?;
+        let map = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        let (dino, dino_ws) = DinoEncoder::<f32>::load(
+            device,
+            blas,
+            CommonOpsRef::new(&device.ctx)?,
+            cfg,
+            shape.image_side,
+            &map,
+            false,
+        )?;
+        let s = &device.stream;
+        let channels = if shape.naf_side.is_some() { 2048 } else { 1024 };
+        let projection_rows = shape.grid_side.pow(3);
+        let projection_bytes = projection_rows as usize * channels as usize * 4;
+        let (free, _) = device.ctx.mem_get_info()?;
+        let reserve =
+            shape.image_side as usize * shape.image_side as usize * 3 * 4 + 15 * 4 + 5 * 1024 * 4;
+        ensure!(
+            projection_bytes + reserve <= capacity.saturating_sub(total - free),
+            "Pixal projection workspace exceeds 22 GB device budget"
+        );
+        let projection = s.alloc_zeros(projection_rows as usize * channels as usize)?;
+        let image = s.alloc_zeros(shape.image_side as usize * shape.image_side as usize * 3)?;
+        let camera = s.alloc_zeros(15)?;
+        let global = s.alloc_zeros(5 * 1024)?;
+        let naf = if let (Some(side), Some(dir)) = (shape.naf_side, naf_dir) {
+            let encoder = NafEncoder::load(device, dir)?;
+            let (free, _) = device.ctx.mem_get_info()?;
+            let ws = encoder.workspace(
+                device,
+                [shape.image_side, side, shape.image_side / 16],
+                capacity.saturating_sub(total - free),
+            )?;
+            Some((encoder, ws))
+        } else {
+            None
+        };
+        let module = cubin::module(&device.ctx, "vision_ops")?;
+        let (free_after, _) = device.ctx.mem_get_info()?;
+        ensure!(
+            total - free_after <= capacity,
+            "Pixal setup exceeded derived device capacity"
+        );
+        Ok(Self {
+            dino,
+            dino_ws,
+            naf,
+            shape,
+            image,
+            camera,
+            global,
+            projection,
+            project: module.load_function("project_bilinear_f32")?,
+            accumulate: module.load_function("accumulate_mean_f32")?,
+            projection_rows,
+            channels,
+            staged: false,
+            views_accumulated: 0,
+            allocated_bytes: free_before.saturating_sub(free_after),
+        })
+    }
+
+    pub fn stage_rgba(
+        &mut self,
+        s: &Arc<CudaStream>,
+        rgba: &[u8],
+        dimensions: [usize; 2],
+        camera: ProjectionCamera,
+    ) -> Result<()> {
+        let (rgb, shape) =
+            crate::vision_input::rgba_foreground_crop(rgba, dimensions[1], dimensions[0])?;
+        self.stage_rgb(s, &rgb, shape, camera)
+    }
+
+    /// Prepared foreground RGB bytes; dimensions are [height,width].
+    pub fn stage_rgb(
+        &mut self,
+        s: &Arc<CudaStream>,
+        rgb: &[u8],
+        dimensions: [usize; 2],
+        camera: ProjectionCamera,
+    ) -> Result<()> {
+        ensure!(
+            camera.world_to_camera.iter().all(|x| x.is_finite())
+                && camera.horizontal_fov.is_finite()
+                && camera.horizontal_fov > 0.0
+                && camera.horizontal_fov < std::f32::consts::PI
+                && camera.mesh_scale.is_finite()
+                && camera.mesh_scale > 0.0,
+            "invalid projection camera"
+        );
+        let side = self.shape.image_side as usize;
+        let resized = crate::serve::image::resize_lanczos(
+            rgb,
+            [dimensions[0], dimensions[1], 3],
+            [side, side],
+        )?;
+        let image = resized
+            .iter()
+            .map(|&v| f32::from(v) / 255.0)
+            .collect::<Vec<_>>();
+        self.stage_image(s, &image, camera)
+    }
+
+    pub fn stage_view_rgba(
+        &mut self,
+        s: &Arc<CudaStream>,
+        rgba: &[u8],
+        dimensions: [usize; 2],
+        camera: ProjectionCamera,
+    ) -> Result<()> {
+        ensure!(
+            rgba.as_chunks::<4>().1.is_empty()
+                && rgba.as_chunks::<4>().0.iter().any(|p| p[3] != 255),
+            "multi-view input requires supplied RGBA alpha"
+        );
+        let side = self.shape.image_side as usize;
+        let pixels = crate::serve::image::resize_lanczos(
+            rgba,
+            [dimensions[0], dimensions[1], 4],
+            [side, side],
+        )?;
+        let image = pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|p| {
+                let alpha = f32::from(p[3]) / 255.0;
+                [
+                    f32::from(p[0]) / 255.0 * alpha,
+                    f32::from(p[1]) / 255.0 * alpha,
+                    f32::from(p[2]) / 255.0 * alpha,
+                ]
+            })
+            .collect::<Vec<_>>();
+        self.stage_image(s, &image, camera)
+    }
+
+    fn stage_image(
+        &mut self,
+        s: &Arc<CudaStream>,
+        image: &[f32],
+        camera: ProjectionCamera,
+    ) -> Result<()> {
+        let side = self.shape.image_side as usize;
+        ensure!(
+            image.len() == side * side * 3
+                && image.iter().all(|v| v.is_finite())
+                && camera.world_to_camera.iter().all(|x| x.is_finite())
+                && camera.horizontal_fov.is_finite()
+                && camera.horizontal_fov > 0.0
+                && camera.horizontal_fov < std::f32::consts::PI
+                && camera.mesh_scale.is_finite()
+                && camera.mesh_scale > 0.0,
+            "invalid conditioning image/camera"
+        );
+        let mut chw = vec![0.0; image.len()];
+        for (i, pixel) in image.as_chunks::<3>().0.iter().enumerate() {
+            for c in 0..3 {
+                chw[c * side * side + i] = pixel[c];
+            }
+        }
+        self.dino.stage_input(s, &mut self.dino_ws, &chw)?;
+        s.memcpy_htod(image, &mut self.image)?;
+        let mut parameters = [0.0f32; 15];
+        parameters[..12].copy_from_slice(&camera.world_to_camera);
+        parameters[12] = (camera.horizontal_fov / 2.0).tan();
+        parameters[13] = camera.mesh_scale;
+        parameters[14] = self.shape.image_side as f32;
+        s.memcpy_htod(&parameters, &mut self.camera)?;
+        self.staged = true;
+        Ok(())
+    }
+
+    fn project(
+        &self,
+        s: &Arc<CudaStream>,
+        input: Tensor<f32, 2>,
+        geometry: [u32; 3],
+        add: bool,
+        divisor: f32,
+    ) -> Result<()> {
+        let [side, offset, chunk] = geometry;
+        ensure!(
+            chunk > 0 && input.shape == [side * side, 1024] && input.stride == [1024, 1],
+            "projection input shape/chunk"
+        );
+        input.validate()?;
+        for first in (0..self.projection_rows).step_by(chunk as usize) {
+            let rows = chunk.min(self.projection_rows - first);
+            unsafe {
+                s.launch_builder(&self.project)
+                    .arg(&input.ptr)
+                    .arg(&self.projection)
+                    .arg(&self.camera)
+                    .arg(&self.shape.grid_side)
+                    .arg(&side)
+                    .arg(&side)
+                    .arg(&1024u32)
+                    .arg(&self.channels)
+                    .arg(&offset)
+                    .arg(&u64::from(first))
+                    .arg(&rows)
+                    .arg(&u32::from(add))
+                    .arg(&divisor)
+                    .launch(grid(
+                        (u64::from(rows) * 1024).div_ceil(256).min(65535) as usize,
+                        256,
+                    ))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The first view resets outputs; subsequent views accumulate in order; the final view divides by count.
+    pub fn run_view(
+        &mut self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        view_index: u32,
+        view_count: u32,
+    ) -> Result<()> {
+        ensure!(
+            self.staged
+                && view_count > 0
+                && view_index < view_count
+                && (view_index == 0 || self.views_accumulated == view_index),
+            "conditioning view order/input staging"
+        );
+        self.run_device(s, blas, view_index, view_count, self.projection_rows)?;
+        self.views_accumulated = if view_index + 1 == view_count {
+            0
+        } else {
+            view_index + 1
+        };
+        self.staged = false;
+        Ok(())
+    }
+
+    fn run_device(
+        &mut self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        view_index: u32,
+        view_count: u32,
+        chunk: u32,
+    ) -> Result<()> {
+        self.dino.embed(s, blas, &mut self.dino_ws)?;
+        self.dino
+            .transform(s, blas, &mut self.dino_ws, None, false)?;
+        let side = self.shape.image_side / 16;
+        let features = dense_at(&self.dino_ws.feature1, s, [side * side, 1024], 5 * 1024)?;
+        let divisor = if view_index + 1 == view_count {
+            view_count as f32
+        } else {
+            1.0
+        };
+        let add = view_index > 0;
+        unsafe {
+            s.launch_builder(&self.accumulate)
+                .arg(&self.dino_ws.feature1)
+                .arg(&self.global)
+                .arg(&5120u64)
+                .arg(&u32::from(add))
+                .arg(&divisor)
+                .launch(grid(20, 256))?;
+        }
+        self.project(s, features, [side, 0, chunk], add, divisor)?;
+        if let Some((encoder, ws)) = &self.naf {
+            encoder.run(s, &self.image, features, ws)?;
+            self.project(
+                s,
+                dense_at(&ws.output, s, [ws.output_side * ws.output_side, 1024], 0)?,
+                [ws.output_side, 1024, chunk],
+                add,
+                divisor,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn global(&self, s: &Arc<CudaStream>) -> Result<Tensor<f32, 2>> {
+        dense_at(&self.global, s, [5, 1024], 0)
+    }
+    pub fn projection(&self, s: &Arc<CudaStream>) -> Result<Tensor<f32, 2>> {
+        dense(&self.projection, s, [self.projection_rows, self.channels])
     }
 }
 
@@ -6517,6 +7668,7 @@ mod tests {
                     .collect::<Vec<_>>(),
             )?;
             let patch = BiasedWeight {
+                f32_bias: None,
                 weight,
                 bias,
                 shape: [width, input],
@@ -7070,8 +8222,11 @@ mod tests {
             }
 
             if case == "armchair" {
-                let d_cfg = &runtime.dinov3.cfg;
-                let patches_side = runtime.dinov3.image_side / d_cfg.patch_size;
+                let DinoEncoderStorage::Bf16(dino) = &runtime.dinov3.inner else {
+                    bail!("Idol gate requires BF16 DINO");
+                };
+                let d_cfg = &dino.cfg;
+                let patches_side = dino.image_side / d_cfg.patch_size;
                 let head_dim = d_cfg.head_dim() as usize;
                 let prefix_rows = d_cfg.prefix_rows();
                 let mut mutant_rope = crate::vision_input::dinov3_rope_table_bf16(
@@ -7141,6 +8296,904 @@ mod tests {
             worst["vae_moments"].1,
             worst["feature2"].0,
             worst["feature2"].1
+        );
+        Ok(())
+    }
+    fn pixal_execute(
+        s: &Arc<CudaStream>,
+        graph: bool,
+        mut run: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        if graph {
+            s.begin_capture(
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )?;
+            let result = run();
+            let captured = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+            result?;
+            captured?.context("empty Pixal operation graph")?.launch()?;
+        } else {
+            run()?;
+        }
+        s.synchronize()?;
+        Ok(())
+    }
+
+    fn pixal_capture(
+        s: &Arc<CudaStream>,
+        captured: &mut Option<crate::backend::gpu::CudaGraph>,
+        mut run: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        if captured.is_none() {
+            s.begin_capture(
+                cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )?;
+            let result = run();
+            let graph = s.end_capture(cudarc::driver::sys::CUgraphInstantiate_flags(0));
+            result?;
+            *captured = Some(graph?.context("empty persistent Pixal graph")?);
+        }
+        captured
+            .as_ref()
+            .context("persistent Pixal graph missing")?
+            .launch()?;
+        s.synchronize()?;
+        Ok(())
+    }
+
+    fn pixal_guard(s: &Arc<CudaStream>, buffer: &mut CudaSlice<f32>) -> Result<()> {
+        let count = buffer.len();
+        drop(std::mem::replace(buffer, s.alloc_zeros(1)?));
+        *buffer = s.alloc_zeros(count + 64)?;
+        s.memcpy_htod(&[12345.25f32; 64], &mut buffer.slice_mut(count..))?;
+        Ok(())
+    }
+
+    fn pixal_check_guard(s: &Arc<CudaStream>, buffer: &CudaSlice<f32>) -> Result<()> {
+        let guard = s.clone_dtoh(&buffer.slice(buffer.len() - 64..))?;
+        ensure!(
+            guard == [12345.25f32; 64],
+            "conditioning output canary changed"
+        );
+        Ok(())
+    }
+
+    fn pixal_score(
+        s: &Arc<CudaStream>,
+        actual: &CudaSlice<f32>,
+        expected: safetensors::tensor::TensorView<'_>,
+        cell: &serde_json::Value,
+        tag: &str,
+        channels_first: bool,
+        negative: bool,
+    ) -> Result<bool> {
+        ensure!(
+            expected.dtype() == safetensors::Dtype::F32,
+            "reference dtype {tag}"
+        );
+        let count = expected.data().len() / 4;
+        ensure!(
+            count > 0 && count <= actual.len(),
+            "reference/native extent {tag}"
+        );
+        let channels = expected.shape()[0];
+        let plane = count / channels;
+        let control = cell["control"].as_str().context("frozen control")?;
+        let kind = if negative {
+            0
+        } else {
+            match control {
+                "patch_x_y_transpose" => 1,
+                "register_split_offset_one" | "global register index shift" => 2,
+                "projection_x_z_transpose"
+                | "projection X/Z index swap"
+                | "projection X/Z coordinate indexing" => 3,
+                "NAF_guide_spatial_x_y_transpose" => 4,
+                _ => 0,
+            }
+        };
+        let width = *expected.shape().last().context("reference rank")?;
+        let rows = count / width;
+        let side = match kind {
+            1 => ((rows - 5) as f64).sqrt() as usize,
+            3 => (rows as f64).cbrt().round() as usize,
+            4 => expected.shape()[1],
+            _ => 1,
+        };
+        if kind == 1 {
+            ensure!(side * side + 5 == rows, "patch control shape");
+        }
+        if kind == 3 {
+            ensure!(side * side * side == rows, "projection control shape");
+        }
+        let mut negative_max = 0.0f64;
+        let mut negative_squares = 0.0f64;
+        let mut maximum = 0.0f64;
+        let mut squares = 0.0f64;
+        for first in (0..count).step_by(262144) {
+            let data = s.clone_dtoh(&actual.slice(first..(first + 262144).min(count)))?;
+            for (j, &a) in data.iter().enumerate() {
+                let index = first + j;
+                let logical = if channels_first {
+                    (index % channels) * plane + index / channels
+                } else {
+                    index
+                };
+                let e =
+                    f32::from_le_bytes(expected.data()[logical * 4..logical * 4 + 4].try_into()?);
+                ensure!(a.is_finite() && e.is_finite(), "nonfinite value {tag}");
+                let d = f64::from(a) - f64::from(e);
+                maximum = maximum.max(d.abs());
+                squares += d * d;
+                if kind != 0 {
+                    let row = index / width;
+                    let column = index % width;
+                    let wrong = match kind {
+                        1 if row >= 5 => {
+                            let patch = row - 5;
+                            (5 + (patch % side) * side + patch / side) * width + column
+                        }
+                        1 => index,
+                        2 => ((row + 1) % 5) * width + column,
+                        3 => {
+                            let x = row / (side * side);
+                            let y = (row / side) % side;
+                            let z = row % side;
+                            ((z * side + y) * side + x) * width + column
+                        }
+                        4 => {
+                            let pixel = index / channels;
+                            let c = index % channels;
+                            c * plane + (pixel % side) * side + pixel / side
+                        }
+                        _ => unreachable!(),
+                    };
+                    let value =
+                        f32::from_le_bytes(expected.data()[wrong * 4..wrong * 4 + 4].try_into()?);
+                    ensure!(value.is_finite(), "nonfinite control reference {tag}");
+                    let delta = f64::from(a) - f64::from(value);
+                    negative_max = negative_max.max(delta.abs());
+                    negative_squares += delta * delta;
+                }
+            }
+        }
+        let rmse = (squares / count as f64).sqrt();
+        let tau_max = cell["tau"]["max_abs"]
+            .as_f64()
+            .context("frozen max_abs tau")?;
+        let tau_rmse = cell["tau"]["rmse"].as_f64().context("frozen RMSE tau")?;
+        let pass = if negative {
+            maximum >= 10.0 * tau_max && rmse >= 10.0 * tau_rmse
+        } else {
+            maximum <= tau_max && rmse <= tau_rmse
+        };
+        if kind != 0 {
+            let negative_rmse = (negative_squares / count as f64).sqrt();
+            let valid = negative_max >= 10.0 * tau_max && negative_rmse >= 10.0 * tau_rmse;
+            println!(
+                "P1_M2_NATIVE_INDEX_CONTROL {tag} control={control} ratio_max_abs={:.8} ratio_rmse={:.8} discriminating={valid}",
+                negative_max / tau_max,
+                negative_rmse / tau_rmse
+            );
+            if pass {
+                ensure!(valid, "native index control not discriminating {tag}");
+            }
+        }
+        println!(
+            "P1_M2_CELL {} {tag} negative={negative} max_abs={maximum:.12e} rmse={rmse:.12e} tau_max_abs={tau_max:.12e} tau_rmse={tau_rmse:.12e}",
+            if pass { "PASS" } else { "DEFECT" }
+        );
+        Ok(pass)
+    }
+
+    fn pixal_anchor(root: &std::path::Path) -> Result<serde_json::Value> {
+        let anchor: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("M2-ANCHOR.json"))?)?;
+        ensure!(
+            anchor["anchor"] == "r0a"
+                && anchor["tau_changed"] == false
+                && anchor["cells"] == 96
+                && anchor["gating_metrics"] == 192
+                && anchor["reference_valid"] == true,
+            "M2 r0a amendment invalid"
+        );
+        let controls = anchor["controls"].as_array().context("M2 controls")?;
+        ensure!(controls.len() == 96, "M2 control count");
+        for c in controls {
+            ensure!(
+                c["reference_valid"] == true
+                    && c["ratios"]["max_abs"].as_f64().context("control ratio")? >= 10.0
+                    && c["ratios"]["rmse"].as_f64().context("control ratio")? >= 10.0,
+                "reference control under 10 tau"
+            );
+            let table = anchor["tables"]
+                .as_array()
+                .context("M2 tables")?
+                .iter()
+                .find(|t| t["source_table"] == c["source_table"])
+                .context("control table")?;
+            let cell = table["cells"]
+                .as_array()
+                .context("M2 cells")?
+                .iter()
+                .find(|v| v["name"] == c["name"] && v["key"] == c["key"])
+                .context("control cell")?;
+            ensure!(cell["tau"] == c["tau"], "amended tau mismatch");
+        }
+        Ok(anchor)
+    }
+
+    fn pixal_camera(
+        inputs: &safetensors::SafeTensors<'_>,
+        project: &std::path::Path,
+        name: &str,
+    ) -> Result<ProjectionCamera> {
+        let metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            project
+                .join("fixtures/pixal3d")
+                .join(format!("{name}-camera.json")),
+        )?)?;
+        Ok(ProjectionCamera {
+            world_to_camera: read_f32_tensor(inputs, &format!("{name}-world-to-camera"))?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("camera extent"))?,
+            horizontal_fov: metadata["camera_angle_x"].as_f64().context("camera FOV")? as f32,
+            mesh_scale: metadata["mesh_scale"]
+                .as_f64()
+                .context("camera mesh scale")? as f32,
+        })
+    }
+
+    #[test]
+    #[ignore = "GPU published Pixal conditioning reference; FF_P1_M2_ROOT, FF_DINOV3_MODEL, FF_NAF_MODEL"]
+    fn pixal_conditioning_definition_gpu() -> Result<()> {
+        use crate::backend::cuda::closure::Closure;
+        use std::{path::PathBuf, rc::Rc};
+        let root = PathBuf::from(std::env::var_os("FF_P1_M2_ROOT").context("FF_P1_M2_ROOT")?);
+        let dino = PathBuf::from(std::env::var_os("FF_DINOV3_MODEL").context("FF_DINOV3_MODEL")?);
+        let naf = PathBuf::from(std::env::var_os("FF_NAF_MODEL").context("FF_NAF_MODEL")?);
+        let project = root
+            .parent()
+            .and_then(|p| p.parent())
+            .context("evidence root")?;
+        let anchor = pixal_anchor(&root)?;
+        let inputs_file = std::fs::File::open(root.join("gate-inputs.safetensors"))?;
+        let inputs_map = unsafe { memmap2::MmapOptions::new().map(&inputs_file)? };
+        let inputs = safetensors::SafeTensors::deserialize(&inputs_map)?;
+        let device = Device::new(0)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let runtime_dir = std::env::temp_dir().join(format!("ff-pixal-m2-{}", std::process::id()));
+        std::fs::create_dir_all(&runtime_dir)?;
+        let mut blas = test_blas(
+            &device,
+            &runtime_dir,
+            Rc::new(Closure::new(false, "Pixal conditioning".into())),
+        )?;
+        let mut defects = 0;
+        let mut cells = 0;
+        for (stage, image_side, grid_side, naf_side) in [
+            ("ss", 512, 16, None),
+            ("dino1024", 1024, 64, None),
+            ("shape512", 512, 32, Some(512)),
+            ("shape1024", 1024, 64, Some(512)),
+            ("tex1024", 1024, 64, Some(1024)),
+            ("tex1536", 1024, 96, Some(1024)),
+        ] {
+            let table = anchor["tables"]
+                .as_array()
+                .context("tables")?
+                .iter()
+                .find(|t| t["source_table"] == format!("floors-conditioning-{stage}.json"))
+                .context("conditioning table")?;
+            let mut native = PixalConditioningRuntime::load(
+                &device,
+                &mut blas,
+                &dino,
+                naf_side.map(|_| naf.as_path()),
+                PixalConditioningShape {
+                    image_side,
+                    grid_side,
+                    naf_side,
+                },
+            )?;
+            println!(
+                "P1_M2_SETUP stage={stage} allocated_bytes={} projection_rows={} channels={} no_cache=true",
+                native.allocated_bytes, native.projection_rows, native.channels
+            );
+            pixal_guard(s, &mut native.projection)?;
+            if let Some((_, ws)) = &mut native.naf {
+                pixal_guard(s, &mut ws.guide)?;
+                pixal_guard(s, &mut ws.output)?;
+            }
+            let mut embedding_graph = None;
+            let mut pipeline_graph = None;
+            for name in ["cottage", "robot_crab"] {
+                let rgba = inputs.tensor(&format!("{name}-rgba"))?;
+                let (prepared, dimensions) = crate::vision_input::rgba_foreground_crop(
+                    rgba.data(),
+                    rgba.shape()[1],
+                    rgba.shape()[0],
+                )?;
+                let golden = inputs.tensor(&format!("{name}-prepared"))?;
+                ensure!(
+                    dimensions == golden.shape()[..2] && prepared == golden.data(),
+                    "publisher RGBA crop mismatch {name}"
+                );
+                let resized = crate::serve::image::resize_lanczos(
+                    &prepared,
+                    [dimensions[0], dimensions[1], 3],
+                    [image_side as usize, image_side as usize],
+                )?;
+                ensure!(
+                    resized == inputs.tensor(&format!("{name}-rgb{image_side}"))?.data(),
+                    "publisher Lanczos mismatch {name}/{image_side}"
+                );
+                let camera = pixal_camera(&inputs, project, name)?;
+                native.stage_rgba(s, rgba.data(), [rgba.shape()[0], rgba.shape()[1]], camera)?;
+                let reference_file = std::fs::File::open(
+                    project
+                        .join("evidence/P1-M1-r1")
+                        .join(format!("conditioning-{stage}-r0a/{name}.safetensors")),
+                )?;
+                let reference_map = unsafe { memmap2::MmapOptions::new().map(&reference_file)? };
+                let reference = safetensors::SafeTensors::deserialize(&reference_map)?;
+                for graph in [false, true] {
+                    if graph {
+                        pixal_capture(s, &mut embedding_graph, || {
+                            native.dino.embed(s, &blas, &mut native.dino_ws)
+                        })?;
+                    } else {
+                        native.dino.embed(s, &blas, &mut native.dino_ws)?;
+                    }
+
+                    let embedding = table["cells"]
+                        .as_array()
+                        .context("cells")?
+                        .iter()
+                        .find(|c| c["name"] == name && c["key"] == "dino_embeddings")
+                        .context("embedding cell")?;
+                    let tag = format!(
+                        "stage={stage} media={name} mode={} key=dino_embeddings",
+                        if graph { "graph" } else { "eager" }
+                    );
+                    defects += usize::from(!pixal_score(
+                        s,
+                        &native.dino_ws.x_a,
+                        reference.tensor("dino_embeddings")?,
+                        embedding,
+                        &tag,
+                        false,
+                        false,
+                    )?);
+                    cells += 1;
+                    if graph {
+                        pixal_capture(s, &mut pipeline_graph, || {
+                            native.run_device(s, &blas, 0, 1, native.projection_rows)
+                        })?;
+                    } else {
+                        native.run_device(s, &blas, 0, 1, native.projection_rows)?;
+                    }
+                    pixal_check_guard(s, &native.projection)?;
+                    if let Some((_, ws)) = &native.naf {
+                        pixal_check_guard(s, &ws.guide)?;
+                        pixal_check_guard(s, &ws.output)?;
+                    }
+
+                    for cell in table["cells"]
+                        .as_array()
+                        .context("cells")?
+                        .iter()
+                        .filter(|c| c["name"] == name && c["key"] != "dino_embeddings")
+                    {
+                        let key = cell["key"].as_str().context("cell key")?;
+                        let (data, channels_first) = match key {
+                            "dino_final_block" => (&native.dino_ws.x_a, false),
+                            "global" => (&native.global, false),
+                            "projection" => (&native.projection, false),
+                            "naf_guide_features" => {
+                                (&native.naf.as_ref().context("NAF guide")?.1.guide, true)
+                            }
+                            "naf_output" => {
+                                (&native.naf.as_ref().context("NAF output")?.1.output, true)
+                            }
+                            _ => bail!("unhandled conditioning cell {key}"),
+                        };
+                        let tag = format!(
+                            "stage={stage} media={name} mode={} key={key}",
+                            if graph { "graph" } else { "eager" }
+                        );
+                        defects += usize::from(!pixal_score(
+                            s,
+                            data,
+                            reference.tensor(key)?,
+                            cell,
+                            &tag,
+                            channels_first,
+                            false,
+                        )?);
+                        cells += 1;
+                    }
+                    let (free, total) = device.ctx.mem_get_info()?;
+                    ensure!(
+                        total - free <= 22_000_000_000,
+                        "M2 graph/library allocations exceed 22 GB device budget"
+                    );
+                    println!(
+                        "P1_M2_CAPACITY stage={stage} media={name} graph={graph} device_used_bytes={} output_guards=PASS",
+                        total - free
+                    );
+                    if let Some((encoder, ws)) = &native.naf {
+                        let features = dense_at(
+                            &native.dino_ws.feature1,
+                            s,
+                            [ws.source_side * ws.source_side, 1024],
+                            5120,
+                        )?;
+                        let dilation = 2 * ws.dilation;
+                        pixal_execute(s, graph, || {
+                            unsafe {
+                                s.launch_builder(&encoder.attention)
+                                    .arg(&ws.guide)
+                                    .arg(&ws.keys)
+                                    .arg(&features.ptr)
+                                    .arg(&ws.output)
+                                    .arg(&ws.output_side)
+                                    .arg(&ws.output_side)
+                                    .arg(&ws.source_side)
+                                    .arg(&ws.source_side)
+                                    .arg(&4u32)
+                                    .arg(&dilation)
+                                    .arg(&dilation)
+                                    .launch(grid(
+                                        ws.output_side as usize * ws.output_side as usize,
+                                        128,
+                                    ))?;
+                            }
+                            Ok(())
+                        })?;
+                        let cell = table["cells"]
+                            .as_array()
+                            .context("cells")?
+                            .iter()
+                            .find(|c| c["name"] == name && c["key"] == "naf_output")
+                            .context("NAF control cell")?;
+                        let tag = format!(
+                            "stage={stage} media={name} graph={graph} control=NAF_wrong_dilation_double"
+                        );
+                        let discriminating = pixal_score(
+                            s,
+                            &ws.output,
+                            reference.tensor("naf_output")?,
+                            cell,
+                            &tag,
+                            true,
+                            true,
+                        )?;
+                        ensure!(discriminating, "NAF doubled-dilation control under 10 tau");
+                        pixal_check_guard(s, &ws.output)?;
+                    }
+                }
+            }
+        }
+        std::fs::remove_dir_all(runtime_dir)?;
+        println!(
+            "P1_M2_CONDITIONING {} cells={cells} defects={defects} graph=true eager=true",
+            if defects == 0 { "PASS" } else { "DEFECT" }
+        );
+        ensure!(
+            cells == 128 && defects == 0,
+            "conditioning candidate defects={defects}, cells={cells}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "GPU published Pixal multi-view reference; FF_P1_M2_ROOT, FF_DINOV3_MODEL, FF_NAF_MODEL"]
+    fn pixal_multiview_definition_gpu() -> Result<()> {
+        use crate::backend::cuda::closure::Closure;
+        use std::{path::PathBuf, rc::Rc};
+        let root = PathBuf::from(std::env::var_os("FF_P1_M2_ROOT").context("FF_P1_M2_ROOT")?);
+        let dino = PathBuf::from(std::env::var_os("FF_DINOV3_MODEL").context("FF_DINOV3_MODEL")?);
+        let naf = PathBuf::from(std::env::var_os("FF_NAF_MODEL").context("FF_NAF_MODEL")?);
+        let project = root
+            .parent()
+            .and_then(|p| p.parent())
+            .context("evidence root")?;
+        let anchor = pixal_anchor(&root)?;
+        let input_file = std::fs::File::open(root.join("gate-inputs.safetensors"))?;
+        let input_map = unsafe { memmap2::MmapOptions::new().map(&input_file)? };
+        let inputs = safetensors::SafeTensors::deserialize(&input_map)?;
+        let matrices = read_f32_tensor(&inputs, "mv-world-to-camera")?;
+        let angles = read_f32_tensor(&inputs, "mv-angle")?;
+        let scale = read_f32_tensor(&inputs, "mv-mesh-scale")?[0];
+        let expected_images = read_f32_tensor(&inputs, "mv-image")?;
+        let control_bytes = std::fs::read(root.join("gate-camera-control.safetensors"))?;
+        let control_inputs = safetensors::SafeTensors::deserialize(&control_bytes)?;
+        let inverse_camera: [f32; 12] =
+            read_f32_tensor(&control_inputs, "nonanchor_inverse_world_to_camera")?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("camera control extent"))?;
+        let device = Device::new(0)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let runtime_dir = std::env::temp_dir().join(format!("ff-pixal-mv-{}", std::process::id()));
+        std::fs::create_dir_all(&runtime_dir)?;
+        let mut blas = test_blas(
+            &device,
+            &runtime_dir,
+            Rc::new(Closure::new(false, "Pixal multi-view".into())),
+        )?;
+        let mut defects = 0;
+        let mut cells = 0;
+        for (stage, grid_side, naf_side) in [("ss", 16, None), ("shape512", 32, Some(512))] {
+            let table = anchor["tables"]
+                .as_array()
+                .context("tables")?
+                .iter()
+                .find(|t| t["source_table"] == format!("floors-mv-{stage}.json"))
+                .context("MV table")?;
+            let mut native = PixalConditioningRuntime::load(
+                &device,
+                &mut blas,
+                &dino,
+                naf_side.map(|_| naf.as_path()),
+                PixalConditioningShape {
+                    image_side: 512,
+                    grid_side,
+                    naf_side,
+                },
+            )?;
+            for count in [1u32, 2, 4, 9] {
+                let reference_file = std::fs::File::open(
+                    project
+                        .join("evidence/P1-M1-r1")
+                        .join(format!("mv-conditioning-{stage}-r0a/V{count}.safetensors")),
+                )?;
+                let reference_map = unsafe { memmap2::MmapOptions::new().map(&reference_file)? };
+                let reference = safetensors::SafeTensors::deserialize(&reference_map)?;
+                let mut graphs: [Option<crate::backend::gpu::CudaGraph>; 3] = [None, None, None];
+                for graph in [false, true] {
+                    for view in 0..count {
+                        let index = view as usize % 4;
+                        let rgba = inputs.tensor(&format!("mv-{index}-rgba"))?;
+                        let camera = ProjectionCamera {
+                            world_to_camera: matrices[index * 12..(index + 1) * 12].try_into()?,
+                            horizontal_fov: angles[index],
+                            mesh_scale: scale,
+                        };
+                        native.stage_view_rgba(
+                            s,
+                            rgba.data(),
+                            [rgba.shape()[0], rgba.shape()[1]],
+                            camera,
+                        )?;
+                        let image = s.clone_dtoh(&native.image)?;
+                        ensure!(
+                            image
+                                == expected_images
+                                    [index * 512 * 512 * 3..(index + 1) * 512 * 512 * 3],
+                            "MV RGBA publisher preprocessing mismatch view={index}"
+                        );
+                        if graph {
+                            let slot = if view == 0 {
+                                0
+                            } else if view + 1 == count {
+                                2
+                            } else {
+                                1
+                            };
+                            pixal_capture(s, &mut graphs[slot], || {
+                                native.run_device(s, &blas, view, count, native.projection_rows)
+                            })?;
+                        } else {
+                            native.run_device(s, &blas, view, count, native.projection_rows)?;
+                        }
+                    }
+                    for (key, data) in [
+                        ("global", &native.global),
+                        ("projection", &native.projection),
+                    ] {
+                        let name = format!("V{count}-{key}");
+                        let cell = table["cells"]
+                            .as_array()
+                            .context("cells")?
+                            .iter()
+                            .find(|c| c["name"] == name)
+                            .context("MV cell")?;
+                        let tag = format!(
+                            "stage=mv-{stage} views={count} mode={} key={key}",
+                            if graph { "graph" } else { "eager" }
+                        );
+                        defects += usize::from(!pixal_score(
+                            s,
+                            data,
+                            reference.tensor(key)?,
+                            cell,
+                            &tag,
+                            false,
+                            false,
+                        )?);
+                        cells += 1;
+                    }
+                    if count > 1 {
+                        for (control, key) in [("media", "global"), ("camera", "projection")] {
+                            for view in 0..count {
+                                let index = view as usize % 4;
+                                let rgba = inputs.tensor(&if control == "media" && view == 1 {
+                                    "robot_crab-rgba".to_owned()
+                                } else {
+                                    format!("mv-{index}-rgba")
+                                })?;
+                                let camera = ProjectionCamera {
+                                    world_to_camera: if control == "camera" && view == 1 {
+                                        inverse_camera
+                                    } else {
+                                        matrices[index * 12..(index + 1) * 12].try_into()?
+                                    },
+                                    horizontal_fov: angles[index],
+                                    mesh_scale: scale,
+                                };
+                                native.stage_view_rgba(
+                                    s,
+                                    rgba.data(),
+                                    [rgba.shape()[0], rgba.shape()[1]],
+                                    camera,
+                                )?;
+                                if graph {
+                                    let slot = if view == 0 {
+                                        0
+                                    } else if view + 1 == count {
+                                        2
+                                    } else {
+                                        1
+                                    };
+                                    pixal_capture(s, &mut graphs[slot], || {
+                                        native.run_device(
+                                            s,
+                                            &blas,
+                                            view,
+                                            count,
+                                            native.projection_rows,
+                                        )
+                                    })?;
+                                } else {
+                                    native.run_device(
+                                        s,
+                                        &blas,
+                                        view,
+                                        count,
+                                        native.projection_rows,
+                                    )?;
+                                }
+                            }
+                            let cell = table["cells"]
+                                .as_array()
+                                .context("cells")?
+                                .iter()
+                                .find(|c| c["name"] == format!("V{count}-{key}"))
+                                .context("MV control cell")?;
+                            let data = if key == "global" {
+                                &native.global
+                            } else {
+                                &native.projection
+                            };
+                            let tag = format!(
+                                "stage=mv-{stage} views={count} graph={graph} control=nonanchor_{control}"
+                            );
+                            let discriminating = pixal_score(
+                                s,
+                                data,
+                                reference.tensor(key)?,
+                                cell,
+                                &tag,
+                                false,
+                                true,
+                            )?;
+                            ensure!(discriminating, "MV native control under 10 tau: {tag}");
+                        }
+                    }
+                }
+            }
+        }
+        std::fs::remove_dir_all(runtime_dir)?;
+        println!(
+            "P1_M2_MULTIVIEW {} cells={cells} defects={defects} graph=true eager=true",
+            if defects == 0 { "PASS" } else { "DEFECT" }
+        );
+        ensure!(
+            cells == 32 && defects == 0,
+            "multi-view candidate defects={defects}, cells={cells}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "GPU published projection reference; FF_P1_M2_ROOT"]
+    fn project_bilinear_definition_gpu() -> Result<()> {
+        use std::path::PathBuf;
+        let root = PathBuf::from(std::env::var_os("FF_P1_M2_ROOT").context("FF_P1_M2_ROOT")?);
+        let project = root
+            .parent()
+            .and_then(|p| p.parent())
+            .context("evidence root")?;
+        let anchor = pixal_anchor(&root)?;
+        let table = anchor["tables"]
+            .as_array()
+            .context("tables")?
+            .iter()
+            .find(|t| t["source_table"] == "floors-projection-published.json")
+            .context("projection table")?;
+        let input_file = std::fs::File::open(root.join("gate-inputs.safetensors"))?;
+        let input_map = unsafe { memmap2::MmapOptions::new().map(&input_file)? };
+        let inputs = safetensors::SafeTensors::deserialize(&input_map)?;
+        let device = Device::new(0)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let op = cubin::module(&device.ctx, "vision_ops")?.load_function("project_bilinear_f32")?;
+        let mut host = Vec::with_capacity(31 * 37 * 17);
+        for y in 0..31 {
+            for x in 0..37 {
+                for c in 0..17 {
+                    host.push(
+                        ((y * 7 + x * 11 + c * 3) % 19 - 9) as f32 / 16.0
+                            + ((y * 13 + x * 5 + c * 7) % 23 - 11) as f32 / 32.0,
+                    );
+                }
+            }
+        }
+        let feature = s.clone_htod(&host)?;
+        let mut defects = 0;
+        let mut cells = 0;
+        let mut mask_controls = 0;
+        for grid_side in [16u32, 32, 64, 96] {
+            let count = grid_side.pow(3);
+            let output = s.alloc_zeros::<f32>(count as usize * 17)?;
+            for name in ["cottage", "robot_crab", "near"] {
+                let mut camera = pixal_camera(
+                    &inputs,
+                    project,
+                    if name == "near" { "cottage" } else { name },
+                )?;
+                if name == "near" {
+                    camera.world_to_camera[11] = -0.125;
+                }
+                let mut parameters = camera.world_to_camera.to_vec();
+                parameters.extend([
+                    (camera.horizontal_fov / 2.0).tan(),
+                    camera.mesh_scale,
+                    1024.0,
+                ]);
+                let parameters = s.clone_htod(&parameters)?;
+                let reference_file = std::fs::File::open(
+                    project
+                        .join("evidence/P1-M1-r1/projection-local")
+                        .join(format!("{grid_side}-{name}.safetensors")),
+                )?;
+                let reference_map = unsafe { memmap2::MmapOptions::new().map(&reference_file)? };
+                let reference = safetensors::SafeTensors::deserialize(&reference_map)?;
+                for graph in [false, true] {
+                    for chunk in [count, 65521] {
+                        pixal_execute(s, graph, || {
+                            for first in (0..count).step_by(chunk as usize) {
+                                let rows = chunk.min(count - first);
+                                unsafe {
+                                    s.launch_builder(&op)
+                                        .arg(&feature)
+                                        .arg(&output)
+                                        .arg(&parameters)
+                                        .arg(&grid_side)
+                                        .arg(&31u32)
+                                        .arg(&37u32)
+                                        .arg(&17u32)
+                                        .arg(&17u32)
+                                        .arg(&0u32)
+                                        .arg(&u64::from(first))
+                                        .arg(&rows)
+                                        .arg(&0u32)
+                                        .arg(&1.0f32)
+                                        .launch(grid(
+                                            (u64::from(rows) * 17).div_ceil(256).min(65535)
+                                                as usize,
+                                            256,
+                                        ))?;
+                                }
+                            }
+                            Ok(())
+                        })?;
+                        for suffix in if name == "near" {
+                            vec!["", "-invalid-mask"]
+                        } else {
+                            vec![""]
+                        } {
+                            let label = format!("{grid_side}-{name}{suffix}");
+                            let cell = table["cells"]
+                                .as_array()
+                                .context("cells")?
+                                .iter()
+                                .find(|c| c["name"] == label)
+                                .context("projection cell")?;
+                            let tag = format!(
+                                "stage=projection cell={label} mode={} chunk={chunk}",
+                                if graph { "graph" } else { "eager" }
+                            );
+                            defects += usize::from(!pixal_score(
+                                s,
+                                &output,
+                                reference.tensor("r0a")?,
+                                cell,
+                                &tag,
+                                false,
+                                false,
+                            )?);
+                            cells += 1;
+                            if suffix == "-invalid-mask" {
+                                let masked = reference.tensor("wrong_zero_invalid")?;
+                                let unmasked = reference.tensor("r3math")?;
+                                ensure!(
+                                    masked.dtype() == safetensors::Dtype::F64
+                                        && unmasked.dtype() == safetensors::Dtype::F64
+                                        && masked.shape() == unmasked.shape()
+                                        && masked.data().len() == output.len() * 8,
+                                    "frozen projection mask layout"
+                                );
+                                let mut wrong = s.clone_dtoh(&output)?;
+                                let mut invalid = 0;
+                                for ((row, masked), unmasked) in wrong
+                                    .as_chunks_mut::<17>()
+                                    .0
+                                    .iter_mut()
+                                    .zip(masked.data().as_chunks::<{ 17 * 8 }>().0.iter())
+                                    .zip(unmasked.data().as_chunks::<{ 17 * 8 }>().0.iter())
+                                {
+                                    let zero = masked
+                                        .as_chunks::<8>()
+                                        .0
+                                        .iter()
+                                        .all(|v| f64::from_le_bytes(*v) == 0.0);
+                                    let signal = unmasked
+                                        .as_chunks::<8>()
+                                        .0
+                                        .iter()
+                                        .any(|v| f64::from_le_bytes(*v) != 0.0);
+                                    ensure!(signal, "ambiguous frozen projection mask");
+                                    if zero {
+                                        row.fill(0.0);
+                                        invalid += 1;
+                                    } else {
+                                        ensure!(
+                                            masked == unmasked,
+                                            "frozen mask alters a valid row"
+                                        );
+                                    }
+                                }
+                                ensure!(invalid > 0, "projection mask control has no invalid rows");
+                                let wrong = s.clone_htod(&wrong)?;
+                                defects += usize::from(!pixal_score(
+                                    s,
+                                    &wrong,
+                                    reference.tensor("r0a")?,
+                                    cell,
+                                    &format!(
+                                        "{tag} control=native_output_zero_invalid invalid={invalid}"
+                                    ),
+                                    false,
+                                    true,
+                                )?);
+                                mask_controls += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        println!(
+            "P1_M2_PROJECTION {} cells={cells} defects={defects} mask_controls={mask_controls} graph=true eager=true full=true chunk65521=true",
+            if defects == 0 { "PASS" } else { "DEFECT" }
+        );
+        ensure!(
+            cells == 64 && mask_controls == 16 && defects == 0,
+            "projection candidate defects={defects}, cells={cells}"
         );
         Ok(())
     }

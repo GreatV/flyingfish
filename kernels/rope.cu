@@ -1,8 +1,9 @@
 #include "gpu_compat.cuh"
 
-__device__ __forceinline__ void rotary_prefix(__nv_bfloat16* q,
-    const __nv_bfloat16* key, const __nv_bfloat16* value,
-    __nv_bfloat16* k, __nv_bfloat16* v, const __nv_bfloat16* table,
+template<typename T>
+__device__ __forceinline__ void rotary_prefix(T* q,
+    const T* key, const T* value,
+    T* k, T* v, const T* table,
     int start, int rows, int q_heads, int kv_heads, int dim, int rotary,
     int capacity) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -24,21 +25,33 @@ __device__ __forceinline__ void rotary_prefix(__nv_bfloat16* q,
     }
     const int half = rotary / 2;
     if (d >= half) return;
-    const __nv_bfloat16* input = query ? q : key;
-    const __nv_bfloat16 a = input[src + d];
-    const __nv_bfloat16 b = input[src + d + half];
-    const __nv_bfloat16 c = table[(size_t)position * rotary + d];
-    const __nv_bfloat16 s = table[(size_t)position * rotary + d + half];
+    const T* input = query ? q : key;
+    const T a = input[src + d];
+    const T b = input[src + d + half];
+    const T c = table[(size_t)position * rotary + d];
+    const T s = table[(size_t)position * rotary + d + half];
+T lo, hi;
+    if constexpr (sizeof(T) == sizeof(float)) {
+        lo = __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s));
+        hi = __fadd_rn(__fmul_rn(b, c), __fmul_rn(a, s));
+    } else {
 #if defined(__HIP__)
-    const __nv_bfloat16 lo = __hsub_rn(__hmul_rn(a, c), __hmul_rn(b, s));
-    const __nv_bfloat16 hi = __hadd_rn(__hmul_rn(b, c), __hmul_rn(a, s));
+    lo = __hsub_rn(__hmul_rn(a, c), __hmul_rn(b, s));
+    hi = __hadd_rn(__hmul_rn(b, c), __hmul_rn(a, s));
 #else
-    const __nv_bfloat16 lo = __hsub(__hmul(a, c), __hmul(b, s));
-    const __nv_bfloat16 hi = __hadd(__hmul(b, c), __hmul(a, s));
+    lo = __hsub(__hmul(a, c), __hmul(b, s));
+    hi = __hadd(__hmul(b, c), __hmul(a, s));
 #endif
-    __nv_bfloat16* output = query ? q + src : k + dst;
+    }
+    T* output = query ? q + src : k + dst;
     output[d] = lo;
     output[d + half] = hi;
+}
+
+extern "C" __global__ void rotary_prefix_kv_f32(float* q,
+    const float* key, const float* value, float* k, float* v, const float* table,
+    int start, int rows, int q_heads, int kv_heads, int dim, int rotary, int capacity) {
+    rotary_prefix(q, key, value, k, v, table, start, rows, q_heads, kv_heads, dim, rotary, capacity);
 }
 
 extern "C" __global__ void rotary_prefix_kv(__nv_bfloat16* q,

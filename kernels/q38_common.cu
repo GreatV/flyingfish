@@ -1014,9 +1014,10 @@ extern "C" __global__ __launch_bounds__(256) void group_norm_nhwc_bf16(
 }
 
 // y[r, c] = bf16(residual[r, c] + bf16(branch[r, c] * scale[c])).
-extern "C" __global__ void channel_scale_residual_bf16(
-    const __nv_bfloat16* residual, const __nv_bfloat16* branch,
-    const __nv_bfloat16* scale, __nv_bfloat16* y,
+template<typename T>
+__device__ __forceinline__ void channel_scale_residual(
+    const T* residual, const T* branch,
+    const T* scale, T* y,
     uint32_t rows, uint32_t width) {
     if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
         gridDim.y != 1 || gridDim.z != 1 || !residual || !branch ||
@@ -1025,6 +1026,20 @@ extern "C" __global__ void channel_scale_residual_bf16(
     for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
          i += uint64_t(gridDim.x) * 256) {
         const uint32_t c = uint32_t(i % width);
-        y[i] = __hadd(residual[i], __hmul(branch[i], scale[c]));
+        if constexpr (sizeof(T) == sizeof(float))
+            y[i] = __fadd_rn(residual[i], __fmul_rn(branch[i], scale[c]));
+        else
+            y[i] = __hadd(residual[i], __hmul(branch[i], scale[c]));
     }
+}
+
+extern "C" __global__ void channel_scale_residual_bf16(
+    const __nv_bfloat16* residual, const __nv_bfloat16* branch,
+    const __nv_bfloat16* scale, __nv_bfloat16* y, uint32_t rows, uint32_t width) {
+    channel_scale_residual(residual, branch, scale, y, rows, width);
+}
+extern "C" __global__ void channel_scale_residual_f32(
+    const float* residual, const float* branch, const float* scale, float* y,
+    uint32_t rows, uint32_t width) {
+    channel_scale_residual(residual, branch, scale, y, rows, width);
 }

@@ -1468,6 +1468,87 @@ impl Blas {
     }
 }
 
+impl Blas {
+    pub(crate) fn batched_f32(
+        &self,
+        left: super::contracts::Tensor<f32, 3>,
+        right: super::contracts::Tensor<f32, 3>,
+        output: &mut super::contracts::TensorMut<f32, 3>,
+        transpose: [bool; 2],
+        alpha: f32,
+    ) -> Result<()> {
+        use super::contracts::no_overlap;
+        for t in [&left, &right, &output.0] {
+            t.validate()?;
+            ensure!(
+                t.stride[2] == 1
+                    && t.stride[1] >= u64::from(t.shape[2])
+                    && (t.stride[0] >= u64::from(t.shape[1]) * t.stride[1]
+                        || (t.stride[0] == u64::from(t.shape[2])
+                            && t.stride[1] >= u64::from(t.shape[0]) * t.stride[0])),
+                "F32 batched GEMM row/head stride"
+            );
+        }
+        no_overlap(&left, &output.0, "left", "output")?;
+        no_overlap(&right, &output.0, "right", "output")?;
+        let [m, k] = if transpose[0] {
+            [left.shape[2], left.shape[1]]
+        } else {
+            [left.shape[1], left.shape[2]]
+        };
+        let [rk, n] = if transpose[1] {
+            [right.shape[2], right.shape[1]]
+        } else {
+            [right.shape[1], right.shape[2]]
+        };
+        let batches = left.shape[0];
+        ensure!(
+            k == rk
+                && right.shape[0] == batches
+                && output.0.shape == [batches, m, n]
+                && alpha.is_finite(),
+            "F32 batched GEMM shape/scale mismatch"
+        );
+        let trans = |value: bool| {
+            if value {
+                bs::cublasOperation_t::CUBLAS_OP_T
+            } else {
+                bs::cublasOperation_t::CUBLAS_OP_N
+            }
+        };
+        let beta = 0f32;
+        unsafe {
+            bs::cublasGemmStridedBatchedEx(
+                *self.decode.handle(),
+                trans(transpose[1]),
+                trans(transpose[0]),
+                i32::try_from(n)?,
+                i32::try_from(m)?,
+                i32::try_from(k)?,
+                (&alpha as *const f32).cast(),
+                right.ptr as *const core::ffi::c_void,
+                bs::cudaDataType_t::CUDA_R_32F,
+                i32::try_from(right.stride[1])?,
+                i64::try_from(right.stride[0])?,
+                left.ptr as *const core::ffi::c_void,
+                bs::cudaDataType_t::CUDA_R_32F,
+                i32::try_from(left.stride[1])?,
+                i64::try_from(left.stride[0])?,
+                (&beta as *const f32).cast(),
+                output.0.ptr as *mut core::ffi::c_void,
+                bs::cudaDataType_t::CUDA_R_32F,
+                i32::try_from(output.0.stride[1])?,
+                i64::try_from(output.0.stride[0])?,
+                i32::try_from(batches)?,
+                bs::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                bs::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+            .result()?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
