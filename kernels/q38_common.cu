@@ -966,21 +966,13 @@ extern "C" __global__ void clamp_f32(float* __restrict__ x, long long count, flo
     x[i] = fminf(fmaxf(x[i], lo), hi);
 }
 
-__device__ __forceinline__ float gn_to_f32(float v) { return v; }
-__device__ __forceinline__ float gn_to_f32(__nv_bfloat16 v) { return __bfloat162float(v); }
-template<typename T> __device__ __forceinline__ T gn_from_f32(float v);
-template<> __device__ __forceinline__ float gn_from_f32<float>(float v) { return v; }
-template<> __device__ __forceinline__ __nv_bfloat16 gn_from_f32<__nv_bfloat16>(float v) {
-    return __float2bfloat16_rn(v);
-}
-
 // NHWC GroupNorm over [batch, spatial, channels] with `groups` channel groups.
 // One CTA of 256 threads per (batch, group); F32 reduction and affine `x * a + b`
 // where `a = rstd * weight[c]` and `b = bias[c] - a * mean`.
-template<typename T>
-__device__ void group_norm_nhwc_impl(
-    const T* x, const T* weight, const T* bias, T* y,
-    uint32_t batch, uint32_t spatial, uint32_t channels, uint32_t groups, float eps) {
+extern "C" __global__ __launch_bounds__(256) void group_norm_nhwc_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* bias,
+    __nv_bfloat16* y, uint32_t batch, uint32_t spatial, uint32_t channels,
+    uint32_t groups, float eps) {
     if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
         gridDim.y != 1 || gridDim.z != 1 || !x || !weight || !bias || !y ||
         !batch || !spatial || !channels || !groups || channels % groups ||
@@ -998,7 +990,7 @@ __device__ void group_norm_nhwc_impl(
     for (uint64_t i = threadIdx.x; i < group_elems; i += 256) {
         const uint64_t hw = i / c_per_group;
         const uint32_t c = c_base + uint32_t(i % c_per_group);
-        sum = __fadd_rn(sum, gn_to_f32(x[batch_base + hw * channels + c]));
+        sum = __fadd_rn(sum, __bfloat162float(x[batch_base + hw * channels + c]));
     }
     const float inv_n = 1.0f / float(group_elems);
     const float mean = __fmul_rn(block_sum(sum, tmp), inv_n);
@@ -1007,7 +999,7 @@ __device__ void group_norm_nhwc_impl(
     for (uint64_t i = threadIdx.x; i < group_elems; i += 256) {
         const uint64_t hw = i / c_per_group;
         const uint32_t c = c_base + uint32_t(i % c_per_group);
-        const float delta = __fsub_rn(gn_to_f32(x[batch_base + hw * channels + c]), mean);
+        const float delta = __fsub_rn(__bfloat162float(x[batch_base + hw * channels + c]), mean);
         var_sum = __fadd_rn(var_sum, __fmul_rn(delta, delta));
     }
     const float rstd = rsqrtf(__fadd_rn(__fmul_rn(block_sum(var_sum, tmp), inv_n), eps));
@@ -1015,24 +1007,10 @@ __device__ void group_norm_nhwc_impl(
         const uint64_t hw = i / c_per_group;
         const uint32_t c = c_base + uint32_t(i % c_per_group);
         const uint64_t idx = batch_base + hw * channels + c;
-        const float a = __fmul_rn(rstd, gn_to_f32(weight[c]));
-        const float b = __fsub_rn(gn_to_f32(bias[c]), __fmul_rn(a, mean));
-        y[idx] = gn_from_f32<T>(__fadd_rn(__fmul_rn(gn_to_f32(x[idx]), a), b));
+        const float a = __fmul_rn(rstd, __bfloat162float(weight[c]));
+        const float b = __fsub_rn(__bfloat162float(bias[c]), __fmul_rn(a, mean));
+        y[idx] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(__bfloat162float(x[idx]), a), b));
     }
-}
-
-extern "C" __global__ __launch_bounds__(256) void group_norm_nhwc_bf16(
-    const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* bias,
-    __nv_bfloat16* y, uint32_t batch, uint32_t spatial, uint32_t channels,
-    uint32_t groups, float eps) {
-    group_norm_nhwc_impl<__nv_bfloat16>(x, weight, bias, y, batch, spatial, channels, groups, eps);
-}
-
-extern "C" __global__ __launch_bounds__(256) void group_norm_nhwc_f32(
-    const float* x, const float* weight, const float* bias,
-    float* y, uint32_t batch, uint32_t spatial, uint32_t channels,
-    uint32_t groups, float eps) {
-    group_norm_nhwc_impl<float>(x, weight, bias, y, batch, spatial, channels, groups, eps);
 }
 
 // y[r, c] = bf16(residual[r, c] + bf16(branch[r, c] * scale[c])).

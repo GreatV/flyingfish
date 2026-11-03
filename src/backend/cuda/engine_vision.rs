@@ -3225,6 +3225,1770 @@ impl EncodedImages {
     }
 }
 
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct DinoV3Config {
+    pub hidden_act: String,
+    pub hidden_size: u32,
+    pub intermediate_size: u32,
+    pub key_bias: bool,
+    pub layer_norm_eps: f32,
+    pub mlp_bias: bool,
+    pub model_type: String,
+    pub num_attention_heads: u32,
+    pub num_channels: u32,
+    pub num_hidden_layers: usize,
+    pub num_register_tokens: usize,
+    pub patch_size: u32,
+    pub proj_bias: bool,
+    pub query_bias: bool,
+    pub rope_theta: f32,
+    pub use_gated_mlp: bool,
+    pub value_bias: bool,
+}
+
+impl DinoV3Config {
+    pub fn from_dir(dir: &std::path::Path) -> Result<Self> {
+        let cfg: Self = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
+        ensure!(
+            cfg.model_type == "dinov3_vit"
+                && cfg.hidden_act == "silu"
+                && cfg.use_gated_mlp
+                && cfg.query_bias
+                && !cfg.key_bias
+                && cfg.value_bias
+                && cfg.proj_bias
+                && cfg.mlp_bias
+                && cfg.hidden_size > 0
+                && cfg.num_attention_heads > 0
+                && cfg.hidden_size.is_multiple_of(cfg.num_attention_heads)
+                && (cfg.hidden_size / cfg.num_attention_heads).is_multiple_of(4)
+                && cfg.patch_size > 0
+                && cfg.num_channels == 3
+                && cfg.num_hidden_layers > 0
+                && cfg.layer_norm_eps > 0.0,
+            "unsupported DINOv3 configuration"
+        );
+        Ok(cfg)
+    }
+
+    pub fn head_dim(&self) -> u32 {
+        self.hidden_size / self.num_attention_heads
+    }
+
+    pub fn patch_dim(&self) -> u32 {
+        self.num_channels * self.patch_size * self.patch_size
+    }
+
+    pub fn prefix_rows(&self) -> usize {
+        1 + self.num_register_tokens
+    }
+
+    pub fn patch_rows(&self, image_side: u32) -> Result<u32> {
+        ensure!(
+            image_side > 0 && image_side.is_multiple_of(self.patch_size),
+            "image_side {image_side} not divisible by patch_size {}",
+            self.patch_size
+        );
+        let grid = image_side / self.patch_size;
+        grid.checked_mul(grid).context("DINOv3 patch_rows overflow")
+    }
+
+    pub fn total_rows(&self, image_side: u32) -> Result<u32> {
+        u32::try_from(self.prefix_rows())?
+            .checked_add(self.patch_rows(image_side)?)
+            .context("DINOv3 total_rows overflow")
+    }
+
+    pub fn expected_loaded_elements(&self) -> usize {
+        let h = self.hidden_size as usize;
+        let inter = self.intermediate_size as usize;
+        let patch_dim = self.patch_dim() as usize;
+        let prefix = self.prefix_rows() * h;
+        let patch_embed = h * patch_dim + h;
+        let per_layer = 2 * (2 * h) + 4 * (h * h) + 3 * h + 2 * h + 3 * (inter * h) + 2 * inter + h;
+        let final_norm = 2 * h;
+        prefix + patch_embed + self.num_hidden_layers * per_layer + final_norm
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct Flux2VaeConfig {
+    #[serde(rename = "_class_name")]
+    pub class_name: String,
+    pub act_fn: String,
+    pub batch_norm_eps: f32,
+    pub block_out_channels: Vec<u32>,
+    pub down_block_types: Vec<String>,
+    pub in_channels: u32,
+    pub latent_channels: u32,
+    pub layers_per_block: usize,
+    pub mid_block_add_attention: bool,
+    pub norm_num_groups: u32,
+    pub patch_size: [u32; 2],
+    pub sample_size: u32,
+    pub use_quant_conv: bool,
+}
+
+impl Flux2VaeConfig {
+    pub fn from_dir(dir: &std::path::Path) -> Result<Self> {
+        let path = if dir.join("config.json").exists()
+            && (dir.join("diffusion_pytorch_model.safetensors").exists()
+                || !dir.join("vae").join("config.json").exists())
+        {
+            dir.join("config.json")
+        } else {
+            dir.join("vae").join("config.json")
+        };
+        let cfg: Self = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        let n = cfg.block_out_channels.len();
+        ensure!(
+            cfg.class_name == "AutoencoderKLFlux2"
+                && cfg.act_fn == "silu"
+                && n > 0
+                && cfg.down_block_types.len() == n
+                && cfg
+                    .down_block_types
+                    .iter()
+                    .all(|t| t == "DownEncoderBlock2D")
+                && cfg.layers_per_block == 2
+                && cfg.mid_block_add_attention
+                && cfg.use_quant_conv
+                && cfg.in_channels == 3
+                && cfg.latent_channels > 0
+                && cfg.norm_num_groups > 0
+                && cfg
+                    .block_out_channels
+                    .iter()
+                    .all(|&c| c > 0 && c.is_multiple_of(cfg.norm_num_groups))
+                && cfg.patch_size == [2, 2]
+                && cfg.sample_size > 0
+                && (cfg.sample_size >> (n - 1)) > 0
+                && (cfg.sample_size >> (n - 1)).is_multiple_of(cfg.patch_size[0]),
+            "unsupported FLUX.2 VAE configuration"
+        );
+        Ok(cfg)
+    }
+
+    pub fn safetensors_path(dir: &std::path::Path) -> std::path::PathBuf {
+        if dir.join("diffusion_pytorch_model.safetensors").exists() {
+            dir.join("diffusion_pytorch_model.safetensors")
+        } else {
+            dir.join("vae").join("diffusion_pytorch_model.safetensors")
+        }
+    }
+
+    pub fn latent_side(&self) -> u32 {
+        self.sample_size >> (self.block_out_channels.len() - 1)
+    }
+
+    pub fn latent_spatial(&self) -> u32 {
+        let s = self.latent_side();
+        s * s
+    }
+
+    pub fn mid_channels(&self) -> u32 {
+        *self.block_out_channels.last().expect("validated non-empty")
+    }
+
+    pub fn quant_channels(&self) -> u32 {
+        2 * self.latent_channels
+    }
+
+    pub fn bn_channels(&self) -> u32 {
+        self.latent_channels * self.patch_size[0] * self.patch_size[1]
+    }
+
+    pub fn patch_rows(&self) -> u32 {
+        let ls = self.latent_side();
+        (ls / self.patch_size[0]) * (ls / self.patch_size[1])
+    }
+
+    pub fn max_feature_elements(&self) -> usize {
+        self.block_out_channels
+            .iter()
+            .enumerate()
+            .map(|(s, &c)| {
+                let hw = (self.sample_size >> s) as usize;
+                hw * hw * (c as usize)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn expected_loaded_elements(&self) -> usize {
+        let mut total = (self.block_out_channels[0] as usize) * (self.in_channels as usize) * 9
+            + (self.block_out_channels[0] as usize);
+        let resnet_elems = |c_in: u32, c_out: u32| -> usize {
+            let ci = c_in as usize;
+            let co = c_out as usize;
+            let mut e = 2 * ci + co * ci * 9 + co + 2 * co + co * co * 9 + co;
+            if ci != co {
+                e += co * ci + co;
+            }
+            e
+        };
+        for (s, &c1) in self.block_out_channels.iter().enumerate() {
+            let c0 = if s == 0 {
+                self.block_out_channels[0]
+            } else {
+                self.block_out_channels[s - 1]
+            };
+            total += resnet_elems(c0, c1) + resnet_elems(c1, c1);
+            if s + 1 < self.block_out_channels.len() {
+                let c = c1 as usize;
+                total += c * c * 9 + c;
+            }
+        }
+        let mc = self.mid_channels();
+        let mcu = mc as usize;
+        total += 2 * resnet_elems(mc, mc);
+        total += 2 * mcu + 4 * (mcu * mcu + mcu);
+        let qc = self.quant_channels() as usize;
+        total += 2 * mcu + qc * mcu * 9 + qc;
+        total += qc * qc + qc;
+        total += 2 * (self.bn_channels() as usize);
+        total
+    }
+}
+
+struct SafetensorsLoader<'a> {
+    st: safetensors::SafeTensors<'a>,
+    remaining: std::collections::BTreeSet<String>,
+    loaded_elements: usize,
+}
+
+impl<'a> SafetensorsLoader<'a> {
+    fn new(bytes: &'a [u8]) -> Result<Self> {
+        let st = safetensors::SafeTensors::deserialize(bytes)?;
+        let remaining = st.names().into_iter().map(str::to_owned).collect();
+        Ok(Self {
+            st,
+            remaining,
+            loaded_elements: 0,
+        })
+    }
+
+    fn take_bf16(
+        &mut self,
+        s: &Arc<CudaStream>,
+        name: &str,
+        expected_shape: &[usize],
+    ) -> Result<CudaSlice<bf16>> {
+        ensure!(
+            self.remaining.remove(name),
+            "tensor {name} missing or loaded twice"
+        );
+        let view = self.st.tensor(name)?;
+        ensure!(
+            view.shape() == expected_shape,
+            "tensor {name} shape {:?} != expected {expected_shape:?}",
+            view.shape()
+        );
+        let host: Vec<bf16> = match view.dtype() {
+            safetensors::Dtype::BF16 => view
+                .data()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| bf16::from_le_bytes(*b))
+                .collect(),
+            safetensors::Dtype::F32 => view
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| bf16::from_f32(f32::from_le_bytes(*b)))
+                .collect(),
+            dt => bail!("unsupported dtype {dt:?} for {name}"),
+        };
+        self.loaded_elements += host.len();
+        Ok(s.clone_htod(&host)?)
+    }
+
+    fn remove_unused(&mut self, name: &str, expected_shape: &[usize]) -> Result<()> {
+        ensure!(
+            self.remaining.remove(name),
+            "expected unused tensor {name} missing"
+        );
+        let view = self.st.tensor(name)?;
+        ensure!(
+            view.shape() == expected_shape,
+            "unused tensor {name} shape {:?} != expected {expected_shape:?}",
+            view.shape()
+        );
+        Ok(())
+    }
+}
+
+struct UnbiasedWeight {
+    weight: CudaSlice<bf16>,
+    shape: [u32; 2],
+}
+
+impl UnbiasedWeight {
+    fn load(
+        loader: &mut SafetensorsLoader<'_>,
+        s: &Arc<CudaStream>,
+        name: &str,
+        shape: [u32; 2],
+    ) -> Result<Self> {
+        Ok(Self {
+            weight: loader.take_bf16(
+                s,
+                &format!("{name}.weight"),
+                &[shape[0] as usize, shape[1] as usize],
+            )?,
+            shape,
+        })
+    }
+
+    fn prepare(&self, blas: &Blas, rows: u32) -> Result<()> {
+        blas.prepare_request_fixed(rows, self.shape[0], self.shape[1])
+    }
+
+    fn run(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        input: Tensor<bf16, 2>,
+        output: &mut TensorMut<bf16, 2>,
+    ) -> Result<()> {
+        blas.linear_typed(
+            crate::op_contract::ExecutionPhase::Prefill,
+            LinearWeightRef::Bf16(dense(&self.weight, s, self.shape)?),
+            input,
+            output,
+        )
+    }
+}
+
+fn load_biased_weight(
+    loader: &mut SafetensorsLoader<'_>,
+    s: &Arc<CudaStream>,
+    name: &str,
+    shape: [u32; 2],
+    stored_shape: &[usize],
+    bias_mode: LinearBiasMode,
+) -> Result<BiasedWeight> {
+    Ok(BiasedWeight {
+        weight: loader.take_bf16(s, &format!("{name}.weight"), stored_shape)?,
+        bias: loader.take_bf16(s, &format!("{name}.bias"), &[shape[0] as usize])?,
+        shape,
+        bias_mode,
+    })
+}
+
+fn load_affine_weights(
+    loader: &mut SafetensorsLoader<'_>,
+    s: &Arc<CudaStream>,
+    name: &str,
+    width: u32,
+) -> Result<AffineWeights> {
+    Ok(AffineWeights {
+        weight: loader.take_bf16(s, &format!("{name}.weight"), &[width as usize])?,
+        bias: loader.take_bf16(s, &format!("{name}.bias"), &[width as usize])?,
+    })
+}
+
+struct DinoV3Layer {
+    norm1: AffineWeights,
+    q: BiasedWeight,
+    k: UnbiasedWeight,
+    v: BiasedWeight,
+    o: BiasedWeight,
+    scale1: CudaSlice<bf16>,
+    norm2: AffineWeights,
+    gate: BiasedWeight,
+    up: BiasedWeight,
+    down: BiasedWeight,
+    scale2: CudaSlice<bf16>,
+}
+
+pub struct DinoV3Workspace {
+    pixel_packed: CudaSlice<f32>,
+    patches: CudaSlice<bf16>,
+    x_a: CudaSlice<bf16>,
+    x_b: CudaSlice<bf16>,
+    x_c: CudaSlice<bf16>,
+    k_cache: CudaSlice<bf16>,
+    v_cache: CudaSlice<bf16>,
+    mlp_a: CudaSlice<bf16>,
+    mlp_b: CudaSlice<bf16>,
+    mlp_c: CudaSlice<bf16>,
+    rope_table: CudaSlice<bf16>,
+    feature1: CudaSlice<f32>,
+    flash_d64: Flash,
+}
+
+pub struct DinoV3Encoder {
+    cfg: DinoV3Config,
+    image_side: u32,
+    prefix_tokens: CudaSlice<bf16>,
+    patch_embed: BiasedWeight,
+    layers: Vec<DinoV3Layer>,
+    final_norm: AffineWeights,
+    common: CommonOpsRef,
+    ops: crate::backend::cuda::ops::Ops,
+    io: VisionIo,
+    channel_scale_residual: CudaFunction,
+    layer_norm_f32: CudaFunction,
+    upcast_f32: CudaFunction,
+    silu_mul_split: CudaFunction,
+}
+
+pub struct DinoV3Output {
+    pub layer0: Option<Vec<f32>>,
+    pub layer15: Option<Vec<f32>>,
+    pub feature1: Vec<f32>,
+}
+
+impl DinoV3Encoder {
+    pub fn load(
+        device: &Device,
+        blas: &mut Blas,
+        common: CommonOpsRef,
+        cfg: DinoV3Config,
+        image_side: u32,
+        safetensors_bytes: &[u8],
+    ) -> Result<(Self, DinoV3Workspace)> {
+        let s = &device.stream;
+        let h = cfg.hidden_size;
+        let hu = h as usize;
+        let inter = cfg.intermediate_size;
+        let inter_u = inter as usize;
+        let patch = cfg.patch_size;
+        let patch_u = patch as usize;
+        let patch_dim = cfg.patch_dim();
+        let patch_rows = cfg.patch_rows(image_side)?;
+        let rows = cfg.total_rows(image_side)?;
+        let rows_u = rows as usize;
+        let heads = cfg.num_attention_heads;
+        let head_dim = cfg.head_dim();
+        let patches_side = image_side / patch;
+
+        let mut loader = SafetensorsLoader::new(safetensors_bytes)?;
+        let cls = loader.take_bf16(s, "embeddings.cls_token", &[1, 1, hu])?;
+        let reg = loader.take_bf16(
+            s,
+            "embeddings.register_tokens",
+            &[1, cfg.num_register_tokens, hu],
+        )?;
+        loader.remove_unused("embeddings.mask_token", &[1, 1, hu])?;
+        let mut prefix_host = s.clone_dtoh(&cls)?;
+        prefix_host.extend(s.clone_dtoh(&reg)?);
+        let prefix_tokens = s.clone_htod(&prefix_host)?;
+        let patch_embed = load_biased_weight(
+            &mut loader,
+            s,
+            "embeddings.patch_embeddings",
+            [h, patch_dim],
+            &[hu, cfg.num_channels as usize, patch_u, patch_u],
+            LinearBiasMode::AfterOutputRound,
+        )?;
+        patch_embed.prepare(s, blas, patch_rows)?;
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        for i in 0..cfg.num_hidden_layers {
+            let p = format!("layer.{i}");
+            let norm1 = load_affine_weights(&mut loader, s, &format!("{p}.norm1"), h)?;
+            let q = load_biased_weight(
+                &mut loader,
+                s,
+                &format!("{p}.attention.q_proj"),
+                [h, h],
+                &[hu, hu],
+                LinearBiasMode::BeforeOutputRound,
+            )?;
+            let k = UnbiasedWeight::load(&mut loader, s, &format!("{p}.attention.k_proj"), [h, h])?;
+            let v = load_biased_weight(
+                &mut loader,
+                s,
+                &format!("{p}.attention.v_proj"),
+                [h, h],
+                &[hu, hu],
+                LinearBiasMode::BeforeOutputRound,
+            )?;
+            let o = load_biased_weight(
+                &mut loader,
+                s,
+                &format!("{p}.attention.o_proj"),
+                [h, h],
+                &[hu, hu],
+                LinearBiasMode::BeforeOutputRound,
+            )?;
+            let scale1 = loader.take_bf16(s, &format!("{p}.layer_scale1.lambda1"), &[hu])?;
+            let norm2 = load_affine_weights(&mut loader, s, &format!("{p}.norm2"), h)?;
+            let gate = load_biased_weight(
+                &mut loader,
+                s,
+                &format!("{p}.mlp.gate_proj"),
+                [inter, h],
+                &[inter_u, hu],
+                LinearBiasMode::BeforeOutputRound,
+            )?;
+            let up = load_biased_weight(
+                &mut loader,
+                s,
+                &format!("{p}.mlp.up_proj"),
+                [inter, h],
+                &[inter_u, hu],
+                LinearBiasMode::BeforeOutputRound,
+            )?;
+            let down = load_biased_weight(
+                &mut loader,
+                s,
+                &format!("{p}.mlp.down_proj"),
+                [h, inter],
+                &[hu, inter_u],
+                LinearBiasMode::BeforeOutputRound,
+            )?;
+            let scale2 = loader.take_bf16(s, &format!("{p}.layer_scale2.lambda1"), &[hu])?;
+            for w in [&q, &v, &o, &gate, &up, &down] {
+                w.prepare(s, blas, rows)?;
+            }
+            k.prepare(blas, rows)?;
+            layers.push(DinoV3Layer {
+                norm1,
+                q,
+                k,
+                v,
+                o,
+                scale1,
+                norm2,
+                gate,
+                up,
+                down,
+                scale2,
+            });
+        }
+        let final_norm = load_affine_weights(&mut loader, s, "norm", h)?;
+        ensure!(
+            loader.remaining.is_empty(),
+            "unconsumed DINOv3 safetensors keys: {:?}",
+            loader.remaining
+        );
+        let expected_elems = cfg.expected_loaded_elements();
+        ensure!(
+            loader.loaded_elements == expected_elems,
+            "DINOv3 loaded element count {} != {expected_elems}",
+            loader.loaded_elements
+        );
+        let rope_host = crate::vision_input::dinov3_rope_table_bf16(
+            cfg.prefix_rows(),
+            patches_side,
+            patches_side,
+            head_dim,
+            cfg.rope_theta,
+        )?;
+        let patch_elems = (patch_rows as usize) * (patch_dim as usize);
+        let ws = DinoV3Workspace {
+            pixel_packed: s.alloc_zeros(patch_elems)?,
+            patches: s.alloc_zeros(patch_elems)?,
+            x_a: s.alloc_zeros(rows_u * hu)?,
+            x_b: s.alloc_zeros(rows_u * hu)?,
+            x_c: s.alloc_zeros(rows_u * hu)?,
+            k_cache: s.alloc_zeros(rows_u * hu)?,
+            v_cache: s.alloc_zeros(rows_u * hu)?,
+            mlp_a: s.alloc_zeros(rows_u * inter_u)?,
+            mlp_b: s.alloc_zeros(rows_u * inter_u)?,
+            mlp_c: s.alloc_zeros(rows_u * inter_u)?,
+            rope_table: s.clone_htod(&rope_host)?,
+            feature1: s.alloc_zeros(rows_u * hu)?,
+            flash_d64: Flash::new_with_score(
+                s.clone(),
+                rows_u,
+                heads as usize,
+                heads as usize,
+                head_dim as usize,
+                Score::from_tokens((head_dim as f32).sqrt().recip(), None)?,
+                rows_u,
+            )?,
+        };
+        let q38_mod = cubin::module(&device.ctx, "q38_common")?;
+        let vis_mod = cubin::module(&device.ctx, "vision_ops")?;
+        let act_mod = cubin::module(&device.ctx, "act")?;
+        Ok((
+            Self {
+                cfg,
+                image_side,
+                prefix_tokens,
+                patch_embed,
+                layers,
+                final_norm,
+                common,
+                ops: crate::backend::cuda::ops::Ops::new(&device.ctx)?,
+                io: VisionIo::new(device, h)?,
+                channel_scale_residual: q38_mod.load_function("channel_scale_residual_bf16")?,
+                layer_norm_f32: q38_mod.load_function("q38_layer_norm_f32")?,
+                upcast_f32: vis_mod.load_function("vision_upcast_f32")?,
+                silu_mul_split: act_mod.load_function("silu_mul_split")?,
+            },
+            ws,
+        ))
+    }
+
+    fn layer_norm(
+        &self,
+        s: &Arc<CudaStream>,
+        norm: &AffineWeights,
+        input: &CudaSlice<bf16>,
+        output: &CudaSlice<bf16>,
+        rows: u32,
+    ) -> Result<()> {
+        let h = self.cfg.hidden_size;
+        self.common.norm.layer_norm(
+            s,
+            dense(input, s, [rows, 1, h])?,
+            dense(&norm.weight, s, [h])?,
+            dense(&norm.bias, s, [h])?,
+            &mut TensorMut(dense(output, s, [rows, 1, h])?),
+            self.cfg.layer_norm_eps,
+        )
+    }
+
+    fn scale_residual(
+        &self,
+        s: &Arc<CudaStream>,
+        residual: &CudaSlice<bf16>,
+        branch: &CudaSlice<bf16>,
+        scale: &CudaSlice<bf16>,
+        rows: u32,
+    ) -> Result<()> {
+        let h = self.cfg.hidden_size;
+        let count = u64::from(rows) * u64::from(h);
+        unsafe {
+            s.launch_builder(&self.channel_scale_residual)
+                .arg(residual)
+                .arg(branch)
+                .arg(scale)
+                .arg(residual)
+                .arg(&rows)
+                .arg(&h)
+                .launch(grid(count.div_ceil(256).min(65535) as usize, 256))?;
+        }
+        Ok(())
+    }
+
+    pub fn encode(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        ws: &mut DinoV3Workspace,
+        chw_f32: &[f32],
+        rope_override: Option<&CudaSlice<bf16>>,
+        capture_layers: bool,
+    ) -> Result<DinoV3Output> {
+        let side = self.image_side as usize;
+        let patch = self.cfg.patch_size;
+        let patch_dim = self.cfg.patch_dim();
+        let patch_rows = self.cfg.patch_rows(self.image_side)?;
+        let prefix_rows = self.cfg.prefix_rows();
+        let rows = self.cfg.total_rows(self.image_side)?;
+        let h = self.cfg.hidden_size;
+        let heads = self.cfg.num_attention_heads;
+        let head_dim = self.cfg.head_dim();
+        let inter = self.cfg.intermediate_size;
+        let packed_host = crate::vision_input::dinov3_pack_normalized_chw(
+            chw_f32,
+            side,
+            side,
+            patch as usize,
+            [0.485, 0.456, 0.406],
+            [0.229, 0.224, 0.225],
+        )?;
+        s.memcpy_htod(&packed_host, &mut ws.pixel_packed)?;
+        self.io.patch_rows(
+            s,
+            dense(&ws.pixel_packed, s, [patch_rows, patch_dim])?,
+            &mut TensorMut(dense(&ws.patches, s, [patch_rows, patch_dim])?),
+            patch_rows,
+            self.cfg.num_channels,
+            patch,
+        )?;
+        s.memcpy_dtod(
+            &self.prefix_tokens,
+            &mut ws.x_a.slice_mut(0..prefix_rows * h as usize),
+        )?;
+        self.patch_embed.run(
+            s,
+            blas,
+            dense(&ws.patches, s, [patch_rows, patch_dim])?,
+            &mut TensorMut(dense_at(
+                &ws.x_a,
+                s,
+                [patch_rows, h],
+                prefix_rows * h as usize,
+            )?),
+        )?;
+        let rope_slice = rope_override.unwrap_or(&ws.rope_table);
+        let mut layer0 = None;
+        let mut layer15 = None;
+        for (idx, layer) in self.layers.iter().enumerate() {
+            self.layer_norm(s, &layer.norm1, &ws.x_a, &ws.x_b, rows)?;
+            layer.q.run(
+                s,
+                blas,
+                dense(&ws.x_b, s, [rows, h])?,
+                &mut TensorMut(dense(&ws.x_c, s, [rows, h])?),
+            )?;
+            layer.k.run(
+                s,
+                blas,
+                dense(&ws.x_b, s, [rows, h])?,
+                &mut TensorMut(stage_view(&ws.mlp_a, s, [rows, h])?),
+            )?;
+            layer.v.run(
+                s,
+                blas,
+                dense(&ws.x_b, s, [rows, h])?,
+                &mut TensorMut(stage_view(&ws.mlp_b, s, [rows, h])?),
+            )?;
+            self.ops.rotary_prefix_kv(
+                s,
+                crate::backend::cuda::ops::RotaryPrefixKv {
+                    q: TensorMut(dense(&ws.x_c, s, [rows, heads, head_dim])?),
+                    key: stage_view(&ws.mlp_a, s, [rows, heads, head_dim])?,
+                    value: stage_view(&ws.mlp_b, s, [rows, heads, head_dim])?,
+                    k: TensorMut(dense(&ws.k_cache, s, [heads, rows, head_dim])?),
+                    v: TensorMut(dense(&ws.v_cache, s, [heads, rows, head_dim])?),
+                    table: dense(rope_slice, s, [rows, head_dim])?,
+                    start: 0,
+                },
+            )?;
+            ws.flash_d64.run(
+                &ws.x_c,
+                h as usize,
+                &ws.k_cache,
+                &ws.v_cache,
+                &mut ws.x_b,
+                Shape {
+                    rows: rows as usize,
+                    start: 0,
+                    capacity: rows as usize,
+                    q_heads: heads as usize,
+                    kv_heads: heads as usize,
+                    head_dim: head_dim as usize,
+                    causal: false,
+                    window_left: None,
+                },
+            )?;
+            layer.o.run(
+                s,
+                blas,
+                dense(&ws.x_b, s, [rows, h])?,
+                &mut TensorMut(dense(&ws.x_c, s, [rows, h])?),
+            )?;
+            self.scale_residual(s, &ws.x_a, &ws.x_c, &layer.scale1, rows)?;
+            self.layer_norm(s, &layer.norm2, &ws.x_a, &ws.x_b, rows)?;
+            layer.gate.run(
+                s,
+                blas,
+                dense(&ws.x_b, s, [rows, h])?,
+                &mut TensorMut(dense(&ws.mlp_a, s, [rows, inter])?),
+            )?;
+            layer.up.run(
+                s,
+                blas,
+                dense(&ws.x_b, s, [rows, h])?,
+                &mut TensorMut(dense(&ws.mlp_b, s, [rows, inter])?),
+            )?;
+            let mlp_elems = (rows * inter) as usize;
+            let cfg = crate::backend::cuda::ops::silu_mul_split_grid(
+                mlp_elems,
+                ws.mlp_a.device_ptr(s).0,
+                ws.mlp_b.device_ptr(s).0,
+                ws.mlp_c.device_ptr(s).0,
+            )?;
+            let mlp_count = i32::try_from(mlp_elems)?;
+            unsafe {
+                s.launch_builder(&self.silu_mul_split)
+                    .arg(&ws.mlp_a)
+                    .arg(&ws.mlp_b)
+                    .arg(&ws.mlp_c)
+                    .arg(&mlp_count)
+                    .arg(&0i32)
+                    .launch(cfg)?;
+            }
+            layer.down.run(
+                s,
+                blas,
+                dense(&ws.mlp_c, s, [rows, inter])?,
+                &mut TensorMut(dense(&ws.x_c, s, [rows, h])?),
+            )?;
+            self.scale_residual(s, &ws.x_a, &ws.x_c, &layer.scale2, rows)?;
+            if capture_layers && idx == 0 {
+                layer0 = Some(
+                    s.clone_dtoh(&ws.x_a)?
+                        .into_iter()
+                        .map(bf16::to_f32)
+                        .collect(),
+                );
+            } else if capture_layers && idx == 15 {
+                layer15 = Some(
+                    s.clone_dtoh(&ws.x_a)?
+                        .into_iter()
+                        .map(bf16::to_f32)
+                        .collect(),
+                );
+            }
+        }
+        self.layer_norm(s, &self.final_norm, &ws.x_a, &ws.x_b, rows)?;
+        let total_elems = rows * h;
+        unsafe {
+            s.launch_builder(&self.upcast_f32)
+                .arg(&ws.x_b)
+                .arg(&ws.feature1)
+                .arg(&total_elems)
+                .launch(grid((total_elems as usize).div_ceil(256).min(65535), 256))?;
+            s.launch_builder(&self.layer_norm_f32)
+                .arg(&ws.feature1)
+                .arg(&0u64)
+                .arg(&0u64)
+                .arg(&ws.feature1)
+                .arg(&rows)
+                .arg(&1u32)
+                .arg(&h)
+                .arg(&u64::from(h))
+                .arg(&u64::from(h))
+                .arg(&1u64)
+                .arg(&u64::from(h))
+                .arg(&u64::from(h))
+                .arg(&1u64)
+                .arg(&self.cfg.layer_norm_eps)
+                .launch(grid(rows as usize, 256))?;
+        }
+        Ok(DinoV3Output {
+            layer0,
+            layer15,
+            feature1: s.clone_dtoh(&ws.feature1)?,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Conv2dGeom {
+    h: u32,
+    w: u32,
+    c_in: u32,
+    c_out: u32,
+    kh: u32,
+    kw: u32,
+    sh: u32,
+    sw: u32,
+    pad: [u32; 4],
+}
+
+impl Conv2dGeom {
+    fn out_hw(self) -> (u32, u32) {
+        (
+            (self.h + self.pad[0] + self.pad[1] - self.kh) / self.sh + 1,
+            (self.w + self.pad[2] + self.pad[3] - self.kw) / self.sw + 1,
+        )
+    }
+
+    fn strip_h(self, strip_pixels: u32) -> u32 {
+        let (out_h, out_w) = self.out_hw();
+        (strip_pixels / out_w).min(out_h)
+    }
+}
+
+struct VaeResnetBlock {
+    norm1: AffineWeights,
+    conv1: BiasedWeight,
+    norm2: AffineWeights,
+    conv2: BiasedWeight,
+    shortcut: Option<BiasedWeight>,
+    h: u32,
+    w: u32,
+    c_in: u32,
+    c_out: u32,
+}
+
+struct VaeDownBlock {
+    resnets: [VaeResnetBlock; 2],
+    downsampler: Option<(BiasedWeight, u32, u32, u32)>,
+}
+
+struct VaeMidAttn {
+    group_norm: AffineWeights,
+    to_q: BiasedWeight,
+    to_k: BiasedWeight,
+    to_v: BiasedWeight,
+    to_out: BiasedWeight,
+}
+
+pub struct Flux2VaeWorkspace {
+    pub strip_pixels: u32,
+    input_chw: CudaSlice<f32>,
+    buf_0: CudaSlice<bf16>,
+    buf_1: CudaSlice<bf16>,
+    buf_2: CudaSlice<bf16>,
+    im2col: CudaSlice<bf16>,
+    mid_v: CudaSlice<bf16>,
+    noise_nchw: CudaSlice<bf16>,
+    moments_nchw: CudaSlice<bf16>,
+    feature2: CudaSlice<f32>,
+    flash_d512: Flash,
+}
+
+pub struct Flux2VaeEncoder {
+    cfg: Flux2VaeConfig,
+    prefix_rows: usize,
+    conv_in: BiasedWeight,
+    down_blocks: Vec<VaeDownBlock>,
+    mid_resnet0: VaeResnetBlock,
+    mid_attn: VaeMidAttn,
+    mid_resnet1: VaeResnetBlock,
+    conv_norm_out: AffineWeights,
+    conv_out: BiasedWeight,
+    quant_conv: BiasedWeight,
+    bn_mean: CudaSlice<bf16>,
+    bn_var: CudaSlice<bf16>,
+    ops: crate::backend::cuda::ops::Ops,
+    chw_scale_shift: CudaFunction,
+    im2col_fn: CudaFunction,
+    group_norm_fn: CudaFunction,
+    act_fn: CudaFunction,
+    diag_gauss_bn_fn: CudaFunction,
+}
+
+pub struct Flux2VaeOutput {
+    pub moments_f32: Vec<f32>,
+    pub feature2_f32: Vec<f32>,
+}
+
+impl Flux2VaeEncoder {
+    fn load_resnet(
+        loader: &mut SafetensorsLoader<'_>,
+        s: &Arc<CudaStream>,
+        blas: &mut Blas,
+        prefix: &str,
+        hw_c: (u32, u32, u32, u32),
+        strip_pixels: u32,
+    ) -> Result<VaeResnetBlock> {
+        let (h, w, c_in, c_out) = hw_c;
+        let norm1 = load_affine_weights(loader, s, &format!("{prefix}.norm1"), c_in)?;
+        let conv1 = load_biased_weight(
+            loader,
+            s,
+            &format!("{prefix}.conv1"),
+            [c_out, c_in * 9],
+            &[c_out as usize, c_in as usize, 3, 3],
+            LinearBiasMode::AfterOutputRound,
+        )?;
+        let norm2 = load_affine_weights(loader, s, &format!("{prefix}.norm2"), c_out)?;
+        let conv2 = load_biased_weight(
+            loader,
+            s,
+            &format!("{prefix}.conv2"),
+            [c_out, c_out * 9],
+            &[c_out as usize, c_out as usize, 3, 3],
+            LinearBiasMode::AfterOutputRound,
+        )?;
+        let strip_rows = ((strip_pixels / w).min(h)) * w;
+        conv1.prepare(s, blas, strip_rows)?;
+        conv2.prepare(s, blas, strip_rows)?;
+        let shortcut = if c_in != c_out {
+            let sc = load_biased_weight(
+                loader,
+                s,
+                &format!("{prefix}.conv_shortcut"),
+                [c_out, c_in],
+                &[c_out as usize, c_in as usize, 1, 1],
+                LinearBiasMode::AfterOutputRound,
+            )?;
+            sc.prepare(s, blas, h * w)?;
+            Some(sc)
+        } else {
+            None
+        };
+        Ok(VaeResnetBlock {
+            norm1,
+            conv1,
+            norm2,
+            conv2,
+            shortcut,
+            h,
+            w,
+            c_in,
+            c_out,
+        })
+    }
+
+    pub fn load(
+        device: &Device,
+        blas: &mut Blas,
+        cfg: Flux2VaeConfig,
+        prefix_rows: usize,
+        safetensors_bytes: &[u8],
+        reserve_bytes: usize,
+    ) -> Result<(Self, Flux2VaeWorkspace)> {
+        let s = &device.stream;
+        let mut loader = SafetensorsLoader::new(safetensors_bytes)?;
+        let names: Vec<String> = loader.remaining.iter().cloned().collect();
+        let mut removed_decoder = 0usize;
+        for name in names {
+            if name.starts_with("decoder.") || name.starts_with("post_quant_conv.") {
+                let shape = loader.st.tensor(&name)?.shape().to_vec();
+                loader.remove_unused(&name, &shape)?;
+                removed_decoder += 1;
+            }
+        }
+        ensure!(
+            removed_decoder == 140,
+            "unexpected FLUX.2 VAE decoder key count {removed_decoder}"
+        );
+        let sample_size = cfg.sample_size;
+        let in_ch = cfg.in_channels;
+        let latent_side = cfg.latent_side();
+        let latent_spatial = cfg.latent_spatial();
+        let mid_ch = cfg.mid_channels();
+        let quant_ch = cfg.quant_channels();
+        let bn_ch = cfg.bn_channels();
+        let feature2_rows = prefix_rows
+            .checked_add(cfg.patch_rows() as usize)
+            .context("feature2 row count overflow")?;
+        let input_chw_elems = (in_ch as usize) * (sample_size as usize) * (sample_size as usize);
+        let max_map = cfg.max_feature_elements();
+        let mid_v_elems = (latent_spatial as usize) * (mid_ch as usize);
+        let noise_elems = (cfg.latent_channels as usize) * (latent_spatial as usize);
+        let moments_elems = (quant_ch as usize) * (latent_spatial as usize);
+        let feature2_elems = feature2_rows * (bn_ch as usize);
+        let base_ws = input_chw_elems * size_of::<f32>()
+            + 3 * max_map * size_of::<bf16>()
+            + mid_v_elems * size_of::<bf16>()
+            + noise_elems * size_of::<bf16>()
+            + moments_elems * size_of::<bf16>()
+            + feature2_elems * size_of::<f32>();
+        let (free, _) = device.ctx.mem_get_info()?;
+        let avail = free.saturating_sub(reserve_bytes);
+        let avail_im2col = avail
+            .checked_sub(base_ws)
+            .context("FLUX.2 VAE fixed workspace exceeds available device memory")?;
+        let max_c_stage = cfg
+            .block_out_channels
+            .iter()
+            .position(|&c| c == mid_ch)
+            .context("mid_channels missing from block_out_channels")?;
+        let peak_max_c_side = sample_size >> max_c_stage;
+        let peak_max_c_pixels = (peak_max_c_side * peak_max_c_side) as usize;
+        let col_bytes = (mid_ch as usize) * 9 * size_of::<bf16>();
+        let max_fit_pixels = (avail_im2col / col_bytes).min(peak_max_c_pixels);
+        ensure!(
+            max_fit_pixels >= sample_size as usize,
+            "FLUX.2 VAE im2col workspace does not fit a single row strip ({avail_im2col} B available)"
+        );
+        let strip_pixels = 1u32 << (max_fit_pixels as u32).ilog2();
+
+        let c0_init = cfg.block_out_channels[0];
+        let conv_in = load_biased_weight(
+            &mut loader,
+            s,
+            "encoder.conv_in",
+            [c0_init, in_ch * 9],
+            &[c0_init as usize, in_ch as usize, 3, 3],
+            LinearBiasMode::AfterOutputRound,
+        )?;
+        conv_in.prepare(
+            s,
+            blas,
+            ((strip_pixels / sample_size).min(sample_size)) * sample_size,
+        )?;
+        let num_stages = cfg.block_out_channels.len();
+        let mut down_blocks = Vec::with_capacity(num_stages);
+        for (idx, &c1) in cfg.block_out_channels.iter().enumerate() {
+            let hw = sample_size >> idx;
+            let c0 = if idx == 0 {
+                c0_init
+            } else {
+                cfg.block_out_channels[idx - 1]
+            };
+            let has_down = idx + 1 < num_stages;
+            let p = format!("encoder.down_blocks.{idx}");
+            let r0 = Self::load_resnet(
+                &mut loader,
+                s,
+                blas,
+                &format!("{p}.resnets.0"),
+                (hw, hw, c0, c1),
+                strip_pixels,
+            )?;
+            let r1 = Self::load_resnet(
+                &mut loader,
+                s,
+                blas,
+                &format!("{p}.resnets.1"),
+                (hw, hw, c1, c1),
+                strip_pixels,
+            )?;
+            let downsampler = if has_down {
+                let conv = load_biased_weight(
+                    &mut loader,
+                    s,
+                    &format!("{p}.downsamplers.0.conv"),
+                    [c1, c1 * 9],
+                    &[c1 as usize, c1 as usize, 3, 3],
+                    LinearBiasMode::AfterOutputRound,
+                )?;
+                let out_hw = hw / 2;
+                let strip_rows = ((strip_pixels / out_hw).min(out_hw)) * out_hw;
+                conv.prepare(s, blas, strip_rows)?;
+                Some((conv, hw, hw, c1))
+            } else {
+                None
+            };
+            down_blocks.push(VaeDownBlock {
+                resnets: [r0, r1],
+                downsampler,
+            });
+        }
+        let mid_resnet0 = Self::load_resnet(
+            &mut loader,
+            s,
+            blas,
+            "encoder.mid_block.resnets.0",
+            (latent_side, latent_side, mid_ch, mid_ch),
+            strip_pixels,
+        )?;
+        let mcu = mid_ch as usize;
+        let mid_attn = VaeMidAttn {
+            group_norm: load_affine_weights(
+                &mut loader,
+                s,
+                "encoder.mid_block.attentions.0.group_norm",
+                mid_ch,
+            )?,
+            to_q: load_biased_weight(
+                &mut loader,
+                s,
+                "encoder.mid_block.attentions.0.to_q",
+                [mid_ch, mid_ch],
+                &[mcu, mcu],
+                LinearBiasMode::BeforeOutputRound,
+            )?,
+            to_k: load_biased_weight(
+                &mut loader,
+                s,
+                "encoder.mid_block.attentions.0.to_k",
+                [mid_ch, mid_ch],
+                &[mcu, mcu],
+                LinearBiasMode::BeforeOutputRound,
+            )?,
+            to_v: load_biased_weight(
+                &mut loader,
+                s,
+                "encoder.mid_block.attentions.0.to_v",
+                [mid_ch, mid_ch],
+                &[mcu, mcu],
+                LinearBiasMode::BeforeOutputRound,
+            )?,
+            to_out: load_biased_weight(
+                &mut loader,
+                s,
+                "encoder.mid_block.attentions.0.to_out.0",
+                [mid_ch, mid_ch],
+                &[mcu, mcu],
+                LinearBiasMode::BeforeOutputRound,
+            )?,
+        };
+        for w in [
+            &mid_attn.to_q,
+            &mid_attn.to_k,
+            &mid_attn.to_v,
+            &mid_attn.to_out,
+        ] {
+            w.prepare(s, blas, latent_spatial)?;
+        }
+        let mid_resnet1 = Self::load_resnet(
+            &mut loader,
+            s,
+            blas,
+            "encoder.mid_block.resnets.1",
+            (latent_side, latent_side, mid_ch, mid_ch),
+            strip_pixels,
+        )?;
+        let conv_norm_out = load_affine_weights(&mut loader, s, "encoder.conv_norm_out", mid_ch)?;
+        let qcu = quant_ch as usize;
+        let conv_out = load_biased_weight(
+            &mut loader,
+            s,
+            "encoder.conv_out",
+            [quant_ch, mid_ch * 9],
+            &[qcu, mcu, 3, 3],
+            LinearBiasMode::AfterOutputRound,
+        )?;
+        conv_out.prepare(
+            s,
+            blas,
+            ((strip_pixels / latent_side).min(latent_side)) * latent_side,
+        )?;
+        let quant_conv = load_biased_weight(
+            &mut loader,
+            s,
+            "quant_conv",
+            [quant_ch, quant_ch],
+            &[qcu, qcu, 1, 1],
+            LinearBiasMode::AfterOutputRound,
+        )?;
+        quant_conv.prepare(s, blas, latent_spatial)?;
+        let bn_mean = loader.take_bf16(s, "bn.running_mean", &[bn_ch as usize])?;
+        let bn_var = loader.take_bf16(s, "bn.running_var", &[bn_ch as usize])?;
+        loader.remove_unused("bn.num_batches_tracked", &[])?;
+        ensure!(
+            loader.remaining.is_empty(),
+            "unconsumed FLUX.2 VAE encoder keys: {:?}",
+            loader.remaining
+        );
+        let expected_elems = cfg.expected_loaded_elements();
+        ensure!(
+            loader.loaded_elements == expected_elems,
+            "FLUX.2 VAE loaded element count {} != {expected_elems}",
+            loader.loaded_elements
+        );
+        let ws = Flux2VaeWorkspace {
+            strip_pixels,
+            input_chw: s.alloc_zeros(input_chw_elems)?,
+            buf_0: s.alloc_zeros(max_map)?,
+            buf_1: s.alloc_zeros(max_map)?,
+            buf_2: s.alloc_zeros(max_map)?,
+            im2col: s.alloc_zeros((strip_pixels as usize) * mcu * 9)?,
+            mid_v: s.alloc_zeros(mid_v_elems)?,
+            noise_nchw: s.alloc_zeros(noise_elems)?,
+            moments_nchw: s.alloc_zeros(moments_elems)?,
+            feature2: s.alloc_zeros(feature2_elems)?,
+            flash_d512: Flash::new_with_score(
+                s.clone(),
+                latent_spatial as usize,
+                1,
+                1,
+                mcu,
+                Score::from_tokens((mid_ch as f32).sqrt().recip(), None)?,
+                latent_spatial as usize,
+            )?,
+        };
+        let vis_mod = cubin::module(&device.ctx, "vision_ops")?;
+        let q38_mod = cubin::module(&device.ctx, "q38_common")?;
+        Ok((
+            Self {
+                cfg,
+                prefix_rows,
+                conv_in,
+                down_blocks,
+                mid_resnet0,
+                mid_attn,
+                mid_resnet1,
+                conv_norm_out,
+                conv_out,
+                quant_conv,
+                bn_mean,
+                bn_var,
+                ops: crate::backend::cuda::ops::Ops::new(&device.ctx)?,
+                chw_scale_shift: vis_mod.load_function("chw_to_nhwc_scale_shift_bf16")?,
+                im2col_fn: vis_mod.load_function("masked_strided_patch_bf16")?,
+                group_norm_fn: q38_mod.load_function("group_norm_nhwc_bf16")?,
+                act_fn: vis_mod.load_function("activation_bf16")?,
+                diag_gauss_bn_fn: vis_mod.load_function("diagonal_gaussian_patch_bn_f32")?,
+            },
+            ws,
+        ))
+    }
+
+    fn group_norm(
+        &self,
+        s: &Arc<CudaStream>,
+        norm: &AffineWeights,
+        input: &CudaSlice<bf16>,
+        output: &CudaSlice<bf16>,
+        hw_c: (u32, u32, u32),
+    ) -> Result<()> {
+        let (h, w, c) = hw_c;
+        let spatial = h * w;
+        let groups = self.cfg.norm_num_groups;
+        unsafe {
+            s.launch_builder(&self.group_norm_fn)
+                .arg(input)
+                .arg(&norm.weight)
+                .arg(&norm.bias)
+                .arg(output)
+                .arg(&1u32)
+                .arg(&spatial)
+                .arg(&c)
+                .arg(&groups)
+                .arg(&1e-6f32)
+                .launch(grid(groups as usize, 256))?;
+        }
+        Ok(())
+    }
+
+    fn silu_in_place(
+        &self,
+        s: &Arc<CudaStream>,
+        buf: &CudaSlice<bf16>,
+        rows: u32,
+        width: u32,
+    ) -> Result<()> {
+        let count = u64::from(rows) * u64::from(width);
+        unsafe {
+            s.launch_builder(&self.act_fn)
+                .arg(buf)
+                .arg(buf)
+                .arg(&rows)
+                .arg(&width)
+                .arg(&1i32)
+                .launch(grid(count.div_ceil(256).min(65535) as usize, 256))?;
+        }
+        Ok(())
+    }
+
+    fn add_in_place(
+        &self,
+        s: &Arc<CudaStream>,
+        dst: &CudaSlice<bf16>,
+        src: &CudaSlice<bf16>,
+        count: u32,
+    ) -> Result<()> {
+        let n = i32::try_from(count)?;
+        unsafe {
+            s.launch_builder(&self.ops.residual)
+                .arg(dst)
+                .arg(src)
+                .arg(&n)
+                .launch(flat((count as usize).div_ceil(8)))?;
+        }
+        Ok(())
+    }
+
+    fn conv2d(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        conv: &BiasedWeight,
+        buffers: (&CudaSlice<bf16>, &CudaSlice<bf16>, &CudaSlice<bf16>),
+        geom: Conv2dGeom,
+        strip_pixels: u32,
+    ) -> Result<()> {
+        let (input, im2col, output) = buffers;
+        if geom.kh == 1 && geom.kw == 1 && geom.sh == 1 && geom.sw == 1 && geom.pad == [0; 4] {
+            let rows = geom.h * geom.w;
+            return conv.run(
+                s,
+                blas,
+                stage_view(input, s, [rows, geom.c_in])?,
+                &mut TensorMut(stage_view(output, s, [rows, geom.c_out])?),
+            );
+        }
+        let (out_h, out_w) = geom.out_hw();
+        let strip_h = geom.strip_h(strip_pixels);
+        let col_width = geom.c_in * geom.kh * geom.kw;
+        let mut y0 = 0u32;
+        while y0 < out_h {
+            let yc = strip_h.min(out_h - y0);
+            let strip_rows = yc * out_w;
+            let count = u64::from(strip_rows) * u64::from(col_width);
+            unsafe {
+                s.launch_builder(&self.im2col_fn)
+                    .arg(input)
+                    .arg(&0u64)
+                    .arg(im2col)
+                    .arg(&geom.h)
+                    .arg(&geom.w)
+                    .arg(&geom.c_in)
+                    .arg(&geom.kh)
+                    .arg(&geom.kw)
+                    .arg(&geom.sh)
+                    .arg(&geom.sw)
+                    .arg(&geom.pad[0])
+                    .arg(&geom.pad[1])
+                    .arg(&geom.pad[2])
+                    .arg(&geom.pad[3])
+                    .arg(&y0)
+                    .arg(&yc)
+                    .launch(grid(count.div_ceil(256).min(65535) as usize, 256))?;
+            }
+            conv.run(
+                s,
+                blas,
+                stage_view(im2col, s, [strip_rows, col_width])?,
+                &mut TensorMut(dense_at(
+                    output,
+                    s,
+                    [strip_rows, geom.c_out],
+                    (y0 * out_w * geom.c_out) as usize,
+                )?),
+            )?;
+            y0 += yc;
+        }
+        Ok(())
+    }
+
+    fn run_resnet(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        block: &VaeResnetBlock,
+        ws: &mut Flux2VaeWorkspace,
+    ) -> Result<()> {
+        let rows = block.h * block.w;
+        let sp = ws.strip_pixels;
+        self.group_norm(
+            s,
+            &block.norm1,
+            &ws.buf_0,
+            &ws.buf_1,
+            (block.h, block.w, block.c_in),
+        )?;
+        self.silu_in_place(s, &ws.buf_1, rows, block.c_in)?;
+        self.conv2d(
+            s,
+            blas,
+            &block.conv1,
+            (&ws.buf_1, &ws.im2col, &ws.buf_2),
+            Conv2dGeom {
+                h: block.h,
+                w: block.w,
+                c_in: block.c_in,
+                c_out: block.c_out,
+                kh: 3,
+                kw: 3,
+                sh: 1,
+                sw: 1,
+                pad: [1, 1, 1, 1],
+            },
+            sp,
+        )?;
+        self.group_norm(
+            s,
+            &block.norm2,
+            &ws.buf_2,
+            &ws.buf_1,
+            (block.h, block.w, block.c_out),
+        )?;
+        self.silu_in_place(s, &ws.buf_1, rows, block.c_out)?;
+        self.conv2d(
+            s,
+            blas,
+            &block.conv2,
+            (&ws.buf_1, &ws.im2col, &ws.buf_2),
+            Conv2dGeom {
+                h: block.h,
+                w: block.w,
+                c_in: block.c_out,
+                c_out: block.c_out,
+                kh: 3,
+                kw: 3,
+                sh: 1,
+                sw: 1,
+                pad: [1, 1, 1, 1],
+            },
+            sp,
+        )?;
+        if let Some(sc) = &block.shortcut {
+            self.conv2d(
+                s,
+                blas,
+                sc,
+                (&ws.buf_0, &ws.im2col, &ws.buf_1),
+                Conv2dGeom {
+                    h: block.h,
+                    w: block.w,
+                    c_in: block.c_in,
+                    c_out: block.c_out,
+                    kh: 1,
+                    kw: 1,
+                    sh: 1,
+                    sw: 1,
+                    pad: [0, 0, 0, 0],
+                },
+                sp,
+            )?;
+            self.add_in_place(s, &ws.buf_1, &ws.buf_2, rows * block.c_out)?;
+            std::mem::swap(&mut ws.buf_0, &mut ws.buf_1);
+        } else {
+            self.add_in_place(s, &ws.buf_0, &ws.buf_2, rows * block.c_out)?;
+        }
+        Ok(())
+    }
+
+    pub fn encode(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        ws: &mut Flux2VaeWorkspace,
+        chw_f32: &[f32],
+        noise_bf16: &[bf16],
+        downsample_pad: [u32; 4],
+    ) -> Result<Flux2VaeOutput> {
+        let sample_size = self.cfg.sample_size;
+        let in_ch = self.cfg.in_channels;
+        let c0_init = self.cfg.block_out_channels[0];
+        let latent_side = self.cfg.latent_side();
+        let latent_spatial = self.cfg.latent_spatial();
+        let mid_ch = self.cfg.mid_channels();
+        let quant_ch = self.cfg.quant_channels();
+        let latent_ch = self.cfg.latent_channels;
+        let bn_ch = self.cfg.bn_channels() as usize;
+
+        s.memcpy_htod(chw_f32, &mut ws.input_chw)?;
+        s.memcpy_htod(noise_bf16, &mut ws.noise_nchw)?;
+        let in_elems = u64::from(in_ch) * u64::from(sample_size) * u64::from(sample_size);
+        unsafe {
+            s.launch_builder(&self.chw_scale_shift)
+                .arg(&ws.input_chw)
+                .arg(&ws.buf_1)
+                .arg(&in_ch)
+                .arg(&sample_size)
+                .arg(&sample_size)
+                .arg(&2.0f32)
+                .arg(&-1.0f32)
+                .launch(grid(in_elems.div_ceil(256).min(65535) as usize, 256))?;
+        }
+        let sp = ws.strip_pixels;
+        self.conv2d(
+            s,
+            blas,
+            &self.conv_in,
+            (&ws.buf_1, &ws.im2col, &ws.buf_0),
+            Conv2dGeom {
+                h: sample_size,
+                w: sample_size,
+                c_in: in_ch,
+                c_out: c0_init,
+                kh: 3,
+                kw: 3,
+                sh: 1,
+                sw: 1,
+                pad: [1, 1, 1, 1],
+            },
+            sp,
+        )?;
+        for stage in &self.down_blocks {
+            for r in &stage.resnets {
+                self.run_resnet(s, blas, r, ws)?;
+            }
+            if let Some((conv, h, w, c)) = &stage.downsampler {
+                self.conv2d(
+                    s,
+                    blas,
+                    conv,
+                    (&ws.buf_0, &ws.im2col, &ws.buf_1),
+                    Conv2dGeom {
+                        h: *h,
+                        w: *w,
+                        c_in: *c,
+                        c_out: *c,
+                        kh: 3,
+                        kw: 3,
+                        sh: 2,
+                        sw: 2,
+                        pad: downsample_pad,
+                    },
+                    sp,
+                )?;
+                std::mem::swap(&mut ws.buf_0, &mut ws.buf_1);
+            }
+        }
+        self.run_resnet(s, blas, &self.mid_resnet0, ws)?;
+        self.group_norm(
+            s,
+            &self.mid_attn.group_norm,
+            &ws.buf_0,
+            &ws.buf_1,
+            (latent_side, latent_side, mid_ch),
+        )?;
+        self.mid_attn.to_q.run(
+            s,
+            blas,
+            stage_view(&ws.buf_1, s, [latent_spatial, mid_ch])?,
+            &mut TensorMut(stage_view(&ws.buf_2, s, [latent_spatial, mid_ch])?),
+        )?;
+        self.mid_attn.to_k.run(
+            s,
+            blas,
+            stage_view(&ws.buf_1, s, [latent_spatial, mid_ch])?,
+            &mut TensorMut(stage_view(&ws.im2col, s, [latent_spatial, mid_ch])?),
+        )?;
+        self.mid_attn.to_v.run(
+            s,
+            blas,
+            stage_view(&ws.buf_1, s, [latent_spatial, mid_ch])?,
+            &mut TensorMut(dense(&ws.mid_v, s, [latent_spatial, mid_ch])?),
+        )?;
+        ws.flash_d512.run(
+            &ws.buf_2,
+            mid_ch as usize,
+            &ws.im2col,
+            &ws.mid_v,
+            &mut ws.buf_1,
+            Shape {
+                rows: latent_spatial as usize,
+                start: 0,
+                capacity: latent_spatial as usize,
+                q_heads: 1,
+                kv_heads: 1,
+                head_dim: mid_ch as usize,
+                causal: false,
+                window_left: None,
+            },
+        )?;
+        self.mid_attn.to_out.run(
+            s,
+            blas,
+            stage_view(&ws.buf_1, s, [latent_spatial, mid_ch])?,
+            &mut TensorMut(stage_view(&ws.buf_2, s, [latent_spatial, mid_ch])?),
+        )?;
+        self.add_in_place(s, &ws.buf_0, &ws.buf_2, latent_spatial * mid_ch)?;
+        self.run_resnet(s, blas, &self.mid_resnet1, ws)?;
+        self.group_norm(
+            s,
+            &self.conv_norm_out,
+            &ws.buf_0,
+            &ws.buf_1,
+            (latent_side, latent_side, mid_ch),
+        )?;
+        self.silu_in_place(s, &ws.buf_1, latent_spatial, mid_ch)?;
+        self.conv2d(
+            s,
+            blas,
+            &self.conv_out,
+            (&ws.buf_1, &ws.im2col, &ws.buf_0),
+            Conv2dGeom {
+                h: latent_side,
+                w: latent_side,
+                c_in: mid_ch,
+                c_out: quant_ch,
+                kh: 3,
+                kw: 3,
+                sh: 1,
+                sw: 1,
+                pad: [1, 1, 1, 1],
+            },
+            sp,
+        )?;
+        self.conv2d(
+            s,
+            blas,
+            &self.quant_conv,
+            (&ws.buf_0, &ws.im2col, &ws.buf_1),
+            Conv2dGeom {
+                h: latent_side,
+                w: latent_side,
+                c_in: quant_ch,
+                c_out: quant_ch,
+                kh: 1,
+                kw: 1,
+                sh: 1,
+                sw: 1,
+                pad: [0, 0, 0, 0],
+            },
+            sp,
+        )?;
+        let prefix_elems = self.prefix_rows * bn_ch;
+        s.memcpy_htod(
+            &vec![0.0f32; prefix_elems],
+            &mut ws.feature2.slice_mut(0..prefix_elems),
+        )?;
+        let (feat2_ptr, _feat2_guard) = ws.feature2.device_ptr(s);
+        let feat2_patch_ptr = feat2_ptr + (prefix_elems * size_of::<f32>()) as u64;
+        let count = u64::from(latent_ch) * u64::from(latent_spatial);
+        unsafe {
+            s.launch_builder(&self.diag_gauss_bn_fn)
+                .arg(&ws.buf_1)
+                .arg(&ws.noise_nchw)
+                .arg(&self.bn_mean)
+                .arg(&self.bn_var)
+                .arg(&ws.moments_nchw)
+                .arg(&feat2_patch_ptr)
+                .arg(&latent_ch)
+                .arg(&latent_side)
+                .arg(&latent_side)
+                .arg(&self.cfg.batch_norm_eps)
+                .launch(grid(count.div_ceil(256).min(65535) as usize, 256))?;
+        }
+        let moments_f32 = s
+            .clone_dtoh(&ws.moments_nchw)?
+            .into_iter()
+            .map(bf16::to_f32)
+            .collect();
+        let feature2_f32 = s.clone_dtoh(&ws.feature2)?;
+        Ok(Flux2VaeOutput {
+            moments_f32,
+            feature2_f32,
+        })
+    }
+}
+
+pub struct IdolVisionEncoderRuntime {
+    pub dinov3: DinoV3Encoder,
+    pub dinov3_ws: DinoV3Workspace,
+    pub vae: Flux2VaeEncoder,
+    pub vae_ws: Flux2VaeWorkspace,
+}
+
+impl IdolVisionEncoderRuntime {
+    pub fn load(
+        device: &Device,
+        blas: &mut Blas,
+        common: CommonOpsRef,
+        dinov3_dir: &std::path::Path,
+        vae_dir: &std::path::Path,
+        reserve_bytes: usize,
+    ) -> Result<Self> {
+        let dinov3_cfg = DinoV3Config::from_dir(dinov3_dir)?;
+        let vae_cfg = Flux2VaeConfig::from_dir(vae_dir)?;
+        let prefix_rows = dinov3_cfg.prefix_rows();
+        ensure!(
+            dinov3_cfg.patch_rows(vae_cfg.sample_size)? == vae_cfg.patch_rows(),
+            "DINOv3 patch_rows != FLUX.2 VAE patch_rows"
+        );
+        let dinov3_file = std::fs::File::open(dinov3_dir.join("model.safetensors"))?;
+        let dinov3_mmap = unsafe { memmap2::MmapOptions::new().map(&dinov3_file)? };
+        let (dinov3, dinov3_ws) = DinoV3Encoder::load(
+            device,
+            blas,
+            common,
+            dinov3_cfg,
+            vae_cfg.sample_size,
+            &dinov3_mmap,
+        )?;
+        let vae_file = std::fs::File::open(Flux2VaeConfig::safetensors_path(vae_dir))?;
+        let vae_mmap = unsafe { memmap2::MmapOptions::new().map(&vae_file)? };
+        let (vae, vae_ws) =
+            Flux2VaeEncoder::load(device, blas, vae_cfg, prefix_rows, &vae_mmap, reserve_bytes)?;
+        Ok(Self {
+            dinov3,
+            dinov3_ws,
+            vae,
+            vae_ws,
+        })
+    }
+
+    pub fn encode_image(
+        &mut self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        chw_f32: &[f32],
+        vae_noise_bf16: &[bf16],
+        capture_dinov3_layers: bool,
+    ) -> Result<(DinoV3Output, Flux2VaeOutput)> {
+        let d_out = self.dinov3.encode(
+            s,
+            blas,
+            &mut self.dinov3_ws,
+            chw_f32,
+            None,
+            capture_dinov3_layers,
+        )?;
+        let v_out = self.vae.encode(
+            s,
+            blas,
+            &mut self.vae_ws,
+            chw_f32,
+            vae_noise_bf16,
+            [0, 1, 0, 1],
+        )?;
+        Ok((d_out, v_out))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5112,1410 +6876,18 @@ mod tests {
         Ok(())
     }
 
-    const DINOV3_SIDE: usize = 1024;
-    const DINOV3_PATCH: u32 = 16;
-    const DINOV3_PATCH_DIM: u32 = 768;
-    const DINOV3_PATCH_ROWS: u32 = 4096;
-    const DINOV3_PREFIX_ROWS: usize = 5;
-    const DINOV3_ROWS: u32 = 4101;
-    const DINOV3_HIDDEN: u32 = 1280;
-    const DINOV3_HEADS: u32 = 20;
-    const DINOV3_HEAD_DIM: u32 = 64;
-    const DINOV3_INTERMEDIATE: u32 = 5120;
-    const DINOV3_LAYERS: usize = 32;
-    const DINOV3_EPS: f32 = 1e-5;
-
-    struct SafetensorsLoader<'a> {
-        st: safetensors::SafeTensors<'a>,
-        remaining: std::collections::BTreeSet<String>,
-        loaded_elements: usize,
-    }
-
-    impl<'a> SafetensorsLoader<'a> {
-        fn new(bytes: &'a [u8]) -> Result<Self> {
-            let st = safetensors::SafeTensors::deserialize(bytes)?;
-            let remaining = st.names().into_iter().map(str::to_owned).collect();
-            Ok(Self {
-                st,
-                remaining,
-                loaded_elements: 0,
-            })
-        }
-
-        fn take_bf16(
-            &mut self,
-            s: &Arc<CudaStream>,
-            name: &str,
-            expected_shape: &[usize],
-        ) -> Result<CudaSlice<bf16>> {
-            ensure!(
-                self.remaining.remove(name),
-                "tensor {name} missing or loaded twice"
-            );
-            let view = self.st.tensor(name)?;
-            ensure!(
-                view.shape() == expected_shape,
-                "tensor {name} shape {:?} != expected {expected_shape:?}",
-                view.shape()
-            );
-            let host: Vec<bf16> = match view.dtype() {
-                safetensors::Dtype::BF16 => view
-                    .data()
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|b| bf16::from_le_bytes(*b))
-                    .collect(),
-                safetensors::Dtype::F32 => view
-                    .data()
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|b| bf16::from_f32(f32::from_le_bytes(*b)))
-                    .collect(),
-                dt => bail!("unsupported dtype {dt:?} for {name}"),
-            };
-            self.loaded_elements += host.len();
-            Ok(s.clone_htod(&host)?)
-        }
-
-        fn remove_unused(&mut self, name: &str, expected_shape: &[usize]) -> Result<()> {
-            ensure!(
-                self.remaining.remove(name),
-                "expected unused tensor {name} missing"
-            );
-            let view = self.st.tensor(name)?;
-            ensure!(
-                view.shape() == expected_shape,
-                "unused tensor {name} shape {:?} != expected {expected_shape:?}",
-                view.shape()
-            );
-            Ok(())
-        }
-    }
-
-    struct UnbiasedWeight {
-        weight: CudaSlice<bf16>,
-        shape: [u32; 2],
-    }
-
-    impl UnbiasedWeight {
-        fn load(
-            loader: &mut SafetensorsLoader<'_>,
-            s: &Arc<CudaStream>,
-            name: &str,
-            shape: [u32; 2],
-        ) -> Result<Self> {
-            Ok(Self {
-                weight: loader.take_bf16(
-                    s,
-                    &format!("{name}.weight"),
-                    &[shape[0] as usize, shape[1] as usize],
-                )?,
-                shape,
-            })
-        }
-
-        fn prepare(&self, blas: &Blas, rows: u32) -> Result<()> {
-            blas.prepare_request_fixed(rows, self.shape[0], self.shape[1])
-        }
-
-        fn run(
-            &self,
-            s: &Arc<CudaStream>,
-            blas: &Blas,
-            input: Tensor<bf16, 2>,
-            output: &mut TensorMut<bf16, 2>,
-        ) -> Result<()> {
-            blas.linear_typed(
-                crate::op_contract::ExecutionPhase::Prefill,
-                LinearWeightRef::Bf16(dense(&self.weight, s, self.shape)?),
-                input,
-                output,
-            )
-        }
-    }
-
-    fn load_biased_weight(
-        loader: &mut SafetensorsLoader<'_>,
-        s: &Arc<CudaStream>,
-        name: &str,
-        shape: [u32; 2],
-        stored_shape: &[usize],
-        bias_mode: LinearBiasMode,
-    ) -> Result<BiasedWeight> {
-        Ok(BiasedWeight {
-            weight: loader.take_bf16(s, &format!("{name}.weight"), stored_shape)?,
-            bias: loader.take_bf16(s, &format!("{name}.bias"), &[shape[0] as usize])?,
-            shape,
-            bias_mode,
-        })
-    }
-
-    fn load_affine_weights(
-        loader: &mut SafetensorsLoader<'_>,
-        s: &Arc<CudaStream>,
-        name: &str,
-        width: u32,
-    ) -> Result<AffineWeights> {
-        Ok(AffineWeights {
-            weight: loader.take_bf16(s, &format!("{name}.weight"), &[width as usize])?,
-            bias: loader.take_bf16(s, &format!("{name}.bias"), &[width as usize])?,
-        })
-    }
-
-    struct DinoV3Layer {
-        norm1: AffineWeights,
-        q: BiasedWeight,
-        k: UnbiasedWeight,
-        v: BiasedWeight,
-        o: BiasedWeight,
-        scale1: CudaSlice<bf16>,
-        norm2: AffineWeights,
-        gate: BiasedWeight,
-        up: BiasedWeight,
-        down: BiasedWeight,
-        scale2: CudaSlice<bf16>,
-    }
-
-    struct DinoV3Workspace {
-        pixel_packed: CudaSlice<f32>,
-        patches: CudaSlice<bf16>,
-        x_a: CudaSlice<bf16>,
-        x_b: CudaSlice<bf16>,
-        x_c: CudaSlice<bf16>,
-        k_cache: CudaSlice<bf16>,
-        v_cache: CudaSlice<bf16>,
-        mlp_a: CudaSlice<bf16>,
-        mlp_b: CudaSlice<bf16>,
-        mlp_c: CudaSlice<bf16>,
-        rope_table: CudaSlice<bf16>,
-        feature1: CudaSlice<f32>,
-        flash_d64: Flash,
-    }
-
-    struct DinoV3Encoder {
-        prefix_tokens: CudaSlice<bf16>,
-        patch_embed: BiasedWeight,
-        layers: Vec<DinoV3Layer>,
-        final_norm: AffineWeights,
-        common: CommonOpsRef,
-        ops: crate::backend::cuda::ops::Ops,
-        io: VisionIo,
-        channel_scale_residual: CudaFunction,
-        layer_norm_f32: CudaFunction,
-        upcast_f32: CudaFunction,
-        silu_mul_split: CudaFunction,
-    }
-
-    struct DinoV3Output {
-        layer0: Option<Vec<f32>>,
-        layer15: Option<Vec<f32>>,
-        feature1: Vec<f32>,
-    }
-
-    impl DinoV3Encoder {
-        fn load(
-            device: &Device,
-            blas: &mut Blas,
-            common: CommonOpsRef,
-            safetensors_bytes: &[u8],
-        ) -> Result<(Self, DinoV3Workspace)> {
-            let s = &device.stream;
-            let mut loader = SafetensorsLoader::new(safetensors_bytes)?;
-            let cls = loader.take_bf16(s, "embeddings.cls_token", &[1, 1, 1280])?;
-            let reg = loader.take_bf16(s, "embeddings.register_tokens", &[1, 4, 1280])?;
-            loader.remove_unused("embeddings.mask_token", &[1, 1, 1280])?;
-            let mut prefix_host = s.clone_dtoh(&cls)?;
-            prefix_host.extend(s.clone_dtoh(&reg)?);
-            let prefix_tokens = s.clone_htod(&prefix_host)?;
-            let patch_embed = load_biased_weight(
-                &mut loader,
-                s,
-                "embeddings.patch_embeddings",
-                [DINOV3_HIDDEN, DINOV3_PATCH_DIM],
-                &[1280, 3, 16, 16],
-                LinearBiasMode::AfterOutputRound,
-            )?;
-            patch_embed.prepare(s, blas, DINOV3_PATCH_ROWS)?;
-            let mut layers = Vec::with_capacity(DINOV3_LAYERS);
-            for i in 0..DINOV3_LAYERS {
-                let p = format!("layer.{i}");
-                let norm1 = load_affine_weights(&mut loader, s, &format!("{p}.norm1"), 1280)?;
-                let q = load_biased_weight(
-                    &mut loader,
-                    s,
-                    &format!("{p}.attention.q_proj"),
-                    [1280, 1280],
-                    &[1280, 1280],
-                    LinearBiasMode::BeforeOutputRound,
-                )?;
-                let k = UnbiasedWeight::load(
-                    &mut loader,
-                    s,
-                    &format!("{p}.attention.k_proj"),
-                    [1280, 1280],
-                )?;
-                let v = load_biased_weight(
-                    &mut loader,
-                    s,
-                    &format!("{p}.attention.v_proj"),
-                    [1280, 1280],
-                    &[1280, 1280],
-                    LinearBiasMode::BeforeOutputRound,
-                )?;
-                let o = load_biased_weight(
-                    &mut loader,
-                    s,
-                    &format!("{p}.attention.o_proj"),
-                    [1280, 1280],
-                    &[1280, 1280],
-                    LinearBiasMode::BeforeOutputRound,
-                )?;
-                let scale1 = loader.take_bf16(s, &format!("{p}.layer_scale1.lambda1"), &[1280])?;
-                let norm2 = load_affine_weights(&mut loader, s, &format!("{p}.norm2"), 1280)?;
-                let gate = load_biased_weight(
-                    &mut loader,
-                    s,
-                    &format!("{p}.mlp.gate_proj"),
-                    [5120, 1280],
-                    &[5120, 1280],
-                    LinearBiasMode::BeforeOutputRound,
-                )?;
-                let up = load_biased_weight(
-                    &mut loader,
-                    s,
-                    &format!("{p}.mlp.up_proj"),
-                    [5120, 1280],
-                    &[5120, 1280],
-                    LinearBiasMode::BeforeOutputRound,
-                )?;
-                let down = load_biased_weight(
-                    &mut loader,
-                    s,
-                    &format!("{p}.mlp.down_proj"),
-                    [1280, 5120],
-                    &[1280, 5120],
-                    LinearBiasMode::BeforeOutputRound,
-                )?;
-                let scale2 = loader.take_bf16(s, &format!("{p}.layer_scale2.lambda1"), &[1280])?;
-                for w in [&q, &v, &o, &gate, &up, &down] {
-                    w.prepare(s, blas, DINOV3_ROWS)?;
-                }
-                k.prepare(blas, DINOV3_ROWS)?;
-                layers.push(DinoV3Layer {
-                    norm1,
-                    q,
-                    k,
-                    v,
-                    o,
-                    scale1,
-                    norm2,
-                    gate,
-                    up,
-                    down,
-                    scale2,
-                });
-            }
-            let final_norm = load_affine_weights(&mut loader, s, "norm", 1280)?;
-            ensure!(
-                loader.remaining.is_empty(),
-                "unconsumed DINOv3 safetensors keys: {:?}",
-                loader.remaining
-            );
-            ensure!(
-                loader.loaded_elements == 840_591_360,
-                "DINOv3 loaded element count {} != 840591360",
-                loader.loaded_elements
-            );
-            let rope_host = crate::vision_input::dinov3_rope_table_bf16(5, 64, 64, 64, 100.0)?;
-            let rows = DINOV3_ROWS as usize;
-            let h = DINOV3_HIDDEN as usize;
-            let inter = DINOV3_INTERMEDIATE as usize;
-            let ws = DinoV3Workspace {
-                pixel_packed: s
-                    .alloc_zeros(DINOV3_PATCH_ROWS as usize * DINOV3_PATCH_DIM as usize)?,
-                patches: s.alloc_zeros(DINOV3_PATCH_ROWS as usize * DINOV3_PATCH_DIM as usize)?,
-                x_a: s.alloc_zeros(rows * h)?,
-                x_b: s.alloc_zeros(rows * h)?,
-                x_c: s.alloc_zeros(rows * h)?,
-                k_cache: s.alloc_zeros(rows * h)?,
-                v_cache: s.alloc_zeros(rows * h)?,
-                mlp_a: s.alloc_zeros(rows * inter)?,
-                mlp_b: s.alloc_zeros(rows * inter)?,
-                mlp_c: s.alloc_zeros(rows * inter)?,
-                rope_table: s.clone_htod(&rope_host)?,
-                feature1: s.alloc_zeros(rows * h)?,
-                flash_d64: Flash::new_with_score(
-                    s.clone(),
-                    rows,
-                    DINOV3_HEADS as usize,
-                    DINOV3_HEADS as usize,
-                    DINOV3_HEAD_DIM as usize,
-                    Score::from_tokens((DINOV3_HEAD_DIM as f32).sqrt().recip(), None)?,
-                    rows,
-                )?,
-            };
-            let q38_mod = cubin::module(&device.ctx, "q38_common")?;
-            let vis_mod = cubin::module(&device.ctx, "vision_ops")?;
-            let act_mod = cubin::module(&device.ctx, "act")?;
-            Ok((
-                Self {
-                    prefix_tokens,
-                    patch_embed,
-                    layers,
-                    final_norm,
-                    common,
-                    ops: crate::backend::cuda::ops::Ops::new(&device.ctx)?,
-                    io: VisionIo::new(device, DINOV3_HIDDEN)?,
-                    channel_scale_residual: q38_mod.load_function("channel_scale_residual_bf16")?,
-                    layer_norm_f32: q38_mod.load_function("q38_layer_norm_f32")?,
-                    upcast_f32: vis_mod.load_function("vision_upcast_f32")?,
-                    silu_mul_split: act_mod.load_function("silu_mul_split")?,
-                },
-                ws,
-            ))
-        }
-
-        fn layer_norm(
-            &self,
-            s: &Arc<CudaStream>,
-            norm: &AffineWeights,
-            input: &CudaSlice<bf16>,
-            output: &CudaSlice<bf16>,
-        ) -> Result<()> {
-            self.common.norm.layer_norm(
-                s,
-                dense(input, s, [DINOV3_ROWS, 1, DINOV3_HIDDEN])?,
-                dense(&norm.weight, s, [DINOV3_HIDDEN])?,
-                dense(&norm.bias, s, [DINOV3_HIDDEN])?,
-                &mut TensorMut(dense(output, s, [DINOV3_ROWS, 1, DINOV3_HIDDEN])?),
-                DINOV3_EPS,
-            )
-        }
-
-        fn scale_residual(
-            &self,
-            s: &Arc<CudaStream>,
-            residual: &CudaSlice<bf16>,
-            branch: &CudaSlice<bf16>,
-            scale: &CudaSlice<bf16>,
-        ) -> Result<()> {
-            let count = u64::from(DINOV3_ROWS) * u64::from(DINOV3_HIDDEN);
-            unsafe {
-                s.launch_builder(&self.channel_scale_residual)
-                    .arg(residual)
-                    .arg(branch)
-                    .arg(scale)
-                    .arg(residual)
-                    .arg(&DINOV3_ROWS)
-                    .arg(&DINOV3_HIDDEN)
-                    .launch(grid(count.div_ceil(256).min(65535) as usize, 256))?;
-            }
-            Ok(())
-        }
-
-        fn encode(
-            &self,
-            s: &Arc<CudaStream>,
-            blas: &Blas,
-            ws: &mut DinoV3Workspace,
-            chw_f32: &[f32],
-            rope_override: Option<&CudaSlice<bf16>>,
-            capture_layers: bool,
-        ) -> Result<DinoV3Output> {
-            let packed_host = crate::vision_input::dinov3_pack_normalized_chw(
-                chw_f32,
-                DINOV3_SIDE,
-                DINOV3_SIDE,
-                DINOV3_PATCH as usize,
-                [0.485, 0.456, 0.406],
-                [0.229, 0.224, 0.225],
-            )?;
-            s.memcpy_htod(&packed_host, &mut ws.pixel_packed)?;
-            self.io.patch_rows(
-                s,
-                dense(&ws.pixel_packed, s, [DINOV3_PATCH_ROWS, DINOV3_PATCH_DIM])?,
-                &mut TensorMut(dense(
-                    &ws.patches,
-                    s,
-                    [DINOV3_PATCH_ROWS, DINOV3_PATCH_DIM],
-                )?),
-                DINOV3_PATCH_ROWS,
-                3,
-                DINOV3_PATCH,
-            )?;
-            s.memcpy_dtod(
-                &self.prefix_tokens,
-                &mut ws
-                    .x_a
-                    .slice_mut(0..DINOV3_PREFIX_ROWS * DINOV3_HIDDEN as usize),
-            )?;
-            self.patch_embed.run(
-                s,
-                blas,
-                dense(&ws.patches, s, [DINOV3_PATCH_ROWS, DINOV3_PATCH_DIM])?,
-                &mut TensorMut(dense_at(
-                    &ws.x_a,
-                    s,
-                    [DINOV3_PATCH_ROWS, DINOV3_HIDDEN],
-                    DINOV3_PREFIX_ROWS * DINOV3_HIDDEN as usize,
-                )?),
-            )?;
-            let rope_slice = rope_override.unwrap_or(&ws.rope_table);
-            let mut layer0 = None;
-            let mut layer15 = None;
-            let rows = DINOV3_ROWS;
-            let h = DINOV3_HIDDEN;
-            let inter = DINOV3_INTERMEDIATE;
-            for (idx, layer) in self.layers.iter().enumerate() {
-                self.layer_norm(s, &layer.norm1, &ws.x_a, &ws.x_b)?;
-                layer.q.run(
-                    s,
-                    blas,
-                    dense(&ws.x_b, s, [rows, h])?,
-                    &mut TensorMut(dense(&ws.x_c, s, [rows, h])?),
-                )?;
-                layer.k.run(
-                    s,
-                    blas,
-                    dense(&ws.x_b, s, [rows, h])?,
-                    &mut TensorMut(stage_view(&ws.mlp_a, s, [rows, h])?),
-                )?;
-                layer.v.run(
-                    s,
-                    blas,
-                    dense(&ws.x_b, s, [rows, h])?,
-                    &mut TensorMut(stage_view(&ws.mlp_b, s, [rows, h])?),
-                )?;
-                self.ops.rotary_prefix_kv(
-                    s,
-                    crate::backend::cuda::ops::RotaryPrefixKv {
-                        q: TensorMut(dense(&ws.x_c, s, [rows, DINOV3_HEADS, DINOV3_HEAD_DIM])?),
-                        key: stage_view(&ws.mlp_a, s, [rows, DINOV3_HEADS, DINOV3_HEAD_DIM])?,
-                        value: stage_view(&ws.mlp_b, s, [rows, DINOV3_HEADS, DINOV3_HEAD_DIM])?,
-                        k: TensorMut(dense(
-                            &ws.k_cache,
-                            s,
-                            [DINOV3_HEADS, rows, DINOV3_HEAD_DIM],
-                        )?),
-                        v: TensorMut(dense(
-                            &ws.v_cache,
-                            s,
-                            [DINOV3_HEADS, rows, DINOV3_HEAD_DIM],
-                        )?),
-                        table: dense(rope_slice, s, [rows, DINOV3_HEAD_DIM])?,
-                        start: 0,
-                    },
-                )?;
-                ws.flash_d64.run(
-                    &ws.x_c,
-                    h as usize,
-                    &ws.k_cache,
-                    &ws.v_cache,
-                    &mut ws.x_b,
-                    Shape {
-                        rows: rows as usize,
-                        start: 0,
-                        capacity: rows as usize,
-                        q_heads: DINOV3_HEADS as usize,
-                        kv_heads: DINOV3_HEADS as usize,
-                        head_dim: DINOV3_HEAD_DIM as usize,
-                        causal: false,
-                        window_left: None,
-                    },
-                )?;
-                layer.o.run(
-                    s,
-                    blas,
-                    dense(&ws.x_b, s, [rows, h])?,
-                    &mut TensorMut(dense(&ws.x_c, s, [rows, h])?),
-                )?;
-                self.scale_residual(s, &ws.x_a, &ws.x_c, &layer.scale1)?;
-                self.layer_norm(s, &layer.norm2, &ws.x_a, &ws.x_b)?;
-                layer.gate.run(
-                    s,
-                    blas,
-                    dense(&ws.x_b, s, [rows, h])?,
-                    &mut TensorMut(dense(&ws.mlp_a, s, [rows, inter])?),
-                )?;
-                layer.up.run(
-                    s,
-                    blas,
-                    dense(&ws.x_b, s, [rows, h])?,
-                    &mut TensorMut(dense(&ws.mlp_b, s, [rows, inter])?),
-                )?;
-                let mlp_elems = (rows * inter) as usize;
-                let cfg = crate::backend::cuda::ops::silu_mul_split_grid(
-                    mlp_elems,
-                    ws.mlp_a.device_ptr(s).0,
-                    ws.mlp_b.device_ptr(s).0,
-                    ws.mlp_c.device_ptr(s).0,
-                )?;
-                let mlp_count = i32::try_from(mlp_elems)?;
-                unsafe {
-                    s.launch_builder(&self.silu_mul_split)
-                        .arg(&ws.mlp_a)
-                        .arg(&ws.mlp_b)
-                        .arg(&ws.mlp_c)
-                        .arg(&mlp_count)
-                        .arg(&0i32)
-                        .launch(cfg)?;
-                }
-                layer.down.run(
-                    s,
-                    blas,
-                    dense(&ws.mlp_c, s, [rows, inter])?,
-                    &mut TensorMut(dense(&ws.x_c, s, [rows, h])?),
-                )?;
-                self.scale_residual(s, &ws.x_a, &ws.x_c, &layer.scale2)?;
-                if capture_layers && idx == 0 {
-                    layer0 = Some(
-                        s.clone_dtoh(&ws.x_a)?
-                            .into_iter()
-                            .map(bf16::to_f32)
-                            .collect(),
-                    );
-                } else if capture_layers && idx == 15 {
-                    layer15 = Some(
-                        s.clone_dtoh(&ws.x_a)?
-                            .into_iter()
-                            .map(bf16::to_f32)
-                            .collect(),
-                    );
-                }
-            }
-            self.layer_norm(s, &self.final_norm, &ws.x_a, &ws.x_b)?;
-            let total_elems = rows * h;
-            unsafe {
-                s.launch_builder(&self.upcast_f32)
-                    .arg(&ws.x_b)
-                    .arg(&ws.feature1)
-                    .arg(&total_elems)
-                    .launch(grid((total_elems as usize).div_ceil(256).min(65535), 256))?;
-                s.launch_builder(&self.layer_norm_f32)
-                    .arg(&ws.feature1)
-                    .arg(&0u64)
-                    .arg(&0u64)
-                    .arg(&ws.feature1)
-                    .arg(&rows)
-                    .arg(&1u32)
-                    .arg(&h)
-                    .arg(&u64::from(h))
-                    .arg(&u64::from(h))
-                    .arg(&1u64)
-                    .arg(&u64::from(h))
-                    .arg(&u64::from(h))
-                    .arg(&1u64)
-                    .arg(&DINOV3_EPS)
-                    .launch(grid(rows as usize, 256))?;
-            }
-            Ok(DinoV3Output {
-                layer0,
-                layer15,
-                feature1: s.clone_dtoh(&ws.feature1)?,
-            })
-        }
-    }
-
-    #[derive(Clone, Copy)]
-    struct Conv2dGeom {
-        h: u32,
-        w: u32,
-        c_in: u32,
-        c_out: u32,
-        kh: u32,
-        kw: u32,
-        sh: u32,
-        sw: u32,
-        pad: [u32; 4],
-    }
-
-    impl Conv2dGeom {
-        fn out_hw(self) -> (u32, u32) {
-            (
-                (self.h + self.pad[0] + self.pad[1] - self.kh) / self.sh + 1,
-                (self.w + self.pad[2] + self.pad[3] - self.kw) / self.sw + 1,
-            )
-        }
-
-        fn strip_h(self, strip_pixels: u32) -> u32 {
-            let (out_h, out_w) = self.out_hw();
-            (strip_pixels / out_w).min(out_h)
-        }
-    }
-
-    struct VaeResnetBlock {
-        norm1: AffineWeights,
-        conv1: BiasedWeight,
-        norm2: AffineWeights,
-        conv2: BiasedWeight,
-        shortcut: Option<BiasedWeight>,
-        h: u32,
-        w: u32,
-        c_in: u32,
-        c_out: u32,
-    }
-
-    struct VaeDownBlock {
-        resnets: [VaeResnetBlock; 2],
-        downsampler: Option<(BiasedWeight, u32, u32, u32)>,
-    }
-
-    struct VaeMidAttn {
-        group_norm: AffineWeights,
-        to_q: BiasedWeight,
-        to_k: BiasedWeight,
-        to_v: BiasedWeight,
-        to_out: BiasedWeight,
-    }
-
-    struct Flux2VaeWorkspace {
-        strip_pixels: u32,
-        input_chw: CudaSlice<f32>,
-        buf_0: CudaSlice<bf16>,
-        buf_1: CudaSlice<bf16>,
-        buf_2: CudaSlice<bf16>,
-        im2col: CudaSlice<bf16>,
-        mid_v: CudaSlice<bf16>,
-        noise_nchw: CudaSlice<bf16>,
-        moments_nchw: CudaSlice<bf16>,
-        feature2: CudaSlice<f32>,
-        flash_d512: Flash,
-    }
-
-    struct Flux2VaeEncoder {
-        conv_in: BiasedWeight,
-        down_blocks: Vec<VaeDownBlock>,
-        mid_resnet0: VaeResnetBlock,
-        mid_attn: VaeMidAttn,
-        mid_resnet1: VaeResnetBlock,
-        conv_norm_out: AffineWeights,
-        conv_out: BiasedWeight,
-        quant_conv: BiasedWeight,
-        bn_mean: CudaSlice<bf16>,
-        bn_var: CudaSlice<bf16>,
-        ops: crate::backend::cuda::ops::Ops,
-        chw_scale_shift: CudaFunction,
-        im2col_fn: CudaFunction,
-        group_norm_fn: CudaFunction,
-        act_fn: CudaFunction,
-        diag_gauss_bn_fn: CudaFunction,
-    }
-
-    struct Flux2VaeOutput {
-        moments_f32: Vec<f32>,
-        feature2_f32: Vec<f32>,
-    }
-
-    impl Flux2VaeEncoder {
-        fn load_resnet(
-            loader: &mut SafetensorsLoader<'_>,
-            s: &Arc<CudaStream>,
-            blas: &mut Blas,
-            prefix: &str,
-            hw_c: (u32, u32, u32, u32),
-            strip_pixels: u32,
-        ) -> Result<VaeResnetBlock> {
-            let (h, w, c_in, c_out) = hw_c;
-            let norm1 = load_affine_weights(loader, s, &format!("{prefix}.norm1"), c_in)?;
-            let conv1 = load_biased_weight(
-                loader,
-                s,
-                &format!("{prefix}.conv1"),
-                [c_out, c_in * 9],
-                &[c_out as usize, c_in as usize, 3, 3],
-                LinearBiasMode::AfterOutputRound,
-            )?;
-            let norm2 = load_affine_weights(loader, s, &format!("{prefix}.norm2"), c_out)?;
-            let conv2 = load_biased_weight(
-                loader,
-                s,
-                &format!("{prefix}.conv2"),
-                [c_out, c_out * 9],
-                &[c_out as usize, c_out as usize, 3, 3],
-                LinearBiasMode::AfterOutputRound,
-            )?;
-            let strip_rows = ((strip_pixels / w).min(h)) * w;
-            conv1.prepare(s, blas, strip_rows)?;
-            conv2.prepare(s, blas, strip_rows)?;
-            let shortcut = if c_in != c_out {
-                let sc = load_biased_weight(
-                    loader,
-                    s,
-                    &format!("{prefix}.conv_shortcut"),
-                    [c_out, c_in],
-                    &[c_out as usize, c_in as usize, 1, 1],
-                    LinearBiasMode::AfterOutputRound,
-                )?;
-                sc.prepare(s, blas, h * w)?;
-                Some(sc)
-            } else {
-                None
-            };
-            Ok(VaeResnetBlock {
-                norm1,
-                conv1,
-                norm2,
-                conv2,
-                shortcut,
-                h,
-                w,
-                c_in,
-                c_out,
-            })
-        }
-
-        fn load(
-            device: &Device,
-            blas: &mut Blas,
-            safetensors_bytes: &[u8],
-            reserve_bytes: usize,
-        ) -> Result<(Self, Flux2VaeWorkspace)> {
-            let s = &device.stream;
-            let mut loader = SafetensorsLoader::new(safetensors_bytes)?;
-            let names: Vec<String> = loader.remaining.iter().cloned().collect();
-            let mut removed_decoder = 0usize;
-            for name in names {
-                if name.starts_with("decoder.") || name.starts_with("post_quant_conv.") {
-                    let shape = loader.st.tensor(&name)?.shape().to_vec();
-                    loader.remove_unused(&name, &shape)?;
-                    removed_decoder += 1;
-                }
-            }
-            ensure!(
-                removed_decoder == 140,
-                "unexpected FLUX.2 VAE decoder key count {removed_decoder}"
-            );
-            let (free, _) = device.ctx.mem_get_info()?;
-            let avail = free.saturating_sub(reserve_bytes);
-            let base_ws = 3usize * 268_435_456 + 16_777_216 + 2_097_152 + 2_099_712 + 12_582_912;
-            let strip_pixels = [65536u32, 32768, 16384]
-                .into_iter()
-                .find(|&sp| base_ws + (sp as usize) * 512 * 18 <= avail)
-                .context("FLUX.2 VAE workspace does not fit available device memory")?;
-            let conv_in = load_biased_weight(
-                &mut loader,
-                s,
-                "encoder.conv_in",
-                [128, 27],
-                &[128, 3, 3, 3],
-                LinearBiasMode::AfterOutputRound,
-            )?;
-            conv_in.prepare(s, blas, ((strip_pixels / 1024).min(1024)) * 1024)?;
-            let stage_specs = [
-                (0usize, 1024u32, 128u32, 128u32, true),
-                (1, 512, 128, 256, true),
-                (2, 256, 256, 512, true),
-                (3, 128, 512, 512, false),
-            ];
-            let mut down_blocks = Vec::with_capacity(4);
-            for (idx, hw, c0, c1, has_down) in stage_specs {
-                let p = format!("encoder.down_blocks.{idx}");
-                let r0 = Self::load_resnet(
-                    &mut loader,
-                    s,
-                    blas,
-                    &format!("{p}.resnets.0"),
-                    (hw, hw, c0, c1),
-                    strip_pixels,
-                )?;
-                let r1 = Self::load_resnet(
-                    &mut loader,
-                    s,
-                    blas,
-                    &format!("{p}.resnets.1"),
-                    (hw, hw, c1, c1),
-                    strip_pixels,
-                )?;
-                let downsampler = if has_down {
-                    let conv = load_biased_weight(
-                        &mut loader,
-                        s,
-                        &format!("{p}.downsamplers.0.conv"),
-                        [c1, c1 * 9],
-                        &[c1 as usize, c1 as usize, 3, 3],
-                        LinearBiasMode::AfterOutputRound,
-                    )?;
-                    let out_hw = hw / 2;
-                    let strip_rows = ((strip_pixels / out_hw).min(out_hw)) * out_hw;
-                    conv.prepare(s, blas, strip_rows)?;
-                    Some((conv, hw, hw, c1))
-                } else {
-                    None
-                };
-                down_blocks.push(VaeDownBlock {
-                    resnets: [r0, r1],
-                    downsampler,
-                });
-            }
-            let mid_resnet0 = Self::load_resnet(
-                &mut loader,
-                s,
-                blas,
-                "encoder.mid_block.resnets.0",
-                (128, 128, 512, 512),
-                strip_pixels,
-            )?;
-            let mid_attn = VaeMidAttn {
-                group_norm: load_affine_weights(
-                    &mut loader,
-                    s,
-                    "encoder.mid_block.attentions.0.group_norm",
-                    512,
-                )?,
-                to_q: load_biased_weight(
-                    &mut loader,
-                    s,
-                    "encoder.mid_block.attentions.0.to_q",
-                    [512, 512],
-                    &[512, 512],
-                    LinearBiasMode::BeforeOutputRound,
-                )?,
-                to_k: load_biased_weight(
-                    &mut loader,
-                    s,
-                    "encoder.mid_block.attentions.0.to_k",
-                    [512, 512],
-                    &[512, 512],
-                    LinearBiasMode::BeforeOutputRound,
-                )?,
-                to_v: load_biased_weight(
-                    &mut loader,
-                    s,
-                    "encoder.mid_block.attentions.0.to_v",
-                    [512, 512],
-                    &[512, 512],
-                    LinearBiasMode::BeforeOutputRound,
-                )?,
-                to_out: load_biased_weight(
-                    &mut loader,
-                    s,
-                    "encoder.mid_block.attentions.0.to_out.0",
-                    [512, 512],
-                    &[512, 512],
-                    LinearBiasMode::BeforeOutputRound,
-                )?,
-            };
-            for w in [
-                &mid_attn.to_q,
-                &mid_attn.to_k,
-                &mid_attn.to_v,
-                &mid_attn.to_out,
-            ] {
-                w.prepare(s, blas, 16384)?;
-            }
-            let mid_resnet1 = Self::load_resnet(
-                &mut loader,
-                s,
-                blas,
-                "encoder.mid_block.resnets.1",
-                (128, 128, 512, 512),
-                strip_pixels,
-            )?;
-            let conv_norm_out = load_affine_weights(&mut loader, s, "encoder.conv_norm_out", 512)?;
-            let conv_out = load_biased_weight(
-                &mut loader,
-                s,
-                "encoder.conv_out",
-                [64, 512 * 9],
-                &[64, 512, 3, 3],
-                LinearBiasMode::AfterOutputRound,
-            )?;
-            conv_out.prepare(s, blas, ((strip_pixels / 128).min(128)) * 128)?;
-            let quant_conv = load_biased_weight(
-                &mut loader,
-                s,
-                "quant_conv",
-                [64, 64],
-                &[64, 64, 1, 1],
-                LinearBiasMode::AfterOutputRound,
-            )?;
-            quant_conv.prepare(s, blas, 16384)?;
-            let bn_mean = loader.take_bf16(s, "bn.running_mean", &[128])?;
-            let bn_var = loader.take_bf16(s, "bn.running_var", &[128])?;
-            loader.remove_unused("bn.num_batches_tracked", &[])?;
-            ensure!(
-                loader.remaining.is_empty(),
-                "unconsumed FLUX.2 VAE encoder keys: {:?}",
-                loader.remaining
-            );
-            ensure!(
-                loader.loaded_elements == 34_426_112,
-                "FLUX.2 VAE loaded element count {} != 34426112",
-                loader.loaded_elements
-            );
-            let max_map = 1024usize * 1024 * 128;
-            let ws = Flux2VaeWorkspace {
-                strip_pixels,
-                input_chw: s.alloc_zeros(3 * 1024 * 1024)?,
-                buf_0: s.alloc_zeros(max_map)?,
-                buf_1: s.alloc_zeros(max_map)?,
-                buf_2: s.alloc_zeros(max_map)?,
-                im2col: s.alloc_zeros(strip_pixels as usize * 512 * 9)?,
-                mid_v: s.alloc_zeros(16384 * 512)?,
-                noise_nchw: s.alloc_zeros(32 * 128 * 128)?,
-                moments_nchw: s.alloc_zeros(64 * 128 * 128)?,
-                feature2: s.alloc_zeros(4101 * 128)?,
-                flash_d512: Flash::new_with_score(
-                    s.clone(),
-                    16384,
-                    1,
-                    1,
-                    512,
-                    Score::from_tokens((512.0f32).sqrt().recip(), None)?,
-                    16384,
-                )?,
-            };
-            let vis_mod = cubin::module(&device.ctx, "vision_ops")?;
-            let q38_mod = cubin::module(&device.ctx, "q38_common")?;
-            Ok((
-                Self {
-                    conv_in,
-                    down_blocks,
-                    mid_resnet0,
-                    mid_attn,
-                    mid_resnet1,
-                    conv_norm_out,
-                    conv_out,
-                    quant_conv,
-                    bn_mean,
-                    bn_var,
-                    ops: crate::backend::cuda::ops::Ops::new(&device.ctx)?,
-                    chw_scale_shift: vis_mod.load_function("chw_to_nhwc_scale_shift_bf16")?,
-                    im2col_fn: vis_mod.load_function("masked_strided_patch_bf16")?,
-                    group_norm_fn: q38_mod.load_function("group_norm_nhwc_bf16")?,
-                    act_fn: vis_mod.load_function("activation_bf16")?,
-                    diag_gauss_bn_fn: vis_mod.load_function("diagonal_gaussian_patch_bn_f32")?,
-                },
-                ws,
-            ))
-        }
-
-        fn group_norm(
-            &self,
-            s: &Arc<CudaStream>,
-            norm: &AffineWeights,
-            input: &CudaSlice<bf16>,
-            output: &CudaSlice<bf16>,
-            hw_c: (u32, u32, u32),
-        ) -> Result<()> {
-            let (h, w, c) = hw_c;
-            let spatial = h * w;
-            unsafe {
-                s.launch_builder(&self.group_norm_fn)
-                    .arg(input)
-                    .arg(&norm.weight)
-                    .arg(&norm.bias)
-                    .arg(output)
-                    .arg(&1u32)
-                    .arg(&spatial)
-                    .arg(&c)
-                    .arg(&32u32)
-                    .arg(&1e-6f32)
-                    .launch(grid(32, 256))?;
-            }
-            Ok(())
-        }
-
-        fn silu_in_place(
-            &self,
-            s: &Arc<CudaStream>,
-            buf: &CudaSlice<bf16>,
-            rows: u32,
-            width: u32,
-        ) -> Result<()> {
-            let count = u64::from(rows) * u64::from(width);
-            unsafe {
-                s.launch_builder(&self.act_fn)
-                    .arg(buf)
-                    .arg(buf)
-                    .arg(&rows)
-                    .arg(&width)
-                    .arg(&1i32)
-                    .launch(grid(count.div_ceil(256).min(65535) as usize, 256))?;
-            }
-            Ok(())
-        }
-
-        fn add_in_place(
-            &self,
-            s: &Arc<CudaStream>,
-            dst: &CudaSlice<bf16>,
-            src: &CudaSlice<bf16>,
-            count: u32,
-        ) -> Result<()> {
-            let n = i32::try_from(count)?;
-            unsafe {
-                s.launch_builder(&self.ops.residual)
-                    .arg(dst)
-                    .arg(src)
-                    .arg(&n)
-                    .launch(flat((count as usize).div_ceil(8)))?;
-            }
-            Ok(())
-        }
-
-        fn conv2d(
-            &self,
-            s: &Arc<CudaStream>,
-            blas: &Blas,
-            conv: &BiasedWeight,
-            buffers: (&CudaSlice<bf16>, &CudaSlice<bf16>, &CudaSlice<bf16>),
-            geom: Conv2dGeom,
-            strip_pixels: u32,
-        ) -> Result<()> {
-            let (input, im2col, output) = buffers;
-            if geom.kh == 1 && geom.kw == 1 && geom.sh == 1 && geom.sw == 1 && geom.pad == [0; 4] {
-                let rows = geom.h * geom.w;
-                return conv.run(
-                    s,
-                    blas,
-                    stage_view(input, s, [rows, geom.c_in])?,
-                    &mut TensorMut(stage_view(output, s, [rows, geom.c_out])?),
-                );
-            }
-            let (out_h, out_w) = geom.out_hw();
-            let strip_h = geom.strip_h(strip_pixels);
-            let col_width = geom.c_in * geom.kh * geom.kw;
-            let mut y0 = 0u32;
-            while y0 < out_h {
-                let yc = strip_h.min(out_h - y0);
-                let strip_rows = yc * out_w;
-                let count = u64::from(strip_rows) * u64::from(col_width);
-                unsafe {
-                    s.launch_builder(&self.im2col_fn)
-                        .arg(input)
-                        .arg(&0u64)
-                        .arg(im2col)
-                        .arg(&geom.h)
-                        .arg(&geom.w)
-                        .arg(&geom.c_in)
-                        .arg(&geom.kh)
-                        .arg(&geom.kw)
-                        .arg(&geom.sh)
-                        .arg(&geom.sw)
-                        .arg(&geom.pad[0])
-                        .arg(&geom.pad[1])
-                        .arg(&geom.pad[2])
-                        .arg(&geom.pad[3])
-                        .arg(&y0)
-                        .arg(&yc)
-                        .launch(grid(count.div_ceil(256).min(65535) as usize, 256))?;
-                }
-                conv.run(
-                    s,
-                    blas,
-                    stage_view(im2col, s, [strip_rows, col_width])?,
-                    &mut TensorMut(dense_at(
-                        output,
-                        s,
-                        [strip_rows, geom.c_out],
-                        (y0 * out_w * geom.c_out) as usize,
-                    )?),
-                )?;
-                y0 += yc;
-            }
-            Ok(())
-        }
-
-        fn run_resnet(
-            &self,
-            s: &Arc<CudaStream>,
-            blas: &Blas,
-            block: &VaeResnetBlock,
-            ws: &mut Flux2VaeWorkspace,
-        ) -> Result<()> {
-            let rows = block.h * block.w;
-            let sp = ws.strip_pixels;
-            self.group_norm(
-                s,
-                &block.norm1,
-                &ws.buf_0,
-                &ws.buf_1,
-                (block.h, block.w, block.c_in),
-            )?;
-            self.silu_in_place(s, &ws.buf_1, rows, block.c_in)?;
-            self.conv2d(
-                s,
-                blas,
-                &block.conv1,
-                (&ws.buf_1, &ws.im2col, &ws.buf_2),
-                Conv2dGeom {
-                    h: block.h,
-                    w: block.w,
-                    c_in: block.c_in,
-                    c_out: block.c_out,
-                    kh: 3,
-                    kw: 3,
-                    sh: 1,
-                    sw: 1,
-                    pad: [1, 1, 1, 1],
-                },
-                sp,
-            )?;
-            self.group_norm(
-                s,
-                &block.norm2,
-                &ws.buf_2,
-                &ws.buf_1,
-                (block.h, block.w, block.c_out),
-            )?;
-            self.silu_in_place(s, &ws.buf_1, rows, block.c_out)?;
-            self.conv2d(
-                s,
-                blas,
-                &block.conv2,
-                (&ws.buf_1, &ws.im2col, &ws.buf_2),
-                Conv2dGeom {
-                    h: block.h,
-                    w: block.w,
-                    c_in: block.c_out,
-                    c_out: block.c_out,
-                    kh: 3,
-                    kw: 3,
-                    sh: 1,
-                    sw: 1,
-                    pad: [1, 1, 1, 1],
-                },
-                sp,
-            )?;
-            if let Some(sc) = &block.shortcut {
-                self.conv2d(
-                    s,
-                    blas,
-                    sc,
-                    (&ws.buf_0, &ws.im2col, &ws.buf_1),
-                    Conv2dGeom {
-                        h: block.h,
-                        w: block.w,
-                        c_in: block.c_in,
-                        c_out: block.c_out,
-                        kh: 1,
-                        kw: 1,
-                        sh: 1,
-                        sw: 1,
-                        pad: [0, 0, 0, 0],
-                    },
-                    sp,
-                )?;
-                self.add_in_place(s, &ws.buf_1, &ws.buf_2, rows * block.c_out)?;
-                std::mem::swap(&mut ws.buf_0, &mut ws.buf_1);
-            } else {
-                self.add_in_place(s, &ws.buf_0, &ws.buf_2, rows * block.c_out)?;
-            }
-            Ok(())
-        }
-
-        fn encode(
-            &self,
-            s: &Arc<CudaStream>,
-            blas: &Blas,
-            ws: &mut Flux2VaeWorkspace,
-            chw_f32: &[f32],
-            noise_bf16: &[bf16],
-            downsample_pad: [u32; 4],
-        ) -> Result<Flux2VaeOutput> {
-            s.memcpy_htod(chw_f32, &mut ws.input_chw)?;
-            s.memcpy_htod(noise_bf16, &mut ws.noise_nchw)?;
-            let in_elems = 3u64 * 1024 * 1024;
-            unsafe {
-                s.launch_builder(&self.chw_scale_shift)
-                    .arg(&ws.input_chw)
-                    .arg(&ws.buf_1)
-                    .arg(&3u32)
-                    .arg(&1024u32)
-                    .arg(&1024u32)
-                    .arg(&2.0f32)
-                    .arg(&-1.0f32)
-                    .launch(grid(in_elems.div_ceil(256).min(65535) as usize, 256))?;
-            }
-            let sp = ws.strip_pixels;
-            self.conv2d(
-                s,
-                blas,
-                &self.conv_in,
-                (&ws.buf_1, &ws.im2col, &ws.buf_0),
-                Conv2dGeom {
-                    h: 1024,
-                    w: 1024,
-                    c_in: 3,
-                    c_out: 128,
-                    kh: 3,
-                    kw: 3,
-                    sh: 1,
-                    sw: 1,
-                    pad: [1, 1, 1, 1],
-                },
-                sp,
-            )?;
-            for stage in &self.down_blocks {
-                for r in &stage.resnets {
-                    self.run_resnet(s, blas, r, ws)?;
-                }
-                if let Some((conv, h, w, c)) = &stage.downsampler {
-                    self.conv2d(
-                        s,
-                        blas,
-                        conv,
-                        (&ws.buf_0, &ws.im2col, &ws.buf_1),
-                        Conv2dGeom {
-                            h: *h,
-                            w: *w,
-                            c_in: *c,
-                            c_out: *c,
-                            kh: 3,
-                            kw: 3,
-                            sh: 2,
-                            sw: 2,
-                            pad: downsample_pad,
-                        },
-                        sp,
-                    )?;
-                    std::mem::swap(&mut ws.buf_0, &mut ws.buf_1);
-                }
-            }
-            self.run_resnet(s, blas, &self.mid_resnet0, ws)?;
-            self.group_norm(
-                s,
-                &self.mid_attn.group_norm,
-                &ws.buf_0,
-                &ws.buf_1,
-                (128, 128, 512),
-            )?;
-            self.mid_attn.to_q.run(
-                s,
-                blas,
-                stage_view(&ws.buf_1, s, [16384, 512])?,
-                &mut TensorMut(stage_view(&ws.buf_2, s, [16384, 512])?),
-            )?;
-            self.mid_attn.to_k.run(
-                s,
-                blas,
-                stage_view(&ws.buf_1, s, [16384, 512])?,
-                &mut TensorMut(stage_view(&ws.im2col, s, [16384, 512])?),
-            )?;
-            self.mid_attn.to_v.run(
-                s,
-                blas,
-                stage_view(&ws.buf_1, s, [16384, 512])?,
-                &mut TensorMut(dense(&ws.mid_v, s, [16384, 512])?),
-            )?;
-            ws.flash_d512.run(
-                &ws.buf_2,
-                512,
-                &ws.im2col,
-                &ws.mid_v,
-                &mut ws.buf_1,
-                Shape {
-                    rows: 16384,
-                    start: 0,
-                    capacity: 16384,
-                    q_heads: 1,
-                    kv_heads: 1,
-                    head_dim: 512,
-                    causal: false,
-                    window_left: None,
-                },
-            )?;
-            self.mid_attn.to_out.run(
-                s,
-                blas,
-                stage_view(&ws.buf_1, s, [16384, 512])?,
-                &mut TensorMut(stage_view(&ws.buf_2, s, [16384, 512])?),
-            )?;
-            self.add_in_place(s, &ws.buf_0, &ws.buf_2, 16384 * 512)?;
-            self.run_resnet(s, blas, &self.mid_resnet1, ws)?;
-            self.group_norm(
-                s,
-                &self.conv_norm_out,
-                &ws.buf_0,
-                &ws.buf_1,
-                (128, 128, 512),
-            )?;
-            self.silu_in_place(s, &ws.buf_1, 16384, 512)?;
-            self.conv2d(
-                s,
-                blas,
-                &self.conv_out,
-                (&ws.buf_1, &ws.im2col, &ws.buf_0),
-                Conv2dGeom {
-                    h: 128,
-                    w: 128,
-                    c_in: 512,
-                    c_out: 64,
-                    kh: 3,
-                    kw: 3,
-                    sh: 1,
-                    sw: 1,
-                    pad: [1, 1, 1, 1],
-                },
-                sp,
-            )?;
-            self.conv2d(
-                s,
-                blas,
-                &self.quant_conv,
-                (&ws.buf_0, &ws.im2col, &ws.buf_1),
-                Conv2dGeom {
-                    h: 128,
-                    w: 128,
-                    c_in: 64,
-                    c_out: 64,
-                    kh: 1,
-                    kw: 1,
-                    sh: 1,
-                    sw: 1,
-                    pad: [0, 0, 0, 0],
-                },
-                sp,
-            )?;
-            s.memcpy_htod(
-                &vec![0.0f32; 5 * 128],
-                &mut ws.feature2.slice_mut(0..5 * 128),
-            )?;
-            let (feat2_ptr, _feat2_guard) = ws.feature2.device_ptr(s);
-            let feat2_patch_ptr = feat2_ptr + (5 * 128 * size_of::<f32>()) as u64;
-            let count = 32u64 * 128 * 128;
-            unsafe {
-                s.launch_builder(&self.diag_gauss_bn_fn)
-                    .arg(&ws.buf_1)
-                    .arg(&ws.noise_nchw)
-                    .arg(&self.bn_mean)
-                    .arg(&self.bn_var)
-                    .arg(&ws.moments_nchw)
-                    .arg(&feat2_patch_ptr)
-                    .arg(&32u32)
-                    .arg(&128u32)
-                    .arg(&128u32)
-                    .arg(&1e-4f32)
-                    .launch(grid(count.div_ceil(256).min(65535) as usize, 256))?;
-            }
-            let moments_f32 = s
-                .clone_dtoh(&ws.moments_nchw)?
-                .into_iter()
-                .map(bf16::to_f32)
-                .collect();
-            let feature2_f32 = s.clone_dtoh(&ws.feature2)?;
-            Ok(Flux2VaeOutput {
-                moments_f32,
-                feature2_f32,
-            })
-        }
-    }
-
-    fn decode_rgb_png_chw_f32(path: &std::path::Path) -> Result<Vec<f32>> {
+    fn decode_rgb_png_chw_f32(path: &std::path::Path, side: usize) -> Result<Vec<f32>> {
         let bytes = std::fs::read(path)?;
         let decoded = crate::serve::image::decode_image(&bytes, None)?;
         ensure!(
-            decoded.width == 1024
-                && decoded.height == 1024
-                && decoded.pixels.len() == 3 * 1024 * 1024,
+            decoded.width as usize == side
+                && decoded.height as usize == side
+                && decoded.pixels.len() == 3 * side * side,
             "unexpected PNG dimensions {}x{}",
             decoded.width,
             decoded.height
         );
-        let hw = 1024 * 1024;
+        let hw = side * side;
         let mut chw = vec![0.0f32; 3 * hw];
         for idx in 0..hw {
             for c in 0..3 {
@@ -6595,7 +6967,6 @@ mod tests {
         let ref_png_f32_path = PathBuf::from(
             std::env::var_os("FF_IDOL_REF_PNG_F32").context("FF_IDOL_REF_PNG_F32 missing")?,
         );
-        let nsys_only = std::env::var("FF_IDOL_NSYS_ONLY").as_deref() == Ok("1");
         let runtime_dir = std::env::temp_dir().join(format!("ff-idol-m2-{}", std::process::id()));
         std::fs::create_dir_all(&runtime_dir)?;
 
@@ -6622,52 +6993,27 @@ mod tests {
         let common = CommonOpsRef::new(&device.ctx)?;
         let closure = Rc::new(Closure::new(false, "I1-M2 DINOv3 + FLUX.2 VAE".into()));
         let mut blas = test_blas(&device, &runtime_dir, closure.clone())?;
-
-        let dinov3_file = std::fs::File::open(dinov3_dir.join("model.safetensors"))?;
-        let dinov3_mmap = unsafe { memmap2::MmapOptions::new().map(&dinov3_file)? };
-        let (dinov3, mut dinov3_ws) =
-            DinoV3Encoder::load(&device, &mut blas, common, &dinov3_mmap)?;
-
-        let vae_path = if vae_dir.join("diffusion_pytorch_model.safetensors").exists() {
-            vae_dir.join("diffusion_pytorch_model.safetensors")
-        } else {
-            vae_dir
-                .join("vae")
-                .join("diffusion_pytorch_model.safetensors")
-        };
-        let vae_file = std::fs::File::open(&vae_path)?;
-        let vae_mmap = unsafe { memmap2::MmapOptions::new().map(&vae_file)? };
         let reserve = device.ctx.mem_get_info()?.1 / 16;
-        let (vae, mut vae_ws) = Flux2VaeEncoder::load(&device, &mut blas, &vae_mmap, reserve)?;
+        let mut runtime = IdolVisionEncoderRuntime::load(
+            &device,
+            &mut blas,
+            common,
+            &dinov3_dir,
+            &vae_dir,
+            reserve,
+        )?;
         closure.freeze_fixed()?;
         closure.ready(Instant::now())?;
 
-        if nsys_only {
-            let chw = decode_rgb_png_chw_f32(&fixture_dir.join("armchair_1024.png"))?;
-            let ref_file =
-                std::fs::File::open(fixture_dir.join("armchair").join("reference.safetensors"))?;
-            let ref_mmap = unsafe { memmap2::MmapOptions::new().map(&ref_file)? };
-            let ref_st = safetensors::SafeTensors::deserialize(&ref_mmap)?;
-            let vae_eps = read_bf16_tensor(&ref_st, "vae_eps")?;
-            let _ = dinov3.encode(s, &blas, &mut dinov3_ws, &chw, None, false)?;
-            let _ = vae.encode(s, &blas, &mut vae_ws, &chw, &vae_eps, [0, 1, 0, 1])?;
-            s.synchronize()?;
-            closure.assert_ready()?;
-            let _ = std::fs::remove_dir_all(&runtime_dir);
-            println!(
-                "I1_M2_NSYS_SINGLE_IMAGE PASS strip_pixels={}",
-                vae_ws.strip_pixels
-            );
-            return Ok(());
-        }
-
+        let sample_size = runtime.vae.cfg.sample_size as usize;
         let ref_png_file = std::fs::File::open(&ref_png_f32_path)?;
         let ref_png_mmap = unsafe { memmap2::MmapOptions::new().map(&ref_png_file)? };
         let ref_png_st = safetensors::SafeTensors::deserialize(&ref_png_mmap)?;
         let mut worst: std::collections::BTreeMap<&str, (f64, f64)> =
             std::collections::BTreeMap::new();
         for case in ["armchair", "avocado"] {
-            let chw = decode_rgb_png_chw_f32(&fixture_dir.join(format!("{case}_1024.png")))?;
+            let chw =
+                decode_rgb_png_chw_f32(&fixture_dir.join(format!("{case}_1024.png")), sample_size)?;
             let ref_file =
                 std::fs::File::open(fixture_dir.join(case).join("reference.safetensors"))?;
             let ref_mmap = unsafe { memmap2::MmapOptions::new().map(&ref_file)? };
@@ -6691,8 +7037,7 @@ mod tests {
             );
             let vae_eps = read_bf16_tensor(&ref_st, "vae_eps")?;
 
-            let d_out = dinov3.encode(s, &blas, &mut dinov3_ws, &chw, None, true)?;
-            let v_out = vae.encode(s, &blas, &mut vae_ws, &chw, &vae_eps, [0, 1, 0, 1])?;
+            let (d_out, v_out) = runtime.encode_image(s, &blas, &chw, &vae_eps, true)?;
 
             for (name, actual) in [
                 ("dinov3_layer0", d_out.layer0.as_ref().unwrap()),
@@ -6725,14 +7070,23 @@ mod tests {
             }
 
             if case == "armchair" {
-                let mut mutant_rope =
-                    crate::vision_input::dinov3_rope_table_bf16(5, 64, 64, 64, 100.0)?;
-                mutant_rope.copy_within(5 * 64..10 * 64, 0);
+                let d_cfg = &runtime.dinov3.cfg;
+                let patches_side = runtime.dinov3.image_side / d_cfg.patch_size;
+                let head_dim = d_cfg.head_dim() as usize;
+                let prefix_rows = d_cfg.prefix_rows();
+                let mut mutant_rope = crate::vision_input::dinov3_rope_table_bf16(
+                    prefix_rows,
+                    patches_side,
+                    patches_side,
+                    d_cfg.head_dim(),
+                    d_cfg.rope_theta,
+                )?;
+                mutant_rope.copy_within(prefix_rows * head_dim..2 * prefix_rows * head_dim, 0);
                 let mutant_rope_gpu = s.clone_htod(&mutant_rope)?;
-                let neg_d = dinov3.encode(
+                let neg_d = runtime.dinov3.encode(
                     s,
                     &blas,
-                    &mut dinov3_ws,
+                    &mut runtime.dinov3_ws,
                     &chw,
                     Some(&mutant_rope_gpu),
                     false,
@@ -6750,7 +7104,14 @@ mod tests {
                     "neg_g1a_rotate_prefix feature1 rmse {neg_f1_rmse} < 10 * tau {tau_f1_rmse}"
                 );
 
-                let neg_v = vae.encode(s, &blas, &mut vae_ws, &chw, &vae_eps, [1, 0, 1, 0])?;
+                let neg_v = runtime.vae.encode(
+                    s,
+                    &blas,
+                    &mut runtime.vae_ws,
+                    &chw,
+                    &vae_eps,
+                    [1, 0, 1, 0],
+                )?;
                 for (name, actual) in [
                     ("vae_moments", &neg_v.moments_f32),
                     ("feature2", &neg_v.feature2_f32),
@@ -6774,7 +7135,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&runtime_dir);
         println!(
             "I1_M2_GATE PASS strip_pixels={} feature1_worst_rmse={:.8} vae_moments_worst_max_abs={:.8} vae_moments_worst_rmse={:.8} feature2_worst_max_abs={:.8} feature2_worst_rmse={:.8}",
-            vae_ws.strip_pixels,
+            runtime.vae_ws.strip_pixels,
             worst["feature1"].1,
             worst["vae_moments"].0,
             worst["vae_moments"].1,
