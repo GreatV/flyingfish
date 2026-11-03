@@ -542,6 +542,11 @@ impl VideoDecoder {
         let raw = s.alloc_zeros::<bf16>(slots * w.pixels())?;
         let canvas = s.alloc_zeros::<bf16>(channels * clip_frames * plane)?;
         let mut faded = s.alloc_zeros::<bf16>(channels * tail * plane)?;
+        ensure!(
+            2 * (raw.len() + canvas.len() + faded.len())
+                == decode_bytes(spec, tiles, (height, width)),
+            "decode buffers differ from decode_bytes"
+        );
         eprintln!(
             "{}",
             serde_json::json!({"h3_vae_decode": {"chunks": plan.chunks, "tiles": slots, "tokens_per_tile": w.tokens,
@@ -646,6 +651,21 @@ impl VideoDecoder {
     }
 }
 
+/// Device bytes `VideoDecoder::decode` allocates besides its output for a `height x width` px video through `tiles`:
+/// raw tiles of one clip, the stitched clip canvas and the cross-faded tail, BF16.
+pub(crate) fn decode_bytes(
+    spec: &VaeSpec,
+    tiles: &VaeTiles,
+    (height, width): (usize, usize),
+) -> usize {
+    let clip_frames = (spec.chunk_latents() + spec.overlap_latents()) * spec.temporal_ratio;
+    let lead = spec.chunk_latents() * spec.temporal_ratio;
+    let tail = clip_frames - lead - spec.frame_pre_padding();
+    let channels = spec.out_channels;
+    let tile = channels * clip_frames * tiles.height * tiles.width;
+    2 * (tiles.count() * tile + channels * (clip_frames + tail) * height * width)
+}
+
 /// A device latent video `[latent_channels, frames, height, width]` F32.
 pub(crate) struct LatentVideo<'a> {
     pub data: &'a CudaSlice<f32>,
@@ -686,6 +706,20 @@ pub(crate) struct TileWork {
 }
 
 impl TileWork {
+    /// Device bytes `new` allocates for a `frames x height x width` tile: BF16 latent rows, activations, FFN, patch
+    /// rows, rotary table and unit vector; the F32 residual pair; the attention LSE `[heads, tokens]` F32.
+    pub(crate) fn bytes(spec: &VaeSpec, (frames, height, width): (usize, usize, usize)) -> usize {
+        let patches = frames * height * width;
+        let tokens = patches + spec.registers + 1;
+        let bf16s = 2 * patches * spec.latent_channels
+            + 11 * tokens * spec.dim
+            + 3 * tokens * spec.ffn
+            + tokens * spec.patch_width()
+            + tokens * spec.rope_dims
+            + spec.head_dim;
+        2 * bf16s + 4 * (2 * tokens * spec.dim + spec.heads * tokens)
+    }
+
     pub(crate) fn new(
         s: &Arc<CudaStream>,
         spec: &VaeSpec,
@@ -695,7 +729,7 @@ impl TileWork {
         let tokens = patches + spec.registers + 1;
         let dim = spec.dim;
         let rows = |n: usize| s.alloc_zeros::<bf16>(n);
-        Ok(Self {
+        let work = Self {
             frames,
             height,
             width,
@@ -734,7 +768,38 @@ impl TileWork {
                 tokens,
             )?,
             spec: spec.clone(),
-        })
+        };
+        let bf16s: usize = [
+            &work.latent,
+            &work.latent_q,
+            &work.hidden,
+            &work.normed,
+            &work.q,
+            &work.k,
+            &work.v,
+            &work.q_n,
+            &work.k_n,
+            &work.k_cache,
+            &work.v_cache,
+            &work.attn,
+            &work.o,
+            &work.gate_up,
+            &work.gated,
+            &work.patch_rows,
+            &work.rope,
+            &work.ones,
+        ]
+        .iter()
+        .map(|b| b.len())
+        .sum();
+        let allocated =
+            2 * bf16s + 4 * (work.x.len() + work.y.len()) + work.flash.allocated_bytes();
+        ensure!(
+            allocated == Self::bytes(spec, (frames, height, width)),
+            "tile work allocated {allocated} B, planned {}",
+            Self::bytes(spec, (frames, height, width))
+        );
+        Ok(work)
     }
 
     /// Binds the biased GEMM plans of every decoder projection at this tile's row counts.

@@ -15,7 +15,7 @@ use crate::backend::gpu::{
 use crate::checkpoint::{MappedCheckpoint, TensorEntry, TensorManifest};
 use crate::experts::disk::{AlignedBytes, SpanReader};
 use crate::minimax_h3::{AdalnPlan, H3Spec, MODALITIES, adaln_input};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use half::bf16;
 use safetensors::Dtype;
 use std::{
@@ -24,6 +24,10 @@ use std::{
     sync::Arc,
 };
 
+#[path = "engine_minimax_h3_audio.rs"]
+mod audio;
+#[path = "engine_minimax_h3_pipeline.rs"]
+mod pipeline;
 #[path = "engine_minimax_h3_vae.rs"]
 mod vae;
 
@@ -1174,15 +1178,19 @@ pub(crate) struct StepInputs<'a> {
     pub row_timesteps: &'a CudaSlice<u32>,
 }
 
-/// Transformer-block placement: `Derived` from the sensed VRAM and host budgets; `Streamed` keeps no block resident
-/// (two device slots, host tier from the sensed host budget, rest disk); `StreamedDisk` streams every block from disk.
+/// Transformer-block placement: `Derived` from the sensed VRAM and host budgets; the gates also force `Streamed` (no
+/// block resident: two device slots, host tier from the sensed host budget, rest disk) and `StreamedDisk` (every block
+/// from disk).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Placement {
     Derived,
+    #[cfg(test)]
     Streamed,
+    #[cfg(test)]
     StreamedDisk,
 }
 
+#[cfg(test)]
 impl Placement {
     /// `FF_H3_PLACEMENT` = `derived`, `streamed` or `streamed-disk`.
     pub(crate) fn from_env() -> Result<Self> {
@@ -1190,7 +1198,9 @@ impl Placement {
             Ok("derived") => Ok(Self::Derived),
             Ok("streamed") => Ok(Self::Streamed),
             Ok("streamed-disk") => Ok(Self::StreamedDisk),
-            other => bail!("FF_H3_PLACEMENT must be derived, streamed or streamed-disk: {other:?}"),
+            other => anyhow::bail!(
+                "FF_H3_PLACEMENT must be derived, streamed or streamed-disk: {other:?}"
+            ),
         }
     }
 }
@@ -1276,8 +1286,11 @@ fn place_layers(
             "dense pinned staging and host reserve exceed available RAM: need={reserved} available={available}"
         );
         let host_bytes = match placement {
+            Placement::Derived => available - reserved,
+            #[cfg(test)]
+            Placement::Streamed => available - reserved,
+            #[cfg(test)]
             Placement::StreamedDisk => 0,
-            Placement::Derived | Placement::Streamed => available - reserved,
         };
         plan = DensePlacement::new(layers, budget, host_bytes)?;
         host = Some(available);
@@ -2285,6 +2298,92 @@ pub(crate) fn embedding_rows(
     Ok(out)
 }
 
+/// Runs one MiniMax-H3 i2va request on GPU `device` with the transformer LoRA at `lora` (cuBLAS calibration under
+/// `runtime`) and returns its u8 frames and stereo PCM.
+pub fn generate(
+    model: &Path,
+    lora: &Path,
+    request: &crate::minimax_h3::H3Request,
+    (device, runtime): (usize, &Path),
+) -> Result<crate::minimax_h3::H3Output> {
+    Ok(pipeline::run(model, lora, request, (device, runtime))?.output)
+}
+
+/// One Qwen3-VL conditioner prompt: prompt tokens with their image grids and packed `pixel_values`.
+pub(crate) struct ConditionerPrompt {
+    pub tokens: Vec<u32>,
+    pub modality: Vec<u8>,
+    pub grids: Vec<crate::vision_input::ImageGrid>,
+    pub pixels: Vec<f32>,
+}
+
+/// Image-token runs of a prompt as `(first row, rows)`.
+pub(crate) fn image_runs(tokens: &[u32], image_token: u32) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (row, &id) in tokens.iter().enumerate() {
+        if id != image_token {
+            continue;
+        }
+        match runs.last_mut() {
+            Some((first, n)) if *first + *n == row => *n += 1,
+            _ => runs.push((row, 1)),
+        }
+    }
+    runs
+}
+
+/// BF16 mRoPE table `[rows, head_dim]` of a conditioner cell from its validated position plan.
+pub(crate) fn conditioner_rope(
+    spec: &crate::model_spec::ModelSpec,
+    cell: &ConditionerPrompt,
+) -> Result<Vec<bf16>> {
+    let vision = spec.vision.as_ref().context("vision missing")?;
+    let section = vision.mrope_section.context("mRoPE section missing")?;
+    let plan = crate::vision_input::MultimodalInput {
+        input_ids: &cell.tokens,
+        modality_ids: &cell.modality,
+        pixel_values: &cell.pixels,
+        grids: &cell.grids,
+        audio: &[],
+    }
+    .validate(spec, cell.tokens.len())?;
+    Ok(
+        crate::minimax_h3::mrope_table(&plan, section, spec.rope_theta, spec.head_dim)?
+            .into_iter()
+            .map(bf16::from_f32)
+            .collect(),
+    )
+}
+
+/// Conditioner input of one cell: table rows for text tokens, `merged` for the image rows in order.
+pub(crate) fn conditioner_embeds(
+    cell: &ConditionerPrompt,
+    image_token: u32,
+    table: &BTreeMap<u32, Vec<bf16>>,
+    merged: &[bf16],
+    hidden: usize,
+) -> Result<Vec<bf16>> {
+    let mut embeds = Vec::with_capacity(cell.tokens.len() * hidden);
+    let mut feature = 0usize;
+    for &id in &cell.tokens {
+        if id == image_token {
+            embeds.extend_from_slice(
+                merged
+                    .get(feature * hidden..(feature + 1) * hidden)
+                    .context("fewer image features than image tokens")?,
+            );
+            feature += 1;
+        } else {
+            embeds.extend_from_slice(table.get(&id).context("embedding row missing")?);
+        }
+    }
+    ensure!(
+        feature * hidden == merged.len(),
+        "more image features than image tokens"
+    );
+    Ok(embeds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2292,6 +2391,7 @@ mod tests {
     use crate::minimax_h3::{
         Geometry, KeyframeAnchor, PackedLayout, RowTimesteps, Schedule, row_timestep_plan,
     };
+    use anyhow::bail;
     use safetensors::SafeTensors;
     use std::{fs, rc::Rc};
 
@@ -3243,19 +3343,11 @@ mod tests {
         Ok(())
     }
 
-    /// One Qwen3-VL conditioner cell: prompt tokens with their image grids and packed `pixel_values`.
-    struct ConditionerCell {
-        tokens: Vec<u32>,
-        modality: Vec<u8>,
-        grids: Vec<crate::vision_input::ImageGrid>,
-        pixels: Vec<f32>,
-    }
-
     /// Cells A, D and E of the N6 freeze: tokens and grids of `tokens_from`, pixel rows of `pixel_sources` in order.
     fn conditioner_cells(
         s0: &Path,
         image_token: u32,
-    ) -> Result<Vec<(&'static str, ConditionerCell)>> {
+    ) -> Result<Vec<(&'static str, ConditionerPrompt)>> {
         let mut cells = Vec::new();
         for (name, tokens_from, pixel_sources) in [
             ("A", "A-bf16", &["A-bf16"][..]),
@@ -3297,7 +3389,7 @@ mod tests {
                 .collect();
             cells.push((
                 name,
-                ConditionerCell {
+                ConditionerPrompt {
                     tokens,
                     modality,
                     grids,
@@ -3373,7 +3465,7 @@ mod tests {
         )?;
         let cells = conditioner_cells(&s0, image_token)?;
         let mut run = |tower: &super::super::vision_runtime::LayerNormTower,
-                       cell: &ConditionerCell|
+                       cell: &ConditionerPrompt|
          -> Result<Vec<Vec<f64>>> {
             let input = crate::vision_input::MultimodalInput {
                 input_ids: &cell.tokens,
@@ -3456,44 +3548,6 @@ mod tests {
         Ok(())
     }
 
-    /// Image-token runs of a prompt as `(first row, rows)`.
-    fn image_runs(tokens: &[u32], image_token: u32) -> Vec<(usize, usize)> {
-        let mut runs: Vec<(usize, usize)> = Vec::new();
-        for (row, &id) in tokens.iter().enumerate() {
-            if id != image_token {
-                continue;
-            }
-            match runs.last_mut() {
-                Some((first, n)) if *first + *n == row => *n += 1,
-                _ => runs.push((row, 1)),
-            }
-        }
-        runs
-    }
-
-    /// BF16 mRoPE table `[rows, head_dim]` of a conditioner cell from its validated position plan.
-    fn conditioner_rope(
-        spec: &crate::model_spec::ModelSpec,
-        cell: &ConditionerCell,
-    ) -> Result<Vec<bf16>> {
-        let vision = spec.vision.as_ref().context("vision missing")?;
-        let section = vision.mrope_section.context("mRoPE section missing")?;
-        let plan = crate::vision_input::MultimodalInput {
-            input_ids: &cell.tokens,
-            modality_ids: &cell.modality,
-            pixel_values: &cell.pixels,
-            grids: &cell.grids,
-            audio: &[],
-        }
-        .validate(spec, cell.tokens.len())?;
-        Ok(
-            crate::minimax_h3::mrope_table(&plan, section, spec.rope_theta, spec.head_dim)?
-                .into_iter()
-                .map(bf16::from_f32)
-                .collect(),
-        )
-    }
-
     /// Scores `got` against `want` (`[rows, width]`) under a frozen sink-rule cell: the candidate's sink rows `C`
     /// satisfy `I <= C <= U`, every row of `I` meets its row bound, and the rows outside `U` meet the aggregate bound.
     fn sink_rule(
@@ -3557,35 +3611,6 @@ mod tests {
             .collect())
     }
 
-    /// Conditioner input of one cell: table rows for text tokens, `merged` for the image rows in order.
-    fn conditioner_embeds(
-        cell: &ConditionerCell,
-        image_token: u32,
-        table: &BTreeMap<u32, Vec<bf16>>,
-        merged: &[bf16],
-        hidden: usize,
-    ) -> Result<Vec<bf16>> {
-        let mut embeds = Vec::with_capacity(cell.tokens.len() * hidden);
-        let mut feature = 0usize;
-        for &id in &cell.tokens {
-            if id == image_token {
-                embeds.extend_from_slice(
-                    merged
-                        .get(feature * hidden..(feature + 1) * hidden)
-                        .context("fewer image features than image tokens")?,
-                );
-                feature += 1;
-            } else {
-                embeds.extend_from_slice(table.get(&id).context("embedding row missing")?);
-            }
-        }
-        ensure!(
-            feature * hidden == merged.len(),
-            "more image features than image tokens"
-        );
-        Ok(embeds)
-    }
-
     /// Conditioner text gate state shared by the N6c and N6d gates: the checkpoint manifest with `layers` decoder
     /// layers loading, the embedding rows of every cell's text tokens, and the frozen thresholds.
     struct TextGate {
@@ -3593,7 +3618,7 @@ mod tests {
         legs: PathBuf,
         spec: crate::model_spec::ModelSpec,
         frozen: serde_json::Value,
-        cells: Vec<(&'static str, ConditionerCell)>,
+        cells: Vec<(&'static str, ConditionerPrompt)>,
         table: BTreeMap<u32, Vec<bf16>>,
         manifest: TensorManifest,
     }
@@ -4233,6 +4258,371 @@ mod tests {
             bail!("H3_VAE_KEYFRAME_GATE DEFECT cells outside the frozen thresholds: {defects:?}");
         }
         println!("H3_VAE_KEYFRAME_GATE PASS cells=2 control=FAIL_AS_REQUIRED");
+        Ok(())
+    }
+
+    /// N8a gate: the native audio VAE decoder on the Stage 0 captured audio decoder input of cells A and P against the
+    /// CUDA FP32 replay under the frozen thresholds-n7n8.json bounds; activations without their FIR resampling must
+    /// fail.
+    #[test]
+    #[ignore = "requires FF_MODEL, FF_H3_S0, FF_H3_N7_THRESHOLDS and the GPU"]
+    fn audio_decoder_matches_the_fp32_replay() -> Result<()> {
+        use super::audio::AudioDecoder;
+        let var = |key: &str| -> Result<PathBuf> {
+            Ok(PathBuf::from(
+                std::env::var_os(key).with_context(|| format!("{key} missing"))?,
+            ))
+        };
+        let (model, s0) = (var("FF_MODEL")?, var("FF_H3_S0")?);
+        let frozen: serde_json::Value =
+            serde_json::from_slice(&fs::read(var("FF_H3_N7_THRESHOLDS")?)?)?;
+        let spec = crate::minimax_h3::AudioVaeSpec::read(&model)?;
+        let audio_dir = model.join("audio_vae");
+        let checkpoint = MappedCheckpoint::open_component(&audio_dir, "diffusion_pytorch_model")?;
+        let manifest = checkpoint.minimax_h3_audio_vae_manifest(&spec)?;
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        let ops = Ops::new(&device.ctx)?;
+        let runtime = std::env::temp_dir().join(format!("ff-h3-audio-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(true, "MiniMax-H3 audio decoder gate".into())),
+        )?;
+        let f32s = |bytes: &[u8]| -> Vec<f64> {
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f64::from(f32::from_le_bytes(*v)))
+                .collect()
+        };
+        let decode = |decoder: &AudioDecoder, cell: &str| -> Result<(Vec<f64>, Vec<f64>)> {
+            let map = mapped(&s0.join(format!("{cell}-bf16")).join("decode.safetensors"))?;
+            let file = SafeTensors::deserialize(&map)?;
+            let input = file.tensor("audio_decoder_input")?;
+            let shape = input.shape().to_vec();
+            ensure!(
+                input.dtype() == Dtype::F32 && shape.len() == 3 && shape[1] == spec.latent_channels,
+                "audio decoder input {:?} {shape:?}",
+                input.dtype()
+            );
+            let latents = s.clone_htod(
+                &input
+                    .data()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|v| f32::from_le_bytes(*v))
+                    .collect::<Vec<_>>(),
+            )?;
+            let out = decoder.decode((s, &blas), &latents, (shape[0], shape[2]))?;
+            s.synchronize()?;
+            let candidate: Vec<f64> = s.clone_dtoh(&out)?.into_iter().map(f64::from).collect();
+            let reference_map = mapped(
+                &s0.join(format!("{cell}-fp32-replay"))
+                    .join("replay.safetensors"),
+            )?;
+            let reference_file = SafeTensors::deserialize(&reference_map)?;
+            let reference = reference_file.tensor("decode.audio_decoder_output")?;
+            ensure!(
+                reference.dtype() == Dtype::F32
+                    && reference.shape() == [shape[0], 1, shape[2] * spec.hop()]
+                    && reference.data().len() == 4 * candidate.len(),
+                "reference audio {:?} {:?}",
+                reference.dtype(),
+                reference.shape()
+            );
+            Ok((candidate, f32s(reference.data())))
+        };
+        let decoder = AudioDecoder::new(&device, &spec, &audio_dir, &manifest)?;
+        let mut defects = Vec::new();
+        for cell in ["A", "P"] {
+            let (candidate, reference) = decode(&decoder, cell)?;
+            let d = distance(&candidate, &reference);
+            let key = format!("{cell}.decode.audio_decoder_output");
+            let ok = within(d, &frozen["cells"][&key])?;
+            println!("H3_AUDIO cell={cell} pcm={d:?} within={ok}");
+            if !ok {
+                defects.push(key);
+            }
+        }
+        let control = decoder.without_resampling();
+        let (candidate, reference) = decode(&control, "A")?;
+        let d = distance(&candidate, &reference);
+        let failed = !within(d, &frozen["cells"]["A.decode.audio_decoder_output"])?;
+        println!("H3_AUDIO fir-off control cell=A pcm={d:?} fails={failed}");
+        ensure!(failed, "FIR-off control passed the A audio bound");
+        if !defects.is_empty() {
+            bail!("H3_AUDIO_DECODE_GATE DEFECT cells outside the frozen thresholds: {defects:?}");
+        }
+        println!("H3_AUDIO_DECODE_GATE PASS cells=2 control=FAIL_AS_REQUIRED");
+        Ok(())
+    }
+
+    /// The recorded i2va request of Stage 0 run `<cell>-bf16`: prompt tokens, image grid and `pixel_values`, the text
+    /// tags of the run's layout, the keyframe u8 pixels and posterior noise, the request generator's draws from
+    /// `noise/<cell>/noise.safetensors`, and the run's sampling (8 evaluations, shifts 6 / 3).
+    fn recorded_request(
+        s0: &Path,
+        noise: &Path,
+        cell: &str,
+    ) -> Result<crate::minimax_h3::H3Request> {
+        let run = s0.join(format!("{cell}-bf16"));
+        let meta: serde_json::Value = serde_json::from_slice(&fs::read(run.join("meta.json"))?)?;
+        let text_map = mapped(&run.join("text.safetensors"))?;
+        let text = SafeTensors::deserialize(&text_map)?;
+        let token_ids: Vec<u32> = decoded(&text, "token_ids")?
+            .0
+            .into_iter()
+            .map(|v| v as u32)
+            .collect();
+        let grids = decoded(&text, "image_grid_thw")?
+            .0
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|g| crate::vision_input::ImageGrid {
+                t: g[0] as u32,
+                h: g[1] as u32,
+                w: g[2] as u32,
+            })
+            .collect();
+        let f32s = |v: Vec<f64>| v.into_iter().map(|x| x as f32).collect::<Vec<_>>();
+        let pixel_values = f32s(decoded(&text, "pixel_values")?.0);
+        let layout_map = mapped(&run.join("layout.safetensors"))?;
+        let layout = SafeTensors::deserialize(&layout_map)?;
+        let (tags, _) = decoded(&layout, "token_tags")?;
+        let (rows, _) = decoded(&layout, "text_indices")?;
+        let text_tags = rows.iter().map(|&row| tags[row as usize] as u8).collect();
+        let key_map = mapped(&run.join("keyframes.safetensors"))?;
+        let keys = SafeTensors::deserialize(&key_map)?;
+        let pixels = keys.tensor("k0.pixels")?;
+        let shape = pixels.shape().to_vec();
+        ensure!(
+            pixels.dtype() == Dtype::U8 && shape.len() == 5 && shape[..3] == [1, 3, 1],
+            "keyframe {shape:?}"
+        );
+        let noise_map = mapped(&noise.join(cell).join("noise.safetensors"))?;
+        let draws = SafeTensors::deserialize(&noise_map)?;
+        Ok(crate::minimax_h3::H3Request {
+            token_ids,
+            text_tags,
+            grids,
+            pixel_values,
+            keyframe: pixels.data().to_vec(),
+            height: shape[3],
+            width: shape[4],
+            frames: meta["cell"]["frames"].as_u64().context("meta frames")? as usize,
+            posterior_eps: f32s(decoded(&keys, "k0.posterior_eps")?.0),
+            anchor_noise: f32s(decoded(&draws, "anchor_noise")?.0),
+            video_noise: f32s(decoded(&draws, "video_noise")?.0),
+            audio_rows: f32s(decoded(&draws, "audio_rows")?.0),
+            evaluations: 8,
+            shifts: (6.0, 3.0),
+        })
+    }
+
+    /// N8b run: the production pipeline on the recorded requests of cells A, P and B (B: the second keyframe under A's
+    /// prompt). Writes `<FF_H3_E2E_OUT>/<cell>/native.safetensors` (denormalised decoder inputs, the BF16 video decoder
+    /// output, u8 frames, PCM) for the splice gate; the media control requires A's and B's frames and PCM to differ.
+    #[test]
+    #[ignore = "GPU; FF_MODEL, FF_H3_LORA, FF_H3_S0, FF_H3_E2E_NOISE, FF_H3_E2E_OUT"]
+    fn end_to_end_generates_from_the_recorded_inputs() -> Result<()> {
+        let var = |key: &str| -> Result<PathBuf> {
+            Ok(PathBuf::from(
+                std::env::var_os(key).with_context(|| format!("{key} missing"))?,
+            ))
+        };
+        let (model, lora, s0, noise, out) = (
+            var("FF_MODEL")?,
+            var("FF_H3_LORA")?,
+            var("FF_H3_S0")?,
+            var("FF_H3_E2E_NOISE")?,
+            var("FF_H3_E2E_OUT")?,
+        );
+        let runtime = std::env::temp_dir().join(format!("ff-h3-e2e-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let mut media = Vec::new();
+        for cell in ["A", "P", "B"] {
+            let request = recorded_request(&s0, &noise, cell)?;
+            let generated = super::pipeline::run(&model, &lora, &request, (0, &runtime))?;
+            let o = &generated.output;
+            println!(
+                "H3_E2E cell={cell} frames={} size={}x{} samples={} rate={} video_u8_mean={:.3}",
+                o.frames,
+                o.height,
+                o.width,
+                o.samples,
+                o.sampling_rate,
+                o.video.iter().map(|&v| f64::from(v)).sum::<f64>() / o.video.len() as f64
+            );
+            let dir = out.join(cell);
+            fs::create_dir_all(&dir)?;
+            let mut t = crate::tensors::Tensors::default();
+            t.f32(
+                "video_latents".into(),
+                generated.video_latents.0.clone(),
+                &generated.video_latents.1,
+            )?;
+            t.f32(
+                "audio_latents".into(),
+                generated.audio_latents.0.clone(),
+                &generated.audio_latents.1,
+            )?;
+            t.bf16(
+                "video_decoded".into(),
+                generated.video_decoded.0.clone(),
+                &generated.video_decoded.1,
+            )?;
+            t.f32("audio_decoded".into(), vec![2, 1, o.samples], &o.audio)?;
+            t.u8(
+                "video_u8".into(),
+                vec![o.frames, o.height, o.width, 3],
+                &o.video,
+            )?;
+            t.save_new(
+                &dir.join("native.safetensors"),
+                [("sampling_rate".to_owned(), o.sampling_rate.to_string())].into(),
+            )?;
+            media.push((cell, generated.output));
+        }
+        fs::remove_dir_all(&runtime)?;
+        let (a, b) = (&media[0].1, &media[2].1);
+        ensure!(
+            a.video.len() == b.video.len() && a.audio.len() == b.audio.len(),
+            "A and B extents differ"
+        );
+        let video_diff = a
+            .video
+            .iter()
+            .zip(&b.video)
+            .map(|(&x, &y)| f64::from(x.abs_diff(y)))
+            .sum::<f64>()
+            / a.video.len() as f64;
+        let audio_rms = (a
+            .audio
+            .iter()
+            .zip(&b.audio)
+            .map(|(&x, &y)| f64::from(x - y).powi(2))
+            .sum::<f64>()
+            / a.audio.len() as f64)
+            .sqrt();
+        let differ = a.video != b.video && a.audio != b.audio;
+        println!(
+            "H3_E2E media control A vs B video_mean_abs_u8={video_diff:.3} audio_rms={audio_rms:.5} differ={differ}"
+        );
+        ensure!(differ, "the second keyframe left the output unchanged");
+        println!("H3_E2E_RUN PASS cells=3 media_control=DIFFER");
+        Ok(())
+    }
+
+    /// N8b splice gate: for cells A and P, the native decoder outputs of the end-to-end run against the model
+    /// definition's CUDA FP32 decoders on the same native latents (`reference.safetensors`, harness leg) under the
+    /// frozen N7a / N8a bounds (video whole and cross-fade frames, audio); control: the native video with frame k
+    /// replaced by frame k + 1 must leave the whole-video bound.
+    #[test]
+    #[ignore = "FF_H3_E2E_OUT (run and harness dumps), FF_H3_N7_THRESHOLDS"]
+    fn end_to_end_splice_matches_the_definition_decoders() -> Result<()> {
+        let var = |key: &str| -> Result<PathBuf> {
+            Ok(PathBuf::from(
+                std::env::var_os(key).with_context(|| format!("{key} missing"))?,
+            ))
+        };
+        let out = var("FF_H3_E2E_OUT")?;
+        let frozen: serde_json::Value =
+            serde_json::from_slice(&fs::read(var("FF_H3_N7_THRESHOLDS")?)?)?;
+        let mut defects = Vec::new();
+        for cell in ["A", "P"] {
+            let native_map = mapped(&out.join(cell).join("native.safetensors"))?;
+            let native = SafeTensors::deserialize(&native_map)?;
+            let reference_map = mapped(&out.join(cell).join("reference.safetensors"))?;
+            let reference = SafeTensors::deserialize(&reference_map)?;
+            let video = native.tensor("video_decoded")?;
+            let want = reference.tensor("video_decoder_output")?;
+            ensure!(
+                video.dtype() == Dtype::BF16
+                    && want.dtype() == Dtype::F32
+                    && video.shape() == want.shape(),
+                "splice video {:?} {:?} vs {:?} {:?}",
+                video.dtype(),
+                video.shape(),
+                want.dtype(),
+                want.shape()
+            );
+            let shape = video.shape().to_vec();
+            let extents = (shape[1], shape[2], shape[3] * shape[4]);
+            let candidate: Vec<bf16> = video
+                .data()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| bf16::from_le_bytes(*b))
+                .collect();
+            let key = format!("{cell}.decode.video_decoder_output");
+            let whole = video_distance(&candidate, want.data(), extents, None)?;
+            let ok = within(whole, &frozen["cells"][&key])?;
+            println!("H3_SPLICE cell={cell} video={whole:?} within={ok}");
+            if !ok {
+                defects.push(key.clone());
+            }
+            let fade_key = format!("{key}.crossfade_frames");
+            let fade: Vec<usize> = frozen["cells"][&fade_key]["frames"]
+                .as_array()
+                .context("crossfade frame list missing")?
+                .iter()
+                .map(|v| v.as_u64().map(|v| v as usize).context("crossfade frame"))
+                .collect::<Result<_>>()?;
+            let faded = video_distance(&candidate, want.data(), extents, Some(&fade))?;
+            let ok = within(faded, &frozen["cells"][&fade_key])?;
+            println!("H3_SPLICE cell={cell} crossfade_frames={faded:?} within={ok}");
+            if !ok {
+                defects.push(fade_key);
+            }
+            let (channels, frames, plane) = extents;
+            let mut shifted = candidate.clone();
+            for c in 0..channels {
+                for f in 0..frames {
+                    let from = (c * frames + (f + 1).min(frames - 1)) * plane;
+                    shifted[(c * frames + f) * plane..(c * frames + f + 1) * plane]
+                        .copy_from_slice(&candidate[from..from + plane]);
+                }
+            }
+            let mutant = video_distance(&shifted, want.data(), extents, None)?;
+            let caught = !within(mutant, &frozen["cells"][&key])?;
+            println!("H3_SPLICE frame-shift control cell={cell} video={mutant:?} fails={caught}");
+            ensure!(caught, "frame-shift control passed the {cell} video bound");
+            let pcm = native.tensor("audio_decoded")?;
+            let want = reference.tensor("audio_decoder_output")?;
+            ensure!(
+                pcm.dtype() == Dtype::F32
+                    && want.dtype() == Dtype::F32
+                    && pcm.shape() == want.shape(),
+                "splice audio {:?} vs {:?}",
+                pcm.shape(),
+                want.shape()
+            );
+            let as64 = |b: &[u8]| {
+                b.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|v| f64::from(f32::from_le_bytes(*v)))
+                    .collect::<Vec<_>>()
+            };
+            let d = distance(&as64(pcm.data()), &as64(want.data()));
+            let key = format!("{cell}.decode.audio_decoder_output");
+            let ok = within(d, &frozen["cells"][&key])?;
+            println!("H3_SPLICE cell={cell} pcm={d:?} within={ok}");
+            if !ok {
+                defects.push(key);
+            }
+        }
+        if !defects.is_empty() {
+            bail!("H3_SPLICE_GATE DEFECT cells outside the frozen thresholds: {defects:?}");
+        }
+        println!("H3_SPLICE_GATE PASS cells=2 control=FAIL_AS_REQUIRED");
         Ok(())
     }
 }

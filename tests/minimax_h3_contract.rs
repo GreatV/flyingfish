@@ -118,6 +118,16 @@ fn minimax_h3_vae_decode_geometry_equals_the_model_definition() -> Result<()> {
     assert_eq!(DecodePlan::new(&vae, 37)?.chunks, 7);
     assert_eq!(DecodePlan::new(&vae, 57)?.chunks, 11);
     assert!(DecodePlan::new(&vae, 2).is_err());
+    let spec = spec()?;
+    assert_eq!(Geometry::resolve(&spec, 768, 1344, 120)?.frames, 124);
+    for requested in 120..=345 {
+        let geometry = Geometry::resolve(&spec, 768, 1344, requested)?;
+        assert_eq!(
+            DecodePlan::new(&vae, geometry.latent_frames)?.frames,
+            geometry.frames,
+            "{requested} requested frames"
+        );
+    }
     Ok(())
 }
 

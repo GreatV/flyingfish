@@ -4,6 +4,9 @@ use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 use std::{fs, path::Path};
 
+#[cfg(feature = "cuda")]
+pub use crate::backend::cuda::engine::minimax_h3::generate;
+
 /// Row modality tags; the AdaLN table row of a sequence row is `timestep_index * MODALITIES + tag`.
 pub const VIDEO_TAG: u8 = 0;
 pub const TEXT_TAG: u8 = 1;
@@ -19,8 +22,10 @@ const MAX_SECONDS: f64 = 15.0;
 const AUDIO_LATENTS_PER_SECOND: f64 = 40.0;
 /// Stereo audio rows are packed channel-major, one block per channel.
 const AUDIO_CHANNELS: usize = 2;
-/// Conditioning video rows are pinned at `max(t, KEYFRAME_NOISE_AUG)`.
-const KEYFRAME_NOISE_AUG: f64 = 0.999;
+/// Conditioning video rows are pinned at `max(t, KEYFRAME_NOISE_AUG)`; keyframe anchors are noised to it.
+pub const KEYFRAME_NOISE_AUG: f64 = 0.999;
+/// Qwen3-VL hidden state that conditions the transformer (model definition `text_encoder_layer`).
+pub const TEXT_ENCODER_LAYER: usize = 50;
 /// Latent frame `i` spans `ROPE_FRAME_RESCALE * ROPE_FRAMES_PER_LATENT[i % 5]` rotary time units.
 const ROPE_FRAME_RESCALE: f64 = 5.0 / 3.0;
 const ROPE_FRAMES_PER_LATENT: [f64; 5] = [1.0, 4.0, 4.0, 4.0, 4.0];
@@ -256,19 +261,6 @@ impl VaeSpec {
                 .map(|v| v as usize)
                 .collect())
         };
-        let floats = |key| -> Result<Vec<f32>> {
-            root.get(key)
-                .and_then(Value::as_array)
-                .with_context(|| format!("missing/invalid {key}"))?
-                .iter()
-                .map(|v| {
-                    v.as_f64()
-                        .filter(|v| v.is_finite())
-                        .map(|v| v as f32)
-                        .with_context(|| format!("{key} contains a non-finite or non-number value"))
-                })
-                .collect()
-        };
         let (spatial_factors, temporal_factors) = (
             list("spatial_downsample_factors")?,
             list("temporal_downsample_factors")?,
@@ -298,8 +290,8 @@ impl VaeSpec {
             token_drop: n("token_drop")?,
             groups: n("norm_num_groups")?,
             encoder_eps: f("norm_eps")? as f32,
-            latents_mean: floats("latents_mean")?,
-            latents_std: floats("latents_std")?,
+            latents_mean: f32_list(root, "latents_mean")?,
+            latents_std: f32_list(root, "latents_std")?,
         };
         let blocks = spec.block_out_channels.len();
         ensure!(
@@ -385,6 +377,143 @@ pub fn vae_tiles(
         starts.push(starts[starts.len() - 1] + tile - overlap);
     }
     Ok((tile, starts, overlaps))
+}
+
+const AUDIO_VAE_KEYS: [&str; 15] = [
+    "_class_name",
+    "_diffusers_version",
+    "encoder_dim",
+    "encoder_rates",
+    "latent_dim",
+    "latent_channels",
+    "decoder_dim",
+    "decoder_rates",
+    "decoder_kernel_sizes",
+    "num_attention_heads",
+    "resblock_kernel_sizes",
+    "resblock_dilation_sizes",
+    "sampling_rate",
+    "latents_mean",
+    "latents_std",
+];
+/// Alias-free activation resampling of the audio decoder: ratio and Kaiser filter taps (model definition
+/// `MiniMaxH3AudioActivation1d` defaults).
+pub const AUDIO_RESAMPLE_RATIO: usize = 2;
+pub const AUDIO_RESAMPLE_TAPS: usize = 12;
+
+/// MiniMax-H3 audio VAE (`audio_vae/config.json`): DAC encoder, attention pre-block and BigVGAN decoder geometry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioVaeSpec {
+    pub encoder_dim: usize,
+    pub encoder_rates: Vec<usize>,
+    pub latent_dim: usize,
+    pub latent_channels: usize,
+    pub heads: usize,
+    pub decoder_dim: usize,
+    pub decoder_rates: Vec<usize>,
+    pub decoder_kernels: Vec<usize>,
+    pub resblock_kernels: Vec<usize>,
+    pub resblock_dilations: Vec<Vec<usize>>,
+    pub sampling_rate: usize,
+    pub latents_mean: Vec<f32>,
+    pub latents_std: Vec<f32>,
+}
+
+impl AudioVaeSpec {
+    pub fn read(model_dir: &Path) -> Result<Self> {
+        let path = model_dir.join("audio_vae").join("config.json");
+        Self::parse(
+            &serde_json::from_slice(
+                &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+            )
+            .with_context(|| format!("parse {}", path.display()))?,
+        )
+    }
+
+    pub fn parse(root: &Value) -> Result<Self> {
+        exact_keys(root, &AUDIO_VAE_KEYS, "MiniMax-H3 audio VAE config")?;
+        equal(root, "_class_name", "AutoencoderKLMiniMaxH3Audio".into())?;
+        let n = |key| positive(root, key).map(|v| v as usize);
+        let list = |key| -> Result<Vec<usize>> {
+            Ok(u32_list(root, key)?
+                .into_iter()
+                .map(|v| v as usize)
+                .collect())
+        };
+        let resblock_dilations = root
+            .get("resblock_dilation_sizes")
+            .and_then(Value::as_array)
+            .context("missing/invalid resblock_dilation_sizes")?
+            .iter()
+            .map(|row| {
+                row.as_array()
+                    .context("resblock_dilation_sizes row is not a list")?
+                    .iter()
+                    .map(|v| {
+                        v.as_u64()
+                            .filter(|&v| v > 0)
+                            .map(|v| v as usize)
+                            .context("resblock dilation is not a positive integer")
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let spec = Self {
+            encoder_dim: n("encoder_dim")?,
+            encoder_rates: list("encoder_rates")?,
+            latent_dim: n("latent_dim")?,
+            latent_channels: n("latent_channels")?,
+            heads: n("num_attention_heads")?,
+            decoder_dim: n("decoder_dim")?,
+            decoder_rates: list("decoder_rates")?,
+            decoder_kernels: list("decoder_kernel_sizes")?,
+            resblock_kernels: list("resblock_kernel_sizes")?,
+            resblock_dilations,
+            sampling_rate: n("sampling_rate")?,
+            latents_mean: f32_list(root, "latents_mean")?,
+            latents_std: f32_list(root, "latents_std")?,
+        };
+        let levels = spec.decoder_rates.len();
+        ensure!(
+            spec.decoder_rates.iter().product::<usize>()
+                == spec.encoder_rates.iter().product::<usize>()
+                && spec.decoder_kernels.len() == levels
+                && spec
+                    .decoder_rates
+                    .iter()
+                    .zip(&spec.decoder_kernels)
+                    .all(|(&s, &k)| k > s && (k - s).is_multiple_of(2))
+                && spec.decoder_dim.is_multiple_of(1 << levels)
+                && spec.latent_dim.is_multiple_of(spec.latent_channels)
+                && spec.latent_dim.is_multiple_of(spec.heads)
+                && spec.resblock_kernels.len() == spec.resblock_dilations.len()
+                && spec.resblock_kernels.iter().all(|k| k % 2 == 1)
+                && spec.latents_mean.len() == spec.latent_channels
+                && spec.latents_std.len() == spec.latent_channels,
+            "unsupported MiniMax-H3 audio VAE geometry: {spec:?}"
+        );
+        Ok(spec)
+    }
+
+    /// Waveform samples per latent frame: the product of the decoder rates.
+    pub fn hop(&self) -> usize {
+        self.decoder_rates.iter().product()
+    }
+}
+
+/// A JSON list of finite numbers as F32 (nearest).
+fn f32_list(root: &Value, key: &str) -> Result<Vec<f32>> {
+    root.get(key)
+        .and_then(Value::as_array)
+        .with_context(|| format!("missing/invalid {key}"))?
+        .iter()
+        .map(|v| {
+            v.as_f64()
+                .filter(|v| v.is_finite())
+                .map(|v| v as f32)
+                .with_context(|| format!("{key} contains a non-finite or non-number value"))
+        })
+        .collect()
 }
 
 /// Spatial tile grid of a pixel frame: tile height and width, and per axis the tile starts and neighbour overlaps.
@@ -962,4 +1091,40 @@ pub fn mrope_table(
         table.extend(angles.iter().map(|a| a.sin()));
     }
     Ok(table)
+}
+
+/// One MiniMax-H3 i2va request in the form the native path consumes. Conditioner prompt: token ids, the text tag of
+/// every text row, image grids `[t, h, w]` and Qwen3-VL `pixel_values` rows. Keyframe: u8 pixels `[3, height, width]`
+/// and the posterior noise `[latent_channels, height / 16, width / 16]` of its encode. The request generator's draws,
+/// in the pipeline's order: anchor noise (same shape), video noise `[latent_channels, latent frames, height / 16,
+/// width / 16]` and audio rows `[rows, audio channels]`. Sampling: pixel frames, evaluation count and the video /
+/// audio grid shifts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct H3Request {
+    pub token_ids: Vec<u32>,
+    pub text_tags: Vec<u8>,
+    pub grids: Vec<crate::vision_input::ImageGrid>,
+    pub pixel_values: Vec<f32>,
+    pub keyframe: Vec<u8>,
+    pub height: usize,
+    pub width: usize,
+    pub frames: usize,
+    pub posterior_eps: Vec<f32>,
+    pub anchor_noise: Vec<f32>,
+    pub video_noise: Vec<f32>,
+    pub audio_rows: Vec<f32>,
+    pub evaluations: usize,
+    pub shifts: (f64, f64),
+}
+
+/// Generated media: u8 frames `[frames, height, width, 3]` and stereo PCM `[2, samples]` F32 at `sampling_rate`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct H3Output {
+    pub frames: usize,
+    pub height: usize,
+    pub width: usize,
+    pub video: Vec<u8>,
+    pub samples: usize,
+    pub sampling_rate: usize,
+    pub audio: Vec<f32>,
 }
