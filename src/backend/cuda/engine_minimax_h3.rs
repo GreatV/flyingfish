@@ -24,6 +24,8 @@ use std::{
     sync::Arc,
 };
 
+#[path = "engine_minimax_h3_audio.rs"]
+mod audio;
 #[path = "engine_minimax_h3_vae.rs"]
 mod vae;
 
@@ -4233,6 +4235,107 @@ mod tests {
             bail!("H3_VAE_KEYFRAME_GATE DEFECT cells outside the frozen thresholds: {defects:?}");
         }
         println!("H3_VAE_KEYFRAME_GATE PASS cells=2 control=FAIL_AS_REQUIRED");
+        Ok(())
+    }
+
+    /// N8a gate: the native audio VAE decoder on the Stage 0 captured audio decoder input of cells A and P against the
+    /// CUDA FP32 replay under the frozen thresholds-n7n8.json bounds; activations without their FIR resampling must
+    /// fail.
+    #[test]
+    #[ignore = "requires FF_MODEL, FF_H3_S0, FF_H3_N7_THRESHOLDS and the GPU"]
+    fn audio_decoder_matches_the_fp32_replay() -> Result<()> {
+        use super::audio::AudioDecoder;
+        let var = |key: &str| -> Result<PathBuf> {
+            Ok(PathBuf::from(
+                std::env::var_os(key).with_context(|| format!("{key} missing"))?,
+            ))
+        };
+        let (model, s0) = (var("FF_MODEL")?, var("FF_H3_S0")?);
+        let frozen: serde_json::Value =
+            serde_json::from_slice(&fs::read(var("FF_H3_N7_THRESHOLDS")?)?)?;
+        let spec = crate::minimax_h3::AudioVaeSpec::read(&model)?;
+        let audio_dir = model.join("audio_vae");
+        let checkpoint = MappedCheckpoint::open_component(&audio_dir, "diffusion_pytorch_model")?;
+        let manifest = checkpoint.minimax_h3_audio_vae_manifest(&spec)?;
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        let ops = Ops::new(&device.ctx)?;
+        let runtime = std::env::temp_dir().join(format!("ff-h3-audio-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(true, "MiniMax-H3 audio decoder gate".into())),
+        )?;
+        let f32s = |bytes: &[u8]| -> Vec<f64> {
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f64::from(f32::from_le_bytes(*v)))
+                .collect()
+        };
+        let decode = |decoder: &AudioDecoder, cell: &str| -> Result<(Vec<f64>, Vec<f64>)> {
+            let map = mapped(&s0.join(format!("{cell}-bf16")).join("decode.safetensors"))?;
+            let file = SafeTensors::deserialize(&map)?;
+            let input = file.tensor("audio_decoder_input")?;
+            let shape = input.shape().to_vec();
+            ensure!(
+                input.dtype() == Dtype::F32 && shape.len() == 3 && shape[1] == spec.latent_channels,
+                "audio decoder input {:?} {shape:?}",
+                input.dtype()
+            );
+            let latents = s.clone_htod(
+                &input
+                    .data()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|v| f32::from_le_bytes(*v))
+                    .collect::<Vec<_>>(),
+            )?;
+            let out = decoder.decode((s, &blas), &latents, (shape[0], shape[2]))?;
+            s.synchronize()?;
+            let candidate: Vec<f64> = s.clone_dtoh(&out)?.into_iter().map(f64::from).collect();
+            let reference_map = mapped(
+                &s0.join(format!("{cell}-fp32-replay"))
+                    .join("replay.safetensors"),
+            )?;
+            let reference_file = SafeTensors::deserialize(&reference_map)?;
+            let reference = reference_file.tensor("decode.audio_decoder_output")?;
+            ensure!(
+                reference.dtype() == Dtype::F32
+                    && reference.shape() == [shape[0], 1, shape[2] * spec.hop()]
+                    && reference.data().len() == 4 * candidate.len(),
+                "reference audio {:?} {:?}",
+                reference.dtype(),
+                reference.shape()
+            );
+            Ok((candidate, f32s(reference.data())))
+        };
+        let decoder = AudioDecoder::new(&device, &spec, &audio_dir, &manifest)?;
+        let mut defects = Vec::new();
+        for cell in ["A", "P"] {
+            let (candidate, reference) = decode(&decoder, cell)?;
+            let d = distance(&candidate, &reference);
+            let key = format!("{cell}.decode.audio_decoder_output");
+            let ok = within(d, &frozen["cells"][&key])?;
+            println!("H3_AUDIO cell={cell} pcm={d:?} within={ok}");
+            if !ok {
+                defects.push(key);
+            }
+        }
+        let control = decoder.without_resampling();
+        let (candidate, reference) = decode(&control, "A")?;
+        let d = distance(&candidate, &reference);
+        let failed = !within(d, &frozen["cells"]["A.decode.audio_decoder_output"])?;
+        println!("H3_AUDIO fir-off control cell=A pcm={d:?} fails={failed}");
+        ensure!(failed, "FIR-off control passed the A audio bound");
+        if !defects.is_empty() {
+            bail!("H3_AUDIO_DECODE_GATE DEFECT cells outside the frozen thresholds: {defects:?}");
+        }
+        println!("H3_AUDIO_DECODE_GATE PASS cells=2 control=FAIL_AS_REQUIRED");
         Ok(())
     }
 }

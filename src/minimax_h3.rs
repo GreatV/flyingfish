@@ -256,19 +256,6 @@ impl VaeSpec {
                 .map(|v| v as usize)
                 .collect())
         };
-        let floats = |key| -> Result<Vec<f32>> {
-            root.get(key)
-                .and_then(Value::as_array)
-                .with_context(|| format!("missing/invalid {key}"))?
-                .iter()
-                .map(|v| {
-                    v.as_f64()
-                        .filter(|v| v.is_finite())
-                        .map(|v| v as f32)
-                        .with_context(|| format!("{key} contains a non-finite or non-number value"))
-                })
-                .collect()
-        };
         let (spatial_factors, temporal_factors) = (
             list("spatial_downsample_factors")?,
             list("temporal_downsample_factors")?,
@@ -298,8 +285,8 @@ impl VaeSpec {
             token_drop: n("token_drop")?,
             groups: n("norm_num_groups")?,
             encoder_eps: f("norm_eps")? as f32,
-            latents_mean: floats("latents_mean")?,
-            latents_std: floats("latents_std")?,
+            latents_mean: f32_list(root, "latents_mean")?,
+            latents_std: f32_list(root, "latents_std")?,
         };
         let blocks = spec.block_out_channels.len();
         ensure!(
@@ -385,6 +372,143 @@ pub fn vae_tiles(
         starts.push(starts[starts.len() - 1] + tile - overlap);
     }
     Ok((tile, starts, overlaps))
+}
+
+const AUDIO_VAE_KEYS: [&str; 15] = [
+    "_class_name",
+    "_diffusers_version",
+    "encoder_dim",
+    "encoder_rates",
+    "latent_dim",
+    "latent_channels",
+    "decoder_dim",
+    "decoder_rates",
+    "decoder_kernel_sizes",
+    "num_attention_heads",
+    "resblock_kernel_sizes",
+    "resblock_dilation_sizes",
+    "sampling_rate",
+    "latents_mean",
+    "latents_std",
+];
+/// Alias-free activation resampling of the audio decoder: ratio and Kaiser filter taps (model definition
+/// `MiniMaxH3AudioActivation1d` defaults).
+pub const AUDIO_RESAMPLE_RATIO: usize = 2;
+pub const AUDIO_RESAMPLE_TAPS: usize = 12;
+
+/// MiniMax-H3 audio VAE (`audio_vae/config.json`): DAC encoder, attention pre-block and BigVGAN decoder geometry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioVaeSpec {
+    pub encoder_dim: usize,
+    pub encoder_rates: Vec<usize>,
+    pub latent_dim: usize,
+    pub latent_channels: usize,
+    pub heads: usize,
+    pub decoder_dim: usize,
+    pub decoder_rates: Vec<usize>,
+    pub decoder_kernels: Vec<usize>,
+    pub resblock_kernels: Vec<usize>,
+    pub resblock_dilations: Vec<Vec<usize>>,
+    pub sampling_rate: usize,
+    pub latents_mean: Vec<f32>,
+    pub latents_std: Vec<f32>,
+}
+
+impl AudioVaeSpec {
+    pub fn read(model_dir: &Path) -> Result<Self> {
+        let path = model_dir.join("audio_vae").join("config.json");
+        Self::parse(
+            &serde_json::from_slice(
+                &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+            )
+            .with_context(|| format!("parse {}", path.display()))?,
+        )
+    }
+
+    pub fn parse(root: &Value) -> Result<Self> {
+        exact_keys(root, &AUDIO_VAE_KEYS, "MiniMax-H3 audio VAE config")?;
+        equal(root, "_class_name", "AutoencoderKLMiniMaxH3Audio".into())?;
+        let n = |key| positive(root, key).map(|v| v as usize);
+        let list = |key| -> Result<Vec<usize>> {
+            Ok(u32_list(root, key)?
+                .into_iter()
+                .map(|v| v as usize)
+                .collect())
+        };
+        let resblock_dilations = root
+            .get("resblock_dilation_sizes")
+            .and_then(Value::as_array)
+            .context("missing/invalid resblock_dilation_sizes")?
+            .iter()
+            .map(|row| {
+                row.as_array()
+                    .context("resblock_dilation_sizes row is not a list")?
+                    .iter()
+                    .map(|v| {
+                        v.as_u64()
+                            .filter(|&v| v > 0)
+                            .map(|v| v as usize)
+                            .context("resblock dilation is not a positive integer")
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let spec = Self {
+            encoder_dim: n("encoder_dim")?,
+            encoder_rates: list("encoder_rates")?,
+            latent_dim: n("latent_dim")?,
+            latent_channels: n("latent_channels")?,
+            heads: n("num_attention_heads")?,
+            decoder_dim: n("decoder_dim")?,
+            decoder_rates: list("decoder_rates")?,
+            decoder_kernels: list("decoder_kernel_sizes")?,
+            resblock_kernels: list("resblock_kernel_sizes")?,
+            resblock_dilations,
+            sampling_rate: n("sampling_rate")?,
+            latents_mean: f32_list(root, "latents_mean")?,
+            latents_std: f32_list(root, "latents_std")?,
+        };
+        let levels = spec.decoder_rates.len();
+        ensure!(
+            spec.decoder_rates.iter().product::<usize>()
+                == spec.encoder_rates.iter().product::<usize>()
+                && spec.decoder_kernels.len() == levels
+                && spec
+                    .decoder_rates
+                    .iter()
+                    .zip(&spec.decoder_kernels)
+                    .all(|(&s, &k)| k > s && (k - s).is_multiple_of(2))
+                && spec.decoder_dim.is_multiple_of(1 << levels)
+                && spec.latent_dim.is_multiple_of(spec.latent_channels)
+                && spec.latent_dim.is_multiple_of(spec.heads)
+                && spec.resblock_kernels.len() == spec.resblock_dilations.len()
+                && spec.resblock_kernels.iter().all(|k| k % 2 == 1)
+                && spec.latents_mean.len() == spec.latent_channels
+                && spec.latents_std.len() == spec.latent_channels,
+            "unsupported MiniMax-H3 audio VAE geometry: {spec:?}"
+        );
+        Ok(spec)
+    }
+
+    /// Waveform samples per latent frame: the product of the decoder rates.
+    pub fn hop(&self) -> usize {
+        self.decoder_rates.iter().product()
+    }
+}
+
+/// A JSON list of finite numbers as F32 (nearest).
+fn f32_list(root: &Value, key: &str) -> Result<Vec<f32>> {
+    root.get(key)
+        .and_then(Value::as_array)
+        .with_context(|| format!("missing/invalid {key}"))?
+        .iter()
+        .map(|v| {
+            v.as_f64()
+                .filter(|v| v.is_finite())
+                .map(|v| v as f32)
+                .with_context(|| format!("{key} contains a non-finite or non-number value"))
+        })
+        .collect()
 }
 
 /// Spatial tile grid of a pixel frame: tile height and width, and per axis the tile starts and neighbour overlaps.

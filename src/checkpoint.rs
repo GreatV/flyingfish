@@ -2619,6 +2619,166 @@ impl MappedCheckpoint {
         )
     }
 
+    /// MiniMax-H3 audio VAE (published F32): every tensor's name and shape from `audio_vae/config.json`. The decoder
+    /// side (dec_in_proj and the BigVGAN decoder) is Audio scope and loads; the DAC encoder, pre_block, mean_proj and
+    /// logs_proj are Dormant.
+    pub fn minimax_h3_audio_vae_manifest(
+        &self,
+        a: &crate::minimax_h3::AudioVaeSpec,
+    ) -> Result<TensorManifest> {
+        type Entry<'a> = dyn FnMut(String, Vec<usize>, TensorScope) + 'a;
+        /// A weight-normed convolution: `weight_g [dim0, 1, 1]`, `weight_v [dim0, dim1, k]`, optional `bias [width]`.
+        fn normed(
+            e: &mut Entry<'_>,
+            base: &str,
+            v: [usize; 3],
+            bias: Option<usize>,
+            scope: TensorScope,
+        ) {
+            e(format!("{base}.weight_g"), vec![v[0], 1, 1], scope);
+            e(format!("{base}.weight_v"), v.to_vec(), scope);
+            if let Some(width) = bias {
+                e(format!("{base}.bias"), vec![width], scope);
+            }
+        }
+        let mut expected = BTreeMap::new();
+        let e: &mut Entry<'_> = &mut |name: String, shape: Vec<usize>, scope: TensorScope| {
+            put(&mut expected, name, Dtype::F32, shape, scope)
+        };
+        let (encoder, decoder) = (TensorScope::Dormant, TensorScope::Audio);
+        let snake = |e: &mut Entry<'_>, base: String, dim: usize| {
+            e(format!("{base}.alpha"), vec![1, dim, 1], encoder)
+        };
+        normed(
+            e,
+            "encoder.block.0",
+            [a.encoder_dim, 1, 7],
+            Some(a.encoder_dim),
+            encoder,
+        );
+        let mut dim = a.encoder_dim;
+        for (i, &stride) in a.encoder_rates.iter().enumerate() {
+            let block = format!("encoder.block.{}", i + 1);
+            for unit in 0..3 {
+                let base = format!("{block}.block.{unit}.block");
+                snake(e, format!("{base}.0"), dim);
+                normed(e, &format!("{base}.1"), [dim, dim, 7], Some(dim), encoder);
+                snake(e, format!("{base}.2"), dim);
+                normed(e, &format!("{base}.3"), [dim, dim, 1], Some(dim), encoder);
+            }
+            snake(e, format!("{block}.block.3"), dim);
+            normed(
+                e,
+                &format!("{block}.block.4"),
+                [2 * dim, dim, 2 * stride],
+                Some(2 * dim),
+                encoder,
+            );
+            dim *= 2;
+        }
+        let tail = a.encoder_rates.len() + 1;
+        snake(e, format!("encoder.block.{tail}"), dim);
+        normed(
+            e,
+            &format!("encoder.block.{}", tail + 1),
+            [a.latent_dim, dim, 3],
+            Some(a.latent_dim),
+            encoder,
+        );
+        let (latent, lc) = (a.latent_dim, a.latent_channels);
+        for (name, shape) in [
+            ("pre_block.norm1.weight", vec![latent]),
+            ("pre_block.norm1.bias", vec![latent]),
+            ("pre_block.norm3.weight", vec![latent]),
+            ("pre_block.norm3.bias", vec![latent]),
+            ("pre_block.norm2.weight", vec![lc]),
+            ("pre_block.norm2.bias", vec![lc]),
+            ("pre_block.attn.qkv.weight", vec![3 * latent, latent]),
+            ("pre_block.attn.q_bias", vec![latent]),
+            ("pre_block.attn.v_bias", vec![latent]),
+            ("pre_block.attn.zero_k_bias", vec![latent]),
+            ("pre_block.attn.proj.weight", vec![lc, lc]),
+            ("pre_block.attn.proj.bias", vec![lc]),
+            ("pre_block.proj.weight", vec![lc, latent]),
+            ("pre_block.proj.bias", vec![lc]),
+            ("pre_block.mlp.norm.weight", vec![lc]),
+            ("pre_block.mlp.norm.bias", vec![lc]),
+            ("pre_block.mlp.w0.weight", vec![2 * lc, lc]),
+            ("pre_block.mlp.w0.bias", vec![2 * lc]),
+            ("pre_block.mlp.w1.weight", vec![2 * lc, lc]),
+            ("pre_block.mlp.w1.bias", vec![2 * lc]),
+            ("pre_block.mlp.w2.weight", vec![lc, 2 * lc]),
+            ("pre_block.mlp.w2.bias", vec![lc]),
+            ("mean_proj.weight", vec![lc, lc, 1]),
+            ("mean_proj.bias", vec![lc]),
+            ("logs_proj.weight", vec![lc, lc, 1]),
+            ("logs_proj.bias", vec![lc]),
+        ] {
+            e(name.to_owned(), shape, encoder);
+        }
+        e("dec_in_proj.weight".into(), vec![latent, lc, 1], decoder);
+        e("dec_in_proj.bias".into(), vec![latent], decoder);
+        normed(
+            e,
+            "decoder.conv_pre",
+            [a.decoder_dim, latent, 7],
+            Some(a.decoder_dim),
+            decoder,
+        );
+        let activation = |e: &mut Entry<'_>, base: String, channels: usize| {
+            let taps = vec![1, 1, crate::minimax_h3::AUDIO_RESAMPLE_TAPS];
+            e(format!("{base}.act.alpha"), vec![channels], decoder);
+            e(format!("{base}.act.beta"), vec![channels], decoder);
+            e(format!("{base}.upsample.filter"), taps.clone(), decoder);
+            e(format!("{base}.downsample.lowpass.filter"), taps, decoder);
+        };
+        let blocks = a.resblock_kernels.len();
+        let mut channels = a.decoder_dim;
+        for (i, &kernel) in a.decoder_kernels.iter().enumerate() {
+            let half = channels / 2;
+            normed(
+                e,
+                &format!("decoder.ups.{i}.0"),
+                [channels, half, kernel],
+                Some(half),
+                decoder,
+            );
+            channels = half;
+            for (j, (&k, dilations)) in a
+                .resblock_kernels
+                .iter()
+                .zip(&a.resblock_dilations)
+                .enumerate()
+            {
+                let block = format!("decoder.resblocks.{}", i * blocks + j);
+                for m in 0..dilations.len() {
+                    for convs in ["convs1", "convs2"] {
+                        normed(
+                            e,
+                            &format!("{block}.{convs}.{m}"),
+                            [channels, channels, k],
+                            Some(channels),
+                            decoder,
+                        );
+                    }
+                }
+                for m in 0..2 * dilations.len() {
+                    activation(e, format!("{block}.activations.{m}"), channels);
+                }
+            }
+        }
+        activation(e, "decoder.activation_post".into(), channels);
+        normed(e, "decoder.conv_post", [1, channels, 7], None, decoder);
+        let planned = planned_bytes(&expected, LoadPolicy::AudioOnly)?;
+        self.assemble_manifest(
+            "MiniMax-H3 audio VAE",
+            expected,
+            LoadPolicy::AudioOnly,
+            planned,
+            None,
+        )
+    }
+
     /// MiniMax-H3 Qwen3-VL conditioner: decoder layers `0..layers` load; the embedding table (read by row), the later
     /// layers, the final norm and the LM head are Dormant; the vision tower is Vision scope.
     pub fn minimax_h3_conditioner_manifest(

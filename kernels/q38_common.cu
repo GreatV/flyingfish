@@ -803,3 +803,164 @@ extern "C" __global__ __launch_bounds__(256) void rms_branch_add(
     for(uint32_t i=threadIdx.x;i<width;i+=256)
         n[base+i]=norm_scale<false>(__bfloat162float(x[base+i]),inv,wn[i],zero,5);
 }
+
+// Weight-norm fold at setup: v viewed [channels, rest]; out = g[c] * v[c] /
+// ||v[c]||, computed once in memory.
+extern "C" __global__ void weight_norm_fold_f32(const float* __restrict__ g,
+    const float* __restrict__ v, float* __restrict__ out,
+    long long channels, long long rest) {
+    const long long c = (long long)blockIdx.x;
+    if (c >= channels) return;
+    float sum = 0.0f;
+    for (long long r = threadIdx.x; r < rest; r += blockDim.x) {
+        const float e = v[c * rest + r];
+        sum = __fadd_rn(sum, __fmul_rn(e, e));
+    }
+    __shared__ float scratch[8];
+    for (int delta = 16; delta; delta /= 2)
+        sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffu, sum, delta));
+    if (threadIdx.x % 32 == 0) scratch[threadIdx.x / 32] = sum;
+    __syncthreads();
+    sum = threadIdx.x < 8 ? scratch[threadIdx.x] : 0.0f;
+    if (threadIdx.x < 32) {
+        for (int delta = 16; delta; delta /= 2)
+            sum = __fadd_rn(sum, __shfl_down_sync(0xffffffffu, sum, delta));
+        if (threadIdx.x == 0) scratch[0] = sum;
+    }
+    __syncthreads();
+    const float norm = sqrtf(scratch[0] + 1e-12f);
+    for (long long r = threadIdx.x; r < rest; r += blockDim.x)
+        out[c * rest + r] = __fmul_rn(__fdiv_rn(g[c], norm), v[c * rest + r]);
+}
+
+// Zero-pad n rows on both sides: out has rows + 2n rows, out[n..n+rows) = x.
+extern "C" __global__ void pad_rows_n_f32(const float* __restrict__ x,
+    float* __restrict__ out, long long rows, long long pad, long long width) {
+    const long long total = (rows + 2 * pad) * width;
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const long long row = i / width;
+    out[i] = (row < pad || row >= pad + rows) ? 0.0f : x[i - pad * width];
+}
+
+
+// Transpose [C, L] -> [L, C], elementwise.
+extern "C" __global__ void transpose_f32(const float* __restrict__ in,
+    float* __restrict__ out, long long channels, long long length) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= channels * length) return;
+    const long long c = i / length;
+    const long long t = i - c * length;
+    out[t * channels + c] = in[i];
+}
+
+
+// Conv1d im2col over a zero-padded buffer: A[t, c*K + k] = padded[t + k*d, c],
+// with A row-major [rows, width*K] and padded [rows + 2*pad, width].
+extern "C" __global__ void conv_im2col_f32(const float* __restrict__ padded,
+    float* __restrict__ a, long long rows, int width, int kernel, int dilation) {
+    if (!padded || !a || !rows || !width || !kernel || !dilation) { __trap(); return; }
+    const long long cols = (long long)width * kernel;
+    const long long total = rows * cols;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += (long long)gridDim.x * blockDim.x) {
+        const long long t = i / cols;
+        const int col = (int)(i - t * cols);
+        const int c = col / kernel;
+        const int k = col - c * kernel;
+        a[i] = padded[(t + (long long)k * dilation) * width + c];
+    }
+}
+
+
+// Transposed conv1d on the published [in, out * kernel] weight with bias: out row t of rows * stride sums, over taps
+// k ascending with (t + pad - k) divisible by stride, x row j = (t + pad - k) / stride in [0, rows). x [rows, in],
+// out [rows * stride, out]; kernel - 2 * pad == stride.
+extern "C" __global__ void conv_transpose_rows_f32(const float* __restrict__ x,
+    const float* __restrict__ w, const float* __restrict__ bias, float* __restrict__ out,
+    int rows, int in_dim, int out_dim, int kernel, int stride, int pad) {
+    if (!x || !w || !bias || !out || rows <= 0 || in_dim <= 0 || out_dim <= 0 || stride <= 0 ||
+        pad < 0 || kernel - 2 * pad != stride || blockDim.x != 256 || blockDim.y != 1 ||
+        blockDim.z != 1 || gridDim.y != 1 || gridDim.z != 1) { __trap(); return; }
+    const long long out_rows = (long long)rows * stride;
+    for (long long t = (long long)blockIdx.x; t < out_rows; t += gridDim.x) {
+        for (int o = threadIdx.x; o < out_dim; o += blockDim.x) {
+            float acc = 0.0f;
+            for (int k = (int)((t + pad) % stride); k < kernel; k += stride) {
+                const long long j = (t + pad - k) / stride;
+                if (j < 0 || j >= rows) continue;
+                const float* xr = x + j * in_dim;
+                const float* wr = w + (long long)o * kernel + k;
+                for (int c = 0; c < in_dim; c++)
+                    acc = __fadd_rn(acc, __fmul_rn(xr[c], wr[(long long)c * out_dim * kernel]));
+            }
+            out[t * out_dim + o] = __fadd_rn(acc, bias[o]);
+        }
+    }
+}
+
+// SnakeBeta on time-major rows [T, C]: y = x + rcp(exp(beta[c]) + 1e-9) * sin(exp(alpha[c]) * x)^2.
+extern "C" __global__ void snake_beta_rows_f32(const float* __restrict__ x,
+    const float* __restrict__ alpha, const float* __restrict__ beta, float* __restrict__ y,
+    long long count, int channels) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int c = (int)(i % channels);
+    const float v = x[i];
+    const float s = sinf(__fmul_rn(expf(alpha[c]), v));
+    y[i] = __fadd_rn(v, __fmul_rn(__frcp_rn(__fadd_rn(expf(beta[c]), 1e-9f)), __fmul_rn(s, s)));
+}
+
+// Depthwise FIR upsampler on rows [T, C] with one shared filter [kernel]: x replicate-padded by pad rows on both
+// sides, transposed-convolved at stride (taps ascending), times scale, rows [crop, crop + T * stride) -> y.
+extern "C" __global__ void fir_upsample_rows_f32(const float* __restrict__ x,
+    const float* __restrict__ filter, float* __restrict__ y, int rows, int channels, int kernel,
+    int stride, int pad, int crop, float scale) {
+    const long long count = (long long)rows * stride * channels;
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int c = (int)(i % channels);
+    const long long u = i / channels + crop;
+    const long long padded = (long long)rows + 2 * pad;
+    float acc = 0.0f;
+    for (int k = (int)(u % stride); k < kernel; k += stride) {
+        const long long j = (u - k) / stride;
+        if (j < 0 || j >= padded) continue;
+        const long long src = min(max(j - pad, 0LL), (long long)rows - 1);
+        acc = __fadd_rn(acc, __fmul_rn(x[src * channels + c], filter[k]));
+    }
+    y[i] = __fmul_rn(scale, acc);
+}
+
+// Depthwise FIR lowpass downsampler on rows [T, C] with one shared filter [kernel]: x replicate-padded by left /
+// right rows, convolved at stride (taps ascending); out_rows = (T + left + right - kernel) / stride + 1.
+extern "C" __global__ void fir_downsample_rows_f32(const float* __restrict__ x,
+    const float* __restrict__ filter, float* __restrict__ y, int rows, int channels, int kernel,
+    int stride, int left, int out_rows) {
+    const long long count = (long long)out_rows * channels;
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int c = (int)(i % channels);
+    const long long t = i / channels;
+    float acc = 0.0f;
+    for (int k = 0; k < kernel; k++) {
+        const long long src = min(max(t * stride + k - left, 0LL), (long long)rows - 1);
+        acc = __fadd_rn(acc, __fmul_rn(x[src * channels + c], filter[k]));
+    }
+    y[i] = acc;
+}
+
+// y = (y + x) * scale, elementwise F32.
+extern "C" __global__ void add_scale_f32(float* __restrict__ y, const float* __restrict__ x,
+    long long count, float scale) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    y[i] = __fmul_rn(__fadd_rn(y[i], x[i]), scale);
+}
+
+// x = min(max(x, lo), hi), elementwise F32.
+extern "C" __global__ void clamp_f32(float* __restrict__ x, long long count, float lo, float hi) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    x[i] = fminf(fmaxf(x[i], lo), hi);
+}
