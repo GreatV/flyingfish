@@ -1240,6 +1240,10 @@ impl VisionPositions {
                 (-step).mul_add((n - 1 - i) as f32, end)
             }
         };
+        // Qwen3-VL (transformers 5.21 model definition): `src = f32(i * (side - 1)) / (n - 1)` and per-axis weights
+        // `max(0, 1 - |src - floor - k|)`, k in {0, 1}. Q38: the linspace coordinate and `1 - d` / `d` weights.
+        let closed_form = architecture == Architecture::Qwen3Vl;
+        let closed = |i: u32, n: u32| (i as f32 * (side - 1) as f32) / (n.max(2) - 1) as f32;
         for grid in grids {
             for block_y in 0..grid.h / 2 {
                 for block_x in 0..grid.w / 2 {
@@ -1250,8 +1254,11 @@ impl VisionPositions {
                             result
                                 .coordinates
                                 .push([i32::try_from(y)?, i32::try_from(x)?]);
-                            let h = coordinate(y, grid.h);
-                            let w = coordinate(x, grid.w);
+                            let (h, w) = if closed_form {
+                                (closed(y, grid.h), closed(x, grid.w))
+                            } else {
+                                (coordinate(y, grid.h), coordinate(x, grid.w))
+                            };
                             let hf = h as i32;
                             let wf = w as i32;
                             let hc = (hf + 1).min(side - 1);
@@ -1264,12 +1271,19 @@ impl VisionPositions {
                                 hc * side + wf,
                                 hc * side + wc,
                             ];
-                            let weights = [
-                                (1.0 - dh) * (1.0 - dw),
-                                (1.0 - dh) * dw,
-                                dh * (1.0 - dw),
-                                dh * dw,
-                            ];
+                            let weights = if closed_form {
+                                let near = |d: f32| (1.0 - d.abs()).max(0.0);
+                                let (h0, h1, w0, w1) =
+                                    (near(dh), near(dh - 1.0), near(dw), near(dw - 1.0));
+                                [h0 * w0, h0 * w1, h1 * w0, h1 * w1]
+                            } else {
+                                [
+                                    (1.0 - dh) * (1.0 - dw),
+                                    (1.0 - dh) * dw,
+                                    dh * (1.0 - dw),
+                                    dh * dw,
+                                ]
+                            };
                             for k in 0..4 {
                                 result.bilinear_indices[k].push(indices[k]);
                                 result.bilinear_weights[k].push(weights[k]);
