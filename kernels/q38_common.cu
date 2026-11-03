@@ -975,6 +975,7 @@ extern "C" __global__ void clamp_f32(float* __restrict__ x, long long count, flo
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     x[i] = fminf(fmaxf(x[i], lo), hi);
+}
 
 // Fourier time features: angle = (2*pi*t) * w[i]; out = [cos(angle) ..., sin(angle) ...].
 extern "C" __global__ void fourier_time_f32(const float* __restrict__ timestep,
@@ -1012,7 +1013,7 @@ extern "C" __global__ void softmax_rows_f32(float* __restrict__ scores,
 
 // Flow input concat in F32: out[t, 0:in] = x[c, t] (channel-major latent),
 // out[t, in:2*in] = 0, out[t, 2*in:2*in+cond] = cond[t, c].
-extern "C" __global__ void flow_concat_f32(const float* __restrict__ x,
+extern "C" __global__ void concat_channels_f32(const float* __restrict__ x,
     const float* __restrict__ cond, float* __restrict__ out,
     long long length, int channels, int cond_dim) {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1027,13 +1028,6 @@ extern "C" __global__ void flow_concat_f32(const float* __restrict__ x,
     out[i] = v;
 }
 
-// y[i] += bias[i % dim], elementwise F32.
-extern "C" __global__ void bias_add_f32(float* __restrict__ y,
-    const float* __restrict__ bias, long long count, int dim) {
-    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= count) return;
-    y[i] += bias[i % dim];
-}
 
 // a[i] += b[i], elementwise F32.
 extern "C" __global__ void add_inplace_f32(float* __restrict__ a,
@@ -1055,7 +1049,7 @@ extern "C" __global__ void silu_f32(float* __restrict__ x, long long count) {
 // row-major [length, channels], velocity channel-major [channels, length].
 // The definition's residual at the postprocess conv is the transposed
 // proj_out output, not the transformer input.
-extern "C" __global__ void flow_tail_f32(const float* __restrict__ post,
+extern "C" __global__ void transpose_residual_f32(const float* __restrict__ post,
     const float* __restrict__ proj, float* __restrict__ velocity,
     long long length, int channels) {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1142,10 +1136,11 @@ extern "C" __global__ void channel_scale_residual_f32(
     const float* residual, const float* branch, const float* scale, float* y,
     uint32_t rows, uint32_t width) {
     channel_scale_residual(residual, branch, scale, y, rows, width);
+}
 
 // Condition fusion: out[t, h] = scale * sum_l w[l] * x[t, l*H + h], with x
 // [frames, layers*H] row-major and w the softmax over the 8 layers.
-extern "C" __global__ void cond_layer_sum_f32(const float* __restrict__ x,
+extern "C" __global__ void weighted_layer_sum_f32(const float* __restrict__ x,
     const float* __restrict__ w, float scale, float* __restrict__ out,
     long long frames, int layers, int width) {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1158,25 +1153,7 @@ extern "C" __global__ void cond_layer_sum_f32(const float* __restrict__ x,
     out[i] = __fmul_rn(scale, sum);
 }
 
-// Zero-pad rows: out[0] = 0, out[1..F] = x, out[F+1] = 0; both [rows, C].
-extern "C" __global__ void pad_rows_f32(const float* __restrict__ x,
-    float* __restrict__ out, long long rows, long long width) {
-    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    const long long total = (rows + 2) * width;
-    if (i >= total) return;
-    const long long row = i / width;
-    out[i] = (row == 0 || row == rows + 1) ? 0.0f : x[i - width];
-}
 
-// Repack one k-plane of a Conv1d weight [O, I, K] into a dense [O, I].
-extern "C" __global__ void extract_plane_f32(const float* __restrict__ w,
-    int k, float* __restrict__ out, long long out_elems, int in_dim, int kernel) {
-    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= out_elems) return;
-    const long long o = i / in_dim;
-    const int c = (int)(i - o * in_dim);
-    out[i] = w[o * (long long)in_dim * kernel + (long long)c * kernel + k];
-}
 
 // Nearest-row gather: out[j, :] = in[map[j], :].
 extern "C" __global__ void nearest_rows_f32(const float* __restrict__ in,
@@ -1201,17 +1178,6 @@ extern "C" __global__ void snake_rows_f32(const float* __restrict__ x,
 
 // Transposed-conv scatter-add: out[j*s + k - pad, :] += tmp[j, :], bounds
 // checked; out rows = in_rows * s, both [rows, channels].
-extern "C" __global__ void scatter_strided_add_f32(const float* __restrict__ tmp,
-    float* __restrict__ out, long long in_rows, int channels,
-    int stride, int k, int pad) {
-    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= in_rows * channels) return;
-    const long long j = i / channels;
-    const int c = (int)(i - j * channels);
-    const long long row = j * stride + k - pad;
-    if (row < 0 || row >= in_rows * stride) return;
-    out[row * channels + c] += tmp[i];
-}
 
 // In-place tanh, elementwise F32.
 extern "C" __global__ void tanh_f32(float* __restrict__ x, long long count) {
@@ -1230,10 +1196,67 @@ extern "C" __global__ void extract_plane_transposed_f32(const float* __restrict_
     out[i] = w[(long long)a * b_dim * kernel + (long long)b * kernel + k];
 }
 
+
 // Euler flow update: x += (sigma_next - sigma) * v, elementwise F32.
 extern "C" __global__ void euler_update_f32(float* __restrict__ x,
     const float* __restrict__ v, float dt, long long count) {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     x[i] = __fadd_rn(x[i], __fmul_rn(dt, v[i]));
+}
+
+// Conv1d im2col over a zero-padded buffer: A[t, c*K + k] = padded[t + k*d, c],
+// with A row-major [rows, width*K] and padded [rows + 2*pad, width].
+extern "C" __global__ void conv_im2col_f32(const float* __restrict__ padded,
+    float* __restrict__ a, long long rows, int width, int kernel, int dilation) {
+    if (!padded || !a || !rows || !width || !kernel || !dilation) { __trap(); return; }
+    const long long cols = (long long)width * kernel;
+    const long long total = rows * cols;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += (long long)gridDim.x * blockDim.x) {
+        const long long t = i / cols;
+        const int col = (int)(i - t * cols);
+        const int c = col / kernel;
+        const int k = col - c * kernel;
+        a[i] = padded[(t + (long long)k * dilation) * width + c];
+    }
+}
+
+// Transposed conv, stride s, kernel K = 2*s, pad p = ceil(s/2), on the
+// published folded weight [in, out*K]: out row t sums the at-most-two taps
+// k with (t + p - k) divisible by s. x [rows, in], out [rows*s, out].
+extern "C" __global__ void conv_transpose_f32(const float* __restrict__ x,
+    const float* __restrict__ w, const float* __restrict__ bias,
+    float* __restrict__ out, int rows, int in_dim, int out_dim,
+    int stride, int pad) {
+    if (!x || !w || !bias || !out || !rows || !in_dim || !out_dim || !stride ||
+        pad < 0 || blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
+        gridDim.y != 1 || gridDim.z != 1) { __trap(); return; }
+    const int kernel = 2 * stride;
+    const long long out_rows = (long long)rows * stride;
+    for (long long t = (long long)blockIdx.x; t < out_rows; t += gridDim.x) {
+        const int phase = (int)((t + pad) % stride);
+        for (int o = threadIdx.x; o < out_dim; o += blockDim.x) {
+            float acc = 0.0f;
+            for (int k = phase; k < kernel; k += stride) {
+                const long long j = (t + pad - k) / stride;
+                if (j < 0 || j >= rows) continue;
+                const float* wr = w + (long long)o * kernel + k;
+                const float* xr = x + j * in_dim;
+                for (int c = 0; c < in_dim; c++)
+                    acc = __fadd_rn(acc, __fmul_rn(xr[c], wr[(long long)c * out_dim * kernel]));
+            }
+            out[t * out_dim + o] = __fadd_rn(acc, bias[o]);
+        }
+    }
+}
+
+// Guided Euler update: x += dt * (u + scale * (c - u)), elementwise F32.
+extern "C" __global__ void guided_euler_f32(float* __restrict__ x,
+    const float* __restrict__ c, const float* __restrict__ u,
+    float scale, float dt, long long count) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float guided = __fadd_rn(u[i], __fmul_rn(scale, __fsub_rn(c[i], u[i])));
+    x[i] = __fadd_rn(x[i], __fmul_rn(dt, guided));
 }

@@ -155,18 +155,6 @@ extern "C" __global__ void residual_scale(const __nv_bfloat16* __restrict__ a,
     y[i] = __float2bfloat16_rn(__bfloat162float(sum) * scale);
 }
 
-// Music3 snake activation in F32: y = x + (alpha + 1e-9)^-1 * sin(alpha * x)^2
-// with one alpha per channel; x/y are [channels, length] rows.
-extern "C" __global__ void snake_f32(const float* __restrict__ x,
-    const float* __restrict__ alpha, float* __restrict__ y,
-    long long count, long long length) {
-    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= count) return;
-    const float a = alpha[i / length];
-    const float v = x[i];
-    const float s = sinf(a * v);
-    y[i] = v + __frcp_rn(a + 1e-9f) * s * s;
-}
 
 // Music3 FF gate in F32: pairs [rows, 2*dim] split half/half,
 // y = first * silu(second).

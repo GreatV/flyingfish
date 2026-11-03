@@ -1203,8 +1203,10 @@ impl Music3SynWeights {
         let dim = spec.flow_dim() as usize;
         let concat = spec.concat_channels() as usize;
         let ff = spec.flow_ff_inner as usize;
-        let mapped_transformer =
-            crate::checkpoint::MappedCheckpoint::open(&dir.join("transformer"))?;
+        let mapped_transformer = crate::checkpoint::MappedCheckpoint::open_component(
+            &dir.join("transformer"),
+            "diffusion_pytorch_model",
+        )?;
         let manifest_transformer = mapped_transformer.music3_syn_manifest(spec)?;
         let (flow, _) = checkpoint_mapped(
             &mapped_transformer,
@@ -1258,8 +1260,10 @@ impl Music3SynWeights {
 
         let cond_hidden = spec.cond_hidden as usize;
         let layers = spec.cond_layers as usize;
-        let mapped_condition_encoder =
-            crate::checkpoint::MappedCheckpoint::open(&dir.join("condition_encoder"))?;
+        let mapped_condition_encoder = crate::checkpoint::MappedCheckpoint::open_component(
+            &dir.join("condition_encoder"),
+            "diffusion_pytorch_model",
+        )?;
         let manifest_condition_encoder = mapped_condition_encoder.music3_syn_manifest(spec)?;
         let (cond, _) = checkpoint_mapped(
             &mapped_condition_encoder,
@@ -1290,7 +1294,10 @@ impl Music3SynWeights {
             stage_input = output;
         }
         let tail = stage_input;
-        let mapped_vocoder = crate::checkpoint::MappedCheckpoint::open(&dir.join("vocoder"))?;
+        let mapped_vocoder = crate::checkpoint::MappedCheckpoint::open_component(
+            &dir.join("vocoder"),
+            "diffusion_pytorch_model",
+        )?;
         let manifest_vocoder = mapped_vocoder.music3_syn_manifest(spec)?;
         let (vocoder, _) =
             checkpoint_mapped(&mapped_vocoder, d, Some(&manifest_vocoder), false, |l| {

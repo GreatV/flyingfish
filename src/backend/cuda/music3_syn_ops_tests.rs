@@ -1,8 +1,6 @@
-//! Music3 synthesis engine gates. GPU gates are `#[ignore]`d and run under a
-//! coordinator-granted window with `FF_MUSIC3_MODEL` naming the official
-//! weights directory; the frozen cells come from
-//! `~/ff-work/minimax/evidence/oracle/frozen-r3-syn` (input captures under
-//! `evidence/oracle/captures`).
+//! Music3 synthesis engine gates. GPU gates are `#[ignore]`d and run under
+//! a coordinator-granted window with `FF_MUSIC3_MODEL` naming the official
+//! weights directory; frozen cells live in the ff-work evidence tree.
 
 #[cfg(feature = "cuda")]
 mod gates {
@@ -20,7 +18,7 @@ mod gates {
     fn music3_syn_real_load_gpu() -> anyhow::Result<()> {
         std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
         let device = Device::new(0)?;
-        let engine = Music3Syn::load(&model_dir()?, &device)?;
+        let engine = Music3Syn::load(&model_dir()?, &device, 86)?;
         assert_eq!(
             engine.weights.flow.blocks.len(),
             engine.spec.flow_layers as usize
@@ -82,7 +80,8 @@ mod velocity {
     fn music3_syn_flow_velocity_gpu() -> Result<()> {
         std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
         let device = Device::new(0)?;
-        let engine = Music3Syn::load(&env_path("FF_MUSIC3_MODEL")?, &device)?;
+        let engine = Music3Syn::load(&env_path("FF_MUSIC3_MODEL")?, &device, 86)?;
+        let mut workspace = Music3Syn::workspace(&engine.spec, &device, 86)?;
         let capture = std::fs::read(env_path("FF_MUSIC3_CAPTURE")?)?;
         let view = SafeTensors::deserialize(&capture)?;
         let frozen: serde_json::Value =
@@ -97,28 +96,8 @@ mod velocity {
             .last()
             .copied()
             .context("empty x_t shape")?;
-        let tokens = length + 1;
-        let rotary_dim = engine.spec.rotary_dim as usize;
-        let half = rotary_dim / 2;
-        let mut cos_table = Vec::with_capacity(tokens * rotary_dim);
-        let mut sin_table = Vec::with_capacity(tokens * rotary_dim);
-        for pos in 0..tokens {
-            let mut freqs = Vec::with_capacity(half);
-            for i in 0..half {
-                let inv = 1.0f32 / 10000.0f32.powf((2 * i) as f32 / rotary_dim as f32);
-                freqs.push(pos as f32 * inv);
-            }
-            for _ in 0..2 {
-                for f in &freqs {
-                    cos_table.push(f.cos());
-                    sin_table.push(f.sin());
-                }
-            }
-        }
         let timesteps = tensor_f32(&view, "syn_timesteps")?;
         let s = &engine.stream;
-        let d_cos = s.clone_htod(&cos_table)?;
-        let d_sin = s.clone_htod(&sin_table)?;
 
         let mut max_cond = 0.0f64;
         let mut max_uncond = 0.0f64;
@@ -130,7 +109,7 @@ mod velocity {
             let cond = tensor_f32(&view, &format!("syn_cond_{index:03}"))?;
             let d_x = s.clone_htod(&x_t)?;
             let d_cond = s.clone_htod(&cond)?;
-            engine.flow_velocity(&d_x, *t, &d_cond, (&d_cos, &d_sin), length, &mut velocity)?;
+            engine.flow_velocity(&mut workspace, &d_x, *t, &d_cond, length, &mut velocity)?;
             let got = s.clone_dtoh(&velocity)?;
             let want = tensor_f32(&view, &format!("syn_velocity_{index:03}"))?;
             let delta = got
@@ -180,10 +159,10 @@ mod velocity {
         let d_x = s.clone_htod(&x_t)?;
         let d_zero = s.clone_htod(&zeros)?;
         engine.flow_velocity(
+            &mut workspace,
             &d_x,
             timesteps[10],
             &d_zero,
-            (&d_cos, &d_sin),
             length,
             &mut velocity,
         )?;
@@ -199,164 +178,6 @@ mod velocity {
             "dropped-condition control did not exceed the bound"
         );
         println!("MUSIC3_FLOW_CONTROL dropped_condition={control:.6e} > bound");
-        Ok(())
-    }
-}
-
-#[cfg(feature = "cuda")]
-mod probe {
-    use super::super::Device;
-    use super::super::engine_music3_syn::Music3Syn;
-    use anyhow::{Context, Result};
-    use safetensors::SafeTensors;
-
-    fn tensor_f32<'a>(view: &'a SafeTensors<'a>, name: &str) -> Result<Vec<f32>> {
-        let t = view
-            .tensor(name)
-            .with_context(|| format!("tensor {name}"))?;
-        let bytes = t.data();
-        Ok(bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect())
-    }
-
-    fn max_abs(a: &[f32], b: &[f32]) -> f64 {
-        a.iter()
-            .zip(b)
-            .map(|(x, y)| (x - y).abs() as f64)
-            .fold(0.0, f64::max)
-    }
-
-    /// Per-stage bisection of the flow forward against definition taps for
-    /// capture call 000. Prints every stage delta; the first gross delta
-    /// names the broken stage.
-    #[test]
-    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_CAPTURE, FF_MUSIC3_PROBE"]
-    fn music3_syn_flow_probe_gpu() -> Result<()> {
-        std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
-        let device = Device::new(0)?;
-        let engine = Music3Syn::load(
-            &std::path::PathBuf::from(std::env::var("FF_MUSIC3_MODEL")?),
-            &device,
-        )?;
-        let capture = std::fs::read(std::path::PathBuf::from(std::env::var(
-            "FF_MUSIC3_CAPTURE",
-        )?))?;
-        let view = SafeTensors::deserialize(&capture)?;
-        let probe_file =
-            std::fs::read(std::path::PathBuf::from(std::env::var("FF_MUSIC3_PROBE")?))?;
-        let probe = SafeTensors::deserialize(&probe_file)?;
-
-        let call: String = std::env::var("FF_MUSIC3_PROBE_CALL").unwrap_or_else(|_| "000".into());
-        let length = 86usize;
-        let tokens = length + 1;
-        let rotary_dim = engine.spec.rotary_dim as usize;
-        let half = rotary_dim / 2;
-        let dim = engine.spec.flow_dim() as usize;
-        let mut cos_table = Vec::with_capacity(tokens * rotary_dim);
-        let mut sin_table = Vec::with_capacity(tokens * rotary_dim);
-        for pos in 0..tokens {
-            let freqs: Vec<f32> = (0..half)
-                .map(|i| pos as f32 / 10000.0f32.powf((2 * i) as f32 / rotary_dim as f32))
-                .collect();
-            for _ in 0..2 {
-                for f in &freqs {
-                    cos_table.push(f.cos());
-                    sin_table.push(f.sin());
-                }
-            }
-        }
-        let x_t = tensor_f32(&view, &format!("syn_x_t_{call}"))?;
-        let cond = tensor_f32(&view, &format!("syn_cond_{call}"))?;
-        let t = tensor_f32(&view, "syn_timesteps")?[call.parse::<usize>()?];
-        let s = &engine.stream;
-        let d_x = s.clone_htod(&x_t)?;
-        let d_cond = s.clone_htod(&cond)?;
-        let d_cos = s.clone_htod(&cos_table)?;
-        let d_sin = s.clone_htod(&sin_table)?;
-        let mut velocity = unsafe { s.alloc::<f32>(engine.spec.in_channels as usize * length)? };
-        let mut taps: Vec<(&'static str, Vec<f32>)> = Vec::new();
-        engine.flow_velocity_probed(
-            &d_x,
-            t,
-            &d_cond,
-            (&d_cos, &d_sin),
-            length,
-            &mut velocity,
-            Some(&mut taps),
-        )?;
-
-        // preprocess: engine [length, concat] rows vs definition [concat, length]
-        let want_pre = tensor_f32(&probe, "preprocess_out")?;
-        for (name, got) in &taps {
-            match *name {
-                "preprocess" => {
-                    let mut transposed = vec![0.0f32; got.len()];
-                    for (tt, row) in got.chunks(2304).enumerate() {
-                        for (c, v) in row.iter().enumerate() {
-                            transposed[c * length + tt] = *v;
-                        }
-                    }
-                    println!(
-                        "PROBE preprocess max_abs={:.6e}",
-                        max_abs(&transposed, &want_pre)
-                    );
-                }
-                "fourier" => {
-                    let want = tensor_f32(&probe, "time_proj_out")?;
-                    println!("PROBE fourier max_abs={:.6e}", max_abs(got, &want));
-                    let head: Vec<String> = got
-                        .iter()
-                        .zip(&want)
-                        .take(6)
-                        .map(|(a, b)| format!("{a:.4}/{b:.4}"))
-                        .collect();
-                    println!("PROBE fourier head engine/want: {}", head.join(" "));
-                }
-                "time_l1" => {
-                    if probe.tensor("time_l1_out").is_ok() {
-                        println!(
-                            "PROBE time_l1(bias,silu) max_abs={:.6e}",
-                            max_abs(got, &tensor_f32(&probe, "time_l1_out")?)
-                        );
-                    }
-                }
-                "temb" => println!(
-                    "PROBE temb max_abs={:.6e}",
-                    max_abs(got, &tensor_f32(&probe, "time_l2_out")?)
-                ),
-                "wide_after_proj_in" => {
-                    let want = tensor_f32(&probe, "proj_in_out")?;
-                    let body: Vec<f32> = got[dim..].to_vec();
-                    println!("PROBE proj_in max_abs={:.6e}", max_abs(&body, &want));
-                }
-                "block0_norm1" => println!(
-                    "PROBE block0_norm1 max_abs={:.6e}",
-                    max_abs(got, &tensor_f32(&probe, "block0_norm1")?)
-                ),
-                "block0_attn" => println!(
-                    "PROBE block0_attn max_abs={:.6e}",
-                    max_abs(got, &tensor_f32(&probe, "block0_attn")?)
-                ),
-                "block0_out" => println!(
-                    "PROBE block0_out max_abs={:.6e}",
-                    max_abs(got, &tensor_f32(&probe, "block0_out")?)
-                ),
-                "proj_out" => println!(
-                    "PROBE proj_out max_abs={:.6e}",
-                    max_abs(got, &tensor_f32(&probe, "proj_out_out")?)
-                ),
-                _ => {}
-            }
-        }
-        let got_velocity = s.clone_dtoh(&velocity)?;
-        println!(
-            "PROBE velocity max_abs={:.6e}",
-            max_abs(&got_velocity, &tensor_f32(&probe, "velocity_cpu")?)
-        );
         Ok(())
     }
 }
@@ -391,6 +212,7 @@ mod encoder {
         let engine = Music3Syn::load(
             &std::path::PathBuf::from(std::env::var("FF_MUSIC3_MODEL")?),
             &device,
+            86,
         )?;
         let capture_bytes = std::fs::read(std::path::PathBuf::from(std::env::var(
             "FF_MUSIC3_CONDITION",
@@ -500,6 +322,7 @@ mod vocoder_gate {
         let engine = Music3Syn::load(
             &std::path::PathBuf::from(std::env::var("FF_MUSIC3_MODEL")?),
             &device,
+            86,
         )?;
         let capture_bytes = std::fs::read(std::path::PathBuf::from(std::env::var(
             "FF_MUSIC3_CAPTURE",
@@ -586,8 +409,8 @@ mod euler {
 
     /// Euler scheduler gate: derived sigma schedule within 2 ULP (corrected
     /// pre-candidate 2026-11-03, CPU derivation analysis), and the
-    /// teacher-forced update chain. r13 DEFECT recorded: 4.768372e-6 > the
-    /// original 2.0e-6 bound; 1.0e-5 is the new frozen bound for later runs.
+    /// teacher-forced update chain (bounds: original 2.0e-6, frozen
+    /// 1.0e-5; see the report for the recorded run history).
     #[test]
     #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_CAPTURE"]
     fn music3_syn_euler_gpu() -> Result<()> {
@@ -596,6 +419,7 @@ mod euler {
         let engine = Music3Syn::load(
             &std::path::PathBuf::from(std::env::var("FF_MUSIC3_MODEL")?),
             &device,
+            86,
         )?;
         let capture_bytes = std::fs::read(std::path::PathBuf::from(std::env::var(
             "FF_MUSIC3_CAPTURE",
@@ -651,7 +475,7 @@ mod euler {
             max_update = max_update.max(delta);
         }
         println!(
-            "MUSIC3_EULER update max_abs={max_update:.6e} (new frozen bound 1.0e-05; original bound 2.0e-06, r13 defect 4.768372e-06)"
+            "MUSIC3_EULER update max_abs={max_update:.6e} (frozen bound 1.0e-05; original bound 2.0e-06)"
         );
         ensure!(
             max_update <= 1.0e-5,
@@ -662,7 +486,7 @@ mod euler {
 }
 
 #[cfg(feature = "cuda")]
-mod vocoder_probe {
+mod end_to_end {
     use super::super::Device;
     use super::super::engine_music3_syn::Music3Syn;
     use anyhow::{Context, Result, ensure};
@@ -681,122 +505,78 @@ mod vocoder_probe {
             .collect())
     }
 
-    /// max|engine_rows_major_transposed - definition[stream, C, T]|.
-    fn delta_stream(got: &[f32], want: &[f32], rows: usize, dim: usize) -> f64 {
-        let mut worst = 0.0f64;
-        for t in 0..rows {
-            for c in 0..dim {
-                let a = got[t * dim + c] as f64;
-                let b = want[c * rows + t] as f64;
-                worst = worst.max((a - b).abs());
-            }
-        }
-        worst
-    }
-
-    /// Per-stage vocoder bisection: fold plane0, conv_in, convT0, unit1 and
-    /// per-block outputs against the definition taps.
+    /// Free-running synthesis end to end against the frozen-r1 final_audio
+    /// cell: initial latent = captured step-0 noise, condition from the
+    /// frozen capture, 30 CFG Euler steps, vocoder. Negative control: the
+    /// negated initial latent must exceed the bound.
     #[test]
-    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_CAPTURE, FF_MUSIC3_VOCODER_PROBE"]
-    fn music3_syn_vocoder_probe_gpu() -> Result<()> {
+    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_CAPTURE, FF_MUSIC3_FROZEN_R1"]
+    fn music3_syn_end_to_end_gpu() -> Result<()> {
         std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
         let device = Device::new(0)?;
         let engine = Music3Syn::load(
             &std::path::PathBuf::from(std::env::var("FF_MUSIC3_MODEL")?),
             &device,
+            86,
         )?;
+        let mut workspace = Music3Syn::workspace(&engine.spec, &device, 86)?;
         let capture_bytes = std::fs::read(std::path::PathBuf::from(std::env::var(
             "FF_MUSIC3_CAPTURE",
         )?))?;
         let view = SafeTensors::deserialize(&capture_bytes)?;
-        let probe_bytes = std::fs::read(std::path::PathBuf::from(std::env::var(
-            "FF_MUSIC3_VOCODER_PROBE",
-        )?))?;
-        let probe = SafeTensors::deserialize(&probe_bytes)?;
+        let frozen: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            std::path::PathBuf::from(std::env::var("FF_MUSIC3_FROZEN_R1")?),
+        )?)?;
+        let bound_max = frozen["cells"]["final_audio"]["bound"]["max"]
+            .as_f64()
+            .context("final_audio max bound missing")?;
+        let bound_rmse = frozen["cells"]["final_audio"]["bound"]["rmse"]
+            .as_f64()
+            .context("final_audio rmse bound missing")?;
+
         let length = 86usize;
         let total: usize = engine.spec.upsampling.iter().map(|r| *r as usize).product();
-        let latent = tensor_f32(&view, "syn_vocoder_latent")?;
+        let initial = tensor_f32(&view, "syn_x_t_000")?;
+        let cond_input = tensor_f32(&view, "condition_input")?;
+        let want = tensor_f32(&view, "final_audio")?;
         let s = &engine.stream;
-        let d_latent = s.clone_htod(&latent)?;
-        let mut out = unsafe { s.alloc::<f32>(2 * length * total)? };
-        engine.vocoder(&d_latent, length, &mut out)?;
-
-        let want_dec = tensor_f32(&probe, "dec_in_out")?;
-        let want_conv_in = tensor_f32(&probe, "conv_in_out")?;
-        let want_convt0 = tensor_f32(&probe, "block0_convt")?;
-        let want_u1 = tensor_f32(&probe, "block0_u1")?;
-        let want_plane = tensor_f32(&probe, "fold_p0_conv_in")?;
-        // Block taps are post-block outputs: dims halve per stage.
-        let stage_dims = [768usize, 384, 192, 96];
-        let stage_rows = [86usize * 8, 86 * 64, 86 * 256, 86 * 512];
-        let want_blocks: Vec<Vec<f32>> = (0..4)
-            .map(|i| tensor_f32(&probe, &format!("block{i}_out")))
-            .collect::<Result<_>>()?;
-        let taps = engine.vocoder_taps.borrow();
-        let mut block_index = 0usize;
-        let mut half = 0usize;
-        for (name, got) in taps.iter() {
-            match *name {
-                "fold_p0" => {
-                    let d = got
-                        .iter()
-                        .zip(&want_plane)
-                        .map(|(a, b)| (a - b).abs() as f64)
-                        .fold(0.0, f64::max);
-                    println!("PROBE_V fold_p0 max_abs={d:.6e}");
-                }
-                "conv_in" => {
-                    let d = delta_stream(got, &want_conv_in, length, 1536);
-                    println!("PROBE_V s0 conv_in max_abs={d:.6e}");
-                }
-                "convt0" => {
-                    let d = delta_stream(got, &want_convt0, 86 * 8, 768);
-                    println!("PROBE_V s0 convt0 max_abs={d:.6e}");
-                }
-                "u1_0" => {
-                    let d = delta_stream(got, &want_u1, 86 * 8, 768);
-                    println!("PROBE_V s0 u1_0 max_abs={d:.6e}");
-                }
-                "dec_in" => {
-                    block_index = 0;
-                    let d = delta_stream(got, &want_dec[half * 1024 * length..], length, 1024);
-                    println!("PROBE_V s{half} dec_in max_abs={d:.6e}");
-                    if half == 0 {
-                        half = 1;
-                    }
-                }
-                "block" => {
-                    let rows = stage_rows[block_index];
-                    let dim = stage_dims[block_index];
-                    ensure!(
-                        got.len() == rows * dim,
-                        "block{block_index} tap len {} != {rows}x{dim}",
-                        got.len()
-                    );
-                    let d = delta_stream(
-                        got,
-                        &want_blocks[block_index][half * dim * rows..],
-                        rows,
-                        dim,
-                    );
-                    println!("PROBE_V s{half} block{block_index} max_abs={d:.6e}");
-                    block_index += 1;
-                    if block_index == 4 {
-                        block_index = 0;
-                    }
-                }
-                _ => {}
-            }
-        }
-        drop(taps);
-        let got_final = s.clone_dtoh(&out)?;
-        let want_final = tensor_f32(&probe, "final")?;
-        let delta = got_final
+        let d_init = s.clone_htod(&initial)?;
+        let d_cond = s.clone_htod(&cond_input)?;
+        let mut audio = unsafe { s.alloc::<f32>(2 * length * total)? };
+        engine.synthesize(&mut workspace, &d_cond, 25, &d_init, &mut audio)?;
+        let got = s.clone_dtoh(&audio)?;
+        let max_abs = got
             .iter()
-            .zip(&want_final)
+            .zip(&want)
             .map(|(a, b)| (a - b).abs() as f64)
             .fold(0.0, f64::max);
-        println!("PROBE_V final max_abs={delta:.6e}");
+        let rmse = (got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (*a as f64 - *b as f64) * (*a as f64 - *b as f64))
+            .sum::<f64>()
+            / got.len() as f64)
+            .sqrt();
+        println!(
+            "MUSIC3_END_TO_END max_abs={max_abs:.6e} (bound {bound_max:.6e}) rmse={rmse:.6e} (bound {bound_rmse:.6e})"
+        );
+        ensure!(max_abs <= bound_max, "end-to-end max exceeds frozen bound");
+        ensure!(rmse <= bound_rmse, "end-to-end rmse exceeds frozen bound");
+
+        let negated: Vec<f32> = initial.iter().map(|v| -v).collect();
+        let d_neg = s.clone_htod(&negated)?;
+        engine.synthesize(&mut workspace, &d_cond, 25, &d_neg, &mut audio)?;
+        let control = s
+            .clone_dtoh(&audio)?
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs() as f64)
+            .fold(0.0, f64::max);
+        ensure!(
+            control > bound_max,
+            "negated-initial control did not exceed the bound"
+        );
+        println!("MUSIC3_E2E_CONTROL negated_initial={control:.6e} > bound");
         Ok(())
     }
 }
