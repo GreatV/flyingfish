@@ -41,8 +41,6 @@ pub struct Music3Syn {
     guidance_scale: f32,
     vocoder_folds: VocoderFolds,
     max_length: usize,
-    #[cfg(test)]
-    pub vocoder_taps: std::cell::RefCell<Vec<(&'static str, Vec<f32>)>>,
 }
 
 /// One conv1d call site on the published folded [out, in*k] layout.
@@ -65,43 +63,6 @@ pub struct PairFlowCall<'a> {
     pub length: usize,
     pub v_cond: &'a mut CudaSlice<f32>,
     pub v_unc: &'a mut CudaSlice<f32>,
-}
-
-/// One linear+bias call for the vocoder discriminator.
-#[cfg(test)]
-pub struct LinearDisc<'a> {
-    pub weight: &'a CudaSlice<u8>,
-    pub out_rows: usize,
-    pub in_cols: usize,
-    pub x: &'a CudaSlice<f32>,
-    pub rows: usize,
-    pub out: &'a mut CudaSlice<f32>,
-    pub bias: &'a CudaSlice<u8>,
-}
-
-/// One conv-transpose call for the discriminator.
-#[cfg(test)]
-pub struct ConvTransposeDisc<'a> {
-    pub x: &'a CudaSlice<f32>,
-    pub w: &'a CudaSlice<f32>,
-    pub bias: &'a CudaSlice<u8>,
-    pub out: &'a mut CudaSlice<f32>,
-    pub rows: usize,
-    pub in_dim: usize,
-    pub out_dim: usize,
-    pub stride: usize,
-}
-
-/// One linear+bias call on an F32 weight for the discriminator.
-#[cfg(test)]
-pub struct LinearDiscBytes<'a> {
-    pub weight: &'a CudaSlice<f32>,
-    pub out_rows: usize,
-    pub in_cols: usize,
-    pub x: &'a CudaSlice<f32>,
-    pub rows: usize,
-    pub out: &'a mut CudaSlice<f32>,
-    pub bias: &'a CudaSlice<u8>,
 }
 
 /// Preallocated activation buffers for the synthesis path, sized at load
@@ -256,8 +217,6 @@ impl Music3Syn {
             guidance_scale: 1.7,
             vocoder_folds,
             max_length,
-            #[cfg(test)]
-            vocoder_taps: std::cell::RefCell::new(Vec::new()),
         })
     }
 
@@ -1104,171 +1063,8 @@ impl Music3Syn {
     }
 
     #[cfg(test)]
-    pub fn transpose_for_disc(
-        &self,
-        input: &CudaSlice<f32>,
-        out: &mut CudaSlice<f32>,
-        channels: usize,
-        length: usize,
-    ) -> Result<()> {
-        let s = &self.stream;
-        unsafe {
-            s.launch_builder(&self.transpose)
-                .arg(input)
-                .arg(out)
-                .arg(&(channels as i64))
-                .arg(&(length as i64))
-                .launch(super::ops::flat(channels * length))?;
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub fn linear_for_disc(&self, site: LinearDisc<'_>) -> Result<()> {
-        let LinearDisc {
-            weight,
-            out_rows,
-            in_cols,
-            x,
-            rows,
-            out,
-            bias,
-        } = site;
-        self.linear(
-            weight,
-            out_rows,
-            in_cols,
-            &x.slice(0..x.len()),
-            rows,
-            &mut out.slice_mut(0..out.len()),
-        )?;
-        let out_ptr = out.device_ptr(&self.stream).0;
-        let bias_ptr = bias.device_ptr(&self.stream).0;
-        let count = out.len();
-        unsafe {
-            self.stream
-                .launch_builder(&self.bias)
-                .arg(&out_ptr)
-                .arg(&bias_ptr)
-                .arg(&out_ptr)
-                .arg(&(rows as u32))
-                .arg(&(out_rows as u32))
-                .launch(super::ops::flat(count))?;
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub fn snake_rows_for_disc(
-        &self,
-        x: &CudaSlice<f32>,
-        alpha: &CudaSlice<u8>,
-        out: &mut CudaSlice<f32>,
-        count: usize,
-        channels: usize,
-    ) -> Result<()> {
-        let s = &self.stream;
-        unsafe {
-            s.launch_builder(&self.snake_rows)
-                .arg(x)
-                .arg(alpha)
-                .arg(out)
-                .arg(&(count as i64))
-                .arg(&(channels as i32))
-                .launch(super::ops::flat(count))?;
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub fn conv1d_dilated_for_disc(&self, site: Conv1dSite<'_>) -> Result<()> {
-        self.conv1d(site)
-    }
-
-    #[cfg(test)]
-    pub fn linear_bytes_bias_for_disc(&self, site: LinearDiscBytes<'_>) -> Result<()> {
-        let LinearDiscBytes {
-            weight,
-            out_rows,
-            in_cols,
-            x,
-            rows,
-            out,
-            bias,
-        } = site;
-        let x_t = unsafe {
-            Tensor::new(
-                x.device_ptr(&self.stream).0,
-                [rows as u32, in_cols as u32],
-                [in_cols as u64, 1],
-                (rows * in_cols * 4) as u64,
-            )?
-        };
-        let mut out_view = TensorMut(unsafe {
-            Tensor::new(
-                out.device_ptr_mut(&self.stream).0,
-                [rows as u32, out_rows as u32],
-                [out_rows as u64, 1],
-                (rows * out_rows * 4) as u64,
-            )?
-        });
-        let w_t = unsafe {
-            Tensor::new(
-                weight.device_ptr(&self.stream).0,
-                [out_rows as u32, in_cols as u32],
-                [in_cols as u64, 1],
-                (out_rows * in_cols * 4) as u64,
-            )?
-        };
-        self.blas.linear_f32(w_t, x_t, &mut out_view)?;
-        let out_ptr = out.device_ptr(&self.stream).0;
-        let bias_ptr = bias.device_ptr(&self.stream).0;
-        let count = out.len();
-        unsafe {
-            self.stream
-                .launch_builder(&self.bias)
-                .arg(&out_ptr)
-                .arg(&bias_ptr)
-                .arg(&out_ptr)
-                .arg(&(rows as u32))
-                .arg(&(out_rows as u32))
-                .launch(super::ops::flat(count))?;
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
     pub fn add_inplace_for_disc(&self) -> &cudarc::driver::CudaFunction {
         &self.add_inplace
-    }
-
-    #[cfg(test)]
-    pub fn conv_transpose_for_disc(&self, site: ConvTransposeDisc<'_>) -> Result<()> {
-        let ConvTransposeDisc {
-            x,
-            w,
-            bias,
-            out,
-            rows,
-            in_dim,
-            out_dim,
-            stride,
-        } = site;
-        let s = &self.stream;
-        unsafe {
-            s.launch_builder(&self.conv_transpose)
-                .arg(x)
-                .arg(w)
-                .arg(bias)
-                .arg(out)
-                .arg(&(rows as i32))
-                .arg(&(in_dim as i32))
-                .arg(&(out_dim as i32))
-                .arg(&(stride as i32))
-                .arg(&(stride.div_ceil(2) as i32))
-                .launch(super::ops::grid(rows * stride, 256))?;
-        }
-        Ok(())
     }
 
     #[cfg(test)]
@@ -1634,10 +1430,6 @@ impl Music3Syn {
                         .launch(super::ops::flat(count))?;
                 }
             }
-            #[cfg(test)]
-            self.vocoder_taps
-                .borrow_mut()
-                .push(("block", s.clone_dtoh(&wide)?));
         }
         let total = rows;
         let tail = dim;
