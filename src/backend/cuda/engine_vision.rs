@@ -917,7 +917,6 @@ impl VisionWeights {
             ]
         };
         let window_width = (merge * merge) as usize * mlp_usize;
-<<<<<<< HEAD
         let (patch, position, post_norm, blocks, window, merger, deepstack, expected) =
             match architecture {
                 Architecture::Qwen35Text | Architecture::Qwen3Vl => {
@@ -927,8 +926,7 @@ impl VisionWeights {
                         [hidden, geometry.patch],
                         &patch_shape,
                     )?;
-                    let position = take(
-                        catalog,
+                    let position = catalog.take_bf16(
                         "model.visual.pos_embed.weight",
                         &[position_rows, hidden_usize],
                     )?;
@@ -971,26 +969,6 @@ impl VisionWeights {
                     let merger = MergerWeights {
                         norm: AffineWeights::take(catalog, "model.visual.merger.norm", hidden)?,
                         fc1: BiasedWeight::take(
-=======
-        let (patch, position, post_norm, blocks, window, merger, expected) = match architecture {
-            Architecture::Qwen35Text => {
-                let patch = BiasedWeight::patch(
-                    catalog,
-                    "model.visual.patch_embed.proj",
-                    [hidden, geometry.patch],
-                    &patch_shape,
-                )?;
-                let position = catalog.take_bf16(
-                    "model.visual.pos_embed.weight",
-                    &[position_rows, hidden_usize],
-                )?;
-                let mut blocks = Vec::with_capacity(depth as usize);
-                for i in 0..depth {
-                    let p = format!("model.visual.blocks.{i}");
-                    blocks.push(BlockWeights {
-                        norm1: AffineWeights::take(catalog, &format!("{p}.norm1"), hidden)?,
-                        qkv: QkvWeights::Fused(BiasedWeight::take(
->>>>>>> f6244ff8 (Support Gemma 4 12B and 31B media input)
                             catalog,
                             "model.visual.merger.linear_fc1",
                             [geometry.spec.merger_fc1, geometry.spec.merger_fc1],
@@ -1043,8 +1021,7 @@ impl VisionWeights {
                         [hidden, geometry.patch],
                         &patch_shape,
                     )?;
-                    let position = take(
-                        catalog,
+                    let position = catalog.take_bf16(
                         "model.vision_tower.embeddings.position_embedding.weight",
                         &[position_rows, hidden_usize],
                     )?;
@@ -1063,7 +1040,6 @@ impl VisionWeights {
                             [hidden, hidden],
                             &[hidden_usize, hidden_usize],
                             LinearBiasMode::BeforeOutputRound,
-<<<<<<< HEAD
                         )
                     };
                     let mut blocks = Vec::with_capacity(depth as usize);
@@ -1108,85 +1084,6 @@ impl VisionWeights {
                         k: projection(catalog, p, "k")?,
                         v: projection(catalog, p, "v")?,
                         projection: projection(catalog, p, "out")?,
-=======
-                        )?,
-                        norm2: AffineWeights::take(catalog, &format!("{p}.norm2"), hidden)?,
-                        fc1: BiasedWeight::take(
-                            catalog,
-                            &format!("{p}.mlp.linear_fc1"),
-                            [mlp, hidden],
-                            &[mlp_usize, hidden_usize],
-                            LinearBiasMode::BeforeOutputRound,
-                        )?,
-                        fc2: BiasedWeight::take(
-                            catalog,
-                            &format!("{p}.mlp.linear_fc2"),
-                            [hidden, mlp],
-                            &[hidden_usize, mlp_usize],
-                            LinearBiasMode::BeforeOutputRound,
-                        )?,
-                    });
-                }
-                let merger = MergerWeights {
-                    norm: AffineWeights::take(catalog, "model.visual.merger.norm", hidden)?,
-                    fc1: BiasedWeight::take(
-                        catalog,
-                        "model.visual.merger.linear_fc1",
-                        [geometry.spec.merger_fc1, geometry.spec.merger_fc1],
-                        &[fc1_usize, fc1_usize],
-                        LinearBiasMode::BeforeOutputRound,
-                    )?,
-                    fc2: BiasedWeight::take(
-                        catalog,
-                        "model.visual.merger.linear_fc2",
-                        [geometry.output(), geometry.spec.merger_fc1],
-                        &[output_usize, fc1_usize],
-                        LinearBiasMode::BeforeOutputRound,
-                    )?,
-                };
-                (
-                    patch,
-                    position,
-                    None,
-                    blocks,
-                    None,
-                    merger,
-                    2 + 1 + 6 + depth as usize * 12,
-                )
-            }
-            Architecture::MiniCpmV47 => {
-                let patch = BiasedWeight::patch(
-                    catalog,
-                    "model.vision_tower.embeddings.patch_embedding",
-                    [hidden, geometry.patch],
-                    &patch_shape,
-                )?;
-                let position = catalog.take_bf16(
-                    "model.vision_tower.embeddings.position_embedding.weight",
-                    &[position_rows, hidden_usize],
-                )?;
-                let post_norm = Some(AffineWeights::take(
-                    catalog,
-                    "model.vision_tower.post_layernorm",
-                    hidden,
-                )?);
-                let projection = |catalog: &mut WeightCatalog,
-                                  prefix: &str,
-                                  name: &str|
-                 -> Result<BiasedWeight> {
-                    BiasedWeight::take(
-                        catalog,
-                        &format!("{prefix}.self_attn.{name}_proj"),
-                        [hidden, hidden],
-                        &[hidden_usize, hidden_usize],
-                        LinearBiasMode::BeforeOutputRound,
-                    )
-                };
-                let mut blocks = Vec::with_capacity(depth as usize);
-                for i in 0..depth {
-                    let p = format!("model.vision_tower.encoder.layers.{i}");
-                    blocks.push(BlockWeights {
->>>>>>> f6244ff8 (Support Gemma 4 12B and 31B media input)
                         norm1: AffineWeights::take(catalog, &format!("{p}.layer_norm1"), hidden)?,
                         pre_norm: AffineWeights::take(
                             catalog,
