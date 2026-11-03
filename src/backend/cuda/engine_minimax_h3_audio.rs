@@ -14,6 +14,9 @@ use crate::minimax_h3::{AUDIO_RESAMPLE_RATIO, AUDIO_RESAMPLE_TAPS, AudioVaeSpec}
 use anyhow::{Context, Result, ensure};
 use std::{path::Path, sync::Arc};
 
+/// Kernel of `conv_pre` and `conv_post` (model definition `MiniMaxH3AudioBigVGANDecoder`).
+const EDGE_KERNEL: usize = 7;
+
 /// A 1D convolution `[out, input, kernel]` at `dilation` with zero padding `dilation * (kernel - 1) / 2`; the weight
 /// is the published one (weight-norm folded at load when the module is weight-normed).
 struct Conv {
@@ -204,7 +207,11 @@ impl AudioDecoder {
             kernel: 1,
             dilation: 1,
         };
-        let conv_pre = load.conv("decoder.conv_pre", (spec.decoder_dim, latent, 7, 1), true)?;
+        let conv_pre = load.conv(
+            "decoder.conv_pre",
+            (spec.decoder_dim, latent, EDGE_KERNEL, 1),
+            true,
+        )?;
         let blocks = spec.resblock_kernels.len();
         let mut levels = Vec::with_capacity(spec.decoder_rates.len());
         let mut channels = spec.decoder_dim;
@@ -255,7 +262,7 @@ impl AudioDecoder {
             levels.push(Level { up, blocks: amp });
         }
         let post = load.activation("decoder.activation_post", channels)?;
-        let conv_post = load.conv("decoder.conv_post", (1, channels, 7, 1), false)?;
+        let conv_post = load.conv("decoder.conv_post", (1, channels, EDGE_KERNEL, 1), false)?;
         let bytes = load.bytes;
         drop(load);
         s.synchronize()?;
@@ -283,32 +290,48 @@ impl AudioDecoder {
         self
     }
 
-    /// Row extents `[T, C]` of every activation and the im2col width of every convolution for `frames` latent frames.
-    fn extents(&self, frames: usize) -> (usize, usize, usize) {
+    /// Widest activation `[T, C]`, im2col and zero-padded extents (elements) of a decode of `frames` latent frames.
+    fn extents(spec: &AudioVaeSpec, frames: usize) -> Result<(usize, usize, usize)> {
         let mut rows = frames;
-        let mut widest = rows * self.in_proj.out.max(self.in_proj.input);
-        let mut columns = rows * self.conv_pre.input * self.conv_pre.kernel;
-        let mut padded = (rows + self.conv_pre.kernel) * self.conv_pre.input;
-        for level in &self.levels {
-            rows *= level.up.stride;
-            widest = widest.max(rows * level.up.out);
-            for block in &level.blocks {
-                for (c1, c2) in &block.convs {
-                    for c in [c1, c2] {
-                        columns = columns.max(rows * c.input * c.kernel);
-                        padded = padded.max((rows + c.dilation * (c.kernel - 1)) * c.input);
-                    }
-                }
+        let mut widest = rows * spec.latent_dim.max(spec.latent_channels);
+        let mut columns = rows * spec.latent_dim * EDGE_KERNEL;
+        let mut padded = (rows + EDGE_KERNEL) * spec.latent_dim;
+        let mut channels = spec.decoder_dim;
+        let dilation = spec
+            .resblock_dilations
+            .iter()
+            .flatten()
+            .copied()
+            .max()
+            .context("audio decoder without resblock dilations")?;
+        for &rate in &spec.decoder_rates {
+            rows *= rate;
+            channels /= 2;
+            widest = widest.max(rows * channels);
+            for &k in &spec.resblock_kernels {
+                columns = columns.max(rows * channels * k);
+                padded = padded.max((rows + dilation * (k - 1)) * channels);
             }
         }
-        let c = &self.conv_post;
-        columns = columns.max(rows * c.input * c.kernel);
-        padded = padded.max((rows + c.kernel) * c.input);
-        (widest, columns, padded)
+        columns = columns.max(rows * channels * EDGE_KERNEL);
+        padded = padded.max((rows + EDGE_KERNEL) * channels);
+        Ok((widest, columns, padded))
+    }
+
+    /// Device bytes of a decode of `frames` latent frames: the scratch rows of `work` and the PCM output, F32.
+    pub(crate) fn work_bytes(
+        spec: &AudioVaeSpec,
+        (channels, frames): (usize, usize),
+    ) -> Result<usize> {
+        let (widest, columns, padded) = Self::extents(spec, frames)?;
+        Ok(4 * ((6 + AUDIO_RESAMPLE_RATIO) * widest
+            + columns
+            + padded
+            + channels * frames * spec.hop()))
     }
 
     fn work(&self, s: &Arc<CudaStream>, frames: usize) -> Result<AudioWork> {
-        let (widest, columns, padded) = self.extents(frames);
+        let (widest, columns, padded) = Self::extents(&self.spec, frames)?;
         let buffer = |n: usize| s.alloc_zeros::<f32>(n);
         Ok(AudioWork {
             a: buffer(widest)?,

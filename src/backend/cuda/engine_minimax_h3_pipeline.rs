@@ -3,7 +3,7 @@
 //! dropped before the next stage's placement is derived from the then-free device memory.
 use super::audio::AudioDecoder;
 use super::vae::{
-    EncodeWork, KeyframeEncoder, LatentVideo, TileWork, VideoDecoder, bf16_parameter,
+    EncodeWork, KeyframeEncoder, LatentVideo, TileWork, VideoDecoder, bf16_parameter, decode_bytes,
 };
 use super::{
     AdalnTable, BlockContext, BlockKernels, Conditioner, ConditionerInput, ConditionerPrompt, Dit,
@@ -391,22 +391,9 @@ pub(crate) fn run(
     let audio_dir = model.join("audio_vae");
     let audio_manifest = MappedCheckpoint::open_component(&audio_dir, "diffusion_pytorch_model")?
         .minimax_h3_audio_vae_manifest(&audio_spec)?;
-    let (free_after, total) = device.ctx.mem_get_info()?;
-    let planned = decoder_bytes(&vae_manifest, &audio_manifest);
-    eprintln!(
-        "{}",
-        serde_json::json!({"h3_release": {"free_before_release_bytes": free_before, "free_after_release_bytes": free_after,
-            "decoder_weight_bytes": planned, "total_bytes": total, "placement": "resident"}})
-    );
-    ensure!(
-        planned < free_after,
-        "decoder weights {planned} B do not fit the {free_after} B free after releasing the transformer and conditioner"
-    );
-    let decoder = VideoDecoder::new(&device, &vae, &vae_dir, &vae_manifest)?;
     let tiles = VaeTiles::released(&vae, request.height, request.width)?;
     let clip = vae.chunk_latents() + vae.overlap_latents();
-    let mut work = TileWork::new(s, &vae, (clip, tiles.height / r, tiles.width / r))?;
-    work.prepare(s, &mut blas, &decoder)?;
+    let tile = (clip, tiles.height / r, tiles.width / r);
     let decode_plan = crate::minimax_h3::DecodePlan::new(&vae, latent_frames)?;
     let (lead, pre) = (
         vae.chunk_latents() * vae.temporal_ratio,
@@ -414,6 +401,27 @@ pub(crate) fn run(
     );
     let total_frames = decode_plan.chunks * (lead - pre) + clip * vae.temporal_ratio - lead - pre;
     let pixels = request.height * request.width;
+    let weights = decoder_bytes(&vae_manifest, &audio_manifest);
+    let work_bytes = TileWork::bytes(&vae, tile)
+        + decode_bytes(&vae, &tiles, (request.height, request.width))
+        + 2 * vae.out_channels * total_frames * pixels
+        + 4 * (video_latents.len() + audio_latents.len())
+        + AudioDecoder::work_bytes(&audio_spec, (2, latents))?;
+    let planned = weights + work_bytes;
+    let (free_after, total) = device.ctx.mem_get_info()?;
+    eprintln!(
+        "{}",
+        serde_json::json!({"h3_release": {"free_before_release_bytes": free_before, "free_after_release_bytes": free_after,
+            "decoder_weight_bytes": weights, "decode_work_bytes": work_bytes, "planned_bytes": planned,
+            "total_bytes": total, "placement": "resident"}})
+    );
+    ensure!(
+        planned < free_after,
+        "decoders {weights} B plus decode work {work_bytes} B do not fit the {free_after} B free after releasing the transformer and conditioner"
+    );
+    let decoder = VideoDecoder::new(&device, &vae, &vae_dir, &vae_manifest)?;
+    let mut work = TileWork::new(s, &vae, tile)?;
+    work.prepare(s, &mut blas, &decoder)?;
     let mut decoded = s.alloc_zeros::<bf16>(vae.out_channels * total_frames * pixels)?;
     let latents_device = s.clone_htod(&video_latents)?;
     let decode_plan = decoder.decode(
