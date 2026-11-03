@@ -1117,6 +1117,131 @@ pub struct H3Request {
     pub shifts: (f64, f64),
 }
 
+/// Released canvas of MiniMax-H3 (model definition `canvas_short_edge` and `canvas_max_pixels`) and the aspect
+/// ratios it was trained over.
+const CANVAS_SHORT_EDGE: f64 = 768.0;
+const CANVAS_MAX_PIXELS: f64 = 768.0 * 1344.0;
+const CANVAS_ASPECT: (f64, f64) = (0.25, 4.0);
+
+/// The canvas `(height, width)` of an aspect `aspect_width : aspect_height` (model definition `resolve_canvas_size`):
+/// short edge 768, area capped at 768 * 1344, both axes rounded half to even to a multiple of the latent patch (32).
+pub fn canvas_size(spec: &H3Spec, aspect_width: f64, aspect_height: f64) -> Result<(usize, usize)> {
+    ensure!(
+        aspect_width > 0.0 && aspect_height > 0.0,
+        "aspect ratio {aspect_width}:{aspect_height} is not positive"
+    );
+    let ratio = aspect_width / aspect_height;
+    ensure!(
+        (CANVAS_ASPECT.0..=CANVAS_ASPECT.1).contains(&ratio),
+        "aspect ratio {ratio} lies outside [{}, {}]",
+        CANVAS_ASPECT.0,
+        CANVAS_ASPECT.1
+    );
+    let (mut width, mut height) = if ratio >= 1.0 {
+        (CANVAS_SHORT_EDGE * ratio, CANVAS_SHORT_EDGE)
+    } else {
+        (CANVAS_SHORT_EDGE, CANVAS_SHORT_EDGE / ratio)
+    };
+    let area = width * height;
+    if area > CANVAS_MAX_PIXELS {
+        let scale = (CANVAS_MAX_PIXELS / area).powf(0.5);
+        (width, height) = (width * scale, height * scale);
+    }
+    let multiple = (VAE_SPATIAL_RATIO * spec.patch[2]) as f64;
+    let snap = |v: f64| ((v / multiple).round_ties_even() * multiple).max(multiple) as usize;
+    Ok((snap(height), snap(width)))
+}
+
+/// Token ids and row tags of an i2va / fl2va presentation (model definition encoders.py:283-301): per keyframe the
+/// label `"<Picture {i}>: "` (text rows) and `<|vision_start|>`, `image_tokens[i]` x `<|image_pad|>`,
+/// `<|vision_end|>` (video rows), then the prompt verbatim (text rows), all without special tokens.
+pub fn presentation(
+    tokenizer: &crate::serve::detok::Shared,
+    prompt: &str,
+    image_tokens: &[usize],
+) -> Result<(Vec<u32>, Vec<u8>)> {
+    let (start, pad, end) = (
+        tokenizer.token_id("<|vision_start|>")?,
+        tokenizer.token_id("<|image_pad|>")?,
+        tokenizer.token_id("<|vision_end|>")?,
+    );
+    let (mut ids, mut tags) = (Vec::new(), Vec::new());
+    for (index, &count) in image_tokens.iter().enumerate() {
+        let label = tokenizer.encode_chat(&format!("<Picture {}>: ", index + 1))?;
+        tags.extend(std::iter::repeat_n(TEXT_TAG, label.len()));
+        ids.extend(label);
+        ids.push(start);
+        ids.extend(std::iter::repeat_n(pad, count));
+        ids.push(end);
+        tags.extend(std::iter::repeat_n(VIDEO_TAG, count + 2));
+    }
+    let text = tokenizer.encode_chat(prompt)?;
+    tags.extend(std::iter::repeat_n(TEXT_TAG, text.len()));
+    ids.extend(text);
+    Ok((ids, tags))
+}
+
+/// The request generator's draws of one i2va request, in the shapes of `H3Request`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct H3Draws {
+    pub posterior_eps: Vec<f32>,
+    pub anchor_noise: Vec<f32>,
+    pub video_noise: Vec<f32>,
+    pub audio_rows: Vec<f32>,
+}
+
+/// An i2va request from a prompt and a decoded keyframe image: the keyframe stretched onto the canvas of its own
+/// aspect with Lanczos-3 (model definition before_encoder.py:141-144, PIL `resize(LANCZOS)`), its Qwen3-VL
+/// `pixel_values` and grid through the text encoder's image processor, the presentation, the aligned frame count,
+/// and the given draws and sampling (evaluations, video / audio shifts).
+pub fn prepare_i2va(
+    model: &Path,
+    prompt: &str,
+    keyframe: &crate::serve::image::RgbImage,
+    (frames, draws): (usize, H3Draws),
+    (evaluations, shifts): (usize, (f64, f64)),
+) -> Result<H3Request> {
+    let spec = H3Spec::read(model)?;
+    let encoder = model.join("text_encoder");
+    let (height, width) = canvas_size(&spec, keyframe.width as f64, keyframe.height as f64)?;
+    let canvas = crate::serve::image::RgbImage {
+        width,
+        height,
+        pixels: crate::serve::image::resize_lanczos(keyframe, width, height),
+    };
+    let processor = crate::serve::image::Processor::load(&encoder, None)?
+        .context("MiniMax-H3 text encoder without an image processor")?;
+    let packed = processor.prepare_rgb(&canvas)?;
+    let merge = (processor.merge() * processor.merge()) as usize;
+    let image_tokens = packed
+        .grids
+        .iter()
+        .map(|g| (g.t * g.h * g.w) as usize / merge)
+        .collect::<Vec<_>>();
+    let tokenizer = crate::serve::detok::Shared::load(&encoder)?;
+    let (token_ids, text_tags) = presentation(&tokenizer, prompt, &image_tokens)?;
+    let geometry = Geometry::resolve(&spec, height, width, frames)?;
+    let planes = (0..3)
+        .flat_map(|c| canvas.pixels.iter().skip(c).step_by(3).copied())
+        .collect();
+    Ok(H3Request {
+        token_ids,
+        text_tags,
+        grids: packed.grids,
+        pixel_values: packed.pixel_values,
+        keyframe: planes,
+        height,
+        width,
+        frames: geometry.frames,
+        posterior_eps: draws.posterior_eps,
+        anchor_noise: draws.anchor_noise,
+        video_noise: draws.video_noise,
+        audio_rows: draws.audio_rows,
+        evaluations,
+        shifts,
+    })
+}
+
 /// Generated media: u8 frames `[frames, height, width, 3]` and stereo PCM `[2, samples]` F32 at `sampling_rate`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct H3Output {

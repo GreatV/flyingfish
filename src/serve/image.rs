@@ -1429,17 +1429,23 @@ fn cubic(x: f64) -> f64 {
     }
 }
 
-fn coefficients(input: usize, output: usize) -> Vec<(usize, Vec<f64>)> {
+/// Normalised separable weights `(first input, weights)` of every output sample: `kernel` of radius `radius`, its
+/// support widened by the downscale factor, sampled at input centres `i + 0.5`.
+fn coefficients(
+    input: usize,
+    output: usize,
+    (kernel, radius): (fn(f64) -> f64, f64),
+) -> Vec<(usize, Vec<f64>)> {
     let scale = input as f64 / output as f64;
     let filter_scale = scale.max(1.0);
-    let support = 2.0 * filter_scale;
+    let support = radius * filter_scale;
     (0..output)
         .map(|out| {
             let center = (out as f64 + 0.5) * scale;
             let start = ((center - support + 0.5).floor() as isize).max(0) as usize;
             let end = ((center + support + 0.5).floor() as usize).min(input);
             let mut weights: Vec<_> = (start..end)
-                .map(|i| cubic((i as f64 + 0.5 - center) / filter_scale))
+                .map(|i| kernel((i as f64 + 0.5 - center) / filter_scale))
                 .collect();
             let sum: f64 = weights.iter().sum();
             for weight in &mut weights {
@@ -1452,10 +1458,42 @@ fn coefficients(input: usize, output: usize) -> Vec<(usize, Vec<f64>)> {
 
 // Tensor-resize parity bounds: resized u8 <= 2, FP32 <= 4/255 + 4*EPS, BF16 <= that + 1/256; else bit-exact.
 fn resize_bicubic(image: &RgbImage, width: usize, height: usize) -> Vec<u8> {
+    resize_separable(image, width, height, (cubic, 2.0))
+}
+
+/// Lanczos-3 `sinc(x) sinc(x / 3)` for `|x| < 3`, else 0.
+fn lanczos(x: f64) -> f64 {
+    let sinc = |v: f64| {
+        if v == 0.0 {
+            1.0
+        } else {
+            (std::f64::consts::PI * v).sin() / (std::f64::consts::PI * v)
+        }
+    };
+    if x.abs() < 3.0 {
+        sinc(x) * sinc(x / 3.0)
+    } else {
+        0.0
+    }
+}
+
+/// Lanczos-3 resize of an RGB u8 image to `width x height`, horizontal pass then vertical pass with a u8 intermediate.
+pub(crate) fn resize_lanczos(image: &RgbImage, width: usize, height: usize) -> Vec<u8> {
+    resize_separable(image, width, height, (lanczos, 3.0))
+}
+
+/// Separable resize with `filter` (kernel, radius): horizontal pass then vertical pass, each rounded to u8; an axis
+/// of unchanged size is copied.
+fn resize_separable(
+    image: &RgbImage,
+    width: usize,
+    height: usize,
+    filter: (fn(f64) -> f64, f64),
+) -> Vec<u8> {
     let horizontal = if width == image.width {
         image.pixels.clone()
     } else {
-        let weights = coefficients(image.width, width);
+        let weights = coefficients(image.width, width, filter);
         let mut buffer = vec![0; width * image.height * 3];
         for y in 0..image.height {
             for (x, (start, weights)) in weights.iter().enumerate() {
@@ -1476,7 +1514,7 @@ fn resize_bicubic(image: &RgbImage, width: usize, height: usize) -> Vec<u8> {
     if height == image.height {
         return horizontal;
     }
-    let weights = coefficients(image.height, height);
+    let weights = coefficients(image.height, height, filter);
     let mut result = vec![0; width * height * 3];
     for (y, (start, weights)) in weights.iter().enumerate() {
         for x in 0..width {
@@ -2128,7 +2166,7 @@ fn image_dimensions(bytes: &[u8], mime: Option<&str>) -> Result<(usize, usize)> 
     }
 }
 
-pub(super) fn decode_image(bytes: &[u8], mime: Option<&str>) -> Result<RgbImage> {
+pub fn decode_image(bytes: &[u8], mime: Option<&str>) -> Result<RgbImage> {
     match image_format(bytes, mime)? {
         ImageFormat::Png => decode_png(bytes),
         ImageFormat::Jpeg => decode_jpeg(bytes),

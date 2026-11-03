@@ -1,4 +1,4 @@
-//! MiniMax-H3 FL2VA geometry, layout and schedule gates.
+//! MiniMax-H3 FL2VA geometry, layout, schedule and request-producer gates.
 use anyhow::{Context, Result, ensure};
 use flyingfish::{
     checkpoint::MappedCheckpoint,
@@ -751,5 +751,219 @@ fn minimax_h3_conditioner_inputs_equal_the_reference() -> Result<()> {
         println!("H3_N6A_CELL cell={name} PASS");
     }
     println!("H3_N6A_GATE PASS cells=3 control=FAIL_AS_REQUIRED");
+    Ok(())
+}
+
+/// `FF_MODEL`, `FF_H3_S0` (Stage 0 runs) and `FF_H3_N9` (the N9 freeze) for the producer gates.
+fn producer_env() -> Result<(PathBuf, PathBuf, PathBuf)> {
+    let var = |key: &str| -> Result<PathBuf> {
+        Ok(PathBuf::from(
+            env::var_os(key).with_context(|| format!("{key} missing"))?,
+        ))
+    };
+    Ok((var("FF_MODEL")?, var("FF_H3_S0")?, var("FF_H3_N9")?))
+}
+
+/// The tensor `name` of a recorded safetensors file as raw little-endian bytes with its dtype and shape.
+fn recorded(path: &std::path::Path, name: &str) -> Result<(Dtype, Vec<usize>, Vec<u8>)> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let file = SafeTensors::deserialize(&bytes)?;
+    let t = file.tensor(name)?;
+    Ok((t.dtype(), t.shape().to_vec(), t.data().to_vec()))
+}
+
+fn i64s(data: &[u8]) -> Vec<i64> {
+    data.as_chunks::<8>()
+        .0
+        .iter()
+        .map(|b| i64::from_le_bytes(*b))
+        .collect()
+}
+
+/// The recorded run `cell`'s prompt and its keyframe image tokens (`t * h * w / 4` per image grid).
+fn recorded_presentation(s0: &std::path::Path, cell: &str) -> Result<(String, Vec<usize>)> {
+    let run = s0.join(format!("{cell}-bf16"));
+    let meta: serde_json::Value = serde_json::from_slice(&fs::read(run.join("meta.json"))?)?;
+    let prompt = meta["prompt"].as_str().context("meta prompt")?.to_owned();
+    let (_, shape, grid) = recorded(&run.join("text.safetensors"), "image_grid_thw")?;
+    ensure!(
+        shape.len() == 2 && shape[1] == 3,
+        "image_grid_thw {shape:?}"
+    );
+    let tokens = i64s(&grid)
+        .chunks(3)
+        .map(|g| (g[0] * g[1] * g[2]) as usize / 4)
+        .collect();
+    Ok((prompt, tokens))
+}
+
+/// N9a: the native presentation of the recorded prompt and image grids equals the recorded token ids and text-row
+/// tags of cells A, P, B and D (D: two keyframes); control: one prompt character changed changes the ids.
+#[test]
+#[ignore = "FF_MODEL, FF_H3_S0, FF_H3_N9"]
+fn minimax_h3_presentation_matches_the_recorded_tokens() -> Result<()> {
+    let (model, s0, _) = producer_env()?;
+    let tokenizer = flyingfish::serve::detok::Shared::load(&model.join("text_encoder"))?;
+    for cell in ["A", "P", "B", "D"] {
+        let (prompt, image_tokens) = recorded_presentation(&s0, cell)?;
+        let (ids, tags) = flyingfish::minimax_h3::presentation(&tokenizer, &prompt, &image_tokens)?;
+        let run = s0.join(format!("{cell}-bf16"));
+        let want: Vec<u32> = i64s(&recorded(&run.join("text.safetensors"), "token_ids")?.2)
+            .into_iter()
+            .map(|v| v as u32)
+            .collect();
+        let token_tags = i64s(&recorded(&run.join("layout.safetensors"), "token_tags")?.2);
+        let rows = i64s(&recorded(&run.join("layout.safetensors"), "text_indices")?.2);
+        let want_tags: Vec<u8> = rows.iter().map(|&r| token_tags[r as usize] as u8).collect();
+        println!(
+            "H3_N9A cell={cell} keyframes={} tokens={} ids_equal={} tags_equal={}",
+            image_tokens.len(),
+            ids.len(),
+            ids == want,
+            tags == want_tags
+        );
+        ensure!(
+            ids == want && tags == want_tags,
+            "cell {cell}: presentation differs from the recording"
+        );
+        let mut changed = prompt.clone();
+        changed.replace_range(0..1, "f");
+        let (control, _) =
+            flyingfish::minimax_h3::presentation(&tokenizer, &changed, &image_tokens)?;
+        ensure!(
+            control != want,
+            "cell {cell}: a changed prompt kept the recorded ids"
+        );
+    }
+    println!("H3_N9A_GATE PASS cells=4 control=FAIL_AS_REQUIRED");
+    Ok(())
+}
+
+/// N9b: the native canvas equals the model definition's `resolve_canvas_size` table of the N9 freeze.
+#[test]
+#[ignore = "FF_MODEL, FF_H3_S0, FF_H3_N9"]
+fn minimax_h3_canvas_matches_the_definition_table() -> Result<()> {
+    let (model, _, n9) = producer_env()?;
+    let spec = H3Spec::read(&model)?;
+    let table: serde_json::Value = serde_json::from_slice(&fs::read(n9.join("canvas.json"))?)?;
+    let rows = table["rows"].as_array().context("canvas rows")?;
+    for row in rows {
+        let v = |i: usize| row[i].as_f64().context("canvas row value");
+        let got = flyingfish::minimax_h3::canvas_size(&spec, v(0)?, v(1)?)?;
+        let want = (v(2)? as usize, v(3)? as usize);
+        ensure!(
+            got == want,
+            "aspect {}:{} gives {got:?}, the definition {want:?}",
+            v(0)?,
+            v(1)?
+        );
+    }
+    println!("H3_N9B_CANVAS PASS rows={}", rows.len());
+    Ok(())
+}
+
+/// N9b: the text encoder's image processor on the recorded canvas u8 reproduces the recorded `pixel_values` and grid
+/// (cells A and B, exact); the native keyframe (decode + Lanczos-3 of the source JPEG) lies within the frozen floor of
+/// the recorded canvas (max_abs and differing fraction at most twice the freeze's combined floor).
+#[test]
+#[ignore = "FF_MODEL, FF_H3_S0, FF_H3_N9"]
+fn minimax_h3_image_producers_match_the_recording() -> Result<()> {
+    let (model, s0, n9) = producer_env()?;
+    let floor: serde_json::Value = serde_json::from_slice(&fs::read(n9.join("floor.json"))?)?;
+    let combined = |key: &str| -> Result<f64> {
+        ["i2va_test_1_chef.jpg", "i2va_test_11_rally_car.jpg"]
+            .iter()
+            .map(|name| {
+                floor[name]["combined_floor"][key]
+                    .as_f64()
+                    .context("combined floor")
+            })
+            .try_fold(0f64, |m, v| Ok(m.max(v?)))
+    };
+    let (max_bound, fraction_bound) = (
+        2.0 * combined("max_abs")?,
+        2.0 * combined("differing_fraction")?,
+    );
+    let processor = flyingfish::serve::image::Processor::load(&model.join("text_encoder"), None)?
+        .context("text encoder image processor")?;
+    for cell in ["A", "B"] {
+        let run = s0.join(format!("{cell}-bf16"));
+        let (_, shape, planes) = recorded(&run.join("keyframes.safetensors"), "k0.pixels")?;
+        let (height, width) = (shape[3], shape[4]);
+        let plane = height * width;
+        let pixels: Vec<u8> = (0..plane)
+            .flat_map(|p| (0..3).map(move |c| (c, p)))
+            .map(|(c, p)| planes[c * plane + p])
+            .collect();
+        let canvas = flyingfish::serve::image::RgbImage {
+            width,
+            height,
+            pixels,
+        };
+        let packed = processor.prepare_rgb(&canvas)?;
+        let (_, _, want) = recorded(&run.join("text.safetensors"), "pixel_values")?;
+        let want: Vec<f32> = want
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        let grid = i64s(&recorded(&run.join("text.safetensors"), "image_grid_thw")?.2);
+        let grid_equal = packed
+            .grids
+            .iter()
+            .flat_map(|g| [g.t as i64, g.h as i64, g.w as i64])
+            .collect::<Vec<_>>()
+            == grid;
+        println!(
+            "H3_N9B cell={cell} pixel_values_equal={} grid_equal={grid_equal}",
+            packed.pixel_values == want
+        );
+        ensure!(
+            packed.pixel_values == want && grid_equal,
+            "cell {cell}: pixel_values differ from the recording"
+        );
+        let meta: serde_json::Value = serde_json::from_slice(&fs::read(run.join("meta.json"))?)?;
+        let source = flyingfish::serve::image::decode_image(
+            &fs::read(meta["cell"]["image"].as_str().context("meta image")?)?,
+            Some("image/jpeg"),
+        )?;
+        let empty = flyingfish::minimax_h3::H3Draws {
+            posterior_eps: Vec::new(),
+            anchor_noise: Vec::new(),
+            video_noise: Vec::new(),
+            audio_rows: Vec::new(),
+        };
+        let (prompt, _) = recorded_presentation(&s0, cell)?;
+        let request = flyingfish::minimax_h3::prepare_i2va(
+            &model,
+            &prompt,
+            &source,
+            (124, empty),
+            (8, (6.0, 3.0)),
+        )?;
+        ensure!(
+            request.height == height && request.width == width,
+            "canvas {}x{}",
+            request.height,
+            request.width
+        );
+        let diff: Vec<u8> = request
+            .keyframe
+            .iter()
+            .zip(&planes)
+            .map(|(&a, &b)| a.abs_diff(b))
+            .collect();
+        let max = f64::from(*diff.iter().max().context("empty keyframe")?);
+        let fraction = diff.iter().filter(|&&d| d > 0).count() as f64 / diff.len() as f64;
+        let mean = diff.iter().map(|&d| f64::from(d)).sum::<f64>() / diff.len() as f64;
+        let ok = max <= max_bound && fraction <= fraction_bound;
+        println!(
+            "H3_N9B cell={cell} keyframe max_abs={max} differing_fraction={fraction:.6} mean_abs={mean:.6} bounds=[{max_bound}, {fraction_bound:.6}] within={ok} native_pixel_values_equal={}",
+            request.pixel_values == want
+        );
+        ensure!(ok, "cell {cell}: native keyframe outside the frozen floor");
+    }
+    println!("H3_N9B_GATE PASS cells=2");
     Ok(())
 }
