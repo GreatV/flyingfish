@@ -323,6 +323,8 @@ impl Music3Syn {
             length,
             &mut wide.slice_mut(dim..dim + length * dim),
         )?;
+        let temb_ptr = ws.temb.device_ptr(s).0;
+        let l2b_ptr = self.weights.flow.time_l2_b.device_ptr(s).0;
         let mut temb = ws.temb.slice_mut(0..ws.temb.len());
         let mut fourier = ws.fourier.slice_mut(0..ws.fourier.len());
         let t_dev = s.clone_htod(&[t])?;
@@ -334,6 +336,8 @@ impl Music3Syn {
                 .arg(&((fourier_dim / 2) as u32))
                 .launch(super::ops::flat(fourier_dim / 2))?;
         }
+        let t1_ptr = ws.t1.device_ptr(s).0;
+        let l1b_ptr = self.weights.flow.time_l1_b.device_ptr(s).0;
         let mut t1 = ws.t1.slice_mut(0..ws.t1.len());
         self.linear(
             &self.weights.flow.time_l1_w,
@@ -345,10 +349,11 @@ impl Music3Syn {
         )?;
         unsafe {
             s.launch_builder(&self.bias)
-                .arg(&mut t1)
-                .arg(&self.weights.flow.time_l1_b)
-                .arg(&(dim as i64))
-                .arg(&(dim as i32))
+                .arg(&t1_ptr)
+                .arg(&l1b_ptr)
+                .arg(&t1_ptr)
+                .arg(&1u32)
+                .arg(&(dim as u32))
                 .launch(super::ops::flat(dim))?;
             s.launch_builder(&self.silu)
                 .arg(&mut t1)
@@ -365,10 +370,11 @@ impl Music3Syn {
         )?;
         unsafe {
             s.launch_builder(&self.bias)
-                .arg(&mut temb)
-                .arg(&self.weights.flow.time_l2_b)
-                .arg(&(dim as i64))
-                .arg(&(dim as i32))
+                .arg(&temb_ptr)
+                .arg(&l2b_ptr)
+                .arg(&temb_ptr)
+                .arg(&1u32)
+                .arg(&(dim as u32))
                 .launch(super::ops::flat(dim))?;
         }
         s.memcpy_dtod(&temb, &mut wide)?;
@@ -379,8 +385,10 @@ impl Music3Syn {
         let mut v = ws.v.slice_mut(0..ws.v.len());
         let mut attn = ws.attn.slice_mut(0..ws.attn.len());
         let mut scores = ws.scores.slice_mut(0..ws.scores.len());
+        let ffb_ptr = ws.ff_buf.device_ptr(s).0;
         let mut ff_buf = ws.ff_buf.slice_mut(0..ws.ff_buf.len());
         let mut ff_gated = ws.ff_gated.slice_mut(0..ws.ff_gated.len());
+        let ffo_ptr = ws.ff_out.device_ptr(s).0;
         let mut ff_out = ws.ff_out.slice_mut(0..ws.ff_out.len());
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         for block in &self.weights.flow.blocks {
@@ -512,11 +520,13 @@ impl Music3Syn {
                 &mut ff_buf.slice_mut(0..2 * ff * tokens),
             )?;
             unsafe {
+                let ffinb_ptr = block.ff_in_b.device_ptr(s).0;
                 s.launch_builder(&self.bias)
-                    .arg(&mut ff_buf)
-                    .arg(&block.ff_in_b)
-                    .arg(&((2 * ff * tokens) as i64))
-                    .arg(&((2 * ff) as i32))
+                    .arg(&ffb_ptr)
+                    .arg(&ffinb_ptr)
+                    .arg(&ffb_ptr)
+                    .arg(&(tokens as u32))
+                    .arg(&((2 * ff) as u32))
                     .launch(super::ops::flat(2 * ff * tokens))?;
                 s.launch_builder(&self.silu_mul)
                     .arg(&mut ff_buf)
@@ -534,11 +544,13 @@ impl Music3Syn {
                 &mut ff_out.slice_mut(0..dim * tokens),
             )?;
             unsafe {
+                let ffob_ptr = block.ff_out_b.device_ptr(s).0;
                 s.launch_builder(&self.bias)
-                    .arg(&mut ff_out)
-                    .arg(&block.ff_out_b)
-                    .arg(&((dim * tokens) as i64))
-                    .arg(&(dim as i32))
+                    .arg(&ffo_ptr)
+                    .arg(&ffob_ptr)
+                    .arg(&ffo_ptr)
+                    .arg(&(tokens as u32))
+                    .arg(&(dim as u32))
                     .launch(super::ops::flat(dim * tokens))?;
                 s.launch_builder(&self.add_inplace)
                     .arg(&mut wide)
