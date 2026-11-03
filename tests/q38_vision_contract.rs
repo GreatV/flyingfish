@@ -217,20 +217,27 @@ fn packed_input_rejects_ambiguous_slots_and_invalid_pixels() {
 #[test]
 fn text_axes_and_all_rotary_frequencies_are_exactly_linear() -> Result<()> {
     let plan = PositionPlan::text(65, 192)?;
-    let mut axes = [0; 3];
-    for j in 0..32 {
-        axes[PositionPlan::rotary_axis(j)?] += 1;
-        for physical in 0..192 {
-            assert_eq!(
-                plan.rotary_position(j, physical)?.to_le_bytes(),
-                (physical as i32).to_le_bytes()
-            );
+    for (section, frequencies) in [([11, 11, 10], 32), ([24, 20, 20], 64)] {
+        let mut axes = [0; 3];
+        for j in 0..frequencies {
+            axes[PositionPlan::rotary_axis(section, j)?] += 1;
+            for physical in 0..192 {
+                assert_eq!(
+                    plan.rotary_position(section, j, physical)?.to_le_bytes(),
+                    (physical as i32).to_le_bytes()
+                );
+            }
         }
+        assert_eq!(axes, section);
+        assert!(PositionPlan::rotary_axis(section, frequencies).is_err());
     }
-    assert_eq!(axes, [11, 11, 10]);
+    let interleaved: Vec<_> = (0..12)
+        .map(|j| PositionPlan::rotary_axis([24, 20, 20], j))
+        .collect::<Result<_>>()?;
+    assert_eq!(interleaved, [0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2]);
+    assert_eq!(PositionPlan::rotary_axis([24, 20, 20], 61)?, 0);
     assert_eq!(plan.rope_delta(), 0);
-    assert!(PositionPlan::rotary_axis(32).is_err());
-    assert!(plan.rotary_position(0, 192).is_err());
+    assert!(plan.rotary_position([11, 11, 10], 0, 192).is_err());
     assert!(PositionPlan::text(66, 65).is_err());
     assert!(PositionPlan::text(0, 65).is_err());
     let ids = [1, 2, 3];

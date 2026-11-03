@@ -395,7 +395,7 @@ impl Processor {
         vision.validate(spec.architecture)?;
         let path = model.join("preprocessor_config.json");
         let config = match spec.architecture {
-            Architecture::Qwen35Text => {
+            Architecture::Qwen35Text | Architecture::Qwen3Vl => {
                 let config: QwenConfig = serde_json::from_reader(std::fs::File::open(&path)?)?;
                 ensure!(
                     config.patch_size == 16

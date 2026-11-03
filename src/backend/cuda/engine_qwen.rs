@@ -231,7 +231,8 @@ fn require_qwen35_geometry(spec: &crate::model_spec::ModelSpec) -> Result<()> {
         | Architecture::LoopVl
         | Architecture::Gemma4
         | Architecture::EmbeddingGemma2
-        | Architecture::DiffusionGemma => anyhow::bail!(
+        | Architecture::DiffusionGemma
+        | Architecture::Qwen3Vl => anyhow::bail!(
             "hybrid engine does not implement architecture={:?}",
             spec.architecture
         ),

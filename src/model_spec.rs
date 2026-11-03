@@ -18,6 +18,7 @@ pub enum Architecture {
     EmbeddingGemma2,
     Clover,
     DiffusionGemma,
+    Qwen3Vl,
 }
 impl Architecture {
     /// Architectures with a bound MTP decode path.
@@ -666,12 +667,65 @@ pub struct VisionConfig {
     pub minicpm: Option<MiniCpmVision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub axial: Option<AxialVision>,
+    /// Encoder blocks whose outputs feed a deepstack merger; empty without deepstack.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deepstack: Vec<u32>,
+    /// Interleaved mRoPE section `[t, h, w]` in rotary frequencies of the Qwen3-VL text decoder; Q38's `[11, 11, 10]`
+    /// is checked in its text geometry and not stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mrope_section: Option<[u32; 3]>,
 }
 
 impl VisionConfig {
     pub fn validate(&self, architecture: Architecture) -> Result<()> {
+        ensure!(
+            self.deepstack.is_empty() || architecture == Architecture::Qwen3Vl,
+            "deepstack vision taps are bound only for Qwen3-VL"
+        );
         match architecture {
+            Architecture::Qwen3Vl => {
+                ensure!(
+                    [
+                        self.depth,
+                        self.hidden,
+                        self.heads,
+                        self.intermediate,
+                        self.channels,
+                        self.patch,
+                        self.temporal_patch,
+                        self.merge,
+                        self.output,
+                        self.position_side
+                    ] == [27, 1152, 16, 4304, 3, 16, 2, 2, 5120, 48],
+                    "unsupported Qwen3-VL vision geometry"
+                );
+                ensure!(
+                    [
+                        self.image_token,
+                        self.video_token,
+                        self.start_token,
+                        self.end_token
+                    ] == [151655, 151656, 151652, 151653],
+                    "unsupported Qwen3-VL image token IDs"
+                );
+                ensure!(
+                    self.deepstack == [8, 16, 24],
+                    "unsupported Qwen3-VL deepstack taps: {:?}",
+                    self.deepstack
+                );
+                ensure!(
+                    self.mrope_section == Some([24, 20, 20]),
+                    "unsupported Qwen3-VL mRoPE section: {:?}",
+                    self.mrope_section
+                );
+                ensure!(self.minicpm.is_none(), "unexpected MiniCPM vision fields");
+                ensure!(self.axial.is_none(), "unexpected axial vision fields");
+            }
             Architecture::Qwen35Text => {
+                ensure!(
+                    self.mrope_section.is_none(),
+                    "unexpected stored mRoPE section for Q38"
+                );
                 ensure!(
                     [
                         self.depth,
@@ -815,7 +869,8 @@ impl VisionConfig {
             return Ok(None);
         };
         match v.get("model_type").and_then(Value::as_str) {
-            Some("qwen3_5") => Self::qwen_from_root(root, v).map(Some),
+            Some("qwen3_5") => Self::qwen_from_root(root, v, Architecture::Qwen35Text).map(Some),
+            Some("qwen3_vl") => Self::qwen_from_root(root, v, Architecture::Qwen3Vl).map(Some),
             Some("minicpmv4_7_vision") => Self::minicpm_from_root(root, v).map(Some),
             Some("gemma4_vision") => Self::axial_from_root(root, v).map(Some),
             other => bail!("unsupported vision_config model_type: {other:?}"),
@@ -896,14 +951,31 @@ impl VisionConfig {
                 standardize: flag("standardize")?,
                 clipped_linears: flag("use_clipped_linears")?,
             }),
+            deepstack: Vec::new(),
+            mrope_section: None,
         };
         spec.validate(Architecture::Gemma4)?;
         Ok(spec)
     }
 
-    fn qwen_from_root(root: &Value, v: &Value) -> Result<Self> {
+    fn qwen_from_root(root: &Value, v: &Value, architecture: Architecture) -> Result<Self> {
         equal(v, "hidden_act", "gelu_pytorch_tanh".into())?;
-        equal(v, "deepstack_visual_indexes", serde_json::json!([]))?;
+        let (deepstack, mrope_section) = if architecture == Architecture::Qwen3Vl {
+            let rope = root
+                .get("text_config")
+                .and_then(|text| text.get("rope_scaling"))
+                .context("Qwen3-VL text_config.rope_scaling missing")?;
+            let section: [u32; 3] =
+                u32_list(rope, "mrope_section")?
+                    .try_into()
+                    .map_err(|section| {
+                        anyhow::anyhow!("mrope_section is not three axes: {section:?}")
+                    })?;
+            (u32_list(v, "deepstack_visual_indexes")?, Some(section))
+        } else {
+            equal(v, "deepstack_visual_indexes", serde_json::json!([]))?;
+            (Vec::new(), None)
+        };
         ensure!(
             integer(v, "num_position_embeddings")? == 2304,
             "unsupported vision position table"
@@ -925,8 +997,10 @@ impl VisionConfig {
             end_token: integer(root, "vision_end_token_id")?,
             minicpm: None,
             axial: None,
+            deepstack,
+            mrope_section,
         };
-        spec.validate(Architecture::Qwen35Text)?;
+        spec.validate(architecture)?;
         Ok(spec)
     }
 
@@ -990,6 +1064,8 @@ impl VisionConfig {
                 newline_token: integer(root, "newline_id")?,
             }),
             axial: None,
+            deepstack: Vec::new(),
+            mrope_section: None,
         };
         spec.validate(Architecture::MiniCpmV47)?;
         Ok(spec)
@@ -1620,7 +1696,8 @@ impl ModelSpec {
             | Architecture::MiniCpmV47
             | Architecture::LoopVl
             | Architecture::Gemma4
-            | Architecture::EmbeddingGemma2 => SwigluRounding::Twice,
+            | Architecture::EmbeddingGemma2
+            | Architecture::Qwen3Vl => SwigluRounding::Twice,
             Architecture::DiffusionGemma => SwigluRounding::GeluTwice,
         }
     }
@@ -1644,7 +1721,8 @@ impl ModelSpec {
             | Architecture::Gemma4
             | Architecture::EmbeddingGemma2
             | Architecture::Clover
-            | Architecture::DiffusionGemma => 0.0,
+            | Architecture::DiffusionGemma
+            | Architecture::Qwen3Vl => 0.0,
         }
     }
 
@@ -1661,7 +1739,8 @@ impl ModelSpec {
             | Architecture::LoopVl
             | Architecture::Gemma4
             | Architecture::EmbeddingGemma2
-            | Architecture::DiffusionGemma => RoutedWeightBoundary::AfterDownBf16,
+            | Architecture::DiffusionGemma
+            | Architecture::Qwen3Vl => RoutedWeightBoundary::AfterDownBf16,
         }
     }
 
@@ -1681,6 +1760,7 @@ impl ModelSpec {
                 Architecture::EmbeddingGemma2 => "embedding_gemma2_text",
                 Architecture::Clover => "clover_moe",
                 Architecture::DiffusionGemma => "diffusion_gemma_text",
+                Architecture::Qwen3Vl => "qwen3_vl_text",
             }
             .into(),
             hidden_size: self.hidden as usize,
@@ -1746,6 +1826,8 @@ impl ModelSpec {
             Self::clover(&root, &generation)
         } else if root.get("model_type").and_then(Value::as_str) == Some("diffusion_gemma") {
             Self::diffusion_gemma(&root, &generation)
+        } else if root.get("model_type").and_then(Value::as_str) == Some("qwen3_vl") {
+            Self::qwen3_vl(&root)
         } else {
             Self::qwen(&root, &generation)
         }
@@ -2188,6 +2270,140 @@ impl ModelSpec {
             LinearFormat::read(root)?,
             None,
         )
+    }
+    /// Qwen3-VL: dense full-attention text decoder (GQA, per-head q/k RMSNorm, interleaved mRoPE) with a
+    /// deepstack vision tower.
+    pub fn qwen3_vl(root: &Value) -> Result<Self> {
+        exact_keys(
+            root,
+            &[
+                "architectures",
+                "image_token_id",
+                "model_type",
+                "text_config",
+                "tie_word_embeddings",
+                "transformers_version",
+                "video_token_id",
+                "vision_config",
+                "vision_end_token_id",
+                "vision_start_token_id",
+            ],
+            "Qwen3-VL config",
+        )?;
+        equal(
+            root,
+            "architectures",
+            serde_json::json!(["Qwen3VLForConditionalGeneration"]),
+        )?;
+        equal(root, "tie_word_embeddings", false.into())?;
+        let t = root.get("text_config").context("missing text_config")?;
+        exact_keys(
+            t,
+            &[
+                "attention_bias",
+                "attention_dropout",
+                "bos_token_id",
+                "dtype",
+                "eos_token_id",
+                "head_dim",
+                "hidden_act",
+                "hidden_size",
+                "initializer_range",
+                "intermediate_size",
+                "max_position_embeddings",
+                "model_type",
+                "num_attention_heads",
+                "num_hidden_layers",
+                "num_key_value_heads",
+                "rms_norm_eps",
+                "rope_scaling",
+                "rope_theta",
+                "use_cache",
+                "vocab_size",
+            ],
+            "Qwen3-VL text_config",
+        )?;
+        for (key, value) in [
+            ("model_type", "qwen3_vl_text".into()),
+            ("attention_bias", false.into()),
+            ("attention_dropout", 0.0.into()),
+            ("dtype", "bfloat16".into()),
+            ("hidden_act", "silu".into()),
+        ] {
+            equal(t, key, value)?;
+        }
+        let rope = t.get("rope_scaling").context("missing rope_scaling")?;
+        exact_keys(
+            rope,
+            &["mrope_interleaved", "mrope_section", "rope_type"],
+            "Qwen3-VL rope_scaling",
+        )?;
+        equal(rope, "mrope_interleaved", true.into())?;
+        equal(rope, "rope_type", "default".into())?;
+        let float = |key: &str| -> Result<f32> {
+            let value = t
+                .get(key)
+                .and_then(Value::as_f64)
+                .with_context(|| format!("missing/invalid {key}"))?;
+            ensure!(
+                value.is_finite() && value > 0.0,
+                "unsupported {key}: {value}"
+            );
+            Ok(value as f32)
+        };
+        let head_dim = positive(t, "head_dim")?;
+        let q_heads = positive(t, "num_attention_heads")?;
+        let kv_heads = positive(t, "num_key_value_heads")?;
+        ensure!(
+            q_heads.is_multiple_of(kv_heads),
+            "query heads {q_heads} are not a multiple of KV heads {kv_heads}"
+        );
+        let vision = VisionConfig::from_root(root)?.context("Qwen3-VL vision_config missing")?;
+        let section = vision
+            .mrope_section
+            .context("Qwen3-VL mRoPE section missing")?;
+        ensure!(
+            section.iter().sum::<u32>() * 2 == head_dim,
+            "mRoPE section {section:?} does not cover head_dim {head_dim}"
+        );
+        Ok(Self {
+            abi_version: 1,
+            architecture: Architecture::Qwen3Vl,
+            hidden: positive(t, "hidden_size")?,
+            intermediate: positive(t, "intermediate_size")?,
+            vocab: positive(t, "vocab_size")?,
+            q_heads,
+            kv_heads,
+            head_dim,
+            q_width: q_heads.checked_mul(head_dim).context("q width overflow")?,
+            max_position: positive(t, "max_position_embeddings")?,
+            rms_eps: float("rms_norm_eps")?,
+            rope_theta: float("rope_theta")?,
+            rotary_dim: head_dim,
+            linear_format: LinearFormat::Bf16,
+            expert_format: None,
+            eos: vec![positive(t, "eos_token_id")?],
+            vision: Some(vision),
+            moe: None,
+            gdn: None,
+            glm5_next: None,
+            deepseek_v41: None,
+            logit_softcap: None,
+            per_layer_input: None,
+            audio: None,
+            canvas_length: None,
+            diffusion: None,
+            layers: (0..positive(t, "num_hidden_layers")?)
+                .map(|state_index| LayerPlan {
+                    geometry: None,
+                    mixer: Mixer::FullAttention,
+                    state_index,
+                    rope: true,
+                    sliding_window: None,
+                    ffn: FfnKind::Dense,
+                })
+                .collect(),
+        })
     }
     pub fn minicpm(root: &Value, generation: &Value) -> Result<Self> {
         equal(root, "model_type", "minicpmv4_7".into())?;

@@ -327,8 +327,13 @@ impl PositionPlan {
         i32::try_from(position).context("mRoPE coordinate exceeds device range")
     }
 
-    pub fn rotary_position(&self, frequency: usize, physical_position: usize) -> Result<i32> {
-        let axis = Self::rotary_axis(frequency)?;
+    pub fn rotary_position(
+        &self,
+        section: [u32; 3],
+        frequency: usize,
+        physical_position: usize,
+    ) -> Result<i32> {
+        let axis = Self::rotary_axis(section, frequency)?;
         if physical_position < self.prompt_rows() {
             Ok(self.axes[axis][physical_position])
         } else {
@@ -336,11 +341,14 @@ impl PositionPlan {
         }
     }
 
-    pub fn rotary_axis(frequency: usize) -> Result<usize> {
-        ensure!(frequency < 32, "frequency outside Q38 partial RoPE");
-        Ok(if frequency % 3 == 1 {
+    /// Interleaved mRoPE axis of a rotary frequency: `h` at `f % 3 == 1` below `3 * section[1]`, `w` at
+    /// `f % 3 == 2` below `3 * section[2]`, `t` otherwise, over `section.sum()` frequencies.
+    pub fn rotary_axis(section: [u32; 3], frequency: usize) -> Result<usize> {
+        let [t, h, w] = section.map(|n| n as usize);
+        ensure!(frequency < t + h + w, "frequency outside the mRoPE section");
+        Ok(if frequency % 3 == 1 && frequency < 3 * h {
             1
-        } else if frequency % 3 == 2 && frequency < 30 {
+        } else if frequency % 3 == 2 && frequency < 3 * w {
             2
         } else {
             0
@@ -355,7 +363,7 @@ impl MultimodalInput<'_> {
             "audio input requires a supported audio tower"
         );
         match spec.architecture {
-            Architecture::Qwen35Text => self.validate_qwen(spec, capacity),
+            Architecture::Qwen35Text | Architecture::Qwen3Vl => self.validate_qwen(spec, capacity),
             Architecture::MiniCpmV47 => self.validate_minicpm(spec, capacity),
             Architecture::Gemma4 | Architecture::EmbeddingGemma2 => {
                 self.validate_axial(spec, capacity)
@@ -1202,7 +1210,10 @@ impl VisionPositions {
         row_limit: usize,
     ) -> Result<Self> {
         ensure!(
-            architecture == Architecture::Qwen35Text,
+            matches!(
+                architecture,
+                Architecture::Qwen35Text | Architecture::Qwen3Vl
+            ),
             "vision positions require the Qwen tower"
         );
         spec.validate(architecture)?;
@@ -1229,6 +1240,10 @@ impl VisionPositions {
                 (-step).mul_add((n - 1 - i) as f32, end)
             }
         };
+        // Qwen3-VL (transformers 5.21 model definition): `src = f32(i * (side - 1)) / (n - 1)` and per-axis weights
+        // `max(0, 1 - |src - floor - k|)`, k in {0, 1}. Q38: the linspace coordinate and `1 - d` / `d` weights.
+        let closed_form = architecture == Architecture::Qwen3Vl;
+        let closed = |i: u32, n: u32| (i as f32 * (side - 1) as f32) / (n.max(2) - 1) as f32;
         for grid in grids {
             for block_y in 0..grid.h / 2 {
                 for block_x in 0..grid.w / 2 {
@@ -1239,8 +1254,11 @@ impl VisionPositions {
                             result
                                 .coordinates
                                 .push([i32::try_from(y)?, i32::try_from(x)?]);
-                            let h = coordinate(y, grid.h);
-                            let w = coordinate(x, grid.w);
+                            let (h, w) = if closed_form {
+                                (closed(y, grid.h), closed(x, grid.w))
+                            } else {
+                                (coordinate(y, grid.h), coordinate(x, grid.w))
+                            };
                             let hf = h as i32;
                             let wf = w as i32;
                             let hc = (hf + 1).min(side - 1);
@@ -1253,12 +1271,19 @@ impl VisionPositions {
                                 hc * side + wf,
                                 hc * side + wc,
                             ];
-                            let weights = [
-                                (1.0 - dh) * (1.0 - dw),
-                                (1.0 - dh) * dw,
-                                dh * (1.0 - dw),
-                                dh * dw,
-                            ];
+                            let weights = if closed_form {
+                                let near = |d: f32| (1.0 - d.abs()).max(0.0);
+                                let (h0, h1, w0, w1) =
+                                    (near(dh), near(dh - 1.0), near(dw), near(dw - 1.0));
+                                [h0 * w0, h0 * w1, h1 * w0, h1 * w1]
+                            } else {
+                                [
+                                    (1.0 - dh) * (1.0 - dw),
+                                    (1.0 - dh) * dw,
+                                    dh * (1.0 - dw),
+                                    dh * dw,
+                                ]
+                            };
                             for k in 0..4 {
                                 result.bilinear_indices[k].push(indices[k]);
                                 result.bilinear_weights[k].push(weights[k]);

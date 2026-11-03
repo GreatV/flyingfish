@@ -39,6 +39,8 @@ struct VisionGeometry {
     insert_scale: u32,
     /// Encoder layer after which the window-attention merger runs, if the model has one.
     insert_layer: Option<u32>,
+    /// Encoder blocks whose outputs feed the deepstack mergers, if the model has them.
+    deepstack: Option<[u32; 3]>,
 }
 
 impl VisionGeometry {
@@ -49,7 +51,8 @@ impl VisionGeometry {
             .context("vision configuration missing")?;
         vision.validate(model.architecture)?;
         let spec = match model.architecture {
-            crate::model_spec::Architecture::Qwen35Text => VisionSpec::q38(),
+            crate::model_spec::Architecture::Qwen35Text
+            | crate::model_spec::Architecture::Qwen3Vl => VisionSpec::q38(),
             crate::model_spec::Architecture::MiniCpmV47 => {
                 ensure!(
                     vision.heads > 0 && vision.hidden.is_multiple_of(vision.heads),
@@ -106,6 +109,11 @@ impl VisionGeometry {
             mlp: vision.intermediate,
             insert_scale: total / final_merge,
             insert_layer: vision.minicpm.as_ref().map(|m| m.insert_layer),
+            deepstack: match *vision.deepstack.as_slice() {
+                [] => None,
+                [a, b, c] => Some([a, b, c]),
+                ref taps => bail!("unsupported deepstack taps: {taps:?}"),
+            },
         })
     }
 
@@ -835,6 +843,8 @@ struct VisionWeights {
     blocks: Vec<BlockWeights>,
     window: Option<WindowMergerWeights>,
     merger: MergerWeights,
+    /// One merger per deepstack tap, LayerNorm over the merged `merger_fc1` row.
+    deepstack: Vec<MergerWeights>,
 }
 
 impl VisionWeights {
@@ -873,214 +883,245 @@ impl VisionWeights {
             ]
         };
         let window_width = (merge * merge) as usize * mlp_usize;
-        let (patch, position, post_norm, blocks, window, merger, expected) = match architecture {
-            Architecture::Qwen35Text => {
-                let patch = BiasedWeight::patch(
-                    catalog,
-                    "model.visual.patch_embed.proj",
-                    [hidden, geometry.patch],
-                    &patch_shape,
-                )?;
-                let position = take(
-                    catalog,
-                    "model.visual.pos_embed.weight",
-                    &[position_rows, hidden_usize],
-                )?;
-                let mut blocks = Vec::with_capacity(depth as usize);
-                for i in 0..depth {
-                    let p = format!("model.visual.blocks.{i}");
-                    blocks.push(BlockWeights {
-                        norm1: AffineWeights::take(catalog, &format!("{p}.norm1"), hidden)?,
-                        qkv: QkvWeights::Fused(BiasedWeight::take(
+        let (patch, position, post_norm, blocks, window, merger, deepstack, expected) =
+            match architecture {
+                Architecture::Qwen35Text | Architecture::Qwen3Vl => {
+                    let patch = BiasedWeight::patch(
+                        catalog,
+                        "model.visual.patch_embed.proj",
+                        [hidden, geometry.patch],
+                        &patch_shape,
+                    )?;
+                    let position = take(
+                        catalog,
+                        "model.visual.pos_embed.weight",
+                        &[position_rows, hidden_usize],
+                    )?;
+                    let mut blocks = Vec::with_capacity(depth as usize);
+                    for i in 0..depth {
+                        let p = format!("model.visual.blocks.{i}");
+                        blocks.push(BlockWeights {
+                            norm1: AffineWeights::take(catalog, &format!("{p}.norm1"), hidden)?,
+                            qkv: QkvWeights::Fused(BiasedWeight::take(
+                                catalog,
+                                &format!("{p}.attn.qkv"),
+                                [3 * hidden, hidden],
+                                &[3 * hidden_usize, hidden_usize],
+                                LinearBiasMode::BeforeOutputRound,
+                            )?),
+                            projection: BiasedWeight::take(
+                                catalog,
+                                &format!("{p}.attn.proj"),
+                                [hidden, hidden],
+                                &[hidden_usize, hidden_usize],
+                                LinearBiasMode::BeforeOutputRound,
+                            )?,
+                            norm2: AffineWeights::take(catalog, &format!("{p}.norm2"), hidden)?,
+                            fc1: BiasedWeight::take(
+                                catalog,
+                                &format!("{p}.mlp.linear_fc1"),
+                                [mlp, hidden],
+                                &[mlp_usize, hidden_usize],
+                                LinearBiasMode::BeforeOutputRound,
+                            )?,
+                            fc2: BiasedWeight::take(
+                                catalog,
+                                &format!("{p}.mlp.linear_fc2"),
+                                [hidden, mlp],
+                                &[hidden_usize, mlp_usize],
+                                LinearBiasMode::BeforeOutputRound,
+                            )?,
+                        });
+                    }
+                    let merger = MergerWeights {
+                        norm: AffineWeights::take(catalog, "model.visual.merger.norm", hidden)?,
+                        fc1: BiasedWeight::take(
                             catalog,
-                            &format!("{p}.attn.qkv"),
-                            [3 * hidden, hidden],
-                            &[3 * hidden_usize, hidden_usize],
+                            "model.visual.merger.linear_fc1",
+                            [geometry.spec.merger_fc1, geometry.spec.merger_fc1],
+                            &[fc1_usize, fc1_usize],
                             LinearBiasMode::BeforeOutputRound,
-                        )?),
-                        projection: BiasedWeight::take(
+                        )?,
+                        fc2: BiasedWeight::take(
                             catalog,
-                            &format!("{p}.attn.proj"),
+                            "model.visual.merger.linear_fc2",
+                            [geometry.output(), geometry.spec.merger_fc1],
+                            &[output_usize, fc1_usize],
+                            LinearBiasMode::BeforeOutputRound,
+                        )?,
+                    };
+                    let deepstack = (0..vision.deepstack.len())
+                        .map(|k| {
+                            let p = format!("model.visual.deepstack_merger_list.{k}");
+                            Ok(MergerWeights {
+                                norm: AffineWeights::take(
+                                    catalog,
+                                    &format!("{p}.norm"),
+                                    geometry.spec.merger_fc1,
+                                )?,
+                                fc1: BiasedWeight::take(
+                                    catalog,
+                                    &format!("{p}.linear_fc1"),
+                                    [geometry.spec.merger_fc1, geometry.spec.merger_fc1],
+                                    &[fc1_usize, fc1_usize],
+                                    LinearBiasMode::BeforeOutputRound,
+                                )?,
+                                fc2: BiasedWeight::take(
+                                    catalog,
+                                    &format!("{p}.linear_fc2"),
+                                    [geometry.output(), geometry.spec.merger_fc1],
+                                    &[output_usize, fc1_usize],
+                                    LinearBiasMode::BeforeOutputRound,
+                                )?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let expected = 2 + 1 + 6 + depth as usize * 12 + 6 * deepstack.len();
+                    (
+                        patch, position, None, blocks, None, merger, deepstack, expected,
+                    )
+                }
+                Architecture::MiniCpmV47 => {
+                    let patch = BiasedWeight::patch(
+                        catalog,
+                        "model.vision_tower.embeddings.patch_embedding",
+                        [hidden, geometry.patch],
+                        &patch_shape,
+                    )?;
+                    let position = take(
+                        catalog,
+                        "model.vision_tower.embeddings.position_embedding.weight",
+                        &[position_rows, hidden_usize],
+                    )?;
+                    let post_norm = Some(AffineWeights::take(
+                        catalog,
+                        "model.vision_tower.post_layernorm",
+                        hidden,
+                    )?);
+                    let projection = |catalog: &mut WeightCatalog,
+                                      prefix: &str,
+                                      name: &str|
+                     -> Result<BiasedWeight> {
+                        BiasedWeight::take(
+                            catalog,
+                            &format!("{prefix}.self_attn.{name}_proj"),
                             [hidden, hidden],
                             &[hidden_usize, hidden_usize],
                             LinearBiasMode::BeforeOutputRound,
-                        )?,
-                        norm2: AffineWeights::take(catalog, &format!("{p}.norm2"), hidden)?,
-                        fc1: BiasedWeight::take(
-                            catalog,
-                            &format!("{p}.mlp.linear_fc1"),
-                            [mlp, hidden],
-                            &[mlp_usize, hidden_usize],
-                            LinearBiasMode::BeforeOutputRound,
-                        )?,
-                        fc2: BiasedWeight::take(
-                            catalog,
-                            &format!("{p}.mlp.linear_fc2"),
-                            [hidden, mlp],
-                            &[hidden_usize, mlp_usize],
-                            LinearBiasMode::BeforeOutputRound,
-                        )?,
-                    });
-                }
-                let merger = MergerWeights {
-                    norm: AffineWeights::take(catalog, "model.visual.merger.norm", hidden)?,
-                    fc1: BiasedWeight::take(
-                        catalog,
-                        "model.visual.merger.linear_fc1",
-                        [geometry.spec.merger_fc1, geometry.spec.merger_fc1],
-                        &[fc1_usize, fc1_usize],
-                        LinearBiasMode::BeforeOutputRound,
-                    )?,
-                    fc2: BiasedWeight::take(
-                        catalog,
-                        "model.visual.merger.linear_fc2",
-                        [geometry.output(), geometry.spec.merger_fc1],
-                        &[output_usize, fc1_usize],
-                        LinearBiasMode::BeforeOutputRound,
-                    )?,
-                };
-                (
-                    patch,
-                    position,
-                    None,
-                    blocks,
-                    None,
-                    merger,
-                    2 + 1 + 6 + depth as usize * 12,
-                )
-            }
-            Architecture::MiniCpmV47 => {
-                let patch = BiasedWeight::patch(
-                    catalog,
-                    "model.vision_tower.embeddings.patch_embedding",
-                    [hidden, geometry.patch],
-                    &patch_shape,
-                )?;
-                let position = take(
-                    catalog,
-                    "model.vision_tower.embeddings.position_embedding.weight",
-                    &[position_rows, hidden_usize],
-                )?;
-                let post_norm = Some(AffineWeights::take(
-                    catalog,
-                    "model.vision_tower.post_layernorm",
-                    hidden,
-                )?);
-                let projection = |catalog: &mut WeightCatalog,
-                                  prefix: &str,
-                                  name: &str|
-                 -> Result<BiasedWeight> {
-                    BiasedWeight::take(
-                        catalog,
-                        &format!("{prefix}.self_attn.{name}_proj"),
-                        [hidden, hidden],
-                        &[hidden_usize, hidden_usize],
-                        LinearBiasMode::BeforeOutputRound,
-                    )
-                };
-                let mut blocks = Vec::with_capacity(depth as usize);
-                for i in 0..depth {
-                    let p = format!("model.vision_tower.encoder.layers.{i}");
-                    blocks.push(BlockWeights {
+                        )
+                    };
+                    let mut blocks = Vec::with_capacity(depth as usize);
+                    for i in 0..depth {
+                        let p = format!("model.vision_tower.encoder.layers.{i}");
+                        blocks.push(BlockWeights {
+                            norm1: AffineWeights::take(
+                                catalog,
+                                &format!("{p}.layer_norm1"),
+                                hidden,
+                            )?,
+                            qkv: QkvWeights::Split(Box::new(QkvSplit {
+                                q: projection(catalog, &p, "q")?,
+                                k: projection(catalog, &p, "k")?,
+                                v: projection(catalog, &p, "v")?,
+                            })),
+                            projection: projection(catalog, &p, "out")?,
+                            norm2: AffineWeights::take(
+                                catalog,
+                                &format!("{p}.layer_norm2"),
+                                hidden,
+                            )?,
+                            fc1: BiasedWeight::take(
+                                catalog,
+                                &format!("{p}.mlp.fc1"),
+                                [mlp, hidden],
+                                &[mlp_usize, hidden_usize],
+                                LinearBiasMode::BeforeOutputRound,
+                            )?,
+                            fc2: BiasedWeight::take(
+                                catalog,
+                                &format!("{p}.mlp.fc2"),
+                                [hidden, mlp],
+                                &[hidden_usize, mlp_usize],
+                                LinearBiasMode::BeforeOutputRound,
+                            )?,
+                        });
+                    }
+                    let p = "model.vision_tower.vit_merger";
+                    let window = WindowMergerWeights {
+                        q: projection(catalog, p, "q")?,
+                        k: projection(catalog, p, "k")?,
+                        v: projection(catalog, p, "v")?,
+                        projection: projection(catalog, p, "out")?,
                         norm1: AffineWeights::take(catalog, &format!("{p}.layer_norm1"), hidden)?,
-                        qkv: QkvWeights::Split(Box::new(QkvSplit {
-                            q: projection(catalog, &p, "q")?,
-                            k: projection(catalog, &p, "k")?,
-                            v: projection(catalog, &p, "v")?,
-                        })),
-                        projection: projection(catalog, &p, "out")?,
-                        norm2: AffineWeights::take(catalog, &format!("{p}.layer_norm2"), hidden)?,
+                        pre_norm: AffineWeights::take(
+                            catalog,
+                            &format!("{p}.pre_norm"),
+                            geometry.spec.merger_fc1,
+                        )?,
                         fc1: BiasedWeight::take(
                             catalog,
-                            &format!("{p}.mlp.fc1"),
-                            [mlp, hidden],
-                            &[mlp_usize, hidden_usize],
+                            &format!("{p}.linear_1"),
+                            [merge * merge * mlp, geometry.spec.merger_fc1],
+                            &[window_width, fc1_usize],
                             LinearBiasMode::BeforeOutputRound,
                         )?,
                         fc2: BiasedWeight::take(
                             catalog,
-                            &format!("{p}.mlp.fc2"),
-                            [hidden, mlp],
-                            &[hidden_usize, mlp_usize],
+                            &format!("{p}.linear_2"),
+                            [hidden, merge * merge * mlp],
+                            &[hidden_usize, window_width],
                             LinearBiasMode::BeforeOutputRound,
                         )?,
-                    });
+                    };
+                    let m = "model.merger.mlp.0";
+                    let merger = MergerWeights {
+                        norm: AffineWeights::take(
+                            catalog,
+                            &format!("{m}.pre_norm"),
+                            geometry.spec.merger_fc1,
+                        )?,
+                        fc1: BiasedWeight::take(
+                            catalog,
+                            &format!("{m}.linear_1"),
+                            [geometry.spec.merger_fc1, geometry.spec.merger_fc1],
+                            &[fc1_usize, fc1_usize],
+                            LinearBiasMode::BeforeOutputRound,
+                        )?,
+                        fc2: BiasedWeight::take(
+                            catalog,
+                            &format!("{m}.linear_2"),
+                            [geometry.output(), geometry.spec.merger_fc1],
+                            &[output_usize, fc1_usize],
+                            LinearBiasMode::BeforeOutputRound,
+                        )?,
+                    };
+                    let expected = 2 + 1 + 2 + depth as usize * 16 + 16 + 6;
+                    (
+                        patch,
+                        position,
+                        post_norm,
+                        blocks,
+                        Some(window),
+                        merger,
+                        Vec::new(),
+                        expected,
+                    )
                 }
-                let p = "model.vision_tower.vit_merger";
-                let window = WindowMergerWeights {
-                    q: projection(catalog, p, "q")?,
-                    k: projection(catalog, p, "k")?,
-                    v: projection(catalog, p, "v")?,
-                    projection: projection(catalog, p, "out")?,
-                    norm1: AffineWeights::take(catalog, &format!("{p}.layer_norm1"), hidden)?,
-                    pre_norm: AffineWeights::take(
-                        catalog,
-                        &format!("{p}.pre_norm"),
-                        geometry.spec.merger_fc1,
-                    )?,
-                    fc1: BiasedWeight::take(
-                        catalog,
-                        &format!("{p}.linear_1"),
-                        [merge * merge * mlp, geometry.spec.merger_fc1],
-                        &[window_width, fc1_usize],
-                        LinearBiasMode::BeforeOutputRound,
-                    )?,
-                    fc2: BiasedWeight::take(
-                        catalog,
-                        &format!("{p}.linear_2"),
-                        [hidden, merge * merge * mlp],
-                        &[hidden_usize, window_width],
-                        LinearBiasMode::BeforeOutputRound,
-                    )?,
-                };
-                let m = "model.merger.mlp.0";
-                let merger = MergerWeights {
-                    norm: AffineWeights::take(
-                        catalog,
-                        &format!("{m}.pre_norm"),
-                        geometry.spec.merger_fc1,
-                    )?,
-                    fc1: BiasedWeight::take(
-                        catalog,
-                        &format!("{m}.linear_1"),
-                        [geometry.spec.merger_fc1, geometry.spec.merger_fc1],
-                        &[fc1_usize, fc1_usize],
-                        LinearBiasMode::BeforeOutputRound,
-                    )?,
-                    fc2: BiasedWeight::take(
-                        catalog,
-                        &format!("{m}.linear_2"),
-                        [geometry.output(), geometry.spec.merger_fc1],
-                        &[output_usize, fc1_usize],
-                        LinearBiasMode::BeforeOutputRound,
-                    )?,
-                };
-                let expected = 2 + 1 + 2 + depth as usize * 16 + 16 + 6;
-                (
-                    patch,
-                    position,
-                    post_norm,
-                    blocks,
-                    Some(window),
-                    merger,
-                    expected,
-                )
-            }
-            Architecture::Llama
-            | Architecture::Qwen3
-            | Architecture::Flint
-            | Architecture::Glm5Next
-            | Architecture::LoopVl
-            | Architecture::Gemma4
-            | Architecture::EmbeddingGemma2
-            | Architecture::Clover
-            | Architecture::DiffusionGemma => {
-                bail!("vision configuration requires a multimodal architecture")
-            }
-            Architecture::DeepseekV41 => {
-                bail!("DeepSeek-V4.1 vision execution is not bound yet")
-            }
-        };
+                Architecture::Llama
+                | Architecture::Qwen3
+                | Architecture::Flint
+                | Architecture::Glm5Next
+                | Architecture::LoopVl
+                | Architecture::Gemma4
+                | Architecture::EmbeddingGemma2
+                | Architecture::Clover
+                | Architecture::DiffusionGemma => {
+                    bail!("vision configuration requires a multimodal architecture")
+                }
+                Architecture::DeepseekV41 => {
+                    bail!("DeepSeek-V4.1 vision execution is not bound yet")
+                }
+            };
         ensure!(
             before.checked_sub(catalog.tensors.len()) == Some(expected),
             "incomplete vision weight binding"
@@ -1092,6 +1133,7 @@ impl VisionWeights {
             blocks,
             window,
             merger,
+            deepstack,
         })
     }
 }
@@ -1214,6 +1256,8 @@ pub(super) struct LayerNormRequest {
     attention: VisionAttnPlan,
     down: Option<DownTower>,
     merger: VisionMergerPlan,
+    /// One plan and `[features, output]` buffer per deepstack tap.
+    deepstack: Vec<(VisionMergerPlan, CudaSlice<bf16>)>,
 }
 
 /// Stages that exist only when an insert merger divides the tower in two row extents.
@@ -1363,7 +1407,7 @@ fn tower_bytes(geometry: &VisionGeometry, packings: &VisionPackings) -> Result<(
             .checked_mul(hidden * 2)
             .context("insert buffer overflow")?,
         output_rows
-            .checked_mul(output * 2)
+            .checked_mul(output * 2 * (1 + geometry.deepstack.map_or(0, |taps| taps.len())))
             .context("merger output overflow")?,
         packing
             .images()
@@ -1454,6 +1498,19 @@ struct BlockRun<'a> {
 }
 
 impl LayerNormTower {
+    /// Moves every deepstack tap one encoder block later.
+    #[cfg(test)]
+    pub(super) fn shift_deepstack_taps(&mut self) -> Result<()> {
+        let taps = self
+            .geometry
+            .deepstack
+            .as_mut()
+            .context("tower has no deepstack taps")?;
+        for tap in taps {
+            *tap += 1;
+        }
+        Ok(())
+    }
     pub(super) fn request_bytes(
         model: &ModelSpec,
         input: &MultimodalInput<'_>,
@@ -1645,6 +1702,40 @@ impl LayerNormTower {
             self.common.clone(),
             blas,
         )?;
+        ensure!(
+            down.is_none() || self.weights.deepstack.is_empty(),
+            "deepstack taps with an insert merger are not bound"
+        );
+        let grouped = crate::backend::cuda::vision::VisionSpec {
+            merger_norm: crate::backend::cuda::vision::MergerNorm::Grouped,
+            ..spec
+        };
+        let deepstack = self
+            .weights
+            .deepstack
+            .iter()
+            .map(|m| {
+                let out = s.alloc_zeros(
+                    tower_rows as usize / (merge * merge) as usize * output as usize,
+                )?;
+                let plan = VisionMergerOps::prepare(
+                    &grouped,
+                    VisionMergerBindings {
+                        x: stage_view(&prefix.hidden, s, [tower_rows, hidden])?,
+                        norm_w: dense(&m.norm.weight, s, [spec.merger_fc1])?,
+                        norm_b: dense(&m.norm.bias, s, [spec.merger_fc1])?,
+                        fc1_w: dense(&m.fc1.weight, s, m.fc1.shape)?,
+                        fc1_b: dense(&m.fc1.bias, s, [spec.merger_fc1])?,
+                        fc2_w: dense(&m.fc2.weight, s, m.fc2.shape)?,
+                        fc2_b: dense(&m.fc2.bias, s, [output])?,
+                        out: TensorMut(dense(&out, s, [tower_rows / (merge * merge), output])?),
+                    },
+                    self.common.clone(),
+                    blas,
+                )?;
+                Ok((plan, out))
+            })
+            .collect::<Result<Vec<_>>>()?;
         s.synchronize()?;
         eprintln!(
             "{}",
@@ -1669,6 +1760,7 @@ impl LayerNormTower {
             attention,
             down,
             merger,
+            deepstack,
         })
     }
 
@@ -1758,6 +1850,24 @@ impl LayerNormTower {
                     },
                     &mut trace,
                 )?;
+                if let Some(k) = geometry
+                    .deepstack
+                    .and_then(|taps| taps.iter().position(|&tap| tap as usize == index))
+                {
+                    let (plan, out) = request
+                        .deepstack
+                        .get(k)
+                        .context("deepstack merger missing")?;
+                    VisionMergerOps::run(plan, stream, blas, scratch())?;
+                    record(
+                        &mut trace,
+                        stream,
+                        &format!("deepstack_{k}_out"),
+                        out,
+                        geometry.output(),
+                        rows / (spec.merge * spec.merge),
+                    )?;
+                }
                 if Some(index as u32) == geometry.insert_layer {
                     let insert = u32::try_from(index)?;
                     record(
@@ -1830,7 +1940,12 @@ impl LayerNormTower {
         let synchronized = stream.synchronize();
         launched?;
         synchronized?;
-        EncodedImages::new(request.prefix.positions, request.features, self.io.clone())
+        let encoded =
+            EncodedImages::new(request.prefix.positions, request.features, self.io.clone())?;
+        #[cfg(test)]
+        let encoded =
+            encoded.with_deepstack(request.deepstack.into_iter().map(|(_, out)| out).collect())?;
+        Ok(encoded)
     }
 
     fn run_block(
@@ -2242,7 +2357,7 @@ impl LayerNormTower {
             .context("vision configuration missing")?;
         let s = &device.stream;
         let (indices, bilinear) = match self.model.architecture {
-            Architecture::Qwen35Text => {
+            Architecture::Qwen35Text | Architecture::Qwen3Vl => {
                 let tables =
                     VisionPositions::new(vision, self.model.architecture, input.grids, rows)?;
                 let indices: Vec<_> = tables.bilinear_indices.into_iter().flatten().collect();
@@ -2307,7 +2422,7 @@ impl LayerNormTower {
         let packed = dense(&request.packed, stream, [rows, geometry.patch])?;
         let launched = (|| -> Result<()> {
             match self.model.architecture {
-                Architecture::Qwen35Text => {
+                Architecture::Qwen35Text | Architecture::Qwen3Vl => {
                     self.io.cast_patches(
                         stream,
                         dense(&request.pixels, stream, [rows, geometry.patch])?,
@@ -3037,6 +3152,9 @@ impl AxialTower {
 pub(super) struct EncodedImages {
     pub(super) positions: PositionPlan,
     pub(super) features: CudaSlice<bf16>,
+    /// Deepstack merger outputs in tap order, each shaped like `features`; empty without deepstack.
+    #[cfg(test)]
+    pub(super) deepstack: Vec<CudaSlice<bf16>>,
     io: Arc<VisionIo>,
 }
 impl EncodedImages {
@@ -3058,8 +3176,20 @@ impl EncodedImages {
         Ok(Self {
             positions,
             features,
+            #[cfg(test)]
+            deepstack: Vec::new(),
             io,
         })
+    }
+    /// Attaches the completed deepstack merger outputs of this request, each shaped like `features`.
+    #[cfg(test)]
+    pub(super) fn with_deepstack(mut self, deepstack: Vec<CudaSlice<bf16>>) -> Result<Self> {
+        ensure!(
+            deepstack.iter().all(|f| f.len() == self.features.len()),
+            "deepstack feature count mismatch"
+        );
+        self.deepstack = deepstack;
+        Ok(self)
     }
     pub(super) fn splice(
         &self,
@@ -3127,6 +3257,7 @@ mod tests {
             mlp: 4304,
             insert_scale: 1,
             insert_layer: None,
+            deepstack: None,
         }
     }
     #[test]
@@ -3148,6 +3279,14 @@ mod tests {
             + scratch;
         assert_eq!(bytes, expected);
         assert!(scratch >= VisionMergerOps::workspace(&VisionSpec::q38(), 12)?.bytes as usize);
+        let deepstack = VisionGeometry {
+            deepstack: Some([8, 16, 24]),
+            ..q38_geometry()
+        };
+        assert_eq!(
+            tower_bytes(&deepstack, &packings)?,
+            (expected + 3 * 3 * 5120 * 2, scratch)
+        );
         let root =
             serde_json::from_str(include_str!("../../../tests/data/gemma4-e2b-config.json"))?;
         let model = ModelSpec::gemma4(&root, &serde_json::json!({"eos_token_id":1}))?;

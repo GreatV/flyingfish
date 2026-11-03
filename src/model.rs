@@ -512,6 +512,9 @@ pub fn layer_program(
             LayerStage::Hc(HcStage::Post),
             LayerStage::Common(O::NextNorm),
         ])),
+        crate::model_spec::Architecture::Qwen3Vl => {
+            bail!("Qwen3-VL runs only as the MiniMax-H3 conditioner")
+        }
         crate::model_spec::Architecture::DiffusionGemma => {
             bail!("DiffusionGemma layer program is not bound yet")
         }

@@ -71,6 +71,9 @@ impl RowWorkSpec {
             .checked_mul(spec.head_dim as usize)
             .context("KV width overflow")?;
         let (projection, mixer, extra_mixer, ab) = match spec.architecture {
+            Architecture::Qwen3Vl => {
+                anyhow::bail!("Qwen3-VL runs only as the MiniMax-H3 conditioner")
+            }
             Architecture::Clover => {
                 intermediate = 0;
                 (0, 0, false, 0)

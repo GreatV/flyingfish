@@ -469,3 +469,214 @@ fn minimax_h3_adaln_plan_addresses_every_row_pair() -> Result<()> {
     }
     Ok(())
 }
+
+struct ConditionerCell {
+    tokens: Vec<u32>,
+    grids: Vec<flyingfish::vision_input::ImageGrid>,
+    pixel_values: Vec<f32>,
+}
+
+/// Packs the u8 keyframes `k*.pixels [1, 3, 1, h, w]` of `runs` through the published processor configuration.
+fn conditioner_pixels(
+    processor: &flyingfish::serve::image::Processor,
+    frames: &[(PathBuf, usize)],
+) -> Result<(Vec<flyingfish::vision_input::ImageGrid>, Vec<f32>)> {
+    let (mut grids, mut values) = (Vec::new(), Vec::new());
+    for (run, index) in frames {
+        let bytes = fs::read(run.join("keyframes.safetensors"))?;
+        let file = SafeTensors::deserialize(&bytes)?;
+        let name = format!("k{index}.pixels");
+        let view = file
+            .tensor(&name)
+            .with_context(|| format!("capture lacks {name}"))?;
+        ensure!(view.dtype() == Dtype::U8, "{name} dtype {:?}", view.dtype());
+        let &[1, 3, 1, height, width] = view.shape() else {
+            anyhow::bail!("{name} shape {:?}", view.shape());
+        };
+        let plane = height * width;
+        let chw = view.data();
+        let image = flyingfish::serve::image::RgbImage {
+            width,
+            height,
+            pixels: (0..plane)
+                .flat_map(|p| (0..3).map(move |c| chw[c * plane + p]))
+                .collect(),
+        };
+        let packed = processor.prepare_rgb(&image)?;
+        grids.extend(packed.grids);
+        values.extend(packed.pixel_values);
+    }
+    Ok((grids, values))
+}
+
+fn check_conditioner_cell(
+    spec: &flyingfish::model_spec::ModelSpec,
+    cell: &ConditionerCell,
+    reference: &SafeTensors<'_>,
+) -> Result<()> {
+    use flyingfish::vision_input::{MultimodalInput, VisionPositions};
+    let vision = spec
+        .vision
+        .as_ref()
+        .context("vision configuration missing")?;
+    let section = vision.mrope_section.context("mRoPE section missing")?;
+    let rows = cell.tokens.len();
+    let modality: Vec<u8> = cell
+        .tokens
+        .iter()
+        .map(|&id| u8::from(id == vision.image_token))
+        .collect();
+    let plan = MultimodalInput {
+        input_ids: &cell.tokens,
+        modality_ids: &modality,
+        pixel_values: &cell.pixel_values,
+        grids: &cell.grids,
+        audio: &[],
+    }
+    .validate(spec, rows)?;
+    let axes = plan.chunk(0..rows)?;
+    let positions = tensor(reference, "rope_position_ids", Dtype::I64, le_i64)?;
+    for (axis, values) in axes.iter().enumerate() {
+        ensure!(
+            values
+                .iter()
+                .map(|&v| i64::from(v))
+                .eq(positions[axis * rows..(axis + 1) * rows].iter().copied()),
+            "rope position axis {axis} differs"
+        );
+    }
+    let half = spec.head_dim as usize / 2;
+    let table =
+        flyingfish::minimax_h3::mrope_table(&plan, section, spec.rope_theta, spec.head_dim)?;
+    let mut worst = 0f32;
+    for (name, offset) in [("text_cos", 0), ("text_sin", half)] {
+        let expected = tensor(reference, name, Dtype::F32, le_f32)?;
+        ensure!(expected.len() == rows * 2 * half, "{name} extent");
+        for row in 0..rows {
+            for j in 0..2 * half {
+                let got = table[row * 2 * half + offset + j % half];
+                worst = worst.max((got - expected[row * 2 * half + j]).abs());
+            }
+        }
+    }
+    ensure!(worst <= 4e-6, "mRoPE table max_abs {worst:e} above 4e-6");
+    let patches: usize = cell.grids.iter().map(|g| (g.t * g.h * g.w) as usize).sum();
+    let positions = VisionPositions::new(vision, spec.architecture, &cell.grids, patches)?;
+    let coordinates = tensor(reference, "vision_position_ids", Dtype::I64, le_i64)?;
+    ensure!(
+        positions
+            .coordinates
+            .iter()
+            .flat_map(|c| c.map(i64::from))
+            .eq(coordinates.iter().copied()),
+        "vision coordinates differ"
+    );
+    let indices = tensor(reference, "interp_indices", Dtype::I64, le_i64)?;
+    let weights = tensor(reference, "interp_weights", Dtype::F32, le_f32)?;
+    for k in 0..4 {
+        ensure!(
+            positions.bilinear_indices[k]
+                .iter()
+                .enumerate()
+                .all(|(n, &i)| i64::from(i) == indices[n * 4 + k]),
+            "interpolation corner {k} indices differ"
+        );
+        ensure!(
+            positions.bilinear_weights[k]
+                .iter()
+                .enumerate()
+                .all(|(n, w)| w.to_bits() == weights[n * 4 + k].to_bits()),
+            "interpolation corner {k} weights differ"
+        );
+    }
+    println!("H3_N6A_TABLE rows={rows} patches={patches} mrope_max_abs={worst:e}");
+    Ok(())
+}
+
+/// Qwen3-VL conditioner inputs on the CPU: processor pixels bit-equal to the captured `pixel_values`; mRoPE
+/// positions, vision coordinates and bilinear tables equal to the model-definition dump; the mRoPE table within 4e-6.
+#[test]
+#[ignore = "CPU-only N6a gate; set FF_H3_TEXT_ENCODER, FF_H3_S0 (Stage 0 run root) and FF_H3_N6A_REF"]
+fn minimax_h3_conditioner_inputs_equal_the_reference() -> Result<()> {
+    let encoder =
+        PathBuf::from(env::var_os("FF_H3_TEXT_ENCODER").context("FF_H3_TEXT_ENCODER missing")?);
+    let s0 = PathBuf::from(env::var_os("FF_H3_S0").context("FF_H3_S0 missing")?);
+    let dumps = PathBuf::from(env::var_os("FF_H3_N6A_REF").context("FF_H3_N6A_REF missing")?);
+    let spec = flyingfish::model_spec::ModelSpec::read(&encoder)?;
+    ensure!(
+        spec.architecture == flyingfish::model_spec::Architecture::Qwen3Vl,
+        "text encoder parsed as {:?}",
+        spec.architecture
+    );
+    let processor = flyingfish::serve::image::Processor::load(&encoder, None)?
+        .context("text encoder has no processor")?;
+    let cells = [
+        ("A", "A-bf16", vec![("A-bf16", 0)], vec!["A-bf16"]),
+        (
+            "D",
+            "D-bf16",
+            vec![("D-bf16", 0), ("D-bf16", 1)],
+            vec!["D-bf16"],
+        ),
+        (
+            "E",
+            "D-bf16",
+            vec![("A-bf16", 0), ("B-bf16", 0)],
+            vec!["A-bf16", "B-bf16"],
+        ),
+    ];
+    for (name, tokens_from, frames, captured) in cells {
+        let bytes = fs::read(s0.join(tokens_from).join("text.safetensors"))?;
+        let text = SafeTensors::deserialize(&bytes)?;
+        let tokens = tensor(&text, "token_ids", Dtype::I64, le_i64)?
+            .into_iter()
+            .map(u32::try_from)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let frames: Vec<_> = frames
+            .into_iter()
+            .map(|(run, k)| (s0.join(run), k))
+            .collect();
+        let (grids, pixel_values) = conditioner_pixels(&processor, &frames)?;
+        let mut expected = Vec::new();
+        for run in captured {
+            let bytes = fs::read(s0.join(run).join("text.safetensors"))?;
+            expected.extend(f32_bits(&tensor(
+                &SafeTensors::deserialize(&bytes)?,
+                "pixel_values",
+                Dtype::F32,
+                le_f32,
+            )?));
+        }
+        ensure!(
+            f32_bits(&pixel_values) == expected,
+            "cell {name}: pixel_values differ from the capture"
+        );
+        let dump = fs::read(dumps.join(format!("{name}.safetensors")))?;
+        let reference = SafeTensors::deserialize(&dump)?;
+        let cell = ConditionerCell {
+            tokens,
+            grids,
+            pixel_values,
+        };
+        check_conditioner_cell(&spec, &cell, &reference).with_context(|| format!("cell {name}"))?;
+        let swapped = ConditionerCell {
+            grids: cell
+                .grids
+                .iter()
+                .map(|g| flyingfish::vision_input::ImageGrid {
+                    t: g.t,
+                    h: g.w,
+                    w: g.h,
+                })
+                .collect(),
+            ..cell
+        };
+        ensure!(
+            check_conditioner_cell(&spec, &swapped, &reference).is_err(),
+            "cell {name}: h/w swapped grid control matched the reference"
+        );
+        println!("H3_N6A_CELL cell={name} PASS");
+    }
+    println!("H3_N6A_GATE PASS cells=3 control=FAIL_AS_REQUIRED");
+    Ok(())
+}
