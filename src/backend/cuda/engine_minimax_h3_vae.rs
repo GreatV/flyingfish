@@ -5,7 +5,7 @@ use crate::backend::cuda::{
     blas::Blas,
     contracts::TensorMut,
     cubin,
-    flash::Flash,
+    flash::{Flash, Score},
     linear::LinearBiasMode,
     ops::{self, flat},
     verification::Shape,
@@ -718,7 +718,18 @@ impl TileWork {
             patch_rows: rows(tokens * spec.patch_width())?,
             rope: s.clone_htod(&rope_table(spec, (frames, height, width)))?,
             ones: s.clone_htod(&vec![bf16::ONE; spec.head_dim])?,
-            flash: Flash::new(s.clone(), tokens, spec.heads, spec.heads, spec.head_dim)?,
+            flash: Flash::new_with_score(
+                s.clone(),
+                tokens,
+                spec.heads,
+                spec.heads,
+                spec.head_dim,
+                Score {
+                    scale: (spec.head_dim as f32).sqrt().recip(),
+                    window_left: None,
+                },
+                tokens,
+            )?,
             spec: spec.clone(),
         })
     }
