@@ -1242,9 +1242,6 @@ fn cast_rows(
     Ok(())
 }
 
-/// The transformer over one request layout: F32 patch and output projections, BF16 text embedder, norms, refiner
-/// blocks and LoRA factors resident; the 50 transformer blocks' matrices placed by `DensePlacement` from the sensed
-/// VRAM and host budgets (resident, or two device slots fed from pinned host memory or the disk tier).
 /// Dense streaming of `layers` (per-layer matrix bytes, `largest` matrix) beside `owned` resident bytes: placement
 /// derived from free device memory and host RAM, or forced streamed / disk-only; host-tier copies are filled from
 /// `base` in `roles` order before the first `begin`.
@@ -1318,6 +1315,9 @@ fn place_layers(
     })
 }
 
+/// The transformer over one request layout: F32 patch and output projections, BF16 text embedder, norms, refiner
+/// blocks and LoRA factors resident; the 50 transformer blocks' matrices placed by `DensePlacement` from the sensed
+/// VRAM and host budgets (resident, or two device slots fed from pinned host memory or the disk tier).
 pub(crate) struct Dit {
     ranges: Ranges,
     proj_in: [CudaSlice<f32>; 2],
