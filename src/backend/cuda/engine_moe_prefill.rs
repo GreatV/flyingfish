@@ -3108,23 +3108,28 @@ mod tests {
         };
         let device = Device::new(0)?;
         let stream = &device.stream;
+        let count = usize::from(u16::MAX) + 1;
         let domain: Vec<_> = (0..=u16::MAX)
-            .flat_map(|bits| [bf16::from_bits(bits), bf16::ONE])
+            .map(bf16::from_bits)
+            .chain(std::iter::repeat_n(bf16::ONE, count))
             .collect();
         let domain_device = stream.clone_htod(&domain)?;
-        let silu_device = stream.alloc_zeros::<bf16>(usize::from(u16::MAX) + 1)?;
+        let silu_device = stream.alloc_zeros::<bf16>(count)?;
         let silu =
             crate::backend::cuda::cubin::module(&device.ctx, "act")?.load_function("silu_mul")?;
-        // SAFETY: the dense [65536,2] input and [65536,1] output cover the BF16 domain.
+        let domain_ptr = domain_device.device_ptr(stream).0;
+        let silu_ptr = silu_device.device_ptr(stream).0;
+        let silu_cfg = crate::backend::cuda::ops::silu_mul_grid(1, count, domain_ptr, silu_ptr)?;
+        // SAFETY: the dense [1, 131072] input and [1, 65536] output cover the BF16 domain.
         unsafe {
             stream
                 .launch_builder(&silu)
-                .arg(&domain_device.device_ptr(stream).0)
-                .arg(&silu_device.device_ptr(stream).0)
-                .arg(&65536i32)
+                .arg(&domain_ptr)
+                .arg(&silu_ptr)
                 .arg(&1i32)
+                .arg(&(count as i32))
                 .arg(&0i32)
-                .launch(crate::backend::cuda::ops::grid(256, 256))?;
+                .launch(silu_cfg)?;
         }
         let silu_map = stream.clone_dtoh(&silu_device)?;
         let silu_mismatches = silu_map

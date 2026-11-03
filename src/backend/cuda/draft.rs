@@ -1271,6 +1271,12 @@ impl Draft {
                 2 * f,
                 h,
             )?;
+            let act_cfg = super::ops::silu_mul_grid(
+                block_rows,
+                f,
+                self.gu.device_ptr(s).0,
+                self.act.device_ptr(s).0,
+            )?;
             unsafe {
                 s.launch_builder(&ops.act)
                     .arg(&self.gu)
@@ -1278,7 +1284,7 @@ impl Draft {
                     .arg(&(block_rows as i32))
                     .arg(&(f as i32))
                     .arg(&(ops.swiglu_rounding() as i32))
-                    .launch(flat(block_rows * f))?;
+                    .launch(act_cfg)?;
             }
             blas.linear(
                 &layer.block.down,

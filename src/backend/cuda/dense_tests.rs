@@ -1906,11 +1906,13 @@ fn rope_gate(s: &Arc<CudaStream>, ops: &ops::Ops, gate: &mut Gate) -> Result<()>
 }
 
 fn activation_sample(s: &Arc<CudaStream>, ops: &ops::Ops, gate: &mut Gate) -> Result<()> {
+    use crate::backend::gpu::DevicePtr;
     let dim = 6144usize;
     for rows in [1usize, 3, 16, 17, 33] {
         let input = pattern(rows * 2 * dim, 5);
         let x = s.clone_htod(&input)?;
         let mut y = s.alloc_zeros::<bf16>(rows * dim)?;
+        let cfg = ops::silu_mul_grid(rows, dim, x.device_ptr(s).0, y.device_ptr(s).0)?;
         unsafe {
             s.launch_builder(&ops.act)
                 .arg(&x)
@@ -1918,7 +1920,7 @@ fn activation_sample(s: &Arc<CudaStream>, ops: &ops::Ops, gate: &mut Gate) -> Re
                 .arg(&(rows as i32))
                 .arg(&(dim as i32))
                 .arg(&0i32)
-                .launch(ops::flat(rows * dim))?;
+                .launch(cfg)?;
         }
         let expected: Vec<_> = (0..rows * dim)
             .map(|i| {

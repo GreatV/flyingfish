@@ -210,6 +210,10 @@ impl MoePrefillFinish {
             "moe prefill finish shared_down must be dense [hidden, shared_inter] (shape {:?})",
             self.shared_down.shape
         );
+        ensure!(
+            hidden.is_multiple_of(2) && shared_inter.is_multiple_of(8),
+            "moe prefill finish hidden {hidden} must be even and shared inter {shared_inter} must be a multiple of 8"
+        );
         if let Some(gate) = &self.shared_expert_gate {
             gate.validate()?;
             ensure!(
@@ -382,8 +386,8 @@ impl<W: Copy + 'static> MoePrefillContribute<'_, W> {
             "moe prefill top_k {top_k} outside [1,32]"
         );
         ensure!(
-            hidden.is_multiple_of(2) && inter.is_multiple_of(2) && shared_inter.is_multiple_of(2),
-            "moe prefill hidden {hidden}, inter {inter}, and shared inter {shared_inter} must be even for cuBLAS BF16 alignment"
+            hidden.is_multiple_of(2) && inter.is_multiple_of(8) && shared_inter.is_multiple_of(8),
+            "moe prefill hidden {hidden} must be even and inter {inter} and shared inter {shared_inter} must be multiples of 8 for cuBLAS BF16 and vectorized silu_mul alignment"
         );
         ensure!(
             u64::from(hidden) <= i32::MAX as u64
@@ -1283,7 +1287,12 @@ impl PrefillOps {
             )?;
         }
 
-        let silu_grid = |elems: usize| grid(elems.div_ceil(BLOCK_THREADS as usize), BLOCK_THREADS);
+        let silu_cfg = crate::backend::cuda::ops::silu_mul_grid(
+            active_total as usize,
+            inter as usize,
+            h1_at,
+            act_at,
+        )?;
         unsafe {
             stream
                 .launch_builder(&self.silu)
@@ -1292,7 +1301,7 @@ impl PrefillOps {
                 .arg(&(active_total as i32))
                 .arg(&(inter as i32))
                 .arg(&fused_act_mode(self.swiglu_rounding)?)
-                .launch(silu_grid(active_total as usize * inter as usize))?;
+                .launch(silu_cfg)?;
         }
 
         // GEMM2: one problem per active expert over the expert's whole
@@ -1667,6 +1676,12 @@ impl PrefillOps {
                 self.grouped_gemm(stage, base, 2)
                     .context("moe prefill shared gate/up GEMM")?;
             }
+            let silu_cfg = crate::backend::cuda::ops::silu_mul_grid(
+                rows as usize,
+                inter as usize,
+                h1s_at,
+                act_s_at,
+            )?;
             unsafe {
                 stream
                     .launch_builder(&self.silu)
@@ -1675,10 +1690,7 @@ impl PrefillOps {
                     .arg(&(rows as i32))
                     .arg(&(inter as i32))
                     .arg(&fused_act_mode(self.swiglu_rounding)?)
-                    .launch(grid(
-                        (rows as usize * inter as usize).div_ceil(BLOCK_THREADS as usize),
-                        BLOCK_THREADS,
-                    ))?;
+                    .launch(silu_cfg)?;
             }
             stage.arrays.clear();
             stage.arrays.push(GemmShape {

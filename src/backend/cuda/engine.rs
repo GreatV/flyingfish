@@ -2,7 +2,9 @@ use super::copy;
 use super::flash::Flash;
 use crate::backend::TreeBuilder;
 use crate::backend::gpu::{CudaContext, PinnedHostSlice};
-use crate::backend::gpu::{CudaGraph, CudaSlice, CudaStream, DevicePtrMut, PushKernelArg};
+use crate::backend::gpu::{
+    CudaGraph, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, PushKernelArg,
+};
 #[cfg(feature = "cuda")]
 use crate::prefix_state::{
     PrefixBoundary, PrefixBuilder, PrefixGeometry, PrefixIdentity, PrefixRecordKind,
@@ -2736,15 +2738,23 @@ impl Engine {
                     trace_value(trace, s, "debug.gu", &w.gu, trace_rows, 2 * f)?;
                 }
             }
-            crate::backend::Operator::Activate => unsafe {
-                s.launch_builder(&self.ops.act)
-                    .arg(&w.gu)
-                    .arg(&mut w.act)
-                    .arg(&nr)
-                    .arg(&fd)
-                    .arg(&(self.ops.swiglu_rounding() as i32))
-                    .launch(flat(rows * f))?;
-            },
+            crate::backend::Operator::Activate => {
+                let cfg = super::ops::silu_mul_grid(
+                    rows,
+                    f,
+                    w.gu.device_ptr(s).0,
+                    w.act.device_ptr(s).0,
+                )?;
+                unsafe {
+                    s.launch_builder(&self.ops.act)
+                        .arg(&w.gu)
+                        .arg(&mut w.act)
+                        .arg(&nr)
+                        .arg(&fd)
+                        .arg(&(self.ops.swiglu_rounding() as i32))
+                        .launch(cfg)?;
+                }
+            }
             crate::backend::Operator::Down => {
                 self.blas
                     .linear(

@@ -6,7 +6,7 @@ use crate::backend::cuda::{
     cubin,
     flash::Flash,
     linear::LinearBiasMode,
-    ops::flat,
+    ops::{self, flat},
     verification::Shape,
 };
 use crate::backend::gpu::{
@@ -966,14 +966,17 @@ pub(crate) fn block_forward(
             },
             n,
         )?;
+        let hidden = pointer(&work.hidden, s);
+        let gated = pointer(&work.gated, s);
+        let cfg = ops::silu_mul_grid(n, f, hidden, gated)?;
         unsafe {
             s.launch_builder(&kernels.swiglu)
-                .arg(&pointer(&work.hidden, s))
-                .arg(&pointer(&work.gated, s))
+                .arg(&hidden)
+                .arg(&gated)
                 .arg(&i32::try_from(n)?)
                 .arg(&i32::try_from(f)?)
                 .arg(&3i32)
-                .launch(flat(n * f))?;
+                .launch(cfg)?;
         }
         base(
             FF_OUT,

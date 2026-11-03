@@ -11,26 +11,42 @@ __device__ __forceinline__ float gelu_tanh(float x) {
 
 extern "C" __global__ void silu_mul(const __nv_bfloat16* gu, __nv_bfloat16* y,
                                    int rows, int dim, int mode) {
-    if ((unsigned)mode > 3u) __trap();
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= rows * dim) return;
-    int row = i / dim;
-    int d = i % dim;
-    if (mode == 3) {
-      const float gate = __bfloat162float(gu[row * 2 * dim + dim + d]);
-      y[i] = __hmul(__float2bfloat16(gate / (1.0f + expf(-gate))), gu[row * 2 * dim + d]);
-      return;
+    if ((unsigned)mode > 3u || rows <= 0 || dim <= 0 || (dim & 7) != 0 ||
+        (long long)rows * dim > 2147483647LL || !gu || !y ||
+        ((reinterpret_cast<uintptr_t>(gu) | reinterpret_cast<uintptr_t>(y)) &
+         15u) != 0u) {
+        __trap();
+        return;
     }
-    float g = __bfloat162float(gu[row * 2 * dim + d]);
-    const float u = __bfloat162float(gu[row * 2 * dim + dim + d]);
-    if (mode == 2) {
-      y[i] = __hmul(__float2bfloat16(gelu_tanh(g)), gu[row * 2 * dim + dim + d]);
-    } else if (mode == 1) {
-      y[i] = __float2bfloat16(g / (1.0f + expf(-g)) * u);
-    } else {
-      const __nv_bfloat16 s = __float2bfloat16(g / (1.0f + expf(-g)));
-      y[i] = __hmul(s, gu[row * 2 * dim + dim + d]);
+    const int vec = blockIdx.x * blockDim.x + threadIdx.x;
+    const int vec_dim = dim >> 3;
+    if (vec >= rows * vec_dim) return;
+    const int row = vec / vec_dim;
+    const int vd = vec % vec_dim;
+    const uint4 gv =
+        reinterpret_cast<const uint4*>(gu)[row * 2 * vec_dim + vd];
+    const uint4 uv =
+        reinterpret_cast<const uint4*>(gu)[row * 2 * vec_dim + vec_dim + vd];
+    const __nv_bfloat16* gp = reinterpret_cast<const __nv_bfloat16*>(&gv);
+    const __nv_bfloat16* up = reinterpret_cast<const __nv_bfloat16*>(&uv);
+    uint4 yv;
+    __nv_bfloat16* yp = reinterpret_cast<__nv_bfloat16*>(&yv);
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const float g = __bfloat162float(gp[j]);
+        const float u = __bfloat162float(up[j]);
+        if (mode == 3) {
+            yp[j] = __hmul(__float2bfloat16(u / (1.0f + expf(-u))), gp[j]);
+        } else if (mode == 2) {
+            yp[j] = __hmul(__float2bfloat16(gelu_tanh(g)), up[j]);
+        } else if (mode == 1) {
+            yp[j] = __float2bfloat16(g / (1.0f + expf(-g)) * u);
+        } else {
+            const __nv_bfloat16 s = __float2bfloat16(g / (1.0f + expf(-g)));
+            yp[j] = __hmul(s, up[j]);
+        }
     }
+    reinterpret_cast<uint4*>(y)[vec] = yv;
 }
 
 // Gate and up are dense [rows,dim] regions; y is disjoint from both inputs.

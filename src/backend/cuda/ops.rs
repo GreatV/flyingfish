@@ -388,6 +388,30 @@ pub fn flat(n: usize) -> LaunchConfig {
     grid(n.div_ceil(256), 256)
 }
 
+pub(crate) fn silu_mul_grid(
+    rows: usize,
+    dim: usize,
+    gu_ptr: u64,
+    y_ptr: u64,
+) -> Result<LaunchConfig> {
+    let elems = rows
+        .checked_mul(dim)
+        .ok_or_else(|| anyhow::anyhow!("silu_mul element count overflow: rows={rows} dim={dim}"))?;
+    ensure!(
+        rows > 0
+            && dim > 0
+            && dim.is_multiple_of(8)
+            && rows <= i32::MAX as usize
+            && dim <= i32::MAX as usize
+            && elems <= i32::MAX as usize
+            && gu_ptr != 0
+            && y_ptr != 0
+            && ((gu_ptr | y_ptr) & 15) == 0,
+        "silu_mul requires positive rows, 8-element dim, and 16-byte alignment: rows={rows} dim={dim} gu={gu_ptr:#x} y={y_ptr:#x}"
+    );
+    Ok(flat(elems / 8))
+}
+
 pub(crate) fn silu_mul_split_grid(
     elems: usize,
     gate_ptr: u64,

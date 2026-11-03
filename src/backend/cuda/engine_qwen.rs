@@ -6098,28 +6098,44 @@ impl Engine {
         let q = self.qwen.as_ref().context("Q38 runtime missing")?;
         let ops = q.gemma.as_ref().context("Gemma 4 operations missing")?;
         let s = &self.device.stream;
-        let gate_ones: Vec<bf16> = gate.iter().flat_map(|&g| [g, bf16::ONE]).collect();
-        let gate_up: Vec<bf16> = gate.iter().zip(up).flat_map(|(&g, &u)| [g, u]).collect();
+        let gate_ones: Vec<bf16> = gate
+            .iter()
+            .copied()
+            .chain(std::iter::repeat_n(bf16::ONE, gate.len()))
+            .collect();
+        let gate_up: Vec<bf16> = gate.iter().chain(up).copied().collect();
         let gate_ones = s.clone_htod(&gate_ones)?;
         let gate_up = s.clone_htod(&gate_up)?;
         let mut activation = s.alloc_zeros::<bf16>(gate.len())?;
         let mut product = s.alloc_zeros::<bf16>(gate.len())?;
         let count = i32::try_from(gate.len())?;
+        let act_cfg = crate::backend::cuda::ops::silu_mul_grid(
+            1,
+            gate.len(),
+            gate_ones.device_ptr(s).0,
+            activation.device_ptr(s).0,
+        )?;
+        let prod_cfg = crate::backend::cuda::ops::silu_mul_grid(
+            1,
+            gate.len(),
+            gate_up.device_ptr(s).0,
+            product.device_ptr(s).0,
+        )?;
         unsafe {
             s.launch_builder(&ops.gated_activation)
                 .arg(&gate_ones)
                 .arg(&mut activation)
-                .arg(&count)
                 .arg(&1i32)
+                .arg(&count)
                 .arg(&2i32)
-                .launch(flat(gate.len()))?;
+                .launch(act_cfg)?;
             s.launch_builder(&ops.gated_activation)
                 .arg(&gate_up)
                 .arg(&mut product)
-                .arg(&count)
                 .arg(&1i32)
+                .arg(&count)
                 .arg(&2i32)
-                .launch(flat(gate.len()))?;
+                .launch(prod_cfg)?;
         }
         Ok((s.clone_dtoh(&activation)?, s.clone_dtoh(&product)?))
     }
@@ -6767,6 +6783,12 @@ impl Engine {
             O::Activate => {
                 if gemma {
                     let ops = q.gemma.as_ref().context("Gemma 4 operations missing")?;
+                    let cfg = crate::backend::cuda::ops::silu_mul_grid(
+                        rows,
+                        f,
+                        w.gu.device_ptr(s).0,
+                        w.act.device_ptr(s).0,
+                    )?;
                     unsafe {
                         s.launch_builder(&ops.gated_activation)
                             .arg(&w.gu)
@@ -6774,7 +6796,7 @@ impl Engine {
                             .arg(&(rows as i32))
                             .arg(&(f as i32))
                             .arg(&2i32)
-                            .launch(flat(rows * f))?;
+                            .launch(cfg)?;
                     }
                 } else {
                     let gate = heads(&w.gu, s, 0, rows, 1, f as u32)?;
@@ -6794,6 +6816,12 @@ impl Engine {
                         row[f..].fill(bf16::ONE);
                     }
                     let gate_ones = s.clone_htod(&gate_ones)?;
+                    let cfg = crate::backend::cuda::ops::silu_mul_grid(
+                        rows,
+                        f,
+                        gate_ones.device_ptr(s).0,
+                        ops.mlp_activation.device_ptr(s).0,
+                    )?;
                     let activation = &mut ops.mlp_activation;
                     unsafe {
                         s.launch_builder(&ops.gated_activation)
@@ -6802,7 +6830,7 @@ impl Engine {
                             .arg(&(rows as i32))
                             .arg(&(f as i32))
                             .arg(&2i32)
-                            .launch(flat(rows * f))?;
+                            .launch(cfg)?;
                     }
                     trace_value(
                         trace,
