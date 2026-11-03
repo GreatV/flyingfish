@@ -28,6 +28,21 @@ pub struct Music3Syn {
     silu_mul: CudaFunction,
     bias_add: CudaFunction,
     add_inplace: CudaFunction,
+    cond_sum: CudaFunction,
+    pad_rows: CudaFunction,
+    nearest_rows: CudaFunction,
+    cond_weights: CudaSlice<f32>,
+    cond_scale: f32,
+    proj_planes: [CudaSlice<f32>; 3],
+    vocoder: VocoderSetup,
+    pad_rows_n: CudaFunction,
+    snake_rows: CudaFunction,
+    scatter_add: CudaFunction,
+    tanh_fn: CudaFunction,
+    transpose_fn: CudaFunction,
+    euler_fn: CudaFunction,
+    #[cfg(test)]
+    pub(crate) vocoder_taps: std::cell::RefCell<Vec<(&'static str, Vec<f32>)>>,
 }
 
 fn f32_matrix(
@@ -82,7 +97,136 @@ impl Music3Syn {
             m.load_function(name)
                 .with_context(|| format!("loading kernel {name}"))
         };
-        Ok(Self {
+        let logits_bytes = d.stream.clone_dtoh(&weights.cond.layer_weight_logits)?;
+        let logits: Vec<f32> = logits_bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let exp_sum: f32 = logits.iter().map(|l| l.exp()).sum();
+        let softmax: Vec<f32> = logits.iter().map(|l| l.exp() / exp_sum).collect();
+        let cond_weights = d.stream.clone_htod(&softmax)?;
+        let scale_bytes = d.stream.clone_dtoh(&weights.cond.layer_scale)?;
+        let cond_scale = f32::from_le_bytes(scale_bytes[0..4].try_into()?);
+        let cond_out = spec.cond_out as usize;
+        let cond_hidden = spec.cond_hidden as usize;
+        let mut proj_planes = Vec::with_capacity(3);
+        for k in 0..3 {
+            let mut plane: CudaSlice<f32> = unsafe { d.stream.alloc(cond_out * cond_hidden)? };
+            unsafe {
+                d.stream
+                    .launch_builder(&kernel(&common, "extract_plane_f32")?)
+                    .arg(&weights.cond.proj_w)
+                    .arg(&k)
+                    .arg(&mut plane)
+                    .arg(&((cond_out * cond_hidden) as i64))
+                    .arg(&(cond_hidden as i32))
+                    .arg(&3i32)
+                    .launch(super::ops::flat(cond_out * cond_hidden))?;
+            }
+            proj_planes.push(plane);
+        }
+        let [p0, p1, p2] = proj_planes.try_into().unwrap();
+        let wn_fold = kernel(&common, "weight_norm_fold_f32")?;
+        let extract = kernel(&common, "extract_plane_f32")?;
+        let extract_t = kernel(&common, "extract_plane_transposed_f32")?;
+        let s = &d.stream;
+        let plane = |w: &CudaSlice<f32>,
+                     k: usize,
+                     rows: usize,
+                     cols: usize,
+                     kernel: i32|
+         -> Result<CudaSlice<f32>> {
+            let mut out: CudaSlice<f32> = unsafe { s.alloc(rows * cols)? };
+            unsafe {
+                s.launch_builder(&extract)
+                    .arg(w)
+                    .arg(&(k as i32))
+                    .arg(&mut out)
+                    .arg(&((rows * cols) as i64))
+                    .arg(&(cols as i32))
+                    .arg(&kernel)
+                    .launch(super::ops::flat(rows * cols))?;
+            }
+            Ok(out)
+        };
+        let _ = &extract_t;
+        let vc = &weights.vocoder;
+        let hidden = spec.decoder_hidden as usize;
+        let input_dim = spec.decoder_input as usize;
+        let conv_in_folded = fold_weight_norm(
+            s,
+            &wn_fold,
+            &vc.conv_in_g,
+            &vc.conv_in_v,
+            hidden,
+            input_dim * 7,
+        )?;
+        let conv_in_planes = (0..7)
+            .map(|k| plane(&conv_in_folded, k, hidden, input_dim, 7))
+            .collect::<Result<Vec<_>>>()?;
+        let mut blocks = Vec::with_capacity(vc.blocks.len());
+        let mut stage_in = hidden;
+        for (vb, ratio) in vc.blocks.iter().zip(&spec.upsampling) {
+            let stage_out = stage_in / 2;
+            let stride = *ratio as usize;
+            let conv_t_folded = fold_weight_norm(
+                s,
+                &wn_fold,
+                &vb.conv_t_g,
+                &vb.conv_t_v,
+                stage_in,
+                stage_out * 2 * stride,
+            )?;
+            let conv_t_planes = (0..2 * stride)
+                .map(|k| {
+                    let mut out: CudaSlice<f32> = unsafe { s.alloc(stage_out * stage_in)? };
+                    unsafe {
+                        s.launch_builder(&extract_t)
+                            .arg(&conv_t_folded)
+                            .arg(&(k as i32))
+                            .arg(&mut out)
+                            .arg(&((stage_out * stage_in) as i64))
+                            .arg(&(stage_in as i32))
+                            .arg(&(stage_out as i32))
+                            .arg(&((2 * stride) as i32))
+                            .launch(super::ops::flat(stage_out * stage_in))?;
+                    }
+                    Ok(out)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut units = Vec::with_capacity(vb.units.len());
+            for u in &vb.units {
+                let c1_folded =
+                    fold_weight_norm(s, &wn_fold, &u.c1_g, &u.c1_v, stage_out, stage_out * 7)?;
+                let c1_planes = (0..7)
+                    .map(|k| plane(&c1_folded, k, stage_out, stage_out, 7))
+                    .collect::<Result<Vec<_>>>()?;
+                let c2_w = fold_weight_norm(s, &wn_fold, &u.c2_g, &u.c2_v, stage_out, stage_out)?;
+                units.push(VocoderUnitSetup { c1_planes, c2_w });
+            }
+            blocks.push(VocoderBlockSetup {
+                conv_t_planes,
+                units,
+            });
+            stage_in = stage_out;
+        }
+        let tail_dim = stage_in;
+        let conv_out_folded =
+            fold_weight_norm(s, &wn_fold, &vc.conv_out_g, &vc.conv_out_v, 1, tail_dim * 7)?;
+        let conv_out_planes = (0..7)
+            .map(|k| plane(&conv_out_folded, k, 1, tail_dim, 7))
+            .collect::<Result<Vec<_>>>()?;
+        #[cfg(test)]
+        #[cfg(test)]
+        let fold_tap = s.clone_dtoh(&conv_in_planes[0])?;
+        let vocoder = VocoderSetup {
+            conv_in_planes,
+            blocks,
+            conv_out_planes,
+        };
+        let built = Self {
             spec,
             weights,
             stream: d.stream.clone(),
@@ -98,7 +242,26 @@ impl Music3Syn {
             silu_mul: kernel(&act, "silu_mul_f32")?,
             bias_add: kernel(&common, "bias_add_f32")?,
             add_inplace: kernel(&common, "add_inplace_f32")?,
-        })
+            cond_sum: kernel(&common, "cond_layer_sum_f32")?,
+            pad_rows: kernel(&common, "pad_rows_f32")?,
+            nearest_rows: kernel(&common, "nearest_rows_f32")?,
+            cond_weights,
+            cond_scale,
+            proj_planes: [p0, p1, p2],
+            vocoder,
+            pad_rows_n: kernel(&common, "pad_rows_n_f32")?,
+            snake_rows: kernel(&common, "snake_rows_f32")?,
+            scatter_add: kernel(&common, "scatter_strided_add_f32")?,
+            tanh_fn: kernel(&common, "tanh_f32")?,
+            transpose_fn: kernel(&common, "transpose_f32")?,
+            euler_fn: kernel(&common, "euler_update_f32")?,
+            #[cfg(test)]
+            vocoder_taps: std::cell::RefCell::new(Vec::new()),
+        };
+        #[cfg(test)]
+        built.vocoder_taps.borrow_mut().push(("fold_p0", fold_tap));
+        #[allow(clippy::needless_return)]
+        Ok(built)
     }
 
     fn linear(
@@ -503,6 +666,492 @@ impl Music3Syn {
         Ok(())
     }
 
+    /// Flow sigma schedule for `steps` Euler steps: numpy-semantics
+    /// linspace(steps ascending 1/steps..1 in f64, cast f32) with the
+    /// terminal 0 first, 31 entries for 30 steps.
+    pub fn sigma_schedule(steps: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; steps + 1];
+        let start = 1.0f64 / steps as f64;
+        let step = (1.0 - start) / (steps as f64 - 1.0);
+        for i in 0..steps {
+            out[i + 1] = (start + i as f64 * step) as f32;
+        }
+        out[steps] = 1.0;
+        out
+    }
+
+    /// One Euler update: x += (sigma_next - sigma) * velocity.
+    pub fn euler_step(
+        &self,
+        x: &mut CudaSlice<f32>,
+        velocity: &CudaSlice<f32>,
+        sigma: f32,
+        sigma_next: f32,
+    ) -> Result<()> {
+        ensure!(x.len() == velocity.len(), "euler extent mismatch");
+        let count = x.len();
+        unsafe {
+            self.stream
+                .launch_builder(&self.euler_fn)
+                .arg(&mut *x)
+                .arg(velocity)
+                .arg(&(sigma_next - sigma))
+                .arg(&(count as i64))
+                .launch(super::ops::flat(count))?;
+        }
+        Ok(())
+    }
+
+    /// Latent length for a frame count: int(frames * out_rate * in_hop /
+    /// (in_rate * out_hop)), at least 1.
+    pub fn latent_length(&self, frames: usize) -> usize {
+        let numerator = self.spec.output_rate as u64 * self.spec.input_hop as u64 * frames as u64;
+        let denominator = self.spec.input_rate as u64 * self.spec.output_hop as u64;
+        usize::max(1, (numerator / denominator) as usize)
+    }
+
+    /// Condition encoder: fused layer softmax-sum, k=3 conv (padded, three
+    /// shifted GEMMs over repacked planes) and nearest upsample. `input` is
+    /// [frames, layers*cond_hidden], `out` [latent_length, cond_out].
+    pub fn condition_encode(
+        &self,
+        input: &CudaSlice<f32>,
+        frames: usize,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<()> {
+        let s = &self.stream;
+        let cond_hidden = self.spec.cond_hidden as usize;
+        let cond_out = self.spec.cond_out as usize;
+        let layers = self.spec.cond_layers as usize;
+        let length = self.latent_length(frames);
+        ensure!(
+            input.len() == frames * layers * cond_hidden && out.len() == length * cond_out,
+            "condition_encode extent mismatch"
+        );
+        let mut fused: CudaSlice<f32> = unsafe { s.alloc(frames * cond_hidden)? };
+        unsafe {
+            s.launch_builder(&self.cond_sum)
+                .arg(input)
+                .arg(&self.cond_weights)
+                .arg(&self.cond_scale)
+                .arg(&mut fused)
+                .arg(&(frames as i64))
+                .arg(&(layers as i32))
+                .arg(&(cond_hidden as i32))
+                .launch(super::ops::flat(frames * cond_hidden))?;
+        }
+        let mut padded: CudaSlice<f32> = unsafe { s.alloc((frames + 2) * cond_hidden)? };
+        unsafe {
+            s.launch_builder(&self.pad_rows)
+                .arg(&fused)
+                .arg(&mut padded)
+                .arg(&(frames as i64))
+                .arg(&(cond_hidden as i64))
+                .launch(super::ops::flat((frames + 2) * cond_hidden))?;
+        }
+        let mut conv: CudaSlice<f32> = unsafe { s.alloc(frames * cond_out)? };
+        let mut shifted: CudaSlice<f32> = unsafe { s.alloc(frames * cond_out)? };
+        for (k, plane) in self.proj_planes.iter().enumerate() {
+            let window = padded.slice(k * cond_hidden..k * cond_hidden + frames * cond_hidden);
+            if k == 0 {
+                self.linear_bytes(plane, cond_out, cond_hidden, &window, frames, &mut conv)?;
+            } else {
+                self.linear_bytes(plane, cond_out, cond_hidden, &window, frames, &mut shifted)?;
+                unsafe {
+                    s.launch_builder(&self.add_inplace)
+                        .arg(&conv)
+                        .arg(&shifted)
+                        .arg(&((frames * cond_out) as i64))
+                        .launch(super::ops::flat(frames * cond_out))?;
+                }
+            }
+        }
+        unsafe {
+            s.launch_builder(&self.bias_add)
+                .arg(&conv)
+                .arg(&self.weights.cond.proj_b)
+                .arg(&((frames * cond_out) as i64))
+                .arg(&(cond_out as i32))
+                .launch(super::ops::flat(frames * cond_out))?;
+        }
+        let map: Vec<u32> = (0..length)
+            .map(|j| u32::try_from(j * frames / length).context("map index overflow"))
+            .collect::<Result<_>>()?;
+        let d_map = s.clone_htod(&map)?;
+        unsafe {
+            s.launch_builder(&self.nearest_rows)
+                .arg(&conv)
+                .arg(&d_map)
+                .arg(out)
+                .arg(&(length as i64))
+                .arg(&(cond_out as i64))
+                .launch(super::ops::flat(length * cond_out))?;
+        }
+        Ok(())
+    }
+
+    /// Shifted-view conv over a zero-padded buffer: out rows `rows`, one
+    /// GEMM per kernel tap with dilated offsets, bias at the end.
+    #[allow(clippy::too_many_arguments)]
+    fn conv_taps(
+        &self,
+        planes: &[CudaSlice<f32>],
+        padded: &CudaSlice<f32>,
+        in_dim: usize,
+        rows: usize,
+        dilation: usize,
+        out: &mut CudaSlice<f32>,
+        bias: &CudaSlice<u8>,
+    ) -> Result<()> {
+        let s = &self.stream;
+        let out_dim = out.len() / rows;
+        let mut scratch: CudaSlice<f32> = unsafe { s.alloc(rows * out_dim)? };
+        for (k, plane) in planes.iter().enumerate() {
+            let offset = k * dilation * in_dim;
+            let window = padded.slice(offset..offset + rows * in_dim);
+            if k == 0 {
+                self.linear_bytes(plane, out_dim, in_dim, &window, rows, &mut *out)?;
+            } else {
+                self.linear_bytes(plane, out_dim, in_dim, &window, rows, &mut scratch)?;
+                unsafe {
+                    s.launch_builder(&self.add_inplace)
+                        .arg(&mut *out)
+                        .arg(&scratch)
+                        .arg(&((rows * out_dim) as i64))
+                        .launch(super::ops::flat(rows * out_dim))?;
+                }
+            }
+        }
+        unsafe {
+            let count = out.len();
+            s.launch_builder(&self.bias_add)
+                .arg(&mut *out)
+                .arg(bias)
+                .arg(&(count as i64))
+                .arg(&((count / rows) as i32))
+                .launch(super::ops::flat(count))?;
+        }
+        Ok(())
+    }
+
+    /// One folded stereo stream: latent half [channels/2, length]
+    /// channel-major -> waveform [total_samples].
+    fn vocoder_stream(
+        &self,
+        latent: &cudarc::driver::CudaView<f32>,
+        length: usize,
+        waveform: &mut CudaSlice<f32>,
+    ) -> Result<()> {
+        let s = &self.stream;
+        let streams = self.spec.vocoder_stream_channels() as usize;
+        let input_dim = self.spec.decoder_input as usize;
+        let hidden = self.spec.decoder_hidden as usize;
+        ensure!(latent.len() == streams * length, "vocoder stream extent");
+        let mut x: CudaSlice<f32> = unsafe { s.alloc(length * streams)? };
+        unsafe {
+            s.launch_builder(&self.transpose_fn)
+                .arg(latent)
+                .arg(&mut x)
+                .arg(&(streams as i64))
+                .arg(&(length as i64))
+                .launch(super::ops::flat(streams * length))?;
+        }
+        let mut buf: CudaSlice<f32> = unsafe { s.alloc(length * input_dim)? };
+        self.linear(
+            &self.weights.vocoder.dec_in_proj_w,
+            input_dim,
+            streams,
+            &x.slice(0..length * streams),
+            length,
+            &mut buf.slice_mut(0..length * input_dim),
+        )?;
+        unsafe {
+            s.launch_builder(&self.bias_add)
+                .arg(&buf)
+                .arg(&self.weights.vocoder.dec_in_proj_b)
+                .arg(&((length * input_dim) as i64))
+                .arg(&(input_dim as i32))
+                .launch(super::ops::flat(length * input_dim))?;
+        }
+        #[cfg(test)]
+        self.vocoder_taps
+            .borrow_mut()
+            .push(("dec_in", s.clone_dtoh(&buf)?));
+        // conv_in k=7 pad=3.
+        let mut padded: CudaSlice<f32> = unsafe { s.alloc((length + 6) * hidden)? };
+        let mut wide: CudaSlice<f32> = unsafe { s.alloc(length * hidden)? };
+
+        unsafe {
+            s.launch_builder(&self.pad_rows_n)
+                .arg(&buf.slice(0..length * input_dim))
+                .arg(&mut padded)
+                .arg(&(length as i64))
+                .arg(&3i64)
+                .arg(&(input_dim as i64))
+                .launch(super::ops::flat((length + 6) * input_dim))?;
+        }
+        let mut wide_buf: CudaSlice<f32> = unsafe { s.alloc(length * hidden)? };
+        self.conv_taps(
+            &self.vocoder.conv_in_planes,
+            &padded,
+            input_dim,
+            length,
+            1,
+            &mut wide_buf,
+            &self.weights.vocoder.conv_in_b,
+        )?;
+        std::mem::swap(&mut wide, &mut wide_buf);
+        #[cfg(test)]
+        self.vocoder_taps
+            .borrow_mut()
+            .push(("conv_in", s.clone_dtoh(&wide)?));
+        let mut rows = length;
+        let mut dim = hidden;
+        for (block_index, vb) in self.vocoder.blocks.iter().enumerate() {
+            let stride = self.spec.upsampling[block_index] as usize;
+            let out_dim = dim / 2;
+            let pad = stride.div_ceil(2);
+            unsafe {
+                s.launch_builder(&self.snake_rows)
+                    .arg(&wide)
+                    .arg(&self.weights.vocoder.blocks[block_index].snake1_alpha)
+                    .arg(&wide)
+                    .arg(&((rows * dim) as i64))
+                    .arg(&(dim as i32))
+                    .launch(super::ops::flat(rows * dim))?;
+            }
+            let mut up: CudaSlice<f32> = s.alloc_zeros(rows * stride * out_dim)?;
+            let mut gemm_out: CudaSlice<f32> = unsafe { s.alloc(rows * out_dim)? };
+            for (k, plane) in vb.conv_t_planes.iter().enumerate() {
+                self.linear_bytes(
+                    plane,
+                    out_dim,
+                    dim,
+                    &wide.slice(0..rows * dim),
+                    rows,
+                    &mut gemm_out,
+                )?;
+                unsafe {
+                    s.launch_builder(&self.scatter_add)
+                        .arg(&gemm_out)
+                        .arg(&mut up)
+                        .arg(&(rows as i64))
+                        .arg(&(out_dim as i32))
+                        .arg(&(stride as i32))
+                        .arg(&(k as i32))
+                        .arg(&(pad as i32))
+                        .launch(super::ops::flat(rows * out_dim))?;
+                }
+            }
+            unsafe {
+                s.launch_builder(&self.bias_add)
+                    .arg(&up)
+                    .arg(&self.weights.vocoder.blocks[block_index].conv_t_b)
+                    .arg(&((rows * stride * out_dim) as i64))
+                    .arg(&(out_dim as i32))
+                    .launch(super::ops::flat(rows * stride * out_dim))?;
+            }
+            rows *= stride;
+            dim = out_dim;
+            wide = up;
+            #[cfg(test)]
+            if block_index == 0 {
+                self.vocoder_taps
+                    .borrow_mut()
+                    .push(("convt0", s.clone_dtoh(&wide)?));
+            }
+            #[cfg(test)]
+            self.vocoder_taps
+                .borrow_mut()
+                .push(("block", s.clone_dtoh(&wide)?));
+            for (unit_index, unit) in vb.units.iter().enumerate() {
+                let dilation = [1usize, 3, 9][unit_index];
+                let mut snaked: CudaSlice<f32> = unsafe { s.alloc(rows * dim)? };
+                unsafe {
+                    s.launch_builder(&self.snake_rows)
+                        .arg(&wide)
+                        .arg(
+                            &self.weights.vocoder.blocks[block_index].units[unit_index]
+                                .snake1_alpha,
+                        )
+                        .arg(&mut snaked)
+                        .arg(&((rows * dim) as i64))
+                        .arg(&(dim as i32))
+                        .launch(super::ops::flat(rows * dim))?;
+                }
+                let pad_rows = 3 * dilation;
+                let mut padded: CudaSlice<f32> = unsafe { s.alloc((rows + 2 * pad_rows) * dim)? };
+                unsafe {
+                    s.launch_builder(&self.pad_rows_n)
+                        .arg(&snaked)
+                        .arg(&mut padded)
+                        .arg(&(rows as i64))
+                        .arg(&(pad_rows as i64))
+                        .arg(&(dim as i64))
+                        .launch(super::ops::flat((rows + 2 * pad_rows) * dim))?;
+                }
+                let mut conv: CudaSlice<f32> = unsafe { s.alloc(rows * dim)? };
+                self.conv_taps(
+                    &unit.c1_planes,
+                    &padded,
+                    dim,
+                    rows,
+                    dilation,
+                    &mut conv,
+                    &self.weights.vocoder.blocks[block_index].units[unit_index].c1_b,
+                )?;
+                unsafe {
+                    s.launch_builder(&self.snake_rows)
+                        .arg(&conv)
+                        .arg(
+                            &self.weights.vocoder.blocks[block_index].units[unit_index]
+                                .snake2_alpha,
+                        )
+                        .arg(&conv)
+                        .arg(&((rows * dim) as i64))
+                        .arg(&(dim as i32))
+                        .launch(super::ops::flat(rows * dim))?;
+                }
+                let mut gated: CudaSlice<f32> = unsafe { s.alloc(rows * dim)? };
+                self.linear_bytes(
+                    &unit.c2_w,
+                    dim,
+                    dim,
+                    &conv.slice(0..rows * dim),
+                    rows,
+                    &mut gated,
+                )?;
+                unsafe {
+                    s.launch_builder(&self.bias_add)
+                        .arg(&gated)
+                        .arg(&self.weights.vocoder.blocks[block_index].units[unit_index].c2_b)
+                        .arg(&((rows * dim) as i64))
+                        .arg(&(dim as i32))
+                        .launch(super::ops::flat(rows * dim))?;
+                    s.launch_builder(&self.add_inplace)
+                        .arg(&wide)
+                        .arg(&gated)
+                        .arg(&((rows * dim) as i64))
+                        .launch(super::ops::flat(rows * dim))?;
+                    #[cfg(test)]
+                    if block_index == 0 && unit_index == 0 {
+                        self.vocoder_taps
+                            .borrow_mut()
+                            .push(("u1_0", s.clone_dtoh(&wide)?));
+                    }
+                }
+            }
+        }
+        let total = rows;
+        let tail = dim;
+        ensure!(waveform.len() == total, "waveform extent");
+        unsafe {
+            s.launch_builder(&self.snake_rows)
+                .arg(&wide)
+                .arg(&self.weights.vocoder.snake_out_alpha)
+                .arg(&wide)
+                .arg(&((total * tail) as i64))
+                .arg(&(tail as i32))
+                .launch(super::ops::flat(total * tail))?;
+        }
+        let pad_rows = 3;
+        let mut padded: CudaSlice<f32> = unsafe { s.alloc((total + 2 * pad_rows) * tail)? };
+        unsafe {
+            s.launch_builder(&self.pad_rows_n)
+                .arg(&wide)
+                .arg(&mut padded)
+                .arg(&(total as i64))
+                .arg(&(pad_rows as i64))
+                .arg(&(tail as i64))
+                .launch(super::ops::flat((total + 2 * pad_rows) * tail))?;
+        }
+        let mut conv: CudaSlice<f32> = unsafe { s.alloc(total)? };
+        self.conv_taps(
+            &self.vocoder.conv_out_planes,
+            &padded,
+            tail,
+            total,
+            1,
+            &mut conv,
+            &self.weights.vocoder.conv_out_b,
+        )?;
+        unsafe {
+            s.launch_builder(&self.tanh_fn)
+                .arg(&mut conv)
+                .arg(&(total as i64))
+                .launch(super::ops::flat(total))?;
+        }
+        s.memcpy_dtod(&conv, waveform)?;
+        Ok(())
+    }
+
+    /// Full vocoder: latents [channels, length] channel-major -> stereo
+    /// [2, total] (channel-major rows per stream, concatenated).
+    pub fn vocoder(
+        &self,
+        latents: &CudaSlice<f32>,
+        length: usize,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<()> {
+        let streams = self.spec.vocoder_stream_channels() as usize;
+        let total: usize = self.spec.upsampling.iter().map(|r| *r as usize).product();
+        ensure!(
+            latents.len() == 2 * streams * length && out.len() == 2 * length * total,
+            "vocoder extent mismatch"
+        );
+        let s = &self.stream;
+        let mut wave: CudaSlice<f32> = unsafe { s.alloc(length * total)? };
+        for half in 0..2 {
+            let latent = latents.slice(half * streams * length..(half + 1) * streams * length);
+            self.vocoder_stream(&latent, length, &mut wave)?;
+            s.memcpy_dtod(
+                &wave,
+                &mut out.slice_mut(half * length * total..(half + 1) * length * total),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// `linear` for a dense F32 weight already on device.
+    fn linear_bytes(
+        &self,
+        weight: &CudaSlice<f32>,
+        out_rows: usize,
+        in_cols: usize,
+        input: &CudaView<f32>,
+        rows: usize,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<()> {
+        let mut view = TensorMut(unsafe {
+            Tensor::new(
+                out.device_ptr_mut(&self.stream).0,
+                [rows as u32, out_rows as u32],
+                [out_rows as u64, 1],
+                (rows * out_rows * 4) as u64,
+            )?
+        });
+        let w = unsafe {
+            Tensor::<f32, 2>::new(
+                weight.device_ptr(&self.stream).0,
+                [out_rows as u32, in_cols as u32],
+                [in_cols as u64, 1],
+                (out_rows * in_cols * 4) as u64,
+            )?
+        };
+        self.blas.linear_f32(
+            w,
+            unsafe {
+                Tensor::new(
+                    input.device_ptr(&self.stream).0,
+                    [rows as u32, in_cols as u32],
+                    [in_cols as u64, 1],
+                    (rows * in_cols * 4) as u64,
+                )?
+            },
+            &mut view,
+        )
+    }
+
     fn layernorm(
         &self,
         input: &CudaSlice<f32>,
@@ -590,4 +1239,44 @@ unsafe fn gemm_f32(handle: &CudaBlas, cfg: &GemmF32, a: u64, b: u64, c: u64) -> 
         .context("cublasGemmEx failed")?;
     }
     Ok(())
+}
+
+/// Folded vocoder weights: weight-norm convs folded once at setup
+/// (g * v / ||v||, in memory) and their kernel planes repacked dense.
+pub struct VocoderSetup {
+    pub conv_in_planes: Vec<CudaSlice<f32>>,
+    pub blocks: Vec<VocoderBlockSetup>,
+    pub conv_out_planes: Vec<CudaSlice<f32>>,
+}
+
+pub struct VocoderBlockSetup {
+    pub conv_t_planes: Vec<CudaSlice<f32>>,
+    pub units: Vec<VocoderUnitSetup>,
+}
+
+pub struct VocoderUnitSetup {
+    pub c1_planes: Vec<CudaSlice<f32>>,
+    pub c2_w: CudaSlice<f32>,
+}
+
+fn fold_weight_norm(
+    s: &Arc<cudarc::driver::CudaStream>,
+    fold: &CudaFunction,
+    g: &CudaSlice<u8>,
+    v: &CudaSlice<u8>,
+    channels: usize,
+    rest: usize,
+) -> Result<CudaSlice<f32>> {
+    // g is [C, 1, 1] bytes: C contiguous floats, read by the kernel directly.
+    let mut folded: CudaSlice<f32> = unsafe { s.alloc(channels * rest)? };
+    unsafe {
+        s.launch_builder(fold)
+            .arg(g)
+            .arg(v)
+            .arg(&mut folded)
+            .arg(&(channels as i64))
+            .arg(&(rest as i64))
+            .launch(super::ops::grid(channels, 256))?;
+    }
+    Ok(folded)
 }

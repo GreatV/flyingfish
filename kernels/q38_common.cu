@@ -1142,4 +1142,98 @@ extern "C" __global__ void channel_scale_residual_f32(
     const float* residual, const float* branch, const float* scale, float* y,
     uint32_t rows, uint32_t width) {
     channel_scale_residual(residual, branch, scale, y, rows, width);
+
+// Condition fusion: out[t, h] = scale * sum_l w[l] * x[t, l*H + h], with x
+// [frames, layers*H] row-major and w the softmax over the 8 layers.
+extern "C" __global__ void cond_layer_sum_f32(const float* __restrict__ x,
+    const float* __restrict__ w, float scale, float* __restrict__ out,
+    long long frames, int layers, int width) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= frames * width) return;
+    const long long t = i / width;
+    const int h = (int)(i - t * width);
+    float sum = 0.0f;
+    for (int l = 0; l < layers; l++)
+        sum = __fadd_rn(sum, __fmul_rn(w[l], x[t * layers * width + (long long)l * width + h]));
+    out[i] = __fmul_rn(scale, sum);
+}
+
+// Zero-pad rows: out[0] = 0, out[1..F] = x, out[F+1] = 0; both [rows, C].
+extern "C" __global__ void pad_rows_f32(const float* __restrict__ x,
+    float* __restrict__ out, long long rows, long long width) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long total = (rows + 2) * width;
+    if (i >= total) return;
+    const long long row = i / width;
+    out[i] = (row == 0 || row == rows + 1) ? 0.0f : x[i - width];
+}
+
+// Repack one k-plane of a Conv1d weight [O, I, K] into a dense [O, I].
+extern "C" __global__ void extract_plane_f32(const float* __restrict__ w,
+    int k, float* __restrict__ out, long long out_elems, int in_dim, int kernel) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= out_elems) return;
+    const long long o = i / in_dim;
+    const int c = (int)(i - o * in_dim);
+    out[i] = w[o * (long long)in_dim * kernel + (long long)c * kernel + k];
+}
+
+// Nearest-row gather: out[j, :] = in[map[j], :].
+extern "C" __global__ void nearest_rows_f32(const float* __restrict__ in,
+    const unsigned int* __restrict__ map, float* __restrict__ out,
+    long long out_rows, long long width) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= out_rows * width) return;
+    const long long j = i / width;
+    out[i] = in[(long long)map[j] * width + (i - j * width)];
+}
+// Snake on time-major rows [T, C]: y[t, c] = x + (a[c]+1e-9)^-1 sin(a[c] x)^2.
+extern "C" __global__ void snake_rows_f32(const float* __restrict__ x,
+    const float* __restrict__ alpha, float* __restrict__ y,
+    long long count, int channels) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float a = alpha[i % channels];
+    const float v = x[i];
+    const float s = sinf(a * v);
+    y[i] = v + __frcp_rn(a + 1e-9f) * s * s;
+}
+
+// Transposed-conv scatter-add: out[j*s + k - pad, :] += tmp[j, :], bounds
+// checked; out rows = in_rows * s, both [rows, channels].
+extern "C" __global__ void scatter_strided_add_f32(const float* __restrict__ tmp,
+    float* __restrict__ out, long long in_rows, int channels,
+    int stride, int k, int pad) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= in_rows * channels) return;
+    const long long j = i / channels;
+    const int c = (int)(i - j * channels);
+    const long long row = j * stride + k - pad;
+    if (row < 0 || row >= in_rows * stride) return;
+    out[row * channels + c] += tmp[i];
+}
+
+// In-place tanh, elementwise F32.
+extern "C" __global__ void tanh_f32(float* __restrict__ x, long long count) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    x[i] = tanhf(x[i]);
+}
+// Transposing plane extract for folded ConvTranspose weights [A, B, K]:
+// out[b, a] = w[a, b, k] -> dense [B, A] for the per-phase GEMM.
+extern "C" __global__ void extract_plane_transposed_f32(const float* __restrict__ w,
+    int k, float* __restrict__ out, long long out_elems, int a_dim, int b_dim, int kernel) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= out_elems) return;
+    const long long b = i / a_dim;
+    const int a = (int)(i - b * a_dim);
+    out[i] = w[(long long)a * b_dim * kernel + (long long)b * kernel + k];
+}
+
+// Euler flow update: x += (sigma_next - sigma) * v, elementwise F32.
+extern "C" __global__ void euler_update_f32(float* __restrict__ x,
+    const float* __restrict__ v, float dt, long long count) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    x[i] = __fadd_rn(x[i], __fmul_rn(dt, v[i]));
 }
