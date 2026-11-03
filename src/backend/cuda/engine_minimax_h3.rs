@@ -1248,14 +1248,14 @@ fn cast_rows(
 fn place_layers(
     d: &Device,
     base: &mut Source<'_>,
-    (layers, largest, owned): (&[usize], usize, usize),
+    (layers, largest, owned, media): (&[usize], usize, usize, usize),
     placement: Placement,
     name: impl Fn(usize) -> String,
     roles: &[&str],
 ) -> Result<Option<crate::backend::cuda::weights::DenseStreaming>> {
     use crate::prefill::DensePlacement;
     let (free, total) = d.ctx.mem_get_info()?;
-    let mut budget = DensePlacement::device_budget(free, total, owned, 0, 0)?;
+    let mut budget = DensePlacement::device_budget(free, total, owned, 0, media)?;
     if placement != Placement::Derived {
         let slots = 2 * layers.iter().copied().max().context("no streamed layers")?;
         ensure!(slots <= budget, "two block slots exceed the device budget");
@@ -1446,7 +1446,7 @@ impl Dit {
         let dense = place_layers(
             d,
             &mut base,
-            (&layers, largest, owned),
+            (&layers, largest, owned, 0),
             placement,
             |layer| format!("transformer_blocks.{layer}"),
             &LINEAR_ROLES,
@@ -1910,7 +1910,8 @@ pub(crate) struct ConditionerInput<'a> {
 }
 
 /// The Qwen3-VL conditioner text decoder: layers `0..layers.len()` of the published checkpoint, placed through
-/// dense streaming; the output is the residual after the last layer (`hidden_states[layers]`).
+/// dense streaming; the output is the residual after the last layer (`hidden_states[layers]`). Activations are
+/// allocated before the placement is derived; `media` bytes stay unplaced for the vision request.
 pub(crate) struct Conditioner {
     hidden: usize,
     q_heads: usize,
@@ -1940,7 +1941,7 @@ impl Conditioner {
     pub(crate) fn new(
         d: &Device,
         spec: &crate::model_spec::ModelSpec,
-        (layers, capacity): (usize, usize),
+        (layers, capacity, media): (usize, usize, usize),
         mut base: Source<'_>,
         placement: Placement,
     ) -> Result<Self> {
@@ -1970,11 +1971,18 @@ impl Conditioner {
                 largest = largest.max(entry.bytes);
             }
         }
+        let rows = |width: usize| s.alloc_zeros::<bf16>(capacity * width);
+        let (x, normed, rope) = (rows(hidden)?, rows(hidden)?, rows(head_dim)?);
+        let (q, attention) = (rows(q_heads * head_dim)?, rows(q_heads * head_dim)?);
+        let (k, v) = (rows(kv_heads * head_dim)?, rows(kv_heads * head_dim)?);
+        let (keys, values) = (rows(kv_heads * head_dim)?, rows(kv_heads * head_dim)?);
+        let (gate_up, gated) = (rows(2 * ffn)?, rows(ffn)?);
+        let flash = Flash::new(s.clone(), capacity, q_heads, kv_heads, head_dim)?;
         let owned = layers * 2 * (2 * hidden + 2 * head_dim);
         let dense = place_layers(
             d,
             &mut base,
-            (&bytes, largest, owned),
+            (&bytes, largest, owned, media),
             placement,
             name,
             &TEXT_ROLES,
@@ -1995,7 +2003,6 @@ impl Conditioner {
                 &mut base,
             )?);
         }
-        let rows = |width: usize| s.alloc_zeros::<bf16>(capacity * width);
         Ok(Self {
             hidden,
             q_heads,
@@ -2007,18 +2014,18 @@ impl Conditioner {
             layers: text_layers,
             dense,
             kernels: BlockKernels::new(s.context())?,
-            flash: Flash::new(s.clone(), capacity, q_heads, kv_heads, head_dim)?,
-            x: rows(hidden)?,
-            normed: rows(hidden)?,
-            q: rows(q_heads * head_dim)?,
-            k: rows(kv_heads * head_dim)?,
-            v: rows(kv_heads * head_dim)?,
-            keys: rows(kv_heads * head_dim)?,
-            values: rows(kv_heads * head_dim)?,
-            attention: rows(q_heads * head_dim)?,
-            gate_up: rows(2 * ffn)?,
-            gated: rows(ffn)?,
-            rope: rows(head_dim)?,
+            flash,
+            x,
+            normed,
+            q,
+            k,
+            v,
+            keys,
+            values,
+            attention,
+            gate_up,
+            gated,
+            rope,
         })
     }
 
@@ -3725,7 +3732,7 @@ mod tests {
         let mut conditioner = Conditioner::new(
             &device,
             &gate.spec,
-            (51, capacity),
+            (51, capacity, 0),
             Source::new(&gate.encoder, &gate.manifest),
             Placement::from_env()?,
         )?;
@@ -3833,10 +3840,25 @@ mod tests {
             .map(|(_, c)| c.tokens.len())
             .max()
             .context("no cells")?;
+        let mut media = 0;
+        for (_, c) in &gate.cells {
+            let input = crate::vision_input::MultimodalInput {
+                input_ids: &c.tokens,
+                modality_ids: &c.modality,
+                pixel_values: &c.pixels,
+                grids: &c.grids,
+                audio: &[],
+            };
+            media = media.max(super::super::vision_runtime::LayerNormTower::request_bytes(
+                &gate.spec,
+                &input,
+                c.tokens.len(),
+            )?);
+        }
         let mut conditioner = Conditioner::new(
             &device,
             &gate.spec,
-            (50, capacity),
+            (50, capacity, media),
             Source::new(&gate.encoder, &gate.manifest),
             Placement::from_env()?,
         )?;
