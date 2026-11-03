@@ -439,9 +439,9 @@ pub(crate) fn run(
     )?;
     let frames = decode_plan.frames;
     ensure!(
-        frames == request.frames,
-        "decoded {frames} frames, requested {}",
-        request.frames
+        frames == geometry.frames,
+        "decoded {frames} frames, resolved geometry has {}",
+        geometry.frames
     );
     let decoded = s.clone_dtoh(&decoded)?;
     drop((work, decoder, latents_device));
