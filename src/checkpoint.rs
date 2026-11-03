@@ -321,12 +321,12 @@ impl MappedCheckpoint {
             Architecture::MiniCpmV47 => "MiniCPM",
             Architecture::Flint => "Flint",
             Architecture::Clover => "Clover",
+            Architecture::Qwen3Vl => "Qwen3-VL",
             Architecture::Llama
             | Architecture::Glm5Next
             | Architecture::LoopVl
             | Architecture::Gemma4
-            | Architecture::EmbeddingGemma2
-            | Architecture::Qwen3Vl => {
+            | Architecture::EmbeddingGemma2 => {
                 bail!("checkpoint manifest requires a Qwen3.5-family spec")
             }
             Architecture::DeepseekV41 | Architecture::DiffusionGemma => {
@@ -366,14 +366,14 @@ impl MappedCheckpoint {
                 }
             }
             Architecture::MiniCpmV47 => Self::minicpm_vision_entries(spec, &mut expected)?,
+            Architecture::Qwen3Vl => Self::qwen3_vl_vision_entries(spec, &mut expected)?,
             Architecture::Flint | Architecture::Clover | Architecture::Qwen3 => {}
             Architecture::Llama
             | Architecture::Glm5Next
             | Architecture::LoopVl
             | Architecture::Gemma4
             | Architecture::EmbeddingGemma2
-            | Architecture::DiffusionGemma
-            | Architecture::Qwen3Vl => unreachable!(),
+            | Architecture::DiffusionGemma => unreachable!(),
             Architecture::DeepseekV41 => {
                 unreachable!("DeepSeek-V4.1 has a dedicated manifest path")
             }
@@ -995,16 +995,16 @@ impl MappedCheckpoint {
         let dense_fp8 = fp8.filter(|layout| layout.block_scale().is_some());
         let global_prefix = match spec.architecture {
             Architecture::Flint | Architecture::Clover | Architecture::Qwen3 => "model",
-            Architecture::Qwen35Text | Architecture::MiniCpmV47 | Architecture::Llama => {
-                "model.language_model"
-            }
+            Architecture::Qwen35Text
+            | Architecture::MiniCpmV47
+            | Architecture::Llama
+            | Architecture::Qwen3Vl => "model.language_model",
             Architecture::Glm5Next
             | Architecture::LoopVl
             | Architecture::DeepseekV41
             | Architecture::Gemma4
             | Architecture::EmbeddingGemma2
-            | Architecture::DiffusionGemma
-            | Architecture::Qwen3Vl => {
+            | Architecture::DiffusionGemma => {
                 unreachable!("architecture has a dedicated manifest path")
             }
         };
@@ -1163,7 +1163,7 @@ impl MappedCheckpoint {
             match layer.mixer {
                 Mixer::FullAttention => {
                     let q_out = match spec.architecture {
-                        Architecture::Flint | Architecture::Qwen3 => q_width,
+                        Architecture::Flint | Architecture::Qwen3 | Architecture::Qwen3Vl => q_width,
                         Architecture::Qwen35Text
                         | Architecture::Clover
                         | Architecture::MiniCpmV47
@@ -1172,8 +1172,7 @@ impl MappedCheckpoint {
                         | Architecture::LoopVl
                         | Architecture::Gemma4
                         | Architecture::EmbeddingGemma2
-                        | Architecture::DiffusionGemma
-                        | Architecture::Qwen3Vl => {
+                        | Architecture::DiffusionGemma => {
                             unreachable!("architecture has a dedicated manifest path")
                         }
                         Architecture::DeepseekV41 => {
@@ -2064,6 +2063,75 @@ impl MappedCheckpoint {
                     scope,
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// Qwen3-VL vision tower: patch embedding, learned positions, `depth` LayerNorm blocks, the final merger (LayerNorm
+    /// per patch) and one deepstack merger per tap (LayerNorm over the merged row), all BF16.
+    fn qwen3_vl_vision_entries(
+        spec: &crate::model_spec::ModelSpec,
+        expected: &mut BTreeMap<String, ExpectedTensor>,
+    ) -> Result<()> {
+        let v = spec
+            .vision
+            .as_ref()
+            .context("Qwen3-VL vision configuration missing")?;
+        v.validate(crate::model_spec::Architecture::Qwen3Vl)?;
+        let (hidden, mlp, output) = (
+            v.hidden as usize,
+            v.intermediate as usize,
+            v.output as usize,
+        );
+        let merged = hidden * (v.merge * v.merge) as usize;
+        let mut add = |name: String, shape: Vec<usize>| {
+            put(expected, name, Dtype::BF16, shape, TensorScope::Vision)
+        };
+        add(
+            "model.visual.patch_embed.proj.weight".into(),
+            vec![
+                hidden,
+                v.channels as usize,
+                v.temporal_patch as usize,
+                v.patch as usize,
+                v.patch as usize,
+            ],
+        );
+        add("model.visual.patch_embed.proj.bias".into(), vec![hidden]);
+        add(
+            "model.visual.pos_embed.weight".into(),
+            vec![(v.position_side * v.position_side) as usize, hidden],
+        );
+        for i in 0..v.depth {
+            let p = format!("model.visual.blocks.{i}");
+            for (name, shape) in [
+                ("attn.qkv.weight", vec![3 * hidden, hidden]),
+                ("attn.qkv.bias", vec![3 * hidden]),
+                ("attn.proj.weight", vec![hidden, hidden]),
+                ("attn.proj.bias", vec![hidden]),
+                ("mlp.linear_fc1.weight", vec![mlp, hidden]),
+                ("mlp.linear_fc1.bias", vec![mlp]),
+                ("mlp.linear_fc2.weight", vec![hidden, mlp]),
+                ("mlp.linear_fc2.bias", vec![hidden]),
+                ("norm1.weight", vec![hidden]),
+                ("norm1.bias", vec![hidden]),
+                ("norm2.weight", vec![hidden]),
+                ("norm2.bias", vec![hidden]),
+            ] {
+                add(format!("{p}.{name}"), shape);
+            }
+        }
+        let mergers = std::iter::once(("model.visual.merger".to_owned(), hidden)).chain(
+            (0..v.deepstack.len())
+                .map(|k| (format!("model.visual.deepstack_merger_list.{k}"), merged)),
+        );
+        for (p, norm) in mergers {
+            add(format!("{p}.norm.weight"), vec![norm]);
+            add(format!("{p}.norm.bias"), vec![norm]);
+            add(format!("{p}.linear_fc1.weight"), vec![merged, merged]);
+            add(format!("{p}.linear_fc1.bias"), vec![merged]);
+            add(format!("{p}.linear_fc2.weight"), vec![output, merged]);
+            add(format!("{p}.linear_fc2.bias"), vec![output]);
         }
         Ok(())
     }

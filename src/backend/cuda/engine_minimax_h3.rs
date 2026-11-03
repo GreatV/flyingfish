@@ -2722,4 +2722,217 @@ mod tests {
         println!("H3_CHAIN_GATE PASS cell={cell} control=FAIL_AS_REQUIRED");
         Ok(())
     }
+
+    /// One Qwen3-VL conditioner cell: prompt tokens with their image grids and packed `pixel_values`.
+    struct ConditionerCell {
+        tokens: Vec<u32>,
+        modality: Vec<u8>,
+        grids: Vec<crate::vision_input::ImageGrid>,
+        pixels: Vec<f32>,
+    }
+
+    /// Cells A, D and E of the N6 freeze: tokens and grids of `tokens_from`, pixel rows of `pixel_sources` in order.
+    fn conditioner_cells(
+        s0: &Path,
+        image_token: u32,
+    ) -> Result<Vec<(&'static str, ConditionerCell)>> {
+        let mut cells = Vec::new();
+        for (name, tokens_from, pixel_sources) in [
+            ("A", "A-bf16", &["A-bf16"][..]),
+            ("D", "D-bf16", &["D-bf16"][..]),
+            ("E", "D-bf16", &["A-bf16", "B-bf16"][..]),
+        ] {
+            let map = mapped(&s0.join(tokens_from).join("text.safetensors"))?;
+            let text = SafeTensors::deserialize(&map)?;
+            let tokens: Vec<u32> = decoded(&text, "token_ids")?
+                .0
+                .into_iter()
+                .map(|v| v as u32)
+                .collect();
+            let (grid, _) = decoded(&text, "image_grid_thw")?;
+            let grids = grid
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|g| crate::vision_input::ImageGrid {
+                    t: g[0] as u32,
+                    h: g[1] as u32,
+                    w: g[2] as u32,
+                })
+                .collect();
+            let mut pixels = Vec::new();
+            for source in pixel_sources {
+                let map = mapped(&s0.join(source).join("text.safetensors"))?;
+                let file = SafeTensors::deserialize(&map)?;
+                pixels.extend(
+                    decoded(&file, "pixel_values")?
+                        .0
+                        .into_iter()
+                        .map(|v| v as f32),
+                );
+            }
+            let modality = tokens
+                .iter()
+                .map(|&id| u8::from(id == image_token))
+                .collect();
+            cells.push((
+                name,
+                ConditionerCell {
+                    tokens,
+                    modality,
+                    grids,
+                    pixels,
+                },
+            ));
+        }
+        Ok(cells)
+    }
+
+    /// N6b gate: the Qwen3-VL vision tower on the captured `pixel_values` of cells A, D and E; the merged features and
+    /// the three deepstack outputs are scored against the fp32 composition legs at the frozen `thresholds-n6-r2.json`
+    /// cells. Eager (the tower captures no graph), all tower weights resident. Control: deepstack taps shifted one
+    /// block later (9/17/25) must leave every deepstack output of cell A outside its cell.
+    #[test]
+    #[ignore = "GPU gate; set FF_H3_TEXT_ENCODER, FF_H3_S0 (Stage 0 runs), FF_H3_N6_LEGS (N6 reference legs) and FF_H3_N6_THRESHOLDS"]
+    fn conditioner_vision_matches_the_fp32_reference() -> Result<()> {
+        use crate::backend::cuda::{ops::CommonOpsRef, weights::WeightCatalog};
+        let var = |key: &str| -> Result<PathBuf> {
+            Ok(PathBuf::from(
+                std::env::var_os(key).with_context(|| format!("{key} missing"))?,
+            ))
+        };
+        let (encoder, s0, legs) = (
+            var("FF_H3_TEXT_ENCODER")?,
+            var("FF_H3_S0")?,
+            var("FF_H3_N6_LEGS")?,
+        );
+        let frozen: serde_json::Value =
+            serde_json::from_slice(&fs::read(var("FF_H3_N6_THRESHOLDS")?)?)?;
+        let spec = crate::model_spec::ModelSpec::read(&encoder)?;
+        ensure!(
+            spec.architecture == crate::model_spec::Architecture::Qwen3Vl,
+            "text encoder parsed as {:?}",
+            spec.architecture
+        );
+        let image_token = spec.vision.as_ref().context("vision missing")?.image_token;
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        let common = CommonOpsRef::new(&device.ctx)?;
+        let mut catalog = WeightCatalog::load_with_policy(
+            &encoder,
+            &spec,
+            &device,
+            crate::checkpoint::LoadPolicy::VisionOnly,
+        )?;
+        ensure!(
+            catalog.bytes == 1_190_533_600,
+            "vision weight ledger {} B",
+            catalog.bytes
+        );
+        let mut tower = super::super::vision_runtime::LayerNormTower::from_catalog(
+            &spec,
+            &mut catalog,
+            &device,
+            common,
+        )?;
+        ensure!(
+            catalog.tensors.is_empty(),
+            "vision binding left unloaded owners"
+        );
+        device.finish_upload()?;
+        let runtime = std::env::temp_dir().join(format!("ff-h3-vision-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(
+                true,
+                "MiniMax-H3 conditioner vision gate".into(),
+            )),
+        )?;
+        let cells = conditioner_cells(&s0, image_token)?;
+        let mut run = |tower: &super::super::vision_runtime::LayerNormTower,
+                       cell: &ConditionerCell|
+         -> Result<Vec<Vec<f64>>> {
+            let input = crate::vision_input::MultimodalInput {
+                input_ids: &cell.tokens,
+                modality_ids: &cell.modality,
+                pixel_values: &cell.pixels,
+                grids: &cell.grids,
+                audio: &[],
+            };
+            let request = tower.prepare(&device, &mut blas, &input, cell.tokens.len(), 0)?;
+            let encoded = tower.encode(&device.stream, &blas, request, None)?;
+            std::iter::once(&encoded.features)
+                .chain(&encoded.deepstack)
+                .map(|f| {
+                    Ok(device
+                        .stream
+                        .clone_dtoh(f)?
+                        .into_iter()
+                        .map(|v| f64::from(v.to_f32()))
+                        .collect())
+                })
+                .collect()
+        };
+        let names = ["merged", "deepstack0", "deepstack1", "deepstack2"];
+        let reference = |cell: &str| -> Result<Vec<Vec<f64>>> {
+            let map = mapped(
+                &legs
+                    .join(format!("C-{cell}-fp32"))
+                    .join("conditioner.safetensors"),
+            )?;
+            let file = SafeTensors::deserialize(&map)?;
+            names
+                .iter()
+                .map(|n| Ok(decoded(&file, &format!("vision.{n}"))?.0))
+                .collect()
+        };
+        let mut defects = Vec::new();
+        for (cell, inputs) in &cells {
+            let outputs = run(&tower, inputs)?;
+            let expected = reference(cell)?;
+            ensure!(
+                outputs.len() == names.len(),
+                "cell {cell}: {} outputs",
+                outputs.len()
+            );
+            for ((name, got), want) in names.iter().zip(&outputs).zip(&expected) {
+                ensure!(
+                    got.len() == want.len(),
+                    "cell {cell} {name}: {} vs {}",
+                    got.len(),
+                    want.len()
+                );
+                ensure!(
+                    got.iter().all(|v| v.is_finite()),
+                    "cell {cell} {name}: non-finite output"
+                );
+                let d = distance(got, want);
+                let ok = within(d, &frozen["thresholds"][format!("{cell}.vision.{name}")])?;
+                println!("H3_VISION cell={cell} {name}={d:?} within={ok}");
+                if !ok {
+                    defects.push(format!("{cell}.{name}"));
+                }
+            }
+        }
+        tower.shift_deepstack_taps()?;
+        let (_, a) = cells.first().context("cell A missing")?;
+        let shifted = run(&tower, a)?;
+        let expected = reference("A")?;
+        for (k, name) in names.iter().enumerate().skip(1) {
+            let d = distance(&shifted[k], &expected[k]);
+            println!("H3_VISION shifted-taps control cell=A {name}={d:?}");
+            ensure!(
+                !within(d, &frozen["thresholds"][format!("A.vision.{name}")])?,
+                "shifted deepstack taps passed A.vision.{name}"
+            );
+        }
+        if !defects.is_empty() {
+            bail!("H3_VISION_GATE DEFECT cells outside the frozen thresholds: {defects:?}");
+        }
+        println!("H3_VISION_GATE PASS cells=3 control=FAIL_AS_REQUIRED");
+        Ok(())
+    }
 }
