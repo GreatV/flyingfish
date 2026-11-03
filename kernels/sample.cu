@@ -589,9 +589,7 @@ extern "C" __global__ void philox_uniform_ids(
   }
 }
 
-// Inverse-CDF categorical sample per row: one uniform draw from the same
-// Philox stream, then the first prefix that reaches it (two passes: row sum,
-// then scan). Deterministic given (seed, stream).
+// Samples contiguous F32 CDF intervals from one Philox draw per row.
 extern "C" __global__ void categorical_sample_rows(
     const float* __restrict__ probs, int* __restrict__ out, int rows,
     long long vocab, unsigned long long seed, unsigned long long stream,
@@ -616,50 +614,39 @@ extern "C" __global__ void categorical_sample_rows(
   const long long lo = (long long)tid * chunk;
   const long long hi = lo + chunk < vocab ? lo + chunk : vocab;
 
-  __shared__ float s_stage[32];
   __shared__ float s_scan[1024];
   float sum = 0.0f;
   for (long long c = lo; c < hi; ++c) {
     const float probability = p[c];
     if (!isfinite(probability) || probability < 0.0f) { __trap(); return; }
-    sum += probability;
+    sum = __fadd_rn(sum, probability);
   }
-
-  // Block total of the row probabilities.
-  float t = sum;
-  for (int off = 16; off > 0; off >>= 1)
-    t += __shfl_down_sync(FF_WARP_MASK, t, off);
-  if (lane == 0) s_stage[warp] = t;
-  __syncthreads();
-  if (warp == 0) {
-    const int nw = (int)blockDim.x >> 5;
-    t = lane < nw ? s_stage[lane] : 0.0f;
-    for (int off = 16; off > 0; off >>= 1)
-      t += __shfl_down_sync(FF_WARP_MASK, t, off);
-    if (lane == 0) s_stage[0] = t;
-  }
-  __syncthreads();
-  if (!isfinite(s_stage[0]) || !(s_stage[0] > 0.0f)) { __trap(); return; }
-  const float norm = 1.0f / s_stage[0];
-
-  // Exclusive block scan over the per-thread chunk sums (s_scan).
   s_scan[tid] = sum;
   __syncthreads();
-  for (int d = 1; d < vocab_threads; d <<= 1) {
-    const float add = tid >= d ? s_scan[tid - d] : 0.0f;
-    __syncthreads();
-    s_scan[tid] += add;
-    __syncthreads();
+  if (tid == 0) {
+    float cumulative = 0.0f;
+    for (int i = 0; i < vocab_threads; ++i) {
+      cumulative = __fadd_rn(cumulative, s_scan[i]);
+      s_scan[i] = cumulative;
+    }
   }
-  float base = s_scan[tid] - sum;
+  __syncthreads();
+  const float total = s_scan[vocab_threads - 1];
+  if (!isfinite(total) || !(total > 0.0f)) { __trap(); return; }
+  const float target = fminf(__fmul_rn(u, total), nextafterf(total, 0.0f));
+  const float base = tid == 0 ? 0.0f : s_scan[tid - 1];
 
-  // First prefix reaching u inside this thread's chunk.
+  // The final local prefix equals this chunk's sum from the first pass.
   int mine = 0x7fffffff;
-  float run = base * norm;
-  for (long long c = lo; c < hi && mine == 0x7fffffff; ++c) {
-    const float next = run + p[c] * norm;
-    if (u >= run && u < next) mine = (int)c;
-    run = next;
+  if (target >= base && target < s_scan[tid]) {
+    float local = 0.0f;
+    float run = base;
+    for (long long c = lo; c < hi && mine == 0x7fffffff; ++c) {
+      local = __fadd_rn(local, p[c]);
+      const float next = __fadd_rn(base, local);
+      if (target >= run && target < next) mine = (int)c;
+      run = next;
+    }
   }
 
   __shared__ int s_pick[32];
