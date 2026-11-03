@@ -88,6 +88,32 @@ impl EntryReader {
             destination.len(),
             T::DTYPE
         );
+        let bytes = self.read(name, entry)?;
+        ensure!(T::finite(bytes), "{name}: nonfinite value");
+        let (pointer, _record) = destination.device_ptr_mut(stream);
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async(pointer, bytes, stream.cu_stream())?;
+        }
+        Ok(())
+    }
+
+    /// Copies a finite BF16 tensor into host memory of exactly its size.
+    fn read_into(&mut self, name: &str, entry: &TensorEntry, destination: &mut [u8]) -> Result<()> {
+        ensure!(
+            entry.dtype == Dtype::BF16 && entry.bytes == destination.len(),
+            "{name}: {:?} {} B does not fill {} B",
+            entry.dtype,
+            entry.bytes,
+            destination.len()
+        );
+        let bytes = self.read(name, entry)?;
+        ensure!(<bf16 as Element>::finite(bytes), "{name}: nonfinite value");
+        destination.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    /// The tensor's bytes, read with O_DIRECT into the reusable aligned staging buffer.
+    fn read(&mut self, name: &str, entry: &TensorEntry) -> Result<&[u8]> {
         if !self.readers.contains_key(&entry.shard) {
             let reader = SpanReader::open(&self.dir.join(&entry.shard), true)?;
             self.readers.insert(entry.shard.clone(), reader);
@@ -108,14 +134,7 @@ impl EntryReader {
         }
         let staging = self.staging.as_mut().context("staging buffer")?;
         let begin = usize::try_from(offset - span.begin)?;
-        let bytes =
-            &reader.read_span(&span, READ_CHUNK_BYTES, staging)?[begin..begin + entry.bytes];
-        ensure!(T::finite(bytes), "{name}: nonfinite value");
-        let (pointer, _record) = destination.device_ptr_mut(stream);
-        unsafe {
-            cudarc::driver::result::memcpy_htod_async(pointer, bytes, stream.cu_stream())?;
-        }
-        Ok(())
+        Ok(&reader.read_span(&span, READ_CHUNK_BYTES, staging)?[begin..begin + entry.bytes])
     }
 }
 
@@ -1314,12 +1333,27 @@ impl Dit {
         );
         let dense = if plan.slot_bytes > 0 {
             let dir = base.reader.dir.clone();
-            Some(crate::backend::cuda::weights::DenseStreaming::new(
-                &dir,
-                base.manifest,
-                plan,
-                d,
-            )?)
+            let host_tier = plan.host.clone();
+            let mut dense =
+                crate::backend::cuda::weights::DenseStreaming::new(&dir, base.manifest, plan, d)?;
+            for layer in (0..spec.layers).filter(|&layer| host_tier[layer]) {
+                let name = format!("transformer_blocks.{layer}");
+                let (layout, elements) = matrix_layout(base.manifest, &name)?;
+                let host = dense
+                    .host_layer(layer)?
+                    .with_context(|| format!("{name}: host tier without a pinned copy"))?;
+                ensure!(host.len() == 2 * elements, "{name}: pinned copy size");
+                for (role, (offset, _)) in &layout {
+                    let tensor = format!("{name}.{role}");
+                    let entry = &base.manifest.entries[&tensor];
+                    base.reader.read_into(
+                        &tensor,
+                        entry,
+                        &mut host[2 * offset..2 * offset + entry.bytes],
+                    )?;
+                }
+            }
+            Some(dense)
         } else {
             None
         };

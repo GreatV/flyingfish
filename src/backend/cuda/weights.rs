@@ -1455,6 +1455,20 @@ impl DenseStreaming {
         Ok(counts)
     }
 
+    /// Pinned host copy of a host-tier layer, its linear projections packed in manifest-name order; `None` for
+    /// resident and disk-tier layers. Callers outside the loader fill it before the first `begin`.
+    #[cfg(test)]
+    pub(crate) fn host_layer(&mut self, layer: usize) -> Result<Option<&mut [u8]>> {
+        let binding = self
+            .layers
+            .get_mut(layer)
+            .context("dense layer outside plan")?;
+        Ok(match binding.host.as_mut() {
+            Some(host) => Some(host.as_mut_slice()?),
+            None => None,
+        })
+    }
+
     pub(crate) fn pointer(&self, layer: usize, offset: usize, bytes: usize) -> Result<u64> {
         let binding = self.layers.get(layer).context("dense layer outside plan")?;
         ensure!(
