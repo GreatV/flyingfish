@@ -462,6 +462,7 @@ impl Flash {
                     | (32, 4, 128)
                     | (56, 56, 128)
                     | (32, 8, 128)
+                    | (64, 8, 128)
             ) {
             use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
             let ctx = stream.context();

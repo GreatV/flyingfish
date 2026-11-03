@@ -114,6 +114,24 @@ impl EntryReader {
 
     /// The tensor's bytes, read with O_DIRECT into the reusable aligned staging buffer.
     fn read(&mut self, name: &str, entry: &TensorEntry) -> Result<&[u8]> {
+        self.read_range(name, entry, 0, entry.bytes)
+    }
+
+    /// Bytes `start..start + bytes` of the tensor, read with O_DIRECT into the reusable aligned staging buffer.
+    fn read_range(
+        &mut self,
+        name: &str,
+        entry: &TensorEntry,
+        start: usize,
+        bytes: usize,
+    ) -> Result<&[u8]> {
+        ensure!(
+            start
+                .checked_add(bytes)
+                .is_some_and(|end| end <= entry.bytes),
+            "{name}: range {start}+{bytes} outside {} B",
+            entry.bytes
+        );
         if !self.readers.contains_key(&entry.shard) {
             let reader = SpanReader::open(&self.dir.join(&entry.shard), true)?;
             self.readers.insert(entry.shard.clone(), reader);
@@ -122,9 +140,10 @@ impl EntryReader {
         let offset = entry
             .data_start
             .checked_add(entry.data_offsets[0])
+            .and_then(|offset| offset.checked_add(start as u64))
             .context("tensor offset overflow")?;
         let span = reader
-            .plan(&[(offset, entry.bytes as u64)], READ_CHUNK_BYTES)?
+            .plan(&[(offset, bytes as u64)], READ_CHUNK_BYTES)?
             .pop()
             .with_context(|| format!("{name}: no read span"))?;
         let alignment = reader.alignment as usize;
@@ -134,7 +153,7 @@ impl EntryReader {
         }
         let staging = self.staging.as_mut().context("staging buffer")?;
         let begin = usize::try_from(offset - span.begin)?;
-        Ok(&reader.read_span(&span, READ_CHUNK_BYTES, staging)?[begin..begin + entry.bytes])
+        Ok(&reader.read_span(&span, READ_CHUNK_BYTES, staging)?[begin..begin + bytes])
     }
 }
 
@@ -344,7 +363,11 @@ const FF_OUT: usize = 5;
 /// fills a layer slot in, and the block's total matrix elements.
 type MatrixLayout = BTreeMap<String, (usize, [u32; 2])>;
 
-fn matrix_layout(manifest: &TensorManifest, block: &str) -> Result<(MatrixLayout, usize)> {
+fn matrix_layout(
+    manifest: &TensorManifest,
+    block: &str,
+    roles: &[&str],
+) -> Result<(MatrixLayout, usize)> {
     let prefix = format!("{block}.");
     let mut layout = BTreeMap::new();
     let mut elements = 0usize;
@@ -369,7 +392,7 @@ fn matrix_layout(manifest: &TensorManifest, block: &str) -> Result<(MatrixLayout
         elements += entry.bytes / 2;
     }
     ensure!(
-        layout.len() == LINEAR_ROLES.len() && LINEAR_ROLES.iter().all(|r| layout.contains_key(*r)),
+        layout.len() == roles.len() && roles.iter().all(|r| layout.contains_key(*r)),
         "{block}: matrix set {:?}",
         layout.keys().collect::<Vec<_>>()
     );
@@ -386,7 +409,7 @@ impl BlockWeights {
         base: &mut Source<'_>,
         lora: &mut Source<'_>,
     ) -> Result<Self> {
-        let (layout, elements) = matrix_layout(base.manifest, block)?;
+        let (layout, elements) = matrix_layout(base.manifest, block, &LINEAR_ROLES)?;
         let mut storage = s.alloc_zeros::<bf16>(elements)?;
         for (role, (offset, shape)) in &layout {
             let count = shape[0] as usize * shape[1] as usize;
@@ -412,7 +435,7 @@ impl BlockWeights {
         base: &mut Source<'_>,
         lora: &mut Source<'_>,
     ) -> Result<Self> {
-        let (layout, _) = matrix_layout(base.manifest, block)?;
+        let (layout, _) = matrix_layout(base.manifest, block, &LINEAR_ROLES)?;
         Self::with_linears(s, spec, rank, block, (slot, &layout), base, lora)
     }
 
@@ -1222,6 +1245,79 @@ fn cast_rows(
 /// The transformer over one request layout: F32 patch and output projections, BF16 text embedder, norms, refiner
 /// blocks and LoRA factors resident; the 50 transformer blocks' matrices placed by `DensePlacement` from the sensed
 /// VRAM and host budgets (resident, or two device slots fed from pinned host memory or the disk tier).
+/// Dense streaming of `layers` (per-layer matrix bytes, `largest` matrix) beside `owned` resident bytes: placement
+/// derived from free device memory and host RAM, or forced streamed / disk-only; host-tier copies are filled from
+/// `base` in `roles` order before the first `begin`.
+fn place_layers(
+    d: &Device,
+    base: &mut Source<'_>,
+    (layers, largest, owned): (&[usize], usize, usize),
+    placement: Placement,
+    name: impl Fn(usize) -> String,
+    roles: &[&str],
+) -> Result<Option<crate::backend::cuda::weights::DenseStreaming>> {
+    use crate::prefill::DensePlacement;
+    let (free, total) = d.ctx.mem_get_info()?;
+    let mut budget = DensePlacement::device_budget(free, total, owned, 0, 0)?;
+    if placement != Placement::Derived {
+        let slots = 2 * layers.iter().copied().max().context("no streamed layers")?;
+        ensure!(slots <= budget, "two block slots exceed the device budget");
+        budget = slots;
+    }
+    let mut plan = DensePlacement::new(layers, budget, 0)?;
+    let mut host = None;
+    if plan.slot_bytes > 0 {
+        let available = usize::try_from(crate::backend::cuda::calibrate::host_memory(Path::new(
+            "/",
+        ))?)?;
+        let reserved = 2 * plan.slot_bytes + largest + (4 << 30);
+        ensure!(
+            available >= reserved,
+            "dense pinned staging and host reserve exceed available RAM: need={reserved} available={available}"
+        );
+        let host_bytes = match placement {
+            Placement::StreamedDisk => 0,
+            Placement::Derived | Placement::Streamed => available - reserved,
+        };
+        plan = DensePlacement::new(layers, budget, host_bytes)?;
+        host = Some(available);
+    }
+    ensure!(
+        placement == Placement::Derived || plan.resident_bytes == 0,
+        "{placement:?} placement kept a resident block"
+    );
+    eprintln!(
+        "{}",
+        serde_json::json!({"h3_dense_placement": &plan, "mode": format!("{placement:?}"), "free_bytes": free, "total_bytes": total, "owned_block_bytes": owned, "host_available_bytes": host})
+    );
+    Ok(if plan.slot_bytes > 0 {
+        let dir = base.reader.dir.clone();
+        let host_tier = plan.host.clone();
+        let mut dense =
+            crate::backend::cuda::weights::DenseStreaming::new(&dir, base.manifest, plan, d)?;
+        for layer in (0..layers.len()).filter(|&layer| host_tier[layer]) {
+            let name = name(layer);
+            let (layout, elements) = matrix_layout(base.manifest, &name, roles)?;
+            let host = dense
+                .host_layer(layer)?
+                .with_context(|| format!("{name}: host tier without a pinned copy"))?;
+            ensure!(host.len() == 2 * elements, "{name}: pinned copy size");
+            for (role, (offset, _)) in &layout {
+                let tensor = format!("{name}.{role}");
+                let entry = &base.manifest.entries[&tensor];
+                base.reader.read_into(
+                    &tensor,
+                    entry,
+                    &mut host[2 * offset..2 * offset + entry.bytes],
+                )?;
+            }
+        }
+        Some(dense)
+    } else {
+        None
+    })
+}
+
 pub(crate) struct Dit {
     ranges: Ranges,
     proj_in: [CudaSlice<f32>; 2],
@@ -1262,7 +1358,6 @@ impl Dit {
         mut lora: Source<'_>,
         placement: Placement,
     ) -> Result<Self> {
-        use crate::prefill::DensePlacement;
         let s = &d.stream;
         let ranges = Ranges::of(layout)?;
         let (h, r) = (spec.hidden, rank);
@@ -1348,69 +1443,14 @@ impl Dit {
             .map(|(_, entry)| entry.bytes)
             .sum::<usize>()
             + spec.layers * 2 * (2 * h + 2 * spec.head_dim);
-        let (free, total) = d.ctx.mem_get_info()?;
-        let mut budget = DensePlacement::device_budget(free, total, owned, 0, 0)?;
-        if placement != Placement::Derived {
-            let slots = 2 * layers
-                .iter()
-                .copied()
-                .max()
-                .context("no transformer blocks")?;
-            ensure!(slots <= budget, "two block slots exceed the device budget");
-            budget = slots;
-        }
-        let mut plan = DensePlacement::new(&layers, budget, 0)?;
-        let mut host = None;
-        if plan.slot_bytes > 0 {
-            let available = usize::try_from(crate::backend::cuda::calibrate::host_memory(
-                Path::new("/"),
-            )?)?;
-            let reserved = 2 * plan.slot_bytes + largest + (4 << 30);
-            ensure!(
-                available >= reserved,
-                "dense pinned staging and host reserve exceed available RAM: need={reserved} available={available}"
-            );
-            let host_bytes = match placement {
-                Placement::StreamedDisk => 0,
-                Placement::Derived | Placement::Streamed => available - reserved,
-            };
-            plan = DensePlacement::new(&layers, budget, host_bytes)?;
-            host = Some(available);
-        }
-        ensure!(
-            placement == Placement::Derived || plan.resident_bytes == 0,
-            "{placement:?} placement kept a resident block"
-        );
-        eprintln!(
-            "{}",
-            serde_json::json!({"h3_dense_placement": &plan, "mode": format!("{placement:?}"), "free_bytes": free, "total_bytes": total, "owned_block_bytes": owned, "host_available_bytes": host})
-        );
-        let dense = if plan.slot_bytes > 0 {
-            let dir = base.reader.dir.clone();
-            let host_tier = plan.host.clone();
-            let mut dense =
-                crate::backend::cuda::weights::DenseStreaming::new(&dir, base.manifest, plan, d)?;
-            for layer in (0..spec.layers).filter(|&layer| host_tier[layer]) {
-                let name = format!("transformer_blocks.{layer}");
-                let (layout, elements) = matrix_layout(base.manifest, &name)?;
-                let host = dense
-                    .host_layer(layer)?
-                    .with_context(|| format!("{name}: host tier without a pinned copy"))?;
-                ensure!(host.len() == 2 * elements, "{name}: pinned copy size");
-                for (role, (offset, _)) in &layout {
-                    let tensor = format!("{name}.{role}");
-                    let entry = &base.manifest.entries[&tensor];
-                    base.reader.read_into(
-                        &tensor,
-                        entry,
-                        &mut host[2 * offset..2 * offset + entry.bytes],
-                    )?;
-                }
-            }
-            Some(dense)
-        } else {
-            None
-        };
+        let dense = place_layers(
+            d,
+            &mut base,
+            (&layers, largest, owned),
+            placement,
+            |layer| format!("transformer_blocks.{layer}"),
+            &LINEAR_ROLES,
+        )?;
         let mut blocks = Vec::with_capacity(spec.layers);
         for (layer, &bytes) in layers.iter().enumerate() {
             let name = format!("transformer_blocks.{layer}");
@@ -1763,6 +1803,474 @@ impl Dit {
         )?;
         Ok(())
     }
+}
+
+/// Roles of a Qwen3-VL decoder layer's matrices in manifest name order; `mlp.gate_proj` and `mlp.up_proj` are
+/// adjacent, so one `[2 * ffn, hidden]` view projects both.
+const TEXT_ROLES: [&str; 7] = [
+    "mlp.down_proj.weight",
+    "mlp.gate_proj.weight",
+    "mlp.up_proj.weight",
+    "self_attn.k_proj.weight",
+    "self_attn.o_proj.weight",
+    "self_attn.q_proj.weight",
+    "self_attn.v_proj.weight",
+];
+
+/// One Qwen3-VL decoder layer: matrices as views into `storage` or a dense streaming slot, norms owned.
+pub(crate) struct TextLayer {
+    input_norm: CudaSlice<bf16>,
+    post_norm: CudaSlice<bf16>,
+    q_norm: CudaSlice<bf16>,
+    k_norm: CudaSlice<bf16>,
+    q: Tensor<bf16, 2>,
+    k: Tensor<bf16, 2>,
+    v: Tensor<bf16, 2>,
+    o: Tensor<bf16, 2>,
+    gate_up: Tensor<bf16, 2>,
+    down: Tensor<bf16, 2>,
+    storage: Option<CudaSlice<bf16>>,
+}
+
+impl TextLayer {
+    fn new(
+        s: &Arc<CudaStream>,
+        block: &str,
+        (hidden, head_dim): (usize, usize),
+        slot: Option<u64>,
+        base: &mut Source<'_>,
+    ) -> Result<Self> {
+        let (layout, elements) = matrix_layout(base.manifest, block, &TEXT_ROLES)?;
+        let mut storage = None;
+        let at = match slot {
+            Some(slot) => slot,
+            None => {
+                let mut owned = s.alloc_zeros::<bf16>(elements)?;
+                for (role, (offset, shape)) in &layout {
+                    let count = shape[0] as usize * shape[1] as usize;
+                    base.into(
+                        s,
+                        &format!("{block}.{role}"),
+                        &mut owned.slice_mut(*offset..offset + count),
+                    )?;
+                }
+                let at = pointer(&owned, s);
+                storage = Some(owned);
+                at
+            }
+        };
+        let view = |offset: usize, shape: [u32; 2]| unsafe {
+            Tensor::new(
+                at + 2 * offset as u64,
+                shape,
+                [u64::from(shape[1]), 1],
+                2 * u64::from(shape[0]) * u64::from(shape[1]),
+            )
+        };
+        let role = |name: &str| -> Result<Tensor<bf16, 2>> {
+            let (offset, shape) = layout[name];
+            view(offset, shape)
+        };
+        let (gate, gate_shape) = layout["mlp.gate_proj.weight"];
+        let (up, up_shape) = layout["mlp.up_proj.weight"];
+        ensure!(
+            gate_shape == up_shape && up == gate + gate_shape[0] as usize * gate_shape[1] as usize,
+            "{block}: gate and up projections are not adjacent"
+        );
+        let norm = |base: &mut Source<'_>, name: &str, n: usize| {
+            base.tensor::<bf16>(s, &format!("{block}.{name}.weight"), n)
+        };
+        let mut layer = Self {
+            input_norm: norm(base, "input_layernorm", hidden)?,
+            post_norm: norm(base, "post_attention_layernorm", hidden)?,
+            q_norm: norm(base, "self_attn.q_norm", head_dim)?,
+            k_norm: norm(base, "self_attn.k_norm", head_dim)?,
+            q: role("self_attn.q_proj.weight")?,
+            k: role("self_attn.k_proj.weight")?,
+            v: role("self_attn.v_proj.weight")?,
+            o: role("self_attn.o_proj.weight")?,
+            gate_up: view(gate, [2 * gate_shape[0], gate_shape[1]])?,
+            down: role("mlp.down_proj.weight")?,
+            storage: None,
+        };
+        layer.storage = storage;
+        Ok(layer)
+    }
+}
+
+/// Conditioner input over `rows` prompt rows: the BF16 input embeddings `[rows, hidden]` with the image rows already
+/// spliced, the deepstack features added to the image rows after decoder layers `0..deepstack.len()`
+/// (`[image rows, hidden]` each, image runs in order), the image runs as `(first row, rows)`, and the BF16 mRoPE
+/// table `[rows, head_dim]` (cosines, then sines).
+pub(crate) struct ConditionerInput<'a> {
+    pub embeds: &'a [bf16],
+    pub deepstack: &'a [CudaSlice<bf16>],
+    pub runs: &'a [(usize, usize)],
+    pub rope: &'a [bf16],
+}
+
+/// The Qwen3-VL conditioner text decoder: layers `0..layers.len()` of the published checkpoint, placed through
+/// dense streaming; the output is the residual after the last layer (`hidden_states[layers]`).
+pub(crate) struct Conditioner {
+    hidden: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    ffn: usize,
+    eps: f32,
+    capacity: usize,
+    layers: Vec<TextLayer>,
+    dense: Option<crate::backend::cuda::weights::DenseStreaming>,
+    kernels: BlockKernels,
+    flash: Flash,
+    x: CudaSlice<bf16>,
+    normed: CudaSlice<bf16>,
+    q: CudaSlice<bf16>,
+    k: CudaSlice<bf16>,
+    v: CudaSlice<bf16>,
+    keys: CudaSlice<bf16>,
+    values: CudaSlice<bf16>,
+    attention: CudaSlice<bf16>,
+    gate_up: CudaSlice<bf16>,
+    gated: CudaSlice<bf16>,
+    rope: CudaSlice<bf16>,
+}
+
+impl Conditioner {
+    pub(crate) fn new(
+        d: &Device,
+        spec: &crate::model_spec::ModelSpec,
+        (layers, capacity): (usize, usize),
+        mut base: Source<'_>,
+        placement: Placement,
+    ) -> Result<Self> {
+        ensure!(
+            spec.architecture == crate::model_spec::Architecture::Qwen3Vl
+                && layers <= spec.layers.len(),
+            "conditioner needs Qwen3-VL with at least {layers} decoder layers"
+        );
+        let s = &d.stream;
+        let (hidden, head_dim, ffn) = (
+            spec.hidden as usize,
+            spec.head_dim as usize,
+            spec.intermediate as usize,
+        );
+        let (q_heads, kv_heads) = (spec.q_heads as usize, spec.kv_heads as usize);
+        let name = |layer: usize| format!("model.language_model.layers.{layer}");
+        let mut bytes = vec![0usize; layers];
+        let mut largest = 0usize;
+        for entry in base.manifest.entries.values() {
+            if let Some(layer) = entry.layer
+                && entry.load
+                && entry.shape.len() == 2
+            {
+                let layer = layer as usize;
+                ensure!(layer < layers, "manifest loads decoder layer {layer}");
+                bytes[layer] += entry.bytes;
+                largest = largest.max(entry.bytes);
+            }
+        }
+        let owned = layers * 2 * (2 * hidden + 2 * head_dim);
+        let dense = place_layers(
+            d,
+            &mut base,
+            (&bytes, largest, owned),
+            placement,
+            name,
+            &TEXT_ROLES,
+        )?;
+        let mut text_layers = Vec::with_capacity(layers);
+        for (layer, &layer_bytes) in bytes.iter().enumerate() {
+            let slot = match &dense {
+                Some(dense) if dense.plan.slots[layer].is_some() => {
+                    Some(dense.pointer(layer, 0, layer_bytes)?)
+                }
+                _ => None,
+            };
+            text_layers.push(TextLayer::new(
+                s,
+                &name(layer),
+                (hidden, head_dim),
+                slot,
+                &mut base,
+            )?);
+        }
+        let rows = |width: usize| s.alloc_zeros::<bf16>(capacity * width);
+        Ok(Self {
+            hidden,
+            q_heads,
+            kv_heads,
+            head_dim,
+            ffn,
+            eps: spec.rms_eps,
+            capacity,
+            layers: text_layers,
+            dense,
+            kernels: BlockKernels::new(s.context())?,
+            flash: Flash::new(s.clone(), capacity, q_heads, kv_heads, head_dim)?,
+            x: rows(hidden)?,
+            normed: rows(hidden)?,
+            q: rows(q_heads * head_dim)?,
+            k: rows(kv_heads * head_dim)?,
+            v: rows(kv_heads * head_dim)?,
+            keys: rows(kv_heads * head_dim)?,
+            values: rows(kv_heads * head_dim)?,
+            attention: rows(q_heads * head_dim)?,
+            gate_up: rows(2 * ffn)?,
+            gated: rows(ffn)?,
+            rope: rows(head_dim)?,
+        })
+    }
+
+    /// Binds the fixed GEMM plans of every decoder-layer shape at `rows`.
+    pub(crate) fn prepare(&self, blas: &Blas, rows: usize) -> Result<()> {
+        let (h, q, kv, f) = (
+            self.hidden,
+            self.q_heads * self.head_dim,
+            self.kv_heads * self.head_dim,
+            self.ffn,
+        );
+        for (output, input) in [(q, h), (kv, h), (h, q), (2 * f, h), (h, f)] {
+            blas.prepare_fixed(
+                u32::try_from(rows)?,
+                u32::try_from(output)?,
+                u32::try_from(input)?,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Runs every decoder layer on `input` and returns the residual after layer `tap - 1` for each `tap`, in order.
+    pub(crate) fn forward(
+        &mut self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        input: &ConditionerInput<'_>,
+        taps: &[usize],
+    ) -> Result<Vec<Vec<bf16>>> {
+        let (h, d) = (self.hidden, self.head_dim);
+        let (qw, kvw) = (self.q_heads * d, self.kv_heads * d);
+        ensure!(
+            !input.embeds.is_empty() && input.embeds.len().is_multiple_of(h),
+            "embedding extent"
+        );
+        let rows = input.embeds.len() / h;
+        ensure!(
+            rows <= self.capacity,
+            "{rows} rows exceed capacity {}",
+            self.capacity
+        );
+        ensure!(input.rope.len() == rows * d, "mRoPE table extent");
+        let image_rows: usize = input.runs.iter().map(|&(_, n)| n).sum();
+        ensure!(
+            input.runs.iter().all(|&(first, n)| first + n <= rows)
+                && input.deepstack.len() <= self.layers.len()
+                && input.deepstack.iter().all(|f| f.len() == image_rows * h),
+            "image runs or deepstack features differ from the prompt"
+        );
+        ensure!(
+            taps.iter()
+                .all(|&tap| (1..=self.layers.len()).contains(&tap)),
+            "taps outside 1..={}",
+            self.layers.len()
+        );
+        s.memcpy_htod(input.embeds, &mut self.x.slice_mut(..rows * h))?;
+        s.memcpy_htod(input.rope, &mut self.rope.slice_mut(..rows * d))?;
+        let rows_i = i32::try_from(rows)?;
+        let linear = |weight: Tensor<bf16, 2>,
+                      x: &CudaSlice<bf16>,
+                      k: usize,
+                      y: &CudaSlice<bf16>,
+                      n: usize|
+         -> Result<()> {
+            blas.linear_typed(
+                crate::op_contract::ExecutionPhase::Prefill,
+                crate::backend::cuda::linear::LinearWeightRef::Bf16(weight),
+                rows_view(x, s, 0, rows, k, k)?,
+                &mut TensorMut(rows_view(y, s, 0, rows, n, n)?),
+            )
+        };
+        let kernels = &self.kernels;
+        let norm = |input: &CudaSlice<bf16>,
+                    weight: &CudaSlice<bf16>,
+                    output: &CudaSlice<bf16>,
+                    (rows, dim, threads): (usize, usize, u32)|
+         -> Result<()> {
+            kernels.rms_norm(
+                s,
+                NormRows {
+                    input: pointer(input, s),
+                    weight: pointer(weight, s),
+                    output: pointer(output, s),
+                    rows,
+                    dim,
+                    threads,
+                    eps: self.eps,
+                },
+            )
+        };
+        let residual = |residual: u64, update: u64, count: usize| -> Result<()> {
+            unsafe {
+                s.launch_builder(&kernels.residual)
+                    .arg(&residual)
+                    .arg(&update)
+                    .arg(&i32::try_from(count)?)
+                    .launch(flat(count / 8))?;
+            }
+            Ok(())
+        };
+        let mut tapped = Vec::with_capacity(taps.len());
+        let x = pointer(&self.x, s);
+        let normed = pointer(&self.normed, s);
+        for (index, layer) in self.layers.iter().enumerate() {
+            if let Some(dense) = self.dense.as_mut() {
+                dense.begin(index, s)?;
+            }
+            norm(
+                &self.x,
+                &layer.input_norm,
+                &self.normed,
+                (rows, h, HIDDEN_NORM_THREADS),
+            )?;
+            linear(layer.q, &self.normed, h, &self.attention, qw)?;
+            linear(layer.k, &self.normed, h, &self.keys, kvw)?;
+            linear(layer.v, &self.normed, h, &self.v, kvw)?;
+            norm(
+                &self.attention,
+                &layer.q_norm,
+                &self.q,
+                (rows * self.q_heads, d, HEAD_NORM_THREADS),
+            )?;
+            norm(
+                &self.keys,
+                &layer.k_norm,
+                &self.k,
+                (rows * self.kv_heads, d, HEAD_NORM_THREADS),
+            )?;
+            // q rotates in place; k and v land head-major [kv_heads, rows, head_dim] in keys and values.
+            unsafe {
+                s.launch_builder(&kernels.rotary)
+                    .arg(&pointer(&self.q, s))
+                    .arg(&pointer(&self.k, s))
+                    .arg(&pointer(&self.v, s))
+                    .arg(&pointer(&self.keys, s))
+                    .arg(&pointer(&self.values, s))
+                    .arg(&pointer(&self.rope, s))
+                    .arg(&0i32)
+                    .arg(&rows_i)
+                    .arg(&i32::try_from(self.q_heads)?)
+                    .arg(&i32::try_from(self.kv_heads)?)
+                    .arg(&i32::try_from(d)?)
+                    .arg(&i32::try_from(d)?)
+                    .arg(&rows_i)
+                    .launch(flat(rows * (self.q_heads + self.kv_heads) * d))?;
+            }
+            self.flash.run(
+                &self.q,
+                qw,
+                &self.keys,
+                &self.values,
+                &mut self.attention,
+                Shape {
+                    rows,
+                    start: 0,
+                    q_heads: self.q_heads,
+                    kv_heads: self.kv_heads,
+                    capacity: rows,
+                    head_dim: d,
+                    causal: true,
+                    window_left: None,
+                },
+            )?;
+            linear(layer.o, &self.attention, qw, &self.normed, h)?;
+            residual(x, normed, rows * h)?;
+            norm(
+                &self.x,
+                &layer.post_norm,
+                &self.normed,
+                (rows, h, HIDDEN_NORM_THREADS),
+            )?;
+            linear(layer.gate_up, &self.normed, h, &self.gate_up, 2 * self.ffn)?;
+            unsafe {
+                s.launch_builder(&kernels.swiglu)
+                    .arg(&pointer(&self.gate_up, s))
+                    .arg(&pointer(&self.gated, s))
+                    .arg(&rows_i)
+                    .arg(&i32::try_from(self.ffn)?)
+                    .arg(&0i32)
+                    .launch(flat(rows * self.ffn))?;
+            }
+            linear(layer.down, &self.gated, self.ffn, &self.normed, h)?;
+            residual(x, normed, rows * h)?;
+            if let Some(features) = input.deepstack.get(index) {
+                let mut feature = 0usize;
+                for &(first, n) in input.runs {
+                    residual(
+                        x + (2 * first * h) as u64,
+                        pointer(features, s) + (2 * feature * h) as u64,
+                        n * h,
+                    )?;
+                    feature += n;
+                }
+            }
+            if let Some(dense) = self.dense.as_mut() {
+                dense.end(index, s)?;
+            }
+            if taps.contains(&(index + 1)) {
+                tapped.push((index + 1, s.clone_dtoh(&self.x.slice(..rows * h))?));
+            }
+        }
+        Ok(taps
+            .iter()
+            .map(|tap| {
+                tapped
+                    .iter()
+                    .find(|(t, _)| t == tap)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default()
+            })
+            .collect())
+    }
+}
+
+/// `[ids.len(), hidden]` BF16 rows of the published embedding table `embed`, read row by row.
+pub(crate) fn embedding_rows(
+    base: &mut Source<'_>,
+    embed: &str,
+    hidden: usize,
+    ids: &[u32],
+) -> Result<Vec<bf16>> {
+    let entry = base
+        .manifest
+        .entries
+        .get(embed)
+        .with_context(|| format!("manifest lacks {embed}"))?;
+    ensure!(
+        entry.dtype == Dtype::BF16 && entry.shape.len() == 2 && entry.shape[1] == hidden,
+        "{embed}: {:?} {:?}",
+        entry.dtype,
+        entry.shape
+    );
+    let row = 2 * hidden;
+    let mut out = Vec::with_capacity(ids.len() * hidden);
+    for &id in ids {
+        ensure!((id as usize) < entry.shape[0], "token {id} outside {embed}");
+        let bytes = base
+            .reader
+            .read_range(embed, entry, id as usize * row, row)?;
+        ensure!(
+            <bf16 as Element>::finite(bytes),
+            "{embed}: nonfinite row {id}"
+        );
+        out.extend(
+            bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| bf16::from_le_bytes(*b)),
+        );
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -2933,6 +3441,440 @@ mod tests {
             bail!("H3_VISION_GATE DEFECT cells outside the frozen thresholds: {defects:?}");
         }
         println!("H3_VISION_GATE PASS cells=3 control=FAIL_AS_REQUIRED");
+        Ok(())
+    }
+
+    /// Image-token runs of a prompt as `(first row, rows)`.
+    fn image_runs(tokens: &[u32], image_token: u32) -> Vec<(usize, usize)> {
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for (row, &id) in tokens.iter().enumerate() {
+            if id != image_token {
+                continue;
+            }
+            match runs.last_mut() {
+                Some((first, n)) if *first + *n == row => *n += 1,
+                _ => runs.push((row, 1)),
+            }
+        }
+        runs
+    }
+
+    /// BF16 mRoPE table `[rows, head_dim]` of a conditioner cell from its validated position plan.
+    fn conditioner_rope(
+        spec: &crate::model_spec::ModelSpec,
+        cell: &ConditionerCell,
+    ) -> Result<Vec<bf16>> {
+        let vision = spec.vision.as_ref().context("vision missing")?;
+        let section = vision.mrope_section.context("mRoPE section missing")?;
+        let plan = crate::vision_input::MultimodalInput {
+            input_ids: &cell.tokens,
+            modality_ids: &cell.modality,
+            pixel_values: &cell.pixels,
+            grids: &cell.grids,
+            audio: &[],
+        }
+        .validate(spec, cell.tokens.len())?;
+        Ok(
+            crate::minimax_h3::mrope_table(&plan, section, spec.rope_theta, spec.head_dim)?
+                .into_iter()
+                .map(bf16::from_f32)
+                .collect(),
+        )
+    }
+
+    /// Scores `got` against `want` (`[rows, width]`) under a frozen sink-rule cell: the candidate's sink rows `C`
+    /// satisfy `I <= C <= U`, every row of `I` meets its row bound, and the rows outside `U` meet the aggregate bound.
+    fn sink_rule(
+        got: &[f64],
+        want: &[f64],
+        width: usize,
+        cell: &serde_json::Value,
+    ) -> Result<(bool, String)> {
+        use std::collections::BTreeSet;
+        let rows = want.len() / width;
+        let number = |v: &serde_json::Value, key: &str| {
+            v[key]
+                .as_f64()
+                .with_context(|| format!("sink cell lacks {key}"))
+        };
+        let (median, factor) = (
+            number(cell, "median_norm_fp32")?,
+            number(cell, "sink_factor")?,
+        );
+        let row = |v: &[f64], r: usize| v[r * width..(r + 1) * width].to_vec();
+        let norm = |v: &[f64], r: usize| row(v, r).iter().map(|x| x * x).sum::<f64>().sqrt();
+        let set = |key: &str| -> Result<BTreeSet<usize>> {
+            cell[key]
+                .as_array()
+                .with_context(|| format!("sink cell lacks {key}"))?
+                .iter()
+                .map(|r| r.as_u64().map(|r| r as usize).context("sink row"))
+                .collect()
+        };
+        let candidate: BTreeSet<usize> = (0..rows)
+            .filter(|&r| norm(got, r) > factor * median)
+            .collect();
+        let (inter, union) = (set("I")?, set("U")?);
+        let mut ok = inter.is_subset(&candidate) && candidate.is_subset(&union);
+        let mut sink_rows = Vec::new();
+        for &r in &inter {
+            let d = distance(&row(got, r), &row(want, r));
+            let bound = &cell["rows"][r.to_string()];
+            let within_row = d[1] <= number(bound, "rel_max")? && d[2] >= number(bound, "cos_min")?;
+            ok &= within_row;
+            sink_rows.push((r, d[1], d[2], within_row));
+        }
+        let keep: Vec<usize> = (0..rows).filter(|r| !union.contains(r)).collect();
+        let gather = |v: &[f64]| keep.iter().flat_map(|&r| row(v, r)).collect::<Vec<_>>();
+        let aggregate = distance(&gather(got), &gather(want));
+        ok &= within(aggregate, &cell["aggregate"])?;
+        Ok((
+            ok,
+            format!(
+                "sinks={candidate:?} I={inter:?} U={union:?} sink_rows={sink_rows:?} aggregate={aggregate:?}"
+            ),
+        ))
+    }
+
+    /// BF16 copy of an F32 reference tensor.
+    fn bf16_of(file: &SafeTensors<'_>, name: &str) -> Result<Vec<bf16>> {
+        Ok(decoded(file, name)?
+            .0
+            .into_iter()
+            .map(bf16::from_f64)
+            .collect())
+    }
+
+    /// Conditioner input of one cell: table rows for text tokens, `merged` for the image rows in order.
+    fn conditioner_embeds(
+        cell: &ConditionerCell,
+        image_token: u32,
+        table: &BTreeMap<u32, Vec<bf16>>,
+        merged: &[bf16],
+        hidden: usize,
+    ) -> Result<Vec<bf16>> {
+        let mut embeds = Vec::with_capacity(cell.tokens.len() * hidden);
+        let mut feature = 0usize;
+        for &id in &cell.tokens {
+            if id == image_token {
+                embeds.extend_from_slice(
+                    merged
+                        .get(feature * hidden..(feature + 1) * hidden)
+                        .context("fewer image features than image tokens")?,
+                );
+                feature += 1;
+            } else {
+                embeds.extend_from_slice(table.get(&id).context("embedding row missing")?);
+            }
+        }
+        ensure!(
+            feature * hidden == merged.len(),
+            "more image features than image tokens"
+        );
+        Ok(embeds)
+    }
+
+    /// Conditioner text gate state shared by the N6c and N6d gates: the checkpoint manifest with `layers` decoder
+    /// layers loading, the embedding rows of every cell's text tokens, and the frozen thresholds.
+    struct TextGate {
+        encoder: PathBuf,
+        legs: PathBuf,
+        spec: crate::model_spec::ModelSpec,
+        frozen: serde_json::Value,
+        cells: Vec<(&'static str, ConditionerCell)>,
+        table: BTreeMap<u32, Vec<bf16>>,
+        manifest: TensorManifest,
+    }
+
+    impl TextGate {
+        fn new(layers: usize) -> Result<Self> {
+            let var = |key: &str| -> Result<PathBuf> {
+                Ok(PathBuf::from(
+                    std::env::var_os(key).with_context(|| format!("{key} missing"))?,
+                ))
+            };
+            let (encoder, s0, legs) = (
+                var("FF_H3_TEXT_ENCODER")?,
+                var("FF_H3_S0")?,
+                var("FF_H3_N6_LEGS")?,
+            );
+            let frozen = serde_json::from_slice(&fs::read(var("FF_H3_N6_THRESHOLDS")?)?)?;
+            let spec = crate::model_spec::ModelSpec::read(&encoder)?;
+            let image_token = spec.vision.as_ref().context("vision missing")?.image_token;
+            let manifest = MappedCheckpoint::open_component(&encoder, "model")?
+                .minimax_h3_conditioner_manifest(&spec, layers)?;
+            let cells = conditioner_cells(&s0, image_token)?;
+            let ids: std::collections::BTreeSet<u32> = cells
+                .iter()
+                .flat_map(|(_, c)| c.tokens.iter().copied())
+                .filter(|&id| id != image_token)
+                .collect();
+            let ids: Vec<u32> = ids.into_iter().collect();
+            let hidden = spec.hidden as usize;
+            let rows = embedding_rows(
+                &mut Source::new(&encoder, &manifest),
+                "model.language_model.embed_tokens.weight",
+                hidden,
+                &ids,
+            )?;
+            let table = ids
+                .iter()
+                .zip(rows.chunks(hidden))
+                .map(|(&id, row)| (id, row.to_vec()))
+                .collect();
+            println!(
+                "H3_TEXT embedding_rows={} bytes={}",
+                ids.len(),
+                2 * rows.len()
+            );
+            Ok(Self {
+                encoder,
+                legs,
+                spec,
+                frozen,
+                cells,
+                table,
+                manifest,
+            })
+        }
+
+        fn image_token(&self) -> Result<u32> {
+            Ok(self
+                .spec
+                .vision
+                .as_ref()
+                .context("vision missing")?
+                .image_token)
+        }
+
+        /// Scores `taps` (hidden_states indices) of one cell against `{kind}-{cell}-fp32` and the frozen `{cell}.{label}` cells;
+        /// returns whether the gating hidden_states[50] passed.
+        fn score(
+            &self,
+            cell: &str,
+            (kind, label): (&str, &str),
+            outputs: &[Vec<bf16>],
+            taps: &[usize],
+        ) -> Result<bool> {
+            let map = mapped(
+                &self
+                    .legs
+                    .join(format!("{kind}-{cell}-fp32"))
+                    .join("conditioner.safetensors"),
+            )?;
+            let file = SafeTensors::deserialize(&map)?;
+            let mut gating = true;
+            for (output, &tap) in outputs.iter().zip(taps) {
+                let got: Vec<f64> = output.iter().map(|v| f64::from(v.to_f32())).collect();
+                let want = decoded(&file, &format!("text.hidden_states_{tap}"))?.0;
+                ensure!(
+                    got.len() == want.len(),
+                    "cell {cell} hidden_states[{tap}] extent"
+                );
+                ensure!(
+                    got.iter().all(|v| v.is_finite()),
+                    "cell {cell} hidden_states[{tap}] non-finite"
+                );
+                let (ok, summary) = sink_rule(
+                    &got,
+                    &want,
+                    self.spec.hidden as usize,
+                    &self.frozen["thresholds"][format!("{cell}.{label}.hidden_states_{tap}")],
+                )?;
+                println!("H3_TEXT {label} cell={cell} hidden_states_{tap} within={ok} {summary}");
+                if tap == 50 {
+                    gating = ok;
+                }
+            }
+            Ok(gating)
+        }
+    }
+
+    const TEXT_TAPS: [usize; 4] = [1, 4, 25, 50];
+
+    /// N6c gate: Qwen3-VL decoder layers 0-49 on the fp32 reference vision features of cells A, D and E (image rows
+    /// spliced as BF16, the three deepstack features added after layers 0-2); hidden_states[50] is scored under the
+    /// frozen sink rule of `thresholds-n6-r2.json` against the `T-<cell>-fp32` legs, hidden_states[1/4/25] printed.
+    /// Layers placed per `FF_H3_PLACEMENT`, eager (no graph capture). Layer 50 also loads for the control tap.
+    /// Controls on cell A: hidden_states[51] scored as hidden_states[50], and deepstack off, must both fail.
+    #[test]
+    #[ignore = "GPU gate; set FF_H3_TEXT_ENCODER, FF_H3_S0, FF_H3_N6_LEGS, FF_H3_N6_THRESHOLDS and FF_H3_PLACEMENT"]
+    fn conditioner_text_matches_the_fp32_reference() -> Result<()> {
+        let gate = TextGate::new(51)?;
+        let (hidden, image_token) = (gate.spec.hidden as usize, gate.image_token()?);
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let runtime = std::env::temp_dir().join(format!("ff-h3-text-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(
+                true,
+                "MiniMax-H3 conditioner text gate".into(),
+            )),
+        )?;
+        let capacity = gate
+            .cells
+            .iter()
+            .map(|(_, c)| c.tokens.len())
+            .max()
+            .context("no cells")?;
+        let mut conditioner = Conditioner::new(
+            &device,
+            &gate.spec,
+            (51, capacity),
+            Source::new(&gate.encoder, &gate.manifest),
+            Placement::from_env()?,
+        )?;
+        let mut defects = Vec::new();
+        for (cell, inputs) in &gate.cells {
+            conditioner.prepare(&blas, inputs.tokens.len())?;
+            let map = mapped(
+                &gate
+                    .legs
+                    .join(format!("C-{cell}-fp32"))
+                    .join("conditioner.safetensors"),
+            )?;
+            let reference = SafeTensors::deserialize(&map)?;
+            let merged = bf16_of(&reference, "vision.merged")?;
+            let deepstack = (0..3)
+                .map(|k| {
+                    Ok(device
+                        .stream
+                        .clone_htod(&bf16_of(&reference, &format!("vision.deepstack{k}"))?)?)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let embeds = conditioner_embeds(inputs, image_token, &gate.table, &merged, hidden)?;
+            let runs = image_runs(&inputs.tokens, image_token);
+            let rope = conditioner_rope(&gate.spec, inputs)?;
+            let input = ConditionerInput {
+                embeds: &embeds,
+                deepstack: &deepstack,
+                runs: &runs,
+                rope: &rope,
+            };
+            let mut taps = TEXT_TAPS.to_vec();
+            taps.push(51);
+            let outputs = conditioner.forward(&device.stream, &blas, &input, &taps)?;
+            if !gate.score(cell, ("T", "text"), &outputs[..4], &TEXT_TAPS)? {
+                defects.push(*cell);
+            }
+            if *cell == "A" {
+                ensure!(
+                    !gate.score(cell, ("T", "text"), &outputs[4..], &[50])?,
+                    "hidden_states[51] passed the hidden_states[50] cell"
+                );
+                let flat = ConditionerInput {
+                    deepstack: &[],
+                    ..input
+                };
+                let outputs = conditioner.forward(&device.stream, &blas, &flat, &[50])?;
+                ensure!(
+                    !gate.score(cell, ("T", "text"), &outputs, &[50])?,
+                    "deepstack-off control passed cell A"
+                );
+                println!("H3_TEXT controls cell=A tap51=FAIL deepstack_off=FAIL as required");
+            }
+        }
+        if !defects.is_empty() {
+            bail!("H3_TEXT_GATE DEFECT cells outside the frozen thresholds: {defects:?}");
+        }
+        println!("H3_TEXT_GATE PASS cells=3 control=FAIL_AS_REQUIRED");
+        Ok(())
+    }
+
+    /// N6d gate: the native vision tower on the captured `pixel_values` feeds the native decoder layers 0-49 (merged
+    /// features spliced, deepstack added) for cells A, D and E; hidden_states[50] is scored under the frozen sink
+    /// rule against the `C-<cell>-fp32` composition legs. Tower eager with resident weights; layers placed per
+    /// `FF_H3_PLACEMENT`, eager.
+    #[test]
+    #[ignore = "GPU gate; set FF_H3_TEXT_ENCODER, FF_H3_S0, FF_H3_N6_LEGS, FF_H3_N6_THRESHOLDS and FF_H3_PLACEMENT"]
+    fn conditioner_composition_matches_the_fp32_reference() -> Result<()> {
+        use crate::backend::cuda::{ops::CommonOpsRef, weights::WeightCatalog};
+        let gate = TextGate::new(50)?;
+        let (hidden, image_token) = (gate.spec.hidden as usize, gate.image_token()?);
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        let mut catalog = WeightCatalog::load_with_policy(
+            &gate.encoder,
+            &gate.spec,
+            &device,
+            crate::checkpoint::LoadPolicy::VisionOnly,
+        )?;
+        let tower = super::super::vision_runtime::LayerNormTower::from_catalog(
+            &gate.spec,
+            &mut catalog,
+            &device,
+            CommonOpsRef::new(&device.ctx)?,
+        )?;
+        ensure!(
+            catalog.tensors.is_empty(),
+            "vision binding left unloaded owners"
+        );
+        device.finish_upload()?;
+        let runtime =
+            std::env::temp_dir().join(format!("ff-h3-composition-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(
+                true,
+                "MiniMax-H3 conditioner composition gate".into(),
+            )),
+        )?;
+        let capacity = gate
+            .cells
+            .iter()
+            .map(|(_, c)| c.tokens.len())
+            .max()
+            .context("no cells")?;
+        let mut conditioner = Conditioner::new(
+            &device,
+            &gate.spec,
+            (50, capacity),
+            Source::new(&gate.encoder, &gate.manifest),
+            Placement::from_env()?,
+        )?;
+        let mut defects = Vec::new();
+        for (cell, inputs) in &gate.cells {
+            let input = crate::vision_input::MultimodalInput {
+                input_ids: &inputs.tokens,
+                modality_ids: &inputs.modality,
+                pixel_values: &inputs.pixels,
+                grids: &inputs.grids,
+                audio: &[],
+            };
+            let request = tower.prepare(&device, &mut blas, &input, inputs.tokens.len(), 0)?;
+            let encoded = tower.encode(&device.stream, &blas, request, None)?;
+            let merged = device.stream.clone_dtoh(&encoded.features)?;
+            conditioner.prepare(&blas, inputs.tokens.len())?;
+            let embeds = conditioner_embeds(inputs, image_token, &gate.table, &merged, hidden)?;
+            let runs = image_runs(&inputs.tokens, image_token);
+            let rope = conditioner_rope(&gate.spec, inputs)?;
+            let outputs = conditioner.forward(
+                &device.stream,
+                &blas,
+                &ConditionerInput {
+                    embeds: &embeds,
+                    deepstack: &encoded.deepstack,
+                    runs: &runs,
+                    rope: &rope,
+                },
+                &TEXT_TAPS,
+            )?;
+            if !gate.score(cell, ("C", "composition"), &outputs, &TEXT_TAPS)? {
+                defects.push(*cell);
+            }
+        }
+        if !defects.is_empty() {
+            bail!("H3_COMPOSITION_GATE DEFECT cells outside the frozen thresholds: {defects:?}");
+        }
+        println!("H3_COMPOSITION_GATE PASS cells=3");
         Ok(())
     }
 }

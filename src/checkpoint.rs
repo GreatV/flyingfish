@@ -2498,6 +2498,40 @@ impl MappedCheckpoint {
         self.assemble_manifest("MiniMax-H3", expected, LoadPolicy::TextOnly, planned, None)
     }
 
+    /// MiniMax-H3 Qwen3-VL conditioner: decoder layers `0..layers` load; the embedding table (read by row), the later
+    /// layers, the final norm and the LM head are Dormant; the vision tower is Vision scope.
+    pub fn minimax_h3_conditioner_manifest(
+        &self,
+        spec: &crate::model_spec::ModelSpec,
+        layers: usize,
+    ) -> Result<TensorManifest> {
+        ensure!(
+            spec.architecture == crate::model_spec::Architecture::Qwen3Vl
+                && layers <= spec.layers.len(),
+            "conditioner manifest needs Qwen3-VL with at least {layers} decoder layers"
+        );
+        let mut expected = BTreeMap::new();
+        Self::text_entries(spec, &mut expected)?;
+        Self::qwen3_vl_vision_entries(spec, &mut expected)?;
+        for (name, (_, _, scope)) in expected.iter_mut() {
+            let layer = name
+                .strip_prefix("model.language_model.layers.")
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|index| index.parse::<usize>().ok());
+            if *scope == TensorScope::Text && layer.is_none_or(|layer| layer >= layers) {
+                *scope = TensorScope::Dormant;
+            }
+        }
+        let planned = planned_bytes(&expected, LoadPolicy::TextOnly)?;
+        self.assemble_manifest(
+            "MiniMax-H3 conditioner",
+            expected,
+            LoadPolicy::TextOnly,
+            planned,
+            None,
+        )
+    }
+
     /// MiniMax-H3 LoRA file: `{linear}.lora_A.default.weight [rank, in]` and `{linear}.lora_B.default.weight
     /// [out, rank]` in BF16 for every block linear; scale is the metadata `alpha` over the rank.
     pub fn minimax_h3_lora_manifest(
