@@ -385,6 +385,86 @@ mod vocoder_gate {
         println!("MUSIC3_VOCODER_CONTROL negated={control:.6e} > bound");
         Ok(())
     }
+
+    /// Residual-unit aliasing control. The pre-99bafb0d form runs snake1
+    /// in place into the residual base, so the final add reads snake1(x)
+    /// instead of x and must exceed the bound; the fresh-buffer form
+    /// reads x. The in-place snake kernel itself must be bit-identical
+    /// to the fresh form, isolating the residual source as the defect.
+    #[test]
+    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_VOCODER_PROBE"]
+    fn music3_syn_vocoder_unit_residual_gpu() -> Result<()> {
+        std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
+        let device = Device::new(0)?;
+        let engine = Music3Syn::load(
+            &std::path::PathBuf::from(std::env::var("FF_MUSIC3_MODEL")?),
+            &device,
+            86,
+        )?;
+        let probe_bytes = std::fs::read(std::path::PathBuf::from(std::env::var(
+            "FF_MUSIC3_VOCODER_PROBE",
+        )?))?;
+        let view = SafeTensors::deserialize(&probe_bytes)?;
+        let tap = view.tensor("block0_convt").context("tensor block0_convt")?;
+        let shape = tap.shape();
+        ensure!(shape.len() == 3, "probe tap layout [batch, dim, rows]");
+        let dim = shape[1];
+        let rows = shape[2];
+        let data = tensor_f32(&view, "block0_convt")?;
+        let want = tensor_f32(&view, "block0_u1")?;
+        let to_rows = |flat: &Vec<f32>| -> Vec<f32> {
+            // reference [batch, dim, rows] batch 0 -> engine [rows, dim]
+            let mut out = vec![0.0f32; rows * dim];
+            for r in 0..rows {
+                for c in 0..dim {
+                    out[r * dim + c] = flat[c * rows + r];
+                }
+            }
+            out
+        };
+        let x = to_rows(&data);
+        let want_rows = to_rows(&want);
+        let s = &engine.stream;
+        let d_x = s.clone_htod(&x)?;
+        let fresh = engine.residual_unit_for_test(&d_x, rows, dim, false)?;
+        let in_place = engine.residual_unit_for_test(&d_x, rows, dim, true)?;
+        let got_fresh = s.clone_dtoh(&fresh)?;
+        let got_in_place = s.clone_dtoh(&in_place)?;
+        let d_fresh = got_fresh
+            .iter()
+            .zip(&want_rows)
+            .map(|(a, b)| (a - b).abs() as f64)
+            .fold(0.0, f64::max);
+        let d_in_place = got_in_place
+            .iter()
+            .zip(&want_rows)
+            .map(|(a, b)| (a - b).abs() as f64)
+            .fold(0.0, f64::max);
+        let mut alias_buf = s.clone_htod(&x)?;
+        let mut fresh_buf = unsafe { s.alloc(rows * dim)? };
+        let alpha = &engine.weights.vocoder.blocks[0].units[0].snake1_alpha;
+        engine.snake_inplace_for_test(&mut alias_buf, alpha, rows * dim, dim)?;
+        engine.snake_fresh_for_test(&d_x, alpha, &mut fresh_buf, rows * dim, dim)?;
+        let got_alias = s.clone_dtoh(&alias_buf)?;
+        let got_fresh_snake = s.clone_dtoh(&fresh_buf)?;
+        let d_alias = got_alias
+            .iter()
+            .zip(&got_fresh_snake)
+            .map(|(a, b)| (a - b).abs() as f64)
+            .fold(0.0, f64::max);
+        println!(
+            "UNIT_RESIDUAL new_form max_abs={d_fresh:.6e} (frozen bound 1.0e-04; discriminator stage observed 3.4e-05)"
+        );
+        println!("UNIT_RESIDUAL old_form max_abs={d_in_place:.6e} (must exceed the bound)");
+        println!("UNIT_RESIDUAL snake_alias max_abs={d_alias:.6e} (must be 0)");
+        ensure!(
+            d_fresh <= 1.0e-4,
+            "fresh-buffer residual unit exceeds the frozen bound"
+        );
+        ensure!(d_in_place > 1.0e-4, "in-place form no longer discriminates");
+        ensure!(d_alias == 0.0, "in-place snake differs from fresh snake");
+        Ok(())
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -481,6 +561,47 @@ mod euler {
             max_update <= 1.0e-5,
             "euler update exceeds the new frozen bound"
         );
+
+        // Transition 29: its output never appears as a call input; the
+        // vocoder latent is the only witness (offline f64 match 4.57e-07).
+        let mut x30: cudarc::driver::CudaSlice<f32> =
+            s.clone_htod(&tensor_f32(&view, "syn_x_t_058")?)?;
+        let c29 = tensor_f32(&view, "syn_velocity_cond_029")?;
+        let u29 = tensor_f32(&view, "syn_velocity_uncond_029")?;
+        let guided29: Vec<f32> = c29
+            .iter()
+            .zip(&u29)
+            .map(|(a, b)| b + 1.7f32 * (a - b))
+            .collect();
+        let d_guided29 = s.clone_htod(&guided29)?;
+        engine.euler_step(&mut x30, &d_guided29, want_sigma[29], want_sigma[30])?;
+        let want_latent = tensor_f32(&view, "syn_vocoder_latent")?;
+        let got30 = s.clone_dtoh(&x30)?;
+        let delta30 = got30
+            .iter()
+            .zip(&want_latent)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!("MUSIC3_EULER transition29 max_abs={delta30:.6e} (frozen bound 1.0e-05)");
+        ensure!(delta30 <= 1.0e-5, "transition 29 exceeds the frozen bound");
+
+        // Fused guided_euler_f32 kernel on the same step-0 data.
+        let mut g0: cudarc::driver::CudaSlice<f32> =
+            s.clone_htod(&tensor_f32(&view, "syn_x_t_000")?)?;
+        let c0 = tensor_f32(&view, "syn_velocity_cond_000")?;
+        let u0 = tensor_f32(&view, "syn_velocity_uncond_000")?;
+        let d_c0 = s.clone_htod(&c0)?;
+        let d_u0 = s.clone_htod(&u0)?;
+        engine.guided_euler_for_test(&mut g0, &d_c0, &d_u0, want_sigma[1] - want_sigma[0])?;
+        let want_g0 = tensor_f32(&view, "syn_x_t_002")?;
+        let got_g0 = s.clone_dtoh(&g0)?;
+        let delta_g0 = got_g0
+            .iter()
+            .zip(&want_g0)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!("MUSIC3_EULER guided_kernel max_abs={delta_g0:.6e} (frozen bound 1.0e-05)");
+        ensure!(delta_g0 <= 1.0e-5, "guided euler kernel exceeds the bound");
         Ok(())
     }
 }
@@ -577,6 +698,94 @@ mod end_to_end {
             "negated-initial control did not exceed the bound"
         );
         println!("MUSIC3_E2E_CONTROL negated_initial={control:.6e} > bound");
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+mod pair_flow {
+    use super::super::Device;
+    use super::super::engine_music3_syn::{Music3Syn, PairFlowCall};
+    use anyhow::{Context, Result, ensure};
+    use safetensors::SafeTensors;
+
+    fn tensor_f32<'a>(view: &'a SafeTensors<'a>, name: &str) -> Result<Vec<f32>> {
+        let t = view
+            .tensor(name)
+            .with_context(|| format!("tensor {name}"))?;
+        let bytes = t.data();
+        Ok(bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
+
+    /// Pair flow, teacher-forced: one batched call on captured x_t/cond must
+    /// reproduce both captured branch velocities. Also the fused guided
+    /// update on captured tensors vs the captured next x_t.
+    #[test]
+    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_CAPTURE"]
+    fn music3_syn_pair_flow_gpu() -> Result<()> {
+        std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
+        let device = Device::new(0)?;
+        let engine = Music3Syn::load(
+            &std::path::PathBuf::from(std::env::var("FF_MUSIC3_MODEL")?),
+            &device,
+            86,
+        )?;
+        let mut workspace = Music3Syn::workspace(&engine.spec, &device, 86)?;
+        let capture_bytes = std::fs::read(std::path::PathBuf::from(std::env::var(
+            "FF_MUSIC3_CAPTURE",
+        )?))?;
+        let view = SafeTensors::deserialize(&capture_bytes)?;
+        let s = &engine.stream;
+        let channels = engine.spec.in_channels as usize;
+        let length = 86usize;
+        let timesteps = tensor_f32(&view, "syn_timesteps")?;
+
+        // Pair call on step 0 inputs: x_t_000 + cond_000, t = timesteps[0].
+        let x_t = tensor_f32(&view, "syn_x_t_000")?;
+        let cond = tensor_f32(&view, "syn_cond_000")?;
+        let d_x = s.clone_htod(&x_t)?;
+        let d_cond = s.clone_htod(&cond)?;
+        let want_c = tensor_f32(&view, "syn_velocity_000")?;
+        let want_u = tensor_f32(&view, "syn_velocity_001")?;
+        let mut v_c = unsafe { s.alloc::<f32>(channels * length)? };
+        let mut v_u = unsafe { s.alloc::<f32>(channels * length)? };
+        engine.flow_velocity_pair(PairFlowCall {
+            ws: &mut workspace,
+            x_t: &d_x,
+            t: timesteps[0],
+            cond: &d_cond,
+            length,
+            v_cond: &mut v_c,
+            v_unc: &mut v_u,
+        })?;
+        let got_c = s.clone_dtoh(&v_c)?;
+        let got_u = s.clone_dtoh(&v_u)?;
+        let dc = got_c
+            .iter()
+            .zip(&want_c)
+            .map(|(a, b)| (a - b).abs() as f64)
+            .fold(0.0, f64::max);
+        let du = got_u
+            .iter()
+            .zip(&want_u)
+            .map(|(a, b)| (a - b).abs() as f64)
+            .fold(0.0, f64::max);
+        println!(
+            "PAIR_FLOW cond max_abs={dc:.6e} uncond max_abs={du:.6e} (frozen-r3-syn cells: cond 9.796142e-03, uncond 2.662754e-02)"
+        );
+        ensure!(
+            dc <= 9.796142e-3,
+            "pair cond velocity exceeds the frozen-r3-syn cell"
+        );
+        ensure!(
+            du <= 2.662754e-2,
+            "pair uncond velocity exceeds the frozen-r3-syn cell"
+        );
         Ok(())
     }
 }
