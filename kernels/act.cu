@@ -11,7 +11,7 @@ __device__ __forceinline__ float gelu_tanh(float x) {
 
 extern "C" __global__ void silu_mul(const __nv_bfloat16* gu, __nv_bfloat16* y,
                                    int rows, int dim, int mode) {
-    if ((unsigned)mode > 2u || rows <= 0 || dim <= 0 || (dim & 7) != 0 ||
+    if ((unsigned)mode > 3u || rows <= 0 || dim <= 0 || (dim & 7) != 0 ||
         (long long)rows * dim > 2147483647LL || !gu || !y ||
         ((reinterpret_cast<uintptr_t>(gu) | reinterpret_cast<uintptr_t>(y)) &
          15u) != 0u) {
@@ -35,7 +35,9 @@ extern "C" __global__ void silu_mul(const __nv_bfloat16* gu, __nv_bfloat16* y,
     for (int j = 0; j < 8; ++j) {
         const float g = __bfloat162float(gp[j]);
         const float u = __bfloat162float(up[j]);
-        if (mode == 2) {
+        if (mode == 3) {
+            yp[j] = __hmul(__float2bfloat16(u / (1.0f + expf(-u))), gp[j]);
+        } else if (mode == 2) {
             yp[j] = __hmul(__float2bfloat16(gelu_tanh(g)), up[j]);
         } else if (mode == 1) {
             yp[j] = __float2bfloat16(g / (1.0f + expf(-g)) * u);

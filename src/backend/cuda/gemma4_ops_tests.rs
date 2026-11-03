@@ -1195,10 +1195,11 @@ fn gelu_tanh_gated_activation_matches_the_definition_gpu() -> Result<()> {
         let fused = module.load_function("silu_mul")?;
         let buf = s.alloc_zeros::<bf16>(64)?;
         let ptr = buf.device_ptr(s).0;
-        let (gu, y, rows, dim) = match case.as_str() {
-            "odd_dim" => (ptr, ptr + 64, 1i32, 12i32),
-            "unaligned" => (ptr + 2, ptr + 64, 1i32, 8i32),
-            "zero_rows" => (ptr, ptr + 64, 0i32, 8i32),
+        let (gu, y, rows, dim, mode) = match case.as_str() {
+            "odd_dim" => (ptr, ptr + 64, 1i32, 12i32, 0i32),
+            "unaligned" => (ptr + 2, ptr + 64, 1i32, 8i32, 0i32),
+            "zero_rows" => (ptr, ptr + 64, 0i32, 8i32, 0i32),
+            "bad_mode" => (ptr, ptr + 64, 1i32, 8i32, 4i32),
             other => anyhow::bail!("unknown FF_ACT_TRAP_CHILD={other}"),
         };
         unsafe {
@@ -1207,7 +1208,7 @@ fn gelu_tanh_gated_activation_matches_the_definition_gpu() -> Result<()> {
                 .arg(&y)
                 .arg(&rows)
                 .arg(&dim)
-                .arg(&0i32)
+                .arg(&mode)
                 .launch(flat(1))?;
         }
         if s.synchronize().is_err() {
@@ -1248,10 +1249,15 @@ fn gelu_tanh_gated_activation_matches_the_definition_gpu() -> Result<()> {
                     packed.device_ptr(s).0,
                     y.device_ptr(s).0,
                 )?;
+                let (split_gate, split_up, split_mode) = if mode == 3 {
+                    (&up, &gate, 0i32)
+                } else {
+                    (&gate, &up, mode)
+                };
                 let split_cfg = super::ops::silu_mul_split_grid(
                     rows * dim,
-                    gate.device_ptr(s).0,
-                    up.device_ptr(s).0,
+                    split_gate.device_ptr(s).0,
+                    split_up.device_ptr(s).0,
                     z.device_ptr(s).0,
                 )?;
                 unsafe {
@@ -1263,11 +1269,11 @@ fn gelu_tanh_gated_activation_matches_the_definition_gpu() -> Result<()> {
                         .arg(&mode)
                         .launch(fused_cfg)?;
                     s.launch_builder(&split)
-                        .arg(&gate)
-                        .arg(&up)
+                        .arg(split_gate)
+                        .arg(split_up)
                         .arg(&mut z)
                         .arg(&((rows * dim) as i32))
-                        .arg(&mode)
+                        .arg(&split_mode)
                         .launch(split_cfg)?;
                 }
                 Ok((s.clone_dtoh(&y)?, s.clone_dtoh(&z)?))
@@ -1291,6 +1297,14 @@ fn gelu_tanh_gated_activation_matches_the_definition_gpu() -> Result<()> {
                 .map(|(g, u)| {
                     let gf = g.to_f32();
                     bf16::from_f32((gf / (1.0 + (-gf).exp())) * u.to_f32())
+                })
+                .collect();
+            let ref_mode3: Vec<bf16> = gate_host
+                .iter()
+                .zip(up_host)
+                .map(|(g, u)| {
+                    let uf = u.to_f32();
+                    bf16::from_f32(bf16::from_f32(uf / (1.0 + (-uf).exp())).to_f32() * g.to_f32())
                 })
                 .collect();
             let (fused_out, split_out) = run(2)?;
@@ -1332,10 +1346,23 @@ fn gelu_tanh_gated_activation_matches_the_definition_gpu() -> Result<()> {
                     defects += 1;
                 }
             }
+            let (mode3_fused, mode3_split) = run(3)?;
+            let stats3 = Stats::with_floor(&mode3_fused, &ref_mode3, Some(&floor))?;
+            println!("SILU_MUL_MODE3 {}", stats3.line(&format!("silu_mul.{key}")));
+            if !(stats3.passes() && stats3.max_ulp == 0) {
+                println!("SILU_MUL_MODE3 DEFECT silu_mul.{key}");
+                defects += 1;
+            }
+            let stats3_ctrl = Stats::with_floor(&mode3_fused, &ref_mode0, Some(&floor))?;
+            if stats3_ctrl.passes() {
+                println!("SILU_MUL_MODE3_CONTROL NOT_DETECTED silu_mul.{key}");
+                undetected += 1;
+            }
             for (m, f_out, s_out) in [
                 (0, &silu_fused, &silu_split),
                 (1, &mode1_fused, &mode1_split),
                 (2, &fused_out, &split_out),
+                (3, &mode3_fused, &mode3_split),
             ] {
                 let pair = Stats::new(f_out, s_out)?;
                 if pair.max_ulp != 0 {
@@ -1443,7 +1470,7 @@ fn gelu_tanh_gated_activation_matches_the_definition_gpu() -> Result<()> {
     );
     drop((common, fused, split, module, device));
     let exe = std::env::current_exe()?;
-    for case in ["odd_dim", "unaligned", "zero_rows"] {
+    for case in ["odd_dim", "unaligned", "zero_rows", "bad_mode"] {
         let status = std::process::Command::new(&exe)
             .arg("--exact")
             .arg("backend::cuda::gemma4_ops_tests::gelu_tanh_gated_activation_matches_the_definition_gpu")
