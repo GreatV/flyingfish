@@ -178,7 +178,7 @@ impl VideoDecoder {
         let kernels = VaeKernels {
             cast: vision.load_function("vision_affine_cast_bf16")?,
             upcast: vision.load_function("vision_upcast_f32")?,
-            rms_weight: vision.load_function("rms_norm_weight_f32")?,
+            rms_weight: vision.load_function("vision_rms_scale_f32")?,
             scaled_residual: vision.load_function("scaled_residual_f32")?,
             layer_norm: cubin::module(s.context(), "q38_common")?
                 .load_function("q38_layer_norm_f32")?,
@@ -344,6 +344,8 @@ impl VideoDecoder {
             s.launch_builder(&self.kernels.rms_weight)
                 .arg(&pointer(x, s))
                 .arg(&pointer(weight, s))
+                .arg(&1u32)
+                .arg(&0u64)
                 .arg(&pointer(out, s))
                 .arg(&u32::try_from(self.spec.dim)?)
                 .arg(&self.spec.norm_eps)
@@ -1371,7 +1373,7 @@ impl EncodeWork {
             })
             .max()
             .context("encoder without convolutions")?;
-        let columns = |(h, w): (usize, usize)| {
+        let columns = |(h, w): (usize, usize)| -> Result<usize> {
             encoder
                 .convolutions((h, w))
                 .iter()
@@ -1380,9 +1382,9 @@ impl EncodeWork {
                     c.extent(*h, *stride) * c.extent(*w, *stride) * c.columns()
                 })
                 .max()
-                .unwrap_or(0)
+                .context("encoder without spatial convolutions")
         };
-        let workspace = columns((height, width)).min(columns((VAE_TILE, VAE_TILE)));
+        let workspace = columns((height, width))?.min(columns((VAE_TILE, VAE_TILE))?);
         let buffer = || s.alloc_zeros::<f32>(activations);
         Ok(Self {
             height,

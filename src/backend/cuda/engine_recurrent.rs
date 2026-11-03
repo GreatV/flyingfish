@@ -533,6 +533,7 @@ impl VisionRuntime {
             s.launch_builder(&self.rms_scale)
                 .arg(&work.f32_c)
                 .arg(&f32_weight(&weights.visual_scale, s, 1, 1)?.ptr)
+                .arg(&0u32)
                 .arg(&mut work.projected_f32)
                 .arg(&mut work.projected_bf16)
                 .arg(&1536i32)

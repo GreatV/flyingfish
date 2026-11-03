@@ -245,13 +245,14 @@ extern "C" __global__ void vision_bias_gelu_f32(
     }
 }
 
-// One FP32 RMS normalization and scale, with independent FP32 and BF16 outputs.
+// One FP32 RMS normalization per row times scale[i * scale_stride] (stride 0: one scalar, 1: per element), with a
+// BF16 output and an optional (null-skipped) FP32 output.
 extern "C" __global__ void vision_rms_scale_f32(
-    const float* input, const float* scale, float* output_f32,
+    const float* input, const float* scale, uint32_t scale_stride, float* output_f32,
     __nv_bfloat16* output_bf16, uint32_t width, float eps) {
     if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
-        gridDim.y != 1 || gridDim.z != 1 || !input || !scale ||
-        !output_f32 || !output_bf16 || !width || !(eps > 0.0f)) { __trap(); return; }
+        gridDim.y != 1 || gridDim.z != 1 || !input || !scale || scale_stride > 1 ||
+        !output_bf16 || !width || !(eps > 0.0f)) { __trap(); return; }
     uint32_t row = blockIdx.x;
     __shared__ float partial[8];
     float sum = 0.0f;
@@ -273,8 +274,8 @@ extern "C" __global__ void vision_rms_scale_f32(
     float rstd = partial[0];
     for (uint32_t i = threadIdx.x; i < width; i += 256) {
         float normalized = __fmul_rn(input[uint64_t(row) * width + i], rstd);
-        float scaled = __fmul_rn(normalized, *scale);
-        output_f32[uint64_t(row) * width + i] = scaled;
+        float scaled = __fmul_rn(normalized, scale[i * scale_stride]);
+        if (output_f32) output_f32[uint64_t(row) * width + i] = scaled;
         output_bf16[uint64_t(row) * width + i] = __float2bfloat16_rn(scaled);
     }
 }
@@ -343,36 +344,6 @@ extern "C" __global__ void vision_anchor_reinject_bf16(
         states[i] = __hadd(states[i], delta);
 #endif
     }
-}
-
-// One CTA of 256 threads per row: bf16(x * rsqrt(mean(x^2) + eps) * weight[i]) of an F32 row.
-extern "C" __global__ void rms_norm_weight_f32(
-    const float* input, const float* weight, __nv_bfloat16* output, uint32_t width, float eps) {
-    if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 || gridDim.y != 1 ||
-        gridDim.z != 1 || !input || !weight || !output || !width || !(eps > 0.0f)) {
-        __trap(); return;
-    }
-    const uint64_t row = uint64_t(blockIdx.x) * width;
-    __shared__ float partial[8];
-    float sum = 0.0f;
-    for (uint32_t i = threadIdx.x; i < width; i += 256) {
-        const float x = input[row + i];
-        sum = __fadd_rn(sum, __fmul_rn(x, x));
-    }
-    for (int delta = 16; delta; delta >>= 1)
-        sum = __fadd_rn(sum, __shfl_down_sync(FF_WARP_MASK, sum, delta));
-    if ((threadIdx.x & 31) == 0) partial[threadIdx.x >> 5] = sum;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        sum = threadIdx.x < 8 ? partial[threadIdx.x] : 0.0f;
-        for (int delta = 16; delta; delta >>= 1)
-            sum = __fadd_rn(sum, __shfl_down_sync(FF_WARP_MASK, sum, delta));
-        if (threadIdx.x == 0) partial[0] = rsqrtf(__fadd_rn(sum / float(width), eps));
-    }
-    __syncthreads();
-    const float rstd = partial[0];
-    for (uint32_t i = threadIdx.x; i < width; i += 256)
-        output[row + i] = __float2bfloat16_rn(__fmul_rn(__fmul_rn(input[row + i], rstd), weight[i]));
 }
 
 // residual[i] = residual[i] + f32(delta[i]) * scale[i % width], rounded after the product and after the sum.
