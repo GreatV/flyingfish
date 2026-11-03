@@ -513,6 +513,7 @@ impl BlockKernels {
 /// Activations of one block forward over `rows` sequence rows.
 pub(crate) struct BlockWork {
     rows: usize,
+    rank: usize,
     normed: CudaSlice<bf16>,
     q_raw: CudaSlice<bf16>,
     k_raw: CudaSlice<bf16>,
@@ -525,16 +526,24 @@ pub(crate) struct BlockWork {
 }
 
 impl BlockWork {
-    /// Binds the fixed GEMM plans of every base linear shape these rows run: q/k/v and out over all rows, the two
-    /// FFN projections over full and tail chunks.
+    /// Binds the fixed GEMM plans of every base and LoRA-A linear shape these rows run: q/k/v, out, the stacked
+    /// q/k/v LoRA A and the out LoRA A over all rows; the two FFN projections and their LoRA A over full and tail
+    /// chunks.
     pub(crate) fn prepare(&self, blas: &Blas, spec: &H3Spec) -> Result<()> {
-        let (h, width, f) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn);
-        let mut shapes = vec![(self.rows, width, h), (self.rows, h, width)];
+        let (h, width, f, r) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn, self.rank);
+        let mut shapes = vec![
+            (self.rows, width, h),
+            (self.rows, h, width),
+            (self.rows, 3 * r, h),
+            (self.rows, r, width),
+        ];
         let chunk = ffn_chunk(self.rows);
         let tail = self.rows % chunk;
         for rows in [chunk, tail].into_iter().filter(|&n| n > 0) {
             shapes.push((rows, 2 * f, h));
             shapes.push((rows, h, f));
+            shapes.push((rows, r, h));
+            shapes.push((rows, r, f));
         }
         for (rows, output, input) in shapes {
             blas.prepare_fixed(
@@ -558,6 +567,7 @@ impl BlockWork {
         let attention = || s.alloc_zeros::<bf16>(rows * width);
         Ok(Self {
             rows,
+            rank,
             normed: s.alloc_zeros::<bf16>(rows * spec.hidden)?,
             q_raw: attention()?,
             k_raw: attention()?,
@@ -638,13 +648,11 @@ fn lora_pair(
     y: Operand<'_>,
     rows: usize,
 ) -> Result<()> {
-    c.blas.linear(
-        a,
-        &x.buffer.slice(x.offset..x.offset + rows * x.width),
-        &mut work.slice_mut(..rows * rank),
-        rows,
-        rank,
-        x.width,
+    c.blas.linear_typed(
+        crate::op_contract::ExecutionPhase::Prefill,
+        crate::backend::cuda::linear::LinearWeightRef::Bf16(matrix(a, c.s, rank, x.width)?),
+        rows_view(x.buffer, c.s, x.offset, rows, x.width, x.width)?,
+        &mut TensorMut(rows_view(work, c.s, 0, rows, rank, rank)?),
     )?;
     c.blas.linear_accumulate(
         matrix(b, c.s, y.width, rank)?,
@@ -799,13 +807,11 @@ pub(crate) fn block_forward(
             rows,
         )?;
     }
-    blas.linear(
-        &w.qkv_a,
-        &work.normed.slice(..),
-        &mut work.lora.slice_mut(..),
-        rows,
-        3 * r,
-        h,
+    blas.linear_typed(
+        crate::op_contract::ExecutionPhase::Prefill,
+        crate::backend::cuda::linear::LinearWeightRef::Bf16(matrix(&w.qkv_a, s, 3 * r, h)?),
+        rows_view(&work.normed, s, 0, rows, h, h)?,
+        &mut TensorMut(rows_view(&work.lora, s, 0, rows, 3 * r, 3 * r)?),
     )?;
     for (i, (b, out)) in [
         (&w.q_b, &work.q_raw),
@@ -1256,7 +1262,7 @@ impl Dit {
         use crate::prefill::DensePlacement;
         let s = &d.stream;
         let ranges = Ranges::of(layout)?;
-        let (h, width, ffn, r) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn, rank);
+        let (h, r) = (spec.hidden, rank);
         let patch = spec.video_row_width();
         let mut pair = |name: &str, n: usize, k: usize| -> Result<[CudaSlice<f32>; 2]> {
             Ok([
@@ -1286,12 +1292,6 @@ impl Dit {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        blas.declare(
-            ranges.rows,
-            &[(3 * r, h), (r, width), (r, h), (r, ffn)]
-                .into_iter()
-                .collect(),
-        );
         blas.prepare_biased(
             u32::try_from(ranges.text)?,
             u32::try_from(h)?,
@@ -1817,6 +1817,88 @@ mod tests {
         Ok(())
     }
 
+    /// Token-refiner block 0 (published weights, Turbo LoRA at its scale) on 1, 12, 16 and 17 text rows: the LoRA A
+    /// projections of the skinny class (rows <= 16, input a multiple of 256) run on the bound fixed plans; every
+    /// output is finite.
+    #[test]
+    #[ignore = "GPU; FF_MODEL and FF_H3_LORA"]
+    fn refiner_block_runs_on_skinny_text_rows_gpu() -> Result<()> {
+        let path = |key: &str| {
+            std::env::var_os(key)
+                .map(PathBuf::from)
+                .with_context(|| format!("{key} missing"))
+        };
+        let model = path("FF_MODEL")?;
+        let lora_path = path("FF_H3_LORA")?;
+        let spec = H3Spec::read(&model)?;
+        let transformer = model.join("transformer");
+        let manifest = MappedCheckpoint::open_component(&transformer, "diffusion_pytorch_model")?
+            .minimax_h3_manifest(&spec)?;
+        let lora_dir = lora_path.parent().context("LoRA directory")?.to_owned();
+        let stem = lora_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".safetensors"))
+            .context("LoRA file stem")?;
+        let (lora_manifest, adapter) =
+            MappedCheckpoint::open_component(&lora_dir, stem)?.minimax_h3_lora_manifest(&spec)?;
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let runtime = std::env::temp_dir().join(format!("ff-h3-refiner-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(
+                true,
+                "MiniMax-H3 refiner skinny-row test".into(),
+            )),
+        )?;
+        let kernels = BlockKernels::new(&device.ctx)?;
+        let weights = BlockWeights::resident(
+            s,
+            &spec,
+            adapter.rank,
+            "token_refiner.refiner_blocks.0",
+            &mut Source::new(&transformer, &manifest),
+            &mut Source::new(&lora_dir, &lora_manifest),
+        )?;
+        for rows in [1usize, 12, 16, 17] {
+            let mut work = BlockWork::new(s, &spec, adapter.rank, rows)?;
+            work.prepare(&blas, &spec)?;
+            let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?;
+            let input: Vec<bf16> = (0..rows * spec.hidden)
+                .map(|i| bf16::from_f32(((i * 37 % 509) as f32 - 254.0) / 127.0))
+                .collect();
+            let mut x = s.clone_htod(&input)?;
+            let context = BlockContext {
+                s,
+                blas: &blas,
+                kernels: &kernels,
+                spec: &spec,
+                lora_scale: adapter.scale,
+            };
+            block_forward(
+                &context,
+                &mut flash,
+                &weights,
+                &Conditioning::Plain,
+                &mut x,
+                &mut work,
+            )?;
+            let output = s.clone_dtoh(&x)?;
+            ensure!(
+                output.iter().all(|v| v.to_f32().is_finite()),
+                "rows={rows}: non-finite refiner output"
+            );
+            println!("H3_REFINER_SKINNY rows={rows} finite=true");
+        }
+        Ok(())
+    }
+
     /// `cast_rows` with `count == 0` launches nothing (the kernel traps on a zero count); a non-zero count rounds.
     #[test]
     #[ignore = "GPU test"]
@@ -2157,33 +2239,13 @@ mod tests {
         let s = &device.stream;
         let runtime = std::env::temp_dir().join(format!("ff-h3-block0-{}", std::process::id()));
         fs::create_dir(&runtime)?;
-        let mut blas = Blas::new(
+        let blas = Blas::new(
             &device,
             &ops,
             &runtime,
             Rc::new(Closure::new(true, "MiniMax-H3 block gate".into())),
         )?;
-        let (h, width, ffn, r) = (
-            spec.hidden,
-            spec.heads * spec.head_dim,
-            spec.ffn,
-            adapter.rank,
-        );
-        blas.declare(
-            rows,
-            &[
-                (width, h),
-                (h, width),
-                (2 * ffn, h),
-                (h, ffn),
-                (3 * r, h),
-                (r, width),
-                (r, h),
-                (r, ffn),
-            ]
-            .into_iter()
-            .collect(),
-        );
+        let r = adapter.rank;
         let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?;
         let kernels = BlockKernels::new(&device.ctx)?;
         let weights = BlockWeights::resident(
