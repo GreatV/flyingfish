@@ -702,17 +702,23 @@ impl Music3Syn {
                 .launch(super::ops::flat(count_pre))?;
         }
 
-        // proj_in writes rows 1..=length of each branch token window.
-        let pre_ro = ws.pre.slice(0..2 * length * concat_width);
-        let mut wide = ws.wide.slice_mut(0..pair_tokens * dim);
-        self.linear(
-            &self.weights.flow.proj_in,
-            dim,
-            concat_width,
-            &pre_ro,
-            2 * length,
-            &mut wide.slice_mut(dim..dim + 2 * length * dim),
-        )?;
+        // proj_in writes rows 1..=length of each branch token window;
+        // row tokens of window 1 is its temb row, not body row 0.
+        for branch in 0..2 {
+            let pre_branch = ws
+                .pre
+                .slice(branch * length * concat_width..(branch + 1) * length * concat_width);
+            let base = (branch * tokens + 1) * dim;
+            let mut wide = ws.wide.slice_mut(base..base + length * dim);
+            self.linear(
+                &self.weights.flow.proj_in,
+                dim,
+                concat_width,
+                &pre_branch,
+                length,
+                &mut wide,
+            )?;
+        }
         let mut fourier = ws.fourier.slice_mut(0..fourier_dim);
         let t_dev = s.clone_htod(&[t])?;
         unsafe {
@@ -1023,10 +1029,12 @@ impl Music3Syn {
         let sigmas = Self::sigma_schedule(30);
         s.memcpy_dtod(initial, &mut ws.x)?;
         let channels = self.spec.in_channels as usize;
-        // 30 scheduler steps share 30 x_t states: 29 guided transitions
-        // reach the final latent (verified against the captured chain).
-        for step in 0..29 {
-            let t = sigmas[step + 1];
+        // Pair k runs at t = sigmas[k] and applies x +=
+        // (sigmas[k+1] - sigmas[k]) * guided(v_pair_k), k = 0..30.
+        // The transition-29 output is the vocoder latent; no call input
+        // in the capture shows it (matched 2026-11-03, max 4.57e-07).
+        for step in 0..30 {
+            let t = sigmas[step];
             let mut v_c = ws.v_cond.clone();
             let mut v_u = ws.v_unc.clone();
             let x_now = ws.x.clone();
@@ -1041,7 +1049,7 @@ impl Music3Syn {
             })?;
             s.memcpy_dtod(&v_c, &mut ws.v_cond)?;
             s.memcpy_dtod(&v_u, &mut ws.v_unc)?;
-            let dt = sigmas[step + 2] - sigmas[step + 1];
+            let dt = sigmas[step + 1] - sigmas[step];
             let count = (channels * length) as i64;
             let x_ptr = ws.x.device_ptr_mut(s).0;
             let c_ptr = ws.v_cond.device_ptr(s).0;
@@ -1090,8 +1098,144 @@ impl Music3Syn {
     }
 
     #[cfg(test)]
-    pub fn vocoder_folds_for_disc(&self) -> &VocoderFolds {
-        &self.vocoder_folds
+    pub fn snake_inplace_for_test(
+        &self,
+        buffer: &mut CudaSlice<f32>,
+        alpha: &CudaSlice<u8>,
+        count: usize,
+        channels: usize,
+    ) -> Result<()> {
+        let s = &self.stream;
+        let ptr = buffer.device_ptr_mut(s).0;
+        unsafe {
+            s.launch_builder(&self.snake_rows)
+                .arg(&ptr)
+                .arg(alpha)
+                .arg(&ptr)
+                .arg(&(count as i64))
+                .arg(&(channels as i32))
+                .launch(super::ops::flat(count))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn snake_fresh_for_test(
+        &self,
+        x: &CudaSlice<f32>,
+        alpha: &CudaSlice<u8>,
+        out: &mut CudaSlice<f32>,
+        count: usize,
+        channels: usize,
+    ) -> Result<()> {
+        let s = &self.stream;
+        unsafe {
+            s.launch_builder(&self.snake_rows)
+                .arg(x)
+                .arg(alpha)
+                .arg(out)
+                .arg(&(count as i64))
+                .arg(&(channels as i32))
+                .launch(super::ops::flat(count))?;
+        }
+        Ok(())
+    }
+
+    /// Residual unit (block 0, unit 0) replay. old_form = the pre-99bafb0d
+    /// aliasing: snake1 writes in place into the residual base, so the
+    /// final add reads snake1(x) instead of x.
+    #[cfg(test)]
+    pub fn residual_unit_for_test(
+        &self,
+        x: &CudaSlice<f32>,
+        rows: usize,
+        dim: usize,
+        old_form: bool,
+    ) -> Result<CudaSlice<f32>> {
+        let s = &self.stream;
+        let unit = &self.vocoder_folds.blocks[0].units[0];
+        let uw = &self.weights.vocoder.blocks[0].units[0];
+        let count = rows * dim;
+        let mut c1: CudaSlice<f32> = unsafe { s.alloc(count)? };
+        let mut gated: CudaSlice<f32> = unsafe { s.alloc(count)? };
+        let (snake_in, residual) = if old_form {
+            let mut base: CudaSlice<f32> = x.clone();
+            self.snake_inplace_for_test(&mut base, &uw.snake1_alpha, count, dim)?;
+            let owned = base;
+            (owned, None)
+        } else {
+            let mut sn1: CudaSlice<f32> = unsafe { s.alloc(count)? };
+            self.snake_fresh_for_test(x, &uw.snake1_alpha, &mut sn1, count, dim)?;
+            (sn1, Some(x.clone()))
+        };
+        self.conv1d(Conv1dSite {
+            w: &unit.c1_w,
+            x: &snake_in,
+            rows,
+            in_dim: dim,
+            out: &mut c1,
+            bias: &uw.c1_b,
+            dilation: 1,
+        })?;
+        if old_form {
+            self.snake_inplace_for_test(&mut c1, &uw.snake2_alpha, count, dim)?;
+            self.linear_bytes(&unit.c2_w, dim, dim, &c1.slice(0..count), rows, &mut gated)?;
+        } else {
+            let mut sn2: CudaSlice<f32> = unsafe { s.alloc(count)? };
+            self.snake_fresh_for_test(&c1, &uw.snake2_alpha, &mut sn2, count, dim)?;
+            self.linear_bytes(&unit.c2_w, dim, dim, &sn2.slice(0..count), rows, &mut gated)?;
+        }
+        let gated_ptr = gated.device_ptr(s).0;
+        let gated_bias = uw.c2_b.device_ptr(s).0;
+        unsafe {
+            s.launch_builder(&self.bias)
+                .arg(&gated_ptr)
+                .arg(&gated_bias)
+                .arg(&gated_ptr)
+                .arg(&(rows as u32))
+                .arg(&(dim as u32))
+                .launch(super::ops::flat(count))?;
+        }
+        let mut out = match residual {
+            Some(r) => r,
+            None => snake_in,
+        };
+        unsafe {
+            s.launch_builder(&self.add_inplace)
+                .arg(&mut out)
+                .arg(&gated)
+                .arg(&(count as i64))
+                .launch(super::ops::flat(count))?;
+        }
+        Ok(out)
+    }
+
+    /// Fused guided euler update, the raw-pointer launch form synthesize
+    /// uses.
+    #[cfg(test)]
+    pub fn guided_euler_for_test(
+        &self,
+        x: &mut CudaSlice<f32>,
+        c: &CudaSlice<f32>,
+        u: &CudaSlice<f32>,
+        dt: f32,
+    ) -> Result<()> {
+        let s = &self.stream;
+        let count = x.len();
+        let x_ptr = x.device_ptr_mut(s).0;
+        let c_ptr = c.device_ptr(s).0;
+        let u_ptr = u.device_ptr(s).0;
+        unsafe {
+            s.launch_builder(&self.guided_euler)
+                .arg(&x_ptr)
+                .arg(&c_ptr)
+                .arg(&u_ptr)
+                .arg(&self.guidance_scale)
+                .arg(&dt)
+                .arg(&(count as i64))
+                .launch(super::ops::flat(count))?;
+        }
+        Ok(())
     }
 
     /// Latent length for a frame count: int(frames * out_rate * in_hop /
