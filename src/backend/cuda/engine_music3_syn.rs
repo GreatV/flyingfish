@@ -208,7 +208,7 @@ impl Music3Syn {
             transpose: kernel(&common, "transpose_f32")?,
             euler_fn: kernel(&common, "euler_update_f32")?,
             im2col: kernel(&common, "conv_im2col_f32")?,
-            conv_transpose: kernel(&common, "conv_transpose_f32")?,
+            conv_transpose: kernel(&common, "conv_transpose_rows_f32")?,
             guided_euler: kernel(&common, "guided_euler_f32")?,
             cond_weights,
             cond_scale,
@@ -1510,6 +1510,7 @@ impl Music3Syn {
                     .arg(&(rows as i32))
                     .arg(&(dim as i32))
                     .arg(&(out_dim as i32))
+                    .arg(&(2 * stride as i32))
                     .arg(&(stride as i32))
                     .arg(&(stride.div_ceil(2) as i32))
                     .launch(super::ops::grid(rows * stride, 256))?;

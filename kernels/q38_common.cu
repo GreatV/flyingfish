@@ -855,7 +855,6 @@ extern "C" __global__ void pad_rows_n_f32(const float* __restrict__ x,
     out[i] = (row < pad || row >= pad + rows) ? 0.0f : x[i - pad * width];
 }
 
-
 // Transpose [C, L] -> [L, C], elementwise.
 extern "C" __global__ void transpose_f32(const float* __restrict__ in,
     float* __restrict__ out, long long channels, long long length) {
@@ -865,7 +864,6 @@ extern "C" __global__ void transpose_f32(const float* __restrict__ in,
     const long long t = i - c * length;
     out[t * channels + c] = in[i];
 }
-
 
 // Conv1d im2col over a zero-padded buffer: A[t, c*K + k] = padded[t + k*d, c],
 // with A row-major [rows, width*K] and padded [rows + 2*pad, width].
@@ -883,7 +881,6 @@ extern "C" __global__ void conv_im2col_f32(const float* __restrict__ padded,
         a[i] = padded[(t + (long long)k * dilation) * width + c];
     }
 }
-
 
 // Transposed conv1d on the published [in, out * kernel] weight with bias: out row t of rows * stride sums, over taps
 // k ascending with (t + pad - k) divisible by stride, x row j = (t + pad - k) / stride in [0, rows). x [rows, in],
@@ -1028,7 +1025,6 @@ extern "C" __global__ void concat_channels_f32(const float* __restrict__ x,
     out[i] = v;
 }
 
-
 // a[i] += b[i], elementwise F32.
 extern "C" __global__ void add_inplace_f32(float* __restrict__ a,
     const float* __restrict__ b, long long count) {
@@ -1153,8 +1149,6 @@ extern "C" __global__ void weighted_layer_sum_f32(const float* __restrict__ x,
     out[i] = __fmul_rn(scale, sum);
 }
 
-
-
 // Nearest-row gather: out[j, :] = in[map[j], :].
 extern "C" __global__ void nearest_rows_f32(const float* __restrict__ in,
     const unsigned int* __restrict__ map, float* __restrict__ out,
@@ -1185,17 +1179,6 @@ extern "C" __global__ void tanh_f32(float* __restrict__ x, long long count) {
     if (i >= count) return;
     x[i] = tanhf(x[i]);
 }
-// Transposing plane extract for folded ConvTranspose weights [A, B, K]:
-// out[b, a] = w[a, b, k] -> dense [B, A] for the per-phase GEMM.
-extern "C" __global__ void extract_plane_transposed_f32(const float* __restrict__ w,
-    int k, float* __restrict__ out, long long out_elems, int a_dim, int b_dim, int kernel) {
-    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= out_elems) return;
-    const long long b = i / a_dim;
-    const int a = (int)(i - b * a_dim);
-    out[i] = w[(long long)a * b_dim * kernel + (long long)b * kernel + k];
-}
-
 
 // Euler flow update: x += (sigma_next - sigma) * v, elementwise F32.
 extern "C" __global__ void euler_update_f32(float* __restrict__ x,
@@ -1204,53 +1187,6 @@ extern "C" __global__ void euler_update_f32(float* __restrict__ x,
     if (i >= count) return;
     x[i] = __fadd_rn(x[i], __fmul_rn(dt, v[i]));
 }
-
-// Conv1d im2col over a zero-padded buffer: A[t, c*K + k] = padded[t + k*d, c],
-// with A row-major [rows, width*K] and padded [rows + 2*pad, width].
-extern "C" __global__ void conv_im2col_f32(const float* __restrict__ padded,
-    float* __restrict__ a, long long rows, int width, int kernel, int dilation) {
-    if (!padded || !a || !rows || !width || !kernel || !dilation) { __trap(); return; }
-    const long long cols = (long long)width * kernel;
-    const long long total = rows * cols;
-    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < total;
-         i += (long long)gridDim.x * blockDim.x) {
-        const long long t = i / cols;
-        const int col = (int)(i - t * cols);
-        const int c = col / kernel;
-        const int k = col - c * kernel;
-        a[i] = padded[(t + (long long)k * dilation) * width + c];
-    }
-}
-
-// Transposed conv, stride s, kernel K = 2*s, pad p = ceil(s/2), on the
-// published folded weight [in, out*K]: out row t sums the at-most-two taps
-// k with (t + p - k) divisible by s. x [rows, in], out [rows*s, out].
-extern "C" __global__ void conv_transpose_f32(const float* __restrict__ x,
-    const float* __restrict__ w, const float* __restrict__ bias,
-    float* __restrict__ out, int rows, int in_dim, int out_dim,
-    int stride, int pad) {
-    if (!x || !w || !bias || !out || !rows || !in_dim || !out_dim || !stride ||
-        pad < 0 || blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
-        gridDim.y != 1 || gridDim.z != 1) { __trap(); return; }
-    const int kernel = 2 * stride;
-    const long long out_rows = (long long)rows * stride;
-    for (long long t = (long long)blockIdx.x; t < out_rows; t += gridDim.x) {
-        const int phase = (int)((t + pad) % stride);
-        for (int o = threadIdx.x; o < out_dim; o += blockDim.x) {
-            float acc = 0.0f;
-            for (int k = phase; k < kernel; k += stride) {
-                const long long j = (t + pad - k) / stride;
-                if (j < 0 || j >= rows) continue;
-                const float* wr = w + (long long)o * kernel + k;
-                const float* xr = x + j * in_dim;
-                for (int c = 0; c < in_dim; c++)
-                    acc = __fadd_rn(acc, __fmul_rn(xr[c], wr[(long long)c * out_dim * kernel]));
-            }
-            out[t * out_dim + o] = __fadd_rn(acc, bias[o]);
-        }
-    }
-}
-
 // Guided Euler update: x += dt * (u + scale * (c - u)), elementwise F32.
 extern "C" __global__ void guided_euler_f32(float* __restrict__ x,
     const float* __restrict__ c, const float* __restrict__ u,
