@@ -34,6 +34,8 @@ pub mod mhc;
 pub mod moe;
 #[cfg(feature = "cuda")]
 pub mod multi_calibrate;
+#[cfg(feature = "cuda")]
+pub mod music3;
 pub mod ops;
 pub mod profile;
 pub mod quantize;

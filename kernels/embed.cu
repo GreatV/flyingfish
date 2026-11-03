@@ -1,6 +1,35 @@
 #include "gpu_compat.cuh"
 #include <stdint.h>
 
+extern "C" __global__ void embed_code_broadcast(const __nv_bfloat16* table,
+    const uint32_t* code, __nv_bfloat16* out, int offset, int vocab, int dim, int branches) {
+    if (*code >= (unsigned)vocab || offset < 0) { __trap(); return; }
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < branches * dim)
+        out[i] = table[(size_t)(*code + offset) * dim + i % dim];
+}
+
+// Semantic code is absolute; residual table is [codebooks*vocab, dim].
+extern "C" __global__ void codebook_embedding_sum(
+    const __nv_bfloat16* semantic, const __nv_bfloat16* residual,
+    const uint32_t* codes, __nv_bfloat16* out, int semantic_begin,
+    int semantic_count, int codebooks, int vocab, int dim, int branches, float scale) {
+    if (codes[0] < (unsigned)semantic_begin ||
+        codes[0] >= (unsigned)(semantic_begin + semantic_count)) { __trap(); return; }
+    for (int book = 0; book < codebooks; ++book)
+        if (codes[book + 1] >= (unsigned)vocab) { __trap(); return; }
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= dim * branches) return;
+    const int channel = i % dim;
+    float sum = 0.0f;
+    for (int book = 0; book < codebooks; ++book)
+        sum += __bfloat162float(residual[((size_t)book * vocab + codes[book + 1]) * dim + channel]);
+    const float rounded = __bfloat162float(__float2bfloat16_rn(sum));
+    const float combined = __bfloat162float(__float2bfloat16_rn(
+        __bfloat162float(semantic[(size_t)codes[0] * dim + channel]) + rounded));
+    out[i] = __float2bfloat16_rn(combined * scale);
+}
+
 extern "C" __global__ void embed(const __nv_bfloat16* w, const uint32_t* ids,
                                 __nv_bfloat16* y, int rows, int dim) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;

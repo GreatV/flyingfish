@@ -78,6 +78,7 @@ impl VisionGeometry {
                 }
             }
             crate::model_spec::Architecture::Llama
+            | Architecture::Qwen3
             | crate::model_spec::Architecture::Flint
             | crate::model_spec::Architecture::Glm5Next
             | crate::model_spec::Architecture::LoopVl
@@ -1066,6 +1067,7 @@ impl VisionWeights {
                 )
             }
             Architecture::Llama
+            | Architecture::Qwen3
             | Architecture::Flint
             | Architecture::Glm5Next
             | Architecture::LoopVl
@@ -2259,6 +2261,7 @@ impl LayerNormTower {
                 (s.clone_htod(&ids)?, None)
             }
             Architecture::Llama
+            | Architecture::Qwen3
             | Architecture::Flint
             | Architecture::Glm5Next
             | Architecture::LoopVl
@@ -2328,6 +2331,7 @@ impl LayerNormTower {
                     )?;
                 }
                 Architecture::Llama
+                | Architecture::Qwen3
                 | Architecture::Flint
                 | Architecture::Glm5Next
                 | Architecture::LoopVl

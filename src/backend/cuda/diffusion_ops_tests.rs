@@ -392,6 +392,24 @@ fn diffusion_sampler_ops_gpu() -> Result<()> {
         picks.iter().zip(&repeat).filter(|(a, b)| a != b).count() == 0,
         "categorical must repeat identically under the same seed"
     );
+    let mut gap_row = vec![f32::from_bits(0x3a7f_4090); svocab];
+    gap_row[svocab - 1] = f32::from_bits(0x3b7f_4024);
+    let d_gap = s.clone_htod(&gap_row)?;
+    let d_gap_pick = s.clone_htod(&[-1i32])?;
+    unsafe {
+        s.launch_builder(&categorical)
+            .arg(&d_gap)
+            .arg(&d_gap_pick)
+            .arg(&1i32)
+            .arg(&(svocab as i64))
+            .arg(&0u64)
+            .arg(&38471471u64)
+            .arg(&256i32)
+            .launch(crate::backend::cuda::ops::grid(1, 256u32))?;
+    }
+    let gap_pick = s.clone_dtoh(&d_gap_pick)?[0];
+    ensure!(gap_pick == 1023, "categorical CDF gap token={gap_pick}");
+    println!("DIFFUSION_CDF_GAP PASS vocab=1024 seed=0 stream=38471471 token={gap_pick}");
     let _ = bf16::ZERO;
     println!(
         "DIFFUSION_SAMPLER temperature=bitexact entropy_rel={worst}/{worst_prod} accept=exact argmax=exact philox_4sigma_ok categorical_hits={hits}/{srows}"

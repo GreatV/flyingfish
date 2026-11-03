@@ -7,6 +7,7 @@ use std::{fs, path::Path};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Architecture {
     Llama,
+    Qwen3,
     Qwen35Text,
     MiniCpmV47,
     Flint,
@@ -789,6 +790,7 @@ impl VisionConfig {
                 );
             }
             Architecture::Llama
+            | Architecture::Qwen3
             | Architecture::Flint
             | Architecture::Glm5Next
             | Architecture::LoopVl
@@ -1613,6 +1615,7 @@ impl ModelSpec {
             Architecture::Flint | Architecture::Clover => SwigluRounding::Once,
             Architecture::Glm5Next | Architecture::DeepseekV41 => SwigluRounding::ClampedTwice,
             Architecture::Llama
+            | Architecture::Qwen3
             | Architecture::Qwen35Text
             | Architecture::MiniCpmV47
             | Architecture::LoopVl
@@ -1633,6 +1636,7 @@ impl ModelSpec {
                 .as_ref()
                 .map_or(0.0, |config| config.swiglu_limit),
             Architecture::Llama
+            | Architecture::Qwen3
             | Architecture::Qwen35Text
             | Architecture::MiniCpmV47
             | Architecture::Flint
@@ -1651,6 +1655,7 @@ impl ModelSpec {
             }
             Architecture::DeepseekV41 => RoutedWeightBoundary::BeforeDownQuantization,
             Architecture::Llama
+            | Architecture::Qwen3
             | Architecture::Qwen35Text
             | Architecture::MiniCpmV47
             | Architecture::LoopVl
@@ -1665,6 +1670,7 @@ impl ModelSpec {
         crate::config::Config {
             model_type: match self.architecture {
                 Architecture::Llama => "llama",
+                Architecture::Qwen3 => "qwen3",
                 Architecture::Qwen35Text => "qwen3_5_text",
                 Architecture::MiniCpmV47 => "qwen3_5_moe_text",
                 Architecture::Flint => "flint",
@@ -1706,6 +1712,9 @@ impl ModelSpec {
     }
     pub fn read(dir: &Path) -> Result<Self> {
         let root: Value = serde_json::from_slice(&fs::read(dir.join("config.json"))?)?;
+        if root.get("model_type").and_then(Value::as_str) == Some("qwen3") {
+            return Self::qwen3(&root);
+        }
         if root.get("model_type").and_then(Value::as_str) == Some("llama") {
             let c = crate::config::Config::read(dir)?;
             return Self::from_llama(&c);
@@ -1780,6 +1789,128 @@ impl ModelSpec {
                     ffn: FfnKind::Dense,
                 })
                 .collect(),
+        })
+    }
+    pub fn qwen3(root: &Value) -> Result<Self> {
+        exact_keys(
+            root,
+            &[
+                "architectures",
+                "attention_bias",
+                "attention_dropout",
+                "bos_token_id",
+                "dtype",
+                "eos_token_id",
+                "head_dim",
+                "hidden_act",
+                "hidden_size",
+                "initializer_range",
+                "intermediate_size",
+                "layer_types",
+                "max_position_embeddings",
+                "max_window_layers",
+                "model_type",
+                "num_attention_heads",
+                "num_hidden_layers",
+                "num_key_value_heads",
+                "pad_token_id",
+                "rms_norm_eps",
+                "rope_parameters",
+                "sliding_window",
+                "tie_word_embeddings",
+                "transformers_version",
+                "use_cache",
+                "use_sliding_window",
+                "vocab_size",
+            ],
+            "Qwen3 config",
+        )?;
+        for (key, value) in [
+            ("architectures", serde_json::json!(["Qwen3ForCausalLM"])),
+            ("model_type", "qwen3".into()),
+            ("dtype", "bfloat16".into()),
+            ("hidden_act", "silu".into()),
+            ("attention_bias", false.into()),
+            ("attention_dropout", 0.0.into()),
+            ("tie_word_embeddings", false.into()),
+            ("use_sliding_window", false.into()),
+            ("sliding_window", Value::Null),
+            ("use_cache", true.into()),
+        ] {
+            equal(root, key, value)?;
+        }
+        let h = positive(root, "hidden_size")?;
+        let q = positive(root, "num_attention_heads")?;
+        let kv = positive(root, "num_key_value_heads")?;
+        let d = positive(root, "head_dim")?;
+        let n = positive(root, "num_hidden_layers")?;
+        ensure!(
+            q.is_multiple_of(kv) && d.is_multiple_of(2),
+            "invalid Qwen3 attention geometry"
+        );
+        let q_width = q.checked_mul(d).context("Qwen3 query width overflow")?;
+        kv.checked_mul(d).context("Qwen3 KV width overflow")?;
+        equal(
+            root,
+            "layer_types",
+            serde_json::json!(vec!["full_attention"; n as usize]),
+        )?;
+        let rope = &root["rope_parameters"];
+        exact_keys(rope, &["rope_type", "rope_theta"], "Qwen3 rope_parameters")?;
+        equal(rope, "rope_type", "default".into())?;
+        let theta = rope["rope_theta"]
+            .as_f64()
+            .context("invalid Qwen3 rope_theta")? as f32;
+        let eps = root["rms_norm_eps"]
+            .as_f64()
+            .context("invalid Qwen3 rms_norm_eps")? as f32;
+        ensure!(
+            theta.is_finite() && theta > 0.0 && eps.is_finite() && eps > 0.0,
+            "invalid Qwen3 RoPE/norm constants"
+        );
+        let vocab = positive(root, "vocab_size")?;
+        let eos = if root["eos_token_id"].is_null() {
+            Vec::new()
+        } else {
+            eos(&root["eos_token_id"], vocab)?
+        };
+        Ok(Self {
+            abi_version: 1,
+            architecture: Architecture::Qwen3,
+            hidden: h,
+            intermediate: positive(root, "intermediate_size")?,
+            vocab,
+            q_heads: q,
+            kv_heads: kv,
+            head_dim: d,
+            q_width,
+            max_position: positive(root, "max_position_embeddings")?,
+            rms_eps: eps,
+            rope_theta: theta,
+            rotary_dim: d,
+            linear_format: LinearFormat::Bf16,
+            expert_format: None,
+            eos,
+            layers: (0..n)
+                .map(|state_index| LayerPlan {
+                    geometry: None,
+                    mixer: Mixer::FullAttention,
+                    state_index,
+                    rope: true,
+                    sliding_window: None,
+                    ffn: FfnKind::Dense,
+                })
+                .collect(),
+            moe: None,
+            gdn: None,
+            glm5_next: None,
+            deepseek_v41: None,
+            logit_softcap: None,
+            per_layer_input: None,
+            audio: None,
+            vision: None,
+            canvas_length: None,
+            diffusion: None,
         })
     }
     pub fn loopvl(root: &Value, generation: &Value) -> Result<Self> {

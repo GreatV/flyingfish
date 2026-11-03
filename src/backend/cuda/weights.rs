@@ -1733,6 +1733,7 @@ impl WeightCatalog {
         transient_bytes: usize,
         media_bytes: usize,
         prefix_cache: bool,
+        host_bytes: usize,
     ) -> Result<Self> {
         use crate::prefill::DensePlacement;
         ensure!(
@@ -1792,6 +1793,9 @@ impl WeightCatalog {
             "prefix-cache identity for streamed dense weights is not bound"
         );
         let available_host = usize::try_from(super::calibrate::host_memory(Path::new("/"))?)?;
+        let available_host = available_host
+            .checked_sub(host_bytes)
+            .context("dense host feature reservation exceeds available RAM")?;
         let (_, plan) = Self::dense_host_fixed(&layers, &ranges, budget, available_host)?;
         let memory_bus_bits = d
             .ctx
@@ -2120,6 +2124,15 @@ impl WeightCatalog {
                     [u64::from(width), 1],
                 )
             }
+            #[cfg(feature = "cuda")]
+            Some(StoredTensor::Slot { pointer, bytes }) => unsafe {
+                super::contracts::Tensor::new(
+                    *pointer,
+                    [rows, width],
+                    [u64::from(width), 1],
+                    *bytes as u64,
+                )
+            },
             _ => anyhow::bail!("missing/non-BF16 tensor {name}"),
         }
     }

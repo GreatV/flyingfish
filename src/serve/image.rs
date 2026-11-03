@@ -434,6 +434,7 @@ impl Processor {
                 ImageConfig::MiniCpm(config)
             }
             Architecture::Llama
+            | Architecture::Qwen3
             | Architecture::Flint
             | Architecture::Glm5Next
             | Architecture::LoopVl

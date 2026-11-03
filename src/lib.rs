@@ -17,6 +17,7 @@ pub mod minimax_h3;
 pub mod model;
 pub mod model_spec;
 pub mod mtp;
+pub mod music3;
 pub mod op_contract;
 pub mod prefill;
 pub mod prefix_state;
