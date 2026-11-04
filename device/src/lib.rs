@@ -577,7 +577,8 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
                                     ld4::<{ ($inner / 4) * 128 + $pair * 4096 }>(kb[$inner % 4])
                                 };
                                 scores[$pair * 2] = mma::<F16>(a, [b[0], b[1]], scores[$pair * 2]);
-                                scores[$pair * 2 + 1] = mma::<F16>(a, [b[2], b[3]], scores[$pair * 2 + 1]);
+                                scores[$pair * 2 + 1] =
+                                    mma::<F16>(a, [b[2], b[3]], scores[$pair * 2 + 1]);
                             }};
                         }
                         four!(qk_pair);
@@ -730,12 +731,19 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const 
                                     )
                                 };
                                 output[$pair * 2] = mma::<F16>(a, [b[0], b[1]], output[$pair * 2]);
-                                output[$pair * 2 + 1] = mma::<F16>(a, [b[2], b[3]], output[$pair * 2 + 1]);
+                                output[$pair * 2 + 1] =
+                                    mma::<F16>(a, [b[2], b[3]], output[$pair * 2 + 1]);
                                 if D <= 128 {
-                                    output[$pair * 2] =
-                                        mma::<F16>(residual[$inner], [b[0], b[1]], output[$pair * 2]);
-                                    output[$pair * 2 + 1] =
-                                        mma::<F16>(residual[$inner], [b[2], b[3]], output[$pair * 2 + 1]);
+                                    output[$pair * 2] = mma::<F16>(
+                                        residual[$inner],
+                                        [b[0], b[1]],
+                                        output[$pair * 2],
+                                    );
+                                    output[$pair * 2 + 1] = mma::<F16>(
+                                        residual[$inner],
+                                        [b[2], b[3]],
+                                        output[$pair * 2 + 1],
+                                    );
                                 }
                             }};
                         }
@@ -1019,7 +1027,8 @@ unsafe fn attention_d512<const SPLIT: bool, const BIDI: bool>(
                                 512,
                             ));
                             scores[$pair * 2] = mma::<false>(a, [b[0], b[1]], scores[$pair * 2]);
-                            scores[$pair * 2 + 1] = mma::<false>(a, [b[2], b[3]], scores[$pair * 2 + 1]);
+                            scores[$pair * 2 + 1] =
+                                mma::<false>(a, [b[2], b[3]], scores[$pair * 2 + 1]);
                         }};
                     }
                     pair!(0);
