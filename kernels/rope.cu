@@ -590,7 +590,7 @@ __device__ __forceinline__ __half rope_from_f32<__half>(float v) {
 template <typename T>
 __device__ __forceinline__ void rope_pair_tail_impl(
     T* x, const float* __restrict__ rotary, int rows, int n,
-    int width, int tail, int rotary_heads, bool head_major = false) {
+    int width, int tail, int rotary_heads, bool head_major, bool round_products) {
   if (rows < 1 || n < 1 || tail < 2 || (tail % 2) != 0 || tail > width ||
       (rotary_heads != 1 && rotary_heads != n))
     __trap();
@@ -600,15 +600,21 @@ __device__ __forceinline__ void rope_pair_tail_impl(
   const int pair = i % half;
   const int v = (i / half) % n;
   const int r = i / (half * n);
-  const size_t vector = head_major ? (size_t)v * rows + r : (size_t)r * n + v;
-  const size_t d = vector * width + (width - tail) + 2 * pair;
+  const size_t d = head_major
+      ? ((size_t)v * rows + r) * width + (width - tail) + 2 * pair
+      : (size_t)(r * n * width + v * width + (width - tail) + 2 * pair);
   const size_t rot_row = (rotary_heads == 1) ? (size_t)r : ((size_t)r * n + v);
   const float c = rotary[rot_row * tail + 2 * pair];
   const float s = rotary[rot_row * tail + 2 * pair + 1];
   const float a = rope_to_f32(x[d]);
   const float b = rope_to_f32(x[d + 1]);
-  x[d] = rope_from_f32<T>(__fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s)));
-  x[d + 1] = rope_from_f32<T>(__fadd_rn(__fmul_rn(a, s), __fmul_rn(b, c)));
+  if (round_products) {
+    x[d] = rope_from_f32<T>(__fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s)));
+    x[d + 1] = rope_from_f32<T>(__fadd_rn(__fmul_rn(a, s), __fmul_rn(b, c)));
+  } else {
+    x[d] = rope_from_f32<T>(a * c - b * s);
+    x[d + 1] = rope_from_f32<T>(a * s + b * c);
+  }
 }
 
 }  // namespace
@@ -645,13 +651,13 @@ extern "C" __global__ void rope_pair_rows_3d(
 extern "C" __global__ void rope_pair_tail(
     __nv_bfloat16* x, const float* __restrict__ rotary, int rows, int n,
     int width, int tail) {
-  rope_pair_tail_impl(x, rotary, rows, n, width, tail, 1);
+  rope_pair_tail_impl(x, rotary, rows, n, width, tail, 1, false, false);
 }
 
 extern "C" __global__ void rope_pair_tail_hm(
     __nv_bfloat16* x, const float* __restrict__ rotary, int rows, int heads,
     int width, int tail) {
-  rope_pair_tail_impl(x, rotary, rows, heads, width, tail, 1, true);
+  rope_pair_tail_impl(x, rotary, rows, heads, width, tail, 1, true, true);
 }
 
 // Partial split-half rotary apply in F32: q [rows, heads, head_dim], only the
