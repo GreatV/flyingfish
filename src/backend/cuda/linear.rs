@@ -3600,7 +3600,11 @@ mod tests {
             return Ok(());
         };
         let file = crate::gguf::GgufFile::open(&std::path::PathBuf::from(gguf_path))?;
-        let real = real_q4_0_blocks(&file, "blocks.0.attn.qkv_proj.weight", 256)?;
+        let qkv = file
+            .tensor("blocks.0.attn.qkv_proj.weight")
+            .context("GGUF has no blocks.0.attn.qkv_proj.weight")?;
+        let row_blocks = (qkv.dims[0] / 32) as usize;
+        let real = real_q4_0_blocks(&file, "blocks.0.attn.qkv_proj.weight", row_blocks)?;
         let real_flat = q4_0_flat_f32(&real, false);
         let real_device = stream.clone_htod(&real)?;
         let real_count = (real.len() / 18) as i64;
