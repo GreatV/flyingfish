@@ -5790,6 +5790,7 @@ pub struct PixalConditioningRuntime {
     global: CudaSlice<f32>,
     projection: CudaSlice<f32>,
     project: CudaFunction,
+    focal: CudaFunction,
     accumulate: CudaFunction,
     projection_rows: u32,
     channels: u32,
@@ -5888,6 +5889,7 @@ impl PixalConditioningRuntime {
             global,
             projection,
             project: module.load_function("project_bilinear_f32")?,
+            focal: module.load_function("perspective_focal_f32")?,
             accumulate: module.load_function("accumulate_mean_f32")?,
             projection_rows,
             channels,
@@ -6001,10 +6003,15 @@ impl PixalConditioningRuntime {
         s.memcpy_htod(image, &mut self.image)?;
         let mut parameters = [0.0f32; 15];
         parameters[..12].copy_from_slice(&camera.world_to_camera);
-        parameters[12] = (camera.horizontal_fov / 2.0).tan();
+        parameters[12] = camera.horizontal_fov;
         parameters[13] = camera.mesh_scale;
         parameters[14] = self.shape.image_side as f32;
         s.memcpy_htod(&parameters, &mut self.camera)?;
+        unsafe {
+            s.launch_builder(&self.focal)
+                .arg(&self.camera)
+                .launch(grid(1, 1))?;
+        }
         self.staged = true;
         Ok(())
     }
@@ -9018,6 +9025,8 @@ mod tests {
         device.finish_upload()?;
         let s = &device.stream;
         let op = cubin::module(&device.ctx, "vision_ops")?.load_function("project_bilinear_f32")?;
+        let focal =
+            cubin::module(&device.ctx, "vision_ops")?.load_function("perspective_focal_f32")?;
         let mut host = Vec::with_capacity(31 * 37 * 17);
         for y in 0..31 {
             for x in 0..37 {
@@ -9046,12 +9055,13 @@ mod tests {
                     camera.world_to_camera[11] = -0.125;
                 }
                 let mut parameters = camera.world_to_camera.to_vec();
-                parameters.extend([
-                    (camera.horizontal_fov / 2.0).tan(),
-                    camera.mesh_scale,
-                    1024.0,
-                ]);
+                parameters.extend([camera.horizontal_fov, camera.mesh_scale, 1024.0]);
                 let parameters = s.clone_htod(&parameters)?;
+                unsafe {
+                    s.launch_builder(&focal)
+                        .arg(&parameters)
+                        .launch(grid(1, 1))?;
+                }
                 let reference_file = std::fs::File::open(
                     project
                         .join("evidence/P1-M1-r1/projection-local")

@@ -141,9 +141,13 @@ impl Conv2dF32 {
             w: &filter,
             y: &output,
         };
-        let algorithm = operation
-            .pick_algorithm()
-            .context("cuDNN F32 convolution heuristic")?;
+        let algorithm = if kernel == 3 && channels >= 32 {
+            cs::cudnnConvolutionFwdAlgo_t::CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD
+        } else {
+            operation
+                .pick_algorithm()
+                .context("cuDNN F32 convolution heuristic")?
+        };
         let bytes = operation
             .get_workspace_size(algorithm)
             .context("cuDNN F32 convolution workspace")?;

@@ -883,8 +883,20 @@ extern "C" __global__ __launch_bounds__(128) void neighborhood_attention_2d_f32(
     for (uint32_t j = 0; j < 8; ++j) output[query*256+j*32+lane] = accum[j];
 }
 
+// Camera [12] changes from horizontal FOV to focal pixels; [14] is image resolution.
+extern "C" __global__ void perspective_focal_f32(float* camera) {
+    if (blockDim.x != 1 || blockDim.y != 1 || blockDim.z != 1 ||
+        gridDim.x != 1 || gridDim.y != 1 || gridDim.z != 1 || !camera ||
+        !isfinite(camera[12]) || !isfinite(camera[14]) || !(camera[12] > 0.0f) ||
+        !(camera[12] < 3.14159265358979323846f) || !(camera[14] > 0.0f)) { __trap(); return; }
+    const float tangent = tanf(__fmul_rn(camera[12], 0.5f));
+    const float focal = __fdiv_rn(__fmul_rn(__fdiv_rn(16.0f, tangent), camera[14]), 32.0f);
+    if (!isfinite(focal) || !(focal > 0.0f)) { __trap(); return; }
+    camera[12] = focal;
+}
+
 // Inclusive XYZ grid, row-major camera inverse [3,4], border bilinear align_corners=false.
-// Camera parameters [12 matrix values, tan(angle/2), mesh_scale, image_resolution].
+// Camera parameters [12 matrix values, focal_pixels, mesh_scale, image_resolution].
 extern "C" __global__ void project_bilinear_f32(const float* input, float* output, const float* camera,
     uint32_t grid_side, uint32_t height, uint32_t width, uint32_t channels,
     uint32_t output_channels, uint32_t offset, uint64_t first, uint32_t rows,
@@ -907,7 +919,7 @@ extern "C" __global__ void project_bilinear_f32(const float* input, float* outpu
         };
         const float xx=transform(0), yy=transform(1), zz=transform(2);
         const float resolution=camera[14];
-        const float focal=__fdiv_rn(__fmul_rn(__fdiv_rn(16.0f,camera[12]),resolution),32.0f);
+        const float focal=camera[12];
         const float denom=__fadd_rn(-zz,1.0e-8f);
         const auto pixel = [&](float camera_coord, uint32_t size) {
             const float projected=__fadd_rn(__fdiv_rn(__fmul_rn(focal,camera_coord),denom),resolution/2.0f);
