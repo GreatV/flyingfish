@@ -846,8 +846,18 @@ mod e2e {
                 .iter()
                 .flat_map(|v| v.to_le_bytes())
                 .collect();
+            let latent_shape = {
+                let spec = crate::music3::SynSpec::read(&std::path::PathBuf::from(
+                    std::env::var("FF_MUSIC3_MODEL").context("model dir")?,
+                ))?;
+                vec![
+                    1usize,
+                    spec.latent_channels as usize,
+                    spec.latent_length(input.request.frames),
+                ]
+            };
             let latent_view =
-                TensorView::new(safetensors::Dtype::F32, vec![latent.len()], &latent_bytes)?;
+                TensorView::new(safetensors::Dtype::F32, latent_shape, &latent_bytes)?;
             let ids_view = TensorView::new(
                 safetensors::Dtype::I64,
                 vec![input.request.prompt_ids.len()],
