@@ -1067,9 +1067,7 @@ impl Music3Syn {
     /// Latent length for a frame count: int(frames * out_rate * in_hop /
     /// (in_rate * out_hop)), at least 1.
     pub fn latent_length(&self, frames: usize) -> usize {
-        let numerator = self.spec.output_rate as u64 * self.spec.input_hop as u64 * frames as u64;
-        let denominator = self.spec.input_rate as u64 * self.spec.output_hop as u64;
-        usize::max(1, (numerator / denominator) as usize)
+        self.spec.latent_length(frames)
     }
 
     /// Condition encoder: fused layer softmax-sum, k=3 conv and nearest
