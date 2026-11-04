@@ -6037,6 +6037,7 @@ mod gguf_tests {
                 weight_map: BTreeMap::new(),
             },
             maps: BTreeMap::new(),
+            zip_tensors: None,
             #[cfg(any(feature = "cuda", feature = "rocm"))]
             files: BTreeMap::new(),
         }
