@@ -3603,6 +3603,7 @@ fn large_media_components(
             let mut norms = Vec::new();
             let mut logits = Vec::new();
             for range in calls {
+                engine.reset()?;
                 let mut trace = crate::trace::Trace::default();
                 let actual = engine.gemma_final_probe(
                     &fixed[range.start * width..range.end * width],
