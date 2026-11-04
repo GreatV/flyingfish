@@ -1930,6 +1930,29 @@ impl DenseStreaming {
         Ok(counts)
     }
 
+    /// Test control: shift one layer entry's source offset by `delta` bytes.
+    #[cfg(test)]
+    pub(crate) fn shift_source_offset(
+        &mut self,
+        layer: usize,
+        name: &str,
+        delta: isize,
+    ) -> Result<()> {
+        let entry = self
+            .layers
+            .get_mut(layer)
+            .context("dense layer outside plan")?
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == name)
+            .context("dense entry missing")?;
+        entry.source_offset = entry
+            .source_offset
+            .checked_add_signed(delta)
+            .context("dense source offset overflow")?;
+        Ok(())
+    }
+
     /// Pinned host copy of a host-tier layer, its linear projections packed in manifest-name order; `None` for
     /// resident and disk-tier layers. Callers outside the loader fill it before the first `begin`.
     pub(crate) fn host_layer(&mut self, layer: usize) -> Result<Option<&mut [u8]>> {

@@ -3339,6 +3339,154 @@ mod tests {
         Ok(())
     }
 
+    /// The streamed quantized path gate: the real target's GGUF manifest placed `Streamed` (host tier) and
+    /// `StreamedDisk` (disk tier), every layer's device slot compared bit-exact against `BlockWeights::resident`
+    /// for the same layer. The control shifts one entry's source offset by one Q4_0 block (18 B) and must fail.
+    #[test]
+    #[ignore = "FF_MODEL, FF_H3_GGUF, FF_H3_LORA"]
+    fn gguf_streamed_slots_match_resident_weights() -> Result<()> {
+        let var = |key: &str| -> Result<PathBuf> {
+            Ok(PathBuf::from(
+                std::env::var_os(key).with_context(|| format!("{key} missing"))?,
+            ))
+        };
+        let model = var("FF_MODEL")?;
+        let gguf_path = var("FF_H3_GGUF")?;
+        let lora_path = var("FF_H3_LORA")?;
+        let spec = H3Spec::read(&model)?;
+        let gguf = crate::gguf::GgufFile::open(&gguf_path)?;
+        let manifest = MappedCheckpoint::open_component(
+            &model.join("transformer"),
+            "diffusion_pytorch_model",
+        )?
+        .minimax_h3_gguf_manifest(&spec, &gguf)?;
+        let lora_dir = lora_path.parent().context("LoRA directory")?.to_owned();
+        let stem = lora_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".safetensors"))
+            .context("LoRA file stem")?;
+        let (lora_manifest, adapter) =
+            MappedCheckpoint::open_component(&lora_dir, stem)?.minimax_h3_lora_manifest(&spec)?;
+        let gguf_dir = gguf_path.parent().context("GGUF directory")?.to_owned();
+
+        let mut layers = vec![0usize; spec.layers];
+        let mut source_layers = vec![0usize; spec.layers];
+        let mut dequant_layer = vec![false; spec.layers];
+        let mut largest = 0usize;
+        for (name, entry) in &manifest.entries {
+            if let Some(layer) = entry.layer
+                && entry.load
+                && entry.shape.len() == 2
+            {
+                let device_bytes = device_slot_bytes(name, entry)?;
+                layers[layer as usize] += device_bytes;
+                source_layers[layer as usize] += entry.bytes;
+                largest = largest.max(device_bytes);
+                if dequantizes(entry.quant) {
+                    dequant_layer[layer as usize] = true;
+                }
+            }
+        }
+        let staging = dequant_layer
+            .iter()
+            .zip(&source_layers)
+            .filter_map(|(dequant, source)| dequant.then_some(*source))
+            .max()
+            .unwrap_or(0);
+        let transient = manifest
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.load && dequantizes(entry.quant))
+            .map(|(_, entry)| entry.bytes)
+            .max()
+            .unwrap_or(0);
+        let owned = lora_manifest
+            .entries
+            .iter()
+            .filter(|(name, _)| name.starts_with("transformer_blocks."))
+            .map(|(_, entry)| entry.bytes)
+            .sum::<usize>()
+            + spec.layers * 2 * (2 * spec.hidden + 2 * spec.head_dim)
+            + staging
+            + transient;
+
+        let device = Device::new(0)?;
+        let stream = &device.stream;
+        let mismatches =
+            |placement: Placement, perturb: Option<(usize, &str, isize)>| -> Result<Vec<usize>> {
+                let mut base = Source::new(&gguf_dir, &manifest);
+                let mut dense = place_layers(
+                    &device,
+                    &mut base,
+                    (&layers, &source_layers, largest, owned, 0),
+                    placement,
+                    |layer| format!("transformer_blocks.{layer}"),
+                    &LINEAR_ROLES,
+                )?
+                .context("streamed placement")?;
+                if let Some((layer, name, delta)) = perturb {
+                    dense.shift_source_offset(layer, name, delta)?;
+                }
+                let mut mismatches = Vec::new();
+                for layer in 0..spec.layers {
+                    let name = format!("transformer_blocks.{layer}");
+                    let resident = BlockWeights::resident(
+                        stream,
+                        &spec,
+                        adapter.rank,
+                        &name,
+                        &mut Source::new(&gguf_dir, &manifest),
+                        &mut Source::new(&lora_dir, &lora_manifest),
+                    )?;
+                    let expected = stream
+                        .clone_dtoh(resident.storage.as_ref().context("resident storage")?)?;
+                    dense.begin(layer, stream)?;
+                    let pointer = dense.pointer(layer, 0, layers[layer])?;
+                    let mut actual = stream.alloc_zeros::<bf16>(expected.len())?;
+                    unsafe {
+                        cudarc::driver::result::memcpy_dtod_async(
+                            actual.device_ptr(stream).0,
+                            pointer,
+                            layers[layer],
+                            stream.cu_stream(),
+                        )?;
+                    }
+                    dense.end(layer, stream)?;
+                    let actual = stream.clone_dtoh(&actual)?;
+                    if actual
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .ne(expected.iter().map(|v| v.to_bits()))
+                    {
+                        mismatches.push(layer);
+                    }
+                }
+                Ok(mismatches)
+            };
+        for placement in [Placement::Streamed, Placement::StreamedDisk] {
+            let clean = mismatches(placement, None)?;
+            ensure!(
+                clean.is_empty(),
+                "{placement:?}: streamed slots differ from resident in layers {clean:?}"
+            );
+            let control = mismatches(
+                placement,
+                Some((0, "transformer_blocks.0.attn.to_q.weight", 18)),
+            )?;
+            ensure!(
+                control == vec![0],
+                "{placement:?}: the shifted source offset control did not fail exactly layer 0: {control:?}"
+            );
+            println!(
+                "H3_GGUF_STREAMED {placement:?} layers={} bit_exact_mismatches=0 control=FAIL_AS_REQUIRED",
+                spec.layers
+            );
+        }
+        println!("H3_GGUF_STREAMED_GATE PASS");
+        Ok(())
+    }
+
     /// The GGUF AdaLN gate: the 50 `adaln_proj` weights dequantized from the GGUF into the engine's AdaLN table,
     /// against the definition's per-block modulation for the same timesteps (the harness dump, layer-major). The
     /// floor is the reference's own FP32-vs-BF16 arm spread; the control swaps the video/audio tags.
