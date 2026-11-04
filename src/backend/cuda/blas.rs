@@ -63,189 +63,6 @@ use std::{
     sync::Arc,
 };
 
-/// F32 NCHW convolution, reflection padding k/2, unit stride, published OIHW weights.
-pub(crate) struct Conv2dF32 {
-    stream: Arc<CudaStream>,
-    input: cudarc::cudnn::TensorDescriptor<f32>,
-    output: cudarc::cudnn::TensorDescriptor<f32>,
-    filter: cudarc::cudnn::FilterDescriptor<f32>,
-    convolution: cudarc::cudnn::ConvDescriptor<f32>,
-    algorithm: cudarc::cudnn::sys::cudnnConvolutionFwdAlgo_t,
-    shape: [u32; 5],
-    workspace: [usize; 2],
-    reflect: CudaFunction,
-    bias: CudaFunction,
-}
-
-pub(crate) struct Conv2dWorkspaceF32 {
-    padded: CudaSlice<f32>,
-    temporary: CudaSlice<u8>,
-}
-
-impl Conv2dWorkspaceF32 {
-    pub(crate) fn new(stream: &Arc<CudaStream>, [elements, bytes]: [usize; 2]) -> Result<Self> {
-        Ok(Self {
-            padded: stream.alloc_zeros(elements.max(1))?,
-            temporary: stream.alloc_zeros(bytes.max(1))?,
-        })
-    }
-}
-
-impl Conv2dF32 {
-    pub(crate) fn new(
-        stream: &Arc<CudaStream>,
-        handle: &Arc<cudarc::cudnn::Cudnn>,
-        shape: [u32; 5],
-    ) -> Result<Self> {
-        use cudarc::cudnn::{ConvForward, sys as cs};
-        let [height, width, channels, outputs, kernel] = shape;
-        ensure!(
-            shape.iter().all(|&v| v > 0 && v <= i32::MAX as u32)
-                && kernel % 2 == 1
-                && kernel / 2 < height.min(width),
-            "invalid F32 reflection convolution geometry {shape:?}"
-        );
-        let pad = kernel / 2;
-        let ph = height
-            .checked_add(2 * pad)
-            .context("convolution height overflow")?;
-        let pw = width
-            .checked_add(2 * pad)
-            .context("convolution width overflow")?;
-        let nchw = cs::cudnnTensorFormat_t::CUDNN_TENSOR_NCHW;
-        let input = handle.create_4d_tensor(
-            nchw,
-            [1, channels as i32, i32::try_from(ph)?, i32::try_from(pw)?],
-        )?;
-        let output =
-            handle.create_4d_tensor(nchw, [1, outputs as i32, height as i32, width as i32])?;
-        let filter = handle.create_4d_filter(
-            nchw,
-            [
-                outputs as i32,
-                channels as i32,
-                kernel as i32,
-                kernel as i32,
-            ],
-        )?;
-        let mut convolution = handle.create_conv2d(
-            [0, 0],
-            [1, 1],
-            [1, 1],
-            cs::cudnnConvolutionMode_t::CUDNN_CROSS_CORRELATION,
-        )?;
-        convolution.set_math_type(cs::cudnnMathType_t::CUDNN_FMA_MATH)?;
-        let operation = ConvForward {
-            conv: &convolution,
-            x: &input,
-            w: &filter,
-            y: &output,
-        };
-        let algorithm = if kernel == 3 && channels >= 32 {
-            cs::cudnnConvolutionFwdAlgo_t::CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD
-        } else {
-            operation
-                .pick_algorithm()
-                .context("cuDNN F32 convolution heuristic")?
-        };
-        let bytes = operation
-            .get_workspace_size(algorithm)
-            .context("cuDNN F32 convolution workspace")?;
-        let elements = if pad == 0 {
-            0
-        } else {
-            channels as usize * ph as usize * pw as usize
-        };
-        let module = cubin::module(stream.context(), "vision_ops")?;
-        Ok(Self {
-            stream: stream.clone(),
-            input,
-            output,
-            filter,
-            convolution,
-            algorithm,
-            shape,
-            workspace: [elements, bytes],
-            reflect: module.load_function("reflect_pad_2d_f32")?,
-            bias: module.load_function("bias_residual_f32")?,
-        })
-    }
-
-    pub(crate) fn workspace(&self) -> [usize; 2] {
-        self.workspace
-    }
-
-    pub(crate) fn run(
-        &self,
-        weights: [&CudaSlice<f32>; 2],
-        input: &CudaSlice<f32>,
-        output: &mut CudaSlice<f32>,
-        workspace: &mut Conv2dWorkspaceF32,
-    ) -> Result<()> {
-        let [height, width, channels, outputs, kernel] = self.shape;
-        let pixels = u64::from(height) * u64::from(width);
-        ensure!(
-            input.len() as u64 >= pixels * u64::from(channels)
-                && output.len() as u64 >= pixels * u64::from(outputs)
-                && weights[0].len() as u64
-                    == u64::from(outputs) * u64::from(channels) * u64::from(kernel).pow(2)
-                && weights[1].len() == outputs as usize
-                && workspace.padded.len() >= self.workspace[0]
-                && workspace.temporary.len() >= self.workspace[1],
-            "F32 convolution tensor/workspace extent changed after setup"
-        );
-        let pad = kernel / 2;
-        let source = if pad == 0 {
-            input
-        } else {
-            unsafe {
-                self.stream
-                    .launch_builder(&self.reflect)
-                    .arg(input)
-                    .arg(&workspace.padded)
-                    .arg(&channels)
-                    .arg(&height)
-                    .arg(&width)
-                    .arg(&pad)
-                    .launch(super::ops::grid(
-                        self.workspace[0].div_ceil(256).min(65535),
-                        256,
-                    ))?;
-            }
-            &workspace.padded
-        };
-        unsafe {
-            cudarc::cudnn::ConvForward {
-                conv: &self.convolution,
-                x: &self.input,
-                w: &self.filter,
-                y: &self.output,
-            }
-            .launch(
-                self.algorithm,
-                Some(&mut workspace.temporary),
-                (1.0f32, 0.0f32),
-                source,
-                weights[0],
-                output,
-            )?;
-            self.stream
-                .launch_builder(&self.bias)
-                .arg(output)
-                .arg(weights[1])
-                .arg(&0u64)
-                .arg(&(pixels * u64::from(outputs)))
-                .arg(&outputs)
-                .arg(&pixels)
-                .launch(super::ops::grid(
-                    (pixels * u64::from(outputs)).div_ceil(256).min(65535) as usize,
-                    256,
-                ))?;
-        }
-        Ok(())
-    }
-}
-
 struct Plan {
     desc: sys::cublasLtMatmulDesc_t,
     a: sys::cublasLtMatrixLayout_t,
@@ -1309,14 +1126,27 @@ impl Blas {
         let input = x.shape[1] as usize;
         let output = weight.shape[0] as usize;
         checked_dims(rows, output, input)?;
+        let column_major = y.0.stride[0] == 1 && y.0.stride[1] >= rows as u64;
         ensure!(
             weight.shape == [output as u32, input as u32]
                 && weight.stride == [input as u64, 1]
                 && x.stride == [input as u64, 1]
                 && y.0.shape == [rows as u32, output as u32]
-                && y.0.stride == [output as u64, 1],
-            "FP32 linear requires dense [output,input] x [rows,input] -> [rows,output]"
+                && (y.0.stride == [output as u64, 1] || column_major),
+            "FP32 linear requires dense operands and row/column-major output"
         );
+        let (m, n, a, b, ld) = if column_major {
+            (
+                rows,
+                output,
+                x.ptr,
+                weight.ptr,
+                usize::try_from(y.0.stride[1])?,
+            )
+        } else {
+            (output, rows, weight.ptr, x.ptr, output)
+        };
+        ensure!(ld <= i32::MAX as usize, "FP32 linear output pitch overflow");
         let alpha = 1f32;
         let beta = 0f32;
         unsafe {
@@ -1324,20 +1154,20 @@ impl Blas {
                 *self.decode.handle(),
                 bs::cublasOperation_t::CUBLAS_OP_T,
                 bs::cublasOperation_t::CUBLAS_OP_N,
-                output as i32,
-                rows as i32,
+                m as i32,
+                n as i32,
                 input as i32,
                 (&alpha as *const f32).cast(),
-                weight.ptr as *const core::ffi::c_void,
+                a as *const core::ffi::c_void,
                 bs::cudaDataType_t::CUDA_R_32F,
                 input as i32,
-                x.ptr as *const core::ffi::c_void,
+                b as *const core::ffi::c_void,
                 bs::cudaDataType_t::CUDA_R_32F,
                 input as i32,
                 (&beta as *const f32).cast(),
                 y.0.ptr as *mut core::ffi::c_void,
                 bs::cudaDataType_t::CUDA_R_32F,
-                output as i32,
+                ld as i32,
                 bs::cublasComputeType_t::CUBLAS_COMPUTE_32F,
                 bs::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
             )

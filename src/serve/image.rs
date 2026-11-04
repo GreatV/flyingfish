@@ -1528,8 +1528,19 @@ fn resize_separable(
     result
 }
 
-/// Separable radius-3 Lanczos on interleaved u8 pixels, with 22-bit coefficients.
-pub fn resize_lanczos(input: &[u8], shape: [usize; 3], output: [usize; 2]) -> Result<Vec<u8>> {
+#[derive(Clone, Copy)]
+pub enum ResizeRounding {
+    F64,
+    Fixed22,
+}
+
+/// Separable radius-3 Lanczos on interleaved u8 pixels.
+pub fn resize_lanczos(
+    input: &[u8],
+    shape: [usize; 3],
+    output: [usize; 2],
+    rounding: ResizeRounding,
+) -> Result<Vec<u8>> {
     let [height, width, channels] = shape;
     let [out_height, out_width] = output;
     ensure!(
@@ -1553,19 +1564,23 @@ pub fn resize_lanczos(input: &[u8], shape: [usize; 3], output: [usize; 2]) -> Re
             }
         }
     }
-    let weights = |from: usize, to: usize| -> Vec<(usize, Vec<i64>)> {
-        coefficients(from, to, (lanczos, 3.0))
-            .into_iter()
-            .map(|(first, values)| {
-                (
-                    first,
-                    values
-                        .iter()
-                        .map(|v| (v * 4194304.0).round() as i64)
-                        .collect(),
-                )
-            })
-            .collect()
+    let weights = |from: usize, to: usize| coefficients(from, to, (lanczos, 3.0));
+    let sample = |weights: &[f64], pixels: &[u8], first: usize, stride: usize| -> u8 {
+        match rounding {
+            ResizeRounding::F64 => weights
+                .iter()
+                .enumerate()
+                .map(|(i, w)| w * f64::from(pixels[first + i * stride]))
+                .sum::<f64>()
+                .round()
+                .clamp(0.0, 255.0) as u8,
+            ResizeRounding::Fixed22 => {
+                (weights.iter().enumerate().fold(1i64 << 21, |sum, (i, w)| {
+                    sum + (w * 4194304.0).round() as i64 * i64::from(pixels[first + i * stride])
+                }) >> 22)
+                    .clamp(0, 255) as u8
+            }
+        }
     };
     let horizontal = if width == out_width {
         source
@@ -1575,13 +1590,12 @@ pub fn resize_lanczos(input: &[u8], shape: [usize; 3], output: [usize; 2]) -> Re
         for y in 0..height {
             for (x, (first, coefficients)) in weights.iter().enumerate() {
                 for c in 0..channels {
-                    let value = coefficients
-                        .iter()
-                        .enumerate()
-                        .fold(1i64 << 21, |sum, (i, w)| {
-                            sum + w * i64::from(source[(y * width + first + i) * channels + c])
-                        });
-                    target[(y * out_width + x) * channels + c] = (value >> 22).clamp(0, 255) as u8;
+                    target[(y * out_width + x) * channels + c] = sample(
+                        coefficients,
+                        &source,
+                        (y * width + first) * channels + c,
+                        channels,
+                    );
                 }
             }
         }
@@ -1595,15 +1609,12 @@ pub fn resize_lanczos(input: &[u8], shape: [usize; 3], output: [usize; 2]) -> Re
         for (y, (first, coefficients)) in weights.iter().enumerate() {
             for x in 0..out_width {
                 for c in 0..channels {
-                    let value = coefficients
-                        .iter()
-                        .enumerate()
-                        .fold(1i64 << 21, |sum, (i, w)| {
-                            sum + w * i64::from(
-                                horizontal[((first + i) * out_width + x) * channels + c],
-                            )
-                        });
-                    target[(y * out_width + x) * channels + c] = (value >> 22).clamp(0, 255) as u8;
+                    target[(y * out_width + x) * channels + c] = sample(
+                        coefficients,
+                        &horizontal,
+                        (first * out_width + x) * channels + c,
+                        out_width * channels,
+                    );
                 }
             }
         }
@@ -2339,6 +2350,25 @@ mod tests {
 
     #[test]
     fn lanczos_u8_matches_rgb_and_rgba_goldens() -> Result<()> {
+        let rgb = RgbImage {
+            width: 97,
+            height: 83,
+            pixels: (0..97 * 83 * 3)
+                .map(|i| ((i * 73 + i / 11 * 19) % 256) as u8)
+                .collect(),
+        };
+        let merged = resize_separable(&rgb, 151, 43, (lanczos, 3.0));
+        let f64_pixels = resize_lanczos(&rgb.pixels, [83, 97, 3], [43, 151], ResizeRounding::F64)?;
+        let fixed = resize_lanczos(&rgb.pixels, [83, 97, 3], [43, 151], ResizeRounding::Fixed22)?;
+        ensure!(f64_pixels == merged, "merged H3 F64 Lanczos bytes changed");
+        let differing = fixed.iter().zip(&merged).filter(|(a, b)| a != b).count();
+        ensure!(
+            differing > 0,
+            "Lanczos rounding control did not discriminate"
+        );
+        println!(
+            "PASS H3_LANCZOS_BYTES mismatched_bytes=0 fixed22_control_differences={differing}"
+        );
         let input: Vec<u8> = (0..7 * 11 * 3)
             .map(|i| ((i * 37 + 11) % 251) as u8)
             .collect();
@@ -2355,7 +2385,12 @@ mod tests {
             158, 160, 92, 110, 153, 154, 80, 129, 166, 97, 81, 140, 149, 111, 86, 129, 170, 135,
             104, 132, 187, 65, 120, 153, 118, 66, 117, 154, 135, 72, 109, 169, 164,
         ];
-        let actual = resize_lanczos(&input, [7, 11, 3], [13, 5])?;
+        let actual = resize_lanczos(
+            &input,
+            [7, 11, 3],
+            [13, 5],
+            crate::serve::image::ResizeRounding::Fixed22,
+        )?;
         ensure!(
             actual == expected,
             "Lanczos 3-channel golden mismatch: {actual:?}"
@@ -2387,7 +2422,12 @@ mod tests {
             99, 119, 113, 157, 124, 163, 176, 72, 122, 117, 119, 144, 103, 143, 162, 79, 126, 164,
             135, 111, 57, 104, 98,
         ];
-        let actual = resize_lanczos(&input, [7, 11, 4], [13, 5])?;
+        let actual = resize_lanczos(
+            &input,
+            [7, 11, 4],
+            [13, 5],
+            crate::serve::image::ResizeRounding::Fixed22,
+        )?;
         ensure!(
             actual == expected,
             "Lanczos 4-channel golden mismatch: {actual:?}"

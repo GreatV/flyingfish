@@ -1211,6 +1211,7 @@ pub fn prepare_i2va(
             &keyframe.pixels,
             [keyframe.height, keyframe.width, 3],
             [height, width],
+            crate::serve::image::ResizeRounding::F64,
         )?,
     };
     let processor = crate::serve::image::Processor::load(&encoder, None)?

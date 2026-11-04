@@ -1,6 +1,4 @@
 //! Vision weights, patch/position preparation, and image-feature splice for Engine.
-#[cfg(feature = "cuda")]
-use crate::backend::cuda::blas::{Conv2dF32, Conv2dWorkspaceF32};
 use crate::backend::gpu::{CudaFunction, CudaSlice, CudaStream, DevicePtr, PushKernelArg};
 use crate::{
     backend::cuda::{
@@ -5436,7 +5434,8 @@ impl DinoV3Encoder {
 #[cfg(feature = "cuda")]
 struct NafConv {
     weight: BiasedWeight<f32>,
-    plan: Conv2dF32,
+    kernel: u32,
+    input_channels: u32,
 }
 
 #[cfg(feature = "cuda")]
@@ -5447,6 +5446,8 @@ struct NafGuideBranch {
 
 #[cfg(feature = "cuda")]
 struct NafEncoder {
+    im2col: CudaFunction,
+    bias: CudaFunction,
     branches: [NafGuideBranch; 2],
     transpose: CudaFunction,
     group_norm: CudaFunction,
@@ -5462,7 +5463,8 @@ struct NafWorkspace {
     output_side: u32,
     source_side: u32,
     dilation: u32,
-    convolution: Conv2dWorkspaceF32,
+    conv_rows: u32,
+    columns: CudaSlice<f32>,
     a: CudaSlice<f32>,
     b: CudaSlice<f32>,
     guide: CudaSlice<f32>,
@@ -5473,18 +5475,7 @@ struct NafWorkspace {
 
 #[cfg(feature = "cuda")]
 impl NafEncoder {
-    fn check_cudnn_library() -> Result<()> {
-        ensure!(
-            std::panic::catch_unwind(|| unsafe { cudarc::cudnn::sys::culib() }).is_ok(),
-            "Pixal cuDNN unavailable: initialize retained cuDNN library"
-        );
-        Ok(())
-    }
-
-    fn load(device: &Device, dir: &std::path::Path, image_side: u32) -> Result<Self> {
-        Self::check_cudnn_library()?;
-        let convolution_handle = cudarc::cudnn::Cudnn::new(device.stream.clone())
-            .context("cuDNN F32 convolution handle")?;
+    fn load(device: &Device, dir: &std::path::Path) -> Result<Self> {
         let checkpoint =
             crate::checkpoint::MappedCheckpoint::open_component(dir, "naf_release.pth")?;
         let mut remaining = checkpoint
@@ -5517,11 +5508,8 @@ impl NafEncoder {
                 )?;
                 let bias = read(&format!("{prefix}.bias"), &[128])?;
                 Ok(NafConv {
-                    plan: Conv2dF32::new(
-                        s,
-                        &convolution_handle,
-                        [image_side, image_side, channels, 128, kernel],
-                    )?,
+                    kernel,
+                    input_channels: channels,
                     weight: BiasedWeight {
                         weight: s.clone_htod(&weight)?,
                         bias: s.clone_htod(&bias)?,
@@ -5564,6 +5552,8 @@ impl NafEncoder {
             branches: branches
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("NAF guide branch count"))?,
+            im2col: module.load_function("causal_frame_im2col_f32")?,
+            bias: module.load_function("bias_residual_f32")?,
             transpose: cubin::module(&device.ctx, "q38_common")?.load_function("transpose_f32")?,
             group_norm: module.load_function("group_norm_silu_f32")?,
             pool: module.load_function("adaptive_avg_pool2d_f32")?,
@@ -5592,22 +5582,13 @@ impl NafEncoder {
         let target = output_side as usize * output_side as usize;
         let source = source_side as usize * source_side as usize;
         let fixed = 4 * (pixels * 256 + target * (256 + 1024 + 64) + source * 256);
-        let mut convolution_workspace = [0usize; 2];
-        for branch in &self.branches {
-            for convolution in
-                std::iter::once(&branch.initial).chain(branch.blocks.iter().map(|(_, conv)| conv))
-            {
-                for (maximum, extent) in convolution_workspace
-                    .iter_mut()
-                    .zip(convolution.plan.workspace())
-                {
-                    *maximum = (*maximum).max(extent);
-                }
-            }
-        }
+        let available = free_budget
+            .checked_sub(fixed)
+            .context("NAF fixed workspace exceeds remaining device budget")?;
+        let conv_rows = (available / (128 * 9 * 4)).min(pixels).min(32768) as u32;
         ensure!(
-            fixed + 4 * convolution_workspace[0] + convolution_workspace[1] <= free_budget,
-            "NAF F32 convolution workspace exceeds derived device budget"
+            conv_rows > 0,
+            "NAF convolution workspace has no row capacity"
         );
         let mut table = Vec::with_capacity(target * 64);
         for y in 0..output_side {
@@ -5632,7 +5613,8 @@ impl NafEncoder {
             output_side,
             source_side,
             dilation: output_side / source_side,
-            convolution: Conv2dWorkspaceF32::new(s, convolution_workspace)?,
+            conv_rows,
+            columns: s.alloc_zeros(conv_rows as usize * 128 * 9)?,
             a: s.alloc_zeros(pixels * 128)?,
             b: s.alloc_zeros(pixels * 128)?,
             guide: s.alloc_zeros(target * 256)?,
@@ -5640,6 +5622,76 @@ impl NafEncoder {
             output: s.alloc_zeros(target * 1024)?,
             rope_table: s.clone_htod(&table)?,
         })
+    }
+
+    fn convolve(
+        &self,
+        context: (&Arc<CudaStream>, &Blas),
+        conv: &NafConv,
+        input: &CudaSlice<f32>,
+        output: &CudaSlice<f32>,
+        ws: &NafWorkspace,
+    ) -> Result<()> {
+        let (s, blas) = context;
+        let pixels = ws.image_side * ws.image_side;
+        let cols = conv.input_channels * conv.kernel * conv.kernel;
+        ensure!(
+            input.len() >= pixels as usize * conv.input_channels as usize
+                && output.len() >= pixels as usize * 128,
+            "NAF convolution tensor extent"
+        );
+        let weight = stage_view(&conv.weight.weight, s, [128, cols])?;
+        for first in (0..pixels).step_by(ws.conv_rows as usize) {
+            let rows = ws.conv_rows.min(pixels - first);
+            unsafe {
+                s.launch_builder(&self.im2col)
+                    .arg(input)
+                    .arg(&ws.columns)
+                    .arg(&conv.input_channels)
+                    .arg(&ws.image_side)
+                    .arg(&ws.image_side)
+                    .arg(&ws.image_side)
+                    .arg(&1u32)
+                    .arg(&conv.kernel)
+                    .arg(&1u32)
+                    .arg(&(conv.kernel / 2))
+                    .arg(&u64::from(first))
+                    .arg(&rows)
+                    .arg(&1u32)
+                    .launch(grid(
+                        (u64::from(rows) * u64::from(cols)).div_ceil(256).min(65535) as usize,
+                        256,
+                    ))?;
+            }
+            let (ptr, _read) = output.device_ptr(s);
+            let target = unsafe {
+                Tensor::new(
+                    ptr + u64::from(first) * 4,
+                    [rows, 128],
+                    [1, u64::from(pixels)],
+                    (output.len() as u64 - u64::from(first)) * 4,
+                )?
+            };
+            blas.linear_f32(
+                weight,
+                stage_view(&ws.columns, s, [rows, cols])?,
+                &mut TensorMut(target),
+            )?;
+        }
+        unsafe {
+            s.launch_builder(&self.bias)
+                .arg(output)
+                .arg(&conv.weight.bias)
+                .arg(&0u64)
+                .arg(&(u64::from(pixels) * 128))
+                .arg(&128u32)
+                .arg(&u64::from(pixels))
+                .launch(grid(
+                    (u64::from(pixels) * 128).div_ceil(256).min(65535) as usize,
+                    256,
+                ))?;
+        }
+        Ok(())
     }
 
     fn transpose(
@@ -5699,6 +5751,7 @@ impl NafEncoder {
     fn run(
         &self,
         s: &Arc<CudaStream>,
+        blas: &Blas,
         image: &CudaSlice<f32>,
         features: Tensor<f32, 2>,
         ws: &mut NafWorkspace,
@@ -5712,12 +5765,7 @@ impl NafEncoder {
         let pixels = u64::from(ws.image_side) * u64::from(ws.image_side);
         for (branch_index, branch) in self.branches.iter().enumerate() {
             self.transpose(s, image, &ws.b, [ws.image_side * ws.image_side, 3])?;
-            branch.initial.plan.run(
-                [&branch.initial.weight.weight, &branch.initial.weight.bias],
-                &ws.b,
-                &mut ws.a,
-                &mut ws.convolution,
-            )?;
+            self.convolve((s, blas), &branch.initial, &ws.b, &ws.a, ws)?;
             for (norm, conv) in &branch.blocks {
                 unsafe {
                     s.launch_builder(&self.group_norm)
@@ -5733,12 +5781,7 @@ impl NafEncoder {
                         .arg(&1u32)
                         .launch(grid(8, 512))?;
                 }
-                conv.plan.run(
-                    [&conv.weight.weight, &conv.weight.bias],
-                    &ws.b,
-                    &mut ws.a,
-                    &mut ws.convolution,
-                )?;
+                self.convolve((s, blas), conv, &ws.b, &ws.a, ws)?;
             }
             self.transpose(s, &ws.a, &ws.b, [128, ws.image_side * ws.image_side])?;
             self.pool(
@@ -5890,7 +5933,7 @@ impl PixalConditioningRuntime {
         let camera = s.alloc_zeros(15)?;
         let global = s.alloc_zeros(5 * 1024)?;
         let naf = if let (Some(side), Some(dir)) = (shape.naf_side, naf_dir) {
-            let encoder = NafEncoder::load(device, dir, shape.image_side)?;
+            let encoder = NafEncoder::load(device, dir)?;
             let (free, _) = device.ctx.mem_get_info()?;
             let ws = encoder.workspace(
                 device,
@@ -5961,6 +6004,7 @@ impl PixalConditioningRuntime {
             rgb,
             [dimensions[0], dimensions[1], 3],
             [side, side],
+            crate::serve::image::ResizeRounding::Fixed22,
         )?;
         let image = resized
             .iter()
@@ -5986,6 +6030,7 @@ impl PixalConditioningRuntime {
             rgba,
             [dimensions[0], dimensions[1], 4],
             [side, side],
+            crate::serve::image::ResizeRounding::Fixed22,
         )?;
         let image = pixels
             .as_chunks::<4>()
@@ -6139,7 +6184,7 @@ impl PixalConditioningRuntime {
         }
         self.project(s, features, [side, 0, chunk], add, divisor)?;
         let naf_features = if let Some((encoder, ws)) = &mut self.naf {
-            encoder.run(s, &self.image, features, ws)?;
+            encoder.run(s, blas, &self.image, features, ws)?;
             Some((
                 dense_at(&ws.output, s, [ws.output_side * ws.output_side, 1024], 0)?,
                 ws.output_side,
@@ -8323,22 +8368,6 @@ mod tests {
         Ok(())
     }
     #[cfg(feature = "cuda")]
-    #[test]
-    fn cudnn_library_load_returns_an_error_when_unavailable() {
-        let available = unsafe { cudarc::cudnn::sys::is_culib_present() };
-        let old_panics =
-            std::panic::catch_unwind(|| unsafe { cudarc::cudnn::sys::culib() }).is_err();
-        assert_eq!(old_panics, !available);
-        let result = std::panic::catch_unwind(NafEncoder::check_cudnn_library)
-            .expect("cuDNN load panic escaped the setup error boundary");
-        assert_eq!(result.is_ok(), available);
-        println!(
-            "PASS CUDNN_LIBRARY_LOAD available={available} returned_error={} uncaught_control_panics={old_panics}",
-            result.is_err()
-        );
-    }
-
-    #[cfg(feature = "cuda")]
     fn pixal_execute(
         s: &Arc<CudaStream>,
         graph: bool,
@@ -8534,10 +8563,11 @@ mod tests {
     #[cfg(feature = "cuda")]
     fn pixal_anchor(root: &std::path::Path) -> Result<serde_json::Value> {
         let anchor: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(root.join("M2-ANCHOR.json"))?)?;
+            serde_json::from_slice(&std::fs::read(root.join("M2-CONDITIONING-FREEZE-r2.json"))?)?;
         ensure!(
             anchor["anchor"] == "r0a"
-                && anchor["tau_changed"] == false
+                && anchor["tau_changed"] == true
+                && anchor["added_reference"] == "r5cpu-full"
                 && anchor["cells"] == 96
                 && anchor["gating_metrics"] == 192
                 && anchor["reference_valid"] == true,
@@ -8672,6 +8702,7 @@ mod tests {
                     &prepared,
                     [dimensions[0], dimensions[1], 3],
                     [image_side as usize, image_side as usize],
+                    crate::serve::image::ResizeRounding::Fixed22,
                 )?;
                 ensure!(
                     resized == inputs.tensor(&format!("{name}-rgb{image_side}"))?.data(),

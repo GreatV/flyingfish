@@ -1660,7 +1660,12 @@ pub fn rgba_foreground_crop(
     } else {
         [height, width]
     };
-    let pixels = crate::serve::image::resize_lanczos(input, [height, width, 4], [h, w])?;
+    let pixels = crate::serve::image::resize_lanczos(
+        input,
+        [height, width, 4],
+        [h, w],
+        crate::serve::image::ResizeRounding::Fixed22,
+    )?;
     let mut bounds = [w, h, 0, 0];
     let mut foreground = false;
     for (i, p) in pixels.as_chunks::<4>().0.iter().enumerate() {
@@ -1729,6 +1734,7 @@ mod resampling_tests {
                     &rgb,
                     [shape[0], shape[1], 3],
                     [side, side],
+                    crate::serve::image::ResizeRounding::Fixed22,
                 )?;
                 let expected = inputs.tensor(&format!("{name}-rgb{side}"))?;
                 let mismatches = resized
@@ -1749,6 +1755,7 @@ mod resampling_tests {
                 rgba.data(),
                 [rgba.shape()[0], rgba.shape()[1], 4],
                 [512, 512],
+                crate::serve::image::ResizeRounding::Fixed22,
             )?;
             let mut mismatches = 0;
             for (i, pixel) in resized.as_chunks::<4>().0.iter().enumerate() {

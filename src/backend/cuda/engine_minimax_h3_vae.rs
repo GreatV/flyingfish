@@ -1200,6 +1200,7 @@ impl KeyframeEncoder {
                         .arg(&u32::try_from(pad)?)
                         .arg(&(first as u64))
                         .arg(&u32::try_from(rows)?)
+                        .arg(&0u32)
                         .launch(flat(rows * k))?;
                 }
                 blas.linear_f32(

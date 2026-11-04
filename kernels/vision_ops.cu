@@ -532,29 +532,16 @@ __device__ __forceinline__ int reflect_index(int i, int n) {
     return i < 0 ? -i : (i >= n ? 2 * (n - 1) - i : i);
 }
 
-// NCHW reflection padding, with pad < min(height,width).
-extern "C" __global__ void reflect_pad_2d_f32(const float* input, float* output,
-    uint32_t channels, uint32_t height, uint32_t width, uint32_t pad) {
-    if (!vision_flat_launch() || !input || !output || !channels || pad >= height || pad >= width) { __trap(); return; }
-    const uint64_t ph = uint64_t(height) + 2 * pad, pw = uint64_t(width) + 2 * pad;
-    const uint64_t count = uint64_t(channels) * ph * pw;
-    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count; i += uint64_t(gridDim.x) * 256) {
-        const uint32_t c = i / (ph * pw);
-        const int y = reflect_index(int((i / pw) % ph) - int(pad), int(height));
-        const int x = reflect_index(int(i % pw) - int(pad), int(width));
-        output[i] = input[(uint64_t(c) * height + y) * width + x];
-    }
-}
-
-// One frame x [height * width, channels] -> im2col rows a [rows, channels * kt * k * k] of a causal 3D convolution
+// Input layout 0 [height * width, channels], 1 [channels, height * width].
+// One frame x -> im2col rows a [rows, channels * kt * k * k] of a causal 3D convolution
 // with weight [out, channels, kt, k, k] and spatial stride, for output pixels first + r of an out_w-wide output.
 // Column (c * kt + t) * k * k + ky * k + kx is 0 for t < kt - 1 (the causal zero frames), else x at
 // (oy * stride + ky - pad, ox * stride + kx - pad) with reflected borders.
 extern "C" __global__ void causal_frame_im2col_f32(
     const float* x, float* a, uint32_t channels, uint32_t height, uint32_t width, uint32_t out_w,
-    uint32_t kt, uint32_t k, uint32_t stride, uint32_t pad, uint64_t first, uint32_t rows) {
+    uint32_t kt, uint32_t k, uint32_t stride, uint32_t pad, uint64_t first, uint32_t rows, uint32_t layout) {
     if (!vision_flat_launch() || !x || !a || !channels || height < 2 || width < 2 || !out_w || !kt ||
-        !k || !stride || pad >= height || pad >= width) { __trap(); return; }
+        !k || !stride || pad >= height || pad >= width || layout > 1) { __trap(); return; }
     const uint32_t taps = k * k, frame_cols = kt * taps;
     const uint64_t cols = uint64_t(channels) * frame_cols, count = uint64_t(rows) * cols;
     for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
@@ -567,7 +554,8 @@ extern "C" __global__ void causal_frame_im2col_f32(
         const int oy = int(p / out_w), ox = int(p % out_w);
         const int iy = reflect_index(oy * int(stride) + int(j / k) - int(pad), int(height));
         const int ix = reflect_index(ox * int(stride) + int(j % k) - int(pad), int(width));
-        a[i] = x[(uint64_t(iy) * width + ix) * channels + c];
+        const uint64_t pixel = uint64_t(iy) * width + ix;
+        a[i] = x[layout ? uint64_t(c) * height * width + pixel : pixel * channels + c];
     }
 }
 
