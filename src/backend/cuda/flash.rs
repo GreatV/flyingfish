@@ -1130,7 +1130,7 @@ impl F32Attention {
                     self.scores.len() as u64 * 4,
                 )?
             };
-            let probabilities = unsafe {
+            let probabilities: Tensor<f32, 3> = unsafe {
                 Tensor::new(
                     self.probabilities.device_ptr(&self.stream).0,
                     shape,
