@@ -47,12 +47,6 @@ pub enum GgmlType {
     F16,
     Bf16,
     Q4_0,
-    Q8_0,
-    Q2K,
-    Q3K,
-    Q4K,
-    Q5K,
-    Q6K,
     Other(u32),
 }
 
@@ -60,8 +54,7 @@ impl GgmlType {
     pub fn block_size(self) -> Option<usize> {
         match self {
             Self::F32 | Self::F16 | Self::Bf16 => Some(1),
-            Self::Q4_0 | Self::Q8_0 => Some(32),
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K => Some(256),
+            Self::Q4_0 => Some(32),
             Self::Other(_) => None,
         }
     }
@@ -71,12 +64,6 @@ impl GgmlType {
             Self::F32 => Some(4),
             Self::F16 | Self::Bf16 => Some(2),
             Self::Q4_0 => Some(18),
-            Self::Q8_0 => Some(34),
-            Self::Q2K => Some(84),
-            Self::Q3K => Some(110),
-            Self::Q4K => Some(144),
-            Self::Q5K => Some(176),
-            Self::Q6K => Some(210),
             Self::Other(_) => None,
         }
     }
@@ -86,12 +73,6 @@ impl GgmlType {
             0 => Self::F32,
             1 => Self::F16,
             2 => Self::Q4_0,
-            8 => Self::Q8_0,
-            10 => Self::Q2K,
-            11 => Self::Q3K,
-            12 => Self::Q4K,
-            13 => Self::Q5K,
-            14 => Self::Q6K,
             30 => Self::Bf16,
             other => Self::Other(other),
         }
@@ -652,80 +633,57 @@ mod tests {
         assert!(parse(&bytes[..cut]).is_err(), "accepted a truncated file");
     }
 
-    fn collect_gguf(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-        for entry in fs::read_dir(dir)? {
-            let path = entry?.path();
-            if path.is_dir() {
-                collect_gguf(&path, out)?;
-            } else if path.extension().is_some_and(|e| e == "gguf") {
-                out.push(path);
-            }
-        }
-        Ok(())
+    #[test]
+    fn tensor_count_beyond_index_bytes_is_rejected() {
+        let mut bytes = Vec::new();
+        put_u32(&mut bytes, MAGIC);
+        put_u32(&mut bytes, 3);
+        put_u64(&mut bytes, 64);
+        put_u64(&mut bytes, 0);
+        bytes.resize(96, 0);
+        assert!(
+            parse(&bytes).is_err(),
+            "accepted a tensor count beyond the index bytes"
+        );
     }
 
     #[test]
-    fn parses_published_nvidia_ggufs() -> Result<()> {
-        let Some(dir) = std::env::var_os("FF_GGUF_DIR") else {
-            return Ok(());
-        };
-        let mut files = Vec::new();
-        collect_gguf(&PathBuf::from(dir), &mut files)?;
-        ensure!(!files.is_empty(), "no .gguf files in FF_GGUF_DIR");
-        for path in files {
-            let file = GgufFile::open(&path)?;
-            let header = file.header();
-            ensure!(header.version == 3, "{}: version", path.display());
-            ensure!(header.alignment == 32, "{}: alignment", path.display());
-            ensure!(
-                header
-                    .architecture
-                    .as_deref()
-                    .is_some_and(|a| !a.is_empty()),
-                "{}: architecture missing",
-                path.display()
-            );
-            let tensors: Vec<_> = file.tensors().collect();
-            ensure!(
-                header.tensor_count == tensors.len(),
-                "{}: header tensor_count {} != {}",
-                path.display(),
-                header.tensor_count,
-                tensors.len()
-            );
-            for t in tensors {
-                let block_size = t
-                    .ggml_type
-                    .block_size()
-                    .context("unsupported tensor type")?;
-                let block_bytes = t
-                    .ggml_type
-                    .block_bytes()
-                    .context("unsupported tensor type")?;
-                let elements: u128 = t.dims.iter().map(|&d| u128::from(d)).product();
-                ensure!(
-                    elements.is_multiple_of(block_size as u128),
-                    "{}: tensor {:?} has {elements} elements, not a multiple of {block_size}",
-                    path.display(),
-                    t.name
-                );
-                let expected = elements / (block_size as u128) * (block_bytes as u128);
-                ensure!(
-                    t.nbytes as u128 == expected,
-                    "{}: tensor {:?} nbytes {} != {expected}",
-                    path.display(),
-                    t.name,
-                    t.nbytes
-                );
-                ensure!(
-                    t.offset.is_multiple_of(u64::from(header.alignment)),
-                    "{}: tensor {:?} offset {} misaligned",
-                    path.display(),
-                    t.name,
-                    t.offset
-                );
-            }
+    fn metadata_array_length_beyond_file_is_rejected() {
+        let mut bytes = Vec::new();
+        put_u32(&mut bytes, MAGIC);
+        put_u32(&mut bytes, 3);
+        put_u64(&mut bytes, 0);
+        put_u64(&mut bytes, 1);
+        put_str(&mut bytes, "arr");
+        put_u32(&mut bytes, 9);
+        put_u32(&mut bytes, 5);
+        put_u64(&mut bytes, 1 << 40);
+        assert!(
+            parse(&bytes).is_err(),
+            "accepted a metadata array length beyond the file"
+        );
+    }
+
+    #[test]
+    fn deeply_nested_metadata_array_is_rejected() {
+        let mut bytes = Vec::new();
+        put_u32(&mut bytes, MAGIC);
+        put_u32(&mut bytes, 3);
+        put_u64(&mut bytes, 0);
+        put_u64(&mut bytes, 1);
+        put_str(&mut bytes, "nested");
+        put_u32(&mut bytes, 9);
+        for _ in 0..MAX_META_NESTING {
+            put_u32(&mut bytes, 9);
+            put_u64(&mut bytes, 1);
         }
-        Ok(())
+        put_u32(&mut bytes, 4);
+        put_u64(&mut bytes, 1);
+        put_u32(&mut bytes, 0);
+        bytes.resize(256, 0);
+        assert!(
+            parse(&bytes).is_err(),
+            "accepted metadata nested deeper than the limit"
+        );
     }
 }

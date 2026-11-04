@@ -5774,7 +5774,6 @@ mod gguf_tests {
             GgmlType::F32 => 0,
             GgmlType::F16 => 1,
             GgmlType::Q4_0 => 2,
-            GgmlType::Q8_0 => 8,
             GgmlType::Bf16 => 30,
             other => panic!("unsupported synthetic type {other:?}"),
         }

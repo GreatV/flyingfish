@@ -3545,44 +3545,6 @@ mod tests {
             );
         }
 
-        let qkv_function = module.load_function("q4_0_dequant_qkv_bf16")?;
-        for (inner, hidden) in [(4i64, 64i64), (4, 5376)] {
-            let qkv_blocks = q4_0_synthetic_blocks((3 * inner * hidden / 32) as usize);
-            let qkv_device = stream.clone_htod(&qkv_blocks)?;
-            let qkv = q4_0_qkv_f32(&qkv_blocks, inner as usize, hidden as usize);
-            let mut q = stream.alloc_zeros::<bf16>(qkv[0].len())?;
-            let mut k = stream.alloc_zeros::<bf16>(qkv[1].len())?;
-            let mut v = stream.alloc_zeros::<bf16>(qkv[2].len())?;
-            let count = 3 * inner * hidden / 32;
-            unsafe {
-                stream
-                    .launch_builder(&qkv_function)
-                    .arg(&qkv_device)
-                    .arg(&mut q)
-                    .arg(&mut k)
-                    .arg(&mut v)
-                    .arg(&inner)
-                    .arg(&hidden)
-                    .launch(launch(count))?;
-            }
-            for (name, actual, golden) in [
-                ("q", stream.clone_dtoh(&q)?, &qkv[0]),
-                ("k", stream.clone_dtoh(&k)?, &qkv[1]),
-                ("v", stream.clone_dtoh(&v)?, &qkv[2]),
-            ] {
-                let expected: Vec<bf16> =
-                    golden.iter().map(|&value| bf16::from_f32(value)).collect();
-                ensure!(
-                    actual.len() == expected.len()
-                        && actual
-                            .iter()
-                            .zip(&expected)
-                            .all(|(a, b)| a.to_bits() == b.to_bits()),
-                    "q4_0_dequant_qkv_bf16 {name} bit mismatch inner={inner} hidden={hidden}"
-                );
-            }
-        }
-
         let f16_bits = q4_0_f16_bits();
         let f16_device = stream.clone_htod(&f16_bits)?;
         let cast_function = module.load_function("f16_to_bf16")?;

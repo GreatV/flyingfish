@@ -3490,8 +3490,8 @@ mod tests {
             assert_eq!(slot, 4 * elements, "{quant:?} slot");
         }
         for quant in [
-            Some(GgmlType::Q8_0),
-            Some(GgmlType::Q4K),
+            Some(GgmlType::Other(8)),
+            Some(GgmlType::Other(12)),
             Some(GgmlType::Other(9)),
         ] {
             assert!(
