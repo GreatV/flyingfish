@@ -3485,7 +3485,7 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     #[test]
-    #[ignore = "GPU window required; Q4_0 dequant kernels vs CPU golden"]
+    #[ignore = "GPU window required; FF_H3_GGUF, FF_H3_GGUF_GOLDEN; Q4_0 dequant kernels vs CPU golden"]
     fn q4_0_dequant_kernels_match_cpu_golden() -> Result<()> {
         let device = Device::new(0)?;
         let stream = &device.stream;
@@ -3596,10 +3596,13 @@ mod tests {
             "f16_to_bf16 bit mismatch"
         );
 
-        let Some(gguf_path) = std::env::var_os("FF_H3_GGUF") else {
-            return Ok(());
-        };
-        let file = crate::gguf::GgufFile::open(&std::path::PathBuf::from(gguf_path))?;
+        let gguf_path = std::env::var_os("FF_H3_GGUF")
+            .map(std::path::PathBuf::from)
+            .context("FF_H3_GGUF missing")?;
+        let golden_path = std::env::var_os("FF_H3_GGUF_GOLDEN")
+            .map(std::path::PathBuf::from)
+            .context("FF_H3_GGUF_GOLDEN missing")?;
+        let file = crate::gguf::GgufFile::open(&gguf_path)?;
         let qkv = file
             .tensor("blocks.0.attn.qkv_proj.weight")
             .context("GGUF has no blocks.0.attn.qkv_proj.weight")?;
@@ -3647,13 +3650,21 @@ mod tests {
                 .all(|(a, b)| a.to_bits() == b.to_bits()),
             "q4_0_dequant_f32 bit mismatch on real target blocks"
         );
-        if let Some(out) = std::env::var_os("FF_H3_GGUF_GOLDEN_OUT") {
-            let bytes: Vec<u8> = actual_f32
+        let golden = std::fs::read(&golden_path)?;
+        let (golden, rest) = golden.as_chunks::<4>();
+        ensure!(
+            rest.is_empty() && golden.len() == actual_f32.len(),
+            "FF_H3_GGUF_GOLDEN holds {} values, the GPU produced {}",
+            golden.len(),
+            actual_f32.len()
+        );
+        ensure!(
+            actual_f32
                 .iter()
-                .flat_map(|value| value.to_bits().to_le_bytes())
-                .collect();
-            std::fs::write(out, bytes)?;
-        }
+                .zip(golden)
+                .all(|(a, b)| a.to_bits() == u32::from_le_bytes(*b)),
+            "the real target blocks differ from the gguf-py golden"
+        );
         let nibble_mutant: Vec<bf16> = q4_0_flat_f32(&real, true)
             .iter()
             .map(|&value| bf16::from_f32(value))

@@ -1338,6 +1338,59 @@ fn cast_rows(
     Ok(())
 }
 
+/// Per-layer device slot bytes, stored source bytes, the largest slot and the staging/transient bytes of a
+/// manifest's dense linears.
+struct DenseSizing {
+    layers: Vec<usize>,
+    source_layers: Vec<usize>,
+    largest: usize,
+    staging: usize,
+    transient: usize,
+}
+
+/// Sizing of a manifest's dense linears: a dequantized entry's device slot holds its BF16 tile, a pass-through
+/// entry's holds its stored bytes, and a stored type with no device path is an error.
+fn dense_sizing(manifest: &TensorManifest, layers: usize) -> Result<DenseSizing> {
+    let mut device_layers = vec![0usize; layers];
+    let mut source_layers = vec![0usize; layers];
+    let mut dequant_layer = vec![false; layers];
+    let mut largest = 0usize;
+    for (name, entry) in &manifest.entries {
+        if let Some(layer) = entry.layer
+            && entry.load
+            && entry.shape.len() == 2
+        {
+            let device_bytes = device_slot_bytes(name, entry)?;
+            device_layers[layer as usize] += device_bytes;
+            source_layers[layer as usize] += entry.bytes;
+            largest = largest.max(device_bytes);
+            if dequantizes(entry.quant) {
+                dequant_layer[layer as usize] = true;
+            }
+        }
+    }
+    let staging = dequant_layer
+        .iter()
+        .zip(&source_layers)
+        .filter_map(|(dequant, source)| dequant.then_some(*source))
+        .max()
+        .unwrap_or(0);
+    let transient = manifest
+        .entries
+        .iter()
+        .filter(|(_, entry)| entry.load && dequantizes(entry.quant))
+        .map(|(_, entry)| entry.bytes)
+        .max()
+        .unwrap_or(0);
+    Ok(DenseSizing {
+        layers: device_layers,
+        source_layers,
+        largest,
+        staging,
+        transient,
+    })
+}
+
 /// Dense streaming of `layers` (per-layer device matrix bytes, `largest` device matrix) beside `owned` resident bytes:
 /// placement derived from free device memory and host RAM, or forced streamed / disk-only. `source_layers` sizes the
 /// host/disk tier; it equals `layers` for a native BF16 manifest and is the stored source size for a quantized one.
@@ -1537,40 +1590,7 @@ impl Dit {
         let audio = s.alloc_zeros::<f32>(ranges.audio * spec.audio_in_channels)?;
         let rotary = s.clone_htod(&crate::minimax_h3::rotary_table(spec, layout))?;
 
-        let mut layers = vec![0usize; spec.layers];
-        let mut source_layers = vec![0usize; spec.layers];
-        let mut dequant_layer = vec![false; spec.layers];
-        let mut largest = 0usize;
-        for (name, entry) in &base.manifest.entries {
-            if let Some(layer) = entry.layer
-                && entry.load
-                && entry.shape.len() == 2
-            {
-                // A dequantized entry's device slot holds its BF16 tile; a pass-through entry's holds its
-                // stored bytes. A stored type with no device path is an error, never an under-allocated slot.
-                let device_bytes = device_slot_bytes(name, entry)?;
-                layers[layer as usize] += device_bytes;
-                source_layers[layer as usize] += entry.bytes;
-                largest = largest.max(device_bytes);
-                if dequantizes(entry.quant) {
-                    dequant_layer[layer as usize] = true;
-                }
-            }
-        }
-        let staging = dequant_layer
-            .iter()
-            .zip(&source_layers)
-            .filter_map(|(dequant, source)| dequant.then_some(*source))
-            .max()
-            .unwrap_or(0);
-        let transient = base
-            .manifest
-            .entries
-            .iter()
-            .filter(|(_, entry)| entry.load && dequantizes(entry.quant))
-            .map(|(_, entry)| entry.bytes)
-            .max()
-            .unwrap_or(0);
+        let sizing = dense_sizing(base.manifest, spec.layers)?;
         let owned = lora
             .manifest
             .entries
@@ -1579,18 +1599,24 @@ impl Dit {
             .map(|(_, entry)| entry.bytes)
             .sum::<usize>()
             + spec.layers * 2 * (2 * h + 2 * spec.head_dim)
-            + staging
-            + transient;
+            + sizing.staging
+            + sizing.transient;
         let dense = place_layers(
             d,
             &mut base,
-            (&layers, &source_layers, largest, owned, 0),
+            (
+                &sizing.layers,
+                &sizing.source_layers,
+                sizing.largest,
+                owned,
+                0,
+            ),
             placement,
             |layer| format!("transformer_blocks.{layer}"),
             &LINEAR_ROLES,
         )?;
         let mut blocks = Vec::with_capacity(spec.layers);
-        for (layer, &bytes) in layers.iter().enumerate() {
+        for (layer, &bytes) in sizing.layers.iter().enumerate() {
             let name = format!("transformer_blocks.{layer}");
             let slot = match &dense {
                 Some(dense) if dense.plan.slots[layer].is_some() => {
@@ -3092,7 +3118,9 @@ mod tests {
     /// 2026-11-04: the `official` arm keeps the GGUF AdaLN and the GGUF fixed projections, and the floor adds the
     /// `bf16_strict` arm. The earlier floor was the FP32-vs-BF16 spread alone, and the `official` dump it scored
     /// against predated the harness revision that put the GGUF modulation in that arm. The thresholds below were
-    /// re-derived from the regenerated arms before the candidate was rerun.
+    /// re-derived from the regenerated arms before the candidate was rerun. The `bf16_strict` spread against
+    /// `bf16` is exactly 0 because `allow_bf16_reduced_precision_reduction=False` is a no-op on the CPU
+    /// reference, so the floor is the FP32-vs-BF16 spread in practice.
     #[test]
     #[ignore = "FF_MODEL, FF_H3_GGUF, FF_H3_GGUF_BLOCK_OUT, FF_H3_LORA"]
     fn gguf_block_matches_the_definition_reference() -> Result<()> {
@@ -3374,37 +3402,7 @@ mod tests {
             MappedCheckpoint::open_component(&lora_dir, stem)?.minimax_h3_lora_manifest(&spec)?;
         let gguf_dir = gguf_path.parent().context("GGUF directory")?.to_owned();
 
-        let mut layers = vec![0usize; spec.layers];
-        let mut source_layers = vec![0usize; spec.layers];
-        let mut dequant_layer = vec![false; spec.layers];
-        let mut largest = 0usize;
-        for (name, entry) in &manifest.entries {
-            if let Some(layer) = entry.layer
-                && entry.load
-                && entry.shape.len() == 2
-            {
-                let device_bytes = device_slot_bytes(name, entry)?;
-                layers[layer as usize] += device_bytes;
-                source_layers[layer as usize] += entry.bytes;
-                largest = largest.max(device_bytes);
-                if dequantizes(entry.quant) {
-                    dequant_layer[layer as usize] = true;
-                }
-            }
-        }
-        let staging = dequant_layer
-            .iter()
-            .zip(&source_layers)
-            .filter_map(|(dequant, source)| dequant.then_some(*source))
-            .max()
-            .unwrap_or(0);
-        let transient = manifest
-            .entries
-            .iter()
-            .filter(|(_, entry)| entry.load && dequantizes(entry.quant))
-            .map(|(_, entry)| entry.bytes)
-            .max()
-            .unwrap_or(0);
+        let sizing = dense_sizing(&manifest, spec.layers)?;
         let owned = lora_manifest
             .entries
             .iter()
@@ -3412,8 +3410,8 @@ mod tests {
             .map(|(_, entry)| entry.bytes)
             .sum::<usize>()
             + spec.layers * 2 * (2 * spec.hidden + 2 * spec.head_dim)
-            + staging
-            + transient;
+            + sizing.staging
+            + sizing.transient;
 
         let device = Device::new(0)?;
         let stream = &device.stream;
@@ -3423,7 +3421,13 @@ mod tests {
                 let mut dense = place_layers(
                     &device,
                     &mut base,
-                    (&layers, &source_layers, largest, owned, 0),
+                    (
+                        &sizing.layers,
+                        &sizing.source_layers,
+                        sizing.largest,
+                        owned,
+                        0,
+                    ),
                     placement,
                     |layer| format!("transformer_blocks.{layer}"),
                     &LINEAR_ROLES,
@@ -3433,7 +3437,7 @@ mod tests {
                     dense.shift_source_offset(layer, name, delta)?;
                 }
                 let mut mismatches = Vec::new();
-                for (layer, &layer_bytes) in layers.iter().enumerate() {
+                for (layer, &layer_bytes) in sizing.layers.iter().enumerate() {
                     let name = format!("transformer_blocks.{layer}");
                     let resident = BlockWeights::resident(
                         stream,
