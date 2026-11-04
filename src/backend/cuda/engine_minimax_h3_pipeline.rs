@@ -280,13 +280,17 @@ pub(crate) fn run(
     let audio_count = layout.audio_indices.len() * spec.audio_in_channels;
 
     let normal = cubin::module(&device.ctx, "sample")?.load_function("philox_normal_f32")?;
-    let draws = crate::minimax_h3::noise_draws(request.seeds);
+    let draws = crate::minimax_h3::noise_draws(request.seed);
     let posterior_eps = super::draw_normals(s, &normal, draws[0], anchor_count, 256)?;
-    let anchor_draw = super::draw_normals(s, &normal, draws[1], anchor_count, 256)?;
-    let video_draw = super::draw_normals(s, &normal, draws[2], video_count, 256)?;
+    let anchor_noise = {
+        let draw = super::draw_normals(s, &normal, draws[1], anchor_count, 256)?;
+        s.clone_dtoh(&draw)?
+    };
+    let video_noise = {
+        let draw = super::draw_normals(s, &normal, draws[2], video_count, 256)?;
+        s.clone_dtoh(&draw)?
+    };
     let audio = super::draw_normals(s, &normal, draws[3], audio_count, 256)?;
-    let anchor_noise = s.clone_dtoh(&anchor_draw)?;
-    let video_noise = s.clone_dtoh(&video_draw)?;
 
     let text = condition(&device, &mut blas, model, request)?;
     let anchor = keyframe(&device, &blas, model, request, &posterior_eps)?;

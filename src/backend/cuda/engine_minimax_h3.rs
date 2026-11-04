@@ -2308,7 +2308,8 @@ pub(crate) fn draw_normals(
     count: usize,
     block: u32,
 ) -> Result<CudaSlice<f32>> {
-    let out = s.alloc_zeros::<f32>(count)?;
+    // The kernel writes every one of the `count` outputs.
+    let out = unsafe { s.alloc::<f32>(count) }?;
     let threads = count.div_ceil(4);
     unsafe {
         s.launch_builder(normal)
@@ -2323,7 +2324,7 @@ pub(crate) fn draw_normals(
 
 /// Runs one MiniMax-H3 i2va request on GPU `device` with the transformer LoRA at `lora` (cuBLAS calibration under
 /// `runtime`) and returns its u8 frames and stereo PCM. The four noise draws are generated natively on device from
-/// `request.seeds`; there is no recorded-draw path.
+/// `request.seed`; there is no recorded-draw path.
 pub fn generate(
     model: &Path,
     lora: &Path,
@@ -2413,8 +2414,8 @@ mod tests {
     use super::*;
     use crate::backend::cuda::{closure::Closure, ops::Ops};
     use crate::minimax_h3::{
-        Geometry, H3Seeds, KEYFRAME_ENCODE_SEED, KeyframeAnchor, PackedLayout, RowTimesteps,
-        Schedule, noise_draws, row_timestep_plan,
+        Geometry, KeyframeAnchor, PackedLayout, RowTimesteps, Schedule, noise_draws,
+        row_timestep_plan,
     };
     use anyhow::bail;
     use safetensors::SafeTensors;
@@ -4439,17 +4440,15 @@ mod tests {
             height: shape[3],
             width: shape[4],
             frames: meta["cell"]["frames"].as_u64().context("meta frames")? as usize,
-            seeds: crate::minimax_h3::H3Seeds {
-                generator: generator_seed,
-                keyframe: crate::minimax_h3::KEYFRAME_ENCODE_SEED,
-            },
+            seed: generator_seed,
             evaluations: 8,
             shifts: (6.0, 3.0),
         })
     }
 
-    /// N9d run: `prepare_i2va`'s seeds-in request through the production pipeline for cells A, P and B, plus cell A at
-    /// generator seed 43 for the seed control. Writes `<FF_H3_E2E_OUT>/<cell>/native.safetensors` (denormalised decoder
+    /// N9d run: `seeded_request`'s recorded presentation and keyframe with a request seed, through the production
+    /// pipeline for cells A, P and B, plus cell A at generator seed 43 for the seed control. Writes
+    /// `<FF_H3_E2E_OUT>/<cell>/native.safetensors` (denormalised decoder
     /// inputs, the BF16 video decoder output, u8 frames, PCM) for the splice gate. The media control requires A's and B's
     /// frames and PCM to differ; the seed control requires A at seeds 42 and 43 to differ. The envelope comparison is a
     /// measurement (N9-0: the x0.9 video-noise control is not detected), reported in the PR, not a gate.
@@ -4640,10 +4639,7 @@ mod tests {
         let device = Device::new(0)?;
         let s = &device.stream;
         let normal = cubin::module(&device.ctx, "sample")?.load_function("philox_normal_f32")?;
-        let pairs = noise_draws(H3Seeds {
-            generator: 42,
-            keyframe: KEYFRAME_ENCODE_SEED,
-        });
+        let pairs = noise_draws(42);
         let site = |name: &str| -> Result<usize> {
             Ok(if name.ends_with("posterior_eps") {
                 0

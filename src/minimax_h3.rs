@@ -1103,18 +1103,11 @@ pub fn mrope_table(
     Ok(table)
 }
 
-/// Seeds of one request's four native normal draws. `generator` drives the anchor, video and audio draws;
-/// `keyframe` drives the conditioning posterior, sampled under the definition's independent encode seed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct H3Seeds {
-    pub generator: u64,
-    pub keyframe: u64,
-}
-
 /// One MiniMax-H3 i2va request in the form the native path consumes. Conditioner prompt: token ids, the text tag of
 /// every text row, image grids `[t, h, w]` and Qwen3-VL `pixel_values` rows. Keyframe: u8 pixels `[3, height, width]`.
-/// `seeds` are the request inputs from which the four normal draws are generated on device; there is no recorded-draw
-/// path. Sampling: pixel frames, evaluation count and the video / audio grid shifts.
+/// `seed` is the request input from which the four normal draws are generated on device; the conditioning posterior
+/// uses `KEYFRAME_ENCODE_SEED` instead. There is no recorded-draw path. Sampling: pixel frames, evaluation count and
+/// the video / audio grid shifts.
 #[derive(Clone, Debug, PartialEq)]
 pub struct H3Request {
     pub token_ids: Vec<u32>,
@@ -1125,7 +1118,7 @@ pub struct H3Request {
     pub height: usize,
     pub width: usize,
     pub frames: usize,
-    pub seeds: H3Seeds,
+    pub seed: u64,
     pub evaluations: usize,
     pub shifts: (f64, f64),
 }
@@ -1195,14 +1188,15 @@ pub fn presentation(
 }
 
 /// The four documented (seed, stream) pairs of one request, in the pipeline's draw order: conditioning posterior
-/// eps, anchor noise, video noise, audio rows. Each pair is a distinct Philox counter range; no identity with the
-/// model definition's torch generator is claimed.
-pub fn noise_draws(seeds: H3Seeds) -> [(u64, u64); 4] {
+/// eps, anchor noise, video noise, audio rows. The posterior uses the definition's fixed encode seed; the other three
+/// use the request seed. Each pair is a distinct Philox counter range; no identity with the model definition's torch
+/// generator is claimed.
+pub fn noise_draws(seed: u64) -> [(u64, u64); 4] {
     [
-        (seeds.keyframe, STREAM_POSTERIOR_EPS),
-        (seeds.generator, STREAM_ANCHOR_NOISE),
-        (seeds.generator, STREAM_VIDEO_NOISE),
-        (seeds.generator, STREAM_AUDIO_ROWS),
+        (KEYFRAME_ENCODE_SEED, STREAM_POSTERIOR_EPS),
+        (seed, STREAM_ANCHOR_NOISE),
+        (seed, STREAM_VIDEO_NOISE),
+        (seed, STREAM_AUDIO_ROWS),
     ]
 }
 
@@ -1255,10 +1249,7 @@ pub fn prepare_i2va(
         height,
         width,
         frames: geometry.frames,
-        seeds: H3Seeds {
-            generator: seed,
-            keyframe: KEYFRAME_ENCODE_SEED,
-        },
+        seed,
         evaluations,
         shifts,
     })
