@@ -20,6 +20,7 @@ Language and multimodal models:
 | Flint | `FlintForCausalLM` | MoE expert tiering, sliding-window attention with sinks | CUDA, ROCm |
 | LoopVL | `LoopVLForConditionalGeneration` | Recurrent text decode, image input with prefix attention | CUDA, ROCm |
 | DeepSeek-V4.1-Flash | `DeepseekV41ForCausalLM` | Block FP8 projections, E2M1 experts, compressed latent attention, mHC | CUDA |
+| GLM-5.3-Flash | `Glm5NextForConditionalGeneration` | FP8 routed experts tiered across GPU, pinned host and NVMe; DSA and KDA attention, mHC; eager decode | CUDA |
 | Gemma 4 E2B, E4B, 12B, 31B | `Gemma4ForConditionalGeneration`, `Gemma4UnifiedForConditionalGeneration` | Text for all sizes; image and audio input for E2B and E4B; 12B and 31B stream dense layers when they do not fit | CUDA |
 | EmbeddingGemma-2 | `EmbeddingGemma2Model` | Text, image and audio embeddings | CUDA |
 
@@ -37,7 +38,7 @@ Media generation (library entry points, no CLI):
 | MiniMax-H3 | Image and text to video with audio: Qwen3-VL conditioner, streamed diffusion transformer with Turbo LoRA, video and audio decoders, native prompt, canvas and keyframe producers; `flyingfish::minimax_h3::generate` | CUDA |
 | MiniMax-Music3 | Autoregressive stage and synthesis stage (condition encoder, flow transformer with guidance, vocoder) | CUDA |
 
-In progress: GLM-5.3-Flash; Gemma 4 12B and 31B image and audio input; MiniMax-H3 native noise sampling and GGUF Q4_0 weights; a single MiniMax-Music3 entry from tokens to audio; Pixal3D image-to-3D (image conditioning landed, sparse-structure and shape flows in progress); Idol image-to-3D Gaussians (DINOv3 and FLUX.2 VAE encoders landed, denoiser and decoders in progress).
+In progress: GLM-5.3-Flash and DeepSeek-V4.1-Flash CUDA-graph decode; Gemma 4 12B and 31B image and audio input; MiniMax-H3 native noise sampling and GGUF Q4_0 weights; a single MiniMax-Music3 entry from tokens to audio; Pixal3D image-to-3D (image conditioning landed, sparse-structure and shape flows in progress); Idol image-to-3D Gaussians (DINOv3 and FLUX.2 VAE encoders landed, denoiser and decoders in progress).
 
 ## Platforms
 
