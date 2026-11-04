@@ -3350,6 +3350,18 @@ impl DinoV3Config {
         let final_norm = 2 * h;
         prefix + patch_embed + self.num_hidden_layers * per_layer + final_norm
     }
+
+    pub fn workspace_bytes(&self, image_side: u32) -> Result<usize> {
+        let rows = self.total_rows(image_side)? as usize;
+        let hu = self.hidden_size as usize;
+        let patch_elems = self.patch_rows(image_side)? as usize * self.patch_dim() as usize;
+        Ok(patch_elems * size_of::<f32>()
+            + patch_elems * size_of::<bf16>()
+            + 5 * rows * hu * size_of::<bf16>()
+            + 3 * rows * self.intermediate_size as usize * size_of::<bf16>()
+            + rows * self.head_dim() as usize * size_of::<bf16>()
+            + rows * hu * size_of::<f32>())
+    }
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -3489,6 +3501,21 @@ impl Flux2VaeConfig {
         total += qc * qc + qc;
         total += 2 * (self.bn_channels() as usize);
         total
+    }
+
+    pub fn base_workspace_bytes(&self, prefix_rows: usize) -> Result<usize> {
+        let latent_spatial = self.latent_spatial() as usize;
+        let feature2_rows = prefix_rows
+            .checked_add(self.patch_rows() as usize)
+            .context("feature2 row count overflow")?;
+        let input_chw_elems =
+            (self.in_channels as usize) * (self.sample_size as usize) * (self.sample_size as usize);
+        Ok(input_chw_elems * size_of::<f32>()
+            + 3 * self.max_feature_elements() * size_of::<bf16>()
+            + latent_spatial * (self.mid_channels() as usize) * size_of::<bf16>()
+            + (self.latent_channels as usize) * latent_spatial * size_of::<bf16>()
+            + (self.quant_channels() as usize) * latent_spatial * size_of::<bf16>()
+            + feature2_rows * (self.bn_channels() as usize) * size_of::<f32>())
     }
 }
 
@@ -4081,12 +4108,12 @@ impl<T: DinoScalar> DinoEncoder<T> {
         let q38_mod = cubin::module(&device.ctx, "q38_common")?;
         let vis_mod = cubin::module(&device.ctx, "vision_ops")?;
         let act_mod = cubin::module(&device.ctx, "act")?;
-        let ws_bytes = patch_elems * size_of::<f32>()
-            + patch_elems * size_of::<bf16>()
-            + 5 * rows_u * hu * size_of::<bf16>()
-            + 3 * rows_u * inter_u * size_of::<bf16>()
-            + rope_host.len() * size_of::<bf16>()
-            + rows_u * hu * size_of::<f32>();
+        ensure!(
+            rope_host.len() == rows_u * (head_dim as usize),
+            "DINOv3 RoPE table length {} != rows x head_dim",
+            rope_host.len()
+        );
+        let ws_bytes = cfg.workspace_bytes(image_side)?;
         println!(
             "I1_LOAD component=dinov3 tensors={} elems={} weight_bytes={} ws_bytes={}",
             loader.loaded_tensors, loader.loaded_elements, loader.runtime_bytes, ws_bytes
@@ -4665,12 +4692,7 @@ impl Flux2VaeEncoder {
         let noise_elems = (cfg.latent_channels as usize) * (latent_spatial as usize);
         let moments_elems = (quant_ch as usize) * (latent_spatial as usize);
         let feature2_elems = feature2_rows * (bn_ch as usize);
-        let base_ws = input_chw_elems * size_of::<f32>()
-            + 3 * max_map * size_of::<bf16>()
-            + mid_v_elems * size_of::<bf16>()
-            + noise_elems * size_of::<bf16>()
-            + moments_elems * size_of::<bf16>()
-            + feature2_elems * size_of::<f32>();
+        let base_ws = cfg.base_workspace_bytes(prefix_rows)?;
         let (free, _) = device.ctx.mem_get_info()?;
         let avail = free.saturating_sub(reserve_bytes);
         let avail_im2col = avail
@@ -5348,6 +5370,22 @@ pub struct IdolVisionEncoderRuntime {
 }
 
 impl IdolVisionEncoderRuntime {
+    /// Device bytes `load` holds before the VAE im2col strip: BF16 weights (2 B per loaded element) and the
+    /// DINOv3 and FLUX.2 VAE fixed workspaces.
+    fn min_resident_bytes(
+        dinov3_dir: &std::path::Path,
+        vae_dir: &std::path::Path,
+    ) -> Result<usize> {
+        let dinov3_cfg = DinoV3Config::from_dir(dinov3_dir)?;
+        let vae_cfg = Flux2VaeConfig::from_dir(vae_dir)?;
+        Ok(
+            (dinov3_cfg.expected_loaded_elements() + vae_cfg.expected_loaded_elements())
+                * size_of::<bf16>()
+                + dinov3_cfg.workspace_bytes(vae_cfg.sample_size)?
+                + vae_cfg.base_workspace_bytes(dinov3_cfg.prefix_rows())?,
+        )
+    }
+
     pub fn load(
         device: &Device,
         blas: &mut Blas,
@@ -7826,7 +7864,7 @@ impl IdolDenoiser {
         self.forward_batch(s, blas, ws, 1, t_val, qk_scale)
     }
 
-    pub fn sample_flow(
+    fn sample_flow(
         &self,
         s: &Arc<CudaStream>,
         blas: &Blas,
@@ -9450,7 +9488,6 @@ impl IdolPipelineRuntime {
         idol_dir: &std::path::Path,
         dinov3_dir: &std::path::Path,
         vae_dir: &std::path::Path,
-        force_cfg_batch: Option<usize>,
     ) -> Result<Self> {
         let cfg = IdolConfig::from_dir(idol_dir)?;
         let (free_vram, total_vram) = device.ctx.mem_get_info()?;
@@ -9471,31 +9508,19 @@ impl IdolPipelineRuntime {
         let gs_ws_bytes = IdolGaussianWorkspace::byte_size();
         let den_ws_b2 = IdolDenoiserWorkspace::byte_size(2);
         let den_ws_b1 = IdolDenoiserWorkspace::byte_size(1);
-        let cfg_batch = match force_cfg_batch {
-            Some(b) => {
-                ensure!(b == 1 || b == 2, "invalid force_cfg_batch {b}");
-                b
-            }
-            None => {
-                let min_m2_bytes = 1_681_185_280usize
-                    + 346_567_680usize
-                    + 68_852_224usize
-                    + 839_911_936usize
-                    + 1024usize * 512 * 9 * 2;
-                let needed_b2 = driver_headroom
-                    + min_m2_bytes
-                    + m3_weight_bytes
-                    + den_ws_b2
-                    + oct_ws_bytes
-                    + gs_ws_bytes;
-                if free_vram >= needed_b2 { 2 } else { 1 }
-            }
-        };
+        let min_m2_bytes = IdolVisionEncoderRuntime::min_resident_bytes(dinov3_dir, vae_dir)?;
+        let needed_b2 = driver_headroom
+            + min_m2_bytes
+            + m3_weight_bytes
+            + den_ws_b2
+            + oct_ws_bytes
+            + gs_ws_bytes;
+        let cfg_batch = if free_vram >= needed_b2 { 2 } else { 1 };
         let den_ws_bytes = if cfg_batch == 2 { den_ws_b2 } else { den_ws_b1 };
         let m3_ws_bytes = den_ws_bytes + oct_ws_bytes + gs_ws_bytes;
         let vae_reserve_bytes = driver_headroom + m3_weight_bytes + m3_ws_bytes;
         println!(
-            "I1_LOAD component=pipeline total_vram={total_vram} driver_headroom={driver_headroom} m3_weight_bytes={m3_weight_bytes} m3_ws_bytes={m3_ws_bytes} vae_reserve_bytes={vae_reserve_bytes} cfg_batch={cfg_batch}"
+            "I1_LOAD component=pipeline total_vram={total_vram} driver_headroom={driver_headroom} m3_weight_bytes={m3_weight_bytes} m3_ws_bytes={m3_ws_bytes} vae_reserve_bytes={vae_reserve_bytes} min_m2_bytes={min_m2_bytes} cfg_batch={cfg_batch}"
         );
 
         let vision = IdolVisionEncoderRuntime::load(
@@ -9538,7 +9563,6 @@ impl IdolPipelineRuntime {
         blas: &Blas,
         chw_f32: &[f32],
         seed: u64,
-        batch_cfg: bool,
     ) -> Result<(IdolGaussianSplat, IdolCamera)> {
         let vae_cnt = 32u32 * 128 * 128;
         let lat_cnt = 8192u32 * 16;
@@ -9571,11 +9595,11 @@ impl IdolPipelineRuntime {
             blas,
             chw_f32,
             (&vae_eps, &init_lat, &init_cam),
-            (seed, batch_cfg),
+            (seed, self.denoiser_ws.cfg_batch == 2),
         )
     }
 
-    pub fn generate_with_initial_draws(
+    fn generate_with_initial_draws(
         &mut self,
         s: &Arc<CudaStream>,
         blas: &Blas,
@@ -12901,7 +12925,6 @@ mod tests {
             &idol_dir,
             &dinov3_dir,
             &vae_dir,
-            None,
         )?;
         closure.freeze_fixed()?;
         closure.ready(Instant::now())?;
