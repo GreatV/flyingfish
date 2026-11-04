@@ -11,9 +11,10 @@ use std::{collections::BTreeMap, fs, path::Path};
 #[cfg(feature = "cuda")]
 pub use crate::backend::cuda::music3::{Runtime, generate};
 
-/// One production synthesis request: AR prompt token ids, audio frame
-/// count, the initial flow latent [in_channels, latent_length(frames)]
-/// and the AR sampling seed.
+/// One production synthesis request: AR prompt token ids in the paired
+/// cond/uncond layout [2, prompt_rows] (row 0 cond, row 1 uncond; the
+/// length must be even), the audio frame count, the initial flow latent
+/// [in_channels, latent_length(frames)] and the AR sampling seed.
 pub struct Music3Request {
     pub prompt_ids: Vec<u32>,
     pub frames: usize,
