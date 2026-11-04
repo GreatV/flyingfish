@@ -931,18 +931,12 @@ fn minimax_h3_image_producers_match_the_recording() -> Result<()> {
             &fs::read(meta["cell"]["image"].as_str().context("meta image")?)?,
             Some("image/jpeg"),
         )?;
-        let empty = flyingfish::minimax_h3::H3Draws {
-            posterior_eps: Vec::new(),
-            anchor_noise: Vec::new(),
-            video_noise: Vec::new(),
-            audio_rows: Vec::new(),
-        };
         let (prompt, _) = recorded_presentation(&s0, cell)?;
         let request = flyingfish::minimax_h3::prepare_i2va(
             &model,
             &prompt,
             &source,
-            (124, empty),
+            (124, 42),
             (8, (6.0, 3.0)),
         )?;
         ensure!(

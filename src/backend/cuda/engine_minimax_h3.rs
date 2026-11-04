@@ -10,7 +10,8 @@ use crate::backend::cuda::{
     verification::Shape,
 };
 use crate::backend::gpu::{
-    CudaSlice, CudaStream, CudaViewMut, DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg,
+    CudaFunction, CudaSlice, CudaStream, CudaViewMut, DevicePtr, DevicePtrMut, LaunchConfig,
+    PushKernelArg,
 };
 use crate::checkpoint::{MappedCheckpoint, TensorEntry, TensorManifest};
 use crate::experts::disk::{AlignedBytes, SpanReader};
@@ -2298,8 +2299,31 @@ pub(crate) fn embedding_rows(
     Ok(out)
 }
 
+/// Fills `out` with `count` standard normals from one documented `(seed, stream)` Philox counter range.
+/// `block` selects the launch geometry; the counter-based output is identical for every geometry.
+pub(crate) fn draw_normals(
+    s: &Arc<CudaStream>,
+    normal: &CudaFunction,
+    (seed, stream): (u64, u64),
+    count: usize,
+    block: u32,
+) -> Result<CudaSlice<f32>> {
+    let out = s.alloc_zeros::<f32>(count)?;
+    let threads = count.div_ceil(4);
+    unsafe {
+        s.launch_builder(normal)
+            .arg(&seed)
+            .arg(&stream)
+            .arg(&out)
+            .arg(&(count as i64))
+            .launch(ops::grid(threads.div_ceil(block as usize), block))?;
+    }
+    Ok(out)
+}
+
 /// Runs one MiniMax-H3 i2va request on GPU `device` with the transformer LoRA at `lora` (cuBLAS calibration under
-/// `runtime`) and returns its u8 frames and stereo PCM.
+/// `runtime`) and returns its u8 frames and stereo PCM. The four noise draws are generated natively on device from
+/// `request.seeds`; there is no recorded-draw path.
 pub fn generate(
     model: &Path,
     lora: &Path,
@@ -2389,7 +2413,8 @@ mod tests {
     use super::*;
     use crate::backend::cuda::{closure::Closure, ops::Ops};
     use crate::minimax_h3::{
-        Geometry, KeyframeAnchor, PackedLayout, RowTimesteps, Schedule, row_timestep_plan,
+        Geometry, H3Seeds, KEYFRAME_ENCODE_SEED, KeyframeAnchor, PackedLayout, RowTimesteps,
+        Schedule, noise_draws, row_timestep_plan,
     };
     use anyhow::bail;
     use safetensors::SafeTensors;
@@ -4363,12 +4388,12 @@ mod tests {
     }
 
     /// The recorded i2va request of Stage 0 run `<cell>-bf16`: prompt tokens, image grid and `pixel_values`, the text
-    /// tags of the run's layout, the keyframe u8 pixels and posterior noise, the request generator's draws from
-    /// `noise/<cell>/noise.safetensors`, and the run's sampling (8 evaluations, shifts 6 / 3).
-    fn recorded_request(
+    /// tags of the run's layout, the keyframe u8 pixels, and the run's sampling (8 evaluations, shifts 6 / 3). The
+    /// four noise draws are generated natively on device from `generator_seed`; no recorded draws are loaded.
+    fn seeded_request(
         s0: &Path,
-        noise: &Path,
         cell: &str,
+        generator_seed: u64,
     ) -> Result<crate::minimax_h3::H3Request> {
         let run = s0.join(format!("{cell}-bf16"));
         let meta: serde_json::Value = serde_json::from_slice(&fs::read(run.join("meta.json"))?)?;
@@ -4405,8 +4430,6 @@ mod tests {
             pixels.dtype() == Dtype::U8 && shape.len() == 5 && shape[..3] == [1, 3, 1],
             "keyframe {shape:?}"
         );
-        let noise_map = mapped(&noise.join(cell).join("noise.safetensors"))?;
-        let draws = SafeTensors::deserialize(&noise_map)?;
         Ok(crate::minimax_h3::H3Request {
             token_ids,
             text_tags,
@@ -4416,42 +4439,44 @@ mod tests {
             height: shape[3],
             width: shape[4],
             frames: meta["cell"]["frames"].as_u64().context("meta frames")? as usize,
-            posterior_eps: f32s(decoded(&keys, "k0.posterior_eps")?.0),
-            anchor_noise: f32s(decoded(&draws, "anchor_noise")?.0),
-            video_noise: f32s(decoded(&draws, "video_noise")?.0),
-            audio_rows: f32s(decoded(&draws, "audio_rows")?.0),
+            seeds: crate::minimax_h3::H3Seeds {
+                generator: generator_seed,
+                keyframe: crate::minimax_h3::KEYFRAME_ENCODE_SEED,
+            },
             evaluations: 8,
             shifts: (6.0, 3.0),
         })
     }
 
-    /// N8b run: the production pipeline on the recorded requests of cells A, P and B (B: the second keyframe under A's
-    /// prompt). Writes `<FF_H3_E2E_OUT>/<cell>/native.safetensors` (denormalised decoder inputs, the BF16 video decoder
-    /// output, u8 frames, PCM) for the splice gate; the media control requires A's and B's frames and PCM to differ.
+    /// N9d run: `prepare_i2va`'s seeds-in request through the production pipeline for cells A, P and B, plus cell A at
+    /// generator seed 43 for the seed control. Writes `<FF_H3_E2E_OUT>/<cell>/native.safetensors` (denormalised decoder
+    /// inputs, the BF16 video decoder output, u8 frames, PCM) for the splice gate. The media control requires A's and B's
+    /// frames and PCM to differ; the seed control requires A at seeds 42 and 43 to differ. The envelope comparison is a
+    /// measurement (N9-0: the x0.9 video-noise control is not detected), reported in the PR, not a gate.
     #[test]
-    #[ignore = "GPU; FF_MODEL, FF_H3_LORA, FF_H3_S0, FF_H3_E2E_NOISE, FF_H3_E2E_OUT"]
-    fn end_to_end_generates_from_the_recorded_inputs() -> Result<()> {
+    #[ignore = "GPU; FF_MODEL, FF_H3_LORA, FF_H3_S0, FF_H3_E2E_OUT"]
+    fn end_to_end_generates_from_seeds() -> Result<()> {
         let var = |key: &str| -> Result<PathBuf> {
             Ok(PathBuf::from(
                 std::env::var_os(key).with_context(|| format!("{key} missing"))?,
             ))
         };
-        let (model, lora, s0, noise, out) = (
+        let (model, lora, s0, out) = (
             var("FF_MODEL")?,
             var("FF_H3_LORA")?,
             var("FF_H3_S0")?,
-            var("FF_H3_E2E_NOISE")?,
             var("FF_H3_E2E_OUT")?,
         );
         let runtime = std::env::temp_dir().join(format!("ff-h3-e2e-{}", std::process::id()));
         fs::create_dir(&runtime)?;
         let mut media = Vec::new();
-        for cell in ["A", "P", "B"] {
-            let request = recorded_request(&s0, &noise, cell)?;
+        let mut seed43 = None;
+        for (cell, seed) in [("A", 42), ("P", 42), ("B", 43), ("A", 43)] {
+            let request = seeded_request(&s0, cell, seed)?;
             let generated = super::pipeline::run(&model, &lora, &request, (0, &runtime))?;
             let o = &generated.output;
             println!(
-                "H3_E2E cell={cell} frames={} size={}x{} samples={} rate={} video_u8_mean={:.3}",
+                "H3_E2E cell={cell} seed={seed} frames={} size={}x{} samples={} rate={} video_u8_mean={:.3}",
                 o.frames,
                 o.height,
                 o.width,
@@ -4459,6 +4484,10 @@ mod tests {
                 o.sampling_rate,
                 o.video.iter().map(|&v| f64::from(v)).sum::<f64>() / o.video.len() as f64
             );
+            if seed == 43 && cell == "A" {
+                seed43 = Some(generated.output.clone());
+                continue;
+            }
             let dir = out.join(cell);
             fs::create_dir_all(&dir)?;
             let mut t = crate::tensors::Tensors::default();
@@ -4515,7 +4544,209 @@ mod tests {
             "H3_E2E media control A vs B video_mean_abs_u8={video_diff:.3} audio_rms={audio_rms:.5} differ={differ}"
         );
         ensure!(differ, "the second keyframe left the output unchanged");
-        println!("H3_E2E_RUN PASS cells=3 media_control=DIFFER");
+        let alt = seed43.context("seed-43 run missing")?;
+        let seed_differ = a.video != alt.video && a.audio != alt.audio;
+        println!("H3_E2E seed control A seed42 vs seed43 differ={seed_differ}");
+        ensure!(
+            seed_differ,
+            "generator seed 42 and 43 left the output unchanged"
+        );
+        println!(
+            "H3_E2E_RUN PASS cells=3 media_control=DIFFER seed_control=DIFFER envelope=MEASUREMENT"
+        );
+        Ok(())
+    }
+
+    /// N9c: the frozen per-stream normal-distribution bounds and the planted biased-draw controls of the s9 freeze
+    /// spec, applied to `philox_normal_f32` at each production count. Thresholds and planted offsets are read from
+    /// `FF_H3_N9`; a candidate DEFECT is scored, not hidden. Two grid sizes and two launches are forced.
+    #[test]
+    #[ignore = "GPU; FF_H3_N9 (s9 freeze dir)"]
+    fn native_noise_matches_the_frozen_distribution() -> Result<()> {
+        fn norm_cdf(x: f64) -> f64 {
+            let z = x / std::f64::consts::SQRT_2;
+            let t = 1.0 / (1.0 + 0.3275911 * z.abs());
+            let mut p = 1.061405429f64;
+            for &c in &[-1.453152027f64, 1.421413741, -0.284496736, 0.254829592] {
+                p = c + t * p;
+            }
+            let e = 1.0 - p * t * (-z * z).exp();
+            if z >= 0.0 {
+                0.5 * (1.0 + e)
+            } else {
+                0.5 * (1.0 - e)
+            }
+        }
+        fn f64s(x: &[f32]) -> Vec<f64> {
+            x.iter().map(|&v| f64::from(v)).collect()
+        }
+        fn mean_var(a: &[f64]) -> (f64, f64) {
+            let n = a.len() as f64;
+            let m = a.iter().sum::<f64>() / n;
+            (m, a.iter().map(|&x| (x - m) * (x - m)).sum::<f64>() / n)
+        }
+        fn ks(a: &[f64]) -> f64 {
+            let n = a.len() as f64;
+            let mut s = a.to_vec();
+            s.sort_by(f64::total_cmp);
+            let mut d = 0.0f64;
+            for (i, &v) in s.iter().enumerate() {
+                let cdf = norm_cdf(v);
+                d = d
+                    .max((cdf - i as f64 / n).abs())
+                    .max((cdf - (i as f64 + 1.0) / n).abs());
+            }
+            d
+        }
+        fn corr(a: &[f64], b: &[f64]) -> f64 {
+            let (am, av) = mean_var(a);
+            let (bm, bv) = mean_var(b);
+            let cov = a
+                .iter()
+                .zip(b)
+                .map(|(&x, &y)| (x - am) * (y - bm))
+                .sum::<f64>()
+                / a.len() as f64;
+            cov / (av * bv).sqrt()
+        }
+
+        let var = |key: &str| -> Result<PathBuf> {
+            Ok(PathBuf::from(
+                std::env::var_os(key).with_context(|| format!("{key} missing"))?,
+            ))
+        };
+        let n9 = var("FF_H3_N9")?;
+        let add: serde_json::Value =
+            serde_json::from_slice(&fs::read(n9.join("freeze-spec-n9-addendum1.json"))?)?;
+        let spec: serde_json::Value =
+            serde_json::from_slice(&fs::read(n9.join("freeze-spec-n9.json"))?)?;
+        let rules = spec["N9c"]["gates_per_stream_on_production_count_N"]
+            .as_array()
+            .context("freeze-spec N9c gate rules missing")?;
+        ensure!(
+            rules.len() == 6,
+            "Runner FAIL: freeze-spec N9c has {} gate rules, expected 6",
+            rules.len()
+        );
+        let streams = add["streams"]
+            .as_object()
+            .context("addendum 1 streams missing")?;
+        ensure!(
+            streams.len() == 8,
+            "addendum 1 declares 8 production streams, got {}",
+            streams.len()
+        );
+
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        let normal = cubin::module(&device.ctx, "sample")?.load_function("philox_normal_f32")?;
+        let pairs = noise_draws(H3Seeds {
+            generator: 42,
+            keyframe: KEYFRAME_ENCODE_SEED,
+        });
+        let site = |name: &str| -> Result<usize> {
+            Ok(if name.ends_with("posterior_eps") {
+                0
+            } else if name.ends_with("anchor_noise") {
+                1
+            } else if name.ends_with("video_noise") {
+                2
+            } else if name.ends_with("audio_rows") {
+                3
+            } else {
+                bail!("Runner FAIL: unknown draw site {name}");
+            })
+        };
+
+        let mut defects = Vec::new();
+        for (name, entry) in streams {
+            let n = entry["N"].as_u64().context("N missing")? as usize;
+            let mean_limit = entry["mean_limit"].as_f64().context("mean_limit missing")?;
+            let ks_critical = entry["ks_critical"]
+                .as_f64()
+                .context("ks_critical missing")?;
+            let delta = entry["planted_offset"]
+                .as_f64()
+                .context("planted_offset missing")?;
+            let detected_by: Vec<&str> = entry["detected_by"]
+                .as_array()
+                .context("detected_by missing")?
+                .iter()
+                .map(|v| v.as_str().context("detected_by entry"))
+                .collect::<Result<Vec<_>>>()?;
+            let var_limit = 5.0 * (2.0 / n as f64).sqrt();
+            let corr_limit = 5.0 / (n as f64).sqrt();
+            let (seed, stream) = pairs[site(name)?];
+
+            let d = super::draw_normals(s, &normal, (seed, stream), n, 256)?;
+            let x = s.clone_dtoh(&d)?;
+            ensure!(
+                x.len() == n && x.iter().all(|v| v.is_finite()),
+                "Runner FAIL: {name} produced {} values or non-finite draws",
+                x.len()
+            );
+            let xf = f64s(&x);
+            let (mean, vari) = mean_var(&xf);
+            let ks_d = ks(&xf);
+            let lag1 = corr(&xf[..n - 1], &xf[1..n]);
+
+            // Determinism: two launches and two grid sizes bit-identical.
+            let d2 = super::draw_normals(s, &normal, (seed, stream), n, 256)?;
+            let d3 = super::draw_normals(s, &normal, (seed, stream), n, 1024)?;
+            let (x2, x3) = (s.clone_dtoh(&d2)?, s.clone_dtoh(&d3)?);
+            let deterministic = x.len() == x2.len()
+                && x.len() == x3.len()
+                && x.iter()
+                    .zip(&x2)
+                    .zip(&x3)
+                    .all(|((a, b), c)| a.to_bits() == b.to_bits() && a.to_bits() == c.to_bits());
+
+            // Seed control 42 vs 43 differ with |corr| <= 5/sqrt(N).
+            let alt = super::draw_normals(s, &normal, (seed + 1, stream), n, 256)?;
+            let af = f64s(&s.clone_dtoh(&alt)?);
+            let seed_corr = corr(&xf, &af);
+            let seed_differ = xf != af;
+
+            // Cross-stream |corr| <= 5/sqrt(N) against a distinct counter range.
+            let cross = super::draw_normals(s, &normal, (seed, stream + 4), n, 256)?;
+            let cf = f64s(&s.clone_dtoh(&cross)?);
+            let cross_corr = corr(&xf, &cf);
+
+            // Planted biased-draw control: output x 0.999 + delta_s. Each frozen `detected_by` detector must
+            // fire on the biased draws; a stream with an empty detected_by is "declared as having none".
+            let biased: Vec<f64> = xf.iter().map(|&v| 0.999 * v + delta).collect();
+            let (bm, bv) = mean_var(&biased);
+            let bks = ks(&biased);
+            let blag = corr(&biased[..n - 1], &biased[1..n]);
+            let fires = |d: &str| match d {
+                "mean" => bm.abs() > mean_limit,
+                "var" => (bv - 1.0).abs() > var_limit,
+                "ks" => bks > ks_critical,
+                "corr" => blag.abs() > corr_limit,
+                _ => false,
+            };
+            let detected = detected_by.is_empty() || detected_by.iter().all(|d| fires(d));
+
+            let within = mean.abs() <= mean_limit
+                && (vari - 1.0).abs() <= var_limit
+                && ks_d <= ks_critical
+                && lag1.abs() <= corr_limit
+                && cross_corr.abs() <= corr_limit;
+            let seed_ok = seed_corr.abs() <= corr_limit && seed_differ;
+            let pass = within && deterministic && seed_ok && detected;
+            println!(
+                "H3_N9C {name} N={n} mean={mean:.6e} var={vari:.6} ks={ks_d:.6} lag1={lag1:.6} \
+                 cross={cross_corr:.6} seed_corr={seed_corr:.6} deterministic={deterministic} \
+                 control_mean={bm:.6e} control_ks={bks:.6} detected={detected} pass={pass}"
+            );
+            if !pass {
+                defects.push(name.clone());
+            }
+        }
+        if !defects.is_empty() {
+            bail!("H3_N9C_GATE DEFECT streams outside frozen bounds: {defects:?}");
+        }
+        println!("H3_N9C_GATE PASS streams=8 controls_detected=8");
         Ok(())
     }
 

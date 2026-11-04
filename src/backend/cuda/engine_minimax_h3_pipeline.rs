@@ -10,8 +10,9 @@ use super::{
     Placement, Source, conditioner_embeds, conditioner_rope, embedding_rows, image_runs,
 };
 use crate::backend::cuda::{
-    Device, blas::Blas, closure::Closure, ops::Ops, weights::WeightCatalog,
+    Device, blas::Blas, closure::Closure, cubin, ops::Ops, weights::WeightCatalog,
 };
+use crate::backend::gpu::CudaSlice;
 use crate::checkpoint::{LoadPolicy, MappedCheckpoint, TensorManifest};
 use crate::minimax_h3::{
     AdalnPlan, AudioVaeSpec, Geometry, H3Output, H3Request, H3Spec, KEYFRAME_NOISE_AUG,
@@ -193,7 +194,13 @@ fn condition(
 
 /// Keyframe stage: the video VAE encoder (released on return) maps the keyframe to its normalised latents
 /// `[latent_channels, height / r, width / r]`.
-fn keyframe(device: &Device, blas: &Blas, model: &Path, request: &H3Request) -> Result<Vec<f32>> {
+fn keyframe(
+    device: &Device,
+    blas: &Blas,
+    model: &Path,
+    request: &H3Request,
+    eps: &CudaSlice<f32>,
+) -> Result<Vec<f32>> {
     let s = &device.stream;
     let spec = VaeSpec::read(model)?;
     let vae_dir = model.join("vae");
@@ -203,13 +210,12 @@ fn keyframe(device: &Device, blas: &Blas, model: &Path, request: &H3Request) -> 
     let tiles = VaeTiles::released(&spec, request.height, request.width)?;
     let mut work = EncodeWork::new(s, &encoder, (tiles.height, tiles.width))?;
     let frame = s.clone_htod(&request.keyframe)?;
-    let eps = s.clone_htod(&request.posterior_eps)?;
     let [_, _, latents] = encoder.encode(
         (s, blas),
         &mut work,
         &tiles,
         (&frame, request.height, request.width),
-        &eps,
+        eps,
     )?;
     Ok(s.clone_dtoh(&latents)?)
 }
@@ -256,9 +262,6 @@ pub(crate) fn run(
         runtime,
         Rc::new(Closure::new(false, "MiniMax-H3 generate".into())),
     )?;
-    let text = condition(&device, &mut blas, model, request)?;
-    let anchor = keyframe(&device, &blas, model, request)?;
-
     let spec = H3Spec::read(model)?;
     let vae = VaeSpec::read(model)?;
     let audio_spec = AudioVaeSpec::read(model)?;
@@ -271,37 +274,49 @@ pub(crate) fn run(
     )?;
     let (r, lc) = (vae.spatial_ratio, vae.latent_channels);
     let (lh, lw) = (request.height / r, request.width / r);
-    let latent_frames = request.video_noise.len() / (lc * lh * lw);
+    let plane = lh * lw;
+    let latent_frames = geometry.latent_frames;
+    let (anchor_count, video_count) = (lc * plane, lc * latent_frames * plane);
+    let audio_count = layout.audio_indices.len() * spec.audio_in_channels;
+
+    let normal = cubin::module(&device.ctx, "sample")?.load_function("philox_normal_f32")?;
+    let draws = crate::minimax_h3::noise_draws(request.seeds);
+    let posterior_eps = super::draw_normals(s, &normal, draws[0], anchor_count, 256)?;
+    let anchor_draw = super::draw_normals(s, &normal, draws[1], anchor_count, 256)?;
+    let video_draw = super::draw_normals(s, &normal, draws[2], video_count, 256)?;
+    let audio = super::draw_normals(s, &normal, draws[3], audio_count, 256)?;
+    let anchor_noise = s.clone_dtoh(&anchor_draw)?;
+    let video_noise = s.clone_dtoh(&video_draw)?;
+
+    let text = condition(&device, &mut blas, model, request)?;
+    let anchor = keyframe(&device, &blas, model, request, &posterior_eps)?;
+
     let patch = spec.patch;
     let condition_rows = {
         let t = KEYFRAME_NOISE_AUG as f32;
         let mixed: Vec<f32> = anchor
             .iter()
-            .zip(&request.anchor_noise)
+            .zip(&anchor_noise)
             .map(|(&x, &n)| t * x + (1.0 - t) * n)
             .collect();
         patchify(&mixed, (lc, 1, lh, lw), [1, patch[1], patch[2]])
     };
     let width = spec.video_row_width();
     ensure!(
-        anchor.len() == request.anchor_noise.len()
+        anchor.len() == anchor_count
             && condition_rows.len() == layout.condition_video_rows * width
-            && request.video_noise.len() == lc * latent_frames * lh * lw
-            && (layout.video_indices.len() - layout.condition_video_rows) * width
-                == request.video_noise.len()
-            && layout.audio_indices.len() * spec.audio_in_channels == request.audio_rows.len()
+            && video_noise.len() == video_count
+            && (layout.video_indices.len() - layout.condition_video_rows) * width == video_count
+            && audio.len() == audio_count
             && request.text_tags.len() == text.len() / spec.text_dim,
-        "request does not match the packed layout: video noise {}, audio rows {}, text rows {}",
-        request.video_noise.len(),
-        request.audio_rows.len(),
+        "native draws do not match the packed layout: anchor {}, video {}, audio {}, text rows {}",
+        anchor_noise.len(),
+        video_noise.len(),
+        audio.len(),
         request.text_tags.len()
     );
     let mut video_rows = condition_rows;
-    video_rows.extend(patchify(
-        &request.video_noise,
-        (lc, latent_frames, lh, lw),
-        patch,
-    ));
+    video_rows.extend(patchify(&video_noise, (lc, latent_frames, lh, lw), patch));
 
     let transformer = model.join("transformer");
     let checkpoint = MappedCheckpoint::open_component(&transformer, "diffusion_pytorch_model")?;
@@ -346,7 +361,6 @@ pub(crate) fn run(
             lora_scale: adapter.scale,
         };
         let video = s.clone_htod(&video_rows)?;
-        let audio = s.clone_htod(&request.audio_rows)?;
         let text = s.clone_htod(&text)?;
         dit.sample(
             &context,
