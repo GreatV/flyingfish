@@ -11,6 +11,387 @@ use std::{collections::BTreeMap, fs, path::Path};
 #[cfg(feature = "cuda")]
 pub use crate::backend::cuda::music3::Runtime;
 
+/// Synthesis-stage geometry from the per-component configs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SynSpec {
+    pub flow_layers: u32,
+    pub flow_heads: u32,
+    pub flow_head_dim: u32,
+    pub flow_ff_inner: u32,
+    pub fourier_dim: u32,
+    pub in_channels: u32,
+    pub condition_dim: u32,
+    pub rotary_dim: u32,
+    pub cond_hidden: u32,
+    pub cond_layers: u32,
+    pub cond_out: u32,
+    pub latent_channels: u32,
+    pub decoder_input: u32,
+    pub decoder_hidden: u32,
+    pub upsampling: Vec<u32>,
+    pub input_hop: u32,
+    pub input_rate: u32,
+    pub output_hop: u32,
+    pub output_rate: u32,
+}
+
+impl SynSpec {
+    /// Flow model width; the conv/proj shapes below derive from it.
+    pub fn flow_dim(&self) -> u32 {
+        self.flow_heads * self.flow_head_dim
+    }
+
+    /// Channel width of the pre/post k=1 convs and the proj_in input:
+    /// latent + zero latent + condition channels.
+    pub fn concat_channels(&self) -> u32 {
+        2 * self.in_channels + self.condition_dim
+    }
+
+    /// Vocoder channel width of one folded stereo stream.
+    pub fn vocoder_stream_channels(&self) -> u32 {
+        self.latent_channels / 2
+    }
+
+    pub fn read(dir: &Path) -> Result<Self> {
+        let component = |name: &str| -> Result<serde_json::Value> {
+            let path = dir.join(name).join("config.json");
+            let text = fs::read_to_string(&path)
+                .with_context(|| format!("missing component config {}", path.display()))?;
+            serde_json::from_str(&text).with_context(|| format!("invalid {name} config"))
+        };
+        let int = |v: &serde_json::Value, key: &str| -> Result<u32> {
+            v.get(key)
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+                .with_context(|| format!("missing/invalid {key}"))
+        };
+        let root: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(dir.join("config.json")).context("missing config.json")?,
+        )?;
+        let bad = |v: &serde_json::Value, key: &str| -> anyhow::Error {
+            anyhow::anyhow!("unsupported {key}: {:?}", v.get(key))
+        };
+        let keys = |v: &serde_json::Value| -> Result<Vec<String>> {
+            let object = v.as_object().context("config is not an object")?;
+            Ok(object.keys().cloned().collect())
+        };
+        ensure!(
+            root.get("architectures")
+                == Some(&serde_json::json!([
+                    "MiniMaxMusic3ForConditionalGeneration"
+                ])),
+            "unsupported architectures"
+        );
+        ensure!(
+            root.get("model_type") == Some(&serde_json::json!("minimax_music3")),
+            "unsupported model_type"
+        );
+
+        let flow = component("transformer")?;
+        let flow_keys = keys(&flow)?;
+        let want_flow = [
+            "_class_name",
+            "_diffusers_version",
+            "attention_head_dim",
+            "condition_dim",
+            "ff_inner_dim",
+            "fourier_embedding_dim",
+            "in_channels",
+            "num_attention_heads",
+            "num_layers",
+            "rotary_dim",
+        ];
+        ensure!(
+            flow_keys.iter().all(|k| want_flow.contains(&k.as_str())),
+            "unknown transformer config key"
+        );
+        ensure!(
+            flow.get("_class_name") == Some(&serde_json::json!("MiniMaxMusic3Transformer1DModel")),
+            "unsupported transformer class"
+        );
+        let heads = int(&flow, "num_attention_heads")?;
+        let head_dim = int(&flow, "attention_head_dim")?;
+        let rotary = int(&flow, "rotary_dim")?;
+        ensure!(
+            rotary <= head_dim && rotary.is_multiple_of(2),
+            "invalid rotary_dim"
+        );
+
+        let cond = component("condition_encoder")?;
+        let cond_keys = keys(&cond)?;
+        let want_cond = [
+            "_class_name",
+            "_diffusers_version",
+            "condition_hidden_dim",
+            "input_hop_length",
+            "input_sampling_rate",
+            "num_condition_layers",
+            "out_dim",
+            "output_hop_length",
+            "output_sampling_rate",
+        ];
+        ensure!(
+            cond_keys.iter().all(|k| want_cond.contains(&k.as_str())),
+            "unknown condition_encoder config key"
+        );
+        ensure!(
+            cond.get("_class_name") == Some(&serde_json::json!("MiniMaxMusic3ConditionEncoder")),
+            "unsupported condition_encoder class"
+        );
+
+        let vocoder = component("vocoder")?;
+        let vocoder_keys = keys(&vocoder)?;
+        let want_vocoder = [
+            "_class_name",
+            "_diffusers_version",
+            "decoder_hidden_dim",
+            "decoder_input_dim",
+            "latent_channels",
+            "sampling_rate",
+            "upsampling_ratios",
+        ];
+        ensure!(
+            vocoder_keys
+                .iter()
+                .all(|k| want_vocoder.contains(&k.as_str())),
+            "unknown vocoder config key"
+        );
+        ensure!(
+            vocoder.get("_class_name") == Some(&serde_json::json!("MiniMaxMusic3Vocoder")),
+            "unsupported vocoder class"
+        );
+        let ratios = vocoder
+            .get("upsampling_ratios")
+            .and_then(serde_json::Value::as_array)
+            .context("missing/invalid upsampling_ratios")?;
+        let upsampling = ratios
+            .iter()
+            .map(|v| {
+                u32::try_from(v.as_u64().context("upsampling ratio not an integer")?)
+                    .context("upsampling ratio overflows u32")
+            })
+            .collect::<Result<Vec<u32>>>()?;
+        ensure!(upsampling.len() == 4, "vocoder needs 4 upsampling stages");
+
+        let spec = Self {
+            flow_layers: int(&flow, "num_layers")?,
+            flow_heads: heads,
+            flow_head_dim: head_dim,
+            flow_ff_inner: int(&flow, "ff_inner_dim")?,
+            fourier_dim: int(&flow, "fourier_embedding_dim")?,
+            in_channels: int(&flow, "in_channels")?,
+            condition_dim: int(&flow, "condition_dim")?,
+            rotary_dim: rotary,
+            cond_hidden: int(&cond, "condition_hidden_dim")?,
+            cond_layers: int(&cond, "num_condition_layers")?,
+            cond_out: int(&cond, "out_dim")?,
+            latent_channels: int(&vocoder, "latent_channels")?,
+            decoder_input: int(&vocoder, "decoder_input_dim")?,
+            decoder_hidden: int(&vocoder, "decoder_hidden_dim")?,
+            upsampling,
+            input_hop: int(&cond, "input_hop_length")?,
+            input_rate: int(&cond, "input_sampling_rate")?,
+            output_hop: int(&cond, "output_hop_length")?,
+            output_rate: int(&cond, "output_sampling_rate")?,
+        };
+        ensure!(
+            vocoder.get("sampling_rate") == Some(&serde_json::json!(spec.output_rate)),
+            "vocoder sampling_rate differs from the condition output rate"
+        );
+        ensure!(
+            spec.latent_channels.is_multiple_of(2)
+                && spec.flow_dim() > 0
+                && spec.flow_ff_inner.is_multiple_of(2)
+                && spec.fourier_dim.is_multiple_of(2)
+                && spec.condition_dim == spec.cond_out
+                && spec.condition_dim == spec.flow_dim(),
+            "inconsistent synthesis geometry"
+        );
+        let _ = (&bad, &int);
+        Ok(spec)
+    }
+
+    /// Audited manifest for the transformer component, all F32 as published.
+    pub fn manifest_transformer(&self, mapped: &MappedCheckpoint) -> Result<TensorManifest> {
+        let dim = self.flow_dim() as usize;
+        let concat = self.concat_channels() as usize;
+        let ff = self.flow_ff_inner as usize;
+        let fourier = self.fourier_dim as usize;
+        let channels = self.in_channels as usize;
+        let mut expected = BTreeMap::<String, ExpectedTensor>::new();
+        let add =
+            |expected: &mut BTreeMap<String, ExpectedTensor>, name: String, shape: Vec<usize>| {
+                expected.insert(name, (Dtype::F32, shape, TensorScope::Text));
+            };
+        for layer in 0..self.flow_layers as usize {
+            let p = format!("transformer_blocks.{layer}");
+            for role in ["to_q", "to_k", "to_v"] {
+                add(
+                    &mut expected,
+                    format!("{p}.attn.{role}.weight"),
+                    vec![dim, dim],
+                );
+            }
+            add(
+                &mut expected,
+                format!("{p}.attn.to_out.0.weight"),
+                vec![dim, dim],
+            );
+            for norm in ["norm1", "norm2"] {
+                for suffix in ["weight", "bias"] {
+                    add(&mut expected, format!("{p}.{norm}.{suffix}"), vec![dim]);
+                }
+            }
+            add(
+                &mut expected,
+                format!("{p}.ff_in.weight"),
+                vec![2 * ff, dim],
+            );
+            add(&mut expected, format!("{p}.ff_in.bias"), vec![2 * ff]);
+            add(&mut expected, format!("{p}.ff_out.weight"), vec![dim, ff]);
+            add(&mut expected, format!("{p}.ff_out.bias"), vec![dim]);
+        }
+        for (name, shape) in [
+            ("preprocess_conv.weight", vec![concat, concat, 1]),
+            ("postprocess_conv.weight", vec![channels, channels, 1]),
+            ("proj_in.weight", vec![dim, concat]),
+            ("proj_out.weight", vec![channels, dim]),
+            ("time_proj.weight", vec![fourier / 2, 1]),
+            ("time_embed.linear_1.weight", vec![dim, fourier]),
+            ("time_embed.linear_1.bias", vec![dim]),
+            ("time_embed.linear_2.weight", vec![dim, dim]),
+            ("time_embed.linear_2.bias", vec![dim]),
+        ] {
+            add(&mut expected, name.into(), shape);
+        }
+        let bytes = manifest_bytes(&expected)?;
+        mapped.assemble_manifest(
+            "Music3Syn transformer",
+            expected,
+            LoadPolicy::TextOnly,
+            bytes,
+            None,
+        )
+    }
+
+    /// Audited manifest for the condition encoder component.
+    pub fn manifest_condition(&self, mapped: &MappedCheckpoint) -> Result<TensorManifest> {
+        let mut expected = BTreeMap::<String, ExpectedTensor>::new();
+        let insert =
+            |expected: &mut BTreeMap<String, ExpectedTensor>, name: &str, shape: Vec<usize>| {
+                expected.insert(name.into(), (Dtype::F32, shape, TensorScope::Text));
+            };
+        insert(
+            &mut expected,
+            "proj.weight",
+            vec![self.cond_out as usize, self.cond_hidden as usize, 3],
+        );
+        insert(&mut expected, "proj.bias", vec![self.cond_out as usize]);
+        insert(
+            &mut expected,
+            "layer_weight_logits",
+            vec![self.cond_layers as usize],
+        );
+        insert(&mut expected, "layer_scale", vec![1]);
+        let bytes = manifest_bytes(&expected)?;
+        mapped.assemble_manifest(
+            "Music3Syn condition",
+            expected,
+            LoadPolicy::TextOnly,
+            bytes,
+            None,
+        )
+    }
+
+    /// Audited manifest for the vocoder component.
+    pub fn manifest_vocoder(&self, mapped: &MappedCheckpoint) -> Result<TensorManifest> {
+        let hidden = self.decoder_hidden as usize;
+        let input = self.decoder_input as usize;
+        let streams = self.vocoder_stream_channels() as usize;
+        let mut expected = BTreeMap::<String, ExpectedTensor>::new();
+        let insert =
+            |expected: &mut BTreeMap<String, ExpectedTensor>, name: &str, shape: Vec<usize>| {
+                expected.insert(name.into(), (Dtype::F32, shape, TensorScope::Text));
+            };
+        insert(&mut expected, "dec_in_proj.weight", vec![input, streams, 1]);
+        insert(&mut expected, "dec_in_proj.bias", vec![input]);
+        insert(&mut expected, "conv_in.weight_g", vec![hidden, 1, 1]);
+        insert(&mut expected, "conv_in.weight_v", vec![hidden, input, 7]);
+        insert(&mut expected, "conv_in.bias", vec![hidden]);
+        let mut stage_in = hidden;
+        for (index, ratio) in self.upsampling.iter().enumerate() {
+            let (in_dim, out_dim, stride) = (stage_in, stage_in / 2, *ratio as usize);
+            stage_in = out_dim;
+            let block = format!("blocks.{index}");
+            insert(
+                &mut expected,
+                &format!("{block}.snake1.alpha"),
+                vec![1, in_dim, 1],
+            );
+            insert(
+                &mut expected,
+                &format!("{block}.conv_t1.weight_g"),
+                vec![in_dim, 1, 1],
+            );
+            insert(
+                &mut expected,
+                &format!("{block}.conv_t1.weight_v"),
+                vec![in_dim, out_dim, 2 * stride],
+            );
+            insert(
+                &mut expected,
+                &format!("{block}.conv_t1.bias"),
+                vec![out_dim],
+            );
+            for unit in 1..=3 {
+                let ru = format!("{block}.res_unit{unit}");
+                for snake in ["snake1", "snake2"] {
+                    insert(
+                        &mut expected,
+                        &format!("{ru}.{snake}.alpha"),
+                        vec![1, out_dim, 1],
+                    );
+                }
+                insert(
+                    &mut expected,
+                    &format!("{ru}.conv1.weight_g"),
+                    vec![out_dim, 1, 1],
+                );
+                insert(
+                    &mut expected,
+                    &format!("{ru}.conv1.weight_v"),
+                    vec![out_dim, out_dim, 7],
+                );
+                insert(&mut expected, &format!("{ru}.conv1.bias"), vec![out_dim]);
+                insert(
+                    &mut expected,
+                    &format!("{ru}.conv2.weight_g"),
+                    vec![out_dim, 1, 1],
+                );
+                insert(
+                    &mut expected,
+                    &format!("{ru}.conv2.weight_v"),
+                    vec![out_dim, out_dim, 1],
+                );
+                insert(&mut expected, &format!("{ru}.conv2.bias"), vec![out_dim]);
+            }
+        }
+        let tail = stage_in;
+        insert(&mut expected, "snake_out.alpha", vec![1, tail, 1]);
+        insert(&mut expected, "conv_out.weight_g", vec![1, 1, 1]);
+        insert(&mut expected, "conv_out.weight_v", vec![1, tail, 7]);
+        insert(&mut expected, "conv_out.bias", vec![1]);
+        let bytes = manifest_bytes(&expected)?;
+        mapped.assemble_manifest(
+            "Music3Syn vocoder",
+            expected,
+            LoadPolicy::TextOnly,
+            bytes,
+            None,
+        )
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DepthConfig {
@@ -304,6 +685,17 @@ pub struct MemoryPlan {
     pub host_fixed_bytes: usize,
     pub device_bytes: usize,
     pub placement: DensePlacement,
+}
+
+fn manifest_bytes(expected: &BTreeMap<String, ExpectedTensor>) -> Result<usize> {
+    expected.values().try_fold(0usize, |sum, (_, shape, _)| {
+        sum.checked_add(
+            product(shape)?
+                .checked_mul(4)
+                .context("manifest bytes overflow")?,
+        )
+        .context("manifest size overflow")
+    })
 }
 
 fn product(values: &[usize]) -> Result<usize> {

@@ -14,6 +14,8 @@ pub mod decode;
 pub mod draft;
 pub mod dsa;
 pub mod engine;
+#[cfg(feature = "cuda")]
+pub(crate) mod engine_music3_syn;
 pub mod flash;
 pub mod gated_residual;
 pub(crate) mod gdn;
@@ -606,6 +608,8 @@ mod q38_tests;
 mod diffusion_ops_tests;
 #[cfg(test)]
 mod gemma4_ops_tests;
+#[cfg(test)]
+mod music3_syn_ops_tests;
 
 #[cfg(test)]
 #[cfg(feature = "cuda")]

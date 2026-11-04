@@ -589,3 +589,32 @@ extern "C" __global__ void rope_pair_tail(
   x[d] = __float2bfloat16_rn(a * c - b * s);
   x[d + 1] = __float2bfloat16_rn(a * s + b * c);
 }
+
+// Partial split-half rotary apply in F32: q [rows, heads, head_dim], only the
+// leading rotary_dim dims rotate against per-row cos/sin tables (already
+// sliced to the row positions, layout [rows, rotary_dim]).
+// Partial split-half rotary apply in F32: q [rows, heads, head_dim]; each
+// thread owns one (d, d + rotary_dim/2) pair, reads both, writes both.
+extern "C" __global__ void partial_rotary_f32(float* __restrict__ q,
+    const float* __restrict__ cos, const float* __restrict__ sin,
+    int rows, int heads, int head_dim, int rotary_dim) {
+    if (!q || !cos || !sin || !rows || !heads || head_dim < rotary_dim ||
+        rotary_dim % 2 || blockDim.x != 256 || blockDim.y != 1 ||
+        blockDim.z != 1 || gridDim.y != 1 || gridDim.z != 1) { __trap(); return; }
+    const int half = rotary_dim / 2;
+    const long long pairs = (long long)rows * heads * half;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < pairs;
+         i += (long long)gridDim.x * blockDim.x) {
+        const int d = (int)(i % half);
+        const long long base = (i / half) * head_dim;
+        const long long row = i / ((long long)heads * half);
+        const float c0 = cos[row * rotary_dim + d];
+        const float s0 = sin[row * rotary_dim + d];
+        const float c1 = cos[row * rotary_dim + half + d];
+        const float s1 = sin[row * rotary_dim + half + d];
+        const float a = q[base + d];
+        const float b = q[base + half + d];
+        q[base + d] = a * c0 - b * s0;
+        q[base + half + d] = a * s1 + b * c1;
+    }
+}

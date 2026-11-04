@@ -73,6 +73,17 @@ extern "C" __global__ void q38_stage_inputs(const uint32_t* source, uint32_t* id
     ids[row] = token;
     positions[3 * row] = positions[3 * row + 1] = positions[3 * row + 2] = prefix + int32_t(row) + 1;
 }
+__device__ __forceinline__ float block_max(float v,float* scratch) {
+    for(int delta=16;delta;delta/=2) v=fmaxf(v,__shfl_down_sync(FF_WARP_MASK,v,delta));
+    if(threadIdx.x%32==0) scratch[threadIdx.x/32]=v;
+    __syncthreads();
+    v=threadIdx.x<8?scratch[threadIdx.x]:-3.402823466e38f;
+    if(threadIdx.x<32) {
+        for(int delta=16;delta;delta/=2) v=fmaxf(v,__shfl_down_sync(FF_WARP_MASK,v,delta));
+        if(threadIdx.x==0) scratch[0]=v;
+    }
+    __syncthreads(); return scratch[0];
+}
 __device__ __forceinline__ float block_sum(float v,float* scratch) {
     for(int delta=16;delta;delta/=2) v+=__shfl_down_sync(FF_WARP_MASK,v,delta);
     if(threadIdx.x%32==0) scratch[threadIdx.x/32]=v;
@@ -844,7 +855,6 @@ extern "C" __global__ void pad_rows_n_f32(const float* __restrict__ x,
     out[i] = (row < pad || row >= pad + rows) ? 0.0f : x[i - pad * width];
 }
 
-
 // Transpose [C, L] -> [L, C], elementwise.
 extern "C" __global__ void transpose_f32(const float* __restrict__ in,
     float* __restrict__ out, long long channels, long long length) {
@@ -854,7 +864,6 @@ extern "C" __global__ void transpose_f32(const float* __restrict__ in,
     const long long t = i - c * length;
     out[t * channels + c] = in[i];
 }
-
 
 // Conv1d im2col over a zero-padded buffer: A[t, c*K + k] = padded[t + k*d, c],
 // with A row-major [rows, width*K] and padded [rows + 2*pad, width].
@@ -872,7 +881,6 @@ extern "C" __global__ void conv_im2col_f32(const float* __restrict__ padded,
         a[i] = padded[(t + (long long)k * dilation) * width + c];
     }
 }
-
 
 // Transposed conv1d on the published [in, out * kernel] weight with bias: out row t of rows * stride sums, over taps
 // k ascending with (t + pad - k) divisible by stride, x row j = (t + pad - k) / stride in [0, rows). x [rows, in],
@@ -966,6 +974,72 @@ extern "C" __global__ void clamp_f32(float* __restrict__ x, long long count, flo
     x[i] = fminf(fmaxf(x[i], lo), hi);
 }
 
+// Fourier time features: angle = (2*pi*t) * w[i]; out = [cos(angle) ..., sin(angle) ...].
+extern "C" __global__ void fourier_time_f32(float t,
+    const float* __restrict__ weight, float* __restrict__ out, uint32_t n) {
+    if(!weight || !out || !n) {__trap();return;}
+    t = 6.283185307179586f * t;
+    for(uint32_t i=blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        const float angle = __fmul_rn(t, weight[i]);
+        out[i] = cosf(angle);
+        out[n + i] = sinf(angle);
+    }
+}
+
+// In-place F32 row softmax with max subtraction; one CTA per row.
+extern "C" __global__ void softmax_rows_f32(float* __restrict__ scores,
+    uint32_t rows, uint32_t width, uint64_t stride) {
+    if(blockDim.x!=256 || blockDim.y!=1 || blockDim.z!=1 || gridDim.y!=1 || gridDim.z!=1 ||
+       uint64_t(gridDim.x)!=rows || !rows || !width || !scores) {__trap();return;}
+    float* row = scores + uint64_t(blockIdx.x) * stride;
+    __shared__ float tmp[8];
+    float m = -3.402823466e38f;
+    for(uint32_t k=threadIdx.x;k<width;k+=256) m=fmaxf(m,row[k]);
+    m = block_max(m, tmp);
+    __syncthreads();
+    float sum=0;
+    for(uint32_t k=threadIdx.x;k<width;k+=256) {
+        float e=__expf(row[k]-m);
+        row[k]=e;
+        sum=__fadd_rn(sum,e);
+    }
+    float total=block_sum(sum,tmp);
+    float inv=__fdiv_rn(1.0f,total);
+    for(uint32_t k=threadIdx.x;k<width;k+=256) row[k]=__fmul_rn(row[k],inv);
+}
+
+// Flow input concat in F32: out[t, 0:in] = x[c, t] (channel-major latent),
+// out[t, in:2*in] = 0, out[t, 2*in:2*in+cond] = cond[t, c].
+extern "C" __global__ void concat_channels_f32(const float* __restrict__ x,
+    const float* __restrict__ cond, float* __restrict__ out,
+    long long length, int channels, int cond_dim) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const int width = 2 * channels + cond_dim;
+    const long long total = length * width;
+    if (i >= total) return;
+    const long long t = i / width;
+    const int c = (int)(i - t * width);
+    float v = 0.0f;
+    if (c < channels) v = x[(long long)c * length + t];
+    else if (c >= 2 * channels) v = cond[t * cond_dim + (c - 2 * channels)];
+    out[i] = v;
+}
+
+// Flow tail: velocity[c, t] = post[t, c] + proj[t, c]; post and proj are
+// row-major [length, channels], velocity channel-major [channels, length].
+// The definition's residual at the postprocess conv is the transposed
+// proj_out output, not the transformer input.
+extern "C" __global__ void transpose_residual_f32(const float* __restrict__ post,
+    const float* __restrict__ proj, float* __restrict__ velocity,
+    long long length, int channels) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)channels * length) return;
+    const long long c = i / length;
+    const long long t = i - c * length;
+    const long long rm = t * channels + c;
+    velocity[i] = post[rm] + proj[rm];
+}
+
 // NHWC GroupNorm over [batch, spatial, channels] with `groups` channel groups.
 // One CTA of 256 threads per (batch, group); F32 reduction and affine `x * a + b`
 // where `a = rstd * weight[c]` and `b = bias[c] - a * mean`.
@@ -1042,4 +1116,57 @@ extern "C" __global__ void channel_scale_residual_f32(
     const float* residual, const float* branch, const float* scale, float* y,
     uint32_t rows, uint32_t width) {
     channel_scale_residual(residual, branch, scale, y, rows, width);
+}
+
+// Condition fusion: out[t, h] = scale * sum_l w[l] * x[t, l*H + h], with x
+// [frames, layers*H] row-major and w the softmax over the 8 layers.
+extern "C" __global__ void weighted_layer_sum_f32(const float* __restrict__ x,
+    const float* __restrict__ w, float scale, float* __restrict__ out,
+    long long frames, int layers, int width) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= frames * width) return;
+    const long long t = i / width;
+    const int h = (int)(i - t * width);
+    float sum = 0.0f;
+    for (int l = 0; l < layers; l++)
+        sum = __fadd_rn(sum, __fmul_rn(w[l], x[t * layers * width + (long long)l * width + h]));
+    out[i] = __fmul_rn(scale, sum);
+}
+
+// Nearest-row gather: out[j, :] = in[map[j], :].
+extern "C" __global__ void nearest_rows_f32(const float* __restrict__ in,
+    const unsigned int* __restrict__ map, float* __restrict__ out,
+    long long out_rows, long long width) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= out_rows * width) return;
+    const long long j = i / width;
+    out[i] = in[(long long)map[j] * width + (i - j * width)];
+}
+// Snake on time-major rows [T, C]: y[t, c] = x + (a[c]+1e-9)^-1 sin(a[c] x)^2.
+extern "C" __global__ void snake_rows_f32(const float* __restrict__ x,
+    const float* __restrict__ alpha, float* __restrict__ y,
+    long long count, int channels) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float a = alpha[i % channels];
+    const float v = x[i];
+    const float s = sinf(a * v);
+    y[i] = v + __frcp_rn(a + 1e-9f) * s * s;
+}
+
+// In-place tanh, elementwise F32.
+extern "C" __global__ void tanh_f32(float* __restrict__ x, long long count) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    x[i] = tanhf(x[i]);
+}
+
+// Guided Euler update: x += dt * (u + scale * (c - u)), elementwise F32.
+extern "C" __global__ void guided_euler_f32(float* __restrict__ x,
+    const float* __restrict__ c, const float* __restrict__ u,
+    float scale, float dt, long long count) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float guided = __fadd_rn(u[i], __fmul_rn(scale, __fsub_rn(c[i], u[i])));
+    x[i] = __fadd_rn(x[i], __fmul_rn(dt, guided));
 }

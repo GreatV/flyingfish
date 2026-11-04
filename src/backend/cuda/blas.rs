@@ -3,6 +3,22 @@ use super::{Device, cubin, linear_calibrate, ops::Ops};
 /// cuBLASLt heuristic candidates trialled per linear shape, alongside Skinny.
 pub const LT_CANDIDATES: u32 = 2;
 
+/// One raw F32 GEMM call: C = alpha * op(A) * op(B) on device pointers.
+pub(crate) struct GemmF32Raw {
+    pub transa: bs::cublasOperation_t,
+    pub transb: bs::cublasOperation_t,
+    pub m: i32,
+    pub n: i32,
+    pub k: i32,
+    pub alpha: f32,
+    pub a: u64,
+    pub lda: i32,
+    pub b: u64,
+    pub ldb: i32,
+    pub c: u64,
+    pub ldc: i32,
+}
+
 unsafe fn heuristic_algos(
     handle: sys::cublasLtHandle_t,
     desc: sys::cublasLtMatmulDesc_t,
@@ -1113,6 +1129,51 @@ impl Blas {
     pub(super) fn has_fixed_plan(&self, rows: u32) -> bool {
         self.plans.borrow().keys().any(|key| key.0 == rows as usize)
     }
+    /// C = alpha * op(A) * op(B) in CUBLAS_COMPUTE_32F (no TF32) on raw
+    /// device pointers, column-major with the given leading dimensions.
+    pub(crate) unsafe fn gemm_f32(&self, gemm: &GemmF32Raw) -> Result<()> {
+        let GemmF32Raw {
+            transa,
+            transb,
+            m,
+            n,
+            k,
+            alpha,
+            a,
+            lda,
+            b,
+            ldb,
+            c,
+            ldc,
+        } = *gemm;
+        let beta = 0f32;
+        unsafe {
+            bs::cublasGemmEx(
+                *self.decode.handle(),
+                transa,
+                transb,
+                m,
+                n,
+                k,
+                (&alpha as *const f32).cast(),
+                a as *const core::ffi::c_void,
+                bs::cudaDataType_t::CUDA_R_32F,
+                lda,
+                b as *const core::ffi::c_void,
+                bs::cudaDataType_t::CUDA_R_32F,
+                ldb,
+                (&beta as *const f32).cast(),
+                c as *mut core::ffi::c_void,
+                bs::cudaDataType_t::CUDA_R_32F,
+                ldc,
+                bs::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                bs::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+            .result()?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn linear_f32(
         &self,
         weight: super::contracts::Tensor<f32, 2>,
