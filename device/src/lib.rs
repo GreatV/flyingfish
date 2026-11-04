@@ -454,11 +454,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_blocks(
 ) {
     unsafe {
         let p = resolve_position(p);
-        if window == u32::MAX {
-            attention::<256, 32, 4, 256, false>(p, keys, 0, scale, blocks, origin);
-        } else {
-            attention::<256, 32, 5, 256, false>(p, keys, window, scale, blocks, origin);
-        }
+        attention::<256, 32, 5, 256, false>(p, keys, window, scale, blocks, origin);
     }
 }
 
@@ -563,7 +559,7 @@ unsafe fn attention<
         let diagonal = p.start + qstart;
         let sk = sm + (128 * D) as u32;
         let sv = sm + (256 * D) as u32;
-        let stop = if MODE == 4 || MODE == 5 {
+        let stop = if MODE == 5 {
             block_bounds(p, (qstart + 63).min(p.rows - 1), prefix, blocks, origin)[1].min(end)
         } else if MODE == 1 {
             end
@@ -574,7 +570,7 @@ unsafe fn attention<
         } else {
             end.min(diagonal + 64)
         };
-        let interior = if MODE == 4 || MODE == 5 {
+        let interior = if MODE == 5 {
             block_bounds(p, qstart, prefix, blocks, origin)[1].min(end)
         } else if MODE == 1 {
             end
@@ -722,7 +718,7 @@ unsafe fn attention<
                 }
                 let mut next = peak;
                 let upper = |row: u32| {
-                    if MODE == 4 || MODE == 5 {
+                    if MODE == 5 {
                         block_bounds(p, qstart + row, prefix, blocks, origin)[1].min(end)
                     } else if MODE == 1 {
                         end
@@ -736,7 +732,7 @@ unsafe fn attention<
                 };
                 macro_rules! mask_max {
                     ($n:expr) => {{
-                        if $masked || MODE == 3 || MODE == 4 || MODE == 5 {
+                        if $masked || MODE == 3 || MODE == 5 {
                             let col = key + $n * 8 + (lane & 3) * 2;
                             if col >= upper(r0) {
                                 scores[$n][0] = f32::NEG_INFINITY;
@@ -793,7 +789,7 @@ unsafe fn attention<
                     probability::<{ D }>(peak[0] - next[0], 0.0, scale),
                     probability::<{ D }>(peak[1] - next[1], 0.0, scale),
                 ];
-                if MODE == 3 || MODE == 4 || MODE == 5 {
+                if MODE == 3 || MODE == 5 {
                     for row in 0..2 {
                         if next[row] == f32::NEG_INFINITY {
                             negative_peak[row] = 0.0;
@@ -1021,15 +1017,7 @@ unsafe fn attention<
 pub unsafe extern "ptx-kernel" fn attention_prefill_d512(p: Attention, scale: f32) {
     unsafe {
         let p = resolve_position(p);
-        attention_d512::<false, 0>(
-            p,
-            0,
-            scale,
-            core::ptr::null_mut(),
-            1,
-            0,
-            (core::ptr::null(), 0),
-        )
+        attention_d512::<false, false>(p, 0, scale, core::ptr::null_mut(), 1, 0)
     }
 }
 
@@ -1043,38 +1031,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d512_bidirectional(
 ) {
     unsafe {
         let p = resolve_position(p);
-        attention_d512::<false, 1>(
-            p,
-            keys,
-            scale,
-            core::ptr::null_mut(),
-            1,
-            0,
-            (core::ptr::null(), 0),
-        )
-    }
-}
-
-/// # Safety
-/// Blocks cover [origin + start, origin + start + rows, 2]; launch uses 128 threads and 90112 shared bytes.
-#[unsafe(no_mangle)]
-pub unsafe extern "ptx-kernel" fn attention_prefill_d512_blocks(
-    p: Attention,
-    keys: u32,
-    scale: f32,
-    blocks: *const u32,
-    origin: u32,
-) {
-    unsafe {
-        attention_d512::<false, 4>(
-            resolve_position(p),
-            keys,
-            scale,
-            core::ptr::null_mut(),
-            1,
-            0,
-            (blocks, origin),
-        );
+        attention_d512::<false, true>(p, keys, scale, core::ptr::null_mut(), 1, 0)
     }
 }
 
@@ -1090,21 +1047,19 @@ pub unsafe extern "ptx-kernel" fn attention_partial_d512(
 ) {
     unsafe {
         let p = resolve_position(p);
-        attention_d512::<true, 0>(p, 0, scale, partials, parts, chunk, (core::ptr::null(), 0))
+        attention_d512::<true, false>(p, 0, scale, partials, parts, chunk)
     }
 }
 
 #[inline(always)]
-unsafe fn attention_d512<const SPLIT: bool, const MODE: u32>(
+unsafe fn attention_d512<const SPLIT: bool, const BIDI: bool>(
     p: Attention,
     keys: u32,
     scale: f32,
     partials: *mut f32,
     parts: u32,
     chunk: u32,
-    bounds: (*const u32, u32),
 ) {
-    let (blocks, origin) = bounds;
     unsafe {
         let (tid, tile, head, sm): (u32, u32, u32, u32);
         asm!("mov.u32 {t}, %tid.x; mov.u32 {b}, %ctaid.x; mov.u32 {h}, %ctaid.y; mov.u32 {s}, attention_shared;",
@@ -1112,13 +1067,12 @@ unsafe fn attention_d512<const SPLIT: bool, const MODE: u32>(
         let lane = tid & 31;
         let warp = tid >> 5;
         let qstart = tile * 16;
-        let end = if MODE != 0 { keys } else { p.start + p.rows };
+        // BIDI: every query row sees all keys below the explicit extent.
+        let end = if BIDI { keys } else { p.start + p.rows };
         let part: u32;
         asm!("mov.u32 {p}, %ctaid.z;", p=out(reg32) part);
         let begin = if SPLIT { part * chunk } else { 0 };
-        let stop = (if MODE == 4 {
-            block_bounds(p, (qstart + 15).min(p.rows - 1), u32::MAX, blocks, origin)[1].min(end)
-        } else if MODE == 1 {
+        let stop = (if BIDI {
             end
         } else {
             end.min(p.start + qstart + 16)
@@ -1229,9 +1183,7 @@ unsafe fn attention_d512<const SPLIT: bool, const MODE: u32>(
                         let c = f32::from_bits(load_shared(addr + 4096));
                         let d = f32::from_bits(load_shared(addr + 6144));
                         scores[$i][j] = ((a + b) + c) + d;
-                        let bound = if MODE == 4 {
-                            block_bounds(p, qstart + row, u32::MAX, blocks, origin)[1].min(end)
-                        } else if MODE == 1 {
+                        let bound = if BIDI {
                             end
                         } else {
                             (p.start + qstart + row + 1).min(end)

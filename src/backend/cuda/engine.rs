@@ -899,6 +899,11 @@ impl Engine {
                 && spec.linear_format.fp8_layout().is_none(),
             "media-aware dense placement requires a BF16 dense Qwen-family runtime"
         );
+        #[cfg(feature = "rocm")]
+        ensure!(
+            spec.architecture != crate::model_spec::Architecture::Gemma4,
+            "Gemma 4 media on HIP requires unavailable D72 vision and D256 image-block attention kernels"
+        );
         let plan = input.validate(&spec, capacity)?;
         if let Some(chunk) = requested_chunk
             && spec.architecture == crate::model_spec::Architecture::Gemma4

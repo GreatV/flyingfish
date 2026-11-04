@@ -196,7 +196,7 @@ impl AudioClip<'_> {
                     .features
                     .iter()
                     .all(|&v| v.is_finite() && half::bf16::from_f32(v).is_finite()),
-            "raw audio requires finite [frames, samples_per_token] features and frame masks"
+            "audio requires finite frame features and matching frame masks"
         );
         let rows = self
             .mask
@@ -204,7 +204,7 @@ impl AudioClip<'_> {
             .step_by(stride)
             .filter(|&&valid| valid)
             .count();
-        ensure!(rows > 0, "raw audio has no valid frames");
+        ensure!(rows > 0, "audio has no valid frames");
         Ok(rows)
     }
 }
@@ -412,7 +412,7 @@ impl MultimodalInput<'_> {
     pub fn validate(&self, spec: &ModelSpec, capacity: usize) -> Result<PositionPlan> {
         ensure!(
             self.audio.is_empty() || spec.audio.is_some(),
-            "raw audio input requires a supported audio embedder"
+            "audio input requires a supported audio encoder or embedder"
         );
         match spec.architecture {
             Architecture::Qwen35Text | Architecture::Qwen3Vl => self.validate_qwen(spec, capacity),

@@ -331,7 +331,7 @@ impl Flash {
         #[cfg(feature = "rocm")]
         {
             ensure!(head_dim != 64, "HIP D64 prefill is not bound");
-            Ok(if matches!(head_dim, 72 | 128) { 32 } else { 16 })
+            Ok(if head_dim == 128 { 32 } else { 16 })
         }
     }
 
@@ -453,6 +453,7 @@ impl Flash {
             elements <= u32::MAX as usize,
             "prefill LSE indexing exceeds u32"
         );
+        #[cfg(feature = "cuda")]
         let bidirectional_256 = if score.as_ref().is_some_and(|score| score.scale != 0.0625) {
             "attention_prefill_d256_bidirectional_scored"
         } else {
@@ -486,7 +487,6 @@ impl Flash {
                 &[
                     "attention_prefill_d512",
                     "attention_prefill_d512_bidirectional",
-                    "attention_prefill_d512_blocks",
                 ]
             } else if let Some(score) = score {
                 if score.window_left.is_some() {
@@ -567,27 +567,17 @@ impl Flash {
                 rows.div_ceil(Self::tile(head_dim)?) <= ctx.properties.max_grid_x as usize,
                 "prefill query tiles exceed grid limit"
             );
-            let names: &[&str] = if head_dim == 72 {
-                &["attention_prefill_d72_bidirectional"]
-            } else if head_dim == 512 {
+            let names: &[&str] = if head_dim == 512 {
                 &[
                     "attention_prefill_d512",
                     "attention_prefill_d512_bidirectional",
-                    "attention_prefill_d512_blocks",
                 ]
             } else if head_dim == 256 && score.is_some() {
-                &[
-                    "attention_prefill_d256_window",
-                    bidirectional_256,
-                    "attention_prefill_d256_symmetric",
-                    "attention_prefill_d256_blocks",
-                ]
+                &["attention_prefill_d256_window"]
             } else if head_dim == 256 {
                 &[
                     "attention_prefill_d256",
-                    bidirectional_256,
-                    "attention_prefill_d256_symmetric",
-                    "attention_prefill_d256_blocks",
+                    "attention_prefill_d256_bidirectional",
                 ]
             } else if (heads, kv_heads) == (32, 4) {
                 &["attention_prefill_d128", "attention_prefill_d128_window"]
@@ -877,13 +867,14 @@ impl Flash {
             ensure!(
                 shape.causal
                     && prefix.is_none()
-                    && matches!(shape.head_dim, 256 | 512)
+                    && shape.head_dim == 256
+                    && shape.window_left.is_some()
                     && self.score.is_some()
                     && origin
                         .checked_add(end)
                         .and_then(|n| n.checked_mul(2))
                         .is_some_and(|n| n <= blocks.len()),
-                "image-block prefill requires complete bounds, a causal D256/D512 score and no prefix mask"
+                "image-block prefill requires complete bounds, a sliding D256 score and no prefix mask"
             );
         }
         ensure!(
@@ -903,7 +894,7 @@ impl Flash {
             "prefix-LM requires D128"
         );
         let mode = if image_blocks.is_some() {
-            if shape.window_left.is_some() { 5 } else { 4 }
+            5
         } else if prefix.is_some() {
             2
         } else if shape.window_left.is_some() && !shape.causal {
@@ -922,7 +913,10 @@ impl Flash {
             mode == 0
                 || mode == 6
                 || image_blocks.is_some()
-                || (shape.window_left.is_none() && (self.native.len() >= 3 || bidirectional_only)),
+                || (shape.window_left.is_none()
+                    && (self.native.len() >= 3
+                        || bidirectional_only
+                        || (shape.head_dim == 512 && mode == 1))),
             "prefill mask is not bound for this geometry/window"
         );
         ensure!(
@@ -1007,7 +1001,7 @@ impl Flash {
             let native = self
                 .native
                 .get(if image_blocks.is_some() {
-                    if shape.head_dim == 256 { 3 } else { 2 }
+                    3
                 } else if bidirectional_only {
                     0
                 } else if mode == 6 {
@@ -1092,9 +1086,7 @@ impl Flash {
                     let origin = u32::try_from(origin)?;
                     launch.arg(&keys);
                     let window = score.window_left.map_or(u32::MAX, |w| w as u32);
-                    if shape.head_dim == 256 {
-                        launch.arg(&window);
-                    }
+                    launch.arg(&window);
                     launch.arg(&score.scale).arg(&bounds).arg(&origin);
                     launch.launch(LaunchConfig {
                         grid_dim: (
@@ -1117,7 +1109,7 @@ impl Flash {
                             launch.arg(&key_extent);
                         } else if mode == 6 {
                             launch.arg(&key_extent).arg(&window);
-                        } else if score.window_left.is_some() || cfg!(feature = "rocm") {
+                        } else if score.window_left.is_some() {
                             launch.arg(&window);
                         } else if mode != 0 {
                             launch.arg(&extent);

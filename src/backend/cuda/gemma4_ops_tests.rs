@@ -1092,6 +1092,10 @@ fn media_prefill_attention_gpu() -> Result<()> {
         } else {
             Some(integer("window_left")?)
         };
+        ensure!(
+            !block_mode || (dim == 256 && window_left.is_some()),
+            "RUNNER_FAIL image-block attention requires sliding D256 cells"
+        );
         let max_limit = bound["output_max"].as_f64().context("max limit")?;
         let rmse_limit = bound["output_rmse"].as_f64().context("RMSE limit")?;
         ensure!(

@@ -2755,6 +2755,11 @@ impl Engine {
         input: &crate::vision_input::MultimodalInput<'_>,
         mut trace: Option<&mut Trace>,
     ) -> Result<()> {
+        #[cfg(feature = "rocm")]
+        ensure!(
+            self.model_spec.architecture != crate::model_spec::Architecture::Gemma4,
+            "Gemma 4 media on HIP requires unavailable D72 vision and D256 image-block attention kernels"
+        );
         ensure!(self.qwen.is_some(), "packed images require Qwen");
         ensure!(
             self.state.kv.iter().all(|kv| kv.compact.is_none()),
@@ -3217,16 +3222,18 @@ impl Engine {
             settings.kv_format,
             s,
         )?;
-        let mut kv_scratch = if settings.kv_format == crate::kv::KvFormat::Bf16 {
-            None
-        } else {
-            Some((
-                s.alloc_zeros::<bf16>(capacity * kv_width as usize)?,
-                s.alloc_zeros::<bf16>(capacity * kv_width as usize)?,
-            ))
-        };
-        let capture_checkpoint =
-            if glm || model_spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
+        let setup_kv = || -> Result<_> {
+            let kv_scratch = if settings.kv_format == crate::kv::KvFormat::Bf16 {
+                None
+            } else {
+                Some((
+                    s.alloc_zeros::<bf16>(capacity * kv_width as usize)?,
+                    s.alloc_zeros::<bf16>(capacity * kv_width as usize)?,
+                ))
+            };
+            let capture_checkpoint = if glm
+                || model_spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2
+            {
                 None
             } else {
                 Some(super::super::state::StateCheckpoint::new(
@@ -3236,14 +3243,21 @@ impl Engine {
                     s,
                 )?)
             };
-        let ops = Ops::new(&device.ctx)?;
-        #[cfg(feature = "cuda")]
-        let mut blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
-        #[cfg(feature = "rocm")]
-        let mut blas = Blas::new(device.stream.clone())?;
-        if model_spec.linear_format.fp8_layout().is_some() {
-            blas.enable_fp8(&device.ctx)?;
-        }
+            Ok((kv_scratch, capture_checkpoint))
+        };
+        let early_kv = gemma.then(setup_kv).transpose()?;
+        let setup_blas = || -> Result<_> {
+            let ops = Ops::new(&device.ctx)?;
+            #[cfg(feature = "cuda")]
+            let mut blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
+            #[cfg(feature = "rocm")]
+            let mut blas = Blas::new(device.stream.clone())?;
+            if model_spec.linear_format.fp8_layout().is_some() {
+                blas.enable_fp8(&device.ctx)?;
+            }
+            Ok((ops, blas))
+        };
+        let early_blas = gemma.then(setup_blas).transpose()?;
         let prefix_cache = settings.prefix_cache;
         #[cfg(feature = "cuda")]
         let mut catalog =
@@ -3315,6 +3329,10 @@ impl Engine {
             identity.attention_kv_dtype = settings.kv_format.tag().into();
         }
         let weights = catalog.take_globals()?;
+        let (mut kv_scratch, capture_checkpoint) = match early_kv {
+            Some(fixed) => fixed,
+            None => setup_kv()?,
+        };
         #[cfg(feature = "cuda")]
         let arena_bytes = (0..model_spec.layers.len())
             .map(|i| {
@@ -3331,6 +3349,10 @@ impl Engine {
             None
         } else {
             Some(s.alloc_zeros::<u8>(usize::try_from(arena_bytes)?)?)
+        };
+        let (ops, mut blas) = match early_blas {
+            Some(fixed) => fixed,
+            None => setup_blas()?,
         };
         let mut draft = if let Some(draft_config) = &draft_config {
             let path = settings

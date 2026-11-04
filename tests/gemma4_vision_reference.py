@@ -132,12 +132,12 @@ def capture_attention(config, rows, device):
 @torch.inference_mode()
 def capture_blocks(config, rows, start, window, origin, device):
     from importlib import import_module
-    from transformers.masking_utils import blockwise_overlay, causal_mask_function, sliding_window_causal_mask_function, sliding_window_overlay
+    from transformers.masking_utils import blockwise_overlay, sliding_window_causal_mask_function, sliding_window_overlay
     cls = getattr(transformers, config.architectures[0])
     with torch.device("meta"):
         model = cls(config)
-    index = 5 if window is None else 0
-    module = model.model.language_model.layers[index].self_attn.eval()
+    assert window > 0
+    module = model.model.language_model.layers[0].self_attn.eval()
     forward = import_module(type(module).__module__).eager_attention_forward
     heads, dim = config.text_config.num_attention_heads, module.head_dim
     kv_heads = heads // module.num_key_value_groups
@@ -155,11 +155,10 @@ def capture_blocks(config, rows, start, window, origin, device):
         groups[:, first:end] = group
     query = torch.arange(origin + start, origin + start + rows, device=device)[:, None]
     key = torch.arange(origin, origin + keys, device=device)[None, :]
-    causal = causal_mask_function if window is None else sliding_window_causal_mask_function(window + 1)
+    causal = sliding_window_causal_mask_function(window + 1)
     base = causal(0, 0, query, key)
     legal = base | blockwise_overlay(groups)(0, 0, query, key)
-    if window is not None:
-        legal = legal & sliding_window_overlay(window + 1)(0, 0, query, key)
+    legal = legal & sliding_window_overlay(window + 1)(0, 0, query, key)
     def run(q, k, v, mask):
         additive = torch.zeros_like(mask, dtype=torch.float32).masked_fill(~mask, -torch.inf)[None, None]
         return forward(module, q, k, v, additive, scaling=1.0)[0][0]
@@ -788,7 +787,7 @@ def main():
             cases += [(f"vision-attention-{rows}", capture_attention, (config.vision_config, rows, args.device))
                       for rows in [1, 17, 63, 64, 65, 135, 2304, 2520]]
         if config.text_config.hidden_size_per_layer_input == 0:
-            for window in (None, 1023, 31):
+            for window in (1023, 31):
                 for rows, start, origin in [(1, 0, 0), (17, 31, 0), (65, 1020, 37), (280, 0, 0)]:
                     name = f"block-attention-{window}-{rows}-{start}-{origin}"
                     cases.append((name, capture_blocks, (config, rows, start, window, origin, args.device)))
