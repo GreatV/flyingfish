@@ -44,6 +44,8 @@ pub use cuda::mhc::{
     HcCombOrientation, HcFnDtype, HcFnW, HcMixes, HcParams, HcRounding, HcUpdate, HcWeights,
     MhcOps, mix_rows, validate_params,
 };
+#[cfg(feature = "cuda")]
+pub use cuda::pixal3d::{Conditioning as PixalFlowConditioning, PixalFlow, denormalize_shape};
 #[cfg(not(any(feature = "cuda", feature = "rocm")))]
 mod missing;
 #[cfg(not(any(feature = "cuda", feature = "rocm")))]

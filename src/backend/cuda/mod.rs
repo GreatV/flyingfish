@@ -39,6 +39,8 @@ pub mod multi_calibrate;
 #[cfg(feature = "cuda")]
 pub mod music3;
 pub mod ops;
+#[cfg(feature = "cuda")]
+pub mod pixal3d;
 pub mod profile;
 pub mod quantize;
 pub mod sample;

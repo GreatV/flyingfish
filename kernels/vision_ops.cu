@@ -315,10 +315,10 @@ extern "C" __global__ void vision_rms_scale_f32(
 
 extern "C" __global__ void vision_add_row_silu_f32(
     const float* input, const float* row, float* output, uint32_t count, uint32_t width) {
-    if (!vision_flat_launch() || !input || !output || !count || !width ||
+    if (!vision_flat_launch() || !input || !row || !output || !count || !width ||
         count % width) { __trap(); return; }
     for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < count; i += gridDim.x * 256) {
-        float x = row ? __fadd_rn(input[i], row[i % width]) : input[i];
+        float x = __fadd_rn(input[i], row[i % width]);
         output[i] = __fdiv_rn(x, __fadd_rn(1.0f, expf(-x)));
     }
 }
@@ -992,7 +992,6 @@ extern "C" __global__ __launch_bounds__(256) void linear_ordered_f32(
         }
     }
 }
-
 extern "C" __global__ void sinusoidal_embed_f32(
     const float* t, const float* freqs, float* out,
     uint32_t batch, uint32_t half, int two_pi) {
@@ -1013,52 +1012,9 @@ extern "C" __global__ void sinusoidal_embed_f32(
     }
 }
 
-extern "C" __global__ void pcd_pos_embed_f32(
-    const float* points, const float* freqs, float* out,
-    uint32_t rows, uint32_t channels, uint32_t freq_dim,
-    int version, int accumulate) {
-    if (!vision_flat_launch() || !points || !freqs || !out || !rows ||
-        !channels || !freq_dim || 6u * freq_dim > channels ||
-        (version != 1 && version != 2)) {
-        __trap();
-        return;
-    }
-    const uint64_t total = uint64_t(rows) * channels;
-    const uint32_t coord_span = 2u * freq_dim;
-    const uint32_t active_span = 3u * coord_span;
-    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < total;
-         i += uint64_t(gridDim.x) * 256) {
-        const uint64_t r = i / channels;
-        const uint32_t c_idx = uint32_t(i % channels);
-        float val = 0.0f;
-        if (c_idx < active_span) {
-            const uint32_t axis = c_idx / coord_span;
-            const uint32_t rem = c_idx % coord_span;
-            const uint32_t f = rem % freq_dim;
-            const bool is_cos = rem >= freq_dim;
-            const float x = points[r * 3u + axis];
-            float ang = __fmul_rn(x, freqs[f]);
-            if (version == 1) {
-                ang = __fmul_rn(__fmul_rn(ang, 2.0f), 3.14159265358979323846f);
-            } else {
-                ang = __fmul_rn(ang, 3.14159265358979323846f);
-            }
-            val = is_cos ? cosf(ang) : sinf(ang);
-        }
-        out[i] = accumulate ? __fadd_rn(out[i], val) : val;
-    }
-}
-
-extern "C" __global__ void vision_downcast_f32_to_f16(
-    const float* input, __half* output, uint32_t count) {
-    if (!vision_flat_launch() || !input || !output || !count) { __trap(); return; }
-    for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < count; i += gridDim.x * 256) {
-        output[i] = __float2half_rn(input[i]);
-    }
-}
-
-extern "C" __global__ void qkv_unpack_hm_f16(
-    const __half* packed, __half* q_out, __half* k_out, __half* v_hm_out,
+template <typename T>
+__device__ void qkv_unpack_hm_impl(
+    const T* packed, T* q_out, T* k_out, T* v_hm_out,
     uint32_t batch, uint32_t seq_len, uint32_t heads, uint32_t dim, int parts) {
     if (!vision_flat_launch() || !packed || !k_out || !v_hm_out ||
         !batch || !seq_len || !heads || !dim ||
@@ -1090,4 +1046,16 @@ extern "C" __global__ void qkv_unpack_hm_f16(
             v_hm_out[hm_idx] = packed[base + hd + rem];
         }
     }
+}
+
+extern "C" __global__ void qkv_unpack_hm_f16(
+    const __half* packed, __half* q, __half* k, __half* v,
+    uint32_t batch, uint32_t seq_len, uint32_t heads, uint32_t dim, int parts) {
+    qkv_unpack_hm_impl(packed, q, k, v, batch, seq_len, heads, dim, parts);
+}
+
+extern "C" __global__ void qkv_unpack_hm_bf16(
+    const __nv_bfloat16* packed, __nv_bfloat16* q, __nv_bfloat16* k, __nv_bfloat16* v,
+    uint32_t batch, uint32_t seq_len, uint32_t heads, uint32_t dim, int parts) {
+    qkv_unpack_hm_impl(packed, q, k, v, batch, seq_len, heads, dim, parts);
 }

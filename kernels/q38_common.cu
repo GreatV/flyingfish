@@ -23,10 +23,6 @@ extern "C" __global__ void q38_bias_add(__nv_bfloat16* y,const __nv_bfloat16* bi
         y[i]=__hadd(y[i],bias[i%width]);
 }
 #endif
-extern "C" __global__ void q38_bias_add_f16(__half* y,const __half* bias,uint64_t count,uint32_t width) {
-    for(uint64_t i=uint64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=uint64_t(gridDim.x)*blockDim.x)
-        y[i]=__float2half_rn(__fadd_rn(__half2float(y[i]),__half2float(bias[i%width])));
-}
 extern "C" __global__ void q38_advance(Q38SequenceMeta* meta, int32_t* position, int32_t* length) {
     q38_meta_guard(meta);
     if(threadIdx.x==0 && blockIdx.x==0) {
@@ -678,14 +674,16 @@ __device__ __forceinline__ void q38_layer_norm_f32_impl(
     for(uint32_t d=threadIdx.x;d<width;d+=256) {
         float centered=__fsub_rn(q38_to_f32(x[uint64_t(d)*xs2]),mean);
         float normalized=__fmul_rn(centered,inv);
-        float out=weight ? __fadd_rn(__fmul_rn(normalized,weight[d]),bias[d]) : normalized;
+        float out=weight
+            ? __fadd_rn(__fmul_rn(normalized,weight[d]),bias[d])
+            : normalized;
         y[uint64_t(d)*ys2]=q38_from_f32<OutT>(out);
     }
 }
 
 }  // namespace
 
-// Stateless LayerNorm with F32 io: same math as q38_layer_norm.
+// Stateless LayerNorm with F32 math: same math as q38_layer_norm; weight and bias may both be null.
 extern "C" __global__ void q38_layer_norm_f32(
     const float* x,const float* weight,const float* bias,float* y,
     uint32_t rows,uint32_t heads,uint32_t width,
@@ -705,21 +703,27 @@ extern "C" __global__ void q38_layer_norm_f16_to_f32(
     q38_layer_norm_f32_impl<__half, float>(x,weight,bias,y,rows,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,eps);
 }
 
+extern "C" __global__ void q38_layer_norm_bf16_affine_f32(
+    const __nv_bfloat16* x,const float* weight,const float* bias,__nv_bfloat16* y,
+    uint32_t rows,uint32_t heads,uint32_t width,
+    uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,float eps) {
+    q38_layer_norm_f32_impl<__nv_bfloat16, __nv_bfloat16>(x,weight,bias,y,rows,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,eps);
+}
+
 // mode 0: erf GELU. mode 1: tanh approximation. All declared rows are valid.
 extern "C" __global__ void q38_gelu(
     const __nv_bfloat16* x,__nv_bfloat16* y,uint32_t rows,uint32_t heads,uint32_t width,
     uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,int mode) {
-    q38_gelu_impl(x,y,rows,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,mode);
-}
-extern "C" __global__ void q38_gelu_f16(
-    const __half* x,__half* y,uint32_t rows,uint32_t heads,uint32_t width,
-    uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,int mode) {
-    q38_gelu_impl(x,y,rows,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,mode);
-}
-extern "C" __global__ void q38_gelu_f32(
-    const float* x,float* y,uint32_t rows,uint32_t heads,uint32_t width,
-    uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,int mode) {
-    q38_gelu_impl(x,y,rows,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,mode);
+    if(blockDim.x!=256 || blockDim.y!=1 || blockDim.z!=1 || gridDim.y!=1 || gridDim.z!=1 ||
+       !rows || !heads || !width || !x || !y || mode<0 || mode>1) {__trap();return;}
+    uint64_t count=uint64_t(rows)*heads*width;
+    for(uint64_t i=uint64_t(blockIdx.x)*256+threadIdx.x;i<count;i+=uint64_t(gridDim.x)*256) {
+        uint64_t row=i/(uint64_t(heads)*width);uint32_t head=(i/width)%heads,d=i%width;
+        float value=__bfloat162float(x[row*xs0+head*xs1+uint64_t(d)*xs2]);
+        float result=mode==1 ? gelu_tanh_rn(value) : __fmul_rn(__fmul_rn(0.5f,value),
+            __fadd_rn(1.0f,erff(__fmul_rn(value,0.7071067811865475244f))));
+        y[row*ys0+head*ys1+uint64_t(d)*ys2]=__float2bfloat16_rn(result);
+    }
 }
 // y = bf16(bf16(tanh-GELU(x)) * up). All declared rows are valid.
 extern "C" __global__ void gelu_tanh_mul(
@@ -1157,7 +1161,7 @@ template<typename T>
 __device__ __forceinline__ void channel_scale_residual(
     const T* residual, const T* branch,
     const T* scale, T* y,
-    uint32_t rows, uint32_t width) {
+    uint32_t rows, uint32_t width, bool broadcast_residual = false) {
     if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
         gridDim.y != 1 || gridDim.z != 1 || !residual || !branch ||
         !scale || !y || !rows || !width) { __trap(); return; }
@@ -1166,7 +1170,7 @@ __device__ __forceinline__ void channel_scale_residual(
          i += uint64_t(gridDim.x) * 256) {
         const uint32_t c = uint32_t(i % width);
         if constexpr (sizeof(T) == sizeof(float))
-            y[i] = __fadd_rn(residual[i], __fmul_rn(branch[i], scale[c]));
+            y[i] = __fadd_rn(residual[broadcast_residual ? c : i], __fmul_rn(branch[i], scale[c]));
         else
             y[i] = __hadd(residual[i], __hmul(branch[i], scale[c]));
     }
@@ -1226,12 +1230,22 @@ extern "C" __global__ void tanh_f32(float* __restrict__ x, long long count) {
     x[i] = tanhf(x[i]);
 }
 
-// Guided Euler update: x += dt * (u + scale * (c - u)), elementwise F32.
-extern "C" __global__ void guided_euler_f32(float* __restrict__ x,
-    const float* __restrict__ c, const float* __restrict__ u,
-    float scale, float dt, long long count) {
+// form 0: u + g*(c-u); form 1: g*c + (1-g)*u. Each operation rounds to F32.
+extern "C" __global__ void guided_euler_f32(float* x,
+    const float* c, const float* u, float scale, float dt, long long count,
+    int form, float* velocity) {
+    if ((!x && !velocity) || !c || !u || count < 1 || form < 0 || form > 1) { __trap(); return; }
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
-    const float guided = __fadd_rn(u[i], __fmul_rn(scale, __fsub_rn(c[i], u[i])));
-    x[i] = __fadd_rn(x[i], __fmul_rn(dt, guided));
+    const float guided = form == 0
+        ? __fadd_rn(u[i], __fmul_rn(scale, __fsub_rn(c[i], u[i])))
+        : __fadd_rn(__fmul_rn(scale, c[i]), __fmul_rn(__fsub_rn(1.0f, scale), u[i]));
+    if (velocity) velocity[i] = guided;
+    if (x) x[i] = __fadd_rn(x[i], __fmul_rn(dt, guided));
+}
+
+extern "C" __global__ void channel_affine_f32(
+    const float* x, const float* scale, const float* bias, float* y,
+    uint32_t rows, uint32_t width) {
+    channel_scale_residual(bias, x, scale, y, rows, width, true);
 }

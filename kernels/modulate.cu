@@ -26,21 +26,15 @@ __device__ __forceinline__ float mod_from_f32<float>(float v) {
     return v;
 }
 
-// NULLABLE: `index` may be null, row r then uses entry r / (rows / entries). The BF16 symbols keep the dense-index form.
-template <typename T, bool NULLABLE>
+template <typename T>
 __device__ __forceinline__ void row_modulate_impl(
     const T* x, const T* shift, const T* scale, const unsigned* index,
     T* y, int rows, int dim, unsigned long long stride, unsigned entries) {
     const int row = blockIdx.x;
     const int d = blockIdx.y * blockDim.x + threadIdx.x;
     if (row >= rows || d >= dim) return;
-    unsigned p;
-    if constexpr (NULLABLE) {
-        if (entries == 0 || (!index && (rows % (int)entries) != 0)) __trap();
-        p = index ? index[row] : (unsigned)(row / (rows / (int)entries));
-    } else {
-        p = index[row];
-    }
+    if (entries == 0 || (!index && (rows % (int)entries) != 0)) __trap();
+    const unsigned p = index ? index[row] : (unsigned)(row / (rows / (int)entries));
     if (p >= entries) __trap();
     const size_t at = (size_t)row * dim + d;
     const size_t param = (size_t)p * stride + d;
@@ -49,20 +43,15 @@ __device__ __forceinline__ void row_modulate_impl(
     y[at] = mod_from_f32<T>(mod_to_f32(scaled) + mod_to_f32(shift[param]));
 }
 
-template <typename T, bool NULLABLE>
+template <typename T>
 __device__ __forceinline__ void row_gated_add_impl(
     T* x, const T* y, const T* gate, const unsigned* index,
     int rows, int dim, unsigned long long stride, unsigned entries) {
     const int row = blockIdx.x;
     const int d = blockIdx.y * blockDim.x + threadIdx.x;
     if (row >= rows || d >= dim) return;
-    unsigned p;
-    if constexpr (NULLABLE) {
-        if (entries == 0 || (!index && (rows % (int)entries) != 0)) __trap();
-        p = index ? index[row] : (unsigned)(row / (rows / (int)entries));
-    } else {
-        p = index[row];
-    }
+    if (entries == 0 || (!index && (rows % (int)entries) != 0)) __trap();
+    const unsigned p = index ? index[row] : (unsigned)(row / (rows / (int)entries));
     if (p >= entries) __trap();
     const size_t at = (size_t)row * dim + d;
     const T gated = mod_from_f32<T>(mod_to_f32(gate[(size_t)p * stride + d]) * mod_to_f32(y[at]));
@@ -75,33 +64,43 @@ extern "C" __global__ void row_modulate(const __nv_bfloat16* x, const __nv_bfloa
                                         const __nv_bfloat16* scale, const unsigned* index,
                                         __nv_bfloat16* y, int rows, int dim,
                                         unsigned long long stride, unsigned entries) {
-    row_modulate_impl<__nv_bfloat16, false>(x, shift, scale, index, y, rows, dim, stride, entries);
+    row_modulate_impl(x, shift, scale, index, y, rows, dim, stride, entries);
 }
 
 extern "C" __global__ void row_gated_add(__nv_bfloat16* x, const __nv_bfloat16* y,
                                          const __nv_bfloat16* gate, const unsigned* index,
                                          int rows, int dim, unsigned long long stride,
                                          unsigned entries) {
-    row_gated_add_impl<__nv_bfloat16, false>(x, y, gate, index, rows, dim, stride, entries);
+    row_gated_add_impl(x, y, gate, index, rows, dim, stride, entries);
 }
 
 extern "C" __global__ void row_modulate_f16(const __half* x, const __half* shift,
                                             const __half* scale, const unsigned* index,
                                             __half* y, int rows, int dim,
                                             unsigned long long stride, unsigned entries) {
-    row_modulate_impl<__half, true>(x, shift, scale, index, y, rows, dim, stride, entries);
+    row_modulate_impl(x, shift, scale, index, y, rows, dim, stride, entries);
 }
 
 extern "C" __global__ void row_gated_add_f16(__half* x, const __half* y,
                                              const __half* gate, const unsigned* index,
                                              int rows, int dim, unsigned long long stride,
                                              unsigned entries) {
-    row_gated_add_impl<__half, true>(x, y, gate, index, rows, dim, stride, entries);
+    row_gated_add_impl(x, y, gate, index, rows, dim, stride, entries);
 }
 
 extern "C" __global__ void row_modulate_f32(const float* x, const float* shift,
                                             const float* scale, const unsigned* index,
                                             float* y, int rows, int dim,
                                             unsigned long long stride, unsigned entries) {
-    row_modulate_impl<float, true>(x, shift, scale, index, y, rows, dim, stride, entries);
+    row_modulate_impl(x, shift, scale, index, y, rows, dim, stride, entries);
+}
+
+extern "C" __global__ void add_row_bf16_f32(
+    const __nv_bfloat16* x, const float* row, __nv_bfloat16* y,
+    unsigned long long count, unsigned width) {
+    if (!x || !row || !y || !width || count % width) { __trap(); return; }
+    for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+         i < count; i += (unsigned long long)gridDim.x * blockDim.x) {
+        y[i] = __float2bfloat16_rn(__fadd_rn(__bfloat162float(x[i]), row[i % width]));
+    }
 }

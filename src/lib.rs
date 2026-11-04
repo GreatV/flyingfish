@@ -19,6 +19,7 @@ pub mod model_spec;
 pub mod mtp;
 pub mod music3;
 pub mod op_contract;
+pub mod pixal3d;
 pub mod prefill;
 pub mod prefix_state;
 pub mod serve;
