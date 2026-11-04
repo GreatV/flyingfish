@@ -5411,22 +5411,21 @@ mod tests {
     /// manifest and once with the community GGUF, and the frames/PCM distance printed. The two arms share the
     /// recorded request, so only the transformer weights differ; the numbers are a measurement, not a gate.
     #[test]
-    #[ignore = "FF_MODEL, FF_H3_GGUF, FF_H3_LORA, FF_H3_S0, FF_H3_E2E_NOISE, FF_H3_E2E_OUT"]
+    #[ignore = "FF_MODEL, FF_H3_GGUF, FF_H3_LORA, FF_H3_S0, FF_H3_E2E_OUT"]
     fn gguf_end_to_end_measurement_against_the_bf16_path() -> Result<()> {
         let var = |key: &str| -> Result<PathBuf> {
             Ok(PathBuf::from(
                 std::env::var_os(key).with_context(|| format!("{key} missing"))?,
             ))
         };
-        let (model, gguf, lora, s0, noise, out) = (
+        let (model, gguf, lora, s0, out) = (
             var("FF_MODEL")?,
             var("FF_H3_GGUF")?,
             var("FF_H3_LORA")?,
             var("FF_H3_S0")?,
-            var("FF_H3_E2E_NOISE")?,
             var("FF_H3_E2E_OUT")?,
         );
-        let request = recorded_request(&s0, &noise, "A")?;
+        let request = seeded_request(&s0, "A", 42)?;
         let runtime = std::env::temp_dir().join(format!("ff-h3-gguf-e2e-{}", std::process::id()));
         fs::create_dir(&runtime)?;
         let bf16 = super::generate(&model, &lora, &request, (0, &runtime), None)?;
