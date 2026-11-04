@@ -926,7 +926,7 @@ pub unsafe trait ValidAsZeroBits: DeviceRepr {}
 macro_rules! plain {
     ($($t:ty),*) => { $(unsafe impl DeviceRepr for $t {} unsafe impl ValidAsZeroBits for $t {})* };
 }
-plain!(u8, u16, u32, u64, i32, i64, f32, half::bf16);
+plain!(u8, u16, u32, u64, i32, i64, f32, half::bf16, half::f16);
 #[cfg(test)]
 plain!(f64);
 

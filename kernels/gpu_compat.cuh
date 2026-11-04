@@ -3,6 +3,7 @@
 #if defined(__HIP__)
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
+#include <hip/hip_fp16.h>
 
 #if !defined(__HIP_PLATFORM_AMD__)
 #error "HIP compiler is not targeting AMD"
@@ -25,6 +26,7 @@ __device__ __forceinline__ __nv_bfloat162 __floats2bfloat162_rn(float low, float
 #else
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
 #define FF_WARP_MASK 0xffffffffu
 #define FF_TRAP() asm volatile("trap;")

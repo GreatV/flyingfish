@@ -620,6 +620,170 @@ impl Flash {
         })
     }
 
+    pub fn new_f16_d64(
+        stream: Arc<CudaStream>,
+        rows: usize,
+        heads: usize,
+        kv_heads: usize,
+        score: Score,
+    ) -> Result<Self> {
+        let head_dim = 64usize;
+        let tile = 64usize;
+        let dynamic_shared = (384 * head_dim) as u32;
+        ensure!(
+            rows > 0 && heads > 0 && kv_heads > 0 && heads.is_multiple_of(kv_heads),
+            "invalid F16 D64 prefill geometry"
+        );
+        let elements = rows
+            .checked_mul(heads)
+            .context("prefill LSE extent overflow")?;
+        ensure!(
+            elements <= u32::MAX as usize,
+            "prefill LSE indexing exceeds u32"
+        );
+        #[cfg(feature = "cuda")]
+        let native = {
+            use cudarc::driver::sys::{CUdevice_attribute as A, CUfunction_attribute as F};
+            let ctx = stream.context();
+            ensure!(
+                heads <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y)? as usize,
+                "prefill heads exceed grid limit"
+            );
+            let module = super::cubin::module(ctx, "attention_native")?;
+            let name = "attention_prefill_d64_bidirectional_f16";
+            let function = module.load_function(name)?;
+            let shared = function.get_attribute(F::CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?;
+            let local = function.get_attribute(F::CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES)?;
+            let registers = function.get_attribute(F::CU_FUNC_ATTRIBUTE_NUM_REGS)?;
+            ensure!(
+                local == 0 && registers <= 255,
+                "native prefill {name} resource limit: registers={registers} local={local}"
+            );
+            ensure!(
+                shared
+                    <= ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?,
+                "native prefill {name} shared memory does not fit"
+            );
+            ensure!(
+                function.occupancy_max_active_blocks_per_multiprocessor(
+                    128,
+                    dynamic_shared as usize,
+                    None
+                )? > 0,
+                "native prefill {name} has zero resident blocks"
+            );
+            vec![function]
+        };
+        #[cfg(feature = "rocm")]
+        let native = {
+            anyhow::bail!("HIP native F16 D64 prefill geometry is not bound");
+        };
+        let lse = stream.alloc_zeros(elements)?;
+        let sink_rescale = super::cubin::module(stream.context(), "attention")?
+            .load_function("attention_sink_rescale")?;
+        Ok(Self {
+            stream,
+            lse,
+            sink_rescale,
+            native,
+            geometry: [heads, kv_heads, head_dim],
+            score: Some(score),
+            tile,
+            shared: dynamic_shared,
+            split: None,
+            position: 0,
+            position_limit: 0,
+        })
+    }
+
+    pub fn run_f16_d64(
+        &mut self,
+        q: &crate::backend::gpu::CudaView<'_, half::f16>,
+        q_row_stride: usize,
+        k: &crate::backend::gpu::CudaView<'_, half::f16>,
+        v: &crate::backend::gpu::CudaView<'_, half::f16>,
+        out: &mut crate::backend::gpu::CudaViewMut<'_, half::f16>,
+        (rows, keys, capacity): (usize, usize, usize),
+    ) -> Result<()> {
+        let [q_heads, kv_heads, head_dim] = self.geometry;
+        ensure!(head_dim == 64, "run_f16_d64 requires D=64");
+        ensure!(
+            rows > 0
+                && keys > 0
+                && rows <= keys
+                && keys <= capacity
+                && capacity <= i32::MAX as usize,
+            "invalid F16 D64 prefill row/key/capacity extents"
+        );
+        ensure!(
+            q_row_stride >= q_heads * head_dim
+                && q_row_stride <= u32::MAX as usize
+                && q_row_stride.is_multiple_of(8),
+            "prefill Q row pitch {q_row_stride} is invalid"
+        );
+        ensure!(
+            rows * q_heads <= self.lse.len(),
+            "prefill LSE buffer is too small"
+        );
+        let q_span = rows
+            .saturating_sub(1)
+            .checked_mul(q_row_stride)
+            .and_then(|span| span.checked_add(q_heads * head_dim))
+            .context("prefill Q extent overflow")?;
+        ensure!(q_span <= q.len(), "prefill Q buffer is too small");
+        let cache_span = capacity
+            .checked_mul(kv_heads)
+            .and_then(|x| x.checked_mul(head_dim))
+            .context("prefill cache span overflow")?;
+        ensure!(
+            cache_span <= k.len() && cache_span <= v.len(),
+            "prefill KV buffers are too small"
+        );
+        ensure!(
+            rows * q_heads * head_dim <= out.len(),
+            "prefill output buffer is too small"
+        );
+        self.stream.context().bind_to_thread()?;
+        let (q, _q) = q.device_ptr(&self.stream);
+        let (k, _k) = k.device_ptr(&self.stream);
+        let (v, _v) = v.device_ptr(&self.stream);
+        let (out, _out) = out.device_ptr_mut(&self.stream);
+        let (lse, _lse) = self.lse.device_ptr_mut(&self.stream);
+        let native = self
+            .native
+            .first()
+            .context("F16 D64 native function missing")?;
+        let score = self.score.as_ref().context("F16 D64 score missing")?;
+        let args = Attention {
+            q,
+            k,
+            v,
+            out,
+            lse,
+            rows: rows as u32,
+            capacity: capacity as u32,
+            q_stride: q_row_stride as u32,
+            q_heads: q_heads as u32,
+            group: (q_heads / kv_heads) as u32,
+            start: 0,
+            position: 0,
+        };
+        let key_extent = keys as u32;
+        unsafe {
+            self.stream
+                .launch_builder(native)
+                .arg(&args)
+                .arg(&key_extent)
+                .arg(&score.scale)
+                .launch(LaunchConfig {
+                    grid_dim: (rows.div_ceil(self.tile) as u32, q_heads as u32, 1),
+                    block_dim: (128, 1, 1),
+                    shared_mem_bytes: self.shared,
+                })?;
+        }
+        Ok(())
+    }
+
     pub fn bind_position(&mut self, position: &CudaSlice<i32>, limit: usize) -> Result<()> {
         ensure!(position.len() == 1, "attention position must be scalar");
         ensure!(

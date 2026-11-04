@@ -1,5 +1,7 @@
 //! Vision weights, patch/position preparation, and image-feature splice for Engine.
-use crate::backend::gpu::{CudaFunction, CudaSlice, CudaStream, DevicePtr, PushKernelArg};
+use crate::backend::gpu::{
+    CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
+};
 use crate::{
     backend::cuda::{
         Device,
@@ -3493,7 +3495,13 @@ impl Flux2VaeConfig {
 struct SafetensorsLoader<'a> {
     st: safetensors::SafeTensors<'a>,
     remaining: std::collections::BTreeSet<String>,
+    loaded_tensors: usize,
     loaded_elements: usize,
+    runtime_bytes: usize,
+    f16_tensors: usize,
+    f16_bytes: usize,
+    f32_tensors: usize,
+    f32_bytes: usize,
 }
 
 impl<'a> SafetensorsLoader<'a> {
@@ -3503,7 +3511,13 @@ impl<'a> SafetensorsLoader<'a> {
         Ok(Self {
             st,
             remaining,
+            loaded_tensors: 0,
             loaded_elements: 0,
+            runtime_bytes: 0,
+            f16_tensors: 0,
+            f16_bytes: 0,
+            f32_tensors: 0,
+            f32_bytes: 0,
         })
     }
 
@@ -3548,7 +3562,93 @@ impl<'a> SafetensorsLoader<'a> {
                 .collect(),
             dt => bail!("unsupported dtype {dt:?} for {name}"),
         };
+        self.loaded_tensors += 1;
         self.loaded_elements += host.len();
+        self.runtime_bytes += host.len() * size_of::<bf16>();
+        Ok(s.clone_htod(&host)?)
+    }
+
+    fn take_f16(
+        &mut self,
+        s: &Arc<CudaStream>,
+        name: &str,
+        expected_shape: &[usize],
+    ) -> Result<CudaSlice<half::f16>> {
+        ensure!(
+            self.remaining.remove(name),
+            "tensor {name} missing or loaded twice"
+        );
+        let view = self.st.tensor(name)?;
+        ensure!(
+            view.shape() == expected_shape,
+            "tensor {name} shape {:?} != expected {expected_shape:?}",
+            view.shape()
+        );
+        let host: Vec<half::f16> = match view.dtype() {
+            safetensors::Dtype::F16 => view
+                .data()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| half::f16::from_le_bytes(*b))
+                .collect(),
+            safetensors::Dtype::F32 => view
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| half::f16::from_f32(f32::from_le_bytes(*b)))
+                .collect(),
+            dt => bail!("unsupported dtype {dt:?} for {name}"),
+        };
+        let bytes = host.len() * size_of::<half::f16>();
+        self.loaded_tensors += 1;
+        self.loaded_elements += host.len();
+        self.runtime_bytes += bytes;
+        self.f16_tensors += 1;
+        self.f16_bytes += bytes;
+        Ok(s.clone_htod(&host)?)
+    }
+
+    fn take_f32_host(&mut self, name: &str, expected_shape: &[usize]) -> Result<Vec<f32>> {
+        ensure!(
+            self.remaining.remove(name),
+            "tensor {name} missing or loaded twice"
+        );
+        let view = self.st.tensor(name)?;
+        ensure!(
+            view.shape() == expected_shape,
+            "tensor {name} shape {:?} != expected {expected_shape:?}",
+            view.shape()
+        );
+        ensure!(
+            view.dtype() == safetensors::Dtype::F32,
+            "expected F32 for {name}, got {:?}",
+            view.dtype()
+        );
+        let host: Vec<f32> = view
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        let bytes = host.len() * size_of::<f32>();
+        self.loaded_tensors += 1;
+        self.loaded_elements += host.len();
+        self.runtime_bytes += bytes;
+        self.f32_tensors += 1;
+        self.f32_bytes += bytes;
+        Ok(host)
+    }
+
+    fn take_f32(
+        &mut self,
+        s: &Arc<CudaStream>,
+        name: &str,
+        expected_shape: &[usize],
+    ) -> Result<CudaSlice<f32>> {
+        let host = self.take_f32_host(name, expected_shape)?;
         Ok(s.clone_htod(&host)?)
     }
 
@@ -3616,6 +3716,105 @@ impl<T: DinoScalar> UnbiasedWeight<T> {
             dino_tensor_cast(input)?,
             &mut TensorMut(dino_tensor_cast(output.0)?),
         )
+    }
+}
+
+impl UnbiasedWeight<f32> {
+    fn load_f32(
+        loader: &mut SafetensorsLoader<'_>,
+        s: &Arc<CudaStream>,
+        name: &str,
+        shape: [u32; 2],
+    ) -> Result<Self> {
+        Ok(Self {
+            weight: loader.take_f32(
+                s,
+                &format!("{name}.weight"),
+                &[shape[0] as usize, shape[1] as usize],
+            )?,
+            shape,
+        })
+    }
+}
+
+impl BiasedWeight<half::f16> {
+    fn load_f16(
+        loader: &mut SafetensorsLoader<'_>,
+        s: &Arc<CudaStream>,
+        name: &str,
+        shape: [u32; 2],
+    ) -> Result<Self> {
+        Ok(Self {
+            weight: loader.take_f16(
+                s,
+                &format!("{name}.weight"),
+                &[shape[0] as usize, shape[1] as usize],
+            )?,
+            bias: loader.take_f16(s, &format!("{name}.bias"), &[shape[0] as usize])?,
+            f32_bias: None,
+            shape,
+            bias_mode: LinearBiasMode::AfterOutputRound,
+        })
+    }
+
+    fn run_f16(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        bias_fn: &CudaFunction,
+        input: Tensor<half::f16, 2>,
+        output: &mut TensorMut<half::f16, 2>,
+    ) -> Result<()> {
+        blas.linear_f16(dense(&self.weight, s, self.shape)?, input, output)?;
+        let rows = output.0.shape[0];
+        let cols = self.shape[0];
+        let count = u64::from(rows) * u64::from(cols);
+        unsafe {
+            s.launch_builder(bias_fn)
+                .arg(&output.0.ptr)
+                .arg(&self.bias)
+                .arg(&count)
+                .arg(&cols)
+                .launch(grid(count.div_ceil(256).min(65535) as usize, 256))?;
+        }
+        Ok(())
+    }
+}
+
+impl BiasedWeight<f32> {
+    fn load_f32(
+        loader: &mut SafetensorsLoader<'_>,
+        s: &Arc<CudaStream>,
+        name: &str,
+        shape: [u32; 2],
+    ) -> Result<Self> {
+        Ok(Self {
+            weight: loader.take_f32(
+                s,
+                &format!("{name}.weight"),
+                &[shape[0] as usize, shape[1] as usize],
+            )?,
+            bias: loader.take_f32(s, &format!("{name}.bias"), &[shape[0] as usize])?,
+            f32_bias: Some(
+                cubin::module(s.context(), "vision_ops")?.load_function("vision_bias_f32")?,
+            ),
+            shape,
+            bias_mode: LinearBiasMode::AfterOutputRound,
+        })
+    }
+}
+
+impl AffineWeights<f32> {
+    fn load_f32(
+        loader: &mut SafetensorsLoader<'_>,
+        s: &Arc<CudaStream>,
+        name: &str,
+        width: u32,
+    ) -> Result<Self> {
+        Ok(Self {
+            weight: loader.take_f32(s, &format!("{name}.weight"), &[width as usize])?,
+            bias: loader.take_f32(s, &format!("{name}.bias"), &[width as usize])?,
+        })
     }
 }
 
@@ -3882,6 +4081,16 @@ impl<T: DinoScalar> DinoEncoder<T> {
         let q38_mod = cubin::module(&device.ctx, "q38_common")?;
         let vis_mod = cubin::module(&device.ctx, "vision_ops")?;
         let act_mod = cubin::module(&device.ctx, "act")?;
+        let ws_bytes = patch_elems * size_of::<f32>()
+            + patch_elems * size_of::<bf16>()
+            + 5 * rows_u * hu * size_of::<bf16>()
+            + 3 * rows_u * inter_u * size_of::<bf16>()
+            + rope_host.len() * size_of::<bf16>()
+            + rows_u * hu * size_of::<f32>();
+        println!(
+            "I1_LOAD component=dinov3 tensors={} elems={} weight_bytes={} ws_bytes={}",
+            loader.loaded_tensors, loader.loaded_elements, loader.runtime_bytes, ws_bytes
+        );
         Ok((
             Self {
                 cfg,
@@ -4670,6 +4879,18 @@ impl Flux2VaeEncoder {
         };
         let vis_mod = cubin::module(&device.ctx, "vision_ops")?;
         let q38_mod = cubin::module(&device.ctx, "q38_common")?;
+        let im2col_bytes = (strip_pixels as usize) * mcu * 9 * size_of::<bf16>();
+        let ws_bytes = base_ws + im2col_bytes;
+        println!(
+            "I1_LOAD component=flux2_vae tensors={} elems={} weight_bytes={} base_ws={} im2col_bytes={} ws_bytes={} strip_pixels={}",
+            loader.loaded_tensors,
+            loader.loaded_elements,
+            loader.runtime_bytes,
+            base_ws,
+            im2col_bytes,
+            ws_bytes,
+            strip_pixels
+        );
         Ok((
             Self {
                 cfg,
@@ -6203,6 +6424,3195 @@ impl PixalConditioningRuntime {
     }
     pub fn projection(&self, s: &Arc<CudaStream>) -> Result<Tensor<f32, 2>> {
         dense(&self.projection, s, [self.projection_rows, self.channels])
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct IdolDenoiserArgs {
+    pub q_token_length: u32,
+    pub in_channels: u32,
+    pub cam_channels: u32,
+    pub model_channels: u32,
+    pub cond_channels: u32,
+    pub cond2_channels: u32,
+    pub num_blocks: usize,
+    pub num_refiner_blocks: usize,
+    pub num_heads: u32,
+    pub mlp_ratio: u32,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct IdolComponentSpec<T> {
+    pub name: String,
+    pub args: T,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct IdolOctreeDecoderArgs {
+    pub model_channels: u32,
+    pub cond_channels: u32,
+    pub num_blocks: usize,
+    pub num_heads: u32,
+    pub mlp_ratio: u32,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct IdolGsLrConfig {
+    #[serde(rename = "_xyz")]
+    pub xyz: f32,
+    #[serde(rename = "_features_dc")]
+    pub features_dc: f32,
+    #[serde(rename = "_opacity")]
+    pub opacity: f32,
+    #[serde(rename = "_scaling")]
+    pub scaling: f32,
+    #[serde(rename = "_rotation")]
+    pub rotation: f32,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct IdolGsRepConfig {
+    pub num_gaussians: usize,
+    pub lr: IdolGsLrConfig,
+    pub perturbe_size: f32,
+    #[serde(rename = "3d_filter_kernel_size")]
+    pub filter_kernel_size: f32,
+    pub scaling_bias: f32,
+    pub opacity_bias: f32,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct IdolGaussianDecoderArgs {
+    pub in_channels: u32,
+    pub model_channels: u32,
+    pub cond_channels: u32,
+    pub num_blocks: usize,
+    pub num_heads: u32,
+    pub mlp_ratio: u32,
+    pub representation_config: IdolGsRepConfig,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct IdolConfig {
+    pub denoiser: IdolComponentSpec<IdolDenoiserArgs>,
+    pub decoder: IdolComponentSpec<IdolOctreeDecoderArgs>,
+    pub decoder_gs: IdolComponentSpec<IdolGaussianDecoderArgs>,
+    pub image_size: u32,
+    pub max_voxel_level: u32,
+}
+
+impl IdolConfig {
+    pub fn from_dir(dir: &std::path::Path) -> Result<Self> {
+        let cfg: Self = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
+        ensure!(
+            cfg.denoiser.name == "LatentSeqMMFlowModel"
+                && cfg.denoiser.args.q_token_length == 8192
+                && cfg.denoiser.args.in_channels == 16
+                && cfg.denoiser.args.cam_channels == 5
+                && cfg.denoiser.args.model_channels == 1024
+                && cfg.denoiser.args.cond_channels == 1280
+                && cfg.denoiser.args.cond2_channels == 128
+                && cfg.denoiser.args.num_blocks == 24
+                && cfg.denoiser.args.num_refiner_blocks == 2
+                && cfg.denoiser.args.num_heads == 16
+                && cfg.denoiser.args.mlp_ratio == 4
+                && cfg.decoder.name == "OctreeProbabilityFixedlenDecoder"
+                && cfg.decoder.args.model_channels == 1024
+                && cfg.decoder.args.cond_channels == 16
+                && cfg.decoder.args.num_blocks == 4
+                && cfg.decoder.args.num_heads == 16
+                && cfg.decoder.args.mlp_ratio == 4
+                && cfg.decoder_gs.name == "GaussianFixedlenDecoder"
+                && cfg.decoder_gs.args.in_channels == 3
+                && cfg.decoder_gs.args.model_channels == 1024
+                && cfg.decoder_gs.args.cond_channels == 16
+                && cfg.decoder_gs.args.num_blocks == 16
+                && cfg.decoder_gs.args.num_heads == 16
+                && cfg.decoder_gs.args.mlp_ratio == 4
+                && cfg.decoder_gs.args.representation_config.num_gaussians == 32
+                && cfg.image_size == 1024
+                && cfg.max_voxel_level == 8,
+            "unsupported Idol configuration"
+        );
+        Ok(cfg)
+    }
+}
+
+/// Grid of `row_modulate*` / `row_gated_add*`: one row per block row, `ceil(dim / 256)` column blocks of 256 threads.
+fn row_grid(rows: u32, dim: u32) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: (rows, dim.div_ceil(256), 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+struct IdolRepoLayer {
+    norm: AffineWeights<f32>,
+    gate_map: UnbiasedWeight<f32>,
+    content_map: UnbiasedWeight<f32>,
+    final_map: UnbiasedWeight<f32>,
+    /// RePo angle frequencies of the three position axes, `freqs_0 | freqs_1 | freqs_2` (10 | 10 | 12).
+    freqs: CudaSlice<f32>,
+}
+
+impl IdolRepoLayer {
+    fn load(loader: &mut SafetensorsLoader<'_>, s: &Arc<CudaStream>, prefix: &str) -> Result<Self> {
+        Ok(Self {
+            gate_map: UnbiasedWeight::<f32>::load_f32(
+                loader,
+                s,
+                &format!("{prefix}.gate_map"),
+                [128, 1024],
+            )?,
+            content_map: UnbiasedWeight::<f32>::load_f32(
+                loader,
+                s,
+                &format!("{prefix}.content_map"),
+                [128, 1024],
+            )?,
+            final_map: UnbiasedWeight::<f32>::load_f32(
+                loader,
+                s,
+                &format!("{prefix}.final_map"),
+                [48, 128],
+            )?,
+            norm: AffineWeights::<f32>::load_f32(loader, s, &format!("{prefix}.norm"), 1024)?,
+            freqs: s.clone_htod(
+                &[
+                    loader.take_f32_host(&format!("{prefix}.freqs_0"), &[10])?,
+                    loader.take_f32_host(&format!("{prefix}.freqs_1"), &[10])?,
+                    loader.take_f32_host(&format!("{prefix}.freqs_2"), &[12])?,
+                ]
+                .concat(),
+            )?,
+        })
+    }
+}
+
+struct IdolUnifiedBlock {
+    shift_table: Option<CudaSlice<f32>>,
+    norm1: Option<AffineWeights<f32>>,
+    norm2: Option<AffineWeights<f32>>,
+    qkv: BiasedWeight<half::f16>,
+    q_norm: CudaSlice<f32>,
+    k_norm: CudaSlice<f32>,
+    out: BiasedWeight<half::f16>,
+    mlp0: BiasedWeight<half::f16>,
+    mlp2: BiasedWeight<half::f16>,
+}
+
+impl IdolUnifiedBlock {
+    fn load(
+        loader: &mut SafetensorsLoader<'_>,
+        s: &Arc<CudaStream>,
+        prefix: &str,
+        modulation: bool,
+    ) -> Result<Self> {
+        let (shift_table, norm1, norm2) = if modulation {
+            (
+                Some(loader.take_f32(s, &format!("{prefix}.shift_table"), &[1, 6144])?),
+                None,
+                None,
+            )
+        } else {
+            (
+                None,
+                Some(AffineWeights::<f32>::load_f32(
+                    loader,
+                    s,
+                    &format!("{prefix}.norm1"),
+                    1024,
+                )?),
+                Some(AffineWeights::<f32>::load_f32(
+                    loader,
+                    s,
+                    &format!("{prefix}.norm2"),
+                    1024,
+                )?),
+            )
+        };
+        Ok(Self {
+            shift_table,
+            norm1,
+            norm2,
+            qkv: BiasedWeight::<half::f16>::load_f16(
+                loader,
+                s,
+                &format!("{prefix}.attn.qkv"),
+                [3072, 1024],
+            )?,
+            q_norm: loader.take_f32(s, &format!("{prefix}.attn.q_norm.gamma"), &[16, 64])?,
+            k_norm: loader.take_f32(s, &format!("{prefix}.attn.k_norm.gamma"), &[16, 64])?,
+            out: BiasedWeight::<half::f16>::load_f16(
+                loader,
+                s,
+                &format!("{prefix}.attn.out"),
+                [1024, 1024],
+            )?,
+            mlp0: BiasedWeight::<half::f16>::load_f16(
+                loader,
+                s,
+                &format!("{prefix}.mlp.mlp.0"),
+                [4096, 1024],
+            )?,
+            mlp2: BiasedWeight::<half::f16>::load_f16(
+                loader,
+                s,
+                &format!("{prefix}.mlp.mlp.2"),
+                [1024, 4096],
+            )?,
+        })
+    }
+}
+
+struct IdolSharedKernels {
+    bias_f16: CudaFunction,
+    ln_f16: CudaFunction,
+    ln_f16_to_f32: CudaFunction,
+    gelu_f16: CudaFunction,
+    gelu_f32: CudaFunction,
+    silu_row_f32: CudaFunction,
+    silu_mul_split_f32: CudaFunction,
+    downcast_f32_to_f16: CudaFunction,
+    sinusoidal_f32: CudaFunction,
+    pcd_pos_f32: CudaFunction,
+    qkv_unpack_hm_f16: CudaFunction,
+    rope_pair_rows_3d: CudaFunction,
+    rope_pair_tail_f16: CudaFunction,
+    l2_norm_scale_f16: CudaFunction,
+    row_modulate_f16: CudaFunction,
+    row_gated_add_f16: CudaFunction,
+    row_modulate_f32: CudaFunction,
+    residual_f16: CudaFunction,
+    add_scale_f32: CudaFunction,
+    philox_uniform_f32: CudaFunction,
+    philox_normal_f32: CudaFunction,
+    philox_normal_bf16: CudaFunction,
+}
+
+impl IdolSharedKernels {
+    fn new(device: &Device) -> Result<Self> {
+        let vis = cubin::module(&device.ctx, "vision_ops")?;
+        let q38 = cubin::module(&device.ctx, "q38_common")?;
+        let act = cubin::module(&device.ctx, "act")?;
+        let rope = cubin::module(&device.ctx, "rope")?;
+        let norm = cubin::module(&device.ctx, "norm")?;
+        let mod_m = cubin::module(&device.ctx, "modulate")?;
+        let samp = cubin::module(&device.ctx, "sample")?;
+        Ok(Self {
+            bias_f16: q38.load_function("q38_bias_add_f16")?,
+            ln_f16: q38.load_function("q38_layer_norm_f16")?,
+            ln_f16_to_f32: q38.load_function("q38_layer_norm_f16_to_f32")?,
+            gelu_f16: q38.load_function("q38_gelu_f16")?,
+            gelu_f32: q38.load_function("q38_gelu_f32")?,
+            silu_row_f32: vis.load_function("vision_add_row_silu_f32")?,
+            silu_mul_split_f32: act.load_function("silu_mul_split_f32")?,
+            downcast_f32_to_f16: vis.load_function("vision_downcast_f32_to_f16")?,
+            sinusoidal_f32: vis.load_function("sinusoidal_embed_f32")?,
+            pcd_pos_f32: vis.load_function("pcd_pos_embed_f32")?,
+            qkv_unpack_hm_f16: vis.load_function("qkv_unpack_hm_f16")?,
+            rope_pair_rows_3d: rope.load_function("rope_pair_rows_3d")?,
+            rope_pair_tail_f16: rope.load_function("rope_pair_tail_f16")?,
+            l2_norm_scale_f16: norm.load_function("l2_norm_scale_f16")?,
+            row_modulate_f16: mod_m.load_function("row_modulate_f16")?,
+            row_gated_add_f16: mod_m.load_function("row_gated_add_f16")?,
+            row_modulate_f32: mod_m.load_function("row_modulate_f32")?,
+            residual_f16: norm.load_function("residual_f16")?,
+            add_scale_f32: q38.load_function("add_scale_f32")?,
+            philox_uniform_f32: samp.load_function("philox_uniform_f32")?,
+            philox_normal_f32: samp.load_function("philox_normal_f32")?,
+            philox_normal_bf16: samp.load_function("philox_normal_bf16")?,
+        })
+    }
+
+    fn launch_ln_f16(
+        &self,
+        s: &Arc<CudaStream>,
+        input_ptr: u64,
+        norm: Option<&AffineWeights<f32>>,
+        output_ptr: u64,
+        rows: u32,
+        eps: f32,
+    ) -> Result<()> {
+        let (w_ptr, b_ptr) = match norm {
+            Some(n) => (n.weight.device_ptr(s).0, n.bias.device_ptr(s).0),
+            None => (0u64, 0u64),
+        };
+        let h = 1024u32;
+        let stride = 1024u64;
+        unsafe {
+            s.launch_builder(&self.ln_f16)
+                .arg(&input_ptr)
+                .arg(&w_ptr)
+                .arg(&b_ptr)
+                .arg(&output_ptr)
+                .arg(&rows)
+                .arg(&1u32)
+                .arg(&h)
+                .arg(&stride)
+                .arg(&stride)
+                .arg(&1u64)
+                .arg(&stride)
+                .arg(&stride)
+                .arg(&1u64)
+                .arg(&eps)
+                .launch(grid(rows as usize, 256))?;
+        }
+        Ok(())
+    }
+
+    fn launch_ln_f16_to_f32(
+        &self,
+        s: &Arc<CudaStream>,
+        input_ptr: u64,
+        norm: Option<&AffineWeights<f32>>,
+        output_ptr: u64,
+        rows: u32,
+        eps: f32,
+    ) -> Result<()> {
+        let (w_ptr, b_ptr) = match norm {
+            Some(n) => (n.weight.device_ptr(s).0, n.bias.device_ptr(s).0),
+            None => (0u64, 0u64),
+        };
+        let h = 1024u32;
+        let stride = 1024u64;
+        unsafe {
+            s.launch_builder(&self.ln_f16_to_f32)
+                .arg(&input_ptr)
+                .arg(&w_ptr)
+                .arg(&b_ptr)
+                .arg(&output_ptr)
+                .arg(&rows)
+                .arg(&1u32)
+                .arg(&h)
+                .arg(&stride)
+                .arg(&stride)
+                .arg(&1u64)
+                .arg(&stride)
+                .arg(&stride)
+                .arg(&1u64)
+                .arg(&eps)
+                .launch(grid(rows as usize, 256))?;
+        }
+        Ok(())
+    }
+}
+
+pub struct IdolDenoiserWorkspace {
+    pub cfg_batch: usize,
+    latent_in_f32: CudaSlice<f32>,
+    camera_in_f32: CudaSlice<f32>,
+    cond_f1_in_f32: CudaSlice<f32>,
+    cond_f2_in_f32: CudaSlice<f32>,
+    t_in_f32: CudaSlice<f32>,
+    t_sin_f32: CudaSlice<f32>,
+    t_mlp0_f32: CudaSlice<f32>,
+    t_emb_f32: CudaSlice<f32>,
+    t_mod_f32: CudaSlice<f32>,
+    t_mod_f16: CudaSlice<half::f16>,
+    block_mod_f16: CudaSlice<half::f16>,
+    final_mod_f32: CudaSlice<f32>,
+    h_f32_scratch: CudaSlice<f32>,
+    h_f32_aux: CudaSlice<f32>,
+    h_x_f16: CudaSlice<half::f16>,
+    h_cond_f16: CudaSlice<half::f16>,
+    h_cam_f16: CudaSlice<half::f16>,
+    h_mm_f16: CudaSlice<half::f16>,
+    norm_f32: CudaSlice<f32>,
+    norm_f16: CudaSlice<half::f16>,
+    repo_gate_f32: CudaSlice<f32>,
+    repo_content_f32: CudaSlice<f32>,
+    repo_delta_f32: CudaSlice<f32>,
+    rotary_f32: CudaSlice<f32>,
+    qkv_f16: CudaSlice<half::f16>,
+    q_f16: CudaSlice<half::f16>,
+    k_hm_f16: CudaSlice<half::f16>,
+    v_hm_f16: CudaSlice<half::f16>,
+    attn_out_f16: CudaSlice<half::f16>,
+    proj_out_f16: CudaSlice<half::f16>,
+    mlp_fc1_f16: CudaSlice<half::f16>,
+    mlp_fc2_f16: CudaSlice<half::f16>,
+    v_latent_out_f32: CudaSlice<f32>,
+    v_camera_out_f32: CudaSlice<f32>,
+    prefill_f16: Flash,
+}
+
+impl IdolDenoiserWorkspace {
+    pub fn byte_size(b: usize) -> usize {
+        let l_lat = 8192usize;
+        let l_cam = 1usize;
+        let l_cond = 4101usize;
+        let l_mm = l_lat + l_cond + l_cam;
+        let c = 1024usize;
+        let h = 16usize;
+        let d = 64usize;
+        let m = 4096usize;
+        let r = 128usize;
+        (b * l_lat * 16
+            + b * l_cam * 5
+            + b * l_cond * 1280
+            + b * l_cond * 128
+            + b
+            + b * 256
+            + 2 * b * c
+            + b * 6 * c
+            + b * 2 * c
+            + 2 * b * l_mm * c
+            + b * l_mm * c
+            + 2 * b * l_mm * r
+            + b * l_mm * h * 3
+            + b * l_mm * h * d
+            + b * l_lat * 16
+            + b * l_cam * 5
+            + h * l_mm)
+            * size_of::<f32>()
+            + (2 * b * 6 * c
+                + b * l_lat * c
+                + b * l_cond * c
+                + b * l_cam * c
+                + 2 * b * l_mm * c
+                + b * l_mm * 3 * c
+                + b * l_mm * c
+                + 2 * b * h * l_mm * d
+                + 2 * b * l_mm * c
+                + b * l_mm * m
+                + b * l_mm * c)
+                * size_of::<half::f16>()
+    }
+}
+
+pub struct IdolDenoiser {
+    pub args: IdolDenoiserArgs,
+    pub weight_bytes: usize,
+    t_mlp0: BiasedWeight<f32>,
+    t_mlp2: BiasedWeight<f32>,
+    t_freqs: CudaSlice<f32>,
+    adaln_modulation: BiasedWeight<f32>,
+    input_layer: BiasedWeight<f32>,
+    cond_embedder: BiasedWeight<f32>,
+    cond_embedder2: BiasedWeight<f32>,
+    pos_pe_f16: CudaSlice<half::f16>,
+    noise_repo_layers: Vec<IdolRepoLayer>,
+    context_repo_layers: Vec<IdolRepoLayer>,
+    repo_layers: Vec<IdolRepoLayer>,
+    noise_refiner: Vec<IdolUnifiedBlock>,
+    context_refiner: Vec<IdolUnifiedBlock>,
+    cam_mlp0: BiasedWeight<f32>,
+    cam_mlp2: BiasedWeight<f32>,
+    blocks: Vec<IdolUnifiedBlock>,
+    shift_table: CudaSlice<f32>,
+    out_layer: BiasedWeight<f32>,
+    cam_out_layer: BiasedWeight<f32>,
+    kernels: IdolSharedKernels,
+}
+
+impl IdolDenoiser {
+    pub fn load(
+        device: &Device,
+        args: IdolDenoiserArgs,
+        safetensors_bytes: &[u8],
+        cfg_batch: usize,
+    ) -> Result<(Self, IdolDenoiserWorkspace)> {
+        ensure!(
+            cfg_batch == 1 || cfg_batch == 2,
+            "unsupported cfg_batch {cfg_batch}"
+        );
+        let s = &device.stream;
+        let kernels = IdolSharedKernels::new(device)?;
+        let mut loader = SafetensorsLoader::new(safetensors_bytes)?;
+        let t_mlp0 =
+            BiasedWeight::<f32>::load_f32(&mut loader, s, "t_embedder.mlp.0", [1024, 256])?;
+        let t_mlp2 =
+            BiasedWeight::<f32>::load_f32(&mut loader, s, "t_embedder.mlp.2", [1024, 1024])?;
+        let adaln_modulation =
+            BiasedWeight::<f32>::load_f32(&mut loader, s, "adaLN_modulation.1", [6144, 1024])?;
+        let input_layer = BiasedWeight::<f32>::load_f32(&mut loader, s, "input_layer", [1024, 16])?;
+        let cond_embedder =
+            BiasedWeight::<f32>::load_f32(&mut loader, s, "cond_embedder", [1024, 1280])?;
+        let cond_embedder2 =
+            BiasedWeight::<f32>::load_f32(&mut loader, s, "cond_embedder2", [1024, 128])?;
+        let pos_pe = loader.take_f32(s, "pos_pe", &[1, 8192, 3])?;
+        let mut noise_repo_layers = Vec::with_capacity(args.num_refiner_blocks);
+        for i in 0..args.num_refiner_blocks {
+            noise_repo_layers.push(IdolRepoLayer::load(
+                &mut loader,
+                s,
+                &format!("noise_repo_layers.{i}"),
+            )?);
+        }
+        let mut context_repo_layers = Vec::with_capacity(args.num_refiner_blocks);
+        for i in 0..args.num_refiner_blocks {
+            context_repo_layers.push(IdolRepoLayer::load(
+                &mut loader,
+                s,
+                &format!("context_repo_layers.{i}"),
+            )?);
+        }
+        let mut repo_layers = Vec::with_capacity(args.num_blocks);
+        for i in 0..args.num_blocks {
+            repo_layers.push(IdolRepoLayer::load(
+                &mut loader,
+                s,
+                &format!("repo_layers.{i}"),
+            )?);
+        }
+        let mut noise_refiner = Vec::with_capacity(args.num_refiner_blocks);
+        for i in 0..args.num_refiner_blocks {
+            noise_refiner.push(IdolUnifiedBlock::load(
+                &mut loader,
+                s,
+                &format!("noise_refiner.{i}"),
+                true,
+            )?);
+        }
+        let mut context_refiner = Vec::with_capacity(args.num_refiner_blocks);
+        for i in 0..args.num_refiner_blocks {
+            context_refiner.push(IdolUnifiedBlock::load(
+                &mut loader,
+                s,
+                &format!("context_refiner.{i}"),
+                false,
+            )?);
+        }
+        let cam_mlp0 =
+            BiasedWeight::<f32>::load_f32(&mut loader, s, "cam_refiner.mlp.0", [1024, 5])?;
+        let cam_mlp2 =
+            BiasedWeight::<f32>::load_f32(&mut loader, s, "cam_refiner.mlp.2", [1024, 1024])?;
+        let mut blocks = Vec::with_capacity(args.num_blocks);
+        for i in 0..args.num_blocks {
+            blocks.push(IdolUnifiedBlock::load(
+                &mut loader,
+                s,
+                &format!("blocks.{i}"),
+                true,
+            )?);
+        }
+        let shift_table = loader.take_f32(s, "shift_table", &[1, 2, 1024])?;
+        let out_layer = BiasedWeight::<f32>::load_f32(&mut loader, s, "out_layer", [16, 1024])?;
+        let cam_out_layer =
+            BiasedWeight::<f32>::load_f32(&mut loader, s, "cam_out_layer", [5, 1024])?;
+        ensure!(
+            loader.remaining.is_empty(),
+            "unconsumed denoiser safetensors keys: {:?}",
+            loader.remaining
+        );
+        ensure!(
+            loader.loaded_tensors == 560
+                && loader.loaded_elements == 370_550_677
+                && loader.runtime_bytes == 777_043_540,
+            "unexpected denoiser weight counts: tensors={} elems={} bytes={}",
+            loader.loaded_tensors,
+            loader.loaded_elements,
+            loader.runtime_bytes
+        );
+
+        let t_freqs_host: Vec<f32> = (0..128)
+            .map(|i| (-((10000.0f64.ln() as f32) * (i as f32) / 128.0f32)).exp())
+            .collect();
+        let t_freqs = s.clone_htod(&t_freqs_host)?;
+
+        let pcd_freqs_host: Vec<f32> = (0..170)
+            .map(|i| {
+                let exp = if i < 16 {
+                    i as f32
+                } else {
+                    ((i - 16) as f32) / 154.0f32 * 16.0f32
+                };
+                2.0f32.powf(exp)
+            })
+            .collect();
+        let pcd_freqs = s.clone_htod(&pcd_freqs_host)?;
+        let pos_pe_f32 = s.alloc_zeros::<f32>(8192 * 1024)?;
+        let pos_pe_f16 = s.alloc_zeros::<half::f16>(8192 * 1024)?;
+        let count_pe = 8192u32 * 1024u32;
+        unsafe {
+            s.launch_builder(&kernels.pcd_pos_f32)
+                .arg(&pos_pe)
+                .arg(&pcd_freqs)
+                .arg(&pos_pe_f32)
+                .arg(&8192u32)
+                .arg(&1024u32)
+                .arg(&170u32)
+                .arg(&1i32)
+                .arg(&0i32)
+                .launch(grid((count_pe as usize).div_ceil(256).min(65535), 256))?;
+            s.launch_builder(&kernels.downcast_f32_to_f16)
+                .arg(&pos_pe_f32)
+                .arg(&pos_pe_f16)
+                .arg(&count_pe)
+                .launch(grid((count_pe as usize).div_ceil(256).min(65535), 256))?;
+        }
+
+        let b = cfg_batch;
+        let ws_bytes = IdolDenoiserWorkspace::byte_size(b);
+        let (free, _) = device.ctx.mem_get_info()?;
+        ensure!(
+            free >= ws_bytes,
+            "denoiser workspace ({ws_bytes} B) exceeds free device memory ({free} B)"
+        );
+        let l_lat = 8192usize;
+        let l_cam = 1usize;
+        let l_cond = 4101usize;
+        let l_mm = l_lat + l_cond + l_cam;
+        let c = 1024usize;
+        let h = 16usize;
+        let d = 64usize;
+        let m = 4096usize;
+        let r = 128usize;
+        let ws = IdolDenoiserWorkspace {
+            cfg_batch: b,
+            latent_in_f32: s.alloc_zeros(b * l_lat * 16)?,
+            camera_in_f32: s.alloc_zeros(b * l_cam * 5)?,
+            cond_f1_in_f32: s.alloc_zeros(b * l_cond * 1280)?,
+            cond_f2_in_f32: s.alloc_zeros(b * l_cond * 128)?,
+            t_in_f32: s.alloc_zeros(b)?,
+            t_sin_f32: s.alloc_zeros(b * 256)?,
+            t_mlp0_f32: s.alloc_zeros(b * c)?,
+            t_emb_f32: s.alloc_zeros(b * c)?,
+            t_mod_f32: s.alloc_zeros(b * 6 * c)?,
+            t_mod_f16: s.alloc_zeros(b * 6 * c)?,
+            block_mod_f16: s.alloc_zeros(b * 6 * c)?,
+            final_mod_f32: s.alloc_zeros(b * 2 * c)?,
+            h_f32_scratch: s.alloc_zeros(b * l_mm * c)?,
+            h_f32_aux: s.alloc_zeros(b * l_mm * c)?,
+            h_x_f16: s.alloc_zeros(b * l_lat * c)?,
+            h_cond_f16: s.alloc_zeros(b * l_cond * c)?,
+            h_cam_f16: s.alloc_zeros(b * l_cam * c)?,
+            h_mm_f16: s.alloc_zeros(b * l_mm * c)?,
+            norm_f32: s.alloc_zeros(b * l_mm * c)?,
+            norm_f16: s.alloc_zeros(b * l_mm * c)?,
+            repo_gate_f32: s.alloc_zeros(b * l_mm * r)?,
+            repo_content_f32: s.alloc_zeros(b * l_mm * r)?,
+            repo_delta_f32: s.alloc_zeros(b * l_mm * h * 3)?,
+            rotary_f32: s.alloc_zeros(b * l_mm * h * d)?,
+            qkv_f16: s.alloc_zeros(b * l_mm * 3 * c)?,
+            q_f16: s.alloc_zeros(b * l_mm * c)?,
+            k_hm_f16: s.alloc_zeros(b * h * l_mm * d)?,
+            v_hm_f16: s.alloc_zeros(b * h * l_mm * d)?,
+            attn_out_f16: s.alloc_zeros(b * l_mm * c)?,
+            proj_out_f16: s.alloc_zeros(b * l_mm * c)?,
+            mlp_fc1_f16: s.alloc_zeros(b * l_mm * m)?,
+            mlp_fc2_f16: s.alloc_zeros(b * l_mm * c)?,
+            v_latent_out_f32: s.alloc_zeros(b * l_lat * 16)?,
+            v_camera_out_f32: s.alloc_zeros(b * l_cam * 5)?,
+            prefill_f16: Flash::new_f16_d64(
+                s.clone(),
+                l_mm,
+                h,
+                h,
+                Score::from_tokens((d as f32).sqrt().recip(), None)?,
+            )?,
+        };
+        println!(
+            "I1_LOAD component=denoiser tensors={} elems={} f16_tensors={} f16_bytes={} f32_tensors={} f32_bytes={} weight_bytes={} cfg_batch={} ws_bytes={}",
+            loader.loaded_tensors,
+            loader.loaded_elements,
+            loader.f16_tensors,
+            loader.f16_bytes,
+            loader.f32_tensors,
+            loader.f32_bytes,
+            loader.runtime_bytes,
+            cfg_batch,
+            ws_bytes
+        );
+        Ok((
+            Self {
+                args,
+                weight_bytes: loader.runtime_bytes,
+                t_mlp0,
+                t_mlp2,
+                t_freqs,
+                adaln_modulation,
+                input_layer,
+                cond_embedder,
+                cond_embedder2,
+                pos_pe_f16,
+                noise_repo_layers,
+                context_repo_layers,
+                repo_layers,
+                noise_refiner,
+                context_refiner,
+                cam_mlp0,
+                cam_mlp2,
+                blocks,
+                shift_table,
+                out_layer,
+                cam_out_layer,
+                kernels,
+            },
+            ws,
+        ))
+    }
+
+    fn run_repo_and_block(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        ws: &mut IdolDenoiserWorkspace,
+        repo: &IdolRepoLayer,
+        block: &IdolUnifiedBlock,
+        seq_info: (u32, u32, bool, f32),
+    ) -> Result<()> {
+        let (batch, seq_len, use_h_mm, qk_scale) = seq_info;
+        let rows = batch * seq_len;
+        let c = 1024u32;
+        let h = 16u32;
+        let d = 64u32;
+        let r_dim = 128u32;
+        let m_dim = 4096u32;
+        let h_ptr = if use_h_mm {
+            ws.h_mm_f16.device_ptr(s).0
+        } else if seq_len == 8192 {
+            ws.h_x_f16.device_ptr(s).0
+        } else {
+            ws.h_cond_f16.device_ptr(s).0
+        };
+        let norm_f32_ptr = ws.norm_f32.device_ptr(s).0;
+        let norm_f16_ptr = ws.norm_f16.device_ptr(s).0;
+
+        self.kernels.launch_ln_f16_to_f32(
+            s,
+            h_ptr,
+            Some(&repo.norm),
+            norm_f32_ptr,
+            rows,
+            1e-5f32,
+        )?;
+        repo.gate_map.run(
+            s,
+            blas,
+            stage_view(&ws.norm_f32, s, [rows, c])?,
+            &mut TensorMut(stage_view(&ws.repo_gate_f32, s, [rows, r_dim])?),
+        )?;
+        repo.content_map.run(
+            s,
+            blas,
+            stage_view(&ws.norm_f32, s, [rows, c])?,
+            &mut TensorMut(stage_view(&ws.repo_content_f32, s, [rows, r_dim])?),
+        )?;
+        let repo_elems = i32::try_from(rows * r_dim)?;
+        unsafe {
+            s.launch_builder(&self.kernels.silu_mul_split_f32)
+                .arg(&ws.repo_gate_f32)
+                .arg(&ws.repo_content_f32)
+                .arg(&ws.repo_gate_f32)
+                .arg(&repo_elems)
+                .arg(&0i32)
+                .launch(grid((repo_elems as usize).div_ceil(256).min(65535), 256))?;
+        }
+        repo.final_map.run(
+            s,
+            blas,
+            stage_view(&ws.repo_gate_f32, s, [rows, r_dim])?,
+            &mut TensorMut(stage_view(&ws.repo_delta_f32, s, [rows, 48])?),
+        )?;
+        let rope_rows = rows * h;
+        unsafe {
+            s.launch_builder(&self.kernels.rope_pair_rows_3d)
+                .arg(&ws.repo_delta_f32)
+                .arg(&repo.freqs)
+                .arg(&i32::try_from(rows)?)
+                .arg(&i32::try_from(h)?)
+                .arg(&i32::try_from(d)?)
+                .arg(&ws.rotary_f32)
+                .launch(grid(
+                    (rope_rows as usize * d as usize / 2).div_ceil(256),
+                    256,
+                ))?;
+        }
+
+        if let Some(st) = &block.shift_table {
+            let mod_elems = 6144u32;
+            let b_mod_ptr = ws.block_mod_f16.device_ptr(s).0;
+            for b_idx in 0..batch {
+                let dst_ptr = b_mod_ptr + u64::from(b_idx * mod_elems) * 2;
+                unsafe {
+                    s.launch_builder(&self.kernels.downcast_f32_to_f16)
+                        .arg(st)
+                        .arg(&dst_ptr)
+                        .arg(&mod_elems)
+                        .launch(grid((mod_elems as usize).div_ceil(256), 256))?;
+                }
+            }
+            let total_mod = i32::try_from(batch * mod_elems)?;
+            unsafe {
+                s.launch_builder(&self.kernels.residual_f16)
+                    .arg(&ws.block_mod_f16)
+                    .arg(&ws.t_mod_f16)
+                    .arg(&total_mod)
+                    .launch(grid((total_mod as usize).div_ceil(256), 256))?;
+            }
+            self.kernels
+                .launch_ln_f16(s, h_ptr, None, norm_f16_ptr, rows, 1e-6f32)?;
+            let scale_msa_ptr = b_mod_ptr + 1024 * 2;
+            let shift_msa_ptr = b_mod_ptr;
+            unsafe {
+                s.launch_builder(&self.kernels.row_modulate_f16)
+                    .arg(&norm_f16_ptr)
+                    .arg(&shift_msa_ptr)
+                    .arg(&scale_msa_ptr)
+                    .arg(&0u64)
+                    .arg(&norm_f16_ptr)
+                    .arg(&rows)
+                    .arg(&c)
+                    .arg(&6144u64)
+                    .arg(&batch)
+                    .launch(row_grid(rows, c))?;
+            }
+        } else {
+            self.kernels.launch_ln_f16(
+                s,
+                h_ptr,
+                block.norm1.as_ref(),
+                norm_f16_ptr,
+                rows,
+                1e-6f32,
+            )?;
+        }
+
+        block.qkv.run_f16(
+            s,
+            blas,
+            &self.kernels.bias_f16,
+            stage_view(&ws.norm_f16, s, [rows, c])?,
+            &mut TensorMut(stage_view(&ws.qkv_f16, s, [rows, 3 * c])?),
+        )?;
+        let unpack_total = u64::from(rows) * u64::from(c);
+        unsafe {
+            s.launch_builder(&self.kernels.qkv_unpack_hm_f16)
+                .arg(&ws.qkv_f16)
+                .arg(&ws.q_f16)
+                .arg(&ws.attn_out_f16)
+                .arg(&ws.v_hm_f16)
+                .arg(&batch)
+                .arg(&seq_len)
+                .arg(&h)
+                .arg(&d)
+                .arg(&3i32)
+                .launch(grid(unpack_total.div_ceil(256).min(65535) as usize, 256))?;
+            s.launch_builder(&self.kernels.rope_pair_tail_f16)
+                .arg(&ws.q_f16)
+                .arg(&ws.rotary_f32)
+                .arg(&i32::try_from(rows)?)
+                .arg(&i32::try_from(h)?)
+                .arg(&i32::try_from(d)?)
+                .arg(&i32::try_from(d)?)
+                .arg(&i32::try_from(h)?)
+                .launch(grid(
+                    (rope_rows as usize * d as usize / 2).div_ceil(256),
+                    256,
+                ))?;
+            s.launch_builder(&self.kernels.rope_pair_tail_f16)
+                .arg(&ws.attn_out_f16)
+                .arg(&ws.rotary_f32)
+                .arg(&i32::try_from(rows)?)
+                .arg(&i32::try_from(h)?)
+                .arg(&i32::try_from(d)?)
+                .arg(&i32::try_from(d)?)
+                .arg(&i32::try_from(h)?)
+                .launch(grid(
+                    (rope_rows as usize * d as usize / 2).div_ceil(256),
+                    256,
+                ))?;
+            s.launch_builder(&self.kernels.l2_norm_scale_f16)
+                .arg(&ws.q_f16)
+                .arg(&block.q_norm)
+                .arg(&ws.q_f16)
+                .arg(&rows)
+                .arg(&h)
+                .arg(&d)
+                .arg(&qk_scale)
+                .arg(&1e-12f32)
+                .arg(&0u32)
+                .launch(grid(rope_rows as usize, 64))?;
+            s.launch_builder(&self.kernels.l2_norm_scale_f16)
+                .arg(&ws.attn_out_f16)
+                .arg(&block.k_norm)
+                .arg(&ws.k_hm_f16)
+                .arg(&rows)
+                .arg(&h)
+                .arg(&d)
+                .arg(&qk_scale)
+                .arg(&1e-12f32)
+                .arg(&seq_len)
+                .launch(grid(rope_rows as usize, 64))?;
+        }
+
+        let slice_elems = (seq_len as usize) * (c as usize);
+        for b_idx in 0..batch {
+            let start = (b_idx as usize) * slice_elems;
+            let end = start + slice_elems;
+            let q_view = ws.q_f16.slice(start..end);
+            let k_view = ws.k_hm_f16.slice(start..end);
+            let v_view = ws.v_hm_f16.slice(start..end);
+            let mut o_view = ws.attn_out_f16.slice_mut(start..end);
+            ws.prefill_f16.run_f16_d64(
+                &q_view,
+                c as usize,
+                &k_view,
+                &v_view,
+                &mut o_view,
+                (seq_len as usize, seq_len as usize, seq_len as usize),
+            )?;
+        }
+
+        block.out.run_f16(
+            s,
+            blas,
+            &self.kernels.bias_f16,
+            stage_view(&ws.attn_out_f16, s, [rows, c])?,
+            &mut TensorMut(stage_view(&ws.proj_out_f16, s, [rows, c])?),
+        )?;
+
+        if block.shift_table.is_some() {
+            let b_mod_ptr = ws.block_mod_f16.device_ptr(s).0;
+            let gate_msa_ptr = b_mod_ptr + 2 * 1024 * 2;
+            unsafe {
+                s.launch_builder(&self.kernels.row_gated_add_f16)
+                    .arg(&h_ptr)
+                    .arg(&ws.proj_out_f16)
+                    .arg(&gate_msa_ptr)
+                    .arg(&0u64)
+                    .arg(&rows)
+                    .arg(&c)
+                    .arg(&6144u64)
+                    .arg(&batch)
+                    .launch(row_grid(rows, c))?;
+            }
+            self.kernels
+                .launch_ln_f16(s, h_ptr, None, norm_f16_ptr, rows, 1e-6f32)?;
+            let shift_mlp_ptr = b_mod_ptr + 3 * 1024 * 2;
+            let scale_mlp_ptr = b_mod_ptr + 4 * 1024 * 2;
+            unsafe {
+                s.launch_builder(&self.kernels.row_modulate_f16)
+                    .arg(&norm_f16_ptr)
+                    .arg(&shift_mlp_ptr)
+                    .arg(&scale_mlp_ptr)
+                    .arg(&0u64)
+                    .arg(&norm_f16_ptr)
+                    .arg(&rows)
+                    .arg(&c)
+                    .arg(&6144u64)
+                    .arg(&batch)
+                    .launch(row_grid(rows, c))?;
+            }
+        } else {
+            let total_elems = i32::try_from(rows * c)?;
+            unsafe {
+                s.launch_builder(&self.kernels.residual_f16)
+                    .arg(&h_ptr)
+                    .arg(&ws.proj_out_f16)
+                    .arg(&total_elems)
+                    .launch(grid((total_elems as usize).div_ceil(256).min(65535), 256))?;
+            }
+            self.kernels.launch_ln_f16(
+                s,
+                h_ptr,
+                block.norm2.as_ref(),
+                norm_f16_ptr,
+                rows,
+                1e-6f32,
+            )?;
+        }
+
+        block.mlp0.run_f16(
+            s,
+            blas,
+            &self.kernels.bias_f16,
+            stage_view(&ws.norm_f16, s, [rows, c])?,
+            &mut TensorMut(stage_view(&ws.mlp_fc1_f16, s, [rows, m_dim])?),
+        )?;
+        let mlp_elems = u64::from(rows) * u64::from(m_dim);
+        unsafe {
+            s.launch_builder(&self.kernels.gelu_f16)
+                .arg(&ws.mlp_fc1_f16)
+                .arg(&ws.mlp_fc1_f16)
+                .arg(&u32::try_from(mlp_elems)?)
+                .arg(&1u32)
+                .arg(&1u32)
+                .arg(&1u64)
+                .arg(&1u64)
+                .arg(&1u64)
+                .arg(&1u64)
+                .arg(&1u64)
+                .arg(&1u64)
+                .arg(&1i32)
+                .launch(grid(mlp_elems.div_ceil(256).min(65535) as usize, 256))?;
+        }
+        block.mlp2.run_f16(
+            s,
+            blas,
+            &self.kernels.bias_f16,
+            stage_view(&ws.mlp_fc1_f16, s, [rows, m_dim])?,
+            &mut TensorMut(stage_view(&ws.mlp_fc2_f16, s, [rows, c])?),
+        )?;
+        if block.shift_table.is_some() {
+            let b_mod_ptr = ws.block_mod_f16.device_ptr(s).0;
+            let gate_mlp_ptr = b_mod_ptr + 5 * 1024 * 2;
+            unsafe {
+                s.launch_builder(&self.kernels.row_gated_add_f16)
+                    .arg(&h_ptr)
+                    .arg(&ws.mlp_fc2_f16)
+                    .arg(&gate_mlp_ptr)
+                    .arg(&0u64)
+                    .arg(&rows)
+                    .arg(&c)
+                    .arg(&6144u64)
+                    .arg(&batch)
+                    .launch(row_grid(rows, c))?;
+            }
+        } else {
+            let total_elems = i32::try_from(rows * c)?;
+            unsafe {
+                s.launch_builder(&self.kernels.residual_f16)
+                    .arg(&h_ptr)
+                    .arg(&ws.mlp_fc2_f16)
+                    .arg(&total_elems)
+                    .launch(grid((total_elems as usize).div_ceil(256).min(65535), 256))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn forward_batch(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        ws: &mut IdolDenoiserWorkspace,
+        batch: usize,
+        t_val: f32,
+        qk_scale: f32,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        ensure!(
+            batch >= 1 && batch <= ws.cfg_batch,
+            "invalid batch {batch} for ws.cfg_batch={}",
+            ws.cfg_batch
+        );
+        let b = batch as u32;
+        let l_lat = 8192u32;
+        let l_cond = 4101u32;
+        let l_cam = 1u32;
+        let l_mm = l_lat + l_cond + l_cam;
+        let c = 1024u32;
+
+        self.input_layer.run(
+            s,
+            blas,
+            stage_view(&ws.latent_in_f32, s, [b * l_lat, 16])?,
+            &mut TensorMut(stage_view(&ws.h_f32_scratch, s, [b * l_lat, c])?),
+        )?;
+        let lat_elems = b * l_lat * c;
+        let pe_elems = i32::try_from(l_lat * c)?;
+        let hx_ptr = ws.h_x_f16.device_ptr(s).0;
+        unsafe {
+            s.launch_builder(&self.kernels.downcast_f32_to_f16)
+                .arg(&ws.h_f32_scratch)
+                .arg(&ws.h_x_f16)
+                .arg(&lat_elems)
+                .launch(grid((lat_elems as usize).div_ceil(256).min(65535), 256))?;
+            for b_idx in 0..b {
+                let dst_ptr = hx_ptr + u64::from(b_idx * l_lat * c) * 2;
+                s.launch_builder(&self.kernels.residual_f16)
+                    .arg(&dst_ptr)
+                    .arg(&self.pos_pe_f16)
+                    .arg(&pe_elems)
+                    .launch(grid((pe_elems as usize).div_ceil(256).min(65535), 256))?;
+            }
+        }
+
+        self.cond_embedder.run(
+            s,
+            blas,
+            stage_view(&ws.cond_f1_in_f32, s, [b * l_cond, 1280])?,
+            &mut TensorMut(stage_view(&ws.h_f32_scratch, s, [b * l_cond, c])?),
+        )?;
+        self.cond_embedder2.run(
+            s,
+            blas,
+            stage_view(&ws.cond_f2_in_f32, s, [b * l_cond, 128])?,
+            &mut TensorMut(stage_view(&ws.h_f32_aux, s, [b * l_cond, c])?),
+        )?;
+        let cond_elems = b * l_cond * c;
+        unsafe {
+            s.launch_builder(&self.kernels.add_scale_f32)
+                .arg(&ws.h_f32_scratch)
+                .arg(&ws.h_f32_aux)
+                .arg(&i64::from(cond_elems))
+                .arg(&1.0f32)
+                .launch(grid((cond_elems as usize).div_ceil(256), 256))?;
+            s.launch_builder(&self.kernels.downcast_f32_to_f16)
+                .arg(&ws.h_f32_scratch)
+                .arg(&ws.h_cond_f16)
+                .arg(&cond_elems)
+                .launch(grid((cond_elems as usize).div_ceil(256).min(65535), 256))?;
+        }
+
+        s.memcpy_htod(&vec![t_val; batch], &mut ws.t_in_f32.slice_mut(0..batch))?;
+        unsafe {
+            s.launch_builder(&self.kernels.sinusoidal_f32)
+                .arg(&ws.t_in_f32)
+                .arg(&self.t_freqs)
+                .arg(&ws.t_sin_f32)
+                .arg(&b)
+                .arg(&128u32)
+                .arg(&0i32)
+                .launch(grid((b as usize * 128).div_ceil(256), 256))?;
+        }
+        self.t_mlp0.run(
+            s,
+            blas,
+            stage_view(&ws.t_sin_f32, s, [b, 256])?,
+            &mut TensorMut(stage_view(&ws.t_mlp0_f32, s, [b, c])?),
+        )?;
+        unsafe {
+            s.launch_builder(&self.kernels.silu_row_f32)
+                .arg(&ws.t_mlp0_f32)
+                .arg(&0u64)
+                .arg(&ws.t_mlp0_f32)
+                .arg(&(b * c))
+                .arg(&c)
+                .launch(grid((b * c).div_ceil(256) as usize, 256))?;
+        }
+        self.t_mlp2.run(
+            s,
+            blas,
+            stage_view(&ws.t_mlp0_f32, s, [b, c])?,
+            &mut TensorMut(stage_view(&ws.t_emb_f32, s, [b, c])?),
+        )?;
+        s.memcpy_dtod(
+            &ws.t_emb_f32.slice(0..batch * c as usize),
+            &mut ws.t_mlp0_f32.slice_mut(0..batch * c as usize),
+        )?;
+        unsafe {
+            s.launch_builder(&self.kernels.silu_row_f32)
+                .arg(&ws.t_mlp0_f32)
+                .arg(&0u64)
+                .arg(&ws.t_mlp0_f32)
+                .arg(&(b * c))
+                .arg(&c)
+                .launch(grid((b * c).div_ceil(256) as usize, 256))?;
+        }
+        self.adaln_modulation.run(
+            s,
+            blas,
+            stage_view(&ws.t_mlp0_f32, s, [b, c])?,
+            &mut TensorMut(stage_view(&ws.t_mod_f32, s, [b, 6144])?),
+        )?;
+        let mod_total = b * 6144;
+        unsafe {
+            s.launch_builder(&self.kernels.downcast_f32_to_f16)
+                .arg(&ws.t_mod_f32)
+                .arg(&ws.t_mod_f16)
+                .arg(&mod_total)
+                .launch(grid((mod_total as usize).div_ceil(256), 256))?;
+        }
+
+        for (repo, blk) in self.noise_repo_layers.iter().zip(&self.noise_refiner) {
+            self.run_repo_and_block(s, blas, ws, repo, blk, (b, l_lat, false, qk_scale))?;
+        }
+        for (repo, blk) in self.context_repo_layers.iter().zip(&self.context_refiner) {
+            self.run_repo_and_block(s, blas, ws, repo, blk, (b, l_cond, false, qk_scale))?;
+        }
+
+        self.cam_mlp0.run(
+            s,
+            blas,
+            stage_view(&ws.camera_in_f32, s, [b * l_cam, 5])?,
+            &mut TensorMut(stage_view(&ws.h_f32_scratch, s, [b * l_cam, c])?),
+        )?;
+        let cam_elems = u64::from(b * l_cam * c);
+        let cam_elems_u32 = b * l_cam * c;
+        unsafe {
+            s.launch_builder(&self.kernels.gelu_f32)
+                .arg(&ws.h_f32_scratch)
+                .arg(&ws.h_f32_scratch)
+                .arg(&u32::try_from(cam_elems)?)
+                .arg(&1u32)
+                .arg(&1u32)
+                .arg(&1u64)
+                .arg(&1u64)
+                .arg(&1u64)
+                .arg(&1u64)
+                .arg(&1u64)
+                .arg(&1u64)
+                .arg(&1i32)
+                .launch(grid((cam_elems as usize).div_ceil(256), 256))?;
+        }
+        self.cam_mlp2.run(
+            s,
+            blas,
+            stage_view(&ws.h_f32_scratch, s, [b * l_cam, c])?,
+            &mut TensorMut(stage_view(&ws.h_f32_aux, s, [b * l_cam, c])?),
+        )?;
+        unsafe {
+            s.launch_builder(&self.kernels.downcast_f32_to_f16)
+                .arg(&ws.h_f32_aux)
+                .arg(&ws.h_cam_f16)
+                .arg(&cam_elems_u32)
+                .launch(grid((cam_elems_u32 as usize).div_ceil(256), 256))?;
+        }
+
+        for b_idx in 0..batch {
+            let mm_base = b_idx * (l_mm as usize) * (c as usize);
+            let x_len = (l_lat as usize) * (c as usize);
+            let cond_len = (l_cond as usize) * (c as usize);
+            let cam_len = (l_cam as usize) * (c as usize);
+            s.memcpy_dtod(
+                &ws.h_x_f16.slice(b_idx * x_len..(b_idx + 1) * x_len),
+                &mut ws.h_mm_f16.slice_mut(mm_base..mm_base + x_len),
+            )?;
+            s.memcpy_dtod(
+                &ws.h_cond_f16
+                    .slice(b_idx * cond_len..(b_idx + 1) * cond_len),
+                &mut ws
+                    .h_mm_f16
+                    .slice_mut(mm_base + x_len..mm_base + x_len + cond_len),
+            )?;
+            s.memcpy_dtod(
+                &ws.h_cam_f16.slice(b_idx * cam_len..(b_idx + 1) * cam_len),
+                &mut ws
+                    .h_mm_f16
+                    .slice_mut(mm_base + x_len + cond_len..mm_base + x_len + cond_len + cam_len),
+            )?;
+        }
+
+        for (repo, blk) in self.repo_layers.iter().zip(&self.blocks) {
+            self.run_repo_and_block(s, blas, ws, repo, blk, (b, l_mm, true, qk_scale))?;
+        }
+
+        for b_idx in 0..batch {
+            let mm_base = b_idx * (l_mm as usize) * (c as usize);
+            let x_len = (l_lat as usize) * (c as usize);
+            let cond_len = (l_cond as usize) * (c as usize);
+            let cam_len = (l_cam as usize) * (c as usize);
+            s.memcpy_dtod(
+                &ws.h_mm_f16.slice(mm_base..mm_base + x_len),
+                &mut ws.h_x_f16.slice_mut(b_idx * x_len..(b_idx + 1) * x_len),
+            )?;
+            s.memcpy_dtod(
+                &ws.h_mm_f16
+                    .slice(mm_base + x_len + cond_len..mm_base + x_len + cond_len + cam_len),
+                &mut ws
+                    .h_cam_f16
+                    .slice_mut(b_idx * cam_len..(b_idx + 1) * cam_len),
+            )?;
+        }
+
+        let hx_f16_ptr = ws.h_x_f16.device_ptr(s).0;
+        let hcam_f16_ptr = ws.h_cam_f16.device_ptr(s).0;
+        let hx_f32_ptr = ws.h_f32_scratch.device_ptr(s).0;
+        let hcam_f32_ptr = ws.h_f32_aux.device_ptr(s).0;
+        self.kernels
+            .launch_ln_f16_to_f32(s, hx_f16_ptr, None, hx_f32_ptr, b * l_lat, 1e-5f32)?;
+        self.kernels.launch_ln_f16_to_f32(
+            s,
+            hcam_f16_ptr,
+            None,
+            hcam_f32_ptr,
+            b * l_cam,
+            1e-5f32,
+        )?;
+
+        for b_idx in 0..batch {
+            let dst_base = b_idx * 2048;
+            s.memcpy_dtod(
+                &self.shift_table,
+                &mut ws.final_mod_f32.slice_mut(dst_base..dst_base + 2048),
+            )?;
+            let temb_slice = ws.t_emb_f32.slice(b_idx * 1024..(b_idx + 1) * 1024);
+            let temb_ptr = temb_slice.device_ptr(s).0;
+            let fmod_ptr = ws.final_mod_f32.device_ptr(s).0 + (dst_base * 4) as u64;
+            let fmod_ptr2 = fmod_ptr + 1024 * 4;
+            let c_i32 = 1024i32;
+            unsafe {
+                s.launch_builder(&self.kernels.add_scale_f32)
+                    .arg(&fmod_ptr)
+                    .arg(&temb_ptr)
+                    .arg(&i64::from(c_i32))
+                    .arg(&1.0f32)
+                    .launch(grid(4, 256))?;
+                s.launch_builder(&self.kernels.add_scale_f32)
+                    .arg(&fmod_ptr2)
+                    .arg(&temb_ptr)
+                    .arg(&i64::from(c_i32))
+                    .arg(&1.0f32)
+                    .launch(grid(4, 256))?;
+            }
+        }
+        let fmod_base = ws.final_mod_f32.device_ptr(s).0;
+        let shift_ptr = fmod_base;
+        let scale_ptr = fmod_base + 1024 * 4;
+        unsafe {
+            s.launch_builder(&self.kernels.row_modulate_f32)
+                .arg(&hx_f32_ptr)
+                .arg(&shift_ptr)
+                .arg(&scale_ptr)
+                .arg(&0u64)
+                .arg(&hx_f32_ptr)
+                .arg(&(b * l_lat))
+                .arg(&c)
+                .arg(&2048u64)
+                .arg(&b)
+                .launch(row_grid(b * l_lat, c))?;
+            s.launch_builder(&self.kernels.row_modulate_f32)
+                .arg(&hcam_f32_ptr)
+                .arg(&shift_ptr)
+                .arg(&scale_ptr)
+                .arg(&0u64)
+                .arg(&hcam_f32_ptr)
+                .arg(&(b * l_cam))
+                .arg(&c)
+                .arg(&2048u64)
+                .arg(&b)
+                .launch(row_grid(b * l_cam, c))?;
+        }
+
+        self.out_layer.run(
+            s,
+            blas,
+            stage_view(&ws.h_f32_scratch, s, [b * l_lat, c])?,
+            &mut TensorMut(stage_view(&ws.v_latent_out_f32, s, [b * l_lat, 16])?),
+        )?;
+        self.cam_out_layer.run(
+            s,
+            blas,
+            stage_view(&ws.h_f32_aux, s, [b * l_cam, c])?,
+            &mut TensorMut(stage_view(&ws.v_camera_out_f32, s, [b * l_cam, 5])?),
+        )?;
+
+        let v_lat = s.clone_dtoh(&ws.v_latent_out_f32.slice(0..batch * 8192 * 16))?;
+        let v_cam = s.clone_dtoh(&ws.v_camera_out_f32.slice(0..batch * 5))?;
+        Ok((v_lat, v_cam))
+    }
+
+    pub fn prepare_conditioning(
+        &self,
+        s: &Arc<CudaStream>,
+        ws: &mut IdolDenoiserWorkspace,
+        feature1: &[f32],
+        feature2: &[f32],
+    ) -> Result<()> {
+        let f1_len = 4101 * 1280;
+        let f2_len = 4101 * 128;
+        ensure!(
+            feature1.len() == f1_len && feature2.len() == f2_len,
+            "unexpected conditioning lengths: {} and {}",
+            feature1.len(),
+            feature2.len()
+        );
+        s.memcpy_htod(feature1, &mut ws.cond_f1_in_f32.slice_mut(0..f1_len))?;
+        s.memcpy_htod(feature2, &mut ws.cond_f2_in_f32.slice_mut(0..f2_len))?;
+        if ws.cfg_batch == 2 {
+            s.memset_zeros(&mut ws.cond_f1_in_f32.slice_mut(f1_len..2 * f1_len))?;
+            s.memset_zeros(&mut ws.cond_f2_in_f32.slice_mut(f2_len..2 * f2_len))?;
+        }
+        Ok(())
+    }
+
+    pub fn eval_single(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        ws: &mut IdolDenoiserWorkspace,
+        (latent_f32, camera_f32): (&[f32], &[f32]),
+        cond: (&[f32], &[f32]),
+        (t_val, qk_scale): (f32, f32),
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        s.memcpy_htod(latent_f32, &mut ws.latent_in_f32.slice_mut(0..8192 * 16))?;
+        s.memcpy_htod(camera_f32, &mut ws.camera_in_f32.slice_mut(0..5))?;
+        s.memcpy_htod(cond.0, &mut ws.cond_f1_in_f32.slice_mut(0..4101 * 1280))?;
+        s.memcpy_htod(cond.1, &mut ws.cond_f2_in_f32.slice_mut(0..4101 * 128))?;
+        self.forward_batch(s, blas, ws, 1, t_val, qk_scale)
+    }
+
+    pub fn sample_flow(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        ws: &mut IdolDenoiserWorkspace,
+        (init_latent, init_camera): (&[f32], &[f32]),
+        cond: (&[f32], &[f32]),
+        batch_cfg: bool,
+    ) -> Result<IdolFlowTrajectory> {
+        ensure!(
+            !batch_cfg || ws.cfg_batch == 2,
+            "batch_cfg=true requires ws.cfg_batch=2"
+        );
+        let steps = 50usize;
+        let rescale_t = 3.0f64;
+        let cfg_strength = 3.0f32;
+        let mut t_seq = Vec::with_capacity(steps + 1);
+        for i in 0..=steps {
+            let u = 1.0f64 - (i as f64) / (steps as f64);
+            let t = rescale_t * u / (1.0f64 + (rescale_t - 1.0f64) * u);
+            t_seq.push(t);
+        }
+        let mut lat = init_latent.to_vec();
+        let mut cam = init_camera.to_vec();
+        let zero_f1 = vec![0.0f32; 4101 * 1280];
+        let zero_f2 = vec![0.0f32; 4101 * 128];
+        if batch_cfg {
+            self.prepare_conditioning(s, ws, cond.0, cond.1)?;
+        }
+        let mut step0_lat = Vec::new();
+        let mut step0_cam = Vec::new();
+        let mut step9_lat = Vec::new();
+        let mut step9_cam = Vec::new();
+        let mut step24_lat = Vec::new();
+        let mut step24_cam = Vec::new();
+
+        for i in 0..steps {
+            let t_model = (1000.0f64 * t_seq[i]) as f32;
+            let dt = (t_seq[i] - t_seq[i + 1]) as f32;
+            let (vc_lat, vc_cam, vu_lat, vu_cam) = if batch_cfg {
+                let lat_len = 8192 * 16;
+                s.memcpy_htod(&lat, &mut ws.latent_in_f32.slice_mut(0..lat_len))?;
+                s.memcpy_htod(&lat, &mut ws.latent_in_f32.slice_mut(lat_len..2 * lat_len))?;
+                s.memcpy_htod(&cam, &mut ws.camera_in_f32.slice_mut(0..5))?;
+                s.memcpy_htod(&cam, &mut ws.camera_in_f32.slice_mut(5..10))?;
+                let (both_lat, both_cam) = self.forward_batch(s, blas, ws, 2, t_model, 8.0f32)?;
+                (
+                    both_lat[..lat_len].to_vec(),
+                    both_cam[..5].to_vec(),
+                    both_lat[lat_len..].to_vec(),
+                    both_cam[5..].to_vec(),
+                )
+            } else {
+                let (vcl, vcc) =
+                    self.eval_single(s, blas, ws, (&lat, &cam), cond, (t_model, 8.0f32))?;
+                let (vul, vuc) = self.eval_single(
+                    s,
+                    blas,
+                    ws,
+                    (&lat, &cam),
+                    (&zero_f1, &zero_f2),
+                    (t_model, 8.0f32),
+                )?;
+                (vcl, vcc, vul, vuc)
+            };
+            for ((x, vc), vu) in lat.iter_mut().zip(&vc_lat).zip(&vu_lat) {
+                let v = (1.0f32 + cfg_strength) * (*vc) - cfg_strength * (*vu);
+                *x -= v * dt;
+            }
+            for ((x, vc), vu) in cam.iter_mut().zip(&vc_cam).zip(&vu_cam) {
+                let v = (1.0f32 + cfg_strength) * (*vc) - cfg_strength * (*vu);
+                *x -= v * dt;
+            }
+            if i == 0 {
+                step0_lat.clone_from(&lat);
+                step0_cam.clone_from(&cam);
+            } else if i == 9 {
+                step9_lat.clone_from(&lat);
+                step9_cam.clone_from(&cam);
+            } else if i == 24 {
+                step24_lat.clone_from(&lat);
+                step24_cam.clone_from(&cam);
+            }
+        }
+        Ok(IdolFlowTrajectory {
+            step0_latent: step0_lat,
+            step0_camera: step0_cam,
+            step9_latent: step9_lat,
+            step9_camera: step9_cam,
+            step24_latent: step24_lat,
+            step24_camera: step24_cam,
+            step49_latent: lat,
+            step49_camera: cam,
+        })
+    }
+}
+
+pub struct IdolFlowTrajectory {
+    pub step0_latent: Vec<f32>,
+    pub step0_camera: Vec<f32>,
+    pub step9_latent: Vec<f32>,
+    pub step9_camera: Vec<f32>,
+    pub step24_latent: Vec<f32>,
+    pub step24_camera: Vec<f32>,
+    pub step49_latent: Vec<f32>,
+    pub step49_camera: Vec<f32>,
+}
+
+struct IdolCrossOnlyBlock {
+    to_q: BiasedWeight<half::f16>,
+    to_kv: BiasedWeight<half::f16>,
+    q_norm: CudaSlice<f32>,
+    k_norm: CudaSlice<f32>,
+    to_out: BiasedWeight<half::f16>,
+    mlp0: BiasedWeight<half::f16>,
+    mlp2: BiasedWeight<half::f16>,
+}
+
+impl IdolCrossOnlyBlock {
+    fn load(loader: &mut SafetensorsLoader<'_>, s: &Arc<CudaStream>, prefix: &str) -> Result<Self> {
+        Ok(Self {
+            to_q: BiasedWeight::<half::f16>::load_f16(
+                loader,
+                s,
+                &format!("{prefix}.cross_attn.to_q"),
+                [1024, 1024],
+            )?,
+            to_kv: BiasedWeight::<half::f16>::load_f16(
+                loader,
+                s,
+                &format!("{prefix}.cross_attn.to_kv"),
+                [2048, 16],
+            )?,
+            q_norm: loader.take_f32(
+                s,
+                &format!("{prefix}.cross_attn.q_rms_norm.gamma"),
+                &[16, 64],
+            )?,
+            k_norm: loader.take_f32(
+                s,
+                &format!("{prefix}.cross_attn.k_rms_norm.gamma"),
+                &[16, 64],
+            )?,
+            to_out: BiasedWeight::<half::f16>::load_f16(
+                loader,
+                s,
+                &format!("{prefix}.cross_attn.to_out"),
+                [1024, 1024],
+            )?,
+            mlp0: BiasedWeight::<half::f16>::load_f16(
+                loader,
+                s,
+                &format!("{prefix}.mlp.mlp.0"),
+                [4096, 1024],
+            )?,
+            mlp2: BiasedWeight::<half::f16>::load_f16(
+                loader,
+                s,
+                &format!("{prefix}.mlp.mlp.2"),
+                [1024, 4096],
+            )?,
+        })
+    }
+}
+
+pub struct IdolOctreeWorkspace {
+    cond_in_f32: CudaSlice<f32>,
+    context_f16: CudaSlice<half::f16>,
+    coords_f32: CudaSlice<f32>,
+    h_f32: CudaSlice<f32>,
+    pe_f32: CudaSlice<f32>,
+    l_in_f32: CudaSlice<f32>,
+    l_sin_f32: CudaSlice<f32>,
+    l_mlp0_f32: CudaSlice<f32>,
+    l_emb_f32: CudaSlice<f32>,
+    level_mod_f32: CudaSlice<f32>,
+    level_mod_f16: CudaSlice<half::f16>,
+    out_f16: CudaSlice<half::f16>,
+    norm_f32: CudaSlice<f32>,
+    norm_f16: CudaSlice<half::f16>,
+    q_f16: CudaSlice<half::f16>,
+    kv_f16: CudaSlice<half::f16>,
+    k_hm_f16: CudaSlice<half::f16>,
+    v_hm_f16: CudaSlice<half::f16>,
+    attn_out_f16: CudaSlice<half::f16>,
+    proj_out_f16: CudaSlice<half::f16>,
+    mlp_fc1_f16: CudaSlice<half::f16>,
+    mlp_fc2_f16: CudaSlice<half::f16>,
+    logits_f32: CudaSlice<f32>,
+    prefill_f16: Flash,
+}
+
+impl IdolOctreeWorkspace {
+    pub fn byte_size() -> usize {
+        let n_max = 8192usize;
+        let c = 1024usize;
+        let h = 16usize;
+        let d = 64usize;
+        let m = 4096usize;
+        (n_max * 16
+            + n_max * 3
+            + 2 * n_max * c
+            + 1
+            + 256
+            + 2 * c
+            + 6 * c
+            + n_max * c
+            + n_max * 8
+            + h * n_max)
+            * size_of::<f32>()
+            + (n_max * 16
+                + 6 * c
+                + 3 * n_max * c
+                + n_max * 2 * c
+                + 2 * h * n_max * d
+                + 2 * n_max * c
+                + n_max * m
+                + n_max * c)
+                * size_of::<half::f16>()
+    }
+}
+
+pub struct IdolOctreeDecoder {
+    pub args: IdolOctreeDecoderArgs,
+    pub weight_bytes: usize,
+    in_proj: BiasedWeight<f32>,
+    pcd_freqs: CudaSlice<f32>,
+    input_layer: BiasedWeight<f32>,
+    l_freqs: CudaSlice<f32>,
+    l_mlp0: BiasedWeight<f32>,
+    l_mlp2: BiasedWeight<f32>,
+    adaln_modulation: BiasedWeight<f32>,
+    blocks: Vec<IdolCrossOnlyBlock>,
+    out_proj: BiasedWeight<f32>,
+    kernels: IdolSharedKernels,
+}
+
+impl IdolOctreeDecoder {
+    pub fn load(
+        device: &Device,
+        args: IdolOctreeDecoderArgs,
+        safetensors_bytes: &[u8],
+    ) -> Result<(Self, IdolOctreeWorkspace)> {
+        let s = &device.stream;
+        let kernels = IdolSharedKernels::new(device)?;
+        let mut loader = SafetensorsLoader::new(safetensors_bytes)?;
+        let in_proj = BiasedWeight::<f32>::load_f32(&mut loader, s, "in_proj", [1024, 3])?;
+        let input_layer =
+            BiasedWeight::<f32>::load_f32(&mut loader, s, "input_layer", [1024, 1024])?;
+        let l_mlp0 =
+            BiasedWeight::<f32>::load_f32(&mut loader, s, "l_embedder.mlp.0", [1024, 256])?;
+        let l_mlp2 =
+            BiasedWeight::<f32>::load_f32(&mut loader, s, "l_embedder.mlp.2", [1024, 1024])?;
+        let adaln_modulation =
+            BiasedWeight::<f32>::load_f32(&mut loader, s, "adaLN_modulation.1", [6144, 1024])?;
+        let mut blocks = Vec::with_capacity(args.num_blocks);
+        for i in 0..args.num_blocks {
+            blocks.push(IdolCrossOnlyBlock::load(
+                &mut loader,
+                s,
+                &format!("blocks.{i}"),
+            )?);
+        }
+        let out_proj = BiasedWeight::<f32>::load_f32(&mut loader, s, "out_proj", [8, 1024])?;
+        ensure!(
+            loader.remaining.is_empty(),
+            "unconsumed octree decoder keys: {:?}",
+            loader.remaining
+        );
+        ensure!(
+            loader.loaded_tensors == 60
+                && loader.loaded_elements == 50_791_432
+                && loader.runtime_bytes == 118_943_776,
+            "unexpected octree decoder weight counts: tensors={} elems={} bytes={}",
+            loader.loaded_tensors,
+            loader.loaded_elements,
+            loader.runtime_bytes
+        );
+
+        let l_freqs_host: Vec<f32> = (0..128)
+            .map(|i| (-((1024.0f64.ln() as f32) * (i as f32) / 128.0f32)).exp())
+            .collect();
+        let l_freqs = s.clone_htod(&l_freqs_host)?;
+        let pcd_freqs_host: Vec<f32> = (0..170)
+            .map(|i| {
+                let log_val = (i as f32) * 10.0f32 / 169.0f32;
+                2.0f32.powf(log_val)
+            })
+            .collect();
+        let pcd_freqs = s.clone_htod(&pcd_freqs_host)?;
+
+        let ws_bytes = IdolOctreeWorkspace::byte_size();
+        let (free, _) = device.ctx.mem_get_info()?;
+        ensure!(
+            free >= ws_bytes,
+            "octree decoder workspace ({ws_bytes} B) exceeds free device memory ({free} B)"
+        );
+        let n_max = 8192usize;
+        let c = 1024usize;
+        let h = 16usize;
+        let d = 64usize;
+        let m = 4096usize;
+        let ws = IdolOctreeWorkspace {
+            cond_in_f32: s.alloc_zeros(n_max * 16)?,
+            context_f16: s.alloc_zeros(n_max * 16)?,
+            coords_f32: s.alloc_zeros(n_max * 3)?,
+            h_f32: s.alloc_zeros(n_max * c)?,
+            pe_f32: s.alloc_zeros(n_max * c)?,
+            l_in_f32: s.alloc_zeros(1)?,
+            l_sin_f32: s.alloc_zeros(256)?,
+            l_mlp0_f32: s.alloc_zeros(c)?,
+            l_emb_f32: s.alloc_zeros(c)?,
+            level_mod_f32: s.alloc_zeros(6 * c)?,
+            level_mod_f16: s.alloc_zeros(6 * c)?,
+            out_f16: s.alloc_zeros(n_max * c)?,
+            norm_f32: s.alloc_zeros(n_max * c)?,
+            norm_f16: s.alloc_zeros(n_max * c)?,
+            q_f16: s.alloc_zeros(n_max * c)?,
+            kv_f16: s.alloc_zeros(n_max * 2 * c)?,
+            k_hm_f16: s.alloc_zeros(h * n_max * d)?,
+            v_hm_f16: s.alloc_zeros(h * n_max * d)?,
+            attn_out_f16: s.alloc_zeros(n_max * c)?,
+            proj_out_f16: s.alloc_zeros(n_max * c)?,
+            mlp_fc1_f16: s.alloc_zeros(n_max * m)?,
+            mlp_fc2_f16: s.alloc_zeros(n_max * c)?,
+            logits_f32: s.alloc_zeros(n_max * 8)?,
+            prefill_f16: Flash::new_f16_d64(
+                s.clone(),
+                n_max,
+                h,
+                h,
+                Score::from_tokens((d as f32).sqrt().recip(), None)?,
+            )?,
+        };
+        println!(
+            "I1_LOAD component=decoder tensors={} elems={} f16_tensors={} f16_bytes={} f32_tensors={} f32_bytes={} weight_bytes={} ws_bytes={}",
+            loader.loaded_tensors,
+            loader.loaded_elements,
+            loader.f16_tensors,
+            loader.f16_bytes,
+            loader.f32_tensors,
+            loader.f32_bytes,
+            loader.runtime_bytes,
+            ws_bytes
+        );
+        Ok((
+            Self {
+                args,
+                weight_bytes: loader.runtime_bytes,
+                in_proj,
+                pcd_freqs,
+                input_layer,
+                l_freqs,
+                l_mlp0,
+                l_mlp2,
+                adaln_modulation,
+                blocks,
+                out_proj,
+                kernels,
+            },
+            ws,
+        ))
+    }
+
+    pub fn forward_level(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        ws: &mut IdolOctreeWorkspace,
+        coords_norm_f32: &[f32],
+        cond_latent_f32: &[f32],
+        (res_level, two_pi): (f32, bool),
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let rows = u32::try_from(coords_norm_f32.len() / 3)?;
+        ensure!(
+            (1..=8192).contains(&rows) && coords_norm_f32.len() == (rows as usize) * 3,
+            "invalid octree parent coordinate count {}",
+            coords_norm_f32.len()
+        );
+        let c = 1024u32;
+        let h = 16u32;
+        let d = 64u32;
+        let m_dim = 4096u32;
+        let n_ctx = 8192u32;
+
+        s.memcpy_htod(
+            coords_norm_f32,
+            &mut ws.coords_f32.slice_mut(0..coords_norm_f32.len()),
+        )?;
+        s.memcpy_htod(cond_latent_f32, &mut ws.cond_in_f32)?;
+        let ctx_elems = n_ctx * 16;
+        unsafe {
+            s.launch_builder(&self.kernels.downcast_f32_to_f16)
+                .arg(&ws.cond_in_f32)
+                .arg(&ws.context_f16)
+                .arg(&ctx_elems)
+                .launch(grid((ctx_elems as usize).div_ceil(256), 256))?;
+        }
+
+        self.in_proj.run(
+            s,
+            blas,
+            stage_view(&ws.coords_f32, s, [rows, 3])?,
+            &mut TensorMut(stage_view(&ws.pe_f32, s, [rows, c])?),
+        )?;
+        let pe_total = u64::from(rows) * u64::from(c);
+        unsafe {
+            s.launch_builder(&self.kernels.pcd_pos_f32)
+                .arg(&ws.coords_f32)
+                .arg(&self.pcd_freqs)
+                .arg(&ws.pe_f32)
+                .arg(&rows)
+                .arg(&c)
+                .arg(&170u32)
+                .arg(&2i32)
+                .arg(&1i32)
+                .launch(grid(pe_total.div_ceil(256).min(65535) as usize, 256))?;
+        }
+        self.input_layer.run(
+            s,
+            blas,
+            stage_view(&ws.pe_f32, s, [rows, c])?,
+            &mut TensorMut(stage_view(&ws.h_f32, s, [rows, c])?),
+        )?;
+        let h_elems = rows * c;
+        unsafe {
+            s.launch_builder(&self.kernels.downcast_f32_to_f16)
+                .arg(&ws.h_f32)
+                .arg(&ws.out_f16)
+                .arg(&h_elems)
+                .launch(grid((h_elems as usize).div_ceil(256).min(65535), 256))?;
+        }
+
+        s.memcpy_htod(&[res_level], &mut ws.l_in_f32)?;
+        let two_pi_i32 = i32::from(two_pi);
+        unsafe {
+            s.launch_builder(&self.kernels.sinusoidal_f32)
+                .arg(&ws.l_in_f32)
+                .arg(&self.l_freqs)
+                .arg(&ws.l_sin_f32)
+                .arg(&1u32)
+                .arg(&128u32)
+                .arg(&two_pi_i32)
+                .launch(grid(1, 256))?;
+        }
+        self.l_mlp0.run(
+            s,
+            blas,
+            stage_view(&ws.l_sin_f32, s, [1, 256])?,
+            &mut TensorMut(stage_view(&ws.l_mlp0_f32, s, [1, c])?),
+        )?;
+        unsafe {
+            s.launch_builder(&self.kernels.silu_row_f32)
+                .arg(&ws.l_mlp0_f32)
+                .arg(&0u64)
+                .arg(&ws.l_mlp0_f32)
+                .arg(&c)
+                .arg(&c)
+                .launch(grid(4, 256))?;
+        }
+        self.l_mlp2.run(
+            s,
+            blas,
+            stage_view(&ws.l_mlp0_f32, s, [1, c])?,
+            &mut TensorMut(stage_view(&ws.l_emb_f32, s, [1, c])?),
+        )?;
+        unsafe {
+            s.launch_builder(&self.kernels.silu_row_f32)
+                .arg(&ws.l_emb_f32)
+                .arg(&0u64)
+                .arg(&ws.l_emb_f32)
+                .arg(&c)
+                .arg(&c)
+                .launch(grid(4, 256))?;
+        }
+        self.adaln_modulation.run(
+            s,
+            blas,
+            stage_view(&ws.l_emb_f32, s, [1, c])?,
+            &mut TensorMut(stage_view(&ws.level_mod_f32, s, [1, 6144])?),
+        )?;
+        let mod_elems = 6144u32;
+        unsafe {
+            s.launch_builder(&self.kernels.downcast_f32_to_f16)
+                .arg(&ws.level_mod_f32)
+                .arg(&ws.level_mod_f16)
+                .arg(&mod_elems)
+                .launch(grid(24, 256))?;
+        }
+
+        let out_ptr = ws.out_f16.device_ptr(s).0;
+        let norm_f16_ptr = ws.norm_f16.device_ptr(s).0;
+        let mod_ptr = ws.level_mod_f16.device_ptr(s).0;
+        for blk in &self.blocks {
+            self.kernels
+                .launch_ln_f16(s, out_ptr, None, norm_f16_ptr, rows, 1e-6f32)?;
+            let shift_msa_ptr = mod_ptr;
+            let scale_msa_ptr = mod_ptr + 1024 * 2;
+            let gate_msa_ptr = mod_ptr + 2 * 1024 * 2;
+            let shift_mlp_ptr = mod_ptr + 3 * 1024 * 2;
+            let scale_mlp_ptr = mod_ptr + 4 * 1024 * 2;
+            let gate_mlp_ptr = mod_ptr + 5 * 1024 * 2;
+            unsafe {
+                s.launch_builder(&self.kernels.row_modulate_f16)
+                    .arg(&norm_f16_ptr)
+                    .arg(&shift_msa_ptr)
+                    .arg(&scale_msa_ptr)
+                    .arg(&0u64)
+                    .arg(&norm_f16_ptr)
+                    .arg(&rows)
+                    .arg(&c)
+                    .arg(&6144u64)
+                    .arg(&1u32)
+                    .launch(row_grid(rows, c))?;
+            }
+            blk.to_q.run_f16(
+                s,
+                blas,
+                &self.kernels.bias_f16,
+                stage_view(&ws.norm_f16, s, [rows, c])?,
+                &mut TensorMut(stage_view(&ws.q_f16, s, [rows, c])?),
+            )?;
+            blk.to_kv.run_f16(
+                s,
+                blas,
+                &self.kernels.bias_f16,
+                stage_view(&ws.context_f16, s, [n_ctx, 16])?,
+                &mut TensorMut(stage_view(&ws.kv_f16, s, [n_ctx, 2 * c])?),
+            )?;
+            let kv_total = u64::from(n_ctx) * u64::from(c);
+            unsafe {
+                s.launch_builder(&self.kernels.qkv_unpack_hm_f16)
+                    .arg(&ws.kv_f16)
+                    .arg(&0u64)
+                    .arg(&ws.attn_out_f16)
+                    .arg(&ws.v_hm_f16)
+                    .arg(&1u32)
+                    .arg(&n_ctx)
+                    .arg(&h)
+                    .arg(&d)
+                    .arg(&2i32)
+                    .launch(grid(kv_total.div_ceil(256).min(65535) as usize, 256))?;
+                s.launch_builder(&self.kernels.l2_norm_scale_f16)
+                    .arg(&ws.q_f16)
+                    .arg(&blk.q_norm)
+                    .arg(&ws.q_f16)
+                    .arg(&rows)
+                    .arg(&h)
+                    .arg(&d)
+                    .arg(&8.0f32)
+                    .arg(&1e-12f32)
+                    .arg(&0u32)
+                    .launch(grid((rows * h) as usize, 64))?;
+                s.launch_builder(&self.kernels.l2_norm_scale_f16)
+                    .arg(&ws.attn_out_f16)
+                    .arg(&blk.k_norm)
+                    .arg(&ws.k_hm_f16)
+                    .arg(&n_ctx)
+                    .arg(&h)
+                    .arg(&d)
+                    .arg(&8.0f32)
+                    .arg(&1e-12f32)
+                    .arg(&n_ctx)
+                    .launch(grid((n_ctx * h) as usize, 64))?;
+            }
+            let q_view = ws.q_f16.slice(0..(rows as usize) * (c as usize));
+            let k_view = ws.k_hm_f16.slice(0..(n_ctx as usize) * (c as usize));
+            let v_view = ws.v_hm_f16.slice(0..(n_ctx as usize) * (c as usize));
+            let mut o_view = ws.attn_out_f16.slice_mut(0..(rows as usize) * (c as usize));
+            ws.prefill_f16.run_f16_d64(
+                &q_view,
+                c as usize,
+                &k_view,
+                &v_view,
+                &mut o_view,
+                (rows as usize, n_ctx as usize, n_ctx as usize),
+            )?;
+            blk.to_out.run_f16(
+                s,
+                blas,
+                &self.kernels.bias_f16,
+                stage_view(&ws.attn_out_f16, s, [rows, c])?,
+                &mut TensorMut(stage_view(&ws.proj_out_f16, s, [rows, c])?),
+            )?;
+            unsafe {
+                s.launch_builder(&self.kernels.row_gated_add_f16)
+                    .arg(&out_ptr)
+                    .arg(&ws.proj_out_f16)
+                    .arg(&gate_msa_ptr)
+                    .arg(&0u64)
+                    .arg(&rows)
+                    .arg(&c)
+                    .arg(&6144u64)
+                    .arg(&1u32)
+                    .launch(row_grid(rows, c))?;
+            }
+            self.kernels
+                .launch_ln_f16(s, out_ptr, None, norm_f16_ptr, rows, 1e-6f32)?;
+            unsafe {
+                s.launch_builder(&self.kernels.row_modulate_f16)
+                    .arg(&norm_f16_ptr)
+                    .arg(&shift_mlp_ptr)
+                    .arg(&scale_mlp_ptr)
+                    .arg(&0u64)
+                    .arg(&norm_f16_ptr)
+                    .arg(&rows)
+                    .arg(&c)
+                    .arg(&6144u64)
+                    .arg(&1u32)
+                    .launch(row_grid(rows, c))?;
+            }
+            blk.mlp0.run_f16(
+                s,
+                blas,
+                &self.kernels.bias_f16,
+                stage_view(&ws.norm_f16, s, [rows, c])?,
+                &mut TensorMut(stage_view(&ws.mlp_fc1_f16, s, [rows, m_dim])?),
+            )?;
+            let mlp_elems = u64::from(rows) * u64::from(m_dim);
+            unsafe {
+                s.launch_builder(&self.kernels.gelu_f16)
+                    .arg(&ws.mlp_fc1_f16)
+                    .arg(&ws.mlp_fc1_f16)
+                    .arg(&u32::try_from(mlp_elems)?)
+                    .arg(&1u32)
+                    .arg(&1u32)
+                    .arg(&1u64)
+                    .arg(&1u64)
+                    .arg(&1u64)
+                    .arg(&1u64)
+                    .arg(&1u64)
+                    .arg(&1u64)
+                    .arg(&1i32)
+                    .launch(grid(mlp_elems.div_ceil(256).min(65535) as usize, 256))?;
+            }
+            blk.mlp2.run_f16(
+                s,
+                blas,
+                &self.kernels.bias_f16,
+                stage_view(&ws.mlp_fc1_f16, s, [rows, m_dim])?,
+                &mut TensorMut(stage_view(&ws.mlp_fc2_f16, s, [rows, c])?),
+            )?;
+            unsafe {
+                s.launch_builder(&self.kernels.row_gated_add_f16)
+                    .arg(&out_ptr)
+                    .arg(&ws.mlp_fc2_f16)
+                    .arg(&gate_mlp_ptr)
+                    .arg(&0u64)
+                    .arg(&rows)
+                    .arg(&c)
+                    .arg(&6144u64)
+                    .arg(&1u32)
+                    .launch(row_grid(rows, c))?;
+            }
+        }
+
+        let norm_f32_ptr = ws.norm_f32.device_ptr(s).0;
+        self.kernels
+            .launch_ln_f16_to_f32(s, out_ptr, None, norm_f32_ptr, rows, 1e-5f32)?;
+        self.out_proj.run(
+            s,
+            blas,
+            stage_view(&ws.norm_f32, s, [rows, c])?,
+            &mut TensorMut(stage_view(&ws.logits_f32, s, [rows, 8])?),
+        )?;
+        let logits = s.clone_dtoh(&ws.logits_f32.slice(0..(rows as usize) * 8))?;
+        let mut probs = vec![0.0f32; logits.len()];
+        for (l_row, p_row) in logits
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .zip(probs.as_chunks_mut::<8>().0)
+        {
+            let max_l = l_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for (p, &lv) in p_row.iter_mut().zip(l_row) {
+                *p = (lv - max_l).exp();
+                sum += *p;
+            }
+            for p in p_row.iter_mut() {
+                *p /= sum;
+            }
+        }
+        Ok((logits, probs))
+    }
+
+    pub fn systematic_sample_level(
+        probs_flat: &[f32],
+        counts: &[i64],
+        u0_by_n: &std::collections::BTreeMap<i64, Vec<f32>>,
+    ) -> Result<Vec<i64>> {
+        let rows = counts.len();
+        ensure!(probs_flat.len() == rows * 8, "probs/counts length mismatch");
+        let mut cdf = vec![[0.0f32; 8]; rows];
+        for r in 0..rows {
+            let row = &probs_flat[r * 8..(r + 1) * 8];
+            let mut clamped = [0.0f32; 8];
+            let mut sum = 0.0f32;
+            for (c, &p) in clamped.iter_mut().zip(row) {
+                *c = p.max(0.0f32);
+                sum += *c;
+            }
+            if sum == 0.0f32 {
+                clamped = [0.125f32; 8];
+            } else {
+                let denom = sum.max(1.0f32);
+                for c in &mut clamped {
+                    *c /= denom;
+                }
+            }
+            let mut acc = 0.0f32;
+            for k in 0..8 {
+                acc += clamped[k];
+                cdf[r][k] = acc.min(1.0f32 - 1e-12f32);
+            }
+        }
+        let mut unique_n = Vec::new();
+        for &c in counts {
+            if !unique_n.contains(&c) {
+                unique_n.push(c);
+            }
+        }
+        let mut out = vec![0i64; rows * 8];
+        for n in unique_n {
+            if n == 0 {
+                continue;
+            }
+            let group_rows: Vec<usize> = counts
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, &c)| (c == n).then_some(idx))
+                .collect();
+            let u0_vec = u0_by_n
+                .get(&n)
+                .with_context(|| format!("missing u0_raw for n={n}"))?;
+            ensure!(
+                u0_vec.len() == group_rows.len(),
+                "u0_raw length {} != group_rows {}",
+                u0_vec.len(),
+                group_rows.len()
+            );
+            let nf = n as f32;
+            for (&r_idx, &u0_raw) in group_rows.iter().zip(u0_vec) {
+                let u0 = u0_raw / nf;
+                let row_cdf = &cdf[r_idx];
+                let mut row_bins = [0.0f32; 8];
+                for j in 0..n {
+                    let grid_val = (j as f32) / nf;
+                    let u = (u0 + grid_val).min(1.0f32 - 1e-12f32);
+                    let mut bin = 7usize;
+                    for (k, &c_val) in row_cdf.iter().enumerate() {
+                        if u <= c_val {
+                            bin = k;
+                            break;
+                        }
+                    }
+                    row_bins[bin] += 1.0f32;
+                }
+                for k in 0..8 {
+                    out[r_idx * 8 + k] = row_bins[k] as i64;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn sample_octree(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        ws: &mut IdolOctreeWorkspace,
+        cond_latent_f32: &[f32],
+        (num_points, max_level, seed): (i64, u32, u64),
+    ) -> Result<Vec<f32>> {
+        let child_offsets: [[i64; 3]; 8] = [
+            [0, 0, 0],
+            [1, 0, 0],
+            [0, 1, 0],
+            [1, 1, 0],
+            [0, 0, 1],
+            [1, 0, 1],
+            [0, 1, 1],
+            [1, 1, 1],
+        ];
+        let mut prev_coords: Vec<[i64; 3]> = vec![[0, 0, 0]];
+        let mut prev_counts: Vec<i64> = vec![num_points];
+        let mut philox_offset = 0u64;
+
+        for l in 1..=max_level {
+            let res_p = (1u32 << (l - 1)) as f32;
+            let mut coords_norm = Vec::with_capacity(prev_coords.len() * 3);
+            for &[cx, cy, cz] in &prev_coords {
+                coords_norm.push(((cx as f32) + 0.5f32) / res_p);
+                coords_norm.push(((cy as f32) + 0.5f32) / res_p);
+                coords_norm.push(((cz as f32) + 0.5f32) / res_p);
+            }
+            let res_f32 = (1u32 << l) as f32;
+            let (_logits, probs) =
+                self.forward_level(s, blas, ws, &coords_norm, cond_latent_f32, (res_f32, true))?;
+            let mut unique_n = Vec::new();
+            for &c in &prev_counts {
+                if !unique_n.contains(&c) {
+                    unique_n.push(c);
+                }
+            }
+            let mut u0_by_n = std::collections::BTreeMap::new();
+            for &n in &unique_n {
+                if n == 0 {
+                    continue;
+                }
+                let r_cnt = prev_counts.iter().filter(|&&c| c == n).count();
+                let u_cnt = r_cnt as u32;
+                unsafe {
+                    s.launch_builder(&self.kernels.philox_uniform_f32)
+                        .arg(&seed)
+                        .arg(&philox_offset)
+                        .arg(&ws.logits_f32)
+                        .arg(&i64::from(u_cnt))
+                        .launch(grid(r_cnt.div_ceil(1024).max(1), 256))?;
+                }
+                philox_offset += u64::from(u_cnt.div_ceil(4));
+                u0_by_n.insert(n, s.clone_dtoh(&ws.logits_f32.slice(0..r_cnt))?);
+            }
+            let sampled = Self::systematic_sample_level(&probs, &prev_counts, &u0_by_n)?;
+            let mut next_coords = Vec::new();
+            let mut next_counts = Vec::new();
+            for (p_idx, &p_coord) in prev_coords.iter().enumerate() {
+                for (c_idx, &off) in child_offsets.iter().enumerate() {
+                    let cnt = sampled[p_idx * 8 + c_idx];
+                    if cnt > 0 {
+                        next_coords.push([
+                            p_coord[0] * 2 + off[0],
+                            p_coord[1] * 2 + off[1],
+                            p_coord[2] * 2 + off[2],
+                        ]);
+                        next_counts.push(cnt);
+                    }
+                }
+            }
+            prev_coords = next_coords;
+            prev_counts = next_counts;
+        }
+
+        let total_pts = usize::try_from(num_points)?;
+        let jitter_cnt = u32::try_from(total_pts * 3)?;
+        unsafe {
+            s.launch_builder(&self.kernels.philox_uniform_f32)
+                .arg(&seed)
+                .arg(&philox_offset)
+                .arg(&ws.coords_f32)
+                .arg(&i64::from(jitter_cnt))
+                .launch(grid((jitter_cnt as usize).div_ceil(1024).max(1), 256))?;
+        }
+        let jitter = s.clone_dtoh(&ws.coords_f32.slice(0..total_pts * 3))?;
+        let scale = (1u32 << max_level) as f32;
+        let mut anchors = Vec::with_capacity(total_pts * 3);
+        let mut pt_idx = 0usize;
+        for (&coord, &cnt) in prev_coords.iter().zip(&prev_counts) {
+            for _ in 0..cnt {
+                anchors.push(((coord[0] as f32) + jitter[pt_idx * 3]) / scale);
+                anchors.push(((coord[1] as f32) + jitter[pt_idx * 3 + 1]) / scale);
+                anchors.push(((coord[2] as f32) + jitter[pt_idx * 3 + 2]) / scale);
+                pt_idx += 1;
+            }
+        }
+        ensure!(pt_idx == total_pts, "anchor point count mismatch");
+        Ok(anchors)
+    }
+}
+
+struct IdolCrossBlock {
+    self_qkv: BiasedWeight<half::f16>,
+    self_q_norm: CudaSlice<f32>,
+    self_k_norm: CudaSlice<f32>,
+    self_out: BiasedWeight<half::f16>,
+    norm2: AffineWeights<f32>,
+    cross_q: BiasedWeight<half::f16>,
+    cross_kv: BiasedWeight<half::f16>,
+    cross_q_norm: CudaSlice<f32>,
+    cross_k_norm: CudaSlice<f32>,
+    cross_out: BiasedWeight<half::f16>,
+    mlp0: BiasedWeight<half::f16>,
+    mlp2: BiasedWeight<half::f16>,
+}
+
+impl IdolCrossBlock {
+    fn load(loader: &mut SafetensorsLoader<'_>, s: &Arc<CudaStream>, prefix: &str) -> Result<Self> {
+        Ok(Self {
+            self_qkv: BiasedWeight::<half::f16>::load_f16(
+                loader,
+                s,
+                &format!("{prefix}.self_attn.to_qkv"),
+                [3072, 1024],
+            )?,
+            self_q_norm: loader.take_f32(
+                s,
+                &format!("{prefix}.self_attn.q_rms_norm.gamma"),
+                &[16, 64],
+            )?,
+            self_k_norm: loader.take_f32(
+                s,
+                &format!("{prefix}.self_attn.k_rms_norm.gamma"),
+                &[16, 64],
+            )?,
+            self_out: BiasedWeight::<half::f16>::load_f16(
+                loader,
+                s,
+                &format!("{prefix}.self_attn.to_out"),
+                [1024, 1024],
+            )?,
+            norm2: AffineWeights::<f32>::load_f32(loader, s, &format!("{prefix}.norm2"), 1024)?,
+            cross_q: BiasedWeight::<half::f16>::load_f16(
+                loader,
+                s,
+                &format!("{prefix}.cross_attn.to_q"),
+                [1024, 1024],
+            )?,
+            cross_kv: BiasedWeight::<half::f16>::load_f16(
+                loader,
+                s,
+                &format!("{prefix}.cross_attn.to_kv"),
+                [2048, 16],
+            )?,
+            cross_q_norm: loader.take_f32(
+                s,
+                &format!("{prefix}.cross_attn.q_rms_norm.gamma"),
+                &[16, 64],
+            )?,
+            cross_k_norm: loader.take_f32(
+                s,
+                &format!("{prefix}.cross_attn.k_rms_norm.gamma"),
+                &[16, 64],
+            )?,
+            cross_out: BiasedWeight::<half::f16>::load_f16(
+                loader,
+                s,
+                &format!("{prefix}.cross_attn.to_out"),
+                [1024, 1024],
+            )?,
+            mlp0: BiasedWeight::<half::f16>::load_f16(
+                loader,
+                s,
+                &format!("{prefix}.mlp.mlp.0"),
+                [4096, 1024],
+            )?,
+            mlp2: BiasedWeight::<half::f16>::load_f16(
+                loader,
+                s,
+                &format!("{prefix}.mlp.mlp.2"),
+                [1024, 4096],
+            )?,
+        })
+    }
+}
+
+pub struct IdolGaussianWorkspace {
+    cond_in_f32: CudaSlice<f32>,
+    context_f16: CudaSlice<half::f16>,
+    points_f32: CudaSlice<f32>,
+    h_f32: CudaSlice<f32>,
+    pe_f32: CudaSlice<f32>,
+    out_f16: CudaSlice<half::f16>,
+    norm_f32: CudaSlice<f32>,
+    norm_f16: CudaSlice<half::f16>,
+    qkv_self_f16: CudaSlice<half::f16>,
+    q_f16: CudaSlice<half::f16>,
+    kv_cross_f16: CudaSlice<half::f16>,
+    k_hm_f16: CudaSlice<half::f16>,
+    v_hm_f16: CudaSlice<half::f16>,
+    attn_out_f16: CudaSlice<half::f16>,
+    proj_out_f16: CudaSlice<half::f16>,
+    mlp_fc1_f16: CudaSlice<half::f16>,
+    mlp_fc2_f16: CudaSlice<half::f16>,
+    gs_features_f32: CudaSlice<f32>,
+    prefill_f16: Flash,
+}
+
+impl IdolGaussianWorkspace {
+    pub fn byte_size() -> usize {
+        let n = 8192usize;
+        let c = 1024usize;
+        let h = 16usize;
+        let d = 64usize;
+        let m = 4096usize;
+        (n * 16 + n * 3 + 3 * n * c + n * 480 + h * n) * size_of::<f32>()
+            + (n * 16
+                + 2 * n * c
+                + n * 3 * c
+                + n * c
+                + n * 2 * c
+                + 2 * h * n * d
+                + 2 * n * c
+                + n * m
+                + n * c)
+                * size_of::<half::f16>()
+    }
+}
+
+pub struct IdolGaussianSplat {
+    pub xyz: Vec<f32>,
+    pub features_dc: Vec<f32>,
+    pub scaling: Vec<f32>,
+    pub rotation: Vec<f32>,
+    pub opacity: Vec<f32>,
+    pub ply_mat: Vec<f32>,
+}
+
+impl IdolGaussianSplat {
+    pub fn save_ply(&self, path: &std::path::Path) -> Result<()> {
+        let n_verts = self.xyz.len() / 3;
+        ensure!(
+            self.ply_mat.len() == n_verts * 17,
+            "unexpected ply_mat length {}",
+            self.ply_mat.len()
+        );
+        let header = format!(
+            "ply\nformat binary_little_endian 1.0\nelement vertex {n_verts}\nproperty float x\nproperty float y\nproperty float z\nproperty float nx\nproperty float ny\nproperty float nz\nproperty float f_dc_0\nproperty float f_dc_1\nproperty float f_dc_2\nproperty float opacity\nproperty float scale_0\nproperty float scale_1\nproperty float scale_2\nproperty float rot_0\nproperty float rot_1\nproperty float rot_2\nproperty float rot_3\nend_header\n"
+        );
+        let mut bytes = Vec::with_capacity(header.len() + self.ply_mat.len() * 4);
+        bytes.extend_from_slice(header.as_bytes());
+        for &val in &self.ply_mat {
+            bytes.extend_from_slice(&val.to_le_bytes());
+        }
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
+}
+
+pub struct IdolGaussianDecoder {
+    pub args: IdolGaussianDecoderArgs,
+    pub weight_bytes: usize,
+    in_proj: BiasedWeight<f32>,
+    pcd_freqs: CudaSlice<f32>,
+    input_layer: BiasedWeight<f32>,
+    blocks: Vec<IdolCrossBlock>,
+    out_proj: BiasedWeight<f32>,
+    pub points_offset_perturbation: Vec<f32>,
+    pub base_offset_scale: f32,
+    kernels: IdolSharedKernels,
+}
+
+impl IdolGaussianDecoder {
+    pub fn load(
+        device: &Device,
+        args: IdolGaussianDecoderArgs,
+        safetensors_bytes: &[u8],
+    ) -> Result<(Self, IdolGaussianWorkspace)> {
+        let s = &device.stream;
+        let kernels = IdolSharedKernels::new(device)?;
+        let mut loader = SafetensorsLoader::new(safetensors_bytes)?;
+        let in_proj = BiasedWeight::<f32>::load_f32(&mut loader, s, "in_proj", [1024, 3])?;
+        let input_layer =
+            BiasedWeight::<f32>::load_f32(&mut loader, s, "input_layer", [1024, 1024])?;
+        let mut blocks = Vec::with_capacity(args.num_blocks);
+        for i in 0..args.num_blocks {
+            blocks.push(IdolCrossBlock::load(
+                &mut loader,
+                s,
+                &format!("blocks.{i}"),
+            )?);
+        }
+        let out_proj = BiasedWeight::<f32>::load_f32(&mut loader, s, "out_proj", [480, 1024])?;
+        let points_offset_perturbation =
+            loader.take_f32_host("points_offset_perturbation", &[32, 3])?;
+        let base_offset_scale = loader.take_f32_host("base_offset_scale", &[])?[0];
+        ensure!(
+            loader.remaining.is_empty(),
+            "unconsumed gaussian decoder keys: {:?}",
+            loader.remaining
+        );
+        ensure!(
+            loader.loaded_tensors == 328
+                && loader.loaded_elements == 237_262_401
+                && loader.runtime_bytes == 477_812_996,
+            "unexpected gaussian decoder weight counts: tensors={} elems={} bytes={}",
+            loader.loaded_tensors,
+            loader.loaded_elements,
+            loader.runtime_bytes
+        );
+
+        let pcd_freqs_host: Vec<f32> = (0..170)
+            .map(|i| {
+                let log_val = (i as f32) * 10.0f32 / 169.0f32;
+                2.0f32.powf(log_val)
+            })
+            .collect();
+        let pcd_freqs = s.clone_htod(&pcd_freqs_host)?;
+
+        let ws_bytes = IdolGaussianWorkspace::byte_size();
+        let (free, _) = device.ctx.mem_get_info()?;
+        ensure!(
+            free >= ws_bytes,
+            "gaussian decoder workspace ({ws_bytes} B) exceeds free device memory ({free} B)"
+        );
+        let n = 8192usize;
+        let c = 1024usize;
+        let h = 16usize;
+        let d = 64usize;
+        let m = 4096usize;
+        let ws = IdolGaussianWorkspace {
+            cond_in_f32: s.alloc_zeros(n * 16)?,
+            context_f16: s.alloc_zeros(n * 16)?,
+            points_f32: s.alloc_zeros(n * 3)?,
+            h_f32: s.alloc_zeros(n * c)?,
+            pe_f32: s.alloc_zeros(n * c)?,
+            out_f16: s.alloc_zeros(n * c)?,
+            norm_f32: s.alloc_zeros(n * c)?,
+            norm_f16: s.alloc_zeros(n * c)?,
+            qkv_self_f16: s.alloc_zeros(n * 3 * c)?,
+            q_f16: s.alloc_zeros(n * c)?,
+            kv_cross_f16: s.alloc_zeros(n * 2 * c)?,
+            k_hm_f16: s.alloc_zeros(h * n * d)?,
+            v_hm_f16: s.alloc_zeros(h * n * d)?,
+            attn_out_f16: s.alloc_zeros(n * c)?,
+            proj_out_f16: s.alloc_zeros(n * c)?,
+            mlp_fc1_f16: s.alloc_zeros(n * m)?,
+            mlp_fc2_f16: s.alloc_zeros(n * c)?,
+            gs_features_f32: s.alloc_zeros(n * 480)?,
+            prefill_f16: Flash::new_f16_d64(
+                s.clone(),
+                n,
+                h,
+                h,
+                Score::from_tokens((d as f32).sqrt().recip(), None)?,
+            )?,
+        };
+        println!(
+            "I1_LOAD component=decoder_gs tensors={} elems={} f16_tensors={} f16_bytes={} f32_tensors={} f32_bytes={} weight_bytes={} ws_bytes={}",
+            loader.loaded_tensors,
+            loader.loaded_elements,
+            loader.f16_tensors,
+            loader.f16_bytes,
+            loader.f32_tensors,
+            loader.f32_bytes,
+            loader.runtime_bytes,
+            ws_bytes
+        );
+        Ok((
+            Self {
+                args,
+                weight_bytes: loader.runtime_bytes,
+                in_proj,
+                pcd_freqs,
+                input_layer,
+                blocks,
+                out_proj,
+                points_offset_perturbation,
+                base_offset_scale,
+                kernels,
+            },
+            ws,
+        ))
+    }
+
+    pub fn forward(
+        &self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        ws: &mut IdolGaussianWorkspace,
+        points_f32: &[f32],
+        cond_latent_f32: &[f32],
+    ) -> Result<Vec<f32>> {
+        let rows = 8192u32;
+        let c = 1024u32;
+        let h = 16u32;
+        let d = 64u32;
+        let m_dim = 4096u32;
+        ensure!(
+            points_f32.len() == (rows as usize) * 3
+                && cond_latent_f32.len() == (rows as usize) * 16,
+            "invalid GaussianFixedlenDecoder input lengths"
+        );
+        s.memcpy_htod(points_f32, &mut ws.points_f32)?;
+        s.memcpy_htod(cond_latent_f32, &mut ws.cond_in_f32)?;
+        let ctx_elems = rows * 16;
+        unsafe {
+            s.launch_builder(&self.kernels.downcast_f32_to_f16)
+                .arg(&ws.cond_in_f32)
+                .arg(&ws.context_f16)
+                .arg(&ctx_elems)
+                .launch(grid((ctx_elems as usize).div_ceil(256), 256))?;
+        }
+        self.in_proj.run(
+            s,
+            blas,
+            stage_view(&ws.points_f32, s, [rows, 3])?,
+            &mut TensorMut(stage_view(&ws.pe_f32, s, [rows, c])?),
+        )?;
+        let pe_total = u64::from(rows) * u64::from(c);
+        unsafe {
+            s.launch_builder(&self.kernels.pcd_pos_f32)
+                .arg(&ws.points_f32)
+                .arg(&self.pcd_freqs)
+                .arg(&ws.pe_f32)
+                .arg(&rows)
+                .arg(&c)
+                .arg(&170u32)
+                .arg(&2i32)
+                .arg(&1i32)
+                .launch(grid(pe_total.div_ceil(256).min(65535) as usize, 256))?;
+        }
+        self.input_layer.run(
+            s,
+            blas,
+            stage_view(&ws.pe_f32, s, [rows, c])?,
+            &mut TensorMut(stage_view(&ws.h_f32, s, [rows, c])?),
+        )?;
+        let h_elems = rows * c;
+        let h_elems_i32 = i32::try_from(h_elems)?;
+        unsafe {
+            s.launch_builder(&self.kernels.downcast_f32_to_f16)
+                .arg(&ws.h_f32)
+                .arg(&ws.out_f16)
+                .arg(&h_elems)
+                .launch(grid((h_elems as usize).div_ceil(256).min(65535), 256))?;
+        }
+
+        let out_ptr = ws.out_f16.device_ptr(s).0;
+        let norm_f16_ptr = ws.norm_f16.device_ptr(s).0;
+        for blk in &self.blocks {
+            self.kernels
+                .launch_ln_f16(s, out_ptr, None, norm_f16_ptr, rows, 1e-6f32)?;
+            blk.self_qkv.run_f16(
+                s,
+                blas,
+                &self.kernels.bias_f16,
+                stage_view(&ws.norm_f16, s, [rows, c])?,
+                &mut TensorMut(stage_view(&ws.qkv_self_f16, s, [rows, 3 * c])?),
+            )?;
+            unsafe {
+                s.launch_builder(&self.kernels.qkv_unpack_hm_f16)
+                    .arg(&ws.qkv_self_f16)
+                    .arg(&ws.q_f16)
+                    .arg(&ws.attn_out_f16)
+                    .arg(&ws.v_hm_f16)
+                    .arg(&1u32)
+                    .arg(&rows)
+                    .arg(&h)
+                    .arg(&d)
+                    .arg(&3i32)
+                    .launch(grid(pe_total.div_ceil(256).min(65535) as usize, 256))?;
+                s.launch_builder(&self.kernels.l2_norm_scale_f16)
+                    .arg(&ws.q_f16)
+                    .arg(&blk.self_q_norm)
+                    .arg(&ws.q_f16)
+                    .arg(&rows)
+                    .arg(&h)
+                    .arg(&d)
+                    .arg(&8.0f32)
+                    .arg(&1e-12f32)
+                    .arg(&0u32)
+                    .launch(grid((rows * h) as usize, 64))?;
+                s.launch_builder(&self.kernels.l2_norm_scale_f16)
+                    .arg(&ws.attn_out_f16)
+                    .arg(&blk.self_k_norm)
+                    .arg(&ws.k_hm_f16)
+                    .arg(&rows)
+                    .arg(&h)
+                    .arg(&d)
+                    .arg(&8.0f32)
+                    .arg(&1e-12f32)
+                    .arg(&rows)
+                    .launch(grid((rows * h) as usize, 64))?;
+            }
+            {
+                let q_view = ws.q_f16.slice(0..(rows as usize) * (c as usize));
+                let k_view = ws.k_hm_f16.slice(0..(rows as usize) * (c as usize));
+                let v_view = ws.v_hm_f16.slice(0..(rows as usize) * (c as usize));
+                let mut o_view = ws.attn_out_f16.slice_mut(0..(rows as usize) * (c as usize));
+                ws.prefill_f16.run_f16_d64(
+                    &q_view,
+                    c as usize,
+                    &k_view,
+                    &v_view,
+                    &mut o_view,
+                    (rows as usize, rows as usize, rows as usize),
+                )?;
+            }
+            blk.self_out.run_f16(
+                s,
+                blas,
+                &self.kernels.bias_f16,
+                stage_view(&ws.attn_out_f16, s, [rows, c])?,
+                &mut TensorMut(stage_view(&ws.proj_out_f16, s, [rows, c])?),
+            )?;
+            unsafe {
+                s.launch_builder(&self.kernels.residual_f16)
+                    .arg(&out_ptr)
+                    .arg(&ws.proj_out_f16)
+                    .arg(&h_elems_i32)
+                    .launch(grid((h_elems as usize).div_ceil(256).min(65535), 256))?;
+            }
+
+            self.kernels.launch_ln_f16(
+                s,
+                out_ptr,
+                Some(&blk.norm2),
+                norm_f16_ptr,
+                rows,
+                1e-6f32,
+            )?;
+            blk.cross_q.run_f16(
+                s,
+                blas,
+                &self.kernels.bias_f16,
+                stage_view(&ws.norm_f16, s, [rows, c])?,
+                &mut TensorMut(stage_view(&ws.q_f16, s, [rows, c])?),
+            )?;
+            blk.cross_kv.run_f16(
+                s,
+                blas,
+                &self.kernels.bias_f16,
+                stage_view(&ws.context_f16, s, [rows, 16])?,
+                &mut TensorMut(stage_view(&ws.kv_cross_f16, s, [rows, 2 * c])?),
+            )?;
+            unsafe {
+                s.launch_builder(&self.kernels.qkv_unpack_hm_f16)
+                    .arg(&ws.kv_cross_f16)
+                    .arg(&0u64)
+                    .arg(&ws.attn_out_f16)
+                    .arg(&ws.v_hm_f16)
+                    .arg(&1u32)
+                    .arg(&rows)
+                    .arg(&h)
+                    .arg(&d)
+                    .arg(&2i32)
+                    .launch(grid(pe_total.div_ceil(256).min(65535) as usize, 256))?;
+                s.launch_builder(&self.kernels.l2_norm_scale_f16)
+                    .arg(&ws.q_f16)
+                    .arg(&blk.cross_q_norm)
+                    .arg(&ws.q_f16)
+                    .arg(&rows)
+                    .arg(&h)
+                    .arg(&d)
+                    .arg(&8.0f32)
+                    .arg(&1e-12f32)
+                    .arg(&0u32)
+                    .launch(grid((rows * h) as usize, 64))?;
+                s.launch_builder(&self.kernels.l2_norm_scale_f16)
+                    .arg(&ws.attn_out_f16)
+                    .arg(&blk.cross_k_norm)
+                    .arg(&ws.k_hm_f16)
+                    .arg(&rows)
+                    .arg(&h)
+                    .arg(&d)
+                    .arg(&8.0f32)
+                    .arg(&1e-12f32)
+                    .arg(&rows)
+                    .launch(grid((rows * h) as usize, 64))?;
+            }
+            {
+                let q_view = ws.q_f16.slice(0..(rows as usize) * (c as usize));
+                let k_view = ws.k_hm_f16.slice(0..(rows as usize) * (c as usize));
+                let v_view = ws.v_hm_f16.slice(0..(rows as usize) * (c as usize));
+                let mut o_view = ws.attn_out_f16.slice_mut(0..(rows as usize) * (c as usize));
+                ws.prefill_f16.run_f16_d64(
+                    &q_view,
+                    c as usize,
+                    &k_view,
+                    &v_view,
+                    &mut o_view,
+                    (rows as usize, rows as usize, rows as usize),
+                )?;
+            }
+            blk.cross_out.run_f16(
+                s,
+                blas,
+                &self.kernels.bias_f16,
+                stage_view(&ws.attn_out_f16, s, [rows, c])?,
+                &mut TensorMut(stage_view(&ws.proj_out_f16, s, [rows, c])?),
+            )?;
+            unsafe {
+                s.launch_builder(&self.kernels.residual_f16)
+                    .arg(&out_ptr)
+                    .arg(&ws.proj_out_f16)
+                    .arg(&h_elems_i32)
+                    .launch(grid((h_elems as usize).div_ceil(256).min(65535), 256))?;
+            }
+
+            self.kernels
+                .launch_ln_f16(s, out_ptr, None, norm_f16_ptr, rows, 1e-6f32)?;
+            blk.mlp0.run_f16(
+                s,
+                blas,
+                &self.kernels.bias_f16,
+                stage_view(&ws.norm_f16, s, [rows, c])?,
+                &mut TensorMut(stage_view(&ws.mlp_fc1_f16, s, [rows, m_dim])?),
+            )?;
+            let mlp_elems = u64::from(rows) * u64::from(m_dim);
+            unsafe {
+                s.launch_builder(&self.kernels.gelu_f16)
+                    .arg(&ws.mlp_fc1_f16)
+                    .arg(&ws.mlp_fc1_f16)
+                    .arg(&u32::try_from(mlp_elems)?)
+                    .arg(&1u32)
+                    .arg(&1u32)
+                    .arg(&1u64)
+                    .arg(&1u64)
+                    .arg(&1u64)
+                    .arg(&1u64)
+                    .arg(&1u64)
+                    .arg(&1u64)
+                    .arg(&1i32)
+                    .launch(grid(mlp_elems.div_ceil(256).min(65535) as usize, 256))?;
+            }
+            blk.mlp2.run_f16(
+                s,
+                blas,
+                &self.kernels.bias_f16,
+                stage_view(&ws.mlp_fc1_f16, s, [rows, m_dim])?,
+                &mut TensorMut(stage_view(&ws.mlp_fc2_f16, s, [rows, c])?),
+            )?;
+            unsafe {
+                s.launch_builder(&self.kernels.residual_f16)
+                    .arg(&out_ptr)
+                    .arg(&ws.mlp_fc2_f16)
+                    .arg(&h_elems_i32)
+                    .launch(grid((h_elems as usize).div_ceil(256).min(65535), 256))?;
+            }
+        }
+
+        let norm_f32_ptr = ws.norm_f32.device_ptr(s).0;
+        self.kernels
+            .launch_ln_f16_to_f32(s, out_ptr, None, norm_f32_ptr, rows, 1e-5f32)?;
+        self.out_proj.run(
+            s,
+            blas,
+            stage_view(&ws.norm_f32, s, [rows, c])?,
+            &mut TensorMut(stage_view(&ws.gs_features_f32, s, [rows, 480])?),
+        )?;
+        Ok(s.clone_dtoh(&ws.gs_features_f32)?)
+    }
+
+    pub fn to_representation(
+        &self,
+        points_f32: &[f32],
+        features_f32: &[f32],
+        base_offset_scale_override: Option<f32>,
+    ) -> Result<IdolGaussianSplat> {
+        let n_anchors = 8192usize;
+        let per_anchor = 32usize;
+        let n_gauss = n_anchors * per_anchor;
+        ensure!(
+            points_f32.len() == n_anchors * 3 && features_f32.len() == n_anchors * 480,
+            "invalid to_representation shapes"
+        );
+        let rep = &self.args.representation_config;
+        let base_off = base_offset_scale_override.unwrap_or(self.base_offset_scale);
+        let softplus = |x: f32| -> f32 { if x > 20.0f32 { x } else { x.exp().ln_1p() } };
+        let scaling_offset = rep.scaling_bias + (-(-rep.scaling_bias).exp_m1()).ln();
+        let opacity_offset = (rep.opacity_bias / (1.0f32 - rep.opacity_bias)).ln();
+        let min_k2 = rep.filter_kernel_size * rep.filter_kernel_size;
+        let s_quat = 0.5f64.sqrt();
+
+        let mut xyz = Vec::with_capacity(n_gauss * 3);
+        let mut features_dc = Vec::with_capacity(n_gauss * 3);
+        let mut scaling = Vec::with_capacity(n_gauss * 3);
+        let mut rotation = Vec::with_capacity(n_gauss * 4);
+        let mut opacity = Vec::with_capacity(n_gauss);
+        let mut ply_mat = Vec::with_capacity(n_gauss * 17);
+
+        for a in 0..n_anchors {
+            let f_row = &features_f32[a * 480..(a + 1) * 480];
+            let px = points_f32[a * 3];
+            let py = points_f32[a * 3 + 1];
+            let pz = points_f32[a * 3 + 2];
+            for g in 0..per_anchor {
+                let off_scale = softplus(f_row[448 + g] + base_off);
+                let mut gx = [0.0f32; 3];
+                for (d, p_coord) in [px, py, pz].into_iter().enumerate() {
+                    let raw_o =
+                        f_row[g * 3 + d] * rep.lr.xyz + self.points_offset_perturbation[g * 3 + d];
+                    let off = raw_o.tanh() * 0.5f32 * rep.perturbe_size * off_scale;
+                    gx[d] = (off + p_coord) - 0.5f32;
+                }
+                xyz.extend_from_slice(&gx);
+
+                let fdc0 = f_row[96 + g * 3] * rep.lr.features_dc;
+                let fdc1 = f_row[96 + g * 3 + 1] * rep.lr.features_dc;
+                let fdc2 = f_row[96 + g * 3 + 2] * rep.lr.features_dc;
+                features_dc.extend_from_slice(&[fdc0, fdc1, fdc2]);
+
+                let mut gs = [0.0f32; 3];
+                for d in 0..3 {
+                    let raw_s = f_row[192 + g * 3 + d] * rep.lr.scaling;
+                    let sp = softplus(raw_s + scaling_offset);
+                    gs[d] = (sp * sp + min_k2).sqrt();
+                }
+                scaling.extend_from_slice(&gs);
+
+                let mut gr = [
+                    f_row[288 + g * 4] * rep.lr.rotation + 1.0f32,
+                    f_row[288 + g * 4 + 1] * rep.lr.rotation,
+                    f_row[288 + g * 4 + 2] * rep.lr.rotation,
+                    f_row[288 + g * 4 + 3] * rep.lr.rotation,
+                ];
+                let r_norm = (gr[0] * gr[0] + gr[1] * gr[1] + gr[2] * gr[2] + gr[3] * gr[3])
+                    .sqrt()
+                    .max(1e-12f32);
+                for r_val in &mut gr {
+                    *r_val /= r_norm;
+                }
+                rotation.extend_from_slice(&gr);
+
+                let raw_op = f_row[416 + g] * rep.lr.opacity;
+                let op = 1.0f32 / (1.0f32 + (-(raw_op + opacity_offset)).exp());
+                opacity.push(op);
+
+                let op_clamped = op.clamp(1e-6f32, 1.0f32 - 1e-6f32);
+                let ply_op = (op_clamped / (1.0f32 - op_clamped)).ln();
+                let ply_s0 = gs[0].max(1e-6f32).ln();
+                let ply_s1 = gs[1].max(1e-6f32).ln();
+                let ply_s2 = gs[2].max(1e-6f32).ln();
+                let bw = gr[0] as f64;
+                let bx = gr[1] as f64;
+                let by = gr[2] as f64;
+                let bz = gr[3] as f64;
+                let rot0 = (s_quat * bw - s_quat * bx) as f32;
+                let rot1 = (s_quat * bx + s_quat * bw) as f32;
+                let rot2 = (s_quat * by - s_quat * bz) as f32;
+                let rot3 = (s_quat * bz + s_quat * by) as f32;
+                ply_mat.extend_from_slice(&[
+                    gx[0], -gx[2], gx[1], 0.0f32, 0.0f32, 0.0f32, fdc0, fdc1, fdc2, ply_op, ply_s0,
+                    ply_s1, ply_s2, rot0, rot1, rot2, rot3,
+                ]);
+            }
+        }
+
+        Ok(IdolGaussianSplat {
+            xyz,
+            features_dc,
+            scaling,
+            rotation,
+            opacity,
+            ply_mat,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct IdolCamera {
+    pub yaw: f64,
+    pub pitch: f64,
+    pub radius: f64,
+    pub fov: f64,
+}
+
+impl IdolCamera {
+    pub fn from_raw(cam: &[f32]) -> Result<Self> {
+        ensure!(
+            cam.len() == 5,
+            "expected 5 camera parameters, got {}",
+            cam.len()
+        );
+        let norm = (cam[0] * cam[0] + cam[1] * cam[1] + cam[2] * cam[2]).sqrt() as f64;
+        let (dx, dy, dz) = if norm > 1e-6 {
+            (
+                (cam[0] as f64) / norm,
+                (cam[1] as f64) / norm,
+                (cam[2] as f64) / norm,
+            )
+        } else {
+            (0.0, 0.0, 1.0)
+        };
+        let inv_dist = cam[3] as f64;
+        let half_w = cam[4] as f64;
+        let (radius, fov) = if inv_dist < 1e-3 {
+            let r = 1000.0;
+            (r, (2.0 * (half_w / r).atan()).to_degrees())
+        } else {
+            let r = 1.0 / inv_dist;
+            (r, (2.0 * (half_w * inv_dist).atan()).to_degrees())
+        };
+        Ok(Self {
+            yaw: dx.atan2(dy),
+            pitch: dz.clamp(-1.0, 1.0).asin(),
+            radius,
+            fov,
+        })
+    }
+}
+
+/// Device bytes the Idol denoiser, octree decoder and Gaussian decoder loaders hold for one F32 checkpoint: the
+/// attention and MLP linears (weight and bias) of the block stacks (`blocks.N`, `context_refiner.N`,
+/// `noise_refiner.N`) are F16, every other tensor stays F32.
+fn idol_resident_bytes(checkpoint: &[u8]) -> Result<usize> {
+    let st = safetensors::SafeTensors::deserialize(checkpoint)?;
+    let mut bytes = 0usize;
+    for (name, view) in st.tensors() {
+        ensure!(
+            view.dtype() == safetensors::Dtype::F32,
+            "Idol checkpoint tensor {name} is {:?}, not F32",
+            view.dtype()
+        );
+        let parts: Vec<&str> = name.split('.').collect();
+        let half = parts.len() >= 4
+            && matches!(parts[0], "blocks" | "context_refiner" | "noise_refiner")
+            && parts[1].bytes().all(|b| b.is_ascii_digit())
+            && matches!(parts[2], "attn" | "cross_attn" | "self_attn" | "mlp")
+            && matches!(parts.last(), Some(&"weight") | Some(&"bias"));
+        bytes += view.shape().iter().product::<usize>() * if half { 2 } else { 4 };
+    }
+    Ok(bytes)
+}
+
+pub struct IdolPipelineRuntime {
+    pub cfg: IdolConfig,
+    pub vision: IdolVisionEncoderRuntime,
+    pub denoiser: IdolDenoiser,
+    pub denoiser_ws: IdolDenoiserWorkspace,
+    pub octree: IdolOctreeDecoder,
+    pub octree_ws: IdolOctreeWorkspace,
+    pub gaussian: IdolGaussianDecoder,
+    pub gaussian_ws: IdolGaussianWorkspace,
+}
+
+impl IdolPipelineRuntime {
+    pub fn open(
+        device: &Device,
+        blas: &mut Blas,
+        common: CommonOpsRef,
+        idol_dir: &std::path::Path,
+        dinov3_dir: &std::path::Path,
+        vae_dir: &std::path::Path,
+        force_cfg_batch: Option<usize>,
+    ) -> Result<Self> {
+        let cfg = IdolConfig::from_dir(idol_dir)?;
+        let (free_vram, total_vram) = device.ctx.mem_get_info()?;
+        let driver_headroom = total_vram / 16;
+        let map = |file: &str| -> Result<memmap2::Mmap> {
+            let file = std::fs::File::open(idol_dir.join(file))?;
+            Ok(unsafe { memmap2::MmapOptions::new().map(&file)? })
+        };
+        let (den_mmap, oct_mmap, gs_mmap) = (
+            map("denoiser.safetensors")?,
+            map("decoder.safetensors")?,
+            map("decoder_gs.safetensors")?,
+        );
+        let m3_weight_bytes = idol_resident_bytes(&den_mmap)?
+            + idol_resident_bytes(&oct_mmap)?
+            + idol_resident_bytes(&gs_mmap)?;
+        let oct_ws_bytes = IdolOctreeWorkspace::byte_size();
+        let gs_ws_bytes = IdolGaussianWorkspace::byte_size();
+        let den_ws_b2 = IdolDenoiserWorkspace::byte_size(2);
+        let den_ws_b1 = IdolDenoiserWorkspace::byte_size(1);
+        let cfg_batch = match force_cfg_batch {
+            Some(b) => {
+                ensure!(b == 1 || b == 2, "invalid force_cfg_batch {b}");
+                b
+            }
+            None => {
+                let min_m2_bytes = 1_681_185_280usize
+                    + 346_567_680usize
+                    + 68_852_224usize
+                    + 839_911_936usize
+                    + 1024usize * 512 * 9 * 2;
+                let needed_b2 = driver_headroom
+                    + min_m2_bytes
+                    + m3_weight_bytes
+                    + den_ws_b2
+                    + oct_ws_bytes
+                    + gs_ws_bytes;
+                if free_vram >= needed_b2 { 2 } else { 1 }
+            }
+        };
+        let den_ws_bytes = if cfg_batch == 2 { den_ws_b2 } else { den_ws_b1 };
+        let m3_ws_bytes = den_ws_bytes + oct_ws_bytes + gs_ws_bytes;
+        let vae_reserve_bytes = driver_headroom + m3_weight_bytes + m3_ws_bytes;
+        println!(
+            "I1_LOAD component=pipeline total_vram={total_vram} driver_headroom={driver_headroom} m3_weight_bytes={m3_weight_bytes} m3_ws_bytes={m3_ws_bytes} vae_reserve_bytes={vae_reserve_bytes} cfg_batch={cfg_batch}"
+        );
+
+        let vision = IdolVisionEncoderRuntime::load(
+            device,
+            blas,
+            common,
+            dinov3_dir,
+            vae_dir,
+            vae_reserve_bytes,
+        )?;
+        let (denoiser, denoiser_ws) =
+            IdolDenoiser::load(device, cfg.denoiser.args.clone(), &den_mmap, cfg_batch)?;
+
+        let (octree, octree_ws) =
+            IdolOctreeDecoder::load(device, cfg.decoder.args.clone(), &oct_mmap)?;
+
+        let (gaussian, gaussian_ws) =
+            IdolGaussianDecoder::load(device, cfg.decoder_gs.args.clone(), &gs_mmap)?;
+        ensure!(
+            denoiser.weight_bytes + octree.weight_bytes + gaussian.weight_bytes == m3_weight_bytes,
+            "derived M3 weight bytes {m3_weight_bytes} differ from the loaded {}",
+            denoiser.weight_bytes + octree.weight_bytes + gaussian.weight_bytes
+        );
+
+        Ok(Self {
+            cfg,
+            vision,
+            denoiser,
+            denoiser_ws,
+            octree,
+            octree_ws,
+            gaussian,
+            gaussian_ws,
+        })
+    }
+
+    pub fn generate_from_rgb(
+        &mut self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        chw_f32: &[f32],
+        seed: u64,
+        batch_cfg: bool,
+    ) -> Result<(IdolGaussianSplat, IdolCamera)> {
+        let vae_cnt = 32u32 * 128 * 128;
+        let lat_cnt = 8192u32 * 16;
+        let cam_cnt = 5u32;
+        unsafe {
+            s.launch_builder(&self.denoiser.kernels.philox_normal_bf16)
+                .arg(&seed)
+                .arg(&0u64)
+                .arg(&self.vision.vae_ws.noise_nchw)
+                .arg(&i64::from(vae_cnt))
+                .launch(grid((vae_cnt as usize).div_ceil(1024), 256))?;
+            s.launch_builder(&self.denoiser.kernels.philox_normal_f32)
+                .arg(&seed)
+                .arg(&u64::from(vae_cnt.div_ceil(4)))
+                .arg(&self.denoiser_ws.latent_in_f32)
+                .arg(&i64::from(lat_cnt))
+                .launch(grid((lat_cnt as usize).div_ceil(1024), 256))?;
+            s.launch_builder(&self.denoiser.kernels.philox_normal_f32)
+                .arg(&seed)
+                .arg(&u64::from(vae_cnt.div_ceil(4) + lat_cnt.div_ceil(4)))
+                .arg(&self.denoiser_ws.camera_in_f32)
+                .arg(&i64::from(cam_cnt))
+                .launch(grid(1, 256))?;
+        }
+        let vae_eps = s.clone_dtoh(&self.vision.vae_ws.noise_nchw)?;
+        let init_lat = s.clone_dtoh(&self.denoiser_ws.latent_in_f32.slice(0..8192 * 16))?;
+        let init_cam = s.clone_dtoh(&self.denoiser_ws.camera_in_f32.slice(0..5))?;
+        self.generate_with_initial_draws(
+            s,
+            blas,
+            chw_f32,
+            (&vae_eps, &init_lat, &init_cam),
+            (seed, batch_cfg),
+        )
+    }
+
+    pub fn generate_with_initial_draws(
+        &mut self,
+        s: &Arc<CudaStream>,
+        blas: &Blas,
+        chw_f32: &[f32],
+        (vae_eps_bf16, init_latent_f32, init_camera_f32): (&[bf16], &[f32], &[f32]),
+        (octree_seed, batch_cfg): (u64, bool),
+    ) -> Result<(IdolGaussianSplat, IdolCamera)> {
+        let (d_out, v_out) = self
+            .vision
+            .encode_image(s, blas, chw_f32, vae_eps_bf16, false)?;
+        let traj = self.denoiser.sample_flow(
+            s,
+            blas,
+            &mut self.denoiser_ws,
+            (init_latent_f32, init_camera_f32),
+            (&d_out.feature1, &v_out.feature2_f32),
+            batch_cfg,
+        )?;
+        let anchors = self.octree.sample_octree(
+            s,
+            blas,
+            &mut self.octree_ws,
+            &traj.step49_latent,
+            (8192, self.cfg.max_voxel_level, octree_seed),
+        )?;
+        let gs_features = self.gaussian.forward(
+            s,
+            blas,
+            &mut self.gaussian_ws,
+            &anchors,
+            &traj.step49_latent,
+        )?;
+        let splat = self
+            .gaussian
+            .to_representation(&anchors, &gs_features, None)?;
+        let cam = IdolCamera::from_raw(&traj.step49_camera)?;
+        Ok((splat, cam))
     }
 }
 
@@ -9279,6 +12689,722 @@ mod tests {
             cells == 64 && mask_controls == 16 && defects == 0,
             "projection candidate defects={defects}, cells={cells}"
         );
+        Ok(())
+    }
+
+    fn read_i64_tensor(st: &safetensors::SafeTensors<'_>, key: &str) -> Result<Vec<i64>> {
+        let v = st.tensor(key)?;
+        ensure!(
+            v.dtype() == safetensors::Dtype::I64,
+            "expected I64 for {key}, got {:?}",
+            v.dtype()
+        );
+        Ok(v.data()
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| i64::from_le_bytes(*b))
+            .collect())
+    }
+
+    struct KdTree3d {
+        pts: Vec<[f64; 3]>,
+    }
+
+    impl KdTree3d {
+        fn build(flat_xyz: &[f32]) -> Self {
+            let mut pts: Vec<[f64; 3]> = flat_xyz
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|c| [f64::from(c[0]), f64::from(c[1]), f64::from(c[2])])
+                .collect();
+            let n = pts.len();
+            Self::sort_range(&mut pts, 0, n, 0);
+            Self { pts }
+        }
+
+        fn sort_range(pts: &mut [[f64; 3]], start: usize, end: usize, depth: usize) {
+            if end - start <= 1 {
+                return;
+            }
+            let axis = depth % 3;
+            let mid = start + (end - start) / 2;
+            pts[start..end].select_nth_unstable_by(mid - start, |a, b| {
+                a[axis]
+                    .partial_cmp(&b[axis])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            Self::sort_range(pts, start, mid, depth + 1);
+            Self::sort_range(pts, mid + 1, end, depth + 1);
+        }
+
+        fn nearest_dist_sq(&self, q: [f64; 3]) -> f64 {
+            let mut best_sq = f64::INFINITY;
+            self.search(0, self.pts.len(), 0, q, &mut best_sq);
+            best_sq
+        }
+
+        fn search(&self, start: usize, end: usize, depth: usize, q: [f64; 3], best_sq: &mut f64) {
+            if start >= end {
+                return;
+            }
+            let mid = start + (end - start) / 2;
+            let p = self.pts[mid];
+            let dx = q[0] - p[0];
+            let dy = q[1] - p[1];
+            let dz = q[2] - p[2];
+            let d2 = dx * dx + dy * dy + dz * dz;
+            if d2 < *best_sq {
+                *best_sq = d2;
+            }
+            let axis = depth % 3;
+            let diff = q[axis] - p[axis];
+            if diff <= 0.0 {
+                self.search(start, mid, depth + 1, q, best_sq);
+                if diff * diff < *best_sq {
+                    self.search(mid + 1, end, depth + 1, q, best_sq);
+                }
+            } else {
+                self.search(mid + 1, end, depth + 1, q, best_sq);
+                if diff * diff < *best_sq {
+                    self.search(start, mid, depth + 1, q, best_sq);
+                }
+            }
+        }
+    }
+
+    fn anchor_means_from_xyz(xyz: &[f32]) -> Vec<f32> {
+        let mut out = Vec::with_capacity(8192 * 3);
+        for a in 0..8192 {
+            let mut sx = 0.0f64;
+            let mut sy = 0.0f64;
+            let mut sz = 0.0f64;
+            for g in 0..32 {
+                let base = (a * 32 + g) * 3;
+                sx += f64::from(xyz[base]);
+                sy += f64::from(xyz[base + 1]);
+                sz += f64::from(xyz[base + 2]);
+            }
+            out.push((sx / 32.0) as f32);
+            out.push((sy / 32.0) as f32);
+            out.push((sz / 32.0) as f32);
+        }
+        out
+    }
+
+    fn coarse_tv_from_xyz(xyz_a: &[f32], xyz_b: &[f32], grid_res: usize) -> f64 {
+        let anc_a = anchor_means_from_xyz(xyz_a);
+        let anc_b = anchor_means_from_xyz(xyz_b);
+        let total_bins = grid_res * grid_res * grid_res;
+        let mut ca = vec![0.0f64; total_bins];
+        let mut cb = vec![0.0f64; total_bins];
+        let bin_pt = |p: &[f32], hist: &mut [f64]| {
+            let ix = (((f64::from(p[0]) + 0.5) * grid_res as f64).floor() as isize)
+                .clamp(0, grid_res as isize - 1) as usize;
+            let iy = (((f64::from(p[1]) + 0.5) * grid_res as f64).floor() as isize)
+                .clamp(0, grid_res as isize - 1) as usize;
+            let iz = (((f64::from(p[2]) + 0.5) * grid_res as f64).floor() as isize)
+                .clamp(0, grid_res as isize - 1) as usize;
+            hist[(ix * grid_res + iy) * grid_res + iz] += 1.0;
+        };
+        for p in anc_a.as_chunks::<3>().0 {
+            bin_pt(p, &mut ca);
+        }
+        for p in anc_b.as_chunks::<3>().0 {
+            bin_pt(p, &mut cb);
+        }
+        let l1: f64 = ca.iter().zip(&cb).map(|(a, b)| (a - b).abs()).sum();
+        0.5 * l1 / 8192.0
+    }
+
+    fn chamfer_l2_and_rms(xyz_a: &[f32], xyz_b: &[f32]) -> (f64, f64) {
+        let tree_b = KdTree3d::build(xyz_b);
+        let tree_a = KdTree3d::build(xyz_a);
+        let n_a = (xyz_a.len() / 3) as f64;
+        let n_b = (xyz_b.len() / 3) as f64;
+        let mut sum_d_ab = 0.0f64;
+        let mut sum_d2_ab = 0.0f64;
+        for c in xyz_a.as_chunks::<3>().0 {
+            let d2 = tree_b.nearest_dist_sq([f64::from(c[0]), f64::from(c[1]), f64::from(c[2])]);
+            sum_d_ab += d2.sqrt();
+            sum_d2_ab += d2;
+        }
+        let mut sum_d_ba = 0.0f64;
+        let mut sum_d2_ba = 0.0f64;
+        for c in xyz_b.as_chunks::<3>().0 {
+            let d2 = tree_a.nearest_dist_sq([f64::from(c[0]), f64::from(c[1]), f64::from(c[2])]);
+            sum_d_ba += d2.sqrt();
+            sum_d2_ba += d2;
+        }
+        let chamfer_l2 = 0.5 * (sum_d_ab / n_a + sum_d_ba / n_b);
+        let chamfer_rms = (0.5 * (sum_d2_ab / n_a + sum_d2_ba / n_b)).sqrt();
+        (chamfer_l2, chamfer_rms)
+    }
+
+    #[test]
+    #[ignore = "requires local GPU window and FF_IDOL_MODEL, FF_DINOV3_MODEL, FF_FLUX2_VAE_MODEL, FF_IDOL_FIXTURE_DIR, FF_IDOL_THRESHOLDS"]
+    fn idol_m3_gates_and_e2e_match_definition_gpu() -> Result<()> {
+        use crate::backend::cuda::closure::Closure;
+        use std::{path::PathBuf, rc::Rc, time::Instant};
+
+        let idol_dir =
+            PathBuf::from(std::env::var_os("FF_IDOL_MODEL").context("FF_IDOL_MODEL missing")?);
+        let dinov3_dir =
+            PathBuf::from(std::env::var_os("FF_DINOV3_MODEL").context("FF_DINOV3_MODEL missing")?);
+        let vae_dir = PathBuf::from(
+            std::env::var_os("FF_FLUX2_VAE_MODEL").context("FF_FLUX2_VAE_MODEL missing")?,
+        );
+        let fixture_dir = PathBuf::from(
+            std::env::var_os("FF_IDOL_FIXTURE_DIR").context("FF_IDOL_FIXTURE_DIR missing")?,
+        );
+        let thresholds_path = PathBuf::from(
+            std::env::var_os("FF_IDOL_THRESHOLDS").context("FF_IDOL_THRESHOLDS missing")?,
+        );
+        let runtime_dir = std::env::temp_dir().join(format!("ff-idol-m3-{}", std::process::id()));
+        std::fs::create_dir_all(&runtime_dir)?;
+
+        let thresholds: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&thresholds_path)?)?;
+        let tensor_tau = |name: &str| -> Result<(bool, bool, f64, f64)> {
+            let entry = &thresholds["tensors"][name];
+            Ok((
+                entry["gating_max_abs"]
+                    .as_bool()
+                    .context("gating_max_abs missing")?,
+                entry["gating_rmse"]
+                    .as_bool()
+                    .context("gating_rmse missing")?,
+                entry["tau_max_abs"]
+                    .as_f64()
+                    .context("tau_max_abs missing")?,
+                entry["tau_rmse"].as_f64().context("tau_rmse missing")?,
+            ))
+        };
+        let e2e_tau = |name: &str| -> Result<(bool, f64)> {
+            let entry = &thresholds["e2e_distributional"][name];
+            Ok((
+                entry["gating"].as_bool().context("gating missing")?,
+                entry["tau"].as_f64().context("tau missing")?,
+            ))
+        };
+
+        let device = Device::new(0)?;
+        let s = &device.stream;
+        let common = CommonOpsRef::new(&device.ctx)?;
+        let closure = Rc::new(Closure::new(false, "I1-M3 IDOL full pipeline".into()));
+        let mut blas = test_blas(&device, &runtime_dir, closure.clone())?;
+        let mut pipe = IdolPipelineRuntime::open(
+            &device,
+            &mut blas,
+            common,
+            &idol_dir,
+            &dinov3_dir,
+            &vae_dir,
+            None,
+        )?;
+        closure.freeze_fixed()?;
+        closure.ready(Instant::now())?;
+        ensure!(
+            pipe.denoiser_ws.cfg_batch == 2,
+            "expected derived cfg_batch=2 on 24 GB GPU, got {}",
+            pipe.denoiser_ws.cfg_batch
+        );
+
+        let defects = std::cell::RefCell::new(Vec::<String>::new());
+        let check_metric = |case: &str,
+                            mode: &str,
+                            name: &str,
+                            actual: &[f32],
+                            expected: &[f32]|
+         -> Result<(f64, f64)> {
+            let (ma, rmse) = max_abs_and_rmse(actual, expected)?;
+            let (gate_ma, gate_rmse, tau_ma, tau_rmse) = tensor_tau(name)?;
+            println!(
+                "I1_M3_METRIC case={case} mode={mode} tensor={name} max_abs={ma:.8} tau_max_abs={tau_ma:.8} gating_max_abs={gate_ma} rmse={rmse:.8} tau_rmse={tau_rmse:.8} gating_rmse={gate_rmse}"
+            );
+            if gate_ma && ma > tau_ma {
+                println!("I1_M3_DEFECT {case} {mode} {name} max_abs {ma} > tau {tau_ma}");
+                defects
+                    .borrow_mut()
+                    .push(format!("{case} {mode} {name} max_abs"));
+            }
+            if gate_rmse && rmse > tau_rmse {
+                println!("I1_M3_DEFECT {case} {mode} {name} rmse {rmse} > tau {tau_rmse}");
+                defects
+                    .borrow_mut()
+                    .push(format!("{case} {mode} {name} rmse"));
+            }
+            Ok((ma, rmse))
+        };
+
+        let sample_size = pipe.vision.vae.cfg.sample_size as usize;
+        let mut e2e_xyz_by_case: std::collections::BTreeMap<String, Vec<f32>> =
+            std::collections::BTreeMap::new();
+        let mut ref_e2e_xyz_by_case: std::collections::BTreeMap<String, Vec<f32>> =
+            std::collections::BTreeMap::new();
+        let mut ply_bytes_by_case: std::collections::BTreeMap<String, Vec<u8>> =
+            std::collections::BTreeMap::new();
+
+        for case in ["armchair", "avocado"] {
+            let chw =
+                decode_rgb_png_chw_f32(&fixture_dir.join(format!("{case}_1024.png")), sample_size)?;
+            let ref_file =
+                std::fs::File::open(fixture_dir.join(case).join("reference.safetensors"))?;
+            let ref_mmap = unsafe { memmap2::MmapOptions::new().map(&ref_file)? };
+            let ref_st = safetensors::SafeTensors::deserialize(&ref_mmap)?;
+
+            let ref_f1 = read_f32_tensor(&ref_st, "feature1")?;
+            let ref_f2 = read_f32_tensor(&ref_st, "feature2")?;
+            let init_lat = read_f32_tensor(&ref_st, "init_latent")?;
+            let init_cam = read_f32_tensor(&ref_st, "init_camera")?;
+            let step25_in_lat = read_f32_tensor(&ref_st, "step25_in_latent")?;
+            let step25_in_cam = read_f32_tensor(&ref_st, "step25_in_camera")?;
+            let zero_f1 = vec![0.0f32; 4101 * 1280];
+            let zero_f2 = vec![0.0f32; 4101 * 128];
+
+            let rescale_t = 3.0f64;
+            let u25 = 1.0f64 - 25.0f64 / 50.0f64;
+            let t25 =
+                (1000.0f64 * (rescale_t * u25 / (1.0f64 + (rescale_t - 1.0f64) * u25))) as f32;
+
+            for batch_cfg in [false, true] {
+                let mode = if batch_cfg { "cfg_b2" } else { "cfg_b1" };
+                let (vc0_lat, vc0_cam, vu0_lat, vu0_cam, vc25_lat, vc25_cam, vu25_lat, vu25_cam) =
+                    if batch_cfg {
+                        pipe.denoiser.prepare_conditioning(
+                            s,
+                            &mut pipe.denoiser_ws,
+                            &ref_f1,
+                            &ref_f2,
+                        )?;
+                        let lat_len = 8192 * 16;
+                        s.memcpy_htod(
+                            &init_lat,
+                            &mut pipe.denoiser_ws.latent_in_f32.slice_mut(0..lat_len),
+                        )?;
+                        s.memcpy_htod(
+                            &init_lat,
+                            &mut pipe
+                                .denoiser_ws
+                                .latent_in_f32
+                                .slice_mut(lat_len..2 * lat_len),
+                        )?;
+                        s.memcpy_htod(
+                            &init_cam,
+                            &mut pipe.denoiser_ws.camera_in_f32.slice_mut(0..5),
+                        )?;
+                        s.memcpy_htod(
+                            &init_cam,
+                            &mut pipe.denoiser_ws.camera_in_f32.slice_mut(5..10),
+                        )?;
+                        let (b0_lat, b0_cam) = pipe.denoiser.forward_batch(
+                            s,
+                            &blas,
+                            &mut pipe.denoiser_ws,
+                            2,
+                            1000.0f32,
+                            8.0f32,
+                        )?;
+                        s.memcpy_htod(
+                            &step25_in_lat,
+                            &mut pipe.denoiser_ws.latent_in_f32.slice_mut(0..lat_len),
+                        )?;
+                        s.memcpy_htod(
+                            &step25_in_lat,
+                            &mut pipe
+                                .denoiser_ws
+                                .latent_in_f32
+                                .slice_mut(lat_len..2 * lat_len),
+                        )?;
+                        s.memcpy_htod(
+                            &step25_in_cam,
+                            &mut pipe.denoiser_ws.camera_in_f32.slice_mut(0..5),
+                        )?;
+                        s.memcpy_htod(
+                            &step25_in_cam,
+                            &mut pipe.denoiser_ws.camera_in_f32.slice_mut(5..10),
+                        )?;
+                        let (b25_lat, b25_cam) = pipe.denoiser.forward_batch(
+                            s,
+                            &blas,
+                            &mut pipe.denoiser_ws,
+                            2,
+                            t25,
+                            8.0f32,
+                        )?;
+                        (
+                            b0_lat[..lat_len].to_vec(),
+                            b0_cam[..5].to_vec(),
+                            b0_lat[lat_len..].to_vec(),
+                            b0_cam[5..].to_vec(),
+                            b25_lat[..lat_len].to_vec(),
+                            b25_cam[..5].to_vec(),
+                            b25_lat[lat_len..].to_vec(),
+                            b25_cam[5..].to_vec(),
+                        )
+                    } else {
+                        let (vc0_l, vc0_c) = pipe.denoiser.eval_single(
+                            s,
+                            &blas,
+                            &mut pipe.denoiser_ws,
+                            (&init_lat, &init_cam),
+                            (&ref_f1, &ref_f2),
+                            (1000.0f32, 8.0f32),
+                        )?;
+                        let (vu0_l, vu0_c) = pipe.denoiser.eval_single(
+                            s,
+                            &blas,
+                            &mut pipe.denoiser_ws,
+                            (&init_lat, &init_cam),
+                            (&zero_f1, &zero_f2),
+                            (1000.0f32, 8.0f32),
+                        )?;
+                        let (vc25_l, vc25_c) = pipe.denoiser.eval_single(
+                            s,
+                            &blas,
+                            &mut pipe.denoiser_ws,
+                            (&step25_in_lat, &step25_in_cam),
+                            (&ref_f1, &ref_f2),
+                            (t25, 8.0f32),
+                        )?;
+                        let (vu25_l, vu25_c) = pipe.denoiser.eval_single(
+                            s,
+                            &blas,
+                            &mut pipe.denoiser_ws,
+                            (&step25_in_lat, &step25_in_cam),
+                            (&zero_f1, &zero_f2),
+                            (t25, 8.0f32),
+                        )?;
+                        (vc0_l, vc0_c, vu0_l, vu0_c, vc25_l, vc25_c, vu25_l, vu25_c)
+                    };
+
+                let vcfg0_lat: Vec<f32> = vc0_lat
+                    .iter()
+                    .zip(&vu0_lat)
+                    .map(|(c, u)| 4.0f32 * c - 3.0f32 * u)
+                    .collect();
+                let vcfg0_cam: Vec<f32> = vc0_cam
+                    .iter()
+                    .zip(&vu0_cam)
+                    .map(|(c, u)| 4.0f32 * c - 3.0f32 * u)
+                    .collect();
+                let vcfg25_lat: Vec<f32> = vc25_lat
+                    .iter()
+                    .zip(&vu25_lat)
+                    .map(|(c, u)| 4.0f32 * c - 3.0f32 * u)
+                    .collect();
+                let vcfg25_cam: Vec<f32> = vc25_cam
+                    .iter()
+                    .zip(&vu25_cam)
+                    .map(|(c, u)| 4.0f32 * c - 3.0f32 * u)
+                    .collect();
+
+                for (t_name, actual) in [
+                    ("g2a_step0_v_cond_latent", &vc0_lat),
+                    ("g2a_step0_v_cond_camera", &vc0_cam),
+                    ("g2a_step0_v_uncond_latent", &vu0_lat),
+                    ("g2a_step0_v_uncond_camera", &vu0_cam),
+                    ("g2a_step0_v_cfg_latent", &vcfg0_lat),
+                    ("g2a_step0_v_cfg_camera", &vcfg0_cam),
+                    ("g2a_step25_v_cond_latent", &vc25_lat),
+                    ("g2a_step25_v_cond_camera", &vc25_cam),
+                    ("g2a_step25_v_cfg_latent", &vcfg25_lat),
+                    ("g2a_step25_v_cfg_camera", &vcfg25_cam),
+                ] {
+                    let expected = read_f32_tensor(&ref_st, t_name)?;
+                    check_metric(case, mode, t_name, actual, &expected)?;
+                }
+
+                let traj = pipe.denoiser.sample_flow(
+                    s,
+                    &blas,
+                    &mut pipe.denoiser_ws,
+                    (&init_lat, &init_cam),
+                    (&ref_f1, &ref_f2),
+                    batch_cfg,
+                )?;
+                for (t_name, actual) in [
+                    ("g2b_step0_out_latent", &traj.step0_latent),
+                    ("g2b_step9_out_latent", &traj.step9_latent),
+                    ("g2b_step24_out_latent", &traj.step24_latent),
+                    ("g2b_step49_out_latent", &traj.step49_latent),
+                    ("g2b_step49_out_camera", &traj.step49_camera),
+                ] {
+                    let expected = read_f32_tensor(&ref_st, t_name)?;
+                    check_metric(case, mode, t_name, actual, &expected)?;
+                }
+            }
+
+            if case == "armchair" {
+                let (neg_vc0_lat, neg_vc0_cam) = pipe.denoiser.eval_single(
+                    s,
+                    &blas,
+                    &mut pipe.denoiser_ws,
+                    (&init_lat, &init_cam),
+                    (&ref_f1, &ref_f2),
+                    (1000.0f32, 1.0f32),
+                )?;
+                for (t_name, actual) in [
+                    ("g2a_step0_v_cond_latent", &neg_vc0_lat),
+                    ("g2a_step0_v_cond_camera", &neg_vc0_cam),
+                ] {
+                    let expected = read_f32_tensor(&ref_st, t_name)?;
+                    let (neg_ma, neg_rmse) = max_abs_and_rmse(actual, &expected)?;
+                    let (_, _, tau_ma, tau_rmse) = tensor_tau(t_name)?;
+                    println!(
+                        "I1_M3_NEG control=neg_g2_no_sqrt64_scale tensor={t_name} max_abs={neg_ma:.8} ratio_max_abs={:.4} rmse={neg_rmse:.8} ratio_rmse={:.4}",
+                        neg_ma / tau_ma,
+                        neg_rmse / tau_rmse
+                    );
+                    ensure!(
+                        neg_ma >= 10.0 * tau_ma && neg_rmse >= 10.0 * tau_rmse,
+                        "neg_g2_no_sqrt64_scale {t_name} < 10*tau: max_abs={neg_ma} rmse={neg_rmse}"
+                    );
+                }
+            }
+
+            let tf_latent = read_f32_tensor(&ref_st, "g2b_step49_out_latent")?;
+            let mut max_logits_ma = 0.0f64;
+            let mut max_logits_rmse = 0.0f64;
+            let mut max_probs_ma = 0.0f64;
+            let mut max_probs_rmse = 0.0f64;
+            let mut tf_sample_mismatches = 0usize;
+
+            for l in 1..=8usize {
+                let p_coords_i64 = read_i64_tensor(&ref_st, &format!("l{l}_parent_coords_int"))?;
+                let p_counts_i64 = read_i64_tensor(&ref_st, &format!("l{l}_parent_counts"))?;
+                let res_p = (1usize << (l - 1)) as f32;
+                let p_norm: Vec<f32> = p_coords_i64
+                    .iter()
+                    .map(|&v| (v as f32 + 0.5f32) / res_p)
+                    .collect();
+                let (logits, probs) = pipe.octree.forward_level(
+                    s,
+                    &blas,
+                    &mut pipe.octree_ws,
+                    &p_norm,
+                    &tf_latent,
+                    ((1usize << l) as f32, true),
+                )?;
+                let ref_logits = read_f32_tensor(&ref_st, &format!("l{l}_logits"))?;
+                let ref_probs = read_f32_tensor(&ref_st, &format!("l{l}_probs"))?;
+                let (l_ma, l_rmse) = max_abs_and_rmse(&logits, &ref_logits)?;
+                let (p_ma, p_rmse) = max_abs_and_rmse(&probs, &ref_probs)?;
+                println!(
+                    "I1_M3_G3A_LEVEL case={case} level={l} nodes={} logits_max_abs={l_ma:.8} logits_rmse={l_rmse:.8} probs_max_abs={p_ma:.8} probs_rmse={p_rmse:.8} (diagnostic, not scored)",
+                    p_counts_i64.len()
+                );
+                max_logits_ma = max_logits_ma.max(l_ma);
+                max_logits_rmse = max_logits_rmse.max(l_rmse);
+                max_probs_ma = max_probs_ma.max(p_ma);
+                max_probs_rmse = max_probs_rmse.max(p_rmse);
+
+                let unique_n = read_i64_tensor(&ref_st, &format!("l{l}_unique_n"))?;
+                let mut keyed_u0 = std::collections::BTreeMap::new();
+                for &n in &unique_n {
+                    if n > 0 {
+                        let u0_vec = read_f32_tensor(&ref_st, &format!("l{l}_u0_raw_n{n}"))?;
+                        keyed_u0.insert(n, u0_vec);
+                    }
+                }
+                let sampled_replay = IdolOctreeDecoder::systematic_sample_level(
+                    &ref_probs,
+                    &p_counts_i64,
+                    &keyed_u0,
+                )?;
+                let ref_sampled = read_i64_tensor(&ref_st, &format!("l{l}_sampled"))?;
+                tf_sample_mismatches += sampled_replay
+                    .iter()
+                    .zip(&ref_sampled)
+                    .filter(|(a, b)| a != b)
+                    .count();
+            }
+            println!("I1_M3_TF_SAMPLE case={case} mismatches={tf_sample_mismatches}");
+            ensure!(
+                tf_sample_mismatches == 0,
+                "teacher-forced systematic_sample mismatches on {case}: {tf_sample_mismatches}"
+            );
+
+            for (t_name, ma, rmse) in [
+                ("g3a_all_levels_logits", max_logits_ma, max_logits_rmse),
+                ("g3a_all_levels_probs", max_probs_ma, max_probs_rmse),
+            ] {
+                let (gate_ma, gate_rmse, tau_ma, tau_rmse) = tensor_tau(t_name)?;
+                println!(
+                    "I1_M3_METRIC case={case} mode=tf tensor={t_name} max_abs={ma:.8} tau_max_abs={tau_ma:.8} gating_max_abs={gate_ma} rmse={rmse:.8} tau_rmse={tau_rmse:.8} gating_rmse={gate_rmse}"
+                );
+                if gate_ma && ma > tau_ma {
+                    println!("I1_M3_DEFECT {case} {t_name} max_abs {ma} > tau {tau_ma}");
+                    defects
+                        .borrow_mut()
+                        .push(format!("{case} {t_name} max_abs"));
+                }
+                if gate_rmse && rmse > tau_rmse {
+                    println!("I1_M3_DEFECT {case} {t_name} rmse {rmse} > tau {tau_rmse}");
+                    defects.borrow_mut().push(format!("{case} {t_name} rmse"));
+                }
+            }
+
+            if case == "armchair" {
+                let p_coords_l4 = read_i64_tensor(&ref_st, "l4_parent_coords_int")?;
+                let p_norm_l4: Vec<f32> = p_coords_l4
+                    .iter()
+                    .map(|&v| (v as f32 + 0.5f32) / 8.0f32)
+                    .collect();
+                let (neg_l4_logits, neg_l4_probs) = pipe.octree.forward_level(
+                    s,
+                    &blas,
+                    &mut pipe.octree_ws,
+                    &p_norm_l4,
+                    &tf_latent,
+                    (16.0f32, false),
+                )?;
+                let ref_l4_logits = read_f32_tensor(&ref_st, "l4_logits")?;
+                let ref_l4_probs = read_f32_tensor(&ref_st, "l4_probs")?;
+                for (t_name, actual, expected) in [
+                    ("g3a_all_levels_logits", &neg_l4_logits, &ref_l4_logits),
+                    ("g3a_all_levels_probs", &neg_l4_probs, &ref_l4_probs),
+                ] {
+                    let (neg_ma, neg_rmse) = max_abs_and_rmse(actual, expected)?;
+                    let (_, _, tau_ma, tau_rmse) = tensor_tau(t_name)?;
+                    println!(
+                        "I1_M3_NEG control=neg_g3a_no_two_pi_l4 tensor={t_name} max_abs={neg_ma:.8} ratio_max_abs={:.4} rmse={neg_rmse:.8} ratio_rmse={:.4}",
+                        neg_ma / tau_ma,
+                        neg_rmse / tau_rmse
+                    );
+                    ensure!(
+                        neg_ma >= 10.0 * tau_ma && neg_rmse >= 10.0 * tau_rmse,
+                        "neg_g3a_no_two_pi_l4 {t_name} < 10*tau: max_abs={neg_ma} rmse={neg_rmse}"
+                    );
+                }
+            }
+
+            let tf_anchors = read_f32_tensor(&ref_st, "anchors")?;
+            let tf_gs_features =
+                pipe.gaussian
+                    .forward(s, &blas, &mut pipe.gaussian_ws, &tf_anchors, &tf_latent)?;
+            let tf_splat = pipe
+                .gaussian
+                .to_representation(&tf_anchors, &tf_gs_features, None)?;
+            for (t_name, actual) in [
+                ("g3b_gs_features", &tf_gs_features),
+                ("g3b_xyz", &tf_splat.xyz),
+                ("g3b_features_dc", &tf_splat.features_dc),
+                ("g3b_scaling", &tf_splat.scaling),
+                ("g3b_rotation", &tf_splat.rotation),
+                ("g3b_opacity", &tf_splat.opacity),
+                ("g3b_ply_mat", &tf_splat.ply_mat),
+            ] {
+                let expected = read_f32_tensor(&ref_st, t_name)?;
+                check_metric(case, "tf", t_name, actual, &expected)?;
+            }
+
+            if case == "armchair" {
+                let neg_splat =
+                    pipe.gaussian
+                        .to_representation(&tf_anchors, &tf_gs_features, Some(0.0f32))?;
+                let ref_xyz = read_f32_tensor(&ref_st, "g3b_xyz")?;
+                let (neg_ma, neg_rmse) = max_abs_and_rmse(&neg_splat.xyz, &ref_xyz)?;
+                let (_, _, tau_ma, tau_rmse) = tensor_tau("g3b_xyz")?;
+                println!(
+                    "I1_M3_NEG control=neg_g3b_no_base_offset tensor=g3b_xyz max_abs={neg_ma:.8} ratio_max_abs={:.4} rmse={neg_rmse:.8} ratio_rmse={:.4}",
+                    neg_ma / tau_ma,
+                    neg_rmse / tau_rmse
+                );
+                ensure!(
+                    neg_ma >= 10.0 * tau_ma && neg_rmse >= 10.0 * tau_rmse,
+                    "neg_g3b_no_base_offset g3b_xyz < 10*tau: max_abs={neg_ma} rmse={neg_rmse}"
+                );
+            }
+
+            let vae_eps = read_bf16_tensor(&ref_st, "vae_eps")?;
+            let (e2e_splat, e2e_cam) = pipe.generate_with_initial_draws(
+                s,
+                &blas,
+                &chw,
+                (&vae_eps, &init_lat, &init_cam),
+                (42, true),
+            )?;
+            println!(
+                "I1_M3_E2E_CAMERA case={case} yaw={:.6} pitch={:.6} radius={:.6} fov={:.6}",
+                e2e_cam.yaw, e2e_cam.pitch, e2e_cam.radius, e2e_cam.fov
+            );
+            let ply_path = runtime_dir.join(format!("{case}_e2e.ply"));
+            e2e_splat.save_ply(&ply_path)?;
+            ply_bytes_by_case.insert(case.to_string(), std::fs::read(&ply_path)?);
+
+            let ref_e2e_xyz = read_f32_tensor(&ref_st, "e2e_xyz")?;
+            let dc_l3 = coarse_tv_from_xyz(&e2e_splat.xyz, &ref_e2e_xyz, 8);
+            let dc_l4 = coarse_tv_from_xyz(&e2e_splat.xyz, &ref_e2e_xyz, 16);
+            let (ch_l2, ch_rms) = chamfer_l2_and_rms(&e2e_splat.xyz, &ref_e2e_xyz);
+            let (anc_ch_l2, _) = chamfer_l2_and_rms(
+                &anchor_means_from_xyz(&e2e_splat.xyz),
+                &anchor_means_from_xyz(&ref_e2e_xyz),
+            );
+            for (m_name, val) in [
+                ("delta_count_l3_8x8x8", dc_l3),
+                ("delta_count_l4_16x16x16", dc_l4),
+                ("chamfer_l2", ch_l2),
+                ("chamfer_rms", ch_rms),
+                ("anchor_chamfer_l2", anc_ch_l2),
+            ] {
+                let (gating, tau) = e2e_tau(m_name)?;
+                println!(
+                    "I1_M3_E2E_METRIC case={case} metric={m_name} value={val:.8} tau={tau:.8} gating={gating}"
+                );
+                if gating && val > tau {
+                    println!("I1_M3_DEFECT E2E {case} {m_name} {val} > tau {tau}");
+                    defects.borrow_mut().push(format!("E2E {case} {m_name}"));
+                }
+            }
+            e2e_xyz_by_case.insert(case.to_string(), e2e_splat.xyz);
+            ref_e2e_xyz_by_case.insert(case.to_string(), ref_e2e_xyz);
+        }
+
+        ensure!(
+            ply_bytes_by_case["armchair"] != ply_bytes_by_case["avocado"],
+            "armchair and avocado E2E .ply files are byte-identical"
+        );
+        let neg_dc_l3 = coarse_tv_from_xyz(
+            &e2e_xyz_by_case["avocado"],
+            &ref_e2e_xyz_by_case["armchair"],
+            8,
+        );
+        let neg_dc_l4 = coarse_tv_from_xyz(
+            &e2e_xyz_by_case["avocado"],
+            &ref_e2e_xyz_by_case["armchair"],
+            16,
+        );
+        let (neg_ch_l2, neg_ch_rms) = chamfer_l2_and_rms(
+            &e2e_xyz_by_case["avocado"],
+            &ref_e2e_xyz_by_case["armchair"],
+        );
+        for (m_name, neg_val) in [
+            ("delta_count_l3_8x8x8", neg_dc_l3),
+            ("delta_count_l4_16x16x16", neg_dc_l4),
+            ("chamfer_l2", neg_ch_l2),
+            ("chamfer_rms", neg_ch_rms),
+        ] {
+            let (_, tau) = e2e_tau(m_name)?;
+            println!(
+                "I1_M3_NEG control=neg_g4_cross_image metric={m_name} value={neg_val:.8} ratio={:.4}",
+                neg_val / tau
+            );
+            ensure!(
+                neg_val >= 10.0 * tau,
+                "neg_g4_cross_image {m_name} {neg_val} < 10 * tau {tau}"
+            );
+        }
+
+        closure.assert_ready()?;
+        let _ = std::fs::remove_dir_all(&runtime_dir);
+        let defects = defects.into_inner();
+        ensure!(
+            defects.is_empty(),
+            "I1_M3_GATE DEFECT cells outside the frozen thresholds: {defects:?}"
+        );
+        println!("I1_M3_GATE PASS cases=2 cfg_modes=2 e2e=PASS");
         Ok(())
     }
 }

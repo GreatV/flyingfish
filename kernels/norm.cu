@@ -389,3 +389,89 @@ extern "C" __global__ void add_rmsnorm_unit(const __nv_bfloat16* x,
   else
     add_rmsnorm_row<1, false, true, false>(x + off, res + off, nullptr, y + off, res_out + off, dim, eps, nullptr);
 }
+
+namespace {
+
+__device__ __forceinline__ float l2_to_f32(__nv_bfloat16 v) { return __bfloat162float(v); }
+__device__ __forceinline__ float l2_to_f32(__half v) { return __half2float(v); }
+__device__ __forceinline__ float l2_to_f32(float v) { return v; }
+
+template <typename T>
+__device__ __forceinline__ T l2_from_f32(float v);
+template <>
+__device__ __forceinline__ __nv_bfloat16 l2_from_f32<__nv_bfloat16>(float v) {
+  return __float2bfloat16_rn(v);
+}
+template <>
+__device__ __forceinline__ __half l2_from_f32<__half>(float v) {
+  return __float2half_rn(v);
+}
+template <>
+__device__ __forceinline__ float l2_from_f32<float>(float v) {
+  return v;
+}
+
+template <typename InT, typename OutT>
+__device__ __forceinline__ void l2_norm_scale_impl(
+    const InT* x, const float* gamma, OutT* y, int rows, int heads, int dim,
+    float scale, float eps, int head_major_seq_len) {
+  if (!x || !gamma || !y || rows < 1 || heads < 1 || dim < 1 ||
+      (blockDim.x & 31) != 0 || blockDim.x > 1024 || !(eps > 0.0f) ||
+      !isfinite(scale) || head_major_seq_len < 0 ||
+      (head_major_seq_len > 0 && (rows % head_major_seq_len) != 0)) {
+    __trap();
+    return;
+  }
+  const int slice = blockIdx.x;
+  if (slice >= rows * heads) return;
+  const int row = slice / heads;
+  const int head = slice % heads;
+  const InT* xs = x + (size_t)slice * dim;
+  const float* gs = gamma + (size_t)head * dim;
+  size_t dst_slice = (size_t)slice;
+  if (head_major_seq_len > 0) {
+    const int b = row / head_major_seq_len;
+    const int l = row % head_major_seq_len;
+    dst_slice = ((size_t)(b * heads + head) * (size_t)head_major_seq_len + (size_t)l);
+  }
+  OutT* ys = y + dst_slice * dim;
+  __shared__ float smem[32];
+  float ssq = 0.0f;
+  for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+    const float v = l2_to_f32(xs[d]);
+    ssq = __fadd_rn(ssq, __fmul_rn(v, v));
+  }
+  const float total = block_reduce_sum(ssq, smem);
+  const float denom = fmaxf(__fsqrt_rn(total), eps);
+  for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+    const float v = l2_to_f32(xs[d]);
+    const float normed = __fdiv_rn(v, denom);
+    const float scaled = __fmul_rn(__fmul_rn(normed, gs[d]), scale);
+    ys[d] = l2_from_f32<OutT>(scaled);
+  }
+}
+
+}  // namespace
+
+extern "C" __global__ __launch_bounds__(256) void l2_norm_scale_f16(
+    const __half* x, const float* gamma, __half* y, int rows, int heads,
+    int dim, float scale, float eps, int head_major_seq_len) {
+  l2_norm_scale_impl<__half, __half>(
+      x, gamma, y, rows, heads, dim, scale, eps, head_major_seq_len);
+}
+
+extern "C" __global__ __launch_bounds__(256) void l2_norm_scale_f32(
+    const float* x, const float* gamma, float* y, int rows, int heads,
+    int dim, float scale, float eps, int head_major_seq_len) {
+  l2_norm_scale_impl<float, float>(
+      x, gamma, y, rows, heads, dim, scale, eps, head_major_seq_len);
+}
+
+extern "C" __global__ __launch_bounds__(1024) void residual_f16(
+    __half* x, const __half* y, int n) {
+  const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int nthr = blockDim.x * gridDim.x;
+  for (int i = gid; i < n; i += nthr) {
+    x[i] = __float2half_rn(__fadd_rn(__half2float(x[i]), __half2float(y[i])));
+  }
+}
