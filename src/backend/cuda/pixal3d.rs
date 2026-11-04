@@ -137,7 +137,7 @@ impl Kernels {
             norm_f32: q.load_function("q38_layer_norm_f32")?,
             l2: n.load_function("l2_norm_scale_bf16")?,
             unpack: v.load_function("qkv_unpack_hm_bf16")?,
-            rope: r.load_function("rope_pair_tail")?,
+            rope: r.load_function("rope_pair_tail_rn")?,
             rope_hm: r.load_function("rope_pair_tail_hm")?,
             phases: r.load_function("rope_pair_rows_3d")?,
             modulate: m.load_function("row_modulate")?,
