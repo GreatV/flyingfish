@@ -410,10 +410,9 @@ mod euler {
             .collect())
     }
 
-    /// Euler scheduler gate: derived sigma schedule within 2 ULP (corrected
-    /// pre-candidate 2026-11-03, CPU derivation analysis), and the
-    /// teacher-forced update chain (bounds: original 2.0e-6, frozen
-    /// 1.0e-5; see the report for the recorded run history).
+    /// Euler scheduler gate: derived sigma schedule within 2 ULP, and the
+    /// fused guided update chained over 30 teacher-forced transitions
+    /// (bound 1.0e-5).
     #[test]
     #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_CAPTURE"]
     fn music3_syn_euler_gpu() -> Result<()> {
