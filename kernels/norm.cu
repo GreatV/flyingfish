@@ -411,7 +411,7 @@ __device__ __forceinline__ float l2_from_f32<float>(float v) {
   return v;
 }
 
-template <typename InT, typename OutT, int vector_width = 1>
+template <typename InT, typename OutT, bool ascending_warp = false>
 __device__ __forceinline__ void l2_norm_scale_impl(
     const InT* x, const float* gamma, OutT* y, int rows, int heads, int dim,
     float scale, float eps, int head_major_seq_len) {
@@ -437,18 +437,20 @@ __device__ __forceinline__ void l2_norm_scale_impl(
   OutT* ys = y + dst_slice * dim;
   __shared__ float smem[32];
   float ssq = 0.0f;
-  for (int first = threadIdx.x * vector_width; first < dim; first += blockDim.x * vector_width) {
-#pragma unroll
-    for (int lane = 0; lane < vector_width; ++lane) {
-      const int d = first + lane;
-      if (d < dim) {
-        const float v = l2_to_f32(xs[d]);
-        ssq = __fadd_rn(ssq, __fmul_rn(v, v));
-      }
-    }
+  for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+    const float v = l2_to_f32(xs[d]);
+    ssq = __fadd_rn(ssq, __fmul_rn(v, v));
   }
-  const float total = vector_width == 4 && blockDim.x == 32
-      ? warp_reduce_sum(ssq) : block_reduce_sum(ssq, smem);
+  float total;
+  if constexpr (ascending_warp) {
+    if (blockDim.x != 32) { __trap(); return; }
+#pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1)
+      ssq = __fadd_rn(ssq, __shfl_xor_sync(FF_WARP_MASK, ssq, offset));
+    total = ssq;
+  } else {
+    total = block_reduce_sum(ssq, smem);
+  }
   const float denom = fmaxf(__fsqrt_rn(total), eps);
   for (int d = threadIdx.x; d < dim; d += blockDim.x) {
     const float v = l2_to_f32(xs[d]);
@@ -477,7 +479,7 @@ extern "C" __global__ __launch_bounds__(256) void l2_norm_scale_f32(
 extern "C" __global__ __launch_bounds__(256) void l2_norm_scale_bf16(
     const __nv_bfloat16* x, const float* gamma, __nv_bfloat16* y, int rows,
     int heads, int dim, float scale, float eps, int head_major_seq_len) {
-  l2_norm_scale_impl<__nv_bfloat16, __nv_bfloat16, 4>(
+  l2_norm_scale_impl<__nv_bfloat16, __nv_bfloat16, true>(
       x, gamma, y, rows, heads, dim, scale, eps, head_major_seq_len);
 }
 
