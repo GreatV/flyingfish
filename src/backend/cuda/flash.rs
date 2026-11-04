@@ -1028,6 +1028,7 @@ impl Flash {
     }
 }
 
+#[cfg(feature = "cuda")]
 pub(crate) struct F32Attention {
     stream: Arc<CudaStream>,
     geometry: [u32; 5],
@@ -1040,6 +1041,7 @@ pub(crate) struct F32Attention {
     softmax: CudaFunction,
 }
 
+#[cfg(feature = "cuda")]
 impl F32Attention {
     pub(crate) fn new(
         stream: Arc<CudaStream>,

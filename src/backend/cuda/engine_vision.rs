@@ -1,9 +1,11 @@
 //! Vision weights, patch/position preparation, and image-feature splice for Engine.
+#[cfg(feature = "cuda")]
+use crate::backend::cuda::blas::{Conv2dF32, Conv2dWorkspaceF32};
 use crate::backend::gpu::{CudaFunction, CudaSlice, CudaStream, DevicePtr, PushKernelArg};
 use crate::{
     backend::cuda::{
         Device,
-        blas::{Blas, Conv2dF32, Conv2dWorkspaceF32},
+        blas::Blas,
         contracts::{Scratch, Tensor, TensorMut, dense_layout},
         cubin,
         flash::{Flash, Query, Score, Shape},
@@ -5271,6 +5273,7 @@ impl DinoScalar for bf16 {
     }
 }
 
+#[cfg(feature = "cuda")]
 impl DinoScalar for f32 {
     const F32: bool = true;
     type Attention = crate::backend::cuda::flash::F32Attention;
@@ -5334,6 +5337,7 @@ pub struct DinoV3Encoder {
 
 enum DinoEncoderStorage {
     Bf16(Box<DinoEncoder<bf16>>),
+    #[cfg(feature = "cuda")]
     F32(Box<DinoEncoder<f32>>),
 }
 
@@ -5343,10 +5347,12 @@ pub struct DinoV3Workspace {
 
 enum DinoWorkspaceStorage {
     Bf16(Box<DinoWorkspace<bf16>>),
+    #[cfg(feature = "cuda")]
     F32(Box<DinoWorkspace<f32>>),
 }
 
 #[derive(Clone, Copy)]
+#[cfg(feature = "cuda")]
 pub enum DinoV3OutputNormalization {
     LearnedThenUnit,
     UnitHidden,
@@ -5372,6 +5378,7 @@ impl DinoV3Encoder {
             },
         ))
     }
+    #[cfg(feature = "cuda")]
     pub fn load_f32(
         device: &Device,
         blas: &mut Blas,
@@ -5412,6 +5419,7 @@ impl DinoV3Encoder {
             (DinoEncoderStorage::Bf16(encoder), DinoWorkspaceStorage::Bf16(workspace)) => {
                 encoder.encode(s, blas, workspace, chw_f32, rope_override, capture_layers)
             }
+            #[cfg(feature = "cuda")]
             (DinoEncoderStorage::F32(encoder), DinoWorkspaceStorage::F32(workspace)) => {
                 ensure!(
                     rope_override.is_none(),
@@ -5419,21 +5427,25 @@ impl DinoV3Encoder {
                 );
                 encoder.encode(s, blas, workspace, chw_f32, None, capture_layers)
             }
+            #[cfg(feature = "cuda")]
             _ => bail!("DINO encoder/workspace precision mismatch"),
         }
     }
 }
 
+#[cfg(feature = "cuda")]
 struct NafConv {
     weight: BiasedWeight<f32>,
     plan: Conv2dF32,
 }
 
+#[cfg(feature = "cuda")]
 struct NafGuideBranch {
     initial: NafConv,
     blocks: Vec<(AffineWeights<f32>, NafConv)>,
 }
 
+#[cfg(feature = "cuda")]
 struct NafEncoder {
     branches: [NafGuideBranch; 2],
     transpose: CudaFunction,
@@ -5444,6 +5456,7 @@ struct NafEncoder {
     periods: Vec<f32>,
 }
 
+#[cfg(feature = "cuda")]
 struct NafWorkspace {
     image_side: u32,
     output_side: u32,
@@ -5458,6 +5471,7 @@ struct NafWorkspace {
     rope_table: CudaSlice<f32>,
 }
 
+#[cfg(feature = "cuda")]
 impl NafEncoder {
     fn load(device: &Device, dir: &std::path::Path, image_side: u32) -> Result<Self> {
         let convolution_handle = cudarc::cudnn::Cudnn::new(device.stream.clone())
@@ -5766,6 +5780,7 @@ impl NafEncoder {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(feature = "cuda")]
 pub struct PixalConditioningShape {
     pub image_side: u32,
     pub grid_side: u32,
@@ -5774,12 +5789,14 @@ pub struct PixalConditioningShape {
 
 /// World-to-camera matrix on the rotated XYZ grid, horizontal FOV in radians, and mesh scale.
 #[derive(Clone, Copy)]
+#[cfg(feature = "cuda")]
 pub struct ProjectionCamera {
     pub world_to_camera: [f32; 12],
     pub horizontal_fov: f32,
     pub mesh_scale: f32,
 }
 
+#[cfg(feature = "cuda")]
 pub struct PixalConditioningRuntime {
     dino: DinoEncoder<f32>,
     dino_ws: DinoWorkspace<f32>,
@@ -5799,6 +5816,7 @@ pub struct PixalConditioningRuntime {
     pub allocated_bytes: usize,
 }
 
+#[cfg(feature = "cuda")]
 impl PixalConditioningRuntime {
     pub fn load(
         device: &Device,
@@ -8215,8 +8233,10 @@ mod tests {
             }
 
             if case == "armchair" {
-                let DinoEncoderStorage::Bf16(dino) = &runtime.dinov3.inner else {
-                    bail!("Idol gate requires BF16 DINO");
+                let dino = match &runtime.dinov3.inner {
+                    DinoEncoderStorage::Bf16(dino) => dino,
+                    #[cfg(feature = "cuda")]
+                    DinoEncoderStorage::F32(_) => bail!("Idol gate requires BF16 DINO"),
                 };
                 let d_cfg = &dino.cfg;
                 let patches_side = dino.image_side / d_cfg.patch_size;
@@ -8292,6 +8312,7 @@ mod tests {
         );
         Ok(())
     }
+    #[cfg(feature = "cuda")]
     fn pixal_execute(
         s: &Arc<CudaStream>,
         graph: bool,
@@ -8312,6 +8333,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     fn pixal_capture(
         s: &Arc<CudaStream>,
         captured: &mut Option<crate::backend::gpu::CudaGraph>,
@@ -8334,6 +8356,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     fn pixal_guard(s: &Arc<CudaStream>, buffer: &mut CudaSlice<f32>) -> Result<()> {
         let count = buffer.len();
         drop(std::mem::replace(buffer, s.alloc_zeros(1)?));
@@ -8343,6 +8366,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     fn pixal_check_guard(s: &Arc<CudaStream>, buffer: &CudaSlice<f32>) -> Result<()> {
         let guard = s.clone_dtoh(&buffer.slice(buffer.len() - 64..))?;
         ensure!(
@@ -8352,6 +8376,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cuda")]
     fn pixal_score(
         s: &Arc<CudaStream>,
         actual: &CudaSlice<f32>,
@@ -8480,6 +8505,7 @@ mod tests {
         Ok(pass)
     }
 
+    #[cfg(feature = "cuda")]
     fn pixal_anchor(root: &std::path::Path) -> Result<serde_json::Value> {
         let anchor: serde_json::Value =
             serde_json::from_slice(&std::fs::read(root.join("M2-ANCHOR.json"))?)?;
@@ -8517,6 +8543,7 @@ mod tests {
         Ok(anchor)
     }
 
+    #[cfg(feature = "cuda")]
     fn pixal_camera(
         inputs: &safetensors::SafeTensors<'_>,
         project: &std::path::Path,
@@ -8540,6 +8567,7 @@ mod tests {
 
     #[test]
     #[ignore = "GPU published Pixal conditioning reference; FF_P1_M2_ROOT, FF_DINOV3_MODEL, FF_NAF_MODEL"]
+    #[cfg(feature = "cuda")]
     fn pixal_conditioning_definition_gpu() -> Result<()> {
         use crate::backend::cuda::closure::Closure;
         use std::{path::PathBuf, rc::Rc};
@@ -8784,6 +8812,7 @@ mod tests {
 
     #[test]
     #[ignore = "GPU published Pixal multi-view reference; FF_P1_M2_ROOT, FF_DINOV3_MODEL, FF_NAF_MODEL"]
+    #[cfg(feature = "cuda")]
     fn pixal_multiview_definition_gpu() -> Result<()> {
         use crate::backend::cuda::closure::Closure;
         use std::{path::PathBuf, rc::Rc};
@@ -9004,6 +9033,7 @@ mod tests {
 
     #[test]
     #[ignore = "GPU published projection reference; FF_P1_M2_ROOT"]
+    #[cfg(feature = "cuda")]
     fn project_bilinear_definition_gpu() -> Result<()> {
         use std::path::PathBuf;
         let root = PathBuf::from(std::env::var_os("FF_P1_M2_ROOT").context("FF_P1_M2_ROOT")?);
