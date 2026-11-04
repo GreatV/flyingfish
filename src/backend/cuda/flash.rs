@@ -1051,7 +1051,7 @@ impl F32Attention {
             geometry.iter().all(|&d| d > 0) && dim.is_multiple_of(4) && value_dim.is_multiple_of(4),
             "F32 attention dimensions"
         );
-        let key_chunk = keys.div_ceil(32).max(512);
+        let key_chunk = keys.div_ceil(32).max(512).next_multiple_of(4);
         let parts = keys.div_ceil(key_chunk);
         let row_bytes = usize::try_from(heads)?
             .checked_mul((keys as usize) * 8 + (parts as usize) * (value_dim as usize) * 4)
@@ -1099,6 +1099,14 @@ impl F32Attention {
         no_overlap(&q, &output.0, "q", "output")?;
         no_overlap(&k, &output.0, "k", "output")?;
         no_overlap(&v, &output.0, "v", "output")?;
+        ensure!(
+            output.0.stride[2] == 1
+                && output.0.stride[1] >= u64::from(value_dim)
+                && (output.0.stride[0] >= u64::from(queries) * output.0.stride[1]
+                    || (output.0.stride[0] == u64::from(value_dim)
+                        && output.0.stride[1] >= u64::from(heads) * output.0.stride[0])),
+            "F32 attention output row/head stride"
+        );
         let slice = |t: Tensor<f32, 3>, start: u32, rows: u32| -> Result<Tensor<f32, 3>> {
             t.validate()?;
             let offset = u64::from(start)
