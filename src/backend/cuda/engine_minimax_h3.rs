@@ -4447,7 +4447,8 @@ mod tests {
     }
 
     /// N9d run: `seeded_request`'s recorded presentation and keyframe with a request seed, through the production
-    /// pipeline for cells A, P and B, plus cell A at generator seed 43 for the seed control. Writes
+    /// pipeline for cells A, P and B at generator seed 42, plus cell A at generator seed 43 for the seed control. B uses
+    /// seed 42 so the A-vs-B media control varies only the keyframe; A at 43 isolates the seed. Writes
     /// `<FF_H3_E2E_OUT>/<cell>/native.safetensors` (denormalised decoder
     /// inputs, the BF16 video decoder output, u8 frames, PCM) for the splice gate. The media control requires A's and B's
     /// frames and PCM to differ; the seed control requires A at seeds 42 and 43 to differ. The envelope comparison is a
@@ -4470,7 +4471,7 @@ mod tests {
         fs::create_dir(&runtime)?;
         let mut media = Vec::new();
         let mut seed43 = None;
-        for (cell, seed) in [("A", 42), ("P", 42), ("B", 43), ("A", 43)] {
+        for (cell, seed) in [("A", 42), ("P", 42), ("B", 42), ("A", 43)] {
             let request = seeded_request(&s0, cell, seed)?;
             let generated = super::pipeline::run(&model, &lora, &request, (0, &runtime))?;
             let o = &generated.output;
