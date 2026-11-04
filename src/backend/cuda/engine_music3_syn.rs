@@ -1020,37 +1020,23 @@ impl Music3Syn {
             let t = sigmas[step];
             self.flow_velocity_pair(ws, t, length)?;
             let dt = sigmas[step + 1] - sigmas[step];
-            let count = (channels * length) as i64;
-            let x_ptr = ws.x.device_ptr_mut(s).0;
-            let c_ptr = ws.pair_v_c.device_ptr(s).0;
-            let u_ptr = ws.pair_v_u.device_ptr(s).0;
-            unsafe {
-                s.launch_builder(&self.guided_euler)
-                    .arg(&x_ptr)
-                    .arg(&c_ptr)
-                    .arg(&u_ptr)
-                    .arg(&self.guidance_scale)
-                    .arg(&dt)
-                    .arg(&count)
-                    .launch(super::ops::flat(channels * length))?;
-            }
+            self.guided_euler_update(&mut ws.x, &ws.pair_v_c, &ws.pair_v_u, dt, channels * length)?;
         }
         self.vocoder(ws, length, audio)?;
         Ok(())
     }
 
-    /// Fused guided euler update, the raw-pointer launch form synthesize
-    /// uses.
-    #[cfg(test)]
-    pub fn guided_euler_for_test(
+    /// Fused guided Euler update over the first `count` elements; the
+    /// launch form synthesize and the euler gate share.
+    pub(crate) fn guided_euler_update(
         &self,
         x: &mut CudaSlice<f32>,
         c: &CudaSlice<f32>,
         u: &CudaSlice<f32>,
         dt: f32,
+        count: usize,
     ) -> Result<()> {
         let s = &self.stream;
-        let count = x.len();
         let x_ptr = x.device_ptr_mut(s).0;
         let c_ptr = c.device_ptr(s).0;
         let u_ptr = u.device_ptr(s).0;

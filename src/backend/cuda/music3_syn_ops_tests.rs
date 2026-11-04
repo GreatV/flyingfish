@@ -459,11 +459,13 @@ mod euler {
             let u = tensor_f32(&view, &format!("syn_velocity_uncond_{step:03}"))?;
             let d_c = s.clone_htod(&c)?;
             let d_u = s.clone_htod(&u)?;
-            engine.guided_euler_for_test(
+            let count = x.len();
+            engine.guided_euler_update(
                 &mut x,
                 &d_c,
                 &d_u,
                 want_sigma[step + 1] - want_sigma[step],
+                count,
             )?;
             let got = s.clone_dtoh(&x)?;
             let delta = got
