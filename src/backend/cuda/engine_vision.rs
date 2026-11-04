@@ -5585,7 +5585,7 @@ impl NafEncoder {
         let available = free_budget
             .checked_sub(fixed)
             .context("NAF fixed workspace exceeds remaining device budget")?;
-        let conv_rows = (available / (128 * 9 * 4)).min(pixels).min(32768) as u32;
+        let conv_rows = ((available / (128 * 9 * 4)).min(pixels).min(32768) / 4 * 4) as u32;
         ensure!(
             conv_rows > 0,
             "NAF convolution workspace has no row capacity"

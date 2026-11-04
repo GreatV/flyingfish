@@ -1564,7 +1564,17 @@ pub fn resize_lanczos(
             }
         }
     }
-    let weights = |from: usize, to: usize| coefficients(from, to, (lanczos, 3.0));
+    let weights = |from: usize, to: usize| {
+        let mut weights = coefficients(from, to, (lanczos, 3.0));
+        if let ResizeRounding::Fixed22 = rounding {
+            for (_, values) in &mut weights {
+                for value in values {
+                    *value = (*value * 4194304.0).round();
+                }
+            }
+        }
+        weights
+    };
     let sample = |weights: &[f64], pixels: &[u8], first: usize, stride: usize| -> u8 {
         match rounding {
             ResizeRounding::F64 => weights
@@ -1576,7 +1586,7 @@ pub fn resize_lanczos(
                 .clamp(0.0, 255.0) as u8,
             ResizeRounding::Fixed22 => {
                 (weights.iter().enumerate().fold(1i64 << 21, |sum, (i, w)| {
-                    sum + (w * 4194304.0).round() as i64 * i64::from(pixels[first + i * stride])
+                    sum + *w as i64 * i64::from(pixels[first + i * stride])
                 }) >> 22)
                     .clamp(0, 255) as u8
             }
@@ -2350,16 +2360,26 @@ mod tests {
 
     #[test]
     fn lanczos_u8_matches_rgb_and_rgba_goldens() -> Result<()> {
+        let mut state = 123456789u32;
         let rgb = RgbImage {
-            width: 97,
-            height: 83,
-            pixels: (0..97 * 83 * 3)
-                .map(|i| ((i * 73 + i / 11 * 19) % 256) as u8)
+            width: 263,
+            height: 263,
+            pixels: (0..263 * 263 * 3)
+                .map(|_| {
+                    state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (state >> 24) as u8
+                })
                 .collect(),
         };
-        let merged = resize_separable(&rgb, 151, 43, (lanczos, 3.0));
-        let f64_pixels = resize_lanczos(&rgb.pixels, [83, 97, 3], [43, 151], ResizeRounding::F64)?;
-        let fixed = resize_lanczos(&rgb.pixels, [83, 97, 3], [43, 151], ResizeRounding::Fixed22)?;
+        let merged = resize_separable(&rgb, 97, 263, (lanczos, 3.0));
+        let f64_pixels =
+            resize_lanczos(&rgb.pixels, [263, 263, 3], [263, 97], ResizeRounding::F64)?;
+        let fixed = resize_lanczos(
+            &rgb.pixels,
+            [263, 263, 3],
+            [263, 97],
+            ResizeRounding::Fixed22,
+        )?;
         ensure!(f64_pixels == merged, "merged H3 F64 Lanczos bytes changed");
         let differing = fixed.iter().zip(&merged).filter(|(a, b)| a != b).count();
         ensure!(
