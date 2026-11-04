@@ -341,8 +341,7 @@ pub struct PixalFlow {
     spec: FlowSpec,
     rows: usize,
     coordinates: Vec<[i32; 3]>,
-    pub weight_bytes: usize,
-    pub reserved_bytes: usize,
+    steps: usize,
     _bf16: BTreeMap<String, CudaSlice<bf16>>,
     _f32: BTreeMap<String, CudaSlice<f32>>,
     blocks: Vec<Block>,
@@ -384,10 +383,15 @@ impl PixalFlow {
             "sparse_structure_sampler"
         }];
         let parameters = &sampler["params"];
+        let steps = usize::try_from(
+            parameters["steps"]
+                .as_u64()
+                .context("sampler steps missing")?,
+        )?;
         ensure!(
             sampler["name"] == "FlowEulerGuidanceIntervalSampler"
                 && sampler["args"]["sigma_min"] == 1e-5
-                && parameters["steps"] == 12
+                && steps == 12
                 && parameters["guidance_strength"] == 7.5
                 && parameters["guidance_interval"] == serde_json::json!([0.6, 1.0])
                 && parameters["guidance_rescale"] == if spec.sparse() { 0.5 } else { 0.7 }
@@ -515,7 +519,12 @@ impl PixalFlow {
         let input = Linear::bind(&fp, &device, "input_layer", [h, spec.in_channels])?;
         let output = Linear::bind(&fp, &device, "out_layer", [spec.out_channels, h])?;
         let time = [
-            Linear::bind(&fp, &device, "t_embedder.mlp.0", [h, 256])?,
+            Linear::bind(
+                &fp,
+                &device,
+                "t_embedder.mlp.0",
+                [h, tensors["t_embedder.mlp.0.weight"].shape[1]],
+            )?,
             Linear::bind(&fp, &device, "t_embedder.mlp.2", [h, h])?,
             Linear::bind(&fp, &device, "adaLN_modulation.1", [6 * h, h])?,
         ];
@@ -556,16 +565,17 @@ impl PixalFlow {
         };
         let work = Work::new(&device, rows, &spec)?;
         let flash = Flash::new(device.stream.clone(), rows, heads, heads, dim)?;
-        let mods = device.stream.alloc_zeros(12 * 6 * h)?;
+        let mods = device.stream.alloc_zeros(steps * 6 * h)?;
         let condition_bytes = 4usize
             .checked_mul(5 * spec.cond_channels + rows * spec.projection_width())
             .context("flow conditioning bytes overflow")?;
         let sampler_bytes = rows
             .checked_mul(spec.in_channels)
-            .and_then(|n| n.checked_mul(32))
+            .and_then(|n| n.checked_mul(8 * size_of::<f32>()))
             .and_then(|n| n.checked_add(8))
             .context("flow sampler bytes overflow")?;
-        let time_bytes = 4 * (12 * (256 + 8 * h + 1) + h + 128);
+        let time_width = time[0].weight.shape[1] as usize;
+        let time_bytes = size_of::<f32>() * (steps * (time_width + 8 * h + 1) + h + time_width / 2);
         let live_bytes = condition_bytes
             .checked_add(sampler_bytes)
             .and_then(|n| n.checked_add(time_bytes))
@@ -577,15 +587,12 @@ impl PixalFlow {
             cross_budget,
         )?;
         device.workspace_budget(free, budget, live_bytes)?;
-        let (remaining, _) = device.ctx.mem_get_info()?;
-        let reserved_bytes = free.saturating_sub(remaining);
         Ok(Self {
             device,
             spec,
             rows,
             coordinates: coordinates.to_vec(),
-            weight_bytes: checkpoint.runtime_bytes,
-            reserved_bytes,
+            steps,
             _bf16: bf,
             _f32: fp,
             blocks,
@@ -638,7 +645,7 @@ impl PixalFlow {
     }
     fn set_times(&mut self, times: &[f32]) -> Result<()> {
         ensure!(
-            !times.is_empty() && times.len() <= 12 && times.iter().all(|x| x.is_finite()),
+            !times.is_empty() && times.len() <= self.steps && times.iter().all(|x| x.is_finite()),
             "invalid flow time setup"
         );
         let d = &self.device;
@@ -1152,29 +1159,20 @@ impl Sampler {
     }
 }
 
-fn schedule(sparse: bool) -> [f64; 13] {
+fn schedule(sparse: bool, steps: usize) -> Vec<f64> {
     let scale = if sparse { 3.0 } else { 5.0 };
-    std::array::from_fn(|i| {
-        let t = if i == 12 {
-            0.0
-        } else {
-            1.0 + i as f64 * (-1.0 / 12.0)
-        };
-        scale * t / (1.0 + (scale - 1.0) * t)
-    })
+    (0..=steps)
+        .map(|i| {
+            let t = if i == steps {
+                0.0
+            } else {
+                1.0 + i as f64 * (-1.0 / steps as f64)
+            };
+            scale * t / (1.0 + (scale - 1.0) * t)
+        })
+        .collect()
 }
 impl PixalFlow {
-    pub fn denormalize(&self, latent: &[f32], mean: &[f32], std: &[f32]) -> Result<Vec<f32>> {
-        ensure!(
-            self.spec.sparse()
-                && latent.len() == self.rows * 32
-                && latent.iter().all(|x| x.is_finite()),
-            "shape latent extent or finiteness differs from setup"
-        );
-        let mut values = self.device.stream.clone_htod(latent)?;
-        denormalize_shape(&self.device, &mut values, mean, std)?;
-        Ok(self.device.stream.clone_dtoh(&values)?)
-    }
     pub fn sample(
         &mut self,
         noise: &[f32],
@@ -1185,11 +1183,14 @@ impl PixalFlow {
             noise.len() == self.rows * self.spec.in_channels,
             "noise extent differs from flow geometry"
         );
-        let times = schedule(self.spec.sparse());
-        let model_times: Vec<_> = times[..12].iter().map(|t| (1000.0 * t) as f32).collect();
+        let times = schedule(self.spec.sparse(), self.steps);
+        let model_times: Vec<_> = times[..self.steps]
+            .iter()
+            .map(|t| (1000.0 * t) as f32)
+            .collect();
         self.set_times(&model_times)?;
         let mut sampler = Sampler::new(&self.device, noise)?;
-        for step in 0..12 {
+        for step in 0..self.steps {
             self.forward(&sampler.state, step, positive, &mut sampler.positive)?;
             if (0.6..=1.0).contains(&times[step]) {
                 self.forward(&sampler.state, step, negative, &mut sampler.negative)?;
@@ -1206,17 +1207,20 @@ impl PixalFlow {
 }
 
 /// Published per-channel latent denormalization, F32 multiply then F32 add.
+#[cfg(test)]
 fn denormalize_shape(
     d: &Device,
     values: &mut CudaSlice<f32>,
     mean: &[f32],
     std: &[f32],
+    channels: usize,
 ) -> Result<()> {
     ensure!(
-        mean.len() == 32
-            && std.len() == 32
+        channels > 0
+            && mean.len() == channels
+            && std.len() == channels
             && !values.is_empty()
-            && values.len().is_multiple_of(32),
+            && values.len().is_multiple_of(channels),
         "shape latent normalization extent mismatch"
     );
     ensure!(
@@ -1233,8 +1237,8 @@ fn denormalize_shape(
             .arg(&std)
             .arg(&mean)
             .arg(&ptr(values, d))
-            .arg(&u32::try_from(values.len() / 32)?)
-            .arg(&32u32)
+            .arg(&u32::try_from(values.len() / channels)?)
+            .arg(&u32::try_from(channels)?)
             .launch(flat(values.len()))?;
     }
     Ok(())

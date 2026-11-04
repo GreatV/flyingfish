@@ -1168,7 +1168,7 @@ __device__ __forceinline__ void channel_scale_residual(
         if constexpr (sizeof(T) == sizeof(float))
             y[i] = __fadd_rn(residual[broadcast_residual ? c : i], __fmul_rn(branch[i], scale[c]));
         else
-            y[i] = __hadd(residual[i], __hmul(branch[i], scale[c]));
+            y[i] = __hadd(residual[broadcast_residual ? c : i], __hmul(branch[i], scale[c]));
     }
 }
 
@@ -1226,7 +1226,8 @@ extern "C" __global__ void tanh_f32(float* __restrict__ x, long long count) {
     x[i] = tanhf(x[i]);
 }
 
-// Guided Euler update: x += dt * (u + scale * (c - u)), elementwise F32.
+// F32 guide: form 0 = u + scale*(c-u), form 1 = scale*c + (1-scale)*u.
+// Non-null velocity stores the guide; non-null x accumulates dt*guide.
 extern "C" __global__ void guided_euler_f32(float* x,
     const float* c, const float* u, float scale, float dt, long long count,
     int form, float* velocity) {

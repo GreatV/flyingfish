@@ -280,12 +280,13 @@ impl Gate {
 #[test]
 fn sampler_schedule_preserves_cfg_branch_counts() {
     for (sparse, expected) in [(false, 22), (true, 21)] {
-        let times = schedule(sparse);
+        let steps = 12;
+        let times = schedule(sparse, steps);
         assert_eq!(times[0], 1.0);
-        assert_eq!(times[12], 0.0);
+        assert_eq!(times[steps], 0.0);
         assert!(times.windows(2).all(|t| t[0] > t[1]));
         assert_eq!(
-            times[..12]
+            times[..steps]
                 .iter()
                 .map(|t| 1 + usize::from((0.6..=1.0).contains(t)))
                 .sum::<usize>(),
@@ -394,16 +395,17 @@ fn flow_cells(
     negative: &Conditioning,
 ) -> Result<()> {
     let sparse = flow.spec.sparse();
-    let times = schedule(sparse);
+    let steps = flow.steps;
+    let times = schedule(sparse, steps);
     flow.set_times(
-        &times[..12]
+        &times[..steps]
             .iter()
             .map(|t| (1000.0 * t) as f32)
             .collect::<Vec<_>>(),
     )?;
     let mut sampler = Sampler::new(&flow.device, noise)?;
     let mut call = 0;
-    for step in 0..12 {
+    for step in 0..steps {
         for (index, condition) in [positive, negative].into_iter().enumerate() {
             if index == 1 && !(0.6..=1.0).contains(&times[step]) {
                 continue;
@@ -447,7 +449,7 @@ fn flow_cells(
         &flow.device.stream.clone_dtoh(&sampler.state)?,
     )?;
     println!(
-        "P1_M3A_FLOW_COMPLETE table={} fixture={:?} forwards={call} steps=12",
+        "P1_M3A_FLOW_COMPLETE table={} fixture={:?} forwards={call} steps={steps}",
         case.table, case.fixture
     );
     Ok(())
@@ -973,6 +975,11 @@ fn transitions(gate: &mut Gate, model: &Path, root: &Path) -> Result<()> {
             .map(|v| Ok(v.as_f64().context("normalization value invalid")? as f32))
             .collect()
     };
+    let channels = FlowSpec::read(
+        &model.join("ckpts"),
+        "slat_flow_img2shape_dit_1_3B_1024_bf16",
+    )?
+    .out_channels;
     let mean = coefficients("mean")?;
     let std = coefficients("std")?;
     let d = Device::new(0)?;
@@ -986,7 +993,7 @@ fn transitions(gate: &mut Gate, model: &Path, root: &Path) -> Result<()> {
         let mut values = d
             .stream
             .clone_htod(&host.values.iter().map(|&x| x as f32).collect::<Vec<_>>())?;
-        denormalize_shape(&d, &mut values, &mean, &std)?;
+        denormalize_shape(&d, &mut values, &mean, &std, channels)?;
         gate.score_f32(
             id(
                 "floors-transition-published.json",
