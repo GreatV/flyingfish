@@ -191,23 +191,7 @@ impl MappedCheckpoint {
             );
             let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
             let map = unsafe { MmapOptions::new().map(&file)? };
-            ensure!(map.len() >= 8, "truncated safetensors header");
-            let hlen = usize::try_from(u64::from_le_bytes(map[..8].try_into()?))?;
-            let end = 8usize.checked_add(hlen).context("header size overflow")?;
-            ensure!(
-                hlen <= 16 * 1024 * 1024 && end <= map.len(),
-                "invalid safetensors header size"
-            );
-            let header: Header = serde_json::from_slice(&map[8..end])?;
             let tensors = published_tensors(&map)?;
-            if !tensors.values().any(|t| t.dtype == "C64") {
-                SafeTensors::deserialize(&map)?;
-            }
-            ensure!(
-                header.0.len()
-                    == tensors.len() + usize::from(header.0.contains_key("__metadata__")),
-                "header tensor count mismatch"
-            );
             for name in tensors.keys() {
                 ensure!(
                     index.weight_map.get(name) == Some(shard),
@@ -3873,6 +3857,35 @@ mod component_tests {
         assert!(published_tensors(&make(2, 0, 8)?).is_err());
         assert!(published_tensors(&make(2, 8, 24)?).is_err());
         assert!(published_tensors(&make(usize::MAX, 0, 16)?).is_err());
+        let root = std::env::temp_dir().join(format!("ff-indexed-packed-{}", std::process::id()));
+        std::fs::create_dir(&root)?;
+        let write_shard = |name: &str, dtype: &str, bytes: usize| -> Result<()> {
+            let header = serde_json::to_vec(&serde_json::json!({
+                name: {"dtype":dtype,"shape":[4],"data_offsets":[0,bytes]}
+            }))?;
+            let mut data = (header.len() as u64).to_le_bytes().to_vec();
+            data.extend(header);
+            data.resize(data.len() + bytes, 0);
+            std::fs::write(root.join(format!("{name}.safetensors")), data)?;
+            Ok(())
+        };
+        write_shard("packed", "F4", 2)?;
+        write_shard("float8", "F8_E4M3", 4)?;
+        std::fs::write(
+            root.join("model.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({"weight_map":{
+                "packed":"packed.safetensors","float8":"float8.safetensors"
+            }}))?,
+        )?;
+        let checkpoint = MappedCheckpoint::open(&root)?;
+        let tensors = checkpoint.component_tensors()?;
+        assert_eq!(tensors["packed"].data.len(), 2);
+        assert_eq!(tensors["float8"].data.len(), 4);
+        drop(tensors);
+        drop(checkpoint);
+        write_shard("packed", "F4", 3)?;
+        assert!(MappedCheckpoint::open(&root).is_err());
+        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 

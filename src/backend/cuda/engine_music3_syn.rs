@@ -1059,6 +1059,8 @@ impl Music3Syn {
                 .arg(&self.guidance_scale)
                 .arg(&dt)
                 .arg(&(count as i64))
+                .arg(&0i32)
+                .arg(&0u64)
                 .launch(super::ops::flat(count))?;
         }
         Ok(())

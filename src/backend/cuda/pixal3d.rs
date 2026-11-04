@@ -106,6 +106,8 @@ struct Block {
     gamma: [u64; 4],
 }
 struct Kernels {
+    heads: usize,
+    head_dim: usize,
     norm: CudaFunction,
     norm_f32: CudaFunction,
     l2: CudaFunction,
@@ -126,20 +128,22 @@ struct Kernels {
     transpose: CudaFunction,
 }
 impl Kernels {
-    fn load(d: &Device) -> Result<Self> {
+    fn load(d: &Device, spec: &FlowSpec) -> Result<Self> {
         let q = cubin::module(&d.ctx, "q38_common")?;
         let n = cubin::module(&d.ctx, "norm")?;
         let r = cubin::module(&d.ctx, "rope")?;
         let m = cubin::module(&d.ctx, "modulate")?;
         let v = cubin::module(&d.ctx, "vision_ops")?;
         Ok(Self {
+            heads: spec.num_heads,
+            head_dim: spec.model_channels / spec.num_heads,
             norm: q.load_function("q38_layer_norm_bf16_affine_f32")?,
             norm_f32: q.load_function("q38_layer_norm_f32")?,
             l2: n.load_function("l2_norm_scale_bf16")?,
             unpack: v.load_function("qkv_unpack_hm_bf16")?,
             rope: r.load_function("rope_pair_tail_rn")?,
             rope_hm: r.load_function("rope_pair_tail_hm")?,
-            phases: r.load_function("rope_pair_rows_3d")?,
+            phases: r.load_function("rope_pair_rows_3d_direct")?,
             modulate: m.load_function("row_modulate")?,
             gated: m.load_function("row_gated_add")?,
             add_mod: m.load_function("add_row_bf16_f32")?,
@@ -225,12 +229,12 @@ impl Kernels {
                 .arg(&gamma)
                 .arg(&output)
                 .arg(&(rows as i32))
-                .arg(&12i32)
-                .arg(&128i32)
-                .arg(&128f32.sqrt())
+                .arg(&(self.heads as i32))
+                .arg(&(self.head_dim as i32))
+                .arg(&(self.head_dim as f32).sqrt())
                 .arg(&1e-12f32)
                 .arg(&(if head_major { rows as i32 } else { 0 }))
-                .launch(grid(rows * 12, 32))?;
+                .launch(grid(rows * self.heads, 32))?;
         }
         Ok(())
     }
@@ -251,10 +255,10 @@ impl Kernels {
                 .arg(&outputs[2])
                 .arg(&1u32)
                 .arg(&(rows as u32))
-                .arg(&12u32)
-                .arg(&128u32)
+                .arg(&(self.heads as u32))
+                .arg(&(self.head_dim as u32))
                 .arg(&parts)
-                .launch(flat(rows * 1536))?;
+                .launch(flat(rows * self.heads * self.head_dim))?;
         }
         Ok(())
     }
@@ -297,9 +301,9 @@ struct Work {
     block_mod: CudaSlice<bf16>,
 }
 impl Work {
-    fn new(d: &Device, n: usize, channels: usize) -> Result<Self> {
+    fn new(d: &Device, n: usize, spec: &FlowSpec) -> Result<Self> {
         let s = &d.stream;
-        let h = 1536;
+        let h = spec.model_channels;
         Ok(Self {
             row_index: s.alloc_zeros(n)?,
             hidden: s.alloc_zeros(n * h)?,
@@ -311,7 +315,7 @@ impl Work {
             v: s.alloc_zeros(n * h)?,
             kn: s.alloc_zeros(n * h)?,
             attention: s.alloc_zeros(n * h)?,
-            ff: s.alloc_zeros(n * 8192)?,
+            ff: s.alloc_zeros(n * spec.feed_forward_width())?,
             cross_kv: s.alloc_zeros(10 * h)?,
             cross_k: s.alloc_zeros(5 * h)?,
             cross_kn: s.alloc_zeros(5 * h)?,
@@ -321,8 +325,8 @@ impl Work {
             cross_v32: s.alloc_zeros(5 * h)?,
             cross_out32: s.alloc_zeros(n * h)?,
             outer: s.alloc_zeros(n * h)?,
-            input_rows: s.alloc_zeros(n * channels)?,
-            output_rows: s.alloc_zeros(n * channels)?,
+            input_rows: s.alloc_zeros(n * spec.in_channels)?,
+            output_rows: s.alloc_zeros(n * spec.in_channels)?,
             block_mod: s.alloc_zeros(6 * h)?,
         })
     }
@@ -392,7 +396,7 @@ impl PixalFlow {
         );
         let rows = coordinates.len();
         ensure!(
-            rows > 0 && rows <= i32::MAX as usize / (3 * 1536),
+            rows > 0 && rows <= i32::MAX as usize / (3 * spec.model_channels),
             "flow row extent overflow"
         );
         ensure!(
@@ -424,25 +428,7 @@ impl PixalFlow {
             budget > 0 && budget <= total,
             "invalid admitted flow device budget"
         );
-        let work_bytes = rows
-            .checked_mul(
-                2 * (11 * 1536 + 8192)
-                    + 4 * (3 * 1536 + 8 * spec.in_channels + 128)
-                    + 4 * spec.projection_width()
-                    + 4,
-            )
-            .context("flow workspace overflow")?;
-        let reserve = checkpoint
-            .runtime_bytes
-            .checked_add(work_bytes)
-            .and_then(|x| x.checked_add(512 << 20))
-            .context("flow reservation overflow")?;
-        ensure!(
-            reserve <= free.min(budget),
-            "flow setup needs {reserve} bytes; available {}",
-            free.min(budget)
-        );
-        let kernels = Kernels::load(&device)?;
+        let kernels = Kernels::load(&device, &spec)?;
         let ops = Ops::new(&device.ctx)?;
         let mut blas = Blas::new(
             &device,
@@ -493,11 +479,15 @@ impl PixalFlow {
                 qkv: linear("self_attn.to_qkv", 3 * h, h)?,
                 self_out: linear("self_attn.to_out", h, h)?,
                 cross_q: linear("cross_attn.cross_attn_block.to_q", h, h)?,
-                cross_kv: linear("cross_attn.cross_attn_block.to_kv", 2 * h, 1024)?,
+                cross_kv: linear(
+                    "cross_attn.cross_attn_block.to_kv",
+                    2 * h,
+                    spec.cond_channels,
+                )?,
                 cross_out: linear("cross_attn.cross_attn_block.to_out", h, h)?,
                 projection: linear("cross_attn.proj_linear", h, spec.projection_width())?,
-                fc1: linear("mlp.mlp.0", 8192, h)?,
-                fc2: linear("mlp.mlp.2", h, 8192)?,
+                fc1: linear("mlp.mlp.0", spec.feed_forward_width(), h)?,
+                fc2: linear("mlp.mlp.2", h, spec.feed_forward_width())?,
                 norm_weight: weight("norm2.weight"),
                 norm_bias: weight("norm2.bias"),
                 modulation: weight("modulation"),
@@ -529,23 +519,25 @@ impl PixalFlow {
             Linear::bind(&fp, &device, "t_embedder.mlp.2", [h, h])?,
             Linear::bind(&fp, &device, "adaLN_modulation.1", [6 * h, h])?,
         ];
+        let heads = spec.num_heads;
+        let dim = h / heads;
         let phases = if spec.sparse() {
             let values: Vec<_> = coordinates
                 .iter()
                 .flat_map(|p| p.iter().map(|&x| x as f32))
                 .collect();
             let points = device.stream.clone_htod(&values)?;
-            let freqs: Vec<f32> = (0..64)
+            let freqs: Vec<f32> = (0..dim / 2)
                 .map(|i| {
-                    if i == 63 {
+                    if i >= 3 * (dim / 6) {
                         0.0
                     } else {
-                        1.0 / 10000f32.powf((i % 21) as f32 / 21.0)
+                        1.0 / 10000f32.powf((i % (dim / 6)) as f32 / (dim / 6) as f32)
                     }
                 })
                 .collect();
             let freqs = device.stream.clone_htod(&freqs)?;
-            let phase = device.stream.alloc_zeros(rows * 128)?;
+            let phase = device.stream.alloc_zeros(rows * dim)?;
             unsafe {
                 device
                     .stream
@@ -554,34 +546,39 @@ impl PixalFlow {
                     .arg(&freqs)
                     .arg(&(rows as i32))
                     .arg(&1i32)
-                    .arg(&128i32)
+                    .arg(&(dim as i32))
                     .arg(&phase)
-                    .arg(&1i32)
-                    .launch(flat(rows * 64))?;
+                    .launch(flat(rows * dim / 2))?;
             }
             phase
         } else {
             fp.remove("rope_phases").context("SS phases missing")?
         };
-        let work = Work::new(&device, rows, spec.in_channels)?;
-        let flash = Flash::new(device.stream.clone(), rows, 12, 12, 128)?;
+        let work = Work::new(&device, rows, &spec)?;
+        let flash = Flash::new(device.stream.clone(), rows, heads, heads, dim)?;
+        let mods = device.stream.alloc_zeros(12 * 6 * h)?;
+        let condition_bytes = 4usize
+            .checked_mul(5 * spec.cond_channels + rows * spec.projection_width())
+            .context("flow conditioning bytes overflow")?;
+        let sampler_bytes = rows
+            .checked_mul(spec.in_channels)
+            .and_then(|n| n.checked_mul(32))
+            .and_then(|n| n.checked_add(8))
+            .context("flow sampler bytes overflow")?;
+        let time_bytes = 4 * (12 * (256 + 8 * h + 1) + h + 128);
+        let live_bytes = condition_bytes
+            .checked_add(sampler_bytes)
+            .and_then(|n| n.checked_add(time_bytes))
+            .context("flow live bytes overflow")?;
+        let cross_budget = device.workspace_budget(free, budget, live_bytes)?;
         let cross = F32Attention::new(
             device.stream.clone(),
-            [12, rows as u32, 5, 128, 128],
-            8 << 20,
+            [heads as u32, rows as u32, 5, dim as u32, dim as u32],
+            cross_budget,
         )?;
-        let mods = device.stream.alloc_zeros(12 * 6 * h)?;
-        device.stream.synchronize()?;
+        device.workspace_budget(free, budget, live_bytes)?;
         let (remaining, _) = device.ctx.mem_get_info()?;
         let reserved_bytes = free.saturating_sub(remaining);
-        ensure!(
-            reserved_bytes <= budget,
-            "flow allocations exceed admitted budget"
-        );
-        println!(
-            "PIXAL_FLOW_SETUP rows={rows} weight_bytes={} work_bound={work_bytes} reserve={reserve} allocated_delta={reserved_bytes} mode=eager serial_samples=true",
-            checkpoint.runtime_bytes
-        );
         Ok(Self {
             device,
             spec,
@@ -646,15 +643,17 @@ impl PixalFlow {
         );
         let d = &self.device;
         let n = times.len();
+        let h = self.spec.model_channels;
+        let half = self.time[0].weight.shape[1] as usize / 2;
         let t = d.stream.clone_htod(times)?;
-        let freq: Vec<_> = (0..128)
-            .map(|i| (-10000f64.ln() as f32 * i as f32 / 128.0).exp())
+        let freq: Vec<_> = (0..half)
+            .map(|i| (-10000f64.ln() as f32 * i as f32 / half as f32).exp())
             .collect();
         let freq = d.stream.clone_htod(&freq)?;
-        let embed = d.stream.alloc_zeros::<f32>(n * 256)?;
-        let first = d.stream.alloc_zeros::<f32>(n * 1536)?;
-        let second = d.stream.alloc_zeros::<f32>(n * 1536)?;
-        let all = d.stream.alloc_zeros::<f32>(n * 9216)?;
+        let embed = d.stream.alloc_zeros::<f32>(n * half * 2)?;
+        let first = d.stream.alloc_zeros::<f32>(n * h)?;
+        let second = d.stream.alloc_zeros::<f32>(n * h)?;
+        let all = d.stream.alloc_zeros::<f32>(n * 6 * h)?;
         unsafe {
             d.stream
                 .launch_builder(&self.kernels.sinusoid)
@@ -662,26 +661,26 @@ impl PixalFlow {
                 .arg(&freq)
                 .arg(&embed)
                 .arg(&(n as u32))
-                .arg(&128u32)
+                .arg(&(half as u32))
                 .arg(&0i32)
-                .launch(flat(n * 128))?;
+                .launch(flat(n * half))?;
         }
         self.linear_f32(self.time[0], n, ptr(&embed, d), ptr(&first, d), true)?;
         self.linear_f32(self.time[1], n, ptr(&first, d), ptr(&second, d), false)?;
-        let zero = d.stream.alloc_zeros::<f32>(1536)?;
+        let zero = d.stream.alloc_zeros::<f32>(h)?;
         unsafe {
             d.stream
                 .launch_builder(&self.kernels.silu)
                 .arg(&second)
                 .arg(&zero)
                 .arg(&second)
-                .arg(&((n * 1536) as u32))
-                .arg(&1536u32)
-                .launch(flat(n * 1536))?;
+                .arg(&((n * h) as u32))
+                .arg(&(h as u32))
+                .launch(flat(n * h))?;
         }
         self.linear_f32(self.time[2], n, ptr(&second, d), ptr(&all, d), false)?;
         self.kernels
-            .cast(d, ptr(&all, d), ptr(&self.mods, d), n * 9216)?;
+            .cast(d, ptr(&all, d), ptr(&self.mods, d), n * 6 * h)?;
         self.time_count = n;
         Ok(())
     }
@@ -696,7 +695,8 @@ impl PixalFlow {
             "conditioning coordinate rows differ from flow setup"
         );
         ensure!(
-            global.len() == 5 * 1024 && projected.len() == self.rows * self.spec.projection_width(),
+            global.len() == 5 * self.spec.cond_channels
+                && projected.len() == self.rows * self.spec.projection_width(),
             "flow conditioning shape mismatch"
         );
         ensure!(
@@ -719,7 +719,10 @@ impl PixalFlow {
     fn block(&mut self, index: usize, modulation: u64, conditioning: &Conditioning) -> Result<()> {
         let d = &self.device;
         let n = self.rows;
-        let h = 1536;
+        let h = self.spec.model_channels;
+        let heads = self.spec.num_heads;
+        let dim = h / heads;
+        let ff = self.spec.feed_forward_width();
         let b = &self.blocks[index];
         let k = &self.kernels;
         let hidden = ptr(&self.work.hidden, d);
@@ -737,9 +740,9 @@ impl PixalFlow {
                 .arg(&modulation)
                 .arg(&b.modulation)
                 .arg(&bm)
-                .arg(&9216u64)
-                .arg(&9216u32)
-                .launch(flat(9216))?;
+                .arg(&((6 * h) as u64))
+                .arg(&((6 * h) as u32))
+                .launch(flat(6 * h))?;
         }
         k.norm(d, hidden, norm, [n, h], [0, 0], (1e-6, false))?;
         self.modulate(norm, bm, 0)?;
@@ -754,15 +757,15 @@ impl PixalFlow {
                     .arg(&data)
                     .arg(&self.phases)
                     .arg(&(n as i32))
-                    .arg(&12i32)
-                    .arg(&128i32)
-                    .arg(&128i32)
-                    .launch(flat(n * 12 * 64))?;
+                    .arg(&(heads as i32))
+                    .arg(&(dim as i32))
+                    .arg(&(dim as i32))
+                    .launch(flat(n * heads * dim / 2))?;
             }
         }
         self.flash.run(
             &self.work.q,
-            1536,
+            h,
             &self.work.kn,
             &self.work.v,
             &mut self.work.attention,
@@ -770,9 +773,9 @@ impl PixalFlow {
                 rows: n,
                 start: 0,
                 capacity: n,
-                q_heads: 12,
-                kv_heads: 12,
-                head_dim: 128,
+                q_heads: heads,
+                kv_heads: heads,
+                head_dim: dim,
                 causal: false,
                 window_left: None,
             },
@@ -827,17 +830,17 @@ impl PixalFlow {
             &self.work.cross_q32,
             &d.stream,
             0,
-            [12, n as u32, 128],
-            [128, 1536, 1],
+            [heads as u32, n as u32, dim as u32],
+            [dim as u64, h as u64, 1],
         )?;
-        let k32 = dense(&self.work.cross_k32, d, [12, 5, 128])?;
-        let v32 = dense(&self.work.cross_v32, d, [12, 5, 128])?;
+        let k32 = dense(&self.work.cross_k32, d, [heads as u32, 5, dim as u32])?;
+        let v32 = dense(&self.work.cross_v32, d, [heads as u32, 5, dim as u32])?;
         let out32 = view(
             &self.work.cross_out32,
             &d.stream,
             0,
-            [12, n as u32, 128],
-            [128, 1536, 1],
+            [heads as u32, n as u32, dim as u32],
+            [dim as u64, h as u64, 1],
         )?;
         self.cross
             .run(&self.blas, q32, k32, v32, &mut TensorMut(out32))?;
@@ -857,23 +860,24 @@ impl PixalFlow {
                 .arg(&self.work.ff)
                 .arg(&(n as u32))
                 .arg(&1u32)
-                .arg(&8192u32)
-                .arg(&8192u64)
+                .arg(&(ff as u32))
+                .arg(&(ff as u64))
                 .arg(&0u64)
                 .arg(&1u64)
-                .arg(&8192u64)
+                .arg(&(ff as u64))
                 .arg(&0u64)
                 .arg(&1u64)
                 .arg(&1i32)
-                .launch(grid((n * 8192).div_ceil(256).min(65535), 256))?;
+                .launch(grid((n * ff).div_ceil(256).min(65535), 256))?;
         }
         b.fc2.run(&self.blas, n, ptr(&self.work.ff, d), projected)?;
         self.gated_add(projected, bm, 5)?;
         Ok(())
     }
     fn modulate(&self, values: u64, modulation: u64, part: usize) -> Result<()> {
-        let shift = modulation + (part * 1536 * 2) as u64;
-        let scale = shift + 1536 * 2;
+        let h = self.spec.model_channels;
+        let shift = modulation + (part * h * 2) as u64;
+        let scale = shift + (h * 2) as u64;
         unsafe {
             self.device
                 .stream
@@ -884,11 +888,11 @@ impl PixalFlow {
                 .arg(&self.work.row_index)
                 .arg(&values)
                 .arg(&(self.rows as i32))
-                .arg(&1536i32)
-                .arg(&9216u64)
+                .arg(&(h as i32))
+                .arg(&((6 * h) as u64))
                 .arg(&1u32)
                 .launch(crate::backend::gpu::LaunchConfig {
-                    grid_dim: (self.rows as u32, 6, 1),
+                    grid_dim: (self.rows as u32, h.div_ceil(256) as u32, 1),
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 })?;
@@ -896,7 +900,8 @@ impl PixalFlow {
         Ok(())
     }
     fn gated_add(&self, values: u64, modulation: u64, part: usize) -> Result<()> {
-        let gate = modulation + (part * 1536 * 2) as u64;
+        let h = self.spec.model_channels;
+        let gate = modulation + (part * h * 2) as u64;
         unsafe {
             self.device
                 .stream
@@ -906,11 +911,11 @@ impl PixalFlow {
                 .arg(&gate)
                 .arg(&self.work.row_index)
                 .arg(&(self.rows as i32))
-                .arg(&1536i32)
-                .arg(&9216u64)
+                .arg(&(h as i32))
+                .arg(&((6 * h) as u64))
                 .arg(&1u32)
                 .launch(crate::backend::gpu::LaunchConfig {
-                    grid_dim: (self.rows as u32, 6, 1),
+                    grid_dim: (self.rows as u32, h.div_ceil(256) as u32, 1),
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 })?;
@@ -941,7 +946,7 @@ impl PixalFlow {
             "flow input/time extent differs from setup"
         );
         ensure!(
-            conditioning.global.len() == 5 * 1024
+            conditioning.global.len() == 5 * self.spec.cond_channels
                 && conditioning.projected.len() == self.rows * self.spec.projection_width(),
             "conditioning belongs to different flow geometry"
         );
@@ -1132,7 +1137,6 @@ impl Sampler {
         } else {
             d.stream.memcpy_dtod(&self.positive, &mut self.velocity)?;
         }
-        self.convert(d, ptr(&self.velocity, d), ptr(&self.x0, d), t, false)?;
         unsafe {
             d.stream
                 .launch_builder(&self.euler)
