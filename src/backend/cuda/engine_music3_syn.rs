@@ -56,6 +56,18 @@ pub struct Conv1dSite<'a> {
     pub cols: &'a mut CudaSlice<f32>,
 }
 
+/// k=3 condition conv call site on the published [out, in*3] bytes.
+struct K3Site<'a> {
+    w: &'a CudaSlice<u8>,
+    x: &'a CudaSlice<f32>,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    out: &'a mut CudaSlice<f32>,
+    padded: &'a mut CudaSlice<f32>,
+    cols: &'a mut CudaSlice<f32>,
+}
+
 /// Preallocated activation buffers for the synthesis path, sized at load
 /// for `max_length` latents (pair rows = 2 * (max_length + 1) tokens).
 pub struct Workspace {
@@ -81,6 +93,10 @@ pub struct Workspace {
     pub pair_v_u: CudaSlice<f32>,
     pub cond: CudaSlice<f32>,
     pub zeros_cond: CudaSlice<f32>,
+    pub cond_fused: CudaSlice<f32>,
+    pub cond_conv: CudaSlice<f32>,
+    pub cond_pad: CudaSlice<f32>,
+    pub cond_cols: CudaSlice<f32>,
     pub rotary_cos: CudaSlice<f32>,
     pub rotary_sin: CudaSlice<f32>,
     pub voc_x: CudaSlice<f32>,
@@ -992,7 +1008,7 @@ impl Music3Syn {
         let s = &self.stream;
         let length = self.latent_length(frames);
         ensure!(length <= self.max_length, "length exceeds workspace");
-        self.condition_encode(condition_input, frames, &mut ws.cond)?;
+        self.condition_encode(ws, condition_input, frames)?;
         let sigmas = Self::sigma_schedule(30);
         s.memcpy_dtod(initial, &mut ws.x)?;
         let channels = self.spec.in_channels as usize;
@@ -1064,9 +1080,9 @@ impl Music3Syn {
     /// [latent_length, cond_out].
     pub fn condition_encode(
         &self,
+        ws: &mut Workspace,
         input: &CudaSlice<f32>,
         frames: usize,
-        out: &mut CudaSlice<f32>,
     ) -> Result<()> {
         let s = &self.stream;
         let cond_hidden = self.spec.cond_hidden as usize;
@@ -1074,38 +1090,43 @@ impl Music3Syn {
         let layers = self.spec.cond_layers as usize;
         let length = self.latent_length(frames);
         ensure!(
-            input.len() == frames * layers * cond_hidden && out.len() >= length * cond_out,
+            input.len() == frames * layers * cond_hidden
+                && ws.cond.len() >= length * cond_out
+                && ws.cond_fused.len() >= frames * cond_hidden
+                && ws.cond_conv.len() >= frames * cond_out,
             "condition_encode extent mismatch"
         );
-        let mut fused: CudaSlice<f32> = unsafe { s.alloc(frames * cond_hidden)? };
         unsafe {
             s.launch_builder(&self.cond_sum)
                 .arg(input)
                 .arg(&self.cond_weights)
                 .arg(&self.cond_scale)
-                .arg(&mut fused)
+                .arg(&mut ws.cond_fused.slice_mut(0..frames * cond_hidden))
                 .arg(&(frames as i64))
                 .arg(&(layers as i32))
                 .arg(&(cond_hidden as i32))
                 .launch(super::ops::flat(frames * cond_hidden))?;
         }
-        let mut conv: CudaSlice<f32> = unsafe { s.alloc(frames * cond_out)? };
-        self.conv1d_k3(
-            &self.weights.cond.proj_w,
-            &fused,
-            frames,
-            cond_hidden,
-            &mut conv,
-        )?;
-        let count = conv.len();
+        self.conv1d_k3(K3Site {
+            w: &self.weights.cond.proj_w,
+            x: &ws.cond_fused,
+            rows: frames,
+            in_dim: cond_hidden,
+            out_dim: cond_out,
+            out: &mut ws.cond_conv,
+            padded: &mut ws.cond_pad,
+            cols: &mut ws.cond_cols,
+        })?;
+        let conv_ptr = ws.cond_conv.device_ptr(s).0;
+        let conv_bias = self.weights.cond.proj_b.device_ptr(s).0;
         unsafe {
             s.launch_builder(&self.bias)
-                .arg(&conv)
-                .arg(&self.weights.cond.proj_b)
-                .arg(&conv)
+                .arg(&conv_ptr)
+                .arg(&conv_bias)
+                .arg(&conv_ptr)
                 .arg(&(frames as u32))
                 .arg(&(cond_out as u32))
-                .launch(super::ops::flat(count))?;
+                .launch(super::ops::flat(frames * cond_out))?;
         }
         let map: Vec<u32> = (0..length)
             .map(|j| u32::try_from(j * frames / length).context("map index overflow"))
@@ -1113,9 +1134,9 @@ impl Music3Syn {
         let d_map = s.clone_htod(&map)?;
         unsafe {
             s.launch_builder(&self.nearest_rows)
-                .arg(&conv)
+                .arg(&ws.cond_conv.slice(0..frames * cond_out))
                 .arg(&d_map)
-                .arg(out)
+                .arg(&mut ws.cond.slice_mut(0..length * cond_out))
                 .arg(&(length as i64))
                 .arg(&(cond_out as i64))
                 .launch(super::ops::flat(length * cond_out))?;
@@ -1196,41 +1217,51 @@ impl Music3Syn {
 
     /// k=3 conv on the published folded [out, in*3] layout (condition
     /// encoder): zero-pad one row each side, im2col, one GEMM.
-    fn conv1d_k3(
-        &self,
-        w_bytes: &CudaSlice<u8>,
-        x: &CudaSlice<f32>,
-        rows: usize,
-        in_dim: usize,
-        out: &mut CudaSlice<f32>,
-    ) -> Result<()> {
+    fn conv1d_k3(&self, site: K3Site<'_>) -> Result<()> {
+        let K3Site {
+            w: w_bytes,
+            x,
+            rows,
+            in_dim,
+            out_dim,
+            out,
+            padded,
+            cols,
+        } = site;
         let s = &self.stream;
-        let out_dim = out.len() / rows;
         ensure!(
             w_bytes.len() == out_dim * in_dim * 3 * 4,
             "k3 weight extent"
         );
         let w_tensor = f32_matrix(w_bytes, s, out_dim, in_dim * 3)?;
-        let mut padded: CudaSlice<f32> = unsafe { s.alloc((rows + 2) * in_dim)? };
-        unsafe {
-            s.launch_builder(&self.pad_rows_n)
-                .arg(x)
-                .arg(&mut padded)
-                .arg(&(rows as i64))
-                .arg(&1i64)
-                .arg(&(in_dim as i64))
-                .launch(super::ops::flat((rows + 2) * in_dim))?;
+        ensure!(
+            padded.len() >= (rows + 2) * in_dim && cols.len() >= rows * in_dim * 3,
+            "k3 scratch extent"
+        );
+        {
+            let mut padded = padded.slice_mut(0..(rows + 2) * in_dim);
+            unsafe {
+                s.launch_builder(&self.pad_rows_n)
+                    .arg(x)
+                    .arg(&mut padded)
+                    .arg(&(rows as i64))
+                    .arg(&1i64)
+                    .arg(&(in_dim as i64))
+                    .launch(super::ops::flat((rows + 2) * in_dim))?;
+            }
         }
-        let mut a: CudaSlice<f32> = unsafe { s.alloc(rows * in_dim * 3)? };
-        unsafe {
-            s.launch_builder(&self.im2col)
-                .arg(&padded)
-                .arg(&mut a)
-                .arg(&(rows as i64))
-                .arg(&(in_dim as i32))
-                .arg(&3i32)
-                .arg(&1i32)
-                .launch(super::ops::flat(rows * in_dim * 3))?;
+        {
+            let mut cols = cols.slice_mut(0..rows * in_dim * 3);
+            unsafe {
+                s.launch_builder(&self.im2col)
+                    .arg(&padded.slice(0..(rows + 2) * in_dim))
+                    .arg(&mut cols)
+                    .arg(&(rows as i64))
+                    .arg(&(in_dim as i32))
+                    .arg(&3i32)
+                    .arg(&1i32)
+                    .launch(super::ops::flat(rows * in_dim * 3))?;
+            }
         }
         let mut view = TensorMut(unsafe {
             Tensor::new(
@@ -1242,7 +1273,7 @@ impl Music3Syn {
         });
         let x_tensor = unsafe {
             Tensor::<f32, 2>::new(
-                a.device_ptr(s).0,
+                cols.device_ptr(s).0,
                 [rows as u32, (in_dim * 3) as u32],
                 [(in_dim * 3) as u64, 1],
                 (rows * in_dim * 3 * 4) as u64,
@@ -1251,8 +1282,6 @@ impl Music3Syn {
         self.blas.linear_f32(w_tensor, x_tensor, &mut view)
     }
 
-    /// One folded stereo stream: latent half [channels/2, length]
-    /// channel-major -> waveform [total_samples].
     /// One vocoder stream over workspace scratch buffers; the residual
     /// units read the stage input through fresh snake buffers, never the
     /// snake outputs.
@@ -1581,6 +1610,9 @@ fn build_workspace(
     let rotary_dim = spec.rotary_dim as usize;
     let streams = spec.vocoder_stream_channels() as usize;
     let decoder_input = spec.decoder_input as usize;
+    // frames that produce max_length latent rows (inverse of latent_length)
+    let cond_frames = (max_length as u64 * spec.input_rate as u64 * spec.output_hop as u64)
+        .div_ceil(spec.output_rate as u64 * spec.input_hop as u64) as usize;
     let decoder_hidden = spec.decoder_hidden as usize;
     let voc_total: usize = spec.upsampling.iter().map(|r| *r as usize).product();
     // Largest vocoder stage extent over all blocks and both endpoints,
@@ -1647,6 +1679,10 @@ fn build_workspace(
         pair_v_u: alloc(channels * max_length)?,
         cond: alloc(max_length * cond_dim)?,
         zeros_cond: s.alloc_zeros(max_length * cond_dim)?,
+        cond_fused: alloc(cond_frames * cond_dim)?,
+        cond_conv: alloc(cond_frames * cond_dim)?,
+        cond_pad: alloc((cond_frames + 2) * cond_dim)?,
+        cond_cols: alloc(cond_frames * cond_dim * 3)?,
         rotary_cos: s.clone_htod(&cos)?,
         rotary_sin: s.clone_htod(&sin)?,
         voc_x: alloc(max_length * streams)?,

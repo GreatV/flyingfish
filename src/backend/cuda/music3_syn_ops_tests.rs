@@ -238,9 +238,9 @@ mod encoder {
         let input = tensor_f32(&view, "condition_input")?;
         let s = &engine.stream;
         let d_in = s.clone_htod(&input)?;
-        let mut out = unsafe { s.alloc::<f32>(length * cond_out)? };
-        engine.condition_encode(&d_in, frames, &mut out)?;
-        let got = s.clone_dtoh(&out)?;
+        let mut workspace = Music3Syn::workspace(&engine.spec, &device, 86)?;
+        engine.condition_encode(&mut workspace, &d_in, frames)?;
+        let got = s.clone_dtoh(&workspace.cond.slice(0..length * cond_out))?;
         let max_abs = got
             .iter()
             .zip(&want)
@@ -276,9 +276,9 @@ mod encoder {
             }
         }
         let d_swapped = s.clone_htod(&swapped)?;
-        engine.condition_encode(&d_swapped, frames, &mut out)?;
+        engine.condition_encode(&mut workspace, &d_swapped, frames)?;
         let control = s
-            .clone_dtoh(&out)?
+            .clone_dtoh(&workspace.cond.slice(0..length * cond_out))?
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs() as f64)
