@@ -577,8 +577,15 @@ impl Runtime {
         Ok(())
     }
 
-    fn draw(&self, codebook: usize, seed: u64, draw: u64) -> Result<()> {
+    fn draw(
+        &self,
+        codebook: usize,
+        seed: u64,
+        draw: u64,
+        margins: Option<&mut Vec<f32>>,
+    ) -> Result<()> {
         ensure!(codebook < 8, "AR draw codebook");
+        let vocab = if codebook == 0 { 200000i64 } else { 1024i64 };
         unsafe {
             self.device
                 .stream
@@ -586,7 +593,7 @@ impl Runtime {
                 .arg(&ptr(&self.policy.probabilities, &self.device))
                 .arg(&(ptr(&self.policy.codes, &self.device) + (codebook * 4) as u64))
                 .arg(&1i32)
-                .arg(&(if codebook == 0 { 200000i64 } else { 1024i64 }))
+                .arg(&vocab)
                 .arg(&seed)
                 .arg(&draw)
                 .arg(&256i32)
@@ -595,6 +602,20 @@ impl Runtime {
                     block_dim: (256, 1, 1),
                     shared_mem_bytes: 0,
                 })?;
+        }
+        if let Some(margins) = margins {
+            let row = self
+                .device
+                .stream
+                .clone_dtoh(&self.policy.probabilities.slice(..vocab as usize))?;
+            let code = self
+                .device
+                .stream
+                .clone_dtoh(&self.policy.codes.slice(codebook..codebook + 1))?[0]
+                as usize;
+            let chosen = row[code];
+            let top = row.iter().copied().fold(0.0f32, f32::max);
+            margins.push(top - chosen);
         }
         Ok(())
     }
@@ -627,6 +648,7 @@ impl Runtime {
         seed: Option<(u64, u64)>,
         graphs: bool,
         mut observe: impl FnMut(&Self, usize) -> Result<()>,
+        mut margins: Option<&mut Vec<f32>>,
     ) -> Result<()> {
         self.depth.position = 0;
         for codebook in 1..8 {
@@ -642,7 +664,12 @@ impl Runtime {
             }
             observe(self, codebook)?;
             if let Some((seed, base)) = seed {
-                self.draw(codebook, seed, base + codebook as u64)?;
+                self.draw(
+                    codebook,
+                    seed,
+                    base + codebook as u64,
+                    margins.as_deref_mut(),
+                )?;
             }
         }
         Ok(())
@@ -699,7 +726,29 @@ impl Runtime {
         seed: u64,
     ) -> Result<Vec<f32>> {
         self.prepare_graphs()?;
-        self.run(prompt, recorded, seed, true, |_, _, _| Ok(()))
+        self.run(prompt, recorded, seed, true, |_, _, _| Ok(()), None)
+    }
+
+    /// Free-running native sampling: returns the features, the drawn code
+    /// rows (semantic first, the END row's depth entries are zeros) and
+    /// the per-draw sampling margin max_prob - p(chosen).
+    pub(crate) fn generate_sampled(
+        &mut self,
+        prompt: &[u32],
+        seed: u64,
+    ) -> Result<(Vec<f32>, Vec<u32>, Vec<f32>)> {
+        self.prepare_graphs()?;
+        let mut codes = Vec::new();
+        let mut margins = Vec::new();
+        let features = self.run(
+            prompt,
+            None,
+            seed,
+            true,
+            |_, _, _| Ok(()),
+            Some((&mut codes, &mut margins)),
+        )?;
+        Ok((features, codes, margins))
     }
 
     fn run(
@@ -709,6 +758,7 @@ impl Runtime {
         seed: u64,
         graphs: bool,
         mut observe: impl FnMut(&Self, usize, usize) -> Result<()>,
+        mut sink: Option<(&mut Vec<u32>, &mut Vec<f32>)>,
     ) -> Result<Vec<f32>> {
         if let Some(codes) = recorded {
             ensure!(
@@ -739,13 +789,17 @@ impl Runtime {
                     &mut self.policy.codes.slice_mut(..end - frame * 8),
                 )?;
             } else {
-                self.draw(0, seed, (frame * 8) as u64)?;
+                let margins = sink.as_mut().map(|(_, margins)| &mut **margins);
+                self.draw(0, seed, (frame * 8) as u64, margins)?;
             }
             let semantic = self
                 .device
                 .stream
                 .clone_dtoh(&self.policy.codes.slice(..1))?[0];
             if semantic == 151670 {
+                if let Some((codes, _)) = sink.as_mut() {
+                    codes.extend_from_slice(&[semantic, 0, 0, 0, 0, 0, 0, 0]);
+                }
                 break;
             }
             ensure!(
@@ -756,7 +810,15 @@ impl Runtime {
                 recorded.is_none().then_some((seed, (frame * 8) as u64)),
                 graphs,
                 |ar, book| observe(ar, frame, book),
+                sink.as_mut().map(|(_, margins)| &mut **margins),
             )?;
+            if let Some((codes, _)) = sink.as_mut() {
+                let row = self
+                    .device
+                    .stream
+                    .clone_dtoh(&self.policy.codes.slice(..8))?;
+                codes.extend_from_slice(&row);
+            }
             if frame > 0 {
                 unsafe {
                     dtoh_async(
@@ -1311,8 +1373,12 @@ pub fn generate(
     request: &crate::music3::Music3Request,
     runtime: &Path,
 ) -> Result<crate::music3::Music3Output> {
-    Ok(generate_inner(model, request, runtime, None)?.1)
+    Ok(generate_inner(model, request, runtime, None, None, None)?.3)
 }
+
+/// The chain results: the free-run codes, the drawn (or teacher-forced)
+/// latent, the AR features and the output.
+pub(crate) type Chain = (Vec<u32>, Vec<f32>, Vec<f32>, crate::music3::Music3Output);
 
 /// The chain with optional teacher-forced draws; the public entry passes
 /// none, the gates pass the recorded codes.
@@ -1321,7 +1387,9 @@ pub(crate) fn generate_inner(
     request: &crate::music3::Music3Request,
     runtime: &Path,
     recorded: Option<&[u32]>,
-) -> Result<(Vec<f32>, crate::music3::Music3Output)> {
+    initial: Option<&[f32]>,
+    margins_out: Option<&mut Vec<f32>>,
+) -> Result<Chain> {
     use super::engine_music3_syn::Music3Syn;
 
     let spec = crate::music3::SynSpec::read(model)?;
@@ -1332,12 +1400,6 @@ pub(crate) fn generate_inner(
         request.prompt_ids.len().is_multiple_of(2),
         "AR prompt ids are the paired cond/uncond layout [2, prompt_rows]; got {} elements",
         request.prompt_ids.len()
-    );
-    ensure!(
-        request.initial.len() == channels * length,
-        "initial latent extent: got {} elements, in_channels * latent_length = {}",
-        request.initial.len(),
-        channels * length
     );
     let handoff_width = spec.cond_layers as usize * spec.cond_hidden as usize;
     let total: usize = spec.upsampling.iter().map(|r| *r as usize).product();
@@ -1351,7 +1413,18 @@ pub(crate) fn generate_inner(
         request.frames,
         free,
     )?;
-    let features = ar.generate(&request.prompt_ids, recorded, request.seed)?;
+    let (features, codes) = match (recorded, margins_out) {
+        (None, Some(margins)) => {
+            let (features, codes, drawn_margins) =
+                ar.generate_sampled(&request.prompt_ids, request.seed)?;
+            *margins = drawn_margins;
+            (features, codes)
+        }
+        _ => {
+            let features = ar.generate(&request.prompt_ids, recorded, request.seed)?;
+            (features, Vec::new())
+        }
+    };
     ensure!(
         features.len() == request.frames * handoff_width,
         "AR feature handoff: got {} elements, frames * cond_layers * cond_hidden = {}",
@@ -1375,12 +1448,42 @@ pub(crate) fn generate_inner(
     let engine = Music3Syn::load(model, &device_ctx, length)?;
     let s = &device_ctx.stream;
     let d_features = s.clone_htod(&features)?;
-    let d_initial = s.clone_htod(&request.initial)?;
+    let d_initial: CudaSlice<f32> = match initial {
+        Some(initial) => s.clone_htod(initial)?,
+        None => {
+            let count = channels * length;
+            let drawn = unsafe { s.alloc::<f32>(count)? };
+            let sample = super::cubin::module(&device_ctx.ctx, "sample")?;
+            let philox = sample.load_function("philox_normal_f32")?;
+            unsafe {
+                s.launch_builder(&philox)
+                    .arg(&request.seed)
+                    .arg(&MUSIC3_NORMAL_STREAM)
+                    .arg(&drawn)
+                    .arg(&(count as i64))
+                    .launch(super::ops::grid(
+                        (count.div_ceil(4)).div_ceil(256).max(1),
+                        256,
+                    ))?;
+            }
+            drawn
+        }
+    };
     let mut audio = unsafe { s.alloc::<f32>(2 * length * total)? };
     engine.synthesize(&mut ws, &d_features, request.frames, &d_initial, &mut audio)?;
     let pcm = s.clone_dtoh(&audio)?;
-    Ok((features, crate::music3::Music3Output { pcm }))
+    let drawn_latent = s.clone_dtoh(&d_initial)?;
+    Ok((
+        codes,
+        drawn_latent,
+        features,
+        crate::music3::Music3Output { pcm },
+    ))
 }
+
+/// Normal-draw stream offset: counter[1] = 1, disjoint from the AR
+/// categorical draw whose counter is (draw, 0, 0, 0).
+pub(crate) const MUSIC3_NORMAL_STREAM: u64 = 1 << 32;
 
 /// Sum of the three synthesis component safetensors: the F32 resident
 /// weight estimate for the release assert.
@@ -1898,50 +2001,57 @@ mod tests {
                 )?,
             )?;
         }
-        let features = ar.run(ids, Some(&codes), 0, ar.frames != 25, |ar, frame, book| {
-            let file = format!("frame-{frame:05}.safetensors");
-            let key = if book == 0 {
-                "ar_lm_head_logits".to_owned()
-            } else {
-                format!("ar_depth_head_{}", book - 1)
-            };
-            let value = if book == 0 {
-                read_device(ar, &ar.work.logits, 0, 400000)?
-            } else {
-                read_device(ar, &ar.depth.logits, 0, 2048)?
-            };
-            compare(&mut stats, &key, &value, &read(oracle, &file, &key)?)?;
-            if ar.frames == 25 {
-                if book == 0 {
-                    compare(
-                        &mut stats,
-                        "legacy_lm_head_logits",
-                        &value,
-                        &legacy["lm_head_logits"][frame * 400000..(frame + 1) * 400000],
-                    )?;
-                } else if frame * 7 + book <= 27 {
-                    let mut hidden = Vec::new();
-                    for branch in 0..2 {
-                        hidden.extend(read_device(
-                            ar,
-                            &ar.depth.outputs,
-                            branch * 8 * 4096,
-                            (book + 1) * 4096,
-                        )?);
+        let features = ar.run(
+            ids,
+            Some(&codes),
+            0,
+            ar.frames != 25,
+            |ar, frame, book| {
+                let file = format!("frame-{frame:05}.safetensors");
+                let key = if book == 0 {
+                    "ar_lm_head_logits".to_owned()
+                } else {
+                    format!("ar_depth_head_{}", book - 1)
+                };
+                let value = if book == 0 {
+                    read_device(ar, &ar.work.logits, 0, 400000)?
+                } else {
+                    read_device(ar, &ar.depth.logits, 0, 2048)?
+                };
+                compare(&mut stats, &key, &value, &read(oracle, &file, &key)?)?;
+                if ar.frames == 25 {
+                    if book == 0 {
+                        compare(
+                            &mut stats,
+                            "legacy_lm_head_logits",
+                            &value,
+                            &legacy["lm_head_logits"][frame * 400000..(frame + 1) * 400000],
+                        )?;
+                    } else if frame * 7 + book <= 27 {
+                        let mut hidden = Vec::new();
+                        for branch in 0..2 {
+                            hidden.extend(read_device(
+                                ar,
+                                &ar.depth.outputs,
+                                branch * 8 * 4096,
+                                (book + 1) * 4096,
+                            )?);
+                        }
+                        compare(
+                            &mut stats,
+                            "legacy_rvq_depth_decoder_heads",
+                            &hidden,
+                            &legacy["rvq_depth_decoder_heads"]
+                                [legacy_hidden_offset..legacy_hidden_offset + hidden.len()],
+                        )?;
+                        legacy_hidden_offset += hidden.len();
                     }
-                    compare(
-                        &mut stats,
-                        "legacy_rvq_depth_decoder_heads",
-                        &hidden,
-                        &legacy["rvq_depth_decoder_heads"]
-                            [legacy_hidden_offset..legacy_hidden_offset + hidden.len()],
-                    )?;
-                    legacy_hidden_offset += hidden.len();
+                    policy_snapshot(ar, &policy_output, frame, book)?;
                 }
-                policy_snapshot(ar, &policy_output, frame, book)?;
-            }
-            Ok(())
-        })?;
+                Ok(())
+            },
+            None,
+        )?;
         drop(range);
         ensure!(
             features.len() == ar.frames * 32768 && ar.position == ids.len() / 2 + ar.frames,
@@ -1992,59 +2102,66 @@ mod tests {
             ar.prepare_graphs()?;
             ar.position = 0;
             let mut changed = 0;
-            let graph_features = ar.run(ids, Some(&codes), 0, true, |ar, frame, book| {
-                let file = format!("frame-{frame:05}-head-{book}.safetensors");
-                let logits = if book == 0 {
-                    read_device(ar, &ar.work.logits, 0, 400000)?
-                } else {
-                    read_device(ar, &ar.depth.logits, 0, 2048)?
-                };
-                let expected = read(&policy_output, &file, "logits")?;
-                changed += logits
-                    .iter()
-                    .zip(&expected)
-                    .filter(|(a, b)| a.to_bits() != b.to_bits())
-                    .count();
-                let vocab = logits.len() / 2;
-                let probabilities = ar
-                    .device
-                    .stream
-                    .clone_dtoh(&ar.policy.probabilities.slice(..vocab))?;
-                ensure!(
-                    logits.iter().chain(&probabilities).all(|x| x.is_finite()),
-                    "Runner FAIL graph nonfinite frame={frame} book={book}"
-                );
-                let expected = read(&policy_output, &file, "probabilities")?;
-                changed += probabilities
-                    .iter()
-                    .zip(&expected)
-                    .filter(|(a, b)| a.to_bits() != b.to_bits())
-                    .count();
-                let thresholds = ar.device.stream.clone_dtoh(&ar.policy.thresholds)?;
-                let expected = read(&policy_output, &file, "thresholds")?;
-                changed += thresholds
-                    .iter()
-                    .zip(&expected)
-                    .filter(|(a, b)| a.to_bits() != b.to_bits())
-                    .count();
-                let keep = ar
-                    .device
-                    .stream
-                    .clone_dtoh(&ar.policy.keep.slice(..vocab))?;
-                let bytes = std::fs::read(policy_output.join(&file))?;
-                let tensors = safetensors::SafeTensors::deserialize(&bytes)?;
-                let expected = tensors.tensor("keep")?;
-                ensure!(
-                    expected.shape() == [vocab],
-                    "Runner FAIL policy keep layout"
-                );
-                changed += keep
-                    .iter()
-                    .zip(expected.data())
-                    .filter(|(a, b)| a != b)
-                    .count();
-                Ok(())
-            })?;
+            let graph_features = ar.run(
+                ids,
+                Some(&codes),
+                0,
+                true,
+                |ar, frame, book| {
+                    let file = format!("frame-{frame:05}-head-{book}.safetensors");
+                    let logits = if book == 0 {
+                        read_device(ar, &ar.work.logits, 0, 400000)?
+                    } else {
+                        read_device(ar, &ar.depth.logits, 0, 2048)?
+                    };
+                    let expected = read(&policy_output, &file, "logits")?;
+                    changed += logits
+                        .iter()
+                        .zip(&expected)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    let vocab = logits.len() / 2;
+                    let probabilities = ar
+                        .device
+                        .stream
+                        .clone_dtoh(&ar.policy.probabilities.slice(..vocab))?;
+                    ensure!(
+                        logits.iter().chain(&probabilities).all(|x| x.is_finite()),
+                        "Runner FAIL graph nonfinite frame={frame} book={book}"
+                    );
+                    let expected = read(&policy_output, &file, "probabilities")?;
+                    changed += probabilities
+                        .iter()
+                        .zip(&expected)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    let thresholds = ar.device.stream.clone_dtoh(&ar.policy.thresholds)?;
+                    let expected = read(&policy_output, &file, "thresholds")?;
+                    changed += thresholds
+                        .iter()
+                        .zip(&expected)
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                    let keep = ar
+                        .device
+                        .stream
+                        .clone_dtoh(&ar.policy.keep.slice(..vocab))?;
+                    let bytes = std::fs::read(policy_output.join(&file))?;
+                    let tensors = safetensors::SafeTensors::deserialize(&bytes)?;
+                    let expected = tensors.tensor("keep")?;
+                    ensure!(
+                        expected.shape() == [vocab],
+                        "Runner FAIL policy keep layout"
+                    );
+                    changed += keep
+                        .iter()
+                        .zip(expected.data())
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    Ok(())
+                },
+                None,
+            )?;
             ensure!(
                 features.len() == graph_features.len(),
                 "Runner FAIL graph/eager frame extent"
@@ -2141,7 +2258,7 @@ mod tests {
         ar.device
             .stream
             .memcpy_htod(&[1.0f32], &mut ar.policy.probabilities.slice_mut(17..18))?;
-        ar.draw(1, 0, 38471471)?;
+        ar.draw(1, 0, 38471471, None)?;
         let id = ar.device.stream.clone_dtoh(&ar.policy.codes.slice(1..2))?[0];
         let uniform = 4294967276.0f64 / 4294967296.0;
         ensure!(

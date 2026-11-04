@@ -606,9 +606,10 @@ mod end_to_end {
 mod e2e {
     use super::super::Device;
     use super::super::engine_music3_syn::Music3Syn;
-    use super::super::music3::generate_inner;
+    use super::super::music3::{MUSIC3_NORMAL_STREAM, generate_inner};
     use crate::music3::Music3Request;
     use anyhow::{Context, Result, ensure};
+    use cudarc::driver::PushKernelArg;
     use safetensors::SafeTensors;
 
     fn tensor_f32<'a>(view: &'a SafeTensors<'a>, name: &str) -> Result<Vec<f32>> {
@@ -627,10 +628,9 @@ mod e2e {
     struct E2EInputs {
         request: Music3Request,
         codes: Vec<u32>,
+        initial: Vec<f32>,
         condition_input: Vec<f32>,
-        want_audio: Vec<f32>,
         handoff_bound: (f64, f64),
-        audio_bound: (f64, f64),
     }
 
     fn load_inputs() -> Result<E2EInputs> {
@@ -652,13 +652,11 @@ mod e2e {
         let frozen: serde_json::Value = serde_json::from_slice(&std::fs::read(
             std::path::PathBuf::from(std::env::var("FF_MUSIC3_FROZEN_R5")?),
         )?)?;
-        let cell = |name: &str| -> Result<(f64, f64)> {
-            let c = &frozen["cells"][name]["bound"];
-            Ok((
-                c["max"].as_f64().context("bound max")?,
-                c["rmse"].as_f64().context("bound rmse")?,
-            ))
-        };
+        let c = &frozen["cells"]["condition_input"]["bound"];
+        let handoff_bound = (
+            c["max"].as_f64().context("bound max")?,
+            c["rmse"].as_f64().context("bound rmse")?,
+        );
         let spec = crate::music3::SynSpec::read(&std::path::PathBuf::from(
             std::env::var("FF_MUSIC3_MODEL").context("model dir")?,
         ))?;
@@ -674,21 +672,19 @@ mod e2e {
             request: Music3Request {
                 prompt_ids: ids,
                 frames,
-                initial,
-                seed: 0,
+                seed: 7,
             },
             codes,
+            initial,
             condition_input: tensor_f32(&view, "condition_input")?,
-            want_audio: tensor_f32(&view, "final_audio")?,
-            handoff_bound: cell("condition_input")?,
-            audio_bound: cell("final_audio")?,
+            handoff_bound,
         })
     }
 
-    /// The full chain through the production entry inner with the
-    /// recorded draws; the AR features must land inside the frozen handoff
-    /// cell, and a layout-misread perturbation of the features must trip
-    /// the same comparator at 10x the bound.
+    /// Teacher-forced handoff cell (frozen bounds) plus the draw-wiring
+    /// gate: a native-draw run's latent must be bit-identical to a direct
+    /// philox_normal_f32(seed, stream, count) launch, and the seed+1
+    /// control must differ.
     #[test]
     #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_E2E, FF_MUSIC3_E2E_CODES, FF_MUSIC3_FROZEN_R5"]
     fn music3_e2e_handoff_gpu() -> Result<()> {
@@ -698,16 +694,16 @@ mod e2e {
         let input = load_inputs()?;
         let scratch = std::env::temp_dir().join(format!("ff-m3e2e-{}", std::process::id()));
         std::fs::create_dir(&scratch)?;
-        let probe = Device::new(0)?;
-        let free_before = probe.ctx.mem_get_info()?.0;
-        let (features, _output) =
-            generate_inner(&model, &input.request, &scratch, Some(&input.codes))?;
-        let free_after = probe.ctx.mem_get_info()?.0;
-        std::fs::remove_dir_all(&scratch)?;
-        let features = &features;
-        ensure!(!features.is_empty(), "empty AR features");
-        println!("M3E2E_RELEASE free_before={free_before} free_after={free_after}");
 
+        // Teacher-forced handoff cell.
+        let (_codes, _latent, features, _out) = generate_inner(
+            &model,
+            &input.request,
+            &scratch,
+            Some(&input.codes),
+            Some(&input.initial),
+            None,
+        )?;
         let max_abs = features
             .iter()
             .zip(&input.condition_input)
@@ -729,75 +725,199 @@ mod e2e {
             "AR feature handoff exceeds the frozen cell"
         );
 
-        // A wrong handoff reading the [frames, layers, hidden] features as
-        // [layers, frames, hidden] must exceed 10x the bound max through
-        // the same comparator.
-        let width = input.condition_input.len();
-        let frames = input.request.frames;
+        // Native draw: wiring against a direct kernel launch.
+        let mut margins = Vec::new();
+        let (free_codes, drawn_latent, _features, _out) = generate_inner(
+            &model,
+            &input.request,
+            &scratch,
+            None,
+            None,
+            Some(&mut margins),
+        )?;
+        std::fs::remove_dir_all(&scratch)?;
+        ensure!(!free_codes.is_empty(), "empty free-run codes");
+
+        let device = Device::new(0)?;
         let spec = crate::music3::SynSpec::read(&model)?;
-        let layers = spec.cond_layers as usize;
-        let hidden = spec.cond_hidden as usize;
-        let mut misread = vec![0.0f32; width];
-        for f in 0..frames {
-            for l in 0..layers {
-                for h in 0..hidden {
-                    misread[f * layers * hidden + l * hidden + h] =
-                        features[l * frames * hidden + f * hidden + h];
-                }
-            }
+        let count = spec.in_channels as usize * spec.latent_length(25);
+        ensure!(drawn_latent.len() == count, "drawn latent extent");
+        let module = super::super::cubin::module(&device.ctx, "sample")?;
+        let philox = module.load_function("philox_normal_f32")?;
+        let s = &device.stream;
+        let direct = unsafe { s.alloc::<f32>(count)? };
+        unsafe {
+            s.launch_builder(&philox)
+                .arg(&input.request.seed)
+                .arg(&MUSIC3_NORMAL_STREAM)
+                .arg(&direct)
+                .arg(&(count as i64))
+                .launch(super::super::ops::grid(
+                    (count.div_ceil(4)).div_ceil(256).max(1),
+                    256,
+                ))?;
         }
-        let control = misread
-            .iter()
-            .zip(&input.condition_input)
-            .map(|(a, b)| (a - b).abs() as f64)
-            .fold(0.0, f64::max);
-        let control_threshold = 10.0 * input.handoff_bound.0;
-        println!("M3E2E_HANDOFF_CONTROL layout_misread={control:.6e} >= {control_threshold:.6e}");
+        let got_direct = s.clone_dtoh(&direct)?;
         ensure!(
-            control >= control_threshold,
-            "layout-misread control under 10x the handoff bound"
+            got_direct == drawn_latent,
+            "drawn latent differs from a direct philox_normal_f32 launch"
         );
+        println!("M3E2E_DRAW_WIRING bit_identical=true count={count}");
+        let control = unsafe { s.alloc::<f32>(count)? };
+        unsafe {
+            s.launch_builder(&philox)
+                .arg(&(input.request.seed + 1))
+                .arg(&MUSIC3_NORMAL_STREAM)
+                .arg(&control)
+                .arg(&(count as i64))
+                .launch(super::super::ops::grid(
+                    (count.div_ceil(4)).div_ceil(256).max(1),
+                    256,
+                ))?;
+        }
+        let got_control = s.clone_dtoh(&control)?;
+        let differ = got_direct
+            .iter()
+            .zip(&got_control)
+            .filter(|(a, b)| a != b)
+            .count();
+        println!("M3E2E_DRAW_CONTROL seed_plus_1_differing={differ}/{count} (must be > 0)");
+        ensure!(differ > 0, "seed+1 control did not change the draw");
+
         Ok(())
     }
 
-    /// The chain through the production entry inner on the recorded
-    /// draws; the PCM must land inside the frozen audio cell. The
-    /// zero-condition control builds the synthesis stage directly: it
-    /// perturbs the stage input, which the entry API does not expose.
+    /// Free-running cell: the engine runs with its own codes and its own
+    /// drawn latent at the request seed; same-seed repeat must be
+    /// bit-identical; the PCM is scored against the drawn-chain freeze
+    /// consumed by a definition run of the same draws.
     #[test]
-    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_E2E, FF_MUSIC3_E2E_CODES, FF_MUSIC3_FROZEN_R5"]
-    fn music3_e2e_gpu() -> Result<()> {
+    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_E2E, FF_MUSIC3_E2E_CODES, FF_MUSIC3_FROZEN_R7"]
+    fn music3_e2e_free_run_gpu() -> Result<()> {
         std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
         let model =
             std::path::PathBuf::from(std::env::var("FF_MUSIC3_MODEL").context("model dir")?);
         let input = load_inputs()?;
         let scratch = std::env::temp_dir().join(format!("ff-m3e2e-{}", std::process::id()));
         std::fs::create_dir(&scratch)?;
-        let (_features, output) =
-            generate_inner(&model, &input.request, &scratch, Some(&input.codes))?;
+        let mut margins = Vec::new();
+        let (codes, latent, _features, output) = generate_inner(
+            &model,
+            &input.request,
+            &scratch,
+            None,
+            None,
+            Some(&mut margins),
+        )?;
+        let mut margins2 = Vec::new();
+        let (codes2, latent2, _features2, output2) = generate_inner(
+            &model,
+            &input.request,
+            &scratch,
+            None,
+            None,
+            Some(&mut margins2),
+        )?;
         std::fs::remove_dir_all(&scratch)?;
+        ensure!(codes == codes2, "same-seed codes not bit-identical");
+        ensure!(latent == latent2, "same-seed latent not bit-identical");
+        ensure!(output.pcm == output2.pcm, "same-seed PCM not bit-identical");
+        println!(
+            "M3E2E_FREE_RUN determinism=true codes={} margins_mean={:.3e} margins_median={:.3e} margins_max={:.3e}",
+            codes.len(),
+            statistical_median(&margins, true),
+            statistical_median(&margins, false),
+            margins.iter().copied().fold(0.0f32, f32::max)
+        );
+
+        // Phase 1 always dumps the engine draws for the definition arms;
+        // phase 2 scores when the drawn-chain freeze is present.
+        if let Ok(out_dir) = std::env::var("FF_MUSIC3_E2E_DRAW_OUT") {
+            use safetensors::tensor::TensorView;
+            let out = std::path::PathBuf::from(out_dir);
+            std::fs::create_dir_all(&out)?;
+            let latent_bytes: Vec<u8> = latent.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let ids_bytes: Vec<u8> = input
+                .request
+                .prompt_ids
+                .iter()
+                .map(|v| i64::from(*v))
+                .collect::<Vec<_>>()
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            let latent_view =
+                TensorView::new(safetensors::Dtype::F32, vec![latent.len()], &latent_bytes)?;
+            let ids_view = TensorView::new(
+                safetensors::Dtype::I64,
+                vec![input.request.prompt_ids.len()],
+                &ids_bytes,
+            )?;
+            let views: Vec<(&str, TensorView)> =
+                vec![("syn_x_t_000", latent_view), ("ar_prompt_ids", ids_view)];
+            safetensors::serialize_to_file(views, None, &out.join("draw.safetensors")).map_err(
+                |e: safetensors::SafeTensorError| anyhow::anyhow!("serialize draws: {e}"),
+            )?;
+            std::fs::write(
+                out.join("CODES.json"),
+                serde_json::to_string(&codes)? + "\n",
+            )?;
+            println!("M3E2E_DRAW_OUT dumped to {}", out.display());
+        }
+        let frozen: serde_json::Value = match std::env::var("FF_MUSIC3_FROZEN_R7") {
+            Ok(path) => serde_json::from_slice(&std::fs::read(path)?)?,
+            Err(_) => {
+                println!("M3E2E_DRAW_AUDIO phase=dump (no drawn-chain freeze set)");
+                return Ok(());
+            }
+        };
+        let oracle = std::path::PathBuf::from(frozen["oracle"].as_str().context("oracle path")?);
+        let arm_bytes = std::fs::read(
+            oracle
+                .parent()
+                .context("oracle parent")
+                .map(|p| p.to_path_buf())?,
+        );
+        let _ = arm_bytes;
+        let arm_path = frozen["oracle"].as_str().context("oracle")?;
+        let arm_root = std::path::Path::new(arm_path);
+        let arm_file = if arm_root.is_file() {
+            arm_root.to_path_buf()
+        } else {
+            arm_root.join("capture.safetensors")
+        };
+        let arm_bytes = std::fs::read(&arm_file)?;
+        let view = SafeTensors::deserialize(&arm_bytes)?;
+        let want = tensor_f32(&view, "final_audio")?;
         let got = &output.pcm;
+        let c = &frozen["cells"]["final_audio"]["bound"];
+        let bound = (
+            c["max"].as_f64().context("audio bound max")?,
+            c["rmse"].as_f64().context("audio bound rmse")?,
+        );
         let max_abs = got
             .iter()
-            .zip(&input.want_audio)
+            .zip(&want)
             .map(|(a, b)| (a - b).abs() as f64)
             .fold(0.0, f64::max);
         let rmse = (got
             .iter()
-            .zip(&input.want_audio)
+            .zip(&want)
             .map(|(a, b)| (*a as f64 - *b as f64) * (*a as f64 - *b as f64))
             .sum::<f64>()
             / got.len() as f64)
             .sqrt();
         println!(
-            "M3E2E_AUDIO max_abs={max_abs:.6e} (bound {:.6e}) rmse={rmse:.6e} (bound {:.6e})",
-            input.audio_bound.0, input.audio_bound.1
+            "M3E2E_DRAW_AUDIO max_abs={max_abs:.6e} (bound {:.6e}) rmse={rmse:.6e} (bound {:.6e})",
+            bound.0, bound.1
         );
         ensure!(
-            max_abs <= input.audio_bound.0 && rmse <= input.audio_bound.1,
-            "end-to-end PCM exceeds the frozen cell"
+            max_abs <= bound.0 && rmse <= bound.1,
+            "free-running PCM exceeds the drawn-chain cell"
         );
 
+        // Zero-condition control on the synthesis stage with the drawn
+        // latent as the stage input.
         let device = Device::new(0)?;
         let spec = crate::music3::SynSpec::read(&model)?;
         let length = spec.latent_length(25);
@@ -805,25 +925,36 @@ mod e2e {
         let engine = Music3Syn::load(&model, &device, length)?;
         let mut ws = Music3Syn::workspace(&engine.spec, &device, length)?;
         let s = &device.stream;
-        let zero_features =
-            vec![0.0f32; spec.cond_layers as usize * spec.cond_hidden as usize * 25];
+        let zero_features = vec![0.0f32; input.condition_input.len()];
         let d_zero = s.clone_htod(&zero_features)?;
-        let d_initial = s.clone_htod(&input.request.initial)?;
+        let d_latent = s.clone_htod(&latent)?;
         let mut audio = unsafe { s.alloc::<f32>(2 * length * total)? };
-        engine.synthesize(&mut ws, &d_zero, 25, &d_initial, &mut audio)?;
+        engine.synthesize(&mut ws, &d_zero, 25, &d_latent, &mut audio)?;
         let control = s
             .clone_dtoh(&audio)?
             .iter()
-            .zip(&input.want_audio)
+            .zip(&want)
             .map(|(a, b)| (a - b).abs() as f64)
             .fold(0.0, f64::max);
-        let control_threshold = 10.0 * input.audio_bound.0;
-        println!("M3E2E_AUDIO_CONTROL zero_condition={control:.6e} >= {control_threshold:.6e}");
+        let control_threshold = 10.0 * bound.0;
+        println!("M3E2E_DRAW_CONTROL zero_condition={control:.6e} >= {control_threshold:.6e}");
         ensure!(
             control >= control_threshold,
-            "zero-condition control under 10x the audio bound"
+            "zero-condition control under 10x the drawn-chain bound"
         );
         Ok(())
+    }
+
+    fn statistical_median(values: &[f32], mean: bool) -> f32 {
+        if values.is_empty() {
+            return 0.0;
+        }
+        if mean {
+            return values.iter().sum::<f32>() / values.len() as f32;
+        }
+        let mut sorted = values.to_vec();
+        sorted.sort_by(f32::total_cmp);
+        sorted[sorted.len() / 2]
     }
 }
 

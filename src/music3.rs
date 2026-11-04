@@ -13,12 +13,11 @@ pub use crate::backend::cuda::music3::{Runtime, generate};
 
 /// One production synthesis request: AR prompt token ids in the paired
 /// cond/uncond layout [2, prompt_rows] (row 0 cond, row 1 uncond; the
-/// length must be even), the audio frame count, the initial flow latent
-/// [in_channels, latent_length(frames)] and the AR sampling seed.
+/// length must be even), the audio frame count, and the sampling seed
+/// that drives both the AR draws and the native initial-latent draw.
 pub struct Music3Request {
     pub prompt_ids: Vec<u32>,
     pub frames: usize,
-    pub initial: Vec<f32>,
     pub seed: u64,
 }
 
