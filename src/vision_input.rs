@@ -1297,6 +1297,136 @@ impl VisionPositions {
     }
 }
 
+/// DINOv3 2D axial RoPE table `[prefix_tokens + patches_h * patches_w, head_dim]` in F32 for
+/// `rotary_prefix_kv`: the first `prefix_tokens` rows are identity `(cos=1, sin=0)`, and each patch
+/// row holds `[cos_h(0..head_dim/4), cos_w(0..head_dim/4), sin_h(0..head_dim/4), sin_w(0..head_dim/4)]`.
+pub fn dinov3_rope_table_f32(
+    prefix_tokens: usize,
+    patches_h: u32,
+    patches_w: u32,
+    head_dim: u32,
+    rope_theta: f32,
+) -> Result<Vec<f32>> {
+    ensure!(
+        patches_h > 0
+            && patches_w > 0
+            && head_dim > 0
+            && head_dim.is_multiple_of(4)
+            && rope_theta.is_finite()
+            && rope_theta > 0.0,
+        "invalid DINOv3 RoPE geometry"
+    );
+    let quarter = (head_dim / 4) as usize;
+    let half = (head_dim / 2) as usize;
+    let dim = head_dim as usize;
+    let patches = usize::try_from(patches_h)?
+        .checked_mul(usize::try_from(patches_w)?)
+        .context("DINOv3 patch count overflow")?;
+    let total_rows = prefix_tokens
+        .checked_add(patches)
+        .context("DINOv3 RoPE row count overflow")?;
+    let mut table = Vec::with_capacity(
+        total_rows
+            .checked_mul(dim)
+            .context("DINOv3 RoPE table size overflow")?,
+    );
+    let one = 1.0f32;
+    let zero = 0.0f32;
+    for _ in 0..prefix_tokens {
+        table.extend(std::iter::repeat_n(one, half));
+        table.extend(std::iter::repeat_n(zero, half));
+    }
+    let inv_freq: Vec<f32> = (0..quarter)
+        .map(|j| 1.0f32 / rope_theta.powf((4 * j) as f32 / head_dim as f32))
+        .collect();
+    let coords_h: Vec<f32> = (0..patches_h)
+        .map(|i| 2.0f32 * ((i as f32 + 0.5f32) / patches_h as f32) - 1.0f32)
+        .collect();
+    let coords_w: Vec<f32> = (0..patches_w)
+        .map(|i| 2.0f32 * ((i as f32 + 0.5f32) / patches_w as f32) - 1.0f32)
+        .collect();
+    let two_pi = 2.0f32 * std::f32::consts::PI;
+    for &ch in &coords_h {
+        for &cw in &coords_w {
+            for &coord in &[ch, cw] {
+                for &freq in &inv_freq {
+                    let angle = two_pi * coord * freq;
+                    table.push(angle.cos());
+                }
+            }
+            for &coord in &[ch, cw] {
+                for &freq in &inv_freq {
+                    let angle = two_pi * coord * freq;
+                    table.push(angle.sin());
+                }
+            }
+        }
+    }
+    Ok(table)
+}
+
+pub fn dinov3_rope_table_bf16(
+    prefix_tokens: usize,
+    patches_h: u32,
+    patches_w: u32,
+    head_dim: u32,
+    rope_theta: f32,
+) -> Result<Vec<half::bf16>> {
+    Ok(
+        dinov3_rope_table_f32(prefix_tokens, patches_h, patches_w, head_dim, rope_theta)?
+            .into_iter()
+            .map(half::bf16::from_f32)
+            .collect(),
+    )
+}
+
+/// Normalizes an `F32` CHW `[3, height, width]` image by `(x - mean[c]) / std[c]` and packs it into
+/// the `[3, side, rows * side]` layout consumed by `vision_patch_rows`.
+pub fn dinov3_pack_normalized_chw(
+    chw: &[f32],
+    height: usize,
+    width: usize,
+    side: usize,
+    mean: [f32; 3],
+    std: [f32; 3],
+) -> Result<Vec<f32>> {
+    ensure!(
+        height > 0
+            && width > 0
+            && side > 0
+            && height.is_multiple_of(side)
+            && width.is_multiple_of(side)
+            && std.iter().all(|&s| s.is_finite() && s > 0.0)
+            && mean.iter().all(|&m| m.is_finite()),
+        "invalid DINOv3 image packing geometry"
+    );
+    let plane = height.checked_mul(width).context("image plane overflow")?;
+    let total = plane.checked_mul(3).context("image size overflow")?;
+    ensure!(chw.len() == total, "DINOv3 CHW input length mismatch");
+    let patches_h = height / side;
+    let patches_w = width / side;
+    let rows = patches_h * patches_w;
+    let mut packed = vec![0.0f32; total];
+    for c in 0..3 {
+        let m = mean[c];
+        let s = std[c];
+        for ih in 0..patches_h {
+            for iw in 0..patches_w {
+                let patch = ih * patches_w + iw;
+                for ky in 0..side {
+                    let y = ih * side + ky;
+                    let src_row = (c * height + y) * width + iw * side;
+                    let dst_row = ((c * side + ky) * rows + patch) * side;
+                    for kx in 0..side {
+                        packed[dst_row + kx] = (chw[src_row + kx] - m) / s;
+                    }
+                }
+            }
+        }
+    }
+    Ok(packed)
+}
+
 #[cfg(test)]
 mod loopvl_tests {
     use super::*;
@@ -1457,6 +1587,194 @@ mod loopvl_tests {
             }
         }
         println!("PASS loopvl_dynamic_grid grids=19x29,34x60 patch_rows=6x588");
+        Ok(())
+    }
+
+    #[test]
+    fn dinov3_rope_table_matches_model_definition() -> Result<()> {
+        let table = super::dinov3_rope_table_bf16(5, 64, 64, 64, 100.0)?;
+        assert_eq!(table.len(), 4101 * 64);
+        for row in 0..5 {
+            for col in 0..32 {
+                assert_eq!(table[row * 64 + col].to_bits(), 0x3f80);
+            }
+            for col in 32..64 {
+                assert_eq!(table[row * 64 + col].to_bits(), 0x0000);
+            }
+        }
+        let expected_row5_cos: [u16; 8] = [
+            0x3f7f, 0xbd98, 0xbf72, 0xbf5c, 0xbec0, 0x3dd5, 0x3ee8, 0x3f2e,
+        ];
+        let expected_row5_sin: [u16; 8] = [
+            0x3dc9, 0x3f7f, 0x3ea9, 0xbf02, 0xbf6d, 0xbf7f, 0xbf64, 0xbf3c,
+        ];
+        let expected_row4100_sin: [u16; 8] = [
+            0xbdc9, 0xbf7f, 0xbea9, 0x3f02, 0x3f6d, 0x3f7f, 0x3f64, 0x3f3c,
+        ];
+        for i in 0..8 {
+            assert_eq!(table[5 * 64 + i].to_bits(), expected_row5_cos[i]);
+            assert_eq!(table[5 * 64 + 32 + i].to_bits(), expected_row5_sin[i]);
+            assert_eq!(table[4100 * 64 + i].to_bits(), expected_row5_cos[i]);
+            assert_eq!(table[4100 * 64 + 32 + i].to_bits(), expected_row4100_sin[i]);
+        }
+        let fnv1a64 = |items: &[half::bf16]| -> u64 {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            for v in items {
+                for b in v.to_bits().to_le_bytes() {
+                    h ^= u64::from(b);
+                    h = h.wrapping_mul(0x0100_0000_01b3);
+                }
+            }
+            h
+        };
+        assert_eq!(fnv1a64(&table), 0x328d_0244_c944_5525);
+        let wrong_theta = super::dinov3_rope_table_bf16(5, 64, 64, 64, 10000.0)?;
+        assert_ne!(fnv1a64(&wrong_theta), 0x328d_0244_c944_5525);
+        Ok(())
+    }
+}
+
+/// Alpha>204 bounding box, 1.1 square crop, transparent padding and black composite.
+pub fn rgba_foreground_crop(
+    input: &[u8],
+    width: usize,
+    height: usize,
+) -> Result<(Vec<u8>, [usize; 2])> {
+    ensure!(
+        width > 0
+            && height > 0
+            && width.checked_mul(height).and_then(|n| n.checked_mul(4)) == Some(input.len()),
+        "RGBA image extent"
+    );
+    ensure!(
+        input.as_chunks::<4>().0.iter().any(|p| p[3] != 255),
+        "RGBA input requires supplied alpha"
+    );
+    let max_side = width.max(height);
+    let [h, w] = if max_side > 1024 {
+        let scale = 1024.0 / max_side as f64;
+        [
+            (height as f64 * scale) as usize,
+            (width as f64 * scale) as usize,
+        ]
+    } else {
+        [height, width]
+    };
+    let pixels = crate::serve::image::resize_lanczos(
+        input,
+        [height, width, 4],
+        [h, w],
+        crate::serve::image::ResizeRounding::Fixed22,
+    )?;
+    let mut bounds = [w, h, 0, 0];
+    let mut foreground = false;
+    for (i, p) in pixels.as_chunks::<4>().0.iter().enumerate() {
+        if p[3] > 204 {
+            foreground = true;
+            bounds[0] = bounds[0].min(i % w);
+            bounds[1] = bounds[1].min(i / w);
+            bounds[2] = bounds[2].max(i % w);
+            bounds[3] = bounds[3].max(i / w);
+        }
+    }
+    ensure!(foreground, "RGBA foreground is empty");
+    let half =
+        (((bounds[2] - bounds[0]).max(bounds[3] - bounds[1]) as f64 * 1.1) as usize / 2) as f64;
+    let cx = (bounds[0] + bounds[2]) as f64 / 2.0;
+    let cy = (bounds[1] + bounds[3]) as f64 / 2.0;
+    let x0 = (cx - half).round_ties_even() as isize;
+    let y0 = (cy - half).round_ties_even() as isize;
+    let crop_w = ((cx + half).round_ties_even() as isize - x0) as usize;
+    let crop_h = ((cy + half).round_ties_even() as isize - y0) as usize;
+    ensure!(crop_w > 0 && crop_h > 0, "RGBA foreground crop is empty");
+    let mut rgb = vec![
+        0;
+        crop_h
+            .checked_mul(crop_w)
+            .and_then(|n| n.checked_mul(3))
+            .context("RGBA crop overflow")?
+    ];
+    for y in 0..crop_h {
+        for x in 0..crop_w {
+            let sx = x0 + x as isize;
+            let sy = y0 + y as isize;
+            if sx < 0 || sy < 0 || sx >= w as isize || sy >= h as isize {
+                continue;
+            }
+            let p = &pixels[(sy as usize * w + sx as usize) * 4..][..4];
+            for c in 0..3 {
+                let value = (f32::from(p[c]) / 255.0) * (f32::from(p[3]) / 255.0);
+                rgb[(y * crop_w + x) * 3 + c] = (value.clamp(0.0, 1.0) * 255.0) as u8;
+            }
+        }
+    }
+    Ok((rgb, [crop_h, crop_w]))
+}
+
+#[cfg(test)]
+mod resampling_tests {
+    use super::*;
+    #[test]
+    #[ignore = "CPU publisher RGBA/Lanczos fixtures; set FF_P1_M2_ROOT"]
+    fn pixal_preprocessing_matches_publisher_bytes() -> Result<()> {
+        let root =
+            std::path::PathBuf::from(std::env::var_os("FF_P1_M2_ROOT").context("FF_P1_M2_ROOT")?);
+        let bytes = std::fs::read(root.join("gate-inputs.safetensors"))?;
+        let inputs = safetensors::SafeTensors::deserialize(&bytes)?;
+        for name in ["cottage", "robot_crab"] {
+            let rgba = inputs.tensor(&format!("{name}-rgba"))?;
+            let (rgb, shape) = rgba_foreground_crop(rgba.data(), rgba.shape()[1], rgba.shape()[0])?;
+            let expected = inputs.tensor(&format!("{name}-prepared"))?;
+            ensure!(
+                shape == expected.shape()[..2] && rgb == expected.data(),
+                "publisher crop mismatch {name}"
+            );
+            for side in [512, 1024] {
+                let resized = crate::serve::image::resize_lanczos(
+                    &rgb,
+                    [shape[0], shape[1], 3],
+                    [side, side],
+                    crate::serve::image::ResizeRounding::Fixed22,
+                )?;
+                let expected = inputs.tensor(&format!("{name}-rgb{side}"))?;
+                let mismatches = resized
+                    .iter()
+                    .zip(expected.data())
+                    .filter(|(a, b)| a != b)
+                    .count();
+                ensure!(
+                    mismatches == 0,
+                    "publisher RGB Lanczos mismatch {name}/{side}: {mismatches} bytes"
+                );
+            }
+        }
+        let expected = inputs.tensor("mv-image")?;
+        for view in 0..4 {
+            let rgba = inputs.tensor(&format!("mv-{view}-rgba"))?;
+            let resized = crate::serve::image::resize_lanczos(
+                rgba.data(),
+                [rgba.shape()[0], rgba.shape()[1], 4],
+                [512, 512],
+                crate::serve::image::ResizeRounding::Fixed22,
+            )?;
+            let mut mismatches = 0;
+            for (i, pixel) in resized.as_chunks::<4>().0.iter().enumerate() {
+                for (c, &byte) in pixel[..3].iter().enumerate() {
+                    let value = (f32::from(byte) / 255.0) * (f32::from(pixel[3]) / 255.0);
+                    let offset = ((view * 512 * 512 + i) * 3 + c) * 4;
+                    let golden =
+                        f32::from_le_bytes(expected.data()[offset..offset + 4].try_into()?);
+                    mismatches += usize::from(value.to_bits() != golden.to_bits());
+                }
+            }
+            ensure!(
+                mismatches == 0,
+                "publisher multi-view alpha mismatch view={view}: {mismatches} values"
+            );
+        }
+        println!(
+            "PASS PIXAL_PREPROCESSING single_media=2 rgb_resizes=4 multi_media=4 mismatched_bytes=0 mismatched_f32_bits=0"
+        );
         Ok(())
     }
 }

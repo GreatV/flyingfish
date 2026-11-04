@@ -1028,6 +1028,200 @@ impl Flash {
     }
 }
 
+#[cfg(feature = "cuda")]
+pub(crate) struct F32Attention {
+    stream: Arc<CudaStream>,
+    geometry: [u32; 5],
+    tile: u32,
+    key_chunk: u32,
+    partials: CudaSlice<f32>,
+    sum_parts: CudaFunction,
+    scores: CudaSlice<f32>,
+    probabilities: CudaSlice<f32>,
+    softmax: CudaFunction,
+}
+
+#[cfg(feature = "cuda")]
+impl F32Attention {
+    pub(crate) fn new(
+        stream: Arc<CudaStream>,
+        geometry: [u32; 5],
+        workspace_bytes: usize,
+    ) -> Result<Self> {
+        let [heads, queries, keys, dim, value_dim] = geometry;
+        ensure!(
+            geometry.iter().all(|&d| d > 0) && dim.is_multiple_of(4) && value_dim.is_multiple_of(4),
+            "F32 attention dimensions"
+        );
+        let key_chunk = keys.div_ceil(32).max(512).next_multiple_of(4);
+        let parts = keys.div_ceil(key_chunk);
+        let row_bytes = usize::try_from(heads)?
+            .checked_mul((keys as usize) * 8 + (parts as usize) * (value_dim as usize) * 4)
+            .context("F32 attention workspace overflow")?;
+        let tile = u32::try_from((workspace_bytes / row_bytes).min(queries as usize).min(128))?;
+        ensure!(
+            tile > 0,
+            "F32 attention needs at least {row_bytes} workspace bytes; available {workspace_bytes}"
+        );
+        let elements = (heads as usize) * (keys as usize) * (tile as usize);
+        let partial_elements =
+            (heads as usize) * (tile as usize) * (value_dim as usize) * (parts as usize);
+        let softmax =
+            super::cubin::module(stream.context(), "sample")?.load_function("softmax_rows_dual")?;
+        Ok(Self {
+            geometry,
+            tile,
+            key_chunk,
+            partials: stream.alloc_zeros(partial_elements)?,
+            sum_parts: super::cubin::module(stream.context(), "vision_ops")?
+                .load_function("sum_parts_f32")?,
+            scores: stream.alloc_zeros(elements)?,
+            probabilities: stream.alloc_zeros(elements)?,
+            softmax,
+            stream,
+        })
+    }
+    pub(crate) fn run(
+        &self,
+        blas: &super::blas::Blas,
+        q: super::contracts::Tensor<f32, 3>,
+        k: super::contracts::Tensor<f32, 3>,
+        v: super::contracts::Tensor<f32, 3>,
+        output: &mut super::contracts::TensorMut<f32, 3>,
+    ) -> Result<()> {
+        use super::contracts::{Tensor, TensorMut, no_overlap};
+        let [heads, queries, keys, dim, value_dim] = self.geometry;
+        ensure!(
+            q.shape == [heads, queries, dim]
+                && k.shape == [heads, keys, dim]
+                && v.shape == [heads, keys, value_dim]
+                && output.0.shape == [heads, queries, value_dim],
+            "F32 attention shape changed after setup"
+        );
+        no_overlap(&q, &output.0, "q", "output")?;
+        no_overlap(&k, &output.0, "k", "output")?;
+        no_overlap(&v, &output.0, "v", "output")?;
+        ensure!(
+            output.0.stride[2] == 1
+                && output.0.stride[1] >= u64::from(value_dim)
+                && (output.0.stride[0] >= u64::from(queries) * output.0.stride[1]
+                    || (output.0.stride[0] == u64::from(value_dim)
+                        && output.0.stride[1] >= u64::from(heads) * output.0.stride[0])),
+            "F32 attention output row/head stride"
+        );
+        let slice = |t: Tensor<f32, 3>, start: u32, rows: u32| -> Result<Tensor<f32, 3>> {
+            t.validate()?;
+            let offset = u64::from(start)
+                .checked_mul(t.stride[1])
+                .and_then(|n| n.checked_mul(4))
+                .context("F32 attention tile offset overflow")?;
+            unsafe {
+                Tensor::new(
+                    t.ptr
+                        .checked_add(offset)
+                        .context("F32 attention tile pointer overflow")?,
+                    [t.shape[0], rows, t.shape[2]],
+                    t.stride,
+                    t.span_bytes
+                        .checked_sub(offset)
+                        .context("F32 attention tile exceeds span")?,
+                )
+            }
+        };
+        for start in (0..queries).step_by(self.tile as usize) {
+            let rows = self.tile.min(queries - start);
+            let stride = [u64::from(rows) * u64::from(keys), u64::from(keys), 1];
+            let shape = [heads, rows, keys];
+            let scores = unsafe {
+                Tensor::new(
+                    self.scores.device_ptr(&self.stream).0,
+                    shape,
+                    stride,
+                    self.scores.len() as u64 * 4,
+                )?
+            };
+            let probabilities: Tensor<f32, 3> = unsafe {
+                Tensor::new(
+                    self.probabilities.device_ptr(&self.stream).0,
+                    shape,
+                    stride,
+                    self.probabilities.len() as u64 * 4,
+                )?
+            };
+            blas.batched_f32(
+                slice(q, start, rows)?,
+                k,
+                &mut TensorMut(scores),
+                [false, true],
+                (dim as f32).sqrt().recip(),
+            )?;
+            let softmax_rows = heads
+                .checked_mul(rows)
+                .context("F32 attention softmax rows overflow")?;
+            unsafe {
+                self.stream
+                    .launch_builder(&self.softmax)
+                    .arg(&scores.ptr)
+                    .arg(&probabilities.ptr)
+                    .arg(&0u64)
+                    .arg(&i32::try_from(softmax_rows)?)
+                    .arg(&i64::from(keys))
+                    .launch(super::ops::grid(softmax_rows as usize, 256))?;
+            }
+            let part_elements = u64::from(heads) * u64::from(rows) * u64::from(value_dim);
+            for (part, first) in (0..keys).step_by(self.key_chunk as usize).enumerate() {
+                let columns = self.key_chunk.min(keys - first);
+                let left = unsafe {
+                    Tensor::new(
+                        probabilities.ptr + u64::from(first) * 4,
+                        [heads, rows, columns],
+                        probabilities.stride,
+                        probabilities.span_bytes - u64::from(first) * 4,
+                    )?
+                };
+                let offset = part as u64 * part_elements * 4;
+                let partial = unsafe {
+                    Tensor::new(
+                        self.partials.device_ptr(&self.stream).0 + offset,
+                        [heads, rows, value_dim],
+                        [
+                            u64::from(rows) * u64::from(value_dim),
+                            u64::from(value_dim),
+                            1,
+                        ],
+                        self.partials.len() as u64 * 4 - offset,
+                    )?
+                };
+                blas.batched_f32(
+                    left,
+                    slice(v, first, columns)?,
+                    &mut TensorMut(partial),
+                    [false, false],
+                    1.0,
+                )?;
+            }
+            let destination = slice(output.0, start, rows)?;
+            unsafe {
+                self.stream
+                    .launch_builder(&self.sum_parts)
+                    .arg(&self.partials)
+                    .arg(&destination.ptr)
+                    .arg(&keys.div_ceil(self.key_chunk))
+                    .arg(&heads)
+                    .arg(&rows)
+                    .arg(&value_dim)
+                    .arg(&destination.stride[0])
+                    .arg(&destination.stride[1])
+                    .launch(super::ops::grid(
+                        part_elements.div_ceil(256).min(65535) as usize,
+                        256,
+                    ))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,7 +1,7 @@
 //! Shared mmap/index audit, independent of device upload and model execution.
 use anyhow::{Context, Result, bail, ensure};
 use memmap2::{Mmap, MmapOptions};
-use safetensors::{Dtype, SafeTensors};
+use safetensors::{Dtype, SafeTensors, tensor::TensorView};
 use serde::{
     Deserialize, Deserializer,
     de::{Error, MapAccess, Visitor},
@@ -48,6 +48,7 @@ struct Header(#[serde(deserialize_with = "unique_map")] BTreeMap<String, serde_j
 pub struct MappedCheckpoint {
     pub(crate) index: Index,
     maps: BTreeMap<String, Mmap>,
+    zip_tensors: Option<BTreeMap<String, StoredTensor>>,
     #[cfg(any(feature = "cuda", feature = "rocm"))]
     files: BTreeMap<String, File>,
 }
@@ -72,7 +73,7 @@ impl MappedCheckpoint {
     pub fn open(dir: &Path) -> Result<Self> {
         Self::open_component(dir, "model")
     }
-    /// Opens `{stem}.safetensors.index.json` with its shards, or the single `{stem}.safetensors`.
+    /// Opens a safetensors component stem or an explicit stored-ZIP `.pth` component.
     pub fn open_component(dir: &Path, stem: &str) -> Result<Self> {
         ensure!(
             Path::new(stem).components().count() == 1
@@ -82,6 +83,9 @@ impl MappedCheckpoint {
                 ),
             "checkpoint stem must be a single path component"
         );
+        if Path::new(stem).extension().is_some_and(|s| s == "pth") {
+            return Self::open_stored_zip(dir, stem);
+        }
         let indexed = dir.join(format!("{stem}.safetensors.index.json"));
         let index = if indexed.is_file() {
             serde_json::from_slice::<Index>(&std::fs::read(indexed)?)?
@@ -153,9 +157,51 @@ impl MappedCheckpoint {
         Ok(Self {
             index,
             maps,
+            zip_tensors: None,
             #[cfg(any(feature = "cuda", feature = "rocm"))]
             files,
         })
+    }
+    fn open_stored_zip(dir: &Path, name: &str) -> Result<Self> {
+        let base = dir.canonicalize()?;
+        let path = base.join(name).canonicalize()?;
+        ensure!(
+            path.starts_with(&base),
+            "checkpoint symlink escapes directory"
+        );
+        let file = File::open(path)?;
+        let map = unsafe { MmapOptions::new().map(&file)? };
+        let tensors = stored_zip_tensors(&map)?;
+        let index = Index {
+            weight_map: tensors
+                .keys()
+                .map(|key| (key.clone(), name.to_owned()))
+                .collect(),
+        };
+        Ok(Self {
+            index,
+            maps: BTreeMap::from([(name.to_owned(), map)]),
+            zip_tensors: Some(tensors),
+            #[cfg(any(feature = "cuda", feature = "rocm"))]
+            files: BTreeMap::from([(name.to_owned(), file)]),
+        })
+    }
+    pub(crate) fn tensor(&self, name: &str) -> Result<TensorView<'_>> {
+        let shard = self
+            .index
+            .weight_map
+            .get(name)
+            .with_context(|| format!("checkpoint lacks {name}"))?;
+        let map = self.maps.get(shard).context("unknown checkpoint shard")?;
+        if let Some(tensors) = &self.zip_tensors {
+            let tensor = tensors.get(name).context("ZIP tensor missing")?;
+            return Ok(TensorView::new(
+                Dtype::F32,
+                tensor.shape.clone(),
+                &map[tensor.range.clone()],
+            )?);
+        }
+        Ok(SafeTensors::deserialize(map)?.tensor(name)?)
     }
     /// Reads a validated mapped range through its file descriptor without faulting mapping pages.
     #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -188,13 +234,7 @@ impl MappedCheckpoint {
     }
     /// Host copy of one published F32 tensor with the given shape.
     pub(crate) fn f32_tensor(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
-        let shard = self
-            .index
-            .weight_map
-            .get(name)
-            .with_context(|| format!("checkpoint lacks {name}"))?;
-        let map = self.maps.get(shard).context("unknown checkpoint shard")?;
-        let tensor = SafeTensors::deserialize(map)?.tensor(name)?;
+        let tensor = self.tensor(name)?;
         ensure!(
             tensor.dtype() == Dtype::F32 && tensor.shape() == shape,
             "{name} is {:?} {:?}, expected F32 {shape:?}",
@@ -210,6 +250,10 @@ impl MappedCheckpoint {
             .collect())
     }
     pub(crate) fn views(&self) -> Result<BTreeMap<String, SafeTensors<'_>>> {
+        ensure!(
+            self.zip_tensors.is_none(),
+            "safetensors shard views requested for stored ZIP"
+        );
         self.maps
             .iter()
             .map(|(n, m)| Ok((n.clone(), SafeTensors::deserialize(m)?)))
@@ -4390,6 +4434,728 @@ mod component_tests {
                 );
             }
         }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct StoredTensor {
+    shape: Vec<usize>,
+    range: std::ops::Range<usize>,
+}
+
+struct CheckpointBytes<'a> {
+    data: &'a [u8],
+    position: usize,
+}
+
+impl<'a> CheckpointBytes<'a> {
+    fn take(&mut self, count: usize) -> Result<&'a [u8]> {
+        let end = self
+            .position
+            .checked_add(count)
+            .context("checkpoint offset overflow")?;
+        let bytes = self
+            .data
+            .get(self.position..end)
+            .context("truncated checkpoint record")?;
+        self.position = end;
+        Ok(bytes)
+    }
+    fn number(&mut self, width: usize) -> Result<usize> {
+        ensure!(width <= 8, "checkpoint integer width");
+        let mut bytes = [0u8; 8];
+        bytes[..width].copy_from_slice(self.take(width)?);
+        Ok(usize::try_from(u64::from_le_bytes(bytes))?)
+    }
+    fn signature(&mut self, expected: usize) -> Result<()> {
+        ensure!(self.number(4)? == expected, "invalid ZIP signature");
+        Ok(())
+    }
+}
+
+fn stored_zip_entries(data: &[u8]) -> Result<BTreeMap<String, std::ops::Range<usize>>> {
+    ensure!(data.len() >= 22, "truncated ZIP end record");
+    let end = (data.len().saturating_sub(65557)..=data.len() - 22)
+        .rev()
+        .find(|&i| data[i..i + 4] == [0x50, 0x4b, 5, 6])
+        .context("ZIP end record missing")?;
+    let mut tail = CheckpointBytes {
+        data,
+        position: end + 4,
+    };
+    ensure!(
+        tail.number(2)? == 0 && tail.number(2)? == 0,
+        "multi-disk ZIP unsupported"
+    );
+    let entries = tail.number(2)?;
+    ensure!(
+        entries > 0 && entries < 4096 && tail.number(2)? == entries,
+        "ZIP entry count"
+    );
+    let directory_bytes = tail.number(4)?;
+    let directory_offset = tail.number(4)?;
+    let comment = tail.number(2)?;
+    tail.take(comment)?;
+    ensure!(tail.position == data.len(), "trailing ZIP bytes");
+    let directory_end = directory_offset
+        .checked_add(directory_bytes)
+        .context("ZIP directory overflow")?;
+    ensure!(directory_end <= end, "ZIP directory exceeds end record");
+    if directory_end != end {
+        let mut zip64 = CheckpointBytes {
+            data,
+            position: directory_end,
+        };
+        zip64.signature(0x06064b50)?;
+        ensure!(zip64.number(8)? == 44, "ZIP64 record length");
+        zip64.take(4)?;
+        ensure!(
+            zip64.number(4)? == 0 && zip64.number(4)? == 0,
+            "ZIP64 disk count"
+        );
+        ensure!(
+            zip64.number(8)? == entries && zip64.number(8)? == entries,
+            "ZIP64 entry count mismatch"
+        );
+        ensure!(
+            zip64.number(8)? == directory_bytes && zip64.number(8)? == directory_offset,
+            "ZIP64 directory mismatch"
+        );
+        zip64.signature(0x07064b50)?;
+        ensure!(
+            zip64.number(4)? == 0 && zip64.number(8)? == directory_end && zip64.number(4)? == 1,
+            "ZIP64 locator mismatch"
+        );
+        ensure!(zip64.position == end, "ZIP64 trailer length");
+    }
+    let mut directory = CheckpointBytes {
+        data: &data[..directory_end],
+        position: directory_offset,
+    };
+    let mut result = BTreeMap::new();
+    let mut occupied = Vec::new();
+    for _ in 0..entries {
+        directory.signature(0x02014b50)?;
+        directory.take(4)?;
+        let flags = directory.number(2)?;
+        ensure!(
+            flags & !0x808 == 0 && directory.number(2)? == 0,
+            "compressed or encrypted ZIP member"
+        );
+        directory.take(4)?;
+        let crc = directory.number(4)?;
+        let bytes = directory.number(4)?;
+        ensure!(directory.number(4)? == bytes, "stored ZIP size mismatch");
+        let name_len = directory.number(2)?;
+        let extra_len = directory.number(2)?;
+        let comment_len = directory.number(2)?;
+        ensure!(directory.number(2)? == 0, "ZIP member on another disk");
+        directory.take(6)?;
+        let local_offset = directory.number(4)?;
+        let name = std::str::from_utf8(directory.take(name_len)?)?.to_owned();
+        ensure!(
+            !name.is_empty()
+                && name
+                    .split('/')
+                    .all(|p| !p.is_empty() && p != "." && p != ".." && !p.contains('\\')),
+            "unsafe ZIP member name"
+        );
+        ensure!(extra_len == 0, "unsupported central ZIP extra fields");
+        directory.take(comment_len)?;
+        let mut local = CheckpointBytes {
+            data: &data[..directory_offset],
+            position: local_offset,
+        };
+        local.signature(0x04034b50)?;
+        local.take(2)?;
+        ensure!(
+            local.number(2)? == flags && local.number(2)? == 0,
+            "ZIP local flags/method mismatch"
+        );
+        local.take(4)?;
+        let local_crc = local.number(4)?;
+        let compressed = local.number(4)?;
+        let uncompressed = local.number(4)?;
+        let local_name_len = local.number(2)?;
+        let local_extra_len = local.number(2)?;
+        ensure!(
+            local.take(local_name_len)? == name.as_bytes(),
+            "ZIP local name mismatch"
+        );
+        let extra = local.take(local_extra_len)?;
+        if !extra.is_empty() {
+            let mut padding = CheckpointBytes {
+                data: extra,
+                position: 0,
+            };
+            ensure!(
+                padding.number(2)? == 0x4246,
+                "unsupported local ZIP extra field"
+            );
+            let count = padding.number(2)?;
+            ensure!(
+                padding.take(count)?.iter().all(|&b| b == b'Z') && padding.position == extra.len(),
+                "invalid ZIP alignment padding"
+            );
+        }
+        let start = local.position;
+        let payload = local.take(bytes)?;
+        let stop = local.position;
+        let mut computed = !0u32;
+        for &byte in payload {
+            computed ^= u32::from(byte);
+            for _ in 0..8 {
+                computed = (computed >> 1) ^ (0xedb88320 & 0u32.wrapping_sub(computed & 1));
+            }
+        }
+        ensure!(
+            (!computed) as usize == crc,
+            "ZIP payload checksum mismatch: {name}"
+        );
+        if flags & 8 != 0 {
+            ensure!(
+                local_crc == 0 && compressed == 0 && uncompressed == 0,
+                "ZIP descriptor local fields"
+            );
+            local.signature(0x08074b50)?;
+            ensure!(
+                local.number(4)? == crc && local.number(4)? == bytes && local.number(4)? == bytes,
+                "ZIP data descriptor mismatch"
+            );
+        } else {
+            ensure!(
+                local_crc == crc && compressed == bytes && uncompressed == bytes,
+                "ZIP local size/checksum mismatch"
+            );
+        }
+        occupied.push(local_offset..local.position);
+        ensure!(
+            result.insert(name, start..stop).is_none(),
+            "duplicate ZIP entry"
+        );
+    }
+    ensure!(
+        directory.position == directory_end,
+        "ZIP directory size mismatch"
+    );
+    occupied.sort_by_key(|r| r.start);
+    ensure!(
+        occupied.first().is_some_and(|r| r.start == 0)
+            && occupied.windows(2).all(|w| w[0].end == w[1].start)
+            && occupied.last().is_some_and(|r| r.end == directory_offset),
+        "ZIP member overlap or unindexed bytes"
+    );
+    Ok(result)
+}
+
+#[derive(Clone)]
+enum CheckpointValue {
+    Mark,
+    Integer(usize),
+    String(String),
+    Global(String),
+    Tuple(Vec<std::rc::Rc<CheckpointValue>>),
+    Dictionary(BTreeMap<String, std::rc::Rc<CheckpointValue>>),
+    False,
+    Storage(String, usize),
+    Tensor(StoredTensor),
+}
+
+impl CheckpointValue {
+    fn text(&self) -> Result<&str> {
+        if let Self::String(s) = self {
+            Ok(s)
+        } else {
+            bail!("pickle expected string")
+        }
+    }
+    fn integer(&self) -> Result<usize> {
+        if let Self::Integer(i) = self {
+            Ok(*i)
+        } else {
+            bail!("pickle expected integer")
+        }
+    }
+    fn tuple(&self) -> Result<&[std::rc::Rc<Self>]> {
+        if let Self::Tuple(v) = self {
+            Ok(v)
+        } else {
+            bail!("pickle expected tuple")
+        }
+    }
+    fn dictionary(&self) -> Result<&BTreeMap<String, std::rc::Rc<Self>>> {
+        if let Self::Dictionary(v) = self {
+            Ok(v)
+        } else {
+            bail!("pickle expected dictionary")
+        }
+    }
+}
+
+struct CheckpointPickle<'a> {
+    bytes: CheckpointBytes<'a>,
+    stack: Vec<std::rc::Rc<CheckpointValue>>,
+    memo: BTreeMap<usize, std::rc::Rc<CheckpointValue>>,
+    entries: &'a BTreeMap<String, std::ops::Range<usize>>,
+    prefix: &'a str,
+}
+
+impl CheckpointPickle<'_> {
+    fn pop(&mut self) -> Result<std::rc::Rc<CheckpointValue>> {
+        self.stack.pop().context("pickle stack underflow")
+    }
+    fn marked(&mut self) -> Result<Vec<std::rc::Rc<CheckpointValue>>> {
+        let index = self
+            .stack
+            .iter()
+            .rposition(|v| matches!(**v, CheckpointValue::Mark))
+            .context("pickle MARK missing")?;
+        let values = self.stack.split_off(index + 1);
+        self.stack.pop();
+        Ok(values)
+    }
+    fn reduce(&mut self) -> Result<CheckpointValue> {
+        use CheckpointValue as V;
+        let args = self.pop()?;
+        let args = args.tuple()?;
+        let callable = self.pop()?;
+        let V::Global(tag) = &*callable else {
+            bail!("pickle REDUCE callable")
+        };
+        if tag == "collections.OrderedDict" {
+            ensure!(args.is_empty(), "OrderedDict constructor arguments");
+            return Ok(V::Dictionary(BTreeMap::new()));
+        }
+        ensure!(
+            tag == "torch._utils._rebuild_tensor_v2" && args.len() == 6,
+            "unsupported tensor constructor"
+        );
+        let V::Storage(storage, count) = &*args[0] else {
+            bail!("tensor storage missing")
+        };
+        ensure!(
+            matches!(*args[4], V::False) && args[5].dictionary()?.is_empty(),
+            "tensor grad/hooks unsupported"
+        );
+        let offset = args[1].integer()?;
+        let shape = args[2]
+            .tuple()?
+            .iter()
+            .map(|v| v.integer())
+            .collect::<Result<Vec<_>>>()?;
+        let strides = args[3]
+            .tuple()?
+            .iter()
+            .map(|v| v.integer())
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            !shape.is_empty() && shape.len() <= 8 && shape.len() == strides.len(),
+            "tensor rank mismatch"
+        );
+        let mut elements = 1usize;
+        for (&dim, &stride) in shape.iter().zip(&strides).rev() {
+            ensure!(dim > 0 && stride == elements, "noncontiguous stored tensor");
+            elements = elements
+                .checked_mul(dim)
+                .context("tensor element count overflow")?;
+        }
+        ensure!(
+            offset == 0 && elements == *count,
+            "tensor storage offset/size mismatch"
+        );
+        let range = self
+            .entries
+            .get(&format!("{}data/{storage}", self.prefix))
+            .context("tensor ZIP storage missing")?;
+        ensure!(
+            range.len()
+                == elements
+                    .checked_mul(4)
+                    .context("tensor byte count overflow")?,
+            "tensor storage byte count mismatch"
+        );
+        Ok(V::Tensor(StoredTensor {
+            shape,
+            range: range.clone(),
+        }))
+    }
+    fn persistent(&mut self) -> Result<CheckpointValue> {
+        use CheckpointValue as V;
+        let value = self.pop()?;
+        let fields = value.tuple()?;
+        ensure!(
+            fields.len() == 5 && fields[0].text()? == "storage",
+            "unsupported persistent ID"
+        );
+        ensure!(
+            matches!(&*fields[1], V::Global(s) if s == "torch.FloatStorage"),
+            "unsupported storage type"
+        );
+        let name = fields[2].text()?;
+        ensure!(
+            !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()),
+            "invalid storage key"
+        );
+        ensure!(
+            fields[3].text()? == "cuda:0",
+            "unsupported stored location tag"
+        );
+        Ok(V::Storage(name.to_owned(), fields[4].integer()?))
+    }
+    fn set_items(&mut self, multiple: bool) -> Result<()> {
+        let values = if multiple {
+            self.marked()?
+        } else {
+            let value = self.pop()?;
+            vec![self.pop()?, value]
+        };
+        ensure!(values.len().is_multiple_of(2), "pickle key/value count");
+        let mut map = self.pop()?.dictionary()?.clone();
+        for pair in values.as_chunks::<2>().0.iter() {
+            ensure!(
+                map.insert(pair[0].text()?.to_owned(), pair[1].clone())
+                    .is_none(),
+                "duplicate pickle dictionary key"
+            );
+        }
+        self.stack
+            .push(std::rc::Rc::new(CheckpointValue::Dictionary(map)));
+        Ok(())
+    }
+    fn parse(mut self) -> Result<BTreeMap<String, StoredTensor>> {
+        use CheckpointValue as V;
+        use std::rc::Rc;
+        ensure!(
+            self.bytes.take(2)? == [0x80, 2],
+            "checkpoint requires pickle protocol 2"
+        );
+        loop {
+            ensure!(
+                self.stack.len() < 8192 && self.memo.len() < 8192,
+                "pickle metadata capacity"
+            );
+            let opcode = u8::try_from(self.bytes.number(1)?)?;
+            let value = match opcode {
+                b'(' => Some(V::Mark),
+                b')' => Some(V::Tuple(Vec::new())),
+                b'}' => Some(V::Dictionary(BTreeMap::new())),
+                b'K' => Some(V::Integer(self.bytes.number(1)?)),
+                b'M' => Some(V::Integer(self.bytes.number(2)?)),
+                b'J' => {
+                    let i = self.bytes.number(4)?;
+                    ensure!(i <= i32::MAX as usize, "negative pickle integer");
+                    Some(V::Integer(i))
+                }
+                0x89 => Some(V::False),
+                b'X' => {
+                    let len = self.bytes.number(4)?;
+                    Some(V::String(
+                        std::str::from_utf8(self.bytes.take(len)?)?.to_owned(),
+                    ))
+                }
+                b'c' => {
+                    let mut names = Vec::new();
+                    for _ in 0..2 {
+                        let start = self.bytes.position;
+                        while self.bytes.number(1)? != usize::from(b'\n') {}
+                        names.push(std::str::from_utf8(
+                            &self.bytes.data[start..self.bytes.position - 1],
+                        )?);
+                    }
+                    let name = names.join(".");
+                    ensure!(
+                        [
+                            "collections.OrderedDict",
+                            "torch.FloatStorage",
+                            "torch._utils._rebuild_tensor_v2"
+                        ]
+                        .contains(&name.as_str()),
+                        "unsupported pickle GLOBAL {name}"
+                    );
+                    Some(V::Global(name))
+                }
+                b't' => Some(V::Tuple(self.marked()?)),
+                0x85 => Some(V::Tuple(vec![self.pop()?])),
+                b'R' => Some(self.reduce()?),
+                b'Q' => Some(self.persistent()?),
+                b'q' | b'r' => {
+                    let index = self.bytes.number(if opcode == b'q' { 1 } else { 4 })?;
+                    ensure!(
+                        index < 8192
+                            && self
+                                .memo
+                                .insert(
+                                    index,
+                                    self.stack
+                                        .last()
+                                        .context("pickle memo stack empty")?
+                                        .clone()
+                                )
+                                .is_none(),
+                        "pickle memo index overwrite/overflow"
+                    );
+                    None
+                }
+                b'h' | b'j' => {
+                    let index = self.bytes.number(if opcode == b'h' { 1 } else { 4 })?;
+                    let value = self
+                        .memo
+                        .get(&index)
+                        .context("pickle memo reference missing")?;
+                    ensure!(
+                        !matches!(
+                            **value,
+                            V::Dictionary(_) | V::Tensor(_) | V::Storage(..) | V::Mark
+                        ),
+                        "mutable pickle alias unsupported"
+                    );
+                    self.stack.push(value.clone());
+                    None
+                }
+                b'u' | b's' => {
+                    self.set_items(opcode == b'u')?;
+                    None
+                }
+                b'b' => {
+                    let state = self.pop()?;
+                    let state = state.dictionary()?;
+                    ensure!(state.len() == 1, "unsupported pickle BUILD state");
+                    let metadata = state
+                        .get("_metadata")
+                        .context("state metadata missing")?
+                        .dictionary()?;
+                    for value in metadata.values() {
+                        let value = value.dictionary()?;
+                        ensure!(
+                            value.len() == 1
+                                && value
+                                    .get("version")
+                                    .context("module version missing")?
+                                    .integer()?
+                                    == 1,
+                            "unsupported module metadata"
+                        );
+                    }
+                    self.stack
+                        .last()
+                        .context("BUILD target missing")?
+                        .dictionary()?;
+                    None
+                }
+                b'.' => {
+                    ensure!(
+                        self.stack.len() == 1 && self.bytes.position == self.bytes.data.len(),
+                        "pickle trailing stack/data"
+                    );
+                    let result = self.pop()?;
+                    let mut tensors = BTreeMap::new();
+                    let mut storage_ranges = BTreeSet::new();
+                    for (name, value) in result.dictionary()? {
+                        let V::Tensor(tensor) = &**value else {
+                            bail!("non-tensor state entry {name}")
+                        };
+                        ensure!(
+                            storage_ranges.insert((tensor.range.start, tensor.range.end)),
+                            "aliased tensor storage"
+                        );
+                        tensors.insert(name.clone(), tensor.clone());
+                    }
+                    ensure!(!tensors.is_empty(), "empty state dictionary");
+                    return Ok(tensors);
+                }
+                _ => bail!(
+                    "unsupported pickle opcode 0x{opcode:02x} at {}",
+                    self.bytes.position - 1
+                ),
+            };
+            if let Some(value) = value {
+                self.stack.push(Rc::new(value));
+            }
+        }
+    }
+}
+
+fn stored_zip_tensors(data: &[u8]) -> Result<BTreeMap<String, StoredTensor>> {
+    let entries = stored_zip_entries(data)?;
+    let pickle_names: Vec<_> = entries
+        .keys()
+        .filter(|s| s.ends_with("/data.pkl"))
+        .collect();
+    ensure!(pickle_names.len() == 1, "ZIP requires one data.pkl");
+    let name = pickle_names[0];
+    let prefix = name
+        .strip_suffix("data.pkl")
+        .context("pickle path suffix")?;
+    for (suffix, expected) in [
+        ("byteorder", b"little".as_slice()),
+        ("version", b"3\n".as_slice()),
+    ] {
+        let range = entries
+            .get(&format!("{prefix}{suffix}"))
+            .context("ZIP metadata missing")?;
+        ensure!(&data[range.clone()] == expected, "unsupported ZIP {suffix}");
+    }
+    let range = entries[name].clone();
+    ensure!(
+        range.len() <= 16 * 1024 * 1024,
+        "pickle metadata exceeds 16 MiB"
+    );
+    let tensors = CheckpointPickle {
+        bytes: CheckpointBytes {
+            data: &data[range],
+            position: 0,
+        },
+        stack: Vec::new(),
+        memo: BTreeMap::new(),
+        entries: &entries,
+        prefix,
+    }
+    .parse()?;
+    let allowed: BTreeSet<_> = ["data.pkl", "byteorder", "version", ".data/serialization_id"]
+        .map(|s| format!("{prefix}{s}"))
+        .into_iter()
+        .collect();
+    ensure!(
+        entries
+            .iter()
+            .all(|(name, range)| allowed.contains(name)
+                || tensors.values().any(|t| t.range == *range))
+            && entries.len() == tensors.len() + allowed.len(),
+        "unconsumed ZIP entries"
+    );
+    let id = &data[entries[&format!("{prefix}.data/serialization_id")].clone()];
+    ensure!(
+        !id.is_empty() && id.iter().all(u8::is_ascii_digit),
+        "invalid serialization ID"
+    );
+    Ok(tensors)
+}
+
+#[cfg(test)]
+mod stored_zip_tests {
+    use super::*;
+
+    fn archive(pickle: &[u8], method: u16) -> Vec<u8> {
+        let payload = [1.25f32.to_le_bytes(), (-2.5f32).to_le_bytes()].concat();
+        let members = [
+            ("model/data.pkl", pickle),
+            ("model/data/0", payload.as_slice()),
+            ("model/byteorder", b"little".as_slice()),
+            ("model/version", b"3\n".as_slice()),
+            ("model/.data/serialization_id", b"12345678".as_slice()),
+        ];
+        let mut data = Vec::new();
+        let mut directory = Vec::new();
+        for (name, value) in members {
+            let offset = data.len() as u32;
+            let mut crc = !0u32;
+            for &b in value {
+                crc ^= u32::from(b);
+                for _ in 0..8 {
+                    crc = (crc >> 1) ^ (0xedb88320 & 0u32.wrapping_sub(crc & 1));
+                }
+            }
+            let crc = !crc;
+            data.extend_from_slice(&0x04034b50u32.to_le_bytes());
+            data.extend_from_slice(&[0; 4]);
+            data.extend_from_slice(&method.to_le_bytes());
+            data.extend_from_slice(&[0; 4]);
+            data.extend_from_slice(&crc.to_le_bytes());
+            for _ in 0..2 {
+                data.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            }
+            data.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            data.extend_from_slice(&[0; 2]);
+            data.extend_from_slice(name.as_bytes());
+            data.extend_from_slice(value);
+            directory.extend_from_slice(&0x02014b50u32.to_le_bytes());
+            directory.extend_from_slice(&[0; 6]);
+            directory.extend_from_slice(&method.to_le_bytes());
+            directory.extend_from_slice(&[0; 4]);
+            directory.extend_from_slice(&crc.to_le_bytes());
+            for _ in 0..2 {
+                directory.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            }
+            directory.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            directory.extend_from_slice(&[0; 12]);
+            directory.extend_from_slice(&offset.to_le_bytes());
+            directory.extend_from_slice(name.as_bytes());
+        }
+        let start = data.len() as u32;
+        data.extend_from_slice(&directory);
+        data.extend_from_slice(&0x06054b50u32.to_le_bytes());
+        data.extend_from_slice(&[0; 4]);
+        for _ in 0..2 {
+            data.extend_from_slice(&(members.len() as u16).to_le_bytes());
+        }
+        data.extend_from_slice(&(directory.len() as u32).to_le_bytes());
+        data.extend_from_slice(&start.to_le_bytes());
+        data.extend_from_slice(&[0; 2]);
+        data
+    }
+
+    fn pickle(offset: u8) -> Vec<u8> {
+        let mut data = b"\x80\x02ccollections\nOrderedDict\n)R(".to_vec();
+        fn string(data: &mut Vec<u8>, value: &str) {
+            data.push(b'X');
+            data.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            data.extend_from_slice(value.as_bytes());
+        }
+        string(&mut data, "weight");
+        data.extend_from_slice(b"ctorch._utils\n_rebuild_tensor_v2\n((");
+        string(&mut data, "storage");
+        data.extend_from_slice(b"ctorch\nFloatStorage\n");
+        string(&mut data, "0");
+        string(&mut data, "cuda:0");
+        data.extend_from_slice(&[b'K', 2, b't', b'Q', b'K', offset]);
+        data.extend_from_slice(b"K\x02\x85K\x01\x85\x89ccollections\nOrderedDict\n)RtRu.");
+        data
+    }
+
+    #[test]
+    #[ignore = "CPU published NAF checkpoint; set FF_MODEL to its directory"]
+    fn stored_zip_tensor_layout_rejects_invalid_metadata() -> Result<()> {
+        let data = archive(&pickle(0), 0);
+        let tensors = stored_zip_tensors(&data)?;
+        ensure!(
+            tensors.len() == 1 && tensors["weight"].shape == [2],
+            "valid stored tensor layout"
+        );
+        let tensor = &tensors["weight"];
+        ensure!(
+            data[tensor.range.clone()] == [1.25f32.to_le_bytes(), (-2.5f32).to_le_bytes()].concat(),
+            "valid stored tensor bytes"
+        );
+        ensure!(
+            stored_zip_tensors(&archive(&pickle(1), 0)).is_err(),
+            "wrong storage offset accepted"
+        );
+        let mut unknown = pickle(0);
+        unknown[2] = 0xff;
+        ensure!(
+            stored_zip_tensors(&archive(&unknown, 0)).is_err(),
+            "unknown opcode accepted"
+        );
+        ensure!(
+            stored_zip_tensors(&archive(&pickle(0), 8)).is_err(),
+            "compressed member accepted"
+        );
+        let root =
+            std::path::PathBuf::from(std::env::var_os("FF_MODEL").context("FF_MODEL missing")?);
+        let checkpoint = MappedCheckpoint::open_component(&root, "naf_release.pth")?;
+        ensure!(checkpoint.index.weight_map.len() == 37, "NAF key count");
+        let mut elements = 0;
+        for name in checkpoint.index.weight_map.keys() {
+            let tensor = checkpoint.tensor(name)?;
+            let values = checkpoint.f32_tensor(name, tensor.shape())?;
+            ensure!(values.iter().all(|v| v.is_finite()), "nonfinite NAF {name}");
+            elements += values.len();
+        }
+        ensure!(elements == 662544, "NAF storage element count");
+        println!(
+            "PASS stored_zip_tensor_layout valid=1 wrong_offset=rejected unknown_opcode=rejected compressed_member=rejected"
+        );
         Ok(())
     }
 }

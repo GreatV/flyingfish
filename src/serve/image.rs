@@ -1477,11 +1477,6 @@ fn lanczos(x: f64) -> f64 {
     }
 }
 
-/// Lanczos-3 resize of an RGB u8 image to `width x height`, horizontal pass then vertical pass with a u8 intermediate.
-pub(crate) fn resize_lanczos(image: &RgbImage, width: usize, height: usize) -> Vec<u8> {
-    resize_separable(image, width, height, (lanczos, 3.0))
-}
-
 /// Separable resize with `filter` (kernel, radius): horizontal pass then vertical pass, each rounded to u8; an axis
 /// of unchanged size is copied.
 fn resize_separable(
@@ -1531,6 +1526,120 @@ fn resize_separable(
         }
     }
     result
+}
+
+#[derive(Clone, Copy)]
+pub enum ResizeRounding {
+    F64,
+    Fixed22,
+}
+
+/// Separable radius-3 Lanczos on interleaved u8 pixels.
+pub fn resize_lanczos(
+    input: &[u8],
+    shape: [usize; 3],
+    output: [usize; 2],
+    rounding: ResizeRounding,
+) -> Result<Vec<u8>> {
+    let [height, width, channels] = shape;
+    let [out_height, out_width] = output;
+    ensure!(
+        height > 0 && width > 0 && out_height > 0 && out_width > 0 && (1..=4).contains(&channels),
+        "Lanczos dimensions/channels"
+    );
+    let count = |h: usize, w: usize| {
+        h.checked_mul(w)
+            .and_then(|n| n.checked_mul(channels))
+            .context("Lanczos extent overflow")
+    };
+    ensure!(input.len() == count(height, width)?, "Lanczos input extent");
+    if [height, width] == output {
+        return Ok(input.to_vec());
+    }
+    let mut source = input.to_vec();
+    if channels == 4 {
+        for p in source.as_chunks_mut::<4>().0.iter_mut() {
+            for c in 0..3 {
+                p[c] = ((u32::from(p[c]) * u32::from(p[3]) + 127) / 255) as u8;
+            }
+        }
+    }
+    let weights = |from: usize, to: usize| {
+        let mut weights = coefficients(from, to, (lanczos, 3.0));
+        if let ResizeRounding::Fixed22 = rounding {
+            for (_, values) in &mut weights {
+                for value in values {
+                    *value = (*value * 4194304.0).round();
+                }
+            }
+        }
+        weights
+    };
+    let sample = |weights: &[f64], pixels: &[u8], first: usize, stride: usize| -> u8 {
+        match rounding {
+            ResizeRounding::F64 => weights
+                .iter()
+                .enumerate()
+                .map(|(i, w)| w * f64::from(pixels[first + i * stride]))
+                .sum::<f64>()
+                .round()
+                .clamp(0.0, 255.0) as u8,
+            ResizeRounding::Fixed22 => {
+                (weights.iter().enumerate().fold(1i64 << 21, |sum, (i, w)| {
+                    sum + *w as i64 * i64::from(pixels[first + i * stride])
+                }) >> 22)
+                    .clamp(0, 255) as u8
+            }
+        }
+    };
+    let horizontal = if width == out_width {
+        source
+    } else {
+        let weights = weights(width, out_width);
+        let mut target = vec![0; count(height, out_width)?];
+        for y in 0..height {
+            for (x, (first, coefficients)) in weights.iter().enumerate() {
+                for c in 0..channels {
+                    target[(y * out_width + x) * channels + c] = sample(
+                        coefficients,
+                        &source,
+                        (y * width + first) * channels + c,
+                        channels,
+                    );
+                }
+            }
+        }
+        target
+    };
+    let mut target = if height == out_height {
+        horizontal
+    } else {
+        let weights = weights(height, out_height);
+        let mut target = vec![0; count(out_height, out_width)?];
+        for (y, (first, coefficients)) in weights.iter().enumerate() {
+            for x in 0..out_width {
+                for c in 0..channels {
+                    target[(y * out_width + x) * channels + c] = sample(
+                        coefficients,
+                        &horizontal,
+                        (first * out_width + x) * channels + c,
+                        out_width * channels,
+                    );
+                }
+            }
+        }
+        target
+    };
+    if channels == 4 {
+        for p in target.as_chunks_mut::<4>().0.iter_mut() {
+            if p[3] != 0 && p[3] != 255 {
+                for c in 0..3 {
+                    p[c] = (u32::from(p[c]) * 255 / u32::from(p[3])).min(255) as u8;
+                }
+            }
+        }
+    }
+    Ok(target)
 }
 
 pub fn load_image(url: &str) -> Result<RgbImage> {
@@ -2249,6 +2358,110 @@ mod tests {
     use super::*;
     use crate::serve::detok::Shared;
 
+    #[test]
+    fn lanczos_u8_matches_rgb_and_rgba_goldens() -> Result<()> {
+        let mut state = 123456789u32;
+        let rgb = RgbImage {
+            width: 263,
+            height: 263,
+            pixels: (0..263 * 263 * 3)
+                .map(|_| {
+                    state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (state >> 24) as u8
+                })
+                .collect(),
+        };
+        let merged = resize_separable(&rgb, 97, 263, (lanczos, 3.0));
+        let f64_pixels =
+            resize_lanczos(&rgb.pixels, [263, 263, 3], [263, 97], ResizeRounding::F64)?;
+        let fixed = resize_lanczos(
+            &rgb.pixels,
+            [263, 263, 3],
+            [263, 97],
+            ResizeRounding::Fixed22,
+        )?;
+        ensure!(f64_pixels == merged, "merged H3 F64 Lanczos bytes changed");
+        let differing = fixed.iter().zip(&merged).filter(|(a, b)| a != b).count();
+        ensure!(
+            differing > 0,
+            "Lanczos rounding control did not discriminate"
+        );
+        println!(
+            "PASS H3_LANCZOS_BYTES mismatched_bytes=0 fixed22_control_differences={differing}"
+        );
+        let input: Vec<u8> = (0..7 * 11 * 3)
+            .map(|i| ((i * 37 + 11) % 251) as u8)
+            .collect();
+        let expected: &[u8] = &[
+            85, 80, 140, 177, 114, 95, 132, 183, 131, 96, 129, 184, 62, 117, 145, 114, 79, 120,
+            163, 138, 100, 109, 169, 152, 83, 120, 169, 95, 96, 139, 157, 89, 91, 135, 170, 116,
+            86, 139, 178, 74, 102, 138, 143, 74, 122, 170, 130, 75, 95, 170, 153, 118, 97, 172,
+            108, 77, 112, 154, 104, 87, 138, 166, 96, 85, 132, 177, 174, 88, 135, 153, 78, 100,
+            117, 153, 76, 98, 168, 139, 120, 94, 167, 182, 131, 111, 155, 119, 81, 81, 152, 116,
+            90, 135, 172, 164, 90, 129, 155, 182, 94, 120, 159, 85, 77, 114, 159, 133, 97, 168,
+            168, 130, 94, 138, 182, 67, 82, 155, 129, 110, 81, 151, 173, 96, 132, 149, 171, 96,
+            114, 155, 75, 72, 117, 164, 153, 83, 111, 162, 145, 95, 137, 172, 141, 77, 139, 131,
+            96, 79, 154, 174, 119, 79, 127, 175, 106, 111, 147, 175, 71, 112, 163, 133, 79, 114,
+            158, 160, 92, 110, 153, 154, 80, 129, 166, 97, 81, 140, 149, 111, 86, 129, 170, 135,
+            104, 132, 187, 65, 120, 153, 118, 66, 117, 154, 135, 72, 109, 169, 164,
+        ];
+        let actual = resize_lanczos(
+            &input,
+            [7, 11, 3],
+            [13, 5],
+            crate::serve::image::ResizeRounding::Fixed22,
+        )?;
+        ensure!(
+            actual == expected,
+            "Lanczos 3-channel golden mismatch: {actual:?}"
+        );
+        ensure!(
+            actual
+                .iter()
+                .zip(expected.iter().rev())
+                .any(|(a, b)| a != b),
+            "reversed-coordinate control did not discriminate"
+        );
+        let input: Vec<u8> = (0..7 * 11 * 4)
+            .map(|i| ((i * 37 + 11) % 251) as u8)
+            .collect();
+        let expected: &[u8] = &[
+            0, 35, 82, 65, 109, 153, 130, 135, 185, 85, 125, 102, 60, 118, 101, 88, 144, 95, 116,
+            136, 59, 100, 135, 107, 109, 133, 121, 126, 148, 96, 137, 122, 52, 107, 104, 83, 136,
+            123, 129, 144, 91, 136, 161, 161, 108, 102, 106, 110, 115, 107, 152, 157, 46, 101, 116,
+            83, 125, 157, 144, 152, 83, 122, 151, 135, 102, 104, 99, 105, 128, 119, 161, 182, 73,
+            121, 139, 115, 124, 137, 132, 137, 26, 60, 104, 76, 95, 131, 107, 109, 154, 123, 161,
+            180, 87, 134, 147, 142, 130, 89, 104, 117, 48, 101, 144, 111, 99, 114, 121, 105, 134,
+            116, 153, 169, 72, 121, 135, 113, 122, 116, 120, 129, 87, 130, 167, 158, 96, 86, 124,
+            100, 106, 106, 146, 160, 40, 93, 115, 82, 115, 150, 138, 144, 133, 105, 142, 111, 80,
+            100, 115, 102, 129, 108, 151, 167, 68, 117, 133, 111, 118, 116, 118, 125, 171, 41, 87,
+            67, 70, 126, 103, 101, 146, 118, 154, 172, 82, 126, 139, 133, 120, 81, 97, 110, 89, 91,
+            137, 106, 79, 128, 106, 93, 117, 133, 146, 160, 56, 96, 115, 95, 111, 125, 119, 128,
+            86, 120, 164, 163, 87, 122, 116, 96, 98, 134, 139, 152, 33, 72, 109, 77, 105, 139, 132,
+            135, 128, 124, 165, 176, 78, 122, 118, 110, 125, 116, 141, 157, 64, 108, 148, 110, 108,
+            99, 119, 113, 157, 124, 163, 176, 72, 122, 117, 119, 144, 103, 143, 162, 79, 126, 164,
+            135, 111, 57, 104, 98,
+        ];
+        let actual = resize_lanczos(
+            &input,
+            [7, 11, 4],
+            [13, 5],
+            crate::serve::image::ResizeRounding::Fixed22,
+        )?;
+        ensure!(
+            actual == expected,
+            "Lanczos 4-channel golden mismatch: {actual:?}"
+        );
+        ensure!(
+            actual
+                .iter()
+                .zip(expected.iter().rev())
+                .any(|(a, b)| a != b),
+            "reversed-coordinate control did not discriminate"
+        );
+        println!("PASS lanczos_u8_reference rgb=exact rgba=exact reversed_coordinates=rejected");
+        Ok(())
+    }
     #[test]
     fn image_input_files_use_the_model_patch_width() -> Result<()> {
         let root: serde_json::Value =

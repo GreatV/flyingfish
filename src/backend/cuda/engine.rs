@@ -70,7 +70,7 @@ mod qwen;
 #[path = "engine_recurrent.rs"]
 mod recurrent;
 #[path = "engine_vision.rs"]
-mod vision_runtime;
+pub mod vision_runtime;
 
 fn trace_value(
     trace: &mut Option<Target<'_>>,

@@ -1101,6 +1101,8 @@ impl KeyframeEncoder {
                 .arg(&u32::try_from(channels)?)
                 .arg(&groups)
                 .arg(&self.spec.encoder_eps)
+                .arg(&0u32)
+                .arg(&0u32)
                 .launch(LaunchConfig {
                     grid_dim: (groups, 1, 1),
                     block_dim: (1024, 1, 1),
@@ -1198,6 +1200,7 @@ impl KeyframeEncoder {
                         .arg(&u32::try_from(pad)?)
                         .arg(&(first as u64))
                         .arg(&u32::try_from(rows)?)
+                        .arg(&0u32)
                         .launch(flat(rows * k))?;
                 }
                 blas.linear_f32(

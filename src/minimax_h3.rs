@@ -1207,7 +1207,12 @@ pub fn prepare_i2va(
     let canvas = crate::serve::image::RgbImage {
         width,
         height,
-        pixels: crate::serve::image::resize_lanczos(keyframe, width, height),
+        pixels: crate::serve::image::resize_lanczos(
+            &keyframe.pixels,
+            [keyframe.height, keyframe.width, 3],
+            [height, width],
+            crate::serve::image::ResizeRounding::F64,
+        )?,
     };
     let processor = crate::serve::image::Processor::load(&encoder, None)?
         .context("MiniMax-H3 text encoder without an image processor")?;

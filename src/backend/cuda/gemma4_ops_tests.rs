@@ -483,7 +483,8 @@ fn audio_operators_match_definition_gpu() -> Result<()> {
         if name.starts_with("audio-patch-") {
             let [time, frequency, channels] = <[usize; 3]>::try_from(fixture["x"].0.clone())
                 .map_err(|_| anyhow::anyhow!("patch shape"))?;
-            let count = time.div_ceil(2) * frequency.div_ceil(2) * channels * 9;
+            let out_h = time.div_ceil(2) as u32;
+            let count = out_h as usize * frequency.div_ceil(2) * channels * 9;
             let out = output(count)?;
             let run = |mask: &crate::backend::gpu::CudaSlice<u8>| -> Result<()> {
                 unsafe {
@@ -495,6 +496,16 @@ fn audio_operators_match_definition_gpu() -> Result<()> {
                         .arg(&(time as u32))
                         .arg(&(frequency as u32))
                         .arg(&(channels as u32))
+                        .arg(&3u32)
+                        .arg(&3u32)
+                        .arg(&2u32)
+                        .arg(&2u32)
+                        .arg(&1u32)
+                        .arg(&1u32)
+                        .arg(&1u32)
+                        .arg(&1u32)
+                        .arg(&0u32)
+                        .arg(&out_h)
                         .launch(flat(count))?;
                 }
                 Ok(())

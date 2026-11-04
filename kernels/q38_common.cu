@@ -603,7 +603,7 @@ extern "C" __global__ void q38_layer_norm_f32(
     uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,float eps) {
     if(blockDim.x!=256 || blockDim.y!=1 || blockDim.z!=1 || gridDim.y!=1 || gridDim.z!=1 ||
        !rows || !heads || !width || uint64_t(gridDim.x)!=uint64_t(rows)*heads ||
-       !x || !weight || !bias || !y || !(eps>0)) {__trap();return;}
+       !x || bool(weight)!=bool(bias) || !y || !(eps>0)) {__trap();return;}
     uint32_t row=blockIdx.x/heads,head=blockIdx.x%heads;
     x+=uint64_t(row)*xs0+uint64_t(head)*xs1;
     y+=uint64_t(row)*ys0+uint64_t(head)*ys1;
@@ -620,7 +620,8 @@ extern "C" __global__ void q38_layer_norm_f32(
     float inv=__fdiv_rn(1.0f,__fsqrt_rn(__fadd_rn(block_sum(variance,tmp)/float(width),eps)));
     for(uint32_t d=threadIdx.x;d<width;d+=256) {
         float centered=__fsub_rn(x[uint64_t(d)*xs2],mean);
-        float affine=__fadd_rn(__fmul_rn(__fmul_rn(centered,inv),weight[d]),bias[d]);
+        float normalized=__fmul_rn(centered,inv);
+        float affine=weight ? __fadd_rn(__fmul_rn(normalized,weight[d]),bias[d]) : normalized;
         y[uint64_t(d)*ys2]=affine;
     }
 }
@@ -963,4 +964,82 @@ extern "C" __global__ void clamp_f32(float* __restrict__ x, long long count, flo
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     x[i] = fminf(fmaxf(x[i], lo), hi);
+}
+
+// NHWC GroupNorm over [batch, spatial, channels] with `groups` channel groups.
+// One CTA of 256 threads per (batch, group); F32 reduction and affine `x * a + b`
+// where `a = rstd * weight[c]` and `b = bias[c] - a * mean`.
+extern "C" __global__ __launch_bounds__(256) void group_norm_nhwc_bf16(
+    const __nv_bfloat16* x, const __nv_bfloat16* weight, const __nv_bfloat16* bias,
+    __nv_bfloat16* y, uint32_t batch, uint32_t spatial, uint32_t channels,
+    uint32_t groups, float eps) {
+    if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
+        gridDim.y != 1 || gridDim.z != 1 || !x || !weight || !bias || !y ||
+        !batch || !spatial || !channels || !groups || channels % groups ||
+        uint64_t(gridDim.x) != uint64_t(batch) * groups || !(eps > 0.0f)) {
+        __trap(); return;
+    }
+    const uint32_t b_idx = blockIdx.x / groups;
+    const uint32_t g_idx = blockIdx.x % groups;
+    const uint32_t c_per_group = channels / groups;
+    const uint32_t c_base = g_idx * c_per_group;
+    const uint64_t group_elems = uint64_t(spatial) * c_per_group;
+    const uint64_t batch_base = uint64_t(b_idx) * spatial * channels;
+    __shared__ float tmp[8];
+    float sum = 0.0f;
+    for (uint64_t i = threadIdx.x; i < group_elems; i += 256) {
+        const uint64_t hw = i / c_per_group;
+        const uint32_t c = c_base + uint32_t(i % c_per_group);
+        sum = __fadd_rn(sum, __bfloat162float(x[batch_base + hw * channels + c]));
+    }
+    const float inv_n = 1.0f / float(group_elems);
+    const float mean = __fmul_rn(block_sum(sum, tmp), inv_n);
+    __syncthreads();
+    float var_sum = 0.0f;
+    for (uint64_t i = threadIdx.x; i < group_elems; i += 256) {
+        const uint64_t hw = i / c_per_group;
+        const uint32_t c = c_base + uint32_t(i % c_per_group);
+        const float delta = __fsub_rn(__bfloat162float(x[batch_base + hw * channels + c]), mean);
+        var_sum = __fadd_rn(var_sum, __fmul_rn(delta, delta));
+    }
+    const float rstd = rsqrtf(__fadd_rn(__fmul_rn(block_sum(var_sum, tmp), inv_n), eps));
+    for (uint64_t i = threadIdx.x; i < group_elems; i += 256) {
+        const uint64_t hw = i / c_per_group;
+        const uint32_t c = c_base + uint32_t(i % c_per_group);
+        const uint64_t idx = batch_base + hw * channels + c;
+        const float a = __fmul_rn(rstd, __bfloat162float(weight[c]));
+        const float b = __fsub_rn(__bfloat162float(bias[c]), __fmul_rn(a, mean));
+        y[idx] = __float2bfloat16_rn(__fadd_rn(__fmul_rn(__bfloat162float(x[idx]), a), b));
+    }
+}
+
+// y[r, c] = bf16(residual[r, c] + bf16(branch[r, c] * scale[c])).
+template<typename T>
+__device__ __forceinline__ void channel_scale_residual(
+    const T* residual, const T* branch,
+    const T* scale, T* y,
+    uint32_t rows, uint32_t width) {
+    if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 ||
+        gridDim.y != 1 || gridDim.z != 1 || !residual || !branch ||
+        !scale || !y || !rows || !width) { __trap(); return; }
+    const uint64_t count = uint64_t(rows) * width;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint32_t c = uint32_t(i % width);
+        if constexpr (sizeof(T) == sizeof(float))
+            y[i] = __fadd_rn(residual[i], __fmul_rn(branch[i], scale[c]));
+        else
+            y[i] = __hadd(residual[i], __hmul(branch[i], scale[c]));
+    }
+}
+
+extern "C" __global__ void channel_scale_residual_bf16(
+    const __nv_bfloat16* residual, const __nv_bfloat16* branch,
+    const __nv_bfloat16* scale, __nv_bfloat16* y, uint32_t rows, uint32_t width) {
+    channel_scale_residual(residual, branch, scale, y, rows, width);
+}
+extern "C" __global__ void channel_scale_residual_f32(
+    const float* residual, const float* branch, const float* scale, float* y,
+    uint32_t rows, uint32_t width) {
+    channel_scale_residual(residual, branch, scale, y, rows, width);
 }
