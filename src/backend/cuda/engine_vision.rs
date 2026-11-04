@@ -705,25 +705,6 @@ impl VisionIo {
     }
 }
 
-fn take(catalog: &mut WeightCatalog, name: &str, shape: &[usize]) -> Result<CudaSlice<bf16>> {
-    let entry = catalog
-        .manifest
-        .entries
-        .get(name)
-        .context("vision manifest entry missing")?;
-    ensure!(
-        entry.load
-            && entry.scope == crate::checkpoint::TensorScope::Vision
-            && entry.dtype == safetensors::Dtype::BF16
-            && entry.shape == shape,
-        "invalid vision tensor {name}"
-    );
-    match catalog.tensors.remove(name) {
-        Some(StoredTensor::Bf16(buffer)) => Ok(buffer),
-        _ => anyhow::bail!("vision weight not uploaded as BF16: {name}"),
-    }
-}
-
 struct AffineWeights<T = bf16> {
     weight: CudaSlice<T>,
     bias: CudaSlice<T>,
