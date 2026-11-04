@@ -255,12 +255,17 @@ extern "C" __global__ void vision_bucket_position_add(
     }
 }
 
-extern "C" __global__ void vision_upcast_f32(
-    const __nv_bfloat16* input, float* output, uint32_t count) {
+template<typename T>
+__device__ __forceinline__ void vision_upcast(
+    const T* input, float* output, uint32_t count) {
     if (!vision_flat_launch() || !input || !output || !count) { __trap(); return; }
     for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < count; i += gridDim.x * 256) {
-        output[i] = __bfloat162float(input[i]);
+        output[i] = float(input[i]);
     }
+}
+extern "C" __global__ void vision_upcast_f32(
+    const __nv_bfloat16* input, float* output, uint32_t count) {
+    vision_upcast(input, output, count);
 }
 
 extern "C" __global__ void vision_bias_f32(
@@ -537,11 +542,11 @@ __device__ __forceinline__ int reflect_index(int i, int n) {
     return i < 0 ? -i : (i >= n ? 2 * (n - 1) - i : i);
 }
 
-// Input layout 0 [height * width, channels], 1 [channels, height * width].
-// One frame x -> im2col rows a [rows, channels * kt * k * k] of a causal 3D convolution
-// with weight [out, channels, kt, k, k] and spatial stride, for output pixels first + r of an out_w-wide output.
-// Column (c * kt + t) * k * k + ky * k + kx is 0 for t < kt - 1 (the causal zero frames), else x at
-// (oy * stride + ky - pad, ox * stride + kx - pad) with reflected borders.
+// Frame layout 0 [height*width,channels], 1 [channels,height*width].
+// Causal past frames are zero; height/width borders are reflected.
+// Volume layout 0 [depth*height*width,channels], 1 [channels,depth*height*width].
+// Volume padding is zero on the depth, height and width axes.
+// Output rows a [rows,channels*kt*k*k] retain weight [out,channels,kt,k,k] order.
 template<typename T>
 __device__ __forceinline__ void frame_im2col(
     const T* x, T* a, uint32_t channels, uint32_t height, uint32_t width, uint32_t out_w,
@@ -1168,10 +1173,7 @@ extern "C" __global__ void channel_to_spatial_f16(
 
 extern "C" __global__ void vision_upcast_f16_to_f32(
     const __half* input, float* output, uint32_t count) {
-    if (!vision_flat_launch() || !input || !output || !count) { __trap(); return; }
-    for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < count; i += gridDim.x * 256) {
-        output[i] = __half2float(input[i]);
-    }
+    vision_upcast(input, output, count);
 }
 
 extern "C" __global__ void activation_f16(

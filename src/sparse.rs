@@ -4,7 +4,6 @@ use anyhow::{Context, Result, ensure};
 pub struct SparseSites {
     coordinates: Vec<[i32; 4]>,
     sorted: Vec<([i32; 4], i32)>,
-    pub segments: Vec<std::ops::Range<usize>>,
 }
 impl SparseSites {
     pub fn new(coordinates: Vec<[i32; 4]>) -> Result<Self> {
@@ -16,19 +15,10 @@ impl SparseSites {
             coordinates.iter().flatten().all(|&x| x >= 0),
             "negative sparse coordinate"
         );
-        let mut segments = Vec::new();
-        let mut start = 0;
-        for row in 1..coordinates.len() {
-            ensure!(
-                coordinates[row][0] >= coordinates[row - 1][0],
-                "sparse sample rows must be contiguous and batch ordered"
-            );
-            if coordinates[row][0] != coordinates[row - 1][0] {
-                segments.push(start..row);
-                start = row;
-            }
-        }
-        segments.push(start..coordinates.len());
+        ensure!(
+            coordinates.windows(2).all(|p| p[0][0] <= p[1][0]),
+            "sparse sample rows must be contiguous and batch ordered"
+        );
         let mut sorted: Vec<_> = coordinates
             .iter()
             .copied()
@@ -43,7 +33,6 @@ impl SparseSites {
         Ok(Self {
             coordinates,
             sorted,
-            segments,
         })
     }
     pub fn coordinates(&self) -> &[[i32; 4]] {
