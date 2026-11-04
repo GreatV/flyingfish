@@ -3089,6 +3089,10 @@ mod tests {
     /// definition reference's dumped input and conditioning, compared with the definition's own output. The floor is
     /// the max over the reference's pairwise arm spreads and the engine's official-weight spread; the control
     /// re-runs with the fused gate+up halves unswapped.
+    /// 2026-11-04: the `official` arm keeps the GGUF AdaLN and the GGUF fixed projections, and the floor adds the
+    /// `bf16_strict` arm. The earlier floor was the FP32-vs-BF16 spread alone, and the `official` dump it scored
+    /// against predated the harness revision that put the GGUF modulation in that arm. The thresholds below were
+    /// re-derived from the regenerated arms before the candidate was rerun.
     #[test]
     #[ignore = "FF_MODEL, FF_H3_GGUF, FF_H3_GGUF_BLOCK_OUT, FF_H3_LORA"]
     fn gguf_block_matches_the_definition_reference() -> Result<()> {
