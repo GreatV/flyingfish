@@ -6083,9 +6083,15 @@ impl Engine {
         self.prepare_vision_weights(request)?;
         let runtime = self.qwen.as_mut().context("prefix runtime missing")?;
         ensure!(
-            runtime.dense_graphs.is_empty(),
-            "prefix graph already captured"
+            runtime.dense_graphs.len() == runtime.layers.len() + 2,
+            "prefix control requires the full streamed capture"
         );
+        let head = runtime
+            .dense_graphs
+            .pop()
+            .context("prefix head graph missing")?;
+        runtime.dense_graphs.truncate(7);
+        runtime.dense_graphs.push(head);
         runtime.layers.truncate(6);
         self.model_spec.layers.truncate(6);
         self.config.num_hidden_layers = 6;
