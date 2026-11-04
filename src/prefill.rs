@@ -333,6 +333,44 @@ mod tests {
     }
 
     #[test]
+    fn dense_host_tiers_preserve_streamed_source_and_device_bytes() -> anyhow::Result<()> {
+        use super::DensePlacement;
+        let layers = [10usize, 8, 6, 4];
+        let host_layers = [10usize, 9, 7, 5];
+        let device = 24usize;
+        let host = 12usize;
+        let plan = DensePlacement::new(&layers, Some(&host_layers), device, host)?;
+        let total = layers.iter().sum::<usize>();
+        let mut streamed_device = 0usize;
+        let mut streamed_source = 0usize;
+        for (i, slot) in plan.slots.iter().enumerate() {
+            if slot.is_some() {
+                streamed_device += layers[i];
+                streamed_source += host_layers[i];
+            }
+        }
+        assert!(plan.resident_bytes + 2 * plan.slot_bytes <= device);
+        assert!(plan.resident_bytes > 0);
+        assert_eq!(plan.resident_bytes + streamed_device, total);
+        assert_eq!(plan.host_bytes + plan.disk_bytes, streamed_source);
+        assert!(plan.host_bytes <= host);
+        assert!(plan.disk_bytes > 0);
+        for (i, &on_host) in plan.host.iter().enumerate() {
+            if plan.slots[i].is_some() && !on_host {
+                assert!(host_layers[i] > host - plan.host_bytes);
+            }
+        }
+        assert!(plan.host[0]);
+        assert!(!plan.host[1]);
+        assert!(!plan.host[2]);
+        assert_eq!(plan.host_bytes, 10);
+        assert_eq!(plan.disk_bytes, 16);
+        assert!(DensePlacement::new(&layers, Some(&host_layers[..3]), device, host).is_err());
+        assert!(DensePlacement::new(&layers, Some(&[10, 9, 0, 5]), device, host).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn dense_prefill_chunk_order_rejects_a_swapped_predecessor() -> anyhow::Result<()> {
         let mut expected = 0;
         for (start, rows) in [(0, 8192), (8192, 8128)] {
