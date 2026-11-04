@@ -118,6 +118,7 @@ impl SparseSites {
         }
         Ok((Self::new(coordinates)?, source))
     }
+    #[cfg(test)]
     pub fn scaled_coordinates(&self, source_grid: u32, target_grid: u32) -> Result<Vec<[f32; 3]>> {
         ensure!(
             source_grid > 0 && target_grid > 1 && target_grid <= i32::MAX as u32,
@@ -143,6 +144,7 @@ impl SparseSites {
         }
         Ok(coordinates)
     }
+    #[cfg(test)]
     pub fn round_unique(&self, source_grid: u32, target_grid: u32) -> Result<Self> {
         let scaled = self.scaled_coordinates(source_grid, target_grid)?;
         let mut coordinates: Vec<_> = self

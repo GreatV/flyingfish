@@ -53,21 +53,19 @@ impl SparseConv {
         let maps = sites.neighbours_3x3()?;
         let neighbours = device.stream.clone_htod(maps.as_flattened())?;
         let columns = device.stream.alloc_zeros(tile * 27 * channels)?;
-        println!(
-            "SPARSE_GATHER_SETUP rows={rows} channels={channels} tile={tile} map_bytes={map_bytes} columns_bytes={} host_lookup_queries={} h2d_map_bytes={map_bytes}",
-            tile * row_bytes,
-            rows * 27
-        );
         Ok(Self {
             device: device.clone(),
             neighbours,
             columns,
             gather: cubin::module(&device.ctx, "vision_ops")?.load_function("sparse_gather_f16")?,
-            bias: cubin::module(&device.ctx, "q38_common")?.load_function("q38_bias_add_f16")?,
+            bias: cubin::module(&device.ctx, "q38_common")?.load_function("q38_bias_fill_f16")?,
             rows,
             channels,
             tile,
         })
+    }
+    pub(crate) fn workspace_bytes(&self) -> usize {
+        self.neighbours.len() * size_of::<i32>() + self.columns.len() * size_of::<f16>()
     }
     pub fn run(
         &self,
@@ -138,7 +136,6 @@ impl SparseConv {
                 [rows as u32, out as u32],
                 [out as u64, 1],
             )?;
-            blas.linear_f16(weight, x, &mut TensorMut(y), false)?;
             unsafe {
                 stream
                     .launch_builder(&self.bias)
@@ -146,9 +143,9 @@ impl SparseConv {
                     .arg(&bias.ptr)
                     .arg(&((rows * out) as u64))
                     .arg(&(out as u32))
-                    .arg(&0i32)
                     .launch(flat(rows * out))?;
             }
+            blas.linear_f16(weight, x, &mut TensorMut(y), true)?;
         }
         Ok(())
     }

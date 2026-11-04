@@ -63,7 +63,6 @@ __device__ __forceinline__ void activation(
         output[i] = T(y);
     }
 }
-
 extern "C" __global__ void activation_bf16(
     const __nv_bfloat16* input, __nv_bfloat16* output, uint32_t rows, uint32_t width, int mode) {
     activation(input,output,rows,width,mode);
@@ -321,10 +320,10 @@ extern "C" __global__ void vision_rms_scale_f32(
 
 extern "C" __global__ void vision_add_row_silu_f32(
     const float* input, const float* row, float* output, uint32_t count, uint32_t width) {
-    if (!vision_flat_launch() || !input || !row || !output || !count || !width ||
+    if (!vision_flat_launch() || !input || !output || !count || !width ||
         count % width) { __trap(); return; }
     for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < count; i += gridDim.x * 256) {
-        float x = __fadd_rn(input[i], row[i % width]);
+        float x = row ? __fadd_rn(input[i], row[i % width]) : input[i];
         output[i] = __fdiv_rn(x, __fadd_rn(1.0f, expf(-x)));
     }
 }
@@ -572,23 +571,10 @@ __device__ __forceinline__ void frame_im2col(
         a[i] = x[layout ? uint64_t(c) * depth * height * width + pixel : pixel * channels + c];
     }
 }
-
 extern "C" __global__ void causal_frame_im2col_f32(
     const float* x, float* a, uint32_t channels, uint32_t height, uint32_t width, uint32_t out_w,
     uint32_t kt, uint32_t k, uint32_t stride, uint32_t pad, uint64_t first, uint32_t rows, uint32_t layout) {
     frame_im2col(x,a,channels,height,width,out_w,kt,k,stride,pad,first,rows,layout,1,false);
-}
-
-// Symmetric zero padding, unit stride; weight layout [Co,Ci,kz,ky,kx].
-extern "C" __global__ void conv3d_im2col_f16(
-    const __half* x, __half* a, uint32_t channels, uint32_t depth, uint32_t height,
-    uint32_t width, uint32_t k, uint64_t first, uint32_t rows, uint32_t layout) {
-    frame_im2col(x,a,channels,height,width,width,k,k,1,k/2,first,rows,layout,depth,true);
-}
-extern "C" __global__ void conv3d_im2col_f32(
-    const float* x, float* a, uint32_t channels, uint32_t depth, uint32_t height,
-    uint32_t width, uint32_t k, uint64_t first, uint32_t rows, uint32_t layout) {
-    frame_im2col(x,a,channels,height,width,width,k,k,1,k/2,first,rows,layout,depth,true);
 }
 
 // GroupNorm/SiLU: layout 0 NHWC, 1 NCHW; arithmetic 0 two-pass/1024 threads, 1 Welford/512 threads.
@@ -1025,7 +1011,130 @@ extern "C" __global__ __launch_bounds__(256) void linear_ordered_f32(
     }
 }
 
-// Features [sites,channels], neighbours [sites,27], columns [rows,27*channels].
+extern "C" __global__ void sinusoidal_embed_f32(
+    const float* t, const float* freqs, float* out,
+    uint32_t batch, uint32_t half, int two_pi) {
+    if (!vision_flat_launch() || !t || !freqs || !out || !batch || !half) {
+        __trap();
+        return;
+    }
+    const uint32_t total = batch * half;
+    for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < total; i += gridDim.x * 256) {
+        const uint32_t b = i / half;
+        const uint32_t d = i % half;
+        float arg = __fmul_rn(t[b], freqs[d]);
+        if (two_pi) {
+            arg = __fmul_rn(__fmul_rn(arg, 2.0f), 3.14159265358979323846f);
+        }
+        out[b * (2u * half) + d] = cosf(arg);
+        out[b * (2u * half) + half + d] = sinf(arg);
+    }
+}
+
+extern "C" __global__ void pcd_pos_embed_f32(
+    const float* points, const float* freqs, float* out,
+    uint32_t rows, uint32_t channels, uint32_t freq_dim,
+    int version, int accumulate) {
+    if (!vision_flat_launch() || !points || !freqs || !out || !rows ||
+        !channels || !freq_dim || 6u * freq_dim > channels ||
+        (version != 1 && version != 2)) {
+        __trap();
+        return;
+    }
+    const uint64_t total = uint64_t(rows) * channels;
+    const uint32_t coord_span = 2u * freq_dim;
+    const uint32_t active_span = 3u * coord_span;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < total;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint64_t r = i / channels;
+        const uint32_t c_idx = uint32_t(i % channels);
+        float val = 0.0f;
+        if (c_idx < active_span) {
+            const uint32_t axis = c_idx / coord_span;
+            const uint32_t rem = c_idx % coord_span;
+            const uint32_t f = rem % freq_dim;
+            const bool is_cos = rem >= freq_dim;
+            const float x = points[r * 3u + axis];
+            float ang = __fmul_rn(x, freqs[f]);
+            if (version == 1) {
+                ang = __fmul_rn(__fmul_rn(ang, 2.0f), 3.14159265358979323846f);
+            } else {
+                ang = __fmul_rn(ang, 3.14159265358979323846f);
+            }
+            val = is_cos ? cosf(ang) : sinf(ang);
+        }
+        out[i] = accumulate ? __fadd_rn(out[i], val) : val;
+    }
+}
+
+extern "C" __global__ void vision_downcast_f32_to_f16(
+    const float* input, __half* output, uint32_t count) {
+    if (!vision_flat_launch() || !input || !output || !count) { __trap(); return; }
+    for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < count; i += gridDim.x * 256) {
+        output[i] = __float2half_rn(input[i]);
+    }
+}
+
+template <typename T>
+__device__ __forceinline__ void qkv_unpack_hm_impl(
+    const T* packed, T* q_out, T* k_out, T* v_hm_out,
+    uint32_t batch, uint32_t seq_len, uint32_t heads, uint32_t dim, int parts) {
+    if (!vision_flat_launch() || !packed || !k_out || !v_hm_out ||
+        !batch || !seq_len || !heads || !dim ||
+        (parts != 2 && parts != 3) || (parts == 3 && !q_out)) {
+        __trap();
+        return;
+    }
+    const uint32_t hd = heads * dim;
+    const uint64_t rows = uint64_t(batch) * seq_len;
+    const uint64_t total = rows * hd;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < total;
+         i += uint64_t(gridDim.x) * 256) {
+        const uint64_t row = i / hd;
+        const uint32_t rem = uint32_t(i % hd);
+        const uint32_t h = rem / dim;
+        const uint32_t d = rem % dim;
+        const uint32_t b = uint32_t(row / seq_len);
+        const uint32_t l = uint32_t(row % seq_len);
+        const uint64_t hm_idx =
+            ((uint64_t(b * heads + h) * seq_len + l) * dim) + d;
+        if (parts == 3) {
+            const uint64_t base = row * (3ull * hd);
+            q_out[i] = packed[base + rem];
+            k_out[i] = packed[base + hd + rem];
+            v_hm_out[hm_idx] = packed[base + 2ull * hd + rem];
+        } else {
+            const uint64_t base = row * (2ull * hd);
+            k_out[i] = packed[base + rem];
+            v_hm_out[hm_idx] = packed[base + hd + rem];
+        }
+    }
+}
+
+extern "C" __global__ void qkv_unpack_hm_f16(
+    const __half* packed, __half* q_out, __half* k_out, __half* v_hm_out,
+    uint32_t batch, uint32_t seq_len, uint32_t heads, uint32_t dim, int parts) {
+    qkv_unpack_hm_impl(packed, q_out, k_out, v_hm_out, batch, seq_len, heads, dim, parts);
+}
+
+extern "C" __global__ void qkv_unpack_hm_bf16(
+    const __nv_bfloat16* packed, __nv_bfloat16* q_out, __nv_bfloat16* k_out, __nv_bfloat16* v_hm_out,
+    uint32_t batch, uint32_t seq_len, uint32_t heads, uint32_t dim, int parts) {
+    qkv_unpack_hm_impl(packed, q_out, k_out, v_hm_out, batch, seq_len, heads, dim, parts);
+}
+
+extern "C" __global__ void conv3d_im2col_f16(
+    const __half* x, __half* a, uint32_t channels, uint32_t depth, uint32_t height,
+    uint32_t width, uint32_t k, uint64_t first, uint32_t rows, uint32_t layout) {
+    frame_im2col(x,a,channels,height,width,width,k,k,1,k/2,first,rows,layout,depth,true);
+}
+
+extern "C" __global__ void conv3d_im2col_f32(
+    const float* x, float* a, uint32_t channels, uint32_t depth, uint32_t height,
+    uint32_t width, uint32_t k, uint64_t first, uint32_t rows, uint32_t layout) {
+    frame_im2col(x,a,channels,height,width,width,k,k,1,k/2,first,rows,layout,depth,true);
+}
+
 extern "C" __global__ void sparse_gather_f16(
     const __half* x, const int32_t* neighbours, __half* columns,
     uint32_t sites, uint32_t channels, uint32_t first, uint32_t rows) {
@@ -1042,7 +1151,6 @@ extern "C" __global__ void sparse_gather_f16(
     }
 }
 
-// Source pairs [parent,child], child blocks contiguous in [parents,8*channels].
 extern "C" __global__ void channel_to_spatial_f16(
     const __half* x, const uint32_t* source, __half* y,
     uint32_t parents, uint32_t rows, uint32_t input_channels, uint32_t channels, int add) {
@@ -1066,20 +1174,11 @@ extern "C" __global__ void vision_upcast_f16_to_f32(
     }
 }
 
-extern "C" __global__ void vision_downcast_f32_to_f16(
-    const float* input, __half* output, uint32_t count) {
-    if (!vision_flat_launch() || !input || !output || !count) { __trap(); return; }
-    for (uint32_t i = blockIdx.x * 256 + threadIdx.x; i < count; i += gridDim.x * 256) {
-        output[i] = __float2half_rn(input[i]);
-    }
-}
-
 extern "C" __global__ void activation_f16(
     const __half* input, __half* output, uint32_t rows, uint32_t width, int mode) {
     activation(input,output,rows,width,mode);
 }
 
-// Rows [z,y,x,channels*8] -> rows [2z,2y,2x,channels], child order z,y,x.
 extern "C" __global__ void pixel_shuffle_3d_f16(
     const __half* x, __half* y, uint32_t side, uint32_t channels) {
     if (!vision_flat_launch() || !x || !y || !side || !channels) { __trap(); return; }
@@ -1093,6 +1192,7 @@ extern "C" __global__ void pixel_shuffle_3d_f16(
         y[i] = x[(parent * channels + c) * 8 + child];
     }
 }
+
 extern "C" __global__ void activation_f32(
     const float* input, float* output, uint32_t rows, uint32_t width, int mode) {
     activation(input,output,rows,width,mode);

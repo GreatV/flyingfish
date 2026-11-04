@@ -34,5 +34,3 @@ pub mod vision_input;
 pub mod work_layout;
 
 pub mod sparse;
-
-pub mod pixal3d;

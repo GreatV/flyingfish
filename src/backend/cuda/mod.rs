@@ -45,8 +45,8 @@ pub mod profile;
 pub mod quantize;
 pub mod sample;
 pub mod selection;
-#[cfg(feature = "cuda")]
-pub mod sparse;
+#[cfg(all(feature = "cuda", test))]
+mod sparse;
 pub mod state;
 pub(crate) mod tree;
 pub mod verification;
