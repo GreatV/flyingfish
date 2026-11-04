@@ -3689,6 +3689,74 @@ fn large_media_components(
 }
 
 #[cfg(feature = "cuda")]
+fn copy_media_defect_trace(
+    defect: &mut crate::trace::Trace,
+    trace: &crate::trace::Trace,
+    mut names: Vec<String>,
+    layers: usize,
+    _scoped: bool,
+) -> Result<()> {
+    names.extend(
+        [
+            ".embed",
+            ".norm",
+            ".debug.norm1",
+            ".debug.norm2",
+            ".debug.qkv_projected",
+            ".debug.qkv_prepared",
+            ".debug.mixer_out",
+            ".debug.o_proj",
+            ".debug.mlp_gate",
+            ".debug.mlp_up",
+            ".debug.mlp_product",
+        ]
+        .map(str::to_owned),
+    );
+    names.extend((0..layers).map(|layer| format!(".layer.{layer}")));
+    for key in names {
+        defect.add(
+            key.clone(),
+            trace.shape(&key)?.to_vec(),
+            trace.values(&key)?,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn scoped_media_defect_capture_preserves_scored_features_cpu() -> Result<()> {
+    let expected = [0.0f32, -0.0, 1.25, -7.0, 3.125, 0.00390625];
+    let mut trace = crate::trace::Trace::default();
+    trace.add("media_features".into(), vec![2, 3], expected.to_vec())?;
+    let mut defect = crate::trace::Trace::default();
+    copy_media_defect_trace(&mut defect, &trace, vec!["media_features".into()], 60, true)?;
+    ensure!(
+        defect.shape("media_features")? == [2, 3],
+        "scored feature layout changed"
+    );
+    let actual = defect.values("media_features")?;
+    ensure!(
+        actual.len() == expected.len()
+            && actual
+                .iter()
+                .zip(expected)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "scored feature bits changed"
+    );
+    let mut full = crate::trace::Trace::default();
+    ensure!(
+        copy_media_defect_trace(&mut full, &trace, vec!["media_features".into()], 60, false)
+            .is_err(),
+        "full capture accepted missing decoder fields"
+    );
+    println!(
+        "PASS scoped_media_defect_capture features_bits=0 full_capture_requires_decoder_fields=true GPU_calls=0"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
 fn large_media_model_definition(
     dir: &std::path::Path,
     fixtures: &std::path::Path,
@@ -3847,7 +3915,7 @@ fn large_media_model_definition(
             );
             let mut defect = crate::trace::Trace::default();
             defect.set_device(&engine.device_info().name)?;
-            let mut names: Vec<String> = oracle
+            let names: Vec<String> = oracle
                 .keys()
                 .filter(|key| key.as_str() != "logits")
                 .map(|key| {
@@ -3858,30 +3926,7 @@ fn large_media_model_definition(
                     }
                 })
                 .collect();
-            names.extend(
-                [
-                    ".embed",
-                    ".norm",
-                    ".debug.norm1",
-                    ".debug.norm2",
-                    ".debug.qkv_projected",
-                    ".debug.qkv_prepared",
-                    ".debug.mixer_out",
-                    ".debug.o_proj",
-                    ".debug.mlp_gate",
-                    ".debug.mlp_up",
-                    ".debug.mlp_product",
-                ]
-                .map(str::to_owned),
-            );
-            names.extend((0..spec.layers.len()).map(|layer| format!(".layer.{layer}")));
-            for key in names {
-                defect.add(
-                    key.clone(),
-                    trace.shape(&key)?.to_vec(),
-                    trace.values(&key)?,
-                )?;
-            }
+            copy_media_defect_trace(&mut defect, &trace, names, spec.layers.len(), scoped)?;
             for (layer, label) in [(0, "sliding"), (global, "global")] {
                 let geometry = spec.layers[layer]
                     .geometry
