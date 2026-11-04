@@ -1,5 +1,7 @@
 //! MiniMax-H3 FL2VA transformer execution.
-use crate::backend::cuda::weights::{DequantCopy, QuantKernels};
+use crate::backend::cuda::weights::{
+    DequantCopy, QuantKernels, dequantizes, device_slot_bytes, quant_source_finite,
+};
 use crate::backend::cuda::{
     Device,
     blas::Blas,
@@ -115,6 +117,7 @@ impl EntryReader {
         entry: &TensorEntry,
     ) -> Result<CudaSlice<u8>> {
         let bytes = self.read(name, entry)?;
+        quant_source_finite(name, entry, bytes)?;
         let mut buffer = stream.alloc_zeros::<u8>(entry.bytes)?;
         let (pointer, record) = buffer.device_ptr_mut(stream);
         unsafe {
@@ -1536,34 +1539,38 @@ impl Dit {
 
         let mut layers = vec![0usize; spec.layers];
         let mut source_layers = vec![0usize; spec.layers];
+        let mut dequant_layer = vec![false; spec.layers];
         let mut largest = 0usize;
         for (name, entry) in &base.manifest.entries {
             if let Some(layer) = entry.layer
                 && entry.load
                 && entry.shape.len() == 2
             {
-                // A quantized entry's device slot holds its BF16 tile (`shape[0] * shape[1] * 2`); its stored
-                // source bytes stay in the host/disk tier. A quantized entry with no dequant path is an error,
-                // never an under-allocated slot.
-                let device_bytes = match entry.quant {
-                    Some(quant) => {
-                        ensure!(
-                            matches!(
-                                quant,
-                                GgmlType::Q4_0 | GgmlType::F16 | GgmlType::F32 | GgmlType::Bf16
-                            ),
-                            "{name}: quantized entry type {quant:?} has no dequant path"
-                        );
-                        ensure!(entry.shape.len() == 2, "{name}: quantized entry is not 2-D");
-                        2 * entry.shape[0] * entry.shape[1]
-                    }
-                    None => entry.bytes,
-                };
+                // A dequantized entry's device slot holds its BF16 tile; a pass-through entry's holds its
+                // stored bytes. A stored type with no device path is an error, never an under-allocated slot.
+                let device_bytes = device_slot_bytes(name, entry)?;
                 layers[layer as usize] += device_bytes;
                 source_layers[layer as usize] += entry.bytes;
                 largest = largest.max(device_bytes);
+                if dequantizes(entry.quant) {
+                    dequant_layer[layer as usize] = true;
+                }
             }
         }
+        let staging = dequant_layer
+            .iter()
+            .zip(&source_layers)
+            .filter_map(|(dequant, source)| dequant.then_some(*source))
+            .max()
+            .unwrap_or(0);
+        let transient = base
+            .manifest
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.load && dequantizes(entry.quant))
+            .map(|(_, entry)| entry.bytes)
+            .max()
+            .unwrap_or(0);
         let owned = lora
             .manifest
             .entries
@@ -1571,7 +1578,9 @@ impl Dit {
             .filter(|(name, _)| name.starts_with("transformer_blocks."))
             .map(|(_, entry)| entry.bytes)
             .sum::<usize>()
-            + spec.layers * 2 * (2 * h + 2 * spec.head_dim);
+            + spec.layers * 2 * (2 * h + 2 * spec.head_dim)
+            + staging
+            + transient;
         let dense = place_layers(
             d,
             &mut base,

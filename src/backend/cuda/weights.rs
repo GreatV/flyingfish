@@ -1556,16 +1556,69 @@ impl QuantKernels {
     }
 }
 
-/// Device slot bytes of a streamed linear: the BF16 tile for a quantized entry, the stored bytes otherwise.
+/// Whether a stored GGUF type dequantizes into its device slot; the other accepted types pass through.
 #[cfg(feature = "cuda")]
-fn dense_device_bytes(name: &str, entry: &TensorEntry) -> Result<usize> {
+pub(crate) fn dequantizes(quant: Option<GgmlType>) -> bool {
+    matches!(quant, Some(GgmlType::Q4_0 | GgmlType::F16))
+}
+
+/// Device slot bytes of a streamed linear: the BF16 tile for a dequantized entry, the stored bytes otherwise.
+#[cfg(feature = "cuda")]
+pub(crate) fn device_slot_bytes(name: &str, entry: &TensorEntry) -> Result<usize> {
     match entry.quant {
-        Some(_) => {
+        Some(quant) if dequantizes(Some(quant)) => {
             ensure!(entry.shape.len() == 2, "{name}: quantized entry is not 2-D");
             Ok(2 * entry.shape[0] * entry.shape[1])
         }
+        Some(GgmlType::F32 | GgmlType::Bf16) => Ok(entry.bytes),
+        Some(other) => bail!("{name}: quantized entry type {other:?} has no device path"),
         None => Ok(entry.bytes),
     }
+}
+
+/// Finiteness of a quantized entry's stored source: every F16 value for F16, each 18-byte Q4_0 block's scale.
+#[cfg(feature = "cuda")]
+pub(crate) fn quant_source_finite(name: &str, entry: &TensorEntry, bytes: &[u8]) -> Result<()> {
+    match entry.quant {
+        Some(GgmlType::F16) => {
+            let (words, rest) = bytes.as_chunks::<2>();
+            ensure!(
+                rest.is_empty(),
+                "{name}: F16 source is not a whole number of values"
+            );
+            ensure!(
+                words
+                    .iter()
+                    .all(|v| half::f16::from_bits(u16::from_le_bytes(*v)).is_finite()),
+                "{name}: nonfinite F16 value"
+            );
+        }
+        Some(GgmlType::Q4_0) => {
+            let (blocks, rest) = bytes.as_chunks::<18>();
+            ensure!(
+                rest.is_empty(),
+                "{name}: Q4_0 source is not a whole number of blocks"
+            );
+            ensure!(
+                blocks
+                    .iter()
+                    .all(|b| half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).is_finite()),
+                "{name}: nonfinite Q4_0 scale"
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Finiteness of a streamed layer's quantized source, over every entry's stored bytes.
+#[cfg(feature = "cuda")]
+fn check_layer_source(layer: &DenseLayer, source: &[u8]) -> Result<()> {
+    for entry in &layer.entries {
+        let bytes = &source[entry.source_offset..entry.source_offset + entry.entry.bytes];
+        quant_source_finite(&entry.name, &entry.entry, bytes)?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "cuda")]
@@ -1585,6 +1638,7 @@ struct DenseLayer {
     source_bytes: usize,
     entries: Vec<DenseEntry>,
     host: Option<PinnedHostSlice<u8>>,
+    checked: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -1641,10 +1695,10 @@ impl DenseStreaming {
                 source_bytes: 0,
                 entries: Vec::new(),
                 host: None,
+                checked: false,
             })
             .collect();
         let mut ranges = vec![Vec::new(); layers.len()];
-        let mut staging_bytes = 0usize;
         for (name, entry) in manifest
             .entries
             .iter()
@@ -1657,7 +1711,7 @@ impl DenseStreaming {
             }
             let device_offset = layer.bytes;
             let source_offset = layer.source_bytes;
-            let device_bytes = dense_device_bytes(name, entry)?;
+            let device_bytes = device_slot_bytes(name, entry)?;
             layer.bytes = layer
                 .bytes
                 .checked_add(device_bytes)
@@ -1666,9 +1720,6 @@ impl DenseStreaming {
                 .source_bytes
                 .checked_add(entry.bytes)
                 .context("dense layer source bytes overflow")?;
-            if entry.quant.is_some() {
-                staging_bytes = staging_bytes.max(layer.source_bytes);
-            }
             layer.entries.push(DenseEntry {
                 name: name.clone(),
                 device_offset,
@@ -1690,6 +1741,17 @@ impl DenseStreaming {
                 ));
             }
         }
+        let staging_bytes = layers
+            .iter()
+            .filter(|layer| {
+                layer
+                    .entries
+                    .iter()
+                    .any(|entry| dequantizes(entry.entry.quant))
+            })
+            .map(|layer| layer.source_bytes)
+            .max()
+            .unwrap_or(0);
         let first_disk = (0..layers.len()).find(|&i| layers[i].slot.is_some() && !plan.host[i]);
         let mut next = None;
         let mut next_disk = first_disk;
@@ -1904,10 +1966,11 @@ impl DenseStreaming {
             self.upload.wait(&self.slots[slot_index].retired)?;
         }
         let source_bytes = self.layers[index].source_bytes;
+        let check_source = !self.layers[index].checked;
         let quantized = self.layers[index]
             .entries
             .iter()
-            .any(|entry| entry.entry.quant.is_some());
+            .any(|entry| dequantizes(entry.entry.quant));
         let pointer = self.slots[slot_index].device.device_ptr(&self.upload).0;
         let staging = quantized
             .then(|| {
@@ -1920,6 +1983,9 @@ impl DenseStreaming {
         let source_pointer = staging.unwrap_or(pointer);
         if let Some(host) = &self.layers[index].host {
             let source = &host.as_slice()?[..source_bytes];
+            if check_source {
+                check_layer_source(&self.layers[index], source)?;
+            }
             unsafe {
                 cudarc::driver::result::memcpy_htod_async(
                     source_pointer,
@@ -1945,6 +2011,9 @@ impl DenseStreaming {
             // SAFETY: the ring slot holds at least `source_bytes` initialized bytes for the lease's lifetime.
             let raw =
                 unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, source_bytes) };
+            if check_source {
+                check_layer_source(&self.layers[index], raw)?;
+            }
             unsafe {
                 cudarc::driver::result::memcpy_htod_async(
                     source_pointer,
@@ -1976,24 +2045,39 @@ impl DenseStreaming {
                 reader.copied[ring as usize] = Some(copied);
             }
         }
+        if check_source {
+            self.layers[index].checked = true;
+        }
         if quantized {
             let quant = self
                 .quant
                 .as_ref()
                 .context("quantized layer without dequant kernels")?;
             for entry in &self.layers[index].entries {
-                let elements = entry.entry.shape[0] * entry.entry.shape[1];
-                quant.dequant(
-                    &self.upload,
-                    &entry.name,
-                    &entry.entry,
-                    DequantCopy {
-                        source: source_pointer + entry.source_offset as u64,
-                        destination: pointer + entry.device_offset as u64,
-                        elements,
-                        dtype: entry.entry.dtype,
-                    },
-                )?;
+                let destination = pointer + entry.device_offset as u64;
+                if dequantizes(entry.entry.quant) {
+                    let elements = entry.entry.shape[0] * entry.entry.shape[1];
+                    quant.dequant(
+                        &self.upload,
+                        &entry.name,
+                        &entry.entry,
+                        DequantCopy {
+                            source: source_pointer + entry.source_offset as u64,
+                            destination,
+                            elements,
+                            dtype: entry.entry.dtype,
+                        },
+                    )?;
+                } else {
+                    unsafe {
+                        cudarc::driver::result::memcpy_dtod_async(
+                            destination,
+                            source_pointer + entry.source_offset as u64,
+                            entry.entry.bytes,
+                            self.upload.cu_stream(),
+                        )?;
+                    }
+                }
             }
         }
         self.slots[slot_index].ready.record(&self.upload)?;
@@ -3375,6 +3459,68 @@ mod tests {
         let mut values = vec![bf16::ZERO; bits.len()];
         decode_bf16(&bytes, &mut values);
         assert_eq!(values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), bits);
+    }
+
+    #[test]
+    fn quantized_device_slot_and_source_finite_checks() {
+        let entry = |shape: Vec<usize>, bytes: usize, quant: Option<GgmlType>| TensorEntry {
+            dtype: Dtype::BF16,
+            bytes,
+            shape,
+            shard: "model.gguf".into(),
+            load: true,
+            data_start: 0,
+            data_offsets: [0, 0],
+            scope: crate::checkpoint::TensorScope::Text,
+            layer: Some(0),
+            role: "mlp.gate_proj.weight".into(),
+            scale_name: None,
+            quant,
+            swap_halves: false,
+        };
+        let shape = vec![64usize, 32];
+        let elements = 64 * 32;
+        for quant in [Some(GgmlType::Q4_0), Some(GgmlType::F16)] {
+            let slot =
+                device_slot_bytes("t", &entry(shape.clone(), 18 * elements / 32, quant)).unwrap();
+            assert_eq!(slot, 2 * elements, "{quant:?} slot");
+        }
+        for quant in [None, Some(GgmlType::F32), Some(GgmlType::Bf16)] {
+            let slot = device_slot_bytes("t", &entry(shape.clone(), 4 * elements, quant)).unwrap();
+            assert_eq!(slot, 4 * elements, "{quant:?} slot");
+        }
+        for quant in [
+            Some(GgmlType::Q8_0),
+            Some(GgmlType::Q4K),
+            Some(GgmlType::Other(9)),
+        ] {
+            assert!(
+                device_slot_bytes("t", &entry(shape.clone(), 18 * elements / 32, quant)).is_err(),
+                "{quant:?} has no device path"
+            );
+        }
+        let nan = 0x7e00u16.to_le_bytes();
+        let mut f16 = vec![0u8; 8];
+        f16[2..4].copy_from_slice(&nan);
+        assert!(
+            quant_source_finite("t", &entry(vec![], 8, Some(GgmlType::F16)), &f16).is_err(),
+            "NaN F16 value accepted"
+        );
+        let mut q4 = vec![0u8; 18 * 2];
+        q4[18..20].copy_from_slice(&nan);
+        assert!(
+            quant_source_finite("t", &entry(vec![], 18 * 2, Some(GgmlType::Q4_0)), &q4).is_err(),
+            "NaN Q4_0 scale accepted"
+        );
+        q4[18..20].copy_from_slice(&0x3c00u16.to_le_bytes());
+        assert!(
+            quant_source_finite("t", &entry(vec![], 18 * 2, Some(GgmlType::Q4_0)), &q4).is_ok(),
+            "finite Q4_0 scale rejected"
+        );
+        assert!(
+            quant_source_finite("t", &entry(vec![], 8, None), &f16).is_ok(),
+            "unquantized source checked"
+        );
     }
 
     #[test]
