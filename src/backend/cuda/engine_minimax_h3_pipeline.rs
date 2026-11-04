@@ -326,14 +326,13 @@ pub(crate) fn run(
     video_rows.extend(patchify(&video_noise, (lc, latent_frames, lh, lw), patch));
 
     let transformer = model.join("transformer");
-    let gguf_file = match gguf {
-        Some(path) => Some(crate::gguf::GgufFile::open(path)?),
-        None => None,
-    };
-    let checkpoint = MappedCheckpoint::open_component(&transformer, "diffusion_pytorch_model")?;
-    let manifest = match &gguf_file {
-        Some(gguf) => checkpoint.minimax_h3_gguf_manifest(&spec, gguf)?,
-        None => checkpoint.minimax_h3_manifest(&spec)?,
+    let manifest = match gguf {
+        Some(path) => {
+            let gguf = crate::gguf::GgufFile::open(path)?;
+            MappedCheckpoint::minimax_h3_gguf_manifest(&spec, &gguf)?
+        }
+        None => MappedCheckpoint::open_component(&transformer, "diffusion_pytorch_model")?
+            .minimax_h3_manifest(&spec)?,
     };
     let source_dir = match gguf {
         Some(path) => path.parent().context("GGUF directory")?.to_path_buf(),

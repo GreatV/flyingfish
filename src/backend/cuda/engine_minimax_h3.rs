@@ -3135,11 +3135,7 @@ mod tests {
         let lora_path = var("FF_H3_LORA")?;
         let spec = H3Spec::read(&model)?;
         let gguf = crate::gguf::GgufFile::open(&gguf_path)?;
-        let manifest = MappedCheckpoint::open_component(
-            &model.join("transformer"),
-            "diffusion_pytorch_model",
-        )?
-        .minimax_h3_gguf_manifest(&spec, &gguf)?;
+        let manifest = MappedCheckpoint::minimax_h3_gguf_manifest(&spec, &gguf)?;
         let transformer = model.join("transformer");
         let official = MappedCheckpoint::open_component(&transformer, "diffusion_pytorch_model")?
             .minimax_h3_manifest(&spec)?;
@@ -3387,11 +3383,7 @@ mod tests {
         let lora_path = var("FF_H3_LORA")?;
         let spec = H3Spec::read(&model)?;
         let gguf = crate::gguf::GgufFile::open(&gguf_path)?;
-        let manifest = MappedCheckpoint::open_component(
-            &model.join("transformer"),
-            "diffusion_pytorch_model",
-        )?
-        .minimax_h3_gguf_manifest(&spec, &gguf)?;
+        let manifest = MappedCheckpoint::minimax_h3_gguf_manifest(&spec, &gguf)?;
         let lora_dir = lora_path.parent().context("LoRA directory")?.to_owned();
         let stem = lora_path
             .file_name()
@@ -3511,11 +3503,7 @@ mod tests {
         let out = var("FF_H3_GGUF_ADALN_OUT")?;
         let spec = H3Spec::read(&model)?;
         let gguf = crate::gguf::GgufFile::open(&gguf_path)?;
-        let checkpoint = MappedCheckpoint::open_component(
-            &model.join("transformer"),
-            "diffusion_pytorch_model",
-        )?;
-        let manifest = checkpoint.minimax_h3_gguf_manifest(&spec, &gguf)?;
+        let manifest = MappedCheckpoint::minimax_h3_gguf_manifest(&spec, &gguf)?;
 
         let adaln_map = mapped(&out.join("adaln.safetensors"))?;
         let adaln = SafeTensors::deserialize(&adaln_map)?;

@@ -2602,7 +2602,6 @@ impl MappedCheckpoint {
     /// official entry. `rope.inv_freq` has no official counterpart and is ignored; any other unknown tensor is an
     /// error, as is any expected tensor the GGUF does not produce.
     pub fn minimax_h3_gguf_manifest(
-        &self,
         spec: &crate::minimax_h3::H3Spec,
         gguf: &crate::gguf::GgufFile,
     ) -> Result<TensorManifest> {
@@ -2703,6 +2702,27 @@ impl MappedCheckpoint {
                     tensor.name,
                     map.official
                 );
+                ensure!(
+                    !map.swap_halves || tensor.ggml_type == crate::gguf::GgmlType::Q4_0,
+                    "GGUF tensor {} stores the fused fc1 as {:?}, which has no half-swap path",
+                    tensor.name,
+                    tensor.ggml_type
+                );
+                let pass_through = match tensor.ggml_type {
+                    crate::gguf::GgmlType::F32 => Some(Dtype::F32),
+                    crate::gguf::GgmlType::Bf16 => Some(Dtype::BF16),
+                    _ => None,
+                };
+                if let Some(stored) = pass_through {
+                    ensure!(
+                        stored == *dtype,
+                        "GGUF tensor {} stores {:?} bytes for the {:?} tensor {}",
+                        tensor.name,
+                        tensor.ggml_type,
+                        dtype,
+                        map.official
+                    );
+                }
                 let (layer, role) = split_layer_role(&map.official)?;
                 let load = LoadPolicy::TextOnly.selects_tensor(*scope, &map.official);
                 let nbytes = usize::try_from(nbytes)?;
@@ -5904,10 +5924,10 @@ mod gguf_tests {
         push("audio_patch_proj.bias".into(), GgmlType::F32, vec![hidden]);
         push(
             "condition_proj.weight".into(),
-            GgmlType::F32,
+            GgmlType::Bf16,
             vec![text, hidden],
         );
-        push("condition_proj.bias".into(), GgmlType::F32, vec![hidden]);
+        push("condition_proj.bias".into(), GgmlType::Bf16, vec![hidden]);
         push(
             "time_embedder.proj_in.weight".into(),
             GgmlType::F32,
@@ -6036,25 +6056,13 @@ mod gguf_tests {
         out
     }
 
-    fn checkpoint() -> MappedCheckpoint {
-        MappedCheckpoint {
-            index: Index {
-                weight_map: BTreeMap::new(),
-            },
-            maps: BTreeMap::new(),
-            zip_tensors: None,
-            #[cfg(any(feature = "cuda", feature = "rocm"))]
-            files: BTreeMap::new(),
-        }
-    }
-
     #[test]
     fn minimax_h3_gguf_manifest_maps_names_shapes_and_quants() -> Result<()> {
         let spec = spec();
         let file = temp_gguf(&synthetic_tensors(&spec))?;
         let gguf = crate::gguf::GgufFile::open(&file.0)?;
         let expected = minimax_h3_expected(&spec)?;
-        let manifest = checkpoint().minimax_h3_gguf_manifest(&spec, &gguf)?;
+        let manifest = MappedCheckpoint::minimax_h3_gguf_manifest(&spec, &gguf)?;
         ensure!(
             manifest.entries.len() == expected.len(),
             "manifest has {} entries, expected {}",
@@ -6131,8 +6139,46 @@ mod gguf_tests {
         let file = temp_gguf(&tensors)?;
         let gguf = crate::gguf::GgufFile::open(&file.0)?;
         ensure!(
-            checkpoint().minimax_h3_gguf_manifest(&spec, &gguf).is_err(),
+            MappedCheckpoint::minimax_h3_gguf_manifest(&spec, &gguf).is_err(),
             "unknown GGUF tensor was accepted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn minimax_h3_gguf_manifest_rejects_a_half_swapped_non_q4_fc1() -> Result<()> {
+        let spec = spec();
+        let mut tensors = synthetic_tensors(&spec);
+        for tensor in &mut tensors {
+            if tensor.name == "blocks.0.mlp.fc1.weight" {
+                tensor.ggml_type = GgmlType::F16;
+                tensor.bytes = tensor_bytes(GgmlType::F16, &tensor.dims);
+            }
+        }
+        let file = temp_gguf(&tensors)?;
+        let gguf = crate::gguf::GgufFile::open(&file.0)?;
+        ensure!(
+            MappedCheckpoint::minimax_h3_gguf_manifest(&spec, &gguf).is_err(),
+            "an F16 fused fc1 with swap_halves was accepted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn minimax_h3_gguf_manifest_rejects_a_pass_through_dtype_mismatch() -> Result<()> {
+        let spec = spec();
+        let mut tensors = synthetic_tensors(&spec);
+        for tensor in &mut tensors {
+            if tensor.name == "blocks.0.attn.out_proj.weight" {
+                tensor.ggml_type = GgmlType::F32;
+                tensor.bytes = tensor_bytes(GgmlType::F32, &tensor.dims);
+            }
+        }
+        let file = temp_gguf(&tensors)?;
+        let gguf = crate::gguf::GgufFile::open(&file.0)?;
+        ensure!(
+            MappedCheckpoint::minimax_h3_gguf_manifest(&spec, &gguf).is_err(),
+            "an F32 source for the BF16 attn.out_proj was accepted"
         );
         Ok(())
     }
@@ -6144,7 +6190,7 @@ mod gguf_tests {
         let gguf_path = std::env::var("FF_H3_GGUF").context("FF_H3_GGUF missing")?;
         let spec = crate::minimax_h3::H3Spec::read(std::path::Path::new(&model))?;
         let gguf = crate::gguf::GgufFile::open(std::path::Path::new(&gguf_path))?;
-        let manifest = checkpoint().minimax_h3_gguf_manifest(&spec, &gguf)?;
+        let manifest = MappedCheckpoint::minimax_h3_gguf_manifest(&spec, &gguf)?;
         ensure!(
             manifest.entries.len() == 638,
             "manifest has {} entries, expected 638",
