@@ -1,41 +1,45 @@
-//! Pixal3D flow execution on recorded conditioning and fixed coordinates.
-#[cfg(test)]
-#[path = "pixal3d_tests.rs"]
-mod tests;
+//! Dense structure and sparse shape-prefix decoding on published layouts.
 use super::{
     Device,
     blas::Blas,
     closure::Closure,
     contracts::{Tensor, TensorMut, view},
     cubin,
-    flash::{F32Attention, Flash, Shape},
-    linear::LinearBiasMode,
     ops::{Ops, flat, grid},
+    sparse::SparseConv,
 };
 use crate::{
     backend::gpu::{CudaFunction, CudaSlice, DevicePtr, DeviceRepr, PushKernelArg},
-    pixal3d::{FlowCheckpoint, FlowSpec},
+    pixal3d::{DecoderCheckpoint, DecoderKind},
+    sparse::SparseSites,
 };
 use anyhow::{Context, Result, ensure};
-use half::bf16;
-use std::{collections::BTreeMap, mem::size_of, path::Path, rc::Rc};
+use half::f16;
+use safetensors::Dtype;
+use std::{collections::BTreeMap, path::Path, rc::Rc};
 
 fn ptr<T: DeviceRepr>(x: &CudaSlice<T>, d: &Device) -> u64 {
     x.device_ptr(&d.stream).0
 }
-fn dense<T: DeviceRepr + Copy, const R: usize>(
+fn matrix<T: DeviceRepr + Copy>(
     x: &CudaSlice<T>,
     d: &Device,
-    shape: [u32; R],
-) -> Result<Tensor<T, R>> {
-    let (stride, _) = super::contracts::dense_layout(shape)?;
-    view(x, &d.stream, 0, shape, stride)
+    rows: usize,
+    width: usize,
+) -> Result<Tensor<T, 2>> {
+    view(
+        x,
+        &d.stream,
+        0,
+        [u32::try_from(rows)?, u32::try_from(width)?],
+        [width as u64, 1],
+    )
 }
-fn matrix<T: Copy>(address: u64, rows: usize, width: usize) -> Result<Tensor<T, 2>> {
+fn raw_matrix<T: Copy>(address: u64, rows: usize, width: usize) -> Result<Tensor<T, 2>> {
     let bytes = rows
         .checked_mul(width)
         .and_then(|n| n.checked_mul(size_of::<T>()))
-        .context("flow matrix size overflow")?;
+        .context("decoder matrix overflow")?;
     unsafe {
         Tensor::new(
             address,
@@ -45,136 +49,126 @@ fn matrix<T: Copy>(address: u64, rows: usize, width: usize) -> Result<Tensor<T, 
         )
     }
 }
-
-#[derive(Clone, Copy)]
-struct Linear<T> {
-    weight: Tensor<T, 2>,
-    bias: Tensor<T, 1>,
+struct Weights {
+    half: BTreeMap<String, CudaSlice<f16>>,
+    float: BTreeMap<String, CudaSlice<f32>>,
 }
-impl<T: DeviceRepr + Copy> Linear<T> {
-    fn bind(
-        weights: &BTreeMap<String, CudaSlice<T>>,
-        d: &Device,
-        name: &str,
-        shape: [usize; 2],
-    ) -> Result<Self> {
-        let weight = weights
-            .get(&format!("{name}.weight"))
-            .with_context(|| format!("linear weight missing: {name}"))?;
-        let bias = weights
-            .get(&format!("{name}.bias"))
-            .with_context(|| format!("linear bias missing: {name}"))?;
-        Ok(Self {
-            weight: dense(weight, d, [shape[0] as u32, shape[1] as u32])?,
-            bias: dense(bias, d, [shape[0] as u32])?,
-        })
+impl Weights {
+    fn load(d: &Device, checkpoint: &DecoderCheckpoint) -> Result<Self> {
+        let mut half = BTreeMap::new();
+        let mut float = BTreeMap::new();
+        for (name, (_, _, f32_runtime)) in checkpoint.kind.inventory() {
+            let t = checkpoint.mapped.tensor(&name)?;
+            if f32_runtime {
+                let values: Vec<f32> = if t.dtype() == Dtype::F32 {
+                    t.data()
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|b| f32::from_le_bytes(*b))
+                        .collect()
+                } else {
+                    t.data()
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|b| f16::from_le_bytes(*b).to_f32())
+                        .collect()
+                };
+                ensure!(
+                    values.iter().all(|x| x.is_finite()),
+                    "nonfinite decoder weight {name}"
+                );
+                float.insert(name, d.stream.clone_htod(&values)?);
+            } else {
+                let values: Vec<f16> = t
+                    .data()
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| f16::from_le_bytes(*b))
+                    .collect();
+                ensure!(
+                    values.iter().all(|x| x.is_finite()),
+                    "nonfinite decoder weight {name}"
+                );
+                half.insert(name, d.stream.clone_htod(&values)?);
+            }
+        }
+        Ok(Self { half, float })
     }
-}
-impl Linear<bf16> {
-    fn prepare(self, blas: &mut Blas, rows: usize) -> Result<()> {
-        blas.prepare_biased(
-            rows as u32,
-            self.weight.shape[0],
-            self.weight.shape[1],
-            self.bias,
-            LinearBiasMode::BeforeOutputRound,
-        )
+    fn affine(&self, d: &Device, name: Option<&str>) -> Result<[u64; 2]> {
+        match name {
+            Some(name) => Ok([
+                ptr(
+                    self.float
+                        .get(&format!("{name}.weight"))
+                        .context("norm weight missing")?,
+                    d,
+                ),
+                ptr(
+                    self.float
+                        .get(&format!("{name}.bias"))
+                        .context("norm bias missing")?,
+                    d,
+                ),
+            ]),
+            None => Ok([0, 0]),
+        }
     }
-    fn run(self, blas: &Blas, rows: usize, input: u64, output: u64) -> Result<()> {
-        blas.linear_biased(
-            self.weight,
-            self.bias,
-            matrix(input, rows, self.weight.shape[1] as usize)?,
-            &mut TensorMut(matrix(output, rows, self.weight.shape[0] as usize)?),
-            LinearBiasMode::BeforeOutputRound,
-        )
-    }
-}
-
-struct Block {
-    qkv: Linear<bf16>,
-    self_out: Linear<bf16>,
-    cross_q: Linear<bf16>,
-    cross_kv: Linear<bf16>,
-    cross_out: Linear<bf16>,
-    projection: Linear<bf16>,
-    fc1: Linear<bf16>,
-    fc2: Linear<bf16>,
-    norm_weight: u64,
-    norm_bias: u64,
-    modulation: u64,
-    gamma: [u64; 4],
 }
 struct Kernels {
-    heads: usize,
-    head_dim: usize,
-    norm: CudaFunction,
-    norm_f32: CudaFunction,
-    l2: CudaFunction,
-    unpack: CudaFunction,
-    rope: CudaFunction,
-    rope_hm: CudaFunction,
-    phases: CudaFunction,
-    modulate: CudaFunction,
-    gated: CudaFunction,
-    add_mod: CudaFunction,
-    residual: CudaFunction,
+    ln16: CudaFunction,
+    ln32: CudaFunction,
+    act16: CudaFunction,
+    act32: CudaFunction,
     cast: CudaFunction,
     upcast: CudaFunction,
-    bias: CudaFunction,
-    silu: CudaFunction,
-    sinusoid: CudaFunction,
-    gelu: CudaFunction,
-    transpose: CudaFunction,
+    bias16: CudaFunction,
+    bias32: CudaFunction,
+    residual: CudaFunction,
+    shuffle: CudaFunction,
+    c2s: CudaFunction,
+    conv16: CudaFunction,
+    conv32: CudaFunction,
 }
 impl Kernels {
-    fn load(d: &Device, spec: &FlowSpec) -> Result<Self> {
+    fn load(d: &Device) -> Result<Self> {
         let q = cubin::module(&d.ctx, "q38_common")?;
-        let n = cubin::module(&d.ctx, "norm")?;
-        let r = cubin::module(&d.ctx, "rope")?;
-        let m = cubin::module(&d.ctx, "modulate")?;
         let v = cubin::module(&d.ctx, "vision_ops")?;
         Ok(Self {
-            heads: spec.num_heads,
-            head_dim: spec.model_channels / spec.num_heads,
-            norm: q.load_function("q38_layer_norm_bf16_affine_f32")?,
-            norm_f32: q.load_function("q38_layer_norm_f32")?,
-            l2: n.load_function("l2_norm_scale_bf16")?,
-            unpack: v.load_function("qkv_unpack_hm_bf16")?,
-            rope: r.load_function("rope_pair_tail_rn")?,
-            rope_hm: r.load_function("rope_pair_tail_hm")?,
-            phases: r.load_function("rope_pair_rows_3d_direct")?,
-            modulate: m.load_function("row_modulate")?,
-            gated: m.load_function("row_gated_add")?,
-            add_mod: m.load_function("add_row_bf16_f32")?,
-            residual: n.load_function("residual")?,
-            cast: v.load_function("vision_affine_cast_bf16")?,
-            upcast: v.load_function("vision_upcast_f32")?,
-            bias: v.load_function("vision_bias_f32")?,
-            silu: v.load_function("vision_add_row_silu_f32")?,
-            sinusoid: v.load_function("sinusoidal_embed_f32")?,
-            gelu: q.load_function("q38_gelu")?,
-            transpose: q.load_function("transpose_f32")?,
+            ln16: q.load_function("q38_layer_norm_f16")?,
+            ln32: q.load_function("q38_layer_norm_f32")?,
+            act16: v.load_function("activation_f16")?,
+            act32: v.load_function("activation_f32")?,
+            cast: v.load_function("vision_downcast_f32_to_f16")?,
+            upcast: v.load_function("vision_upcast_f16_to_f32")?,
+            bias16: q.load_function("q38_bias_add_f16")?,
+            bias32: v.load_function("vision_bias_f32")?,
+            residual: q.load_function("channel_scale_residual_f16")?,
+            shuffle: v.load_function("pixel_shuffle_3d_f16")?,
+            c2s: v.load_function("channel_to_spatial_f16")?,
+            conv16: v.load_function("conv3d_im2col_f16")?,
+            conv32: v.load_function("conv3d_im2col_f32")?,
         })
     }
     fn norm(
         &self,
         d: &Device,
-        input: u64,
-        output: u64,
+        io: [u64; 2],
         shape: [usize; 2],
         affine: [u64; 2],
-        arithmetic: (f32, bool),
+        f32_io: bool,
+        eps: f32,
     ) -> Result<()> {
         let [rows, width] = shape;
-        let (eps, f32_io) = arithmetic;
         unsafe {
             d.stream
-                .launch_builder(if f32_io { &self.norm_f32 } else { &self.norm })
-                .arg(&input)
+                .launch_builder(if f32_io { &self.ln32 } else { &self.ln16 })
+                .arg(&io[0])
                 .arg(&affine[0])
                 .arg(&affine[1])
-                .arg(&output)
+                .arg(&io[1])
                 .arg(&(rows as u32))
                 .arg(&1u32)
                 .arg(&(width as u32))
@@ -189,1072 +183,718 @@ impl Kernels {
         }
         Ok(())
     }
-    fn cast(&self, d: &Device, input: u64, output: u64, count: usize) -> Result<()> {
+    fn act(&self, d: &Device, x: u64, rows: usize, width: usize, f32_io: bool) -> Result<()> {
         unsafe {
             d.stream
-                .launch_builder(&self.cast)
-                .arg(&input)
-                .arg(&output)
-                .arg(&(count as u64))
-                .arg(&0f32)
-                .arg(&1f32)
-                .launch(flat(count))?;
+                .launch_builder(if f32_io { &self.act32 } else { &self.act16 })
+                .arg(&x)
+                .arg(&x)
+                .arg(&(rows as u32))
+                .arg(&(width as u32))
+                .arg(&1i32)
+                .launch(flat(rows * width))?;
         }
         Ok(())
     }
-    fn upcast(&self, d: &Device, input: u64, output: u64, count: usize) -> Result<()> {
+    fn cast(&self, d: &Device, io: [u64; 2], count: usize, up: bool) -> Result<()> {
         unsafe {
             d.stream
-                .launch_builder(&self.upcast)
-                .arg(&input)
-                .arg(&output)
+                .launch_builder(if up { &self.upcast } else { &self.cast })
+                .arg(&io[0])
+                .arg(&io[1])
                 .arg(&u32::try_from(count)?)
                 .launch(flat(count))?;
         }
         Ok(())
     }
-    fn l2(
+    fn bias(
         &self,
         d: &Device,
-        input: u64,
-        output: u64,
-        gamma: u64,
-        rows: usize,
-        head_major: bool,
+        y: u64,
+        bias: u64,
+        shape: [usize; 2],
+        overwrite: bool,
+        f32_io: bool,
     ) -> Result<()> {
+        let [rows, width] = shape;
         unsafe {
-            d.stream
-                .launch_builder(&self.l2)
-                .arg(&input)
-                .arg(&gamma)
-                .arg(&output)
-                .arg(&(rows as i32))
-                .arg(&(self.heads as i32))
-                .arg(&(self.head_dim as i32))
-                .arg(&(self.head_dim as f32).sqrt())
-                .arg(&1e-12f32)
-                .arg(&(if head_major { rows as i32 } else { 0 }))
-                .launch(grid(rows * self.heads, 32))?;
+            if f32_io {
+                d.stream
+                    .launch_builder(&self.bias32)
+                    .arg(&y)
+                    .arg(&bias)
+                    .arg(&y)
+                    .arg(&(rows as u32))
+                    .arg(&(width as u32))
+                    .launch(flat(rows * width))?;
+            } else {
+                d.stream
+                    .launch_builder(&self.bias16)
+                    .arg(&y)
+                    .arg(&bias)
+                    .arg(&((rows * width) as u64))
+                    .arg(&(width as u32))
+                    .arg(&(overwrite as i32))
+                    .launch(flat(rows * width))?;
+            }
         }
         Ok(())
     }
-    fn unpack(
+    fn add(
         &self,
         d: &Device,
-        input: u64,
-        outputs: [u64; 3],
-        rows: usize,
-        parts: i32,
+        x: &CudaSlice<f16>,
+        y: &CudaSlice<f16>,
+        ones: &CudaSlice<f16>,
+        shape: [usize; 2],
     ) -> Result<()> {
-        unsafe {
-            d.stream
-                .launch_builder(&self.unpack)
-                .arg(&input)
-                .arg(&outputs[0])
-                .arg(&outputs[1])
-                .arg(&outputs[2])
-                .arg(&1u32)
-                .arg(&(rows as u32))
-                .arg(&(self.heads as u32))
-                .arg(&(self.head_dim as u32))
-                .arg(&parts)
-                .launch(flat(rows * self.heads * self.head_dim))?;
-        }
-        Ok(())
-    }
-    fn residual(&self, d: &Device, x: u64, y: u64, count: usize) -> Result<()> {
+        let [rows, width] = shape;
         unsafe {
             d.stream
                 .launch_builder(&self.residual)
-                .arg(&x)
-                .arg(&y)
-                .arg(&i32::try_from(count)?)
-                .launch(flat(count))?;
+                .arg(x)
+                .arg(y)
+                .arg(ones)
+                .arg(x)
+                .arg(&(rows as u32))
+                .arg(&(width as u32))
+                .launch(flat(rows * width))?;
         }
         Ok(())
     }
 }
 
-struct Work {
-    row_index: CudaSlice<u32>,
-    hidden: CudaSlice<bf16>,
-    norm: CudaSlice<bf16>,
-    projected: CudaSlice<bf16>,
-    qkv: CudaSlice<bf16>,
-    q: CudaSlice<bf16>,
-    k: CudaSlice<bf16>,
-    v: CudaSlice<bf16>,
-    kn: CudaSlice<bf16>,
-    attention: CudaSlice<bf16>,
-    ff: CudaSlice<bf16>,
-    cross_kv: CudaSlice<bf16>,
-    cross_k: CudaSlice<bf16>,
-    cross_kn: CudaSlice<bf16>,
-    cross_v: CudaSlice<bf16>,
-    cross_q32: CudaSlice<f32>,
-    cross_k32: CudaSlice<f32>,
-    cross_v32: CudaSlice<f32>,
-    cross_out32: CudaSlice<f32>,
-    outer: CudaSlice<f32>,
-    input_rows: CudaSlice<f32>,
-    output_rows: CudaSlice<f32>,
-    block_mod: CudaSlice<bf16>,
-}
-impl Work {
-    fn new(d: &Device, n: usize, spec: &FlowSpec) -> Result<Self> {
-        let s = &d.stream;
-        let h = spec.model_channels;
-        Ok(Self {
-            row_index: s.alloc_zeros(n)?,
-            hidden: s.alloc_zeros(n * h)?,
-            norm: s.alloc_zeros(n * h)?,
-            projected: s.alloc_zeros(n * h)?,
-            qkv: s.alloc_zeros(n * 3 * h)?,
-            q: s.alloc_zeros(n * h)?,
-            k: s.alloc_zeros(n * h)?,
-            v: s.alloc_zeros(n * h)?,
-            kn: s.alloc_zeros(n * h)?,
-            attention: s.alloc_zeros(n * h)?,
-            ff: s.alloc_zeros(n * spec.feed_forward_width())?,
-            cross_kv: s.alloc_zeros(10 * h)?,
-            cross_k: s.alloc_zeros(5 * h)?,
-            cross_kn: s.alloc_zeros(5 * h)?,
-            cross_v: s.alloc_zeros(5 * h)?,
-            cross_q32: s.alloc_zeros(n * h)?,
-            cross_k32: s.alloc_zeros(5 * h)?,
-            cross_v32: s.alloc_zeros(5 * h)?,
-            cross_out32: s.alloc_zeros(n * h)?,
-            outer: s.alloc_zeros(n * h)?,
-            input_rows: s.alloc_zeros(n * spec.in_channels)?,
-            output_rows: s.alloc_zeros(n * spec.in_channels)?,
-            block_mod: s.alloc_zeros(6 * h)?,
-        })
-    }
-}
-
-fn validate_conditioning_origin(origin: &Rc<()>, flow: &Rc<()>) -> Result<()> {
-    ensure!(
-        Rc::ptr_eq(origin, flow),
-        "conditioning originates from another flow"
-    );
-    Ok(())
-}
-
-pub struct Conditioning {
-    origin: Rc<()>,
-    global: CudaSlice<bf16>,
-    projected: CudaSlice<bf16>,
-}
-pub struct PixalFlow {
-    origin: Rc<()>,
+pub struct PixalDecoder {
     device: Device,
-    spec: FlowSpec,
-    rows: usize,
-    coordinates: Vec<[i32; 3]>,
-    steps: usize,
-    _bf16: BTreeMap<String, CudaSlice<bf16>>,
-    _f32: BTreeMap<String, CudaSlice<f32>>,
-    blocks: Vec<Block>,
-    input: Linear<f32>,
-    output: Linear<f32>,
-    time: [Linear<f32>; 3],
-    kernels: Kernels,
     blas: Blas,
-    flash: Flash,
-    cross: F32Attention,
-    work: Work,
-    phases: CudaSlice<f32>,
-    mods: CudaSlice<bf16>,
-    time_count: usize,
+    weights: Weights,
+    k: Kernels,
+    kind: DecoderKind,
+    workspace: usize,
+    ones: CudaSlice<f16>,
+    columns: Option<CudaSlice<u8>>,
 }
-
-impl PixalFlow {
+pub struct SparseDecoderOutput {
+    pub coordinates: Vec<[i32; 4]>,
+    pub features: Vec<f32>,
+    pub channels: usize,
+}
+pub struct SubdivisionGuide<'a> {
+    pub coordinates: &'a [[i32; 4]],
+    pub logits: &'a [f32],
+}
+impl PixalDecoder {
     pub fn open(
         dir: &Path,
-        stem: &str,
+        kind: DecoderKind,
         runtime: &Path,
-        coordinates: &[[i32; 3]],
-        budget: usize,
+        device_budget: usize,
     ) -> Result<Self> {
-        let checkpoint = FlowCheckpoint::open(dir, stem)?;
-        let spec = checkpoint.spec.clone();
-        let pipeline = dir
-            .parent()
-            .context("checkpoint directory lacks model root")?
-            .join(if stem.ends_with("_mv") {
-                "pipeline_mv.json"
-            } else {
-                "pipeline.json"
-            });
-        let pipeline: serde_json::Value = serde_json::from_slice(&std::fs::read(pipeline)?)?;
-        let sampler = &pipeline["args"][if spec.sparse() {
-            "shape_slat_sampler"
-        } else {
-            "sparse_structure_sampler"
-        }];
-        let parameters = &sampler["params"];
-        let steps = usize::try_from(
-            parameters["steps"]
-                .as_u64()
-                .context("sampler steps missing")?,
-        )?;
-        ensure!(
-            sampler["name"] == "FlowEulerGuidanceIntervalSampler"
-                && sampler["args"]["sigma_min"] == 1e-5
-                && steps == 12
-                && parameters["guidance_strength"] == 7.5
-                && parameters["guidance_interval"] == serde_json::json!([0.6, 1.0])
-                && parameters["guidance_rescale"] == if spec.sparse() { 0.5 } else { 0.7 }
-                && parameters["rescale_t"] == if spec.sparse() { 3.0 } else { 5.0 },
-            "unsupported published flow sampler contract"
-        );
-        let rows = coordinates.len();
-        ensure!(
-            rows > 0 && rows <= i32::MAX as usize / (3 * spec.model_channels),
-            "flow row extent overflow"
-        );
-        ensure!(
-            coordinates.iter().flatten().all(|&v| v >= 0),
-            "negative flow coordinates"
-        );
-        ensure!(
-            coordinates
-                .iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len()
-                == rows,
-            "duplicate flow coordinates"
-        );
-        if !spec.sparse() {
-            ensure!(
-                rows == 4096
-                    && coordinates
-                        .iter()
-                        .enumerate()
-                        .all(|(i, p)| *p
-                            == [(i / 256) as i32, ((i / 16) % 16) as i32, (i % 16) as i32]),
-                "SS coordinates must be the published 16^3 grid order"
-            );
-        }
+        let checkpoint = DecoderCheckpoint::open(&dir.join("ckpts"), kind)?;
         let device = Device::new(0)?;
-        let (free, total) = device.ctx.mem_get_info()?;
+        let (free, _) = device.ctx.mem_get_info()?;
+        let available = device_budget
+            .min(free)
+            .checked_sub(checkpoint.runtime_bytes + 512 * 1024 * 1024)
+            .context("decoder weights and reserve exceed device budget")?;
         ensure!(
-            budget > 0 && budget <= total,
-            "invalid admitted flow device budget"
+            available >= 512 * 1024 * 1024,
+            "decoder workspace cannot fit a stage"
         );
-        let kernels = Kernels::load(&device, &spec)?;
         let ops = Ops::new(&device.ctx)?;
-        let mut blas = Blas::new(
+        let blas = Blas::new(
             &device,
             &ops,
             runtime,
-            Rc::new(Closure::new(true, "Pixal3D flow".into())),
+            Rc::new(Closure::new(false, "Pixal decoder".into())),
         )?;
-        let mut bf = BTreeMap::new();
-        let mut fp = BTreeMap::new();
-        let tensors = checkpoint.mapped.component_tensors()?;
-        for (name, (_, use_bf16)) in spec.inventory() {
-            let bytes = tensors[&name].data;
-            if use_bf16 {
-                let values: Vec<_> = bytes
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|b| bf16::from_f32(f32::from_le_bytes(*b)))
-                    .collect();
-                ensure!(
-                    values.iter().all(|v| v.is_finite()),
-                    "non-finite weight: {name}"
-                );
-                bf.insert(name, device.stream.clone_htod(&values)?);
-            } else {
-                let values: Vec<_> = bytes
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|b| f32::from_le_bytes(*b))
-                    .collect();
-                ensure!(
-                    values.iter().all(|v| v.is_finite()),
-                    "non-finite weight: {name}"
-                );
-                fp.insert(name, device.stream.clone_htod(&values)?);
-            }
-        }
-        let mut blocks = Vec::new();
-        let h = spec.model_channels;
-        for i in 0..spec.num_blocks {
-            let p = format!("blocks.{i}");
-            let linear = |name: &str, output, input| {
-                Linear::bind(&bf, &device, &format!("{p}.{name}"), [output, input])
-            };
-            let weight = |name: &str| ptr(&fp[&format!("{p}.{name}")], &device);
-            let b = Block {
-                qkv: linear("self_attn.to_qkv", 3 * h, h)?,
-                self_out: linear("self_attn.to_out", h, h)?,
-                cross_q: linear("cross_attn.cross_attn_block.to_q", h, h)?,
-                cross_kv: linear(
-                    "cross_attn.cross_attn_block.to_kv",
-                    2 * h,
-                    spec.cond_channels,
-                )?,
-                cross_out: linear("cross_attn.cross_attn_block.to_out", h, h)?,
-                projection: linear("cross_attn.proj_linear", h, spec.projection_width())?,
-                fc1: linear("mlp.mlp.0", spec.feed_forward_width(), h)?,
-                fc2: linear("mlp.mlp.2", h, spec.feed_forward_width())?,
-                norm_weight: weight("norm2.weight"),
-                norm_bias: weight("norm2.bias"),
-                modulation: weight("modulation"),
-                gamma: [
-                    weight("self_attn.q_rms_norm.gamma"),
-                    weight("self_attn.k_rms_norm.gamma"),
-                    weight("cross_attn.cross_attn_block.q_rms_norm.gamma"),
-                    weight("cross_attn.cross_attn_block.k_rms_norm.gamma"),
-                ],
-            };
-            for l in [
-                b.qkv,
-                b.self_out,
-                b.cross_q,
-                b.cross_out,
-                b.projection,
-                b.fc1,
-                b.fc2,
-            ] {
-                l.prepare(&mut blas, rows)?;
-            }
-            b.cross_kv.prepare(&mut blas, 5)?;
-            blocks.push(b);
-        }
-        let input = Linear::bind(&fp, &device, "input_layer", [h, spec.in_channels])?;
-        let output = Linear::bind(&fp, &device, "out_layer", [spec.out_channels, h])?;
-        let time = [
-            Linear::bind(
-                &fp,
-                &device,
-                "t_embedder.mlp.0",
-                [h, tensors["t_embedder.mlp.0.weight"].shape[1]],
-            )?,
-            Linear::bind(&fp, &device, "t_embedder.mlp.2", [h, h])?,
-            Linear::bind(&fp, &device, "adaLN_modulation.1", [6 * h, h])?,
-        ];
-        let heads = spec.num_heads;
-        let dim = h / heads;
-        let phases = if spec.sparse() {
-            let values: Vec<_> = coordinates
-                .iter()
-                .flat_map(|p| p.iter().map(|&x| x as f32))
-                .collect();
-            let points = device.stream.clone_htod(&values)?;
-            let freqs: Vec<f32> = (0..dim / 2)
-                .map(|i| {
-                    if i >= 3 * (dim / 6) {
-                        0.0
-                    } else {
-                        1.0 / 10000f32.powf((i % (dim / 6)) as f32 / (dim / 6) as f32)
-                    }
-                })
-                .collect();
-            let freqs = device.stream.clone_htod(&freqs)?;
-            let phase = device.stream.alloc_zeros(rows * dim)?;
-            unsafe {
+        let k = Kernels::load(&device)?;
+        let weights = Weights::load(&device, &checkpoint)?;
+        let ones = device.stream.clone_htod(&vec![f16::ONE; 1024])?;
+        let columns = if matches!(kind, DecoderKind::Structure) {
+            Some(
                 device
                     .stream
-                    .launch_builder(&kernels.phases)
-                    .arg(&points)
-                    .arg(&freqs)
-                    .arg(&(rows as i32))
-                    .arg(&1i32)
-                    .arg(&(dim as i32))
-                    .arg(&phase)
-                    .launch(flat(rows * dim / 2))?;
-            }
-            phase
+                    .alloc_zeros::<u8>((available / 2).min(512 * 1024 * 1024))?,
+            )
         } else {
-            fp.remove("rope_phases").context("SS phases missing")?
+            None
         };
-        let work = Work::new(&device, rows, &spec)?;
-        let flash = Flash::new(device.stream.clone(), rows, heads, heads, dim)?;
-        let mods = device.stream.alloc_zeros(steps * 6 * h)?;
-        let condition_bytes = 4usize
-            .checked_mul(5 * spec.cond_channels + rows * spec.projection_width())
-            .context("flow conditioning bytes overflow")?;
-        let sampler_bytes = rows
-            .checked_mul(spec.in_channels)
-            .and_then(|n| n.checked_mul(8 * size_of::<f32>()))
-            .and_then(|n| n.checked_add(8))
-            .context("flow sampler bytes overflow")?;
-        let time_width = time[0].weight.shape[1] as usize;
-        let time_bytes = size_of::<f32>() * (steps * (time_width + 8 * h + 1) + h + time_width / 2);
-        let live_bytes = condition_bytes
-            .checked_add(sampler_bytes)
-            .and_then(|n| n.checked_add(time_bytes))
-            .context("flow live bytes overflow")?;
-        let cross_budget = device.workspace_budget(free, budget, live_bytes)?;
-        let cross = F32Attention::new(
-            device.stream.clone(),
-            [heads as u32, rows as u32, 5, dim as u32, dim as u32],
-            cross_budget,
-        )?;
-        device.workspace_budget(free, budget, live_bytes)?;
+        println!(
+            "PIXAL_DECODER_SETUP kind={kind:?} weight_bytes={} workspace_budget={available} device_budget={device_budget} eager=true",
+            checkpoint.runtime_bytes
+        );
         Ok(Self {
-            origin: Rc::new(()),
             device,
-            spec,
-            rows,
-            coordinates: coordinates.to_vec(),
-            steps,
-            _bf16: bf,
-            _f32: fp,
-            blocks,
-            input,
-            output,
-            time,
-            kernels,
             blas,
-            flash,
-            cross,
-            work,
-            phases,
-            mods,
-            time_count: 0,
+            weights,
+            k,
+            kind,
+            workspace: available,
+            ones,
+            columns,
         })
     }
-    fn linear_f32(
+    fn linear16(
         &self,
-        linear: Linear<f32>,
-        rows: usize,
-        input: u64,
-        output: u64,
-        silu: bool,
+        name: &str,
+        input: &CudaSlice<f16>,
+        output: &mut CudaSlice<f16>,
+        shape: [usize; 3],
     ) -> Result<()> {
+        let [rows, ci, co] = shape;
+        let d = &self.device;
+        let w = self
+            .weights
+            .half
+            .get(&format!("{name}.weight"))
+            .context("linear16 weight missing")?;
+        let b = self
+            .weights
+            .half
+            .get(&format!("{name}.bias"))
+            .context("linear16 bias missing")?;
+        self.k
+            .bias(d, ptr(output, d), ptr(b, d), [rows, co], true, false)?;
+        self.blas.linear_f16(
+            matrix(w, d, co, ci)?,
+            matrix(input, d, rows, ci)?,
+            &mut TensorMut(matrix(output, d, rows, co)?),
+            true,
+        )
+    }
+    fn linear32(
+        &self,
+        name: &str,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+        shape: [usize; 3],
+    ) -> Result<()> {
+        let [rows, ci, co] = shape;
+        let d = &self.device;
+        let w = self
+            .weights
+            .float
+            .get(&format!("{name}.weight"))
+            .context("linear32 weight missing")?;
+        let b = self
+            .weights
+            .float
+            .get(&format!("{name}.bias"))
+            .context("linear32 bias missing")?;
         self.blas.linear_f32(
-            linear.weight,
-            matrix(input, rows, linear.weight.shape[1] as usize)?,
-            &mut TensorMut(matrix(output, rows, linear.weight.shape[0] as usize)?),
+            matrix(w, d, co, ci)?,
+            matrix(input, d, rows, ci)?,
+            &mut TensorMut(matrix(output, d, rows, co)?),
         )?;
-        let width = linear.weight.shape[0];
+        self.k
+            .bias(d, ptr(output, d), ptr(b, d), [rows, co], false, true)
+    }
+    fn sparse_conv(
+        &self,
+        conv: &SparseConv,
+        name: &str,
+        input: &CudaSlice<f16>,
+        output: &mut CudaSlice<f16>,
+        ci: usize,
+    ) -> Result<()> {
+        let d = &self.device;
+        let w = self
+            .weights
+            .half
+            .get(&format!("{name}.weight"))
+            .context("sparse conv weight missing")?;
+        let b = self
+            .weights
+            .half
+            .get(&format!("{name}.bias"))
+            .context("sparse conv bias missing")?;
+        conv.run(
+            &self.blas,
+            input,
+            matrix(w, d, b.len(), 27 * ci)?,
+            view(b, &d.stream, 0, [b.len() as u32], [1])?,
+            output,
+        )
+    }
+    fn norm16(
+        &self,
+        name: Option<&str>,
+        input: &CudaSlice<f16>,
+        output: &CudaSlice<f16>,
+        rows: usize,
+        c: usize,
+        eps: f32,
+    ) -> Result<()> {
+        self.k.norm(
+            &self.device,
+            [ptr(input, &self.device), ptr(output, &self.device)],
+            [rows, c],
+            self.weights.affine(&self.device, name)?,
+            false,
+            eps,
+        )
+    }
+    fn next_blocks(
+        &self,
+        stage: usize,
+        conv: &SparseConv,
+        x: CudaSlice<f16>,
+        c: usize,
+        blocks: usize,
+    ) -> Result<CudaSlice<f16>> {
+        let d = &self.device;
+        let n = x.len() / c;
+        let features = n.checked_mul(c).context("sparse features overflow")?;
+        let live = features
+            .checked_mul(16)
+            .context("sparse workspace overflow")?;
+        ensure!(
+            live.checked_add(512 * 1024 * 1024)
+                .is_some_and(|b| b <= self.workspace),
+            "sparse stage activations and gather exceed budget"
+        );
+        let mut a = d.stream.alloc_zeros::<f16>(features)?;
+        let b = d.stream.alloc_zeros::<f16>(features)?;
+        let mut wide = d.stream.alloc_zeros::<f16>(features * 4)?;
+        for block in 0..blocks {
+            let name = format!("blocks.{stage}.{block}");
+            self.sparse_conv(conv, &format!("{name}.conv"), &x, &mut a, c)?;
+            self.norm16(Some(&format!("{name}.norm")), &a, &b, n, c, 1e-6)?;
+            self.linear16(&format!("{name}.mlp.0"), &b, &mut wide, [n, c, 4 * c])?;
+            self.k.act(d, ptr(&wide, d), n, 4 * c, false)?;
+            self.linear16(&format!("{name}.mlp.2"), &wide, &mut a, [n, 4 * c, c])?;
+            self.k.add(d, &x, &a, &self.ones, [n, c])?;
+        }
+        Ok(x)
+    }
+    fn c2s(
+        &self,
+        x: &CudaSlice<f16>,
+        pairs: &CudaSlice<u32>,
+        y: &CudaSlice<f16>,
+        shape: [usize; 4],
+        add: bool,
+    ) -> Result<()> {
+        let [parents, rows, ci, co] = shape;
         unsafe {
-            let mut launch = self.device.stream.launch_builder(if silu {
-                &self.kernels.silu
-            } else {
-                &self.kernels.bias
-            });
-            launch.arg(&output).arg(&linear.bias.ptr).arg(&output);
-            launch
-                .arg(
-                    &(if silu {
-                        rows as u32 * width
-                    } else {
-                        rows as u32
-                    }),
-                )
-                .arg(&width)
-                .launch(flat(rows * width as usize))?;
+            self.device
+                .stream
+                .launch_builder(&self.k.c2s)
+                .arg(x)
+                .arg(pairs)
+                .arg(y)
+                .arg(&(parents as u32))
+                .arg(&(rows as u32))
+                .arg(&(ci as u32))
+                .arg(&(co as u32))
+                .arg(&(add as i32))
+                .launch(flat(rows * co))?;
         }
         Ok(())
     }
-    fn set_times(&mut self, times: &[f32]) -> Result<()> {
+    fn up_stage(
+        &self,
+        stage: usize,
+        sites: SparseSites,
+        x: CudaSlice<f16>,
+        conv: SparseConv,
+        guide: SubdivisionGuide<'_>,
+    ) -> Result<(SparseSites, CudaSlice<f16>, Vec<f32>, SparseConv)> {
+        let c = 1024 >> stage;
+        let co = c / 2;
+        let n = sites.coordinates().len();
+        let blocks = [4, 16, 8, 4][stage];
         ensure!(
-            !times.is_empty() && times.len() <= self.steps && times.iter().all(|x| x.is_finite()),
-            "invalid flow time setup"
+            guide.coordinates == sites.coordinates()
+                && guide.logits.len() == n * 8
+                && guide.logits.iter().all(|x| x.is_finite()),
+            "subdivision guide does not match stage coordinates"
+        );
+        let active: Vec<[bool; 8]> = guide
+            .logits
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|row| row.map(|x| x > 0.0))
+            .collect();
+        let capacity = self.workspace / (co * 16 + 108 + 16);
+        let (children, source) = sites.subdivide(&active, capacity)?;
+        let child_n = children.coordinates().len();
+        let name = format!("blocks.{stage}.{blocks}");
+        let d = &self.device;
+        let live = n
+            .checked_mul(c * 2 * 7 + 16)
+            .and_then(|b| b.checked_add(child_n * co * 2 * 3 + child_n * 8))
+            .context("C2S workspace overflow")?;
+        let budget = self
+            .workspace
+            .checked_sub(live)
+            .context("C2S live activations exceed budget")?
+            .min(512 * 1024 * 1024);
+        let mut subdivision = d.stream.alloc_zeros::<f16>(n * 8)?;
+        self.linear16(
+            &format!("{name}.to_subdiv"),
+            &x,
+            &mut subdivision,
+            [n, c, 8],
+        )?;
+        let predicted = d
+            .stream
+            .clone_dtoh(&subdivision)?
+            .into_iter()
+            .map(f16::to_f32)
+            .collect();
+        drop(subdivision);
+        let normalized = d.stream.alloc_zeros::<f16>(n * c)?;
+        self.norm16(Some(&format!("{name}.norm1")), &x, &normalized, n, c, 1e-6)?;
+        self.k.act(d, ptr(&normalized, d), n, c, false)?;
+        let mut expanded = d.stream.alloc_zeros::<f16>(n * 8 * co)?;
+        self.sparse_conv(
+            &conv,
+            &format!("{name}.conv1"),
+            &normalized,
+            &mut expanded,
+            c,
+        )?;
+        drop(conv);
+        drop(normalized);
+        drop(sites);
+        let pairs = d.stream.clone_htod(source.as_flattened())?;
+        let child = d.stream.alloc_zeros::<f16>(child_n * co)?;
+        self.c2s(&expanded, &pairs, &child, [n, child_n, co, co], false)?;
+        drop(expanded);
+        let normalized = d.stream.alloc_zeros::<f16>(child_n * co)?;
+        self.norm16(None, &child, &normalized, child_n, co, 1e-6)?;
+        drop(child);
+        self.k.act(d, ptr(&normalized, d), child_n, co, false)?;
+        let mut output = d.stream.alloc_zeros::<f16>(child_n * co)?;
+        let conv = SparseConv::new(d, &children, co, budget)?;
+        self.sparse_conv(
+            &conv,
+            &format!("{name}.conv2"),
+            &normalized,
+            &mut output,
+            co,
+        )?;
+        self.c2s(&x, &pairs, &output, [n, child_n, c / 8, co], true)?;
+        Ok((children, output, predicted, conv))
+    }
+    pub fn shape_prefix<F>(
+        &self,
+        coordinates: Vec<[i32; 4]>,
+        latent: &[f32],
+        guides: &[SubdivisionGuide<'_>],
+        mut observe: F,
+    ) -> Result<SparseDecoderOutput>
+    where
+        F: FnMut(usize, &SparseDecoderOutput, &[f32]) -> Result<()>,
+    {
+        ensure!(
+            matches!(self.kind, DecoderKind::Shape),
+            "shape decoder required"
+        );
+        ensure!(
+            guides.len() == 4,
+            "four recorded subdivision guides required"
+        );
+        let mut sites = SparseSites::new(coordinates)?;
+        let n = sites.coordinates().len();
+        ensure!(
+            latent.len() == n * 32 && latent.iter().all(|x| x.is_finite()),
+            "invalid denormalized sparse latent"
+        );
+        ensure!(
+            n.checked_mul(32 * 4 + 1024 * 6)
+                .is_some_and(|b| b < self.workspace),
+            "sparse input exceeds workspace"
         );
         let d = &self.device;
-        let n = times.len();
-        let h = self.spec.model_channels;
-        let half = self.time[0].weight.shape[1] as usize / 2;
-        let t = d.stream.clone_htod(times)?;
-        let freq: Vec<_> = (0..half)
-            .map(|i| (-10000f64.ln() as f32 * i as f32 / half as f32).exp())
-            .collect();
-        let freq = d.stream.clone_htod(&freq)?;
-        let embed = d.stream.alloc_zeros::<f32>(n * half * 2)?;
-        let first = d.stream.alloc_zeros::<f32>(n * h)?;
-        let second = d.stream.alloc_zeros::<f32>(n * h)?;
-        let all = d.stream.alloc_zeros::<f32>(n * 6 * h)?;
-        unsafe {
-            d.stream
-                .launch_builder(&self.kernels.sinusoid)
-                .arg(&t)
-                .arg(&freq)
-                .arg(&embed)
-                .arg(&(n as u32))
-                .arg(&(half as u32))
-                .arg(&0i32)
-                .launch(flat(n * half))?;
-        }
-        self.linear_f32(self.time[0], n, ptr(&embed, d), ptr(&first, d), true)?;
-        self.linear_f32(self.time[1], n, ptr(&first, d), ptr(&second, d), false)?;
-        let zero = d.stream.alloc_zeros::<f32>(h)?;
-        unsafe {
-            d.stream
-                .launch_builder(&self.kernels.silu)
-                .arg(&second)
-                .arg(&zero)
-                .arg(&second)
-                .arg(&((n * h) as u32))
-                .arg(&(h as u32))
-                .launch(flat(n * h))?;
-        }
-        self.linear_f32(self.time[2], n, ptr(&second, d), ptr(&all, d), false)?;
-        self.kernels
-            .cast(d, ptr(&all, d), ptr(&self.mods, d), n * 6 * h)?;
-        self.time_count = n;
-        Ok(())
-    }
-    pub fn conditioning(
-        &self,
-        global: &[f32],
-        projected: &[f32],
-        coordinates: &[[i32; 3]],
-    ) -> Result<Conditioning> {
-        ensure!(
-            coordinates == self.coordinates,
-            "conditioning coordinate rows differ from flow setup"
-        );
-        ensure!(
-            global.len() == 5 * self.spec.cond_channels
-                && projected.len() == self.rows * self.spec.projection_width(),
-            "flow conditioning shape mismatch"
-        );
-        ensure!(
-            global.iter().chain(projected).all(|x| x.is_finite()),
-            "non-finite conditioning"
-        );
-        let cast = |values: &[f32]| -> Result<_> {
-            let values: Vec<_> = values.iter().map(|&v| bf16::from_f32(v)).collect();
+        let input = d.stream.clone_htod(latent)?;
+        let mut float = d.stream.alloc_zeros::<f32>(n * 1024)?;
+        self.linear32("from_latent", &input, &mut float, [n, 32, 1024])?;
+        drop(input);
+        let mut x = d.stream.alloc_zeros::<f16>(n * 1024)?;
+        self.k
+            .cast(d, [ptr(&float, d), ptr(&x, d)], n * 1024, false)?;
+        drop(float);
+        let mut conv = SparseConv::new(d, &sites, 1024, 512 * 1024 * 1024)?;
+        for (stage, guide) in guides.iter().enumerate() {
+            x = self.next_blocks(stage, &conv, x, 1024 >> stage, [4, 16, 8, 4][stage])?;
+            let (next, features, predicted, next_conv) = self.up_stage(
+                stage,
+                sites,
+                x,
+                conv,
+                SubdivisionGuide {
+                    coordinates: guide.coordinates,
+                    logits: guide.logits,
+                },
+            )?;
+            let host = SparseDecoderOutput {
+                coordinates: next.coordinates().to_vec(),
+                features: d
+                    .stream
+                    .clone_dtoh(&features)?
+                    .into_iter()
+                    .map(f16::to_f32)
+                    .collect(),
+                channels: 512 >> stage,
+            };
             ensure!(
-                values.iter().all(|x| x.is_finite()),
-                "conditioning overflows BF16"
+                host.features.iter().all(|x| x.is_finite())
+                    && predicted.iter().all(|x| x.is_finite()),
+                "nonfinite sparse stage output"
             );
-            Ok(self.device.stream.clone_htod(&values)?)
-        };
-        Ok(Conditioning {
-            origin: self.origin.clone(),
-            global: cast(global)?,
-            projected: cast(projected)?,
+            observe(stage, &host, &predicted)?;
+            sites = next;
+            x = features;
+            conv = next_conv;
+        }
+        Ok(SparseDecoderOutput {
+            coordinates: sites.coordinates().to_vec(),
+            features: d
+                .stream
+                .clone_dtoh(&x)?
+                .into_iter()
+                .map(f16::to_f32)
+                .collect(),
+            channels: 64,
         })
     }
-    fn block(&mut self, index: usize, modulation: u64, conditioning: &Conditioning) -> Result<()> {
+    fn dense_conv(&self, name: &str, io: [u64; 2], shape: [usize; 3], half: bool) -> Result<()> {
+        let [side, ci, co] = shape;
+        let n = side.pow(3);
+        let width = 27 * ci;
         let d = &self.device;
-        let n = self.rows;
-        let h = self.spec.model_channels;
-        let heads = self.spec.num_heads;
-        let dim = h / heads;
-        let ff = self.spec.feed_forward_width();
-        let b = &self.blocks[index];
-        let k = &self.kernels;
-        let hidden = ptr(&self.work.hidden, d);
-        let norm = ptr(&self.work.norm, d);
-        let projected = ptr(&self.work.projected, d);
-        let q = ptr(&self.work.q, d);
-        let key = ptr(&self.work.k, d);
-        let value = ptr(&self.work.v, d);
-        let kn = ptr(&self.work.kn, d);
-        let attention = ptr(&self.work.attention, d);
-        let bm = ptr(&self.work.block_mod, d);
-        unsafe {
-            d.stream
-                .launch_builder(&k.add_mod)
-                .arg(&modulation)
-                .arg(&b.modulation)
-                .arg(&bm)
-                .arg(&((6 * h) as u64))
-                .arg(&((6 * h) as u32))
-                .launch(flat(6 * h))?;
-        }
-        k.norm(d, hidden, norm, [n, h], [0, 0], (1e-6, false))?;
-        self.modulate(norm, bm, 0)?;
-        b.qkv.run(&self.blas, n, norm, ptr(&self.work.qkv, d))?;
-        k.unpack(d, ptr(&self.work.qkv, d), [q, key, value], n, 3)?;
-        k.l2(d, q, q, b.gamma[0], n, false)?;
-        k.l2(d, key, kn, b.gamma[1], n, true)?;
-        for (kernel, data) in [(&k.rope, q), (&k.rope_hm, kn)] {
+        let columns = self.columns.as_ref().context("dense columns unavailable")?;
+        let bytes = if half { 2 } else { 4 };
+        let tile = (columns.len() / (width * bytes)).min(n);
+        ensure!(tile > 0, "dense conv cannot fit one row");
+        let (weight, bias) = if half {
+            (
+                ptr(
+                    self.weights
+                        .half
+                        .get(&format!("{name}.weight"))
+                        .context("dense F16 weight missing")?,
+                    d,
+                ),
+                ptr(
+                    self.weights
+                        .half
+                        .get(&format!("{name}.bias"))
+                        .context("dense F16 bias missing")?,
+                    d,
+                ),
+            )
+        } else {
+            (
+                ptr(
+                    self.weights
+                        .float
+                        .get(&format!("{name}.weight"))
+                        .context("dense F32 weight missing")?,
+                    d,
+                ),
+                ptr(
+                    self.weights
+                        .float
+                        .get(&format!("{name}.bias"))
+                        .context("dense F32 bias missing")?,
+                    d,
+                ),
+            )
+        };
+        for first in (0..n).step_by(tile) {
+            let rows = tile.min(n - first);
+            let y = io[1] + (first * co * bytes) as u64;
             unsafe {
                 d.stream
-                    .launch_builder(kernel)
-                    .arg(&data)
-                    .arg(&self.phases)
-                    .arg(&(n as i32))
-                    .arg(&(heads as i32))
-                    .arg(&(dim as i32))
-                    .arg(&(dim as i32))
-                    .launch(flat(n * heads * dim / 2))?;
+                    .launch_builder(if half { &self.k.conv16 } else { &self.k.conv32 })
+                    .arg(&io[0])
+                    .arg(columns)
+                    .arg(&(ci as u32))
+                    .arg(&(side as u32))
+                    .arg(&(side as u32))
+                    .arg(&(side as u32))
+                    .arg(&3u32)
+                    .arg(&(first as u64))
+                    .arg(&(rows as u32))
+                    .arg(&0u32)
+                    .launch(flat(rows * width))?;
             }
+            if half {
+                self.blas.linear_f16(
+                    raw_matrix::<f16>(weight, co, width)?,
+                    raw_matrix(ptr(columns, d), rows, width)?,
+                    &mut TensorMut(raw_matrix(y, rows, co)?),
+                    false,
+                )?;
+            } else {
+                self.blas.linear_f32(
+                    raw_matrix::<f32>(weight, co, width)?,
+                    raw_matrix(ptr(columns, d), rows, width)?,
+                    &mut TensorMut(raw_matrix(y, rows, co)?),
+                )?;
+            }
+            self.k.bias(d, y, bias, [rows, co], false, !half)?;
         }
-        self.flash.run(
-            &self.work.q,
-            h,
-            &self.work.kn,
-            &self.work.v,
-            &mut self.work.attention,
-            Shape {
-                rows: n,
-                start: 0,
-                capacity: n,
-                q_heads: heads,
-                kv_heads: heads,
-                head_dim: dim,
-                causal: false,
-                window_left: None,
-            },
-        )?;
-        b.self_out.run(&self.blas, n, attention, projected)?;
-        self.gated_add(projected, bm, 2)?;
-        k.norm(
-            d,
-            hidden,
-            norm,
-            [n, h],
-            [b.norm_weight, b.norm_bias],
-            (1e-6, false),
-        )?;
-        b.cross_q.run(&self.blas, n, norm, q)?;
-        b.cross_kv.run(
-            &self.blas,
-            5,
-            ptr(&conditioning.global, d),
-            ptr(&self.work.cross_kv, d),
-        )?;
-        k.unpack(
-            d,
-            ptr(&self.work.cross_kv, d),
-            [0, ptr(&self.work.cross_k, d), ptr(&self.work.cross_v, d)],
-            5,
-            2,
-        )?;
-        k.l2(d, q, q, b.gamma[2], n, false)?;
-        k.l2(
-            d,
-            ptr(&self.work.cross_k, d),
-            ptr(&self.work.cross_kn, d),
-            b.gamma[3],
-            5,
+        Ok(())
+    }
+    fn dense_residual(&self, name: &str, x: &CudaSlice<f16>, side: usize, c: usize) -> Result<()> {
+        let d = &self.device;
+        let rows = side.pow(3);
+        let a = d.stream.alloc_zeros::<f16>(rows * c)?;
+        let b = d.stream.alloc_zeros::<f16>(rows * c)?;
+        self.norm16(Some(&format!("{name}.norm1")), x, &a, rows, c, 1e-5)?;
+        self.k.act(d, ptr(&a, d), rows, c, false)?;
+        self.dense_conv(
+            &format!("{name}.conv1"),
+            [ptr(&a, d), ptr(&b, d)],
+            [side, c, c],
             true,
         )?;
-        k.upcast(d, q, ptr(&self.work.cross_q32, d), n * h)?;
-        k.upcast(
-            d,
-            ptr(&self.work.cross_kn, d),
-            ptr(&self.work.cross_k32, d),
-            5 * h,
+        self.norm16(Some(&format!("{name}.norm2")), &b, &a, rows, c, 1e-5)?;
+        self.k.act(d, ptr(&a, d), rows, c, false)?;
+        self.dense_conv(
+            &format!("{name}.conv2"),
+            [ptr(&a, d), ptr(&b, d)],
+            [side, c, c],
+            true,
         )?;
-        k.upcast(
-            d,
-            ptr(&self.work.cross_v, d),
-            ptr(&self.work.cross_v32, d),
-            5 * h,
-        )?;
-        let q32 = view(
-            &self.work.cross_q32,
-            &d.stream,
-            0,
-            [heads as u32, n as u32, dim as u32],
-            [dim as u64, h as u64, 1],
-        )?;
-        let k32 = dense(&self.work.cross_k32, d, [heads as u32, 5, dim as u32])?;
-        let v32 = dense(&self.work.cross_v32, d, [heads as u32, 5, dim as u32])?;
-        let out32 = view(
-            &self.work.cross_out32,
-            &d.stream,
-            0,
-            [heads as u32, n as u32, dim as u32],
-            [dim as u64, h as u64, 1],
-        )?;
-        self.cross
-            .run(&self.blas, q32, k32, v32, &mut TensorMut(out32))?;
-        k.cast(d, ptr(&self.work.cross_out32, d), attention, n * h)?;
-        b.cross_out.run(&self.blas, n, attention, projected)?;
-        b.projection
-            .run(&self.blas, n, ptr(&conditioning.projected, d), norm)?;
-        k.residual(d, norm, projected, n * h)?;
-        k.residual(d, hidden, norm, n * h)?;
-        k.norm(d, hidden, norm, [n, h], [0, 0], (1e-6, false))?;
-        self.modulate(norm, bm, 3)?;
-        b.fc1.run(&self.blas, n, norm, ptr(&self.work.ff, d))?;
-        unsafe {
-            d.stream
-                .launch_builder(&k.gelu)
-                .arg(&self.work.ff)
-                .arg(&self.work.ff)
-                .arg(&(n as u32))
-                .arg(&1u32)
-                .arg(&(ff as u32))
-                .arg(&(ff as u64))
-                .arg(&0u64)
-                .arg(&1u64)
-                .arg(&(ff as u64))
-                .arg(&0u64)
-                .arg(&1u64)
-                .arg(&1i32)
-                .launch(grid((n * ff).div_ceil(256).min(65535), 256))?;
-        }
-        b.fc2.run(&self.blas, n, ptr(&self.work.ff, d), projected)?;
-        self.gated_add(projected, bm, 5)?;
-        Ok(())
+        self.k.add(d, x, &b, &self.ones, [rows, c])
     }
-    fn modulate(&self, values: u64, modulation: u64, part: usize) -> Result<()> {
-        let h = self.spec.model_channels;
-        let shift = modulation + (part * h * 2) as u64;
-        let scale = shift + (h * 2) as u64;
-        unsafe {
-            self.device
-                .stream
-                .launch_builder(&self.kernels.modulate)
-                .arg(&values)
-                .arg(&shift)
-                .arg(&scale)
-                .arg(&self.work.row_index)
-                .arg(&values)
-                .arg(&(self.rows as i32))
-                .arg(&(h as i32))
-                .arg(&((6 * h) as u64))
-                .arg(&1u32)
-                .launch(crate::backend::gpu::LaunchConfig {
-                    grid_dim: (self.rows as u32, h.div_ceil(256) as u32, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
-        }
-        Ok(())
-    }
-    fn gated_add(&self, values: u64, modulation: u64, part: usize) -> Result<()> {
-        let h = self.spec.model_channels;
-        let gate = modulation + (part * h * 2) as u64;
-        unsafe {
-            self.device
-                .stream
-                .launch_builder(&self.kernels.gated)
-                .arg(&self.work.hidden)
-                .arg(&values)
-                .arg(&gate)
-                .arg(&self.work.row_index)
-                .arg(&(self.rows as i32))
-                .arg(&(h as i32))
-                .arg(&((6 * h) as u64))
-                .arg(&1u32)
-                .launch(crate::backend::gpu::LaunchConfig {
-                    grid_dim: (self.rows as u32, h.div_ceil(256) as u32, 1),
-                    block_dim: (256, 1, 1),
-                    shared_mem_bytes: 0,
-                })?;
-        }
-        Ok(())
-    }
-    fn forward(
-        &mut self,
-        input: &CudaSlice<f32>,
-        time: usize,
-        conditioning: &Conditioning,
-        output: &mut CudaSlice<f32>,
-    ) -> Result<()> {
-        self.forward_observe(input, time, conditioning, output, |_, _| Ok(()))
-    }
-    fn forward_observe(
-        &mut self,
-        input: &CudaSlice<f32>,
-        time: usize,
-        conditioning: &Conditioning,
-        output: &mut CudaSlice<f32>,
-        mut observe: impl FnMut(&Self, usize) -> Result<()>,
-    ) -> Result<()> {
+    pub fn structure(&self, latent_chw: &[f32]) -> Result<Vec<f32>> {
         ensure!(
-            time < self.time_count
-                && input.len() == self.rows * self.spec.in_channels
-                && output.len() == input.len(),
-            "flow input/time extent differs from setup"
+            matches!(self.kind, DecoderKind::Structure),
+            "structure decoder required"
         );
-        validate_conditioning_origin(&conditioning.origin, &self.origin)?;
         ensure!(
-            conditioning.global.len() == 5 * self.spec.cond_channels
-                && conditioning.projected.len() == self.rows * self.spec.projection_width(),
-            "conditioning belongs to different flow geometry"
+            latent_chw.len() == 8 * 16usize.pow(3) && latent_chw.iter().all(|x| x.is_finite()),
+            "structure latent must be finite [8,16,16,16]"
         );
-        let n = self.rows;
-        let h = self.spec.model_channels;
-        let input_ptr = if self.spec.sparse() {
-            ptr(input, &self.device)
-        } else {
-            unsafe {
-                self.device
-                    .stream
-                    .launch_builder(&self.kernels.transpose)
-                    .arg(input)
-                    .arg(&self.work.input_rows)
-                    .arg(&(self.spec.in_channels as i64))
-                    .arg(&(n as i64))
-                    .launch(flat(input.len()))?;
-            }
-            ptr(&self.work.input_rows, &self.device)
-        };
-        self.linear_f32(
-            self.input,
-            n,
-            input_ptr,
-            ptr(&self.work.outer, &self.device),
+        ensure!(
+            self.workspace >= 512 * 1024 * 1024,
+            "dense decoder workspace below live bound"
+        );
+        let rows = 16usize.pow(3);
+        let input: Vec<f32> = (0..rows * 8)
+            .map(|i| latent_chw[(i % 8) * rows + i / 8])
+            .collect();
+        let d = &self.device;
+        let input = d.stream.clone_htod(&input)?;
+        let float = d.stream.alloc_zeros::<f32>(rows * 512)?;
+        self.dense_conv(
+            "input_layer",
+            [ptr(&input, d), ptr(&float, d)],
+            [16, 8, 512],
             false,
         )?;
-        self.kernels.cast(
-            &self.device,
-            ptr(&self.work.outer, &self.device),
-            ptr(&self.work.hidden, &self.device),
-            n * h,
-        )?;
-        let modulation = ptr(&self.mods, &self.device) + (time * 6 * h * 2) as u64;
-        for i in 0..self.blocks.len() {
-            self.block(i, modulation, conditioning)?;
-            observe(self, i)?;
+        drop(input);
+        let mut x = d.stream.alloc_zeros::<f16>(rows * 512)?;
+        self.k
+            .cast(d, [ptr(&float, d), ptr(&x, d)], rows * 512, false)?;
+        drop(float);
+        for block in 0..2 {
+            self.dense_residual(&format!("middle_block.{block}"), &x, 16, 512)?;
         }
-        self.kernels.upcast(
-            &self.device,
-            ptr(&self.work.hidden, &self.device),
-            ptr(&self.work.outer, &self.device),
-            n * h,
-        )?;
-        self.kernels.norm(
-            &self.device,
-            ptr(&self.work.outer, &self.device),
-            ptr(&self.work.outer, &self.device),
-            [n, h],
-            [0, 0],
-            (1e-5, true),
-        )?;
-        let out = if self.spec.sparse() {
-            ptr(output, &self.device)
-        } else {
-            ptr(&self.work.output_rows, &self.device)
-        };
-        self.linear_f32(
-            self.output,
-            n,
-            ptr(&self.work.outer, &self.device),
-            out,
-            false,
-        )?;
-        if !self.spec.sparse() {
-            unsafe {
-                self.device
-                    .stream
-                    .launch_builder(&self.kernels.transpose)
-                    .arg(&out)
-                    .arg(&*output)
-                    .arg(&(n as i64))
-                    .arg(&(self.spec.out_channels as i64))
-                    .launch(flat(output.len()))?;
-            }
-        }
-        Ok(())
-    }
-}
-
-struct Sampler {
-    state: CudaSlice<f32>,
-    positive: CudaSlice<f32>,
-    negative: CudaSlice<f32>,
-    velocity: CudaSlice<f32>,
-    x0: CudaSlice<f32>,
-    positive_x0: CudaSlice<f32>,
-    std: CudaSlice<f32>,
-    guided: CudaFunction,
-    convert: CudaFunction,
-    std_kernel: CudaFunction,
-    rescale: CudaFunction,
-    euler: CudaFunction,
-}
-impl Sampler {
-    fn new(d: &Device, noise: &[f32]) -> Result<Self> {
-        ensure!(
-            noise.len() > 1 && noise.iter().all(|x| x.is_finite()),
-            "invalid flow noise"
-        );
-        let common = cubin::module(&d.ctx, "q38_common")?;
-        let flow = cubin::module(&d.ctx, "flow")?;
-        Ok(Self {
-            state: d.stream.clone_htod(noise)?,
-            positive: d.stream.alloc_zeros(noise.len())?,
-            negative: d.stream.alloc_zeros(noise.len())?,
-            velocity: d.stream.alloc_zeros(noise.len())?,
-            x0: d.stream.alloc_zeros(noise.len())?,
-            positive_x0: d.stream.alloc_zeros(noise.len())?,
-            std: d.stream.alloc_zeros(2)?,
-            guided: common.load_function("guided_euler_f32")?,
-            convert: flow.load_function("flow_x0_f32")?,
-            std_kernel: cubin::module(&d.ctx, "norm")?.load_function("sample_std_f32")?,
-            rescale: flow.load_function("flow_rescale_f32")?,
-            euler: flow.load_function("euler_blend_f32")?,
-        })
-    }
-    fn convert(&self, d: &Device, input: u64, output: u64, t: f64, inverse: bool) -> Result<()> {
-        let alpha = (1.0f64 - 1e-5) as f32;
-        let beta = (1e-5 + (1.0 - 1e-5) * t) as f32;
-        unsafe {
-            d.stream
-                .launch_builder(&self.convert)
-                .arg(&self.state)
-                .arg(&input)
-                .arg(&output)
-                .arg(&(self.state.len() as u64))
-                .arg(&alpha)
-                .arg(&beta)
-                .arg(&(inverse as i32))
-                .launch(flat(self.state.len()))?;
-        }
-        Ok(())
-    }
-    fn step(&mut self, d: &Device, t: f64, next: f64, sparse: bool) -> Result<()> {
-        ensure!(
-            t.is_finite() && next.is_finite() && next >= 0.0 && next < t && t <= 1.0,
-            "invalid Euler time pair"
-        );
-        let count = self.state.len();
-        if (0.6..=1.0).contains(&t) {
-            unsafe {
-                d.stream
-                    .launch_builder(&self.guided)
-                    .arg(&0u64)
-                    .arg(&self.positive)
-                    .arg(&self.negative)
-                    .arg(&7.5f32)
-                    .arg(&0f32)
-                    .arg(&(count as i64))
-                    .arg(&1i32)
-                    .arg(&self.velocity)
-                    .launch(flat(count))?;
-            }
-            self.convert(
-                d,
-                ptr(&self.positive, d),
-                ptr(&self.positive_x0, d),
-                t,
-                false,
-            )?;
-            self.convert(d, ptr(&self.velocity, d), ptr(&self.x0, d), t, false)?;
-            for (i, input) in [&self.positive_x0, &self.x0].into_iter().enumerate() {
-                let output = ptr(&self.std, d) + (i * 4) as u64;
+        let mut side = 16usize;
+        let mut c = 512;
+        for block in 0..8 {
+            if block == 2 || block == 5 {
+                let co = c / 4;
+                let expanded = d.stream.alloc_zeros::<f16>(side.pow(3) * co * 8)?;
+                self.dense_conv(
+                    &format!("blocks.{block}.conv"),
+                    [ptr(&x, d), ptr(&expanded, d)],
+                    [side, c, co * 8],
+                    true,
+                )?;
+                drop(x);
+                let next = d.stream.alloc_zeros::<f16>((side * 2).pow(3) * co)?;
                 unsafe {
                     d.stream
-                        .launch_builder(&self.std_kernel)
-                        .arg(input)
-                        .arg(&output)
-                        .arg(&(count as u64))
-                        .arg(&(sparse as i32))
-                        .launch(grid(1, 256))?;
+                        .launch_builder(&self.k.shuffle)
+                        .arg(&expanded)
+                        .arg(&next)
+                        .arg(&(side as u32))
+                        .arg(&(co as u32))
+                        .launch(flat(next.len()))?;
+                }
+                x = next;
+                side *= 2;
+                c = co;
+            } else {
+                self.dense_residual(&format!("blocks.{block}"), &x, side, c)?;
+            }
+        }
+        let rows = side.pow(3);
+        let float = d.stream.alloc_zeros::<f32>(rows * c)?;
+        self.k
+            .cast(d, [ptr(&x, d), ptr(&float, d)], rows * c, true)?;
+        drop(x);
+        let normalized = d.stream.alloc_zeros::<f32>(rows * c)?;
+        self.k.norm(
+            d,
+            [ptr(&float, d), ptr(&normalized, d)],
+            [rows, c],
+            self.weights.affine(d, Some("out_layer.0"))?,
+            true,
+            1e-5,
+        )?;
+        drop(float);
+        self.k.act(d, ptr(&normalized, d), rows, c, true)?;
+        let logits = d.stream.alloc_zeros::<f32>(rows)?;
+        self.dense_conv(
+            "out_layer.2",
+            [ptr(&normalized, d), ptr(&logits, d)],
+            [side, c, 1],
+            false,
+        )?;
+        let logits = d.stream.clone_dtoh(&logits)?;
+        ensure!(
+            logits.iter().all(|x| x.is_finite()),
+            "nonfinite structure logits"
+        );
+        Ok(logits)
+    }
+    pub fn structure_sites(logits: &[f32], side: usize, target: usize) -> Result<SparseSites> {
+        ensure!(
+            side > 0
+                && target > 0
+                && side.is_multiple_of(target)
+                && side.checked_pow(3) == Some(logits.len())
+                && logits.iter().all(|x| x.is_finite()),
+            "invalid occupancy grid"
+        );
+        let factor = side / target;
+        let mut points = Vec::new();
+        for x in 0..target {
+            for y in 0..target {
+                for z in 0..target {
+                    let mut occupied = false;
+                    for dx in 0..factor {
+                        for dy in 0..factor {
+                            for dz in 0..factor {
+                                occupied |= logits[((x * factor + dx) * side + y * factor + dy)
+                                    * side
+                                    + z * factor
+                                    + dz]
+                                    > 0.0;
+                            }
+                        }
+                    }
+                    if occupied {
+                        points.push([0, i32::try_from(x)?, i32::try_from(y)?, i32::try_from(z)?]);
+                    }
                 }
             }
-            let std_pos = ptr(&self.std, d);
-            let std_cfg = std_pos + 4;
-            unsafe {
-                d.stream
-                    .launch_builder(&self.rescale)
-                    .arg(&self.x0)
-                    .arg(&std_pos)
-                    .arg(&std_cfg)
-                    .arg(&(count as u64))
-                    .arg(&(if sparse { 0.5f32 } else { 0.7f32 }))
-                    .launch(flat(count))?;
-            }
-            self.convert(d, ptr(&self.x0, d), ptr(&self.velocity, d), t, true)?;
-        } else {
-            d.stream.memcpy_dtod(&self.positive, &mut self.velocity)?;
         }
-        unsafe {
-            d.stream
-                .launch_builder(&self.euler)
-                .arg(&self.state)
-                .arg(&self.velocity)
-                .arg(&(count as u64))
-                .arg(&(-(t - next) as f32))
-                .arg(&0f32)
-                .arg(&1f32)
-                .launch(flat(count))?;
-        }
-        Ok(())
+        SparseSites::new(points)
     }
 }
 
-fn schedule(sparse: bool, steps: usize) -> Vec<f64> {
-    let scale = if sparse { 3.0 } else { 5.0 };
-    (0..=steps)
-        .map(|i| {
-            let t = if i == steps {
-                0.0
-            } else {
-                1.0 + i as f64 * (-1.0 / steps as f64)
-            };
-            scale * t / (1.0 + (scale - 1.0) * t)
-        })
-        .collect()
-}
-impl PixalFlow {
-    pub fn sample(
-        &mut self,
-        noise: &[f32],
-        positive: &Conditioning,
-        negative: &Conditioning,
-    ) -> Result<Vec<f32>> {
-        validate_conditioning_origin(&positive.origin, &self.origin)?;
-        validate_conditioning_origin(&negative.origin, &self.origin)?;
-        ensure!(
-            noise.len() == self.rows * self.spec.in_channels,
-            "noise extent differs from flow geometry"
-        );
-        let times = schedule(self.spec.sparse(), self.steps);
-        let model_times: Vec<_> = times[..self.steps]
-            .iter()
-            .map(|t| (1000.0 * t) as f32)
-            .collect();
-        self.set_times(&model_times)?;
-        let mut sampler = Sampler::new(&self.device, noise)?;
-        for step in 0..self.steps {
-            self.forward(&sampler.state, step, positive, &mut sampler.positive)?;
-            if (0.6..=1.0).contains(&times[step]) {
-                self.forward(&sampler.state, step, negative, &mut sampler.negative)?;
-            }
-            sampler.step(
-                &self.device,
-                times[step],
-                times[step + 1],
-                self.spec.sparse(),
-            )?;
-        }
-        Ok(self.device.stream.clone_dtoh(&sampler.state)?)
-    }
-}
-
-/// Published per-channel latent denormalization, F32 multiply then F32 add.
 #[cfg(test)]
-fn denormalize_shape(
-    d: &Device,
-    values: &mut CudaSlice<f32>,
-    mean: &[f32],
-    std: &[f32],
-    channels: usize,
-) -> Result<()> {
-    ensure!(
-        channels > 0
-            && mean.len() == channels
-            && std.len() == channels
-            && !values.is_empty()
-            && values.len().is_multiple_of(channels),
-        "shape latent normalization extent mismatch"
-    );
-    ensure!(
-        mean.iter().all(|x| x.is_finite()) && std.iter().all(|x| x.is_finite() && *x > 0.0),
-        "invalid shape normalization coefficients"
-    );
-    let mean = d.stream.clone_htod(mean)?;
-    let std = d.stream.clone_htod(std)?;
-    let kernel = cubin::module(&d.ctx, "q38_common")?.load_function("channel_affine_f32")?;
-    unsafe {
-        d.stream
-            .launch_builder(&kernel)
-            .arg(&ptr(values, d))
-            .arg(&std)
-            .arg(&mean)
-            .arg(&ptr(values, d))
-            .arg(&u32::try_from(values.len() / channels)?)
-            .arg(&u32::try_from(channels)?)
-            .launch(flat(values.len()))?;
-    }
-    Ok(())
-}
+#[path = "pixal3d_tests.rs"]
+mod tests;

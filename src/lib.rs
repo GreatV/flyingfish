@@ -32,3 +32,7 @@ pub mod tree_replay;
 pub mod verify;
 pub mod vision_input;
 pub mod work_layout;
+
+pub mod sparse;
+
+pub mod pixal3d;

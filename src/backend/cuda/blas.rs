@@ -1242,6 +1242,7 @@ impl Blas {
         weight: super::contracts::Tensor<half::f16, 2>,
         x: super::contracts::Tensor<half::f16, 2>,
         y: &mut super::contracts::TensorMut<half::f16, 2>,
+        accumulate: bool,
     ) -> Result<()> {
         weight.validate()?;
         x.validate()?;
@@ -1259,7 +1260,7 @@ impl Blas {
             "FP16 linear requires dense [output,input] x [rows,input] -> [rows,output]"
         );
         let alpha = 1f32;
-        let beta = 0f32;
+        let beta = if accumulate { 1f32 } else { 0f32 };
         unsafe {
             bs::cublasGemmEx(
                 *self.decode.handle(),
