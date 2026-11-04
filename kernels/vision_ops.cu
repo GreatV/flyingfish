@@ -1048,12 +1048,6 @@ __device__ void qkv_unpack_hm_impl(
     }
 }
 
-extern "C" __global__ void qkv_unpack_hm_f16(
-    const __half* packed, __half* q, __half* k, __half* v,
-    uint32_t batch, uint32_t seq_len, uint32_t heads, uint32_t dim, int parts) {
-    qkv_unpack_hm_impl(packed, q, k, v, batch, seq_len, heads, dim, parts);
-}
-
 extern "C" __global__ void qkv_unpack_hm_bf16(
     const __nv_bfloat16* packed, __nv_bfloat16* q, __nv_bfloat16* k, __nv_bfloat16* v,
     uint32_t batch, uint32_t seq_len, uint32_t heads, uint32_t dim, int parts) {

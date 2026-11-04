@@ -615,7 +615,6 @@ __device__ __forceinline__ float gelu_tanh_rn(float value) {
 namespace {
 
 __device__ __forceinline__ float q38_to_f32(__nv_bfloat16 v) { return __bfloat162float(v); }
-__device__ __forceinline__ float q38_to_f32(__half v) { return __half2float(v); }
 __device__ __forceinline__ float q38_to_f32(float v) { return v; }
 
 template <typename T>
@@ -625,28 +624,8 @@ __device__ __forceinline__ __nv_bfloat16 q38_from_f32<__nv_bfloat16>(float v) {
     return __float2bfloat16_rn(v);
 }
 template <>
-__device__ __forceinline__ __half q38_from_f32<__half>(float v) {
-    return __float2half_rn(v);
-}
-template <>
 __device__ __forceinline__ float q38_from_f32<float>(float v) {
     return v;
-}
-
-template <typename T>
-__device__ __forceinline__ void q38_gelu_impl(
-    const T* x, T* y, uint32_t rows, uint32_t heads, uint32_t width,
-    uint64_t xs0, uint64_t xs1, uint64_t xs2, uint64_t ys0, uint64_t ys1, uint64_t ys2, int mode) {
-    if(blockDim.x!=256 || blockDim.y!=1 || blockDim.z!=1 || gridDim.y!=1 || gridDim.z!=1 ||
-       !rows || !heads || !width || !x || !y || mode<0 || mode>1) {__trap();return;}
-    uint64_t count=uint64_t(rows)*heads*width;
-    for(uint64_t i=uint64_t(blockIdx.x)*256+threadIdx.x;i<count;i+=uint64_t(gridDim.x)*256) {
-        uint64_t row=i/(uint64_t(heads)*width);uint32_t head=(i/width)%heads,d=i%width;
-        float value=q38_to_f32(x[row*xs0+head*xs1+uint64_t(d)*xs2]);
-        float result=mode==1 ? gelu_tanh_rn(value) : __fmul_rn(__fmul_rn(0.5f,value),
-            __fadd_rn(1.0f,erff(__fmul_rn(value,0.7071067811865475244f))));
-        y[row*ys0+head*ys1+uint64_t(d)*ys2]=q38_from_f32<T>(result);
-    }
 }
 
 template <typename InT, typename OutT>
@@ -690,19 +669,6 @@ extern "C" __global__ void q38_layer_norm_f32(
     uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,float eps) {
     q38_layer_norm_f32_impl<float, float>(x,weight,bias,y,rows,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,eps);
 }
-extern "C" __global__ void q38_layer_norm_f16(
-    const __half* x,const float* weight,const float* bias,__half* y,
-    uint32_t rows,uint32_t heads,uint32_t width,
-    uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,float eps) {
-    q38_layer_norm_f32_impl<__half, __half>(x,weight,bias,y,rows,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,eps);
-}
-extern "C" __global__ void q38_layer_norm_f16_to_f32(
-    const __half* x,const float* weight,const float* bias,float* y,
-    uint32_t rows,uint32_t heads,uint32_t width,
-    uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,float eps) {
-    q38_layer_norm_f32_impl<__half, float>(x,weight,bias,y,rows,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,eps);
-}
-
 extern "C" __global__ void q38_layer_norm_bf16_affine_f32(
     const __nv_bfloat16* x,const float* weight,const float* bias,__nv_bfloat16* y,
     uint32_t rows,uint32_t heads,uint32_t width,

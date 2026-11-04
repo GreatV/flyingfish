@@ -272,6 +272,7 @@ impl Kernels {
 }
 
 struct Work {
+    row_index: CudaSlice<u32>,
     hidden: CudaSlice<bf16>,
     norm: CudaSlice<bf16>,
     projected: CudaSlice<bf16>,
@@ -300,6 +301,7 @@ impl Work {
         let s = &d.stream;
         let h = 1536;
         Ok(Self {
+            row_index: s.alloc_zeros(n)?,
             hidden: s.alloc_zeros(n * h)?,
             norm: s.alloc_zeros(n * h)?,
             projected: s.alloc_zeros(n * h)?,
@@ -426,7 +428,8 @@ impl PixalFlow {
             .checked_mul(
                 2 * (11 * 1536 + 8192)
                     + 4 * (3 * 1536 + 8 * spec.in_channels + 128)
-                    + 4 * spec.projection_width(),
+                    + 4 * spec.projection_width()
+                    + 4,
             )
             .context("flow workspace overflow")?;
         let reserve = checkpoint
@@ -878,7 +881,7 @@ impl PixalFlow {
                 .arg(&values)
                 .arg(&shift)
                 .arg(&scale)
-                .arg(&0u64)
+                .arg(&self.work.row_index)
                 .arg(&values)
                 .arg(&(self.rows as i32))
                 .arg(&1536i32)
@@ -901,7 +904,7 @@ impl PixalFlow {
                 .arg(&self.work.hidden)
                 .arg(&values)
                 .arg(&gate)
-                .arg(&0u64)
+                .arg(&self.work.row_index)
                 .arg(&(self.rows as i32))
                 .arg(&1536i32)
                 .arg(&9216u64)

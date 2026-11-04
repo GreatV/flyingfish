@@ -648,12 +648,6 @@ extern "C" __global__ void rope_pair_tail(
   rope_pair_tail_impl(x, rotary, rows, n, width, tail, 1);
 }
 
-extern "C" __global__ void rope_pair_tail_f16(
-    __half* x, const float* __restrict__ rotary, int rows, int n,
-    int width, int tail, int rotary_heads) {
-  rope_pair_tail_impl(x, rotary, rows, n, width, tail, rotary_heads);
-}
-
 extern "C" __global__ void rope_pair_tail_hm(
     __nv_bfloat16* x, const float* __restrict__ rotary, int rows, int heads,
     int width, int tail) {
