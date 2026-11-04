@@ -30,17 +30,17 @@ __device__ __forceinline__ void rotary_prefix(T* q,
     const T b = input[src + d + half];
     const T c = table[(size_t)position * rotary + d];
     const T s = table[(size_t)position * rotary + d + half];
-T lo, hi;
+    T lo, hi;
     if constexpr (sizeof(T) == sizeof(float)) {
         lo = __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s));
         hi = __fadd_rn(__fmul_rn(b, c), __fmul_rn(a, s));
     } else {
 #if defined(__HIP__)
-    lo = __hsub_rn(__hmul_rn(a, c), __hmul_rn(b, s));
-    hi = __hadd_rn(__hmul_rn(b, c), __hmul_rn(a, s));
+        lo = __hsub_rn(__hmul_rn(a, c), __hmul_rn(b, s));
+        hi = __hadd_rn(__hmul_rn(b, c), __hmul_rn(a, s));
 #else
-    lo = __hsub(__hmul(a, c), __hmul(b, s));
-    hi = __hadd(__hmul(b, c), __hmul(a, s));
+        lo = __hsub(__hmul(a, c), __hmul(b, s));
+        hi = __hadd(__hmul(b, c), __hmul(a, s));
 #endif
     }
     T* output = query ? q + src : k + dst;

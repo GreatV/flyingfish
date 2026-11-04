@@ -1102,6 +1102,7 @@ impl KeyframeEncoder {
                 .arg(&groups)
                 .arg(&self.spec.encoder_eps)
                 .arg(&0u32)
+                .arg(&0u32)
                 .launch(LaunchConfig {
                     grid_dim: (groups, 1, 1),
                     block_dim: (1024, 1, 1),

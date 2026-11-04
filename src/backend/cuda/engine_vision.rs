@@ -5473,7 +5473,16 @@ struct NafWorkspace {
 
 #[cfg(feature = "cuda")]
 impl NafEncoder {
+    fn check_cudnn_library() -> Result<()> {
+        ensure!(
+            std::panic::catch_unwind(|| unsafe { cudarc::cudnn::sys::culib() }).is_ok(),
+            "Pixal cuDNN unavailable: initialize retained cuDNN library"
+        );
+        Ok(())
+    }
+
     fn load(device: &Device, dir: &std::path::Path, image_side: u32) -> Result<Self> {
+        Self::check_cudnn_library()?;
         let convolution_handle = cudarc::cudnn::Cudnn::new(device.stream.clone())
             .context("cuDNN F32 convolution handle")?;
         let checkpoint =
@@ -5720,6 +5729,7 @@ impl NafEncoder {
                         .arg(&128u32)
                         .arg(&8u32)
                         .arg(&1.0e-5f32)
+                        .arg(&1u32)
                         .arg(&1u32)
                         .launch(grid(8, 512))?;
                 }
@@ -8312,6 +8322,22 @@ mod tests {
         );
         Ok(())
     }
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cudnn_library_load_returns_an_error_when_unavailable() {
+        let available = unsafe { cudarc::cudnn::sys::is_culib_present() };
+        let old_panics =
+            std::panic::catch_unwind(|| unsafe { cudarc::cudnn::sys::culib() }).is_err();
+        assert_eq!(old_panics, !available);
+        let result = std::panic::catch_unwind(NafEncoder::check_cudnn_library)
+            .expect("cuDNN load panic escaped the setup error boundary");
+        assert_eq!(result.is_ok(), available);
+        println!(
+            "PASS CUDNN_LIBRARY_LOAD available={available} returned_error={} uncaught_control_panics={old_panics}",
+            result.is_err()
+        );
+    }
+
     #[cfg(feature = "cuda")]
     fn pixal_execute(
         s: &Arc<CudaStream>,
