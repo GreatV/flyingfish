@@ -3694,25 +3694,27 @@ fn copy_media_defect_trace(
     trace: &crate::trace::Trace,
     mut names: Vec<String>,
     layers: usize,
-    _scoped: bool,
+    scoped: bool,
 ) -> Result<()> {
-    names.extend(
-        [
-            ".embed",
-            ".norm",
-            ".debug.norm1",
-            ".debug.norm2",
-            ".debug.qkv_projected",
-            ".debug.qkv_prepared",
-            ".debug.mixer_out",
-            ".debug.o_proj",
-            ".debug.mlp_gate",
-            ".debug.mlp_up",
-            ".debug.mlp_product",
-        ]
-        .map(str::to_owned),
-    );
-    names.extend((0..layers).map(|layer| format!(".layer.{layer}")));
+    if !scoped {
+        names.extend(
+            [
+                ".embed",
+                ".norm",
+                ".debug.norm1",
+                ".debug.norm2",
+                ".debug.qkv_projected",
+                ".debug.qkv_prepared",
+                ".debug.mixer_out",
+                ".debug.o_proj",
+                ".debug.mlp_gate",
+                ".debug.mlp_up",
+                ".debug.mlp_product",
+            ]
+            .map(str::to_owned),
+        );
+        names.extend((0..layers).map(|layer| format!(".layer.{layer}")));
+    }
     for key in names {
         defect.add(
             key.clone(),
