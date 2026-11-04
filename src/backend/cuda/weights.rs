@@ -1,12 +1,15 @@
 use super::Device;
-use crate::backend::gpu::{CudaContext, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice};
+use crate::backend::gpu::{
+    CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice, PushKernelArg,
+};
 use crate::config::Config;
 use crate::experts::{
     arena::{HostBlocks, SlotLayout},
     catalogue::ExpertGeometry,
     plan::Capacity,
 };
-use anyhow::{Context, Result, ensure};
+use crate::gguf::GgmlType;
+use anyhow::{Context, Result, bail, ensure};
 #[cfg(feature = "cuda")]
 use cudarc::driver::sys;
 use half::bf16;
@@ -1447,12 +1450,140 @@ impl Loader<'_> {
     }
 }
 
+/// The GGUF dequant kernels, loaded once from the `q4_0_linear` cubin.
+#[cfg(feature = "cuda")]
+pub(crate) struct QuantKernels {
+    dequant_bf16: CudaFunction,
+    dequant_f32: CudaFunction,
+    swap_halves: CudaFunction,
+    f16_to_bf16: CudaFunction,
+}
+
+/// One dequant launch: the source bytes, the destination buffer and its element type.
+#[cfg(feature = "cuda")]
+pub(crate) struct DequantCopy {
+    pub source: u64,
+    pub destination: u64,
+    pub elements: usize,
+    pub dtype: Dtype,
+}
+
+#[cfg(feature = "cuda")]
+impl QuantKernels {
+    pub(crate) fn new(ctx: &Arc<CudaContext>) -> Result<Self> {
+        let module = super::cubin::module(ctx, "q4_0_linear")?;
+        Ok(Self {
+            dequant_bf16: module.load_function("q4_0_dequant_bf16")?,
+            dequant_f32: module.load_function("q4_0_dequant_f32")?,
+            swap_halves: module.load_function("q4_0_dequant_swap_halves_bf16")?,
+            f16_to_bf16: module.load_function("f16_to_bf16")?,
+        })
+    }
+
+    /// Dequantizes `entry`'s `copy.source` bytes into `copy.destination` (`copy.elements` of `copy.dtype`).
+    pub(crate) fn dequant(
+        &self,
+        s: &Arc<CudaStream>,
+        name: &str,
+        entry: &TensorEntry,
+        copy: DequantCopy,
+    ) -> Result<()> {
+        let DequantCopy {
+            source,
+            destination,
+            elements,
+            dtype,
+        } = copy;
+        match entry.quant.context("quantized entry")? {
+            GgmlType::F16 => {
+                ensure!(
+                    dtype == Dtype::BF16,
+                    "{name}: F16 GGUF source cannot fill a {dtype:?} buffer"
+                );
+                let n = elements as u64;
+                unsafe {
+                    s.launch_builder(&self.f16_to_bf16)
+                        .arg(&source)
+                        .arg(&destination)
+                        .arg(&(n as i64))
+                        .launch(super::ops::flat(n as usize))?;
+                }
+            }
+            GgmlType::Q4_0 => {
+                let blocks = entry.bytes / 18;
+                ensure!(
+                    blocks * 18 == entry.bytes && blocks * 32 == elements,
+                    "{name}: {} source bytes do not fill a {elements}-element buffer",
+                    entry.bytes
+                );
+                if entry.swap_halves {
+                    ensure!(
+                        dtype == Dtype::BF16 && entry.shape.len() == 2,
+                        "{name}: swap_halves needs a 2-D BF16 tensor"
+                    );
+                    let (rows, cols) = (entry.shape[0] as u64, entry.shape[1] as u64);
+                    unsafe {
+                        s.launch_builder(&self.swap_halves)
+                            .arg(&source)
+                            .arg(&destination)
+                            .arg(&(rows as i64))
+                            .arg(&(cols as i64))
+                            .launch(super::ops::flat((rows as usize) * (cols as usize) / 32))?;
+                    }
+                } else if dtype == Dtype::BF16 {
+                    unsafe {
+                        s.launch_builder(&self.dequant_bf16)
+                            .arg(&source)
+                            .arg(&destination)
+                            .arg(&(blocks as i64))
+                            .launch(super::ops::flat(blocks))?;
+                    }
+                } else if dtype == Dtype::F32 {
+                    unsafe {
+                        s.launch_builder(&self.dequant_f32)
+                            .arg(&source)
+                            .arg(&destination)
+                            .arg(&(blocks as i64))
+                            .launch(super::ops::flat(blocks))?;
+                    }
+                } else {
+                    bail!("{name}: Q4_0 source cannot fill a {dtype:?} buffer");
+                }
+            }
+            other => bail!("{name}: unsupported GGUF type {other:?}"),
+        }
+        Ok(())
+    }
+}
+
+/// Device slot bytes of a streamed linear: the BF16 tile for a quantized entry, the stored bytes otherwise.
+#[cfg(feature = "cuda")]
+fn dense_device_bytes(name: &str, entry: &TensorEntry) -> Result<usize> {
+    match entry.quant {
+        Some(_) => {
+            ensure!(entry.shape.len() == 2, "{name}: quantized entry is not 2-D");
+            Ok(2 * entry.shape[0] * entry.shape[1])
+        }
+        None => Ok(entry.bytes),
+    }
+}
+
+#[cfg(feature = "cuda")]
+struct DenseEntry {
+    name: String,
+    device_offset: usize,
+    source_offset: usize,
+    entry: TensorEntry,
+}
+
 #[cfg(feature = "cuda")]
 struct DenseLayer {
     slot: Option<usize>,
     next: Option<usize>,
     next_disk: Option<usize>,
     bytes: usize,
+    source_bytes: usize,
+    entries: Vec<DenseEntry>,
     host: Option<PinnedHostSlice<u8>>,
 }
 
@@ -1474,6 +1605,8 @@ pub(crate) struct DenseStreaming {
     read_ahead: super::engine::ReadAhead,
     next_disk_read: Option<usize>,
     upload: Arc<CudaStream>,
+    staging: Option<CudaSlice<u8>>,
+    quant: Option<QuantKernels>,
     pub plan: crate::prefill::DensePlacement,
     #[cfg(test)]
     skip_reclaim: bool,
@@ -1505,32 +1638,50 @@ impl DenseStreaming {
                 next: None,
                 next_disk: None,
                 bytes: 0,
+                source_bytes: 0,
+                entries: Vec::new(),
                 host: None,
             })
             .collect();
         let mut ranges = vec![Vec::new(); layers.len()];
-        for entry in manifest
+        let mut staging_bytes = 0usize;
+        for (name, entry) in manifest
             .entries
-            .values()
-            .filter(|entry| entry.is_linear_projection() && entry.layer.is_some())
+            .iter()
+            .filter(|(_, entry)| entry.is_linear_projection() && entry.layer.is_some())
         {
             let layer_index = entry.layer.context("dense layer missing")? as usize;
             let layer = &mut layers[layer_index];
             if layer.slot.is_none() {
                 continue;
             }
-            let target = u64::try_from(layer.bytes)?;
+            let device_offset = layer.bytes;
+            let source_offset = layer.source_bytes;
+            let device_bytes = dense_device_bytes(name, entry)?;
             layer.bytes = layer
                 .bytes
-                .checked_add(entry.bytes)
+                .checked_add(device_bytes)
                 .context("dense layer bytes overflow")?;
+            layer.source_bytes = layer
+                .source_bytes
+                .checked_add(entry.bytes)
+                .context("dense layer source bytes overflow")?;
+            if entry.quant.is_some() {
+                staging_bytes = staging_bytes.max(layer.source_bytes);
+            }
+            layer.entries.push(DenseEntry {
+                name: name.clone(),
+                device_offset,
+                source_offset,
+                entry: entry.clone(),
+            });
             if !plan.host[layer_index] {
                 let offset = entry
                     .data_start
                     .checked_add(entry.data_offsets[0])
                     .context("dense source offset overflow")?;
                 ranges[layer_index].push((
-                    target,
+                    u64::try_from(source_offset)?,
                     NativeRange {
                         shard: Arc::from(entry.shard.as_str()),
                         offset,
@@ -1554,7 +1705,8 @@ impl DenseStreaming {
         }
         for (index, layer) in layers.iter_mut().enumerate() {
             if plan.host[index] {
-                layer.host = Some(unsafe { d.ctx.alloc_pinned_with_flags::<u8>(layer.bytes, 0)? });
+                layer.host =
+                    Some(unsafe { d.ctx.alloc_pinned_with_flags::<u8>(layer.source_bytes, 0)? });
             }
         }
         let (disk, events, read_ahead) = if plan.disk_bytes > 0 {
@@ -1582,6 +1734,12 @@ impl DenseStreaming {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let staging = (staging_bytes > 0)
+            .then(|| d.upload.alloc_zeros::<u8>(staging_bytes))
+            .transpose()?;
+        let quant = (staging_bytes > 0)
+            .then(|| QuantKernels::new(&d.ctx))
+            .transpose()?;
         Ok(Self {
             layers,
             slots,
@@ -1590,6 +1748,8 @@ impl DenseStreaming {
             read_ahead,
             next_disk_read: first_disk,
             upload: d.upload.clone(),
+            staging,
+            quant,
             plan,
             #[cfg(test)]
             skip_reclaim: false,
@@ -1605,6 +1765,10 @@ impl DenseStreaming {
         offset: usize,
     ) -> Result<()> {
         loader.defer(name)?;
+        ensure!(
+            entry.quant.is_none(),
+            "tensor {name}: the loader dense path holds BF16 only, not a quantized entry"
+        );
         let binding = self
             .layers
             .get_mut(layer)
@@ -1739,13 +1903,26 @@ impl DenseStreaming {
         if self.slots[slot_index].retired_valid {
             self.upload.wait(&self.slots[slot_index].retired)?;
         }
-        let layer_bytes = self.layers[index].bytes;
+        let source_bytes = self.layers[index].source_bytes;
+        let quantized = self.layers[index]
+            .entries
+            .iter()
+            .any(|entry| entry.entry.quant.is_some());
         let pointer = self.slots[slot_index].device.device_ptr(&self.upload).0;
+        let staging = quantized
+            .then(|| {
+                self.staging
+                    .as_ref()
+                    .context("quantized layer without a staging buffer")
+                    .map(|staging| staging.device_ptr(&self.upload).0)
+            })
+            .transpose()?;
+        let source_pointer = staging.unwrap_or(pointer);
         if let Some(host) = &self.layers[index].host {
-            let source = &host.as_slice()?[..layer_bytes];
+            let source = &host.as_slice()?[..source_bytes];
             unsafe {
                 cudarc::driver::result::memcpy_htod_async(
-                    pointer,
+                    source_pointer,
                     source,
                     self.upload.cu_stream(),
                 )?;
@@ -1765,11 +1942,15 @@ impl DenseStreaming {
                 .as_mut()
                 .context("dense disk reader missing after demand")?;
             let values = reader.disk.values(ring)?;
-            // SAFETY: the ring slot holds at least `layer_bytes` initialized bytes for the lease's lifetime.
+            // SAFETY: the ring slot holds at least `source_bytes` initialized bytes for the lease's lifetime.
             let raw =
-                unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, layer_bytes) };
+                unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, source_bytes) };
             unsafe {
-                cudarc::driver::result::memcpy_htod_async(pointer, raw, self.upload.cu_stream())?;
+                cudarc::driver::result::memcpy_htod_async(
+                    source_pointer,
+                    raw,
+                    self.upload.cu_stream(),
+                )?;
             }
             #[cfg(test)]
             if self.skip_reclaim {
@@ -1793,6 +1974,26 @@ impl DenseStreaming {
                     .record(&self.upload)?;
                 values.copied(copied.id)?;
                 reader.copied[ring as usize] = Some(copied);
+            }
+        }
+        if quantized {
+            let quant = self
+                .quant
+                .as_ref()
+                .context("quantized layer without dequant kernels")?;
+            for entry in &self.layers[index].entries {
+                let elements = entry.entry.shape[0] * entry.entry.shape[1];
+                quant.dequant(
+                    &self.upload,
+                    &entry.name,
+                    &entry.entry,
+                    DequantCopy {
+                        source: source_pointer + entry.source_offset as u64,
+                        destination: pointer + entry.device_offset as u64,
+                        elements,
+                        dtype: entry.entry.dtype,
+                    },
+                )?;
             }
         }
         self.slots[slot_index].ready.record(&self.upload)?;
@@ -1937,10 +2138,11 @@ impl WeightCatalog {
             !layers.is_empty() && layer_staging.iter().all(|&n| n > 0),
             "invalid dense layer staging extent"
         );
-        let preliminary = DensePlacement::new(layers, budget, 0)?;
+        let preliminary = DensePlacement::new(layers, None, budget, 0)?;
         let base_reserve = 4usize << 30;
         if available_host >= base_reserve {
-            let host_only = DensePlacement::new(layers, budget, available_host - base_reserve)?;
+            let host_only =
+                DensePlacement::new(layers, None, budget, available_host - base_reserve)?;
             if host_only.disk_bytes == 0 {
                 return Ok((base_reserve, host_only));
             }
@@ -1957,7 +2159,7 @@ impl WeightCatalog {
                 available_host >= host_fixed,
                 "dense pinned staging and host reserve exceed available RAM: need={host_fixed} available={available_host}"
             );
-            let plan = DensePlacement::new(layers, budget, available_host - host_fixed)?;
+            let plan = DensePlacement::new(layers, None, budget, available_host - host_fixed)?;
             let required_staging = layer_staging
                 .iter()
                 .enumerate()
@@ -2026,7 +2228,7 @@ impl WeightCatalog {
         let (free, total) = d.ctx.mem_get_info()?;
         let budget =
             DensePlacement::device_budget(free, total, fixed, transient_bytes, media_bytes)?;
-        let preliminary = DensePlacement::new(&layers, budget, 0)?;
+        let preliminary = DensePlacement::new(&layers, None, budget, 0)?;
         if preliminary.slot_bytes == 0 {
             return Self::load_inner(
                 dir,
@@ -2606,6 +2808,7 @@ mod tests {
             for host_layers in [0, 2, 4] {
                 let plan = crate::prefill::DensePlacement::new(
                     &[per_layer; 4],
+                    None,
                     2 * per_layer,
                     host_layers * per_layer,
                 )?;
@@ -2699,7 +2902,8 @@ mod tests {
                 }
             }
             for skip_reclaim in [false, true] {
-                let plan = crate::prefill::DensePlacement::new(&[per_layer; 4], 2 * per_layer, 0)?;
+                let plan =
+                    crate::prefill::DensePlacement::new(&[per_layer; 4], None, 2 * per_layer, 0)?;
                 let mut dense = DenseStreaming::new(&root, &manifest, plan, &device)?;
                 populate(&mut dense)?;
                 dense.skip_reclaim = skip_reclaim;

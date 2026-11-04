@@ -1,4 +1,5 @@
 //! MiniMax-H3 FL2VA transformer execution.
+use crate::backend::cuda::weights::{DequantCopy, QuantKernels};
 use crate::backend::cuda::{
     Device,
     blas::Blas,
@@ -61,26 +62,6 @@ impl Element for f32 {
             .0
             .iter()
             .all(|v| f32::from_le_bytes(*v).is_finite())
-    }
-}
-
-/// The GGUF dequant kernels, loaded once from the `q4_0_linear` cubin.
-struct QuantKernels {
-    dequant_bf16: crate::backend::gpu::CudaFunction,
-    dequant_f32: crate::backend::gpu::CudaFunction,
-    swap_halves: crate::backend::gpu::CudaFunction,
-    f16_to_bf16: crate::backend::gpu::CudaFunction,
-}
-
-impl QuantKernels {
-    fn new(ctx: &Arc<crate::backend::gpu::CudaContext>) -> Result<Self> {
-        let module = cubin::module(ctx, "q4_0_linear")?;
-        Ok(Self {
-            dequant_bf16: module.load_function("q4_0_dequant_bf16")?,
-            dequant_f32: module.load_function("q4_0_dequant_f32")?,
-            swap_halves: module.load_function("q4_0_dequant_swap_halves_bf16")?,
-            f16_to_bf16: module.load_function("f16_to_bf16")?,
-        })
     }
 }
 
@@ -155,6 +136,18 @@ impl EntryReader {
         let bytes = self.read(name, entry)?;
         ensure!(<bf16 as Element>::finite(bytes), "{name}: nonfinite value");
         destination.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Copies a quantized tensor's stored source bytes into host memory of exactly its size.
+    fn read_raw(&mut self, name: &str, entry: &TensorEntry, destination: &mut [u8]) -> Result<()> {
+        ensure!(
+            entry.bytes == destination.len(),
+            "{name}: {} B does not fill {} B",
+            entry.bytes,
+            destination.len()
+        );
+        destination.copy_from_slice(self.read(name, entry)?);
         Ok(())
     }
 
@@ -385,69 +378,22 @@ impl<'a> Source<'a> {
         };
         match quant {
             GgmlType::F32 | GgmlType::Bf16 => self.reader.upload(s, name, entry, destination),
-            GgmlType::F16 => {
-                ensure!(
-                    T::DTYPE == Dtype::BF16,
-                    "{name}: F16 GGUF source cannot fill a {:?} buffer",
-                    T::DTYPE
-                );
+            GgmlType::F16 | GgmlType::Q4_0 => {
                 let src = self.reader.read_device(s, name, entry)?;
                 let kernels = self.quant_kernels(s)?;
-                let n = destination.len() as u64;
-                unsafe {
-                    s.launch_builder(&kernels.f16_to_bf16)
-                        .arg(&src)
-                        .arg(destination)
-                        .arg(&(n as i64))
-                        .launch(flat(n as usize))?;
-                }
-                Ok(())
-            }
-            GgmlType::Q4_0 => {
-                let src = self.reader.read_device(s, name, entry)?;
-                let kernels = self.quant_kernels(s)?;
-                let blocks = entry.bytes / 18;
-                ensure!(
-                    blocks * 18 == entry.bytes && blocks * 32 == destination.len(),
-                    "{name}: {} source bytes do not fill a {}-element buffer",
-                    entry.bytes,
-                    destination.len()
-                );
-                if entry.swap_halves {
-                    ensure!(
-                        entry.dtype == Dtype::BF16
-                            && T::DTYPE == Dtype::BF16
-                            && entry.shape.len() == 2,
-                        "{name}: swap_halves needs a 2-D BF16 tensor"
-                    );
-                    let (rows, cols) = (entry.shape[0] as u64, entry.shape[1] as u64);
-                    unsafe {
-                        s.launch_builder(&kernels.swap_halves)
-                            .arg(&src)
-                            .arg(destination)
-                            .arg(&(rows as i64))
-                            .arg(&(cols as i64))
-                            .launch(flat((rows as usize) * (cols as usize) / 32))?;
-                    }
-                } else if T::DTYPE == Dtype::BF16 {
-                    unsafe {
-                        s.launch_builder(&kernels.dequant_bf16)
-                            .arg(&src)
-                            .arg(destination)
-                            .arg(&(blocks as i64))
-                            .launch(flat(blocks))?;
-                    }
-                } else if T::DTYPE == Dtype::F32 {
-                    unsafe {
-                        s.launch_builder(&kernels.dequant_f32)
-                            .arg(&src)
-                            .arg(destination)
-                            .arg(&(blocks as i64))
-                            .launch(flat(blocks))?;
-                    }
-                } else {
-                    bail!("{name}: Q4_0 source cannot fill a {:?} buffer", T::DTYPE);
-                }
+                let elements = destination.len();
+                let (pointer, _record) = destination.device_ptr_mut(s);
+                kernels.dequant(
+                    s,
+                    name,
+                    entry,
+                    DequantCopy {
+                        source: src.device_ptr(s).0,
+                        destination: pointer,
+                        elements,
+                        dtype: T::DTYPE,
+                    },
+                )?;
                 Ok(())
             }
             other => bail!("{name}: unsupported GGUF type {other:?}"),
@@ -1371,13 +1317,14 @@ fn cast_rows(
     Ok(())
 }
 
-/// Dense streaming of `layers` (per-layer matrix bytes, `largest` matrix) beside `owned` resident bytes: placement
-/// derived from free device memory and host RAM, or forced streamed / disk-only; host-tier copies are filled from
-/// `base` in `roles` order before the first `begin`.
+/// Dense streaming of `layers` (per-layer device matrix bytes, `largest` device matrix) beside `owned` resident bytes:
+/// placement derived from free device memory and host RAM, or forced streamed / disk-only. `source_layers` sizes the
+/// host/disk tier; it equals `layers` for a native BF16 manifest and is the stored source size for a quantized one.
+/// Host-tier copies are filled from `base` in `roles` order before the first `begin`.
 fn place_layers(
     d: &Device,
     base: &mut Source<'_>,
-    (layers, largest, owned, media): (&[usize], usize, usize, usize),
+    (layers, source_layers, largest, owned, media): (&[usize], &[usize], usize, usize, usize),
     placement: Placement,
     name: impl Fn(usize) -> String,
     roles: &[&str],
@@ -1390,7 +1337,7 @@ fn place_layers(
         ensure!(slots <= budget, "two block slots exceed the device budget");
         budget = slots;
     }
-    let mut plan = DensePlacement::new(layers, budget, 0)?;
+    let mut plan = DensePlacement::new(layers, Some(source_layers), budget, 0)?;
     let mut host = None;
     if plan.slot_bytes > 0 {
         let available = usize::try_from(crate::backend::cuda::calibrate::host_memory(Path::new(
@@ -1408,7 +1355,7 @@ fn place_layers(
             #[cfg(test)]
             Placement::StreamedDisk => 0,
         };
-        plan = DensePlacement::new(layers, budget, host_bytes)?;
+        plan = DensePlacement::new(layers, Some(source_layers), budget, host_bytes)?;
         host = Some(available);
     }
     ensure!(
@@ -1426,19 +1373,32 @@ fn place_layers(
             crate::backend::cuda::weights::DenseStreaming::new(&dir, base.manifest, plan, d)?;
         for layer in (0..layers.len()).filter(|&layer| host_tier[layer]) {
             let name = name(layer);
-            let (layout, elements) = matrix_layout(base.manifest, &name, roles)?;
+            let (layout, _) = matrix_layout(base.manifest, &name, roles)?;
             let host = dense
                 .host_layer(layer)?
                 .with_context(|| format!("{name}: host tier without a pinned copy"))?;
-            ensure!(host.len() == 2 * elements, "{name}: pinned copy size");
+            ensure!(
+                host.len() == source_layers[layer],
+                "{name}: pinned copy size"
+            );
+            let mut source_offset = 0usize;
             for (role, (offset, _)) in &layout {
                 let tensor = format!("{name}.{role}");
                 let entry = &base.manifest.entries[&tensor];
-                base.reader.read_into(
-                    &tensor,
-                    entry,
-                    &mut host[2 * offset..2 * offset + entry.bytes],
-                )?;
+                if entry.quant.is_some() {
+                    base.reader.read_raw(
+                        &tensor,
+                        entry,
+                        &mut host[source_offset..source_offset + entry.bytes],
+                    )?;
+                } else {
+                    base.reader.read_into(
+                        &tensor,
+                        entry,
+                        &mut host[2 * offset..2 * offset + entry.bytes],
+                    )?;
+                }
+                source_offset += entry.bytes;
             }
         }
         Some(dense)
@@ -1557,14 +1517,33 @@ impl Dit {
         let rotary = s.clone_htod(&crate::minimax_h3::rotary_table(spec, layout))?;
 
         let mut layers = vec![0usize; spec.layers];
+        let mut source_layers = vec![0usize; spec.layers];
         let mut largest = 0usize;
-        for entry in base.manifest.entries.values() {
+        for (name, entry) in &base.manifest.entries {
             if let Some(layer) = entry.layer
                 && entry.load
                 && entry.shape.len() == 2
             {
-                layers[layer as usize] += entry.bytes;
-                largest = largest.max(entry.bytes);
+                // A quantized entry's device slot holds its BF16 tile (`shape[0] * shape[1] * 2`); its stored
+                // source bytes stay in the host/disk tier. A quantized entry with no dequant path is an error,
+                // never an under-allocated slot.
+                let device_bytes = match entry.quant {
+                    Some(quant) => {
+                        ensure!(
+                            matches!(
+                                quant,
+                                GgmlType::Q4_0 | GgmlType::F16 | GgmlType::F32 | GgmlType::Bf16
+                            ),
+                            "{name}: quantized entry type {quant:?} has no dequant path"
+                        );
+                        ensure!(entry.shape.len() == 2, "{name}: quantized entry is not 2-D");
+                        2 * entry.shape[0] * entry.shape[1]
+                    }
+                    None => entry.bytes,
+                };
+                layers[layer as usize] += device_bytes;
+                source_layers[layer as usize] += entry.bytes;
+                largest = largest.max(device_bytes);
             }
         }
         let owned = lora
@@ -1578,7 +1557,7 @@ impl Dit {
         let dense = place_layers(
             d,
             &mut base,
-            (&layers, largest, owned, 0),
+            (&layers, &source_layers, largest, owned, 0),
             placement,
             |layer| format!("transformer_blocks.{layer}"),
             &LINEAR_ROLES,
@@ -2114,7 +2093,7 @@ impl Conditioner {
         let dense = place_layers(
             d,
             &mut base,
-            (&bytes, largest, owned, media),
+            (&bytes, &bytes, largest, owned, media),
             placement,
             name,
             &TEXT_ROLES,
@@ -2439,14 +2418,16 @@ pub(crate) fn draw_normals(
 
 /// Runs one MiniMax-H3 i2va request on GPU `device` with the transformer LoRA at `lora` (cuBLAS calibration under
 /// `runtime`) and returns its u8 frames and stereo PCM. The four noise draws are generated natively on device from
-/// `request.seed`; there is no recorded-draw path.
+/// `request.seed`; there is no recorded-draw path. `gguf` replaces the transformer safetensors with one
+/// community GGUF file.
 pub fn generate(
     model: &Path,
     lora: &Path,
     request: &crate::minimax_h3::H3Request,
     (device, runtime): (usize, &Path),
+    gguf: Option<&Path>,
 ) -> Result<crate::minimax_h3::H3Output> {
-    Ok(pipeline::run(model, lora, request, (device, runtime))?.output)
+    Ok(pipeline::run(model, lora, request, (device, runtime), gguf)?.output)
 }
 
 /// One Qwen3-VL conditioner prompt: prompt tokens with their image grids and packed `pixel_values`.
@@ -3106,6 +3087,9 @@ mod tests {
             "diffusion_pytorch_model",
         )?
         .minimax_h3_gguf_manifest(&spec, &gguf)?;
+        let transformer = model.join("transformer");
+        let official = MappedCheckpoint::open_component(&transformer, "diffusion_pytorch_model")?
+            .minimax_h3_manifest(&spec)?;
         let lora_dir = lora_path.parent().context("LoRA directory")?.to_owned();
         let stem = lora_path
             .file_name()
@@ -3193,6 +3177,7 @@ mod tests {
         };
         let reference_bf16 = output("bf16")?;
         let reference_fp32 = output("fp32")?;
+        let reference_official = output("official")?;
 
         let device = Device::new(0)?;
         let ops = Ops::new(&device.ctx)?;
@@ -3230,6 +3215,14 @@ mod tests {
             r,
             "transformer_blocks.0",
             &mut Source::new(gguf_dir, &wrong),
+            &mut Source::new(&lora_dir, &lora_manifest),
+        )?;
+        let official_weights = BlockWeights::resident(
+            s,
+            &spec,
+            r,
+            "transformer_blocks.0",
+            &mut Source::new(&transformer, &official),
             &mut Source::new(&lora_dir, &lora_manifest),
         )?;
         let mut work = BlockWork::new(s, &spec, r, rows)?;
@@ -3271,11 +3264,13 @@ mod tests {
         };
         let candidate = run(&weights)?;
         let control = run(&wrong_weights)?;
+        let engine_official = run(&official_weights)?;
 
-        // The reference's own FP32-vs-BF16 arm spread, and the engine's block-vs-definition arithmetic spread
-        // frozen by the N3 gate (evidence/H3/N2N5-r5/logs/N3-block0-A-nsys/raw.log, `candidate_vs_fp32`).
+        // The floor on this gate's own input: the reference's FP32-vs-BF16 arm spread, and the engine's
+        // block-vs-definition arithmetic spread measured here with the official BF16 weights on the same
+        // conditioning (the `official` arm shares the GGUF temb/rotary).
         let arm_floor = distance(&reference_bf16, &reference_fp32);
-        let engine_floor = [681.1484375, 0.005947928113812796, 0.9999847307784467];
+        let engine_floor = distance(&engine_official, &reference_official);
         let floor = [
             arm_floor[0].max(engine_floor[0]),
             arm_floor[1].max(engine_floor[1]),
@@ -3287,21 +3282,179 @@ mod tests {
         let rel_tau = (2.0 * floor[1]).max(1e-6);
         let cos_tau = 1.0 - 2.0 * (1.0 - floor[2]);
         let ok = d[0] <= abs_tau && d[1] <= rel_tau && d[2] >= cos_tau;
-        let caught = d_control[0] > 10.0 * abs_tau || d_control[1] > 10.0 * rel_tau;
+        let control_abs_ratio = d_control[0] / abs_tau;
+        let control_rel_ratio = d_control[1] / rel_tau;
+        let caught = control_abs_ratio > 10.0 || control_rel_ratio > 10.0;
         println!(
-            "H3_GGUF_BLOCK candidate={d:?} arm_floor={arm_floor:?} floor={floor:?} control={d_control:?} abs_tau={abs_tau} rel_tau={rel_tau} within={ok}"
+            "H3_GGUF_BLOCK candidate={d:?} arm_floor={arm_floor:?} engine_floor={engine_floor:?} floor={floor:?} control={d_control:?} control_abs_ratio={control_abs_ratio:.3} control_rel_ratio={control_rel_ratio:.3} abs_tau={abs_tau} rel_tau={rel_tau} within={ok}"
         );
         ensure!(
             candidate.iter().all(|v| v.is_finite()),
             "non-finite block output"
         );
+        ensure!(ok, "GGUF block output {d:?} outside the floor {floor:?}");
         ensure!(
-            ok,
-            "GGUF block output {d:?} outside the arm floor {floor:?}"
+            caught,
+            "unswapped-fc1 control stayed within 10x tau (abs {:.3}x, rel {:.3}x)",
+            control_abs_ratio,
+            control_rel_ratio
         );
-        ensure!(caught, "unswapped-fc1 control stayed within 10x tau");
         fs::remove_dir(&runtime)?;
         println!("H3_GGUF_BLOCK_GATE PASS control=FAIL_AS_REQUIRED");
+        Ok(())
+    }
+
+    /// The GGUF AdaLN gate: the 50 `adaln_proj` weights dequantized from the GGUF into the engine's AdaLN table,
+    /// against the definition's modulation for the same timesteps (the harness dump). The floor is the reference's
+    /// own FP32-vs-BF16 arm spread; the control swaps the video/audio tags.
+    #[test]
+    #[ignore = "FF_MODEL, FF_H3_GGUF, FF_H3_GGUF_ADALN_OUT"]
+    fn gguf_adaln_matches_the_definition_modulation() -> Result<()> {
+        let var = |key: &str| {
+            std::env::var_os(key)
+                .map(PathBuf::from)
+                .with_context(|| format!("{key} missing"))
+        };
+        let model = var("FF_MODEL")?;
+        let gguf_path = var("FF_H3_GGUF")?;
+        let out = var("FF_H3_GGUF_ADALN_OUT")?;
+        let spec = H3Spec::read(&model)?;
+        let gguf = crate::gguf::GgufFile::open(&gguf_path)?;
+        let checkpoint = MappedCheckpoint::open_component(
+            &model.join("transformer"),
+            "diffusion_pytorch_model",
+        )?;
+        let manifest = checkpoint.minimax_h3_gguf_manifest(&spec, &gguf)?;
+
+        let adaln_map = mapped(&out.join("adaln.safetensors"))?;
+        let adaln = SafeTensors::deserialize(&adaln_map)?;
+        let timesteps_tensor = adaln.tensor("timesteps")?;
+        ensure!(
+            timesteps_tensor.dtype() == Dtype::F32 && timesteps_tensor.shape().len() == 1,
+            "timesteps {:?} {:?}",
+            timesteps_tensor.dtype(),
+            timesteps_tensor.shape()
+        );
+        let timesteps: Vec<f32> = timesteps_tensor
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        let width = 6 * spec.hidden;
+        let modulation = |arm: &str| -> Result<Vec<bf16>> {
+            let tensor = adaln.tensor(&format!("modulation_{arm}"))?;
+            ensure!(
+                tensor.shape().len() == 2
+                    && tensor.shape()[0] == timesteps.len() * MODALITIES as usize
+                    && tensor.shape()[1] == width,
+                "modulation_{arm} {:?} {:?} for {} timesteps",
+                tensor.dtype(),
+                tensor.shape(),
+                timesteps.len()
+            );
+            Ok(match tensor.dtype() {
+                Dtype::BF16 => tensor
+                    .data()
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| bf16::from_le_bytes(*b))
+                    .collect(),
+                Dtype::F32 => tensor
+                    .data()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| bf16::from_f32(f32::from_le_bytes(*b)))
+                    .collect(),
+                other => bail!("modulation_{arm} dtype {other:?}"),
+            })
+        };
+        let to_f64 = |values: &[bf16]| -> Vec<f64> {
+            values.iter().map(|&v| f64::from(v.to_f32())).collect()
+        };
+        let expected_bf16 = to_f64(&modulation("bf16")?);
+        let expected_fp32 = to_f64(&modulation("fp32")?);
+        let floor = distance(&expected_bf16, &expected_fp32);
+
+        let pairs: Vec<(u32, u8)> = (0..timesteps.len() as u32)
+            .flat_map(|t| (0..MODALITIES).map(move |tag| (t, tag as u8)))
+            .collect();
+        let plan = AdalnPlan {
+            timesteps: timesteps.clone(),
+            pairs: pairs.clone(),
+            row_pairs: Vec::new(),
+            row_timesteps: Vec::new(),
+        };
+
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let runtime = std::env::temp_dir().join(format!("ff-h3-gguf-adaln-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let mut blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(true, "MiniMax-H3 GGUF AdaLN gate".into())),
+        )?;
+        let gguf_dir = gguf_path.parent().context("GGUF directory")?;
+        let table = AdalnTable::build(
+            &device,
+            &mut blas,
+            gguf_dir,
+            &checkpoint,
+            &manifest,
+            &spec,
+            &plan,
+        )?;
+        let blocks: Vec<f64> = s
+            .clone_dtoh(&table.blocks)?
+            .into_iter()
+            .map(|v| f64::from(v.to_f32()))
+            .collect();
+        fs::remove_dir(&runtime)?;
+
+        let mut candidate = Vec::new();
+        let mut expected = Vec::new();
+        let mut control_candidate = Vec::new();
+        let mut control_expected = Vec::new();
+        for layer in 0..spec.layers {
+            for (pair, &(t, tag)) in pairs.iter().enumerate() {
+                let row = layer * pairs.len() + pair;
+                let c = &blocks[row * width..][..width];
+                let mrow = (t as usize * MODALITIES as usize + usize::from(tag)) * width;
+                candidate.extend_from_slice(c);
+                expected.extend_from_slice(&expected_bf16[mrow..mrow + width]);
+                if tag != 1 {
+                    control_candidate.extend_from_slice(c);
+                    let other = t as usize * MODALITIES as usize + (2 - usize::from(tag));
+                    control_expected.extend_from_slice(&expected_bf16[other * width..][..width]);
+                }
+            }
+        }
+        let d = distance(&candidate, &expected);
+        let d_control = distance(&control_candidate, &control_expected);
+        let abs_tau = (2.0 * floor[0]).max(1e-5);
+        let rel_tau = (2.0 * floor[1]).max(1e-6);
+        let cos_tau = 1.0 - 2.0 * (1.0 - floor[2]);
+        let ok = d[0] <= abs_tau && d[1] <= rel_tau && d[2] >= cos_tau;
+        let caught = d_control[0] > 10.0 * abs_tau || d_control[1] > 10.0 * rel_tau;
+        println!(
+            "H3_GGUF_ADALN timesteps={} pairs={} candidate={d:?} arm_floor={floor:?} control={d_control:?} abs_tau={abs_tau} rel_tau={rel_tau} within={ok}",
+            timesteps.len(),
+            pairs.len()
+        );
+        ensure!(
+            candidate.iter().all(|v| v.is_finite()),
+            "non-finite AdaLN table"
+        );
+        ensure!(ok, "GGUF AdaLN table {d:?} outside the arm floor {floor:?}");
+        ensure!(caught, "tag-swap control stayed within 10x tau");
+        println!("H3_GGUF_ADALN_GATE PASS control=FAIL_AS_REQUIRED");
         Ok(())
     }
 
@@ -4809,7 +4962,7 @@ mod tests {
         let mut seed43 = None;
         for (cell, seed) in [("A", 42), ("P", 42), ("B", 42), ("A", 43)] {
             let request = seeded_request(&s0, cell, seed)?;
-            let generated = super::pipeline::run(&model, &lora, &request, (0, &runtime))?;
+            let generated = super::pipeline::run(&model, &lora, &request, (0, &runtime), None)?;
             let o = &generated.output;
             println!(
                 "H3_E2E cell={cell} seed={seed} frames={} size={}x{} samples={} rate={} video_u8_mean={:.3}",
@@ -5080,6 +5233,76 @@ mod tests {
             bail!("H3_N9C_GATE DEFECT streams outside frozen bounds: {defects:?}");
         }
         println!("H3_N9C_GATE PASS streams=8 controls_detected=8");
+        Ok(())
+    }
+
+    /// GGUF measurement: one recorded cell A run twice through `generate`, once with the official BF16 transformer
+    /// manifest and once with the community GGUF, and the frames/PCM distance printed. The two arms share the
+    /// recorded request, so only the transformer weights differ; the numbers are a measurement, not a gate.
+    #[test]
+    #[ignore = "FF_MODEL, FF_H3_GGUF, FF_H3_LORA, FF_H3_S0, FF_H3_E2E_NOISE, FF_H3_E2E_OUT"]
+    fn gguf_end_to_end_measurement_against_the_bf16_path() -> Result<()> {
+        let var = |key: &str| -> Result<PathBuf> {
+            Ok(PathBuf::from(
+                std::env::var_os(key).with_context(|| format!("{key} missing"))?,
+            ))
+        };
+        let (model, gguf, lora, s0, noise, out) = (
+            var("FF_MODEL")?,
+            var("FF_H3_GGUF")?,
+            var("FF_H3_LORA")?,
+            var("FF_H3_S0")?,
+            var("FF_H3_E2E_NOISE")?,
+            var("FF_H3_E2E_OUT")?,
+        );
+        let request = recorded_request(&s0, &noise, "A")?;
+        let runtime = std::env::temp_dir().join(format!("ff-h3-gguf-e2e-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let bf16 = super::generate(&model, &lora, &request, (0, &runtime), None)?;
+        let quantized = super::generate(&model, &lora, &request, (0, &runtime), Some(&gguf))?;
+        fs::remove_dir_all(&runtime)?;
+        let (a, b) = (&bf16, &quantized);
+        ensure!(
+            a.frames == b.frames
+                && a.height == b.height
+                && a.width == b.width
+                && a.video.len() == b.video.len()
+                && a.samples == b.samples
+                && a.audio.len() == b.audio.len(),
+            "the two arms differ in extent"
+        );
+        ensure!(b.audio.iter().all(|v| v.is_finite()), "non-finite GGUF PCM");
+        let video: Vec<f64> = a.video.iter().map(|&v| f64::from(v)).collect();
+        let video_b: Vec<f64> = b.video.iter().map(|&v| f64::from(v)).collect();
+        let pcm: Vec<f64> = a.audio.iter().map(|&v| f64::from(v)).collect();
+        let pcm_b: Vec<f64> = b.audio.iter().map(|&v| f64::from(v)).collect();
+        let video_d = distance(&video, &video_b);
+        let pcm_d = distance(&pcm, &pcm_b);
+        ensure!(
+            a.video != b.video || a.audio != b.audio,
+            "the GGUF arm left the output unchanged"
+        );
+        let dir = out.join("A-gguf");
+        fs::create_dir_all(&dir)?;
+        let mut t = crate::tensors::Tensors::default();
+        t.u8(
+            "video_u8".into(),
+            vec![b.frames, b.height, b.width, 3],
+            &b.video,
+        )?;
+        t.f32("audio_decoded".into(), vec![2, 1, b.samples], &b.audio)?;
+        t.save_new(
+            &dir.join("native.safetensors"),
+            [("sampling_rate".to_owned(), b.sampling_rate.to_string())].into(),
+        )?;
+        println!(
+            "H3_GGUF_E2E cell=A frames={} video_max_abs={:.6e} video_rel_rms={:.6e} video_cosine={:.9} pcm_max_abs={:.6e} pcm_rel_rms={:.6e} pcm_cosine={:.9}",
+            b.frames, video_d[0], video_d[1], video_d[2], pcm_d[0], pcm_d[1], pcm_d[2]
+        );
+        println!(
+            "H3_GGUF_E2E_MEASUREMENT frames={} video={video_d:?} pcm={pcm_d:?}",
+            b.frames
+        );
         Ok(())
     }
 

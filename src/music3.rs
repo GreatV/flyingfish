@@ -652,7 +652,7 @@ impl ArCheckpoint {
             transient_bytes,
             0,
         )?;
-        let preliminary = DensePlacement::new(&layers, budget, 0)?;
+        let preliminary = DensePlacement::new(&layers, None, budget, 0)?;
         let host_staging = if preliminary.slot_bytes == 0 {
             0
         } else {
@@ -670,7 +670,7 @@ impl ArCheckpoint {
             .host_available
             .checked_sub(host_fixed_bytes)
             .context("AR features, pinned staging and host reserve exceed available host memory")?;
-        let placement = DensePlacement::new(&layers, budget, host_budget)?;
+        let placement = DensePlacement::new(&layers, None, budget, host_budget)?;
         let device_bytes = fixed_weights
             .checked_add(transient_bytes)
             .and_then(|n| n.checked_add(placement.resident_bytes))

@@ -64,10 +64,22 @@ impl DensePlacement {
             .context("dense fixed weights, media and workspace exceed VRAM")
     }
 
-    pub fn new(layers: &[usize], device_bytes: usize, host_bytes: usize) -> Result<Self> {
+    /// `host_layers` sizes the host/disk tier per layer; `None` makes it the device size, the native BF16 form.
+    /// A quantized manifest passes the stored source bytes here and the BF16 tile size in `layers`.
+    pub fn new(
+        layers: &[usize],
+        host_layers: Option<&[usize]>,
+        device_bytes: usize,
+        host_bytes: usize,
+    ) -> Result<Self> {
         ensure!(
             !layers.is_empty() && layers.iter().all(|&n| n > 0),
             "empty dense layer extent"
+        );
+        let host_layers = host_layers.unwrap_or(layers);
+        ensure!(
+            host_layers.len() == layers.len() && host_layers.iter().all(|&n| n > 0),
+            "dense host layer extent differs from the device layers"
         );
         let total = layers.iter().try_fold(0usize, |sum, &n| {
             sum.checked_add(n).context("dense weight extent overflow")
@@ -132,19 +144,27 @@ impl DensePlacement {
             }
         }
         let mut remaining = host_bytes;
+        let mut streamed_device = 0usize;
+        let mut streamed_source = 0usize;
         for &i in &order {
             if plan.slots[i].is_some() {
-                if layers[i] <= remaining {
+                streamed_device += layers[i];
+                streamed_source += host_layers[i];
+                if host_layers[i] <= remaining {
                     plan.host[i] = true;
-                    remaining -= layers[i];
-                    plan.host_bytes += layers[i];
+                    remaining -= host_layers[i];
+                    plan.host_bytes += host_layers[i];
                 } else {
-                    plan.disk_bytes += layers[i];
+                    plan.disk_bytes += host_layers[i];
                 }
             }
         }
         ensure!(
-            plan.resident_bytes + plan.host_bytes + plan.disk_bytes == total,
+            plan.resident_bytes + streamed_device == total,
+            "dense device byte conservation"
+        );
+        ensure!(
+            plan.host_bytes + plan.disk_bytes == streamed_source,
             "dense tier byte conservation"
         );
         Ok(plan)
@@ -246,14 +266,14 @@ mod tests {
         let media = media_weights + media_workspace + request_buffers;
         let layers = [256usize << 20; 48];
         let budget = DensePlacement::device_budget(total, total, fixed, transient, media)?;
-        let plan = DensePlacement::new(&layers, budget, 4 << 30)?;
+        let plan = DensePlacement::new(&layers, None, budget, 4 << 30)?;
         assert!(plan.slot_bytes > 0);
         assert!(
             plan.resident_bytes + 2 * plan.slot_bytes + fixed + transient + media
                 <= total - total / 16
         );
         let old_budget = DensePlacement::device_budget(total, total, fixed, transient, 0)?;
-        let old = DensePlacement::new(&layers, old_budget, 4 << 30)?;
+        let old = DensePlacement::new(&layers, None, old_budget, 4 << 30)?;
         assert_eq!(old.slot_bytes, 0);
         assert!(old.resident_bytes + fixed + transient + media > total - total / 16);
         assert!(DensePlacement::device_budget(total, total, fixed, transient, total).is_err());
@@ -285,7 +305,7 @@ mod tests {
             ),
             (vec![13, 29, 17, 29, 13], 78, 17),
         ] {
-            let plan = DensePlacement::new(&layers, device, host)?;
+            let plan = DensePlacement::new(&layers, None, device, host)?;
             assert!(plan.resident_bytes + 2 * plan.slot_bytes <= device);
             assert!(plan.host_bytes <= host);
             assert_eq!(
@@ -304,11 +324,11 @@ mod tests {
             }
             assert!(sequence > 0);
         }
-        let resident = DensePlacement::new(&[13, 29, 17], 59, 0)?;
+        let resident = DensePlacement::new(&[13, 29, 17], None, 59, 0)?;
         assert_eq!(resident.slot_bytes, 0);
-        assert!(DensePlacement::new(&[13, 29, 17], 25, 100).is_err());
-        assert!(DensePlacement::new(&[usize::MAX, 1], usize::MAX, 0).is_err());
-        assert!(DensePlacement::new(&[0], 1, 0).is_err());
+        assert!(DensePlacement::new(&[13, 29, 17], None, 25, 100).is_err());
+        assert!(DensePlacement::new(&[usize::MAX, 1], None, usize::MAX, 0).is_err());
+        assert!(DensePlacement::new(&[0], None, 1, 0).is_err());
         Ok(())
     }
 
