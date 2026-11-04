@@ -1,33 +1,54 @@
 # flyingfish
 
-LLM inference engine in Rust, targeting near-roofline decode and prefill on consumer and workstation GPUs.
+Inference engine in Rust for language, multimodal, diffusion and media-generation models, targeting near-roofline decode and prefill on consumer and workstation GPUs.
 
-- **Hardware-adaptive.** At setup the engine reads GPU memory, SM count, PCIe bandwidth, host RAM and cgroup limits, and derives the execution plan from them: chunk sizes, graph shapes and expert placement.
-- **MoE expert tiering.** Experts live across GPU slots, pinned host memory and NVMe, with a CPU expert path for host-resident experts.
+- **Hardware-adaptive.** At setup the engine reads GPU memory, SM count, PCIe bandwidth, host RAM and cgroup limits, and derives the execution plan from them: chunk sizes, graph shapes, dense-layer streaming and expert placement.
+- **MoE expert tiering.** Experts live across GPU slots, pinned host memory and NVMe, with a CPU expert path for host-resident experts whose arithmetic matches the GPU reduction.
 - **Speculative decoding.** MTP heads and DSpark draft models, with verification on the target model.
-- **Published weights only.** Checkpoints are computed in their published format (BF16, FP8). Nothing is requantized or converted.
+- **Published weights only.** Checkpoints are computed in their published format (BF16, F16, F32, FP8, E2M1 experts). Nothing is requantized or converted.
+- **One kernel source for two vendors.** The CUDA C++ kernels compile with `nvcc` for NVIDIA and with `hipcc` for AMD; the host engine is shared and the device layer is selected at build time.
 
 ## Models
 
-| Model | Architecture | Weights | Notes |
-|---|---|---|---|
-| Qwen3.8-27B | `Qwen3_5ForConditionalGeneration` | BF16, FP8 | MTP up to depth 4 |
-| MiniCPM-V-4.7 | `MiniCPMV4_7ForConditionalGeneration` | BF16, FP8 | MoE expert tiering, DSpark draft, image input |
-| MiniCPM5-2B | `LlamaForCausalLM` | BF16 | DSpark draft |
-| Flint | `FlintForCausalLM` | BF16 | MoE expert tiering, sliding-window attention with sinks |
+Language and multimodal models:
 
-In progress: GLM-5.3-Flash and DeepSeek-V4.1-Flash.
+| Model | Architecture | Notes | Backends |
+|---|---|---|---|
+| Qwen3.8-27B | `Qwen3_5ForConditionalGeneration` | BF16 and FP8; MTP up to depth 4; image input | CUDA, ROCm |
+| MiniCPM-V-4.7 | `MiniCPMV4_7ForConditionalGeneration` | BF16 and FP8; MoE expert tiering, DSpark draft, image input | CUDA, ROCm |
+| MiniCPM5-2B | `LlamaForCausalLM` | DSpark draft | CUDA, ROCm |
+| Flint | `FlintForCausalLM` | MoE expert tiering, sliding-window attention with sinks | CUDA, ROCm |
+| LoopVL | `LoopVLForConditionalGeneration` | Recurrent text decode, image input with prefix attention | CUDA, ROCm |
+| DeepSeek-V4.1-Flash | `DeepseekV41ForCausalLM` | Block FP8 projections, E2M1 experts, compressed latent attention, mHC | CUDA |
+| Gemma 4 E2B, E4B, 12B, 31B | `Gemma4ForConditionalGeneration`, `Gemma4UnifiedForConditionalGeneration` | Text for all sizes; image and audio input for E2B and E4B; 12B and 31B stream dense layers when they do not fit | CUDA |
+| EmbeddingGemma-2 | `EmbeddingGemma2Model` | Text, image and audio embeddings | CUDA |
+
+Diffusion language models:
+
+| Model | Architecture | Notes | Backends |
+|---|---|---|---|
+| Clover-35B-A3B | `CloverMoeModelLM` | Canvas inference with tiered experts | CUDA |
+| DiffusionGemma-26B-A4B | `DiffusionGemmaForBlockDiffusion` | Canvas inference | CUDA |
+
+Media generation (library entry points, no CLI):
+
+| Model | Notes | Backends |
+|---|---|---|
+| MiniMax-H3 | Image and text to video with audio: Qwen3-VL conditioner, streamed diffusion transformer with Turbo LoRA, video and audio decoders, native prompt, canvas and keyframe producers; `flyingfish::minimax_h3::generate` | CUDA |
+| MiniMax-Music3 | Autoregressive stage and synthesis stage (condition encoder, flow transformer with guidance, vocoder) | CUDA |
+
+In progress: GLM-5.3-Flash; Gemma 4 12B and 31B image and audio input; MiniMax-H3 native noise sampling and GGUF Q4_0 weights; a single MiniMax-Music3 entry from tokens to audio; Pixal3D image-to-3D (image conditioning landed, sparse-structure and shape flows in progress); Idol image-to-3D Gaussians (DINOv3 and FLUX.2 VAE encoders landed, denoiser and decoders in progress).
 
 ## Platforms
 
 | Platform | Backend | Status |
 |---|---|---|
 | NVIDIA Ampere / Ada (sm_86, sm_89) | CUDA | Supported |
+| AMD RDNA3 (gfx1100) | ROCm / HIP | Supported for the models marked ROCm above |
 | NVIDIA Blackwell (sm_120) | CUDA | In progress |
 | Apple Silicon | Metal | Planned |
-| AMD | ROCm / HIP | Planned |
 
-Multi-GPU expert placement (layer split across devices) is in progress.
+Two-GPU MoE expert residency with peer compute is supported.
 
 ## Build
 
@@ -60,6 +81,14 @@ This builds `flyingfish` and `ff`. `ff` is a short alias: it runs the `flyingfis
 Kernels are compiled for the GPUs that `nvidia-smi` reports. To build without a GPU visible, set the target explicitly, for example `CUDA_ARCH_LIST=89`.
 
 `cargo build --no-default-features` builds the host-side code without CUDA. It has no GPU inference path.
+
+For AMD GPUs, build the ROCm backend instead of CUDA:
+
+```sh
+cargo build --release --no-default-features --features rocm
+```
+
+It needs `hipcc` (found through `HIP_HOME`, `ROCM_PATH` or `PATH`) and the hipBLAS and hipBLASLt libraries. Kernels are compiled for the architectures that `rocminfo` reports; set `ROCM_ARCH_LIST` (for example `gfx1100`) to build without a GPU visible.
 
 ## Usage
 
