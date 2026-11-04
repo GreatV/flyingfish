@@ -2758,7 +2758,7 @@ impl Engine {
         #[cfg(feature = "rocm")]
         ensure!(
             self.model_spec.architecture != crate::model_spec::Architecture::Gemma4,
-            "Gemma 4 media on HIP requires unavailable D72 vision and D256 image-block attention kernels"
+            "Gemma 4 media attention kernels are not built for HIP"
         );
         ensure!(self.qwen.is_some(), "packed images require Qwen");
         ensure!(

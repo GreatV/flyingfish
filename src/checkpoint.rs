@@ -3216,6 +3216,7 @@ pub enum LoadPolicy {
     TextWithVision,
     /// For the standalone vision component; cannot construct a text Engine.
     VisionOnly,
+    /// Audio component attached to an existing text engine.
     AudioOnly,
     TextWithMtp,
     /// Only MTP and the shared embedding/head; no target layers or final norm.

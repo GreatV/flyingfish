@@ -902,7 +902,7 @@ impl Engine {
         #[cfg(feature = "rocm")]
         ensure!(
             spec.architecture != crate::model_spec::Architecture::Gemma4,
-            "Gemma 4 media on HIP requires unavailable D72 vision and D256 image-block attention kernels"
+            "Gemma 4 media attention kernels are not built for HIP"
         );
         let plan = input.validate(&spec, capacity)?;
         if let Some(chunk) = requested_chunk

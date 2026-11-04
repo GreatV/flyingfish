@@ -944,6 +944,7 @@ fn sparse_attention(gate: &mut Gate, model: &Path, runtime: &Path, root: &Path) 
             out: &mut output,
             keys: n,
             prefix: None,
+            image_blocks: None,
             shape: Shape {
                 rows: 127,
                 start: 0,
