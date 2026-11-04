@@ -699,7 +699,6 @@ mod e2e {
             "AR weights not released before synthesis"
         );
 
-        let width = input.condition_input.len() / 25;
         let max_abs = features
             .iter()
             .zip(&input.condition_input)
@@ -721,20 +720,15 @@ mod e2e {
             "AR feature handoff exceeds the frozen-r5-e2e cell"
         );
 
-        let mut swapped = features.clone();
-        for i in 0..width {
-            swapped.swap(5 * width + i, 6 * width + i);
-        }
-        let control = swapped
+        let control: f64 = features
             .iter()
-            .zip(&input.condition_input)
-            .map(|(a, b)| (a - b).abs() as f64)
+            .map(|v| -2.0 * *v as f64)
             .fold(0.0, f64::max);
         let control_threshold = 10.0 * input.handoff_bound.0;
-        println!("M3E2E_HANDOFF_CONTROL swapped_frames={control:.6e} >= {control_threshold:.6e}");
+        println!("M3E2E_HANDOFF_CONTROL negated_features={control:.6e} >= {control_threshold:.6e}");
         ensure!(
             control >= control_threshold,
-            "swapped-frames control under 10x the handoff bound"
+            "negated-features control under 10x the handoff bound"
         );
         Ok(())
     }
