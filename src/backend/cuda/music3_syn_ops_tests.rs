@@ -881,21 +881,9 @@ mod e2e {
                 return Ok(());
             }
         };
-        let oracle = std::path::PathBuf::from(frozen["oracle"].as_str().context("oracle path")?);
-        let arm_bytes = std::fs::read(
-            oracle
-                .parent()
-                .context("oracle parent")
-                .map(|p| p.to_path_buf())?,
+        let arm_file = std::path::PathBuf::from(
+            std::env::var("FF_MUSIC3_E2E_DRAW_ARM").context("drawn-chain arm capture")?,
         );
-        let _ = arm_bytes;
-        let arm_path = frozen["oracle"].as_str().context("oracle")?;
-        let arm_root = std::path::Path::new(arm_path);
-        let arm_file = if arm_root.is_file() {
-            arm_root.to_path_buf()
-        } else {
-            arm_root.join("capture.safetensors")
-        };
         let arm_bytes = std::fs::read(&arm_file)?;
         let view = SafeTensors::deserialize(&arm_bytes)?;
         let want = tensor_f32(&view, "final_audio")?;
