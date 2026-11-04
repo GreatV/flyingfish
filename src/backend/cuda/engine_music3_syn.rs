@@ -25,14 +25,13 @@ pub struct Music3Syn {
     silu: CudaFunction,
     silu_mul: CudaFunction,
     bias: CudaFunction,
-    add_inplace: CudaFunction,
+    add_scale: CudaFunction,
     cond_sum: CudaFunction,
     pad_rows_n: CudaFunction,
     nearest_rows: CudaFunction,
     snake_rows: CudaFunction,
     tanh_fn: CudaFunction,
     transpose: CudaFunction,
-    euler_fn: CudaFunction,
     im2col: CudaFunction,
     conv_transpose: CudaFunction,
     guided_euler: CudaFunction,
@@ -49,20 +48,12 @@ pub struct Conv1dSite<'a> {
     pub x: &'a CudaSlice<f32>,
     pub rows: usize,
     pub in_dim: usize,
+    pub out_dim: usize,
     pub out: &'a mut CudaSlice<f32>,
     pub bias: &'a CudaSlice<u8>,
     pub dilation: usize,
-}
-
-/// One batched CFG flow call site.
-pub struct PairFlowCall<'a> {
-    pub ws: &'a mut Workspace,
-    pub x_t: &'a CudaSlice<f32>,
-    pub t: f32,
-    pub cond: &'a CudaSlice<f32>,
-    pub length: usize,
-    pub v_cond: &'a mut CudaSlice<f32>,
-    pub v_unc: &'a mut CudaSlice<f32>,
+    pub padded: &'a mut CudaSlice<f32>,
+    pub cols: &'a mut CudaSlice<f32>,
 }
 
 /// Preallocated activation buffers for the synthesis path, sized at load
@@ -86,12 +77,23 @@ pub struct Workspace {
     pub t1: CudaSlice<f32>,
     pub temb: CudaSlice<f32>,
     pub x: CudaSlice<f32>,
-    pub v_cond: CudaSlice<f32>,
-    pub v_unc: CudaSlice<f32>,
+    pub pair_v_c: CudaSlice<f32>,
+    pub pair_v_u: CudaSlice<f32>,
     pub cond: CudaSlice<f32>,
     pub zeros_cond: CudaSlice<f32>,
     pub rotary_cos: CudaSlice<f32>,
     pub rotary_sin: CudaSlice<f32>,
+    pub voc_x: CudaSlice<f32>,
+    pub voc_dec: CudaSlice<f32>,
+    pub voc_cur: CudaSlice<f32>,
+    pub voc_next: CudaSlice<f32>,
+    pub voc_sn1: CudaSlice<f32>,
+    pub voc_conv: CudaSlice<f32>,
+    pub voc_sn2: CudaSlice<f32>,
+    pub voc_gated: CudaSlice<f32>,
+    pub voc_pad: CudaSlice<f32>,
+    pub voc_cols: CudaSlice<f32>,
+    pub voc_out: CudaSlice<f32>,
 }
 
 fn f32_matrix(
@@ -199,21 +201,20 @@ impl Music3Syn {
             silu: kernel(&act, "silu_f32")?,
             silu_mul: kernel(&act, "silu_mul_f32")?,
             bias: kernel(&vision, "vision_bias_f32")?,
-            add_inplace: kernel(&common, "add_inplace_f32")?,
+            add_scale: kernel(&common, "add_scale_f32")?,
             cond_sum: kernel(&common, "weighted_layer_sum_f32")?,
             pad_rows_n: kernel(&common, "pad_rows_n_f32")?,
             nearest_rows: kernel(&common, "nearest_rows_f32")?,
             snake_rows: kernel(&common, "snake_rows_f32")?,
             tanh_fn: kernel(&common, "tanh_f32")?,
             transpose: kernel(&common, "transpose_f32")?,
-            euler_fn: kernel(&common, "euler_update_f32")?,
             im2col: kernel(&common, "conv_im2col_f32")?,
             conv_transpose: kernel(&common, "conv_transpose_rows_f32")?,
             guided_euler: kernel(&common, "guided_euler_f32")?,
             cond_weights,
             cond_scale,
-            // Pipeline denoise block config: guidance_scale 1.7 (pinned
-            // definition, modular_pipelines/minimax_music3/denoise.py:180).
+            // Guidance 1.7 and 30 steps are the model definition's
+            // denoise defaults (denoise.py), not published config keys.
             guidance_scale: 1.7,
             vocoder_folds,
             max_length,
@@ -306,10 +307,11 @@ impl Music3Syn {
             &mut pre.slice_mut(0..concat_width * length),
         )?;
         unsafe {
-            s.launch_builder(&self.add_inplace)
+            s.launch_builder(&self.add_scale)
                 .arg(&mut pre)
                 .arg(&mut hidden)
                 .arg(&((concat_width * length) as i64))
+                .arg(&1.0f32)
                 .launch(super::ops::flat(concat_width * length))?;
         }
 
@@ -327,10 +329,9 @@ impl Music3Syn {
         let l2b_ptr = self.weights.flow.time_l2_b.device_ptr(s).0;
         let mut temb = ws.temb.slice_mut(0..ws.temb.len());
         let mut fourier = ws.fourier.slice_mut(0..ws.fourier.len());
-        let t_dev = s.clone_htod(&[t])?;
         unsafe {
             s.launch_builder(&self.fourier)
-                .arg(&t_dev)
+                .arg(&t)
                 .arg(&self.weights.flow.time_proj)
                 .arg(&mut fourier)
                 .arg(&((fourier_dim / 2) as u32))
@@ -496,10 +497,11 @@ impl Music3Syn {
                 &mut ff_out.slice_mut(0..dim * tokens),
             )?;
             unsafe {
-                s.launch_builder(&self.add_inplace)
+                s.launch_builder(&self.add_scale)
                     .arg(&mut wide)
                     .arg(&mut ff_out)
                     .arg(&((dim * tokens) as i64))
+                    .arg(&1.0f32)
                     .launch(super::ops::flat(dim * tokens))?;
             }
 
@@ -552,10 +554,11 @@ impl Music3Syn {
                     .arg(&(tokens as u32))
                     .arg(&(dim as u32))
                     .launch(super::ops::flat(dim * tokens))?;
-                s.launch_builder(&self.add_inplace)
+                s.launch_builder(&self.add_scale)
                     .arg(&mut wide)
                     .arg(&mut ff_out)
                     .arg(&((dim * tokens) as i64))
+                    .arg(&1.0f32)
                     .launch(super::ops::flat(dim * tokens))?;
             }
         }
@@ -605,41 +608,10 @@ impl Music3Syn {
         out
     }
 
-    /// One Euler update: x += (sigma_next - sigma) * velocity.
-    pub fn euler_step(
-        &self,
-        x: &mut CudaSlice<f32>,
-        velocity: &CudaSlice<f32>,
-        sigma: f32,
-        sigma_next: f32,
-    ) -> Result<()> {
-        ensure!(x.len() == velocity.len(), "euler extent mismatch");
-        let count = x.len();
-        unsafe {
-            self.stream
-                .launch_builder(&self.euler_fn)
-                .arg(&mut *x)
-                .arg(velocity)
-                .arg(&(sigma_next - sigma))
-                .arg(&(count as i64))
-                .launch(super::ops::flat(count))?;
-        }
-        Ok(())
-    }
-
     /// One batched CFG flow call: branch 0 conditions on `cond`, branch 1 on
     /// zeros; both share `x_t` (one weight read per pair). Writes branch
     /// velocities channel-major [in_channels, length] each.
-    pub fn flow_velocity_pair(&self, call: PairFlowCall<'_>) -> Result<()> {
-        let PairFlowCall {
-            ws,
-            x_t,
-            t,
-            cond,
-            length,
-            v_cond,
-            v_unc,
-        } = call;
+    pub fn flow_velocity_pair(&self, ws: &mut Workspace, t: f32, length: usize) -> Result<()> {
         let s = &self.stream;
         let dim = self.spec.flow_dim() as usize;
         let concat_width = self.spec.concat_channels() as usize;
@@ -651,21 +623,18 @@ impl Music3Syn {
         let rotary_dim = self.spec.rotary_dim as usize;
         let tokens = length + 1;
         let pair_tokens = 2 * tokens;
-        ensure!(
-            x_t.len() == channels * length
-                && cond.len() == length * dim
-                && v_cond.len() == channels * length
-                && v_unc.len() == channels * length
-                && length <= self.max_length,
-            "flow_velocity_pair extent mismatch"
-        );
+        ensure!(length <= self.max_length, "flow_velocity_pair length");
+        let cond_branch: &CudaSlice<f32> = &ws.cond;
+        let zeros_branch: &CudaSlice<f32> = &ws.zeros_cond;
 
         // Branch concat halves into one [2*length, concat_width] buffer.
+        // Branch 0 carries ws.cond, branch 1 the zero condition.
         for branch in 0..2 {
-            let cond_branch = if branch == 0 {
-                cond.clone()
+            let x_t: &CudaSlice<f32> = &ws.x;
+            let cond_in = if branch == 0 {
+                cond_branch
             } else {
-                ws.zeros_cond.clone()
+                zeros_branch
             };
             let mut hidden = ws.hidden.slice_mut(0..2 * length * concat_width);
             let base = branch * length * concat_width;
@@ -673,7 +642,7 @@ impl Music3Syn {
             unsafe {
                 s.launch_builder(&self.concat)
                     .arg(x_t)
-                    .arg(&cond_branch)
+                    .arg(cond_in)
                     .arg(&mut half)
                     .arg(&(length as i64))
                     .arg(&(channels as i32))
@@ -695,10 +664,11 @@ impl Music3Syn {
         let hidden_ptr = ws.hidden.device_ptr(s).0;
         let pre_ptr = ws.pre.device_ptr(s).0;
         unsafe {
-            s.launch_builder(&self.add_inplace)
+            s.launch_builder(&self.add_scale)
                 .arg(&pre_ptr)
                 .arg(&hidden_ptr)
                 .arg(&((count_pre) as i64))
+                .arg(&1.0f32)
                 .launch(super::ops::flat(count_pre))?;
         }
 
@@ -720,10 +690,9 @@ impl Music3Syn {
             )?;
         }
         let mut fourier = ws.fourier.slice_mut(0..fourier_dim);
-        let t_dev = s.clone_htod(&[t])?;
         unsafe {
             s.launch_builder(&self.fourier)
-                .arg(&t_dev)
+                .arg(&t)
                 .arg(&self.weights.flow.time_proj)
                 .arg(&mut fourier)
                 .arg(&((fourier_dim / 2) as u32))
@@ -879,10 +848,11 @@ impl Music3Syn {
             let wide2 = ws.wide.device_ptr(s).0;
             let ffo = ws.ff_out.device_ptr(s).0;
             unsafe {
-                s.launch_builder(&self.add_inplace)
+                s.launch_builder(&self.add_scale)
                     .arg(&wide2)
                     .arg(&ffo)
                     .arg(&((count) as i64))
+                    .arg(&1.0f32)
                     .launch(super::ops::flat(count))?;
             }
             self.layernorm(
@@ -943,10 +913,11 @@ impl Music3Syn {
                     .arg(&(pair_tokens as u32))
                     .arg(&(dim as u32))
                     .launch(super::ops::flat(count2))?;
-                s.launch_builder(&self.add_inplace)
+                s.launch_builder(&self.add_scale)
                     .arg(&wide2)
                     .arg(&ffo2)
                     .arg(&((count2) as i64))
+                    .arg(&1.0f32)
                     .launch(super::ops::flat(count2))?;
             }
         }
@@ -985,9 +956,8 @@ impl Music3Syn {
         )?;
         let post_ptr = ws.post.device_ptr(s).0;
         let proj_ptr = ws.proj.device_ptr(s).0;
-        let v0 = v_cond.device_ptr_mut(s).0;
-        let v1 = v_unc.device_ptr_mut(s).0;
-        let x_ptr = x_t.device_ptr(s).0;
+        let v0 = ws.pair_v_c.device_ptr_mut(s).0;
+        let v1 = ws.pair_v_u.device_ptr_mut(s).0;
         unsafe {
             s.launch_builder(&self.tail)
                 .arg(&post_ptr)
@@ -1004,7 +974,6 @@ impl Music3Syn {
                 .arg(&(channels as i32))
                 .launch(super::ops::flat(channels * length))?;
         }
-        let _ = x_ptr;
         Ok(())
     }
 
@@ -1023,37 +992,22 @@ impl Music3Syn {
         let s = &self.stream;
         let length = self.latent_length(frames);
         ensure!(length <= self.max_length, "length exceeds workspace");
-        let cond_len = self.latent_length(frames) * self.spec.cond_out as usize;
-        let mut cond_target: CudaSlice<f32> = unsafe { s.alloc(cond_len)? };
-        self.condition_encode(condition_input, frames, &mut cond_target)?;
+        self.condition_encode(condition_input, frames, &mut ws.cond)?;
         let sigmas = Self::sigma_schedule(30);
         s.memcpy_dtod(initial, &mut ws.x)?;
         let channels = self.spec.in_channels as usize;
         // Pair k runs at t = sigmas[k] and applies x +=
         // (sigmas[k+1] - sigmas[k]) * guided(v_pair_k), k = 0..30.
         // The transition-29 output is the vocoder latent; no call input
-        // in the capture shows it (matched 2026-11-03, max 4.57e-07).
+        // of the reference loop observes it.
         for step in 0..30 {
             let t = sigmas[step];
-            let mut v_c = ws.v_cond.clone();
-            let mut v_u = ws.v_unc.clone();
-            let x_now = ws.x.clone();
-            self.flow_velocity_pair(PairFlowCall {
-                ws,
-                x_t: &x_now,
-                t,
-                cond: &cond_target,
-                length,
-                v_cond: &mut v_c,
-                v_unc: &mut v_u,
-            })?;
-            s.memcpy_dtod(&v_c, &mut ws.v_cond)?;
-            s.memcpy_dtod(&v_u, &mut ws.v_unc)?;
+            self.flow_velocity_pair(ws, t, length)?;
             let dt = sigmas[step + 1] - sigmas[step];
             let count = (channels * length) as i64;
             let x_ptr = ws.x.device_ptr_mut(s).0;
-            let c_ptr = ws.v_cond.device_ptr(s).0;
-            let u_ptr = ws.v_unc.device_ptr(s).0;
+            let c_ptr = ws.pair_v_c.device_ptr(s).0;
+            let u_ptr = ws.pair_v_u.device_ptr(s).0;
             unsafe {
                 s.launch_builder(&self.guided_euler)
                     .arg(&x_ptr)
@@ -1065,149 +1019,8 @@ impl Music3Syn {
                     .launch(super::ops::flat(channels * length))?;
             }
         }
-        let x_full2 = ws.x.clone();
-        self.vocoder(&x_full2, length, audio)?;
+        self.vocoder(ws, length, audio)?;
         Ok(())
-    }
-
-    #[cfg(test)]
-    pub fn add_inplace_for_disc(&self) -> &cudarc::driver::CudaFunction {
-        &self.add_inplace
-    }
-
-    #[cfg(test)]
-    pub fn conv1d_for_disc(
-        &self,
-        w: &CudaSlice<f32>,
-        x: &cudarc::driver::CudaView<f32>,
-        rows: usize,
-        in_dim: usize,
-        out: &mut CudaSlice<f32>,
-    ) -> Result<()> {
-        let mut owned: CudaSlice<f32> = unsafe { self.stream.alloc(x.len())? };
-        self.stream.memcpy_dtod(x, &mut owned)?;
-        self.conv1d(Conv1dSite {
-            w,
-            x: &owned,
-            rows,
-            in_dim,
-            out,
-            bias: &self.weights.vocoder.conv_in_b,
-            dilation: 1,
-        })
-    }
-
-    #[cfg(test)]
-    pub fn snake_inplace_for_test(
-        &self,
-        buffer: &mut CudaSlice<f32>,
-        alpha: &CudaSlice<u8>,
-        count: usize,
-        channels: usize,
-    ) -> Result<()> {
-        let s = &self.stream;
-        let ptr = buffer.device_ptr_mut(s).0;
-        unsafe {
-            s.launch_builder(&self.snake_rows)
-                .arg(&ptr)
-                .arg(alpha)
-                .arg(&ptr)
-                .arg(&(count as i64))
-                .arg(&(channels as i32))
-                .launch(super::ops::flat(count))?;
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub fn snake_fresh_for_test(
-        &self,
-        x: &CudaSlice<f32>,
-        alpha: &CudaSlice<u8>,
-        out: &mut CudaSlice<f32>,
-        count: usize,
-        channels: usize,
-    ) -> Result<()> {
-        let s = &self.stream;
-        unsafe {
-            s.launch_builder(&self.snake_rows)
-                .arg(x)
-                .arg(alpha)
-                .arg(out)
-                .arg(&(count as i64))
-                .arg(&(channels as i32))
-                .launch(super::ops::flat(count))?;
-        }
-        Ok(())
-    }
-
-    /// Residual unit (block 0, unit 0) replay. old_form = the pre-99bafb0d
-    /// aliasing: snake1 writes in place into the residual base, so the
-    /// final add reads snake1(x) instead of x.
-    #[cfg(test)]
-    pub fn residual_unit_for_test(
-        &self,
-        x: &CudaSlice<f32>,
-        rows: usize,
-        dim: usize,
-        old_form: bool,
-    ) -> Result<CudaSlice<f32>> {
-        let s = &self.stream;
-        let unit = &self.vocoder_folds.blocks[0].units[0];
-        let uw = &self.weights.vocoder.blocks[0].units[0];
-        let count = rows * dim;
-        let mut c1: CudaSlice<f32> = unsafe { s.alloc(count)? };
-        let mut gated: CudaSlice<f32> = unsafe { s.alloc(count)? };
-        let (snake_in, residual) = if old_form {
-            let mut base: CudaSlice<f32> = x.clone();
-            self.snake_inplace_for_test(&mut base, &uw.snake1_alpha, count, dim)?;
-            let owned = base;
-            (owned, None)
-        } else {
-            let mut sn1: CudaSlice<f32> = unsafe { s.alloc(count)? };
-            self.snake_fresh_for_test(x, &uw.snake1_alpha, &mut sn1, count, dim)?;
-            (sn1, Some(x.clone()))
-        };
-        self.conv1d(Conv1dSite {
-            w: &unit.c1_w,
-            x: &snake_in,
-            rows,
-            in_dim: dim,
-            out: &mut c1,
-            bias: &uw.c1_b,
-            dilation: 1,
-        })?;
-        if old_form {
-            self.snake_inplace_for_test(&mut c1, &uw.snake2_alpha, count, dim)?;
-            self.linear_bytes(&unit.c2_w, dim, dim, &c1.slice(0..count), rows, &mut gated)?;
-        } else {
-            let mut sn2: CudaSlice<f32> = unsafe { s.alloc(count)? };
-            self.snake_fresh_for_test(&c1, &uw.snake2_alpha, &mut sn2, count, dim)?;
-            self.linear_bytes(&unit.c2_w, dim, dim, &sn2.slice(0..count), rows, &mut gated)?;
-        }
-        let gated_ptr = gated.device_ptr(s).0;
-        let gated_bias = uw.c2_b.device_ptr(s).0;
-        unsafe {
-            s.launch_builder(&self.bias)
-                .arg(&gated_ptr)
-                .arg(&gated_bias)
-                .arg(&gated_ptr)
-                .arg(&(rows as u32))
-                .arg(&(dim as u32))
-                .launch(super::ops::flat(count))?;
-        }
-        let mut out = match residual {
-            Some(r) => r,
-            None => snake_in,
-        };
-        unsafe {
-            s.launch_builder(&self.add_inplace)
-                .arg(&mut out)
-                .arg(&gated)
-                .arg(&(count as i64))
-                .launch(super::ops::flat(count))?;
-        }
-        Ok(out)
     }
 
     /// Fused guided euler update, the raw-pointer launch form synthesize
@@ -1246,9 +1059,9 @@ impl Music3Syn {
         usize::max(1, (numerator / denominator) as usize)
     }
 
-    /// Condition encoder: fused layer softmax-sum, k=3 conv (padded, three
-    /// shifted GEMMs over repacked planes) and nearest upsample. `input` is
-    /// [frames, layers*cond_hidden], `out` [latent_length, cond_out].
+    /// Condition encoder: fused layer softmax-sum, k=3 conv and nearest
+    /// upsample. `input` is [frames, layers*cond_hidden], `out`
+    /// [latent_length, cond_out].
     pub fn condition_encode(
         &self,
         input: &CudaSlice<f32>,
@@ -1261,7 +1074,7 @@ impl Music3Syn {
         let layers = self.spec.cond_layers as usize;
         let length = self.latent_length(frames);
         ensure!(
-            input.len() == frames * layers * cond_hidden && out.len() == length * cond_out,
+            input.len() == frames * layers * cond_hidden && out.len() >= length * cond_out,
             "condition_encode extent mismatch"
         );
         let mut fused: CudaSlice<f32> = unsafe { s.alloc(frames * cond_hidden)? };
@@ -1310,55 +1123,63 @@ impl Music3Syn {
         Ok(())
     }
 
-    /// Shifted-view conv over a zero-padded buffer: out rows `rows`, one
-    /// GEMM per kernel tap with dilated offsets, bias at the end.
-    /// Conv1d on the published folded [out, in*k] layout: zero-pad, im2col
-    /// activations to [rows, in*k], one GEMM, bias.
+    /// Conv1d on the published folded [out, in*k] layout: zero-pad,
+    /// im2col activations to [rows, in*k], one GEMM, bias.
     fn conv1d(&self, site: Conv1dSite<'_>) -> Result<()> {
         let Conv1dSite {
             w,
             x,
             rows,
             in_dim,
+            out_dim,
             out,
             bias,
             dilation,
+            padded,
+            cols,
         } = site;
         let s = &self.stream;
         let kernel = 7usize;
         let pad = 3 * dilation;
-        let out_dim = out.len() / rows;
         ensure!(w.len() == out_dim * in_dim * kernel, "conv1d weight extent");
-        let mut padded: CudaSlice<f32> = unsafe { s.alloc((rows + 2 * pad) * in_dim)? };
-        unsafe {
-            s.launch_builder(&self.pad_rows_n)
-                .arg(x)
-                .arg(&mut padded)
-                .arg(&(rows as i64))
-                .arg(&(pad as i64))
-                .arg(&(in_dim as i64))
-                .launch(super::ops::flat((rows + 2 * pad) * in_dim))?;
+        ensure!(
+            padded.len() >= (rows + 2 * pad) * in_dim && cols.len() >= rows * in_dim * kernel,
+            "conv1d scratch extent"
+        );
+        {
+            let mut padded = padded.slice_mut(0..(rows + 2 * pad) * in_dim);
+            unsafe {
+                s.launch_builder(&self.pad_rows_n)
+                    .arg(x)
+                    .arg(&mut padded)
+                    .arg(&(rows as i64))
+                    .arg(&(pad as i64))
+                    .arg(&(in_dim as i64))
+                    .launch(super::ops::flat((rows + 2 * pad) * in_dim))?;
+            }
         }
-        let mut a: CudaSlice<f32> = unsafe { s.alloc(rows * in_dim * kernel)? };
-        unsafe {
-            s.launch_builder(&self.im2col)
-                .arg(&padded)
-                .arg(&mut a)
-                .arg(&(rows as i64))
-                .arg(&(in_dim as i32))
-                .arg(&(kernel as i32))
-                .arg(&(dilation as i32))
-                .launch(super::ops::flat(rows * in_dim * kernel))?;
+        {
+            let mut cols = cols.slice_mut(0..rows * in_dim * kernel);
+            unsafe {
+                s.launch_builder(&self.im2col)
+                    .arg(&padded.slice(0..(rows + 2 * pad) * in_dim))
+                    .arg(&mut cols)
+                    .arg(&(rows as i64))
+                    .arg(&(in_dim as i32))
+                    .arg(&(kernel as i32))
+                    .arg(&(dilation as i32))
+                    .launch(super::ops::flat(rows * in_dim * kernel))?;
+            }
+            self.linear_bytes(
+                w,
+                out_dim,
+                in_dim * kernel,
+                &cols.slice(0..rows * in_dim * kernel),
+                rows,
+                out,
+            )?;
         }
-        self.linear_bytes(
-            w,
-            out_dim,
-            in_dim * kernel,
-            &a.slice(0..rows * in_dim * kernel),
-            rows,
-            &mut *out,
-        )?;
-        let count = out.len();
+        let count = rows * out_dim;
         let out_ptr = out.device_ptr(&self.stream).0;
         let bias_ptr = bias.device_ptr(&self.stream).0;
         unsafe {
@@ -1432,56 +1253,54 @@ impl Music3Syn {
 
     /// One folded stereo stream: latent half [channels/2, length]
     /// channel-major -> waveform [total_samples].
-    fn vocoder_stream(
-        &self,
-        latent: &cudarc::driver::CudaView<f32>,
-        length: usize,
-        waveform: &mut CudaSlice<f32>,
-    ) -> Result<()> {
+    /// One vocoder stream over workspace scratch buffers; the residual
+    /// units read the stage input through fresh snake buffers, never the
+    /// snake outputs.
+    fn vocoder_stream(&self, ws: &mut Workspace, half: usize, length: usize) -> Result<()> {
         let s = &self.stream;
         let streams = self.spec.vocoder_stream_channels() as usize;
         let input_dim = self.spec.decoder_input as usize;
         let hidden = self.spec.decoder_hidden as usize;
-        ensure!(latent.len() == streams * length, "vocoder stream extent");
-        let mut x: CudaSlice<f32> = unsafe { s.alloc(length * streams)? };
+        let latent =
+            ws.x.slice(half * streams * length..(half + 1) * streams * length);
         unsafe {
             s.launch_builder(&self.transpose)
-                .arg(latent)
-                .arg(&mut x)
+                .arg(&latent)
+                .arg(&mut ws.voc_x.slice_mut(0..length * streams))
                 .arg(&(streams as i64))
                 .arg(&(length as i64))
                 .launch(super::ops::flat(streams * length))?;
         }
-        let mut buf: CudaSlice<f32> = unsafe { s.alloc(length * input_dim)? };
         self.linear(
             &self.weights.vocoder.dec_in_proj_w,
             input_dim,
             streams,
-            &x.slice(0..length * streams),
+            &ws.voc_x.slice(0..length * streams),
             length,
-            &mut buf.slice_mut(0..length * input_dim),
+            &mut ws.voc_dec.slice_mut(0..length * input_dim),
         )?;
-        {
-            let count = buf.len();
-            unsafe {
-                s.launch_builder(&self.bias)
-                    .arg(&buf)
-                    .arg(&self.weights.vocoder.dec_in_proj_b)
-                    .arg(&buf)
-                    .arg(&(length as u32))
-                    .arg(&(input_dim as u32))
-                    .launch(super::ops::flat(count))?;
-            }
+        let dec_ptr = ws.voc_dec.device_ptr(s).0;
+        let dec_bias = self.weights.vocoder.dec_in_proj_b.device_ptr(s).0;
+        unsafe {
+            s.launch_builder(&self.bias)
+                .arg(&dec_ptr)
+                .arg(&dec_bias)
+                .arg(&dec_ptr)
+                .arg(&(length as u32))
+                .arg(&(input_dim as u32))
+                .launch(super::ops::flat(length * input_dim))?;
         }
-        let mut wide: CudaSlice<f32> = unsafe { s.alloc(length * hidden)? };
         self.conv1d(Conv1dSite {
             w: &self.vocoder_folds.conv_in_w,
-            x: &buf,
+            x: &ws.voc_dec,
             rows: length,
             in_dim: input_dim,
-            out: &mut wide,
+            out_dim: hidden,
+            out: &mut ws.voc_cur,
             bias: &self.weights.vocoder.conv_in_b,
             dilation: 1,
+            padded: &mut ws.voc_pad,
+            cols: &mut ws.voc_cols,
         })?;
         let mut rows = length;
         let mut dim = hidden;
@@ -1489,24 +1308,23 @@ impl Music3Syn {
             let stride = self.spec.upsampling[block_index] as usize;
             let out_dim = dim / 2;
             let count = rows * dim;
-            let ptr = wide.device_ptr_mut(s).0;
+            let cur_ptr = ws.voc_cur.device_ptr_mut(s).0;
 
             unsafe {
                 s.launch_builder(&self.snake_rows)
-                    .arg(&ptr)
+                    .arg(&cur_ptr)
                     .arg(&self.weights.vocoder.blocks[block_index].snake1_alpha)
-                    .arg(&ptr)
+                    .arg(&cur_ptr)
                     .arg(&(count as i64))
                     .arg(&(dim as i32))
                     .launch(super::ops::flat(count))?;
             }
-            let mut up: CudaSlice<f32> = unsafe { s.alloc(rows * stride * out_dim)? };
             unsafe {
                 s.launch_builder(&self.conv_transpose)
-                    .arg(&mut wide)
+                    .arg(&ws.voc_cur.slice(0..count))
                     .arg(&vb.conv_t_w)
                     .arg(&self.weights.vocoder.blocks[block_index].conv_t_b)
-                    .arg(&mut up)
+                    .arg(&mut ws.voc_next.slice_mut(0..rows * stride * out_dim))
                     .arg(&(rows as i32))
                     .arg(&(dim as i32))
                     .arg(&(out_dim as i32))
@@ -1515,38 +1333,38 @@ impl Music3Syn {
                     .arg(&(stride.div_ceil(2) as i32))
                     .launch(super::ops::grid(rows * stride, 256))?;
             }
+            std::mem::swap(&mut ws.voc_cur, &mut ws.voc_next);
             rows *= stride;
             dim = out_dim;
-            wide = up;
             for (unit_index, unit) in vb.units.iter().enumerate() {
                 let dilation = [1usize, 3, 9][unit_index];
                 let count = rows * dim;
                 let unit_weights = &self.weights.vocoder.blocks[block_index].units[unit_index];
-                let mut sn1: CudaSlice<f32> = unsafe { s.alloc(count)? };
-                let sn1_ptr = wide.device_ptr(s).0;
-                let sn1_out = sn1.device_ptr_mut(s).0;
+                let sn1_in = ws.voc_cur.device_ptr(s).0;
+                let sn1_out = ws.voc_sn1.device_ptr_mut(s).0;
                 unsafe {
                     s.launch_builder(&self.snake_rows)
-                        .arg(&sn1_ptr)
+                        .arg(&sn1_in)
                         .arg(&unit_weights.snake1_alpha)
                         .arg(&sn1_out)
                         .arg(&(count as i64))
                         .arg(&(dim as i32))
                         .launch(super::ops::flat(count))?;
                 }
-                let mut conv: CudaSlice<f32> = unsafe { s.alloc(rows * dim)? };
                 self.conv1d(Conv1dSite {
                     w: &unit.c1_w,
-                    x: &sn1,
+                    x: &ws.voc_sn1,
                     rows,
                     in_dim: dim,
-                    out: &mut conv,
+                    out_dim: dim,
+                    out: &mut ws.voc_conv,
                     bias: &unit_weights.c1_b,
                     dilation,
+                    padded: &mut ws.voc_pad,
+                    cols: &mut ws.voc_cols,
                 })?;
-                let mut sn2: CudaSlice<f32> = unsafe { s.alloc(count)? };
-                let conv_ptr = conv.device_ptr(s).0;
-                let sn2_out = sn2.device_ptr_mut(s).0;
+                let conv_ptr = ws.voc_conv.device_ptr(s).0;
+                let sn2_out = ws.voc_sn2.device_ptr_mut(s).0;
                 unsafe {
                     s.launch_builder(&self.snake_rows)
                         .arg(&conv_ptr)
@@ -1556,9 +1374,15 @@ impl Music3Syn {
                         .arg(&(dim as i32))
                         .launch(super::ops::flat(count))?;
                 }
-                let mut gated: CudaSlice<f32> = unsafe { s.alloc(rows * dim)? };
-                self.linear_bytes(&unit.c2_w, dim, dim, &sn2.slice(0..count), rows, &mut gated)?;
-                let gated_ptr = gated.device_ptr(s).0;
+                self.linear_bytes(
+                    &unit.c2_w,
+                    dim,
+                    dim,
+                    &ws.voc_sn2.slice(0..count),
+                    rows,
+                    &mut ws.voc_gated,
+                )?;
+                let gated_ptr = ws.voc_gated.device_ptr(s).0;
                 let gated_bias = unit_weights.c2_b.device_ptr(s).0;
                 unsafe {
                     s.launch_builder(&self.bias)
@@ -1568,68 +1392,71 @@ impl Music3Syn {
                         .arg(&(rows as u32))
                         .arg(&(dim as u32))
                         .launch(super::ops::flat(count))?;
-                    s.launch_builder(&self.add_inplace)
-                        .arg(&mut wide)
-                        .arg(&gated)
+                    let cur_ptr = ws.voc_cur.device_ptr_mut(s).0;
+                    s.launch_builder(&self.add_scale)
+                        .arg(&cur_ptr)
+                        .arg(&gated_ptr)
                         .arg(&(count as i64))
+                        .arg(&1.0f32)
                         .launch(super::ops::flat(count))?;
                 }
             }
         }
         let total = rows;
         let tail = dim;
-        ensure!(waveform.len() == total, "waveform extent");
+        ensure!(ws.voc_out.len() >= total, "vocoder output extent");
         let count = total * tail;
-        let ptr = wide.device_ptr_mut(s).0;
+        let cur_ptr = ws.voc_cur.device_ptr_mut(s).0;
 
         unsafe {
             s.launch_builder(&self.snake_rows)
-                .arg(&ptr)
+                .arg(&cur_ptr)
                 .arg(&self.weights.vocoder.snake_out_alpha)
-                .arg(&ptr)
+                .arg(&cur_ptr)
                 .arg(&(count as i64))
                 .arg(&(tail as i32))
                 .launch(super::ops::flat(count))?;
         }
-        let mut conv: CudaSlice<f32> = unsafe { s.alloc(total)? };
         self.conv1d(Conv1dSite {
             w: &self.vocoder_folds.conv_out_w,
-            x: &wide,
+            x: &ws.voc_cur,
             rows: total,
             in_dim: tail,
-            out: &mut conv,
+            out_dim: 1,
+            out: &mut ws.voc_out,
             bias: &self.weights.vocoder.conv_out_b,
             dilation: 1,
+            padded: &mut ws.voc_pad,
+            cols: &mut ws.voc_cols,
         })?;
         unsafe {
             s.launch_builder(&self.tanh_fn)
-                .arg(&mut conv)
+                .arg(&mut ws.voc_out.slice_mut(0..total))
                 .arg(&(total as i64))
                 .launch(super::ops::flat(total))?;
         }
-        s.memcpy_dtod(&conv, waveform)?;
         Ok(())
     }
 
+    /// Decode both latent halves of ws.x into `out` [2, length * total].
     pub fn vocoder(
         &self,
-        latents: &CudaSlice<f32>,
+        ws: &mut Workspace,
         length: usize,
         out: &mut CudaSlice<f32>,
     ) -> Result<()> {
         let streams = self.spec.vocoder_stream_channels() as usize;
         let total: usize = self.spec.upsampling.iter().map(|r| *r as usize).product();
+        let channels = self.spec.in_channels as usize;
         ensure!(
-            latents.len() == 2 * streams * length && out.len() == 2 * length * total,
+            channels == 2 * streams && out.len() == 2 * length * total,
             "vocoder extent mismatch"
         );
         let s = &self.stream;
-        let mut wave: CudaSlice<f32> = unsafe { s.alloc(length * total)? };
         for half in 0..2 {
-            let latent = latents.slice(half * streams * length..(half + 1) * streams * length);
-            self.vocoder_stream(&latent, length, &mut wave)?;
+            self.vocoder_stream(ws, half, length)?;
             s.memcpy_dtod(
-                &wave,
+                &ws.voc_out.slice(0..length * total),
                 &mut out.slice_mut(half * length * total..(half + 1) * length * total),
             )?;
         }
@@ -1752,6 +1579,36 @@ fn build_workspace(
     let tokens = max_length + 1;
     let pair = 2 * tokens;
     let rotary_dim = spec.rotary_dim as usize;
+    let streams = spec.vocoder_stream_channels() as usize;
+    let decoder_input = spec.decoder_input as usize;
+    let decoder_hidden = spec.decoder_hidden as usize;
+    let voc_total: usize = spec.upsampling.iter().map(|r| *r as usize).product();
+    // Largest vocoder stage extent over all blocks and both endpoints,
+    // and the conv1d scratch extents (kernel 7, dilations 1/3/9).
+    let mut voc_stage = max_length * decoder_hidden.max(decoder_input);
+    let mut voc_pad = 0usize;
+    let mut voc_cols = 0usize;
+    {
+        let mut note = |rows: usize, in_dim: usize, dilation: usize| {
+            voc_pad = voc_pad.max((rows + 6 * dilation) * in_dim);
+            voc_cols = voc_cols.max(rows * in_dim * 7);
+        };
+        note(max_length, decoder_input, 1);
+        note(
+            max_length * voc_total,
+            1.max(spec.decoder_hidden as usize >> spec.upsampling.len()),
+            1,
+        );
+        let (mut rows, mut dim) = (max_length, decoder_hidden);
+        for r in spec.upsampling.iter() {
+            rows *= *r as usize;
+            dim /= 2;
+            voc_stage = voc_stage.max(rows * dim);
+            for dilation in [1usize, 3, 9] {
+                note(rows, dim, dilation);
+            }
+        }
+    }
     let half = rotary_dim / 2;
     let mut cos = Vec::with_capacity(pair * rotary_dim);
     let mut sin = Vec::with_capacity(pair * rotary_dim);
@@ -1786,12 +1643,23 @@ fn build_workspace(
         t1: alloc(dim)?,
         temb: alloc(dim)?,
         x: alloc(channels * max_length)?,
-        v_cond: alloc(channels * max_length)?,
-        v_unc: alloc(channels * max_length)?,
+        pair_v_c: alloc(channels * max_length)?,
+        pair_v_u: alloc(channels * max_length)?,
         cond: alloc(max_length * cond_dim)?,
         zeros_cond: s.alloc_zeros(max_length * cond_dim)?,
         rotary_cos: s.clone_htod(&cos)?,
         rotary_sin: s.clone_htod(&sin)?,
+        voc_x: alloc(max_length * streams)?,
+        voc_dec: alloc(max_length * decoder_input)?,
+        voc_cur: alloc(voc_stage)?,
+        voc_next: alloc(voc_stage)?,
+        voc_sn1: alloc(voc_stage)?,
+        voc_conv: alloc(voc_stage)?,
+        voc_sn2: alloc(voc_stage)?,
+        voc_gated: alloc(voc_stage)?,
+        voc_pad: alloc(voc_pad)?,
+        voc_cols: alloc(voc_cols)?,
+        voc_out: alloc(max_length * voc_total)?,
     })
 }
 

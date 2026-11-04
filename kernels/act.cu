@@ -156,7 +156,7 @@ extern "C" __global__ void residual_scale(const __nv_bfloat16* __restrict__ a,
 }
 
 
-// Music3 FF gate in F32: pairs [rows, 2*dim] split half/half,
+// Gated FF in F32: pairs [rows, 2*dim] split half/half,
 // y = first * silu(second).
 extern "C" __global__ void silu_mul_f32(const float* __restrict__ gu,
     float* __restrict__ y, long long rows, int dim) {

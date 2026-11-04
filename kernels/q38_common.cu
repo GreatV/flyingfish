@@ -975,10 +975,10 @@ extern "C" __global__ void clamp_f32(float* __restrict__ x, long long count, flo
 }
 
 // Fourier time features: angle = (2*pi*t) * w[i]; out = [cos(angle) ..., sin(angle) ...].
-extern "C" __global__ void fourier_time_f32(const float* __restrict__ timestep,
+extern "C" __global__ void fourier_time_f32(float t,
     const float* __restrict__ weight, float* __restrict__ out, uint32_t n) {
-    if(!timestep || !weight || !out || !n) {__trap();return;}
-    const float t = 6.283185307179586f * timestep[0];
+    if(!weight || !out || !n) {__trap();return;}
+    t = 6.283185307179586f * t;
     for(uint32_t i=blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
         const float angle = __fmul_rn(t, weight[i]);
         out[i] = cosf(angle);
@@ -1023,22 +1023,6 @@ extern "C" __global__ void concat_channels_f32(const float* __restrict__ x,
     if (c < channels) v = x[(long long)c * length + t];
     else if (c >= 2 * channels) v = cond[t * cond_dim + (c - 2 * channels)];
     out[i] = v;
-}
-
-// a[i] += b[i], elementwise F32.
-extern "C" __global__ void add_inplace_f32(float* __restrict__ a,
-    const float* __restrict__ b, long long count) {
-    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= count) return;
-    a[i] += b[i];
-}
-
-// In-place silu, elementwise F32.
-extern "C" __global__ void silu_f32(float* __restrict__ x, long long count) {
-    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= count) return;
-    const float v = x[i];
-    x[i] = v / (1.0f + expf(-v));
 }
 
 // Flow tail: velocity[c, t] = post[t, c] + proj[t, c]; post and proj are
@@ -1170,9 +1154,6 @@ extern "C" __global__ void snake_rows_f32(const float* __restrict__ x,
     y[i] = v + __frcp_rn(a + 1e-9f) * s * s;
 }
 
-// Transposed-conv scatter-add: out[j*s + k - pad, :] += tmp[j, :], bounds
-// checked; out rows = in_rows * s, both [rows, channels].
-
 // In-place tanh, elementwise F32.
 extern "C" __global__ void tanh_f32(float* __restrict__ x, long long count) {
     const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1180,13 +1161,6 @@ extern "C" __global__ void tanh_f32(float* __restrict__ x, long long count) {
     x[i] = tanhf(x[i]);
 }
 
-// Euler flow update: x += (sigma_next - sigma) * v, elementwise F32.
-extern "C" __global__ void euler_update_f32(float* __restrict__ x,
-    const float* __restrict__ v, float dt, long long count) {
-    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= count) return;
-    x[i] = __fadd_rn(x[i], __fmul_rn(dt, v[i]));
-}
 // Guided Euler update: x += dt * (u + scale * (c - u)), elementwise F32.
 extern "C" __global__ void guided_euler_f32(float* __restrict__ x,
     const float* __restrict__ c, const float* __restrict__ u,
