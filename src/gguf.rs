@@ -673,13 +673,13 @@ mod tests {
             put_u64(&mut bytes, 0);
             put_u64(&mut bytes, 1);
             put_str(&mut bytes, "nested");
+            put_u32(&mut bytes, 9);
             for _ in 0..levels {
-                put_u32(&mut bytes, 9);
                 put_u32(&mut bytes, 9);
                 put_u64(&mut bytes, 1);
             }
             put_u32(&mut bytes, 4);
-            put_u32(&mut bytes, 0);
+            put_u64(&mut bytes, 0);
             bytes.resize(512, 0);
             bytes
         };
