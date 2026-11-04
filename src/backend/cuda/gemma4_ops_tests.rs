@@ -3807,6 +3807,7 @@ fn large_media_model_definition(
             &input.input(input.ids.len(), &audio),
             &identities,
             &mut trace,
+            scoped,
         )?;
         for (key, (_, expected)) in &oracle {
             if key != "logits" {
@@ -4132,7 +4133,7 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
         let first = usize::try_from(cell["score_first"].as_u64().context("score first")?)?;
         engine.reset()?;
         let mut trace = crate::trace::Trace::default();
-        engine.gemma_vision_trace(&input, &identities, &mut trace)?;
+        engine.gemma_vision_trace(&input, &identities, &mut trace, false)?;
         let features = trace.values("image_features")?;
         let feature_pass = vision_distance(
             &features,
@@ -4175,7 +4176,7 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
             ));
             engine.reset()?;
             let mut wrong = crate::trace::Trace::default();
-            engine.gemma_vision_trace(&input, &ids, &mut wrong)?;
+            engine.gemma_vision_trace(&input, &ids, &mut wrong, false)?;
             let wrong_combined = wrong.values(".debug.ple_identity")?;
             let wrong_ple = wrong_combined
                 .get(..ids.len() * 256)
@@ -4244,7 +4245,7 @@ fn image_model_definition_and_graph_gpu() -> Result<()> {
                 &mixed_input,
             )?;
             let mut mixed_trace = crate::trace::Trace::default();
-            engine.gemma_vision_trace(&mixed_input, &mixed_identities, &mut mixed_trace)?;
+            engine.gemma_vision_trace(&mixed_input, &mixed_identities, &mut mixed_trace, false)?;
             let actual = mixed_trace.values("image_features")?;
             let mut expected = street_features
                 .as_ref()
@@ -4422,7 +4423,7 @@ fn audio_model_definition_and_graph_gpu() -> Result<()> {
         let first = cell["score_first"].as_u64().context("score first")? as usize;
         engine.reset()?;
         let mut trace = crate::trace::Trace::default();
-        engine.gemma_vision_trace(&input, &identities, &mut trace)?;
+        engine.gemma_vision_trace(&input, &identities, &mut trace, false)?;
         for (stage, width, frequency, stride) in [
             ("subsample0", 128usize, 64, 2),
             ("subsample1", 32, 32, 4),
@@ -4546,7 +4547,7 @@ fn audio_model_definition_and_graph_gpu() -> Result<()> {
         if name == "stew" {
             engine.reset()?;
             let mut wrong = crate::trace::Trace::default();
-            engine.gemma_vision_trace(&input, &ids, &mut wrong)?;
+            engine.gemma_vision_trace(&input, &ids, &mut wrong, false)?;
             let wrong = wrong.values(".debug.ple_identity")?;
             let wrong = &wrong[..ids.len() * 256];
             let detected = !vision_distance(wrong, &oracle["ple"].1.as_f32(), &bounds["ple"])?;
@@ -4624,7 +4625,7 @@ fn audio_model_definition_and_graph_gpu() -> Result<()> {
                 &image_input,
             )?;
             let mut image_trace = crate::trace::Trace::default();
-            engine.gemma_vision_trace(&image_input, &image_identities, &mut image_trace)?;
+            engine.gemma_vision_trace(&image_input, &image_identities, &mut image_trace, false)?;
             let mut mixed_ids = ids[..first + 1].to_vec();
             mixed_ids.extend_from_slice(image_input.input_ids);
             let mut mixed_modalities = modalities.data()[..first + 1].to_vec();
@@ -4656,7 +4657,7 @@ fn audio_model_definition_and_graph_gpu() -> Result<()> {
                 &mixed,
             )?;
             let mut mixed_trace = crate::trace::Trace::default();
-            engine.gemma_vision_trace(&mixed, &mixed_identities, &mut mixed_trace)?;
+            engine.gemma_vision_trace(&mixed, &mixed_identities, &mut mixed_trace, false)?;
             let mut expected = singles[0].clone();
             expected.extend(image_trace.values("media_features")?);
             let actual = mixed_trace.values("media_features")?;

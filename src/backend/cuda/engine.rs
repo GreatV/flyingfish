@@ -2161,10 +2161,16 @@ impl Engine {
         input: &crate::vision_input::MultimodalInput<'_>,
         identities: &[u32],
         trace: &mut crate::trace::Trace,
+        features_only: bool,
     ) -> Result<()> {
         trace.set_device(&self.device.info.name)?;
-        self.prepare_multimodal(input, Some(trace))?;
-        self.gemma_prefill_trace(identities, trace)?;
+        if features_only {
+            self.gemma_media_features_trace(input, trace)?;
+            self.gemma_prefill_all(identities)?;
+        } else {
+            self.prepare_multimodal(input, Some(trace))?;
+            self.gemma_prefill_trace(identities, trace)?;
+        }
         let q = self.qwen.as_ref().context("Gemma runtime missing")?;
         ensure!(
             q.vision_encode_calls == usize::from(!input.grids.is_empty())
@@ -2180,6 +2186,23 @@ impl Engine {
             "media encoder call counts differ from the requested modalities"
         );
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn gemma_media_features_trace(
+        &mut self,
+        input: &crate::vision_input::MultimodalInput<'_>,
+        trace: &mut crate::trace::Trace,
+    ) -> Result<()> {
+        self.prepare_multimodal(input, None)?;
+        let images = self.images.as_ref().context("media features missing")?;
+        let values = self.device.stream.clone_dtoh(&images.features)?;
+        let width = self.model_spec.hidden as usize;
+        trace.add(
+            "media_features".into(),
+            vec![values.len() / width, width],
+            values.into_iter().map(bf16::to_f32).collect(),
+        )
     }
 
     #[cfg(test)]
@@ -2311,7 +2334,7 @@ impl Engine {
         input: &[bf16],
         layers: usize,
         trace: &mut crate::trace::Trace,
-    ) -> Result<Vec<bf16>> {
+    ) -> Result<()> {
         let width = self.model_spec.hidden as usize;
         ensure!(
             !ids.is_empty()
@@ -2354,17 +2377,42 @@ impl Engine {
             mask: crate::backend::Mask::Causal,
         };
         let prefix = if trace.all_layers { "" } else { "layer_rule_a" };
+        let boundaries_only = trace.all_layers;
         let mut target = Some(Target {
             trace,
             prefix,
             skip: 0,
         });
-        self.run_operator(crate::backend::Operator::Embed, 0, step, &mut target)?;
+        if boundaries_only {
+            self.run_operator(crate::backend::Operator::Embed, 0, step, &mut None)?;
+            trace_value(
+                &mut target,
+                &self.device.stream,
+                "embed",
+                &self.work.x,
+                ids.len(),
+                width,
+            )?;
+        } else {
+            self.run_operator(crate::backend::Operator::Embed, 0, step, &mut target)?;
+        }
         self.device
             .stream
             .memcpy_htod(input, &mut self.work.x.slice_mut(..input.len()))?;
         for layer in 0..layers {
-            self.run_layer(layer, step, &mut target)?;
+            if boundaries_only {
+                self.run_layer(layer, step, &mut None)?;
+                trace_value(
+                    &mut target,
+                    &self.device.stream,
+                    &layer.to_string(),
+                    &self.work.x,
+                    ids.len(),
+                    width,
+                )?;
+            } else {
+                self.run_layer(layer, step, &mut target)?;
+            }
         }
         self.position += ids.len();
         self.device
@@ -2381,10 +2429,7 @@ impl Engine {
                 self.workspace_rows as u32,
             )?;
         }
-        Ok(self
-            .device
-            .stream
-            .clone_dtoh(&self.work.x.slice(..input.len()))?)
+        Ok(())
     }
 
     #[cfg(all(test, feature = "cuda"))]
@@ -2399,7 +2444,7 @@ impl Engine {
             "media prefix depth differs"
         );
         trace.set_device(&self.device.info.name)?;
-        self.prepare_multimodal(input, Some(trace))?;
+        self.gemma_media_features_trace(input, trace)?;
         let identities: Vec<_> = input
             .input_ids
             .iter()
