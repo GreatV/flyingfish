@@ -589,6 +589,77 @@ extern "C" __global__ void philox_uniform_ids(
   }
 }
 
+extern "C" __global__ void philox_uniform_f32(
+    unsigned long long seed, unsigned long long stream, float* __restrict__ out,
+    long long count) {
+  if (count < 0 || (count > 0 && !out)) __trap();
+  const long long base = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (base * 4 >= count) return;
+  const uint2 key = make_uint2((unsigned)(seed & 0xffffffffu),
+                               (unsigned)(seed >> 32));
+  const uint4 counter = make_uint4((unsigned)(stream & 0xffffffffu),
+                                   (unsigned)(stream >> 32),
+                                   (unsigned)(base & 0xffffffffu),
+                                   (unsigned)(base >> 32));
+  const uint4 r = philox4_32_10(counter, key);
+  const unsigned words[4] = {r.x, r.y, r.z, r.w};
+  for (int j = 0; j < 4; ++j) {
+    const long long idx = base * 4 + j;
+    if (idx < count) {
+      out[idx] = (float)((words[j] >> 8) * (1.0 / 16777216.0));
+    }
+  }
+}
+
+template <typename T>
+__device__ __forceinline__ T philox_from_f32(float v);
+template <>
+__device__ __forceinline__ float philox_from_f32<float>(float v) { return v; }
+template <>
+__device__ __forceinline__ __nv_bfloat16 philox_from_f32<__nv_bfloat16>(float v) {
+  return __float2bfloat16_rn(v);
+}
+
+template <typename T>
+__device__ __forceinline__ void philox_normal_impl(
+    unsigned long long seed, unsigned long long stream, T* __restrict__ out,
+    long long count) {
+  if (count < 0 || (count > 0 && !out)) __trap();
+  const long long base = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (base * 4 >= count) return;
+  const uint2 key = make_uint2((unsigned)(seed & 0xffffffffu),
+                               (unsigned)(seed >> 32));
+  const uint4 counter = make_uint4((unsigned)(stream & 0xffffffffu),
+                                   (unsigned)(stream >> 32),
+                                   (unsigned)(base & 0xffffffffu),
+                                   (unsigned)(base >> 32));
+  const uint4 r = philox4_32_10(counter, key);
+  const float u0 = fmaxf((float)(((r.x >> 8) + 0.5) * (1.0 / 16777216.0)), 1e-7f);
+  const float u1 = (float)((r.y >> 8) * (1.0 / 16777216.0)) * 6.28318530717958647692f;
+  const float u2 = fmaxf((float)(((r.z >> 8) + 0.5) * (1.0 / 16777216.0)), 1e-7f);
+  const float u3 = (float)((r.w >> 8) * (1.0 / 16777216.0)) * 6.28318530717958647692f;
+  const float rad0 = sqrtf(-2.0f * logf(u0));
+  const float rad1 = sqrtf(-2.0f * logf(u2));
+  const float vals[4] = {
+      rad0 * cosf(u1), rad0 * sinf(u1), rad1 * cosf(u3), rad1 * sinf(u3)};
+  for (int j = 0; j < 4; ++j) {
+    const long long idx = base * 4 + j;
+    if (idx < count) out[idx] = philox_from_f32<T>(vals[j]);
+  }
+}
+
+extern "C" __global__ void philox_normal_f32(
+    unsigned long long seed, unsigned long long stream, float* __restrict__ out,
+    long long count) {
+  philox_normal_impl<float>(seed, stream, out, count);
+}
+
+extern "C" __global__ void philox_normal_bf16(
+    unsigned long long seed, unsigned long long stream,
+    __nv_bfloat16* __restrict__ out, long long count) {
+  philox_normal_impl<__nv_bfloat16>(seed, stream, out, count);
+}
+
 // Samples contiguous F32 CDF intervals from one Philox draw per row.
 extern "C" __global__ void categorical_sample_rows(
     const float* __restrict__ probs, int* __restrict__ out, int rows,

@@ -102,6 +102,8 @@ fn diffusion_sampler_ops_gpu() -> Result<()> {
     let entropy = sample.load_function("row_entropy_f32")?;
     let accept = sample.load_function("entropy_bound_accept")?;
     let philox = sample.load_function("philox_uniform_ids")?;
+    let normal_f32 = sample.load_function("philox_normal_f32")?;
+    let normal_bf16 = sample.load_function("philox_normal_bf16")?;
     let categorical = sample.load_function("categorical_sample_rows")?;
     let stop = sample.load_function("canvas_stability_stop")?;
     let argmax = sample.load_function("argmax_rows_f32")?;
@@ -343,6 +345,88 @@ fn diffusion_sampler_ops_gpu() -> Result<()> {
     ensure!(
         (0..buckets).contains(&mapped),
         "philox boundary word maps outside the vocab: {mapped}"
+    );
+
+    // Philox normal draws (bounds fixed here before the test first ran). N = 2^20 + 3 draws, so the last launch thread
+    // writes a partial group: |mean| <= 5 / sqrt(N), |variance - 1| <= 5 sqrt(2 / N), same seed and stream repeat
+    // exactly, a different seed shares at most 0.01% of the values, nothing is written past N, and the BF16 draw is
+    // the round-to-nearest of the F32 draw.
+    let n = draws as usize + 3;
+    let guard = 8usize;
+    let sentinel = -777.0f32;
+    let launch_normal = |seed: u64| -> Result<Vec<f32>> {
+        let out = s.clone_htod(&vec![sentinel; n + guard])?;
+        unsafe {
+            s.launch_builder(&normal_f32)
+                .arg(&seed)
+                .arg(&3u64)
+                .arg(&out)
+                .arg(&(n as i64))
+                .launch(crate::backend::cuda::ops::flat(n.div_ceil(4)))?;
+        }
+        Ok(s.clone_dtoh(&out)?)
+    };
+    let draw_a = launch_normal(7)?;
+    let draw_b = launch_normal(7)?;
+    ensure!(
+        draw_a == draw_b,
+        "philox_normal_f32 must repeat identically under the same seed and stream"
+    );
+    ensure!(
+        draw_a[n..].iter().all(|v| *v == sentinel),
+        "philox_normal_f32 wrote past its count"
+    );
+    ensure!(
+        draw_a[..n].iter().all(|v| v.is_finite()),
+        "philox_normal_f32 produced a non-finite value"
+    );
+    let mean = draw_a[..n].iter().map(|v| f64::from(*v)).sum::<f64>() / n as f64;
+    let variance = draw_a[..n]
+        .iter()
+        .map(|v| (f64::from(*v) - mean).powi(2))
+        .sum::<f64>()
+        / n as f64;
+    let mean_bound = 5.0 / (n as f64).sqrt();
+    let variance_bound = 5.0 * (2.0 / n as f64).sqrt();
+    ensure!(
+        mean.abs() <= mean_bound && (variance - 1.0).abs() <= variance_bound,
+        "philox_normal_f32 moments: mean {mean} (bound {mean_bound}), variance {variance} (bound {variance_bound})"
+    );
+    let other = launch_normal(8)?;
+    let shared = draw_a[..n]
+        .iter()
+        .zip(&other[..n])
+        .filter(|(a, b)| a == b)
+        .count();
+    ensure!(
+        (shared as f64) <= 1e-4 * n as f64,
+        "philox_normal_f32 seeds 7 and 8 share {shared} of {n} values"
+    );
+    let out_bf16 = s.clone_htod(&vec![bf16::from_f32(sentinel); n + guard])?;
+    unsafe {
+        s.launch_builder(&normal_bf16)
+            .arg(&7u64)
+            .arg(&3u64)
+            .arg(&out_bf16)
+            .arg(&(n as i64))
+            .launch(crate::backend::cuda::ops::flat(n.div_ceil(4)))?;
+    }
+    let draw_bf16 = s.clone_dtoh(&out_bf16)?;
+    ensure!(
+        draw_bf16[..n]
+            .iter()
+            .zip(&draw_a[..n])
+            .all(|(b, f)| b.to_bits() == bf16::from_f32(*f).to_bits()),
+        "philox_normal_bf16 differs from the round-to-nearest of philox_normal_f32"
+    );
+    ensure!(
+        draw_bf16[n..]
+            .iter()
+            .all(|v| *v == bf16::from_f32(sentinel)),
+        "philox_normal_bf16 wrote past its count"
+    );
+    println!(
+        "PHILOX_NORMAL PASS n={n} mean={mean:.6} (bound {mean_bound:.6}) variance={variance:.6} (bound {variance_bound:.6}) shared_with_other_seed={shared} bf16_equals_rn_f32=true no_overrun=true"
     );
 
     // Categorical: peaked rows (0.999 mass on one id) must sample the argmax

@@ -756,6 +756,63 @@ impl Blas {
         Ok(())
     }
 
+    pub(crate) fn linear_f16(
+        &self,
+        weight: crate::backend::gpu::contracts::Tensor<half::f16, 2>,
+        x: crate::backend::gpu::contracts::Tensor<half::f16, 2>,
+        y: &mut crate::backend::gpu::contracts::TensorMut<half::f16, 2>,
+    ) -> Result<()> {
+        use crate::backend::gpu::contracts::no_overlap;
+        weight.validate()?;
+        x.validate()?;
+        y.0.validate()?;
+        let [rows, input] = x.shape;
+        let output = weight.shape[0];
+        ensure!(
+            [rows, input, output]
+                .into_iter()
+                .all(|n| n > 0 && n <= i32::MAX as u32)
+                && weight.shape == [output, input]
+                && weight.stride == [u64::from(input), 1]
+                && x.stride == [u64::from(input), 1]
+                && y.0.shape == [rows, output]
+                && y.0.stride == [u64::from(output), 1],
+            "HIP FP16 linear requires dense [output,input] x [rows,input] -> [rows,output]"
+        );
+        no_overlap(&weight, &y.0, "weight", "output")?;
+        no_overlap(&x, &y.0, "input", "output")?;
+        self.stream.context().bind_to_thread()?;
+        self.stream.retain(&self.handles);
+        let (alpha, beta) = (1f32, 0f32);
+        unsafe {
+            check(
+                hipblasGemmEx(
+                    self.handles.handle,
+                    112,
+                    111,
+                    output as i32,
+                    rows as i32,
+                    input as i32,
+                    (&alpha as *const f32).cast(),
+                    weight.ptr as *const c_void,
+                    2,
+                    input as i32,
+                    x.ptr as *const c_void,
+                    2,
+                    input as i32,
+                    (&beta as *const f32).cast(),
+                    y.0.ptr as Handle,
+                    2,
+                    output as i32,
+                    2,
+                    160,
+                ),
+                "hipblasGemmEx FP16 linear",
+            )?;
+        }
+        Ok(())
+    }
+
     /// BF16 operands, BF16 or F32 output, FP32 accumulation, W transpose, alpha=1 and beta=0.
     /// # Safety
     /// Pointers cover the strided matrices, or `batch` device pointer arrays.

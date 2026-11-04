@@ -23,6 +23,10 @@ extern "C" __global__ void q38_bias_add(__nv_bfloat16* y,const __nv_bfloat16* bi
         y[i]=__hadd(y[i],bias[i%width]);
 }
 #endif
+extern "C" __global__ void q38_bias_add_f16(__half* y,const __half* bias,uint64_t count,uint32_t width) {
+    for(uint64_t i=uint64_t(blockIdx.x)*blockDim.x+threadIdx.x;i<count;i+=uint64_t(gridDim.x)*blockDim.x)
+        y[i]=__float2half_rn(__fadd_rn(__half2float(y[i]),__half2float(bias[i%width])));
+}
 extern "C" __global__ void q38_advance(Q38SequenceMeta* meta, int32_t* position, int32_t* length) {
     q38_meta_guard(meta);
     if(threadIdx.x==0 && blockIdx.x==0) {
@@ -607,11 +611,53 @@ extern "C" __global__ void q38_layer_norm(
         y[uint64_t(d)*ys2]=__float2bfloat16_rn(affine);
     }
 }
-// Stateless LayerNorm with F32 io: same math as q38_layer_norm.
-extern "C" __global__ void q38_layer_norm_f32(
-    const float* x,const float* weight,const float* bias,float* y,
-    uint32_t rows,uint32_t heads,uint32_t width,
-    uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,float eps) {
+__device__ __forceinline__ float gelu_tanh_rn(float value) {
+    float cubic=__fmul_rn(__fmul_rn(value,value),value);
+    float inner=__fmul_rn(0.7978845608028653559f,__fadd_rn(value,__fmul_rn(0.044715f,cubic)));
+    return __fmul_rn(__fmul_rn(0.5f,value),__fadd_rn(1.0f,tanhf(inner)));
+}
+namespace {
+
+__device__ __forceinline__ float q38_to_f32(__nv_bfloat16 v) { return __bfloat162float(v); }
+__device__ __forceinline__ float q38_to_f32(__half v) { return __half2float(v); }
+__device__ __forceinline__ float q38_to_f32(float v) { return v; }
+
+template <typename T>
+__device__ __forceinline__ T q38_from_f32(float v);
+template <>
+__device__ __forceinline__ __nv_bfloat16 q38_from_f32<__nv_bfloat16>(float v) {
+    return __float2bfloat16_rn(v);
+}
+template <>
+__device__ __forceinline__ __half q38_from_f32<__half>(float v) {
+    return __float2half_rn(v);
+}
+template <>
+__device__ __forceinline__ float q38_from_f32<float>(float v) {
+    return v;
+}
+
+template <typename T>
+__device__ __forceinline__ void q38_gelu_impl(
+    const T* x, T* y, uint32_t rows, uint32_t heads, uint32_t width,
+    uint64_t xs0, uint64_t xs1, uint64_t xs2, uint64_t ys0, uint64_t ys1, uint64_t ys2, int mode) {
+    if(blockDim.x!=256 || blockDim.y!=1 || blockDim.z!=1 || gridDim.y!=1 || gridDim.z!=1 ||
+       !rows || !heads || !width || !x || !y || mode<0 || mode>1) {__trap();return;}
+    uint64_t count=uint64_t(rows)*heads*width;
+    for(uint64_t i=uint64_t(blockIdx.x)*256+threadIdx.x;i<count;i+=uint64_t(gridDim.x)*256) {
+        uint64_t row=i/(uint64_t(heads)*width);uint32_t head=(i/width)%heads,d=i%width;
+        float value=q38_to_f32(x[row*xs0+head*xs1+uint64_t(d)*xs2]);
+        float result=mode==1 ? gelu_tanh_rn(value) : __fmul_rn(__fmul_rn(0.5f,value),
+            __fadd_rn(1.0f,erff(__fmul_rn(value,0.7071067811865475244f))));
+        y[row*ys0+head*ys1+uint64_t(d)*ys2]=q38_from_f32<T>(result);
+    }
+}
+
+template <typename InT, typename OutT>
+__device__ __forceinline__ void q38_layer_norm_f32_impl(
+    const InT* x, const float* weight, const float* bias, OutT* y,
+    uint32_t rows, uint32_t heads, uint32_t width,
+    uint64_t xs0, uint64_t xs1, uint64_t xs2, uint64_t ys0, uint64_t ys1, uint64_t ys2, float eps) {
     if(blockDim.x!=256 || blockDim.y!=1 || blockDim.z!=1 || gridDim.y!=1 || gridDim.z!=1 ||
        !rows || !heads || !width || uint64_t(gridDim.x)!=uint64_t(rows)*heads ||
        !x || bool(weight)!=bool(bias) || !y || !(eps>0)) {__trap();return;}
@@ -620,41 +666,60 @@ extern "C" __global__ void q38_layer_norm_f32(
     y+=uint64_t(row)*ys0+uint64_t(head)*ys1;
     __shared__ float tmp[8];
     float sum=0;
-    for(uint32_t d=threadIdx.x;d<width;d+=256) sum=__fadd_rn(sum,x[uint64_t(d)*xs2]);
+    for(uint32_t d=threadIdx.x;d<width;d+=256) sum=__fadd_rn(sum,q38_to_f32(x[uint64_t(d)*xs2]));
     float mean=block_sum(sum,tmp)/float(width);
     __syncthreads();
     float variance=0;
     for(uint32_t d=threadIdx.x;d<width;d+=256) {
-        float delta=__fsub_rn(x[uint64_t(d)*xs2],mean);
+        float delta=__fsub_rn(q38_to_f32(x[uint64_t(d)*xs2]),mean);
         variance=__fadd_rn(variance,__fmul_rn(delta,delta));
     }
     float inv=__fdiv_rn(1.0f,__fsqrt_rn(__fadd_rn(block_sum(variance,tmp)/float(width),eps)));
     for(uint32_t d=threadIdx.x;d<width;d+=256) {
-        float centered=__fsub_rn(x[uint64_t(d)*xs2],mean);
+        float centered=__fsub_rn(q38_to_f32(x[uint64_t(d)*xs2]),mean);
         float normalized=__fmul_rn(centered,inv);
-        float affine=weight ? __fadd_rn(__fmul_rn(normalized,weight[d]),bias[d]) : normalized;
-        y[uint64_t(d)*ys2]=affine;
+        float out=weight ? __fadd_rn(__fmul_rn(normalized,weight[d]),bias[d]) : normalized;
+        y[uint64_t(d)*ys2]=q38_from_f32<OutT>(out);
     }
 }
-__device__ __forceinline__ float gelu_tanh_rn(float value) {
-    float cubic=__fmul_rn(__fmul_rn(value,value),value);
-    float inner=__fmul_rn(0.7978845608028653559f,__fadd_rn(value,__fmul_rn(0.044715f,cubic)));
-    return __fmul_rn(__fmul_rn(0.5f,value),__fadd_rn(1.0f,tanhf(inner)));
+
+}  // namespace
+
+// Stateless LayerNorm with F32 io: same math as q38_layer_norm.
+extern "C" __global__ void q38_layer_norm_f32(
+    const float* x,const float* weight,const float* bias,float* y,
+    uint32_t rows,uint32_t heads,uint32_t width,
+    uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,float eps) {
+    q38_layer_norm_f32_impl<float, float>(x,weight,bias,y,rows,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,eps);
 }
+extern "C" __global__ void q38_layer_norm_f16(
+    const __half* x,const float* weight,const float* bias,__half* y,
+    uint32_t rows,uint32_t heads,uint32_t width,
+    uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,float eps) {
+    q38_layer_norm_f32_impl<__half, __half>(x,weight,bias,y,rows,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,eps);
+}
+extern "C" __global__ void q38_layer_norm_f16_to_f32(
+    const __half* x,const float* weight,const float* bias,float* y,
+    uint32_t rows,uint32_t heads,uint32_t width,
+    uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,float eps) {
+    q38_layer_norm_f32_impl<__half, float>(x,weight,bias,y,rows,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,eps);
+}
+
 // mode 0: erf GELU. mode 1: tanh approximation. All declared rows are valid.
 extern "C" __global__ void q38_gelu(
     const __nv_bfloat16* x,__nv_bfloat16* y,uint32_t rows,uint32_t heads,uint32_t width,
     uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,int mode) {
-    if(blockDim.x!=256 || blockDim.y!=1 || blockDim.z!=1 || gridDim.y!=1 || gridDim.z!=1 ||
-       !rows || !heads || !width || !x || !y || mode<0 || mode>1) {__trap();return;}
-    uint64_t count=uint64_t(rows)*heads*width;
-    for(uint64_t i=uint64_t(blockIdx.x)*256+threadIdx.x;i<count;i+=uint64_t(gridDim.x)*256) {
-        uint64_t row=i/(uint64_t(heads)*width);uint32_t head=(i/width)%heads,d=i%width;
-        float value=__bfloat162float(x[row*xs0+head*xs1+uint64_t(d)*xs2]);
-        float result=mode==1 ? gelu_tanh_rn(value) : __fmul_rn(__fmul_rn(0.5f,value),
-            __fadd_rn(1.0f,erff(__fmul_rn(value,0.7071067811865475244f))));
-        y[row*ys0+head*ys1+uint64_t(d)*ys2]=__float2bfloat16_rn(result);
-    }
+    q38_gelu_impl(x,y,rows,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,mode);
+}
+extern "C" __global__ void q38_gelu_f16(
+    const __half* x,__half* y,uint32_t rows,uint32_t heads,uint32_t width,
+    uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,int mode) {
+    q38_gelu_impl(x,y,rows,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,mode);
+}
+extern "C" __global__ void q38_gelu_f32(
+    const float* x,float* y,uint32_t rows,uint32_t heads,uint32_t width,
+    uint64_t xs0,uint64_t xs1,uint64_t xs2,uint64_t ys0,uint64_t ys1,uint64_t ys2,int mode) {
+    q38_gelu_impl(x,y,rows,heads,width,xs0,xs1,xs2,ys0,ys1,ys2,mode);
 }
 // y = bf16(bf16(tanh-GELU(x)) * up). All declared rows are valid.
 extern "C" __global__ void gelu_tanh_mul(

@@ -571,10 +571,29 @@ extern "C" __global__ void rope_pair_rows(
 
 // rows*n*(tail/2) threads: rotate the last `tail` elements of every n-vector
 // of x[r] in place by the row's (cos, sin) pair.
-extern "C" __global__ void rope_pair_tail(
-    __nv_bfloat16* x, const float* __restrict__ rotary, int rows, int n,
-    int width, int tail) {
-  if (rows < 1 || n < 1 || tail < 2 || (tail % 2) != 0 || tail > width) __trap();
+namespace {
+
+__device__ __forceinline__ float rope_to_f32(__nv_bfloat16 v) { return __bfloat162float(v); }
+__device__ __forceinline__ float rope_to_f32(__half v) { return __half2float(v); }
+
+template <typename T>
+__device__ __forceinline__ T rope_from_f32(float v);
+template <>
+__device__ __forceinline__ __nv_bfloat16 rope_from_f32<__nv_bfloat16>(float v) {
+  return __float2bfloat16_rn(v);
+}
+template <>
+__device__ __forceinline__ __half rope_from_f32<__half>(float v) {
+  return __float2half_rn(v);
+}
+
+template <typename T>
+__device__ __forceinline__ void rope_pair_tail_impl(
+    T* x, const float* __restrict__ rotary, int rows, int n,
+    int width, int tail, int rotary_heads) {
+  if (rows < 1 || n < 1 || tail < 2 || (tail % 2) != 0 || tail > width ||
+      (rotary_heads != 1 && rotary_heads != n))
+    __trap();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   const int half = tail / 2;
   if (i >= rows * n * half) return;
@@ -582,12 +601,49 @@ extern "C" __global__ void rope_pair_tail(
   const int v = (i / half) % n;
   const int r = i / (half * n);
   const int d = r * n * width + v * width + (width - tail) + 2 * pair;
-  const float c = rotary[(size_t)r * tail + 2 * pair];
-  const float s = rotary[(size_t)r * tail + 2 * pair + 1];
-  const float a = __bfloat162float(x[d]);
-  const float b = __bfloat162float(x[d + 1]);
-  x[d] = __float2bfloat16_rn(a * c - b * s);
-  x[d + 1] = __float2bfloat16_rn(a * s + b * c);
+  const size_t rot_row = (rotary_heads == 1) ? (size_t)r : ((size_t)r * n + v);
+  const float c = rotary[rot_row * tail + 2 * pair];
+  const float s = rotary[rot_row * tail + 2 * pair + 1];
+  const float a = rope_to_f32(x[d]);
+  const float b = rope_to_f32(x[d + 1]);
+  x[d] = rope_from_f32<T>(a * c - b * s);
+  x[d + 1] = rope_from_f32<T>(a * s + b * c);
+}
+
+}  // namespace
+
+extern "C" __global__ void rope_pair_rows_3d(
+    const float* __restrict__ delta_pos, const float* __restrict__ freqs,
+    int rows, int heads, int tail, float* __restrict__ fwd) {
+  if (!delta_pos || !freqs || !fwd || rows < 1 || heads < 1 || tail < 6 || (tail % 2) != 0)
+    __trap();
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  const int half = tail / 2;
+  const int total = rows * heads * half;
+  if (i >= total) return;
+  const int d = i % half;
+  const int rh = i / half;
+  const int h0 = tail / 6;
+  const int axis = (d < h0) ? 0 : ((d < 2 * h0) ? 1 : 2);
+  const float x = delta_pos[(size_t)rh * 3 + axis];
+  const float f = freqs[d];
+  const float f_t = tanhf(f);
+  const float cm = __fadd_rn(__fmul_rn(x, f_t), __fmul_rn(x, __fsub_rn(f, f_t)));
+  const float angle = __fmul_rn(cm, 3.14159265358979323846f);
+  fwd[(size_t)rh * tail + 2 * d] = cosf(angle);
+  fwd[(size_t)rh * tail + 2 * d + 1] = sinf(angle);
+}
+
+extern "C" __global__ void rope_pair_tail(
+    __nv_bfloat16* x, const float* __restrict__ rotary, int rows, int n,
+    int width, int tail) {
+  rope_pair_tail_impl(x, rotary, rows, n, width, tail, 1);
+}
+
+extern "C" __global__ void rope_pair_tail_f16(
+    __half* x, const float* __restrict__ rotary, int rows, int n,
+    int width, int tail, int rotary_heads) {
+  rope_pair_tail_impl(x, rotary, rows, n, width, tail, rotary_heads);
 }
 
 // Partial split-half rotary apply in F32: q [rows, heads, head_dim], only the

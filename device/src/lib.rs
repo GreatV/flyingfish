@@ -90,11 +90,17 @@ unsafe fn ld4_trans<const OFFSET: u32>(p: u32) -> [u32; 4] {
 }
 
 #[inline(always)]
-unsafe fn mma(a: [u32; 4], b: [u32; 2], mut c: [f32; 4]) -> [f32; 4] {
+unsafe fn mma<const F16: bool>(a: [u32; 4], b: [u32; 2], mut c: [f32; 4]) -> [f32; 4] {
     unsafe {
-        asm!("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {{{c0},{c1},{c2},{c3}}}, {{{a0},{a1},{a2},{a3}}}, {{{b0},{b1}}}, {{{c0},{c1},{c2},{c3}}};",
-            c0=inout(reg32) c[0],c1=inout(reg32) c[1],c2=inout(reg32) c[2],c3=inout(reg32) c[3],
-            a0=in(reg32) a[0],a1=in(reg32) a[1],a2=in(reg32) a[2],a3=in(reg32) a[3],b0=in(reg32) b[0],b1=in(reg32) b[1]);
+        if F16 {
+            asm!("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{{c0},{c1},{c2},{c3}}}, {{{a0},{a1},{a2},{a3}}}, {{{b0},{b1}}}, {{{c0},{c1},{c2},{c3}}};",
+                c0=inout(reg32) c[0],c1=inout(reg32) c[1],c2=inout(reg32) c[2],c3=inout(reg32) c[3],
+                a0=in(reg32) a[0],a1=in(reg32) a[1],a2=in(reg32) a[2],a3=in(reg32) a[3],b0=in(reg32) b[0],b1=in(reg32) b[1]);
+        } else {
+            asm!("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {{{c0},{c1},{c2},{c3}}}, {{{a0},{a1},{a2},{a3}}}, {{{b0},{b1}}}, {{{c0},{c1},{c2},{c3}}};",
+                c0=inout(reg32) c[0],c1=inout(reg32) c[1],c2=inout(reg32) c[2],c3=inout(reg32) c[3],
+                a0=in(reg32) a[0],a1=in(reg32) a[1],a2=in(reg32) a[2],a3=in(reg32) a[3],b0=in(reg32) b[0],b1=in(reg32) b[1]);
+        }
     }
     c
 }
@@ -152,21 +158,30 @@ unsafe fn reciprocal(a: f32) -> f32 {
     x
 }
 #[inline(always)]
-unsafe fn pack(a: f32, b: f32) -> u32 {
+unsafe fn pack<const F16: bool>(a: f32, b: f32) -> u32 {
     let x;
     unsafe {
-        asm!("cvt.rn.bf16x2.f32 {x}, {b}, {a};",x=out(reg32) x,a=in(reg32) a,b=in(reg32) b);
+        if F16 {
+            asm!("cvt.rn.f16x2.f32 {x}, {b}, {a};",x=out(reg32) x,a=in(reg32) a,b=in(reg32) b);
+        } else {
+            asm!("cvt.rn.bf16x2.f32 {x}, {b}, {a};",x=out(reg32) x,a=in(reg32) a,b=in(reg32) b);
+        }
     }
     x
 }
 #[inline(always)]
-unsafe fn pack_residual(a: f32, b: f32, high: u32) -> u32 {
+unsafe fn pack_residual<const F16: bool>(a: f32, b: f32, high: u32) -> u32 {
     let ah: f32;
     let bh: f32;
     unsafe {
-        asm!("{{ .reg .b16 lo, hi; mov.b32 {{lo, hi}}, {high}; cvt.f32.bf16 {ah}, lo; cvt.f32.bf16 {bh}, hi; }}",
-            high=in(reg32) high,ah=out(reg32) ah,bh=out(reg32) bh);
-        pack(a - ah, b - bh)
+        if F16 {
+            asm!("{{ .reg .b16 lo, hi; mov.b32 {{lo, hi}}, {high}; cvt.f32.f16 {ah}, lo; cvt.f32.f16 {bh}, hi; }}",
+                high=in(reg32) high,ah=out(reg32) ah,bh=out(reg32) bh);
+        } else {
+            asm!("{{ .reg .b16 lo, hi; mov.b32 {{lo, hi}}, {high}; cvt.f32.bf16 {ah}, lo; cvt.f32.bf16 {bh}, hi; }}",
+                high=in(reg32) high,ah=out(reg32) ah,bh=out(reg32) bh);
+        }
+        pack::<F16>(a - ah, b - bh)
     }
 }
 #[inline(always)]
@@ -278,7 +293,7 @@ unsafe fn copy_kv<const D: usize, const MASK: bool>(
 pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
     unsafe {
         let p = resolve_position(p);
-        attention::<256, 32, 0>(p, p.start + p.rows, 0, 0.0625);
+        attention::<256, 32, 0, false>(p, p.start + p.rows, 0, 0.0625);
     }
 }
 
@@ -288,7 +303,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256(p: Attention) {
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128(p: Attention) {
     unsafe {
         let p = resolve_position(p);
-        attention::<128, 16, 0>(
+        attention::<128, 16, 0, false>(
             p,
             p.start + p.rows,
             0,
@@ -303,7 +318,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d128(p: Attention) {
 pub unsafe extern "ptx-kernel" fn attention_prefill_d256_bidirectional(p: Attention, keys: u32) {
     unsafe {
         let p = resolve_position(p);
-        attention::<256, 32, 1>(p, keys, 0, 0.0625);
+        attention::<256, 32, 1, false>(p, keys, 0, 0.0625);
     }
 }
 
@@ -318,7 +333,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_symmetric(
 ) {
     unsafe {
         let p = resolve_position(p);
-        attention::<256, 32, 6>(p, keys, radius, scale);
+        attention::<256, 32, 6, false>(p, keys, radius, scale);
     }
 }
 
@@ -328,7 +343,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_symmetric(
 pub unsafe extern "ptx-kernel" fn attention_prefill_d256_scored(p: Attention, scale: f32) {
     unsafe {
         let p = resolve_position(p);
-        attention::<256, 32, 0>(p, p.start + p.rows, 0, scale);
+        attention::<256, 32, 0, false>(p, p.start + p.rows, 0, scale);
     }
 }
 
@@ -342,7 +357,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_bidirectional_scored(
 ) {
     unsafe {
         let p = resolve_position(p);
-        attention::<256, 32, 1>(p, keys, 0, scale);
+        attention::<256, 32, 1, false>(p, keys, 0, scale);
     }
 }
 
@@ -352,7 +367,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_bidirectional_scored(
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128_bidirectional(p: Attention, keys: u32) {
     unsafe {
         let p = resolve_position(p);
-        attention::<128, 16, 1>(p, keys, 0, core::f32::consts::FRAC_1_SQRT_2 / 8.0);
+        attention::<128, 16, 1, false>(p, keys, 0, core::f32::consts::FRAC_1_SQRT_2 / 8.0);
     }
 }
 
@@ -366,7 +381,21 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d64_bidirectional(
 ) {
     unsafe {
         let p = resolve_position(p);
-        attention::<64, 8, 1>(p, keys, 0, scale);
+        attention::<64, 8, 1, false>(p, keys, 0, scale);
+    }
+}
+
+/// # Safety
+/// All keys below `keys` are populated in F16; launch uses 128 threads and 24576 shared bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "ptx-kernel" fn attention_prefill_d64_bidirectional_f16(
+    p: Attention,
+    keys: u32,
+    scale: f32,
+) {
+    unsafe {
+        let p = resolve_position(p);
+        attention::<64, 8, 1, true>(p, keys, 0, scale);
     }
 }
 
@@ -376,7 +405,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d64_bidirectional(
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128_prefix(p: Attention, prefix: u32) {
     unsafe {
         let p = resolve_position(p);
-        attention::<128, 16, 2>(
+        attention::<128, 16, 2, false>(
             p,
             prefix.max(p.start + p.rows),
             prefix,
@@ -395,7 +424,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_window(
 ) {
     unsafe {
         let p = resolve_position(p);
-        attention::<256, 32, 3>(p, p.start + p.rows, window, scale);
+        attention::<256, 32, 3, false>(p, p.start + p.rows, window, scale);
     }
 }
 
@@ -405,7 +434,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d256_window(
 pub unsafe extern "ptx-kernel" fn attention_prefill_d128_window(p: Attention, window: u32) {
     unsafe {
         let p = resolve_position(p);
-        attention::<128, 16, 3>(
+        attention::<128, 16, 3, false>(
             p,
             p.start + p.rows,
             window,
@@ -415,7 +444,7 @@ pub unsafe extern "ptx-kernel" fn attention_prefill_d128_window(p: Attention, wi
 }
 
 #[inline(always)]
-unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
+unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32, const F16: bool>(
     p: Attention,
     end: u32,
     prefix: u32,
@@ -547,8 +576,9 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                                 } else {
                                     ld4::<{ ($inner / 4) * 128 + $pair * 4096 }>(kb[$inner % 4])
                                 };
-                                scores[$pair * 2] = mma(a, [b[0], b[1]], scores[$pair * 2]);
-                                scores[$pair * 2 + 1] = mma(a, [b[2], b[3]], scores[$pair * 2 + 1]);
+                                scores[$pair * 2] = mma::<F16>(a, [b[0], b[1]], scores[$pair * 2]);
+                                scores[$pair * 2 + 1] =
+                                    mma::<F16>(a, [b[2], b[3]], scores[$pair * 2 + 1]);
                             }};
                         }
                         four!(qk_pair);
@@ -655,13 +685,13 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                         let d = probability::<{ D }>(scores[$n][3], negative_peak[1], scale);
                         sum[0] += a + b;
                         sum[1] += c + d;
-                        packed[$n / 2][($n % 2) * 2] = pack(a, b);
-                        packed[$n / 2][($n % 2) * 2 + 1] = pack(c, d);
+                        packed[$n / 2][($n % 2) * 2] = pack::<F16>(a, b);
+                        packed[$n / 2][($n % 2) * 2 + 1] = pack::<F16>(c, d);
                         if D <= 128 {
                             residual[$n / 2][($n % 2) * 2] =
-                                pack_residual(a, b, packed[$n / 2][($n % 2) * 2]);
+                                pack_residual::<F16>(a, b, packed[$n / 2][($n % 2) * 2]);
                             residual[$n / 2][($n % 2) * 2 + 1] =
-                                pack_residual(c, d, packed[$n / 2][($n % 2) * 2 + 1]);
+                                pack_residual::<F16>(c, d, packed[$n / 2][($n % 2) * 2 + 1]);
                         }
                     }};
                 }
@@ -700,13 +730,20 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                                         vb[$pair % 4],
                                     )
                                 };
-                                output[$pair * 2] = mma(a, [b[0], b[1]], output[$pair * 2]);
-                                output[$pair * 2 + 1] = mma(a, [b[2], b[3]], output[$pair * 2 + 1]);
+                                output[$pair * 2] = mma::<F16>(a, [b[0], b[1]], output[$pair * 2]);
+                                output[$pair * 2 + 1] =
+                                    mma::<F16>(a, [b[2], b[3]], output[$pair * 2 + 1]);
                                 if D <= 128 {
-                                    output[$pair * 2] =
-                                        mma(residual[$inner], [b[0], b[1]], output[$pair * 2]);
-                                    output[$pair * 2 + 1] =
-                                        mma(residual[$inner], [b[2], b[3]], output[$pair * 2 + 1]);
+                                    output[$pair * 2] = mma::<F16>(
+                                        residual[$inner],
+                                        [b[0], b[1]],
+                                        output[$pair * 2],
+                                    );
+                                    output[$pair * 2 + 1] = mma::<F16>(
+                                        residual[$inner],
+                                        [b[2], b[3]],
+                                        output[$pair * 2 + 1],
+                                    );
                                 }
                             }};
                         }
@@ -767,19 +804,19 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                 store_shared4(
                     base,
                     [
-                        pack(
+                        pack::<F16>(
                             output[$group * 4][0] * norm[0],
                             output[$group * 4][1] * norm[0],
                         ),
-                        pack(
+                        pack::<F16>(
                             output[$group * 4 + 1][0] * norm[0],
                             output[$group * 4 + 1][1] * norm[0],
                         ),
-                        pack(
+                        pack::<F16>(
                             output[$group * 4 + 2][0] * norm[0],
                             output[$group * 4 + 2][1] * norm[0],
                         ),
-                        pack(
+                        pack::<F16>(
                             output[$group * 4 + 3][0] * norm[0],
                             output[$group * 4 + 3][1] * norm[0],
                         ),
@@ -788,19 +825,19 @@ unsafe fn attention<const D: usize, const OUTPUT: usize, const MODE: u32>(
                 store_shared4(
                     base + 512,
                     [
-                        pack(
+                        pack::<F16>(
                             output[$group * 4][2] * norm[1],
                             output[$group * 4][3] * norm[1],
                         ),
-                        pack(
+                        pack::<F16>(
                             output[$group * 4 + 1][2] * norm[1],
                             output[$group * 4 + 1][3] * norm[1],
                         ),
-                        pack(
+                        pack::<F16>(
                             output[$group * 4 + 2][2] * norm[1],
                             output[$group * 4 + 2][3] * norm[1],
                         ),
-                        pack(
+                        pack::<F16>(
                             output[$group * 4 + 3][2] * norm[1],
                             output[$group * 4 + 3][3] * norm[1],
                         ),
@@ -989,8 +1026,9 @@ unsafe fn attention_d512<const SPLIT: bool, const BIDI: bool>(
                                 warp * 128 + $i * 16 + ((lane >> 3) & 1) * 8,
                                 512,
                             ));
-                            scores[$pair * 2] = mma(a, [b[0], b[1]], scores[$pair * 2]);
-                            scores[$pair * 2 + 1] = mma(a, [b[2], b[3]], scores[$pair * 2 + 1]);
+                            scores[$pair * 2] = mma::<false>(a, [b[0], b[1]], scores[$pair * 2]);
+                            scores[$pair * 2 + 1] =
+                                mma::<false>(a, [b[2], b[3]], scores[$pair * 2 + 1]);
                         }};
                     }
                     pair!(0);
@@ -1081,8 +1119,8 @@ unsafe fn attention_d512<const SPLIT: bool, const BIDI: bool>(
                     let d = probability::<512>(scores[$i][3], negative_peak[1], scale);
                     sum[0] += a + b;
                     sum[1] += c + d;
-                    packed[$i / 2][($i % 2) * 2] = pack(a, b);
-                    packed[$i / 2][($i % 2) * 2 + 1] = pack(c, d);
+                    packed[$i / 2][($i % 2) * 2] = pack::<false>(a, b);
+                    packed[$i / 2][($i % 2) * 2 + 1] = pack::<false>(c, d);
                 }};
             }
             four!(probabilities);
@@ -1114,9 +1152,9 @@ unsafe fn attention_d512<const SPLIT: bool, const BIDI: bool>(
                                 512,
                             ));
                             output[$pair * 2] =
-                                mma(packed[$inner], [b[0], b[1]], output[$pair * 2]);
+                                mma::<false>(packed[$inner], [b[0], b[1]], output[$pair * 2]);
                             output[$pair * 2 + 1] =
-                                mma(packed[$inner], [b[2], b[3]], output[$pair * 2 + 1]);
+                                mma::<false>(packed[$inner], [b[2], b[3]], output[$pair * 2 + 1]);
                         }};
                     }
                     eight!(pair);
@@ -1174,11 +1212,11 @@ unsafe fn attention_d512<const SPLIT: bool, const BIDI: bool>(
                 let col = warp * 128 + $i * 8 + (lane & 3) * 2;
                 if qstart + r0 < p.rows {
                     let dst = p.out.wrapping_add(((qstart + r0) as usize * p.q_heads as usize + head as usize)*512 + col as usize);
-                    asm!("st.global.u32 [{p}], {x};",p=in(reg64) dst,x=in(reg32) pack(output[$i][0]*inv[0],output[$i][1]*inv[0]));
+                    asm!("st.global.u32 [{p}], {x};",p=in(reg64) dst,x=in(reg32) pack::<false>(output[$i][0]*inv[0],output[$i][1]*inv[0]));
                 }
                 if qstart + r1 < p.rows {
                     let dst = p.out.wrapping_add(((qstart + r1) as usize * p.q_heads as usize + head as usize)*512 + col as usize);
-                    asm!("st.global.u32 [{p}], {x};",p=in(reg64) dst,x=in(reg32) pack(output[$i][2]*inv[1],output[$i][3]*inv[1]));
+                    asm!("st.global.u32 [{p}], {x};",p=in(reg64) dst,x=in(reg32) pack::<false>(output[$i][2]*inv[1],output[$i][3]*inv[1]));
                 }
             }};
         }
@@ -1229,8 +1267,8 @@ pub unsafe extern "ptx-kernel" fn attention_merge_d512(
         let dst = p
             .out
             .add((row as usize * p.q_heads as usize + head as usize) * 512 + tid as usize * 4);
-        let a = pack(output[0] * inv, output[1] * inv);
-        let b = pack(output[2] * inv, output[3] * inv);
+        let a = pack::<false>(output[0] * inv, output[1] * inv);
+        let b = pack::<false>(output[2] * inv, output[3] * inv);
         asm!("st.global.v2.u32 [{p}], {{{a},{b}}};", p=in(reg64) dst,a=in(reg32) a,b=in(reg32) b);
         if tid == 0 {
             *p.lse.add(head as usize * p.rows as usize + row as usize) = peak + logarithm(sum);

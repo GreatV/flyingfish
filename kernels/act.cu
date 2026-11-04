@@ -86,6 +86,26 @@ extern "C" __global__ void silu_mul_split(const __nv_bfloat16* gate,
     reinterpret_cast<uint4*>(y)[vec] = yv;
 }
 
+extern "C" __global__ void silu_mul_split_f32(const float* gate,
+                                              const float* up,
+                                              float* y, int count,
+                                              int mode) {
+    if ((unsigned)mode > 2u || count < 0 || !gate || !up || !y) {
+        __trap();
+        return;
+    }
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
+         i += gridDim.x * blockDim.x) {
+        const float g = gate[i];
+        const float u = up[i];
+        if (mode == 2) {
+            y[i] = __fmul_rn(gelu_tanh(g), u);
+        } else {
+            y[i] = __fmul_rn(__fdiv_rn(g, __fadd_rn(1.0f, expf(-g))), u);
+        }
+    }
+}
+
 // Clamped SwiGLU over dense [rows, width] gate and up regions (ClampedTwice):
 // gate clamps above at the limit, up on both sides; the SiLU rounds to BF16,
 // then the product rounds once. Grid (vectors, row_capacity), 256 threads,

@@ -1237,6 +1237,56 @@ impl Blas {
         Ok(())
     }
 
+    pub(crate) fn linear_f16(
+        &self,
+        weight: super::contracts::Tensor<half::f16, 2>,
+        x: super::contracts::Tensor<half::f16, 2>,
+        y: &mut super::contracts::TensorMut<half::f16, 2>,
+    ) -> Result<()> {
+        weight.validate()?;
+        x.validate()?;
+        y.0.validate()?;
+        let rows = x.shape[0] as usize;
+        let input = x.shape[1] as usize;
+        let output = weight.shape[0] as usize;
+        checked_dims(rows, output, input)?;
+        ensure!(
+            weight.shape == [output as u32, input as u32]
+                && weight.stride == [input as u64, 1]
+                && x.stride == [input as u64, 1]
+                && y.0.shape == [rows as u32, output as u32]
+                && y.0.stride == [output as u64, 1],
+            "FP16 linear requires dense [output,input] x [rows,input] -> [rows,output]"
+        );
+        let alpha = 1f32;
+        let beta = 0f32;
+        unsafe {
+            bs::cublasGemmEx(
+                *self.decode.handle(),
+                bs::cublasOperation_t::CUBLAS_OP_T,
+                bs::cublasOperation_t::CUBLAS_OP_N,
+                output as i32,
+                rows as i32,
+                input as i32,
+                (&alpha as *const f32).cast(),
+                weight.ptr as *const core::ffi::c_void,
+                bs::cudaDataType_t::CUDA_R_16F,
+                input as i32,
+                x.ptr as *const core::ffi::c_void,
+                bs::cudaDataType_t::CUDA_R_16F,
+                input as i32,
+                (&beta as *const f32).cast(),
+                y.0.ptr as *mut core::ffi::c_void,
+                bs::cudaDataType_t::CUDA_R_16F,
+                output as i32,
+                bs::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                bs::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+            .result()?;
+        }
+        Ok(())
+    }
+
     /// `y = bf16(y + alpha * x * weight^T)` with BF16 operands and FP32 compute. `weight` is dense
     /// `[output, input]`; `x [rows, input]` and `y [rows, output]` may have row pitches above their widths.
     pub(crate) fn linear_accumulate(
