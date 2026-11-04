@@ -3433,7 +3433,7 @@ mod tests {
                     dense.shift_source_offset(layer, name, delta)?;
                 }
                 let mut mismatches = Vec::new();
-                for layer in 0..spec.layers {
+                for (layer, &layer_bytes) in layers.iter().enumerate() {
                     let name = format!("transformer_blocks.{layer}");
                     let resident = BlockWeights::resident(
                         stream,
@@ -3446,13 +3446,13 @@ mod tests {
                     let expected = stream
                         .clone_dtoh(resident.storage.as_ref().context("resident storage")?)?;
                     dense.begin(layer, stream)?;
-                    let pointer = dense.pointer(layer, 0, layers[layer])?;
+                    let pointer = dense.pointer(layer, 0, layer_bytes)?;
                     let actual = stream.alloc_zeros::<bf16>(expected.len())?;
                     unsafe {
                         cudarc::driver::result::memcpy_dtod_async(
                             actual.device_ptr(stream).0,
                             pointer,
-                            layers[layer],
+                            layer_bytes,
                             stream.cu_stream(),
                         )?;
                     }
