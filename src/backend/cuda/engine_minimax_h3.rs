@@ -3447,7 +3447,7 @@ mod tests {
                         .clone_dtoh(resident.storage.as_ref().context("resident storage")?)?;
                     dense.begin(layer, stream)?;
                     let pointer = dense.pointer(layer, 0, layers[layer])?;
-                    let mut actual = stream.alloc_zeros::<bf16>(expected.len())?;
+                    let actual = stream.alloc_zeros::<bf16>(expected.len())?;
                     unsafe {
                         cudarc::driver::result::memcpy_dtod_async(
                             actual.device_ptr(stream).0,
