@@ -3087,7 +3087,8 @@ mod tests {
 
     /// The GGUF layer gate: one H3 transformer block with the gguf-py-dequantized weights, run by the engine on the
     /// definition reference's dumped input and conditioning, compared with the definition's own output. The floor is
-    /// the reference's FP32-vs-BF16 arm spread; the control re-runs with the fused gate+up halves unswapped.
+    /// the max over the reference's pairwise arm spreads and the engine's official-weight spread; the control
+    /// re-runs with the fused gate+up halves unswapped.
     #[test]
     #[ignore = "FF_MODEL, FF_H3_GGUF, FF_H3_GGUF_BLOCK_OUT, FF_H3_LORA"]
     fn gguf_block_matches_the_definition_reference() -> Result<()> {
@@ -3197,6 +3198,7 @@ mod tests {
         };
         let reference_bf16 = output("bf16")?;
         let reference_fp32 = output("fp32")?;
+        let reference_bf16_strict = output("bf16_strict")?;
         let reference_official = output("official")?;
 
         let device = Device::new(0)?;
@@ -3286,10 +3288,23 @@ mod tests {
         let control = run(&wrong_weights)?;
         let engine_official = run(&official_weights)?;
 
-        // The floor on this gate's own input: the reference's FP32-vs-BF16 arm spread, and the engine's
+        // The floor on this gate's own input: the reference's max pairwise arm spread, and the engine's
         // block-vs-definition arithmetic spread measured here with the official BF16 weights on the same
-        // conditioning (the `official` arm shares the GGUF temb/rotary).
-        let arm_floor = distance(&reference_bf16, &reference_fp32);
+        // conditioning (the `official` arm shares the GGUF temb/rotary and the GGUF AdaLN table).
+        let arm_pairs = [
+            ("bf16_vs_fp32", distance(&reference_bf16, &reference_fp32)),
+            (
+                "bf16_vs_bf16_strict",
+                distance(&reference_bf16, &reference_bf16_strict),
+            ),
+            (
+                "fp32_vs_bf16_strict",
+                distance(&reference_fp32, &reference_bf16_strict),
+            ),
+        ];
+        let arm_floor = arm_pairs.iter().fold([0.0f64, 0.0, 2.0], |floor, (_, d)| {
+            [floor[0].max(d[0]), floor[1].max(d[1]), floor[2].min(d[2])]
+        });
         let engine_floor = distance(&engine_official, &reference_official);
         let floor = [
             arm_floor[0].max(engine_floor[0]),
@@ -3306,7 +3321,7 @@ mod tests {
         let control_rel_ratio = d_control[1] / rel_tau;
         let caught = control_abs_ratio > 10.0 || control_rel_ratio > 10.0;
         println!(
-            "H3_GGUF_BLOCK candidate={d:?} arm_floor={arm_floor:?} engine_floor={engine_floor:?} floor={floor:?} control={d_control:?} control_abs_ratio={control_abs_ratio:.3} control_rel_ratio={control_rel_ratio:.3} abs_tau={abs_tau} rel_tau={rel_tau} within={ok}"
+            "H3_GGUF_BLOCK candidate={d:?} arm_pairs={arm_pairs:?} arm_floor={arm_floor:?} engine_floor={engine_floor:?} floor={floor:?} control={d_control:?} control_abs_ratio={control_abs_ratio:.3} control_rel_ratio={control_rel_ratio:.3} abs_tau={abs_tau} rel_tau={rel_tau} within={ok}"
         );
         ensure!(
             candidate.iter().all(|v| v.is_finite()),
