@@ -792,17 +792,22 @@ impl Music3Syn {
             let scores_ptr = ws.scores.device_ptr_mut(s).0;
             let cos_ptr = ws.rotary_cos.device_ptr(s).0;
             let sin_ptr = ws.rotary_sin.device_ptr(s).0;
+            // Each branch window rotates its own rows 0..tokens against
+            // the shared single-branch table.
             for buffer in [q_ptr, k_ptr] {
-                unsafe {
-                    s.launch_builder(&self.rotary)
-                        .arg(&buffer)
-                        .arg(&cos_ptr)
-                        .arg(&sin_ptr)
-                        .arg(&(pair_tokens as i32))
-                        .arg(&(heads as i32))
-                        .arg(&(head_dim as i32))
-                        .arg(&(rotary_dim as i32))
-                        .launch(super::ops::flat(pair_tokens * heads * rotary_dim))?;
+                for branch in 0..2 {
+                    let base = buffer + 4 * (branch * tokens * dim) as u64;
+                    unsafe {
+                        s.launch_builder(&self.rotary)
+                            .arg(&base)
+                            .arg(&cos_ptr)
+                            .arg(&sin_ptr)
+                            .arg(&(tokens as i32))
+                            .arg(&(heads as i32))
+                            .arg(&(head_dim as i32))
+                            .arg(&(rotary_dim as i32))
+                            .launch(super::ops::flat(tokens * heads * rotary_dim))?;
+                    }
                 }
             }
             for head in 0..heads {
@@ -1009,9 +1014,15 @@ impl Music3Syn {
         let length = self.latent_length(frames);
         ensure!(length <= self.max_length, "length exceeds workspace");
         self.condition_encode(ws, condition_input, frames)?;
-        let sigmas = Self::sigma_schedule(30);
-        s.memcpy_dtod(initial, &mut ws.x)?;
         let channels = self.spec.in_channels as usize;
+        ensure!(
+            initial.len() == channels * length,
+            "initial latent extent: got {} elements, in_channels * latent_length = {}",
+            initial.len(),
+            channels * length
+        );
+        let sigmas = Self::sigma_schedule(30);
+        s.memcpy_dtod(initial, &mut ws.x.slice_mut(0..channels * length))?;
         // Pair k runs at t = sigmas[k] and applies x +=
         // (sigmas[k+1] - sigmas[k]) * guided(v_pair_k), k = 0..30.
         // The transition-29 output is the vocoder latent; no call input
@@ -1628,10 +1639,9 @@ fn build_workspace(
         }
     }
     let half = rotary_dim / 2;
-    let mut cos = Vec::with_capacity(pair * rotary_dim);
-    let mut sin = Vec::with_capacity(pair * rotary_dim);
-    for row in 0..pair {
-        let pos = row % tokens;
+    let mut cos = Vec::with_capacity(tokens * rotary_dim);
+    let mut sin = Vec::with_capacity(tokens * rotary_dim);
+    for pos in 0..tokens {
         let freqs: Vec<f32> = (0..half)
             .map(|i| pos as f32 / 10000.0f32.powf((2 * i) as f32 / rotary_dim as f32))
             .collect();

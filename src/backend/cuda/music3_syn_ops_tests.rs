@@ -519,7 +519,9 @@ mod end_to_end {
             &device,
             86,
         )?;
-        let mut workspace = Music3Syn::workspace(&engine.spec, &device, 86)?;
+        // max_length above the synthesis length: the whole path runs
+        // with short windows.
+        let mut workspace = Music3Syn::workspace(&engine.spec, &device, 120)?;
         let capture_bytes = std::fs::read(std::path::PathBuf::from(std::env::var(
             "FF_MUSIC3_CAPTURE",
         )?))?;
@@ -633,7 +635,9 @@ mod pair_flow {
             &device,
             86,
         )?;
-        let mut workspace = Music3Syn::workspace(&engine.spec, &device, 86)?;
+        // max_length above the capture length: the pair windows must
+        // rotate on their own rows, not the packed-table positions.
+        let mut workspace = Music3Syn::workspace(&engine.spec, &device, 120)?;
         let capture_bytes = std::fs::read(std::path::PathBuf::from(std::env::var(
             "FF_MUSIC3_CAPTURE",
         )?))?;
