@@ -229,7 +229,7 @@ mod encoder {
             .context("frozen condition_encoder rmse bound missing")?;
 
         let frames = 25usize;
-        let length = engine.latent_length(frames);
+        let length = engine.spec.latent_length(frames);
         ensure!(length == 86, "unexpected latent length {length}");
         let cond_out = engine.spec.cond_out as usize;
         let want = tensor_f32(&view, "condition_encoder")?;
@@ -338,7 +338,7 @@ mod vocoder_gate {
             .as_f64()
             .context("final_audio rmse bound missing")?;
 
-        let length = 86usize;
+        let length = engine.spec.latent_length(25);
         let channels = engine.spec.in_channels as usize;
         let total: usize = engine.spec.upsampling.iter().map(|r| *r as usize).product();
         let latent = tensor_f32(&view, "syn_vocoder_latent")?;
@@ -536,7 +536,7 @@ mod end_to_end {
             .as_f64()
             .context("final_audio rmse bound missing")?;
 
-        let length = 86usize;
+        let length = engine.spec.latent_length(25);
         let total: usize = engine.spec.upsampling.iter().map(|r| *r as usize).product();
         let initial = tensor_f32(&view, "syn_x_t_000")?;
         let cond_input = tensor_f32(&view, "condition_input")?;
@@ -603,6 +603,231 @@ mod end_to_end {
 }
 
 #[cfg(feature = "cuda")]
+mod e2e {
+    use super::super::Device;
+    use super::super::engine_music3_syn::Music3Syn;
+    use super::super::music3::generate_inner;
+    use crate::music3::Music3Request;
+    use anyhow::{Context, Result, ensure};
+    use safetensors::SafeTensors;
+
+    fn tensor_f32<'a>(view: &'a SafeTensors<'a>, name: &str) -> Result<Vec<f32>> {
+        let t = view
+            .tensor(name)
+            .with_context(|| format!("tensor {name}"))?;
+        let bytes = t.data();
+        Ok(bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
+
+    struct E2EInputs {
+        request: Music3Request,
+        codes: Vec<u32>,
+        condition_input: Vec<f32>,
+        want_audio: Vec<f32>,
+        handoff_bound: (f64, f64),
+        audio_bound: (f64, f64),
+    }
+
+    fn load_inputs() -> Result<E2EInputs> {
+        let capture_bytes =
+            std::fs::read(std::path::PathBuf::from(std::env::var("FF_MUSIC3_E2E")?))?;
+        let view = SafeTensors::deserialize(&capture_bytes)?;
+        let ids_t = view.tensor("ar_prompt_ids").context("ar_prompt_ids")?;
+        ensure!(ids_t.dtype() == safetensors::Dtype::I64, "prompt id dtype");
+        let ids = ids_t
+            .data()
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u32::try_from(i64::from_le_bytes(*c)))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let codes: Vec<u32> = serde_json::from_str(&std::fs::read_to_string(
+            std::path::PathBuf::from(std::env::var("FF_MUSIC3_E2E_CODES")?),
+        )?)?;
+        let frozen: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            std::path::PathBuf::from(std::env::var("FF_MUSIC3_FROZEN_R5")?),
+        )?)?;
+        let cell = |name: &str| -> Result<(f64, f64)> {
+            let c = &frozen["cells"][name]["bound"];
+            Ok((
+                c["max"].as_f64().context("bound max")?,
+                c["rmse"].as_f64().context("bound rmse")?,
+            ))
+        };
+        let spec = crate::music3::SynSpec::read(&std::path::PathBuf::from(
+            std::env::var("FF_MUSIC3_MODEL").context("model dir")?,
+        ))?;
+        let frames = 25usize;
+        let length = spec.latent_length(frames);
+        let channels = spec.in_channels as usize;
+        let initial = tensor_f32(&view, "syn_x_t_000")?;
+        ensure!(
+            initial.len() == channels * length,
+            "captured initial latent extent"
+        );
+        Ok(E2EInputs {
+            request: Music3Request {
+                prompt_ids: ids,
+                frames,
+                initial,
+                seed: 0,
+            },
+            codes,
+            condition_input: tensor_f32(&view, "condition_input")?,
+            want_audio: tensor_f32(&view, "final_audio")?,
+            handoff_bound: cell("condition_input")?,
+            audio_bound: cell("final_audio")?,
+        })
+    }
+
+    /// The full chain through the production entry inner with the
+    /// recorded draws; the AR features must land inside the frozen handoff
+    /// cell, and a layout-misread perturbation of the features must trip
+    /// the same comparator at 10x the bound.
+    #[test]
+    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_E2E, FF_MUSIC3_E2E_CODES, FF_MUSIC3_FROZEN_R5"]
+    fn music3_e2e_handoff_gpu() -> Result<()> {
+        std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
+        let model =
+            std::path::PathBuf::from(std::env::var("FF_MUSIC3_MODEL").context("model dir")?);
+        let input = load_inputs()?;
+        let scratch = std::env::temp_dir().join(format!("ff-m3e2e-{}", std::process::id()));
+        std::fs::create_dir(&scratch)?;
+        let probe = Device::new(0)?;
+        let free_before = probe.ctx.mem_get_info()?.0;
+        let (features, _output) =
+            generate_inner(&model, &input.request, &scratch, Some(&input.codes))?;
+        let free_after = probe.ctx.mem_get_info()?.0;
+        std::fs::remove_dir_all(&scratch)?;
+        let features = &features;
+        ensure!(!features.is_empty(), "empty AR features");
+        println!("M3E2E_RELEASE free_before={free_before} free_after={free_after}");
+
+        let max_abs = features
+            .iter()
+            .zip(&input.condition_input)
+            .map(|(a, b)| (a - b).abs() as f64)
+            .fold(0.0, f64::max);
+        let rmse = (features
+            .iter()
+            .zip(&input.condition_input)
+            .map(|(a, b)| (*a as f64 - *b as f64) * (*a as f64 - *b as f64))
+            .sum::<f64>()
+            / features.len() as f64)
+            .sqrt();
+        println!(
+            "M3E2E_HANDOFF max_abs={max_abs:.6e} (bound {:.6e}) rmse={rmse:.6e} (bound {:.6e})",
+            input.handoff_bound.0, input.handoff_bound.1
+        );
+        ensure!(
+            max_abs <= input.handoff_bound.0 && rmse <= input.handoff_bound.1,
+            "AR feature handoff exceeds the frozen cell"
+        );
+
+        // A wrong handoff reading the [frames, layers, hidden] features as
+        // [layers, frames, hidden] must exceed 10x the bound max through
+        // the same comparator.
+        let width = input.condition_input.len();
+        let frames = input.request.frames;
+        let spec = crate::music3::SynSpec::read(&model)?;
+        let layers = spec.cond_layers as usize;
+        let hidden = spec.cond_hidden as usize;
+        let mut misread = vec![0.0f32; width];
+        for f in 0..frames {
+            for l in 0..layers {
+                for h in 0..hidden {
+                    misread[f * layers * hidden + l * hidden + h] =
+                        features[l * frames * hidden + f * hidden + h];
+                }
+            }
+        }
+        let control = misread
+            .iter()
+            .zip(&input.condition_input)
+            .map(|(a, b)| (a - b).abs() as f64)
+            .fold(0.0, f64::max);
+        let control_threshold = 10.0 * input.handoff_bound.0;
+        println!("M3E2E_HANDOFF_CONTROL layout_misread={control:.6e} >= {control_threshold:.6e}");
+        ensure!(
+            control >= control_threshold,
+            "layout-misread control under 10x the handoff bound"
+        );
+        Ok(())
+    }
+
+    /// The chain through the production entry inner on the recorded
+    /// draws; the PCM must land inside the frozen audio cell. The
+    /// zero-condition control builds the synthesis stage directly: it
+    /// perturbs the stage input, which the entry API does not expose.
+    #[test]
+    #[ignore = "requires coordinator-granted GPU window; FF_MUSIC3_MODEL, FF_MUSIC3_E2E, FF_MUSIC3_E2E_CODES, FF_MUSIC3_FROZEN_R5"]
+    fn music3_e2e_gpu() -> Result<()> {
+        std::env::var("FF_Q38_GPU_WINDOW").context("GPU window not granted")?;
+        let model =
+            std::path::PathBuf::from(std::env::var("FF_MUSIC3_MODEL").context("model dir")?);
+        let input = load_inputs()?;
+        let scratch = std::env::temp_dir().join(format!("ff-m3e2e-{}", std::process::id()));
+        std::fs::create_dir(&scratch)?;
+        let (_features, output) =
+            generate_inner(&model, &input.request, &scratch, Some(&input.codes))?;
+        std::fs::remove_dir_all(&scratch)?;
+        let got = &output.pcm;
+        let max_abs = got
+            .iter()
+            .zip(&input.want_audio)
+            .map(|(a, b)| (a - b).abs() as f64)
+            .fold(0.0, f64::max);
+        let rmse = (got
+            .iter()
+            .zip(&input.want_audio)
+            .map(|(a, b)| (*a as f64 - *b as f64) * (*a as f64 - *b as f64))
+            .sum::<f64>()
+            / got.len() as f64)
+            .sqrt();
+        println!(
+            "M3E2E_AUDIO max_abs={max_abs:.6e} (bound {:.6e}) rmse={rmse:.6e} (bound {:.6e})",
+            input.audio_bound.0, input.audio_bound.1
+        );
+        ensure!(
+            max_abs <= input.audio_bound.0 && rmse <= input.audio_bound.1,
+            "end-to-end PCM exceeds the frozen cell"
+        );
+
+        let device = Device::new(0)?;
+        let spec = crate::music3::SynSpec::read(&model)?;
+        let length = spec.latent_length(25);
+        let total: usize = spec.upsampling.iter().map(|r| *r as usize).product();
+        let engine = Music3Syn::load(&model, &device, length)?;
+        let mut ws = Music3Syn::workspace(&engine.spec, &device, length)?;
+        let s = &device.stream;
+        let zero_features =
+            vec![0.0f32; spec.cond_layers as usize * spec.cond_hidden as usize * 25];
+        let d_zero = s.clone_htod(&zero_features)?;
+        let d_initial = s.clone_htod(&input.request.initial)?;
+        let mut audio = unsafe { s.alloc::<f32>(2 * length * total)? };
+        engine.synthesize(&mut ws, &d_zero, 25, &d_initial, &mut audio)?;
+        let control = s
+            .clone_dtoh(&audio)?
+            .iter()
+            .zip(&input.want_audio)
+            .map(|(a, b)| (a - b).abs() as f64)
+            .fold(0.0, f64::max);
+        let control_threshold = 10.0 * input.audio_bound.0;
+        println!("M3E2E_AUDIO_CONTROL zero_condition={control:.6e} >= {control_threshold:.6e}");
+        ensure!(
+            control >= control_threshold,
+            "zero-condition control under 10x the audio bound"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
 mod pair_flow {
     use super::super::Device;
     use super::super::engine_music3_syn::Music3Syn;
@@ -645,7 +870,7 @@ mod pair_flow {
         let s = &engine.stream;
         let channels = engine.spec.in_channels as usize;
         let cond_dim = engine.spec.cond_out as usize;
-        let length = 86usize;
+        let length = engine.spec.latent_length(25);
         let timesteps = tensor_f32(&view, "syn_timesteps")?;
 
         // Pair call on step 0 inputs: x_t_000 + cond_000, t = timesteps[0].

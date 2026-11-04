@@ -1011,7 +1011,7 @@ impl Music3Syn {
         audio: &mut CudaSlice<f32>,
     ) -> Result<()> {
         let s = &self.stream;
-        let length = self.latent_length(frames);
+        let length = self.spec.latent_length(frames);
         ensure!(length <= self.max_length, "length exceeds workspace");
         self.condition_encode(ws, condition_input, frames)?;
         let channels = self.spec.in_channels as usize;
@@ -1066,12 +1066,6 @@ impl Music3Syn {
 
     /// Latent length for a frame count: int(frames * out_rate * in_hop /
     /// (in_rate * out_hop)), at least 1.
-    pub fn latent_length(&self, frames: usize) -> usize {
-        let numerator = self.spec.output_rate as u64 * self.spec.input_hop as u64 * frames as u64;
-        let denominator = self.spec.input_rate as u64 * self.spec.output_hop as u64;
-        usize::max(1, (numerator / denominator) as usize)
-    }
-
     /// Condition encoder: fused layer softmax-sum, k=3 conv and nearest
     /// upsample. `input` is [frames, layers*cond_hidden], `out`
     /// [latent_length, cond_out].
@@ -1085,7 +1079,7 @@ impl Music3Syn {
         let cond_hidden = self.spec.cond_hidden as usize;
         let cond_out = self.spec.cond_out as usize;
         let layers = self.spec.cond_layers as usize;
-        let length = self.latent_length(frames);
+        let length = self.spec.latent_length(frames);
         ensure!(
             input.len() == frames * layers * cond_hidden
                 && ws.cond.len() >= length * cond_out

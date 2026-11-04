@@ -9,7 +9,23 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, path::Path};
 
 #[cfg(feature = "cuda")]
-pub use crate::backend::cuda::music3::Runtime;
+pub use crate::backend::cuda::music3::{Runtime, generate};
+
+/// One production synthesis request: AR prompt token ids in the paired
+/// cond/uncond layout [2, prompt_rows] (row 0 cond, row 1 uncond; the
+/// length must be even), the audio frame count, the initial flow latent
+/// [in_channels, latent_length(frames)] and the AR sampling seed.
+pub struct Music3Request {
+    pub prompt_ids: Vec<u32>,
+    pub frames: usize,
+    pub initial: Vec<f32>,
+    pub seed: u64,
+}
+
+/// Synthesis output: stereo PCM [2, latent_length(frames) * upsampling].
+pub struct Music3Output {
+    pub pcm: Vec<f32>,
+}
 
 /// Synthesis-stage geometry from the per-component configs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -50,6 +66,14 @@ impl SynSpec {
     /// Vocoder channel width of one folded stereo stream.
     pub fn vocoder_stream_channels(&self) -> u32 {
         self.latent_channels / 2
+    }
+
+    /// Latent length for a frame count: int(frames * out_rate * in_hop /
+    /// (in_rate * out_hop)), at least 1.
+    pub fn latent_length(&self, frames: usize) -> usize {
+        let numerator = self.output_rate as u64 * self.input_hop as u64 * frames as u64;
+        let denominator = self.input_rate as u64 * self.output_hop as u64;
+        usize::max(1, (numerator / denominator) as usize)
     }
 
     pub fn read(dir: &Path) -> Result<Self> {

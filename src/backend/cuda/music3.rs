@@ -1302,6 +1302,108 @@ impl Runtime {
     }
 }
 
+/// One production synthesis: the AR stage runs the prompt, its condition
+/// features hand off to the synthesis stage, the AR runtime is released
+/// before the synthesis weights load, and the flow + vocoder emit stereo
+/// PCM.
+pub fn generate(
+    model: &Path,
+    request: &crate::music3::Music3Request,
+    runtime: &Path,
+) -> Result<crate::music3::Music3Output> {
+    Ok(generate_inner(model, request, runtime, None)?.1)
+}
+
+/// The chain with optional teacher-forced draws; the public entry passes
+/// none, the gates pass the recorded codes.
+pub(crate) fn generate_inner(
+    model: &Path,
+    request: &crate::music3::Music3Request,
+    runtime: &Path,
+    recorded: Option<&[u32]>,
+) -> Result<(Vec<f32>, crate::music3::Music3Output)> {
+    use super::engine_music3_syn::Music3Syn;
+
+    let spec = crate::music3::SynSpec::read(model)?;
+    let length = spec.latent_length(request.frames);
+    let channels = spec.in_channels as usize;
+    ensure!(!request.prompt_ids.is_empty(), "empty AR prompt");
+    ensure!(
+        request.prompt_ids.len().is_multiple_of(2),
+        "AR prompt ids are the paired cond/uncond layout [2, prompt_rows]; got {} elements",
+        request.prompt_ids.len()
+    );
+    ensure!(
+        request.initial.len() == channels * length,
+        "initial latent extent: got {} elements, in_channels * latent_length = {}",
+        request.initial.len(),
+        channels * length
+    );
+    let handoff_width = spec.cond_layers as usize * spec.cond_hidden as usize;
+    let total: usize = spec.upsampling.iter().map(|r| *r as usize).product();
+
+    let device_ctx = Device::new(0)?;
+    let (free, _t) = device_ctx.ctx.mem_get_info()?;
+    let mut ar = Runtime::load(
+        model,
+        runtime,
+        request.prompt_ids.len() / 2,
+        request.frames,
+        free,
+    )?;
+    let features = ar.generate(&request.prompt_ids, recorded, request.seed)?;
+    ensure!(
+        features.len() == request.frames * handoff_width,
+        "AR feature handoff: got {} elements, frames * cond_layers * cond_hidden = {}",
+        features.len(),
+        request.frames * handoff_width
+    );
+    drop(ar);
+
+    // Workspace first: its bytes are measured from the real allocations.
+    let mut ws = super::engine_music3_syn::Music3Syn::workspace(&spec, &device_ctx, length)?;
+    let (post_release, _t) = device_ctx.ctx.mem_get_info()?;
+    let syn_bytes = syn_resident_bytes(model)?;
+    let reserve = 1usize << 30;
+    ensure!(
+        post_release > syn_bytes + reserve,
+        "synthesis weights {} + {} reserve exceed free {} after AR release and workspace; the check covers weights only",
+        syn_bytes,
+        reserve,
+        post_release
+    );
+    let engine = Music3Syn::load(model, &device_ctx, length)?;
+    let s = &device_ctx.stream;
+    let d_features = s.clone_htod(&features)?;
+    let d_initial = s.clone_htod(&request.initial)?;
+    let mut audio = unsafe { s.alloc::<f32>(2 * length * total)? };
+    engine.synthesize(&mut ws, &d_features, request.frames, &d_initial, &mut audio)?;
+    let pcm = s.clone_dtoh(&audio)?;
+    Ok((features, crate::music3::Music3Output { pcm }))
+}
+
+/// Sum of the three synthesis component safetensors: the F32 resident
+/// weight estimate for the release assert.
+fn syn_resident_bytes(model: &Path) -> Result<usize> {
+    let mut bytes = 0usize;
+    for component in ["transformer", "condition_encoder", "vocoder"] {
+        for entry in std::fs::read_dir(model.join(component))
+            .with_context(|| format!("synthesis component dir {component}"))?
+        {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".safetensors") {
+                bytes += entry
+                    .metadata()
+                    .with_context(|| format!("component file {name}"))?
+                    .len() as usize;
+            }
+        }
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
