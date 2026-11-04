@@ -3217,6 +3217,33 @@ impl Engine {
             settings.kv_format,
             s,
         )?;
+        let mut kv_scratch = if settings.kv_format == crate::kv::KvFormat::Bf16 {
+            None
+        } else {
+            Some((
+                s.alloc_zeros::<bf16>(capacity * kv_width as usize)?,
+                s.alloc_zeros::<bf16>(capacity * kv_width as usize)?,
+            ))
+        };
+        let capture_checkpoint =
+            if glm || model_spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
+                None
+            } else {
+                Some(super::super::state::StateCheckpoint::new(
+                    &state,
+                    &model_spec,
+                    1,
+                    s,
+                )?)
+            };
+        let ops = Ops::new(&device.ctx)?;
+        #[cfg(feature = "cuda")]
+        let mut blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
+        #[cfg(feature = "rocm")]
+        let mut blas = Blas::new(device.stream.clone())?;
+        if model_spec.linear_format.fp8_layout().is_some() {
+            blas.enable_fp8(&device.ctx)?;
+        }
         let prefix_cache = settings.prefix_cache;
         #[cfg(feature = "cuda")]
         let mut catalog =
@@ -3288,25 +3315,6 @@ impl Engine {
             identity.attention_kv_dtype = settings.kv_format.tag().into();
         }
         let weights = catalog.take_globals()?;
-        let mut kv_scratch = if settings.kv_format == crate::kv::KvFormat::Bf16 {
-            None
-        } else {
-            Some((
-                s.alloc_zeros::<bf16>(capacity * kv_width as usize)?,
-                s.alloc_zeros::<bf16>(capacity * kv_width as usize)?,
-            ))
-        };
-        let capture_checkpoint =
-            if glm || model_spec.architecture == crate::model_spec::Architecture::EmbeddingGemma2 {
-                None
-            } else {
-                Some(super::super::state::StateCheckpoint::new(
-                    &state,
-                    &model_spec,
-                    1,
-                    s,
-                )?)
-            };
         #[cfg(feature = "cuda")]
         let arena_bytes = (0..model_spec.layers.len())
             .map(|i| {
@@ -3324,14 +3332,6 @@ impl Engine {
         } else {
             Some(s.alloc_zeros::<u8>(usize::try_from(arena_bytes)?)?)
         };
-        let ops = Ops::new(&device.ctx)?;
-        #[cfg(feature = "cuda")]
-        let mut blas = Blas::new(&device, &ops, &runtime, closure.clone())?;
-        #[cfg(feature = "rocm")]
-        let mut blas = Blas::new(device.stream.clone())?;
-        if model_spec.linear_format.fp8_layout().is_some() {
-            blas.enable_fp8(&device.ctx)?;
-        }
         let mut draft = if let Some(draft_config) = &draft_config {
             let path = settings
                 .draft_model
