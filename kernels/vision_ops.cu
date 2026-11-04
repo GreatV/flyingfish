@@ -644,7 +644,9 @@ extern "C" __global__ __launch_bounds__(1024) void group_norm_silu_f32(
         const uint64_t i = (e / width) * channels + first + e % width;
         const uint32_t c = first + uint32_t(e % width);
         const float a = __fmul_rn(rstd, gamma[c]);
-        const float v = __fmaf_rn(x[i], a, __fmaf_rn(-a, mean, beta[c]));
+        const float b = blockDim.x == 512 ? __fsub_rn(beta[c], __fmul_rn(a, mean))
+                                        : __fmaf_rn(-a, mean, beta[c]);
+        const float v = __fmaf_rn(x[i], a, b);
         y[i] = __fdiv_rn(v, __fadd_rn(1.0f, expf(-v)));
     }
 }
