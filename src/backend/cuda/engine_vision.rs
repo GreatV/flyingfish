@@ -5426,9 +5426,7 @@ impl DinoV3Encoder {
 
 struct NafConv {
     weight: BiasedWeight<f32>,
-    linear: CudaFunction,
-    kernel: u32,
-    input_channels: u32,
+    plan: super::blas::Conv2dF32,
 }
 
 struct NafGuideBranch {
@@ -5438,7 +5436,7 @@ struct NafGuideBranch {
 
 struct NafEncoder {
     branches: [NafGuideBranch; 2],
-    im2col: CudaFunction,
+    transpose: CudaFunction,
     group_norm: CudaFunction,
     pool: CudaFunction,
     rope: CudaFunction,
@@ -5451,10 +5449,9 @@ struct NafWorkspace {
     output_side: u32,
     source_side: u32,
     dilation: u32,
-    conv_rows: u32,
+    convolution: super::blas::Conv2dWorkspaceF32,
     a: CudaSlice<f32>,
     b: CudaSlice<f32>,
-    columns: CudaSlice<f32>,
     guide: CudaSlice<f32>,
     keys: CudaSlice<f32>,
     output: CudaSlice<f32>,
@@ -5462,7 +5459,9 @@ struct NafWorkspace {
 }
 
 impl NafEncoder {
-    fn load(device: &Device, dir: &std::path::Path) -> Result<Self> {
+    fn load(device: &Device, dir: &std::path::Path, image_side: u32) -> Result<Self> {
+        let convolution_handle = cudarc::cudnn::Cudnn::new(device.stream.clone())
+            .context("cuDNN F32 convolution handle")?;
         let checkpoint =
             crate::checkpoint::MappedCheckpoint::open_component(dir, "naf_release.pth")?;
         let mut remaining = checkpoint
@@ -5495,11 +5494,11 @@ impl NafEncoder {
                 )?;
                 let bias = read(&format!("{prefix}.bias"), &[128])?;
                 Ok(NafConv {
-                    linear: module.load_function(if kernel == 3 && channels == 128 {
-                        "linear_compensated_f32"
-                    } else {
-                        "linear_ordered_f32"
-                    })?,
+                    plan: super::blas::Conv2dF32::new(
+                        s,
+                        &convolution_handle,
+                        [image_side, image_side, channels, 128, kernel],
+                    )?,
                     weight: BiasedWeight {
                         weight: s.clone_htod(&weight)?,
                         bias: s.clone_htod(&bias)?,
@@ -5507,8 +5506,6 @@ impl NafEncoder {
                         bias_mode: LinearBiasMode::AfterOutputRound,
                         f32_bias: Some(module.load_function("vision_bias_f32")?),
                     },
-                    kernel,
-                    input_channels: channels,
                 })
             };
             let initial = conv("0", 3)?;
@@ -5544,7 +5541,7 @@ impl NafEncoder {
             branches: branches
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("NAF guide branch count"))?,
-            im2col: module.load_function("causal_frame_im2col_f32")?,
+            transpose: cubin::module(&device.ctx, "q38_common")?.load_function("transpose_f32")?,
             group_norm: module.load_function("group_norm_silu_f32")?,
             pool: module.load_function("adaptive_avg_pool2d_f32")?,
             rope: module.load_function("rotary_spatial_f32")?,
@@ -5572,13 +5569,22 @@ impl NafEncoder {
         let target = output_side as usize * output_side as usize;
         let source = source_side as usize * source_side as usize;
         let fixed = 4 * (pixels * 256 + target * (256 + 1024 + 64) + source * 256);
-        let available = free_budget
-            .checked_sub(fixed)
-            .context("NAF fixed workspace exceeds remaining device budget")?;
-        let conv_rows = (available / (128 * 9 * 4)).min(pixels).min(32768) as u32;
+        let mut convolution_workspace = [0usize; 2];
+        for branch in &self.branches {
+            for convolution in
+                std::iter::once(&branch.initial).chain(branch.blocks.iter().map(|(_, conv)| conv))
+            {
+                for (maximum, extent) in convolution_workspace
+                    .iter_mut()
+                    .zip(convolution.plan.workspace())
+                {
+                    *maximum = (*maximum).max(extent);
+                }
+            }
+        }
         ensure!(
-            conv_rows > 0,
-            "NAF convolution workspace has no row capacity"
+            fixed + 4 * convolution_workspace[0] + convolution_workspace[1] <= free_budget,
+            "NAF F32 convolution workspace exceeds derived device budget"
         );
         let mut table = Vec::with_capacity(target * 64);
         for y in 0..output_side {
@@ -5603,10 +5609,9 @@ impl NafEncoder {
             output_side,
             source_side,
             dilation: output_side / source_side,
-            conv_rows,
+            convolution: super::blas::Conv2dWorkspaceF32::new(s, convolution_workspace)?,
             a: s.alloc_zeros(pixels * 128)?,
             b: s.alloc_zeros(pixels * 128)?,
-            columns: s.alloc_zeros(conv_rows as usize * 128 * 9)?,
             guide: s.alloc_zeros(target * 256)?,
             keys: s.alloc_zeros(source * 256)?,
             output: s.alloc_zeros(target * 1024)?,
@@ -5614,63 +5619,25 @@ impl NafEncoder {
         })
     }
 
-    fn convolve(
+    fn transpose(
         &self,
         s: &Arc<CudaStream>,
-        conv: &NafConv,
         input: &CudaSlice<f32>,
         output: &CudaSlice<f32>,
-        ws: &NafWorkspace,
+        shape: [u32; 2],
     ) -> Result<()> {
-        let pixels = ws.image_side * ws.image_side;
-        let cols = conv.input_channels * conv.kernel * conv.kernel;
-        for first in (0..pixels).step_by(ws.conv_rows as usize) {
-            let rows = ws.conv_rows.min(pixels - first);
-            let source = if conv.kernel == 1 {
-                dense_at(
-                    input,
-                    s,
-                    [rows, conv.input_channels],
-                    first as usize * conv.input_channels as usize,
-                )?
-            } else {
-                unsafe {
-                    s.launch_builder(&self.im2col)
-                        .arg(input)
-                        .arg(&ws.columns)
-                        .arg(&conv.input_channels)
-                        .arg(&ws.image_side)
-                        .arg(&ws.image_side)
-                        .arg(&ws.image_side)
-                        .arg(&1u32)
-                        .arg(&conv.kernel)
-                        .arg(&1u32)
-                        .arg(&(conv.kernel / 2))
-                        .arg(&u64::from(first))
-                        .arg(&rows)
-                        .launch(grid(
-                            (u64::from(rows) * u64::from(cols)).div_ceil(256).min(65535) as usize,
-                            256,
-                        ))?;
-                }
-                stage_view(&ws.columns, s, [rows, cols])?
-            };
-            let target = dense_at(output, s, [rows, 128], first as usize * 128)?;
-            unsafe {
-                s.launch_builder(&conv.linear)
-                    .arg(&source.ptr)
-                    .arg(&conv.weight.weight)
-                    .arg(&conv.weight.bias)
-                    .arg(&target.ptr)
-                    .arg(&rows)
-                    .arg(&128u32)
-                    .arg(&cols)
-                    .launch(crate::backend::gpu::LaunchConfig {
-                        grid_dim: (2, rows.div_ceil(16), 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    })?;
-            }
+        let count = u64::from(shape[0]) * u64::from(shape[1]);
+        ensure!(
+            input.len() as u64 >= count && output.len() as u64 >= count,
+            "NAF activation transpose extent"
+        );
+        unsafe {
+            s.launch_builder(&self.transpose)
+                .arg(input)
+                .arg(output)
+                .arg(&i64::from(shape[0]))
+                .arg(&i64::from(shape[1]))
+                .launch(grid(count.div_ceil(256) as usize, 256))?;
         }
         Ok(())
     }
@@ -5711,7 +5678,7 @@ impl NafEncoder {
         s: &Arc<CudaStream>,
         image: &CudaSlice<f32>,
         features: Tensor<f32, 2>,
-        ws: &NafWorkspace,
+        ws: &mut NafWorkspace,
     ) -> Result<()> {
         ensure!(
             features.shape == [ws.source_side * ws.source_side, 1024]
@@ -5721,7 +5688,13 @@ impl NafEncoder {
         features.validate()?;
         let pixels = u64::from(ws.image_side) * u64::from(ws.image_side);
         for (branch_index, branch) in self.branches.iter().enumerate() {
-            self.convolve(s, &branch.initial, image, &ws.a, ws)?;
+            self.transpose(s, image, &ws.b, [ws.image_side * ws.image_side, 3])?;
+            branch.initial.plan.run(
+                [&branch.initial.weight.weight, &branch.initial.weight.bias],
+                &ws.b,
+                &mut ws.a,
+                &mut ws.convolution,
+            )?;
             for (norm, conv) in &branch.blocks {
                 unsafe {
                     s.launch_builder(&self.group_norm)
@@ -5733,13 +5706,20 @@ impl NafEncoder {
                         .arg(&128u32)
                         .arg(&8u32)
                         .arg(&1.0e-5f32)
+                        .arg(&1u32)
                         .launch(grid(8, 512))?;
                 }
-                self.convolve(s, conv, &ws.b, &ws.a, ws)?;
+                conv.plan.run(
+                    [&conv.weight.weight, &conv.weight.bias],
+                    &ws.b,
+                    &mut ws.a,
+                    &mut ws.convolution,
+                )?;
             }
+            self.transpose(s, &ws.a, &ws.b, [128, ws.image_side * ws.image_side])?;
             self.pool(
                 s,
-                &ws.a,
+                &ws.b,
                 &ws.guide,
                 [ws.image_side, ws.output_side],
                 [128, 256, branch_index as u32 * 128],
@@ -5881,7 +5861,7 @@ impl PixalConditioningRuntime {
         let camera = s.alloc_zeros(15)?;
         let global = s.alloc_zeros(5 * 1024)?;
         let naf = if let (Some(side), Some(dir)) = (shape.naf_side, naf_dir) {
-            let encoder = NafEncoder::load(device, dir)?;
+            let encoder = NafEncoder::load(device, dir, shape.image_side)?;
             let (free, _) = device.ctx.mem_get_info()?;
             let ws = encoder.workspace(
                 device,
@@ -6123,15 +6103,17 @@ impl PixalConditioningRuntime {
                 .launch(grid(20, 256))?;
         }
         self.project(s, features, [side, 0, chunk], add, divisor)?;
-        if let Some((encoder, ws)) = &self.naf {
+        let naf_features = if let Some((encoder, ws)) = &mut self.naf {
             encoder.run(s, &self.image, features, ws)?;
-            self.project(
-                s,
+            Some((
                 dense_at(&ws.output, s, [ws.output_side * ws.output_side, 1024], 0)?,
-                [ws.output_side, 1024, chunk],
-                add,
-                divisor,
-            )?;
+                ws.output_side,
+            ))
+        } else {
+            None
+        };
+        if let Some((features, side)) = naf_features {
+            self.project(s, features, [side, 1024, chunk], add, divisor)?;
         }
         Ok(())
     }
@@ -8348,6 +8330,7 @@ mod tests {
     fn pixal_guard(s: &Arc<CudaStream>, buffer: &mut CudaSlice<f32>) -> Result<()> {
         let count = buffer.len();
         drop(std::mem::replace(buffer, s.alloc_zeros(1)?));
+        s.synchronize()?;
         *buffer = s.alloc_zeros(count + 64)?;
         s.memcpy_htod(&[12345.25f32; 64], &mut buffer.slice_mut(count..))?;
         Ok(())

@@ -532,6 +532,20 @@ __device__ __forceinline__ int reflect_index(int i, int n) {
     return i < 0 ? -i : (i >= n ? 2 * (n - 1) - i : i);
 }
 
+// NCHW reflection padding, with pad < min(height,width).
+extern "C" __global__ void reflect_pad_2d_f32(const float* input, float* output,
+    uint32_t channels, uint32_t height, uint32_t width, uint32_t pad) {
+    if (!vision_flat_launch() || !input || !output || !channels || pad >= height || pad >= width) { __trap(); return; }
+    const uint64_t ph = uint64_t(height) + 2 * pad, pw = uint64_t(width) + 2 * pad;
+    const uint64_t count = uint64_t(channels) * ph * pw;
+    for (uint64_t i = uint64_t(blockIdx.x) * 256 + threadIdx.x; i < count; i += uint64_t(gridDim.x) * 256) {
+        const uint32_t c = i / (ph * pw);
+        const int y = reflect_index(int((i / pw) % ph) - int(pad), int(height));
+        const int x = reflect_index(int(i % pw) - int(pad), int(width));
+        output[i] = input[(uint64_t(c) * height + y) * width + x];
+    }
+}
+
 // One frame x [height * width, channels] -> im2col rows a [rows, channels * kt * k * k] of a causal 3D convolution
 // with weight [out, channels, kt, k, k] and spatial stride, for output pixels first + r of an out_w-wide output.
 // Column (c * kt + t) * k * k + ky * k + kx is 0 for t < kt - 1 (the causal zero frames), else x at
@@ -557,12 +571,12 @@ extern "C" __global__ void causal_frame_im2col_f32(
     }
 }
 
-// NHWC GroupNorm/SiLU: 512 threads use channel-major Welford; 1024 threads use two-pass moments.
+// GroupNorm/SiLU: layout 0 NHWC, 1 NCHW; 512-thread Welford or 1024-thread two-pass moments.
 extern "C" __global__ __launch_bounds__(1024) void group_norm_silu_f32(
     const float* x, const float* gamma, const float* beta, float* y, uint64_t pixels,
-    uint32_t channels, uint32_t groups, float eps) {
+    uint32_t channels, uint32_t groups, float eps, uint32_t layout) {
     if ((blockDim.x != 512 && blockDim.x != 1024) || blockDim.y != 1 || gridDim.x != groups || gridDim.y != 1 || !x ||
-        !gamma || !beta || !y || !pixels || !groups || channels % groups) { __trap(); return; }
+        !gamma || !beta || !y || !pixels || !groups || channels % groups || layout > 1) { __trap(); return; }
     __shared__ float means[32], moments[32], counts[32];
     __shared__ float result[2], total;
     const uint32_t width = channels / groups, first = blockIdx.x * width;
@@ -583,7 +597,8 @@ extern "C" __global__ __launch_bounds__(1024) void group_norm_silu_f32(
             __syncthreads();
             return out;
         };
-        const auto at = [&](uint64_t e) { return (e / width) * channels + first + e % width; };
+        const auto at = [&](uint64_t e) { return layout ? (first + e % width) * pixels + e / width
+                                                      : (e / width) * channels + first + e % width; };
         float sum = 0.0f;
         for (uint64_t e = threadIdx.x; e < count; e += 1024) sum = __fadd_rn(sum, x[at(e)]);
         mean = __fdiv_rn(reduce(sum), float(count));
@@ -594,7 +609,8 @@ extern "C" __global__ __launch_bounds__(1024) void group_norm_silu_f32(
         }
         rstd = __frcp_rn(__fsqrt_rn(__fadd_rn(__fdiv_rn(reduce(squares), float(count)), eps)));
     } else {
-    const auto at = [&](uint64_t e) { return (e % pixels) * channels + first + e / pixels; };
+    const auto at = [&](uint64_t e) { return layout ? uint64_t(first) * pixels + e
+                                                  : (e % pixels) * channels + first + e / pixels; };
     float m = 0.0f, moment = 0.0f, n = 0.0f;
     for (uint64_t e = threadIdx.x; e < count; e += blockDim.x) {
         const float value = x[at(e)];
@@ -641,8 +657,8 @@ extern "C" __global__ __launch_bounds__(1024) void group_norm_silu_f32(
     rstd = result[1];
     }
     for (uint64_t e = threadIdx.x; e < count; e += blockDim.x) {
-        const uint64_t i = (e / width) * channels + first + e % width;
-        const uint32_t c = first + uint32_t(e % width);
+        const uint64_t i = layout ? uint64_t(first) * pixels + e : (e / width) * channels + first + e % width;
+        const uint32_t c = first + uint32_t(layout ? e / pixels : e % width);
         const float a = __fmul_rn(rstd, gamma[c]);
         const float b = blockDim.x == 512 ? __fsub_rn(beta[c], __fmul_rn(a, mean))
                                         : __fmaf_rn(-a, mean, beta[c]);
@@ -919,7 +935,7 @@ extern "C" __global__ void accumulate_mean_f32(const float* input, float* output
 }
 
 // Row-major [rows, inner] times transposed [cols, inner], with optional product/sum compensation.
-template<bool Compensated> __device__ __forceinline__ void linear_f32_impl(
+extern "C" __global__ __launch_bounds__(256) void linear_ordered_f32(
     const float* x, const float* weight, const float* bias, float* y,
     uint32_t rows, uint32_t cols, uint32_t inner) {
     if (blockDim.x != 256 || blockDim.y != 1 || blockDim.z != 1 || gridDim.z != 1 ||
@@ -929,7 +945,6 @@ template<bool Compensated> __device__ __forceinline__ void linear_f32_impl(
     const uint32_t row0 = blockIdx.y * 16, col0 = blockIdx.x * 64;
     const uint32_t lane = threadIdx.x % 64, group = threadIdx.x / 64;
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float correction[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (uint32_t first = 0; first < inner; first += 32) {
         for (uint32_t j = threadIdx.x; j < 16 * 32; j += 256) {
             const uint32_t r = j / 32, k = j % 32;
@@ -944,19 +959,7 @@ template<bool Compensated> __device__ __forceinline__ void linear_f32_impl(
         for (uint32_t k = 0; k < count; ++k) {
             const float w = b[k][lane];
             #pragma unroll
-            for (uint32_t r = 0; r < 4; ++r) {
-                const float v = a[group + r * 4][k];
-                if constexpr (Compensated) {
-                    const float product = __fmul_rn(v, w);
-                    const float adjusted = __fsub_rn(product, correction[r]);
-                    const float next = __fadd_rn(acc[r], adjusted);
-                    correction[r] = __fsub_rn(__fsub_rn(__fsub_rn(next, acc[r]), adjusted),
-                                             __fmaf_rn(v, w, -product));
-                    acc[r] = next;
-                } else {
-                    acc[r] = __fmaf_rn(v, w, acc[r]);
-                }
-            }
+            for (uint32_t r = 0; r < 4; ++r) acc[r] = __fmaf_rn(a[group + r * 4][k], w, acc[r]);
         }
         __syncthreads();
     }
@@ -964,20 +967,7 @@ template<bool Compensated> __device__ __forceinline__ void linear_f32_impl(
         #pragma unroll
         for (uint32_t r = 0; r < 4; ++r) {
             const uint32_t row = row0 + group + r * 4;
-            const float value = Compensated ? __fsub_rn(acc[r], correction[r]) : acc[r];
-            if (row < rows) y[uint64_t(row) * cols + col0 + lane] = bias ? __fadd_rn(value, bias[col0 + lane]) : value;
+            if (row < rows) y[uint64_t(row) * cols + col0 + lane] = bias ? __fadd_rn(acc[r], bias[col0 + lane]) : acc[r];
         }
     }
-}
-
-extern "C" __global__ __launch_bounds__(256) void linear_ordered_f32(
-    const float* x, const float* weight, const float* bias, float* y,
-    uint32_t rows, uint32_t cols, uint32_t inner) {
-    linear_f32_impl<false>(x, weight, bias, y, rows, cols, inner);
-}
-
-extern "C" __global__ __launch_bounds__(256) void linear_compensated_f32(
-    const float* x, const float* weight, const float* bias, float* y,
-    uint32_t rows, uint32_t cols, uint32_t inner) {
-    linear_f32_impl<true>(x, weight, bias, y, rows, cols, inner);
 }
