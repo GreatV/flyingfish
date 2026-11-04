@@ -12,6 +12,8 @@ const DEFAULT_ALIGNMENT: u32 = 32;
 const MIN_HEADER_BYTES: u64 = 24;
 const MAX_TENSOR_NAME_BYTES: usize = 64;
 const MAX_TENSOR_DIMS: u32 = 4;
+const MIN_TENSOR_RECORD_BYTES: usize = 24; // name length + dimension count + type + offset
+const MAX_META_NESTING: u32 = 16;
 
 pub struct GgufFile {
     path: PathBuf,
@@ -169,6 +171,10 @@ impl<'a> SliceReader<'a> {
         self.pos
     }
 
+    fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+
     fn take(&mut self, n: usize, what: &str) -> Result<&'a [u8]> {
         let left = self.buf.len() - self.pos;
         ensure!(
@@ -224,6 +230,20 @@ impl<'a> SliceReader<'a> {
     }
 }
 
+fn ensure_capacity(
+    remaining: usize,
+    count: usize,
+    bytes_per_item: usize,
+    what: &str,
+) -> Result<()> {
+    ensure!(
+        count <= remaining / bytes_per_item,
+        "truncated GGUF: {what} needs at least {} bytes, {remaining} left",
+        count.saturating_mul(bytes_per_item)
+    );
+    Ok(())
+}
+
 struct ParsedGguf {
     header: GgufHeader,
     tensors: Vec<GgufTensor>,
@@ -261,7 +281,7 @@ fn parse(buf: &[u8]) -> Result<ParsedGguf> {
     for _ in 0..kv_count {
         let key = r.string("metadata key")?;
         let value_type = r.u32("metadata value type")?;
-        let value = read_meta_value(&mut r, value_type, &key)?;
+        let value = read_meta_value(&mut r, value_type, &key, 0)?;
         match value {
             MetaValue::U32(v) if key == "general.alignment" => alignment = v,
             MetaValue::Str(s) if key == "general.architecture" => architecture = Some(s),
@@ -289,6 +309,12 @@ fn parse(buf: &[u8]) -> Result<ParsedGguf> {
         "invalid GGUF alignment {alignment}"
     );
 
+    ensure_capacity(
+        r.remaining(),
+        tensor_count,
+        MIN_TENSOR_RECORD_BYTES,
+        "tensor index",
+    )?;
     let mut tensors = Vec::with_capacity(tensor_count);
     for _ in 0..tensor_count {
         let name = r.string("tensor name")?;
@@ -302,6 +328,12 @@ fn parse(buf: &[u8]) -> Result<ParsedGguf> {
             n_dimensions <= MAX_TENSOR_DIMS,
             "tensor {name:?} has {n_dimensions} dimensions, at most {MAX_TENSOR_DIMS} allowed"
         );
+        ensure_capacity(
+            r.remaining(),
+            n_dimensions as usize,
+            8,
+            "tensor dimension list",
+        )?;
         let mut dims = Vec::with_capacity(n_dimensions as usize);
         for _ in 0..n_dimensions {
             dims.push(r.u64("tensor dimension")?);
@@ -345,6 +377,12 @@ fn parse(buf: &[u8]) -> Result<ParsedGguf> {
         );
     }
 
+    ensure_capacity(
+        buf.len(),
+        tensors.len(),
+        MIN_TENSOR_RECORD_BYTES,
+        "tensor name set",
+    )?;
     let mut names = HashSet::with_capacity(tensors.len());
     for t in &tensors {
         ensure!(
@@ -367,7 +405,16 @@ fn parse(buf: &[u8]) -> Result<ParsedGguf> {
     })
 }
 
-fn read_meta_value(r: &mut SliceReader, value_type: u32, key: &str) -> Result<MetaValue> {
+fn read_meta_value(
+    r: &mut SliceReader,
+    value_type: u32,
+    key: &str,
+    depth: u32,
+) -> Result<MetaValue> {
+    ensure!(
+        depth <= MAX_META_NESTING,
+        "metadata {key:?} nests deeper than {MAX_META_NESTING} arrays"
+    );
     Ok(match value_type {
         0 | 1 => {
             r.u8(key)?;
@@ -397,6 +444,7 @@ fn read_meta_value(r: &mut SliceReader, value_type: u32, key: &str) -> Result<Me
             let len =
                 usize::try_from(r.u64("array length")?).context("GGUF array length overflow")?;
             if element_type == 5 {
+                ensure_capacity(r.remaining(), len, 4, "metadata i32 array")?;
                 let mut values = Vec::with_capacity(len);
                 for _ in 0..len {
                     values.push(r.i32(key)?);
@@ -404,7 +452,7 @@ fn read_meta_value(r: &mut SliceReader, value_type: u32, key: &str) -> Result<Me
                 MetaValue::I32Array(values)
             } else {
                 for _ in 0..len {
-                    read_meta_value(r, element_type, key)?;
+                    read_meta_value(r, element_type, key, depth + 1)?;
                 }
                 MetaValue::Other
             }
