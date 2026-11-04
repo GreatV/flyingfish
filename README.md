@@ -14,7 +14,7 @@ Language and multimodal models:
 
 | Model | Architecture | Notes | Backends |
 |---|---|---|---|
-| Qwen3.8-27B | `Qwen3_5ForConditionalGeneration` | BF16 and FP8; MTP up to depth 4; image input | CUDA, ROCm |
+| Qwen3.8-27B | `Qwen3_5ForConditionalGeneration` | BF16 and FP8; image input; MTP up to depth 4 on CUDA (ROCm runs it with `--mtp 0`) | CUDA, ROCm |
 | MiniCPM-V-4.7 | `MiniCPMV4_7ForConditionalGeneration` | BF16 and FP8; MoE expert tiering, DSpark draft, image input | CUDA, ROCm |
 | MiniCPM5-2B | `LlamaForCausalLM` | DSpark draft | CUDA, ROCm |
 | Flint | `FlintForCausalLM` | MoE expert tiering, sliding-window attention with sinks | CUDA, ROCm |
@@ -106,7 +106,7 @@ flyingfish --model <model-dir> --runtime-dir <dir> serve --port 8080
 Common options:
 - `--runtime-dir` (or `FLYINGFISH_RUNTIME_DIR`) holds per-machine calibration. MoE models require it. It must be outside any model directory.
 - `--draft-model <dir>` enables a DSpark draft model.
-- `--mtp <0-4>` sets the MTP depth. It defaults to 4 when the checkpoint has MTP weights for an architecture with MTP decode (Qwen3.8); 0 selects plain decoding.
+- `--mtp <0-4>` sets the MTP depth. It defaults to 4 when the checkpoint has MTP weights for an architecture with MTP decode (Qwen3.8); 0 selects plain decoding. MTP decode is CUDA-only, so ROCm builds need `--mtp 0` for such checkpoints.
 - `--kv-format affine8` stores an 8-bit KV cache for long contexts. The default is `bf16`.
 - `--device <n>` selects the GPU.
 
