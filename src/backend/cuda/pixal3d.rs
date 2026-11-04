@@ -332,11 +332,21 @@ impl Work {
     }
 }
 
+fn validate_conditioning_origin(origin: &Rc<()>, flow: &Rc<()>) -> Result<()> {
+    ensure!(
+        Rc::ptr_eq(origin, flow),
+        "conditioning originates from another flow"
+    );
+    Ok(())
+}
+
 pub struct Conditioning {
+    origin: Rc<()>,
     global: CudaSlice<bf16>,
     projected: CudaSlice<bf16>,
 }
 pub struct PixalFlow {
+    origin: Rc<()>,
     device: Device,
     spec: FlowSpec,
     rows: usize,
@@ -588,6 +598,7 @@ impl PixalFlow {
         )?;
         device.workspace_budget(free, budget, live_bytes)?;
         Ok(Self {
+            origin: Rc::new(()),
             device,
             spec,
             rows,
@@ -719,6 +730,7 @@ impl PixalFlow {
             Ok(self.device.stream.clone_htod(&values)?)
         };
         Ok(Conditioning {
+            origin: self.origin.clone(),
             global: cast(global)?,
             projected: cast(projected)?,
         })
@@ -952,6 +964,7 @@ impl PixalFlow {
                 && output.len() == input.len(),
             "flow input/time extent differs from setup"
         );
+        validate_conditioning_origin(&conditioning.origin, &self.origin)?;
         ensure!(
             conditioning.global.len() == 5 * self.spec.cond_channels
                 && conditioning.projected.len() == self.rows * self.spec.projection_width(),
@@ -1179,6 +1192,8 @@ impl PixalFlow {
         positive: &Conditioning,
         negative: &Conditioning,
     ) -> Result<Vec<f32>> {
+        validate_conditioning_origin(&positive.origin, &self.origin)?;
+        validate_conditioning_origin(&negative.origin, &self.origin)?;
         ensure!(
             noise.len() == self.rows * self.spec.in_channels,
             "noise extent differs from flow geometry"

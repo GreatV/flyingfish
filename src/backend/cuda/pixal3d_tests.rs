@@ -1021,3 +1021,20 @@ fn pixal3d_flows_match_frozen_definition_gpu() -> Result<()> {
     shape_flows(&mut gate, &model, &runtime, &root)?;
     gate.finish()
 }
+
+#[test]
+fn conditioning_rejects_another_flow_with_the_same_row_count() -> Result<()> {
+    let coordinates = [[1, 3, 7], [2, 5, 11], [4, 9, 13]];
+    let origin = Rc::new(());
+    validate_conditioning_origin(&origin.clone(), &origin)?;
+    for foreign in [
+        [[1, 3, 8], [2, 5, 11], [4, 9, 13]],
+        [[4, 9, 13], [1, 3, 7], [2, 5, 11]],
+        coordinates,
+    ] {
+        assert_eq!(foreign.len(), coordinates.len());
+        let other_flow = Rc::new(());
+        assert!(validate_conditioning_origin(&other_flow, &origin).is_err());
+    }
+    Ok(())
+}
