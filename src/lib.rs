@@ -11,6 +11,7 @@ pub mod engram;
 pub mod experts;
 pub mod fp8;
 pub mod gdn_plan;
+pub mod gguf;
 pub mod kv;
 pub mod linear_plan;
 pub mod minimax_h3;

@@ -5071,6 +5071,8 @@ mod tests {
                     layer: Some(0),
                     role: format!("linear_attn.{role}"),
                     scale_name: None,
+                    quant: None,
+                    swap_halves: false,
                 },
             );
             tensors.insert(name, StoredTensor::Bf16(stream.clone_htod(&weight)?));

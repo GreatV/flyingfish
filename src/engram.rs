@@ -1071,6 +1071,8 @@ mod tests {
             layer: Some(1),
             role: "engram.embed.weight".into(),
             scale_name: None,
+            quant: None,
+            swap_halves: false,
         }
     }
 

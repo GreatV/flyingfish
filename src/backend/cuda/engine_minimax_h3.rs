@@ -15,14 +15,15 @@ use crate::backend::gpu::{
 };
 use crate::checkpoint::{MappedCheckpoint, TensorEntry, TensorManifest};
 use crate::experts::disk::{AlignedBytes, SpanReader};
+use crate::gguf::GgmlType;
 use crate::minimax_h3::{AdalnPlan, H3Spec, MODALITIES, adaln_input};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use half::bf16;
 use safetensors::Dtype;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 #[path = "engine_minimax_h3_audio.rs"]
@@ -60,6 +61,26 @@ impl Element for f32 {
             .0
             .iter()
             .all(|v| f32::from_le_bytes(*v).is_finite())
+    }
+}
+
+/// The GGUF dequant kernels, loaded once from the `q4_0_linear` cubin.
+struct QuantKernels {
+    dequant_bf16: crate::backend::gpu::CudaFunction,
+    dequant_f32: crate::backend::gpu::CudaFunction,
+    swap_halves: crate::backend::gpu::CudaFunction,
+    f16_to_bf16: crate::backend::gpu::CudaFunction,
+}
+
+impl QuantKernels {
+    fn new(ctx: &Arc<crate::backend::gpu::CudaContext>) -> Result<Self> {
+        let module = cubin::module(ctx, "q4_0_linear")?;
+        Ok(Self {
+            dequant_bf16: module.load_function("q4_0_dequant_bf16")?,
+            dequant_f32: module.load_function("q4_0_dequant_f32")?,
+            swap_halves: module.load_function("q4_0_dequant_swap_halves_bf16")?,
+            f16_to_bf16: module.load_function("f16_to_bf16")?,
+        })
     }
 }
 
@@ -103,6 +124,23 @@ impl EntryReader {
             cudarc::driver::result::memcpy_htod_async(pointer, bytes, stream.cu_stream())?;
         }
         Ok(())
+    }
+
+    /// The tensor's source bytes in a device buffer, for a quantized GGUF entry.
+    fn read_device(
+        &mut self,
+        stream: &Arc<CudaStream>,
+        name: &str,
+        entry: &TensorEntry,
+    ) -> Result<CudaSlice<u8>> {
+        let bytes = self.read(name, entry)?;
+        let mut buffer = stream.alloc_zeros::<u8>(entry.bytes)?;
+        let (pointer, record) = buffer.device_ptr_mut(stream);
+        unsafe {
+            cudarc::driver::result::memcpy_htod_async(pointer, bytes, stream.cu_stream())?;
+        }
+        drop(record);
+        Ok(buffer)
     }
 
     /// Copies a finite BF16 tensor into host memory of exactly its size.
@@ -207,14 +245,8 @@ impl AdalnTable {
         let timesteps = plan.timesteps.len();
         let width = 6 * spec.hidden;
         let modulation = width * MODALITIES as usize;
-        let entry = |name: &str| {
-            manifest
-                .entries
-                .get(name)
-                .with_context(|| format!("manifest lacks {name}"))
-        };
         let x = s.clone_htod(&adaln_input(spec, checkpoint, &plan.timesteps)?)?;
-        let mut reader = EntryReader::new(transformer_dir);
+        let mut source = Source::new(transformer_dir, manifest);
         let mut weight = s.alloc_zeros::<bf16>(modulation * spec.time_dim)?;
         let mut bias = s.alloc_zeros::<bf16>(modulation)?;
         let y = s.alloc_zeros::<bf16>(timesteps * modulation)?;
@@ -231,7 +263,7 @@ impl AdalnTable {
             let base = format!("transformer_blocks.{layer}.adaln_proj.linear");
             for (suffix, buffer) in [("weight", &mut weight), ("bias", &mut bias)] {
                 let name = format!("{base}.{suffix}");
-                reader.upload(s, &name, entry(&name)?, &mut buffer.slice_mut(..))?;
+                source.fill(s, &name, &mut buffer.slice_mut(..))?;
             }
             blas.linear_biased(
                 matrix(&weight, s, modulation, spec.time_dim)?,
@@ -254,7 +286,7 @@ impl AdalnTable {
         let mut norm_bias = s.alloc_zeros::<bf16>(norm)?;
         for (suffix, buffer) in [("weight", &mut norm_weight), ("bias", &mut norm_bias)] {
             let name = format!("norm_out.linear.{suffix}");
-            reader.upload(s, &name, entry(&name)?, &mut buffer.slice_mut(..))?;
+            source.fill(s, &name, &mut buffer.slice_mut(..))?;
         }
         let norm_out = s.alloc_zeros::<bf16>(timesteps * norm)?;
         blas.prepare_biased(
@@ -315,6 +347,7 @@ pub(crate) struct BlockWeights {
 pub(crate) struct Source<'a> {
     reader: EntryReader,
     manifest: &'a TensorManifest,
+    quant: OnceLock<QuantKernels>,
 }
 
 impl<'a> Source<'a> {
@@ -322,10 +355,20 @@ impl<'a> Source<'a> {
         Self {
             reader: EntryReader::new(dir),
             manifest,
+            quant: OnceLock::new(),
         }
     }
 
-    fn into<T: Element>(
+    fn quant_kernels(&self, s: &Arc<CudaStream>) -> Result<&QuantKernels> {
+        if let Some(kernels) = self.quant.get() {
+            return Ok(kernels);
+        }
+        let kernels = QuantKernels::new(s.context())?;
+        let _ = self.quant.set(kernels);
+        self.quant.get().context("quant kernels")
+    }
+
+    fn fill<T: Element>(
         &mut self,
         s: &Arc<CudaStream>,
         name: &str,
@@ -336,7 +379,79 @@ impl<'a> Source<'a> {
             .entries
             .get(name)
             .with_context(|| format!("manifest lacks {name}"))?;
-        self.reader.upload(s, name, entry, destination)
+        let quant = match entry.quant {
+            Some(quant) => quant,
+            None => return self.reader.upload(s, name, entry, destination),
+        };
+        match quant {
+            GgmlType::F32 | GgmlType::Bf16 => self.reader.upload(s, name, entry, destination),
+            GgmlType::F16 => {
+                ensure!(
+                    T::DTYPE == Dtype::BF16,
+                    "{name}: F16 GGUF source cannot fill a {:?} buffer",
+                    T::DTYPE
+                );
+                let src = self.reader.read_device(s, name, entry)?;
+                let kernels = self.quant_kernels(s)?;
+                let n = destination.len() as u64;
+                unsafe {
+                    s.launch_builder(&kernels.f16_to_bf16)
+                        .arg(&src)
+                        .arg(destination)
+                        .arg(&(n as i64))
+                        .launch(flat(n as usize))?;
+                }
+                Ok(())
+            }
+            GgmlType::Q4_0 => {
+                let src = self.reader.read_device(s, name, entry)?;
+                let kernels = self.quant_kernels(s)?;
+                let blocks = entry.bytes / 18;
+                ensure!(
+                    blocks * 18 == entry.bytes && blocks * 32 == destination.len(),
+                    "{name}: {} source bytes do not fill a {}-element buffer",
+                    entry.bytes,
+                    destination.len()
+                );
+                if entry.swap_halves {
+                    ensure!(
+                        entry.dtype == Dtype::BF16
+                            && T::DTYPE == Dtype::BF16
+                            && entry.shape.len() == 2,
+                        "{name}: swap_halves needs a 2-D BF16 tensor"
+                    );
+                    let (rows, cols) = (entry.shape[0] as u64, entry.shape[1] as u64);
+                    unsafe {
+                        s.launch_builder(&kernels.swap_halves)
+                            .arg(&src)
+                            .arg(destination)
+                            .arg(&(rows as i64))
+                            .arg(&(cols as i64))
+                            .launch(flat((rows as usize) * (cols as usize) / 32))?;
+                    }
+                } else if T::DTYPE == Dtype::BF16 {
+                    unsafe {
+                        s.launch_builder(&kernels.dequant_bf16)
+                            .arg(&src)
+                            .arg(destination)
+                            .arg(&(blocks as i64))
+                            .launch(flat(blocks))?;
+                    }
+                } else if T::DTYPE == Dtype::F32 {
+                    unsafe {
+                        s.launch_builder(&kernels.dequant_f32)
+                            .arg(&src)
+                            .arg(destination)
+                            .arg(&(blocks as i64))
+                            .launch(flat(blocks))?;
+                    }
+                } else {
+                    bail!("{name}: Q4_0 source cannot fill a {:?} buffer", T::DTYPE);
+                }
+                Ok(())
+            }
+            other => bail!("{name}: unsupported GGUF type {other:?}"),
+        }
     }
 
     fn tensor<T: Element + crate::backend::gpu::ValidAsZeroBits>(
@@ -346,7 +461,7 @@ impl<'a> Source<'a> {
         elements: usize,
     ) -> Result<CudaSlice<T>> {
         let mut buffer = s.alloc_zeros::<T>(elements)?;
-        self.into(s, name, &mut buffer.slice_mut(..))?;
+        self.fill(s, name, &mut buffer.slice_mut(..))?;
         Ok(buffer)
     }
 }
@@ -397,7 +512,7 @@ fn matrix_layout(
                 ],
             ),
         );
-        elements += entry.bytes / 2;
+        elements += entry.shape[0] * entry.shape[1];
     }
     ensure!(
         layout.len() == roles.len() && roles.iter().all(|r| layout.contains_key(*r)),
@@ -421,7 +536,7 @@ impl BlockWeights {
         let mut storage = s.alloc_zeros::<bf16>(elements)?;
         for (role, (offset, shape)) in &layout {
             let count = shape[0] as usize * shape[1] as usize;
-            base.into(
+            base.fill(
                 s,
                 &format!("{block}.{role}"),
                 &mut storage.slice_mut(*offset..offset + count),
@@ -475,7 +590,7 @@ impl BlockWeights {
         let (h, w, f, r) = (spec.hidden, spec.heads * spec.head_dim, spec.ffn, rank);
         let mut qkv_a = s.alloc_zeros::<bf16>(3 * r * h)?;
         for (i, name) in ["to_q", "to_k", "to_v"].iter().enumerate() {
-            lora.into(
+            lora.fill(
                 s,
                 &format!("{block}.attn.{name}.lora_A.default.weight"),
                 &mut qkv_a.slice_mut(i * r * h..(i + 1) * r * h),
@@ -1865,7 +1980,7 @@ impl TextLayer {
                 let mut owned = s.alloc_zeros::<bf16>(elements)?;
                 for (role, (offset, shape)) in &layout {
                     let count = shape[0] as usize * shape[1] as usize;
-                    base.into(
+                    base.fill(
                         s,
                         &format!("{block}.{role}"),
                         &mut owned.slice_mut(*offset..offset + count),
@@ -2966,6 +3081,227 @@ mod tests {
             "LoRA-scale-0 control stayed within {threshold}"
         );
         println!("H3_BLOCK0_GATE PASS control=FAIL_AS_REQUIRED");
+        Ok(())
+    }
+
+    /// The GGUF layer gate: one H3 transformer block with the gguf-py-dequantized weights, run by the engine on the
+    /// definition reference's dumped input and conditioning, compared with the definition's own output. The floor is
+    /// the reference's FP32-vs-BF16 arm spread; the control re-runs with the fused gate+up halves unswapped.
+    #[test]
+    #[ignore = "FF_MODEL, FF_H3_GGUF, FF_H3_GGUF_BLOCK_OUT, FF_H3_LORA"]
+    fn gguf_block_matches_the_definition_reference() -> Result<()> {
+        let var = |key: &str| {
+            std::env::var_os(key)
+                .map(PathBuf::from)
+                .with_context(|| format!("{key} missing"))
+        };
+        let model = var("FF_MODEL")?;
+        let gguf_path = var("FF_H3_GGUF")?;
+        let out = var("FF_H3_GGUF_BLOCK_OUT")?;
+        let lora_path = var("FF_H3_LORA")?;
+        let spec = H3Spec::read(&model)?;
+        let gguf = crate::gguf::GgufFile::open(&gguf_path)?;
+        let manifest = MappedCheckpoint::open_component(
+            &model.join("transformer"),
+            "diffusion_pytorch_model",
+        )?
+        .minimax_h3_gguf_manifest(&spec, &gguf)?;
+        let lora_dir = lora_path.parent().context("LoRA directory")?.to_owned();
+        let stem = lora_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".safetensors"))
+            .context("LoRA file stem")?;
+        let (lora_manifest, adapter) =
+            MappedCheckpoint::open_component(&lora_dir, stem)?.minimax_h3_lora_manifest(&spec)?;
+
+        let input_map = mapped(&out.join("input.safetensors"))?;
+        let input = SafeTensors::deserialize(&input_map)?;
+        let hidden = input.tensor("hidden_states")?;
+        ensure!(
+            hidden.dtype() == Dtype::BF16 && hidden.shape().len() == 3,
+            "hidden_states {:?} {:?}",
+            hidden.dtype(),
+            hidden.shape()
+        );
+        let rows = hidden.shape()[1];
+        let input_host: Vec<bf16> = hidden
+            .data()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| bf16::from_le_bytes(*b))
+            .collect();
+        let table = input.tensor("modulation")?;
+        ensure!(
+            table.dtype() == Dtype::BF16 && table.shape().len() == 2,
+            "modulation {:?} {:?}",
+            table.dtype(),
+            table.shape()
+        );
+        let entries = u32::try_from(table.shape()[0])?;
+        let table_host: Vec<bf16> = table
+            .data()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| bf16::from_le_bytes(*b))
+            .collect();
+        let rotary = input.tensor("rotary_table")?;
+        ensure!(
+            rotary.dtype() == Dtype::BF16 && rotary.shape() == [rows, 6 * spec.rope_freq_dim],
+            "rotary_table {:?} {:?}",
+            rotary.dtype(),
+            rotary.shape()
+        );
+        let rotary_host: Vec<bf16> = rotary
+            .data()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| bf16::from_le_bytes(*b))
+            .collect();
+        let (indices, _) = decoded(&input, "adaln_indices")?;
+        let index_host: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
+        let output = |arm: &str| -> Result<Vec<f64>> {
+            let map = mapped(&out.join(format!("output_{arm}.safetensors")))?;
+            let file = SafeTensors::deserialize(&map)?;
+            let tensor = file.tensor("output")?;
+            ensure!(
+                tensor.shape() == [1, rows, spec.hidden],
+                "{arm} output {:?} {:?}",
+                tensor.dtype(),
+                tensor.shape()
+            );
+            Ok(match tensor.dtype() {
+                Dtype::BF16 => tensor
+                    .data()
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| f64::from(bf16::from_le_bytes(*b).to_f32()))
+                    .collect(),
+                Dtype::F32 => tensor
+                    .data()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f64::from(f32::from_le_bytes(*b)))
+                    .collect(),
+                other => bail!("{arm} output dtype {other:?}"),
+            })
+        };
+        let reference_bf16 = output("bf16")?;
+        let reference_fp32 = output("fp32")?;
+
+        let device = Device::new(0)?;
+        let ops = Ops::new(&device.ctx)?;
+        device.finish_upload()?;
+        let s = &device.stream;
+        let runtime = std::env::temp_dir().join(format!("ff-h3-gguf-block-{}", std::process::id()));
+        fs::create_dir(&runtime)?;
+        let blas = Blas::new(
+            &device,
+            &ops,
+            &runtime,
+            Rc::new(Closure::new(true, "MiniMax-H3 GGUF block gate".into())),
+        )?;
+        let r = adapter.rank;
+        let gguf_dir = gguf_path.parent().context("GGUF directory")?;
+        let mut flash = Flash::new(s.clone(), rows, spec.heads, spec.heads, spec.head_dim)?;
+        let kernels = BlockKernels::new(&device.ctx)?;
+        let weights = BlockWeights::resident(
+            s,
+            &spec,
+            r,
+            "transformer_blocks.0",
+            &mut Source::new(gguf_dir, &manifest),
+            &mut Source::new(&lora_dir, &lora_manifest),
+        )?;
+        let mut wrong = manifest.clone();
+        wrong
+            .entries
+            .get_mut("transformer_blocks.0.ff.net.0.proj.weight")
+            .context("fc1 entry")?
+            .swap_halves = false;
+        let wrong_weights = BlockWeights::resident(
+            s,
+            &spec,
+            r,
+            "transformer_blocks.0",
+            &mut Source::new(gguf_dir, &wrong),
+            &mut Source::new(&lora_dir, &lora_manifest),
+        )?;
+        let mut work = BlockWork::new(s, &spec, r, rows)?;
+        work.prepare(&blas, &spec)?;
+        let rotary_device = s.clone_htod(&rotary_host)?;
+        let table_device = s.clone_htod(&table_host)?;
+        let index_device = s.clone_htod(&index_host)?;
+        let modulation = Modulation {
+            table: &table_device,
+            offset: 0,
+            entries,
+            index: &index_device,
+        };
+        let conditioning = Conditioning::Modulated {
+            rotary: &rotary_device,
+            modulation: &modulation,
+        };
+        let context = BlockContext {
+            s,
+            blas: &blas,
+            kernels: &kernels,
+            spec: &spec,
+            lora_scale: 0.0,
+        };
+        let mut run = |weights: &BlockWeights| -> Result<Vec<f64>> {
+            let mut x = s.clone_htod(&input_host)?;
+            block_forward(
+                &context,
+                &mut flash,
+                weights,
+                &conditioning,
+                &mut x,
+                &mut work,
+            )?;
+            Ok(s.clone_dtoh(&x)?
+                .into_iter()
+                .map(|v| f64::from(v.to_f32()))
+                .collect())
+        };
+        let candidate = run(&weights)?;
+        let control = run(&wrong_weights)?;
+
+        // The reference's own FP32-vs-BF16 arm spread, and the engine's block-vs-definition arithmetic spread
+        // frozen by the N3 gate (evidence/H3/N2N5-r5/logs/N3-block0-A-nsys/raw.log, `candidate_vs_fp32`).
+        let arm_floor = distance(&reference_bf16, &reference_fp32);
+        let engine_floor = [681.1484375, 0.005947928113812796, 0.9999847307784467];
+        let floor = [
+            arm_floor[0].max(engine_floor[0]),
+            arm_floor[1].max(engine_floor[1]),
+            arm_floor[2].min(engine_floor[2]),
+        ];
+        let d = distance(&candidate, &reference_bf16);
+        let d_control = distance(&control, &reference_bf16);
+        let abs_tau = (2.0 * floor[0]).max(1e-5);
+        let rel_tau = (2.0 * floor[1]).max(1e-6);
+        let cos_tau = 1.0 - 2.0 * (1.0 - floor[2]);
+        let ok = d[0] <= abs_tau && d[1] <= rel_tau && d[2] >= cos_tau;
+        let caught = d_control[0] > 10.0 * abs_tau || d_control[1] > 10.0 * rel_tau;
+        println!(
+            "H3_GGUF_BLOCK candidate={d:?} arm_floor={arm_floor:?} floor={floor:?} control={d_control:?} abs_tau={abs_tau} rel_tau={rel_tau} within={ok}"
+        );
+        ensure!(
+            candidate.iter().all(|v| v.is_finite()),
+            "non-finite block output"
+        );
+        ensure!(
+            ok,
+            "GGUF block output {d:?} outside the arm floor {floor:?}"
+        );
+        ensure!(caught, "unswapped-fc1 control stayed within 10x tau");
+        fs::remove_dir(&runtime)?;
+        println!("H3_GGUF_BLOCK_GATE PASS control=FAIL_AS_REQUIRED");
         Ok(())
     }
 

@@ -762,6 +762,7 @@ fn native_fixture(
                             load: false, data_start: 0, data_offsets: [start, bytes.len() as u64],
                             scope: TensorScope::Text, layer: Some(layer), role,
                             scale_name: (!scale).then(|| format!("model.language_model.layers.{layer}.mlp.experts.{expert}.{op}.weight_scale")),
+                            quant: None, swap_halves: false,
                         });
                     }
                 }
@@ -808,6 +809,8 @@ fn native_fixture(
                     layer: Some(layer),
                     role: format!("mlp.experts.{role}"),
                     scale_name: None,
+                    quant: None,
+                    swap_halves: false,
                 },
             );
         }
@@ -957,6 +960,8 @@ fn hybrid_manifest(
                     layer: Some(layer as u32),
                     role: role.into(),
                     scale_name: None,
+                    quant: None,
+                    swap_halves: false,
                 },
             );
         }

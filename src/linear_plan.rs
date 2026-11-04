@@ -245,6 +245,8 @@ mod tests {
             layer: Some(0),
             role: "linear_attn.in_proj_qkv.weight".into(),
             scale_name: None,
+            quant: None,
+            swap_halves: false,
         };
         let mut manifest = TensorManifest {
             entries: [(
@@ -310,6 +312,8 @@ mod tests {
                     layer: Some(0),
                     role: "linear_attn.in_proj_qkv.scale".into(),
                     scale_name: None,
+                    quant: None,
+                    swap_halves: false,
                 },
             );
             let plan = LayerDequantPlan::from_manifest(&manifest, 0, format)?;
@@ -345,6 +349,8 @@ mod tests {
                         layer: Some(3),
                         role: "mlp.gate_proj.weight".into(),
                         scale_name: None,
+                        quant: None,
+                        swap_halves: false,
                     },
                 ),
                 (
@@ -361,6 +367,8 @@ mod tests {
                         layer: Some(3),
                         role: "mlp.up_proj.weight".into(),
                         scale_name: None,
+                        quant: None,
+                        swap_halves: false,
                     },
                 ),
                 (
@@ -377,6 +385,8 @@ mod tests {
                         layer: Some(3),
                         role: "self_attn.q_proj.weight".into(),
                         scale_name: None,
+                        quant: None,
+                        swap_halves: false,
                     },
                 ),
                 (
@@ -396,6 +406,8 @@ mod tests {
                         layer: Some(3),
                         role: "self_attn.v_proj.weight".into(),
                         scale_name: None,
+                        quant: None,
+                        swap_halves: false,
                     },
                 ),
             ]

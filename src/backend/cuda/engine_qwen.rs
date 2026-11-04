@@ -7400,6 +7400,8 @@ mod tests {
                     layer: Some(2),
                     role,
                     scale_name: None,
+                    quant: None,
+                    swap_halves: false,
                 },
             );
             tensors.insert(name, StoredTensor::Bf16(s.clone_htod(&weight)?));

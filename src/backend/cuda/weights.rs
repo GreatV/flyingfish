@@ -2437,6 +2437,8 @@ mod tests {
                             layer: Some(layer),
                             role: format!("matrix{tensor}.weight"),
                             scale_name: None,
+                            quant: None,
+                            swap_halves: false,
                         },
                     );
                     offset += bytes;
@@ -2987,6 +2989,8 @@ mod tests {
                 layer: None,
                 role: "scale".into(),
                 scale_name: None,
+                quant: None,
+                swap_halves: false,
             };
             let manifest = TensorManifest {
                 entries: [("scale".to_owned(), entry)].into(),
@@ -3060,6 +3064,8 @@ mod tests {
                     layer: Some(0),
                     role: role.into(),
                     scale_name: None,
+                    quant: None,
+                    swap_halves: false,
                 };
                 let manifest = TensorManifest {
                     entries: [(name.clone(), entry)].into(),
@@ -3133,6 +3139,8 @@ mod tests {
             layer: Some(0),
             role: role.into(),
             scale_name: None,
+            quant: None,
+            swap_halves: false,
         });
         let uploaded = entries
             .iter()
