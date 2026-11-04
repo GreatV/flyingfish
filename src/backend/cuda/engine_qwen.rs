@@ -6205,11 +6205,19 @@ impl Engine {
                 head: Head::All,
                 mask: crate::backend::Mask::Causal,
             },
+            &mut None,
+        )?;
+        trace_value(
             &mut trace.map(|trace| Target {
                 trace,
                 prefix: "",
                 skip: 0,
             }),
+            &self.device.stream,
+            "norm",
+            &self.work.n,
+            rows,
+            width,
         )?;
         let mut output = Vec::with_capacity(rows * self.model_spec.vocab as usize);
         for row in 0..rows {
