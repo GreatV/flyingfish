@@ -8638,6 +8638,15 @@ impl IdolOctreeDecoder {
         cond_latent_f32: &[f32],
         (num_points, max_level, seed): (i64, u32, u64),
     ) -> Result<Vec<f32>> {
+        let total_pts = usize::try_from(num_points).context("num_points is negative")?;
+        let jitter_len = total_pts
+            .checked_mul(3)
+            .context("num_points x 3 overflows")?;
+        ensure!(
+            total_pts >= 1 && jitter_len <= ws.coords_f32.len(),
+            "num_points {total_pts} needs {jitter_len} jitter values; the workspace holds {}",
+            ws.coords_f32.len()
+        );
         let child_offsets: [[i64; 3]; 8] = [
             [0, 0, 0],
             [1, 0, 0],
@@ -8675,6 +8684,11 @@ impl IdolOctreeDecoder {
                     continue;
                 }
                 let r_cnt = prev_counts.iter().filter(|&&c| c == n).count();
+                ensure!(
+                    r_cnt <= ws.logits_f32.len(),
+                    "level {l}: {r_cnt} uniform draws exceed the {} workspace values",
+                    ws.logits_f32.len()
+                );
                 let u_cnt = r_cnt as u32;
                 unsafe {
                     s.launch_builder(&self.kernels.philox_uniform_f32)
@@ -8707,8 +8721,7 @@ impl IdolOctreeDecoder {
             prev_counts = next_counts;
         }
 
-        let total_pts = usize::try_from(num_points)?;
-        let jitter_cnt = u32::try_from(total_pts * 3)?;
+        let jitter_cnt = u32::try_from(jitter_len)?;
         unsafe {
             s.launch_builder(&self.kernels.philox_uniform_f32)
                 .arg(&seed)
@@ -13419,6 +13432,17 @@ mod tests {
                 "neg_g4_cross_image {m_name} {neg_val} < 10 * tau {tau}"
             );
         }
+
+        let capacity = i64::try_from(pipe.octree_ws.coords_f32.len() / 3)?;
+        for bad in [0, -1, capacity + 1] {
+            ensure!(
+                pipe.octree
+                    .sample_octree(s, &blas, &mut pipe.octree_ws, &[], (bad, 1, 0))
+                    .is_err(),
+                "sample_octree accepted num_points {bad} with capacity {capacity}"
+            );
+        }
+        println!("I1_M3_SAMPLE_OCTREE_BOUNDS PASS capacity={capacity} rejected=3");
 
         closure.assert_ready()?;
         let _ = std::fs::remove_dir_all(&runtime_dir);
