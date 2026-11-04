@@ -411,7 +411,7 @@ __device__ __forceinline__ float l2_from_f32<float>(float v) {
   return v;
 }
 
-template <typename InT, typename OutT>
+template <typename InT, typename OutT, bool ascending_warp = false>
 __device__ __forceinline__ void l2_norm_scale_impl(
     const InT* x, const float* gamma, OutT* y, int rows, int heads, int dim,
     float scale, float eps, int head_major_seq_len) {
@@ -441,7 +441,16 @@ __device__ __forceinline__ void l2_norm_scale_impl(
     const float v = l2_to_f32(xs[d]);
     ssq = __fadd_rn(ssq, __fmul_rn(v, v));
   }
-  const float total = block_reduce_sum(ssq, smem);
+  float total;
+  if constexpr (ascending_warp) {
+    if (blockDim.x != 32) { __trap(); return; }
+#pragma unroll
+    for (int offset = 1; offset < 32; offset <<= 1)
+      ssq = __fadd_rn(ssq, __shfl_xor_sync(FF_WARP_MASK, ssq, offset));
+    total = ssq;
+  } else {
+    total = block_reduce_sum(ssq, smem);
+  }
   const float denom = fmaxf(__fsqrt_rn(total), eps);
   for (int d = threadIdx.x; d < dim; d += blockDim.x) {
     const float v = l2_to_f32(xs[d]);
@@ -474,4 +483,33 @@ extern "C" __global__ __launch_bounds__(1024) void residual_f16(
   for (int i = gid; i < n; i += nthr) {
     x[i] = __float2half_rn(__fadd_rn(__half2float(x[i]), __half2float(y[i])));
   }
+}
+
+extern "C" __global__ __launch_bounds__(256) void l2_norm_scale_bf16(
+    const __nv_bfloat16* x, const float* gamma, __nv_bfloat16* y, int rows,
+    int heads, int dim, float scale, float eps, int head_major_seq_len) {
+  l2_norm_scale_impl<__nv_bfloat16, __nv_bfloat16, true>(
+      x, gamma, y, rows, heads, dim, scale, eps, head_major_seq_len);
+}
+extern "C" __global__ __launch_bounds__(256) void sample_std_f32(
+    const float* x, float* output, unsigned long long count, int population) {
+  if (!x || !output || count < 2 || blockDim.x != 256 || gridDim.x != 1 ||
+      population < 0 || population > 1) { __trap(); return; }
+  __shared__ float partial[32];
+  float sum = 0.0f;
+  for (unsigned long long i = threadIdx.x; i < count; i += 256)
+    sum = __fadd_rn(sum, x[i]);
+  const float mean = __fdiv_rn(block_reduce_sum(sum, partial), (float)count);
+  __syncthreads();
+  float squares = 0.0f;
+  for (unsigned long long i = threadIdx.x; i < count; i += 256) {
+    const float value = population ? x[i] : __fsub_rn(x[i], mean);
+    squares = __fadd_rn(squares, __fmul_rn(value, value));
+  }
+  const float total = block_reduce_sum(squares, partial);
+  const float variance = population
+      ? __fsub_rn(__fdiv_rn(total, (float)count), __fmul_rn(mean, mean))
+      : __fdiv_rn(total, (float)(count - 1));
+  if (!(variance >= 0.0f) || !isfinite(variance)) { __trap(); return; }
+  if (threadIdx.x == 0) *output = __fsqrt_rn(variance);
 }

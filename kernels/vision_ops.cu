@@ -1057,8 +1057,9 @@ extern "C" __global__ void vision_downcast_f32_to_f16(
     }
 }
 
-extern "C" __global__ void qkv_unpack_hm_f16(
-    const __half* packed, __half* q_out, __half* k_out, __half* v_hm_out,
+template <typename T>
+__device__ __forceinline__ void qkv_unpack_hm_impl(
+    const T* packed, T* q_out, T* k_out, T* v_hm_out,
     uint32_t batch, uint32_t seq_len, uint32_t heads, uint32_t dim, int parts) {
     if (!vision_flat_launch() || !packed || !k_out || !v_hm_out ||
         !batch || !seq_len || !heads || !dim ||
@@ -1090,4 +1091,16 @@ extern "C" __global__ void qkv_unpack_hm_f16(
             v_hm_out[hm_idx] = packed[base + hd + rem];
         }
     }
+}
+
+extern "C" __global__ void qkv_unpack_hm_f16(
+    const __half* packed, __half* q_out, __half* k_out, __half* v_hm_out,
+    uint32_t batch, uint32_t seq_len, uint32_t heads, uint32_t dim, int parts) {
+    qkv_unpack_hm_impl(packed, q_out, k_out, v_hm_out, batch, seq_len, heads, dim, parts);
+}
+
+extern "C" __global__ void qkv_unpack_hm_bf16(
+    const __nv_bfloat16* packed, __nv_bfloat16* q_out, __nv_bfloat16* k_out, __nv_bfloat16* v_hm_out,
+    uint32_t batch, uint32_t seq_len, uint32_t heads, uint32_t dim, int parts) {
+    qkv_unpack_hm_impl(packed, q_out, k_out, v_hm_out, batch, seq_len, heads, dim, parts);
 }

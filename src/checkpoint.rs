@@ -45,6 +45,76 @@ pub(crate) struct Index {
 #[derive(Deserialize)]
 struct Header(#[serde(deserialize_with = "unique_map")] BTreeMap<String, serde_json::Value>);
 
+pub(crate) struct PublishedTensor<'a> {
+    pub dtype: String,
+    pub shape: Vec<usize>,
+    pub data: &'a [u8],
+}
+
+fn published_tensors(map: &[u8]) -> Result<BTreeMap<String, PublishedTensor<'_>>> {
+    ensure!(map.len() >= 8, "truncated safetensors header");
+    let length = usize::try_from(u64::from_le_bytes(map[..8].try_into()?))?;
+    let end = 8usize.checked_add(length).context("header size overflow")?;
+    ensure!(
+        length <= 16 * 1024 * 1024 && end <= map.len(),
+        "invalid safetensors header size"
+    );
+    let header: Header = serde_json::from_slice(&map[8..end])?;
+    let mut tensors = BTreeMap::new();
+    let mut ranges = Vec::new();
+    for (name, value) in header.0 {
+        if name == "__metadata__" {
+            let _: BTreeMap<String, String> = serde_json::from_value(value)?;
+            continue;
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Entry {
+            dtype: String,
+            shape: Vec<usize>,
+            data_offsets: [usize; 2],
+        }
+        let entry: Entry = serde_json::from_value(value)?;
+        let bits = if entry.dtype == "C64" {
+            64
+        } else {
+            serde_json::from_value::<Dtype>(serde_json::Value::String(entry.dtype.clone()))?
+                .bitsize()
+        };
+        let elements = entry.shape.iter().try_fold(1usize, |n, &d| {
+            n.checked_mul(d).context("tensor shape overflow")
+        })?;
+        let total_bits = elements
+            .checked_mul(bits)
+            .context("tensor byte size overflow")?;
+        let [start, stop] = entry.data_offsets;
+        ensure!(
+            total_bits.is_multiple_of(8) && stop.checked_sub(start) == Some(total_bits / 8),
+            "invalid tensor byte span for {name}"
+        );
+        let data = map[end..]
+            .get(start..stop)
+            .with_context(|| format!("tensor range outside file: {name}"))?;
+        ranges.push([start, stop]);
+        tensors.insert(
+            name,
+            PublishedTensor {
+                dtype: entry.dtype,
+                shape: entry.shape,
+                data,
+            },
+        );
+    }
+    ranges.sort_unstable();
+    let mut next = 0;
+    for [start, stop] in ranges {
+        ensure!(start == next, "tensor ranges overlap or contain holes");
+        next = stop;
+    }
+    ensure!(next == map.len() - end, "unindexed bytes in checkpoint");
+    Ok(tensors)
+}
+
 pub struct MappedCheckpoint {
     pub(crate) index: Index,
     maps: BTreeMap<String, Mmap>,
@@ -93,11 +163,10 @@ impl MappedCheckpoint {
             let map = unsafe {
                 MmapOptions::new().map(&File::open(dir.join(format!("{stem}.safetensors")))?)?
             };
-            let tensors = SafeTensors::deserialize(&map)?;
+            let tensors = published_tensors(&map)?;
             Index {
                 weight_map: tensors
-                    .names()
-                    .into_iter()
+                    .keys()
                     .map(|s| (s.to_owned(), format!("{stem}.safetensors")))
                     .collect(),
             }
@@ -122,21 +191,8 @@ impl MappedCheckpoint {
             );
             let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
             let map = unsafe { MmapOptions::new().map(&file)? };
-            ensure!(map.len() >= 8, "truncated safetensors header");
-            let hlen = usize::try_from(u64::from_le_bytes(map[..8].try_into()?))?;
-            let end = 8usize.checked_add(hlen).context("header size overflow")?;
-            ensure!(
-                hlen <= 16 * 1024 * 1024 && end <= map.len(),
-                "invalid safetensors header size"
-            );
-            let header: Header = serde_json::from_slice(&map[8..end])?;
-            let tensors = SafeTensors::deserialize(&map)?;
-            ensure!(
-                header.0.len()
-                    == tensors.len() + usize::from(header.0.contains_key("__metadata__")),
-                "header tensor count mismatch"
-            );
-            for name in tensors.names() {
+            let tensors = published_tensors(&map)?;
+            for name in tensors.keys() {
                 ensure!(
                     index.weight_map.get(name) == Some(shard),
                     "index/header mismatch for {name}"
@@ -202,6 +258,18 @@ impl MappedCheckpoint {
             )?);
         }
         Ok(SafeTensors::deserialize(map)?.tensor(name)?)
+    }
+
+    pub(crate) fn component_tensors(&self) -> Result<BTreeMap<String, PublishedTensor<'_>>> {
+        ensure!(
+            self.zip_tensors.is_none(),
+            "component range inventory requires safetensors"
+        );
+        let mut result = BTreeMap::new();
+        for map in self.maps.values() {
+            result.extend(published_tensors(map)?);
+        }
+        Ok(result)
     }
     /// Reads a validated mapped range through its file descriptor without faulting mapping pages.
     #[cfg(any(feature = "cuda", feature = "rocm"))]
@@ -3762,6 +3830,62 @@ mod component_tests {
         println!(
             "PASS glm_native_manifest text=74001 mtp=1760 native_roles=12 asymmetric_value_control=true overflow_controls=2"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn complex_checkpoint_ranges_are_checked() -> Result<()> {
+        let make = |shape: usize, start: usize, stop: usize| -> Result<Vec<u8>> {
+            let header = serde_json::to_vec(&serde_json::json!({
+                "phases": {"dtype":"C64", "shape":[shape], "data_offsets":[start,stop]}
+            }))?;
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend(header);
+            for value in [0.0f32, 1.0, -1.0, 0.0] {
+                bytes.extend(value.to_le_bytes());
+            }
+            Ok(bytes)
+        };
+        let bytes = make(2, 0, 16)?;
+        let tensors = published_tensors(&bytes)?;
+        assert_eq!(tensors["phases"].shape, [2]);
+        assert_eq!(tensors["phases"].data.len(), 16);
+        assert_eq!(
+            f32::from_le_bytes(tensors["phases"].data[8..12].try_into()?),
+            -1.0
+        );
+        assert!(published_tensors(&make(2, 0, 8)?).is_err());
+        assert!(published_tensors(&make(2, 8, 24)?).is_err());
+        assert!(published_tensors(&make(usize::MAX, 0, 16)?).is_err());
+        let root = std::env::temp_dir().join(format!("ff-indexed-packed-{}", std::process::id()));
+        std::fs::create_dir(&root)?;
+        let write_shard = |name: &str, dtype: &str, bytes: usize| -> Result<()> {
+            let header = serde_json::to_vec(&serde_json::json!({
+                name: {"dtype":dtype,"shape":[4],"data_offsets":[0,bytes]}
+            }))?;
+            let mut data = (header.len() as u64).to_le_bytes().to_vec();
+            data.extend(header);
+            data.resize(data.len() + bytes, 0);
+            std::fs::write(root.join(format!("{name}.safetensors")), data)?;
+            Ok(())
+        };
+        write_shard("packed", "F4", 2)?;
+        write_shard("float8", "F8_E4M3", 4)?;
+        std::fs::write(
+            root.join("model.safetensors.index.json"),
+            serde_json::to_vec(&serde_json::json!({"weight_map":{
+                "packed":"packed.safetensors","float8":"float8.safetensors"
+            }}))?,
+        )?;
+        let checkpoint = MappedCheckpoint::open(&root)?;
+        let tensors = checkpoint.component_tensors()?;
+        assert_eq!(tensors["packed"].data.len(), 2);
+        assert_eq!(tensors["float8"].data.len(), 4);
+        drop(tensors);
+        drop(checkpoint);
+        write_shard("packed", "F4", 3)?;
+        assert!(MappedCheckpoint::open(&root).is_err());
+        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 

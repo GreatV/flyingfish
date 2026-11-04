@@ -13,3 +13,26 @@ extern "C" __global__ void euler_blend_f32(float* x, const float* v, unsigned lo
         x[i] = __fadd_rn(__fmul_rn(r, sample), __fmul_rn(q, denoised));
     }
 }
+
+// form 0: alpha*x-beta*v; form 1: (alpha*x-x0)/beta.
+extern "C" __global__ void flow_x0_f32(const float* x, const float* prediction,
+    float* output, unsigned long long count, float alpha, float beta, int form) {
+    if (!x || !prediction || !output || !count || !(beta > 0) || form < 0 || form > 1) { __trap(); return; }
+    for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+         i < count; i += (unsigned long long)gridDim.x * blockDim.x) {
+        const float left = __fmul_rn(alpha, x[i]);
+        output[i] = form == 0 ? __fsub_rn(left, __fmul_rn(beta, prediction[i]))
+            : __fdiv_rn(__fsub_rn(left, prediction[i]), beta);
+    }
+}
+
+extern "C" __global__ void flow_rescale_f32(float* x0, const float* std_pos,
+    const float* std_cfg, unsigned long long count, float amount) {
+    const float scale = __fdiv_rn(*std_pos, *std_cfg);
+    if (!isfinite(scale)) { __trap(); return; }
+    for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+         i < count; i += (unsigned long long)gridDim.x * blockDim.x) {
+        const float scaled = __fmul_rn(x0[i], scale);
+        x0[i] = __fadd_rn(__fmul_rn(amount, scaled), __fmul_rn(__fsub_rn(1.0f, amount), x0[i]));
+    }
+}

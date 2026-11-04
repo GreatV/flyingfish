@@ -105,3 +105,13 @@ extern "C" __global__ void row_modulate_f32(const float* x, const float* shift,
                                             unsigned long long stride, unsigned entries) {
     row_modulate_impl<float, true>(x, shift, scale, index, y, rows, dim, stride, entries);
 }
+
+extern "C" __global__ void add_row_bf16_f32(
+    const __nv_bfloat16* x, const float* row, __nv_bfloat16* y,
+    unsigned long long count, unsigned width) {
+    if (!x || !row || !y || !width || count % width) { __trap(); return; }
+    for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+         i < count; i += (unsigned long long)gridDim.x * blockDim.x) {
+        y[i] = __float2bfloat16_rn(__fadd_rn(__bfloat162float(x[i]), row[i % width]));
+    }
+}

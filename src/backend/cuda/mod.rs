@@ -39,6 +39,8 @@ pub mod multi_calibrate;
 #[cfg(feature = "cuda")]
 pub mod music3;
 pub mod ops;
+#[cfg(feature = "cuda")]
+pub mod pixal3d;
 pub mod profile;
 pub mod quantize;
 pub mod sample;
@@ -69,6 +71,26 @@ pub struct Device {
 }
 
 impl Device {
+    #[cfg(feature = "cuda")]
+    pub(crate) fn workspace_budget(
+        &self,
+        initial_free: usize,
+        limit: usize,
+        live_bytes: usize,
+    ) -> Result<usize> {
+        self.stream.synchronize()?;
+        let (free, total) = self.ctx.mem_get_info()?;
+        ensure!(limit > 0 && limit <= total, "invalid device memory limit");
+        let allocated = initial_free.saturating_sub(free);
+        let available = limit
+            .checked_sub(allocated)
+            .context("device allocations exceed memory limit")?
+            .min(free);
+        available
+            .checked_sub(live_bytes)
+            .with_context(|| format!("live arrays need {live_bytes} bytes; available {available}"))
+    }
+
     #[cfg(feature = "cuda")]
     pub fn new(ordinal: usize) -> Result<Self> {
         ensure!(
