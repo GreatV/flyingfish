@@ -230,7 +230,7 @@ impl Kernels {
                 .arg(&128f32.sqrt())
                 .arg(&1e-12f32)
                 .arg(&(if head_major { rows as i32 } else { 0 }))
-                .launch(grid(rows * 12, 128))?;
+                .launch(grid(rows * 12, 32))?;
         }
         Ok(())
     }
@@ -331,9 +331,9 @@ pub struct Conditioning {
     projected: CudaSlice<bf16>,
 }
 pub struct PixalFlow {
-    pub device: Device,
-    pub spec: FlowSpec,
-    pub rows: usize,
+    device: Device,
+    spec: FlowSpec,
+    rows: usize,
     coordinates: Vec<[i32; 3]>,
     pub weight_bytes: usize,
     pub reserved_bytes: usize,
@@ -636,7 +636,7 @@ impl PixalFlow {
         }
         Ok(())
     }
-    pub fn set_times(&mut self, times: &[f32]) -> Result<()> {
+    fn set_times(&mut self, times: &[f32]) -> Result<()> {
         ensure!(
             !times.is_empty() && times.len() <= 12 && times.iter().all(|x| x.is_finite()),
             "invalid flow time setup"
@@ -914,7 +914,7 @@ impl PixalFlow {
         }
         Ok(())
     }
-    pub fn forward(
+    fn forward(
         &mut self,
         input: &CudaSlice<f32>,
         time: usize,
@@ -1157,6 +1157,17 @@ fn schedule(sparse: bool) -> [f64; 13] {
     })
 }
 impl PixalFlow {
+    pub fn denormalize(&self, latent: &[f32], mean: &[f32], std: &[f32]) -> Result<Vec<f32>> {
+        ensure!(
+            self.spec.sparse()
+                && latent.len() == self.rows * 32
+                && latent.iter().all(|x| x.is_finite()),
+            "shape latent extent or finiteness differs from setup"
+        );
+        let mut values = self.device.stream.clone_htod(latent)?;
+        denormalize_shape(&self.device, &mut values, mean, std)?;
+        Ok(self.device.stream.clone_dtoh(&values)?)
+    }
     pub fn sample(
         &mut self,
         noise: &[f32],
@@ -1188,7 +1199,7 @@ impl PixalFlow {
 }
 
 /// Published per-channel latent denormalization, F32 multiply then F32 add.
-pub fn denormalize_shape(
+fn denormalize_shape(
     d: &Device,
     values: &mut CudaSlice<f32>,
     mean: &[f32],
