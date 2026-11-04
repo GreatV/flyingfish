@@ -1477,11 +1477,6 @@ fn lanczos(x: f64) -> f64 {
     }
 }
 
-/// Lanczos-3 resize of an RGB u8 image to `width x height`, horizontal pass then vertical pass with a u8 intermediate.
-pub(crate) fn resize_lanczos(image: &RgbImage, width: usize, height: usize) -> Vec<u8> {
-    resize_separable(image, width, height, (lanczos, 3.0))
-}
-
 /// Separable resize with `filter` (kernel, radius): horizontal pass then vertical pass, each rounded to u8; an axis
 /// of unchanged size is copied.
 fn resize_separable(
@@ -1559,38 +1554,14 @@ pub fn resize_lanczos(input: &[u8], shape: [usize; 3], output: [usize; 2]) -> Re
         }
     }
     let weights = |from: usize, to: usize| -> Vec<(usize, Vec<i64>)> {
-        let scale = from as f64 / to as f64;
-        let filter_scale = scale.max(1.0);
-        let radius = 3.0 * filter_scale;
-        let sinc = |x: f64| {
-            if x == 0.0 {
-                1.0
-            } else {
-                let a = std::f64::consts::PI * x;
-                a.sin() / a
-            }
-        };
-        (0..to)
-            .map(|index| {
-                let center = (index as f64 + 0.5) * scale;
-                let first = ((center - radius + 0.5) as isize).max(0) as usize;
-                let last = ((center + radius + 0.5) as usize).min(from);
-                let values: Vec<_> = (first..last)
-                    .map(|i| {
-                        let x = (i as f64 + 0.5 - center) / filter_scale;
-                        if x.abs() >= 3.0 {
-                            0.0
-                        } else {
-                            sinc(x) * sinc(x / 3.0)
-                        }
-                    })
-                    .collect();
-                let total: f64 = values.iter().sum();
+        coefficients(from, to, (lanczos, 3.0))
+            .into_iter()
+            .map(|(first, values)| {
                 (
                     first,
                     values
                         .iter()
-                        .map(|v| (v / total * 4194304.0).round() as i64)
+                        .map(|v| (v * 4194304.0).round() as i64)
                         .collect(),
                 )
             })
