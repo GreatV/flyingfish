@@ -3,7 +3,7 @@ use crate::backend::gpu::{CudaFunction, CudaSlice, CudaStream, DevicePtr, PushKe
 use crate::{
     backend::cuda::{
         Device,
-        blas::Blas,
+        blas::{Blas, Conv2dF32, Conv2dWorkspaceF32},
         contracts::{Scratch, Tensor, TensorMut, dense_layout},
         cubin,
         flash::{Flash, Query, Score, Shape},
@@ -5426,7 +5426,7 @@ impl DinoV3Encoder {
 
 struct NafConv {
     weight: BiasedWeight<f32>,
-    plan: super::blas::Conv2dF32,
+    plan: Conv2dF32,
 }
 
 struct NafGuideBranch {
@@ -5449,7 +5449,7 @@ struct NafWorkspace {
     output_side: u32,
     source_side: u32,
     dilation: u32,
-    convolution: super::blas::Conv2dWorkspaceF32,
+    convolution: Conv2dWorkspaceF32,
     a: CudaSlice<f32>,
     b: CudaSlice<f32>,
     guide: CudaSlice<f32>,
@@ -5494,7 +5494,7 @@ impl NafEncoder {
                 )?;
                 let bias = read(&format!("{prefix}.bias"), &[128])?;
                 Ok(NafConv {
-                    plan: super::blas::Conv2dF32::new(
+                    plan: Conv2dF32::new(
                         s,
                         &convolution_handle,
                         [image_side, image_side, channels, 128, kernel],
@@ -5609,7 +5609,7 @@ impl NafEncoder {
             output_side,
             source_side,
             dilation: output_side / source_side,
-            convolution: super::blas::Conv2dWorkspaceF32::new(s, convolution_workspace)?,
+            convolution: Conv2dWorkspaceF32::new(s, convolution_workspace)?,
             a: s.alloc_zeros(pixels * 128)?,
             b: s.alloc_zeros(pixels * 128)?,
             guide: s.alloc_zeros(target * 256)?,

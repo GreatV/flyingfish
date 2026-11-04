@@ -926,6 +926,27 @@ extern "C" __global__ void project_bilinear_f32(const float* input, float* outpu
     }
 }
 
+// Pairwise sum of at most 32 dense [heads, rows, columns] parts into a strided tensor.
+extern "C" __global__ void sum_parts_f32(const float* input, float* output,
+    uint32_t parts, uint32_t heads, uint32_t rows, uint32_t columns,
+    uint64_t head_stride, uint64_t row_stride) {
+    if (!vision_flat_launch() || !input || !output || !parts || parts > 32 ||
+        !heads || !rows || !columns) { __trap(); return; }
+    const uint64_t count = uint64_t(heads) * rows * columns;
+    for (uint64_t i = uint64_t(blockIdx.x)*256+threadIdx.x; i<count; i+=uint64_t(gridDim.x)*256) {
+        float values[32];
+        #pragma unroll
+        for (uint32_t p=0; p<32; ++p) values[p] = p<parts ? input[uint64_t(p)*count+i] : 0.0f;
+        #pragma unroll
+        for (uint32_t step=1; step<32; step*=2) {
+            #pragma unroll
+            for (uint32_t p=0; p<32; p+=2*step) values[p] = __fadd_rn(values[p],values[p+step]);
+        }
+        const uint64_t row = i/columns;
+        output[(row/rows)*head_stride+(row%rows)*row_stride+i%columns] = values[0];
+    }
+}
+
 // Ordered F32 sum with division on the last view.
 extern "C" __global__ void accumulate_mean_f32(const float* input, float* output,
     uint64_t count, uint32_t add, float divisor) {
@@ -934,7 +955,7 @@ extern "C" __global__ void accumulate_mean_f32(const float* input, float* output
         output[i]=__fdiv_rn(add ? __fadd_rn(output[i],input[i]) : input[i],divisor);
 }
 
-// Row-major [rows, inner] times transposed [cols, inner], with optional product/sum compensation.
+// Row-major [rows, inner] times transposed [cols, inner].
 extern "C" __global__ __launch_bounds__(256) void linear_ordered_f32(
     const float* x, const float* weight, const float* bias, float* y,
     uint32_t rows, uint32_t cols, uint32_t inner) {

@@ -228,7 +228,7 @@ impl Conv2dF32 {
             self.stream
                 .launch_builder(&self.bias)
                 .arg(output)
-                .arg(&weights[1])
+                .arg(weights[1])
                 .arg(&0u64)
                 .arg(&(pixels * u64::from(outputs)))
                 .arg(&outputs)
