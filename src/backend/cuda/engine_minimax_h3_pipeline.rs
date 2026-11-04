@@ -356,7 +356,6 @@ pub(crate) fn run(
             &device,
             &mut blas,
             &source_dir,
-            &checkpoint,
             &manifest,
             &spec,
             &adaln_plan,

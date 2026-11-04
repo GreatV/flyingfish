@@ -14,10 +14,10 @@ use crate::backend::gpu::{
     CudaFunction, CudaSlice, CudaStream, CudaViewMut, DevicePtr, DevicePtrMut, LaunchConfig,
     PushKernelArg,
 };
-use crate::checkpoint::{MappedCheckpoint, TensorEntry, TensorManifest};
+use crate::checkpoint::{TensorEntry, TensorManifest};
 use crate::experts::disk::{AlignedBytes, SpanReader};
 use crate::gguf::GgmlType;
-use crate::minimax_h3::{AdalnPlan, H3Spec, MODALITIES, adaln_input};
+use crate::minimax_h3::{AdalnPlan, AdalnTimeEmbedder, H3Spec, MODALITIES, adaln_input};
 use anyhow::{Context, Result, bail, ensure};
 use half::bf16;
 use safetensors::Dtype;
@@ -229,7 +229,6 @@ impl AdalnTable {
         d: &Device,
         blas: &mut Blas,
         transformer_dir: &Path,
-        checkpoint: &MappedCheckpoint,
         manifest: &TensorManifest,
         spec: &H3Spec,
         plan: &AdalnPlan,
@@ -238,8 +237,22 @@ impl AdalnTable {
         let timesteps = plan.timesteps.len();
         let width = 6 * spec.hidden;
         let modulation = width * MODALITIES as usize;
-        let x = s.clone_htod(&adaln_input(spec, checkpoint, &plan.timesteps)?)?;
         let mut source = Source::new(transformer_dir, manifest);
+        let time = AdalnTimeEmbedder {
+            linear_1_weight: source.host_f32(
+                s,
+                "time_embedder.linear_1.weight",
+                spec.time_hidden * spec.freq_dim,
+            )?,
+            linear_1_bias: source.host_f32(s, "time_embedder.linear_1.bias", spec.time_hidden)?,
+            linear_2_weight: source.host_f32(
+                s,
+                "time_embedder.linear_2.weight",
+                spec.time_dim * spec.time_hidden,
+            )?,
+            linear_2_bias: source.host_f32(s, "time_embedder.linear_2.bias", spec.time_dim)?,
+        };
+        let x = s.clone_htod(&adaln_input(spec, &time, &plan.timesteps)?)?;
         let mut weight = s.alloc_zeros::<bf16>(modulation * spec.time_dim)?;
         let mut bias = s.alloc_zeros::<bf16>(modulation)?;
         let y = s.alloc_zeros::<bf16>(timesteps * modulation)?;
@@ -409,6 +422,11 @@ impl<'a> Source<'a> {
         let mut buffer = s.alloc_zeros::<T>(elements)?;
         self.fill(s, name, &mut buffer.slice_mut(..))?;
         Ok(buffer)
+    }
+
+    fn host_f32(&mut self, s: &Arc<CudaStream>, name: &str, elements: usize) -> Result<Vec<f32>> {
+        let tensor = self.tensor::<f32>(s, name, elements)?;
+        Ok(s.clone_dtoh(&tensor)?)
     }
 }
 
@@ -2509,6 +2527,7 @@ pub(crate) fn conditioner_embeds(
 mod tests {
     use super::*;
     use crate::backend::cuda::{closure::Closure, ops::Ops};
+    use crate::checkpoint::MappedCheckpoint;
     use crate::minimax_h3::{
         Geometry, KeyframeAnchor, PackedLayout, RowTimesteps, Schedule, noise_draws,
         row_timestep_plan,
@@ -2793,15 +2812,7 @@ mod tests {
             &runtime,
             Rc::new(Closure::new(true, "MiniMax-H3 AdaLN gate".into())),
         )?;
-        let table = AdalnTable::build(
-            &device,
-            &mut blas,
-            &transformer,
-            &checkpoint,
-            &manifest,
-            &spec,
-            &adaln,
-        )?;
+        let table = AdalnTable::build(&device, &mut blas, &transformer, &manifest, &spec, &adaln)?;
         let blocks: Vec<f64> = device
             .stream
             .clone_dtoh(&table.blocks)?
@@ -3305,8 +3316,8 @@ mod tests {
     }
 
     /// The GGUF AdaLN gate: the 50 `adaln_proj` weights dequantized from the GGUF into the engine's AdaLN table,
-    /// against the definition's modulation for the same timesteps (the harness dump). The floor is the reference's
-    /// own FP32-vs-BF16 arm spread; the control swaps the video/audio tags.
+    /// against the definition's per-block modulation for the same timesteps (the harness dump, layer-major). The
+    /// floor is the reference's own FP32-vs-BF16 arm spread; the control swaps the video/audio tags.
     #[test]
     #[ignore = "FF_MODEL, FF_H3_GGUF, FF_H3_GGUF_ADALN_OUT"]
     fn gguf_adaln_matches_the_definition_modulation() -> Result<()> {
@@ -3347,11 +3358,12 @@ mod tests {
             let tensor = adaln.tensor(&format!("modulation_{arm}"))?;
             ensure!(
                 tensor.shape().len() == 2
-                    && tensor.shape()[0] == timesteps.len() * MODALITIES as usize
+                    && tensor.shape()[0] == spec.layers * timesteps.len() * MODALITIES as usize
                     && tensor.shape()[1] == width,
-                "modulation_{arm} {:?} {:?} for {} timesteps",
+                "modulation_{arm} {:?} {:?} for {} layers x {} timesteps",
                 tensor.dtype(),
                 tensor.shape(),
+                spec.layers,
                 timesteps.len()
             );
             Ok(match tensor.dtype() {
@@ -3402,15 +3414,7 @@ mod tests {
             Rc::new(Closure::new(true, "MiniMax-H3 GGUF AdaLN gate".into())),
         )?;
         let gguf_dir = gguf_path.parent().context("GGUF directory")?;
-        let table = AdalnTable::build(
-            &device,
-            &mut blas,
-            gguf_dir,
-            &checkpoint,
-            &manifest,
-            &spec,
-            &plan,
-        )?;
+        let table = AdalnTable::build(&device, &mut blas, gguf_dir, &manifest, &spec, &plan)?;
         let blocks: Vec<f64> = s
             .clone_dtoh(&table.blocks)?
             .into_iter()
@@ -3426,12 +3430,13 @@ mod tests {
             for (pair, &(t, tag)) in pairs.iter().enumerate() {
                 let row = layer * pairs.len() + pair;
                 let c = &blocks[row * width..][..width];
-                let mrow = (t as usize * MODALITIES as usize + usize::from(tag)) * width;
                 candidate.extend_from_slice(c);
-                expected.extend_from_slice(&expected_bf16[mrow..mrow + width]);
+                expected.extend_from_slice(&expected_bf16[row * width..][..width]);
                 if tag != 1 {
                     control_candidate.extend_from_slice(c);
-                    let other = t as usize * MODALITIES as usize + (2 - usize::from(tag));
+                    let other = layer * pairs.len()
+                        + t as usize * MODALITIES as usize
+                        + (2 - usize::from(tag));
                     control_expected.extend_from_slice(&expected_bf16[other * width..][..width]);
                 }
             }
@@ -3538,7 +3543,6 @@ mod tests {
             &device,
             &mut blas,
             &transformer,
-            &checkpoint,
             &manifest,
             &spec,
             &adaln_plan,
@@ -3788,7 +3792,6 @@ mod tests {
             &device,
             &mut blas,
             &transformer,
-            &checkpoint,
             &manifest,
             &spec,
             &adaln_plan,

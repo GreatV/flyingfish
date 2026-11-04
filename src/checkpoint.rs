@@ -1,7 +1,9 @@
 //! Shared mmap/index audit, independent of device upload and model execution.
 use anyhow::{Context, Result, bail, ensure};
 use memmap2::{Mmap, MmapOptions};
-use safetensors::{Dtype, SafeTensors, tensor::TensorView};
+#[cfg(any(feature = "cuda", feature = "rocm", test))]
+use safetensors::tensor::TensorView;
+use safetensors::{Dtype, SafeTensors};
 use serde::{
     Deserialize, Deserializer,
     de::{Error, MapAccess, Visitor},
@@ -242,6 +244,7 @@ impl MappedCheckpoint {
             files: BTreeMap::from([(name.to_owned(), file)]),
         })
     }
+    #[cfg(any(feature = "cuda", feature = "rocm", test))]
     pub(crate) fn tensor(&self, name: &str) -> Result<TensorView<'_>> {
         let shard = self
             .index
@@ -301,6 +304,7 @@ impl MappedCheckpoint {
         Ok(())
     }
     /// Host copy of one published F32 tensor with the given shape.
+    #[cfg(any(feature = "cuda", feature = "rocm", test))]
     pub(crate) fn f32_tensor(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
         let tensor = self.tensor(name)?;
         ensure!(
@@ -5015,6 +5019,7 @@ mod component_tests {
 
 #[derive(Clone)]
 struct StoredTensor {
+    #[cfg(any(feature = "cuda", feature = "rocm", test))]
     shape: Vec<usize>,
     range: std::ops::Range<usize>,
 }
@@ -5351,6 +5356,7 @@ impl CheckpointPickle<'_> {
             "tensor storage byte count mismatch"
         );
         Ok(V::Tensor(StoredTensor {
+            #[cfg(any(feature = "cuda", feature = "rocm", test))]
             shape,
             range: range.clone(),
         }))
