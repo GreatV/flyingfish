@@ -26,6 +26,16 @@ const AUDIO_CHANNELS: usize = 2;
 pub const KEYFRAME_NOISE_AUG: f64 = 0.999;
 /// Qwen3-VL hidden state that conditions the transformer (model definition `text_encoder_layer`).
 pub const TEXT_ENCODER_LAYER: usize = 50;
+/// Seed of the conditioning posterior, fixed independently of the request generator (model definition
+/// `modular_pipeline.py:279` `keyframe_encode_seed` returns 42; `encoders.py:134` samples the posterior
+/// under a fresh `manual_seed(encode_seed)`).
+pub const KEYFRAME_ENCODE_SEED: u64 = 42;
+/// Philox counter streams of the four native normal draws; each (seed, stream) pair is a distinct counter range.
+/// No identity with the model definition's torch generator is claimed.
+pub const STREAM_POSTERIOR_EPS: u64 = 0;
+pub const STREAM_ANCHOR_NOISE: u64 = 1;
+pub const STREAM_VIDEO_NOISE: u64 = 2;
+pub const STREAM_AUDIO_ROWS: u64 = 3;
 /// Latent frame `i` spans `ROPE_FRAME_RESCALE * ROPE_FRAMES_PER_LATENT[i % 5]` rotary time units.
 const ROPE_FRAME_RESCALE: f64 = 5.0 / 3.0;
 const ROPE_FRAMES_PER_LATENT: [f64; 5] = [1.0, 4.0, 4.0, 4.0, 4.0];
@@ -1094,11 +1104,10 @@ pub fn mrope_table(
 }
 
 /// One MiniMax-H3 i2va request in the form the native path consumes. Conditioner prompt: token ids, the text tag of
-/// every text row, image grids `[t, h, w]` and Qwen3-VL `pixel_values` rows. Keyframe: u8 pixels `[3, height, width]`
-/// and the posterior noise `[latent_channels, height / 16, width / 16]` of its encode. The request generator's draws,
-/// in the pipeline's order: anchor noise (same shape), video noise `[latent_channels, latent frames, height / 16,
-/// width / 16]` and audio rows `[rows, audio channels]`. Sampling: pixel frames, evaluation count and the video /
-/// audio grid shifts.
+/// every text row, image grids `[t, h, w]` and Qwen3-VL `pixel_values` rows. Keyframe: u8 pixels `[3, height, width]`.
+/// `seed` is the request input from which the four normal draws are generated on device; the conditioning posterior
+/// uses `KEYFRAME_ENCODE_SEED` instead. There is no recorded-draw path. Sampling: pixel frames, evaluation count and
+/// the video / audio grid shifts.
 #[derive(Clone, Debug, PartialEq)]
 pub struct H3Request {
     pub token_ids: Vec<u32>,
@@ -1109,10 +1118,7 @@ pub struct H3Request {
     pub height: usize,
     pub width: usize,
     pub frames: usize,
-    pub posterior_eps: Vec<f32>,
-    pub anchor_noise: Vec<f32>,
-    pub video_noise: Vec<f32>,
-    pub audio_rows: Vec<f32>,
+    pub seed: u64,
     pub evaluations: usize,
     pub shifts: (f64, f64),
 }
@@ -1181,24 +1187,29 @@ pub fn presentation(
     Ok((ids, tags))
 }
 
-/// The request generator's draws of one i2va request, in the shapes of `H3Request`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct H3Draws {
-    pub posterior_eps: Vec<f32>,
-    pub anchor_noise: Vec<f32>,
-    pub video_noise: Vec<f32>,
-    pub audio_rows: Vec<f32>,
+/// The four documented (seed, stream) pairs of one request, in the pipeline's draw order: conditioning posterior
+/// eps, anchor noise, video noise, audio rows. The posterior uses the definition's fixed encode seed; the other three
+/// use the request seed. Each pair is a distinct Philox counter range; no identity with the model definition's torch
+/// generator is claimed.
+pub fn noise_draws(seed: u64) -> [(u64, u64); 4] {
+    [
+        (KEYFRAME_ENCODE_SEED, STREAM_POSTERIOR_EPS),
+        (seed, STREAM_ANCHOR_NOISE),
+        (seed, STREAM_VIDEO_NOISE),
+        (seed, STREAM_AUDIO_ROWS),
+    ]
 }
 
 /// An i2va request from a prompt and a decoded keyframe image: the keyframe stretched onto the canvas of its own
 /// aspect with Lanczos-3 (model definition before_encoder.py:141-144, PIL `resize(LANCZOS)`), its Qwen3-VL
 /// `pixel_values` and grid through the text encoder's image processor, the presentation, the aligned frame count,
-/// and the given draws and sampling (evaluations, video / audio shifts).
+/// the request `seed` and sampling (evaluations, video / audio shifts). The conditioning posterior is seeded with
+/// `KEYFRAME_ENCODE_SEED`, fixed independently of `seed` by the model definition.
 pub fn prepare_i2va(
     model: &Path,
     prompt: &str,
     keyframe: &crate::serve::image::RgbImage,
-    (frames, draws): (usize, H3Draws),
+    (frames, seed): (usize, u64),
     (evaluations, shifts): (usize, (f64, f64)),
 ) -> Result<H3Request> {
     let spec = H3Spec::read(model)?;
@@ -1238,10 +1249,7 @@ pub fn prepare_i2va(
         height,
         width,
         frames: geometry.frames,
-        posterior_eps: draws.posterior_eps,
-        anchor_noise: draws.anchor_noise,
-        video_noise: draws.video_noise,
-        audio_rows: draws.audio_rows,
+        seed,
         evaluations,
         shifts,
     })
