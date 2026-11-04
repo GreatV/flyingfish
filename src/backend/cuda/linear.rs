@@ -3398,6 +3398,30 @@ mod tests {
             .collect()
     }
 
+    /// The first `blocks` Q4_0 blocks of a real target tensor, read from the published file.
+    fn real_q4_0_blocks(
+        file: &crate::gguf::GgufFile,
+        tensor: &str,
+        blocks: usize,
+    ) -> Result<Vec<u8>> {
+        let t = file
+            .tensor(tensor)
+            .with_context(|| format!("GGUF has no tensor {tensor}"))?;
+        ensure!(
+            t.ggml_type == crate::gguf::GgmlType::Q4_0,
+            "{tensor} is {:?}, not Q4_0",
+            t.ggml_type
+        );
+        let bytes = blocks * 18;
+        ensure!(
+            t.nbytes >= bytes,
+            "{tensor} has {} bytes, need {bytes}",
+            t.nbytes
+        );
+        let start = file.data_start() as usize + t.offset as usize;
+        Ok(file.data()[start..start + bytes].to_vec())
+    }
+
     #[test]
     fn q4_0_dequant_cpu_golden_discriminates_nibble_order_mutant() {
         let blocks = q4_0_synthetic_blocks(64);
@@ -3570,6 +3594,114 @@ mod tests {
                     .zip(&expected)
                     .all(|(a, b)| a.to_bits() == b.to_bits()),
             "f16_to_bf16 bit mismatch"
+        );
+
+        let Some(gguf_path) = std::env::var_os("FF_H3_GGUF") else {
+            return Ok(());
+        };
+        let file = crate::gguf::GgufFile::open(&std::path::PathBuf::from(gguf_path))?;
+        let real = real_q4_0_blocks(&file, "blocks.0.attn.qkv_proj.weight", 256)?;
+        let real_flat = q4_0_flat_f32(&real, false);
+        let real_device = stream.clone_htod(&real)?;
+        let real_count = (real.len() / 18) as i64;
+        let mut real_bf16 = stream.alloc_zeros::<bf16>(real_flat.len())?;
+        unsafe {
+            stream
+                .launch_builder(&dequant_bf16)
+                .arg(&real_device)
+                .arg(&mut real_bf16)
+                .arg(&real_count)
+                .launch(launch(real_count))?;
+        }
+        let actual = stream.clone_dtoh(&real_bf16)?;
+        let expected: Vec<bf16> = real_flat
+            .iter()
+            .map(|&value| bf16::from_f32(value))
+            .collect();
+        ensure!(
+            actual.len() == expected.len()
+                && actual
+                    .iter()
+                    .zip(&expected)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "q4_0_dequant_bf16 bit mismatch on real target blocks"
+        );
+        let mut real_f32_out = stream.alloc_zeros::<f32>(real_flat.len())?;
+        unsafe {
+            stream
+                .launch_builder(&dequant_f32)
+                .arg(&real_device)
+                .arg(&mut real_f32_out)
+                .arg(&real_count)
+                .launch(launch(real_count))?;
+        }
+        let actual_f32 = stream.clone_dtoh(&real_f32_out)?;
+        ensure!(
+            actual_f32
+                .iter()
+                .zip(&real_flat)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "q4_0_dequant_f32 bit mismatch on real target blocks"
+        );
+        if let Some(out) = std::env::var_os("FF_H3_GGUF_GOLDEN_OUT") {
+            let bytes: Vec<u8> = actual_f32
+                .iter()
+                .flat_map(|value| value.to_bits().to_le_bytes())
+                .collect();
+            std::fs::write(out, bytes)?;
+        }
+        let nibble_mutant: Vec<bf16> = q4_0_flat_f32(&real, true)
+            .iter()
+            .map(|&value| bf16::from_f32(value))
+            .collect();
+        ensure!(
+            actual != nibble_mutant,
+            "the nibble-order mutant escaped on real target blocks"
+        );
+
+        let fc1 = file
+            .tensor("blocks.0.mlp.fc1.weight")
+            .context("GGUF has no blocks.0.mlp.fc1.weight")?;
+        let (rows, cols) = (fc1.dims[1] as i64, fc1.dims[0] as i64);
+        let fc1_blocks = real_q4_0_blocks(
+            &file,
+            "blocks.0.mlp.fc1.weight",
+            (rows * cols / 32) as usize,
+        )?;
+        let fc1_device = stream.clone_htod(&fc1_blocks)?;
+        let swapped = q4_0_swap_halves_f32(&fc1_blocks, rows as usize, cols as usize);
+        let mut fc1_out = stream.alloc_zeros::<bf16>(swapped.len())?;
+        unsafe {
+            stream
+                .launch_builder(&swap)
+                .arg(&fc1_device)
+                .arg(&mut fc1_out)
+                .arg(&rows)
+                .arg(&cols)
+                .launch(launch(rows * cols / 32))?;
+        }
+        let actual = stream.clone_dtoh(&fc1_out)?;
+        let expected: Vec<bf16> = swapped.iter().map(|&value| bf16::from_f32(value)).collect();
+        ensure!(
+            actual.len() == expected.len()
+                && actual
+                    .iter()
+                    .zip(&expected)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "q4_0_dequant_swap_halves_bf16 bit mismatch on real target blocks"
+        );
+        let swap_mutant: Vec<bf16> = q4_0_flat_f32(&fc1_blocks, false)
+            .iter()
+            .map(|&value| bf16::from_f32(value))
+            .collect();
+        ensure!(
+            actual != swap_mutant,
+            "the half-swap mutant escaped on real target blocks"
+        );
+        println!(
+            "H3_GGUF_Q4_0_REAL flat_blocks={} swap_blocks={} bit_mismatches=0 mutants=FAIL_AS_REQUIRED",
+            real.len() / 18,
+            fc1_blocks.len() / 18
         );
         Ok(())
     }
