@@ -1601,6 +1601,7 @@ fn build_workspace(
     let concat_width = spec.concat_channels() as usize;
     let channels = spec.in_channels as usize;
     let cond_dim = spec.condition_dim as usize;
+    let cond_hidden = spec.cond_hidden as usize;
     let ff = spec.flow_ff_inner as usize;
     let tokens = max_length + 1;
     let pair = 2 * tokens;
@@ -1675,10 +1676,10 @@ fn build_workspace(
         pair_v_u: alloc(channels * max_length)?,
         cond: alloc(max_length * cond_dim)?,
         zeros_cond: s.alloc_zeros(max_length * cond_dim)?,
-        cond_fused: alloc(cond_frames * cond_dim)?,
+        cond_fused: alloc(cond_frames * cond_hidden)?,
         cond_conv: alloc(cond_frames * cond_dim)?,
-        cond_pad: alloc((cond_frames + 2) * cond_dim)?,
-        cond_cols: alloc(cond_frames * cond_dim * 3)?,
+        cond_pad: alloc((cond_frames + 2) * cond_hidden)?,
+        cond_cols: alloc(cond_frames * cond_hidden * 3)?,
         rotary_cos: s.clone_htod(&cos)?,
         rotary_sin: s.clone_htod(&sin)?,
         voc_x: alloc(max_length * streams)?,
